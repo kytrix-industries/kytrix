@@ -1,6 +1,3 @@
-//! The tests of the credential dialog: what it opens with, what it writes, and what it leaves
-//! alone.
-
 use std::{io, path::PathBuf};
 
 use app_config::{
@@ -33,7 +30,6 @@ use crate::{
     },
 };
 
-/// The page one set's row is drawn on.
 fn page_of(kind: CredentialsKind) -> &'static str {
     match kind {
         CredentialsKind::BinanceSpot | CredentialsKind::BinanceUsdMPerp => {
@@ -45,7 +41,6 @@ fn page_of(kind: CredentialsKind) -> &'static str {
     }
 }
 
-/// The five sets the settings edit, each with every value it holds.
 const KINDS: [CredentialsKind; 5] = [
     CredentialsKind::BinanceSpot,
     CredentialsKind::BinanceUsdMPerp,
@@ -54,7 +49,6 @@ const KINDS: [CredentialsKind; 5] = [
     CredentialsKind::Longbridge,
 ];
 
-/// A store failure a test makes the next write report.
 fn write_failure() -> SettingsWriteError {
     SettingsWriteError::new(ConfigPersistenceError::CreateDirectory {
         path: PathBuf::from("blocked"),
@@ -62,7 +56,6 @@ fn write_failure() -> SettingsWriteError {
     })
 }
 
-/// Whether the credential dialog of one set is drawn.
 fn dialog_is_open(harness: &Harness, kind: CredentialsKind) -> bool {
     harness
         .find(&format!("{}:panel", dialog_key(kind)))
@@ -70,8 +63,6 @@ fn dialog_is_open(harness: &Harness, kind: CredentialsKind) -> bool {
         || harness.find(DIALOG_SELECTOR).is_some()
 }
 
-/// The dialog opens over what the settings hold, and confirming it writes the values the user
-/// left: the set is one value, so every value of it is written together.
 #[test]
 fn the_dialog_should_open_prefilled_and_write_the_whole_set() {
     let mut harness = Harness::with_config(english_settings());
@@ -107,8 +98,6 @@ fn the_dialog_should_open_prefilled_and_write_the_whole_set() {
         "the dialog is titled with the set it edits"
     );
 
-    // The caret is put at the end of what the field holds, so what is typed is appended: the
-    // stored value was prefilled rather than the field started empty.
     type_into(&mut harness, kind, "api_key", "typed");
     confirm_dialog(&mut harness);
 
@@ -135,7 +124,6 @@ fn the_dialog_should_open_prefilled_and_write_the_whole_set() {
     );
 }
 
-/// A dialog the user walks away from is not a change of the settings.
 #[test]
 fn a_cancelled_dialog_should_not_write_the_set() {
     let mut harness = Harness::with_config(english_settings());
@@ -163,8 +151,6 @@ fn a_cancelled_dialog_should_not_write_the_set() {
     );
 }
 
-/// An empty form is rejected: the dialog stays open, reports every required value it is missing,
-/// and writes nothing.
 #[test]
 fn an_incomplete_set_should_keep_the_dialog_open_and_write_nothing() {
     let mut harness = Harness::new();
@@ -217,8 +203,6 @@ fn an_incomplete_set_should_keep_the_dialog_open_and_write_nothing() {
     );
 }
 
-/// Clearing is asked about before it is written: walking away from the alert leaves the set, and
-/// confirming it clears the set the row belongs to and no other.
 #[test]
 fn clearing_a_set_should_ask_first_and_take_only_that_set() {
     let mut harness = Harness::with_config(english_settings());
@@ -269,8 +253,6 @@ fn clearing_a_set_should_ask_first_and_take_only_that_set() {
         "a row with nothing stored should not offer to clear it"
     );
 
-    // The dialog the row opens again is an empty form: a set cleared is a set the settings no
-    // longer hold, and a form prefilled with what was cleared would still hold its values.
     open_credentials_dialog(&mut harness, kind);
     type_into(&mut harness, kind, "api_key", "after-clear");
     confirm_dialog(&mut harness);
@@ -281,8 +263,6 @@ fn clearing_a_set_should_ask_first_and_take_only_that_set() {
     cancel_dialog(&mut harness);
 }
 
-/// A set the settings do not hold has nothing to clear, and a set they do hold offers the button
-/// that clears it.
 #[test]
 fn the_clear_button_should_be_drawn_only_for_a_configured_set() {
     let mut harness = Harness::new();
@@ -316,8 +296,6 @@ fn the_clear_button_should_be_drawn_only_for_a_configured_set() {
     );
 }
 
-/// A write that could not be stored keeps the dialog open with what the user typed; once the
-/// settings can be stored, confirming it again writes the set.
 #[test]
 fn a_failed_write_should_keep_the_dialog_and_what_was_typed() {
     let mut harness = Harness::new();
@@ -348,8 +326,6 @@ fn a_failed_write_should_keep_the_dialog_and_what_was_typed() {
         "settings that could not be stored must not be published as if they had been"
     );
 
-    // The reason is reported over the page; the engine closes the report with Escape, which is
-    // what leaves the dialog where the set is submitted again from.
     harness.press(KeyCode::Escape);
     harness.settle(3);
     confirm_dialog(&mut harness);
@@ -373,8 +349,6 @@ fn a_failed_write_should_keep_the_dialog_and_what_was_typed() {
     );
 }
 
-/// A clear that could not be stored leaves the set where it was and reports why; clearing the same
-/// row again once the settings can be stored is what writes it — and only it.
 #[test]
 fn a_failed_clear_should_keep_the_set_until_the_retry_writes_it() {
     let mut harness = Harness::with_config(english_settings());
@@ -427,7 +401,6 @@ fn a_failed_clear_should_keep_the_set_until_the_retry_writes_it() {
     }
 }
 
-/// A venue's credential row is a row of the card that holds the rest of that venue's settings.
 #[test]
 fn a_credential_row_should_share_the_venues_card() {
     let mut harness = Harness::with_config(english_settings());
@@ -481,8 +454,6 @@ fn a_credential_row_should_share_the_venues_card() {
     );
 }
 
-/// Every value of a set is required but Binance's passphrase, which its key may have been created
-/// without.
 #[test]
 fn every_credential_value_should_be_required_except_binances_passphrase() {
     for kind in KINDS {
@@ -498,9 +469,6 @@ fn every_credential_value_should_be_required_except_binances_passphrase() {
     }
 }
 
-/// A secret is drawn masked and an identity as it is: a private key or a secret must not be read
-/// off the screen, and an API key, a main account address and an application key are identities
-/// the operator checks against the venue's own page.
 #[test]
 fn a_secret_should_be_masked_and_an_identity_shown() {
     for kind in KINDS {
@@ -525,9 +493,6 @@ fn a_secret_should_be_masked_and_an_identity_shown() {
     }
 }
 
-/// The alert a clear is confirmed with names the set it is about, in both languages and for both
-/// of Binance's markets: the title is the one thing that tells one venue's credentials from
-/// another's.
 #[test]
 fn the_clear_alert_should_name_the_credentials_it_clears() {
     let cases = [
@@ -578,8 +543,6 @@ fn the_clear_alert_should_name_the_credentials_it_clears() {
     }
 }
 
-/// The dialog's title names the trading surface its set signs for, in both languages: Binance's
-/// two markets are two dialogs, and a title that named only the venue would not say which one.
 #[test]
 fn the_dialog_titles_should_name_the_trading_surface() {
     let messages = i18n::embedded::load().expect("embedded locales should load");
@@ -627,9 +590,6 @@ fn the_dialog_titles_should_name_the_trading_surface() {
     }
 }
 
-/// A form submitted without its required values is rejected in place: every empty value is
-/// reported under the field it belongs to, and each report goes when the value it complains about
-/// is filled in rather than when the first of them is.
 #[test]
 fn a_rejected_submission_should_report_every_value_it_is_missing() {
     let mut harness = Harness::new();
@@ -650,8 +610,6 @@ fn a_rejected_submission_should_report_every_value_it_is_missing() {
         "a rejected submission should leave the dialog where it can be completed"
     );
 
-    // A field reports what it holds when Enter is pressed in it, which is what takes a report
-    // away: what is left in the other fields is still empty, so their reports stay.
     type_into(&mut harness, kind, "api_key", "typed-key");
     harness.press(KeyCode::Enter);
     harness.settle(1);
@@ -704,8 +662,6 @@ fn a_rejected_submission_should_report_every_value_it_is_missing() {
     );
 }
 
-/// Submitting a field without changing what it holds does not take away the report of what it is
-/// missing: only a value that actually changed clears the report.
 #[test]
 fn submitting_a_field_unchanged_should_keep_its_report() {
     let mut harness = Harness::new();
@@ -731,8 +687,6 @@ fn submitting_a_field_unchanged_should_keep_its_report() {
     );
 }
 
-/// Binance's passphrase is the one value a set is complete without, and the form says so twice:
-/// an empty required value is reported under its field, and an empty passphrase is not.
 #[test]
 fn binances_passphrase_should_not_be_reported_as_missing() {
     let mut harness = Harness::new();
@@ -776,8 +730,6 @@ fn binances_passphrase_should_not_be_reported_as_missing() {
     );
 }
 
-/// The dialog ends the way the application's other dialogs end: a line across it, and the two
-/// buttons under that line rather than in among the fields.
 #[test]
 fn the_credentials_dialog_should_be_drawn_the_way_the_application_draws_its_dialogs() {
     let mut harness = Harness::with_config(english_settings());
@@ -838,9 +790,6 @@ fn the_credentials_dialog_should_be_drawn_the_way_the_application_draws_its_dial
     );
 }
 
-/// A credential row says what is configured and offers the two things a row can do: the dialog
-/// that edits the set, and — for a set the settings hold — the alert that clears it. The buttons
-/// end the control column in that order.
 #[test]
 fn a_credential_rows_buttons_should_end_the_control_column() {
     let mut harness = Harness::with_config(english_settings());
@@ -875,8 +824,6 @@ fn a_credential_rows_buttons_should_end_the_control_column() {
     );
 }
 
-/// The buttons of a credential row are actions of the settings row rather than compact controls
-/// inside a table, so they are drawn at the medium size.
 #[test]
 fn a_credential_rows_buttons_should_be_medium_sized() {
     let mut harness = Harness::with_config(english_settings());
@@ -893,9 +840,6 @@ fn a_credential_rows_buttons_should_be_medium_sized() {
     }
 }
 
-/// The Hyperliquid dialog opens over the set the settings hold and writes the whole set: what the
-/// user types is appended to the stored value, the value the user did not touch is written back as
-/// it was, and a cancelled dialog writes nothing at all.
 #[test]
 fn a_hyperliquid_dialog_should_open_prefilled_and_write_the_whole_set() {
     let mut harness = Harness::with_config(english_settings());
@@ -936,9 +880,6 @@ fn a_hyperliquid_dialog_should_open_prefilled_and_write_the_whole_set() {
     );
 }
 
-/// A venue that signs its whole surface with one set is cleared by the alert its row opens: what
-/// is cleared is that venue's set, and neither the other venues nor Binance's two markets are
-/// touched by it.
 #[test]
 fn clearing_a_venue_should_write_none_and_leave_the_other_venues_alone() {
     let mut harness = Harness::with_config(english_settings());
@@ -984,9 +925,6 @@ fn clearing_a_venue_should_write_none_and_leave_the_other_venues_alone() {
     }
 }
 
-/// A set the settings hold is a set the row can clear, even when a hand-edited file left every
-/// value of it empty: the row says what is stored rather than what it holds, and the dialog is
-/// where an incomplete set is completed.
 #[test]
 fn a_stored_but_empty_set_should_be_completed_or_cleared() {
     fn empty() -> Option<BinanceMarketCredentials> {
@@ -1070,9 +1008,6 @@ fn a_stored_but_empty_set_should_be_completed_or_cleared() {
     );
 }
 
-/// A set the settings hold is prefilled with the values it does hold, even when a hand-edited file
-/// left it incomplete: typing the value that is empty completes the set, and the values that were
-/// already there are written back untouched.
 #[test]
 fn a_stored_but_incomplete_set_should_open_prefilled() {
     fn incomplete() -> Option<BinanceMarketCredentials> {
@@ -1123,8 +1058,6 @@ fn a_stored_but_incomplete_set_should_open_prefilled() {
     );
 }
 
-/// Closing the dialog releases what one open built: opening it again is a form of its own rather
-/// than a second set of handlers over the first one's state.
 #[test]
 fn closing_the_dialog_should_release_its_fields() {
     let mut harness = Harness::new();
@@ -1164,8 +1097,6 @@ fn closing_the_dialog_should_release_its_fields() {
     );
 }
 
-/// Leaving the page releases the dialog it was opened over: a page switch rebuilds the page the
-/// dialog belonged to, and the controls of a dialog that is still open go with it.
 #[test]
 fn leaving_the_page_should_release_the_dialog() {
     let mut harness = Harness::with_config(english_settings());
@@ -1196,8 +1127,6 @@ fn leaving_the_page_should_release_the_dialog() {
     );
 }
 
-/// A language switch rebuilds the page, and the dialog a page held goes with the page it was
-/// opened over rather than outliving it.
 #[test]
 fn a_language_switch_should_take_the_open_dialog_away() {
     let mut harness = Harness::with_config(english_settings());
@@ -1227,8 +1156,6 @@ fn a_language_switch_should_take_the_open_dialog_away() {
     );
 }
 
-/// The credential row of one set is the same row on every page it is drawn on, and the values are
-/// never row ids: a row that named a value would make a secret a thing the page lays out.
 #[test]
 fn every_set_should_be_drawn_as_one_row() {
     let mut harness = Harness::with_config(english_settings());
@@ -1251,8 +1178,6 @@ fn every_set_should_be_drawn_as_one_row() {
     }
 }
 
-/// The keys the controls of one page are named by are the page's own: a control's identity carries
-/// the row id, so a test — and a second pane — can tell one row's control from another's.
 #[test]
 fn a_credentials_controls_should_be_named_by_the_row_they_belong_to() {
     let kind = CredentialsKind::Longbridge;

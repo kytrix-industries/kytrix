@@ -1,82 +1,49 @@
-//! a11y 测试基建：`TreeUpdate` 影子树校验、机器可读快照、变异友好断言。
-//!
-//! 这一层回答的是「a11y 修复有没有被**能失败**的测试钉住」，而不是"引擎看起来对不对"：
-//!
-//! - [`ShadowTree`]：把一串 `accesskit::TreeUpdate` 按 AccessKit 的五条硬契约逐步应用
-//!   （父必须已在树里或同批 / `children` 必须可达 / 每个节点只有一个父 / 被删子节点及其后代
-//!   不得再出现 / `focus` 必须指向应用后的树里存在的节点）。R13-10 指出全仓没有一处
-//!   `TreeUpdate` 端到端断言，而这五条恰好对应"脏位漏标、祖先漏发、父指针被双父覆盖、节点删了
-//!   还在批里、焦点指向不存在的节点"五类 "测试全绿但 AT 崩" 的 bug。
-//! - [`tree_update_snapshot`]：把 `TreeUpdate` 序列化成**确定性文本**（角色/名字/值/结构/
-//!   焦点/动作/文本长度/排序/滚动/自定义动作），供快照测试审查语义变更。文本而非二进制：
-//!   diff 可读、评审能看到"这一行 a11y 变了什么"。
-//! - [`assert_contract_holds`] / [`assert_ids_are_unique`] / [`assert_node_covers`]：小而明确的
-//!   断言 helper。它们的共同点是要么**有真实失败路径**（构造非法 update 必须报错），
-//!   要么是双向断言（不写"检查了某个自建对象又读回来"的自证测试）。
-//!
-//! 这一层不依赖 `accesskit_consumer`（内部 crate），只依赖 `accesskit` 的公开类型。
-
 use std::fmt::Write as _;
 
 use accesskit::{NodeId as AkNodeId, TreeUpdate};
 
-/// `TreeUpdate` 里一个节点的影子记录（只剩结构信息 + 一段可读摘要）。
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ShadowNode {
     children: Vec<AkNodeId>,
-    /// 快照摘要（`role:Button label=ok children=2`），用于全量/增量一致性比较。
     summary: String,
 }
 
-/// a11y 树影子：按顺序应用 `TreeUpdate` 并校验 AccessKit 的硬契约。
 #[derive(Clone, Debug, Default)]
 pub struct ShadowTree {
     nodes: ahash::HashMap<AkNodeId, ShadowNode>,
     focus: Option<AkNodeId>,
-    /// 已应用的笔数（测试可断言"分了 N 批"）。
     updates: usize,
-    /// 上一次全树笔的根（`TreeInfo.root`）。
     root: Option<AkNodeId>,
 }
 
 impl ShadowTree {
-    /// 空影子。
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 已应用的更新笔数。
     #[must_use]
     pub fn updates(&self) -> usize {
         self.updates
     }
 
-    /// 树里的节点数。
     #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
-    /// 是否为空。
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
-    /// 当前焦点。
     #[must_use]
     pub fn focus(&self) -> Option<AkNodeId> {
         self.focus
     }
 
-    /// 应用一笔 `TreeUpdate`。
-    ///
-    /// # Errors
-    /// 违反 AccessKit 契约时返回**具体**的错误描述（哪个 id、哪条规则），供测试断言失败面。
     pub fn apply(&mut self, update: &TreeUpdate) -> Result<(), String> {
         if let Some(tree) = &update.tree {
-            // 全树笔：消费端会整体重置树。
             self.nodes.clear();
             self.root = Some(tree.root);
             self.nodes.insert(
@@ -97,7 +64,6 @@ impl ShadowTree {
             ));
         };
 
-        // ① 同一笔内每个节点：父必须已在树里或同批。
         let batch: ahash::HashSet<AkNodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
         for (id, node) in &update.nodes {
             if *id == root {
@@ -120,7 +86,6 @@ impl ShadowTree {
             let _ = node;
         }
 
-        // ② `children` 里的 id 必须可达（已存在 / 同批）。
         for (id, node) in &update.nodes {
             for child in node.children() {
                 let known = self.nodes.contains_key(child) || batch.contains(child);
@@ -133,9 +98,6 @@ impl ShadowTree {
             }
         }
 
-        // ②b 父唯一性：AccessKit 的树要求每个节点只有一个父。同一 id 出现在两个父的 `children`
-        // 里时，consumer 的 parent 指针会被后处理者覆盖（结构与阅读顺序错乱）；旧的"有某个父"
-        // 断言放过了这种双父 bug（E9b F1），这里作为硬契约钉死。
         let mut parents: ahash::HashMap<AkNodeId, AkNodeId> = ahash::HashMap::default();
         let kept = self
             .nodes
@@ -155,7 +117,6 @@ impl ShadowTree {
             }
         }
 
-        // ③ 被删子节点及其后代不得在本批出现：父的旧 children 里消失的 id 必须在树里被移除。
         for (id, node) in &update.nodes {
             let Some(previous) = self.nodes.get(id) else {
                 continue;
@@ -178,8 +139,6 @@ impl ShadowTree {
             }
         }
 
-        // ④ 应用：先记下旧的 children（删子树要用旧列表），再写入/更新节点，
-        //    最后把从父 children 里移除的节点整棵子树删掉。
         let previous: Vec<(AkNodeId, Vec<AkNodeId>)> = update
             .nodes
             .iter()
@@ -205,7 +164,6 @@ impl ShadowTree {
             }
         }
 
-        // ⑤ 焦点必须存在于应用后的树里。
         if !self.nodes.contains_key(&update.focus) {
             return Err(format!(
                 "focus {:?} does not exist in the resulting tree",
@@ -217,7 +175,6 @@ impl ShadowTree {
         Ok(())
     }
 
-    /// 节点摘要（`id -> summary`；全量 / 增量一致性比较用）。
     #[must_use]
     pub fn summaries(&self) -> ahash::HashMap<AkNodeId, String> {
         self.nodes
@@ -226,7 +183,6 @@ impl ShadowTree {
             .collect()
     }
 
-    /// 退出树里每个节点的 children 列表摘要（结构一致性用）。
     #[must_use]
     pub fn structure(&self) -> Vec<(AkNodeId, Vec<AkNodeId>)> {
         let mut rows: Vec<(AkNodeId, Vec<AkNodeId>)> = self
@@ -263,7 +219,6 @@ fn remove_shadow_subtree(nodes: &mut ahash::HashMap<AkNodeId, ShadowNode>, root:
     }
 }
 
-/// 快照里值得审查的动作集合（`accesskit::Node` 没有公开的动作迭代器，只有 `supports_action`）。
 const INTERESTING_ACTIONS: [accesskit::Action; 16] = [
     accesskit::Action::Click,
     accesskit::Action::Focus,
@@ -289,7 +244,6 @@ fn has_any_action(node: &accesskit::Node) -> bool {
         .any(|action| node.supports_action(*action))
 }
 
-/// 单个节点的确定性文本摘要（角色 / 名字 / 值 / 结构 / 状态）。
 fn node_summary(id: AkNodeId, node: &accesskit::Node) -> String {
     let mut out = String::new();
     let _ = write!(
@@ -349,7 +303,6 @@ fn node_summary(id: AkNodeId, node: &accesskit::Node) -> String {
     if !node.word_starts().is_empty() {
         let _ = write!(out, " word_starts={:?}", node.word_starts());
     }
-    // 字符度量 / 文本方向（E4b）：caret 高亮能力是否发出、是否单行 LTR，直接进 oracle 摘要。
     if let Some(positions) = node.character_positions() {
         let _ = write!(out, " character_positions={positions:?}");
     }
@@ -375,8 +328,6 @@ fn node_summary(id: AkNodeId, node: &accesskit::Node) -> String {
     if node.clips_children() {
         let _ = write!(out, " clips_children");
     }
-    // 方向（E15b P4）：显式声明或滚动轴推导出的 `orientation` 必须进 oracle 摘要，否则
-    // 增量笔漏发 / 发错方向时增量与全树不会分叉（E15 审查 F8）。
     if let Some(orientation) = node.orientation() {
         let _ = write!(out, " orientation={orientation:?}");
     }
@@ -392,9 +343,6 @@ fn node_summary(id: AkNodeId, node: &accesskit::Node) -> String {
     out
 }
 
-/// `TreeUpdate` 的确定性机器可读快照（**文本**，供快照测试 / 评审 diff）。
-///
-/// 格式：每行一个节点，按 id 升序；最后一行是焦点与树信息。字段顺序固定，空的属性不输出。
 #[must_use]
 pub fn tree_update_snapshot(update: &TreeUpdate) -> String {
     let mut rows: Vec<(u64, String)> = update
@@ -425,10 +373,6 @@ pub fn tree_update_snapshot(update: &TreeUpdate) -> String {
     out
 }
 
-/// 断言一笔 update 满足 AccessKit 契约（`shadow` 必须已经被之前的笔推进到同一状态）。
-///
-/// # Panics
-/// 契约失败（错误信息带"哪个 id / 哪条规则"）。
 pub fn assert_contract_holds(shadow: &mut ShadowTree, update: &TreeUpdate) {
     if let Err(error) = shadow.apply(update) {
         panic!(
@@ -438,10 +382,6 @@ pub fn assert_contract_holds(shadow: &mut ShadowTree, update: &TreeUpdate) {
     }
 }
 
-/// 断言一批 id 互不相同（身份分配器的"不同节点不冲突"）。
-///
-/// # Panics
-/// 出现重复 id（打印重复项）。
 pub fn assert_ids_are_unique(ids: impl IntoIterator<Item = AkNodeId>) {
     let mut seen: ahash::HashSet<AkNodeId> = ahash::HashSet::default();
     let mut duplicates = Vec::new();
@@ -456,13 +396,6 @@ pub fn assert_ids_are_unique(ids: impl IntoIterator<Item = AkNodeId>) {
     );
 }
 
-/// 断言"全部改变"的节点集合确实是增量（不是变相全量）。
-///
-/// 这是给"预算/增量"测试用的变异友好断言：把增量退回全量、或把预算调成无限，
-/// `nodes.len() <= max` 立刻红。
-///
-/// # Panics
-/// 本笔节点数超过 `max`。
 pub fn assert_incremental_within(update: &TreeUpdate, max: usize) {
     assert!(
         update.nodes.len() <= max,
@@ -510,11 +443,9 @@ mod tests {
         }
     }
 
-    /// 合法的一串更新必须全部通过（含删节点时父重发）。
     #[test]
     fn a_valid_update_sequence_is_accepted() {
         let mut shadow = ShadowTree::new();
-        // 首笔：root → [button]
         shadow
             .apply(&full(
                 vec![
@@ -525,7 +456,6 @@ mod tests {
             ))
             .expect("first update");
         assert_eq!(shadow.len(), 2);
-        // 增量：加一个子节点，父重发。
         shadow
             .apply(&incremental(
                 vec![
@@ -540,7 +470,6 @@ mod tests {
         assert_eq!(shadow.updates(), 2);
     }
 
-    /// 契约 ①：没有父的孤儿节点必须被拒绝。
     #[test]
     fn an_orphan_node_is_rejected() {
         let mut shadow = ShadowTree::new();
@@ -555,7 +484,6 @@ mod tests {
         assert!(error.contains("no parent"), "{error}");
     }
 
-    /// 契约 ②b：同一节点不得同时挂在两个父下（"双父"会让 consumer 的 parent 指针被覆盖）。
     #[test]
     fn a_node_with_two_parents_is_rejected() {
         let mut shadow = ShadowTree::new();
@@ -568,7 +496,6 @@ mod tests {
                 AkNodeId(1),
             ))
             .expect("first");
-        // 同一笔里 3 既挂在 root 下、又挂在 2 下 ⇒ 双父，非法。
         let update = incremental(
             vec![
                 (AkNodeId(1), node(Role::Window, &[AkNodeId(2), AkNodeId(3)])),
@@ -581,7 +508,6 @@ mod tests {
         assert!(error.contains("multiple parents"), "{error}");
     }
 
-    /// 契约 ④：被删子节点仍在本批出现必须被拒绝（"节点删了还在批里"）。
     #[test]
     fn a_removed_child_must_not_reappear_in_the_batch() {
         let mut shadow = ShadowTree::new();
@@ -594,7 +520,6 @@ mod tests {
                 AkNodeId(1),
             ))
             .expect("first");
-        // 父不再列出 2，但同一笔里 2 仍然被更新 ⇒ 非法。
         let update = incremental(
             vec![
                 (AkNodeId(1), node(Role::Window, &[])),
@@ -606,7 +531,6 @@ mod tests {
         assert!(error.contains("still present"), "{error}");
     }
 
-    /// 契约 ⑤：焦点必须指向结果树里存在的节点（"焦点指向未发出的节点"）。
     #[test]
     fn a_focus_outside_the_tree_is_rejected() {
         let mut shadow = ShadowTree::new();
@@ -621,7 +545,6 @@ mod tests {
         assert!(error.contains("focus"), "{error}");
     }
 
-    /// 快照是确定性的：同样的 update 输出同样文本；节点按 id 升序。
     #[test]
     fn the_snapshot_is_deterministic_and_sorted() {
         let update = full(
@@ -641,7 +564,6 @@ mod tests {
         assert!(first.contains("focus: #1"), "{first}");
     }
 
-    /// 断言 helper 必须**能失败**（否则它们就是又一个假绿）。
     #[test]
     fn the_assertion_helpers_detect_violations() {
         let update = full(
@@ -663,8 +585,6 @@ mod tests {
         assert!(outcome.is_err(), "超预算必须让断言失败");
     }
 
-    /// R13-13：滚动容器必须把 `scroll_*` 状态暴露到 `TreeUpdate`（UIA 的 ScrollPattern /
-    /// AT-SPI 的 Value 读这几项；旧实现宣告了滚动动作却没有任何滚动几何）。
     #[test]
     fn scroll_state_reaches_the_tree_update() {
         use crate::{
@@ -716,11 +636,6 @@ mod tests {
         assert!(snapshot.contains("clips_children"), "{snapshot}");
     }
 
-    /// E12：模态作用域变化的 a11y 增量必须**合法**，且背景 `hidden` 真的随增量送达。
-    ///
-    /// 走 `TestApp::drain` 的真实顺序（帧 → a11y 交付），用 `ShadowTree` 逐笔校验 AccessKit
-    /// 契约（父先于子 / children 一致 / 焦点恒在）：模态打开与关闭各是一笔增量，不靠全树重发
-    /// 兜底。变异守卫：不标全树 `A11Y`（背景节点没有脏位）⇒ 本笔里找不到背景节点 ⇒ 红。
     #[test]
     fn a_modal_scope_change_is_delivered_as_a_legal_incremental_update() {
         use crate::{

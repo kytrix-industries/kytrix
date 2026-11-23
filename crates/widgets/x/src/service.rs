@@ -1,36 +1,3 @@
-//! The timeline protocol, its background service, and the seams a test drives it through.
-//!
-//! # One account, and everything a pane does with it
-//!
-//! A pane showing this widget follows the timeline of the accounts one X account monitors, and
-//! it manages the list of accounts being monitored. Both belong to the same account and both
-//! are answered with the same session — the timeline is subscribed with it and every change to
-//! the list is sent with it — so one service owns both and one run loop serializes them.
-//!
-//! # The session is the service's, the list is the pane's
-//!
-//! Nothing about the monitored accounts is kept here as a list. What the pane shows is the
-//! last answer it was given, and the projection of a confirmed change is [`SelectionData`]'s.
-//! What this service does own is the *session*: a change is only made through the session the
-//! stream was opened with, which is what keeps a dialog acting on an account the pane has left
-//! from changing anything — such a request is refused with the session it disagrees with.
-//!
-//! # Pictures are fetched here, and belong to the stream
-//!
-//! The service streams tweets and it also fetches the pictures they want, because the two are
-//! one question — what is on screen — asked of two places. The pictures a stream is fetching
-//! live and die with that stream: a new stream starts from what the run loop knows the pane
-//! wants, and a stream that is replaced takes its downloads with it. A picture's state travels
-//! in the same message as the tweets it belongs to, so a frame never has to reconcile a tweet
-//! against a picture from another moment.
-//!
-//! # Readiness
-//!
-//! `Ready` means the subscription is live, and the tweets are published before it: being live
-//! is what makes the timeline already on the wire the pane's content, including none at all. A
-//! subscription that never came up publishes why instead, and the pane reads the monitored
-//! accounts through the session the service still holds.
-
 use std::{collections::VecDeque, future::Future, path::PathBuf, sync::Arc};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -66,78 +33,56 @@ use super::{
     model::{MediaState, MediaStates, SelectionData, TweetSnapshot, TweetState},
 };
 
-/// How many pictures one stream fetches at once.
-///
-/// A timeline is read by a person, and a picture that is not on screen yet is not late: four at
-/// a time fills a viewport quickly without turning a pane into a burst of requests at X.
 const MEDIA_CONCURRENCY: usize = 4;
 
-/// How many "fetch that picture again" requests may be waiting for the stream at once.
 const MEDIA_RETRY_CAPACITY: usize = 16;
 
-/// What a pane asks its service to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TweetRequest {
-    /// Follows an account's timeline, keeping the stream that already follows it.
     Load(TweetScope),
-    /// Reopens an account's timeline, for one whose stream has failed.
     Retry(TweetScope),
-    /// Follows nothing, because nobody is signed in.
     Stop,
-    /// Reads the accounts the account monitors.
     FetchSelections(TweetScope),
-    /// Says whether a dialog showing those accounts is open, which is what decides whether
-    /// their avatars are fetched at all.
-    WatchSelections { scope: TweetScope, watched: bool },
-    /// Searches X for an account to monitor.
-    SearchUsers { scope: TweetScope, query: SmolStr },
-    /// Monitors one more account, by username.
+    WatchSelections {
+        scope: TweetScope,
+        watched: bool,
+    },
+    SearchUsers {
+        scope: TweetScope,
+        query: SmolStr,
+    },
     AddSelection {
         scope: TweetScope,
         username: SmolStr,
     },
-    /// Stops monitoring one account.
     DeleteSelection {
         scope: TweetScope,
         x_user_id: SmolStr,
     },
-    /// Fetches one picture again, for one that failed.
-    RetryMedia { scope: TweetScope, url: SmolStr },
+    RetryMedia {
+        scope: TweetScope,
+        url: SmolStr,
+    },
 }
 
-/// What the service answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TweetResponse {
-    /// The account's timeline is running.
     StreamStarted,
-    /// Nothing is followed.
     Stopped,
-    /// The accounts the account monitors.
     Selections(SelectionData),
-    /// The dialog's avatars are, or are no longer, being fetched.
     SelectionsWatched,
-    /// What the search found.
     SearchResults(Arc<[XProfile]>),
-    /// What became of an account the pane asked to monitor.
     Added(XMutationOutcome<XSelection>),
-    /// What became of an account the pane asked to stop monitoring.
     Deleted(XMutationOutcome<()>),
-    /// One picture is being fetched again.
     MediaRetried,
 }
 
-/// The account whose timeline a stream carries.
-///
-/// Every request names one, including the ones that change the monitored list: the pane's
-/// account can change while a dialog is still open, and an answer about the account the pane
-/// has left is not one the pane may act on.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct TweetScope {
     account_id: SmolStr,
 }
 
 impl TweetScope {
-    /// The scope an account follows, or `None` when nobody is signed in.
     pub(super) fn new(account_id: Option<&SmolStr>) -> Option<Self> {
         let account_id = account_id.filter(|account_id| !account_id.is_empty())?;
         Some(Self {
@@ -150,23 +95,16 @@ impl TweetScope {
     }
 }
 
-/// What a subscription the pane holds is doing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TweetStatus {
-    /// The subscription is being established.
     Connecting,
-    /// The subscription is live.
     Ready,
-    /// The subscription ended; the pane is finished until the user recovers it.
     Failed(TweetStreamError),
 }
 
-/// Why a subscription stopped, or why it never started.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TweetStreamError {
-    /// The account's session could not be taken, or the subscription was refused.
     Service(KytrixServiceError),
-    /// The timeline already published could not be read.
     Api(XApiError),
     Transport(TransportError),
 }
@@ -181,15 +119,12 @@ impl TranslatedError for TweetStreamError {
     }
 }
 
-/// One message of an account's timeline.
 #[derive(Clone, Debug)]
 pub(super) enum TweetStreamMessage {
     Status(TweetStatus),
-    /// The tweets the pane is showing, with the pictures they want.
     Update(TweetUpdate),
 }
 
-/// What one frame draws: the timeline, and what is known about its pictures.
 #[derive(Clone, Debug)]
 pub(super) struct TweetUpdate {
     revision: u64,
@@ -198,7 +133,6 @@ pub(super) struct TweetUpdate {
 }
 
 impl TweetUpdate {
-    /// How many updates this stream has published, which is what makes an older one stale.
     pub(super) const fn revision(&self) -> u64 {
         self.revision
     }
@@ -211,7 +145,6 @@ impl TweetUpdate {
         &self.media
     }
 
-    /// One update, as a stream would have published it, for a test that reports one by hand.
     #[cfg(test)]
     pub(super) const fn published(revision: u64, feed: TweetSnapshot, media: MediaStates) -> Self {
         Self {
@@ -232,34 +165,24 @@ impl WidgetProtocol for TweetProtocol {
     type Error = XApiError;
 }
 
-/// The X account a pane reads through.
-///
-/// The service is written against this seam rather than against the connector, so a test can
-/// drive every state a session and a subscription can be in without one.
 pub(super) trait TweetSource: Clone + Send + Sync + 'static {
     type Session: TweetSession;
 
-    /// Takes the account's session, which answers both the stream and every request the pane
-    /// makes about the accounts it monitors.
     fn acquire_session(
         &self,
         account_id: &str,
     ) -> impl Future<Output = Result<Self::Session, KytrixServiceError>> + Send;
 }
 
-/// One account's session.
 pub(super) trait TweetSession: Clone + Send + Sync + 'static {
     type Subscription: TweetEventSubscription;
 
-    /// The account this session is for, which is what a stream keyed by another one is checked
-    /// against.
     fn account_id(&self) -> &str;
 
     fn subscribe_x(
         &self,
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 
-    /// The timeline already published for the accounts being monitored.
     fn fetch_tweets(&self) -> impl Future<Output = Result<XTweetBatch, XApiError>> + Send;
 
     fn fetch_selections(
@@ -282,7 +205,6 @@ pub(super) trait TweetSession: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = XMutationOutcome<()>> + Send;
 }
 
-/// One live event subscription.
 pub(super) trait TweetEventSubscription: Send + 'static {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus>;
 
@@ -339,7 +261,6 @@ impl TweetEventSubscription for Subscription<XSubscriptionEvent> {
     }
 }
 
-/// The service that follows one pane's timeline.
 pub(super) struct TweetService<S = KytrixServiceConnector, T = SharedTransport> {
     source: S,
     downloader: MediaDownloader<T>,
@@ -351,14 +272,10 @@ impl<S, T> TweetService<S, T> {
     }
 }
 
-/// The session the account a stream belongs to is answered with.
 struct ActiveSession<S> {
     scope: TweetScope,
     session: S,
-    /// The pictures beyond the timeline this stream should be fetching, as the run loop last
-    /// knew them.
     auxiliary: watch::Sender<Arc<[SmolStr]>>,
-    /// "Fetch that picture again" requests on their way to the stream that owns it.
     retries: mpsc::Sender<SmolStr>,
 }
 
@@ -375,9 +292,6 @@ where
 {
     async fn run(self, mut context: ServiceContext<TweetProtocol>) {
         let mut active: Option<ActiveSession<S::Session>> = None;
-        // What the pane wants pictures of beyond the timeline: the avatars of the monitored
-        // accounts, while a dialog is showing them, and those of its search results. The
-        // avatars are keyed by account so a confirmed removal can take its own avatar out.
         let mut selection_avatars: HashMap<SmolStr, SmolStr> =
             HashMap::with_capacity(MAX_X_SELECTIONS);
         let mut search_avatars: Vec<SmolStr> = Vec::new();
@@ -408,11 +322,6 @@ where
                         continue;
                     }
 
-                    // A stream the service is already holding for this account is the one that
-                    // was asked for: what the pane is waiting for is the account, and nothing
-                    // about the stream changes. A retry is the caller saying the stream it has
-                    // is not one it wants, so it is replaced even when the account behind it is
-                    // the same.
                     if !retry
                         && active.as_ref().is_some_and(|active| active.scope == scope)
                         && context.stream_generation(&scope).is_some()
@@ -434,9 +343,6 @@ where
                             }
                         },
                     };
-                    // The stream is keyed by the account the pane asked for, so a session that
-                    // turned out to be for another one is answered rather than streamed: a
-                    // tweet is not data a pane may show under a name it does not belong to.
                     if session.account_id() != scope.account_id() {
                         let _ = reply.respond(Err(XApiError::AccountChanged));
                         continue;
@@ -468,9 +374,6 @@ where
                         retries,
                     });
                     if reply.respond(Ok(TweetResponse::StreamStarted)).is_err() {
-                        // Nobody is waiting for this stream any more, so it is nobody's stream:
-                        // a pane that went away must not leave a subscription holding an
-                        // account it is not reading.
                         context.cancel_stream(&scope);
                         active = None;
                     }
@@ -585,9 +488,6 @@ where
                     tokio::pin!(add);
                     let outcome = tokio::select! {
                         biased;
-                        // A caller that went away takes its question with it. The change may or
-                        // may not have been made, and nothing here decides which: the pane
-                        // reads the list again instead of guessing.
                         () = reply.cancelled() => continue,
                         outcome = &mut add => outcome,
                     };
@@ -656,9 +556,6 @@ where
                             .respond(Err(XApiError::Protocol("X media URL is invalid".into())));
                         continue;
                     }
-                    // What is on screen is the stream's to say, so a retry is handed to the
-                    // stream that owns the picture: it decides whether the picture is one it
-                    // is still fetching, and publishes what comes of it.
                     if active.retries.try_send(url).is_err() {
                         let _ = reply.respond(Err(XApiError::NotReady));
                         continue;
@@ -670,7 +567,6 @@ where
     }
 }
 
-/// The pictures a pane wants beyond its timeline.
 fn auxiliary_urls(
     selections: &HashMap<SmolStr, SmolStr>,
     search: &[SmolStr],
@@ -684,11 +580,6 @@ fn auxiliary_urls(
     urls.into()
 }
 
-/// The session a request about the monitored accounts is answered with.
-///
-/// A request that names an account the service is not holding is refused with what is wrong
-/// rather than answered from another account's session: not holding one at all is a pane that
-/// asked too early, and holding a different one is a pane whose account changed under it.
 fn matching_session<'a, S>(
     active: &'a Option<ActiveSession<S>>,
     scope: &TweetScope,
@@ -702,11 +593,6 @@ fn matching_session<'a, S>(
     Ok(active)
 }
 
-/// What a session that could not be taken means to the request that asked for it.
-///
-/// The four that name a condition of their own are named as themselves: an expired login, a
-/// changed account, a timeout and a closed service all read differently to a user than a
-/// service error does.
 fn session_failure(error: KytrixServiceError) -> XApiError {
     match error {
         KytrixServiceError::Authentication(_) => XApiError::Authentication,
@@ -717,7 +603,6 @@ fn session_failure(error: KytrixServiceError) -> XApiError {
     }
 }
 
-/// Runs the account's subscription and everything the pane wants pictures of.
 async fn run_stream<S, T>(
     session: S,
     downloader: MediaDownloader<T>,
@@ -735,8 +620,6 @@ async fn run_stream<S, T>(
         return;
     }
 
-    // The pictures belong to this stream, so their downloads are cancelled with it: a stream
-    // that is replaced stops fetching what it was fetching.
     let mut media = MediaSet::new(downloader, CancellationToken::new());
     let exit = serve(session, &publisher, wanted, retries, &mut media).await;
     media.shutdown().await;
@@ -745,7 +628,6 @@ async fn run_stream<S, T>(
     }
 }
 
-/// Serves one subscription until it ends, holding the stream's pictures as it goes.
 async fn serve<S, T>(
     session: S,
     publisher: &StreamPublisher<TweetProtocol>,
@@ -774,9 +656,6 @@ where
     let mut state = TweetState::new();
     let mut revision = 0;
 
-    // The timeline already on the wire is what the subscription will add to, so it is read
-    // first and published before any status: a pane that becomes ready holds the history, and
-    // a history that could not be read is why it never becomes ready at all.
     let history = tokio::select! {
         biased;
         () = publisher.cancelled() => return StreamExit::Cancelled,
@@ -816,7 +695,6 @@ where
     .await
 }
 
-/// Files everything one history read holds, in the order that keeps authors resolvable.
 fn accept_history(state: &mut TweetState, batch: XTweetBatch) {
     for tweet in batch.tweets {
         state.push(tweet);
@@ -828,11 +706,6 @@ fn accept_history(state: &mut TweetState, batch: XTweetBatch) {
     state.prune_profiles();
 }
 
-/// Serves one live subscription until it ends.
-///
-/// The workspace allows `too_many_arguments`, so the long parameter list is a
-/// deliberate part of this loop's shape: each receiver is a different seam the
-/// subscription turns on, and bundling them would hide which one woke it.
 async fn run_subscription<Sub, T>(
     subscription: &mut Sub,
     status: &mut watch::Receiver<SubscriptionStatus>,
@@ -867,8 +740,6 @@ where
             finished = media.active.join_next_with_id(), if !media.active.is_empty() => {
                 match finished {
                     Some(finished) => StreamInput::Media(finished),
-                    // The guard is what says a download is running, so an empty join set here
-                    // is a task that settled between the two reads.
                     None => continue,
                 }
             }
@@ -885,7 +756,6 @@ where
                     return StreamExit::Cancelled;
                 }
             }
-            // A run loop that dropped the sender is a stream nobody is holding any more.
             StreamInput::Wanted(false) => return StreamExit::Cancelled,
             StreamInput::Wanted(true) => {
                 let urls = wanted.borrow_and_update().clone();
@@ -908,14 +778,9 @@ where
                 }
             }
             StreamInput::Event(event) => {
-                // A replaced stream is a stream whose account nobody is reading any more, so
-                // what it delivers is not converted either.
                 if publisher.is_cancelled() {
                     return StreamExit::Cancelled;
                 }
-                // A tweet already on the wire belongs to the credentials the subscription was
-                // opened with. If those are gone, so is the pane's standing to read it, and the
-                // subscription's own status is what says so.
                 let current = status.borrow_and_update().clone();
                 if let Some(error) = ended_subscription(&current) {
                     return StreamExit::Failed(error);
@@ -932,9 +797,6 @@ where
                 if !changed && !pruned {
                     continue;
                 }
-                // Only a new tweet can want a picture nothing wanted before: a profile that was
-                // corrected is the same URL, and one that was pruned takes its picture with it
-                // as the timeline it belonged to moves on.
                 if changed {
                     media.reconcile(state.media_urls());
                 }
@@ -946,29 +808,23 @@ where
     }
 }
 
-/// One thing a subscription loop can wake up for.
 enum StreamInput {
     Cancelled,
-    /// The pane's pictures changed, or the run loop let go of them.
     Wanted(bool),
-    /// The subscription's status changed, or its sender was dropped.
     Status(bool),
     Event(Result<XSubscriptionEvent, TransportError>),
     Retry(SmolStr),
     Media(MediaTaskResult),
 }
 
-/// One finished download, as the join set reports it.
 type MediaTaskResult =
     Result<(tokio::task::Id, (SmolStr, Result<PathBuf, MediaError>)), tokio::task::JoinError>;
 
-/// Why a stream stopped.
 enum StreamExit {
     Cancelled,
     Failed(TweetStreamError),
 }
 
-/// Publishes the timeline and the pictures it wants, one revision newer.
 fn publish_update<T>(
     publisher: &StreamPublisher<TweetProtocol>,
     state: &mut TweetState,
@@ -982,7 +838,6 @@ where
     publisher.publish_latest(TweetStreamMessage::Update(update(*revision, state, media)))
 }
 
-/// The message one frame draws.
 fn update<T>(revision: u64, state: &mut TweetState, media: &MediaSet<T>) -> TweetUpdate
 where
     T: MediaTransport,
@@ -994,10 +849,6 @@ where
     }
 }
 
-/// Applies one subscription status, publishing what it means to the pane.
-///
-/// Returns whether the stream may keep running: a status that ended it has already published
-/// why, and the task settles on the pane that will replace it.
 async fn apply_subscription_status(
     publisher: &StreamPublisher<TweetProtocol>,
     status: &SubscriptionStatus,
@@ -1008,16 +859,12 @@ async fn apply_subscription_status(
         return false;
     }
     match status {
-        // A closing subscription is on its way to a terminal status of its own, and that is
-        // where the failure is reported from.
         SubscriptionStatus::Closing => true,
         SubscriptionStatus::Connecting | SubscriptionStatus::Reconnecting => {
             publish_change(publisher, TweetStatus::Connecting, published)
                 .await
                 .is_ok()
         }
-        // The timeline was published with the history it was read from, so being live is all
-        // that is left to say: a reconnect does not make the tweets a pane already has new.
         SubscriptionStatus::Active => publish_change(publisher, TweetStatus::Ready, published)
             .await
             .is_ok(),
@@ -1025,7 +872,6 @@ async fn apply_subscription_status(
     }
 }
 
-/// Why a subscription is no longer one a tweet may be read from.
 fn ended_subscription(status: &SubscriptionStatus) -> Option<TweetStreamError> {
     match status {
         SubscriptionStatus::Closed => Some(TweetStreamError::Transport(TransportError::Closed)),
@@ -1037,7 +883,6 @@ fn ended_subscription(status: &SubscriptionStatus) -> Option<TweetStreamError> {
     }
 }
 
-/// Publishes a status the pane has not been told yet.
 async fn publish_status(
     publisher: &StreamPublisher<TweetProtocol>,
     status: TweetStatus,
@@ -1047,7 +892,6 @@ async fn publish_status(
         .await
 }
 
-/// Publishes a status change, if it is one.
 async fn publish_change(
     publisher: &StreamPublisher<TweetProtocol>,
     status: TweetStatus,
@@ -1061,25 +905,16 @@ async fn publish_change(
     Ok(())
 }
 
-/// Publishes the failure a stream ended with, and holds the account it took.
-///
-/// A terminal failure is not retried: the pane asks for a new stream when the user takes the
-/// recovery, and until then this task stays where it is so the framework still sees the
-/// account as taken — and so the accounts it monitors can still be read and changed, which is
-/// the other half of what the session was taken for.
 async fn publish_failure(publisher: &StreamPublisher<TweetProtocol>, error: TweetStreamError) {
     let _ = publish_status(publisher, TweetStatus::Failed(error)).await;
     publisher.cancelled().await;
 }
 
-/// The pictures one stream is fetching, and what it knows about each.
 struct MediaSet<T> {
     downloader: MediaDownloader<T>,
     cancellation: CancellationToken,
     states: HashMap<SmolStr, MediaState>,
-    /// The pictures the tweets on screen want.
     timeline: HashSet<SmolStr>,
-    /// The pictures the pane asked for on a dialog's behalf.
     auxiliary: HashSet<SmolStr>,
     pending: VecDeque<SmolStr>,
     active: JoinSet<(SmolStr, Result<PathBuf, MediaError>)>,
@@ -1103,19 +938,16 @@ where
         }
     }
 
-    /// Replaces the timeline's own pictures, returning whether anything changed.
     fn reconcile(&mut self, urls: Vec<SmolStr>) -> bool {
         self.timeline = urls.into_iter().collect();
         self.refresh()
     }
 
-    /// Replaces the pictures a dialog asked for, returning whether anything changed.
     fn replace_auxiliary(&mut self, urls: Arc<[SmolStr]>) -> bool {
         self.auxiliary = urls.iter().cloned().collect();
         self.refresh()
     }
 
-    /// Forgets what nothing wants any more and queues what is new.
     fn refresh(&mut self) -> bool {
         let mut wanted = HashSet::with_capacity(self.timeline.len() + self.auxiliary.len());
         wanted.extend(self.timeline.iter().cloned());
@@ -1127,8 +959,6 @@ where
         changed |= self.states.len() != known;
         self.pending.retain(|url| wanted.contains(url));
 
-        // A queued picture is one whose state is loading, so nothing is fetched twice: what a
-        // picture that is already on its way needs is nothing.
         for url in wanted {
             if !self.states.contains_key(&url) {
                 self.states.insert(url.clone(), MediaState::Loading);
@@ -1139,7 +969,6 @@ where
         changed
     }
 
-    /// Queues one failed picture again.
     fn retry(&mut self, url: &str) -> bool {
         if self.states.get(url) != Some(&MediaState::Failed) {
             return false;
@@ -1149,7 +978,6 @@ where
         true
     }
 
-    /// Starts as many downloads as the concurrency allows.
     fn fill(&mut self) {
         while self.active.len() < MEDIA_CONCURRENCY {
             let Some(url) = self.pending.pop_front() else {
@@ -1170,10 +998,6 @@ where
         }
     }
 
-    /// Files one finished download, returning whether it changed what a frame draws.
-    ///
-    /// A download nobody wants any more is dropped: the timeline moved on while it was in
-    /// flight, and what it fetched is not a picture any tweet on screen names.
     fn finish(&mut self, result: MediaTaskResult) -> bool {
         let (id, outcome) = match result {
             Ok((id, outcome)) => (id, Some(outcome)),
@@ -1185,8 +1009,6 @@ where
         let url = match outcome.as_ref() {
             Some((url, _)) => url.clone(),
             None => {
-                // A task that panicked left no picture behind, and the URL it was for is the
-                // one this stream recorded when it started it.
                 log::debug!("a picture of {known} did not finish");
                 known.clone()
             }
@@ -1207,12 +1029,10 @@ where
         true
     }
 
-    /// Every picture state, as one shared map for the frame that draws them.
     fn states(&self) -> MediaStates {
         Arc::new(self.states.clone())
     }
 
-    /// Gives up on everything still running.
     async fn shutdown(&mut self) {
         self.cancellation.cancel();
         while self.active.join_next().await.is_some() {}
@@ -1222,13 +1042,6 @@ where
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -1394,12 +1207,10 @@ mod tests {
             .collect()
     }
 
-    /// The picture state one URL is in, if it is one the stream is tracking.
     fn picture(update: &TweetUpdate, url: &str) -> Option<MediaState> {
         update.media().get(url).cloned()
     }
 
-    /// A running service with one account taken and its subscription live.
     async fn live(
         source: &FakeSource,
         transport: FakeTransport,
@@ -1418,7 +1229,6 @@ mod tests {
         (runtime, reliable, latest)
     }
 
-    /// A session, its subscription and a live service over both.
     async fn subscribed(
         transport: FakeTransport,
         cache: MediaCache,
@@ -1512,8 +1322,6 @@ mod tests {
             }
             other => panic!("the refusal should be the account, not {other:?}"),
         }
-        // The history was read by the stream; what the other account's request did not do is
-        // reach the session at all.
         let counts = session.state();
         assert_eq!(counts.history_reads, 1);
         assert_eq!(counts.fetches, 0);
@@ -1647,14 +1455,11 @@ mod tests {
             live(&source, FakeTransport::blocking(), cache).await;
         let avatar = "https://pbs.twimg.com/seven.jpg";
 
-        // The timeline wants the author's face, and its own update is where that shows.
         next_update(&mut latest, |update| {
             picture(update, "https://pbs.twimg.com/kytrix.jpg").is_some()
         })
         .await;
 
-        // Reading the monitored accounts does not make their faces pictures any frame wants:
-        // nothing is showing them.
         fetch(&runtime, scope())
             .await
             .expect("the read should answer");
@@ -1778,8 +1583,6 @@ mod tests {
             vec![tweet_with_media("1", 1, url.as_str())],
             vec![profile("42", "kytrix")],
         );
-        // The transport refuses and the cache is empty, so the first fetch fails. The picture
-        // is put on disk afterwards, which is what a retry then finds.
         let (runtime, _reliable, mut latest) =
             live(&source, FakeTransport::failing(), cache.clone()).await;
         next_update(&mut latest, |update| {
@@ -1818,14 +1621,11 @@ mod tests {
         );
         let (_runtime, _reliable, mut latest) =
             live(&source, FakeTransport::blocking(), cache).await;
-        // A picture that is still being fetched is one the stream is tracking.
         next_update(&mut latest, |update| {
             picture(update, url.as_str()) == Some(MediaState::Loading)
         })
         .await;
 
-        // A timeline that fills up and keeps going drops its oldest tweet, which takes that
-        // tweet's picture with it.
         for index in 2..MAX_TWEETS + 2 {
             control
                 .events
@@ -1851,7 +1651,6 @@ mod tests {
 
         session.answer_history(Vec::new(), vec![profile("42", "kytrix")]);
         session.subscribe();
-        // The account is taken again for the replacement, which is a second session of it.
         let replacement = source.session(ACCOUNT);
         replacement.answer_history(Vec::new(), vec![profile("42", "kytrix")]);
         replacement.subscribe();

@@ -1,10 +1,3 @@
-//! The public surface a widget builds a market request from.
-//!
-//! A candlestick or perpetual-statistics builder is chosen by its interval, so a
-//! caller outside this crate has to be able to name the interval types. These
-//! tests are the outside view: they compile only if the market facade really
-//! exposes them, which is what a widget's own build depends on.
-
 use std::sync::Arc;
 
 use app_config_provider::notification::ConfigNotification;
@@ -22,8 +15,6 @@ use market_participants_model::{
 };
 use network::transport::hub::{TransportHub, TransportPolicy};
 
-/// The candlestick intervals a caller can name, with the wire spellings the
-/// crate's own queries serialize them to.
 #[test]
 fn the_market_facade_exposes_the_candlestick_intervals() {
     let intervals = [
@@ -53,8 +44,6 @@ fn the_market_facade_exposes_the_candlestick_intervals() {
     }
 }
 
-/// The statistics intervals are nameable too, and their labels are the closed set
-/// a statistics builder can be chosen by.
 #[test]
 fn the_market_facade_exposes_the_statistics_intervals() {
     let intervals = [
@@ -84,12 +73,6 @@ fn the_market_facade_exposes_the_statistics_intervals() {
     assert_eq!(labels.len(), distinct, "every interval has its own label");
 }
 
-/// The adjustment conventions a candlestick request can carry, with the
-/// spellings they serialize to.
-///
-/// A caller persists the convention it charted with, so the spelling is wire
-/// schema just as an interval's is, and the default has to be the one convention
-/// every route can honestly serve.
 #[test]
 fn the_market_facade_exposes_the_adjustment_conventions() {
     let conventions = [(Adjustment::None, "none"), (Adjustment::Forward, "forward")];
@@ -109,8 +92,6 @@ fn the_market_facade_exposes_the_adjustment_conventions() {
     );
 }
 
-/// A connector built from typed runtime inputs, so a test can reach the market
-/// facade without a venue answering.
 fn connector() -> MarketParticipantsConnector {
     let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
     let notification = ConfigNotification::new(snapshot);
@@ -124,11 +105,6 @@ fn connector() -> MarketParticipantsConnector {
     .expect("MarketParticipantsConnector should build from typed runtime inputs")
 }
 
-/// The prediction order-book methods take the model's own event, legs and leg.
-///
-/// This is the outside view of that seam: the calls below compile only with
-/// those typed arguments, and no protocol query type from the crate's internal
-/// namespace is nameable here. Nothing is polled, so no request reaches a venue.
 #[test]
 fn the_market_facade_takes_the_prediction_order_book_by_its_own_types() {
     let connector = connector();
@@ -150,8 +126,6 @@ fn the_market_facade_takes_the_prediction_order_book_by_its_own_types() {
         native_event: IdentifierValue::new("1262243").expect("the event id is valid"),
     };
 
-    // Building the futures is the whole check: the arguments are typed, and
-    // nothing is polled, so no request reaches a venue.
     let _fetch = capability.fetch_prediction_order_book(event.clone(), Vec::new(), leg.clone());
     let _subscribe = capability.subscribe_prediction_order_book(event, Vec::new(), leg);
 }

@@ -1,29 +1,3 @@
-//! `window` / `idle` 模式：真机真窗口。
-//!
-//! # 帧间隔口径（写进报告，避免与 HUD 的 FPS 对不上）
-//!
-//! 测量点是 **UI 线程提交帧**（`FrameOutcome::Committed` 的时刻，commit → commit），不是
-//! 「GPU 完成」也不是「上屏」：
-//!
-//! - **驱动**：一个按目标刷新率（`--hz`，默认 60）节拍的数据泵线程（混合 sleep + 1 ms 自旋，
-//!   精度 ~0.1 ms）。每个节拍给 UI 线程投一次「增量帧更新」；UI 线程在钩子里应用更新并提交一帧。
-//!   这样测的是「数据以 60/120 Hz 到达时，引擎能否稳定每拍交一帧」——市场数据类界面的真实形态。
-//!   为什么不用「每次泵循环都写状态」：那会自己唤醒自己（写状态 ⇒ `request_frame` ⇒ 唤醒 ⇒
-//!   再写），实测变成 ~300 fps 的忙循环，测到的就不是刷新节拍了。
-//! - **present 级观测（A4）**：`App::last_frame_presentation` / `Window::recent_frame_presentations`
-//!   给出每帧的 `published_at / completed_at / presented_at`（`presented_at` 是真实上屏时刻的
-//!   **下界**：Windows 帧统计 / Linux `wp_presentation` / macOS display-link tick 推断）。本 harness
-//!   按 `FrameIndex` 增量消费最近若干帧的呈现快照，打印 `publish→presented` 的 p50/p99 与有值率。
-//!   `presented_at` 缺失（该端/该帧没有可信值）的帧计入「有值率」分母、不进 e2e 样本。
-//!   **阈值先测量后定**（目标 ≤2 vsync @60 Hz，即 p99 ≤ ~33 ms）：本 harness 只输出测量值，
-//!   不把它并入本次 PASS/FAIL（A2 的帧预算落地后再定门禁）。
-//!
-//! # 为什么钩子里自己提交一帧
-//!
-//! 泵的 `frame_all` 只在「有唤醒 / 平台节拍」时出帧，外面拿不到「本帧 CPU 起点」。钩子里的
-//! `App::frame` 让我们能同时测到 **UI 线程帧内 CPU**（样式 → 文本 → 布局 → 绘制 → 发布；
-//! 真实窗口的实例编码在合成线程）。泵随后那次 `frame` 因为没有脏位而退化为 `Idle`。
-
 use std::{
     cell::Cell,
     rc::Rc,
@@ -47,32 +21,23 @@ use crate::{
     scene::{self, Load},
 };
 
-/// 帧间隔抖动上限（毫秒；相对**目标间隔**的 RMS 偏差）。
 const MAX_JITTER_MS: f64 = 1.0;
-/// 掉拍判据：间隔 ≥ 目标间隔的 1.5 倍（漏了至少一拍）。
 const MISSED_FACTOR: f64 = 1.5;
-/// 进度打印间隔。
 const PROGRESS: Duration = Duration::from_secs(5);
 
-/// 真实窗口模式的运行状态。
 struct WindowRun {
     warmup: Duration,
     duration: Duration,
     started: Instant,
     measure_at: Instant,
     deadline: Instant,
-    /// 目标间隔（微秒；`--hz` 的倒数）。
     target_us: f64,
     intervals: Samples,
     frame_cpu: Samples,
     update_cpu: Samples,
-    /// `publish → presented`（上屏时刻下界）的 e2e 样本（A4；微秒）。
     e2e_presented: Samples,
-    /// 已结算（有反馈且不再变化）的呈现快照帧数（有值率分母）。
     presentation_observed: usize,
-    /// 其中 `presented_at` 有值的帧数（有值率分子）。
     presentation_presented: usize,
-    /// 已消费到的最后一条呈现快照的 `FrameIndex`（增量消费游标）。
     presentation_cursor: Option<u32>,
     commits: usize,
     last_commit: Option<Instant>,
@@ -88,7 +53,6 @@ impl WindowRun {
         let duration = Duration::from_secs_f64(config.window_seconds.max(0.1));
         let measure_at = started + warmup;
         let deadline = measure_at + duration;
-        // 容量按「目标频率 × 1.5」估算（比目标快 50% 也不扩容）。
         let capacity = (duration.as_secs_f64() * f64::from(config.hz) * 1.5).ceil() as usize + 8;
         Self {
             warmup,
@@ -112,11 +76,6 @@ impl WindowRun {
         }
     }
 
-    /// 增量消费窗口上最近若干帧的呈现快照（A4）。
-    ///
-    /// 结算口径：`presented_at` 有值 ⇒ 立即结算；没有值但要等它「后面已经又来了 2 帧反馈」
-    /// 才判为 `None`（Linux 的 `wp_presentation` 事件晚于反馈一个 vsync 左右到达，不能过早
-    /// 判死）。只统计测量窗口内提交的帧（`published_at ≥ measure_at`）。
     fn observe_presentations(&mut self, app: &App, window: WindowId) {
         let Some(target) = app.window(window) else {
             return;
@@ -140,7 +99,6 @@ impl WindowRun {
                 || latest.saturating_sub(index) >= 2
                 || presentation.published_at < self.deadline - Duration::from_millis(50);
             if !settled {
-                // 保持帧序：前面的还没结算，后面的不能先消费（否则 e2e 会被错配）。
                 break;
             }
             self.presentation_cursor = Some(index);
@@ -157,7 +115,6 @@ impl WindowRun {
         }
     }
 
-    /// 记录一帧（`now` = 提交时刻）。
     fn observe(&mut self, now: Instant, update: Duration, frame: Duration) {
         self.commits += 1;
         if now < self.measure_at {
@@ -179,15 +136,9 @@ impl WindowRun {
         }
     }
 
-    /// 打印报告；返回 `true` = 帧率、抖动与帧预算门禁都达标。
-    ///
-    /// `refresh_hz` = 平台上报的窗口所在 output 刷新率提示（A5；`None` = 平台没给，门禁禁用）；
-    /// `deferrals` = 累计被预算门禁推迟的请求数（证明「合并到下一拍」真的发生过）。
     fn report(&self, hz: u32, refresh_hz: Option<f32>, deferrals: u64) -> bool {
         let elapsed = self.started.elapsed().as_secs_f64();
         println!();
-        // RA-3：刷新率提示在**平台注入之后**（`Application::run` 已启动、泵已跑过）打印，
-        // 与测量/推迟计数同点，日志自洽（旧实现在 `run` 之前打印 ⇒ 恒显示「禁用」）。
         match refresh_hz {
             Some(hz) => println!("帧预算门禁：刷新率提示 {hz:.1} Hz（写入快于刷新时合并到下一拍）"),
             None => println!(
@@ -210,7 +161,6 @@ impl WindowRun {
         };
         println!("{}", report.lines());
 
-        // 相对**目标间隔**（而不是中位数）的抖动：漏拍会同时抬高它和掉拍计数。
         let target = self.target_us;
         let rms = (self
             .intervals
@@ -238,7 +188,6 @@ impl WindowRun {
         );
         println!("测量期吞吐          {throughput:.2} fps（帧数 / 测量时长）");
         println!();
-        // A4：publish → presented（上屏时刻下界）的 e2e 分布与有值率。
         println!("-- A4 e2e 呈现（publish → presented；presented 是真实上屏时刻的下界） --");
         println!("{}", self.e2e_presented.line());
         let ratio = if self.presentation_observed == 0 {
@@ -275,8 +224,6 @@ impl WindowRun {
         println!();
         println!("-- 判定（真机窗口） --");
         let jitter_ok = rms <= MAX_JITTER_MS * 1e3;
-        // 60 Hz 目标：≥60 fps（60 Hz vsync 锁定的 59.9 视为达标）；
-        // 120 Hz 目标：测的是「能否稳定每 8.33 ms 交一帧」，达标口径同为 fps ≥ 目标频率 - 1。
         let fps_ok = throughput >= f64::from(hz) - 1.0;
         println!(
             "≥{hz} fps（吞吐）         实测 {throughput:.2} fps（门槛 ≥{:.0}）⇒ {}",
@@ -288,12 +235,6 @@ impl WindowRun {
             rms / 1e3,
             verdict(jitter_ok)
         );
-        // A5：帧预算门禁。写入快于刷新时（`--hz` > 刷新率），吞吐必须被钳到刷新率附近，
-        // 且必须观测到推迟（否则说明门禁没生效，UI 帧率 = 写入率）。
-        //
-        // 门槛 = 刷新率 × 1.15：预算门禁的相位带 10% 周期的提前量（吸收平台唤醒抖动，
-        // 保证同频写入稳定 60 fps，见 `window::frame_budget::FrameBudget::admits`），稳态
-        // 上限因此是 1/(0.9×周期) ≈ 1.11×刷新率；预留到 1.15 倍余量。
         let budget_ok = match refresh_hz {
             Some(refresh) if f64::from(hz) > f64::from(refresh) + 1.0 => {
                 let limit = f64::from(refresh) * 1.15;
@@ -333,7 +274,6 @@ impl WindowRun {
     }
 }
 
-/// 跑 `window` 模式；返回 `true` = 帧率与抖动达标。
 pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -369,24 +309,15 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         println!("Debug HUD：本二进制未以 --features hud 构建，忽略 --hud");
     }
 
-    // 首帧：全量（让窗口先有内容）。
     let _ = app.frame(window);
-    // 注意：此刻还没有原生窗口（`Application::run` 尚未启动），平台刷新率提示不可用；
-    // 预算门禁的提示在 `report()`（计数/判定同点）打印，避免「先禁用、后启用」的误导日志（RA-3）。
     let mut run = WindowRun::new(config);
     let passed = Rc::new(Cell::new(false));
     let result_slot = Rc::clone(&passed);
 
-    // 数据泵：按目标刷新率投递「本拍该更新」的信号（混合 sleep + 1 ms 自旋保证精度）。
     let pending = Arc::new(AtomicU32::new(0));
     let stop_pump = Arc::new(AtomicBool::new(false));
     let hz = config.hz.max(1);
-    // 关闭时自唤醒一次：钩子跑在泵的 ④ 步（关闭检查在 ③），不补一拍唤醒的话泵会在
-    // `GetMessageW` 上永久阻塞（窗口已从 `App` 移除，但没有新的唤醒到达）。
     let close_handle = app.handle();
-    // 数据泵**必须在 `Application::run` 装好平台唤醒目标之后**才启动：macOS 的 run loop
-    // source 是在 `run()` 里安装的，提前从其它线程 `wake()` 会踩到未初始化的唤醒目标
-    // （实测 SIGSEGV）。因此线程在第一次帧钩子里懒启动。
     let pump_handle = app.handle();
     let mut pump_started = false;
     app.on_frame(move |app| {
@@ -403,9 +334,7 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
             return;
         }
         let now = Instant::now();
-        // A4：每轮都增量消费一次呈现快照（presented 事件可能晚于反馈到达，不能只在提交时读）。
         run.observe_presentations(app, window);
-        // 只应用「一拍」：积压的节拍合并成一次更新（最新值胜），与真实行情的合并语义一致。
         if pending.swap(0, Ordering::AcqRel) > 0 {
             let update_started = Instant::now();
             load.incremental_step(app);
@@ -444,10 +373,6 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     });
 
     Application::new().run(app)?;
-    // C4 设备恢复的注入验收（macOS + test-support）：`KYTRIX_METAL_INJECT_DEVICE_LOST=1` 让
-    // GPU 线程在首个有待画帧的 tick 发布一次 `DeviceLost`。恢复成功后进程仍正常退出（exit 0），
-    // 且 `GpuCore` 恰好重建一次（首次创建 = 1，恢复一次 ⇒ 2）；恢复失败/超限会让 `run` 返回
-    // `Err`、进程以 exit 2 退出，走不到这一行。
     #[cfg(all(target_os = "macos", feature = "test-support"))]
     println!(
         "metal_gpu_core_generation={}（首次创建=1；设备恢复一次 ⇒ 2）",
@@ -456,13 +381,6 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(passed.get())
 }
 
-/// 数据泵线程：按 `hz` 的节拍置位「本拍该更新」并唤醒 UI 线程。
-///
-/// 混合 sleep + 1 ms 自旋：`Sleep` 在 Windows 上的默认精度是 15.6 ms，纯 sleep 会产生
-/// 十几毫秒的相位误差；自旋只覆盖最后 1 ms（占空比 ~6%，且在独立线程上，不进 UI 帧计时）。
-///
-/// # Panics
-/// 线程创建失败（进程已无法继续验收）。
 fn spawn_data_pump(handle: AppHandle, pending: Arc<AtomicU32>, stop: Arc<AtomicBool>, hz: u32) {
     let period = Duration::from_secs_f64(1.0 / f64::from(hz));
     std::thread::Builder::new()
@@ -484,7 +402,6 @@ fn spawn_data_pump(handle: AppHandle, pending: Arc<AtomicU32>, stop: Arc<AtomicB
                         std::hint::spin_loop();
                     }
                 } else {
-                    // 落后了（上一拍被抢占）：立刻补一拍并重新对齐相位。
                     next = now;
                 }
                 pending.fetch_add(1, Ordering::AcqRel);
@@ -494,7 +411,6 @@ fn spawn_data_pump(handle: AppHandle, pending: Arc<AtomicU32>, stop: Arc<AtomicB
         .expect("data pump thread");
 }
 
-/// 跑 `idle` 模式：窗口静止（无动画、无脏位）时测进程 CPU；返回 `true` = <1%。
 pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -513,7 +429,6 @@ pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     print_environment(&app, window);
     println!("{}", load.describe(&app));
     println!("pid={}", std::process::id());
-    // 首帧：把 5000 行 / 500 笔 / 20 万点全部提交一次，然后**不再写任何状态**。
     let _ = app.frame(window);
     println!(
         "首帧已提交；不安装动画 ⇒ `needs_continuous_frames=false`，泵阻塞在消息等待（零唤醒）。\
@@ -528,8 +443,6 @@ pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     app.on_frame(move |app| {
         if stop_hook.load(Ordering::Acquire) {
             let _ = app.close_window(window);
-            // 钩子在泵的 ④ 步、关闭检查在 ③ 步：自己补一拍唤醒，否则泵在关闭后
-            // 还会阻塞在 `GetMessageW` 上。
             close_handle.wake();
         }
     });
@@ -567,7 +480,6 @@ pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(passed.load(Ordering::Acquire))
 }
 
-/// 打印测量环境（OS / 核数 / 窗口尺寸 / DPI）。
 fn print_environment(app: &App, window: WindowId) {
     let size = app.window(window).map(|window| window.size());
     let scale = app.window(window).map(|window| window.scale().factor());
@@ -581,7 +493,6 @@ fn print_environment(app: &App, window: WindowId) {
     );
 }
 
-/// PASS / FAIL 标记。
 fn verdict(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
 }

@@ -1,8 +1,3 @@
-//! ⑥ 图片与滚动：内嵌 PNG（1:1 / 2×）+ 20 行滚动列表
-//!
-//! 两个能力都是 P13 / P10 已有的公开面：`ResourceCache::insert`（PNG → 解码 → 线性预乘 → 图集 tile）
-//! 与 `App::{make_scroll, set_scroll_content}`（自带 clip 的滚动容器）。
-
 use smol_str::SmolStr;
 use ui_core::{
     a11y::{A11yOverride, A11yRole},
@@ -21,11 +16,6 @@ use ui_core::{
 
 use super::{DIM_RGBA, TRACK_RGBA, card, color, text_style};
 
-/// 内嵌的 16×16 PNG（四个 8×8 象限，alpha = 255 / 170 / 85 / 0）。
-///
-/// P13 的 `ResourceCache` 生产消费者：解码 → 线性预乘 → sRGB 编码 → 图片图集 tile → 页上传 → 采样，
-/// 一条路径全部覆盖（`--features snapshot` 时像素可看）。生成方式：用 `image` 把 16×16 的
-/// 四象限 RGBA 编码成 PNG 后粘贴字节（无外部资产依赖）。
 const ICON_PNG: [u8; 189] = [
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0xF3, 0xFF,
@@ -41,25 +31,16 @@ const ICON_PNG: [u8; 189] = [
     0xFE, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
-/// 两个图片节点的逻辑矩形（1:1 与 2× 放大；相对卡片）。
 const ICON_SLOTS: [(f32, f32, f32); 2] = [(18.0, 40.0, 16.0), (44.0, 40.0, 32.0)];
 
-/// 两个图片的替代文本（自绘节点缺替代文本会被引擎标 `hidden` 并记诊断）。
 const ICON_LABELS: [&str; 2] = ["Kytrix 图标（16×16，1:1）", "Kytrix 图标（2× 放大）"];
 
-/// 滚动容器（相对卡片）与行高。
 const SCROLL_RECT: (f32, f32, f32, f32) = (18.0, 82.0, 276.0, 126.0);
 
-/// 行数。
 const ROW_COUNT: usize = 20;
 
-/// 行高。
 const ROW_HEIGHT: f32 = 24.0;
 
-/// 建图标 + 滚动列表；不产生可聚焦节点。
-///
-/// `origin` 是卡片在窗口里的绝对原点：`Canvas` 内部的图元坐标是**绝对窗口逻辑像素**
-/// （`paint::primitive` 的契约），与 `LayoutOverride` 的父相对坐标不同，必须显式平移。
 pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, origin: Point) {
     let icon = app
         .resources_mut()

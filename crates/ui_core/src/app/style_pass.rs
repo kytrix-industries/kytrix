@@ -1,7 +1,3 @@
-//! 样式求值 pass、脏标记失效、动作 handler 表与键盘绑定表。
-//!
-//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
-
 use smallvec::{SmallVec, smallvec};
 
 use super::{App, StylePassReport};
@@ -18,10 +14,6 @@ use crate::{
     window::WindowId,
 };
 
-// ── P10：动作（Action）与键盘绑定 ──────────────────────────────────────────
-
-/// 注册/替换一个动作的处理器（同 `Action` 后写覆盖）。
-/// 消费者：`App::on_action`。
 pub(crate) fn on_action(
     app: &mut App,
     action: Action,
@@ -30,27 +22,15 @@ pub(crate) fn on_action(
     app.handlers.insert(action, Box::new(handler));
 }
 
-/// 删除处理器（返回是否真的删了）。
-/// 消费者：`App::off_action`。
 pub(crate) fn off_action(app: &mut App, action: &Action) -> bool {
     app.handlers.remove(action).is_some()
 }
 
-/// 仅测试（`test-support`）：某个动作当前是否注册了处理器。
-///
-/// 组件 `release` 清理的**直接证据面**：泄漏的 handler 不一定会 panic（`ctx.update` 对死
-/// 句柄是 no-op、滚动条 handler 只写引擎状态），所以「重放输入不 panic」不足以证明表项被摘掉。
-/// 消费者：`App::has_action_handler`（base_ui release 测试）。
 #[cfg(feature = "test-support")]
 pub(crate) fn has_action_handler(app: &App, action: &Action) -> bool {
     app.handlers.contains_key(action)
 }
 
-/// 仅测试（`test-support`）：某个 `(window, scope)` 上剩余的焦点作用域化键绑定条数。
-///
-/// `App::unbind_scope_keys` 的直接证据面（树 release）：只删除绑定时重放按键不会 panic
-/// （handler 已摘 ⇒ 不消费、回落默认行为），因此必须观察表项本身。
-/// 消费者：`App::scoped_key_binding_count`（base_ui `Tree::release` 测试）。
 #[cfg(feature = "test-support")]
 pub(crate) fn scoped_binding_count(
     app: &App,
@@ -63,8 +43,6 @@ pub(crate) fn scoped_binding_count(
         .count()
 }
 
-/// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。
-/// 消费者：`App::bind_key`。
 pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {
     app.bindings.retain(|existing| {
         !(existing.key == binding.key && existing.modifiers == binding.modifiers)
@@ -72,11 +50,6 @@ pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {
     app.bindings.push(binding);
 }
 
-/// 添加/替换一条焦点作用域化的键盘绑定（同 `(window, scope, key, modifiers)` 后写覆盖）。
-///
-/// 注册前校验窗口与 `scope` 节点：**永不命中**的绑定必须在注册期拒绝（否则表项会一直留到
-/// 窗口关闭，见 `App::bind_key_scoped` 的清理契约）。
-/// 消费者：`App::bind_key_scoped`。
 pub(crate) fn bind_key_scoped(
     app: &mut App,
     window: crate::window::WindowId,
@@ -87,7 +60,6 @@ pub(crate) fn bind_key_scoped(
     let Some(target) = app.windows.get(&window) else {
         return Err(EngineError::UnknownWindow { window });
     };
-    // `NodeId` 携带窗口身份：另一窗口的节点在这里确定性失败（`StaleNode`），不会串窗命中。
     target.tree().get(scope)?;
     app.scoped_bindings.retain(|existing| {
         !(existing.window == window
@@ -103,8 +75,6 @@ pub(crate) fn bind_key_scoped(
     Ok(())
 }
 
-/// 删除一条 scoped 绑定（返回是否真的删了）。
-/// 消费者：`App::unbind_key_scoped`。
 pub(crate) fn unbind_key_scoped(
     app: &mut App,
     window: crate::window::WindowId,
@@ -122,8 +92,6 @@ pub(crate) fn unbind_key_scoped(
     app.scoped_bindings.len() != before
 }
 
-/// 删除某个 scope 在某个窗口上的**全部** scoped 绑定，返回删除条数。
-/// 消费者：`App::unbind_scope_keys`（组件 `release` 不需要复述自己绑定过哪些键）。
 pub(crate) fn unbind_scope_keys(
     app: &mut App,
     window: crate::window::WindowId,
@@ -135,8 +103,6 @@ pub(crate) fn unbind_scope_keys(
     before - app.scoped_bindings.len()
 }
 
-/// 删除一条键盘绑定（返回是否真的删了）。
-/// 消费者：`App::unbind_key`。
 pub(crate) fn unbind_key(app: &mut App, key: KeyCode, modifiers: Modifiers) -> bool {
     let before = app.bindings.len();
     app.bindings
@@ -144,34 +110,6 @@ pub(crate) fn unbind_key(app: &mut App, key: KeyCode, modifiers: Modifiers) -> b
     app.bindings.len() != before
 }
 
-// ── 帧内：样式求值 pass ────────────────────────────────────────────────────
-
-/// P03 的「样式求值 pass」：对指定窗口中**带 `BIND`** 的节点求值。
-///
-/// 它做四件事：求值闭包、差分替换依赖、写回 patch、按需升级 `LAYOUT` / 标 `A11Y`。
-/// **不产生任何 Scene 图元**（那是 P06 的 paint 阶段；两者共用本实现的前半段）。
-///
-/// 只遍历 `dirty_bind` 反向集合（R03-1 / R03-9）：旧实现每帧遍历全序 `order` 并对每个节点
-/// 查 `PAINT` 位 —— 既是 O(N)，又把"重算动态属性"和"重建 lane"压在同一个位上。
-///
-/// # R03-15 的结论（复核记录，防再被误判为"未修"）
-///
-/// 台账把它记为「每 pass 整体替换 deps + 每节点 clone old_patch」，但按代码逐项核对：
-/// - `DependencyGraph::replace_deps` **本身就是差量**：只对「旧有新无」退订、「新有旧无」订阅，
-///   相同的边既不删也不重加（`node/dependency.rs` 的同名方法与 `replace_deps_*` 单测）；
-/// - `tree.set_deps` 换的是 `SmallVec<[SignalId; 8]>`（内联 8），常规读者数下**零堆分配**；
-/// - `style_patch().clone()` 克隆的是 `StylePatch`：字段全是 `Copy`（`Option<Color>`/`Option<Border>`/
-///   `Option<f32>`/`Option<bool>`/`Option<Cursor>`/`bool`），clone 就是一次 ~40 B 的 memcpy。
-///
-/// 唯一真实的剩余成本是 `ReadTracker::record` 的线性查重（典型 1–5 个读者）—— 已作为
-/// **R03-5 的显式取舍**登记（测量驱动，不在 1–5 读者规模上引入 HashSet/位图）。
-/// 因此本条**不再有一次"整表重建"级别的开销可消**；如未来出现 >8 读者的节点，先动的是 R03-5。
-///
-/// 返回 `None` = 窗口不存在（P03 的冻结错误表里没有「未知窗口」变体，`Option` 是唯一诚实的表达）。
-/// P11 追加：`bind_a11y` 与另两条动态通道同批求值（同一 `ReadCtx` / `ReadTracker` / 依赖边集）。
-/// **只有** `bind_a11y` 的节点不在这里求值（R13-6）：它们走 `refresh_a11y_bindings`，不标
-/// `BIND`/`PAINT`（帧可以整段跳过像素管线）。
-/// 消费者：`App::refresh_styles`。
 pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePassReport> {
     let App {
         store,
@@ -191,7 +129,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
     let mut text_changed = 0usize;
     let nodes = tree.take_dirty_bind();
     for node in nodes.iter().copied() {
-        // 集合的成员资格是权威判据；防御性再确认一次位（`take` 之后位可能已被消费）。
         let needs_eval = tree
             .get(node)
             .is_ok_and(|n| n.dirty().contains(DirtyFlags::BIND));
@@ -206,10 +143,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
         let bind_text = tree.take_bind_text(node);
         let bind_a11y = tree.take_bind_a11y(node);
         if compute.is_none() && bind_text.is_none() && bind_a11y.is_none() {
-            // 闭包不见了 ⇒ 上次求值 **panic** 后没放回（`build` 之后必然有闭包）。
-            // 那次 pass 在 `replace_deps` 之前就中断了，所以节点仍带着**上一次成功的** deps：
-            // 它们是「幽灵边」—— 节点已不会再求值，但写这些信号仍会把它标脏。
-            // 这里显式退订，把状态收敛成「静态节点」。
             let ghost_deps = tree.deps(node).unwrap_or(&[]);
             graph.replace_deps(Owner::Node { window, node }, ghost_deps, &[]);
             tree.set_deps(node, SmallVec::new());
@@ -219,7 +152,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
 
         let (values, derived) = store.split();
         let mut tracker = ReadTracker::new();
-        // 作用域块结束即释放 `ReadCtx` 的借用（`ReadCtx` 不是 `Drop` 类型，不能用 `drop`）。
         let (patch, text_value, a11y_value, owner) = {
             let mut ctx = ReadCtx::new(
                 values,
@@ -259,12 +191,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
                 tree.mark_layout(node);
             }
             if a11y_changed {
-                // E15：`visible` / `interactive` 是**沿祖先链生效**的 a11y 输入 —— `focusable`
-                // （隐式 `Focus` 能力）与 `is_hidden` 都向上看祖先。祖先切换可见/可交互后，
-                // 后代的 `Focus` / `Click` 能力会翻转，但后代自己没有脏位；只标本节点时增量笔
-                // 与全树分叉（P2-4c2 / P2-4d2 的「增量缺 Focus」证据：浮层根 `visible` 一翻，
-                // 面板里的 `Tab` / `List` 容器在增量笔里仍是没有 Focus 的旧记录）。
-                // 整棵子树标 `A11Y`：只重发 a11y 快照字段，不产生像素工作、不清 `REUSABLE`。
                 tree.mark_subtree_a11y(node);
             }
         }
@@ -280,10 +206,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
                 .text_content(node)
                 .is_none_or(|content| content.text != value);
             if changed {
-                // v2.1 E2（`§11.2`）：只换整段 text/style，**保留** runs 与 inline_boxes
-                // （静态载荷不被动态文本清空）。新文本更短时按新长度裁剪 / 丢弃越界 runs，
-                // 并压诊断 —— 不静默改变样式归属（`clip_runs_to_text` 的返回值就是被改动的
-                // run 数）。
                 let mut content = tree
                     .text_content(node)
                     .cloned()
@@ -301,23 +223,13 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
                 text_changed_here = true;
             }
         }
-        // P11：`bind_a11y` 的差分与写回（与 `bind_style` 同一个依赖集，见方法文档）。
-        //
-        // E15b F2：这里是 `bind_a11y` 在**普通帧**里的第二份写点（节点同时有
-        // `bind_style`/`bind_text` 时帧走本 pass，不进 a11y-only pass）。必须与
-        // `refresh_a11y_bindings` 共用 `write_a11y_patch`：角色 / 隐藏变化会改变后代的
-        // 推导语义，只标本节点会让增量笔与全树分叉。
         if let Some(bind) = bind_a11y {
             let _ = crate::a11y::tree::write_a11y_patch(tree, node, a11y_value);
             tree.put_bind_a11y(node, bind);
         }
-        // `BIND` 的唯一清除点：本 pass 求值完即消费（`PAINT` 不归这里管）。
         tree.clear_bind(node);
         if text_changed_here {
-            // 文本变了 ⇒ 必须重画（`PAINT` 是 paint pass 的通道，本 pass 只登记）。
             tree.mark_paint(node);
-            // 文本节点的可访问名/值就是文本内容：内容变了 a11y 必须重发。只标 PAINT 时，
-            // 新字符串与旧串度量相同（例如 "70%" → "80%"）不会触发 LAYOUT，AT 会读到旧值。
             tree.mark_a11y(node);
         }
     }
@@ -327,7 +239,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
     let paint_dirty = tree.has_paint_work();
     Some(StylePassReport {
         evaluated,
-        // O(1)：读反向集合长度，不再为被丢弃的诊断字段做两次全树扫描（R03-1 / R01-4）。
         layout_dirty,
         paint_dirty,
         wake_requested: app.wake_requested,
@@ -336,8 +247,6 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
     })
 }
 
-/// 沿依赖图失效：节点标脏（或经派生级联），有节点变脏则置唤醒位。
-/// 消费者：`App::invalidate`。
 pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
     let App {
         store,
@@ -352,16 +261,6 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
         let Some(owners) = graph.dependents_mut(current) else {
             continue;
         };
-        // R01-5 的复核结论（代码注释即登记，防止再被当成"漏修"）：这里的两处开销都**不能删**：
-        //
-        // 1. `retain` 的逐 owner 存活检查是**惰性剔除**的唯一实现。死 owner（节点已卸载、arena
-        //    槽位已复用）只能在这里被发现 —— 引擎的卸载路径不逐信号摘边（`remove_node` 只解自己
-        //    那一层的边，`close_window` 是唯一的全量退订点）。删掉它，反查表会随节点回收无界增长，
-        //    且写一次信号就要为死 owner 付出一次 `windows.get`。若将来改为**卸载时立刻摘边**，
-        //    这里才能删；那是 R03-6 槽位回收的配套改动，不是本 pass 的局部优化。
-        // 2. `snapshot` 是 `SmallVec<[Owner; 8]>`：读者 ≤8 时**纯栈上**，无堆分配；超过 8 才
-        //    一次分配。它存在的原因是借用（`dependents_mut` 的可变借用不能在遍历中再次借用
-        //    `graph` 去做级联），不是"每次都要分配一份拷贝"。
         owners.retain(|owner| match owner {
             Owner::Node { window, node } => windows
                 .get(window)
@@ -381,18 +280,12 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
                     let Some(target) = windows.get_mut(&window) else {
                         continue;
                     };
-                    // P11 / R13-6：只有 `bind_a11y` 的节点（没有视觉绑定）被写信号时，**不得**
-                    // 进帧的像素通道：登记到 a11y 桥的待重算队列（不标 `BIND`/`PAINT`）。
-                    // 下一帧的 `refresh_a11y_bindings` 只重算 patch；帧本身按 a11y-only 结算
-                    // （不重建 lane / 不编码 / 不产生 damage）。
                     let a11y_only =
                         target.tree().has_a11y_bind(node) && !target.tree().has_visual_bind(node);
                     let affects_layout = target
                         .tree()
                         .get(node)
                         .is_ok_and(|n| n.style_patch().affects_layout);
-                    // `BIND` 是"重算动态属性"的唯一通道（R03-9）；`PAINT`/`LAYOUT`/`A11Y`
-                    // 是它可能引发的下游失效，三者按语义各自独立登记。
                     let alive = if a11y_only {
                         let queued = target.a11y_note_binding(node);
                         let marked = target.tree_mut().mark_a11y(node);
@@ -418,7 +311,6 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
     }
 
     if marked > 0 {
-        // 批处理内只登记推迟位（最外层 `App::batch` 结束时合并成一次请求）。
         app.request_frame();
     }
 }
@@ -442,7 +334,6 @@ mod tests {
         (runtime, app)
     }
 
-    /// v2.1 E2（`§11.2`）：`bind_text` 只换整段文本，**保留** runs（静态载荷不被清空）。
     #[test]
     fn bind_text_preserves_runs() {
         use crate::paint::color::Color;
@@ -479,8 +370,6 @@ mod tests {
         assert_eq!(content.runs()[1].style, red);
     }
 
-    /// v2.1 E2：新文本更短时按新长度裁剪 runs（不越界），并压 `TextRunClipped` 诊断
-    /// （不静默改变样式归属）。
     #[test]
     fn bind_text_crops_runs_to_the_new_text_and_diagnoses() {
         let (_runtime, mut app) = new_app();
@@ -519,7 +408,6 @@ mod tests {
         );
     }
 
-    /// v2.1 E2：inline_boxes 与 runs 在同一段文本上共存（静态载荷不互相覆盖）。
     #[test]
     fn bind_text_preserves_runs_and_inline_boxes_together() {
         let (_runtime, mut app) = new_app();

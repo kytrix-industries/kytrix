@@ -1,19 +1,3 @@
-//! Test seams for the updater's own tests: the engine host, the product catalogue,
-//! and a download manager that answers on demand.
-//!
-//! The harness is the same shape a non-widget application-layer crate uses
-//! (`instrument_selector_ui/src/test_support.rs`): a headless `TestApp`, the real
-//! `WidgetServices` aggregate assembled exactly as the composition root assembles it
-//! — with its own `Layer` / `FrameRouter` / `AnimationRouter` singletons — and one
-//! `drain` that runs the composition root's routes and then one engine frame. The
-//! updater is not a widget, so the contract layer's `WidgetTestApp` does not fit it.
-//!
-//! The download manager is a fake: the real one is still a toolkit entity, and what
-//! the updater depends on is the seam's contract — an added task, the events a
-//! manager publishes, and the operations answering whether they took. A test drives
-//! those events synchronously, so the download states are asserted without a
-//! network, a file system race or a wall clock.
-
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -47,10 +31,8 @@ use crate::{
     updater::{Updater, UpdaterDeps},
 };
 
-/// The key prefix the harness's controls are built with.
 pub(crate) const KEY: &str = "test.updater";
 
-/// The release the tests offer.
 pub(crate) fn release(version: &str) -> ReleaseInfo {
     ReleaseInfo {
         key: PlatformKey::current().expect("the tests run on a packaged platform"),
@@ -68,7 +50,6 @@ pub(crate) fn release(version: &str) -> ReleaseInfo {
     }
 }
 
-/// The same release with only the notes a test publishes.
 pub(crate) fn release_with_notes(notes: &[(&'static str, &'static str)]) -> ReleaseInfo {
     ReleaseInfo {
         notes: Some(ReleaseNotes::for_test(notes)),
@@ -76,19 +57,13 @@ pub(crate) fn release_with_notes(notes: &[(&'static str, &'static str)]) -> Rele
     }
 }
 
-/// How long a test waits for work that really runs asynchronously.
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
 
-/// The updater's test host.
 pub(crate) struct Harness {
     pub app: TestApp,
     pub services: Rc<WidgetServices>,
     pub router: Rc<FrameRouter>,
     pub layer: Rc<Layer>,
-    /// The runtime the updater's asynchronous work is spawned on.
-    ///
-    /// A current-thread runtime, driven explicitly by [`Harness::run_runtime`]: no
-    /// test depends on a worker thread finishing on its own.
     runtime: tokio::runtime::Runtime,
     downloads: Rc<FakeDownloads>,
     updater: Option<Updater>,
@@ -96,8 +71,6 @@ pub(crate) struct Harness {
 }
 
 impl Harness {
-    /// A 1280 × 900 host: the notes panel is 1040 px wide, so a smaller window would
-    /// not hold it.
     pub(crate) fn new() -> Self {
         let mut app = TestApp::with_options(WindowOptions {
             size: Size::new(1280.0, 900.0),
@@ -136,8 +109,6 @@ impl Harness {
         }
     }
 
-    /// Installs the updater over the harness's services, reading metadata from
-    /// `endpoint` when one is given.
     pub(crate) fn install_updater(&mut self, endpoint: Option<Url>) -> Updater {
         let window = self.window();
         let mut deps = UpdaterDeps::new(
@@ -163,7 +134,6 @@ impl Harness {
         updater
     }
 
-    /// Mounts the indicator into the window's root and returns it.
     pub(crate) fn mount_indicator(&mut self) -> UpdateIndicator {
         let updater = self.updater.clone().expect("the updater is installed");
         let window = self.window();
@@ -180,7 +150,6 @@ impl Harness {
         indicator
     }
 
-    /// Runs the composition root's routes and then one engine frame.
     pub(crate) fn drain(&mut self) {
         if let Err(error) = self.router.tick(self.app.app_mut()) {
             panic!("a frame route failed: {error}");
@@ -188,31 +157,23 @@ impl Harness {
         let _ = self.app.drain().expect("the harness frame");
     }
 
-    /// Runs `frames` production-shaped frames.
     pub(crate) fn settle(&mut self, frames: usize) {
         for _ in 0..frames {
             self.drain();
         }
     }
 
-    /// Advances the engine clock by `by` and runs one frame (E10 timers are dispatched
-    /// at frame entry, so a callback's writes are visible in this frame's paint).
     pub(crate) fn advance(&mut self, by: Duration) {
         self.app.advance(by);
         self.drain();
     }
 
-    /// Drives the updater's runtime for `duration`, so spawned work makes progress.
-    ///
-    /// Deterministic tests never need this (they hand the updater its messages); it is
-    /// for the paths that really spawn — reading a completed payload's file.
     pub(crate) fn run_runtime(&mut self, duration: Duration) {
         self.runtime.block_on(async {
             tokio::time::sleep(duration).await;
         });
     }
 
-    /// Waits for `condition`, alternating runtime turns and frames.
     pub(crate) fn wait_until(
         &mut self,
         what: &str,
@@ -229,16 +190,12 @@ impl Harness {
         }
     }
 
-    /// Switches the language the way the composition root does: translator first, then
-    /// the signal, so a redraw can only draw the new language.
     pub(crate) fn switch_language(&mut self, language: LanguageCode) {
         self.services.translate.set_language(language);
         let signal = self.services.language;
         let _ = self.app.app_mut().write(&signal, language);
     }
 
-    /// The engine's value-slot census (released assertions read `live`, reuse reads
-    /// `slots`).
     pub(crate) fn signal_slot_stats(&self) -> ui_core::test_support::diagnostics::SignalSlotStats {
         ui_core::test_support::diagnostics::signal_slot_stats(self.app.app())
     }
@@ -272,8 +229,6 @@ impl Harness {
         &self.downloads
     }
 
-    /// The text the subtree under `node` draws, in document order, one line per text
-    /// node.
     pub(crate) fn text_of(&self, node: NodeId) -> String {
         let tree = self.tree();
         let mut texts = Vec::new();
@@ -288,7 +243,6 @@ impl Harness {
         texts.join("\n")
     }
 
-    /// The first node under `parent` whose debug id starts with `prefix`.
     pub(crate) fn find_in(&self, parent: NodeId, prefix: &str) -> Option<NodeId> {
         let tree = self.tree();
         let mut stack = vec![parent];
@@ -311,7 +265,6 @@ impl Harness {
         None
     }
 
-    /// The first node under the window's root whose debug id starts with `prefix`.
     pub(crate) fn find(&self, prefix: &str) -> Option<NodeId> {
         self.find_in(self.root(), prefix)
     }
@@ -319,8 +272,6 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        // A test may leave a dialog open, and one test closes the window; the app's
-        // pump must not be stepped after that.
         if self.app.app().window(self.window()).is_none() {
             return;
         }
@@ -335,17 +286,13 @@ impl Drop for Harness {
     }
 }
 
-/// The product catalogue's translation context in one language.
 pub(crate) fn translate(language: LanguageCode) -> Translate {
     let catalogue = embedded::load().expect("the embedded locales load");
     Translate::new(Rc::new(catalogue), language)
 }
 
-/// A download manager that answers on demand.
 pub(crate) struct FakeDownloads {
     state: RefCell<FakeState>,
-    /// The one sink the updater installed, held apart from the task table so the
-    /// subscription's drop can withdraw it through a plain `Rc`.
     sink: Rc<RefCell<Option<Arc<dyn Fn(DownloadEvent) + Send + Sync>>>>,
 }
 
@@ -369,27 +316,22 @@ impl FakeDownloads {
         })
     }
 
-    /// The identity of the task that was added last.
     pub(crate) fn last_task(&self) -> Option<DownloadId> {
         self.state.borrow().last
     }
 
-    /// Every request the updater added, in order.
     pub(crate) fn requests(&self) -> Vec<DownloadRequest> {
         self.state.borrow().requests.clone()
     }
 
-    /// The tasks the manager was asked to delete, in order.
     pub(crate) fn deleted(&self) -> Vec<DownloadId> {
         self.state.borrow().deleted.clone()
     }
 
-    /// How many subscriptions were installed.
     pub(crate) fn subscriptions(&self) -> usize {
         usize::from(self.sink.borrow().is_some())
     }
 
-    /// Publishes one task update, as the manager does when a transfer reports.
     pub(crate) fn publish(&self, id: DownloadId, status: DownloadStatus) {
         let task = {
             let mut state = self.state.borrow_mut();
@@ -402,7 +344,6 @@ impl FakeDownloads {
         self.event(DownloadEvent::TaskUpdated(task));
     }
 
-    /// Completes a task: writes `bytes` to its destination and publishes the completion.
     pub(crate) fn complete(&self, id: DownloadId, bytes: &[u8]) {
         let destination = {
             let state = self.state.borrow();
@@ -421,7 +362,6 @@ impl FakeDownloads {
         );
     }
 
-    /// Reports a failed transfer.
     pub(crate) fn fail(&self, id: DownloadId, failure: download_provider::error::DownloadFailure) {
         self.publish(id, DownloadStatus::Failed { failure });
     }

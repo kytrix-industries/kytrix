@@ -1,27 +1,3 @@
-//! a11y 树的侧表载荷与「节点 → `A11yNode`」的构建。
-//!
-//! 侧表（`NodeTree::a11y_slots`）与 `layout_cache` / `clip_keys` / `text_slots` / `debug_ids` 同型：
-//! 按 arena 槽位索引、槽位复用时清空、`remove` 时逐槽清空。`Node` 因此保持 ≤ 320 B（B5 之后为 312 B）。
-//!
-//! 本模块的三条职责（都在 [`node_a11y`] 一个入口里）：
-//! 1. **语义判定**：角色 / 名字 / 值 / 隐藏 / 禁用 / 动作，判据来自 `a11y::mapping` 的纯函数；
-//! 2. **自动语义**：虚拟列表位置、表格的行列索引与总数、文本的 grapheme 长度与词边界、
-//!    滚动状态 —— 这些是引擎**已经知道**的事实，不该逼应用逐节点手填；
-//! 3. **稳定身份**：一切 id（自身 / children / parent）都经 `a11y::identity` 的分配器发放。
-//!
-//! # 集合语义（E9）
-//!
-//! 表格 / 树是**集合**：AccessKit 的消费端要求「`Row` 在 `Table`/`Grid` 下」「单元格在 `Row`
-//! 下」「`TreeItem` 在 `Tree`/`TreeItem` 下」，且行列索引与总数必须描述**逻辑集合**。但物理
-//! 节点树里这些语义节点通常隔着一层布局实现细节（虚拟列表的 `List` 行窗口、单元格的排板盒），
-//! 直接按物理父子建树会让行挂到 `List` 下、`row_count` 退化成「已挂载行数」。
-//!
-//! 因此 a11y 树用**逻辑父**（[`logical_a11y_parent`]）而不是物理父：集合角色（`Row` /
-//! `Cell` / `ColumnHeader` / `RowHeader` / `TreeItem`）挂到最近的集合祖先下，包裹层只保留
-//! 它们自己的普通子节点。逻辑父是物理祖先的子集（永远更浅），所以「父先于子」的交付顺序不
-//! 受影响；集合结构由 [`CollectionSemanticsCache`] 每笔交付扫一次（逻辑父 / 逻辑子 / 行列位置
-//! 都是 O(1) 查询）。**只认显式声明的角色**：裸虚拟列表（自动推导的 `ListBoxOption`）结构不变。
-
 use smallvec::SmallVec;
 
 use crate::{
@@ -45,15 +21,9 @@ use crate::{
     paint::style::Clip,
 };
 
-/// 一个节点的 a11y 载荷（侧表元素）。
-///
-/// `pub(crate)` 结构 + `pub` 字段（workspace lint 禁止字段级 `pub(crate)`；与 `NodeInteraction` 同款）。
 pub(crate) struct NodeA11y {
-    /// 静态声明（挂载时写入）。
     pub over: Option<A11yOverride>,
-    /// 动态补丁闭包（`bind_a11y`）。
     pub bind: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> A11yPatch>>,
-    /// 上次求值的动态补丁（diff 用）。
     pub patch: A11yPatch,
 }
 
@@ -80,13 +50,6 @@ impl std::fmt::Debug for NodeA11y {
     }
 }
 
-/// 构建一个节点的 a11y 快照记录（角色 → 名字 → 值 → 隐藏 → 禁用 → 动作 → 自动语义 → 稳定身份）。
-///
-/// 生产入口是 [`node_a11y_with_cache`]：集合语义索引由调用方跨节点复用。这里只为同模块单测
-/// 保留一次性的索引（每个测试用例的树/结构独立，缓存没有复用价值）。
-///
-/// 返回 `None` = 句柄陈旧（调用方已过滤，防御性）。诊断直接推进 `diagnostics`。
-/// 稳定身份由 `ids` 发放（同一节点跨帧不变、逻辑行重建后不变）。
 #[cfg(test)]
 pub(crate) fn node_a11y(
     tree: &NodeTree,
@@ -115,8 +78,6 @@ pub(crate) fn node_a11y_with_cache(
     let patch = slot.map(|slot| &slot.patch);
 
     let role = effective_role(tree, node, target, over, patch);
-    // E15b/F4：集合根要接管的虚拟窗口（被平台 `common_filter` 过滤的那一层）。只有集合角色
-    // 才可能有上提目标；其余角色保持 `None`，不付任何查询成本。
     let lifted_window = if matches!(
         role,
         A11yRole::Table | A11yRole::Grid | A11yRole::Tree | A11yRole::ListBox | A11yRole::Menu
@@ -125,7 +86,6 @@ pub(crate) fn node_a11y_with_cache(
     } else {
         None
     };
-    // 集合语义：行 / 单元格 / 树项的 a11y 父是最近的集合祖先（布局包裹层被跳过）。
     let parent = logical_a11y_parent(tree, node);
     let mut label = effective_label(target, role, over, patch);
     if node == tree.root() && label.is_none() && !title.is_empty() {
@@ -136,23 +96,14 @@ pub(crate) fn node_a11y_with_cache(
     }
     let value = effective_value(target, role, over, patch);
     let description = effective_description(over, patch);
-    // 与 `selected` / `expanded` 同型：布尔状态只走动态补丁（`A11yOverride` 不承载）。
     let checked = patch.and_then(|patch| patch.checked);
-    // 隐藏 = 本地判据 ∪ 被领养跳过的物理祖先的隐藏声明（AccessKit 只沿 a11y 子树继承）
-    //        ∪ 模态作用域外（E12：背景 inert，见 [`hidden_outside_modal_scope`]）。
     let hidden = is_hidden(target, role, label.as_ref(), over, patch)
         || hidden_by_skipped_ancestors(tree, node, parent)
         || hidden_outside_modal_scope(tree, node);
     let disabled = a11y_disabled(tree, node);
-    // `read_only` 必须在能力计算之前求（E3：能力集 = 分发判据，read_only 剔除值变更类动作）。
     let read_only = a11y_read_only(tree, node);
     let actions = effective_actions(tree, node, role, over, patch, disabled, read_only);
 
-    // 诊断：自绘缺替代文本（§5.4）、交互节点无名（§5.2）。
-    //
-    // E7 图片节点的**显式** `A11yOverride { hidden: true }` 是装饰声明（P2-1b3 裁决）：装饰图
-    // 不需要可访问名，因此免 `MissingAltText`。**没有**显式 hidden 的图片（包括靠引擎
-    // 「无 label ⇒ hidden」兜底兜下来的）仍记诊断 —— 应用要么给 label，要么显式声明装饰。
     let decorative_image = is_decorative_image(target, over);
     if role == A11yRole::Image
         && label.is_none()
@@ -177,13 +128,9 @@ pub(crate) fn node_a11y_with_cache(
                 | A11yRole::RadioButton
                 | A11yRole::Slider
                 | A11yRole::MenuItem
-                // E15：可勾选菜单项与组合控件同样「没有名字就没有语义」。
                 | A11yRole::MenuItemCheckBox
                 | A11yRole::MenuItemRadio
                 | A11yRole::ListBoxOption
-                // R13-22 补：没有名字就没有语义的容器 / 控件。
-                // 刻意**不含** `Row` / `Cell` / `ColumnHeader` / `RowHeader`：这些角色的
-                // 可读内容在子文本节点上（AT 读子节点），要求它们自己有 label 是假诊断。
                 | A11yRole::ScrollBar
                 | A11yRole::Menu
                 | A11yRole::MenuBar
@@ -196,8 +143,6 @@ pub(crate) fn node_a11y_with_cache(
         diagnostics.push(A11yDiagnostic::MissingLabel { node });
     }
 
-    // 自定义动作（R13-4）：能力（`A11yAction::Custom`）与注册表（id + 名字）配对；
-    // 只有能力没有注册项的节点在 AT 侧完全不可见。
     let custom_actions = match patch.and_then(|patch| patch.custom_actions.clone()) {
         Some(actions) => actions,
         None => over
@@ -212,19 +157,11 @@ pub(crate) fn node_a11y_with_cache(
         }
     }
 
-    // 文本语义（A5/E4a）：`character_lengths` / `word_starts` 只对"文本就是 value"的角色有意义。
-    //
-    // `TextInput` / `MultilineTextInput` **不**携带字符语义（E4a 契约收窄）：AccessKit 的
-    // `TextPosition.node` 必须指向 `Role::TextRun`，输入框的字符语义由它的子文本运行承担；
-    // 输入框自身只承载 `value`（+ 可选选区属性，但 `text_selection` 只挂 TextRun）。
     let text_metrics = match role {
         A11yRole::Label | A11yRole::TextRun => value.as_deref().and_then(textrun::text_metrics),
         _ => None,
     };
     let (character_lengths, word_starts) = text_metrics.unwrap_or_default();
-    // 字符度量（E4b）：只有 TextRun 且能**正确表达**时才发 `character_positions` /
-    // `character_widths`（a11y `value` 与已 shape 文本逐字节相同 + 解析后 LTR + 单行 + shape
-    // 输入一致），否则留空让 AT 回退。`value` 同时是 `character_lengths` 的口径来源（RBA-01）。
     let (character_positions, character_widths) = match (role, value.as_deref()) {
         (A11yRole::TextRun, Some(value)) => {
             textrun::character_metrics(tree, node, value, &character_lengths, scale)
@@ -232,8 +169,6 @@ pub(crate) fn node_a11y_with_cache(
         }
         _ => (Vec::new(), Vec::new()),
     };
-    // 选区只挂 `TextRun`（AccessKit 契约：`TextPosition.node` 必须是 TextRun，否则 consumer
-    // 静默丢弃整段选区）；输入框的选区由子 TextRun 承载，输入框自身不生成。
     let text_selection = match role {
         A11yRole::TextRun => patch
             .and_then(|patch| patch.selection)
@@ -242,26 +177,15 @@ pub(crate) fn node_a11y_with_cache(
         _ => None,
     };
 
-    // 表格语义（A2）：行/列索引与总数在没有显式声明时**自动推导**。
     let table = derive_table_semantics(tree, node, role, over, patch, tables);
     let sort = patch
         .and_then(|patch| patch.sort)
         .or_else(|| over.and_then(|over| over.sort));
 
-    // 滚动状态（R13-13）：`ScrollView` 宣告了 6 个滚动动作却没暴露 `scroll_*`，AT 无从播报。
-    // E15b/F4（E9 R2 后半）：被抑制的虚拟窗口是平台透明层，它自己的 `scroll` / `clips_children`
-    // 会随节点一起从 AT 树里消失 —— 由集合根按窗口的值接管（滚动力学仍在窗口上）。
     let scroll = scroll_state(tree, node)
         .or_else(|| lifted_window.and_then(|window| scroll_state(tree, window)));
-    // 上提窗口必有滚动槽 ⇒ 它的 `clips_children` 恒为真；集合根因此也要宣告裁剪感知。
     let clips_children = clips_children_of(tree, node) || lifted_window.is_some();
 
-    // 表单 / 状态属性（R13-14）。`read_only` 已在能力计算之前求（E3）。
-    //
-    // 模态（E12）：浮层包装的 `aria-modal` 跟**引擎的模态作用域**走（`OverlaySlot::trap_focus`），
-    // 不跟角色走、也不被 `A11yOverride::modal = false`（静态声明的默认值）吞掉 —— 否则
-    // 「声明了 Dialog 角色」反而会把真正的模态声明成非模态。非浮层节点仍可用
-    // `A11yOverride::modal` / `A11yPatch::modal` 显式声明；动态补丁最优先。
     let modal =
         patch
             .and_then(|patch| patch.modal)
@@ -277,8 +201,6 @@ pub(crate) fn node_a11y_with_cache(
         .and_then(|patch| patch.invalid)
         .or_else(|| over.map(|over| over.invalid))
         .unwrap_or(false);
-    // `error_message` 是 NodeId 关系（`aria-errormessage`）：目标必须存活（悬挂引用会让
-    // `TreeUpdate` 指向不存在的节点），存活时换算成稳定 id。
     let error_message = patch
         .and_then(|patch| patch.error_message)
         .or_else(|| over.and_then(|over| over.error_message))
@@ -298,8 +220,6 @@ pub(crate) fn node_a11y_with_cache(
     let level = patch
         .and_then(|patch| patch.level)
         .or_else(|| over.and_then(|over| over.level));
-    // E15：方向（滑条 / 色盘等轴向控件）。滚动容器的方向由 `A11yScroll` 在 adapter 侧推导，
-    // 显式声明优先（应用对非滚动控件用它表达轴向）。
     let orientation = patch
         .and_then(|patch| patch.orientation)
         .or_else(|| over.and_then(|over| over.orientation));
@@ -310,7 +230,6 @@ pub(crate) fn node_a11y_with_cache(
         identity_key(tree, node, over, patch),
         diagnostics,
     );
-    // 逻辑子节点（集合语义下 = 未被领养走的物理子节点 + 被领养到本节点的行 / 单元格 / 树项）。
     let children = a11y_children(tree, node, role, tables)
         .into_iter()
         .map(|child| {
@@ -337,27 +256,13 @@ pub(crate) fn node_a11y_with_cache(
         checked,
         selected: patch.and_then(|patch| patch.selected),
         expanded: patch.and_then(|patch| patch.expanded),
-        // 以下新增的语义字段一律**动态补丁优先、静态声明兜底** —— 与 `effective_role` /
-        // `effective_label` / `effective_value` 的合并方向一致（复审发现此前写成 over 优先，
-        // 会让静态声明永久压住 `bind_a11y` 的每帧更新，例如滑块数值永远停在初值）。
         live: patch
             .and_then(|patch| patch.live)
             .or_else(|| over.and_then(|over| over.live)),
-        // 虚拟列表行：引擎知道「第 N 项 / 共 M 项」，必须自动填 —— 否则应用得自己算，
-        // 而 `VirtualSlot` 是内部状态（review P2-6：修复只做了字段管道，没接线）。
-        //
-        // **AccessKit 的 `pos_in_set` 是 0-based**（其文档明确：aria-posinset 是 1-based，
-        // 而本属性是 0-based；Windows/AT-SPI 适配层自己 +1）。此前写成 `index + 1` 会让 AT
-        // 播报「第 N+2 项」（第二轮复审 P2-1）。
         pos_in_set: patch
             .and_then(|patch| patch.pos_in_set)
             .or_else(|| over.and_then(|over| over.pos_in_set))
             .or_else(|| virtual_set_position(tree, node).map(|(index, _)| index)),
-        // `size_of_set` 必须挂在**容器**上：AccessKit 的 consumer 只在祖先上查它
-        // （`size_of_set_from_container`），写在行上不会到达 AT；写在行上还会让嵌套虚拟列表
-        // 的内层行读到外层的 count。所以这里对「虚拟列表容器」节点填自己的条目总数。
-        // E15b/F4：虚拟窗口的总条目数同样随窗口被平台过滤 —— 集合根按与窗口**同一口径**
-        // 接管（patch > override > 虚拟条目数），应用已在集合根上声明时仍以声明为准。
         size_of_set: size_of_set_of(tree, node)
             .or_else(|| lifted_window.and_then(|window| size_of_set_of(tree, window))),
         numeric_value: patch
@@ -417,10 +322,6 @@ fn patch_child(tree: &NodeTree, node: NodeId) -> Option<&A11yPatch> {
     tree.a11y_of(node).map(|slot| &slot.patch)
 }
 
-/// 节点的**逻辑身份键**（显式声明优先，其次虚拟列表行）。
-///
-/// 引擎自动为虚拟列表行生成 `(容器, 条目下标)` 键：行滚出视口被回收、再滚回来重新 `build`
-/// 之后，a11y id 仍与首次挂载相同（R13-1 的核心场景：订单簿/持仓表的读屏位置不丢）。
 fn identity_key(
     tree: &NodeTree,
     node: NodeId,
@@ -442,10 +343,6 @@ fn identity_key(
     })
 }
 
-/// 该节点是虚拟列表的已挂载行时返回 `(index, count)`（`index` 是 0-based）。
-///
-/// `VirtualSlot` 是引擎内部状态，应用拿不到 —— 所以「第 N 项，共 M 项」必须由引擎自己
-/// 填进 a11y 快照，否则屏幕阅读器只能播报行内容、无法告知位置（复审 P2-6）。
 fn virtual_set_position(tree: &NodeTree, node: NodeId) -> Option<(usize, usize)> {
     let mut cursor = tree.get(node).ok().and_then(|target| target.parent());
     while let Some(current) = cursor {
@@ -459,9 +356,6 @@ fn virtual_set_position(tree: &NodeTree, node: NodeId) -> Option<(usize, usize)>
     None
 }
 
-/// 节点的集合大小（`patch` > `override` > 虚拟列表条目数）。
-///
-/// `node_a11y` 与「窗口语义上提」共用同一口径：上提时集合根读到的必须与窗口原本会写出的一致。
 fn size_of_set_of(tree: &NodeTree, node: NodeId) -> Option<usize> {
     let slot = tree.a11y_of(node);
     slot.and_then(|slot| slot.patch.size_of_set)
@@ -472,9 +366,6 @@ fn size_of_set_of(tree: &NodeTree, node: NodeId) -> Option<usize> {
         .or_else(|| tree.virtual_slot(node).map(|slot| slot.count))
 }
 
-/// 节点是否向 AT 宣告「裁剪子节点」（自身滚动槽或非 `Clip::None`）。
-///
-/// `node_a11y` 与「窗口语义上提」共用（上提窗口必有滚动槽 ⇒ 恒真）。
 fn clips_children_of(tree: &NodeTree, node: NodeId) -> bool {
     tree.scroll_slot(node).is_some()
         || tree
@@ -482,7 +373,6 @@ fn clips_children_of(tree: &NodeTree, node: NodeId) -> bool {
             .is_ok_and(|state| state.style().clip != Clip::None)
 }
 
-/// 滚动状态（逻辑像素 → 物理像素由适配层按 scale 换算；这里保留引擎的布局单位）。
 fn scroll_state(tree: &NodeTree, node: NodeId) -> Option<A11yScroll> {
     let slot = tree.scroll_slot(node)?;
     let viewport = crate::interaction::scroll::viewport(tree, node);
@@ -496,7 +386,6 @@ fn scroll_state(tree: &NodeTree, node: NodeId) -> Option<A11yScroll> {
     })
 }
 
-/// 表格行列语义（显式声明优先，缺失时从结构推导）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TableSemantics {
     row_index: Option<usize>,
@@ -505,60 +394,35 @@ struct TableSemantics {
     column_count: Option<usize>,
 }
 
-/// 集合语义（表格 / 树）的结构索引：一个集合每笔交付只扫一遍子树，逻辑父 / 逻辑子 / 行列
-/// 位置都是 O(1) 查询。
-///
-/// **为什么必须有索引**：集合语义要求「行挂 `Table`、单元格挂 `Row`、树项挂 `Tree`/`TreeItem`」，
-/// 而物理节点树里这些语义节点通常隔着一层布局包裹（虚拟列表的 `List` 行窗口、单元格的排板盒）。
-/// 旧实现只认物理父子（表格语义推导要求 `Row` 的直接父是 `Table`、`Cell` 的直接父是 `Row`），
-/// 虚拟化表格的行因此挂在 `List` 下、列号退化成「兄弟序号」。
-///
-/// 旧实现还按每个 `Row`/`Cell` 重扫整张表（`count_rows` / `count_columns` /
-/// `sibling_index_where`），5000×8 的表是 O(行×列×行) 的 arena 访问。Chrome 的 `AXTableInfo`
-/// 也是构建时一次算好 row/column count，cell 只做索引查询 —— 这里同样。
 #[derive(Default)]
 pub(crate) struct CollectionSemanticsCache {
     tables: ahash::HashMap<NodeId, TableIndex>,
     trees: ahash::HashMap<NodeId, TreeIndex>,
-    /// 建索引次数（仅测试：证明每个集合每笔交付只扫一次）。
     #[cfg(test)]
     builds: u64,
 }
 
-/// 一张表的逻辑结构。
 #[derive(Default)]
 struct TableIndex {
-    /// 逻辑总行数（虚拟化表格 = 行窗口之外的行走完之后的计数，含未挂载的条目）。
     row_count: Option<usize>,
-    /// 列数（最宽的行的单元格数）。
     column_count: Option<usize>,
-    /// 表的逻辑子节点（文档序）：未被领养走的物理子节点 + 被领养到表下的行。
     children: Vec<NodeId>,
-    /// 逻辑行（文档序）。
     rows: Vec<RowEntry>,
-    /// 行节点 → `rows` 下标。
     row_of: ahash::HashMap<NodeId, usize>,
 }
 
-/// 一行（表格）的逻辑结构。
 struct RowEntry {
-    /// 行的逻辑行号（虚拟化行窗口 = 窗口基址 + 条目的逻辑下标）。
     index: usize,
-    /// 行的逻辑子节点（文档序）：未被领养走的物理子节点 + 被领养到行下的单元格。
     children: Vec<NodeId>,
-    /// 单元格 → 逻辑列号。
     column_of: ahash::HashMap<NodeId, usize>,
 }
 
-/// 一棵树（`Tree` / `TreeItem`）的逻辑结构。
 #[derive(Default)]
 struct TreeIndex {
-    /// 节点（集合根或 `TreeItem`）→ 逻辑子节点（文档序）。
     children: ahash::HashMap<NodeId, Vec<NodeId>>,
 }
 
 impl CollectionSemanticsCache {
-    /// 开始一笔新交付：集合结构可能已经变化，索引不能跨批复用。
     pub(crate) fn clear(&mut self) {
         self.tables.clear();
         self.trees.clear();
@@ -590,24 +454,11 @@ impl CollectionSemanticsCache {
     }
 }
 
-/// 扫一遍表：逻辑行（含虚拟行窗口的已挂载行与未挂载计数）、每行的单元格、逻辑子节点列表。
 fn build_table_index(tree: &NodeTree, table: NodeId) -> TableIndex {
     let mut index = TableIndex::default();
-    // 下一个逻辑行号：非虚拟行逐个递增；虚拟行窗口一次占 `slot.count` 行。
     let mut next_row = 0usize;
     let mut stack: Vec<NodeId> = children_of(tree, table).iter().rev().copied().collect();
     while let Some(node) = stack.pop() {
-        // 虚拟行窗口（`List` 容器）：已挂载的行就是表的**可见行**；未挂载的行只贡献计数。
-        // 行窗口自身是布局/滚动实现细节，只有在它物理上直挂表时才随表出现。
-        //
-        // **行窗口判据 = 已挂载项全部声明了 `Row`**（E9b F1）：表格子树里还可能挂着别的虚拟
-        // 列表（表内分组列表、兼容路径 `Table > Cell` 的虚拟单元格窗口……），它们不是行窗口。
-        // 无条件领养会让同一节点同时出现在 `Table` 与物理父的 `children` 里（a11y 父不唯一，
-        // AccessKit consumer 的父指针被覆盖），`slot.count` 也会虚增 `row_count`。
-        // 非行窗口按普通包裹层继续下降：里面若有声明的 `Row`，走下面的通用行路径。
-        //
-        // 空窗口（0 个已挂载项）无法区分，仍按行窗口计：初始帧还没挂载行时 `slot.count` 已经
-        // 是逻辑行数；声明值（`A11yPatch::row_count`）始终优先（见 E9.md §2.3）。
         if let Some(slot) = tree.virtual_slot(node) {
             let row_window = slot
                 .mounted
@@ -623,14 +474,12 @@ fn build_table_index(tree: &NodeTree, table: NodeId) -> TableIndex {
                     let entry = build_row_entry(tree, *row, base.saturating_add(*item));
                     index.row_of.insert(*row, index.rows.len());
                     index.rows.push(entry);
-                    // 行的逻辑父 = 表（见 `logical_a11y_parent`）。
                     index.children.push(*row);
                 }
                 continue;
             }
         }
         match declared_role(tree, node) {
-            // 嵌套集合：它的行属于它自己，不进入本表索引。
             Some(A11yRole::Table | A11yRole::Grid) => {
                 if tree.get(node).ok().and_then(Node::parent) == Some(table) {
                     index.children.push(node);
@@ -662,7 +511,6 @@ fn build_table_index(tree: &NodeTree, table: NodeId) -> TableIndex {
     index
 }
 
-/// 一行的逻辑结构：物理子节点（未被领养走的）+ 被领养到行下的单元格（文档序）。
 fn build_row_entry(tree: &NodeTree, row: NodeId, index: usize) -> RowEntry {
     let mut entry = RowEntry {
         index,
@@ -678,7 +526,6 @@ fn build_row_entry(tree: &NodeTree, row: NodeId, index: usize) -> RowEntry {
                 entry.children.push(node);
                 continue;
             }
-            // 嵌套集合 / 行：它们自己的集合语义，不领养到本行。
             Some(A11yRole::Row | A11yRole::Table | A11yRole::Grid | A11yRole::Tree) => continue,
             _ => {}
         }
@@ -690,10 +537,8 @@ fn build_row_entry(tree: &NodeTree, row: NodeId, index: usize) -> RowEntry {
     entry
 }
 
-/// 扫一棵树：逻辑子节点列表（`Tree` 根 + 每个 `TreeItem`；包裹层的非集合内容按物理父子保留）。
 fn build_tree_index(tree: &NodeTree, root: NodeId) -> TreeIndex {
     let mut index = TreeIndex::default();
-    // DFS 先序；栈里携带「最近的集合祖先」（根或树项）。
     let mut stack: Vec<(NodeId, NodeId)> = children_of(tree, root)
         .iter()
         .rev()
@@ -705,7 +550,6 @@ fn build_tree_index(tree: &NodeTree, root: NodeId) -> TreeIndex {
                 index.children.entry(logical_parent).or_default().push(node);
                 node
             }
-            // 嵌套树：它自己是另一棵树的根，不进入本索引。
             Some(A11yRole::Tree) => {
                 if tree.get(node).ok().and_then(Node::parent) == Some(logical_parent) {
                     index.children.entry(logical_parent).or_default().push(node);
@@ -713,8 +557,6 @@ fn build_tree_index(tree: &NodeTree, root: NodeId) -> TreeIndex {
                 continue;
             }
             _ => {
-                // 非集合节点保留物理父子：它也出现在集合祖先的 children 里（只是包裹层），
-                // 自己的子节点由通用路径（物理子节点过滤）算。
                 if tree.get(node).ok().and_then(Node::parent) == Some(logical_parent) {
                     index.children.entry(logical_parent).or_default().push(node);
                 }
@@ -728,10 +570,6 @@ fn build_tree_index(tree: &NodeTree, root: NodeId) -> TreeIndex {
     index
 }
 
-/// 该节点的**声明**角色（只看 `patch.role` / `over.role`；不做 kind 推导）。
-///
-/// 集合结构的推导只认显式角色：`Row` / `Cell` / `TreeItem` 本来就是"应用声明才有"的角色，靠
-/// kind 猜会把任何虚拟列表行也算进来。
 fn declared_role(tree: &NodeTree, node: NodeId) -> Option<A11yRole> {
     let slot = tree.a11y_of(node)?;
     slot.patch
@@ -739,7 +577,6 @@ fn declared_role(tree: &NodeTree, node: NodeId) -> Option<A11yRole> {
         .or_else(|| slot.over.as_ref().and_then(|over| over.role))
 }
 
-/// 最近的声明了某角色的祖先（不含自身）。
 fn nearest_ancestor_where(
     tree: &NodeTree,
     node: NodeId,
@@ -755,20 +592,12 @@ fn nearest_ancestor_where(
     None
 }
 
-/// 最近的**集合根**祖先（`Table` / `Grid` / `Tree`，不含自身）。
-///
-/// 集合派生字段（行数 / 行号 / 集合位置）由引擎在 a11y 交付时按集合结构现算，写点（虚拟列表
-/// 条目数变化）因此必须把集合根以下整棵子树重进增量笔（E9c）。没有集合根时返回 `None`
-/// （裸虚拟列表维持既有行为：只标行窗口自己）。
 pub(crate) fn nearest_collection_ancestor(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
     nearest_ancestor_where(tree, node, |role| {
         matches!(role, A11yRole::Table | A11yRole::Grid | A11yRole::Tree)
     })
 }
 
-/// 最近的**显式声明**的集合语义容器（`Table` / `Grid` / `Tree` / `ListBox` / `Menu`）及其角色。
-///
-/// 只认声明角色：自动推导的 `List` 不构成集合边界（嵌套列表的窗口仍各自推导）。
 fn nearest_declared_container(tree: &NodeTree, node: NodeId) -> Option<(NodeId, A11yRole)> {
     let mut cursor = tree.get(node).ok().and_then(Node::parent);
     while let Some(current) = cursor {
@@ -787,20 +616,6 @@ fn nearest_declared_container(tree: &NodeTree, node: NodeId) -> Option<(NodeId, 
     None
 }
 
-/// 虚拟列表容器是否应该**抑制**自动推导的 `List` 角色（E15；E9 残余 R2 的修复判据）。
-///
-/// 虚拟窗口只是一层布局/滚动实现细节，但它默认会被推导成 `List`。当窗口位于一个**显式声明的
-/// 集合语义容器**之下时，那个容器已经在表达集合，窗口再报 `List` 会让 AT 读到「表格/树/列表框/
-/// 菜单里套了一个列表」（`accesskit_consumer::common_filter` 只过滤 `GenericContainer`）：
-///
-/// | 最近的声明祖先 | 抑制判据 |
-/// |---|---|
-/// | `Table` / `Grid` | 已挂载项全部声明 `Row`（空窗口按行窗口计，与 E9 判据同口径） |
-/// | `Tree` | 已挂载项全部声明 `TreeItem`（空窗口同上） |
-/// | `ListBox` / `Menu` | 恒抑制：列表框 / 菜单的项由容器语义负责，窗口只承载布局 |
-///
-/// 只认**声明**角色（`A11yPatch::role` / `A11yOverride::role`）：裸虚拟列表没有声明祖先，继续
-/// 按 `List` 暴露（反向护栏见 `a_plain_virtual_list_keeps_the_list_role`）。
 pub(crate) fn is_suppressed_list_window(tree: &NodeTree, node: NodeId) -> bool {
     if tree.virtual_slot(node).is_none() {
         return false;
@@ -823,19 +638,6 @@ pub(crate) fn is_suppressed_list_window(tree: &NodeTree, node: NodeId) -> bool {
     }
 }
 
-/// 被抑制的虚拟窗口把滚动语义**上提到**哪个集合根（E15b/F4；E9 R2 后半）。
-///
-/// 平台三端都用 `accesskit_consumer::common_filter` 把 `GenericContainer` 透明上提，窗口节点
-/// 连同它的 `scroll_x/y` / `clips_children` / `size_of_set` / `ScrollUp..` 能力一起从 AT 树里
-/// 消失。集合根必须接管这些属性，否则读屏用户无法滚动虚拟化表格 / 树 / 列表框 / 菜单。
-///
-/// 返回 `Some(root)` 的四个条件（任一不满足都不上提）：
-/// 1. 窗口有 `VirtualSlot` **且** 有 `ScrollSlot`（没有滚动槽就没有可上提的滚动语义）；
-/// 2. 窗口角色是**自动推导**的（`declared_role` 为空）：应用显式声明角色的窗口（逃生口，
-///    例如显式 `ListBox`）不会被平台过滤，自己保留滚动语义，不能重复声明；
-/// 3. [`is_suppressed_list_window`]（确实会被过滤成 `GenericContainer`）；
-/// 4. 最近的声明集合容器**自身没有**滚动槽：自身有槽时平台能读到它自己的滚动状态，
-///    再借后代的偏移会写出两个互相矛盾的 `scroll`。
 pub(crate) fn lifted_scroll_root(tree: &NodeTree, window: NodeId) -> Option<NodeId> {
     if tree.virtual_slot(window).is_none()
         || tree.scroll_slot(window).is_none()
@@ -848,14 +650,7 @@ pub(crate) fn lifted_scroll_root(tree: &NodeTree, window: NodeId) -> Option<Node
     (tree.scroll_slot(root).is_none()).then_some(root)
 }
 
-/// 集合根要接管的**虚拟窗口**（[`lifted_scroll_root`] 的反向查询）。
-///
-/// 只在 `virtual_containers` 反向索引里找候选（每棵树里的虚拟列表数量远小于节点数），逐项用
-/// [`lifted_scroll_root`] 验证所有权 ⇒ 单次记录构建的代价是 `O(虚拟列表数 × 祖先深度)`，与
-/// 子树的节点数无关（不扫子树）。
 pub(crate) fn lifted_scroll_window(tree: &NodeTree, root: NodeId) -> Option<NodeId> {
-    // O(1) 早退（`effective_actions` 对**每个节点**都会调本函数）：只有「自身没有滚动槽的
-    // 声明集合根」才可能有上提目标，其余节点直接返回，不去遍历虚拟列表候选。
     if tree.scroll_slot(root).is_some()
         || !matches!(
             declared_role(tree, root),
@@ -876,12 +671,6 @@ pub(crate) fn lifted_scroll_window(tree: &NodeTree, root: NodeId) -> Option<Node
         .find(|window| lifted_scroll_root(tree, *window) == Some(root))
 }
 
-/// a11y 滚动动作的目标容器：自身滚动槽 → 上提的虚拟窗口 → 最近的滚动祖先。
-///
-/// 「上提窗口」优先于物理滚动祖先：表格自己内嵌的虚拟窗口是表格的滚动目标，AT 对表格发
-/// `ScrollDown` 不该意外驱动外层面板。消费者：`mapping::action_allowed`（能力判据）与
-/// `a11y::action::scroll_container`（派发）—— 两处必须用同一份解析，否则"允许但派发失败"
-/// 会变成死动作。
 pub(crate) fn a11y_scroll_target(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
     if tree.scroll_slot(node).is_some() {
         return Some(node);
@@ -892,18 +681,6 @@ pub(crate) fn a11y_scroll_target(tree: &NodeTree, node: NodeId) -> Option<NodeId
     crate::interaction::scroll::scroll_ancestor(tree, node).map(|(container, _)| container)
 }
 
-/// 写一个节点的动态 a11y 补丁并登记交付 —— **三个写点共用**的唯一差分实现（E15b F2/F3）。
-///
-/// 语义与 `bind_a11y` 的写回一致：补丁整值替换；只有变化会影响后代
-/// （[`crate::a11y::A11yPatch::affects_descendants`]：`role` / `hidden`）时才把整棵子树标
-/// `A11Y`（只重发快照字段，不产生像素工作、不清 `REUSABLE`），否则只标本节点。
-///
-/// 三个写入点（任一漏掉子树差分都会让增量笔与全树分叉）：
-/// 1. `app::a11y::refresh_a11y_bindings`（只有 `bind_a11y` 的 a11y-only pass）；
-/// 2. `app::style_pass::refresh_styles`（节点同时有 `bind_style`/`bind_text` 时的普通帧）；
-/// 3. `app::a11y::set_a11y_patch`（应用显式通道）。
-///
-/// 返回 `true` = 补丁真的变了（等值短路，不重复标脏）。
 pub(crate) fn write_a11y_patch(
     tree: &mut NodeTree,
     node: NodeId,
@@ -917,7 +694,6 @@ pub(crate) fn write_a11y_patch(
     }
     let affects_descendants = patch.affects_descendants(&previous);
     tree.set_a11y_patch(node, patch);
-    // 只标 `A11Y`：不产生视觉 damage、不清 `REUSABLE`（P03 §9.3 表第 9 行）。
     tree.mark_a11y(node);
     if affects_descendants {
         tree.mark_subtree_a11y(node);
@@ -925,17 +701,6 @@ pub(crate) fn write_a11y_patch(
     true
 }
 
-/// a11y 树里的**逻辑父**：集合语义把节点挂到最近的集合祖先下、跳过布局包裹层；其它角色就是
-/// 物理父节点（`None` = 根）。
-///
-/// | 角色 | 逻辑父 |
-/// |---|---|
-/// | `Row` | 最近的 `Table` / `Grid` 祖先（虚拟行窗口 `List` 不是父） |
-/// | `Cell` / `ColumnHeader` / `RowHeader` | 最近的 `Row` 祖先 |
-/// | `TreeItem` | 最近的 `Tree` / `TreeItem` 祖先（嵌套树项） |
-///
-/// 只认**声明**角色（[`declared_role`]）：自动推导出的 `ListBoxOption` 等仍是物理父子，
-/// 裸虚拟列表的 a11y 结构不受影响。
 pub(crate) fn logical_a11y_parent(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
     let physical = tree.get(node).ok().and_then(Node::parent);
     let adopted = match declared_role(tree, node) {
@@ -953,9 +718,6 @@ pub(crate) fn logical_a11y_parent(tree: &NodeTree, node: NodeId) -> Option<NodeI
     adopted.or(physical)
 }
 
-/// 树项所属的集合根：**最近的** `Tree` 祖先（找到即停 —— 嵌套 `Tree` 有自己的索引，集合边界不
-/// 穿越）；没有 `Tree` 时取最外层 `TreeItem`（无 `Tree` 的裸树项集合属应用违约，但仍要产出
-/// 父唯一的自洽树）。
 fn tree_collection_root(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
     let mut outermost_item = None;
     let mut cursor = tree.get(node).ok().and_then(Node::parent);
@@ -970,7 +732,6 @@ fn tree_collection_root(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
     outermost_item
 }
 
-/// 节点的 a11y 逻辑子节点（集合节点查索引，其余按物理子节点过滤掉被领养走的）。
 fn a11y_children(
     tree: &NodeTree,
     node: NodeId,
@@ -983,9 +744,6 @@ fn a11y_children(
             let Some(table) = nearest_ancestor_where(tree, node, |role| {
                 matches!(role, A11yRole::Table | A11yRole::Grid)
             }) else {
-                // 无 `Table`/`Grid` 的 `Row` 是应用违约（文档要求 Row 位于表格内），但引擎不能
-                // 因此产出孤儿：`Cell` 的逻辑父仍是最近的 `Row`，这里按**行内领养规则**构造
-                // children（声明的单元格 / 排板盒都在），否则 Cell 无父可达（E9b F2）。
                 return build_row_entry(tree, node, 0).children;
             };
             let index = tables.table(tree, table);
@@ -1005,8 +763,6 @@ fn a11y_children(
             .cloned()
             .unwrap_or_default(),
         A11yRole::TreeItem => {
-            // 集合根 = 最近的 `Tree`（嵌套树有自己的索引）；没有 `Tree` 时以自身为根建索引，
-            // 裸树项集合也能把嵌套树项列全（E9b F3）。
             let root = tree_collection_root(tree, node).unwrap_or(node);
             tables
                 .tree(tree, root)
@@ -1019,7 +775,6 @@ fn a11y_children(
     }
 }
 
-/// 物理子节点里**逻辑父仍是本节点**的那些（被集合语义领养走的子节点不在这里重复出现）。
 fn logical_physical_children(tree: &NodeTree, node: NodeId) -> Vec<NodeId> {
     children_of(tree, node)
         .iter()
@@ -1028,11 +783,6 @@ fn logical_physical_children(tree: &NodeTree, node: NodeId) -> Vec<NodeId> {
         .collect()
 }
 
-/// 被集合语义跳过（不在 a11y 父链上）的物理祖先若有隐藏声明，被领养的后代也必须隐藏。
-///
-/// AccessKit 的 `hidden` 只沿 a11y 子树继承：把行从隐藏的包裹层下领养到 `Table` 时，包裹层的
-/// 隐藏语义不能丢。只看**本地声明**（补丁 / 静态 / `visible` / `display:none`），到 a11y 父即止
-/// （再往上由 AccessKit 沿 a11y 父链继承）。
 fn hidden_by_skipped_ancestors(tree: &NodeTree, node: NodeId, a11y_parent: Option<NodeId>) -> bool {
     let mut cursor = tree.get(node).ok().and_then(Node::parent);
     while let Some(current) = cursor {
@@ -1063,17 +813,6 @@ fn children_of(tree: &NodeTree, node: NodeId) -> &[NodeId] {
     tree.get(node).map_or(&[], |target| target.children())
 }
 
-/// 模态作用域外 ⇒ a11y `hidden`（E12：背景 `inert` / `aria-hidden` 语义）。
-///
-/// 判据与交互层**同一份**：模态浮层的作用域 = 模态子树 ∪ 经 `opener` 链属于该模态的弹出层
-/// （[`crate::interaction::overlay::in_modal_scope`]）。它和焦点陷阱、指针 hover/按下过滤
-/// 共用 `focus_scope_root`，因此「AT 读到什么」与「鼠标键盘能操作什么」不会分叉。
-///
-/// 例外是**窗口根**：它是模态浮层的祖先，隐藏它会把对话框一起隐藏。引擎把浮层恒挂 root，
-/// 所以 root 之外不存在「作用域内的节点却位于根之上」的情况。
-///
-/// 注意：`hidden` 沿 a11y 子树向下继承（AccessKit 语义），背景节点的后代无需逐节点标记也
-/// 会隐藏；这里仍逐节点计算是为了让快照/增量直接可断言（数据库式真相，不依赖 AT 侧继承）。
 fn hidden_outside_modal_scope(tree: &NodeTree, node: NodeId) -> bool {
     if node == tree.root() {
         return false;
@@ -1084,12 +823,6 @@ fn hidden_outside_modal_scope(tree: &NodeTree, node: NodeId) -> bool {
     !crate::interaction::overlay::in_modal_scope(tree, node, Some(scope))
 }
 
-/// 模态作用域变化（模态浮层打开 / 关闭 / 提到栈顶）⇒ 整棵树的 a11y `hidden` 语义都变了。
-///
-/// [`hidden_outside_modal_scope`] 是**每节点**的判据，而 a11y 交付是增量的：背景节点没有
-/// 自己的脏位就永远不会重发，AT 影子树里会留着旧的 `hidden = false`。引擎的做法是在作用域
-/// 改变时把全树标 `A11Y`（O(n) 一次；模态开合的频次远低于任何一帧的节点数），下一笔交付
-/// 把新 hidden 状态带到 AT。消费者：`create_overlay`（模态）/ `remove_node` / `bring_overlay_to_front`。
 pub(crate) fn mark_modal_scope_changed(tree: &mut NodeTree) {
     let mut ids = Vec::with_capacity(tree.len());
     tree.for_each_subtree(tree.root(), |node| ids.push(node));
@@ -1131,7 +864,6 @@ fn derive_table_semantics(
             }
         }
         A11yRole::Row => {
-            // 行可能挂在虚拟行窗口（`List`）下：逻辑表是**最近的 Table/Grid 祖先**，不是物理父。
             let Some(table) = nearest_ancestor_where(tree, node, |role| {
                 matches!(role, A11yRole::Table | A11yRole::Grid)
             }) else {
@@ -1153,7 +885,6 @@ fn derive_table_semantics(
         }
         A11yRole::Cell | A11yRole::ColumnHeader | A11yRole::RowHeader => {
             let Some(row) = nearest_ancestor_where(tree, node, |role| role == A11yRole::Row) else {
-                // 旧兼容路径：非 `Row` 容器直接挂 `Cell`/表头时用同角色兄弟序号。
                 if semantics.column_index.is_none() {
                     semantics.column_index = cell_sibling_index(tree, node);
                 }
@@ -1195,7 +926,6 @@ fn derive_table_semantics(
     semantics
 }
 
-/// `Cell` 在父容器同角色兄弟里的序号（仅在父链路里没有声明 `Row` 的兼容路径上使用）。
 fn cell_sibling_index(tree: &NodeTree, node: NodeId) -> Option<usize> {
     let parent = tree.get(node).ok()?.parent()?;
     let mut index = 0usize;
@@ -1213,7 +943,6 @@ fn cell_sibling_index(tree: &NodeTree, node: NodeId) -> Option<usize> {
     None
 }
 
-/// 表节点声明的行数（`row_count` 在表上声明时优先用它）。
 fn declared_row_count(tree: &NodeTree, table: NodeId) -> Option<usize> {
     let slot = tree.a11y_of(table)?;
     slot.patch
@@ -1228,7 +957,6 @@ fn declared_column_count(tree: &NodeTree, table: NodeId) -> Option<usize> {
         .or_else(|| slot.over.as_ref().and_then(|over| over.column_count))
 }
 
-/// 把 `root` 及其整棵子树（DFS 先序）推进 `out`（去重由调用方决定）。
 pub(crate) fn collect_subtree(tree: &NodeTree, root: NodeId, out: &mut SmallVec<[NodeId; 16]>) {
     let mut stack: SmallVec<[NodeId; 16]> = SmallVec::new();
     stack.push(root);
@@ -1245,7 +973,6 @@ pub(crate) fn collect_subtree(tree: &NodeTree, root: NodeId, out: &mut SmallVec<
     }
 }
 
-/// 从 `from` 的**父**开始向上，把祖先链推进 `out`（`from` 自身不加）。
 pub(crate) fn push_ancestors(tree: &NodeTree, from: NodeId, out: &mut SmallVec<[NodeId; 16]>) {
     let mut cursor = tree.get(from).ok().and_then(|target| target.parent());
     while let Some(current) = cursor {
@@ -1254,10 +981,6 @@ pub(crate) fn push_ancestors(tree: &NodeTree, from: NodeId, out: &mut SmallVec<[
     }
 }
 
-/// 焦点回退：焦点节点必须**存在**于当前树里（否则 `accesskit_consumer` 的 `validate_global`
-/// 会 panic），陈旧/已卸载时回退到窗口根。
-///
-/// 返回值第二项 = 需要记 `MissingFocusTarget` 诊断的原节点。
 pub(crate) fn resolve_focus(tree: &NodeTree, focus: Option<NodeId>) -> (NodeId, Option<NodeId>) {
     match focus {
         Some(node) if tree.get(node).is_ok() => (node, None),
@@ -1285,7 +1008,6 @@ mod tests {
         (root, parent, child)
     }
 
-    /// P2-6：live region 必须落进 accesskit 节点（AT 靠它决定是否主动播报）。
     #[test]
     fn live_region_reaches_the_accesskit_node() {
         let mut tree = NodeTree::new();
@@ -1314,9 +1036,6 @@ mod tests {
         let ak = crate::a11y::adapter::to_accesskit(&node);
         assert_eq!(ak.live(), Some(accesskit::Live::Polite));
     }
-    /// P2-8：滑块的数值通道必须同时进快照与 accesskit 节点。
-    ///
-    /// UIA 的 `RangeValuePattern` 读的是 accesskit 那一层；只给字符串值时不播报也不行调节。
     #[test]
     fn numeric_value_reaches_the_accesskit_node() {
         let mut tree = NodeTree::new();
@@ -1354,7 +1073,6 @@ mod tests {
         assert_eq!(ak.numeric_value_step(), Some(1.0));
         assert_eq!(ak.numeric_value_jump(), Some(10.0));
     }
-    /// P2-7：静态声明的行/列语义必须出现在快照里（虚拟列表 / 表格播报依赖它）。
     #[test]
     fn row_and_column_semantics_come_from_the_static_override() {
         let mut tree = NodeTree::new();
@@ -1382,7 +1100,6 @@ mod tests {
         assert_eq!(node.row_index, Some(3));
         assert_eq!(node.row_count, Some(100));
         assert_eq!(node.column_index, None, "未声明列语义时不得凭空编造");
-        // 快照转 accesskit 后必须真的写到节点上（屏幕阅读器读的是这一层）。
         let ak = crate::a11y::adapter::to_accesskit(&node);
         assert_eq!(ak.row_index(), Some(3));
         assert_eq!(ak.row_count(), Some(100));
@@ -1429,7 +1146,6 @@ mod tests {
         assert_eq!(missing, Some(doomed), "并记一条 MissingFocusTarget");
     }
 
-    /// A2：表格的 3 列表头 + 5 行 —— 表头角色、行列索引、行列数都必须自动正确。
     #[test]
     fn table_semantics_are_derived_from_structure() {
         let mut tree = NodeTree::new();
@@ -1478,7 +1194,6 @@ mod tests {
             }
         }
 
-        // 表容器：行数 / 列数从结构推导（`Grid` 的 `row_count` / `column_count` 是同一路径）。
         let table_snapshot = snapshot(&tree, table);
         assert_eq!(table_snapshot.row_count, Some(5), "行数从 Row 子节点数推导");
         assert_eq!(
@@ -1498,9 +1213,7 @@ mod tests {
             assert_eq!(cell_snapshot.row_count, Some(5));
             assert_eq!(cell_snapshot.column_count, Some(3));
         }
-        // 行自身的行号同样自动推导。
         assert_eq!(snapshot(&tree, rows[3]).row_index, Some(3));
-        // 表头单元格的角色 + 排序状态（`aria-sort`）必须到达 accesskit 层。
         let header = NodeBuilder::boxed()
             .a11y(A11yOverride {
                 role: Some(A11yRole::ColumnHeader),
@@ -1517,14 +1230,9 @@ mod tests {
             ak.sort_direction(),
             Some(accesskit::SortDirection::Descending)
         );
-        // 加了一个表头单元格 ⇒ 列数变成 4（自动推导必须跟着结构走）。
         assert_eq!(snapshot(&tree, table).column_count, Some(4));
     }
 
-    /// P0 回归：5000×8 表每笔交付只建一次语义索引，末尾行列号仍必须正确。
-    ///
-    /// 旧实现每个 cell 都重扫整张表（O(行×列×行)）；本用例的 `builds()` 断言把「每 cell
-    /// 重新扫描」变成可失败的事实：任何回退都会让 builds 变成 cell 数量级。
     #[test]
     fn a_large_table_builds_the_semantics_index_once() {
         const ROWS: usize = 5000;
@@ -1616,8 +1324,6 @@ mod tests {
         );
     }
 
-    /// 声明齐全的表格语义不再需要逐节点扫描；但**逻辑子节点**（E9 集合语义）必须知道哪些行 /
-    /// 单元格被领养到哪一层，所以一笔交付仍要建一次结构索引（之后 O(1) 复用）。
     #[test]
     fn declared_table_semantics_share_one_structure_scan() {
         let mut tree = NodeTree::new();
@@ -1683,7 +1389,6 @@ mod tests {
         );
     }
 
-    /// 兼容路径：`Table > Cell`（没有 Row 容器）仍沿用旧实现的同角色兄弟序号。
     #[test]
     fn a_cell_directly_under_a_table_keeps_its_sibling_column_index() {
         let mut tree = NodeTree::new();
@@ -1718,8 +1423,6 @@ mod tests {
         assert_eq!(record.column_index, Some(0));
     }
 
-    /// A5：文本节点的 `character_lengths` 必须与真实文本一致（CJK / emoji / ZWJ），
-    /// 且 `Σ lengths == value.len()`；`TextRun` 的 caret 走 `text_selection`。
     #[test]
     fn text_runs_expose_grapheme_lengths_and_caret() {
         let mut tree = NodeTree::new();
@@ -1735,7 +1438,6 @@ mod tests {
         let text = NodeBuilder::text("价🌍ab", TextStyle::new(12.0))
             .build(&mut tree, input)
             .expect("text");
-        // caret 放在 emoji 之后（字节 7）：订阅通道是字节偏移，a11y 层换算成 grapheme 下标 2。
         tree.set_a11y_patch(
             text,
             crate::a11y::A11yPatch {
@@ -1776,7 +1478,6 @@ mod tests {
         );
     }
 
-    /// 空文本：不给字符长度（`Σ == value.len()` 依旧成立），也不 panic。
     #[test]
     fn empty_text_has_no_grapheme_lengths() {
         let mut tree = NodeTree::new();
@@ -1792,7 +1493,6 @@ mod tests {
         assert!(snapshot.text_selection.is_none());
     }
 
-    /// R13-4：自定义动作必须把 id + 名字注册进 accesskit（`custom_actions()` 非空）。
     #[test]
     fn custom_actions_are_registered_on_the_accesskit_node() {
         let mut tree = NodeTree::new();
@@ -1825,7 +1525,6 @@ mod tests {
         assert_eq!(ak.custom_actions()[0].description, "加入自选");
     }
 
-    /// R13-4：声明了 `Custom(id)` 却没有注册项 ⇒ 必须留诊断（旧实现完全静默）。
     #[test]
     fn unregistered_custom_actions_are_diagnosed() {
         let mut tree = NodeTree::new();
@@ -1852,7 +1551,6 @@ mod tests {
         );
     }
 
-    /// A1：同一节点跨两笔快照 id 不变；不同节点不冲突（分配器是窗口级状态）。
     #[test]
     fn snapshot_ids_are_stable_across_calls() {
         let mut tree = NodeTree::new();
@@ -1873,8 +1571,6 @@ mod tests {
         assert_eq!(ids.sizes().0, 3, "root + first + second 各一个引擎绑定");
     }
 
-    /// E4a：`text_selection` **只挂 `TextRun`**（AccessKit 的 `TextPosition.node` 硬约束）：
-    /// 打在输入框上的选区补丁必须被忽略；字符语义也收窄到 `TextRun`（输入框只承载 `value`）。
     #[test]
     fn text_selection_only_lives_on_text_run() {
         let mut tree = NodeTree::new();
@@ -1935,7 +1631,6 @@ mod tests {
                 .expect("text run snapshot");
         assert_eq!(run_snapshot.role, A11yRole::TextRun);
         assert_eq!(run_snapshot.character_lengths, vec![3, 4, 1, 1]);
-        // E4b：未 shape 的 TextRun **省略**字符度量（AT 回退到无 caret 高亮），绝不发错位置。
         assert!(
             run_snapshot.character_positions.is_empty() && run_snapshot.character_widths.is_empty(),
             "未 shape 的文本不得输出 character_positions/widths"
@@ -1953,7 +1648,6 @@ mod tests {
             "TextRun 默认宣告 SetTextSelection"
         );
     }
-    /// 一次性快照（共享同一份 id 分配器与集合索引：测试里要跨节点断言父 / 子身份）。
     fn snapshot_with(
         tree: &NodeTree,
         node: NodeId,
@@ -1965,7 +1659,6 @@ mod tests {
             .expect("snapshot")
     }
 
-    /// 给节点挂浮层槽（E12 测试的公共前置：模态作用域来自 `OverlaySlot::trap_focus`）。
     fn declare_overlay(
         tree: &mut NodeTree,
         node: NodeId,
@@ -1982,11 +1675,6 @@ mod tests {
             });
     }
 
-    /// a11y 树的硬不变量：每个节点**只有一个父**，且父的 `children` 必须列出它（无孤儿 / 无双父）。
-    ///
-    /// 引擎侧快照（不是 `TreeUpdate`）也要钉住这条：F1 这类「同一节点同时挂在 Table 与物理父
-    /// 下」的缺陷只会在快照的 children/parent 交叉比对里暴露（`ShadowTree` 的父唯一性断言另在
-    /// `test_support::a11y` 覆盖 `TreeUpdate` 层）。
     fn assert_single_parent_per_node(
         tree: &NodeTree,
         ids: &mut A11yIds,
@@ -2025,7 +1713,7 @@ mod tests {
                 continue;
             };
             let Some(parent_record) = by_id.get(&parent) else {
-                continue; // 根节点的 a11y 父不在快照范围内（窗口根没有 a11y 父）
+                continue;
             };
             assert!(
                 parent_record.children.contains(&record.id),
@@ -2035,12 +1723,6 @@ mod tests {
         }
     }
 
-    /// E9：虚拟化表格的行窗口（`List` 容器）不是行的 a11y 父。
-    ///
-    /// 结构对齐 base_ui 表格：`Table → header → Row → ColumnHeader` 与
-    /// `Table → list → viewport(虚拟行窗口) → Row → column → cells_row → Cell`。行必须挂到
-    /// `Table` 下；行号是**逻辑行号**（窗口基址 + 条目下标），`row_count` 是逻辑总行数
-    /// （含未挂载的条目），不是已挂载行数。
     #[test]
     fn a_virtualized_table_hangs_rows_under_the_table() {
         const FIRST: usize = 10;
@@ -2101,7 +1783,6 @@ mod tests {
             rows.push(row);
             cells.push(cell);
         }
-        // 行窗口：100 个逻辑条目，只挂载 10..13（可见窗口）。
         let mut slot = crate::interaction::VirtualSlot::new(20.0, 0);
         slot.count = 100;
         slot.mounted = rows
@@ -2120,7 +1801,6 @@ mod tests {
             ids.stable_of(node).expect("stable id")
         }
 
-        // 表：逻辑子节点 = 未被领养走的包裹层（表头 / 列表）+ 被领养的行（文档序）。
         assert_eq!(
             table_record.children,
             vec![
@@ -2141,7 +1821,6 @@ mod tests {
         );
         assert_eq!(table_record.column_count, Some(1));
 
-        // 行：父 = Table（不是 List 行窗口），行号 = 窗口基址 + 条目下标，总数 = 逻辑总数。
         let header_row_record = snapshot_with(&tree, header_row, &mut ids, &mut tables);
         assert_eq!(
             header_row_record.parent,
@@ -2169,9 +1848,6 @@ mod tests {
             assert_eq!(accesskit_node.row_count(), Some(101));
         }
 
-        // 行窗口自身不再是行的 a11y 父（它的逻辑子节点为空），且 E15 起不再以 `List` 暴露：
-        // 行已被领养到 Table 下，窗口只是布局实现细节；`GenericContainer` 会被平台
-        // `common_filter` 透明上提，AT 因此看不到「表格里套了一个空列表」（E9 残余 R2）。
         let viewport_record = snapshot_with(&tree, viewport, &mut ids, &mut tables);
         assert_eq!(
             viewport_record.role,
@@ -2183,7 +1859,6 @@ mod tests {
             "行被领养到 Table 后，行窗口不得再列出行"
         );
 
-        // 单元格：父 = 行，行列号从集合结构推导（不是「物理父 + 兄弟序号」）。
         for (offset, cell) in cells.iter().enumerate() {
             let record = snapshot_with(&tree, *cell, &mut ids, &mut tables);
             assert_eq!(record.parent, Some(stable(rows[offset], &ids)));
@@ -2194,12 +1869,6 @@ mod tests {
         }
     }
 
-    /// E15b/F4（E9 R2 后半）：虚拟行窗口被平台 `common_filter` 透明上提后，它承载的滚动语义
-    /// （`scroll` / `clips_children` / `size_of_set` / 滚动动作）必须由集合根接管 —— 否则读屏
-    /// 用户无法滚动虚拟化表格（窗口节点连属性带动作一起从 AT 树里消失）。
-    ///
-    /// 变异守卫：删掉 `lifted_scroll_window` 的接管（或 `effective_actions` 的上提分支）⇒
-    /// scroll / 动作断言红。
     #[test]
     fn a_suppressed_row_window_lifts_its_scroll_semantics_to_the_table() {
         let mut tree = NodeTree::new();
@@ -2248,21 +1917,17 @@ mod tests {
             "被抑制的窗口仍是平台透明层（它的属性由集合根接管）"
         );
 
-        // ① scroll：集合根读到窗口的偏移与范围（测试树未跑布局，视口尺寸 0 ⇒ 上限 = 内容）。
         let scroll = table_record
             .scroll
             .expect("集合根必须接管窗口的 scroll（E9 R2 后半）");
         assert_eq!(scroll.y, 40.0);
         assert_eq!(scroll.y_max, 2000.0);
         assert!(scroll.vertical);
-        // ② 裁剪感知。
         assert!(
             table_record.clips_children,
             "滚动容器的裁剪感知必须随语义上提"
         );
-        // ③ 集合大小（窗口没有显式 patch ⇒ 取虚拟条目数）。
         assert_eq!(table_record.size_of_set, Some(100));
-        // ④ 滚动动作：AT 对集合根发的动作必须被允许，且派发到窗口。
         for action in [
             A11yAction::ScrollUp,
             A11yAction::ScrollDown,
@@ -2285,7 +1950,6 @@ mod tests {
             "行上的滚动动作仍落到窗口"
         );
 
-        // ⑤ accesskit 节点：滚动属性 / 裁剪 / 动作都真的写出去了（三端读同一份）。
         let ak = crate::a11y::adapter::to_accesskit(&table_record);
         assert_eq!(ak.scroll_y(), Some(40.0));
         assert_eq!(ak.scroll_y_max(), Some(2000.0));
@@ -2293,8 +1957,6 @@ mod tests {
         assert!(ak.supports_action(accesskit::Action::ScrollDown));
     }
 
-    /// E9：树项挂到最近的 `Tree` / `TreeItem` 祖先下（布局包裹层被跳过），展开 / 选中 / 禁用
-    /// 状态原样进 a11y 节点（`expanded` / `selected` / `disabled`）。
     #[test]
     fn tree_items_hang_under_the_tree_and_carry_their_state() {
         let mut tree = NodeTree::new();
@@ -2335,7 +1997,6 @@ mod tests {
             })
             .build(&mut tree, panel)
             .expect("sibling");
-        // 展开 / 选中 / 禁用全部走 `bind_a11y` 的动态补丁。
         tree.set_a11y_patch(
             item,
             crate::a11y::A11yPatch {
@@ -2393,8 +2054,6 @@ mod tests {
         );
     }
 
-    /// E9：被领养的行若其物理祖先（行窗口 / 排版盒）被隐藏，也必须隐藏 —— AccessKit 的
-    /// `hidden` 只沿 a11y 子树继承，跳过包裹层不能把隐藏语义丢掉。
     #[test]
     fn a_hidden_row_window_hides_the_adopted_rows() {
         let mut tree = NodeTree::new();
@@ -2436,11 +2095,6 @@ mod tests {
         );
     }
 
-    /// E9b F1：表格子树里的**非行**虚拟窗口不得被当行领养。
-    ///
-    /// 旧实现把任何虚拟窗口的已挂载项无条件当行：同一节点同时出现在 `Table` 与物理父的
-    /// `children` 里（a11y 父不唯一，AccessKit consumer 的父指针被覆盖），`row_count` 还被
-    /// `slot.count` 虚增。修复后：只有已挂载项全部声明 `Row` 的窗口才是行窗口。
     #[test]
     fn a_non_row_virtual_window_inside_a_table_is_not_adopted_as_rows() {
         let mut tree = NodeTree::new();
@@ -2458,7 +2112,6 @@ mod tests {
             .expect("viewport");
         let mut items = Vec::with_capacity(3);
         for _ in 0..3 {
-            // 非 Row 的挂载项（例如表内的分组列表条目）。
             items.push(
                 NodeBuilder::boxed()
                     .a11y(A11yOverride {
@@ -2470,7 +2123,7 @@ mod tests {
             );
         }
         let mut slot = crate::interaction::VirtualSlot::new(20.0, 0);
-        slot.count = 30; // 分组列表的条目数，不是表格行数
+        slot.count = 30;
         slot.mounted = items
             .iter()
             .enumerate()
@@ -2510,9 +2163,6 @@ mod tests {
         assert_single_parent_per_node(&tree, &mut ids, &mut tables);
     }
 
-    /// E9b F2：没有 `Table`/`Grid` 祖先的 `Row` 仍是应用违约，但引擎必须产出**自洽**的树：
-    /// `Row` 的父回落到物理父（不误领养），`Cell` 仍挂 `Row`，且 `Row.children` 必须列出它
-    /// （旧实现只列物理直系 ⇒ `Cell` 没有父可达，成为孤儿）。
     #[test]
     fn a_row_without_a_table_keeps_a_self_consistent_tree() {
         let mut tree = NodeTree::new();
@@ -2565,10 +2215,6 @@ mod tests {
         assert_single_parent_per_node(&tree, &mut ids, &mut tables);
     }
 
-    /// E9b F3：`TreeItem` 内嵌 `Tree` 时，内层树的树项必须由**最近的** `Tree` 的索引给出。
-    ///
-    /// 旧实现取「最外层 Tree」：外层索引在嵌套 `Tree` 处停止，内层树项查不到自己的 children
-    /// ⇒ 子项漏列（孤儿）。修复后集合边界不穿越：每棵 `Tree` 有独立索引。
     #[test]
     fn a_nested_tree_inside_a_tree_item_indexes_its_own_items() {
         let mut tree = NodeTree::new();
@@ -2646,9 +2292,6 @@ mod tests {
         assert_single_parent_per_node(&tree, &mut ids, &mut tables);
     }
 
-    /// E9c：写点向上找**最近的声明集合根**（`Table` / `Grid` / `Tree`）——`set_virtual_items`
-    /// 的条目数变化要把集合根以下整棵子树标 `A11Y`，集合边界内最近的根才是派生字段的重算范围
-    /// （嵌套集合的派生字段由内层根自己的索引给出，不得越界标到外层）。
     #[test]
     fn nearest_collection_ancestor_finds_the_closest_declared_collection() {
         fn collection(tree: &mut NodeTree, parent: NodeId, role: A11yRole) -> NodeId {
@@ -2703,12 +2346,6 @@ mod tests {
         );
     }
 
-    /// E12：浮层包装节点是**容器**，不是对话框 —— 引擎不再按浮层槽猜角色。
-    ///
-    /// 这里钉住三条：
-    /// 1. 没有 `role` 声明 ⇒ `GenericContainer`（平台侧透明，不会让 AT 读成对话框）；
-    /// 2. 默认动作表为空（旧实现的 `Dialog` 默认带 `Expand`/`Collapse`，是死动作）；
-    /// 3. 显式声明的角色（Menu / Dialog / AlertDialog / Tooltip）原样生效，不被 kind 覆盖。
     #[test]
     fn an_overlay_wrapper_is_a_container_unless_it_declares_a_role() {
         let mut tree = NodeTree::new();
@@ -2785,13 +2422,6 @@ mod tests {
         );
     }
 
-    /// E12：模态浮层的作用域外节点在 a11y 树里标 `hidden`（背景 `inert` / `aria-hidden`）。
-    ///
-    /// 关键断言：
-    /// - 根**不**隐藏（它是模态的祖先）；
-    /// - 模态包装、模态子树里的节点不隐藏（AT 仍可读对话框内容）；
-    /// - 背景与「不属于该模态的另一个浮层」都隐藏；
-    /// - 包装的 a11y `modal` 跟 `OverlaySlot::trap_focus` 走（不再要求角色是 Dialog）。
     #[test]
     fn a_modal_overlay_hides_the_background_from_a11y() {
         let mut tree = NodeTree::new();
@@ -2854,7 +2484,6 @@ mod tests {
         assert!(modal_ak.is_modal(), "accesskit::Node 必须带 modal 状态");
         assert!(!snapshot_with(&tree, confirm, &mut ids, &mut tables).hidden);
 
-        // 正反对照：没有模态时背景可见（hidden 不是常态）。
         tree.ensure_interaction(modal).expect("interaction").overlay = None;
         let mut fresh_ids = A11yIds::new();
         let mut fresh_tables = super::CollectionSemanticsCache::default();
@@ -2864,7 +2493,6 @@ mod tests {
         );
     }
 
-    /// E12：模态里打开的弹出层经 `opener` 链属于作用域 ⇒ a11y 不隐藏（与交互层同判据）。
     #[test]
     fn a_popup_opened_inside_the_modal_stays_visible_to_a11y() {
         let mut tree = NodeTree::new();
@@ -2902,10 +2530,6 @@ mod tests {
         );
     }
 
-    // ── E15：虚拟容器角色 + orientation ──────────────────────────────────────
-
-    /// 给节点挂虚拟列表槽（E15 容器角色测试的公共前置；与 `make_virtual_list` 一样同时登记
-    /// 反向索引 —— 窗口语义上提用 `virtual_containers` 查候选，漏登记会让 F4 静默失效）。
     fn declare_virtual_window(
         tree: &mut NodeTree,
         node: NodeId,
@@ -2921,8 +2545,6 @@ mod tests {
         tree.note_virtual_container(node);
     }
 
-    /// E15 反向护栏：**裸**虚拟列表（没有集合祖先）仍然自动推导成 `List` —— 「抑制自动 List」
-    /// 只针对集合行窗口，不能把普通列表也吞掉（那会让行长文本的集合语义整体消失）。
     #[test]
     fn a_plain_virtual_list_keeps_the_list_role() {
         let mut tree = NodeTree::new();
@@ -2949,8 +2571,6 @@ mod tests {
         );
     }
 
-    /// E15：容器角色可以**显式声明**（`A11yPatch::role` 优先于按种类推导）—— 选择器 / 菜单的
-    /// 虚拟列表容器声明 `ListBox` 后，AT 看到的是列表框而不是「列表里再套一个列表」。
     #[test]
     fn an_explicit_container_role_overrides_the_auto_list() {
         let mut tree = NodeTree::new();
@@ -2980,8 +2600,6 @@ mod tests {
         assert_eq!(ak.size_of_set(), Some(3));
     }
 
-    /// E15：树的**行窗口**（已挂载项全部声明 `TreeItem`）不再以 `List` 出现；树项仍挂到 `Tree`
-    /// 下（E9 集合语义不变），窗口只作为空的容器留给平台过滤。
     #[test]
     fn a_tree_row_window_is_not_exposed_as_a_list() {
         let mut tree = NodeTree::new();
@@ -3034,8 +2652,6 @@ mod tests {
         }
     }
 
-    /// E15：空行窗口按行窗口计（与 E9 的行窗口判据同口径）—— 首帧还没挂载行时，表格里的虚拟
-    /// 容器不能先闪一个 `List` 再变成容器（角色翻转会让 AT 重新播报整棵集合）。
     #[test]
     fn an_empty_collection_row_window_is_still_suppressed() {
         let mut tree = NodeTree::new();
@@ -3062,9 +2678,6 @@ mod tests {
         );
     }
 
-    /// E15：选择器 / 菜单场景 —— 包装容器显式声明 `ListBox` / `Menu` 后，内层的虚拟列表容器
-    /// 不再自成一列表（平台透明上提后是 `ListBox → ListBoxOption` / `Menu → MenuItem`，而不是
-    /// 「列表里再套一个列表」；P2-4c2 F9 / kit-menu 缺口 2）。
     #[test]
     fn a_list_box_or_menu_container_suppresses_the_inner_list() {
         let mut tree = NodeTree::new();
@@ -3137,9 +2750,6 @@ mod tests {
         );
     }
 
-    /// E15：`orientation` 走**动态补丁优先、静态声明兜底**（与 role/label 的合并方向一致），
-    /// 并落进 `accesskit::Node`（三端读同一属性：UIA OrientationProperty / macOS orientation
-    /// attribute / AT-SPI getOrientation）。
     #[test]
     fn orientation_follows_the_patch_first_merge() {
         let mut tree = NodeTree::new();

@@ -1,32 +1,3 @@
-//! 应用层的几何入口。
-//!
-//! - **变换**（`App::set_geometry_transform`，R05-12 / AR2 P1-D4）：几何节点的 per-draw
-//!   变换（`GeometryDraw.transform` → 顶点着色器的 `draw.basis` / `draw.translation`），
-//!   **不重建顶点缓冲**；
-//! - **数据更新**（`App::update_geometry_vertices/indices`，X5）：按 range 就地更新几何快照，
-//!   只重建块版本变化的块 lane / 只上传变化的 4 KiB 页；
-//! - **成对截断**（`App::truncate_geometry`，X5）：滑动窗口（删尾 + 追加）把顶点/索引同时
-//!   缩短，块数只减、被移除块的旧 AABB 进 damage。
-//!
-//! 数据更新 / 截断会把**所有窗口**里绑定该几何的节点标 PAINT（`GeometryStore` 是进程级，一个
-//! `GeometryId` 可被多个窗口的节点引用），并自动请求一帧；空 range / 没有任何块受影响 /
-//! 截断到当前长度时不标脏、不请求帧。绑定节点包括几何节点（`NodeBuilder::geometry`）与内容里
-//! 引用该几何的 `Canvas` 节点（`Canvas::push_geometry` / `push_path`）。
-//!
-//! # damage 必须两侧都算
-//!
-//! 变换改变后，屏幕上**旧位置**的像素也要重画，否则局部刷新会留残影。节点的 damage 累加器
-//! 由 `touch` 按**节点布局盒**并入，而几何的可见范围是 `transform(GeometryDesc.bounds)` ——
-//! 平移/缩放后它可能落在盒外。因此这里把「旧变换 ∪ 新变换」下的可见范围一起算出来，交给
-//! `NodeTree::set_geometry_transform` 并进**同一条** damage 记账（不是第二条 damage 路径）。
-//!
-//! # 语义边界
-//!
-//! - **只影响绘制，不影响命中**：命中测试（`layout/hit_test.rs`）用的是节点布局盒，per-draw
-//!   变换不参与。让命中跟随变换需要把同一变换的逆应用到命中点，并重估滚动容器的裁剪链 ——
-//!   代价与风险都远超本项，故显式不做（应用若要变点击区，改节点布局盒）。
-//! - 变换只对 `NodeKind::Geometry` 节点有效；其它节点返回 [`EngineError::StaleNode`]。
-
 use super::App;
 use crate::{
     error::EngineError,
@@ -36,23 +7,6 @@ use crate::{
     window::WindowId,
 };
 
-/// `GeometryStore::update_*` 的引擎侧包装（X5）：数据更新 + 绑定节点自动标脏。
-///
-/// # 为什么不是纯数据更新
-///
-/// 几何数据变了以后，绘制输出（`Primitive::Geometry` / 块 lane 的块 AABB）必须跟着重算，
-/// 否则 GPU 读到的还是旧快照。`GeometryStore` 是进程级、不知道哪些节点引用它，因此这里用
-/// 节点树的反向绑定表把「数据更新」翻译成「绑定节点标 PAINT」：paint 走几何分块路径，
-/// 只重建**块版本变化**的块 lane（追加 K 线只重建尾块）。引用该几何的 Canvas 节点也在绑定表
-/// 里（`NodeTree` 在挂载 / `set_canvas` / 卸载时维护），它们没有块级判据 ⇒ 整条 lane 重建。
-///
-/// 几何节点级 `REUSABLE` 不清、节点盒 damage 不并（见 `NodeTree::mark_geometry_updated`）：
-/// 块 lane 的 damage 由块 bounds 的旧∪新精确给出。
-///
-/// # Errors
-/// 同 [`crate::paint::geometry_store::GeometryStore::update_vertices`] /
-/// [`crate::paint::geometry_store::GeometryStore::update_indices`]（陈旧句柄 / 越界 / 非对齐 /
-/// 字节数不一致的强类型错误）。
 pub(crate) fn update_vertices(
     app: &mut App,
     id: GeometryId,
@@ -66,7 +20,6 @@ pub(crate) fn update_vertices(
     Ok(update)
 }
 
-/// [`update_vertices`] 的索引版本（语义对称）。
 pub(crate) fn update_indices(
     app: &mut App,
     id: GeometryId,
@@ -80,13 +33,6 @@ pub(crate) fn update_indices(
     Ok(update)
 }
 
-/// [`update_vertices`] 的截断版本（X5 滑动窗口）：数据层成对缩短 + 绑定节点自动标脏。
-///
-/// 与 range 更新共用同一条「damaged 非空 ⇒ 标脏 ⇒ request_frame」路径；截断到当前个数时
-/// `damaged` 为空 ⇒ 不标脏、不请求帧。
-///
-/// # Errors
-/// 同 [`crate::paint::geometry_store::GeometryStore::truncate`]（陈旧句柄 / 目标个数大于当前）。
 pub(crate) fn truncate(
     app: &mut App,
     id: GeometryId,
@@ -100,12 +46,6 @@ pub(crate) fn truncate(
     Ok(update)
 }
 
-/// 把所有窗口里绑定到 `geometry` 的节点（几何节点 / 引用该几何的 Canvas）标 PAINT，
-/// 返回「是否有节点被标脏」。
-///
-/// `damaged` 为空 = 没有可见变化（空 range / 只改了未被块引用的顶点 / 截断到当前长度）⇒
-/// 不标脏、不请求帧。返回 `true` 时调用方负责 `request_frame`（与 `App::request_repaint` /
-/// signal 写入同语义）。
 fn mark_bound_nodes(app: &mut App, geometry: GeometryId, damaged: Rect) -> bool {
     if damaged.is_empty() {
         return false;
@@ -117,21 +57,8 @@ fn mark_bound_nodes(app: &mut App, geometry: GeometryId, damaged: Rect) -> bool 
     marked
 }
 
-/// 几何 damage 的额外外扩（逻辑像素）。
-///
-/// 与编码器 `paint/instance.rs::bounds_of_aabb` 的 ±1 px 同口径：`GeometryPipeline::Ui` 的解析
-/// AA 让覆盖率带向外扩约 1 个**物理**像素，`FrameOp::Geometry.bounds` 因此再外扩 1 px。这里在
-/// **逻辑**坐标里取 1：`scale >= 1` 时等价保守，`scale < 1` 时更宽（damage 允许偏大）。
 const GEOMETRY_DAMAGE_PAD: f32 = 1.0;
 
-/// 设置几何节点的 per-draw 变换（顶点不重建）。消费者：`App::set_geometry_transform`。
-///
-/// `transform` 是**逻辑像素**的仿射变换：几何局部空间 → 内容空间（与
-/// `GeometryDraw.transform` 同一语义）。
-///
-/// # Errors
-/// - [`EngineError::UnknownWindow`]：窗口不存在；
-/// - [`EngineError::StaleNode`]：节点不存在或不是几何节点。
 pub(crate) fn set_geometry_transform(
     app: &mut App,
     window: WindowId,
@@ -150,7 +77,6 @@ pub(crate) fn set_geometry_transform(
         _ => return Err(EngineError::StaleNode { node }),
     };
     let previous = tree.geometry_transform(node);
-    // 未注册（陈旧句柄）⇒ 拿不到真实范围，只能依赖 `touch` 的节点盒（与 paint 阶段的退化一致）。
     let extra_damage = match geometry.snapshot_arc(id) {
         Some(snapshot) => transformed_damage(previous, snapshot.bounds())
             .union(transformed_damage(transform, snapshot.bounds())),
@@ -159,10 +85,6 @@ pub(crate) fn set_geometry_transform(
     tree.set_geometry_transform(node, transform, extra_damage)
 }
 
-/// `transform(bounds)` 的 AABB + [`GEOMETRY_DAMAGE_PAD`]（内容坐标）。
-///
-/// 与 `paint/pass.rs::geometry_damage` 同一算法（四角取极值）；非有限输入退回 `bounds`
-/// （不制造 NaN damage：`Rect::union` 对空矩形是恒等）。
 fn transformed_damage(transform: Transform, bounds: Rect) -> Rect {
     if bounds.is_empty() {
         return bounds;
@@ -218,7 +140,6 @@ mod tests {
         test_support::app::TestApp,
     };
 
-    /// 注册一块 20×10 的几何（真实三角形顶点，块 AABB = (0,0,20,10)；damage / op 范围可精确断言）。
     fn register(app: &mut TestApp) -> GeometryId {
         let points = [[0.0f32, 0.0, -1.0], [20.0, 0.0, -1.0], [0.0, 10.0, -1.0]];
         let vertex_bytes: Vec<u8> = points
@@ -237,7 +158,6 @@ mod tests {
         app.app_mut().geometry_mut().insert(desc).expect("注册几何")
     }
 
-    /// 挂一个几何节点（布局盒 40×40）并跑一帧，返回节点 id。
     fn mount(app: &mut TestApp, id: GeometryId) -> crate::node::id::NodeId {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口存在").tree().root();
@@ -249,7 +169,6 @@ mod tests {
         node
     }
 
-    /// 帧里 `Primitive::Geometry` 的 per-draw 变换（paint 阶段的消费结果）。
     fn painted_transform(app: &TestApp, window: crate::window::WindowId) -> Option<Transform> {
         let scene = app.app().window(window)?.scene();
         for lane in scene.order() {
@@ -262,7 +181,6 @@ mod tests {
         None
     }
 
-    /// 帧里那条几何 op 的可见范围（物理像素）。
     fn geometry_op_bounds(
         app: &TestApp,
         window: crate::window::WindowId,
@@ -274,8 +192,6 @@ mod tests {
         })
     }
 
-    /// AR2 P1-D4 ①：**生产入口可达** —— 调用后下一帧的 `Primitive::Geometry` 带新变换，
-    /// 编码出的 op 可见范围也按变换后的 `desc.bounds` 算（旧实现只有 `#[cfg(test)]` 写入口）。
     #[test]
     fn the_public_entry_sets_the_transform_that_the_paint_pass_consumes() {
         let mut app = TestApp::new();
@@ -305,14 +221,12 @@ mod tests {
             "paint 必须把节点级变换写进 `GeometryDraw.transform`"
         );
         let bounds = geometry_op_bounds(&app, window).expect("必须有一条几何 op");
-        // 变换后的 AABB (12,7,32,17) 经编码器 `bounds_of_aabb`（floor−1 / ceil+1）。
         assert_eq!(bounds.x0, (12.0 * scale).floor() as i32 - 1);
         assert_eq!(bounds.y0, (7.0 * scale).floor() as i32 - 1);
         assert_eq!(bounds.x1, (32.0 * scale).ceil() as i32 + 1);
         assert_eq!(bounds.y1, (17.0 * scale).ceil() as i32 + 1);
     }
 
-    /// AR2 P1-D4 ②③：damage 两侧都要算（旧 ∪ 新），且回退到单位矩阵后旧位置也会重画。
     #[test]
     fn damage_union_covers_both_the_old_and_the_new_transform() {
         let mut app = TestApp::new();
@@ -355,7 +269,6 @@ mod tests {
         assert_eq!(painted_transform(&app, window), Some(Transform::IDENTITY));
     }
 
-    /// 只有该节点的 damage 被扩大：其它节点的 damage 必须保持为空（局部刷新不被拖成全帧）。
     #[test]
     fn the_transform_damage_stays_local_to_the_geometry_node() {
         let mut app = TestApp::new();
@@ -384,7 +297,6 @@ mod tests {
         );
     }
 
-    /// 非几何节点 / 不存在的窗口：强类型错误，不是静默无效。
     #[test]
     fn invalid_targets_are_typed_errors() {
         let mut app = TestApp::new();
@@ -411,11 +323,9 @@ mod tests {
             other => panic!("不存在的窗口必须报 UnknownWindow，实际 {other:?}"),
         }
     }
-    // ── X5：Geometry range 更新（数据层 + 节点标脏 + damage / 顺序快路径）─────────
 
     use crate::math::PhysicalRect;
 
-    /// `triangles` 个互不共享顶点的三角形（真实位置；每 4096 个三角形一块）。
     fn long_desc(triangles: u32) -> GeometryDesc {
         let mut vertex_bytes = Vec::with_capacity(triangles as usize * 36);
         let mut index_bytes = Vec::with_capacity(triangles as usize * 6);
@@ -450,7 +360,6 @@ mod tests {
             .expect("注册几何")
     }
 
-    /// 每个块的 lane 内容版本（按块序）。
     fn chunk_lane_versions(app: &TestApp, node: crate::node::id::NodeId) -> Vec<u32> {
         let window = app.window_id();
         let window_state = app.app().window(window).expect("窗口存在");
@@ -471,7 +380,6 @@ mod tests {
         bytes
     }
 
-    /// 在几何末尾追加一个三角形（顶点 range + 索引 range，与 K 线追加同路径）。
     fn append_triangle(app: &mut TestApp, id: GeometryId, x: f32, y: f32) {
         let snapshot = app.app().geometry().snapshot_arc(id).expect("已注册");
         let vertex_at = snapshot.vertex_len();
@@ -503,8 +411,6 @@ mod tests {
         damage.iter().any(|rect| !rect.intersect(point).is_empty())
     }
 
-    /// 顶点 range 更新（热力图改色 / 改一格位置）：只重建受影响块的 lane、只产生该块旧∪新的
-    /// damage，并且**不重排绘制序**（`delta.order == None` 快路径）。
     #[test]
     fn range_update_rebuilds_only_the_affected_chunk_lane() {
         let mut app = TestApp::new();
@@ -513,7 +419,6 @@ mod tests {
         let before = chunk_lane_versions(&app, node);
         assert_eq!(before.len(), 2, "两块几何 = 两条块 lane");
 
-        // 移动块 0 里的一个顶点（热力图改一格的位置/颜色都走同一个 range 更新入口）。
         let update = app
             .app_mut()
             .update_geometry_vertices(id, 0..12, &vertex(100.0, 100.0))
@@ -552,7 +457,6 @@ mod tests {
         );
     }
 
-    /// 追加一个三角形到未满的尾块：只重建尾块 lane、damage 只覆盖尾块新范围。
     #[test]
     fn appending_to_the_tail_chunk_rebuilds_only_the_tail_chunk_lane() {
         let mut app = TestApp::new();
@@ -582,7 +486,6 @@ mod tests {
         );
     }
 
-    /// 块满后追加：新建块 lane，绘制序成员变化 ⇒ 本帧 `delta.order` 必须携带新序。
     #[test]
     fn appending_across_the_chunk_boundary_updates_the_draw_order_once() {
         let mut app = TestApp::new();
@@ -603,13 +506,11 @@ mod tests {
         assert_eq!(stats.geometry_encoded_chunks, 1);
         assert!(order_some, "新 lane ⇒ 绘制序成员变化，delta 必须带新序");
 
-        // 下一帧没有新变化 ⇒ 空闲（顺序已经发布，不重复重建）。
         let idle = app.drain().expect("后续帧");
         assert!(!idle.rendered, "顺序已发布后的无变化帧必须空闲");
         assert_eq!(idle.stats.encoded_lanes, 0);
     }
 
-    /// 只追加未被索引引用的顶点：没有块受影响 ⇒ 无 damage、不标脏、帧保持空闲。
     #[test]
     fn appending_unreferenced_vertices_is_invisible_and_keeps_the_frame_idle() {
         let mut app = TestApp::new();
@@ -634,7 +535,6 @@ mod tests {
         assert_eq!(record.stats.geometry_encoded_chunks, 0);
     }
 
-    /// 陈旧句柄与参数错误是**分开的**强类型错误（应用可按类型决定重注册 / 修参数）。
     #[test]
     fn range_update_errors_are_typed_and_distinct() {
         let mut app = TestApp::new();
@@ -671,7 +571,6 @@ mod tests {
             Err(EngineError::GeometryRangeBytes { bytes, .. }) => assert_eq!(bytes, 6),
             other => panic!("字节数不一致必须报 GeometryRangeBytes，实际 {other:?}"),
         }
-        // 合法空区间是 no-op：版本与画面都不动。
         let update = app
             .app_mut()
             .update_geometry_indices(id, 0..0, &[])
@@ -679,8 +578,6 @@ mod tests {
         assert!(update.damaged.is_empty());
     }
 
-    /// RX-7/RX-8：一个 `GeometryId` 被多个窗口的几何节点引用时，数据更新必须标脏**所有**
-    /// 窗口并自动请求一帧；空 range 不标脏、不请求帧。
     #[test]
     fn geometry_update_marks_bound_nodes_in_every_window_and_requests_a_frame() {
         let mut app = TestApp::new();
@@ -696,7 +593,6 @@ mod tests {
                 .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
                 .expect("挂载几何节点");
         }
-        // 首帧：两个窗口各自建立块 lane。
         for window in [first, second] {
             let outcome = app.app_mut().frame(window).expect("窗口存在").expect("帧");
             assert!(
@@ -718,7 +614,6 @@ mod tests {
             app.app().frame_requests() > requests,
             "几何数据更新必须自动请求一帧（与 signal 写入同语义）"
         );
-        // 两个窗口都绑定同一几何 ⇒ 都必须被标脏：各自的下一帧必须真的提交（未标脏会是 Idle）。
         for window in [first, second] {
             match app.app_mut().frame(window).expect("窗口存在").expect("帧") {
                 crate::window::FrameOutcome::Committed(_) => {}
@@ -726,7 +621,6 @@ mod tests {
             }
         }
 
-        // 空 range：合法 no-op ⇒ 不标脏、不请求帧。
         let requests = app.app().frame_requests();
         let update = app
             .app_mut()
@@ -736,9 +630,6 @@ mod tests {
         assert_eq!(app.app().frame_requests(), requests, "空 range 不请求帧");
     }
 
-    // ── 子项 1：Canvas 引用的几何，数据更新后自动标脏 ────────────────────────
-
-    /// 挂一个 Canvas 节点（内容引用 `geometries` 里的几何），返回节点 id。
     fn mount_canvas(app: &mut TestApp, geometries: &[GeometryId]) -> crate::node::id::NodeId {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口存在").tree().root();
@@ -773,9 +664,6 @@ mod tests {
             .contains(DirtyFlags::PAINT)
     }
 
-    /// 公开路径：`NodeBuilder::canvas` + `Canvas::push_geometry`（`GeometryDraw.id` 公开）。
-    /// 更新该几何的顶点后，Canvas 节点必须被自动标 PAINT 且窗口请求一帧（旧实现只标几何节点，
-    /// Canvas 引用完全不在绑定表里 ⇒ 更新要等下一次无关重绘才上屏）。
     #[test]
     fn canvas_referencing_geometry_is_marked_when_the_geometry_data_updates() {
         let mut app = TestApp::new();
@@ -810,9 +698,6 @@ mod tests {
             "Canvas 重建必须把它的内容范围并入 damage：{:?}",
             record.damage
         );
-        // 端到端（headless 合成路径）：编码出的几何 op 必须携带**真实快照**。修复前
-        // `SceneDelta.geometries` 不含 Canvas 内几何 ⇒ 合成端 catalog 查不到 ⇒ 这里会是
-        // `missing_snapshot`（revision 0 / 空页），GPU 侧随之报 `GeometryRegister`。
         let encoded = app
             .app()
             .window(window)
@@ -833,7 +718,6 @@ mod tests {
         );
     }
 
-    /// `Window::set_canvas` 换内容后必须**重建绑定**：旧几何不再标脏该节点，新几何开始标脏。
     #[test]
     fn replacing_canvas_content_rebinds_the_referenced_geometries() {
         let mut app = TestApp::new();
@@ -851,7 +735,6 @@ mod tests {
         let _ = app.drain().expect("旧几何更新帧");
         clear_dirty(&mut app);
 
-        // 换成只引用 second 的内容。
         let window = app.window_id();
         let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 40.0, 40.0));
         canvas.push_geometry(GeometryDraw::full(
@@ -870,7 +753,6 @@ mod tests {
         let _ = app.drain().expect("替换帧");
         clear_dirty(&mut app);
 
-        // 旧几何再更新：已解绑 ⇒ 不标脏、不请求帧。
         let requests = app.app().frame_requests();
         let update = app
             .app_mut()
@@ -887,7 +769,6 @@ mod tests {
             "没有绑定节点 ⇒ 不请求帧"
         );
 
-        // 新几何更新：重新登记（标 PAINT + 请求帧）。
         let requests = app.app().frame_requests();
         let _ = app
             .app_mut()
@@ -900,10 +781,6 @@ mod tests {
         );
     }
 
-    // ── 子项 2：truncate 接线：块 lane 释放 / 请求帧 / 截断后追加 ─────────────
-
-    /// 截断 2 块 → 1 块：绑定节点标脏、窗口请求一帧，下一帧释放多余块 lane 并把被移除块的
-    /// 旧 AABB 并入 damage；随后追加跨块会重新建出块 lane（绘制序再次发布）。
     #[test]
     fn truncating_geometry_releases_block_lanes_and_requests_a_frame() {
         let mut app = TestApp::new();
@@ -966,7 +843,6 @@ mod tests {
             "块数减少后多余块 lane 必须释放"
         );
 
-        // 截断到当前长度 = no-op：不标脏、不请求帧。
         let requests = app.app().frame_requests();
         let update = app
             .app_mut()
@@ -975,7 +851,6 @@ mod tests {
         assert!(update.damaged.is_empty());
         assert_eq!(app.app().frame_requests(), requests, "no-op 不请求帧");
 
-        // 截断后追加一个三角形（跨块）：重新建出块 lane，绘制序再次变化。
         append_triangle(&mut app, id, 100.0, 100.0);
         let record = app.drain().expect("追加帧");
         assert!(record.delta.order_some, "新建块 lane ⇒ 绘制序必须重新发布");
@@ -998,12 +873,6 @@ mod tests {
         assert_eq!(idle.stats.encoded_lanes, 0);
     }
 
-    /// 截断到 0：节点保留一条**装饰 lane**（几何 op 不发射），damage 只覆盖被移除的块、不把
-    /// 整个注册 `bounds` 拖进来；随后追加会自动恢复块 lane 与几何 op。
-    ///
-    /// 审查 RBG-03：`desired.max(1)` 保留装饰 lane 是**有意行为**（空数据不应让节点背景/边框/
-    /// 焦点环消失）；但缺失块不能回退整块注册 bounds（否则清空图表时闪一次覆盖整个几何范围的
-    /// damage）。
     #[test]
     fn truncating_geometry_to_zero_keeps_the_decorative_lane_and_can_grow_back() {
         let mut app = TestApp::new();
@@ -1011,7 +880,6 @@ mod tests {
         let node = mount(&mut app, id);
         let window = app.window_id();
         let snapshot = app.app().geometry().snapshot_arc(id).expect("快照");
-        // 两块 AABB：(0,0,64,64) 与 (0,64,10,1)；注册 bounds 是 (0,0,64,100)。
         let first_bounds = snapshot.chunk(0).expect("块 0").bounds;
         let second_bounds = snapshot.chunk(1).expect("块 1").bounds;
         assert_eq!(snapshot.bounds(), Rect::new(0.0, 0.0, 64.0, 100.0));
@@ -1052,7 +920,6 @@ mod tests {
             window_state.encoded_geometry()
         );
 
-        // 追加：块 lane 与几何 op 都必须恢复。
         append_triangle(&mut app, id, 100.0, 100.0);
         let record = app.drain().expect("追加帧");
         assert!(record.rendered, "追加必须提交");
@@ -1073,10 +940,6 @@ mod tests {
         );
     }
 
-    /// Canvas 引用 2 块几何：`truncate_geometry` 后 Canvas 节点被自动标脏/请求帧，重建 lane 后
-    /// 编码器按**新快照**只发射 1 个几何 op（块 1 的 op 消失）。
-    ///
-    /// 审查 RBG-06/07：Canvas 绑定 × truncate 的交叉面（两个修复点组合）此前没有测试。
     #[test]
     fn truncating_geometry_reencodes_the_canvas_that_references_it() {
         let mut app = TestApp::new();
@@ -1132,8 +995,6 @@ mod tests {
         );
     }
 
-    /// E4 / §11.4：Canvas 内 `GeometryDraw.range` 切换子区间 ⇒ 只编码新 range 相交的块；
-    /// damage 覆盖画布旧 ∪ 新范围且**不是整帧**（子范围变化不损伤整个窗口）。
     #[test]
     fn canvas_geometry_range_change_reencodes_and_damages_locally() {
         let mut app = TestApp::new();
@@ -1158,9 +1019,6 @@ mod tests {
         );
         clear_dirty(&mut app);
 
-        // 中间帧：把画布 bounds 扩到整份几何（64×100；节点盒只有 40×40）。这样下一步收缩
-        // range 时，「旧画布 AABB」里节点盒之外的部分（如 y = 50）只能由旧侧 damage 覆盖——
-        // 下面的旧侧断言因此对「删除旧画布 damage」的变异敏感（节点盒 damage 覆盖不到 y = 50）。
         let window = app.window_id();
         let mut wide = Canvas::new(Rect::new(0.0, 0.0, 64.0, 100.0));
         wide.push_geometry(GeometryDraw::full(id, Transform::IDENTITY, Color::WHITE));
@@ -1176,8 +1034,6 @@ mod tests {
         assert!(record.rendered, "画布扩展必须提交一帧");
         clear_dirty(&mut app);
 
-        // 换成只画第二块；画布 bounds 收缩到新 range 的可见块 AABB（Canvas 契约：
-        // bounds ⊇ 内部图元 bounds）。旧侧区域（y = 50，见上）只能由旧画布 AABB 覆盖。
         let visible_bounds = Rect::new(0.0, 64.0, 10.0, 1.0);
         let mut canvas = Canvas::new(visible_bounds);
         canvas.push_geometry(GeometryDraw {
@@ -1213,7 +1069,6 @@ mod tests {
             "只编码新 range 相交的块（不相交的块不产生 op）"
         );
 
-        // 空 range：该 draw 不产生任何几何 op，但旧像素必须由画布 damage 重画。
         let mut canvas = Canvas::new(visible_bounds);
         canvas.push_geometry(GeometryDraw {
             id,

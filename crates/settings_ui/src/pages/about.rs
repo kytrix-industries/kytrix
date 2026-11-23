@@ -1,5 +1,3 @@
-//! The about page: the version of the application that is running.
-
 use base_ui::{style_builder::StyleBuilder, theme::role::Role};
 use i18n::translate::Translate;
 use smol_str::SmolStr;
@@ -12,16 +10,13 @@ use crate::{
     search::{FieldSearch, PageSearch, words},
 };
 
-/// The id of this page's setting.
 const PAGE: &str = "about";
 
-/// The about page.
 pub(crate) struct AboutPage {
     host: SettingsHost,
 }
 
 impl AboutPage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
     pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
         Self { host }
     }
@@ -96,7 +91,6 @@ impl PageView for AboutPage {
     fn release(&mut self, _app: &mut App) {}
 }
 
-/// The text this page and its settings are searched by.
 pub(crate) fn search(translate: &Translate) -> PageSearch {
     let title = i18n::t_smol!(translate, "settings_ui.about.title");
     let version = i18n::t_smol!(translate, "settings_ui.about.version");

@@ -1,16 +1,3 @@
-//! The fixture seam, driven the way a test outside this crate drives it.
-//!
-//! The seam's own coverage lives here rather than beside it because a fixture is a
-//! *configuration*, and this target builds one through the public API the other crates'
-//! tests use: `fixture::venues` hands back the settings snapshot a root is built over,
-//! with every address the venues it names publish resolving at the sockets the caller
-//! owns. Nothing here is process-wide, so two tests in one binary never read each
-//! other's sockets.
-//!
-//! `test-support` is a dev-dependency feature, and this target is what asks for it: the
-//! crate's own `[dev-dependencies]` turns it on, so `cargo test -p app_config` builds the
-//! seam exactly as a workspace build does.
-
 use app_config::market_participants::{
     fixture::{self, FixtureAddress},
     settings::{
@@ -20,7 +7,6 @@ use app_config::market_participants::{
 use market_participants_model::identifier::VenueId;
 use url::Url;
 
-/// A pair of sockets, one per role.
 fn everywhere() -> FixtureAddress {
     FixtureAddress {
         http: Url::parse("http://127.0.0.1:8080").expect("the fixture address is a URL"),
@@ -28,7 +14,6 @@ fn everywhere() -> FixtureAddress {
     }
 }
 
-/// Everything the seam promises, driven in one installation.
 #[test]
 fn a_fixture_installation_reaches_a_venue_at_the_sockets_it_names() {
     let fixture = everywhere();
@@ -64,8 +49,6 @@ fn a_fixture_installation_reaches_a_venue_at_the_sockets_it_names() {
         "every scope of one venue is reached at the same pair"
     );
 
-    // What an address is *called* never moves, so a file written from a fixture is a
-    // file this build decodes and reads back as the same settings.
     let binance =
         serde_json::to_value(&venues[&VenueId::Binance]).expect("a fixture row serializes");
     assert_eq!(
@@ -89,9 +72,6 @@ fn a_fixture_installation_reaches_a_venue_at_the_sockets_it_names() {
         "and so is the one address HyperCore publishes"
     );
 
-    // The built-in table is what a venue publishes, and a fixture installation is separate:
-    // building one leaves `default_venues` alone, and the venues the caller did not name keep
-    // the addresses they publish.
     assert_eq!(
         default_venues()[&VenueId::Binance]
             .origins(BINANCE_SPOT)
@@ -121,11 +101,6 @@ fn a_fixture_installation_reaches_a_venue_at_the_sockets_it_names() {
     );
 }
 
-/// One venue's fixtures are that venue's: a snapshot that names only Binance leaves OKX and
-/// HyperCore where their venues publish them.
-///
-/// This is the property that makes two tests in one binary independent — each builds its own
-/// snapshot, and the venues it did not point stay reachable at their real addresses.
 #[test]
 fn a_fixture_points_only_the_venues_it_names() {
     let fixture = everywhere();
@@ -153,7 +128,6 @@ fn a_fixture_points_only_the_venues_it_names() {
         "and so is the other one"
     );
 
-    // A snapshot is a value, so two of them coexist: the second does not move the first.
     let other = Url::parse("http://127.0.0.1:9090").expect("the other fixture address is a URL");
     let moved = fixture::venues([(VenueId::Binance, FixtureAddress::at(&other))]).into_venues();
 
@@ -173,8 +147,6 @@ fn a_fixture_points_only_the_venues_it_names() {
     );
 }
 
-/// The stream role moves with the request role when one address serves both, and apart when
-/// the caller names them apart.
 #[test]
 fn both_roles_of_a_fixture_move_together() {
     let single = Url::parse("http://127.0.0.1:8080").expect("the fixture address is a URL");
@@ -200,7 +172,6 @@ fn both_roles_of_a_fixture_move_together() {
     );
 }
 
-/// Returns one address as the URL a request would dial it at.
 fn published(address: &str) -> Option<String> {
     Some(
         Url::parse(address)

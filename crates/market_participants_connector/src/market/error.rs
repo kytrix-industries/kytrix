@@ -25,7 +25,6 @@ impl MarketNetworkError {
         self.0.is_retryable()
     }
 
-    /// Returns the classified market-participant failure behind this market error.
     pub fn error(&self) -> &MarketParticipantError {
         &self.0
     }
@@ -83,14 +82,6 @@ pub enum MarketError {
 }
 
 impl MarketError {
-    /// Whether the market refused because the venue's scope is not loaded.
-    ///
-    /// "Not loaded" and "not supported" are the two answers one scope can be refused
-    /// with, and a caller acts on them differently: a market the user has not loaded —
-    /// or one a shrinking commit has taken away while a request was in flight — is a
-    /// wait, while a scope this build does not serve is a refusal to give up on. The
-    /// answer is read here, from the typed error, so a caller does not depend on the
-    /// shape the market-participant error happens to be wrapped in.
     pub fn is_venue_not_loaded(&self) -> bool {
         matches!(
             self,
@@ -118,25 +109,12 @@ impl From<ModelError> for MarketError {
     }
 }
 
-/// Why one market request was refused before the venue saw it.
-///
-/// The refusal is a closed value rather than a sentence, because the message a
-/// caller draws from it is a business label a user reads: a formatted reason
-/// would carry the raw listing id of the request into that label, and a listing
-/// identity belongs in the typed field of an error, not in the text of a name.
-/// The status is the venue's own published state, so the message states it
-/// without naming the identity it belongs to.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum MarketRequestRejection {
-    /// The listing is settled or delisted, so it carries no market data to read.
     #[error("the listing is not readable while it is {status:?}")]
-    ListingNotReadable {
-        /// The published state that makes the listing unreadable.
-        status: ListingStatus,
-    },
+    ListingNotReadable { status: ListingStatus },
 }
 
-/// Maps one instrument-directory failure into the market capability's own error.
 pub(crate) fn market_error_from_catalog(error: CatalogError) -> MarketError {
     match error {
         CatalogError::Source(error) => MarketError::CatalogSource((*error).clone()),
@@ -162,8 +140,6 @@ mod tests {
         )
     }
 
-    /// An unsupported capability keeps the full route and the exact capability:
-    /// a caller has to be able to name the scope that failed.
     #[test]
     fn unsupported_network_capability_maps_to_a_market_capability_error() {
         let error = crate::error::MarketParticipantError::UnsupportedCapability {
@@ -180,9 +156,6 @@ mod tests {
         );
     }
 
-    /// A market nothing loaded stays a market nothing loaded — and a different answer
-    /// from the unsupported capability above: a caller waits for the first and gives up
-    /// on the second, so the mapping must not fold them together.
     #[test]
     fn an_unloaded_market_maps_to_a_market_that_is_not_loaded() {
         let error = crate::error::MarketParticipantError::VenueNotLoaded {
@@ -204,9 +177,6 @@ mod tests {
         ));
     }
 
-    /// A rejection the request itself produced keeps its own shape, so a caller reads the
-    /// typed value it named — the interval or the adjustment convention — instead of a
-    /// paraphrased sentence about a failed request.
     #[test]
     fn an_unsupported_adjustment_maps_to_a_network_error() {
         let error = crate::error::MarketParticipantError::UnsupportedAdjustment {
@@ -228,10 +198,6 @@ mod tests {
         ));
     }
 
-    /// The predicate a pane reads is about the one answer that is a wait: the scope is
-    /// not loaded. A scope this build does not serve and a venue that could not be
-    /// reached are both something else — the first is settled on the scope, the second
-    /// is a network failure — so neither may be answered with the notice.
     #[test]
     fn only_an_unloaded_market_is_reported_as_not_loaded() {
         let unloaded = MarketError::from(crate::error::MarketParticipantError::VenueNotLoaded {
@@ -268,8 +234,6 @@ mod tests {
         );
     }
 
-    /// A unit rejection is a model rejection, and it stays typed: a caller shows
-    /// the expected unit instead of a paraphrased string.
     #[test]
     fn a_quantity_unit_mismatch_stays_a_model_error() {
         let error = MarketError::from(ModelError::QuantityUnitMismatch {

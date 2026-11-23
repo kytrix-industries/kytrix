@@ -1,84 +1,3 @@
-//! The order-book widget.
-//!
-//! One widget follows one venue and one instrument, and draws the depth that
-//! venue publishes for it: the ask ladder above the mid price, the bid ladder
-//! below it, and the imbalance between the two sides. A book that has not been
-//! pointed at an instrument yet asks for one and opens no stream; everything it
-//! *does* around a frame — connecting, synchronizing the opening book, failing —
-//! is reported through the framework's status handle, and the body only ever
-//! draws the book it has.
-//!
-//! # The ladder: labels are nodes, depth bars are a canvas
-//!
-//! Each side is a [`List`] of row labels — three text nodes per row, all of them
-//! `bind_text` closures over the book signal this pane publishes — with a depth
-//! bar canvas drawn behind the list. Splitting the two is what makes an easing
-//! frame cheap: the bars move on every frame while the labels only change when
-//! the book does (the model reuses each formatted label for as long as its value
-//! is the same). The canvas carries quads only, so no glyph lease or registered
-//! geometry has to be handed back; what the pane keeps is the prepared frame key
-//! in [`paint`](crate::paint), and a steady `sync` writes no canvas at all (I3).
-//!
-//! The rows are ordinary nodes rather than one big canvas for a second reason:
-//! a ladder is text, and text belongs to the engine. It is laid out, shaped,
-//! clipped and exposed to assistive technology by the same code as every other
-//! label in the product, and a language or appearance switch needs no canvas
-//! rebuild.
-//!
-//! # Three pieces of local state
-//!
-//! Three things make the book feel like a book rather than a picture, and each of
-//! them is deliberately kept out of the status:
-//!
-//! - **the grouped ladder**, which is rebuilt from the snapshot the widget is
-//!   already holding whenever the grouping, the row limit or the pane's height
-//!   changes. None of those is worth reopening a stream for;
-//! - **the depth animation**, which eases every published book towards the ratios
-//!   it asks for, and stops as soon as the bars have arrived. It is driven by one
-//!   [E10](ui_core::app::App::after_scoped) timer chain at the engine's frame
-//!   tick: a steady book schedules no timer, and a settled movement stops the
-//!   chain (I3, `reduce_motion` lands the bars where they belong);
-//! - **the previous mid price**, which is only there to say which way the mid
-//!   price has moved since the frame before.
-//!
-//! # The header: one picker and two drawing choices
-//!
-//! The left group holds the instrument picker — the same
-//! [`InstrumentButton`](instrument_selector_ui::instrument_button::InstrumentButton)
-//! every pane that follows a listing draws — and the right group the price
-//! grouping and the row limit, both [`Select`]s. The picker opens the selector
-//! through [`SelectorHost`], the host the selector crate froze with the widget
-//! contract; the host takes the composition root's shared services handle
-//! (`Rc::clone(cx.services_rc())`), never a second aggregate assembled here.
-//!
-//! A control's label and its entries are chosen when it is built, so a language
-//! switch, a new selection or a directory generation that may have widened what
-//! the picker offers rebuilds it in place; a header row the pane replaced first
-//! is a stale parent, and the component is released without touching the nodes
-//! (AGENTS §15.1). Releasing the picker's [`InstrumentButtonHandle`] is what
-//! takes its click handler and signal scope down — a header rebuilt on every
-//! language switch would otherwise leak one component scope per rebuild (W2a
-//! review F2).
-//!
-//! # Confirmation is a signal, not a re-entry
-//!
-//! The selector's confirm handler and the two pickers' change handlers run with
-//! an application context and no widget context, so they cannot call into the
-//! pane: they write the request into a signal and ask for a frame, and the next
-//! `sync` applies it. That is the same split the news and market-trade panes use
-//! for their header controls (AGENTS §4.2: a control asks for the next `sync`
-//! instead of re-entering the widget).
-//!
-//! # The directory
-//!
-//! The pane never loads the directory and never polls the catalogue: it re-reads
-//! the answers its [`MarketDirectory`] gives on every load, and re-runs that load
-//! when the injected [`catalog_generation`](widget::services::WidgetServices::catalog_generation)
-//! signal moves (AGENTS §8.3). A listing the directory provably dropped — it left
-//! the catalogue, or its route left the loaded venues — is reset to "nothing
-//! chosen"; a lookup that failed proves nothing and leaves the stored value
-//! alone.
-
 use std::{
     cell::{Cell, RefCell},
     convert::Infallible,
@@ -159,41 +78,16 @@ use super::{
     },
 };
 
-/// The depth the service asks a venue for. A venue that publishes shallower than
-/// this answers with what it has.
 const SNAPSHOT_DEPTH: u16 = 5_000;
 
-/// What one depth-animation tick advances the bars by.
-///
-/// The chain is an E10 one-shot timer that re-arms itself, and each callback moves
-/// the easing by exactly this step: the movement is **not** measured from elapsed
-/// engine time (the engine exposes no clock read surface), so a dropped frame
-/// lengthens the animation by the ticks it lost instead of being skipped over.
-/// The settle predicate reads the same step, which is what stops the chain.
 const DEPTH_ANIMATION_TICK: Duration = Duration::from_millis(16);
 
-/// The widget-local names of the header controls' kit keys.
-///
-/// A kit key is **application-level** — the button derives its click action from
-/// it (`"<key>.click"`) and a select its trigger action (`"<key>.trigger"`) — so
-/// the pane does not spell the keys out: [`WidgetCx::unique_key`] stamps each
-/// suffix with the pane's instance scope. The same suffix in the same instance
-/// always mints the same key, which is what lets a control rebuilt on a later
-/// frame reclaim the identity it registered.
 const INSTRUMENT_KEY_SUFFIX: &str = "order_book.header.instrument";
 const PRICE_STEP_KEY_SUFFIX: &str = "order_book.header.price_step";
 const WINDOW_SIZE_KEY_SUFFIX: &str = "order_book.header.window_size";
 const ASK_LIST_KEY_SUFFIX: &str = "order_book.ask";
 const BID_LIST_KEY_SUFFIX: &str = "order_book.bid";
 
-/// Which venue and instrument a book follows, and how finely it groups them.
-///
-/// The scope is optional because a book can exist before the user has chosen
-/// anything: it then asks for an instrument instead of drawing a default one
-/// nobody asked for. The two drawing choices are stored with the scope because
-/// they are what the user picked, not what the venue said: a book of the same
-/// instrument grouped to a finer step is a different chart, and reopening the
-/// pane should show the one that was there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderBookConfig {
     selection: Option<InstrumentSelection>,
@@ -216,16 +110,6 @@ impl WidgetConfig for OrderBookConfig {
 }
 
 impl OrderBookConfig {
-    /// Settles the two drawing choices against the ones this book offers.
-    ///
-    /// A persisted config can name a grouping or a row limit this build no longer
-    /// offers — or a row limit the route's book is too shallow to fill. Such a
-    /// choice goes back to the default one: a neighbouring choice is something the
-    /// user did not pick, and drawing the book with it would look like a decision
-    /// they made. The row limit is judged only when the route's depth is known: a
-    /// book that follows nothing has no route to judge it against, and its stored
-    /// choice is left alone until one is chosen. Returns whether anything was
-    /// replaced, which is what the pane reports so the replacement is written back.
     fn settle(&mut self, depth: Option<u16>) -> bool {
         let defaults = Self::default();
         let mut settled = false;
@@ -244,7 +128,6 @@ impl OrderBookConfig {
     }
 }
 
-/// A failure the book can report that is not already a stream error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OrderBookFailure {
     Stream(OrderBookStreamError),
@@ -260,20 +143,11 @@ impl TranslatedError for OrderBookFailure {
     }
 }
 
-/// One command this pane sent and has not seen the answer to.
-///
-/// A book reads through one binding and issues one kind of command, so the tag
-/// names the read: it is the identity the binding returned that decides whose
-/// answer arrived. A reply whose identity is not tracked answers a call the pane
-/// already replaced (a new selection, a retry, or signing out of a route) and is
-/// dropped and counted rather than failing the scope that replaced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingCommand {
-    /// The read: `Load` or `Retry`.
     Start,
 }
 
-/// The direction the mid price moved in since the frame before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MidDirection {
     Up,
@@ -281,20 +155,12 @@ enum MidDirection {
     Flat,
 }
 
-/// One choice made in the header's right group, waiting for the next `sync`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeaderRequest {
-    /// The price-grouping multiplier the user picked.
     PriceStep(u32),
-    /// The row limit the user picked.
     WindowSize(usize),
 }
 
-/// The labels the ladder's columns are written with.
-///
-/// They come from the listing's own rules — the asset its prices are quoted in and
-/// what its quantities count — never from a field name, and the name of an asset is
-/// the display code the published generation decided on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OrderBookUnitLabels {
     price: SmolStr,
@@ -310,12 +176,6 @@ impl OrderBookUnitLabels {
     }
 }
 
-/// The display code of one asset, as the captured generation published it.
-///
-/// Only the display catalog knows what an asset is called: the canonical identity
-/// of a token is a digest, and the code it publishes is the whole name of the
-/// asset. An asset the captured generation does not name is the localized unknown
-/// rather than an identity digest.
 fn asset_display(display: &DisplaySnapshot, asset: &AssetId, translate: &Translate) -> SmolStr {
     display.resolver().asset_code(asset).map_or_else(
         |_| t_smol!(translate, "error.display.unknown_asset"),
@@ -323,7 +183,6 @@ fn asset_display(display: &DisplaySnapshot, asset: &AssetId, translate: &Transla
     )
 }
 
-/// The label of what one quantity counts.
 fn quantity_label(
     unit: &QuantityUnit,
     display: &DisplaySnapshot,
@@ -340,7 +199,6 @@ fn quantity_label(
     }
 }
 
-/// Which side of the book one list draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowSide {
     Ask,
@@ -348,7 +206,6 @@ enum RowSide {
 }
 
 impl RowSide {
-    /// The themed colour of this side's prices.
     fn price_role(self) -> Role {
         match self {
             Self::Ask => Role::MarketDown,
@@ -356,7 +213,6 @@ impl RowSide {
         }
     }
 
-    /// The themed colour of this side's depth bars.
     fn depth_role(self) -> Role {
         match self {
             Self::Ask => Role::MarketDownWeak,
@@ -365,7 +221,6 @@ impl RowSide {
     }
 }
 
-/// The arrow and the direction the mid price moved in.
 fn mid_direction_of(current: Option<Price>, previous: Option<Price>) -> MidDirection {
     match (current, previous) {
         (Some(current), Some(previous)) if current > previous => MidDirection::Up,
@@ -374,16 +229,10 @@ fn mid_direction_of(current: Option<Price>, previous: Option<Price>) -> MidDirec
     }
 }
 
-/// Whether a movement still has enough left to be worth a frame.
 fn depth_is_active(progress: f32, span: f32) -> bool {
     span * (1.0 - progress) > DEPTH_ANIMATION_SETTLE_EPSILON
 }
 
-/// The state the depth-timer chain reads and writes.
-///
-/// It is shared with the timer callbacks (which own no widget context), so every
-/// value it touches is a signal or a cell the callbacks may reach. `alive` is
-/// what keeps a released pane's chain from reading signals whose scope has gone.
 struct DepthTickerState {
     progress: Signal<f32>,
     span: Signal<f32>,
@@ -395,7 +244,6 @@ struct DepthTickerState {
 }
 
 impl DepthTickerState {
-    /// Schedules the next tick, remembering the timer so `release` can cancel it.
     fn schedule(self: &Rc<Self>, app: &mut App) {
         let state = Rc::clone(self);
         match app.after_scoped(self.window, self.scope, DEPTH_ANIMATION_TICK, move |app| {
@@ -410,8 +258,6 @@ impl DepthTickerState {
     }
 }
 
-/// One tick of the depth animation: advance the progress signal and ask for the
-/// frame that draws the bars at it.
 fn tick_depth(app: &mut App, state: Rc<DepthTickerState>) {
     if !state.alive.get() {
         return;
@@ -428,12 +274,6 @@ fn tick_depth(app: &mut App, state: Rc<DepthTickerState>) {
     state.schedule(app);
 }
 
-/// A grouped ladder as the body's bindings read it.
-///
-/// The signal carries the shared allocation rather than the drawing itself, so two
-/// publishes of the same grouped book compare equal by pointer and a steady `sync`
-/// writes nothing: the widget only ever replaces a grouped book wholesale (the
-/// model reuses labels inside a rebuild), and an unchanged book is never replaced.
 #[derive(Clone, Default)]
 struct PublishedBook {
     book: Option<Arc<GroupedBook>>,
@@ -450,17 +290,14 @@ impl PartialEq for PublishedBook {
 }
 
 impl PublishedBook {
-    /// The newest trade's mid price, when the book has one.
     fn mid_price_text(&self) -> Option<&SmolStr> {
         self.book.as_ref()?.mid_price_text.as_ref()
     }
 
-    /// The spread between the best bid and the best ask, when the book has both.
     fn spread_text(&self) -> Option<&SmolStr> {
         self.book.as_ref()?.spread_text.as_ref()
     }
 
-    /// One side's share of the visible quantity.
     fn imbalance_text(&self, side: RowSide) -> Option<&SmolStr> {
         let book = self.book.as_ref()?;
         Some(match side {
@@ -469,7 +306,6 @@ impl PublishedBook {
         })
     }
 
-    /// One visible level of `side`, best first.
     fn level(&self, side: RowSide, row: usize) -> Option<&GroupedLevel> {
         let book = self.book.as_ref()?;
         match side {
@@ -478,32 +314,23 @@ impl PublishedBook {
         }
     }
 
-    /// Whether the book has no level on either side.
     fn is_empty(&self) -> bool {
         self.book
             .as_ref()
             .is_some_and(|book| book.asks.is_empty() && book.bids.is_empty())
     }
 
-    /// Which way the mid price moved against `previous`.
     fn direction_against(&self, previous: Option<Price>) -> MidDirection {
         mid_direction_of(self.book.as_ref().and_then(|book| book.mid_price), previous)
     }
 }
 
-/// The header's left group: the instrument picker and the copy it was built with.
 struct HeaderLeft {
     control: InstrumentButtonHandle,
     parent: NodeId,
     built: HeaderState,
 }
 
-/// What the header's left control states, as one comparable value.
-///
-/// The generation is part of it because the filters snapshot the control opens its
-/// selector with is read from the loaded venues when the control is built: a venue
-/// loaded later is one the user must be able to pick on, and a control built
-/// before that commit would keep opening a picker that does not offer it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeaderState {
     selection: Option<InstrumentSelection>,
@@ -511,19 +338,14 @@ struct HeaderState {
     generation: u64,
 }
 
-/// The header's right group: the two drawing choices and the copy they were built
-/// with.
 struct HeaderRight {
-    /// The pane's group container the controls are rebuilt into.
     slot: NodeId,
-    /// The widget's own row inside that container, which a rebuild replaces.
     root: NodeId,
     price_step: Select,
     window_size: Select,
     built: HeaderRightState,
 }
 
-/// What the two drawing pickers state, as one comparable value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeaderRightState {
     language: LanguageCode,
@@ -536,88 +358,44 @@ struct HeaderRightState {
 
 pub struct OrderBookWidget {
     config: OrderBookConfig,
-    /// The executor bridge, when this host has a directory to drive a service from.
-    ///
-    /// A headless host without a connector has nothing to start: the pane waits
-    /// for the directory instead of spawning a service it could never ask a
-    /// question.
     binding: Option<WidgetBinding<OrderBookProtocol>>,
-    /// The command in flight, keyed by the identity the binding returned.
     pending: Pending<PendingCommand>,
     status: WidgetStatus,
-    /// The recovery the framework offers for every failure this widget reports.
     recovery: WidgetAction,
     config_change: WidgetConfigChange,
-    /// The loaded directory, when the host has one.
     directory: Option<Rc<dyn MarketDirectory>>,
-    /// The body root and the two ladder areas, once the body has been built.
     body_root: Option<NodeId>,
     ask_area: Option<NodeId>,
     bid_area: Option<NodeId>,
-    /// The two row lists and the canvases behind them.
     ask_list: Option<List>,
     bid_list: Option<List>,
     ask_bars: SideCanvas,
     bid_bars: SideCanvas,
     imbalance: Imbalance,
-    /// The grouped ladder the body draws, published to every `bind_text` that
-    /// reads a row, the mid price or the imbalance.
     book: Signal<PublishedBook>,
-    /// The labels of the price and quantity columns, published on metadata change.
     unit_labels: Signal<OrderBookUnitLabels>,
-    /// Which way the mid price moved since the frame before.
     mid_direction: Signal<MidDirection>,
-    /// The depth easing: how far the bars have come and how far they have to go.
     depth_progress: Signal<f32>,
     depth_span: Signal<f32>,
-    /// The empty-state sentence, in the language the body was last synchronized in.
     empty_text: Signal<SmolStr>,
-    /// Selections confirmed in the header control, waiting for the next `sync`.
     selection_requests: Signal<Option<InstrumentSelection>>,
-    /// Drawing choices made in the header pickers, waiting for the next `sync`.
     header_requests: Signal<Option<HeaderRequest>>,
     language: Signal<LanguageCode>,
-    /// The directory generation the composition root publishes.
     generation: Signal<u64>,
     translate: Translate,
     theme: ThemeHandle,
-    /// The book the stream last published, which is what regrouping reads from.
     snapshot: Option<OrderBookSnapshot>,
-    /// The grouped ladder a frame draws.
     grouped: Option<Arc<GroupedBook>>,
-    /// The sequence a book has to reach before the widget is done working.
     ready: Option<MarketSequence>,
     metadata: Option<OrderBookMetadata>,
-    /// The labels of the price-grouping choices, formatted once per price tick.
     price_step_labels: [SmolStr; PRICE_MULTIPLIERS.len()],
-    /// How many rows one side has room for, as the last layout of the ladder said.
     drawable_rows: usize,
     previous_mid_price: Option<Price>,
-    /// Whether the snapshot metadata moved since it was last published.
     book_dirty: bool,
-    /// Whether the ladder is waiting for its market rather than reading it.
-    ///
-    /// The pane keeps its stream while it waits — the alternative is cancelling the
-    /// binding, which is terminal, and this pane has to be able to read the market
-    /// again once the user loads it — so a book that was in flight when the route
-    /// went away can still arrive. Accepting it would put a snapshot back and make
-    /// the pane report content over the notice the framework is drawing, so every
-    /// message entry refuses while this is set. The stream key cannot do this job:
-    /// it says which scope a book belongs to, and this one belongs to the scope the
-    /// notice is about.
     awaiting_market: bool,
-    /// Whether the venue this book reads was loaded or refreshed again.
-    ///
-    /// Such a commit replaces the catalog generation the live stream resolved its
-    /// rules, units and price steps against, while the stream itself keeps what it
-    /// resolved when it was opened. So the book has to start over, and the request
-    /// it sends has to be the one that opens a new stream.
     market_reloaded: bool,
-    /// The generation this pane has already reacted to.
     seen_generation: u64,
-    /// The language the body's own static copy was last written in.
     built_language: Option<LanguageCode>,
-    /// The depth-animation chain, while one is running.
     depth_ticker: Option<Rc<DepthTickerState>>,
     header_left: Option<HeaderLeft>,
     header_right: Option<HeaderRight>,
@@ -641,8 +419,6 @@ impl WidgetView for OrderBookWidget {
         recovery: WidgetAction,
         cx: &mut WidgetCx<'_>,
     ) -> Result<Self, EngineError> {
-        // A host without a directory has nothing to ask and nothing to start; the
-        // pane reports the neutral notice and waits. Every application supplies one.
         let Some(connector) = cx.services().market_participants.clone() else {
             return Ok(Self::assemble(
                 config,
@@ -668,24 +444,15 @@ impl WidgetView for OrderBookWidget {
         ))
     }
 
-    /// The options this widget persists.
     fn config(&self) -> Option<&Self::Config> {
         Some(&self.config)
     }
 
-    /// A book is content as soon as one has been accepted — including an empty
-    /// one. An empty book is what "this instrument has published nothing" looks
-    /// like: the ladder is still there, and there is nothing to report about it.
     fn has_content(&self) -> bool {
         self.snapshot.is_some()
     }
 
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
-        // The market this book follows has to be loaded before anything else
-        // happens here, and the check is first on purpose: a route the user never
-        // loaded, or one a shrinking commit has since taken away, leaves the pane
-        // waiting for it instead of reaching the branches below, which settle the
-        // selection the user stored.
         let Some(directory) = self.directory.clone() else {
             self.wait_for_market(cx);
             return;
@@ -694,22 +461,10 @@ impl WidgetView for OrderBookWidget {
             self.wait_for_market(cx);
             return;
         }
-        // The pane reached here only past its own gate, so the markets it was
-        // waiting for are in memory again and messages belong to them once more.
         self.awaiting_market = false;
-        // Read past the gate: a commit on the book's own venue that took its
-        // market away leaves this set while the stream that resolved against the
-        // retired generation is still alive, and the load that brings the market
-        // back has to reopen that stream.
         let market_reloaded = mem::take(&mut self.market_reloaded);
         let retry = self.status.is_failed(cx.app());
         if !retry && !market_reloaded {
-            // An explicit load starts over, because the widget cannot vouch for
-            // what it was showing. A retry keeps the book the user is reading, and
-            // so does a directory-generation reload: that one re-resolves the rules
-            // and units behind a book the user is still looking at (AGENTS §8.3),
-            // so it only replaces the subscription and keeps the ladder up until
-            // the new generation publishes the book it holds.
             self.clear_book(cx);
         }
         self.start(retry, market_reloaded, cx);
@@ -762,40 +517,26 @@ impl WidgetView for OrderBookWidget {
         self.publish_book(cx)?;
         self.publish_unit_labels(cx);
         self.publish_empty_text(cx);
-        // A movement started before the body existed picks its timer chain back up
-        // here, now that there is a node to scope it to.
         self.ensure_depth_ticker(cx);
         Ok(())
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        // The directory generation is the one signal the framework's surface root
-        // also reads, so a write schedules the frame that runs this hook — including
-        // for a pane that is only waiting and has no body. Nothing else may poll the
-        // directory (AGENTS §8.3).
         let generation = *cx.read(&self.generation);
         if generation != self.seen_generation {
             self.seen_generation = generation;
             if !self.status.is_failed(cx.app()) {
-                // A new generation may have replaced the one the live stream
-                // resolved its listing against, so the load that follows asks for a
-                // new stream.
                 self.market_reloaded = true;
                 self.load(cx);
             }
         }
 
-        // The binding delivers messages instead of calling back into the widget;
-        // this is the one place they are applied, where the widget has a context
-        // again.
         if let Some(binding) = self.binding.as_ref() {
             for inbound in binding.take() {
                 self.apply(inbound, cx);
             }
         }
 
-        // A confirmation is applied here rather than in the control's handler,
-        // which owns no widget context (see the module documentation).
         let requested = (*cx.read(&self.selection_requests)).clone();
         if let Some(selection) = requested {
             cx.write(&self.selection_requests, None);
@@ -814,9 +555,6 @@ impl WidgetView for OrderBookWidget {
             }
         }
 
-        // The rows one side has room for follows the laid-out height of the ladder:
-        // a pane squeezed under the row limit groups fewer levels, and the rows it
-        // does group are the ones it can draw.
         let ladder_bounds = self.ask_area.and_then(|node| {
             cx.tree()
                 .get(node)
@@ -854,9 +592,6 @@ impl WidgetView for OrderBookWidget {
     ) -> Result<(), EngineError> {
         match group {
             HeaderGroup::Left => {
-                // The pane is building its row; the control this widget built into
-                // the previous one went with it. Only the component is the widget's
-                // to take down.
                 self.release_header_left(cx, true);
                 self.build_header_left(parent, cx)
             }
@@ -868,9 +603,6 @@ impl WidgetView for OrderBookWidget {
     }
 
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
-        // The component scopes are this widget's in every case, which is why the
-        // handles the controls hand back are released here, while their nodes are
-        // still alive (the framework removes the surface subtree after this hook).
         self.release_header_left(cx, false);
         self.release_header_right(cx, false);
         if let Some(list) = self.ask_list.take() {
@@ -880,7 +612,6 @@ impl WidgetView for OrderBookWidget {
             list.release(cx.app_mut());
         }
         self.stop_depth_animation(cx.app_mut());
-        // Dropping the bridge aborts its forwarding tasks and cancels the service.
         if let Some(mut binding) = self.binding.take() {
             binding.cancel();
         }
@@ -891,7 +622,6 @@ impl WidgetView for OrderBookWidget {
 }
 
 impl OrderBookWidget {
-    /// Builds a widget over the collaborators a caller hands it.
     fn assemble(
         config: OrderBookConfig,
         binding: Option<WidgetBinding<OrderBookProtocol>>,
@@ -964,7 +694,6 @@ impl OrderBookWidget {
         }
     }
 
-    /// Builds a widget over a test's own source and directory.
     #[cfg(test)]
     fn with_source<S: super::service::OrderBookSource>(
         config: OrderBookConfig,
@@ -988,9 +717,6 @@ impl OrderBookWidget {
         )
     }
 
-    // ---------------------------------------------------------------- body
-
-    /// Builds the three column labels over the ladders.
     fn build_column_labels(
         &self,
         cx: &mut WidgetCx<'_>,
@@ -1058,7 +784,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    /// Builds one side of the ladder: the depth-bar canvas and the row list over it.
     fn build_ladder_area(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1121,7 +846,6 @@ impl OrderBookWidget {
         Ok(area)
     }
 
-    /// Builds the mid-price row: the direction arrow, the price and the spread.
     fn build_mid_price(
         &self,
         cx: &mut WidgetCx<'_>,
@@ -1221,7 +945,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    /// Builds the imbalance bar: the split canvas with the two shares over it.
     fn build_imbalance(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1289,12 +1012,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    /// Builds the "nothing published" state over the empty ladder.
-    ///
-    /// A book with no level on either side draws an empty ladder between its labels,
-    /// which leaves it and a book that failed to load looking the same. The book is
-    /// still the pane's content — the venue published it — so the pane says what it
-    /// holds rather than letting the framework's placeholder speak for it.
     fn build_empty_state(&self, cx: &mut WidgetCx<'_>, parent: NodeId) -> Result<(), EngineError> {
         let book = self.book;
         let overlay = NodeBuilder::boxed()
@@ -1321,9 +1038,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    // ------------------------------------------------------------ publishing
-
-    /// Publishes the grouped ladder and the two lists' row counts.
     fn publish_book(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let published = PublishedBook {
             book: self.grouped.clone(),
@@ -1347,13 +1061,11 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    /// Publishes the column labels when the metadata (and so the units) moved.
     fn publish_unit_labels(&mut self, cx: &mut WidgetCx<'_>) {
         let labels = self.unit_labels_now();
         cx.write(&self.unit_labels, labels);
     }
 
-    /// Publishes the empty-state sentence in the language showing now.
     fn publish_empty_text(&mut self, cx: &mut WidgetCx<'_>) {
         let language = *cx.read(&self.language);
         if self.built_language == Some(language) {
@@ -1363,7 +1075,6 @@ impl OrderBookWidget {
         cx.write(&self.empty_text, t_smol!(self.translate, "common.no_data"));
     }
 
-    /// The column labels the current metadata resolves.
     fn unit_labels_now(&self) -> OrderBookUnitLabels {
         let Some(metadata) = self.metadata.as_ref() else {
             return OrderBookUnitLabels {
@@ -1380,7 +1091,6 @@ impl OrderBookWidget {
         OrderBookUnitLabels::of(metadata, &directory.display(), &self.translate)
     }
 
-    /// Draws the two bar canvases and the imbalance bar at the progress showing now.
     fn sync_bars(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(book) = self.grouped.clone() else {
             return Ok(());
@@ -1427,7 +1137,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    /// Lets both lists settle what the last layout did (row mounts, scrollbar).
     fn sync_lists(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if let Some(list) = self.ask_list.as_ref() {
             list.sync(cx.app_mut())?;
@@ -1438,10 +1147,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    // --------------------------------------------------------------- loading
-
-    /// Whether what this book needs is in memory: at least one market that answers
-    /// with depth, and the route of the stored selection among them.
     fn market_ready(&self, directory: &dyn MarketDirectory) -> bool {
         if !directory.any_market_loaded() {
             return false;
@@ -1453,15 +1158,12 @@ impl OrderBookWidget {
         }
     }
 
-    /// Reports the neutral notice for the market this book follows, and drops the
-    /// ladder it was drawing.
     fn wait_for_market(&mut self, cx: &mut WidgetCx<'_>) {
         self.awaiting_market = true;
         self.clear_book(cx);
         self.report_markets_not_loaded(cx);
     }
 
-    /// Reports the notice naming the market this book follows.
     fn report_markets_not_loaded(&self, cx: &mut WidgetCx<'_>) {
         let supported = market_venues();
         let venues = self
@@ -1477,7 +1179,6 @@ impl OrderBookWidget {
         );
     }
 
-    /// Reports the prompt asking for an instrument.
     fn report_nothing_chosen(&self, cx: &mut WidgetCx<'_>) {
         self.status.report(
             cx.app_mut(),
@@ -1487,7 +1188,6 @@ impl OrderBookWidget {
         );
     }
 
-    /// Reports the neutral notice for a read the directory answered "not loaded" to.
     fn report_waiting_for_directory(
         &mut self,
         error: &OrderBookStreamError,
@@ -1503,7 +1203,6 @@ impl OrderBookWidget {
         true
     }
 
-    /// The stream scope this book would accept messages from.
     fn current_key(&self) -> Option<OrderBookStreamKey> {
         self.config.selection.as_ref().map(|selection| {
             OrderBookStreamKey::new(
@@ -1514,10 +1213,7 @@ impl OrderBookWidget {
         })
     }
 
-    /// Starts the stream, or restarts it for a scope the user is retrying.
     fn start(&mut self, retry: bool, market_reloaded: bool, cx: &mut WidgetCx<'_>) {
-        // The pane reached here only past its own gate, so the market it was
-        // waiting for is in memory again and messages belong to it once more.
         self.awaiting_market = false;
         self.ready = None;
         let Some(directory) = self.directory.clone() else {
@@ -1529,10 +1225,6 @@ impl OrderBookWidget {
             self.report_nothing_chosen(cx);
             return;
         };
-        // The row limits the book offers follow from how deep its venue publishes,
-        // and that bound is known before the stream is opened: a stored choice the
-        // route cannot fill goes back to the default here, so the request and the
-        // header agree on one choice from the first frame.
         let depth = directory.order_book_depth(&selection.listing.route);
         if self.config.settle(depth) {
             log::warn!(
@@ -1541,12 +1233,6 @@ impl OrderBookWidget {
             );
             self.config_change.publish(cx.app_mut());
         }
-        // What the program still serves is asked before the book reads, but only as
-        // advice: a listing that is gone goes back to "nothing chosen" instead of
-        // being drawn and failing. The question is not the authority on whether the
-        // book can be followed — the request below is, because the connector
-        // resolves the listing's own rules and units inside it. So a lookup that
-        // failed is only logged and the request goes out anyway.
         let routes = directory.loaded_scopes();
         if !offers_route(&routes, &selection.listing.route, CapabilityId::OrderBook) {
             self.withdraw(&selection.listing, "is no longer a loaded route", cx);
@@ -1559,8 +1245,6 @@ impl OrderBookWidget {
             return;
         }
         self.status.report(cx.app_mut(), WidgetState::Connecting);
-        // A new scope drops what the previous one drew; a retry keeps the book the
-        // user is still reading while the generation behind it is replaced.
         if !retry && !market_reloaded {
             self.clear_book(cx);
         }
@@ -1580,14 +1264,11 @@ impl OrderBookWidget {
         }
     }
 
-    /// Says what a book with nothing to follow is doing: nothing, and it is not a
-    /// failure.
     fn nothing_chosen(&mut self, cx: &mut WidgetCx<'_>) {
         self.clear_book(cx);
         self.report_nothing_chosen(cx);
     }
 
-    /// Drops a selection the directory no longer serves.
     fn withdraw(&mut self, listing: &VenueListingKey, cause: &str, cx: &mut WidgetCx<'_>) {
         log::warn!(
             "`{}` {cause}; the book went back to having nothing chosen",
@@ -1598,11 +1279,6 @@ impl OrderBookWidget {
         self.nothing_chosen(cx);
     }
 
-    /// Drops everything that was derived from the previous scope.
-    ///
-    /// The metadata goes with it because a new listing is rounded and labelled in
-    /// its own units, so the header would otherwise name the previous listing's
-    /// price step until the new stream says otherwise.
     fn clear_book(&mut self, cx: &mut WidgetCx<'_>) {
         self.snapshot = None;
         self.grouped = None;
@@ -1623,8 +1299,6 @@ impl OrderBookWidget {
         self.book_dirty = true;
     }
 
-    // -------------------------------------------------------------- messages
-
     fn apply(&mut self, inbound: Inbound<OrderBookProtocol>, cx: &mut WidgetCx<'_>) {
         match inbound {
             Inbound::Reliable { key, message } => self.apply_reliable(key, &message, cx),
@@ -1633,7 +1307,6 @@ impl OrderBookWidget {
         }
     }
 
-    /// Applies one status the stream reported.
     fn apply_reliable(
         &mut self,
         key: OrderBookStreamKey,
@@ -1663,9 +1336,6 @@ impl OrderBookWidget {
             }
             OrderBookStatus::Ready { revision } => {
                 self.ready = Some(revision.clone());
-                // The reliable channel and the latest one have no order between
-                // them, so this can arrive before the book it describes: claiming
-                // readiness now would be claiming a book the widget does not have.
                 if self
                     .snapshot
                     .as_ref()
@@ -1692,7 +1362,6 @@ impl OrderBookWidget {
         }
     }
 
-    /// Applies a book the stream published.
     fn apply_latest(
         &mut self,
         key: OrderBookStreamKey,
@@ -1710,12 +1379,7 @@ impl OrderBookWidget {
         }
     }
 
-    /// Accepts a published book as the whole of what the widget draws.
     fn accept_snapshot(&mut self, snapshot: OrderBookSnapshot, cx: &mut WidgetCx<'_>) {
-        // A book the stream has already overtaken would only make the ladder jump
-        // backwards. Within one generation the venue's sequence only moves
-        // forwards, so a book that is strictly behind the one on screen is one that
-        // was overtaken by a status, which is not something to draw.
         if self
             .snapshot
             .as_ref()
@@ -1731,9 +1395,6 @@ impl OrderBookWidget {
         }
         let regrouped = self.regroup(cx);
         let _ = regrouped;
-        // Readiness is reported at the protocol's own boundary: a complete book is
-        // not the same thing as the book the status said was complete, and this is
-        // where the two meet.
         if self
             .ready
             .as_ref()
@@ -1748,9 +1409,6 @@ impl OrderBookWidget {
         result: WidgetRpcResult<OrderBookProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
-        // An answer that arrives after the pane failed, or while it waits for its
-        // market, is about a call that no longer belongs to what the pane is
-        // showing: the failure is terminal until the user recovers (AGENTS §4.4).
         if self.status.is_failed(cx.app()) || self.awaiting_market {
             return;
         }
@@ -1766,8 +1424,6 @@ impl OrderBookWidget {
         }
     }
 
-    /// Applies one RPC reply, once its identity says it answers the command in
-    /// flight.
     fn apply_rpc(
         &mut self,
         request_id: RequestId,
@@ -1779,12 +1435,6 @@ impl OrderBookWidget {
         }
     }
 
-    // ------------------------------------------------------------- regrouping
-
-    /// Rebuilds the drawn ladder from the snapshot the widget holds.
-    ///
-    /// Returns whether the drawn book changed, which is also whether the body's
-    /// rows and bars have to be published again.
     fn regroup(&mut self, cx: &mut WidgetCx<'_>) -> bool {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return false;
@@ -1812,19 +1462,14 @@ impl OrderBookWidget {
         true
     }
 
-    /// How many rows one side may keep: the user's limit, narrowed to what the
-    /// pane has room to draw.
     fn effective_window_size(&self) -> usize {
         self.config.window_size.min(self.drawable_rows.max(1))
     }
 
-    /// The depth the book being drawn was published at.
     fn book_depth(&self) -> Option<u16> {
         self.metadata.as_ref().map(|metadata| metadata.depth)
     }
 
-    /// The increment the grouping labels are written in: the book's own tick once
-    /// one has been published, and the venue's catalog before that.
     fn display_price_tick(&self) -> Option<Tick> {
         self.grouped
             .as_ref()
@@ -1836,8 +1481,6 @@ impl OrderBookWidget {
             })
     }
 
-    /// The label of one grouping choice, reusing the one formatted for the current
-    /// price tick.
     fn price_step_label(&self, multiplier: u32) -> SmolStr {
         PRICE_MULTIPLIERS
             .iter()
@@ -1858,14 +1501,6 @@ impl OrderBookWidget {
         true
     }
 
-    // -------------------------------------------------------------- animation
-
-    /// Sends the bars after the ratios the ladder now asks for.
-    ///
-    /// Every restart is measured from where the previous frame had painted, so an
-    /// update that arrives mid-flight retargets the movement instead of resetting
-    /// it. Decorative movement is what the platform's reduce-motion setting asks
-    /// not to have, so with it set the bars simply arrive.
     fn restart_depth_animation(&mut self, cx: &mut WidgetCx<'_>) {
         let reduce_motion = *cx.read(&cx.services().reduce_motion);
         let span = self
@@ -1883,12 +1518,6 @@ impl OrderBookWidget {
         self.ensure_depth_ticker(cx);
     }
 
-    /// Starts the depth-timer chain if the movement showing now still needs frames.
-    ///
-    /// A movement can be started before the body exists (the stream published the
-    /// book on a frame whose `has_content` the framework had not sampled yet), and a
-    /// timer chain needs a node to scope itself to: the body's own root is where a
-    /// later `body` call picks the movement back up.
     fn ensure_depth_ticker(&mut self, cx: &mut WidgetCx<'_>) {
         let Some(scope) = self.body_root else {
             return;
@@ -1921,7 +1550,6 @@ impl OrderBookWidget {
         self.depth_ticker = Some(state);
     }
 
-    /// Stops the animation chain and gives its pending timer back.
     fn stop_depth_animation(&mut self, app: &mut App) {
         let Some(state) = self.depth_ticker.take() else {
             return;
@@ -1933,13 +1561,6 @@ impl OrderBookWidget {
         }
     }
 
-    // ---------------------------------------------------------------- header
-
-    /// The filters the picker this control opens is built with.
-    ///
-    /// The loaded venues are read here, where the control is built, rather than
-    /// kept: a scope loaded after this book started reading is a scope the user may
-    /// select, and one a shrinking commit withdrew is not.
     fn instrument_filters(&self) -> InstrumentFilters {
         InstrumentFilters {
             kind_filter: InstrumentKindFilter::All,
@@ -1953,12 +1574,6 @@ impl OrderBookWidget {
         }
     }
 
-    /// The selector host the header control opens its dialog through.
-    ///
-    /// The host is the one thing in this widget that owns the services rather than
-    /// borrowing them, so it takes the shared handle the composition root handed
-    /// over ([`WidgetCx::services_rc`]) — the same aggregate the widget works over,
-    /// not a second one assembled from its fields.
     fn selector_host(&self, cx: &WidgetCx<'_>) -> SelectorHost {
         let host = SelectorHost::new(Rc::clone(cx.services_rc()));
         match &self.directory {
@@ -1986,7 +1601,6 @@ impl OrderBookWidget {
         }
     }
 
-    /// Builds the instrument control into the header's left group.
     fn build_header_left(
         &mut self,
         parent: NodeId,
@@ -2015,7 +1629,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    /// Builds the two drawing pickers into the header's right group.
     fn build_header_right(
         &mut self,
         parent: NodeId,
@@ -2102,7 +1715,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    /// Builds one drawing picker over the entries `spec` names into `parent`.
     fn build_select(
         &self,
         cx: &mut WidgetCx<'_>,
@@ -2147,13 +1759,10 @@ impl OrderBookWidget {
             });
         select.set_chosen(cx.app_mut(), [spec.chosen.as_str()], false);
         select.build(cx.app_mut(), window, parent)?;
-        // Disable after the build: `Interactive::build` initialises its state from the
-        // builder flags, so a `set_disabled` written before it would be overwritten.
         let _ = select.set_disabled(cx.app_mut(), disabled);
         Ok(select)
     }
 
-    /// Keeps the header controls in step with the copy they were built with.
     fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if let Some(header) = self.header_left.as_ref() {
             let moved = header.built.language != *cx.read(&self.language)
@@ -2162,9 +1771,6 @@ impl OrderBookWidget {
             if moved {
                 let parent = header.parent;
                 if cx.tree().get(parent).is_err() {
-                    // The pane took its row down; the control went with it, and only
-                    // the component (its click handler and signal scope) is left to
-                    // release.
                     self.release_header_left(cx, false);
                 } else {
                     self.release_header_left(cx, true);
@@ -2177,8 +1783,6 @@ impl OrderBookWidget {
             if moved {
                 let slot = header.slot;
                 if cx.tree().get(slot).is_err() {
-                    // The pane took its group down; the widget's row went with it, and
-                    // only the components are left to release.
                     self.release_header_right(cx, false);
                 } else {
                     self.release_header_right(cx, true);
@@ -2189,14 +1793,6 @@ impl OrderBookWidget {
         Ok(())
     }
 
-    /// Takes down the instrument control's component.
-    ///
-    /// `remove_node` is true when the pane's row is still there and the widget is
-    /// replacing its own control in it; a row the pane already took down needs no
-    /// node removal (`StaleNode`). The node itself belongs to the pane's header
-    /// row, but the **component** — its click handler and its signal scope — is
-    /// this widget's in every case, which is why the handle the selector's control
-    /// hands back is released here.
     fn release_header_left(&mut self, cx: &mut WidgetCx<'_>, remove_node: bool) {
         let Some(header) = self.header_left.take() else {
             return;
@@ -2209,11 +1805,6 @@ impl OrderBookWidget {
         let _ = header.control.release(cx.app_mut());
     }
 
-    /// Takes down the two drawing pickers and their row.
-    ///
-    /// `remove_node` is true when the pane's group is still there and the widget is
-    /// replacing its own row in it; a group the pane already took down needs no node
-    /// removal. The row is this widget's own, so it is the node that is removed.
     fn release_header_right(&mut self, cx: &mut WidgetCx<'_>, remove_node: bool) {
         let Some(header) = self.header_right.take() else {
             return;
@@ -2226,23 +1817,13 @@ impl OrderBookWidget {
         header.window_size.release(cx.app_mut());
     }
 
-    // ------------------------------------------------------------ selections
-
-    /// Applies an instrument picked in the header as one scope transition.
     fn select_selection(&mut self, selection: InstrumentSelection, cx: &mut WidgetCx<'_>) -> bool {
-        // Picking the scope that is already shown is a request to open it again
-        // when it is not working, and nothing at all otherwise.
         if self.config.selection.as_ref() == Some(&selection) && !self.status.is_failed(cx.app()) {
             return false;
         }
         self.config.selection = Some(selection);
         self.config_change.publish(cx.app_mut());
-        // The ladder on screen belongs to the scope the user just left.
         self.clear_book(cx);
-        // A pane that is waiting for its market is a pane whose gate `start` would
-        // not run: `start` reads the loaded scopes of a directory that has none and
-        // withdraws the choice the user just made. `load` is the path that runs the
-        // gate, and it keeps the choice while it waits (AGENTS §4.2).
         if self.awaiting_market {
             self.load(cx);
         } else {
@@ -2273,15 +1854,7 @@ impl OrderBookWidget {
         self.regroup(cx);
     }
 
-    /// Starts the generation the drawing choices now describe.
-    ///
-    /// Both choices are part of the stream's own scope, so the generation that was
-    /// publishing for the previous one is replaced. Nothing on screen is dropped:
-    /// the ladder the user is reading stays up until the new generation publishes
-    /// the book it holds.
     fn restream(&mut self, cx: &mut WidgetCx<'_>) {
-        // A failed pane is waiting for the user, not for a reload, so the stream it
-        // would replace is left alone.
         if self.status.is_failed(cx.app()) {
             return;
         }
@@ -2295,14 +1868,12 @@ impl OrderBookWidget {
     }
 }
 
-/// Which drawing choice one select in the header's right group states.
 #[derive(Clone, Copy)]
 enum HeaderSelect {
     PriceStep,
     WindowSize,
 }
 
-/// Everything one drawing picker is built from.
 struct SelectSpec {
     key_suffix: &'static str,
     aria_key: &'static str,
@@ -2312,13 +1883,6 @@ struct SelectSpec {
     kind: HeaderSelect,
 }
 
-/// Hands a confirmed selection over to the next `sync`.
-///
-/// The control's confirm handler runs with an application context and no widget
-/// context, so it cannot call into the pane: it writes the request signal and asks
-/// for a frame, and [`WidgetView::sync`] applies the choice and publishes the
-/// configuration change. A confirmation that wrote nothing would leave the pane
-/// following the instrument it was already on, however far the user browsed.
 fn hand_over_selection(
     requests: Signal<Option<InstrumentSelection>>,
     selection: InstrumentSelection,
@@ -2329,8 +1893,6 @@ fn hand_over_selection(
     let _ = app.request_repaint(window);
 }
 
-/// Hands a drawing choice over to the next `sync`, the same way a confirmed
-/// selection is handed over.
 fn hand_over_header_request(
     requests: Signal<Option<HeaderRequest>>,
     request: HeaderRequest,
@@ -2341,25 +1903,18 @@ fn hand_over_header_request(
     let _ = app.request_repaint(window);
 }
 
-/// A text style right-aligned in its column, which is what every ladder number is.
 fn aligned_text(size: f32) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.alignment = TextAlign::Right;
     style
 }
 
-/// A bold text style for the mid price and the imbalance shares.
 fn bold_text(size: f32) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.weight = 700;
     style
 }
 
-/// Builds one row of a ladder: the three labels, each bound to the book signal.
-///
-/// The row factory runs **without an application context** (AGENTS §9), so every
-/// dynamic value here is a `bind_text` / `bind_style` closure over a signal the
-/// pane owns rather than something read while the row is built.
 fn build_row(
     tree: &mut ui_core::node::tree::NodeTree,
     parent: NodeId,

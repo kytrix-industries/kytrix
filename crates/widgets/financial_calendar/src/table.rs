@@ -1,25 +1,3 @@
-//! The calendar's table model: four columns, a label row above each day, and the
-//! choices the header narrows the rows with.
-//!
-//! The whole answer is the model's only input, so a read that answers again replaces
-//! every row rather than patching the ones that moved: a calendar is scheduled ahead,
-//! and a revision can add an event in the middle of a day that is already drawn. What
-//! the model keeps between reads is nothing but its snapshot, the choices the header
-//! narrows it with, and the rows it was grouped into.
-//!
-//! It is deliberately pure: no nodes, no theme, no toolkit. The view owns the kit
-//! table and the cells; this module owns *what* the rows are. Grouping is recomputed
-//! whenever the zone the settings display data in moves, which is the one thing
-//! outside the data that decides where a day begins. The *text* of each row is
-//! resolved by the frame that draws it — the time from the zone showing now, the day
-//! label from the language showing now — so moving either is a redraw rather than a
-//! new answer.
-//!
-//! The header's choices are kept here rather than in the view because they decide
-//! which rows exist, and because every answer has to be checked against them: the
-//! options are the answer's own, so a choice it no longer offers is not a filter any
-//! more.
-
 use std::sync::Arc;
 
 use i18n::{t_smol, translate::Translate};
@@ -31,50 +9,26 @@ use crate::model::{
     dates_of, rows_of,
 };
 
-/// The columns, in the order a reader takes a calendar in: how much it matters, when,
-/// where, and what.
 pub(crate) const COLUMN_COUNT: usize = 4;
 
-/// The column a cell belongs to, named so a draw reads as the column it is.
 pub(crate) const IMPORTANCE: usize = 0;
 pub(crate) const TIME: usize = 1;
 pub(crate) const COUNTRY: usize = 2;
 pub(crate) const NAME: usize = 3;
 
-/// The width weight of each column, in header order.
-///
-/// The name is what a row is read for, so it takes most of the width; the marks, the
-/// time and the country are fixed small parts of it. The kit table distributes the
-/// remaining width by these weights, which is the engine's spelling of the shares the
-/// old dataset declared.
 pub(crate) const COLUMN_WEIGHTS: [f32; COLUMN_COUNT] = [0.09, 0.14, 0.09, 0.68];
 
-/// The day label's debug selector, which is what says a frame drew the head of a day.
 pub(crate) const DAY_SELECTOR: &str = "TEST_FINANCIAL_CALENDAR_DAY";
 
-/// The rows of one answer, narrowed by the choices the header holds.
-///
-/// A table with no answer yet is the default one: no snapshot, no choice, and no row
-/// to draw.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CalendarTable {
     snapshot: Arc<CalendarSnapshot>,
-    /// The choices the header offers, which decide which of the events are rows.
     filter: CalendarFilter,
-    /// The days the answer holds, which is what the header's time control offers.
     dates: Vec<Date>,
-    /// The country codes the answer holds, which is what its country control offers.
     countries: Vec<SmolStr>,
-    /// The days and events of the answer, in the order they are drawn.
     rows: Arc<[CalendarRow]>,
 }
 
-/// Equality is the identity a signal write is deduplicated against.
-///
-/// The snapshot and the row set are shared pointers: every rebuild mints new ones, so
-/// two models are equal exactly when they are the same rebuild of the same answer and
-/// no choice moved. That is O(1) — a calendar can carry thousands of events, and this
-/// runs on every frame's countdown state.
 impl PartialEq for CalendarTable {
     fn eq(&self, other: &Self) -> bool {
         self.filter == other.filter
@@ -88,21 +42,11 @@ impl PartialEq for CalendarTable {
 impl Eq for CalendarTable {}
 
 impl CalendarTable {
-    /// Replaces everything the model holds with one whole answer, grouped for `zone`.
-    ///
-    /// A read answers with the whole calendar, so the rows are rebuilt rather than
-    /// matched against the ones already there: a day may have gained an event, lost
-    /// one, or moved to another day as the setting moved.
     pub(crate) fn rebuild(&mut self, snapshot: Arc<CalendarSnapshot>, zone: UtcOffset) {
         self.snapshot = snapshot;
         self.regroup(zone);
     }
 
-    /// Groups the answer the model already holds for another zone.
-    ///
-    /// The days an answer holds move with the zone as well, so the options the header
-    /// offers are rebuilt here too — and a choice that is no longer one of them goes
-    /// back to "all".
     pub(crate) fn regroup(&mut self, zone: UtcOffset) {
         self.dates = dates_of(self.snapshot.events(), zone);
         self.countries = countries_of(self.snapshot.events());
@@ -110,63 +54,51 @@ impl CalendarTable {
         self.rows = rows_of(self.snapshot.events(), zone, &self.filter).into();
     }
 
-    /// Narrows the rows to one importance level, or to every level.
     pub(crate) fn select_importance(&mut self, importance: Option<Importance>, zone: UtcOffset) {
         self.filter.importance = importance;
         self.regroup(zone);
     }
 
-    /// Narrows the rows to one day, or to every day.
     pub(crate) fn select_date(&mut self, date: Option<Date>, zone: UtcOffset) {
         self.filter.date = date;
         self.regroup(zone);
     }
 
-    /// Narrows the rows to one country, or to every country.
     pub(crate) fn select_country(&mut self, country: Option<SmolStr>, zone: UtcOffset) {
         self.filter.country = country;
         self.regroup(zone);
     }
 
-    /// Puts every choice back to "all".
     pub(crate) fn reset_filter(&mut self, zone: UtcOffset) {
         self.filter = CalendarFilter::default();
         self.regroup(zone);
     }
 
-    /// Drops everything the model draws, which is what a pane that can no longer vouch
-    /// for its answer leaves behind.
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
     }
 
-    /// The choices the header draws.
     pub(crate) fn filter(&self) -> &CalendarFilter {
         &self.filter
     }
 
-    /// The days the time control offers, earliest first.
     pub(crate) fn dates(&self) -> &[Date] {
         &self.dates
     }
 
-    /// The countries the country control offers, in code order.
     pub(crate) fn countries(&self) -> &[SmolStr] {
         &self.countries
     }
 
-    /// The answer the rows were built from.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> &Arc<CalendarSnapshot> {
         &self.snapshot
     }
 
-    /// The row at `index`, if the table draws one there.
     pub(crate) fn row(&self, index: usize) -> Option<CalendarRow> {
         self.rows.get(index).copied()
     }
 
-    /// The event of the row at `index`, when that row is an event rather than a label.
     pub(crate) fn event(&self, index: usize) -> Option<&CalendarEvent> {
         let CalendarRow::Event(event) = self.row(index)? else {
             return None;
@@ -174,20 +106,15 @@ impl CalendarTable {
         self.snapshot.events().get(event)
     }
 
-    /// The rows the table draws, in order.
     #[cfg(test)]
     pub(crate) fn rows(&self) -> &[CalendarRow] {
         &self.rows
     }
 
-    /// The number of rows the table draws.
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
     }
 
-    /// The span of the cell at `(row, column)`: a day's label heads the events below it
-    /// rather than saying anything about one of the columns, so it is one cell across
-    /// the whole table.
     pub(crate) fn column_span(&self, row: usize, column: usize) -> usize {
         match self.rows.get(row) {
             Some(CalendarRow::Day(_)) if column == IMPORTANCE => COLUMN_COUNT,
@@ -195,11 +122,6 @@ impl CalendarTable {
         }
     }
 
-    /// The message a table with no row states.
-    ///
-    /// An answer that carried no event and an answer the header narrowed to nothing are
-    /// two different facts, and a reader who chose a filter is owed the second one: "no
-    /// data" would read as if the calendar itself were empty.
     pub(crate) fn empty_message_key(&self) -> &'static str {
         if self.filter.is_all() {
             "common.no_data"
@@ -209,10 +131,6 @@ impl CalendarTable {
     }
 }
 
-/// The day a label heads, written the way the language showing writes a date.
-///
-/// The header's time control offers the same days and draws them with this, so the day
-/// a reader picks above the table is the day the table heads its events with.
 pub(crate) fn day_label_text(date: Date, translate: &Translate) -> SmolStr {
     let weekday = t_smol!(translate, weekday_key(date.weekday()));
     let month = t_smol!(translate, month_key(date.month()));
@@ -227,7 +145,6 @@ pub(crate) fn day_label_text(date: Date, translate: &Translate) -> SmolStr {
     )
 }
 
-/// The message key a month is named by.
 pub(crate) fn month_key(month: Month) -> &'static str {
     match month {
         Month::January => "widget.financial_calendar.month.january",
@@ -245,7 +162,6 @@ pub(crate) fn month_key(month: Month) -> &'static str {
     }
 }
 
-/// The message key a day of the week is named by.
 pub(crate) fn weekday_key(weekday: Weekday) -> &'static str {
     match weekday {
         Weekday::Monday => "widget.financial_calendar.weekday.monday",
@@ -267,7 +183,6 @@ mod tests {
     use super::*;
     use crate::test_support::{boundary_snapshot, snapshot};
 
-    /// The translator the product ships, in the language a test asks for.
     fn translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -282,12 +197,10 @@ mod tests {
         table
     }
 
-    /// The day of October 2026 a test filters by.
     fn day(day: u8) -> Date {
         Date::from_calendar_date(2026, Month::October, day).expect("a day of October 2026")
     }
 
-    /// The shape of the rows a table draws, as a test reads it.
     fn shape(table: &CalendarTable) -> Vec<String> {
         table
             .rows()
@@ -310,8 +223,6 @@ mod tests {
         );
     }
 
-    /// A read answers with the whole calendar, so a second answer of another length is
-    /// a table of another length — not the first one with a row patched.
     #[test]
     fn an_answer_should_replace_every_row_it_replaces() {
         let mut table = table(snapshot(3), UtcOffset::UTC);
@@ -322,8 +233,6 @@ mod tests {
         assert_eq!(table.len(), 2, "one label and the one event left");
     }
 
-    /// The zone is the whole of what regrouping is: the same answer is two days in UTC
-    /// and one day eight hours east of it.
     #[test]
     fn a_zone_should_regroup_the_answer_the_table_already_holds() {
         let mut table = table(boundary_snapshot(), UtcOffset::UTC);
@@ -338,9 +247,6 @@ mod tests {
         );
     }
 
-    /// The header's options are the answer's own: a country or a day a reader can
-    /// choose is one the calendar holds, and narrowing the rows does not take the
-    /// others away.
     #[test]
     fn the_options_a_table_offers_should_come_from_the_whole_answer() {
         let mut table = table(boundary_snapshot(), UtcOffset::UTC);
@@ -361,8 +267,6 @@ mod tests {
         assert_eq!(table.countries().len(), 2);
     }
 
-    /// A choice the new answer no longer offers is dropped rather than left filtering
-    /// every row away: a table that drew nothing would read as an empty calendar.
     #[test]
     fn a_choice_the_new_answer_no_longer_offers_should_be_dropped() {
         let mut table = table(snapshot(2), UtcOffset::UTC);
@@ -383,8 +287,6 @@ mod tests {
         );
     }
 
-    /// The days an answer holds move with the zone, so a day the new grouping does not
-    /// hold is a choice it cannot keep either.
     #[test]
     fn a_day_the_zone_takes_away_should_be_dropped() {
         let mut table = table(boundary_snapshot(), UtcOffset::UTC);
@@ -401,8 +303,6 @@ mod tests {
         );
     }
 
-    /// A pane that can no longer vouch for its answer leaves no choice behind either:
-    /// the options went with the data the choice was about.
     #[test]
     fn clearing_the_table_should_clear_its_choices() {
         let mut table = table(boundary_snapshot(), UtcOffset::UTC);
@@ -429,8 +329,6 @@ mod tests {
         assert_eq!(table.len(), 4);
     }
 
-    /// A table narrowed to nothing says the filter matched nothing; one whose answer
-    /// carried nothing says there is no data. The two are different facts.
     #[test]
     fn an_empty_table_should_name_the_reason_it_is_empty() {
         assert_eq!(
@@ -518,12 +416,6 @@ mod tests {
         }
     }
 
-    /// Every name the day label is built from is one every locale defines.
-    ///
-    /// The key of a month or a weekday is chosen by number rather than written at a
-    /// call site, so nothing else reads it: a key that no locale defines translates
-    /// to the empty string, and the label over a day would be missing the very word
-    /// that says which day it is.
     #[test]
     fn every_name_a_day_label_is_built_from_should_be_in_every_locale() {
         let i18n = i18n::embedded::load().expect("the embedded locales load");
@@ -568,9 +460,6 @@ mod tests {
         }
     }
 
-    /// The label above a day is written the way the language showing writes a date,
-    /// with the day it belongs to in it: the English one names the weekday first and
-    /// the year last, and the Chinese one puts the year first.
     #[test]
     fn a_day_label_should_read_the_way_each_language_writes_a_date() {
         let date = Date::from_calendar_date(2026, Month::October, 25).expect("a real date");
@@ -585,8 +474,6 @@ mod tests {
         );
     }
 
-    /// The day a row heads is the day of the zone the table was built for, which is
-    /// what the label above the row says.
     #[test]
     fn a_label_should_name_the_day_its_events_fall_on() {
         let table = table(boundary_snapshot(), UtcOffset::UTC);
@@ -600,9 +487,6 @@ mod tests {
         );
     }
 
-    /// Two models built from the same answer are not the same model: a read is a new
-    /// row set even when it draws the same calendar, which is what the stale-write
-    /// comparison in the view relies on.
     #[test]
     fn a_model_should_only_equal_the_rebuild_it_came_from() {
         let mut first = CalendarTable::default();
@@ -617,8 +501,6 @@ mod tests {
         );
     }
 
-    /// The rows a table draws are the answer's own order: the shape helper above is the
-    /// one thing every view test reads.
     #[test]
     fn an_answer_should_be_drawn_as_the_labels_and_events_it_holds() {
         let table = table(boundary_snapshot(), UtcOffset::UTC);

@@ -47,15 +47,6 @@ fn hyperliquid(scope: &str) -> VenueRoute {
     )
 }
 
-/// The route a fixture of a market this build does not trade is addressed on.
-///
-/// A route is an addressing key of *this* build: its venue is one of the venues
-/// this program carries an adapter, a configuration and a catalogue for. What a
-/// listing of an equity, an option series or an outcome market actually *is* is
-/// carried by its continuity terms and its typed identifiers — the MIC, the
-/// issuer, the OCC symbol, the condition id — and never by the venue, so a
-/// fixture about one of those families names the product scope it belongs to on
-/// a venue this build speaks rather than inventing a venue that has no adapter.
 fn fixture_route(scope: &str) -> VenueRoute {
     VenueRoute::new(
         VenueId::Binance,
@@ -136,7 +127,6 @@ fn echo_mismatch(kind: ListingIdentifierKind, value: &str) -> ModelError {
     })
 }
 
-/// A listing whose typed identifiers are compared against declared symbols.
 #[test]
 fn publication_should_refuse_only_a_contradicted_echo() {
     let key = ListingContinuityKey {
@@ -863,8 +853,6 @@ fn equity_listing_should_report_all_three_echo_states() {
     };
     let exact = |_| SymbolNormalization::Exact;
 
-    // The equity family compares two typed fields, so one agreeing field cannot
-    // hide a contradicting one.
     assert_eq!(
         listing(Some("AAPL"), "AAPL", "AAPL").validate_echoed_identifiers(exact),
         Ok(EchoValidationStatus::Verified)
@@ -892,11 +880,6 @@ fn equity_listing_should_report_all_three_echo_states() {
     );
 }
 
-/// One listing whose whole typed identity is one series identifier set.
-///
-/// The echo check compares every typed identifier of a listing with the declared display
-/// symbols, so a listing that pins one identifier of a series declares a symbol
-/// that spells that one value and nothing else.
 fn series_listing_of(
     terms: ListingContinuityTerms,
     identifiers: VenueListingIdentifiers,
@@ -917,16 +900,6 @@ fn series_listing_of(
     .expect("listing should be valid")
 }
 
-/// every verified identifier of an option series is an echo
-/// obligation of its own.
-///
-/// Each case publishes a series that carries exactly one of the three identifiers,
-/// so the status of the listing is decided by that identifier alone: a declared
-/// symbol that spells it is `Verified`, and a declared symbol that spells anything
-/// else is a `Mismatch` naming the identifier and the value it failed to echo. A
-/// model that stopped echoing one of the three fields would answer
-/// `NoComparableIdentifier` for both listings instead, because no comparable typed
-/// identifier would be left.
 #[test]
 fn every_option_series_identifier_should_be_echoed_by_a_declared_symbol() {
     let exact = |_| SymbolNormalization::Exact;
@@ -992,19 +965,6 @@ fn every_option_series_identifier_should_be_echoed_by_a_declared_symbol() {
     }
 }
 
-/// the market-participant series id and the local symbol of a future
-/// series are echo obligations of their own.
-///
-/// The two fields are the first two positions of the echo order, and the contract
-/// code after them is pinned end to end by
-/// `a_declared_native_family_is_verified_native` in the connector's display gate.
-///
-/// A future series states its local symbol under the plain `Symbol` family, which
-/// is the family whose route normalization the display symbols themselves are
-/// compared with, while an option series states its own local symbol under the
-/// series-internal `OptionLocalSymbol` family. The two cases below assert the kind
-/// the model echoes each field under, because that kind is what the status reports
-/// to the echo gate.
 #[test]
 fn every_future_series_identifier_should_be_echoed_by_a_declared_symbol() {
     let exact = |_| SymbolNormalization::Exact;
@@ -1126,10 +1086,6 @@ fn families_without_a_comparable_identifier_should_never_verify() {
     )
     .expect("listing should be valid");
 
-    // Binance declares no comparable typed echo, so a declared symbol cannot be
-    // reported as verified even though the symbols agree with themselves. The
-    // status keeps the listing publishable without claiming a verification that
-    // never happened.
     assert_eq!(
         listing.validate_echoed_identifiers(|_| SymbolNormalization::AsciiCaseInsensitive),
         Ok(EchoValidationStatus::NoComparableIdentifier),

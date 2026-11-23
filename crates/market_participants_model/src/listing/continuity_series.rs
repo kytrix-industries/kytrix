@@ -1,5 +1,3 @@
-//! The verified identifiers of a standardized future or option series.
-
 use serde::Serialize;
 
 use crate::{
@@ -7,7 +5,6 @@ use crate::{
     identifier::{ContractCode, LocalSymbol, MarketParticipantSeriesId, OccSymbol},
 };
 
-/// The verified series identifiers of a standardized future.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct FutureSeriesIdentifiers {
     #[serde(rename = "market_participant_series_id")]
@@ -19,7 +16,6 @@ pub struct FutureSeriesIdentifiers {
 }
 
 impl FutureSeriesIdentifiers {
-    /// Validates that at least one verified series identifier is present.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.is_empty() {
             return Err(ModelError::InvalidListingContinuityTerms {
@@ -29,7 +25,6 @@ impl FutureSeriesIdentifiers {
         Ok(())
     }
 
-    /// Returns `true` when no series identifier is present.
     pub fn is_empty(&self) -> bool {
         self.market_participant_series_id.is_none()
             && self.local_symbol.is_none()
@@ -37,7 +32,6 @@ impl FutureSeriesIdentifiers {
     }
 }
 
-/// The verified identifiers of an option series.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct OptionSeriesIdentifiers {
     #[serde(rename = "occ_symbol")]
@@ -49,7 +43,6 @@ pub struct OptionSeriesIdentifiers {
 }
 
 impl OptionSeriesIdentifiers {
-    /// Validates that at least one verified series identifier is present.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.is_empty() {
             return Err(ModelError::InvalidListingContinuityTerms {
@@ -59,7 +52,6 @@ impl OptionSeriesIdentifiers {
         Ok(())
     }
 
-    /// Returns `true` when no series identifier is present.
     pub fn is_empty(&self) -> bool {
         self.occ_symbol.is_none()
             && self.market_participant_series_id.is_none()

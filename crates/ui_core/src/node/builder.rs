@@ -1,8 +1,3 @@
-//! `NodeBuilder`：声明式建树的唯一入口。
-//!
-//! 一个 builder 实例 = 一次挂载（不是可复用的模板）；`build` 时把 6 个部件装成 `NodeSpec` 交给
-//! `NodeTree::insert_child`（`NodeSpec` 的字段私有 —— 见其 rustdoc）。
-
 use std::sync::Arc;
 
 use smol_str::SmolStr;
@@ -25,10 +20,6 @@ use crate::{
     text::{TextContent, TextStyle},
 };
 
-/// 声明式建树的唯一入口。**只在挂载时使用一次**。
-///
-/// **不 `derive(Default)`**（B3）：默认值必须与 [`NodeBuilder::boxed`] 完全一致，手写 `impl Default`
-/// 表达这一点，也避免 `NodeKind` 被迫实现 `Default`。
 pub struct NodeBuilder {
     kind: NodeKind,
     style: Style,
@@ -54,7 +45,6 @@ impl Default for NodeBuilder {
 }
 
 impl NodeBuilder {
-    /// 普通容器/叶子（`NodeKind::Box`，默认 `Style`）。
     #[must_use]
     pub fn boxed() -> Self {
         Self {
@@ -76,20 +66,12 @@ impl NodeBuilder {
         }
     }
 
-    /// 静态 a11y 声明（角色 / 可访问名 / 值 / 动作 / 隐藏 / 禁用）。
-    ///
-    /// 不写 `a11y` 的节点仍会进 a11y 树（角色由节点种类推导）；
-    /// 自绘节点（`canvas` / `geometry`）**必须**在这里给 `label`，否则会被标 `hidden` 并记诊断。
     #[must_use]
     pub fn a11y(mut self, a11y: crate::a11y::A11yOverride) -> Self {
         self.a11y = Some(a11y);
         self
     }
 
-    /// 动态 a11y 属性：闭包在每次 `refresh_styles` 求值时重算 `A11yPatch`（值语义，不累积）。
-    ///
-    /// **与 `bind_style` / `bind_text` 同一 `ReadCtx`、同一依赖集合**：一个节点只能有一份依赖边集
-    /// （`DependencyGraph::replace_deps` 整体替换），因此三条动态通道必须在同一个 pass 里求值。
     #[must_use]
     pub fn bind_a11y(
         self,
@@ -101,52 +83,36 @@ impl NodeBuilder {
         }
     }
 
-    /// 是否进入 Tab / Shift+Tab 焦点序（默认 `true`）。
-    ///
-    /// `false` 只影响键盘焦点遍历：节点仍可被指针点击、仍可被辅助技术激活。
-    /// 窗口装饰按钮（关闭 / 最小化 / 最大化）用 `false`，避免抢占应用自身的焦点序。
     #[must_use]
     pub fn tab_stop(mut self, tab_stop: bool) -> Self {
         self.tab_stop = tab_stop;
         self
     }
 
-    /// 焦点环（P10）：该节点获得焦点后由 paint 在**它自己的 lane 内**画一圈（受祖先 clip 约束）。
     #[must_use]
     pub fn focus_ring(mut self, ring: crate::paint::style::FocusRing) -> Self {
         self.focus_ring = Some(ring);
         self
     }
 
-    /// 声明**动作**：指针点击，以及焦点节点的 Enter/Space 激活，都会分发它（`event::Action`）。
-    ///
-    /// 与 [`NodeBuilder::on_action`] 写同一个槽（后写覆盖）：`on_click` 是指针语义的拼写，`on_action` 是
-    /// 通用拼写（键盘 / a11y 激活读的是同一个声明）。动作按「命中节点 → 祖先」冒泡取第一条，
-    /// `interactive: Some(false)` 处停止。
     #[must_use]
     pub fn on_click(mut self, action: Action) -> Self {
         self.action = Some(action);
         self
     }
 
-    /// 声明**动作**的通用拼写（与 [`NodeBuilder::on_click`] 同槽）。
     #[must_use]
     pub fn on_action(mut self, action: Action) -> Self {
         self.action = Some(action);
         self
     }
 
-    /// 声明**拖拽动作**：按下即开启会话，移动/抬起按 `ActionSource::Drag` 分发它。
-    ///
-    /// 引擎不改受拖拽节点的布局 —— 分栏/平移的几何由应用在 handler 里写
-    /// （`LayoutOverride` 或 `Signal`）。
     #[must_use]
     pub fn on_drag(mut self, action: Action) -> Self {
         self.drag = Some(action);
         self
     }
 
-    /// 自绘节点：挂载时提交画布内容（P02 的 `Canvas`）。
     #[must_use]
     pub fn canvas(canvas: Canvas) -> Self {
         Self {
@@ -155,7 +121,6 @@ impl NodeBuilder {
         }
     }
 
-    /// 静态几何节点（引用 P09 的 GPU 几何）。
     #[must_use]
     pub fn geometry(geometry: GeometryId) -> Self {
         Self {
@@ -164,14 +129,6 @@ impl NodeBuilder {
         }
     }
 
-    /// 图片叶子（E7）：已就绪的图片资源 + 填充方式。
-    ///
-    /// 尺寸：`Style` 的显式尺寸优先；未给尺寸时用资源内在尺寸（tile 逻辑尺寸 =
-    /// 物理像素 ÷ 窗口 scale，由 `App::refresh_images` 在布局前解析）。
-    /// 颜色调制走 [`NodeBuilder::image_modulation`]（静态）或 `bind_style` 的 `foreground`
-    /// （动态，与文本同一条通道）。
-    ///
-    /// 资源未加载 / 已释放时**不画图元**（节点自身的背景/边框照常绘制 = 占位）。
     #[must_use]
     pub fn image(
         resource: crate::resources::ResourceId,
@@ -186,10 +143,6 @@ impl NodeBuilder {
         }
     }
 
-    /// 图片叶子（E7）：异步解码中的资源 + 填充方式。
-    ///
-    /// 资源未就绪时是占位（透明）；`App::poll_resources` 交付 `Ready` 后引擎自动把节点改成
-    /// 已就绪、解析内在尺寸并失效重绘 —— 不需要应用重建节点。
     #[must_use]
     pub fn image_pending(
         pending: crate::resources::PendingResource,
@@ -204,10 +157,6 @@ impl NodeBuilder {
         }
     }
 
-    /// 图片节点的颜色调制（静态；`Color::WHITE` = 不调制）。非图片节点上是 no-op。
-    ///
-    /// 语义：`texel * modulation`（预乘空间）。动态调制用 `bind_style` 的
-    /// `foreground`（文本/图标同一通道，`StylePatch::foreground` 覆盖本值）。
     #[must_use]
     pub fn image_modulation(mut self, modulation: crate::paint::color::Color) -> Self {
         if let NodeKind::Image(content) = &mut self.kind {
@@ -216,10 +165,6 @@ impl NodeBuilder {
         self
     }
 
-    /// 文本叶子（静态文本）。
-    ///
-    /// 挂载后由 `App::refresh_text` 首次形状 —— **在此之前 measure 是 0×0**
-    /// （`NodeBuilder::text` 不伪造与真实形状不一致的闭包）。
     #[must_use]
     pub fn text(text: impl Into<SmolStr>, style: TextStyle) -> Self {
         Self {
@@ -228,7 +173,6 @@ impl NodeBuilder {
         }
     }
 
-    /// 行内盒（`<img>` / `kbd`）：参与断行与行高，位置由引擎算（§12）。
     #[must_use]
     pub fn inline_boxes(
         mut self,
@@ -240,10 +184,6 @@ impl NodeBuilder {
         self
     }
 
-    /// 富文本 runs（v2.1 E2，`§11.2`）：逐区间覆盖样式；空 = 整段用 `text()` 的兜底样式。
-    ///
-    /// 与 `inline_boxes` 同一形态：只对 `NodeBuilder::text` 节点生效。区间在
-    /// `TextContent::with_runs` 里归一化（裁剪到 char boundary / 文本范围，不 panic）。
     #[must_use]
     pub fn runs(mut self, runs: impl IntoIterator<Item = crate::text::TextRun>) -> Self {
         if let NodeKind::Text(content) = &mut self.kind {
@@ -252,9 +192,6 @@ impl NodeBuilder {
         self
     }
 
-    /// 动态文本：每次 `refresh_styles` 求值（与 `bind_style` 同一机制、同一依赖图）。
-    ///
-    /// 返回值是 `SmolStr`（不是 `String`）：短字符串零分配（AGENTS §2.2）。
     #[must_use]
     pub fn bind_text(self, bind_text: impl Fn(&mut ReadCtx<'_>) -> SmolStr + 'static) -> Self {
         Self {
@@ -263,14 +200,12 @@ impl NodeBuilder {
         }
     }
 
-    /// 静态样式（覆盖 `Style::default()`）。
     #[must_use]
     pub fn style(mut self, style: Style) -> Self {
         self.style = style;
         self
     }
 
-    /// 动态属性：闭包在每次 `refresh_styles` 求值时重算 `StylePatch`（值语义，不累积）。
     #[must_use]
     pub fn bind_style(self, bind_style: impl Fn(&mut ReadCtx<'_>) -> StylePatch + 'static) -> Self {
         Self {
@@ -279,35 +214,18 @@ impl NodeBuilder {
         }
     }
 
-    /// 自定义叶子测量（P05 的文本 / 坐标标签入口）。
-    ///
-    /// 闭包必须是**纯函数**：不读 `Signal`、不写状态（见 `crate::layout::MeasureFn` 的契约）。
     #[must_use]
     pub fn measure(mut self, measure: MeasureFn) -> Self {
         self.measure = Some(measure);
         self
     }
 
-    /// 自定义命中形状（R04-8）：[`HitShape`] 是**数据**（矩形 / 圆角矩形 / 圆 / 椭圆 / 多边形
-    /// 路径），可缓存、可复用、可被 a11y 读取；`point` 是节点 **border box 局部坐标**。
-    ///
-    /// - 形状可以**超出布局盒**（自绘内容平移/缩放后「画得到、点得到」）：命中剪枝与
-    ///   `subtree_bounds` 会把形状 AABB 并进包络；
-    /// - 任意谓词用逃生舱 [`HitShape::custom`]（纯函数契约同 [`NodeBuilder::measure`]）；
-    /// - 默认（不设置）等价于布局盒矩形（旧行为）。
     #[must_use]
     pub fn hit_shape(mut self, hit_shape: HitShape) -> Self {
         self.hit_shape = Some(hit_shape);
         self
     }
 
-    /// 布局覆盖（root 逃生口，P04 §10）：`rect` 相对**父节点 border box**，且就是该节点的 border box。
-    ///
-    /// **副作用**：同时把 `style.inner.position` 置为 `Position::Absolute` —— 出流是「位置与尺寸都由应用定」
-    /// 的必要条件（父不该为它保留流内空间）。
-    ///
-    /// 该节点因此是**布局叶子**：挂在它下面的子节点不会被布局（`build` 有 debug 断言）。
-    /// 若容器还需要子布局，请用普通容器 + `Style` 的尺寸，而不是 Override。
     #[must_use]
     pub fn layout_override(mut self, rect: Rect) -> Self {
         self.style.inner.position = taffy::style::Position::Absolute;
@@ -315,7 +233,6 @@ impl NodeBuilder {
         self
     }
 
-    /// 静态绘制属性（P06）：背景 / 边框 / 圆角 / 阴影 / 渐变。动态覆盖请用 [`NodeBuilder::bind_style`]。
     #[must_use]
     pub fn paint(self, paint: PaintSpec) -> Self {
         Self {
@@ -324,9 +241,6 @@ impl NodeBuilder {
         }
     }
 
-    /// 稳定调试 id（P06）：`Probe::by_selector(Selector::Id(..))` 与诊断日志的锚点。
-    ///
-    /// 同一棵树内**允许重复**（多个命中取 DFS 先序的第一个）；引擎不做唯一性检查。
     #[must_use]
     pub fn id(self, id: impl Into<SmolStr>) -> Self {
         Self {
@@ -335,16 +249,6 @@ impl NodeBuilder {
         }
     }
 
-    /// 挂载到 `parent` 末尾并返回新句柄。
-    ///
-    /// # Errors
-    /// `EngineError::StaleNode { node: parent }`：父节点陈旧（从未存在/已卸载）。
-    ///
-    /// # Panics（仅 debug）
-    /// 父节点是**布局叶子**（`NodeKind::Canvas` / `Geometry` / `Image` / `Text`，或带
-    /// `LayoutOverride`）时 `debug_assert!` 失败。
-    /// **release 下允许挂载，但该子树永不产生布局盒、也永不产生任何像素**（P04 对叶子节点的子节点不做布局）
-    /// ——这是「已定义但不可见」的行为，不是 UB，也不是静默降级（debug 构建必然失败）。
     pub fn build(self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let parent_node = tree.get(parent)?;
         debug_assert!(
@@ -455,7 +359,6 @@ mod tests {
         assert!(tree.get(geometry).expect("存在").kind().is_leaf());
     }
 
-    /// E7：`image(resource, fit)` 装出图片叶子；未解析前 measure 为空、内在尺寸为 `None`。
     #[test]
     fn build_image_sets_kind_and_needs_measure() {
         use crate::{
@@ -492,7 +395,6 @@ mod tests {
         );
     }
 
-    /// E7：异步图片构造器（`Pending` 句柄；就绪后由引擎改写成 `Ready`）。
     #[test]
     fn build_image_pending_stores_the_pending_handle() {
         use crate::{
@@ -517,7 +419,6 @@ mod tests {
         }
     }
 
-    /// E7：`image_modulation` 对非图片节点是 no-op（与 `inline_boxes` 的形态一致）。
     #[test]
     fn image_modulation_is_ignored_on_non_image_nodes() {
         use crate::paint::color::Color;
@@ -674,8 +575,6 @@ mod tests {
 
         let _ = NodeBuilder::boxed().build(&mut tree, pane);
     }
-
-    // ── P05：文本 ────────────────────────────────────────────────────────────
 
     #[test]
     fn text_builder_sets_kind_content_and_no_measure() {

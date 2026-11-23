@@ -17,9 +17,6 @@ greeting: "你好，%{name}！"
 price: "%{amount} 美元"
 "#;
 
-/// The text of `credential`, which is longer than the 23 bytes a `SmolStr` stores
-/// inline. Above that capacity the text is heap-backed, so the address of the
-/// returned string is comparable from one call to the next.
 const LONG_MESSAGE: &str = "The stored sign-in credential is invalid";
 
 fn i18n() -> I18n {
@@ -229,13 +226,6 @@ fn without_a_fallback_missing_messages_stay_empty() {
     assert_eq!(i18n.fallback(), None);
 }
 
-/// Pins that a long static message reaches callers as one stored value: above
-/// the 23 bytes a short string keeps inline the text is heap-backed, so two calls
-/// that share it return one address while two that build it separately do not.
-///
-/// This alone does not guard the fast path — `RenderedCache` also hands out the
-/// same `Arc` — which is what
-/// `tests/static_translation_allocations.rs` is for.
 #[test]
 fn a_static_message_longer_than_the_inline_capacity_is_handed_out_as_one_shared_value() {
     let i18n = i18n();
@@ -253,9 +243,6 @@ fn a_static_message_longer_than_the_inline_capacity_is_handed_out_as_one_shared_
     );
 }
 
-/// A message short enough for the inline buffer is copied on the way out, so its
-/// address says nothing; the inline path is only observable through the text it
-/// produces.
 #[test]
 fn a_static_message_within_the_inline_capacity_keeps_its_text() {
     let i18n = i18n();
@@ -271,11 +258,8 @@ fn a_static_message_within_the_inline_capacity_keeps_its_text() {
     );
 }
 
-/// Pins the same for the fallback lookup, which resolves the message through a
-/// different store than the requested language.
 #[test]
 fn the_fallback_language_is_handed_out_as_one_shared_value() {
-    // `credential` is English-only, so Chinese resolves it through the fallback.
     let i18n = i18n();
 
     let first = i18n.try_translate(LanguageCode::ZhCn, "credential");
@@ -309,28 +293,18 @@ fn an_empty_message_stays_empty_and_a_missing_key_stays_missing() {
     );
 }
 
-/// Guards the thread-safety of the text the templates hold: `Template::Static`
-/// stores a `SmolStr`, whose heap representation is an `Arc<str>` today. A
-/// representation change to something `Rc`-backed would leave the translator no
-/// longer `Send + Sync`, and cross-thread use is what would then start failing,
-/// at a distance from the cause.
 #[test]
 fn the_translator_stays_shareable_across_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<I18n>();
 }
 
-/// Guards the branch the fast path sits in: only a template without placeholders
-/// returns its text, and a message with a placeholder still has to render and be
-/// cached.
 #[test]
 fn an_interpolated_message_still_renders_through_the_cache() {
     let i18n = i18n();
     let count = 3;
     let name = "Cart";
 
-    // Renders to "You have 3 items in Cart.", which is longer than the inline
-    // capacity, so a cache hit is observable as a shared address.
     let first = i18n.translate_with(
         LanguageCode::En,
         "items",

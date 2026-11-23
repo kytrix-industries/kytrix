@@ -1,51 +1,35 @@
-//! Errors produced while loading a model and translating content.
-
 use std::path::PathBuf;
 
 use ai_provider::error::ProviderError;
 use smol_str::SmolStr;
 use thiserror::Error;
 
-/// Typed failures from the translator.
 #[derive(Debug, Error)]
 pub enum TranslationError {
-    /// The requested target language is not one of the model's codes.
     #[error("target language `{code}` is not supported")]
     UnsupportedLanguage { code: SmolStr },
-    /// The content and the requested output do not fit in the model's context.
     #[error("the request needs {tokens} prompt tokens and only {limit} are available for them")]
     ContentTooLong { tokens: usize, limit: usize },
-    /// No directory has been configured to load the model from.
     #[error("no translation model directory is configured")]
     ModelDirectoryUnset,
-    /// No model has been selected in the settings.
     #[error("no translation model is selected")]
     ModelNotSelected,
-    /// The model is being unloaded and cannot be loaded again yet.
     #[error("translation model `{path}` is being unloaded")]
     ModelBusy { path: PathBuf },
-    /// Other translations kept the model in use for longer than an unload may wait.
     #[error("translation model `{path}` did not finish its translations within 30 seconds")]
     UnloadTimeout { path: PathBuf },
-    /// The caller cancelled the request before the model finished it.
     #[error("the translation request was cancelled")]
     Cancelled,
-    /// The batch request repeats a segment id, so its answer could not be matched back.
     #[error("the batch request repeats the segment id `{id}`")]
     BatchRequestDuplicateId { id: SmolStr },
-    /// The model did not answer a batch request with a JSON object.
     #[error("the model response is not a JSON object")]
     BatchResponseNotJson,
-    /// The model response did not translate every requested segment.
     #[error("the model response is missing translations for ids {ids:?}")]
     BatchResponseMissing { ids: Vec<SmolStr> },
-    /// The model response invented segment ids that were not requested.
     #[error("the model response contains translations for unrequested ids {ids:?}")]
     BatchResponseExtra { ids: Vec<SmolStr> },
-    /// The model returned an empty translation for a requested segment.
     #[error("the model response left translations empty for ids {ids:?}")]
     BatchResponseEmpty { ids: Vec<SmolStr> },
-    /// The inference engine failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
 }

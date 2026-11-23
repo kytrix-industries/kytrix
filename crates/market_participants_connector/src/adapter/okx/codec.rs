@@ -1,15 +1,3 @@
-//! The OKX v5 wire codec.
-//!
-//! OKX spells its own protocol values: the candlestick bars, the statistics
-//! periods, the instrument types and the trade modes. Those spellings live here
-//! and nowhere else, so the model's canonical interval label never reaches the
-//! wire, and an interval this venue does not publish is refused with the route
-//! that refused it.
-//!
-//! The codec also owns the venue's listing identity: an OKX listing is
-//! continuous exactly while its `instId` and its instrument type are the same,
-//! which is what [`OkxCodec::listing_key`] derives a `VenueListingKey` from.
-
 use bytes::Bytes;
 use market_participants_model::{
     identifier::{NativeSymbol, VenueScopeId},
@@ -34,26 +22,14 @@ use crate::{
     routing::{SPOT_SCOPE, SWAP_SCOPE},
 };
 
-/// The one wire codec of this adapter; it carries no state.
 pub(crate) const CODEC: OkxCodec = OkxCodec;
 
-/// The OKX codes whose failure is the venue being temporarily unable to serve a
-/// request.
-///
-/// OKX's own wording is what decides membership: a matching-engine upgrade, an
-/// endpoint timeout, an offline API, a busy system and a system error all tell
-/// the caller to try again. The rest of its code space — an empty parameter, a
-/// missing `instFamily`, an unknown instrument — refuses the request itself, and
-/// reporting those as retryable would promise a retry that cannot succeed.
-/// Rate limiting is absent because it is mapped to `RateLimited`, which carries
-/// the venue's own retry guidance.
 const TRANSIENT_ERROR_CODES: [&str; 5] = ["50001", "50004", "50005", "50013", "50026"];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OkxCodec;
 
 impl OkxCodec {
-    /// Extracts the correlation ID from an OKX WebSocket response.
     pub fn extract_response_id(payload: &[u8]) -> Option<u64> {
         serde_json::from_slice::<OkxResponseIdEnvelope>(payload)
             .ok()
@@ -81,10 +57,6 @@ impl OkxCodec {
         })
     }
 
-    /// The `instType` OKX selects instruments with on one scope.
-    ///
-    /// A scope this adapter does not serve has no instrument type at all: the
-    /// caller answers `UnsupportedCapability` for it instead of guessing one.
     pub fn scope_instrument_type(&self, scope: &VenueScopeId) -> Option<OkxInstrumentType> {
         match scope.as_str() {
             SPOT_SCOPE => Some(OkxInstrumentType::Spot),
@@ -93,7 +65,6 @@ impl OkxCodec {
         }
     }
 
-    /// The wire value of one instrument type.
     pub fn instrument_type_param(&self, instrument_type: OkxInstrumentType) -> &'static str {
         match instrument_type {
             OkxInstrumentType::Spot => "SPOT",
@@ -103,14 +74,6 @@ impl OkxCodec {
         }
     }
 
-    /// The `bar` OKX expects for one candlestick interval.
-    ///
-    /// OKX capitalizes the unit letter above minutes and publishes 2-day and
-    /// 3-day bars; it publishes neither a one-second nor an eight-hour bar on
-    /// either of the scopes this adapter serves, and it publishes no
-    /// two/ten/twenty/forty-five-minute bar, no three-hour bar and nothing above
-    /// a month, so those are refused rather than sent as an interval the venue
-    /// would reinterpret.
     pub fn encode_timeframe(
         &self,
         route: &VenueRoute,
@@ -148,7 +111,6 @@ impl OkxCodec {
         }
     }
 
-    /// The `period` OKX expects for one statistics interval.
     pub fn encode_statistics_timeframe(&self, timeframe: StatisticsTimeFrame) -> &'static str {
         match timeframe {
             StatisticsTimeFrame::Minute5 => "5m",
@@ -163,11 +125,6 @@ impl OkxCodec {
         }
     }
 
-    /// The `tdMode` OKX expects for one order on one scope.
-    ///
-    /// A spot order is a cash order and may not carry a perpetual margin mode; a
-    /// swap order always carries one, because OKX answers a swap order without a
-    /// mode from the account's current default instead of the one that was meant.
     pub fn encode_trade_mode(
         &self,
         route: &VenueRoute,
@@ -221,11 +178,6 @@ impl OkxCodec {
         }
     }
 
-    /// Derives the identity of one listing from the venue's own identifiers.
-    ///
-    /// The continuity terms are the `instId` and the instrument type, which are
-    /// the two values that make one OKX listing the same listing across
-    /// publications; a display alias never takes part in it.
     pub fn listing_key(
         &self,
         route: &VenueRoute,
@@ -254,7 +206,6 @@ impl OkxCodec {
         })
     }
 
-    /// Maps one OKX response code onto a typed market-participant failure.
     pub fn map_error(
         &self,
         code: &str,
@@ -290,11 +241,6 @@ impl OkxCodec {
         }
     }
 
-    /// Maps one failed OKX HTTP response onto a typed market-participant failure.
-    ///
-    /// OKX reports a request it refused as its own `{code, msg}` envelope inside
-    /// the response, so a user is shown the venue's own code and words; a failure
-    /// that carries no envelope keeps the venue's plain text instead.
     pub fn response_error(
         &self,
         route: &VenueRoute,
@@ -402,8 +348,6 @@ mod public_api_tests {
         );
     }
 
-    /// The wire bars are OKX's own spellings, and the two intervals the venue
-    /// does not publish are refused instead of being sent as another interval.
     #[test]
     fn okx_candle_bars_are_the_venues_own_spellings() {
         let codec = OkxCodec;
@@ -427,7 +371,6 @@ mod public_api_tests {
         ));
     }
 
-    /// One instrument type is what one scope addresses, and no other scope has one.
     #[test]
     fn okx_scopes_map_onto_their_own_instrument_types() {
         let codec = OkxCodec;
@@ -450,8 +393,6 @@ mod public_api_tests {
         );
     }
 
-    /// The listing identity is the venue's own identity: two instruments of one
-    /// route differ, and the same instrument on two scopes differs as well.
     #[test]
     fn okx_listing_identity_follows_the_instrument_id_and_the_scope() {
         let codec = OkxCodec;
@@ -488,7 +429,6 @@ mod tests {
     use super::OkxCodec;
     use crate::{error::MarketParticipantError, routing::SWAP_SCOPE};
 
-    /// The route one refused request is reported against.
     fn route() -> VenueRoute {
         VenueRoute::new(
             VenueId::Okx,
@@ -552,8 +492,6 @@ mod tests {
         ));
     }
 
-    /// OKX answers a refused request with its own envelope inside the failure
-    /// status: the code and the words a user reads are the venue's own.
     #[test]
     fn a_refusal_envelope_reaches_the_user_as_the_venue_wrote_it() {
         let error = OkxCodec.response_error(
@@ -573,8 +511,6 @@ mod tests {
         ));
     }
 
-    /// Retryability is the venue's own classification: a system error says to
-    /// try again, while a refusal of the request itself never does.
     #[test]
     fn only_the_transient_okx_codes_are_retryable() {
         for code in ["50001", "50004", "50005", "50013", "50026"] {
@@ -600,8 +536,6 @@ mod tests {
         }
     }
 
-    /// Rate limiting keeps its own mapping, which is what carries the venue's
-    /// retry guidance.
     #[test]
     fn a_rate_limit_envelope_maps_to_the_rate_limited_failure() {
         let error = OkxCodec.response_error(
@@ -614,8 +548,6 @@ mod tests {
         assert!(matches!(error, MarketParticipantError::RateLimited { .. }));
     }
 
-    /// A failure OKX did not describe is reported as the transport reported it:
-    /// a server failure is the connection, anything else keeps the status line.
     #[test]
     fn a_failure_without_an_okx_envelope_keeps_the_transport_answer() {
         let server = OkxCodec.response_error(
@@ -642,8 +574,6 @@ mod tests {
         ));
     }
 
-    /// A failure status that still claims success says nothing about a failure,
-    /// so it is reported as the status line rather than as OKX code `0`.
     #[test]
     fn a_success_code_on_a_failure_status_is_reported_as_the_status_line() {
         let error = OkxCodec.response_error(

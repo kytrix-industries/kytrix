@@ -1,21 +1,3 @@
-//! The venue's own board of live asset contexts, kept once for every reader of it.
-//!
-//! `fastAssetCtxs` is the venue's whole-venue context subscription: its body names no
-//! scope and no asset, and what it publishes is not one message per price but a stream
-//! of deltas over the venue's whole board of mark and mid prices. The first message
-//! after the subscription opens is the board; every later one carries only the coins —
-//! and, within a coin, only the fields — that moved since. A reader that took each
-//! message for the whole board would drop every price that message did not happen to
-//! name, which is most of them: a coin's own price is named in a small share of the
-//! messages, so a wallet valued from the board would lose that coin's value on the
-//! message after its price arrived and find it again on the next message that named it.
-//!
-//! The board is therefore kept where the subscription is — one socket of one venue
-//! publishes one board — and every reader is handed the whole of it. That is also what
-//! makes a second reader correct: the subscription is shared by topic, so a reader that
-//! joins after the opening message never sees the opening message, and the board is what
-//! makes its first answer as complete as the first reader's.
-
 use std::{collections::BTreeMap, io::Read as _};
 
 use ahash::AHashMap;
@@ -29,33 +11,19 @@ use crate::{
     error::MarketParticipantError, market_participants::model::NativeHyperliquidAssetContext,
 };
 
-/// The largest fast asset context payload this adapter decompresses.
 const MAX_FAST_ASSET_CONTEXT_PAYLOAD: usize = 16 * 1024 * 1024;
 
-/// The coins one board is expected to hold, which is every asset the venue lists.
 const BOARD_COINS: usize = 2_048;
 
-/// One field of one coin's context update.
-///
-/// The venue distinguishes three things about a field and a plain `Option` collapses two
-/// of them: a field the message does not carry has not moved, and a field the message
-/// carries as null is the venue saying it has no such price any more. Only the second
-/// may clear a price the board holds, so the wire shape says which one it is. (The live
-/// stream has carried nulls only in its opening board, so the clearing case is modelled
-/// from the shape rather than observed.)
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum FieldUpdate<T> {
-    /// The venue did not name this field: what the board holds for it stands.
     #[default]
     Unchanged,
-    /// The venue named this field and published no value for it.
     Cleared,
-    /// The venue published this value.
     Set(T),
 }
 
 impl<T> FieldUpdate<T> {
-    /// Writes this update over the value the board holds for one field.
     fn apply_to(self, held: &mut Option<T>) {
         match self {
             Self::Unchanged => {}
@@ -70,8 +38,6 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for FieldUpdate<T>
     where
         D: serde::Deserializer<'de>,
     {
-        // An absent field never reaches this: `#[serde(default)]` is what says a field a
-        // message left out is unchanged.
         Ok(match Option::<T>::deserialize(deserializer)? {
             Some(value) => Self::Set(value),
             None => Self::Cleared,
@@ -85,7 +51,6 @@ struct FastContextEnvelope {
     data: SmolStr,
 }
 
-/// The fields one coin's context carries in one message.
 #[derive(Clone, serde::Deserialize)]
 struct FastContextValues {
     #[serde(default, rename = "markPx")]
@@ -94,23 +59,19 @@ struct FastContextValues {
     mid_px: FieldUpdate<SmolStr>,
 }
 
-/// One coin's share of one message, with the prices it carried already read.
 struct ContextUpdate {
     coin: SmolStr,
     mark_px: FieldUpdate<Price>,
     mid_px: FieldUpdate<Price>,
 }
 
-/// The prices the venue currently publishes for one coin.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ContextEntry {
     mark_px: Option<Price>,
     mid_px: Option<Price>,
 }
 
-/// The venue's live contexts, as the one subscription that carries them publishes them.
 pub(super) struct FastContextBoard {
-    /// The last price the venue published for each field of each coin it has named.
     coins: Mutex<AHashMap<SmolStr, ContextEntry>>,
 }
 
@@ -123,11 +84,6 @@ impl Default for FastContextBoard {
 }
 
 impl FastContextBoard {
-    /// Merges one socket message and answers the whole board of `listings`.
-    ///
-    /// The answer is the board rather than the message because that is what the venue's
-    /// stream means: every price it has published, not the handful it just repeated.
-    /// `None` is a frame of another channel, which this board has nothing to say about.
     pub(super) fn absorb(
         &self,
         payload: &[u8],
@@ -136,14 +92,6 @@ impl FastContextBoard {
         let Some(values) = decode_message(payload)? else {
             return Ok(None);
         };
-        // Read every price this reader's own listings name before any of it is merged, so
-        // one malformed price leaves the board as it was rather than half-updated.
-        //
-        // A price of a coin no listing here names is not this reader's to read: the venue
-        // publishes the whole venue's board while this reader watches its own listings, and
-        // one unreadable market must not fail a wallet pane that never reads it. Such a
-        // coin is left out of the merge — it keeps the price the venue last published
-        // readably — and the message is reported rather than dropped in silence.
         let mut updates = Vec::with_capacity(values.len());
         for (coin, value) in values {
             let watched = listings.contains_key(&coin);
@@ -165,10 +113,6 @@ impl FastContextBoard {
     }
 }
 
-/// Reads one coin's share of a message, or says why its price could not be read.
-///
-/// The mark price is read before the mid price so that the failure names the field the
-/// venue spelled first.
 fn read_update(
     coin: SmolStr,
     value: FastContextValues,
@@ -182,11 +126,6 @@ fn read_update(
     })
 }
 
-/// The whole board, read as the contexts of the listings one reader asked about.
-///
-/// A coin the venue holds no price for publishes no context at all: a reader values what
-/// a price was published for, and an empty entry would answer for the listing it names
-/// instead of letting another market of the same asset answer for it.
 fn board_contexts(
     coins: &AHashMap<SmolStr, ContextEntry>,
     listings: &RouteListings,
@@ -207,7 +146,6 @@ fn board_contexts(
         .collect()
 }
 
-/// Reads one wire field as the price it carries, keeping what it says about the field.
 fn parse_update(
     value: FieldUpdate<SmolStr>,
     operation: &'static str,
@@ -219,11 +157,6 @@ fn parse_update(
     })
 }
 
-/// Decodes one socket frame into the updates it carries.
-///
-/// Every frame of the connection reaches every one of its streams, so a frame of another
-/// channel, or one no channel of this venue wrote, is not a failure: it is a message this
-/// stream has nothing to say about.
 fn decode_message(
     payload: &[u8],
 ) -> Result<Option<BTreeMap<SmolStr, FastContextValues>>, MarketParticipantError> {
@@ -244,7 +177,6 @@ fn decode_message(
         .map_err(|_| context_decode_failure(payload))
 }
 
-/// The failure of a context message that carried something else.
 fn context_decode_failure(payload: &[u8]) -> MarketParticipantError {
     MarketParticipantError::DecodeFailed {
         operation: SmolStr::new_static("decode Hyperliquid fast asset contexts"),
@@ -252,7 +184,6 @@ fn context_decode_failure(payload: &[u8]) -> MarketParticipantError {
     }
 }
 
-/// Decompresses one deflate payload within this adapter's own limit.
 fn inflate(encoded: &[u8], payload: &[u8]) -> Result<Vec<u8>, MarketParticipantError> {
     let mut decoder = flate2::read::DeflateDecoder::new(encoded);
     let mut decoded = BytesMut::with_capacity(encoded.len().min(MAX_FAST_ASSET_CONTEXT_PAYLOAD));
@@ -276,11 +207,6 @@ fn inflate(encoded: &[u8], payload: &[u8]) -> Result<Vec<u8>, MarketParticipantE
     Ok(decoded.to_vec())
 }
 
-/// The frame of one `fastAssetCtxs` message.
-///
-/// The tests that drive a real stream build their payloads with this, and the ones that
-/// read the board directly use it too, so the shape under test is the shape the socket
-/// delivers.
 #[cfg(test)]
 pub(super) fn fast_contexts_payload(contexts: &str) -> Vec<u8> {
     use std::io::Write as _;
@@ -322,7 +248,6 @@ mod tests {
         )
     }
 
-    /// The listing key of one asset of one perpetual route.
     fn perp_key(route: &VenueRoute, index_in_meta: u32) -> VenueListingKey {
         let asset_id =
             catalog::perp_asset_id(0, index_in_meta).expect("the fixture asset ID should fit");
@@ -330,7 +255,6 @@ mod tests {
             .expect("the fixture listing key should derive")
     }
 
-    /// The listings one reader decodes the shared stream against, by fixture asset index.
     fn listings(entries: &[(&str, u32)]) -> RouteListings {
         let route = route(CORE_PERP_SCOPE);
         Arc::new(
@@ -341,7 +265,6 @@ mod tests {
         )
     }
 
-    /// The prices one answer carries for the fixture listing of one asset index.
     fn prices(
         contexts: &[NativeHyperliquidAssetContext],
         index_in_meta: u32,
@@ -358,11 +281,6 @@ mod tests {
             })
     }
 
-    /// One message is a delta over the board, not the board.
-    ///
-    /// The venue names only the coins that moved, so a reader that took the message for
-    /// the whole board would lose the value of every coin it did not name — which is the
-    /// failure this board exists to prevent.
     #[test]
     fn a_message_that_names_one_coin_does_not_drop_the_others() {
         let board = FastContextBoard::default();
@@ -405,7 +323,6 @@ mod tests {
         );
     }
 
-    /// A field the venue left out is not a price the venue cleared.
     #[test]
     fn a_field_the_message_leaves_out_is_not_a_cleared_price() {
         let board = FastContextBoard::default();
@@ -456,11 +373,6 @@ mod tests {
         );
     }
 
-    /// Every reader of the one subscription is handed the board, not its own history.
-    ///
-    /// The venue sends the whole board once, when the subscription opens, and the topic is
-    /// shared: a reader that joins later never sees that message. It still has to answer
-    /// with the prices the venue published before it arrived.
     #[test]
     fn a_reader_that_never_saw_the_opening_message_still_reads_the_board() {
         let board = FastContextBoard::default();
@@ -489,7 +401,6 @@ mod tests {
         );
     }
 
-    /// A coin no monitored route lists is not a context of this reader's board.
     #[test]
     fn a_coin_this_reader_does_not_list_publishes_no_context() {
         let board = FastContextBoard::default();
@@ -522,7 +433,6 @@ mod tests {
         );
     }
 
-    /// A message of another channel is not a context message and not a failure.
     #[test]
     fn a_message_of_another_channel_is_not_a_context_of_this_stream() {
         let board = FastContextBoard::default();
@@ -543,7 +453,6 @@ mod tests {
         }
     }
 
-    /// A payload that is not the message it claims to be is refused.
     #[test]
     fn a_context_message_that_carries_something_else_is_refused() {
         let board = FastContextBoard::default();
@@ -574,7 +483,6 @@ mod tests {
         ));
     }
 
-    /// One price the venue spelled badly leaves the board as it was.
     #[test]
     fn a_price_the_venue_spelled_badly_leaves_the_board_alone() {
         let board = FastContextBoard::default();
@@ -610,12 +518,6 @@ mod tests {
         );
     }
 
-    /// A price of a coin this reader does not list is not this reader's failure.
-    ///
-    /// The venue publishes the whole venue's board while a reader watches its own listings,
-    /// and one board serves every reader of the subscription: a market nothing here reads
-    /// must not fail a wallet pane that never reads it — and its unreadable price must not
-    /// be merged either.
     #[test]
     fn a_price_of_a_coin_this_reader_does_not_list_is_not_its_failure() {
         let board = FastContextBoard::default();
@@ -643,8 +545,6 @@ mod tests {
             "the price of the coin this reader does watch is still read"
         );
 
-        // The same message read by a reader whose listings do name that coin is refused: a
-        // market the reader reads and cannot price is that reader's failure.
         assert!(matches!(
             board.absorb(
                 &fast_contexts_payload(r#"{"xyz:NVDA":{"markPx":"not a price"}}"#),
@@ -655,7 +555,6 @@ mod tests {
         ));
     }
 
-    /// A message that decompresses past the adapter's own limit is refused.
     #[test]
     fn a_payload_that_decompresses_past_the_limit_is_refused() {
         let board = FastContextBoard::default();

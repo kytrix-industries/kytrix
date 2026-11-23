@@ -3,7 +3,6 @@ use i18n::{
     translator::{builder::Builder, types::I18n},
 };
 
-/// Locale files loaded from disk, exercising the YAML pipeline end to end.
 fn i18n() -> I18n {
     Builder::default()
         .locales("tests/locales")
@@ -145,8 +144,6 @@ fn repeated_translation_returns_the_same_text_without_rerendering() {
 fn fallback_covers_messages_a_language_lacks() {
     let i18n = i18n();
 
-    // `zh-TW` only translates `menu.market`, and `%{name}` is not supplied, so the
-    // rest of the message comes from `zh-CN` and renders without argument.
     assert_eq!(
         i18n.translate(LanguageCode::ZhTw, "menu.market").as_str(),
         "行情"
@@ -161,8 +158,6 @@ fn fallback_covers_messages_a_language_lacks() {
         "量化"
     );
 
-    // `zh-CN` lacks `ratio`, which only English defines, and English is not the
-    // fallback of this instance.
     assert_eq!(i18n.translate(LanguageCode::ZhCn, "ratio").as_str(), "");
     assert_eq!(
         i18n.translate(LanguageCode::ZhCn, "nothing.here").as_str(),

@@ -1,71 +1,34 @@
-//! The workspace's pane topology and the rectangles it lays out as.
-//!
-//! The topology is a binary tree: a leaf is one pane, a split is one orientation, the
-//! head's share of the content (a fraction, not a measurement) and two children. The
-//! stored layout carries the same fraction, so a restored workspace draws the split the
-//! user left it at before anything has been measured.
-//!
-//! # Geometry
-//!
-//! The window is measured by the engine; this module turns a measured viewport into the
-//! rectangles the stage hands each pane through `LayoutOverride`. That keeps the recursive
-//! layout out of the engine's flow layout (which would need one nested flex tree per
-//! split) and makes the result assertable without a window: [`PaneTree::layout`] is a pure
-//! function of the viewport and the fractions, given the minimum pane widths.
-//!
-//! A split bar takes [`SPLIT_BAR_SIZE`] logical pixels between its children; the head's
-//! share is computed inside the content that remains. A horizontal pair is clamped so both
-//! panes keep their preferred width while the workspace allows it, then their compact
-//! width, and only a workspace narrower than that lets a pane fall below it (the panes then
-//! share what is there). Vertical splits have no minimum height: a pane may be short, but
-//! the horizontal minimum is what keeps a widget's controls usable.
-//!
-//! # Identity
-//!
-//! A pane is identified by its [`PaneId`], not by its node: splitting, closing and
-//! rearranging the tree never renumber a surviving pane, so the widget mounted in it (and
-//! the state it has collected) survives a split unchanged. A split bar is identified by
-//! its [`SplitId`] for the same reason.
-
 use app_config::workspace::{WorkspaceLayout, WorkspaceOrientation, WorkspaceWidget};
 use ui_core::math::Rect;
 
 use crate::shell::metrics::{PANE_COMPACT_WIDTH, PANE_MIN_WIDTH, SPLIT_BAR_SIZE};
 
-/// One pane's identity, stable across topology changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PaneId(u64);
 
 impl PaneId {
-    /// The numeric identity, for action keys and diagnostics.
     pub(crate) const fn index(self) -> u64 {
         self.0
     }
 
-    /// A pane identity built by a test.
     #[cfg(test)]
     pub(crate) const fn test(raw: u64) -> Self {
         Self(raw)
     }
 }
 
-/// One split bar's identity, stable across topology changes of its children.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SplitId(u64);
 
 impl SplitId {
-    /// The numeric identity, for action keys and diagnostics.
     pub(crate) const fn index(self) -> u64 {
         self.0
     }
 }
 
-/// The orientation of a split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneOrientation {
-    /// Children side by side, separated by a vertical bar.
     Horizontal,
-    /// Children stacked, separated by a horizontal bar.
     Vertical,
 }
 
@@ -87,12 +50,11 @@ impl From<PaneOrientation> for WorkspaceOrientation {
     }
 }
 
-/// One node of the pane topology.
 #[derive(Debug, Clone)]
 pub(crate) enum PaneNode {
-    /// One pane.
-    Leaf { pane: PaneId },
-    /// Two children and the head's share of the content between the split bar.
+    Leaf {
+        pane: PaneId,
+    },
     Split {
         split: SplitId,
         orientation: PaneOrientation,
@@ -103,7 +65,6 @@ pub(crate) enum PaneNode {
 }
 
 impl PaneNode {
-    /// The panes of this subtree, in drawing order.
     #[cfg(test)]
     fn visit_panes(&self, visit: &mut impl FnMut(PaneId)) {
         match self {
@@ -115,7 +76,6 @@ impl PaneNode {
         }
     }
 
-    /// The minimum width this subtree needs to be usable with its preferred pane widths.
     fn preferred_width(&self) -> f32 {
         match self {
             Self::Leaf { .. } => PANE_MIN_WIDTH,
@@ -133,7 +93,6 @@ impl PaneNode {
         }
     }
 
-    /// The minimum width this subtree needs with its compact pane widths.
     fn compact_width(&self) -> f32 {
         match self {
             Self::Leaf { .. } => PANE_COMPACT_WIDTH,
@@ -162,7 +121,6 @@ impl PaneNode {
     }
 }
 
-/// The pane topology of one workspace.
 #[derive(Debug, Clone)]
 pub(crate) struct PaneTree {
     root: PaneNode,
@@ -170,13 +128,9 @@ pub(crate) struct PaneTree {
     next_split: u64,
 }
 
-/// The rectangles one measured viewport lays the workspace out as.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkspaceGeometry {
-    /// Each pane and the rectangle its chrome takes (window coordinates of the stage).
     pub panes: Vec<(PaneId, Rect)>,
-    /// Each split bar and its rectangle, and the content extent the bar splits (logical
-    /// pixels along the split's axis, excluding the bar) for a drag to be measured against.
     pub splits: Vec<(SplitId, Rect, f32)>,
 }
 
@@ -187,7 +141,6 @@ impl Default for PaneTree {
 }
 
 impl PaneTree {
-    /// A workspace with one pane showing nothing in particular.
     pub(crate) fn single() -> Self {
         Self {
             root: PaneNode::Leaf { pane: PaneId(0) },
@@ -196,10 +149,6 @@ impl PaneTree {
         }
     }
 
-    /// Rebuilds a topology from a stored layout.
-    ///
-    /// Panes are numbered in pre-order, and the leaf widgets are returned in the same
-    /// order so the stage mounts each one in its pane without walking the tree again.
     pub(crate) fn from_layout(layout: &WorkspaceLayout) -> (Self, Vec<(PaneId, WorkspaceWidget)>) {
         let mut tree = Self {
             root: PaneNode::Leaf { pane: PaneId(0) },
@@ -245,7 +194,6 @@ impl PaneTree {
         }
     }
 
-    /// Exports the topology as the stored layout, taking each pane's widget from `widget`.
     pub(crate) fn snapshot(
         &self,
         mut widget: impl FnMut(PaneId) -> WorkspaceWidget,
@@ -276,7 +224,6 @@ impl PaneTree {
         snapshot_node(&self.root, &mut widget)
     }
 
-    /// Every pane, in drawing order.
     #[cfg(test)]
     pub(crate) fn panes(&self) -> Vec<PaneId> {
         let mut panes = Vec::new();
@@ -284,7 +231,6 @@ impl PaneTree {
         panes
     }
 
-    /// Every split, in drawing order.
     pub(crate) fn splits(&self) -> Vec<SplitId> {
         fn visit(node: &PaneNode, splits: &mut Vec<SplitId>) {
             match node {
@@ -303,15 +249,10 @@ impl PaneTree {
         splits
     }
 
-    /// Whether this workspace is split (a pane in a split can be closed).
     pub(crate) fn is_split(&self) -> bool {
         matches!(&self.root, PaneNode::Split { .. })
     }
 
-    /// Splits `target`, returning the split it created and the new pane it adds.
-    ///
-    /// The two panes of the new split are `target` and the new one; `target_on_head` keeps
-    /// `target` on the head side, which is what "keep on the left / top" means.
     pub(crate) fn split_pane(
         &mut self,
         target: PaneId,
@@ -346,9 +287,6 @@ impl PaneTree {
         Some((new_pane, split))
     }
 
-    /// Removes `pane` and promotes its sibling into the split's place.
-    ///
-    /// The last pane cannot be removed: a workspace always shows exactly one.
     pub(crate) fn remove_pane(&mut self, pane: PaneId) -> bool {
         if !self.is_split() {
             return false;
@@ -387,7 +325,6 @@ impl PaneTree {
         remove(&mut self.root, pane)
     }
 
-    /// Sets one split's head fraction (clamped to a usable share).
     pub(crate) fn set_fraction(&mut self, split: SplitId, fraction: f32) -> bool {
         fn set(node: &mut PaneNode, split: SplitId, fraction: f32) -> bool {
             match node {
@@ -409,7 +346,6 @@ impl PaneTree {
         set(&mut self.root, split, fraction)
     }
 
-    /// The orientation of one split.
     pub(crate) fn split_orientation(&self, split: SplitId) -> Option<PaneOrientation> {
         fn get(node: &PaneNode, split: SplitId) -> Option<PaneOrientation> {
             match node {
@@ -426,7 +362,6 @@ impl PaneTree {
         get(&self.root, split)
     }
 
-    /// The head fraction of one split.
     pub(crate) fn fraction(&self, split: SplitId) -> Option<f32> {
         fn get(node: &PaneNode, split: SplitId) -> Option<f32> {
             match node {
@@ -443,10 +378,6 @@ impl PaneTree {
         get(&self.root, split)
     }
 
-    /// Lays the workspace out in `viewport`.
-    ///
-    /// The fractions are updated to the shares the layout actually produced, so a drag
-    /// against a clamped split still persists a fraction the next frame can draw.
     pub(crate) fn layout(&mut self, viewport: Rect) -> WorkspaceGeometry {
         let mut geometry = WorkspaceGeometry::default();
         let viewport = Rect::new(
@@ -460,7 +391,6 @@ impl PaneTree {
     }
 }
 
-/// Lays one node out and writes the fraction each split produced back into the tree.
 fn walk(node: &mut PaneNode, rect: Rect, geometry: &mut WorkspaceGeometry) {
     match node {
         PaneNode::Leaf { pane } => geometry.panes.push((*pane, rect)),
@@ -481,8 +411,6 @@ fn walk(node: &mut PaneNode, rect: Rect, geometry: &mut WorkspaceGeometry) {
     }
 }
 
-/// The rectangles of one split: head, bar, tail; the content extent the bar splits; and
-/// the fraction the layout produced.
 fn split_bounds(
     rect: Rect,
     orientation: PaneOrientation,
@@ -564,10 +492,6 @@ fn split_bounds(
     }
 }
 
-/// The minimum width one side of a horizontal split keeps, given what is available.
-///
-/// Preferred widths while the workspace allows them, compact widths while it allows those,
-/// and nothing once it does not (the two panes then share what is there).
 fn enforced_width(
     available: f32,
     preferred: f32,
@@ -622,7 +546,6 @@ mod tests {
         Rect::new(0.0, 0.0, width, height)
     }
 
-    /// A restored single-pane workspace mounts one pane and draws it over the whole stage.
     #[test]
     fn a_single_pane_should_fill_the_stage() {
         let (mut tree, leaves) = PaneTree::from_layout(&single());
@@ -635,8 +558,6 @@ mod tests {
         assert!(!tree.is_split());
     }
 
-    /// A horizontal split puts a four-pixel bar between its two panes and gives the head
-    /// the fraction of the content that remains.
     #[test]
     fn a_horizontal_split_should_put_the_bar_between_the_panes() {
         let layout = split(WorkspaceOrientation::Horizontal, 0.5, single(), single());
@@ -655,7 +576,6 @@ mod tests {
         assert_eq!(leaves.len(), 2);
     }
 
-    /// A vertical split stacks the panes and separates them with a horizontal bar.
     #[test]
     fn a_vertical_split_should_stack_the_panes() {
         let layout = split(WorkspaceOrientation::Vertical, 0.25, single(), single());
@@ -672,9 +592,6 @@ mod tests {
         assert_eq!(tail.origin.y + tail.size.height, 204.0);
     }
 
-    /// A horizontal split never squeezes a pane below its preferred width while the
-    /// workspace has room for both: the head stops at the minimum instead of following the
-    /// fraction any further.
     #[test]
     fn a_horizontal_split_should_clamp_to_the_preferred_pane_width() {
         let layout = split(WorkspaceOrientation::Horizontal, 0.95, single(), single());
@@ -686,7 +603,6 @@ mod tests {
         let content = 800.0 - SPLIT_BAR_SIZE;
         assert_eq!(head.size.width, content - PANE_MIN_WIDTH);
         assert_eq!(tail.size.width, PANE_MIN_WIDTH);
-        // The fraction the layout produced is what a drag writes back.
         let split = geometry.splits[0].0;
         assert_eq!(
             tree.fraction(split),
@@ -694,8 +610,6 @@ mod tests {
         );
     }
 
-    /// A workspace narrower than two compact panes still lays both out: the panes share the
-    /// content rather than one of them going negative.
     #[test]
     fn a_narrow_horizontal_split_should_share_what_is_there() {
         let layout = split(WorkspaceOrientation::Horizontal, 0.5, single(), single());
@@ -709,8 +623,6 @@ mod tests {
         assert!(head.size.width > 0.0 && tail.size.width > 0.0);
     }
 
-    /// A split inserts the new pane next to the target, keeps the target's identity, and
-    /// numbers the new pane once.
     #[test]
     fn splitting_should_add_one_pane_and_keep_the_target() {
         let (mut tree, leaves) = PaneTree::from_layout(&single());
@@ -729,8 +641,6 @@ mod tests {
         assert_eq!(tree.panes(), vec![target, new_pane, second]);
     }
 
-    /// Closing a pane promotes its sibling into the split's place, and the last pane of a
-    /// workspace cannot be closed.
     #[test]
     fn closing_should_promote_the_sibling_and_keep_the_last_pane() {
         let (mut tree, leaves) = PaneTree::from_layout(&split(
@@ -747,8 +657,6 @@ mod tests {
         assert!(!tree.remove_pane(tail), "the last pane stays");
     }
 
-    /// Closing a pane nested one split down promotes that split's other pane and leaves the
-    /// resting topology intact.
     #[test]
     fn closing_a_nested_pane_should_keep_the_rest_of_the_tree() {
         let nested = split(WorkspaceOrientation::Horizontal, 0.5, single(), single());
@@ -761,8 +669,6 @@ mod tests {
         assert!(tree.is_split());
     }
 
-    /// A stored layout round-trips through the topology: the structure, the fractions and
-    /// each pane's widget are what was stored.
     #[test]
     fn a_stored_layout_should_round_trip() {
         let layout = split(
@@ -783,8 +689,6 @@ mod tests {
         assert_eq!(restored, layout);
     }
 
-    /// Setting a fraction writes it into the tree and the next layout draws it, so a drag
-    /// that stops mid-way persists the position the user left the bar at.
     #[test]
     fn setting_a_fraction_should_move_the_bar() {
         let (mut tree, _) = PaneTree::from_layout(&split(
@@ -802,7 +706,6 @@ mod tests {
         assert_eq!(tree.fraction(split), Some(0.25));
     }
 
-    /// A fraction that is not a number cannot reach the layout: the split draws at half.
     #[test]
     fn a_nonsense_fraction_should_draw_at_half() {
         let layout = split(

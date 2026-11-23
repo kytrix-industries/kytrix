@@ -1,15 +1,3 @@
-//! 像素快照（L3）：读回 → 差图统计 → golden 比对（P13 §9）。
-//!
-//! 语义：`TestApp::snapshot` 只读**最近一次提交**的实例缓冲（P08 §7.7），因此
-//! [`capture`] 的顺序是「建 `TestApp` → [`mount`] 合成场景 → `drain()` → `snapshot`」。
-//! `SnapshotCase` 的 `scene` / `theme` 只决定「挂哪个场景」与「golden 文件名」，不参与渲染本身。
-//!
-//! 平台策略（§9.6 / D14）：golden 按**设备类型**分目录；三个平台各自产出并与自己的基线比对
-//! （跨设备比同一份 golden 会永久红）。`golden` 的字节是读回原样（预乘 sRGB RGBA8），不反预乘。
-//!
-//! 容差（D19）：逐通道最大差 + **不匹配像素比例上限**（[`Tolerance`]），失败信息带不匹配像素数、
-//! 最大通道差、首个差异坐标与差异区域包围盒。`UI_CORE_BLESS` 存在时重生成**当前平台**的 golden。
-
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -31,20 +19,11 @@ use crate::{
     window::WindowOptions,
 };
 
-/// 一次快照请求（合成场景 + 分辨率 + scale + 主题）。
-///
-/// `scene` / `theme` **不参与渲染**：它们只决定 golden 的文件名与「挂哪个合成场景」。
-/// 渲染仍然是「读最近一次提交的实例缓冲」（P08 §7.7 的既有语义），因此 `TestApp::snapshot`
-/// 只消费 `size` / `scale`。场景由 [`mount`] 在 `drain()` 之前挂载。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SnapshotCase {
-    /// 合成场景。
     pub scene: SnapshotScene,
-    /// 明暗配色（引擎里只是场景标签；主题语义在应用层）。
     pub theme: SnapshotTheme,
-    /// 逻辑尺寸。
     pub size: Size,
-    /// 设备比例。
     pub scale: Scale,
 }
 
@@ -60,7 +39,6 @@ impl Default for SnapshotCase {
 }
 
 impl SnapshotCase {
-    /// golden 文件名主干：`"<scene>_<scale>_<theme>"`（例：`shapes_1.25_dark`）。
     #[must_use]
     pub fn golden_name(&self) -> SmolStr {
         format_smolstr!(
@@ -71,10 +49,6 @@ impl SnapshotCase {
         )
     }
 
-    /// `CARGO_MANIFEST_DIR/tests/golden/<device>/<golden_name>.png`。
-    ///
-    /// 按**设备类型**分目录（D14）：`warp/`（Windows WARP）、`lavapipe/`（Linux Mesa llvmpipe）。
-    /// 软件光栅与真实 GPU 的 AA 存在系统性差异，跨设备比同一份 golden 会永久红。
     #[must_use]
     pub fn golden_path(&self) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -84,7 +58,6 @@ impl SnapshotCase {
     }
 }
 
-/// 当前平台的 golden 目录（D14 的设备分组）。
 #[must_use]
 pub fn device_dir() -> &'static str {
     #[cfg(windows)]
@@ -101,30 +74,18 @@ pub fn device_dir() -> &'static str {
     }
 }
 
-/// 合成场景（引擎内建，**不依赖 `base_ui`**：集成测试不能反向依赖应用层）。
-///
-/// 没有 `Glyphs` 变体：文字像素依赖宿主字体，不能进 v1 golden（F-144 / V-96）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SnapshotScene {
-    /// 矩形 / 四角不同圆角 / 1px 边框。
     Shapes,
-    /// 解析阴影（blur 4 与 16）。
     Shadow,
-    /// 线性水平 / 线性垂直 / 径向渐变。
     Gradient,
-    /// 纯色 / 半透明叠加 / 高彩度 OKLCH（gamut mapping 边界）。
     Colors,
-    /// 图片图集：1:1 / 2× 放大 / 半透明调制（四象限 alpha = 255/170/85/0）。
     Image,
-    /// 嵌套 clip + 溢出子矩形。
     Clip,
-    /// **分数坐标边界**的矩形 clip（AR2b P1-N1 / P2-N4）：容器边界落在 1/4 像素上，
-    /// 子图元向四边溢出 —— 用来钉住「矩形 clip 吸附到整数物理像素」的取舍方向（roundOut）。
     ClipSubpixel,
 }
 
 impl SnapshotScene {
-    /// 全部场景（golden 唯一性断言用）。
     pub const ALL: [Self; 7] = [
         Self::Shapes,
         Self::Shadow,
@@ -135,7 +96,6 @@ impl SnapshotScene {
         Self::ClipSubpixel,
     ];
 
-    /// 文件名用的稳定 token。
     #[must_use]
     pub fn token(self) -> &'static str {
         match self {
@@ -149,7 +109,6 @@ impl SnapshotScene {
         }
     }
 
-    /// 场景的逻辑尺寸（与 golden case 表一致）。
     #[must_use]
     pub fn size(self) -> Size {
         match self {
@@ -160,7 +119,6 @@ impl SnapshotScene {
         }
     }
 
-    /// 挂载到 `app` 当前窗口的根节点下（调用方负责先 `drain()` 再 `snapshot`）。
     fn build(self, app: &mut TestApp, theme: SnapshotTheme) {
         let palette = theme.palette();
         let root = root_of(app);
@@ -176,17 +134,13 @@ impl SnapshotScene {
     }
 }
 
-/// 明暗「主题」在引擎里只是**合成场景的配色标签**（D15：主题语义在应用层）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SnapshotTheme {
-    /// 亮底深字。
     Light,
-    /// 深底亮字（也用来钉「预乘叠加在暗底上的表现」）。
     Dark,
 }
 
 impl SnapshotTheme {
-    /// 文件名用的稳定 token。
     #[must_use]
     pub fn token(self) -> &'static str {
         match self {
@@ -195,7 +149,6 @@ impl SnapshotTheme {
         }
     }
 
-    /// 场景配色（只服务 golden，不进引擎）。
     fn palette(self) -> Palette {
         match self {
             Self::Light => Palette {
@@ -216,7 +169,6 @@ impl SnapshotTheme {
     }
 }
 
-/// 合成场景的配色（引擎无主题概念）。
 struct Palette {
     backdrop: Color,
     surface: Color,
@@ -225,22 +177,14 @@ struct Palette {
     muted: Color,
 }
 
-/// 读回结果：**预乘 sRGB 编码**的 RGBA8（与 `render/*/readback.rs` 的约定一致）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotImage {
-    /// 像素宽。
     pub width: u32,
-    /// 像素高。
     pub height: u32,
-    /// `width * height * 4` 字节。
     pub rgba8: Vec<u8>,
 }
 
 impl SnapshotImage {
-    /// 写 PNG（golden 入库用；逐字节无损）。
-    ///
-    /// # Errors
-    /// [`GoldenError::Io`]（父目录不可建 / 写失败）或 [`GoldenError::GoldenDecode`]（尺寸与缓冲不符）。
     pub fn save_png(&self, path: &Path) -> Result<(), GoldenError> {
         let image = image::RgbaImage::from_raw(self.width, self.height, self.rgba8.clone())
             .ok_or_else(|| GoldenError::GoldenDecode {
@@ -259,10 +203,6 @@ impl SnapshotImage {
         })
     }
 
-    /// 读 PNG（golden 比对用）。
-    ///
-    /// # Errors
-    /// [`GoldenError::Io`]（文件不存在 / 读失败）或 [`GoldenError::GoldenDecode`]（不是可解码的 PNG）。
     pub fn load_png(path: &Path) -> Result<Self, GoldenError> {
         let bytes = std::fs::read(path).map_err(|error| GoldenError::Io {
             path: path.to_path_buf(),
@@ -282,56 +222,29 @@ impl SnapshotImage {
     }
 }
 
-/// 快照失败的原因。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotError {
-    /// 本构建没有渲染器（headless 的默认）。
     NoRenderer,
-    /// GPU 路径失败（设备创建 / 渲染 / 读回）。
-    Gpu {
-        /// 可读的诊断（含 HRESULT 或具体阶段）。
-        detail: SmolStr,
-    },
+    Gpu { detail: SmolStr },
 }
 
-/// 像素容差：逐通道最大差 + **不匹配像素比例上限**（D19：数值可校准，机制冻结）。
-///
-/// 判定规则：`mismatched_pixels <= allowed_mismatches(compared_pixels)` 才算通过。
-/// `max_channel_diff` / `avg_channel_diff` 只进报告，不参与判定（它们对 AA 边缘极度敏感，
-/// 拿来做门禁会让每个平台都变成「比谁更圆」）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tolerance {
-    /// 单通道允许的最大绝对差（`0..=255`）。
     pub per_channel: u8,
-    /// 允许「有任一通道超出 `per_channel`」的像素**比例**上限，单位 1e-6（`1_000` = 0.1%）。
-    ///
-    /// 用整数 ppm 而不是 `f32`/`f64`：容差要能 `Eq` 比较，且判定必须逐平台逐次可复现
-    /// （浮点比较在边界上会因为编译目标不同而翻面）。
     pub max_mismatch_ppm: u32,
 }
 
 impl Tolerance {
-    /// 逐字节相等。
     pub const EXACT: Self = Self {
         per_channel: 0,
         max_mismatch_ppm: 0,
     };
 
-    /// **几何边界** case（`clip` / `clip_subpixel`）的容差：不允许任何不匹配像素（`ppm = 0`）。
-    ///
-    /// 这两个 case 的内容是「平涂色块被裁到某一条像素列 / 行」，边界像素的取舍是 0/1 语义
-    /// （AR2b P1-N1 的越界列正是这种像素）。默认的比例容差（0.1% ⇒ 240×160 允许 **38 px**）
-    /// 对它们毫无检测力：整列 20 px 的越界只占 0.05%，会被静默放过；`ppm = 0` 让任何单像素
-    /// 越界/漏裁都立刻变红。`per_channel` 仍是 2：它只吸收三平台 sRGB 量化的 1 级差
-    /// （跨设备不可比性由「各端只跟自己的基线比」保证，见 `tests/golden/README.md`）。
     pub const GEOMETRY: Self = Self {
         per_channel: 2,
         max_mismatch_ppm: 0,
     };
 
-    /// 给定参与比较的像素总数时，允许的不匹配像素数（`floor(pixels × ppm / 1e6)`）。
-    ///
-    /// 向下取整：容差宁可紧一点也不要放过整像素级的回归。
     #[must_use]
     pub fn allowed_mismatches(&self, pixels: u32) -> u32 {
         let allowed = u64::from(pixels) * u64::from(self.max_mismatch_ppm) / 1_000_000;
@@ -341,8 +254,6 @@ impl Tolerance {
 
 impl Default for Tolerance {
     fn default() -> Self {
-        // 大整改基线：逐通道 2（覆盖三平台 sRGB 量化差）+ 0.1% 像素（覆盖 AA 边缘与阴影渐变，
-        // 见 `tests/golden/README.md`）。改这里必须同时改 README 的容差表。
         Self {
             per_channel: 2,
             max_mismatch_ppm: 1_000,
@@ -350,36 +261,21 @@ impl Default for Tolerance {
     }
 }
 
-/// 一次比较的统计。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SnapshotDiff {
-    /// 全图最大单通道差（`0..=255`）。
     pub max_channel_diff: u8,
-    /// 全图所有通道差的均值（`0..=255` 标度）。
     pub avg_channel_diff: f32,
-    /// 有任一通道差 `> tolerance.per_channel` 的像素数。
     pub mismatched_pixels: u32,
-    /// 参与比较的像素数（`width * height`）。
     pub compared_pixels: u32,
-    /// 第一个不匹配像素的坐标 `(x, y)`（读序：先行后列）。
     pub first_mismatch: Option<(u32, u32)>,
-    /// 全部不匹配像素的包围盒（`None` = 一个都不匹配）。
     pub mismatch_bounds: Option<PixelBounds>,
 }
 
-/// 不匹配像素的包围盒（像素坐标，**闭区间**）。
-///
-/// 失败诊断用：`first_mismatch` 只给一个点，包围盒给出「错在多大一片、错在哪儿」，
-/// 一张 240×160 的 golden 里定位到 (12,84)-(71,107) 比定位到一个点快得多。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelBounds {
-    /// 最左列。
     pub min_x: u32,
-    /// 最上行。
     pub min_y: u32,
-    /// 最右列（含）。
     pub max_x: u32,
-    /// 最下行（含）。
     pub max_y: u32,
 }
 
@@ -393,55 +289,32 @@ impl fmt::Display for PixelBounds {
     }
 }
 
-/// golden 层错误（**不** `derive(Eq)`：`Diff.diff` 含 `f32`）。
 #[derive(Clone, Debug, PartialEq)]
 pub enum GoldenError {
-    /// 读回失败（设备 / 渲染）。
     Snapshot(SnapshotError),
-    /// 场景推进失败（文本塑形 / 图集耗尽等）。
     Frame {
-        /// `EngineError` 的英文诊断文本。
         detail: SmolStr,
     },
-    /// 读回尺寸与 golden 不同。
     Dimensions {
-        /// 实际尺寸。
         actual: (u32, u32),
-        /// golden 尺寸。
         golden: (u32, u32),
     },
-    /// 读/写 golden 失败（含「golden 不存在」）。
     Io {
-        /// 出错路径。
         path: PathBuf,
-        /// 诊断文本。
         detail: SmolStr,
     },
-    /// golden 文件不是可解码的 PNG / 尺寸不自洽。
     GoldenDecode {
-        /// 出错路径。
         path: PathBuf,
-        /// 诊断文本。
         detail: SmolStr,
     },
-    /// 输入图像自相矛盾（`rgba8` 长度与 `width × height × 4` 不符）。
-    ///
-    /// 显式错误而不是 `debug_assert`：release 下 `debug_assert` 会被编掉，长度不符会**静默少比**。
     Malformed {
-        /// 诊断文本。
         detail: SmolStr,
     },
-    /// 不匹配像素数超过容差（含统计与热力图路径）。
     Diff {
-        /// golden 文件名主干。
         case: SmolStr,
-        /// 统计。
         diff: SnapshotDiff,
-        /// 本次容差允许的不匹配像素数（`0` 表示逐像素严格）。
         allowed: u32,
-        /// golden 路径。
         golden: PathBuf,
-        /// 失败热力图路径（`target/golden-diff/`）。
         heatmap: PathBuf,
     },
 }
@@ -500,12 +373,6 @@ impl fmt::Display for GoldenError {
     }
 }
 
-/// 比较两张读回图（尺寸必须一致，缓冲长度必须自洽）。
-///
-/// # Errors
-/// [`GoldenError::Dimensions`]（宽高不等）或 [`GoldenError::Malformed`]（缓冲长度与宽高不符）。
-///
-/// 长度检查**不是** `debug_assert`：release 下 `debug_assert` 会被编掉，`zip` 会静默少比。
 pub fn compare(
     actual: &SnapshotImage,
     golden: &SnapshotImage,
@@ -585,15 +452,10 @@ pub fn compare(
     })
 }
 
-/// 在 `app` 当前窗口的根节点下挂载合成场景（调用方随后 `drain()`）。
 pub fn mount(app: &mut TestApp, scene: SnapshotScene, theme: SnapshotTheme) {
     scene.build(app, theme);
 }
 
-/// 冷启动一个 case：建 `TestApp` → 挂场景 → `drain` → `snapshot`。
-///
-/// # Errors
-/// [`GoldenError::Frame`]（场景推进失败）或 [`GoldenError::Snapshot`]（无渲染器 / GPU 失败）。
 pub fn capture(case: SnapshotCase) -> Result<SnapshotImage, GoldenError> {
     let mut app = TestApp::with_options(WindowOptions {
         title: SmolStr::new_static("kytrix golden"),
@@ -608,21 +470,10 @@ pub fn capture(case: SnapshotCase) -> Result<SnapshotImage, GoldenError> {
     app.snapshot(case).map_err(GoldenError::Snapshot)
 }
 
-/// 覆盖写 golden（父目录不存在时创建）。
-///
-/// # Errors
-/// [`GoldenError::Io`] / [`GoldenError::GoldenDecode`]（见 [`SnapshotImage::save_png`]）。
 pub fn write_golden(case: SnapshotCase, image: &SnapshotImage) -> Result<(), GoldenError> {
     image.save_png(&case.golden_path())
 }
 
-/// 比较一个 case（`UI_CORE_BLESS` 存在时先重生成 golden，再读回比较）。
-///
-/// `UI_CORE_BLESS` 只写**当前平台**目录（[`device_dir`]）：跨平台覆盖别人的基线是事故，
-/// 不是便利。每个被覆盖的文件都打印一行 `blessed by UI_CORE_BLESS` 作为改动记录占位。
-///
-/// # Errors
-/// [`GoldenError`]：`Snapshot` / `Frame` / `Io`（缺 golden）/ `Dimensions` / `Diff`。
 pub fn assert_golden(
     case: SnapshotCase,
     tolerance: Tolerance,
@@ -653,24 +504,20 @@ pub fn assert_golden(
     Ok(diff)
 }
 
-/// 进程内串行化 GPU 快照（多个 `#[test]` 并行会各自建 WARP 设备并互相拖垮）。
 pub fn gpu_guard() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// `UI_CORE_BLESS` 存在即重生成（不看值）。
 fn bless_requested() -> bool {
     std::env::var_os("UI_CORE_BLESS").is_some()
 }
 
-/// 小数点后最多两位、去尾零（`1.0 → "1"`、`1.25 → "1.25"`、`2.0 → "2"`）。
 fn scale_token(scale: f32) -> SmolStr {
     let text = format_smolstr!("{scale:.2}");
     SmolStr::new(text.trim_end_matches('0').trim_end_matches('.'))
 }
 
-/// 失败热力图：超容差像素涂洋红，其余取实际值的一半亮度；写入 `target/golden-diff/`。
 fn write_heatmap(
     name: &SmolStr,
     actual: &SnapshotImage,
@@ -709,7 +556,6 @@ fn write_heatmap(
     Ok(path)
 }
 
-/// 当前窗口的根节点。
 fn root_of(app: &TestApp) -> NodeId {
     let window = app.window_id();
     app.app()
@@ -719,7 +565,6 @@ fn root_of(app: &TestApp) -> NodeId {
         .root()
 }
 
-/// 建一个绝对定位的 box 节点（场景构建的唯一原语）。
 fn box_node(app: &mut TestApp, parent: NodeId, id: &str, rect: Rect, paint: PaintSpec) {
     let window = app.window_id();
     let _ = NodeBuilder::boxed()
@@ -733,7 +578,6 @@ fn box_node(app: &mut TestApp, parent: NodeId, id: &str, rect: Rect, paint: Pain
         .expect("scene node");
 }
 
-/// 建一个带 `Style` 的容器（clip 场景用）。
 fn style_node(
     app: &mut TestApp,
     parent: NodeId,
@@ -753,7 +597,6 @@ fn style_node(
         .expect("scene container")
 }
 
-/// 绝对定位的 `Style`（`size` + 可选 clip）。
 fn abs_style(rect: Rect, clip: Clip) -> Style {
     let inner = taffy::Style::<SmolStr> {
         position: taffy::style::Position::Absolute,
@@ -772,7 +615,6 @@ fn abs_style(rect: Rect, clip: Clip) -> Style {
     Style { inner, clip }
 }
 
-/// 铺满场景的底色（所有场景共用：让 golden 覆盖「背景填充 + 主题色」而不是全透明区）。
 fn build_backdrop(app: &mut TestApp, root: NodeId, palette: &Palette) {
     box_node(
         app,
@@ -897,7 +739,6 @@ fn build_gradient(app: &mut TestApp, root: NodeId, palette: &Palette) {
             PaintSpec {
                 background: Color::TRANSPARENT,
                 gradient: Some(Gradient {
-                    // 高彩度端点：覆盖 sRGB gamut mapping（P02 §5.4）。
                     from: Color::Oklch {
                         l: 0.72,
                         c: 0.28,
@@ -916,7 +757,6 @@ fn build_gradient(app: &mut TestApp, root: NodeId, palette: &Palette) {
             },
         );
     }
-    // 与渐变并排的一格实色（对照：确认渐变路径不影响普通 Quad）。
     box_node(
         app,
         root,
@@ -930,7 +770,6 @@ fn build_gradient(app: &mut TestApp, root: NodeId, palette: &Palette) {
 }
 
 fn build_colors(app: &mut TestApp, root: NodeId, palette: &Palette) {
-    // 底色（主题相关）+ 三块半透明叠色 + 一块高彩度 OKLCH（gamut 边界）。
     box_node(
         app,
         root,
@@ -986,7 +825,6 @@ fn build_colors(app: &mut TestApp, root: NodeId, palette: &Palette) {
             ..PaintSpec::default()
         },
     );
-    // 高彩度 OKLCH：C 超出 sRGB gamut，走 CSS Color 4 的 chroma 归零映射。
     box_node(
         app,
         root,
@@ -1030,7 +868,6 @@ fn build_image(app: &mut TestApp, root: NodeId, palette: &Palette) {
             ..PaintSpec::default()
         },
     );
-    // 四象限 alpha = 255 / 170 / 85 / 0（由 `image` 现编码，不落外部资产）。
     let icon = app
         .app_mut()
         .resources_mut()
@@ -1086,7 +923,6 @@ fn build_clip(app: &mut TestApp, root: NodeId, palette: &Palette) {
             ..PaintSpec::default()
         },
     );
-    // 溢出子矩形：被外层裁掉。
     box_node(
         app,
         outer,
@@ -1129,25 +965,8 @@ fn build_clip(app: &mut TestApp, root: NodeId, palette: &Palette) {
     );
 }
 
-/// 分数坐标边界的矩形 clip 场景（AR2b P1-N1 / P2-N4）。
-///
-/// 容器盒是逻辑 `(24.25, 20.5, 132.25, 76.25)`（scale 1 ⇒ 物理同值），右/下边界落在 **1/4 与
-/// 1/2 像素**上；子图元向四边溢出（逻辑框远大于容器），因此可见区域完全由矩形 clip 决定。
-///
-/// 期望（`roundOut` 向外吸附）：`lo = (floor(24.25), floor(20.5)) = (24, 20)`、
-/// `hi = (ceil(156.5), ceil(96.75)) = (157, 97)` ⇒ **ink 恰好覆盖像素列 24..=156、行 20..=96**。
-///
-/// 这个场景专门抓四类回归（都要求**逐像素 0 容差**，见 [`Tolerance::GEOMETRY`]）：
-/// 1. 矩形 clip 没有吸附（仍拿浮点边界做判定）⇒ 边界列随驱动翻面；
-/// 2. 吸附方向错（向内 / trunc / round）⇒ 左右边界各差 1 列、上下各差 1 行；
-/// 3. scissor 被当成 AA（覆盖率不再是 0/1）⇒ 边界列变成混色而不是平涂 ink；
-/// 4. 容器盒子自己不再裁剪子树（越界可见）⇒ 整块 ink 铺满画布。
-///
-/// 场景里**没有任何 AA 边缘**（子图元自己的边远在画布外），因此这三份 golden 在三平台上
-/// 逐像素一致（只有画布右下角属于 backdrop quad 自身的 AA，见 README「跨设备不可比」）。
 fn build_clip_subpixel(app: &mut TestApp, root: NodeId, palette: &Palette) {
     build_backdrop(app, root, palette);
-    // 容器自身不画背景：场景里唯一的半透明来源就只剩 backdrop quad 的画布角。
     let outer = style_node(
         app,
         root,
@@ -1155,7 +974,6 @@ fn build_clip_subpixel(app: &mut TestApp, root: NodeId, palette: &Palette) {
         abs_style(Rect::new(24.25, 20.5, 132.25, 76.25), Clip::Bounds),
         PaintSpec::default(),
     );
-    // 溢出子矩形：四边都越过容器（逻辑框 (-40,-30) 400×300）。
     box_node(
         app,
         outer,
@@ -1168,7 +986,6 @@ fn build_clip_subpixel(app: &mut TestApp, root: NodeId, palette: &Palette) {
     );
 }
 
-/// 16×16 的合成 PNG（四象限 alpha = 255/170/85/0），供 `Image` 场景走真实解码链路。
 fn snapshot_png() -> Vec<u8> {
     let mut pixels = Vec::with_capacity(16 * 16 * 4);
     for y in 0..16u32 {
@@ -1275,7 +1092,6 @@ mod tests {
     fn compare_counts_mismatched_pixels() {
         let actual = image(2, 2, [100, 100, 100, 255]);
         let mut golden = actual.clone();
-        // 一个像素差 3（超过 per_channel = 2），另一个差 2（在容差内）。
         golden.rgba8[0] = 103;
         golden.rgba8[5] = 102;
 
@@ -1290,7 +1106,6 @@ mod tests {
 
     #[test]
     fn compare_reports_the_mismatch_bounds() {
-        // 3×2 图：只有 (0,0)、(2,0)、(1,1) 三个像素超差 ⇒ 包围盒 (0,0)-(2,1)。
         let actual = image(3, 2, [0, 0, 0, 255]);
         let mut golden = actual.clone();
         golden.rgba8[0] = 9;
@@ -1332,7 +1147,7 @@ mod tests {
     fn compare_records_first_divergent_pixel() {
         let actual = image(3, 1, [0, 0, 0, 255]);
         let mut golden = actual.clone();
-        golden.rgba8[8] = 200; // 第 3 个像素的第一个通道
+        golden.rgba8[8] = 200;
 
         let diff = compare(&actual, &golden, Tolerance::default()).expect("compare");
         assert_eq!(diff.first_mismatch, Some((2, 0)));
@@ -1353,7 +1168,6 @@ mod tests {
 
     #[test]
     fn compare_rejects_a_malformed_buffer_in_every_profile() {
-        // release 下 `debug_assert` 会被编掉：长度不符必须是**显式错误**，不能静默少比。
         let mut actual = image(2, 2, [0; 4]);
         actual.rgba8.truncate(12);
         assert!(matches!(
@@ -1371,8 +1185,6 @@ mod tests {
 
     #[test]
     fn diff_error_reports_count_max_first_and_bounds() {
-        // 失败信息是诊断面的一部分：四项（不匹配像素数 / 最大通道差 / 首个坐标 / 包围盒）
-        // 缺一项就得让人去翻热力图。
         let error = GoldenError::Diff {
             case: SmolStr::new_static("shapes_1_light"),
             diff: SnapshotDiff {
@@ -1404,12 +1216,9 @@ mod tests {
 
     #[test]
     fn tolerance_default_is_the_recorded_value() {
-        // D19：数值可校准，但默认值必须与 `tests/golden/README.md` 的容差表一致
-        // （改这里也要改文档）。
         let tolerance = Tolerance::default();
         assert_eq!(tolerance.per_channel, 2);
         assert_eq!(tolerance.max_mismatch_ppm, 1_000, "0.1%");
-        // 几何边界 case 的专用容差（README 容差表第三行）：0 个不匹配像素，任何尺寸都不放水。
         assert_eq!(Tolerance::GEOMETRY.per_channel, 2);
         assert_eq!(Tolerance::GEOMETRY.max_mismatch_ppm, 0);
         assert_eq!(Tolerance::GEOMETRY.allowed_mismatches(38_400), 0);
@@ -1418,10 +1227,8 @@ mod tests {
     #[test]
     fn tolerance_allows_a_ratio_of_mismatched_pixels() {
         let tolerance = Tolerance::default();
-        // 240×160 = 38400 像素 ⇒ 0.1% = 38.4 ⇒ 向下取整 38。
         assert_eq!(tolerance.allowed_mismatches(38_400), 38);
         assert_eq!(tolerance.allowed_mismatches(1_000), 1);
-        // 小图（2×2）在 0.1% 下**不允许**任何像素不匹配：比例容差不是小图的免死金牌。
         assert_eq!(tolerance.allowed_mismatches(4), 0);
         assert_eq!(Tolerance::EXACT.allowed_mismatches(38_400), 0);
     }

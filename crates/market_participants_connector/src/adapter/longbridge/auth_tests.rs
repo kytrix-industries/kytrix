@@ -1,6 +1,3 @@
-//! The tests of the session module: what one handshake presents, and what each step of
-//! it is answered with.
-
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -20,12 +17,10 @@ use crate::{
     error::{AuthError, MarketParticipantError},
 };
 
-/// One plan of one fixture execution.
 fn plan(context: &crate::adapter::ExecutionContext) -> ConnectionPlan {
     ConnectionPlan::of(context, &credential_values()).expect("the fixture connection is planned")
 }
 
-/// One token the venue grants, with the counts a case states.
 fn token(limit: i32, online: i32) -> TokenAnswer {
     TokenAnswer {
         limit,
@@ -34,13 +29,6 @@ fn token(limit: i32, online: i32) -> TokenAnswer {
     }
 }
 
-/// The venue's envelope is what a refusal is read from, not the HTTP status.
-///
-/// The live run measured the venue refusing inside a `403` envelope — `{"code":
-/// 403201,"message":"signature invalid"}` — and the same shape arrives under a
-/// `200`, so a case that read the status alone would report `200` for a request the
-/// venue declined. The code and message a reader gets are the venue's own, and the
-/// refusal is not retried: the same credentials would be declined again.
 #[tokio::test]
 async fn a_refusal_inside_the_envelope_is_the_venues_own_code_and_message() {
     let fixture = LongbridgeFixture::install(
@@ -74,9 +62,6 @@ async fn a_refusal_inside_the_envelope_is_the_venues_own_code_and_message() {
     assert!(fixture.frames().is_empty(), "no socket was opened");
 }
 
-/// An envelope that states success but carries no payload is not a token: the three
-/// fields the design names are inside `data`, so a `code` of zero without one is a body
-/// this build cannot read rather than a socket it may open.
 #[tokio::test]
 async fn an_envelope_without_its_payload_is_not_a_token() {
     let fixture = LongbridgeFixture::install(
@@ -102,10 +87,6 @@ async fn an_envelope_without_its_payload_is_not_a_token() {
     assert!(fixture.frames().is_empty(), "no socket was opened");
 }
 
-/// The connection-count rule is the design's own plain comparison, and the counts
-/// it is applied to are the venue's. A token whose two counts are both zero is
-/// therefore a limit of zero — the reading this build has of a field it does not
-/// own — rather than a case it invents a rule for.
 #[tokio::test]
 async fn the_connection_limit_is_the_venues_own_comparison() {
     let fixture = LongbridgeFixture::install(
@@ -132,7 +113,6 @@ async fn the_connection_limit_is_the_venues_own_comparison() {
     );
 }
 
-/// One response frame of the protocol, as the venue sends it.
 fn answer_frame(command: u8, status: u8, body: &[u8]) -> Bytes {
     let mut frame = Vec::with_capacity(10 + body.len());
     frame.push(2);
@@ -144,8 +124,6 @@ fn answer_frame(command: u8, status: u8, body: &[u8]) -> Bytes {
     Bytes::from(frame)
 }
 
-/// A market-data command the profile grants no permission for is refused before a
-/// frame is sent, and the refusal is the venue's own statement about the account.
 #[tokio::test]
 async fn a_market_data_command_without_permission_is_refused_before_a_frame() {
     let fixture = LongbridgeFixture::install(
@@ -194,8 +172,6 @@ async fn a_market_data_command_without_permission_is_refused_before_a_frame() {
     );
 }
 
-/// The profile request itself never passes the market-data gate, because it is
-/// where the permission comes from: a venue that grants nothing is still asked.
 #[tokio::test]
 async fn the_profile_is_asked_for_even_when_no_permission_is_granted() {
     let fixture = LongbridgeFixture::install(
@@ -217,8 +193,6 @@ async fn the_profile_is_asked_for_even_when_no_permission_is_granted() {
     );
 }
 
-/// A command the venue paces waits for its token, and the wait is observable on
-/// the wire: the request after the burst reaches the fixture one rate later.
 #[tokio::test]
 async fn a_paced_command_waits_for_its_token() {
     let fixture = LongbridgeFixture::install(
@@ -241,13 +215,11 @@ async fn a_paced_command_waits_for_its_token() {
         "the profile installed a bucket for its own command"
     );
 
-    // The bucket's burst is one token, so the request that spends it is free ...
     let burst = fetch_profile(&session, &context.route())
         .await
         .expect("the burst request is answered");
     assert_eq!(burst.member_id, 1);
 
-    // ... and the one after it waits for the venue's rate to drip one back.
     let started = std::time::Instant::now();
     let paced = fetch_profile(&session, &context.route())
         .await
@@ -266,9 +238,6 @@ async fn a_paced_command_waits_for_its_token() {
     );
 }
 
-/// The acknowledgement matcher reads content rather than an id: an accepted
-/// authentication is the acknowledgement, a refused one is a typed failure, and
-/// anything else is handed back to the connection layer.
 #[test]
 fn the_acknowledgement_matches_the_authentications_content() {
     let request =

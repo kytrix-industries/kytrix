@@ -1,20 +1,3 @@
-//! The native building blocks every settings page draws with.
-//!
-//! A setting is one row: its name and supplementary explanation on the left, the control that
-//! changes it on the right. Rows of one group sit in one card, separated by a line; a page is a
-//! column of those groups. Nothing here describes what a page holds — a page writes its own rows
-//! with these helpers — so a setting that needs a custom control builds it beside a row rather than
-//! teaching this module a new shape.
-//!
-//! The helpers only decide geometry, chrome and the debug ids the tests reach a control by. What a
-//! control reads and writes stays with the page that drew it.
-//!
-//! # Text follows the theme, not the frame
-//!
-//! Nothing here bakes a colour into a node: every text node and every surface reads its colour
-//! through `bind_style` from the injected [`ThemeHandle`], so switching the appearance re-colours
-//! the page on the frame that follows without rebuilding it (the same rule kit components follow).
-
 use base_ui::{
     kit::{
         scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
@@ -41,32 +24,15 @@ use ui_core::{
 
 use crate::host::SettingsHost;
 
-/// The width of the column a control is drawn in.
 pub(crate) const CONTROL_WIDTH: f32 = 240.0;
 
-/// The appearance a bound colour is seeded from.
-///
-/// It is only the value a node draws before its first style pass evaluates the patch, so the seed
-/// needs to be one of the two appearances rather than the current one.
 const SEED_APPEARANCE: Appearance = Appearance::Dark;
 
-/// The size of a row's label.
 const LABEL_SIZE: f32 = 13.0;
-/// The size of a row's explanation.
 const DESCRIPTION_SIZE: f32 = 11.0;
 
-/// One row of a card, built when the card is: the closure is what draws the control, because a kit
-/// component needs `&mut App` and the row is decided before the card's nodes exist.
 pub(crate) type RowFn = Box<dyn FnOnce(&mut App, WindowId, NodeId) -> Result<(), EngineError>>;
 
-/// Builds one node under `parent`.
-///
-/// The node tree lives inside the window, which lives inside `App`, so a `&mut NodeTree` borrow
-/// cannot be held across a kit call: the borrow lives for the duration of `build` only, and the
-/// caller gets the tree back before the next component it builds.
-///
-/// # Errors
-/// The window is gone (`UnknownWindow`), or the builder failed (usually `StaleNode`).
 pub(crate) fn build_node(
     app: &mut App,
     window: WindowId,
@@ -80,7 +46,6 @@ pub(crate) fn build_node(
     build(tree, parent)
 }
 
-/// Builds one box node under `parent`.
 pub(crate) fn container(
     app: &mut App,
     window: WindowId,
@@ -92,8 +57,6 @@ pub(crate) fn container(
     })
 }
 
-/// One text style as a node is seeded with: the size, the weight, and the colour of `role` in the
-/// seed appearance (the `bind_style` patch is what the node actually draws with).
 fn text_style(theme: &ThemeHandle, size: f32, weight: u16, role: Role) -> TextStyle {
     TextStyle::new(size)
         .with_weight(weight)
@@ -101,10 +64,6 @@ fn text_style(theme: &ThemeHandle, size: f32, weight: u16, role: Role) -> TextSt
         .with_wrap(TextWrap::Wrap)
 }
 
-/// Builds one box node with a debug id, a style, a paint spec and the theme colours it follows.
-///
-/// `background` and `border` are roles rather than colours: the patch is evaluated on every style
-/// pass, so a surface written with this helper re-colours itself when the appearance changes.
 pub(crate) fn themed_box(
     app: &mut App,
     window: WindowId,
@@ -135,7 +94,6 @@ pub(crate) fn themed_box(
     })
 }
 
-/// Builds one text node that follows the theme's foreground role.
 pub(crate) fn themed_text(
     app: &mut App,
     window: WindowId,
@@ -161,8 +119,6 @@ pub(crate) fn themed_text(
     })
 }
 
-/// Builds one text node that follows the theme's foreground role, on a tree the caller already
-/// holds (a virtual list's row factory has no `App`, so it builds through this form).
 pub(crate) fn themed_text_in_tree(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -185,12 +141,6 @@ pub(crate) fn themed_text_in_tree(
     builder.build(tree, parent)
 }
 
-/// One setting: its name and, when it has one, its explanation on the left, its control on the
-/// right.
-///
-/// The control is drawn in a column of its own so every row of a card lines up on the same edge.
-/// The row, its name and its explanation carry the debug ids the tests read their geometry and
-/// their text by. A row whose setting has no explanation draws none.
 pub(crate) fn row(
     theme: &ThemeHandle,
     id: &'static str,
@@ -266,11 +216,6 @@ pub(crate) fn row(
     })
 }
 
-/// One group of settings: the heading that names it, when it has one, and the card under it.
-///
-/// The card is the group's whole surface; the selected rows are the ones the search left, so a card
-/// never draws a line above a row that is not there, and a group left without rows draws nothing at
-/// all (its heading would name nothing).
 pub(crate) fn section(
     app: &mut App,
     window: WindowId,
@@ -371,11 +316,6 @@ pub(crate) fn section(
     Ok(())
 }
 
-/// A select over a fixed set of choices, drawn in the width of the row that holds it.
-///
-/// The choices are the ids the settings store beside the words they are drawn with. A selected id
-/// that no choice names is still selected: a value read from settings that no longer offers it is
-/// what the user has, and the control that hid it would report a value the settings do not hold.
 pub(crate) fn choice_select(
     app: &mut App,
     host: &SettingsHost,
@@ -409,13 +349,6 @@ pub(crate) fn choice_select(
     })
 }
 
-/// The scroll region one page's content lives in.
-///
-/// Returns the handle the caller keeps (it is what the content height is written through), the
-/// content node the page builds under, and the scroll bar drawn beside it.
-///
-/// # Errors
-/// The window is gone, or the scroll container could not be made.
 pub(crate) fn scroll_region(
     app: &mut App,
     window: WindowId,
@@ -483,12 +416,6 @@ pub(crate) fn scroll_region(
     Ok((handle, content, bar))
 }
 
-/// Writes the measured height of `content` into the scroll range of `handle`.
-///
-/// The engine's scroll container only knows the content size the caller states, while a settings
-/// page's height is whatever its rows laid out to: the height is read off the content node after
-/// the frame that laid it out. Writing the same size twice is a no-op, so a steady page asks for no
-/// frame (I3).
 pub(crate) fn sync_scroll_content(
     app: &mut App,
     window: WindowId,
@@ -508,7 +435,6 @@ pub(crate) fn sync_scroll_content(
     let _ = app.set_scroll_content(handle, Size::new(size.width, size.height));
 }
 
-/// The debug id of the node a page builds its groups under.
 pub(crate) fn page_content_id() -> SmolStr {
     SmolStr::new_static("SETTINGS_PAGE_CONTENT")
 }

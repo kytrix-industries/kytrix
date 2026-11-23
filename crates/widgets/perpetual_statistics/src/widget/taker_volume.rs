@@ -1,11 +1,8 @@
-//! the taker-volume pane.
-
 use widget::identity::WidgetId;
 
 use super::display::{StatisticsMetric, StatisticsWidget};
 use crate::model::MetricKind;
 
-/// The perpetual series this pane plots.
 pub struct TakerVolumeWidgetSeries;
 
 impl StatisticsMetric for TakerVolumeWidgetSeries {
@@ -16,5 +13,4 @@ impl StatisticsMetric for TakerVolumeWidgetSeries {
     const METRIC: MetricKind = MetricKind::TakerVolume;
 }
 
-/// Perpetual taker buy and sell volume.
 pub type TakerVolumeWidget = StatisticsWidget<TakerVolumeWidgetSeries>;

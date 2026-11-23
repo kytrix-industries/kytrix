@@ -1,26 +1,3 @@
-//! The trading credentials of the market participants, and the dialog that edits them.
-//!
-//! A credential set is one value of one venue's shape — or, for Binance, of one market's — and the
-//! page draws it as one row. What the settings hold is a set or nothing at all: the row says
-//! whether the venue (or market) has a stored set rather than showing the values it holds, and a
-//! stored set is treated as configured even when a hand-edited file left one of its values empty.
-//! The values are edited in a dialog of their own, opened from the row, because a private key and a
-//! passphrase are not a value a page should lay out in the open. The dialog owns a draft of one
-//! set: nothing is written until the user confirms it, a cancelled dialog leaves the settings
-//! exactly as they were, and a confirmed one writes the set as one change. A required value that
-//! was left empty rejects the submission, and the dialog stays open with what the user typed. A
-//! stored set that is incomplete is therefore completed in the same dialog; what reports it as
-//! invalid at runtime is the venue's own validation, not this page.
-//!
-//! Clearing is the one row action that takes something away, so it is put to the user before it is
-//! written: the alert it is put to is opened from the row, and only what the alert confirms is
-//! written. Clearing writes `None`, which leaves the other market of the same venue untouched.
-//!
-//! The kind of a credential set is the whole of what tells one set from another: which venue it
-//! belongs to, which Binance market it signs for, the row it is drawn under, the fields it holds,
-//! and how it is read, written and cleared. Every venue page is written with the same helpers
-//! rather than with a copy of this dialog.
-
 use std::{
     cell::RefCell,
     rc::{Rc, Weak},
@@ -73,27 +50,16 @@ use crate::{
     session::SettingsChange,
 };
 
-/// How wide the dialog is.
 const WIDTH: f32 = 480.0;
 
-/// What the dialog's content is drawn under, which is what a test finds it by.
 pub(crate) const DIALOG_SELECTOR: &str = "SETTINGS_CREDENTIALS_DIALOG";
 
-/// What the row the dialog ends in is drawn under: the line across it and the two buttons under
-/// that line, which is where the dialog says what it does rather than what it holds.
 pub(crate) const FOOTER_SELECTOR: &str = "SETTINGS_CREDENTIALS_FOOTER";
 
-/// What the button that writes the set is drawn under.
 pub(crate) const CONFIRM_SELECTOR: &str = "SETTINGS_CREDENTIALS_CONFIRM";
 
-/// What the button that leaves the set alone is drawn under.
 pub(crate) const CANCEL_SELECTOR: &str = "SETTINGS_CREDENTIALS_CANCEL";
 
-/// One value of one credential set.
-///
-/// The id is what the value is stored and identified by: it is the field the venue's API signs
-/// with, and it is part of the element id every input of the dialog is keyed under. The error key
-/// is the sentence a required value is rejected with, and no key for an optional one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CredentialField {
     pub id: &'static str,
@@ -192,7 +158,6 @@ const LONGBRIDGE_FIELDS: [CredentialField; 3] = [
     },
 ];
 
-/// One venue's — or one Binance market's — credential set as the settings page configures it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CredentialsKind {
     BinanceSpot,
@@ -203,7 +168,6 @@ pub(crate) enum CredentialsKind {
 }
 
 impl CredentialsKind {
-    /// The credential set of one Binance market.
     pub(crate) const fn for_market(market: BinanceMarket) -> Self {
         match market {
             BinanceMarket::Spot => Self::BinanceSpot,
@@ -211,7 +175,6 @@ impl CredentialsKind {
         }
     }
 
-    /// The venue this set signs for.
     pub(crate) const fn venue(self) -> VenueId {
         match self {
             Self::BinanceSpot | Self::BinanceUsdMPerp => VenueId::Binance,
@@ -221,8 +184,6 @@ impl CredentialsKind {
         }
     }
 
-    /// The Binance market this set signs for, or nothing for a venue that signs its whole surface
-    /// with one set.
     pub(crate) const fn market(self) -> Option<BinanceMarket> {
         match self {
             Self::BinanceSpot => Some(BinanceMarket::Spot),
@@ -231,7 +192,6 @@ impl CredentialsKind {
         }
     }
 
-    /// The id the row is drawn and searched under.
     pub(crate) const fn row_id(self) -> &'static str {
         match self {
             Self::BinanceSpot => "market_participants.binance.spot.credentials",
@@ -242,11 +202,6 @@ impl CredentialsKind {
         }
     }
 
-    /// The prefix every field of the dialog is identified by.
-    ///
-    /// A field is a value of one set, so its id is the set's plus the field's own: the dialog of
-    /// one market and the dialog of its sibling are drawn from the same code, and the only thing
-    /// that tells their fields apart is which set they belong to.
     pub(crate) const fn field_prefix(self) -> &'static str {
         match self {
             Self::BinanceSpot => "market_participants.binance.spot",
@@ -257,8 +212,6 @@ impl CredentialsKind {
         }
     }
 
-    /// The name the dialog is titled with: it says which trading surface the set signs for, so a
-    /// user editing one of Binance's two markets is told which one.
     pub(crate) const fn title_key(self) -> &'static str {
         match self {
             Self::BinanceSpot => "settings_ui.market_participants.binance_spot_credentials_title",
@@ -271,10 +224,6 @@ impl CredentialsKind {
         }
     }
 
-    /// The title the alert that clears a set is drawn with.
-    ///
-    /// The title and the message are read together from here rather than spelled out at the call
-    /// site, so the alert the row opens is the sentence this set's own part of the page asks for.
     pub(crate) fn clear_title(self, translate: &Translate) -> SmolStr {
         i18n::t_smol!(
             translate,
@@ -282,10 +231,6 @@ impl CredentialsKind {
         )
     }
 
-    /// The sentence the alert that clears a set asks with.
-    ///
-    /// The title of the set is written into it, so a user confirming a removal is told which set
-    /// goes; it is the same name the dialog that edits the set is titled with.
     pub(crate) fn clear_message(self, translate: &Translate) -> SmolStr {
         let title = i18n::t_smol!(translate, self.title_key());
 
@@ -296,7 +241,6 @@ impl CredentialsKind {
         )
     }
 
-    /// The values one set of this kind holds, in the order the dialog lays them out.
     pub(crate) const fn fields(self) -> &'static [CredentialField] {
         match self {
             Self::BinanceSpot | Self::BinanceUsdMPerp => &BINANCE_FIELDS,
@@ -306,36 +250,26 @@ impl CredentialsKind {
         }
     }
 
-    /// The id one value of this set is drawn and keyed under.
     pub(crate) fn field_id(self, field: &CredentialField) -> SmolStr {
         format_smolstr!("{}.{}", self.field_prefix(), field.id)
     }
 
-    /// What the row's edit button is drawn under.
     pub(crate) fn edit_selector(self) -> SmolStr {
         format_smolstr!("SETTINGS_EDIT_CREDENTIALS_{}", self.row_id())
     }
 
-    /// What the row's clear button is drawn under.
     pub(crate) fn clear_selector(self) -> SmolStr {
         format_smolstr!("SETTINGS_CLEAR_CREDENTIALS_{}", self.row_id())
     }
 
-    /// What one field's line of the dialog is drawn under.
     pub(crate) fn field_selector(self, field: &CredentialField) -> SmolStr {
         format_smolstr!("SETTINGS_CREDENTIALS_FIELD_{}", self.field_id(field))
     }
 
-    /// What one field's error is drawn under, when the field has one.
     pub(crate) fn error_selector(self, field: &CredentialField) -> SmolStr {
         format_smolstr!("SETTINGS_CREDENTIALS_ERROR_{}", self.field_id(field))
     }
 
-    /// Whether the settings hold a set for this kind.
-    ///
-    /// The row clears what is stored, so the question is whether a set is there at all — `is_some`
-    /// — rather than whether every value of it is filled in: a set a hand-edited file left
-    /// incomplete is still a set the user can clear, and completing it is what the dialog is for.
     pub(crate) fn has_stored_set(self, config: &Config) -> bool {
         match self {
             Self::BinanceSpot | Self::BinanceUsdMPerp => {
@@ -364,8 +298,6 @@ impl CredentialsKind {
         }
     }
 
-    /// The set the settings hold, as the dialog's draft: a set nothing is stored for is an empty
-    /// form, and a stored one is prefilled with every value it holds.
     pub(crate) fn draft(self, config: &Config) -> CredentialsDraft {
         let mut draft = CredentialsDraft::empty(self);
 
@@ -427,7 +359,6 @@ impl CredentialsKind {
         draft
     }
 
-    /// Writes the set the draft holds, exactly as the user typed it.
     pub(crate) fn save(self, config: &mut Config, draft: &CredentialsDraft) {
         let venue = self.venue();
         match self {
@@ -468,7 +399,6 @@ impl CredentialsKind {
         }
     }
 
-    /// Clears the set, and only the set: Binance's other market keeps its own.
     pub(crate) fn clear(self, config: &mut Config) {
         let venue = self.venue();
         match self {
@@ -490,20 +420,12 @@ impl CredentialsKind {
         }
     }
 
-    /// The search row of this set.
-    ///
-    /// What is searched is the row and what it is for, never the name of a field it holds: the
-    /// fields are values of the row, and a user looking for a credential looks for the credentials
-    /// rather than for the spelling one venue gives one of them.
     pub(crate) fn search_field(self, translate: &Translate) -> FieldSearch {
         let label = i18n::t_smol!(translate, "settings_ui.market_participants.credentials");
         let description = i18n::t_smol!(
             translate,
             "settings_ui.market_participants.credentials_description"
         );
-        // The venue is searched by the name it is drawn with as well as by the identity it is
-        // stored under: the identity is `binance` in every language, and a user looking for the
-        // venue's credentials in Chinese types the name the page shows them.
         let venue_name = i18n::t_smol!(translate, self.venue().name_key());
         let market_title = self
             .market()
@@ -530,7 +452,6 @@ impl CredentialsKind {
     }
 }
 
-/// The name one Binance market is drawn under, which the set's search row repeats.
 pub(crate) const fn market_title_key(market: BinanceMarket) -> &'static str {
     match market {
         BinanceMarket::Spot => "settings_ui.market_participants.binance_spot",
@@ -538,14 +459,12 @@ pub(crate) const fn market_title_key(market: BinanceMarket) -> &'static str {
     }
 }
 
-/// One set's values as the dialog holds them, keyed by the field they belong to.
 #[derive(Clone)]
 pub(crate) struct CredentialsDraft {
     values: AHashMap<&'static str, SmolStr>,
 }
 
 impl CredentialsDraft {
-    /// The form a set nothing is stored for opens on.
     pub(crate) fn empty(kind: CredentialsKind) -> Self {
         let fields = kind.fields();
         let mut values = AHashMap::with_capacity(fields.len());
@@ -556,35 +475,24 @@ impl CredentialsDraft {
         Self { values }
     }
 
-    /// What one field holds; a field the draft does not name holds nothing.
     fn value(&self, id: &str) -> &str {
         self.values.get(id).map_or("", SmolStr::as_str)
     }
 
-    /// Takes what one field holds.
     fn set(&mut self, id: &'static str, value: SmolStr) {
         self.values.insert(id, value);
     }
 }
 
-/// The credential rows one venue page draws.
-///
-/// A venue draws one row per set it configures (Binance draws one per market), and every row owns
-/// the dialog that edits it and the alert that clears it.
 pub(crate) struct CredentialsArea {
     rows: Vec<CredentialsRow>,
 }
 
 impl CredentialsArea {
-    /// The area of a page that draws no rows yet.
     pub(crate) fn new() -> Self {
         Self { rows: Vec::new() }
     }
 
-    /// Builds the row of one set and takes ownership of what it draws with.
-    ///
-    /// # Errors
-    /// Engine node-building errors from the row's controls.
     pub(crate) fn row(
         &mut self,
         app: &mut App,
@@ -600,10 +508,6 @@ impl CredentialsArea {
         Ok(row_fn)
     }
 
-    /// Makes every row show what the settings hold for this frame.
-    ///
-    /// # Errors
-    /// A kit component refused a write.
     pub(crate) fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         for row in &mut self.rows {
             row.sync(app)?;
@@ -612,7 +516,6 @@ impl CredentialsArea {
         Ok(())
     }
 
-    /// Offers one platform event to the rows (their dialogs type into their own fields).
     pub(crate) fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         let mut consumed = false;
         for row in &self.rows {
@@ -622,7 +525,6 @@ impl CredentialsArea {
         consumed
     }
 
-    /// Releases every component the rows own.
     pub(crate) fn release(&mut self, app: &mut App) {
         for row in self.rows.drain(..) {
             row.release(app);
@@ -630,35 +532,27 @@ impl CredentialsArea {
     }
 }
 
-/// One credential row and the dialog that edits it.
 struct CredentialsRow {
     kind: CredentialsKind,
     host: SettingsHost,
     window: WindowId,
     theme: ThemeHandle,
-    /// The control column the buttons are drawn in, and the clear button when a set is stored.
     state: Rc<RefCell<RowState>>,
     edit: Button,
     editor: Rc<CredentialsEditor>,
     alert: Dialog,
-    /// The key the clear button is named by when it is drawn.
     clear_key: SmolStr,
-    /// What the clear button is labelled and named for, resolved in the language of the build.
     clear_label: SmolStr,
     clear_aria: SmolStr,
 }
 
-/// What one row currently draws below its control column.
 #[derive(Default)]
 struct RowState {
-    /// The column the buttons are drawn in; filled when the row is built.
     controls: Option<NodeId>,
-    /// The wrapper and button of the clear control, when a set is stored.
     clear: Option<(NodeId, Button)>,
 }
 
 impl CredentialsRow {
-    /// Builds one row and returns it with the row builder the page puts in its card.
     fn build(
         app: &mut App,
         window: WindowId,
@@ -677,9 +571,6 @@ impl CredentialsRow {
             translate,
             "settings_ui.market_participants.edit_credentials"
         );
-        // The button says what it edits as well as what it does: Binance's two markets are two rows
-        // of the same page, so a label that named only the action would tell them apart by nothing
-        // a reader of the accessibility tree can hear.
         let clear_label = i18n::t_smol!(
             translate,
             "settings_ui.market_participants.clear_credentials"
@@ -779,7 +670,6 @@ impl CredentialsRow {
         Ok((row, row_fn))
     }
 
-    /// Builds the alert that puts clearing one set to the user.
     fn build_clear_alert(
         app: &mut App,
         host: &SettingsHost,
@@ -823,7 +713,6 @@ impl CredentialsRow {
         )
     }
 
-    /// Builds one wrapper node what a row button is drawn in, which is the id a test clicks it by.
     fn button_wrapper(
         app: &mut App,
         window: WindowId,
@@ -844,8 +733,6 @@ impl CredentialsRow {
         })
     }
 
-    /// Makes the row show what the settings hold for this frame, including whether a set is stored
-    /// at all (which is what the clear button is drawn for).
     fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         let stored = self
             .host
@@ -864,7 +751,6 @@ impl CredentialsRow {
         Ok(())
     }
 
-    /// Draws or takes away the clear button, which is drawn only while a set is stored.
     fn rebuild_clear(&mut self, app: &mut App, stored: bool) -> Result<(), EngineError> {
         if let Some((node, button)) = self.state.borrow_mut().clear.take() {
             button.release(app);
@@ -895,12 +781,10 @@ impl CredentialsRow {
         Ok(())
     }
 
-    /// Offers one platform event to the row's dialog.
     fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         self.editor.dispatch(app, event)
     }
 
-    /// Releases every component the row owns.
     fn release(self, app: &mut App) {
         self.edit.release(app);
         if let Some((node, clear)) = self.state.borrow_mut().clear.take() {
@@ -914,55 +798,36 @@ impl CredentialsRow {
     }
 }
 
-/// The dialog that edits one credential set.
-///
-/// The dialog is built once, when the page is, and opened from the row it belongs to. Its content
-/// is built per open, over the draft the settings of that moment hold; nothing is written until
-/// the content's own confirm button writes the set — the submission validates first, and a set
-/// that cannot be stored leaves the dialog open with what the user typed.
 struct CredentialsEditor {
     inner: Rc<RefCell<EditorInner>>,
 }
 
-/// The one state the dialog's content and the row that opens it share.
 struct EditorInner {
     kind: CredentialsKind,
     host: SettingsHost,
     window: WindowId,
-    /// The dialog, once it is built; the content closure reaches the editor through a weak handle
-    /// because the dialog owns that closure.
     dialog: Option<Dialog>,
-    /// The key every component of the dialog is named by.
     key: SmolStr,
-    /// The draft the content of the next open is built from.
     draft: CredentialsDraft,
-    /// The content of the open, when there is one.
     form: Option<CredentialsForm>,
     theme: ThemeHandle,
     translate: Translate,
 }
 
-/// What one open of the dialog holds.
 struct CredentialsForm {
-    /// The scope every signal of the form belongs to, released with the form.
     scope: SignalScope,
     fields: Vec<FormField>,
     buttons: Vec<Button>,
 }
 
-/// One value of the form: its declaration, the input that edits it, and what was already reported
-/// about it (which the value changing is what takes away).
 struct FormField {
     field: &'static CredentialField,
     input: InputNode,
     error: Signal<Option<SmolStr>>,
-    /// The text the input held when its error was last observed, so only a value that changed
-    /// takes the report away.
     previous: RefCell<SmolStr>,
 }
 
 impl CredentialsEditor {
-    /// Builds the (closed) dialog and returns the editor that opens it.
     fn new(
         app: &mut App,
         host: &SettingsHost,
@@ -1008,7 +873,6 @@ impl CredentialsEditor {
         editor
     }
 
-    /// Opens the dialog over the set the settings hold now.
     fn open(&self, app: &mut App) {
         let (dialog, window, draft) = {
             let inner = self.inner.borrow();
@@ -1027,7 +891,6 @@ impl CredentialsEditor {
         let _ = dialog.open(app, window);
     }
 
-    /// Closes the dialog the way its cancel button does.
     fn close(&self, app: &mut App) {
         let dialog = self.inner.borrow().dialog.clone();
         if let Some(dialog) = dialog {
@@ -1035,10 +898,6 @@ impl CredentialsEditor {
         }
     }
 
-    /// Builds the content of one open: the values on top, the foot below.
-    ///
-    /// The content is built over `inner.draft`, which is the set the settings held when the dialog
-    /// was opened, and every value is a field of its own with the line its rejection is drawn in.
     fn build_form(
         self: &Rc<Self>,
         app: &mut App,
@@ -1230,10 +1089,6 @@ impl CredentialsEditor {
         Ok(())
     }
 
-    /// Writes the set the form holds, or reports every value it is missing.
-    ///
-    /// The dialog stays open when anything is missing or the set cannot be stored: what the user
-    /// typed is what they submit again with.
     fn confirm(&self, app: &mut App) {
         let (dialog, kind, host, window, translate) = {
             let inner = self.inner.borrow();
@@ -1280,8 +1135,6 @@ impl CredentialsEditor {
             window,
             SettingsChange::edit(move |config| kind.save(config, &draft)),
         );
-        // The reason the set could not be stored is the settings page's to report, and the dialog
-        // stays where the user can submit it again.
         if stored.is_ok()
             && let Some(dialog) = dialog
         {
@@ -1289,7 +1142,6 @@ impl CredentialsEditor {
         }
     }
 
-    /// Makes the dialog and its form follow the frame.
     fn sync(&self, app: &mut App) -> Result<(), EngineError> {
         let dialog = self.inner.borrow().dialog.clone();
         let Some(dialog) = dialog else {
@@ -1327,7 +1179,6 @@ impl CredentialsEditor {
         Ok(())
     }
 
-    /// Offers one platform event to the form's inputs.
     fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         let inner = self.inner.borrow();
         let Some(form) = inner.form.as_ref() else {
@@ -1341,7 +1192,6 @@ impl CredentialsEditor {
         consumed
     }
 
-    /// Releases the form of the open, if there is one.
     fn release_form(&self, app: &mut App) {
         let form = self.inner.borrow_mut().form.take();
         let Some(form) = form else {
@@ -1356,7 +1206,6 @@ impl CredentialsEditor {
         app.release_scope(form.scope);
     }
 
-    /// Builds one wrapper node a dialog button is drawn in, which is the id a test clicks it by.
     fn button_wrapper(
         app: &mut App,
         window: WindowId,
@@ -1377,7 +1226,6 @@ impl CredentialsEditor {
         })
     }
 
-    /// Releases the form and the dialog.
     fn release(&self, app: &mut App) {
         self.release_form(app);
         let dialog = self.inner.borrow_mut().dialog.take();

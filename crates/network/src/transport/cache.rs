@@ -1,14 +1,7 @@
-//! Fixed-capacity, insertion-ordered cache behind the HTTP client pool.
-
 use std::{collections::VecDeque, hash::Hash};
 
 use ahash::AHashMap;
 
-/// A map that never holds more than its capacity.
-///
-/// The entry inserted longest ago is evicted first. Re-inserting an existing
-/// key keeps its position and replaces its value, so a route that stays in use
-/// is not retired because of unrelated traffic.
 pub(super) struct InsertionOrderedCache<K, V> {
     capacity: usize,
     entries: AHashMap<K, V>,

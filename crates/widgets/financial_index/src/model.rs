@@ -1,20 +1,3 @@
-//! The catalogue of indices a pane can follow, and the quotes it draws for them.
-//!
-//! Everything here is pure: a manifest is validated into the catalogue the
-//! selector lists, a persisted selection is normalized into the set the service is
-//! asked to follow, and a quote is turned into the numbers a cell shows. The only
-//! thing this module borrows from the rest of the application is the translator
-//! its own failures are written with.
-//!
-//! # What a quote keeps
-//!
-//! A quote keeps what a cell draws and what makes two quotes comparable: the last
-//! price, the open it is measured against, whether the market is trading, and the
-//! venue timestamp that orders one quote against another. The rest of the event
-//! the service sends — the session high and low, the previous close — is not part
-//! of anything this pane shows, and a field nothing reads is a field that will
-//! disagree with the code that stopped reading it.
-
 use std::sync::Arc;
 
 use ahash::{HashSet, HashSetExt};
@@ -26,25 +9,12 @@ use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
 use widget::error::TranslatedError;
 
-/// The most indices one pane may follow.
-///
-/// It bounds what the widget will ever ask for, not what an account is entitled
-/// to: the entitlement is the service's to enforce, and the service reports it as
-/// a failure of its own when a selection goes over it.
 pub(super) const MAX_SELECTED_INDICES: usize = 256;
-/// The most categories one manifest may carry.
 const MAX_MANIFEST_CATEGORIES: usize = 256;
-/// The most indices one manifest may carry.
 const MAX_MANIFEST_INDICES: usize = 4_096;
-/// The longest code a manifest entry may carry, counted in characters.
-///
-/// It is the service's own limit — the one `FinancialIndexTopic` accepts — so a manifest
-/// that carries a code this pane keeps is a code the subscription can name.
 const MAX_CODE_CHARS: usize = 64;
-/// The longest name one manifest entry may carry, counted in characters.
 pub(super) const MAX_NAME_CHARS: usize = 120;
 
-/// A failure of the data a pane was asked to draw.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum FinancialIndexDataError {
     #[error("the selection holds more than {limit} indices")]
@@ -55,12 +25,6 @@ pub(super) enum FinancialIndexDataError {
     Invalid(FinancialIndexInvalidReason),
 }
 
-/// Why a manifest entry could not be accepted.
-///
-/// The reasons are the manifest's own structure rather than the field that broke
-/// it: a code that is not a code, a name that is not a name, a reference to a
-/// category the manifest does not define. A reader cannot act on which of the
-/// three codes of an entry was empty, so nothing here says.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum FinancialIndexInvalidReason {
     #[error("the manifest carries an invalid code")]
@@ -135,11 +99,6 @@ impl TranslatedError for FinancialIndexInvalidReason {
     }
 }
 
-/// The two names a manifest carries for one entry.
-///
-/// A manifest names every category and every index in both languages it is
-/// published in, so the name travels with the index rather than being resolved
-/// from a key: the catalogue is data, and a name is part of it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub(super) struct LocalizedFinancialIndexName {
     pub en: SmolStr,
@@ -147,10 +106,6 @@ pub(super) struct LocalizedFinancialIndexName {
 }
 
 impl LocalizedFinancialIndexName {
-    /// The name in the language the interface is reading.
-    ///
-    /// The manifest carries two names, so every locale other than Chinese reads
-    /// the English one rather than a name invented for it.
     pub(super) fn get(&self, language: LanguageCode) -> &str {
         match language {
             LanguageCode::ZhCn => &self.zh,
@@ -185,28 +140,24 @@ impl<'de> Deserialize<'de> for LocalizedFinancialIndexName {
     }
 }
 
-/// One index a pane follows, with the name the manifest gave it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub(super) struct SelectedFinancialIndex {
     pub topic: FinancialIndexTopic,
     pub name: LocalizedFinancialIndexName,
 }
 
-/// One category of a manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FinancialIndexCategory {
     pub code: SmolStr,
     pub name: LocalizedFinancialIndexName,
 }
 
-/// One index of a manifest, and the category it belongs to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FinancialIndexDescriptor {
     pub index: SelectedFinancialIndex,
     pub category: SmolStr,
 }
 
-/// A manifest that has been validated, in the order it was published in.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FinancialIndexCatalog {
     pub categories: Arc<[FinancialIndexCategory]>,
@@ -214,17 +165,6 @@ pub(super) struct FinancialIndexCatalog {
 }
 
 impl FinancialIndexCatalog {
-    /// The indices of one category a search leaves, in manifest order.
-    ///
-    /// A catalogue with no category selected offers nothing: a selector opens on
-    /// its first category and an empty one is a catalogue that lists nothing.
-    ///
-    /// The search is a convenience over the category's own indices rather than a
-    /// second way of listing the catalogue: it narrows what the category offers and
-    /// never reaches past it. An index is matched by its code and by both of the
-    /// names the manifest gave it, in either case: the names are data the catalogue
-    /// is published in, and a reader of one language searching in the other is
-    /// searching for the index rather than for the language it is drawn in.
     pub(super) fn descriptors_for(
         &self,
         category: Option<&SmolStr>,
@@ -252,10 +192,6 @@ impl FinancialIndexCatalog {
     }
 }
 
-/// Whether an index is one a lowercased search leaves.
-///
-/// The fields are the ones a row of the selector draws: its code, and the names the
-/// manifest published for it.
 fn matches_filter(descriptor: &FinancialIndexDescriptor, filter: &str) -> bool {
     let index = &descriptor.index;
     [
@@ -267,7 +203,6 @@ fn matches_filter(descriptor: &FinancialIndexDescriptor, filter: &str) -> bool {
     .any(|field| field.to_lowercase().contains(filter))
 }
 
-/// Which way an index moved against its open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FinancialIndexDirection {
     Down,
@@ -275,23 +210,19 @@ pub(super) enum FinancialIndexDirection {
     Up,
 }
 
-/// One complete quote. All prices are integer cents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FinancialIndexQuote {
     pub latest: u32,
     pub open: u32,
     pub is_trading: bool,
-    /// The venue's own timestamp, which is what orders one quote against another.
     pub timestamp: i64,
 }
 
 impl FinancialIndexQuote {
-    /// The move against the open, in cents.
     pub(super) const fn change(self) -> i64 {
         self.latest as i64 - self.open as i64
     }
 
-    /// The move against the open as a percentage, which a zero open has none of.
     pub(super) fn change_percent(self) -> Option<f64> {
         (self.open != 0).then(|| self.change() as f64 * 100.0 / f64::from(self.open))
     }
@@ -316,7 +247,6 @@ impl FinancialIndexQuote {
     }
 }
 
-/// Validates a manifest into the catalogue a selector lists.
 pub(super) fn prepare_catalog(
     manifest: proto_types::FinancialIndices,
 ) -> Result<FinancialIndexCatalog, FinancialIndexDataError> {
@@ -373,8 +303,6 @@ pub(super) fn prepare_catalog(
     })
 }
 
-/// Normalizes a persisted or chosen selection: the hard limit, then the names,
-/// then the duplicates, which keep the first entry they appeared as.
 pub(super) fn normalize_selection(
     selection: &[SelectedFinancialIndex],
 ) -> Result<Vec<SelectedFinancialIndex>, FinancialIndexDataError> {
@@ -397,21 +325,18 @@ pub(super) fn normalize_selection(
     Ok(normalized)
 }
 
-/// The topics a selection subscribes to, in selection order.
 pub(super) fn selection_topics(selection: &[SelectedFinancialIndex]) -> Arc<[FinancialIndexTopic]> {
     let mut topics = Vec::with_capacity(selection.len());
     topics.extend(selection.iter().map(|index| index.topic.clone()));
     topics.into()
 }
 
-/// A price, in the cents the service publishes.
 pub(super) fn format_price(cents: u32) -> SmolStr {
     let major = cents / 100;
     let minor = cents % 100;
     format_smolstr!("{major}.{minor:02}")
 }
 
-/// A signed move, in the cents the service publishes.
 pub(super) fn format_signed_cents(cents: i64) -> SmolStr {
     let magnitude = cents.unsigned_abs();
     let major = magnitude / 100;
@@ -426,7 +351,6 @@ pub(super) fn format_signed_cents(cents: i64) -> SmolStr {
     format_smolstr!("{sign}{major}.{minor:02}")
 }
 
-/// A signed move, in percent, which a zero open does not have.
 pub(super) fn format_percent(percent: Option<f64>) -> SmolStr {
     match percent {
         Some(value) if value > 0.0 => format_smolstr!("+{value:.2}%"),
@@ -768,8 +692,6 @@ mod tests {
         );
     }
 
-    /// A search matches the code a row is drawn with and both names the manifest gave the
-    /// index, in whatever case it was typed.
     #[test]
     fn a_search_should_match_an_index_by_its_code_or_either_of_its_names() {
         let catalog = prepare_catalog(manifest()).expect("the fixture manifest should be valid");

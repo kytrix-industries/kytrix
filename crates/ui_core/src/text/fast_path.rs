@@ -1,53 +1,3 @@
-//! 数字快速路径（`DigitFastPath`）：对齐 Blink `SimpleLineLayout` 的「字符 → glyph id → advance」
-//! 直拼，跳过 parley 的 itemize / 分析 / 塑形全流程。
-//!
-//! # 为什么需要
-//!
-//! 交易终端的文本量集中在价格 / 数量 / 涨跌幅：字符集是
-//! `[0-9 . , + - % / :]`（[`ALPHABET`]），字体固定、无 bidi、无复杂脚本、无 OpenType 特性。
-//! 这类文本走通用 shaping 是纯开销：每次字符串变化都是一次 `RangedBuilder::build`（itemize +
-//! Unicode 分析 + swash 塑形 + 行/项/簇构建）。Blink 的 `SimpleLineLayout`、Qt 的
-//! `QRawFont`、Windows Terminal 都是「数字/ASCII 直拼」。
-//!
-//! # 正确性策略（**运行时自证**，不是「相信假设」）
-//!
-//! 快速路径**不依赖字体没有 kerning** 这类无法静态验证的假设。每个
-//! `(字体栈身份, 全量 shaping 输入)` 第一次命中时做一次**验证性塑形**（等价关系见
-//! [`FastKey`]：与形状缓存同一个 [`TextStyle::same_shaping_inputs`]）：
-//!
-//! 1. 对 [`ALPHABET`] 的每个字符单独用 parley 塑形一次，取 glyph id / advance（逻辑像素）/
-//!    行度量（ascent/descent/line-height/baseline）/ 实例坐标（可变字体）/ 合成标志；
-//! 2. 再塑形一次「所有有序字符对」（`AA`、`AB`…，800 字符）的探针串，逐字形断言
-//!    `x == 前缀 advance 之和`（容差 [`ADVANCE_TOLERANCE`] = 0.01 px）且 glyph id 与第 1 步一致。
-//!    这一步**同时**证明了「无 kerning」「无默认连字/替换」「advance 可加」，即快速路径
-//!    与 parley 逐字形等价；
-//! 3. 任一条不成立 ⇒ 该字体组合**永久**降级到 parley（`FastEntry::Unsupported`），并计入
-//!    [`FastPathStats::rejected`]（可观测，不静默）。
-//!
-//! 于是「快速路径结果 == parley 结果」是该字体上被证明过的性质，而不是对宿主字体的假设；
-//! 换字体 / 换任一 shaping 输入（字号、字重、行高、stretch、locale、可变字体轴…）都会重新
-//! 验证。验证成本是 1 + 17 次短串塑形，每种组合只付一次。
-//!
-//! # 单行性（为什么不需要断行）
-//!
-//! 快速路径的布局恒为单行，前提是文本**没有内部软换行机会**：
-//!
-//! - `TextWrap::NoWrap`：本来就不换行；
-//! - 其它策略：只有 UAX #14 判定「文本内部没有换行机会」时才走快速路径。数字串里的
-//!   `, . + - % / :` 属于数值表达式序列（`NU (SY | IS)* × …` 与 `HY × NU` 等规则），
-//!   `-1.50%` / `12/34` 这类行情文本**没有**断行机会；真正会出现机会的串（例如 `1.+`
-//!   在 `HY` 后、`SY` 前）必须退回 parley。判定用 `unicode-linebreak` 的 UAX #14 实现，
-//!   不是「含 `-` / `/` 就放弃」的保守近似（后者会让涨跌幅/分数类文本命中率为 0）。
-//!
-//! 因此快速路径的布局恒为单行：`min-content == max-content == 总 advance`，
-//! `measure` 是 O(1)、`layout` 不需要 `break_all_lines`。
-//!
-//! # 开关
-//!
-//! [`DigitFastPath::set_enabled`]（`App::set_digit_fast_path`）可整体回退到 parley 路径做对照；
-//! 命中率由 [`FastPathStats`] 计入 `TextPassReport::{fast_path_shaped, fast_path_queries,
-//! fast_path_ineligible}`（`queries` 含静态条件不满足的候选，因此命中率是真实命中率）。
-
 use std::{hash::Hasher, rc::Rc};
 
 use parley::PositionedLayoutItem;
@@ -64,42 +14,27 @@ use crate::{
     paint::{color::Color, primitive::PositionedGlyph},
 };
 
-/// 快速路径接受的字符集（顺序即内部索引，改动即缓存失效）。
 pub(crate) const ALPHABET: [char; 17] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', ',', '+', '-', '%', '/', ':',
 ];
 
-/// 快速路径与 parley 的 advance 允许误差（逻辑像素）。
 pub(crate) const ADVANCE_TOLERANCE: f32 = 0.01;
 
-/// 字符在 [`ALPHABET`] 里的下标（`None` = 不在快速路径字符集里）。
 fn alphabet_index(character: char) -> Option<usize> {
     ALPHABET
         .iter()
         .position(|candidate| *candidate == character)
 }
 
-/// UAX #14：文本内部（不含行尾）是否存在软换行机会。
-///
-/// 数字串里的 `, . + - % / :` 处于数值表达式序列中（`NU (SY | IS)* × …`、`HY × NU` 等
-/// 规则），`-1.50%` / `12/34` 这类行情文本**没有**内部断行机会，可以安全地走单行快速路径；
-/// 真正有断行机会的串（例如 `1.+`：`.` 后、`+` 前）必须退回 parley。
-///
-/// `linebreaks` 会在 `text.len()` 处给出行尾（eot）机会，因此只接受 `< len()` 的索引。
 fn has_line_break_opportunity(text: &str) -> bool {
     linebreaks(text).any(|(index, _)| index < text.len())
 }
 
-/// 一次验证 / 快速塑形用的字体级数据（按 `(字体栈身份, 全量样式)` 缓存）。
 struct FastFont {
-    /// parley 的字体身份（`Blob` + TTC 索引）：光栅与图集键都要它。
     font: parley::FontData,
-    /// 可变字体实例坐标 / faux bold（光栅必须与排版同参数）。
     variation_coords: Vec<i16>,
     synthesis: fontique::Synthesis,
-    /// 每个字符的 glyph id 与 advance（逻辑像素，已含实例坐标）。
     chars: [Option<FastChar>; ALPHABET.len()],
-    /// 行度量（取 parley 的探针实测值，逻辑像素）。
     metrics: FastMetrics,
 }
 
@@ -109,16 +44,12 @@ struct FastChar {
     advance: f32,
 }
 
-/// 单行文本的行度量（逻辑像素）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FastMetrics {
-    /// 首行基线（文本盒局部）。
     pub baseline: f32,
-    /// 行高（含 leading）。
     pub line_height: f32,
 }
 
-/// 一次快速路径的塑形结果：**单行**字形序列 + 行度量。
 #[derive(Clone, Debug)]
 pub(crate) struct SimpleShaped {
     glyphs: Vec<SimpleGlyph>,
@@ -127,61 +58,46 @@ pub(crate) struct SimpleShaped {
     font: parley::FontData,
     variation_coords: Vec<i16>,
     synthesis: fontique::Synthesis,
-    /// 源文本字节数（ASCII ⇒ 字节 == 字符数）。
     text_len: usize,
 }
 
-/// 一个已定位的简单字形（逻辑坐标）。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SimpleGlyph {
-    /// glyph id（`!= 0`；0 由调用方降级到 parley 以便出 tofu 诊断）。
     pub glyph: u32,
-    /// 逻辑 x（文本盒局部）。
     pub x: f32,
 }
 
 impl SimpleShaped {
-    /// 源文本字节数。
     pub(crate) fn text_len(&self) -> usize {
         self.text_len
     }
 
-    /// 总 advance（逻辑像素）= 单行宽度。
     #[cfg(test)]
     pub(crate) fn width(&self) -> f32 {
         self.width
     }
 
-    /// 内容尺寸（逻辑像素）：单行 ⇒ 高 = 行高。
     pub(crate) fn size(&self) -> Size {
         Size::new(self.width, self.metrics.line_height)
     }
 
-    /// 行度量。
     pub(crate) fn metrics(&self) -> FastMetrics {
         self.metrics
     }
 
-    /// 字符下标处的 glyph id（测试 / 诊断用）。
     #[cfg(test)]
     pub(crate) fn glyph_at(&self, index: usize) -> u32 {
         self.glyphs.get(index).map_or(0, |glyph| glyph.glyph)
     }
 
-    /// 字符下标处的逻辑 x（`index >= 字符数` 时返回总宽）。
     pub(crate) fn x_at(&self, index: usize) -> f32 {
         self.glyphs.get(index).map_or(self.width, |glyph| glyph.x)
     }
 
-    /// `byte_index` 处的 caret x（逻辑像素；ASCII ⇒ 字节下标 == 字符下标）。
     pub(crate) fn caret_x(&self, byte_index: usize) -> f32 {
         self.x_at(byte_index.min(self.text_len))
     }
 
-    /// `x`（已减对齐偏移的文本盒局部坐标）→ 最近字节边界（ASCII ⇒ 字节下标 == 字符下标）。
-    ///
-    /// 与 parley `Cursor::from_point` 同一条「半簇取整」规则：`x` 落在第 i 个簇中点的左侧 ⇒ i，
-    /// 右侧 ⇒ i + 1；越界由首/尾簇自然收敛到 `0` / `text_len`（E5/§11.5 的行内 clamp）。
     pub(crate) fn byte_index_at(&self, x: f32) -> usize {
         for index in 0..self.glyphs.len() {
             let edge = self.x_at(index);
@@ -193,7 +109,6 @@ impl SimpleShaped {
         self.text_len
     }
 
-    /// 单行选区矩形（逻辑像素，文本盒局部）。
     pub(crate) fn selection_rect(
         &self,
         content_width: f32,
@@ -216,10 +131,6 @@ impl SimpleShaped {
         Some(Rect::new(x0, 0.0, x1 - x0, self.metrics.line_height))
     }
 
-    /// 光栅成 [`ShapedLine`]（单行；`color` 由当前内容决定，不参与形状缓存）。
-    ///
-    /// `ctx.scale` 是当前设备 scale：逻辑坐标 × scale = 物理落点，水平相位按物理坐标量化
-    /// （`crate::text::raster::split_subpixel_x`），竖直按整物理像素对齐。
     pub(crate) fn rasterize(
         &self,
         text: SmolStr,
@@ -234,9 +145,6 @@ impl SimpleShaped {
         let baseline = self.metrics.baseline;
         let mut glyphs = Vec::with_capacity(self.glyphs.len());
         for glyph in &self.glyphs {
-            // 对齐偏移必须在**亚像素拆分之前**进入物理坐标：`split_subpixel_x` 同时决定
-            // 整数落点和图集相位桶；先拆再平移会让 `position.x * scale` 变成非整数，且
-            // 相位仍来自未对齐的 x（右对齐/居中在非整数 DPI 下差 1 物理像素）。
             let (base_x, subpixel_x) = split_subpixel_x((glyph.x + layout_offset) * scale);
             let tile = ctx.glyph_atlas.ensure(
                 ctx.raster,
@@ -268,8 +176,6 @@ impl SimpleShaped {
                 text_range: 0..text.len(),
                 glyphs,
             })],
-            // 快速路径只接「无 runs 且无装饰」的纯数字文本（`TextContext::shape_cached` 前置
-            // 拒绝富文本）⇒ 没有装饰几何。
             decorations: Vec::new(),
         };
         Ok(ShapedLine {
@@ -285,33 +191,20 @@ impl SimpleShaped {
     }
 }
 
-/// 快速路径统计（喂 `TextPassReport`；命中率 = `hits / queries`）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FastPathStats {
-    /// 进入快速路径判定的塑形次数（分母）。**包含**静态条件不满足的候选：旧实现只在
-    /// `eligible` 之后计数，命中率是自证式的，无法观测真实热路径命中率。
     pub queries: usize,
-    /// 真正走快速路径的次数（分子）。
     pub hits: usize,
-    /// 走快速路径的字形总数（命中时 ≈ 字符数之和）。
     pub glyphs: usize,
-    /// 首次验证失败的 `(字体栈身份, 全量样式)` 组合数（永久降级）。
     pub rejected: usize,
-    /// 通过验证的字体组合数（缓存条目）。
     pub verified: usize,
-    /// 静态条件拒绝：RTL 段落。
     pub ineligible_rtl: usize,
-    /// 静态条件拒绝：letter-spacing。
     pub ineligible_letter_spacing: usize,
-    /// 静态条件拒绝：文本内部有 UAX #14 换行机会。
     pub ineligible_wrap: usize,
-    /// 静态条件拒绝：字符集不在 [`ALPHABET`] 内。
     pub ineligible_alphabet: usize,
 }
 
 impl FastPathStats {
-    /// 静态条件不满足的候选总数（`queries - hits` 中不包含「验证降级」与「字形缺失」，
-    /// 因此单独提供该口径；汇总进 `TextPassReport::fast_path_ineligible`）。
     pub(crate) fn ineligible(&self) -> usize {
         self.ineligible_rtl
             + self.ineligible_letter_spacing
@@ -320,7 +213,6 @@ impl FastPathStats {
     }
 }
 
-/// 数字快速路径缓存 + 开关（进程级，由 `TextContext` 持有）。
 pub(crate) struct DigitFastPath {
     enabled: bool,
     fonts: ahash::HashMap<FastKey, FastEntry>,
@@ -328,21 +220,16 @@ pub(crate) struct DigitFastPath {
 }
 
 enum FastEntry {
-    /// 已验证：`style` 是 `Rc<FastFont>` 被探针塑形时使用的**全量**样式。
-    ///
-    /// 命中时必须用 [`TextStyle::same_shaping_inputs`] 与请求样式复验：摘要只用于寻址，
-    /// 摘要碰撞时两条不同样式会落在同一个键上，只按摘要命中就会把别的样式的行度量 /
-    /// glyph id 交出去。
     Ready {
         font: Rc<FastFont>,
         style: TextStyle,
     },
-    /// 验证失败：该组合永久走 parley（不静默：计入 `stats.rejected`）。
-    Unsupported { style: TextStyle },
+    Unsupported {
+        style: TextStyle,
+    },
 }
 
 impl FastEntry {
-    /// 该条目被验证时的全量样式（`Ready` 与 `Unsupported` 都必须能复验）。
     fn style(&self) -> &TextStyle {
         match self {
             Self::Ready { style, .. } | Self::Unsupported { style } => style,
@@ -350,23 +237,6 @@ impl FastEntry {
     }
 }
 
-/// 验证缓存的键：`(字体栈身份, 全量 shaping 输入摘要)`。
-///
-/// 键的等价关系**就是** [`TextStyle::same_shaping_inputs`]：`style_digest` 由
-/// [`TextStyle::hash_into`] 算出（与形状缓存 `text/cache.rs` 的 `ShapeKey` 同一套字段集与
-/// 写法），因此 `line_height` / `stretch` / `locale` / `font_variations` / `word_spacing` /
-/// OpenType 特性 / 断行 / 行数上限等**全部** shaping 输入都进键。这些字段确实被 `verify` 的
-/// 探针塑形消费（`shape::push_shaping_defaults`）：
-///
-/// - `line_height` 决定探针实测的 `FastFont::metrics`（`baseline` / `line_height`）；
-/// - `stretch` 改变字体选择（可能落到另一个 face）、`font_variations` 改变可变字体实例坐标
-///   ⇒ **glyph id 与 advance 都会变**；
-/// - `locale` 影响 `locl` 等语言相关的 GSUB 选择。
-///
-/// 旧键只有 `(font_identity, size, weight, slant)`：先塑形 `.with_line_height(2.0)` 的表头会把
-/// 它的行度量缓存进表，随后默认行高的价格文本命中同一键、拿到表头的 `baseline` —— 后者是
-/// 静默错误（P1-②）。`font_identity` 是 `TextContext` 的字体栈版本与家族覆盖的摘要：换栈 /
-/// 重载系统字体会换新键，旧表自然失效（不保留 migration）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct FastKey {
     font_identity: u64,
@@ -374,7 +244,6 @@ struct FastKey {
 }
 
 impl FastKey {
-    /// 由字体栈身份 + 全量样式构造（摘要写法与 `text/cache.rs` 的 `ShapeKey` 一致）。
     fn new(font_identity: u64, style: &TextStyle) -> Self {
         let mut hasher = ahash::AHasher::default();
         style.hash_into(&mut hasher);
@@ -394,36 +263,23 @@ impl DigitFastPath {
         }
     }
 
-    /// 开关（回退验证用）：关闭后所有文本都走 parley。
     pub(crate) fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
 
-    /// 当前开关状态。
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
 
-    /// 字体集合或样式相关配置变化后清空验证表与统计（字体栈/系统字体变了，旧的验证结论失效）。
     pub(crate) fn reset(&mut self) {
         self.fonts.clear();
         self.stats = FastPathStats::default();
     }
 
-    /// 取走统计（累加进 `TextPassReport` 后清零）。
     pub(crate) fn take_stats(&mut self) -> FastPathStats {
         core::mem::take(&mut self.stats)
     }
 
-    /// 尝试走快速路径。`None` = 不适用（调用方走 parley）。
-    ///
-    /// 命中判据是「键（字体栈身份 + 全量样式摘要）相同 **且**
-    /// [`TextStyle::same_shaping_inputs`] 复验通过」：哈希只用来寻址，等价性逐字段比较，
-    /// 因此与形状缓存（`ShapeKey` + `ShapedText::same_shaping_inputs`）是**同一个等价关系**，
-    /// 不会出现「同键不同样式」的串味。复验失败（摘要碰撞）按 miss 重新验证并覆盖该条目。
-    ///
-    /// `font_key` 是**当前字体栈版本**的身份（字体变了必须重新验证）；`family` 是
-    /// `TextContext` 解析出的 parley 家族列表（探针塑形必须与生产塑形用同一份）。
     pub(crate) fn try_shape(
         &mut self,
         font_cx: &mut parley::FontContext,
@@ -436,7 +292,6 @@ impl DigitFastPath {
         if !self.enabled || text.is_empty() {
             return None;
         }
-        // 分母 = 所有候选（含静态条件不满足者）：命中率 `hits / queries` 才是真实热路径命中率。
         self.stats.queries += 1;
         if let Err(reason) = eligibility(text, style) {
             match reason {
@@ -448,14 +303,12 @@ impl DigitFastPath {
             return None;
         }
         let key = FastKey::new(font_identity, style);
-        // 命中：摘要相同（寻址）+ 全量 shaping 输入逐字段等价（复验，防 64 位摘要碰撞）。
         if let Some(entry) = self
             .fonts
             .get(&key)
             .filter(|entry| entry.style().same_shaping_inputs(style))
         {
             let FastEntry::Ready { font, .. } = entry else {
-                // 该组合此前验证失败：永久走 parley（`rejected` 已在首次失败时计入）。
                 return None;
             };
             let simple = build_simple(font, text)?;
@@ -463,7 +316,6 @@ impl DigitFastPath {
             self.stats.glyphs += simple.glyphs.len();
             return Some(simple);
         }
-        // 首次 / 摘要碰撞：验证一次并覆盖该键（碰撞时结论替换旧条目，不静默错配）。
         let font = match verify(font_cx, layout_cx, family, style) {
             Some(font) => {
                 self.stats.verified += 1;
@@ -501,12 +353,6 @@ impl Default for DigitFastPath {
     }
 }
 
-/// 单行文本在给定内容宽度与对齐方式下的水平偏移（逻辑像素）。
-///
-/// 对齐是**布局属性**，与是否命中快速路径无关（Blink 的 SimpleLineLayout、Qt 的
-/// `QTextLayout` 都是先定行偏移再绘制）。快速路径只负责产出从 0 开始的字形序列，行偏移由
-/// 本函数统一给出：`Start`/`End` 按段落方向解释，`Left`/`Right` 是绝对方向，`Justify` 的
-/// 单行（末行）按 `Start` 处理。
 pub(crate) fn simple_alignment_offset(
     line_advance: f32,
     content_width: f32,
@@ -546,51 +392,33 @@ pub(crate) fn simple_alignment_offset(
     }
 }
 
-/// 快速路径候选被**静态条件**拒绝的原因（用于把真实命中率与拒绝原因计入 [`FastPathStats`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ineligible {
-    /// 段落方向是 RTL（bidi 对齐/溢出语义不由快速路径处理）。
     Rtl,
-    /// 有 letter-spacing（逐字符 advance 不再可加）。
     LetterSpacing,
-    /// 非 `NoWrap` 且文本内部存在 UAX #14 软换行机会（单行假设不成立）。
     Wrap,
-    /// 字符集不在 [`ALPHABET`] 内。
     Alphabet,
 }
 
-/// 快速路径的适用条件（除「验证通过」以外的静态条件）。
-///
-/// OpenType 特性（`tnum` 等）**不在这里一刀切**：特性是 `(字体, 样式)` 的一部分，由
-/// [`verify`] 的探针塑形决定等价性 —— 上下文的 `calt`/连字会让「一字符一字形 / advance 可加」
-/// 探针失败并永久降级，而不是静默错配。
 fn eligibility(text: &str, style: &TextStyle) -> Result<(), Ineligible> {
-    // RTL 段落的对齐/溢出语义要按 parley 的 bidi 规则处理（`align_when_overflowing=false`
-    // 时 RTL 溢出会向左平移），而快速路径的所有字符都是 ASCII 数字，没有支持 RTL 的收益。
-    // 显式拒绝，不能把安全性寄托在 bidi 探针偶然失败上。
     if style.direction == TextDirection::Rtl {
         return Err(Ineligible::Rtl);
     }
     if style.letter_spacing != 0.0 {
         return Err(Ineligible::LetterSpacing);
     }
-    // 字符集先于断行判定：不在字母表里的文本（含空格/单位/字母）直接按「不适用」计数，
-    // 而不是被「空格产生断行机会」抢走原因。
     if !text
         .chars()
         .all(|character| alphabet_index(character).is_some())
     {
         return Err(Ineligible::Alphabet);
     }
-    // `Wrap`/`Anywhere` 下若文本内部有断行机会，单行假设不成立（UAX #14 真判定，见
-    // `has_line_break_opportunity`）。
     if style.wrap != super::TextWrap::NoWrap && has_line_break_opportunity(text) {
         return Err(Ineligible::Wrap);
     }
     Ok(())
 }
 
-/// 由验证过的字体表构造单行 glyph 序列（任一字形缺失 ⇒ `None`，退回 parley 出 tofu 诊断）。
 fn build_simple(font: &FastFont, text: &str) -> Option<SimpleShaped> {
     let mut glyphs = Vec::with_capacity(text.len());
     let mut x = 0.0f32;
@@ -617,17 +445,12 @@ fn build_simple(font: &FastFont, text: &str) -> Option<SimpleShaped> {
     })
 }
 
-/// 验证性塑形：该 `(字体, 全量样式)` 是否满足快速路径的全部前提。
-///
-/// 返回 `None` = 不满足（permanent 降级）。成功时返回的 advance / 行度量**来自 parley 本身**，
-/// 因此不存在「自己算一套度量」的漂移风险。
 fn verify(
     font_cx: &mut parley::FontContext,
     layout_cx: &mut parley::LayoutContext<crate::paint::color::ColorBrush>,
     family: &parley::FontFamily<'static>,
     style: &TextStyle,
 ) -> Option<FastFont> {
-    // 1. 逐字符单独塑形：glyph id / advance / 行度量 / 实例参数。
     let mut chars: [Option<FastChar>; ALPHABET.len()] = [None; ALPHABET.len()];
     let mut font: Option<parley::FontData> = None;
     let mut variation_coords: Vec<i16> = Vec::new();
@@ -635,7 +458,6 @@ fn verify(
     let mut metrics: Option<FastMetrics> = None;
     for (index, character) in ALPHABET.iter().copied().enumerate() {
         let buffer = [character as u8];
-        // 安全：`character` 全部是 ASCII，单字节切片就是合法 UTF-8。
         let probe = core::str::from_utf8(&buffer).ok()?;
         let layout = probe_layout(font_cx, layout_cx, family, style, probe)?;
         let (id, advance, probe_font, coords, probe_synthesis) = single_glyph(&layout)?;
@@ -644,7 +466,6 @@ fn verify(
         }
         if let Some(existing) = &font {
             if existing != &probe_font {
-                // 同一份字符集解析到了不同字体（fallback 链）：单行假设下的字形簇不再同质。
                 return None;
             }
         } else {
@@ -675,7 +496,6 @@ fn verify(
         metrics,
     };
 
-    // 2. 全部有序字符对：证明「无 kerning / 无默认替换 / advance 可加」。
     let mut pairs = String::with_capacity(ALPHABET.len() * ALPHABET.len() * 2);
     for first in ALPHABET {
         for second in ALPHABET {
@@ -686,10 +506,6 @@ fn verify(
     let layout = probe_layout(font_cx, layout_cx, family, style, &pairs)?;
     verify_glyph_sequence(&layout, &fast, &pairs)?;
 
-    // 3. 全字符集串 + 真实行情样本：形状缓存对「每 tick 变化的文本」会 miss，上下文形如
-    //    `tnum` / `calt` 的 GSUB 在更长上下文里仍必须保持「一字符一字形 / id 与单字符探针
-    //    一致 / advance 可加」。这一步是 D-2 允许 OpenType 特性进入快速路径的正确性依据：
-    //    验证失败会永久降级到 parley（`FastEntry::Unsupported`），不会静默错配。
     let mut sample = String::with_capacity(ALPHABET.len() + 24);
     sample.extend(ALPHABET);
     sample.push_str("1,234.56-7/8%:+9");
@@ -698,7 +514,6 @@ fn verify(
     Some(fast)
 }
 
-/// 用与生产路径**完全相同**的样式属性塑形一段探针文本（逻辑坐标：scale = 1.0）。
 fn probe_layout(
     font_cx: &mut parley::FontContext,
     layout_cx: &mut parley::LayoutContext<crate::paint::color::ColorBrush>,
@@ -719,7 +534,6 @@ fn probe_layout(
     Some(layout)
 }
 
-/// 从单字符布局里取 `(glyph id, advance, 字体, 实例坐标, 合成标志)`。
 fn single_glyph(
     layout: &parley::Layout<crate::paint::color::ColorBrush>,
 ) -> Option<(u32, f32, parley::FontData, Vec<i16>, fontique::Synthesis)> {
@@ -730,7 +544,6 @@ fn single_glyph(
         };
         let mut glyphs = run.positioned_glyphs();
         let glyph = glyphs.next()?;
-        // 单字符必须恰好产生一个字形（连字/替换会得到 0 或 >1 个）。
         if glyphs.next().is_some() {
             return None;
         }
@@ -752,11 +565,6 @@ fn single_glyph(
     None
 }
 
-/// 校验一段探针串：字形数必须等于字符数，且每个字形 id / x 与「单字符探针」一致
-/// （`x` == 前缀 advance 之和，容差 [`ADVANCE_TOLERANCE`]）。
-///
-/// 字符对探针钉住 pair 上下文（kerning/连字），全字符集样本串再钉住更长上下文的 GSUB
-/// （`tnum` 等上下文替换会让 id 与单字符探针不一致）。
 fn verify_glyph_sequence(
     layout: &parley::Layout<crate::paint::color::ColorBrush>,
     font: &FastFont,
@@ -777,7 +585,6 @@ fn verify_glyph_sequence(
         }
     }
     if glyph_x.len() != expected {
-        // 连字/替换把字符数压缩了：不满足「一字符一字形」。
         return None;
     }
     let mut x = 0.0f32;
@@ -829,26 +636,13 @@ mod tests {
         font_cx.collection.family_names().next().is_some()
     }
 
-    /// parley 全量参考塑形的结果（与 `SimpleShaped` 同口径）。
     struct ParleyReference {
-        /// 逐字形 `(glyph id, x)`。
         glyphs: Vec<(u32, f32)>,
-        /// 总 advance（逻辑像素）。
         width: f32,
-        /// 首行基线。
         baseline: f32,
-        /// 首行行高。
         line_height: f32,
     }
 
-    /// parley 的全量参考塑形：**直接复用生产探针的 builder 配置**。
-    ///
-    /// `probe_layout` = `FontFamily` + `shape::push_shaping_defaults`，与 `verify` 的探针是同一套
-    /// 输入（size / weight / slant / letter-spacing / line-height / features / stretch /
-    /// word-spacing / locale / variations / line-break / `WhiteSpaceCollapse` / wrap）。旧实现
-    /// 自己拼 `push_default` 且只压 5 项，与生产探针**不等价**：`line_height` / `stretch` /
-    /// `locale` / `font_variations` 的差异在测试里天然暴露不出来（P1-② 因此被假绿掩盖）。
-    /// 复用之后「参考 == 生产探针的输入」是构造上的事实，不存在第二套样式定义漂移。
     fn parley_reference(
         font_cx: &mut parley::FontContext,
         layout_cx: &mut parley::LayoutContext<ColorBrush>,
@@ -856,9 +650,6 @@ mod tests {
         text: &str,
         style: &TextStyle,
     ) -> ParleyReference {
-        // 参考与生产共用同一套 builder 配置（含 `set_base_direction`）；没有等价入口的
-        // `color` / `alignment` 不是 shaping 输入（R12-11），`overflow` / `max_lines` 在 shape
-        // 之后由 `apply_overflow` 应用，同样不改 glyph id / advance / 行度量。
         let layout =
             probe_layout(font_cx, layout_cx, family, style, text).expect("探针布局必须能建出来");
         let mut glyphs = Vec::new();
@@ -883,7 +674,6 @@ mod tests {
         }
     }
 
-    /// 断言快速路径结果与「该样式自己的」parley 全量参考一致。
     fn assert_matches_reference(simple: &SimpleShaped, reference: &ParleyReference, text: &str) {
         assert_eq!(
             reference.glyphs.len(),
@@ -922,7 +712,6 @@ mod tests {
         );
     }
 
-    /// 快速路径表里 `Ready` 条目的 `Rc<FastFont>`（`Unsupported` 不计）。
     fn ready_fonts(fast: &DigitFastPath) -> Vec<Rc<FastFont>> {
         fast.fonts
             .values()
@@ -933,9 +722,6 @@ mod tests {
             .collect()
     }
 
-    /// 测试专用：从 `ShapedText` 的 parley 快照里取逐字形 `(id, x, advance)` + 首行度量。
-    ///
-    /// 只对 `ShapedKind::Parley` 有效：关闭快速路径后的生产快照就走这条。
     fn parley_snapshot_glyphs(shaped: &shape::ShapedText) -> (Vec<(u32, f32, f32)>, f32, f32) {
         let layout = shaped.layout();
         let mut glyphs = Vec::new();
@@ -955,10 +741,6 @@ mod tests {
         (glyphs, baseline, line_height)
     }
 
-    /// 走一次快速路径；被拒绝 ⇒ 显式失败。
-    ///
-    /// 拒绝意味着宿主字体对字符集有 kerning/连字，或探针建不出来：这是必须让人看见的失败，
-    /// 不能像旧测试那样 `continue` / `eprintln!("skip")`。
     fn shape_fast(
         fast: &mut DigitFastPath,
         font_cx: &mut parley::FontContext,
@@ -983,11 +765,6 @@ mod tests {
         assert_eq!(alphabet_index('中'), None);
     }
 
-    /// D-2 的静态条件：字符集 / 断行机会（UAX #14 真判定）/ letter-spacing / RTL / tnum。
-    ///
-    /// 旧断言把「默认 `Wrap` 下 `-1.50%` 不可用」当成正确行为（保守近似「含 `-` / `/` 就
-    /// 放弃」）；UAX #14 的数值表达式规则（`HY × NU`、`SY × NU`、`IS × NU`、`NU × NU` …）
-    /// 让涨跌幅/分数类文本**没有内部断行机会**，因此必须在默认 `Wrap` 下也命中快速路径。
     #[test]
     fn eligibility_requires_the_fast_path_alphabet() {
         let style = TextStyle::new(12.0);
@@ -1033,16 +810,6 @@ mod tests {
         );
     }
 
-    /// RBA-02：`ShapedText::has_only_ltr_runs` 的 `Simple` 分支恒 `true` 依赖两个**真实前提**，
-    /// 这里给出可失败的不变量（不是对常量的断言）：
-    ///
-    /// 1. 快速路径构造前必过 [`eligibility`]，它拒绝 `TextDirection::Rtl`（否则 RTL 段落也会被
-    ///    当成单行 ASCII 走快速路径）；
-    /// 2. [`ALPHABET`] 不含强 RTL 字符 —— 这里断言全 ASCII（`R`/`AL` 类字符都不是 ASCII），
-    ///    且字符集整体在 `NoWrap` 下可命中（前提不被 `Wrap` / `Alphabet` 拒绝掩盖）。
-    ///
-    /// 变异守卫：给 `ALPHABET` 加一个 RTL 字母 ⇒ 第 2 条红；删掉 [`eligibility`] 的 `Rtl`
-    /// 拒绝 ⇒ 第 1 条红。
     #[test]
     fn eligibility_rejects_rtl_paragraphs_and_the_alphabet_has_only_ascii() {
         let style = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
@@ -1067,9 +834,6 @@ mod tests {
         );
     }
 
-    /// D-2 正确性自证：`unicode-linebreak`（UAX #14）的「文本内部有断行机会」必须与 parley
-    /// 的实际断行行为一致（17² 有序对 + 真实行情样本）。否则「快速路径单行」与生产布局
-    /// 会在某些字符组合上漂移。
     #[test]
     fn uax14_break_opportunity_matches_parley() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1111,7 +875,6 @@ mod tests {
         }
     }
 
-    /// D-2：静态条件拒绝必须**可观测**（真实命中率 = `hits / queries`，`queries` 含候选）。
     #[test]
     fn ineligible_reasons_are_counted() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1142,21 +905,12 @@ mod tests {
         assert_eq!(stats.verified + stats.rejected, 0, "静态拒绝不得进入验证");
     }
 
-    /// 核心正确性：快速路径的 glyph id / advance / 位置 / 行度量必须与**全量样式**的 parley
-    /// 参考一致（≤0.01 px）。
-    ///
-    /// 旧版本有两个逃逸口：参考只压 size/weight/letter_spacing（与生产探针不等价），验证被
-    /// 拒绝时 `continue` 跳过。两者都已删除 —— 拒绝在这里就是失败。
-    ///
-    /// D-2 后默认 `Wrap` 下 `-1.50%`/`12/34` 也必须命中（UAX #14 内部无断行机会），且
-    /// `tnum` 特性由验证探针放行（`TextFeature::TABULAR_NUMBERS` 探针必须逐字形等价）。
     #[test]
     fn fast_path_matches_parley_advances_and_positions() {
         let (mut font_cx, mut layout_cx, family) = harness();
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        // 默认换行策略（`Wrap`）：单行假设由 UAX#14 判定，而不是「`Wrap` 一律拒绝」。
         let style = TextStyle::new(12.0);
         let tnum_style =
             TextStyle::new(12.0).with_font_features([crate::text::TextFeature::TABULAR_NUMBERS]);
@@ -1195,15 +949,6 @@ mod tests {
         assert_eq!(stats.ineligible(), 0, "全部探针都满足静态条件");
     }
 
-    /// 开关：关闭后 `try_shape` 立即返回 `None`（不计查询），**且端到端逐位回到 parley**。
-    ///
-    /// 旧版本只断言 `try_shape` 返回 `None`：11-d 的「关闭开关后与 parley 逐位相同」没有任何
-    /// 证据。现在锁三层：
-    /// 1. 关闭后快速路径不查询 / 不命中 / 不验证（统计全零）；
-    /// 2. 关闭后生产入口（`TextContext::shape_cached`）产出的就是 parley 快照，其逐字形
-    ///    id / x / advance 与「直接用全量样式塑形」**逐位相等**（同一个 builder，不需要容差）；
-    /// 3. 开启时的快速路径结果与关闭后的 parley 结果逐字形一致（id 相同、x ≤ 0.01 px），
-    ///    端到端尺寸与每个字节位置的 caret x 也一致 —— 开关只切实现，不切语义。
     #[test]
     fn disabling_the_fast_path_returns_none() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1214,14 +959,12 @@ mod tests {
         let text = "1,234.56";
         let content = TextContent::new(text, style.clone());
 
-        // 1) 开启：生产入口走快速路径（一次验证 + 一次命中）。
         let mut enabled = TextContext::new();
         let fast_shaped = enabled.shape_cached(&content).0;
         let stats = enabled.take_fast_path_stats();
         assert_eq!((stats.queries, stats.hits), (1, 1), "开启时必须走快速路径");
         assert_eq!((stats.verified, stats.rejected), (1, 0));
 
-        // 2) 关闭：`try_shape` 语义 + 生产入口回到 parley。
         let mut disabled = TextContext::new();
         disabled.set_digit_fast_path(false);
         assert!(!disabled.digit_fast_path_enabled());
@@ -1233,7 +976,6 @@ mod tests {
             "关闭后不得查询 / 命中 / 验证"
         );
 
-        // 2a) 关闭后的生产快照 == 直接用全量样式塑形的参考（逐位相等）。
         let reference = parley_reference(&mut font_cx, &mut layout_cx, &family, text, &style);
         let (parley_glyphs, baseline, line_height) = parley_snapshot_glyphs(&parley_shaped);
         assert_eq!(parley_glyphs.len(), reference.glyphs.len(), "字形数");
@@ -1268,7 +1010,6 @@ mod tests {
             "max-content 宽度逐位相等"
         );
 
-        // 3) 开启的快速路径 vs 关闭后的 parley：逐字形 + 端到端位置一致。
         let mut fast = DigitFastPath::new();
         let simple = shape_fast(
             &mut fast,
@@ -1314,11 +1055,6 @@ mod tests {
         }
     }
 
-    /// P0 回归：快速路径的 caret / 选区几何必须与 parley 在全部对齐方式 × 段落方向下一致。
-    ///
-    /// 旧实现把 `content_width` / `alignment` 完全丢掉：只要命中快速路径，右对齐/居中的数字列
-    /// 就按 x=0 左对齐绘制，caret/选区也一起错位；而是否命中取决于文本内容（多一个空格就回到
-    /// parley），于是同一列会在不同帧之间跳变。
     #[test]
     fn fast_path_alignment_matches_parley() {
         let (mut font_cx, _, _) = harness();
@@ -1345,8 +1081,6 @@ mod tests {
             let fast = enabled.shape_cached(&content).0;
             let stats = enabled.take_fast_path_stats();
             if direction == TextDirection::Rtl {
-                // RTL 在 `eligible` 就被显式拒绝（不进入验证表）：RTL 的溢出对齐/视觉顺序
-                // 必须由 parley 负责，快速路径只对 LTR 段落启用。
                 assert_eq!(
                     (stats.queries, stats.hits),
                     (1, 0),
@@ -1398,7 +1132,6 @@ mod tests {
         }
     }
 
-    /// 对齐偏移的退化输入：非有限/负/零内容宽不得产生 NaN/Inf 或虚假偏移。
     #[test]
     fn alignment_offset_is_bounded_for_degenerate_widths() {
         use super::simple_alignment_offset;
@@ -1417,7 +1150,6 @@ mod tests {
         );
     }
 
-    /// 非 ASCII / 含空格 / 有真实断行机会的文本必须原样落回 parley，且拒绝原因可观测。
     #[test]
     fn ineligible_text_falls_back() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1448,8 +1180,6 @@ mod tests {
         );
     }
 
-    /// D-2：验证探针的序列校验必须真的能识别「上下文替换/连字」—— 否则第三段样本探针
-    /// （全字符集 + 行情串）只是空转。
     #[test]
     fn sequence_probe_rejects_contextual_glyph_changes() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1459,12 +1189,10 @@ mod tests {
         let style = TextStyle::new(12.0);
         let font = super::verify(&mut font_cx, &mut layout_cx, &family, &style)
             .expect("host font must pass verification for the digit alphabet");
-        // 同一段文本：id / x 与单字符探针一致 ⇒ 通过。
         let text = "1,234.56-7/8";
         let layout = probe_layout(&mut font_cx, &mut layout_cx, &family, &style, text)
             .expect("probe layout");
         assert_eq!(verify_glyph_sequence(&layout, &font, text), Some(()));
-        // 换一个数字：最后一个字形 id 与单字符探针不同 ⇒ 必须拒绝。
         let changed = "1,234.57";
         let layout = probe_layout(&mut font_cx, &mut layout_cx, &family, &style, changed)
             .expect("probe layout");
@@ -1475,7 +1203,6 @@ mod tests {
         );
     }
 
-    /// 缓存键含字号：不同字号各自验证，互不干扰。
     #[test]
     fn font_tables_are_keyed_by_size() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1514,7 +1241,6 @@ mod tests {
         assert_eq!(fast.fonts.len(), 2);
     }
 
-    /// caret / 选区几何：单行、ASCII ⇒ 前缀 advance 与总宽。
     #[test]
     fn caret_and_selection_use_prefix_advances() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1547,11 +1273,6 @@ mod tests {
         );
     }
 
-    /// P1-② 回归：只有 `line_height` 不同时**不得**命中同一条 `FastFont`。
-    ///
-    /// 原缺陷：旧 `FastKey` 只有 `(font_identity, size, weight, slant)`，`.with_line_height(2.0)`
-    /// 的表头先塑形会把 `FastFont{metrics.line_height = 24}` 写进表，随后默认行高的价格文本
-    /// 命中同一键、`rasterize` 用 `self.metrics` 画出**表头的 baseline / 行高**。
     #[test]
     fn different_line_heights_never_share_a_font_entry() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1587,7 +1308,6 @@ mod tests {
         );
         assert_eq!(stats.rejected, 0);
         assert_eq!(fast.fonts.len(), 2, "两种行高必须是两条验证表项");
-        // 行高来自各自的探针塑形，而不是字体的固定值：2 倍行高 == 2 × 字号。
         assert!(
             (tall.metrics().line_height - 2.0 * base.size).abs() <= ADVANCE_TOLERANCE,
             "line_height 必须由 parley 探针实测：{}",
@@ -1611,14 +1331,6 @@ mod tests {
         }
     }
 
-    /// P1-② 回归：只有 `font-stretch` 不同时不得共享条目。
-    ///
-    /// `stretch` 通过 `StyleProperty::FontWidth` 参与**字体选择**，可能落到另一个 face ⇒
-    /// glyph id 与 advance 都会变（比行高更重的「拿错字体」）。
-    ///
-    /// 宿主字体不一定有该宽度面：`verify` 的探针拒绝是合法结果（`Unsupported`）。拒绝路径
-    /// **不能**更强地断言「advance 不同」—— 拒绝时根本没有 `FastFont` 可比较；能锁住的是
-    /// 「两条样式各自成条（不共享）+ 拒绝可观测 + 另一条样式不受影响」。
     #[test]
     fn different_stretches_never_share_a_font_entry() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1649,7 +1361,6 @@ mod tests {
         assert_matches_reference(&normal, &base_reference, text);
         match stretched {
             Some(stretched) => {
-                // 宿主字体能提供该宽度面：两条都验证通过，各自与自己的全量参考一致。
                 assert_eq!((stats.hits, stats.verified, stats.rejected), (2, 2, 0));
                 let fonts = ready_fonts(&fast);
                 assert_eq!(fonts.len(), 2);
@@ -1662,7 +1373,6 @@ mod tests {
                 assert_matches_reference(&stretched, &reference, text);
             }
             None => {
-                // 宿主字体没有该宽度面 ⇒ 探针拒绝、该样式永久降级 parley（可观测）。
                 assert_eq!(
                     (stats.hits, stats.verified, stats.rejected),
                     (1, 1, 1),
@@ -1672,13 +1382,6 @@ mod tests {
         }
     }
 
-    /// P1-② 回归：只有 `font_variations` 不同时不得共享条目。
-    ///
-    /// 可变字体轴值改变**实例坐标**（`FastFont::variation_coords` 直接喂给光栅），也可能改变
-    /// glyph id / advance；共享条目会让价格文本拿到另一个实例的字形与度量。
-    ///
-    /// 宿主字体不一定是可变字体：探针拒绝（`Unsupported`）是合法结果。拒绝路径不能断言
-    /// 「advance 不同」（没有 `FastFont`），只能锁「各自成条 + 拒绝可观测」。
     #[test]
     fn different_font_variations_never_share_a_font_entry() {
         let (mut font_cx, mut layout_cx, family) = harness();
@@ -1732,11 +1435,6 @@ mod tests {
         }
     }
 
-    /// P1-② 回归：只有 `locale` 不同时不得共享条目。
-    ///
-    /// `locale` 影响 `locl` 等语言相关的 GSUB 选择（CJK 字形变体 / 标点宽度）。数字是否真的
-    /// 随 locale 变取决于宿主字体，因此这里锁的是「各自成条 + 各自与自己的全量参考一致」，
-    /// 而不是「两条输出必须不同」。
     #[test]
     fn different_locales_never_share_a_font_entry() {
         let (mut font_cx, mut layout_cx, family) = harness();

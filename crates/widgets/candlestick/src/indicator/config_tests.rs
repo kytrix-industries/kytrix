@@ -1,5 +1,3 @@
-//! Tests for the indicator configuration and its normalization.
-
 use ui_core::paint::color::Color;
 
 use super::{
@@ -24,7 +22,6 @@ fn lines(periods: &[u32]) -> IndicatorSettings {
     })
 }
 
-/// The line list `id` holds, which every line-list indicator must.
 fn line_list_of(config: &CandlestickIndicatorConfig, id: IndicatorId) -> &LineListConfig {
     entry_of(config, id)
         .settings
@@ -32,10 +29,6 @@ fn line_list_of(config: &CandlestickIndicatorConfig, id: IndicatorId) -> &LineLi
         .unwrap_or_else(|| panic!("{id:?} holds a line list"))
 }
 
-/// The eight-bit sRGB bytes `color` quantizes to.
-///
-/// The old format stored exactly these bytes, so this is how the fixed defaults
-/// are compared with the colours the design recorded.
 fn srgba_bytes(color: LineColor) -> [u8; 4] {
     let Color::Srgb { r, g, b, alpha } = Color::from(color) else {
         unreachable!("a line colour is stored as HSL, so it converts to sRGB");
@@ -44,10 +37,6 @@ fn srgba_bytes(color: LineColor) -> [u8; 4] {
     [quantize(r), quantize(g), quantize(b), quantize(alpha)]
 }
 
-/// Six clearly distinct colours, deliberately not the theme's six.
-///
-/// The engine has no HSL constructor, so these are the sRGB values (to two decimal
-/// places) of the six HSL colours the palette used to be spelled with.
 fn synthetic_palette() -> [Color; 6] {
     [
         Color::srgb(0.36, 0.24, 0.24, 1.0),
@@ -59,7 +48,6 @@ fn synthetic_palette() -> [Color; 6] {
     ]
 }
 
-/// Every colour `settings` stores.
 fn colors(settings: &IndicatorSettings) -> Vec<LineColor> {
     match settings {
         IndicatorSettings::None => Vec::new(),
@@ -113,7 +101,6 @@ fn periods(settings: &IndicatorSettings) -> Vec<u32> {
     }
 }
 
-// ① The default configuration holds all five invariants of its type.
 #[test]
 fn the_default_configuration_should_satisfy_every_invariant() {
     let config = CandlestickIndicatorConfig::default();
@@ -157,7 +144,6 @@ fn the_default_configuration_should_satisfy_every_invariant() {
     }
 }
 
-// ② A default configuration survives the JSON round trip unchanged.
 #[test]
 fn a_configuration_should_round_trip_through_json() {
     let config = CandlestickIndicatorConfig::default();
@@ -168,8 +154,6 @@ fn a_configuration_should_round_trip_through_json() {
     assert_eq!(decoded, config);
 }
 
-// ③ Normalization fills missing entries, keeps the first duplicate, repairs a
-// settings value of the wrong shape and clamps out-of-range periods item by item.
 #[test]
 fn normalize_should_fill_reorder_dedupe_and_clamp() {
     let config = CandlestickIndicatorConfig {
@@ -251,8 +235,6 @@ fn normalize_should_fill_reorder_dedupe_and_clamp() {
         "a missing entry takes the catalogue's enabled state"
     );
 
-    // The first MA wins, so its clamped period is 1 rather than the dropped
-    // duplicate's 7.
     let ma = entry_of(&normalized, IndicatorId::Ma);
     assert!(ma.enabled);
     assert_eq!(periods(&ma.settings), [1]);
@@ -279,7 +261,6 @@ fn normalize_should_fill_reorder_dedupe_and_clamp() {
     }
 }
 
-// ④ An empty line list is repaired with one row from the indicator's defaults.
 #[test]
 fn an_empty_line_list_should_be_repaired_with_one_default_row() {
     let empty = || IndicatorSettings::Lines(LineListConfig { rows: Vec::new() });
@@ -316,8 +297,6 @@ fn an_empty_line_list_should_be_repaired_with_one_default_row() {
     assert_eq!(repaired.rows[0].color, default_line_color(0));
 }
 
-// ⑤ A payload from before the indicator field existed does not decode: the
-// field has no `serde(default)`, so it cannot be silently filled in (D8).
 #[test]
 fn a_payload_without_the_indicator_field_should_fail_to_decode() {
     let payload = r#"{"selection":null,"timeframe":"1m","adjustment":"none"}"#;
@@ -331,8 +310,6 @@ fn a_payload_without_the_indicator_field_should_fail_to_decode() {
     );
 }
 
-// ⑥ `normalize` really runs through `deserialize_with`: a payload with one
-// entry decodes into a completed, ordered configuration.
 #[test]
 fn decoding_a_configuration_should_normalize_the_indicator_field() {
     let payload = r#"{
@@ -385,8 +362,6 @@ fn decoding_a_configuration_should_normalize_the_indicator_field() {
     );
 }
 
-// ⑦ `warmup_depth` follows the design's §7.2 table per indicator, and the
-// configuration answers with the longest requirement among enabled ones.
 #[test]
 fn every_indicator_should_report_the_warmup_depth_of_its_formula() {
     let cases: [(IndicatorSettings, IndicatorId, usize); 7] = [
@@ -407,8 +382,6 @@ fn every_indicator_should_report_the_warmup_depth_of_its_formula() {
             25,
         ),
         (
-            // The longer average decides, whichever side it is on: a formula
-            // that assumed `long` were always the longer one would answer 9.
             IndicatorSettings::Macd {
                 short_period: 30,
                 long_period: 10,
@@ -446,8 +419,6 @@ fn every_indicator_should_report_the_warmup_depth_of_its_formula() {
         );
     }
 
-    // The default configuration enables MA (19) and VOL (0), so it reports 19;
-    // an indicator that is switched off does not contribute.
     assert_eq!(CandlestickIndicatorConfig::default().warmup_depth(), 19);
 
     let mut only_kdj = CandlestickIndicatorConfig::default();
@@ -457,10 +428,6 @@ fn every_indicator_should_report_the_warmup_depth_of_its_formula() {
     assert_eq!(only_kdj.warmup_depth(), 12);
 }
 
-// The sub plots come from the configuration, not from the computed series:
-// VOL is enabled by default but has no computed values, so a count derived from
-// the series would draw one sub plot too few. Catalogue order is the stacking
-// order.
 #[test]
 fn enabled_sub_plot_ids_should_follow_catalogue_order() {
     assert_eq!(
@@ -491,16 +458,12 @@ fn enabled_sub_plot_ids_should_keep_the_catalogue_order_when_several_are_on() {
         "VOL comes before MACD and MACD before RSI because the catalogue does"
     );
 
-    // A main-chart indicator is never a sub plot, even when it is the only one
-    // enabled.
     let mut only_ma = CandlestickIndicatorConfig::default();
     for entry in &mut only_ma.entries {
         entry.enabled = entry.id == IndicatorId::Ma;
     }
     assert!(enabled_sub_plot_ids(&only_ma).is_empty());
 
-    // Turning the default VOL off must leave no empty box behind: MACD becomes
-    // the first sub plot.
     let mut without_volume = CandlestickIndicatorConfig::default();
     for entry in &mut without_volume.entries {
         entry.enabled = entry.id == IndicatorId::Macd;
@@ -529,8 +492,6 @@ fn adding_a_line_should_take_the_next_palette_colour() {
     let palette = synthetic_palette();
     let mut config = CandlestickIndicatorConfig::default();
 
-    // MA starts with three rows and EMA with one; the next colour is the row
-    // count modulo the palette length.
     assert!(config.add_line(IndicatorId::Ma, &palette));
     assert!(config.add_line(IndicatorId::Ema, &palette));
     assert!(config.add_line(IndicatorId::Ma, &palette));
@@ -821,12 +782,6 @@ fn line_colour_conversions_should_preserve_alpha() {
     );
 }
 
-/// A colour of another colour space is stored as the sRGB the engine paints.
-///
-/// The chart-series palette a new line takes its colour from is spelled in Oklch,
-/// while a stored line is HSL over sRGB. The conversion therefore has to resolve
-/// the colour and encode it back — reading the Oklch numbers as if they were sRGB
-/// would store a different colour than the pane beside the chart draws.
 #[test]
 fn a_wide_gamut_colour_should_be_stored_as_the_srgb_the_engine_paints() {
     let stored = LineColor::from(Color::oklch(0.62, 0.14, 62.0, 1.0));

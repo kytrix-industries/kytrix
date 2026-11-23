@@ -31,7 +31,6 @@ use crate::{
     },
 };
 
-/// One catalog row a route publishes, as a caller reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketListing {
     pub listing: VenueListingKey,
@@ -53,21 +52,14 @@ impl MarketCapability {
         &self.inner.gateway
     }
 
-    /// Returns the one routing view every call is admitted against.
     pub(crate) fn venues(&self) -> &crate::venue::loaded::LoadedVenues {
         &self.inner.venues
     }
 
-    /// Returns the shared catalogue this capability resolves listings from.
     pub fn catalog(&self) -> &Catalog {
         self.inner.catalog()
     }
 
-    /// Resolves one listing inside the generation the catalog is serving now.
-    ///
-    /// The resolution is the only way a request learns what its listing is: the
-    /// rules that validate a quantity, the status that gates a command and the
-    /// typed identifiers an adapter encodes with all come from this one value.
     pub fn resolve_listing(
         &self,
         listing: &VenueListingKey,
@@ -77,7 +69,6 @@ impl MarketCapability {
             .map_err(market_error_from_catalog)
     }
 
-    /// Resolves one listing of a route, rejecting a listing of another route.
     pub(crate) fn resolve_listing_of_route(
         &self,
         route: &VenueRoute,
@@ -87,14 +78,6 @@ impl MarketCapability {
         self.resolve_listing(listing)
     }
 
-    /// Asserts that one route's catalog is already published, and answers the
-    /// proof that it is present.
-    ///
-    /// The proof is what a per-message path needs: a stream resolves listing keys
-    /// against the published snapshot without ever awaiting a fetch. Nothing here
-    /// reaches the venue: a route no load has fetched is
-    /// [`MarketError::Catalog`] carrying
-    /// [`CatalogError::CatalogNotLoaded`].
     pub fn ensure(&self, route: &VenueRoute) -> Result<EnsuredRoute, MarketError> {
         self.catalog()
             .ensure(route)
@@ -102,15 +85,6 @@ impl MarketCapability {
         Ok(EnsuredRoute::new(self.inner.catalog_arc(), route.clone()))
     }
 
-    /// Returns the venue-specific bounds of one route.
-    ///
-    /// The bounds belong to the adapter that speaks the venue's wire, and the route
-    /// they are looked up for is admitted by the one routing view: the loaded venues.
-    /// A market nobody loaded is not a market this build does not serve — the two are
-    /// the two answers — so an unloaded scope is refused as exactly that and a
-    /// loaded scope whose entry lacks the capability is the one refusal this build's
-    /// own scope set makes. Neither answer costs a request: both are decided against
-    /// the loaded venues before anything is encoded.
     pub(crate) fn limits(
         &self,
         route: &VenueRoute,
@@ -122,28 +96,11 @@ impl MarketCapability {
             .map_err(MarketError::from)
     }
 
-    /// The candlestick intervals one route publishes.
-    ///
-    /// The intervals are the venue's own answer for the route, read through the route's
-    /// `Candlesticks` descriptor, so a caller validates an interval it persisted against
-    /// what this build can actually ask for rather than against the intervals the model can
-    /// express. A market nobody loaded is answered as not loaded — a caller waits for
-    /// it — while a loaded route whose entry does not declare candlesticks is answered with
-    /// the refusal that proves the interval cannot be asked for at all.
     pub fn supported_timeframes(&self, route: &VenueRoute) -> Result<Vec<TimeFrame>, MarketError> {
         self.limits(route, CapabilityId::Candlesticks)
             .map(|limits| limits.timeframes)
     }
 
-    /// The price-adjustment conventions one route publishes.
-    ///
-    /// The conventions are the venue's own answer for the route, read through the
-    /// route's `Candlesticks` descriptor, so a caller validates a convention it
-    /// persisted against what this build can actually ask for rather than against
-    /// what the model can express. A market nobody loaded is answered as not
-    /// loaded — a caller waits for it — while a loaded route whose entry does not
-    /// declare candlesticks is answered with the refusal that proves no convention
-    /// can be asked for at all.
     pub fn supported_adjustments(
         &self,
         route: &VenueRoute,
@@ -152,11 +109,6 @@ impl MarketCapability {
             .map(|limits| limits.adjustments)
     }
 
-    /// The deepest book one route publishes per side.
-    ///
-    /// The depth is the venue's own bound for the route: a book deeper than this is
-    /// not something the venue hands over, and a caller that draws the book uses it
-    /// to offer only the rows the book can fill.
     pub fn order_book_depth(&self, route: &VenueRoute) -> Result<u16, MarketError> {
         self.limits(route, CapabilityId::OrderBook)
             .map(|limits| limits.order_book_depth_limit)
@@ -166,11 +118,6 @@ impl MarketCapability {
         MarketSelector::new(self.clone(), route)
     }
 
-    /// Reads one page of prediction events of one venue.
-    ///
-    /// The facade resolves every loaded scope that declares prediction events,
-    /// so a Hyperliquid venue's deployer scopes are merged into one page and a
-    /// Polymarket scope's server cursor is passed through.
     pub fn prediction_events(
         &self,
         request: super::prediction::PredictionEventsRequest,
@@ -178,7 +125,6 @@ impl MarketCapability {
         super::prediction::PredictionEventsBuilder::new(self.clone(), request)
     }
 
-    /// Reads one prediction event and every leg it publishes.
     pub fn prediction_event(
         &self,
         event: market_participants_model::prediction::PredictionEventRef,
@@ -186,7 +132,6 @@ impl MarketCapability {
         super::prediction::PredictionEventBuilder::new(self.clone(), event)
     }
 
-    /// Reads the probability series of one prediction event.
     pub fn prediction_series(
         &self,
         event: market_participants_model::prediction::PredictionEventRef,
@@ -196,13 +141,6 @@ impl MarketCapability {
         super::prediction::PredictionSeriesBuilder::new(self.clone(), event, legs, range)
     }
 
-    /// Returns every listing of one route the published catalog holds.
-    ///
-    /// The read is answered from the published snapshot alone, so a route nothing
-    /// has loaded is [`MarketError::Catalog`] carrying
-    /// [`CatalogError::CatalogNotLoaded`] rather than an empty list:
-    /// "this market has no instruments" and "this market was never loaded" are
-    /// two different answers, and only the first is an empty list.
     pub fn listings(&self, route: &VenueRoute) -> Result<Vec<MarketListing>, MarketError> {
         self.ensure(route)?;
         let entries = self.catalog().cached_listings(route).ok_or_else(|| {
@@ -227,8 +165,6 @@ impl MarketCapability {
         query: ForceOrderSubscriptionQuery,
     ) -> Result<ForceOrderStream, MarketError> {
         let route = query.route.clone();
-        // The query's own validation is a typed model refusal, so it keeps the
-        // typed error rather than being flattened into a sentence about a request.
         query.validate().map_err(MarketError::from)?;
         let ensured = self.ensure(&route)?;
         let handle = subscribe(
@@ -240,13 +176,6 @@ impl MarketCapability {
         Ok(ForceOrderStream::from_handle(handle, ensured))
     }
 
-    /// Subscribes to the liquidation stream of one route.
-    ///
-    /// A liquidation subscription is route-scoped and carries no listing: which
-    /// listings a route liquidates is what the events themselves say, and the
-    /// stream resolves each of them against the published catalog. This is the
-    /// entry a caller outside this crate uses, because the request type it builds
-    /// the subscription from is this crate's own protocol boundary.
     pub async fn subscribe_force_order_on(
         &self,
         route: VenueRoute,
@@ -255,11 +184,6 @@ impl MarketCapability {
             .await
     }
 
-    /// Subscribes to the live probabilities of one prediction event's legs.
-    ///
-    /// The stream is event-scoped rather than listing-scoped: a prediction leg's
-    /// venue-native identity is discovered with the event and is not a catalog
-    /// listing, so the request carries the legs themselves.
     pub async fn subscribe_prediction_series(
         &self,
         event: PredictionEventRef,
@@ -278,12 +202,6 @@ impl MarketCapability {
         Ok(PredictionSeriesStream::from_handle(handle))
     }
 
-    /// Reads the order book of one prediction leg.
-    ///
-    /// Every leg of the leg's market travels with the request as well as the leg
-    /// itself, so a book and the probability series of the same market subscribe
-    /// with one payload and share one market-channel topic. The snapshot is one
-    /// request: a caller draws the live stream on top of it.
     pub async fn fetch_prediction_order_book(
         &self,
         event: PredictionEventRef,
@@ -299,12 +217,6 @@ impl MarketCapability {
         }
     }
 
-    /// Subscribes to the live order book of one prediction leg.
-    ///
-    /// The subscription is event-scoped like a probability series: a prediction
-    /// leg's venue-native identity is discovered with the event rather than
-    /// catalogued, and the whole market's legs travel with the request so both
-    /// subscriptions acquire the same connection topic.
     pub async fn subscribe_prediction_order_book(
         &self,
         event: PredictionEventRef,

@@ -1,14 +1,3 @@
-//! E25 / P6-1：`automation` feature 的引擎级用例。
-//!
-//! `automation` 是**生产可见**的注入 / 观测面（kytrix 的 `--acceptance` 真实窗口自检要它），
-//! 所以这里不依赖 `test-support`：断言面全部是公开 API（`App::frame` / `Window::frame_index` /
-//! `Window::scene`）+ 本 feature 自己的四个读点。
-//!
-//! 钉住的契约（spec-delta E25）：
-//! - 注入走与平台泵**同一条** `dispatch_input`（命中 / 动作 / 回执语义一致）；
-//! - 三个读取面**不请求帧**（I3），未知窗口读作空 / `None`；
-//! - `painted_primitives` 是场景图元数（最近一帧画了什么），`texts` 是树序文本载荷。
-
 use std::{cell::Cell, rc::Rc};
 
 use super::App;
@@ -50,8 +39,6 @@ fn background() -> PaintSpec {
     }
 }
 
-/// Injected input takes the platform path: the hit test, the action dispatch and the
-/// receipt are the ones a real pointer produces.
 #[test]
 fn injected_input_should_take_the_platform_path() {
     let (_runtime, mut app, window) = setup();
@@ -115,8 +102,6 @@ fn injected_input_should_take_the_platform_path() {
     assert_eq!(calls.get(), 1, "the handler ran exactly once");
 }
 
-/// Injection is the only write: the three read points answer from state the engine already
-/// has, and none of them asks for a frame (I3).
 #[test]
 fn reading_the_automation_surface_should_not_request_frames() {
     let (_runtime, mut app, window) = setup();
@@ -140,7 +125,6 @@ fn reading_the_automation_surface_should_not_request_frames() {
     let _ = primitives;
 }
 
-/// The frame cursor is the window's committed cursor, and a second commit advances it.
 #[test]
 fn the_frame_cursor_should_be_the_committed_one() {
     let (_runtime, mut app, window) = setup();
@@ -159,8 +143,6 @@ fn the_frame_cursor_should_be_the_committed_one() {
     );
 }
 
-/// The painted-primitive count is the scene's primitive count: empty before anything is
-/// painted, positive after a painted node commits.
 #[test]
 fn the_painted_primitive_count_should_follow_the_scene() {
     let (_runtime, mut app, window) = setup();
@@ -184,8 +166,6 @@ fn the_painted_primitive_count_should_follow_the_scene() {
     assert_eq!(painted, scene, "the read is the scene's count");
 }
 
-/// The text read is the tree's payloads in tree order — what the frame draws, not what the
-/// application asked for.
 #[test]
 fn the_text_read_should_report_the_tree_in_order() {
     let (_runtime, mut app, window) = setup();
@@ -205,8 +185,6 @@ fn the_text_read_should_report_the_tree_in_order() {
     );
 }
 
-/// A closed window has no cursor, no scene and no texts; an injection sent to it is a no-op
-/// receipt instead of a panic or a stale write.
 #[test]
 fn an_unknown_window_should_read_as_empty_and_ignore_injection() {
     let (_runtime, mut app, window) = setup();
@@ -224,7 +202,6 @@ fn an_unknown_window_should_read_as_empty_and_ignore_injection() {
     assert_eq!(outcome, crate::event::InputOutcome::default());
 }
 
-/// One text node at the root, for the tests that only need a non-empty tree.
 fn root_text(app: &mut App, window: WindowId, text: &'static str) {
     let root = app.window(window).expect("window").tree().root();
     NodeBuilder::text(text, crate::text::TextStyle::new(12.0))

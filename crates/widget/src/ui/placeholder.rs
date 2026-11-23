@@ -1,43 +1,3 @@
-//! What a widget body shows while it has nothing of its own to render.
-//!
-//! A placeholder replaces the body, never accompanies it: either the widget has
-//! content and draws it, or it does not and this stands in its place. Anything the
-//! user must read while content *is* on screen belongs to a banner instead.
-//!
-//! The three stand-ins are built from the shared component library:
-//!
-//! | situation | components |
-//! |---|---|
-//! | busy (`Connecting`, `Loading`, `Ready`) | [`kit::spinner`](base_ui::kit::spinner), labelled with the name of the work |
-//! | waiting (a plain [`Notice`]) | the notice's sentence in a muted [`kit::empty_state`](base_ui::kit::empty_state) |
-//! | waiting (a rich [`Notice`]) | the notice's markdown through [`kit::markdown`](base_ui::kit::markdown) |
-//! | failed ([`Failure`]) | the failure's detail plus a [`kit::button`](base_ui::kit::button) that runs the recovery |
-//!
-//! A waiting notice is a **catalogue reference**, and the catalogue authors some of
-//! those values as rich text: `common.market_not_loaded` is an aligned paragraph
-//! with a `<kbd>` icon and one markdown line per venue (see [`crate::venue`]), and
-//! several widgets' own notices (`widget.news.logged_out`, say) are `<p …>`
-//! paragraphs as well. Drawing their source as plain text would put
-//! `<p align="center">…` and `![](file://…)` in front of the user, so a notice
-//! whose resolved value carries markup goes through the engine's markdown component
-//! — which is the same component the rest of the interface reads catalogue markdown
-//! with. [`Notice::is_markdown`] answers that question in the language showing now;
-//! a plain notice stays a sentence, drawn by the empty state.
-//!
-//! This lives with the framework rather than with the shared component library
-//! because it is not a general-purpose component: it exists to be a widget body's
-//! stand-in, and only the framework decides when one is shown.
-//!
-//! # Ownership
-//!
-//! A [`Placeholder`] owns the stateful components it built (a spinner, a recovery
-//! button, a markdown node), so the surface can drive their `sync`, forward events
-//! their way, and release them when the state moves on. The nodes themselves are
-//! removed by the surface through [`App::remove_node`]: the nodes are removed first,
-//! then the components' scopes and action handlers are released — the engine's
-//! documented teardown order (E16; the same order
-//! [`App::remove_node_with_scope`](ui_core::app::App::remove_node_with_scope) uses).
-
 use std::{borrow::Cow, sync::Arc};
 
 use base_ui::{
@@ -65,19 +25,9 @@ use crate::{
     status::{Failure, Notice},
 };
 
-/// The size the stand-in's own text is drawn at.
 const PLACEHOLDER_TEXT_SIZE: f32 = 13.0;
-/// The spinner size: visible without competing with the pane's content.
 const SPINNER_SIZE: f32 = 18.0;
 
-/// The embedded product assets, as the markdown parser's image-size seam.
-///
-/// The parser only needs the file header of an inline image, and only when the source
-/// writes no explicit `?size=`. `common.market_not_loaded` writes a size for every
-/// brand logo; the `<kbd>` icon is an SVG the engine has no rasterized asset for, so
-/// it resolves to the parser's default size. Nothing here decodes pixels: the static
-/// image payload is a marker box (the resource pipeline for rich-text images belongs
-/// to the asset batch, not to the widget contract).
 struct EmbeddedAssets;
 
 impl MarkdownAssets for EmbeddedAssets {
@@ -86,9 +36,6 @@ impl MarkdownAssets for EmbeddedAssets {
     }
 }
 
-/// The components one placeholder is built from.
-///
-/// The nodes are already in the tree; this is what the surface keeps to drive them.
 #[derive(Default)]
 pub struct Placeholder {
     spinner: Option<Spinner>,
@@ -97,10 +44,6 @@ pub struct Placeholder {
 }
 
 impl Placeholder {
-    /// Builds the busy stand-in under `parent`.
-    ///
-    /// `label` names the work in progress, drawn under the spinner; `None` draws the
-    /// spinner alone, which is what a widget that is ready with nothing to say shows.
     pub fn busy(
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
@@ -134,13 +77,6 @@ impl Placeholder {
         })
     }
 
-    /// Builds a widget's own notice under `parent`.
-    ///
-    /// A plain notice is one sentence: the catalogue holds it as text, and it is
-    /// resolved in the language showing now. A rich notice ([`Notice::is_markdown`])
-    /// is authored as markdown/HTML and is drawn by the engine's markdown component;
-    /// its sentence is resolved here too, because the surface rebuilds the
-    /// stand-in when the notice or the language moves.
     pub fn notice(
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
@@ -169,8 +105,6 @@ impl Placeholder {
         Ok(Self::default())
     }
 
-    /// Builds a failure under `parent`: its detail exactly as the error states it,
-    /// plus the recovery control the failure offers.
     pub fn failure(
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
@@ -186,13 +120,6 @@ impl Placeholder {
         })
     }
 
-    /// Frame-driven synchronization of the stateful components.
-    ///
-    /// Called only while the placeholder is on screen: a hidden spinner must not keep
-    /// an animation alive, so the surface releases the placeholder instead of hiding
-    /// it. The markdown node is static payload baked for an appearance; its `sync`
-    /// rebuilds the subtree when the appearance moved (the one dynamic channel a
-    /// per-run coloured document has).
     pub fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         if let Some(spinner) = &self.spinner {
             spinner.sync(app)?;
@@ -206,15 +133,12 @@ impl Placeholder {
         Ok(())
     }
 
-    /// Forwards one platform event to the controls the placeholder built.
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         self.button
             .as_ref()
             .is_some_and(|button| button.dispatch(app, event))
     }
 
-    /// Releases the components' scopes and action handlers. Returns the number of
-    /// signal values released.
     pub fn release(&self, app: &mut App) -> usize {
         let spinner = self
             .spinner
@@ -226,12 +150,6 @@ impl Placeholder {
     }
 }
 
-/// Builds a failure's detail under `parent`.
-///
-/// The text is a live binding: the closure reads the language signal and then
-/// renders through the translator, so moving the language redraws the sentence
-/// without the surface rebuilding anything. This is the pattern every widget's own
-/// language-dependent text follows.
 pub(crate) fn failure_text(
     cx: &mut WidgetCx<'_>,
     parent: NodeId,
@@ -254,10 +172,6 @@ pub(crate) fn failure_text(
         .build(cx.tree_mut(), parent)
 }
 
-/// Builds a failure's recovery control under `parent`.
-///
-/// A control that does not accept input is given no click handler at all: `disabled`
-/// only draws that state, it does not stop a click.
 pub(crate) fn recovery_button(
     cx: &mut WidgetCx<'_>,
     parent: NodeId,
@@ -285,23 +199,18 @@ pub(crate) fn recovery_button(
     Ok(Some(button))
 }
 
-/// A per-parent spinner key: a spinner's debug identity, unique inside the tree.
 fn spinner_key(parent: NodeId) -> SmolStr {
     format_smolstr!("widget.placeholder.spinner.{}", parent.to_bits())
 }
 
-/// A per-parent notice key, for the same reason.
 fn notice_key(parent: NodeId) -> SmolStr {
     format_smolstr!("widget.placeholder.notice.{}", parent.to_bits())
 }
 
-/// A per-parent recovery-button key. The engine's action identity is
-/// `"{key}.click"`, so this must be unique across the whole application.
 fn button_key(parent: NodeId) -> SmolStr {
     format_smolstr!("widget.placeholder.action.{}", parent.to_bits())
 }
 
-/// The name of the work in progress, in the language showing now.
 pub(crate) fn busy_label(translate: &Translate, connecting: bool) -> SmolStr {
     if connecting {
         t_smol!(translate, "common.connecting")
@@ -352,9 +261,6 @@ mod tests {
         );
     }
 
-    /// The catalogue also authors a widget's own messages as rich text; the
-    /// decision comes from the resolved value, so such a message is drawn by the
-    /// markdown component and its source markup never reaches the user.
     #[test]
     fn a_rich_message_notice_goes_through_the_markdown_component() {
         let mut harness = WidgetTestApp::new();

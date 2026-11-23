@@ -1,11 +1,3 @@
-//! The fake source the service's and the pane's tests answer through.
-//!
-//! It is shared rather than copied because both halves of the widget test the same
-//! seam: the loop's tests drive the answers it gives, and the pane's tests count the
-//! fetches it was asked for. A source that runs out of plans never answers again, so
-//! a test that expects an absence can tell "the fetch never happened" from "the
-//! answer went somewhere else" by the count.
-
 use std::{
     collections::VecDeque,
     future::pending,
@@ -24,27 +16,18 @@ use crate::{
     service::{CoinMarketCapFearAndGreedIndexFetchError, CoinMarketCapFearAndGreedIndexSource},
 };
 
-/// The account every fixture pane is scoped to.
 pub(crate) const ACCOUNT: &str = "test-account";
 
-/// The collection time every non-empty fixture was collected at.
 pub(crate) const COLLECTED_AT: i64 = 1_790_000_000_000;
 
-/// How the fake answers one fetch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FetchPlan {
-    /// Answers with a complete snapshot of this current value.
     Snapshot(u8),
-    /// Answers with a service failure.
     Failure,
-    /// Never answers, so the fetch stays in flight.
     Pending,
-    /// Waits until the test releases it, so a test can look at what the pane does
-    /// while a fetch is still in flight, then answer it with this value.
     Held(u8),
 }
 
-/// One point of a fixture snapshot.
 pub(crate) fn row(date: &str, score: u8) -> CoinMarketCapFearAndGreedIndexRow {
     CoinMarketCapFearAndGreedIndexRow {
         date: SmolStr::new(date),
@@ -52,7 +35,6 @@ pub(crate) fn row(date: &str, score: u8) -> CoinMarketCapFearAndGreedIndexRow {
     }
 }
 
-/// A complete snapshot of one current value.
 pub(crate) fn snapshot(current: u8) -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
     Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
         current,
@@ -66,7 +48,6 @@ pub(crate) fn snapshot(current: u8) -> Arc<CoinMarketCapFearAndGreedIndexSnapsho
     })
 }
 
-/// The answer the service gives before its collector has run.
 pub(crate) fn empty_snapshot() -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
     Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
         current: 0,
@@ -90,7 +71,6 @@ struct FakeSourceState {
     calls: AtomicUsize,
     in_flight: AtomicUsize,
     cancelled_fetches: AtomicUsize,
-    /// Wakes the fetch a [`FetchPlan::Held`] left waiting.
     release: Notify,
 }
 
@@ -107,15 +87,10 @@ impl FakeSource {
         }
     }
 
-    /// Answers the fetch a [`FetchPlan::Held`] left waiting.
-    ///
-    /// The wake-up is kept even if the fetch has not started waiting yet, so a test
-    /// that releases as soon as the fetch is counted cannot lose the answer.
     pub(crate) fn release(&self) {
         self.state.release.notify_one();
     }
 
-    /// Takes the next plan, counting the fetch as started.
     fn begin(&self) -> (FetchPlan, FetchGuard) {
         let plan = self
             .state
@@ -136,17 +111,14 @@ impl FakeSource {
         )
     }
 
-    /// How many fetches were started.
     pub(crate) fn fetch_count(&self) -> usize {
         self.state.calls.load(Ordering::Acquire)
     }
 
-    /// How many fetches have not answered yet.
     pub(crate) fn in_flight(&self) -> usize {
         self.state.in_flight.load(Ordering::Acquire)
     }
 
-    /// How many fetches were dropped before they answered.
     pub(crate) fn cancelled_fetches(&self) -> usize {
         self.state.cancelled_fetches.load(Ordering::Acquire)
     }
@@ -176,7 +148,6 @@ impl CoinMarketCapFearAndGreedIndexSource for FakeSource {
     }
 }
 
-/// Counts the fetch it belongs to as in flight until it answers or is dropped.
 struct FetchGuard {
     state: Arc<FakeSourceState>,
     completed: bool,

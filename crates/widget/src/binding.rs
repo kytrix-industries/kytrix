@@ -1,37 +1,3 @@
-//! The one executor bridge: background services in, widget state out.
-//!
-//! A widget's protocol is driven on the tokio runtime the composition root injected;
-//! its results have to reach the interface thread. The toolkit this replaces bridged that
-//! with `Context::spawn` + `Context::notify` and an entity update per message. The
-//! engine has neither: its spawn takes `Send` futures and its only way back is
-//! [`AppHandle::send`](ui_core::app::AppHandle::send), which requires a `Send`
-//! closure. The widget's services are `!Send` (`Translate`, `ThemeHandle`), so the
-//! bridge cannot call a widget handler from a background task at all — and calling
-//! one was only ever a way to mutate the view, which in the engine is signal state.
-//!
-//! So the bridge delivers **messages**, not calls:
-//!
-//! 1. [`WidgetBinding::spawn`] starts the widget's service on the injected runtime
-//!    and forwards its reliable stream, its latest-value stream and its RPC replies
-//!    into a [`WidgetInbox`];
-//! 2. each delivery requests a frame on the interface thread (the wake the old
-//!    `context.notify()` performed);
-//! 3. the widget drains the inbox in [`WidgetView::sync`](crate::view::WidgetView::sync)
-//!    — where it has a [`WidgetCx`] again — and applies the messages to its own
-//!    signals.
-//!
-//! That inversion is what makes the bridge `Send`: the inbox is an
-//! `Arc<Mutex<VecDeque<…>>>` of protocol messages (every associated type of
-//! [`WidgetProtocol`] is `Send + 'static`), and the wake closure captures only the
-//! application handle and the window id.
-//!
-//! # The tokio side does not move
-//!
-//! [`WidgetRuntime`], [`RpcClient`], the stream supervisors and their tests are
-//! untouched by the migration: this module changes only how their output reaches the
-//! interface. Task lifetimes are the binding's job — aborting is explicit on
-//! [`WidgetBinding::cancel`] and on drop, because a bare `JoinHandle` drop detaches.
-
 use std::{
     collections::VecDeque,
     fmt,
@@ -49,23 +15,18 @@ use crate::{
     runtime::{RuntimeExit, WidgetRuntime, WidgetRuntimeConfig, WidgetService},
 };
 
-/// One RPC outcome, as the widget receives it.
 pub type WidgetRpcResult<P> =
     Result<<P as WidgetProtocol>::Response, RpcCallError<<P as WidgetProtocol>::Error>>;
 
-/// One message a binding delivered from its service to the widget, in arrival order.
 pub enum Inbound<P: WidgetProtocol> {
-    /// A message of the reliable stream: delivered once, in order.
     Reliable {
         key: <P as WidgetProtocol>::StreamKey,
         message: Arc<<P as WidgetProtocol>::StreamMessage>,
     },
-    /// The newest value for a keyed latest-value stream.
     Latest {
         key: <P as WidgetProtocol>::StreamKey,
         message: Arc<<P as WidgetProtocol>::StreamMessage>,
     },
-    /// The reply to one RPC call the widget issued.
     Rpc {
         request_id: RequestId,
         result: WidgetRpcResult<P>,
@@ -85,11 +46,6 @@ impl<P: WidgetProtocol> fmt::Debug for Inbound<P> {
     }
 }
 
-/// The messages one widget binding delivered and the widget has not consumed yet.
-///
-/// It is `Clone` (it is an `Arc`), so the background tasks and the widget hold the
-/// same queue. Draining is the only operation that removes messages; the widget
-/// drains it in `sync`.
 pub struct WidgetInbox<P: WidgetProtocol> {
     messages: Arc<Mutex<VecDeque<Inbound<P>>>>,
 }
@@ -109,7 +65,6 @@ impl<P: WidgetProtocol> Default for WidgetInbox<P> {
 }
 
 impl<P: WidgetProtocol> WidgetInbox<P> {
-    /// Creates an empty inbox. A binding creates one; a widget never does.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -117,7 +72,6 @@ impl<P: WidgetProtocol> WidgetInbox<P> {
         }
     }
 
-    /// Takes every message delivered so far, in arrival order.
     #[must_use]
     pub fn drain(&self) -> Vec<Inbound<P>> {
         let mut messages = self
@@ -127,7 +81,6 @@ impl<P: WidgetProtocol> WidgetInbox<P> {
         messages.drain(..).collect()
     }
 
-    /// Whether nothing is waiting.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.messages
@@ -136,7 +89,6 @@ impl<P: WidgetProtocol> WidgetInbox<P> {
             .is_empty()
     }
 
-    /// How many messages are waiting.
     #[must_use]
     pub fn len(&self) -> usize {
         self.messages
@@ -162,27 +114,12 @@ impl<P: WidgetProtocol> fmt::Debug for WidgetInbox<P> {
     }
 }
 
-/// The RPC commands one binding has in flight, keyed by the identity
-/// [`WidgetBinding::call`] returned.
-///
-/// A binding replaces — and aborts — the call before it when the widget issues another
-/// call on the same binding, so only the newest command can still be answered:
-/// [`Pending::track`] forgets every older entry. A widget takes the entry a reply
-/// belongs to ([`Pending::take`]); a reply whose identity is not there is a late answer
-/// to a call the widget has already replaced. It is **dropped and counted** rather than
-/// applied to whichever command happens to be pending, which is what stops a replaced
-/// command's failure from being swallowed and a late reply from steering the pane's
-/// state.
-///
-/// One table belongs to one binding: the replacement rule above is the binding's
-/// (a widget with two bindings keeps two tables).
 pub struct Pending<C> {
     commands: ahash::HashMap<RequestId, C>,
     dropped: usize,
 }
 
 impl<C> Pending<C> {
-    /// Creates an empty table.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -191,19 +128,11 @@ impl<C> Pending<C> {
         }
     }
 
-    /// Records `command` as the answer `request_id` will carry.
-    ///
-    /// The binding aborted the call before it, so an entry that is still here answers a
-    /// call that can no longer reply: tracking the replacing command forgets it.
     pub fn track(&mut self, request_id: RequestId, command: C) {
         self.commands.clear();
         self.commands.insert(request_id, command);
     }
 
-    /// Takes the command `request_id` answers.
-    ///
-    /// `None` means the reply answers no call this widget is waiting for (it is late,
-    /// already answered, or never was this binding's): it is dropped and counted.
     pub fn take(&mut self, request_id: RequestId) -> Option<C> {
         match self.commands.remove(&request_id) {
             Some(command) => Some(command),
@@ -214,23 +143,16 @@ impl<C> Pending<C> {
         }
     }
 
-    /// How many replies this table has dropped as late or unknown.
     #[must_use]
     pub const fn dropped(&self) -> usize {
         self.dropped
     }
 
-    /// Whether a call is waiting for its answer.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
 
-    /// Forgets the command in flight without counting a drop.
-    ///
-    /// A widget calls this when it abandons the command for a reason of its own (it
-    /// signed out, failed, or left the market it was reading): the reply will still
-    /// arrive, and then [`Pending::take`] counts it as the late answer it is.
     pub fn clear(&mut self) {
         self.commands.clear();
     }
@@ -252,11 +174,6 @@ impl<C> fmt::Debug for Pending<C> {
     }
 }
 
-/// The widget-side owner of one service and the tasks forwarding its messages.
-///
-/// Concrete widgets define their protocol, service and business handlers; the
-/// binding owns executor bridging, stream generation filtering, cancellation, and
-/// task lifetimes, and the widget owns the inbox consumption in `sync`.
 pub struct WidgetBinding<P: WidgetProtocol> {
     runtime: Option<WidgetRuntime<P>>,
     inbox: WidgetInbox<P>,
@@ -266,12 +183,10 @@ pub struct WidgetBinding<P: WidgetProtocol> {
 }
 
 impl<P: WidgetProtocol> WidgetBinding<P> {
-    /// Starts one widget service with the default runtime configuration.
     pub fn spawn<S: WidgetService<P>>(cx: &mut WidgetCx<'_>, service: S) -> Self {
         Self::spawn_with_config(cx, service, WidgetRuntimeConfig::default())
     }
 
-    /// Starts one widget service with an explicit runtime configuration.
     pub fn spawn_with_config<S: WidgetService<P>>(
         cx: &mut WidgetCx<'_>,
         service: S,
@@ -324,19 +239,16 @@ impl<P: WidgetProtocol> WidgetBinding<P> {
         }
     }
 
-    /// The queue the widget drains in its `sync`.
     #[must_use]
     pub fn inbox(&self) -> &WidgetInbox<P> {
         &self.inbox
     }
 
-    /// Takes every message delivered so far.
     #[must_use]
     pub fn take(&self) -> Vec<Inbound<P>> {
         self.inbox.drain()
     }
 
-    /// The runtime's RPC client, for a caller that drives its own call loop.
     #[must_use]
     pub fn client(&self) -> crate::rpc::RpcClient<P> {
         self.runtime
@@ -345,14 +257,6 @@ impl<P: WidgetProtocol> WidgetBinding<P> {
             .client()
     }
 
-    /// Starts one RPC call, replacing (and aborting) the previous one.
-    ///
-    /// Returns the framework request identity the reply will carry: the reply arrives
-    /// in the inbox as [`Inbound::Rpc`] with that identity, so a widget that has to
-    /// attribute answers — two commands sharing one binding, or a command replaced in
-    /// the same frame — matches them exactly instead of guessing from a pending flag.
-    /// [`Pending`] is that table; a reply whose identity is not in it is a late answer
-    /// to a call that was replaced and must be dropped.
     pub fn call(&mut self, cx: &mut WidgetCx<'_>, request: P::Request) -> RequestId {
         if let Some(task) = self.rpc_task.take() {
             task.abort();
@@ -380,7 +284,6 @@ impl<P: WidgetProtocol> WidgetBinding<P> {
         request_id
     }
 
-    /// Stops the service and aborts the forwarding tasks.
     pub fn cancel(&mut self) {
         self.abort_tasks();
         if let Some(runtime) = self.runtime.as_ref() {
@@ -388,7 +291,6 @@ impl<P: WidgetProtocol> WidgetBinding<P> {
         }
     }
 
-    /// Stops the service and waits for it to finish.
     pub async fn shutdown(mut self) -> RuntimeExit {
         self.abort_tasks();
         let Some(runtime) = self.runtime.take() else {
@@ -427,11 +329,6 @@ impl<P: WidgetProtocol> fmt::Debug for WidgetBinding<P> {
     }
 }
 
-/// Asks the interface thread for the frame that will drain the inbox.
-///
-/// The old bridge called `context.notify()`; the engine's equivalent is a repaint
-/// request on the widget's window. It is made from the application handle because the
-/// caller is a background task.
 fn request_frame(handle: &AppHandle, window: WindowId) {
     handle.send(move |app| {
         if let Err(error) = app.request_repaint(window) {
@@ -477,7 +374,6 @@ mod tests {
         type Error = Infallible;
     }
 
-    /// Answers every RPC with the value it was given.
     struct EchoService;
 
     impl WidgetService<TestProtocol> for EchoService {
@@ -489,7 +385,6 @@ mod tests {
         }
     }
 
-    /// Never answers and never ends.
     struct PendingService;
 
     impl WidgetService<TestProtocol> for PendingService {
@@ -498,13 +393,6 @@ mod tests {
         }
     }
 
-    /// Collects two RPC requests, then answers both — and records whether the answer
-    /// had a live receiver on the widget side.
-    ///
-    /// The first request is answered only after the second one arrived, so the test
-    /// controls when the call the binding already replaced gets its reply: with the
-    /// abort in place its receiver is gone and `respond` fails, without it the reply
-    /// reaches the inbox.
     struct RecordingService {
         received: Arc<AtomicUsize>,
         answered: Arc<Mutex<Vec<bool>>>,
@@ -533,7 +421,6 @@ mod tests {
         }
     }
 
-    /// A headless engine app, the services aggregate, and a runtime owned by the test.
     struct Fixture {
         app: App,
         runtime: tokio::runtime::Runtime,
@@ -582,13 +469,11 @@ mod tests {
             }
         }
 
-        /// Runs `body` with a context over the fixture and drops the borrow.
         fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R {
             let mut cx = WidgetCx::new(&mut self.app, self.window, &self.services, self.scope);
             body(&mut cx)
         }
 
-        /// Waits until the binding delivered one message, then takes everything.
         fn wait_for_one(
             &self,
             binding: &WidgetBinding<TestProtocol>,
@@ -604,7 +489,6 @@ mod tests {
             panic!("the binding delivered nothing within two seconds");
         }
 
-        /// Spins until `condition` holds (the runtime's worker threads drive it).
         fn wait_until(&self, condition: impl Fn() -> bool, what: &str) {
             for _ in 0..2_000 {
                 if condition() {
@@ -617,7 +501,6 @@ mod tests {
         }
     }
 
-    /// The queue itself: empty, ordered, and draining only what arrived.
     #[test]
     fn the_inbox_starts_empty_and_drains_once() {
         let inbox: WidgetInbox<TestProtocol> = WidgetInbox::new();
@@ -627,8 +510,6 @@ mod tests {
         assert!(inbox.drain().is_empty());
     }
 
-    /// The bridge's whole purpose: an RPC's reply reaches the widget's inbox, under the
-    /// identity the call returned before the request was sent.
     #[test]
     fn a_call_returns_the_identity_its_reply_carries() {
         let mut fixture = Fixture::new();
@@ -649,12 +530,6 @@ mod tests {
         assert_eq!(result.ok(), Some(42));
     }
 
-    /// Replacing a call aborts the previous one: the widget cannot be handed two
-    /// replies for one command slot, and the replaced future really is dropped.
-    ///
-    /// The service answers the replaced request *after* the replacement happened, so
-    /// the two behaviours are distinguishable: with the abort the reply has no
-    /// receiver and never reaches the inbox; without it both replies arrive.
     #[test]
     fn replacing_a_call_cancels_the_previous_one() {
         let mut fixture = Fixture::new();
@@ -715,7 +590,6 @@ mod tests {
         );
     }
 
-    /// A cancelled binding stops its service and delivers nothing more.
     #[test]
     fn cancel_stops_the_service() {
         let mut fixture = Fixture::new();
@@ -731,9 +605,6 @@ mod tests {
         );
     }
 
-    /// The table answers exactly one question: is this reply the one the widget waits
-    /// for? A tracked identity is taken once; everything else is a late answer, and it
-    /// is dropped and counted rather than handed to the command now in flight.
     #[test]
     fn a_pending_table_matches_identities_and_counts_late_answers() {
         let mut pending = Pending::new();
@@ -756,9 +627,6 @@ mod tests {
         assert_eq!(pending.dropped(), 2);
     }
 
-    /// A binding aborts the call it replaces, so tracking the replacing command makes
-    /// the replaced one's identity unknown: its reply, if one was already queued, is a
-    /// late answer — never the replacing command's.
     #[test]
     fn tracking_a_replacement_makes_the_replaced_identity_unknown() {
         let mut pending = Pending::new();
@@ -775,8 +643,6 @@ mod tests {
         assert_eq!(pending.dropped(), 1);
     }
 
-    /// A widget that abandons its command (it signed out, say) forgets it without
-    /// counting anything: the answer, when it arrives, is the late reply it then is.
     #[test]
     fn clearing_abandons_the_command_without_counting_it() {
         let mut pending = Pending::new();

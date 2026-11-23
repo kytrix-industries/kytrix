@@ -1,24 +1,3 @@
-//! 上下文菜单（P2-4c：旧 `crate::context_menu` 的引擎化重建）。
-//!
-//! 旧实现是「窗口级单例菜单」：`Layer` 拥有它，全屏透明 backdrop 吃掉菜单外的按下，面板由
-//! `Positioner::corner(anchor, position)` 按锚点角摆放，点击条目 / 外部 / `dismiss` 关闭，关闭时
-//! 调一次 `on_close`。新引擎已具备这些原语，本模块把语义映射过来：
-//!
-//! | 旧语义 | 新落点 |
-//! |---|---|
-//! | 全屏 backdrop 吃按下 | 引擎浮层 `OverlayDismiss::OutsideClick`（整次按下被消费） |
-//! | `Positioner::corner` | [`Anchor::point`] + [`Placement::BOTTOM_START`]（菜单左上角在点上）/ [`Placement::TOP_START`]（左下角在点上） |
-//! | `Layer` 拥有 + 至多一个 | [`Layer::close_top_of`]：打开前关掉同层带（[`Band::ContextMenu`]）里的旧菜单 |
-//! | 点击条目先关再上报 | 激活回调里 `close_now`，再调 `on_item_click` |
-//! | `on_close` 每次关闭一次 | [`Menu::on_close`] 的同一事件（点击外部 / Esc / 选中都算） |
-//! | 视口边距 4 px | 浮层 `margin = 4`（`resolve_origin` 的 clamp） |
-//!
-//! 菜单本身（条目 / 分组 / 分隔线 / 快捷键 / 子菜单 / 危险项 / 键盘导航 / a11y）由
-//! [`crate::kit::menu::Menu`] 提供；本模块只负责「右键坐标 → 浮层锚点」与「窗口级单例 / 关闭」。
-//!
-//! 旧实现每帧重建条目（`MenuBuilder`），新实现要求调用方在 [`ContextMenu::open`] 之前把条目
-//! 准备好（[`ContextMenu::set_entries`] / 构造时给）；打开后菜单内容固定。
-
 use std::{cell::RefCell, fmt, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
@@ -31,13 +10,10 @@ use crate::kit::{
     size::UnifiedSize,
 };
 
-/// 菜单的哪个角落落在右键点上（旧锚点类型）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MenuAnchor {
-    /// 菜单左上角在点上（菜单向右下展开；旧的默认）。
     #[default]
     TopLeft,
-    /// 菜单左下角在点上（菜单向右上展开；旧的行底边菜单）。
     BottomLeft,
 }
 
@@ -50,18 +26,12 @@ impl MenuAnchor {
     }
 }
 
-/// 上下文菜单参数。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContextMenuOptions {
-    /// 尺寸档。
     pub size: UnifiedSize,
-    /// 面板宽度（旧构造函数的 `width` 参数）。
     pub width: f32,
-    /// 面板最大高度（超出滚动）。
     pub max_height: f32,
-    /// 哪个角落落在右键点上。
     pub anchor: MenuAnchor,
-    /// 菜单可访问名。
     pub label: Option<SmolStr>,
 }
 
@@ -78,28 +48,24 @@ impl Default for ContextMenuOptions {
 }
 
 impl ContextMenuOptions {
-    /// 面板宽度。
     #[must_use]
     pub fn width(mut self, width: f32) -> Self {
         self.width = width;
         self
     }
 
-    /// 面板最大高度。
     #[must_use]
     pub fn max_height(mut self, max_height: f32) -> Self {
         self.max_height = max_height;
         self
     }
 
-    /// 锚点角。
     #[must_use]
     pub fn anchor(mut self, anchor: MenuAnchor) -> Self {
         self.anchor = anchor;
         self
     }
 
-    /// 菜单可访问名。
     #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
@@ -107,7 +73,6 @@ impl ContextMenuOptions {
     }
 }
 
-/// 上下文菜单句柄（`Rc` 浅拷贝）。
 #[derive(Clone)]
 pub struct ContextMenu {
     inner: Rc<ContextMenuInner>,
@@ -122,7 +87,6 @@ struct ContextMenuInner {
 }
 
 impl ContextMenu {
-    /// 建上下文菜单（关闭态）。
     pub fn new(
         app: &mut App,
         theme: crate::theme::handle::ThemeHandle,
@@ -154,34 +118,26 @@ impl ContextMenu {
         context_menu
     }
 
-    /// 菜单键（调试 id / 动作前缀）。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 
-    /// 是否打开。
     #[must_use]
     pub fn is_open(&self, app: &App) -> bool {
         self.inner.menu.borrow().is_open(app)
     }
 
-    /// 菜单面板节点（打开时）。
     #[must_use]
     pub fn panel_node(&self) -> Option<NodeId> {
         self.inner.menu.borrow().panel_node()
     }
 
-    /// 高亮行。
     #[must_use]
     pub fn highlighted(&self, app: &App) -> Option<usize> {
         self.inner.menu.borrow().highlighted(app)
     }
 
-    /// 换一批条目（菜单关闭时也可以先设好，`open` 时生效）。
-    ///
-    /// # Errors
-    /// 引擎虚拟列表失效。
     pub fn set_entries(
         &self,
         app: &mut App,
@@ -190,18 +146,11 @@ impl ContextMenu {
         self.inner.menu.borrow().set_entries(app, entries)
     }
 
-    /// 条目快照。
     #[must_use]
     pub fn entries(&self) -> Rc<Vec<MenuEntry>> {
         self.inner.menu.borrow().entries()
     }
 
-    /// 在 `point`（窗口逻辑坐标）处打开菜单。
-    ///
-    /// 同层带里已有的上下文菜单会被关掉（旧 `Layer` 的「至多一个」语义）。
-    ///
-    /// # Errors
-    /// 浮层参数 / 引擎建树错误。
     pub fn open(
         &self,
         app: &mut App,
@@ -216,10 +165,6 @@ impl ContextMenu {
             .open(app, window, Anchor::point(point))
     }
 
-    /// 打开菜单并把高亮停到指定条目 id（右键命中的那一项）。
-    ///
-    /// # Errors
-    /// 同 [`ContextMenu::open`]。
     pub fn open_at(
         &self,
         app: &mut App,
@@ -235,45 +180,33 @@ impl ContextMenu {
             .open_at(app, window, Anchor::point(point), highlighted)
     }
 
-    /// 关闭菜单（先关子菜单）。
     pub fn close(&self, app: &mut App) -> bool {
         self.inner.menu.borrow().close(app)
     }
 
-    /// 立即关闭菜单。
     pub fn close_now(&self, app: &mut App) -> bool {
         self.inner.menu.borrow().close_now(app)
     }
 
-    /// 条目点击回调（菜单先关闭，再上报 id —— 旧 `on_item_click` 的语义）。
     pub fn on_item_click(self, callback: impl Fn(&mut App, SmolStr) + 'static) -> Self {
         *self.inner.on_item_click.borrow_mut() = Some(Rc::new(callback));
         self
     }
 
-    /// 关闭回调（点击外部 / Esc / 选中条目都算；每次打开最多一次）。
     pub fn on_close(self, callback: impl Fn(&mut App) + 'static) -> Self {
         let menu = self.inner.menu.borrow().clone().on_close(callback);
         *self.inner.menu.borrow_mut() = menu;
         self
     }
 
-    /// 帧同步（浮层 / 子菜单 / 悬停）。
-    ///
-    /// # Errors
-    /// 引擎列表同步错误。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         self.inner.menu.borrow().sync(app)
     }
 
-    /// 释放组件（菜单 / 子菜单 / 信号作用域）。
     pub fn release(&self, app: &mut App) -> usize {
         self.inner.menu.borrow().release(app)
     }
 
-    // ── 内部 ──
-
-    /// 菜单激活 ⇒ 先关菜单再上报。
     fn install_handlers(&self) {
         let weak = Rc::downgrade(&self.inner);
         let menu = self
@@ -293,12 +226,6 @@ impl ContextMenu {
         *self.inner.menu.borrow_mut() = menu;
     }
 
-    /// 关掉同层带里别的上下文菜单（旧 `Layer` 的单例语义）；自己的根若已是最上层则保留，
-    /// 自己的子菜单（同带的嵌套层）先关掉。
-    ///
-    /// 归属比较用**引擎浮层包装节点**（`Layer::Entry::node`）而不是 kit 面板节点：
-    /// 两者是不同的 `NodeId`，用面板节点会把自己的根也关掉、然后在 `open` 里重建（审查 F26
-    /// 顺带修正）。
     fn close_peers(&self, app: &mut App, window: WindowId) {
         let own = self.inner.menu.borrow().overlay_node();
         while let Some(top) = self.inner.layer.top_of(window, Band::ContextMenu) {
@@ -316,7 +243,6 @@ impl ContextMenu {
     }
 }
 
-/// 上下文菜单的菜单参数（层带恒为 `ContextMenu`，角色恒为 `Menu`）。
 fn menu_options(options: &ContextMenuOptions) -> MenuOptions {
     MenuOptions {
         size: options.size,
@@ -342,7 +268,6 @@ impl fmt::Debug for ContextMenu {
 
 #[cfg(test)]
 mod tests {
-    //! 引擎树上的行为：锚点角 / 视口 clamp / 单例 / 关闭语义 / 条目上报顺序 / a11y。
 
     use std::{
         cell::{Cell, RefCell},
@@ -514,7 +439,6 @@ mod tests {
             )
         }
 
-        /// 把指针移到 `at`，再推进帧（悬停开子菜单的定时器在 `sync` 里触发）。
         fn hover(&mut self, menu: &ContextMenu, at: Point) {
             let _ = self
                 .app
@@ -522,7 +446,6 @@ mod tests {
             self.settle(menu);
         }
 
-        /// root 的子节点（每个浮层一个包装节点，登记序 = z 序）。
         fn root_children(&self) -> Vec<NodeId> {
             let tree = self.app.app().window(self.window).expect("窗口").tree();
             tree.get(tree.root()).expect("root").children().to_vec()
@@ -623,7 +546,6 @@ mod tests {
         assert!(!menu.is_open(harness.app.app()));
         assert_eq!(harness.closes.get(), 1);
 
-        // 调用方主动关闭（旧 `a_menu_should_close_when_its_caller_asks`）。
         harness.open(&menu, Point::new(300.0, 200.0));
         assert!(menu.close_now(harness.app.app_mut()));
         harness.settle(&menu);
@@ -649,9 +571,6 @@ mod tests {
 
     #[test]
     fn reopening_closes_the_previous_submenu() {
-        // 审查 F26：`close_peers` 必须在**自身重开**时关掉旧子菜单（同带嵌套层）。只测
-        // 「第二个菜单替换第一个」不够 —— 那条由 `Layer::Exclusive` 槽位兜底，`close_peers`
-        // 改 no-op 后仍然绿。
         let mut harness = Harness::new();
         let menu = harness.menu_with(entries_with_submenu(), options());
         harness.open(&menu, Point::new(300.0, 200.0));
@@ -718,10 +637,6 @@ mod tests {
         assert_eq!(menu.highlighted(harness.app.app()), Some(1));
     }
 
-    /// a11y 角色 / 标签由 [`crate::kit::menu`] 的 `ItemPanel` 声明（E12 之后落在引擎浮层包装
-    /// 节点上），本模块只把 `ContextMenuOptions::label` 透传过去 —— 这里断言透传结果。
-    /// 全树 oracle 在本组合下会与增量分叉（引擎 a11y 的焦点脏位问题，见 spec-delta 残余），
-    /// 所以这里不做全树断言。
     #[test]
     fn the_options_label_reaches_the_menu_panel() {
         let mut harness = Harness::new();
@@ -750,7 +665,6 @@ mod tests {
         );
     }
 
-    /// 含子菜单的条目（审查 P1-1：context menu 的子菜单必须继承 `ContextMenu` 层带）。
     fn entries_with_submenu() -> Vec<MenuEntry> {
         vec![
             MenuEntry::Action(MenuAction::new("copy", "复制")),
@@ -761,7 +675,6 @@ mod tests {
         ]
     }
 
-    /// 背景页面：一个可滚动容器（内容 3 屏高）。
     fn scroll_page(harness: &mut Harness) -> ui_core::interaction::ScrollHandle {
         let root = harness
             .app
@@ -803,7 +716,6 @@ mod tests {
         handle
     }
 
-    /// 在 `at` 处滚一格并推进到平滑滚动结束。
     fn wheel(harness: &mut Harness, menu: &ContextMenu, at: Point) {
         let _ = harness.app.inject(InputEvent::scroll_lines(
             at,
@@ -870,7 +782,6 @@ mod tests {
             "子菜单在父面板之后排序（z 序在上）：root {root_index:?} / submenu {submenu_index:?}"
         );
 
-        // `Layer` 顶部仍在 `ContextMenu` 带（子菜单继承父带，而不是降到 `Popup`）。
         let top = harness
             .layer
             .top_of(harness.window, Band::ContextMenu)
@@ -892,7 +803,6 @@ mod tests {
         }
         assert!(top_is_submenu, "层带顶部是子菜单面板（而非父菜单）");
 
-        // 第一次 Esc 只关子菜单，父菜单仍在；第二次 Esc 才关父。
         harness.key(&menu, KeyCode::Escape);
         assert!(menu.is_open(harness.app.app()), "Esc 先关子菜单");
         assert!(
@@ -913,15 +823,12 @@ mod tests {
         let menu = harness.menu(options());
         harness.open(&menu, Point::new(300.0, 200.0));
 
-        // 面板外滚轮：模态作用域消费，页面不滚（旧全屏 backdrop 的语义）。
         wheel(&mut harness, &menu, Point::new(700.0, 500.0));
         assert_eq!(page_offset(&harness, &page), 0.0, "面板外滚轮不滚页面");
-        // 面板上滚轮：滚动链只到浮层内，页面同样不滚。
         let on_panel = harness.row_center(0);
         wheel(&mut harness, &menu, on_panel);
         assert_eq!(page_offset(&harness, &page), 0.0, "面板上滚轮不滚页面");
 
-        // 对照：关掉菜单后同一位置的滚轮真的能滚页面（证明容器有效）。
         harness.key(&menu, KeyCode::Escape);
         wheel(&mut harness, &menu, Point::new(700.0, 500.0));
         assert!(

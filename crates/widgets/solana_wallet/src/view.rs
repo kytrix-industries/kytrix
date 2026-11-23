@@ -1,50 +1,3 @@
-//! The Solana wallet monitor pane: the transfers it follows, and the addresses it manages.
-//!
-//! # What a pane is scoped to
-//!
-//! One account. The account is the pane's scope and the stream key at once, so the pane
-//! never has to decide whether a transfer belongs to the account on screen: a message
-//! published for an account the pane has left is a message the binding does not deliver,
-//! and one that arrives by hand is refused by comparing the key.
-//!
-//! # The pane owns the addresses, the service owns the session
-//!
-//! Following transfers and managing the addresses they are watched for are two things the
-//! same account is asked for, and the same service answers both with the same session. So
-//! the pane is what waits for both, and the dialog it opens is a view of the pane's state
-//! rather than an owner of its own: a dialog that held the list would lose it on the next
-//! open, and one that took a session of its own would hold a second one for an account the
-//! pane is already reading as.
-//!
-//! # What a change the pane stopped waiting for means
-//!
-//! A request the pane stops waiting for — because the user retried, or because the account
-//! changed under it — is dropped rather than decided: whether the service made the change
-//! is not something the pane can know, and it does not guess. What settles it is the next
-//! read, which is why a dialog that is open reads the addresses again as soon as the stream
-//! that answers reads is live. The commands in flight are tracked by the framework's
-//! [`RequestId`](widget::protocol::RequestId) (AGENTS §8.2), so a reply to a command the
-//! binding replaced is dropped rather than applied to the one that replaced it.
-//!
-//! # Why the list reads a signal rather than holding rows
-//!
-//! The body is built once, and a kit list row's content closure has no [`App`] to read
-//! current data with. The rows therefore read the feed through a signal: every row's text
-//! is a `bind_text` closure over the snapshot signal, the display-zone setting signal and
-//! the language signal, and the list itself only holds the row count and where the reader
-//! is. A newer snapshot is reported to the list as the transfers it has not been shown
-//! rather than as a new set of rows: a list rebuilt from scratch would re-measure every row
-//! on screen and, worse, move a reader who had scrolled into the feed back to the top.
-//!
-//! # What this pane does not have
-//!
-//! The interface this crate was written for has no balance cards, no table and no controls
-//! that copy an address or open a block explorer, so none are migrated here: `open_url`
-//! stays unused by this widget. Addresses are drawn by the row's own text node, with the
-//! engine's ellipsis overflow — there is no grapheme-aware truncation helper on the frozen
-//! contract (`widget::util` carries polling arithmetic only), which the W8a ledger
-//! registers as the current state.
-
 use std::sync::Arc;
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
@@ -100,30 +53,16 @@ use super::{
     },
 };
 
-/// The height a transfer row is estimated at until the list has measured one.
-///
-/// A row is four short lines (the amount, the time and two address lines), and the old
-/// interface kept 150 px either side of the viewport; at this estimate that is two rows
-/// (AGENTS §15.3: overscan is a row count, not a pixel buffer).
 const ROW_ESTIMATE: f32 = 68.0;
 
-/// How many rows the list mounts either side of the viewport.
 const ROW_OVERSCAN: usize = 2;
 
-/// The width of the "from"/"to" label column of a transfer row.
 const ADDRESS_LABEL_WIDTH: f32 = 32.0;
 
-/// The size a transfer's amount and address text are drawn at.
 const TRANSFER_TEXT_SIZE: UnifiedSize = UnifiedSize::Medium;
 
-/// The size a transfer's time is drawn at.
 const TRANSFER_TIME_SIZE: UnifiedSize = UnifiedSize::Small;
 
-/// A Solana wallet monitor carries no options.
-///
-/// What a pane follows is the account's own list of monitored addresses, which is read from
-/// the service rather than configured here, so there is nothing to persist but the schema
-/// version.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SolanaWalletConfig;
 
@@ -131,7 +70,6 @@ impl WidgetConfig for SolanaWalletConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// A failure a pane reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SolanaWalletFailure {
     Stream(SolanaWalletStreamError),
@@ -147,77 +85,47 @@ impl TranslatedError for SolanaWalletFailure {
     }
 }
 
-/// One command the pane sent and has not seen the answer to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingCommand {
-    /// A read of the stream: `Load` or `Retry`.
     Start,
-    /// The stop that lets go of the stream an account left behind.
     Stop,
-    /// A read of the monitored addresses.
     Read,
-    /// Monitoring one more address.
     Add,
-    /// Leaving one address.
     Delete,
 }
 
-/// What the dialog is doing, or waiting for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SelectionOperation {
-    /// The addresses are being read for a dialog that has none to show.
     Loading,
-    /// The addresses are being read for a dialog that is already showing some.
     Refreshing,
-    /// An address is being monitored.
     Adding,
-    /// An address is being left.
     Deleting,
 }
 
 impl SelectionOperation {
-    /// Whether this operation is a read rather than a change.
     pub(super) const fn is_read(self) -> bool {
         matches!(self, Self::Loading | Self::Refreshing)
     }
 }
 
-/// The change the pane is waiting for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SelectionPending {
     operation: SelectionOperation,
-    /// The address a change was asked about, which is what its confirmation is checked
-    /// against and what a removal is projected from.
     address: Option<SmolStr>,
-    /// Whether the request is out.
-    ///
-    /// A read asked for before the stream is live is held here instead: there is no session
-    /// behind the account yet, and the readiness that arrives later is what makes the read
-    /// possible.
     sent: bool,
 }
 
-/// What the dialog says about the last change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SelectionNotice {
-    /// The address is now monitored.
     Added,
-    /// Why the last change did not happen, or did not happen for certain.
     Problem(SelectionFailure),
 }
 
-/// Why a change to the monitored addresses did not happen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SelectionFailure {
-    /// The service refused the change.
     Rejected(SolanaWalletApiError),
-    /// The change may or may not have been made, which is what the service answers when it
-    /// could not tell.
     Unknown(SolanaWalletMutationUnknown),
-    /// The confirmed change is not one the list the pane holds can describe, which means the
-    /// list and the account have gone out of step.
     Inconsistent(SolanaWalletDataError),
-    /// The call itself failed.
     Rpc(RpcCallError<SolanaWalletApiError>),
 }
 
@@ -232,67 +140,35 @@ impl TranslatedError for SelectionFailure {
     }
 }
 
-/// How far the pane has got in reading the addresses it follows.
-///
-/// The addresses are a pane's scope rather than a list it happens to show, so not knowing
-/// them is not the same as knowing there are none — and the three states are told apart
-/// because they read differently to a user.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum SelectionRead {
-    /// Nothing has answered yet: the pane does not know what it follows.
     #[default]
     NotRead,
-    /// The list arrived, and it is what the pane follows.
     Known,
-    /// The read failed, and this is why. A read that failed is not a list with nothing in it.
     Failed(RpcCallError<SolanaWalletApiError>),
 }
 
-/// One pane: the transfers it holds, and the addresses it manages.
 pub struct SolanaWalletWidget {
-    /// The executor bridge, absent on a host that installed no Kytrix service.
     binding: Option<WidgetBinding<SolanaWalletProtocol>>,
-    /// The commands in flight, keyed by the identity the binding returned.
     pending: Pending<PendingCommand>,
     status: WidgetStatus,
     recovery: WidgetAction,
-    /// The account the pane reads for, which is its whole scope.
     account_id: Option<SmolStr>,
-    /// The transfers the pane is showing, once a subscription has published them.
     snapshot: Option<TransferSnapshot>,
-    /// Whether the subscription has reported itself live.
     ready: bool,
-    /// The feed the rows read. Rows have no `App` of their own, so the state they draw is a
-    /// signal watched by their `bind_*` closures.
     items: Signal<TransferSnapshot>,
-    /// The list that draws the feed, built by [`WidgetView::body`] where its parent is known.
     list: Option<List>,
-    /// The root of the body this pane built, so teardown can take its own subtree down
-    /// before releasing the list component.
     body_root: Option<NodeId>,
-    /// The stand-in a feed with nothing in it draws.
     empty: Option<NodeId>,
-    /// The copy the stand-in draws, rewritten when the language moves.
     empty_text: Signal<SmolStr>,
-    /// The addresses the account monitors, as the service last answered them.
     selections: Option<SelectionData>,
-    /// What the dialog is waiting for, if anything.
     selection_pending: Option<SelectionPending>,
-    /// What the dialog says about the last change.
     notice: Option<SelectionNotice>,
-    /// How far the read of the addresses has got.
     selection_read: SelectionRead,
-    /// The open dialog, which is the pane's only way of managing addresses.
     dialog: Option<SolanaWalletDialog>,
-    /// The header control that opens the dialog, kept so it can be released.
     manage_button: Option<Button>,
-    /// The header group the control lives in, so a language change can rebuild it in place.
     manage_parent: Option<NodeId>,
-    /// The language the control was built in: a language switch rebuilds it because a kit
-    /// button's label is chosen when it is built.
     manage_language: Option<LanguageCode>,
-    /// Click requests from the header control: a button handler owns no `&mut self`, so it
-    /// asks the next `sync` to open the dialog instead of opening it.
     manage_requests: Signal<u64>,
     seen_manage_requests: u64,
 }
@@ -327,13 +203,6 @@ impl WidgetView for SolanaWalletWidget {
         }
     }
 
-    /// A pane is content once a subscription has published transfers for it.
-    ///
-    /// An empty feed is content: an account whose addresses have not moved yet is still the
-    /// account the pane is about, and the pane says so itself with the empty state its body
-    /// draws. An account with no addresses at all is the different thing — a pane with
-    /// nothing to follow rather than one that is quiet — so that is answered here as no
-    /// content, which leaves the slot to the framework's placeholder and its own sentence.
     fn has_content(&self) -> bool {
         self.account_has_addresses() && self.snapshot.is_some()
     }
@@ -384,10 +253,6 @@ impl WidgetView for SolanaWalletWidget {
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        // The settings are the pane's scope: signing in as someone else is another feed,
-        // and signing out is no feed at all. A settings write reaches this hook on the
-        // frame it schedules, and the comparison is what makes it a reload only when the
-        // account really moved.
         let account = cx.account();
         if account != self.account_id {
             self.account_id = account;
@@ -427,11 +292,6 @@ impl WidgetView for SolanaWalletWidget {
         }
         self.sync_empty_state(cx)?;
 
-        // The body is built by the framework from the answer `has_content` gives, and it
-        // asks that question before this hook runs: content that first appeared here is
-        // one frame away, so ask for that frame. A pane that has no content asks for
-        // nothing — an account with no addresses never builds a body, so asking again
-        // would keep the pane repainting itself every frame it waits for one (I3).
         if self.has_content() && self.body_root.is_none() {
             cx.request_frame()?;
         }
@@ -439,7 +299,6 @@ impl WidgetView for SolanaWalletWidget {
         Ok(())
     }
 
-    /// The control that opens the address dialog.
     fn header(
         &mut self,
         group: HeaderGroup,
@@ -454,17 +313,11 @@ impl WidgetView for SolanaWalletWidget {
     }
 
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
-        // Dropping the bridge aborts its forwarding tasks and cancels the service.
         self.binding = None;
-        // The header's nodes belong to the pane, which removes its row: only the
-        // component's signal scope and action handler are this widget's to release.
         let _ = self.release_manage_button(cx, false);
         if let Some(mut dialog) = self.dialog.take() {
             dialog.release(cx);
         }
-        // The list documents its own teardown order: its nodes first, then the component.
-        // The body subtree is the widget's, not the framework's shell, so removing it here
-        // is the widget cleaning up after itself.
         if let Some(root) = self.body_root.take() {
             let window = cx.window();
             let _ = cx.app_mut().remove_node(window, root);
@@ -478,11 +331,6 @@ impl WidgetView for SolanaWalletWidget {
 }
 
 impl SolanaWalletWidget {
-    /// The seam the framework and the tests build a pane through.
-    ///
-    /// The pane has no opinion about where its wallet comes from, so the source is an
-    /// argument: the production constructor answers it with the injected Kytrix service
-    /// connection, and a test with a fake session.
     fn assemble<S: SolanaWalletSource>(
         source: Option<S>,
         status: WidgetStatus,
@@ -522,7 +370,6 @@ impl SolanaWalletWidget {
         }
     }
 
-    /// A pane over a source the caller answers, for the crate's own tests.
     #[cfg(test)]
     fn new_with_source<S: SolanaWalletSource>(
         source: S,
@@ -533,23 +380,14 @@ impl SolanaWalletWidget {
         Self::assemble(Some(source), status, recovery, cx)
     }
 
-    /// The scope this pane follows, which is the account it reads as.
     fn current_scope(&self) -> Option<SolanaWalletScope> {
         SolanaWalletScope::new(self.account_id.as_ref())
     }
 
-    /// Starts reading, or restarts for a pane the user is recovering.
-    ///
-    /// A recovery keeps the transfers the user is still reading — blanking a feed to
-    /// reconnect would flash it away, and the addresses are read again once the stream this
-    /// pane is recovering is live — while an account change starts over, because the pane
-    /// cannot vouch for what it was showing.
     fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(scope) = self.current_scope() else {
             self.clear(cx)?;
             self.report_no_content_notice(cx);
-            // Nothing is followed, so nothing should stay subscribed on this pane's behalf:
-            // an account that signed out must not keep a seat it is not using.
             self.call(cx, SolanaWalletRequest::Stop, PendingCommand::Stop);
             cx.request_frame()?;
             return Ok(());
@@ -558,10 +396,6 @@ impl SolanaWalletWidget {
         if !retry {
             self.clear(cx)?;
         }
-        // Starting a stream replaces whatever the binding was awaiting, so a change that
-        // was in flight is dropped rather than remembered: whether it was made is not
-        // something this pane knows, and what settles it is the read that follows the
-        // stream coming back.
         self.selection_pending = None;
         self.status.report(cx.app_mut(), WidgetState::Connecting);
         if self.binding.is_none() {
@@ -582,11 +416,6 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// Sends one command through the binding, tracking the identity it was given.
-    ///
-    /// The binding holds one command at a time: a new call replaces the previous one and
-    /// aborts it, so the command it replaced is forgotten here (its reply is then an
-    /// unknown identity and is dropped, AGENTS §8.2).
     fn call(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -600,11 +429,6 @@ impl SolanaWalletWidget {
         self.pending.track(request_id, command);
     }
 
-    /// Drops what a pane is leaving behind.
-    ///
-    /// A change the pane was waiting for goes with it: the request replaces whatever the
-    /// binding was awaiting, so its answer is never seen and nothing about it is remembered —
-    /// the account's addresses are read again instead.
     fn clear(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         self.snapshot = None;
         self.ready = false;
@@ -621,12 +445,6 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// Reports what a pane with nothing to follow waits for.
-    ///
-    /// This is the only place the pane's two waiting references are produced: the paths that
-    /// enter either state call it rather than holding a copy of their own. What each one says
-    /// is a reference into the catalogue, resolved by the framework on the frame that draws
-    /// it, in the language showing then.
     fn report_no_content_notice(&self, cx: &mut WidgetCx<'_>) {
         let notice = if self.current_scope().is_none() {
             Notice::message("widget.solana_wallet.logged_out")
@@ -639,7 +457,6 @@ impl SolanaWalletWidget {
             .report(cx.app_mut(), WidgetState::waiting(notice));
     }
 
-    /// Applies one RPC reply, once its identity says it answers the command in flight.
     fn apply_rpc(
         &mut self,
         request_id: RequestId,
@@ -648,8 +465,6 @@ impl SolanaWalletWidget {
     ) {
         match self.pending.take(request_id) {
             Some(PendingCommand::Start) => self.apply_load_result(result, cx),
-            // The stop lets go of a stream the pane already left; what the service says
-            // about it is nothing the pane reports.
             Some(PendingCommand::Stop) => {}
             Some(PendingCommand::Read) => self.apply_selections_result(result, cx),
             Some(PendingCommand::Add) => self.apply_add_result(result, cx),
@@ -665,18 +480,11 @@ impl SolanaWalletWidget {
         result: WidgetRpcResult<SolanaWalletProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
-        // A failure is terminal (AGENTS §4.4): the read's answer may not repaint the
-        // failure the user is reading, and it is not the reason the pane failed.
         if self.status.is_failed(cx.app()) {
             return;
         }
-        // The answer says the service took the account; what the subscription then reports
-        // about itself arrives on the stream, which is where a failure to subscribe is drawn
-        // from.
         if let Err(error) = result {
             self.ready = false;
-            // A read the dialog is waiting for is answered by the account being taken, so it
-            // does not outlive the failure of the request that would have taken it.
             self.selection_pending = None;
             let recovery = self.recovery.clone();
             self.status.report(
@@ -686,10 +494,6 @@ impl SolanaWalletWidget {
         }
     }
 
-    /// Applies the transfers a subscription published.
-    ///
-    /// Returns whether what a frame draws changed, which for a feed is always: the service
-    /// publishes it when a transfer moved it.
     fn apply_latest(
         &mut self,
         key: SolanaWalletScope,
@@ -716,28 +520,10 @@ impl SolanaWalletWidget {
         true
     }
 
-    /// Whether a message may still publish a status.
-    ///
-    /// A read that failed is terminal until the user recovers it, and the status cell does not
-    /// know that yet while the failure is only recorded here — so a feed that arrives in that
-    /// window must not be allowed to report a pane that looks like it is working.
     fn may_report(&self) -> bool {
         !matches!(self.selection_read, SelectionRead::Failed(_))
     }
 
-    /// Reports what the pane is showing.
-    ///
-    /// The account's addresses are the scope of everything here, so a pane whose account
-    /// monitors none has nothing to follow and says so rather than drawing the empty feed of
-    /// an account that is merely quiet.
-    ///
-    /// Until the list has been read the pane is loading, whatever the feed holds: the service
-    /// publishes an empty feed before it publishes anything else, so a pane that reported what
-    /// it had here would spend the read showing the blank list of an account that may well turn
-    /// out to follow nothing at all.
-    ///
-    /// A read that *failed* is not that window. It is a failure, and it is reported as one with
-    /// the framework's own recovery rather than left looking like a pane that is still working.
     fn report(&mut self, cx: &mut WidgetCx<'_>) {
         match self.selection_read.clone() {
             SelectionRead::NotRead => {
@@ -762,12 +548,6 @@ impl SolanaWalletWidget {
         }
     }
 
-    /// Whether the account is one with addresses to follow.
-    ///
-    /// Only a list that answered *and held nothing* says no: a list nobody has asked for and one
-    /// whose read failed both leave the pane without an answer, and neither of them is a list
-    /// that holds nothing. Answering otherwise here would take the body away from a pane that
-    /// has simply not been told yet.
     fn account_has_addresses(&self) -> bool {
         !self
             .selections
@@ -775,11 +555,6 @@ impl SolanaWalletWidget {
             .is_some_and(|data| data.selections().is_empty())
     }
 
-    /// Applies a status the stream reported.
-    ///
-    /// Returns whether what a frame draws changed, which a status never does on its own: the
-    /// framework draws the state around the body, and a row of transfers says nothing about
-    /// the subscription it arrived on.
     fn apply_reliable(
         &mut self,
         key: SolanaWalletScope,
@@ -799,18 +574,10 @@ impl SolanaWalletWidget {
         match status {
             SolanaWalletStatus::Connecting => {
                 self.ready = false;
-                // The transfers already read stay: a reconnecting feed is not a reason to
-                // blank what a reader was looking at.
                 self.status.report(cx.app_mut(), WidgetState::Connecting);
             }
             SolanaWalletStatus::Ready => {
                 self.ready = true;
-                // What a pane shows is only as true as the read it came from, and a change
-                // the pane stopped waiting for was never read back. The stream coming up is
-                // what makes reading the addresses possible again, so it is what reads them
-                // — and the pane reads them once whether or not the dialog is open, because
-                // an account with no addresses is a pane with nothing to follow rather than
-                // a feed that has been quiet.
                 if self.selection_pending.is_some() {
                     self.send_pending_selections(cx);
                 } else if self.selections.is_none() || self.dialog.is_some() {
@@ -820,8 +587,6 @@ impl SolanaWalletWidget {
             }
             SolanaWalletStatus::Failed(error) => {
                 self.ready = false;
-                // A read that never went out has nothing left to wait for: the stream it was
-                // waiting for failed, and the dialog says so rather than spinning.
                 if self
                     .selection_pending
                     .as_ref()
@@ -836,7 +601,6 @@ impl SolanaWalletWidget {
         false
     }
 
-    /// Reports why a subscription stopped.
     fn fail(&mut self, error: SolanaWalletStreamError, cx: &mut WidgetCx<'_>) {
         let failure = SolanaWalletFailure::Stream(error);
         let recovery = self.recovery.clone();
@@ -846,7 +610,6 @@ impl SolanaWalletWidget {
         );
     }
 
-    /// Tells the list about the transfers this feed changed.
     fn accept(
         &mut self,
         snapshot: TransferSnapshot,
@@ -859,16 +622,11 @@ impl SolanaWalletWidget {
         cx.write(&self.items, snapshot.clone());
         let count = snapshot.items().len();
         match (unshown, self.list.as_ref()) {
-            // The oldest of the transfers it has not been shown goes in first, so the newest
-            // of them ends up where a list that draws its newest transfer first draws it.
             (Some(pushed), Some(list)) => {
                 for _ in 0..pushed {
                     list.push(cx.app_mut())?;
                 }
             }
-            // Nothing the list holds survives, so there is no edit it can be told: every
-            // transfer on screen is one the feed no longer has. The list is rebuilt for the
-            // feed it has now.
             (None, Some(list)) => list.set_items(cx.app_mut(), count)?,
             _ => {}
         }
@@ -878,7 +636,6 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// Builds the list the body draws its feed with.
     fn make_list(&self, cx: &mut WidgetCx<'_>, parent: NodeId) -> Result<List, EngineError> {
         let context = TransferRowContext {
             items: self.items,
@@ -914,7 +671,6 @@ impl SolanaWalletWidget {
         Ok(list)
     }
 
-    /// Shows `common.no_data` over a feed that holds nothing.
     fn sync_empty_state(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let empty = self
             .snapshot
@@ -958,8 +714,6 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// Builds the header control that opens the dialog into `parent`.
-    /// Builds the wrapper the header control is drawn in, and the control itself.
     fn build_manage_button(
         &mut self,
         parent: NodeId,
@@ -973,7 +727,6 @@ impl SolanaWalletWidget {
         self.build_manage_control(cx, wrapper)
     }
 
-    /// Builds the header control into the wrapper it lives in.
     fn build_manage_control(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1007,7 +760,6 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// Keeps the header control in step with the account and the language.
     fn sync_manage_button(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(button) = self.manage_button.as_ref() else {
             return Ok(());
@@ -1021,14 +773,11 @@ impl SolanaWalletWidget {
         let Some(wrapper) = self.manage_parent else {
             return Ok(());
         };
-        // The pane may have rebuilt the header row since: its group is not this widget's
-        // node, so a stale wrapper means the control already went with it.
         if cx.tree().get(wrapper).is_err() {
             self.release_manage_button(cx, false)?;
             return Ok(());
         }
 
-        // The wrapper stays: only the control built into it is replaced.
         if let Some(button) = self.manage_button.take() {
             if let Some(node) = button.node() {
                 remove_own_node(cx, node)?;
@@ -1039,8 +788,6 @@ impl SolanaWalletWidget {
         self.build_manage_control(cx, wrapper)
     }
 
-    /// Removes the control's node (when the widget owns the teardown) and releases its
-    /// component scope and action handler.
     fn release_manage_button(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1064,14 +811,11 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// Opens the address dialog, when there is an account to manage addresses for.
     fn open_dialog(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if self.dialog.is_some() || self.current_scope().is_none() {
             return Ok(());
         }
         let mut dialog = SolanaWalletDialog::open(cx)?;
-        // The read the dialog exists for: the pane reads the addresses on the dialog's
-        // behalf as soon as it opens, and the stream's readiness is what sends it.
         self.load_selections(cx);
         let requests = dialog.take_requests(cx);
         for request in requests {
@@ -1088,7 +832,6 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// One frame of the open dialog and the requests the user made through it.
     fn drive_dialog(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(mut dialog) = self.dialog.take() else {
             return Ok(());
@@ -1107,7 +850,6 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// Applies one request the user made through the dialog.
     fn apply_dialog_request(
         &mut self,
         request: DialogRequest,
@@ -1127,7 +869,6 @@ impl SolanaWalletWidget {
         Ok(())
     }
 
-    /// The pane's own selection state, as the dialog draws it.
     fn dialog_view(&self) -> DialogView {
         DialogView {
             signed_in: self.account_id.is_some(),
@@ -1142,11 +883,6 @@ impl SolanaWalletWidget {
         }
     }
 
-    /// Reads the addresses the account monitors.
-    ///
-    /// A read goes over a live stream, because a live stream is what says the service is
-    /// holding the account: before it there is no session to answer one. A read asked for too
-    /// early waits here instead, and the readiness that arrives later is what sends it.
     fn load_selections(&mut self, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
@@ -1164,8 +900,6 @@ impl SolanaWalletWidget {
             sent: false,
         });
         self.notice = None;
-        // Asking again is what takes a failure back off the screen: the answer to this read is
-        // what the pane will have to say, and until it arrives the pane does not know.
         self.selection_read = SelectionRead::NotRead;
         if self.ready {
             self.send_selections(scope, cx);
@@ -1173,7 +907,6 @@ impl SolanaWalletWidget {
         true
     }
 
-    /// Sends the read a dialog is waiting for.
     fn send_pending_selections(&mut self, cx: &mut WidgetCx<'_>) {
         let Some(scope) = self.current_scope() else {
             return;
@@ -1198,7 +931,6 @@ impl SolanaWalletWidget {
         );
     }
 
-    /// Monitors one more address.
     fn add_selection(&mut self, address: SmolStr, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
@@ -1215,7 +947,6 @@ impl SolanaWalletWidget {
         true
     }
 
-    /// Stops monitoring one address.
     fn delete_selection(&mut self, address: SmolStr, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
@@ -1232,10 +963,6 @@ impl SolanaWalletWidget {
         true
     }
 
-    /// Whether the pane is in a position to change what the account monitors.
-    ///
-    /// A change is sent over the same session the stream was opened with, so a pane whose
-    /// stream is not live has no session to change anything through.
     fn may_change(&self, cx: &WidgetCx<'_>) -> bool {
         self.ready
             && self.selections.is_some()
@@ -1264,22 +991,12 @@ impl SolanaWalletWidget {
                 self.notice = None;
                 self.selection_read = SelectionRead::Known;
             }
-            // The protocol types the answer, so anything else is a service that answered the
-            // wrong question rather than a shape a reader could describe: nothing changes.
             Ok(_) => {}
             Err(error) => {
-                // The read failed, which is not the same as a list that holds nothing: what the
-                // pane follows is unknown, and that is a failure rather than an empty account.
-                // The dialog says so in its own words, and the pane says so as its status —
-                // this is the only place either of them learns it, so it is recorded once and
-                // reported from here.
                 self.selection_read = SelectionRead::Failed(error.clone());
                 self.notice = Some(SelectionNotice::Problem(SelectionFailure::Rpc(error)));
             }
         }
-        // A pane that is following an account says what the answer means; a pane that is not
-        // yet ready has no status to publish, and the readiness that arrives later reports for
-        // it.
         if self.ready {
             self.report(cx);
         }
@@ -1303,8 +1020,6 @@ impl SolanaWalletWidget {
             }
         };
         self.notice = match outcome {
-            // What the list becomes is the confirmation applied to it, and only a
-            // confirmation of the address that was asked about is one of those.
             SolanaWalletMutationOutcome::Confirmed(selection) => {
                 let grown = requested.as_ref().and_then(|address| {
                     self.selections
@@ -1323,8 +1038,6 @@ impl SolanaWalletWidget {
             SolanaWalletMutationOutcome::Rejected(error) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Rejected(error)))
             }
-            // The change may or may not have been made, so the list the pane holds is not one
-            // it can change: it is left as it was, and the next read settles it.
             SolanaWalletMutationOutcome::Unknown(unknown) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(unknown)))
             }
@@ -1375,14 +1088,12 @@ impl SolanaWalletWidget {
     }
 }
 
-/// What the dialog says about a confirmation the list cannot hold.
 fn inconsistent() -> SelectionNotice {
     SelectionNotice::Problem(SelectionFailure::Inconsistent(
         SolanaWalletDataError::InconsistentSelections,
     ))
 }
 
-/// Removes a node this pane built, if it is still in the tree.
 fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) -> Result<(), EngineError> {
     if cx.tree().get(node).is_err() {
         return Ok(());
@@ -1391,11 +1102,6 @@ fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) -> Result<(), EngineErro
     cx.app_mut().remove_node(window, node).map(|_| ())
 }
 
-/// The signals and collaborators one transfer row draws through.
-///
-/// A row closure has no `App`, so everything a row reads or draws with is handed in once
-/// when the list is built: the feed for the transfer, the settings for the display zone, the
-/// language for the labels, and the theme / translator for the colours and the copy.
 #[derive(Clone)]
 struct TransferRowContext {
     items: Signal<TransferSnapshot>,
@@ -1405,7 +1111,6 @@ struct TransferRowContext {
     translate: Translate,
 }
 
-/// Builds one row of the feed into the list's row container.
 fn build_transfer_row(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -1416,10 +1121,6 @@ fn build_transfer_row(
     let a11y_language = context.language;
     let a11y_config = context.config;
     let a11y_translate = context.translate.clone();
-    // The kit list's own row container is the list option this content is drawn in, so the
-    // content root declares no role of its own: `A11yRole::Row` belongs to real tables and
-    // grids only (ui_core `a11y.rs`). The summary travels on the content root because a kit
-    // list row has no a11y-patch seam yet (W8a ledger §6.8).
     let row = NodeBuilder::boxed()
         .id(format_smolstr!("TEST_SOLANA_WALLET_TRANSFER_ROW:{index}"))
         .style(
@@ -1537,14 +1238,12 @@ fn build_transfer_row(
     Ok(())
 }
 
-/// Which end of a transfer an address line names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AddressEnd {
     From,
     To,
 }
 
-/// One end of a transfer: which Solana wallet, under the label that says which end it is.
 fn build_address_line(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -1644,11 +1343,8 @@ mod tests {
     const SECOND: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
     const OTHER_ACCOUNT: &str = "someone-else";
 
-    /// How many runtime / frame turns a settle loop may take before it calls the test a
-    /// failure.
     const SETTLE_TURNS: usize = 64;
 
-    /// The translator the product ships, in `language`.
     fn translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -1656,7 +1352,6 @@ mod tests {
         )
     }
 
-    /// The framework's headless host, over the product catalogue.
     fn harness() -> WidgetTestApp {
         WidgetTestApp::with_translate(translate(LanguageCode::En))
     }
@@ -1671,7 +1366,6 @@ mod tests {
         harness.app_mut().write(&signal, config)
     }
 
-    /// Signs `user_id` in the way the composition root does: a settings write.
     fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
         let mut config = current_config(harness);
         config.account = Some(AccountConfig {
@@ -1685,7 +1379,6 @@ mod tests {
         );
     }
 
-    /// Signs the pane out the way the composition root does: a settings write.
     fn sign_out(harness: &mut WidgetTestApp) {
         let mut config = current_config(harness);
         config.account = None;
@@ -1695,7 +1388,6 @@ mod tests {
         );
     }
 
-    /// A pane the framework would have built, over a source the test answers.
     struct Pane {
         widget: SolanaWalletWidget,
         status: WidgetStatus,
@@ -1722,19 +1414,15 @@ mod tests {
         }
     }
 
-    /// A pane over an account with the service it was given, as `load` would start it.
     fn pane(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
         sign_in(harness, ACCOUNT);
         pane_with(harness, source)
     }
 
-    /// A pane nobody is signed in for.
     fn signed_out_pane(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
         pane_with(harness, source)
     }
 
-    /// A pane no message of which arrives from the binding: the tests below report
-    /// statuses and feeds by hand, and a live service would report its own.
     fn quiet_pane(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
         let mut pane = pane(harness, source);
         if let Some(binding) = pane.widget.binding.as_mut() {
@@ -1743,10 +1431,6 @@ mod tests {
         pane
     }
 
-    /// A pane reading an account whose stream is live, with the addresses it read.
-    ///
-    /// The read is the stream's, not this fixture's: a pane that has answered readiness
-    /// reads the addresses itself.
     fn live_pane(
         harness: &mut WidgetTestApp,
         source: &FakeSource,
@@ -1774,7 +1458,6 @@ mod tests {
             .expect("the widget syncs");
     }
 
-    /// Builds the body the framework would build once the pane has content.
     fn build_body(harness: &mut WidgetTestApp, pane: &mut Pane) {
         let parent = pane.parent;
         harness
@@ -1788,8 +1471,6 @@ mod tests {
         harness.drain();
     }
 
-    /// Lets the host's runtime deliver what the fake source published, and the pane the
-    /// frames it asked for, until `ready` holds.
     fn settle(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -1807,7 +1488,6 @@ mod tests {
         panic!("{what} should happen");
     }
 
-    /// Reports a feed as the stream would, with the binding taken out of the way.
     fn report_feed(harness: &mut WidgetTestApp, pane: &mut Pane, feed: TransferSnapshot) -> bool {
         let scope = pane
             .widget
@@ -1825,7 +1505,6 @@ mod tests {
         })
     }
 
-    /// Reports a status as the stream would.
     fn report_status(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -1851,8 +1530,6 @@ mod tests {
         pane.status.state(harness.app())
     }
 
-    /// Reports a status as the stream would, over the binding the pane is really reading:
-    /// for a live pane whose stream is what answers the read the status asks for.
     fn report_status_live(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -1907,7 +1584,6 @@ mod tests {
         })
     }
 
-    /// Dispatches the click a kit control's action identity names.
     fn click_button(harness: &mut WidgetTestApp, button: &Button) {
         let node = button.node().expect("the control is built");
         let action = button
@@ -1926,7 +1602,6 @@ mod tests {
         );
     }
 
-    /// Builds the header control the pane would build into the window's header row.
     fn build_header(harness: &mut WidgetTestApp, pane: &mut Pane) {
         let root = harness.root();
         harness
@@ -1934,8 +1609,6 @@ mod tests {
             .expect("the header control builds");
     }
 
-    /// A missing key is an empty string on screen rather than an error, so a gap in the
-    /// interface is what a typo looks like: this is the test that turns it into a failure.
     #[test]
     fn every_message_this_pane_shows_should_resolve_to_text() {
         let translate = translate(LanguageCode::En);
@@ -2020,9 +1693,6 @@ mod tests {
         );
     }
 
-    /// What a pane follows is the account's own list of addresses, so the pane has nothing of
-    /// its own to persist: a config it returned would make every save write an empty envelope
-    /// into the layout (AGENTS §4.3).
     #[test]
     fn a_pane_should_persist_no_config() {
         let mut harness = harness();
@@ -2051,8 +1721,6 @@ mod tests {
         assert!(!state_of(&harness, &pane).is_failed());
     }
 
-    /// The words a waiting pane shows are the ones the language resolves them in: the
-    /// notice is a reference into the catalogue, so the pane reports nothing again.
     #[test]
     fn a_signed_out_pane_should_wait_for_a_login_in_the_language_showing_now() {
         let mut harness = harness();
@@ -2094,8 +1762,6 @@ mod tests {
         );
         assert!(!pane.widget.has_content());
 
-        // The sentence is a catalogue reference, so the language it resolves in moves
-        // without the pane reporting anything again.
         let notice = state_of(&harness, &pane)
             .notice()
             .cloned()
@@ -2107,9 +1773,6 @@ mod tests {
         );
     }
 
-    /// A feed that lands while the pane is still reading its addresses is content the
-    /// moment it arrives: the pane holds the transfers even though what it is *reporting*
-    /// is still the read of the addresses, and readiness follows once that answers.
     #[test]
     fn a_feed_should_become_content_and_readiness_should_follow_it() {
         let mut harness = harness();
@@ -2160,8 +1823,6 @@ mod tests {
         assert!(!state_of(&harness, &pane).is_failed());
     }
 
-    /// An account with no addresses is a pane with nothing to follow, and a feed with no
-    /// transfers in it reads exactly the same as one whose addresses were never added.
     #[test]
     fn an_account_with_no_addresses_should_say_it_has_none() {
         let mut harness = harness();
@@ -2187,8 +1848,6 @@ mod tests {
         );
     }
 
-    /// While the pane is reading the addresses it is loading, even though the live stream
-    /// has already handed it a feed.
     #[test]
     fn a_pane_reading_its_addresses_should_be_loading() {
         let mut harness = harness();
@@ -2221,8 +1880,6 @@ mod tests {
         assert_eq!(state_of(&harness, &pane), WidgetState::Ready);
     }
 
-    /// A read that failed is a failure, and the pane reports it as one rather than sitting
-    /// on it. It is *not* a list with nothing in it.
     #[test]
     fn a_read_that_failed_should_be_reported_rather_than_swallowed() {
         let mut harness = harness();
@@ -2244,8 +1901,6 @@ mod tests {
         assert!(pane.widget.selections.is_none());
     }
 
-    /// The pane reads the addresses whether or not the dialog is open: they are its own
-    /// scope, not the dialog's list.
     #[test]
     fn a_pane_without_a_dialog_should_read_the_addresses() {
         let mut harness = harness();
@@ -2364,8 +2019,6 @@ mod tests {
         assert!(pane.widget.selections.is_none());
     }
 
-    /// Another account is another feed, and the pane hears about it from the settings
-    /// rather than from a reload: it opens that account's session.
     #[test]
     fn an_account_change_should_read_the_new_account() {
         let mut harness = harness();
@@ -2564,8 +2217,6 @@ mod tests {
         assert_eq!(addresses_of(&pane.widget), [FIRST.to_owned()]);
     }
 
-    /// A change the service could not tell the outcome of is not one the pane can apply: it
-    /// says so and leaves the list alone rather than guessing either way.
     #[test]
     fn a_change_of_an_unknown_outcome_should_say_so_and_leave_the_list_alone() {
         let mut harness = harness();
@@ -2654,8 +2305,6 @@ mod tests {
         );
     }
 
-    /// A change the pane stopped waiting for — because the user recovered the stream — is
-    /// dropped rather than decided, and the read that follows settles it.
     #[test]
     fn a_change_a_recovery_replaced_should_be_forgotten() {
         let mut harness = harness();
@@ -2698,9 +2347,6 @@ mod tests {
         panic!("the abandoned change should be dropped");
     }
 
-    /// The answer to a command the binding replaced is a late one: its identity is not in
-    /// the table, so it is dropped and counted rather than applied to the command that
-    /// replaced it (AGENTS §8.2).
     #[test]
     fn the_answer_to_a_replaced_command_should_be_dropped() {
         let mut harness = harness();
@@ -2787,8 +2433,6 @@ mod tests {
         );
     }
 
-    /// A transfer's time is read in the zone the settings display data in, on the frame
-    /// that draws it: moving the setting re-reads the row.
     #[test]
     fn moving_the_display_zone_should_re_read_the_row_time() {
         let mut harness = harness();
@@ -2848,8 +2492,6 @@ mod tests {
         );
     }
 
-    /// An account that does follow addresses, none of which has moved, is the other
-    /// emptiness: the pane is ready and its body says it holds nothing.
     #[test]
     fn a_feed_with_no_transfers_should_say_the_body_holds_nothing() {
         let mut harness = harness();
@@ -2882,8 +2524,6 @@ mod tests {
         assert_eq!(list.count(harness.app()), 0);
     }
 
-    /// The rows follow the language: their labels are `bind_text` closures over the
-    /// language signal, so switching it re-reads them and reports nothing again.
     #[test]
     fn the_rows_should_follow_the_language() {
         let mut harness = harness();
@@ -2911,7 +2551,6 @@ mod tests {
         );
     }
 
-    /// The header control opens the dialog, and the dialog's own close control closes it.
     #[test]
     fn the_manage_control_should_open_the_dialog_and_its_close_control_should_close_it() {
         let mut harness = harness();
@@ -2943,7 +2582,6 @@ mod tests {
         );
     }
 
-    /// Settles the dialog through its close: the kit fade needs frames and clock movement.
     fn settle_close(harness: &mut WidgetTestApp, pane: &mut Pane) -> bool {
         for _ in 0..SETTLE_TURNS {
             harness.advance(Duration::from_millis(40));
@@ -2955,8 +2593,6 @@ mod tests {
         pane.widget.dialog.is_none()
     }
 
-    /// The header control is static copy: a language switch rebuilds it in the language
-    /// showing now (a kit button's label is chosen when it is built).
     #[test]
     fn the_manage_control_should_follow_the_language() {
         let mut harness = harness();
@@ -2996,8 +2632,6 @@ mod tests {
         );
     }
 
-    /// Two panes of one application build the same control with different keys: releasing
-    /// one pane's control leaves the other's handler registered (AGENTS §9).
     #[test]
     fn two_panes_should_keep_their_own_header_handlers() {
         let mut harness = harness();
@@ -3013,8 +2647,6 @@ mod tests {
             .action_identity()
             .expect("the first control registered a click");
 
-        // The second pane is a second widget instance: a fresh signal scope, which is what
-        // `cx.unique_key` prefixes a control's identity with.
         let services = Rc::clone(harness.services_rc());
         let window = harness.window();
         let root = harness.root();
@@ -3065,8 +2697,6 @@ mod tests {
         );
     }
 
-    /// The dialog owns its own value slots: opening and releasing it repeatedly returns
-    /// them all, and no slot is minted afresh on each pass.
     #[test]
     fn releasing_the_dialog_should_reclaim_its_value_slots() {
         let mut harness = harness();
@@ -3108,10 +2738,6 @@ mod tests {
         );
     }
 
-    /// The framework drops a pane by releasing the scope it was mounted in; everything the
-    /// pane built has to be gone by then, or the scope's values leak and the next mount
-    /// mints fresh slots (AGENTS §11). A pane with a feed, a header control and an open
-    /// dialog is the widest state it builds.
     #[test]
     fn releasing_the_pane_should_reclaim_what_it_built() {
         let mut harness = harness();
@@ -3143,7 +2769,6 @@ mod tests {
                 }
             };
 
-            // Everything the pane can own: a feed to draw, a header control and the dialog.
             pane.widget.selections =
                 Some(SelectionData::new(selections(vec![selection(FIRST)], 3)));
             pane.widget.selection_read = SelectionRead::Known;
@@ -3175,7 +2800,6 @@ mod tests {
                 "the header control is released"
             );
             drop(pane);
-            // The framework releases the pane's scope after dropping it.
             harness.app_mut().release_scope(scope);
 
             assert_eq!(
@@ -3192,8 +2816,6 @@ mod tests {
         }
     }
 
-    /// A host that installed no Kytrix service is a pane that cannot follow its account:
-    /// it reports a typed failure with its own recovery instead of panicking.
     #[test]
     fn a_pane_mounted_without_the_kytrix_service_should_report_a_typed_failure() {
         let mut harness = harness();
@@ -3232,7 +2854,6 @@ mod tests {
         );
     }
 
-    /// A pane with nothing changing does not ask for a frame (I3).
     #[test]
     fn a_steady_pane_should_not_ask_for_a_frame() {
         let mut harness = harness();
@@ -3257,10 +2878,6 @@ mod tests {
         assert!(!harness.rendered(), "a steady pane paints nothing");
     }
 
-    /// An account nobody has added an address to is a pane with nothing to follow, so the
-    /// feed it is published is not content and the pane must not keep asking for the body
-    /// frame it can never use (I3). The service publishes an empty snapshot for such an
-    /// account, which is the state this pins.
     #[test]
     fn a_pane_waiting_for_its_first_address_should_not_keep_asking_for_frames() {
         let mut harness = harness();
@@ -3289,8 +2906,6 @@ mod tests {
         );
     }
 
-    /// The pane is content for an account with addresses as soon as the feed arrives; the
-    /// addresses are the scope that decides whether there is anything to follow.
     #[test]
     fn signing_out_should_take_the_feed_with_it() {
         let mut harness = harness();

@@ -1,42 +1,3 @@
-//! Everything that turns chart values into shaped text.
-//!
-//! Shaping is the expensive part of drawing this chart: one axis tick is a text
-//! layout, and a frame draws dozens of them plus an OHLCV readout whose runs
-//! change with the candle being described. Both are therefore shaped once and
-//! reused:
-//!
-//! - [`ChartTextCache`] keeps the last [`TEXT_CACHE_CAPACITY`] `(text, style)`
-//!   layouts, so ticks that did not move are not re-shaped as the chart pans,
-//! - [`ReadoutCache`] keeps the single most recent line together with every
-//!   input that produced it, so a pointer moving *within* one candle re-uses the
-//!   shaped line instead of re-shaping it on every mouse move.
-//!
-//! Both caches are keyed on the whole [`TextStyle`], which carries the colour and
-//! the size as well as the font: a colour or font change invalidates shaped text
-//! even when the numbers did not change. The raster scale the engine shaped at is a
-//! key part as well: the atlas does not re-rasterise an existing handle when
-//! [`App::text_scale`] moves, so text shaped at another scale would keep the old
-//! ppem bitmaps for good (design §11.1).
-//!
-//! # The atlas lease
-//!
-//! A [`ShapedTextHandle`] names glyph tiles leased from the engine's shared
-//! atlas. An atlas generation change (a device-scale change, a glyph-capacity
-//! escape, a font-stack switch) or a per-tile eviction leaves those tiles
-//! pointing at reused texture, and the engine drops such runs at encode time
-//! rather than drawing the wrong pixels. A handle that no longer satisfies its
-//! lease is therefore **re-shaped** by both caches, and [`ChartTextCache::has_stale`]
-//! / [`ReadoutCache::has_stale`] are what the canvas asks before it decides a
-//! frame changed nothing: a canvas kept over a dead lease would lose its text
-//! for good.
-//!
-//! # Multi-coloured text
-//!
-//! The engine shapes one line per [`TextStyle`], so a line with two colours (the
-//! OHLCV readout: muted keys, candle-coloured numbers) is a sequence of shaped
-//! runs laid out left to right. [`ReadoutPresentation`] carries them with their
-//! x offsets, measured once when the line is shaped.
-
 use std::sync::Arc;
 
 use base_ui::theme::components::ChartColors;
@@ -55,43 +16,28 @@ use ui_core::{
 
 use crate::{model::CandlePrices, time::format_crosshair_time};
 
-/// Font size of every axis and tag label.
 pub(crate) const AXIS_FONT_SIZE: f32 = 10.0;
-/// Font size of the OHLCV readout line.
 pub(crate) const READOUT_FONT_SIZE: f32 = 11.0;
-/// Height of one text row: axis ticks, tags, legends and the readout all use it.
 pub(crate) const TEXT_ROW_HEIGHT: f32 = 14.0;
 const TEXT_CACHE_CAPACITY: usize = 256;
-/// The CSS font weight of the readout's keys (`O`/`H`/`L`/`C`/`V`).
 const READOUT_KEY_WEIGHT: u16 = 700;
 
-/// What a candle's traded size reads as when it published none.
-///
-/// A listing that does not publish a traded size is not one whose size is zero,
-/// so the label says the number is missing rather than inventing one.
 const MISSING_VOLUME: &str = "—";
 
-/// The style `text` is shaped in at `size` and `color`.
 pub(crate) fn style_of(size: f32, color: Color) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.color = color;
     style
 }
 
-/// One shaped line and the style it was shaped in.
 struct CachedTextLine {
     text: SmolStr,
     style: TextStyle,
     handle: Arc<ShapedTextHandle>,
 }
 
-/// Shaped axis labels, keyed by text and style.
 pub(crate) struct ChartTextCache {
     entries: Vec<CachedTextLine>,
-    /// The raster scale every entry was shaped at, or `None` before the first line.
-    ///
-    /// The engine never re-rasterises a handle it handed out, so a scale change is a
-    /// different cache: the labels would otherwise keep the previous DPI's bitmaps.
     scale: Option<f32>,
 }
 
@@ -108,12 +54,6 @@ impl ChartTextCache {
         self.scale = None;
     }
 
-    /// Shapes `text` in `style`, or returns the line that was shaped before.
-    ///
-    /// A handle whose atlas lease is gone is dropped and shaped again: the glyphs
-    /// it named have been reused, so drawing it would be drawing another line's
-    /// pixels. The same happens when the raster scale moved, because the atlas does
-    /// not re-rasterise a handle.
     pub(crate) fn line(
         &mut self,
         app: &mut App,
@@ -128,8 +68,6 @@ impl ChartTextCache {
             .iter()
             .position(|entry| entry.text == text && entry.style == *style)
         {
-            // Refresh the entry's recency by moving it to the back, which is what
-            // makes the capacity below evict the least recently used label.
             let entry = self.entries.remove(index);
             if !entry.handle.is_stale() {
                 let handle = Arc::clone(&entry.handle);
@@ -152,30 +90,18 @@ impl ChartTextCache {
         handle
     }
 
-    /// The width `text` occupies, shaped in `style`.
     pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
         self.line(app, text, style).size().width
     }
 
-    /// Whether any line this cache holds can no longer be drawn from the atlas.
     pub(crate) fn has_stale(&self) -> bool {
         self.entries.iter().any(|entry| entry.handle.is_stale())
     }
 
-    /// Drops every line whose atlas lease is gone.
-    ///
-    /// Called when a frame is about to repaint. The lines that frame asks for are
-    /// re-shaped on demand by [`Self::line`], and a line it does not ask for again
-    /// would otherwise keep [`Self::has_stale`] true — which would rebuild the canvas
-    /// on every later frame for a label nobody draws any more.
     pub(crate) fn drop_stale(&mut self) {
         self.entries.retain(|entry| !entry.handle.is_stale());
     }
 
-    /// The text of every line this cache holds, in insertion order.
-    ///
-    /// Test-only: the canvas read points see glyph counts rather than words, so a
-    /// test that asserts *which* labels a frame shaped reads them here.
     #[cfg(test)]
     pub(crate) fn texts(&self) -> Vec<SmolStr> {
         self.entries
@@ -184,10 +110,6 @@ impl ChartTextCache {
             .collect()
     }
 
-    /// The raster scale every line this cache holds was shaped at (test read point).
-    ///
-    /// Reads the fact off the handles rather than the cache's own bookkeeping: the
-    /// engine stamps the scale it actually rasterised at onto each handle.
     #[cfg(test)]
     pub(crate) fn shaped_scales(&self) -> Vec<f32> {
         self.entries
@@ -197,13 +119,6 @@ impl ChartTextCache {
     }
 }
 
-/// Shapes one line, drawing nothing rather than failing a frame when the engine
-/// refuses the text: a label is not worth a dropped frame, and the next frame
-/// tries again.
-///
-/// An empty line is the engine's own minimum: it needs no glyphs, so the only
-/// thing that can still refuse it is a missing font stack, which is a broken
-/// host rather than a broken chart.
 fn shape_line(app: &mut App, text: &str, style: &TextStyle) -> ShapedTextHandle {
     app.shape_text(text, style, None, &[])
         .or_else(|_| app.shape_text("", style, None, &[]))
@@ -249,36 +164,24 @@ impl ReadoutSpan {
     }
 }
 
-/// One shaped run of the readout line, and where it starts.
 pub(crate) struct ReadoutRun {
     pub handle: Arc<ShapedTextHandle>,
-    /// The run's x offset from the start of the readout line.
     pub x: f32,
 }
 
-/// The readout line and the crosshair's time tag, already shaped.
 #[derive(Clone)]
 pub(crate) struct ReadoutPresentation {
     pub time_label: SmolStr,
-    /// The line's runs, left to right.
     pub runs: Arc<[ReadoutRun]>,
-    /// The line's total width, which is the last run's offset plus its width.
     pub width: f32,
 }
 
-/// The inputs the readout line is shaped from, apart from the candle itself.
 pub(crate) struct ReadoutSpec<'a> {
-    /// The price increment every price in the line is rounded to.
     pub price_tick: Tick,
-    /// The interval the crosshair's date is read with.
     pub interval: TimeFrame,
-    /// The zone the crosshair's date is read in.
     pub zone: UtcOffset,
-    /// The text the candle's traded size is read in.
     pub volume_unit: &'a str,
-    /// The colour of the line's keys and separators.
     pub muted_color: Color,
-    /// The colour of the line's numbers.
     pub candle_color: Color,
 }
 
@@ -315,7 +218,6 @@ impl ReadoutCacheEntry {
     }
 }
 
-/// The readout of the candle being described, shaped at most once per candle.
 #[derive(Default)]
 pub(crate) struct ReadoutCache {
     entry: Option<ReadoutCacheEntry>,
@@ -326,7 +228,6 @@ impl ReadoutCache {
         self.entry = None;
     }
 
-    /// Whether the shaped line this cache holds can no longer be drawn.
     pub(crate) fn has_stale(&self) -> bool {
         self.entry.as_ref().is_some_and(|entry| {
             entry
@@ -337,21 +238,12 @@ impl ReadoutCache {
         })
     }
 
-    /// Drops a line whose atlas lease is gone, so a repainting frame re-shapes it.
-    ///
-    /// [`Self::presentation`] already re-shapes a stale line when it is asked for one;
-    /// this is for the frames that do not ask (a chart with no candle in range would
-    /// otherwise keep [`Self::has_stale`] true and rebuild the canvas every frame).
     pub(crate) fn drop_stale(&mut self) {
         if self.has_stale() {
             self.entry = None;
         }
     }
 
-    /// The text of the line this cache holds, run by run.
-    ///
-    /// Test-only: the canvas read points see glyph counts rather than words, and a
-    /// test that asserts *which* candle the readout described needs the words.
     #[cfg(test)]
     pub(crate) fn described_text(&self) -> Option<SmolStr> {
         let entry = self.entry.as_ref()?;
@@ -362,13 +254,11 @@ impl ReadoutCache {
         Some(SmolStr::new(text))
     }
 
-    /// The crosshair's time tag the cached line was shaped with (test read point).
     #[cfg(test)]
     pub(crate) fn described_time_label(&self) -> Option<SmolStr> {
         Some(self.entry.as_ref()?.presentation.time_label.clone())
     }
 
-    /// The raster scale every run of the cached line was shaped at (test read point).
     #[cfg(test)]
     pub(crate) fn shaped_scales(&self) -> Vec<f32> {
         self.entry
@@ -384,12 +274,6 @@ impl ReadoutCache {
             .unwrap_or_default()
     }
 
-    /// Shapes the readout for `candle`, reading its traded size in
-    /// [`ReadoutSpec::volume_unit`].
-    ///
-    /// The unit is the text the candle's own quantity is labelled with — an asset
-    /// name, a contract count — so the size the label shows says what it counts
-    /// instead of leaving the reader to assume one.
     pub(crate) fn presentation(
         &mut self,
         app: &mut App,
@@ -478,7 +362,6 @@ fn readout_spans(
     spans
 }
 
-/// The traded size of one candle, read in the unit it was published with.
 fn format_traded_size(candle: &ListingCandlestick, volume_unit: &str) -> SmolStr {
     let Some(quantity) = &candle.traded_quantity else {
         return SmolStr::new_static(MISSING_VOLUME);
@@ -490,9 +373,6 @@ fn format_traded_size(candle: &ListingCandlestick, volume_unit: &str) -> SmolStr
     )
 }
 
-/// Shapes every span of the readout and lays them out left to right.
-///
-/// Returns the runs with their x offsets and the line's total width.
 fn shape_readout(
     app: &mut App,
     candle: &ListingCandlestick,
@@ -523,8 +403,6 @@ fn shape_readout(
     (runs.into(), x)
 }
 
-/// The colour a candle's numbers are drawn in: its own direction, not the
-/// previous candle's.
 pub(crate) fn candle_color(candle: &ListingCandlestick, chart: &ChartColors) -> Color {
     if CandlePrices::of(candle).is_up() {
         chart.bullish
@@ -533,28 +411,19 @@ pub(crate) fn candle_color(candle: &ListingCandlestick, chart: &ChartColors) -> 
     }
 }
 
-/// Formats a chart coordinate as a price, rounded to the market's tick.
 pub(crate) fn format_price(inner: f64, tick: Tick) -> SmolStr {
     let inner = inner.clamp(0.0, u128::MAX as f64).round() as u128;
     Price::from_inner(inner).format_and_round_tick(tick)
 }
 
-/// Formats a signed chart coordinate, rounded to the market's tick.
-///
-/// The MACD sub plot spans `[-m, +m]`, so its axis and legend need a formatter
-/// that keeps the sign: [`format_price`] clamps at zero and would label every
-/// negative tick as `0`. RSI, KDJ and volume are non-negative and do not use it.
 pub(crate) fn format_signed_price(inner: f64, tick: Tick) -> SmolStr {
     let inner = inner.clamp(i128::MIN as f64, i128::MAX as f64).round() as i128;
     ProfitOrLoss::from_inner(inner).format_and_round_tick(tick)
 }
 
-/// Formats a chart coordinate as a volume with a `K` / `M` suffix.
 pub(crate) fn format_volume(inner: f64) -> SmolStr {
     let scale = Quantity::from(1_u64).inner();
     let inner = inner.clamp(0.0, u128::MAX as f64);
-    // Fixed-point thresholds above 2^53 are not exact f64 integers, so choose
-    // the suffix before converting the chart coordinate back to u128.
     let (divisor, suffix) = volume_unit_from_chart_value(inner, scale);
     format_volume_with_unit(inner.round() as u128, scale, divisor, suffix)
 }
@@ -577,8 +446,6 @@ pub(crate) fn format_price_change(candle: &ListingCandlestick, price_tick: Tick)
     ProfitOrLoss::from_inner(change).format_and_round_tick(price_tick)
 }
 
-/// How far the candle moved between its low and its high, against the previous
-/// close. Absent when there is no previous candle to measure against.
 pub(crate) fn format_amplitude(
     candle: &ListingCandlestick,
     previous: Option<&ListingCandlestick>,
@@ -703,8 +570,6 @@ mod tests {
         );
     }
 
-    /// A traded size is read in the unit it was published with, and a candle that
-    /// published none says so instead of showing a number nobody published.
     #[test]
     fn readout_should_read_the_traded_size_in_its_own_unit() {
         let candle = candle_with_ohlcv(1, "100", "110", "90", "105", "12");
@@ -813,8 +678,6 @@ mod tests {
         assert_eq!(format_price(price.inner() as f64, tick("0.01")), "4523.90");
     }
 
-    /// The MACD axis has a negative half, so the signed formatter has to keep the
-    /// sign. The plain one deliberately keeps clamping prices at zero.
     #[test]
     fn format_signed_price_should_keep_a_negative_sign() {
         let price = Price::from_str("1.234").expect("price should parse");
@@ -923,14 +786,12 @@ mod tests {
         );
     }
 
-    /// A fresh cache has nothing to lose to an atlas generation change.
     #[test]
     fn an_empty_text_cache_has_no_stale_line() {
         assert!(!ChartTextCache::new().has_stale());
         assert!(!ReadoutCache::default().has_stale());
     }
 
-    /// The inputs one harness readout is shaped from.
     fn readout_spec(volume_unit: &str) -> ReadoutSpec<'_> {
         ReadoutSpec {
             price_tick: tick("0.01"),
@@ -942,7 +803,6 @@ mod tests {
         }
     }
 
-    /// The words a shaped readout line holds, run by run.
     fn presentation_text(presentation: &ReadoutPresentation) -> String {
         presentation
             .runs
@@ -951,11 +811,6 @@ mod tests {
             .collect()
     }
 
-    /// The unit a size is read in is part of the cache key: the same candle with two
-    /// different units must not reuse the first presentation.
-    ///
-    /// Without this, a chart whose quantity unit changes (a relabelled asset, a
-    /// contract renamed) would keep printing the old unit until the candle changed.
     #[test]
     fn the_readout_cache_should_key_on_the_volume_unit() {
         let mut app = ui_core::test_support::app::TestApp::new();
@@ -996,11 +851,6 @@ mod tests {
         );
     }
 
-    /// The cache returns the very same shaped runs when every input matches.
-    ///
-    /// This is what makes a pointer moving *within* one candle cheap: the second call
-    /// must not re-shape. It is also the only test that pins the hit path — the unit
-    /// test above pins the miss path.
     #[test]
     fn the_readout_cache_should_reuse_the_same_line_for_the_same_candle() {
         let mut app = ui_core::test_support::app::TestApp::new();

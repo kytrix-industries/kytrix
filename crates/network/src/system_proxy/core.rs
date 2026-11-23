@@ -1,5 +1,3 @@
-//! Get-only operating-system proxy snapshot, evaluated for a destination URL.
-
 use std::{
     net::IpAddr,
     sync::{
@@ -21,8 +19,6 @@ use super::macos;
 #[cfg(windows)]
 use super::windows;
 
-/// The URL a PAC script is asked about, with a WebSocket scheme mapped to its
-/// HTTP equivalent.
 pub(super) fn pac_request_url(destination: &Url) -> Url {
     let mut url = destination.clone();
     match url.scheme() {
@@ -37,13 +33,6 @@ pub(super) fn pac_request_url(destination: &Url) -> Url {
     url
 }
 
-/// Whether a destination names a host on this machine.
-///
-/// These are Chromium's implicit bypass rules: a request to a local host — a
-/// `localhost` name, a loopback address, a link-local address — is never handed
-/// to a proxy, whatever the operating system is configured with. The
-/// development service answers on `*.localhost`, so its routes stay direct even
-/// on a machine that sends everything else through a proxy.
 pub(super) fn destination_is_local(destination: &Url) -> bool {
     let Some(host) = destination.host_str() else {
         return false;
@@ -149,9 +138,6 @@ pub(crate) async fn refresh_os_proxy_fingerprint(
     {
         return Some(cached_os_proxy_fingerprint());
     }
-    // Reading the OS settings is a blocking call, and the caller may be an
-    // executor worker with no runtime context of its own: the blocking pool of
-    // the runtime reads them.
     let task = runtime.spawn_blocking(|| {
         struct RefreshGuard;
         impl Drop for RefreshGuard {

@@ -1,28 +1,3 @@
-//! The watch-list protocol, its background service, and the seam the service
-//! reads tickers through.
-//!
-//! One service instance follows the whole list the widget configures. A
-//! `Replace` request states the complete set of listings to follow and is diffed
-//! against the streams that are already open, so adding or removing one listing
-//! neither reopens the others nor loses the snapshots they hold. A `Retry`
-//! request reopens exactly one listing's stream, which is how a row whose stream
-//! failed is brought back. A `MarketReloaded` request states a complete set to
-//! follow the way `Replace` does and opens every one of its streams again, which
-//! is what the market they are on being loaded again needs: every stream resolved
-//! its increments from the generation that load replaced.
-//!
-//! # Stream generations
-//!
-//! Which messages are still current belongs to the framework, not to this
-//! protocol: `start_stream` keeps the generation of a key that is already live,
-//! `replace_stream` opens a new one, and the framework drops everything a retired
-//! generation still had in flight. So a message carries nothing but what it says,
-//! and the widget never sees one that belongs to a stream it has left.
-//!
-//! The service's own state follows the same rule at the request boundary: it
-//! changes the followed set only after the caller has the response, so a request
-//! whose answer was lost leaves no half-applied list behind.
-
 use std::{future::Future, sync::Arc};
 
 use ahash::{HashSet, HashSetExt};
@@ -50,37 +25,18 @@ use super::model::{
     MAX_WATCH_LIST_ENTRIES, WatchListStatus, WatchListStreamError, WatchListStreamEvent,
 };
 
-/// What the widget asks the service to do with the followed set.
-///
-/// The listings a request names are the ones the widget can read: a followed listing whose
-/// market participant is not loaded has no stream for this service to hold, and the widget
-/// keeps its row itself. A request therefore states a subset of what the user follows, and
-/// the widget is the one that decides which part of the list this is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum WatchListRequest {
-    /// Follows exactly these listings, keeping the streams that are already open
-    /// for the listings that stay.
     Replace { entries: Vec<VenueListingKey> },
-    /// Reopens one listing's stream in place.
     Retry { key: VenueListingKey },
-    /// Follows exactly these listings, opening every one of their streams again.
-    ///
-    /// The market they are on was loaded again: every one of those streams resolved its
-    /// increments from the generation that load replaced, so each of them has to resolve
-    /// again. Unlike `Replace` it keeps nothing open — every listing it names has a stream
-    /// that is stale, whether or not this service was already following it — and unlike
-    /// `Retry` it is one request for all of them, because a venue commit moves every listing
-    /// of that venue at once and the widget may have only one request in flight.
     MarketReloaded { entries: Vec<VenueListingKey> },
 }
 
-/// The service accepted the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WatchListResponse {
     Applied,
 }
 
-/// Why the service refused a request.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub(super) enum WatchListServiceError {
     #[error("the watch list follows {actual} listings; the maximum is {maximum}")]
@@ -113,19 +69,9 @@ impl WidgetProtocol for WatchListProtocol {
     type Error = WatchListServiceError;
 }
 
-/// The market data one watch list reads through.
-///
-/// The service is written against this seam rather than against the market participants
-/// connector, so a test can drive every ordering the real venues can produce
-/// without a venue.
 pub(super) trait TickerSource: Clone + Send + Sync + 'static {
     type Subscription: TickerEventSubscription;
 
-    /// The latest ticker of `listing`.
-    ///
-    /// Resolving the listing is part of both calls, so a lookup that fails is
-    /// reported as the failure it is — a catalog or transport error — rather than
-    /// as a listing that does not exist.
     fn fetch_ticker(
         &self,
         listing: VenueListingKey,
@@ -137,12 +83,7 @@ pub(super) trait TickerSource: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
 }
 
-/// One live ticker stream.
 pub(super) trait TickerEventSubscription: Send + 'static {
-    /// The increments of the listing this stream carries tickers of.
-    ///
-    /// They are read from the resolution that opened the stream, so every row the
-    /// stream publishes is written at the precision of the listing it follows.
     fn precision(&self) -> ListingPrecision;
 
     fn recv(
@@ -170,9 +111,6 @@ impl TickerSource for MarketCapability {
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
         let capability = self.clone();
         async move {
-            // The listing's own rules carry the increments its price is written at,
-            // and resolving the listing is what rejects one this route no longer
-            // publishes before a stream is opened for it.
             let resolved = capability.resolve_listing(&listing)?;
             let route = resolved.key.route.clone();
             let inner = capability.market(route).ticker(listing).subscribe().await?;
@@ -184,7 +122,6 @@ impl TickerSource for MarketCapability {
     }
 }
 
-/// One ticker stream from the market participants connector.
 pub(super) struct ClientTickerSubscription {
     inner: TickerStream,
     precision: ListingPrecision,
@@ -200,7 +137,6 @@ impl TickerEventSubscription for ClientTickerSubscription {
     }
 }
 
-/// The service that follows one watch list.
 pub(super) struct WatchListService<S = MarketCapability> {
     source: S,
 }
@@ -297,11 +233,6 @@ where
                     }
                 }
                 WatchListRequest::MarketReloaded { entries } => {
-                    // The listings are the set to follow, exactly as `Replace` follows the set
-                    // it is given: a reload is asked for by a widget that may have had a
-                    // request of its own in flight, and cancelling that request is only
-                    // harmless if this one carries the whole set rather than the difference
-                    // from what this service happens to hold.
                     let replacement = match validate_replacement(&entries) {
                         Ok(replacement) => replacement,
                         Err(error) => {
@@ -316,8 +247,6 @@ where
                             .filter(|key| !replacement.contains(*key))
                             .cloned(),
                     );
-                    // Unlike `Replace`, every listing is subscribed to again: the streams that
-                    // stay are the ones whose resolution this request is about.
                     let reopened = replacement
                         .iter()
                         .cloned()
@@ -327,9 +256,6 @@ where
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                         continue;
                     }
-                    // Every stream is prepared before any of them is opened, so a subscription
-                    // that fails or a caller that went away leaves the streams that are running
-                    // exactly as they were.
                     let Some(reopened) = prepare_subscriptions(reopened, &mut reply).await else {
                         continue;
                     };
@@ -351,25 +277,15 @@ where
     }
 }
 
-/// One listing whose stream is prepared and can be opened.
 struct PreparedTicker<S>
 where
     S: TickerSource,
 {
     key: VenueListingKey,
     source: S,
-    /// The subscription, or the failure that stands in its place. A listing the
-    /// source cannot serve is reported the way a failed subscription is — through
-    /// the stream the retry opens — so the row explains itself instead of the whole
-    /// request failing with nothing to show.
     subscription: Result<S::Subscription, MarketError>,
 }
 
-/// Subscribes to every newly followed listing, all at once.
-///
-/// The request's deadline and its cancellation both end the wait, and whatever
-/// was subscribed to by then is dropped with the tasks: a request the caller no
-/// longer wants must not leave streams running behind it.
 async fn prepare_subscriptions<S>(
     added: Vec<(VenueListingKey, S)>,
     reply: &mut RpcRequestContext<WatchListProtocol>,
@@ -426,7 +342,6 @@ where
     while tasks.join_next().await.is_some() {}
 }
 
-/// Checks a replacement and returns it as the set the streams are keyed by.
 pub(super) fn validate_replacement(
     entries: &[VenueListingKey],
 ) -> Result<HashSet<VenueListingKey>, WatchListServiceError> {
@@ -447,10 +362,6 @@ pub(super) fn validate_replacement(
     Ok(replacement)
 }
 
-/// Opens the stream of a listing that is not followed yet.
-///
-/// Repeating the same request is idempotent: a key that already has a live
-/// generation keeps it, and neither its publisher nor its snapshot is touched.
 fn start_stream<S>(context: &mut ServiceContext<WatchListProtocol>, prepared: PreparedTicker<S>)
 where
     S: TickerSource,
@@ -466,7 +377,6 @@ where
     });
 }
 
-/// Reopens one listing's stream, retiring the generation it replaces.
 fn replace_stream<S>(context: &mut ServiceContext<WatchListProtocol>, prepared: PreparedTicker<S>)
 where
     S: TickerSource,
@@ -482,7 +392,6 @@ where
     });
 }
 
-/// Reports what one stream is doing until it ends.
 async fn run_stream<S>(
     source: S,
     key: VenueListingKey,
@@ -503,13 +412,10 @@ async fn run_stream<S>(
     };
     if let Err(error) = result {
         publish_error(&publisher, error).await;
-        // A failed stream is terminal for its generation: it stays parked until a
-        // retry replaces it, so nothing reconnects behind the user's back.
         publisher.cancelled().await;
     }
 }
 
-/// Publishes one listing's snapshots until the stream ends.
 async fn run_stream_once<S>(
     source: &S,
     key: &VenueListingKey,
@@ -526,9 +432,6 @@ where
         return Ok(());
     }
 
-    // The increments are read once per stream generation: whichever source reports
-    // the opening ticker — the buffered stream or the REST page — the row is written
-    // at the precision of the listing the subscription resolved.
     let precision = subscription.precision();
     let initial = match select_initial_snapshot(source, key, &mut subscription, publisher).await {
         Ok(Some(ticker)) => ticker,
@@ -572,12 +475,6 @@ where
     }
 }
 
-/// Whether an incoming ticker says anything the row does not already show.
-///
-/// A ticker whose identifier went backwards is older than the one that was
-/// accepted, and one that is equal says nothing at all. A venue that publishes no
-/// ordering identifier at all says nothing about which of two tickers is newer, so
-/// a changed ticker is taken as it comes.
 fn should_publish_ticker(current: &ListingTicker, incoming: &ListingTicker) -> bool {
     if incoming == current {
         return false;
@@ -588,10 +485,6 @@ fn should_publish_ticker(current: &ListingTicker, incoming: &ListingTicker) -> b
     }
 }
 
-/// Takes the opening snapshot from whichever source reports it first.
-///
-/// A buffered stream event is newer than a REST response that was started before
-/// it, so the subscription is polled first.
 async fn select_initial_snapshot<S>(
     source: &S,
     key: &VenueListingKey,
@@ -624,7 +517,6 @@ where
     }
 }
 
-/// Rejects a ticker that arrived for a listing other than the subscribed one.
 fn validate_ticker_listing(
     expected: &VenueListingKey,
     ticker: &ListingTicker,
@@ -668,13 +560,6 @@ async fn publish_error(
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -712,7 +597,6 @@ mod tests {
 
     use super::*;
 
-    /// A subscription whose events the test pushes by hand.
     struct FakeSubscription {
         events: mpsc::Receiver<Result<Arc<ListingTicker>, MarketError>>,
         event_received: Arc<Notify>,
@@ -742,7 +626,6 @@ mod tests {
         }
     }
 
-    /// A source that hands out one prepared subscription.
     #[derive(Clone)]
     struct FakeSource {
         subscription: Arc<Mutex<Option<FakeSubscription>>>,
@@ -778,8 +661,6 @@ mod tests {
         }
     }
 
-    /// A source that hands out the subscription prepared for each followed listing and
-    /// answers each fetch with a ticker of the listing that was asked for.
     #[derive(Clone)]
     struct MultiListingSource {
         subscriptions: Arc<Mutex<ahash::HashMap<VenueListingKey, FakeSubscription>>>,
@@ -809,7 +690,6 @@ mod tests {
         }
     }
 
-    /// A source whose opening snapshot never arrives.
     #[derive(Clone)]
     struct PendingFetchSource {
         subscription: Arc<Mutex<Option<FakeSubscription>>>,
@@ -839,7 +719,6 @@ mod tests {
         }
     }
 
-    /// A source that subscribes only when the test says so.
     #[derive(Clone)]
     struct ManualRetrySource {
         attempts: Arc<AtomicUsize>,
@@ -876,10 +755,6 @@ mod tests {
         }
     }
 
-    /// A source whose subscription can be made to fail on demand.
-    ///
-    /// It is what a route that cannot serve the listing reports: the subscription
-    /// itself fails, before anything is asked of a venue.
     #[derive(Clone)]
     struct UnservableListingSource {
         unservable: Arc<AtomicBool>,
@@ -912,14 +787,12 @@ mod tests {
         }
     }
 
-    /// A source that only counts what was asked of it.
     #[derive(Clone)]
     struct CountingSource {
         subscription_calls: Arc<AtomicUsize>,
         fetch_calls: Arc<AtomicUsize>,
     }
 
-    /// A subscription that never reports anything.
     struct PendingSubscription;
 
     impl TickerSource for CountingSource {
@@ -952,7 +825,6 @@ mod tests {
         }
     }
 
-    /// What one subscription of [`GatedTickerSource`] does when it is opened.
     enum SubscriptionPlan {
         Ready,
         Pending {
@@ -961,7 +833,6 @@ mod tests {
         },
     }
 
-    /// Reports that a setup future was dropped before it finished.
     struct SetupDropSignal(Option<oneshot::Sender<()>>);
 
     impl Drop for SetupDropSignal {
@@ -972,7 +843,6 @@ mod tests {
         }
     }
 
-    /// A source that blocks inside subscription setup.
     #[derive(Clone)]
     struct GatedTickerSource {
         plans: Arc<Mutex<VecDeque<SubscriptionPlan>>>,
@@ -1041,7 +911,6 @@ mod tests {
         }
     }
 
-    /// The increments every fake subscription reports for its listing.
     fn precision() -> ListingPrecision {
         ListingPrecision {
             price_tick: "0.01".parse().expect("a price tick should parse"),
@@ -1181,7 +1050,6 @@ mod tests {
         }
     }
 
-    /// The statuses a stream published before it reported anything else.
     async fn receive_statuses_until_ready(
         reliable: &mut ReliableStream<WatchListProtocol>,
     ) -> Vec<WatchListStatus> {
@@ -1268,8 +1136,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A ticker whose identifier went backwards is older than the one already
-    /// accepted, so it does not replace it.
     #[tokio::test]
     async fn a_ticker_that_went_backwards_should_not_replace_a_newer_one() {
         let (source, events, event_received, _dropped) = fake_source(ticker(2, 100));
@@ -1480,8 +1346,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// Two listings of one route are two streams of their own: each is subscribed
-    /// once and publishes under its own key, so neither replaces the other.
     #[tokio::test]
     async fn reloading_a_market_should_reopen_every_listings_stream() {
         let (first_events, first_receiver) = mpsc::channel(8);
@@ -1521,9 +1385,6 @@ mod tests {
             .expect("both listings should be followed");
         assert_eq!(source.subscription_calls.load(Ordering::Acquire), 2);
 
-        // The same set again is a replacement of nothing: the streams that are open are the ones
-        // the service keeps, which is what makes `Replace` the wrong request for a market that was
-        // loaded again.
         runtime
             .client()
             .call(replace(vec![key(), other_key()]))
@@ -1531,8 +1392,6 @@ mod tests {
             .expect("a repeated replacement should be applied");
         assert_eq!(source.subscription_calls.load(Ordering::Acquire), 2);
 
-        // The market those listings are on is loaded again, so every one of their streams is
-        // opened again: the source is asked for both of them once more.
         let (reloaded_first_events, reloaded_first_receiver) = mpsc::channel(8);
         let (reloaded_second_events, reloaded_second_receiver) = mpsc::channel(8);
         {
@@ -1565,8 +1424,6 @@ mod tests {
             .expect("a reload of the market should be applied");
         wait_for_count(&source.subscription_calls, 4).await;
 
-        // The generations the reload retired are gone: the streams it replaced are the ones that
-        // were dropped with the subscriptions they held.
         for (events, listing) in [(&first_events, key()), (&second_events, other_key())] {
             assert!(
                 events
@@ -1577,14 +1434,10 @@ mod tests {
             );
         }
 
-        // The streams the reload opened are the live ones, and they are the resolution this load
-        // produced: what the new subscription publishes is what the pane reads.
         for (events, listing, close) in [
             (&reloaded_first_events, key(), 200_u64),
             (&reloaded_second_events, other_key(), 300),
         ] {
-            // Whatever a stream published while it was opening is not what this reads: the ticker
-            // below is what the resolution this load produced is asked to carry.
             while latest.next_unseen().is_some() {}
             events
                 .send(Ok(Arc::new(ticker_for(&listing, 3, close))))
@@ -1606,9 +1459,6 @@ mod tests {
             assert_eq!(published.close.value, Price::from(close));
         }
 
-        // The listings are the set to follow rather than a set this service is assumed to hold:
-        // a request that names one it does not follow follows it, because the request it stands
-        // in for — the widget's own, still in flight — may never have been applied at all.
         let (third_events, third_receiver) = mpsc::channel(8);
         source.subscriptions.lock().await.insert(
             indexed_key(9),
@@ -1698,8 +1548,6 @@ mod tests {
             .expect("latest stream should remain open");
         while latest.next_unseen().is_some() {}
 
-        // Each stream publishes a ticker of the listing it was opened for under
-        // that listing's own key.
         for (events, received, listing, close) in [
             (&first_events, &first_received, key(), 200_u64),
             (&second_events, &second_received, other_key(), 300),
@@ -2086,9 +1934,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A retry whose listing cannot be subscribed fails the row's own stream, and
-    /// nothing else: the request is still applied, because the row — not the whole
-    /// watch list — is what has something to report.
     #[tokio::test]
     async fn a_retry_whose_listing_cannot_be_subscribed_should_fail_only_that_stream() {
         let (_events, event_receiver) = mpsc::channel(1);
@@ -2159,9 +2004,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A replacement the service refuses is refused before anything is asked of a
-    /// source: a duplicate entry and an over-capacity list both leave the followed
-    /// streams exactly as they were.
     #[tokio::test]
     async fn duplicate_entries_should_be_refused_without_source_calls() {
         let (source, subscription_calls, fetch_calls) = counting_source();

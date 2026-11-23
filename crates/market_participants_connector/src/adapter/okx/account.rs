@@ -1,10 +1,3 @@
-//! OKX account payload decoders.
-//!
-//! Every decoder answers with the venue's own numbers paired with the canonical
-//! asset or listing the venue named: a balance or a fee carries the asset its
-//! currency code names, and an order, position or fill resolves its own
-//! instrument to the listing key the rest of the crate works with.
-
 use std::num::NonZeroU8;
 
 use market_participants_model::{
@@ -49,7 +42,6 @@ pub(super) struct ConfigRow {
     pub pos_mode: Option<SmolStr>,
 }
 
-/// Validates one authenticated history window and its row limit.
 pub(super) fn validate_history(
     query: &AuthenticatedQuery,
     operation: &'static str,
@@ -67,7 +59,6 @@ pub(super) fn validate_history(
     Ok(())
 }
 
-/// Decodes the balance account of one OKX balance answer.
 pub(super) fn decode_balances(
     accounts: &[OkxBalanceAccount],
 ) -> Result<Vec<NativeBalance>, MarketParticipantError> {
@@ -98,7 +89,6 @@ pub(super) fn decode_balances(
     Ok(balances)
 }
 
-/// Decodes a page of OKX orders, each under its own instrument's listing.
 pub(super) fn decode_orders(
     route: &VenueRoute,
     instrument_type: OkxInstrumentType,
@@ -165,10 +155,6 @@ fn decode_order(
     })
 }
 
-/// The margin mode one order was placed under.
-///
-/// A spot order carries OKX's cash mode, which is the absence of a perpetual
-/// margin mode rather than a third one.
 fn decode_order_margin_mode(
     route: &VenueRoute,
     value: Option<&str>,
@@ -244,11 +230,6 @@ fn decode_order_kind(
     }
 }
 
-/// The trigger terms of one conditional OKX order.
-///
-/// A take-profit order names its trigger in the `tp*` fields, a stop order in the
-/// `sl*` fields, and a plain trigger order in the unsuffixed ones; OKX leaves the
-/// fields a branch does not use empty.
 fn decode_conditional_terms(
     normalized: &str,
     item: &OkxOrder,
@@ -322,7 +303,6 @@ fn conditional_price(
     }
 }
 
-/// Decodes OKX positions, each under its own instrument's listing.
 pub(super) fn decode_positions(
     route: &VenueRoute,
     instrument_type: OkxInstrumentType,
@@ -402,7 +382,6 @@ pub(super) fn decode_positions(
     Ok(positions)
 }
 
-/// Decodes a page of OKX fills, each under its own instrument's listing.
 pub(super) fn decode_account_trades(
     route: &VenueRoute,
     instrument_type: OkxInstrumentType,
@@ -443,7 +422,6 @@ pub(super) fn decode_account_trades(
     Ok(trades)
 }
 
-/// Decodes a page of closed OKX positions, each under its own instrument's listing.
 pub(super) fn decode_position_history(
     route: &VenueRoute,
     instrument_type: OkxInstrumentType,
@@ -512,10 +490,6 @@ pub(super) fn decode_position_history(
     Ok(history)
 }
 
-/// The direction of one closed position.
-///
-/// A hedged account names the direction directly; a net account only names the
-/// side it was held on, so the direction is the one that side means.
 fn decode_historical_direction(
     value: Option<&str>,
     position_side: PositionSide,
@@ -538,7 +512,6 @@ fn decode_historical_direction(
     }
 }
 
-/// Decodes the account-wide position mode OKX reports.
 pub(super) fn decode_position_mode(
     rows: &[ConfigRow],
 ) -> Result<PositionMode, MarketParticipantError> {
@@ -555,7 +528,6 @@ pub(super) fn decode_position_mode(
     }
 }
 
-/// Decodes the margin mode and leverage OKX reports for one listing.
 pub(super) fn decode_leverage(
     rows: &[OkxLeverage],
 ) -> Result<(MarginMode, NonZeroU8), MarketParticipantError> {
@@ -568,10 +540,6 @@ pub(super) fn decode_leverage(
     ))
 }
 
-/// Decodes one OKX order push addressed to an authenticated orders subscription.
-///
-/// Every order of the frame keeps its own instrument's listing, and a
-/// subscription narrowed to one listing publishes only that one.
 pub(super) fn decode_order_frame(
     payload: &[u8],
     route: &VenueRoute,
@@ -600,11 +568,6 @@ pub(super) fn decode_order_frame(
         .collect())
 }
 
-/// Decodes one OKX position push addressed to an authenticated positions
-/// subscription.
-///
-/// A position the venue closed is pushed with a zero quantity, which is the
-/// event that reports the closure: its own numbers are published as they are.
 pub(super) fn decode_position_frame(
     payload: &[u8],
     route: &VenueRoute,
@@ -921,7 +884,6 @@ struct PrivateEventEnvelope<T> {
     data: Vec<T>,
 }
 
-/// The channel one private data frame belongs to, or none for a control frame.
 pub(super) fn private_frame_channel(payload: &[u8]) -> Option<SmolStr> {
     #[derive(Deserialize)]
     struct Header {
@@ -1148,8 +1110,6 @@ mod tests {
         ));
     }
 
-    /// A subscription narrowed to one listing publishes that listing and leaves
-    /// the orders of every other instrument of the account alone.
     #[test]
     fn a_narrowed_order_subscription_leaves_other_instruments_alone() {
         let events = decode_order_frame(
@@ -1189,8 +1149,6 @@ mod tests {
         assert_eq!(position.update_timestamp, 1_700_000_002_000);
     }
 
-    /// The venue reports a closed position as a push of quantity zero; its own
-    /// numbers are what the event carries.
     #[test]
     fn decodes_zero_private_position_event_for_removal() {
         let events = decode_position_frame(
@@ -1208,8 +1166,6 @@ mod tests {
         assert_eq!(position.update_timestamp, 1_700_000_003_000);
     }
 
-    /// The account-wide position mode and leverage answers are the venue's own
-    /// spellings, and an unknown one is refused instead of being read as a default.
     #[test]
     fn decodes_account_config_and_leverage_answers() {
         assert_eq!(
@@ -1237,8 +1193,6 @@ mod tests {
         assert_eq!(leverage.get(), 10);
     }
 
-    /// One balance answer keeps the venue's token codes for the account boundary
-    /// to resolve, and drops the entries that hold nothing.
     #[test]
     fn decodes_balance_entries_with_the_venues_token_codes() {
         let balances = decode_balances(&[OkxBalanceAccount {

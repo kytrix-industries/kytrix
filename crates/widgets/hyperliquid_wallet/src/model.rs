@@ -1,29 +1,3 @@
-//! What a Hyperliquid wallet holds and what it means.
-//!
-//! # Prices are only as precise as the catalog says
-//!
-//! Hyperliquid quotes every instrument on its own tick, and a wallet's rows are read against the
-//! catalog of the market they belong to rather than the instrument they name: a spot pair is
-//! displayed with its own price tick and quote asset, a spot balance's quantity with its base
-//! asset's own tick, and a balance in a stablecoin is money rather than a quantity.
-//! [`DisplayPrecision`] is that lookup, built once from the catalogs the venue answered with, so
-//! a snapshot carries the precision it was valued at instead of the view re-deriving it per
-//! frame.
-//!
-//! # A valuation that cannot be made is left out, not guessed
-//!
-//! Spot value, perpetual value and unrealized profit are each a sum over the rows that could
-//! be priced. A row whose asset is absent from the catalog, or an ambiguous spot pair, is
-//! skipped rather than valued at zero — and when nothing could be valued at all the summary
-//! says so with `None` instead of reporting an empty wallet.
-//!
-//! # Every view of an account is one snapshot
-//!
-//! The six detail tabs are six shapes of the same account, and they are all read the same way:
-//! fetch, validate against the catalog, then keep revaluing from the venue's fast asset
-//! contexts. [`DetailSnapshot`] is one such reading, and [`DetailData`] is which of the six it
-//! is.
-
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
@@ -58,8 +32,6 @@ use widget::{
     venue::{VenueDisplay as _, route_display_string},
 };
 
-/// What one listing publishes its numbers in: the increments they are written at,
-/// and the terms its prices are read in.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ListingTerms {
     precision: ListingPrecision,
@@ -67,26 +39,13 @@ struct ListingTerms {
     basis: PriceBasis,
 }
 
-/// The asset names of one catalog generation.
-///
-/// A name is the display code the published display catalog decided on for the
-/// asset, read from the generation the whole reading is built against. Nothing here
-/// restates a naming rule: a venue-issued token, a chain token, a security and a
-/// commodity are all named by the code that generation published, and an asset it
-/// does not name has no name at all — the reader shows the localized unknown rather
-/// than a digest.
 #[derive(Clone, Debug)]
 pub(super) struct AssetLabels {
     generation: DisplaySnapshot,
-    /// The resolved names, so a frame that draws a hundred rows names an asset once.
     labels: Arc<AHashMap<AssetId, SmolStr>>,
 }
 
 impl AssetLabels {
-    /// Reads names out of one captured catalog generation.
-    ///
-    /// The capture is the generation the precision of every value is read from too,
-    /// so a name and the digits beside it always come from one publication.
     pub(super) fn new(generation: DisplaySnapshot) -> Self {
         Self {
             generation,
@@ -94,7 +53,6 @@ impl AssetLabels {
         }
     }
 
-    /// The published display code of one asset, when the generation names it.
     pub(super) fn label(&self, asset: &AssetId) -> Option<SmolStr> {
         if let Some(label) = self.labels.get(asset) {
             return Some(label.clone());
@@ -105,17 +63,6 @@ impl AssetLabels {
         Some(label)
     }
 
-    /// The name one generation gives an asset.
-    ///
-    /// The catalog names every asset whose own terms state a code, or
-    /// whose code a route staged — not only the ones a surviving listing references —
-    /// so the catalog is the one answer to what an asset is called here: a balance, a
-    /// fee or a collateral asset read from a wallet has its code there whether or not
-    /// a listing of this generation trades it. An asset the catalog publishes no code
-    /// for — a contract token or a security no route staged, which nothing references
-    /// — has no name of its own, and the row is drawn as the localized unknown rather
-    /// than under a code this module would derive on its own: a second naming rule
-    /// would be free to disagree with the publication about the same asset.
     fn name(&self, asset: &AssetId) -> Option<SmolStr> {
         self.generation
             .resolver()
@@ -125,19 +72,8 @@ impl AssetLabels {
     }
 }
 
-/// How many rows one detail tab keeps.
-///
-/// The venue answers with more than this, and the oldest beyond it are dropped: a wallet's
-/// history is read from the top, and a tab is a view of what just happened.
 pub(super) const MAX_HISTORY: usize = 100;
 
-/// What a reading could not be turned into.
-///
-/// These are failures of the reading itself rather than of the venue: a catalog that does not
-/// describe the market it was fetched for, a listing it does not carry, or an amount outside
-/// the fixed-point range. They reach the user, so they are typed and localized, and none of
-/// them states an identity: the refusal names what is missing, while the listing a read was
-/// about stays a typed field of the error.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub(super) enum WalletDataError {
     #[error("the market catalog of {route} does not describe the market it was fetched for")]
@@ -153,8 +89,6 @@ pub(super) enum WalletDataError {
 
 impl TranslatedError for WalletDataError {
     fn translated_message(&self, translate: &Translate) -> SmolStr {
-        // The venue this widget reads is named by the catalogue rather than spelled
-        // into each message, so a sentence about it follows a rename of it.
         let market = VenueId::Hyperliquid.display_string(translate);
         match self {
             Self::RouteMismatch { route } => t_smol!(
@@ -163,10 +97,6 @@ impl TranslatedError for WalletDataError {
                 market = market,
                 route = route_display_string(route, translate)
             ),
-            // The listing a reading could not be valued for is an identity this
-            // message does not print: the row it belongs to was already drawn from
-            // the reading, so the failure states what the catalog lacks rather than
-            // naming a listing by a key that has no published name here.
             Self::ListingMissing { route, .. } => t_smol!(
                 translate,
                 "widget.hyperliquid_wallet.error_listing_missing",
@@ -183,33 +113,13 @@ impl TranslatedError for WalletDataError {
     }
 }
 
-/// Which of a venue's partitions one address's state is read from, and how.
-///
-/// # Why the split follows the catalogs rather than the route names
-///
-/// A venue's partitions are not the same kind of thing. `clearinghouseState` and
-/// `frontendOpenOrders` carry a `dex` parameter, so every perpetual partition is read once, while
-/// spot pairs are published by the spot partition alone. Which partition a route is, is answered
-/// by *what its catalog publishes* and never by what the route is called: which routes exist is
-/// the venue's answer, and this widget has no business knowing that one of them is named
-/// `core-spot`.
-///
-/// # Why "everything else is perpetual" is the conservative reading
-///
-/// A deployed DEX whose catalog is empty lands in `perpetual` and is therefore still read once:
-/// if that partition is broken, the address fails, which is the documented behaviour, instead of
-/// being quietly skipped. Grouping by "published a perpetual listing" would put an empty route in
-/// neither group and silently drop a partition from the reading — a much worse way to fail.
 #[derive(Clone, Debug, Default)]
 pub(super) struct WalletRouteKinds {
-    /// The routes that published at least one spot listing.
     spot: Vec<VenueRoute>,
-    /// Every other route, each read once for positions and once for open orders.
     perpetual: Vec<VenueRoute>,
 }
 
 impl WalletRouteKinds {
-    /// Groups the routes by what their catalogs publish, keeping the given order.
     pub(super) fn of(catalogs: &[(VenueRoute, Arc<[CatalogEntry]>)]) -> Self {
         let mut kinds = Self::default();
         for (route, catalog) in catalogs {
@@ -225,60 +135,26 @@ impl WalletRouteKinds {
         kinds
     }
 
-    /// The routes that published spot listings, whose pairs a balance is valued through.
     pub(super) fn spot(&self) -> &[VenueRoute] {
         &self.spot
     }
 
-    /// The routes read once each for positions and once each for open orders.
     pub(super) fn perpetual(&self) -> &[VenueRoute] {
         &self.perpetual
     }
 }
 
-/// How the listings of a venue's markets are displayed.
-///
-/// It is built once per reading and then shared by everything that shows a number from it, so
-/// two rows valued at the same moment agree about how many digits they have and about what the
-/// assets in them are called.
-///
-/// # Why the index is by listing and by asset
-///
-/// A listing's ticks belong to the listing: one canonical instrument can be listed by several
-/// routes, and a position of one of them is drawn with the rules of the listing it was held on,
-/// never with a sibling's. A spot balance names no listing — it is a quantity of one asset — so
-/// it is drawn with that asset's own quantity tick, which is why the two indexes are separate
-/// and neither falls back to a canonical instrument. A balance's *price*, on the other hand, is
-/// read on one pair and is drawn from that pair: two pairs quoting one base against two assets
-/// are two markets, not one asset with two precisions.
 #[derive(Clone, Debug)]
 pub(super) struct DisplayPrecision {
     listings: Arc<AHashMap<VenueListingKey, ListingTerms>>,
-    /// The quantity tick of one spot asset, which is a property of the asset itself.
-    ///
-    /// A spot balance is a quantity of an asset rather than a position on a pair, so what
-    /// displays it is the asset's own tick. A price is the one thing of a pair that is *not*
-    /// the asset's: the same base is quoted at its own tick against each asset it trades
-    /// against, so a price is displayed from the listing it was read on, never from anything
-    /// indexed by the asset alone.
     assets: Arc<AHashMap<AssetId, Tick>>,
-    /// The asset each listing is valued in, which is what matches a listing's row to the
-    /// venue's own mark price for it.
     listing_assets: Arc<AHashMap<VenueListingKey, AssetId>>,
-    /// The assets the route's spot listings are quoted in, in the order the catalog ranks
-    /// them, which is what orders the pairs a balance may be valued through.
     quote_assets: Arc<[AssetId]>,
-    /// The spot listing of one `(base, quote)` pair, which is the listing a balance quoted in
-    /// that pair is valued at.
     pairs: Arc<AHashMap<(AssetId, AssetId), VenueListingKey>>,
-    /// The product family of every listing whose catalog described it.
     listing_kinds: Arc<AHashMap<VenueListingKey, InstrumentKind>>,
-    /// The asset every listing is settled or paid in, when its instrument has one.
     settlement_assets: Arc<AHashMap<VenueListingKey, AssetId>>,
     stable_assets: Arc<AHashSet<AssetId>>,
     labels: AssetLabels,
-    /// The tick a money amount is written in: ten decimal places, which is finer than any
-    /// amount the venue reports.
     amount_tick: Tick,
 }
 
@@ -299,11 +175,6 @@ impl PartialEq for DisplayPrecision {
 impl Eq for DisplayPrecision {}
 
 impl DisplayPrecision {
-    /// Indexes the catalogs of several routes at once.
-    ///
-    /// Every route is passed with its own published entries, and the catalog generation
-    /// supplies the asset names, so a reading is displayed with the terms that were published
-    /// with it.
     pub(super) fn from_catalogs(
         asset_labels: AssetLabels,
         catalogs: impl IntoIterator<Item = (VenueRoute, Arc<[CatalogEntry]>)>,
@@ -332,24 +203,10 @@ impl DisplayPrecision {
                     basis: rules.common.price.basis.clone(),
                 };
                 let quantity_tick = terms.precision.quantity_tick;
-                // One route describes one listing once: a key carries its route, and a route's
-                // catalog is the venue's own answer for it, so a key met twice is a broken
-                // catalog rather than two descriptions to reconcile. Nothing is merged on a
-                // collision — the entry that arrived is the entry the route stated.
                 listings.insert(key.clone(), terms);
                 listing_kinds.insert(key.clone(), entry.instrument.kind());
                 match entry.instrument.terms() {
                     InstrumentTerms::Spot(terms) => {
-                        // A spot balance is held in the listing's base asset, and the base
-                        // token's own size precision is the same on every pair it is quoted in.
-                        // Its price is not: two pairs of one base are quoted at their own ticks
-                        // and against their own assets, which is why nothing pair-shaped is
-                        // indexed by the asset here. Each field takes the finer of the two
-                        // values where a base really is described twice: a tick only decides how
-                        // many digits a value is written with on the reading side, and the finer
-                        // one cannot merge two values a coarser one would tell apart, while the
-                        // coarser one can. Merging per field also keeps the index independent of
-                        // the order the catalogs are visited in.
                         match assets.get_mut(terms.base()) {
                             Some(existing) => *existing = (*existing).min(quantity_tick),
                             None => {
@@ -391,7 +248,6 @@ impl DisplayPrecision {
         })
     }
 
-    /// Displays money without a market behind it: the ledger and its amounts.
     pub(super) fn money_only(asset_labels: AssetLabels) -> Result<Self, WalletDataError> {
         Ok(Self {
             listings: Arc::new(AHashMap::new()),
@@ -407,57 +263,39 @@ impl DisplayPrecision {
         })
     }
 
-    /// The asset one listing is valued in, when the catalogs describe it.
     fn listing_asset(&self, listing: &VenueListingKey) -> Option<&AssetId> {
         self.listing_assets.get(listing)
     }
 
-    /// The asset one listing's prices are quoted in, when the catalogs describe it.
     fn listing_quote_asset(&self, listing: &VenueListingKey) -> Option<&AssetId> {
         Some(&self.listings.get(listing)?.quote_asset)
     }
 
-    /// The asset one listing is settled or paid in, when the catalogs describe it.
     fn listing_settlement_asset(&self, listing: &VenueListingKey) -> Option<&AssetId> {
         self.settlement_assets.get(listing)
     }
 
-    /// The basis one listing's prices are published on, when the catalogs describe it.
     fn listing_price_basis(&self, listing: &VenueListingKey) -> Option<&PriceBasis> {
         Some(&self.listings.get(listing)?.basis)
     }
 
-    /// The spot listing of one pair, when a route publishes it.
     fn pair_listing(&self, base: &AssetId, quote: &AssetId) -> Option<&VenueListingKey> {
         self.pairs.get(&(base.clone(), quote.clone()))
     }
 
-    /// Where one quote asset sits in the route's own ranking.
     fn quote_priority(&self, asset: &AssetId) -> Option<usize> {
         self.quote_assets.iter().position(|quote| quote == asset)
     }
 
-    /// The name of one asset, as a reader knows it.
-    ///
-    /// A generation that does not name the asset is drawn as the localized unknown:
-    /// a digest is not a name, and a name invented here would disagree with every
-    /// other pane about the same asset.
     pub(super) fn asset_label(&self, asset: &AssetId, translate: &Translate) -> SmolStr {
         self.asset_name(asset)
             .unwrap_or_else(|| t_smol!(translate, "error.display.unknown_asset"))
     }
 
-    /// The published display name of one asset, when the generation names it.
     pub(super) fn asset_name(&self, asset: &AssetId) -> Option<SmolStr> {
         self.labels.label(asset)
     }
 
-    /// The label of one quantity unit, when the unit is one this build can name.
-    ///
-    /// A unit that names an asset is labelled by that asset's own short name, and a unit that
-    /// counts contracts is the shared "contracts" wording. An outcome unit names the leg it
-    /// belongs to and not the group it settles with, so it has no label here: the tab that
-    /// knows the group is what names it.
     pub(super) fn quantity_unit_label(
         &self,
         unit: &market_participants_model::market::units::QuantityUnit,
@@ -474,7 +312,6 @@ impl DisplayPrecision {
         }
     }
 
-    /// The product family of one listing the catalogs know.
     pub(super) fn listing_kind(&self, listing: &VenueListingKey) -> InstrumentKind {
         self.listing_kinds
             .get(listing)
@@ -482,13 +319,6 @@ impl DisplayPrecision {
             .unwrap_or(InstrumentKind::Spot)
     }
 
-    /// The name of one listing: its canonical instrument's base asset.
-    ///
-    /// A listing the reading does not describe has no name here, so it is drawn as the
-    /// shared localized unknown rather than as its listing identity. The names
-    /// themselves come from the generation the reading was taken under — this index is
-    /// built from that generation's catalogs — so the fallback is the same shared
-    /// message every other pane falls back to, not a second wording of its own.
     pub(super) fn listing_label(
         &self,
         listing: &VenueListingKey,
@@ -498,29 +328,18 @@ impl DisplayPrecision {
             .unwrap_or_else(|| t_smol!(translate, "error.display.unknown_listing"))
     }
 
-    /// The published display name of one listing, when the reading describes it.
     pub(super) fn listing_name(&self, listing: &VenueListingKey) -> Option<SmolStr> {
         self.listing_assets
             .get(listing)
             .and_then(|asset| self.labels.label(asset))
     }
 
-    /// The published display name of the asset one listing is collateralised in.
-    ///
-    /// It is the pure read `listing_collateral_label` falls back from, which only a
-    /// test asks for directly: the view draws the label, not the name.
     #[cfg(test)]
     pub(super) fn collateral_name(&self, listing: &VenueListingKey) -> Option<SmolStr> {
         self.listing_settlement_asset(listing)
             .and_then(|asset| self.labels.label(asset))
     }
 
-    /// The name of the asset one listing is collateralised in.
-    ///
-    /// A perpetual position is margined in what its settlement asset is and a spot order is paid
-    /// for in its quote asset, so the collateral of a listing is the asset its own terms name.
-    /// A listing the reading does not describe has no collateral to name, which is a missing
-    /// value rather than an unknown name.
     pub(super) fn listing_collateral_label(
         &self,
         listing: &VenueListingKey,
@@ -532,7 +351,6 @@ impl DisplayPrecision {
         }
     }
 
-    /// Displays a quantity of one asset in that asset's own tick, or as money for a stablecoin.
     pub(super) fn format_asset_quantity(
         &self,
         asset: &AssetId,
@@ -548,17 +366,14 @@ impl DisplayPrecision {
         ))
     }
 
-    /// Displays a money amount: a balance value, a margin, a notional.
     pub(super) fn format_money_quantity(&self, value: Quantity) -> SmolStr {
         format_grouped_decimal(value.format_and_round_tick(self.amount_tick).as_str())
     }
 
-    /// Displays a signed money amount.
     pub(super) fn format_money_signed_quantity(&self, value: SignedQuantity) -> SmolStr {
         format_grouped_decimal(value.format_and_round_tick(self.amount_tick).as_str())
     }
 
-    /// Displays a profit or a loss, with the sign a gain is read by.
     pub(super) fn format_money_profit(&self, value: SignedQuantity) -> SmolStr {
         if value.is_zero() {
             return SmolStr::new_static("0");
@@ -572,12 +387,10 @@ impl DisplayPrecision {
         }
     }
 
-    /// Displays one reading's own profit or loss, with the sign a gain is read by.
     pub(super) fn format_profit_or_loss(&self, value: ProfitOrLoss) -> SmolStr {
         self.format_money_profit(SignedQuantity::from_inner(value.inner()))
     }
 
-    /// Displays a price of a listing the catalogs know.
     pub(super) fn format_listing_price(
         &self,
         listing: &VenueListingKey,
@@ -589,7 +402,6 @@ impl DisplayPrecision {
         ))
     }
 
-    /// Displays a quantity of a listing the catalogs know.
     pub(super) fn format_listing_quantity(
         &self,
         listing: &VenueListingKey,
@@ -601,11 +413,6 @@ impl DisplayPrecision {
         ))
     }
 
-    /// Displays an asset's own price, in that asset's own tick, or as money for a stablecoin.
-    ///
-    /// This is for the one price that has no market behind it: a stablecoin is one unit of
-    /// itself, and a balance of one is valued at that. A price read on a pair is drawn from the
-    /// pair (see [`SpotBalanceRow::price_listing`]).
     pub(super) fn format_asset_price(
         &self,
         asset: &AssetId,
@@ -621,7 +428,6 @@ impl DisplayPrecision {
         ))
     }
 
-    /// Displays a signed quantity of a listing the catalogs know: a position or a size.
     pub(super) fn format_listing_signed_quantity(
         &self,
         listing: &VenueListingKey,
@@ -633,7 +439,6 @@ impl DisplayPrecision {
         ))
     }
 
-    /// The quantity tick of one asset of a spot catalog.
     fn asset_quantity_tick(&self, asset: &AssetId) -> Result<Tick, WalletDataError> {
         self.assets
             .get(asset)
@@ -643,11 +448,6 @@ impl DisplayPrecision {
             })
     }
 
-    /// The terms of one listing.
-    ///
-    /// The lookup is by listing key, so two routes that list the same canonical instrument
-    /// keep their own ticks: a position held on one of them is drawn with the rules of the
-    /// listing it was held on.
     fn listing_terms(&self, listing: &VenueListingKey) -> Result<ListingTerms, WalletDataError> {
         self.listings
             .get(listing)
@@ -658,10 +458,6 @@ impl DisplayPrecision {
             })
     }
 
-    /// Refuses a reading the catalog cannot display.
-    ///
-    /// A row whose listing is absent would be drawn as its raw value, which is exactly the
-    /// silent downgrade this refuses: the answer is an error the pane can report instead.
     fn validate_detail(&self, data: &DetailData) -> Result<(), WalletDataError> {
         match data {
             DetailData::Spot(snapshot) => {
@@ -699,14 +495,12 @@ impl DisplayPrecision {
     }
 }
 
-/// The tick a money amount is written in.
 fn amount_tick() -> Result<Tick, WalletDataError> {
     Tick::from_inner(10_000_000_000_000_000).map_err(|_| WalletDataError::Codec {
         operation: "index Hyperliquid wallet money precision",
     })
 }
 
-/// Groups a formatted decimal's integer digits, leaving its fraction as it is.
 fn format_grouped_decimal(value: &str) -> SmolStr {
     let (sign, unsigned) = value
         .strip_prefix('-')
@@ -731,7 +525,6 @@ fn format_grouped_decimal(value: &str) -> SmolStr {
     SmolStr::new(formatted)
 }
 
-/// What one wallet is worth right now.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AccountSummary {
     pub spot_value: Option<Quantity>,
@@ -740,7 +533,6 @@ pub(super) struct AccountSummary {
 }
 
 impl AccountSummary {
-    /// Values one wallet's spot balances and perpetual positions.
     pub(super) fn from_states(
         spot: &HyperliquidSpotState,
         perpetual: &HyperliquidPerpetualState,
@@ -758,11 +550,6 @@ impl AccountSummary {
     }
 }
 
-/// The spot balances a wallet holds, valued at the venue's latest contexts.
-///
-/// A balance names an asset, and an asset has no price of its own on the venue: what is
-/// published is a price per listing. A balance is therefore valued through the pairs that
-/// quote its asset, which is the same reading [`SpotSnapshot`] draws row by row.
 fn spot_value(
     state: &HyperliquidSpotState,
     pairs: &[HyperliquidSpotPair],
@@ -785,30 +572,16 @@ fn spot_value(
     (total.inner() >= 0).then(|| Quantity::from_inner(total.inner() as u128))
 }
 
-/// The signed size of one position, as the one number its profit is read in.
-///
-/// A position carries its size as a non-negative magnitude and the direction it points, so the
-/// sign is put back here: a long is the magnitude itself and a short is the same magnitude read
-/// from the other side. Which way a position points is what decides whether a move in its price
-/// is a profit or a loss, and that is the whole of what the sign carries.
 fn signed_size(position: &HyperliquidPerpetualPosition) -> SignedQuantity {
     let magnitude = SignedQuantity::from_inner(
         i128::try_from(position.size.value.inner()).unwrap_or(i128::MAX),
     );
     match position.direction {
         PositionDirection::Long => magnitude,
-        // A magnitude that fits this build is never `i128::MIN`, so the negation always has a
-        // value; an impossible one would leave the magnitude standing rather than reporting a
-        // position as its opposite.
         PositionDirection::Short => magnitude.checked_neg().unwrap_or(magnitude),
     }
 }
 
-/// The notional a wallet's perpetual positions hold, and what they are up or down.
-///
-/// A position whose listing has no context is left out of both sums, and a position without an
-/// entry price has no unrealized profit to report — which is why the two are optional
-/// independently of each other.
 fn perpetual_values(
     state: &HyperliquidPerpetualState,
     contexts: &[HyperliquidAssetContext],
@@ -825,9 +598,6 @@ fn perpetual_values(
         let Some((price, _)) = listing_context_price(contexts, precision, &position.listing) else {
             continue;
         };
-        // What the positions hold is a magnitude: a size times a price is the notional one
-        // position is worth, whichever side it is held from. Which way it is held is what the
-        // profit below is read in.
         let size = position.size.value;
         let Some(notional) = size.checked_mul_price(price.value) else {
             continue;
@@ -863,12 +633,6 @@ fn perpetual_values(
     (saw_value.then_some(value), saw_pnl.then_some(pnl))
 }
 
-/// The venue's own mark or mid price of one listing, with the listing it was read on.
-///
-/// A position of a route is valued at the context the route publishes for the listing it was
-/// held on, so two routes that list the same canonical instrument keep their own prices. The
-/// listing travels back with the price because a price is drawn with the rules of the market it
-/// was read on and those rules are the listing's, never the one that was asked about.
 fn listing_context_price(
     contexts: &[HyperliquidAssetContext],
     precision: &DisplayPrecision,
@@ -878,12 +642,6 @@ fn listing_context_price(
     let quoted = match contexts.iter().find(|context| &context.listing == listing) {
         Some(context) => context,
         None => {
-            // A route may publish a context for another listing of the same asset, which is a
-            // price of that asset when the venue publishes exactly one of them. Two is not a
-            // price this can pick, so nothing is valued rather than the wrong listing being.
-            //
-            // The listing that answered is the one the price belongs to: it names a market of
-            // the same asset, and that market's quote asset is what the price is quoted in.
             let mut same_asset = contexts.iter().filter(|context| {
                 precision
                     .listing_asset(&context.listing)
@@ -908,14 +666,12 @@ fn listing_context_price(
     Some((price, quoted.listing.clone()))
 }
 
-/// One wallet's row in the overview: what it is worth, and how to read it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WalletOverviewSnapshot {
     pub summary: AccountSummary,
     pub precision: DisplayPrecision,
 }
 
-/// The fills of one wallet over the window a timeline shows.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TimelineSnapshot {
     pub window_start: i64,
@@ -923,7 +679,6 @@ pub(super) struct TimelineSnapshot {
     pub fills: Arc<[HyperliquidUserFill]>,
 }
 
-/// The six views of one account.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum DetailTab {
     Spot,
@@ -935,7 +690,6 @@ pub(super) enum DetailTab {
 }
 
 impl DetailTab {
-    /// Every tab, in the order the tab bar shows them.
     pub(super) const ALL: [Self; 6] = [
         Self::Spot,
         Self::Perpetual,
@@ -945,10 +699,6 @@ impl DetailTab {
         Self::Ledger,
     ];
 
-    /// Where this tab sits in [`DetailTab::ALL`].
-    ///
-    /// Nothing reads a position back into a tab: a control names the tab it opens, so a
-    /// position only ever has to be built from one.
     pub(super) const fn index(self) -> usize {
         match self {
             Self::Spot => 0,
@@ -961,23 +711,16 @@ impl DetailTab {
     }
 }
 
-/// One spot balance, valued against the wallet's other balances.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SpotBalanceRow {
     pub asset: AssetId,
     pub total: SignedQuantity,
     pub value: Option<SignedQuantity>,
     pub price: Option<MarketPrice>,
-    /// The pair the price beside it was read on, which is what draws that price: the price
-    /// tick, the quote asset and the basis of a spot market are that market's, and a base
-    /// quoted against two assets has two of each. A stablecoin's price is money, which no
-    /// market quotes, so it has no listing here.
     pub price_listing: Option<VenueListingKey>,
-    /// What share of the wallet's spot value this balance is, when the wallet has one.
     pub asset_share: Option<SmolStr>,
 }
 
-/// Every spot balance a wallet holds, with the pairs they are quoted against.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SpotSnapshot {
     pub rows: Arc<[SpotBalanceRow]>,
@@ -985,14 +728,6 @@ pub(super) struct SpotSnapshot {
 }
 
 impl SpotSnapshot {
-    /// Takes the displayable balances as read, and values them against the venues' contexts.
-    ///
-    /// The venue's spot state reports every token the account holds, including tokens its
-    /// spot metadata does not describe — outcome shares are the ones seen in practice. A
-    /// balance whose asset has neither a published quantity tick nor a stablecoin identity
-    /// cannot be drawn as a spot position: it has no digits to round to and no pair to price
-    /// it on. It is left out rather than failing the tab, because one such balance would
-    /// otherwise hide every holding the tab can draw.
     pub(super) fn new(
         mut state: HyperliquidSpotState,
         pairs: Vec<HyperliquidSpotPair>,
@@ -1023,7 +758,6 @@ impl SpotSnapshot {
         Ok(snapshot)
     }
 
-    /// Revalues every row at the latest contexts, and re-derives the shares.
     pub(super) fn apply_contexts(
         &mut self,
         contexts: &[HyperliquidAssetContext],
@@ -1068,19 +802,6 @@ impl SpotSnapshot {
     }
 }
 
-/// The price of one spot asset, from the pairs it is quoted in, with the listing it was read on.
-///
-/// A balance is held in an asset and priced through the pairs that quote it: the venue
-/// publishes no price for an asset on its own, and the stablecoins a route settles in are the
-/// money everything else is read against.
-///
-/// The listing travels back with the price because a price is drawn with the rules of the market
-/// it was read on and a base quoted against two assets has two of those. Money is the one price
-/// that has no market behind it, so it answers no listing at all.
-///
-/// Two pairs of the same rank are not a price this can pick — a balance held in one base and
-/// quoted against two different assets has no single price — so it answers `None` rather than
-/// guessing which market the balance is valued in.
 fn spot_asset_price(
     asset: &AssetId,
     pairs: &[HyperliquidSpotPair],
@@ -1118,12 +839,9 @@ fn spot_asset_price(
     {
         return None;
     }
-    // The listing that answered, which is the pair asked about unless that pair published no
-    // context and exactly one other market of the same asset did.
     Some((first.1.0.clone(), Some(first.1.1.clone())))
 }
 
-/// What share of a total one value is, to two places.
 fn checked_percentage(
     value: SignedQuantity,
     total: SignedQuantity,
@@ -1142,7 +860,6 @@ fn checked_percentage(
     Ok(format_smolstr!("{}%", format_grouped_decimal(number)))
 }
 
-/// Which of the six views of an account a reading is.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum DetailData {
     Spot(SpotSnapshot),
@@ -1153,7 +870,6 @@ pub(super) enum DetailData {
     Ledger(Vec<HyperliquidLedgerEvent>),
 }
 
-/// One reading of one detail tab, with the precision it is displayed at.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DetailSnapshot {
     pub data: DetailData,
@@ -1161,7 +877,6 @@ pub(super) struct DetailSnapshot {
 }
 
 impl DetailSnapshot {
-    /// Validates a reading against the catalog before anything shows it.
     pub(super) fn new(
         data: DetailData,
         precision: DisplayPrecision,
@@ -1170,10 +885,6 @@ impl DetailSnapshot {
         Ok(Self { data, precision })
     }
 
-    /// Revalues the reading at the latest contexts.
-    ///
-    /// Only the two tabs whose rows carry a live valuation revalue; the rest are history, and
-    /// history does not move.
     pub(super) fn apply_contexts(
         &mut self,
         contexts: &[HyperliquidAssetContext],
@@ -1196,9 +907,6 @@ impl DetailSnapshot {
                         })
                     });
                     if let (Some(entry), Some(price)) = (position.entry_price.clone(), price) {
-                        // The size the profit is read in carries the direction: a long gains
-                        // what the price rose and a short gains what it fell, which is the same
-                        // arithmetic with the opposite sign.
                         let pnl = if price.value >= entry.value {
                             price
                                 .value
@@ -1224,11 +932,6 @@ impl DetailSnapshot {
     }
 }
 
-/// The newest fills of a reading, newest first.
-///
-/// The venue answers with more than a tab shows, and the oldest beyond the cap are dropped
-/// here rather than by whoever asked: an answer's size is the venue's business, and a tab's
-/// size is this widget's.
 pub(super) fn sort_and_limit_fills(
     mut fills: Vec<HyperliquidUserFill>,
 ) -> Vec<HyperliquidUserFill> {
@@ -1242,7 +945,6 @@ pub(super) fn sort_and_limit_fills(
     fills
 }
 
-/// The newest open orders of a reading, newest first.
 pub(super) fn sort_and_limit_open_orders(
     mut orders: Vec<HyperliquidOpenOrder>,
 ) -> Vec<HyperliquidOpenOrder> {
@@ -1256,7 +958,6 @@ pub(super) fn sort_and_limit_open_orders(
     orders
 }
 
-/// The newest historical orders of a reading, newest first.
 pub(super) fn sort_and_limit_historical_orders(
     mut orders: Vec<HyperliquidHistoricalOrder>,
 ) -> Vec<HyperliquidHistoricalOrder> {
@@ -1270,7 +971,6 @@ pub(super) fn sort_and_limit_historical_orders(
     orders
 }
 
-/// The newest ledger events of a reading, newest first.
 pub(super) fn sort_and_limit_ledger(
     mut events: Vec<HyperliquidLedgerEvent>,
 ) -> Vec<HyperliquidLedgerEvent> {
@@ -1279,7 +979,6 @@ pub(super) fn sort_and_limit_ledger(
     events
 }
 
-/// How old a timestamp is, in the coarsest unit that still says something.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AgeBucket {
     Seconds(u64),
@@ -1288,10 +987,6 @@ pub(super) enum AgeBucket {
     Days(u64),
 }
 
-/// The age of a timestamp, as of `now_millis`.
-///
-/// A timestamp the clock has not reached yet is "now" rather than a negative age, and the
-/// boundaries are inclusive so a value that reads as a whole minute is the minute.
 pub(super) fn age_bucket(now_millis: i64, timestamp: i64) -> AgeBucket {
     let seconds = now_millis.saturating_sub(timestamp).max(0) / 1_000;
     let seconds = u64::try_from(seconds).unwrap_or(u64::MAX);
@@ -1306,10 +1001,6 @@ pub(super) fn age_bucket(now_millis: i64, timestamp: i64) -> AgeBucket {
     }
 }
 
-/// The wall clock, in the milliseconds the venue timestamps with.
-///
-/// It answers nothing when the system clock is before the epoch, which is the one thing a
-/// caller has to decide about rather than read a plausible-looking zero for.
 pub(super) fn now_millis() -> Option<i64> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1320,15 +1011,9 @@ pub(super) fn now_millis() -> Option<i64> {
     i64::try_from(value).ok()
 }
 
-/// When a fill, an order or a transfer happened, read in `zone`, to the second.
-///
-/// It is what a relative age is a summary of, so it is written the same way for every row.
 pub(super) fn absolute_time(timestamp: i64, zone: time::UtcOffset) -> SmolStr {
     use time::OffsetDateTime;
 
-    // The offset can move an instant past the last date the calendar holds — a
-    // timestamp at the far end of the range is one the service cannot publish, and
-    // it is written as a placeholder rather than taken to a date that is not one.
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
         .ok()
         .and_then(|time| time.checked_to_offset(zone))
@@ -1362,7 +1047,6 @@ mod tests {
         published_spot, spot_entry, spot_pair, spot_route, spot_state, token, wallet_balance,
     };
 
-    /// The translator the product ships, in the language a test asks for.
     fn translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -1370,12 +1054,10 @@ mod tests {
         )
     }
 
-    /// The perpetual listing the tests are about, as the fixture publishes it.
     fn perpetual_listing() -> VenueListingKey {
         published_perpetual("ETH")
     }
 
-    /// A perpetual listing of the test perpetual route.
     fn perpetual(asset: &str, price_tick: &str, quantity_tick: &str) -> CatalogEntry {
         crate::test_support::entry(
             &perpetual_route(),
@@ -1386,7 +1068,6 @@ mod tests {
         )
     }
 
-    /// A spot listing of the test spot route.
     fn spot(base: &str, quote: &str) -> CatalogEntry {
         crate::test_support::spot_entry(&spot_route(), base, quote, "0.001", "0.001")
     }
@@ -1415,8 +1096,6 @@ mod tests {
         );
     }
 
-    /// Two routes may list the same canonical instrument under different ticks, and a value is
-    /// drawn with the rules of the listing it belongs to.
     #[test]
     fn display_precision_should_keep_two_listings_of_one_instrument_apart() {
         let first = perpetual("ETH", "0.1", "0.001");
@@ -1513,22 +1192,6 @@ mod tests {
         assert!(matches!(error, WalletDataError::ListingMissing { .. }));
     }
 
-    /// Gate G1: the catalogs of every wallet route index into one display.
-    ///
-    /// One monitored wallet is read across the core spot scope, the core perpetual scope and every
-    /// deployed perpetual DEX, and all of those readings are displayed through one precision index.
-    /// Whether those catalogs can be indexed together is a property to check rather than to
-    /// assume, and the gate that checks it is the precision index itself: the two synthetic
-    /// perpetuals of one instrument are what a deployed DEX publishes next to the core perpetual
-    /// of the same instrument. What the gate does *not* cover is a base asset quoted against two
-    /// assets, which is a property of one route's own catalog rather than of the union; the
-    /// two-quote tests below are that shape's guards.
-    /// A route is read the way its own catalog says: spot pairs come from a route that published
-    /// spot listings, and every other route is read for positions and orders.
-    ///
-    /// The empty catalog is what the last assertion is about: "everything else is perpetual" is
-    /// the conservative reading, because a partition that is skipped drops whatever it held
-    /// silently, while a partition that is read and fails is a failure the address reports.
     #[test]
     fn wallet_route_kinds_should_group_a_route_by_what_it_publishes() {
         let core_spot = spot_route();
@@ -1623,8 +1286,6 @@ mod tests {
         );
     }
 
-    /// An asset is named by its own canonical terms, and an asset no catalog registered is
-    /// named by the identity that stands in for it.
     #[test]
     fn an_asset_should_be_named_by_its_own_terms() {
         let precision = precision_of(&spot_route(), vec![spot("HYPE", "USDC")]);
@@ -1669,7 +1330,6 @@ mod tests {
         );
     }
 
-    /// A perpetual is named by the asset its underlying tracks, and margined in what it settles.
     #[test]
     fn a_perpetual_should_be_named_by_its_underlying() {
         let precision = precision_of(&perpetual_route(), vec![perpetual("ETH", "0.1", "0.001")]);
@@ -1758,8 +1418,6 @@ mod tests {
         );
     }
 
-    /// A balance whose asset no pair prices is left out of the total rather than valued at zero,
-    /// and the venue's quote ranking is what picks between two pairs that quote it.
     #[test]
     fn spot_valuation_should_skip_unpriced_rows_and_fallback_quote_priority() {
         let precision = precision_of(
@@ -1771,8 +1429,6 @@ mod tests {
             wallet_balance("SOL", "4"),
         ]);
         let pairs = vec![spot_pair("HYPE", "USDC"), spot_pair("HYPE", "USDT")];
-        // Both pairs of the base have a price of their own, so the ranking is what decides which
-        // one values it: USDC is the quote the catalog states first.
         let contexts = vec![
             context(&pair_listing("HYPE", "USDC"), Some("2"), None),
             context(&pair_listing("HYPE", "USDT"), Some("3"), None),
@@ -1787,8 +1443,6 @@ mod tests {
         );
     }
 
-    /// The quote ranking still decides when the higher-ranked pair has no price of its own: the
-    /// base is valued through the pair that answered rather than left out.
     #[test]
     fn spot_valuation_should_fall_back_to_the_pair_that_has_a_price() {
         let precision = precision_of(
@@ -1807,8 +1461,6 @@ mod tests {
         );
     }
 
-    /// Two pairs of the same rank are not a price this can pick: a balance quoted against both
-    /// has no single market it is valued in.
     #[test]
     fn spot_valuation_should_mark_two_pairs_of_one_quote_ambiguous() {
         let precision = precision_of(&spot_route(), vec![spot("HYPE", "USDC")]);
@@ -1822,11 +1474,6 @@ mod tests {
         assert!(spot_asset_price(&token("HYPE"), &pairs, &contexts, &precision).is_none());
     }
 
-    /// A balance the spot catalogs do not describe is left out rather than failing the tab.
-    ///
-    /// Hyperliquid's spot state also reports outcome shares, which its spot metadata does not
-    /// describe and whose quantity tick therefore cannot be read. One of them must not hide every
-    /// holding the tab can draw.
     #[test]
     fn a_spot_balance_the_catalog_does_not_describe_should_not_fail_the_tab() {
         let precision = precision_of(&spot_route(), vec![spot("HYPE", "USDC")]);
@@ -1852,9 +1499,6 @@ mod tests {
             .expect("the reading validates once its undescribed balances are left out");
     }
 
-    /// A base asset quoted against two assets is one asset with two markets, and its price
-    /// belongs to the market it was read on: the quote travels with the price rather than being
-    /// taken from whichever pair the catalog happened to list first.
     #[test]
     fn a_balance_price_should_carry_the_pair_it_was_read_on() {
         let precision = precision_of(
@@ -1866,8 +1510,6 @@ mod tests {
         let snapshot = SpotSnapshot::new(
             spot_state(vec![wallet_balance("HYPE", "2")]),
             vec![spot_pair("HYPE", "USDC"), spot_pair("HYPE", "USDH")],
-            // Only the second pair has a price, so the balance is valued through it even though
-            // the first pair is the one the catalog ranks higher.
             vec![context(&usdh, Some("3"), None)],
             &precision,
         )
@@ -1885,9 +1527,6 @@ mod tests {
         );
     }
 
-    /// The two pairs of one base are two markets: their price ticks are their own, so the
-    /// balance is displayed at the tick of the pair that priced it rather than at the first
-    /// tick the catalog stated.
     #[test]
     fn a_two_quote_asset_should_be_priced_at_the_pair_that_quotes_it() {
         let precision = precision_of(
@@ -1921,16 +1560,8 @@ mod tests {
         );
     }
 
-    /// A balance priced through a context of another market of its own asset keeps that market.
-    ///
-    /// A route may publish a context for another listing of the same asset — a perpetual of the
-    /// coin beside the spot pair — and that context's price is the price of the asset, so the
-    /// balance is valued at it. What draws it is still the market that answered: its tick, its
-    /// quote asset and its basis, never the pair that was asked about first.
     #[test]
     fn a_balance_priced_from_another_market_of_its_asset_should_keep_that_market() {
-        // Two routes, because a catalog entry states the route that published it: the spot pair
-        // is core spot's and the perpetual of the same coin is core perpetual's.
         let precision = precision_for(vec![
             (
                 spot_route(),
@@ -1945,8 +1576,6 @@ mod tests {
         let snapshot = SpotSnapshot::new(
             spot_state(vec![wallet_balance("HYPE", "2")]),
             vec![spot_pair("HYPE", "USDT")],
-            // The pair has no context of its own; the coin's perpetual is the only market of
-            // this asset that published one.
             vec![context(&perpetual_listing, Some("1.5"), None)],
             &precision,
         )
@@ -2039,8 +1668,6 @@ mod tests {
         assert_eq!(pnl.unwrap().to_string(), "20");
     }
 
-    /// What a short is worth and what it is up are read from the side it is held on: the price
-    /// falling is a gain to a short exactly where it is a loss to a long.
     #[test]
     fn perpetual_valuation_should_read_a_short_the_other_way_round() {
         let listings = vec![perpetual("BTC", "0.1", "0.001")];
@@ -2197,8 +1824,6 @@ mod tests {
         assert_eq!(absolute_time(i64::MIN, time::UtcOffset::UTC).as_str(), "--");
     }
 
-    /// The display offset can move an instant past the last day the calendar holds.
-    /// That is not a date this can write, so it is a placeholder rather than a panic.
     #[test]
     fn a_time_the_display_zone_cannot_hold_should_read_as_a_placeholder() {
         let boundary = time::Date::MAX
@@ -2235,7 +1860,6 @@ mod tests {
         );
     }
 
-    /// A tab's index is where it sits in the order the tabs are shown in.
     #[test]
     fn every_tab_should_sit_at_its_own_index() {
         for (index, tab) in DetailTab::ALL.into_iter().enumerate() {
@@ -2243,13 +1867,6 @@ mod tests {
         }
     }
 
-    /// An asset no generation names is the localized unknown rather than the
-    /// canonical identity the reading carried.
-    ///
-    /// A wallet reading names balances, fees and collateral of assets the
-    /// published generation may not name at all, and the label of one of those is
-    /// user-visible text. A digest is not a name, and a code invented here would
-    /// disagree with every other pane about the same asset.
     #[test]
     fn an_unpublished_asset_should_be_named_as_unknown() {
         let translate = translate(LanguageCode::En);
@@ -2274,8 +1891,6 @@ mod tests {
         );
     }
 
-    /// The same read for a listing: a listing the reading does not describe is the
-    /// localized unknown rather than its identity.
     #[test]
     fn a_listing_no_generation_names_should_be_the_localized_unknown() {
         let translate = translate(LanguageCode::En);

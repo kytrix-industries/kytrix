@@ -1,5 +1,3 @@
-//! Unit tests for venue trading rules, listing snapshots and listing aliases.
-
 use std::sync::Arc;
 
 use crate::{
@@ -255,8 +253,6 @@ fn quantity_unit_should_match_the_instrument() {
     );
 }
 
-/// A ladder is only a ladder when it rises: an empty one, a repeated cap and a
-/// falling one are each refused where the terms are built.
 #[test]
 fn margin_terms_should_be_a_strictly_rising_ladder() {
     let margin = MarginProfile::new(
@@ -369,10 +365,6 @@ fn trading_rules_should_round_trip_through_serde() {
     assert_eq!(decoded, rules);
 }
 
-/// Every state of a perpetual's margin terms is a valid rule set and survives a
-/// round trip: `Unloaded` is what a venue that publishes them separately leaves
-/// behind and `Published` what one that publishes them inline leaves, and a decode
-/// that dropped either would lose what the venue published.
 #[test]
 fn every_perpetual_risk_state_should_round_trip_through_serde() {
     for risk in [
@@ -674,9 +666,6 @@ fn a_listing_of_another_instrument_should_be_rejected() {
     );
 }
 
-/// A typed identifier that names a value none of the declared symbols carries is a
-/// contradicted echo, and the publication gate reports it as the typed publication
-/// error rather than only through the echo check it delegates to.
 #[test]
 fn publication_should_refuse_a_contradicted_echo_with_its_typed_reason() {
     let instrument = spot_instrument();
@@ -793,8 +782,6 @@ fn listing_precision_should_read_both_increments_of_a_rule_set() {
     );
 }
 
-/// A label has to be written whatever a rule set carries, so a quantity step the
-/// wire never states as positive is written at whole units.
 #[test]
 fn listing_precision_should_fall_back_to_whole_units_without_a_quantity_step() {
     let mut rules = spot_rules();

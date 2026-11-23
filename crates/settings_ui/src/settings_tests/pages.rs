@@ -1,9 +1,3 @@
-//! The tests of the pages that are a list of setting rows: the about page, the data formatting
-//! page and the configure page.
-//!
-//! A page is driven through the shell the application draws it in: the harness opens the page,
-//! presses the controls it built and asserts what the settings received and what the page shows.
-
 use app_config::{network::ProxyRoute, time_zone::DataTimeZone};
 use i18n::t_smol;
 use market_participants_connector::venue::definition::supported_venues;
@@ -13,11 +7,6 @@ use widget::venue::VenueDisplay;
 
 use crate::settings_tests::test_support::{Harness, configured_settings};
 
-/// Chooses the choice at `index` in one open select.
-///
-/// The choice is made with the keyboard: the panel highlights the chosen line when it opens, so
-/// `Home` and then one `↓` per line above the one wanted reaches the wanted line without depending
-/// on where the panel happened to lay its rows out.
 fn choose(harness: &mut Harness, key: &str, index: usize) {
     harness.click_node(&format!("{key}:trigger"));
     harness.settle(2);
@@ -29,17 +18,14 @@ fn choose(harness: &mut Harness, key: &str, index: usize) {
     harness.settle(2);
 }
 
-/// The select key of a row on the current page.
 fn select_key(page: &str, suffix: &str) -> String {
     format!("settings.test.{page}.{suffix}")
 }
 
-/// The action that pressing one select's trigger dispatches.
 fn trigger_action(key: &str) -> Action {
     Action::Custom(format!("{key}.trigger").into())
 }
 
-/// The data formatting page draws its one setting, named the way the catalogue names it.
 #[test]
 fn the_data_format_page_should_draw_the_time_zone_row() {
     let mut harness = Harness::new();
@@ -68,7 +54,6 @@ fn the_data_format_page_should_draw_the_time_zone_row() {
     );
 }
 
-/// Choosing a time zone in the select stores the offset the choice names.
 #[test]
 fn choosing_a_time_zone_should_store_it() {
     let mut harness = Harness::new();
@@ -76,7 +61,6 @@ fn choosing_a_time_zone_should_store_it() {
     harness.select_page("data-format");
     harness.settle(1);
 
-    // The first choice is the westernmost offset the setting offers.
     choose(&mut harness, &select_key("data-format", "offset"), 0);
 
     let chosen = DataTimeZone::from_hours(DataTimeZone::MIN_HOURS)
@@ -106,8 +90,6 @@ fn choosing_a_time_zone_should_store_it() {
     );
 }
 
-/// A time zone written by another subsystem is what the page's control shows on the frame that
-/// follows, and the page writes nothing when it adopts it.
 #[test]
 fn a_time_zone_written_elsewhere_should_be_drawn_by_the_page() {
     let mut harness = Harness::new();
@@ -134,8 +116,6 @@ fn a_time_zone_written_elsewhere_should_be_drawn_by_the_page() {
     );
 }
 
-/// A query that names the time-zone setting reaches the page through that setting and keeps the
-/// row it matched; clearing the query brings the whole page back.
 #[test]
 fn a_query_for_the_time_zone_should_open_the_page_and_keep_the_row() {
     let mut harness = Harness::new();
@@ -173,7 +153,6 @@ fn a_query_for_the_time_zone_should_open_the_page_and_keep_the_row() {
     );
 }
 
-/// The about page draws the version of the application that is running.
 #[test]
 fn the_about_page_should_draw_the_version() {
     let mut harness = Harness::new();
@@ -198,7 +177,6 @@ fn the_about_page_should_draw_the_version() {
     );
 }
 
-/// The about page is reachable by its name, and the query draws the row it holds.
 #[test]
 fn a_query_for_the_about_page_should_reach_it() {
     let mut harness = Harness::new();
@@ -217,8 +195,6 @@ fn a_query_for_the_about_page_should_reach_it() {
     );
 }
 
-/// The configure page draws one row for the default line, one for every venue, and one for every
-/// group of Kytrix services.
 #[test]
 fn the_configure_page_should_draw_every_group() {
     let mut harness = Harness::new();
@@ -280,8 +256,6 @@ fn the_configure_page_should_draw_every_group() {
     assert_eq!(harness.node_text(title), kytrix);
 }
 
-/// Choosing "system proxy" as the default line stores it: the line has nothing above it to inherit
-/// from, so the choice is written as a line of its own.
 #[test]
 fn choosing_the_default_line_should_store_it() {
     let mut harness = Harness::new();
@@ -289,7 +263,6 @@ fn choosing_the_default_line_should_store_it() {
     harness.select_page("configure");
     harness.settle(1);
 
-    // The default line offers the two built-in lines before the catalog: direct, system.
     choose(
         &mut harness,
         &select_key("configure", "proxy.default-line"),
@@ -304,7 +277,6 @@ fn choosing_the_default_line_should_store_it() {
     assert_eq!(harness.writes().len(), 1);
 }
 
-/// Choosing a line for a group of Kytrix services binds every target of the group to it.
 #[test]
 fn choosing_a_group_line_should_bind_every_target() {
     let mut harness = Harness::new();
@@ -333,7 +305,6 @@ fn choosing_a_group_line_should_bind_every_target() {
     assert_eq!(harness.writes().len(), 1);
 }
 
-/// Choosing a line for a venue stores it as that venue's own line.
 #[test]
 fn choosing_a_venue_line_should_store_it() {
     let mut harness = Harness::new();
@@ -359,7 +330,6 @@ fn choosing_a_venue_line_should_store_it() {
     assert_eq!(harness.writes().len(), 1);
 }
 
-/// Every line's control offers the entries of the proxy catalog beside the built-in lines.
 #[test]
 fn every_proxy_line_should_offer_the_catalog_entries() {
     let mut harness = Harness::with_config(configured_settings());
@@ -371,7 +341,6 @@ fn every_proxy_line_should_offer_the_catalog_entries() {
     harness.click_node(&format!("{key}:trigger"));
     harness.settle(2);
 
-    // The default line offers the two built-in lines before the catalog: direct, system, hk.
     let row = harness
         .find(&format!("{key}:panel:list:row:2"))
         .expect("the catalog entry should be offered by the line's control");
@@ -382,8 +351,6 @@ fn every_proxy_line_should_offer_the_catalog_entries() {
     );
 }
 
-/// A query that names one line reaches the configure page through that line and draws only the
-/// rows the query matched.
 #[test]
 fn a_query_for_a_proxy_line_should_open_the_page_and_draw_only_it() {
     let mut harness = Harness::new();
@@ -422,8 +389,6 @@ fn a_query_for_a_proxy_line_should_open_the_page_and_draw_only_it() {
     );
 }
 
-/// Switching away from a page releases the controls it built: the select it drew stops answering
-/// its action, so a page that is gone cannot be pressed.
 #[test]
 fn switching_pages_should_release_the_controls_of_the_page_left() {
     let mut harness = Harness::new();

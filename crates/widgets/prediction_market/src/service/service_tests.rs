@@ -25,7 +25,6 @@ use crate::{
     test_support::{charted_market, event_ref, event_with, market},
 };
 
-/// The handle of the runtime this test runs on.
 #[allow(
     clippy::disallowed_methods,
     reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -34,7 +33,6 @@ fn current_test_handle() -> &'static tokio::runtime::Handle {
     Box::leak(Box::new(tokio::runtime::Handle::current()))
 }
 
-/// One headline market of the fixture event.
 fn headline_market(event: &PredictionEventRef, id: &str, open: bool) -> PredictionMarket {
     let mut market = market(event, id, "markets", open);
     market.headline = true;
@@ -117,7 +115,6 @@ fn a_finished_event_falls_back_to_its_headline() {
     assert_eq!(selected.market.native_market.as_str(), "closed-headline");
 }
 
-/// One source whose event, history and live stream are supplied by the test.
 #[derive(Clone)]
 struct FakeSource {
     event: Arc<Mutex<Option<oneshot::Receiver<PredictionEventView>>>>,
@@ -183,7 +180,6 @@ impl PredictionSeriesEventSubscription for FakeSubscription {
     }
 }
 
-/// One source, one subscription and the handles a test drives them with.
 struct Harness {
     runtime: WidgetRuntime<PredictionMarketProtocol>,
     event: oneshot::Sender<PredictionEventView>,
@@ -405,7 +401,6 @@ async fn a_closed_live_stream_should_end_the_chart_as_a_failure() {
     harness.runtime.shutdown().await;
 }
 
-/// The stream key of one test load.
 #[test]
 fn the_stream_key_names_every_dimension_that_invalidates_a_chart() {
     let key = load().key();

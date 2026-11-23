@@ -1,11 +1,8 @@
-//! the long/short account-ratio pane.
-
 use widget::identity::WidgetId;
 
 use super::display::{StatisticsMetric, StatisticsWidget};
 use crate::model::MetricKind;
 
-/// The perpetual series this pane plots.
 pub struct LongShortAccountRatioWidgetSeries;
 
 impl StatisticsMetric for LongShortAccountRatioWidgetSeries {
@@ -16,5 +13,4 @@ impl StatisticsMetric for LongShortAccountRatioWidgetSeries {
     const METRIC: MetricKind = MetricKind::LongShortAccountRatio;
 }
 
-/// Perpetual long and short account ratio.
 pub type LongShortAccountRatioWidget = StatisticsWidget<LongShortAccountRatioWidgetSeries>;

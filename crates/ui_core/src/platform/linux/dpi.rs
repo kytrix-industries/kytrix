@@ -1,17 +1,8 @@
-//! DPI：`wp_fractional_scale_v1`（120 分之几）与整数倍率回退（V-110 / V-122 ④）。
-//!
-//! 两条路径的 buffer 尺寸都按 `round(logical × scale)` 计算；差别只在缩放由谁完成：fractional
-//! 用 `wp_viewport.set_destination`（`buffer_scale` 恒 1），整数回退用
-//! `wl_surface.set_buffer_scale(N)`（见 `platform/linux/surface.rs`）。
-
 use crate::{
     error::EngineError,
     math::{Rect, Scale, Size},
 };
 
-/// `preferred_scale`（120 = 1.0）→ `Scale`。
-///
-/// 非正数 ⇒ `InvalidDpiScale`（compositor 不该发 0，但协议层是外部输入）。
 pub(crate) fn scale_from_120(scale: u32) -> Result<Scale, EngineError> {
     if scale == 0 {
         return Err(EngineError::InvalidDpiScale { factor: 0.0 });
@@ -20,16 +11,11 @@ pub(crate) fn scale_from_120(scale: u32) -> Result<Scale, EngineError> {
     Scale::new(factor).ok_or(EngineError::InvalidDpiScale { factor })
 }
 
-/// 逻辑尺寸 × scale → 物理像素（**round**，half away from zero；至少 1 px）。
-///
-/// `wp_fractional_scale_v1` 规定 toplevel 的 buffer 尺寸按 `round(logical × scale)` 计算：
-/// 向外取整会让 1.25 / 1.75 下的 buffer 大 1 px，整面被 compositor 以 0.999× 重采样。
 pub(crate) fn physical_size(size: Size, scale: Scale) -> (u32, u32) {
     let rect = Rect::new(0.0, 0.0, size.width, size.height).to_physical_rounded(scale);
     (rect.width().max(1) as u32, rect.height().max(1) as u32)
 }
 
-/// `wp_viewport.set_destination` 的尺寸（逻辑尺寸向上取整；compositor 负责缩放）。
 pub(crate) fn viewport_destination(size: Size) -> (i32, i32) {
     (
         size.width.max(1.0).ceil() as i32,
@@ -62,14 +48,11 @@ mod tests {
             );
         }
 
-        // 1.25 下的奇数逻辑尺寸：701 × 1.25 = 876.25 → 876（ceil 会是 877）。
         assert_eq!(
             physical_size(Size::new(701.0, 501.0), scale(1.25)),
             (876, 626)
         );
-        // 正好 .5：远离零（4.5 → 5、7.5 → 8）。
         assert_eq!(physical_size(Size::new(3.0, 5.0), scale(1.5)), (5, 8));
-        // 退化尺寸至少 1 px（不能给 swapchain 0 尺寸）。
         assert_eq!(physical_size(Size::new(0.0, 0.0), scale(1.0)), (1, 1));
         assert_eq!(
             physical_size(Size::new(f32::NAN, f32::INFINITY), scale(1.25)),
@@ -80,9 +63,7 @@ mod tests {
     #[test]
     fn viewport_destination_is_the_logical_size_rounded_up() {
         assert_eq!(viewport_destination(Size::new(800.0, 600.0)), (800, 600));
-        // 小数逻辑尺寸：向上取整（否则最右/最下 1 px 被裁掉）。
         assert_eq!(viewport_destination(Size::new(700.2, 500.8)), (701, 501));
-        // 至少 1 px。
         assert_eq!(viewport_destination(Size::new(0.0, 0.0)), (1, 1));
     }
 }

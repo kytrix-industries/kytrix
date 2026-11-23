@@ -1,8 +1,3 @@
-//! L2 集成测试：帧记录（`FrameRecord` / `RenderedFrame` / damage / 空闲零帧）。
-//!
-//! 只通过公开 API 访问引擎（AGENTS §5.2）；需要 `--features test-support`
-//! （`Cargo.toml` 的 `[[test]] required-features`）。
-
 use ui_core::{
     math::{Rect, Scale},
     node::builder::NodeBuilder,
@@ -87,7 +82,6 @@ fn canvas_frame_flattens_primitives() {
         rendered.primitives
     );
     assert_eq!(record.stats.instances, 1, "内部 quad 被展平为 1 个实例");
-    // full-refresh oracle：增量 lane 与「清空全部 lane 重建」必须逐项一致。
     app.assert_oracle();
 }
 
@@ -144,7 +138,6 @@ fn damage_is_local_and_idle_is_zero_frame() {
             .expect("挂载成功")
     };
 
-    // 一个完全不动的节点：用来断言「未变化的兄弟子树整棵跳过」（A1 脏子树剪枝）。
     let static_node = NodeBuilder::boxed()
         .layout_override(Rect::new(200.0, 10.0, 40.0, 16.0))
         .paint(PaintSpec {
@@ -155,7 +148,6 @@ fn damage_is_local_and_idle_is_zero_frame() {
         .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
         .expect("挂载成功");
 
-    // 三帧脚本：首帧提交 → 只改一个 label 的颜色 → 空闲零帧（L2.5 脚手架）。
     let mut script = FrameScript::new(app);
     script.push(ScriptFrame::new("首帧"));
     script.push(ScriptFrame::new("只改 label 的颜色").write(background, Color::BLACK));
@@ -171,7 +163,6 @@ fn damage_is_local_and_idle_is_zero_frame() {
     );
     let first_index = report.frame(0).record.frame_index;
 
-    // 只改一个 label 的颜色：damage 必须局部。
     report.assert_rendered(1);
     let frame_area = Rect::new(0.0, 0.0, 800.0, 600.0)
         .to_physical_covering(Scale::new(1.0).expect("scale"))
@@ -181,8 +172,6 @@ fn damage_is_local_and_idle_is_zero_frame() {
         damage.iter().all(|rect| rect.area() < frame_area / 50),
         "damage 必须局部：{damage:?}"
     );
-    // A1 剪枝语义（`PaintLog` 只记录**被访问**的 lane）：
-    // ① 未变化的兄弟子树不得被访问；② 被访问的 lane 中未重建者必须整桶复用。
     let paint_log = &report.frame(1).record.paint_log;
     assert!(
         !paint_log
@@ -203,10 +192,8 @@ fn damage_is_local_and_idle_is_zero_frame() {
             .all(|entry| entry.outcome == LaneOutcome::Reused),
         "被访问且未重建的 lane 必须整桶复用：{paint_log:?}"
     );
-    // 脚手架断言：只改一个节点 ⇒ damage 只允许一块矩形。
     report.assert_damage_rects_at_most(1, 1);
 
-    // 空闲零帧：不提交、序号不变、无 damage。
     report.assert_idle(2);
     assert_eq!(
         report.frame(2).record.frame_index,
@@ -222,16 +209,13 @@ fn damage_is_local_and_idle_is_zero_frame() {
 #[test]
 fn frame_outcome_is_reported() {
     let mut app = TestApp::new();
-    // 首帧：根从 0 尺寸撑满窗口 ⇒ 有布局移动 ⇒ 提交。
     let first = app.window().drain().expect("帧");
     assert!(matches!(first, FrameOutcome::Committed(_)));
-    // 第二帧：无写、无脏 ⇒ 空闲零帧，序号不变。
     let second = app.window().drain().expect("帧");
     assert_eq!(second, FrameOutcome::Idle);
     assert_eq!(app.frame_record().frame_index.get(), 1);
 }
 
-/// P11：`FrameRecord.a11y` 在**空闲帧**也必须存在（纯 `A11Y` 变化不提交像素）。
 #[test]
 fn idle_frames_still_record_the_a11y_snapshot() {
     let mut app = TestApp::new();
@@ -258,7 +242,6 @@ fn idle_frames_still_record_the_a11y_snapshot() {
         "没有焦点时焦点回退到窗口根"
     );
 
-    // 只移动焦点 ⇒ 本帧 `Idle`，但快照仍必须挂到记录上。
     app.app_mut().set_focus(window, Some(button));
     let record = app.drain().expect("帧成功").clone();
     assert_eq!(record.frame_index, first.frame_index, "空闲帧不提交");
@@ -272,18 +255,12 @@ fn idle_frames_still_record_the_a11y_snapshot() {
     let _ = FrameOutcome::Idle;
 }
 
-/// A1 / P1A-1c：没有结构 / lane 成员变化的增量帧，`SceneDelta` **不得**携带绘制序。
-///
-/// 携带绘制序会让编码器 `LaneStore.fast = false`（`render/delta.rs`），退回 O(lanes) 全扫 ——
-/// 那是本项剪枝收益的另一半来源。同时断言脏闭包真的只碰了变化节点 + 祖先链：
-/// `PaintCounters::visited_nodes` 远小于树规模、`full_frames` / `order_rebuilds` 不增长。
 #[test]
 fn incremental_frame_keeps_the_delta_order_fast_path() {
     let mut app = TestApp::new();
     let window = app.window_id();
     let root = app.app().window(window).expect("窗口存在").tree().root();
     let color = app.app_mut().signal(Color::WHITE);
-    // 一棵「有静态兄弟子树」的小树：未变化的兄弟必须被剪掉。
     let mut static_nodes = Vec::new();
     for index in 0..64 {
         static_nodes.push(
@@ -316,7 +293,6 @@ fn incremental_frame_keeps_the_delta_order_fast_path() {
         .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
         .expect("挂载成功");
 
-    // 首帧：全量（有结构变化），delta.full 与绘制序都可能携带。
     let first = app.drain().expect("首帧").clone();
     assert!(first.rendered, "首帧必须提交");
     let node_count = app.app().window(window).expect("窗口").tree().len();
@@ -327,7 +303,6 @@ fn incremental_frame_keeps_the_delta_order_fast_path() {
         .tree()
         .paint_counters();
 
-    // 增量帧：只改一个绑定节点的颜色。
     app.app_mut().write(&color, Color::BLACK);
     let record = app.drain().expect("增量帧").clone();
     assert!(record.rendered, "颜色变化必须出帧");
@@ -350,7 +325,6 @@ fn incremental_frame_keeps_the_delta_order_fast_path() {
         record.stats.reused_segments
     );
 
-    // 遍历规模：脏闭包 = label + 祖先链（root），与 64 个静态兄弟无关。
     let counters = app
         .app()
         .window(window)

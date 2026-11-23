@@ -1,9 +1,3 @@
-//! Route-level shared types: capabilities and identifier normalization.
-//!
-//! Route descriptors themselves belong to the market participants connector and the
-//! persisted endpoint/auth configuration belongs to `app_config`; this module
-//! only owns the closed enums both of them share.
-
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -15,11 +9,6 @@ use crate::{
     listing::venue::{BinanceProduct, HyperliquidAssetProduct, OkxInstrumentType},
 };
 
-/// The closed identifier kinds used by identifier normalization rules.
-///
-/// The kind corresponds one to one with the typed listing identifier variants,
-/// so a route can never declare one normalization rule for two different native
-/// identifier families.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ListingIdentifierKind {
     #[serde(rename = "symbol")]
@@ -47,7 +36,6 @@ pub enum ListingIdentifierKind {
 }
 
 impl ListingIdentifierKind {
-    /// Returns the fixed canonical label of this identifier kind.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Symbol => "symbol",
@@ -64,14 +52,10 @@ impl ListingIdentifierKind {
         }
     }
 
-    /// Returns `true` when this kind carries a symbol that normalization applies
-    /// to at all.
     pub const fn is_symbol_based(self) -> bool {
         !matches!(self, Self::PolymarketToken)
     }
 
-    /// Returns `true` when this kind lives inside a series struct rather than
-    /// being the primary index of a listing.
     pub const fn is_series_internal(self) -> bool {
         matches!(
             self,
@@ -86,7 +70,6 @@ impl fmt::Display for ListingIdentifierKind {
     }
 }
 
-/// A transport or account capability of one venue route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CapabilityId {
     #[serde(rename = "market_catalog")]
@@ -97,28 +80,14 @@ pub enum CapabilityId {
     MarketTrade,
     #[serde(rename = "tickers")]
     Tickers,
-    /// The route-level read of every ticker of a scope.
-    ///
-    /// It is separate from [`Self::Tickers`] because a venue may answer a ticker one
-    /// listing at a time without answering the whole scope in one read: Longbridge's
-    /// US-equity scope does. A caller that folds every listing's ticker into one
-    /// number — a volume heat map — can only be drawn from a scope that serves this
-    /// capability.
     #[serde(rename = "all_tickers")]
     AllTickers,
     #[serde(rename = "order_book")]
     OrderBook,
-    /// The event directory of a prediction venue.
     #[serde(rename = "prediction_events")]
     PredictionEvents,
-    /// Probability series of prediction-event legs.
     #[serde(rename = "prediction_series")]
     PredictionSeries,
-    /// The order book of one leg of a prediction-event market.
-    ///
-    /// It is separate from [`Self::OrderBook`] because a prediction leg has no
-    /// catalog listing: the book is addressed by the event's own legs and the
-    /// venue's own asset id, which are discovered with the event.
     #[serde(rename = "prediction_order_book")]
     PredictionOrderBook,
     #[serde(rename = "open_interest")]
@@ -150,7 +119,6 @@ pub enum CapabilityId {
 }
 
 impl CapabilityId {
-    /// Returns the fixed canonical label of this capability.
     pub const fn label(self) -> &'static str {
         match self {
             Self::MarketCatalog => "market_catalog",
@@ -185,7 +153,6 @@ impl fmt::Display for CapabilityId {
     }
 }
 
-/// How a route normalizes one native identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SymbolNormalization {
     #[serde(rename = "exact")]
@@ -195,7 +162,6 @@ pub enum SymbolNormalization {
 }
 
 impl SymbolNormalization {
-    /// Returns the fixed canonical label of this mode.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Exact => "exact",
@@ -203,11 +169,6 @@ impl SymbolNormalization {
         }
     }
 
-    /// Applies this mode to a native symbol value.
-    ///
-    /// `Exact` rejects surrounding whitespace and preserves case;
-    /// `AsciiCaseInsensitive` performs ASCII uppercase folding only, never
-    /// Unicode case folding.
     pub fn apply(self, value: &str) -> Result<SmolStr, ModelError> {
         match self {
             Self::Exact => {
@@ -223,7 +184,6 @@ impl SymbolNormalization {
     }
 }
 
-/// The product granularity of an identifier normalization rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "product")]
 pub enum IdentifierNormalizationProduct {
@@ -239,11 +199,6 @@ pub enum IdentifierNormalizationProduct {
     HyperliquidOutcome,
 }
 
-/// One identifier normalization rule of a route descriptor.
-///
-/// Rules are declared at typed identifier and optional product granularity, so
-/// two identifiers with the same display text can never be merged by a single
-/// route-level uppercase rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct IdentifierNormalizationRule {
     #[serde(rename = "identifier")]
@@ -255,7 +210,6 @@ pub struct IdentifierNormalizationRule {
 }
 
 impl IdentifierNormalizationRule {
-    /// Builds a normalization rule.
     pub fn new(
         identifier: ListingIdentifierKind,
         product: Option<IdentifierNormalizationProduct>,
@@ -269,10 +223,6 @@ impl IdentifierNormalizationRule {
     }
 }
 
-/// Validates a route descriptor's identifier normalization rules.
-///
-/// Rules are unique and sorted by `(identifier, product)`, and the declared
-/// product must match the typed identifier family it applies to.
 pub fn validate_normalization_rules(
     rules: &[IdentifierNormalizationRule],
 ) -> Result<(), ModelError> {
@@ -317,11 +267,6 @@ fn product_matches(
     }
 }
 
-/// Resolves the normalization mode of one typed identifier.
-///
-/// A missing rule is `Exact`. A rule whose product does not match the typed
-/// identifier returns [`ModelError::IdentifierNormalizationMismatch`] instead of
-/// silently falling back to a route-level default.
 pub fn normalization_mode(
     rules: &[IdentifierNormalizationRule],
     identifier: ListingIdentifierKind,
@@ -374,8 +319,6 @@ mod tests {
         );
     }
 
-    /// The prediction book is its own capability, and its spelling is the one the
-    /// persistence and the static definition table name it by.
     #[test]
     fn the_prediction_order_book_capability_uses_its_documented_spelling() {
         let capability = CapabilityId::PredictionOrderBook;

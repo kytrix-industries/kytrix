@@ -1,5 +1,3 @@
-//! P17 Debug HUD 的公开 API 集成测试（`hud` + `test-support`）。
-
 use std::time::Duration;
 
 use ui_core::{
@@ -44,7 +42,6 @@ fn line(test: &TestApp, index: usize) -> String {
     node_text(test, Selector::Id(LINE_IDS[index]))
 }
 
-/// 安装 HUD 并 drain 完激活帧（只有 1 帧：画面板；不采样、不补帧），返回提交帧数。
 fn activate(test: &mut TestApp) -> u32 {
     install(test);
     let mut frames = 0;
@@ -115,11 +112,6 @@ fn hud_is_hidden_from_the_accessibility_tree() {
     assert!(record.hidden, "HUD 必须标记 hidden，而不是冒充可访问内容");
 }
 
-/// **P-C 契约：HUD 是纯观察者，不是帧源。**
-///
-/// 旧实现（R01-10 之前）每帧无条件请求 HUD damage ⇒ 静止窗口按刷新率提交帧；R01-10 之后改成
-/// 「采样点请求一帧」，帧率仍是 2 Hz。现在 HUD **完全不产生帧**：不请求 damage、不参与
-/// `needs_continuous_frames`、没有任何定时器/周期唤醒 —— 激活也只画一帧面板（不采样、不补帧）。
 #[test]
 fn hud_is_a_passive_observer_and_never_produces_frames() {
     let mut test = TestApp::new();
@@ -127,8 +119,6 @@ fn hud_is_a_passive_observer_and_never_produces_frames() {
     assert_eq!(frames, 1, "激活只画一帧面板（不采样、不补帧）");
     let settled = test.frame_record().frame_index;
 
-    // 2.4 s：跨过四个 500 ms 采样窗口。采样只在「应用自己出帧」时发生，没有帧就没有采样，
-    // 也就没有任何理由把窗口从 Idle 拉起来。
     for index in 0..12 {
         test.advance(Duration::from_millis(200));
         assert!(
@@ -143,12 +133,6 @@ fn hud_is_a_passive_observer_and_never_produces_frames() {
     );
 }
 
-/// **安装帧不采样，但尺寸行已经是真实值。**
-///
-/// 安装帧只画面板、不采样：10 行指标是缺省 `--`，但尺寸行已经由**按帧刷新**路径写成真实值。
-///
-/// 尤其是 `Prims` / `Draw` / `Inst` 不能显示 0（0 会被读成「真的没有内容/draw call」）。
-/// 真实指标只在应用自己出帧且距上一样本 ≥500 ms 时填入。
 #[test]
 fn the_installation_frame_does_not_sample_but_shows_the_real_target() {
     let mut test = TestApp::new();
@@ -172,8 +156,6 @@ fn the_installation_frame_does_not_sample_but_shows_the_real_target() {
     );
 }
 
-/// 尺寸行**按帧刷新**：窗口尺寸 / DPI 变化后的**下一个应用帧**就更新，不用等 500 ms 采样窗口，
-/// 也不会多产生帧（这两帧都是 `set_size` / `set_scale` 自己污染的 damage 帧）。
 #[test]
 fn the_size_line_follows_the_window_on_the_next_application_frame() {
     let mut test = TestApp::new();
@@ -185,7 +167,6 @@ fn the_size_line_follows_the_window_on_the_next_application_frame() {
         line(&test, 10)
     );
 
-    // 逻辑尺寸变化：headless 窗口的渲染目标 = covering(size × scale)。
     test.app_mut()
         .window_mut(window)
         .expect("窗口")
@@ -197,7 +178,6 @@ fn the_size_line_follows_the_window_on_the_next_application_frame() {
         line(&test, 10)
     );
 
-    // DPI 变化：scale 1.25 ⇒ 物理目标 1250×875。
     test.app_mut()
         .window_mut(window)
         .expect("窗口")
@@ -209,16 +189,10 @@ fn the_size_line_follows_the_window_on_the_next_application_frame() {
         line(&test, 10)
     );
 
-    // 10 行指标没有被这两帧污染（没有采样窗口、也没有完成帧）。
     assert_eq!(line(&test, 0).trim(), "FPS     --");
     assert_eq!(line(&test, 8).trim(), "Prims   --");
 }
 
-/// 长时间静止后恢复出帧：**静止时长不算进帧率分母**（真机曾出现真实但误导的
-/// `FPS 4.0 / Frame 251.09 ms`）。
-///
-/// 规则：跨过 `2 × 500 ms` 的采样窗口整窗丢弃 —— 恢复后的第一帧不采样、文本保持上一次；
-/// 之后一个干净的 500 ms 窗口才产出样本。
 #[test]
 fn a_frame_after_a_long_idle_does_not_pollute_the_sample_window() {
     let mut test = TestApp::new();
@@ -226,7 +200,6 @@ fn a_frame_after_a_long_idle_does_not_pollute_the_sample_window() {
     assert_eq!(activate(&mut test), 1, "激活只画一帧面板");
     assert_eq!(line(&test, 8).trim(), "Prims   --", "静止时还没有样本");
 
-    // 3 s 静止后的第一个应用帧：窗口被丢弃 ⇒ 不采样、文本保持占位。
     test.advance(Duration::from_secs(3));
     test.app_mut().request_repaint(window).expect("请求一帧");
     assert!(test.drain().expect("恢复帧").rendered);
@@ -236,7 +209,6 @@ fn a_frame_after_a_long_idle_does_not_pollute_the_sample_window() {
         "跨过 3 s 静止的窗口必须丢弃：这一帧不得产出样本"
     );
 
-    // 干净的 500 ms 窗口之后：正常采样。
     test.advance(Duration::from_millis(500));
     test.app_mut().request_repaint(window).expect("请求一帧");
     assert!(test.drain().expect("采样帧").rendered);
@@ -247,17 +219,12 @@ fn a_frame_after_a_long_idle_does_not_pollute_the_sample_window() {
     );
 }
 
-/// **FPS / Frame 的真实口径：完成帧数 / 采样窗口。**
-///
-/// headless 窗口没有 GPU 完成反馈（`poll_renderer` 恒 `None`）⇒ 采样窗口内完成帧数为 0 ⇒
-/// 两行都必须显示 `--`。旧口径（两次提交帧入口的间隔）在这里会算出 2.0 FPS / 500 ms 的自指值。
 #[test]
 fn hud_reports_no_frame_rate_without_completed_frames() {
     let mut test = TestApp::new();
     let window = test.window_id();
     assert_eq!(activate(&mut test), 1, "激活只画一帧面板");
 
-    // 一个采样窗口之后由应用主动驱动一帧（HUD 自己不会出帧）：这一帧会采样。
     test.advance(Duration::from_millis(600));
     test.app_mut().request_repaint(window).expect("请求一帧");
     assert!(test.drain().expect("应用帧").rendered);
@@ -274,7 +241,6 @@ fn hud_reports_no_frame_rate_without_completed_frames() {
         "Inst    --",
         "没有完成帧就没有 Inst 数据"
     );
-    // 采样帧已经把真实图元数填进来了（它不依赖完成反馈）。
     assert!(
         prims_line(&test) > 0,
         "Prims 必须是真实值：{}",
@@ -282,7 +248,6 @@ fn hud_reports_no_frame_rate_without_completed_frames() {
     );
 }
 
-/// 应用自己出帧时 HUD 顺带刷新，但**不得**额外增帧。
 #[test]
 fn application_frames_refresh_the_hud_without_extra_frames() {
     let mut test = TestApp::new();
@@ -304,7 +269,6 @@ fn application_frames_refresh_the_hud_without_extra_frames() {
         "HUD 不得额外增帧：10 个应用帧就是 10 次提交"
     );
 
-    // 采样窗口（500 ms）已经过去：文本随应用帧刷新成真实值（帧率仍是 --，没有完成帧）。
     assert!(
         prims_line(&test) > 0,
         "应用帧上必须刷新出真实图元计数：{}",
@@ -312,11 +276,9 @@ fn application_frames_refresh_the_hud_without_extra_frames() {
     );
     assert_eq!(line(&test, 0).trim(), "FPS     --");
 
-    // 应用不再出帧 ⇒ 立刻回到 Idle（HUD 不补帧）。
     assert!(!test.drain().expect("静止帧").rendered);
 }
 
-/// 关闭 HUD 必须**请求一帧**把旧像素擦掉，之后窗口重新回到 Idle。
 #[test]
 fn disabling_the_hud_erases_its_pixels_once() {
     let mut test = TestApp::new();

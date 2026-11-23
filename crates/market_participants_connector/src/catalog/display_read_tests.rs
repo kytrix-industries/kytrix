@@ -1,15 +1,3 @@
-//! The catalog's display read entries.
-//!
-//! Two entries on [`Catalog`] answer a listing's name: a cached
-//! one that reads only what is published and never fetches, and a loading one
-//! that asserts the route's catalog is published and then answers from one
-//! captured generation. Both are driven here against a fixture catalogue, because
-//! what they promise is only visible against a whole catalogue: that no request
-//! is made from a read, that a route nothing has loaded is refused as such, that
-//! one operation reads one publication, that a publication happening meanwhile is
-//! never mixed into an answer, and that a listing the publication never named is
-//! a miss rather than a mismatch.
-
 use std::sync::Arc;
 
 use market_participants_model::{
@@ -31,7 +19,6 @@ use crate::{
     test_support::test_handle,
 };
 
-/// The venue symbols of the two fixture listings, and the instruments they trade.
 const BTC_SYMBOL: &str = "BTCUSDT";
 const ETH_SYMBOL: &str = "ETHUSDT";
 
@@ -59,11 +46,6 @@ fn eth_key() -> VenueListingKey {
     listing_key(&spot_route(), ETH_SYMBOL)
 }
 
-/// Publishes the fixture route's catalog through the one write entry a load has.
-///
-/// Every read in this module is answered from what a load published, so a test
-/// that is about a read drives the same load the connection action does and then
-/// reads.
 async fn publish(fixture: &Fixture) {
     fixture
         .catalog()
@@ -72,9 +54,6 @@ async fn publish(fixture: &Fixture) {
         .expect("the fixture spot route publishes its catalog");
 }
 
-// ---- the cached entry ----------------------------------------------------
-
-/// a cached read names the listing from the generation it is published in.
 #[tokio::test]
 async fn a_cached_read_should_name_the_published_listing() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -97,8 +76,6 @@ async fn a_cached_read_should_name_the_published_listing() {
     );
 }
 
-/// a listing the generation never named is a miss, and a miss is never
-/// forged into a generation mismatch.
 #[tokio::test]
 async fn a_cached_read_should_answer_a_listing_the_generation_never_named() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -123,12 +100,6 @@ async fn a_cached_read_should_answer_a_listing_the_generation_never_named() {
     );
 }
 
-/// the cached entry reads the published snapshot and triggers no network,
-/// however little is published.
-///
-/// The catalogue carries an application runtime, exactly as the installed
-/// connector does, so a read that went behind its caller's back — a detached load,
-/// a revalidation — would have somewhere to run and would be caught here.
 #[tokio::test]
 async fn a_cached_read_should_never_fetch() {
     let (gate, source) = test_support::gated(vec![btc_entry()]);
@@ -158,8 +129,6 @@ async fn a_cached_read_should_never_fetch() {
         ),
         "a route that was never loaded names no listing"
     );
-    // A read that detached a fetch behind its caller's back would still be
-    // counted here: the runtime runs every task it has queued first.
     for _ in 0..64 {
         tokio::task::yield_now().await;
     }
@@ -171,8 +140,6 @@ async fn a_cached_read_should_never_fetch() {
     assert!(fixture.catalog().cached_listings(&spot_route()).is_none());
 }
 
-/// every listing of one operation is read from the capture that operation
-/// took, even when the catalogue publishes another generation in between.
 #[tokio::test]
 async fn every_listing_of_one_capture_should_come_from_one_generation() {
     let fixture = Fixture::new(vec![btc_entry(), eth_entry()]);
@@ -207,8 +174,6 @@ async fn every_listing_of_one_capture_should_come_from_one_generation() {
     assert_eq!(captured.generation_id(), retired);
 }
 
-/// a publication that replaces what a reader captured never reaches that
-/// reader, and a later capture never mixes in the retired one.
 #[tokio::test]
 async fn a_capture_should_keep_reading_the_publication_it_took() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -261,13 +226,6 @@ async fn a_capture_should_keep_reading_the_publication_it_took() {
     );
 }
 
-/// the cached read captures the published generation instead of copying it.
-///
-/// The snapshot is the very pointer the publication lock holds and the published
-/// generation is handed out by pointer too, so neither read path copies a map.
-/// This is what makes naming a list of rows cost one `Arc` rather than a whole
-/// generation, and the assertion is an address comparison: a reader that went
-/// back to copying would answer from another allocation and fail here.
 #[test]
 fn a_cached_read_should_capture_the_published_generation_instead_of_copying_it() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -285,10 +243,6 @@ fn a_cached_read_should_capture_the_published_generation_instead_of_copying_it()
     );
 }
 
-// ---- the loading entry ---------------------------------------------------
-
-/// a route nothing has loaded is refused as "not loaded", and the
-/// refusal is not a failed read — no source is ever asked.
 #[tokio::test]
 async fn the_loading_read_should_refuse_a_route_that_was_never_loaded() {
     let (gate, source) = test_support::gated(vec![btc_entry()]);
@@ -321,8 +275,6 @@ async fn the_loading_read_should_refuse_a_route_that_was_never_loaded() {
     assert!(fixture.catalog().cached_listings(&spot_route()).is_none());
 }
 
-/// the loading entry answers from the route's published catalog, and a
-/// listing that publication never named stays a miss rather than a mismatch.
 #[tokio::test]
 async fn the_loading_read_should_report_a_listing_the_published_catalog_omits() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -345,9 +297,6 @@ async fn the_loading_read_should_report_a_listing_the_published_catalog_omits() 
     );
 }
 
-/// one loading read answers its listing and the instrument behind it from
-/// one captured generation, and the name it publishes is the rendering of the
-/// details that generation kept.
 #[tokio::test]
 async fn the_loading_read_should_answer_from_one_captured_generation() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -385,9 +334,6 @@ async fn the_loading_read_should_answer_from_one_captured_generation() {
     assert!(generation.assets().terms(terms.quote()).is_some());
 }
 
-/// a route the catalogue can serve nothing for fails in the
-/// catalogue's own domain and keeps the variant a caller acts on — "this route's
-/// catalog is not loaded" and "this route serves no catalog" are two answers.
 #[tokio::test]
 async fn the_loading_read_should_report_a_route_it_cannot_read_as_a_catalog_failure() {
     let fixture = Fixture::failing();
@@ -421,8 +367,6 @@ async fn the_loading_read_should_report_a_route_it_cannot_read_as_a_catalog_fail
     );
 }
 
-/// a generation an operation carries explicitly is checked against the one
-/// it read, and that is the only thing answered as a mismatch.
 #[tokio::test]
 async fn an_explicitly_named_foreign_generation_should_be_refused() {
     let fixture = Fixture::new(vec![btc_entry()]);

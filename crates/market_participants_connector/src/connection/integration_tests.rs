@@ -36,10 +36,6 @@ use super::{
 };
 use crate::{adapter::hyperliquid::HyperliquidCodec, error::MarketParticipantError};
 
-/// The protocol of a fixture connection that declares no upgrade headers.
-///
-/// A fixture key is built from the protocol its dial would use, so this is what a
-/// fixture names instead of an empty map.
 fn protocol() -> ConnectionProtocol {
     ConnectionProtocol::new(no_response_id)
 }
@@ -50,16 +46,12 @@ struct ReceivedFrame {
     payload: String,
 }
 
-/// What one WebSocket upgrade request carried, as the server saw it.
 #[derive(Debug)]
 struct UpgradeObservation {
     connection: usize,
     headers: HeaderMap,
 }
 
-/// The headers a WebSocket upgrade request carries in this stack whatever its caller
-/// declared: the RFC 6455 handshake's own, and the defaults the HTTP client adds to every
-/// request it sends.
 const HANDSHAKE_HEADERS: [HeaderName; 8] = [
     hyper::header::HOST,
     hyper::header::UPGRADE,
@@ -72,18 +64,6 @@ const HANDSHAKE_HEADERS: [HeaderName; 8] = [
 ];
 
 impl UpgradeObservation {
-    /// The headers this upgrade carried because its caller asked for them.
-    ///
-    /// What a venue reads off an upgrade to decide where to serve the socket is its
-    /// caller's headers; the handshake's own and the client's defaults belong to this
-    /// stack rather than to a venue, so a test comparing an upgrade against what a
-    /// protocol declared compares this view.
-    ///
-    /// The filter is only sound while the two sets are disjoint: a venue that declared
-    /// one of [`HANDSHAKE_HEADERS`] would have it removed from both sides of the
-    /// comparison, and the test would pass whether or not the header ever reached the
-    /// wire. [`upgrade_header_map`] refuses such a declaration when a test makes one, so
-    /// the comparison below can never be neutered into agreeing with itself.
     fn declared_headers(&self) -> HeaderMap {
         let mut declared = self.headers.clone();
         for handshake in HANDSHAKE_HEADERS {
@@ -125,20 +105,15 @@ enum DisconnectOn {
     Unsubscribe,
     HyperliquidResponse,
     AnswerKeepalive,
-    /// Pings the client on a short interval, the way Binance proves a connection is alive.
     PingPeriodically,
 }
 
-/// How often the test server pings a client it is watching a keepalive from.
 const PING_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The liveness window the tests below judge a connection by, short enough to wait out.
 const LIVENESS_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// The idle window the tests below collect an unsubscribed connection on.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// The reconnect server listens on loopback over plaintext ws://.
 fn test_transport() -> Arc<TransportHub> {
     Arc::new(TransportHub::new(TransportPolicy {
         allow_plaintext: true,
@@ -153,11 +128,6 @@ impl ReconnectServer {
             .expect("local listener should bind");
         let url = Url::parse(&format!("ws://{}/ws", listener.local_addr().unwrap()))
             .expect("local WebSocket URL should parse");
-        // Both observation channels are unbounded on purpose: the handler observes the
-        // upgrade request before it upgrades, and publishing that observation is a
-        // synchronous send, so a bounded channel nobody is draining would stall the
-        // fixture rather than lose an observation a test is waiting for. The test drains
-        // them, and the fixture stays dialable however many times a test reconnects.
         let (frame_sender, frames) = mpsc::unbounded_channel();
         let (upgrade_sender, upgrades) = mpsc::unbounded_channel();
         let connections = Arc::new(AtomicUsize::new(0));
@@ -303,7 +273,6 @@ impl ReconnectServer {
             .expect("server task should keep the frame channel open")
     }
 
-    /// The next upgrade request the server answered, with the headers it carried.
     async fn next_upgrade(&mut self) -> UpgradeObservation {
         timeout(Duration::from_secs(2), self.upgrades.recv())
             .await
@@ -360,8 +329,6 @@ async fn stateful_connection_reauthenticates_and_replays_subscriptions() {
         0,
         &protocol(),
     );
-    // Re-authentication reads the account back off the key, so a stateful fixture
-    // key has to name the account it authenticates as.
     key.account = Some(
         market_participants_model::identifier::MarketParticipantAccountId::new("account")
             .expect("the fixture account id should be canonical"),
@@ -722,9 +689,6 @@ async fn hyperliquid_nested_response_id_resolves_pending_request() {
     server.shutdown().await;
 }
 
-/// A venue that proves liveness with its own ping frames keeps a connection trusted even
-/// though no subscription data arrives: the ping is the proof, and ignoring it is what made
-/// a healthy Binance socket look dead once its data went quiet.
 #[tokio::test]
 async fn an_inbound_ping_keeps_a_quiet_connection_trusted() {
     let server = ReconnectServer::spawn(DisconnectOn::PingPeriodically).await;
@@ -758,7 +722,6 @@ async fn an_inbound_ping_keeps_a_quiet_connection_trusted() {
     server.shutdown().await;
 }
 
-/// The control for the test above: the same window, with nothing arriving at all.
 #[tokio::test]
 async fn a_silent_connection_is_not_trusted_past_its_window() {
     let server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -792,9 +755,6 @@ async fn a_silent_connection_is_not_trusted_past_its_window() {
     server.shutdown().await;
 }
 
-/// A connection nothing is subscribed to any more is closed rather than left in the pool
-/// for the life of the process: browsing instruments used to leave one socket behind per
-/// instrument.
 #[tokio::test]
 async fn a_connection_whose_last_subscription_is_released_is_collected() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -839,8 +799,6 @@ async fn a_connection_whose_last_subscription_is_released_is_collected() {
     server.shutdown().await;
 }
 
-/// The grace period is what makes the collection cheap: a pane changing instrument releases
-/// one subscription and takes another, and that must not rebuild the socket.
 #[tokio::test]
 async fn a_connection_resubscribed_within_the_idle_window_is_kept() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -891,9 +849,6 @@ async fn a_connection_resubscribed_within_the_idle_window_is_kept() {
     server.shutdown().await;
 }
 
-/// A stateful connection is not the kind that piles up — there is one per account, and it
-/// carries a login the next request would have to repeat — so releasing its subscriptions
-/// leaves it in the pool.
 #[tokio::test]
 async fn a_stateful_connection_is_kept_after_its_subscriptions_are_released() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -936,15 +891,6 @@ async fn a_stateful_connection_is_kept_after_its_subscriptions_are_released() {
     server.shutdown().await;
 }
 
-/// The pool retires a connection it replaces under a check the last lease of that
-/// connection can drain under, so a connection can be retired with nothing subscribed to
-/// it. A stateful one is idle rather than kept from that moment: it does not start its
-/// idle clock on that release — it is kept for the requests its credentials serve — so the
-/// retirement is the only thing that starts it, from a task other than the actor's, while
-/// the actor is parked in a cycle that already sampled an unstarted clock. A connection
-/// whose key is answered by another dial is ended by the retirement — on the idle clock the
-/// retirement starts — instead of keeping its socket, its actor and its listen-key refresh
-/// for the life of the process.
 #[tokio::test]
 async fn retiring_a_stateful_connection_whose_last_subscription_already_drained_ends_it() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -976,8 +922,6 @@ async fn retiring_a_stateful_connection_whose_last_subscription_already_drained_
     server.next_frame().await;
 
     drop(subscription);
-    // The unsubscribe is the last command this connection's actor wakes for, so a cycle
-    // that got past it has sampled its idle deadline and parked on that sample.
     server.next_frame().await;
     sleep(IDLE_TIMEOUT * 3).await;
     assert!(
@@ -1001,12 +945,6 @@ async fn retiring_a_stateful_connection_whose_last_subscription_already_drained_
     server.shutdown().await;
 }
 
-/// The other side of the pool's window: the replacement found the connection still
-/// subscribed, so the retirement did not start its clock and its subscriptions are the only
-/// reason it is still held. Retiring is not what ends it — a live stream is never ended for a
-/// socket that was not the problem — so it ends on its idle clock once its last lease drains,
-/// rather than keeping its socket, its actor and its listen-key refresh for the life of the
-/// process.
 #[tokio::test]
 async fn a_stateful_connection_retired_while_subscribed_ends_when_its_last_subscription_drains() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -1059,7 +997,6 @@ async fn a_stateful_connection_retired_while_subscribed_ends_when_its_last_subsc
     server.shutdown().await;
 }
 
-/// A keepalive short enough for a test to wait out, shaped like the one OKX requires.
 fn keepalive_protocol() -> ConnectionProtocol {
     ConnectionProtocol::new(no_response_id).with_keepalive(Keepalive {
         message: "ping",
@@ -1079,8 +1016,6 @@ fn keepalive_reconnect_policy() -> ReconnectPolicy {
     }
 }
 
-/// A venue that closes a silent connection is kept open by its own message, sent only once
-/// the connection has actually gone quiet.
 #[tokio::test]
 async fn an_idle_connection_sends_the_venue_keepalive_message() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -1112,8 +1047,6 @@ async fn an_idle_connection_sends_the_venue_keepalive_message() {
     server.shutdown().await;
 }
 
-/// A connection whose keepalives go unanswered is not alive, however open its socket is, so
-/// it is replaced instead of being kept on paper.
 #[tokio::test]
 async fn a_connection_that_never_answers_the_keepalive_is_reconnected() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -1151,8 +1084,6 @@ async fn a_connection_that_never_answers_the_keepalive_is_reconnected() {
     server.shutdown().await;
 }
 
-/// The venue's answer is liveness rather than subscription data, so it stops at the
-/// connection instead of reaching every subscription sharing it.
 #[tokio::test]
 async fn the_venue_keepalive_answer_is_not_published_as_an_event() {
     let mut server = ReconnectServer::spawn(DisconnectOn::AnswerKeepalive).await;
@@ -1190,9 +1121,6 @@ async fn the_venue_keepalive_answer_is_not_published_as_an_event() {
     server.shutdown().await;
 }
 
-/// A subscription that outlives the socket has to end when the connection does, and say
-/// why: a stream that only ever waits leaves a pane showing data that will never change
-/// again.
 #[tokio::test]
 async fn closing_a_connection_ends_its_streams_with_the_reason() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Subscribe).await;
@@ -1251,8 +1179,6 @@ async fn closing_a_connection_ends_its_streams_with_the_reason() {
     server.shutdown().await;
 }
 
-/// A connection that gives up ends its streams with the failure that made it give up, which
-/// is what lets a pane report the failure instead of freezing on stale data.
 #[tokio::test]
 async fn a_failed_reconnect_ends_its_streams_with_that_failure() {
     let mut server = ReconnectServer::spawn(DisconnectOn::SubscribeAndRejectReconnect).await;
@@ -1302,14 +1228,6 @@ async fn a_failed_reconnect_ends_its_streams_with_that_failure() {
     server.shutdown().await;
 }
 
-/// The headers a venue declares travel on the upgrade request the socket is served from,
-/// and the connection key that socket is pooled by carries that same declaration.
-///
-/// They are read off the request the fixture's HTTP server actually received rather than
-/// off the protocol value: what a venue has to see is the header on the wire, and a
-/// protocol field that never reached a dial would satisfy the latter and not the former.
-/// The key is checked against the same protocol, because a key whose dimension came from
-/// somewhere else is a socket the pool would hand to a request needing another gateway.
 #[tokio::test]
 async fn declared_upgrade_headers_reach_the_websocket_upgrade_request() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -1353,9 +1271,6 @@ async fn declared_upgrade_headers_reach_the_websocket_upgrade_request() {
     server.shutdown().await;
 }
 
-/// The seam is additive: a venue that declares nothing dials with the handshake's own
-/// headers alone, and the empty case is what a protocol that stopped declaring any has to
-/// keep working as.
 #[tokio::test]
 async fn a_protocol_without_upgrade_headers_still_upgrades() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Never).await;
@@ -1394,10 +1309,6 @@ async fn a_protocol_without_upgrade_headers_still_upgrades() {
     server.shutdown().await;
 }
 
-/// A reconnect is the same connection dialled again, so it has to declare the same headers —
-/// a socket served from a different gateway than the one first dialled is not the connection
-/// the venue was asked for — and the key both dials are pooled by still carries that
-/// declaration rather than a second one of its own.
 #[tokio::test]
 async fn a_reconnect_carries_the_declared_upgrade_headers_again() {
     let mut server = ReconnectServer::spawn(DisconnectOn::Subscribe).await;
@@ -1458,14 +1369,6 @@ async fn a_reconnect_carries_the_declared_upgrade_headers_again() {
     server.shutdown().await;
 }
 
-/// Builds the header map a venue declares, so a test names the same headers it compares the
-/// upgrade request against.
-///
-/// It refuses a declaration that collides with the handshake's own headers: the comparison
-/// a declared-header test makes strips those from both sides, so a venue declaring one of
-/// them would be asserting its own absence. Nothing this build serves declares one — the
-/// venue's routing and language headers are its own — and a test that reached for one would
-/// otherwise pass without testing anything.
 fn upgrade_header_map(headers: &[(&str, &str)]) -> HeaderMap {
     let mut declared = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {

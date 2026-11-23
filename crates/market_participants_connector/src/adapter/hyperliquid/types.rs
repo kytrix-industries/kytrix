@@ -1,10 +1,3 @@
-//! The typed wire shapes of the Hyperliquid API.
-//!
-//! Every request that addresses one perpetual DEX carries the DEX name the
-//! caller derived from its route scope; the empty string is Hyperliquid's own
-//! spelling of "the first perp DEX", which is why the field is optional and
-//! omitted for the core scope instead of being written as a placeholder.
-
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -25,10 +18,6 @@ pub struct HyperliquidPostRequest<T> {
     pub payload: T,
 }
 
-/// One `info` request of the Hyperliquid API.
-///
-/// `dex` is the name of a builder-deployed perpetual DEX; it is absent for the
-/// core scope, which Hyperliquid addresses as the first perp DEX.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum HyperliquidInfoRequest {
@@ -106,15 +95,6 @@ pub enum HyperliquidInfoRequest {
 }
 
 impl HyperliquidInfoRequest {
-    /// The weight the venue charges for one request of this kind.
-    ///
-    /// Hyperliquid aggregates every REST request of one IP into a budget of 1200
-    /// weight per minute, and publishes what each kind costs: `clearinghouseState`
-    /// and `spotClearinghouseState` are 2, `l2Book` and `allMids` are 2,
-    /// `userRole` is 60, and every other documented request is 20. The per-item
-    /// surcharge the venue adds to `userFills` and its siblings is deliberately
-    /// not modelled here: it is decided by the answer's size, and the budget keeps
-    /// enough headroom under the venue's own cap to absorb it.
     pub(crate) const fn weight(&self) -> u32 {
         match self {
             Self::L2Book { .. }
@@ -134,9 +114,7 @@ impl HyperliquidInfoRequest {
             | Self::PerpDexs
             | Self::OutcomeMeta
             | Self::OutcomeTemplates => 20,
-            // allMids is a light, venue-wide read.
             Self::AllMids => 2,
-            // The one request only a test can make is not in the venue's table.
             #[cfg(test)]
             Self::SettledOutcome { .. } => 20,
         }
@@ -240,10 +218,6 @@ pub struct HyperliquidCancel {
     pub oid: u64,
 }
 
-/// One perpetual DEX as the venue publishes it.
-///
-/// The first element of the venue's answer is `null` and stands for the core
-/// perpetual DEX, which is addressed as the first perp DEX rather than by name.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidPerpDex {
     pub name: SmolStr,
@@ -251,20 +225,15 @@ pub struct HyperliquidPerpDex {
     pub full_name: Option<SmolStr>,
 }
 
-/// The perpetual metadata of one DEX: its assets, its margin tables and the
-/// spot token it settles in.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidMetaResponse {
     pub universe: Vec<HyperliquidMetaAsset>,
     #[serde(rename = "marginTables", default)]
     pub margin_tables: Vec<HyperliquidMarginTableEntry>,
-    /// The spot token index this DEX settles in, as the venue publishes it for
-    /// builder-deployed DEXes and for the core DEX alike.
     #[serde(rename = "collateralToken", default)]
     pub collateral_token: Option<u32>,
 }
 
-/// One `[id, table]` pair of the venue's margin table list.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidMarginTableEntry(pub u32, pub HyperliquidMarginTable);
 
@@ -293,35 +262,28 @@ pub struct HyperliquidMetaAsset {
     pub max_leverage: u32,
     #[serde(rename = "isDelisted", default)]
     pub is_delisted: bool,
-    /// How margin may be added to and removed from a position of this asset.
     #[serde(rename = "marginMode", default)]
     pub margin_mode: Option<HyperliquidMarginMode>,
-    /// The venue's margin table this asset is margined by.
     #[serde(rename = "marginTableId", default)]
     pub margin_table_id: Option<u32>,
 }
 
-/// The venue's own margin-removal rule of one asset.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HyperliquidMarginMode {
-    /// Margin cannot be removed.
     #[serde(rename = "strictIsolated")]
     StrictIsolated,
-    /// Only isolated margin is allowed.
     #[serde(rename = "noCross")]
     NoCross,
     #[serde(rename = "normal")]
     Normal,
 }
 
-/// The spot metadata of the venue: its tokens and its tradable pairs.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidSpotMetaResponse {
     pub tokens: Vec<HyperliquidSpotToken>,
     pub universe: Vec<HyperliquidSpotPairWire>,
 }
 
-/// One spot token, as the venue indexes it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidSpotToken {
     pub name: SmolStr,
@@ -330,7 +292,6 @@ pub struct HyperliquidSpotToken {
     pub index: u32,
 }
 
-/// One spot pair, named by the two token indices it exchanges.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidSpotPairWire {
     pub name: SmolStr,
@@ -338,12 +299,6 @@ pub struct HyperliquidSpotPairWire {
     pub index: u32,
 }
 
-/// The market numbers Hyperliquid publishes for one instrument.
-///
-/// The same shape arrives from the `activeAssetCtx` subscription and from the
-/// `metaAndAssetCtxs` and `spotMetaAndAssetCtxs` queries. A price the market does
-/// not quote is reported as null, and the venue documents the traded base amount
-/// for some markets only, so every number here is optional.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct HyperliquidActiveContextValues {
     #[serde(rename = "prevDayPx")]
@@ -358,7 +313,6 @@ pub struct HyperliquidActiveContextValues {
     pub mid_px: Option<SmolStr>,
 }
 
-/// One outcome of the venue's outcome metadata.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidOutcomeSpec {
     pub outcome: u64,
@@ -366,21 +320,17 @@ pub struct HyperliquidOutcomeSpec {
     pub description: SmolStr,
     #[serde(rename = "sideSpecs")]
     pub side_specs: Vec<HyperliquidOutcomeSideSpec>,
-    /// The token the outcome settles in.
     #[serde(rename = "quoteToken", default)]
     pub quote_token: Option<SmolStr>,
-    /// The deployer namespace the outcome belongs to; absent for the recurring core.
     #[serde(default)]
     pub venue: Option<SmolStr>,
 }
 
-/// One tradable side of an outcome, named by the venue.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidOutcomeSideSpec {
     pub name: SmolStr,
 }
 
-/// One HIP-4 question: a set of named outcomes that settle together.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidOutcomeQuestion {
     pub question: u64,
@@ -402,7 +352,6 @@ pub struct HyperliquidOutcomeMetaResponse {
     pub questions: Vec<HyperliquidOutcomeQuestion>,
 }
 
-/// One HIP-4 outcome template.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HyperliquidOutcomeTemplate {
     pub id: SmolStr,
@@ -412,13 +361,10 @@ pub struct HyperliquidOutcomeTemplate {
     pub description: SmolStr,
 }
 
-/// The role a template plays.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum HyperliquidOutcomeTemplateRole {
-    /// A question template, or any other role the venue names with a string.
     Kind(SmolStr),
-    /// A standalone outcome template with its side names.
     Detailed {
         #[serde(rename = "standaloneOutcome", default)]
         standalone_outcome: Option<HyperliquidStandaloneOutcomeRole>,
@@ -439,14 +385,8 @@ pub struct HyperliquidQuestionOutcomeRole {
     pub parent: SmolStr,
 }
 
-/// The venue's current mid price of every coin.
 pub type HyperliquidAllMids = std::collections::BTreeMap<SmolStr, SmolStr>;
 
-/// The settlement of one outcome, as the venue reports it once it is settled.
-///
-/// The quote token is published here and only here: an unsettled outcome's
-/// settlement asset cannot be read from the outcome metadata, so it is not
-/// invented.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg(test)]
 pub struct HyperliquidSettledOutcome {
@@ -457,8 +397,6 @@ pub struct HyperliquidSettledOutcome {
     pub details: Option<SmolStr>,
 }
 
-/// The settled spec of one outcome, which repeats its metadata and adds the
-/// token the outcome settles in.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg(test)]
 pub struct HyperliquidSettledOutcomeSpec {

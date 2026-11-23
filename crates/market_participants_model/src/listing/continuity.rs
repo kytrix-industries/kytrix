@@ -1,6 +1,3 @@
-//! The continuity terms that prove two listing publications are the same
-//! listing, and the canonical identity derived from them.
-
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::{
@@ -20,11 +17,6 @@ use crate::{
     },
 };
 
-/// The listing continuity terms that determine a [`VenueListingId`].
-///
-/// The terms contain only the typed native identity that proves the continuity
-/// of one listing. Display aliases, snapshots, rules, status and array positions
-/// never appear here.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "kind", content = "terms")]
 pub enum ListingContinuityTerms {
@@ -87,9 +79,6 @@ pub enum ListingContinuityTerms {
 }
 
 impl ListingContinuityTerms {
-    /// Validates the continuity terms of this variant.
-    ///
-    /// Every variant must determine exactly one listing inside one route.
     pub fn validate(&self) -> Result<(), ModelError> {
         match self {
             Self::Binance { .. } | Self::Okx { .. } => Ok(()),
@@ -112,7 +101,6 @@ impl ListingContinuityTerms {
         }
     }
 
-    /// Returns the fixed canonical label of this continuity variant.
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Binance { .. } => "binance",
@@ -348,7 +336,6 @@ impl<'de> Deserialize<'de> for ListingContinuityTerms {
     }
 }
 
-/// The continuity key of one listing: its route and native identity terms.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ListingContinuityKey {
     #[serde(rename = "route")]
@@ -357,7 +344,6 @@ pub struct ListingContinuityKey {
     pub terms: ListingContinuityTerms,
 }
 
-/// The canonical terms of a venue listing continuity key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 struct VenueListingTerms {
     #[serde(rename = "route")]
@@ -376,7 +362,6 @@ impl CanonicalTerms for VenueListingTerms {
 }
 
 impl ListingContinuityKey {
-    /// Validates the continuity terms and derives the listing identity.
     pub fn listing_id(&self) -> Result<VenueListingId, ModelError> {
         self.terms.validate()?;
         Ok(VenueListingId::of_terms(&VenueListingTerms {
@@ -385,7 +370,6 @@ impl ListingContinuityKey {
         }))
     }
 
-    /// Validates the continuity terms and derives the full listing key.
     pub fn listing_key(&self) -> Result<VenueListingKey, ModelError> {
         Ok(VenueListingKey {
             route: self.route.clone(),

@@ -1,11 +1,3 @@
-//! The poll loop, driven through the framework's own runtime.
-//!
-//! A test here owns a real [`WidgetRuntime`] and a real Tokio clock, because what
-//! is being tested is the loop's *timing*: that the first round does not wait out
-//! an interval, that a manual refresh resets the schedule rather than racing it,
-//! and that a failure stops the schedule instead of retrying it. Fake venues are
-//! the only thing that is replaced.
-
 use std::{str::FromStr, sync::Arc, time::Duration};
 
 use market_participants_connector::catalog::{
@@ -44,13 +36,6 @@ use crate::model::{
     HeatMapModelError, RouteListing, RouteTickerAnswer, TILE_LIMIT, combine_market_tickers,
 };
 
-/// The handle of the runtime this test runs on.
-///
-/// A test drives its subject on its own runtime rather than on a shared one. The
-/// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-/// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-/// whose clock was paused. Work started on another runtime keeps waiting on real
-/// time while the test advances a clock it never reads.
 #[allow(
     clippy::disallowed_methods,
     reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -89,14 +74,11 @@ async fn receive_snapshot(
     snapshot.clone()
 }
 
-/// The single tile of a one-route-only round, for tests that only care about the
-/// number the map ends up carrying.
 fn only_notional(snapshot: &VolumeHeatMapSnapshot) -> Quantity {
     assert_eq!(snapshot.entries.len(), 1, "the fixtures build one tile");
     snapshot.entries[0].notional
 }
 
-/// Starts one venue's map and waits for its first round to be published.
 async fn load_and_receive_first_map(
     runtime: &WidgetRuntime<VolumeHeatMapProtocol>,
     reliable: &mut ReliableStream<VolumeHeatMapProtocol>,
@@ -269,9 +251,6 @@ async fn a_load_should_fetch_at_once_and_publish_the_map_then_readiness() {
     runtime.shutdown().await;
 }
 
-/// A venue the user just picked is a different map, so the request replaces the
-/// generation: what the pane is shown afterwards is the market participant it asked for and
-/// nothing of the one it left.
 #[tokio::test(start_paused = true)]
 async fn a_load_of_another_venue_should_replace_the_generation() {
     let source = FakeSource::new([
@@ -342,8 +321,6 @@ async fn a_manual_refresh_should_run_a_round_without_waiting_for_the_interval() 
     let first = load_and_receive_first_map(&runtime, &mut reliable, &mut latest).await;
     assert_eq!(only_notional(&first), Quantity::from(100_u64));
 
-    // Well before the interval is up, so what fetches again is the command rather
-    // than the schedule.
     advance(Duration::from_secs(20)).await;
     let response = runtime
         .client()
@@ -366,9 +343,6 @@ async fn a_manual_refresh_should_run_a_round_without_waiting_for_the_interval() 
     runtime.shutdown().await;
 }
 
-/// A refresh that names another venue than the one being read is refused rather
-/// than forwarded: the loop reads one market participant, and running its round would fetch
-/// the market participant the command did not ask for.
 #[tokio::test(start_paused = true)]
 async fn a_refresh_of_another_venue_should_be_refused() {
     let source = FakeSource::new([
@@ -498,9 +472,6 @@ async fn a_refresh_should_be_refused_while_a_round_is_in_flight() {
 
 #[tokio::test(start_paused = true)]
 async fn a_failed_round_should_be_reported_and_take_the_loop_off_the_clock() {
-    // Both scopes of the first round refuse, so it fails whichever way the plans
-    // fall: a round fetches every scope it reads, and one refusal fails the round.
-    // The refresh then reads both scopes successfully and answers with a map.
     let source = FakeSource::new([FetchPlan::Failure, FetchPlan::Failure].into_iter().chain([
         FetchPlan::Tickers(vec![ticker("BTC", "USDT", 100)]),
         FetchPlan::Tickers(vec![]),
@@ -533,13 +504,6 @@ async fn a_failed_round_should_be_reported_and_take_the_loop_off_the_clock() {
         "a failed round publishes no map"
     );
 
-    // The failure took the loop off the clock: it is alive and waiting, so three
-    // intervals go by without a single fetch.
-    //
-    // The intervals are advanced one at a time on purpose. A single long advance
-    // does not fire the timers a round arms while it runs, so a loop that put a
-    // refused fetch straight back on the schedule would still look idle to a test
-    // that skipped three intervals in one step.
     for interval in 1..=3 {
         advance(REFRESH_INTERVAL).await;
         assert_eq!(
@@ -549,7 +513,6 @@ async fn a_failed_round_should_be_reported_and_take_the_loop_off_the_clock() {
         );
     }
 
-    // A refresh is what starts it again, and the answer is a new map.
     let response = runtime
         .client()
         .call(VolumeHeatMapRequest::Refresh { venue: binance() })
@@ -643,8 +606,6 @@ async fn an_explicit_load_should_replace_a_generation_that_was_off_the_clock() {
         VolumeHeatMapStatus::Failed { .. }
     ));
 
-    // The recovery the framework offers is the same load the first frame used, and
-    // it has to start a generation that is on the clock again.
     let response = runtime
         .client()
         .call(VolumeHeatMapRequest::Load {
@@ -669,7 +630,6 @@ async fn an_explicit_load_should_replace_a_generation_that_was_off_the_clock() {
         VolumeHeatMapStatus::Ready { .. }
     ));
 
-    // And it is scheduled again: the next interval fetches on its own.
     let before = source.fetch_count();
     advance(REFRESH_INTERVAL).await;
     assert!(matches!(
@@ -694,15 +654,8 @@ fn the_published_deadline_should_be_a_wall_clock_instant() {
     );
 }
 
-// ---- a tile is written with the code the catalog published -------------------
-
-/// The address of the fixture's on-chain token.
 const CONTRACT_ADDRESS: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 
-/// The canonical terms of the fixture's on-chain token.
-///
-/// A contract token is the case no term of its own can name: it has no native code
-/// at all, so its code is the one a route stages for it.
 fn contract_token_terms() -> CryptoTokenTerms {
     CryptoTokenTerms {
         origin: CryptoTokenOrigin::Chain {
@@ -715,7 +668,6 @@ fn contract_token_terms() -> CryptoTokenTerms {
     }
 }
 
-/// The canonical terms of a token a chain issued natively.
 fn chain_native_token_terms(chain: &str, code: &str) -> CryptoTokenTerms {
     CryptoTokenTerms {
         origin: CryptoTokenOrigin::Chain {
@@ -727,16 +679,10 @@ fn chain_native_token_terms(chain: &str, code: &str) -> CryptoTokenTerms {
     }
 }
 
-/// A generation whose registry carries exactly the given assets, published the way
-/// a registry-only publication publishes one.
-///
-/// The display catalog of what it returns is the publication's own answer about
-/// those assets, qualification included, which is what a tile has to read.
 fn generation_of(terms: &[AssetTerms]) -> Arc<CatalogGeneration> {
     test_support::install_asset_terms(&Catalog::new(), terms)
 }
 
-/// A fixture price in the given quote asset.
 fn price_of(value: &str, quote: AssetId) -> MarketPrice {
     MarketPrice {
         value: Price::from_str(value).expect("the fixture price should parse"),
@@ -745,7 +691,6 @@ fn price_of(value: &str, quote: AssetId) -> MarketPrice {
     }
 }
 
-/// One venue ticker of one listing, in the notional its own listing publishes.
 fn ticker_of(listing: VenueListingKey, quote: AssetId) -> ListingTicker {
     ListingTicker {
         listing,
@@ -765,8 +710,6 @@ fn ticker_of(listing: VenueListingKey, quote: AssetId) -> ListingTicker {
     }
 }
 
-/// The one spot market of the fixture route: the listing it publishes and the
-/// ticker the venue answered with.
 fn contract_market(base: AssetId, quote: AssetId) -> (Vec<RouteListing>, Vec<ListingTicker>) {
     let listing = test_support::listing_key(&spot("binance"), "USDCUSDT");
     let listings = vec![RouteListing {
@@ -776,13 +719,6 @@ fn contract_market(base: AssetId, quote: AssetId) -> (Vec<RouteListing>, Vec<Lis
     (listings, vec![ticker_of(listing, quote)])
 }
 
-/// A chain-native token publishes its own code, and the tile carries
-/// exactly the code the catalog published.
-///
-/// Two chains that both issue a `SOL` publish the same text, because a code is a
-/// pure function of one asset's own terms and nothing is renamed to tell two assets
-/// apart: the generation names both, and the assertion is on the tile text itself
-/// and not on the map behind it.
 #[test]
 fn a_tile_should_carry_the_code_the_display_catalog_published() {
     let base_terms = chain_native_token_terms("solana", "SOL");
@@ -829,10 +765,6 @@ fn a_tile_should_carry_the_code_the_display_catalog_published() {
     );
 }
 
-/// An on-chain contract token states no code of its own, so a
-/// generation that only carries its terms publishes none — and a market whose base
-/// the catalog cannot name is refused with the typed asset rather than drawn under
-/// a name this widget invented.
 #[test]
 fn a_market_whose_base_asset_has_no_published_code_should_be_refused() {
     let base_terms = contract_token_terms();
@@ -882,12 +814,6 @@ fn a_market_whose_base_asset_has_no_published_code_should_be_refused() {
     );
 }
 
-/// The other half of the same rule: a market whose base asset the generation never
-/// registered is outside the map's scope.
-///
-/// An asset's roles are read from canonical terms, so a reading whose base has
-/// none is not one this map can classify — and it contributes nothing rather than
-/// being named from a venue's answer or failing the whole map.
 #[test]
 fn a_market_whose_base_asset_the_registry_does_not_carry_should_be_left_out() {
     let base = AssetId::CryptoToken(CryptoTokenId::of_terms(&contract_token_terms()));

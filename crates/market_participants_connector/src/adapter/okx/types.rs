@@ -5,13 +5,8 @@ use smol_str::SmolStr;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OkxArg {
     pub channel: SmolStr,
-    /// The instrument a channel addresses, for the channels addressed by one.
-    /// A field the channel does not use is sent as an explicit `null`, which is
-    /// the shape OKX accepts for it.
     #[serde(rename = "instId")]
     pub inst_id: Option<SmolStr>,
-    /// The instrument type a channel selects its data with; OKX refuses the
-    /// subscription when a channel that needs it is sent without it.
     #[serde(rename = "instType")]
     pub inst_type: Option<SmolStr>,
 }
@@ -61,10 +56,6 @@ pub struct OkxResponse<T> {
     pub msg: Option<SmolStr>,
     pub data: Vec<T>,
 }
-/// The envelope OKX wraps a refused REST request in.
-///
-/// It carries no rows at all, which is what separates it from [`OkxResponse`]:
-/// the failure is described by the code and the message alone.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OkxErrorEnvelope {
     pub code: SmolStr,

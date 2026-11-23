@@ -29,11 +29,6 @@ impl OkxSigner {
         STANDARD.encode(mac.finalize().into_bytes()).into()
     }
 
-    /// The `OK-ACCESS-SIGN` value of one signed REST request.
-    ///
-    /// OKX signs the concatenation of the timestamp, the method and the request
-    /// path together with its query, and nothing else: a body is signed only by
-    /// the requests that carry one.
     pub fn request_signature(
         &self,
         timestamp: &str,
@@ -108,7 +103,6 @@ mod tests {
 
     type HmacSha256 = Hmac<Sha256>;
 
-    /// The route whose credential is being authenticated.
     fn route() -> VenueRoute {
         VenueRoute::new(
             VenueId::Okx,
@@ -131,8 +125,6 @@ mod tests {
         assert_eq!(message.args[0].sign, expected);
     }
 
-    /// A signed REST request signs the timestamp, the method and the path with
-    /// its query, which is what OKX verifies server-side.
     #[test]
     fn okx_request_signature_covers_timestamp_method_and_path() {
         let signer = OkxSigner::new("secret");
@@ -195,8 +187,6 @@ mod tests {
         ));
     }
 
-    /// A refusal names the route that was being authenticated, so a caller can
-    /// tell which route's credential failed.
     #[test]
     fn okx_login_refusal_names_the_authenticated_target() {
         let signer = OkxSigner::new("secret");

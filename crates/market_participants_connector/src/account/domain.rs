@@ -1,10 +1,3 @@
-//! The public account model.
-//!
-//! Every tradable subject carries its listing key, every price carries its quote
-//! asset and basis, every quantity carries its unit, and every amount carries the
-//! asset it is denominated in. Nothing here asks a caller to guess a unit from a
-//! field name.
-
 use std::num::NonZeroU8;
 
 use market_participants_model::{
@@ -58,7 +51,6 @@ pub struct Position {
     pub mark_price: MarketPrice,
     pub unrealized_profit_or_loss: AssetAmount,
     pub liquidation_price: Option<MarketPrice>,
-    /// The position's monetary value, expressed as a notional.
     pub notional: MarketQuantity,
     pub initial_margin: AssetAmount,
     pub maintenance_margin: Option<AssetAmount>,
@@ -110,7 +102,6 @@ impl<T> MutationOutcome<T> {
     }
 }
 
-/// One spot balance of a monitored wallet, in its own token.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HyperliquidSpotBalance {
     pub asset: AssetId,
@@ -123,10 +114,6 @@ pub struct HyperliquidSpotState {
     pub balances: Vec<HyperliquidSpotBalance>,
 }
 
-/// One spot pair a Hyperliquid route publishes.
-///
-/// The pair is metadata about a route's token namespace; the tradable identity is
-/// the listing key. The venue's own asset index is carried as such.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HyperliquidSpotPair {
     pub coin: SmolStr,
@@ -135,7 +122,6 @@ pub struct HyperliquidSpotPair {
     pub asset_id: market_participants_model::listing::venue::HyperliquidAssetId,
 }
 
-/// One fast asset context of a route-level stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HyperliquidAssetContext {
     pub listing: VenueListingKey,
@@ -146,11 +132,7 @@ pub struct HyperliquidAssetContext {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HyperliquidPerpetualPosition {
     pub listing: VenueListingKey,
-    /// The size the wallet holds, as the non-negative magnitude of the venue's own signed
-    /// size. Which way it points is [`Self::direction`], because a unit-carrying quantity
-    /// cannot be negative.
     pub size: MarketQuantity,
-    /// Which way the position points, read from the sign of the venue's signed size.
     pub direction: PositionDirection,
     pub entry_price: Option<MarketPrice>,
     pub mark_price: Option<MarketPrice>,
@@ -187,7 +169,6 @@ pub struct HyperliquidHistoricalOrder {
     pub price: MarketPrice,
     pub kind: OrderKind,
     pub reduce_only: bool,
-    /// The venue's own order-state label, which is not one of this crate's.
     pub status: SmolStr,
     pub timestamp: UnixMillis,
     pub order_id: SmolStr,
@@ -216,7 +197,6 @@ pub struct HyperliquidLedgerEvent {
     pub address: WalletAddress,
     pub timestamp: UnixMillis,
     pub hash: SmolStr,
-    /// The asset the entry is denominated in, when it names one.
     pub asset: Option<AssetId>,
     pub amount: Option<AssetAmount>,
     pub kind: SmolStr,
@@ -254,7 +234,6 @@ pub enum HyperliquidWalletUpdate {
     },
 }
 
-/// The price terms one account value is expressed in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountUnits {
     quote_asset: AssetId,
@@ -263,7 +242,6 @@ pub struct AccountUnits {
 }
 
 impl AccountUnits {
-    /// Reads the units of one resolved listing.
     pub(crate) fn of(rules: &market_participants_model::listing::rules::TradingRules) -> Self {
         Self {
             quote_asset: rules.common.price.quote_asset.clone(),
@@ -272,7 +250,6 @@ impl AccountUnits {
         }
     }
 
-    /// Wraps one raw price.
     pub(crate) fn price(&self, value: Price) -> MarketPrice {
         MarketPrice {
             value,
@@ -281,12 +258,10 @@ impl AccountUnits {
         }
     }
 
-    /// Wraps one optional raw price.
     pub(crate) fn optional_price(&self, value: Option<Price>) -> Option<MarketPrice> {
         value.map(|value| self.price(value))
     }
 
-    /// Wraps one traded quantity.
     pub(crate) fn quantity(
         &self,
         value: Quantity,
@@ -294,7 +269,6 @@ impl AccountUnits {
         MarketQuantity::traded(value, self.quantity.clone())
     }
 
-    /// Wraps one monetary amount of the listing's own quote asset.
     pub(crate) fn notional(
         &self,
         value: Quantity,
@@ -306,7 +280,6 @@ impl AccountUnits {
             },
         )
     }
-    /// Wraps one monetary amount of the listing's own quote asset.
     pub(crate) fn amount(&self, value: SignedQuantity) -> AssetAmount {
         AssetAmount {
             asset: self.quote_asset.clone(),

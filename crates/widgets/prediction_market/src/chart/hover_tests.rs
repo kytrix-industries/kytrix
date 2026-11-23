@@ -1,6 +1,3 @@
-//! The pointer's arithmetic, asserted without a window: the sample a time snaps to,
-//! the step value at a sample, and where the label column goes.
-
 use ui_core::math::{Point, Rect, Size};
 
 use super::{
@@ -169,7 +166,6 @@ fn a_collision_pushes_the_upper_box_up_with_a_one_pixel_gap() {
     let plot = plot();
     let tops = label_tops(&[100.0, 120.0], LABEL_HEIGHT, LABEL_COLLISION_GAP, plot);
 
-    // The box of the lower point keeps its own bottom; the upper one gives way.
     assert_eq!(tops[1] + LABEL_HEIGHT, 120.0, "the lower box is not moved");
     assert_eq!(
         tops[0] + LABEL_HEIGHT,
@@ -281,7 +277,6 @@ fn a_snapped_x_is_the_sample_time_on_the_scale() {
     assert_eq!(x, plot.origin.x + plot.size.width / 2.0);
 }
 
-/// The dot a hover draws is a rounded quad centred on the series point.
 #[test]
 fn a_dot_is_centred_on_its_screen_point() {
     let dot = super::hover::dot_bounds(super::geometry::ScreenPoint { x: 100.0, y: 50.0 }, 12.0);

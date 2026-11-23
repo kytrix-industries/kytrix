@@ -1,32 +1,3 @@
-//! Painting one statistics chart.
-//!
-//! A frame is built from three parts, separated because they change at different
-//! times:
-//!
-//! - [`measure`] shapes the axis labels and the legend, which is what the layout and
-//!   the legend's placement are built from;
-//! - [`prepare_*`] folds the window into the boxes and lines a frame draws, using the
-//!   box the layout gave it. It runs only when that box or the window changed;
-//! - [`paint`] turns those boxes into quads, those lines into a registered mesh, and
-//!   shapes every label, plus the crosshair and the tooltip, which are the only parts
-//!   that follow the pointer.
-//!
-//! Everything a label *says* was written when the snapshot arrived; this module places
-//! text, it never formats it. The output is one engine [`Canvas`], because that is the
-//! engine's only self-drawing entry point: a chart's labels move with its data, and a
-//! tooltip that followed the pointer through a popover layer would escape the clipping
-//! that keeps it inside the plot.
-//!
-//! # Lines are static geometry
-//!
-//! The engine has no path builder: a line is a registered mesh (`GeometryDesc`) drawn
-//! with [`GeometryDraw`]. [`line_geometry`] builds that mesh — a two-pixel-wide ribbon,
-//! one quad per segment and a square at every joint — and the chart registers it once
-//! per prepared frame, releasing the previous one. The ribbon carries no
-//! anti-aliasing distance (every vertex is marked as interior), so the line is drawn
-//! with a hard edge rather than the feather the old path painter gave it; that is
-//! registered as a W5a difference.
-
 use base_ui::theme::{resolved::Theme, role::Role};
 use bytes::Bytes;
 use smol_str::SmolStr;
@@ -61,62 +32,36 @@ use crate::model::{
     ratio_shares,
 };
 
-/// The most series one chart draws, and so the most legend and tooltip entries it can
-/// have.
 pub(crate) const MAX_SERIES: usize = 3;
 
-/// The roles the two lines of a line chart are prepared and drawn in, in that order.
-///
-/// The roles are named once here because two passes need them: the one that strokes
-/// the lines and the one that marks a hover. Naming them by index in both places would
-/// leave a line and the marker on it free to be read as two different series.
 const LINE_SERIES: [Series; 2] = [Series::Amount, Series::Value];
 
-/// One point under the pointer, and how high the pointer was.
-///
-/// The height is kept rather than the whole position: the x a hover resolves to is the
-/// reading's own, and the height is rounded to whole pixels before it is stored, so a
-/// pointer that moved a fraction of a pixel is not a change worth a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Hover {
     pub index: usize,
     pub cursor_y: f32,
 }
 
-/// One line of a tooltip's body: what it says, and the role it is read in.
-///
-/// The role is what ties a tooltip line to the legend's swatch for the same series —
-/// naming it is what keeps the two one colour. A chart whose tooltip is not a legend
-/// but a reading leaves it `None`, and every line of that tooltip is then drawn in the
-/// tooltip's own foreground, the colour its title is already in.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TooltipEntry {
     pub text: SmolStr,
     pub color: Option<Series>,
 }
 
-/// One tooltip, already written.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Tooltip {
     pub title: SmolStr,
     pub entries: Box<[TooltipEntry]>,
 }
 
-/// The line and markers of one series.
-///
-/// A day that is not a reading is `None`, which breaks the line rather than drawing the
-/// segment across the gap.
 #[derive(Default, Debug, PartialEq)]
 pub(crate) struct LineGeometry {
     pub points: Option<Box<[Option<Point>]>>,
     pub markers: Box<[Rect]>,
 }
 
-/// The boxes and lines one frame draws, prepared from its layout.
 #[derive(Default, Debug, PartialEq)]
 pub(crate) enum Prepared {
-    /// Nothing has been prepared yet, which is the state of a chart that has never been
-    /// laid out.
     #[default]
     Nothing,
     Lines {
@@ -136,7 +81,6 @@ pub(crate) enum Prepared {
 }
 
 impl Prepared {
-    /// How many points the frame was built from.
     pub(crate) fn point_count(&self) -> usize {
         match self {
             Self::Nothing => 0,
@@ -147,7 +91,6 @@ impl Prepared {
     }
 }
 
-/// The measured width of every legend entry.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LegendMeasurements {
     label_widths: [f32; MAX_SERIES],
@@ -155,7 +98,6 @@ pub(crate) struct LegendMeasurements {
     pub content_width: f32,
 }
 
-/// What the axes and the legend need before a layout can be built.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub(crate) struct Measurements {
     pub left_axis_width: Option<f32>,
@@ -169,11 +111,6 @@ impl PartialEq for LegendMeasurements {
     }
 }
 
-/// Measures the legend and the axis labels, which is what the layout is built from.
-///
-/// Each axis is measured against everything drawn in it, its title included: a title
-/// wider than its axis would be drawn off the edge of the chart and clipped away, so the
-/// axis grows instead.
 pub(crate) fn measure(
     app: &mut App,
     theme: &Theme,
@@ -197,12 +134,10 @@ pub(crate) fn measure(
     }
 }
 
-/// A title that is worth measuring: an empty one occupies nothing.
 fn title_of(title: &str) -> Option<&str> {
     (!title.is_empty()).then_some(title)
 }
 
-/// The widest label of one axis, counting its title.
 fn widest_label_width(
     text: &mut ChartTextCache,
     app: &mut App,
@@ -219,7 +154,6 @@ fn widest_label_width(
         .fold(0.0, f32::max)
 }
 
-/// Measures every legend entry, which is what decides whether the legend fits.
 fn measure_legend(
     legend: &[SeriesLabel],
     text_color: Color,
@@ -239,7 +173,6 @@ fn measure_legend(
     measurements
 }
 
-/// Folds the window of an open-interest chart into lines and markers.
 pub(crate) fn prepare_open_interest(
     points: &[OpenInterestPoint],
     amount: &AxisScale,
@@ -259,11 +192,9 @@ pub(crate) fn prepare_open_interest(
                 layout.plot,
             ),
             line_geometry(
-                points.iter().map(|point| {
-                    // An interval the venue published no amount for breaks the line
-                    // rather than being drawn as a value of zero.
-                    point.quote_asset_volume.map_or(f64::NAN, quantity_as_f64)
-                }),
+                points
+                    .iter()
+                    .map(|point| point.quote_asset_volume.map_or(f64::NAN, quantity_as_f64)),
                 point_count,
                 value.domain,
                 layout.plot,
@@ -273,7 +204,6 @@ pub(crate) fn prepare_open_interest(
     }
 }
 
-/// Folds the window of a taker-volume chart into boxes.
 pub(crate) fn prepare_taker_volume(
     points: &[TakerVolumePoint],
     volume: &AxisScale,
@@ -301,7 +231,6 @@ pub(crate) fn prepare_taker_volume(
     }
 }
 
-/// Folds the window of a ratio chart into boxes and a line.
 pub(crate) fn prepare_ratio(
     points: &[LongShortRatioPoint],
     ratio: &AxisScale,
@@ -341,7 +270,6 @@ pub(crate) fn prepare_ratio(
     }
 }
 
-/// The time labels of a window, written once.
 pub(crate) fn time_labels(
     timestamps: impl Iterator<Item = i64>,
     label: impl Fn(i64) -> SmolStr,
@@ -349,7 +277,6 @@ pub(crate) fn time_labels(
     timestamps.map(label).collect()
 }
 
-/// Builds the line and markers of one series.
 fn line_geometry(
     values: impl Iterator<Item = f64>,
     point_count: usize,
@@ -360,8 +287,6 @@ fn line_geometry(
     let mut points = Vec::with_capacity(point_count);
     for (index, value) in values.enumerate() {
         if !value.is_finite() {
-            // A point that is not a reading breaks the line, so the segment across the
-            // gap is not drawn as if the gap were data.
             points.push(None);
             continue;
         }
@@ -378,7 +303,6 @@ fn line_geometry(
     }
 }
 
-/// Places the time labels a window's width has room for.
 fn time_ticks(
     labels: &[SmolStr],
     point_count: usize,
@@ -393,24 +317,10 @@ fn time_ticks(
     )
 }
 
-/// The mesh of one series line: a ribbon of `width` through the points.
-///
-/// A run of consecutive readings becomes one quad per segment plus a square at every
-/// joint, which is what keeps the ribbon continuous around a corner. A point that is
-/// not a reading is a break rather than a zero, so the runs on either side are drawn as
-/// separate lines — the segment across the gap is not drawn as if the gap were data.
-///
-/// Every vertex is marked as interior (a negative distance, which the engine's coverage
-/// shader reads as full coverage), because this mesh is not anti-aliased: the engine's
-/// `Ui` pipeline is a coverage-distance pipeline and a filled ribbon is its degenerate
-/// case.
 pub(crate) fn line_geometry_mesh(points: &[Option<Point>], width: f32) -> Option<GeometryDesc> {
     let half = (width / 2.0).max(0.5);
     let mut vertices = Vec::<[f32; 3]>::with_capacity(points.len() * 8);
     let mut indices = Vec::<u32>::with_capacity(points.len() * 12);
-    // The mesh's AABB is accumulated from the corners themselves rather than from
-    // rectangles: a zero-size rect is "empty" to the geometry helpers, and a union of
-    // empty rects is the last one of them.
     let mut min = Point::new(f32::INFINITY, f32::INFINITY);
     let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
     let mut push_quad = |corners: [Point; 4]| {
@@ -435,8 +345,6 @@ pub(crate) fn line_geometry_mesh(points: &[Option<Point>], width: f32) -> Option
     for slot in points.iter().chain(std::iter::once(&None)) {
         let Some(point) = *slot else {
             if run.len() == 1 {
-                // A run of one reading is a dot: a circle is not a quad, so it is drawn
-                // as the square the joint of a longer run would have.
                 push_quad(square(run[0]));
             } else {
                 for window in run.windows(2) {
@@ -487,7 +395,6 @@ pub(crate) fn line_geometry_mesh(points: &[Option<Point>], width: f32) -> Option
     })
 }
 
-/// Which way a label hangs off the box it is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Align {
     Left,
@@ -495,31 +402,14 @@ enum Align {
     Right,
 }
 
-/// Everything one frame draws that is not the prepared window.
 pub(crate) struct Frame<'a> {
     pub layout: ChartLayout,
-    /// The y-axes the chart draws: `(left, right, share)`.
-    ///
-    /// The right one is not optional — every chart is read against a scale on its
-    /// right — while a chart with a single series leaves the left empty.
     pub scales: (Option<&'a AxisScale>, &'a AxisScale),
-    /// The titles of the axes: `(left, right)`; an empty one is not drawn.
     pub axis_titles: (&'a str, &'a str),
     pub legend: &'a [SeriesLabel],
     pub legend_measurements: LegendMeasurements,
 }
 
-/// Draws one frame of a chart into a canvas.
-///
-/// The canvas is built whole rather than patched: an engine canvas is a value, and a
-/// chart whose box, data or pointer moved is a different value. The chart keeps the last
-/// one it built and only rebuilds when its key or the pointer says so.
-///
-/// The second half of the answer says whether every label reached the canvas. A line
-/// whose atlas lease died before it could be pushed is refused by the engine rather than
-/// encoded from reused texture, so the frame that ran into it is missing that run: it is
-/// not a frame the chart can keep (see [`ChartTextCache::has_stale`] for the other half
-/// of the same guard).
 pub(crate) fn paint(
     app: &mut App,
     theme: &Theme,
@@ -569,20 +459,14 @@ pub(crate) fn paint(
     (canvas, whole)
 }
 
-/// Paints one frame with the shaped text and the theme it needs.
 struct PaintContext<'a> {
     app: &'a mut App,
     theme: &'a Theme,
     text: &'a mut ChartTextCache,
-    /// Whether every line this pass placed reached the canvas; see [`paint`].
     whole: bool,
 }
 
 impl PaintContext<'_> {
-    /// Places one line of text inside `[x, x + width]`, at the top edge `y`.
-    ///
-    /// Alignment is resolved here rather than by the shaper: a label's box is its axis,
-    /// and where inside that box it starts is what says which side of the plot it names.
     fn text(
         &mut self,
         canvas: &mut Canvas,
@@ -603,24 +487,16 @@ impl PaintContext<'_> {
             Align::Center => x + (width - line_width) / 2.0,
             Align::Right => x + width - line_width,
         };
-        // A refused line is one whose atlas lease died between being shaped and being
-        // pushed: its glyphs have been reused, so the run is left out rather than drawn
-        // from stale texture, and the pass is not a whole frame any more.
         if !canvas.push_shaped_text(&line, Point::new(origin_x, y)) {
             self.whole = false;
         }
     }
 
-    /// The width one line of `text` occupies in `style`.
     fn width(&mut self, text: &str, style: &TextStyle) -> f32 {
         self.text.width(self.app, text, style)
     }
 }
 
-/// Draws the two rules that bound the plot from above and below.
-///
-/// There is no background: the pane body behind the canvas is the background, so the
-/// chart never paints over the body's rounded corners.
 fn paint_plot_rules(canvas: &mut Canvas, layout: ChartLayout, color: Color) {
     push_quad(
         canvas,
@@ -644,11 +520,6 @@ fn paint_plot_rules(canvas: &mut Canvas, layout: ChartLayout, color: Color) {
     );
 }
 
-/// Draws the horizontal grid line of every tick of the axis the plot is read against.
-///
-/// One axis drives the grid, not two: two sets of lines a few pixels apart would read as
-/// neither. The left axis is the one named first, so it is the one that draws them — and
-/// a chart with only a right axis draws its grid from that.
 fn paint_value_grid(canvas: &mut Canvas, frame: &Frame<'_>, color: Color) {
     let scale = frame.scales.0.unwrap_or(frame.scales.1);
     for tick in &scale.ticks {
@@ -666,7 +537,6 @@ fn paint_value_grid(canvas: &mut Canvas, frame: &Frame<'_>, color: Color) {
     }
 }
 
-/// Draws both y-axes: the title above each, and a label per tick beside it.
 fn paint_axes(canvas: &mut Canvas, frame: &Frame<'_>, context: &mut PaintContext<'_>) {
     let color = context.theme.role(Role::ChartAxis);
     let style = label_style(AXIS_FONT_SIZE, AXIS_LINE_HEIGHT, color);
@@ -705,14 +575,12 @@ fn paint_axes(canvas: &mut Canvas, frame: &Frame<'_>, context: &mut PaintContext
     );
 }
 
-/// Which side of the plot a y-axis is on, which is what says where its labels go.
 #[derive(Clone, Copy)]
 enum AxisSide {
     Left,
     Right,
 }
 
-/// Draws one y-axis: a label per tick, beside the line that tick draws.
 fn paint_value_axis(
     canvas: &mut Canvas,
     scale: &AxisScale,
@@ -745,7 +613,6 @@ fn paint_value_axis(
     }
 }
 
-/// Draws the interval of every labelled position under the plot.
 fn paint_time_axis(
     canvas: &mut Canvas,
     ticks: &[PositionedTimeTick],
@@ -770,7 +637,6 @@ fn paint_time_axis(
     }
 }
 
-/// Draws the legend: a swatch and a name per series, centred over the content.
 fn paint_legend(canvas: &mut Canvas, frame: &Frame<'_>, context: &mut PaintContext<'_>) {
     let layout = frame.layout;
     let measurements = frame.legend_measurements;
@@ -794,8 +660,6 @@ fn paint_legend(canvas: &mut Canvas, frame: &Frame<'_>, context: &mut PaintConte
     }
 }
 
-/// The x the legend starts at: centred when it fits, inset from the left when it does
-/// not.
 fn centered_legend_origin(layout: ChartLayout, content_width: f32) -> f32 {
     let legend = layout.legend;
     if content_width <= legend.size.width {
@@ -805,11 +669,6 @@ fn centered_legend_origin(layout: ChartLayout, content_width: f32) -> f32 {
     }
 }
 
-/// Draws the series of the prepared frame.
-///
-/// The meshes arrive registered and are named by the canvas: the chart owns the geometry
-/// store entries for as long as the canvas that draws them is the current one. A chart
-/// whose series are not lines draws its boxes here.
 fn paint_series(
     canvas: &mut Canvas,
     prepared: &Prepared,
@@ -862,7 +721,6 @@ fn paint_series(
     }
 }
 
-/// Draws the dashed rule through the hovered interval.
 fn paint_dashed_vertical(canvas: &mut Canvas, x: f32, plot: Rect, color: Color) {
     let mut y = plot.origin.y;
     while y < plot.bottom() {
@@ -872,11 +730,6 @@ fn paint_dashed_vertical(canvas: &mut Canvas, x: f32, plot: Rect, color: Color) 
     }
 }
 
-/// Draws the square that says which point a tooltip belongs to, and the tooltip itself.
-///
-/// One marker per series, all at the hovered interval: a chart of two lines shows two
-/// readings of the same moment, and marking only the one nearest the pointer would leave
-/// the other reading unmarked on the very frame the tooltip names it.
 fn paint_tooltip(
     canvas: &mut Canvas,
     frame: &Frame<'_>,
@@ -934,17 +787,6 @@ fn paint_tooltip(
     }
 }
 
-/// The marker of every series under the pointer, each naming the line it marks.
-///
-/// Every series is marked at the same x, because they are the readings of one interval;
-/// each is marked at its own y, because each is read against its own axis. A chart whose
-/// series are one shape — a stacked bar, a single line — has one marker, which is the
-/// same answer with one element in it.
-///
-/// A paired-bar chart is marked by none: the top of a bar is both its reading and the
-/// edge of the bar the pointer is over, so a square there would cover the very bar it
-/// was meant to point at, and a hover already says which interval it is on with the rule
-/// drawn through it.
 pub(crate) fn hover_markers(
     frame: &Frame<'_>,
     prepared: &Prepared,
@@ -996,7 +838,6 @@ fn paint_tooltip_surface(
     });
 }
 
-/// Pushes one solid quad.
 fn push_quad(canvas: &mut Canvas, bounds: Rect, fill: Color) {
     canvas.push_quad(Quad {
         bounds,

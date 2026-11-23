@@ -1,11 +1,3 @@
-//! The canvas one chart draws: the box it fills, the pointer it follows, and the labels
-//! it rewrites when the language moves under it.
-//!
-//! These are the interface tests of the chart: they go through the engine's own
-//! `WidgetTestApp` (the headless host a widget is driven by), because what they assert is
-//! what the engine ended up holding — a canvas node, its primitives, and the frames a
-//! change is worth.
-
 use base_ui::style_builder::StyleBuilder;
 use i18n::language::codes::LanguageCode;
 use ui_core::{
@@ -27,7 +19,6 @@ use crate::model::{CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow};
 const WIDTH: f32 = 640.0;
 const HEIGHT: f32 = 360.0;
 
-/// One chart, drawn into a page of a fixed size.
 struct ChartHarness {
     app: WidgetTestApp,
     chart: CryptocurrencyEtfChart,
@@ -45,7 +36,6 @@ impl ChartHarness {
         app.with_cx(|cx| chart.sync_locale(cx))
     }
 
-    /// Points the chart at another history, the way a new answer does.
     fn set_view(&mut self) -> bool {
         let Self { app, chart, .. } = self;
         app.with_cx(|cx| {
@@ -76,10 +66,6 @@ impl ChartHarness {
     }
 }
 
-/// The atlas generation the chart's glyphs were rasterized in, if it draws any.
-///
-/// The leases a canvas holds are what an atlas reset invalidates, so reading the
-/// generation back is how a test tells a canvas that was rebuilt from one that was kept.
 fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
     harness
         .canvas()
@@ -92,7 +78,6 @@ fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
         .map(|glyph| glyph.tile.generation)
 }
 
-/// Builds a chart over a page of `width` × `height`, and lays it out.
 fn harness_in(width: f32, height: f32, flows: &[f64]) -> ChartHarness {
     let mut app = WidgetTestApp::with_translate(translate(LanguageCode::En));
     let window = app.window();
@@ -107,7 +92,6 @@ fn harness_in(width: f32, height: f32, flows: &[f64]) -> ChartHarness {
     });
     app.with_cx(|cx| chart.build(cx, page))
         .expect("the chart builds");
-    // The first frame lays the page (and the canvas inside it) out.
     app.drain();
     ChartHarness { app, chart, window }
 }
@@ -116,7 +100,6 @@ fn harness() -> ChartHarness {
     harness_in(WIDTH, HEIGHT, &[1_000.0, -500.0, 2_000.0])
 }
 
-/// A box of a fixed size, which is the shapes a chart is laid out in.
 fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
     app.with_cx(|cx| {
         let root = cx.tree().root();
@@ -134,7 +117,6 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
     })
 }
 
-/// The middle of the plot, which is over one of the fixture's days.
 fn middle_of_plot(harness: &ChartHarness) -> Point {
     let plot = harness.layout().plot;
     Point::new(
@@ -169,11 +151,8 @@ fn a_chart_should_fill_the_box_it_is_given() {
     );
 }
 
-/// The content box is the pane's when the pane is roomier than the floor the layout keeps
-/// for its labels: that floor is a minimum, not a size the chart insists on.
 #[test]
 fn a_chart_in_a_roomy_box_should_fill_it_rather_than_stay_at_its_floor() {
-    // Taller and wider than the 640×360 floor, inside the headless host's 800×600 window.
     let mut harness = harness_in(760.0, 560.0, &[1_000.0, -500.0, 2_000.0]);
     assert!(harness.sync());
 
@@ -325,11 +304,6 @@ fn a_language_change_should_rewrite_the_labels_a_chart_is_already_showing() {
     );
 }
 
-/// The labels are drawn from shaped handles that lease glyph tiles from the atlas. When a
-/// lease is gone — the atlas was reset, a font stack changed, a tile was evicted — the
-/// engine refuses to encode those runs rather than draw reused texture, so a chart that
-/// kept the canvas it already had would lose its labels for good. A moved lease is a
-/// frame the chart owes.
 #[test]
 fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
     let mut harness = harness();
@@ -337,8 +311,6 @@ fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
     let labels = harness.canvas().primitives().len();
     let generation = glyph_generation(&harness).expect("a chart of three days labels its axes");
 
-    // An atlas reset under the same font stack: every handle the canvas was built from is
-    // leased from an atlas that no longer exists, while the glyphs shape back the same.
     let stack = harness.app.app().font_stack().clone();
     harness.app.app_mut().set_font_stack(stack);
 
@@ -393,8 +365,6 @@ fn releasing_a_chart_should_leave_no_geometry_behind() {
     );
 }
 
-/// A new answer is a new prepared frame, and another net-asset line with it: the mesh the
-/// frame before it registered is handed back rather than stacked behind the new one.
 #[test]
 fn preparing_another_frame_should_hand_the_previous_geometry_back() {
     let mut harness = harness();
@@ -429,8 +399,6 @@ fn a_chart_should_not_draw_before_it_is_laid_out() {
     app.with_cx(|cx| chart.build(cx, page))
         .expect("the chart builds");
 
-    // No frame has laid the page out yet: the canvas node has no box, so there is
-    // nothing to draw into and nothing to draw.
     assert!(
         !app.with_cx(|cx| chart.sync(cx)).expect("the chart syncs"),
         "a chart that was not laid out draws nothing"

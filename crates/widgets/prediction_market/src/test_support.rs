@@ -1,5 +1,3 @@
-//! The fixtures the model and service tests share.
-
 use market_participants_model::{
     asset::{AssetId, CryptoTokenId, CryptoTokenOrigin, TokenReference},
     identifier::{IdentifierNamespace, IdentifierValue, TokenIssuerId, VenueId, VenueScopeId},
@@ -21,7 +19,6 @@ use market_participants_model::{
 };
 use smol_str::{SmolStr, format_smolstr};
 
-/// One event on the prediction fixture route.
 pub(crate) fn event_ref() -> PredictionEventRef {
     PredictionEventRef {
         route: VenueRoute::new(
@@ -32,7 +29,6 @@ pub(crate) fn event_ref() -> PredictionEventRef {
     }
 }
 
-/// One market with no sides, for a test that only reads the header's choices.
 pub(crate) fn market(
     event: &PredictionEventRef,
     id: &str,
@@ -54,7 +50,6 @@ pub(crate) fn market(
     }
 }
 
-/// One event view of `event` carrying the given markets.
 pub(crate) fn event_of(
     event: PredictionEventRef,
     markets: Vec<PredictionMarket>,
@@ -68,7 +63,6 @@ pub(crate) fn event_of(
     }
 }
 
-/// One event view carrying the given markets.
 pub(crate) fn event_with(markets: Vec<PredictionMarket>) -> PredictionEventView {
     event_of(event_ref(), markets)
 }
@@ -86,10 +80,6 @@ fn settlement_asset() -> AssetId {
     )
 }
 
-/// One binary market whose two sides a test can chart.
-///
-/// The returned legs are in the order the group publishes them, so a test can
-/// name the side it ticks without reading the group.
 pub(crate) fn charted_market(
     event: &PredictionEventRef,
     id: &str,
@@ -164,7 +154,6 @@ pub(crate) fn charted_market(
     (market, legs)
 }
 
-/// One price level of a fixture book.
 pub(crate) fn level(price: &str, size: &str) -> PredictionBookLevel {
     PredictionBookLevel {
         price: price.parse().expect("the fixture price is a fraction"),
@@ -172,7 +161,6 @@ pub(crate) fn level(price: &str, size: &str) -> PredictionBookLevel {
     }
 }
 
-/// One absolute size change of a fixture book level.
 pub(crate) fn change(price: &str, size: &str) -> PredictionBookLevelChange {
     PredictionBookLevelChange {
         price: price.parse().expect("the fixture price is a fraction"),
@@ -180,7 +168,6 @@ pub(crate) fn change(price: &str, size: &str) -> PredictionBookLevelChange {
     }
 }
 
-/// One fixture book for `leg`, with no last trade and a fixed timestamp.
 pub(crate) fn order_book(
     leg: OutcomeLegRef,
     tick: &str,

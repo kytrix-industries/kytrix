@@ -1,5 +1,3 @@
-//! The control that opens the prediction-event selector.
-
 use std::rc::Rc;
 
 use base_ui::kit::{
@@ -12,14 +10,9 @@ use ui_core::{app::App, error::EngineError, node::id::NodeId, window::WindowId};
 
 use crate::{host::SelectorHost, prediction_selector::PredictionEventSelector};
 
-/// What a confirmed event is handed to, with the title its card showed.
 pub(crate) type PredictionConfirm =
     Rc<dyn Fn(PredictionEventRef, SmolStr, &mut App, WindowId) + 'static>;
 
-/// One button that states the event a pane follows and opens the selector.
-///
-/// The label is the event title. A selected event is never named by its native
-/// id here; a caller that has no title shows the placeholder instead.
 pub struct PredictionEventButton {
     key: SmolStr,
     selection: Option<PredictionEventRef>,
@@ -29,7 +22,6 @@ pub struct PredictionEventButton {
 }
 
 impl PredictionEventButton {
-    /// Builds the control.
     pub fn new(
         key: impl Into<SmolStr>,
         selection: Option<PredictionEventRef>,
@@ -46,10 +38,6 @@ impl PredictionEventButton {
         }
     }
 
-    /// Builds the control under `parent`; the click opens the selector.
-    ///
-    /// # Errors
-    /// Engine node-building errors (`UnknownWindow` / `StaleNode`).
     pub fn build(
         self,
         host: &SelectorHost,

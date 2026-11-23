@@ -1,12 +1,3 @@
-//! The metadata request the updater makes, and the redirect policy it follows.
-//!
-//! The request does not let the client follow redirects: GitHub answers the
-//! release endpoint with a redirect to the file it publishes, and the transport's
-//! client is built with `Policy::none()` precisely so that every hop is resolved
-//! against the configured route rather than reused from the first one. The hops
-//! are therefore followed here, one at a time, and the budget for them is the
-//! operation class's own.
-
 use app_config::network::{
     Config, ConfigError, KytrixServiceCapability, ProxyRoute, ResolvedProxy, RouteTarget,
     ServiceTarget,
@@ -30,15 +21,6 @@ use crate::{
     release::{PlatformKey, ReleaseInfo, ReleaseManifest},
 };
 
-/// Reads the published metadata from `endpoint` and reduces it to the update this
-/// build would install.
-///
-/// The endpoint is the caller's, not this module's: it is a build-time fact of the
-/// application rather than of how a request is made, and what a request is sent to
-/// is what the tests that drive this path replace.
-///
-/// `Ok(None)` is the endpoint answering that there is nothing newer than the
-/// running build, which is what most checks are.
 pub async fn fetch_release(
     transport: &TransportHub,
     config: &Config,
@@ -72,25 +54,13 @@ pub async fn fetch_release(
     manifest.select(key, &current)
 }
 
-/// What to do with the response to a request that follows its own redirects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RedirectDecision {
-    /// Send the same request to this destination.
     Follow(Url),
-    /// This response answers the request.
     Final,
-    /// This response redirects somewhere this client will not go.
     Refused(RedirectRefusal),
 }
 
-/// Decides what one response means, from the request's own URL and the location it named.
-///
-/// Pure: the hop budget is the only state involved and it is handed in, which is
-/// what lets every refusal be exercised without a server.
-///
-/// `followed` counts the redirects already followed for this request, so the
-/// budget is spent once it reaches `limit`; a request that is over budget fails
-/// rather than being sent to a destination nothing bounds.
 pub(crate) fn redirect_decision(
     current: &Url,
     status: StatusCode,
@@ -98,8 +68,6 @@ pub(crate) fn redirect_decision(
     followed: usize,
     limit: usize,
 ) -> RedirectDecision {
-    // `304 Not Modified` is a redirection by status code alone and names no
-    // destination; nothing here asks a conditional question, so it is a final answer.
     if !status.is_redirection() || status == StatusCode::NOT_MODIFIED {
         return RedirectDecision::Final;
     }
@@ -109,8 +77,6 @@ pub(crate) fn redirect_decision(
     if followed >= limit {
         return RedirectDecision::Refused(RedirectRefusal::HopLimit);
     }
-    // A relative location is resolved against the URL that was asked for, not
-    // against the origin: the release assets are siblings of the metadata.
     let Ok(next) = current.join(location) else {
         return RedirectDecision::Refused(RedirectRefusal::MalformedLocation);
     };
@@ -124,18 +90,6 @@ pub(crate) fn redirect_decision(
     RedirectDecision::Follow(next)
 }
 
-/// Resolves one hop's outbound route, off the runtime's workers when it needs the
-/// operating system's proxy.
-///
-/// The two branches are the ones `network::proxy::resolve_route_async_cancellable`
-/// takes: `Direct` / `Named` are pure configuration reads and resolve inline, while
-/// `System` evaluates the OS proxy (including PAC/WPAD, a blocking download and a
-/// JavaScript run) and must not run on a worker that is driving a future. That
-/// facade's signature still names the old toolkit runtime, which this crate no longer
-/// depends on (P4-4; the crate itself goes away in P5-1), so the blocking hop is made
-/// here against the application runtime handle, with the same cancellation contract:
-/// a cancelled operation reports the route failure that says its system proxy could
-/// not be resolved.
 async fn resolve_route(
     config: &Config,
     target: &RouteTarget,
@@ -169,11 +123,6 @@ async fn resolve_route(
         result = resolving => result.unwrap_or_else(|_| Err(refused())),
     }
 }
-///
-/// The returned permit is the caller's to hold for as long as it is still reading
-/// the response: it is what keeps a shutdown from closing the transport under a
-/// transfer that has not finished, so it must not be dropped at the end of this
-/// call.
 async fn exchange(
     transport: &TransportHub,
     config: &Config,
@@ -185,16 +134,11 @@ async fn exchange(
 ) -> Result<(TransportPermit, Response), UpdaterError> {
     let operation = transport.begin_operation().map_err(UpdaterError::Client)?;
 
-    // What a request is addressed through is the Kytrix service that serves it,
-    // which is what its line is configured under — see the applications page.
     let target = RouteTarget::Service(ServiceTarget::KytrixService { capability });
     let limit = class.redirect_limit();
     let mut followed = 0;
 
     loop {
-        // Every hop is resolved again: the destination changed, and a route may be
-        // destination-dependent, so reusing the first hop's route would send the
-        // rest of the chain down a line the user did not choose for it.
         let route = resolve_route(config, &target, &url, runtime, cancellation)
             .await
             .map_err(UpdaterError::Route)?;

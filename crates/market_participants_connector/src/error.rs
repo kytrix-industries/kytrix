@@ -1,5 +1,3 @@
-//! Typed errors shared by market-participant adapters and the network gateway.
-
 use bytes::Bytes;
 use market_participants_model::{
     decimal::Quantity,
@@ -40,11 +38,6 @@ pub enum AuthError {
     InvalidCredentials,
     #[error("API key was not found")]
     ApiKeyNotFound,
-    /// The venue's own market-data profile grants no permission for the market read.
-    ///
-    /// It is the venue's permission profile that answers this, never a refused
-    /// command: the profile said the account may not read the market at all, so the
-    /// request is refused before anything is sent and no error code is guessed at.
     #[error("the credentials have no market-data permission for this market")]
     NoMarketDataPermission,
     #[error("signature is invalid")]
@@ -61,33 +54,13 @@ pub enum AuthError {
     ResponseMalformed,
     #[error("authentication service closed the connection")]
     ServiceClosed,
-    /// The venue's stored credential set is only partially filled.
-    ///
-    /// The venue is carried as a typed identity rather than flattened into a
-    /// formatted sentence, so the interface states it in the reader's language: a
-    /// diagnostic naming the canonical identity would otherwise be interpolated
-    /// into a localized one, naming the venue twice — once in each language.
-    ///
-    /// The scope is carried beside it because a venue that signs its markets apart can
-    /// be half configured: the scope names which of the venue's credential sets the
-    /// operator has to finish, and without it the interface would send them to a page
-    /// with two of them on it.
     #[error("the stored credentials of venue {venue} are incomplete")]
     IncompleteCredentials {
         venue: VenueId,
         scope: Option<SmolStr>,
     },
-    /// The stored credentials cannot be turned into a signer at all.
-    ///
-    /// A typed venue rather than a formatted sentence: the set the user finished
-    /// filling in is unusable — a private key that does not parse — and the interface
-    /// has to say whose credentials to enter again, in the reader's language.
     #[error("the stored credentials of venue {venue} cannot be used as a signer")]
     UnusableCredentials { venue: VenueId },
-    /// The execution's account identity is not a valid account id.
-    ///
-    /// A typed value rather than a formatted sentence, so the interface can state it
-    /// in the reader's language: the identity came from the caller, not from the wire.
     #[error("the account identity {value} is not a valid account id")]
     InvalidAccountIdentity { value: SmolStr },
 }
@@ -114,12 +87,6 @@ pub enum OrderErrorKind {
     Other { code: SmolStr, message: SmolStr },
 }
 
-/// Every failure of the market-participants layer.
-///
-/// A route is always named by its full `VenueRoute` and a capability by its
-/// `CapabilityId`: an error never collapses them into a venue name or a free
-/// text reason, because the caller has to be able to act on the exact scope that
-/// failed.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum MarketParticipantError {
     #[error("connection to {route} at {endpoint} failed: {source}")]
@@ -128,9 +95,6 @@ pub enum MarketParticipantError {
         endpoint: SmolStr,
         source: NetworkError,
     },
-    /// A venue-level request failed: the discovery conversation, which addresses the
-    /// venue itself because it asks what the venue publishes rather than reading one
-    /// of its scopes.
     #[error("request to venue {venue} at {endpoint} failed: {source}")]
     VenueRequestFailed {
         venue: VenueId,
@@ -169,40 +133,15 @@ pub enum MarketParticipantError {
     },
     #[error("invalid configuration: {0}")]
     Configuration(SmolStr),
-    /// The venue's scopes are all statically known, so it publishes no table to read.
-    ///
-    /// The venue whose loader would have asked is carried as a typed identity for the
-    /// same reason as [`AuthError::IncompleteCredentials`]: the refusal is reported
-    /// through a localized template, and a diagnostic that spells the canonical
-    /// identity would name the venue in the wrong language beside the catalogue's own
-    /// name for it.
     #[error("venue {venue} publishes no scope table to read")]
     VenuePublishesNoScopeTable { venue: VenueId },
-    /// The venue's stored credential set is only partially filled.
-    ///
-    /// Carried as a typed venue for the same reason as
-    /// [`AuthError::IncompleteCredentials`], and with the scope beside it for the same
-    /// reason: a venue that signs its markets apart can be half configured.
     #[error("the stored credentials of venue {venue} are incomplete")]
     IncompleteCredentials {
         venue: VenueId,
         scope: Option<SmolStr>,
     },
-    /// The stored credentials cannot be turned into a signer at all.
-    ///
-    /// A typed venue rather than a formatted sentence: the set the user finished
-    /// filling in is unusable — a private key that does not parse — and the interface
-    /// has to say whose credentials to enter again, in the reader's language.
     #[error("the stored credentials of venue {venue} cannot be used as a signer")]
     UnusableCredentials { venue: VenueId },
-    /// This build carries no adapter or origin for the venue a route names.
-    ///
-    /// Every venue this build speaks has both, so a venue that reaches here is one
-    /// the build was assembled without rather than one a caller picked. The answer
-    /// names the venue rather than the part that is missing, because which part is
-    /// missing is a fact about the assembly and not about what was asked for — and
-    /// it names it as a typed venue, so the interface states it in the reader's
-    /// language instead of spelling the identity into a diagnostic.
     #[error("this build speaks no market named {venue}")]
     VenueUnsupported { venue: VenueId },
     #[error("a Tokio runtime is required for this market-participant operation")]
@@ -261,20 +200,11 @@ pub enum MarketParticipantError {
         route: VenueRoute,
         timeframe: SmolStr,
     },
-    /// A request asked for a price adjustment the route does not publish.
     #[error("{adjustment} is unsupported for route {route}")]
     UnsupportedAdjustment {
         route: VenueRoute,
         adjustment: SmolStr,
     },
-    /// A venue's symbol directory could not be fetched or read.
-    ///
-    /// The venue is carried as a typed identity for the same reason the credential
-    /// errors carry one: the refusal reaches a reader through a localized template,
-    /// and a diagnostic spelling the canonical identity would name the venue in the
-    /// wrong language beside the catalogue's own name for it. The reason is the
-    /// diagnostic detail — the address, the status, the concrete cause — and never
-    /// what the reader is shown instead of the sentence.
     #[error("the symbol directory of venue {venue} could not be fetched: {reason}")]
     SymbolDirectoryFetchFailed { venue: VenueId, reason: SmolStr },
     #[error("the catalog reported: {0}")]
@@ -308,9 +238,6 @@ impl MarketParticipantError {
             | Self::VenueRequestFailed { .. }
             | Self::RateLimited { .. }
             | Self::Timeout { .. }
-            // Reading a symbol directory is a network read of a remote answer, so a
-            // failure of it is worth retrying: nothing about the request itself was
-            // refused.
             | Self::SymbolDirectoryFetchFailed { .. }
             | Self::Disconnected(DisconnectReason::Network(_))
             | Self::Disconnected(DisconnectReason::HeartbeatTimeout) => true,

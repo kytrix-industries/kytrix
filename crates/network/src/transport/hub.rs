@@ -1,5 +1,3 @@
-//! Shared transport hub, transport policy, and lifecycle.
-
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -14,18 +12,12 @@ use url::Url;
 
 use crate::transport::{error::TransportError, http::HttpClientPool, websocket::RawWebSocket};
 
-/// Process-wide transport settings that are not part of a resolved route.
-///
-/// Plaintext traffic is denied unless a caller opts in, and extra trust anchors
-/// exist so a deployment behind a private certificate authority can be reached
-/// without weakening the default trust store.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransportPolicy {
     pub allow_plaintext: bool,
     pub extra_root_certificates: Vec<Bytes>,
 }
 
-/// Shared owner of the network transports used by every connector facade.
 #[derive(Clone)]
 pub struct TransportHub {
     http: Arc<HttpClientPool>,
@@ -50,10 +42,6 @@ impl TransportHub {
         &self.policy
     }
 
-    /// Establishes a WebSocket using this hub's policy and lifecycle.
-    ///
-    /// Callers should pass a child token of [`Self::cancellation`] when they
-    /// need an additional local cancellation boundary.
     pub async fn connect_websocket(
         &self,
         url: &Url,
@@ -161,7 +149,6 @@ impl Drop for BarrierPermit {
     }
 }
 
-/// Keeps one operation visible to a lifecycle barrier until it finishes.
 pub struct TransportPermit {
     _global: BarrierPermit,
     _local: Option<BarrierPermit>,
@@ -176,7 +163,6 @@ impl TransportPermit {
     }
 }
 
-/// A cancellable child lifecycle of one [`TransportHub`].
 #[derive(Clone)]
 pub struct TransportScope {
     global: Arc<LifecycleBarrier>,

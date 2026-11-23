@@ -1,11 +1,3 @@
-//! Hyperliquid catalog values, dynamic scope discovery and canonical identity.
-//!
-//! Everything here is a pure derivation from the venue's own published wire
-//! values: an asset index, a listing continuity key, a route descriptor or the
-//! canonical identity of one outcome side. Nothing in this module holds a
-//! directory, and nothing derives an identity from an array position the venue
-//! did not publish as an identity.
-
 use market_participants_model::{
     asset::{
         AssetId, CryptoTokenOrigin, CryptoTokenTerms, DerivativeUnderlying, TokenReference,
@@ -56,30 +48,20 @@ use crate::{
     routing::{HYPERLIQUID_VENUE, RouteCapabilityDescriptor, VenueRouteDescriptor},
 };
 
-/// The venue these identities belong to.
 pub(super) const VENUE: &str = HYPERLIQUID_VENUE;
 
-/// The scope prefix of a builder-deployed perpetual DEX.
 pub(super) const PERP_DEX_SCOPE_PREFIX: &str = "perp-dex/";
 
-/// The scope prefix of a HIP-4 outcome venue.
 pub(super) const OUTCOME_VENUE_SCOPE_PREFIX: &str = "outcome-venue/";
 
-/// The asset index of the first spot pair.
 const SPOT_ASSET_ID_BASE: u32 = 10_000;
-/// The asset index of the first builder-deployed perpetual.
 const PERP_DEX_ASSET_ID_BASE: u32 = 100_000;
-/// The number of asset indices one perpetual DEX reserves.
 const PERP_DEX_ASSET_ID_STRIDE: u32 = 10_000;
-/// The asset index of the first outcome side token.
 const OUTCOME_ASSET_ID_BASE: u64 = 100_000_000;
 
-/// The smallest scope name the venue accepts for a deployed scope.
 const MIN_SCOPE_NAME_LENGTH: usize = 2;
-/// The largest scope name the venue accepts for a deployed scope.
 const MAX_SCOPE_NAME_LENGTH: usize = 4;
 
-/// Returns the DEX name a perpetual scope names, when it names one.
 pub(crate) fn perp_dex_name(scope: &VenueScopeId) -> Option<&str> {
     scope
         .as_str()
@@ -87,12 +69,6 @@ pub(crate) fn perp_dex_name(scope: &VenueScopeId) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-/// Builds the scope of one builder-deployed perpetual DEX.
-///
-/// The name must have the shape the venue reserves for a deployed scope: a name
-/// outside it is not a scope this build may register, and building one from it
-/// would be inventing an address the venue never published. Whether such a name
-/// fails a load is the reading's decision; this only refuses to build it.
 pub(crate) fn perp_dex_scope(name: &str) -> Result<VenueScopeId, MarketParticipantError> {
     if !is_deployable_scope_name(name) {
         return Err(protocol_error(
@@ -104,23 +80,16 @@ pub(crate) fn perp_dex_scope(name: &str) -> Result<VenueScopeId, MarketParticipa
         .map_err(|error| protocol_error("build a Hyperliquid perpetual DEX scope", error))
 }
 
-/// Builds the scope of one HIP-4 outcome venue.
 pub(crate) fn outcome_venue_scope(name: &str) -> Result<VenueScopeId, MarketParticipantError> {
     VenueScopeId::new(format_smolstr!("{OUTCOME_VENUE_SCOPE_PREFIX}{name}"))
         .map_err(|error| protocol_error("build a Hyperliquid outcome venue scope", error))
 }
 
-/// Returns whether one deployed scope name has the shape the venue reserves.
-///
-/// A builder-deployed DEX and an outcome venue share one namespace of two to four
-/// lowercase ASCII letters, so a name outside that shape is not a scope this
-/// adapter may register.
 pub(crate) fn is_deployable_scope_name(name: &str) -> bool {
     (MIN_SCOPE_NAME_LENGTH..=MAX_SCOPE_NAME_LENGTH).contains(&name.len())
         && name.bytes().all(|byte| byte.is_ascii_lowercase())
 }
 
-/// The asset index of one spot pair.
 pub(super) fn spot_asset_id(index: u32) -> Result<HyperliquidAssetId, MarketParticipantError> {
     SPOT_ASSET_ID_BASE
         .checked_add(index)
@@ -133,12 +102,6 @@ pub(super) fn spot_asset_id(index: u32) -> Result<HyperliquidAssetId, MarketPart
         })
 }
 
-/// The asset index of one asset of a builder-deployed perpetual DEX.
-///
-/// The first (core) perpetual DEX is addressed by its `universe` position alone;
-/// a builder-deployed one is `100000 + perp_dex_index * 10000 + index_in_meta`,
-/// where the DEX index is the position of the DEX in the venue's own `perpDexs`
-/// answer and the meta index is the position of the coin in that DEX's `universe`.
 pub(super) fn perp_asset_id(
     perp_dex_index: u32,
     index_in_meta: u32,
@@ -159,7 +122,6 @@ pub(super) fn perp_asset_id(
         })
 }
 
-/// The wire encoding of one outcome side: `10 * outcome + side`.
 pub(crate) fn outcome_encoding(outcome: u64, side: u64) -> Result<u64, MarketParticipantError> {
     if side > 1 {
         return Err(protocol_error(
@@ -178,7 +140,6 @@ pub(crate) fn outcome_encoding(outcome: u64, side: u64) -> Result<u64, MarketPar
         })
 }
 
-/// The asset index of one outcome side token.
 pub(crate) fn outcome_asset_id(
     encoding: u64,
 ) -> Result<HyperliquidAssetId, MarketParticipantError> {
@@ -194,27 +155,15 @@ pub(crate) fn outcome_asset_id(
         })
 }
 
-/// The spot coin of one outcome side: `#<encoding>`.
 pub(crate) fn outcome_coin(encoding: u64) -> SmolStr {
     format_smolstr!("#{encoding}")
 }
 
-/// The token name of one outcome side: `+<encoding>`.
 #[cfg(test)]
 pub(crate) fn outcome_token_name(encoding: u64) -> SmolStr {
     format_smolstr!("+{encoding}")
 }
 
-/// The canonical asset identity of one Hyperliquid token code.
-///
-/// Hyperliquid issues its tokens inside its own namespace; the venue publishes no
-/// chain identity for a token code, so a token is a venue-issued token of this
-/// venue rather than a chain token this adapter could not verify.
-///
-/// The terms are built here, where the venue's own code is still authoritative,
-/// and the identity is derived from them: a digest cannot be read back into the
-/// terms the display contract renders, so a caller that needs the identity takes
-/// it from [`AssetTerms::asset_id`] rather than the other way round.
 pub(super) fn token_asset(code: &str) -> Result<AssetTerms, MarketParticipantError> {
     let issuer = TokenIssuerId::new(VENUE)
         .map_err(|error| protocol_error("build a Hyperliquid token issuer", error))?;
@@ -233,7 +182,6 @@ pub(super) fn token_asset(code: &str) -> Result<AssetTerms, MarketParticipantErr
     Ok(AssetTerms::CryptoToken(terms))
 }
 
-/// The canonical spot instrument of two Hyperliquid tokens.
 pub(super) fn spot_instrument(
     base: &str,
     quote: &str,
@@ -244,15 +192,9 @@ pub(super) fn spot_instrument(
         SpotTerms::new(base.asset_id(), quote.asset_id()).map_err(model_error)?,
     ))
     .map_err(model_error)?;
-    // A spot pair exchanges its two assets and names no reference of its own.
     Ok((instrument, vec![base, quote], Vec::new()))
 }
 
-/// The canonical perpetual instrument of one Hyperliquid coin.
-///
-/// The contract is one coin of the base asset, quoted and settled in the DEX's own
-/// collateral token, which is what the venue's `position_size * mark_price` margin
-/// and pnl arithmetic describes.
 pub(super) fn perpetual_instrument(
     coin: &str,
     collateral: &str,
@@ -283,12 +225,6 @@ pub(super) fn perpetual_instrument(
     Ok((instrument, vec![base, collateral], vec![mark]))
 }
 
-/// The price reference the venue's own mark price of one asset observes.
-///
-/// The reference is the venue's mark observation of the asset, quoted in the
-/// collateral token; the venue's oracle endpoints and refresh cadence are adapter
-/// detail and never enter an identity. The terms are that identity, so they are
-/// built here and handed on with the instrument that tracks them.
 pub(super) fn price_reference(
     asset: &AssetId,
     quote: &AssetId,
@@ -314,7 +250,6 @@ pub(super) fn price_reference(
     Ok(terms)
 }
 
-/// The listing key one route's continuity terms derive.
 pub(super) fn listing_key(
     route: &VenueRoute,
     terms: ListingContinuityTerms,
@@ -327,7 +262,6 @@ pub(super) fn listing_key(
     .map_err(model_error)
 }
 
-/// The continuity terms of one Hyperliquid spot listing.
 pub(super) fn spot_continuity(
     scope: &VenueScopeId,
     asset_id: HyperliquidAssetId,
@@ -339,7 +273,6 @@ pub(super) fn spot_continuity(
     }
 }
 
-/// The continuity terms of one Hyperliquid perpetual listing.
 pub(super) fn perpetual_continuity(
     scope: &VenueScopeId,
     asset_id: HyperliquidAssetId,
@@ -351,7 +284,6 @@ pub(super) fn perpetual_continuity(
     }
 }
 
-/// The continuity terms of one Hyperliquid outcome listing.
 pub(crate) fn outcome_continuity(
     scope: &VenueScopeId,
     outcome_id: HyperliquidOutcomeId,
@@ -364,7 +296,6 @@ pub(crate) fn outcome_continuity(
     }
 }
 
-/// The base and quote token names and indices one spot pair exchange.
 pub(super) fn spot_assets<'a>(
     tokens: &'a [HyperliquidSpotToken],
     indices: [u32; 2],
@@ -386,7 +317,6 @@ pub(super) fn spot_assets<'a>(
     ))
 }
 
-/// The identifiers of one Hyperliquid spot listing.
 pub(super) fn spot_identifiers(
     asset_id: HyperliquidAssetId,
     base_token_id: HyperliquidTokenId,
@@ -399,7 +329,6 @@ pub(super) fn spot_identifiers(
     }
 }
 
-/// The identifiers of one Hyperliquid perpetual listing.
 pub(super) fn perpetual_identifiers(
     scope: &VenueScopeId,
     asset_id: HyperliquidAssetId,
@@ -413,7 +342,6 @@ pub(super) fn perpetual_identifiers(
     })
 }
 
-/// The identity of one Hyperliquid outcome side listing.
 #[cfg(test)]
 pub(crate) struct OutcomeIdentity {
     pub scope: VenueScopeId,
@@ -426,7 +354,6 @@ pub(crate) struct OutcomeIdentity {
 
 #[cfg(test)]
 impl OutcomeIdentity {
-    /// Builds the identifiers of this outcome side listing.
     pub(crate) fn identifiers(
         &self,
     ) -> Result<HyperliquidListingIdentifiers, MarketParticipantError> {
@@ -446,11 +373,6 @@ impl OutcomeIdentity {
     }
 }
 
-/// The initial and maintenance margin fractions one maximum leverage implies.
-///
-/// The venue documents both: the margin required to open a position is the
-/// position value over the leverage, and the maintenance margin is set to half of
-/// the initial margin at maximum leverage.
 pub(super) fn margin_fractions(
     max_leverage: u32,
 ) -> Result<(Fraction, Fraction), MarketParticipantError> {
@@ -468,17 +390,10 @@ pub(super) fn margin_fractions(
     Ok((initial, maintenance))
 }
 
-/// The notional a leverage tier reaches when the venue publishes no ceiling.
-///
-/// Hyperliquid publishes a maximum leverage per asset, and a builder-deployed DEX
-/// publishes an open-interest cap per coin, but the core DEX publishes no notional
-/// cap at all. Such a tier is stated as reaching the largest notional the model
-/// can express rather than an invented limit.
 pub(super) fn unbounded_notional() -> Quantity {
     Quantity::from_inner(u128::MAX)
 }
 
-/// Reads one notional the venue published as a decimal string.
 pub(super) fn parse_notional(
     value: &str,
     operation: &'static str,
@@ -488,7 +403,6 @@ pub(super) fn parse_notional(
         .map_err(|error| protocol_error(operation, error))
 }
 
-/// The funding rate cap the venue applies to every asset: four percent an hour.
 pub(super) fn funding_rate_cap() -> Result<Fraction, MarketParticipantError> {
     "0.04"
         .parse::<Ratio>()
@@ -496,13 +410,6 @@ pub(super) fn funding_rate_cap() -> Result<Fraction, MarketParticipantError> {
         .and_then(|ratio| Fraction::new(ratio).map_err(model_error))
 }
 
-/// The canonical binary outcome group one wire outcome describes.
-///
-/// The question, the expiry, the settlement asset, the resolution rule and the
-/// fraction rule are the caller's verified terms: the wire outcome metadata carries
-/// none of them, so this function never invents one. The sides and the member are
-/// derived *from* those terms, which is why a renamed side changes the canonical
-/// identity instead of silently reusing it.
 #[cfg(test)]
 pub(crate) fn outcome_group(
     question: SmolStr,
@@ -536,10 +443,6 @@ pub(crate) fn outcome_group(
     OutcomeGroup::new(seed, sides, vec![member]).map_err(model_error)
 }
 
-/// The canonical identity of one wire side of one outcome group.
-///
-/// The wire index only *selects* a declared side; it never constructs an identity,
-/// so a side the group does not declare is a protocol error.
 #[cfg(test)]
 pub(crate) fn outcome_side_id(
     group: &OutcomeGroup,
@@ -557,10 +460,6 @@ pub(crate) fn outcome_side_id(
         })
 }
 
-/// The capability set one builder-deployed perpetual DEX serves.
-///
-/// It is the core perpetual set: the venue serves `meta`, `clearinghouseState`
-/// and `frontendOpenOrders` per DEX, and the same order and cancel actions.
 fn perp_dex_capabilities() -> Vec<RouteCapabilityDescriptor> {
     vec![
         RouteCapabilityDescriptor::new(CapabilityId::MarketCatalog, false),
@@ -578,10 +477,6 @@ fn perp_dex_capabilities() -> Vec<RouteCapabilityDescriptor> {
     ]
 }
 
-/// The identifier normalization of a Hyperliquid asset scope.
-///
-/// A builder-deployed coin is `{dex}:{coin}` and a DEX name is lowercase while a
-/// coin name is not, so the two are never folded into one another.
 fn perp_dex_normalization() -> Vec<IdentifierNormalizationRule> {
     let mut rules = vec![
         IdentifierNormalizationRule::new(
@@ -601,14 +496,6 @@ fn perp_dex_normalization() -> Vec<IdentifierNormalizationRule> {
     rules
 }
 
-/// The descriptor of one builder-deployed perpetual DEX scope.
-///
-/// The descriptor declares the same capabilities and normalization the core
-/// perpetual route declares, under its own scope, so a dynamic scope is isolated by
-/// its route rather than by its origin: which hosts it dials is the venue's own
-/// connection configuration. Its catalog source id folds the deployed
-/// namespace's separator out, because a catalog source id is a lowercase identifier
-/// and a scope is not.
 pub(crate) fn perp_dex_descriptor(
     name: &str,
 ) -> Result<VenueRouteDescriptor, MarketParticipantError> {
@@ -627,7 +514,6 @@ pub(crate) fn perp_dex_descriptor(
     ))
 }
 
-/// The capability set one HIP-4 outcome scope serves.
 fn outcome_capabilities() -> Vec<RouteCapabilityDescriptor> {
     vec![
         RouteCapabilityDescriptor::new(CapabilityId::PredictionEvents, false),
@@ -635,7 +521,6 @@ fn outcome_capabilities() -> Vec<RouteCapabilityDescriptor> {
     ]
 }
 
-/// The normalization of one HIP-4 outcome scope.
 fn outcome_normalization() -> Vec<IdentifierNormalizationRule> {
     vec![IdentifierNormalizationRule::new(
         ListingIdentifierKind::HyperliquidOutcome,
@@ -644,10 +529,6 @@ fn outcome_normalization() -> Vec<IdentifierNormalizationRule> {
     )]
 }
 
-/// The descriptor of one HIP-4 outcome scope.
-///
-/// The scope publishes no catalog: its events are read from the venue's outcome
-/// metadata, which is committed with the venue's load.
 pub(crate) fn outcome_venue_descriptor(
     scope: VenueScopeId,
 ) -> Result<VenueRouteDescriptor, MarketParticipantError> {
@@ -664,15 +545,6 @@ pub(crate) fn outcome_venue_descriptor(
     ))
 }
 
-/// Every deployment the venue's own `perpDexs` answer named, in the venue's order.
-///
-/// The first element of the venue's answer is `null` and stands for the core DEX,
-/// which is already registered as `core-perp`, so it is not a deployment; every
-/// other entry is one. Whether this build reserves a scope shape for a name is
-/// deliberately **not** decided here: a venue that names a deployment this build
-/// cannot serve is a load that must fail whole, and a name dropped here
-/// would be a scope silently missing from an otherwise successful load — and would
-/// not even count against the bound.
 pub(crate) fn deployed_perp_dexes(dexes: &[Option<HyperliquidPerpDex>]) -> Vec<SmolStr> {
     dexes
         .iter()
@@ -682,12 +554,10 @@ pub(crate) fn deployed_perp_dexes(dexes: &[Option<HyperliquidPerpDex>]) -> Vec<S
         .collect()
 }
 
-/// Turns one model failure into the market-participant error that carries it.
 fn model_error(error: ModelError) -> MarketParticipantError {
     MarketParticipantError::MarketModel(Box::new(error))
 }
 
-/// Turns one protocol-shape failure into a typed protocol error.
 fn protocol_error(
     operation: &'static str,
     reason: impl std::fmt::Display,
@@ -751,7 +621,6 @@ mod tests {
         }
     }
 
-    /// The verified terms of one fixture outcome group.
     struct FixtureTerms {
         question: SmolStr,
         expiry: Expiry,
@@ -789,14 +658,12 @@ mod tests {
         .expect("the fixture group should build")
     }
 
-    /// The asset indices are the venue's own arithmetic, not an array position.
     #[test]
     fn asset_ids_follow_the_published_formulas() {
         assert_eq!(spot_asset_id(0).expect("the index should fit").0, 10_000);
         assert_eq!(spot_asset_id(7).expect("the index should fit").0, 10_007);
         assert_eq!(perp_asset_id(0, 0).expect("the index should fit").0, 0);
         assert_eq!(perp_asset_id(0, 150).expect("the index should fit").0, 150);
-        // The venue's own example: `test:ABC` is DEX 1, meta index 0, asset 110000.
         assert_eq!(
             perp_asset_id(1, 0).expect("the index should fit").0,
             110_000
@@ -809,8 +676,6 @@ mod tests {
         assert!(spot_asset_id(u32::MAX).is_err());
     }
 
-    /// A deployed scope name is the two-to-four lowercase letters the venue
-    /// reserves for builder-deployed DEXes and outcome venues.
     #[test]
     fn deployed_scope_names_are_two_to_four_lowercase_letters() {
         assert!(is_deployable_scope_name("ab"));
@@ -823,7 +688,6 @@ mod tests {
         assert!(!is_deployable_scope_name(""));
     }
 
-    /// The scope of one deployed namespace round-trips through its name.
     #[test]
     fn deployed_scopes_round_trip_through_their_names() {
         let dex = perp_dex_scope("xyz").expect("the scope should be canonical");
@@ -839,12 +703,6 @@ mod tests {
         assert_eq!(perp_dex_name(&venue), None);
     }
 
-    /// The first `perpDexs` entry is the core DEX and is never a deployment; every
-    /// other name is answered as the venue published it, whatever its shape.
-    ///
-    /// A name outside the reserved shape is the reading's refusal to make, not
-    /// this list's to drop: dropping it here would leave a load successful with a
-    /// scope missing, and would keep it out of the bound the reading counts.
     #[test]
     fn deployed_perp_dexes_keeps_every_name_the_venue_published() {
         let dexes = [None, perp_dex("xyz"), perp_dex("A"), perp_dex("toolong")];
@@ -863,9 +721,6 @@ mod tests {
         );
     }
 
-    /// The descriptor of a deployed DEX serves exactly the core perpetual set under
-    /// its own scope, with exact identifier matching and the venue's credential
-    /// profile.
     #[test]
     fn a_perp_dex_descriptor_declares_the_core_perpetual_set() {
         let descriptor = perp_dex_descriptor("xyz").expect("the descriptor should build");
@@ -927,7 +782,6 @@ mod tests {
         );
     }
 
-    /// An outcome side's three wire representations are the venue's encoding.
     #[test]
     fn outcome_encodings_follow_the_published_formula() {
         assert_eq!(outcome_encoding(1, 0).expect("the encoding should fit"), 10);
@@ -941,8 +795,6 @@ mod tests {
         assert_eq!(outcome_token_name(10).as_str(), "+10");
     }
 
-    /// The wire metadata parses into typed values, and the quote token appears only
-    /// in the settlement.
     #[test]
     fn the_outcome_wire_shapes_parse() {
         let meta: HyperliquidOutcomeMetaResponse = serde_json::from_str(
@@ -971,7 +823,6 @@ mod tests {
         assert_eq!(settled.details.as_deref(), Some("price:76876.9"));
     }
 
-    /// The outcome requests carry the venue's own type spelling.
     #[test]
     fn the_outcome_requests_serialize_their_wire_spelling() {
         assert_eq!(
@@ -988,8 +839,6 @@ mod tests {
         );
     }
 
-    /// The sides and the member of an outcome group are derived from the verified
-    /// terms, so a renamed side is a new identity and a wire index only selects.
     #[test]
     fn an_outcome_group_derives_its_identity_from_its_terms() {
         let group = fixture_group(["Yes", "No"]);
@@ -1030,7 +879,6 @@ mod tests {
         );
     }
 
-    /// One outcome side is one listing, and its two sides never share a listing ID.
     #[test]
     fn each_outcome_side_is_its_own_listing() {
         let group = fixture_group(["Yes", "No"]);
@@ -1100,7 +948,6 @@ mod tests {
         assert_eq!(token_name.as_str(), "+10");
     }
 
-    /// The documented margin fractions come from the maximum leverage alone.
     #[test]
     fn margin_fractions_are_half_of_the_initial_margin() {
         let (initial, maintenance) = margin_fractions(50).expect("a leverage of 50 is valid");
@@ -1116,7 +963,6 @@ mod tests {
         );
     }
 
-    /// A spot pair resolves both of its token indices to their published names.
     #[test]
     fn a_spot_pair_resolves_both_token_indices() {
         let tokens = vec![

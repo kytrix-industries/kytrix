@@ -1,32 +1,3 @@
-//! The news protocol, its background service, and the seams a test drives it through.
-//!
-//! # What a stream is about
-//!
-//! One account. News itself is global — the service publishes one feed — but whether a
-//! reader may see it is not: the entitlement belongs to the account, so another account
-//! is another stream and signing out is no stream at all. The account is the stream key
-//! for that reason, and the framework's generations are what keep a message published
-//! for one account out of a pane that has moved to another.
-//!
-//! A replacement cancels the stream it replaces and starts the next one. It does not
-//! wait for the old subscription to be let go the way a replacement of index topics
-//! does: a selection of topics is counted against a limit a session shares, while one
-//! news subscription asks for nothing another one contends for.
-//!
-//! # A feed rather than a log
-//!
-//! The subscription retains at most [`MAX_NEWS_ITEMS`] items, newest first, and
-//! publishes the whole feed on the latest stream whenever it changes. A feed belongs on
-//! the latest stream: a pane that was not looking when a report arrived wants the news
-//! as it is now, not every state the feed passed through.
-//!
-//! # Readiness
-//!
-//! `Ready` means the subscription is live, and the feed is published before it — being
-//! live is what makes the news already on the wire the pane's content, including none
-//! at all. A pane that reported itself ready on a socket coming up, while the feed it is
-//! about has not arrived, would be a pane that says it is finished with nothing to show.
-
 use std::{convert::Infallible, future::Future};
 
 use i18n::{t_smol, translate::Translate};
@@ -50,34 +21,25 @@ use widget::{
 
 use super::model::{MAX_NEWS_ITEMS, NewsSnapshot, NewsState};
 
-/// What a pane asks its service to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum NewsRequest {
-    /// Follows an account's news, keeping the stream that already follows it.
     Load(NewsScope),
-    /// Reopens an account's stream, for one whose stream has failed.
     Retry(NewsScope),
-    /// Follows nothing, because nobody is signed in.
     Stop,
 }
 
-/// What the service did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum NewsResponse {
-    /// The account's stream is running.
     StreamStarted,
-    /// Nothing is followed.
     Stopped,
 }
 
-/// The account whose news a stream carries.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct NewsScope {
     account_id: SmolStr,
 }
 
 impl NewsScope {
-    /// The scope an account follows, or `None` when nobody is signed in.
     pub(super) fn new(account_id: Option<&SmolStr>) -> Option<Self> {
         let account_id = account_id.filter(|account_id| !account_id.is_empty())?;
         Some(Self {
@@ -86,23 +48,16 @@ impl NewsScope {
     }
 }
 
-/// What a subscription the pane holds is doing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum NewsStatus {
-    /// The subscription is being established.
     Connecting,
-    /// The subscription is live.
     Ready,
-    /// The subscription ended; the pane is finished until the user recovers it.
     Failed(NewsStreamError),
 }
 
-/// Why a subscription stopped, or why it never started.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum NewsStreamError {
     Service(KytrixServiceError),
-    /// The account may not read news, which is a refusal about the subscription rather
-    /// than about the connection: asking again asks the same refused question.
     EntitlementRequired,
     Transport(TransportError),
 }
@@ -117,11 +72,9 @@ impl TranslatedError for NewsStreamError {
     }
 }
 
-/// One message of an account's stream.
 #[derive(Clone, Debug)]
 pub(super) enum NewsStreamMessage {
     Status(NewsStatus),
-    /// Every item the subscription retains, newest first.
     Snapshot(NewsSnapshot),
 }
 
@@ -135,10 +88,6 @@ impl WidgetProtocol for NewsProtocol {
     type Error = Infallible;
 }
 
-/// The news a pane reads through.
-///
-/// The service is written against this seam rather than against the connector, so a
-/// test can drive every state a subscription can be in without a session.
 pub(super) trait NewsSource: Clone + Send + Sync + 'static {
     type Subscription: NewsEventSubscription;
 
@@ -147,7 +96,6 @@ pub(super) trait NewsSource: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 }
 
-/// One live news subscription.
 pub(super) trait NewsEventSubscription: Send + 'static {
     fn observe_status(&self) -> tokio::sync::watch::Receiver<SubscriptionStatus>;
 
@@ -172,7 +120,6 @@ impl NewsEventSubscription for Subscription<NewsEvent> {
     }
 }
 
-/// The service that follows one pane's news.
 pub(super) struct NewsService<S = KytrixServiceConnector> {
     source: S,
 }
@@ -209,10 +156,6 @@ where
                         continue;
                     }
 
-                    // A stream is about one account, so another account is another
-                    // stream, and a retry asks for the one the service has again:
-                    // either way what is running is cancelled before its replacement
-                    // starts.
                     if (retry || active.as_ref().is_some_and(|active| active != &scope))
                         && let Some(active) = active.take()
                     {
@@ -234,14 +177,6 @@ where
     }
 }
 
-/// Runs the account's subscription, and answers the request that opened it.
-///
-/// The answer is sent from here rather than by the loop because the subscription is what
-/// it answers for: a caller that went away while the subscription was being established
-/// takes the setup down with it instead of leaving a subscription nobody asked for. What
-/// the answer says is that the service took the account — whether the subscription then
-/// works is the stream's own status to report, which is where the failures a pane shows
-/// already live.
 async fn run_stream<S>(
     source: S,
     publisher: StreamPublisher<NewsProtocol>,
@@ -281,8 +216,6 @@ async fn run_stream<S>(
     let mut state = NewsState::new(MAX_NEWS_ITEMS);
     let mut feed_published = false;
 
-    // A subscription can already be live before its first change, so where it is now is
-    // where the stream starts.
     let current = status.borrow_and_update().clone();
     if !apply_subscription_status(
         &publisher,
@@ -341,10 +274,6 @@ async fn run_stream<S>(
     }
 }
 
-/// Applies one subscription status, publishing what it means to the pane.
-///
-/// Returns whether the stream may keep running: a status that ended it has already
-/// published why, and the task settles on the pane that will replace it.
 async fn apply_subscription_status(
     publisher: &StreamPublisher<NewsProtocol>,
     status: SubscriptionStatus,
@@ -359,9 +288,6 @@ async fn apply_subscription_status(
                 .is_ok()
         }
         SubscriptionStatus::Active => {
-            // The feed is published with the readiness it comes with, once: a pane that
-            // becomes ready holds what the subscription holds, and a reconnect does not
-            // make the news the pane already has new again.
             if !*feed_published {
                 if publisher
                     .publish_latest(NewsStreamMessage::Snapshot(state.snapshot()))
@@ -375,8 +301,6 @@ async fn apply_subscription_status(
                 .await
                 .is_ok()
         }
-        // A closing subscription is on its way to a terminal status of its own, and that
-        // is where the failure is reported from.
         SubscriptionStatus::Closing => true,
         SubscriptionStatus::Closed => {
             publish_failure(
@@ -393,11 +317,6 @@ async fn apply_subscription_status(
     }
 }
 
-/// What a refused subscription means to the pane.
-///
-/// An account without news access is the one refusal that is about the subscription
-/// rather than about the connection, so it is named rather than reported as the
-/// connection failure it is not.
 fn stream_error(error: &KytrixServiceError) -> NewsStreamError {
     match error {
         KytrixServiceError::Server(ErrorCode::EntitlementRequired) => {
@@ -407,7 +326,6 @@ fn stream_error(error: &KytrixServiceError) -> NewsStreamError {
     }
 }
 
-/// Publishes a status the pane has not been told yet.
 async fn publish_status(
     publisher: &StreamPublisher<NewsProtocol>,
     status: NewsStatus,
@@ -417,7 +335,6 @@ async fn publish_status(
         .await
 }
 
-/// Publishes a status change, if it is one.
 async fn publish_change(
     publisher: &StreamPublisher<NewsProtocol>,
     status: NewsStatus,
@@ -431,11 +348,6 @@ async fn publish_change(
     Ok(())
 }
 
-/// Publishes the failure a stream ended with, and holds the account it took.
-///
-/// A terminal failure is not retried: the pane asks for a new stream when the user takes
-/// the recovery, and until then this task stays where it is so the framework still sees
-/// the account as taken.
 async fn publish_failure(publisher: &StreamPublisher<NewsProtocol>, error: NewsStreamError) {
     let _ = publish_status(publisher, NewsStatus::Failed(error)).await;
     publisher.cancelled().await;
@@ -444,13 +356,6 @@ async fn publish_failure(publisher: &StreamPublisher<NewsProtocol>, error: NewsS
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -572,8 +477,6 @@ mod tests {
 
         load(&runtime, scope()).await;
         receive_status(&mut reliable, NewsStatus::Ready).await;
-        // Readiness describes the feed that came with it, not a feed still on its way: by
-        // the time the pane is told the subscription is live, the feed is on the stream.
         let live = latest
             .next_unseen()
             .expect("a live feed is published with the readiness it comes with");
@@ -705,8 +608,6 @@ mod tests {
             .expect("the reliable stream should be available");
 
         load(&runtime, scope()).await;
-        // The subscription is live before the stream first looks at it, but the change
-        // from connecting was never reported: a queued change is not news of its own.
         control.status.send_replace(SubscriptionStatus::Active);
         for expected in [NewsStatus::Connecting, NewsStatus::Ready] {
             receive_status(&mut reliable, expected).await;
@@ -926,9 +827,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A pane reads the feed that is current, not every state it passed through, so a
-    /// snapshot that coalesced with the one after it is never delivered — the stream
-    /// still has to hand the pane every item both of them held.
     #[tokio::test]
     async fn a_coalesced_feed_should_still_hold_every_item() {
         let source = FakeSource::default();

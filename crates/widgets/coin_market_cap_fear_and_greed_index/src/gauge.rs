@@ -1,75 +1,3 @@
-//! The half gauge the current reading is drawn on.
-//!
-//! The gauge is vector geometry rather than a picture: a picture would bake one
-//! theme's colours into it and be rasterized at one scale, and this pane has to be
-//! drawn in both appearances at every display density. So each of the five bands is
-//! a filled annulus sector, each end of a sector is rounded by a circle centred on
-//! that sector's own end, and the current reading is a dot on the centre line of the
-//! band — all from the semantic roles, none of it from a palette value or a literal
-//! colour.
-//!
-//! # The canvas has two states, and both draw the reading
-//!
-//! - **large enough**: the half circle, its caps and the indicator, with the score
-//!   above its level name inside the arc;
-//! - **too small**: only the words. A pane squeezed under the threshold draws
-//!   nothing it cannot place, rather than a half arc that runs off the canvas.
-//!
-//! # How it is drawn on the engine
-//!
-//! The gauge is a [`NodeKind::Canvas`](ui_core::node::tree::NodeKind::Canvas) node.
-//! The engine has no path builder (design §5: arrays of primitives, and the
-//! application owns the triangulation), so the migration splits the drawing into the
-//! two primitive kinds that express it:
-//!
-//! - **the five bands** are triangle meshes registered in the process-wide
-//!   [`GeometryStore`](ui_core::paint::geometry_store::GeometryStore) and pushed as
-//!   [`Primitive::Path`](ui_core::paint::primitive::Primitive::Path) fills. Each mesh
-//!   is a three-ring quad strip along its arc — outer edge, centre line, inner edge —
-//!   whose vertices carry the `Ui` pipeline's signed coverage distance
-//!   (`[x, y, coverage]`, 12 B/vertex): `0` on both arc edges and `-band/2` on the
-//!   centre line, which makes the analytic AA band land exactly on the arc. The
-//!   radial cuts themselves are not covered by that distance field; the caps below
-//!   paint over them, which is why the cut is not visible (a **known difference**
-//!   from the reference, whose path fill rounded every edge).
-//!   The strip meets the first of the `Ui` pipeline's three coverage-mesh conditions —
-//!   the distance is linear along the normal — and **not** the other two
-//!   ([`GeometryPipeline::Ui`](ui_core::paint::geometry::GeometryPipeline::Ui) states
-//!   them): neighbouring quads share a radial edge, so the AA band of two triangles
-//!   writes the same pixels from both sides, and the four square corners of each band
-//!   are not extruded into triangles of their own. The engine does not check these
-//!   conditions; not meeting them shows only as aliasing, and here that aliasing lands
-//!   on the radial cuts and shared edges the same-coloured caps paint over (the same
-//!   reason the cut is invisible). A later caller reusing this mesh where those edges
-//!   are not covered would see it.
-//! - **the caps and the indicator** are quads with corner radii of their own radius,
-//!   which is what makes them circles. A quad's own corners reach `r·√2` from its
-//!   centre — past the band's outer edge — and only rounding every corner by `r`
-//!   keeps the shape inside the box the geometry sized for it.
-//! - **the two lines of text** are shaped by the engine's node-free text entry
-//!   ([`App::shape_text`], v2.1 E1) and pushed as glyph runs
-//!   ([`Canvas::push_shaped_text`]): the canvas owns no text node, and a glyph run
-//!   is never constructed by hand. A handle carries an atlas lease, so a handle that
-//!   the atlas has since evicted is dropped and the frame prepared again.
-//!
-//! Values are **window-absolute logical pixels** (the canvas' coordinate space), so
-//! the drawing is a pure function of the box the node ended up with.
-//!
-//! # Preparing is expensive, so a frame is kept
-//!
-//! Shaping is the expensive half of a frame and none of it moves between two frames
-//! of the same reading, so a frame is prepared once and kept: the prepared value is
-//! rebuilt only when the canvas box, the reading, the language (the level's name) or
-//! the colours change, or when its glyph handles went stale. Steady state therefore
-//! does no work at all (I3: no write, no frame request).
-//!
-//! # Group opacity (E13)
-//!
-//! The engine's group opacity does **not** reach canvas content (spec-delta E13 R1:
-//! the engine does not parse an application's own primitives). This pane has no
-//! group fade of its own — the reading is replaced, never faded — so nothing here
-//! compensates for it. A later fading caller must scale these colours itself.
-
 use base_ui::theme::{resolved::Theme, role::Role};
 use bytes::Bytes;
 use smol_str::{SmolStr, format_smolstr};
@@ -91,151 +19,69 @@ use widget::cx::WidgetCx;
 
 use crate::model::Level;
 
-/// The debug id of the canvas node the gauge draws on.
 pub(crate) const GAUGE_SELECTOR: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE";
 
-/// How many bands the scale is drawn in.
 const SEGMENT_COUNT: usize = 5;
 
-/// The two ends of every band: a start and an end per segment.
 const CAP_COUNT: usize = SEGMENT_COUNT * 2;
 
-/// One band's share of the half circle, in degrees.
 const SEGMENT_SWEEP: f32 = 180.0 / SEGMENT_COUNT as f32;
 
-/// The half circle starts at the left end of the scale.
 const START_ANGLE: f32 = 180.0;
 
-/// The whole scale spans half a circle.
 const SWEEP: f32 = 180.0;
 
-/// The band's thickness, as a share of the canvas' shorter side.
 const BAND_RATIO: f32 = 0.09;
 
-/// How far each end of a band is pulled back from its boundary, as a share of the
-/// band's thickness.
-///
-/// A cap's radius is half the band, so an end has to be pulled back more than half a
-/// band for the two caps at a boundary to sit apart instead of on top of each other.
-/// The reference's value is 0.65: it leaves a visible gap of 0.3 of the band between
-/// the two caps.
 const GAP_RATIO: f32 = 0.65;
 
-/// The narrowest canvas a gauge is drawn on.
 const MIN_CANVAS_WIDTH: f32 = 96.0;
 
-/// The shortest canvas a gauge is drawn on.
 const MIN_CANVAS_HEIGHT: f32 = 72.0;
 
-/// The score's font size, as a share of the band's radius.
-///
-/// The gauge's radius is what the text has to fit inside, and a narrow pane limits
-/// that radius by its width while the canvas keeps its height. Sizing the text from
-/// the height would leave it at full size while the arc shrinks under it, which is
-/// exactly the overlap a narrow pane used to draw.
 const SCORE_TEXT_RADIUS_RATIO: f32 = 0.35;
 
-/// The score's font size, as a share of the canvas' shorter side, when the canvas
-/// is too small to draw a gauge and only the words are left.
 const SCORE_TEXT_FALLBACK_RATIO: f32 = 0.28;
 
-/// The level's font size, as a share of the score's.
 const LEVEL_TEXT_RATIO: f32 = 0.55;
 
-/// How tall one line is, as a share of its font size.
 const LINE_HEIGHT_RATIO: f32 = 1.15;
 
-/// The gap between the score and the level's name, as a share of the level's line.
-///
-/// The two lines are stacked rather than anchored to opposite ends of the centre:
-/// the level's name is drawn after the score, so anything that brought them back
-/// together would paint the name over the digits.
 const TEXT_LINE_GAP_RATIO: f32 = 0.15;
 
-/// How far above the arc's centre the reading ends, as a share of the level's line.
-///
-/// The reading belongs inside the half circle; ending exactly on the diameter would
-/// put the level's last line across it.
 const TEXT_ABOVE_DIAMETER_RATIO: f32 = 0.1;
 
-/// The indicator's radius, as a share of a band end's.
-///
-/// The reference's marker is a circle whose diameter is a third wider than the band:
-/// it covers the band it sits on and reads as a marker rather than as another cap.
 const INDICATOR_RATIO: f32 = 1.33;
 
-/// The indicator ring's width, as a share of the band's thickness.
-///
-/// The ring has to grow with the gauge: a fixed width is a hairline on a large
-/// gauge and swallows a small one. Twenty percent of the band is the width the
-/// narrow reference-sized gauge wanted — 8px at a 40px band.
 const INDICATOR_HALO_RATIO: f32 = 0.2;
 
-/// The narrowest the indicator ring is allowed to be, in pixels.
-///
-/// Below this the ring stops separating the marker from the band at all.
 const MIN_INDICATOR_HALO: f32 = 2.0;
 
-/// The widest the indicator ring is allowed to be, in pixels.
-///
-/// Above this the ring starts to read as a second circle rather than as a gap
-/// around the marker.
 const MAX_INDICATOR_HALO: f32 = 16.0;
 
-/// The length of one quad-strip step along a band's arc, in logical pixels.
-///
-/// Two pixels per step keeps a step's chord under a fifth of a degree on the
-/// reference-sized gauge, which is finer than the raster can show.
 const MESH_STEP_LENGTH: f32 = 2.0;
 
-/// The fewest steps one band is triangulated in.
 const MESH_MIN_STEPS: f32 = 4.0;
 
-/// The most steps one band is triangulated in.
 const MESH_MAX_STEPS: f32 = 48.0;
 
-/// One vertex of the `Ui` geometry pipeline: `[x, y, coverage]`, 12 B.
 const VERTEX_STRIDE_BYTES: u32 = 12;
 
-/// The coverage distance of a vertex on a band's arc edge (the shape boundary).
 const EDGE_COVERAGE: f32 = 0.0;
 
-/// Where every piece of the gauge goes, for one canvas box.
-///
-/// The geometry is a pure function of the box: it is what the frame paints and what
-/// the tests measure, and it is computed once per prepared frame rather than per
-/// primitive.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GaugeGeometry {
-    /// The middle of the arc's diameter, at the bottom of the half circle.
     center: Point,
-    /// Half the band's thickness, which is also the ends' radius.
     cap_radius: f32,
-    /// The radius of the line the band is centred on.
     band_radius: f32,
-    /// The outer edge of the band, including its ends.
     outer_radius: f32,
-    /// The inner edge of the band.
     inner_radius: f32,
-    /// The radius of the reading's dot. Its ring adds `indicator_halo` past it, and
-    /// that reach is what the geometry keeps room for.
     indicator_radius: f32,
-    /// The width of the ring around the reading's dot, in pixels. It follows the
-    /// band between [`MIN_INDICATOR_HALO`] and [`MAX_INDICATOR_HALO`].
     indicator_halo: f32,
-    /// How far each end of a band is pulled back from its boundary, in degrees.
     gap_half: f32,
 }
 
 impl GaugeGeometry {
-    /// Places the gauge and its reading as one block, centred on both axes, or
-    /// answers nothing when the box is too small to hold one.
-    ///
-    /// The block is the arc's outer edge plus the indicator's ring above the
-    /// diameter, and the indicator's ring below it; the caps at the ends reach less
-    /// far down than the indicator does. Sizing the band from both the width and
-    /// that block's height is what keeps the gauge inside the canvas, and centring
-    /// the block is what keeps a tall pane from pinning the gauge to its bottom.
     fn compute(bounds: Rect) -> Option<Self> {
         let width = bounds.size.width;
         let height = bounds.size.height;
@@ -271,21 +117,18 @@ impl GaugeGeometry {
         })
     }
 
-    /// The angles one band is assigned, before its ends are pulled back.
     fn segment_span(&self, index: usize) -> (f32, f32) {
         let start = START_ANGLE + SEGMENT_SWEEP * index as f32;
 
         (start, start + SEGMENT_SWEEP)
     }
 
-    /// The angles one band's arc actually sweeps, with a gap at each end.
     fn arc_span(&self, index: usize) -> (f32, f32) {
         let (start, end) = self.segment_span(index);
 
         (start + self.gap_half, end - self.gap_half)
     }
 
-    /// The point at `angle` degrees and `radius` pixels from the centre.
     fn point_at(&self, angle: f32, radius: f32) -> Point {
         let radians = angle.to_radians();
 
@@ -295,11 +138,6 @@ impl GaugeGeometry {
         )
     }
 
-    /// The ten end circles, each with the band it caps.
-    ///
-    /// The centres sit on the ends of the trimmed arcs, not on the boundaries the
-    /// bands were assigned: a cap rounds the cut its own band was drawn with, and a
-    /// cap left on the boundary would sit in the gap and reach into its neighbour.
     fn cap_centers(&self) -> [(Point, usize); CAP_COUNT] {
         std::array::from_fn(|index| {
             let segment = index / 2;
@@ -310,27 +148,17 @@ impl GaugeGeometry {
         })
     }
 
-    /// Where the reading sits on the band's centre line.
     fn indicator_center(&self, score: u8) -> Point {
         let angle = START_ANGLE + SWEEP * f32::from(score) / 100.0;
 
         self.point_at(angle, self.band_radius)
     }
 
-    /// The ten end circles of one frame, one per band end.
-    ///
-    /// Each is a circle, not the box its centre and radius describe: only rounding
-    /// every corner by the radius keeps the cap inside the band's outer edge.
     fn cap_quads(&self, colors: &GaugeColors) -> [Quad; CAP_COUNT] {
         self.cap_centers()
             .map(|(center, segment)| circle_quad(center, self.cap_radius, colors.segments[segment]))
     }
 
-    /// The reading's dot and the ring it is seated in.
-    ///
-    /// The ring is wider than the dot by `indicator_halo` on every side, so its
-    /// corner radius is the dot's radius plus that enlargement — the radius that
-    /// rounds it is the radius it is drawn at, not the dot's.
     fn indicator_quads(&self, score: u8, colors: &GaugeColors) -> (Quad, Quad) {
         let center = self.indicator_center(score);
         let radius = self.indicator_radius;
@@ -341,14 +169,6 @@ impl GaugeGeometry {
         )
     }
 
-    /// The triangle mesh of one band, in window-absolute logical pixels.
-    ///
-    /// The mesh is a quad strip between three rings: the outer arc edge, the band's
-    /// centre line and the inner arc edge. The `Ui` pipeline interpolates one signed
-    /// coverage distance per vertex, so the two edge rings carry `0` (the shape's
-    /// boundary) and the centre ring carries `-cap_radius` — far enough inside that
-    /// the coverage saturates before the next edge, which is what gives the arc an
-    /// analytic one-pixel AA band instead of a hard edge.
     fn band_mesh(&self, index: usize) -> BandMesh {
         let (start, end) = self.arc_span(index);
         let arc_length = (end - start).to_radians() * self.band_radius;
@@ -390,24 +210,16 @@ impl GaugeGeometry {
     }
 }
 
-/// One band's triangles, in window-absolute logical pixels.
 struct BandMesh {
-    /// Interleaved `[x, y, coverage]` triples (three `f32` per vertex).
     vertices: Vec<f32>,
-    /// Triangle-list indices into `vertices`.
     indices: Vec<u32>,
-    /// The band's AABB: the `Path` primitive's damage rectangle.
     bounds: Rect,
 }
 
-/// The colours one frame of the gauge is drawn with, resolved from the theme.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GaugeColors {
-    /// One colour per band, in the order the bands are drawn.
     segments: [Color; SEGMENT_COUNT],
-    /// The ring the indicator is seated in.
     halo: Color,
-    /// The score, the level's name and the reading's dot.
     text: Color,
 }
 
@@ -421,21 +233,12 @@ impl GaugeColors {
                 level_color(theme, Level::Greed),
                 level_color(theme, Level::ExtremeGreed),
             ],
-            // The framework draws every widget body on `surface.sunken`, so the
-            // ring is the body's own background: it reads as a cut-out in the band
-            // rather than as an outline drawn around the dot.
             halo: theme.role(Role::SurfaceSunken),
             text: theme.role(Role::FgDefault),
         }
     }
 }
 
-/// The colour one level of the fear-and-greed scale is drawn in.
-///
-/// The scale reads the theme's own five-step ramp rather than the status and market
-/// roles: the two market colours are deliberately close to their status neighbours,
-/// which is right for a price and wrong for five bands that have to be told apart
-/// side by side.
 pub(crate) fn level_color(theme: &Theme, level: Level) -> Color {
     theme.role(match level {
         Level::ExtremeFear => Role::FearGreedExtremeFear,
@@ -446,15 +249,12 @@ pub(crate) fn level_color(theme: &Theme, level: Level) -> Color {
     })
 }
 
-/// What a prepared frame was made from, so the next frame can keep it.
 #[derive(Clone, Debug, PartialEq)]
 struct GaugeKey {
     bounds: Rect,
     score: u8,
-    /// The level's name in the language the frame was prepared in.
     level: SmolStr,
     colors: GaugeColors,
-    /// The raster scale the glyphs were shaped at: a DPI change has to shape again.
     text_scale: f32,
 }
 
@@ -475,22 +275,14 @@ impl GaugeKey {
     }
 }
 
-/// One frame of the gauge, ready to be kept until its inputs move.
 struct PreparedGauge {
     key: GaugeKey,
-    /// The registered band meshes, released before the next frame replaces them.
     bands: Vec<GeometryId>,
     score_line: ShapedTextHandle,
     level_line: ShapedTextHandle,
 }
 
-/// The gauge of one pane, including the frame it prepared last.
-///
-/// The cache lives in the widget rather than in the node because a node's canvas is
-/// replaced whole, and the point of preparing a frame is that the next one can reuse
-/// it.
 pub(crate) struct Gauge {
-    /// The canvas node the body built, once it has one.
     node: Option<NodeId>,
     prepared: Option<PreparedGauge>,
 }
@@ -503,12 +295,6 @@ impl Gauge {
         }
     }
 
-    /// Builds the canvas node into `parent` and remembers it.
-    ///
-    /// The canvas starts empty (`Rect::default()`): the node has no box until the
-    /// first layout, and [`Gauge::sync`] is what fills it in. The node registers a
-    /// theme dependency so an appearance switch invalidates it and schedules the
-    /// frame whose `sync` resolves the new colours.
     pub(crate) fn build(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -533,8 +319,6 @@ impl Gauge {
         Ok(node)
     }
 
-    /// Draws the gauge of `score`, named by `level`, if the frame it was prepared
-    /// for is no longer the frame this one would be.
     pub(crate) fn sync(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -567,10 +351,6 @@ impl Gauge {
 
         let geometry = GaugeGeometry::compute(bounds);
         let mut canvas = Canvas::new(bounds);
-        // The masked drawing the reference did: the frame is clipped to the box the
-        // node ended up with, so a rounding error cannot paint over a sibling. The
-        // words are inside that mask too — the reference masked the whole frame, not
-        // just the arc — so it is pushed before the frame's two branches split.
         let _ = canvas.push_clip(ClipRect {
             rect: bounds,
             corner_radius: [0.0; 4],
@@ -581,9 +361,6 @@ impl Gauge {
                 let mesh = geometry.band_mesh(index);
                 let id = match register_band(cx.app_mut(), &mesh) {
                     Ok(id) => id,
-                    // The frame is abandoned whole, so the meshes registered so far
-                    // are given back here: `self.prepared` still holds the frame this
-                    // one was replacing, and nothing else would return them.
                     Err(error) => return Err(abandon_frame(cx.app_mut(), bands, error)),
                 };
                 canvas.push_path(Path {
@@ -593,8 +370,6 @@ impl Gauge {
                 });
                 bands.push(id);
             }
-            // The caps are painted over the bands' straight cuts, which is what
-            // turns every cut end into a rounded one.
             for quad in geometry.cap_quads(&colors) {
                 canvas.push_quad(quad);
             }
@@ -652,24 +427,16 @@ impl Gauge {
         Ok(())
     }
 
-    /// Releases the registered meshes and forgets the node. The teardown path.
     pub(crate) fn release(&mut self, app: &mut App) {
         self.release_bands(app);
         self.node = None;
     }
 
-    /// The level's name the last prepared frame was made from.
-    ///
-    /// A prepared frame is rebuilt when the reading, the canvas or the text of the
-    /// frame changes — which is what makes a language change new text rather than the
-    /// same cached one. A test reads it back to assert what a frame actually drew,
-    /// because text is not otherwise readable from a painted frame.
     #[cfg(test)]
     pub(crate) fn prepared_level(&self) -> Option<&SmolStr> {
         self.prepared.as_ref().map(|prepared| &prepared.key.level)
     }
 
-    /// The colours the current appearance resolves.
     fn colors(&self, cx: &WidgetCx<'_>) -> GaugeColors {
         let theme = cx.theme();
         let appearance = theme.current(cx.app());
@@ -677,8 +444,6 @@ impl Gauge {
         GaugeColors::resolve(theme.theme_for(appearance))
     }
 
-    /// Releases the meshes of the prepared frame (the store is process-wide, not
-    /// scoped to a window: nothing else would give them back).
     fn release_bands(&mut self, app: &mut App) {
         if let Some(prepared) = self.prepared.take() {
             for id in prepared.bands {
@@ -688,13 +453,6 @@ impl Gauge {
     }
 }
 
-/// Gives back the band meshes a frame registered before it failed.
-///
-/// A frame registers its meshes in the process-wide store as it builds, so one that
-/// cannot be finished would leave them there for the life of the process: the widget
-/// only ever releases the frame it kept (`Gauge::release_bands`), and this one is never
-/// kept. The error comes back unchanged — it is the caller's to report, not this
-/// cleanup's.
 fn abandon_frame(app: &mut App, bands: Vec<GeometryId>, error: EngineError) -> EngineError {
     for id in bands {
         let _ = app.geometry_mut().release(id);
@@ -702,7 +460,6 @@ fn abandon_frame(app: &mut App, bands: Vec<GeometryId>, error: EngineError) -> E
     error
 }
 
-/// Registers one band's mesh in the process-wide geometry store.
 fn register_band(app: &mut App, mesh: &BandMesh) -> Result<GeometryId, EngineError> {
     let mut vertex_bytes = Vec::with_capacity(mesh.vertices.len() * 4);
     for value in &mesh.vertices {
@@ -724,7 +481,6 @@ fn register_band(app: &mut App, mesh: &BandMesh) -> Result<GeometryId, EngineErr
     })
 }
 
-/// The style one line of the canvas' text is shaped with.
 fn text_style(size: f32, color: Color) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.color = color;
@@ -732,7 +488,6 @@ fn text_style(size: f32, color: Color) -> TextStyle {
     style
 }
 
-/// Where a shaped line's box starts so that it is centred in `box`.
 fn text_origin(box_: Rect, line: ui_core::math::Size) -> Point {
     Point::new(
         box_.origin.x + (box_.size.width - line.width) / 2.0,
@@ -740,12 +495,6 @@ fn text_origin(box_: Rect, line: ui_core::math::Size) -> Point {
     )
 }
 
-/// The score and level font sizes for one canvas.
-///
-/// With a gauge, the text is sized from the band's radius: that is the space the
-/// text has to fit inside, and a narrow pane limits the radius by its width while
-/// the canvas keeps its height. Without a gauge there is no radius, so the shorter
-/// side of the canvas is the measure that cannot overflow it.
 fn text_sizes(bounds: Rect, geometry: Option<GaugeGeometry>) -> (f32, f32) {
     let score_size = match geometry {
         Some(geometry) => geometry.band_radius * SCORE_TEXT_RADIUS_RATIO,
@@ -755,15 +504,6 @@ fn text_sizes(bounds: Rect, geometry: Option<GaugeGeometry>) -> (f32, f32) {
     (score_size, score_size * LEVEL_TEXT_RATIO)
 }
 
-/// The two boxes the reading is drawn in, one above the other.
-///
-/// The score is the value and the level's name labels it, so the score is the upper
-/// line and the name the lower one, with a gap between them: the name is painted
-/// after the score, and anchoring the two to opposite ends of the centre is what
-/// once made it cover the digits. The stack is as wide as the canvas, so the centred
-/// text of both boxes shares one centre line, and it sits above the arc's diameter
-/// when there is an arc — inside the half circle — or in the middle of the box when
-/// the canvas is too small for one.
 fn text_boxes(
     bounds: Rect,
     geometry: Option<GaugeGeometry>,
@@ -788,7 +528,6 @@ fn text_boxes(
     )
 }
 
-/// The box of a solid circle.
 fn circle_bounds(center: Point, radius: f32) -> Rect {
     Rect::new(
         center.x - radius,
@@ -798,11 +537,6 @@ fn circle_bounds(center: Point, radius: f32) -> Rect {
     )
 }
 
-/// The quad a solid circle is painted as.
-///
-/// Rounding every corner by the radius is what makes the quad a circle: a quad with
-/// square corners is a box, and a box reaches `radius * sqrt(2)` from its centre at
-/// the corner — past the edge the geometry allowed for the drawing.
 fn circle_quad(center: Point, radius: f32, color: Color) -> Quad {
     Quad {
         bounds: circle_bounds(center, radius),
@@ -821,8 +555,6 @@ mod tests {
     use super::*;
     use crate::model::Level;
 
-    /// The canvas most of these tests measure: wide enough that the width is not
-    /// what limits the gauge.
     fn canvas() -> Rect {
         Rect::new(0.0, 0.0, 400.0, 240.0)
     }
@@ -838,10 +570,6 @@ mod tests {
         (dx * dx + dy * dy).sqrt()
     }
 
-    /// The distance from `center` to the farthest corner of `bounds`.
-    ///
-    /// It is how far a quad would reach if its corners were painted square, which is
-    /// the shape the radius has to round off.
     fn farthest_corner(bounds: Rect, center: Point) -> f32 {
         [
             bounds.origin,
@@ -854,8 +582,6 @@ mod tests {
         .fold(0.0, f32::max)
     }
 
-    /// The bands tile the half circle: each one keeps a gap at both ends, and the
-    /// gap of one meets the gap of the next rather than overlapping it.
     #[test]
     fn the_bands_should_meet_with_a_gap_and_never_overlap() {
         let geometry = geometry();
@@ -891,9 +617,6 @@ mod tests {
         }
     }
 
-    /// Every cap is centred on the end of the arc it rounds, not on the boundary the
-    /// band was assigned: a cap left on the boundary would sit in the gap and reach
-    /// into the neighbouring band.
     #[test]
     fn every_end_cap_should_sit_at_its_own_arc_end() {
         let geometry = geometry();
@@ -915,8 +638,6 @@ mod tests {
         }
     }
 
-    /// The two caps that meet at a boundary are separated by a visible gap, which is
-    /// what keeps one band's cap from painting over the other band's end.
     #[test]
     fn the_caps_of_two_bands_should_leave_a_visible_gap() {
         let geometry = geometry();
@@ -942,8 +663,6 @@ mod tests {
         }
     }
 
-    /// Every end circle is centred on the line the band is drawn around, which is
-    /// what makes its outer point land exactly on the band's outer edge.
     #[test]
     fn an_end_cap_should_sit_on_the_centre_line_of_its_band() {
         let geometry = geometry();
@@ -958,11 +677,6 @@ mod tests {
         }
     }
 
-    /// The drawing fits the box it was given and is centred in it on both axes.
-    ///
-    /// The block is the arc's outer edge plus the indicator's ring above the
-    /// diameter, and the indicator's ring below it; the indicator is the part that
-    /// reaches furthest at the top and at both ends of the scale.
     #[test]
     fn the_gauge_should_stay_inside_the_canvas_and_be_centred() {
         let canvas = canvas();
@@ -1014,8 +728,6 @@ mod tests {
         }
     }
 
-    /// The reading walks from the left end of the scale, over the top, to the right
-    /// end — the same direction the bands are drawn in.
     #[test]
     fn the_indicator_should_walk_from_the_left_end_to_the_right_one() {
         let geometry = geometry();
@@ -1051,8 +763,6 @@ mod tests {
         }
     }
 
-    /// A box under the threshold has no gauge at all, so nothing is ever placed
-    /// outside the canvas it was given.
     #[test]
     fn a_canvas_below_the_threshold_should_have_no_gauge() {
         let too_short = Rect::new(0.0, 0.0, MIN_CANVAS_WIDTH, MIN_CANVAS_HEIGHT - 1.0);
@@ -1069,8 +779,6 @@ mod tests {
         );
     }
 
-    /// Each level of the scale is drawn in a colour of its own, taken from the
-    /// theme's fear-and-greed roles rather than from a literal.
     #[test]
     fn every_level_should_be_drawn_in_a_colour_of_its_own() {
         let theme = Theme::of(Appearance::Light);
@@ -1103,9 +811,6 @@ mod tests {
         );
     }
 
-    /// The bands, the reading's dot and its ring are the frame's colours: the bands
-    /// are the scale's five roles, and the dot is the foreground so it reads as a
-    /// marker rather than as another band end.
     #[test]
     fn the_gauge_should_take_its_colours_from_the_scale_and_the_foreground() {
         let theme = Theme::of(Appearance::Light);
@@ -1125,8 +830,6 @@ mod tests {
         assert_eq!(colors.halo, theme.role(Role::SurfaceSunken));
     }
 
-    /// The indicator is a marker, not a band end: its diameter is wider than the
-    /// band and it is seated in a ring of the content face.
     #[test]
     fn the_indicator_should_be_wider_than_the_band() {
         let theme = Theme::of(Appearance::Light);
@@ -1165,9 +868,6 @@ mod tests {
         );
     }
 
-    /// The ring follows the band, with a floor for tiny gauges and a ceiling for
-    /// huge ones: a fixed width is a hairline on a large gauge and swallows a small
-    /// one.
     #[test]
     fn the_indicator_ring_should_follow_the_band_with_a_floor_and_a_ceiling() {
         let geometry_of = |width: f32, height: f32| {
@@ -1198,12 +898,6 @@ mod tests {
         );
     }
 
-    /// The caps, the reading's dot and its ring are circles: every corner of each
-    /// quad is rounded by that quad's own radius.
-    ///
-    /// A square cap is not just a cosmetic difference — its corners reach further
-    /// from the centre than the band's outer edge, so the drawing would overflow the
-    /// box the geometry sized it for.
     #[test]
     fn every_circle_should_be_painted_with_corner_radii_of_its_own_radius() {
         let theme = Theme::of(Appearance::Light);
@@ -1250,9 +944,6 @@ mod tests {
         );
     }
 
-    /// Every band is a closed triangle mesh whose vertices carry the `Ui` pipeline's
-    /// coverage distance: `0` on both arc edges and a saturated inside value on the
-    /// centre line, which is what the analytic AA needs.
     #[test]
     fn every_band_should_be_a_solid_triangle_strip_with_its_own_coverage() {
         let geometry = geometry();
@@ -1299,11 +990,6 @@ mod tests {
         }
     }
 
-    /// The reading's two lines are stacked above the arc's centre, in the gauge and
-    /// in the box that is too small for one.
-    ///
-    /// The score is the upper line and the level's name the lower one: the name is
-    /// painted after the score, so an overlap would hide the digits.
     #[test]
     fn the_score_and_the_level_name_should_not_overlap_above_the_centre() {
         let gauge_canvas = canvas();
@@ -1355,8 +1041,6 @@ mod tests {
         }
     }
 
-    /// A narrow canvas limits the gauge by its width, so the reading has to shrink
-    /// with the band's radius instead of keeping the size the canvas height gives it.
     #[test]
     fn a_narrow_canvas_should_shrink_the_reading_with_the_band() {
         let wide = Rect::new(0.0, 0.0, 800.0, 800.0);

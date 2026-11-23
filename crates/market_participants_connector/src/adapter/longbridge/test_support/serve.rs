@@ -1,12 +1,3 @@
-//! The two servers one fixture runs: the token endpoint and the quote socket.
-//!
-//! Nothing here interprets a request beyond the protocol. The token endpoint states the
-//! one-time password the fixture was given and the two connection counts it reports; the
-//! quote socket reads the venue's own framing, answers each command from the answers the
-//! test configured, and delivers the queued pushes once the connection carries the
-//! subscription they belong to. A command the fixture was not written for is refused by
-//! the venue's own error rather than silently accepted.
-
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -42,7 +33,6 @@ use super::{
     },
 };
 
-/// Serves the token endpoint until the fixture is dropped.
 pub(crate) async fn serve_token(
     listener: TcpListener,
     answer: TokenAnswer,
@@ -83,12 +73,6 @@ pub(crate) async fn serve_token(
     }
 }
 
-/// The envelope one token answer is stated in (§14.1).
-///
-/// The venue's own answer is `{"code":…,"message":…,"data":{…}}` rather than the three
-/// payload fields alone: a granted token carries them inside `data`, and a refusal
-/// states its own code and message with no payload at all. That is the shape the live
-/// run measured, so it is the shape the fixture serves.
 fn token_envelope(answer: &TokenAnswer) -> String {
     let data = if answer.payload {
         serde_json::json!({
@@ -107,11 +91,6 @@ fn token_envelope(answer: &TokenAnswer) -> String {
     .to_string()
 }
 
-/// Every answer the quote socket serves one connection from.
-///
-/// The values are what the fixture was told to answer with, and the four shared ones are
-/// the fixture's own records: a test replaces a candle, calendar or quote answer while the
-/// socket is up, and reads back the pushes it queued.
 #[derive(Clone)]
 pub(crate) struct QuoteAnswers {
     auth: AuthAnswer,
@@ -123,7 +102,6 @@ pub(crate) struct QuoteAnswers {
 }
 
 impl QuoteAnswers {
-    /// States the answers one quote socket is served with.
     pub(crate) const fn new(
         auth: AuthAnswer,
         profile: ProfileAnswer,
@@ -143,7 +121,6 @@ impl QuoteAnswers {
     }
 }
 
-/// Serves the quote socket until the fixture is dropped.
 pub(crate) async fn serve_quote_socket(
     listener: TcpListener,
     answers: QuoteAnswers,
@@ -180,11 +157,6 @@ pub(crate) async fn serve_quote_socket(
                             let Ok(mut socket) = upgrade.await else {
                                 return;
                             };
-                            // The socket the subscription was registered on is the one
-                            // the venue's pushes belong to, so it is the one that delivers
-                            // them. A fixture serves one subscription per test, and the
-                            // first frame of that socket is the handshake, which precedes
-                            // any subscription.
                             let mut subscribed = false;
                             loop {
                                 let frame = tokio::select! {
@@ -211,14 +183,6 @@ pub(crate) async fn serve_quote_socket(
                                 if socket.send(yawc::Frame::binary(answer)).await.is_err() {
                                     return;
                                 }
-                                // The venue's own pushes follow the answer and start once
-                                // this subscription is the connection's own: a push
-                                // cannot arrive before the frame that subscribed to it.
-                                // Every frame the test queued before that is delivered
-                                // now, in the order it was stated, because the venue sends
-                                // its pushes as they happen rather than one per request —
-                                // the frames below are the ones a real session would have
-                                // sent while this build was working.
                                 if received_command == SUBSCRIBE {
                                     subscribed = true;
                                 }
@@ -249,7 +213,6 @@ pub(crate) async fn serve_quote_socket(
     }
 }
 
-/// The candles one candlestick command is answered with.
 fn candle_response(candles: &[FixtureCandle]) -> SecurityCandlestickResponse {
     SecurityCandlestickResponse {
         symbol: "AAPL.US".to_owned(),
@@ -269,7 +232,6 @@ fn candle_response(candles: &[FixtureCandle]) -> SecurityCandlestickResponse {
     }
 }
 
-/// The answer one request frame is served with.
 fn answer_of(request: &ReceivedFrame, answers: &QuoteAnswers) -> Bytes {
     let auth = &answers.auth;
     let profile = &answers.profile;
@@ -301,9 +263,6 @@ fn answer_of(request: &ReceivedFrame, answers: &QuoteAnswers) -> Bytes {
             }
             .encode_to_vec(),
         ),
-        // A candlestick command the fixture was told to refuse is refused by the venue's
-        // own error, which is what a reader is meant to see when its account may not read
-        // the market after all.
         GET_SECURITY_CANDLESTICKS | GET_SECURITY_HISTORY_CANDLESTICKS if candles.status != 0 => {
             response_frame(
                 request.command,
@@ -322,9 +281,6 @@ fn answer_of(request: &ReceivedFrame, answers: &QuoteAnswers) -> Bytes {
             0,
             &candle_response(&candles.candles).encode_to_vec(),
         ),
-        // A real-time quote command the fixture was told to refuse is refused by the
-        // venue's own error, which is what a reader sees when the venue will not answer
-        // the quote at all.
         QUERY_SECURITY_QUOTE if quotes.status != 0 => response_frame(
             QUERY_SECURITY_QUOTE,
             request.request_id,
@@ -433,8 +389,6 @@ fn answer_of(request: &ReceivedFrame, answers: &QuoteAnswers) -> Bytes {
                 &answered.encode_to_vec(),
             )
         }
-        // Nothing else is served: a command this fixture was not written for is
-        // refused by the venue's own error rather than silently accepted.
         command => response_frame(
             command,
             request.request_id,
@@ -448,7 +402,6 @@ fn answer_of(request: &ReceivedFrame, answers: &QuoteAnswers) -> Bytes {
     }
 }
 
-/// One response frame of the protocol, built the way the venue builds it.
 fn response_frame(command: u8, request_id: u32, status: u8, body: &[u8]) -> Bytes {
     let mut frame = Vec::with_capacity(RESPONSE_FIELDS + body.len());
     frame.push(PACKAGE_TYPE_RESPONSE);
@@ -460,7 +413,6 @@ fn response_frame(command: u8, request_id: u32, status: u8, body: &[u8]) -> Byte
     Bytes::from(frame)
 }
 
-/// One request frame as the protocol states it, when it is one this fixture reads.
 fn request_frame(payload: &[u8]) -> Option<ReceivedFrame> {
     if payload.len() < REQUEST_FIELDS {
         return None;
@@ -478,7 +430,6 @@ fn request_frame(payload: &[u8]) -> Option<ReceivedFrame> {
     })
 }
 
-/// Reads one request head, answering its line and its headers.
 async fn read_request_head(
     socket: &mut tokio::net::TcpStream,
 ) -> Option<(String, Vec<(String, String)>)> {
@@ -504,7 +455,6 @@ async fn read_request_head(
     Some((request_line, headers))
 }
 
-/// The headers of one request as `(lowercase name, value)` pairs.
 fn header_pairs(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()

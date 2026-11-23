@@ -1,8 +1,3 @@
-//! GPU 计时：`vkCmdWriteTimestamp` + query pool。
-//!
-//! query pool 是**每窗口**的：时间戳写进该窗口自己的命令缓冲、由该窗口的帧槽 fence 观测；
-//! 进程级共享的只有 `VkDevice` 与队列的时间戳能力（`timestampPeriod` / `timestampValidBits`）。
-
 use ash::vk;
 
 use crate::{
@@ -14,25 +9,20 @@ use crate::{
     },
 };
 
-/// 每帧两个时间戳（begin / end）。
 const QUERIES_PER_FRAME: u32 = 2;
 
-/// 时间戳查询池。
 pub(crate) struct GpuTimer {
     device: ash::Device,
     pool: vk::QueryPool,
-    /// ns / tick（`timestampPeriod`）。
     period_ns: f64,
 }
 
 impl GpuTimer {
-    /// 队列不支持时间戳时返回 `Ok(None)`（**不是错误**：计时是可选能力）。
     pub(crate) fn new(shared: &SharedGpu) -> Result<Option<Self>, EngineError> {
         let (period, valid_bits) = shared.timestamps();
         if valid_bits == 0 {
             return Ok(None);
         }
-        // SAFETY: 句柄归本结构独占；`Drop` 里销毁。
         let pool = unsafe {
             shared.raw().create_query_pool(
                 &vk::QueryPoolCreateInfo::default()
@@ -50,9 +40,7 @@ impl GpuTimer {
     }
 
     pub(crate) fn begin(&self, command: vk::CommandBuffer, slot: usize) {
-        // SAFETY: query 索引在池容量内（2 × 槽位）。
         unsafe {
-            // begin/end 是两条 query：必须一起 reset（否则第二帧起 end 的时间戳是脏值）。
             self.device
                 .cmd_reset_query_pool(command, self.pool, index(slot), QUERIES_PER_FRAME);
             self.device.cmd_write_timestamp(
@@ -65,7 +53,6 @@ impl GpuTimer {
     }
 
     pub(crate) fn end(&self, command: vk::CommandBuffer, slot: usize) {
-        // SAFETY: 同上。
         unsafe {
             self.device.cmd_write_timestamp(
                 command,
@@ -76,10 +63,8 @@ impl GpuTimer {
         }
     }
 
-    /// fence 到达后读两个 u64；失败 ⇒ `None`（不 panic）。
     pub(crate) fn resolve(&self, slot: usize) -> Option<GpuTimerSample> {
         let mut values = [0u64; 2];
-        // SAFETY: 池容量与查询数一致；`WAIT` 之外不加同步（调用方已等 fence）。
         unsafe {
             self.device
                 .get_query_pool_results(
@@ -101,7 +86,6 @@ impl GpuTimer {
 
 impl Drop for GpuTimer {
     fn drop(&mut self) {
-        // SAFETY: 句柄归本结构独占；窗口 teardown 已等到自己的最后一次提交完成。
         unsafe {
             self.device.destroy_query_pool(self.pool, None);
         }

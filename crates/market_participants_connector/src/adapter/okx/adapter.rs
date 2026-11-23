@@ -1,17 +1,3 @@
-//! The OKX adapter.
-//!
-//! The adapter speaks OKX's v5 protocol for the two scopes it is registered on.
-//! It owns no origin of its own: the HTTP and WebSocket origins come from the
-//! execution context, which the gateway built from the venue configuration of the
-//! route the request was resolved against — the credentials come from the
-//! authentication the gateway resolved for the request's account, and the only
-//! identity it derives is the venue's own `instId` — a listing key, never a second
-//! directory.
-//!
-//! A route-level answer (the catalog, every ticker, a liquidation push) names its
-//! subjects with the venue's identifiers, and every row is resolved to the
-//! listing key that identifier derives before it leaves this module.
-
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
@@ -93,15 +79,10 @@ use crate::{
     routing::{SPOT_SCOPE, SWAP_SCOPE},
 };
 
-/// How long one request sent over a socket may take before it is given up on.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// The deepest book OKX hands over in one request.
 const ORDER_BOOK_DEPTH_LIMIT: u16 = 400;
-/// The namespace OKX's own tokens and price references are issued under.
 const OKX_NAMESPACE: &str = "okx";
-/// The RFC 3339 version of the reference terms this adapter declares.
 const REFERENCE_TERMS_VERSION: &str = "v1";
-/// The candlestick intervals OKX publishes on the scopes this adapter serves.
 const TIMEFRAMES: &[TimeFrame] = &[
     TimeFrame::Minute1,
     TimeFrame::Minute3,
@@ -121,7 +102,6 @@ const TIMEFRAMES: &[TimeFrame] = &[
     TimeFrame::Month3,
 ];
 
-/// The credential set one signed OKX request needs.
 struct OkxCredentials {
     api_key: SmolStr,
     passphrase: SmolStr,
@@ -133,11 +113,6 @@ pub struct OkxAdapter {
 }
 
 impl OkxAdapter {
-    /// Builds the OKX adapter.
-    ///
-    /// The hosts a request dials are its **venue's** configuration, so the adapter
-    /// holds no region: two installations whose OKX accounts belong to different
-    /// service regions differ in `venues.okx.region`, and one adapter serves both.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             venue: VenueId::Okx,
@@ -150,12 +125,6 @@ impl MarketParticipantAdapter for OkxAdapter {
         &self.venue
     }
 
-    /// Returns OKX's own bounds for one scope.
-    ///
-    /// Both scopes ask for a book of up to four hundred levels and publish the
-    /// same sixteen candlestick intervals, none of them restated. A scope this
-    /// adapter does not serve has no answer at all rather than another scope's
-    /// numbers.
     fn limits(&self, route: &VenueRoute) -> AdapterLimits {
         let served =
             route.venue == self.venue && matches!(route.scope.as_str(), SPOT_SCOPE | SWAP_SCOPE);
@@ -260,14 +229,12 @@ impl MarketParticipantAdapter for OkxAdapter {
     }
 }
 
-/// One listing as the OKX wire addresses it.
 struct OkxListing {
     key: VenueListingKey,
     instrument_id: SmolStr,
     instrument_type: OkxInstrumentType,
 }
 
-/// Reads the venue identity of one resolved listing.
 fn resolved_listing(
     listing: Option<&ResolvedListingRef>,
 ) -> Result<OkxListing, MarketParticipantError> {
@@ -296,7 +263,6 @@ fn resolved_listing(
     })
 }
 
-/// Reads the venue identity of one optional listing.
 fn optional_listing(
     listing: Option<&ResolvedListingRef>,
 ) -> Result<Option<OkxListing>, MarketParticipantError> {
@@ -305,7 +271,6 @@ fn optional_listing(
         .transpose()
 }
 
-/// The instrument type of the scope this request was validated against.
 fn scope_instrument_type(
     context: &ExecutionContext,
 ) -> Result<OkxInstrumentType, MarketParticipantError> {
@@ -317,7 +282,6 @@ fn scope_instrument_type(
         })
 }
 
-/// Builds one protocol failure that names the operation it was raised in.
 fn protocol_error(operation: &'static str, reason: impl Into<SmolStr>) -> MarketParticipantError {
     MarketParticipantError::ProtocolError {
         operation: operation.into(),
@@ -326,12 +290,10 @@ fn protocol_error(operation: &'static str, reason: impl Into<SmolStr>) -> Market
     }
 }
 
-/// Wraps one model rejection as the protocol failure of an operation.
 fn model_error(operation: &'static str, error: impl std::fmt::Display) -> MarketParticipantError {
     protocol_error(operation, format_smolstr!("{error}"))
 }
 
-/// Builds one OKX REST URL from the origin of this request's venue.
 pub(super) fn http_url(
     context: &ExecutionContext,
     path: &str,
@@ -348,19 +310,14 @@ pub(super) fn http_url(
     Ok(url)
 }
 
-/// The WebSocket endpoint of one OKX channel family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OkxSocket {
-    /// The public market-data channels.
     Public,
-    /// The business channels, which carry the candlestick channels.
     Business,
-    /// The authenticated account channels.
     Private,
 }
 
 impl OkxSocket {
-    /// The path this channel family lives on.
     const fn path(self) -> &'static str {
         match self {
             Self::Public => "/ws/v5/public",
@@ -373,7 +330,6 @@ impl OkxSocket {
         matches!(self, Self::Private)
     }
 
-    /// The WebSocket URL of this channel family on this request's venue.
     fn url(self, context: &ExecutionContext) -> Result<Url, MarketParticipantError> {
         context
             .websocket_origin()
@@ -382,7 +338,6 @@ impl OkxSocket {
     }
 }
 
-/// Opens or reuses one physical connection of one channel family.
 async fn connection(
     context: &ExecutionContext,
     socket: OkxSocket,
@@ -392,9 +347,6 @@ async fn connection(
         .auth
         .as_ref()
         .map(|auth| SmolStr::new(auth.account_id()));
-    // The protocol is built before the key because the key is built from it: the upgrade
-    // headers a connection declares are one value, and the key that decides whether a
-    // socket may be reused reads them off the protocol that dials.
     let protocol = ConnectionProtocol::new(OkxCodec::extract_response_id)
         .with_keepalive(super::heartbeat::KEEPALIVE)
         .with_liveness_timeout(super::heartbeat::LIVENESS_TIMEOUT);
@@ -424,13 +376,6 @@ async fn connection(
     .await
 }
 
-/// The credentials one signed OKX request signs with.
-///
-/// Every part of an OKX credential comes from the authentication the gateway
-/// resolved for this request's account: the API key, the secret it signs with and
-/// the passphrase the venue verifies next to the signature are one credential, so
-/// an execution authenticated any other way fails closed instead of being signed
-/// with a secret or a passphrase read from somewhere else.
 fn credentials_for_context(
     context: &ExecutionContext,
 ) -> Result<OkxCredentials, MarketParticipantError> {
@@ -462,7 +407,6 @@ fn credentials_for_context(
     })
 }
 
-/// The account this request authenticates as.
 fn account_id(context: &ExecutionContext) -> Result<SmolStr, MarketParticipantError> {
     context
         .auth
@@ -475,7 +419,6 @@ fn account_id(context: &ExecutionContext) -> Result<SmolStr, MarketParticipantEr
         })
 }
 
-/// Opens an authenticated connection, logging in when it is not authenticated yet.
 async fn authenticated_connection(
     context: &ExecutionContext,
 ) -> Result<Arc<Connection>, MarketParticipantError> {
@@ -490,7 +433,6 @@ async fn authenticated_connection(
     Ok(connection)
 }
 
-/// The login one reconnected OKX socket replays before its subscriptions resume.
 fn reauthentication(context: &ExecutionContext, credentials: &OkxCredentials) -> Reauthentication {
     let api_key = credentials.api_key.clone();
     let passphrase = credentials.passphrase.clone();
@@ -528,7 +470,6 @@ fn reauthentication(context: &ExecutionContext, credentials: &OkxCredentials) ->
     })
 }
 
-/// Logs one fresh connection in and waits for the venue's acknowledgement.
 async fn login(
     connection: &Arc<Connection>,
     context: &ExecutionContext,
@@ -545,7 +486,6 @@ async fn login(
     let mut events = Box::pin(connection.event_stream());
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         while let Some(payload) = events.next().await {
-            // A connection that stopped publishing ends this handshake as well.
             let Ok(payload) = payload else { break };
             let Ok(ack) = OkxCodec.decode::<super::OkxLoginAck>(&payload) else {
                 continue;
@@ -577,7 +517,6 @@ async fn login(
     Ok(())
 }
 
-/// The RFC 3339 millisecond timestamp OKX signs with.
 fn timestamp() -> Result<SmolStr, MarketParticipantError> {
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -585,7 +524,6 @@ fn timestamp() -> Result<SmolStr, MarketParticipantError> {
     Ok(SmolStr::new(now))
 }
 
-/// Signs and sends one authenticated GET, answering its rows.
 pub(super) async fn signed_get<T: DeserializeOwned>(
     context: &ExecutionContext,
     path: &str,
@@ -652,11 +590,6 @@ pub(super) async fn signed_get<T: DeserializeOwned>(
     Ok(decoded.data)
 }
 
-// ---------------------------------------------------------------------------
-// Market catalog
-// ---------------------------------------------------------------------------
-
-/// Fetches the catalog of one route.
 async fn fetch_markets(
     context: &ExecutionContext,
     query: MarketCatalogQuery,
@@ -677,9 +610,6 @@ async fn fetch_markets(
         )],
     )
     .await?;
-    // A perpetual's margin requirements are not part of its instrument record:
-    // OKX publishes them as the contract's own position tiers, which this build
-    // never reads, so every perpetual entry below carries its risk unloaded.
     let rows = decode_public::<OkxInstrumentWire>(&body, "decode OKX market catalog response")?;
     let mut markets = Vec::with_capacity(rows.len());
     for row in rows {
@@ -691,43 +621,12 @@ async fn fetch_markets(
     Ok(ProtocolResponse::Markets(markets))
 }
 
-/// Turns one OKX instrument row into a complete catalog entry.
-///
-/// # Two deliberate kinds of refusal
-///
-/// A row whose terms this model cannot express is left out rather than published
-/// as a different product, and one whose venue fields are missing or inconsistent
-/// is a protocol failure: the catalog is the identity source of its route and
-/// never a partial answer.
-///
-/// The two are told apart by whose decision the refusal is, and the distinction is
-/// deliberate rather than incidental:
-///
-/// - **A product this build cannot express is a listing to leave out, with a
-///   warning.** An unknown `ctType`, a contract multiplier the model cannot fold
-///   into a contract value, a listing state it cannot name and a row the venue has
-///   not described yet are all statements that OKX trades something this build has
-///   no terms for. The rest of the route is still a complete answer for every
-///   product it does serve, so failing the route would hide those listings behind
-///   one the user cannot trade anyway.
-/// - **A venue response that contradicts itself is a protocol failure.** A swap
-///   that states a contract value currency its own shape disagrees with, or that
-///   omits a field every described swap carries, is not a product decision: it is a
-///   row this model cannot read, and publishing anything from it would invent terms
-///   the venue did not state.
-///
-/// Skipping never weakens the identity rules either way: every row that *is*
-/// published still goes through the validated constructors, so a combination the
-/// model forbids is refused rather than skipped into a different shape.
 fn catalog_entry(
     route: &VenueRoute,
     instrument_type: OkxInstrumentType,
     row: OkxInstrumentWire,
 ) -> Result<Option<NativeCatalogEntry>, MarketParticipantError> {
     let instrument = match OkxInstrumentRow::read(route, instrument_type, row)? {
-        // A contract the venue has announced but not described has no terms to
-        // publish and no family to read its risk by: it is not a listing yet, and
-        // nothing that reads a listing can reach it.
         Some(OkxInstrumentRow::Announced { instrument_id }) => {
             log::warn!(
                 "OKX instrument {instrument_id} of {route} publishes no trading terms yet and is not published"
@@ -738,9 +637,6 @@ fn catalog_entry(
         None => return Ok(None),
     };
     let canonical = match instrument.terms()? {
-        // A product this build cannot express is a listing to leave out, not a route
-        // to fail: the venue trades a contract whose terms this model has no shape
-        // for. `terms` reports it with a warning and the row is dropped here.
         Some(terms) => terms,
         None => return Ok(None),
     };
@@ -767,17 +663,10 @@ fn catalog_entry(
         instrument: canonical.instrument,
         asset_terms: canonical.asset_terms,
         reference_terms: canonical.reference_terms,
-        // Every asset these listings publish states its own display code.
         asset_codes: Vec::new(),
     }))
 }
 
-/// The contract shape one OKX swap states.
-///
-/// The venue states this in `ctType` and nowhere else, and it decides what the
-/// contract's value and settlement mean: a linear contract is an amount of the
-/// asset it tracks, an inverse one is a notional of its price quote that settles
-/// in that asset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OkxSwapContractType {
     Linear,
@@ -785,14 +674,6 @@ enum OkxSwapContractType {
 }
 
 impl OkxSwapContractType {
-    /// Reads the contract shape of one swap.
-    ///
-    /// `Ok(None)` is a shape this build cannot express — the venue trades a
-    /// contract whose value and settlement this model has no terms for — so the
-    /// listing is left out of the catalog instead of being published as one of the
-    /// shapes the venue did not state. A row that omits the field entirely breaks
-    /// the protocol instead: `ctType` is part of the terms every published swap is
-    /// described by, so its absence is not a product decision.
     fn read(value: Option<&SmolStr>) -> Result<Option<Self>, MarketParticipantError> {
         match non_empty(value) {
             Some("linear") => Ok(Some(Self::Linear)),
@@ -805,10 +686,6 @@ impl OkxSwapContractType {
         }
     }
 
-    /// Returns the currency the venue counts the contract value in.
-    ///
-    /// This is the shape's own statement of what `ctVal` means, and it is the
-    /// half of the contract terms a swap cannot be read without.
     fn contract_value_currency(self, base: &AssetTerms, quote: &AssetTerms) -> AssetTerms {
         match self {
             Self::Linear => base.clone(),
@@ -817,54 +694,24 @@ impl OkxSwapContractType {
     }
 }
 
-/// What one published OKX listing is.
-///
-/// The instrument family decides what terms a row can have at all, so the shape a
-/// row was read as carries the family rather than sitting beside it: a spot listing
-/// has a base and a quote currency and no contract value or settlement model, and a
-/// swap always has the contract shape the venue stated. The two can therefore not be
-/// confused with each other anywhere the shape is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OkxInstrumentShape {
-    /// A spot market: two currencies exchanged immediately.
     Spot,
-    /// A swap stating one of the contract shapes this build can express.
     Swap(OkxSwapContractType),
 }
 
-/// One row of the instrument response, classified by what the venue published.
-///
-/// OKX answers a contract it has not described yet with its name alone — the
-/// rows of a `preopen` swap carry no family, no contract value and no tick or lot
-/// size — and those rows are not listings: publishing one would publish a
-/// contract with invented terms.
 #[derive(Clone, Debug)]
 enum OkxInstrumentRow {
-    /// The venue published the name only.
     Announced { instrument_id: SmolStr },
-    /// The venue published every term the contract is described by.
     Listed(OkxListedInstrument),
 }
 
 impl OkxInstrumentRow {
-    /// Classifies one instrument row of one route.
-    ///
-    /// `None` is a row this route does not publish at all: another product
-    /// family, or a row the venue answered with nothing.
     fn read(
         route: &VenueRoute,
         instrument_type: OkxInstrumentType,
         row: OkxInstrumentWire,
     ) -> Result<Option<Self>, MarketParticipantError> {
-        // The fields the venue describes each product with. A row that carries
-        // none of them announces a contract whose terms do not exist yet; a row
-        // that carries only some of them contradicts itself, and publishing it
-        // would be publishing a contract the venue does not trade.
-        //
-        // `ctValCcy` and `ctMult` are deliberately not part of this count. They are
-        // read when the venue states them — see `check_stated_contract_terms` — but
-        // they are stated *beside* the terms a contract is described by, and a
-        // response that omits them still describes its product completely.
         let described: &[&Option<SmolStr>] = match instrument_type {
             OkxInstrumentType::Spot => &[&row.base_ccy, &row.quote_ccy, &row.tick_sz, &row.lot_sz],
             OkxInstrumentType::Perpetual => &[
@@ -906,21 +753,11 @@ impl OkxInstrumentRow {
     }
 }
 
-/// The venue fields of one fully published catalog instrument, parsed and
-/// validated.
-///
-/// Every asset is kept as the canonical terms the venue's own currency code was
-/// translated into, because a canonical identity is a digest of those terms: the
-/// instrument is built from the identities and the entry that publishes it carries
-/// the terms the display contract renders.
 #[derive(Clone, Debug)]
 struct OkxListedInstrument {
     instrument_id: SmolStr,
     instrument_type: OkxInstrumentType,
-    /// What this listing is, which is the contract shape of a swap and the plain
-    /// two-currency shape of a spot market.
     shape: OkxInstrumentShape,
-    /// The venue's own instrument family, which a perpetual's risk is read by.
     instrument_family: Option<NativeSymbol>,
     base: AssetTerms,
     quote: AssetTerms,
@@ -930,21 +767,12 @@ struct OkxListedInstrument {
     minimum: Option<Quantity>,
     maximum: Option<Quantity>,
     contract_value: Option<Quantity>,
-    /// The currency the venue states for the contract value, when it states one.
     contract_value_currency: Option<AssetTerms>,
-    /// The venue's contract multiplier, when it states one.
     contract_multiplier: Option<Quantity>,
     status: ListingStatus,
     available_from: Option<UnixMillis>,
 }
 
-/// One OKX row as the canonical catalog values it describes.
-///
-/// The instrument and its rules are what the venue's own row states; the terms are
-/// the ones their construction went through. A canonical asset or reference
-/// identity is a digest of its terms, so the entry that publishes the identities
-/// carries the terms beside them, and nothing downstream has to reconstruct what
-/// the venue already stated.
 struct OkxInstrumentTerms {
     instrument: Instrument,
     rules: TradingRules,
@@ -953,8 +781,6 @@ struct OkxInstrumentTerms {
 }
 
 impl OkxListedInstrument {
-    /// Reads one described instrument record, answering `None` for a product or
-    /// a market state this model does not publish.
     fn read(
         route: &VenueRoute,
         instrument_type: OkxInstrumentType,
@@ -967,11 +793,6 @@ impl OkxListedInstrument {
             );
             return Ok(None);
         };
-        // An OKX swap publishes which of the two contract shapes it is, and that
-        // field is the only place either shape is stated: every contract below is
-        // expressed from it rather than from the instrument's own name. A swap
-        // stating a shape this build cannot express is a product it cannot publish,
-        // which is a listing to leave out and not a route to fail.
         let shape = match instrument_type {
             OkxInstrumentType::Perpetual => {
                 let Some(contract_type) = OkxSwapContractType::read(row.ct_type.as_ref())? else {
@@ -983,8 +804,6 @@ impl OkxListedInstrument {
                 OkxInstrumentShape::Swap(contract_type)
             }
             OkxInstrumentType::Spot => OkxInstrumentShape::Spot,
-            // The two remaining products are refused before a row is parsed;
-            // this route serves spot and perpetual only.
             OkxInstrumentType::Future | OkxInstrumentType::Option => return Ok(None),
         };
         let (base, quote) = match instrument_type {
@@ -1026,8 +845,6 @@ impl OkxListedInstrument {
                 }
                 (base, quote)
             }
-            // The two remaining products are refused before a row is parsed;
-            // this route serves spot and perpetual only.
             OkxInstrumentType::Future | OkxInstrumentType::Option => return Ok(None),
         };
         let quote_asset = asset(quote);
@@ -1058,21 +875,12 @@ impl OkxListedInstrument {
             contract_value_currency: non_empty(row.ct_val_ccy.as_ref()).map(asset),
             contract_multiplier: optional_quantity(row.ct_mult.as_ref(), "decode OKX multiplier")?,
             status,
-            // A scheduled listing is available from the instant the venue
-            // published; a live one has no lower bound to report.
             available_from: (status == ListingStatus::Scheduled)
                 .then_some(list_time)
                 .flatten(),
         }))
     }
 
-    /// Builds the canonical catalog values of this listing.
-    ///
-    /// `None` is a listing this build cannot express at all: the venue states a
-    /// contract multiplier the model has no way to fold into a contract value, which
-    /// is a product decision and not a protocol contradiction. A row whose stated
-    /// terms contradict the shape it also states is a protocol failure instead and is
-    /// reported as one.
     fn terms(&self) -> Result<Option<OkxInstrumentTerms>, MarketParticipantError> {
         match self.shape {
             OkxInstrumentShape::Spot => {
@@ -1083,9 +891,6 @@ impl OkxListedInstrument {
                 Ok(Some(OkxInstrumentTerms {
                     instrument,
                     rules: self.spot_rules()?,
-                    // A spot pair tracks no reference and its contract value is not
-                    // a quote notional, so the two assets it exchanges are the whole
-                    // of what it names.
                     asset_terms: vec![self.base.clone(), self.quote.clone()],
                     reference_terms: Vec::new(),
                 }))
@@ -1103,9 +908,6 @@ impl OkxListedInstrument {
                     mark.reference_id()
                         .map_err(|error| model_error("build OKX price reference", error))?,
                 );
-                // `ctVal` counts the contract value in the currency the venue
-                // states for the contract shape, so the two shapes read the same
-                // field into different units rather than into different numbers.
                 let denomination = contract_type.contract_value_currency(&self.base, &self.quote);
                 if !self.check_stated_contract_terms(&denomination)? {
                     return Ok(None);
@@ -1115,10 +917,6 @@ impl OkxListedInstrument {
                         .map_err(|error| model_error("decode OKX contract value", error))?,
                 )
                 .map_err(|error| model_error("decode OKX contract value", error))?;
-                // An inverse contract values a position of `ctVal` quote units in
-                // the underlying, so it settles in the very asset it tracks and
-                // the venue's mark of that asset is the rate its settlement
-                // converts through.
                 let pnl_model = match contract_type {
                     OkxSwapContractType::Linear => DerivativePnlModel::Linear,
                     OkxSwapContractType::Inverse => {
@@ -1148,10 +946,6 @@ impl OkxListedInstrument {
                 .map_err(|error| model_error("decode OKX market instrument", error))?;
                 let instrument = Instrument::new(InstrumentTerms::Perpetual(terms))
                     .map_err(|error| model_error("decode OKX market instrument", error))?;
-                // A conversion states the direction `S -> Q`, so an inverse contract
-                // names a second reference role whenever its shape requires one; on
-                // this venue that observation is field for field the mark above, so
-                // the registry carries one entry for the two roles.
                 let reference_terms = std::iter::once(mark)
                     .chain(conversion)
                     .collect::<Vec<PriceReferenceTerms>>();
@@ -1170,24 +964,6 @@ impl OkxListedInstrument {
         }
     }
 
-    /// Cross-checks the contract terms the venue states against the ones its own
-    /// contract shape implies.
-    ///
-    /// The shape is derived from `ctType`, and a real OKX instrument response also
-    /// publishes `ctValCcy` and `ctMult` beside it. When the venue states them they
-    /// are the venue's own account of what its contract value means, so a row whose
-    /// stated term disagrees with the derived one contradicts itself: publishing it
-    /// either way would publish a contract the venue does not trade.
-    ///
-    /// A response that omits them carries no such statement, so the derivation from
-    /// `ctType` is all there is to publish from and the contract stands; the fields
-    /// are optional in the wire shape for exactly that reason, because this build has
-    /// no verified sample of every product's response to pin their presence to.
-    ///
-    /// A multiplier the model cannot fold into the contract value is a product this
-    /// build has no terms for rather than a contradiction, so it is reported like any
-    /// other unsupported contract: `Ok(false)` leaves the listing out of the catalog
-    /// with a warning instead of failing the route.
     fn check_stated_contract_terms(
         &self,
         denomination: &AssetTerms,
@@ -1218,7 +994,6 @@ impl OkxListedInstrument {
         Ok(true)
     }
 
-    /// The rules of one OKX spot listing.
     fn spot_rules(&self) -> Result<TradingRules, MarketParticipantError> {
         Ok(TradingRules {
             common: CommonTradingRules {
@@ -1253,13 +1028,6 @@ impl OkxListedInstrument {
         })
     }
 
-    /// The rules of one OKX perpetual.
-    ///
-    /// OKX publishes a perpetual's margin requirements and leverage ladder as the
-    /// contract's own position tiers, outside the instrument record this row came
-    /// from, and this build has no reader for them: the listing is published with
-    /// its risk unloaded, and nothing loads the terms for the contract's family
-    /// afterwards.
     fn perpetual_rules(&self) -> Result<TradingRules, MarketParticipantError> {
         Ok(TradingRules {
             common: CommonTradingRules {
@@ -1294,13 +1062,6 @@ impl OkxListedInstrument {
     }
 }
 
-/// The mark-price reference of one derivative underlying.
-///
-/// OKX publishes the mark price of an instrument against its own index, which is
-/// what this reference identity describes: the venue's direct, continuously
-/// observed mark of that underlying quoted in that asset. The terms are the
-/// identity, so they are built here and handed on with the instrument that names
-/// them.
 fn mark_reference(
     base: &AssetId,
     quote: &AssetId,
@@ -1328,16 +1089,6 @@ fn mark_reference(
     Ok(terms)
 }
 
-/// The registry terms of the conversion rate between one settlement asset and one
-/// price quote.
-///
-/// On OKX that rate is the venue's own continuously observed mark of the
-/// settlement asset quoted in the price quote — the same observation an asset
-/// underlying is priced by, because a contract that settles in the asset it
-/// tracks converts its settlement through exactly that price. The terms are the
-/// registry entry a contract's conversion reference names, and the model
-/// validates the direction they have to carry; nothing here is derived from a
-/// native symbol or a hash.
 fn conversion_reference(
     settlement_asset: &AssetId,
     price_quote: &AssetId,
@@ -1359,18 +1110,6 @@ fn conversion_reference(
     })
 }
 
-/// The canonical asset of one OKX currency code.
-///
-/// A real ISO 4217 code is a currency and every other code is a token OKX issues
-/// itself: the chain identity of a listed asset cannot be verified from the
-/// venue's own catalog, so claiming one would be an invention. One code always
-/// names one asset, so an instrument and a balance that name the same code are
-/// denominated in the same canonical asset.
-///
-/// The terms are built here, where the venue's own code is still authoritative,
-/// and the identity is derived from them: a digest cannot be read back into the
-/// terms the display contract renders, so a caller that needs the identity takes
-/// it from [`AssetTerms::asset_id`] rather than the other way round.
 pub(super) fn asset(code: &str) -> AssetTerms {
     if let Ok(iso) = Iso4217Code::new(code) {
         return AssetTerms::Currency(CurrencyTerms { code: iso });
@@ -1392,13 +1131,10 @@ pub(super) fn asset(code: &str) -> AssetTerms {
     AssetTerms::CryptoToken(terms)
 }
 
-/// The listing state one OKX instrument reports, when it is a state this model has.
 fn listing_status(instrument: &OkxInstrumentWire) -> Option<ListingStatus> {
     match instrument.state.as_deref() {
         Some("live") => Some(ListingStatus::Trading),
         Some("suspend") => Some(ListingStatus::Halted),
-        // A scheduled instrument is only expressible with the instant it becomes
-        // available, which the venue publishes as `listTime`.
         Some("preopen") => non_empty(instrument.list_time.as_ref())
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|list_time| *list_time > 0)
@@ -1451,12 +1187,6 @@ fn non_empty(value: Option<&SmolStr>) -> Option<&str> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// One row of the OKX instrument response, as the venue publishes it.
-///
-/// The optional fields are the ones the venue states beside the terms a contract is
-/// described by: a response that omits one still describes its product completely, so
-/// they are read when present and derived when absent. The derivation is
-/// [`OkxSwapContractType`], which is the shape the venue states in `ctType`.
 #[derive(Clone, Debug, serde::Deserialize)]
 struct OkxInstrumentWire {
     #[serde(rename = "instId")]
@@ -1477,35 +1207,20 @@ struct OkxInstrumentWire {
     max_lmt_sz: Option<SmolStr>,
     #[serde(rename = "ctVal")]
     ct_val: Option<SmolStr>,
-    /// The currency the contract value is counted in.
-    ///
-    /// OKX publishes it beside `ctVal`, and it is the venue's own statement of what
-    /// the contract value means: a linear swap counts `ctVal` in the asset it tracks
-    /// and an inverse one counts it in the price quote.
     #[serde(rename = "ctValCcy")]
     ct_val_ccy: Option<SmolStr>,
-    /// The contract's multiplier.
-    ///
-    /// The model expresses one contract at a time, so a venue multiplier this build
-    /// cannot fold into the contract value is a contract it cannot publish.
     #[serde(rename = "ctMult")]
     ct_mult: Option<SmolStr>,
     #[serde(rename = "ctType")]
     ct_type: Option<SmolStr>,
     #[serde(rename = "listTime")]
     list_time: Option<SmolStr>,
-    /// The venue's own instrument family, which its position tiers are keyed by.
     #[serde(rename = "instFamily")]
     instrument_family: Option<SmolStr>,
     uly: Option<SmolStr>,
     state: Option<SmolStr>,
 }
 
-// ---------------------------------------------------------------------------
-// Route-scoped market data
-// ---------------------------------------------------------------------------
-
-/// Fetches every ticker of one route.
 async fn fetch_all_tickers(
     context: &ExecutionContext,
     query: TickersQuery,
@@ -1533,11 +1248,6 @@ async fn fetch_all_tickers(
     )?))
 }
 
-// ---------------------------------------------------------------------------
-// Listing-scoped market data
-// ---------------------------------------------------------------------------
-
-/// Fetches candlesticks of one listing.
 async fn fetch_candlesticks(
     context: &ExecutionContext,
     listing: Option<&ResolvedListingRef>,
@@ -1559,7 +1269,6 @@ async fn fetch_candlesticks(
     ))
 }
 
-/// Fetches the ticker of one listing.
 async fn fetch_ticker(
     context: &ExecutionContext,
     listing: Option<&ResolvedListingRef>,
@@ -1583,7 +1292,6 @@ async fn fetch_ticker(
     )?))
 }
 
-/// Fetches one order-book snapshot of one listing.
 async fn fetch_order_book(
     context: &ExecutionContext,
     listing: Option<&ResolvedListingRef>,
@@ -1615,7 +1323,6 @@ async fn fetch_order_book(
     )?))
 }
 
-/// Fetches the recent market trades of one listing.
 async fn fetch_trades(
     context: &ExecutionContext,
     listing: Option<&ResolvedListingRef>,
@@ -1643,13 +1350,6 @@ async fn fetch_trades(
     )?))
 }
 
-/// The query parameters of one candlestick request.
-///
-/// OKX names its pagination from the returned records' point of view: `after`
-/// selects the records *earlier* than the timestamp and `before` selects the
-/// records *newer* than it, which is the opposite of what the names suggest. A
-/// range therefore has to be sent as `before` for its start and `after` for its
-/// end, each shifted by one millisecond because both bounds are exclusive.
 fn candle_params(
     instrument_id: &str,
     interval: &str,
@@ -1668,10 +1368,6 @@ fn candle_params(
     }
     params
 }
-
-// ---------------------------------------------------------------------------
-// Perpetual statistics
-// ---------------------------------------------------------------------------
 
 async fn fetch_open_interest(
     context: &ExecutionContext,
@@ -1783,12 +1479,6 @@ async fn fetch_taker_volume(
     Ok(ProtocolResponse::TakerVolumes(values))
 }
 
-/// Reads one rubik statistics endpoint for one listing.
-///
-/// `contracts_unit` asks the endpoint for its contract-denominated answer. Only
-/// the taker-volume endpoint takes the parameter, and it is what makes the two
-/// volumes it returns the unit the listing's own quantity rule declares: a
-/// contract count is what a `Contracts` listing trades in.
 async fn rubik(
     context: &ExecutionContext,
     listing: Option<&ResolvedListingRef>,
@@ -1816,7 +1506,6 @@ async fn rubik(
     public_get(context, path, &params).await
 }
 
-/// One rubik statistics response.
 #[derive(serde::Deserialize)]
 struct OkxOpenInterestHistoryRow([SmolStr; 4]);
 #[derive(serde::Deserialize)]
@@ -1831,11 +1520,6 @@ enum RatioKind {
     TopTraderPosition,
 }
 
-// ---------------------------------------------------------------------------
-// Authenticated trading
-// ---------------------------------------------------------------------------
-
-/// Places one order over the authenticated socket.
 async fn place_order(
     context: &ExecutionContext,
     listing: Option<&ResolvedListingRef>,
@@ -1919,7 +1603,6 @@ async fn place_order(
     ))
 }
 
-/// Cancels one order over the authenticated socket.
 async fn cancel_order(
     context: &ExecutionContext,
     listing: Option<&ResolvedListingRef>,
@@ -1949,10 +1632,6 @@ async fn cancel_order(
     }
     Ok(ProtocolResponse::OrderCancelled(command.order_id))
 }
-
-// ---------------------------------------------------------------------------
-// Authenticated account reads
-// ---------------------------------------------------------------------------
 
 async fn fetch_balances(
     context: &ExecutionContext,
@@ -2070,8 +1749,6 @@ async fn fetch_positions(
     )
     .await?;
     let mut positions = decode_positions(&context.route(), instrument_type, rows)?;
-    // An account read lists the positions it holds; a position the venue reports
-    // with no quantity is one it no longer holds.
     positions.retain(|position| !position.quantity.is_zero());
     Ok(ProtocolResponse::Positions(positions))
 }
@@ -2161,7 +1838,6 @@ async fn fetch_trading_settings(
     }))
 }
 
-/// The parameters every account read is narrowed by.
 fn order_parameters(
     instrument_type: OkxInstrumentType,
     listing: Option<&OkxListing>,
@@ -2180,15 +1856,6 @@ fn order_parameters(
     params
 }
 
-// ---------------------------------------------------------------------------
-// Subscriptions
-// ---------------------------------------------------------------------------
-
-/// One subscription as this adapter holds it.
-///
-/// The kind carries the listing every event of the subscription belongs to, so a
-/// frame is decoded into the exact key the catalog published rather than into the
-/// venue's identifier again.
 #[derive(Clone, Debug)]
 enum SubscriptionKind {
     Candlestick {
@@ -2226,11 +1893,6 @@ enum SubscriptionKind {
 }
 
 impl SubscriptionKind {
-    /// Whether one OKX frame is addressed to this subscription.
-    ///
-    /// A frame that names this subscription's channel can still belong to
-    /// another one: the liquidation channel is shared by every instrument type
-    /// subscribed to it, and all of them name the same channel in `arg`.
     fn matches_event(&self, arg: &OkxEventArg) -> bool {
         match self {
             Self::Candlestick {
@@ -2253,7 +1915,6 @@ impl SubscriptionKind {
     }
 }
 
-/// The args, frame kind, socket and authentication of one subscription.
 fn subscription(
     context: &ExecutionContext,
     listing: Option<&ResolvedListingRef>,
@@ -2304,8 +1965,6 @@ fn subscription(
         ProtocolRequest::SubscribeOrderBook(query) => {
             query.validate().map_err(configuration)?;
             let listing = resolved_listing(listing)?;
-            // `books5` publishes a whole five-level book on every push, `books`
-            // publishes the four-hundred-level book as snapshots and updates.
             let channel = if query.depth <= 5 { "books5" } else { "books" };
             (
                 vec![OkxArg {
@@ -2339,11 +1998,6 @@ fn subscription(
         }
         ProtocolRequest::SubscribeForceOrder(query) => {
             query.validate().map_err(configuration)?;
-            // The liquidation channel is selected by instrument type rather than
-            // by instrument, and OKX refuses the subscription when the type is
-            // missing from the args. The type is the scope's own, so a scope is
-            // never asked for another scope's liquidations; a product family
-            // without liquidations has no instrument type to select here.
             let instrument_type = OkxCodec
                 .scope_instrument_type(&query.route().scope)
                 .filter(|instrument_type| instrument_type != &OkxInstrumentType::Spot)
@@ -2420,7 +2074,6 @@ fn subscription(
     })
 }
 
-/// Opens one subscription on one connection and streams its events.
 fn open_subscription(
     connection: &Arc<Connection>,
     args: Vec<OkxArg>,
@@ -2442,8 +2095,6 @@ fn open_subscription(
         connection.subscribe_with_id(request_id, topic, payload, unsubscribe_payload)?;
     let cancellation = CancellationToken::new();
     let source = Box::pin(connection.event_stream());
-    // `unfold`'s state is the stream itself, so what is left of the frame it last
-    // decoded lives in front of the source it drains next.
     let state = (Vec::new(), source, cancellation.clone(), kind, request_id);
     let stream = stream::unfold(
         state,
@@ -2461,7 +2112,6 @@ fn open_subscription(
                 let payload = tokio::select! { () = cancellation.cancelled() => return None, payload = next_payload => payload };
                 let payload = match payload {
                     Some(Ok(payload)) => payload,
-                    // A connection that stopped publishing ends its streams with why.
                     Some(Err(error)) => {
                         return Some((
                             Err(error),
@@ -2489,7 +2139,6 @@ fn open_subscription(
     ))
 }
 
-/// One frame of the OKX WebSocket protocol.
 #[derive(serde::Deserialize)]
 pub(super) struct OkxEventArg {
     channel: SmolStr,
@@ -2500,9 +2149,6 @@ pub(super) struct OkxEventArg {
 }
 #[derive(serde::Deserialize)]
 struct OkxFrameEnvelope {
-    /// The `event` of a control frame. A subscribe acknowledgement names this
-    /// subscription's channel and is still not data this subscription failed to
-    /// decode.
     event: Option<SmolStr>,
     arg: Option<OkxEventArg>,
 }
@@ -2525,8 +2171,6 @@ struct OkxTickerEvent {
 #[derive(serde::Deserialize)]
 struct OkxBookEvent {
     arg: OkxEventArg,
-    /// The `books` channel labels every push `snapshot` or `update`. The `books5`
-    /// channel publishes whole books and carries no `action` at all.
     action: Option<SmolStr>,
     data: Vec<OkxBookData>,
 }
@@ -2565,8 +2209,6 @@ struct OkxForceOrderEvent {
 struct OkxForceOrderData {
     #[serde(rename = "instId")]
     inst_id: SmolStr,
-    /// One push settles every liquidation OKX has for the instrument it names, so
-    /// the liquidation's own fields live in here rather than beside it.
     details: Vec<OkxForceOrderDetail>,
 }
 #[derive(serde::Deserialize)]
@@ -2601,12 +2243,6 @@ struct OkxOrderResult {
     s_msg: Option<SmolStr>,
 }
 
-/// The failure OKX reports for one subscription, if this frame is that report.
-///
-/// Every subscription reads the same connection's stream, so a frame is this
-/// subscription's only when OKX echoes the request id it was opened with. An
-/// error frame that names no id cannot be attributed to one subscription on a
-/// shared connection.
 fn subscription_error(payload: &[u8], request_id: u64) -> Option<MarketParticipantError> {
     let event: OkxErrorEvent = serde_json::from_slice(payload).ok()?;
     if event.event != "error" || OkxCodec::extract_response_id(payload) != Some(request_id) {
@@ -2620,11 +2256,6 @@ fn subscription_error(payload: &[u8], request_id: u64) -> Option<MarketParticipa
     })
 }
 
-/// Whether one frame is data addressed to this subscription that it could not decode.
-///
-/// Data for another subscription on the same connection is not this one's to
-/// report, and neither is a control frame: an acknowledgement names this
-/// subscription's channel without carrying any of its data.
 fn frame_is_unparsable_data(payload: &[u8], kind: &SubscriptionKind) -> bool {
     let Ok(envelope) = serde_json::from_slice::<OkxFrameEnvelope>(payload) else {
         return false;
@@ -2635,8 +2266,6 @@ fn frame_is_unparsable_data(payload: &[u8], kind: &SubscriptionKind) -> bool {
     envelope.arg.is_some_and(|arg| kind.matches_event(&arg))
 }
 
-/// The failure a frame addressed to this subscription reports when its shape is
-/// not the one the subscribed channel publishes.
 fn malformed_event(payload: &[u8], operation: &'static str) -> MarketParticipantError {
     MarketParticipantError::ProtocolError {
         operation: operation.into(),
@@ -2645,12 +2274,6 @@ fn malformed_event(payload: &[u8], operation: &'static str) -> MarketParticipant
     }
 }
 
-/// Decodes the events one frame carries.
-///
-/// A frame is one push of a channel, which is not the same unit as the events
-/// this adapter reports: the liquidation channel settles several orders at once
-/// and delivers them in a single frame. Returning all of them keeps a frame's
-/// data whole; a frame of another channel is an empty batch and not a failure.
 fn decode_frame(
     payload: &[u8],
     kind: &SubscriptionKind,
@@ -2688,7 +2311,6 @@ fn decode_frame(
             listing,
         } => {
             let Some(channel) = private_frame_channel(payload) else {
-                // A control frame carries none of this channel's data.
                 return Ok(Vec::new());
             };
             let order_route = match channel.as_str() {
@@ -2809,14 +2431,9 @@ fn decode_book_frame(
             "order book event omitted data",
         )
     })?;
-    // The `books5` channel repeats the instrument inside `data` and the `books`
-    // channel names it in `arg` alone, so the subscription is identified by `arg`.
     if event.arg.inst_id.as_deref() != Some(instrument_id) {
         return Ok(Vec::new());
     }
-    // OKX numbers its pushes; a push without a sequence cannot be compared with
-    // the one before it, so its absence is a protocol failure rather than an
-    // invented sequence.
     let last_sequence = value
         .sequence
         .ok_or_else(|| protocol_error("decode OKX order book sequence", "push omitted seqId"))?;
@@ -2824,8 +2441,6 @@ fn decode_book_frame(
         .previous_sequence
         .filter(|sequence| *sequence >= 0)
         .and_then(|sequence| u64::try_from(sequence).ok());
-    // `books5` publishes a whole book on every push, so each of its frames is a
-    // snapshot even though it carries no `action` to say so.
     let snapshot =
         event.action.as_deref() == Some("snapshot") || event.arg.channel.starts_with("books5");
     let first_sequence = if snapshot {
@@ -3016,11 +2631,6 @@ mod tests {
         )
     }
 
-    /// A context whose origins are `origin` on both roles.
-    ///
-    /// The pair is built here rather than read from a venue's settings, because what
-    /// these tests drive is the adapter's own encoding: the context is the one place an
-    /// origin enters it, so a fixture socket is named directly.
     fn context(scope: &str, capability: CapabilityId, origin: &Url) -> ExecutionContext {
         let scope_id = VenueScopeId::new(scope).expect("the scope id is canonical");
         let venue = VenueId::Okx;
@@ -3034,12 +2644,10 @@ mod tests {
         ExecutionContext::new(identity, origins, reqwest::Client::new(), pool)
     }
 
-    /// The fixture origin of a test that never dials.
     fn fixture_origin() -> Url {
         Url::parse("https://openapi.okx.com").expect("the fixture origin parses")
     }
 
-    /// A fixture server answering one HTTP request per body, in order.
     async fn response_server(bodies: Vec<String>) -> (Url, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3075,12 +2683,10 @@ mod tests {
         (origin, task)
     }
 
-    /// One instrument row of the venue's own response shape.
     fn instrument(json: &str) -> OkxInstrumentWire {
         serde_json::from_str(json).expect("the OKX instrument fixture decodes")
     }
 
-    /// A fixture server that answers one request and reports what it received.
     async fn signing_server(
         body: &str,
     ) -> (
@@ -3123,9 +2729,6 @@ mod tests {
         (origin, receiver, task)
     }
 
-    /// An OKX credential is one credential: the request it signs carries the API
-    /// key, the passphrase and a signature computed with the secret the gateway
-    /// resolved, and none of the three is read from anywhere else.
     #[tokio::test]
     async fn a_signed_request_carries_the_resolved_passphrase_and_its_signature() {
         let (origin, received, server) = signing_server(r#"{"code":"0","msg":"","data":[]}"#).await;
@@ -3144,7 +2747,6 @@ mod tests {
         let request = received
             .await
             .expect("the fixture server reports its request");
-        /// Returns one header value of a captured request, by name.
         fn header(request: &str, name: &str) -> Option<String> {
             request.lines().find_map(|line| {
                 let (field, value) = line.split_once(':')?;
@@ -3177,7 +2779,6 @@ mod tests {
         server.abort();
     }
 
-    /// A credential that is not an OKX one is refused before anything is signed.
     #[test]
     fn a_credential_without_a_passphrase_is_refused() {
         let context = context(SPOT_SCOPE, CapabilityId::AccountBalances, &fixture_origin())
@@ -3208,8 +2809,6 @@ mod tests {
             .map(|(_, value)| value.as_str())
     }
 
-    /// The bounds of both served scopes are OKX's own, and a scope this adapter
-    /// does not serve has no bounds at all.
     #[test]
     fn limits_report_okx_depth_and_intervals_per_scope() {
         let adapter = OkxAdapter::new();
@@ -3228,8 +2827,6 @@ mod tests {
         assert!(futures.timeframes.is_empty());
     }
 
-    /// OKX's pagination names read backwards, and a range that is sent the way
-    /// the names suggest comes back as the window the caller is already showing.
     #[test]
     fn a_time_range_should_be_sent_as_the_opposite_of_its_okx_pagination_names() {
         let query = CandlestickFetchQuery {
@@ -3276,11 +2873,6 @@ mod tests {
         assert_eq!(param(&unbounded, "after"), None);
     }
 
-    /// The args of the liquidation subscription, as they go on the wire.
-    ///
-    /// OKX refuses this channel without the instrument type it selects, and the
-    /// type is the scope's own: the subscription is opened for a scope rather
-    /// than for one hard-coded product.
     #[test]
     fn a_force_order_subscription_should_select_the_scope_instrument_type() {
         let context = context(SWAP_SCOPE, CapabilityId::ForceOrder, &fixture_origin());
@@ -3310,8 +2902,6 @@ mod tests {
         ));
     }
 
-    /// The liquidation channel is a perpetual capability: a route that does not
-    /// address a perpetual instrument type cannot open it.
     #[test]
     fn a_force_order_subscription_of_a_spot_scope_is_not_opened() {
         let context = context(SPOT_SCOPE, CapabilityId::ForceOrder, &fixture_origin());
@@ -3335,8 +2925,6 @@ mod tests {
         ));
     }
 
-    /// The channel is shared by every instrument type subscribed to it, so a
-    /// frame OKX addresses to another type is not this subscription's data.
     #[test]
     fn a_force_order_frame_of_another_instrument_type_is_left_alone() {
         let Ok(events) = decode(
@@ -3348,8 +2936,6 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    /// One push lists every liquidation OKX settled for the instrument it names,
-    /// and the liquidation's own fields live inside `details`.
     #[test]
     fn decodes_every_liquidation_of_one_okx_push() {
         let events = decode(
@@ -3387,8 +2973,6 @@ mod tests {
         assert_eq!(decoded[1].data.timestamp, 1_700_000_000_001);
     }
 
-    /// OKX labels an incremental `books` push `update` and names the instrument
-    /// in `arg`: the `data` entries of that channel carry no `instId`.
     #[test]
     fn decodes_okx_order_book_updates_with_sequence_boundary() {
         let event = decode_one(
@@ -3409,8 +2993,6 @@ mod tests {
         );
     }
 
-    /// The `books5` channel publishes a whole book on every push and carries
-    /// neither an `action` nor a `prevSeqId`, so every frame of it is a snapshot.
     #[test]
     fn decodes_okx_books5_snapshots_that_carry_no_action() {
         let event = decode_one(
@@ -3436,8 +3018,6 @@ mod tests {
         assert_eq!(update.data.asks.len(), 1);
     }
 
-    /// A push without a sequence cannot be compared with the one before it, so
-    /// it is refused instead of being published under an invented sequence.
     #[test]
     fn a_book_push_without_a_sequence_is_refused() {
         let Err(error) = decode(
@@ -3454,8 +3034,6 @@ mod tests {
         ));
     }
 
-    /// A SPOT ticker counts base currency in `vol24h` and quote currency in
-    /// `volCcy24h`.
     #[test]
     fn okx_spot_ticker_pushes_base_and_quote_currency() {
         let volumes = ticker_volumes(
@@ -3466,10 +3044,6 @@ mod tests {
         assert_eq!(volumes, ("12".into(), "1260".into()));
     }
 
-    /// A derivative ticker counts contracts in `vol24h` and base currency in
-    /// `volCcy24h`, so the traded quantity is the contract count — the unit the
-    /// listing's own quantity rule declares — and the notional is the base amount
-    /// priced at the last price.
     #[test]
     fn okx_perpetual_ticker_pushes_contracts_and_a_priced_base_amount() {
         let volumes = ticker_volumes(
@@ -3480,11 +3054,6 @@ mod tests {
         assert_eq!(volumes, ("1200".into(), "1260".into()));
     }
 
-    /// A live swap push of an instrument whose contract is worth a hundredth of
-    /// its base currency: the contract count is a hundred times the base amount.
-    /// The traded quantity is the contract count, because a contract is what the
-    /// listing trades in, and the base amount is priced into the quote notional
-    /// rather than being reported as if it were the traded quantity.
     #[test]
     fn okx_perpetual_ticker_does_not_report_the_base_amount_as_the_traded_quantity() {
         let volumes = ticker_volumes(
@@ -3495,11 +3064,6 @@ mod tests {
         assert_eq!(volumes, ("13514035.01".into(), "11591947324.56271".into()));
     }
 
-    /// A derivative candle counts contracts in the volume column and the base
-    /// amount one field later. The traded quantity the model publishes from that
-    /// column is therefore the contract count, labelled with the `Contracts` unit
-    /// the listing's own quantity rule declares — the same number the `candle`
-    /// channel pushes for the same row.
     #[test]
     fn a_derivative_candle_reports_the_contract_count_its_listing_declares() {
         let swap = swap_catalog_entry();
@@ -3533,8 +3097,6 @@ mod tests {
         assert_eq!(pushed.listing, swap.listing);
     }
 
-    /// A spot candle counts the base currency in the same column, which is the
-    /// unit a spot listing's own quantity rule declares.
     #[test]
     fn a_spot_candle_reports_the_base_amount_its_listing_trades_in() {
         let spot = catalog_entry(
@@ -3568,8 +3130,6 @@ mod tests {
         assert_eq!(traded.value.to_string(), "12");
     }
 
-    /// The statistics rows are positional arrays of the venue's own strings, and
-    /// each of the three statistics endpoints has its own row shape.
     #[test]
     fn decodes_rubik_statistics_row_shapes() {
         let open_interest: Vec<super::OkxOpenInterestHistoryRow> = super::decode_public(
@@ -3603,7 +3163,6 @@ mod tests {
         assert_eq!(buy, "20");
     }
 
-    /// A frame of another instrument is not this subscription's data.
     #[test]
     fn okx_ticker_frame_of_another_instrument_is_left_alone() {
         let events = decode(
@@ -3615,8 +3174,6 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    /// One connection carries every subscription, so a frame for another channel
-    /// is not this subscription's to report.
     #[test]
     fn leaves_a_frame_of_another_channel_to_its_own_subscription() {
         assert!(matches!(
@@ -3628,8 +3185,6 @@ mod tests {
         ));
     }
 
-    /// A subscribe acknowledgement names this subscription's channel and arrives
-    /// on the same stream, so it must not be mistaken for data.
     #[test]
     fn leaves_a_subscribe_acknowledgement_alone() {
         assert!(matches!(
@@ -3641,8 +3196,6 @@ mod tests {
         ));
     }
 
-    /// A frame that names this subscription's channel and still does not match
-    /// its shape is a failure: reporting it as nothing kept a wrong DTO silent.
     #[test]
     fn reports_a_frame_addressed_here_that_does_not_parse() {
         let Err(error) = decode(
@@ -3659,9 +3212,6 @@ mod tests {
         ));
     }
 
-    /// A subscription OKX refuses is reported through the request id the
-    /// subscribe command was sent with, which is what makes an error frame
-    /// attributable on a shared stream.
     #[test]
     fn reports_an_error_frame_that_echoes_this_subscription_request_id() {
         let Err(error) = decode(
@@ -3678,7 +3228,6 @@ mod tests {
         ));
     }
 
-    /// An error frame that echoes another subscription's request id belongs to it.
     #[test]
     fn leaves_an_error_frame_of_another_subscription_alone() {
         assert!(matches!(
@@ -3690,8 +3239,6 @@ mod tests {
         ));
     }
 
-    /// An unsubscribe command repeats the args of its subscribe command, so the
-    /// venue releases exactly the channel it opened.
     #[test]
     fn an_unsubscribe_command_repeats_the_arguments_it_releases() {
         let command = super::OkxCommand {
@@ -3717,8 +3264,6 @@ mod tests {
         );
     }
 
-    /// A spot instrument becomes a complete catalog entry: the canonical
-    /// instrument, the venue's own typed identifiers and rules that hold for it.
     #[test]
     fn a_spot_instrument_becomes_a_complete_catalog_entry() {
         let entry = catalog_entry(
@@ -3761,9 +3306,6 @@ mod tests {
         assert_eq!(terms.base(), &super::asset("BTC").asset_id());
     }
 
-    /// A linear swap becomes a complete catalog entry. Its margin requirements
-    /// stay unloaded: the venue publishes them outside the instrument record and
-    /// nothing reads them.
     #[test]
     fn a_linear_swap_becomes_a_complete_catalog_entry() {
         let entry = catalog_entry(
@@ -3799,8 +3341,6 @@ mod tests {
         );
     }
 
-    /// A contract the venue has announced but not described carries no terms to
-    /// publish, so it never becomes a listing.
     #[test]
     fn an_announced_contract_is_not_published() {
         let entry = catalog_entry(
@@ -3815,8 +3355,6 @@ mod tests {
         assert!(entry.is_none());
     }
 
-    /// A row that describes only part of a contract contradicts itself, and
-    /// publishing it would publish terms the venue does not trade.
     #[test]
     fn a_partially_described_contract_is_a_protocol_failure() {
         let error = catalog_entry(
@@ -3836,8 +3374,6 @@ mod tests {
         ));
     }
 
-    /// A scheduled contract whose terms the venue already published is a listing
-    /// with an availability instant, not an announced row.
     #[test]
     fn a_scheduled_swap_with_published_terms_carries_its_availability() {
         let entry = catalog_entry(
@@ -3854,10 +3390,6 @@ mod tests {
         assert_eq!(entry.available_from, Some(1_800_000_000_000));
     }
 
-    /// An inverse swap is published with the terms it really has: it tracks the
-    /// asset it settles in, states its contract value as a notional of the price
-    /// quote, and carries the conversion reference its settlement converts
-    /// through.
     #[test]
     fn an_inverse_swap_is_published_as_an_inverse_perpetual() {
         let entry = catalog_entry(
@@ -3898,9 +3430,6 @@ mod tests {
         );
     }
 
-    /// A swap that states the inverse shape while settling in something other
-    /// than the asset it tracks is refused instead of being published as a
-    /// linear contract, because its terms cannot be expressed at all.
     #[test]
     fn an_inverse_swap_settling_in_another_asset_is_refused() {
         let error = catalog_entry(
@@ -3919,9 +3448,6 @@ mod tests {
         ));
     }
 
-    /// A swap stating a shape this build cannot express is left out of the route
-    /// rather than published as a shape the venue did not state. The row is a
-    /// product this model has no terms for, not a broken route.
     #[test]
     fn a_swap_stating_an_unknown_contract_type_is_not_published() {
         let entry = catalog_entry(
@@ -3939,11 +3465,6 @@ mod tests {
         );
     }
 
-    /// OKX publishes `ctValCcy` beside `ctVal`, which is the venue's own account of
-    /// the currency its contract value is counted in. When it agrees with the shape
-    /// `ctType` states it is a second, independent confirmation of the same contract;
-    /// when it disagrees the row contradicts itself and publishing it either way
-    /// would publish a contract the venue does not trade.
     #[test]
     fn a_swap_stating_its_own_contract_value_currency_should_agree_with_its_shape() {
         let linear = |ct_val_ccy: &str| {
@@ -3967,7 +3488,6 @@ mod tests {
             )
         };
 
-        // The linear shape values its contract in the asset it tracks.
         assert!(
             linear("BTC")
                 .expect("a stated currency the shape agrees with is not a failure")
@@ -3981,7 +3501,6 @@ mod tests {
             "{error:?}"
         );
 
-        // The inverse shape values it in the price quote instead.
         assert!(
             inverse("USD")
                 .expect("a stated currency the shape agrees with is not a failure")
@@ -3993,18 +3512,12 @@ mod tests {
             "an inverse swap that values its contract in the asset it tracks contradicts itself"
         );
 
-        // A response that omits the field states nothing to disagree with, so the
-        // shape `ctType` states is the contract that is published.
         assert!(
             linear_without_stated_currency().is_some(),
             "an omitted ctValCcy leaves the derived contract standing"
         );
     }
 
-    /// A contract multiplier this build cannot fold into the contract value is a
-    /// product decision and not a broken route: the venue trades a contract whose
-    /// terms this model has no shape for, so the listing is left out of the catalog
-    /// exactly as an unknown `ctType` is.
     #[test]
     fn a_swap_stating_a_multiplier_this_model_cannot_express_is_not_published() {
         let entry = catalog_entry(
@@ -4034,8 +3547,6 @@ mod tests {
         );
     }
 
-    /// The fixture of a linear swap that states no contract value currency, which is
-    /// the shape a response without `ctValCcy` has.
     fn linear_without_stated_currency() -> Option<NativeCatalogEntry> {
         catalog_entry(
             &route(SWAP_SCOPE),
@@ -4047,9 +3558,6 @@ mod tests {
         .expect("a swap that states no contract value currency still decodes")
     }
 
-    /// A swap that omits the field its shape is stated by breaks the protocol: the
-    /// field belongs to the required terms of every published swap, so the row is
-    /// refused before a shape could be guessed for it.
     #[test]
     fn a_swap_omitting_its_contract_type_is_refused() {
         let error = catalog_entry(
@@ -4068,8 +3576,6 @@ mod tests {
         ));
     }
 
-    /// The shape reader separates the two shapes this build expresses from the
-    /// shapes it does not, and refuses a swap that states nothing.
     #[test]
     fn reading_a_contract_type_should_separate_known_shapes_from_unknown_ones() {
         let read = |value: &str| OkxSwapContractType::read(Some(&SmolStr::new(value)));
@@ -4093,9 +3599,6 @@ mod tests {
         }
     }
 
-    /// A route that answers both a swap this build publishes and one it cannot
-    /// express still publishes the first: leaving a product out is a decision about
-    /// that listing alone.
     #[tokio::test]
     async fn a_route_should_publish_its_expressible_swaps_beside_an_unknown_one() {
         let (origin, server) = response_server(vec![
@@ -4120,9 +3623,6 @@ mod tests {
         server.await.expect("the fixture server finishes");
     }
 
-    /// A swap that claims the linear shape while settling in an asset other than
-    /// its price quote is refused by the model rather than published with the
-    /// settlement it does not have.
     #[test]
     fn a_linear_swap_settling_in_another_asset_is_refused() {
         let error = catalog_entry(
@@ -4141,7 +3641,6 @@ mod tests {
         ));
     }
 
-    /// The canonical assets the inverse fixtures name.
     fn btc() -> AssetId {
         super::asset("BTC").asset_id()
     }
@@ -4150,8 +3649,6 @@ mod tests {
         super::asset("USD").asset_id()
     }
 
-    /// A scheduled instrument is published under the instant the venue says it
-    /// becomes available, which is the only lower bound that makes it tradable.
     #[test]
     fn a_scheduled_instrument_carries_its_availability() {
         let entry = catalog_entry(
@@ -4168,8 +3665,6 @@ mod tests {
         assert_eq!(entry.available_from, Some(1_800_000_000_000));
     }
 
-    /// The catalog of one swap route is fetched from OKX's instrument endpoint
-    /// alone; the venue's position tiers are never read.
     #[tokio::test]
     async fn fetch_markets_converts_okx_contract_fields_to_catalog_entries() {
         let (origin, server) = response_server(vec![
@@ -4196,8 +3691,6 @@ mod tests {
         server.await.expect("the fixture server finishes");
     }
 
-    /// A listing-scoped request whose listing the gateway could not resolve is
-    /// refused instead of being encoded with an invented instrument.
     #[tokio::test]
     async fn a_listing_scoped_request_without_a_listing_is_refused() {
         let context = context(SPOT_SCOPE, CapabilityId::Tickers, &fixture_origin());
@@ -4222,8 +3715,6 @@ mod tests {
         ));
     }
 
-    /// The subscription a decode test stands for, and the request id it was
-    /// opened with.
     const REQUEST_ID: u64 = 7;
 
     fn order_book_kind() -> super::SubscriptionKind {
@@ -4256,7 +3747,6 @@ mod tests {
         }
     }
 
-    /// The one candle subscription a candle decode test stands for.
     fn candle_kind(scope: &str, instrument_id: &str) -> super::SubscriptionKind {
         super::SubscriptionKind::Candlestick {
             listing: super::OkxCodec
@@ -4267,8 +3757,6 @@ mod tests {
         }
     }
 
-    /// The published catalog entry of one live linear swap, whose margin
-    /// requirements are still unloaded.
     fn swap_catalog_entry() -> NativeCatalogEntry {
         catalog_entry(
             &route(SWAP_SCOPE),
@@ -4306,7 +3794,6 @@ mod tests {
         decode_frame(payload, kind, REQUEST_ID)
     }
 
-    /// The single event a channel that publishes one event per frame carries.
     fn decode_one(payload: &[u8], kind: &super::SubscriptionKind) -> Option<ProtocolEvent> {
         decode(payload, kind)
             .expect("the frame decodes")

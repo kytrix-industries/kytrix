@@ -1,60 +1,3 @@
-//! 菜单族内核（P2-4c：旧 `crate::menu` 的引擎化重建 + dropdown / select / context_menu 的共享面板）。
-//!
-//! 旧实现由三块拼出来：`menu.rs`（无状态菜单列表，条目 = 幽灵按钮）、`overlay.rs`（定位 + 淡入淡出 +
-//! 点击外部关闭）、`layer.rs`（优先级 / 单一 context menu）。旧菜单**没有**键盘导航、没有子菜单、
-//! 没有选中态；本模块按 P2-4c 交付把它们补齐，并把「条目面板」抽成一份共享实现供
-//! `dropdown` / `select` / `context_menu` 复用。
-//!
-//! # 结构
-//!
-//! ```text
-//! Overlay（引擎浮层：placement / 点击外部关闭 / Esc → Action::Dismiss / 焦点陷阱 / 焦点恢复）
-//! └─ panel（Overlay 面板：背景 / 圆角 / 内边距 / 阴影；a11y 角色在引擎包装节点上）
-//!    └─ surface（本模块建的**键盘作用域**：tab_stop + 点击动作 + 固定宽高 + 裁剪）
-//!       └─ List（`kit::list` 内核：虚拟化 + 变高实测 + 悬停/选中行样式 + 自绘滚动条）
-//!          └─ row:content > hit（每行一个带点击动作的命中壳）> 应用内容（图标 / 文本 / 快捷键 / 勾）
-//! ```
-//!
-//! 子菜单**继承父菜单的层带**并以 `LayerSlot::Nested` 登记（同带叠放，后登记在上）：`Popup` 根菜单
-//! 的子菜单在菜单之上，`ContextMenu` 根菜单的子菜单仍在父面板之上（写死 `Popup` 会让父面板反过来
-//! 盖住子菜单、Esc 先关父 —— 审查 P1-1）。
-//!
-//! [`ItemPanel`] 只认「行」这一件事：每行有高度、可禁用、一条 a11y 补丁，以及一个把内容建进
-//! 命中壳的回调。菜单条目模型（[`MenuEntry`]）由 [`Menu`] 解释成行；下拉 / 选择的扁平选项由各自
-//! 模块解释成行。行内核复用 [`crate::kit::list::List`]（E3 虚拟列表）：长菜单 / 长选项表只挂
-//! 可见窗口内的行。
-//!
-//! # 键盘
-//!
-//! 作用域键（E8 `App::bind_key_scoped`）绑在**面板的 surface 节点**上，焦点在浮层内时生效：
-//! `↑` / `↓` 移动高亮（跳过禁用 / 分组 / 分隔线行）、`Home` / `End` 到首 / 末可激活行、
-//! `Enter` / `Space` 激活高亮行（surface 的点击动作；指针点击走行自己的点击动作）、
-//! 菜单额外有 `→` 打开子菜单 / `←` 关闭本层。`Esc` 由引擎默认绑定 → `Action::Dismiss` →
-//! 卸载**最上层**浮层（子菜单先关），本模块的 `sync` 探测到引擎卸载后收尾。
-//!
-//! 指针点击行时引擎按「最近祖先的动作」派发到行命中壳的动作（`ActionSource::Click`），行号由
-//! 命中节点向上反查 [`crate::kit::list::List::mounted_rows`]。**行点击完全由引擎动作承担**：
-//! 门面组件的 `dispatch` 只转发触发器的按下态（dropdown / select），菜单族没有「转发事件再补一次
-//! 激活」的路径（那样会与引擎派发重复，多选面板每点一次切换两次 —— 审查 P1-2）。
-//!
-//! # a11y（E9 集合语义）
-//!
-//! 面板声明 [`MenuMode::Menu`]（`Menu` + `MenuItem`）或 [`MenuMode::ListBox`]（行
-//! `ListBoxOption`）：角色与标签打在**引擎浮层包装节点 / 列表行**上（行基线由
-//! `List::set_row_a11y` 叠加），行内的命中壳与绘制节点声明 `hidden`，避免 AT 把同一个标签读两遍。
-//! E12 之后浮层角色必须显式声明在包装节点上（P2-4b3 的 `OverlayA11y → OverlayOptions::a11y`
-//! 映射）；`ListBox` 角色引擎尚未提供（E15），选择器面板因此不在包装上声明 `List`：E9 的虚拟
-//! 列表容器恒为 `List`，包装再声明一次会让 AT 读到「列表套列表」（见 spec-delta）。
-//!
-//! # 与引擎语义的差异（登记见 `.docs/gui-migration/spec-deltas/kit-menu.md`）
-//!
-//! - 引擎没有 `ComboBox` / `ListBox` 角色：选择器用 `Button`（触发器）+ `List` / `ListBoxOption`
-//!   表达，`aria-expanded` 由触发器的 `A11yPatch` 承担；
-//! - 引擎没有组不透明度（E13）：淡入淡出作用在浮层壳上，行内容不跟随（旧实现同样是整层消隐）；
-//! - 滚动条是 `kit::list` 内核的自绘纵向条（旧菜单 `overflow_y_scroll` + 自绘条的同义）；
-//! - 菜单条目**没有**任意自定义元素通道（旧 `MenuItem::Custom`）：引擎的应用层组件是挂载期
-//!   建树，行内容必须可由回调重建，`AnyElement` 这种一次性元素没有落点。
-
 use std::{
     cell::{Cell, RefCell},
     fmt,
@@ -95,22 +38,12 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-/// 面板内边距（逻辑像素；旧 `Menu` 的 `.p_1()`，也是行内容的左右留白）。
 const MENU_PADDING: f32 = 4.0;
-/// 分组标题行高比例（相对尺寸档高度）。
 const GROUP_HEIGHT_RATIO: f32 = 0.75;
-/// 分隔线行高（逻辑像素）。
 const SEPARATOR_HEIGHT: f32 = 9.0;
-/// 子菜单与父菜单行的间隙（贴边 0 更像桌面菜单）。
 const SUBMENU_GAP: f32 = 0.0;
-/// 悬停打开子菜单的延迟（E10 一次性定时器）。
 const SUBMENU_DELAY: Duration = Duration::from_millis(150);
-// ── 图标资源 ──────────────────────────────────────────────────────────────
 
-/// 图标资源缓存：行内容建树时拿不到 `App`（`List` 的行工厂只有 `NodeTree`），所以图标资源
-/// 必须在打开面板前用 `App` 解析成 [`ResourceId`]，行内只引用 id。
-///
-/// 键是 `(图标, 逻辑尺寸, 光栅档)`：同一图标在 1× / 2× 下各存一份（DPI 换档后重新解析）。
 #[derive(Default)]
 pub(crate) struct IconCache {
     entries: RefCell<Vec<CachedIcon>>,
@@ -124,10 +57,6 @@ struct CachedIcon {
 }
 
 impl IconCache {
-    /// 解析（必要时上传）一个图标的资源 id。
-    ///
-    /// # Errors
-    /// `UnknownWindow`（窗口已关闭）/ 图片解码错误。
     pub(crate) fn resolve(
         &self,
         app: &mut App,
@@ -163,7 +92,6 @@ impl IconCache {
         Ok(())
     }
 
-    /// 只读快照（`List` 的行工厂拿不到 `App`，行内容建树读快照）。
     pub(crate) fn snapshot(&self) -> IconSnapshot {
         IconSnapshot {
             entries: self
@@ -176,7 +104,6 @@ impl IconCache {
     }
 }
 
-/// 行内的图标节点（行内容建树期可用：资源已解析成 id；`hidden` = 装饰）。
 fn build_icon(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -195,40 +122,22 @@ fn build_icon(
         .map(|_| ())
 }
 
-// ── 共享面板 ──────────────────────────────────────────────────────────────
-
-/// 面板的一行（内核只需要高度 / 可禁用；内容由应用回调建）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PanelRow {
-    /// 行高（逻辑像素）。
     pub height: f32,
-    /// 不可交互（分组标题 / 分隔线 / 禁用条目）：键盘导航跳过、点击不激活。
     pub disabled: bool,
 }
 
-/// 面板内容：行规格 + 建行内容 + 行 a11y 补丁 + 宽度测量输入。
 pub(crate) struct PanelContent {
-    /// 行规格（顺序 = 行号）。
     pub rows: Vec<PanelRow>,
-    /// 把第 `index` 行的内容建进 `parent`（命中壳）。
     pub build: Rc<dyn Fn(&mut NodeTree, NodeId, usize) -> Result<(), EngineError>>,
-    /// 行 a11y 补丁（角色 / 标签 / 选中 / 禁用 / 勾选）。
     pub a11y: Rc<dyn Fn(usize) -> A11yPatch>,
-    /// 宽度测量输入（`PanelWidth::AtLeast` 用；`None` = 不量内容宽）。
     pub measure: Option<PanelMeasure>,
 }
 
-/// 行内容固有宽度的测量输入。
-///
-/// 引擎没有公开的「量文本」API（`text_caret_rect` 只认已布局的文本节点），因此内核在面板里建
-/// **一个**隐藏测量文本（行文本用 `\n` 连接），布局后用逐行 caret 偏移差算出每行固有宽 ——
-/// 与旧的「面板 `min_w(trigger)`，内容更宽时长宽」口径对齐，且不破坏虚拟列表（O(1) 个额外节点）。
-/// label 自身含换行时按**最宽行段**计（见 `ItemPanel::measure_content`）。
 #[derive(Clone)]
 pub(crate) struct PanelMeasure {
-    /// 行文本（按行序；行数应与 `rows.len()` 一致）。
     pub labels: Vec<SmolStr>,
-    /// 每行固定附加宽度（图标列 / 勾选列 + 行内间隙）。
     pub extra: f32,
 }
 
@@ -246,86 +155,51 @@ impl Clone for PanelContent {
     }
 }
 
-/// 面板的角色对（菜单 / 列表盒两套语义）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PanelRoles {
-    /// 浮层**包装节点**的角色（`Menu`；`None` = 不声明，包装保持 `GenericContainer`）。
-    ///
-    /// 选择器（`List` 语义）**不**在这里声明 `List`：E9 的虚拟列表容器恒为 `List`，包装上再
-    /// 声明一次会让 AT 读到「列表里套列表」（双 `List`）。`ListBox` 角色引擎尚未提供（E15），
-    /// 在补上之前由内层 `List` 承担集合语义。
     pub panel: Option<A11yRole>,
-    /// 行角色（`MenuItem` / `ListBoxOption`）。
     pub row: A11yRole,
 }
 
-/// 共享面板参数。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ItemPanelOptions {
-    /// 尺寸档（行高 / 内边距 / 字号）。
     pub size: UnifiedSize,
-    /// 列表视口最大高度（逻辑像素；超出滚动）。
     pub max_height: f32,
-    /// 行高估计（变高列表的首帧值，实际值由实测回写）。
     pub row_height: f32,
-    /// 层带。
     pub band: Band,
-    /// 是否模态（焦点陷阱 + 浮层外按下被消费）。根菜单 / 下拉 / 选择恒 `true`。
     pub modal: bool,
-    /// 定位。
     pub placement: Placement,
-    /// 与锚点的间隙。
     pub gap: f32,
-    /// a11y 角色对。
     pub roles: PanelRoles,
-    /// 面板可访问名。
     pub label: Option<SmolStr>,
-    /// 宽度口径（显式宽 = `Exact`；未给宽 = `AtLeast`，见 [`PanelWidth`]）。
     pub width: PanelWidth,
-    /// 层带槽位规则（根菜单 / 下拉 / 选择独占；子菜单嵌套）。
     pub slot: LayerSlot,
 }
 
-/// 面板宽度口径。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PanelWidth {
-    /// 精确宽度（菜单 / 上下文菜单 / 显式 `width` 的下拉与选择：调用方给的面板宽就是最终宽，
-    /// 不随内容增长）。
     Exact,
-    /// 宽度是**下限**（未给显式宽的下拉 / 选择：对齐触发器，但内容更宽时长到内容宽 —— 旧
-    /// `min_w` 口径）。
-    ///
-    /// 内容宽由 [`PanelContent::measure`] 在打开后实测（见 [`PanelMeasure`]）。
     AtLeast,
 }
 
-/// 面板错误（浮层参数 / 引擎建树两条来源，都是一个 `OverlayError`）。
 type PanelResult<T> = Result<T, OverlayError>;
 
-/// 键盘 / 点击动作身份。
 struct PanelActions {
     up: Action,
     down: Action,
     home: Action,
     end: Action,
-    /// surface 的点击动作（键盘 `Enter` / `Space`：引擎按 Click 派发到焦点节点的动作）。
     activate: Action,
-    /// 行命中壳的点击动作（指针点击；行号由命中节点反查）。
     row: Action,
 }
 
 struct PanelState {
     window: Option<WindowId>,
     surface: Option<NodeId>,
-    /// 当前写入 surface 的宽度（surface 口径，已扣面板内边距）。
     width: f32,
-    /// 宽度下限（surface 口径；触发器实测宽 / 显式宽）。
     min_width: f32,
-    /// 内容固有宽度（surface 口径；`AtLeast` 口径实测后写入，`0` = 未量）。
     content_width: f32,
-    /// 这一批行内容是否已按内容量过宽（避免每帧重测）。
     measured: bool,
-    /// 宽度测量用的隐藏文本节点（打开期间存在，量完即卸载）。
     measure: Option<NodeId>,
     height: f32,
     opened: bool,
@@ -336,24 +210,20 @@ struct PanelInner {
     options: ItemPanelOptions,
     overlay: Overlay,
     list: List,
-    /// `List` 的行工厂拿不到 `App`：内容经这个共享槽位进内核。
     content: Rc<RefCell<Option<PanelContent>>>,
     actions: PanelActions,
     on_activate: RefCell<Option<Rc<dyn Fn(&mut App, usize)>>>,
     on_close: RefCell<Option<Rc<dyn Fn(&mut App)>>>,
     state: RefCell<PanelState>,
-    /// 是否打开（触发器画按下态 / 组合控件读）。
     open: Signal<bool>,
 }
 
-/// 共享条目面板（`Rc` 浅拷贝）。
 #[derive(Clone)]
 pub(crate) struct ItemPanel {
     inner: Rc<PanelInner>,
 }
 
 impl ItemPanel {
-    /// 建面板（关闭态）：浮层 + 列表内核 + 动作身份。
     pub(crate) fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -399,10 +269,6 @@ impl ItemPanel {
                     let Some((build, height)) = built else {
                         return Ok(());
                     };
-                    // 命中壳：整行可点、满宽；a11y `hidden`（行语义在列表行基线上）。
-                    // `tab_stop(false)`：行不进 Tab 序、指针按下也不把焦点交给命中壳 —— 键盘
-                    // 作用域由 surface 统一承担（审查 F25：默认 `tab_stop=true` 会让点过行之后
-                    // Enter/Space 落进行动作而 `ctx.hit()==None`，激活被吞）。
                     let hit = NodeBuilder::boxed()
                         .id(format_smolstr!("{list_key}:hit:{index}"))
                         .style(
@@ -485,32 +351,26 @@ impl ItemPanel {
         panel
     }
 
-    /// 浮层句柄。
     pub(crate) fn overlay(&self) -> &Overlay {
         &self.inner.overlay
     }
 
-    /// 列表内核（组合控件读挂载行 / 悬停）。
     pub(crate) fn list(&self) -> &List {
         &self.inner.list
     }
 
-    /// 打开状态信号。
     pub(crate) fn open_state(&self) -> Signal<bool> {
         self.inner.open
     }
 
-    /// 是否打开（应用语义；引擎侧关闭后要等一次 `sync` 才为 `false`）。
     pub(crate) fn is_open(&self, app: &App) -> bool {
         self.inner.overlay.is_open(app)
     }
 
-    /// surface（键盘作用域）节点。
     pub(crate) fn surface_node(&self) -> Option<NodeId> {
         self.inner.state.borrow().surface
     }
 
-    /// 行数。
     pub(crate) fn row_count(&self) -> usize {
         self.inner
             .content
@@ -519,7 +379,6 @@ impl ItemPanel {
             .map_or(0, |content| content.rows.len())
     }
 
-    /// 行是否禁用 / 越界。
     pub(crate) fn row_disabled(&self, index: usize) -> bool {
         self.inner
             .content
@@ -529,20 +388,14 @@ impl ItemPanel {
             .is_none_or(|row| row.disabled)
     }
 
-    /// 当前高亮行（引擎列表选中集的首项）。
     pub(crate) fn highlighted(&self, app: &App) -> Option<usize> {
         self.inner.list.selection(app).first()
     }
 
-    /// 悬停行（`List` 的悬停镜像；未打开时为 `None`）。
     pub(crate) fn hovered(&self, app: &App) -> Option<usize> {
         app.read_with(&self.inner.list.hovered_signal(), |hovered| *hovered)
     }
 
-    /// 设置内容（行数 / 行内容 / 行 a11y）。已打开时重建行。
-    ///
-    /// # Errors
-    /// 引擎虚拟列表失效。
     pub(crate) fn set_content(
         &self,
         app: &mut App,
@@ -571,12 +424,6 @@ impl ItemPanel {
         Ok(())
     }
 
-    /// 打开面板并把内容接进引擎。
-    ///
-    /// 返回 `true` = 本次真的打开了；`false` = 本来就开着（只更新锚点）。
-    ///
-    /// # Errors
-    /// 浮层参数非法 / 引擎建树 / 虚拟列表接线失败。
     pub(crate) fn open(
         &self,
         app: &mut App,
@@ -588,7 +435,6 @@ impl ItemPanel {
         let Some(content) = content else {
             return Ok(false);
         };
-        // `width` / `max_height` 是**面板**（含内边距）的口径：surface 扣掉两侧内边距。
         let width = (width.max(1.0) - MENU_PADDING * 2.0).max(1.0);
         let total: f32 = content.rows.iter().map(|row| row.height).sum();
         let height = total
@@ -662,14 +508,7 @@ impl ItemPanel {
         Ok(true)
     }
 
-    /// 下限宽变化（下拉 / 选择对齐触发器的路径）；最终宽 = max(下限, 内容固有宽)。
-    ///
-    /// `PanelWidth::Exact` 不参与内容增长（只更新下限；当前调用方不会在显式宽下调用本方法）。
-    ///
-    /// # Errors
-    /// 引擎建树错误。
     pub(crate) fn resize(&self, app: &mut App, width: f32) -> Result<(), EngineError> {
-        // `width` 是面板口径（含内边距），surface 扣掉两侧内边距（与 `open` 一致）。
         let min_width = (width.max(1.0) - MENU_PADDING * 2.0).max(1.0);
         {
             let mut state = self.inner.state.borrow_mut();
@@ -682,7 +521,6 @@ impl ItemPanel {
         Ok(())
     }
 
-    /// 写 surface 的宽度（只在变化时写，I3）。
     fn write_surface_width(&self, app: &mut App) -> Result<bool, EngineError> {
         let (window, surface, previous, target) = {
             let state = self.inner.state.borrow();
@@ -709,7 +547,6 @@ impl ItemPanel {
         Ok(true)
     }
 
-    /// 重建宽度测量节点（内容变了：`set_items` / `set_entries`）。
     fn reset_measure(&self, app: &mut App) -> Result<(), EngineError> {
         if self.inner.options.width != PanelWidth::AtLeast {
             return Ok(());
@@ -744,11 +581,6 @@ impl ItemPanel {
         Ok(())
     }
 
-    /// 量内容固有宽（surface 口径）。文本还没 shape 时返回 `None`（下一帧再量）。
-    ///
-    /// 逐**行段**量：label 内可能含显式换行（`\n` / `\r` / `\r\n`），换行处 caret 的 x 会重置，
-    /// 用「整段 caret 差」会把跨行距离算成宽度（审查 F29）。因此把每个 label 按换行切成行段，
-    /// 各行段分别取 caret 差，最终宽 = 最宽行段 + 固定附加宽。
     fn measure_content(&self, app: &App) -> Option<f32> {
         let (window, node) = {
             let state = self.inner.state.borrow();
@@ -774,13 +606,11 @@ impl ItemPanel {
             let start = tree.text_caret_rect(node, offset + segment_start).ok()?;
             let end = tree.text_caret_rect(node, offset + label.len()).ok()?;
             width = width.max((end.origin.x - start.origin.x).abs());
-            // 换行分隔符（最后一行之后没有）。
             offset += label.len() + 1;
         }
         Some(width + measure.extra + MENU_PADDING * 2.0)
     }
 
-    /// 按 `AtLeast` 口径把面板长到内容宽（只量一次，量完卸载测量节点）。
     fn apply_content_width(&self, app: &mut App) -> Result<bool, EngineError> {
         if self.inner.options.width != PanelWidth::AtLeast {
             return Ok(false);
@@ -792,7 +622,6 @@ impl ItemPanel {
             }
         }
         let Some(content_width) = self.measure_content(app) else {
-            // 文本 pass 还没跑（新节点首帧）：下一帧再量。
             return Ok(false);
         };
         let (window, node) = {
@@ -809,29 +638,24 @@ impl ItemPanel {
         self.write_surface_width(app)
     }
 
-    /// 关闭面板（有淡出时先淡出，由 `sync` 收尾）。
     pub(crate) fn close(&self, app: &mut App) -> bool {
         self.inner.overlay.close(app)
     }
 
-    /// 立即卸载面板。
     pub(crate) fn close_now(&self, app: &mut App) -> bool {
         let closed = self.inner.overlay.close_now(app);
         self.finish_close(app);
         closed
     }
 
-    /// 激活回调（点击行 / 回车激活高亮行；参数 = 行号）。
     pub(crate) fn on_activate(&self, callback: impl Fn(&mut App, usize) + 'static) {
         *self.inner.on_activate.borrow_mut() = Some(Rc::new(callback));
     }
 
-    /// 关闭回调（引擎侧被点击外部 / Esc 关闭也调用；每次打开最多一次）。
     pub(crate) fn on_close(&self, callback: impl Fn(&mut App) + 'static) {
         *self.inner.on_close.borrow_mut() = Some(Rc::new(callback));
     }
 
-    /// 设置高亮行（写列表选中集 + 保持可见）。
     pub(crate) fn set_highlighted(&self, app: &mut App, index: Option<usize>) {
         let index = index.filter(|index| !self.row_disabled(*index));
         let mut selection = Selection::new();
@@ -848,13 +672,11 @@ impl ItemPanel {
         }
     }
 
-    /// 高亮首个可激活行（打开时 / 内容重建后）。
     pub(crate) fn select_first(&self, app: &mut App) {
         let next = (0..self.row_count()).find(|index| !self.row_disabled(*index));
         self.set_highlighted(app, next);
     }
 
-    /// 激活一行：跳过禁用行，写高亮，再回调。
     pub(crate) fn activate(&self, app: &mut App, index: usize) -> bool {
         if self.row_disabled(index) || index >= self.row_count() {
             return false;
@@ -870,7 +692,6 @@ impl ItemPanel {
         }
     }
 
-    /// 焦点给 surface（打开后调用；浮层首帧还不可见时由 `sync` 重试）。
     pub(crate) fn focus(&self, app: &mut App) -> bool {
         let (Some(window), Some(surface)) = (
             self.inner.state.borrow().window,
@@ -881,16 +702,9 @@ impl ItemPanel {
         app.set_focus(window, Some(surface))
     }
 
-    /// 帧同步：浮层跟随锚点 / 外部关闭探测 / 列表行内容与行高 / 焦点声明。
-    ///
-    /// `claim_focus`：打开的子菜单存在时父面板不得把焦点抢回来。
-    ///
-    /// # Errors
-    /// 引擎列表同步错误。
     pub(crate) fn sync(&self, app: &mut App, claim_focus: bool) -> Result<bool, EngineError> {
         let mut changed = self.inner.overlay.sync(app);
         if self.inner.state.borrow().opened && !self.inner.overlay.is_open(app) {
-            // 引擎侧卸载（点击外部 / Esc / `Action::Dismiss`）：收尾一次。
             self.finish_close(app);
             return Ok(true);
         }
@@ -905,7 +719,6 @@ impl ItemPanel {
         Ok(changed)
     }
 
-    /// 焦点不在浮层内 ⇒ 给 surface（浮层揭晓前 `set_focus` 会失败，下一帧重试）。
     fn claim_focus(&self, app: &mut App) -> bool {
         let (Some(window), Some(surface)) = (
             self.inner.state.borrow().window,
@@ -930,7 +743,6 @@ impl ItemPanel {
         app.set_focus(window, Some(surface))
     }
 
-    /// 释放面板（先卸载浮层节点，再释放信号作用域与动作 handler）。
     pub(crate) fn release(&self, app: &mut App) -> usize {
         self.close_now(app);
         for action in [
@@ -947,7 +759,6 @@ impl ItemPanel {
         self.inner.list.release(app)
     }
 
-    /// 从命中节点向上找行容器，返回行号。
     fn row_at_node(&self, app: &App, window: WindowId, node: NodeId) -> Option<usize> {
         let rows = self.inner.list.mounted_rows(app);
         let tree = app.window(window)?.tree();
@@ -961,7 +772,6 @@ impl ItemPanel {
         None
     }
 
-    /// 注册 6 个动作的 handler（面板自有的动作身份）。
     fn register_actions(&self, app: &mut App) {
         let this = self.clone();
         app.on_action(self.inner.actions.up.clone(), move |ctx| {
@@ -981,7 +791,6 @@ impl ItemPanel {
         });
         let this = self.clone();
         app.on_action(self.inner.actions.activate.clone(), move |ctx| {
-            // 指针点击落不到 surface（行有更近的动作）：这里只处理键盘激活。
             if matches!(ctx.source(), ActionSource::Click { .. }) && ctx.hit().is_some() {
                 return;
             }
@@ -999,15 +808,11 @@ impl ItemPanel {
             let Some(index) = this.row_at_node(app, window, hit) else {
                 return;
             };
-            // 指针按下把焦点交给命中链上最近的**可聚焦**祖先（行命中壳已退出 Tab 序，落点是
-            // 列表视口）。键盘激活归 surface：这里把焦点收回面板键盘作用域，点过行之后
-            // Enter / Space 仍激活高亮行（审查 F25）。
             this.focus(app);
             this.activate(app, index);
         });
     }
 
-    /// 绑定作用域键（每次打开后绑到新的 surface 节点；节点卸载时引擎自动清除）。
     fn bind_keys(&self, app: &mut App, window: WindowId) -> PanelResult<()> {
         let Some(surface) = self.inner.state.borrow().surface else {
             return Ok(());
@@ -1032,7 +837,6 @@ impl ItemPanel {
         Ok(())
     }
 
-    /// 键盘移动高亮（`step` = ±1）；不环绕。
     fn move_highlight(&self, app: &mut App, step: isize) {
         let count = self.row_count();
         if count == 0 {
@@ -1050,7 +854,6 @@ impl ItemPanel {
         }
     }
 
-    /// `Home` / `End`：首个 / 末个可激活行。
     fn jump_highlight(&self, app: &mut App, last: bool) {
         let count = self.row_count();
         let next = if last {
@@ -1063,7 +866,6 @@ impl ItemPanel {
         }
     }
 
-    /// 几何回写（内容变化 / 宽度变化后）。
     fn apply_geometry(&self, app: &mut App) -> Result<(), EngineError> {
         let (window, surface, width) = {
             let state = self.inner.state.borrow();
@@ -1100,7 +902,6 @@ impl ItemPanel {
         Ok(())
     }
 
-    /// 关闭收尾（引擎卸载后的状态 / 列表选中集 / 关闭回调）。
     fn finish_close(&self, app: &mut App) {
         let was_opened = {
             let mut state = self.inner.state.borrow_mut();
@@ -1134,29 +935,18 @@ impl fmt::Debug for ItemPanel {
     }
 }
 
-// ── 菜单条目模型 ──────────────────────────────────────────────────────────
-
-/// 一个可激活的菜单条目（旧 `MenuItemAction` / `MenuItemIconAction` 的并集）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuAction {
-    /// 条目 id（回调里报告给调用方）。
     pub id: SmolStr,
-    /// 显示文本（同时是可访问名）。
     pub label: SmolStr,
-    /// 图标（画在文本左侧）。
     pub icon: Option<IconKind>,
-    /// 快捷键提示（右对齐的弱化文本；旧实现没有这个字段）。
     pub shortcut: Option<SmolStr>,
-    /// 禁用。
     pub disabled: bool,
-    /// 危险条目（前景走 `StatusDangerBase`）。
     pub danger: bool,
-    /// 勾选态（`None` = 非勾选型条目；选择器的多选条目用它）。
     pub checked: Option<bool>,
 }
 
 impl MenuAction {
-    /// 文本条目。
     #[must_use]
     pub fn new(id: impl Into<SmolStr>, label: impl Into<SmolStr>) -> Self {
         Self {
@@ -1170,35 +960,30 @@ impl MenuAction {
         }
     }
 
-    /// 图标。
     #[must_use]
     pub fn icon(mut self, icon: IconKind) -> Self {
         self.icon = Some(icon);
         self
     }
 
-    /// 快捷键提示。
     #[must_use]
     pub fn shortcut(mut self, shortcut: impl Into<SmolStr>) -> Self {
         self.shortcut = Some(shortcut.into());
         self
     }
 
-    /// 禁用。
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
     }
 
-    /// 危险条目。
     #[must_use]
     pub fn danger(mut self, danger: bool) -> Self {
         self.danger = danger;
         self
     }
 
-    /// 勾选态。
     #[must_use]
     pub fn checked(mut self, checked: bool) -> Self {
         self.checked = Some(checked);
@@ -1206,21 +991,15 @@ impl MenuAction {
     }
 }
 
-/// 子菜单（旧实现没有；挂一层嵌套浮层）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuSubmenu {
-    /// 显示文本。
     pub label: SmolStr,
-    /// 图标。
     pub icon: Option<IconKind>,
-    /// 禁用（不打开）。
     pub disabled: bool,
-    /// 子条目。
     pub entries: Vec<MenuEntry>,
 }
 
 impl MenuSubmenu {
-    /// 子菜单。
     #[must_use]
     pub fn new(label: impl Into<SmolStr>, entries: impl IntoIterator<Item = MenuEntry>) -> Self {
         Self {
@@ -1231,14 +1010,12 @@ impl MenuSubmenu {
         }
     }
 
-    /// 图标。
     #[must_use]
     pub fn icon(mut self, icon: IconKind) -> Self {
         self.icon = Some(icon);
         self
     }
 
-    /// 禁用。
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
@@ -1246,21 +1023,15 @@ impl MenuSubmenu {
     }
 }
 
-/// 菜单条目（旧 `MenuItem` 5 个变体的引擎化版本）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MenuEntry {
-    /// 可激活条目。
     Action(MenuAction),
-    /// 分组标题（不可交互）。
     Group(SmolStr),
-    /// 分隔线。
     Separator,
-    /// 子菜单。
     Submenu(MenuSubmenu),
 }
 
 impl MenuEntry {
-    /// 这个条目是否可激活（键盘导航 / 点击目标）。
     #[must_use]
     pub fn is_actionable(&self) -> bool {
         match self {
@@ -1271,13 +1042,10 @@ impl MenuEntry {
     }
 }
 
-/// 面板语义（a11y 角色对）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MenuMode {
-    /// 菜单：`Menu` + `MenuItem`（默认）。
     #[default]
     Menu,
-    /// 列表盒：`List` + `ListBoxOption`（选择器的面板）。
     ListBox,
 }
 
@@ -1288,8 +1056,6 @@ impl MenuMode {
                 panel: Some(A11yRole::Menu),
                 row: A11yRole::MenuItem,
             },
-            // `ListBox` 角色引擎尚未提供（E15 候选）：包装不声明角色，集合语义由内层
-            // E9 虚拟列表容器（恒 `List`）承担，避免包装 + 内层双 `List`。
             Self::ListBox => PanelRoles {
                 panel: None,
                 row: A11yRole::ListBoxOption,
@@ -1298,26 +1064,16 @@ impl MenuMode {
     }
 }
 
-/// 菜单参数。
 #[derive(Clone, Debug, PartialEq)]
 pub struct MenuOptions {
-    /// 尺寸档。
     pub size: UnifiedSize,
-    /// 面板宽度（逻辑像素；旧菜单宽度来自外层 dropdown / context menu）。
     pub width: f32,
-    /// 列表视口最大高度（超出滚动）。
     pub max_height: f32,
-    /// 面板语义。
     pub mode: MenuMode,
-    /// 根面板相对锚点的定位。
     pub placement: Placement,
-    /// 与锚点的间隙。
     pub gap: f32,
-    /// 层带。
     pub band: Band,
-    /// 面板可访问名。
     pub label: Option<SmolStr>,
-    /// 悬停打开子菜单的延迟（`ZERO` = 立即）。
     pub submenu_delay: Duration,
 }
 
@@ -1338,42 +1094,36 @@ impl Default for MenuOptions {
 }
 
 impl MenuOptions {
-    /// 面板宽度。
     #[must_use]
     pub fn width(mut self, width: f32) -> Self {
         self.width = width;
         self
     }
 
-    /// 视口最大高度。
     #[must_use]
     pub fn max_height(mut self, max_height: f32) -> Self {
         self.max_height = max_height;
         self
     }
 
-    /// 面板语义。
     #[must_use]
     pub fn mode(mut self, mode: MenuMode) -> Self {
         self.mode = mode;
         self
     }
 
-    /// 面板可访问名。
     #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
         self
     }
 
-    /// 层带。
     #[must_use]
     pub fn band(mut self, band: Band) -> Self {
         self.band = band;
         self
     }
 
-    /// 悬停打开子菜单的延迟。
     #[must_use]
     pub fn submenu_delay(mut self, delay: Duration) -> Self {
         self.submenu_delay = delay;
@@ -1381,16 +1131,11 @@ impl MenuOptions {
     }
 }
 
-// ── 菜单 ──────────────────────────────────────────────────────────────────
-
-/// 菜单激活报告。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuActivation {
-    /// 条目 id。
     pub id: SmolStr,
 }
 
-/// 行的种类（条目下标 + 语义）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowKind {
     Action(usize),
@@ -1399,7 +1144,6 @@ enum RowKind {
     Separator,
 }
 
-/// 激活 / 关闭回调（整条菜单链共享一份）。
 #[derive(Default)]
 struct MenuSink {
     on_activate: RefCell<Option<Rc<dyn Fn(&mut App, MenuActivation)>>>,
@@ -1411,13 +1155,11 @@ struct OpenSubmenu {
     menu: Menu,
 }
 
-/// 菜单句柄（`Rc` 浅拷贝）。
 #[derive(Clone)]
 pub struct Menu {
     inner: Rc<MenuInner>,
 }
 
-/// 建菜单的公共参数（构造函数参数过多时收成一份）。
 struct MenuSeed {
     theme: ThemeHandle,
     layer: Layer,
@@ -1453,14 +1195,10 @@ struct MenuInner {
     window: Cell<Option<WindowId>>,
     right_action: Action,
     left_action: Action,
-    /// 子菜单是否允许声明焦点（键盘打开的层级为 `true`，悬停打开保持父焦点）。
     claim_focus: Cell<bool>,
 }
 
 impl Menu {
-    /// 建菜单（关闭态）。
-    ///
-    /// `entries` 可以在之后用 [`Menu::set_entries`] 换一批（面板打开时会重建行）。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -1514,7 +1252,6 @@ impl Menu {
                 max_height: options.max_height,
                 row_height: options.size.h(),
                 band: options.band,
-                // 子菜单非模态：父面板的键盘保持可用（悬停打开不抢焦点）。
                 modal: root,
                 placement: options.placement,
                 gap: options.gap,
@@ -1555,16 +1292,11 @@ impl Menu {
         menu
     }
 
-    /// 菜单键（调试 id / 动作前缀）。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 
-    /// 换一批条目（已打开时重建行；关闭子菜单）。
-    ///
-    /// # Errors
-    /// 引擎虚拟列表失效。
     pub fn set_entries(
         &self,
         app: &mut App,
@@ -1576,57 +1308,45 @@ impl Menu {
         Ok(())
     }
 
-    /// 条目快照。
     #[must_use]
     pub fn entries(&self) -> Rc<Vec<MenuEntry>> {
         self.inner.entries.borrow().clone()
     }
 
-    /// 面板打开状态信号。
     #[must_use]
     pub fn open_state(&self) -> Signal<bool> {
         self.inner.panel.open_state()
     }
 
-    /// 是否打开。
     #[must_use]
     pub fn is_open(&self, app: &App) -> bool {
         self.inner.panel.is_open(app)
     }
 
-    /// 浮层面板节点（内容建在这里）。
     #[must_use]
     pub fn panel_node(&self) -> Option<NodeId> {
         self.inner.panel.overlay().panel_node()
     }
 
-    /// surface（键盘作用域）节点。
     #[must_use]
     pub fn surface_node(&self) -> Option<NodeId> {
         self.inner.panel.surface_node()
     }
 
-    /// 引擎浮层包装节点（同带归属判定用：`Layer::Entry::node` 是这个节点而不是面板节点）。
     pub(crate) fn overlay_node(&self) -> Option<NodeId> {
         self.inner.panel.overlay().overlay_node()
     }
 
-    /// 行数（含分组 / 分隔线）。
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.inner.rows.borrow().len()
     }
 
-    /// 高亮行。
     #[must_use]
     pub fn highlighted(&self, app: &App) -> Option<usize> {
         self.inner.panel.highlighted(app)
     }
 
-    /// 打开菜单（根菜单由调用方给锚点；子菜单由父菜单自己开）。
-    ///
-    /// # Errors
-    /// 浮层参数非法 / 引擎建树失败。
     pub fn open(
         &self,
         app: &mut App,
@@ -1645,10 +1365,6 @@ impl Menu {
         Ok(opened)
     }
 
-    /// 打开菜单并让高亮停在指定条目 id 上（右键菜单用）。
-    ///
-    /// # Errors
-    /// 同 [`Menu::open`]。
     pub fn open_at(
         &self,
         app: &mut App,
@@ -1665,34 +1381,26 @@ impl Menu {
         Ok(opened)
     }
 
-    /// 关闭菜单（先关子菜单；有淡出时由 `sync` 收尾）。
     pub fn close(&self, app: &mut App) -> bool {
         self.close_submenus(app);
         self.inner.panel.close(app)
     }
 
-    /// 立即关闭菜单。
     pub fn close_now(&self, app: &mut App) -> bool {
         self.close_submenus(app);
         self.inner.panel.close_now(app)
     }
 
-    /// 激活回调（条目被点击 / 回车激活；报告后整条菜单链关闭）。
     pub fn on_activate(self, callback: impl Fn(&mut App, MenuActivation) + 'static) -> Self {
         *self.inner.sink.on_activate.borrow_mut() = Some(Rc::new(callback));
         self
     }
 
-    /// 关闭回调（点击外部 / Esc / 选中条目都算；每次打开最多一次）。
     pub fn on_close(self, callback: impl Fn(&mut App) + 'static) -> Self {
         *self.inner.sink.on_close.borrow_mut() = Some(Rc::new(callback));
         self
     }
 
-    /// 帧同步：浮层 / 子菜单 / 悬停开子菜单。
-    ///
-    /// # Errors
-    /// 引擎列表同步错误。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let has_submenu = !self.inner.submenus.borrow().is_empty();
         let claim = self.inner.claim_focus.get() && !has_submenu;
@@ -1716,7 +1424,6 @@ impl Menu {
         Ok(changed)
     }
 
-    /// 释放菜单（关闭 + 摘 handler + 释放信号作用域）。
     pub fn release(&self, app: &mut App) -> usize {
         self.close_now(app);
         if let Some(timer) = self.inner.submenu_timer.take() {
@@ -1738,9 +1445,6 @@ impl Menu {
         released
     }
 
-    // ── 内部 ──
-
-    /// 把条目解释成行 + 建行内容 / a11y 回调，写进面板。
     fn install_content(&self, app: &mut App) {
         let entries = self.inner.entries.borrow().clone();
         let mut rows = Vec::with_capacity(entries.len());
@@ -1907,7 +1611,6 @@ impl Menu {
         );
     }
 
-    /// 面板激活 / 关闭回调。
     fn install_handlers(&self) {
         let this = self.clone();
         self.inner.panel.on_activate(move |app, row| {
@@ -1920,7 +1623,6 @@ impl Menu {
         });
     }
 
-    /// 行被激活（点击 / 回车）：子菜单开子层，动作条目上报 + 关链。
     fn handle_row(&self, app: &mut App, row: usize) {
         let kind = self.inner.rows.borrow().get(row).copied();
         match kind {
@@ -1956,7 +1658,6 @@ impl Menu {
         }
     }
 
-    /// 关闭本层并向上逐层关闭（选中条目 / `←` 的收尾语义）。
     fn close_chain(&self, app: &mut App) {
         self.inner.panel.close_now(app);
         let parent = self
@@ -1969,7 +1670,6 @@ impl Menu {
         }
     }
 
-    /// 打开子菜单（`row` 面板行号 / `index` 条目下标）。
     fn open_submenu(&self, app: &mut App, row: usize, index: usize, focus: bool) {
         if self
             .inner
@@ -1997,8 +1697,6 @@ impl Menu {
         let mut options = self.inner.options.clone();
         options.placement = Placement::RIGHT_START;
         options.gap = SUBMENU_GAP;
-        // 子菜单继承父菜单的层带：context menu（`ContextMenu`）的子菜单必须仍在父之上，
-        // 写死 `Popup` 会让父面板（ContextMenu 带）反盖子菜单，Esc 也先关父（审查 P1-1）。
         let child = Menu::build(
             app,
             format_smolstr!("{}:sub:{row}", self.inner.key),
@@ -2034,7 +1732,6 @@ impl Menu {
         }
     }
 
-    /// 关闭一层子菜单（先关更深层）。
     fn close_submenus(&self, app: &mut App) {
         let submenus: Vec<OpenSubmenu> = self.inner.submenus.borrow_mut().drain(..).collect();
         for open in submenus.into_iter().rev() {
@@ -2047,7 +1744,6 @@ impl Menu {
         self.inner.last_hovered.set(None);
     }
 
-    /// 子菜单被引擎关闭（`Esc` / 点击外部）后从表里摘掉。
     fn retain_open_submenus(&self, app: &mut App) {
         let mut stale: Vec<OpenSubmenu> = Vec::new();
         {
@@ -2066,7 +1762,6 @@ impl Menu {
         }
     }
 
-    /// 悬停行变化 ⇒ 延迟打开子菜单 / 关闭当前子菜单。
     fn sync_hover(&self, app: &mut App) -> Result<bool, EngineError> {
         let Some(window) = self.inner.window.get() else {
             return Ok(false);
@@ -2110,7 +1805,6 @@ impl Menu {
         Ok(true)
     }
 
-    /// `→` 打开 / 进入子菜单，`←` 关闭本层。
     fn bind_extra_keys(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let Some(surface) = self.inner.panel.surface_node() else {
             return Ok(());
@@ -2159,7 +1853,6 @@ impl Menu {
         Ok(())
     }
 
-    /// 图标资源表（行内容建树时读）。
     fn icon_snapshot(&self) -> IconSnapshot {
         self.inner.icons.snapshot()
     }
@@ -2191,7 +1884,6 @@ impl Menu {
         Ok(())
     }
 
-    /// 条目 id → 面板行号。
     fn row_of(&self, id: &str) -> Option<usize> {
         let entries = self.inner.entries.borrow().clone();
         let rows = self.inner.rows.borrow();
@@ -2208,7 +1900,6 @@ impl Menu {
     }
 }
 
-/// 图标资源快照（行内容建树时读；`IconCache` 的只读视图）。
 #[derive(Clone, Default)]
 pub(crate) struct IconSnapshot {
     entries: Vec<(IconKind, f32, ResourceId)>,
@@ -2223,15 +1914,8 @@ impl IconSnapshot {
     }
 }
 
-/// 宽度测量文本的布局宽度：足够宽 ⇒ 每行标签不被软换行（行间用 `\n` 硬换行）；节点本身出流 +
-/// 裁剪在 surface 外，不参与绘制。
 const MEASURE_WIDTH: f32 = 4096.0;
 
-/// 建宽度测量文本（`PanelWidth::AtLeast`）：行文本用 `\n` 连接，布局后逐行段 caret 偏移差 = 固有宽。
-///
-/// label 自身带显式换行（`\n` / `\r` / `\r\n`）时保留原字符 —— 文本长度与字节下标必须与
-/// [`PanelMeasure::labels`] 一致（`measure_content` 按字节偏移取 caret）；换行在量宽时按行段
-/// 切分处理，不参与宽度累计。
 fn build_measure_node(
     tree: &mut NodeTree,
     surface: NodeId,
@@ -2265,7 +1949,6 @@ fn build_measure_node(
     .build(tree, surface)
 }
 
-/// 图标槽（有图标则画，没有也画占位，让标签左对齐）。
 pub(crate) fn build_icon_slot(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2296,7 +1979,6 @@ pub(crate) fn build_icon_slot(
     }
 }
 
-/// 条目文本（`flex_1` + 省略号，压不进面板宽度时截断）。
 fn build_label(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2316,7 +1998,6 @@ fn build_label(
         .map(|_| ())
 }
 
-/// 快捷键提示（右对齐、弱化）。
 fn build_shortcut(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2338,7 +2019,6 @@ fn build_shortcut(
     .map(|_| ())
 }
 
-/// 勾选标记（勾选型条目）。
 fn build_check(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2360,7 +2040,6 @@ fn build_check(
     .map(|_| ())
 }
 
-/// 条目前景角色（危险 / 禁用 / 常规）。
 fn action_foreground(action: &MenuAction) -> Role {
     if action.disabled {
         Role::FgDisabled
@@ -2373,7 +2052,6 @@ fn action_foreground(action: &MenuAction) -> Role {
 
 #[cfg(test)]
 mod tests {
-    //! 引擎树上的行为：打开 / 定位翻边 / 键盘高亮 / 激活 / 关闭语义 / 子菜单 / 虚拟化 / a11y / I3。
 
     use std::{
         cell::{Cell, RefCell},
@@ -2401,7 +2079,6 @@ mod tests {
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
-    /// 锚点按钮的几何（窗口中部，上下都有空间）。
     const ANCHOR: Rect = Rect::new(300.0, 200.0, 120.0, 32.0);
 
     struct Harness {
@@ -2548,7 +2225,6 @@ mod tests {
             )
         }
 
-        /// 根的子节点数（浮层是 root 的子节点：菜单 / 子菜单各一个）。
         fn root_children(&self) -> Vec<NodeId> {
             self.app
                 .app()
@@ -2611,7 +2287,6 @@ mod tests {
     #[test]
     fn a_menu_near_the_bottom_flips_above_its_anchor() {
         let mut harness = Harness::new();
-        // 把锚点挪到窗口底部（TestApp 默认 800×600）。
         let root = harness
             .app
             .app()
@@ -2862,7 +2537,6 @@ mod tests {
         let snapshot = full_a11y(&mut harness.app);
 
         let panel = menu.panel_node().expect("面板");
-        // E12 之后组件角色落在引擎浮层**包装节点**上（P2-4b3）；面板本身保持 GenericContainer。
         let wrapper = overlay_wrapper(harness.app.app(), harness.window, panel);
         let wrapper_record = snapshot.node_for(wrapper).expect("包装节点在 a11y 树里");
         assert_eq!(wrapper_record.role, A11yRole::Menu);
@@ -2917,7 +2591,6 @@ mod tests {
 
     #[test]
     fn a_menu_opened_from_a_modal_window_keeps_the_scope_it_was_opened_in() {
-        // E12：菜单是模态浮层，背景节点在它开着时不接收悬停。
         let mut harness = Harness::new();
         let menu = harness.menu(entries(), options());
         harness.open(&menu);
@@ -2961,7 +2634,6 @@ mod tests {
         rows
     }
 
-    /// `MenuMode::ListBox` 的 a11y 角色对（选择器面板；本模块只验证角色映射）。
     #[test]
     fn the_list_box_mode_declares_list_and_list_box_option_roles() {
         let mut harness = Harness::new();

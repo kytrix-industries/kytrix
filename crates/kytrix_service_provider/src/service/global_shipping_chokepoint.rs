@@ -1,43 +1,21 @@
-//! AIS snapshots and deltas received from the Kytrix service.
-//!
-//! The API sends one snapshot (`keyframe`) when a remote subscription starts and only
-//! deltas after it. The session keeps the resulting picture for each area so a second
-//! pane can start from it without making the server send another full snapshot. A delta
-//! that does not continue the picture is not guessed at: the area is reset and its
-//! subscribers fail with [`ResyncGap`]'s transport equivalent, and the next subscription
-//! takes a fresh snapshot. The proto envelope stays at the protocol boundary, and the
-//! only exception is the area a subscription is keyed by.
-
 use ahash::AHashMap;
 use kytrix_proto::types::v1::GlobalShippingChokepointEvent;
 use smol_str::SmolStr;
 
-/// The area one AIS subscription covers.
 pub type GlobalShippingChokepointArea = kytrix_proto::types::v1::GlobalShippingChokepointArea;
 
-/// One AIS push for an area.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobalShippingChokepointUpdate {
-    /// The API process the delta was produced by. A new epoch means every sequence the
-    /// client holds belongs to a process that no longer exists.
     pub epoch: u64,
-    /// Whether `ships` and `positions` are the whole picture.
     pub keyframe: bool,
-    /// The sequence this push assigns.
     pub sequence: u64,
-    /// The sequence the server expects the client to have applied before this push.
     pub base: u64,
-    /// The static part of every vessel the push describes.
     pub ships: Vec<GlobalShippingChokepointShip>,
-    /// The positions the push describes.
     pub positions: Vec<GlobalShippingChokepointPosition>,
-    /// The MMSIs that left the area.
     pub removed: Vec<u32>,
-    /// The server's generation time in milliseconds; `0` means it holds no state yet.
     pub timestamp: i64,
 }
 
-/// The low-frequency part of one vessel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobalShippingChokepointShip {
     pub mmsi: u32,
@@ -56,33 +34,22 @@ pub struct GlobalShippingChokepointShip {
     pub eta_day: u32,
     pub eta_hour: u32,
     pub eta_minute: u32,
-    /// The source's last static report, in Unix milliseconds; `0` means unknown. It is
-    /// the static record's own time, not the position's `last_update`.
     pub static_updated_at: i64,
 }
 
-/// The high-frequency part of one vessel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GlobalShippingChokepointPosition {
     pub mmsi: u32,
-    /// Latitude in 1e-6 degrees.
     pub latitude: i32,
-    /// Longitude in 1e-6 degrees.
     pub longitude: i32,
-    /// Speed over ground in 0.1 knots; `1023` is unavailable.
     pub sog: u32,
-    /// Course over ground in 0.1 degrees; `3600` is unavailable.
     pub cog: u32,
-    /// True heading in degrees; `511` is unavailable.
     pub heading: u32,
-    /// AIS navigation status; `15` is undefined.
     pub nav_status: u32,
-    /// The server's receipt time of this position report in milliseconds.
     pub last_update: i64,
 }
 
 impl GlobalShippingChokepointUpdate {
-    /// Converts one proto delta into the domain update.
     pub fn from_proto(delta: GlobalShippingChokepointEvent) -> Self {
         Self {
             epoch: delta.epoch,
@@ -132,11 +99,6 @@ impl GlobalShippingChokepointUpdate {
     }
 }
 
-/// The complete picture the session holds for one area.
-///
-/// A snapshot whose `timestamp` is zero means the API has not established a baseline yet;
-/// that is "no state", not "the strait is empty". The wire uses the timestamp as that
-/// sentinel, and the sequence is zero with it.
 #[derive(Debug, Default)]
 pub(crate) struct GlobalShippingChokepointState {
     epoch: u64,
@@ -146,15 +108,10 @@ pub(crate) struct GlobalShippingChokepointState {
     positions: AHashMap<u32, GlobalShippingChokepointPosition>,
 }
 
-/// A delta did not continue the picture the session holds.
-///
-/// The area's state is no longer trustworthy, so every subscriber of it fails and the
-/// remote topic is dropped. The next subscription starts with a fresh API snapshot.
 #[derive(Debug)]
 pub(crate) struct ResyncGap;
 
 impl GlobalShippingChokepointState {
-    /// Applies one push, or reports that it cannot be applied.
     pub(crate) fn apply(
         &mut self,
         update: &GlobalShippingChokepointUpdate,
@@ -193,10 +150,6 @@ impl GlobalShippingChokepointState {
         Ok(())
     }
 
-    /// A snapshot for a pane that joins an area the session already follows.
-    ///
-    /// Sorted by MMSI so the same picture always produces the same frame, independent of
-    /// the hash map's iteration order.
     pub(crate) fn snapshot(&self) -> GlobalShippingChokepointUpdate {
         let mut ships = self.ships.values().cloned().collect::<Vec<_>>();
         ships.sort_unstable_by_key(|entry| entry.mmsi);
@@ -330,7 +283,6 @@ mod tests {
             .unwrap();
 
         assert!(state.apply(&delta(4, 5, Vec::new())).is_err());
-        // The rejected delta neither changed the picture nor moved the baseline.
         assert_eq!(state.snapshot().sequence, 5);
         assert_eq!(state.snapshot().positions, vec![position(1, 10)]);
     }

@@ -1,42 +1,3 @@
-//! The market participants entry the title bar mounts: the venue list this build speaks, and
-//! the one action that loads each of them.
-//!
-//! # What it owns
-//!
-//! The list of venues, and what each of them is doing. The list is the *venue list* — what
-//! [`VenueDirectory::venues`] answers — so it is the same whether or not anything is loaded,
-//! and whether a venue is loaded is read from the directory every time the rows are built
-//! rather than remembered. The activity is this menu's own memory: a load it started and has
-//! not heard the end of, or the failure the last one reported. Nothing is persisted: loading a
-//! venue is something this run did, not a setting.
-//!
-//! # What it does not own
-//!
-//! The venues themselves. Committing a venue's scopes, catalogs and metadata is the
-//! directory's `load`, and this menu is its only caller outside the composition root: the
-//! user's press is the one event that makes the program talk to a market. The load runs on
-//! the engine's runtime and reports back through a channel, because the frame thread has no
-//! reactor to drive a request.
-//!
-//! A failure is reported twice and never hidden: the row keeps saying the venue failed to
-//! load, and the reason itself is opened once in an alert. A success says nothing — the row
-//! already reads "refresh" because the venue is in the directory's loaded venues now.
-//!
-//! # The picture, not the state machine
-//!
-//! The panel's rows are rebuilt only when what they are drawn from moved: the language, which
-//! venues are loaded, and what each venue is doing. A frame in which none of those moved
-//! builds nothing and writes nothing — the steady state is zero frames, as it is for a
-//! widget.
-//!
-//! # Release
-//!
-//! [`MarketParticipants::release`] cancels the loads still in flight, closes and releases the
-//! panel overlay and any alert, releases every kit component the rows and the trigger were
-//! built from, and gives the menu's signal scope back. The trigger node itself belongs to the
-//! caller's title bar: the caller removes it first, then releases the menu (the engine's
-//! teardown order is "remove the subtree, then release the scope", E16).
-
 use std::{
     cell::RefCell,
     rc::{Rc, Weak},
@@ -88,108 +49,55 @@ use crate::{
     host::{MarketParticipantsHost, VenueDirectory},
 };
 
-/// The instance prefix of every kit key and node id this menu registers.
-///
-/// One menu appends its own signal-scope index, so two title bars in one window own two
-/// identities. A constant key would make the later menu replace the earlier one's handlers:
-/// `App::on_action` replaces a handler of the same `Action`, and every kit component derives
-/// its actions from its key.
 const KEY_BASE: &str = "market-participants";
 
-/// The panel's width, surface padding included.
-///
-/// It is a fixed width because the panel is a column of venue lines with an action at the end
-/// of each of them: a panel that resized as a load reported itself would move the buttons
-/// under the pointer that opened it.
 const PANEL_WIDTH: f32 = 280.0;
 
-/// The panel surface's own padding (`OverlaySurface::menu`), which the content width excludes.
 const SURFACE_PADDING: f32 = 4.0;
 
-/// The width the panel's own content column takes.
 const PANEL_CONTENT_WIDTH: f32 = PANEL_WIDTH - 2.0 * SURFACE_PADDING;
 
-/// The mark inside the trigger, drawn at the size the title bar's other marks take.
 const TRIGGER_ICON_SIZE: f32 = 16.0;
 
-/// The room the mark at the left of a row's action takes.
-///
-/// It is stated by this menu because neither thing the mark holds sizes itself: a [`Spinner`]
-/// fills whatever box it is drawn in, and the connection icon is drawn at this size. One box
-/// for both is what keeps a row's action where it is as the row's state changes.
 const MARK_SIZE: f32 = 14.0;
 
-/// How wide a row's action is.
-///
-/// The action is one control whatever a venue's state makes of it — the load a venue nothing
-/// has loaded offers, the refresh a loaded one does — and it states its own width so that the
-/// two labels are drawn in the same box: a control that resized as a load reported itself
-/// would move the button under the pointer that pressed it.
 const ACTION_WIDTH: f32 = 64.0;
 
-/// What one venue's row is doing, as this menu remembers it.
-///
-/// There is no `Idle`: a venue nothing is happening to is not doing anything, which is what
-/// having no entry here says.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Activity {
-    /// A load is in flight for this venue.
     Loading,
-    /// The last load failed: the line the row keeps under the venue's name.
-    ///
-    /// The state is the whole of what is remembered. The sentence the line reads is read
-    /// when the row is *drawn* rather than when the failure was reported, because it names
-    /// the venue: a sentence resolved at report time would keep the language it was reported
-    /// in, while the row it sits under would name the same venue in the language the
-    /// interface is showing now. What the failure actually said is a fact about that moment
-    /// and is stated in full by the alert that was raised when it happened.
     Failed,
 }
 
-/// One line of the panel: a venue this build speaks, and whether the directory committed it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VenueRow {
     venue: VenueId,
     loaded: bool,
 }
 
-/// What the panel's rows are currently drawn from.
-///
-/// The rows are rebuilt when this changes and only then: a language switch, a load that
-/// committed, a load that started or failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PanelSignature {
     language: LanguageCode,
     rows: Vec<(VenueId, bool, Option<Activity>)>,
 }
 
-/// What one load reported back to the frame thread.
 struct LoadOutcome {
     venue: VenueId,
     result: Result<(), VenueLoadError>,
 }
 
-/// The built pieces of one row, kept for `sync` and `release`.
 #[derive(Default)]
 struct RowComponents {
     button: Option<Button>,
     spinner: Option<Spinner>,
 }
 
-/// The market participants entry the title bar mounts.
-///
-/// The handle is a shallow `Rc`: the trigger's click callback upgrades the inner state to
-/// toggle the panel, so callbacks never keep the menu alive past [`Self::release`].
 #[derive(Clone)]
 pub struct MarketParticipants {
     inner: Rc<RefCell<MenuInner>>,
 }
 
 impl MarketParticipants {
-    /// Builds the menu the application mounts.
-    ///
-    /// Nothing is built, loaded or reported here: `build` mounts the trigger, and a load starts
-    /// when the user presses a row's action.
     pub fn new(host: MarketParticipantsHost, app: &mut App) -> Self {
         let scope = app.signal_scope();
         let key = format_smolstr!("{KEY_BASE}@{}", scope.index());
@@ -227,20 +135,16 @@ impl MarketParticipants {
         menu
     }
 
-    /// The instance prefix every kit key and node id is derived from.
     #[must_use]
     pub fn key(&self) -> SmolStr {
         self.inner.borrow().key.clone()
     }
 
-    /// The trigger node, once [`Self::build`] ran.
     #[must_use]
     pub fn trigger_node(&self) -> Option<NodeId> {
         self.inner.borrow().trigger_node
     }
 
-    /// Whether the venue panel is open (the engine may have closed it; this follows the
-    /// handle's state, which [`Self::sync`] brings in step with the engine).
     #[must_use]
     pub fn is_open(&self, app: &App) -> bool {
         self.inner
@@ -250,14 +154,6 @@ impl MarketParticipants {
             .is_some_and(|overlay| overlay.is_open(app))
     }
 
-    /// Mounts the trigger under `parent`, and the panel and alert machinery that belongs to it.
-    ///
-    /// The trigger is the only node this menu builds in the caller's tree: the panel and the
-    /// alert are overlays the menu owns and releases itself.
-    ///
-    /// # Errors
-    /// [`MenuError`] when the trigger or its icon cannot be built (a closed window, a stale
-    /// parent node, a missing asset).
     pub fn build(
         &mut self,
         app: &mut App,
@@ -267,63 +163,39 @@ impl MarketParticipants {
         self.inner.borrow_mut().build(app, window, parent)
     }
 
-    /// Runs one frame of the menu: drains what the loads reported, follows the language,
-    /// keeps the trigger, the panel and any alert in step with their state.
-    ///
-    /// The caller runs this from the application's frame hook, before the frame is drawn
-    /// (the same place a widget's `sync` runs). A steady frame does nothing.
-    ///
-    /// # Errors
-    /// [`MenuError`] when an overlay or a dialog cannot be synchronised (a closed window, a
-    /// stale node).
     pub fn sync(&mut self, app: &mut App) -> Result<(), MenuError> {
         self.inner.borrow_mut().sync(app)
     }
 
-    /// Cancels what is in flight and releases every kit component, overlay and signal scope
-    /// the menu owns. Idempotent.
-    ///
-    /// The caller removes the trigger's node first: this only gives back what it holds.
     pub fn release(&mut self, app: &mut App) {
         self.inner.borrow_mut().release(app);
     }
 
-    /// Cancels one load still in flight, settling its row back to the action it offered
-    /// (test read point for a load the directory itself stopped).
     #[cfg(test)]
     pub(crate) fn cancel_load(&mut self, venue: VenueId) {
         self.inner.borrow().host.directory().cancel_load(&venue);
     }
 
-    /// The venue rows the panel is currently drawn from (test read point).
     #[cfg(test)]
     fn rows(&self) -> Vec<VenueRow> {
         self.inner.borrow().rows.clone()
     }
 
-    /// How many loads this menu is driving (test read point, one per venue).
     #[cfg(test)]
     pub(crate) fn pending_loads(&self) -> usize {
         self.inner.borrow().pending.len()
     }
 
-    /// Runs one row's action, for a press a frame can deliver before the row it was drawn from
-    /// is replaced (test read point for the re-entrancy guard).
     #[cfg(test)]
     pub(crate) fn start_load(&mut self, app: &mut App, venue: VenueId) -> Result<(), MenuError> {
         self.inner.borrow_mut().start_load(app, venue)
     }
 }
 
-/// The state behind one menu.
 struct MenuInner {
     host: MarketParticipantsHost,
-    /// The instance prefix of every kit key and node id.
     key: SmolStr,
-    /// The menu's signal scope: the accessibility label signal lives here, and releasing it
-    /// is what tells the menu's signals from a rebuilt menu's.
     scope: SignalScope,
-    /// The trigger's accessible name, rewritten when the language moves.
     a11y_label: Signal<SmolStr>,
     language: LanguageCode,
     rows: Vec<VenueRow>,
@@ -336,18 +208,12 @@ struct MenuInner {
     trigger_node: Option<NodeId>,
     tooltip: Option<Tooltip>,
     overlay: Option<Overlay>,
-    /// The content column inside the panel's own surface.
     rows_root: Option<NodeId>,
-    /// The row action buttons, kept so `release` / rebuild hands their handlers and scopes back.
     buttons: Vec<Button>,
-    /// The progress marks of the rows in flight.
     spinners: Vec<Spinner>,
-    /// What the panel's content was last built from; `None` = it must be built again.
     panel_signature: Option<PanelSignature>,
-    /// The alert a failed load raised, while it is open.
     alert: Option<Dialog>,
     released: bool,
-    /// A weak handle to this menu, for the trigger and row callbacks.
     self_weak: Weak<RefCell<MenuInner>>,
 }
 
@@ -358,9 +224,6 @@ impl MenuInner {
         }
         self.window = Some(window);
 
-        // The trigger is the title bar's icon-only control: the panel it opens names every
-        // venue, so the trigger itself has nothing to say but the mark, and the label is left
-        // to the tooltip and the accessible name.
         let theme = self.host.theme().clone();
         let trigger_key = format_smolstr!("{}:trigger", self.key);
         let weak = self.self_weak.clone();
@@ -386,9 +249,6 @@ impl MenuInner {
         self.trigger = Some(trigger);
         self.trigger_node = Some(trigger_node);
 
-        // The hint sits under the trigger, but only while the panel is down: the panel
-        // occupies that space, so a hint left over its first row would take the presses meant
-        // for that row.
         let tooltip_key = format_smolstr!("{}:tooltip", self.key);
         let tooltip = Tooltip::new(
             app,
@@ -408,9 +268,6 @@ impl MenuInner {
         ))));
         self.tooltip = Some(tooltip);
 
-        // The panel hangs from the trigger's start edge: the trigger is the bar's leftmost
-        // control, and aligned to the other edge a panel wider than the trigger would be
-        // clamped back into the window and land under the sidebar.
         let overlay_key = format_smolstr!("{}:panel", self.key);
         let overlay = Overlay::new(
             app,
@@ -423,13 +280,6 @@ impl MenuInner {
                 gap: 4.0,
                 dismiss: DismissPolicy::OutsideClick,
                 modal: true,
-                // The panel sits in the dialog band, not the popup band: a failed load raises
-                // `base_ui::kit::dialog`'s alert, and the kit's layer order puts `Alert` above
-                // `Dialog` but *below* `Popup` — a menu in the popup band would cover the very
-                // alert its own rows raised, and would consume the press meant for it. A
-                // title-bar menu never overlaps a content popup, so the one band that lets the
-                // alert stand above its report is the right one (registered in
-                // `test-ledger/p4-1.md` §deviation).
                 band: Band::Dialog,
                 surface: OverlaySurface::menu(),
                 a11y: OverlayA11y::menu(t_smol!(
@@ -444,7 +294,6 @@ impl MenuInner {
         Ok(())
     }
 
-    /// Opens or closes the venue panel, from the trigger's press.
     fn toggle_panel(&mut self, app: &mut App, window: WindowId) -> Result<(), MenuError> {
         if self.released {
             return Ok(());
@@ -462,9 +311,6 @@ impl MenuInner {
         if self.window != Some(window) {
             self.window = Some(window);
         }
-        // The panel is rebuilt from a fresh reading of the directory: an open panel has to
-        // show what the loaded venues hold *now* rather than what they held when it was last
-        // built.
         self.rows = read_rows(self.host.directory());
         self.panel_signature = None;
         overlay.open(app, window, Anchor::Node(trigger), |_, _| Ok(()))?;
@@ -476,13 +322,10 @@ impl MenuInner {
             return Ok(());
         }
 
-        // ① Every load that reported since the last frame.
         while let Ok(outcome) = self.outcome_rx.try_recv() {
             self.finish_load(outcome, app)?;
         }
 
-        // ② The language: the trigger's accessible name and the tooltip follow it, and the
-        // panel's static copy is rebuilt (a static block is rebuilt, not re-bound).
         let language = self.host.language(app);
         if language != self.language {
             self.language = language;
@@ -491,13 +334,10 @@ impl MenuInner {
             self.panel_signature = None;
         }
 
-        // ③ The trigger's own hover / focus / pressed state.
         if let Some(trigger) = self.trigger.clone() {
             trigger.sync(app)?;
         }
 
-        // ④ The panel: close detection first (an outside click or `Esc` is the engine's
-        // close), then the hint, the alert, and the rows.
         let Some(overlay) = self.overlay.clone() else {
             return Ok(());
         };
@@ -524,8 +364,6 @@ impl MenuInner {
         Ok(())
     }
 
-    /// Keeps the hint's content and visibility in step: the title while the panel is down,
-    /// nothing while it is up.
     fn sync_tooltip(&mut self, app: &mut App, panel_open: bool) {
         let Some(tooltip) = self.tooltip.clone() else {
             return;
@@ -542,7 +380,6 @@ impl MenuInner {
         let _ = tooltip.sync(app);
     }
 
-    /// What the panel's rows are drawn from at this instant.
     fn current_signature(&self) -> PanelSignature {
         PanelSignature {
             language: self.language,
@@ -560,7 +397,6 @@ impl MenuInner {
         }
     }
 
-    /// Rebuilds the panel's content column from the current rows and activity.
     fn rebuild_panel(&mut self, app: &mut App, signature: PanelSignature) -> Result<(), MenuError> {
         let Some(window) = self.window else {
             return Ok(());
@@ -572,8 +408,6 @@ impl MenuInner {
             return Ok(());
         };
 
-        // The order is the engine's teardown order: the nodes that read these components'
-        // signals are removed first, then the components (and their scopes) are released.
         if let Some(root) = self.rows_root.take() {
             let _ = app.remove_node(window, root);
         }
@@ -618,10 +452,6 @@ impl MenuInner {
         Ok(())
     }
 
-    /// Releases the row components of the panel and forgets the content column's node.
-    ///
-    /// The nodes are gone already: the panel's overlay unmounted its subtree, or the rebuild
-    /// removed the content column before calling this.
     fn clear_panel(&mut self, app: &mut App) {
         self.rows_root = None;
         self.panel_signature = None;
@@ -637,12 +467,6 @@ impl MenuInner {
         }
     }
 
-    /// Starts the load one row's action asks for.
-    ///
-    /// A venue already loading is left alone. The row in flight attaches no action at all,
-    /// and this is the same rule stated where the load is started: two presses delivered
-    /// inside one frame both reach the handler the previous frame drew, and a second load
-    /// would run beside the first one and report over it.
     fn start_load(&mut self, app: &mut App, venue: VenueId) -> Result<(), MenuError> {
         if self.released || self.pending.contains(&venue) {
             return Ok(());
@@ -685,13 +509,6 @@ impl MenuInner {
         Ok(())
     }
 
-    /// Accepts the outcome of one load.
-    ///
-    /// A success is silent: the row's label follows the loaded venues, which hold the venue
-    /// now. A failure is reported once — in the alert — and stays on the row until the next
-    /// load says otherwise. Whether the venue is loaded is not this menu's answer to give: a
-    /// first connection that failed is not registered, so its row still offers to load, while
-    /// a refresh that failed leaves everything that was loaded exactly as it was.
     fn finish_load(&mut self, outcome: LoadOutcome, app: &mut App) -> Result<(), MenuError> {
         let LoadOutcome { venue, result } = outcome;
         if self.released {
@@ -721,7 +538,6 @@ impl MenuInner {
         Ok(())
     }
 
-    /// Opens one alert, replacing whatever alert of this menu's was open.
     fn raise_alert(
         &mut self,
         app: &mut App,
@@ -755,7 +571,6 @@ impl MenuInner {
         Ok(())
     }
 
-    /// Syncs the alert open on a failed load, and releases it once it closed.
     fn sync_alert(&mut self, app: &mut App) -> Result<(), MenuError> {
         let Some(dialog) = self.alert.clone() else {
             return Ok(());
@@ -774,15 +589,10 @@ impl MenuInner {
         }
         self.released = true;
 
-        // The loads still in flight ask the directory to stop before their futures are
-        // dropped: a load released without cancellation would keep a request alive for a menu
-        // nobody can see.
         let pending: Vec<VenueId> = self.pending.drain().collect();
         for venue in pending {
             self.host.directory().cancel_load(&venue);
         }
-        // The panel's overlay unmounts its own subtree, which the rows live in; the row
-        // components are released after their nodes are gone.
         if let Some(overlay) = self.overlay.take() {
             overlay.release(app);
         }
@@ -801,7 +611,6 @@ impl MenuInner {
     }
 }
 
-/// Reads every venue this build speaks from `directory`, marking the loaded ones.
 fn read_rows(directory: &dyn VenueDirectory) -> Vec<VenueRow> {
     directory
         .venues()
@@ -813,7 +622,6 @@ fn read_rows(directory: &dyn VenueDirectory) -> Vec<VenueRow> {
         .collect()
 }
 
-/// The brand logo of a venue: a fact about the identity, not about the name it is drawn under.
 const fn brand_of(venue: VenueId) -> BrandKind {
     match venue {
         VenueId::Binance => BrandKind::Binance,
@@ -824,17 +632,6 @@ const fn brand_of(venue: VenueId) -> BrandKind {
     }
 }
 
-/// One row of the panel: the venue, what it is doing, and the action it offers.
-///
-/// The action is the only part of a row that takes input, and what it is comes from
-/// `activity`: a venue whose load is in flight offers nothing to press. Greying the button is
-/// not enough — a disabled control still takes the pointer — so the handler is not attached
-/// while the load it would start is already running.
-///
-/// The mark left of the action tells the two apart at a glance: a load in flight is shown by
-/// the progress mark and nothing else, while a row that is not loading shows the connection
-/// its action is about — a venue nothing has loaded offers to plug in, a loaded one is plugged
-/// in already.
 fn build_row(
     app: &mut App,
     window: WindowId,
@@ -916,8 +713,6 @@ fn build_row(
             .id(format_smolstr!("TEST_MARKET_PARTICIPANTS_FAILED_{venue:?}"))
             .style(StyleBuilder::new().min_width_0().build())
             .bind_text(move |cx| {
-                // The failing sentence names the venue, so it is resolved in the language the
-                // interface is showing rather than the one the failure was reported in.
                 let _language = cx.read(&language);
                 let market = venue.display_string(&failed_translate);
                 t_smol!(
@@ -1026,8 +821,6 @@ fn build_row(
             matches!(activity, Some(Activity::Loading)),
         ),
     };
-    // The action's own identity for tests and diagnostics is its cell: a kit button's node is
-    // named after its key, which carries the instance identity rather than the row's meaning.
     let action_cell = {
         let tree = app
             .window_mut(window)
@@ -1065,11 +858,6 @@ fn build_row(
     Ok(components)
 }
 
-/// Runs one style tweak the kit components do not expose: the action button's fixed width.
-///
-/// The menu states it because the two labels it can carry ("load" / "refresh") must be drawn
-/// in the same box: a control that resized as a load reported itself would move the button
-/// under the pointer that pressed it.
 fn fix_width(app: &mut App, window: WindowId, node: NodeId, width: f32) -> Result<(), EngineError> {
     let tree = app
         .window_mut(window)
@@ -1107,8 +895,6 @@ mod tests {
         test_support::{Harness, supported_venues, translate, translate_in, venue},
     };
 
-    // ---------------------------------------------------------------- vocabulary
-
     fn okx() -> VenueId {
         venue("okx")
     }
@@ -1128,9 +914,6 @@ mod tests {
         )
     }
 
-    // ---------------------------------------------------------------- harness actions
-
-    /// Opens the panel through the trigger, the way the title bar's press does.
     fn open_panel(harness: &mut Harness) {
         let trigger = harness.menu().trigger_node().expect("the trigger is built");
         harness.click(trigger);
@@ -1142,7 +925,6 @@ mod tests {
         assert!(harness.shows_panel(), "the open panel draws venue rows");
     }
 
-    /// Presses one row's action.
     fn click_action(harness: &mut Harness, venue: VenueId, loaded: bool) {
         let node = harness
             .action(venue, loaded)
@@ -1164,7 +946,6 @@ mod tests {
             .and_then(|dialog| dialog.with_alert(|alert| SmolStr::new(alert.title())))
     }
 
-    /// Reads the alert the way the user does: presses its one button and lets the fade finish.
     fn click_alert_ok(harness: &mut Harness) {
         let dialog = alert_dialog(harness).expect("an alert is open");
         let button = dialog
@@ -1179,9 +960,6 @@ mod tests {
         harness.menu().inner.borrow().activity.get(&venue).copied()
     }
 
-    // ---------------------------------------------------------------- rows and state
-
-    /// The menu starts with every venue this build speaks, nothing loaded, no panel, no alert.
     #[test]
     fn the_menu_should_start_with_every_venue_and_no_activity() {
         let harness = Harness::new();
@@ -1195,8 +973,6 @@ mod tests {
         assert_eq!(harness.overlay_count(), 0);
     }
 
-    /// Every venue this build speaks is a row of the panel, and a venue it does not speak is
-    /// not: the list is the directory's venue list, whether or not anything is loaded.
     #[test]
     fn the_panel_should_list_every_venue_this_build_speaks() {
         let mut harness = Harness::new();
@@ -1228,8 +1004,6 @@ mod tests {
         }
     }
 
-    /// A market that cannot be read without credentials is refused before a load is started,
-    /// and the user is told to configure it instead.
     #[test]
     fn a_load_without_credentials_should_be_refused_with_an_alert() {
         let gated = longbridge();
@@ -1276,9 +1050,6 @@ mod tests {
         );
     }
 
-    /// The credentials check is beside the re-entrancy guard rather than instead of it: a
-    /// venue that is configured loads exactly as it did, through the same path and with no
-    /// alert.
     #[test]
     fn a_configured_market_should_load_through_the_same_path() {
         let gated = longbridge();
@@ -1316,9 +1087,6 @@ mod tests {
         assert!(alert_open(&harness), "the failure reported itself");
     }
 
-    /// The three venues whose reads are public are offered exactly as they were: the
-    /// credentials gate is a question each venue's own definition answers, and none of them
-    /// declares it.
     #[test]
     fn venues_whose_reads_are_public_should_never_meet_the_credentials_gate() {
         let mut harness = Harness::new();
@@ -1338,8 +1106,6 @@ mod tests {
             assert!(harness.shows_mark(venue, "LOADING"));
             assert!(!alert_open(&harness));
 
-            // The directory answers the way a cancelled connector load does, so the row goes
-            // back to the action it offered and the alert reports what happened.
             harness.menu_mut().cancel_load(venue);
             harness.settle(2);
             assert!(alert_open(&harness), "{venue}'s reported load is reported");
@@ -1351,8 +1117,6 @@ mod tests {
         }
     }
 
-    /// The alert a load refused for want of credentials raises is a sentence in every language
-    /// the interface ships, and it says which market to configure and where.
     #[test]
     fn the_credentials_alert_should_read_in_every_language() {
         let gated = longbridge();
@@ -1393,8 +1157,6 @@ mod tests {
         );
     }
 
-    /// Pressing a row's action leaves the panel open: the row reports its progress and its
-    /// failures in the panel, so a press that closed it would hide what it started.
     #[test]
     fn pressing_a_row_action_should_leave_the_panel_open() {
         let mut harness = Harness::new();
@@ -1420,8 +1182,6 @@ mod tests {
         );
     }
 
-    /// A load that succeeded is silent and flips its row: the row's label follows the loaded
-    /// venues, which hold the venue now, so the action it offers is a refresh.
     #[test]
     fn a_clicked_load_that_succeeds_should_offer_a_refresh() {
         let mut harness = Harness::new();
@@ -1451,8 +1211,6 @@ mod tests {
         assert!(harness.menu().is_open(harness.app()));
     }
 
-    /// A first connection that fails is reported once, in the alert, and its row keeps
-    /// offering to load: nothing is loaded, so pressing it again is the retry.
     #[test]
     fn a_first_load_that_fails_should_be_reported_once() {
         let mut harness = Harness::new();
@@ -1495,8 +1253,6 @@ mod tests {
         assert!(harness.action(okx(), false).is_some());
     }
 
-    /// A refresh that fails changes nothing that was loaded — including the row's own answer:
-    /// the venue is still registered, so the row still offers to refresh.
     #[test]
     fn a_refresh_that_fails_should_keep_offering_a_refresh() {
         let mut harness = Harness::new();
@@ -1524,8 +1280,6 @@ mod tests {
         assert!(harness.directory().is_loaded(&okx()));
     }
 
-    /// A row whose load is in flight does not respond to a second press, and the action itself
-    /// refuses a second start for the press a frame can deliver before the row is replaced.
     #[test]
     fn a_row_that_is_loading_should_ignore_a_second_press() {
         let mut harness = Harness::new();
@@ -1555,7 +1309,6 @@ mod tests {
         harness
             .start_load(okx())
             .expect("the re-entrancy guard is not an error");
-        // The load a start requests is registered when its future is first polled.
         harness.drain();
         assert_eq!(
             harness.directory().loads().len(),
@@ -1565,8 +1318,6 @@ mod tests {
         assert_eq!(harness.menu().pending_loads(), 1);
     }
 
-    /// Venues are independent: two loads run beside each other, and each failure is reported
-    /// against the row that asked for it.
     #[test]
     fn loads_of_two_venues_should_run_beside_each_other() {
         let mut harness = Harness::new();
@@ -1609,8 +1360,6 @@ mod tests {
         );
     }
 
-    /// A load cancelled at the directory is not left in flight: the row goes back to offering
-    /// the action it was asked for rather than keeping a progress mark nothing will finish.
     #[test]
     fn a_cancelled_load_should_not_wedge_its_row() {
         let mut harness = Harness::new();
@@ -1635,10 +1384,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------- language
-
-    /// Switching the language redraws the panel's static copy: names and action labels are
-    /// rebuilt in the language the interface shows.
     #[test]
     fn switching_the_language_should_redraw_the_panel() {
         let mut harness = Harness::new();
@@ -1669,7 +1414,6 @@ mod tests {
         assert!(!chinese_name.is_empty() && !chinese_action.is_empty());
     }
 
-    /// The panel is steady once drawn: a frame in which nothing moved requests no frame.
     #[test]
     fn an_open_panel_should_be_steady_when_nothing_moves() {
         let mut harness = Harness::new();
@@ -1686,10 +1430,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------- hint and dismissal
-
-    /// The hint sits under the trigger, but not while the panel is down: the panel occupies
-    /// that space, and a hint over its first row would take the presses meant for it.
     #[test]
     fn an_open_panel_should_take_the_hint_away() {
         let mut harness = Harness::new();
@@ -1712,8 +1452,6 @@ mod tests {
         assert_eq!(hint(&harness), None, "the open panel takes the hint away");
     }
 
-    /// A press outside the panel closes it: the panel is one popup overlay, dismissed the way
-    /// every popup is.
     #[test]
     fn a_press_outside_the_panel_should_close_it() {
         let mut harness = Harness::new();
@@ -1733,15 +1471,11 @@ mod tests {
         assert_eq!(harness.overlay_count(), 0);
     }
 
-    /// Two failures are two reports, and the alert states the failure that just happened: the
-    /// second alert replaces the first rather than stacking one over the other.
     #[test]
     fn a_second_failure_should_replace_the_alert() {
         let mut harness = Harness::new();
         open_panel(&mut harness);
 
-        // Both loads start before either reports, so both failures land in one frame: the
-        // second report replaces the first alert rather than stacking one over the other.
         click_action(&mut harness, okx(), false);
         click_action(&mut harness, binance(), false);
         harness
@@ -1767,10 +1501,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------- two panes
-
-    /// Two title bars in one window own two identities: their keys differ, their handlers do
-    /// not replace one another, and releasing one leaves the other working.
     #[test]
     fn two_menus_should_live_side_by_side() {
         let mut harness = Harness::new();
@@ -1807,8 +1537,6 @@ mod tests {
             "each menu owns its own trigger"
         );
 
-        // The second trigger is mounted but not laid out until a frame runs; the press is the
-        // first thing a title bar would deliver after the mount, so give it that frame.
         harness.settle(1);
         let trigger = second.trigger_node().expect("the second trigger is built");
         harness.click(trigger);
@@ -1830,7 +1558,6 @@ mod tests {
             "the second menu draws every venue once"
         );
 
-        // The first menu is released while the second one is open; the second one still works.
         let first_trigger = harness.menu().trigger_node().expect("the first trigger");
         harness.remove_node(first_trigger);
         harness.release_menu();
@@ -1852,10 +1579,6 @@ mod tests {
         harness.app_mut().remove_node(window, toolbar).ok();
     }
 
-    // ---------------------------------------------------------------- release
-
-    /// Releasing the menu cancels its loads, releases every kit component and gives the
-    /// window back to what it was before the menu was mounted.
     #[test]
     fn releasing_the_menu_should_cancel_its_loads_and_give_everything_back() {
         let mut harness = Harness::new();
@@ -1881,12 +1604,9 @@ mod tests {
             "nothing of the menu's is left but the caller's node"
         );
 
-        // Releasing twice is not an error: the second call has nothing left to give back.
         harness.release_menu();
     }
 
-    /// Building and releasing a menu repeatedly does not grow the window's tree: everything a
-    /// menu mounts, it unmounts (or hands back to the caller, who unmounts it).
     #[test]
     fn building_and_releasing_menus_should_not_grow_the_window() {
         let mut harness = Harness::new();
@@ -1934,12 +1654,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------- i18n
-
-    /// A missing key translates to an empty string, which is how this menu would fail
-    /// quietly: rows with no action, an alert that says nothing. Every key this crate reads is
-    /// listed here and resolved in every locale the binary embeds, and every failure a load
-    /// can report is put through the same localization.
     #[test]
     fn every_key_this_menu_reads_should_resolve_to_text() {
         let keys = [
@@ -2031,8 +1745,6 @@ mod tests {
                 );
             }
 
-            // A catalog that moved under its fetch is reported as its own sentence, and a
-            // catalog failure that carries a route is not reported as a moved catalog.
             let stale = VenueLoadFailure::new(VenueLoadError::Catalog {
                 venue: okx(),
                 scope: okx_spot().scope,

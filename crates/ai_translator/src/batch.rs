@@ -1,5 +1,3 @@
-//! Batch translation: many short segments in one model request.
-
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -19,34 +17,18 @@ use crate::{
     translator::{parse_language, resolve_model_path, shared_translator},
 };
 
-/// One segment to translate, identified by a caller-assigned id.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchSegment {
-    /// A short caller-assigned id, e.g. `s00`.
     pub id: SmolStr,
-    /// The text to translate.
     pub text: SmolStr,
 }
 
-/// The translation of one requested segment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchTranslation {
-    /// The id of the [`BatchSegment`] this text translates.
     pub id: SmolStr,
-    /// The translated text, trimmed of the padding the model tends to emit.
     pub text: SmolStr,
 }
 
-/// Loads and caches the translation model without generating anything.
-///
-/// This is the same load [`translate_batch`] performs. It exists so a caller can
-/// wait for the model to be ready and only then start its own deadline for the
-/// generation that follows.
-///
-/// `cancel` is checked before the model path is resolved and loaded and again after
-/// the load returns, so a caller that cancelled does not start a batch afterwards.
-/// The load itself cannot be aborted: a cancellation that arrives while the model
-/// loads is reported once the load has finished.
 pub fn prepare(
     model_directory: Option<&Path>,
     selected_model: Option<TranslationModel>,
@@ -64,18 +46,6 @@ pub fn prepare(
     Ok(())
 }
 
-/// Translates `segments` into `target_lang` in one model request.
-///
-/// The language is parsed before any model work, and an empty batch is answered
-/// without loading a model. A repeated segment id is rejected because the model's
-/// answer maps ids to texts and could not tell the duplicates apart. Otherwise the
-/// model is given one JSON object that maps each id to its text, and its answer must
-/// contain exactly the requested ids with non-empty values. Results are returned in
-/// `segments` order.
-///
-/// `cancel` is polled before and after the model is loaded, and the engine polls it
-/// while it generates; a cancelled request is reported as
-/// [`TranslationError::Cancelled`]. The engine stays usable afterwards.
 pub fn translate_batch(
     model_directory: Option<&Path>,
     selected_model: Option<TranslationModel>,
@@ -117,10 +87,6 @@ pub fn translate_batch(
     Ok(order_translations(segments, translations))
 }
 
-/// Parses the model's JSON answer and checks it against the requested ids.
-///
-/// The answer is located as the first `{` through the last `}`, so an optional
-/// markdown fence and surrounding prose are tolerated. Every value is trimmed.
 fn parse_response(
     output: &str,
     requested: &BTreeMap<SmolStr, SmolStr>,
@@ -165,10 +131,6 @@ fn parse_response(
         .collect())
 }
 
-/// Returns the translations in the order the caller supplied the segments.
-///
-/// [`parse_response`] has already checked that the answer contains exactly the
-/// requested ids, so every segment is guaranteed a translation.
 fn order_translations(
     segments: &[BatchSegment],
     translations: BTreeMap<SmolStr, SmolStr>,
@@ -195,7 +157,6 @@ mod tests {
     use super::{BatchSegment, order_translations, parse_response, prepare, translate_batch};
     use crate::{error::TranslationError, translator::CACHE_TEST_LOCK};
 
-    /// The request shape the parser tests answer.
     fn requested() -> BTreeMap<SmolStr, SmolStr> {
         BTreeMap::from([
             (SmolStr::new_static("1"), SmolStr::new_static("Hello")),
@@ -203,7 +164,6 @@ mod tests {
         ])
     }
 
-    /// A batch with ids out of sorted order, so tests can tell order from sorted order.
     fn segments() -> Vec<BatchSegment> {
         vec![
             BatchSegment {

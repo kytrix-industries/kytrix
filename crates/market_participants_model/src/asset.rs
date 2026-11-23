@@ -1,12 +1,3 @@
-//! Canonical asset, security and underlying identities.
-//!
-//! An asset is never a bare ticker. Display symbols are catalog aliases; the
-//! canonical identity is either a validated ISO 4217 currency, a chain or
-//! venue-issued crypto token, an issued security with a share class, or a
-//! commodity. Every identity in this module is derived from versioned canonical
-//! terms by the asset registry, which is the only creation boundary for
-//! canonical assets.
-
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -23,12 +14,6 @@ use crate::{
     reference::ExternalReferenceId,
 };
 
-/// Currency codes currently published by ISO 4217.
-///
-/// The reserved testing code `XTS` and the "no currency" code `XXX` are part of
-/// the ISO table but cannot denominate a tradable instrument, so they are kept
-/// in this list only to be rejected with a precise message. The array length
-/// below is asserted by `iso_table_should_stay_sorted_and_unique`.
 const ISO_4217_CODES: [&str; 177] = [
     "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT",
     "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BOV", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD",
@@ -46,23 +31,13 @@ const ISO_4217_CODES: [&str; 177] = [
     "XPF", "XPT", "XSU", "XUA", "YER", "ZAR", "ZMW", "ZWG",
 ];
 
-/// Currency codes that carry no tradable value.
 const NON_TRADABLE_CURRENCY_CODES: [&str; 2] = ["XTS", "XXX"];
 
-/// An ISO 4217 currency code, normalized to its canonical uppercase spelling.
-///
-/// The built-in table is the real ISO 4217 code list, so `USDT`, `USDC`, `BTC`
-/// and every other stablecoin or on-chain asset is rejected here and can only be
-/// expressed as a [`CryptoTokenId`]. The reserved testing code `XTS` and the
-/// "no currency" code `XXX` are rejected as well. A lower-case or mixed-case
-/// spelling of a published code is normalized instead of rejected; whitespace is
-/// never trimmed, so ` usd ` stays invalid.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Iso4217Code(SmolStr);
 
 impl Iso4217Code {
-    /// Validates an ISO 4217 currency code and normalizes it to uppercase.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         let normalized = value.to_ascii_uppercase();
@@ -76,7 +51,6 @@ impl Iso4217Code {
         Ok(Self(SmolStr::new(normalized)))
     }
 
-    /// Returns the canonical three-letter currency code.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -118,7 +92,6 @@ impl<'de> Deserialize<'de> for Iso4217Code {
     }
 }
 
-/// The canonical terms of a fiat currency: its ISO 4217 code.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct CurrencyTerms {
     #[serde(rename = "code")]
@@ -135,19 +108,16 @@ impl CanonicalTerms for CurrencyTerms {
 crate::identifier::identity_type!(CurrencyId, CurrencyIdentity);
 
 impl CurrencyId {
-    /// Derives a currency identity from a validated ISO 4217 code.
     pub fn new(code: Iso4217Code) -> Self {
         Self::of_terms(&CurrencyTerms { code })
     }
 }
 
-/// A validated EVM contract address: `0x` followed by 40 hexadecimal digits.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ContractAddress(SmolStr);
 
 impl ContractAddress {
-    /// Validates an EVM-style contract address.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         if is_evm_address(value) {
@@ -159,7 +129,6 @@ impl ContractAddress {
         }
     }
 
-    /// Returns the address exactly as published.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -195,7 +164,6 @@ impl<'de> Deserialize<'de> for ContractAddress {
     }
 }
 
-/// How a token is referenced on its chain or inside its issuance domain.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "reference")]
 pub enum TokenReference {
@@ -212,7 +180,6 @@ pub enum TokenReference {
 }
 
 impl TokenReference {
-    /// Returns the address of a contract reference.
     pub fn contract_address(&self) -> Option<&ContractAddress> {
         match self {
             Self::Contract { address } => Some(address),
@@ -236,12 +203,6 @@ impl CanonicalTerms for TokenReference {
     }
 }
 
-/// The verified origin of a crypto token.
-///
-/// Wrapped, bridged, native and venue-native tokens are different canonical
-/// assets, so the origin is part of the identity terms. A CEX asset whose chain
-/// identity cannot be verified must use `VenueIssued` instead of pretending to
-/// be an on-chain token.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "origin")]
 pub enum CryptoTokenOrigin {
@@ -264,7 +225,6 @@ pub enum CryptoTokenOrigin {
 }
 
 impl CryptoTokenOrigin {
-    /// Returns the chain identity this origin belongs to, when it has one.
     pub fn chain(&self) -> Option<&ChainId> {
         match self {
             Self::Chain { chain_id, .. } => Some(chain_id),
@@ -272,7 +232,6 @@ impl CryptoTokenOrigin {
         }
     }
 
-    /// Returns the token reference of this origin.
     pub fn token(&self) -> &TokenReference {
         match self {
             Self::Chain { token, .. } | Self::VenueIssued { token, .. } => token,
@@ -302,7 +261,6 @@ impl CanonicalTerms for CryptoTokenOrigin {
     }
 }
 
-/// The canonical terms of a crypto token: its verified origin.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct CryptoTokenTerms {
     #[serde(rename = "origin")]
@@ -310,11 +268,6 @@ pub struct CryptoTokenTerms {
 }
 
 impl CryptoTokenTerms {
-    /// Validates the origin.
-    ///
-    /// A contract reference must use the address encoding of its chain: EVM
-    /// chains use the `0x` hexadecimal form and Solana uses base58, so a token
-    /// can never claim an address that its chain could not have issued.
     pub fn validate(&self) -> Result<(), ModelError> {
         let Some(address) = self.origin.token().contract_address() else {
             return Ok(());
@@ -352,7 +305,6 @@ impl CanonicalTerms for CryptoTokenTerms {
 crate::identifier::identity_type!(CryptoTokenId, CryptoTokenIdentity);
 
 impl CryptoTokenId {
-    /// Derives a token identity from a verified origin.
     pub fn new(origin: CryptoTokenOrigin) -> Result<Self, ModelError> {
         let terms = CryptoTokenTerms { origin };
         terms.validate()?;
@@ -360,12 +312,6 @@ impl CryptoTokenId {
     }
 }
 
-/// The supported security forms.
-///
-/// This is a closed set. Units, warrants and any other uncovered form must be
-/// rejected by the catalog source with [`ModelError::UnsupportedSecurityForm`]
-/// until a typed variant carrying its fixed conversion, exercise or delivery
-/// terms exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SecurityForm {
     #[serde(rename = "common_stock")]
@@ -379,7 +325,6 @@ pub enum SecurityForm {
 }
 
 impl SecurityForm {
-    /// Returns the fixed canonical label of this security form.
     pub const fn label(self) -> &'static str {
         match self {
             Self::CommonStock => "common-stock",
@@ -396,13 +341,11 @@ impl CanonicalTerms for SecurityForm {
     }
 }
 
-/// An issuer dimension identity such as a CIK, LEI or on-chain issuer.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SecurityIssuerId(SmolStr);
 
 impl SecurityIssuerId {
-    /// Validates a typed issuer identity such as `cik/320193`.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         let valid = value.split_once('/').is_some_and(|(namespace, code)| {
@@ -424,7 +367,6 @@ impl SecurityIssuerId {
         }
     }
 
-    /// Returns the typed issuer identity.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -460,10 +402,6 @@ impl<'de> Deserialize<'de> for SecurityIssuerId {
     }
 }
 
-/// The canonical terms of a share class.
-///
-/// They contain the issuer, the class designation and the fixed clauses the
-/// security form needs, such as the ADR ratio or the par value.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ShareClassTerms {
     #[serde(rename = "issuer")]
@@ -479,7 +417,6 @@ pub struct ShareClassTerms {
 }
 
 impl ShareClassTerms {
-    /// Validates the share class terms.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.designation.is_empty() {
             return Err(ModelError::InvalidShareClassDesignation {
@@ -520,19 +457,12 @@ impl CanonicalTerms for ShareClassTerms {
 crate::identifier::identity_type!(ShareClassId, ShareClassIdentity);
 
 impl ShareClassId {
-    /// Derives a share class identity from validated class terms.
     pub fn new(terms: &ShareClassTerms) -> Result<Self, ModelError> {
         terms.validate()?;
         Ok(Self::of_terms(terms))
     }
 }
 
-/// The canonical terms of an issued security.
-///
-/// Issuer, share class terms and security form together determine the
-/// [`SecurityId`]. A display ticker such as `AAPL`, `AAPL.O` or `600000` never
-/// does; a plain local code only becomes part of a security identity together
-/// with its venue namespace.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct SecurityTerms {
     #[serde(rename = "issuer")]
@@ -555,7 +485,6 @@ impl CanonicalTerms for SecurityTerms {
 crate::identifier::identity_type!(SecurityId, SecurityIdentity);
 
 impl SecurityId {
-    /// Derives a security identity from issuer, share class and security form.
     pub fn new(issuer: SecurityIssuerId, share_class: ShareClassId, form: SecurityForm) -> Self {
         Self::of_terms(&SecurityTerms {
             issuer,
@@ -565,7 +494,6 @@ impl SecurityId {
     }
 }
 
-/// A commodity identity used as an underlying asset.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "origin")]
 pub enum CommodityOrigin {
@@ -599,7 +527,6 @@ impl CanonicalTerms for CommodityOrigin {
     }
 }
 
-/// The canonical terms of a commodity: its verified origin.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct CommodityTerms {
     #[serde(rename = "origin")]
@@ -607,10 +534,6 @@ pub struct CommodityTerms {
 }
 
 impl CommodityTerms {
-    /// Validates the commodity origin.
-    ///
-    /// An ISO commodity code is either a currency code or an ISO 3166 alpha-2
-    /// country code; anything else has to be a venue-scoped origin.
     pub fn validate(&self) -> Result<(), ModelError> {
         if let CommodityOrigin::Iso { code } = &self.origin {
             let code = code.as_str();
@@ -639,7 +562,6 @@ fn is_iso3166_alpha2(value: &str) -> bool {
 crate::identifier::identity_type!(CommodityId, CommodityIdentity);
 
 impl CommodityId {
-    /// Derives a commodity identity from a verified origin.
     pub fn new(origin: CommodityOrigin) -> Result<Self, ModelError> {
         let terms = CommodityTerms { origin };
         terms.validate()?;
@@ -647,7 +569,6 @@ impl CommodityId {
     }
 }
 
-/// The canonical terms of an index: its namespace and index code.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct IndexTerms {
     #[serde(rename = "namespace")]
@@ -667,13 +588,11 @@ impl CanonicalTerms for IndexTerms {
 crate::identifier::identity_type!(IndexId, IndexIdentity);
 
 impl IndexId {
-    /// Derives an index identity from its namespace and index code.
     pub fn new(namespace: IdentifierNamespace, code: IdentifierValue) -> Self {
         Self::of_terms(&IndexTerms { namespace, code })
     }
 }
 
-/// A canonical asset that an instrument can trade or settle in.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "spec")]
 pub enum AssetId {
@@ -688,10 +607,6 @@ pub enum AssetId {
 }
 
 impl AssetId {
-    /// Returns `true` when this asset can settle an outcome group.
-    ///
-    /// Settlement assets are currencies or crypto tokens; securities and
-    /// commodities cannot be delivered as an outcome payoff.
     pub const fn is_settlement_asset(&self) -> bool {
         matches!(self, Self::Currency(_) | Self::CryptoToken(_))
     }
@@ -731,7 +646,6 @@ impl fmt::Display for AssetId {
     }
 }
 
-/// A reference to what a derivative or a price reference actually tracks.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "reference")]
 pub enum UnderlyingRef {
@@ -744,7 +658,6 @@ pub enum UnderlyingRef {
 }
 
 impl UnderlyingRef {
-    /// Returns the asset this reference tracks, when it tracks one directly.
     pub const fn asset(&self) -> Option<&AssetId> {
         match self {
             Self::Asset(asset) => Some(asset),
@@ -752,7 +665,6 @@ impl UnderlyingRef {
         }
     }
 
-    /// Returns the index this reference tracks, when it tracks one.
     pub const fn index(&self) -> Option<&IndexId> {
         match self {
             Self::Index(index) => Some(index),
@@ -780,7 +692,6 @@ impl CanonicalTerms for UnderlyingRef {
     }
 }
 
-/// The economic underlying of a derivative together with its price reference.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DerivativeUnderlying {
     #[serde(rename = "reference")]
@@ -790,7 +701,6 @@ pub struct DerivativeUnderlying {
 }
 
 impl DerivativeUnderlying {
-    /// Builds a derivative underlying.
     pub fn new(
         reference: UnderlyingRef,
         price_reference: crate::reference::PriceReferenceId,
@@ -801,12 +711,10 @@ impl DerivativeUnderlying {
         }
     }
 
-    /// Returns what this derivative tracks.
     pub fn reference(&self) -> &UnderlyingRef {
         &self.reference
     }
 
-    /// Returns the canonical price reference of this derivative.
     pub fn price_reference(&self) -> &crate::reference::PriceReferenceId {
         &self.price_reference
     }
@@ -819,7 +727,6 @@ impl CanonicalTerms for DerivativeUnderlying {
     }
 }
 
-/// Rejects an EVM contract address on a chain that cannot issue one.
 pub fn require_chain_readable_address(
     chain: Option<&ChainId>,
     address: &ContractAddress,

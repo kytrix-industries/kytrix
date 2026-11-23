@@ -1,9 +1,3 @@
-//! The taker-volume chart: buy and sell volume as paired bars.
-//!
-//! Both series are the same interval's volume split by which side crossed the spread, so
-//! they share one axis and stand side by side rather than over each other: a stacked bar
-//! would say the interval traded their sum, which is exactly what the two sides are not.
-
 use std::sync::Arc;
 
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -23,7 +17,6 @@ use super::{
 };
 use crate::model::{StatisticsPoints, TakerVolumePoint, quantity_as_f64};
 
-/// The names this chart shows, resolved from the active language.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Labels {
     buy: SmolStr,
@@ -32,7 +25,6 @@ struct Labels {
 }
 
 impl Labels {
-    /// Resolves the series names from the active language.
     fn resolve(translate: &Translate) -> Self {
         Self {
             buy: t_smol!(translate, "widget.perpetual_statistics.buy_volume"),
@@ -42,11 +34,9 @@ impl Labels {
     }
 }
 
-/// The taker-volume chart's state.
 pub(crate) struct TakerVolumeChart {
     points: Arc<[TakerVolumePoint]>,
     metadata: Option<ListingPrecision>,
-    /// The asset the volume is measured in, which a tooltip names.
     base: SmolStr,
     labels: Labels,
     locale: LanguageCode,
@@ -56,12 +46,10 @@ pub(crate) struct TakerVolumeChart {
     tooltips: Arc<[Tooltip]>,
     legend: Box<[SeriesLabel]>,
     volume_title: SmolStr,
-    /// The zone the axis labels and tooltips were written in.
     zone: UtcOffset,
 }
 
 impl TakerVolumeChart {
-    /// Builds an empty chart of `instrument`'s taker volume.
     pub(crate) fn new(translate: &Translate, base: &str, zone: UtcOffset) -> Self {
         Self::build(
             Arc::from(Vec::new()),
@@ -200,7 +188,6 @@ impl ChartData for TakerVolumeChart {
         self.tooltips.get(index).cloned()
     }
 
-    /// Rewrites the labels in another display zone.
     fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
         if self.zone == zone {
             return false;

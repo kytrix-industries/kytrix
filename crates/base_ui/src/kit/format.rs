@@ -1,20 +1,5 @@
-//! 数字格式化：分位（千分位）分组。
-//!
-//! 纯文本、无主题、无窗口：输入是 `market_participants_model` 写出来的数字串（数字、可选负号、
-//! 可选小数、`e` 记数法），输出是只在**整数部分**插入逗号的等值文本。语义由本模块的测试锁定：
-//! P5-2 删除旧实现前把它的输出冻结成两张基线表（见 `test-ledger/p5-2.md` §2）。
-
 use smol_str::SmolStr;
 
-/// 给数字串的整数部分加千分位逗号。
-///
-/// 语义（与旧实现逐字节等价）：
-/// - 只处理可选前导 `-` 之后、第一个 `.` / `e` / `E` 之前的**整数部分**；
-/// - 整数部分长度 `<= 3` 或含非 ASCII 数字字符时**原样返回**（不去猜；`--`、`1,234`、`+12` 等
-///   输入都保持原样）；
-/// - 其余部分（符号 / 小数 / 指数）原样搬过去，绝不改变数值含义。
-///
-/// 返回 `SmolStr`（短数字零分配堆；AGENTS §2.2）。
 #[must_use]
 pub fn group_digits(text: &str) -> SmolStr {
     let (sign, rest) = match text.strip_prefix('-') {
@@ -44,7 +29,6 @@ pub fn group_digits(text: &str) -> SmolStr {
 mod tests {
     use super::group_digits;
 
-    /// 旧实现的 20 组手工样例输出（P5-2 在旧模块删除前逐值冻结）。
     const HAND_PICKED: [(&str, &str); 20] = [
         ("", ""),
         ("0", "0"),
@@ -68,7 +52,6 @@ mod tests {
         ("1234.5678", "1,234.5678"),
     ];
 
-    /// 旧实现的 72 组程序生成输出（1..=8 位全 9 整数 × 符号 × 小数 / 指数后缀；P5-2 冻结）。
     const GENERATED: [(&str, &str); 72] = [
         ("9", "9"),
         ("9.5", "9.5"),
@@ -144,7 +127,6 @@ mod tests {
         ("-99999999e-7", "-99,999,999e-7"),
     ];
 
-    /// 手工样例：正负号 / 小数 / 指数 / 非法输入的语义与冻结基线一致。
     #[test]
     fn hand_picked_numbers_are_grouped_like_the_frozen_baseline() {
         for (input, expected) in HAND_PICKED {
@@ -154,14 +136,12 @@ mod tests {
                 "输入 `{input}` 的分组结果与冻结基线不一致"
             );
         }
-        // 语义可读性断言（表里读不出来的四条）。
         assert_eq!(group_digits("1234567.00"), "1,234,567.00");
         assert_eq!(group_digits("-12345.5"), "-12,345.5");
         assert_eq!(group_digits("1.50e18"), "1.50e18");
         assert_eq!(group_digits(""), "");
     }
 
-    /// 抽样 ≥ 20 组程序生成的数字串与冻结基线逐位一致（覆盖位数 / 符号 / 小数 / 指数组合）。
     #[test]
     fn generated_numbers_match_the_frozen_baseline() {
         for (input, expected) in GENERATED {

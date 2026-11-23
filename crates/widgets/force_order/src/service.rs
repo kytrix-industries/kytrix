@@ -1,13 +1,3 @@
-//! The background service one force-order pane talks to.
-//!
-//! Which routes report liquidations, and which of their listings exist at all, are
-//! two questions the route registry and the published catalog answer: the pane
-//! hands this service the routes the registry offers, and the service asks each of
-//! them for the perpetual listings it publishes before it subscribes to anything.
-//! A route that publishes no perpetual listing has no liquidation to report, and
-//! an event naming a listing the route does not publish is not one this pane may
-//! show.
-
 use std::{collections::VecDeque, convert::Infallible, future::Future, sync::Arc};
 
 use ahash::AHashMap;
@@ -41,10 +31,7 @@ use super::model::{
 
 #[derive(Debug)]
 pub(super) enum ForceOrderRequest {
-    /// Starts the stream for these routes. Idempotent while one is already live.
     Load { routes: Arc<[VenueRoute]> },
-    /// Replaces the current generation, for a route set that changed under the
-    /// pane or for a user's own retry.
     Retry { routes: Arc<[VenueRoute]> },
 }
 
@@ -53,7 +40,6 @@ pub(super) enum ForceOrderResponse {
     StreamStarted,
 }
 
-/// Every route that reports liquidations publishes into one stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ForceOrderStreamKey {
     AllMarkets,
@@ -85,13 +71,6 @@ impl WidgetProtocol for ForceOrderProtocol {
 pub(super) trait ForceOrderSource: Clone + Send + Sync + 'static {
     type Subscription: ForceOrderEventSubscription;
 
-    /// The perpetual listings one route publishes, as their canonical identities.
-    ///
-    /// A liquidation is only ever published for a perpetual listing, so this is
-    /// what decides whether a route is worth subscribing to. What a listing is
-    /// *called* is not a catalog fact this seam answers: the service reads the name
-    /// from the display generation it captured, so a venue's own symbol can never
-    /// become a row's name.
     fn perpetual_listings(
         &self,
         route: &VenueRoute,
@@ -155,11 +134,6 @@ impl ForceOrderEventSubscription for ClientForceOrderSubscription {
 
 pub(super) struct ForceOrderService<S = MarketCapability> {
     source: S,
-    /// The display context every row's listing name is read from.
-    ///
-    /// It is injected rather than reached for, so the service names its listings
-    /// from the generation its own caller published, and so a test can hand it the
-    /// generation it wants the rows named by.
     display: Arc<Catalog>,
     maximum_orders: usize,
 }
@@ -186,17 +160,10 @@ where
                 ForceOrderRequest::Retry { routes } => (routes, true),
             };
             let key = ForceOrderStreamKey::AllMarkets;
-            // A repeated load of what is already running is answered without
-            // touching the live stream: the caller has not asked for anything new.
-            // A route set that changed arrives as a retry, because another venue's
-            // liquidations are another scope rather than a repeat of this one.
             if !retry && context.stream_generation(&key).is_some() {
                 let _ = reply.respond(Ok(ForceOrderResponse::StreamStarted));
                 continue;
             }
-            // `next_rpc` already dropped expired requests; re-check before
-            // starting anything, so a caller that went away cannot leave a stream
-            // behind.
             if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                 continue;
             }
@@ -244,8 +211,6 @@ async fn run_stream<S>(
         run_stream_once(&source, &routes, &display, maximum_orders, &publisher).await
     {
         publish_error(&publisher, error).await;
-        // A terminal failure must not retry on its own: the view decides when to
-        // ask for a replacement stream, so the task stays alive until then.
         publisher.cancelled().await;
     }
 }
@@ -260,8 +225,6 @@ async fn run_stream_once<S>(
 where
     S: ForceOrderSource,
 {
-    // What each route actually liquidates is the first question: a route whose
-    // published catalog holds no perpetual listing has nothing to subscribe to.
     let discovered = tokio::select! {
         biased;
         () = publisher.cancelled() => return Ok(()),
@@ -270,12 +233,6 @@ where
             Ok::<_, MarketError>((route, listings))
         })) => result?,
     };
-    // Every row is named and written by one generation: the labels and the
-    // increments are read from a single capture of the published catalog, so a
-    // publication that lands while they are read cannot put two generations' names
-    // or two generations' precision on one screen. A listing the captured
-    // generation does not name keeps its structured key and no name at all, which
-    // the view draws as the localized unknown.
     let display = display.cached_display();
     let mut listings: AHashMap<VenueListingKey, ForceOrderListing> =
         AHashMap::with_capacity(discovered.iter().map(|(_, listings)| listings.len()).sum());
@@ -343,11 +300,6 @@ where
                 }
                 event
             } => {
-                // A batch is published as it arrives: the latest stream keeps only
-                // the newest snapshot per key, so batching in time would add
-                // latency without saving anything. A batch that leaves the
-                // retained orders unchanged — every order in it was evicted as
-                // stale — publishes nothing, because nothing drawn would change.
                 if !merge_event(event, &listings, &mut orders)? {
                     continue;
                 }
@@ -369,9 +321,6 @@ fn merge_event(
 ) -> Result<bool, MarketError> {
     match event {
         Some(Ok(batch)) => {
-            // An event naming a listing its own route does not publish is not a
-            // liquidation this pane may show, so it is left out rather than shown
-            // under a listing that does not exist.
             let entries = batch
                 .iter()
                 .filter_map(|order| {
@@ -404,13 +353,6 @@ async fn publish_error(publisher: &StreamPublisher<ForceOrderProtocol>, error: M
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -466,8 +408,6 @@ mod tests {
         test_support::listing_key(route, symbol)
     }
 
-    /// A display context that names nothing: the tests that are not about the
-    /// label drive the rows they assert through the listing keys alone.
     fn unnamed_display() -> Arc<Catalog> {
         Arc::new(Catalog::new())
     }
@@ -799,12 +739,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// Every batch that changes what the widget retains is published as it arrives.
-    ///
-    /// A batch whose orders are all evicted as stale changes nothing, so publishing
-    /// it would only hand the view a snapshot identical to the one it already
-    /// shows. The liveness check at the end keeps the silent-batch assertion
-    /// honest: the stream is still there and still publishes what does change.
     #[tokio::test]
     async fn a_batch_that_changes_nothing_should_not_publish_a_snapshot() {
         let (binance_setup_sender, binance_setup) = setup();
@@ -840,7 +774,6 @@ mod tests {
             .unwrap();
         while latest.next_unseen().is_some() {}
 
-        // Both retained slots hold newer orders, so this batch is evicted whole.
         binance_events
             .send(Ok(Arc::new(vec![force_order(
                 &binance_route(),
@@ -883,8 +816,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// An event naming a listing its own route does not publish is not a
-    /// liquidation this pane may show.
     #[tokio::test]
     async fn an_event_of_an_unpublished_listing_should_not_be_retained() {
         let (binance_setup_sender, binance_setup) = setup();
@@ -930,8 +861,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A source that publishes exactly the listings a test names and answers with
-    /// exactly one batch, so a test can hold every other dimension still.
     #[derive(Clone)]
     struct NamingSource {
         listings: Arc<Vec<VenueListingKey>>,
@@ -971,9 +900,6 @@ mod tests {
         }
     }
 
-    /// Rows are named by the generation the service was *given*, not by the
-    /// venue's own symbol: the same listing key the venue wrote as `BTCUSDT` is
-    /// drawn as the name the injected catalog published.
     #[tokio::test]
     async fn a_row_should_be_named_by_the_generation_the_service_was_given() {
         let route = test_support::spot_route();
@@ -1032,9 +958,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// The numbers of a row are written at the increments of the listing the
-    /// injected generation publishes, so a whole price keeps the decimals its own
-    /// tick states instead of being read as the canonical form.
     #[tokio::test]
     async fn a_row_should_be_written_at_the_precision_of_its_published_listing() {
         let route = test_support::spot_route();
@@ -1091,8 +1014,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A listing the generation never named keeps no name at all, so the row is
-    /// drawn as the localized unknown instead of a symbol or a digest.
     #[tokio::test]
     async fn a_row_the_generation_does_not_name_should_carry_no_label() {
         let route = test_support::spot_route();

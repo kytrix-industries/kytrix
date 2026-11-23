@@ -17,10 +17,6 @@ use crate::{
     market_participants::model::TimeFrame,
 };
 
-/// Binance klines, in the spelling its API expects.
-///
-/// Binance publishes no two-day candle, and its second candles exist on the spot
-/// market only, so the set is keyed by the scope the request is addressed to.
 const BINANCE_INTERVALS: &[(TimeFrame, &str)] = &[
     (TimeFrame::Second1, "1s"),
     (TimeFrame::Minute1, "1m"),
@@ -42,16 +38,11 @@ const BINANCE_INTERVALS: &[(TimeFrame, &str)] = &[
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BinanceCodec;
-/// Returns whether Binance publishes the one-second candle on `route`.
-///
-/// The interval exists on the spot market only: the futures kline endpoint
-/// answers `1s` with an invalid-interval error.
 fn publishes_second(route: &VenueRoute) -> bool {
     route.scope.as_str() == crate::routing::SPOT_SCOPE
 }
 
 impl BinanceCodec {
-    /// The product family one Binance scope trades.
     pub fn product(route: &VenueRoute) -> Option<BinanceProduct> {
         match route.scope.as_str() {
             crate::routing::SPOT_SCOPE => Some(BinanceProduct::Spot),
@@ -60,13 +51,6 @@ impl BinanceCodec {
         }
     }
 
-    /// The listing identity one Binance symbol names on `route`.
-    ///
-    /// A route-scoped answer names its subject by the venue's symbol alone, and a
-    /// Binance symbol is the stable protocol identity of that listing, so the key
-    /// is derived from the symbol exactly the way the catalog derives it — there
-    /// is no directory an adapter could consult, and an invented key would name a
-    /// listing the published catalog does not hold.
     pub fn listing_key(
         route: &VenueRoute,
         product: BinanceProduct,
@@ -93,7 +77,6 @@ impl BinanceCodec {
         })
     }
 
-    /// Extracts the correlation ID from a Binance WebSocket response.
     pub fn extract_response_id(payload: &[u8]) -> Option<u64> {
         serde_json::from_slice::<BinanceResponseId>(payload)
             .ok()
@@ -122,10 +105,6 @@ impl BinanceCodec {
             })
     }
 
-    /// The candlestick intervals Binance publishes on `route`.
-    ///
-    /// The set is the venue's own kline set: the second candle exists on the
-    /// spot market only, and Binance publishes no two-day candle anywhere.
     pub fn published_timeframes(route: &VenueRoute) -> Vec<TimeFrame> {
         BINANCE_INTERVALS
             .iter()
@@ -134,10 +113,6 @@ impl BinanceCodec {
             .collect()
     }
 
-    /// Maps one Binance error envelope onto a typed market-participant failure.
-    ///
-    /// The codes Binance answers with are its own and its message is the whole
-    /// explanation it gives, so both are passed through rather than paraphrased.
     pub(crate) fn map_error(
         &self,
         error: &BinanceErrorResponse,
@@ -177,11 +152,6 @@ impl BinanceCodec {
         }
     }
 
-    /// Maps one failed Binance HTTP response onto a typed market-participant failure.
-    ///
-    /// Binance reports a refused request as its own `{code, msg}` envelope, so
-    /// that envelope is what a user is shown; a failure without one keeps the
-    /// venue's plain text instead.
     pub(crate) fn response_error(
         &self,
         route: &VenueRoute,
@@ -200,10 +170,6 @@ impl BinanceCodec {
         }
     }
 
-    /// The string Binance expects for `timeframe` on `route`.
-    ///
-    /// The set is Binance's own kline set: an interval this route does not
-    /// publish is refused here rather than by the venue.
     pub fn encode_timeframe(
         &self,
         route: &VenueRoute,
@@ -219,10 +185,6 @@ impl BinanceCodec {
                 timeframe: smol_str::SmolStr::new(timeframe.label()),
             })
     }
-    /// The frame that opens one public stream subscription.
-    ///
-    /// Binance answers it with the same request id, which is what lets the
-    /// connection resolve the acknowledgement of this exact subscription.
     pub fn encode_subscription(
         &self,
         streams: &[impl AsRef<str>],
@@ -276,8 +238,6 @@ mod tests {
         );
     }
 
-    /// The venue's own kline spelling is what goes on the wire, and its 1M and 1m
-    /// intervals are different candles.
     #[test]
     fn the_model_intervals_are_encoded_in_the_venue_spelling() {
         let codec = BinanceCodec;
@@ -303,8 +263,6 @@ mod tests {
         );
     }
 
-    /// A stream name that is not a bare string is rejected by the venue, so the
-    /// frame is asserted rather than derived.
     #[test]
     fn a_subscription_frame_carries_bare_stream_names() {
         let args = BinanceCodec.encode_subscription(&["btcusdt@depth@100ms"], 11);
@@ -316,8 +274,6 @@ mod tests {
         );
     }
 
-    /// Binance answers a refused request with its own envelope: the code and the
-    /// words a user reads are the venue's own.
     #[test]
     fn a_refusal_envelope_reaches_the_user_as_the_venue_wrote_it() {
         let error = BinanceCodec.response_error(
@@ -334,7 +290,6 @@ mod tests {
         ));
     }
 
-    /// A rate-limited envelope keeps the venue's own classification of it.
     #[test]
     fn a_rate_limit_envelope_maps_to_the_rate_limited_failure() {
         let error = BinanceCodec.response_error(
@@ -347,8 +302,6 @@ mod tests {
         assert!(matches!(error, MarketParticipantError::RateLimited { .. }));
     }
 
-    /// The error mapping keeps the raw response when a mapped code needs context
-    /// the venue did not send.
     #[test]
     fn market_participant_error_mapping_preserves_raw_response_when_context_is_missing() {
         let error = BinanceCodec.map_error(
@@ -371,8 +324,6 @@ mod tests {
         ));
     }
 
-    /// A failure Binance did not describe is reported as the transport reported
-    /// it: a server failure is the connection, anything else the status line.
     #[test]
     fn a_failure_without_a_binance_envelope_keeps_the_transport_answer() {
         let server = BinanceCodec.response_error(

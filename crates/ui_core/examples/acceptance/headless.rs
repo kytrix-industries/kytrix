@@ -1,23 +1,3 @@
-//! `cpu` 模式：headless 多帧序列，测「增量帧」与「1000 单元文本更新帧」的 CPU 时间。
-//!
-//! 脚本（帧数可调，默认值即报告口径）：
-//!
-//! ```text
-//! 首帧（全量，不计）→ 50 帧预热（增量，不计）
-//! → 250 帧增量帧（5 行盘口 + 1 笔成交 + 滚动 1 行 + 折线平移 0.5px）
-//! → 30 帧 1000 单元文本更新（125 行 × 8 列）
-//! → 30 帧只平移折线 / 30 帧只滚动成交列表（分通道归因）
-//! → 10 帧空闲帧（帧门禁必须全部退化为 Idle）
-//! ```
-//!
-//! 每一帧的计时拆成两段：**写状态**（应用侧 `App::write` / `scroll_to` /
-//! `set_geometry_transform`）与**帧内 CPU**（`App::frame` 的样式 → 文本 → 布局 → 绘制 → 编码）。
-//! 判定用「写 + 帧」的合计（更接近 UI 线程每帧真实占用）。
-//!
-//! `--features test-support` 构建时额外打印 `FrameRecord` 的确定性计数
-//! （`encoded_lanes` / `reused_segments` / `uploaded_bytes` / `scanned_nodes`），
-//! 并**明确警告**该构建的计时不可与生产特性比较。
-
 use std::time::Instant;
 
 use ui_core::{
@@ -33,39 +13,26 @@ use crate::{
     scene::{self, Load},
 };
 
-/// 增量帧目标（毫秒）。
 const INCREMENTAL_TARGET_MS: f64 = 2.0;
-/// 1000 单元文本帧目标（毫秒）。
 const TEXT_TARGET_MS: f64 = 4.0;
 
-/// 一个场景的测量结果。
 struct Scenario {
     name: &'static str,
     update: Samples,
     frame: Samples,
     total: Samples,
     idle_frames: usize,
-    /// A1（paint 脏子树剪枝）的确定性计数：默认构建也打印（`Window::tree()` 是公开只读面）。
     paint: PaintProbe,
-    /// 本场景的 `FrameRecord` 计数区间（仅 test-support 构建）。
     #[cfg(feature = "test-support")]
     counters: Counters,
 }
 
-/// paint 剪枝的观测值（每帧访问数区间 + 累计路径计数）。
-///
-/// 与 [`Counters`]（仅 `test-support`）不同：这里没有 test-support 依赖，因此**默认特性**构建的
-/// 性能报告也能证明「本帧走的是增量路径」。
 #[derive(Clone, Copy, Debug)]
 struct PaintProbe {
-    /// 每帧 `visited_nodes` 的 [min, max]。
     visited: (usize, usize),
-    /// 相对本场景起点的累计全量 / 增量帧数。
     full_frames: u64,
     incremental_frames: u64,
-    /// 相对本场景起点的绘制序兜底次数（增量路径回退率）。
     order_rebuilds: u64,
-    /// 场景起点时的累计计数器快照。
     start: Option<ui_core::node::tree::PaintCounters>,
 }
 
@@ -111,7 +78,6 @@ impl PaintProbe {
     }
 }
 
-/// `FrameRecord` 计数的最小 / 最大值（确定性断言面）。
 #[cfg(feature = "test-support")]
 #[derive(Clone, Copy, Debug)]
 struct Counters {
@@ -230,7 +196,6 @@ impl Scenario {
     }
 }
 
-/// 跑 `cpu` 模式；返回 `true` = 两项 CPU 指标都达标。
 pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -261,7 +226,6 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         build_time.as_secs_f64() * 1e3
     );
 
-    // 首帧：全量（文本塑形 / 布局 / 全 lane 编码），不计入统计。
     let first_started = Instant::now();
     let first = frame_once(&mut app, window)?;
     println!(
@@ -270,7 +234,6 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         outcome_label(&first)
     );
 
-    // 预热：真实增量帧，让文本缓存 / 实例环 / 字形图集都热起来。
     for _ in 0..config.warmup_frames {
         load.incremental_step(&mut app);
         let outcome = frame_once(&mut app, window)?;
@@ -327,7 +290,6 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         )?;
     }
 
-    // 空闲帧：不写任何状态，帧门禁必须直接退化为 Idle（零工作）。
     let mut idle = Samples::new("idle_frame · 帧内 CPU", config.idle_frames);
     let mut idle_bad = 0usize;
     for _ in 0..config.idle_frames {
@@ -342,7 +304,6 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
 
-    // 报告
     println!();
     println!("-- 分场景（毫秒；判定用「写 + 帧」合计的 p99） --");
     for scenario in [&incremental, &text_update, &pan_only, &scroll_only] {
@@ -400,7 +361,6 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(incremental_pass && text_pass && idle_bad == 0)
 }
 
-/// 测一帧：写状态 → 帧 → 记录两段耗时；帧必须提交（否则测的是空帧）。
 fn measure(
     app: &mut App,
     window: WindowId,
@@ -438,7 +398,6 @@ fn measure(
     Ok(())
 }
 
-/// 提交一帧（窗口不存在 = 应用错误）。
 fn frame_once(app: &mut App, window: WindowId) -> Result<FrameOutcome, Box<dyn std::error::Error>> {
     match app.frame(window) {
         Some(result) => Ok(result?),
@@ -446,7 +405,6 @@ fn frame_once(app: &mut App, window: WindowId) -> Result<FrameOutcome, Box<dyn s
     }
 }
 
-/// 帧结果的短标签。
 fn outcome_label(outcome: &FrameOutcome) -> String {
     match outcome {
         FrameOutcome::Idle => "Idle".to_owned(),
@@ -454,7 +412,6 @@ fn outcome_label(outcome: &FrameOutcome) -> String {
     }
 }
 
-/// 打印测量环境（报告可复核的一部分）。
 fn print_environment() {
     println!(
         "环境：os={} arch={} logical_cpus={}",
@@ -464,16 +421,10 @@ fn print_environment() {
     );
 }
 
-/// PASS / FAIL 标记。
 fn verdict(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
 }
 
-/// `breakdown` 模式：把 1000 单元文本帧拆成「样式+形状 → 重排+光栅 → 绘制+编码」三段。
-///
-/// 三段用的是引擎自己的公开入口（`App::refresh_text` / `App::layout_text` / `App::frame`），
-/// 顺序与 `App::frame` 内部的 pass 顺序一致，因此可以把「文本帧为什么这么慢」定位到具体 pass。
-/// **不是**验收判据：单独调用这三段与 `App::frame` 一次跑完在缓存/脏位消费上略有差异。
 pub fn run_breakdown(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

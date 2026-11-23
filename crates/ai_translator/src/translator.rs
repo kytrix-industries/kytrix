@@ -1,5 +1,3 @@
-//! The translator and the process-wide translator instance.
-
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, PoisonError},
@@ -20,20 +18,16 @@ use smol_str::SmolStr;
 
 use crate::{error::TranslationError, language::TargetLanguage, prompt};
 
-/// Names the model file the ignored integration test loads.
 pub const TEST_MODEL_ENV: &str = "KYTRIX_AI_TEST_MODEL";
 
-/// How long unloading may wait for translations that already hold the model.
 const UNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A loaded Hy-MT2 model and the sampling parameters its model card specifies.
 pub struct Translator {
     engine: Engine,
     sampling: SamplingParams,
 }
 
 impl Translator {
-    /// Loads the model at `model_path` and blocks until it can translate.
     pub fn new(model_path: impl Into<PathBuf>) -> Result<Self, TranslationError> {
         let engine = Engine::load(EngineConfig::new(model_path))?;
         Ok(Self {
@@ -42,18 +36,12 @@ impl Translator {
         })
     }
 
-    /// Translates `content` into `target_lang`.
-    ///
-    /// `target_lang` is a model code such as `"en"` or `"zh-Hant"`. Empty content is
-    /// answered without touching the model, and the result is trimmed of the padding the
-    /// model tends to emit.
     pub fn translate(&self, target_lang: &str, content: &str) -> Result<String, TranslationError> {
         let language = parse_language(target_lang)?;
 
         self.translate_parsed(language, content)
     }
 
-    /// Translates content whose language has already been parsed.
     fn translate_parsed(
         &self,
         language: TargetLanguage,
@@ -67,10 +55,6 @@ impl Translator {
         Ok(self.generate(&prompt, None)?.trim().to_owned())
     }
 
-    /// Sends `prompt` to the engine, naming the failures a caller can act on.
-    ///
-    /// A cancelled request is not retried: the caller asked for it to stop, so it is
-    /// reported as [`TranslationError::Cancelled`] rather than as a provider failure.
     pub(crate) fn generate(
         &self,
         prompt: &[PromptSpan],
@@ -82,7 +66,6 @@ impl Translator {
     }
 }
 
-/// Maps an engine failure to the error the translator's callers handle.
 fn map_provider_error(error: ProviderError) -> TranslationError {
     match error {
         ProviderError::PromptTooLong { tokens, limit } => {
@@ -93,17 +76,6 @@ fn map_provider_error(error: ProviderError) -> TranslationError {
     }
 }
 
-/// Translates `content` into `target_lang` through the process-wide translator.
-///
-/// The model is the selected model's file inside `model_directory`: it is loaded on first
-/// use and reused afterwards; a failed load is not cached, so the next call tries again.
-/// The complete model path is part of what is cached, which is what makes a changed
-/// directory or model apply to the next translation. The language is parsed before any
-/// model work, which is what keeps an unknown code from turning into a multi-second model
-/// load.
-///
-/// Empty content is answered before a directory or model is needed, so a build with no
-/// model configured can still prove its translation entry point is usable.
 pub fn translate(
     model_directory: Option<&Path>,
     selected_model: Option<TranslationModel>,
@@ -119,10 +91,6 @@ pub fn translate(
     shared_translator(&model_path)?.translate_parsed(language, content)
 }
 
-/// Returns the file inside `model_directory` that the selected model names.
-///
-/// Every entry point resolves the path here, so a batch and a single translation
-/// load the same file from the same place.
 pub(crate) fn resolve_model_path(
     model_directory: Option<&Path>,
     selected_model: Option<TranslationModel>,
@@ -133,37 +101,22 @@ pub(crate) fn resolve_model_path(
     Ok(directory.join(model.file_name()))
 }
 
-/// The process-wide translator slot.
 enum CachedTranslator {
-    /// No model is cached.
     Empty,
-    /// The model at `path` is loaded and shared by translations in flight.
     Loaded {
         path: PathBuf,
         translator: Arc<Translator>,
     },
-    /// The model at `path` is being dropped and must not be loaded again yet.
-    Unloading { path: PathBuf },
+    Unloading {
+        path: PathBuf,
+    },
 }
 
-/// The translator shared by every caller of [`translate`], with the model path it was
-/// loaded from.
 static TRANSLATOR: OnceLock<Mutex<CachedTranslator>> = OnceLock::new();
 
-/// Serializes tests that touch the process-wide translator cache, in this module and in
-/// [`crate::batch`]: replacing a cache entry or observing one must not overlap.
 #[cfg(test)]
 pub(crate) static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-/// Returns the translator for `model_path`, loading it when the cached model came from
-/// another path.
-///
-/// The lock is held while the model loads: callers clone the `Arc` and translate outside
-/// it, so concurrent translations do not queue on the mutex (the engine serializes them
-/// itself). A different model path replaces the cached translator, so a session that
-/// changes the directory or the selected model gets the new file without a restart; a
-/// failed load leaves the slot empty, so the next call tries again. A model that is being
-/// unloaded is reported as busy instead of being loaded while its file is still dropped.
 pub(crate) fn shared_translator(model_path: &Path) -> Result<Arc<Translator>, TranslationError> {
     let slot = TRANSLATOR.get_or_init(|| Mutex::new(CachedTranslator::Empty));
     let mut cached = slot.lock().unwrap_or_else(PoisonError::into_inner);
@@ -195,16 +148,6 @@ pub(crate) fn shared_translator(model_path: &Path) -> Result<Arc<Translator>, Tr
     }
 }
 
-/// Drops the cached translator when it is the model at `model_path`.
-///
-/// The matching entry is marked unloading and its `Arc` is taken out of the cache before
-/// the lock is released. Translations that already hold the translator keep it alive, so
-/// this waits until they have all finished and the `Arc` is the last reference; only then
-/// is the engine dropped and the model file free to be deleted. The wait is bounded: if
-/// translations still hold the model after [`UNLOAD_TIMEOUT`], the cache keeps the model
-/// and the caller is told the file cannot be removed yet. The waiting happens on the
-/// caller's thread, which is a blocking worker because this is called through
-/// `TranslationDownloads`' blocking delete.
 pub fn unload_model(model_path: &Path) -> Result<(), TranslationError> {
     let slot = TRANSLATOR.get_or_init(|| Mutex::new(CachedTranslator::Empty));
     let removed = {
@@ -251,20 +194,12 @@ pub fn unload_model(model_path: &Path) -> Result<(), TranslationError> {
     Ok(())
 }
 
-/// Replaces the process-wide translator slot, for tests that exercise its states without a
-/// multi-gigabyte model.
 #[cfg(test)]
 fn set_cached_translator_for_test(cached: CachedTranslator) {
     let slot = TRANSLATOR.get_or_init(|| Mutex::new(CachedTranslator::Empty));
     *slot.lock().unwrap_or_else(PoisonError::into_inner) = cached;
 }
 
-/// The sampling parameters the model card specifies for Hy-MT2-1.8B.
-///
-/// `120_020` is the GGUF's EOS. `120_008`, `120_026` and `120_001` are the
-/// model's EOT, conversation-end and end-of-sentence control tokens; stopping on
-/// all four only cuts control markers, so it is safe and bounds a model that
-/// would otherwise run to `max_tokens`.
 fn sampling_params() -> SamplingParams {
     SamplingParams {
         max_tokens: 4096,
@@ -278,7 +213,6 @@ fn sampling_params() -> SamplingParams {
     }
 }
 
-/// Parses a target language code into the language the prompt names.
 pub(crate) fn parse_language(code: &str) -> Result<TargetLanguage, TranslationError> {
     TargetLanguage::parse(code).ok_or_else(|| TranslationError::UnsupportedLanguage {
         code: SmolStr::new(code),
@@ -422,7 +356,6 @@ mod tests {
         );
     }
 
-    /// Unloading a model that is not cached is not a failure: there is nothing to release.
     #[test]
     fn unloading_an_uncached_model_should_succeed() {
         let _guard = CACHE_TEST_LOCK
@@ -434,8 +367,6 @@ mod tests {
             .expect("an uncached model has nothing to release");
     }
 
-    /// A model that is being unloaded is not loaded again while its file may still be held;
-    /// the caller gets a typed busy error instead.
     #[test]
     fn a_model_that_is_being_unloaded_should_be_reported_busy() {
         let _guard = CACHE_TEST_LOCK
@@ -460,8 +391,6 @@ mod tests {
         set_cached_translator_for_test(CachedTranslator::Empty);
     }
 
-    /// The selected model decides the file name looked up inside the configured
-    /// directory: no other location or fixed file name is consulted.
     #[test]
     fn the_selected_model_decides_which_file_is_looked_for() {
         let _guard = CACHE_TEST_LOCK

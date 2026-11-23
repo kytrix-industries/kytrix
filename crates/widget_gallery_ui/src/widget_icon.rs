@@ -1,28 +1,6 @@
-//! The icon one widget shows in the gallery.
-//!
-//! A widget declares its picture as an application asset path (`widgets/candlestick.png`).
-//! The kit does not draw application assets in the catalogue: it has one icon set
-//! (`base_ui::kit::icon`, 55 variants) that every part of the interface uses, so the page
-//! maps the declared path onto the nearest icon of that set. The mapping is a table
-//! rather than a rule because "nearest icon" is a design decision per widget, and a table
-//! is what makes a missing entry visible: a path the table does not name falls back to the
-//! gallery's own puzzle piece, and [`MISSING_ICONS`] is the register of concepts the icon
-//! set does not carry yet (the concept a widget really wants, and the icon it is drawn
-//! with until the asset batch adds one).
-//!
-//! The mapping is keyed by the declared asset path, not by the widget identity: the path
-//! is what [`WidgetDescriptor::icon`] gives the page, and a widget that changes its
-//! picture changes its icon here by editing one row.
-
 use base_ui::kit::icon::IconKind;
 use widget::descriptor::WidgetDescriptor;
 
-/// The icon each declared widget picture maps to.
-///
-/// Every entry is a path a registered widget's [`WidgetView::ICON`] names; the tests pin
-/// that the table covers the catalogue that ships and that every value is a kit icon.
-///
-/// [`WidgetView::ICON`]: widget::view::WidgetView::ICON
 const WIDGET_ICONS: &[(&str, IconKind)] = &[
     ("widgets/candlestick.png", IconKind::Graph),
     (
@@ -52,15 +30,8 @@ const WIDGET_ICONS: &[(&str, IconKind)] = &[
     ("widgets/x.png", IconKind::At),
 ];
 
-/// The picture a widget that declares none is drawn with: the gallery's own mark.
 const FALLBACK: IconKind = IconKind::PuzzlePiece;
 
-/// Concepts the kit's 55-icon set does not carry, and what the page draws instead.
-///
-/// One row per concept (not per widget): the batch that adds an icon to the set replaces
-/// the rows that name it and the mapping above starts using the new variant. The register
-/// is what "缺图标登记" means concretely — an icon that is missing is recorded here, not
-/// silently recoloured into a lookalike.
 pub const MISSING_ICONS: &[(MissingIcon, IconKind)] = &[
     (MissingIcon::CandlestickChart, IconKind::Graph),
     (MissingIcon::Gauge, IconKind::Faders),
@@ -72,29 +43,19 @@ pub const MISSING_ICONS: &[(MissingIcon, IconKind)] = &[
     (MissingIcon::ChipsOrCandles, IconKind::Graph),
 ];
 
-/// One icon the kit does not carry yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MissingIcon {
-    /// A candlestick chart (price series with wicks).
     CandlestickChart,
-    /// A gauge / fear-and-greed dial.
     Gauge,
-    /// A calendar page.
     Calendar,
-    /// A globe or map (shipping choke points).
     Globe,
-    /// A wallet.
     Wallet,
-    /// A heat map (a grid of intensities).
     Heatmap,
-    /// A depth ladder / order book.
     OrderBookLadder,
-    /// A chip stack or candles for the index widgets.
     ChipsOrCandles,
 }
 
 impl MissingIcon {
-    /// The concept this row registers, in words.
     pub const fn concept(self) -> &'static str {
         match self {
             Self::CandlestickChart => "candlestick chart",
@@ -109,10 +70,6 @@ impl MissingIcon {
     }
 }
 
-/// The icon the page draws for one catalogue entry.
-///
-/// A widget with no declared picture, or with a picture this table does not name, gets
-/// the gallery's puzzle piece: the page always draws a picture beside a name.
 pub fn icon_for(descriptor: &WidgetDescriptor) -> IconKind {
     descriptor
         .icon()
@@ -120,7 +77,6 @@ pub fn icon_for(descriptor: &WidgetDescriptor) -> IconKind {
         .unwrap_or(FALLBACK)
 }
 
-/// The icon one declared asset path maps to, if the table names it.
 pub fn icon_for_path(path: &str) -> Option<IconKind> {
     WIDGET_ICONS
         .iter()
@@ -136,10 +92,6 @@ mod tests {
 
     use super::{FALLBACK, MISSING_ICONS, WIDGET_ICONS, icon_for, icon_for_path};
 
-    /// The pictures the catalogue that ships declares. Kept as data rather than imported
-    /// from the widget crates (this crate does not depend on them): the list is the page's
-    /// contract with the catalogue, and the test below is what turns a drift into a
-    /// failure instead of a puzzle piece on screen.
     const CATALOGUE_ICONS: [&str; 23] = [
         "widgets/candlestick.png",
         "widgets/coin_market_cap_fear_and_greed_index.png",
@@ -166,8 +118,6 @@ mod tests {
         "widgets/x.png",
     ];
 
-    /// Every picture the catalogue declares maps to an icon of the kit's set, so a widget
-    /// never appears without a picture because the table forgot it.
     #[test]
     fn every_listed_widget_picture_should_map_to_a_kit_icon() {
         for path in CATALOGUE_ICONS {
@@ -182,8 +132,6 @@ mod tests {
         }
     }
 
-    /// The table names each picture once: two rows for one path would make which icon a
-    /// widget gets depend on row order.
     #[test]
     fn no_picture_should_be_mapped_twice() {
         let paths = WIDGET_ICONS.iter().map(|(path, _)| *path);
@@ -192,8 +140,6 @@ mod tests {
         assert_eq!(paths.count(), unique.len(), "a path is mapped twice");
     }
 
-    /// The table maps nothing the catalogue does not declare: an entry for a picture no
-    /// widget has is a row that will never be read, and it hides a typo in a real one.
     #[test]
     fn the_table_should_map_exactly_the_catalogue_pictures() {
         let declared: HashSet<&str> = CATALOGUE_ICONS.into_iter().collect();
@@ -205,8 +151,6 @@ mod tests {
         );
     }
 
-    /// A widget that declares no picture is drawn with the gallery's own, so a widget that
-    /// has not been given one yet is still a picture beside its name.
     #[test]
     fn a_widget_without_a_picture_should_get_the_gallery_own_icon() {
         use app_config::widget::WidgetConfigSchemaVersion;
@@ -222,15 +166,11 @@ mod tests {
         assert_eq!(icon_for(&descriptor), FALLBACK);
     }
 
-    /// An unknown picture is the gallery's own icon rather than nothing: a picture the
-    /// page does not know is not a reason for the row to lose its picture.
     #[test]
     fn an_unknown_picture_should_get_the_gallery_own_icon() {
         assert_eq!(icon_for_path("widgets/does-not-exist.png"), None);
     }
 
-    /// Every registered missing concept points at a real icon of the set, so the register
-    /// is a record of the workaround that is actually drawn instead of a wish list.
     #[test]
     fn every_missing_icon_should_name_the_icon_drawn_instead() {
         let mut concepts = HashSet::new();

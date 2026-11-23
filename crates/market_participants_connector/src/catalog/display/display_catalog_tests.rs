@@ -1,11 +1,3 @@
-//! The catalogue's naming gate.
-//!
-//! Every test here drives one whole publication — the staged batch, the naming
-//! gate and the resulting display catalog — because the decisions under test are
-//! catalogue-global: which code an asset publishes, which name an instrument gets,
-//! how a listing is named after its instrument, and which staged values are
-//! refused. A single listing cannot answer any of them.
-
 use market_participants_model::{
     asset::{
         AssetId, ContractAddress, CryptoTokenId, CryptoTokenOrigin, CryptoTokenTerms, CurrencyId,
@@ -75,7 +67,6 @@ use crate::catalog::{
     },
 };
 
-/// One price reference of a fixture pair, observed by `source`.
 fn reference_terms(source: &str, base: &str, quote: &str) -> PriceReferenceTerms {
     PriceReferenceTerms {
         underlying: UnderlyingRef::Asset(token(VENUE, base)),
@@ -92,8 +83,6 @@ fn reference_terms(source: &str, base: &str, quote: &str) -> PriceReferenceTerms
     }
 }
 
-/// One price reference of the fixture venue over an explicit underlying, quote and
-/// observation kind.
 fn price_reference_terms(
     underlying: UnderlyingRef,
     quote_asset: AssetId,
@@ -115,12 +104,10 @@ fn price_reference_terms(
     }
 }
 
-/// The fetch context of one registered fixture route.
 fn context(route: &VenueRoute) -> CatalogFetchContext {
     context_of(registration(route))
 }
 
-/// The fixture registration of one route.
 fn registration(route: &VenueRoute) -> CatalogRouteRegistration {
     CatalogRouteRegistration::catalog(
         route.clone(),
@@ -131,7 +118,6 @@ fn registration(route: &VenueRoute) -> CatalogRouteRegistration {
     )
 }
 
-/// The fetch context of one explicitly described fixture route.
 fn context_of(registration: CatalogRouteRegistration) -> CatalogFetchContext {
     let route = registration.route().clone();
     let update = CatalogRouteUpdate::new(
@@ -158,16 +144,10 @@ fn context_of(registration: CatalogRouteRegistration) -> CatalogFetchContext {
     )
 }
 
-/// An empty generation of the fixture route registry.
 fn base_generation() -> CatalogGeneration {
     CatalogGeneration::empty(&CatalogGenerationPublisher::new())
 }
 
-/// Stages one batch against an explicitly named base generation.
-///
-/// The generation a batch is staged on is the one whose registries the publication
-/// carries, so a test that needs a registry identity no listing of its batch
-/// references stages on the generation that published it.
 fn publish_bare_on(
     context: CatalogFetchContext,
     base: &CatalogGeneration,
@@ -180,11 +160,6 @@ fn publish_bare_on(
         .with_pending(pending, &CatalogGenerationPublisher::new())
 }
 
-/// Stages one batch for the fixture route and answers the generation it published.
-///
-/// The batch is published exactly as the caller built it: the fixture vocabulary
-/// does not fill in terms the caller withheld, so a test that withholds them is
-/// the test of the refusal it expects.
 fn publish_bare(
     route: &VenueRoute,
     batch: CatalogBatch,
@@ -192,7 +167,6 @@ fn publish_bare(
     publish_bare_at(context(route), batch)
 }
 
-/// Stages one batch for an explicitly described fixture route.
 fn publish_bare_at(
     context: CatalogFetchContext,
     batch: CatalogBatch,
@@ -204,11 +178,6 @@ fn publish_bare_at(
     base.with_pending(pending, &CatalogGenerationPublisher::new())
 }
 
-/// Stages one batch for the fixture route and answers the generation it published.
-///
-/// The canonical terms of the fixture vocabulary's own assets travel with the
-/// batch, the way a real source stages the terms it translated out of a venue
-/// response.
 fn publish(route: &VenueRoute, batch: CatalogBatch) -> Result<CatalogGeneration, CatalogError> {
     let context = context(route);
     let mut batch = batch;
@@ -220,12 +189,6 @@ fn publish(route: &VenueRoute, batch: CatalogBatch) -> Result<CatalogGeneration,
     base.with_pending(pending, &CatalogGenerationPublisher::new())
 }
 
-/// Stages two fixture routes into one generation, in the order given.
-///
-/// A code is a pure function of one asset, so one route can never move another
-/// route's code; the second batch is staged on top of the generation the first one
-/// produced, which is the same path a revoked route or a registry-only publication
-/// takes.
 fn publish_pair(
     first: (&VenueRoute, CatalogBatch),
     second: (&VenueRoute, CatalogBatch),
@@ -240,7 +203,6 @@ fn publish_pair(
     generation.with_pending(pending, &CatalogGenerationPublisher::new())
 }
 
-/// The typed error of a refused fixture publication.
 fn refused(route: VenueRoute, error: CatalogValidationError) -> CatalogError {
     CatalogError::InvalidCatalog {
         route,
@@ -248,7 +210,6 @@ fn refused(route: VenueRoute, error: CatalogValidationError) -> CatalogError {
     }
 }
 
-/// The display error inside a refusal.
 fn display_error(error: &CatalogError) -> &DisplayError {
     match error {
         CatalogError::InvalidCatalog { error, .. } => match error.as_ref() {
@@ -259,7 +220,6 @@ fn display_error(error: &CatalogError) -> &DisplayError {
     }
 }
 
-/// The fixture security and its canonical terms.
 fn fixture_security() -> (AssetId, SecurityTerms) {
     let issuer = SecurityIssuerId::new("cik/320193").expect("the fixture issuer is canonical");
     let share_class = ShareClassId::new(&ShareClassTerms {
@@ -283,7 +243,6 @@ fn fixture_security() -> (AssetId, SecurityTerms) {
     )
 }
 
-/// A spot instrument of one asset and the fixture USD token.
 fn asset_spot(asset: AssetId) -> Instrument {
     Instrument::new(InstrumentTerms::Spot(
         SpotTerms::new(asset, token(VENUE, "USDT")).expect("the fixture pair is valid"),
@@ -291,7 +250,6 @@ fn asset_spot(asset: AssetId) -> Instrument {
     .expect("the fixture instrument is valid")
 }
 
-/// A linear perpetual quoted, settled and sized in the fixture tokens.
 fn perpetual(reference: PriceReferenceId, base: &str, quote: &str) -> Instrument {
     let contract_size = ContractSize::new(
         ContractUnit::asset_quantity(Quantity::from(1_u8), token(VENUE, base))
@@ -315,7 +273,6 @@ fn perpetual(reference: PriceReferenceId, base: &str, quote: &str) -> Instrument
     .expect("the fixture perpetual instrument is valid")
 }
 
-/// The share class terms the fixture security identity was derived from.
 fn share_class_terms() -> ShareClassTerms {
     ShareClassTerms {
         issuer: SecurityIssuerId::new("cik/320193").expect("the fixture issuer is canonical"),
@@ -326,10 +283,6 @@ fn share_class_terms() -> ShareClassTerms {
     }
 }
 
-/// The stageable display code of one asset of the fixture vocabulary.
-///
-/// A code is free text, so a staged value runs through the same normalization an
-/// adapter's verified value does.
 fn staged_code(asset: AssetId, code: &str) -> StagedAssetCode {
     StagedAssetCode {
         asset,
@@ -337,11 +290,6 @@ fn staged_code(asset: AssetId, code: &str) -> StagedAssetCode {
     }
 }
 
-/// The published name of one fixture listing.
-///
-/// the display layer keeps exactly one *name* per listing — the name of the
-/// instrument it implements — beside the listing's search aliases, so a listing the
-/// publication never named has none.
 fn name_of(generation: &CatalogGeneration, entry: &CatalogEntry) -> SmolStr {
     SmolStr::new(
         generation
@@ -352,7 +300,6 @@ fn name_of(generation: &CatalogGeneration, entry: &CatalogEntry) -> SmolStr {
     )
 }
 
-/// One future series identified by its contract code alone.
 fn future_code_series(code: &str) -> FutureSeriesIdentifiers {
     FutureSeriesIdentifiers {
         market_participant_series_id: None,
@@ -361,7 +308,6 @@ fn future_code_series(code: &str) -> FutureSeriesIdentifiers {
     }
 }
 
-/// One option series identified by its market-participant series id alone.
 fn market_participant_series(value: &str) -> OptionSeriesIdentifiers {
     OptionSeriesIdentifiers {
         occ_symbol: None,
@@ -373,7 +319,6 @@ fn market_participant_series(value: &str) -> OptionSeriesIdentifiers {
     }
 }
 
-/// One physical delivery of `quantity` BTC in `direction`.
 fn physical_delivery(direction: DeliveryDirection) -> DeliveryMode {
     DeliveryMode::physical(vec![
         DeliveryLeg::new(token(VENUE, "BTC"), Quantity::from(1_u8), direction)
@@ -382,11 +327,6 @@ fn physical_delivery(direction: DeliveryDirection) -> DeliveryMode {
     .expect("the fixture physical delivery is valid")
 }
 
-/// One physically delivered crypto future of the fixture venue.
-///
-/// the delivery hands over the asset the contract tracks, so the
-/// fixture states the leg the model requires and the settlement position of the
-/// name is the one the delivery mode decides.
 fn physical_future_entry(
     route: &VenueRoute,
     tracked: PriceReferenceId,
@@ -419,7 +359,6 @@ fn physical_future_entry(
     )
 }
 
-/// One physically delivered crypto option of the fixture venue.
 fn physical_option_entry(
     route: &VenueRoute,
     tracked: PriceReferenceId,
@@ -452,7 +391,6 @@ fn physical_option_entry(
     )
 }
 
-/// One linear perpetual of one explicit pnl model.
 fn perpetual_under(
     reference: PriceReferenceId,
     base: &str,
@@ -478,10 +416,6 @@ fn perpetual_under(
     .expect("the fixture perpetual instrument is valid")
 }
 
-/// One crypto future listing sized in `quantity` units of BTC.
-///
-/// the contract size is a term and not a clause of the name, so a
-/// fixture that varies it is what pins that omission.
 fn crypto_future_entry_of(
     route: &VenueRoute,
     tracked: PriceReferenceId,
@@ -513,7 +447,6 @@ fn crypto_future_entry_of(
     series_entry(route, instrument, token(VENUE, "BTC"), series)
 }
 
-/// One contract token of the fixture chain, which states no code of its own.
 fn contract_token(address: &str) -> AssetTerms {
     AssetTerms::CryptoToken(CryptoTokenTerms {
         origin: CryptoTokenOrigin::Chain {
@@ -525,7 +458,6 @@ fn contract_token(address: &str) -> AssetTerms {
     })
 }
 
-/// One crypto future listing sized in an explicit contract unit asset.
 fn future_entry_with_unit(
     route: &VenueRoute,
     tracked: PriceReferenceId,
@@ -557,10 +489,6 @@ fn future_entry_with_unit(
     series_entry(route, instrument, token(VENUE, "BTC"), series)
 }
 
-// ---- what a name does not state ---------------
-
-/// a contract that hands over real assets renders `PHYS` in the
-/// settlement position, and the price quote it is priced in never replaces it.
 #[test]
 fn a_physical_future_states_the_physical_settlement() {
     let route = future_route();
@@ -584,8 +512,6 @@ fn a_physical_future_states_the_physical_settlement() {
     );
 }
 
-/// an option that hands over real assets renders `PHYS` in the same
-/// position, and its strike and right are stated beside it.
 #[test]
 fn a_physical_option_states_the_physical_settlement() {
     let route = option_route();
@@ -609,12 +535,8 @@ fn a_physical_option_states_the_physical_settlement() {
     );
 }
 
-/// an attribute a name does not state never changes it, so two
-/// instruments whose terms differ in contract size, pnl model or delivery legs
-/// publish one name — on one route, in one batch.
 #[test]
 fn attribute_changes_do_not_change_the_published_name() {
-    // Contract size: `A(1,BTC)` against `A(10,BTC)`.
     let route = future_route();
     let (tracked, reference) = crypto_reference("USD");
     let small = crypto_future_entry_of(&route, tracked, 1, future_code_series("ES-1"));
@@ -645,8 +567,6 @@ fn attribute_changes_do_not_change_the_published_name() {
         "the two contract sizes publish one name"
     );
 
-    // Pnl model: a contract that settles in the asset it tracks states that asset
-    // under both models, so the two differ in the model alone.
     let route = perp_route();
     let terms = reference_terms("binance", "BTC", "BTC");
     let tracked = terms
@@ -690,7 +610,6 @@ fn attribute_changes_do_not_change_the_published_name() {
         "the two pnl models publish one name"
     );
 
-    // Delivery legs: the same physical contract, its legs stated two ways.
     let route = future_route();
     let (tracked, reference) = crypto_reference("USD");
     let receive = physical_future_entry(&route, tracked, DeliveryDirection::Receive, "P-1");
@@ -722,8 +641,6 @@ fn attribute_changes_do_not_change_the_published_name() {
     );
 }
 
-/// a contract token states no code of its own, so a batch that renders
-/// one without staging a code refuses the publication.
 #[test]
 fn a_named_contract_token_without_a_code_refuses_the_batch() {
     let base = contract_token("0x0000000000000000000000000000000000000001");
@@ -747,8 +664,6 @@ fn a_named_contract_token_without_a_code_refuses_the_batch() {
     );
 }
 
-/// only the assets a *name* renders need a code, so a contract sized
-/// in a contract token — which nothing states — still publishes.
 #[test]
 fn a_contract_unit_without_a_code_does_not_refuse_the_batch() {
     let route = future_route();
@@ -778,9 +693,6 @@ fn a_contract_unit_without_a_code_does_not_refuse_the_batch() {
     );
 }
 
-/// only an asset a published name renders must have a code, so a
-/// registry-only security — for which no route staged a ticker — publishes without
-/// one instead of refusing the generation.
 #[test]
 fn a_registry_only_asset_without_a_code_is_not_named() {
     let (security, terms) = fixture_security();
@@ -812,8 +724,6 @@ fn a_registry_only_asset_without_a_code_is_not_named() {
     );
 }
 
-/// one asset has exactly one code, so a staged value that contradicts
-/// the code the asset's own terms state refuses the whole batch.
 #[test]
 fn a_staged_code_that_contradicts_the_asset_terms_refuses_the_batch() {
     let asset = token(VENUE, "BTC");
@@ -840,8 +750,6 @@ fn a_staged_code_that_contradicts_the_asset_terms_refuses_the_batch() {
     );
 }
 
-/// the only other value the display layer keeps for a listing is its search
-/// aliases, so a native symbol is matched by but never stated in a name.
 #[test]
 fn the_native_symbol_is_a_search_alias_and_never_a_name() {
     let asset = test_support::entry_with_aliases(
@@ -877,10 +785,6 @@ fn the_native_symbol_is_a_search_alias_and_never_a_name() {
     );
 }
 
-// ---- the code of an asset ------------------------------------------
-
-/// a code is a pure function of one asset's own terms, so a currency
-/// and a token of one spelling both publish it and neither is renamed.
 #[test]
 fn a_currency_and_a_token_of_one_code_both_keep_it() {
     let currency_terms = CurrencyTerms {
@@ -919,8 +823,6 @@ fn a_currency_and_a_token_of_one_code_both_keep_it() {
     );
 }
 
-/// two tokens of one native code, issued by different venues, publish
-/// the same code and both keep it — nothing is renamed to tell them apart.
 #[test]
 fn two_tokens_of_one_code_keep_it() {
     let mut first_terms = token_terms("alpha", "USD");
@@ -969,8 +871,6 @@ fn two_tokens_of_one_code_keep_it() {
     assert_eq!(second_code.as_str(), "USD");
 }
 
-/// the published name, the details it was rendered from and the listing that
-/// carries it are one computation, so they can never disagree.
 #[test]
 fn the_published_names_and_details_agree() {
     let instrument = test_support::spot_token(VENUE, "BTC", "USDT");
@@ -1003,10 +903,6 @@ fn the_published_names_and_details_agree() {
     );
 }
 
-// ---- the staged code of a security ---------------------------------
-
-/// one security states one code, and two staged entries that
-/// disagree refuse the whole batch.
 #[test]
 fn a_security_staged_with_two_codes_refuses_the_batch() {
     let (security, terms) = fixture_security();
@@ -1036,13 +932,6 @@ fn a_security_staged_with_two_codes_refuses_the_batch() {
     );
 }
 
-/// the staged codes of every surviving route are indexed
-/// together, so two routes that verified two codes for one asset refuse the batch
-/// instead of being resolved by route order.
-///
-/// The first route publishes the security under the ticker it staged; the second
-/// stages a second code for the same canonical asset, which the generation it is
-/// staged on already carries.
 #[test]
 fn two_routes_that_stage_two_codes_for_one_asset_refuse_the_batch() {
     let (security, _terms) = fixture_security();
@@ -1077,8 +966,6 @@ fn two_routes_that_stage_two_codes_for_one_asset_refuse_the_batch() {
     );
 }
 
-/// the ticker a route staged is the code of the security, normalized through
-/// the display pipeline, and the name of a spot pair of it states the ticker alone.
 #[test]
 fn a_security_listing_states_its_staged_ticker() {
     let (security, terms) = fixture_security();
@@ -1110,8 +997,6 @@ fn a_security_listing_states_its_staged_ticker() {
     );
 }
 
-/// one instrument has one name, so two listings of it on one route are both
-/// published under that name; it is the listing identity that tells them apart.
 #[test]
 fn two_listings_of_one_instrument_share_its_name() {
     let instrument = test_support::spot_token(VENUE, "BTC", "USDT");
@@ -1139,19 +1024,9 @@ fn two_listings_of_one_instrument_share_its_name() {
     }
 }
 
-// ---- the direction of a reference -----------------------------------------
-
-/// the direction of a settlement reference is checked against the registry
-/// terms, and one that does not observe the underlying in the contract's own quote
-/// refuses the publication.
-///
-/// A cash delivery names its settlement reference by identity alone — an identity is
-/// a one-way digest — so the direction behind it is visible only in the registry,
-/// which is what this gate reads.
 #[test]
 fn a_settlement_reference_of_the_wrong_direction_is_refused() {
     let route = future_route();
-    // A settlement observation of the same underlying, quoted in another asset.
     let wrong = price_reference_terms(
         UnderlyingRef::Asset(token(VENUE, "BTC")),
         token(VENUE, "EUR"),
@@ -1183,15 +1058,6 @@ fn a_settlement_reference_of_the_wrong_direction_is_refused() {
     );
 }
 
-/// the conversion a decoded contract declares is checked against the registry
-/// terms, and one that does not turn its settlement asset into the price quote
-/// refuses the publication.
-///
-/// A constructor that holds the registry terms checks the whole direction itself, so
-/// the case under test is the one only a decoded payload reaches: an identity whose
-/// digest names a reference the registry carries a different direction for. The
-/// fixture is an inverse contract, which settles in the asset it tracks and
-/// therefore declares a conversion at all.
 #[test]
 fn a_conversion_reference_of_the_wrong_direction_is_refused() {
     let route = future_route();
@@ -1208,7 +1074,6 @@ fn a_conversion_reference_of_the_wrong_direction_is_refused() {
     let conversion_id = conversion
         .reference_id()
         .expect("the fixture reference is valid");
-    // A conversion of the same settlement asset, quoted in another asset.
     let wrong = price_reference_terms(
         UnderlyingRef::Asset(token(VENUE, "BTC")),
         token(VENUE, "EUR"),
@@ -1249,10 +1114,6 @@ fn a_conversion_reference_of_the_wrong_direction_is_refused() {
     );
 }
 
-/// One inverse BTC/USD cash future converting through the reference the caller names.
-///
-/// the fixture settles in the asset it tracks and is sized in the quote, which
-/// is the one shape of a dated contract that has a conversion to check.
 fn inverse_future(
     tracked: PriceReferenceId,
     conversion_id: PriceReferenceId,
@@ -1282,12 +1143,6 @@ fn inverse_future(
         .expect("the fixture inverse future instrument is valid")
 }
 
-/// The terms of one fixture dated contract as a payload states them, converting
-/// through the identity the caller names.
-///
-/// An identity is a one-way digest, so a payload states which reference a contract
-/// converts through without the direction behind it: this is the one path a
-/// conversion reaches the publication with terms its own constructor would refuse.
 fn future_payload(instrument: &Instrument, conversion_reference: PriceReferenceId) -> String {
     let InstrumentTerms::Future(terms) = instrument.terms() else {
         panic!("the fixture is a dated contract");
@@ -1339,16 +1194,10 @@ fn future_payload(instrument: &Instrument, conversion_reference: PriceReferenceI
     serde_json::to_string(&json).expect("the fixture payload serializes")
 }
 
-// ---- the registry is the only source of terms -----------------------
-
-/// the display catalog publishes one entry per canonical asset, so an asset
-/// whose terms the publication does not carry refuses the batch.
 #[test]
 fn a_missing_asset_term_refuses_the_publication() {
     let context = context(&spot_route());
     let base = base_generation();
-    // The batch is published without the fixture terms, which is what an adapter
-    // that forgot to stage them looks like.
     let error = CatalogBatch::pending(
         &context,
         CatalogBatch {
@@ -1373,8 +1222,6 @@ fn a_missing_asset_term_refuses_the_publication() {
     );
 }
 
-/// a settlement reference is checked against the registry terms, and one the
-/// publication does not carry refuses the batch.
 #[test]
 fn an_unregistered_settlement_reference_refuses_the_publication() {
     let route = future_route();
@@ -1399,11 +1246,6 @@ fn an_unregistered_settlement_reference_refuses_the_publication() {
     );
 }
 
-/// One perpetual listing of one route under the fixture venue's own identifiers.
-///
-/// The rules of the entry describe a perpetual rather than a spot product, because
-/// the model refuses a listing whose rules do not hold for the kind of its
-/// instrument, and they state the quote the contract is priced in.
 fn perpetual_entry(
     route: &VenueRoute,
     instrument: Instrument,
@@ -1426,7 +1268,6 @@ fn perpetual_entry(
     entry
 }
 
-/// The product rules of one fixture perpetual quoted in `quote`.
 fn perpetual_rules(quote: &str) -> market_participants_model::listing::rules::ProductTradingRules {
     use market_participants_model::listing::rules::{
         FundingInterval, FundingSchedule, MarginMode, MarginProfile, PerpetualMarginTerms,
@@ -1469,7 +1310,6 @@ fn perpetual_rules(quote: &str) -> market_participants_model::listing::rules::Pr
     )
 }
 
-/// One fixture fraction, written the way a venue publishes a margin ratio.
 fn fraction(value: &str) -> market_participants_model::decimal::Fraction {
     market_participants_model::decimal::Fraction::new(
         value
@@ -1479,14 +1319,10 @@ fn fraction(value: &str) -> market_participants_model::decimal::Fraction {
     .expect("the fixture fraction is valid")
 }
 
-// ---- the staged code of a security ------------------------------------
-
-/// The complete MIC of `code`.
 fn mic_of(code: &str) -> Mic {
     Mic::new(code).expect("the fixture MIC is complete")
 }
 
-/// The typed equity identifiers of one market segment.
 fn equity_identifiers(mic: &Mic, ticker: &str, local_code: &str) -> EquityListingIdentifiers {
     EquityListingIdentifiers {
         mic: mic.clone(),
@@ -1496,11 +1332,6 @@ fn equity_identifiers(mic: &Mic, ticker: &str, local_code: &str) -> EquityListin
     }
 }
 
-/// One equity listing of a security on a named market.
-///
-/// The native symbol is the ticker the listing declares, because the model
-/// requires the equity ticker and the declared symbol to agree; the local code is
-/// the identity of the listing itself.
 fn equity_entry(
     route: &VenueRoute,
     security: &AssetId,
@@ -1544,17 +1375,14 @@ fn equity_entry(
     }
 }
 
-/// The issuer of the fixture security.
 fn security_issuer() -> SecurityIssuerId {
     SecurityIssuerId::new("cik/320193").expect("the fixture issuer is canonical")
 }
 
-/// The share class of the fixture security.
 fn security_share_class() -> ShareClassId {
     ShareClassId::new(&share_class_terms()).expect("the fixture share class is valid")
 }
 
-/// The strike of one fixture option.
 fn strike_of(value: &str, quote: AssetId) -> StrikePrice {
     StrikePrice::new(
         value.parse::<Price>().expect("the fixture strike parses"),
@@ -1564,16 +1392,10 @@ fn strike_of(value: &str, quote: AssetId) -> StrikePrice {
     .expect("the fixture strike is valid")
 }
 
-/// The expiry of one fixture dated contract.
 fn expiry_at(millis: UnixMillis) -> Expiry {
     Expiry::new(millis, None, None).expect("the fixture expiry is valid")
 }
 
-/// The trading rules of one fixture dated contract of an underlying asset.
-///
-/// A dated contract is margined rather than fully paid, so its rule set states a
-/// margin profile; the profile is the one the fixture tokens are margined in, and
-/// the price quote is the one the contract is quoted in.
 fn derivative_rules(
     underlying: AssetId,
     quote: &str,
@@ -1607,7 +1429,6 @@ fn derivative_rules(
     }
 }
 
-/// The product rules of one fixture option listing.
 fn option_product_rules() -> ProductTradingRules {
     ProductTradingRules::Option(
         OptionTradingRules::new(fixture_margin_profile(), None, None)
@@ -1615,7 +1436,6 @@ fn option_product_rules() -> ProductTradingRules {
     )
 }
 
-/// The product rules of one fixture future listing.
 fn future_product_rules() -> ProductTradingRules {
     ProductTradingRules::Future(
         market_participants_model::listing::rules::FutureTradingRules::new(
@@ -1627,7 +1447,6 @@ fn future_product_rules() -> ProductTradingRules {
     )
 }
 
-/// The margin profile the fixture dated contracts are margined by.
 fn fixture_margin_profile() -> MarginProfile {
     MarginProfile::new(
         MarginMode::Cross,
@@ -1640,12 +1459,6 @@ fn fixture_margin_profile() -> MarginProfile {
     .expect("the fixture margin profile is valid")
 }
 
-/// One option listing of a security underlying.
-///
-/// an American cash option whose underlying is the security, stated with its
-/// own strike, right and expiry. `multiplier` is the contract size, which no name
-/// states, and the cash delivery settles through the reference the contract
-/// already tracks.
 fn security_option_entry(
     route: &VenueRoute,
     security: &AssetId,
@@ -1697,7 +1510,6 @@ fn security_option_entry(
     )
 }
 
-/// The terms of one security price reference, over the underlying the caller names.
 fn security_reference_terms(source: &str, underlying: UnderlyingRef) -> PriceReferenceTerms {
     PriceReferenceTerms {
         underlying,
@@ -1714,7 +1526,6 @@ fn security_reference_terms(source: &str, underlying: UnderlyingRef) -> PriceRef
     }
 }
 
-/// One price reference of the security fixture over an explicit underlying.
 fn security_reference_over(
     source: &str,
     underlying: UnderlyingRef,
@@ -1726,10 +1537,6 @@ fn security_reference_over(
     (id, terms)
 }
 
-/// One future listing of a security underlying.
-///
-/// the fixture states the expiry and the cash settlement of the contract, so
-/// its name is the row of the table a dated contract has.
 fn security_future_entry(
     route: &VenueRoute,
     security: &AssetId,
@@ -1770,15 +1577,6 @@ fn security_future_entry(
     )
 }
 
-/// One price reference of the crypto fixture, tracked by the fixture BTC contract
-/// and quoted — and settled — in `settled`.
-///
-/// A dated crypto contract reads its reference in the direction the model gives: the reference observes
-/// the contract's own underlying `U`, which is the fixture BTC, and states the
-/// settlement asset `S` as its quote. The quote and the settlement
-/// are one asset for these fixtures, so one identity is the contract's price
-/// reference and its settlement reference, which is why the expected names of the
-/// crypto fixtures state neither.
 fn crypto_reference(settled: &str) -> (PriceReferenceId, PriceReferenceTerms) {
     let terms = PriceReferenceTerms {
         underlying: UnderlyingRef::Asset(token(VENUE, "BTC")),
@@ -1799,13 +1597,6 @@ fn crypto_reference(settled: &str) -> (PriceReferenceId, PriceReferenceTerms) {
     (id, terms)
 }
 
-/// a value the naming step refuses is not an instrument without a
-/// name — the whole batch stays unpublished.
-///
-/// The model lets a question carry a control character, because it is free text a
-/// venue may answer with; only this layer refuses to render it. The refusal is
-/// catalogue-global on purpose: publishing the rest of the batch would leave an
-/// instrument the reader can hold a key for but never see named.
 #[test]
 fn an_unrenderable_text_refuses_the_whole_batch() {
     let route = spot_route();
@@ -1835,12 +1626,6 @@ fn an_unrenderable_text_refuses_the_whole_batch() {
     );
 }
 
-/// a typed identifier that its own native symbols do not echo refuses the
-/// batch, and the refusal carries the kind and the value behind it.
-///
-/// A contract code the listing's symbol does not state is the case the comparison
-/// exists for: publishing it would mean a listing whose verified identity and whose
-/// declared spelling disagree about the same contract.
 #[test]
 fn a_typed_identifier_its_symbols_do_not_echo_refuses_the_batch() {
     let route = future_route();
@@ -1870,8 +1655,6 @@ fn a_typed_identifier_its_symbols_do_not_echo_refuses_the_batch() {
     );
 }
 
-/// an index is a naming source of the core `U`, so one the publication does
-/// not carry refuses the batch rather than leaving the underlying unnamed.
 #[test]
 fn an_index_underlying_without_registered_terms_refuses_the_publication() {
     let route = perp_route();
@@ -1902,8 +1685,6 @@ fn an_index_underlying_without_registered_terms_refuses_the_publication() {
     );
 }
 
-/// the external half of the same rule. An external reference names the
-/// underlying, so one without registered terms refuses the batch.
 #[test]
 fn an_external_underlying_without_registered_terms_refuses_the_publication() {
     let route = perp_route();
@@ -1936,11 +1717,6 @@ fn an_external_underlying_without_registered_terms_refuses_the_publication() {
     );
 }
 
-/// an outcome listing is named from the outcome registry, so a listing whose
-/// group the batch does not carry never reaches the naming step.
-///
-/// The batch validator is the layer that requires the group, which is why a real
-/// publication does not meet the naming step's own `MissingOutcomeTerms` guard here.
 #[test]
 fn an_outcome_listing_without_its_group_is_refused_by_the_batch() {
     let route = spot_route();
@@ -1965,8 +1741,6 @@ fn an_outcome_listing_without_its_group_is_refused_by_the_batch() {
     );
 }
 
-/// One perpetual over an explicit underlying, for the naming sources that are not
-/// assets.
 fn perpetual_over(
     underlying: UnderlyingRef,
     reference: PriceReferenceId,
@@ -1987,16 +1761,11 @@ fn perpetual_over(
     .expect("the fixture perpetual instrument is valid")
 }
 
-/// The indexed contract unit of a fixture index-perpetual.
 fn index_contract_unit(index: market_participants_model::asset::IndexId) -> ContractUnit {
     ContractUnit::quote_notional_per_index_point(Quantity::from(50_u8), token(VENUE, "USD"), index)
         .expect("the fixture index contract unit is valid")
 }
 
-/// One listing of an index-perpetual, whose price basis is the index itself.
-///
-/// The model refuses a listing whose rules do not hold for its contract, so the
-/// basis of an index-point contract names the index it is priced in.
 fn index_perpetual_entry(
     route: &VenueRoute,
     instrument: Instrument,
@@ -2013,16 +1782,11 @@ fn index_perpetual_entry(
     entry
 }
 
-/// The asset-quantity contract unit of a fixture contract tracking one asset.
 fn asset_contract_unit() -> ContractUnit {
     ContractUnit::asset_quantity(Quantity::from(1_u8), token(VENUE, "USD"))
         .expect("the fixture contract unit is valid")
 }
 
-/// One listing of a dated fixture contract, keyed by its own series identifiers.
-///
-/// The product rules are derived from the instrument kind the series belongs to,
-/// because the model refuses a listing whose rules do not hold for its contract.
 fn series_entry(
     route: &VenueRoute,
     instrument: Instrument,
@@ -2056,14 +1820,10 @@ fn series_entry(
     }
 }
 
-/// The typed series identifiers one fixture listing carries, in both the
-/// continuity key and the listing itself.
 trait SeriesListing {
-    /// Returns the continuity terms of this series.
     fn continuity_terms(
         &self,
     ) -> market_participants_model::listing::continuity::ListingContinuityTerms;
-    /// Returns the listing of this series.
     fn listing(&self, key: VenueListingKey, instrument: InstrumentId) -> VenueListing;
 }
 
@@ -2109,7 +1869,6 @@ impl SeriesListing for FutureSeriesIdentifiers {
     }
 }
 
-/// The canonical terms of the fixture security and its quote.
 fn security_pair_terms(terms: SecurityTerms) -> Vec<AssetTerms> {
     vec![
         AssetTerms::Security {
@@ -2121,12 +1880,6 @@ fn security_pair_terms(terms: SecurityTerms) -> Vec<AssetTerms> {
     ]
 }
 
-/// a security's own terms state no code, so a batch that renders one
-/// without staging a verified ticker is refused rather than published under a name
-/// the catalog cannot answer.
-///
-/// The model's `EquityListingIdentifiers.ticker` is not that code: it is a listing
-/// fact the display layer never reads.
 #[test]
 fn a_security_listing_without_a_staged_code_is_refused() {
     let (security, terms) = fixture_security();
@@ -2152,9 +1905,6 @@ fn a_security_listing_without_a_staged_code_is_refused() {
     );
 }
 
-/// an option whose underlying is a security states the ticker its route
-/// staged together with the identifying fields of the contract, and nothing else:
-/// no exercise style, no contract size, no reference and no route.
 #[test]
 fn a_security_option_states_its_staged_ticker() {
     let (security, terms) = fixture_security();
@@ -2182,8 +1932,6 @@ fn a_security_option_states_its_staged_ticker() {
     );
 }
 
-/// a future whose underlying is a security states its expiry and the asset
-/// it settles in, and never the series identifiers of its listing.
 #[test]
 fn a_security_future_states_its_staged_ticker() {
     let (security, terms) = fixture_security();
@@ -2221,9 +1969,6 @@ fn a_security_future_states_its_staged_ticker() {
     );
 }
 
-/// Two listings of one route whose instruments state the
-/// same fields publish the same name — no name-level uniqueness is required, and
-/// the listing identity is what tells them apart.
 #[test]
 fn two_listings_of_one_name_are_published() {
     let instrument = test_support::spot_token(VENUE, "BTC", "USDT");
@@ -2275,19 +2020,14 @@ fn two_listings_of_one_name_are_published() {
     }
 }
 
-// ---- the listing identifiers of the fixture routes ---------------------
-
-/// The Binance option route of the fixture venue.
 fn option_route() -> VenueRoute {
     test_support::route(VENUE, "european-option")
 }
 
-/// The Binance future route of the fixture venue.
 fn future_route() -> VenueRoute {
     test_support::route(VENUE, "usd-m-future")
 }
 
-/// The fixture asset terms of one crypto dated contract.
 fn crypto_pair_terms() -> Vec<AssetTerms> {
     vec![
         AssetTerms::CryptoToken(token_terms(VENUE, "BTC")),
@@ -2296,7 +2036,6 @@ fn crypto_pair_terms() -> Vec<AssetTerms> {
     ]
 }
 
-/// A binary outcome group of the fixture venue.
 fn outcome_group_of(question: &str) -> OutcomeGroup {
     let seed = OutcomeGroupSeed {
         question: SmolStr::new(question),
@@ -2316,10 +2055,6 @@ fn outcome_group_of(question: &str) -> OutcomeGroup {
     OutcomeGroup::new(seed, vec![yes, no], vec![member]).expect("the group is valid")
 }
 
-/// One Polymarket listing of the first side of one fixture group.
-///
-/// the protocol label echoes the registry label of the leg the listing
-/// trades, which is what the batch validator compares.
 fn outcome_entry_of(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> CatalogEntry {
     let member = group.members[0].id;
     let side = group.members[0].sides[0];
@@ -2364,7 +2099,6 @@ fn outcome_entry_of(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> C
     }
 }
 
-/// The trading rules of one fixture outcome listing.
 fn outcome_rules(
     group: &OutcomeGroup,
     member: OutcomeMemberId,
@@ -2401,8 +2135,6 @@ fn outcome_rules(
     }
 }
 
-/// the protocol label of a Polymarket listing is compared with the registry
-/// label, and a disagreement refuses the whole batch.
 #[test]
 fn a_protocol_outcome_label_that_disagrees_refuses_the_batch() {
     let route = spot_route();
@@ -2432,7 +2164,6 @@ fn a_protocol_outcome_label_that_disagrees_refuses_the_batch() {
     );
 }
 
-/// the registry label is the name, and the protocol label only echoes it.
 #[test]
 fn a_protocol_outcome_label_that_agrees_publishes_the_registry_name() {
     let route = spot_route();
@@ -2462,20 +2193,6 @@ fn a_protocol_outcome_label_that_agrees_publishes_the_registry_name() {
     );
 }
 
-// ---- the references of a contract -------------------------------------
-//
-// A reference is a listing fact and not an identifying field: the name keeps it out of
-// every name, so a contract that observes its settlement and its conversion through
-// references of its own publishes exactly the name its identifying fields state. The
-// direction those references must have is still checked, which is what the tests
-// below pin.
-
-/// a typed identifier that contradicts the declared native symbols refuses
-/// the whole publication.
-///
-/// The echo check runs in the batch validator rather than in the naming pass, but
-/// the refusal is the same typed one: a listing whose typed identity and declared
-/// spelling disagree is never published.
 #[test]
 fn a_contradicted_echo_refuses_the_publication() {
     let (security, terms) = fixture_security();
@@ -2507,14 +2224,6 @@ fn a_contradicted_echo_refuses_the_publication() {
     );
 }
 
-// ---- an asset no listing references --------------------------------
-
-/// a Binance linear perpetual publishes `BTC/USDT:USDT`, and its listing
-/// carries that name.
-///
-/// This is the golden shape of the name table driven end to end through one publication: the
-/// price quote and the settlement asset are one token, and the resulting name states
-/// the identifying fields alone.
 #[test]
 fn the_golden_perpetual_name_carries_no_qualifier() {
     let route = test_support::route("binance", "usd-m-perp");
@@ -2552,14 +2261,6 @@ fn the_golden_perpetual_name_carries_no_qualifier() {
     );
 }
 
-// ---- a code is a pure function of one asset ---------------------------
-
-/// two venues of one native code keep it, because a code is a pure
-/// function of the asset's own terms and never a catalogue-global decision.
-///
-/// `BINANCE/SPOT` publishes `BTC/USDT` from the Binance tokens and `OKX/SPOT` the
-/// same name from the OKX tokens; neither name changes because the other route
-/// exists.
 #[test]
 fn two_venues_of_one_code_keep_their_code_across_routes() {
     let binance = test_support::spot_route();
@@ -2618,15 +2319,6 @@ fn two_venues_of_one_code_keep_their_code_across_routes() {
     }
 }
 
-// ---- one name, more than one instrument ------------------------------
-
-/// Two different instruments whose identifying fields
-/// agree publish one name, and the catalog names both of them.
-///
-/// The two perpetuals track two price references of different scopes, which is a
-/// listing fact and not an identifying field, so both names are one text. No
-/// name-level uniqueness is required: a reader tells the two apart by the listing
-/// key it holds.
 #[test]
 fn two_instruments_of_one_name_are_published() {
     let (security, terms, share_class) = common_stock("cik/320193", "AAPL", None);
@@ -2681,11 +2373,6 @@ fn two_instruments_of_one_name_are_published() {
     );
 }
 
-/// The identity, terms and class terms of one fixture common stock.
-///
-/// A `SecurityId` is a digest of the whole class terms, so two stocks that differ
-/// only in their par value are two identities, and each of them is named by the
-/// code its own route staged.
 fn common_stock(
     issuer: &str,
     designation: &str,
@@ -2713,10 +2400,6 @@ fn common_stock(
     )
 }
 
-/// A linear perpetual on one security, quoted and settled in the fixture token.
-///
-/// The name of the instrument is the security's staged code followed by its quote
-/// and settlement clause.
 fn security_perpetual(security: &AssetId, reference: &PriceReferenceId) -> Instrument {
     let contract_size = ContractSize::new(
         ContractUnit::asset_quantity(Quantity::from(1_u8), security.clone())
@@ -2740,7 +2423,6 @@ fn security_perpetual(security: &AssetId, reference: &PriceReferenceId) -> Instr
     .expect("the fixture perpetual instrument is valid")
 }
 
-/// One perpetual listing of one security under the fixture venue's own family.
 fn security_perpetual_entry(
     route: &VenueRoute,
     security: &AssetId,
@@ -2755,9 +2437,6 @@ fn security_perpetual_entry(
     )
 }
 
-// ---- the code of an asset no listing references ----------------------
-
-/// The exact display code of one asset in the published catalog.
 fn code_of(catalog: &crate::catalog::display::catalog::DisplayCatalog, asset: &AssetId) -> SmolStr {
     SmolStr::new(
         catalog
@@ -2767,19 +2446,16 @@ fn code_of(catalog: &crate::catalog::display::catalog::DisplayCatalog, asset: &A
     )
 }
 
-/// The canonical terms of the fixture currency of one ISO code.
 fn currency_terms_of(code: &str) -> CurrencyTerms {
     CurrencyTerms {
         code: Iso4217Code::new(code).expect("the fixture ISO code is canonical"),
     }
 }
 
-/// The identity of a fixture currency.
 fn currency(code: &str) -> AssetId {
     AssetId::Currency(CurrencyId::of_terms(&currency_terms_of(code)))
 }
 
-/// The canonical terms of a venue-issued token of one issuer and one code.
 fn issuer_token_terms(issuer: &str, code: &str) -> AssetTerms {
     let issuer_id = TokenIssuerId::new(issuer).expect("the fixture issuer is canonical");
     AssetTerms::CryptoToken(CryptoTokenTerms {
@@ -2794,7 +2470,6 @@ fn issuer_token_terms(issuer: &str, code: &str) -> AssetTerms {
     })
 }
 
-/// The canonical terms of the one fixture index.
 fn index_terms() -> market_participants_model::asset::IndexTerms {
     market_participants_model::asset::IndexTerms {
         namespace: IdentifierNamespace::new("sp").expect("the fixture namespace is canonical"),
@@ -2802,7 +2477,6 @@ fn index_terms() -> market_participants_model::asset::IndexTerms {
     }
 }
 
-/// The terms of the one fixture external reference.
 fn external_reference_terms() -> market_participants_model::reference::ExternalReferenceTerms {
     let fixture = reference_terms("binance", "BTC", "USD");
     market_participants_model::reference::ExternalReferenceTerms {
@@ -2818,7 +2492,6 @@ fn external_reference_terms() -> market_participants_model::reference::ExternalR
     }
 }
 
-/// The published registries of one registry-only publication.
 fn published_registries(
     assets: Vec<AssetTerms>,
     indices: Vec<market_participants_model::asset::IndexTerms>,
@@ -2860,12 +2533,6 @@ fn published_registries(
     )
 }
 
-/// The published generation that carries exactly the given registry identities.
-///
-/// The generation is built the way a registry-only publication does: the registries
-/// are installed under
-/// a fresh generation id, so what it publishes is a real catalog of the identities no
-/// listing of the surviving routes names.
 fn registry_only(
     assets: Vec<AssetTerms>,
     indices: Vec<market_participants_model::asset::IndexTerms>,
@@ -2882,14 +2549,6 @@ fn registry_only(
         .expect("a registry-only publication assigns a new generation")
 }
 
-/// the published catalog names every registered asset, not only the ones a
-/// surviving listing references.
-///
-/// A wallet reads balances, fees and collateral of assets no listing of the
-/// generation trades, and every one of them is a canonical asset the generation's own
-/// registry carries. The code of each of them therefore comes from the one
-/// publication that decided every other name of the generation, and a reader never
-/// derives a second code of its own.
 #[test]
 fn a_registered_asset_no_listing_references_is_named_by_the_catalog() {
     let unreferenced_currency = currency("JPY");
@@ -2921,14 +2580,6 @@ fn a_registered_asset_no_listing_references_is_named_by_the_catalog() {
     );
 }
 
-/// the index and external reference halves of the catalog follow the
-/// same rule as the asset half.
-///
-/// `index_codes` and `external_reference_codes` are published for every registered
-/// identity of the generation, so a reader that names an index-point contract size
-/// or an external underlying finds the code there whether or not a listing of the
-/// same publication tracks it. An index states `namespace/code` because its bare
-/// code is a number, and an external reference states its reference value alone.
 #[test]
 fn an_index_and_an_external_reference_no_listing_tracks_are_named_by_the_catalog() {
     let index = index_terms();
@@ -2966,9 +2617,6 @@ fn an_index_and_an_external_reference_no_listing_tracks_are_named_by_the_catalog
     );
 }
 
-/// a generation that publishes no listing at all still names every asset its
-/// registry carries, and the one it does not carry is answered by nothing rather
-/// than by a code derived elsewhere.
 #[test]
 fn a_generation_without_listings_names_every_registered_asset() {
     let carried = currency("EUR");
@@ -2996,13 +2644,6 @@ fn a_generation_without_listings_names_every_registered_asset() {
     );
 }
 
-/// the codes of the assets a publication references are the ones a later
-/// publication still states, even when its registry carries assets no listing
-/// references.
-///
-/// This is the stability the design depends on: the registry of a generation can
-/// grow — a route stages a token a sibling route never trades, a wallet registers a
-/// balance asset — and no name that was already published may move because of it.
 #[test]
 fn growing_the_registry_does_not_change_the_code_a_listing_publishes() {
     let route = spot_route();
@@ -3021,9 +2662,6 @@ fn growing_the_registry_does_not_change_the_code_a_listing_publishes() {
         .listing_instrument(&listing_key(&route, "BTCUSDT"))
         .expect("the fixture listing is published")
         .clone();
-    // The next publication of the same catalog carries three more assets no listing
-    // of the new route snapshot references, beside the two the listing is
-    // denominated in.
     let grown = registry_only(
         vec![
             AssetTerms::CryptoToken(token_terms(VENUE, "BTC")),
@@ -3059,12 +2697,6 @@ fn growing_the_registry_does_not_change_the_code_a_listing_publishes() {
     );
 }
 
-/// two assets no listing references that state one code both publish
-/// it — a code is a pure function of one asset's own terms, so no registry entry
-/// can move another one's code.
-///
-/// The two tokens are two issuers of the native code `USD`, and the catalog names
-/// each of them with the code its own terms state.
 #[test]
 fn two_unreferenced_tokens_of_one_code_are_both_published() {
     let first = issuer_token_terms("alpha", "USD");
@@ -3084,22 +2716,12 @@ fn two_unreferenced_tokens_of_one_code_are_both_published() {
     }
 }
 
-/// an asset no listing references never moves a code a listing already
-/// published.
-///
-/// The named token is the base of a published pair; the currency of the same code is
-/// registered without a listing. Both publish `USD`, because a code is a pure
-/// function of one asset's own terms and never a catalogue-global decision — so no
-/// name that was already published moves because a registry grew.
 #[test]
 fn an_unreferenced_currency_of_a_named_token_code_keeps_the_published_name() {
     let placed = issuer_token_terms("alpha", "USD");
     let placed_id = placed.asset_id();
     let unreferenced_currency = currency("USD");
     let route = spot_route();
-    // The base generation publishes the token, its quote and the currency of the same
-    // code, and the batch stages only the pair a listing of it is denominated in — so
-    // the currency is the registry asset no listing of the batch names.
     let generation = publish_bare_on(
         context(&route),
         &registry_only(
@@ -3142,12 +2764,6 @@ fn an_unreferenced_currency_of_a_named_token_code_keeps_the_published_name() {
     );
 }
 
-/// the spot row of the name table is published word for word by a
-/// generation whose registry carries assets no listing of it references.
-///
-/// A registry the generation publishes in full never moves a name: the two extra
-/// assets are the currency `JPY` and the token `SOL`, which the base generation
-/// carries and no listing of the batch below names.
 #[test]
 fn the_spot_row_of_the_name_table_is_published_word_for_word() {
     let route = spot_route();

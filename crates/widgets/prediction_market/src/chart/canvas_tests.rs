@@ -1,20 +1,3 @@
-//! The canvas one prediction chart draws: the box it fills, the pointer it follows,
-//! and the frames a change is worth.
-//!
-//! These are the interface tests of the chart: they go through the engine's own
-//! `WidgetTestApp`, because what they assert is what the engine ended up holding — a
-//! canvas node, its primitives, its registered geometry, and the frames a change is
-//! worth. The four rules `crates/widgets/AGENTS.md` §11 freezes are here:
-//!
-//! - **A** a steady `sync` writes no canvas and asks for no frame (the same `Arc` is
-//!   still in the node);
-//! - **B** an appearance switch repaints in the appearance's own roles;
-//! - **C** a canvas node that was never written paints no primitives, though the node
-//!   is still one opaque canvas — a node that stopped being a canvas is what this
-//!   turns red. Deleting the chart's `set_canvas` is caught by the tests that assert
-//!   the primitives it wrote (A, B and D), not by C;
-//! - **D** releasing the chart hands its registered geometry back.
-
 use std::{rc::Rc, sync::Arc};
 
 use base_ui::theme::{appearance::Appearance, role::Role};
@@ -38,12 +21,9 @@ use crate::{
     test_support::{charted_market, event_ref, event_with},
 };
 
-/// The chart's page. It has to fit the headless host's 800 x 600 window: the engine
-/// clamps a child to the window it is laid out in.
 const WIDTH: f32 = 760.0;
 const HEIGHT: f32 = 248.0;
 
-/// The catalogue the chart formats through.
 fn translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(embedded::load().expect("the embedded locales should load")),
@@ -51,7 +31,6 @@ fn translate(language: LanguageCode) -> Translate {
     )
 }
 
-/// Two lines, one sample a minute over an hour, running from 20 % to the given ends.
 fn snapshot() -> Arc<PredictionMarketSnapshot> {
     let event = event_ref();
     let (market, legs) = charted_market(&event, "charted");
@@ -86,7 +65,6 @@ fn snapshot() -> Arc<PredictionMarketSnapshot> {
     ))
 }
 
-/// A snapshot with no samples at all.
 fn empty_snapshot() -> Arc<PredictionMarketSnapshot> {
     let event = event_ref();
     let (market, _) = charted_market(&event, "charted");
@@ -100,7 +78,6 @@ fn empty_snapshot() -> Arc<PredictionMarketSnapshot> {
     ))
 }
 
-/// One chart mounted under a page of a fixed size.
 struct ChartHarness {
     app: WidgetTestApp,
     chart: ChartCanvas,
@@ -119,8 +96,6 @@ impl ChartHarness {
         let node = app
             .with_cx(|cx| chart.build(cx, page))
             .expect("the chart builds");
-        // The first frame lays the page (and the canvas inside it) out; the chart's own
-        // `sync` is what fills the node in, and every test here calls it itself.
         app.drain();
         Self {
             app,
@@ -143,7 +118,6 @@ impl ChartHarness {
             .expect("the chart syncs")
     }
 
-    /// Syncs one frame with the pointer over `pointer`.
     fn sync_at(&mut self, pointer: Point) -> bool {
         let Self {
             app,
@@ -155,7 +129,6 @@ impl ChartHarness {
             .expect("the chart syncs")
     }
 
-    /// Paints one frame and returns the primitives it drew.
     fn paint(&mut self) -> Vec<widget::test_support::CanvasPrimitive> {
         let _ = self.sync();
         self.app.drain();
@@ -204,7 +177,6 @@ impl ChartHarness {
     }
 }
 
-/// A box of a fixed size, which is the shape a chart is laid out in.
 fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
     app.with_cx(|cx| {
         let root = cx.tree().root();
@@ -222,10 +194,6 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
     })
 }
 
-/// The atlas generation the chart's glyphs were rasterized in, if it draws any.
-///
-/// The leases a canvas holds are what an atlas reset invalidates, so reading the
-/// generation back is how a test tells a canvas that was rebuilt from one that was kept.
 fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
     harness
         .canvas()
@@ -238,7 +206,6 @@ fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
         .map(|glyph| glyph.tile.generation)
 }
 
-/// The kinds of a canvas' primitives, in paint order.
 fn kinds(primitives: &[widget::test_support::CanvasPrimitive]) -> Vec<PrimitiveKind> {
     primitives.iter().map(|primitive| primitive.kind).collect()
 }
@@ -287,8 +254,6 @@ fn a_steady_chart_should_not_request_a_frame() {
     );
 }
 
-/// **Rule A.** A steady `sync` must not replace the canvas the node holds: the same
-/// `Arc` across two syncs is what proves `set_canvas` was not called.
 #[test]
 fn a_steady_canvas_should_be_kept() {
     let mut harness = ChartHarness::new(snapshot());
@@ -319,7 +284,6 @@ fn a_chart_should_not_draw_before_it_is_laid_out() {
     app.with_cx(|cx| chart.build(cx, root))
         .expect("the chart builds");
 
-    // No frame has laid the node out yet: it has no box, so there is nothing to draw.
     assert!(
         !app.with_cx(|cx| chart.sync(cx, &snapshot(), None, None))
             .expect("the chart syncs"),
@@ -332,8 +296,6 @@ fn a_chart_should_not_draw_before_it_is_laid_out() {
     );
 }
 
-/// **Rule B.** A canvas bakes its colours in, so an appearance switch is a repaint in
-/// the appearance's own roles — not the light ones it was built with.
 #[test]
 fn another_appearance_should_repaint_the_chart_in_the_dark_roles() {
     let mut harness = ChartHarness::new(snapshot());
@@ -393,15 +355,9 @@ fn another_appearance_should_repaint_the_chart_in_the_dark_roles() {
     );
 }
 
-/// **Rule C.** A canvas node that was never written paints no primitives; the node
-/// itself is still one opaque canvas in the frame's paint. What turns this red is a
-/// build that stops making the node a canvas — the frame the chart's `set_canvas`
-/// feeds is guarded by the tests that assert the primitives it wrote (A, B and D).
 #[test]
 fn a_canvas_node_that_was_never_written_paints_no_primitives() {
     let harness = ChartHarness::new(snapshot());
-    // No `sync` was called: the node holds the empty canvas it was built with, and the
-    // frame the harness drained is still the one this reads.
     assert!(
         harness.app.canvas_primitives(harness.node).is_empty(),
         "no set_canvas means nothing inside the canvas"
@@ -418,8 +374,6 @@ fn a_canvas_node_that_was_never_written_paints_no_primitives() {
     );
 }
 
-/// **Rule D.** The series lines are registered meshes; releasing the chart hands them
-/// back to the process-wide store, and takes its canvas node with it.
 #[test]
 fn releasing_a_chart_should_hand_its_geometry_and_node_back() {
     let mut harness = ChartHarness::new(snapshot());
@@ -475,8 +429,6 @@ fn another_snapshot_should_repaint_and_hand_the_previous_meshes_back() {
     assert!(!harness.sync(), "and the frame settles again");
 }
 
-/// A pointer that moved is another sample, not another frame of geometry: the prepared
-/// chart is reused and only the canvas is rebuilt.
 #[test]
 fn a_pointer_should_resolve_to_a_sample_without_preparing_again() {
     let mut harness = ChartHarness::new(snapshot());
@@ -522,11 +474,6 @@ fn a_pointer_should_resolve_to_a_sample_without_preparing_again() {
     );
 }
 
-/// The labels are drawn from shaped handles that lease glyph tiles from the atlas. When
-/// a lease is gone — the atlas was reset or a font stack changed — the engine refuses to
-/// encode those runs rather than draw reused texture, so a chart that kept the canvas
-/// it already had would lose its labels for good. A moved lease is a frame the chart
-/// owes.
 #[test]
 fn a_stale_atlas_lease_should_force_a_repaint() {
     let mut harness = ChartHarness::new(snapshot());
@@ -534,9 +481,6 @@ fn a_stale_atlas_lease_should_force_a_repaint() {
     let labels = harness.canvas().primitives().len();
     let generation = glyph_generation(&harness).expect("the axes are labelled");
 
-    // An atlas reset under the same font stack: every handle the canvas was built from
-    // is leased from an atlas that no longer exists, while the glyphs shape back the
-    // same.
     let stack = harness.app.app().font_stack().clone();
     harness.app.app_mut().set_font_stack(stack);
 
@@ -560,10 +504,6 @@ fn a_stale_atlas_lease_should_force_a_repaint() {
     );
 }
 
-/// The stale-lease guard looks at the handles the canvas on screen was built from, not
-/// at every handle the shaping cache still holds. A label an earlier pointer sample
-/// left behind is in the cache but not on the canvas, and a chart that redrew for it
-/// would never settle again (I3).
 #[test]
 fn a_stale_label_off_the_canvas_should_not_keep_the_chart_repainting() {
     let mut harness = ChartHarness::new(snapshot());
@@ -583,8 +523,6 @@ fn a_stale_label_off_the_canvas_should_not_keep_the_chart_repainting() {
     );
     assert!(harness.sync_at(second), "another sample is another drawing");
 
-    // An atlas reset invalidates every lease, including the labels of the sample the
-    // pointer has left: those stay in the shaping cache but are not on the canvas.
     let stack = harness.app.app().font_stack().clone();
     harness.app.app_mut().set_font_stack(stack);
     assert!(
@@ -597,8 +535,6 @@ fn a_stale_label_off_the_canvas_should_not_keep_the_chart_repainting() {
     );
 }
 
-/// Clearing the chart is what the pane does when it can no longer vouch for a reading:
-/// the prepared frame is dropped, and the frame after it draws from scratch.
 #[test]
 fn clearing_the_chart_should_draw_the_next_frame_from_scratch() {
     let mut harness = ChartHarness::new(snapshot());
@@ -688,8 +624,6 @@ fn a_resize_should_prepare_the_new_box() {
     assert!(!harness.sync(), "and it settles again");
 }
 
-/// The box the chart lays itself out in is rounded to whole pixels, so a resize that
-/// only moves the fraction of a pixel is not a new frame.
 #[test]
 fn a_fractional_resize_should_not_prepare_again() {
     let mut harness = ChartHarness::new(snapshot());

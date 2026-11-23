@@ -1,14 +1,3 @@
-//! The fake session the indices tests answer through.
-//!
-//! It is the seam the service, the selector and the pane all read index data
-//! through, so it is shared rather than copied: what the pane's tests need to
-//! control is the same session the service's tests refuse, delay and close.
-//!
-//! It also holds the two hosts the interface tests are written over: the product
-//! translation catalogue (what a reader of the shipped application reads) and the
-//! framework's headless [`WidgetTestApp`], whose runtime is what the fake session's
-//! messages are delivered through.
-
 use std::{
     collections::{BTreeMap, VecDeque},
     rc::Rc,
@@ -34,9 +23,7 @@ use crate::{
     service::{FinancialIndexEventSubscription, FinancialIndexSource},
 };
 
-/// The account every fixture scope belongs to.
 pub(crate) const ACCOUNT: &str = "test-account";
-/// The translator the product ships: what these tests assert is the catalogue's copy.
 pub(crate) fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -44,7 +31,6 @@ pub(crate) fn product_translate(language: LanguageCode) -> Translate {
     )
 }
 
-/// The framework's headless host, over the product catalogue.
 pub(crate) fn harness() -> WidgetTestApp {
     WidgetTestApp::with_translate(product_translate(LanguageCode::En))
 }
@@ -95,7 +81,6 @@ pub(crate) fn session(limit: u32) -> KytrixSessionState {
     }
 }
 
-/// A manifest of two categories, each with one index.
 pub(crate) fn manifest() -> proto_types::FinancialIndices {
     proto_types::FinancialIndices {
         categories: vec![
@@ -121,7 +106,6 @@ fn index(code: &str, category: &str, en: &str, zh: &str) -> proto_types::Financi
         code: code.to_owned(),
         category: category.to_owned(),
         name: Some(localized(en, zh)),
-        // A protobuf field is a `String`, so the fixture builds one.
         request_code: format!(".{code}"),
     }
 }
@@ -147,33 +131,21 @@ struct FakeState {
     manifest_calls: usize,
 }
 
-/// What the next `subscribe_financial_index` call finds.
 enum FakeSetup {
-    /// A live subscription, and the drop counter of the subscription it replaces —
-    /// which the service is expected to have released already.
     Ready(FakeSubscription, Option<Arc<AtomicUsize>>),
     Failed(KytrixServiceError),
-    /// A setup that never answers, so the caller's cancellation is the only way out.
     Blocked(Arc<OperationBlock>),
 }
 
-/// One live subscription inside the fake source.
-///
-/// It is named by the crate because it is the associated type the source's own
-/// seam publishes it as.
 pub(crate) struct FakeSubscription {
     events: mpsc::Receiver<Result<FinancialIndexEvent, TransportError>>,
     status: watch::Sender<SubscriptionStatus>,
     drops: Arc<AtomicUsize>,
-    /// Held when the venue is to take its time letting go of this subscription.
     release: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl Drop for FakeSubscription {
     fn drop(&mut self) {
-        // A venue does not necessarily let go of a subscription the instant the client
-        // does, which is exactly why a replacement waits for the release instead of
-        // assuming it: this is the moment a test can hold a replacement at.
         if let Some(release) = self.release.take() {
             let _ = release.recv_timeout(Duration::from_secs(2));
         }
@@ -181,18 +153,14 @@ impl Drop for FakeSubscription {
     }
 }
 
-/// One live subscription, as a test drives it.
 pub(crate) struct FakeSubscriptionControl {
     pub events: mpsc::Sender<Result<FinancialIndexEvent, TransportError>>,
     pub status: watch::Sender<SubscriptionStatus>,
-    /// How many times this subscription has been dropped, which is what a
-    /// replacement has to have happened before.
     pub drops: Arc<AtomicUsize>,
     release: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl FakeSubscriptionControl {
-    /// Lets the venue let go of this subscription.
     pub(crate) fn release(&self) {
         if let Some(release) = self.release.as_ref() {
             let _ = release.send(());
@@ -200,7 +168,6 @@ impl FakeSubscriptionControl {
     }
 }
 
-/// One operation a fake source can be held inside.
 #[derive(Default)]
 pub(crate) struct OperationBlock {
     started: Notify,
@@ -248,27 +215,21 @@ impl Default for FakeSource {
 }
 
 impl FakeSource {
-    /// A source holding a session that may follow `limit` indices.
     pub(crate) fn with_session(limit: u32) -> Self {
         let source = Self::default();
         source.session.send_replace(Some(session(limit)));
         source
     }
 
-    /// Queues one live subscription.
     pub(crate) fn subscribe(&self) -> FakeSubscriptionControl {
         self.subscribe_with(None, None)
     }
 
-    /// Queues a subscription the venue holds on to until the test releases it, which
-    /// is what makes a replacement's ordering observable rather than a matter of luck.
     pub(crate) fn subscribe_holding(&self) -> FakeSubscriptionControl {
         let (release, held) = std::sync::mpsc::channel();
         self.subscribe_with(None, Some((release, held)))
     }
 
-    /// Queues a subscription the service may only reach once `previous` — the
-    /// subscription it replaces — has been dropped.
     pub(crate) fn subscribe_after_drop(
         &self,
         previous: Option<Arc<AtomicUsize>>,
@@ -309,8 +270,6 @@ impl FakeSource {
         }
     }
 
-    /// Queues a subscription the session refuses, the way a seat over the account's
-    /// index limit is refused.
     pub(crate) fn refuse_selection(&self) {
         self.refuse(KytrixServiceError::Server(
             ErrorCode::FinancialIndexTopicLimitExceeded,
@@ -325,7 +284,6 @@ impl FakeSource {
             .push_back(FakeSetup::Failed(error));
     }
 
-    /// Queues a subscription setup that never answers.
     pub(crate) fn block(&self) -> Arc<OperationBlock> {
         let block = Arc::new(OperationBlock::default());
         self.state
@@ -343,7 +301,6 @@ impl FakeSource {
             .manifest = manifest;
     }
 
-    /// The topics every subscription has been asked for, in order.
     pub(crate) fn subscribed(&self) -> Vec<Vec<FinancialIndexTopic>> {
         self.state
             .lock()
@@ -393,9 +350,6 @@ impl FinancialIndexSource for FakeSource {
         };
         match setup {
             FakeSetup::Ready(subscription, previous) => {
-                // The service counts every topic a session subscribes to against one
-                // index limit, so a subscription that opens while the one it replaces
-                // is still live is the refusal a real session answers.
                 if previous.is_some_and(|drops| drops.load(Ordering::SeqCst) == 0) {
                     Err(KytrixServiceError::Server(
                         ErrorCode::FinancialIndexTopicLimitExceeded,

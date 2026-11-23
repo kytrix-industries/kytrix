@@ -205,7 +205,6 @@ pub(super) fn normalize_topics(topics: &[ServiceTopic]) -> Vec<ServiceTopic> {
     topics
 }
 
-/// A news kind carried by service events.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NewsKind {
     #[serde(rename = "general")]
@@ -216,18 +215,15 @@ pub enum NewsKind {
     Political,
 }
 
-/// A validated index code exposed by the Kytrix service.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct FinancialIndexTopic(SmolStr);
 
 impl FinancialIndexTopic {
-    /// Returns the wire/API code for this topic.
     pub fn code(&self) -> &str {
         &self.0
     }
 
-    /// Validates a protocol/API code supplied by the server or persisted config.
     pub fn from_code(code: &str) -> Option<Self> {
         (!code.is_empty() && code.trim() == code && code.chars().count() <= 64)
             .then(|| Self(code.into()))
@@ -254,7 +250,6 @@ impl fmt::Display for FinancialIndexTopic {
     }
 }
 
-/// A topic a Kytrix service subscription follows.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ServiceTopic {
     News,
@@ -265,7 +260,6 @@ pub enum ServiceTopic {
     GlobalShippingChokepoint(GlobalShippingChokepointArea),
 }
 
-/// A news event received from the service.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct NewsEvent {
     pub timestamp: i64,
@@ -274,7 +268,6 @@ pub struct NewsEvent {
     pub category: NewsKind,
 }
 
-/// An index event received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FinancialIndexEvent {
     pub topic: FinancialIndexTopic,
@@ -287,7 +280,6 @@ pub struct FinancialIndexEvent {
     pub timestamp: i64,
 }
 
-/// A validated X profile received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XProfileEvent {
     pub x_user_id: SmolStr,
@@ -298,14 +290,12 @@ pub struct XProfileEvent {
     pub revision: u64,
 }
 
-/// A validated XTweet reference received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TweetReference {
     Repost(Box<XTweetEvent>),
     Quote(Box<XTweetEvent>),
 }
 
-/// Validated media attached to a XTweet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum XTweetMedia {
     Image {
@@ -327,14 +317,12 @@ pub enum XTweetMedia {
     },
 }
 
-/// A validated text segment in a XTweet received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XTweetTextSegment {
     pub text: SmolStr,
     pub url: Option<SmolStr>,
 }
 
-/// A validated XTweet received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XTweetEvent {
     pub tweet_id: SmolStr,
@@ -345,14 +333,12 @@ pub struct XTweetEvent {
     pub media: Vec<XTweetMedia>,
 }
 
-/// A validated X timeline snapshot received over HTTP.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XTweetBatch {
     pub tweets: Vec<XTweetEvent>,
     pub profiles: Vec<XProfileEvent>,
 }
 
-/// A validated Ethereum wallet transfer received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EthereumWalletTransfer {
     pub event_id: SmolStr,
@@ -363,7 +349,6 @@ pub struct EthereumWalletTransfer {
     pub timestamp: i64,
 }
 
-/// A validated Solana wallet transfer received from the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SolanaWalletTransfer {
     pub event_id: SmolStr,
@@ -507,16 +492,12 @@ pub(super) fn subscription_send_error<T>(error: SubscriptionSendError<T>) -> Tra
     }
 }
 
-/// The entitlement value the Kytrix service publishes for one feature.
 pub type KytrixEntitlementFeatureValue = proto_types::EntitlementFeatureValue;
 
-/// One catalogue entry, as the Kytrix service publishes it.
 pub type KytrixEntitlementFeature = proto_types::EntitlementFeature;
 
-/// The plan the Kytrix service published for one session.
 pub type KytrixEntitlementPlanCode = proto_types::EntitlementPlanCode;
 
-/// The entitlements the Kytrix service published for one session.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KytrixSessionState {
     pub entitlement_revision: u64,
@@ -578,7 +559,6 @@ impl SessionStateRegistry {
     }
 }
 
-/// Errors raised by the shared Kytrix service connection.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum KytrixServiceError {
     #[error("Kytrix service URL is invalid: {0}")]
@@ -653,7 +633,6 @@ pub(super) fn subscription_transport_error(error: &KytrixServiceError) -> Transp
     }
 }
 
-/// Account-bound handle for service HTTP calls and event subscriptions.
 #[derive(Clone)]
 pub struct KytrixAccountSession {
     pub connector: KytrixServiceConnector,
@@ -670,15 +649,9 @@ pub(super) struct KytrixServiceConnectorInner {
     pub cancellation: CancellationToken,
     pub wake: Arc<Notify>,
     pub supervisor_task: Mutex<Option<JoinHandle<()>>>,
-    /// The task that turns one publication of the network projection into a
-    /// [`SupervisorCommand::Reconfigure`] for every live session.
-    ///
-    /// [`KytrixServiceConnector::spawn`] is the production entry point for
-    /// this task; every `KytrixServiceConnector` constructor starts it.
     pub config_task: Mutex<Option<JoinHandle<()>>>,
     pub next_subscriber_id: AtomicU64,
     pub session_state: SessionStateRegistry,
-    /// The application runtime every route resolution of this connector runs on.
     pub runtime: Handle,
 }
 
@@ -689,8 +662,6 @@ pub enum XSubscriptionEvent {
 }
 
 pub(super) enum SupervisorCommand {
-    /// Delivers one command to the session owning `key`, after checking that the
-    /// caller's profile and route generation are still current.
     Send {
         key: WsSessionKey,
         profile: AccountProfile,
@@ -702,8 +673,6 @@ pub(super) enum SupervisorCommand {
         deadline: Instant,
         respond_to: oneshot::Sender<Result<(), KytrixServiceError>>,
     },
-    /// Tells every live session to re-read the network projection it routes by
-    /// and retire the subscriptions the new projection no longer serves.
     Reconfigure,
 }
 
@@ -729,8 +698,6 @@ pub(super) enum Command {
         respond_to: oneshot::Sender<Result<proto_response::Response, KytrixServiceError>>,
     },
     RetireCredentials,
-    /// Re-reads the network projection and retires the subscriptions whose
-    /// route generation or resolved route it no longer serves.
     Reconfigure,
 }
 
@@ -897,7 +864,6 @@ pub(super) struct ServiceSessionContext {
     pub cancellation: CancellationToken,
     pub wake: Arc<Notify>,
     pub transport_policy: TransportPolicy,
-    /// The application runtime every route resolution of a session runs on.
     pub runtime: Handle,
 }
 
@@ -917,19 +883,8 @@ pub(super) struct ServiceSessionActor {
     pub subscribers: AHashMap<u64, LocalSubscriber>,
     pub topics: AHashMap<ServiceTopic, AHashSet<u64>>,
     pub latest_financial_index: AHashMap<FinancialIndexTopic, FinancialIndexEvent>,
-    /// The complete AIS picture the session holds for each area.
-    ///
-    /// The API sends a keyframe only when the connection subscribes to an area and only
-    /// deltas after it. Applying those deltas here is what lets a later local subscriber
-    /// of the same area start from the current picture without another server snapshot.
     pub global_shipping_chokepoint_states:
         AHashMap<GlobalShippingChokepointArea, GlobalShippingChokepointState>,
-    /// Areas whose next frame must be the server's snapshot.
-    ///
-    /// A connection that re-subscribes an area can still have increments queued from the
-    /// previous subscription, and the server enqueues the new snapshot behind them.
-    /// Until that snapshot arrives, an increment belongs to a picture this session no
-    /// longer holds, so it is dropped rather than treated as a gap.
     pub global_shipping_chokepoint_awaiting_snapshot: AHashSet<GlobalShippingChokepointArea>,
     pub session_state: Option<KytrixSessionState>,
     pub subscriptions_dirty: bool,

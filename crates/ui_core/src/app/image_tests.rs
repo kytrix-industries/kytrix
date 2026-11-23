@@ -1,13 +1,3 @@
-//! E7：`NodeKind::Image` 的集成用例（布局 / 绘制 / 资源生命周期 / DPI / a11y）。
-//!
-//! 覆盖验收面：
-//! - 布局：内在尺寸（未给 `Style` 尺寸）、显式 `Style` 尺寸优先；
-//! - 绘制：`Primitive::Image` 的 bounds / 调制 / `Cover` 的 UV 裁切（`FrameRecord`）；
-//! - 资源：未就绪占位（无图元）、`poll_resources` 交付后自动失效重绘、释放后不再画旧 tile；
-//! - DPI：按新 scale 重算内在尺寸 + `set_image_resource` 换变体；
-//! - a11y：默认 `Image` 角色、可选标签、无标签 hidden、显式 hidden = 装饰图免诊断、默认非交互；
-//! - I3：稳定后不再出帧。
-
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -30,7 +20,6 @@ use crate::{
     window::{WindowId, WindowOptions},
 };
 
-/// 生成指定尺寸的不透明 PNG（真实解码路径，不用伪造 tile）。
 fn png(width: u32, height: u32) -> Vec<u8> {
     let pixels: Vec<u8> = std::iter::repeat_n([10u8, 20, 30, 255], (width * height) as usize)
         .flatten()
@@ -50,7 +39,6 @@ fn white() -> PaintSpec {
     }
 }
 
-/// `Style` 的显式尺寸（taffy definite）。
 fn fixed(width: f32, height: f32) -> Style {
     let mut style = Style::default();
     style.inner.size = taffy::geometry::Size {
@@ -60,7 +48,6 @@ fn fixed(width: f32, height: f32) -> Style {
     style
 }
 
-/// headless App + 一个窗口（拥有自己的 current-thread runtime，便于驱动异步解码）。
 struct Fixture {
     rt: tokio::runtime::Runtime,
     app: App,
@@ -85,7 +72,6 @@ impl Fixture {
         fixture
     }
 
-    /// 根改成「纵向 flex + 左对齐」：子节点因此按自身尺寸（内在/显式）排布，不被 stretch 拉满。
     fn column_root(&mut self) {
         let tree = self.tree_mut();
         let root = tree.root();
@@ -123,7 +109,6 @@ impl Fixture {
             .bounds
     }
 
-    /// 推进一帧并返回帧记录（空闲帧也有记录）。
     fn frame(&mut self) -> FrameRecord {
         self.app
             .frame(self.window)
@@ -137,7 +122,6 @@ impl Fixture {
             .clone()
     }
 
-    /// 推进一帧并断言提交（有像素工作）。
     fn committed(&mut self) -> FrameRecord {
         let record = self.frame();
         assert!(record.rendered, "本帧必须提交：{record:?}");
@@ -145,7 +129,6 @@ impl Fixture {
     }
 }
 
-/// 某个节点的全部 `Primitive::Image` 快照（按绘制序）。
 fn images(record: &FrameRecord, node: NodeId) -> Vec<PrimitiveRecord> {
     record
         .frame
@@ -163,7 +146,6 @@ fn images(record: &FrameRecord, node: NodeId) -> Vec<PrimitiveRecord> {
         .unwrap_or_default()
 }
 
-/// 某个节点的唯一 `Primitive::Image`。
 fn image(record: &FrameRecord, node: NodeId) -> PrimitiveRecord {
     let mut found = images(record, node);
     assert_eq!(found.len(), 1, "必须恰好一个图片图元：{found:?}");
@@ -177,9 +159,6 @@ fn has_quad(record: &FrameRecord, node: NodeId) -> bool {
         .is_some_and(|frame| frame.quads.iter().any(|quad| quad.node == node))
 }
 
-// ── 布局：内在尺寸 / 显式尺寸 ───────────────────────────────────────────────
-
-/// 未给 `Style` 尺寸 ⇒ 用资源内在尺寸（tile 物理像素 ÷ 窗口 scale = 1）。
 #[test]
 fn intrinsic_size_drives_layout_and_fill_paint() {
     let mut fixture = Fixture::new();
@@ -211,7 +190,6 @@ fn intrinsic_size_drives_layout_and_fill_paint() {
     );
 }
 
-/// 显式 `Style` 尺寸优先于资源内在尺寸。
 #[test]
 fn explicit_style_size_wins_over_the_intrinsic_size() {
     let mut fixture = Fixture::new();
@@ -232,13 +210,10 @@ fn explicit_style_size_wins_over_the_intrinsic_size() {
     assert_eq!(image(&record, node).bounds, fixture.bounds(node));
 }
 
-// ── 绘制：Contain / Cover 几何 + 调制 ──────────────────────────────────────
-
-/// `Contain` = 等比内嵌居中；`Cover` = 等比铺满 + 源 UV 居中裁切。
 #[test]
 fn contain_letterboxes_and_cover_crops_the_source_uv() {
     let mut fixture = Fixture::new();
-    let resource = fixture.insert(&png(40, 20)); // 2:1
+    let resource = fixture.insert(&png(40, 20));
     let tile = resource.tile;
     let build = |fit: ImageFit| {
         move |tree: &mut NodeTree, root: NodeId| {
@@ -253,7 +228,6 @@ fn contain_letterboxes_and_cover_crops_the_source_uv() {
 
     let record = fixture.committed();
 
-    // Contain：scale = min(16/40, 16/20) = 0.4 ⇒ 16×8，垂直居中（y = 4）。
     let contain_image = image(&record, contain);
     assert_eq!(
         contain_image.bounds,
@@ -262,8 +236,6 @@ fn contain_letterboxes_and_cover_crops_the_source_uv() {
     );
     assert_eq!(contain_image.image_uv, Some(tile.uv()), "Contain 不裁源");
 
-    // Cover：scale = max(0.4, 0.8) = 0.8 ⇒ 显示 32×16，水平裁中间一半、垂直完整。
-    // 图元 bounds 恒等于节点盒（源区域裁在 UV 上，不溢出、不需要 clip）。
     let cover_image = image(&record, cover);
     assert_eq!(
         cover_image.bounds,
@@ -286,7 +258,6 @@ fn contain_letterboxes_and_cover_crops_the_source_uv() {
     assert!((uv[3] - v1).abs() < 1e-6, "垂直方向不裁：{uv:?}");
 }
 
-/// 静态调制直接进 `Primitive::Image`；`bind_style` 的 `foreground` 动态覆盖（文本同通道）。
 #[test]
 fn static_and_dynamic_modulation_reach_the_image_primitive() {
     let mut fixture = Fixture::new();
@@ -323,7 +294,6 @@ fn static_and_dynamic_modulation_reach_the_image_primitive() {
     );
 }
 
-/// 资源不存活（陈旧 / 已释放句柄）⇒ 不画图元、不 panic（占位 = 节点背景 / 透明）。
 #[test]
 fn missing_resource_paints_no_image_primitive() {
     let mut fixture = Fixture::new();
@@ -342,9 +312,6 @@ fn missing_resource_paints_no_image_primitive() {
     assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 16.0, 16.0));
 }
 
-// ── 资源生命周期：未就绪 → 到达 → 自动重绘；释放 / 关窗 ──────────────────
-
-/// 未就绪占位 → 异步解码交付 → 引擎自动改就绪、重排重绘（应用不重建节点）。
 #[test]
 fn pending_image_placeholder_is_replaced_when_the_resource_arrives() {
     let mut fixture = Fixture::new();
@@ -360,12 +327,10 @@ fn pending_image_placeholder_is_replaced_when_the_resource_arrives() {
             .expect("image")
     });
 
-    // 第 1 帧：current-thread runtime 没有被驱动，解码任务还没跑 ⇒ 资源未就绪。
     let first = fixture.committed();
     assert!(images(&first, node).is_empty(), "未就绪时不得画图元");
     assert!(has_quad(&first, node), "占位 = 节点背景");
 
-    // 驱动 runtime 让解码完成，再轮询交付（等价于平台泵的 poll_resources）。
     let delivered = drive_until_delivered(&mut fixture);
     assert_eq!(delivered.len(), 1, "必须交付一项");
     assert!(
@@ -374,14 +339,12 @@ fn pending_image_placeholder_is_replaced_when_the_resource_arrives() {
         delivered[0].1
     );
 
-    // 交付已把节点改成 Ready 并标 LAYOUT | PAINT ⇒ 下一帧出图。
     let second = fixture.committed();
     let painted = image(&second, node);
     assert_eq!(painted.bounds, fixture.bounds(node));
     assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 40.0, 20.0));
 }
 
-/// 释放资源 ⇒ 引擎把引用它的图片节点标脏；下一帧不画旧 tile、布局不变。
 #[test]
 fn unloading_a_resource_repaints_without_stale_images() {
     let mut fixture = Fixture::new();
@@ -407,7 +370,6 @@ fn unloading_a_resource_repaints_without_stale_images() {
     );
 }
 
-/// 关窗释放 `insert_owned` 的引用后，**其它窗口**里引用同一句柄的图片节点不得继续画旧 tile。
 #[test]
 fn closing_a_window_invalidates_images_referencing_released_resources() {
     let mut fixture = Fixture::new();
@@ -424,7 +386,6 @@ fn closing_a_window_invalidates_images_referencing_released_resources() {
         .insert_owned(owner, &bytes)
         .expect("insert owned");
 
-    // 共享句柄挂在另一个窗口的图片节点上（跨窗口共享是允许的）。
     let node = fixture.mount(|tree, root| {
         NodeBuilder::image(resource.id, ImageFit::Contain)
             .paint(white())
@@ -443,7 +404,6 @@ fn closing_a_window_invalidates_images_referencing_released_resources() {
     );
 }
 
-/// 驱动 runtime 并反复轮询，直到 `poll_resources` 交付至少一项（超时 panic）。
 fn drive_until_delivered(
     fixture: &mut Fixture,
 ) -> Vec<(
@@ -467,13 +427,9 @@ fn drive_until_delivered(
     }
 }
 
-// ── DPI：内在尺寸重算 + 变体切换 ───────────────────────────────────────────
-
-/// DPI 变化 ⇒ 内在尺寸 = tile / 新 scale；应用换 2× 变体后逻辑尺寸恢复。
 #[test]
 fn dpi_change_reresolves_the_intrinsic_size_and_accepts_a_new_variant() {
     let mut fixture = Fixture::new();
-    // 80×40 的 2× 资产：1× 屏取 40×20 变体（逻辑尺寸 40×20），2× 屏取 80×40 变体。
     let bytes = png(80, 40);
     let one_x = fixture
         .app
@@ -488,7 +444,6 @@ fn dpi_change_reresolves_the_intrinsic_size_and_accepts_a_new_variant() {
     let _ = fixture.committed();
     assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 40.0, 20.0));
 
-    // 1× → 2×：tile 仍是 40×20 物理像素 ⇒ 逻辑内在尺寸减半（应用尚未换变体）。
     fixture
         .app
         .window_mut(fixture.window)
@@ -501,7 +456,6 @@ fn dpi_change_reresolves_the_intrinsic_size_and_accepts_a_new_variant() {
         "内在尺寸 = tile 物理像素 ÷ 窗口 scale"
     );
 
-    // 应用按新 scale 取 2× 变体并换到节点上：下一帧布局前重解析 ⇒ 逻辑尺寸恢复。
     let two_x = fixture
         .app
         .resources_mut()
@@ -534,8 +488,6 @@ fn dpi_change_reresolves_the_intrinsic_size_and_accepts_a_new_variant() {
     );
 }
 
-/// `Window::set_image_resource` 的公开面契约（与 `Window::set_canvas` 同型）：
-/// 图片节点 ⇒ `Ok(true)`；非图片节点 ⇒ `Ok(false)` 且不改状态；陈旧句柄 ⇒ `StaleNode`。
 #[test]
 fn set_image_resource_accepts_only_live_image_nodes() {
     let mut fixture = Fixture::new();
@@ -570,7 +522,6 @@ fn set_image_resource_accepts_only_live_image_nodes() {
     );
 }
 
-/// I3：稳定后的图片节点不再产生帧。
 #[test]
 fn a_steady_image_node_does_not_request_frames() {
     let mut fixture = Fixture::new();
@@ -585,9 +536,6 @@ fn a_steady_image_node_does_not_request_frames() {
     assert!(!idle.rendered, "无变化的图片节点必须 Idle（I3）");
 }
 
-// ── a11y ────────────────────────────────────────────────────────────────────
-
-/// 默认 `Image` 角色 + 可选标签；无标签按装饰图 hidden；默认非交互（无动作）。
 #[test]
 fn image_nodes_map_to_the_image_role_with_optional_label() {
     let mut app = TestApp::new();
@@ -638,7 +586,6 @@ fn image_nodes_map_to_the_image_role_with_optional_label() {
         "没有 alt 的图片节点按装饰图 hidden（不静默播报空节点）"
     );
 
-    // §7.4 的诊断面与 hidden 语义配套：无 alt ⇒ `MissingAltText{kind: Image}`；有 alt ⇒ 无诊断。
     let diagnostics = app.app().a11y_diagnostics();
     assert!(
         diagnostics.iter().any(|diagnostic| matches!(
@@ -659,9 +606,6 @@ fn image_nodes_map_to_the_image_role_with_optional_label() {
     );
 }
 
-/// **装饰图免诊断**（P2-1b3 裁决）：显式 `A11yOverride { hidden: true }` 的图片是装饰声明，
-/// **不**产生 `MissingAltText`；没有显式 hidden 的图片（即便被引擎「无 label ⇒ hidden」兜底
-/// 隐藏）仍记诊断；有 label 的图片（即使同时 hidden）也不记诊断。
 #[test]
 fn explicitly_decorative_images_have_no_missing_alt_diagnostic() {
     let mut app = TestApp::new();

@@ -1,31 +1,3 @@
-//! The indices protocol, its background service, and the seams a test drives it
-//! through.
-//!
-//! One service instance follows one scope: the account the pane is for, and the
-//! topics it selected. The scope is the stream key as well, which is what makes the
-//! framework's generations do the filtering — a message can only ever describe the
-//! scope it was published for, so the pane never sees one from a selection it has
-//! left.
-//!
-//! # Replacing a selection
-//!
-//! A replacement releases the subscription it replaces *before* it opens the new
-//! one, and the service waits for the old stream to say it has let its subscription
-//! go. That wait is not bookkeeping: the service counts every topic a session
-//! subscribes to against a single index limit, so a replacement that subscribed
-//! while the old selection was still live would briefly ask for the union of both —
-//! and a selection that already fills the limit would be refused for the very topics
-//! it is replacing. The retirement signal is what makes the two orderings one.
-//!
-//! # What a status means
-//!
-//! `Ready` is the protocol's own boundary rather than "the socket is up": the
-//! subscription is active *and* every index of the scope has quoted, so a pane that
-//! shows `Ready` is a pane whose whole selection is on screen. A reconnect takes
-//! that back — the venue is re-establishing the subscription, and what it quoted
-//! before says nothing about what it will quote now — while the quotes themselves
-//! stay, so a pane keeps showing the last numbers it had instead of blanking.
-
 use std::{future::Future, sync::Arc};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -60,37 +32,24 @@ use super::model::{
     prepare_catalog, selection_topics,
 };
 
-/// What a pane asks its service to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum FinancialIndexRequest {
-    /// Follows this scope, keeping the stream that already follows it.
     Load(FinancialIndexScope),
-    /// Reopens the scope's stream, for a scope whose stream has failed.
     Retry(FinancialIndexScope),
-    /// Follows nothing: nobody is signed in, or nothing is selected.
     Stop,
-    /// Reads the catalogue a selector lists.
     FetchManifest,
 }
 
-/// What the service did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum FinancialIndexResponse {
-    /// The scope's stream is running.
     StreamStarted,
-    /// Nothing is followed.
     Stopped,
-    /// The catalogue a selector lists, and the number of indices the account may follow.
     Manifest {
         catalog: FinancialIndexCatalog,
         limit: Option<u32>,
     },
 }
 
-/// The indices one subscription follows, for one account.
-///
-/// It is the request's subject and the stream's key at once: a scope *is* what a
-/// stream is about.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct FinancialIndexScope {
     account_id: SmolStr,
@@ -98,11 +57,6 @@ pub(super) struct FinancialIndexScope {
 }
 
 impl FinancialIndexScope {
-    /// The scope a selection follows, or `None` when there is nothing to follow.
-    ///
-    /// Both halves are needed. A selection with nobody signed in is a pane the
-    /// service would refuse, and an account with nothing selected is a pane that has
-    /// asked for nothing; neither is a scope, so neither gets a stream.
     pub(super) fn new(
         account_id: Option<&SmolStr>,
         selection: &[SelectedFinancialIndex],
@@ -117,11 +71,6 @@ impl FinancialIndexScope {
         })
     }
 
-    /// Whether the service may open this scope.
-    ///
-    /// The selection is normalized where it is accepted — persisted config and the
-    /// selector both cap it — so this is the second of the two places the limit is
-    /// enforced rather than a check that a caller is trusted to have made.
     fn validate(&self) -> Result<(), FinancialIndexServiceError> {
         if self.topics.len() > MAX_SELECTED_INDICES {
             return Err(FinancialIndexServiceError::Data(
@@ -134,27 +83,18 @@ impl FinancialIndexScope {
     }
 }
 
-/// What one subscription is doing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum FinancialIndexStatus {
-    /// The subscription is being established, or has not quoted every index yet.
     Connecting,
-    /// Every index of the scope has quoted.
     Ready,
-    /// The subscription ended; the pane is finished until the user recovers it.
     Failed(FinancialIndexStreamError),
 }
 
-/// Why a subscription stopped, or why it never started.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum FinancialIndexStreamError {
     Service(KytrixServiceError),
     Transport(TransportError),
-    /// The service refused the selection because the account may follow fewer
-    /// indices, with the account's own limit when the session has published one.
-    FinancialIndexLimit {
-        limit: Option<u32>,
-    },
+    FinancialIndexLimit { limit: Option<u32> },
 }
 
 impl TranslatedError for FinancialIndexStreamError {
@@ -163,7 +103,6 @@ impl TranslatedError for FinancialIndexStreamError {
             Self::Service(error) => error.translated_message(translate),
             Self::Transport(error) => error.translated_message(translate),
             Self::FinancialIndexLimit { limit: Some(limit) } => {
-                // A limit of one is a single index, and the sentence says so.
                 if *limit == 1 {
                     t_smol!(
                         translate,
@@ -185,11 +124,9 @@ impl TranslatedError for FinancialIndexStreamError {
     }
 }
 
-/// One message of the scope's stream.
 #[derive(Clone, Debug)]
 pub(super) enum FinancialIndexStreamMessage {
     Status(FinancialIndexStatus),
-    /// Every quote the subscription holds, which only ever grows within a scope.
     Quotes(Arc<HashMap<FinancialIndexTopic, FinancialIndexQuote>>),
 }
 
@@ -203,7 +140,6 @@ impl WidgetProtocol for FinancialIndexProtocol {
     type Error = FinancialIndexServiceError;
 }
 
-/// Why a request could not be answered.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum FinancialIndexServiceError {
     #[error(transparent)]
@@ -221,14 +157,9 @@ impl TranslatedError for FinancialIndexServiceError {
     }
 }
 
-/// The index data a pane reads through.
-///
-/// The service is written against this seam rather than against the connector, so a
-/// test can drive every ordering a session can produce without a session.
 pub(super) trait FinancialIndexSource: Clone + Send + Sync + 'static {
     type Subscription: FinancialIndexEventSubscription;
 
-    /// The account's session state, which names the index limit it may follow.
     fn session_state(&self) -> watch::Receiver<Option<KytrixSessionState>>;
 
     fn fetch_manifest(
@@ -241,7 +172,6 @@ pub(super) trait FinancialIndexSource: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 }
 
-/// One live index subscription.
 pub(super) trait FinancialIndexEventSubscription: Send + 'static {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus>;
 
@@ -280,7 +210,6 @@ impl FinancialIndexEventSubscription for Subscription<FinancialIndexEvent> {
     }
 }
 
-/// The service that follows one pane's indices.
 pub(super) struct FinancialIndexService<S = KytrixServiceConnector> {
     source: S,
 }
@@ -327,9 +256,6 @@ where
                         continue;
                     }
 
-                    // A scope is what a stream is about, so a different one replaces
-                    // the stream the service is running, and the same one is only
-                    // reopened because the pane is retrying it.
                     let replacing =
                         retry || active.as_ref().is_some_and(|stream| stream.scope != scope);
                     if replacing && !retire(&mut context, &mut active, &mut reply).await {
@@ -353,17 +279,11 @@ where
     }
 }
 
-/// The stream the service is running, and the way it says its subscription is gone.
 struct ActiveStream {
     scope: FinancialIndexScope,
     retired: oneshot::Receiver<()>,
 }
 
-/// Releases the running stream and waits for its subscription to be let go.
-///
-/// Returns whether the caller may go on: a retirement that did not arrive before the
-/// request's deadline leaves the old subscription in a state nobody can vouch for,
-/// and opening a second one on top of it is exactly what the wait exists to prevent.
 async fn retire(
     context: &mut ServiceContext<FinancialIndexProtocol>,
     active: &mut Option<ActiveStream>,
@@ -404,10 +324,6 @@ where
         () = tokio::time::sleep_until(deadline) => Err(KytrixServiceError::Timeout),
         result = source.fetch_manifest() => result,
     };
-    // The limit travels with the catalogue rather than as a read of its own: a selector
-    // draws the two together, and two reads could disagree about the account they
-    // describe. Only a pane the service has no session for leaves the selector nothing to
-    // draw: a feature the session does not carry is off, so a session always names a limit.
     let limit = session_limit(&source.session_state());
 
     Some(
@@ -420,14 +336,6 @@ where
     )
 }
 
-/// Runs the scope's subscription, and answers the request that opened it.
-///
-/// The answer is sent from here rather than by the loop because the subscription is
-/// what it answers for: a caller that went away while the subscription was being
-/// established takes the setup down with it instead of leaving a subscription nobody
-/// asked for. What the answer says is that the service took the scope — whether the
-/// subscription then works is the stream's own status to report, because that is
-/// where the failures a pane shows already live.
 async fn run_stream<S>(
     source: S,
     scope: FinancialIndexScope,
@@ -437,9 +345,6 @@ async fn run_stream<S>(
 ) where
     S: FinancialIndexSource,
 {
-    // Declared before everything else, so that the subscription and the setup that
-    // produced it are dropped before the service is told they are gone: the signal
-    // is what a replacement waits on, and it has to mean what it says.
     let _retirement = StreamRetirement(Some(retirement));
     let mut published = FinancialIndexStatus::Connecting;
     if publish_status(&publisher, FinancialIndexStatus::Connecting)
@@ -480,8 +385,6 @@ async fn run_stream<S>(
     let mut quoted = HashSet::with_capacity(topics.len());
     let mut connected = false;
 
-    // A subscription can already be up before its first change, so where it is now is
-    // where the stream starts.
     let current = status.borrow_and_update().clone();
     if !apply_subscription_status(
         &publisher,
@@ -532,8 +435,6 @@ async fn run_stream<S>(
                 }
                 let quote = FinancialIndexQuote::from_event(&event);
                 match quotes.get(&event.topic) {
-                    // The venue's own clock orders two quotes of one index, so an
-                    // older one is not a correction of a newer one.
                     Some(previous) if previous.timestamp > quote.timestamp => continue,
                     Some(previous) if *previous == quote => continue,
                     _ => {}
@@ -555,15 +456,6 @@ async fn run_stream<S>(
     }
 }
 
-/// Applies one subscription status, which the stream's own readiness follows.
-///
-/// A reconnect gives up the readiness the scope had: the venue is re-establishing
-/// the subscription, so the quotes that arrive next are the ones that decide it
-/// again. The quotes already held are kept, because a pane that is reconnecting
-/// should show the last numbers it had rather than nothing.
-///
-/// Returns whether the stream may keep running: a status that ended it has already
-/// published why, and the task settles on the pane that will replace it.
 async fn apply_subscription_status(
     publisher: &StreamPublisher<FinancialIndexProtocol>,
     status: SubscriptionStatus,
@@ -585,8 +477,6 @@ async fn apply_subscription_status(
             let next = connected_status(*connected, quoted.len(), topics.len());
             publish_change(publisher, next, published).await.is_ok()
         }
-        // A closing subscription is on its way to a terminal status of its own, and
-        // that is where the failure is reported from.
         SubscriptionStatus::Closing => true,
         SubscriptionStatus::Closed => {
             publish_failure(
@@ -603,7 +493,6 @@ async fn apply_subscription_status(
     }
 }
 
-/// The status a subscription that is up has: ready once every index has quoted.
 fn connected_status(connected: bool, quoted: usize, selected: usize) -> FinancialIndexStatus {
     if connected && selected > 0 && quoted == selected {
         FinancialIndexStatus::Ready
@@ -612,12 +501,6 @@ fn connected_status(connected: bool, quoted: usize, selected: usize) -> Financia
     }
 }
 
-/// What a refused subscription means to the pane.
-///
-/// A selection the account may not follow is the one refusal that is about the
-/// selection rather than about the connection, so it carries the number of indices
-/// the account may follow — the number the session state published, when it has
-/// published one.
 fn stream_error(error: &KytrixServiceError, limit: Option<u32>) -> FinancialIndexStreamError {
     match error {
         KytrixServiceError::Server(ErrorCode::FinancialIndexTopicLimitExceeded) => {
@@ -627,12 +510,6 @@ fn stream_error(error: &KytrixServiceError, limit: Option<u32>) -> FinancialInde
     }
 }
 
-/// The number of indices the signed-in account may follow, as the session holds it.
-///
-/// A session that exists always names a limit, because the entitlement contract makes a
-/// feature the session does not carry off: a missing `indices` entry, or one that is not
-/// a limit, is an account that may follow no indices rather than one whose limit nobody
-/// knows. `None` is only for a pane there is no session for at all.
 fn session_limit(session: &watch::Receiver<Option<KytrixSessionState>>) -> Option<u32> {
     let session = session.borrow();
     let state = session.as_ref()?;
@@ -647,11 +524,6 @@ fn session_limit(session: &watch::Receiver<Option<KytrixSessionState>>) -> Optio
     Some(limit)
 }
 
-/// Answers the request that opened one stream.
-///
-/// Returns whether the caller was still there to hear it. A caller that went away
-/// gets no answer, and everything the answer was for — the subscription included —
-/// goes with it rather than being left for a pane that has moved on.
 fn respond(
     reply: RpcRequestContext<FinancialIndexProtocol>,
     response: Result<FinancialIndexResponse, FinancialIndexServiceError>,
@@ -659,10 +531,6 @@ fn respond(
     reply.respond(response).is_ok()
 }
 
-/// Tells the service that this stream has let its subscription go.
-///
-/// The signal is sent when the task is dropped, which is what lets a replacement
-/// wait for the old subscription instead of racing it.
 struct StreamRetirement(Option<oneshot::Sender<()>>);
 
 impl Drop for StreamRetirement {
@@ -673,7 +541,6 @@ impl Drop for StreamRetirement {
     }
 }
 
-/// Publishes a status the pane has not been told yet.
 async fn publish_status(
     publisher: &StreamPublisher<FinancialIndexProtocol>,
     status: FinancialIndexStatus,
@@ -683,7 +550,6 @@ async fn publish_status(
         .await
 }
 
-/// Publishes a status change, if it is one.
 async fn publish_change(
     publisher: &StreamPublisher<FinancialIndexProtocol>,
     status: FinancialIndexStatus,
@@ -697,11 +563,6 @@ async fn publish_change(
     Ok(())
 }
 
-/// Publishes the failure a stream ended with, and holds the scope it took.
-///
-/// A terminal failure is not retried: the pane asks for a new stream when the user
-/// takes the recovery, and until then this task stays where it is so the framework
-/// still sees the scope as taken.
 async fn publish_failure(
     publisher: &StreamPublisher<FinancialIndexProtocol>,
     error: FinancialIndexStreamError,
@@ -713,13 +574,6 @@ async fn publish_failure(
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -850,8 +704,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A session that has published no state is an account the service does not know,
-    /// and a limit nobody published is not one a selector may draw.
     #[tokio::test]
     async fn a_manifest_read_should_carry_no_limit_when_the_session_has_none() {
         let source = FakeSource::default();
@@ -1032,16 +884,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// The replacement of a live scope is the one ordering a session is unforgiving
-    /// about: it counts the topics of every subscription against one index limit, so a
-    /// replacement that subscribed before the previous subscription was gone would
-    /// briefly ask for the union of both. The fake refuses that the way a session at
-    /// its limit would, and holds the old subscription until the test lets it go — so
-    /// this fails if the service does not wait for the release.
-    ///
-    /// It runs on its own threads because the hold happens inside the venue's own drop:
-    /// on a single-threaded runtime that hold would block the test as well, and the
-    /// assertion below could not tell a service that waited from one that did not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_selection_change_should_release_the_old_subscription_before_the_new_one() {
         let source = FakeSource::default();
@@ -1212,9 +1054,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A session that exists always names a limit: the contract makes a feature the
-    /// session does not carry off, so a missing entry is an account that may follow no
-    /// indices rather than one whose limit nobody knows.
     #[test]
     fn a_session_without_an_indices_entitlement_should_follow_no_indices() {
         let mut state = session(3);
@@ -1224,8 +1063,6 @@ mod tests {
         assert_eq!(session_limit(&receiver), Some(0));
     }
 
-    /// A feature whose value is a flag is not a number, so it cannot be a limit either;
-    /// an enabled flag still says nothing about how many indices may be followed.
     #[test]
     fn an_indices_entitlement_that_is_a_flag_should_follow_no_indices() {
         let mut state = session(3);
@@ -1240,8 +1077,6 @@ mod tests {
         assert_eq!(session_limit(&receiver), Some(0));
     }
 
-    /// An entitlement with neither branch set is not a message a session should publish,
-    /// and the contract reads what it does not know as off.
     #[test]
     fn an_indices_entitlement_without_a_value_should_follow_no_indices() {
         let mut state = session(3);

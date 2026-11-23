@@ -1,16 +1,5 @@
-//! The locale catalogue compiled into the binary.
-//!
-//! The messages are embedded rather than read from disk so a packaged build
-//! cannot start without the text it renders.
-
 use crate::{error::types::Error, language::codes::LanguageCode, translator::types::I18n};
 
-/// Builds a translator from the locale files embedded in this crate.
-///
-/// # Errors
-///
-/// Fails when an embedded file is not a valid locale document or when a message
-/// is not a valid template.
 pub fn load() -> Result<I18n, Error> {
     I18n::builder()
         .locale_yaml(LanguageCode::En, include_str!("../locales/en.yaml"))?

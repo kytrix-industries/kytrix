@@ -1,13 +1,3 @@
-//! The fake index several test modules answer through.
-//!
-//! One fake is shared because every module asks the service the same questions and
-//! answers them with the same document: a second copy per module would be the same
-//! lines with a different name.
-//!
-//! It hands over the answer itself rather than a reading, which is what the
-//! production source does: that is the seam the parse is on, so a fake that answered
-//! with a reading could not say what the service does with an unreadable one.
-
 use std::{
     collections::VecDeque,
     future::pending,
@@ -25,31 +15,18 @@ use super::{
     service::{PizzaFetchError, PizzaSource},
 };
 
-/// The account every fixture pane is scoped to.
 pub(super) const ACCOUNT: &str = "test-account";
 
-/// The moment every fixture answer is observed at.
 pub(super) const OBSERVED_AT: i64 = 1_792_821_600_000;
 
-/// How the fake answers one fetch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FetchPlan {
-    /// Answers with a snapshot carrying this level.
     Snapshot(u32),
-    /// Answers with a level the ladder does not have, which is an answer the pane
-    /// must refuse rather than clamp.
     UnknownLevel,
-    /// Answers with a service failure.
     Failure,
-    /// Never answers, so the fetch stays in flight.
     Pending,
 }
 
-/// The answer one DEFCON level is published as.
-///
-/// The collection time is a moment after the observation it carries rather than an
-/// arbitrary one: a snapshot is taken of a point that already exists, and a fixture
-/// that said otherwise would disagree with any check of that order.
 pub(super) fn answer(level: u32) -> proto_types::PentagonPizzaIndex {
     proto_types::PentagonPizzaIndex {
         defcon_level: level,
@@ -58,7 +35,6 @@ pub(super) fn answer(level: u32) -> proto_types::PentagonPizzaIndex {
     }
 }
 
-/// The reading a fixture answer of `level` stands for.
 pub(super) fn reading(level: u8) -> PizzaReading {
     PizzaReading::for_test(
         PizzaLevel::from_number(level).expect("the fixture names a rung"),
@@ -66,11 +42,6 @@ pub(super) fn reading(level: u8) -> PizzaReading {
     )
 }
 
-/// A source whose answers, and whose number of reads, a test decides.
-///
-/// With nothing left to answer it never answers again, so a test that expects an
-/// absence can tell "the fetch never happened" from "the answer went somewhere
-/// else" by the count.
 #[derive(Clone)]
 pub(super) struct FakeSource {
     state: Arc<FakeSourceState>,
@@ -93,17 +64,14 @@ impl FakeSource {
         }
     }
 
-    /// How many times the index has been read.
     pub(super) fn fetches(&self) -> usize {
         self.state.fetches.load(Ordering::Acquire)
     }
 
-    /// How many reads were dropped before they answered.
     pub(super) fn cancelled_fetches(&self) -> usize {
         self.state.cancelled_fetches.load(Ordering::Acquire)
     }
 
-    /// Takes the next plan, counting the read as started.
     fn begin(&self) -> (FetchPlan, FetchGuard) {
         let plan = self
             .state
@@ -147,7 +115,6 @@ impl PizzaSource for FakeSource {
     }
 }
 
-/// Counts the read it belongs to as in flight until it answers or is dropped.
 struct FetchGuard {
     state: Arc<FakeSourceState>,
     completed: bool,

@@ -1,59 +1,3 @@
-//! The force-order pane: the stream it reads and the table it draws.
-//!
-//! The pane is the `WidgetView` the framework mounts: [`ForceOrderWidget::new`] builds
-//! its collaborators and signals, [`load`](WidgetView::load) checks the directory and
-//! starts the stream, [`body`](WidgetView::body) builds the table once, and
-//! [`sync`](WidgetView::sync) drains what the binding delivered and hands the accepted
-//! rows to the table.
-//!
-//! # The table is built once and kept up to date
-//!
-//! The cells are built by `kit::table`'s row factory, which runs **without an
-//! application context**: a cell cannot read the theme, the settings snapshot, or the
-//! translation context while it is built. So the factory builds text nodes whose text
-//! and colour are `bind_text` / `bind_style` closures over the signals the widget
-//! owns — the accepted rows, the settings snapshot (for the display time zone), and
-//! the language (for the route and the localized unknown listing). The rows themselves
-//! reach the table through [`Table::set_rows`], which is what rebuilds the row window
-//! when the accepted snapshot grows, shrinks, or is cleared.
-//!
-//! # The table is display-only
-//!
-//! The old dataset was a table to read, not a table to pick: it had no selection state,
-//! no click handling and no selected-row styling. The kit table defaults to
-//! multi-select, so the pane turns selection off explicitly in `table_options`; a
-//! test pins that, so the interaction is not added by accident.
-//!
-//! # The directory
-//!
-//! Which markets report liquidations, and whether one of them is loaded, is the
-//! injected directory's answer — the connector in the application, a fixture in a
-//! test. The pane never loads the directory and never polls the catalogue: it re-reads
-//! the answer on every load and re-runs the load when the injected
-//! [`catalog_generation`](widget::services::WidgetServices::catalog_generation) signal
-//! moves (`crates/widgets/AGENTS.md` §8.3).
-//!
-//! # A generation is one number for the whole directory
-//!
-//! The signal says *that* the directory published a new generation, not *which venue*
-//! changed (§8.3 has no per-venue version). So **any** write reloads this pane, even a
-//! commit that only touched a venue it does not read: the rows are dropped and the
-//! stream is reopened against the new catalogue. That is the accepted trade — a row
-//! names and writes its listing at the generation its stream resolved against, so
-//! keeping rows across a generation the pane cannot attribute would be showing data
-//! from a retired catalogue — and the price is a visible reload on unrelated venue
-//! commits. Narrowing it needs the composition root to publish the scope of a change,
-//! which the frozen contract does not offer. The test
-//! `an_unrelated_directory_generation_should_reload_the_pane` pins the current
-//! behaviour.
-//!
-//! # The table's static copy
-//!
-//! The kit table takes its column headers and its empty-state sentence as resolved
-//! text when it is created. A language switch therefore rebuilds the table (and only
-//! the table: the rest of the body redraws through `bind_text`), which is the one
-//! place this pane cannot express a language dependency as a binding.
-
 use std::{mem, rc::Rc, sync::Arc};
 
 use app_config::{
@@ -111,17 +55,10 @@ use super::{
     },
 };
 
-/// The number of columns the dataset has: route, listing, price, quantity, time.
 const COLUMN_COUNT: usize = 5;
 
-/// The width weight of each column, in header order.
-///
-/// The kit table distributes the remaining width by these weights, which is the
-/// engine's spelling of the relative widths the dataset used to declare. The listing
-/// column is the widest because a listing name is the longest value a row carries.
 const COLUMN_WEIGHTS: [f32; COLUMN_COUNT] = [0.15, 0.35, 0.175, 0.175, 0.15];
 
-/// The alignment of each column, in header order: text on the left, numbers on the right.
 const COLUMN_ALIGNS: [ColumnAlign; COLUMN_COUNT] = [
     ColumnAlign::Start,
     ColumnAlign::Start,
@@ -130,10 +67,6 @@ const COLUMN_ALIGNS: [ColumnAlign; COLUMN_COUNT] = [
     ColumnAlign::End,
 ];
 
-/// Force orders expose no persisted options yet.
-///
-/// The config exists so the persisted schema version is owned by the widget
-/// rather than inferred from the absence of a config.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForceOrderConfig;
 
@@ -141,25 +74,14 @@ impl WidgetConfig for ForceOrderConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// The loaded market directory one pane reads.
-///
-/// Production wraps the injected connector; a test drives a fixture, because the
-/// framework's headless host cannot build a connector (it still needs the old
-/// toolkit's runtime). The pane only asks the three questions a load needs: which
-/// routes report liquidations, whether one of them is loaded, and the catalogue
-/// generation a new stream resolves its listings against.
 trait MarketDirectory {
-    /// The routes whose market can report liquidations, in the directory's order.
     fn liquidation_routes(&self) -> Vec<VenueRoute>;
 
-    /// Whether one route's market is loaded: its catalogue has been published.
     fn is_loaded(&self, route: &VenueRoute) -> bool;
 
-    /// The published catalogue a new stream resolves names and increments against.
     fn catalog(&self) -> Arc<Catalog>;
 }
 
-/// The application directory: the injected market-participants connector.
 struct ConnectorDirectory(MarketParticipantsConnector);
 
 impl MarketDirectory for ConnectorDirectory {
@@ -176,13 +98,6 @@ impl MarketDirectory for ConnectorDirectory {
     }
 }
 
-/// The loaded routes that carry one capability, in the order the venues answered them.
-///
-/// One question is asked of the loaded venues — which scopes carry the capability — so
-/// a pane that reads a whole market never enumerates venues of its own. The route and
-/// the entry it is judged by come from one reading of one commit: `entries()` takes the
-/// venue table's lock once, so a load landing while this runs cannot put one commit's
-/// route beside another's capabilities.
 fn loaded_routes_carrying(
     connector: &MarketParticipantsConnector,
     capability: CapabilityId,
@@ -201,47 +116,23 @@ fn loaded_routes_carrying(
         .collect()
 }
 
-/// Whether the routes the pane needs are a different set from the ones it holds.
-///
-/// The pane reads one stream over a *set* of routes, so a set that changed — every
-/// scope a venue was loaded with, one a shrinking commit took away — is a different
-/// stream rather than a repeat of the one being read. Compare as `(venue, scope)`
-/// pairs: two sets that name the same markets in a different order are the same stream.
 fn routes_changed(held: &[VenueRoute], needed: &[VenueRoute]) -> bool {
     held.len() != needed.len() || !needed.iter().all(|route| held.contains(route))
 }
 
-/// The markets a notice names while nothing is loaded: the venues whose loader can
-/// report liquidations, in the order the static definition table answers.
-///
-/// This is the one static answer a pane may read: the capability's venue name set,
-/// never a scope, an origin or a credential. It is what says which markets could report
-/// liquidations at all, which is the only honest answer while nothing is loaded.
 fn market_venues() -> Vec<VenueId> {
     venues_supporting(CapabilityId::ForceOrder)
 }
 
-/// The name keys of the venues [`market_venues`] answers, for the table's caption.
 fn market_venue_name_keys() -> Vec<&'static str> {
     market_venues().iter().map(VenueDisplay::name_key).collect()
 }
 
-/// The row a table row index displays: the newest accepted order first.
-///
-/// The table draws the retained orders with the newest at the top, so its row index
-/// counts backwards through the snapshot's chronological order.
 fn displayed_row(snapshot: &ForceOrderSnapshot, row: usize) -> Option<&ForceOrderRow> {
     let index = snapshot.len().checked_sub(row.checked_add(1)?)?;
     snapshot.orders().get(index).map(|row| &**row)
 }
 
-/// The text one cell draws, from the row and column it was built for.
-///
-/// The route is written with the one formatter every route a reader sees is rendered
-/// by, not with the canonical lower-case identity that belongs in logs; the listing is
-/// the name the published generation gave it, or the localized unknown when the
-/// generation named none. A cell that has no row (the table was asked for a row the
-/// accepted snapshot no longer holds) draws nothing.
 fn cell_text(
     row: Option<&ForceOrderRow>,
     column: usize,
@@ -265,19 +156,6 @@ fn cell_text(
     }
 }
 
-/// Builds one cell of the force-order table.
-///
-/// The kit table calls this without an application context, so what it builds is a
-/// text node whose text and colour are read on the frames that draw it: the cell
-/// registers its dependencies inside `bind_text` / `bind_style` rather than resolving
-/// anything here (AGENTS §4.4 / §9).
-///
-/// Every cell draws in a theme foreground. The engine's `TextStyle` colour is
-/// `BLACK` by default and the cell box's `foreground` does not inherit into the text
-/// node, so a cell that bound no colour would be unreadable on a dark appearance (and
-/// differ from the old table, which resolved `theme.roles.fg.default` for every cell).
-/// The listing column overrides that default with the direction colour of the
-/// liquidation's side.
 fn build_cell(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -293,7 +171,6 @@ fn build_cell(
     let text = NodeBuilder::text(SmolStr::default(), TextStyle::new(font_size));
 
     let text = match column {
-        // The route and the listing name are words, so they follow the language.
         0 | 1 => {
             let translate = translate.clone();
             text.bind_text(move |read| {
@@ -307,8 +184,6 @@ fn build_cell(
                 )
             })
         }
-        // The numbers are read in the display time zone, which is a settings read: the
-        // cell resolves it on the frames that draw it, so moving the setting redraws it.
         2..=4 => {
             let translate = translate.clone();
             text.bind_text(move |read| {
@@ -344,10 +219,6 @@ fn build_cell(
     let _ = text.build(tree, parent);
 }
 
-/// The columns the table declares, in header order.
-///
-/// Built when the table is built, because the kit table takes its headers as resolved
-/// text; a language switch rebuilds the table.
 fn columns(translate: &Translate) -> Vec<Column> {
     let headers = [
         t_smol!(translate, "common.route"),
@@ -365,43 +236,22 @@ fn columns(translate: &Translate) -> Vec<Column> {
         .collect()
 }
 
-/// One command this pane sent and has not seen the answer to.
-///
-/// The pane reads through one binding and issues one kind of command, so the tag names
-/// the read rather than telling commands apart: it is the identity the binding returned
-/// that decides which answer applies. A reply whose identity is not tracked answers a
-/// call the pane has already replaced; it is dropped and counted instead of failing the
-/// pane over a command no longer in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingCommand {
-    /// The read: `Load` or `Retry`.
     Start,
 }
 
 pub struct ForceOrderWidget {
-    /// The executor bridge, when this host has a directory to drive a service from.
-    ///
-    /// A headless host without a connector has nothing to start: the pane waits for
-    /// the directory instead of spawning a service it could never ask a question.
     binding: Option<WidgetBinding<ForceOrderProtocol>>,
-    /// The command in flight, keyed by the identity the binding returned.
     pending: Pending<PendingCommand>,
-    /// The table, once the body has been built (the framework builds a body only once
-    /// the pane has content).
     table: Option<Table>,
-    /// The node the table was built into; a language switch rebuilds the table there.
     table_slot: Option<NodeId>,
     status: WidgetStatus,
-    /// The recovery the framework offers for every failure this widget reports.
     recovery: WidgetAction,
-    /// The loaded directory, when the host has one.
     directory: Option<Rc<dyn MarketDirectory>>,
-    /// The accepted rows, as the cells read them.
     rows: Signal<ForceOrderSnapshot>,
-    /// The settings snapshot, for the display time zone the numbers are read in.
     config: Signal<Config>,
     language: Signal<LanguageCode>,
-    /// The directory generation the composition root publishes.
     generation: Signal<u64>,
     translate: Translate,
     theme: ThemeHandle,
@@ -409,35 +259,11 @@ pub struct ForceOrderWidget {
     pending_snapshot: Option<ForceOrderSnapshot>,
     ready_received: bool,
     awaiting_snapshot: bool,
-    /// The routes the stream the pane is running was started for.
-    ///
-    /// Which routes report liquidations is the directory's answer, and the user may
-    /// load another venue at any time, so the set is re-read on every load rather than
-    /// taken once. Empty means no market this pane reads is loaded, which is what keeps
-    /// [`Self::has_content`] false while the pane waits.
     routes: Arc<[VenueRoute]>,
-    /// Whether the catalogue generation moved under the stream the pane is reading.
-    ///
-    /// The rows were named and written at the generation the stream resolved when it
-    /// was opened; a new generation may have replaced it, so the next load asks for the
-    /// request that opens a new stream ([`ForceOrderRequest::Retry`]) rather than the
-    /// idempotent [`ForceOrderRequest::Load`]. Read past the pane's own gate: a pane a
-    /// shrinking commit sent back to waiting keeps the flag, so the load that brings
-    /// the market back reopens the stream too.
     market_reloaded: bool,
-    /// Whether the pane is waiting for its markets rather than reading them.
-    ///
-    /// The pane keeps its stream while it waits — cancelling the binding is terminal,
-    /// and this pane has to read the markets again once the user loads them — so a
-    /// snapshot that was already in flight when the routes went away can still arrive.
-    /// Accepting it would write a status over the notice the framework is drawing, so
-    /// every message entry refuses while this is set.
     awaiting_market: bool,
-    /// The generation this pane has already reacted to.
     seen_generation: u64,
-    /// The language the table's static copy was built in.
     seen_language: LanguageCode,
-    /// Whether the accepted rows changed since the table was last updated.
     rows_dirty: bool,
 }
 
@@ -459,8 +285,6 @@ impl WidgetView for ForceOrderWidget {
         recovery: WidgetAction,
         cx: &mut WidgetCx<'_>,
     ) -> Result<Self, EngineError> {
-        // A host without a directory has nothing to ask and nothing to start; the pane
-        // reports the neutral notice and waits. Every application supplies one.
         let Some(connector) = cx.services().market_participants.clone() else {
             return Ok(Self::assemble(None, None, status, recovery, cx));
         };
@@ -477,22 +301,11 @@ impl WidgetView for ForceOrderWidget {
         ))
     }
 
-    /// The table is the content, and it is ready as soon as a snapshot has been
-    /// accepted — including an empty one. An empty table is what "no force orders right
-    /// now" looks like; it is not a state the widget reports.
-    ///
-    /// A pane that reads no route at all has nothing to draw however much it once
-    /// accepted: the market it was reading is gone, and the neutral notice stands in
-    /// its place.
     fn has_content(&self) -> bool {
         !self.routes.is_empty() && self.snapshot.is_some()
     }
 
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
-        // The markets this pane reads have to be loaded before anything else happens
-        // here, and the check is first on purpose: with no route to read there is no
-        // stream to start, and the pane waits for one instead of reporting the failure
-        // the service would raise about a route nobody serves.
         let Some(directory) = self.directory.clone() else {
             self.wait_for_market(cx);
             return;
@@ -502,15 +315,8 @@ impl WidgetView for ForceOrderWidget {
             self.wait_for_market(cx);
             return;
         }
-        // The pane reached here only past its own gate, so the markets it was waiting
-        // for are in memory again and messages belong to them once more.
         self.awaiting_market = false;
-        // Read past the gate: a new catalogue generation is what brings this pane back
-        // after a shrinking commit, and the stream it still holds resolved against the
-        // retired generation.
         let market_reloaded = mem::take(&mut self.market_reloaded);
-        // A route set that changed is a different stream rather than a repeat of this
-        // one, and replacing it keeps the rows a reader is looking at.
         let retry = self.status.is_failed(cx.app())
             || (!self.routes.is_empty() && routes_changed(&self.routes, &routes));
         if !retry {
@@ -522,9 +328,6 @@ impl WidgetView for ForceOrderWidget {
         self.ready_received = false;
         self.awaiting_snapshot = true;
         self.status.report(cx.app_mut(), WidgetState::Connecting);
-        // The two decisions are separate: a reload still drops the rows — they were
-        // written at the generation behind the commit — while the request is the
-        // replacing one.
         let request = if retry || market_reloaded {
             ForceOrderRequest::Retry { routes }
         } else {
@@ -540,8 +343,6 @@ impl WidgetView for ForceOrderWidget {
         let translate = self.translate.clone();
         let language = self.language;
         let name_keys = market_venue_name_keys();
-        // The body is the content slot's whole surface: the kit table draws the header
-        // and the rows, and the frame exists for the caption the pane states over them.
         let frame = NodeBuilder::boxed()
             .id("ForceOrderTableFrame")
             .style(
@@ -575,40 +376,27 @@ impl WidgetView for ForceOrderWidget {
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        // The directory generation is the one signal the framework's surface root also
-        // reads, so a write schedules the frame that runs this hook — including for a
-        // pane that is only waiting and has no body. Nothing else may poll the
-        // directory (AGENTS §8.3).
         let generation = *cx.read(&self.generation);
         if generation != self.seen_generation {
             self.seen_generation = generation;
             if !self.status.is_failed(cx.app()) {
-                // A new generation may have replaced the one the live stream resolved
-                // its listings against, so the load that follows asks for a new stream.
                 self.market_reloaded = true;
                 self.load(cx);
             }
         }
 
-        // The binding delivers messages instead of calling back into the widget; this
-        // is the one place they are applied, where the widget has a context again.
         if let Some(binding) = self.binding.as_ref() {
             for inbound in binding.take() {
                 self.apply(inbound, cx);
             }
         }
 
-        // A language switch redraws the cells through their `bind_text` closures; the
-        // table's own copy (headers and the empty sentence) is resolved when the table
-        // is built, so that is the one thing rebuilt.
         let language = *cx.read(&self.language);
         if language != self.seen_language {
             self.seen_language = language;
             self.rebuild_table(cx)?;
         }
 
-        // Structural row changes go to the table, whose row factory has no application
-        // context; every dynamic value inside a row is a `bind_*` closure instead.
         if self.rows_dirty {
             self.rows_dirty = false;
             let snapshot = self.snapshot.clone().unwrap_or_default();
@@ -627,9 +415,6 @@ impl WidgetView for ForceOrderWidget {
     }
 
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
-        // The table's nodes are removed by the framework after this hook, so the
-        // component is released here while its nodes are still alive. The service is
-        // cancelled the same way: stopping it is what ends the supervised stream.
         if let Some(table) = self.table.take() {
             table.release(cx.app_mut());
         }
@@ -640,20 +425,11 @@ impl WidgetView for ForceOrderWidget {
     }
 }
 
-/// The options the force-order dataset needs from the kit table: a fixed row height
-/// (the dataset declares one) and **no row selection**.
-///
-/// The old `TableDataSet` drew rows to read, not rows to pick: it had no selection
-/// state, no click handling and no selected-row styling. The kit table defaults to
-/// [`SelectionMode::Multi`], so the pane turns selection off explicitly here — the one
-/// place the decision is made, which is what
-/// `tests::the_table_should_not_offer_row_selection` pins.
 fn table_options(row_height: f32) -> TableOptions {
     TableOptions::fixed(row_height).selection(SelectionMode::None)
 }
 
 impl ForceOrderWidget {
-    /// Builds a widget over the collaborators a caller hands it.
     fn assemble(
         binding: Option<WidgetBinding<ForceOrderProtocol>>,
         directory: Option<Rc<dyn MarketDirectory>>,
@@ -697,12 +473,6 @@ impl ForceOrderWidget {
         }
     }
 
-    /// Builds a widget over a test's own source and directory.
-    ///
-    /// The framework's headless host composes the services without a directory (the
-    /// connector still needs the old toolkit's runtime to build), so an interface test
-    /// constructs the widget directly with the fixture directory it wants, and drives
-    /// the widget hooks itself.
     #[cfg(test)]
     fn with_source<S: ForceOrderSource>(
         source: S,
@@ -717,7 +487,6 @@ impl ForceOrderWidget {
         Self::assemble(Some(binding), Some(directory), status, recovery, cx)
     }
 
-    /// Builds the table into the body slot, over the rows accepted so far.
     fn build_table(&self, cx: &mut WidgetCx<'_>, rows: usize) -> Result<Table, EngineError> {
         let theme = self.theme.clone();
         let cell_theme = self.theme.clone();
@@ -755,10 +524,6 @@ impl ForceOrderWidget {
         Ok(table)
     }
 
-    /// Rebuilds the table after the language moved.
-    ///
-    /// The kit table's headers and empty sentence are resolved text rather than
-    /// bindings, so this is the one part of the body a language switch has to rebuild.
     fn rebuild_table(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let (Some(slot), Some(previous)) = (self.table_slot, self.table.take()) else {
             return Ok(());
@@ -776,13 +541,6 @@ impl ForceOrderWidget {
         Ok(())
     }
 
-    /// Reports the neutral notice for the markets this pane reads, and drops what it
-    /// was showing.
-    ///
-    /// The routes behind those rows are gone, so nothing on screen is backed by a
-    /// market any more, and the framework only draws the notice while the pane reports
-    /// no content — which is why the pane also stops accepting messages: the stream it
-    /// was reading may still deliver a snapshot that was already in flight.
     fn wait_for_market(&mut self, cx: &mut WidgetCx<'_>) {
         self.routes = Arc::from([]);
         self.awaiting_market = true;
@@ -790,10 +548,6 @@ impl ForceOrderWidget {
         self.report_markets_not_loaded(cx);
     }
 
-    /// Reports the notice naming the markets that report liquidations.
-    ///
-    /// The sentence is the framework's to resolve, in the language showing on the
-    /// frame that draws it; the pane hands over a catalogue reference only.
     fn report_markets_not_loaded(&self, cx: &mut WidgetCx<'_>) {
         let venues = market_venues();
         self.status.report(
@@ -805,12 +559,6 @@ impl ForceOrderWidget {
         );
     }
 
-    /// Reports the neutral notice for a read the directory answered "not loaded" to.
-    ///
-    /// The pane's own gate asked the directory before it started a stream, so this is
-    /// the answer to a question the gate could not have seen the answer to: the route
-    /// was revoked between the two. That is a wait rather than a failure. Returns
-    /// whether it reported, so a caller keeps its own failure path for everything else.
     fn report_waiting_for_directory(&mut self, error: &MarketError, cx: &mut WidgetCx<'_>) -> bool {
         if !is_catalog_not_loaded(error) {
             return false;
@@ -819,7 +567,6 @@ impl ForceOrderWidget {
         true
     }
 
-    /// Applies one message the binding delivered.
     fn apply(&mut self, inbound: Inbound<ForceOrderProtocol>, cx: &mut WidgetCx<'_>) {
         match inbound {
             Inbound::Reliable { key, message } => self.apply_reliable(key, &message, cx),
@@ -830,11 +577,6 @@ impl ForceOrderWidget {
         }
     }
 
-    /// Applies one RPC reply, once its identity says it answers the command in flight.
-    ///
-    /// The binding replaces its command slot on every load, but a reply can already be
-    /// queued when that happens: only the identity [`WidgetBinding::call`] returned may
-    /// reach the pane, and a reply this table does not know is dropped and counted.
     fn apply_rpc(
         &mut self,
         request_id: RequestId,
@@ -843,8 +585,6 @@ impl ForceOrderWidget {
     ) {
         match self.pending.take(request_id) {
             Some(PendingCommand::Start) => self.apply_rpc_result(result, cx),
-            // Late or unknown: the reply answers a read this pane replaced, and the
-            // table has counted it.
             None => {}
         }
     }
@@ -919,9 +659,6 @@ impl ForceOrderWidget {
         result: WidgetRpcResult<ForceOrderProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
-        // A failure is terminal and a pane waiting for its market has already reported
-        // the notice the framework draws: neither may be repainted by a late answer
-        // (AGENTS §4.4).
         if self.status.is_failed(cx.app()) || self.awaiting_market {
             return;
         }
@@ -950,11 +687,6 @@ impl ForceOrderWidget {
         }
     }
 
-    /// Reports that the widget is showing its table.
-    ///
-    /// An accepted snapshot means the widget has content even when it holds no orders:
-    /// connecting successfully is enough to show the table, and an empty table is the
-    /// honest rendering of "nothing to show yet". There is no separate empty state.
     fn report_snapshot_state(&self, cx: &mut WidgetCx<'_>) {
         self.status.report(cx.app_mut(), WidgetState::Ready);
     }
@@ -1005,9 +737,6 @@ mod tests {
         service::{ForceOrderEventSubscription, ForceOrderSource},
     };
 
-    // ---------------------------------------------------------------- vocabulary
-
-    /// The route the fixture market reports liquidations on.
     fn route() -> VenueRoute {
         test_support::route("binance", PERPETUAL_SCOPE)
     }
@@ -1016,7 +745,6 @@ mod tests {
         test_support::route("okx", "swap")
     }
 
-    /// The translator the product ships, in the language a test asks for.
     fn product_translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -1045,15 +773,12 @@ mod tests {
         }
     }
 
-    /// The same liquidation on the other side of the book.
     fn short_entry(timestamp: i64) -> ForceOrderEntry {
         let mut entry = entry(timestamp);
         entry.order.position_side = PositionSide::Short;
         entry
     }
 
-    /// A price tick of one cent and a quantity step of one thousandth, so a label
-    /// that keeps the listing's precision is told apart from the canonical form.
     fn precision() -> ListingPrecision {
         ListingPrecision {
             price_tick: "0.01".parse().expect("a price tick should parse"),
@@ -1067,7 +792,6 @@ mod tests {
         state.snapshot()
     }
 
-    /// Two liquidations, one per side: display row 0 is the short (newest) one.
     fn both_sides_snapshot() -> ForceOrderSnapshot {
         let mut state = ForceOrderState::new(2);
         state.merge(&[entry(1), short_entry(2)]);
@@ -1082,7 +806,6 @@ mod tests {
         MarketError::Disconnected(DisconnectReason::Normal)
     }
 
-    /// A listing the fixture publishes at `price_tick`.
     fn published_entry(price_tick: &str) -> CatalogEntry {
         let mut restated = test_support::entry(
             &route(),
@@ -1094,8 +817,6 @@ mod tests {
             .expect("the restated price tick should parse");
         restated
     }
-
-    // --------------------------------------------------------------------- sources
 
     #[derive(Clone, Copy)]
     struct PendingForceOrderSource;
@@ -1127,8 +848,6 @@ mod tests {
         }
     }
 
-    /// A source that counts what the pane asks it for, so a test can tell "the pane
-    /// started over" from "the pane re-checked its precondition".
     #[derive(Clone, Default)]
     struct CountingForceOrderSource {
         subscriptions: Arc<AtomicUsize>,
@@ -1156,9 +875,6 @@ mod tests {
         }
     }
 
-    /// A source that resolves a route's listings through the catalogue it was handed, at
-    /// the moment a stream is opened for it, and records the increments they were
-    /// published at then.
     #[derive(Clone)]
     struct ResolvingForceOrderSource {
         catalog: Arc<Catalog>,
@@ -1206,14 +922,6 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------- directory
-
-    /// A directory a test drives: the routes it publishes, the ones it has loaded, and
-    /// the catalogue a new stream resolves its listings against.
-    ///
-    /// It is the fixture stand-in for the injected connector: the framework's headless
-    /// host cannot build one (the connector still needs the old toolkit's runtime), so
-    /// a test constructs the widget directly with this directory.
     #[derive(Clone)]
     struct FixtureDirectory {
         routes: Rc<RefCell<Vec<VenueRoute>>>,
@@ -1261,10 +969,6 @@ mod tests {
         }
     }
 
-    // --------------------------------------------------------------------- harness
-
-    /// A widget under test: the framework's headless host, the widget built over the
-    /// fixture directory, and the runtime turns needed to let the service answer.
     struct Fixture {
         harness: WidgetTestApp,
         widget: ForceOrderWidget,
@@ -1274,12 +978,10 @@ mod tests {
     }
 
     impl Fixture {
-        /// Builds the fixture over `source`, with the fixture route loaded or not.
         fn new<S: ForceOrderSource>(source: S, loaded: bool) -> Self {
             Self::with_catalog(move |_| source, loaded, Vec::new())
         }
 
-        /// The same, with the source built from the catalogue the fixture publishes.
         fn with_catalog<S: ForceOrderSource>(
             build: impl FnOnce(Arc<Catalog>) -> S,
             loaded: bool,
@@ -1353,8 +1055,6 @@ mod tests {
             self.widget.snapshot.as_ref().map(ForceOrderSnapshot::len)
         }
 
-        /// Loads one more market and announces the catalogue generation that goes with
-        /// it, the way the composition root does when a venue commit lands.
         fn load_market(&mut self, route: VenueRoute) {
             self.directory.load(route);
             self.bump_generation();
@@ -1424,7 +1124,6 @@ mod tests {
             assert!(self.harness.status().report(self.harness.app_mut(), state));
         }
 
-        /// Builds the body the framework would build on the first frame with content.
         fn build_body(&mut self) {
             self.with_cx(|widget, cx| {
                 let root = cx.tree().root();
@@ -1481,10 +1180,6 @@ mod tests {
                 .text_of(node.expect("the header cell is mounted"))
         }
 
-        /// The foreground colour the cell's text node draws in.
-        ///
-        /// The style pass writes the patch, so the frame that draws the cell has to have
-        /// run: `drain` is what makes the patch readable.
         fn cell_foreground(&mut self, row: usize, column: usize) -> Color {
             self.drain();
             let cell = self
@@ -1509,12 +1204,6 @@ mod tests {
         }
     }
 
-    /// A widget whose service has to actually answer.
-    ///
-    /// The framework's [`WidgetTestApp`] owns a **current-thread** runtime and exposes no
-    /// way to drive it, so a service task spawned there never runs. This host composes
-    /// the same engine application and the same [`WidgetServices`] over a runtime the
-    /// test owns, which is what lets `settle_until` pump the stream work.
     struct ServiceFixture {
         runtime: tokio::runtime::Runtime,
         app: App,
@@ -1546,8 +1235,6 @@ mod tests {
             let window = app.create_window(WindowOptions::default());
             let scope = app.signal_scope();
             let theme = ThemeHandle::new(&mut app, Appearance::Light);
-            // The composition root's three singletons, composed exactly as the
-            // application root composes them; this host keeps no handles of its own.
             let layer = Rc::new(Layer::new());
             let animation = Rc::new(AnimationRouter::new());
             let router =
@@ -1684,10 +1371,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------- table dataset
-
-    /// The table keeps the five-column dataset semantics: five columns, the declared
-    /// weights and alignments, and the accepted rows.
     #[test]
     fn the_table_should_keep_the_five_column_dataset_semantics() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -1715,9 +1398,6 @@ mod tests {
         assert_eq!(table.rows(), 2, "the accepted row count reaches the table");
     }
 
-    /// The old dataset was a table to read, so the pane keeps row selection off: the
-    /// kit table's own default is multi-select, which would be a new interaction (and
-    /// a new a11y/selection state) rather than a migration of the old one.
     #[test]
     fn the_table_should_not_offer_row_selection() {
         let options = table_options(30.0);
@@ -1730,8 +1410,6 @@ mod tests {
         assert_eq!(options.row_height, RowHeight::Fixed(30.0));
     }
 
-    /// Every cached column of a row is filled, and the route is the user-visible one
-    /// rather than the canonical identity that belongs in logs.
     #[test]
     fn force_order_display_should_fill_every_cached_column() {
         let state_snapshot = snapshot(1);
@@ -1743,9 +1421,6 @@ mod tests {
 
         assert_eq!(
             cells,
-            // The numbers keep the increments of the listing the liquidation was
-            // reported on: a whole price is still read with the decimals its tick
-            // states.
             [
                 "Binance/USD-M-PERP",
                 "BTCUSDT",
@@ -1766,7 +1441,6 @@ mod tests {
         );
     }
 
-    /// The rows are drawn newest first: display row 0 is the last accepted order.
     #[test]
     fn the_table_should_draw_the_newest_accepted_order_first() {
         let mut state = ForceOrderState::new(4);
@@ -1796,8 +1470,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------ state
-
     #[test]
     fn a_widget_without_a_snapshot_should_report_connecting_and_have_no_content() {
         let fixture = Fixture::new(PendingForceOrderSource, true);
@@ -1806,9 +1478,6 @@ mod tests {
         assert_eq!(fixture.status(), WidgetState::Connecting);
     }
 
-    /// A market the user has not loaded is a wait rather than a failure: the pane names
-    /// what to load and has nothing to draw — not even for a snapshot it once accepted,
-    /// because nothing on screen is backed by a market any more.
     #[test]
     fn an_unloaded_market_should_leave_the_pane_waiting() {
         let mut fixture = Fixture::new(PendingForceOrderSource, false);
@@ -1835,8 +1504,6 @@ mod tests {
         );
     }
 
-    /// The notice is a reference into the catalogue rather than a sentence, so the
-    /// language showing when it is drawn is the language it is read in.
     #[test]
     fn a_language_change_should_re_report_the_market_notice() {
         let notice = Notice::MarketNotLoaded {
@@ -1868,8 +1535,6 @@ mod tests {
         );
     }
 
-    /// Loading the venue is what a waiting pane recovers from, by itself, when the
-    /// directory generation moves.
     #[test]
     fn loading_the_venue_should_let_the_waiting_pane_start() {
         let mut fixture = Fixture::new(PendingForceOrderSource, false);
@@ -1886,9 +1551,6 @@ mod tests {
         assert_eq!(status, WidgetState::Connecting);
     }
 
-    /// The directory answering "this route's catalog is not in memory" is a wait, not
-    /// a failure: the pane's own gate asked the same question a moment earlier, so this
-    /// is the answer changing underneath the request.
     #[test]
     fn a_directory_that_has_not_loaded_a_catalog_should_leave_the_pane_waiting() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -1912,9 +1574,6 @@ mod tests {
         assert!(!fixture.has_content());
     }
 
-    /// A stream that is still alive after its markets went away must not write a status
-    /// over the notice: a message already in flight belongs to markets the pane no
-    /// longer reports reading.
     #[test]
     fn a_late_message_after_the_market_went_away_should_not_clear_the_notice() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -1960,9 +1619,6 @@ mod tests {
         assert!(fixture.status().failure().is_none());
     }
 
-    /// A successful connection is enough to show the table. An empty snapshot is
-    /// content — an empty table — and the widget reports nothing about it: the table
-    /// itself is what says it holds no orders.
     #[test]
     fn an_empty_snapshot_should_be_content_and_report_nothing() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2022,8 +1678,6 @@ mod tests {
         assert!(fixture.status().is_failed());
     }
 
-    /// Every failure path republishes the recovery the framework gave the widget. The
-    /// widget never builds its own: the label and the capability are the framework's.
     #[test]
     fn every_failure_should_offer_the_recovery_that_reloads_the_widget() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2066,8 +1720,6 @@ mod tests {
         assert!(fixture.snapshot_len().is_none());
     }
 
-    /// The answer to the read the pane sent is reported: the binding returned the
-    /// identity before the request went out, and the reply carrying it is the pane's.
     #[test]
     fn the_answer_to_the_read_it_sent_should_be_reported() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2085,8 +1737,6 @@ mod tests {
         );
     }
 
-    /// A read the pane replaced answers a command no longer waiting: the reply is
-    /// dropped and counted, and it does not fail the read that replaced it.
     #[test]
     fn the_answer_to_a_replaced_read_should_be_dropped() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2110,8 +1760,6 @@ mod tests {
         );
     }
 
-    /// A failed pane is terminal: even the reply to the read it was still waiting for
-    /// may not rewrite the failure sentence.
     #[test]
     fn a_failed_pane_should_not_be_repainted_by_a_late_reply() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2153,7 +1801,6 @@ mod tests {
         assert!(!fixture.has_content());
     }
 
-    /// An explicit reload drops what it had and starts over from connecting.
     #[test]
     fn an_explicit_reload_should_start_over_from_connecting() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2168,8 +1815,6 @@ mod tests {
         assert!(fixture.status().failure().is_none());
     }
 
-    /// A failure is terminal: a reload the user asks for keeps the snapshot the widget
-    /// still shows, because the user is looking at it.
     #[test]
     fn a_retry_after_a_failure_should_keep_the_snapshot_the_widget_still_shows() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2185,10 +1830,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------ routes
-
-    /// This pane reads the whole market, so a venue loaded while it already has content
-    /// is a *different* route set rather than a publication of the one it is reading.
     #[test]
     fn a_venue_loaded_after_the_rows_arrived_should_be_read_too() {
         let source = CountingForceOrderSource::default();
@@ -2220,8 +1861,6 @@ mod tests {
         });
     }
 
-    /// A set that grew starts a stream that covers it, and a shrinking commit starts
-    /// over on what is left rather than reading a market nobody loaded.
     #[test]
     fn a_whole_market_pane_wakes_when_its_routes_change() {
         let source = CountingForceOrderSource::default();
@@ -2250,9 +1889,6 @@ mod tests {
         });
     }
 
-    /// A shrinking commit takes the pane's markets away, and the flag it leaves has to
-    /// survive the wait: the load the returning market unblocks opens a new stream
-    /// rather than being answered idempotently for the stream that is still running.
     #[test]
     fn a_market_that_comes_back_after_a_shrinking_commit_should_reopen_the_stream() {
         let source = CountingForceOrderSource::default();
@@ -2282,9 +1918,6 @@ mod tests {
         );
     }
 
-    /// A refresh of a venue the pane reads replaces the catalogue generation its live
-    /// stream resolved those markets' listings against, so the pane starts over: the
-    /// rows go and the request opens a new stream, which resolves at the new generation.
     #[test]
     fn a_refresh_of_a_market_the_pane_reads_should_reopen_its_stream() {
         let resolutions: Arc<std::sync::Mutex<Vec<Vec<ListingPrecision>>>> =
@@ -2312,8 +1945,6 @@ mod tests {
         assert!(fixture.has_content(), "the pane is showing its rows");
         let routes = Arc::clone(&fixture.widget.routes);
 
-        // The same venue loads again and the catalogue it republishes restates the
-        // listing's price tick, which is the shape a production load has.
         fixture.republish(vec![published_entry("0.01")]);
         fixture.bump_generation();
         fixture.settle_until("the market to be read again", |_| {
@@ -2335,11 +1966,6 @@ mod tests {
         );
     }
 
-    /// A generation is one number for the whole directory, not a per-venue version, so
-    /// a commit that only touched a venue this pane does not read still reloads it: the
-    /// rows go and the stream reopens. That is the accepted cost of the coarse signal
-    /// (the module documentation states it); this test pins the behaviour so it stays a
-    /// decision rather than an accident.
     #[test]
     fn an_unrelated_directory_generation_should_reload_the_pane() {
         let source = CountingForceOrderSource::default();
@@ -2353,8 +1979,6 @@ mod tests {
         let routes = Arc::clone(&fixture.widget.routes);
         let reading = subscriptions.load(Ordering::Acquire);
 
-        // Nothing in the directory moved for this pane; only the published generation
-        // did, which is all a commit to an unrelated venue leaves behind here.
         fixture.bump_generation();
 
         assert!(
@@ -2371,7 +1995,6 @@ mod tests {
         });
     }
 
-    /// A failure is terminal: a directory generation write does not revive a failed pane.
     #[test]
     fn a_venue_commit_should_not_revive_a_failed_pane() {
         let source = CountingForceOrderSource::default();
@@ -2403,9 +2026,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------- table
-
-    /// An accepted snapshot reaches the table region, and clearing it reaches it too.
     #[test]
     fn an_accepted_snapshot_should_reach_the_table_region() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2419,9 +2039,6 @@ mod tests {
         assert_eq!(fixture.table_rows(), 0);
     }
 
-    /// The body's cells are the accepted rows: every column of the first display row is
-    /// drawn, with the route in its user-visible form and the numbers at the listing's
-    /// own precision.
     #[test]
     fn the_body_should_draw_the_accepted_rows() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2435,13 +2052,6 @@ mod tests {
         assert_eq!(fixture.settled_cell_text(0, 4), "00:00:00.001");
     }
 
-    /// Every cell draws its text in a theme foreground, and the listing cell draws in
-    /// the direction colour of the liquidation's side.
-    ///
-    /// A cell that binds no colour draws in the engine's default `TextStyle` foreground
-    /// (black): the kit cell box's `FgDefault` does not inherit into the text node, so
-    /// four of the five columns would be unreadable on a dark appearance and differ
-    /// from the old table, which resolved `theme.roles.fg.default` for every cell.
     #[test]
     fn the_cells_should_draw_in_the_theme_colours() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2476,8 +2086,6 @@ mod tests {
         );
     }
 
-    /// The colour is read through the theme on the frame that draws the cell, so an
-    /// appearance switch redraws it in the new appearance's foreground (AGENTS §7/G3).
     #[test]
     fn the_cells_should_follow_the_theme_appearance() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2509,9 +2117,6 @@ mod tests {
         );
     }
 
-    /// The numbers are read in the display time zone, which the cell resolves inside
-    /// `bind_text`: moving the setting redraws the time column without touching the
-    /// data the stream delivered.
     #[test]
     fn moving_the_display_zone_should_redraw_the_time_column() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2540,8 +2145,6 @@ mod tests {
         );
     }
 
-    /// A language switch rebuilds the table's static copy — its headers and its empty
-    /// sentence are resolved text rather than bindings — while the accepted rows stay.
     #[test]
     fn a_language_change_should_rebuild_the_tables_static_copy() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2580,9 +2183,6 @@ mod tests {
         );
     }
 
-    /// A language switch replaces the table's subtree: the old table's nodes are
-    /// removed from the tree before the new one is mounted, so the switch does not
-    /// leave a second table behind.
     #[test]
     fn a_language_change_should_not_leak_the_old_table() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2608,9 +2208,6 @@ mod tests {
         );
     }
 
-    /// `release` hands the table back to the kit component: the handlers the table
-    /// registered are removed with it, which is what keeps the application from holding
-    /// the table (and its row contents) after the surface nodes are gone.
     #[test]
     fn releasing_the_widget_should_release_the_table() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2643,8 +2240,6 @@ mod tests {
         );
     }
 
-    /// The body builds one frame and mounts the table under it; the frame is what
-    /// carries the caption over the table.
     #[test]
     fn the_body_should_mount_the_table_under_its_frame() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -2673,9 +2268,6 @@ mod tests {
         );
     }
 
-    /// `common.market_not_loaded` is authored as markdown/HTML: the surface draws it
-    /// through the markdown component, so a reader gets the sentence, the `<kbd>` icon
-    /// and the venue list — never the source markup.
     #[test]
     fn a_rich_market_notice_is_drawn_as_rich_text() {
         let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
@@ -2706,9 +2298,6 @@ mod tests {
         );
     }
 
-    /// A write to the directory generation is what schedules the frame that runs every
-    /// mounted widget's `sync`, including one that is only waiting and has no body: the
-    /// framework's surface root carries the dependency.
     #[test]
     fn a_directory_generation_write_should_request_a_frame_for_a_waiting_pane() {
         let mut harness = WidgetTestApp::new();

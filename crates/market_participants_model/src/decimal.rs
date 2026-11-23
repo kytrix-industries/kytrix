@@ -1,9 +1,3 @@
-//! Fixed-point decimal values shared by every market-participants model number.
-//!
-//! All decimals use 18 fractional digits and never use floating point. The
-//! canonical decimal representation has no trailing fractional zeroes, which is
-//! also the representation used by canonical identity encoding.
-
 use std::{fmt, num::NonZeroU128, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -114,12 +108,6 @@ fn checked_multiply_scaled(left: u128, right: u128) -> Option<u128> {
         .checked_add(left_fraction.checked_mul(right_fraction)? / DECIMAL_SCALE)
 }
 
-/// Divides two 18-digit fixed-point values and keeps the scale of the quotient.
-///
-/// Scaling the numerator up front — the obvious `numerator * DECIMAL_SCALE /
-/// denominator` — overflows for any numerator past a few hundred units, which is
-/// every traded notional. The fraction is therefore produced one decimal digit at
-/// a time out of the running remainder, so only the result itself has to fit.
 fn checked_divide_scaled(numerator: u128, denominator: u128) -> Option<u128> {
     if denominator == 0 {
         return None;
@@ -195,12 +183,10 @@ macro_rules! unsigned_decimal {
         impl $name {
             pub const ZERO: Self = Self(0);
 
-            /// Creates a value from its 18-digit fixed-point representation.
             pub const fn from_inner(inner: u128) -> Self {
                 Self(inner)
             }
 
-            /// Returns the 18-digit fixed-point representation.
             pub const fn inner(self) -> u128 {
                 self.0
             }
@@ -223,12 +209,10 @@ macro_rules! unsigned_decimal {
                 }
             }
 
-            /// Rounds downward to an exact multiple of `tick`.
             pub const fn checked_floor_to_tick(self, tick: Tick) -> Self {
                 Self(self.0 - self.0 % tick.inner())
             }
 
-            /// Rounds upward to an exact multiple of `tick`.
             pub const fn checked_ceil_to_tick(self, tick: Tick) -> Option<Self> {
                 let remainder = self.0 % tick.inner();
                 if remainder == 0 {
@@ -241,17 +225,14 @@ macro_rules! unsigned_decimal {
                 }
             }
 
-            /// Returns the canonical number of fractional decimal places.
             pub fn decimal_places(self) -> usize {
                 decimal_places(self.0)
             }
 
-            /// Returns the number of significant digits in the canonical decimal value.
             pub fn significant_digits(self) -> usize {
                 significant_digits(self.0)
             }
 
-            /// Rounds to the nearest tick. Half-way values round upward.
             pub const fn checked_round_to_tick(self, tick: Tick) -> Option<Self> {
                 let tick = tick.inner();
                 let remainder = self.0 % tick;
@@ -266,7 +247,6 @@ macro_rules! unsigned_decimal {
                 }
             }
 
-            /// Rounds to the nearest tick and preserves the tick's decimal precision.
             pub fn format_and_round_tick(self, tick: Tick) -> SmolStr {
                 tick.format_unsigned(self.0)
             }
@@ -372,12 +352,10 @@ macro_rules! signed_decimal {
         impl $name {
             pub const ZERO: Self = Self(0);
 
-            /// Creates a value from its 18-digit fixed-point representation.
             pub const fn from_inner(inner: i128) -> Self {
                 Self(inner)
             }
 
-            /// Returns the 18-digit fixed-point representation.
             pub const fn inner(self) -> i128 {
                 self.0
             }
@@ -404,7 +382,6 @@ macro_rules! signed_decimal {
                 }
             }
 
-            /// Rounds to the nearest tick and preserves the tick's decimal precision.
             pub fn format_and_round_tick(self, tick: Tick) -> SmolStr {
                 tick.format_signed(self.0)
             }
@@ -494,42 +471,34 @@ signed_decimal!(SignedQuantity);
 signed_decimal!(ProfitOrLoss);
 
 impl Price {
-    /// Calculates a quote-asset notional without losing fixed-point scale.
     pub fn checked_mul_quantity(self, quantity: Quantity) -> Option<Quantity> {
         checked_multiply_scaled(self.inner(), quantity.inner()).map(Quantity::from_inner)
     }
 
-    /// Calculates a ratio of this price without losing fixed-point scale.
     pub fn checked_mul_ratio(self, ratio: Ratio) -> Option<Self> {
         checked_multiply_scaled(self.inner(), ratio.inner()).map(Self::from_inner)
     }
 }
 
 impl Quantity {
-    /// Calculates a quote-asset notional without losing fixed-point scale.
     pub fn checked_mul_price(self, price: Price) -> Option<Quantity> {
         price.checked_mul_quantity(self)
     }
 
-    /// Divides a quote-asset notional by a price and returns the base quantity it
-    /// traded for.
     pub fn checked_div_price(self, price: Price) -> Option<Self> {
         checked_divide_scaled(self.inner(), price.inner()).map(Self::from_inner)
     }
 
-    /// Divides a quote amount by a base quantity and returns a fixed-point price.
     pub fn checked_div_quantity(self, quantity: Quantity) -> Option<Price> {
         checked_divide_scaled(self.inner(), quantity.inner()).map(Price::from_inner)
     }
 }
 
 impl Ratio {
-    /// Scales a quantity by this ratio without losing fixed-point scale.
     pub fn checked_mul_quantity(self, quantity: Quantity) -> Option<Quantity> {
         checked_multiply_scaled(self.inner(), quantity.inner()).map(Quantity::from_inner)
     }
 
-    /// Scales a price by this ratio without losing fixed-point scale.
     pub fn checked_mul_price(self, price: Price) -> Option<Price> {
         checked_multiply_scaled(self.inner(), price.inner()).map(Price::from_inner)
     }
@@ -540,20 +509,17 @@ impl SignedQuantity {
         self.inner().checked_neg().map(Self::from_inner)
     }
 
-    /// Calculates a signed quote-asset notional without losing fixed-point scale.
     pub fn checked_mul_price(self, price: Price) -> Option<Self> {
         let magnitude = checked_multiply_scaled(self.inner().unsigned_abs(), price.inner())?;
         signed_from_magnitude(magnitude, self.inner().is_negative()).map(Self::from_inner)
     }
 
-    /// Returns the magnitude of this signed quantity.
     pub const fn magnitude(self) -> Quantity {
         Quantity::from_inner(self.inner().unsigned_abs())
     }
 }
 
 impl ProfitOrLoss {
-    /// Returns the magnitude of this profit or loss.
     pub const fn magnitude(self) -> Quantity {
         Quantity::from_inner(self.inner().unsigned_abs())
     }
@@ -571,8 +537,6 @@ impl From<ProfitOrLoss> for SignedQuantity {
     }
 }
 
-/// A ratio constrained to `[0, 1]`, used for probabilities, settlement
-/// fractions and relative price limits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fraction(Ratio);
 
@@ -580,7 +544,6 @@ impl Fraction {
     pub const ZERO: Self = Self(Ratio::ZERO);
     pub const ONE: Self = Self(Ratio::from_inner(DECIMAL_SCALE));
 
-    /// Validates a ratio as a fraction within `[0, 1]`.
     pub const fn new(ratio: Ratio) -> Result<Self, ModelError> {
         if ratio.inner() > DECIMAL_SCALE {
             Err(ModelError::FractionOutOfRange)
@@ -589,7 +552,6 @@ impl Fraction {
         }
     }
 
-    /// Returns the underlying ratio.
     pub const fn ratio(self) -> Ratio {
         self.0
     }
@@ -602,12 +564,10 @@ impl Fraction {
         self.0.inner() == DECIMAL_SCALE
     }
 
-    /// Returns `true` when the fraction is exactly `0` or `1`.
     pub const fn is_binary(self) -> bool {
         self.is_zero() || self.is_one()
     }
 
-    /// Returns the complementary fraction `1 - self`.
     pub const fn complement(self) -> Self {
         Self(Ratio::from_inner(DECIMAL_SCALE - self.0.inner()))
     }
@@ -660,13 +620,10 @@ impl<'de> Deserialize<'de> for Fraction {
     }
 }
 
-/// A ratio strictly greater than zero, used for conversion factors and share
-/// ratios that are not bounded by one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PositiveRatio(Ratio);
 
 impl PositiveRatio {
-    /// Validates a ratio as strictly positive.
     pub const fn new(ratio: Ratio) -> Result<Self, ModelError> {
         if ratio.is_zero() {
             Err(ModelError::NonPositiveRatio)
@@ -675,7 +632,6 @@ impl PositiveRatio {
         }
     }
 
-    /// Returns the underlying ratio.
     pub const fn ratio(self) -> Ratio {
         self.0
     }
@@ -764,12 +720,10 @@ impl CanonicalTerms for SignedQuantity {
     }
 }
 
-/// A positive price or quantity increment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tick(NonZeroU128);
 
 impl Tick {
-    /// Creates a tick from its 18-digit fixed-point representation.
     pub const fn from_inner(inner: u128) -> Result<Self, ModelError> {
         match NonZeroU128::new(inner) {
             Some(inner) => Ok(Self(inner)),
@@ -867,10 +821,8 @@ impl<'de> Deserialize<'de> for Tick {
     }
 }
 
-/// Unix timestamp in milliseconds.
 pub type UnixMillis = i64;
 
-/// Validates that a Unix millisecond timestamp is non-negative.
 pub fn validate_timestamp(timestamp: UnixMillis, field: &'static str) -> Result<(), ModelError> {
     if timestamp < 0 {
         Err(ModelError::InvalidTimestamp { field })
@@ -943,8 +895,6 @@ mod tests {
         assert_eq!(notional.checked_div_price(Price::ZERO), None);
     }
 
-    /// A day of a liquid market trades a notional that scaling up front would
-    /// overflow long before the quotient does.
     #[test]
     fn a_traded_notional_should_divide_by_a_price_without_overflowing() {
         let notional = "1000000000"

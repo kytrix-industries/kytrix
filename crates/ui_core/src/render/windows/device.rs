@@ -1,32 +1,3 @@
-//! 进程级共享 GPU（`SharedGpu`）+ `ID3D12Device` 的创建、D8 采集、DRED、调试层、恢复路径与
-//! 资源句柄表。
-//!
-//! 多窗口的正确形状（与 Chrome / Qt RHI 一致）：进程一个 `ID3D12Device`、一条 direct queue、
-//! 一套根签名 / PSO、两份共享图集纹理；每个窗口只保留 swapchain / DirectComposition 对象 /
-//! persist 目标 / fence 与帧槽 / 命令分配器与命令列表。
-//!
-//! 共享状态全部有明确的同步策略：
-//!
-//! - **设备句柄表 / 设备丢失状态**（[`Device`]）在 `Mutex` 里：`allocate` / `release` /
-//!   `note_failure` 都是短临界区；只读的 `Create*` 调用走 `SharedGpu::raw` 的独立 COM 句柄，
-//!   不需要锁。
-//! - **根签名 / PSO** 创建后只读。
-//! - **图集纹理由 `RwLock` 保护**：窗口的 GPU 线程在**读锁**内录制并提交一帧（页在录制期间不会
-//!   变），页重建走**写锁**。写锁期间不可能出现新的提交（录制与提交都在读锁内）。
-//! - **图集描述符组双代（C3）**：D3D12 禁止改写「提交执行中的命令列表可能引用」的描述符。共享
-//!   SRV 堆的图集固定段因此有 2 代；页换代先把新 SRV 写进**没有在飞引用**的那一代，再翻转
-//!   `atlas_generation`。旧代是否空闲由各窗口登记的**代际弃用水位**
-//!   （[`super::queue::StreamWatermark::generation_idle`]）非阻塞判定：未空闲 ⇒ 本帧不换代
-//!   （[`AtlasRebuildOutcome::Deferred`]，调用方退避重试），绝不改写仍被引用的描述符。旧纹理
-//!   按代挂在 [`AtlasSwitch::retired_textures`] 里，只有该代被重新启用时才释放（旧代回收）。
-//! - **设备恢复**（R08-4）：进程级实例不再是 `OnceLock`，而是可替换的注册表（[`GpuCell`]）；
-//!   设备真的被移除后，[`SharedGpu::recover`] 重建 device / queue / PSO / SRV 堆，并按
-//!   [`super::atlas::SharedAtlas::shadow_snapshot`] 的 CPU 影子把图集内容原样重传。
-//!
-//! 产品路径只建**硬件设备**；WARP 设备仅测试 / CI（`#[cfg(any(test, feature = "test-support"))]`），
-//! 不进发布物的任何运行时分支（D8 / I10）。测试没有真 GPU 时用的是另一个进程级 WARP 实例
-//! （[`SharedGpu::process_warp`]）：与产品路径同构，但设备来源不同。
-
 use std::{
     collections::VecDeque,
     ffi::c_void,
@@ -76,25 +47,15 @@ use crate::{
     },
 };
 
-/// D8 硬基线（错误文案与安装器共用的唯一来源；主设计 §2.2）。
-///
-/// `cast_srgb` 是本后端**唯一**依赖的非通用能力（R08-12）：持久目标与 back buffer 都是
-/// `B8G8R8A8_UNORM` 资源 + `_UNORM_SRGB` 视图，靠 RS2+ 的 relaxed format casting 成立。
-/// 不支持它就无法在本设计下正确编码 sRGB（改成真 sRGB 资源会让到 UNORM back buffer 的
-/// `CopyTextureRegion` 失败），因此显式失败而不是静默输出偏暗的像素。
 pub(crate) const D8_REQUIRED: &str = "FL 12_0 / SM 6.2 / ResourceBindingTier >= 2 / CastingFullyTypedFormat / FLIP_SEQUENTIAL / BufferCount >= 2";
 
-/// 启动时一次性采集的能力快照（含诊断字段；`warp` 只用于诊断，不参与基线）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GpuCaps {
-    /// `DXGI_ADAPTER_DESC1.Description`。
     pub adapter: SmolStr,
     pub vendor_id: u32,
     pub device_id: u32,
     pub dedicated_vram_mib: u64,
-    /// `D3D_FEATURE_LEVEL.0`。
     pub feature_level: i32,
-    /// `D3D_SHADER_MODEL.0`（用 6_8 作为入参查询后的返回值）。
     pub shader_model: i32,
     pub resource_binding_tier: i32,
     pub resource_heap_tier: i32,
@@ -103,16 +64,12 @@ pub(crate) struct GpuCaps {
     pub native_16bit_shader_ops: bool,
     pub root_signature_max: i32,
     pub max_sampler_descriptor_heap: u32,
-    /// `D3D12_FEATURE_DATA_D3D12_OPTIONS3::CastingFullyTypedFormatSupported`（R08-12）。
     pub casting_fully_typed: bool,
-    /// 调试层是否可用（`debug_assertions` 且本机装了「图形工具」；release 恒 `false`）。
     pub debug_layer: bool,
-    /// test / CI 的 WARP 设备标记（诊断用；产品路径恒 `false`）。
     pub warp: bool,
 }
 
 impl GpuCaps {
-    /// 硬基线四项：FL >= 12_0、SM >= 6.2、BindingTier >= 2、支持 relaxed format casting。
     pub(crate) fn baseline_ok(&self) -> bool {
         self.feature_level >= FEATURE_LEVEL_12_0
             && self.shader_model >= SHADER_MODEL_6_2
@@ -120,7 +77,6 @@ impl GpuCaps {
             && self.casting_fully_typed
     }
 
-    /// `UnsupportedGpu.actual` 的稳定格式（只含四项基线值；测试与用户比对共用）。
     pub(crate) fn actual(&self) -> SmolStr {
         smol_str::format_smolstr!(
             "FL {} / SM {} / BindingTier {} / CastSrgb {}",
@@ -131,7 +87,6 @@ impl GpuCaps {
         )
     }
 
-    /// 全字段诊断行（日志 / A-B 对照；不含时间戳）。
     pub(crate) fn describe(&self) -> SmolStr {
         smol_str::format_smolstr!(
             "adapter={:?} vendor=0x{:04X} device=0x{:04X} vram={}MiB FL={} SM={} binding={} heap={} tiled={} min_precision={} native16={} root_sig={} max_sampler_heap={} cast_srgb={} debug_layer={} warp={}",
@@ -154,7 +109,6 @@ impl GpuCaps {
         )
     }
 
-    /// 唯一校验入口：失败 → `EngineError::UnsupportedGpu`（列出实际值与最低要求，I10）。
     pub(crate) fn check(&self) -> Result<(), EngineError> {
         if self.baseline_ok() {
             Ok(())
@@ -168,12 +122,9 @@ impl GpuCaps {
     }
 }
 
-/// `D3D_FEATURE_LEVEL_12_0` 的原始值（不在共享层引 `windows` 类型）。
 pub(crate) const FEATURE_LEVEL_12_0: i32 = 49_152;
-/// `D3D_SHADER_MODEL_6_2` 的原始值。
 pub(crate) const SHADER_MODEL_6_2: i32 = 98;
 
-/// 把 `D3D_FEATURE_LEVEL.0` 映射成 `"12_0"` 之类的短名（唯一转换点）。
 pub(crate) fn fl_name(level: i32) -> &'static str {
     match level {
         45_056 => "11_0",
@@ -185,7 +136,6 @@ pub(crate) fn fl_name(level: i32) -> &'static str {
     }
 }
 
-/// 把 `D3D_SHADER_MODEL.0` 映射成 `"6_2"` 之类的短名（唯一转换点）。
 pub(crate) fn sm_name(shader_model: i32) -> &'static str {
     match shader_model {
         96 => "6_0",
@@ -202,10 +152,8 @@ pub(crate) fn sm_name(shader_model: i32) -> &'static str {
     }
 }
 
-/// `GpuResourceHandle` 的 `kind`：COM 资源（P08 唯一产生的种类）。
 const HANDLE_KIND_OBJECT: u8 = 1;
 
-/// 把 HRESULT 变成 `AppInit` 的 `detail`（`{:#010X} {系统消息}`，可读）。
 pub(crate) fn init_error(context: &str, hr: HRESULT) -> EngineError {
     EngineError::AppInit {
         detail: smol_str::format_smolstr!(
@@ -216,15 +164,10 @@ pub(crate) fn init_error(context: &str, hr: HRESULT) -> EngineError {
     }
 }
 
-/// 把 `windows::core::Error` 变成 `AppInit`。
 pub(crate) fn init_error_from(context: &str, error: windows::core::Error) -> EngineError {
     init_error(context, error.code())
 }
 
-/// 一个 `ID3D12Device` + 资源句柄表 + 丢失状态 + 能力快照。
-///
-/// 产品路径里它是 `SharedGpu` 的私有字段（由互斥锁保护）；测试可以直接构造一个**独立**设备，
-/// 用于「设备被移除」这类会污染进程级共享设备的路径。
 pub(crate) struct Device {
     raw: ID3D12Device,
     resources: ResourceTable,
@@ -232,29 +175,23 @@ pub(crate) struct Device {
     caps: GpuCaps,
 }
 
-/// 设备丢失的粘性记录（`EngineError` 不能 `Clone`，因此存字段、按需重建）。
 struct LostInfo {
     reason: SmolStr,
     log_path: PathBuf,
 }
 
 impl Device {
-    /// 产品路径：第一个**高性能**非软件 DXGI 适配器 → D3D12 设备 → 采 caps → 校验 D8。
     pub(crate) fn new() -> Result<Self, EngineError> {
-        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .map_err(|error| init_error_from("CreateDXGIFactory2", error))?;
         let adapter = pick_hardware_adapter(&factory)?;
         Self::from_adapter(&adapter, false)
     }
 
-    /// test / CI：WARP 设备（不编译进发布物；D8 的软件回退禁令由 `cfg` 保证）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_warp() -> Result<Self, EngineError> {
-        // SAFETY: COM 创建调用：设备 / 工厂句柄有效，描述与输出指针在调用期间存活，失败按 HRESULT 返回。
         let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .map_err(|error| init_error_from("CreateDXGIFactory2", error))?;
-        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         let adapter: IDXGIAdapter = unsafe { factory.EnumWarpAdapter() }
             .map_err(|error| init_error_from("EnumWarpAdapter", error))?;
         let adapter: IDXGIAdapter1 = adapter
@@ -264,20 +201,16 @@ impl Device {
     }
 
     fn from_adapter(adapter: &IDXGIAdapter1, warp: bool) -> Result<Self, EngineError> {
-        // 调试层**必须**在 `D3D12CreateDevice` 之前打开（R08-5），否则层不会挂到设备上。
         debug::enable_debug_layer();
         enable_dred();
         let mut device: Option<ID3D12Device> = None;
-        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe { D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }
             .map_err(|error| init_error_from("D3D12CreateDevice", error))?;
         let raw = device.ok_or_else(|| EngineError::AppInit {
             detail: SmolStr::new_static("d3d12 D3D12CreateDevice returned no device"),
         })?;
-        // 设备创建之后配 InfoQueue：只放行 WARNING 及更严重的消息（每帧 INFO 会刷屏）。
         debug::configure_info_queue(&raw);
 
-        // SAFETY: `unsafe fn` 契约由调用点保证：设备刚创建且适配器存活。
         let caps = unsafe { collect_caps(&raw, adapter, warp) };
         caps.check()?;
         debug_assert!(
@@ -297,12 +230,10 @@ impl Device {
         &self.raw
     }
 
-    /// 启动时采集的能力快照（`SharedGpu` 在创建时记录一行诊断）。
     pub(crate) fn caps(&self) -> &GpuCaps {
         &self.caps
     }
 
-    /// 测试：当前仍有 COM 引用的资源数（teardown 泄漏回归面）。
     #[cfg(test)]
     pub(crate) fn live_resources(&self) -> usize {
         self.resources
@@ -312,7 +243,6 @@ impl Device {
             .count()
     }
 
-    /// 粘性丢失错误（`Some` 之后不得再碰 D3D12）。
     pub(crate) fn lost_error(&self) -> Option<EngineError> {
         self.lost.as_ref().map(|lost| EngineError::DeviceLost {
             reason: lost.reason.clone(),
@@ -320,25 +250,18 @@ impl Device {
         })
     }
 
-    /// 登记一个资源，返回可放进 `RetireQueue` 的句柄。
     pub(crate) fn allocate(&mut self, resource: ID3D12Resource) -> GpuResourceHandle {
         self.resources.insert(resource)
     }
 
-    /// 释放句柄对应的资源；陈旧句柄返回 `false`。
     pub(crate) fn release(&mut self, handle: GpuResourceHandle) -> bool {
         self.resources.release(handle)
     }
 
-    /// 任一 D3D12 调用失败后的分类：设备丢失 → 粘性 `DeviceLost`（并落 DRED）；否则 `None`
-    /// （调用方保留自己的错误分类）。
-    ///
-    /// `GetDeviceRemovedReason()` 是**唯一**权威判据（R08-3）：`S_OK` 时永不返回 `DeviceLost`。
     pub(crate) fn note_failure(&mut self) -> Option<EngineError> {
         if self.lost.is_some() {
             return self.lost_error();
         }
-        // SAFETY: 设备句柄由本结构持有，调用期间有效；查询无副作用。
         let reason = match unsafe { self.raw.GetDeviceRemovedReason() } {
             Ok(()) => return None,
             Err(error) => error.code(),
@@ -364,12 +287,9 @@ impl Device {
         Some(error)
     }
 
-    /// DRED + 调试层落盘：写 breadcrumb / page-fault 的查询结果与 InfoQueue 计数
-    /// （写文件失败不掩盖原始错误）。
     fn write_dred_log(&self) -> PathBuf {
         let path = self.dred_dir();
         let mut body = String::from("kytrix d3d12 device removed diagnostics\n");
-        // SAFETY: 设备句柄由本结构持有，调用期间有效；查询无副作用。
         if let Err(error) = unsafe { self.raw.GetDeviceRemovedReason() } {
             let _ = std::fmt::write(
                 &mut body,
@@ -391,7 +311,6 @@ impl Device {
         );
         match self.raw.cast::<ID3D12DeviceRemovedExtendedData>() {
             Ok(dred) => {
-                // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
                 match unsafe { dred.GetAutoBreadcrumbsOutput() } {
                     Ok(output) => {
                         let _ = std::fmt::write(
@@ -409,7 +328,6 @@ impl Device {
                         );
                     }
                 }
-                // SAFETY: 句柄与指针由 `self` 持有，调用期间有效；错误按 HRESULT / `Result` 处理。
                 match unsafe { dred.GetPageFaultAllocationOutput() } {
                     Ok(output) => {
                         let _ = std::fmt::write(
@@ -439,38 +357,20 @@ impl Device {
     }
 }
 
-/// 进程级共享 GPU：设备 + 一条 direct queue + 根签名 / PSO + 共享图集纹理 / SRV 堆。
-///
-/// 构造函数都是幂等的**进程级单例**（见 [`SharedGpu::process`]）；测试可以直接构造独立实例
-/// （[`SharedGpu::new_warp`]）以隔离图集状态。
 pub(crate) struct SharedGpu {
-    /// 设备的独立 COM 引用：只读 `Create*` 调用不需要拿锁。
     raw: ID3D12Device,
-    /// 资源句柄表 + 粘性丢失状态（写少、临界区短）。
     device: Mutex<Device>,
-    /// 进程唯一的一条 direct queue（D3D12 的 command queue 是 free-threaded 的）。
     queue: ID3D12CommandQueue,
     pipeline: Pipeline,
-    /// 进程唯一的 shader-visible SRV 堆（图集固定段 + 每窗口段）。
     srv_heap: SrvHeap,
-    /// 共享 SRV 堆的窗口段分配器（窗口创建 / 销毁时分配 / 归还）。
     srv_arena: Mutex<DescriptorArena>,
-    /// 共享图集纹理：读锁 = 录制并提交一帧；写锁 = 页重建（见模块文档）。
     atlas: RwLock<SharedAtlas>,
-    /// 当前共享图集页尺寸的无锁快照（`[glyph, image]`；上传入队时打「入队页」标记用）。
     atlas_pages: [AtomicU32; 2],
-    /// 各窗口提交流登记的**提交水位**（R08-6 / C3）：页换代的代际判据来源。
     watermarks: Mutex<Vec<Weak<StreamWatermark>>>,
-    /// 新帧应绑定的图集描述符代（C3）：录制时按图集读锁读取；页换代在写锁内翻转。
     atlas_generation: AtomicU8,
-    /// 图集双代切换状态（图集写锁内访问）：每一代上仍被引用的旧纹理。
     atlas_switch: Mutex<AtlasSwitch>,
 }
 
-/// 图集双代描述符组的切换记账（C3）。
-///
-/// `retired_textures[g]` 是「仍可能被绑定代 g 的在飞命令列表引用」的旧纹理：在切到代 g 之前
-/// 已确认代 g 无在飞引用（代际水位完成），这时才能释放它们。
 struct AtlasSwitch {
     retired_textures: [Vec<ID3D12Resource>; ATLAS_GENERATIONS as usize],
 }
@@ -483,30 +383,16 @@ impl AtlasSwitch {
     }
 }
 
-/// 图集页换代的结果（C3）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AtlasRebuildOutcome {
-    /// 页已重建；目标代描述符已写好并切换为当前代。
     Applied,
-    /// 目标代仍有在飞命令列表引用（非阻塞拒绝）：**没有写任何描述符、没有换纹理**，调用方应
-    /// 短暂退避后重试（页换代是稀有事件，退避不影响稳态帧率）。
     Deferred,
 }
 
-// SAFETY: D3D12 的 device / queue / fence / descriptor heap 都是 free-threaded 的 COM 对象，
-// 允许跨线程调用；本结构把**可变**状态全部收进了同步原语：
-// - `device`（资源句柄表 + 丢失状态）在 `Mutex` 里；
-// - 图集纹理由 `atlas` 的 `RwLock` 保护；图集 SRV 只会在写锁内写进**没有在飞引用**的那一代
-//   （C3 双代，判据是各窗口的代际弃用水位），读锁持有者在录制 / 提交期间不会看到页变化；
-// - `pipeline`（根签名 / PSO）创建后只读；`watermarks` 是 `Weak` 列表。
 unsafe impl Send for SharedGpu {}
 unsafe impl Sync for SharedGpu {}
 
 impl SharedGpu {
-    /// 产品路径的进程级共享 GPU（硬件设备；第一个窗口创建时初始化）。
-    ///
-    /// 有健康实例就复用；实例已丢失或还没建时新建一个（初始化失败不缓存：`EngineError` 不是
-    /// `Clone`，且失败后的重试成本远低于把进程钉在错误状态上）。
     pub(crate) fn process() -> Result<Arc<Self>, EngineError> {
         let mut cell = gpu_cell();
         if let Some(gpu) = cell.current.as_ref().and_then(Weak::upgrade)
@@ -520,7 +406,6 @@ impl SharedGpu {
         Ok(gpu)
     }
 
-    /// 测试 / `test-support` 的进程级共享 GPU（WARP 设备；与产品路径同构）。
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn process_warp() -> Result<Arc<Self>, EngineError> {
         static GPU: OnceLock<Arc<SharedGpu>> = OnceLock::new();
@@ -528,20 +413,11 @@ impl SharedGpu {
         shared_instance(&GPU, &INIT, || Self::create(Device::new_warp()?))
     }
 
-    /// 测试用：独立实例（不进入进程级单例；用于隔离图集页状态 / 验证并发）。
     #[cfg(test)]
     pub(crate) fn new_warp() -> Result<Arc<Self>, EngineError> {
         Ok(Arc::new(Self::create(Device::new_warp()?)?))
     }
 
-    /// **设备丢失后的进程内恢复**（R08-4）。
-    ///
-    /// 三条规则：
-    /// 1. 别的窗口已经重建过（注册表里的当前实例不是 `stale` 且健康）⇒ 直接复用它，避免每个
-    ///    窗口各建一套 device / PSO / 图集；
-    /// 2. 恢复尝试限次（[`MAX_RECOVERIES_PER_WINDOW`] / [`RECOVERY_WINDOW`]），避免「每次出帧都
-    ///    重建一次设备」把 CPU 打满；
-    /// 3. 新设备的图集按 `stale` 的 CPU 影子页重传（否则恢复后的窗口没有字形/图片）。
     pub(crate) fn recover(stale: &Arc<Self>) -> Result<Arc<Self>, EngineError> {
         let mut cell = gpu_cell();
         if let Some(current) = cell.current.as_ref().and_then(Weak::upgrade)
@@ -573,7 +449,6 @@ impl SharedGpu {
     }
 
     fn create(device: Device) -> Result<Self, EngineError> {
-        // SAFETY: 设备刚创建且存活；队列描述是值参数。
         let queue: ID3D12CommandQueue = unsafe {
             device.raw().CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -590,7 +465,6 @@ impl SharedGpu {
             AtomicU32::new(atlas.page(AtlasKind::Image)),
         ];
         let srv_heap = SrvHeap::new(device.raw())?;
-        // C3：两代描述符组都指向当前占位纹理（真正换代时只写未在用的那一代）。
         for generation in 0..ATLAS_GENERATIONS {
             for kind in [AtlasKind::Glyph, AtlasKind::Image] {
                 srv_heap.write_atlas(
@@ -602,7 +476,6 @@ impl SharedGpu {
                 );
             }
         }
-        // 能力快照是进程级共享事实：启动时记录一行（诊断 / A-B 对照；P3-1 的 review 建议）。
         eprintln!("kytrix: d3d12 {}", device.caps().describe());
         let raw = device.raw().clone();
         Ok(Self {
@@ -620,27 +493,22 @@ impl SharedGpu {
         })
     }
 
-    /// 只读设备句柄（`Create*` / `GetDeviceRemovedReason` 等无状态查询用）。
     pub(crate) fn raw(&self) -> &ID3D12Device {
         &self.raw
     }
 
-    /// 进程唯一的 direct queue（各窗口的 `CommandStream` 向它提交）。
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
         &self.queue
     }
 
-    /// 共享根签名 / PSO。
     pub(crate) fn pipeline(&self) -> &Pipeline {
         &self.pipeline
     }
 
-    /// 进程唯一的 shader-visible SRV 堆（图集固定段 + 每窗口段）。
     pub(crate) fn srv_heap(&self) -> &SrvHeap {
         &self.srv_heap
     }
 
-    /// 给一个窗口分配共享 SRV 堆里的窗口段（`Drop` 时归还）。
     pub(crate) fn window_descriptors(self: &Arc<Self>) -> Result<DescriptorLease, EngineError> {
         let base = self
             .srv_arena
@@ -666,32 +534,22 @@ impl SharedGpu {
             .free(base);
     }
 
-    /// 图集读锁：持有期间页不会变（录制 + 提交一帧的整个区间）。
     pub(crate) fn atlas(&self) -> RwLockReadGuard<'_, SharedAtlas> {
         self.atlas.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 图集写锁：重建的唯一入口（正常重建走 [SharedGpu::rebuild_atlas_pages]；录制路径需要
-    /// 「重建 + 整组上传 + draw + 提交」在同一临界区里完成时用它，见 compositor::record）。
     pub(crate) fn atlas_write(&self) -> RwLockWriteGuard<'_, SharedAtlas> {
         self.atlas.write().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// 共享图集当前页尺寸的无锁快照（上传入队时记录「入队页」，见 `AtlasUploads`）。
     pub(crate) fn atlas_page(&self, kind: AtlasKind) -> u32 {
         self.atlas_pages[kind.index() as usize].load(Ordering::Acquire)
     }
 
-    /// 新帧应绑定的图集描述符代（C3）。录制方在持有图集读锁时读取并把它写进根参数 2 的基址。
     pub(crate) fn atlas_generation(&self) -> u8 {
         self.atlas_generation.load(Ordering::Acquire)
     }
 
-    /// 目标代是否已经没有在飞引用（C3；非阻塞，只读各窗口 fence 的完成值）。
-    ///
-    /// 判据：每个窗口在「弃用该代」时登记了当时的提交水位（`StreamWatermark::retire_generation`），
-    /// 该代的所有在飞命令列表都属于 ≤ 该水位的提交 —— 全部完成（`GetCompletedValue` 追上）后，
-    /// 改写该代描述符才是 D3D12 规范允许的。
     fn generation_idle(&self, generation: u8) -> bool {
         self.watermarks
             .lock()
@@ -701,9 +559,6 @@ impl SharedGpu {
             .all(|watermark| watermark.generation_idle(generation))
     }
 
-    /// 把各窗口**当前**的提交水位登记到 `generation` 上（该代即将被弃用；C3）。
-    ///
-    /// 调用方持有图集写锁 ⇒ 不可能有新提交；此刻登记的 `value` 就是该窗口最后使用该代的序号。
     fn capture_generation_watermark(&self, generation: u8) {
         let watermarks = self
             .watermarks
@@ -714,7 +569,6 @@ impl SharedGpu {
         }
     }
 
-    /// 登记一个提交流的水位（`CommandStream::new`；条目只持 `Weak`）。
     pub(crate) fn register_watermark(&self, fence: ID3D12Fence) -> Arc<StreamWatermark> {
         let watermark = Arc::new(StreamWatermark::new(fence));
         self.watermarks
@@ -724,7 +578,6 @@ impl SharedGpu {
         watermark
     }
 
-    /// 注销水位（`CommandStream::drop`）：顺手清掉已经失效的 `Weak`。
     pub(crate) fn unregister_watermark(&self, watermark: &Arc<StreamWatermark>) {
         let mut watermarks = self
             .watermarks
@@ -737,7 +590,6 @@ impl SharedGpu {
         });
     }
 
-    /// 各窗口的当前水位（测试 / 诊断；顺序不保证）。
     #[cfg(test)]
     pub(crate) fn watermark_values(&self) -> Vec<u64> {
         self.watermarks
@@ -749,53 +601,27 @@ impl SharedGpu {
             .collect()
     }
 
-    /// 登记资源（`&mut Device` 的短临界区）。
     pub(crate) fn allocate(&self, resource: ID3D12Resource) -> GpuResourceHandle {
         self.device_lock().allocate(resource)
     }
 
-    /// 释放句柄对应的资源；陈旧句柄返回 `false`。
     pub(crate) fn release(&self, handle: GpuResourceHandle) -> bool {
         self.device_lock().release(handle)
     }
 
-    /// 任一 D3D12 调用失败后的分类（设备丢失是**进程级**粘性状态：一个窗口检测到移除之后，
-    /// 其余窗口在下一次提交 / 等待时拿到同一个 `DeviceLost`）。
     pub(crate) fn note_failure(&self) -> Option<EngineError> {
         self.device_lock().note_failure()
     }
 
-    /// 粘性丢失错误（`Some` 之后不得再触碰 D3D12）。
     pub(crate) fn lost_error(&self) -> Option<EngineError> {
         self.device_lock().lost_error()
     }
 
-    /// 测试：共享设备句柄表里仍存活的资源数。
     #[cfg(test)]
     pub(crate) fn live_resources(&self) -> usize {
         self.device_lock().live_resources()
     }
 
-    /// 把一个或多个图集 array 重建到指定规格（页边长 + 层数；C3：双代描述符组）。
-    ///
-    /// 契约：
-    /// 1. 写锁内重新检查（排队期间别的窗口可能已经建好同一 array）；
-    /// 2. 只把新 SRV 写进**没有在飞引用**的那一代 —— 目标代是否空闲由各窗口登记的代际弃用
-    ///    水位**非阻塞**判定；不空闲返回 [`AtlasRebuildOutcome::Deferred`]，此时**什么都没改**
-    ///    （不换纹理、不写描述符、不翻转代际），调用方短暂退避后重试；
-    /// 3. 换代顺序：释放目标代上更早的旧纹理（目标代已无引用）→ 创建新纹理、当前代旧纹理
-    ///    挂进当前代的回收表 → 写目标代描述符 → 登记当前代的弃用水位 → 翻转
-    ///    `atlas_generation`。全部发生在图集写锁内（录制方持读锁，不会看到中间态）。
-    ///
-    /// 重建是**进程级事件**：只有第一个看到「App 换代的页 / 新层数」的窗口会真正重建（窗口侧的
-    /// `AtlasUploads::reconcile_pages` 已经把「别的窗口换代之后留下的旧页上传」丢弃），其余
-    /// 窗口在写锁释放后发现 array 已对齐，直接录制自己的上传。
-    ///
-    /// **层数增长**：新数组的旧层内容由 App 在扩层帧的整层重传补齐（每个已打开的页都整页上传，
-    /// 见 `AtlasUploads::reconcile_pages` 的层数分支）—— 增长不会丢已上传的图。层数只增不减：
-    /// 请求里的层数与当前层数取最大，缩容会让所有窗口的 `AtlasTile.page` 失效。
-    /// 仅测试便捷入口（拿写锁 + 落地重建）。生产路径是录制线程在**已持有写锁**的临界区里调
-    /// [`SharedGpu::rebuild_atlas_pages_locked`]（重建 + 整组上传 + draw + 提交一次完成）。
     #[cfg(test)]
     pub(crate) fn rebuild_atlas_pages(
         &self,
@@ -805,11 +631,6 @@ impl SharedGpu {
         self.rebuild_atlas_pages_locked(&mut atlas, requests)
     }
 
-    /// 重建的锁内实现：调用方必须已经持有 [SharedGpu::atlas_write] 的写锁。
-    ///
-    /// 录制路径（compositor::record）用它在**同一个写锁临界区**里完成「重建 → 本窗口整组
-    /// 上传 → draw → 提交」：这样新数组的内容在写锁释放前就已经全部进命令列表，别的窗口
-    /// 不可能在「数组已换、内容还没拷」的空档里录制一帧（RBT-01 的跨窗口半成品窗口）。
     pub(crate) fn rebuild_atlas_pages_locked(
         &self,
         atlas: &mut SharedAtlas,
@@ -819,7 +640,6 @@ impl SharedGpu {
             .iter()
             .filter(|request| atlas.spec(request.kind) != request.spec)
             .map(|request| {
-                // 层数只增不减：旧 array 层数更多时（不可能由 App 产生）保留更多的一边。
                 let current = atlas.spec(request.kind);
                 AtlasPageRequest {
                     kind: request.kind,
@@ -835,8 +655,6 @@ impl SharedGpu {
         }
         let active = self.atlas_generation.load(Ordering::Acquire);
         let target = (active + 1) % ATLAS_GENERATIONS;
-        // 1) 非阻塞安全判据（C3 的核心）：目标代上一次被弃用时登记的提交水位必须全部完成。
-        //    未完成 ⇒ 仍可能有在飞命令列表引用目标代的描述符，D3D12 禁止此时改写它们。
         if !self.generation_idle(target) {
             super::diagnostics::atlas_deferred_rebuild();
             return Ok(AtlasRebuildOutcome::Deferred);
@@ -845,9 +663,7 @@ impl SharedGpu {
             .atlas_switch
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // 2) 目标代没有任何在飞引用：它上面更早换下来的旧纹理此时一定也没人引用，可以释放。
         switch.retired_textures[target as usize].clear();
-        // 3) 创建新纹理；被换下来的当前代纹理仍可能被在飞帧采样 ⇒ 按当前代挂进回收表。
         let mut rebuilt = AtlasRebuilt::default();
         for request in pending {
             let old = atlas.recreate(self.raw(), request.kind, request.spec)?;
@@ -867,19 +683,11 @@ impl SharedGpu {
             rebuilt.glyph || rebuilt.image,
             "a non-empty rebuild must recreate at least one atlas page"
         );
-        // 4) 登记当前代在各窗口上的弃用水位（此后新提交都属于 target 代）。
         self.capture_generation_watermark(active);
-        // 5) 翻转代际（写锁内：录制方持读锁 + 读代际，看到的一定是已写好的目标代描述符）。
         self.atlas_generation.store(target, Ordering::Release);
         Ok(AtlasRebuildOutcome::Applied)
     }
 
-    /// 设备恢复后按 CPU 影子页重传图集（R08-4）。
-    ///
-    /// 影子页是录制期从同一份上传字节落下来的（`SharedAtlas::update_shadow`），因此恢复后的
-    /// 图集内容与被移除设备上的一致。图片图集是 texture array：按层重传，层数取影子自己的
-    /// 长度（= 被移除设备上数组的层数）；从未上传过的层（影子为 `None`）保持未定义 ——
-    /// 那里没有 tile 会采样到它，下一次整层上传会补上。
     fn restore_atlas(
         &self,
         snapshot: &[Option<crate::render::windows::atlas::ShadowAtlasSnapshot>; 2],
@@ -929,7 +737,6 @@ impl SharedGpu {
                 self.upload_atlas_page_now(&texture, kind, page, layer, pixels)?;
             }
         }
-        // 设备恢复后没有任何在飞引用：清空旧代回收表并重置代际。
         self.atlas_switch
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -938,10 +745,6 @@ impl SharedGpu {
         Ok(())
     }
 
-    /// 帧外的一次性整层上传（只用于设备恢复：新设备上的图集是空纹理）。
-    ///
-    /// 自己建 staging / allocator / list / fence 并同步等完成：此刻还没有任何窗口的提交流
-    /// （恢复发生在窗口重建之前），不需要与它们同步。
     fn upload_atlas_page_now(
         &self,
         texture: &ID3D12Resource,
@@ -954,11 +757,9 @@ impl SharedGpu {
         let row_pitch = row_pitch_for(kind, page);
         let staging = create_staging(self.raw(), u64::from(row_pitch) * u64::from(page))?;
         let mut pointer: *mut c_void = std::ptr::null_mut();
-        // SAFETY: UPLOAD 堆；本函数独占该映射直到资源释放。
         unsafe { staging.Map(0, None, Some(&mut pointer)) }
             .map_err(|error| init_error_from("Map(atlas restore)", error))?;
         for row in 0..page as usize {
-            // SAFETY: staging 容量 = `row_pitch × page`；源行在 `pixels` 内（长度已校验）。
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     pixels.as_ptr().add(row * row_bytes),
@@ -967,16 +768,13 @@ impl SharedGpu {
                 );
             }
         }
-        // SAFETY: 与上面的 `Map` 成对。
         unsafe { staging.Unmap(0, None) };
 
-        // SAFETY: 设备句柄有效；分配器/列表都是新建的，独占使用。
         let allocator: ID3D12CommandAllocator = unsafe {
             self.raw
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
         }
         .map_err(|error| init_error_from("CreateCommandAllocator(atlas restore)", error))?;
-        // SAFETY: 同上。
         let list: ID3D12GraphicsCommandList = unsafe {
             self.raw
                 .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
@@ -995,26 +793,19 @@ impl SharedGpu {
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         );
-        // SAFETY: 列表由本函数独占，录制完成。
         unsafe { list.Close() }.map_err(|error| init_error_from("Close(atlas restore)", error))?;
         let command_list: ID3D12CommandList = list
             .cast()
             .map_err(|error| init_error_from("cast ID3D12CommandList", error))?;
-        // SAFETY: 命令列表已关闭；队列是进程级的。
         unsafe { self.queue.ExecuteCommandLists(&[Some(command_list)]) };
-        // SAFETY: 新 fence，signal 1；事件仅本次等待使用。
         let fence: ID3D12Fence = unsafe { self.raw.CreateFence(0, D3D12_FENCE_FLAG_NONE) }
             .map_err(|error| init_error_from("CreateFence(atlas restore)", error))?;
-        // SAFETY: fence 由本函数持有；Signal 只入队。
         unsafe { self.queue.Signal(&fence, 1) }
             .map_err(|error| init_error_from("Signal(atlas restore)", error))?;
-        // SAFETY: 无名称 auto-reset 事件；句柄在返回前关闭。
         let event: HANDLE = unsafe { CreateEventW(None, false, false, None) }
             .map_err(|error| init_error_from("CreateEventW(atlas restore)", error))?;
-        // SAFETY: fence / 事件句柄在本次调用期间有效。
         let armed = unsafe { fence.SetEventOnCompletion(1, event) };
         if let Err(error) = armed {
-            // SAFETY: 事件句柄由本函数独占。
             unsafe {
                 let _ = CloseHandle(event);
             }
@@ -1023,15 +814,11 @@ impl SharedGpu {
                 error,
             ));
         }
-        // SAFETY: 同上。
         let wait = unsafe { WaitForSingleObject(event, FENCE_TIMEOUT_MS) };
-        // SAFETY: 事件句柄由本函数独占。
         unsafe {
             let _ = CloseHandle(event);
         }
         if wait != WAIT_OBJECT_0 {
-            // 恢复路径上的超时：设备健康 ⇒ 放弃这次图集重传（窗口照常恢复，图集内容下一帧由
-            // 上传路径补齐）；设备移除 ⇒ 按设备丢失处理。
             return match self.note_failure() {
                 Some(sticky) => Err(sticky),
                 None => Ok(()),
@@ -1047,7 +834,6 @@ impl SharedGpu {
 
 impl Drop for SharedGpu {
     fn drop(&mut self) {
-        // 进程 teardown：把 InfoQueue 里剩下的消息计数并落日志（R08-5）。release 构建是空实现。
         let counts = debug::drain_messages(&self.raw);
         if counts.warning + counts.error + counts.corruption > 0 {
             eprintln!(
@@ -1058,17 +844,12 @@ impl Drop for SharedGpu {
     }
 }
 
-/// 一个窗口在共享 SRV 堆里的段（`Drop` 时把段归还给 `DescriptorArena`）。
-///
-/// `Renderer` 在 GPU 线程 join 之后才销毁，因此归还时该窗口的描述符不再被任何在飞命令列表
-/// 引用；新窗口拿到同一段后重写描述符是安全的。
 pub(crate) struct DescriptorLease {
     gpu: Arc<SharedGpu>,
     base: u32,
 }
 
 impl DescriptorLease {
-    /// 段内第一个描述符的绝对索引（`SrvHeap::slot_table` / `SrvHeap::write_slot` 用）。
     pub(crate) fn base(&self) -> u32 {
         self.base
     }
@@ -1080,19 +861,12 @@ impl Drop for DescriptorLease {
     }
 }
 
-/// 进程级共享 GPU 的注册表（**可替换**，R08-4）。
-///
-/// 旧实现是 `OnceLock<Arc<SharedGpu>>`：设备真的被移除之后进程里再没有可用的设备。
-/// 现在把「当前实例」放进 `Mutex`，并记一个限次窗口给恢复用。
 struct GpuCell {
     current: Option<Weak<SharedGpu>>,
-    /// 最近 [`RECOVERY_WINDOW`] 内的恢复尝试时刻。
     recoveries: VecDeque<Instant>,
-    /// 进程世代号（每次创建 / 恢复 +1；日志字段）。
     generation: u64,
 }
 
-/// 恢复尝试的时间窗口与上限（R08-4：3 次 / 5 s）。
 const RECOVERY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_RECOVERIES_PER_WINDOW: usize = 3;
 
@@ -1109,7 +883,6 @@ fn gpu_cell() -> MutexGuard<'static, GpuCell> {
     .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// 进程级单例的创建协议：快路径无锁，慢路径在初始化互斥锁内二次检查（WARP 用）。
 #[cfg(any(test, feature = "test-support"))]
 fn shared_instance(
     cell: &'static OnceLock<Arc<SharedGpu>>,
@@ -1128,25 +901,14 @@ fn shared_instance(
     Ok(gpu)
 }
 
-/// 选硬件适配器：优先**高性能**（独显），再退回「第一个非软件适配器」。
-///
-/// 混合显卡机器（笔记本 / 台式双卡）上 `EnumAdapters1` 的枚举顺序通常是 iGPU 在前，
-/// 直接取第一个非软件适配器会静默用上核显。D3D12 官方推荐的做法是
-/// `EnumAdapterByGpuPreference(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)`：它会挑驱动声明的
-/// 高性能适配器（无独显时等价于默认顺序）。
-///
-/// 保留旧枚举作为兜底：`IDXGIFactory6` 不可用（极老的 DXGI）时仍能拿到一个硬件适配器。
 fn pick_hardware_adapter(factory: &IDXGIFactory4) -> Result<IDXGIAdapter1, EngineError> {
-    // `cast` 是安全的 COM 查询（失败只说明 IDXGIFactory6 不可用）。
     if let Ok(factory6) = factory.cast::<IDXGIFactory6>() {
-        // SAFETY: 句柄由调用方持有，参数与输出结构在调用期间有效。
         if let Ok(adapter) = unsafe {
             factory6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
                 0,
                 DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
             )
         } {
-            // SAFETY: 适配器句柄由本函数持有到返回。
             let desc = unsafe { adapter.GetDesc1() }
                 .map_err(|error| init_error_from("GetDesc1", error))?;
             if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
@@ -1156,10 +918,8 @@ fn pick_hardware_adapter(factory: &IDXGIFactory4) -> Result<IDXGIAdapter1, Engin
     }
     let mut index = 0u32;
     loop {
-        // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
         match unsafe { factory.EnumAdapters1(index) } {
             Ok(adapter) => {
-                // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
                 let desc = unsafe { adapter.GetDesc1() }
                     .map_err(|error| init_error_from("GetDesc1", error))?;
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
@@ -1178,14 +938,11 @@ fn pick_hardware_adapter(factory: &IDXGIFactory4) -> Result<IDXGIAdapter1, Engin
     }
 }
 
-/// 在建设备**之前**打开 DRED（breadcrumbs + page fault）；接口不可用时静默跳过。
 fn enable_dred() {
     let mut settings: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-    // SAFETY: 调试层接口是可选能力：本机缺 SDK 组件时返回错误并被跳过。
     if unsafe { D3D12GetDebugInterface(&mut settings) }.is_ok()
         && let Some(settings) = settings
     {
-        // SAFETY: COM 调用：句柄有效，参数是值。
         unsafe {
             settings.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             settings.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
@@ -1193,9 +950,7 @@ fn enable_dred() {
     }
 }
 
-/// 采集 D8 检测项（顺序与主设计 §2.2 的 8 项表一致；每项失败都只填默认值）。
 unsafe fn collect_caps(device: &ID3D12Device, adapter: &IDXGIAdapter1, warp: bool) -> GpuCaps {
-    // SAFETY: swapchain / 适配器句柄由调用方持有；参数与输出结构在调用期间有效。
     let desc = unsafe { adapter.GetDesc1() }.unwrap_or_default();
     let name_len = desc
         .Description
@@ -1223,7 +978,6 @@ unsafe fn collect_caps(device: &ID3D12Device, adapter: &IDXGIAdapter1, warp: boo
         std::mem::size_of::<D3D12_FEATURE_DATA_FEATURE_LEVELS>(),
     );
 
-    // F-73：入参必须是期望上限，否则永远得到填入值。
     let mut shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
         HighestShaderModel: D3D_SHADER_MODEL_6_8,
     };
@@ -1242,7 +996,6 @@ unsafe fn collect_caps(device: &ID3D12Device, adapter: &IDXGIAdapter1, warp: boo
         std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS>(),
     );
 
-    // R08-12：本后端唯一依赖的非通用能力（relaxed format casting）。
     let mut options3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
     check_feature(
         device,
@@ -1297,9 +1050,7 @@ unsafe fn collect_caps(device: &ID3D12Device, adapter: &IDXGIAdapter1, warp: boo
     }
 }
 
-/// 单个 `CheckFeatureSupport`（失败只留下默认值：这些字段是记录项，不是硬基线）。
 fn check_feature<T>(device: &ID3D12Device, feature: D3D12_FEATURE, data: &mut T, size: usize) {
-    // SAFETY: `data` 是按调用方给的 `size` 分配的栈上结构体，D3D12 只写入该大小。
     unsafe {
         let _ = device.CheckFeatureSupport(
             feature,
@@ -1309,7 +1060,6 @@ fn check_feature<T>(device: &ID3D12Device, feature: D3D12_FEATURE, data: &mut T,
     }
 }
 
-/// 一块 UPLOAD 堆缓冲（设备恢复时的整页 staging）。
 fn create_staging(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, EngineError> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -1333,7 +1083,6 @@ fn create_staging(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, E
         VisibleNodeMask: 1,
     };
     let mut out: Option<ID3D12Resource> = None;
-    // SAFETY: COM 调用：设备句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
         device.CreateCommittedResource(
             &heap,
@@ -1350,7 +1099,6 @@ fn create_staging(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, E
     })
 }
 
-/// 资源句柄表（generation 拒绝陈旧句柄；P08 只有 `kind = 1`）。
 struct ResourceTable {
     slots: Vec<Option<ID3D12Resource>>,
     generations: Vec<u32>,
@@ -1402,7 +1150,6 @@ impl ResourceTable {
     }
 }
 
-/// GPU 测试的进程级串行锁：多个 WARP 设备 / 多个 GPU 线程并行会互相拖垮（本机实测 device removed）。
 #[cfg(test)]
 pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::Mutex;
@@ -1427,7 +1174,6 @@ mod tests {
         render::{AtlasArraySpec, AtlasPageRequest},
     };
 
-    /// 字形 array 的重建请求（1 层）。
     fn glyph_request(page: u32) -> AtlasPageRequest {
         AtlasPageRequest {
             kind: AtlasKind::Glyph,
@@ -1458,7 +1204,6 @@ mod tests {
             VisibleNodeMask: 1,
         };
         let mut out: Option<ID3D12Resource> = None;
-        // SAFETY: COM 调用：设备句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             device.raw().CreateCommittedResource(
                 &heap,
@@ -1475,7 +1220,6 @@ mod tests {
         })
     }
 
-    /// WARP：D8 基线（`new_warp` 内部 `caps.check()`）+ 设备健康。
     #[test]
     fn warp_device_is_created_and_healthy() {
         let mut device = Device::new_warp().expect("WARP device meets D8");
@@ -1488,7 +1232,6 @@ mod tests {
         );
     }
 
-    /// 进程级单例：两次取到的是同一个 `SharedGpu`（设备 / queue / PSO / 图集只创建一次）。
     #[test]
     fn the_process_wide_gpu_is_created_once() {
         let _guard = super::gpu_test_lock();
@@ -1501,7 +1244,6 @@ mod tests {
         );
     }
 
-    /// C3：共享图集页换代用**双代描述符组**：每次换代只写未在用的一代并翻转代际。
     #[test]
     fn rebuilding_a_shared_atlas_page_swaps_the_descriptor_generation() {
         let _guard = super::gpu_test_lock();
@@ -1522,7 +1264,6 @@ mod tests {
             "换代只写目标代并把它翻成当前代"
         );
 
-        // 同一页重复请求是 no-op：不换代（其余窗口在写锁释放后不必再重建）。
         assert_eq!(
             shared
                 .rebuild_atlas_pages(&[glyph_request(64)])
@@ -1532,7 +1273,6 @@ mod tests {
         assert_eq!(shared.atlas_generation(), 1);
         assert_eq!(shared.atlas().page(AtlasKind::Glyph), 64);
 
-        // 第二次真正换代回到代 0（没有窗口登记水位 ⇒ 代 1 已空闲、可立即复用）。
         assert_eq!(
             shared
                 .rebuild_atlas_pages(&[glyph_request(128)])
@@ -1543,13 +1283,10 @@ mod tests {
         assert_eq!(shared.atlas().page(AtlasKind::Glyph), 128);
     }
 
-    /// C3 的核心不变量：目标代仍有在飞引用时**绝不**改写它的描述符 —— 非阻塞返回
-    /// `Deferred`（纹理 / 页尺寸 / 代际全部保持原状），引用完成后同一请求即可应用。
     #[test]
     fn a_generation_with_in_flight_frames_defers_the_page_rebuild() {
         let _guard = super::gpu_test_lock();
         let shared = SharedGpu::new_warp().expect("WARP shared gpu");
-        // 造一个未完成的 fence 并登记为窗口水位；把「代 1」标记为它使用过（弃用水位 = 1）。
         let fence: ID3D12Fence =
             unsafe { shared.raw().CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("fence");
         let watermark = shared.register_watermark(fence.clone());
@@ -1569,7 +1306,6 @@ mod tests {
             "Deferred 不得换纹理（什么都没改）"
         );
 
-        // CPU 侧 signal 让 fence 完成：同一请求接下来必须成功。
         unsafe { fence.Signal(1) }.expect("signal fence");
         assert!(watermark.generation_idle(1));
         assert_eq!(
@@ -1583,16 +1319,6 @@ mod tests {
         shared.unregister_watermark(&watermark);
     }
 
-    /// C3 的**捕获侧**（review-c RC-3）：换代时弃用水位必须登记到**离开**的那一代
-    /// （`capture_generation_watermark(active)`），下一次回到该代时用它判空闲。
-    ///
-    /// 变异 `capture_generation_watermark(active)` → `(target)`（把水位记到即将启用的代上）
-    /// 会让第二次换代误判「代 0 空闲」并改写仍被在飞帧引用的描述符。本测试用「未完成的
-    /// fence + 真实登记流」确定性构造该状态：
-    /// 1. 流水位 = 7（最后提交序号），fence 完成值 0 ⇒ 代 0 的引用仍在飞；
-    /// 2. 第一次换代（0→1）必须把**代 0**的弃用水位捕获为 7；
-    /// 3. 第二次换代（目标回到代 0）必须 `Deferred`（不写描述符/不翻代）；
-    /// 4. signal 后同一请求 `Applied`。
     #[test]
     fn the_retired_watermark_is_captured_for_the_departing_generation() {
         let _guard = super::gpu_test_lock();
@@ -1600,7 +1326,6 @@ mod tests {
         let fence: ID3D12Fence =
             unsafe { shared.raw().CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("fence");
         let watermark = shared.register_watermark(fence.clone());
-        // 模拟：该流最后一次使用「代 0」的提交序号是 7，且 fence 尚未完成（仍在飞）。
         watermark.publish_for_test(7);
         assert_eq!(watermark.value(), 7);
 
@@ -1611,7 +1336,6 @@ mod tests {
             AtlasRebuildOutcome::Applied
         );
         assert_eq!(shared.atlas_generation(), 1, "第一次换代 0 → 1");
-        // 捕获侧不变量：被弃用的是代 0，弃用水位必须记在**代 0** 上（fence 未完成 ⇒ 非空闲）。
         assert!(
             !watermark.generation_idle(0),
             "capture 必须把弃用水位登记到离开的代（代 0），而不是目标代（代 1）"
@@ -1621,7 +1345,6 @@ mod tests {
             "代 1 从未被该流使用，必须视为空闲"
         );
 
-        // 第二次换代目标回到代 0：其弃用水位（7）尚未完成 ⇒ 只能 Deferred。
         assert_eq!(
             shared
                 .rebuild_atlas_pages(&[glyph_request(128)])
@@ -1639,7 +1362,6 @@ mod tests {
             "Deferred 不得换纹理"
         );
 
-        // fence 完成：同一请求必须成功回到代 0。
         unsafe { fence.Signal(7) }.expect("signal fence");
         assert!(watermark.generation_idle(0), "fence 完成后代 0 才空闲");
         assert_eq!(
@@ -1653,11 +1375,6 @@ mod tests {
         shared.unregister_watermark(&watermark);
     }
 
-    /// 设备真正被移除时：`note_failure` 升级为 `DeviceLost`（粘性）并落 DRED 日志。
-    ///
-    /// **必须在独立进程里跑**：`RemoveDevice` 是运行时级操作，会污染同进程所有 D3D12 设备
-    /// （V-59；旧实现每窗口一个设备时没有这个问题）。而本测试进程里已经有进程级共享 GPU，
-    /// 所以这里把会真正移除设备的用例放子进程执行，父进程只断言子进程退出码。
     #[test]
     fn removed_device_reports_device_lost_and_writes_a_log() {
         const CHILD_ENV: &str = "KYTRIX_DEVICE_LOST_TEST_CHILD";
@@ -1687,7 +1404,6 @@ mod tests {
         assert!(device.note_failure().is_none(), "healthy device");
         {
             let device5: ID3D12Device5 = device.raw().cast().expect("ID3D12Device5");
-            // SAFETY: 故意移除本测试独占的设备（Windows 会立即让后续调用返回 DEVICE_REMOVED）。
             unsafe { device5.RemoveDevice() };
         }
         let error = device
@@ -1705,7 +1421,6 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
-        // 粘性：同一设备不再重复写日志，但状态保持「已丢失」。
         assert!(device.note_failure().is_some());
         assert!(device.lost_error().is_some());
     }
@@ -1726,13 +1441,11 @@ mod tests {
         assert!(device.release(reused));
     }
 
-    /// R08-4：新实例的世代号与旧实例无关；注册表在有健康实例时**不**新建（进程级复用）。
     #[test]
     fn the_gpu_cell_reuses_a_healthy_instance() {
         let _guard = super::gpu_test_lock();
         let first = SharedGpu::new_warp().expect("WARP shared gpu");
         let before = super::gpu_cell().generation;
-        // `process_warp` 是另一个单例，不应影响进程级注册表。
         let _ = SharedGpu::process_warp().expect("WARP singleton");
         assert_eq!(super::gpu_cell().generation, before);
         assert!(std::sync::Arc::strong_count(&first) >= 1);
@@ -1787,8 +1500,6 @@ mod caps_tests {
         below_tier.resource_binding_tier = 1;
         assert!(!below_tier.baseline_ok());
 
-        // R08-12：不支持 relaxed format casting 的驱动（RS1）必须**显式**失败，而不是
-        // 悄悄输出「整窗偏暗」的像素。
         let mut no_cast = caps();
         no_cast.casting_fully_typed = false;
         assert!(!no_cast.baseline_ok());

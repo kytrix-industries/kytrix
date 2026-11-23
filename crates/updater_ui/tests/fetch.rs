@@ -1,9 +1,3 @@
-//! The update metadata end to end, against a server that answers the way GitHub does.
-//!
-//! The request goes through a real transport, a real client and a real redirect
-//! chain, so what is exercised here is the path production takes: the endpoint behind
-//! a redirect, and the release it publishes behind another one.
-
 use std::{
     convert::Infallible,
     net::{Ipv4Addr, SocketAddr},
@@ -30,16 +24,13 @@ use updater_ui::{
 };
 use url::Url;
 
-/// The response body the release server answers with: its whole entity in one frame.
 struct TestBody(Option<Bytes>);
 
 impl TestBody {
-    /// A body that carries `bytes`.
     fn whole(bytes: Bytes) -> Self {
         Self(Some(bytes))
     }
 
-    /// A body that carries nothing, which is what a redirect has.
     fn empty() -> Self {
         Self(None)
     }
@@ -66,7 +57,6 @@ fn answer(status: StatusCode, body: TestBody, location: Option<&str>) -> Respons
     answer.body(body).expect("the response is well formed")
 }
 
-/// What the endpoint publishes: one release, naming the payload at `payload_path`.
 fn metadata(address: SocketAddr, payload_path: &str) -> Bytes {
     let key = PlatformKey::current().expect("the tests run on a packaged platform");
     let published = json!({
@@ -87,9 +77,6 @@ fn metadata(address: SocketAddr, payload_path: &str) -> Bytes {
     Bytes::from(serde_json::to_vec(&published).expect("the manifest is JSON"))
 }
 
-/// Starts a release server: the metadata behind a redirect to a relative location,
-/// which is what GitHub sends and what the client has to resolve against the request
-/// it made.
 async fn spawn_release_server() -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -132,7 +119,6 @@ async fn spawn_release_server() -> SocketAddr {
     address
 }
 
-/// The transport an update request goes through, over loopback.
 fn transport() -> TransportHub {
     TransportHub::new(TransportPolicy {
         allow_plaintext: true,
@@ -140,17 +126,10 @@ fn transport() -> TransportHub {
     })
 }
 
-/// The endpoint the fake release is published at.
 fn endpoint(address: SocketAddr) -> Url {
     Url::parse(&format!("http://{address}/latest.json")).expect("the endpoint is a URL")
 }
 
-/// The metadata request end to end, against a server that answers the way GitHub
-/// does: the endpoint behind a redirect, and the release behind another one.
-///
-/// The test owns the runtime the request is driven on (the workspace denies reaching
-/// for the ambient one), and hands its handle to the updater the way the composition
-/// root does.
 #[test]
 fn a_release_should_be_read_through_its_redirect_chain() {
     let runtime = tokio::runtime::Builder::new_current_thread()

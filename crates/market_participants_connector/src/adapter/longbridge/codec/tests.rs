@@ -1,9 +1,3 @@
-//! The unit tests of the framing and of the venue's own vocabularies.
-//!
-//! They are a file of their own rather than a block inside the module because the module
-//! boundary is what they belong to, not the file: what they assert is the byte layout and
-//! the tables the parent owns, and they reach every private item of it through `super::`.
-
 use bytes::Bytes;
 use flate2::{Compression, write::GzEncoder};
 use prost::Message as _;
@@ -22,7 +16,6 @@ use crate::{
     market::timeframe::{Adjustment, TimeFrame},
 };
 
-/// The refusal one decoded packet states, read the way a request path reads it.
 fn rejection(packet: &Packet) -> Result<Option<MarketParticipantError>, MarketParticipantError> {
     match packet {
         Packet::Response { status, body, .. } => refusal(*status, body),
@@ -30,7 +23,6 @@ fn rejection(packet: &Packet) -> Result<Option<MarketParticipantError>, MarketPa
     }
 }
 
-/// One response frame of the protocol, built byte by byte.
 fn response_frame(
     header: u8,
     command_code: u8,
@@ -46,7 +38,6 @@ fn response_frame(
     frame
 }
 
-/// One push frame of the protocol, built byte by byte.
 fn push_frame(header: u8, command_code: u8, body: &[u8]) -> Vec<u8> {
     let mut frame = vec![header, command_code];
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
@@ -54,7 +45,6 @@ fn push_frame(header: u8, command_code: u8, body: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// A frame whose declared body length is not the length of its body.
 fn declared_frame(header: u8, command_code: u8, declared: usize, body: &[u8]) -> Vec<u8> {
     let mut frame = vec![header, command_code, 0, 0, 0, 0];
     frame.push(0);
@@ -63,8 +53,6 @@ fn declared_frame(header: u8, command_code: u8, declared: usize, body: &[u8]) ->
     frame
 }
 
-/// The request layout is the protocol's own, byte for byte, and every multibyte
-/// integer of it is big-endian.
 #[test]
 fn an_encoded_request_is_the_protocol_layout() {
     let frame = encode_request(
@@ -78,17 +66,17 @@ fn an_encoded_request_is_the_protocol_layout() {
     assert_eq!(
         frame.as_ref(),
         [
-            0b0000_0001, // packet type: request, neither signed nor compressed
-            27,          // command code
+            0b0000_0001,
+            27,
             1,
             2,
             3,
-            4, // request id, big-endian
+            4,
             0x75,
-            0x30, // timeout millis, big-endian
+            0x30,
             0,
             0,
-            4, // body length, big-endian
+            4,
             b'b',
             b'o',
             b'd',
@@ -97,7 +85,6 @@ fn an_encoded_request_is_the_protocol_layout() {
     );
 }
 
-/// The three-byte length field is what bounds a request body.
 #[test]
 fn a_request_body_above_the_length_field_is_refused() {
     let too_long = vec![0_u8; 0x100_0000];
@@ -111,9 +98,6 @@ fn a_request_body_above_the_length_field_is_refused() {
     ));
 }
 
-/// The length field's high bytes are written, not left at zero: a body the
-/// three-byte field can state only with its first byte is a body whose length
-/// the receiver reads from all three of them.
 #[test]
 fn a_body_length_reaches_all_three_of_its_bytes() {
     let body = vec![0_u8; 0x01_0203];
@@ -129,8 +113,6 @@ fn a_body_length_reaches_all_three_of_its_bytes() {
     assert_eq!(frame.len(), 11 + body.len());
 }
 
-/// Both packet types the venue answers with decode into their own shape, and a
-/// push is never mistaken for a response.
 #[test]
 fn responses_and_pushes_decode_into_their_own_packets() {
     let response = decode(&response_frame(PACKAGE_TYPE_RESPONSE, 27, 42, 0, b"answer"))
@@ -160,8 +142,6 @@ fn responses_and_pushes_decode_into_their_own_packets() {
     );
 }
 
-/// A push frame carries its length where a response carries its id, so the
-/// packet type bits are what answers the id — a length is never an id.
 #[test]
 fn a_push_frame_answers_no_request_id() {
     let push = push_frame(PACKAGE_TYPE_PUSH, PUSH_REALTIME_TRADES, &[0_u8; 9]);
@@ -178,8 +158,6 @@ fn a_push_frame_answers_no_request_id() {
     );
     assert_eq!(extract_response_id(&[]), None);
 
-    // The connection layer takes the answer as a plain function pointer, so this
-    // reader is one: it captures nothing and reads only the bytes it is given.
     let extractor: fn(&[u8]) -> Option<u64> = extract_response_id;
     assert_eq!(
         extractor(&response_frame(PACKAGE_TYPE_RESPONSE, 27, 7, 0, b"")),
@@ -188,9 +166,6 @@ fn a_push_frame_answers_no_request_id() {
     assert_eq!(extractor(&push), None);
 }
 
-/// The packet type is the low nibble of the header, so the bits beside it do
-/// not make a response something else: a verified or compressed answer is still
-/// an answer to the request whose id it echoes.
 #[test]
 fn a_response_is_recognised_whatever_the_other_header_bits_say() {
     let verified = response_frame(
@@ -218,9 +193,6 @@ fn a_response_is_recognised_whatever_the_other_header_bits_say() {
     );
 }
 
-/// A verified frame carries its signature after the body, and the frame is
-/// exactly as long as the header says: neither a shorter nor a longer tail is
-/// the frame this build understands.
 #[test]
 fn a_verified_frame_carries_exactly_its_signature_after_the_body() {
     let mut frame = response_frame(PACKAGE_TYPE_RESPONSE | HEADER_VERIFY, 19, 3, 0, b"candles");
@@ -254,10 +226,6 @@ fn a_verified_frame_carries_exactly_its_signature_after_the_body() {
     );
 }
 
-/// A gzip body is inflated before it is read, a body that is not the gzip it
-/// claims is refused, and the bytes it inflates to are bounded by the same limit
-/// the frame is: a small compressed body must not become an unbounded
-/// allocation.
 #[test]
 fn a_gzipped_body_is_inflated_within_the_bound() {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -282,8 +250,6 @@ fn a_gzipped_body_is_inflated_within_the_bound() {
         Err(MarketParticipantError::DecodeFailed { .. })
     ));
 
-    // A body that inflates past the bound is refused however small the frame
-    // that carried it was.
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     let zeros = vec![0_u8; MAX_BODY_BYTES + 1];
     std::io::Write::write_all(&mut encoder, &zeros).expect("the fixture writes");
@@ -300,9 +266,6 @@ fn a_gzipped_body_is_inflated_within_the_bound() {
     ));
 }
 
-/// Every malformed frame the protocol can produce is refused rather than
-/// indexed: an empty frame, an unknown packet type, a frame shorter than its own
-/// type, and a length that is not the bytes that arrived.
 #[test]
 fn a_frame_the_protocol_does_not_allow_is_refused() {
     let empty: &[u8] = &[];
@@ -343,8 +306,6 @@ fn a_frame_the_protocol_does_not_allow_is_refused() {
         "a length shorter than the bytes that arrived is not padded into a frame"
     );
 
-    // The largest length the three-byte field can state, with no bytes behind
-    // it: a declared body is never answered with the bytes that are there.
     let largest = declared_frame(PACKAGE_TYPE_RESPONSE, 27, 0xFF_FFFF, b"");
     assert!(
         decode(&largest).is_err(),
@@ -352,8 +313,6 @@ fn a_frame_the_protocol_does_not_allow_is_refused() {
     );
 }
 
-/// A failed response states the venue's own error: the code is its number in
-/// decimal and the message its own words, and neither is invented here.
 #[test]
 fn a_failed_response_states_the_venues_own_error() {
     let failure = longbridge_proto::Error {
@@ -409,10 +368,6 @@ fn a_failed_response_states_the_venues_own_error() {
         Err(MarketParticipantError::DecodeFailed { .. })
     ));
 
-    // A failed answer that states nothing is not a refusal: the default `Error`
-    // prost reads out of an empty body would render as a rejection with the code
-    // zero and no message at all, which is a sentence about nothing the venue
-    // said. It is the same decode failure a body that is not a message is.
     let empty = decode(&response_frame(PACKAGE_TYPE_RESPONSE, 19, 9, 1, b""))
         .expect("the frame itself decodes");
     assert!(matches!(
@@ -420,9 +375,6 @@ fn a_failed_response_states_the_venues_own_error() {
         Err(MarketParticipantError::DecodeFailed { .. })
     ));
 
-    // The same for a body that is a well-formed message stating the default: a
-    // field this build does not know is skipped, and what is left is the default
-    // `Error` — code zero with no message — rather than a refusal.
     let defaulted = decode(&response_frame(
         PACKAGE_TYPE_RESPONSE,
         19,
@@ -446,9 +398,6 @@ fn a_failed_response_states_the_venues_own_error() {
     ));
 }
 
-/// The protobuf surface this build programs against is the pinned one: the
-/// three modules and the failure body the protocol names. A release that moved
-/// or hid one of them would be a different wire.
 #[test]
 fn the_pinned_protobuf_surface_is_the_one_this_build_speaks() {
     let profile = longbridge_proto::quote::UserQuoteProfileRequest {
@@ -467,14 +416,6 @@ fn the_pinned_protobuf_surface_is_the_one_this_build_speaks() {
     assert_eq!(subscription, longbridge_proto::trade::Sub::default());
 }
 
-/// The command codes are the protocol's own numbers, and this build sends only
-/// what it has a caller for.
-///
-/// The push codes are stated by the tests above rather than here: nothing of this
-/// build reads a push yet, and a code with no reader is not one of this module's
-/// numbers. The market-data set is the one place several of these numbers are read
-/// together, and it is asked here so a command that moved in or out of it fails
-/// this test rather than a gate nobody re-read.
 #[test]
 fn the_command_codes_are_the_venues_own_numbers() {
     assert_eq!(COMMAND_CODE_AUTH, 2);
@@ -514,8 +455,6 @@ fn the_command_codes_are_the_venues_own_numbers() {
     }
 }
 
-/// The numbers the candle wire writes into a frame are the design's own, and the
-/// period table is the venue's rather than arithmetic on an interval's name.
 #[test]
 fn the_candle_wires_own_numbers_are_the_designs() {
     assert_eq!(SUB_TYPE_QUOTE, 1, "QUOTE is the subscription's first type");
@@ -550,15 +489,6 @@ fn the_candle_wires_own_numbers_are_the_designs() {
     assert_eq!(LongbridgeSession::of(-1), None);
 }
 
-/// Every period the venue publishes maps to one interval and back, with the venue's
-/// own numbers pinned one by one.
-///
-/// The 18 values are written out here rather than read from a list the production code
-/// also holds, because a table that asserted itself would pin nothing: a period whose
-/// number moved would move in both halves of the assertion. The `TimeFrame` side is
-/// read back through [`LongbridgePeriod::of`], so the two directions are checked
-/// against one another, and the intervals the venue publishes no period for are
-/// asserted `None` beside it.
 #[test]
 fn the_period_table_is_the_venues_own_in_both_directions() {
     let table = [
@@ -612,9 +542,6 @@ fn the_period_table_is_the_venues_own_in_both_directions() {
     );
 }
 
-/// The intervals this crate has and the venue has no period for are stated rather
-/// than defaulted: `Second1` is finer than the venue's finest, and the rest are
-/// intervals its table does not carry at all.
 #[test]
 fn the_intervals_the_venue_publishes_no_period_for_are_named() {
     for timeframe in [

@@ -1,9 +1,3 @@
-//! Hyperliquid wallet-monitor requests and their native payloads.
-//!
-//! The position a wallet request reads is the one its `WalletTarget`
-//! name: a public address read never resolves a trading credential, and a
-//! route-level stream carries no address at all.
-
 use market_participants_model::{
     asset::AssetId,
     decimal::{Price, ProfitOrLoss, Quantity, SignedQuantity, UnixMillis},
@@ -18,35 +12,13 @@ use crate::{
     protocol::WalletTarget,
 };
 
-/// Hyperliquid wallet query identity.
-///
-/// This is a runtime request, not a wire payload: the adapter encodes its own
-/// subscription body from the query, so the type carries no serde derive at all. That is
-/// also what keeps `decoding_routes` unrepresentable as empty — deserialization would be
-/// the one way past the constructors that refuse an empty set, and there is none. If a
-/// query ever does need to travel as data, the boundary has to refuse an empty set too.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HyperliquidWalletQuery {
     pub target: WalletTarget,
-    /// The routes whose published catalogs may decode this query's answer.
-    ///
-    /// `target` decides what is validated and where the request goes; this set decides
-    /// which catalog an answered row is resolved against. They are not the same set:
-    /// `userFills`, `userNonFundingLedgerUpdates`, `historicalOrders` and
-    /// `fastAssetCtxs` are venue-wide reads — their wire requests name no scope — and
-    /// their rows are the coins of every scope the venue serves. A reader that monitors
-    /// several routes therefore hands over all of them, and a row is decoded with the
-    /// catalog of the route its own listing belongs to.
-    ///
-    /// Never empty, and always names `target`'s own route: a query is built through the
-    /// constructors below, which cannot express anything else. The field is private for
-    /// exactly that reason — a query that named no route would read a venue-wide answer
-    /// and resolve every row of it to nothing.
     decoding_routes: Vec<VenueRoute>,
 }
 
 impl HyperliquidWalletQuery {
-    /// Builds a query about one public wallet address on one route.
     pub fn public(route: VenueRoute, address: WalletAddress) -> Self {
         Self {
             target: WalletTarget::Public {
@@ -57,18 +29,6 @@ impl HyperliquidWalletQuery {
         }
     }
 
-    /// Builds a query about one public wallet address decoded by several routes.
-    ///
-    /// The request is addressed to the first route — its validation and transport are
-    /// what the query uses — while the whole set is what the answer is decoded with.
-    /// The set is the caller's monitored routes rather than the addressed route alone:
-    /// one address is read once per data kind, and an answered row belongs to whichever
-    /// route published its listing.
-    ///
-    /// # Errors
-    ///
-    /// An empty set is refused: a query with nothing to decode against would read an
-    /// answer and publish no row of it.
     pub fn public_across(
         decoding_routes: Vec<VenueRoute>,
         address: WalletAddress,
@@ -84,14 +44,6 @@ impl HyperliquidWalletQuery {
         })
     }
 
-    /// Builds a route-level query decoded by several routes.
-    ///
-    /// A route-level read is the venue-wide one — the fast asset contexts — so the set
-    /// is what its payloads are decoded with, exactly as for a public address read.
-    ///
-    /// # Errors
-    ///
-    /// An empty set is refused, for the same reason as [`Self::public_across`].
     pub fn route_level_across(decoding_routes: Vec<VenueRoute>) -> Result<Self, ModelError> {
         let Some(route) = decoding_routes.first().cloned() else {
             return Err(ModelError::EmptyCollection {
@@ -104,33 +56,22 @@ impl HyperliquidWalletQuery {
         })
     }
 
-    /// Returns the routes this query's answer is decoded with.
     pub fn decoding_routes(&self) -> &[VenueRoute] {
         &self.decoding_routes
     }
 
-    /// Returns the route this query reads.
     pub fn route(&self) -> &VenueRoute {
         self.target.route()
     }
 
-    /// Returns the wallet-monitor target this query reads.
     pub const fn wallet_target(&self) -> &WalletTarget {
         &self.target
     }
 }
 
-/// A bounded Hyperliquid user-fills window.
-///
-/// Like [`HyperliquidWalletQuery`], this is a runtime request rather than a wire payload
-/// and carries no serde derive: that is what keeps its route set unrepresentable as empty.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HyperliquidUserFillsByTimeQuery {
     pub target: WalletTarget,
-    /// The routes whose published catalogs may decode this window's answer, on the same
-    /// terms as [`HyperliquidWalletQuery::decoding_routes`]: a fills window is a
-    /// venue-wide read, so every monitored route's listings may appear in it. Private for
-    /// the same reason — only the constructor below builds one.
     decoding_routes: Vec<VenueRoute>,
     pub start_timestamp: UnixMillis,
     pub end_timestamp: UnixMillis,
@@ -139,15 +80,6 @@ pub struct HyperliquidUserFillsByTimeQuery {
 impl HyperliquidUserFillsByTimeQuery {
     pub const MAX_WINDOW_MILLIS: UnixMillis = 6 * 60 * 60 * 1_000;
 
-    /// Builds a window about one public wallet address decoded by several routes.
-    ///
-    /// As in [`HyperliquidWalletQuery::public_across`], the request is addressed to the
-    /// first route and the whole set decodes the answer.
-    ///
-    /// # Errors
-    ///
-    /// An empty set is refused: a window with nothing to decode against would read an
-    /// answer and publish no row of it.
     pub fn for_routes(
         decoding_routes: Vec<VenueRoute>,
         address: WalletAddress,
@@ -189,23 +121,19 @@ impl HyperliquidUserFillsByTimeQuery {
         Ok(())
     }
 
-    /// Returns the routes this window's answer is decoded with.
     pub fn decoding_routes(&self) -> &[VenueRoute] {
         &self.decoding_routes
     }
 
-    /// Returns the route this window reads.
     pub fn route(&self) -> &VenueRoute {
         self.target.route()
     }
 
-    /// Returns the wallet-monitor target this query reads.
     pub const fn wallet_target(&self) -> &WalletTarget {
         &self.target
     }
 }
 
-/// One spot balance of a monitored wallet, in its own token.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidSpotBalance {
     pub coin: AssetId,
@@ -213,17 +141,11 @@ pub struct NativeHyperliquidSpotBalance {
     pub hold: SignedQuantity,
 }
 
-/// The spot state of one monitored wallet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidSpotState {
     pub balances: Vec<NativeHyperliquidSpotBalance>,
 }
 
-/// One spot pair a Hyperliquid route publishes.
-///
-/// The pair is metadata about a route's token namespace, not about one tradable
-/// listing: `asset_id` is the venue's asset index and the listing key is what
-/// carries the tradable identity.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidSpotPair {
     pub coin: market_participants_model::identifier::IdentifierValue,
@@ -232,7 +154,6 @@ pub struct NativeHyperliquidSpotPair {
     pub asset_id: market_participants_model::listing::venue::HyperliquidAssetId,
 }
 
-/// One fast asset context of a route-level stream.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidAssetContext {
     pub listing: VenueListingKey,
@@ -240,7 +161,6 @@ pub struct NativeHyperliquidAssetContext {
     pub mid_price: Option<Price>,
 }
 
-/// One perpetual position of a monitored wallet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidPerpetualPosition {
     pub listing: VenueListingKey,
@@ -254,13 +174,11 @@ pub struct NativeHyperliquidPerpetualPosition {
     pub funding_since_open: ProfitOrLoss,
 }
 
-/// The perpetual state of one monitored wallet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidPerpetualState {
     pub positions: Vec<NativeHyperliquidPerpetualPosition>,
 }
 
-/// One open order of a monitored wallet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidOpenOrder {
     pub listing: VenueListingKey,
@@ -274,7 +192,6 @@ pub struct NativeHyperliquidOpenOrder {
     pub order_id: market_participants_model::identifier::IdentifierValue,
 }
 
-/// One historical order of a monitored wallet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidHistoricalOrder {
     pub listing: VenueListingKey,
@@ -283,13 +200,11 @@ pub struct NativeHyperliquidHistoricalOrder {
     pub price: Price,
     pub kind: OrderKind,
     pub reduce_only: bool,
-    /// The venue's own order-state label, which is not one of [`OrderStatus`]'s.
     pub status: market_participants_model::identifier::IdentifierValue,
     pub timestamp: UnixMillis,
     pub order_id: market_participants_model::identifier::IdentifierValue,
 }
 
-/// One fill of a monitored wallet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidUserFill {
     pub address: WalletAddress,
@@ -301,7 +216,6 @@ pub struct NativeHyperliquidUserFill {
     pub start_position: SignedQuantity,
     pub closed_pnl: ProfitOrLoss,
     pub fee: ProfitOrLoss,
-    /// The asset the fee was charged in.
     pub fee_asset: AssetId,
     pub hash: Option<market_participants_model::identifier::IdentifierValue>,
     pub tid: u64,
@@ -309,13 +223,11 @@ pub struct NativeHyperliquidUserFill {
     pub direction: Option<crate::account::shared::HyperliquidFillDirection>,
 }
 
-/// One ledger event of a monitored wallet.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidLedgerEvent {
     pub address: WalletAddress,
     pub timestamp: UnixMillis,
     pub hash: market_participants_model::identifier::IdentifierValue,
-    /// The asset the entry is denominated in, when it names one.
     pub coin: Option<AssetId>,
     pub kind: market_participants_model::identifier::IdentifierValue,
     pub amount: Option<SignedQuantity>,
@@ -334,14 +246,12 @@ pub enum HyperliquidTransferDirection {
     Outgoing,
 }
 
-/// One liquidated position of a ledger event.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NativeHyperliquidLiquidatedPosition {
     pub listing: VenueListingKey,
     pub size: SignedQuantity,
 }
 
-/// One update of a Hyperliquid wallet stream.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NativeHyperliquidWalletUpdate {
     #[serde(rename = "user_fills")]
@@ -388,8 +298,6 @@ mod tests {
             .expect("the fixture address is valid")
     }
 
-    /// A query with nothing to decode against is refused instead of reading an answer and
-    /// publishing no row of it.
     #[test]
     fn a_wallet_query_without_a_decoding_route_is_refused() {
         assert_eq!(
@@ -412,8 +320,6 @@ mod tests {
         );
     }
 
-    /// A multi-route query is addressed to its first route — the one whose validation and
-    /// transport it uses — and decodes with every route it was given.
     #[test]
     fn a_multi_route_query_is_addressed_to_its_first_route() {
         let core = route("core-perp");
@@ -436,7 +342,6 @@ mod tests {
         assert_eq!(contexts.decoding_routes(), routes.as_slice());
     }
 
-    /// A single-route query decodes with that route alone.
     #[test]
     fn a_single_route_query_decodes_with_its_own_route() {
         let core = route("core-perp");

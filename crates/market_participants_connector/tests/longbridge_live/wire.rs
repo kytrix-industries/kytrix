@@ -1,16 +1,6 @@
-//! What the venue's wire is made of, as this suite reads and writes it.
-//!
-//! The codec is restated here rather than reused: the adapter's framing is crate-private,
-//! and the facts these cases assert are the venue's own answers, so the frames and the
-//! length identities are this suite's own reading of §4.2.
-
 use bytes::{BufMut as _, Bytes, BytesMut};
 use flate2::read::GzDecoder;
 use prost::Message as _;
-
-// ---------------------------------------------------------------------------
-// The venue's own numbering, restated here so the suite sends what the design says.
-// ---------------------------------------------------------------------------
 
 pub const PACKAGE_TYPE_REQUEST: u8 = 1;
 pub const PACKAGE_TYPE_RESPONSE: u8 = 2;
@@ -42,53 +32,36 @@ pub const DIRECTION_FORWARD: i32 = 1;
 pub const SUBSCRIPTION_REFUSAL: &str = "the venue refused the subscription";
 pub const LOGIN_REFUSAL: &str = "the venue refused the login";
 
-/// One decoded inbound frame, together with the bytes it arrived as.
 #[derive(Clone)]
 pub struct Inbound {
-    /// The raw frame, as the socket delivered it.
     pub frame: Bytes,
-    /// What the first byte of the frame said.
     pub header: u8,
     pub command_code: u8,
-    /// The id a response echoes, and nothing for a push.
     pub request_id: Option<u32>,
-    /// The status a response carries, and nothing for a push.
     pub status: Option<u8>,
-    /// The body length the frame's own length field stated.
     pub declared_body_len: usize,
-    /// The body, after decompression when the header asked for it.
     pub body: Bytes,
 }
 
-/// What every inbound frame of one socket measured.
 #[derive(Default)]
 pub struct FrameStats {
     pub responses: usize,
     pub pushes: usize,
-    /// How many inbound frames had the gzip bit set (§14.1 item 9).
     pub gzip: usize,
-    /// How many inbound frames had the verify bit set (§14.1 item 10).
     pub verify: usize,
-    /// How many frames stated a body length other than the bytes that arrived.
     pub length_mismatches: Vec<String>,
-    /// How many inbound frames carried a packet type this build does not read.
     pub unknown_types: Vec<u8>,
 }
 
-/// The failure one frame or one market participant reported.
 #[derive(Debug)]
 pub enum Failure {
-    /// The socket could not be dialled or read.
     Transport(String),
-    /// The venue refused a request, stating its own code and message.
     Refused {
         command: u8,
         code: u64,
         message: String,
     },
-    /// The body of a frame this build expected to read was not readable.
     Malformed(String),
-    /// The venue's answer stated a fact the design says it cannot.
     Fact(String),
 }
 
@@ -112,7 +85,6 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
-/// Encodes one request frame (§4.2).
 pub fn encode_request(
     command_code: u8,
     request_id: u32,
@@ -131,16 +103,10 @@ pub fn encode_request(
     frame.freeze()
 }
 
-/// Reads the three-byte big-endian body length of one frame.
 fn body_length(field: &[u8]) -> usize {
     (usize::from(field[0]) << 16) | (usize::from(field[1]) << 8) | usize::from(field[2])
 }
 
-/// Decodes one inbound frame, decompressing a gzip body.
-///
-/// The strictness is the point: a response frame is exactly `10 + body_len` bytes
-/// and a push frame exactly `5 + body_len`, so a frame of any other length is
-/// recorded as a mismatch rather than silently accepted.
 pub fn decode_inbound(frame: Bytes, stats: &mut FrameStats) -> Result<Inbound, Failure> {
     let header = *frame
         .first()
@@ -204,11 +170,6 @@ pub fn decode_inbound(frame: Bytes, stats: &mut FrameStats) -> Result<Inbound, F
     })
 }
 
-/// Reads the request id a response frame answers.
-///
-/// A push frame carries its body length where a response carries its id, so the
-/// packet type bits are what decide — the same rule the adapter's own extractor
-/// states (§4.2), restated here so the case can measure it on this build's frames.
 pub fn extract_response_id(data: &[u8]) -> Option<u64> {
     if data.len() < 6 || data[0] & HEADER_TYPE_MASK != PACKAGE_TYPE_RESPONSE {
         return None;
@@ -218,7 +179,6 @@ pub fn extract_response_id(data: &[u8]) -> Option<u64> {
     ])))
 }
 
-/// Decodes the venue's refusal body, when a failed answer carries one.
 pub fn refusal(body: &Bytes) -> (u64, String) {
     match longbridge_proto::Error::decode(body.as_ref()) {
         Ok(error) => (error.code, error.msg),
@@ -226,7 +186,6 @@ pub fn refusal(body: &Bytes) -> (u64, String) {
     }
 }
 
-/// One request frame decoded back, as the round-trip case measures it.
 pub fn measure_round_trip() -> Vec<String> {
     let mut lines = Vec::with_capacity(4);
     let cases: [(u8, u32, &[u8]); 4] = [
@@ -275,9 +234,6 @@ pub fn measure_round_trip() -> Vec<String> {
             frame.len()
         ));
     }
-    // The id extractor is the one function the connection layer is handed, and it
-    // must answer for a response and stay silent for a push — the two frames carry
-    // different fields at the same offset.
     let response = encode_request(
         COMMAND_CODE_AUTH,
         7,

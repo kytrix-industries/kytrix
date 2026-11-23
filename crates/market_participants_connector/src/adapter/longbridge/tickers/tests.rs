@@ -1,15 +1,3 @@
-//! The unit tests of the ticker wire.
-//!
-//! They are a file of their own rather than a block inside the module because the module
-//! boundary is what they belong to, not the file: what they assert is what the wire sends
-//! and what it makes of a frame, and they reach every private item of it through `super::`.
-//!
-//! Two properties are what the whole file is about. The first is that a subscription's
-//! first event is the snapshot the wire itself pulled rather than a push the venue may or
-//! may not send. The second is that the venue's pushes state only the fields that changed,
-//! so a snapshot is what the merge of a push into the baseline makes it — and a case that
-//! only ever sent one push could not tell that merge from no merge at all.
-
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -41,25 +29,18 @@ use crate::{
     error::{AuthError, MarketParticipantError},
 };
 
-/// The one listing these fixtures are about, as the published catalogue resolves it.
 async fn listing() -> ResolvedListingRef {
     resolved_listing().await
 }
 
-/// The symbol the catalogue published for the fixture listing.
-///
-/// The wire reads it through the same function production reads it through, so a case
-/// that compared against a symbol spelled here would be comparing against itself.
 fn symbol_of(listing: &ResolvedListingRef) -> SmolStr {
     market_symbol(listing).expect("the fixture listing is a US equity of this venue")
 }
 
-/// One wire price, read the way the wire reads it.
 fn price(value: &str) -> Price {
     value.parse().expect("the fixture price is a decimal")
 }
 
-/// A session on the fixture venue, established the way the adapter establishes one.
 async fn session(
     context: &crate::adapter::ExecutionContext,
 ) -> std::sync::Arc<crate::adapter::longbridge::auth::LongbridgeSession> {
@@ -70,7 +51,6 @@ async fn session(
         .expect("the fixture venue authenticates the connection")
 }
 
-/// One complete quote of one symbol, as the venue publishes it.
 fn quote(symbol: &str) -> SecurityQuote {
     SecurityQuote {
         symbol: symbol.to_owned(),
@@ -89,10 +69,6 @@ fn quote(symbol: &str) -> SecurityQuote {
     }
 }
 
-/// One push of one symbol that states what the case wants it to state.
-///
-/// Every field is settable because that is the property under test: a push states the
-/// fields that changed and leaves the rest at their defaults.
 fn push(symbol: &str, sequence: i64) -> PushQuote {
     PushQuote {
         symbol: symbol.to_owned(),
@@ -112,7 +88,6 @@ fn push(symbol: &str, sequence: i64) -> PushQuote {
     }
 }
 
-/// One fixture whose quote command answers one complete quote of the fixture symbol.
 async fn fixture_serving(quotes: Vec<SecurityQuote>) -> LongbridgeFixture {
     LongbridgeFixture::install_with(
         TokenAnswer::granted("fixture-otp"),
@@ -124,7 +99,6 @@ async fn fixture_serving(quotes: Vec<SecurityQuote>) -> LongbridgeFixture {
     .await
 }
 
-/// The ticker one event carries.
 fn ticker_of(event: &ProtocolEvent) -> &NativeTicker {
     match event {
         ProtocolEvent::Ticker(ticker) => &ticker.data,
@@ -135,7 +109,6 @@ fn ticker_of(event: &ProtocolEvent) -> &NativeTicker {
     }
 }
 
-/// What one event is, for a failure that has to say what arrived instead.
 fn event_name(event: &ProtocolEvent) -> &'static str {
     match event {
         ProtocolEvent::Candlestick(_) => "a candle",
@@ -151,7 +124,6 @@ fn event_name(event: &ProtocolEvent) -> &'static str {
     }
 }
 
-/// Reads the first `count` events of one subscription, failing rather than hanging.
 async fn drain(
     handle: SubscriptionHandle,
     count: usize,
@@ -185,12 +157,6 @@ async fn drain(
     events
 }
 
-/// One quote pull answers every field of the venue's own quote, and it publishes no
-/// ordering marker because the pull command carries none.
-///
-/// The traded notional is read as the amount it is: its unit — the listing's quote asset
-/// — is attached one layer up, by the capability boundary that knows the listing's rules,
-/// so what this asserts is the number the venue stated.
 #[tokio::test]
 async fn a_pull_answers_the_venues_whole_quote() {
     let reference = listing().await;
@@ -231,9 +197,6 @@ async fn a_pull_answers_the_venues_whole_quote() {
     );
 }
 
-/// A pull the venue answered with no quote is a protocol failure rather than an empty
-/// answer: one request asked about one symbol, and a row built from nothing would show a
-/// price that belongs to no listing.
 #[tokio::test]
 async fn a_pull_without_a_quote_is_a_protocol_failure() {
     let reference = listing().await;
@@ -256,8 +219,6 @@ async fn a_pull_without_a_quote_is_a_protocol_failure() {
     );
 }
 
-/// A pull the venue answered about another symbol is a protocol failure: the answer is
-/// not this listing's, and drawing it would put one instrument's price on another's row.
 #[tokio::test]
 async fn a_pull_about_another_symbol_is_a_protocol_failure() {
     let reference = listing().await;
@@ -280,8 +241,6 @@ async fn a_pull_about_another_symbol_is_a_protocol_failure() {
     );
 }
 
-/// An account whose profile grants no US market data is refused before any quote frame
-/// exists, which is what the pull command's own place in the market-data set buys it.
 #[tokio::test]
 async fn a_pull_without_permission_is_refused_before_the_frame() {
     let fixture = LongbridgeFixture::install_with(
@@ -325,11 +284,6 @@ async fn a_pull_without_permission_is_refused_before_the_frame() {
     );
 }
 
-/// A subscription registers the symbol the catalogue published, asks for quotes alone and
-/// asks for no opening push, and it reads its baseline before the subscribe frame exists.
-///
-/// The order is the design's: a baseline the venue has not answered yet is not a baseline,
-/// so the pull is what the subscribe frame waits for.
 #[tokio::test]
 async fn a_subscription_pulls_its_baseline_and_then_registers() {
     let reference = listing().await;
@@ -341,8 +295,6 @@ async fn a_subscription_pulls_its_baseline_and_then_registers() {
     let handle = subscribe_ticker(&context, &session, &reference)
         .await
         .expect("the fixture answers the baseline and accepts the subscription");
-    // Dropping the handle is what releases the lease, which is when the venue is told to
-    // stop pushing; both directions are read back afterwards.
     drop(handle);
 
     fixture.await_command(codec::SUBSCRIBE).await;
@@ -382,9 +334,6 @@ async fn a_subscription_pulls_its_baseline_and_then_registers() {
     );
 }
 
-/// A baseline the venue refuses fails the whole subscription, and no subscribe frame is
-/// sent for it: a stream that could not be given a snapshot would be a stream whose first
-/// event depends on the market happening to be busy.
 #[tokio::test]
 async fn a_subscription_that_cannot_read_its_baseline_never_registers() {
     let reference = listing().await;
@@ -430,12 +379,6 @@ async fn a_subscription_that_cannot_read_its_baseline_never_registers() {
     );
 }
 
-/// The first event of a subscription is the snapshot the wire pulled, and it arrives
-/// without the venue pushing anything at all.
-///
-/// This is the case the two-field state exists for: a stream that only kept the merge
-/// baseline would have nothing to answer with until the venue sent a push, and a quiet
-/// market would leave it silent.
 #[tokio::test]
 async fn a_subscription_answers_its_baseline_before_any_push() {
     let reference = listing().await;
@@ -471,25 +414,11 @@ async fn a_subscription_answers_its_baseline_before_any_push() {
     );
 }
 
-/// A push states only the fields that changed, and the snapshot it produces is that push
-/// merged into the baseline.
-///
-/// All three frames are what makes this case discriminating. A frame that states only the
-/// last price leaves the volume at the decoded default of zero, which the correct merge
-/// carries over and a merge that took every field would zero — so the first frame is what
-/// tells "keep what was not stated" from "take everything". The second frame states a
-/// volume and nothing else, which is what tells the other direction: the correct merge
-/// adopts a volume that moved, and a merge that kept the baseline unconditionally would
-/// not. The third does the same for the text fields, whose "not stated" spelling is the
-/// empty string rather than a zero.
 #[tokio::test]
 async fn a_push_merges_into_the_baseline_rather_than_replacing_it() {
     let reference = listing().await;
     let symbol = symbol_of(&reference);
     let fixture = fixture_serving(vec![quote(&symbol)]).await;
-    // Every frame is queued before the subscription exists: the fixture delivers the
-    // queue once the subscribe frame arrives, so a case that queued one frame after
-    // reading another could not say when the venue sent it.
     let mut last_price_only = push(&symbol, 1);
     last_price_only.last_done = "106.00".to_owned();
     fixture.push_quote(&last_price_only);
@@ -559,10 +488,6 @@ async fn a_push_merges_into_the_baseline_rather_than_replacing_it() {
     assert_eq!(turnover_moved.monotonic_id, Some(3));
 }
 
-/// One connection publishes every subscription's frames to every subscription, so a quote
-/// of another symbol is not this subscription's and produces no event — while the next
-/// frame, which is this one's, is read normally. A stream that stopped at the foreign
-/// frame would be a stream that one other subscription could end.
 #[tokio::test]
 async fn another_symbols_push_is_skipped_and_the_stream_reads_on() {
     let reference = listing().await;
@@ -596,9 +521,6 @@ async fn another_symbols_push_is_skipped_and_the_stream_reads_on() {
     assert_eq!(ours.monotonic_id, Some(2));
 }
 
-/// A push of a command this build does not read is skipped in silence: the venue pushes
-/// its order book on the same connection, and a subscription that read it as a quote would
-/// be reading another command's body.
 #[tokio::test]
 async fn a_push_of_another_command_is_skipped() {
     let reference = listing().await;
@@ -628,8 +550,6 @@ async fn a_push_of_another_command_is_skipped() {
     );
 }
 
-/// A subscription the venue refuses ends the stream with the venue's own words: the
-/// subscribe answer is not a pending request, so this is the one place it is read.
 #[tokio::test]
 async fn a_refused_subscription_ends_the_stream_with_the_venues_own_words() {
     let reference = listing().await;
@@ -641,8 +561,6 @@ async fn a_refused_subscription_ends_the_stream_with_the_venues_own_words() {
     let handle = subscribe_ticker(&context, &session, &reference)
         .await
         .expect("the baseline is granted even though the subscription is refused");
-    // The subscribe frame is written by the connection's own actor rather than by the
-    // caller, so the refusal is set after the handle exists.
     fixture.serve_quotes(QuoteAnswer {
         status: 0,
         quotes: vec![quote(&symbol)],
@@ -681,9 +599,6 @@ async fn a_refused_subscription_ends_the_stream_with_the_venues_own_words() {
         ),
         "{error}"
     );
-    // The fixture answers the subscribe frame from the answer it holds when the frame
-    // arrives, so the refusal has to be in place before it is registered; the settled
-    // frame log is what says the frame did arrive.
     assert!(
         fixture.commands().contains(&codec::SUBSCRIBE),
         "the subscription was registered"

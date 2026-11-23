@@ -1,13 +1,3 @@
-//! paint pass：把节点树 + 样式 + 文本 + 自绘图元变成 `Scene` 的 lane 与 damage。
-//!
-//! 契约：
-//! - **一节点一 lane**（`Node.lane`，粘性保留）；
-//! - lane 内桶序 = 祖先 clip 前缀 → Shadow → 背景/渐变 → 边框 → 内容 → 祖先 clip 后缀；
-//! - 复用判据 = `REUSABLE` + lane 存在 + **clip 上下文一致**（`clip_key`，审查 B1 的守卫）
-//!   + **组不透明度戳一致**（E13：`StylePatch.opacity` 沿子树级联，父值变化必须重建整棵子树）；
-//! - 隐藏子树（自身/祖先 `display: none`）清空 lane、不产生像素、`clip_key` 置空（重新显示必重建）；
-//! - damage 按「节点级 + 图元级」双写（§6.6）。
-
 use std::{rc::Rc, sync::Arc};
 
 use smallvec::SmallVec;
@@ -39,61 +29,26 @@ use crate::{
     text::{InlineBoxPaint, ShapedLine, ShapedTextItem},
 };
 
-/// 一帧的 lane 重建/复用。字段是 crate 内可见（`pub(crate)` 结构的 `pub` 字段不触发 lint）。
 pub(crate) struct PaintPass<'a> {
     pub tree: &'a mut NodeTree,
-    /// 静态几何注册表：几何内容的 damage 用它自己的 AABB（`GeometryDesc.bounds`），
-    /// 而不是节点布局盒 —— 顶点可以在节点盒之外（`desc.bounds` 才是真实可见范围）。
     pub geometry: &'a crate::paint::geometry_store::GeometryStore,
     pub scene: &'a mut Scene,
     pub damage: &'a mut DamageAccumulator,
     pub scale: Scale,
-    /// 本帧 framebuffer 的物理矩形（`DamageAccumulator::finish` 的面积阈值用）。
     pub frame: PhysicalRect,
-    /// 本帧的 lane 绘制序（复用调用方的容量）。
     pub order: &'a mut Vec<LaneId>,
-    /// 本帧的焦点节点（画 `Style.focus_ring`；`None` = 无焦点）。
     pub focused: Option<NodeId>,
-    /// 本帧的字形图集（`Some` = 绘制前硬校验 + 编码期逐 tile 存活校验；`None` = 无 App 的
-    /// headless/测试路径跳过）。
-    ///
-    /// D-5：`ShapedLine` 里的 `AtlasTile`/UV 是生成时的快照。若图集已换代而该行未被重排，
-    /// 继续编码就是画旧 UV（整窗花字）。这里把「行代际 == 当前代际」变成绘制前硬校验：
-    /// 不匹配的行**本帧不编码**，节点收进 [`PaintReport::stale_text`]，由 `App::frame` 在提交后
-    /// 重新入队（下一帧补齐）。
-    ///
-    /// E1d（F15 方案①）：Canvas 内已经写入的 tile 用 [`AtlasAllocator::is_alive`] 逐 tile 校验
-    /// （代际 + 槽位分配身份），把「逐 tile 淘汰不换代」这类失效也拦在编码前。
     pub atlas: Option<&'a AtlasAllocator>,
-    /// 图片资源缓存（v2.1 E2）：`InlineBoxPaint::Image` 在 paint 阶段解析
-    /// `ResourceId → ResourceImage.tile`（`§11.2`）。`None` = 无 App 的 headless/测试路径：
-    /// 带图片声明的行内盒**跳过**（不画占位图）并计入 `PaintReport::skipped_inline_images`。
     pub resources: Option<&'a ResourceCache>,
-    /// 本帧的**滚动槽表**（槽位 → （逻辑滚动位移，物理视口））。
-    ///
-    /// 全量路径每帧重写它：下标 0 恒是「不随滚动偏移」的哨兵（偏移 0、零面积视口），
-    /// 滚动容器按绘制序依次占 1..。槽位编号在树结构不变时**逐帧稳定**，因此滚动容器
-    /// 的 lane 不需要因为滚动而重建（`Lane::scroll` 参与复用判据）。
-    ///
-    /// 增量路径**不重写**（结构未变 ⇒ 编号稳定）：只把被访问滚动容器的偏移 / 视口写回
-    /// 缓存槽位（`NodeTree::scroll_slot_cached`），必要时追加新槽。
     pub scroll_slots: &'a mut Vec<(Point, PhysicalRect)>,
-    /// 与 `scroll_slots` 平行的「槽位 → 容器节点」（下标 i ⇒ 槽位 i + 1）。消费者：纯滚动帧
-    /// 的快路径（`window/paint.rs`）据它把偏移刷进槽位表，不必重新遍历树。
     pub scroll_slot_nodes: &'a mut Vec<NodeId>,
-    /// lane 重建/复用记录（仅 `test-support`）。
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
 }
 
-/// paint 遍历的两种路径（A1：脏子树剪枝的「双路径」）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaintMode {
-    /// 全量 DFS：访问每个节点、重建绘制序、重建滚动槽表（首帧 / 结构变化 / 全帧 damage /
-    /// 脏节点状态无法增量处理时的兜底）。
     Full,
-    /// 增量 DFS：只访问 `mark_paint_closure` 的脏闭包（非 reusable 节点会保守展开整棵子树，
-    /// 以覆盖 clip / 隐藏上下文的传播），不 push 绘制序，滚动槽按缓存编号写回。
     Incremental,
 }
 
@@ -103,73 +58,37 @@ impl PaintMode {
     }
 }
 
-/// 一次 paint 的产物。
 pub(crate) struct PaintReport {
     pub rebuilt: usize,
     pub damage: DamageSummary,
-    /// D-5：因「行代际 ≠ 当前图集代际」而**未编码**的文本节点（本帧不画旧 UV）。
-    ///
-    /// 消费者：`App::frame` 在 `commit_frame` 之后逐节点 `mark_text_layout_dirty + mark_paint`
-    /// 并请求下一帧（下一帧的 `layout_text` 用当前代际重光栅）。
     pub stale_text: SmallVec<[NodeId; 4]>,
-    /// D-5 的 canvas 半边（v2.1 E1b + E1d）：因含**已失效 `AtlasTile`**（整页换代，或逐 tile
-    /// LRU 淘汰后 tile 已被复用）而**未编码**的 `GlyphRun` 数（Canvas 内文本）。
-    ///
-    /// Canvas 内容归应用所有，引擎无法自动重建：这里只止损（不画旧 UV，少字优于花字）并计数。
-    /// 应用义务：发现句柄 `is_stale()` 后重新 `shape_text` 并用新句柄重建 Canvas。消费者：
-    /// `App::frame`（压 [`crate::text::TextDiagnostic::CanvasTextStale`]）与
-    /// `test_support::record::FrameRecord::stale_canvas_runs`（帧记录）。
     pub stale_canvas_runs: usize,
-    /// v2.1 E2（`§11.2`）：行内盒图片因资源未加载 / 已卸载而被**跳过**的 `InlineBoxSpec::id`
-    /// （本帧不画占位图）。消费者：`App::frame` 压 `TextDiagnostic::InlineBoxImageMissing`；
-    /// 测试直接断言该列表。
     pub skipped_inline_images: SmallVec<[u64; 4]>,
-    /// 本帧编码出的实例数（仅 `test-support`；`Window::paint_frame` 编码后回填）。
     #[cfg(feature = "test-support")]
     pub instances: usize,
-    /// 本帧**重编码**的 lane 数（增量实例编码的断言面；`0` = 全部段都复用）。
     #[cfg(feature = "test-support")]
     pub encoded_lanes: usize,
-    /// 本帧整段复用的 lane 段数。
     #[cfg(feature = "test-support")]
     pub reused_segments: usize,
-    /// 本帧重编码写入实例环的字节数（增量上传量的编码器侧值）。
     #[cfg(feature = "test-support")]
     pub uploaded_bytes: usize,
-    /// 本帧重编码的几何块 op 数（X5：K 线追加应恒为 1）。
     #[cfg(feature = "test-support")]
     pub geometry_encoded_chunks: usize,
-    /// 本帧 GPU 侧实际上传的几何字节数（X5；渲染器路径回填，headless 恒 0）。
     #[cfg(feature = "test-support")]
     pub geometry_uploaded_bytes: usize,
-    /// 本帧滚动偏移变化的槽数（`FrameStats::scroll_offset_frames` 的 inline 来源）。
     #[cfg(feature = "test-support")]
     pub scroll_slots: usize,
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
-    /// 本帧 `SceneDelta` 的结构快照（`Window::paint_frame` 在构建 delta 后回填）。
     #[cfg(feature = "test-support")]
     pub delta: crate::test_support::record::DeltaRecord,
 }
 
 impl PaintPass<'_> {
-    /// 执行整帧 paint（**全量路径**；唯一入口的消费者：`Window::paint_frame` 的帧分类）。
-    ///
-    /// # Errors
-    /// [`EngineError::ClipDepthExceeded`]：clip 嵌套超过 `MAX_CLIP_DEPTH`。release 也必须失败——
-    /// 静默丢弃最外层 clip 会让子内容越界可见（P06 二轮 / P14 审查）。
     pub(crate) fn run(&mut self) -> Result<PaintReport, EngineError> {
         self.execute(PaintMode::Full)
     }
 
-    /// 执行**增量路径**：只 DFS `mark_paint_closure` 的脏闭包（调用方已标记完成）。
-    ///
-    /// 与全量路径共用同一份节点状态逻辑（隐藏 / clip / 复用 / 重建 / 滚动槽），差异只有两点：
-    /// 不 push 绘制序（顺序不变时 `Scene::order` 整体保留，`delta.order` 因此是 `None`），
-    /// 以及新建 / 释放 lane 时用轻量 DFS 兜底重建绘制序。
-    ///
-    /// # Errors
-    /// 同 [`PaintPass::run`]。
     pub(crate) fn run_incremental(&mut self) -> Result<PaintReport, EngineError> {
         self.execute(PaintMode::Incremental)
     }
@@ -186,11 +105,8 @@ impl PaintPass<'_> {
         #[cfg(feature = "test-support")]
         let log = std::mem::take(&mut self.log);
         if mode.is_full() {
-            // 全量路径从零重建绘制序与滚动槽表；增量路径保留上一帧的两者（顺序 / 编号稳定）。
             order.clear();
             tree.begin_full_scroll_slots();
-            // 槽位 0 是「不随滚动偏移」的哨兵：`FrameOp::Instances.scroll = 0` 的 op 永远拿到
-            // 零偏移，因此不需要在绘制期判断「这个 op 是否在滚动容器里」。
             scroll_slots.clear();
             scroll_slots.push((Point::ZERO, PhysicalRect::new(0, 0, 0, 0)));
             scroll_slot_nodes.clear();
@@ -221,7 +137,6 @@ impl PaintPass<'_> {
         };
         let mut clip = ClipContext::default();
         let root = context.tree.root();
-        // 全量路径的根恒访问；增量路径的根只有在闭包里（= 有脏节点）时才访问。
         paint_node(
             &mut context,
             root,
@@ -237,8 +152,6 @@ impl PaintPass<'_> {
         match context.mode {
             PaintMode::Full => context.scene.set_order(context.order),
             PaintMode::Incremental if context.order_changed => {
-                // 绘制序成员变了（新建 / 释放 lane）：用轻量 DFS（只读 children + lane_of，
-                // 无 clip/damage 计算）重建，再让 `Scene::set_order` 与上一帧比较。
                 rebuild_order_only(context.tree, context.order);
                 context.scene.set_order(context.order);
                 context.tree.note_order_rebuild();
@@ -277,55 +190,38 @@ impl PaintPass<'_> {
     }
 }
 
-/// 一次遍历的借用包（避免 `&mut self` 与 `&self.tree` 的借用冲突）。
 struct PaintContext<'a> {
     geometry: &'a crate::paint::geometry_store::GeometryStore,
     tree: &'a mut NodeTree,
     scene: &'a mut Scene,
     damage: &'a mut DamageAccumulator,
     scale: Scale,
-    /// 本帧走全量还是增量路径（共享节点状态逻辑里唯一的分叉点）。
     mode: PaintMode,
     order: &'a mut Vec<LaneId>,
-    /// 滚动槽表（全量：本帧重写；增量：按缓存槽号写回，必要时追加）。
     scroll_slots: &'a mut Vec<(Point, PhysicalRect)>,
-    /// 槽位 → 容器节点（与 `scroll_slots` 平行，下标 i ⇒ 槽位 i + 1）。
     scroll_slot_nodes: &'a mut Vec<NodeId>,
     focused: Option<NodeId>,
-    /// 字形图集（D-5 绘制前硬校验 + E1d 编码期逐 tile 存活校验；`None` = headless/测试路径跳过）。
     atlas: Option<&'a AtlasAllocator>,
-    /// 行代际不匹配、本帧未编码的文本节点（D-5）。
     stale_text: SmallVec<[NodeId; 4]>,
-    /// Canvas 内含已失效 tile、本帧未编码的字形 run 数（D-5 的 canvas 半边，E1b/E1d）。
     stale_canvas_runs: usize,
-    /// 行内盒图片被跳过的 id（v2.1 E2，`§11.2`）。
     skipped_inline_images: SmallVec<[u64; 4]>,
-    /// 图片资源缓存（`InlineBoxPaint::Image` 解析；`None` = headless 路径跳过并记诊断）。
     resources: Option<&'a ResourceCache>,
     #[cfg(feature = "test-support")]
     log: PaintLog,
     rebuilt: usize,
-    /// 本帧做节点状态判定的节点数（`PaintCounters::visited_nodes` 的来源）。
     visited: usize,
-    /// 增量路径：本帧是否新建 / 释放过 lane（绘制序成员变化 ⇒ 需要兜底重建）。
     order_changed: bool,
-    /// 几何块 lane 重建工作区：旧的烘焙块状态（跨节点/帧复用容量；X5）。
     baked_scratch: SmallVec<[crate::node::tree::BakedGeometryChunk; 2]>,
-    /// 几何块 lane 重建工作区：本帧要重建哪些块（与块数等长）。
     rebuild_scratch: SmallVec<[bool; 8]>,
 }
 
-/// 屏幕 = 内容 − `total`；图元烘焙 = 内容 − (`total` − `slot_offset`)。
 fn offset_between(total: Point, slot_offset: Point) -> Point {
     Point::new(total.x - slot_offset.x, total.y - slot_offset.y)
 }
 
-/// 祖先 clip 链（外层在前）+ 物理 covering 交集。
 #[derive(Default)]
 struct ClipContext {
     rects: SmallVec<[ClipRect; 8]>,
-    /// 与 push 次数等长的回溯记录：`Some(prev)` = 这次 push 是折叠（`rects` 未增长，
-    /// 需要把栈顶矩形还原成 `prev`）；`None` = 正常压栈，`pop` 时弹掉 `rects` 末尾。
     pushed: SmallVec<[Option<ClipRect>; 8]>,
     covering: Option<PhysicalRect>,
 }
@@ -335,12 +231,6 @@ impl ClipContext {
         (self.rects.len() as u8, self.covering)
     }
 
-    /// 进入一个 `Clip::Bounds` 节点：按它的 **padding box** 裁剪子树。
-    ///
-    /// 深度达到 `MAX_CLIP_DEPTH` 时**折叠**为「与栈顶求交」而不是失败或丢弃（P2-7）：
-    /// 轴对齐矩形求交是**无损**的（两个矩形 clip 的复合就是它们的交集），而 `covering`
-    /// 本来就是全部矩形的交集。因此 8 层以上嵌套裁剪容器不需要牺牲精度、也不需要让整帧
-    /// 失败 —— 旧实现在这里返回 `ClipDepthExceeded`，8 层嵌套的滚动容器会白屏。
     fn push(&mut self, padding_box: Rect, scale: Scale) {
         let clip = ClipRect {
             rect: padding_box,
@@ -351,8 +241,6 @@ impl ClipContext {
             let previous = *last;
             last.rect = last.rect.intersect(clip.rect);
             last.corner_radius = [0.0; 4];
-            // 回溯时要把求交前的矩形还原，否则父层的 clip 会被子层的矩形永久收窄
-            // （兄弟子树就会被过度裁剪）。
             self.pushed.push(Some(previous));
             self.rebuild_covering(scale);
             return;
@@ -390,60 +278,22 @@ impl ClipContext {
     }
 }
 
-/// 节点要画的内容（读取阶段复制出来，随后释放 `&Node` 借用）。
 enum Content {
     Box,
     Text(Option<Rc<ShapedLine>>),
     Canvas(Arc<crate::paint::canvas::Canvas>),
-    /// E7：图片节点载荷（资源来源 + fit + 调制）。
     Image(ImageContent),
 }
 
-/// 该内容是否会产生图元（决定要不要为它压一层内容 clip）。
-///
-/// `rebuild_lane` 的 clip 深度校验与 `PrimitiveEmitter::emit_content` 必须用**同一个**
-/// 判据，否则两处对「这一层占不占深度」的判断不一致。
 fn content_needs_clip(content: &Content) -> bool {
     match content {
         Content::Box => false,
         Content::Text(line) => line.is_some(),
         Content::Canvas(_) => true,
-        // 图片的图元恒落在节点盒内（Contain 内嵌 / Cover 用 UV 裁切而不是溢出 + clip），
-        // 不占 clip 深度。后果（§11.8 R-20）：图片按 border box 绘制、不内缩 padding/border，
-        // 节点自身有 border 时图片会盖住边框，且 `Clip::Bounds` 不作用于图片内容。
         Content::Image(_) => false,
     }
 }
 
-/// 绘制一棵子树。
-///
-/// 两个偏移（**滚动合成端偏移的核心约定**，见 `render/delta.rs` 的 [`ScrollTable`]）：
-/// - `total`：祖先滚动位移的**完整**累计值（屏幕 = 内容 − total）。damage / clip 上下文 /
-///   滚动视口都用它 —— 它们必须留在屏幕坐标里；
-/// - `slot_offset`：**最近一个滚动容器**（本子树所属滚动槽）自己的位移。图元烘焙时把它扣掉，
-///   于是「滚动这个容器」不改变烘焙字节 ⇒ 不重建 lane、不重编码（`frame.params.yz` 在绘制期
-///   把它加回去）。
-///
-/// `slot` 是本子树所属的滚动槽编号（0 = 不随滚动偏移；`Scene` 的 lane 记录它，编码器据此
-/// 生成 `FrameOp::Instances.scroll`）。
-///
-/// `boundary` 是该槽位的**视口 clip 深度**：`clip.rects[..boundary]` 是「滚动容器之外」的裁剪
-/// 链（含容器自己的 padding box）——它们**不**进 lane 的裁剪链（屏幕固定、随滚动在内容坐标里
-/// 移动，烘焙进去就等于每滚一像素都要重编码全部 lane），改由槽位的屏幕裁剪区在绘制期做
-/// 每 op scissor（`FramePayload::scroll_clip`）。
-///
-/// `inherited_opacity` 是祖先链累计的组不透明度（不含本节点补丁；根恒 `1.0`，E13）：本节点
-/// 的有效值 = 它 × 自身补丁，乘进每个图元并传给子节点；有效值变化会因 `paint_opacity` 戳失配
-/// 重建本节点 lane，且本节点因此不可复用 ⇒ 子树被 `expand` 覆盖、逐级失配重建。
-///
-/// [`ScrollTable`]: crate::render::delta::ScrollTable
-///
-/// # 增量剪枝（A1）
-///
-/// `force` = 本节点所在的子树被「必须完整访问」的口径覆盖：全量路径恒真；增量路径的根为假，
-/// 但从**非 reusable** 节点向下递归时置真（该节点的 clip 上下文 / 隐藏状态可能变化，整棵子树
-/// 都可能需要重建 —— 这是唯一需要保守展开的地方）。未被覆盖且不在脏闭包里的节点整棵跳过，
-/// 它上一帧的 lane / 缓存保持不变（它们本来就是 reusable 的）。
 fn paint_node(
     context: &mut PaintContext<'_>,
     node: NodeId,
@@ -460,17 +310,6 @@ fn paint_node(
         return Ok(());
     }
     context.visited += 1;
-    // 一次取全本节点的只读状态（不可见 / 复用判据 / lane / 子节点数 / clip 盒 / 滚动偏移）。
-    //
-    // 不可见的**定义只有一处**：`display: none` 或 `visible: false`。命中测试、焦点遍历、
-    // a11y 都用同一规则，并且都按「隐藏整棵子树」处理；旧实现的 paint 只对 `display: none`
-    // 隐藏子树，`visible: false` 仅跳过本节点自身的图元 —— 于是容器的背景消失、子控件仍然
-    // 画出来，而那些子控件在命中测试里是不可见的（「看得见但点不动」的死像素，P2-3.2）。
-    //
-    // 复用判据（§5.6 + P10 §7.6）：`REUSABLE` + clip 上下文一致 + **烘焙偏移戳一致**（祖先滚动会
-    // 移动全部后代图元，因此偏移变化必须重建；滚动**本槽**不改变烘焙偏移 ⇒ 不重建）+
-    // **组不透明度戳一致**（E13：有效值 = 祖先链 × 自身补丁，变了就要重乘整棵子树的图元）。
-    // **不要求** lane 存在：从未产生图元的节点没有 lane，但它的 `clip_key` 已写回，仍可整帧跳过。
     let current_key = clip.key();
     let Some(state) = context.tree.paint_state(
         node,
@@ -485,24 +324,18 @@ fn paint_node(
         hide_subtree(context, node, clip, total);
         return Ok(());
     }
-    // 自绘节点（几何 / Canvas）必须留在屏幕坐标：`FrameOp::Geometry` 没有滚动槽、Canvas 图元
-    // 也不参与合成端平移（应用给的是绝对坐标）。它们照旧每次滚动都整条重建 —— 正确性优先。
     let (node_slot, node_slot_offset) = if state.screen_baked {
         (0, Point::ZERO)
     } else {
         (slot, slot_offset)
     };
-    // 复用判据里的槽位一致：树结构变化会重新编号槽位（段的归属变了 ⇒ 必须重编码）。
     let reusable = state.reusable
         && state
             .lane
             .is_none_or(|lane| context.scene.lane_scroll(lane) == node_slot);
     if let Some(geometry) = state.geometry {
-        // 几何节点：按块 lane 重建（X5）。数据 range 更新只把受影响块的版本推进，因此这里
-        // 只重建版本变化的块 lane —— 追加 K 线只重建尾块，热力图改色只重建受影响块。
         paint_geometry_node(context, node, &state, geometry, clip, total, state.opacity)?;
     } else if reusable {
-        // 增量路径不 push 绘制序：顺序没变（结构未变、lane 成员未变），`Scene::order` 整体保留。
         if context.mode.is_full()
             && let Some(lane) = state.lane
         {
@@ -534,22 +367,12 @@ fn paint_node(
         )?;
     }
 
-    // B1：0×0 的 padding box **也要入栈**（depth+1、covering 交空）——子 lane 由此带空前缀、
-    // damage 全部被裁空，与 `hit_test` 的 clip 链语义一致；跳过它会让子内容"越界可见"。
     let child_count = state.children;
     let clip_bounds = state.clip_bounds;
     if let Some(padding_box) = clip_bounds {
-        // 深度上限由 `ClipContext::push` 自己处理：达到上限时与栈顶矩形求交（无损），
-        // 既不失败也不丢弃（P2-7）。
         clip.push(padding_box, context.scale);
     }
 
-    // 本节点是滚动容器 ⇒ 给它的子树分配一个槽位，并把「本槽位移」从现在起从烘焙里扣掉。
-    // 全量路径按绘制序**稠密编号**并写进节点缓存（树不变 ⇒ 逐帧稳定）；增量路径读缓存编号，
-    // 不重排已有槽位（已烘焙进 lane 的槽号不能动），缓存缺失时追加新槽。
-    // 槽位的**屏幕裁剪区**是「容器 padding box 与全部祖先 clip 的交集」（= 刚 push 完之后的
-    // covering），它同时是滚动 damage 与 GPU 侧该槽全部 op 的 scissor —— 因此滚动容器的视口
-    // clip 不再进 lane 的裁剪链。
     let mut child_total = total;
     let mut child_slot = node_slot;
     let mut child_slot_offset = node_slot_offset;
@@ -565,11 +388,8 @@ fn paint_node(
         child_total = Point::new(total.x + own.x, total.y + own.y);
         child_slot = index;
         child_slot_offset = own;
-        // 视口 clip 已经「花掉」：子树看到的 `clip.rects[..boundary]` 全部由屏幕裁剪区承担。
         child_boundary = clip.rects.len();
     }
-    // 非 reusable 的节点会让整棵子树的 clip 上下文 / 隐藏状态 / 组不透明度与上一帧不同 ⇒
-    // 增量路径保守展开（全量路径本来就访问全部子节点）。
     let expand = context.mode.is_full() || !reusable;
     for index in 0..child_count {
         let child = match context.tree.get(node) {
@@ -595,10 +415,6 @@ fn paint_node(
     Ok(())
 }
 
-/// 本节点的滚动槽：全量路径稠密编号并缓存；增量路径复用缓存（缺失时追加新槽，不重排）。
-///
-/// 增量路径的「追加」是槽位表**只增不乱**的唯一语义：已烘焙进 lane 的槽号必须保持不变，
-/// 隐藏容器留下的旧槽（没有 lane 引用）留在表里无害；下一次全量路径会重新稠密编号。
 fn scroll_slot_for(
     context: &mut PaintContext<'_>,
     node: NodeId,
@@ -619,8 +435,6 @@ fn scroll_slot_for(
             context.scroll_slot_nodes[parallel] = node;
         }
         _ => {
-            // 表比缓存短（只可能来自「恢复的缓存 + 被截短的表」，防御性追加）：
-            // 记一个新槽，保持 `scroll_slots.len() == scroll_slot_nodes.len() + 1` 的不变量。
             let index = u32::try_from(context.scroll_slots.len()).unwrap_or(u32::MAX);
             context.scroll_slots.push((offset, viewport));
             context.scroll_slot_nodes.push(node);
@@ -634,10 +448,6 @@ fn scroll_slot_for(
     cached
 }
 
-/// 增量路径的绘制序兜底：只读 `children` + `lane_of` 重建 DFS 先序（不碰 clip / damage / 图元）。
-///
-/// 触发条件：增量帧里新建或释放了 lane（绘制序成员变化）——这是唯一会让 `Scene::order` 变化
-/// 的增量情形（结构变化走全量路径）。隐藏节点不产生绘制输出，它们的空 lane 不进序。
 fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
     order.clear();
     let mut stack: SmallVec<[(NodeId, bool); 32]> = SmallVec::new();
@@ -649,10 +459,8 @@ fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
         let own_hidden = matches!(target.style().inner.display, taffy::style::Display::None)
             || target.style_patch().visible == Some(false);
         if parent_hidden || own_hidden {
-            // 隐藏子树：`hide_subtree` 已把它的 lane 清空，全量路径同样不会把它计入绘制序。
             continue;
         }
-        // 几何节点按块序 push 全部块 lane（X5：块间序 = 块序 = 索引顺序）；普通节点 0/1 条。
         for lane in target.lanes() {
             order.push(*lane);
         }
@@ -662,32 +470,22 @@ fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
     }
 }
 
-/// 隐藏子树：清空每条 lane（保留分配），并把旧像素并入 damage；`clip_key` 置空
-/// （再次显示时必然失配 ⇒ 重建，避免"复用空 lane"）。
-///
-/// `total` 是完整的祖先滚动位移（damage 是屏幕坐标）；隐藏子树不产生 lane，因此不需要烘焙偏移。
 fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext, total: Point) {
-    // AR5 P2-1：隐藏同样是"内容消失"——旧 lane 里的文本/Canvas 可见范围可能溢出节点盒，
-    // 必须先记下再清 lane，否则 `Clip::None` 的长文本隐藏后旧字形留在屏幕上。
     let previous_content = painted_content(context.tree, context.scene, node, context.scale);
     let (children, damage_rect, child_offset) = {
         let Ok(target) = context.tree.get(node) else {
             return;
         };
         let children: SmallVec<[NodeId; 4]> = target.children().iter().copied().collect();
-        // damage 与 bounds 都在**内容坐标**：先并集，再减祖先滚动偏移得到屏幕坐标（P10 §7.2）。
         let mut damage_rect = target
             .damage()
             .union(target.layout().bounds)
             .union(previous_content.content);
-        // 几何的可见范围可能超出节点布局盒：隐藏时也必须把 `desc.bounds` 并入
-        // damage，否则溢出部分留下旧像素（「damage 帧不清屏」会长期残留；复审 A3）。
         if let NodeKind::Geometry(id) = *target.kind()
             && let Some(snapshot) = context.geometry.snapshot_arc(id)
         {
             damage_rect = damage_rect.union(snapshot.bounds());
         }
-        // damage 与 bounds 都在**内容坐标**：先并集，再减祖先滚动偏移得到屏幕坐标（P10 §7.2）。
         let damage_rect = damage_rect.translate(negate(total));
         let child_offset = total
             + context
@@ -696,7 +494,6 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
                 .map_or(Point::ZERO, |slot| slot.offset);
         (children, damage_rect, child_offset)
     };
-    // 几何节点可能有多条块 lane（X5）：隐藏时全部清空（保留分配，再次显示时重建）。
     for index in 0..context.tree.lane_count(node) {
         let Some(lane) = context.tree.lane_at(node, index) else {
             continue;
@@ -708,9 +505,6 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
         if had_primitives {
             let _ = context.scene.clear_lane(lane);
             context.rebuilt += 1;
-            // 全量路径重建绘制序：清空内容但**保留 lane 分配**的节点仍占一个绘制序位置
-            // （GPU 侧据此把该段实例清掉）。增量路径的顺序沿用上一帧，该 lane 已经在序里
-            // （「有图元的 lane 必在绘制序里」是不变式）⇒ 不 push、也不算顺序变化。
             if context.mode.is_full() {
                 context.order.push(lane);
             }
@@ -737,12 +531,6 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
     }
 }
 
-/// 重建一条 lane（该节点本帧有变化 / 首次出现 / clip 或烘焙偏移失配）。
-///
-/// `total` = 完整祖先滚动位移（damage 用，屏幕坐标）；
-/// `slot` / `slot_offset` = 该 lane 的滚动槽位与**本槽自己的位移**（图元烘焙时扣掉它，
-/// 绘制期由 GPU 加回来；见 `paint_node` 的文档）；
-/// `opacity` = 本节点的有效组不透明度（E13：自身补丁 × 祖先链，乘进本节点的每个图元并写回复用戳）。
 fn rebuild_lane(
     context: &mut PaintContext<'_>,
     node: NodeId,
@@ -762,19 +550,13 @@ fn rebuild_lane(
             lane
         }
     };
-    // AR5 P2-1：旧可见内容范围必须在清空 lane **之前**记下 —— 内容收缩（长文本变短 /
-    // Canvas 变小）后新图元只覆盖收缩后的区域，旧像素需要这份旧 AABB 才会被重画。
     let previous_content = painted_content(context.tree, context.scene, node, context.scale);
-    // 增量路径的绘制序成员判据：清空前的「这条 lane 里有没有图元」。
     let had_primitives = context
         .scene
         .lane_primitives(lane)
         .is_some_and(|primitives| !primitives.is_empty());
     let _ = context.scene.clear_lane(lane);
-    // 槽位必须写进 lane：编码器据此生成 `FrameOp::Instances.scroll`，也是段复用的判据之一。
-    // `set_lane_scroll` 在槽位变化时让内容版本 +1，因此总线上不会漏掉这条 lane。
     let _ = context.scene.set_lane_scroll(lane, slot);
-    // 烘焙偏移 = total − slot_offset（不含本槽自己的位移）。
     let bake = offset_between(total, slot_offset);
 
     let (
@@ -796,11 +578,8 @@ fn rebuild_lane(
             NodeKind::Text(_) => Content::Text(context.tree.text_line(node).cloned()),
             NodeKind::Canvas(canvas) => Content::Canvas(Arc::clone(canvas)),
             NodeKind::Image(content) => Content::Image((**content).clone()),
-            // 几何节点在 paint_node 就分流到 paint_geometry_node（块 lane 路径），
-            // 不会走到单 lane 的重建里；这里只是满足 match 的穷尽性。
             NodeKind::Geometry(_) => Content::Box,
         };
-        // 烘焙坐标 = 布局坐标 − 祖先滚动偏移（P10 §7.2；**不含本槽自己的位移**）。
         let bounds = target.layout().bounds.translate(negate(bake));
         let patch = target.style_patch().clone();
         let spec = target.paint_spec().cloned();
@@ -811,8 +590,6 @@ fn rebuild_lane(
         let ring = (context.focused == Some(node))
             .then(|| context.tree.focus_ring(node))
             .flatten();
-        // 普通内容（Box/Text/Canvas）没有 per-draw 变换；几何节点的变换由
-        // paint_geometry_node 单独读取（X5）。
         let geometry_transform = crate::math::Transform::IDENTITY;
         (
             bounds,
@@ -827,16 +604,6 @@ fn rebuild_lane(
         )
     };
 
-    // 内容 clip 的层数由 `ClipContext::push` 折叠处理（达到上限时求交而不是失败），
-    // 这里不需要再校验深度：8 层以上的嵌套裁剪容器会退化成一条求交后的矩形。
-    //
-    // **坐标空间**：`ClipContext` 里的矩形是屏幕坐标（与 damage 同源），而 lane 的图元是烘焙
-    // 坐标（不含本槽位移）⇒ 压进 lane 的 clip 必须同样加上本槽位移（烘焙 = 屏幕 + slot_offset）。
-    // 两者同处烘焙空间，片元侧的 `clip_mask`（在烘焙坐标上判定）因此与图元天然一致。
-    //
-    // **槽位边界**：`clip.rects[..boundary]` 是滚动容器之外的裁剪链（含容器自己的视口）——
-    // 它在内容坐标里随滚动移动，烘焙进去就要求每滚一像素重编码全部 lane。它由槽位的屏幕
-    // 裁剪区在绘制期做每 op scissor（`FramePayload::scroll_clip`），这里必须跳过。
     let inner_clips = if slot == 0 {
         &clip.rects[..]
     } else {
@@ -871,7 +638,6 @@ fn rebuild_lane(
     };
     emitter.emit(context);
 
-    // Canvas 的旧可见范围是屏幕坐标（`screen_baked`，不参与合成端平移），直接进 damage。
     if !previous_content.screen.is_empty() {
         context
             .damage
@@ -888,21 +654,16 @@ fn rebuild_lane(
         .map_or(0, <[Primitive]>::len);
     context.tree.set_reusable(node);
     context.tree.set_clip_key(node, clip.key());
-    // 烘焙偏移戳（**不含本槽位移**）：滚动本容器不改变它 ⇒ 下一帧仍可整条复用。
     context.tree.set_lane_offset(node, bake);
-    // 组不透明度戳（E13）：与本次乘进图元的值一致才可复用（祖先/自身调光必须重建子树）。
     context.tree.set_paint_opacity(node, opacity);
     context.tree.clear_paint(node);
 
-    // 「没有东西要画」的节点不留 lane（空 lane 只占绘制序/内存）：丢弃句柄并释放分配。
-    // 它的 `clip_key` 已写回，下一帧仍可命中复用判据（无需每帧重建）。
     if primitives == 0 {
         context.scene.release_lane(lane);
         context.tree.clear_lane(node);
         if !emitter.node_damage.is_empty() {
             context.rebuilt += 1;
         }
-        // 增量路径：释放了一条**本来在绘制序里**的 lane ⇒ 顺序成员变化，遍历结束后兜底重建。
         if !context.mode.is_full() && (created || had_primitives) {
             context.order_changed = true;
         }
@@ -911,7 +672,6 @@ fn rebuild_lane(
         if context.mode.is_full() {
             context.order.push(lane);
         } else if created || !had_primitives {
-            // 增量路径：新建 lane，或复活了一条没有图元（不在序里）的旧 lane ⇒ 顺序成员变化。
             context.order_changed = true;
         }
     }
@@ -932,9 +692,7 @@ fn rebuild_lane(
     Ok(())
 }
 
-/// 几何节点一次 paint 需要的绘制状态（与 `rebuild_lane` 的读取块同源；X5）。
 struct GeometryNodeState {
-    /// 节点盒的**烘焙坐标**（几何节点 = 屏幕坐标）。
     bounds: Rect,
     content_offset: Point,
     patch: StylePatch,
@@ -943,12 +701,9 @@ struct GeometryNodeState {
     ring: Option<crate::paint::style::FocusRing>,
     content_clip: Option<Rect>,
     geometry_transform: crate::math::Transform,
-    /// 图元烘焙偏移（几何节点 = 祖先滚动累计值，因为它是 screen-baked 节点）。
     bake: Point,
 }
 
-/// 读一个几何节点的全部绘制状态（一次 arena 查找 + 少量旁表查；消费者：
-/// [`paint_geometry_node`]）。
 fn geometry_node_state(
     context: &PaintContext<'_>,
     node: NodeId,
@@ -983,11 +738,6 @@ fn geometry_node_state(
     })
 }
 
-/// 某块在**逻辑空间**的 AABB（快照块表；空块退回整块几何 `bounds`）。`None` = 未注册句柄。
-///
-/// **缺失块**（`truncate` 到 0 块时 paint 仍保留一条装饰 lane）不回退整块几何 `bounds`：
-/// 这条 lane 里没有几何内容，退回注册范围会把整个几何 bounds 并入 damage（清空图表时闪一次
-/// 过大 damage）。未注册句柄的退化（`None`）仍由调用方用节点盒 / clip 处理。
 fn geometry_chunk_local_bounds(
     snapshot: Option<&std::sync::Arc<crate::paint::geometry::GeometrySnapshot>>,
     chunk: usize,
@@ -1000,11 +750,6 @@ fn geometry_chunk_local_bounds(
     })
 }
 
-/// 块 lane 的绘制区间（索引元素，半开）：本块在索引缓冲里的区间按 §11.4 的 range 语义裁剪。
-///
-/// 未注册句柄 / 缺失块返回**空区间**（`GeometryDraw.range` 空 = 不绘制）：缺失块本来就没有
-/// 内容可画，空区间让编码器不产生 op；未注册句柄的错误路径不变（编码器以 `missing_snapshot`
-/// 报 `GeometryRegister`）。
 fn geometry_chunk_draw_range(
     snapshot: Option<&std::sync::Arc<crate::paint::geometry::GeometrySnapshot>>,
     chunk: usize,
@@ -1024,7 +769,6 @@ fn geometry_chunk_draw_range(
     .unwrap_or_default()
 }
 
-/// 几何节点不可见 / 零尺寸：释放全部块 lane、清空块状态，并把旧块范围并入 damage。
 fn clear_geometry_lanes(
     context: &mut PaintContext<'_>,
     node: NodeId,
@@ -1082,25 +826,6 @@ fn clear_geometry_lanes(
     }
 }
 
-/// 几何节点的 paint（X5）：按**块 lane** 规划绘制输出，只重建数据版本变化的块。
-///
-/// # 契约（与单 lane 完全一致）
-///
-/// - **块内/块间绘制序**：块 lane 在绘制序里连续（`lanes[0..n]`，按块序），块内图元序 =
-///   祖先 clip 前缀 → 块 0 lane 的装饰（Shadow/背景/边框/焦点环）→ 内容 clip → 几何 →
-///   content clip 后缀 → 祖先 clip 后缀；块 `i>0` 的 lane 只有「祖先 clip 前缀 + 内容 clip +
-///   第 i 块几何 + 后缀」。与旧单 lane 的差异只是「内容」被切到多条 lane，绘制顺序不变。
-/// - **clip 语义**：每条块 lane 都带完整的祖先 clip 前缀/后缀 + 内容 clip 括号（`emit_content`
-///   的同一实现），因此裁剪结果与单 lane 逐像素一致。
-/// - **复用**：`REUSABLE` + clip 上下文 + 烘焙偏移一致的前提下，只有**块版本**（几何数据里
-///   该块的 revision）变化的块 lane 被重建。data-only 更新（`mark_geometry_updated`）不清
-///   `REUSABLE`，于是追加 K 线只重建尾块、热力图改色只重建受影响块；纯滚动帧仍然
-///   `encoded_lanes == 0`、`delta.order == None`。
-/// - **damage**：每条被重建的块 lane 把「旧块 bounds ∪ 新块 bounds」（经 per-draw 变换）
-///   并入 damage；块数增加/减少同样按旧 bounds 记 damage。
-///
-/// # Panics
-/// debug 构建断言几何节点是 screen-baked（`paint_node` 恒传 slot 0 / offset 0）。
 fn paint_geometry_node(
     context: &mut PaintContext<'_>,
     node: NodeId,
@@ -1111,13 +836,9 @@ fn paint_geometry_node(
     opacity: f32,
 ) -> Result<(), EngineError> {
     let snapshot = context.geometry.snapshot_arc(geometry_id);
-    // 块数：未注册句柄保守按 1 块；已注册但 **0 块**（`truncate` 到 0 / 空几何）也保留 1 条
-    // 装饰 lane —— 几何 op 因 `snapshot.chunk(0)` 缺失而不发射，但节点自己的背景 / 边框 /
-    // 焦点环 / 节点盒 damage 仍需要一条 lane 承载（空数据不应让节点样式消失）。
     let desired = snapshot
         .as_ref()
         .map_or(1, |snapshot| snapshot.chunks().len().max(1));
-    // 一次 arena 查找取全本节点的绘制状态（与 `rebuild_lane` 同一份读取块）。
     let Some(node_state) = geometry_node_state(context, node, total, Point::ZERO) else {
         return Ok(());
     };
@@ -1132,10 +853,6 @@ fn paint_geometry_node(
         geometry_transform,
         bake,
     } = node_state;
-    // E13（审查 F1）：节点级重建（组不透明度 / clip / 烘焙偏移 / 样式失效）时，旧装饰
-    // （阴影外溢 / 背景 / 边框 / 焦点环）的实际覆盖区可能在本帧消失（`opacity = 0` 或样式
-    // 换掉）：并入节点级 damage，否则旧阴影外溢留在屏幕上。与 `rebuild_lane` 的
-    // `painted_content` 同口径；几何内容本身的旧范围由块状态（`baked_scratch`）精确给出。
     let node_damage = if state.reusable {
         node_damage
     } else {
@@ -1143,13 +860,10 @@ fn paint_geometry_node(
     };
     let visible = patch.visible.unwrap_or(true);
     let old_lanes = context.tree.lane_count(node);
-    // 旧块烘焙状态（决定「哪些块需要重建」与旧 bounds damage），拷进复用工作区。
     context.baked_scratch.clear();
     if let Some(baked) = context.tree.baked_geometry_chunks(node) {
         context.baked_scratch.extend(baked.iter().copied());
     }
-    // 节点级 gate：不可见 / 零尺寸布局盒 ⇒ 不画任何块（旧实现 `PrimitiveEmitter::emit` 的
-    // 早退语义），清空全部块 lane 并把旧块范围并入 damage。
     if !visible || bounds.is_empty() {
         clear_geometry_lanes(
             context,
@@ -1161,12 +875,9 @@ fn paint_geometry_node(
             geometry_transform,
             bake,
         );
-        // E13（F5）：清空也是本节点的一次结算 —— 写回组不透明度戳，否则零尺寸 / 不可见
-        // 几何节点在祖先展开访问时每帧都判「不可复用」（I3 退化）。
         context.tree.set_paint_opacity(node, opacity);
         return Ok(());
     }
-    // 规划：块数变化 / 节点级重建（`REUSABLE` 失配）⇒ 全部块重建；否则只重建版本变化的块。
     context.rebuild_scratch.clear();
     for chunk in 0..desired {
         let lane_missing = context.tree.lane_at(node, chunk).is_none();
@@ -1182,10 +893,8 @@ fn paint_geometry_node(
             .rebuild_scratch
             .push(!state.reusable || lane_missing || !baked_matches);
     }
-    // 先对齐块状态的条目数（复用块保留原值；新块由上面的规划判为重建）。
     context.tree.resize_baked_geometry_chunks(node, desired);
     let mut created_any = false;
-    // 内层 clip（屏幕 → 烘焙坐标；几何节点恒 slot 0：见 `paint_node` 的 screen_baked 分支）。
     let inner_clips = &clip.rects[..];
     for chunk in 0..desired {
         let lane = match context.tree.lane_at(node, chunk) {
@@ -1216,10 +925,7 @@ fn paint_geometry_node(
             }
             continue;
         }
-        // 旧块 bounds 必须在清空 lane 之前记下（内容收缩 / 块删除时旧像素要重画）。
         let previous = context.baked_scratch.get(chunk).copied();
-        // 「清空前这条 lane 有没有图元」只用于 test-support 的 lane 日志（Rebuilt/Allocated
-        // 区分），所以查询与消费方同一 feature 编译：默认特性构建下不留未使用变量。
         #[cfg(feature = "test-support")]
         let had_primitives = context
             .scene
@@ -1275,17 +981,13 @@ fn paint_geometry_node(
         for _ in inner_clips.iter().rev() {
             let _ = context.scene.push(lane, Primitive::Clip(ClipOp::Pop));
         }
-        // 全量路径的绘制序在同一次遍历里生成（增量路径不 push：顺序不变；新建 lane 由
-        // 遍历结束后的轻量 DFS 兜底重建）。
         if context.mode.is_full() {
             context.order.push(lane);
         }
-        // damage = 旧块 bounds ∪ 新块 bounds（都经 per-draw 变换；旧一侧来自烘焙状态）。
         let mut damage = match (
             &snapshot,
             geometry_chunk_local_bounds(snapshot.as_ref(), chunk),
         ) {
-            // 未注册句柄：旧实现退回节点布局盒（拿不到真实范围）。
             (None, _) => bounds,
             (Some(_), Some(new_bounds)) => {
                 geometry_chunk_damage(geometry_transform, new_bounds, total)
@@ -1335,8 +1037,6 @@ fn paint_geometry_node(
             });
         }
     }
-    // 块数减少（`truncate_geometry` 变短 / 几何被替换成更短的版本）：释放多余 lane，
-    // 并把被移除块的**旧** bounds 并入 damage（新一侧已经没有这些块了）。
     for chunk in desired..old_lanes {
         let Some(lane) = context.tree.lane_at(node, chunk) else {
             continue;
@@ -1357,13 +1057,11 @@ fn paint_geometry_node(
             context.order_changed = true;
         }
     }
-    // 截断 `Node.lanes` / 块状态到 `desired`。
     context.tree.truncate_lanes(node, desired);
     context.tree.resize_baked_geometry_chunks(node, desired);
     context.tree.set_reusable(node);
     context.tree.set_clip_key(node, clip.key());
     context.tree.set_lane_offset(node, bake);
-    // 组不透明度戳（E13）：与本次乘进块 lane 图元的值一致才可复用。
     context.tree.set_paint_opacity(node, opacity);
     context.tree.clear_paint(node);
     if !context.mode.is_full() && created_any {
@@ -1372,11 +1070,6 @@ fn paint_geometry_node(
     Ok(())
 }
 
-/// 几何块 lane 的 damage 范围：`transform(块 AABB)` 换算到屏幕坐标（减祖先滚动累计值）。
-///
-/// 块 bounds 是**逻辑像素**（几何局部空间，与 `GeometryDesc.bounds` 同空间），因此要先过
-/// per-draw 变换再减滚动累计值 —— 与旧单 lane 的 `geometry_damage` 同一算法；顶点位移时
-/// 调用方把「旧块 bounds」也过一次同样的变换，两者并集就是「旧位置 ∪ 新位置」。
 fn geometry_chunk_damage(
     transform: crate::math::Transform,
     chunk_bounds: Rect,
@@ -1394,7 +1087,6 @@ fn geometry_chunk_damage(
     )
 }
 
-/// 逻辑矩形经仿射变换后的 AABB（`[x0, y0, x1, y1]`；非有限输入 = 空区间）。
 fn transformed_chunk_aabb(transform: crate::math::Transform, bounds: Rect) -> [f32; 4] {
     let far = Point::new(
         bounds.origin.x + bounds.size.width,
@@ -1430,7 +1122,6 @@ fn transformed_chunk_aabb(transform: crate::math::Transform, bounds: Rect) -> [f
 }
 
 struct PrimitiveEmitter {
-    /// 发出本节点图元的节点 id（D-5：图集代际不匹配时记入 `stale_text` 重新入队）。
     node: NodeId,
     lane: LaneId,
     bounds: Rect,
@@ -1440,71 +1131,29 @@ struct PrimitiveEmitter {
     scale: Scale,
     clip: Option<PhysicalRect>,
     content: Content,
-    /// 已 push 的图元数（决定本节点是否计入 `rebuilt`/damage）。
     emitted: usize,
-    /// 本帧累积的节点级 damage（**内容坐标**；`touch`/`absolutize` 写入）。
     node_damage: Rect,
-    /// 该节点的**完整**祖先滚动位移（把 `node_damage` 换算到屏幕坐标）。
     offset: Point,
-    /// 烘焙坐标 → 屏幕坐标的平移（= −本槽位移；`0` = 不在滚动容器里）。
-    ///
-    /// 图元的 `rect` 是烘焙坐标，而 damage 必须是屏幕坐标（scissor / 平台 present 都用屏幕），
-    /// 因此由 [`PrimitiveEmitter::push_damage`] 统一加上这个平移。
     damage_shift: Point,
-    /// 焦点环（仅焦点节点 + `Style.focus_ring` 时存在）。
     ring: Option<crate::paint::style::FocusRing>,
-    /// 本节点几何内容的 per-draw 变换（R05-12；`Content::Geometry` 才有意义）。
     geometry_transform: crate::math::Transform,
-    /// 本节点**自身**的 `Clip::Bounds` padding box（屏幕坐标）。
-    ///
-    /// 只作用于**内容**（文本 / Canvas / 几何），不作用于背景/边框/阴影 —— 与 CSS 一致：
-    /// `overflow` 裁剪的是元素内容，不是元素自己的装饰。旧实现只把 clip 压给子树，
-    /// 于是「容器剪不住自己的 Canvas」：图表的柱子会溢出到容器外（P2-3.2）。
     content_clip: Option<Rect>,
-    /// 本节点的**有效组不透明度**（自身补丁 × 祖先链；E13）：统一乘到本节点发出的每个
-    /// 图元颜色上（阴影 / 背景 / 边框 / 渐变 / 文本 / 图片调制 / 焦点环 / 几何色）。
     opacity: f32,
 }
 
-/// 取负（`Point` 没有 `Neg`；屏幕 = 内容 − 偏移）。
 fn negate(offset: Point) -> Point {
     Point::new(-offset.x, -offset.y)
 }
 
-/// 上一帧 lane 里**全部图元**的实际覆盖范围（lane 重建 / 隐藏**之前**记下；AR5 P2-1 + E13 F1）。
-///
-/// 内容（文本 / Canvas / 图片）的可见范围可能大于节点布局盒。内容**收缩**时如果只按
-/// 「新图元 + 节点盒」记 damage，旧像素没有任何矩形覆盖 ⇒ 残影（AR5 复现：14 个 'W' 改成
-/// 'i'，damage 只到 x=60，旧字形 x∈[61,200] 留在屏幕上）。lane 里恰好保存着上一帧的图元
-/// 列表，重建前取一份 AABB 即可，不需要额外的常驻状态。
-///
-/// E13（审查 F1）：**装饰图元**同样会消失或收缩，而且它们天然溢出节点布局盒 ——
-/// - 阴影：投影盒平移 offset 后再外扩 `3σ + 1`（与 `emit_decorations` 的 damage 同口径）；
-/// - 背景 / 边框 / 渐变 / 焦点环 / 文本装饰线：`Quad` 盒（焦点环在 border box 外侧）；
-/// - 溢出子节点的背景：子节点自己的 `Quad` 盒可以落在父盒之外。
-///
-/// 组不透明度归零时整棵子树的图元集合变空（`opacity = 0` ⇒ 颜色全透明），这些旧像素
-/// 没有任何新图元覆盖 ⇒ 必须由这里并进 damage，否则屏幕上留下旧阴影 / 旧背景（残影）。
-///
-/// 坐标空间（与各 `emit_*` 的 damage 写入保持一致）：
-/// - 普通图元是**烘焙坐标**（lane 图元本来就按 bake 存）⇒ 加 `lane_offset` 还原成内容坐标，
-///   由 `PrimitiveEmitter` 与 `node_damage` 一起统一减祖先滚动偏移转屏幕；
-/// - Canvas 是**屏幕坐标**（`screen_baked` 节点，不参与合成端平移）⇒ 直接进 damage。
 #[derive(Default)]
 struct PaintedContent {
-    /// 内容坐标（走 `node_damage` 的记账路径）。
     content: Rect,
-    /// 屏幕坐标（直接 push 的 damage）。
     screen: Rect,
 }
 
-/// `scale` 只用于把阴影的物理像素外扩（`emit_decorations` 的 `3σ × scale + 1`）反算回逻辑
-/// 坐标，保证旧阴影的覆盖区不小于它已经画出的实际范围。
 fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -> PaintedContent {
     let mut content = Rect::default();
     let mut screen = Rect::default();
-    // 几何节点可能有多条块 lane（X5）；文本 / Canvas 节点恒 ≤1 条。几何内容本身不进这里
-    // （旧几何范围由 `baked_geometry_chunks` 按块精确给出；几何节点自己的装饰仍进这里）。
     for index in 0..tree.lane_count(node) {
         let Some(lane) = tree.lane_at(node, index) else {
             continue;
@@ -1520,7 +1169,6 @@ fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -
                     }
                 }
                 Primitive::Canvas(canvas) => screen = screen.union(canvas.bounds()),
-                // 图片 / 背景 / 边框 / 渐变 / 焦点环 / 文本装饰线都是烘焙坐标的 `Quad`/`Image`。
                 Primitive::Image(image) => content = content.union(image.bounds),
                 Primitive::Quad(quad) => content = content.union(quad.bounds),
                 Primitive::Shadow(shadow) => {
@@ -1531,8 +1179,6 @@ fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -
                         / scale.factor();
                     content = content.union(shadow.rect.translate(shadow.offset).outset(pad));
                 }
-                // `Path` 只能出现在 Canvas 内容里（Canvas 的 bounds 已覆盖）；`Geometry` 由块
-                // 状态精确记账；`Clip` 不产生像素。
                 Primitive::Path(_) | Primitive::Geometry(_) | Primitive::Clip(_) => {}
             }
         }
@@ -1549,10 +1195,6 @@ impl PrimitiveEmitter {
         self.emitted += 1;
     }
 
-    /// 累积一块 damage（入参是**烘焙坐标**下的矩形：背景 / 边框 / 渐变的 `bounds` 等）。
-    ///
-    /// damage 必须留在屏幕坐标（平台 present 的脏矩形、合成线程的 scissor 都是屏幕空间），
-    /// 因此这里统一把烘焙坐标平移回屏幕：`screen = bake − 本槽位移`。
     fn push_damage(&self, context: &mut PaintContext<'_>, bounds: Rect, aa_padding: f32) {
         context
             .damage
@@ -1565,7 +1207,6 @@ impl PrimitiveEmitter {
             self.emit_node_damage(context);
             return;
         }
-        // 组不透明度（E13）已由 `paint_node` 折算好（自身补丁 × 祖先链），这里直接使用。
         let opacity = self.opacity;
         self.emit_decorations(context, opacity);
         self.emit_content(context, opacity);
@@ -1573,22 +1214,14 @@ impl PrimitiveEmitter {
         self.emit_node_damage(context);
     }
 
-    /// 装饰层（阴影层组 → 背景/渐变 → 边框）：不参与内容 clip，也不含焦点环/内容。
-    ///
-    /// 拆成独立方法的唯一原因：几何节点的块 0 lane 要在「装饰之后、焦点环之前」插入几何
-    /// 内容（X5 的多 lane 分块），而 `emit` 的单 lane 顺序必须逐图元保持原样。
     fn emit_decorations(&mut self, context: &mut PaintContext<'_>, opacity: f32) {
         let spec = self.spec.clone().unwrap_or_default();
         let radii = spec.corner_radius;
-        // E13：多层阴影按数组序绘制（先在下、后在上）。每层一个 `Primitive::Shadow`，
-        // spread 在 CPU 侧折算成「投影盒外扩 + 圆角同量增加」，σ 不变 ⇒ 三端 / 字节契约零改动。
         for shadow in spec.shadows.iter() {
             let color = shadow.color.with_opacity(opacity);
             if color.is_transparent() {
                 continue;
             }
-            // CSS `box-shadow` 的 spread：阴影盒 = 元素盒四边外扩；圆角同量增大（负值 clamp 到 0）。
-            // 半径与背景/边框用同一份 `spec.corner_radius`（编码器再按 CSS 规则 clamp）。
             let rect = self.bounds.outset(shadow.spread);
             let primitive = Shadow {
                 rect,
@@ -1598,8 +1231,6 @@ impl PrimitiveEmitter {
                 corner_radius: radii.map(|radius| (radius + shadow.spread).max(0.0)),
             };
             self.push(context, Primitive::Shadow(primitive));
-            // damage 外扩 = 3σ + 1（σ = blur / 2，物理像素）：与 shader 的顶点外扩一致。
-            // 旧的 `blur + 1` 在 σ 改小后会切掉模糊环（可见缺陷）。spread 已含在 `rect` 里。
             let sigma = (primitive.blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
                 .max(crate::paint::instance::SHADOW_SIGMA_MIN);
             let pad = crate::paint::instance::SHADOW_PAD_SIGMAS * sigma * self.scale.factor() + 1.0;
@@ -1631,10 +1262,7 @@ impl PrimitiveEmitter {
                 to: gradient.to.with_opacity(opacity),
                 kind: gradient.kind,
             })
-            .filter(|gradient| {
-                // 两端全透明的渐变不产生像素：不入 lane、不产 damage。
-                !(gradient.from.is_transparent() && gradient.to.is_transparent())
-            });
+            .filter(|gradient| !(gradient.from.is_transparent() && gradient.to.is_transparent()));
 
         match gradient {
             Some(gradient) => {
@@ -1678,7 +1306,6 @@ impl PrimitiveEmitter {
         }
     }
 
-    /// 焦点环：在**节点自己的 lane 内**画（受祖先 clip 约束），环在 border box 外侧。
     fn emit_focus_ring(&mut self, context: &mut PaintContext<'_>, opacity: f32) {
         let radii = self.spec.clone().unwrap_or_default().corner_radius;
         if let Some(ring) = self.ring
@@ -1708,8 +1335,6 @@ impl PrimitiveEmitter {
         }
     }
 
-    /// 节点级 damage（`touch`/布局写入）转屏幕坐标后并入；装饰/内容/几何都没有产出时也要记
-    /// （内容收缩 / 节点不可见时的旧像素）。
     fn emit_node_damage(&mut self, context: &mut PaintContext<'_>) {
         if self.emitted > 0 || !self.node_damage.is_empty() {
             let damage = self.node_damage.translate(negate(self.offset));
@@ -1717,11 +1342,6 @@ impl PrimitiveEmitter {
         }
     }
 
-    /// 几何块的内容：内容 clip 括号 + 一条 `Primitive::Geometry`（X5 的块 lane 内容）。
-    ///
-    /// `range` 是本块在索引缓冲里的绘制区间（索引元素、半开；E4 / §11.4），空区间 = 本块没有
-    /// 可画内容（`truncate` 到 0 块）⇒ 编码器不产生几何 op；paint_geometry_node 已把旧/新块
-    /// bounds 的 damage 记好，这里只负责「画什么」。
     fn emit_geometry_chunk(
         &mut self,
         context: &mut PaintContext<'_>,
@@ -1757,18 +1377,12 @@ impl PrimitiveEmitter {
     }
 
     fn emit_content(&mut self, context: &mut PaintContext<'_>, opacity: f32) {
-        // 内容按本节点自己的 padding box 裁剪（`Clip::Bounds`）。背景/边框/阴影在
-        // `emit` 里先画、不受这个 clip 影响（CSS 的 `overflow` 语义）。
-        //
-        // 只在**确实有内容**时压括号：`Content::Box`（纯盒子）与还没 shape 好的文本不产生
-        // 图元，白压一对 `Clip` 会白占一层 clip 深度（嵌套容器很容易因此提前触顶）。
         let has_content = content_needs_clip(&self.content);
         let content_clip = self
             .content_clip
             .filter(|_| has_content)
             .map(|rect| ClipRect {
                 rect,
-                // 内容裁剪只按轴对齐矩形裁（与子树 clip 同一形状，圆角留空）。
                 corner_radius: [0.0; 4],
             });
         if let Some(clip_rect) = content_clip {
@@ -1781,12 +1395,6 @@ impl PrimitiveEmitter {
 
             Content::Canvas(canvas) => {
                 let canvas_bounds = canvas.bounds();
-                // E1b F2 + E1d：编码期安全网。`push_shaped_text` 只在 push 时校验租约；push 之后
-                // 同帧的图集换代**或逐 tile LRU 淘汰**（不换代）都会让已写入的 tile 变旧 UV。
-                // 逐 tile 用 `AtlasAllocator::is_alive` 校验（O(1)，代际 + 槽位分配身份），失效
-                // run 不编码（少字优于花字），计数进 `PaintReport`/`FrameRecord`。换代时
-                // `App::repaint_text_if_atlas_changed`、淘汰时 `App::layout_text`/`shape_text`
-                // 的收尾已把 Canvas 节点标 PAINT，保证本分支在复用路径上也会执行。
                 let (canvas, stale_runs) = match context.atlas {
                     Some(atlas) => match canvas.without_stale_glyph_runs(atlas) {
                         Some((filtered, dropped)) => (Arc::new(filtered), dropped),
@@ -1799,7 +1407,6 @@ impl PrimitiveEmitter {
                 context.damage.push(canvas_bounds, 1.0, self.clip);
             }
             Content::Text(line) => {
-                // 不早退：早退会跳过下面的 `Clip(Pop)`，把 clip 泄漏给后续节点。
                 if let Some(line) = line {
                     self.emit_text(context, &line, opacity);
                 }
@@ -1812,10 +1419,6 @@ impl PrimitiveEmitter {
     }
 
     fn emit_text(&mut self, context: &mut PaintContext<'_>, line: &ShapedLine, opacity: f32) {
-        // D-5：图集代际硬校验（唯一重光栅入口之外的安全网）。`ShapedLine.atlas_generation`
-        // 是生成时的图集代际；与当前代际不等说明该行仍烘焙旧 `AtlasTile`（旧 UV）——继续
-        // 编码就是整窗花字。本帧跳过该行、记下节点，`App::frame` 提交后重新入队并在下一帧用
-        // 当前代际重光栅。`None` = 无 App 的 headless/测试路径，不做校验。
         if let Some(atlas) = context.atlas
             && line.atlas_generation != atlas.generation()
         {
@@ -1828,8 +1431,6 @@ impl PrimitiveEmitter {
             self.bounds.origin.x + self.content_offset.x,
             self.bounds.origin.y + self.content_offset.y,
         );
-        // v2.1 E2：行内盒的绘制声明（按 `id` 与 `ShapedInlineBox` 配对；两者顺序同源，
-        // 但 id 是应用句柄、更稳）。只在有行内盒时分配。
         let inline_paints: SmallVec<[(u64, Option<InlineBoxPaint>); 4]> = context
             .tree
             .text_content(self.node)
@@ -1863,8 +1464,6 @@ impl PrimitiveEmitter {
                                 size: glyph.size,
                             });
                         }
-                        // v2.1 E2：`run.color` 来自 shaping 期的 parley 画刷（逐 run 样式），
-                        // `bind_style.foreground` 覆盖时整段统一（与单 run 的旧语义一致）。
                         let color = self
                             .patch
                             .foreground
@@ -1892,8 +1491,6 @@ impl PrimitiveEmitter {
                     }
                 }
             }
-            // v2.1 E2（`§11.2`）：文本装饰 = 普通 `Quad`（不进 shader），在字形/行内盒之上绘制。
-            // 不参与布局：几何来自 shaping 期烘好的 `ShapedTextLine::decorations`。
             for decoration in &shaped_line.decorations {
                 let color = self
                     .patch
@@ -1923,19 +1520,6 @@ impl PrimitiveEmitter {
         }
     }
 
-    /// 图片节点的绘制（E7）：`ResourceId → ResourceImage.tile` 在 paint 期解析。
-    ///
-    /// - 资源未就绪（`Pending`）/ 已释放 / 无 `ResourceCache`（headless）：**跳过图元**，
-    ///   节点自身的背景/边框照常绘制（占位 = 背景 / 透明），不 panic、不画错图；
-    /// - `Fill` = 拉伸到节点盒；`Contain` = 等比内嵌居中；`Cover` = 等比铺满 + **UV 裁切**
-    ///   （源区域收缩，图元 bounds 恒等于节点盒 ⇒ 不需要溢出 + clip，布局与绘制一致）；
-    /// - 调制色：`bind_style` 的 `foreground`（动态，与文本同通道）覆盖静态
-    ///   `image_modulation`，再乘节点不透明度。
-    ///
-    /// 图元 bounds 取节点 **border box**（`image` 是替换元素语义的最小实现）：需要留白的图
-    /// 由容器 padding / 显式尺寸承担（残余见 `spec-deltas/E7.md`）。注意这不是 CSS 的
-    /// content box：节点自身的 border/padding 不会为图片让位（图片盖住 border，
-    /// `Clip::Bounds` 也不作用于图片内容，§11.8 R-20）。
     fn emit_image(&mut self, context: &mut PaintContext<'_>, content: &ImageContent, opacity: f32) {
         let Some(image) = context.resources.and_then(|resources| {
             content
@@ -1943,8 +1527,6 @@ impl PrimitiveEmitter {
                 .resource()
                 .and_then(|resource| resources.image(resource))
         }) else {
-            // 未就绪 / 已释放：占位（节点背景 / 透明），不产生图元也不留下旧图元
-            //（lane 已在本节点标脏时重建）。
             return;
         };
         let image_size = Size::new(image.width as f32, image.height as f32);
@@ -1977,16 +1559,9 @@ impl PrimitiveEmitter {
                 modulation,
             }),
         );
-        // damage 的正确性由节点盒覆盖（`touch` 的当前盒、`place_subtree` 的旧 ∪ 新盒、lane
-        // 重建并入的旧图元 AABB）；这里是保守冗余（与 `emit_inline_box` 的局部记录同型），
-        // 不是正确性依赖 —— 见 §11.8 R-20 的 damage 说明。
         self.push_damage(context, rect, 0.0);
     }
 
-    /// 行内盒的引擎绘制（v2.1 E2，`§11.2`）：`Quad` 直接编码；`Image` 经 `ResourceCache` 解析
-    /// `ResourceId → ResourceImage.tile`，资源缺失时**跳过并记诊断**（不画占位图、不 panic）。
-    ///
-    /// `paint = None` = 只算落点、不绘制（E1 的现状语义）。
     fn emit_inline_box(
         &mut self,
         context: &mut PaintContext<'_>,
@@ -2031,9 +1606,6 @@ impl PrimitiveEmitter {
                     .resources
                     .and_then(|resources| resources.image(resource));
                 let Some(image) = image else {
-                    // 资源未加载 / 已卸载：跳过图元并记录 id（`App::frame` 压
-                    // `TextDiagnostic::InlineBoxImageMissing`）。headless 路径（无 ResourceCache）
-                    // 同样跳过 —— 没有资源就没有可画的 tile。
                     if !context.skipped_inline_images.contains(&id) {
                         context.skipped_inline_images.push(id);
                     }
@@ -2095,14 +1667,9 @@ mod tests {
         order: Vec<LaneId>,
         scroll_slots: Vec<(Point, PhysicalRect)>,
         scroll_slot_nodes: Vec<crate::node::id::NodeId>,
-        /// D-5 / E1d：绘制前图集校验的注入点（None = 不校验；Some = 编码期逐 tile 用
-        /// `AtlasAllocator::is_alive` 判活）。
         atlas: Option<crate::render::AtlasAllocator>,
-        /// v2.1 E2：行内盒图片解析用的资源缓存（`None` = 跳过图片并记 `skipped_inline_images`）。
         resources: Option<crate::resources::ResourceCache>,
-        /// 几何注册表（几何节点的块 lane 测试用；X5）。
         geometry: crate::paint::geometry_store::GeometryStore,
-        /// 本帧焦点节点（`Some` = 画它的焦点环；E13 的组不透明度级联覆盖焦点环）。
         focused: Option<crate::node::id::NodeId>,
     }
 
@@ -2149,8 +1716,6 @@ mod tests {
             self.try_paint().expect("paint")
         }
 
-        /// 增量路径：调用方先把脏节点标进闭包（`mark_incremental`），与 `Window::paint_frame`
-        /// 的两步（分类后 `mark_paint_closure` + `run_incremental`）一致。
         fn try_paint_incremental(
             &mut self,
             dirty: &[crate::node::id::NodeId],
@@ -2186,7 +1751,6 @@ mod tests {
             let _ = self.tree.mark_paint(node);
         }
 
-        /// 标脏并返回（方便一次标多个节点后走增量路径）。
         fn mark_dirty(&mut self, nodes: &[crate::node::id::NodeId]) {
             for node in nodes {
                 let _ = self.tree.mark_paint(*node);
@@ -2213,7 +1777,6 @@ mod tests {
         }
     }
 
-    /// 给每个节点写一个固定的绝对布局盒（paint 只读 `layout`，不需要 taffy）。
     fn layout_all(tree: &mut NodeTree) {
         let order: Vec<_> = tree.dfs_ids();
         for (index, id) in order.iter().enumerate() {
@@ -2231,7 +1794,6 @@ mod tests {
         harness.scene.lane_primitives(lane).expect("存在").to_vec()
     }
 
-    /// `rects` 的并集是否完整覆盖 `target`（damage 只要求超集；`PhysicalRect` 是半开区间）。
     fn damage_covers(rects: &[PhysicalRect], target: PhysicalRect) -> bool {
         (target.y0..target.y1).all(|y| {
             (target.x0..target.x1).all(|x| {
@@ -2242,7 +1804,6 @@ mod tests {
         })
     }
 
-    /// 给单个节点写绝对布局盒（溢出 / 阴影用例需要父盒子节点盒的精确相对位置）。
     fn set_layout(tree: &mut NodeTree, node: crate::node::id::NodeId, bounds: Rect) {
         let layout = crate::node::tree::LayoutBox {
             bounds,
@@ -2251,11 +1812,6 @@ mod tests {
         assert!(tree.set_layout_for_test(node, layout), "布局写入");
     }
 
-    /// **滚动合成端偏移的接线**（复审 AR4 P1-3）：滚动容器拿到稳定槽位，且**自己的**偏移不进
-    /// 图元烘焙坐标 ⇒ 滚动容器内的内容滚动时一条 lane 都不重建、图元字节一个都不动。
-    ///
-    /// 变异守卫：把 `paint_node` 里「子树的 `slot_offset` 换成容器自己的偏移」改错（例如沿用
-    /// 祖先的 `slot_offset`），本用例会看到 `rebuilt > 0` 且图元位置变了。
     #[test]
     fn scrolling_only_moves_the_slot_offset_not_the_lane_bytes() {
         use crate::{
@@ -2278,7 +1834,6 @@ mod tests {
             .build(&mut h.tree, container)
             .expect("child");
         layout_all(&mut h.tree);
-        // 与 `App::make_scroll` 写的是同一份状态（`Node.interaction.scroll`）。
         h.tree
             .ensure_interaction(container)
             .expect("interaction")
@@ -2294,7 +1849,6 @@ mod tests {
         assert!(first.rebuilt >= 2, "首帧两条 lane 都要建");
         assert_eq!(h.scroll_slots.len(), 2, "槽位 0 是哨兵，滚动容器占 1");
         assert_eq!(h.scroll_slots[1].0, Point::ZERO);
-        // 视口 = 容器的 padding box（屏幕坐标，物理化；夹具无 border）。
         let container_box = h.tree.get(container).expect("container").layout().bounds;
         assert_eq!(
             h.scroll_slots[1].1,
@@ -2314,7 +1868,6 @@ mod tests {
             "滚动容器的视口 clip 不得烘焙进 lane：它在内容坐标里随滚动移动，烘焙进去就要求\
              每滚一像素重编码全部 lane（改由槽位的屏幕裁剪区做每 op scissor）"
         );
-        // 内容烘焙在**容器内容空间**：不含容器自己的滚动位移。
         let quad_bounds = |primitives: &[Primitive]| {
             primitives
                 .iter()
@@ -2330,8 +1883,6 @@ mod tests {
             "图元烘焙在容器内容空间（= 布局坐标，不含容器自己的滚动位移）"
         );
 
-        // 滚 30 px：**不**标脏任何节点，只改滚动槽（生产路径由 `App::scroll_to` 写偏移 + 视口
-        // damage；paint pass 因为有待画 damage 而重跑）。
         let lane = h.tree.lane_of(child).expect("child lane");
         let version = h.scene.lane_state(lane).expect("lane").0;
         h.tree.scroll_slot_mut(container).expect("slot").offset = Point::new(0.0, 30.0);
@@ -2355,7 +1906,6 @@ mod tests {
         );
     }
 
-    /// X5：块 lane 的 damage = `transform(块 AABB)` 减祖先滚动累计值（逻辑 → 屏幕坐标）。
     #[test]
     fn geometry_chunk_damage_uses_the_chunk_aabb_and_transform() {
         let chunk = Rect::new(0.0, 0.0, 200.0, 200.0);
@@ -2374,7 +1924,6 @@ mod tests {
             "祖先滚动累计值要换算到屏幕坐标"
         );
 
-        // R05-12：per-draw transform 必须进入 damage 范围（否则平移后残影）。
         let moved = super::geometry_chunk_damage(
             crate::math::Transform::translate(30.0, 40.0),
             chunk,
@@ -2382,7 +1931,6 @@ mod tests {
         );
         assert_eq!(moved, Rect::new(30.0, 40.0, 200.0, 200.0));
 
-        // 空块不产生 damage。
         assert!(
             super::geometry_chunk_damage(
                 crate::math::Transform::IDENTITY,
@@ -2503,8 +2051,6 @@ mod tests {
         let _ = h.tree.set_style_patch_for_test(node, patch);
         h.mark_paint(node);
         let _ = h.paint();
-        // 与 `display: none` 同一条 `hide_subtree` 路径：lane 保留分配但被清空，
-        // 因此断言「没有图元」而不是「没有 lane」（后者是旧实现 rebuild_lane 的副作用）。
         assert!(
             h.tree
                 .lane_of(node)
@@ -2516,10 +2062,6 @@ mod tests {
         assert!(!h.damage.finish(frame()).full);
     }
 
-    /// P2-3.2 回归：`visible: false` 隐藏**整棵子树**，与命中测试/焦点遍历/a11y 同一语义。
-    ///
-    /// 旧实现只跳过本节点自身的图元，子控件仍然被画出来 —— 而它们在命中测试里是不可见的，
-    /// 于是出现「看得见但点不动」的死像素。
     #[test]
     fn hiding_a_container_hides_its_children() {
         let mut h = Harness::new();
@@ -2553,17 +2095,12 @@ mod tests {
         );
         let _ = child;
     }
-    /// P2-3.2 回归：`Clip::Bounds` 必须裁剪节点**自身的内容**。
-    ///
-    /// 旧实现只把 clip 压给子树，于是「容器剪不住自己的 Canvas/文本」：图表的柱子会溢出
-    /// 到容器外。CSS 语义里 `overflow` 裁的是内容，装饰（背景/边框）不受影响。
     #[test]
     fn own_clip_brackets_the_node_content() {
         let mut h = Harness::new();
         let root = h.tree.root();
         let mut style = fixed_style(60.0, 20.0);
         style.clip = Clip::Bounds;
-        // 用 Canvas 作内容：paint harness 不做文本 shape，文本内容为空不会产生图元。
         let mut canvas = crate::paint::canvas::Canvas::new(Rect::new(0.0, 0.0, 200.0, 200.0));
         canvas.push_quad(crate::paint::primitive::Quad {
             bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
@@ -2577,7 +2114,6 @@ mod tests {
             .style(style)
             .build(&mut h.tree, root)
             .expect("挂载");
-        // 对照：同样形状但**不**裁剪的 Canvas 节点不应有额外括号。
         let mut plain_canvas = crate::paint::canvas::Canvas::new(Rect::new(0.0, 0.0, 200.0, 200.0));
         plain_canvas.push_quad(crate::paint::primitive::Quad {
             bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
@@ -2685,7 +2221,6 @@ mod tests {
         ));
     }
 
-    /// v2.1 E2：一个最小的 1×1 RGBA PNG（`ResourceCache::insert` 的真实解码路径）。
     const ONE_PIXEL_PNG: &[u8] = &[
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
@@ -2740,7 +2275,6 @@ mod tests {
         }
     }
 
-    /// 挂一个文本节点并注入 `ShapedLine`（paint 只消费快照，不跑 text pass）。
     fn spawn_text(h: &mut Harness, content: TextContent, line: ShapedLine) -> NodeId {
         let root = h.tree.root();
         let node = NodeBuilder::text(content.text.clone(), content.style.clone())
@@ -2762,8 +2296,6 @@ mod tests {
         h.tree.get(node).expect("node").layout().bounds.origin
     }
 
-    /// v2.1 E2：多 run 文本按 run 逐段编码，颜色取各 run（不新增 `Primitive` 变体）；`bind_style`
-    /// 的 `foreground` 仍整段覆盖。
     #[test]
     fn multi_run_text_encodes_each_run_with_its_color() {
         let red = Color::Srgb {
@@ -2812,7 +2344,6 @@ mod tests {
             .collect();
         assert_eq!(colors, vec![red, blue], "逐 run 颜色必须分别编码");
         assert!(report.rebuilt > 0);
-        // `foreground` 覆盖仍整段生效（旧语义）。
         assert!(h.tree.set_style_patch(
             node,
             StylePatch {
@@ -2829,7 +2360,6 @@ mod tests {
         }
     }
 
-    /// v2.1 E2（`§11.2`）：文本装饰 = 普通 `Quad`，几何 = shaping 期算好的局部矩形 + 文本盒原点。
     #[test]
     fn text_decorations_are_encoded_as_quads_at_their_geometry() {
         let underline_color = Color::Srgb {
@@ -2891,9 +2421,6 @@ mod tests {
         assert!(report.rebuilt > 0);
     }
 
-    /// v2.1 E2b（审查 F6，变异 M5 的守护）：`StylePatch::foreground` 同时覆盖**字形颜色与
-    /// 装饰线色**（含显式 `TextDecoration::color`）；`foreground` 缺省时装饰跟 shaping 期
-    /// 解析出的颜色（显式线色 > 兜底文本色，见 `decoration_segments`）。
     #[test]
     fn foreground_overrides_glyph_and_decoration_colors() {
         let text_color = Color::Srgb {
@@ -2921,12 +2448,10 @@ mod tests {
             shaped_line(
                 vec![ShapedTextItem::GlyphRun(glyph_run(text_color, 0..2, 0.0))],
                 vec![
-                    // `color = None` 的装饰：shaping 期解析为该 run 的文本色。
                     ShapedDecoration {
                         rect: Rect::new(0.0, 14.5, 10.0, 1.0),
                         color: text_color,
                     },
-                    // 显式 `TextDecoration::color`：随 shaping 期烘焙进 `ShapedDecoration.color`。
                     ShapedDecoration {
                         rect: Rect::new(10.0, 8.0, 10.0, 1.0),
                         color: explicit_line,
@@ -2956,12 +2481,10 @@ mod tests {
                 .collect()
         };
 
-        // 1) 无 `foreground`：装饰跟随 shaping 期颜色（文本色 / 显式线色），字形跟随 run 颜色。
         let _ = h.paint();
         assert_eq!(decoration_fills(&h), vec![text_color, explicit_line]);
         assert_eq!(glyph_colors(&h), vec![text_color]);
 
-        // 2) `foreground` 覆盖：字形与两条装饰线（含显式线色）统一为 foreground。
         assert!(h.tree.set_style_patch(
             node,
             StylePatch {
@@ -2982,8 +2505,6 @@ mod tests {
             "foreground 必须覆盖字形颜色"
         );
 
-        // 3) foreground 与 style.color 相同 ⇒ 等价于「foreground = None 时跟 style.color」：
-        //    显式线色仍然被覆盖（foreground 优先级高于装饰自带颜色）。
         assert!(h.tree.set_style_patch(
             node,
             StylePatch {
@@ -2997,7 +2518,6 @@ mod tests {
         assert_eq!(glyph_colors(&h), vec![text_color]);
     }
 
-    /// v2.1 E2：`InlineBoxPaint::Quad` 按落点矩形绘制；`paint = None` 只保留落点、不绘制。
     #[test]
     fn inline_box_quad_paint_uses_the_landing_rect() {
         let fill = Color::Srgb {
@@ -3063,8 +2583,6 @@ mod tests {
         assert_eq!(quad.corner_radius, [2.0, 3.0, 4.0, 5.0]);
     }
 
-    /// v2.1 E2：`InlineBoxPaint::Image` 经 `ResourceCache` 解析 tile；资源卸载后跳过图元并记
-    /// `PaintReport::skipped_inline_images`（不画占位图、不 panic）。
     #[test]
     fn inline_box_image_paint_resolves_tiles_and_skips_missing_resources() {
         let mut resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
@@ -3087,7 +2605,6 @@ mod tests {
                     modulation: Color::WHITE,
                 },
             ),
-            // 未加载的句柄：`ResourceId::for_test` 的代际不命中任何存活条目。
             spec(
                 6,
                 InlineBoxPaint::Image {
@@ -3137,7 +2654,6 @@ mod tests {
         assert_eq!(primed.modulation, Color::WHITE);
         assert_eq!(report.skipped_inline_images.as_slice(), &[6]);
 
-        // 卸载 → 下一帧跳过、记诊断；不产生 Image，也不 panic。
         let mut cache = h.resources.take().expect("resources");
         assert!(cache.unload(image.id));
         h.resources = Some(cache);
@@ -3158,8 +2674,6 @@ mod tests {
 
     #[test]
     fn geometry_node_transform_reaches_the_primitive() {
-        // R05-12：节点级几何的 per-draw 变换必须进 `Primitive::Geometry`（旧实现硬编码
-        // `Transform::IDENTITY`，图表平移只能重建顶点）。顶点缓冲不动，只换 uniform。
         let mut h = Harness::new();
         let root = h.tree.root();
         let geometry = NodeBuilder::geometry(GeometryId::for_test(0, 1))
@@ -3183,7 +2697,6 @@ mod tests {
             crate::math::Transform::translate(4.0, 6.0),
             "节点级几何的 transform 必须是 setter 写入的那个"
         );
-        // 非几何节点：setter 必须报 StaleNode（不能静默写到错误节点上）。
         let boxed = NodeBuilder::boxed()
             .style(fixed_style(10.0, 10.0))
             .build(&mut h.tree, root)
@@ -3221,7 +2734,6 @@ mod tests {
             _ => panic!("应以 clip push 开始"),
         };
 
-        // resize：只改 clip 容器的布局盒，子节点绝对盒不变。
         let resize = crate::node::tree::LayoutBox {
             bounds: Rect::new(0.0, 0.0, 60.0, 60.0),
             border: crate::math::Edges::ZERO,
@@ -3283,7 +2795,6 @@ mod tests {
             .build(&mut h.tree, clipped)
             .expect("挂载");
         layout_all(&mut h.tree);
-        // 0×0 的 clip 容器：padding box 为空，但仍必须入栈（B1）。
         let empty = crate::node::tree::LayoutBox {
             bounds: Rect::default(),
             border: crate::math::Edges::ZERO,
@@ -3328,7 +2839,6 @@ mod tests {
         assert_eq!(report.damage.rects, 0);
     }
 
-    /// 叠 `depth` 层 `Clip::Bounds`，返回最内层节点。
     fn nest_clips(h: &mut Harness, depth: usize) -> crate::node::id::NodeId {
         let root = h.tree.root();
         let mut parent = root;
@@ -3348,7 +2858,6 @@ mod tests {
     fn clip_depth_at_limit_is_allowed() {
         let mut h = Harness::new();
         let deepest = nest_clips(&mut h, usize::from(crate::paint::scene::MAX_CLIP_DEPTH));
-        // 最内层节点的祖先链 = 7 层（第 8 层是它自己的子树），允许。
         let _ = h.paint();
         assert!(
             h.tree
@@ -3359,29 +2868,17 @@ mod tests {
 
     #[test]
     fn empty_clipping_containers_do_not_consume_clip_depth() {
-        // 纯 `Box` 容器不产图元 ⇒ 也不压内容 clip。旧实现按「有 `Clip::Bounds` 就算一层」
-        // 校验深度，8 层嵌套的空容器会被误判超深（`ClipDepthExceeded`），实际它一个图元
-        // 都没有、根本不需要 clip。
         let mut h = Harness::new();
         let _ = nest_clips(&mut h, usize::from(crate::paint::scene::MAX_CLIP_DEPTH));
-        // `h.paint()` 内部会 `expect` 成功：这里唯一要验的就是**不报** `ClipDepthExceeded`。
-        // 各层 lane 里仍有「祖先 clip 的括号」原始图元，所以不能断言 rebuilt == 0。
         let _ = h.paint();
     }
 
-    /// P2-7 回归：超过 `MAX_CLIP_DEPTH` 的嵌套裁剪容器**折叠**而不是失败。
-    ///
-    /// 旧实现在这里返回 `ClipDepthExceeded` 让整帧中止 —— 8 层嵌套的滚动容器（深层
-    /// 面板 + 列表 + 弹层）会直接白屏。矩形 clip 的复合就是交集，求交是无损的，因此
-    /// 折叠既保住精度也不牺牲可用性。
     #[test]
     fn clip_depth_over_limit_folds_instead_of_failing() {
         let mut h = Harness::new();
         let deepest = nest_clips(&mut h, usize::from(crate::paint::scene::MAX_CLIP_DEPTH) + 1);
         let report = h.paint();
-        // 折叠后每一层都还在（线段里仍有 clip 图元），关键是没有报错、没有丢绘制。
         assert!(report.rebuilt > 0, "折叠后必须仍能绘制");
-        // 最深层带内容时也要能画：这里只验证 clip 上下文结构（`clip_key` 深度被折叠到上限）。
         assert!(
             h.tree
                 .clip_key(deepest)
@@ -3391,15 +2888,10 @@ mod tests {
         );
     }
 
-    // ── A1：增量路径（脏闭包）单元测试 ─────────────────────────────────────
-
-    /// 单节点 lane 的内容版本（增量路径「未访问节点不得被触碰」的判据）。
     fn lane_version(h: &Harness, lane: LaneId) -> u32 {
         h.scene.lane_state(lane).expect("lane 活着").0
     }
 
-    /// 场景的「绘制相关」快照：按 DFS 的（节点, lane 图元, 滚动槽）+ 仅含非空 lane 的绘制序 +
-    /// 滚动槽表。用于增量 vs 全量的逐字段等价断言（空 lane 是否在绘制序里不影响像素）。
     fn rendered_state(
         h: &Harness,
     ) -> (
@@ -3434,8 +2926,6 @@ mod tests {
         (lanes, drawn_order, h.scroll_slots.clone())
     }
 
-    /// A1 / P1A-1a：增量帧只访问脏闭包（变化节点 + 祖先链），兄弟子树整棵跳过；绘制序
-    /// 与未访问 lane 完全不动（这是「不重建 order ⇒ `delta.order == None`」的单元级证据）。
     #[test]
     fn incremental_only_visits_the_dirty_closure() {
         let mut h = Harness::new();
@@ -3532,7 +3022,6 @@ mod tests {
         }
     }
 
-    /// A1：clip 上下文变化会让整棵子树失配 ⇒ 增量路径必须保守展开子树（全量路径的语义）。
     #[test]
     fn incremental_expands_the_subtree_when_the_clip_context_changes() {
         let mut h = Harness::new();
@@ -3573,8 +3062,6 @@ mod tests {
         );
     }
 
-    /// A1：隐藏变化必须访问整棵子树（`hide_subtree`），清空它们的 lane 并产生 damage；
-    /// 但**不**改变绘制序成员（lane 保留分配 ⇒ 再次显示时位置稳定）。
     #[test]
     fn incremental_hides_the_whole_subtree() {
         let mut h = Harness::new();
@@ -3623,7 +3110,6 @@ mod tests {
         assert_eq!(h.order, order_before, "隐藏不改变绘制序成员");
     }
 
-    /// A1：增量路径出现「新建 lane」⇒ 绘制序成员变化 ⇒ 用轻量 DFS 兜底重建绘制序。
     #[test]
     fn incremental_new_lane_rebuilds_the_order() {
         let mut h = Harness::new();
@@ -3634,7 +3120,6 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("node");
         layout_all(&mut h.tree);
-        // 先让它隐藏地画一帧：隐藏子树不分配 lane。
         h.tree.set_style_patch_for_test(
             node,
             StylePatch {
@@ -3649,7 +3134,6 @@ mod tests {
         );
         assert!(h.order.is_empty(), "隐藏节点不进绘制序");
 
-        // 重新显示：重建时新建 lane ⇒ 顺序兜底必须把它放进绘制序。
         h.tree.set_style_patch_for_test(
             node,
             StylePatch {
@@ -3671,8 +3155,6 @@ mod tests {
         );
     }
 
-    /// A1：增量帧访问滚动容器时用**缓存槽号**写偏移，不重新稠密编号（已烘焙进 lane 的
-    /// 槽号不能动）。
     #[test]
     fn incremental_reuses_the_cached_scroll_slot() {
         use crate::{
@@ -3711,7 +3193,6 @@ mod tests {
         let child_lane = h.tree.lane_of(child).expect("child lane");
         assert_eq!(h.scene.lane_scroll(child_lane), 1, "lane 登记槽位 1");
 
-        // 滚动 + 子树内容变化同一帧：走增量路径（有 paint 工作，用不上纯滚动快路径）。
         h.tree.scroll_slot_mut(container).expect("slot").offset = Point::new(0.0, 30.0);
         h.mark_paint(child);
         let report = h.paint_incremental(&[child]);
@@ -3725,8 +3206,6 @@ mod tests {
         assert_eq!(h.scene.lane_scroll(child_lane), 1, "槽号不得改变");
     }
 
-    /// A1 / P1A-1b 的单元级差分 oracle：同一状态下，增量路径与全量路径产出的
-    /// lane 内容 / 每 lane 滚动槽 / 绘制序（按绘制内容归一化）/ 滚动槽表逐字段一致。
     #[test]
     fn incremental_and_full_paths_produce_the_same_scene() {
         let mut h = Harness::new();
@@ -3757,7 +3236,6 @@ mod tests {
         let mut first = h.paint();
         assert!(first.rebuilt >= 4);
 
-        // 一串增量修改：clip 容器改尺寸（clip 上下文 + damage）、隐藏 hider、inner 重建。
         let resize = crate::node::tree::LayoutBox {
             bounds: Rect::new(0.0, 0.0, 60.0, 60.0),
             border: crate::math::Edges::ZERO,
@@ -3774,7 +3252,6 @@ mod tests {
         let _ = h.paint_incremental(&[clip_container, hider, inner]);
         let incremental = rendered_state(&h);
 
-        // 同一状态走全量路径（所有节点标脏 ⇒ 全量重放）。
         let ids = h.tree.dfs_ids();
         h.mark_dirty(&ids);
         first = h.paint();
@@ -3788,9 +3265,7 @@ mod tests {
         );
         assert_eq!(incremental, full, "增量与全量产物必须逐字段一致");
     }
-    // ── X5：几何节点多 lane 分块 ─────────────────────────────────────────────
 
-    /// `triangles` 个互不共享顶点的三角形（真实位置；每 4096 个三角形一块）。
     fn long_geometry(triangles: u32) -> crate::paint::geometry::GeometryDesc {
         use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
         let mut vertex_bytes = Vec::with_capacity(triangles as usize * 36);
@@ -3819,7 +3294,6 @@ mod tests {
         }
     }
 
-    /// 挂一个几何节点并把布局盒写成固定值（paint 只读 `layout`）。
     fn mount_geometry(h: &mut Harness, id: GeometryId, clip: Clip) -> NodeId {
         let root = h.tree.root();
         let mut style = fixed_style(100.0, 100.0);
@@ -3832,7 +3306,6 @@ mod tests {
         node
     }
 
-    /// 在几何末尾追加一个三角形（顶点 range + 索引 range 两次更新，与 K 线追加同路径）。
     fn append_triangle(h: &mut Harness, id: GeometryId, x: f32, y: f32) {
         let snapshot = h.geometry.snapshot_arc(id).expect("已注册");
         let vertex_at = snapshot.vertex_len();
@@ -3857,8 +3330,6 @@ mod tests {
             .expect("追加索引");
     }
 
-    /// X5：几何节点每块一条 lane，块间绘制序 = 块序，且每条块 lane 的 clip 语义完整
-    /// （内容 clip 前缀/后缀与单 lane 用同一个 `emit_geometry_chunk` 实现）。
     #[test]
     fn geometry_node_gets_one_clipped_lane_per_chunk_in_order() {
         let mut h = Harness::new();
@@ -3899,7 +3370,6 @@ mod tests {
                 "每条块 lane 恰好一条几何绘制"
             );
         }
-        // E4 / §11.4：每条块 lane 的 `GeometryDraw.range` = 本块在索引缓冲里的区间（块间 = 索引序）。
         let ranges: Vec<std::ops::Range<u32>> = [first, second]
             .iter()
             .map(|lane| {
@@ -3923,12 +3393,9 @@ mod tests {
         );
     }
 
-    /// E4 / §11.4：几何变短（`truncate_geometry`）时块 lane 的 range 收缩 ⇒ damage =
-    /// **受影响块**的旧 ∪ 新 AABB（不是整帧，也不是整个几何 bounds），且多画的那块 lane 被释放。
     #[test]
     fn geometry_truncation_damages_only_the_removed_chunk_bounds() {
         let mut h = Harness::new();
-        // 两块：块 0 = 4096 个三角形（y ∈ 0..64），块 1 = 10 个三角形（y ∈ 64..65）。
         let id = h
             .geometry
             .insert(long_geometry(4096 + 10))
@@ -3947,7 +3414,6 @@ mod tests {
             "尾块的旧 AABB 必须在块的 y 段上：{old_tail:?}"
         );
 
-        // 截断到一块（4096 个三角形 = 12288 顶点 / 索引）。
         let update = h
             .geometry
             .truncate(id, 4096 * 3, crate::paint::geometry::GEOMETRY_CHUNK_INDICES)
@@ -3975,7 +3441,6 @@ mod tests {
             hits(1, probe_y),
             "被移除块的旧像素必须并入 damage（否则留残影）：{rects:?}"
         );
-        // 新尾块（块 0）的尾部索引区间必须仍是 0..12288：range 收缩只影响被移除的那块。
         let lane = h.tree.lane_at(node, 0).expect("块 0 lane");
         let Some(Primitive::Geometry(draw)) = h
             .scene
@@ -3993,7 +3458,6 @@ mod tests {
         );
     }
 
-    /// X5：几何数据只改尾块 ⇒ 增量帧只重建尾块 lane，前面的块一条都不动、绘制序不变。
     #[test]
     fn geometry_data_update_rebuilds_only_the_tail_chunk_lane() {
         let mut h = Harness::new();
@@ -4030,12 +3494,6 @@ mod tests {
         );
     }
 
-    /// RX-3（review-x 覆盖探针）：块 lane 的 damage 必须同时覆盖**旧块位置**与**新块位置**。
-    ///
-    /// 探针：删除 `paint_geometry_node` 里「旧块 bounds 并入 damage」后全量测试仍绿
-    /// （只测了 store 层 `GeometryUpdate.damaged`）。本测试把整个三角形从 (10,10) 移到
-    /// (100,60)：旧位置不在新块 AABB 内，而数据更新又**不并节点盒 damage** ⇒ 只有旧∪新
-    /// 并集才能覆盖旧位置；只算新位置会静默留下残影。
     #[test]
     fn geometry_data_update_damage_covers_old_and_new_block_bounds() {
         use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
@@ -4067,7 +3525,6 @@ mod tests {
         h.paint();
         assert_eq!(h.tree.lane_count(node), 1, "单块几何只有一条块 lane");
 
-        // 整体移动（旧 AABB 约 (10,10)-(11,11)，新 AABB 约 (100,60)-(101,61)）。
         h.geometry
             .update_vertices(id, 0..36, &triangle(100.0, 60.0))
             .expect("整体移动");
@@ -4086,7 +3543,6 @@ mod tests {
         assert!(hits(100, 60), "新位置必须重画：{rects:?}");
     }
 
-    /// X5：块满后追加 ⇒ 新建块 lane，增量路径用轻量 DFS 兜底重建绘制序；旧块 lane 不动。
     #[test]
     fn appending_across_the_chunk_boundary_creates_a_new_lane_and_rebuilds_order() {
         let mut h = Harness::new();
@@ -4116,7 +3572,6 @@ mod tests {
         );
     }
 
-    /// X5：没有数据变化的帧不重建任何块 lane（纯 damage / 滚动帧的 `encoded_lanes == 0` 前提）。
     #[test]
     fn unchanged_geometry_reuses_every_block_lane() {
         let mut h = Harness::new();
@@ -4141,7 +3596,6 @@ mod tests {
         }
     }
 
-    /// X5：per-draw 变换变化 ⇒ 全部块 lane 重建（变换烘在每条块 lane 的图元里）。
     #[test]
     fn geometry_transform_change_rebuilds_every_block_lane() {
         let mut h = Harness::new();
@@ -4170,14 +3624,6 @@ mod tests {
         }
     }
 
-    // ── E13：组不透明度（`StylePatch.opacity` 沿子树级联）──────────────────────
-
-    /// E13 组不透明度 ①：父 0.5 × 子 0.5 ⇒ 子图元 0.25；父自己的装饰（阴影 / 渐变 / 边框）
-    /// 是 0.5。`Clip::Bounds` 与圆角只影响几何，不参与 alpha 计算（子 lane 的 clip 前缀照旧）。
-    ///
-    /// 变异守卫：把级联拆掉（`paint_state` 不乘 `inherited_opacity`，或 emitter 用自身补丁值）
-    /// ⇒ 子图元回到 0.5 / 1.0，本用例变红。第二帧走**增量路径且只登记组根**：去掉复用判据里的
-    /// `paint_opacity` 戳（M7）⇒ 子 lane 不重建、颜色停在 1.0，本用例同样变红。
     #[test]
     fn group_opacity_cascades_to_decorations_and_children() {
         let mut h = Harness::new();
@@ -4214,7 +3660,6 @@ mod tests {
             .expect("child");
         layout_all(&mut h.tree);
 
-        // 基线：没有补丁时全部不透明（否则下面的 0.25 可能来自别的原因）。
         let _ = h.paint();
         let baseline = lane_primitives(&h, group);
         let shadow_of = |primitives: &[Primitive]| {
@@ -4242,12 +3687,9 @@ mod tests {
                 ..StylePatch::default()
             },
         );
-        // 只登记**组根**：子节点的补丁变化靠「组根戳失配 ⇒ expand 整棵子树 ⇒ 子节点逐级
-        // 戳失配」重建（真实动画路径只标组根，见 `App::animate`）。
         h.mark_paint(group);
         let _ = h.paint_incremental(&[group]);
 
-        // 父自己的装饰 × 0.5。
         let primitives = lane_primitives(&h, group);
         assert_eq!(
             shadow_of(&primitives).color,
@@ -4278,7 +3720,6 @@ mod tests {
             .expect("边框 quad");
         assert_eq!(border.color, Color::BLACK.with_opacity(0.5));
 
-        // 子节点：0.5 × 0.5 = 0.25（级联，不是逐节点各算各的）。
         let child_primitives = lane_primitives(&h, child);
         assert!(
             child_primitives
@@ -4303,11 +3744,6 @@ mod tests {
         );
     }
 
-    /// E13 组不透明度 ②：文本色 / 图片调制色 / 焦点环 / `GeometryDraw.color` 都被级联乘上。
-    ///
-    /// 第二帧走**增量路径且只登记组根**（`App::animate` 的真实路径）：这四类图元的 lane 重建
-    /// 完全靠 `paint_opacity` 戳的级联失配 ⇒ M7（去掉戳判据）会让它们停在首帧的 1.0。
-    /// `Canvas` 内容例外（应用自绘、引擎不解析其颜色）—— 见 spec-delta E13 R1。
     #[test]
     fn group_opacity_cascades_to_text_image_focus_ring_and_geometry_colors() {
         let mut resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
@@ -4354,7 +3790,6 @@ mod tests {
         layout_all(&mut h.tree);
         h.focused = Some(focus);
 
-        // 首帧 = 1.0 基线（下面 0.5 的断言不能来自建造期就带的补丁）。
         let _ = h.paint();
         let text_color_of = |h: &Harness| {
             lane_primitives(h, text)
@@ -4403,7 +3838,6 @@ mod tests {
         assert_eq!(geometry_color_of(&h), Color::WHITE);
         assert_eq!(ring_border_of(&h).color, Color::BLACK);
 
-        // 组根 0.5；**只登记组根** + 增量路径（子树靠戳级联失配重建）。
         let _ = h.tree.set_style_patch_for_test(
             group,
             StylePatch {
@@ -4440,13 +3874,10 @@ mod tests {
             "焦点环边框色级联"
         );
 
-        // 戳写回 ⇒ 稳定帧零重建（I3；四类图元的 lane 都不再重建）。
         let settled = h.paint_incremental(&[]);
         assert_eq!(settled.rebuilt, 0, "有效不透明度不变 ⇒ 零重建");
     }
 
-    /// E13 组不透明度 ③：变更只重建被调光的那棵子树（兄弟子树整条复用），
-    /// 且戳写回后稳定帧零重建（I3）。
     #[test]
     fn a_group_opacity_change_rebuilds_only_that_subtree_then_settles() {
         let mut h = Harness::new();
@@ -4496,11 +3927,9 @@ mod tests {
             "兄弟子树整条复用（不因别人的调光重建）"
         );
 
-        // 戳已写回 ⇒ 下一帧完全静止。
         let again = h.paint_incremental(&[]);
         assert_eq!(again.rebuilt, 0, "有效不透明度不变 ⇒ 零重建");
 
-        // 兄弟子树的颜色不受影响（1.0）—— 级联只在各自祖先链内。
         let sibling_fill = lane_primitives(&h, child_b)
             .iter()
             .find_map(|primitive| match primitive {
@@ -4513,7 +3942,6 @@ mod tests {
             .expect("child b quad");
         assert_eq!(sibling_fill, Color::WHITE, "兄弟子树保持不透明");
 
-        // 增量路径确实把 0.25 乘进了两条 lane。
         let group_fill = lane_primitives(&h, group_a)
             .iter()
             .find_map(|primitive| match primitive {
@@ -4541,8 +3969,6 @@ mod tests {
             "子节点继承 0.25（父调光在增量路径上同样级联）"
         );
 
-        // 恢复方向（0.25 → 1.0）：复用判据若写成「只对变暗重建」（`opacity >= 戳`），这一步
-        // 不会重建、颜色停在 0.25 —— 恢复方向必须有独立用例（审查 F4 / M6 存活）。
         let _ = h
             .tree
             .set_style_patch_for_test(group_a, StylePatch::default());
@@ -4581,15 +4007,6 @@ mod tests {
         );
     }
 
-    /// **E13 审查 F1（残影回归）**：组淡出到 0 时，旧 `Shadow`（外溢节点盒）与溢出子节点的
-    /// `Quad`（落在父盒之外）都必须进 damage —— 引擎只按 damage rect 重绘、未变区域从前帧拷贝，
-    /// 漏覆盖就是屏幕残影。
-    ///
-    /// 双帧断言：首帧全量（旧像素就是这一帧画出来的）→ 只登记组根把 opacity 改成 0 → 增量帧的
-    /// `damage` 必须完整覆盖「旧阴影外溢区」与「父盒外的子背景」。
-    ///
-    /// 变异守卫：`painted_content` 只记文本 / 图片 / Canvas（不记 `Quad` / `Shadow`）⇒ 第二帧
-    /// damage 只剩组盒，两处覆盖断言变红（= 审查探针①）。
     #[test]
     fn a_group_fade_to_zero_damages_the_old_shadow_spill_and_the_overflowing_child() {
         let mut h = Harness::new();
@@ -4613,25 +4030,18 @@ mod tests {
             .paint(with_white())
             .build(&mut h.tree, group)
             .expect("child");
-        // 手工布局：组在 (0,0)，子节点**溢出到父盒之外**（x ∈ [149,191]，真实布局的负边距 /
-        // 绝对定位都会产生这种盒子关系）。
         set_layout(&mut h.tree, group, Rect::new(0.0, 0.0, 100.0, 60.0));
         set_layout(&mut h.tree, child, Rect::new(149.0, 0.0, 42.0, 20.0));
         let _ = h.paint();
 
-        // 首帧只作为上下文：证明这两块区域确实被画过（旧像素存在才有「残影」）。
         let first = h.damage.rects().to_vec();
-        // 旧阴影的实际外溢：投影盒 (0,25,100,60) 再外扩 `3σ + 1`（σ = 20/2 = 10 ⇒ 31），
-        // 即 (−31,−6)-(131,116)；这里取「节点盒下方」的一段，节点盒完全盖不住它。
         let shadow_spill = PhysicalRect::new(0, 61, 100, 116);
-        // 父盒外的子背景（父盒 x ∈ [0,100]）。
         let overflow = PhysicalRect::new(149, 0, 191, 20);
         assert!(
             damage_covers(&first, shadow_spill),
             "首帧旧阴影必须被画到：{first:?}"
         );
 
-        // 只登记组根：子树靠 `paint_opacity` 戳级联失配重建（真实淡出路径只标组根）。
         let _ = h.tree.set_style_patch_for_test(
             group,
             StylePatch {
@@ -4651,17 +4061,10 @@ mod tests {
             damage_covers(&damage, overflow),
             "父盒外的子节点背景必须进 damage：{damage:?}"
         );
-        // 图元确实全部消失（damage 断言不能靠「其实还在画」蒙混过关）。
         assert!(h.tree.lane_of(group).is_none(), "组 lane 应被释放");
         assert!(h.tree.lane_of(child).is_none(), "子 lane 应被释放");
     }
 
-    /// **E13 审查 F5 / M8（几何节点的组不透明度戳）**：祖先因别的原因重绘时（`expand` 覆盖
-    /// 整棵子树），几何节点的块复用判据必须能命中「有效不透明度已一致」的戳，否则每帧全量重建
-    /// 块 lane（I3 退化、动画成本放大）。
-    ///
-    /// 变异守卫：删掉 `paint_geometry_node` 末尾的 `set_paint_opacity` ⇒ 戳停在 1.0，第二帧会
-    /// 把几何块 lane 一起重建（`rebuilt == 2`、块版本推进），本用例变红。
     #[test]
     fn a_geometry_node_under_a_group_fade_stays_reusable_when_only_the_group_repaints() {
         let mut h = Harness::new();
@@ -4684,7 +4087,6 @@ mod tests {
                 ..StylePatch::default()
             },
         );
-        // 首帧：组 0.5 级联到几何节点，几何路径写回戳 0.5。
         let _ = h.paint();
         let geometry_color = |h: &Harness| {
             lane_primitives(h, geometry)
@@ -4699,7 +4101,6 @@ mod tests {
         let lane = h.tree.lane_at(geometry, 0).expect("块 lane");
         let version = h.scene.lane_state(lane).expect("lane").0;
 
-        // 只重绘组根（几何节点自身没有被标脏）：`expand` 覆盖子树后，几何节点应整块复用。
         h.mark_paint(group);
         let report = h.paint_incremental(&[group]);
         assert_eq!(
@@ -4714,11 +4115,6 @@ mod tests {
         assert_eq!(geometry_color(&h), Color::WHITE.with_opacity(0.5));
     }
 
-    // ── E13：阴影 `spread` + 多层 ─────────────────────────────────────────────
-
-    /// E13 阴影 ①：`spread` 在 CPU 侧折算成「投影盒四边外扩 + 圆角同量增加」；σ 不变。
-    ///
-    /// 变异守卫：忽略 `spread`（rect 恒 `bounds`、半径不变）⇒ 本用例变红。
     #[test]
     fn shadow_spread_expands_the_projection_box_and_the_corner_radii() {
         let mut h = Harness::new();
@@ -4755,7 +4151,6 @@ mod tests {
         assert_eq!(shadow.corner_radius, [11.0; 4], "圆角 = 原半径 + spread");
         assert_eq!(shadow.blur, 6.0, "σ 不随 spread 变");
 
-        // 负 spread：盒收缩，半径 clamp 到 0（CSS `box-shadow` 的语义）。
         let negative = NodeBuilder::boxed()
             .style(fixed_style(50.0, 20.0))
             .paint(PaintSpec {
@@ -4784,9 +4179,6 @@ mod tests {
         assert_eq!(shadow.corner_radius, [3.0; 4], "半径随负 spread 减小");
     }
 
-    /// E13 阴影 ②：多层按数组序发射（先画的在下），全部在背景 quad 之前；层数上限 4。
-    ///
-    /// 变异守卫：只画第一层（`spec.shadows.iter().take(1)`）⇒ 层数断言变红。
     #[test]
     fn shadow_layers_are_emitted_in_order_and_capped() {
         let mut h = Harness::new();
@@ -4838,14 +4230,6 @@ mod tests {
         assert!(last_shadow < background, "全部阴影层都在背景之前绘制");
     }
 
-    // ── E13：整组淡出（`Transient` + `App::animate` 只登记组根）─────────────────
-
-    /// 组不透明度的**端到端**证据：`FrameRecord` 里编码出的 quad 颜色（= 交给 GPU 的实例色）随
-    /// 组根 `Transient` 整体变化，子树自动跟随；兄弟组不受影响；淡到 0 时组件整棵不产生图元。
-    ///
-    /// 为什么用 `FrameRecord` 而不是 paint 内部图元：`App::animate` 的 `nodes` 只登记**组根**，
-    /// 子树的重绘完全靠 `paint_opacity` 戳的级联失配。这条测试同时守护「只登记根节点也能整组
-    /// 淡出」（P2-4b 的 G6 诉求）。
     #[cfg(feature = "test-support")]
     mod group_fade {
         use std::time::Duration;
@@ -4863,8 +4247,6 @@ mod tests {
             test_support::app::TestApp,
         };
 
-        /// 固定尺寸的布局样式（组 / 子 / 兄弟都是真实布局盒，不用 `layout_override`：
-        /// 覆盖节点是布局叶子，挂不了子节点）。
         fn sized(width: f32, height: f32) -> Style {
             let mut inner = taffy::Style::<SmolStr>::DEFAULT;
             inner.size = taffy::geometry::Size {
@@ -4884,8 +4266,6 @@ mod tests {
             }
         }
 
-        /// 带大阴影的浮层壳：阴影 `(0, 25, blur 20, spread 0)` ⇒ σ = 10、顶点外扩 `3σ + 1 = 31`
-        /// ⇒ 实际覆盖到节点盒下方 56 px（足够溢出组盒，用于 F1 的残影断言）。
         fn floating_shell() -> PaintSpec {
             PaintSpec {
                 background: Color::WHITE,
@@ -4899,14 +4279,12 @@ mod tests {
             }
         }
 
-        /// 物理 damage 是否覆盖某个物理像素点（引擎只重绘 damage rect：漏覆盖 = 残影）。
         fn damage_has_point(damage: &[PhysicalRect], x: i32, y: i32) -> bool {
             damage
                 .iter()
                 .any(|rect| rect.x0 <= x && x < rect.x1 && rect.y0 <= y && y < rect.y1)
         }
 
-        /// 该节点编码出的 quad 的不透明度（`None` = 本帧没有这个节点的 quad）。
         fn alpha_of(
             record: &crate::test_support::record::FrameRecord,
             node: crate::node::id::NodeId,
@@ -4958,7 +4336,6 @@ mod tests {
             assert_eq!(alpha_of(&first, child), Some(1.0));
             assert_eq!(alpha_of(&first, sibling), Some(1.0));
 
-            // 只登记**组根**：子树必须靠级联戳自动重绘（不逐节点 bind）。
             app.app_mut()
                 .animate(
                     window,
@@ -4987,16 +4364,12 @@ mod tests {
             );
             assert_eq!(alpha_of(&middle, sibling), Some(1.0), "兄弟组不受影响");
 
-            // 到终值：组与子树整棵不产生图元（alpha 0 ⇒ 图元被丢弃），兄弟保持。
             app.advance(Duration::from_millis(60));
             let done = app.drain().expect("淡出结束帧").clone();
             assert_eq!(alpha_of(&done, group), None, "淡到 0 后组不再产生图元");
             assert_eq!(alpha_of(&done, child), None, "子树同上");
             assert_eq!(alpha_of(&done, sibling), Some(1.0), "兄弟组仍然不透明");
 
-            // **E13 审查 F1（双帧 FrameRecord 断言）**：淡出到 0 的那一帧必须把旧阴影的实际
-            // 覆盖区（含节点盒外的外溢）并入 damage —— 引擎只按 damage rect 重绘，漏了就是残影。
-            // 旧阴影 = 组盒下移 25、外扩 `3σ + 1`（σ = 20/2 = 10 ⇒ 31）⇒ 盒下方 10 px 仍在阴影内。
             let group_bounds = app
                 .app()
                 .window(window)

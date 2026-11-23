@@ -1,14 +1,9 @@
-//! 滚动：夹紧、视口、最近滚动祖先、滚轮目标（纯逻辑；状态在 `Node.interaction.scroll`）。
-//!
-//! 偏移是 `Transient` 语义（不登记依赖、不标脏位）；应用点是 `paint` 的累计偏移与 `hit_test` 的点换算
-
 use crate::{
     interaction::{ScrollAxis, ScrollSlot},
     math::{Point, Rect, Size},
     node::{id::NodeId, tree::NodeTree},
 };
 
-/// 让 `point` 落在 `[0, max]` 内。
 #[must_use]
 pub(crate) fn clamp(value: f32, max: f32) -> f32 {
     if max <= 0.0 {
@@ -17,7 +12,6 @@ pub(crate) fn clamp(value: f32, max: f32) -> f32 {
     value.clamp(0.0, max)
 }
 
-/// 某轴的可用滚动范围（`content - viewport`，`>= 0`）。
 #[must_use]
 pub(crate) fn max_offset(slot: &ScrollSlot, viewport: Size) -> Point {
     let max_x = (slot.content.width - viewport.width).max(0.0);
@@ -28,7 +22,6 @@ pub(crate) fn max_offset(slot: &ScrollSlot, viewport: Size) -> Point {
     }
 }
 
-/// 夹紧后的偏移（只 clamp 该容器的轴；另一轴恒 0）。
 #[must_use]
 pub(crate) fn clamp_offset(slot: &ScrollSlot, viewport: Size) -> Point {
     let max = max_offset(slot, viewport);
@@ -38,7 +31,6 @@ pub(crate) fn clamp_offset(slot: &ScrollSlot, viewport: Size) -> Point {
     }
 }
 
-/// 节点自身的滚动视口（`bounds.inset(border)` = padding box，屏幕空间）。
 #[must_use]
 pub(crate) fn viewport(tree: &NodeTree, node: NodeId) -> Rect {
     tree.get(node).map_or_else(
@@ -47,7 +39,6 @@ pub(crate) fn viewport(tree: &NodeTree, node: NodeId) -> Rect {
     )
 }
 
-/// 从 `from`（含自身）向上找第一个挂了滚动槽的节点。
 #[must_use]
 pub(crate) fn scroll_ancestor(tree: &NodeTree, from: NodeId) -> Option<(NodeId, ScrollSlot)> {
     let mut cursor = Some(from);
@@ -60,10 +51,6 @@ pub(crate) fn scroll_ancestor(tree: &NodeTree, from: NodeId) -> Option<(NodeId, 
     None
 }
 
-/// 某个节点的**祖先**滚动偏移之和（不含自身；屏幕 = 内容 − 该值）。
-///
-/// 用途：`damage` / `resolve_placement` 需要把**内容坐标**换算成屏幕坐标，而容器自身的 `offset`
-/// 只作用于它的子树，不作用于它自己的 bounds。
 #[must_use]
 pub(crate) fn ancestor_offset(tree: &NodeTree, node: NodeId) -> Point {
     let mut total = Point::ZERO;
@@ -77,7 +64,6 @@ pub(crate) fn ancestor_offset(tree: &NodeTree, node: NodeId) -> Point {
     total
 }
 
-/// 把内容坐标的矩形换算到屏幕坐标（减去祖先滚动偏移）。
 #[must_use]
 pub(crate) fn to_screen(tree: &NodeTree, node: NodeId, rect: Rect) -> Rect {
     let offset = ancestor_offset(tree, node);

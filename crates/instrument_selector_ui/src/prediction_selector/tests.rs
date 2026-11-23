@@ -1,12 +1,3 @@
-//! The prediction dialog's state machine.
-//!
-//! The old suite drove the dialog through a real window and the old toolkit's executor. The engine
-//! has no executor to drive from a test host, so the read and translation supervisors (which
-//! are tokio tasks) are out of reach here; what is asserted instead is everything the
-//! supervisors report back into: the affordance rules, the chunk application, the
-//! cancellation paths, paging and confirmation. The supervisor functions themselves are
-//! exercised by the real application, and the ledger records which old tests became which.
-
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use ahash::AHashSet;
@@ -26,7 +17,6 @@ use smol_str::{SmolStr, format_smolstr};
 use super::*;
 use crate::test_support::{EchoTranslator, Harness};
 
-/// One source that answers every read with the same page.
 #[derive(Clone)]
 struct FakeSource {
     page: Arc<PredictionEventsPage>,
@@ -112,8 +102,6 @@ fn translatable_page() -> PredictionEventsPage {
     ])
 }
 
-/// A host whose translation engine is present (`translator`) and whose settings name a
-/// model and its directory, as a user who configured translation has.
 fn translation_host(translator: bool) -> Harness {
     let harness = Harness::new();
 
@@ -124,7 +112,6 @@ fn translation_host(translator: bool) -> Harness {
     }
 }
 
-/// The same host with the model configured.
 fn configured(translator: bool) -> Harness {
     let mut harness = translation_host(translator);
     harness.update_config(|config| {
@@ -135,7 +122,6 @@ fn configured(translator: bool) -> Harness {
     harness
 }
 
-/// A state over `harness` with `page` loaded, as a completed read leaves it.
 fn loaded_state(
     harness: &mut Harness,
     page: PredictionEventsPage,
@@ -184,13 +170,9 @@ fn an_english_interface_hides_the_translate_button() {
     );
 }
 
-/// An English interface does not draw the control at all: the old dialog returned an empty
-/// element instead of a button, and a disabled button would be a control that can never do
-/// anything. The container the button lives in is what is hidden, so it leaves the layout and
-/// the pointer never reaches it.
 #[test]
 fn an_english_interface_hides_the_control_not_only_the_affordance() {
-    let mut harness = configured(true); // Chinese: translation is offered
+    let mut harness = configured(true);
     let mut state = loaded_state(&mut harness, translatable_page(), true);
     let body = harness.root();
     let window = harness.window();
@@ -219,12 +201,6 @@ fn an_english_interface_hides_the_control_not_only_the_affordance() {
     );
 }
 
-/// Waiting text is dimmed while its translation is in flight; `reduce_motion` is what skips
-/// the dimming and lands on the final value, and a title whose translation arrived is drawn
-/// at full strength either way.
-///
-/// The assertion is on the opacity the text node's `bind_style` computed, so an
-/// implementation that ignores `reduce_motion` (dimming always) fails here.
 #[test]
 fn a_pending_title_is_dimmed_unless_the_application_reduces_motion() {
     let mut harness = configured(true);
@@ -307,9 +283,6 @@ fn a_pending_title_is_dimmed_unless_the_application_reduces_motion() {
     );
 }
 
-/// A chunk's texts are matched back by the id the translator echoes, not by their position in
-/// the answer: a translator that returns its segments reordered must still land every text on
-/// the source it translates.
 #[test]
 fn a_chunk_is_matched_by_segment_id_not_by_position() {
     let mut harness = configured(true);
@@ -324,7 +297,6 @@ fn a_chunk_is_matched_by_segment_id_not_by_position() {
         TranslationEvent::Chunk {
             generation: 9,
             chunk,
-            // The ids the request carried, answered in the opposite order.
             outcome: Ok(vec![
                 TranslatedSegment {
                     id: SmolStr::new_static("s01"),
@@ -360,8 +332,6 @@ fn a_chunk_is_matched_by_segment_id_not_by_position() {
     );
 }
 
-/// The dialog's signals live in a scope of its own: finishing releases it, and releasing it
-/// again reclaims nothing.
 #[test]
 fn the_dialog_releases_its_signal_scope_when_it_finishes() {
     let mut harness = Harness::new();
@@ -822,8 +792,6 @@ fn error_messages_resolve_in_the_language_the_host_renders() {
     );
 }
 
-/// A page's categories accumulate across pages, so a category label that a later
-/// generation renames is updated rather than duplicated.
 #[test]
 fn a_renamed_category_updates_the_known_label() {
     let mut harness = configured(true);
@@ -844,7 +812,6 @@ fn a_renamed_category_updates_the_known_label() {
     assert_eq!(state.categories[0].label, "Politics (renamed)");
 }
 
-/// The pending set is a set, not a list: a text two cards share is tracked once.
 #[test]
 fn a_shared_label_is_pending_once() {
     let mut harness = configured(true);
@@ -872,7 +839,6 @@ fn a_shared_label_is_pending_once() {
     assert_eq!(pending, &expected);
 }
 
-/// A second click while a run is in flight starts nothing.
 #[test]
 fn a_second_click_while_busy_starts_nothing() {
     let mut harness = configured(true);
@@ -892,8 +858,6 @@ fn a_second_click_while_busy_starts_nothing() {
     );
 }
 
-/// Nothing to translate means nothing to start: an all-translated page leaves the
-/// finished translation in place.
 #[test]
 fn clicking_a_fully_translated_page_starts_nothing() {
     let mut harness = configured(true);
@@ -910,8 +874,6 @@ fn clicking_a_fully_translated_page_starts_nothing() {
     assert_eq!(state.translation_generation, generation);
 }
 
-/// The timeout is a per-run value the dialog owns, which is what lets the supervisor
-/// take it as an argument (and a test assemble a run without a clock).
 #[test]
 fn the_run_timeout_is_the_dialog_s_own_value() {
     let mut harness = Harness::new();

@@ -1,6 +1,5 @@
 use smol_str::SmolStr;
 
-/// Authentication state for a physical connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
     Stateful {

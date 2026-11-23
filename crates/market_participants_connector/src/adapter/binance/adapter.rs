@@ -77,7 +77,6 @@ use crate::{
     runtime::{CredentialState, MarketParticipantNetworkSnapshot},
 };
 
-/// The public REST paths one Binance product family serves its data on.
 #[derive(Clone, Copy)]
 struct BinanceRest {
     market_participant_info: &'static str,
@@ -96,7 +95,6 @@ struct BinanceRest {
     listen_key: &'static str,
 }
 
-/// The spot market's own paths.
 const SPOT_REST: BinanceRest = BinanceRest {
     market_participant_info: "api/v3/exchangeInfo",
     klines: "api/v3/klines",
@@ -114,7 +112,6 @@ const SPOT_REST: BinanceRest = BinanceRest {
     listen_key: "api/v3/userDataStream",
 };
 
-/// The USD-M perpetual market's own paths.
 const PERPETUAL_REST: BinanceRest = BinanceRest {
     market_participant_info: "fapi/v1/exchangeInfo",
     klines: "fapi/v1/klines",
@@ -132,13 +129,8 @@ const PERPETUAL_REST: BinanceRest = BinanceRest {
     listen_key: "fapi/v1/listenKey",
 };
 
-/// The issuance domain every Binance-listed asset belongs to.
-///
-/// Binance lists a code, not a verified on-chain token, so its assets are
-/// venue-issued tokens of the venue's own domain.
 const BINANCE_ISSUER: &str = "binance";
 
-/// The credentials one Binance market signs with.
 #[derive(Clone)]
 struct BinanceMarketSigner {
     api_key: SmolStr,
@@ -147,23 +139,12 @@ struct BinanceMarketSigner {
 
 #[derive(Clone)]
 pub struct BinanceAdapter {
-    /// The venue this adapter speaks to; it never decides routing.
     venue: VenueId,
     pub codec: BinanceCodec,
-    /// The configured signer of each market, absent where the operator configured none.
-    ///
-    /// The venue grants each of its products its own key, so the signer a request uses
-    /// is the one its own market was configured with, and a market holding none signs
-    /// with nothing.
     credentials: BTreeMap<BinanceCredentialMarket, BinanceMarketSigner>,
 }
 
 impl BinanceAdapter {
-    /// Builds an adapter with no configured credentials.
-    ///
-    /// A release build reaches a configured adapter through [`Self::from_config`], which
-    /// is the only constructor that reads a venue's settings; a fixture that drives
-    /// signing and verification without a configuration builds this one.
     #[cfg(test)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -173,13 +154,6 @@ impl BinanceAdapter {
         })
     }
 
-    /// Builds the adapter with the credentials the runtime snapshot holds.
-    ///
-    /// One signer is built per market, because Binance signs each of its products with
-    /// its own set and a signature made for one is refused by the other. A set that is
-    /// only partly filled is refused here — where the venue's settings are first read —
-    /// rather than at the request that would have signed with half a key, and a market
-    /// the operator left empty simply has no signer.
     pub fn from_config(
         config: &MarketParticipantNetworkSnapshot,
     ) -> Result<Arc<Self>, MarketParticipantError> {
@@ -203,9 +177,6 @@ impl BinanceAdapter {
                     );
                 }
                 CredentialState::Unconfigured => {}
-                // The venue's settings hold Binance's own credential shape, so the one
-                // set that reaches here is a market the operator has not finished
-                // filling in.
                 CredentialState::Invalid(_) => {
                     return Err(MarketParticipantError::IncompleteCredentials {
                         venue,
@@ -221,7 +192,6 @@ impl BinanceAdapter {
         }))
     }
 
-    /// The product family of this execution's scope.
     fn product(context: &ExecutionContext) -> Result<BinanceProduct, MarketParticipantError> {
         BinanceCodec::product(&context.route()).ok_or_else(|| {
             MarketParticipantError::UnsupportedCapability {
@@ -231,7 +201,6 @@ impl BinanceAdapter {
         })
     }
 
-    /// The REST paths of one product family.
     fn rest(product: BinanceProduct) -> Result<&'static BinanceRest, MarketParticipantError> {
         match product {
             BinanceProduct::Spot => Ok(&SPOT_REST),
@@ -244,10 +213,6 @@ impl BinanceAdapter {
         }
     }
 
-    /// Joins one REST path onto the HTTP origin the venue configuration gives.
-    ///
-    /// The origin is never guessed: it is the pair the request's venue gives its
-    /// scope, and every venue this build speaks states both members.
     fn http_url(context: &ExecutionContext, path: &str) -> Result<Url, MarketParticipantError> {
         context.http_origin().join(path).map_err(|_| {
             MarketParticipantError::Configuration(format_smolstr!(
@@ -257,7 +222,6 @@ impl BinanceAdapter {
         })
     }
 
-    /// Joins one WebSocket path onto the origin the venue configuration gives.
     fn websocket_url(
         context: &ExecutionContext,
         path: &str,
@@ -270,12 +234,6 @@ impl BinanceAdapter {
         })
     }
 
-    /// Opens, or reuses, one connection to a resolved origin.
-    ///
-    /// The key is the whole transport identity of this execution: its origin, its
-    /// venue route and all three typed generations. The venue is the credential
-    /// identity of this build, and the account is carried as the auth identity on
-    /// top of it.
     async fn connection(
         &self,
         context: &ExecutionContext,
@@ -286,9 +244,6 @@ impl BinanceAdapter {
             .auth
             .as_ref()
             .map(|value| SmolStr::new(value.account_id()));
-        // The protocol is built before the key because the key is built from it: the
-        // upgrade headers a connection declares are one value, and the key that decides
-        // whether a socket may be reused reads them off the protocol that dials.
         let protocol = ConnectionProtocol::new(BinanceCodec::extract_response_id)
             .with_liveness_timeout(liveness_timeout(&context.route()));
         let key = crate::adapter::bind_execution_identity(
@@ -317,7 +272,6 @@ impl BinanceAdapter {
         .await
     }
 
-    /// Performs one public REST GET and returns the raw body.
     async fn get_bytes(
         &self,
         context: &ExecutionContext,
@@ -352,7 +306,6 @@ impl BinanceAdapter {
         Ok(body)
     }
 
-    /// Performs one public REST GET and decodes its JSON body.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         context: &ExecutionContext,
@@ -362,12 +315,6 @@ impl BinanceAdapter {
         self.codec.decode(&body)
     }
 
-    /// The credentials one execution signs with.
-    ///
-    /// The request's own resolved credentials win: they are the ones the route's own
-    /// venue configuration produced for this account. A request that carries none falls back
-    /// to the signer its own market was configured with, and a market holding no
-    /// configured set signs with nothing — it never borrows its sibling market's key.
     fn credentials_for_context(
         &self,
         context: &ExecutionContext,
@@ -414,10 +361,6 @@ impl BinanceAdapter {
         }
     }
 
-    /// The configured signer of the market one route addresses.
-    ///
-    /// The scope names the market, and a scope this venue serves no market for has no
-    /// signer of its own: the answer is nothing rather than another market's key.
     fn configured_signer(&self, route: &VenueRoute) -> Option<&BinanceMarketSigner> {
         let market = match BinanceCodec::product(route)? {
             BinanceProduct::Spot => BinanceCredentialMarket::Spot,
@@ -427,11 +370,6 @@ impl BinanceAdapter {
         self.credentials.get(&market)
     }
 
-    /// Performs one signed REST call and returns the raw body.
-    ///
-    /// The signature covers exactly the query string that is sent, and the
-    /// endpoint an error reports never carries that query: it holds the
-    /// credential and its signature.
     pub(crate) async fn signed_request(
         &self,
         context: &ExecutionContext,
@@ -569,9 +507,6 @@ impl BinanceAdapter {
         let decoded: BinanceMarketParticipantInfo = self.get_json(context, url).await?;
         let mut markets = Vec::with_capacity(decoded.symbols.len());
         for symbol in decoded.symbols {
-            // The scope holds USD-M perpetuals only: a dated future of the same
-            // base asset carries the same native symbol, and mixing the two in one
-            // scope would collide on that symbol.
             if product == BinanceProduct::Perpetual
                 && !matches!(
                     symbol.contract_type.as_deref(),
@@ -614,10 +549,6 @@ impl BinanceAdapter {
         let rows: Vec<BinanceTickerWire> = self.get_json(context, url).await?;
         let mut result = Vec::with_capacity(rows.len());
         for row in rows {
-            // A route-level answer names its subject by the venue's symbol alone,
-            // so the key is derived from that symbol exactly as the catalog
-            // derives it; a symbol the published catalog does not hold is dropped
-            // by the caller instead of being published under a new key.
             let key = BinanceCodec::listing_key(&route, product, row.symbol.as_str())?;
             result.push(NativeListing::new(
                 key,
@@ -643,8 +574,6 @@ impl BinanceAdapter {
             .append_pair("symbol", symbol.as_str())
             .append_pair("limit", &query.depth.to_string());
         let wire: BinanceOrderBookWire = self.get_json(context, url).await?;
-        // The venue's own update id orders the book; there is no numeric one to
-        // publish when it is absent, so the answer is refused rather than numbered.
         let sequence = wire.last_update_id.ok_or_else(|| {
             protocol_error(
                 "decode Binance order book",
@@ -804,7 +733,6 @@ impl BinanceAdapter {
         }
     }
 
-    /// Places one order over the venue's REST trading endpoint.
     async fn place_order(
         &self,
         context: &ExecutionContext,
@@ -817,8 +745,6 @@ impl BinanceAdapter {
         let (_, symbol) = listing_identity(listing, "place order")?;
         let product = Self::product(context)?;
         let quantity = match &command.quantity {
-            // A USDT-M contract trades in base-asset units, which is the unit the
-            // venue's own `quantity` parameter is expressed in.
             OrderQuantity::AssetUnits { value, .. } | OrderQuantity::Contracts(value) => *value,
             OrderQuantity::Notional { .. } | OrderQuantity::OutcomeTokens { .. } => {
                 return Err(MarketParticipantError::Configuration(
@@ -880,7 +806,6 @@ impl BinanceAdapter {
         Ok(ProtocolResponse::OrderPlaced(id))
     }
 
-    /// Cancels one order over the venue's REST trading endpoint.
     async fn cancel_order(
         &self,
         context: &ExecutionContext,
@@ -1074,11 +999,6 @@ impl BinanceAdapter {
         Ok(ProtocolResponse::AccountTrades(trades))
     }
 
-    /// Reads the trading settings of one listing of one account.
-    ///
-    /// The position mode, the margin mode and the leverage of a listing are
-    /// perpetual-account settings: the spot market has no equivalent endpoint, so
-    /// a spot request is refused here instead of being answered by the futures API.
     async fn fetch_trading_settings(
         &self,
         context: &ExecutionContext,
@@ -1107,7 +1027,6 @@ impl BinanceAdapter {
         )?))
     }
 
-    /// The Binance adapter serves no position history on either scope.
     async fn reject_position_history(
         &self,
         context: &ExecutionContext,
@@ -1118,7 +1037,6 @@ impl BinanceAdapter {
         })
     }
 
-    /// Opens one public market-data subscription.
     async fn subscribe_request(
         &self,
         context: ExecutionContext,
@@ -1231,7 +1149,6 @@ impl BinanceAdapter {
                     let payload = tokio::select! { () = cancellation.cancelled() => return None, payload = next_payload => payload };
                     let payload = match payload {
                         Some(Ok(payload)) => payload,
-                        // A connection that stopped publishing ends its streams with why.
                         Some(Err(error)) => {
                             return Some((Err(error), (source, cancellation, kind)));
                         }
@@ -1256,11 +1173,6 @@ impl BinanceAdapter {
         ))
     }
 
-    /// Opens the account's user-data connection.
-    ///
-    /// The listen key is acquired from the route's own HTTP origin and the socket
-    /// is dialled on its own WebSocket origin: a spot account's user stream exists
-    /// on the spot market only and the futures one on the futures market.
     async fn private_connection(
         &self,
         context: &ExecutionContext,
@@ -1289,9 +1201,6 @@ impl BinanceAdapter {
             .auth
             .as_ref()
             .map(|value| SmolStr::new(value.account_id()));
-        // The protocol is built before the key because the key is built from it, and this
-        // key is read back through the pool before the listen key is acquired: a socket
-        // already dialled for this declaration is reused instead of registered again.
         let protocol = ConnectionProtocol::new(BinanceCodec::extract_response_id)
             .with_liveness_timeout(liveness_timeout(&context.route()));
         let key = crate::adapter::bind_execution_identity(
@@ -1354,7 +1263,6 @@ impl BinanceAdapter {
         Ok((connection, lifecycle))
     }
 
-    /// Opens one account stream over the user-data connection.
     async fn subscribe_private(
         &self,
         context: ExecutionContext,
@@ -1415,7 +1323,6 @@ impl BinanceAdapter {
                     };
                     let payload = match payload {
                         Some(Ok(payload)) => payload,
-                        // A connection that stopped publishing ends its streams with why.
                         Some(Err(error)) => return Some((Err(error), state)),
                         None => return None,
                     };
@@ -1464,12 +1371,6 @@ impl MarketParticipantAdapter for BinanceAdapter {
         &self.venue
     }
 
-    /// The venue-specific bounds of one route.
-    ///
-    /// The depth is the deepest book the venue hands over in one request, and the
-    /// intervals are the ones its kline endpoint publishes: the second candle
-    /// exists on the spot market only. Binance restates no history, so the one
-    /// adjustment convention its candles carry is the raw one.
     fn limits(&self, route: &VenueRoute) -> AdapterLimits {
         match route.scope.as_str() {
             crate::routing::SPOT_SCOPE => AdapterLimits {
@@ -1482,7 +1383,6 @@ impl MarketParticipantAdapter for BinanceAdapter {
                 timeframes: BinanceCodec::published_timeframes(route),
                 adjustments: vec![Adjustment::None],
             },
-            // A scope this adapter does not trade publishes no limits at all.
             _ => AdapterLimits {
                 order_book_depth_limit: 0,
                 timeframes: Vec::new(),
@@ -1636,18 +1536,14 @@ impl MarketParticipantAdapter for BinanceAdapter {
     }
 }
 
-/// The byte frames one connection publishes, as the decoders consume them.
 type ConnectionFrames = std::pin::Pin<
     Box<dyn futures::Stream<Item = Result<Bytes, MarketParticipantError>> + Send + 'static>,
 >;
 
-/// One account subscription's decoding state.
 struct PrivateStreamState {
     source: ConnectionFrames,
     cancellation: CancellationToken,
     kind: PrivateSubscriptionKind,
-    /// The listing the subscription named, when it named one: an order or position
-    /// of another listing is not an event of that subscription.
     listing: Option<ResolvedListingRef>,
     target: crate::protocol::AuthenticatedTarget,
     adapter: BinanceAdapter,
@@ -1656,7 +1552,6 @@ struct PrivateStreamState {
     product: BinanceProduct,
 }
 
-/// Which stream family of a product family one subscription belongs to.
 #[derive(Clone, Copy)]
 enum StreamPath {
     Market,
@@ -1664,10 +1559,6 @@ enum StreamPath {
 }
 
 impl StreamPath {
-    /// The path of one stream family on the product's WebSocket origin.
-    ///
-    /// The spot market serves every public stream on `/ws`; the futures market
-    /// splits its market-data streams and its public streams onto separate paths.
     const fn path(self, product: BinanceProduct) -> &'static str {
         match (self, product) {
             (Self::Public, BinanceProduct::Perpetual) => "public/stream",
@@ -1677,11 +1568,6 @@ impl StreamPath {
     }
 }
 
-/// How long one Binance connection may stay silent and still be trusted.
-///
-/// Measured against the live venue: the spot endpoints ping every 20 seconds and the
-/// futures endpoints every 3 minutes, and the window is three pings so a single missed one
-/// is not a reason to throw a healthy socket away.
 fn liveness_timeout(route: &VenueRoute) -> Duration {
     match route.scope.as_str() {
         crate::routing::PERPETUAL_SCOPE => Duration::from_secs(540),
@@ -1689,10 +1575,6 @@ fn liveness_timeout(route: &VenueRoute) -> Duration {
     }
 }
 
-/// The listing and venue symbol one prepared request is about.
-///
-/// A listing whose venue identifier is absent cannot be encoded, and inventing one
-/// would name a listing the venue never published, so it is reported instead.
 fn listing_identity<'a>(
     listing: Option<&'a ResolvedListingRef>,
     operation: &'static str,
@@ -1709,7 +1591,6 @@ fn listing_identity<'a>(
     Ok((&listing.key, symbol))
 }
 
-/// The venue symbol of an account query, which may name no listing at all.
 fn narrowing<'a>(
     listing: Option<&'a ResolvedListingRef>,
     operation: &'static str,
@@ -1945,7 +1826,6 @@ enum StatisticsKind {
     Taker,
 }
 
-/// The venue filters one catalog entry's rules are built from.
 struct VenueRules {
     product: BinanceProduct,
     instrument: Instrument,
@@ -1960,7 +1840,6 @@ struct VenueRules {
     maintenance_margin_percent: Option<SmolStr>,
 }
 
-/// Decodes one public stream payload into the event the subscriber asked for.
 fn decode_subscription_event(
     payload: &[u8],
     kind: &SubscriptionKind,
@@ -2003,7 +1882,6 @@ fn decode_subscription_event(
                 return Ok(None);
             }
             let data = NativeTicker {
-                // Binance publishes no rolling-statistics identifier.
                 monotonic_id: None,
                 open: parse_price(&event.open, "decode Binance ticker event")?,
                 high: Some(parse_price(&event.high, "decode Binance ticker event")?),
@@ -2074,12 +1952,7 @@ fn decode_subscription_event(
                 Some(event) if event.event == "forceOrder" => event,
                 _ => return Ok(None),
             };
-            // The stream is route-level, so its subject is named by the venue's
-            // symbol alone; the key is derived from that symbol exactly as the
-            // catalog derives it.
             let listing = BinanceCodec::listing_key(route, *product, event.order.symbol.as_str())?;
-            // The venue publishes the liquidation order's own side: a long
-            // position is closed by a sell and a short one by a buy.
             let position_side = if event.order.side.eq_ignore_ascii_case("SELL") {
                 PositionSide::Long
             } else {
@@ -2113,13 +1986,11 @@ fn decode_stream_event<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Option
     })
 }
 
-/// One ticker answer of the venue's rolling-statistics endpoint.
 fn decode_ticker(
     wire: &BinanceTickerWire,
     operation: &'static str,
 ) -> Result<NativeTicker, MarketParticipantError> {
     Ok(NativeTicker {
-        // Binance publishes no rolling-statistics identifier.
         monotonic_id: None,
         open: parse_price(&wire.open_price, operation)?,
         high: wire
@@ -2138,11 +2009,6 @@ fn decode_ticker(
     })
 }
 
-/// One order-book side of a REST depth answer or of a diff depth event.
-///
-/// A level is decoded exactly as the venue printed it, a zero quantity included:
-/// the diff stream publishes one to remove the price level, and which of the two
-/// shapes the level may appear in is the model's rule, not the wire's.
 fn decode_levels(
     levels: &[BinanceLevelRow],
     operation: &'static str,
@@ -2158,11 +2024,6 @@ fn decode_levels(
         .collect()
 }
 
-/// One catalog entry of one Binance exchange-info symbol.
-///
-/// The entry carries the canonical instrument, its typed Binance identifiers, its
-/// trading rules and its listing status, so the catalog source has nothing left to
-/// decide about the venue's identity.
 fn decode_market_entry(
     route: &VenueRoute,
     product: BinanceProduct,
@@ -2210,9 +2071,6 @@ fn decode_market_entry(
         })
         .map(|value| parse::<Quantity>(value, "decode Binance minimum notional"))
         .transpose()?;
-    // The two assets the entry's own symbols name belong to the entry, while the
-    // settlement asset and the mark reference of a perpetual are decided inside
-    // the instrument's construction.
     let (instrument, mut asset_terms, reference_terms) =
         market_instrument(product, &symbol, &base, &quote)?;
     asset_terms.push(base_terms);
@@ -2246,18 +2104,10 @@ fn decode_market_entry(
         instrument,
         asset_terms,
         reference_terms,
-        // Every asset these listings publish states its own display code.
         asset_codes: Vec::new(),
     })
 }
 
-/// The canonical instrument one exchange-info symbol implements, together with
-/// the canonical terms its own construction produced.
-///
-/// A perpetual is margined and settled in the venue's own `marginAsset`, which is
-/// a third canonical asset of the entry, and it tracks the venue's mark of its
-/// underlying as its price reference. Neither is read back from a digest, so both
-/// come out of the one place they are built.
 fn market_instrument(
     product: BinanceProduct,
     symbol: &BinanceMarketParticipantSymbol,
@@ -2342,14 +2192,12 @@ fn market_instrument(
     Ok((instrument, asset_terms, reference_terms))
 }
 
-/// Builds the trading rules the venue's own published filters state.
 fn trading_rules(venue: VenueRules) -> Result<TradingRules, MarketParticipantError> {
     let common = CommonTradingRules {
         price: PriceRule {
             quote_asset: venue.quote.clone(),
             basis: PriceBasis::PerAssetUnit,
             tick: venue.tick,
-            // Binance publishes no absolute price bounds of its own.
             minimum: None,
             maximum: None,
         },
@@ -2366,9 +2214,6 @@ fn trading_rules(venue: VenueRules) -> Result<TradingRules, MarketParticipantErr
             minimum: Some(minimum),
             maximum: None,
         }),
-        // The venue's own price bands are neither the absolute nor the relative
-        // rule this model states, so no bound is published rather than a
-        // reinterpreted one.
         venue_policy: Arc::new(VenueTradingPolicy::continuous()),
     };
     let product = match venue.product {
@@ -2393,8 +2238,6 @@ fn trading_rules(venue: VenueRules) -> Result<TradingRules, MarketParticipantErr
                 venue.maintenance_margin_percent.as_deref(),
                 "decode Binance maintenance margin",
             )?;
-            // A perpetual is margined and funded in the asset it settles in, which
-            // is the venue's own `marginAsset` of the contract.
             let settlement = match venue.instrument.terms() {
                 InstrumentTerms::Perpetual(terms) => terms.settlement_asset().clone(),
                 _ => {
@@ -2430,8 +2273,6 @@ fn trading_rules(venue: VenueRules) -> Result<TradingRules, MarketParticipantErr
                     })?,
                 ),
                 funding: FundingSchedule {
-                    // The venue sets a contract's funding interval per contract
-                    // and its catalog endpoint does not state which one applies.
                     interval: FundingInterval::Adaptive,
                     funding_rate_cap: None,
                     funding_rate_floor: None,
@@ -2457,11 +2298,6 @@ fn trading_rules(venue: VenueRules) -> Result<TradingRules, MarketParticipantErr
     Ok(rules)
 }
 
-/// The one leverage tier the venue's own margin requirement states.
-///
-/// Binance publishes a single initial-margin requirement per contract and no
-/// per-notional tier ladder, so that requirement is the contract's only tier and
-/// the tier's cap is the largest order the venue accepts for it.
 fn leverage_tier(
     initial_margin: Fraction,
     maintenance_margin: Fraction,
@@ -2473,8 +2309,6 @@ fn leverage_tier(
             "the venue published no maximum order size for the contract",
         )
     })?;
-    // `initial_margin` is `p / 100` of the notional, so the venue's own maximum
-    // leverage is `100 / p`, evaluated exactly in fixed point.
     let scale = Quantity::from(1_u8).inner();
     let max_leverage = u32::try_from(scale / initial_margin.ratio().inner())
         .map_err(|_| protocol_error("decode Binance leverage", "leverage is out of range"))?;
@@ -2482,12 +2316,6 @@ fn leverage_tier(
         .map_err(|error| protocol_error("decode Binance leverage", format_smolstr!("{}", error)))
 }
 
-/// One venue asset code as the canonical venue-issued token it names.
-///
-/// The terms are built here, where the venue's own code is still authoritative,
-/// and the identity is derived from them: a digest cannot be read back into the
-/// terms the display contract renders, so a caller that needs the identity takes
-/// it from [`AssetTerms::asset_id`] rather than the other way round.
 pub(super) fn venue_asset(code: &str) -> Result<AssetTerms, MarketParticipantError> {
     let issuer = TokenIssuerId::new(BINANCE_ISSUER).map_err(|error| {
         protocol_error("decode Binance asset issuer", format_smolstr!("{}", error))
@@ -2514,10 +2342,6 @@ pub(super) fn venue_asset(code: &str) -> Result<AssetTerms, MarketParticipantErr
     Ok(AssetTerms::CryptoToken(terms))
 }
 
-/// The mark price reference a Binance perpetual is margined against.
-///
-/// The terms are the reference's identity, so they are built here and handed on
-/// with the instrument that tracks them.
 fn mark_reference(
     base: &AssetId,
     quote: &AssetId,
@@ -2556,11 +2380,6 @@ fn mark_reference(
     Ok(terms)
 }
 
-/// The lifecycle status one exchange-info symbol state stands for.
-///
-/// A state the venue added after this adapter was written is treated as halted: it
-/// must not allow a new order, and it is not terminal, so a settlement-side
-/// command stays possible.
 fn listing_status(status: &str) -> ListingStatus {
     match status {
         "TRADING" => ListingStatus::Trading,
@@ -2571,7 +2390,6 @@ fn listing_status(status: &str) -> ListingStatus {
     }
 }
 
-/// One venue margin percentage as the fraction of the notional it states.
 fn margin_fraction(
     value: Option<&str>,
     operation: &'static str,
@@ -2687,7 +2505,6 @@ fn statistics_period(timeframe: StatisticsTimeFrame) -> &'static str {
     }
 }
 
-/// The wall-clock timestamp Binance signs a request with.
 pub(crate) fn current_timestamp_ms() -> u64 {
     (time::OffsetDateTime::now_utc()
         .unix_timestamp_nanos()
@@ -2748,8 +2565,6 @@ mod tests {
         NativeSymbol::new(value).expect("the fixture symbol is valid")
     }
 
-    /// The context of one request, whose origins are the venue's own settings for the
-    /// scope.
     fn context(scope_name: &str) -> ExecutionContext {
         let transport = Arc::new(TransportHub::new(TransportPolicy::default()));
         let pool = Arc::new(ConnectionPool::with_transport(transport));
@@ -2788,8 +2603,6 @@ mod tests {
         }
     }
 
-    /// The venue's own limits: the spot book is five thousand levels deep and
-    /// publishes the one-second candle the futures market does not.
     #[test]
     fn limits_follow_the_venue_book_depth_and_kline_set() {
         let adapter = BinanceAdapter::new();
@@ -2802,7 +2615,6 @@ mod tests {
         assert!(!perpetual.timeframes.contains(&TimeFrame::Second1));
         assert_eq!(spot.timeframes.len(), 16);
         assert_eq!(perpetual.timeframes.len(), 15);
-        // Binance publishes no two-day candle on either market.
         assert!(!spot.timeframes.contains(&TimeFrame::Day2));
         assert!(!perpetual.timeframes.contains(&TimeFrame::Day2));
         assert!(spot.timeframes.contains(&TimeFrame::Month1));
@@ -2833,8 +2645,6 @@ mod tests {
         ));
     }
 
-    /// One venue catalog entry carries the canonical instrument, the typed
-    /// identifiers and the rules the venue's own filters state.
     #[test]
     fn a_spot_catalog_entry_carries_its_instrument_identifiers_and_rules() {
         let route = route(crate::routing::SPOT_SCOPE);
@@ -2898,16 +2708,12 @@ mod tests {
                 .map(|value| value.to_string()),
             Some("5".to_owned())
         );
-        // The published rules are the listing's own: the model accepts them for
-        // the instrument they were derived with.
         entry
             .rules
             .validate_for(&entry.instrument)
             .expect("the decoded rules must hold for the decoded instrument");
     }
 
-    /// A perpetual entry states the venue's own margin percentages, its single
-    /// leverage tier and the `marginAsset` it settles in.
     #[test]
     fn a_perpetual_catalog_entry_states_the_venue_margin_and_contract_size() {
         let route = route(crate::routing::PERPETUAL_SCOPE);
@@ -2962,8 +2768,6 @@ mod tests {
             .expect("the decoded rules must hold for the decoded instrument");
     }
 
-    /// A state the venue added after this adapter was written must not be read as
-    /// permission to trade.
     #[test]
     fn an_unknown_listing_status_is_halted() {
         assert_eq!(super::listing_status("TRADING"), ListingStatus::Trading);
@@ -2977,8 +2781,6 @@ mod tests {
         );
     }
 
-    /// A listing without a native symbol is refused instead of being encoded
-    /// under an invented one.
     #[test]
     fn a_request_without_a_native_symbol_is_rejected() {
         let error = listing_identity(None, "fetch ticker")
@@ -2989,9 +2791,6 @@ mod tests {
         ));
     }
 
-    /// A request's URL is the venue configuration's own origin with the venue's
-    /// path appended — never a host picked from a venue name, and never another
-    /// scope's host.
     #[test]
     fn a_request_url_is_the_venues_own_origin_with_its_path() {
         let spot = context(crate::routing::SPOT_SCOPE);
@@ -3064,7 +2863,6 @@ mod tests {
         assert_eq!(candlestick.data.timestamp, 1_700_000_000_000);
     }
 
-    /// A stream payload of another listing is not an event of this subscription.
     #[test]
     fn a_candle_of_another_symbol_is_not_published() {
         let event = decode_subscription_event(
@@ -3108,7 +2906,6 @@ mod tests {
         assert_eq!(update.data.asks[0].price.to_string(), "101");
     }
 
-    /// A liquidation order's own side is the opposite of the position it closes.
     #[test]
     fn a_force_order_names_the_position_side_it_closes() {
         let event = decode_subscription_event(
@@ -3133,7 +2930,6 @@ mod tests {
         );
     }
 
-    /// A ticker carries the venue's own numbers and no invented statistics id.
     #[test]
     fn a_ticker_carries_the_venue_numbers() {
         let ticker = decode_ticker(
@@ -3163,9 +2959,6 @@ mod tests {
         );
     }
 
-    /// A diff depth event removes a price level by publishing it with quantity
-    /// zero, so that level is decoded like any other and the book applies the
-    /// removal.
     #[test]
     fn a_depth_update_level_with_zero_quantity_is_decoded() {
         let event = decode_subscription_event(
@@ -3185,8 +2978,6 @@ mod tests {
         assert!(update.data.bids[0].quantity.is_zero());
     }
 
-    /// The two scopes address different markets: a spot route signs spot paths and
-    /// streams on the spot path, and the perpetual one its own.
     #[test]
     fn the_two_scopes_address_their_own_paths() {
         assert_eq!(

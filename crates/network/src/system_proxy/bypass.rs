@@ -1,5 +1,3 @@
-//! Chromium-style proxy bypass matching (`ignore-hosts` / `no_proxy` / `<local>`).
-
 use std::net::IpAddr;
 
 use url::Url;

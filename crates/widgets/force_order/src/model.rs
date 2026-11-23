@@ -1,13 +1,3 @@
-//! The force orders a pane retains, and how one row reads.
-//!
-//! A liquidation is reported by a route-level stream: the venue says which of its
-//! listings was liquidated, and the stream resolves that to the exact
-//! [`VenueListingKey`] it belongs to. This module keeps the liquidation together
-//! with what the published generation says about that listing — the name it is
-//! shown under and the increments its numbers are written at — because a listing key
-//! alone is not something a reader can recognise, and a liquidation carries no
-//! precision of its own.
-
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, PoisonError},
@@ -21,37 +11,20 @@ use time::{OffsetDateTime, UtcOffset};
 
 pub(super) const MAX_FORCE_ORDERS: usize = 200;
 
-/// The name one listing is shown under, when the published generation has one.
-///
-/// The name is read from the display catalog of one generation, so it is the same
-/// name the selector and every other pane draws the listing with. A generation that
-/// names no display for the listing is not a reason to invent one from the venue's
-/// own symbol or from an identity: the row says it is unknown, localized by the
-/// view, and the structured listing key stays in the order it came from.
 pub(super) type ForceOrderListingLabel = Option<SmolStr>;
 
-/// What one published generation says about the listing a row draws.
-///
-/// The name and the increments are read from the same generation, so a row cannot
-/// be named by one publication and written at the precision of another.
 #[derive(Clone, Debug)]
 pub(super) struct ForceOrderListing {
     pub label: ForceOrderListingLabel,
-    /// The increments the listing's numbers are written at, or nothing when the
-    /// generation does not hold its rules: the row then states the number in the
-    /// canonical decimal form rather than holding back the liquidation.
     pub precision: Option<ListingPrecision>,
 }
 
-/// One liquidation together with what the published generation says about its
-/// listing.
 #[derive(Clone, Debug)]
 pub(super) struct ForceOrderEntry {
     pub order: ListingForceOrder,
     pub listing: ForceOrderListing,
 }
 
-/// An immutable, cheap-to-clone view of the retained force orders.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ForceOrderSnapshot {
     orders: Arc<[Arc<ForceOrderRow>]>,
@@ -67,13 +40,6 @@ impl ForceOrderSnapshot {
     }
 }
 
-/// Two snapshots are the same read of the same retained set.
-///
-/// The equality decides whether publishing a snapshot is a change at all: a batch
-/// that leaves the retained orders as they were republishes the same read, so the
-/// cells and the table that read it must not be invalidated. It is the pointer
-/// identity of the retained set, which is how [`ForceOrderState::snapshot`] hands
-/// an unchanged set back.
 impl PartialEq for ForceOrderSnapshot {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.orders, &other.orders)
@@ -94,19 +60,10 @@ impl ForceOrderRow {
         &self.order
     }
 
-    /// The name the published generation gave this row's listing, if it gave one.
-    ///
-    /// The name does not depend on the display zone, so a cell that draws only the
-    /// name reads it here instead of asking for a formatted row.
     pub(super) fn listing_label(&self) -> &ForceOrderListingLabel {
         &self.listing.label
     }
 
-    /// The text of a row that is produced only once something draws it.
-    ///
-    /// The zone the time was read in is remembered beside the text, so a frame that
-    /// draws the same zone reuses it and a frame after the setting moved reads it
-    /// again.
     pub(super) fn display(&self, zone: UtcOffset) -> Arc<ForceOrderDisplay> {
         let mut cached = self.display.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((cached_zone, display)) = cached.as_ref()
@@ -130,8 +87,6 @@ pub(super) struct ForceOrderDisplay {
 
 impl ForceOrderDisplay {
     fn new(order: &ListingForceOrder, listing: &ForceOrderListing, zone: UtcOffset) -> Self {
-        // A liquidation is written at the increments of its own listing, so a price
-        // of `90000` on a listing with a tick of `0.01` reads as `90000.00`.
         let (price, quantity) = match listing.precision {
             Some(precision) => (
                 order
@@ -175,12 +130,6 @@ impl ForceOrderState {
         }
     }
 
-    /// Inserts a batch, keeping only the newest `maximum_orders` entries.
-    ///
-    /// Returns the number of retained orders so callers can distinguish a
-    /// batch that changed the visible set from one that was fully evicted.
-    /// Orders carry no market-participant-assigned identity, so two identical reports
-    /// stay distinct instead of silently collapsing into one row.
     pub(super) fn merge(&mut self, orders: &[ForceOrderEntry]) -> usize {
         let mut retained = 0;
         for entry in orders {
@@ -228,11 +177,7 @@ impl ForceOrderState {
     }
 }
 
-/// The time of a liquidation, read in the zone the settings display data in.
 fn format_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
-    // The offset can move an instant past the last date the calendar holds — a
-    // timestamp at the far end of the range is one the service cannot publish, and
-    // it is written as a placeholder rather than taken to a date that is not one.
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
         .ok()
         .and_then(|datetime| datetime.checked_to_offset(zone))
@@ -293,8 +238,6 @@ mod tests {
         }
     }
 
-    /// A price tick of one cent and a quantity step of one thousandth, so a label
-    /// that keeps the listing's precision is told apart from the canonical form.
     fn precision() -> ListingPrecision {
         ListingPrecision {
             price_tick: "0.01".parse().expect("a price tick should parse"),
@@ -349,9 +292,6 @@ mod tests {
         assert_eq!((retained, snapshot.len()), (2, 2));
     }
 
-    /// Two listings of one canonical instrument are two rows: the key that decides
-    /// which listing a liquidation belongs to is the exact listing, not the
-    /// instrument it implements.
     #[test]
     fn two_listings_of_one_instrument_should_stay_distinct_rows() {
         let mut state = ForceOrderState::new(2);
@@ -392,8 +332,6 @@ mod tests {
         );
     }
 
-    /// The display offset can move an instant past the last day the calendar holds.
-    /// That is not a time this can write, so it is a placeholder rather than a panic.
     #[test]
     fn a_time_the_display_zone_cannot_hold_should_read_as_a_placeholder() {
         let boundary = time::Date::MAX
@@ -428,8 +366,6 @@ mod tests {
         );
     }
 
-    /// A liquidation states its numbers at the increments of its own listing, so a
-    /// whole price keeps the decimals its tick states.
     #[test]
     fn row_display_should_write_the_numbers_at_the_listings_precision() {
         let mut state = ForceOrderState::new(1);
@@ -445,8 +381,6 @@ mod tests {
         );
     }
 
-    /// A generation that does not hold the listing's rules is not a reason to hold
-    /// back the liquidation: the row states the number it was given.
     #[test]
     fn row_display_should_state_the_number_without_a_published_precision() {
         let mut state = ForceOrderState::new(1);
@@ -471,8 +405,6 @@ mod tests {
         assert!(snapshot.orders().is_empty());
     }
 
-    /// Two snapshots are the same read only when they hold the same retained set: that
-    /// equality is what keeps an unchanged batch from invalidating the table's cells.
     #[test]
     fn a_snapshot_should_be_the_same_read_only_for_the_same_retained_set() {
         let mut state = ForceOrderState::new(2);

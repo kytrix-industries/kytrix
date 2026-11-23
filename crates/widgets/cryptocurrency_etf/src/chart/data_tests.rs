@@ -1,6 +1,3 @@
-//! The resolved view one chart draws: which days a window keeps, what each of them
-//! says, and what the pane's own row shows.
-
 use i18n::language::codes::LanguageCode;
 use smol_str::SmolStr;
 
@@ -10,15 +7,11 @@ use super::{
 };
 use crate::model::{CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow};
 
-/// The readings the row shows for a view, which is what the pane draws above the chart.
 fn metrics(data: &PreparedData, hover: Option<usize>) -> Metrics {
     data.metrics(hover)
         .expect("a window with days has a reading")
 }
 
-/// One line of a tooltip, as it is drawn: the caption the tooltip gives the day's flow,
-/// and then the amount the caption belongs to. The two are one reading drawn in two
-/// colours, so a test that wants to read it has to put them back together.
 fn flow_tooltip(point: &PreparedPoint) -> String {
     format!(
         "{}{}",
@@ -63,8 +56,6 @@ fn a_window_of_days_should_be_resolved_into_points_and_two_axes() {
     );
 }
 
-/// Both axes say what they count and what unit their numbers are read in: the numbers
-/// themselves are bare, so nothing else on the chart could say it.
 #[test]
 fn the_axes_should_name_the_reading_and_the_unit_it_is_measured_in() {
     let data = prepared_all(&english(), &[1_000.0]);

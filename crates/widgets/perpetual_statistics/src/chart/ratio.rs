@@ -1,11 +1,3 @@
-//! The long/short ratio chart: the ratio as a line, with the two sides it implies
-//! stacked behind it.
-//!
-//! Only the ratio is published, and it is the long side over the short side, so the two
-//! shares a stacked bar needs are that ratio resolved against a whole. Drawing both is
-//! the point: the ratio says how lopsided the market is, and the stack says which way,
-//! which a ratio below one makes easy to misread.
-
 use std::sync::Arc;
 
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -22,8 +14,6 @@ use super::{
 };
 use crate::model::{LongShortRatioPoint, StatisticsPoints, ratio_as_f64, ratio_shares};
 
-/// The share axis: a whole is one, so its ticks are the same whatever the data says, and
-/// they are written as the percentages the shares are read as.
 const SHARE_TICKS: [(f64, &str); 5] = [
     (0.0, "0%"),
     (0.25, "25%"),
@@ -32,11 +22,6 @@ const SHARE_TICKS: [(f64, &str); 5] = [
     (1.0, "100%"),
 ];
 
-/// The names one ratio chart shows, resolved from the active language.
-///
-/// The three ratio widgets share this chart but not their wording: "long accounts" and
-/// "long positions" are different readings of the same series, so the names are given to
-/// the chart rather than chosen by it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Labels {
     long: SmolStr,
@@ -45,7 +30,6 @@ struct Labels {
 }
 
 impl Labels {
-    /// Resolves the series names from three message keys.
     fn resolve(translate: &Translate, keys: [&'static str; 3]) -> Self {
         Self {
             long: t_smol!(translate, keys[0]),
@@ -55,11 +39,8 @@ impl Labels {
     }
 }
 
-/// The ratio chart's state.
 pub(crate) struct RatioChart {
     points: Arc<[LongShortRatioPoint]>,
-    /// The three message keys the labels were resolved from, kept so a language change
-    /// can resolve them again.
     keys: [&'static str; 3],
     labels: Labels,
     locale: LanguageCode,
@@ -69,15 +50,11 @@ pub(crate) struct RatioChart {
     time_labels: Box<[SmolStr]>,
     tooltips: Arc<[Tooltip]>,
     legend: Box<[SeriesLabel]>,
-    /// The indices whose ratio is a reading, which is what a hover may land on and the
-    /// only points the chart draws.
     valid: Box<[usize]>,
-    /// The zone the axis labels and tooltips were written in.
     zone: UtcOffset,
 }
 
 impl RatioChart {
-    /// Builds an empty chart of `labels`' series.
     pub(crate) fn new(
         translate: &Translate,
         long: &'static str,
@@ -217,8 +194,6 @@ impl ChartData for RatioChart {
     }
 
     fn hover_point(&self, index: usize) -> Option<usize> {
-        // A point whose ratio is not a reading has no shares to annotate, so a hover over
-        // one moves on to the nearest that has.
         valid_index(&self.valid, index)
     }
 
@@ -229,7 +204,6 @@ impl ChartData for RatioChart {
             .cloned()
     }
 
-    /// Rewrites the labels in another display zone.
     fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
         if self.zone == zone {
             return false;
@@ -271,8 +245,6 @@ impl ChartData for RatioChart {
         _metadata: Option<ListingPrecision>,
         points: Arc<Self::Slice>,
     ) -> bool {
-        // A revision that moved is a new window even when its points are the same values:
-        // the pane asked for this one, and it is the one it is now showing.
         if revision < self.revision
             || (revision == self.revision && Arc::ptr_eq(&self.points, &points))
         {

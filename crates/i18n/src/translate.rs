@@ -1,62 +1,9 @@
-//! The translation context handed to code that renders localized text.
-//!
-//! [`Translate`] keeps the catalogue and the language it renders in one handle: the host
-//! builds it once and hands it to the code that renders, so nothing about translating a
-//! message depends on process-wide state. [`t_smol!`](crate::t_smol) is the macro that
-//! pairs with it.
-
 use std::{cell::Cell, fmt::Display, rc::Rc};
 
 use smol_str::SmolStr;
 
 use crate::{language::codes::LanguageCode, translator::types::I18n};
 
-/// A cloneable handle to a translator and the language it renders.
-///
-/// Cloning shares both the catalogue and the selected language, so a host that switches
-/// the language through one clone switches it for every clone it has handed out. A
-/// renderer receives the handle as an argument instead of reaching into application
-/// state.
-///
-/// # Thread affinity
-///
-/// The handle is neither `Send` nor `Sync`: it shares the catalogue through an `Rc` and
-/// the language through a `Cell`. It belongs to the UI thread that built it — clone it
-/// there, and never capture it in a future that requires `Send` (such as the engine's
-/// spawn). Work that runs elsewhere hands its result back to the UI thread, which renders
-/// it.
-///
-/// # Language
-///
-/// The selected language is pushed explicitly through [`Translate::set_language`]; the
-/// handle observes no signal and does not follow one by itself. A host that keeps the
-/// language in an engine signal must update this handle whenever it writes that signal:
-/// the two are kept in step by the composition root, not by the type system.
-///
-/// # Examples
-///
-/// ```
-/// use std::rc::Rc;
-///
-/// use i18n::{language::codes::LanguageCode, translate::Translate, translator::types::I18n};
-///
-/// let i18n = I18n::builder()
-///     .locale_yaml(
-///         LanguageCode::En,
-///         "menu:\n  market: Market\ngreeting: \"Hello, %{name}!\"",
-///     )?
-///     .build()?;
-/// let translate = Translate::new(Rc::new(i18n), LanguageCode::En);
-///
-/// assert_eq!(translate.translate("menu.market"), "Market");
-///
-/// let name = "Ada";
-/// assert_eq!(
-///     translate.translate_with("greeting", &[("name", &name)]),
-///     "Hello, Ada!"
-/// );
-/// # Ok::<(), i18n::error::types::Error>(())
-/// ```
 #[derive(Clone, Debug)]
 pub struct Translate {
     i18n: Rc<I18n>,
@@ -64,7 +11,6 @@ pub struct Translate {
 }
 
 impl Translate {
-    /// Wraps `i18n` so it renders `language`.
     pub fn new(i18n: Rc<I18n>, language: LanguageCode) -> Self {
         Self {
             i18n,
@@ -72,43 +18,28 @@ impl Translate {
         }
     }
 
-    /// Returns the language messages are rendered in.
     pub fn language(&self) -> LanguageCode {
         self.language.get()
     }
 
-    /// Selects the language, returning whether it changed.
     pub fn set_language(&self, language: LanguageCode) -> bool {
         self.language.replace(language) != language
     }
 
-    /// Returns the message registered for `key`, or an empty string when no loaded
-    /// locale defines it.
-    ///
-    /// A message missing from every locale renders as nothing rather than failing, the
-    /// same rule [`t_smol!`](crate::t_smol) follows, so a broken key shows up as a gap
-    /// instead of a crash. Use [`Translate::try_translate`] to tell a missing message
-    /// from one that is deliberately empty.
     pub fn translate(&self, key: &str) -> SmolStr {
         self.try_translate(key).unwrap_or_default()
     }
 
-    /// Returns the message registered for `key`, or `None` when no loaded locale
-    /// defines it.
     pub fn try_translate(&self, key: &str) -> Option<SmolStr> {
         self.i18n
             .try_translate(self.language(), key)
             .map(|text| SmolStr::new(text.as_str()))
     }
 
-    /// Returns the message registered for `key`, replacing its `%{name}` placeholders
-    /// with `arguments`, or an empty string when no loaded locale defines it.
     pub fn translate_with(&self, key: &str, arguments: &[(&str, &dyn Display)]) -> SmolStr {
         self.try_translate_with(key, arguments).unwrap_or_default()
     }
 
-    /// Returns the message registered for `key` with its `%{name}` placeholders
-    /// replaced, or `None` when no loaded locale defines it.
     pub fn try_translate_with(
         &self,
         key: &str,
@@ -120,8 +51,6 @@ impl Translate {
     }
 }
 
-/// Expands `name = value` to `value` and a bare `name` to the local variable of
-/// that name.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __i18n_value {
@@ -133,60 +62,6 @@ macro_rules! __i18n_value {
     };
 }
 
-/// Translates a message through an explicitly injected [`Translate`] context, returning
-/// a [`SmolStr`].
-///
-/// The context is an argument of the macro, so a renderer never reads process-wide
-/// state. A placeholder is bound either to an expression or to a local variable of that
-/// name, and a message that is missing from every loaded locale translates to an empty
-/// string.
-///
-/// ```text
-/// t_smol!(translate, "menu.market")             // a message without placeholders
-/// t_smol!(translate, "greeting", name = name)   // a placeholder bound to an expression
-/// t_smol!(translate, "greeting", name)          // a placeholder bound to a local variable
-/// ```
-///
-/// # Examples
-///
-/// ```
-/// use std::rc::Rc;
-///
-/// use i18n::{language::codes::LanguageCode, t_smol, translate::Translate, translator::types::I18n};
-/// use smol_str::SmolStr;
-///
-/// let i18n = I18n::builder()
-///     .locale_yaml(
-///         LanguageCode::En,
-///         "menu:\n  market: Market\ngreeting: \"Hello, %{name}!\"",
-///     )?
-///     .build()?;
-/// let translate = Translate::new(Rc::new(i18n), LanguageCode::En);
-///
-/// let market: SmolStr = t_smol!(translate, "menu.market");
-/// assert_eq!(market, "Market");
-///
-/// let name = "Ada";
-/// assert_eq!(t_smol!(translate, "greeting", name = name), "Hello, Ada!");
-/// # Ok::<(), i18n::error::types::Error>(())
-/// ```
-///
-/// # Building the context
-///
-/// The host builds the handle where it builds the rest of the application, e.g. from the
-/// catalogue embedded in the binary:
-///
-/// ```
-/// use std::rc::Rc;
-///
-/// use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
-///
-/// # fn build() -> Result<Translate, i18n::error::types::Error> {
-/// let translate = Translate::new(Rc::new(embedded::load()?), LanguageCode::En);
-/// # Ok(translate)
-/// # }
-/// # build().expect("the embedded locales load");
-/// ```
 #[macro_export]
 macro_rules! t_smol {
     ($translate:expr, $key:expr $(,)?) => {
@@ -271,9 +146,6 @@ price: \"%{amount} 美元\"";
         );
     }
 
-    /// The catalogue has no plural rule: a count-sensitive sentence is one key per form,
-    /// and the message takes the count like any other placeholder. This pins the shape —
-    /// the macro has no plural capability, so the key-per-form call is the whole story.
     #[test]
     fn a_count_sensitive_message_takes_one_key_per_form() {
         let translate = translate();
@@ -294,8 +166,6 @@ price: \"%{amount} 美元\"";
         assert!(translate.try_translate("never.defined").is_none());
     }
 
-    /// A catalogue that defines none of the keys a renderer asks for: every call still
-    /// renders the empty string rather than panicking.
     #[test]
     fn a_catalogue_without_the_requested_keys_translates_them_to_empty_text() {
         let i18n = I18n::builder()
@@ -321,8 +191,6 @@ price: \"%{amount} 美元\"";
         assert!(!clone.set_language(LanguageCode::ZhCn));
     }
 
-    /// Both rendering paths share the catalogue and the template parser, so the text is
-    /// the same; only the returned string type differs.
     #[test]
     fn the_macro_renders_what_the_shared_translate_returns() {
         let catalogue = Rc::new(catalogue());

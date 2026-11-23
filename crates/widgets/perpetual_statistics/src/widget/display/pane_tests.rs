@@ -1,14 +1,3 @@
-//! Tests for the perpetual-statistics pane.
-//!
-//! The framework's headless host cannot build a market-participants connector (its
-//! constructor still needs the old toolkit's runtime), so the pane is built directly over a
-//! fixture directory and a fake answer source, and driven through the `WidgetView` hooks —
-//! the same shape the W2 `market_trade` tests use. The mount-path tests at the end drive the
-//! real framework host, which is what a pane with no directory is.
-//!
-//! What a test can see is what the engine ended up holding: the reported `WidgetState`, the
-//! canvas a chart built, the nodes the body made, and the actions the header registered.
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -60,13 +49,10 @@ use crate::{
 
 type Widget = StatisticsWidget<OpenInterestWidgetSeries>;
 
-// ------------------------------------------------------------------- vocabulary
-
 fn listing() -> VenueListingKey {
     perpetual_listing("BTCUSDT")
 }
 
-/// Another listing of the same route, for the "follow another instrument" tests.
 fn other_listing() -> VenueListingKey {
     perpetual_listing("ETHUSDT")
 }
@@ -152,7 +138,6 @@ fn product_translate(language: LanguageCode) -> Translate {
     )
 }
 
-/// One rule set of the fixture pair, which is what the chart's units are read from.
 fn listing_rules() -> TradingRules {
     catalog_fixture::rules(
         catalog_fixture::token(catalog_fixture::VENUE, "USDT"),
@@ -164,16 +149,11 @@ fn supported() -> ListingSupport {
     ListingSupport::Supported(Box::new(listing_rules()))
 }
 
-// -------------------------------------------------------------------- directory
-
-/// A directory a test drives: the scopes it has loaded, the answer it gives about the
-/// followed listing, and the units the chart is labelled in.
 #[derive(Clone)]
 struct FixtureDirectory {
     loaded: Rc<RefCell<Vec<VenueRoute>>>,
     support: Rc<RefCell<ListingSupport>>,
     capabilities: Rc<RefCell<Vec<CapabilityId>>>,
-    /// The capability the pane under test plots, which is what its gate asks the venues for.
     capability: CapabilityId,
     units: ChartUnits,
 }
@@ -196,8 +176,6 @@ impl FixtureDirectory {
         }
     }
 
-    /// The same directory answering for another series' capability: the loaded route
-    /// declares that series, and the gate asks about the venues that serve it.
     fn offering(self, capability: CapabilityId) -> Self {
         *self.capabilities.borrow_mut() = vec![capability];
         Self { capability, ..self }
@@ -255,10 +233,6 @@ impl StatisticsDirectory for FixtureDirectory {
     }
 }
 
-// ---------------------------------------------------------------------- fixture
-
-/// A widget under test: the framework's headless host, the widget built over the fixture
-/// directory, and the runtime turns needed to let the service answer.
 struct Fixture {
     harness: WidgetTestApp,
     widget: Widget,
@@ -353,7 +327,6 @@ impl Fixture {
             .expect("the pane syncs");
     }
 
-    /// Lets the service run and the pane consume what it published, a few turns deep.
     fn settle(&mut self) {
         for _ in 0..12 {
             self.harness.drain_runtime();
@@ -374,7 +347,6 @@ impl Fixture {
         self.widget.has_content()
     }
 
-    /// Builds the body the framework would build once `has_content` turned true.
     fn build_body(&mut self) {
         let Self {
             harness,
@@ -390,7 +362,6 @@ impl Fixture {
         }
     }
 
-    /// Builds both header groups the way the pane does, into one column.
     fn build_header(&mut self) {
         let Self {
             harness, widget, ..
@@ -478,7 +449,6 @@ impl Fixture {
         self.widget.countdown_label(self.harness.app())
     }
 
-    /// Rewrites the display zone the way the settings screen does.
     fn set_zone(&mut self, hours: i8) {
         let signal = self.harness.services().config;
         let mut config = (*self.harness.app().read(&signal)).clone();
@@ -491,7 +461,6 @@ impl Fixture {
         self.harness.app_mut().write(&signal, generation);
     }
 
-    /// Draws and settles the pane's chart: the body must exist first.
     fn paint(&mut self) {
         self.build_body();
         self.sync();
@@ -499,12 +468,8 @@ impl Fixture {
     }
 }
 
-// ------------------------------------------------------------------------ tests
-
 #[test]
 fn every_stored_interval_should_be_one_the_picker_offers() {
-    // The picker is built from `TIMEFRAMES`, and a stored interval is validated against the
-    // same list: every interval the enum can hold has to be in it.
     for timeframe in [
         StatisticsTimeFrame::Minute5,
         StatisticsTimeFrame::Minute15,
@@ -700,8 +665,6 @@ fn a_message_from_another_scope_should_be_ignored() {
 
 #[test]
 fn a_message_after_a_failure_should_be_ignored() {
-    // The source never answers, so the failure is the pane's first answer and there is no
-    // window to keep under the banner.
     let mut fixture = Fixture::new(config(), true, supported(), [FetchPlan::Pending]);
     fixture.load();
     fixture.settle();
@@ -836,7 +799,6 @@ fn the_countdown_should_follow_the_schedule() {
 
     assert_eq!(fixture.countdown().as_deref(), Some("01:00"));
 
-    // The clock moves, and the one-shot tick writes the new label.
     fixture.clock.set(1_000_000 + 1_000);
     assert!(
         fixture.harness.advance(COUNTDOWN_TICK),
@@ -870,8 +832,6 @@ fn a_failed_pane_should_stop_counting_down() {
         !fixture.widget.countdown_is_armed_for_test(),
         "a failure cancels the tick it was waiting for"
     );
-    // The engine holds the only clock the tick reads, so a tick that was cancelled is a
-    // round that fires nothing: the clock moving does not bring the countdown back.
     fixture.harness.drain();
     fixture.clock.set(1_000_000 + 10_000);
     assert!(
@@ -926,8 +886,6 @@ fn an_answer_to_a_replaced_command_should_be_dropped() {
     fixture.report_snapshot(snapshot(1));
     fixture.sync();
 
-    // A refresh is issued, then the load that replaces it: the refresh's identity is
-    // forgotten, and its answer is a reply the pane is no longer waiting for.
     fixture.request_refresh();
     fixture.sync();
     let replaced = RequestId::new(1);
@@ -1037,8 +995,6 @@ fn an_empty_window_should_say_there_is_no_data() {
         text.contains("No data"),
         "the overlay says there is no data: {text}"
     );
-    // The overlay is built after the canvas, so it is drawn over the axes rather than under
-    // them: the tree draws a node's children in order.
     assert_eq!(
         children_of(&fixture, "TEST_PERPETUAL_STATISTICS_CHART_HOST"),
         [
@@ -1047,7 +1003,6 @@ fn an_empty_window_should_say_there_is_no_data() {
         ],
         "the empty-window sentence is drawn after the chart, not behind it"
     );
-    // The chart is still there behind it: an empty window draws its axes.
     assert!(fixture.canvas().is_some_and(|canvas| !canvas.is_empty()));
 }
 
@@ -1126,8 +1081,6 @@ fn a_directory_generation_should_rerun_load() {
 
 #[test]
 fn the_charts_name_should_be_in_the_catalogue_in_every_language() {
-    // The chart's canvas names itself through this key: a missing one translates to an
-    // empty a11y label rather than failing, so the catalogue is what has to hold it.
     for language in [LanguageCode::En, LanguageCode::ZhCn] {
         let translate = product_translate(language);
         let name = translate.translate("widget.perpetual_statistics.chart");
@@ -1183,8 +1136,6 @@ fn a_directory_generation_should_keep_the_window_the_pane_is_showing() {
         "the labels and the lines are still on the canvas"
     );
 
-    // The stream that is polling the window is still the one filling it: a window after the
-    // publication is applied rather than counted as one the pane has already overtaken.
     fixture.report_snapshot(snapshot(2));
     fixture.report_status(ready(2, 1_060_000));
     fixture.sync();
@@ -1332,7 +1283,6 @@ fn two_panes_should_keep_their_own_header_handlers() {
     assert!(harness.app().has_action_handler(&actions[0]));
     assert!(harness.app().has_action_handler(&actions[1]));
 
-    // Releasing one pane leaves the other pane's handler in place.
     let (first, scope) = &mut panes[0];
     let services = Rc::clone(harness.services_rc());
     let window = harness.window();
@@ -1487,10 +1437,6 @@ fn a_pane_without_a_directory_should_report_that_it_cannot_read() {
     widget.release(harness.app_mut());
 }
 
-// ---------------------------------------------------------------------- helpers
-
-/// One widget's identity, checked against the values this crate ships, and the pane it
-/// builds checked against the series it names. Returns the identity the caller compares.
 fn assert_widget<M: StatisticsMetric>(
     translate: &Translate,
     id: &str,
@@ -1519,8 +1465,6 @@ fn assert_widget<M: StatisticsMetric>(
     M::ID.as_str().to_owned()
 }
 
-/// Builds one pane over the fixture directory and answers what it polls: the stream key it
-/// would accept, and the chart it drew, both have to name the series its widget names.
 fn assert_polls<M: StatisticsMetric>(metric: MetricKind) {
     let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
     let directory = FixtureDirectory::new(true, supported()).offering(metric.capability());
@@ -1566,7 +1510,6 @@ fn assert_polls<M: StatisticsMetric>(metric: MetricKind) {
     assert!(drawn, "the chart is the one this series draws");
 }
 
-/// The debug ids of a node's children, in the order the tree draws them.
 fn children_of(fixture: &Fixture, parent: &str) -> Vec<String> {
     let tree = fixture.harness.tree();
     let mut stack = vec![tree.root()];
@@ -1586,7 +1529,6 @@ fn children_of(fixture: &Fixture, parent: &str) -> Vec<String> {
     panic!("no node with the debug id `{parent}`");
 }
 
-/// Whether a node with this debug id is under `parent`.
 fn node_under(cx: &mut widget::cx::WidgetCx<'_>, parent: NodeId, id: &str) -> bool {
     let mut stack = vec![parent];
     while let Some(node) = stack.pop() {
@@ -1601,7 +1543,6 @@ fn node_under(cx: &mut widget::cx::WidgetCx<'_>, parent: NodeId, id: &str) -> bo
     false
 }
 
-/// Every text node under `parent`, as the last frame shaped it.
 fn texts(fixture: &Fixture, parent: NodeId) -> String {
     let tree = fixture.harness.tree();
     let mut stack = vec![parent];

@@ -1,5 +1,3 @@
-//! CFNetwork system proxy evaluation (PAC, WPAD, scheme-specific static proxies).
-
 use app_config::network::{ConfigError, ResolvedProxy, RouteTarget};
 use core_foundation::{
     array::CFArray,
@@ -184,8 +182,6 @@ fn dictionary_number(dictionary: &CFDictionary<CFString, CFType>, key: CFStringR
 }
 
 fn cf_string_equals(value: &str, expected: CFStringRef) -> bool {
-    // `kCFProxyType*` are process-wide constants, so wrapping one under the get
-    // rule borrows a string that outlives the comparison.
     let expected = unsafe { CFString::wrap_under_get_rule(expected) };
     expected == value
 }

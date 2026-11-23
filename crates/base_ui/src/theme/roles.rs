@@ -1,19 +1,3 @@
-//! 解析侧：把一套调色板解析成 64 个语义角色（引擎 `Color`）。
-//!
-//! 解析规则逐条移植自旧 `style/roles.rs`：表面直接取调色板；文字与线以 `text` 为源按权重混入
-//! `canvas`；品牌与状态阶梯的方向跟随外观（浅色变暗、深色变亮）；chip 的填充是状态色几乎全部混进
-//! 画布。旧实现把 58 条对比度地板写成表（设计规格即测试），这里原样保留：**调色板读不出来就是
-//! debug 构建加载主题时失败**，而不是等到截图。
-//!
-//! 与旧实现的两处已登记数学差异：
-//!
-//! - **对比度**在**线性亮度**上算（引擎的合成空间），半透明前景也在线性空间合成；旧实现的路径
-//!   在 sRGB 编码空间合成。58 条地板的底色/前景都不透明，因此**地板值（角色对与下限）逐条相同**；
-//!   参与越界色（8 对）的少数地板，比值因 gamut mapping 有 <0.25 的微小差（见 `resolved.rs` 与
-//!   `spec-deltas/theme.md` §3/§4）。
-//! - **越界色渲染**：旧实现逐通道 clamp、引擎做 CSS Color 4 chroma 二分，8 对角色 × 外观的 8 位
-//!   sRGB 不同（最大 15/255）。用户裁决以引擎映射为准；golden 表在 `resolved.rs`。
-
 use ui_core::paint::color::Color;
 
 use super::{
@@ -23,28 +7,22 @@ use super::{
     role::Role,
 };
 
-/// 一个外观解析后的全部角色，按 [`Role::index`] 存放。
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct RoleColors {
     colors: [Color; Role::COUNT],
 }
 
 impl RoleColors {
-    /// 读一个角色。
     pub fn get(&self, role: Role) -> Color {
         self.colors[role.index()]
     }
 
-    /// 全部角色（审计与测试用）。
     pub fn iter(&self) -> impl Iterator<Item = (Role, Color)> + '_ {
         Role::ALL
             .into_iter()
             .map(|role| (role, self.colors[role.index()]))
     }
 
-    /// 58 条对比度地板，作为「前景角色、背景角色、下限」的表。
-    ///
-    /// 这张表同时被 debug 期检查与验收测试读取：读不出来的角色报一次，报的是失败的那一对。
     pub(crate) fn contrast_floors(&self) -> [(Role, Role, f32); 58] {
         [
             (Role::FgDefault, Role::SurfaceCanvas, 12.0),
@@ -93,16 +71,8 @@ impl RoleColors {
             (Role::ChartSeries3, Role::SurfaceSunken, 3.0),
             (Role::ChartSeries4, Role::SurfaceSunken, 3.0),
             (Role::ChartSeries5, Role::SurfaceSunken, 3.0),
-            // 海岸线地板：OSM 那一对填充自己的 1.40:1，略留余量。两个填充是整个地图的底，调色板
-            // 就是交通层的，因此这条记录的是这对颜色测到的值，而不是要求它变成别的颜色。
             (Role::ChartMapLand, Role::ChartMapOcean, MAP_FILL_FLOOR),
-            // 海面同时是画在图表内容面上的填充：浅色外观的纸陆地在那上面读 1.01:1——这是调色板
-            // 所有者的选择（OSM 纸陆地优先于地图与面板的可见分界），因此陆地与内容面的分界被**刻意
-            // 放弃**，只保留海面对内容面的这条地板（深色外观的近黑海面 1.04:1、浅色 1.38:1）。
             (Role::ChartMapOcean, Role::SurfaceSunken, 1.03),
-            // 画在填充之上的描边，按制图学给线的地板：每条都是读者要跟着走的线，因此在陆地上读
-            // 2.5:1；边界跨水、桥梁/堤道把干道带过水，因此这两条在水上也读 2.0:1；主干道在 1.2 px
-            // 时太细，用同样 2.0:1 而不是更弱的一档。
             (
                 Role::ChartMapBorder,
                 Role::ChartMapLand,
@@ -140,7 +110,6 @@ impl RoleColors {
         ]
     }
 
-    /// debug 构建里加载主题就检查 58 条地板：release 发布的是两张手检过的调色板，不付这笔检查。
     pub(crate) fn assert_contrast_floors(&self) {
         if cfg!(debug_assertions) {
             for (foreground, background, floor) in self.contrast_floors() {
@@ -157,7 +126,6 @@ impl RoleColors {
     }
 }
 
-/// 把一个外观的调色板解析成全部角色。
 pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
     let dark = palette.appearance == Appearance::Dark;
     let mix = |from: Color, to: Color, weight: f32| mix_oklab(from, to, weight);
@@ -167,8 +135,6 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
     {
         let mut set = |role: Role, color: Color| colors[role.index()] = color;
 
-        // 表面：z 轴，由远及近。反色块就是文字色——浅色外观的近黑、深色外观的近白，正好是"页面的
-        // 反面"。
         set(Role::SurfaceCanvas, canvas);
         set(Role::SurfaceRaised, palette.surface_raised);
         set(Role::SurfaceSunken, palette.surface_sunken);
@@ -176,7 +142,6 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
         set(Role::SurfaceControl, palette.control);
         set(Role::SurfaceInverse, text);
 
-        // 前景：正文、次级、占位、禁用，再混出两阶；两个"在填充上"的文字直接取调色板。
         set(Role::FgDefault, text);
         set(Role::FgMuted, mix(text, canvas, 0.30));
         set(Role::FgSubtle, mix(text, canvas, 0.50));
@@ -184,9 +149,6 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
         set(Role::FgOnBrand, palette.on_brand);
         set(Role::FgOnInverse, palette.on_inverse);
 
-        // 线：分隔线画在页面/面板头/表格面/菜单上，按页面混；深色外观把它带得更远（那里的 `raised`
-        // 与 `overlay` 只比页面高 0.05–0.06 L）。强边缘在深色外观里少走一步，因为亮色混进暗页面比
-        // 暗色混进亮页面涨对比涨得快。
         set(
             Role::LineDivider,
             mix(text, canvas, if dark { 0.72 } else { 0.76 }),
@@ -198,12 +160,10 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
         );
         set(Role::LineFocus, palette.brand);
 
-        // 品牌色与它的两阶。
         set(Role::BrandBase, palette.brand);
         set(Role::BrandHover, step(palette.brand, 0.045, dark));
         set(Role::BrandActive, step(palette.brand, 0.075, dark));
 
-        // 状态阶梯：一个配方给每一档——本色、几乎所有混进页面的 chip 填充、两者之间的边缘。
         let status_role =
             |color: Color| [color, tint(color, canvas, dark), mix(color, canvas, 0.62)];
         let statuses = [
@@ -221,7 +181,6 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
             set(Role::ALL[index + 2], border);
         }
 
-        // 行情色：与状态色分离；chip 填充用同一配方，weak 是本色 22% alpha 的淡洗。
         set(Role::MarketUp, palette.market.up);
         set(Role::MarketDown, palette.market.down);
         set(Role::MarketFlat, mix(text, canvas, 0.50));
@@ -233,7 +192,6 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
         set(Role::MarketUpWeak, with_alpha(palette.market.up, 0.22));
         set(Role::MarketDownWeak, with_alpha(palette.market.down, 0.22));
 
-        // 恐慌贪婪：调色板原样（这是刻度自己的阶梯，不是状态色）。
         set(Role::FearGreedExtremeFear, palette.fear_greed.extreme_fear);
         set(Role::FearGreedFear, palette.fear_greed.fear);
         set(Role::FearGreedNeutral, palette.fear_greed.neutral);
@@ -243,8 +201,6 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
             palette.fear_greed.extreme_greed,
         );
 
-        // 图表家具画在内容面（`surface.sunken`）上，因此网格与十字线按它混；地图的两个填充与三个描
-        // 边是作者写的值（它们互相读，不对表面读）。
         set(Role::ChartGrid, mix(text, palette.surface_sunken, 0.86));
         set(Role::ChartAxis, mix(text, canvas, 0.50));
         set(
@@ -270,7 +226,6 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
             set(position, series);
         }
 
-        // 选择与叠层。
         set(Role::Selection, mix(palette.brand, canvas, 0.62));
         set(Role::VeilHover, with_alpha(text, palette.veil_hover));
         set(Role::VeilActive, with_alpha(text, palette.veil_active));
@@ -283,16 +238,10 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
     roles
 }
 
-/// 地图两个填充互相之间的地板。
-///
-/// 这对填充是 OSM 交通层自己的：海岸线读 1.40:1、海面在图表内容面上读 1.38:1。地板略低于两个测
-/// 量值，因此它钉住调色板**已有**的数值，而不是要求 OSM 那对颜色给出它没有的一步。
 const MAP_FILL_FLOOR: f32 = 1.35;
 
-/// 地图上每条描边在它穿过的陆地上的地板。
 const MAP_STROKE_LAND_FLOOR: f32 = 2.5;
 
-/// 描边跨水时的地板（边界跨水，桥梁/堤道把道路带过水）。
 const MAP_STROKE_OCEAN_FLOOR: f32 = 2.0;
 
 #[cfg(test)]
@@ -308,7 +257,6 @@ mod tests {
         [Palette::light(), Palette::dark()]
     }
 
-    /// A1：两种外观下每条地板都成立。失败信息报出失败的那一对与它的地板。
     #[test]
     fn every_contrast_floor_holds_in_both_appearances() {
         for palette in palettes() {
@@ -328,7 +276,6 @@ mod tests {
         }
     }
 
-    /// 地板表本身：58 条、每组都有覆盖。截断/改序会被这条挡住。
     #[test]
     fn the_contrast_floor_table_covers_fifty_eight_pairs() {
         use std::collections::HashSet;
@@ -345,7 +292,6 @@ mod tests {
             .iter()
             .map(|(_, background, _)| *background)
             .collect();
-        // 五个状态色、六个图表系列、行情与品牌这些「必须被读」的前景都在表里。
         for role in [
             Role::StatusDangerBase,
             Role::StatusWarningBase,
@@ -388,15 +334,10 @@ mod tests {
         assert!(backgrounds.contains(&Role::ChartMapOcean));
     }
 
-    /// debug 期检查的守护：地板不达标时**加载主题就会失败**。
-    ///
-    /// `assert_contrast_floors` 是 `debug_assert!`，它的失败会 panic；如果实现被删空（或
-    /// `resolve_roles` 不再调用它），本测试会红——这正是审查 F3-1 的覆盖缺口。
     #[test]
     #[cfg(debug_assertions)]
     fn a_palette_that_breaks_a_floor_is_rejected_when_the_theme_loads() {
         let mut broken = Palette::light();
-        // 正文提到近白：`fg.default on surface.canvas >= 12.0` 不可能成立。
         broken.text = ui_core::paint::color::Color::oklch(0.9, 0.0, 0.0, 1.0);
 
         let result =
@@ -407,8 +348,6 @@ mod tests {
         );
     }
 
-    /// A2：两种外观里表面都按 `raised → canvas → sunken` 堆叠（旧灰阶在一个表里向下一步、在另一
-    /// 个表里向上一步，正是这条要挡住的）。
     #[test]
     fn surfaces_stack_raised_above_canvas_above_sunken() {
         for palette in palettes() {
@@ -431,7 +370,6 @@ mod tests {
         }
     }
 
-    /// A3：品牌色的彩度是正文的好几倍，才读得出"这是颜色"而不是"这是粗体正文"。
     #[test]
     fn brand_is_three_times_more_chromatic_than_text() {
         for palette in palettes() {
@@ -448,7 +386,6 @@ mod tests {
         }
     }
 
-    /// A4：六个图表系列要能靠色相之外的东西区分（Oklab 距离 ≥ 0.13）。
     #[test]
     fn chart_series_are_told_apart_by_oklab_distance() {
         let mut compared = 0;
@@ -496,7 +433,6 @@ mod tests {
         assert_eq!(compared, 30, "两种外观各比较 15 对");
     }
 
-    /// 六个系列在内容面上都读得清。
     #[test]
     fn every_chart_series_reads_on_the_sunken_surface() {
         for palette in palettes() {
@@ -522,7 +458,6 @@ mod tests {
         }
     }
 
-    /// 恐慌贪婪五档靠 Oklab 距离区分；深色外观的两端在内容面上读得清。
     #[test]
     fn the_fear_greed_scale_is_told_apart_and_reads_on_the_dark_face() {
         let scale = [
@@ -567,7 +502,6 @@ mod tests {
         }
     }
 
-    /// A5：只有必须透视的角色才是半透明的（叠洗、遮罩、行情淡洗）。
     #[test]
     fn only_the_veils_the_scrim_and_the_weak_market_colors_are_translucent() {
         for palette in palettes() {
@@ -603,7 +537,6 @@ mod tests {
         }
     }
 
-    /// A6：地图两个填充在两种外观里都分得开（地图自己的地板，不是 §7.8 的表面阶梯）。
     #[test]
     fn map_land_and_map_ocean_stay_apart_in_both_appearances() {
         for palette in palettes() {
@@ -621,7 +554,6 @@ mod tests {
         }
     }
 
-    /// 三种地图描边在陆地与海面上都读得清。
     #[test]
     fn map_strokes_read_on_both_fills_in_both_appearances() {
         for palette in palettes() {
@@ -650,11 +582,6 @@ mod tests {
         }
     }
 
-    /// 旧测试的移植：浅色外观画 CMC 自己的五个颜色，深色外观只抬两端。
-    ///
-    /// 这里比较的是**作者写下的调色板色值**（硬编码 golden），不是旧实现的渲染值：恐慌贪婪五色
-    /// 实测都在 sRGB 色域内（旧/新 8 位差 0），因此本测试与 gamut mapping 无关；越界色的引擎映射
-    /// 基线在 `resolved.rs` 的 8 组 golden 里（`spec-deltas/theme.md` §3）。
     #[test]
     fn the_fear_greed_scale_paints_its_authored_colors() {
         let cases: [(Appearance, Role, [u8; 3]); 8] = [
@@ -705,14 +632,10 @@ mod tests {
         }
     }
 
-    /// 每个角色都能被解析（无缺失、无 panic）；除恐慌贪婪刻度中间两档（两套外观刻意同值）外，
-    /// 其余角色在深浅外观下都换一个颜色（切换是可见的）。
     #[test]
     fn every_role_resolves_in_both_appearances() {
         let light = resolve_roles(&Palette::light());
         let dark = resolve_roles(&Palette::dark());
-        // 旧 `Palette::dark` 的注释：刻度中间三档"已经读得清"，只抬升两端；因此 neutral 与 greed
-        // 在两套外观里是同一个颜色（这是数据决定，不是遗漏）。
         let shared_by_design = [Role::FearGreedNeutral, Role::FearGreedGreed];
         let mut seen = HashSet::with_capacity(Role::COUNT);
         let mut differing = 0;

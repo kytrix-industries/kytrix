@@ -1,11 +1,3 @@
-//! The poll loop, driven through the framework's own runtime.
-//!
-//! A test here owns a real [`WidgetRuntime`] and a real Tokio clock, because what
-//! is being tested is the loop's *timing*: that the first fetch does not wait out
-//! an interval, that a manual refresh resets the schedule rather than racing it,
-//! and that a failure stops the schedule instead of retrying it. A fake source is
-//! the only thing that is replaced.
-
 use std::{sync::Arc, time::Duration};
 
 use market_participants_connector::market::timeframe::StatisticsTimeFrame;
@@ -23,13 +15,6 @@ use super::{
 };
 use crate::model::{MetricKind, StatisticsPoints, StatisticsSnapshot};
 
-/// The handle of the runtime this test runs on.
-///
-/// A test drives its subject on its own runtime rather than on a shared one. The
-/// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-/// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-/// whose clock was paused. Work started on another runtime keeps waiting on real
-/// time while the test advances a clock it never reads.
 #[allow(
     clippy::disallowed_methods,
     reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -38,12 +23,10 @@ fn current_test_handle() -> &'static tokio::runtime::Handle {
     Box::leak(Box::new(tokio::runtime::Handle::current()))
 }
 
-/// The listing every service test follows.
 fn listing() -> VenueListingKey {
     perpetual_listing("BTCUSDT")
 }
 
-/// A second listing of the very same canonical contract on another scope.
 fn other_listing() -> VenueListingKey {
     market_participants_connector::catalog::test_support::listing_key(
         &market_participants_connector::catalog::test_support::perp_route(),
@@ -87,7 +70,6 @@ async fn receive_snapshot(
     snapshot.clone()
 }
 
-/// Every metric the service knows, so one test can cover the whole routing table.
 const ALL_METRICS: [MetricKind; 5] = [
     MetricKind::OpenInterest,
     MetricKind::TopTraderAccountRatio,
@@ -149,8 +131,6 @@ fn stream_key(request: &StatisticsRequest) -> StatisticsStreamKey {
     }
 }
 
-/// Two listings of the very same canonical contract are two scopes: what a pane
-/// follows is the venue's own listing, so the key has to tell them apart.
 #[tokio::test]
 async fn two_listings_of_one_contract_should_be_two_scopes() {
     let first = StatisticsStreamKey::new(
@@ -213,7 +193,6 @@ async fn two_listings_of_one_contract_should_be_two_scopes() {
     runtime.shutdown().await;
 }
 
-/// The fetch a snapshot of the fake source produces: one point at `timestamp`.
 fn points_timestamp(snapshot: &StatisticsSnapshot) -> Option<i64> {
     match &snapshot.points {
         StatisticsPoints::OpenInterest(points) => points.last().map(|point| point.timestamp),
@@ -312,8 +291,6 @@ async fn an_unchanged_window_should_not_be_published_again() {
     let _ = receive_snapshot(&mut latest).await;
     let _ = receive_status(&mut reliable).await;
 
-    // The same window again: the venue answered, but nothing about the chart
-    // changed, so there is nothing to draw and nothing to publish.
     advance(Duration::from_secs(60)).await;
     let _ = receive_status(&mut reliable).await;
     match receive_status(&mut reliable).await {
@@ -366,14 +343,6 @@ async fn a_manual_refresh_should_fetch_again_even_when_the_window_did_not_move()
     runtime.shutdown().await;
 }
 
-/// A failed fetch leaves the loop alive, off the clock, and recoverable.
-///
-/// Which of the fake's answers lands after the recovery is not asserted on: an
-/// automatic tick armed before the failure can also fire while the refresh is in
-/// flight, so *which* window arrives is a detail of the fake rather than of the
-/// loop. What the loop promises is that the failure is reported, that nothing
-/// happens on its own while it is off the clock, and that a refresh starts it
-/// again without a whole new scope.
 #[tokio::test(start_paused = true)]
 async fn a_failed_fetch_should_be_reported_and_stop_the_schedule() {
     let source = FakeSource::new([
@@ -406,13 +375,6 @@ async fn a_failed_fetch_should_be_reported_and_stop_the_schedule() {
         "a failed fetch publishes no window"
     );
 
-    // The failure took the loop off the clock: it is alive and waiting, so three
-    // intervals go by without a single fetch.
-    //
-    // The intervals are advanced one at a time on purpose. A single long advance
-    // does not fire the timers a cycle arms while it runs, so a loop that put a
-    // refused fetch straight back on the schedule would still look idle to a test
-    // that skipped three intervals in one step.
     for interval in 1..=3 {
         advance(Duration::from_secs(60)).await;
         assert_eq!(
@@ -422,8 +384,6 @@ async fn a_failed_fetch_should_be_reported_and_stop_the_schedule() {
         );
     }
 
-    // The recovery is a refresh on the same scope rather than a new one, and it
-    // fetches again.
     let response = runtime
         .client()
         .call(StatisticsRequest::Refresh)
@@ -517,8 +477,6 @@ async fn a_second_metric_should_replace_the_first() {
         .expect("a second scope should replace the first");
     assert_eq!(response.into_value(), StatisticsResponse::StreamStarted);
 
-    // The replacement announces itself from the beginning, and its window is the
-    // new series'.
     let _ = receive_status(&mut reliable).await;
     let _ = receive_status(&mut reliable).await;
     let snapshot = receive_snapshot(&mut latest).await;
@@ -554,8 +512,6 @@ async fn a_refresh_while_one_is_in_flight_should_be_refused() {
         .expect("a refresh is accepted while a fetch is in flight");
     assert_eq!(response.into_value(), StatisticsResponse::RefreshQueued);
 
-    // The one that was queued is the fetch in flight, so the gate refuses a
-    // second click rather than piling it up behind the first.
     let error = runtime
         .client()
         .call(StatisticsRequest::Refresh)
@@ -652,8 +608,6 @@ fn only_the_series_the_venue_labels_should_ask_for_its_precision() {
     assert!(!MetricKind::LongShortAccountRatio.needs_instrument_precision());
 }
 
-/// Each series is served by its own capability, which is what a route has to
-/// declare for a pane of that series to be pointed at it.
 #[test]
 fn every_series_should_name_the_capability_that_serves_it() {
     use market_participants_model::routing::CapabilityId;

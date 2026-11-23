@@ -1,52 +1,3 @@
-//! 树（P2-2）：展开 / 折叠、缩进、层级线、选择、键盘导航。
-//!
-//! 纯逻辑在 [`TreeState`]（扁平化、展开集、按上下左右 / 回车导航，可单测）；节点层复用
-//! [`List`] 内核（行虚拟化 / 滚动 / 选中 / hover），每行画「缩进 + 层级线 + 折叠标 + 文本」。
-//!
-//! # 选择
-//!
-//! 选中集只有一份：列表内核的 `Signal<Selection>`（行高亮由它驱动）。树不另存「选中 id」；
-//! 需要 id 时用 [`Tree::selected`] 从行表反查。
-//!
-//! # 键盘
-//!
-//! [`Tree::bind_keys`] 注册 `Up/Down/Left/Right` 四个**焦点作用域化**绑定（引擎
-//! `App::bind_key_scoped`：只有焦点落在本树 viewport 子树内时才消费；同屏多个树互不干扰，
-//! 其它滚动容器的方向键默认滚动也不受影响）。`Enter/Space` 走引擎的「焦点节点激活」通道
-//! （列表容器的 Action），由 [`List::on_activate`] 回调触发折叠。
-//!
-//! # 禁用行
-//!
-//! `TreeItem::disabled` 的行不可点击 / 不可键盘导航 / 不可程序化选中（列表内核的 disabled
-//! 集 + [`TreeState::apply_key`] 跳过）；渲染仍是弱化色（旧实现 `Button::disabled` 语义）。
-//!
-//! # a11y（E9 集合语义）
-//!
-//! 采纳引擎 E9 的树集合语义：容器静态声明 [`A11yRole::Tree`]（`A11yOverride`）并动态宣告集合
-//! 大小（`size_of_set` = 可见行数）；每个可见行在列表行基线之上叠加 [`A11yRole::TreeItem`]、
-//! 行标签、展开态、禁用态（`set_row_a11y` 的 `A11yPatch`，选中态来自列表基线）。引擎把树项
-//! 挂到**最近的** `Tree` / `TreeItem` 祖先下 —— 缩进槽 / 折叠标 / 标签这些渲染包裹层不参与
-//! a11y 父子（角色始终落在逻辑树项那一行）。
-//!
-//! **层级**：本组件是扁平化虚拟树（可见行是虚拟列表的兄弟行，物理节点树里没有嵌套）。因此
-//! a11y 父子是「所有可见树项 = `Tree` 的子节点」，嵌套深度用 `aria-level` 语义
-//! （`A11yPatch::level`，0-based = [`FlatRow::depth`]）表达 —— ARIA 的 flattened-tree 模式。
-//! 不要为了 a11y 层级在物理树里造嵌套：行窗口是虚拟列表，嵌套会和窗口化冲突。
-//!
-//! 折叠标（`▸` / `▾`）与行标签文本节点都显式 `hidden`：树项的**可访问名在逻辑行上**
-//! （`A11yPatch::label`），装饰字形与重复文本不应再作为独立 Label 被读屏朗读。
-//!
-//! **残余**（`.docs/gui-migration/spec-deltas/kit-a11y.md`）：
-//! - 行窗口（列表 `viewport`，角色 `List`）仍是 `Tree` 的 a11y 子节点（E9 R2：集合内虚拟窗口
-//!   未透明化，滚动状态仍挂在窗口上）；`Tree` 自身没有滚动动作/滚动值（AT 通过窗口滚动）。
-//! - AT 的展开 / 折叠动作未接入：`TreeItem` 默认不宣告 `Expand` / `Collapse`（E9 R9 的操作
-//!   路径要求 `on_a11y_action` handler），展开态目前只由状态表达。
-//!
-//! # 折叠标
-//!
-//! 折叠标是 `bind_text` 节点，读展开状态 `Signal<TreeState>`：展开 / 折叠后只有该节点的文本
-//! 变化；行内容本身在 `set_count` 时按新行表重建（展开会改变行数）。
-
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
@@ -73,21 +24,15 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-/// 一条树数据（根或子节点）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TreeItem {
-    /// 稳定 id（展开集 / 选择身份）。
     pub id: SmolStr,
-    /// 显示文本。
     pub label: SmolStr,
-    /// 是否禁用（不可交互，画成弱化色）。
     pub disabled: bool,
-    /// 子节点（非空即文件夹）。
     pub children: Vec<TreeItem>,
 }
 
 impl TreeItem {
-    /// 一个叶子 / 文件夹（子节点后续用 [`TreeItem::child`] 加）。
     #[must_use]
     pub fn new(id: impl Into<SmolStr>, label: impl Into<SmolStr>) -> Self {
         Self {
@@ -98,48 +43,36 @@ impl TreeItem {
         }
     }
 
-    /// 加一个子节点。
     #[must_use]
     pub fn child(mut self, child: Self) -> Self {
         self.children.push(child);
         self
     }
 
-    /// 禁用。
     #[must_use]
     pub fn disabled(mut self) -> Self {
         self.disabled = true;
         self
     }
 
-    /// 是否文件夹。
     #[must_use]
     pub fn is_folder(&self) -> bool {
         !self.children.is_empty()
     }
 }
 
-/// 扁平化后的一行。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlatRow {
-    /// 节点 id。
     pub id: SmolStr,
-    /// 显示文本。
     pub label: SmolStr,
-    /// 层级（根的 `depth = 0`）。
     pub depth: usize,
-    /// 是否文件夹。
     pub folder: bool,
-    /// 是否展开（`folder == false` 时恒 `false`）。
     pub expanded: bool,
-    /// 是否禁用。
     pub disabled: bool,
-    /// 父节点 id（根为 `None`）。
     pub parent: Option<SmolStr>,
 }
 
 impl FlatRow {
-    /// 缩进层级：叶子比同级文件夹多缩进一格（与旧 `tree.rs` 的显示规则一致）。
     #[must_use]
     pub fn indent_depth(&self) -> usize {
         if self.folder {
@@ -150,7 +83,6 @@ impl FlatRow {
     }
 }
 
-/// 树的模型：根数据 + 展开集合（选中在列表内核里）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TreeState {
     roots: Vec<TreeItem>,
@@ -158,7 +90,6 @@ pub struct TreeState {
 }
 
 impl TreeState {
-    /// 以根数据建树；默认全部折叠。
     #[must_use]
     pub fn new(roots: impl IntoIterator<Item = TreeItem>) -> Self {
         Self {
@@ -167,25 +98,21 @@ impl TreeState {
         }
     }
 
-    /// 根数据。
     #[must_use]
     pub fn roots(&self) -> &[TreeItem] {
         &self.roots
     }
 
-    /// 展开的 id 集合。
     #[must_use]
     pub fn expanded(&self) -> &BTreeSet<SmolStr> {
         &self.expanded
     }
 
-    /// 某节点是否展开。
     #[must_use]
     pub fn is_expanded(&self, id: &str) -> bool {
         self.expanded.contains(id)
     }
 
-    /// 展开 / 折叠（非文件夹 / 禁用返回 `false`）。
     pub fn toggle(&mut self, id: &str) -> bool {
         if self
             .find(id)
@@ -199,13 +126,11 @@ impl TreeState {
         true
     }
 
-    /// 该 id 是否禁用（不存在的 id / 非禁用返回 `false`）。
     #[must_use]
     pub fn is_disabled(&self, id: &str) -> bool {
         self.find(id).is_some_and(|item| item.disabled)
     }
 
-    /// 展开（非文件夹 / 已展开 / 禁用返回 `false`）。
     pub fn expand(&mut self, id: &str) -> bool {
         if self
             .find(id)
@@ -216,12 +141,10 @@ impl TreeState {
         self.expanded.insert(SmolStr::new(id))
     }
 
-    /// 折叠（非文件夹 / 未展开返回 `false`）。
     pub fn collapse(&mut self, id: &str) -> bool {
         self.expanded.remove(id)
     }
 
-    /// 全部展开 / 收起（测试与「展开全部」按钮用）。
     pub fn set_all_expanded(&mut self, expanded: bool) {
         self.expanded.clear();
         if expanded {
@@ -246,7 +169,6 @@ impl TreeState {
         walk(&self.roots, id)
     }
 
-    /// 扁平化（只含可见行：折叠的子树不展开）。
     #[must_use]
     pub fn rows(&self) -> Vec<FlatRow> {
         let mut rows = Vec::new();
@@ -277,14 +199,6 @@ impl TreeState {
         rows
     }
 
-    /// 键盘导航：返回要执行的结果；`selected` 是当前选中行。
-    ///
-    /// 不可交互行（[`TreeItem::disabled`]）不展开 / 不折叠 / 不激活；上下移动会跳过它们。
-    ///
-    /// - `Up/Down`：在可见行里移动（跳过禁用行）；
-    /// - `Right`：折叠的文件夹展开；已展开的文件夹选到第一个子节点；叶子无动作；
-    /// - `Left`：展开的文件夹折叠；否则选到父节点；
-    /// - `Enter`：文件夹折叠 / 展开；叶子无动作。
     pub fn apply_key(&mut self, selected: Option<usize>, key: TreeKey) -> KeyOutcome {
         let rows = self.rows();
         if rows.is_empty() {
@@ -309,7 +223,6 @@ impl TreeState {
                         KeyOutcome::None
                     }
                 } else {
-                    // 叶子上右键是 no-op（常见树语义；旧实现的「跳到下一行」会意外移动选中）。
                     KeyOutcome::None
                 }
             }
@@ -338,7 +251,6 @@ impl TreeState {
     }
 }
 
-/// 朝 `forward` 方向找下一行可交互行（跳过禁用行；没有则停在原地）。
 fn step_over_disabled(rows: &[FlatRow], current: usize, forward: bool) -> usize {
     if forward {
         (current + 1..rows.len())
@@ -361,45 +273,27 @@ fn collect_folder_ids(items: &[TreeItem], ids: &mut Vec<SmolStr>) {
     }
 }
 
-/// 树键盘动作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TreeKey {
-    /// 上移一行。
     Up,
-    /// 下移一行。
     Down,
-    /// 折叠 / 选父节点。
     Left,
-    /// 展开 / 选首个子节点。
     Right,
-    /// 折叠切换（叶子无动作）。
     Enter,
 }
 
-/// 键盘导航结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyOutcome {
-    /// 选中新行（行表未变）。
     Select(usize),
-    /// 展开 / 折叠生效（行表变了，调用方要重建行数）。
-    Toggle {
-        /// 发生切换的行（行表重建后仍是同一行）。
-        row: usize,
-    },
-    /// 无动作。
+    Toggle { row: usize },
     None,
 }
 
-/// 树参数。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TreeOptions {
-    /// 行高（逻辑像素；树是等高行列表）。
     pub row_height: f32,
-    /// 每层缩进宽度。
     pub indent: f32,
-    /// 选中策略（树默认单选）。
     pub selection: SelectionMode,
-    /// 是否画滚动条。
     pub scrollbar: bool,
 }
 
@@ -415,14 +309,12 @@ impl Default for TreeOptions {
 }
 
 impl TreeOptions {
-    /// 行高。
     #[must_use]
     pub fn row_height(mut self, row_height: f32) -> Self {
         self.row_height = row_height.max(1.0);
         self
     }
 
-    /// 缩进宽度。
     #[must_use]
     pub fn indent(mut self, indent: f32) -> Self {
         self.indent = indent.max(0.0);
@@ -453,14 +345,12 @@ struct TreeGeometry {
     outer: Option<NodeId>,
 }
 
-/// 树句柄（`Rc` 浅拷贝）。
 #[derive(Clone)]
 pub struct Tree {
     inner: Rc<TreeInner>,
 }
 
 impl Tree {
-    /// 建树（根数据 + 参数）。之后 [`Tree::build`] + [`Tree::attach`]（或 [`Tree::mount`]）。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -506,9 +396,6 @@ impl Tree {
         list.set_initial_count(app, count);
         let disabled = disabled_rows(&flat.borrow());
         list.set_disabled_rows(disabled);
-        // 行级 a11y（E9）：逻辑树项 = 可见行。角色 / 标签 / 展开态 / 禁用态 / 层级在这里声明；
-        // 选中与扁平集合位置来自列表行基线。层级用 `level`（0-based depth）表达 —— 行是虚拟列表
-        // 的兄弟行，物理树里没有嵌套，引擎的父子推导因此给出「全部挂在 Tree 下」。
         let flat_a11y = flat.clone();
         list.set_row_a11y(move |_cx, index| {
             let flat = flat_a11y.borrow();
@@ -542,7 +429,6 @@ impl Tree {
         let this = Self {
             inner: Rc::new(inner),
         };
-        // 列表的行激活（双击 / Enter）→ 文件夹折叠切换。
         let tree = this.clone();
         this.inner.list.on_activate(move |app, row| {
             let _ = tree.toggle_row(app, row);
@@ -550,22 +436,16 @@ impl Tree {
         this
     }
 
-    /// 树键（调试 id 前缀）。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 
-    /// 行体的列表内核（组合 / 测试用）。
     #[must_use]
     pub fn list(&self) -> &List {
         &self.inner.list
     }
 
-    /// 只建节点（容器 + 列表）。
-    ///
-    /// # Errors
-    /// `StaleNode`。
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let count = self.inner.list.count_signal();
         let outer = NodeBuilder::boxed()
@@ -579,8 +459,6 @@ impl Tree {
                     .overflow_hidden()
                     .build(),
             )
-            // a11y（E9）：树的集合根。角色是静态语义；集合大小随行数（含展开/折叠后的可见行）
-            // 动态更新，屏幕阅读器才能播报「第 N 项，共 M 项」。
             .a11y(A11yOverride {
                 role: Some(A11yRole::Tree),
                 ..A11yOverride::default()
@@ -595,12 +473,6 @@ impl Tree {
         Ok(outer)
     }
 
-    /// 接引擎：列表 + 键盘绑定。
-    ///
-    /// # Errors
-    /// 同 [`List::attach`]（含 `make_virtual_list` / 行工厂建树 / 首帧 `compute_layout` 的
-    /// 错误，都会原样传播）；方向键作用域绑定也要求 viewport 已挂载（`bind_key_scoped` 的
-    /// `StaleNode` 在这里只可能是引擎不变量被破坏）。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         self.inner.list.attach(app, window)?;
         *self.inner.window.borrow_mut() = Some(window);
@@ -608,10 +480,6 @@ impl Tree {
         Ok(())
     }
 
-    /// 一步完成 `build` + `attach`。
-    ///
-    /// # Errors
-    /// 同 [`Tree::build`] / [`Tree::attach`]。
     pub fn mount(
         &self,
         app: &mut App,
@@ -628,17 +496,6 @@ impl Tree {
         Ok(outer)
     }
 
-    /// 注册方向键绑定（**实例级**：只有本树的列表容器内有焦点时才消费）。
-    ///
-    /// 引擎的 [`App::bind_key_scoped`] 在焦点不在本树 viewport 子树内时**不消费**按键，因此
-    /// 同屏多个树互不干扰，其它滚动容器的方向键默认滚动也不受影响（P2-2 审查 P2）。
-    /// 必须在 [`Tree::attach`] 之后调用（需要窗口与 viewport 节点）；`attach` 会自动调用。
-    ///
-    /// 绑定的生命周期归 [`App`] 管：`release` 用 [`App::unbind_scope_keys`] 显式摘除，
-    /// 即使漏掉也会在节点卸载 / 关窗时自动清理（见 `App::bind_key_scoped`）。
-    ///
-    /// # Errors
-    /// [`EngineError::UnknownWindow`] / [`EngineError::StaleNode`]：窗口或 viewport 已失效。
     pub fn bind_keys(&self, app: &mut App) -> Result<(), EngineError> {
         let (Some(window), Some(viewport)) =
             (*self.inner.window.borrow(), self.inner.list.viewport_node())
@@ -681,13 +538,6 @@ impl Tree {
         Ok(())
     }
 
-    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的树必须调用；先卸载节点再释放）。
-    ///
-    /// 清理面：4 条方向键的 scoped 绑定（[`App::unbind_scope_keys`]）+ 4 个方向键 Action
-    /// handler（[`App::off_action`]）+ 行体列表（含滚动条）的 handler / 信号作用域。只释放信号
-    /// 不摘 handler 会让 `App` 永久持有 `Rc<Tree>` 闭包与绑定表项（P2-2 复核 R2.2 的泄漏）。
-    ///
-    /// 返回被释放的槽位数（展开状态 + 行体列表 / 滚动条的状态）；重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
         if let (Some(window), Some(viewport)) =
             (*self.inner.window.borrow(), self.inner.list.viewport_node())
@@ -705,10 +555,6 @@ impl Tree {
         self.inner.list.release(app) + app.release_scope(self.inner.scope)
     }
 
-    /// 展开 / 折叠一行；返回行表是否变了。
-    ///
-    /// # Errors
-    /// `List::set_count` 的引擎错误。
     pub fn toggle_row(&self, app: &mut App, row: usize) -> Result<bool, EngineError> {
         let Some(flat) = self.inner.flat.borrow().get(row).cloned() else {
             return Ok(false);
@@ -723,10 +569,6 @@ impl Tree {
         self.rebuild_rows(app, state)
     }
 
-    /// 展开 / 折叠指定 id；返回行表是否变了。
-    ///
-    /// # Errors
-    /// `List::set_count` 的引擎错误。
     pub fn toggle(&self, app: &mut App, id: &str) -> Result<bool, EngineError> {
         let mut state = app.read_with(&self.inner.state, TreeState::clone);
         if state.is_disabled(id) || !state.toggle(id) {
@@ -735,10 +577,6 @@ impl Tree {
         self.rebuild_rows(app, state)
     }
 
-    /// 换根数据（行表 / 展开集全部替换，**滚回顶部**，选中清空）。
-    ///
-    /// # Errors
-    /// `List::set_items` 的引擎错误。
     pub fn set_roots(
         &self,
         app: &mut App,
@@ -751,12 +589,10 @@ impl Tree {
         *self.inner.flat.borrow_mut() = rows;
         self.inner.list.set_disabled_rows(disabled);
         app.write(&self.inner.state, state);
-        // 换根 = 换数据：重置滚动位置与选中（`set_count` 会保留旧偏移，语义不符）。
         self.inner.list.set_items(app, count)?;
         Ok(())
     }
 
-    /// 把模型写回信号并重建行表（保留选中行）。
     fn rebuild_rows(&self, app: &mut App, state: TreeState) -> Result<bool, EngineError> {
         let rows = state.rows();
         let count = rows.len();
@@ -768,50 +604,37 @@ impl Tree {
         Ok(true)
     }
 
-    /// 读模型。
     #[must_use]
     pub fn state(&self, app: &App) -> TreeState {
         app.read_with(&self.inner.state, TreeState::clone)
     }
 
-    /// 可见行表。
     #[must_use]
     pub fn rows(&self) -> Vec<FlatRow> {
         self.inner.flat.borrow().clone()
     }
 
-    /// 某 id 是否展开。
     #[must_use]
     pub fn is_expanded(&self, app: &App, id: &str) -> bool {
         app.read_with(&self.inner.state, |state| state.is_expanded(id))
     }
 
-    /// 选中行。
     #[must_use]
     pub fn selected_row(&self, app: &App) -> Option<usize> {
         self.inner.list.selection(app).first()
     }
 
-    /// 选中行的 id。
     #[must_use]
     pub fn selected(&self, app: &App) -> Option<SmolStr> {
         let row = self.selected_row(app)?;
         self.inner.flat.borrow().get(row).map(|row| row.id.clone())
     }
 
-    /// 选中一行并滚到可见。
-    ///
-    /// # Errors
-    /// `scroll_to_item` 的引擎错误。
     pub fn select_row(&self, app: &mut App, row: usize) -> Result<(), EngineError> {
         self.inner.list.select(app, Some(row));
         self.inner.list.scroll_to_item(app, row, ItemAlign::Nearest)
     }
 
-    /// 键盘一步（`Up/Down/Left/Right`；`Enter` 由列表激活回调处理）。
-    ///
-    /// # Errors
-    /// 行表重建时的引擎错误。
     pub fn handle_key(&self, app: &mut App, key: TreeKey) -> Result<(), EngineError> {
         let selected = self.selected_row(app);
         let mut state = app.read_with(&self.inner.state, TreeState::clone);
@@ -827,24 +650,16 @@ impl Tree {
         }
     }
 
-    /// 帧同步（行内容 / 悬停 / 滚动条）。
-    ///
-    /// # Errors
-    /// 同 [`List::sync`]。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         self.inner.list.sync(app)
     }
 
-    /// 外层容器节点（`build` 之后）。
     #[must_use]
     pub fn outer_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().outer
     }
 
     fn on_key(&self, ctx: &mut ActionCtx<'_>, key: TreeKey) {
-        // 绑定是实例作用域的；这里再校验一次「焦点在本树 viewport 子树内」，因为多窗口 / 陈旧
-        // 焦点的时序可能让绑定求值与事件分发之间焦点变化。`ctx.window()` 是**事件**所属窗口
-        // （旧实现读树的建窗窗口，多窗口下会用另一窗口的陈旧焦点误操作本树）。
         let window = ctx.window();
         let Some(viewport) = self.inner.list.viewport_node() else {
             return;
@@ -863,7 +678,6 @@ impl Tree {
     }
 }
 
-/// `node` 是否是 `ancestor` 或它的后代（焦点作用域判定）。
 fn node_in_subtree(tree: &NodeTree, node: NodeId, ancestor: NodeId) -> bool {
     let mut cursor = Some(node);
     while let Some(current) = cursor {
@@ -875,7 +689,6 @@ fn node_in_subtree(tree: &NodeTree, node: NodeId, ancestor: NodeId) -> bool {
     false
 }
 
-/// 行表里不可交互行的下标。
 fn disabled_rows(rows: &[FlatRow]) -> Vec<usize> {
     rows.iter()
         .enumerate()
@@ -884,7 +697,6 @@ fn disabled_rows(rows: &[FlatRow]) -> Vec<usize> {
         .collect()
 }
 
-/// 一行内容：缩进 + 层级线 + 折叠标 + 文本。
 fn build_row(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -928,8 +740,6 @@ fn build_row(
             SmolStr::new_static("▸"),
             TextStyle::new(theme.tokens().small.font_size),
         )
-        // 折叠标是纯装饰：树项的可访问名在逻辑行上（`A11yPatch::label`），读屏不应读到
-        //「▸ / ▾」这个字形。
         .a11y(A11yOverride {
             hidden: true,
             ..A11yOverride::default()
@@ -964,8 +774,6 @@ fn build_row(
         row.label.clone(),
         TextStyle::new(theme.tokens().medium.font_size),
     )
-    // 行的可访问名已经由逻辑树项的 `A11yPatch::label` 承载；这份文本只是绘制用的内容，
-    // 再从 a11y 暴露一次会让读屏把同一个名字读两遍（树的条目是叶子语义）。
     .a11y(A11yOverride {
         hidden: true,
         ..A11yOverride::default()
@@ -1107,7 +915,6 @@ mod tests {
                 .disabled(),
             TreeItem::new("leaf", "leaf"),
         ]);
-        // 0 → 1 是禁用行：下移动跳过，落到 3。
         assert_eq!(
             state.apply_key(Some(0), TreeKey::Down),
             KeyOutcome::Select(3),
@@ -1339,7 +1146,6 @@ mod ui_tests {
         assert_eq!(harness.tree.selected_row(harness.app.app()), Some(1));
         key(&mut harness, KeyCode::ArrowUp);
         assert_eq!(harness.tree.selected_row(harness.app.app()), Some(0));
-        // 展开 first，再右键进入子节点，然后左键回父节点。
         key(&mut harness, KeyCode::Enter);
         settle(&mut harness);
         key(&mut harness, KeyCode::ArrowRight);
@@ -1387,10 +1193,8 @@ mod ui_tests {
                 .disabled(),
             TreeItem::new("leaf", "leaf"),
         ]);
-        // 点击禁用行不选中。
         click_row(&mut harness, 1);
         assert_eq!(harness.tree.selected_row(harness.app.app()), None);
-        // 程序化选中被拒绝。
         harness
             .tree
             .select_row(harness.app.app_mut(), 2)
@@ -1400,7 +1204,6 @@ mod ui_tests {
             None,
             "程序化选中禁用行被拒绝"
         );
-        // 键盘上下跳过禁用行（0 → 3）。
         click_row(&mut harness, 0);
         assert_eq!(harness.tree.selected_row(harness.app.app()), Some(0));
         key(&mut harness, KeyCode::ArrowDown);
@@ -1411,7 +1214,6 @@ mod ui_tests {
         );
         key(&mut harness, KeyCode::ArrowUp);
         assert_eq!(harness.tree.selected_row(harness.app.app()), Some(0));
-        // 禁用文件夹不能程序化展开 / 折叠。
         assert!(
             !harness
                 .tree
@@ -1485,19 +1287,16 @@ mod ui_tests {
         let first_viewport = first.list().viewport_node().expect("first viewport");
         let second_viewport = second.list().viewport_node().expect("second viewport");
 
-        // 焦点在第一棵树：只有它消费方向键。
         app.app_mut().set_focus(window, Some(first_viewport));
         key_on(&mut app, KeyCode::ArrowDown);
         assert_eq!(first.selected_row(app.app()), Some(1));
         assert_eq!(second.selected_row(app.app()), None, "未聚焦的树不动");
 
-        // 焦点换到第二棵树：反过来成立。
         app.app_mut().set_focus(window, Some(second_viewport));
         key_on(&mut app, KeyCode::ArrowDown);
         assert_eq!(second.selected_row(app.app()), Some(1));
         assert_eq!(first.selected_row(app.app()), Some(1), "第一棵树保持不动");
 
-        // 焦点在别的滚动容器：方向键的**默认滚动**照常生效（树不再吞键）。
         app.app_mut().set_focus(window, Some(external));
         key_on(&mut app, KeyCode::ArrowDown);
         let offset = app
@@ -1514,8 +1313,6 @@ mod ui_tests {
         assert_eq!(second.selected_row(app.app()), Some(1));
     }
 
-    /// E9：树容器 = `Tree`、可见行 = `TreeItem`（a11y 父 = `Tree`），标签 / 展开 / 层级 / 选中
-    /// 状态进 a11y；行窗口（`List`）不再是树项的父；装饰字形与重复文本 hidden。
     #[test]
     fn tree_items_declare_tree_semantics_to_a11y() {
         let mut harness = harness();
@@ -1548,8 +1345,6 @@ mod ui_tests {
                 Some(tree.id),
                 "树项的 a11y 父是 Tree（行窗口只是布局包裹层）"
             );
-            // 行窗口被 E9 领养规则跳过：它不再列出树项；E15b 起也不再以 `List` 暴露（集合
-            // 行窗口抑制，平台 `common_filter` 会把 `GenericContainer` 透明上提）。
             let window = a11y_of(snapshot, viewport);
             assert_eq!(
                 window.role,
@@ -1557,7 +1352,6 @@ mod ui_tests {
                 "集合行窗口不得再自动声明 List（否则 AT 读到「树里套列表」）"
             );
             assert!(window.children.is_empty(), "行窗口不得再列树项");
-            // 折叠标 / 重复的行标签文本显式 hidden：读屏不应读到「▸」或把名字读两遍。
             assert!(
                 snapshot.nodes().iter().any(|node| node.hidden),
                 "装饰文本必须 hidden"
@@ -1571,7 +1365,6 @@ mod ui_tests {
                 }
             }
         }
-        // 选中 + 展开后行语义更新；全树快照上同时校验父子结构（父唯一 / 无孤儿）。
         click_row(&mut harness, 0);
         key(&mut harness, KeyCode::Enter);
         settle(&mut harness);
@@ -1607,7 +1400,6 @@ mod ui_tests {
         );
     }
 
-    /// 选中 / 展开 / 禁用三种状态都经 `A11yPatch` 动态更新，且结构变化发增量笔（不是全树）。
     #[test]
     fn tree_state_changes_are_incremental_a11y_updates() {
         let mut harness = harness_with(vec![
@@ -1621,13 +1413,11 @@ mod ui_tests {
         let mut updates = A11yUpdates::new();
         updates.apply(&harness.app);
 
-        // 点击禁用行：不选中、不产生 a11y 结构变化。
         click_row(&mut harness, 1);
         frame_a11y(&mut harness.app);
         updates.apply(&harness.app);
         assert_eq!(harness.tree.selected_row(harness.app.app()), None);
 
-        // 展开（行表重建）：结构变化必须是增量笔，不能退化成全树。
         assert!(
             harness
                 .tree
@@ -1656,7 +1446,6 @@ mod ui_tests {
         assert!(disabled.disabled, "禁用态进 a11y");
         assert_eq!(disabled.expanded, None, "叶子不宣告展开态");
 
-        // 选中：只有相关节点进增量笔（挂载行 + 祖先链），且有上界。
         click_row(&mut harness, 0);
         let _ = harness.app.drain().expect("选中帧");
         harness.app.assert_a11y_contract();
@@ -1683,8 +1472,6 @@ mod ui_tests {
         );
     }
 
-    /// 虚拟化：a11y 树只含已挂载的可见行，集合大小仍是逻辑总数（可见行数）；滚动换页后
-    /// 每笔 `TreeUpdate` 都过 `ShadowTree` 契约，树项始终挂在 `Tree` 下。
     #[test]
     fn a_virtualized_tree_exposes_mounted_items_and_the_logical_set() {
         let roots: Vec<TreeItem> = (0..40)
@@ -1725,7 +1512,6 @@ mod ui_tests {
             assert_eq!(node.parent, Some(tree.id));
         }
 
-        // 滚动到第 30 行：窗口换页；新行同样是 Tree 下的 TreeItem，集合大小不变。
         harness
             .tree
             .list()
@@ -1822,12 +1608,6 @@ mod ui_tests {
         assert_eq!(tree.release(app.app_mut()), 0, "重复释放幂等");
     }
 
-    /// `release` 必须解绑 4 条 scoped 方向键绑定并摘掉 4 个方向键 handler。
-    ///
-    /// 两种遗漏必须分别可观测：
-    /// - 只漏 `off_action`：绑定表项归零但 handler 残留 ⇒ `has_action_handler` 抓到；
-    /// - 只漏 `unbind_scope_keys`：handler 已摘，重放按键既不 panic 也不消费 ⇒ 只有绑定表
-    ///   计数（`scoped_key_binding_count`）能抓到。
     #[test]
     fn releasing_the_tree_unbinds_its_keys_and_removes_the_handlers() {
         let mut harness = harness();
@@ -1871,7 +1651,6 @@ mod ui_tests {
             );
         }
 
-        // 不卸载节点直接释放：重放按键 / 点击不得再调用已清理的绑定与 handler。
         let key_outcome = key(&mut harness, KeyCode::ArrowDown);
         assert_eq!(
             key_outcome.action, None,
@@ -1882,11 +1661,8 @@ mod ui_tests {
             click_outcome.action, None,
             "释放后重放点击不得命中已摘除的行选择 handler"
         );
-        // 解析出的节点仍可查（纯树查询，不读信号）。
         assert!(harness.tree.list().row_node(harness.app.app(), 1).is_some());
     }
-
-    // ── G3：运行时主题响应性（行文字 / 折叠标 / 选中底色） ─────────────────
 
     fn resolved(color: ui_core::paint::color::Color) -> [f32; 4] {
         ui_core::paint::color::ColorResolver
@@ -1894,7 +1670,6 @@ mod ui_tests {
             .components
     }
 
-    /// 行内文本节点的 `bind_style.foreground`（DFS 顺序：折叠标在前、标签在后）。
     fn row_text_foregrounds(
         harness: &Harness,
         row: usize,
@@ -1918,7 +1693,6 @@ mod ui_tests {
         out
     }
 
-    /// 外观切换后树行的文字 / 折叠标 / 选中底色换成新主题的角色色；不读主题的静态节点不被失效。
     #[test]
     fn switching_appearance_repaints_tree_row_text_and_selection() {
         let mut harness = harness();
@@ -1961,7 +1735,6 @@ mod ui_tests {
             "浅色行标签"
         );
 
-        // 静态节点（不读任何信号）：主题切换不得失效它。
         let static_node = {
             let parent = harness.tree.outer_node().expect("树的外层");
             let window = harness.app.window_id();

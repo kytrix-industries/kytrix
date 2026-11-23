@@ -1,10 +1,3 @@
-//! The selector's pure decisions, and the dialog it is mounted in.
-//!
-//! The pure tests drive the free functions directly; the dialog tests open the real kit
-//! dialog against the crate's test host and read the engine tree back
-//! ([`Harness::find`] / [`Harness::text_of`]), which is what the old bounds lookups
-//! assertions became.
-
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use market_participants_connector::catalog::test_support;
@@ -35,7 +28,6 @@ fn selection(route: &VenueRoute, symbol: &str) -> InstrumentSelection {
     }
 }
 
-/// The loaded scopes the fixtures are described by: two Binance scopes and one OKX scope.
 fn registry() -> Arc<[LoadedScope]> {
     loaded(vec![
         scope(
@@ -82,7 +74,6 @@ fn entry(
     test_support::with_status(test_support::entry(route, instrument, symbol), status)
 }
 
-/// One row of a listing whose generation published no name for it.
 fn unnamed_row(
     route: &VenueRoute,
     symbol: &str,
@@ -98,7 +89,6 @@ fn unnamed_row(
     }
 }
 
-/// One unnamed row of `entry`, ordered under `route_order`.
 fn ordered_under(entry: &CatalogEntry, route_order: &str) -> ListingRow {
     ListingRow {
         route_order: SmolStr::new(route_order),
@@ -125,7 +115,6 @@ fn row_names(rows: &[ListingRow]) -> Vec<&str> {
         .collect()
 }
 
-/// The rows one published fixture offers under `filters`.
 fn fixture_rows(
     catalog: &market_participants_connector::catalog::store::Catalog,
     route: &VenueRoute,
@@ -137,7 +126,6 @@ fn fixture_rows(
     rows_of(&display, route, entries, filters, entry_predicate)
 }
 
-/// Whether the matcher answers `query` with the one row whose column is `column`.
 fn matcher_hits(column: &str, query: &str) -> bool {
     let mut matcher: Nucleo<()> = Nucleo::new(
         MatcherConfig::DEFAULT,
@@ -226,7 +214,6 @@ fn initial_route_should_fall_back_to_first_permitted_route() {
 }
 
 impl InstrumentFilters {
-    /// The same filters over another registry snapshot.
     fn with(mut self, routes: Arc<[LoadedScope]>) -> Self {
         self.routes = routes;
         self
@@ -327,8 +314,6 @@ fn confirmation_should_refuse_a_status_the_filters_do_not_offer() {
     );
 }
 
-/// A listing that declares a window is only selectable inside it: the window is
-/// part of what a selection satisfies, not only what the list was filtered by.
 #[test]
 fn confirmation_should_refuse_a_listing_whose_window_has_not_opened() {
     let binance_spot = route("binance", "spot");
@@ -355,7 +340,6 @@ fn confirmation_should_refuse_a_listing_whose_window_has_not_opened() {
     );
 }
 
-/// The same listing is selectable once its window covers the moment of confirmation.
 #[test]
 fn confirmation_should_accept_a_listing_inside_its_window() {
     let binance_spot = route("binance", "spot");
@@ -687,9 +671,6 @@ fn rows_should_be_ordered_by_the_published_name() {
     );
 }
 
-/* ── the dialog ───────────────────────────────────────────────────────────── */
-
-/// Opens the selector against `harness` and reports what the entry point answered.
 fn open(harness: &mut Harness, filters: InstrumentFilters) -> bool {
     let host = harness.host().clone();
     let window = harness.window();
@@ -717,13 +698,6 @@ fn click_node_id(harness: &mut Harness, node: ui_core::node::id::NodeId) {
     harness.click(centre);
 }
 
-/// The per-instance kit key prefixes of the selectors open in the harness window, in the order
-/// the dialogs were built.
-///
-/// Every kit component of a dialog is keyed by `"instrument-selector@{scope}"`, so the debug ids
-/// the components built (`"{key}:cancel"`, `"{key}:list:row:0"`, …) state the key they were built
-/// with. The engine appends a scope slot per dialog and never recycles an index, so the keys
-/// sort in open order.
 fn selector_keys(harness: &Harness) -> Vec<SmolStr> {
     let mut keys: Vec<SmolStr> = Vec::new();
     for id in harness.debug_ids() {
@@ -742,7 +716,6 @@ fn selector_keys(harness: &Harness) -> Vec<SmolStr> {
     keys
 }
 
-/// The kit key prefix of the one selector open in `harness`.
 fn selector_key(harness: &Harness) -> SmolStr {
     selector_keys(harness)
         .into_iter()
@@ -750,14 +723,11 @@ fn selector_key(harness: &Harness) -> SmolStr {
         .unwrap_or_else(|| panic!("no selector is open; ids: {:?}", harness.debug_ids()))
 }
 
-/// Clicks one node of the open selector: `suffix` is the part after the dialog's key
-/// (e.g. `":cancel"` or `":filter.root"`).
 fn click_selector(harness: &mut Harness, suffix: &str) {
     let key = selector_key(harness);
     click_node(harness, &format_smolstr!("{key}{suffix}"));
 }
 
-/// Settles the dialog through a close: the kit fade needs frames and clock movement.
 fn settle_close(harness: &mut Harness) -> bool {
     let closed = harness.settle_until(120, |harness| {
         harness.overlay_count() == 0 && harness.router().is_empty()
@@ -769,7 +739,6 @@ fn settle_close(harness: &mut Harness) -> bool {
     closed || (harness.overlay_count() == 0 && harness.router().is_empty())
 }
 
-/// Opens one selector the way a pane's instrument control does, confirming into `confirmed`.
 fn open_confirming(
     harness: &mut Harness,
     current: Option<InstrumentSelection>,
@@ -788,7 +757,6 @@ fn open_confirming(
     )
 }
 
-/// Whether every open selector has drawn a listing row of its own list.
 fn both_selectors_list(harness: &Harness) -> bool {
     let keys = selector_keys(harness);
     keys.len() == 2
@@ -801,7 +769,6 @@ fn both_selectors_list(harness: &Harness) -> bool {
         })
 }
 
-/// Settles until the dialog whose key prefix is `key` has closed and released its nodes.
 fn settle_dialog_close(harness: &mut Harness, key: &str) -> bool {
     let confirm = format_smolstr!("{key}:ok");
     let closed = harness.settle_until(120, |harness| harness.find(&confirm).is_none());
@@ -904,7 +871,6 @@ fn an_empty_catalog_should_leave_the_list_empty() {
         )],
     );
     let mut harness = Harness::with_catalog(catalog);
-    // The one listing is a spot listing, and the filters ask for options only.
     let opened = open(
         &mut harness,
         InstrumentFilters {
@@ -1007,11 +973,6 @@ fn switching_language_rebuilds_the_venue_column() {
     );
 }
 
-/// The host is assembled from the services the composition root already owns: the dialog's
-/// overlay registers in the services' layer stack and its frame route in the services'
-/// router, so the application's z-order arbitration and its single frame hook see the
-/// dialog. A host that built its own layer stack / routers would open a dialog the
-/// application can neither order nor tick.
 #[test]
 fn the_dialog_builds_through_the_services_singletons() {
     let mut harness = Harness::new();
@@ -1097,7 +1058,6 @@ fn two_panes_confirm_their_own_selector_and_release_only_their_own_handlers() {
     let baseline = stats(&harness);
     let baseline_nodes = harness.tree_len();
 
-    // Pane A follows BTC, pane B follows ETH: each confirmation must report its own listing.
     assert!(open_confirming(
         &mut harness,
         Some(selection(&spot_route, "BTCUSDT")),
@@ -1121,9 +1081,6 @@ fn two_panes_confirm_their_own_selector_and_release_only_their_own_handlers() {
     assert_ne!(keys[0], keys[1], "each dialog owns its own kit key prefix");
     assert_eq!(harness.overlay_count(), 2, "both dialogs are open at once");
 
-    // The second dialog is the topmost one. Its row click and its confirm must reach the
-    // second pane's callback and nothing else: with one constant dialog key the second
-    // dialog's registration had already replaced the first pane's handler.
     let rows = harness.find_all("INSTRUMENT_SELECTOR:row:");
     let row_text: Vec<String> = rows.iter().map(|row| harness.text_of(*row)).collect();
     assert_eq!(
@@ -1154,8 +1111,6 @@ fn two_panes_confirm_their_own_selector_and_release_only_their_own_handlers() {
         "the first pane's dialog is still open"
     );
 
-    // The remaining dialog is now the topmost one: its own confirm handler must still be
-    // registered (the closed dialog released exactly its own identity).
     let rows = harness.find_all("INSTRUMENT_SELECTOR:row:");
     assert_eq!(rows.len(), 2, "only the first dialog lists rows now");
     assert_eq!(harness.text_of(rows[0]), "BTC/USDT");
@@ -1233,16 +1188,10 @@ fn two_panes_confirm_their_own_selector_and_release_only_their_own_handlers() {
 
 #[test]
 fn selecting_a_match_then_confirming_reports_the_key() {
-    // The pointer path into the dialog is covered by the cancel / filter tests; this test
-    // drives the list's own selection (which is where a row click ends) and then the
-    // confirmation, so the state machine's wiring is asserted without leaning on hit
-    // testing inside a modal overlay.
     let spot_route = test_support::spot_route();
     let entry = test_support::entry(&spot_route, spot("BTC", "USDT"), "BTCUSDT");
     let catalog = catalog_with(&spot_route, vec![entry]);
     let mut harness = Harness::with_catalog(catalog);
-    // Every confirmation is recorded, so a callback that runs twice is visible: the caller
-    // is a pane that opens something / follows the listing, and one click must report once.
     let confirmed: Rc<RefCell<Vec<InstrumentSelection>>> = Rc::new(RefCell::new(Vec::new()));
     let callback = Rc::clone(&confirmed);
     let host = harness.host().clone();
@@ -1279,8 +1228,6 @@ fn selecting_a_match_then_confirming_reports_the_key() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(published, "the matcher publishes the listing");
-    // The frame route is what copies a published ranking into the list; here the test is
-    // the route for the one step it needs.
     state.show_matches(harness.app_mut());
     assert_eq!(state.rows.borrow().len(), 1, "the list is given the row");
     assert!(state.list.select(harness.app_mut(), Some(0)));
@@ -1315,12 +1262,6 @@ fn selecting_a_match_then_confirming_reports_the_key() {
     );
 }
 
-/// The dialog's signals live in a scope of its own: closing releases it (so a re-open starts
-/// from reclaimed slots), and releasing it again is a no-op.
-///
-/// The engine's `release_scope` answers how many value slots it reclaimed; a dialog that
-/// minted its signals at the root would leave four slots behind per open/close cycle and
-/// answer `> 0` here, because nothing else could have released them.
 #[test]
 fn the_dialog_releases_its_signal_scope_when_it_finishes() {
     let mut harness = Harness::new();
@@ -1346,13 +1287,6 @@ fn the_dialog_releases_its_signal_scope_when_it_finishes() {
     );
 }
 
-/// A dialog's own signal scope means an open/close cycle allocates nothing for good: a
-/// hundred cycles leave the value store exactly where the first close left it, and no node,
-/// overlay or frame route behind.
-///
-/// The engine reports the slot table through `test_support::diagnostics::signal_slot_stats`;
-/// a dialog that minted its four signals at the root would add four live slots per cycle and
-/// nothing would ever reclaim them.
 #[test]
 fn opening_and_closing_the_dialog_a_hundred_times_reclaims_everything() {
     let mut harness = Harness::new();
@@ -1391,11 +1325,6 @@ fn opening_and_closing_the_dialog_a_hundred_times_reclaims_everything() {
     );
 }
 
-/// The keyboard events a dialog owns are the typed text of its own window, and only while it
-/// is the window's modal scope: everything else stays in the application's observation queue.
-///
-/// A dialog that took the whole queue would swallow the pointer / resize / focus events the
-/// composition root reads (and, with two windows, another window's typing).
 #[test]
 fn the_filter_takes_its_own_text_and_leaves_every_other_event_queued() {
     let mut harness = Harness::new();

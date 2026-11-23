@@ -1,212 +1,104 @@
 use std::fmt;
 
-/// A language supported by the Google Workspace Admin SDK.
-///
-/// Source: <https://developers.google.com/workspace/admin/directory/v1/languages>.
-///
-/// The [`LanguageCode::as_str`] values are the exact strings Google Workspace
-/// expects in `languageCode` fields and `Accept-Language` headers, including the
-/// legacy `iw` (Hebrew) and `in` (Indonesian) spellings. They also name the
-/// locale files loaded by [`I18n::builder`](crate::I18n::builder), e.g. `zh-CN.yaml`.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum LanguageCode {
-    /// Afrikaans.
     Af,
-    /// Albanian.
     Sq,
-    /// Amharic.
     Am,
-    /// Arabic.
     Ar,
-    /// Armenian.
     Hy,
-    /// Assamese.
     As,
-    /// Azerbaijani.
     Az,
-    /// Basque.
     Eu,
-    /// Bengali.
     Bn,
-    /// Bulgarian.
     Bg,
-    /// Burmese.
     My,
-    /// Catalan.
     Ca,
-    /// Cherokee.
     Chr,
-    /// Chinese (Hong Kong).
     ZhHk,
-    /// Chinese (Simplified).
     ZhCn,
-    /// Chinese (Traditional).
     ZhTw,
-    /// Croatian.
     Hr,
-    /// Czech.
     Cs,
-    /// Danish.
     Da,
-    /// Dutch.
     Nl,
-    /// English (United Kingdom).
     EnGb,
-    /// English (United States).
     #[default]
     En,
-    /// Estonian.
     Et,
-    /// Filipino.
     Fil,
-    /// Finnish.
     Fi,
-    /// French.
     Fr,
-    /// French (Canada).
     FrCa,
-    /// Galician.
     Gl,
-    /// Georgian.
     Ka,
-    /// German.
     De,
-    /// Greek.
     El,
-    /// Gujarati.
     Gu,
-    /// Hebrew.
     Iw,
-    /// Hindi.
     Hi,
-    /// Hungarian.
     Hu,
-    /// Icelandic.
     Is,
-    /// Indonesian.
     In,
-    /// Irish.
     Ga,
-    /// Italian.
     It,
-    /// Japanese.
     Ja,
-    /// Kannada.
     Kn,
-    /// Kazakh.
     Kk,
-    /// Khmer.
     Km,
-    /// Korean.
     Ko,
-    /// Lao.
     Lo,
-    /// Latvian.
     Lv,
-    /// Lithuanian.
     Lt,
-    /// Macedonian.
     Mk,
-    /// Malay.
     Ms,
-    /// Malayalam.
     Ml,
-    /// Marathi.
     Mr,
-    /// Mongolian.
     Mn,
-    /// Nepali.
     Ne,
-    /// Norwegian.
     No,
-    /// Odia (Oriya).
     Or,
-    /// Persian.
     Fa,
-    /// Polish.
     Pl,
-    /// Portuguese (Brazil).
     PtBr,
-    /// Portuguese (Portugal).
     PtPt,
-    /// Punjabi.
     Pa,
-    /// Romanian.
     Ro,
-    /// Russian.
     Ru,
-    /// Serbian.
     Sr,
-    /// Sinhala.
     Si,
-    /// Slovak.
     Sk,
-    /// Slovenian.
     Sl,
-    /// Spanish.
     Es,
-    /// Spanish (Latin America).
     Es419,
-    /// Swahili.
     Sw,
-    /// Swedish.
     Sv,
-    /// Tamil.
     Ta,
-    /// Telugu.
     Te,
-    /// Thai.
     Th,
-    /// Turkish.
     Tr,
-    /// Ukrainian.
     Uk,
-    /// Urdu.
     Ur,
-    /// Uzbek.
     Uz,
-    /// Vietnamese.
     Vi,
-    /// Welsh.
     Cy,
-    /// Zulu.
     Zu,
 }
 
-/// Declares the code/name table and the matching variant list from one source of
-/// truth, so `LanguageCode::as_str`, `LanguageCode::name` and `LanguageCode::all`
-/// cannot drift apart.
 macro_rules! language_codes {
     ($($variant:ident => $code:literal, $name:literal;)*) => {
-        /// Every supported language code, as `(code, English name)` pairs.
-        ///
-        /// The order is the one the
-        /// [Google Workspace language list](https://developers.google.com/workspace/admin/directory/v1/languages)
-        /// uses, which is a sensible order for a language picker.
-        ///
-        /// [`LanguageCode::all`] walks the same list, so it is the only accessor
-        /// consumers need.
         pub(crate) const CODES: &[(&str, &str)] = &[$(($code, $name)),*];
         impl LanguageCode {
-            /// Returns the Google Workspace language code, e.g. `"zh-CN"`.
             pub const fn as_str(self) -> &'static str {
                 const CODES: [&str; language_codes!(@count $($variant)*)] = [$($code),*];
                 CODES[self as usize]
             }
 
-            /// Returns the English name of the language, e.g. `"Chinese (Simplified)"`.
             pub const fn name(self) -> &'static str {
                 const NAMES: [&str; language_codes!(@count $($variant)*)] = [$($name),*];
                 NAMES[self as usize]
             }
 
-            /// Parses a Google Workspace language code such as `"en"`, `"zh-CN"` or
-            /// `"pt-BR"`.
-            ///
-            /// Returns `None` for anything that is not in the language list. The
-            /// list holds fewer than a hundred short codes and is only searched
-            /// while loading locale files, so a scan is cheaper than keeping a
-            /// second, code-sorted copy of the table in the binary.
             pub fn parse(code: &str) -> Option<Self> {
                 CODES
                     .iter()
@@ -214,8 +106,6 @@ macro_rules! language_codes {
                     .map(Self::from_index)
             }
 
-            /// Returns every supported language code, in the order of the Google
-            /// Workspace language list.
             pub fn all() -> impl ExactSizeIterator<Item = Self> {
                 const VARIANTS: [LanguageCode; language_codes!(@count $($variant)*)] =
                     [$(LanguageCode::$variant),*];
@@ -223,7 +113,6 @@ macro_rules! language_codes {
                 VARIANTS.into_iter()
             }
 
-            /// Converts the position of a table entry to its variant.
             #[inline]
             const fn from_index(index: usize) -> Self {
                 const VARIANTS: [LanguageCode; language_codes!(@count $($variant)*)] =
@@ -235,8 +124,6 @@ macro_rules! language_codes {
 
         #[cfg(test)]
         impl LanguageCode {
-            /// Returns every variant, including any that
-            /// [`LanguageCode::all`] might have missed.
             pub(super) fn all_reachable() -> Vec<Self> {
                 vec![$(LanguageCode::$variant),*]
             }

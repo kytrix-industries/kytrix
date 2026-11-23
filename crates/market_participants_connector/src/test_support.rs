@@ -1,16 +1,3 @@
-//! Shared fixture infrastructure of this crate's tests.
-//!
-//! Three fixtures are shared. The venue's `info` endpoint is a real HTTP socket
-//! that answers what the adapter's own encoder asked for, so several tests need
-//! it and it is served from one place instead of being stubbed. The other is the
-//! market a test loads: the definition table is crate-private, so a fixture that
-//! wants a venue's statically declared scopes loaded reaches it through the
-//! helpers below. The third is the root itself: every test that drives a load
-//! builds the same root over the snapshot it wants and the transport it owns,
-//! Third, the process's shared test runtime: a root is built over a `tokio` handle
-//! like the application's, and one runtime for every test in the process keeps a
-//! root's tasks alive for as long as a peer drives them.
-
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,15 +39,6 @@ use crate::{
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
 };
 
-/// The definitions of the venues named, as a fixture loads them.
-///
-/// [`crate::connector::MarketParticipantsConnector::load_fixture`] takes the definition
-/// table's entries, and the table itself is crate-private: this is how a fixture
-/// outside this crate names the venues whose statically declared scopes it wants
-/// loaded. The table answers every venue the identity carries, so a name the
-/// identity does not know is the only one a fixture can ask for and not get — and
-/// that is a mistake in the fixture rather than a case to answer with an empty
-/// scope set.
 pub fn definitions(venues: &[VenueId]) -> Vec<VenueDefinition> {
     venues
         .iter()
@@ -68,15 +46,6 @@ pub fn definitions(venues: &[VenueId]) -> Vec<VenueDefinition> {
         .collect()
 }
 
-/// The handle of the runtime every test in the process shares.
-///
-/// A runtime built inside one test would be shut down when that test ends, cancelling
-/// the transfers a still-running peer started; one runtime per process is what makes the
-/// handle a stand-in for the application runtime rather than a second one.
-///
-/// # Panics
-///
-/// Panics when the operating system cannot provide the runtime's worker threads.
 pub fn test_handle() -> Handle {
     static SHARED: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
@@ -91,24 +60,15 @@ pub fn test_handle() -> Handle {
         .clone()
 }
 
-/// The settings snapshot one fixture installation belongs to.
-///
-/// A root is built over the settings its fixture addresses were installed into, so this is the
-/// one place a test turns an installation into the shape a root takes. The snapshot owns the
-/// configuration, which is what carries the addresses: a test holds the root and nothing else.
 pub fn fixture_config(installation: &FixtureInstallation) -> Config {
     let mut config = Config::default();
     config.venues = installation.venues().clone();
     config
 }
 
-/// One fixture `info` server: the origin it serves on, the log of the request types
-/// it has been asked, and the task that owns its socket.
 #[cfg(test)]
 pub(crate) type InfoFixture = (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>);
 
-/// The transport policy a fixture server needs: the servers speak plain HTTP on a
-/// loopback socket, and every other transport decision is the production one.
 #[cfg(test)]
 pub(crate) fn plaintext_policy() -> TransportPolicy {
     TransportPolicy {
@@ -117,14 +77,6 @@ pub(crate) fn plaintext_policy() -> TransportPolicy {
     }
 }
 
-/// A fixture root over the snapshot `notification` carries, with the catalog wiring
-/// attached.
-///
-/// This is the one place a test root is built: what varies between the fixtures of
-/// this crate is the configuration the snapshot carries and the transport policy the
-/// test owns, and both are the caller's. The handle returned is the directory the
-/// root writes and reads through, so a fixture drives a real load through
-/// the real gateway, registry, commit and request path.
 #[cfg(test)]
 pub(crate) fn connector_over(
     notification: ConfigNotification<MarketParticipantNetworkSnapshot>,
@@ -140,23 +92,6 @@ pub(crate) fn connector_over(
     (connector, catalog)
 }
 
-/// Serves one discovery conversation of a venue's `info` endpoint.
-///
-/// Every answer is selected by the request that arrived: the `perpDexs` answers
-/// are handed out in order (the last one repeats), and a `meta` request is
-/// answered with the metadata of the DEX it names. The fixture is therefore the
-/// wire, not a stub of the adapter's own functions.
-///
-/// `core_meta` is the core perpetual route's metadata and `dex_meta` the metadata of one
-/// deployed DEX each. A `metaAndAssetCtxs` request is answered with that metadata and an
-/// empty context list, which is all it takes for a route's catalog to be derivable — and
-/// therefore what lets a test drive a read that decodes against several routes' catalogs.
-/// `spotMetaAndAssetCtxs` is answered from the spot metadata in the same way.
-///
-/// The second element of the answer is the log of the request types the fixture served, in
-/// arrival order: a test about how many requests a caller makes — whether a remote answer
-/// is bounded, for instance — counts them there instead of inferring the count from the
-/// answer the caller got back.
 #[cfg(test)]
 pub(crate) async fn info_fixture_server(
     perp_dexs: Vec<String>,
@@ -177,16 +112,6 @@ pub(crate) async fn info_fixture_server(
     .0
 }
 
-/// The same server, with each deployment's `meta` answered from a switch.
-///
-/// One reading of a venue is one `perpDexs` answer plus the `meta` of every deployment
-/// it named, and how many requests one reading makes is the adapter's business. A
-/// fixture that advanced a body per request would answer one reading with two different
-/// universes, or two readings with the same one, depending on the order they arrive in.
-/// The switch is the test's instead: it holds the index of the body every `meta` answer
-/// uses until the test moves it, which is what "the venue answers its next reading now"
-/// means for a test that pins how a reader behaves across a refresh. A caller with one
-/// body per deployment wants [`info_fixture_server`].
 #[cfg(test)]
 pub(crate) async fn info_fixture_server_with_readings(
     perp_dexs: Vec<String>,
@@ -248,10 +173,6 @@ pub(crate) async fn info_fixture_server_with_readings(
                             };
                             format!("[{},[]]", meta.unwrap_or_else(|| "null".to_owned()))
                         }
-                        // A venue reading now also carries the HIP-4 outcome table
-                        // and its templates. A fixture that serves no outcomes is a
-                        // venue with no outcome scopes, which is the shape every
-                        // pre-HIP-4 fixture means.
                         "outcomeMeta" => r#"{"outcomes":[],"questions":[]}"#.to_owned(),
                         "outcomeTemplates" => "[]".to_owned(),
                         "allMids" => "{}".to_owned(),
@@ -272,11 +193,6 @@ pub(crate) async fn info_fixture_server_with_readings(
     ((format!("http://{address}"), requests, task), reading)
 }
 
-/// Answers one deployment's `meta` from the reading the switch names.
-///
-/// The index is the test's, not a per-request counter: every `meta` answer of one
-/// reading uses the same body however many requests that reading makes and in whatever
-/// order they arrive. An index past the last body repeats it.
 #[cfg(test)]
 fn next_dex_body(
     dex_meta: &[(String, Vec<String>)],
@@ -291,11 +207,6 @@ fn next_dex_body(
     bodies.get(index.min(bodies.len() - 1)).cloned()
 }
 
-/// Reads one HTTP request off one connection and answers the JSON body it carried.
-///
-/// The body is what the venue's own encoder wrote, so a fixture that counts requests sees
-/// the requests themselves rather than the bytes that carried them — a client is free to
-/// reuse one connection for several of them.
 #[cfg(test)]
 pub(crate) async fn read_info_request(
     socket: &mut tokio::net::TcpStream,
@@ -328,7 +239,6 @@ pub(crate) async fn read_info_request(
     serde_json::from_slice(&buffer[header_end..header_end + length]).ok()
 }
 
-/// One answer the [`refusing_fixture_server`] hands out, in the order it hands them out.
 #[derive(Clone)]
 #[cfg(test)]
 pub(crate) struct FixtureAnswer {
@@ -339,7 +249,6 @@ pub(crate) struct FixtureAnswer {
 
 #[cfg(test)]
 impl FixtureAnswer {
-    /// One JSON answer the venue serves.
     pub(crate) fn ok(body: &str) -> Self {
         Self {
             status: 200,
@@ -348,7 +257,6 @@ impl FixtureAnswer {
         }
     }
 
-    /// A refusal with a status and whatever the venue put in the body.
     pub(crate) fn refused(status: u16, headers: &str, body: &str) -> Self {
         Self {
             status,
@@ -358,13 +266,6 @@ impl FixtureAnswer {
     }
 }
 
-/// Serves one conversation from a queue of answers this test states.
-///
-/// A venue that refuses a request answers with a status and a body and no envelope,
-/// which is the shape the adapter's own HTTP failure mapping reads — and the shape a
-/// test that pins what a client does about a refusal needs to state itself. The
-/// answers are handed out one per request, the last one repeating, so a test can say
-/// "refused, then served" as well as "refused however often it is asked".
 #[cfg(test)]
 pub(crate) async fn refusing_fixture_server(answers: Vec<FixtureAnswer>) -> InfoFixture {
     assert!(!answers.is_empty(), "a fixture needs one answer to serve");
@@ -415,8 +316,6 @@ pub(crate) async fn refusing_fixture_server(answers: Vec<FixtureAnswer>) -> Info
     (format!("http://{address}"), requests, task)
 }
 
-/// One DEX metadata answer whose universe names `coins` and settles in the first
-/// spot token.
 #[cfg(test)]
 pub(crate) fn dex_meta(coins: &[&str]) -> String {
     let universe: Vec<String> = coins
@@ -429,7 +328,6 @@ pub(crate) fn dex_meta(coins: &[&str]) -> String {
     )
 }
 
-/// The spot token table a DEX's collateral index resolves against.
 #[cfg(test)]
 pub(crate) fn spot_meta_answer(tokens: &[&str]) -> String {
     let tokens: Vec<String> = tokens
@@ -440,38 +338,24 @@ pub(crate) fn spot_meta_answer(tokens: &[&str]) -> String {
     format!(r#"{{"tokens":[{}],"universe":[]}}"#, tokens.join(","))
 }
 
-/// One catalog route of the fixture venues, as the fixture names it.
-///
-/// A route is keyed by the request its own venue's protocol addresses: the
-/// `exchangeInfo` of one Binance REST base, or the `instruments` table of one OKX
-/// instrument type. What a route serves is that venue's own answer, so a test that
-/// changes one route's answer changes what one venue publishes and nothing else.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum CatalogRoute {
-    /// Binance spot: `GET /api/v3/exchangeInfo`.
     BinanceSpot,
-    /// Binance USD-M perpetuals: `GET /fapi/v1/exchangeInfo`.
     BinancePerp,
-    /// OKX spot: `GET /api/v5/public/instruments?instType=SPOT`.
     OkxSpot,
-    /// OKX swaps: `GET /api/v5/public/instruments?instType=SWAP`.
     OkxSwap,
 }
 
-/// The Binance USD-M perpetual `exchangeInfo` the fixture serves by default.
 #[cfg(test)]
 const BINANCE_PERPETUAL_ANSWER: &str = r#"{"timezone":"UTC","serverTime":1700000000000,"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","marginAsset":"USDT","contractType":"PERPETUAL","onboardDate":1569398400000,"requiredMarginPercent":"2.0000","maintMarginPercent":"1.0000","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]}]}"#;
 
-/// The OKX spot `instruments` answer the fixture serves by default.
 #[cfg(test)]
 const OKX_SPOT_ANSWER: &str = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","baseCcy":"BTC","quoteCcy":"USDT","tickSz":"0.1","lotSz":"0.000001","minSz":"0.00001","maxLmtSz":"1000","state":"live","listTime":"1500000000000"}]}"#;
 
-/// The OKX swap `instruments` answer the fixture serves by default.
 #[cfg(test)]
 const OKX_SWAP_ANSWER: &str = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","baseCcy":"","quoteCcy":"","settleCcy":"USDT","tickSz":"0.1","lotSz":"0.01","minSz":"0.01","maxLmtSz":"10000","ctVal":"0.01","ctType":"linear","uly":"BTC-USDT","instFamily":"BTC-USDT","state":"live"}]}"#;
 
-/// One Binance spot `exchangeInfo` answer listing one tradable pair per symbol.
 #[cfg(test)]
 pub(crate) fn binance_spot_market_participant_info(symbols: &[&str]) -> String {
     let pairs: Vec<String> = symbols
@@ -489,15 +373,6 @@ pub(crate) fn binance_spot_market_participant_info(symbols: &[&str]) -> String {
     )
 }
 
-/// The catalogue fixture: a socket that answers the catalog protocol of the built-in
-/// venues, with one switch per catalog route.
-///
-/// The fixture is the wire, not a stub of the adapter's own functions: every answer is
-/// the JSON the venue's protocol defines, so a request travels through the real
-/// gateway, registry and adapter dispatch. A test states what one route answers — the
-/// venue's table, a refusal, or a response held back — and reads which routes were
-/// asked for, which is how a refresh and two concurrent venues are driven without a
-/// venue behind them.
 #[cfg(test)]
 pub(crate) struct CatalogFixture {
     origin: String,
@@ -506,22 +381,14 @@ pub(crate) struct CatalogFixture {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// What one [`CatalogFixture`] serves, route by route.
 #[cfg(test)]
 struct FixtureState {
-    /// The answer of every route, as the venue's own protocol states it.
     bodies: AHashMap<CatalogRoute, SmolStr>,
-    /// The routes that refuse every request from here on.
     refused: AHashSet<CatalogRoute>,
-    /// The route whose requests are held until the fixture is released.
     stalled: Option<CatalogRoute>,
-    /// The routes asked for so far, in arrival order.
     served: Vec<CatalogRoute>,
 }
 
-/// The stall control of one [`CatalogFixture`]: a held route reports that it was
-/// asked and then waits for a latched release, so a release that happens before the
-/// request arrives is never lost.
 #[cfg(test)]
 struct Stall {
     started: tokio::sync::Semaphore,
@@ -550,7 +417,6 @@ impl Stall {
 
 #[cfg(test)]
 impl CatalogFixture {
-    /// Starts a fixture serving the catalog protocol of every fixture venue.
     pub(crate) async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -582,27 +448,22 @@ impl CatalogFixture {
         }
     }
 
-    /// The origin every catalog endpoint of this fixture is pointed at.
     pub(crate) fn origin(&self) -> &str {
         &self.origin
     }
 
-    /// Serves `body` for one route from here on.
     pub(crate) fn serve(&self, route: CatalogRoute, body: &str) {
         self.state.lock().bodies.insert(route, SmolStr::new(body));
     }
 
-    /// Refuses every request for one route from here on.
     pub(crate) fn refuse(&self, route: CatalogRoute) {
         self.state.lock().refused.insert(route);
     }
 
-    /// Holds every request for one route until [`Self::release`].
     pub(crate) fn stall(&self, route: CatalogRoute) {
         self.state.lock().stalled = Some(route);
     }
 
-    /// Waits until the stalled route has been asked for something.
     pub(crate) async fn await_stall(&self) {
         let permit = self
             .stall
@@ -613,12 +474,10 @@ impl CatalogFixture {
         permit.forget();
     }
 
-    /// Answers every held request.
     pub(crate) fn release(&self) {
         self.stall.released.store(true, Ordering::Release);
     }
 
-    /// The routes asked for so far, in arrival order.
     pub(crate) fn served(&self) -> Vec<CatalogRoute> {
         self.state.lock().served.clone()
     }
@@ -631,7 +490,6 @@ impl Drop for CatalogFixture {
     }
 }
 
-/// The answer every fixture route serves before a test states another one.
 #[cfg(test)]
 fn default_catalog_bodies() -> AHashMap<CatalogRoute, SmolStr> {
     AHashMap::from_iter([
@@ -648,7 +506,6 @@ fn default_catalog_bodies() -> AHashMap<CatalogRoute, SmolStr> {
     ])
 }
 
-/// Serves one connection of catalog requests.
 #[cfg(test)]
 async fn serve_catalog_requests(
     mut socket: tokio::net::TcpStream,
@@ -689,8 +546,6 @@ async fn serve_catalog_requests(
     }
 }
 
-/// Reads one HTTP request off one connection and answers the path and query it
-/// addressed.
 #[cfg(test)]
 async fn read_catalog_request(socket: &mut tokio::net::TcpStream) -> Option<(SmolStr, SmolStr)> {
     let mut buffer = Vec::new();
@@ -729,7 +584,6 @@ async fn read_catalog_request(socket: &mut tokio::net::TcpStream) -> Option<(Smo
     Some((SmolStr::new(path), SmolStr::new(query)))
 }
 
-/// The fixture route one request addresses, when the fixture serves it.
 #[cfg(test)]
 fn catalog_route_of(path: &str, query: &str) -> Option<CatalogRoute> {
     match path {
@@ -745,7 +599,6 @@ fn catalog_route_of(path: &str, query: &str) -> Option<CatalogRoute> {
     }
 }
 
-/// Whether one request's query asked OKX for one instrument type.
 #[cfg(test)]
 fn asks_instrument_type(query: &str, instrument_type: &str) -> bool {
     query
@@ -753,15 +606,6 @@ fn asks_instrument_type(query: &str, instrument_type: &str) -> bool {
         .any(|pair| pair.strip_prefix("instType=") == Some(instrument_type))
 }
 
-/// A Hyperliquid socket that answers every `post` with one fixed info payload.
-///
-/// A Hyperliquid request path is a socket request, so driving one end to end needs
-/// the venue's own wire on a real socket. The fixture answers the info frame the
-/// venue sends — the request's own id echoed with the payload under `response` — and
-/// interprets nothing else: the connection, the request id and the decode are all
-/// the adapter's own. What it received is kept, so a test can assert what went on
-/// the wire, and an `event` it was given is pushed down the socket as soon as a
-/// subscription is asked for, which is what lets a test drive a stream's decoding.
 #[cfg(test)]
 pub(crate) struct InfoSocket {
     url: String,
@@ -773,18 +617,6 @@ pub(crate) struct InfoSocket {
 
 #[cfg(test)]
 impl InfoSocket {
-    /// Serves the fixture on a fresh port, answering each subscription it receives with
-    /// the next of `events`.
-    ///
-    /// One event per subscription is enough for a test that reads one stream's opening
-    /// message; a test that wants a *later* message on the same venue subscription (the
-    /// stream is shared by topic, so the second reader's subscribe never reaches the
-    /// wire while the first still holds it) gives the socket a second event, which the
-    /// next subscription — a re-acquisition of the released topic — receives.
-    ///
-    /// A test that has to decide *when* a frame arrives — because what it pins is how a
-    /// stream behaves after the venue was re-read — pushes it with [`Self::push`]
-    /// instead and leaves `events` empty.
     pub(crate) async fn spawn(payload: String, events: Vec<String>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -834,8 +666,6 @@ impl InfoSocket {
                                         let next = tokio::select! {
                                             () = connection_cancellation.cancelled() => return,
                                             frame = socket.next_frame() => Next::Frame(frame),
-                                            // A frame the test decides to push, sent as
-                                            // soon as it asks for it.
                                             pushed = pushed.recv() => match pushed {
                                                 Ok(frame) => Next::Push(frame),
                                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -909,23 +739,16 @@ impl InfoSocket {
         }
     }
 
-    /// Returns the URL a context dials this fixture on.
     pub(crate) fn url(&self) -> &str {
         &self.url
     }
 
-    /// Sends one frame down the socket the next time it is asked for one.
-    ///
-    /// The frame is delivered to the connection this fixture serves, when the caller
-    /// says so rather than at subscription time: a test that pins how a stream behaves
-    /// after the venue was re-read opens the stream first and pushes afterwards.
     pub(crate) fn push(&self, frame: String) {
         self.pushes
             .send(frame)
             .expect("the fixture socket is serving");
     }
 
-    /// Returns every frame the fixture received so far.
     pub(crate) fn frames(&self) -> Vec<String> {
         self.frames
             .lock()
@@ -933,13 +756,6 @@ impl InfoSocket {
             .clone()
     }
 
-    /// Returns the frames the wire settled on: it waits until the fixture received
-    /// nothing new for a settle window, and never longer than a deadline.
-    ///
-    /// A test about how many frames went on the wire cannot simply sleep: a slow
-    /// machine would make a correct implementation look like it never sent the frame,
-    /// and an immediate read would make a forked topic look like it never sent a second
-    /// one. Waiting for the log to stop growing is bounded either way.
     pub(crate) async fn settled_frames(&self) -> Vec<String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut settled = self.frames();
@@ -965,12 +781,6 @@ struct SocketRequestId {
     id: u64,
 }
 
-/// The address symbol directories are read from.
-///
-/// The default is the market participant's own site, which the caller states: which host a
-/// directory lives on is the adapter's own fact, and a build that answers it here
-/// would be a second place to keep in step with it. A test replaces the address
-/// through [`set_symbol_directory_root`] for as long as it holds the guard.
 #[cfg(any(test, feature = "test-support"))]
 pub fn symbol_directory_root(published: &str) -> Url {
     SYMBOL_DIRECTORY_ROOT
@@ -979,10 +789,6 @@ pub fn symbol_directory_root(published: &str) -> Url {
         .unwrap_or_else(|| Url::parse(published).expect("the published directory address is a URL"))
 }
 
-/// Points symbol directory reads at `root` until the returned guard is dropped.
-///
-/// The guard restores the address that was in place before it, so a fixture cannot
-/// leave a later test reading a socket that is already gone.
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_symbol_directory_root(root: Url) -> SymbolDirectoryRootGuard {
     let mut installed = SYMBOL_DIRECTORY_ROOT.write();
@@ -993,7 +799,6 @@ pub fn set_symbol_directory_root(root: Url) -> SymbolDirectoryRootGuard {
     guard
 }
 
-/// The address a fixture installed for as long as it holds this guard.
 #[cfg(any(test, feature = "test-support"))]
 pub struct SymbolDirectoryRootGuard {
     previous: Option<Url>,
@@ -1006,21 +811,9 @@ impl Drop for SymbolDirectoryRootGuard {
     }
 }
 
-/// The address one fixture installed, absent while the published one is read.
 #[cfg(any(test, feature = "test-support"))]
 static SYMBOL_DIRECTORY_ROOT: RwLock<Option<Url>> = RwLock::new(None);
 
-/// The design's own `nasdaqlisted.txt` sample, verbatim.
-///
-/// Its generation timestamp carries eight fields, where `otherlisted.txt` states
-/// the same line with seven: that difference is what the parser's ordering rule is
-/// about, so both samples are kept exactly as the market participant publishes them.
-///
-/// A crate-level integration test drives the real adapter's directory fetch, which is
-/// why this and the fixture below are reachable from a target outside this crate. The
-/// address a download dials is one process-wide value, so such a target is the second
-/// binary that can hold it; [`SymbolDirectoryFixture::install`] serializes on it either
-/// way.
 #[cfg(any(test, feature = "test-support"))]
 pub const NASDAQ_LISTED_SAMPLE: &str = concat!(
     "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\r\n",
@@ -1029,7 +822,6 @@ pub const NASDAQ_LISTED_SAMPLE: &str = concat!(
     "File Creation Time: 1009202621:31|||||||\r\n",
 );
 
-/// The design's own `otherlisted.txt` sample, verbatim.
 #[cfg(any(test, feature = "test-support"))]
 pub const OTHER_LISTED_SAMPLE: &str = concat!(
     "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\r\n",
@@ -1039,50 +831,25 @@ pub const OTHER_LISTED_SAMPLE: &str = concat!(
     "File Creation Time: 1009202621:31||||||\r\n",
 );
 
-/// What one symbol directory request is answered with.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
 pub enum DirectoryAnswer {
-    /// A directory file, served with a `200`.
     File(&'static str),
-    /// A refusal status with no directory in it.
     Status(u16),
-    /// A body longer than the bound the adapter reads.
     Oversize,
-    /// A request that is accepted and never answered.
     Silent,
 }
 
-/// One loopback symbol directory, installed as the address a download dials.
-///
-/// The directory host is not the venue's origin, so the venue fixture address does
-/// not reach it: this is the one place a test points symbol directory reads at a
-/// socket it owns. A request for a file the fixture was not given is answered with
-/// silence, so a test that forgot a file sees a deadline rather than another file's
-/// body.
-///
-/// The address is one process-wide value, so only one fixture exists at a time: a
-/// second [`Self::install`] waits until the first fixture is dropped. Without that
-/// the tests of one process would point the address at each other's sockets, and
-/// the one that read last would pass or fail by timing.
 #[cfg(any(test, feature = "test-support"))]
 pub struct SymbolDirectoryFixture {
-    /// Held for the whole life of the fixture, so one fixture installs at a time.
     exclusive: Option<tokio::sync::MutexGuard<'static, ()>>,
-    /// Restores the address that was read before this fixture was installed.
     root: Option<SymbolDirectoryRootGuard>,
-    /// The head of every request the fixture answered, as `(lowercase name, value)`.
-    ///
-    /// A test reads it to state what a download did *not* send: the directory's host is
-    /// not the venue's, so the headers the venue routes and authenticates by have no
-    /// business on it.
     requests: Arc<Mutex<Vec<Vec<(String, String)>>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl SymbolDirectoryFixture {
-    /// Serves the answers a test states, one per published file name.
     pub async fn install(answers: Vec<(&'static str, DirectoryAnswer)>) -> Self {
         let exclusive = exclusive_symbol_directory().await;
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1132,10 +899,6 @@ impl SymbolDirectoryFixture {
                             let _ = socket.write_all(head.as_bytes()).await;
                         }
                         Some(DirectoryAnswer::Oversize) => {
-                            // One byte past the bound is enough to state the body, and
-                            // the socket is held open after it: a reader that has no
-                            // bound of its own therefore never sees the body end, and
-                            // the bound is the only thing that can end the read.
                             let head = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
                                 SYMBOL_DIRECTORY_FIXTURE_BOUND + 1
@@ -1152,8 +915,6 @@ impl SymbolDirectoryFixture {
                             std::future::pending::<()>().await;
                         }
                         Some(DirectoryAnswer::Silent) | None => {
-                            // The socket stays open and is never answered: the request
-                            // hangs until a deadline ends it.
                             std::future::pending::<()>().await;
                         }
                     }
@@ -1168,11 +929,6 @@ impl SymbolDirectoryFixture {
         }
     }
 
-    /// The head of every request the fixture answered.
-    ///
-    /// A test that states what a download sent reads this rather than the request that
-    /// produced it: the download is the adapter's own, and the answer is what reached
-    /// the directory's host.
     pub fn request_headers(&self) -> Vec<Vec<(String, String)>> {
         self.requests.lock().clone()
     }
@@ -1182,48 +938,28 @@ impl SymbolDirectoryFixture {
 impl Drop for SymbolDirectoryFixture {
     fn drop(&mut self) {
         self.task.abort();
-        // The address is restored once the socket it named is gone, so a later test
-        // cannot read a fixture that has already stopped. The lock is released after
-        // this body, so the next fixture sees the restored address.
         drop(self.root.take());
         drop(self.exclusive.take());
     }
 }
 
-/// The lock that keeps one symbol directory fixture installed at a time.
 #[cfg(any(test, feature = "test-support"))]
 static SYMBOL_DIRECTORY_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Takes the exclusivity a symbol directory fixture has for its whole life.
-///
-/// The address is one value for the whole process, so a test that reads or replaces
-/// it — rather than serving a directory through it — has to be the only one doing
-/// so. [`SymbolDirectoryFixture::install`] takes this lock itself; this is the same
-/// exclusivity for a test that is about the seam instead of about a download.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn exclusive_symbol_directory() -> tokio::sync::MutexGuard<'static, ()> {
     SYMBOL_DIRECTORY_FIXTURES.lock().await
 }
 
-/// The bound the oversized-directory fixture streams past, in bytes.
-///
-/// It is the adapter's own bound stated a second time on purpose: a fixture that
-/// imported it would keep streaming the right amount if the adapter's bound moved,
-/// and the test would then pin nothing.
 #[cfg(any(test, feature = "test-support"))]
 const SYMBOL_DIRECTORY_FIXTURE_BOUND: usize = 16 * 1024 * 1024;
 
-/// One request head as the directory fixture reads it: the path it addressed and the
-/// headers it presented.
 #[cfg(any(test, feature = "test-support"))]
 struct DirectoryRequestHead {
-    /// The request target, when the line stated one.
     path: Option<String>,
-    /// Every header, as `(lowercase name, value)`.
     headers: Vec<(String, String)>,
 }
 
-/// Reads one request head off one connection, answering its target and its headers.
 #[cfg(any(test, feature = "test-support"))]
 async fn read_request_head(socket: &mut tokio::net::TcpStream) -> Option<DirectoryRequestHead> {
     let mut buffer = Vec::new();
@@ -1253,13 +989,6 @@ async fn read_request_head(socket: &mut tokio::net::TcpStream) -> Option<Directo
     Some(DirectoryRequestHead { path, headers })
 }
 
-/// One execution whose HTTP client dials loopback over plaintext.
-///
-/// A symbol directory download uses the execution's client and its proxy line, and
-/// never the venue's own origin, so this is all a directory fixture needs of a
-/// venue. The origins are names the reserved `.invalid` domain answers for, which
-/// resolve nowhere: a read that dialled the venue instead of the directory would
-/// fail loudly rather than leave the machine.
 #[cfg(test)]
 pub(crate) fn loopback_execution(
     route: market_participants_model::listing::route::VenueRoute,

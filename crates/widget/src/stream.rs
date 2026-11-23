@@ -19,7 +19,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::{StreamEnvelope, StreamGeneration, WidgetProtocol};
 
-/// Bounded lossless receiver that rejects messages from retired generations.
 pub struct ReliableStream<P: WidgetProtocol> {
     receiver: mpsc::Receiver<ReliableItem<P>>,
     generations: DeliveryRegistry<P>,
@@ -39,14 +38,10 @@ type LatestStaged<P> = (
 type DeliveryRegistry<P> =
     Arc<std::sync::RwLock<HashMap<<P as WidgetProtocol>::StreamKey, DeliveryGeneration>>>;
 
-/// Receiver that yields each key's newest unseen snapshot without queue growth.
 pub struct LatestStream<P: WidgetProtocol> {
     receiver: watch::Receiver<LatestState<P>>,
     seen: HashMap<P::StreamKey, (StreamGeneration, u64)>,
     pending: VecDeque<StreamEnvelope<P::StreamKey, P::StreamMessage>>,
-    // Reuse the staging allocation across watch updates. Latest streams may carry many
-    // independent keys (for example a watch list), but only the newest envelope per key is
-    // retained. Keeping this scratch storage avoids a heap allocation on every changed key.
     staging: Vec<LatestStaged<P>>,
 }
 
@@ -130,7 +125,6 @@ impl<P: WidgetProtocol> LatestStream<P> {
         }
     }
 
-    /// Returns one unseen snapshot, preferring the oldest generation and sequence.
     pub fn next_unseen(&mut self) -> Option<StreamEnvelope<P::StreamKey, P::StreamMessage>> {
         while let Some(envelope) = self.pending.pop_front() {
             let is_current = self
@@ -204,7 +198,6 @@ impl<P: WidgetProtocol> Clone for LatestStream<P> {
     }
 }
 
-/// Publisher scoped to one stream key and immutable generation.
 pub struct StreamPublisher<P: WidgetProtocol> {
     key: P::StreamKey,
     generation: StreamGeneration,
@@ -228,13 +221,10 @@ impl<P: WidgetProtocol> StreamPublisher<P> {
         self.cancellation.cancelled().await;
     }
 
-    /// Waits for cancellation by value, so a borrow of the publisher is not held
-    /// across the wait and the publisher stays usable inside the same `select!`.
     pub async fn cancelled_owned(self) {
         self.cancellation.cancelled().await;
     }
 
-    /// Publishes a message without loss, waiting for bounded-channel capacity.
     pub async fn publish_reliable(
         &self,
         message: P::StreamMessage,
@@ -267,7 +257,6 @@ impl<P: WidgetProtocol> StreamPublisher<P> {
         }
     }
 
-    /// Replaces the current latest-value snapshot without queue growth.
     pub fn publish_latest(&self, message: P::StreamMessage) -> Result<(), StreamPublishError> {
         self.publish_latest_arc(Arc::new(message))
     }

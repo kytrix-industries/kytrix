@@ -1,78 +1,3 @@
-//! 颜色选择器（旧 `crate::color_picker` 的引擎化重建，P2-4d2）。
-//!
-//! 旧实现是一个 视图：触发器 + [`Overlay`] 面板（色板 / HSLA 四条滑条 / HEX 输入 / 确认
-//! 按钮），颜色、草稿、悬停预览与标签都归视图所有，`ColorChanged` 只在按确认按钮时发出一次。
-//! 本模块按同一语义重建，但把「谁拥有什么」拆成引擎的通道：
-//!
-//! | 旧实现 | 新实现 |
-//! |---|---|
-//! | `Entity<ColorPicker>` + `Render` | [`ColorPicker`] 句柄（`Rc` 浅拷贝）+ 挂载期 `build` |
-//! | `Hsla` 颜色 | 引擎一等 [`Color`]（公开面入口 / 出口都是 `Color`；内部以 HSL 通道编辑） |
-//! | `EventEmitter<ColorPickerEvent>` | [`ColorPicker::on_change`] 回调（确认时一次） |
-//! | `set_color` 静默写视图 | [`ColorPicker::set_color`]（静默；受控调用方的唯一写入口） |
-//! | `canvas()` + `paint_quad` | E1 自绘画布：`NodeBuilder::canvas` + `Window::set_canvas` |
-//! | `on_mouse_move` 色板悬停 | 144 个透明命中格（引擎没有指针坐标读点，见「已知差异」） |
-//! | `on_drag_move` + `HslaDrag` | 节点 `on_drag` + 引擎拖拽会话（`App::drag`）+ 指针捕获 |
-//! | `InputState`（旧输入组件库） | [`crate::kit::input`]（应用层编辑状态机 + 引擎绘制） |
-//! | `Overlay`（旧实现） | [`crate::kit::overlay::Overlay`]（浮层 / 12 向定位 / 淡入淡出 / a11y） |
-//!
-//! # 状态与事件（旧语义逐条保留）
-//!
-//! 1. **确认色**（`color` 信号）：触发器画它，[`ColorPicker::color`] 报告它；只有确认按钮会改它。
-//! 2. **草稿**（`draft` 信号）：面板里选色板 / 拖滑条 / 输 HEX 只写草稿，调用方听不到事件；
-//!    关掉面板 = 丢草稿（退回确认色），确认 = 把草稿提为确认色并回调一次。
-//! 3. **悬停预览**（`hovered` 信号）：面板里悬停色板时 HEX 输入框与页脚色块跟随预览（不写草稿、
-//!    不出事件），离开色板恢复。跨色板间隙保留上一个预览（与旧实现一致，避免 A → 真实色 → B 闪）。
-//! 4. **程序化写色**：[`ColorPicker::set_color`] 静默同步 HEX 字段并丢弃草稿/预览，不回调。
-//! 5. **HEX 校验**：支持 `#rgb` / `#rgba` / `#rrggbb` / `#rrggbbaa`（大小写、前导 `#`、首尾空白
-//!    均可）；非法文本在提交（Enter / 失焦）时被当前颜色覆盖；合法提交归一化为大写。
-//! 6. **标签**：`set_labels` 改面板文本（标签信号驱动，面板打开时也即时生效）；等值写入 no-op。
-//! 7. **标签页**：Palette / HSLA 切换，关面板不重置；`set_active_tab` 等值 no-op。
-//!
-//! # 受控 / 非受控
-//!
-//! - **非受控**（旧默认用法）：picker 拥有确认色；调用方 [`ColorPicker::on_change`] 收最终色。
-//! - **受控**：调用方用 [`ColorPicker::color_signal`] 绑定外部真值，所有程序化写走
-//!   [`ColorPicker::set_color`]；picker 仍维护面板草稿，但确认回调里通常只把值写回外部信号。
-//!
-//! # 引擎化落点
-//!
-//! - **Canvas 自绘**（E1）：色板 144 格、四条滑条（256 段 + 拇指）、两个色块全在同一类画布里
-//!   逐帧按实测布局盒重画；`sync` 只在**内容或几何变化时** `set_canvas`（I3：稳态零工作）。
-//! - **拖拽**：滑条节点 `on_drag`，`DragPhase::Start` 捕获指针、`Move` 用引擎拖拽会话的窗口
-//!   坐标换算成 0..=1 的分量、`End/Cancel` 释放；越界按 clamp 处理（旧实现同义）。
-//! - **浮层**：`kit::overlay` 的 12 向定位（BottomStart）+ flip/clamp + `OutsideClick` 关闭 +
-//!   淡入淡出（E10 完成回调路由 / E13 组不透明度）；面板表面沿用菜单配方（旧
-//!   `components.menu` 的 `SurfaceOverlay` + **双层**菜单阴影 `(0,1,2,0)+(0,3,6,-2)`，
-//!   内边距 8 与旧 `p_2` 一致，圆角 4 与旧 `rounded_sm` 一致）。
-//! - **HEX 输入**：`kit::input`（`InputSpec::submit` + 读状态信号）——文本变化在 `sync` 里校验，
-//!   `PressEnter` 走 submit 动作，`Blur` 是 `is_focused` 的下降沿。
-//! - **a11y**：触发器 `Button`（可访问名 = 当前 HEX）、色板 `Group`（label = 面板标签）、
-//!   滑条 `Slider` + 数值通道、标签页 `Tab` + `TabList`、确认 `Button`、HEX `TextInput`（输入框
-//!   自带）。引擎没有 `ColorWell` / popover 角色：面板浮层包装节点用 `Dialog`（非模态）、
-//!   色块是装饰性 `hidden`，登记见 spec-delta §3。
-//!
-//! # 已知差异（spec-delta `kit-color-picker.md` §2）
-//!
-//! - **没有指针坐标读点**（引擎 G7：只有 `App::hovered → NodeId`）：色板悬停靠 144 个透明命中格
-//!   还原下标；色板本身仍是一张画布（144 格不产生绘制图元）。
-//! - **没有 `aria-orientation` 通道**：滑条是水平语义，但引擎 a11y 结构里没有方向字段（登记缺口）。
-//! - **挂载期主题常量**：面板里的 HEX 输入框底色与文字色取自打开时的外观；深浅色切换时浮层壳
-//!   （`bind_style` 读主题）+ 自绘内容（`sync` 检测外观变化后重画）会更新，但 `kit::input` 的
-//!   静态底色要等下次重开面板（input 模块自身契约，登记差异）。
-//! - **画布不参与组不透明度**（E13 语义）：淡出期浮层壳 / 文本随组根一起淡，三张自绘画布
-//!   （色板 / 轨道 / 色块）不淡；旧实现是逐图元 alpha（登记差异）。
-//! - **面板 1px divider 边框未画**：旧面板 `.border_1().border_color(line.divider)`，而
-//!   [`OverlaySurface`] 没有 border 字段（过渡期 kit::overlay 缺口，登记差异）。
-//! - **HEX 输入框的可访问名是内部 key**（`<key>.hex`）：`kit::input` 的 `InputSpec.name`
-//!   同时承担动作命名空间与 a11y label，暂未分离（登记 kit-text/E 批）。
-//! - **最近使用色**：旧实现没有该功能；本批不新增（不扩未验证语义）。
-//!
-//! # 生命周期
-//!
-//! 组件的信号归自有 `SignalScope`（[`ColorPicker::release`] 回收）；浮层的信号归 overlay 自己的
-//! 作用域（`Overlay::release` 一并关闭 + 回收），`release` 把两者与全部 Action handler 一起清理。
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -122,91 +47,50 @@ use crate::{
     },
 };
 
-// ── 旧实现的几何 / 取值常量（逐值保留） ────────────────────────────────────
-
-/// 面板内容宽度。
 const PANEL_CONTENT_WIDTH: f32 = 284.0;
-/// 一条 HSLA 滑条行的高度。
 const SLIDER_ROW_HEIGHT: f32 = 24.0;
-/// 滑条行标签列宽度。
 const SLIDER_LABEL_WIDTH: f32 = 72.0;
-/// 滑条行数值列宽度。
 const SLIDER_VALUE_WIDTH: f32 = 40.0;
-/// 滑条行内间隙。
 const SLIDER_ROW_INNER_GAP: f32 = 8.0;
-/// 轨道高度。
 const TRACK_HEIGHT: f32 = 14.0;
-/// 轨道圆角（半高，端帽为圆）。
 const TRACK_RADIUS: f32 = 7.0;
-/// 一条轨道画多少段实色切片。
 const TRACK_SLICES: usize = 256;
-/// 拇指直径。
 const THUMB_DIAMETER: f32 = 12.0;
-/// 色板列数（一列一个明度档）。
 const PALETTE_COLS: usize = 12;
-/// 色板行数（一行中性色 + 十一行色相族）。
 const PALETTE_ROWS: usize = 12;
-/// 单个色块边长。
 const PALETTE_CELL: f32 = 20.0;
-/// 相邻色块间隙。
 const PALETTE_GAP: f32 = 4.0;
-/// 一个色块的间距（格 + 后续间隙）。
 const PALETTE_STEP: f32 = 24.0;
-/// 色板边长（与 [`PANEL_CONTENT_WIDTH`] 相等的设计值）。
 const PALETTE_SIZE: f32 =
     PALETTE_CELL * PALETTE_COLS as f32 + PALETTE_GAP * (PALETTE_COLS as f32 - 1.0);
-/// 色相行的饱和度；中性行不饱和。
 const PALETTE_SATURATION: f32 = 0.72;
-/// 十二档明度（暗到亮，暗端更密）。
 const PALETTE_LIGHTNESS: [f32; PALETTE_COLS] = [
     0.06, 0.12, 0.18, 0.26, 0.34, 0.42, 0.50, 0.60, 0.70, 0.80, 0.90, 0.96,
 ];
 
-/// 触发器圆角。
 const TRIGGER_RADIUS: f32 = 4.0;
-/// 触发器内边距（旧 `.p_0p5()`）。
 const TRIGGER_PADDING: f32 = 2.0;
-/// 触发器色块圆角。
 const TRIGGER_WELL_RADIUS: f32 = 4.0;
-/// 页脚色块边长。
 const FOOTER_WELL_SIZE: f32 = 30.0;
-/// 页脚色块圆角。
 const FOOTER_WELL_RADIUS: f32 = 6.0;
-/// 面板内边距（旧 `p_2`）。
 const PANEL_PADDING: f32 = 8.0;
-/// 标签页 / 确认按钮圆角。
 const CONTROL_RADIUS: f32 = 4.0;
-/// 色板悬停环的宽度与内缩。
 const RING_WIDTH: f32 = 2.0;
 const RING_INSET: f32 = 1.0;
-/// 透明度棋盘格边长。
 const CHECKER_CELL: f32 = 4.0;
 
-// ── 颜色的 HSL 表示与换算（纯逻辑） ────────────────────────────────────────
-
-/// HSL + alpha（旧实现 `Hsla` 的等价物；只在模块内部做通道编辑）。
-///
-/// 公开面不发这个类型：调用方给 / 收 [`Color`]，内部把它规范成 HSL 再编辑。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Hsla {
-    /// 色相 `0..=1`（0 = 0°、1 = 360°）。
     h: f32,
-    /// 饱和度 `0..=1`。
     s: f32,
-    /// 明度 `0..=1`。
     l: f32,
-    /// 不透明度 `0..=1`。
     a: f32,
 }
 
-/// 构造一个 HSL 颜色（旧 `hsla(..)` 的同义）。
 const fn hsla(h: f32, s: f32, l: f32, a: f32) -> Hsla {
     Hsla { h, s, l, a }
 }
 
-/// HSL → sRGB 的 `Color`（旧实现 `Hsla → Rgba` 的等价换算）。
-///
-/// 标准的 CSS `hsl()` 公式：色相按 0..=1 归一，饱和度 0 时三段同值（灰）。
 fn hsla_to_color(color: Hsla) -> Color {
     let h = color.h.rem_euclid(1.0) * 6.0;
     let s = color.s.clamp(0.0, 1.0);
@@ -227,10 +111,6 @@ fn hsla_to_color(color: Hsla) -> Color {
     Color::srgb(r1 + m, g1 + m, b1 + m, a)
 }
 
-/// 颜色 → HSL（旧实现 `Rgba → Hsla` 的等价换算）。
-///
-/// `Srgb` 变体直接取分量；其它色彩空间先经 [`ColorResolver`] 解析到线性 sRGB，再做传递函数
-/// 反变换回 sRGB（sRGB ↔ 线性 sRGB 是互逆的 IEC 61966-2-1 曲线）。
 fn color_to_hsla(color: Color) -> Hsla {
     let [r, g, b, a] = srgb_components(color);
     let max = r.max(g).max(b);
@@ -258,7 +138,6 @@ fn color_to_hsla(color: Color) -> Hsla {
     hsla(h / 6.0, s, l, a)
 }
 
-/// 颜色的 sRGB 分量（未预乘；`Srgb` 变体直接用，其它变体解析到线性 sRGB 再编码）。
 fn srgb_components(color: Color) -> [f32; 4] {
     if let Color::Srgb { r, g, b, alpha } = color {
         return [r, g, b, alpha];
@@ -278,7 +157,6 @@ fn srgb_components(color: Color) -> [f32; 4] {
     ]
 }
 
-/// 线性 sRGB → sRGB 编码（IEC 61966-2-1 的逆曲线）。
 fn linear_to_srgb(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
 
@@ -289,7 +167,6 @@ fn linear_to_srgb(value: f32) -> f32 {
     }
 }
 
-/// 把颜色量化成八位 sRGB 通道（HEX 能表达的范围）。
 fn rgba8(color: Color) -> [u8; 4] {
     let [r, g, b, a] = srgb_components(color);
     let quantize = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -297,7 +174,6 @@ fn rgba8(color: Color) -> [u8; 4] {
     [quantize(r), quantize(g), quantize(b), quantize(a)]
 }
 
-/// 格式化成大写 `#RRGGBB`；量化后不透明时省略 alpha（旧 `hex_string` 同义）。
 fn hex_string(color: Color) -> SmolStr {
     let [r, g, b, a] = rgba8(color);
 
@@ -308,10 +184,6 @@ fn hex_string(color: Color) -> SmolStr {
     }
 }
 
-/// 解析 `#rgb` / `#rgba` / `#rrggbb` / `#rrggbbaa`（前导 `#` 可选、首尾空白与大小写不敏感）。
-///
-/// 短格式逐 nibble 复制（`#f00` = `#ff0000`），不做缩放；长度不对、含非十六进制字符、带符号
-/// 或前缀一律拒绝。
 fn parse_hex(text: &str) -> Option<Color> {
     let text = text.trim();
     let text = text.strip_prefix('#').unwrap_or(text);
@@ -344,7 +216,6 @@ fn parse_hex(text: &str) -> Option<Color> {
     ))
 }
 
-/// 悬停环的颜色：按色块亮度翻转（亮块配深环、暗块配亮环），与主题无关。
 fn hover_ring_color(color: Color) -> Color {
     let [r, g, b, _] = rgba8(color);
     let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
@@ -356,12 +227,10 @@ fn hover_ring_color(color: Color) -> Color {
     }
 }
 
-/// 色板某一行的色相，中性行（第 0 行）为 `None`。
 fn palette_hue(row: usize) -> Option<f32> {
     (row > 0).then(|| (row - 1) as f32 / (PALETTE_ROWS as f32 - 1.0))
 }
 
-/// 十二乘十二色板（进程级唯一，旧实现同义：所有 picker 共享同一张生成表）。
 static PALETTE: LazyLock<[Hsla; PALETTE_ROWS * PALETTE_COLS]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         let row = index / PALETTE_COLS;
@@ -374,7 +243,6 @@ static PALETTE: LazyLock<[Hsla; PALETTE_ROWS * PALETTE_COLS]> = LazyLock::new(||
     })
 });
 
-/// 一个色块的窗口包围盒（画布按整体缩放，与 [`palette_index_at`] 同一几何）。
 fn palette_cell_bounds(bounds: Rect, row: usize, col: usize) -> Rect {
     let scale_x = bounds.size.width / PALETTE_SIZE;
     let scale_y = bounds.size.height / PALETTE_SIZE;
@@ -386,7 +254,6 @@ fn palette_cell_bounds(bounds: Rect, row: usize, col: usize) -> Rect {
     )
 }
 
-/// 把画布内坐标映射到色块下标；间隙、越界与网格外的点都不是命中。
 fn palette_index_at(size: Size, position: Point) -> Option<usize> {
     let (width, height) = (size.width, size.height);
     let (x, y) = (position.x, position.y);
@@ -418,9 +285,6 @@ fn palette_index_at(size: Size, position: Point) -> Option<usize> {
     Some(row * PALETTE_COLS + col)
 }
 
-// ── 纯画布函数（可单测：不碰窗口） ─────────────────────────────────────────
-
-/// 一个圆角色块的画布（底 / 棋盘格 / 颜色三层，顺序与旧 `ColorWell` 一致）。
 fn well_canvas(bounds: Rect, color: Color, base: Color, checker: Color, radius: f32) -> Canvas {
     let mut canvas = Canvas::new(bounds);
     canvas.push_quad(solid_quad(bounds, radius, base));
@@ -451,7 +315,6 @@ fn well_canvas(bounds: Rect, color: Color, base: Color, checker: Color, radius: 
     canvas
 }
 
-/// 色板画布：144 个圆角色块 + 悬停环。
 fn palette_canvas(bounds: Rect, hovered: Option<usize>) -> Canvas {
     let mut canvas = Canvas::new(bounds);
     let scale = (bounds.size.width / PALETTE_SIZE).min(bounds.size.height / PALETTE_SIZE);
@@ -489,7 +352,6 @@ fn palette_canvas(bounds: Rect, hovered: Option<usize>) -> Canvas {
     canvas
 }
 
-/// 一条滑条轨道：256 段实色切片（端帽按圆角弦高收缩）+ 拇指。
 fn track_canvas(
     bounds: Rect,
     channel: HslaChannel,
@@ -546,7 +408,6 @@ fn track_canvas(
         });
     }
 
-    // 轨道比拇指还窄时没有位置画拇指（两个 clamp 边界会交叉）：切片仍然完整。
     if width < THUMB_DIAMETER {
         return canvas;
     }
@@ -569,7 +430,6 @@ fn track_canvas(
     canvas
 }
 
-/// 一个实色圆角四边形。
 fn solid_quad(bounds: Rect, radius: f32, color: Color) -> Quad {
     Quad {
         bounds,
@@ -581,36 +441,22 @@ fn solid_quad(bounds: Rect, radius: f32, color: Color) -> Quad {
     }
 }
 
-// ── 公开类型 ──────────────────────────────────────────────────────────────
-
-/// 面板的两个标签页。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ColorPickerTab {
-    /// 色板。
     #[default]
     Palette,
-    /// 色相 / 饱和度 / 明度 / 不透明度滑条。
     Hsla,
 }
 
-/// 面板里所有可本地化的文本。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColorPickerLabels {
-    /// 面板的可访问名（浮层包装节点的 a11y label）。
     pub panel: SmolStr,
-    /// 色板标签页。
     pub palette: SmolStr,
-    /// HSLA 标签页。
     pub hsla: SmolStr,
-    /// 色相滑条。
     pub hue: SmolStr,
-    /// 饱和度滑条。
     pub saturation: SmolStr,
-    /// 明度滑条。
     pub lightness: SmolStr,
-    /// 不透明度滑条。
     pub alpha: SmolStr,
-    /// 确认按钮。
     pub confirm: SmolStr,
 }
 
@@ -629,20 +475,17 @@ impl Default for ColorPickerLabels {
     }
 }
 
-/// 颜色选择器句柄（`Rc` 浅拷贝；可 move 进 Action 回调）。
 #[derive(Clone)]
 pub struct ColorPicker {
     inner: Rc<Inner>,
 }
 
-/// 一次挂载留下的几何。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TriggerView {
     node: NodeId,
     well: NodeId,
 }
 
-/// 面板几何与子组件（面板关闭时整体丢弃，节点归引擎）。
 struct Panel {
     window: WindowId,
     body: NodeId,
@@ -653,17 +496,14 @@ struct Panel {
     confirm: NodeId,
     well: NodeId,
     input: InputNode,
-    /// 页脚色块上次画的内容。
     well_last: Option<(Rect, Color)>,
 }
 
-/// 面板主体（按标签页二选一）。
 enum BodyView {
     Palette(PaletteView),
     Sliders(SliderView),
 }
 
-/// 色板：一张画布 + 144 个透明命中格。
 struct PaletteView {
     root: NodeId,
     canvas: NodeId,
@@ -671,7 +511,6 @@ struct PaletteView {
     last: Option<(Rect, Option<usize>)>,
 }
 
-/// 四条滑条。
 struct SliderView {
     root: NodeId,
     tracks: [TrackView; 4],
@@ -679,7 +518,6 @@ struct SliderView {
     thumb_border: Color,
 }
 
-/// 一条滑条行的节点与上次绘制。
 #[derive(Debug)]
 struct TrackView {
     track: NodeId,
@@ -687,7 +525,6 @@ struct TrackView {
     last: Option<(Rect, Hsla, f32)>,
 }
 
-/// 组件的全部动作身份（`release` 逐个摘 handler）。
 struct Actions {
     trigger: Action,
     confirm: Action,
@@ -698,7 +535,6 @@ struct Actions {
     drag: [Action; 4],
 }
 
-/// 滑条编辑的 HSL 分量。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HslaChannel {
     Hue,
@@ -786,7 +622,6 @@ struct Inner {
     tab_hover: Signal<Option<usize>>,
     confirm_hovered: Signal<bool>,
     change: RefCell<Option<Rc<dyn Fn(&mut App, Color)>>>,
-    /// 打开回调（`open_panel` 建好面板内容后**同步**调用一次；G5 的可观测面）。
     open_callback: RefCell<Option<Rc<dyn Fn(&mut App)>>>,
     trigger: RefCell<Option<TriggerView>>,
     panel: RefCell<Option<Panel>>,
@@ -795,17 +630,12 @@ struct Inner {
     last_hex_focus: Cell<bool>,
     last_trigger_color: Cell<Option<Color>>,
     last_trigger_bounds: Cell<Option<Rect>>,
-    /// 上一次同步看到的确认色（检测**受控调用方直接写信号**的路径，`set_color` / 确认会提前更新）。
     last_color: Cell<Color>,
-    /// 触发器 `bind_style` 看到的外观（挂载期主题常量的来源）。
     appearance: Rc<Cell<Appearance>>,
     last_appearance: Cell<Appearance>,
 }
 
 impl ColorPicker {
-    /// 建选择器（关闭态）。`key` 是动作身份 / 调试 id 前缀（同一 App 内唯一）。
-    ///
-    /// `layer` / `router` 必须是组合根的**共享**实例（浮层 z 序 / 动画完成路由都是应用级单例）。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -900,81 +730,61 @@ impl ColorPicker {
         Self { inner }
     }
 
-    /// 组件 key（动作身份与调试 id 前缀）。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 
-    /// 尺寸档（触发器边长 / 面板输入框档位）。
     #[must_use]
     pub fn unified_size(&self) -> UnifiedSize {
         self.inner.size
     }
 
-    /// 当前确认色（用户确认过 / 程序化写入的颜色；草稿不算）。
     #[must_use]
     pub fn color(&self, app: &App) -> Color {
         *app.read(&self.inner.color)
     }
 
-    /// 确认色信号（受控用法：外部把它当真值绑定 / 写）。
     #[must_use]
     pub fn color_signal(&self) -> Signal<Color> {
         self.inner.color
     }
 
-    /// 面板正在编辑的草稿（`None` = 没有未确认的编辑 / 已回到确认色）。
     #[must_use]
     pub fn draft(&self, app: &App) -> Option<Color> {
         *app.read(&self.inner.draft)
     }
 
-    /// 悬停预览的色板下标。
     #[must_use]
     pub fn hovered_swatch(&self, app: &App) -> Option<usize> {
         *app.read(&self.inner.hovered)
     }
 
-    /// 当前标签页。
     #[must_use]
     pub fn active_tab(&self, app: &App) -> ColorPickerTab {
         *app.read(&self.inner.active_tab)
     }
 
-    /// 当前面板文本。
     #[must_use]
     pub fn labels(&self, app: &App) -> ColorPickerLabels {
         app.read(&self.inner.labels).clone()
     }
 
-    /// HEX 字段的当前文本（面板打开时是输入框内容，关闭时是确认色的规范 HEX）。
     #[must_use]
     pub fn hex_text(&self, app: &App) -> SmolStr {
         SmolStr::new(app.read(&self.inner.hex_state).text())
     }
 
-    /// 面板是否打开（引擎侧点击外部 / Esc 关闭后、下一次 `sync` 之前仍报 `true`）。
     #[must_use]
     pub fn is_open(&self, app: &App) -> bool {
         self.inner.overlay.is_open(app)
     }
 
-    /// 打开状态信号（`bind_style` / `bind_a11y` 可读；验收与组合根观测不靠截图）。
-    ///
-    /// 与 [`ColorPicker::is_open`] 是同一份真相（overlay 的 `Signal<bool>`）：读它即登记依赖，
-    /// 状态变化只失效读过它的节点（I6/I17）。
     #[must_use]
     pub fn open_state(&self) -> Signal<bool> {
         self.inner.overlay.open_state()
     }
 
-    /// 程序化打开面板（与点击触发器同一条路径：浮层 + 面板内容；已打开时 no-op）。
-    ///
-    /// 返回是否真的打开了：面板打开时**同步**调用一次 [`ColorPicker::on_open`]（点击路径与
-    /// `open()` 共用 `open_panel`；`build_panel` 已把 `was_open` 置位，下一次 `sync` 不再有
-    /// 边沿）。已打开时 no-op 返回 `false`；淡出动画期间 overlay 仍报 `is_open = true`，此时
-    /// 也无法重开（既有 overlay 模型）。真实窗口验收用它拿确定性证据（不依赖 OS 输入注入）。
     pub fn open(&self, app: &mut App, window: WindowId) -> bool {
         if self.inner.overlay.is_open(app) {
             return false;
@@ -983,49 +793,36 @@ impl ColorPicker {
         self.inner.overlay.is_open(app)
     }
 
-    /// 程序化关闭面板（与点击触发器 / 引擎侧外部点击关闭同一语义）。
     pub fn close(&self, app: &mut App) -> bool {
         self.inner.overlay.close(app)
     }
 
-    /// 触发器节点（`build` 之后可用）。
     #[must_use]
     pub fn trigger_node(&self) -> Option<NodeId> {
         self.inner.trigger.borrow().map(|view| view.node)
     }
 
-    /// 浮层句柄（组合 / 测试用）。
     #[must_use]
     pub fn overlay(&self) -> &Overlay {
         &self.inner.overlay
     }
 
-    /// 确认回调（旧 `ColorPickerEvent::ColorChanged`）：只在按确认按钮、且确有编辑时调用一次。
     pub fn on_change(&self, callback: impl Fn(&mut App, Color) + 'static) {
         *self.inner.change.borrow_mut() = Some(Rc::new(callback));
     }
 
-    /// 打开回调：面板打开时同步调用一次（点击触发器与 [`ColorPicker::open`] 同一条路径；
-    /// 关闭**不**回调）。
-    ///
-    /// G5 的可观测面之一：验收 / 埋点不靠截图判读；重复注册替换上一个回调。
     pub fn on_open(&self, callback: impl Fn(&mut App) + 'static) {
         *self.inner.open_callback.borrow_mut() = Some(Rc::new(callback));
     }
 
-    /// 设置面板文本（等值写入是 no-op；面板打开时立即重绘文本）。
     pub fn set_labels(&self, app: &mut App, labels: ColorPickerLabels) -> bool {
         app.write(&self.inner.labels, labels)
     }
 
-    /// 切换标签页（等值写入 no-op）。
     pub fn set_active_tab(&self, app: &mut App, tab: ColorPickerTab) -> bool {
         app.write(&self.inner.active_tab, tab)
     }
 
-    /// 程序化设置确认色：静默（不回调），清空草稿与预览，同步 HEX 字段。
-    ///
-    /// 这是受控用法的唯一写入口；返回是否真的改了颜色 / 清掉了草稿。
     pub fn set_color(&self, app: &mut App, color: Color) -> bool {
         let inner = &self.inner;
         let changed = *app.read(&inner.color) != color
@@ -1041,10 +838,6 @@ impl ColorPicker {
         changed
     }
 
-    /// 挂载触发器节点（浮层在首次点击时创建）。
-    ///
-    /// # Errors
-    /// `UnknownWindow`（窗口已关闭）/ `StaleNode`（父节点陈旧）。
     pub fn build(
         &self,
         app: &mut App,
@@ -1154,19 +947,11 @@ impl ColorPicker {
         Ok(trigger)
     }
 
-    /// 帧同步（组合根 `on_frame` 钩子里调用；测试直接调）：浮层 / 输入 / 悬停镜像 / 自绘画布。
-    ///
-    /// 稳态（关着且触发器静止，或面板打开且指针不动）返回 `false`、不出帧（I3）。
-    ///
-    /// # Errors
-    /// `UnknownWindow`（窗口已关闭）/ `StaleNode`（节点已卸载）。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let inner = &self.inner;
         let mut changed = inner.overlay.sync(app);
         let open = inner.overlay.is_open(app);
 
-        // 受控调用方可以直接写确认色信号（`color_signal()`）：这里把它当成一次程序化写色，
-        // 清掉面板草稿/预览、同步 HEX 字段（等价于 `set_color`，但不重复回调）。
         let current = *app.read(&inner.color);
         if current != inner.last_color.get() {
             inner.last_color.set(current);
@@ -1197,7 +982,6 @@ impl ColorPicker {
         Ok(changed)
     }
 
-    /// 事件路由（外壳 `drain_events` 之后逐条调用）：只把 HEX 输入框的事件转进去。
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         let panel = self.inner.panel.borrow();
         let Some(panel) = panel.as_ref() else {
@@ -1206,7 +990,6 @@ impl ColorPicker {
         panel.input.dispatch(app, event)
     }
 
-    /// 释放组件的 Action handler、浮层与信号作用域（动态创建 / 销毁的选择器调用；先卸载节点）。
     pub fn release(&self, app: &mut App) -> usize {
         let inner = &self.inner;
         for action in self.action_list() {
@@ -1231,8 +1014,6 @@ impl ColorPicker {
 
         list
     }
-
-    // ── Action 注册 ──────────────────────────────────────────────────────
 
     fn register_actions(&self, app: &mut App) {
         let trigger = self.clone();
@@ -1272,8 +1053,6 @@ impl ColorPicker {
             });
         }
     }
-
-    // ── 用户路径（草稿 / 预览 / 确认） ───────────────────────────────────
 
     fn on_confirm(&self, app: &mut App) {
         let inner = &self.inner;
@@ -1424,7 +1203,6 @@ impl ColorPicker {
         self.set_channel(app, channel, t);
     }
 
-    /// 悬停预览：写预览下标 + HEX 字段（不写草稿、不回调）。
     fn set_preview_swatch(&self, app: &mut App, index: Option<usize>, input: Option<&InputNode>) {
         let inner = &self.inner;
         let index = index.filter(|index| *index < PALETTE.len());
@@ -1445,11 +1223,6 @@ impl ColorPicker {
         self.with_input(|input| self.set_preview_swatch(app, None, input));
     }
 
-    /// 移动一个 HSL 分量。`t` = 轨道上的分量位置，**越界按 clamp**（这里是唯一钳制点：
-    /// 点击 / 拖拽都只负责把指针换算成比例，几何越界不丢给下游）。
-    ///
-    /// 色相必须 clamp 而不是 wrap：旧实现拖过轨道端点停在 0° / 360°（红）；若把越界值直接交给
-    /// [`hsla_to_color`] 的 `rem_euclid`，1.32 会绕回 0.32（绿），语义就变了。
     fn set_channel(&self, app: &mut App, channel: HslaChannel, t: f32) {
         let base = color_to_hsla(self.display_color(app));
         let mut color = base;
@@ -1463,7 +1236,6 @@ impl ColorPicker {
         self.with_input(|input| self.set_user_color(app, candidate, true, input));
     }
 
-    /// 应用一次用户编辑：八位量化相同视为 no-op；落在确认色上则不留草稿。
     fn set_user_color(
         &self,
         app: &mut App,
@@ -1491,7 +1263,6 @@ impl ColorPicker {
         true
     }
 
-    /// 提交 HEX 文本（Enter / 失焦）：合法值成为草稿并归一化；非法值被当前颜色覆盖。
     fn commit_hex_text(&self, app: &mut App, input: Option<&InputNode>) {
         let text = SmolStr::new(app.read(&self.inner.hex_state).text());
         if let Some(color) = parse_hex(text.as_str()) {
@@ -1505,12 +1276,10 @@ impl ColorPicker {
         self.with_input(|input| self.commit_hex_text(app, input));
     }
 
-    /// 面板显示的颜色：草稿优先，否则确认色。
     fn display_color(&self, app: &App) -> Color {
         (*app.read(&self.inner.draft)).unwrap_or_else(|| *app.read(&self.inner.color))
     }
 
-    /// 写 HEX 字段（`input` 为 `None` 时面板关着，直接重置状态信号并保留焦点标志）。
     fn store_hex(&self, app: &mut App, color: Color, input: Option<&InputNode>) -> bool {
         let hex = hex_string(color);
         let changed = match input {
@@ -1527,13 +1296,10 @@ impl ColorPicker {
         changed
     }
 
-    /// 借面板里的 HEX 输入框执行一次操作（面板关着时 `None`）。
     fn with_input<T>(&self, body: impl FnOnce(Option<&InputNode>) -> T) -> T {
         let panel = self.inner.panel.borrow();
         body(panel.as_ref().map(|panel| &panel.input))
     }
-
-    // ── 面板打开 / 关闭 / 主体构建 ───────────────────────────────────────
 
     fn open_panel(&self, app: &mut App, window: WindowId) {
         let inner = &self.inner;
@@ -1560,8 +1326,6 @@ impl ColorPicker {
             inner.overlay.close_now(app);
             return;
         }
-        // G5：打开回调在面板内容建好之后同步触发（`build_panel` 已把 `was_open` 置真，
-        // 因此不能等下一次 `sync` 的边沿）。
         let callback = inner.open_callback.borrow().clone();
         if let Some(callback) = callback {
             callback(app);
@@ -1864,7 +1628,6 @@ impl ColorPicker {
         Ok(())
     }
 
-    /// 建面板主体（色板或滑条）。
     fn build_body(
         &self,
         app: &mut App,
@@ -2119,7 +1882,6 @@ impl ColorPicker {
         })
     }
 
-    /// 面板主体切换（标签页变了就换掉旧子树）。
     fn rebuild_body(&self, app: &mut App, panel: &mut Panel) {
         let active = *app.read(&self.inner.active_tab);
         if panel.tab_active == active {
@@ -2137,8 +1899,6 @@ impl ColorPicker {
             panel.tab_active = active;
         }
     }
-
-    // ── 帧同步细节 ───────────────────────────────────────────────────────
 
     fn sync_trigger(&self, app: &mut App) -> Result<bool, EngineError> {
         let inner = &self.inner;
@@ -2276,7 +2036,6 @@ impl ColorPicker {
                 if let Some(index) = view.cells.iter().position(|cell| *cell == node) {
                     Some(index)
                 } else if node_in_subtree(app, panel.window, view.root, hovered) {
-                    // 间隙 / 画布：保留上一个预览，避免跨格闪。
                     current
                 } else {
                     None
@@ -2363,7 +2122,6 @@ impl ColorPicker {
         Ok(changed)
     }
 
-    /// 面板关闭后的收尾：丢草稿与预览、HEX 字段回到确认色。
     fn reset_after_close(&self, app: &mut App) {
         let inner = &self.inner;
         inner.panel.borrow_mut().take();
@@ -2384,7 +2142,6 @@ impl ColorPicker {
     }
 }
 
-/// 标签页下标 → 标签页枚举。
 const fn tab_of(index: usize) -> ColorPickerTab {
     if index == 0 {
         ColorPickerTab::Palette
@@ -2393,7 +2150,6 @@ const fn tab_of(index: usize) -> ColorPickerTab {
     }
 }
 
-/// 交互配方：选中 > 悬停 > 普通（颜色选择器没有禁用态）。
 fn recipe_for(
     colors: &InteractiveStateColors,
     hovered: bool,
@@ -2408,14 +2164,12 @@ fn recipe_for(
     }
 }
 
-/// 节点布局盒（窗口内容坐标）。
 fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
     app.window(window)
         .and_then(|target| target.tree().get(node).ok())
         .map(|node| node.layout().bounds)
 }
 
-/// 画布内容相同则跳过；不同才 `set_canvas`。
 fn apply_canvas(
     app: &mut App,
     window: WindowId,
@@ -2440,7 +2194,6 @@ fn apply_canvas(
         .set_canvas(node, canvas)
 }
 
-/// 候选节点是否在 `root` 子树里（含自身）。
 fn node_in_subtree(app: &App, window: WindowId, root: NodeId, candidate: Option<NodeId>) -> bool {
     let Some(candidate) = candidate else {
         return false;
@@ -2459,7 +2212,6 @@ fn node_in_subtree(app: &App, window: WindowId, root: NodeId, candidate: Option<
 
     false
 }
-// ── 纯逻辑测试（旧 `mod tests` 的移植 + 颜色换算抽样） ──────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -2861,7 +2613,6 @@ mod tests {
         }
     }
 
-    /// HSL ↔ sRGB 抽样（≥ 30 组）：六色相 × 四饱和度 × 五明度，往返误差在量化前可忽略。
     #[test]
     fn hsl_and_srgb_should_round_trip_through_more_than_thirty_samples() {
         let mut samples = 0usize;
@@ -2889,7 +2640,6 @@ mod tests {
             assert!((back.l - lightness).abs() < EPS);
             samples += 1;
         }
-        // 任意色相（不是 60° 倍数）与 alpha 两端（0 / 1）：旧测试只取 60° 倍数、alpha 固定 0.5。
         for hue in [0.1_f32, 0.37] {
             for saturation in [0.3_f32, 1.0] {
                 for lightness in [0.2_f32, 0.8] {
@@ -2912,7 +2662,6 @@ mod tests {
         assert!(samples >= 30, "抽样数 {samples} 不足 30");
     }
 
-    /// 非 `Srgb` 分支（`ColorResolver` + `linear_to_srgb`）与 alpha 0 短路：本批新代码必须有直测。
     #[test]
     fn colors_in_other_spaces_should_resolve_through_linear_srgb() {
         let gray = color_to_hsla(Color::linear_srgb(0.5, 0.5, 0.5, 1.0));
@@ -2938,7 +2687,6 @@ mod tests {
                     "非 Srgb 分量必须走线性（去预乘）→ sRGB 编码"
                 );
             }
-            // HSL 往返仍落在同一个 sRGB 色上（gamut 映射由 `ColorResolver` 完成）。
             let back = hsla_to_color(color_to_hsla(color));
             for (left, right) in srgb_components(back)
                 .into_iter()
@@ -2955,7 +2703,6 @@ mod tests {
         );
     }
 
-    /// sRGB 传递函数：线性 0.5 的编码值是 0.7354…（不是 0.5）；这是「颜色换算错」的变异靶点。
     #[test]
     fn linear_and_srgb_should_use_the_iec_transfer_curve() {
         let linear = srgb_components(Color::linear_srgb(0.5, 0.5, 0.5, 1.0));
@@ -3064,7 +2811,6 @@ mod tests {
         assert_eq!(labels.confirm.as_str(), "OK");
     }
 }
-// ── 引擎交互测试（旧 `#[旧测试宏]` 的移植） ────────────────────────────
 
 #[cfg(test)]
 mod ui_tests {
@@ -3167,7 +2913,6 @@ mod ui_tests {
             }
         }
 
-        /// 泵到「`sync` 不再报变化、也不再出帧」的稳态（I3）；返回是否在预算内达到。
         fn settled(&mut self) -> bool {
             for _ in 0..6 {
                 let changed = self.pump();
@@ -3285,8 +3030,6 @@ mod ui_tests {
             self.pump_times(2);
         }
 
-        /// 清空 HEX 字段（面板自己的写回路径 `update_value`，不产生用户编辑），
-        /// 与旧测试的 `clear_and_focus_hex` 同义。
         fn clear_hex(&mut self) {
             let panel = self.picker.inner.panel.borrow();
             let input = &panel.as_ref().expect("面板已打开").input;
@@ -3337,7 +3080,6 @@ mod ui_tests {
             self.pump_times(2);
         }
 
-        /// 指针从 `start_fraction` 按下、越过拖拽阈值后拖到 `target`（越界坐标由调用方给）。
         fn drag_track(&mut self, channel: usize, start_fraction: f32, target: Point) {
             let start = self.track_point(channel, start_fraction);
             let launch_fraction = if target.x >= start.x {
@@ -3373,7 +3115,6 @@ mod ui_tests {
             self.pump_times(2);
         }
 
-        /// 键盘按键的完整 down + up（引擎在焦点节点上按 `on_click` 声明分发动作）。
         fn key_press(&mut self, code: KeyCode) {
             for state in [KeyState::Down, KeyState::Up] {
                 self.pump_event(Event::Input(InputEvent::Key {
@@ -3400,7 +3141,6 @@ mod ui_tests {
             self.click_node(tabs[1]);
         }
 
-        /// 画布内容快照（`Arc` 浅拷贝；用于断言「主题切换后重画了什么」）。
         fn canvas_content(&self, node: NodeId) -> Arc<Canvas> {
             let tree = self.app.app().window(self.window).expect("窗口").tree();
             match tree.get(node).expect("节点").kind() {
@@ -3409,7 +3149,6 @@ mod ui_tests {
             }
         }
 
-        /// 子树里第一个文本节点（页签 / 确认按钮的文字）。
         fn text_node(&self, root: NodeId) -> NodeId {
             fn walk(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
                 let target = tree.get(node).ok()?;
@@ -3426,7 +3165,6 @@ mod ui_tests {
             walk(tree, root).expect("子树里有文本")
         }
 
-        /// 文本节点 `bind_style` 求出的前景色（主题切换后由样式 pass 更新）。
         fn text_foreground(&self, node: NodeId) -> Option<Color> {
             let tree = self.app.app().window(self.window).expect("窗口").tree();
             tree.get(node).expect("文本节点").style_patch().foreground
@@ -3486,8 +3224,6 @@ mod ui_tests {
 
     #[test]
     fn the_panel_surface_should_use_the_old_double_layer_menu_recipe() {
-        // F1：旧 picker 面板 = 菜单表面（`SurfaceOverlay` / `rounded_sm` / `p_2`）+ 菜单**双层**阴影
-        // `(0,1,2,0)+(0,3,6,-2)`。单层 `(0,3,6,0)` 是视觉差异，不是等价迁移。
         let harness = Harness::new();
         let surface = &harness.picker.overlay().options().surface;
         assert_eq!(surface.background, Role::SurfaceOverlay);
@@ -3538,7 +3274,6 @@ mod ui_tests {
         let _ = visual;
     }
 
-    /// G5：打开状态必须可观测（`open_state` 信号 + `on_open` 回调），不必靠截图判读。
     #[test]
     fn the_open_state_signal_and_on_open_callback_track_the_panel() {
         let mut harness = Harness::new();
@@ -3737,7 +3472,6 @@ mod ui_tests {
 
     #[test]
     fn keyboard_confirm_after_hovering_should_report_nothing() {
-        // F5：悬停预览不是草稿；焦点在确认按钮上按 Enter 只能关面板，不得把预览色当成编辑报出去。
         let mut harness = Harness::new();
         harness.open();
         let (grid, _) = harness.palette().expect("色板");
@@ -3928,8 +3662,6 @@ mod ui_tests {
         assert!(harness.changes.borrow().is_empty());
     }
 
-    /// 旧 `Entity::write` 即使值相同也会通知；引擎的 `App::write` 等值短路（不失效、不出帧）。
-    /// 语义不变式：重复写「打开」信号不得吞掉草稿。
     #[test]
     fn a_repeated_open_signal_write_should_be_a_no_op_and_keep_the_edit() {
         let mut harness = Harness::new();
@@ -4054,9 +3786,6 @@ mod ui_tests {
         assert!(harness.panel_open(), "HEX 提交不关闭面板");
     }
 
-    /// 旧实现用「无 Change 事件的写值」把提交分支独立出来；新 `kit::input` 没有 Change 事件，
-    /// 任何文本变化都由 `sync` 观察到并当作编辑（与旧 `Change` 同义）。因此这里断言：输入
-    /// 合法短格式立即成为草稿，Enter 只负责归一化字段、且不重复应用。
     #[test]
     fn entering_a_legal_hex_should_edit_the_panel_and_normalize_the_field_exactly_once() {
         let mut harness = Harness::new();
@@ -4089,7 +3818,6 @@ mod ui_tests {
         assert!(harness.changes.borrow().is_empty());
         assert!(harness.panel_open());
 
-        // 已经归一化的文本再次提交仍是同一草稿、字段不变（旧「等价 HEX 的提交」语义）。
         harness.key(KeyCode::Enter);
         assert_eq!(harness.picker.draft(harness.app.app()), Some(edited));
         assert_eq!(harness.picker.hex_text(harness.app.app()), "#FFFFFF");
@@ -4261,9 +3989,6 @@ mod ui_tests {
 
     #[test]
     fn dragging_far_past_every_track_should_clamp_to_the_ends() {
-        // F3：只断言「最终色 = 1.0」不够 —— `hsla_to_color` 会兜底 clamp s/l/a，删掉 `set_channel`
-        // 的钳制也不会变红。色相是唯一可观测的钳制点：必须停在 0° / 360°（红），不能交给
-        // `rem_euclid` 把 1.32 绕回 0.32（绿）；负值同理。
         let mut harness = Harness::new();
         harness.open();
         harness.switch_to_hsla();
@@ -4292,8 +4017,6 @@ mod ui_tests {
             "色相 >360° 必须 clamp 到 360°（红），不得绕回 0.32"
         );
 
-        // 饱和度 / 明度 / 透明度：越界同样停在端点（这三条由 `hsla_to_color` 的 clamp 兜底，
-        // 是行为断言；色相的钳制才是 `set_channel` 的可观测点）。
         let base = super::color_to_hsla(harness.picker.display_color(harness.app.app()));
         harness.drag_track(1, 0.5, harness.track_point(1, -0.5));
         let draft = harness.picker.draft(harness.app.app()).expect("饱和度越界");
@@ -4380,9 +4103,6 @@ mod ui_tests {
             harness.picker.active_tab(harness.app.app()),
             ColorPickerTab::Hsla
         );
-        // F5/F11：旧测试只断言状态不变，「主题切换后重绘」被削弱成空断言。这里恢复：
-        // 触发器色块 / 轨道拇指（`track.last = None` 分支）/ 页脚色块的自绘画布必须按新主题重画，
-        // 文本的 `bind_style` 前景色也必须更新。
         assert_ne!(
             harness.canvas_content(trigger_well),
             trigger_before,
@@ -4525,7 +4245,6 @@ mod ui_tests {
         let expected_label = hex_string(default_color());
         assert_eq!(record.label_text(), Some(expected_label.as_str()));
 
-        // 打开面板并切到 HSLA 页，断言面板 / 页签 / 滑条 / 输入框 / 确认按钮的 a11y。
         let bounds = app.probe().bounds(trigger).expect("触发器盒");
         let point = Point::new(
             bounds.origin.x + bounds.size.width / 2.0,
@@ -4631,8 +4350,6 @@ mod ui_tests {
 
     #[test]
     fn a_controlled_write_should_settle_without_requesting_frames() {
-        // F4：受控写回后 `sync` 必须把 `last_color` 同步到当前值；否则每一轮都因
-        // `current != last_color` 返回 changed=true，组合根会持续请求帧（I3 破）且无法观测。
         let mut harness = Harness::new();
         let signal = harness.picker.color_signal();
         let blue = super::hsla_to_color(super::hsla(2.0 / 3.0, 1.0, 0.5, 1.0));
@@ -4642,7 +4359,6 @@ mod ui_tests {
         assert_eq!(harness.picker.hex_text(harness.app.app()), hex_string(blue));
         assert!(harness.settled(), "关闭态受控写回后不得持续请求帧（I3）");
 
-        // 面板打开时同样：受控写 → 同步 HEX / 清草稿 → 收敛（不再有变化、不再出帧）。
         harness.open();
         harness.settle();
         let green = super::hsla_to_color(super::hsla(1.0 / 3.0, 1.0, 0.5, 1.0));
@@ -4659,7 +4375,6 @@ mod ui_tests {
 
     #[test]
     fn a_palette_click_maps_through_the_hit_test() {
-        // 命中测试与纯逻辑 `palette_index_at` 必须一致：点在色板画布内 = 选中该格。
         let mut harness = Harness::new();
         harness.open();
         let (grid, _) = harness.palette().expect("色板");

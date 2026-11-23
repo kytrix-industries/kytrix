@@ -1,37 +1,3 @@
-//! 下拉（P2-4c：旧 `crate::dropdown` 的引擎化重建）。
-//!
-//! 旧 `Dropdown` =「按钮式触发器（`Interactive`）+ 挂 `Menu` 的 `Overlay`」：触发器点击写 keyed 的
-//! open 状态，`Overlay::on_prepaint` 量触发器宽度给面板 `min_w`，`on_mouse_down_out` 关面板。
-//! 新引擎里这四件事分别落在：触发器 [`Interactive`]（hover / 按下 / 焦点 / 禁用 + 点击动作）、
-//! 共享条目面板 [`ItemPanel`]（浮层定位 / 点击外部关闭 / Esc / 焦点陷阱 / 虚拟化行）、
-//! `bind_text`（触发器文本）、`bind_style`（占位弱化）。
-//!
-//! # 行为
-//!
-//! - 点击触发器打开 / 再点关闭；
-//! - `↓` 在触发器上打开面板并把高亮落到选中项（没有选中则首行），`↑` 打开并落到末行；
-//! - 面板内 `↑` / `↓` / `Home` / `End` 移动高亮，`Enter` / `Space` 选中高亮项；
-//! - 选中项写回触发器文本并回调 `on_select`，然后关闭面板（旧实现同款：选中即关）；
-//! - **不自动选中首项**：没有选中项时触发器显示占位文本（旧 dropdown 没有选中状态，首项回退
-//!   只属于 select 的「打开时高亮」）；
-//! - 面板宽度默认对齐触发器实测宽度，但它只是**下限**：内容更宽时面板长到内容宽（旧
-//!   `min_w(trigger)` 口径）；[`DropdownOptions::width`] 显式给宽时按面板口径**精确使用**
-//!   （旧 `menu_width` 语义，不随内容增长）；打开期间触发器宽度变化只在未给显式宽时重新对齐；
-//! - 面板高度上限 [`DropdownOptions::max_height`]，超出滚动（旧 `menu_max_h`）；
-//! - 条目支持图标（旧 dropdown 的条目就是 `MenuItem`，可带 `IconAction`）：有图标的条目整列
-//!   留槽；选中项的图标同时画在触发器上（换选中时 `sync` 换资源与占位尺寸）。
-//!
-//! # 与旧实现的差异（已接受，见 spec-delta）
-//!
-//! - 触发器内容由组件自建（文本 + 可选图标 + caret），不再接受调用方任意 children；
-//! - 面板是**模态浮层**：打开态外部按下与背景滚动被消费（旧实现外部按下不消费）。
-//!
-//! # a11y
-//!
-//! 触发器是 `Button`（引擎没有 `ComboBox` 角色，登记见 spec-delta），面板 `Menu` + 行 `MenuItem`
-//! 由 [`ItemPanel`] 声明；没有显式 `label` 时触发器的可访问名跟随选中项 / 占位文本，
-//! 编展开态写进 `aria-expanded`。
-
 use std::{cell::RefCell, fmt, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
@@ -64,21 +30,15 @@ use crate::{
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 
-/// 下拉条目。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropdownItem {
-    /// 条目 id（回调里报告给调用方）。
     pub id: SmolStr,
-    /// 显示文本（同时是可访问名）。
     pub label: SmolStr,
-    /// 条目图标（旧 dropdown 的条目就是 `MenuItem`，支持 `IconAction`）；有图标时整列留槽。
     pub icon: Option<IconKind>,
-    /// 禁用（点击不选中）。
     pub disabled: bool,
 }
 
 impl DropdownItem {
-    /// 条目。
     #[must_use]
     pub fn new(id: impl Into<SmolStr>, label: impl Into<SmolStr>) -> Self {
         Self {
@@ -89,14 +49,12 @@ impl DropdownItem {
         }
     }
 
-    /// 图标。
     #[must_use]
     pub fn icon(mut self, icon: IconKind) -> Self {
         self.icon = Some(icon);
         self
     }
 
-    /// 禁用。
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
@@ -104,25 +62,15 @@ impl DropdownItem {
     }
 }
 
-/// 下拉参数。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropdownOptions {
-    /// 尺寸档（触发器高度 / 字号 / 行高）。
     pub size: UnifiedSize,
-    /// 触发器视觉变体。
     pub variant: InteractiveVariant,
-    /// 面板宽度（`None` = 对齐触发器实测宽度、内容更宽时长到内容宽；`Some` = 精确宽度，
-    /// 不随内容增长）。
     pub width: Option<f32>,
-    /// 面板最大高度（逻辑像素）。
     pub max_height: f32,
-    /// 面板相对触发器的定位。
     pub placement: Placement,
-    /// 与触发器的间隙。
     pub gap: f32,
-    /// 触发器可访问名（`None` 用占位文本）。
     pub label: Option<SmolStr>,
-    /// 没有选中项时的占位文本。
     pub placeholder: SmolStr,
 }
 
@@ -142,49 +90,42 @@ impl Default for DropdownOptions {
 }
 
 impl DropdownOptions {
-    /// 尺寸档。
     #[must_use]
     pub fn size(mut self, size: UnifiedSize) -> Self {
         self.size = size;
         self
     }
 
-    /// 触发器变体。
     #[must_use]
     pub fn variant(mut self, variant: InteractiveVariant) -> Self {
         self.variant = variant;
         self
     }
 
-    /// 面板宽度（`None` = 对齐触发器；显式值 = 精确宽度，不随内容增长）。
     #[must_use]
     pub fn width(mut self, width: f32) -> Self {
         self.width = Some(width);
         self
     }
 
-    /// 面板最大高度。
     #[must_use]
     pub fn max_height(mut self, max_height: f32) -> Self {
         self.max_height = max_height;
         self
     }
 
-    /// 面板定位。
     #[must_use]
     pub fn placement(mut self, placement: Placement) -> Self {
         self.placement = placement;
         self
     }
 
-    /// 占位文本。
     #[must_use]
     pub fn placeholder(mut self, placeholder: impl Into<SmolStr>) -> Self {
         self.placeholder = placeholder.into();
         self
     }
 
-    /// 触发器可访问名。
     #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
@@ -192,7 +133,6 @@ impl DropdownOptions {
     }
 }
 
-/// 下拉（`Rc` 浅拷贝）。
 #[derive(Clone)]
 pub struct Dropdown {
     inner: Rc<DropdownInner>,
@@ -202,18 +142,13 @@ pub struct Dropdown {
 struct DropdownState {
     window: Option<WindowId>,
     trigger: Option<NodeId>,
-    /// 触发器宽度（对齐面板用；打开期间变化重对齐）。
     trigger_width: f32,
-    /// 触发器前导图标节点（有选中项且该项有图标时占位并绘制）。
     trigger_icon: Option<NodeId>,
-    /// 当前图标节点上的图标（`None` = 虚线占位，尺寸 0）。
     icon_shown: Option<IconKind>,
 }
 
 struct DropdownActions {
-    /// 触发器自身的点击动作。
     trigger_click: Action,
-    /// 触发器上的 `↓` / `↑`（打开并定位高亮）。
     down: Action,
     up: Action,
 }
@@ -226,11 +161,8 @@ struct DropdownInner {
     panel: ItemPanel,
     icons: IconCache,
     items: RefCell<Rc<Vec<DropdownItem>>>,
-    /// 选中条目下标。
     selected: Signal<Option<usize>>,
-    /// 触发器显示文本（选中项的 label；空 = 占位）。
     display: Signal<SmolStr>,
-    /// 触发器可访问名（选中项文本 / 显式 label / 占位文本；`Interactive` 的 a11y 读它）。
     a11y_label: Signal<SmolStr>,
     on_select: RefCell<Option<Rc<dyn Fn(&mut App, SmolStr)>>>,
     actions: DropdownActions,
@@ -238,7 +170,6 @@ struct DropdownInner {
 }
 
 impl Dropdown {
-    /// 建下拉（关闭态）。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -269,8 +200,6 @@ impl Dropdown {
                     row: A11yRole::MenuItem,
                 },
                 label: options.label.clone(),
-                // 显式 `width` = 精确宽度（旧 `menu_width` 语义，审查 F24）；未给宽时按触发器
-                // 下限对齐、内容更宽时长到内容宽。
                 width: if options.width.is_some() {
                     PanelWidth::Exact
                 } else {
@@ -317,37 +246,31 @@ impl Dropdown {
         dropdown
     }
 
-    /// 下拉键（调试 id / 动作前缀）。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 
-    /// 触发器节点（`build` 之后）。
     #[must_use]
     pub fn trigger_node(&self) -> Option<NodeId> {
         self.inner.state.borrow().trigger
     }
 
-    /// 浮层面板节点（打开时）。
     #[must_use]
     pub fn panel_node(&self) -> Option<NodeId> {
         self.inner.panel.overlay().panel_node()
     }
 
-    /// 打开状态信号。
     #[must_use]
     pub fn open_state(&self) -> Signal<bool> {
         self.inner.panel.open_state()
     }
 
-    /// 是否打开。
     #[must_use]
     pub fn is_open(&self, app: &App) -> bool {
         self.inner.panel.is_open(app)
     }
 
-    /// 选中条目 id。
     #[must_use]
     pub fn selected(&self, app: &App) -> Option<SmolStr> {
         let index = app.read_with(&self.inner.selected, |selected| *selected)?;
@@ -358,23 +281,16 @@ impl Dropdown {
             .map(|item| item.id.clone())
     }
 
-    /// 高亮行（面板打开时）。
     #[must_use]
     pub fn highlighted(&self, app: &App) -> Option<usize> {
         self.inner.panel.highlighted(app)
     }
 
-    /// 条目快照。
     #[must_use]
     pub fn items(&self) -> Rc<Vec<DropdownItem>> {
         self.inner.items.borrow().clone()
     }
 
-    /// 换一批条目（选中项按 id 保留，找不到则**清空** —— 不回退首项：没有选中的下拉显示
-    /// 占位文本，旧实现同样没有默认选中）。
-    ///
-    /// # Errors
-    /// 引擎虚拟列表失效。
     pub fn set_items(
         &self,
         app: &mut App,
@@ -390,27 +306,20 @@ impl Dropdown {
         self.inner.panel.set_content(app, self.panel_content())
     }
 
-    /// 选中条目 id（`None` = 清空；找不到的 id 忽略）。
     pub fn set_selected(&self, app: &mut App, id: Option<&str>) {
         let next = id.and_then(|id| self.index_of(id));
         self.apply_selected(app, next);
     }
 
-    /// 选中变化回调（用户选择；程序化 `set_selected` 不触发）。
     pub fn on_select(self, callback: impl Fn(&mut App, SmolStr) + 'static) -> Self {
         *self.inner.on_select.borrow_mut() = Some(Rc::new(callback));
         self
     }
 
-    /// 禁用 / 启用触发器。
     pub fn set_disabled(&self, app: &mut App, disabled: bool) -> bool {
         self.inner.trigger.set_disabled(app, disabled)
     }
 
-    /// 建触发器节点（前导图标 + 文本 + 下拉箭头）。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode` / 图标资源错误。
     pub fn build(
         &self,
         app: &mut App,
@@ -427,8 +336,6 @@ impl Dropdown {
         let trigger_text = trigger.clone();
         let trigger_text_move = trigger_text.clone();
         let trigger_caret = trigger.clone();
-        // 触发器前导图标：当前选中项有图标时显示（旧 select 触发器画选中项图标；下拉同口径）。
-        // 先按占位图标建节点（尺寸 0），`sync` 按选中项换资源 / 尺寸。
         let current_icon = self.selected_icon(app);
         self.inner.icons.resolve(
             app,
@@ -526,10 +433,6 @@ impl Dropdown {
         Ok(node)
     }
 
-    /// 接引擎：触发器上的 `↓` / `↑` 作用域键（必须在 `build` 之后）。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode`。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let Some(trigger) = self.inner.state.borrow().trigger else {
             return Ok(());
@@ -551,10 +454,6 @@ impl Dropdown {
         Ok(())
     }
 
-    /// 一步完成 `build` + `attach`。
-    ///
-    /// # Errors
-    /// 同 [`Dropdown::build`] / [`Dropdown::attach`]。
     pub fn mount(
         &self,
         app: &mut App,
@@ -566,10 +465,6 @@ impl Dropdown {
         Ok(node)
     }
 
-    /// 打开面板（锚点 = 触发器；宽度 = 实测触发器宽度或显式宽度）。
-    ///
-    /// # Errors
-    /// 浮层参数 / 引擎建树错误。
     pub fn open(&self, app: &mut App) -> Result<bool, OverlayError> {
         let (Some(window), Some(trigger)) = (
             self.inner.state.borrow().window,
@@ -603,20 +498,14 @@ impl Dropdown {
         Ok(opened)
     }
 
-    /// 关闭面板。
     pub fn close(&self, app: &mut App) -> bool {
         self.inner.panel.close(app)
     }
 
-    /// 立即关闭面板。
     pub fn close_now(&self, app: &mut App) -> bool {
         self.inner.panel.close_now(app)
     }
 
-    /// 帧同步：触发器状态 / 选中项图标 / 面板行 / 打开时宽度对齐触发器。
-    ///
-    /// # Errors
-    /// 引擎列表同步错误。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let mut changed = self.inner.trigger.sync(app)?;
         changed |= self.sync_trigger_a11y(app);
@@ -632,12 +521,10 @@ impl Dropdown {
         Ok(changed)
     }
 
-    /// 转发平台事件（触发器按下态；行点击由引擎动作承担，不在这里补激活）。
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         self.inner.trigger.dispatch(app, event)
     }
 
-    /// 释放组件（触发器 / 面板的信号作用域与动作 handler）。
     pub fn release(&self, app: &mut App) -> usize {
         for action in [
             &self.inner.actions.trigger_click,
@@ -649,9 +536,6 @@ impl Dropdown {
         self.inner.trigger.release(app) + self.inner.panel.release(app)
     }
 
-    // ── 内部 ──
-
-    /// 条目 → 面板行 / build / a11y 回调。
     fn panel_content(&self) -> PanelContent {
         let items = self.inner.items.borrow().clone();
         let rows: Vec<PanelRow> = items
@@ -754,7 +638,6 @@ impl Dropdown {
         });
         let this = self.clone();
         self.inner.panel.on_close(move |app| {
-            // 引擎侧关闭（点击外部 / Esc）后把焦点还给触发器。
             let (Some(window), Some(trigger)) = (
                 this.inner.state.borrow().window,
                 this.inner.state.borrow().trigger,
@@ -765,7 +648,6 @@ impl Dropdown {
         });
     }
 
-    /// 选中一行（用户操作）。
     fn select_row(&self, app: &mut App, row: usize) {
         let item = self.inner.items.borrow().get(row).cloned();
         let Some(item) = item else {
@@ -781,7 +663,6 @@ impl Dropdown {
         }
     }
 
-    /// 写选中 / 显示文本 / 触发器可访问名。
     fn apply_selected(&self, app: &mut App, index: Option<usize>) {
         let label = index
             .and_then(|index| {
@@ -800,7 +681,6 @@ impl Dropdown {
         }
     }
 
-    /// 触发器可访问名：显式 `label` 优先，否则 = 选中项文本 / 占位文本（随选中变化失效）。
     fn sync_trigger_a11y(&self, app: &mut App) -> bool {
         if self.inner.options.label.is_some() {
             return false;
@@ -818,7 +698,6 @@ impl Dropdown {
         app.write(&self.inner.a11y_label, next)
     }
 
-    /// 当前选中项的图标。
     fn selected_icon(&self, app: &App) -> Option<IconKind> {
         let index = app.read_with(&self.inner.selected, |selected| *selected)?;
         self.inner
@@ -828,7 +707,6 @@ impl Dropdown {
             .and_then(|item| item.icon)
     }
 
-    /// 解析条目图标资源（行工厂拿不到 `App`，行内容建树读快照）。
     fn resolve_icons(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let size = self.inner.options.size.icon_size();
         let items = self.inner.items.borrow().clone();
@@ -842,7 +720,6 @@ impl Dropdown {
         Ok(())
     }
 
-    /// 选中项变化 ⇒ 换触发器前导图标的资源与占位尺寸。
     fn sync_trigger_icon(&self, app: &mut App) -> Result<bool, EngineError> {
         let (Some(window), Some(node)) = (
             self.inner.state.borrow().window,
@@ -898,7 +775,6 @@ impl Dropdown {
             .position(|item| !item.disabled)
     }
 
-    /// 实测触发器宽度（打开期间对齐面板）。
     fn measure_trigger(&self, app: &App) {
         let (Some(window), Some(trigger)) = (
             self.inner.state.borrow().window,
@@ -928,7 +804,6 @@ impl fmt::Debug for Dropdown {
 
 #[cfg(test)]
 mod tests {
-    //! 引擎树上的行为：触发器开合 / 键盘 / 选择 / 宽度对齐 / 长列表虚拟化 / 关闭与焦点 / a11y / I3。
 
     use std::{
         cell::{Cell, RefCell},
@@ -1067,7 +942,6 @@ mod tests {
                 PointerButton::Primary,
                 Modifiers::empty(),
             ));
-            // 揭开面板要等两帧（`Overlay` 首次实测后才 `visible`，命中同样被挡）。
             self.settle(dropdown);
         }
 
@@ -1110,7 +984,6 @@ mod tests {
             )
         }
 
-        /// 触发器里第一个文本叶子的当前文本（`bind_text` 的结果）。
         fn trigger_text(&self, dropdown: &Dropdown) -> SmolStr {
             let trigger = dropdown.trigger_node().expect("触发器");
             let tree = self.app.app().window(self.window).expect("窗口").tree();
@@ -1149,7 +1022,6 @@ mod tests {
             !self.app.drain().expect("帧").rendered
         }
 
-        /// 子树里**有尺寸**的图片节点数（尺寸 0 的图标槽 = 未显示）。
         fn visible_images(&self, node: NodeId) -> usize {
             let tree = self.app.app().window(self.window).expect("窗口").tree();
             let mut stack = vec![node];
@@ -1359,7 +1231,6 @@ mod tests {
         assert!(!dropdown.is_open(harness.app.app()), "Esc 关闭面板");
     }
 
-    /// 旧 `a_closed_dropdown_should_not_swallow_a_click_behind_it`：关闭态不遮背景。
     #[test]
     fn a_closed_dropdown_does_not_swallow_a_click_behind_it() {
         let mut harness = Harness::new();
@@ -1379,7 +1250,6 @@ mod tests {
         harness.click(&dropdown, harness.center(trigger));
         let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
         let panel = dropdown.panel_node().expect("面板");
-        // E12 之后角色落在引擎浮层包装节点上（面板本身是 GenericContainer）。
         let wrapper = overlay_wrapper(harness.app.app(), harness.window, panel);
         assert_eq!(
             snapshot.node_for(wrapper).expect("包装").role,
@@ -1413,7 +1283,6 @@ mod tests {
 
     #[test]
     fn set_items_keeps_no_selection_and_shows_the_placeholder() {
-        // 审查 F4：旧 dropdown 没有选中状态；首项回退只属于 select「打开时的高亮」。
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions::default().placeholder("请选择"));
         harness.mount(&dropdown, items());
@@ -1427,7 +1296,6 @@ mod tests {
 
     #[test]
     fn a_long_item_grows_the_panel_past_its_trigger() {
-        // 旧 `min_w(trigger)` 是下限：内容更宽时面板长到内容宽（不是精确等宽）。
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions::default());
         harness.mount(
@@ -1453,7 +1321,6 @@ mod tests {
 
     #[test]
     fn an_explicit_width_stays_exact_for_long_items() {
-        // 审查 F24：显式 `width` = 精确宽度（旧 `menu_width` 语义），长条目不得把面板撑宽。
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions::default().width(120.0));
         harness.mount(
@@ -1484,7 +1351,6 @@ mod tests {
 
     #[test]
     fn item_icons_are_drawn_in_the_rows_and_on_the_trigger() {
-        // 旧 dropdown 的条目是 `MenuItem`（可带 `IconAction`），条目图标列必须保留。
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions::default());
         harness.mount(
@@ -1520,7 +1386,6 @@ mod tests {
 
     #[test]
     fn the_trigger_reports_the_selection_and_the_expanded_state() {
-        // 审查 F8：触发器可访问名跟选中项走、展开态走 `aria-expanded`。
         let mut harness = Harness::new();
         harness.app.enable_a11y_capture();
         let dropdown = harness.dropdown(DropdownOptions::default().placeholder("请选择"));
@@ -1550,7 +1415,6 @@ mod tests {
 
     #[test]
     fn an_open_dropdown_consumes_background_scroll() {
-        // 已接受的偏差（审查 F5）：菜单族是模态浮层，打开态外部滚轮被消费（背景不滚）。
         let mut harness = Harness::new();
         let root = harness
             .app
@@ -1625,7 +1489,6 @@ mod tests {
             "面板打开时背景滚轮被消费"
         );
 
-        // 对照：让触发器再点一次关掉面板后，同一位置的滚轮会滚背景。
         harness.click(&dropdown, harness.center(trigger));
         wheel(&mut harness, &dropdown);
         assert!(

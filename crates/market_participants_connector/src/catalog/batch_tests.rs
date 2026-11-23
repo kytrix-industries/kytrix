@@ -1,6 +1,3 @@
-//! Batch validation: every reason a candidate catalog is refused as a whole,
-//! and the registry transaction that goes with it.
-
 use std::sync::Arc;
 
 use market_participants_model::{
@@ -62,13 +59,10 @@ fn eth() -> Instrument {
     spot_token("binance", "ETH", "USDT")
 }
 
-/// A second instrument quoted in another asset, for a route that holds two
-/// independent listings of one venue.
 fn btc_usdc() -> Instrument {
     spot_token("binance", "BTC", "USDC")
 }
 
-/// One registered fixture route, without a catalogue behind it.
 fn registered(route: &VenueRoute) -> RegisteredCatalogRoute {
     let update = CatalogRouteUpdate::new(
         [test_support::binding(
@@ -113,8 +107,6 @@ fn accept(
     base: &CatalogGeneration,
     batch: CatalogBatch,
 ) -> Result<crate::catalog::batch::CatalogPending, CatalogValidationError> {
-    // The fixture vocabulary carries the canonical terms of its own assets, so a
-    // test batch is the batch a real source would have produced.
     let mut batch = batch;
     crate::catalog::test_support::stage_fixture_terms(&mut batch, context.staging(), base.assets());
     CatalogBatch::pending(context, batch, base)
@@ -130,8 +122,6 @@ fn batch_of(entries: Vec<CatalogEntry>) -> CatalogBatch {
         ..CatalogBatch::default()
     }
 }
-
-// ---- entries -------------------------------------------------------------
 
 #[test]
 fn an_empty_batch_is_a_successful_snapshot() {
@@ -318,9 +308,6 @@ fn an_alias_that_normalizes_onto_its_own_symbol_is_not_a_collision() {
     assert_eq!(pending.native_keys().len(), 1);
 }
 
-/// The route folds the typed identifier of every listing with its own rule, so two
-/// listings whose typed identifiers differ only in case produce one normalized
-/// identifier, and a batch that would publish both is refused as a whole.
 #[test]
 fn a_case_different_typed_identifier_that_normalizes_onto_another_is_refused() {
     let (context, route) = context(&spot_route());
@@ -420,8 +407,6 @@ fn a_listing_may_carry_several_identifier_families() {
 #[test]
 fn the_canonical_order_of_a_snapshot_is_the_listing_key() {
     let (context, route) = context(&spot_route());
-    // Three listings of three instruments: the order of a snapshot is the
-    // order of its listing keys, whatever economic name the listings carry.
     let first = entry(&spot_route(), btc(), "AAA");
     let second = entry(&spot_route(), eth(), "EEE");
     let third = entry(&spot_route(), btc_usdc(), "BBB");
@@ -467,8 +452,6 @@ fn a_batch_keeps_the_declared_trading_rules_of_each_listing() {
         .expect("the primary listing is stored");
     assert_eq!(stored.snapshot.status, ListingStatus::Halted);
 }
-
-// ---- outcome closure -----------------------------------------------------
 
 #[test]
 fn a_listing_without_its_outcome_group_is_refused() {
@@ -666,8 +649,6 @@ fn a_complete_event_and_pool_are_accepted() {
 
     assert_eq!(pending.outcome_events.len(), 1);
 }
-
-// ---- lineage -------------------------------------------------------------
 
 #[test]
 fn a_risk_pool_lineage_without_its_predecessor_is_refused() {
@@ -920,8 +901,6 @@ fn an_instrument_lineage_cycle_is_refused() {
     ));
 }
 
-// ---- registry staging ----------------------------------------------------
-
 #[test]
 fn an_unreferenced_staged_identity_is_not_published() {
     let (context, route) = context(&spot_route());
@@ -1106,8 +1085,6 @@ fn two_issuers_never_share_a_token_identity() {
     );
 }
 
-// ---- fixtures ------------------------------------------------------------
-
 fn expiry() -> Expiry {
     Expiry::new(2_000, Some(1_800), Some(2_100)).expect("the expiry is valid")
 }
@@ -1156,21 +1133,16 @@ fn risk_pool(first: &OutcomeGroup, second: &OutcomeGroup) -> OutcomeRiskPool {
     .expect("the pool is valid")
 }
 
-/// The settlement asset of a fixture outcome relation.
-///
-/// A stablecoin is a venue-issued token, never a fiat currency.
 fn settlement_asset() -> AssetId {
     AssetId::CryptoToken(token_id("binance", "USDC"))
 }
 
-/// A member of the group's own seed that the group does *not* carry.
 fn ghost_member(group: &OutcomeGroup) -> OutcomeMember {
     let yes = OutcomeSide::new(&group.id, SmolStr::new_static("yes")).expect("the side is valid");
     OutcomeMember::new(&group.id, SmolStr::new_static("ghost"), vec![yes.id])
         .expect("the member is valid")
 }
 
-/// One outcome listing that trades `member`/`side` of `group`.
 fn outcome_entry_of_leg(
     route: &VenueRoute,
     group: &OutcomeGroup,
@@ -1193,7 +1165,6 @@ fn outcome_entry_of_leg(
     entry
 }
 
-/// The same outcome listing with a declared native event.
 fn outcome_entry_with_event(
     route: &VenueRoute,
     group: &OutcomeGroup,
@@ -1239,8 +1210,6 @@ fn price_reference_terms() -> market_participants_model::reference::PriceReferen
     }
 }
 
-/// A staged event across a second batch is published while a surviving listing
-/// still declares it, and dropped by the batch that replaces that listing.
 #[test]
 fn a_staged_event_leaves_when_its_listing_does() {
     let (context, route) = context(&spot_route());
@@ -1283,8 +1252,6 @@ fn a_staged_event_leaves_when_its_listing_does() {
         "a listing of the route declares the event, so it is published"
     );
 
-    // The next batch of the same route replaces the listing, so nothing declares
-    // the event any more and it leaves the current generation.
     let replacement = published
         .clone()
         .with_pending(
@@ -1342,8 +1309,6 @@ fn outcome_entry(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> Cata
                 .expect("the condition id is valid"),
             asset_id: CtfTokenId::new("12345").expect("the token id is valid"),
             protocol: market_participants_model::listing::venue::PolymarketProtocolVersion::V1,
-            // the protocol label of a fixture echoes the registry label of
-            // the leg it trades, so a test that changes the leg keeps the echo.
             outcome_label: group.members[0]
                 .sides
                 .iter()
@@ -1606,7 +1571,6 @@ fn a_batch_publishes_its_own_native_event_lookup() {
         "the event lookup belongs to the route that published it"
     );
 }
-// ---- outcome price terms -----------------------------------------
 
 #[test]
 fn an_outcome_listing_that_quotes_another_asset_is_refused() {
@@ -1728,11 +1692,6 @@ fn an_outcome_listing_may_take_its_group_from_the_previous_generation() {
     ));
 }
 
-// ---- outcome closure against the group, events and references ------------
-
-/// Probe 2: a batch whose listing trades a member its own group does not carry
-/// is refused as a whole. The check is against the group's terms, never against
-/// the batch's own listings.
 #[test]
 fn an_outcome_listing_of_a_leg_outside_its_group_is_refused() {
     let (context, route) = context(&spot_route());
@@ -1762,8 +1721,6 @@ fn an_outcome_listing_of_a_leg_outside_its_group_is_refused() {
     );
 }
 
-/// A listing that trades a member the group carries but a side that member does
-/// not is refused too.
 #[test]
 fn an_outcome_listing_of_a_side_outside_its_member_is_refused() {
     let (context, route) = context(&spot_route());
@@ -1782,9 +1739,6 @@ fn an_outcome_listing_of_a_side_outside_its_member_is_refused() {
         side,
     };
     listing.instrument = instrument;
-    // The fixture keeps its protocol outcome label in step with the leg it now
-    // states, so this test exercises the structural leg check rather than the display gate's
-    // label echo, which has its own test.
     let VenueListingIdentifiers::Polymarket(identifiers) = &mut listing.listing.identifiers else {
         panic!("the fixture is a Polymarket listing");
     };
@@ -1794,8 +1748,6 @@ fn an_outcome_listing_of_a_side_outside_its_member_is_refused() {
         .label
         .clone();
 
-    // The group does carry both sides, so this batch is accepted: the check must
-    // not refuse a leg that exists.
     accept(
         &context,
         &base_generation(&route),
@@ -1807,7 +1759,6 @@ fn an_outcome_listing_of_a_side_outside_its_member_is_refused() {
     )
     .expect("both sides belong to the member");
 
-    // A side of another seed of the same question is not a side of this group.
     let foreign_seed = OutcomeGroupSeed {
         question: SmolStr::new_static("Will it rain elsewhere?"),
         expiry: expiry(),
@@ -1848,8 +1799,6 @@ fn an_outcome_listing_of_a_side_outside_its_member_is_refused() {
     );
 }
 
-/// Probe 3: a listing that declares a native event no batch and no published
-/// generation carries is refused with the exact field that failed.
 #[test]
 fn an_outcome_listing_of_an_unknown_native_event_is_refused() {
     let (context, route) = context(&spot_route());
@@ -1877,9 +1826,6 @@ fn an_outcome_listing_of_an_unknown_native_event_is_refused() {
     );
 }
 
-/// Probe 3, positive half: a batch that carries the declared event is accepted
-/// and the route publishes the event index
-/// `(VenueRoute, PolymarketEventId) -> OutcomeEventId -> [OutcomeGroupId]`.
 #[test]
 fn a_batch_publishes_its_own_event_group_index() {
     let (context, route) = context(&spot_route());
@@ -1930,8 +1876,6 @@ fn a_batch_publishes_its_own_event_group_index() {
     );
 }
 
-/// Probe 15: a staged event the accepted batch never references stays
-/// unpublished, and one the batch does reference is published.
 #[test]
 fn a_staged_event_without_a_referencing_batch_is_not_published() {
     let (empty_context, empty_route) = context(&spot_route());
@@ -1959,8 +1903,6 @@ fn a_staged_event_without_a_referencing_batch_is_not_published() {
         "an event no published listing references must not become visible"
     );
 
-    // A batch that carries an event but publishes no listing for it is refused:
-    // the batch declares events, only a listing keeps them alive.
     let (referenced_context, referenced_route) = context(&spot_route());
     let group = binary_group("Will it snow?");
     let referenced = event_of(std::slice::from_ref(&group.id), &[], "referenced-event");
@@ -1989,7 +1931,6 @@ fn a_staged_event_without_a_referencing_batch_is_not_published() {
         "a batch event no listing declares must not become visible either"
     );
 
-    // The same event named by a listing of the batch is published.
     let (named_context, named_route) = context(&spot_route());
     let native = PolymarketEventId::new("referenced-event").expect("the event id is valid");
     named_context.staging().with(|staging| {
@@ -2020,8 +1961,6 @@ fn a_staged_event_without_a_referencing_batch_is_not_published() {
     );
 }
 
-/// A staged reference the batch never tracks stays unpublished, and one the
-/// batch does track is published.
 #[test]
 fn only_the_references_a_batch_tracks_are_published() {
     let (context, route) = context(&spot_route());
@@ -2059,9 +1998,6 @@ fn only_the_references_a_batch_tracks_are_published() {
     )
     .expect("the batch is accepted");
 
-    // The batch tracks exactly two of the four staged references. The listings
-    // happen to be spot listings, so the tracked set a derivative would produce is
-    // stated explicitly here and the whole publication path is checked with it.
     let mut referenced = ReferencedTerms::collect(&pending, &base_generation(&route));
     referenced.indices.insert(tracked_id);
     referenced.price_references.insert(price_id);
@@ -2105,9 +2041,6 @@ fn only_the_references_a_batch_tracks_are_published() {
     );
 }
 
-/// The collector reads the index, external reference and price reference a
-/// derivative tracks, so a reference only reaches a generation when an
-/// instrument of the batch uses it.
 #[test]
 fn the_reference_collector_reads_a_derivative_underlying() {
     use market_participants_model::{asset::DerivativeUnderlying, reference::PriceReferenceId};

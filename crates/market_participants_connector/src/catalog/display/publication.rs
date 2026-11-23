@@ -1,18 +1,3 @@
-//! The one publication pass that turns surviving listings and registries into a
-//! [`DisplayCatalog`].
-//!
-//! Everything catalogue-global is decided here exactly once per publication: the
-//! code of every canonical asset, the name of every instrument and the name of
-//! every listing, together with the one invariant that ties a name to the details
-//! it was rendered from. A publication that cannot make one of those decisions is
-//! refused as a whole, and the generation that was published before it stays
-//! exactly as it was.
-//!
-//! The pass reads exactly the material the new generation will carry — the
-//! surviving route snapshots, the codes they staged and the asset, reference and
-//! outcome registries — so the catalog can never describe one publication while
-//! the registries describe another.
-
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
@@ -42,50 +27,28 @@ use crate::catalog::{
     registry::{asset::AssetRegistry, outcome::OutcomeRegistry, reference::ReferenceRegistry},
 };
 
-/// The verified display code one route staged for one canonical asset.
-///
-/// The staging key is the canonical asset itself, so one asset states one code
-/// whatever route staged it: a contract token has no code of its own, and the
-/// ticker of a security is a listing fact rather than a canonical term.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedAssetCode {
-    /// The canonical asset the code was verified for.
     pub asset: AssetId,
-    /// The verified display code of that asset.
     pub code: AssetDisplayCode,
 }
 
-/// The display material one route staged together with its listings.
-///
-/// The material is kept with the route snapshot rather than with the batch, so a
-/// later publication that only revokes another route — or only replaces the
-/// canonical registries — rebuilds the same display from the same facts instead
-/// of losing them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteDisplayMaterial {
-    /// The display code of every asset whose own terms state none.
     pub asset_codes: Arc<[StagedAssetCode]>,
 }
 
-/// Every staged code of the surviving routes, indexed by canonical asset.
 #[derive(Clone, Debug, Default)]
 struct StagedCodes {
     entries: AHashMap<AssetId, AssetDisplayCode>,
 }
 
 impl StagedCodes {
-    /// Returns the code one route staged for an asset.
     fn get(&self, asset: &AssetId) -> Option<&AssetDisplayCode> {
         self.entries.get(asset)
     }
 }
 
-/// Indexes the staged codes of every surviving route by canonical asset.
-///
-/// Every entry belongs to a route the generation still holds — a revoked route
-/// leaves no snapshot, so its staged codes are dropped with it — and one asset
-/// states exactly one code, so two routes that disagree refuse the batch instead
-/// of being resolved by iteration order.
 fn index_staged_codes(
     snapshots: &AHashMap<VenueRoute, Arc<RouteSnapshot>>,
 ) -> Result<StagedCodes, DisplayError> {
@@ -107,33 +70,16 @@ fn index_staged_codes(
     Ok(StagedCodes { entries })
 }
 
-/// Everything the publication has to look up in the registries.
 #[derive(Default)]
 struct RequestedTerms {
-    /// Every asset the catalog names: the ones a listing states and every
-    /// registered one.
     assets: AHashSet<AssetId>,
-    /// The assets a published name renders, which must have a code.
-    ///
-    /// A contract unit, a strike quote and a delivery leg are deliberately not
-    /// part of it: no name states them, so an asset only they mention may stay
-    /// without a code.
     named_assets: AHashSet<AssetId>,
-    /// Every index the catalog names.
     indices: AHashSet<IndexId>,
-    /// Every external reference the catalog names.
     external_references: AHashSet<ExternalReferenceId>,
-    /// Every outcome group an outcome listing names.
     outcomes: AHashSet<OutcomeGroupId>,
 }
 
 impl RequestedTerms {
-    /// Collects every registry identity the publication must resolve.
-    ///
-    /// Only the positions a name renders are collected as *named*: the base and
-    /// quote of a spot pair, the underlying of a derivative, the asset a contract
-    /// settles in cash and the settlement asset of an outcome group. Everything
-    /// else a listing states is a listing fact and never a name.
     fn collect(
         candidates: &[&CatalogEntry],
         outcomes: &OutcomeRegistry,
@@ -176,9 +122,6 @@ impl RequestedTerms {
             }
             InstrumentTerms::Outcome(terms) => {
                 self.outcomes.insert(*terms.group());
-                // An outcome instrument names no asset of its own: the group's
-                // settlement asset is the one its name is denominated in, so it is
-                // the asset this publication resolves.
                 let group = outcome_group(outcomes, terms.group())?;
                 self.named_asset(&group.settlement_asset);
             }
@@ -204,15 +147,6 @@ impl RequestedTerms {
     }
 }
 
-/// Adds the registry identities no listing of this publication references.
-///
-/// The catalog names one asset, index and external reference per *registered*
-/// identity, not one per identity a surviving listing happens to state, because a
-/// reader that names an asset no listing of its generation references — a wallet
-/// balance, a fee asset, a collateral asset — has to find that code in the same
-/// catalog every other name comes from. The identity is added without being named:
-/// an asset nothing renders occupies no position of a name, so an asset whose own
-/// terms state no code and which no route staged may stay without one.
 fn collect_registered_terms(
     requested: &mut RequestedTerms,
     assets: &AssetRegistry,
@@ -220,10 +154,6 @@ fn collect_registered_terms(
     staged: &StagedCodes,
 ) {
     for asset in assets.assets() {
-        // A security states no code of its own, so a registered one is named only
-        // when a route staged a code for it: without one the resolution below could
-        // only ever skip it, and an asset no name renders stays without a code
-        // either way.
         if matches!(asset, AssetId::Security(_)) && staged.get(&asset).is_none() {
             continue;
         }
@@ -237,19 +167,13 @@ fn collect_registered_terms(
     }
 }
 
-/// The display material of one publication, before any name is assembled.
 pub struct PublicationInput<'a> {
-    /// The route snapshots the new generation will carry.
     pub snapshots: &'a AHashMap<VenueRoute, Arc<RouteSnapshot>>,
-    /// The asset registry the new generation will carry.
     pub assets: &'a AssetRegistry,
-    /// The reference registry the new generation will carry.
     pub references: &'a ReferenceRegistry,
-    /// The outcome registry the new generation will carry.
     pub outcomes: &'a OutcomeRegistry,
 }
 
-/// The resolved display codes every instrument component is assembled from.
 struct NameLinks<'a> {
     assets: &'a AHashMap<AssetId, AssetDisplayCode>,
     indices: &'a AHashMap<IndexId, AssetDisplayCode>,
@@ -257,7 +181,6 @@ struct NameLinks<'a> {
 }
 
 impl NameLinks<'_> {
-    /// Returns the display code of one canonical asset.
     fn asset_code(&self, asset: &AssetId) -> Result<AssetDisplayCode, DisplayError> {
         self.assets
             .get(asset)
@@ -267,7 +190,6 @@ impl NameLinks<'_> {
             })
     }
 
-    /// Returns the display code of one canonical index.
     fn index_code(&self, index: &IndexId) -> Result<AssetDisplayCode, DisplayError> {
         self.indices
             .get(index)
@@ -277,7 +199,6 @@ impl NameLinks<'_> {
             })
     }
 
-    /// Returns the display code of one external reference.
     fn external_reference_code(
         &self,
         reference: &ExternalReferenceId,
@@ -291,12 +212,6 @@ impl NameLinks<'_> {
     }
 }
 
-/// Builds the display catalog of one publication.
-///
-/// A revocation drops the routes it removes and rebuilds the catalog from the
-/// survivors with the same rules, so the display of a surviving listing never
-/// changes because another route left, and a registry-only publication rebuilds
-/// against the registries it installs.
 pub fn build_display_catalog(input: PublicationInput<'_>) -> Result<DisplayCatalog, DisplayError> {
     let PublicationInput {
         snapshots,
@@ -332,7 +247,6 @@ pub fn build_display_catalog(input: PublicationInput<'_>) -> Result<DisplayCatal
     ))
 }
 
-/// Every surviving listing of the generation, in canonical route/key order.
 fn collect_candidates(snapshots: &AHashMap<VenueRoute, Arc<RouteSnapshot>>) -> Vec<&CatalogEntry> {
     let mut routes: Vec<&VenueRoute> = snapshots.keys().collect();
     routes.sort();
@@ -343,12 +257,6 @@ fn collect_candidates(snapshots: &AHashMap<VenueRoute, Arc<RouteSnapshot>>) -> V
     candidates
 }
 
-/// Resolves the display code of every canonical asset the catalog names.
-///
-/// The code of an asset is a pure function of its own terms or of the value a
-/// route staged for it, so no decision is taken here beyond the one refusal the
-/// contract states: an asset a published name renders must have a code, and an
-/// asset that is only registered may stay without one.
 fn resolve_asset_codes(
     requested: &RequestedTerms,
     assets: &AssetRegistry,
@@ -358,7 +266,6 @@ fn resolve_asset_codes(
         AHashMap::with_capacity(requested.assets.len());
     for asset in &requested.assets {
         let code = match (staged.get(asset), term_code(asset, assets)?) {
-            // One asset states exactly one code, whatever stated it.
             (Some(staged), Some(term)) if staged != &term => {
                 return Err(DisplayError::StagedCodeMismatch {
                     asset: Box::new(asset.clone()),
@@ -380,12 +287,6 @@ fn resolve_asset_codes(
     Ok(codes)
 }
 
-/// Returns the code the canonical terms of one asset state on their own.
-///
-/// A currency, a token and a commodity state theirs; a contract token keeps its
-/// chain and its address and states none, and a security states none at all —
-/// its ticker is the code a route stages — so both are named by the staging of
-/// the route that publishes them.
 fn term_code(
     asset: &AssetId,
     assets: &AssetRegistry,
@@ -403,14 +304,11 @@ fn term_code(
         AssetId::Commodity(id) => {
             AssetDisplayTerms::Commodity(assets.commodity(id).ok_or_else(missing)?)
         }
-        // The issuer, designation and form of a security are not a name and state
-        // no code, so no registered term is read for one.
         AssetId::Security(_) => return Ok(None),
     };
     AssetDisplayCode::from_terms(terms).map_err(|error| DisplayError::Format { error })
 }
 
-/// Resolves the display code of every index the catalog names.
 fn resolve_index_codes(
     requested: &AHashSet<IndexId>,
     references: &ReferenceRegistry,
@@ -429,7 +327,6 @@ fn resolve_index_codes(
     Ok(codes)
 }
 
-/// Resolves the display code of every external reference the catalog names.
 fn resolve_external_reference_codes(
     requested: &AHashSet<ExternalReferenceId>,
     references: &ReferenceRegistry,
@@ -451,7 +348,6 @@ fn resolve_external_reference_codes(
     Ok(codes)
 }
 
-/// Resolves the economic name and the details of every published instrument.
 fn resolve_instruments(
     candidates: &[&CatalogEntry],
     links: &NameLinks<'_>,
@@ -480,11 +376,6 @@ fn resolve_instruments(
     Ok((names, details))
 }
 
-/// Renders the typed display details of one instrument.
-///
-/// This is the one place the identifying fields of an instrument become the
-/// details the grammar renders, so a field a name does not state is never read
-/// here and a field a name states is never filled in twice.
 fn instrument_details(
     instrument: &Instrument,
     links: &NameLinks<'_>,
@@ -528,13 +419,6 @@ fn instrument_details(
     })
 }
 
-/// Returns the display code of the settlement of a dated contract.
-///
-/// Only a cash delivery states one: a contract that hands over real assets states
-/// no settlement asset, and its name renders the `PHYS` value of that position.
-/// The settlement asset is deliberately not inferred from the price quote — a
-/// physical contract has none, and the model's own settlement accessor answers
-/// with the cash asset alone.
 fn cash_settlement_code(
     delivery: &DeliveryMode,
     links: &NameLinks<'_>,
@@ -545,7 +429,6 @@ fn cash_settlement_code(
         .transpose()
 }
 
-/// Renders the underlying of one derivative.
 fn underlying_code(
     underlying: &UnderlyingRef,
     links: &NameLinks<'_>,
@@ -557,7 +440,6 @@ fn underlying_code(
     }
 }
 
-/// The outcome group one outcome listing is displayed from.
 fn outcome_group<'a>(
     outcomes: &'a OutcomeRegistry,
     group: &OutcomeGroupId,
@@ -567,7 +449,6 @@ fn outcome_group<'a>(
         .ok_or(DisplayError::MissingOutcomeTerms { group: *group })
 }
 
-/// Returns the registry label of the member and side one outcome listing trades.
 fn outcome_leg<'a>(
     group: &'a OutcomeGroup,
     member: &market_participants_model::outcome::OutcomeMemberId,
@@ -584,12 +465,6 @@ fn outcome_leg<'a>(
     Ok((member_label, side_label))
 }
 
-/// Requires that every published name is the rendering of its own details.
-///
-/// The publication gate asserts the invariant: for every instrument, formatting
-/// the published details again must produce the published name. A generation that
-/// fails it has two renderings of one instrument and is refused rather than
-/// published.
 fn verify_instrument_equality(
     names: &AHashMap<InstrumentId, InstrumentDisplayString>,
     details: &AHashMap<InstrumentId, InstrumentDisplayDetails>,
@@ -606,13 +481,6 @@ fn verify_instrument_equality(
     Ok(())
 }
 
-/// Names every surviving listing after its own instrument.
-///
-/// A listing never re-renders an economic name: it copies the one the catalog
-/// published for its instrument, which is what makes the two unable to drift.
-/// The search aliases are the listing's own native symbols, uppercased and
-/// deduplicated, because a reader that searches by the spelling a venue publishes
-/// is searching for a listing and not for an economic name.
 fn resolve_listings(
     candidates: &[&CatalogEntry],
     names: &AHashMap<InstrumentId, InstrumentDisplayString>,
@@ -640,7 +508,6 @@ fn resolve_listings(
     Ok((listings, aliases))
 }
 
-/// Returns the normalized search aliases of one listing.
 fn search_aliases(listing: &VenueListing) -> Arc<[SmolStr]> {
     let mut aliases: Vec<SmolStr> = listing
         .native_symbol
@@ -655,13 +522,6 @@ fn search_aliases(listing: &VenueListing) -> Arc<[SmolStr]> {
 
 #[cfg(test)]
 mod tests {
-    //! The publication pass's own guards.
-    //!
-    //! Each guard refuses a state the pass must never publish: a name that is not the
-    //! rendering of its details, a listing whose instrument the pass did not name, and
-    //! an outcome group no registry carries. The pass is driven end to end by
-    //! `display_catalog_tests`, so what these pin is the refusal itself — the answer a
-    //! caller gets when an invariant is broken.
 
     use market_participants_model::{
         display::{
@@ -680,13 +540,11 @@ mod tests {
     };
     use crate::catalog::test_support;
 
-    /// One canonical identity of a fixture instrument.
     fn instrument_id(seed: char) -> InstrumentId {
         InstrumentId::from_identity_value(&format_smolstr!("v1/{}", seed.to_string().repeat(64)))
             .expect("the fixture identity is canonical")
     }
 
-    /// One fixture spot instrument of two venue tokens.
     fn spot_instrument(base: &str, quote: &str) -> Instrument {
         Instrument::new(InstrumentTerms::Spot(
             SpotTerms::new(
@@ -698,7 +556,6 @@ mod tests {
         .expect("the fixture spot instrument is valid")
     }
 
-    /// The display details of one fixture spot instrument.
     fn spot_details(base: &str, quote: &str) -> InstrumentDisplayDetails {
         InstrumentDisplayDetails::Spot {
             base: token_code(base),
@@ -766,7 +623,6 @@ mod tests {
         );
     }
 
-    /// The code one fixture native token publishes.
     fn token_code(code: &str) -> AssetDisplayCode {
         let terms = test_support::token_terms(test_support::VENUE, code);
         AssetDisplayCode::from_terms(AssetDisplayTerms::CryptoToken(&terms))

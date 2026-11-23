@@ -9,10 +9,6 @@ use super::types::{
 };
 use crate::{error::MarketParticipantError, market_participants::model::TimeFrame};
 
-/// Hyperliquid candle intervals, in the spelling its API expects.
-///
-/// Hyperliquid candles follow its funding clock: eight-hour candles exist and
-/// six-hour ones do not.
 const HYPERLIQUID_INTERVALS: &[(TimeFrame, &str)] = &[
     (TimeFrame::Minute1, "1m"),
     (TimeFrame::Minute3, "3m"),
@@ -32,10 +28,6 @@ const HYPERLIQUID_INTERVALS: &[(TimeFrame, &str)] = &[
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HyperliquidCodec;
 impl HyperliquidCodec {
-    /// Extracts the request ID from a Hyperliquid `post` response.
-    ///
-    /// Subscription events and other channels may contain unrelated `id`
-    /// fields, so only the documented `channel == "post"` envelope is used.
     pub fn extract_response_id(payload: &[u8]) -> Option<u64> {
         let response = serde_json::from_slice::<HyperliquidResponseIdEnvelope>(payload).ok()?;
         (response.channel == "post").then_some(response.data.id)
@@ -140,12 +132,6 @@ impl HyperliquidCodec {
             },
         }
     }
-    /// The subscription that carries every market number one instrument's ticker
-    /// reports.
-    ///
-    /// An asset context is the only channel that publishes the change and the
-    /// volume of a day next to the price, and it serves spot and perpetual
-    /// instruments alike.
     pub fn ticker_subscription(
         &self,
         coin: impl Into<SmolStr>,
@@ -173,10 +159,6 @@ impl HyperliquidCodec {
             subscription: HyperliquidSubscription::L2Book { coin: coin.into() },
         }
     }
-    /// The interval Hyperliquid expects for `timeframe` on `route`.
-    ///
-    /// The set is Hyperliquid's own candle set: an interval this route does not
-    /// publish is refused here rather than by the venue.
     pub fn encode_timeframe(
         &self,
         route: &VenueRoute,

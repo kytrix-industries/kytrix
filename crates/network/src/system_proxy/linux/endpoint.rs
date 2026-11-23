@@ -1,6 +1,3 @@
-//! Desktop proxy endpoint parsing shared by the GNOME, KDE, and environment
-//! readers.
-
 use crate::error::NetworkError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,5 +1,3 @@
-//! GNOME `gsettings` proxy discovery.
-
 use std::process::Command;
 
 use super::settings::{LinuxProxyConfig, LinuxSettings, config_from_values};

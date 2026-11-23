@@ -1,16 +1,3 @@
-//! Indicator series computed from the loaded candles.
-//!
-//! Pure functions with no application context: the chart painter builds the
-//! [`IndicatorInput`] columns from a snapshot and asks for every enabled
-//! indicator's lines in one pass (design §7.1). Values are indexed by the
-//! absolute candle index of the whole snapshot, never by a visible-window slot;
-//! the legend and the price-bounds fold both rely on that (design §5.6, §6.3).
-//!
-//! The formulas are the design's §7.2, and the depths come from [`line_depth`]
-//! and [`settings_depth`] in `config.rs`: the same function that decides an
-//! [`IndicatorLine`]'s display threshold feeds the history prefetch, so the two
-//! cannot disagree.
-
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::paint::color::Color;
 
@@ -19,11 +6,6 @@ use super::{
     IndicatorSettings, LineColor, default_line_color, line_depth, settings_depth,
 };
 
-/// The prices of one candle that the computations read.
-///
-/// The chart's own [`crate::model::CandlePrices`] resolves a candle's legs;
-/// this type is the narrowed contract of the computation: it knows three prices
-/// and nothing about listings, quote assets or units.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndicatorInput {
     pub close: f64,
@@ -31,69 +13,33 @@ pub(crate) struct IndicatorInput {
     pub low: f64,
 }
 
-/// How a line is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LineShape {
     Line,
     Histogram,
 }
 
-/// The y range of one sub plot, derived from the visible window.
-///
-/// It is deliberately not stored on [`IndicatorSeries`]: a range depends on the
-/// visible window (design §6.4), while the values are computed once per snapshot.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ValueRange {
     pub lowest: f64,
     pub highest: f64,
 }
 
-/// One computed line, indexed like the whole snapshot's candle array.
 pub(crate) struct IndicatorLine {
-    /// The line's name, e.g. `MA5`, `DIF` or `J`.
     pub label: SmolStr,
-    /// The colour a [`LineShape::Line`] is painted in, and the colour its legend
-    /// entry uses.
-    ///
-    /// A [`LineShape::Histogram`] line carries a colour only for the model's
-    /// completeness: its bars are painted in the market's bullish/bearish colours
-    /// and the sub-plot legend does not list it, so its stored colour is never
-    /// drawn.
     pub color: Color,
-    /// One entry per candle; `None` means the value is not defined there.
     pub values: Vec<Option<f64>>,
-    /// The first absolute index whose value is trustworthy.
-    ///
-    /// The line still has values before this index where the formula defines
-    /// one (EMA and MACD do, from the first candle on); the legend and the readout
-    /// read no value before it. It is computed per line from that line's own
-    /// settings, not from the indicator's longest depth.
     pub readable_from: usize,
     pub shape: LineShape,
 }
 
-/// One enabled indicator's computed output.
-///
-/// It deliberately holds no y-axis range: a range depends on the visible window
-/// and is derived every frame (design §6.4), so storing one here would freeze it
-/// behind the "computed once per snapshot" cache.
 pub(crate) struct IndicatorSeries {
     pub id: IndicatorId,
-    /// The formula name shown by a sub-plot legend, e.g. `MACD(12,26,9)`.
     pub legend: SmolStr,
     pub lines: Vec<IndicatorLine>,
-    /// The reference lines the sub plot draws at fixed values.
-    ///
-    /// They depend only on the indicator, not on the visible window, so they
-    /// belong to the cached series rather than to a per-frame range.
     pub guides: Vec<f64>,
 }
 
-/// Computes every enabled line indicator, in catalogue order.
-///
-/// Volume is not here: it is a sub-plot indicator whose bars the painter builds
-/// from the snapshot's traded sizes directly, and it has no values to compute.
-/// `None`-setting indicators are skipped for the same reason.
 pub(crate) fn compute_indicators(
     inputs: &[IndicatorInput],
     config: &CandlestickIndicatorConfig,
@@ -106,7 +52,6 @@ pub(crate) fn compute_indicators(
         .collect()
 }
 
-/// One enabled entry's series, or `None` for an indicator with no computed line.
 fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<IndicatorSeries> {
     match (entry.id, &entry.settings) {
         (IndicatorId::Ma, IndicatorSettings::Lines(lines)) => Some(lines_series(
@@ -181,16 +126,10 @@ fn series_for(inputs: &[IndicatorInput], entry: &IndicatorEntry) -> Option<Indic
             *j_color,
             settings_depth(entry.id, &entry.settings),
         )),
-        // VOL has no computed line, and a settings value of the wrong shape
-        // cannot survive normalization; both are simply not drawn.
         _ => None,
     }
 }
 
-/// One `Lines` indicator: one line per configured row.
-///
-/// The row's period decides both the formula and that line's `readable_from`, so
-/// MA 5/10/20 is readable from 4/9/19 rather than from the maximum 19.
 fn lines_series(
     inputs: &[IndicatorInput],
     id: IndicatorId,
@@ -206,9 +145,6 @@ fn lines_series(
         guides,
     };
     for row in rows {
-        // The line's name is the indicator's formula name followed by its
-        // period (`MA5`, `EMA12`, `RSI6`); taking the prefix from the series
-        // legend keeps the two spellings from drifting apart.
         let label = format_smolstr!("{}{}", series.legend, row.period);
         series.lines.push(IndicatorLine {
             label,
@@ -241,8 +177,6 @@ fn macd_series(
         .map(|(short, long)| short - long)
         .collect();
     let dea = ema_closes(&dif, signal_period);
-    // The histogram is always drawn: its two switches only choose the DIF and
-    // DEA lines. The ×2 is the convention the design fixes (Tongdaxin).
     let histogram = dif
         .iter()
         .zip(&dea)
@@ -336,10 +270,6 @@ fn kdj_series(
     }
 }
 
-/// Simple moving average over the closes, with a sliding sum.
-///
-/// The first value is at index `period - 1`; before that there are not enough
-/// candles and the entries stay `None`.
 fn sma(inputs: &[IndicatorInput], period: u32) -> Vec<Option<f64>> {
     let period = period as usize;
     let mut values = vec![None; inputs.len()];
@@ -359,11 +289,6 @@ fn sma(inputs: &[IndicatorInput], period: u32) -> Vec<Option<f64>> {
     values
 }
 
-/// Exponential moving average over the closes, seeded with the first close.
-///
-/// It has a value from the first candle on; the value only becomes trustworthy
-/// after `period - 1` candles, which is [`line_depth`]'s answer rather than a
-/// property of this function.
 fn ema_line(inputs: &[IndicatorInput], period: u32) -> Vec<Option<f64>> {
     let closes: Vec<f64> = inputs.iter().map(|input| input.close).collect();
     ema_closes(&closes, period).into_iter().map(Some).collect()
@@ -382,10 +307,6 @@ fn ema_closes(closes: &[f64], period: u32) -> Vec<f64> {
     values
 }
 
-/// Wilder-smoothed relative strength index.
-///
-/// The first change needs one candle, so the first value is at index `period`
-/// (`period + 1` candles in); everything before it is `None`.
 fn rsi(inputs: &[IndicatorInput], period: u32) -> Vec<Option<f64>> {
     let period = period as usize;
     let mut values = vec![None; inputs.len()];
@@ -413,8 +334,6 @@ fn rsi(inputs: &[IndicatorInput], period: u32) -> Vec<Option<f64>> {
     values
 }
 
-/// A flat market has no gains and no losses; the design fixes its RSI at 50
-/// rather than leaving the ratio undefined.
 fn rsi_value(average_gain: f64, average_loss: f64) -> f64 {
     let total = average_gain + average_loss;
     if total == 0.0 {
@@ -424,12 +343,6 @@ fn rsi_value(average_gain: f64, average_loss: f64) -> f64 {
     }
 }
 
-/// The K / D / J lines of the stochastic oscillator.
-///
-/// The recursion is seeded with `prev_k = prev_d = 50`, and the first RSV index
-/// is smoothed once like every later one. Before that index the outputs are
-/// `None` and the seeds are **not** advanced: feeding a `None` into the
-/// recursion would make the first real value NaN.
 fn kdj(
     inputs: &[IndicatorInput],
     period: u32,
@@ -461,8 +374,6 @@ fn kdj(
             .iter()
             .map(|input| input.low)
             .fold(f64::MAX, f64::min);
-        // A window that never moved has no range to normalise against; the
-        // design fixes its RSV at the neutral 50.
         let rsv = if highest == lowest {
             50.0
         } else {

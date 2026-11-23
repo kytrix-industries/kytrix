@@ -1,143 +1,3 @@
-//! The collaborators a widget is handed instead of reading process globals.
-//!
-//! This is the replacement for the process globals the framework used to reach through
-//! its context: a widget renders with the [`Translate`] it was handed, reads the
-//! selected language from the [`Signal`] it was handed, reads settings from the
-//! [`Signal<Config>`] the composition root keeps in step with the settings manager,
-//! draws through the [`ThemeHandle`] it was handed, and drives its streams on the
-//! runtime it was handed. Nothing here is installed process-wide and nothing is
-//! looked up by type, so a test composes the same aggregate the application does.
-//!
-//! # The settings signal
-//!
-//! P3-0 froze this type with a `ConfigManager` field. That manager owns an application-shell
-//! entity, so the aggregate could only be built inside that shell — which
-//! is exactly what the contract layer is leaving behind. P3-1 freezes the engine
-//! shape instead: `config` is the **settings snapshot as a signal**. The composition
-//! root owns the `ConfigManager`, writes the signal whenever the manager's snapshot
-//! moves, and widgets read either the value
-//! ([`WidgetCx::config_ref`](crate::cx::WidgetCx::config_ref)) or the signal (inside a
-//! `bind_*` closure that must follow a setting).
-//!
-//! The framework's surface root reads the signal while it renders, like the language
-//! and the directory generation: **one settings write schedules exactly one frame**,
-//! and every mounted widget's `sync` runs on it — including a widget that has no body
-//! yet, whose own tree therefore has no node that could carry the edge. A widget that
-//! follows a setting compares it in `sync` (or derives its drawing from it inside a
-//! `bind_*`); it never schedules the frame itself. See `crates/widgets/AGENTS.md` §8.1.
-//!
-//! # The directory generation
-//!
-//! [`WidgetServices::catalog_generation`] is the published market-directory generation
-//! as a signal. The composition root writes the value of a `CatalogGenerationId`
-//! whenever the catalogue publishes a new generation (`0` = nothing published yet),
-//! and the framework's surface root reads it while it renders: a write therefore
-//! schedules exactly one frame, and every mounted widget's `sync` runs on it —
-//! including a widget that is still waiting for the directory and has no body that
-//! could read anything. A widget that follows the directory compares the signal with
-//! the value it saw in `new` and runs `load` again when it moved
-//! (`crates/widgets/AGENTS.md` §8.3); it never reads the connector's
-//! `generation_id()` itself.
-//!
-//! # Why two collaborators are optional
-//!
-//! Both [`WidgetServices::market_participants`] and
-//! [`WidgetServices::kytrix_service`] are application-shell objects: the directory
-//! connector takes the application's tokio runtime handle, and the service connector owns
-//! the process's OAuth session and its transport. Both are constructed by the
-//! composition root (the connector through its toolkit-free
-//! `KytrixServiceConnector::spawn`, P4-5). The contract layer cannot construct either
-//! in a headless test, so both are `Option` (§13.9 R-1):
-//!
-//! - the application root always supplies them;
-//! - a headless test that does not read the directory or the service leaves them
-//!   absent, and a widget that needs one maps `None` to its own business
-//!   notice/failure (there is no shared `WidgetError` type for it — a widget states
-//!   its own).
-//!
-//! # The application seams a widget cannot read itself
-//!
-//! Three collaborators are application-layer actions rather than data:
-//!
-//! - [`WidgetServices::open_url`] — opening an external link is the application's
-//!   command (design §11.7); the contract only receives a closure, so it never learns
-//!   which browser or shell the platform uses.
-//! - [`WidgetServices::sound`] — audio assets and the player stay in the application
-//!   (design §9.5); a widget asks for the bytes of a named sound and gets `None` when
-//!   this host has no audio, which is the ordinary case in a test.
-//! - [`WidgetServices::reduce_motion`] — the application mirrors its accessibility
-//!   settings into a signal; a widget that animates reads it and lands on the final
-//!   value when it is set. The engine has no accessibility-settings store of its own.
-//!
-//! # The three composition-root singletons
-//!
-//! Kit components need three application-level instances that only the composition
-//! root may create:
-//!
-//! - [`WidgetServices::layer`] — the z-order arbitration between overlays
-//!   (`base_ui::kit::layer::Layer`). One instance per application, partitioned by
-//!   window inside; a second one would make two overlays disagree about who is on
-//!   top, and dialogs / popups opened through different stacks would interleave
-//!   wrongly.
-//! - [`WidgetServices::frame_router`] — the owner of the engine's single
-//!   `App::on_frame` slot ([`FrameRouter`]). `AnyWidget::mount` registers its sync
-//!   route here and `release` unregisters it; a second router cannot install itself
-//!   (the slot is taken) and its routes would silently never run.
-//! - [`WidgetServices::animation_router`] — the owner of the engine's single
-//!   `App::on_animation_complete` slot (`base_ui::kit::overlay::AnimationRouter`).
-//!   Every `Overlay` / `Tooltip` hands its fade-in/fade-out ids to this one router; a
-//!   second one would replace the completion callback and the first overlay's fade-out
-//!   would never finish (the node would stay on screen).
-//!
-//! A widget therefore never builds its own — it takes the instance it was handed
-//! ([`WidgetCx::layer`](crate::cx::WidgetCx::layer),
-//! [`WidgetCx::frame_router`](crate::cx::WidgetCx::frame_router),
-//! [`WidgetCx::animation`](crate::cx::WidgetCx::animation)) and passes clones into the
-//! kit component it builds. The three fields are `Rc` handles so cloning one into a
-//! dialog / selector host shares the composition root's instance rather than copying
-//! its state. [`WidgetServices::builder`] is the assembly seam: the composition root
-//! (and the test host) names the three singletons once, and everything a widget builds
-//! through its context reaches the same instances.
-//!
-//! The aggregate is deliberately minimal: it gains a field when a widget needs
-//! another collaborator, not because one may be needed later. P3-1 freezes this
-//! shape.
-//!
-//! # Language
-//!
-//! A widget reads [`WidgetServices::language`] where it renders — that read
-//! registers the engine dependency which redraws it — and renders its text through
-//! [`WidgetServices::translate`]. The translator is pure `i18n` state and observes no
-//! signal, so both carry the selected language and the composition root keeps them
-//! in step: switching the language sets the translator's language and writes the
-//! signal. Set the translator first, so a redraw the write schedules can only draw
-//! the new language.
-//!
-//! # Threading
-//!
-//! The aggregate is neither `Clone` (it owns a [`Translate`] and a [`ThemeHandle`],
-//! both `Rc`-backed and `!Send`) nor `Send`; the host builds it once on the UI
-//! thread and hands it out as an `Rc<WidgetServices>`. It must not be captured by a
-//! future that requires `Send`, such as the engine's spawn. The three singletons are
-//! `Rc` handles for the same reason: they are shared on the UI thread, never across
-//! one.
-//!
-//! # Examples
-//!
-//! A widget reads the settings snapshot from the services it was handed:
-//!
-//! ```text
-//! // Before: the settings lived in a process global looked up through the context.
-//! let config = cx.global::<ConfigManager>().read();
-//!
-//! // After: the composition root hands the services in, and the widget reads a field
-//! // (or a borrowed view of the snapshot, without cloning it per frame).
-//! let zone = cx.config_ref(|config| data_time_zone(config));
-//! ```
-//!
-//! The translation context is the other half of the same move — see
-//! [`Translate`] and [`t_smol!`](i18n::t_smol).
-
 use std::rc::Rc;
 
 use app_config::settings::Config;
@@ -154,119 +14,34 @@ use ui_core::{app::App, node::signal::Signal};
 
 use crate::frame::FrameRouter;
 
-/// The services every widget is given by the composition root.
-///
-/// See the module documentation for the frozen shape, the language contract, the
-/// optional collaborators, and the threading rules.
 pub struct WidgetServices {
-    /// Renders the interface's own messages in the selected language.
     pub translate: Translate,
-    /// The selected language as an engine signal: a component that reads it while it
-    /// renders is redrawn when the language changes.
     pub language: Signal<LanguageCode>,
-    /// The current settings snapshot as an engine signal.
-    ///
-    /// The composition root writes it when `ConfigManager`'s snapshot moves; a
-    /// `bind_*` closure that reads it follows the setting it reads. The framework's
-    /// surface root reads it too, so a write schedules a frame even for a widget
-    /// with no body (see the module documentation).
     pub config: Signal<Config>,
-    /// The theme service: colours are read through it inside `bind_style` closures.
     pub theme: ThemeHandle,
-    /// The market-participants directory, when the host has one.
-    ///
-    /// The application root always supplies it; a headless test that does not read
-    /// the directory leaves it absent. See the module documentation.
     pub market_participants: Option<MarketParticipantsConnector>,
-    /// The published market-directory generation, as an engine signal.
-    ///
-    /// The composition root writes `CatalogGenerationId::get()` whenever a venue
-    /// commit publishes a new generation; `0` = nothing published yet. The
-    /// framework's surface root reads it while it renders, so a write schedules the
-    /// frame that runs every widget's `sync`. A widget that follows the directory
-    /// compares it with the value it saw and reloads when it moved; see the module
-    /// documentation.
     pub catalog_generation: Signal<u64>,
-    /// The Kytrix service connection, when the host has one.
-    ///
-    /// The application root always supplies it; a headless test leaves it absent.
-    /// Widgets that fetch through the service map `None` to their own failure. See
-    /// the module documentation.
     pub kytrix_service: Option<KytrixServiceConnector>,
-    /// Opens an external link through the application's own command.
-    ///
-    /// The contract receives the closure and calls it with the URL to open; it never
-    /// talks to a browser or a shell itself.
     pub open_url: Rc<dyn Fn(&str)>,
-    /// The bytes of one application audio asset, by name; `None` = no audio here.
-    ///
-    /// The player and the asset source stay in the application (design §9.5); a
-    /// widget only says which sound to play.
     pub sound: Rc<dyn Fn(&'static str) -> Option<Bytes>>,
-    /// Whether the application asks for reduced motion.
-    ///
-    /// The composition root mirrors the accessibility setting into this signal; an
-    /// animating widget reads it and lands on the final value when it is set.
     pub reduce_motion: Signal<bool>,
-    /// The application's one layer stack: who is on top of whom among the window's
-    /// overlays.
-    ///
-    /// The composition root creates it once and mirrors it into every
-    /// [`Overlay`](base_ui::kit::overlay::Overlay) and dialog it builds; a widget hands
-    /// this instance to the kit components it builds (see the module documentation).
-    /// It holds one stack partitioned by window, so a widget never partitions it
-    /// itself.
     pub layer: Rc<Layer>,
-    /// The application's one frame router: the owner of `App::on_frame`.
-    ///
-    /// The framework registers each mounted widget's `sync` route here; the kit's
-    /// per-frame components (overlays, lists, tables) are ticked by the routes their
-    /// owners register. The application's hook already points at this instance, so a
-    /// widget never installs another one.
     pub frame_router: Rc<FrameRouter>,
-    /// The application's one animation-completion router: the owner of
-    /// `App::on_animation_complete`.
-    ///
-    /// Every overlay / tooltip fade registers its animation here, so the completion
-    /// callback has one dispatcher. A second router would replace the engine's single
-    /// slot and the first overlay's fade-out would never complete — see the module
-    /// documentation.
     pub animation_router: Rc<AnimationRouter>,
-    /// The tokio runtime the widget's streams and RPC calls are driven on.
-    ///
-    /// The composition root hands over the application runtime; the framework's test
-    /// host owns a current-thread runtime and drives it through
-    /// [`WidgetTestApp::drain_runtime`](crate::test_support::WidgetTestApp::drain_runtime)
-    /// / [`run_until_idle`](crate::test_support::WidgetTestApp::run_until_idle).
     pub runtime: Handle,
 }
 
 impl WidgetServices {
-    /// The market-participants directory, if the host installed one.
     #[must_use]
     pub fn market_participants(&self) -> Option<&MarketParticipantsConnector> {
         self.market_participants.as_ref()
     }
 
-    /// The Kytrix service connection, if the host installed one.
     #[must_use]
     pub fn kytrix_service(&self) -> Option<&KytrixServiceConnector> {
         self.kytrix_service.as_ref()
     }
 
-    /// Starts assembling the aggregate the way the composition root does.
-    ///
-    /// The three singletons are constructor arguments rather than setters because a
-    /// widget's kit components cannot work without the application's instances (see
-    /// the module documentation): a caller cannot forget one and get a silently
-    /// private layer / router. The four signals are minted by
-    /// [`WidgetServicesBuilder::build`] with the documented defaults; the optional
-    /// application seams and the signal initial values are builder methods.
-    ///
-    /// `app` is where the signals are minted (one scope per built aggregate), so the
-    /// builder borrows it until [`WidgetServicesBuilder::build`] runs. The caller still
-    /// owns the composition-root singletons it passes in — it keeps its own handles for
-    /// the frame hook, the layer enforcement and the completion routing.
     pub fn builder(
         app: &mut App,
         runtime: Handle,
@@ -296,10 +71,6 @@ impl WidgetServices {
     }
 }
 
-/// The assembly seam for [`WidgetServices`]: defaults plus the seams a host overrides.
-///
-/// [`WidgetServices::builder`] documents the shape. Every builder method returns the
-/// builder, so a host names only the collaborators it actually provides.
 pub struct WidgetServicesBuilder<'a> {
     app: &'a mut App,
     runtime: Handle,
@@ -319,39 +90,30 @@ pub struct WidgetServicesBuilder<'a> {
 }
 
 impl WidgetServicesBuilder<'_> {
-    /// The initial language signal value (default: English).
-    ///
-    /// The host must keep the translator and the signal in step; set the translator
-    /// first, then this value, so a redraw the write schedules can only draw the new
-    /// language (see the module documentation).
     #[must_use]
     pub fn language(mut self, language: LanguageCode) -> Self {
         self.language = language;
         self
     }
 
-    /// The initial settings snapshot (default: [`Config::default`]).
     #[must_use]
     pub fn config(mut self, config: Config) -> Self {
         self.config = config;
         self
     }
 
-    /// The initial catalogue generation (default `0` = nothing published yet).
     #[must_use]
     pub fn catalog_generation(mut self, generation: u64) -> Self {
         self.catalog_generation = generation;
         self
     }
 
-    /// The initial reduced-motion value (default `false`).
     #[must_use]
     pub fn reduce_motion(mut self, reduce_motion: bool) -> Self {
         self.reduce_motion = reduce_motion;
         self
     }
 
-    /// The market-participants directory, when the host has one.
     #[must_use]
     pub fn market_participants(
         mut self,
@@ -361,28 +123,24 @@ impl WidgetServicesBuilder<'_> {
         self
     }
 
-    /// The Kytrix service connection, when the host has one.
     #[must_use]
     pub fn kytrix_service(mut self, kytrix_service: Option<KytrixServiceConnector>) -> Self {
         self.kytrix_service = kytrix_service;
         self
     }
 
-    /// The application's command for opening an external link.
     #[must_use]
     pub fn open_url(mut self, open_url: impl Fn(&str) + 'static) -> Self {
         self.open_url = Rc::new(open_url);
         self
     }
 
-    /// The application's source of audio-asset bytes.
     #[must_use]
     pub fn sound(mut self, sound: impl Fn(&'static str) -> Option<Bytes> + 'static) -> Self {
         self.sound = Rc::new(sound);
         self
     }
 
-    /// Mints the four signals in one scope and returns the aggregate.
     #[must_use]
     pub fn build(self) -> WidgetServices {
         let Self {
@@ -465,13 +223,8 @@ mod tests {
     const MESSAGES_EN: &str = "common:\n  close: Close\n";
     const MESSAGES_ZH: &str = "common:\n  close: 关闭\n";
 
-    /// What the test host's `open_url` was called with.
     type Opened = Rc<RefCell<Vec<String>>>;
 
-    /// A headless engine app and a runtime; the services are composed through the same
-    /// builder the application root uses, only without the two shell-bound collaborators
-    /// (the directory and the Kytrix service). The three composition-root singletons come
-    /// back too, so a test can assert the aggregate carries the instances the host built.
     fn compose() -> (
         App,
         WidgetServices,
@@ -520,8 +273,6 @@ mod tests {
         (app, services, opened, layer, frame_router, animation_router)
     }
 
-    /// The services are built without any application-shell context: an engine application and a
-    /// tokio runtime are the whole host, and every frozen slot is assembled.
     #[test]
     fn services_compose_without_a_gui_context() {
         let (app, services, opened, layer, frame_router, animation_router) = compose();
@@ -581,9 +332,6 @@ mod tests {
         assert_eq!(opened.borrow().as_slice(), ["https://example.com/market"]);
     }
 
-    /// The builder is the assembly seam: the host names the two optional connectors, the four
-    /// initial signal values and the application seams, and everything else is the documented
-    /// default.
     #[test]
     fn the_builder_composes_every_frozen_slot() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -658,8 +406,6 @@ mod tests {
         assert_eq!(opened.borrow().as_slice(), ["https://example.com/news"]);
     }
 
-    /// Builds one closed overlay over the host's singletons, the way a widget's `new` builds the
-    /// kit components it owns.
     fn build_overlay(harness: &mut WidgetTestApp, key: &str) -> Overlay {
         harness.with_cx(|cx| {
             let theme = cx.theme().clone();
@@ -676,7 +422,6 @@ mod tests {
         })
     }
 
-    /// Opens `overlay` at a fixed point, with one box of content in its panel.
     fn open_overlay(harness: &mut WidgetTestApp, overlay: &Overlay) -> bool {
         harness
             .with_cx(|cx| {
@@ -689,8 +434,6 @@ mod tests {
             .expect("the overlay opens")
     }
 
-    /// The layer stack is a composition-root singleton: an overlay a widget builds through its
-    /// context registers in the host's one stack, so the framework can enforce the z-order.
     #[test]
     fn an_overlay_opened_through_the_widget_context_registers_in_the_layer_stack() {
         let mut harness = WidgetTestApp::new();
@@ -715,9 +458,6 @@ mod tests {
         );
     }
 
-    /// The completion callback is a composition-root singleton too: building an overlay through
-    /// the context installs the host's router (a widget-built router would take the engine's
-    /// single slot and the other overlays' fade-outs would never finish).
     #[test]
     fn the_animation_router_handed_to_a_widget_owns_the_completion_slot() {
         let mut harness = WidgetTestApp::new();
@@ -741,8 +481,6 @@ mod tests {
         );
     }
 
-    /// The widget context hands out the very instances the host created, and its layer queries
-    /// answer for the overlays that were registered through it.
     #[test]
     fn the_widget_context_queries_the_layer_stack_it_was_handed() {
         let mut harness = WidgetTestApp::new();
@@ -793,9 +531,6 @@ mod tests {
         );
     }
 
-    /// The reduced-motion signal is application state like any other: writing it
-    /// wakes the widgets that read it, and a widget observes the new value through
-    /// the same signal handle.
     #[test]
     fn reduced_motion_is_a_signal_the_application_owns() {
         let (mut app, services, _opened, _layer, _frame_router, _animation_router) = compose();
@@ -809,11 +544,6 @@ mod tests {
         );
     }
 
-    /// Switching the language is a write to the signal a widget reads plus the
-    /// matching update of the translator it renders through: after both, the signal
-    /// reports the new language and the next render draws the new text. The two are
-    /// separate pieces of state, so the composition root is what keeps them
-    /// together — this pins the documented order (translator first, then the signal).
     #[test]
     fn switching_the_language_updates_the_signal_and_the_translator_together() {
         let (mut app, services, _opened, _layer, _frame_router, _animation_router) = compose();
@@ -834,8 +564,6 @@ mod tests {
         );
     }
 
-    /// A setting the widget must follow reaches it through the settings signal; the
-    /// borrowed view of the snapshot reads the same value without cloning it.
     #[test]
     fn a_settings_change_reaches_the_widget_through_the_signal() {
         let (mut app, services, _opened, _layer, _frame_router, _animation_router) = compose();
@@ -852,8 +580,6 @@ mod tests {
         );
     }
 
-    /// The signal handles are minted in one scope so the host can release the whole
-    /// aggregate's state at once.
     #[test]
     fn the_services_signals_live_in_one_scope() {
         let (mut app, services, _opened, _layer, _frame_router, _animation_router) = compose();
@@ -867,8 +593,6 @@ mod tests {
         let _: Signal<u8> = signal;
     }
 
-    /// `Handle` is the runtime half of the aggregate: a widget spawns its streams on
-    /// it rather than asking the process for one.
     #[test]
     fn the_services_carry_the_runtime_the_widget_spawns_on() {
         let (_app, services, _opened, _layer, _frame_router, _animation_router) = compose();
@@ -876,10 +600,6 @@ mod tests {
         assert!(handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread);
     }
 
-    /// A consumer in the shape `force_order` has: it waits for the directory, reloads
-    /// when a generation is published, and only then grows a body. The body reads the
-    /// reload counter rather than the generation, so the frame scheduled by the write
-    /// has to come from the framework's own dependency.
     struct DirectoryConsumer {
         status: WidgetStatus,
         generation: Signal<u64>,
@@ -953,10 +673,6 @@ mod tests {
         }
     }
 
-    /// The directory reaches a widget through the generation signal. A widget still
-    /// waiting for the directory has no body, so nothing it built can register the
-    /// dependency: the surface root carries it, the write schedules the frame that
-    /// runs `sync`, and the consumer reloads and grows its body.
     #[test]
     fn a_directory_generation_change_reaches_a_widget_waiting_for_it() {
         let mut harness = WidgetTestApp::new();
@@ -992,8 +708,6 @@ mod tests {
         );
     }
 
-    /// A generation that did not move is not a write, so it schedules no frame: the
-    /// directory costs a frame only when it actually published (I3).
     #[test]
     fn an_unchanged_directory_generation_schedules_no_frame() {
         let mut harness = WidgetTestApp::new();

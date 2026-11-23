@@ -1,9 +1,3 @@
-//! One page per venue this build serves.
-//!
-//! A venue's page is native UI for the settings that venue's API has. Which module draws it is a
-//! fact of the venue rather than of a declaration, so adding a venue adds a page beside the venues
-//! already served, and the compiler is what says one is missing.
-
 use i18n::translate::Translate;
 use market_participants_model::identifier::VenueId;
 use widget::venue::VenueDisplay;
@@ -17,7 +11,6 @@ use crate::{
     search::{PageSearch, words},
 };
 
-/// Opens the page of one venue.
 pub(crate) fn page_view(venue: VenueId, host: &SettingsHost, key: &str) -> Box<dyn PageView> {
     match venue {
         VenueId::Binance => Box::new(binance::VenuePage::new(host.clone(), key)),
@@ -28,7 +21,6 @@ pub(crate) fn page_view(venue: VenueId, host: &SettingsHost, key: &str) -> Box<d
     }
 }
 
-/// The text one venue's page and its settings are searched by.
 pub(crate) fn search(venue: VenueId, translate: &Translate) -> PageSearch {
     let title = i18n::t_smol!(translate, venue.name_key());
     let fields = match venue {

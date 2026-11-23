@@ -1,12 +1,3 @@
-//! The gateway: the only place a protocol request becomes a network operation.
-//!
-//! Every operation is validated against the registered route registry before it
-//! touches a socket: the request's capability must be the target's, the route and
-//! listing the request names must be the target's route, and the listing status
-//! must permit the command. Which origins a request dials and which credentials it
-//! signs with come from the route's **venue** configuration, never from the route's
-//! own descriptor.
-
 use std::sync::Arc;
 
 use app_config::market_participants::{
@@ -51,8 +42,6 @@ use crate::{
         metadata::{VenueMetadata, VenueReading},
     },
 };
-/// A spawned watcher whose owner can cancel and await it before releasing the
-/// underlying resources captured by the task.
 pub(crate) struct OwnedTask(Option<JoinHandle<()>>);
 
 impl OwnedTask {
@@ -76,20 +65,12 @@ impl Drop for OwnedTask {
     }
 }
 
-/// What one request was admitted against, and the metadata that admitted it.
-///
-/// A request path is admitted by the one routing view, and the commit that
-/// admitted it is the only place its venue metadata can come from. A
-/// load-time conversation names its own route view instead and carries the
-/// reading it belongs to — the metadata a load is about to commit for the catalog
-/// it stages, or nothing for the discovery that produces it.
 #[derive(Default)]
 struct Admission {
     metadata: Option<Arc<VenueMetadata>>,
 }
 
 impl Admission {
-    /// Returns the admission of one loaded `(route, capability)`.
     fn loaded(
         venues: &LoadedVenues,
         identity: &RequestIdentity,
@@ -103,12 +84,10 @@ impl Admission {
         })
     }
 
-    /// Returns the admission of one load-time conversation.
     fn unchecked(metadata: Option<Arc<VenueMetadata>>) -> Self {
         Self { metadata }
     }
 
-    /// Returns the venue metadata this execution is resolved against.
     fn metadata(&self) -> Option<Arc<VenueMetadata>> {
         self.metadata.clone()
     }
@@ -119,9 +98,6 @@ pub struct MarketParticipantRuntime {
     pub transport: Arc<TransportHub>,
     pub connection_pool: Arc<ConnectionPool>,
     proxy_resolver: ProxyResolver,
-    /// The application runtime every request's route resolution runs on.
-    ///
-    /// A request can arrive from a task that runs no Tokio context of its own, so\r\n    /// the runtime travels with the gateway instead of being discovered on the\r\n    /// thread that happens to be executing.
     pub runtime: Handle,
     pub snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
 }
@@ -157,7 +133,6 @@ impl MarketParticipantRuntime {
     }
 }
 
-/// The single market-participants gateway: registry, adapters and transport.
 #[derive(Clone)]
 pub struct MarketParticipantGateway {
     pub router: Arc<CapabilityRouter>,
@@ -166,12 +141,6 @@ pub struct MarketParticipantGateway {
 }
 
 impl MarketParticipantGateway {
-    /// Builds the adapter registry of one configuration.
-    ///
-    /// An adapter is constructed once per venue and then answers `supports` per
-    /// exact scope: whether a scope is served is never decided by the venue, and a
-    /// Hyperliquid HIP-3 DEX or HIP-4 outcome venue is answered by the same
-    /// adapter as the core scope without being folded into it.
     pub fn adapter_router(
         config: &MarketParticipantNetworkSnapshot,
     ) -> Result<CapabilityRouter, MarketParticipantError> {
@@ -189,11 +158,6 @@ impl MarketParticipantGateway {
         ]))
     }
 
-    /// Builds a gateway around already-built adapters and shared resources.
-    ///
-    /// The composition root uses this when adapters are constructed from typed
-    /// runtime inputs of their own; the registry starts empty and the root publishes
-    /// its routes into it.
     pub fn with_shared_resources(
         router: CapabilityRouter,
         transport: Arc<TransportHub>,
@@ -215,30 +179,14 @@ impl MarketParticipantGateway {
         })
     }
 
-    /// Returns the registered descriptor view.
-    ///
-    /// This is the plumbing the request path reads a route's capabilities and its
-    /// adapter from, never the answer to whether a scope may be addressed: that is
-    /// the loaded venues behind `Admission`.
     pub(crate) fn registered(&self) -> Arc<RegisteredRoutes> {
         Arc::clone(self.registry.read().routes())
     }
 
-    /// Returns the route registry a venue commit writes.
-    ///
-    /// The commit holds this lock across the catalog publication, which is what
-    /// makes the descriptor view the request path reads and the catalog routes the
-    /// directory publishes two halves of one write instead of two publications
-    /// that could be observed apart.
     pub(crate) fn registry(&self) -> &Arc<RwLock<VenueRouteRegistry>> {
         &self.registry
     }
 
-    /// Validates one venue's candidate route set without changing anything.
-    ///
-    /// The stage of a load validates the route set it is about to commit here, so
-    /// the descriptors the commit writes are the ones the catalog registrations
-    /// were derived from and the commit itself cannot be refused halfway through.
     pub(crate) fn plan_venue_routes(
         &self,
         venue: &market_participants_model::identifier::VenueId,
@@ -247,16 +195,10 @@ impl MarketParticipantGateway {
         self.registry.read().plan_venue_routes(venue, descriptors)
     }
 
-    /// Closes every connection owned by this gateway.
     pub async fn shutdown(&self) {
         self.runtime.shutdown().await;
     }
 
-    /// Executes one validated protocol call.
-    ///
-    /// `admission` names the view the call is admitted against: the loaded venues
-    /// for a request path or a route view built for one call that has to
-    /// happen before anything is loaded.
     pub async fn execute(
         &self,
         venues: &LoadedVenues,
@@ -272,17 +214,6 @@ impl MarketParticipantGateway {
         adapter.execute(execution_context, request).await
     }
 
-    /// Executes one protocol call against an explicitly supplied route view.
-    ///
-    /// A venue conversation that has to happen before the venue is registered —
-    /// its own scope reading, and the catalog a load stages — addresses a route
-    /// view built for that one call rather than the registry's: the request is
-    /// dialed through the venue's configuration, and the view only says
-    /// which capability, endpoint and adapter the request is validated against.
-    ///
-    /// The metadata is the reading that conversation belongs to: a catalog staged
-    /// by a load is resolved against the metadata the same load read, and a
-    /// discovery carries none because it is itself what produces it.
     pub(crate) async fn execute_with_routes(
         &self,
         routes: &RegisteredRoutes,
@@ -303,15 +234,6 @@ impl MarketParticipantGateway {
         adapter.execute(execution_context, request).await
     }
 
-    /// Reads what one venue publishes, through the venue's own configuration.
-    ///
-    /// This is the one market-participants call a load makes before the venue is registered:
-    /// it addresses the venue rather than a route, so it is dialed through the
-    /// venue's **primary scope** — the scope a venue that discovers what it deploys
-    /// answers its own non-scoped conversations on — and resolved to the venue's
-    /// adapter directly, with no route view, no classification and no admission in
-    /// between. The request is public, so it takes the public HTTP client of the
-    /// venue's own proxy decision.
     pub(crate) async fn read_venue(
         &self,
         venue: &market_participants_model::identifier::VenueId,
@@ -345,7 +267,6 @@ impl MarketParticipantGateway {
         adapter.read_venue(context).await
     }
 
-    /// Opens one validated protocol subscription.
     pub async fn subscribe(
         &self,
         venues: &LoadedVenues,
@@ -361,11 +282,6 @@ impl MarketParticipantGateway {
         adapter.subscribe(execution_context, request).await
     }
 
-    /// Validates one request and resolves everything the adapter needs.
-    ///
-    /// The listing a request names is resolved here and nowhere else: a command,
-    /// a narrowed account read and a listing-scoped fetch all hand the adapter the
-    /// same kind of reference, and a request that names no listing gets none.
     async fn prepare(
         &self,
         routes: &RegisteredRoutes,
@@ -403,9 +319,6 @@ impl MarketParticipantGateway {
                 capability: context.capability(),
             })?;
         let listing = self.resolve_listing(&classified, catalog).await?;
-        // The listing route the request itself names is checked against the
-        // context route here, whether it came from a listing-scoped request or
-        // from the payload of a command or a narrowed account read.
         if let Some(listing) = listing.as_ref()
             && listing.key.route != *route
         {
@@ -428,15 +341,6 @@ impl MarketParticipantGateway {
         ))
     }
 
-    /// Resolves the listing one request encodes with, when it is about one.
-    ///
-    /// The resolution carries the venue's own typed identifiers together with the
-    /// status, the availability window and the generation they were published in,
-    /// so the rules a command is checked against and the identity its adapter
-    /// encodes with come from one read of the directory — a request can never be
-    /// signed under a listing whose status was read from another generation. A
-    /// request that names no listing — a route-scoped call, an account-wide read —
-    /// resolves nothing at all.
     async fn resolve_listing(
         &self,
         classified: &ClassifiedRequest,
@@ -451,7 +355,6 @@ impl MarketParticipantGateway {
             .map_err(|error| MarketParticipantError::Catalog(Box::new(error)))
     }
 
-    /// Validates one command against the listing's published status and window.
     fn require_listing_command(
         classified: &ClassifiedRequest,
         listing: &ResolvedListing,
@@ -479,11 +382,6 @@ impl MarketParticipantGateway {
         })
     }
 
-    /// Builds the execution context of one validated request.
-    ///
-    /// The venue metadata of the admission travels with the context: it is the
-    /// commit's own value, handed over rather than looked up, so an adapter reads
-    /// what the load published and no request path reaches the venue for it.
     async fn execution_context(
         &self,
         identity: &RequestIdentity,
@@ -493,10 +391,6 @@ impl MarketParticipantGateway {
     ) -> Result<ExecutionContext, MarketParticipantError> {
         let route = identity.route();
         let snapshot = self.runtime.snapshot.current();
-        // The origins of a request are its venue's connection settings: the scope's
-        // own pair where the venue publishes the scope, and the pair the venue
-        // reaches a scope it deploys through — a deployed perpetual DEX is reached
-        // through the venue that deployed it, never through an endpoint of its own.
         let endpoints = snapshot
             .endpoints(&route.venue, &route.scope)
             .ok_or(MarketParticipantError::VenueUnsupported { venue: route.venue })?;
@@ -538,15 +432,6 @@ impl MarketParticipantGateway {
     }
 }
 
-/// Attaches the credentials one request authenticates with.
-///
-/// A public wallet read and a route-level public stream never resolve a trading
-/// credential; an authenticated target resolves the credentials of its **venue**,
-/// which is the credential identity of this build. A request that
-/// authenticates against a capability the venue does not declare as needing one is
-/// refused as the capability mismatch it is — naming the exact route and capability
-/// — instead of being reported as a missing API key, which would describe a
-/// credential this route never had.
 fn authenticate(
     snapshot: &MarketParticipantNetworkSnapshot,
     context: ExecutionContext,
@@ -567,11 +452,6 @@ fn authenticate(
     Ok(context.with_authentication(auth))
 }
 
-/// Resolves the authentication of one authenticated request.
-///
-/// The credentials are read per scope: a venue that configures its markets apart
-/// signs each with its own set, and one that authenticates as a whole signs every
-/// scope — a scope it deploys most of all — with the one set it stores.
 fn credential_authentication(
     snapshot: &MarketParticipantNetworkSnapshot,
     account: &MarketParticipantAccountId,
@@ -656,8 +536,6 @@ fn credential_authentication(
                 }
             }
         }
-        // Polymarket's market data is public and this build stores no credential
-        // for it, so an authenticated request is one the venue cannot answer.
         VenueSettings::Polymarket(_) => Err(authentication_failed(
             route,
             account,
@@ -678,12 +556,6 @@ fn authentication_failed(
     }
 }
 
-/// Reports a stored credential set that cannot authenticate anything.
-///
-/// The venue is carried as the typed identity the set belongs to rather than as the
-/// configuration error's own sentence: that sentence spells the canonical identity,
-/// and interpolating it would name the venue a second time, in English, inside a
-/// message whose venue is already the catalogue's name.
 fn authentication_invalid(
     route: &VenueRoute,
     account: &MarketParticipantAccountId,
@@ -697,7 +569,6 @@ fn authentication_invalid(
     )
 }
 
-/// Returns the current wall-clock time in Unix milliseconds.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -706,11 +577,6 @@ fn now_millis() -> i64 {
         })
 }
 
-/// Projects one resolution into the reference an adapter encodes with.
-///
-/// The reference is built from the one resolution the status and the window of a
-/// command were checked against, so the identity an adapter signs with and the
-/// rules it was validated under always name the same catalog generation.
 fn listing_ref(resolved: &ResolvedListing) -> ResolvedListingRef {
     ResolvedListingRef {
         key: resolved.key.clone(),
@@ -769,17 +635,14 @@ mod tests {
         test_support::{fixture_config, test_handle},
     };
 
-    /// The fixture route: the built-in Binance spot scope.
     fn route() -> VenueRoute {
         test_support::spot_route()
     }
 
-    /// A second built-in route of the same venue, for cross-route checks.
     fn other_route() -> VenueRoute {
         test_support::route("binance", PERPETUAL_SCOPE)
     }
 
-    /// The route of the one venue this build carries an identity for and no adapter for.
     fn longbridge_route() -> VenueRoute {
         VenueRoute::new(
             VenueId::Longbridge,
@@ -787,24 +650,20 @@ mod tests {
         )
     }
 
-    /// The listing every fixture publishes on the fixture route.
     fn listing() -> VenueListingKey {
         test_support::listing_key(&route(), "BTCUSDT")
     }
 
-    /// The same native symbol as a listing of the other fixture route.
     fn other_listing() -> VenueListingKey {
         test_support::listing_key(&other_route(), "BTCUSDT")
     }
 
-    /// The address every fixture venue's published origins resolve at.
     fn fixture_origin() -> url::Url {
         "https://fixture.test"
             .parse()
             .expect("the fixture origin is a URL")
     }
 
-    /// The account the fixture authenticates as.
     fn account(route: &VenueRoute) -> AuthenticatedTarget {
         AuthenticatedTarget::new(
             market_participants_model::identifier::MarketParticipantAccountId::new("primary")
@@ -813,15 +672,6 @@ mod tests {
         )
     }
 
-    /// A configuration with one complete Binance credential set per market and the
-    /// venue's own fixture origins.
-    ///
-    /// The credentials are written into the row the fixture built, because a venue's
-    /// credentials are a field of that venue's own settings rather than a value beside
-    /// them. The private key is the Ed25519 seed the adapter parses, so the credential
-    /// resolution under test is the real one rather than a stub; the origins are the
-    /// fixture's, so an origin a context carries can only have come from the venue's
-    /// own settings.
     fn configured(fixture: &FixtureInstallation) -> Config {
         let mut config = fixture_config(fixture);
         let venue = route().venue;
@@ -842,7 +692,6 @@ mod tests {
         config
     }
 
-    /// The identifier normalization rules one built-in route declares.
     fn descriptor_rules(route: &VenueRoute) -> Vec<IdentifierNormalizationRule> {
         crate::venue::specs::all_descriptors()
             .iter()
@@ -852,15 +701,12 @@ mod tests {
             .to_vec()
     }
 
-    /// A gateway whose Binance spot route publishes one fixture listing.
     struct Fixture {
         gateway: MarketParticipantGateway,
         catalog: Arc<Catalog>,
     }
 
     impl Fixture {
-        /// Builds the fixture with one listing at the given status and the
-        /// normalization rules the route's own descriptor declares.
         async fn new(status: ListingStatus, rules: Vec<IdentifierNormalizationRule>) -> Self {
             let fixture = fixture::venues([(route().venue, FixtureAddress::at(&fixture_origin()))]);
             let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(configured(&fixture)));
@@ -878,8 +724,6 @@ mod tests {
             )
             .expect("the fixture gateway builds");
             let catalog = Arc::new(Catalog::new());
-            // The fixture loads Binance the way a load does: the venue's whole
-            // route set is planned against the registry and then committed.
             let binance: Vec<crate::routing::VenueRouteDescriptor> =
                 crate::venue::specs::all_descriptors()
                     .into_iter()
@@ -896,10 +740,6 @@ mod tests {
                 committed.supports(&route(), CapabilityId::MarketCatalog),
                 "the fixture venue is registered"
             );
-            // The two catalog routes are rebound to a fixture source, so
-            // resolution runs through the real connector path while the venue
-            // behind it is the fixture. The second route exists so a listing of
-            // another route is a listing the directory really holds.
             let source_id = CatalogSourceId::new("gateway-fixture")
                 .expect("the fixture source id is canonical");
             let entry = test_support::with_status(
@@ -951,8 +791,6 @@ mod tests {
                     &test_support::requirements(&[route(), other_route()]),
                 )
                 .expect("the fixture catalog routes publish");
-            // The fixture loads the two routes the way a load does: after the
-            // registration, each catalog route is fetched and published.
             for published in [route(), other_route()] {
                 catalog
                     .refresh_for_test(&published)
@@ -962,17 +800,14 @@ mod tests {
             Self { gateway, catalog }
         }
 
-        /// Builds the fixture with the route's own declared rules.
         async fn with_status(status: ListingStatus) -> Self {
             Self::new(status, descriptor_rules(&route())).await
         }
 
-        /// The request context of one capability of the fixture route.
         fn context(&self, capability: CapabilityId) -> RequestIdentity {
             RequestIdentity::new(route(), capability)
         }
 
-        /// Validates one request against the fixture route's capability.
         async fn prepare(
             &self,
             request: ProtocolRequest,
@@ -981,7 +816,6 @@ mod tests {
             self.prepare_with(request, self.context(capability)).await
         }
 
-        /// Validates one request against an explicit context.
         async fn prepare_with(
             &self,
             request: ProtocolRequest,
@@ -999,14 +833,12 @@ mod tests {
                 .map(|(_, _, prepared)| prepared)
         }
 
-        /// One market-catalog request of the fixture route.
         fn markets(&self, route: &VenueRoute) -> ProtocolRequest {
             ProtocolRequest::FetchMarkets(MarketCatalogQuery {
                 route: route.clone(),
             })
         }
 
-        /// One order-book request about one listing.
         fn order_book(&self, listing: &VenueListingKey) -> ProtocolRequest {
             ProtocolRequest::FetchOrderBook(OrderBookQuery {
                 listing: listing.clone(),
@@ -1014,7 +846,6 @@ mod tests {
             })
         }
 
-        /// One place-order command about one listing as one account.
         fn place_order(&self, listing: &VenueListingKey, route: &VenueRoute) -> ProtocolRequest {
             ProtocolRequest::PlaceOrder(PlaceOrderCommand {
                 target: account(route),
@@ -1033,7 +864,6 @@ mod tests {
             })
         }
 
-        /// One active-order read narrowed to one listing.
         fn active_orders_of(&self, listing: &VenueListingKey) -> ProtocolRequest {
             ProtocolRequest::FetchActiveOrders(AuthenticatedQuery::for_listing(
                 account(&route()),
@@ -1041,14 +871,11 @@ mod tests {
             ))
         }
 
-        /// One account-wide active-order read.
         fn active_orders(&self) -> ProtocolRequest {
             ProtocolRequest::FetchActiveOrders(AuthenticatedQuery::account_wide(account(&route())))
         }
     }
 
-    /// A capability that is not the request's own is refused before anything is
-    /// resolved, and the error names both capabilities.
     #[tokio::test]
     async fn a_capability_that_is_not_the_requests_own_is_refused() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;
@@ -1066,8 +893,6 @@ mod tests {
         );
     }
 
-    /// A request that names another route than its target is refused, and the
-    /// error names both routes.
     #[tokio::test]
     async fn a_request_of_another_route_than_its_target_is_refused() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;
@@ -1085,8 +910,6 @@ mod tests {
         );
     }
 
-    /// A halted listing refuses a new order, and the error carries the listing,
-    /// the status and the command.
     #[tokio::test]
     async fn a_halted_listing_refuses_a_new_order() {
         let fixture = Fixture::with_status(ListingStatus::Halted).await;
@@ -1109,9 +932,6 @@ mod tests {
         );
     }
 
-    /// A command the listing's status permits reaches the adapter with the
-    /// listing the gateway resolved, and a command naming a listing of another
-    /// route is refused before anything is signed.
     #[tokio::test]
     async fn a_command_carries_the_listing_the_gateway_resolved() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;
@@ -1129,8 +949,6 @@ mod tests {
             "a command reaches the adapter with its resolved listing"
         );
 
-        // The same command addressed to a listing of another route — under this
-        // route's own target — must not be sent as if this route published it.
         let error = fixture
             .prepare(
                 fixture.place_order(&other_listing(), &route()),
@@ -1148,8 +966,6 @@ mod tests {
         );
     }
 
-    /// A read narrowed to one listing carries that listing to the adapter, and an
-    /// account-wide read carries none: the narrowing is never dropped.
     #[tokio::test]
     async fn a_narrowed_account_read_keeps_its_listing() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;
@@ -1175,13 +991,6 @@ mod tests {
         );
     }
 
-    /// A request that authenticates against a capability the route does not declare is
-    /// refused as that capability, naming the exact route and capability instead of a
-    /// missing API key.
-    ///
-    /// The fixture route is the built-in Binance spot route, which publishes no position
-    /// read: the refusal is `prepare`'s answer to a descriptor that lacks the capability,
-    /// not the credential lookup's answer to a set that is absent.
     #[tokio::test]
     async fn an_authenticated_request_of_a_capability_the_route_lacks_names_it() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;
@@ -1204,15 +1013,6 @@ mod tests {
         );
     }
 
-    /// A Longbridge route resolves its own credential set, and each of the three
-    /// states the settings can be in answers its own way.
-    ///
-    /// The venue authenticates by an app key, an app secret and an access token, so a
-    /// complete set becomes the authentication a client can present; an empty one is
-    /// the missing API key; and a half-filled one is the incomplete credential the
-    /// operator has to finish. The stored set is asserted complete through the
-    /// settings' own validation in the first case, so that answer cannot be read as
-    /// "nothing was configured".
     #[test]
     fn a_longbridge_route_answers_its_own_credential_states() {
         let route = longbridge_route();
@@ -1271,7 +1071,6 @@ mod tests {
         );
     }
 
-    /// One Longbridge configuration whose three values are `values`.
     fn longbridge_config(values: Option<(&str, &str, &str)>) -> Config {
         let mut config = Config::default();
         let Some(VenueSettings::Longbridge(settings)) = config.venues.get_mut(&VenueId::Longbridge)
@@ -1288,12 +1087,6 @@ mod tests {
         config
     }
 
-    /// The adapter registry answers the venue's route with the venue's own adapter.
-    ///
-    /// A registered adapter is what decides whether a scope is served at all, so the
-    /// venue's presence in the router is what every later lookup of its scope rests
-    /// on: a router without it would answer the venue's routes as unsupported however
-    /// well its loader registered them.
     #[test]
     fn the_router_registers_the_longbridge_adapter() {
         let router = MarketParticipantGateway::adapter_router(
@@ -1321,9 +1114,6 @@ mod tests {
         );
     }
 
-    /// Every request variant that is about one listing — each command and each
-    /// account read that can be narrowed to a listing — is classified with the
-    /// listing it names, whichever target variant it is classified into.
     #[test]
     fn every_command_and_every_narrowed_account_read_names_its_listing() {
         let target = account(&route());
@@ -1392,8 +1182,6 @@ mod tests {
         }
     }
 
-    /// A listing-scoped read and a settings read of one published listing reach
-    /// the adapter with the listing the gateway resolved.
     #[tokio::test]
     async fn a_listing_scoped_read_and_a_settings_read_reach_the_adapter_with_their_listing() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;
@@ -1425,8 +1213,6 @@ mod tests {
         );
     }
 
-    /// A listing the route never published is reported by the directory instead
-    /// of being sent as an empty identity.
     #[tokio::test]
     async fn a_listing_the_route_never_published_is_refused() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;
@@ -1442,8 +1228,6 @@ mod tests {
         );
     }
 
-    /// The execution context of a request names the route and capability it was
-    /// validated under, and the origins its venue configuration gives that scope.
     #[tokio::test]
     async fn an_execution_context_names_the_route_and_the_venues_origins() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;
@@ -1478,9 +1262,6 @@ mod tests {
         );
     }
 
-    /// A route folds its own native symbols with the rule its descriptor
-    /// declares: the Binance scope resolves a lowercase spelling end to end, the
-    /// OKX scopes declare the same fold, and a HIP-3 coin stays exact.
     #[tokio::test]
     async fn the_routes_own_rules_decide_how_a_native_symbol_is_folded() {
         let fixture = Fixture::with_status(ListingStatus::Trading).await;

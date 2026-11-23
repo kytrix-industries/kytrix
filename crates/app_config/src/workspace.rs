@@ -1,21 +1,3 @@
-//! Workspace layout persistence.
-//!
-//! A workspace is one named pane layout: which panes exist, how they are split,
-//! and which widget each pane shows together with the config envelope it was
-//! created from. The whole set is persisted so that restarting the application
-//! restores the workspaces the user left behind.
-//!
-//! A workspace's name is its identity. There is no separate ID, so renaming a
-//! workspace is the same operation as changing which workspace
-//! [`WorkspacesConfig::active`] points at, and no other persisted value can go
-//! stale against it.
-//!
-//! Everything a saved file could get wrong is rejected while decoding rather
-//! than repaired afterwards, so a layout that decodes is one the runtime can
-//! build. The cross-field rules — a duplicate name, an active workspace that is
-//! not in the list — live in [`WorkspacesConfig`]'s `Deserialize`; the rest are
-//! field-level.
-
 use ahash::AHashSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use smol_str::SmolStr;
@@ -23,25 +5,19 @@ use thiserror::Error;
 
 use crate::widget::VersionedWidgetConfig;
 
-/// One workspace: its name and the pane layout that belongs to it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
-    /// A trimmed, non-empty name. Decoding rejects anything else, so a persisted
-    /// name can be compared with a user-typed one directly.
     #[serde(deserialize_with = "deserialize_workspace_name")]
     pub name: SmolStr,
     pub layout: WorkspaceLayout,
 }
 
-/// The pane topology of one workspace.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum WorkspaceLayout {
     #[serde(rename = "split")]
     Split {
         orientation: WorkspaceOrientation,
-        /// The head child's share of the content box, once the split bar is
-        /// removed. Decoding rejects anything outside `[0.0, 1.0]`.
         #[serde(
             serialize_with = "serialize_head_fraction",
             deserialize_with = "deserialize_head_fraction"
@@ -51,27 +27,12 @@ pub enum WorkspaceLayout {
         tail: Box<Self>,
     },
     #[serde(rename = "pane")]
-    Pane {
-        /// The widget this pane shows.
-        ///
-        /// A pane always shows one: the user's choice, or [`DEFAULT_WIDGET_ID`] when
-        /// they have not made one yet.
-        widget: WorkspaceWidget,
-    },
+    Pane { widget: WorkspaceWidget },
 }
 
-/// The widget a pane shows when the user has chosen none.
-///
-/// Every pane hosts a widget, so a new pane — the one a workspace starts as and the
-/// ones a split adds — shows this one rather than nothing. The ID belongs to the
-/// empty widget, which is the widget that draws the hint pointing at the pane's own
-/// picker; this crate cannot depend on the crate that owns it, so the two are kept
-/// on the same widget by a test in the registry's catalogue.
 pub const DEFAULT_WIDGET_ID: &str = "kytrix.empty";
 
 impl WorkspaceLayout {
-    /// The starting layout of a new workspace: one pane showing the widget a pane
-    /// falls back to.
     pub fn single_pane() -> Self {
         Self::Pane {
             widget: WorkspaceWidget {
@@ -82,7 +43,6 @@ impl WorkspaceLayout {
     }
 }
 
-/// Which way a split lays its two children out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceOrientation {
     #[serde(rename = "horizontal")]
@@ -91,31 +51,20 @@ pub enum WorkspaceOrientation {
     Vertical,
 }
 
-/// The widget one pane shows, and the config it was created from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceWidget {
-    /// A persisted widget ID. Whether it names a registered widget is the widget
-    /// registry's question, asked when the layout is restored; this crate only
-    /// rejects an empty one.
     #[serde(deserialize_with = "deserialize_widget_id")]
     pub id: SmolStr,
-    /// The envelope the widget was created with; `None` means its config type's
-    /// default value.
     #[serde(default)]
     pub config: Option<VersionedWidgetConfig>,
 }
 
-/// Every workspace of this installation, and the active one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct WorkspacesConfig {
-    /// In the order the workspace sidebar lists them.
     pub entries: Vec<WorkspaceConfig>,
-    /// The active workspace's name; `None` exactly when `entries` is empty.
     pub active: Option<SmolStr>,
 }
 
-/// What `Deserialize` decodes into, so the cross-field rules below can run on a
-/// value that still has every field.
 #[derive(Deserialize)]
 struct WorkspacesConfigFields {
     #[serde(default)]
@@ -138,7 +87,6 @@ impl<'de> Deserialize<'de> for WorkspacesConfig {
     }
 }
 
-/// The reason a persisted workspace list is not usable.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 enum WorkspacesConfigError {
     #[error("an empty workspace list must not name an active workspace")]
@@ -184,11 +132,6 @@ fn validate_workspaces(
     Ok(())
 }
 
-/// The reason a workspace cannot be given a name.
-///
-/// [`validate_workspace_name`] answers for one name on its own and can only
-/// produce [`WorkspaceNameError::Empty`]; whether a name is already taken is a
-/// relation between workspaces, so only the workspace list can answer that.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum WorkspaceNameError {
     #[error("a workspace name must not be empty")]
@@ -197,10 +140,6 @@ pub enum WorkspaceNameError {
     Taken,
 }
 
-/// Trims a candidate name and rejects it when nothing is left.
-///
-/// The alert that asks for a name and the workspace list that stores it both go
-/// through this, so the rule exists once.
 pub fn validate_workspace_name(name: &str) -> Result<SmolStr, WorkspaceNameError> {
     let name = name.trim();
     if name.is_empty() {
@@ -239,8 +178,6 @@ where
     Ok(fraction)
 }
 
-/// Writes the fraction with the three decimals the runtime keeps, so a saved
-/// file reads as `0.35` instead of as the `f64` widening of `0.35_f32`.
 fn serialize_head_fraction<S>(fraction: &f32, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -279,7 +216,6 @@ mod tests {
     use super::*;
     use crate::widget::{WidgetConfig, WidgetConfigSchemaVersion, decode_or_default};
 
-    /// Stands in for a widget's own config type.
     #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
     struct TestConfig {
         interval: u32,
@@ -300,14 +236,10 @@ mod tests {
         }
     }
 
-    /// The pane a workspace starts as: no widget chosen, so the one a pane falls
-    /// back to.
     fn default_pane() -> WorkspaceLayout {
         WorkspaceLayout::single_pane()
     }
 
-    /// A workspace with a nested split, an asymmetric fraction, a configured
-    /// widget and a pane nobody has chosen one for.
     fn saved_workspaces() -> WorkspacesConfig {
         WorkspacesConfig {
             entries: vec![
@@ -390,8 +322,6 @@ mod tests {
         assert_eq!(json["active"], "Workspace 2");
     }
 
-    /// The pane a workspace starts as, as the wire shape spells it: every pane names
-    /// a widget, and the one no user has chosen is the widget a pane falls back to.
     fn default_pane_json() -> Value {
         json!({ "kind": "pane", "widget": { "id": DEFAULT_WIDGET_ID, "config": null } })
     }
@@ -468,13 +398,7 @@ mod tests {
 
     #[test]
     fn a_split_fraction_outside_zero_to_one_should_be_rejected() {
-        for fraction in [
-            json!(-0.1),
-            json!(1.1),
-            // Beyond the range an `f32` can hold, so it decodes as an infinity.
-            json!(1.0e40),
-            json!(null),
-        ] {
+        for fraction in [json!(-0.1), json!(1.1), json!(1.0e40), json!(null)] {
             let saved = json!({
                 "entries": [{
                     "name": "Workspace 1",
@@ -496,7 +420,6 @@ mod tests {
         }
     }
 
-    /// JSON cannot carry a NaN, so the rule is checked where it is written.
     #[test]
     fn a_nan_split_fraction_should_be_rejected() {
         let error = deserialize_head_fraction(F32Deserializer::<ValueError>::new(f32::NAN))
@@ -545,8 +468,6 @@ mod tests {
         assert!(serde_json::from_value::<WorkspacesConfig>(saved).is_err());
     }
 
-    /// A pane without a widget is not a pane this build can draw, so a stored one is
-    /// refused like any other unusable layout.
     #[test]
     fn a_pane_without_a_widget_should_be_rejected() {
         for missing in [json!(null), json!("kytrix.empty")] {
@@ -565,9 +486,6 @@ mod tests {
         }
     }
 
-    /// A workspace that has not been chosen for starts as one pane showing the widget
-    /// a pane falls back to, and the layout it starts as is the one a stored file
-    /// spells.
     #[test]
     fn a_new_workspace_should_start_as_a_pane_showing_the_default_widget() {
         let layout = WorkspaceLayout::single_pane();
@@ -673,11 +591,6 @@ mod tests {
         );
     }
 
-    /// Stands in for a widget whose config carries the selected listing, which
-    /// is the shape every listing-scoped widget moved to. The listing is a
-    /// required field: a payload that names a route and an instrument instead,
-    /// or a selection without its listing key, cannot decode and leaves the pane
-    /// with the default selection.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     struct ListingConfig {
         selection: InstrumentSelection,
@@ -711,7 +624,6 @@ mod tests {
         }
     }
 
-    /// The payload a pane wrote before the listing migration.
     fn stored_route_and_instrument_payload() -> &'static str {
         concat!(
             r#"{"route":{"venue":"binance","scope":"spot"},"#,
@@ -719,7 +631,6 @@ mod tests {
         )
     }
 
-    /// The envelope a pane wrote before the listing migration.
     fn stored_route_and_instrument_config() -> VersionedWidgetConfig {
         serde_json::from_value(json!({
             "schema_version": 1,

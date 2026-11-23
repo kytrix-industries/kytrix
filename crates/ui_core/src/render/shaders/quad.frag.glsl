@@ -18,14 +18,11 @@ void main() {
 
     vec4 color;
     if (kind == KYTRIX_KIND_GLYPH) {
-        // 字形图集恒 1 层（contract §8）：layer 硬编码 0。
         float coverage = texture(glyph_atlas, vec3(v_uv, 0.0)).r;
         color = p.color0 * coverage;
     } else if (kind == KYTRIX_KIND_IMAGE) {
-        // 图片图集是 texture array：`params1.y` 是图集页（= 层号）索引（整数编码进 f32）。
         color = texture(image_atlas, vec3(v_uv, float(uint(p.params1.y)))) * p.color0;
     } else if (kind == KYTRIX_KIND_SHADOW) {
-        // 可分离 2D 高斯（σ = blur / 2）：矩形部分是精确解，角部按圆角半径混合。
         color = p.color0 * analytic_shadow(v_local_px, half_size, p.corner_radius, p.params0.y);
     } else {
         float d_outer = sd_rounded_rect(v_local_px, half_size, p.corner_radius);

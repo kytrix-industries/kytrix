@@ -1,11 +1,3 @@
-//! The poll loop, driven through the framework's own runtime.
-//!
-//! A test here owns a real [`WidgetRuntime`] and a real Tokio clock, because what
-//! is being tested is the loop's *timing*: that the first fetch does not wait out
-//! an interval, that a manual refresh resets the schedule rather than racing it,
-//! and that a failure stops the schedule instead of retrying it. A fake source is
-//! the only thing that is replaced.
-
 use std::{sync::Arc, time::Duration};
 
 use smol_str::SmolStr;
@@ -22,13 +14,6 @@ use super::{
 };
 use crate::model::CryptocurrencyEtfSnapshot;
 
-/// The handle of the runtime this test runs on.
-///
-/// A test drives its subject on its own runtime rather than on a shared one. The
-/// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-/// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-/// whose clock was paused. Work started on another runtime keeps waiting on real
-/// time while the test advances a clock it never reads.
 #[allow(
     clippy::disallowed_methods,
     reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -57,7 +42,6 @@ async fn receive_status(
     receive_status_for(reliable, &account()).await
 }
 
-/// Reads one status, asserting it belongs to `key`.
 async fn receive_status_for(
     reliable: &mut ReliableStream<CryptocurrencyEtfProtocol>,
     key: &CryptocurrencyEtfStreamKey,
@@ -94,8 +78,6 @@ async fn receive_snapshot(
     snapshot.clone()
 }
 
-/// The flow of the one day the fake's snapshot carries, which is how two answers
-/// are told apart.
 fn flow(snapshot: &CryptocurrencyEtfSnapshot) -> f64 {
     snapshot
         .dataset(crate::model::CryptocurrencyEtfAsset::Btc)
@@ -105,8 +87,6 @@ fn flow(snapshot: &CryptocurrencyEtfSnapshot) -> f64 {
         .total_flow
 }
 
-/// Starts a runtime watching `account()` and consumes the four messages one
-/// successful load publishes.
 async fn load_and_settle(
     runtime: &WidgetRuntime<CryptocurrencyEtfProtocol>,
     reliable: &mut ReliableStream<CryptocurrencyEtfProtocol>,
@@ -235,8 +215,6 @@ async fn an_unchanged_answer_should_not_bump_the_revision() {
     let mut latest = runtime.latest_stream();
     load_and_settle(&runtime, &mut reliable, &mut latest).await;
 
-    // The same answer again: the service answered, but nothing about the data
-    // changed, so there is nothing to draw and nothing to publish.
     advance(REFRESH_INTERVAL).await;
     assert!(matches!(
         receive_status(&mut reliable).await,
@@ -263,9 +241,6 @@ async fn a_manual_refresh_should_fetch_again_and_reset_the_schedule() {
     let mut latest = runtime.latest_stream();
     load_and_settle(&runtime, &mut reliable, &mut latest).await;
 
-    // A manual refresh brings the next automatic fetch forward: it fetches now
-    // and schedules the interval from now, rather than from where the old
-    // schedule had got to.
     advance(Duration::from_secs(60)).await;
     let response = runtime
         .client()
@@ -295,7 +270,6 @@ async fn a_manual_refresh_should_fetch_again_and_reset_the_schedule() {
     }
     assert_eq!(source.fetch_count(), 2);
 
-    // Nothing is due until a whole interval after the refresh.
     advance(REFRESH_INTERVAL - Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
     assert_eq!(source.fetch_count(), 2);
@@ -303,10 +277,6 @@ async fn a_manual_refresh_should_fetch_again_and_reset_the_schedule() {
     runtime.shutdown().await;
 }
 
-/// A failed fetch leaves the loop alive, off the clock, and recoverable.
-///
-/// It also leaves the snapshot the pane is still reading where it was: a failed
-/// fetch publishes no snapshot, and it does not retract the last good one.
 #[tokio::test(start_paused = true)]
 async fn a_failed_fetch_should_be_reported_and_stop_the_schedule() {
     let source = FakeSource::new([
@@ -348,19 +318,11 @@ async fn a_failed_fetch_should_be_reported_and_stop_the_schedule() {
         "a failure does not retract what is shown"
     );
 
-    // The failure took the loop off the clock: it is alive and waiting, so two
-    // intervals go by without a single fetch.
-    //
-    // The intervals are advanced one at a time on purpose. A single long advance
-    // does not fire the timers a cycle arms while it runs, so a loop that put a
-    // refused fetch straight back on the schedule would still look idle to a test
-    // that skipped three intervals in one step.
     for _ in 0..2 {
         advance(REFRESH_INTERVAL).await;
         assert_eq!(source.fetch_count(), 2, "the loop does not retry by itself");
     }
 
-    // The recovery is a refresh on the same account rather than a new one.
     let response = runtime
         .client()
         .call(CryptocurrencyEtfRequest::Refresh)
@@ -440,8 +402,6 @@ async fn another_account_should_replace_the_stream() {
         CryptocurrencyEtfResponse::StreamStarted
     );
 
-    // The replacement announces itself from the beginning, and every message it
-    // publishes says which account it is about.
     assert!(matches!(
         receive_status_for(&mut reliable, &second).await,
         CryptocurrencyEtfStatus::Connecting
@@ -507,8 +467,6 @@ async fn a_refresh_while_one_is_in_flight_should_be_refused() {
         CryptocurrencyEtfResponse::RefreshQueued
     );
 
-    // The one that was queued is the fetch in flight, so the gate refuses a second
-    // click rather than piling it up behind the first.
     let error = runtime
         .client()
         .call(CryptocurrencyEtfRequest::Refresh)

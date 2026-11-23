@@ -1,7 +1,3 @@
-//! Linux 平台层。仅 Wayland（D25 / I16）。
-//!
-//! 模块根只做声明（lint `definition_in_module_root`）；`run` 是 `Application::run` 的平台入口。
-
 pub(crate) mod a11y;
 pub(crate) mod clipboard;
 pub(crate) mod cursor;

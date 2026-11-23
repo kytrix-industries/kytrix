@@ -1,33 +1,3 @@
-//! The settings page: what the application is configured by, drawn in the page area of the main
-//! window in place of the workspace.
-//!
-//! The page owns what outlives a frame: the page that is drawn and whether it is drawn in a scroll
-//! region. Each page is native UI — its rows, cards and controls are written where the page is
-//! written — and this module is the frame around them: the sidebar, the search, the routing between
-//! pages, and the one place a failed write is reported.
-//!
-//! The page has the gallery's shape: a title and the search field in its header, and the settings
-//! menu on the left with the detail page behind the selected entry on the right. There is no
-//! footer: a control writes the change it makes at once, so there is nothing to confirm and nothing
-//! to cancel, and the page is left through the workspace rows alone.
-//!
-//! A control writes the settings rather than a copy of them, through the session every view of this
-//! page shares — see [`SettingsHost::write`]. A write that cannot be stored leaves the settings as
-//! they were and is reported over the page, so what the user had is still there to try again with.
-//!
-//! # What follows the settings
-//!
-//! The page projects the appearance it owns: [`Self::sync`] resolves the stored preference against
-//! the system and writes the theme, because a control that changed the preference has to see the
-//! change on the frame that follows the write. The language is the composition root's projection
-//! (it keeps the translation context and the language signal in step, the way it does for every
-//! widget); the page follows the signal and rebuilds its text when it moves.
-//!
-//! A page is native UI, so a page's text is built when the page is: a language that moved on is
-//! what rebuilds it (the same rule `crates/widgets/AGENTS.md` §15 states for static text). The
-//! sidebar and the page behind it are rebuilt together, because a row and the page it names are one
-//! thing.
-
 use std::{cell::RefCell, rc::Rc};
 
 use base_ui::{
@@ -69,75 +39,41 @@ use crate::{
     search::SearchFilter,
 };
 
-/// The width of the field the settings are searched with.
 const SEARCH_WIDTH: f32 = 240.0;
 
-/// The width of the sidebar column.
 const SIDEBAR_WIDTH: f32 = 232.0;
 
-/// The height of one sidebar row.
 const SIDEBAR_ROW_HEIGHT: f32 = 30.0;
 
-/// The whole of the settings, as the main window's settings page.
 pub struct SettingsPage {
-    /// The collaborators every control writes through.
     host: SettingsHost,
-    /// The window the page lives in.
     window: WindowId,
-    /// The unique key prefix of this page instance (two panes have two).
     key: SmolStr,
-    /// The node every part of the page is built under.
     root: NodeId,
-    /// The column the sidebar is drawn in.
     sidebar_column: NodeId,
-    /// The node the current page is built into.
     body: NodeId,
-    /// The current page's id.
     current: SmolStr,
-    /// The current page, as every sidebar row reads it for its selected state.
     current_signal: Signal<SmolStr>,
-    /// The page a sidebar row asked for, waiting for the frame that moves to it.
     selection: Signal<Option<SmolStr>>,
-    /// The query typed into the search field.
     query: SmolStr,
-    /// What the query admits.
     filter: SearchFilter,
-    /// The language the text this page holds was built in.
     language: LanguageCode,
-    /// The query the sidebar was last built for.
     sidebar_query: Option<SmolStr>,
-    /// The rows of the sidebar, in the order they are drawn.
     sidebar_entries: Rc<RefCell<Vec<SidebarEntry>>>,
-    /// The list the sidebar rows are drawn by, when the sidebar is drawn at all.
     sidebar: Option<List>,
-    /// The actions one sidebar row dispatches when it is activated.
     sidebar_actions: Vec<Action>,
-    /// The page behind the current entry.
     page: Option<Box<dyn PageView>>,
-    /// The scroll region the current page lives in, when it scrolls.
     page_scroll: Option<(ScrollHandle, NodeId, ScrollBar)>,
-    /// The search field and the state it edits.
     search_input: Option<InputNode>,
     search_state: Option<Signal<InputState>>,
-    /// The spec the search field was built with, which is what a programmatic write needs.
     #[cfg(test)]
     search_spec: std::sync::Arc<InputSpec>,
-    /// The dialogs this page opened and has not released yet.
     alerts: Vec<Dialog>,
-    /// How many reports this page has opened, so each one gets a fresh key.
     alert_count: u64,
-    /// Whether the operating system reports a dark appearance.
     system_dark: bool,
 }
 
 impl SettingsPage {
-    /// Builds the settings page under `parent` and opens the page the settings start on.
-    ///
-    /// `key` is the unique prefix of this page instance: two settings pages in one application (two
-    /// panes) need two, because a kit key is an application-level action identity.
-    ///
-    /// # Errors
-    /// Engine node-building errors, or a failure from a kit component the page builds.
     pub fn mount(
         host: SettingsHost,
         key: &str,
@@ -245,8 +181,6 @@ impl SettingsPage {
             )
         };
         search_input.install(app);
-        // The field is cleared the way the old search field was: the clear control is the
-        // field's own, and clearing it is what brings the whole sidebar back.
         search_input.set_clearable(app, true);
 
         let body_row = layout::build_node(app, window, root, |tree, parent| {
@@ -342,19 +276,16 @@ impl SettingsPage {
         Ok(page)
     }
 
-    /// The page currently drawn, for the shell and for the tests that assert where routing left it.
     #[must_use]
     pub fn current_page(&self) -> &SmolStr {
         &self.current
     }
 
-    /// The query the page is answering, for the tests of the search.
     #[must_use]
     pub fn query(&self) -> &SmolStr {
         &self.query
     }
 
-    /// Types query into the search field, for the tests of what a query answers.
     #[cfg(test)]
     pub(crate) fn set_query(&mut self, app: &mut App, query: &str) {
         let Some(state) = self.search_state else {
@@ -366,24 +297,17 @@ impl SettingsPage {
         });
     }
 
-    /// Says why the last write could not be stored, if one is waiting.
-    ///
-    /// The page reports its own failures; the shell asks for one only when it takes the page away
-    /// before a frame reported it, so the reason is carried to what is drawn next rather than
-    /// dropped with the page. The reason is taken out of the session, so it is reported once.
     pub fn take_write_failure(&mut self) -> Option<SmolStr> {
         self.host
             .take_failure()
             .map(|error| SmolStr::new(error.to_string()))
     }
 
-    /// What the query admits, for the tests of the search's answer.
     #[cfg(test)]
     pub(crate) fn filter_for_test(&self) -> &SearchFilter {
         &self.filter
     }
 
-    /// The rows the sidebar is drawing, for the tests of its labels.
     #[cfg(test)]
     pub(crate) fn sidebar_labels(&self) -> Vec<SmolStr> {
         self.sidebar_entries
@@ -393,7 +317,6 @@ impl SettingsPage {
             .collect()
     }
 
-    /// Registers the actions one sidebar row dispatches.
     fn register_sidebar(&mut self, app: &mut App) -> Result<(), EngineError> {
         for page in registry::pages() {
             let id = page.id();
@@ -407,12 +330,10 @@ impl SettingsPage {
         Ok(())
     }
 
-    /// The action one sidebar row dispatches.
     fn sidebar_action(&self, page: &str) -> Action {
         Action::Custom(format_smolstr!("{}.sidebar.{page}", self.key))
     }
 
-    /// Builds the sidebar rows the current filter admits, replacing the ones drawn before.
     fn rebuild_sidebar(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         if let Some(list) = self.sidebar.take() {
             list.release(app);
@@ -472,7 +393,6 @@ impl SettingsPage {
         Ok(())
     }
 
-    /// Releases the page that is drawn and builds the one the settings are on.
     fn open_page(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         if let Some(mut page) = self.page.take() {
             page.release(app);
@@ -531,12 +451,10 @@ impl SettingsPage {
         Ok(())
     }
 
-    /// The page the ids name, when the settings are on one.
     fn page(&self) -> Option<PageId> {
         registry::page(self.current.as_ref())
     }
 
-    /// Moves the page to one entry of the sidebar.
     fn move_to(&mut self, id: SmolStr, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         if self.current == id {
             return Ok(());
@@ -549,7 +467,6 @@ impl SettingsPage {
         self.open_page(app, window)
     }
 
-    /// Answers what the search field holds.
     fn adopt_query(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let query = self
             .search_state
@@ -578,7 +495,6 @@ impl SettingsPage {
         self.open_page(app, window)
     }
 
-    /// The language the interface is drawn in, as the settings name it.
     fn adopt_language(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let language = self.host.language(app);
         if language == self.language {
@@ -596,11 +512,6 @@ impl SettingsPage {
         self.open_page(app, window)
     }
 
-    /// Projects the appearance the settings name, so a control that changed it sees the change on
-    /// the frame that follows the write.
-    ///
-    /// The language is the composition root's projection: it moves the translation context and the
-    /// language signal together, and the page follows the signal in [Self::adopt_language].
     fn project(&mut self, app: &mut App) {
         let preference = self.host.config(app, |config| config.appearance);
         let resolved = appearance::appearance_of(preference, self.system_dark);
@@ -609,7 +520,6 @@ impl SettingsPage {
         }
     }
 
-    /// Reports the last write that could not be stored, if one is waiting.
     fn report_write_failure(&mut self, app: &mut App) {
         let Some(error) = self.host.take_failure() else {
             return;
@@ -640,11 +550,6 @@ impl SettingsPage {
         self.alerts.push(dialog);
     }
 
-    /// Drives the reports that are open and releases the ones that closed.
-    ///
-    /// A dialog is a kit component: it owns a fade-in / fade-out and the focus trap, so it has to
-    /// be synchronised on every frame the way the page's other controls are. A dialog that is not
-    /// synchronised never finishes closing, which would leave its modal scope over the page.
     fn sync_alerts(&mut self, app: &mut App) {
         self.alerts.retain(|dialog| {
             if dialog.is_open(app) {
@@ -659,10 +564,6 @@ impl SettingsPage {
         });
     }
 
-    /// Runs the per-frame half of the page: what the settings moved, and what the page draws.
-    ///
-    /// # Errors
-    /// Engine node-building errors from a rebuild, or a kit component that refused a write.
     pub fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         if app.window(self.window).is_none() {
             return Ok(());
@@ -702,7 +603,6 @@ impl SettingsPage {
         Ok(())
     }
 
-    /// Offers one platform event to the controls of the page; returns whether one consumed it.
     pub fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
         if let Event::AppearanceChanged { dark } = event {
             self.system_dark = *dark;
@@ -717,7 +617,6 @@ impl SettingsPage {
         consumed
     }
 
-    /// Releases every component the page owns and removes the nodes it built.
     pub fn release(&mut self, app: &mut App) {
         if let Some(mut page) = self.page.take() {
             page.release(app);
@@ -742,8 +641,6 @@ impl SettingsPage {
         }
     }
 
-    /// Removes every child of `parent`, which is how a rebuilt region is cleaned before it is built
-    /// again.
     fn remove_children(&self, app: &mut App, parent: NodeId) {
         let children = app
             .window(self.window)
@@ -758,20 +655,14 @@ impl SettingsPage {
     }
 }
 
-/// One row of the settings sidebar.
 #[derive(Clone, Debug)]
 pub(crate) enum SidebarEntry {
-    /// A group's name over the pages that follow it: text, because a group is not something a user
-    /// opens.
     Heading(SmolStr),
-    /// A page, which is the one kind of row that opens something.
     Page { id: SmolStr, label: SmolStr },
-    /// A divider between one part of the sidebar and the next.
     Separator,
 }
 
 impl SidebarEntry {
-    /// The text this row draws.
     #[cfg(test)]
     fn label(&self) -> SmolStr {
         match self {
@@ -781,7 +672,6 @@ impl SidebarEntry {
         }
     }
 
-    /// The page this row opens, or `None` for anything else.
     fn page_id(&self) -> Option<SmolStr> {
         match self {
             Self::Heading(_) | Self::Separator => None,
@@ -790,7 +680,6 @@ impl SidebarEntry {
     }
 }
 
-/// Builds one sidebar row inside the virtual list that draws them.
 fn build_sidebar_row(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -890,11 +779,6 @@ fn build_sidebar_row(
     Ok(())
 }
 
-/// The sidebar as it is drawn, holding only what the filter leaves reachable.
-///
-/// A page is reached by its label or by a setting on it — see [`registry::page_is_reachable`] — and
-/// a group with none of its pages left is not drawn at all, which is what keeps an unmatched part
-/// of the settings out of the way instead of dimming it.
 fn sidebar_entries(filter: &SearchFilter, translate: &Translate) -> Vec<SidebarEntry> {
     let mut entries = Vec::new();
 

@@ -1,15 +1,5 @@
-//! Where a download streams before it is renamed into place.
-//!
-//! The partial file sits beside its destination: the download manager, the
-//! transfer and the views that remove an unfinished download all have to agree
-//! on that one path, so it is named here once.
-
 use std::path::{Path, PathBuf};
 
-/// The partial file a download to `destination` streams into.
-///
-/// The name is the destination's own with `.part` appended, in the same
-/// directory. A destination with no file name has no partial file beside it.
 pub fn path(destination: &Path) -> Option<PathBuf> {
     let mut file_name = destination.file_name()?.to_os_string();
     file_name.push(".part");

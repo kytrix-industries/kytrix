@@ -1,12 +1,3 @@
-//! Contract construction primitives and the canonical instrument identity.
-//!
-//! These are the economic terms every product family shares: contract size and
-//! settlement primitives, delivery, expiry, strike and exercise, plus the
-//! versioned [`InstrumentId`], its lineage edges and the [`StockSplit`]
-//! corporate action. Terms are immutable: changing any of them creates a new
-//! identity instead of editing an existing one, and every term type can only be
-//! built through its validating constructor.
-
 use ahash::AHashSet;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use smol_str::SmolStr;
@@ -25,7 +16,6 @@ use crate::{
 };
 crate::identifier::identity_type!(InstrumentId, InstrumentIdentity);
 
-/// A contract size expressed either in asset quantity or per index point.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "kind", content = "unit")]
 pub enum ContractUnit {
@@ -48,13 +38,11 @@ pub enum ContractUnit {
 }
 
 impl ContractUnit {
-    /// Builds an asset-quantity contract unit.
     pub fn asset_quantity(quantity: Quantity, asset: AssetId) -> Result<Self, ModelError> {
         crate::error::require_positive_quantity(quantity, "contract_unit.quantity")?;
         Ok(Self::AssetQuantity { quantity, asset })
     }
 
-    /// Builds an index-point contract unit.
     pub fn quote_notional_per_index_point(
         amount: Quantity,
         quote_asset: AssetId,
@@ -68,7 +56,6 @@ impl ContractUnit {
         })
     }
 
-    /// Returns the contract quantity or amount.
     pub fn quantity(&self) -> Quantity {
         match self {
             Self::AssetQuantity { quantity, .. } => *quantity,
@@ -76,7 +63,6 @@ impl ContractUnit {
         }
     }
 
-    /// Returns the asset this contract unit is denominated in, when it has one.
     pub fn denomination(&self) -> Option<&AssetId> {
         match self {
             Self::AssetQuantity { asset, .. } => Some(asset),
@@ -84,7 +70,6 @@ impl ContractUnit {
         }
     }
 
-    /// Returns the index of an index-point contract unit.
     pub fn index(&self) -> Option<&IndexId> {
         match self {
             Self::QuoteNotionalPerIndexPoint { index, .. } => Some(index),
@@ -92,12 +77,6 @@ impl ContractUnit {
         }
     }
 
-    /// Returns the asset an index-point contract unit is quoted in, when it has
-    /// one.
-    ///
-    /// An index is not an asset, so the currency an index point is worth is what
-    /// says which contract the unit describes; an asset quantity carries its asset
-    /// in [`ContractUnit::denomination`] instead.
     pub fn quote_asset(&self) -> Option<&AssetId> {
         match self {
             Self::QuoteNotionalPerIndexPoint { quote_asset, .. } => Some(quote_asset),
@@ -175,10 +154,6 @@ impl<'de> Deserialize<'de> for ContractUnit {
     }
 }
 
-/// The economic contract size of a derivative.
-///
-/// The contract size is an economic term, never a formatter setting; the order
-/// quantity step of a listing stays in `QuantityRule`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ContractSize {
     #[serde(rename = "unit")]
@@ -186,43 +161,31 @@ pub struct ContractSize {
 }
 
 impl ContractSize {
-    /// Validates a contract unit and builds the contract size.
     pub fn new(unit: ContractUnit) -> Result<Self, ModelError> {
         crate::error::require_positive_quantity(unit.quantity(), "contract_unit.quantity")?;
         Ok(Self { unit })
     }
 
-    /// Returns the contract unit.
     pub fn unit(&self) -> &ContractUnit {
         &self.unit
     }
 
-    /// Returns the contract quantity.
     pub fn quantity(&self) -> Quantity {
         self.unit.quantity()
     }
 
-    /// Returns the asset this contract size is denominated in, when it has one.
     pub fn denomination(&self) -> Option<&AssetId> {
         self.unit.denomination()
     }
 
-    /// Returns the index of an index-point contract size.
     pub fn index(&self) -> Option<&IndexId> {
         self.unit.index()
     }
 
-    /// Returns the asset an index-point contract size is quoted in, when it has
-    /// one.
     pub fn quote_asset(&self) -> Option<&AssetId> {
         self.unit.quote_asset()
     }
 
-    /// Returns the contract quantity of a cash-settled contract, when the unit
-    /// is a plain quantity multiplier.
-    ///
-    /// An index-point contract is quoted as a currency amount per index point, so
-    /// it has no plain quantity multiplier and is rejected here.
     pub fn cash_quantity(&self) -> Option<Quantity> {
         match self.unit {
             ContractUnit::AssetQuantity { .. } => Some(self.unit.quantity()),
@@ -253,10 +216,6 @@ impl<'de> Deserialize<'de> for ContractSize {
     }
 }
 
-/// The dated part of a future or option contract.
-///
-/// `expiration_at` is mandatory. The optional instants mean that the market did
-/// not publish that instant, never that a caller may omit the expiry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Expiry {
     #[serde(rename = "expiration_at")]
@@ -268,10 +227,6 @@ pub struct Expiry {
 }
 
 impl Expiry {
-    /// Validates the expiry instants.
-    ///
-    /// Every instant must be non-negative and ordered
-    /// `last_trading_at <= expiration_at <= settlement_at`.
     pub fn new(
         expiration_at: UnixMillis,
         last_trading_at: Option<UnixMillis>,
@@ -286,7 +241,6 @@ impl Expiry {
         Ok(expiry)
     }
 
-    /// Validates the expiry instants.
     pub fn validate(&self) -> Result<(), ModelError> {
         require_non_negative_time(self.expiration_at, "expiration_at")?;
         if let Some(last_trading_at) = self.last_trading_at {
@@ -310,22 +264,18 @@ impl Expiry {
         Ok(())
     }
 
-    /// Returns the instant at which the contract expires.
     pub const fn expiration_at(&self) -> UnixMillis {
         self.expiration_at
     }
 
-    /// Returns the published last trading instant.
     pub const fn last_trading_at(&self) -> Option<UnixMillis> {
         self.last_trading_at
     }
 
-    /// Returns the published settlement instant.
     pub const fn settlement_at(&self) -> Option<UnixMillis> {
         self.settlement_at
     }
 
-    /// Returns the latest instant at which the contract is still tradable.
     pub fn last_tradable_at(&self) -> UnixMillis {
         self.last_trading_at.unwrap_or(self.expiration_at)
     }
@@ -370,7 +320,6 @@ impl<'de> Deserialize<'de> for Expiry {
     }
 }
 
-/// Which side of a physical delivery a long holder receives or delivers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DeliveryDirection {
     #[serde(rename = "receive")]
@@ -380,7 +329,6 @@ pub enum DeliveryDirection {
 }
 
 impl DeliveryDirection {
-    /// Returns the opposite direction.
     pub const fn opposite(self) -> Self {
         match self {
             Self::Receive => Self::Deliver,
@@ -388,7 +336,6 @@ impl DeliveryDirection {
         }
     }
 
-    /// Returns the fixed canonical label of this direction.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Receive => "receive",
@@ -403,7 +350,6 @@ impl CanonicalTerms for DeliveryDirection {
     }
 }
 
-/// One physical delivery leg, always interpreted from the long holder's view.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct DeliveryLeg {
     #[serde(rename = "asset")]
@@ -415,7 +361,6 @@ pub struct DeliveryLeg {
 }
 
 impl DeliveryLeg {
-    /// Validates a delivery leg.
     pub fn new(
         asset: AssetId,
         quantity: Quantity,
@@ -429,17 +374,14 @@ impl DeliveryLeg {
         })
     }
 
-    /// Returns the delivered asset.
     pub fn asset(&self) -> &AssetId {
         &self.asset
     }
 
-    /// Returns the delivered quantity.
     pub const fn quantity(&self) -> Quantity {
         self.quantity
     }
 
-    /// Returns the delivery direction.
     pub const fn direction(&self) -> DeliveryDirection {
         self.direction
     }
@@ -480,7 +422,6 @@ impl<'de> Deserialize<'de> for DeliveryLeg {
     }
 }
 
-/// How a contract settles.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "kind", content = "mode")]
 pub enum DeliveryMode {
@@ -490,27 +431,6 @@ pub enum DeliveryMode {
         asset: AssetId,
         #[serde(rename = "reference")]
         reference: PriceReferenceId,
-        /// The conversion reference that turns the settlement asset into the instrument
-        /// price quote, when the two differ.
-        ///
-        /// The value is a registry identity, and an identity is a one-way digest: it says
-        /// *which* reference the contract converts through, never the direction that
-        /// reference has. How much of that direction is checked therefore depends on the
-        /// entry that built this delivery: [`DeliveryMode::cash`] holds the registry terms
-        /// behind the identity and checks the half a delivery can check without a price
-        /// quote — the reference tracks the settlement asset and is expressed per asset
-        /// unit — while an identity that arrives from the wire carries no terms and is
-        /// stored as declared. The quote half of the direction belongs to the instrument
-        /// that owns the price quote, which checks it when it takes this delivery.
-        ///
-        /// # Obligations
-        ///
-        /// The market participant that publishes the contract **must** resolve the identity in
-        /// `ReferenceRegistry`, refuse the publication with its own missing-reference
-        /// error when the registry carries no terms for it, and reject the instrument
-        /// when those terms do not convert the settlement asset into the price quote per
-        /// asset unit. On the path that carries an identity alone that is the final
-        /// direction check, because nothing here performs it.
         #[serde(
             rename = "conversion_reference",
             skip_serializing_if = "Option::is_none"
@@ -524,46 +444,12 @@ pub enum DeliveryMode {
     },
 }
 
-/// Where a cash delivery's conversion identity comes from.
-///
-/// A cash delivery states the reference it converts through in one of two ways, and the
-/// two differ in one thing only: a caller that holds the registry terms behind the
-/// reference can also check the half of the direction those terms express that needs no
-/// price quote, while an identity is a one-way digest that names only itself.
-///
-/// The same two ways are stated one level up by
-/// [`ConversionSource`](crate::instrument::ConversionSource), which resolves the
-/// conversion of a whole instrument. The two types are one fact at two levels and **must
-/// stay in step**: a way of stating a conversion that is added to one has to be answered
-/// in the other. They are not one type because the instrument level holds evidence a
-/// delivery cannot have — a mirror copy of the identity, and a carrier stated separately
-/// from the terms it has to agree with — while a delivery derives its identity from the
-/// terms themselves, once the asset it settles in has been checked.
 enum CashConversion<'a> {
-    /// The caller supplied the registry terms, so the identity is derived from them
-    /// and the half of the direction they express that needs no price quote is checked.
-    /// `None` declares no conversion at all.
     Registry(Option<&'a PriceReferenceTerms>),
-    /// A decoded payload carries only the opaque identity, whose direction is left to the
-    /// instrument that owns the price quote and to the publishing market participant. `None`
-    /// declares no conversion at all.
     Identity(Option<PriceReferenceId>),
 }
 
 impl DeliveryMode {
-    /// Builds a cash settlement mode.
-    ///
-    /// The settlement asset must be a currency or a crypto token so the
-    /// reference output can be converted into it.
-    ///
-    /// `conversion` is the full registry terms of the conversion reference when
-    /// the settlement asset is not the price quote. Only the half of the direction
-    /// a delivery can check without a price quote is checked here — the reference
-    /// must track the settlement asset and be expressed per asset unit; the quote
-    /// half belongs to the instrument constructor that owns the price quote. The
-    /// identity this entry stores is a one-way digest, so the direction behind it is
-    /// established here only as far as it can be, and the final check is the
-    /// obligation of the market participant that publishes the reference.
     pub fn cash(
         asset: AssetId,
         reference: PriceReferenceId,
@@ -572,18 +458,6 @@ impl DeliveryMode {
         Self::build_cash(asset, reference, CashConversion::Registry(conversion))
     }
 
-    /// The one entry that builds and validates a cash settlement.
-    ///
-    /// The caller-facing [`DeliveryMode::cash`], the wire decoder and
-    /// [`DeliveryMode::validate`] all run this function, so the rule a cash
-    /// settlement states about itself is stated once and no entry can accept a
-    /// settlement another entry refuses. The two entries differ in one thing only:
-    /// a caller holds the registry terms behind the reference and therefore checks
-    /// the half of the direction a delivery can check without a price quote — the
-    /// reference tracks the settlement asset and is expressed per asset unit — while
-    /// a decoded payload carries the opaque identity and leaves every direction check
-    /// to the instrument that owns the price quote and to the market participant that publishes
-    /// the reference.
     fn build_cash(
         asset: AssetId,
         reference: PriceReferenceId,
@@ -610,11 +484,6 @@ impl DeliveryMode {
         })
     }
 
-    /// Builds a physical settlement mode.
-    ///
-    /// At least one leg is required, the legs are normalized into their
-    /// canonical order, and the same asset cannot be both received and
-    /// delivered.
     pub fn physical(mut deliveries: Vec<DeliveryLeg>) -> Result<Self, ModelError> {
         if deliveries.is_empty() {
             return Err(ModelError::EmptyCollection {
@@ -640,12 +509,6 @@ impl DeliveryMode {
         Ok(Self::Physical { deliveries })
     }
 
-    /// Validates this delivery mode.
-    ///
-    /// A cash settlement is re-built through [`DeliveryMode::build_cash`], which is
-    /// the entry its constructor and the wire decoder also run, so the judgement is
-    /// the one that built the value rather than a second set of rules over it. A
-    /// physical delivery has no identity to re-state, so its legs are re-normalized.
     pub fn validate(&self) -> Result<(), ModelError> {
         match self {
             Self::Cash {
@@ -662,7 +525,6 @@ impl DeliveryMode {
         }
     }
 
-    /// Returns the asset a cash settlement pays in.
     pub fn cash_asset(&self) -> Option<&AssetId> {
         match self {
             Self::Cash { asset, .. } => Some(asset),
@@ -670,7 +532,6 @@ impl DeliveryMode {
         }
     }
 
-    /// Returns the price reference a cash settlement observes.
     pub fn cash_reference(&self) -> Option<&PriceReferenceId> {
         match self {
             Self::Cash { reference, .. } => Some(reference),
@@ -678,18 +539,6 @@ impl DeliveryMode {
         }
     }
 
-    /// Returns the conversion reference a cash settlement converts through.
-    ///
-    /// The reference is present only when the settlement asset differs from the
-    /// price quote of the instrument, and it always converts that asset into the
-    /// price quote. The returned identity is only as trustworthy as its publisher:
-    /// its direction lives in the registry terms it was derived from, and nothing
-    /// here can check it.
-    ///
-    /// # Obligations
-    ///
-    /// Whoever publishes the reference **must** resolve the identity in
-    /// `ReferenceRegistry` and check the direction those terms express.
     pub fn cash_conversion_reference(&self) -> Option<&PriceReferenceId> {
         match self {
             Self::Cash {
@@ -700,7 +549,6 @@ impl DeliveryMode {
         }
     }
 
-    /// Returns the physical delivery legs in canonical order.
     pub fn deliveries(&self) -> &[DeliveryLeg] {
         match self {
             Self::Physical { deliveries } => deliveries,
@@ -708,7 +556,6 @@ impl DeliveryMode {
         }
     }
 
-    /// Returns `true` when this mode delivers assets physically.
     pub const fn is_physical(&self) -> bool {
         matches!(self, Self::Physical { .. })
     }
@@ -725,10 +572,6 @@ impl CanonicalTerms for DeliveryMode {
                 encoder.write_label("cash");
                 encoder.write_terms(asset);
                 encoder.write_terms(reference);
-                // The conversion reference is optional and absent for every
-                // quote-settled contract, so it must not write a presence marker:
-                // the bytes of a cash delivery without a conversion reference are
-                // the bytes of the pre-conversion-reference version of this shape.
                 if let Some(conversion) = conversion_reference {
                     encoder.write_label("conversion-reference");
                     encoder.write_terms(conversion);
@@ -751,10 +594,6 @@ pub enum DeliveryModeWire {
         asset: AssetId,
         #[serde(rename = "reference")]
         reference: PriceReferenceId,
-        /// The `default` is written out because the wire shape states that a missing
-        /// conversion reference means "no conversion", rather than inheriting that from
-        /// serde: serde already decodes a missing `Option` as `None`, so the attribute has
-        /// no behaviour of its own and no test can tell it apart from leaving it out.
         #[serde(rename = "conversion_reference", default)]
         conversion_reference: Option<PriceReferenceId>,
     },
@@ -768,21 +607,6 @@ pub enum DeliveryModeWire {
 impl TryFrom<DeliveryModeWire> for DeliveryMode {
     type Error = ModelError;
 
-    /// Decodes the shape of one settlement mode.
-    ///
-    /// Only the rules a delivery states on its own are enforced: the asset has to
-    /// be one a settlement can be denominated in, and the physical legs have to
-    /// form a valid delivery. A cash conversion reference is carried through as the
-    /// identity the payload names — not claimed to be verified, because a delivery
-    /// does not know the price quote of its contract and an identity carries no
-    /// direction. The instrument constructor that owns the price quote decides
-    /// whether the contract may convert at all.
-    ///
-    /// # Obligations
-    ///
-    /// Nothing on this path checks the direction behind the identity: it is a
-    /// one-way digest. The market participant that publishes the contract **must** resolve it
-    /// in `ReferenceRegistry` and check the direction the registry terms express.
     fn try_from(wire: DeliveryModeWire) -> Result<Self, Self::Error> {
         match wire {
             DeliveryModeWire::Cash {
@@ -808,34 +632,16 @@ impl<'de> Deserialize<'de> for DeliveryMode {
     }
 }
 
-/// A typed cash settlement observation of an option.
-///
-/// A cash option whose settlement asset is not its price quote cannot be valued
-/// from the quote price alone: the caller has to hand over the amount already
-/// converted through the conversion reference of the option. A quote-settled
-/// option has exactly the opposite obligation and must not supply one, so the two
-/// cases cannot be confused at the call site.
-///
-/// The observation carries the conversion identity the amount was converted
-/// through: it is compared with the reference the option declares, and the
-/// direction behind that identity stays the responsibility of whoever published
-/// the reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OptionSettlementObservation {
-    /// The settlement asset is the price quote, so the quote price is enough.
     Quote,
-    /// The settlement asset differs from the price quote, so the converted
-    /// settlement amount of the option must be supplied explicitly.
     Converted {
-        /// The conversion reference the amount was converted through.
         conversion_reference: PriceReferenceId,
-        /// The converted amount, denominated in the cash settlement asset.
         amount: AssetAmount,
     },
 }
 
 impl OptionSettlementObservation {
-    /// Builds a converted settlement observation.
     pub fn converted(conversion_reference: PriceReferenceId, amount: AssetAmount) -> Self {
         Self::Converted {
             conversion_reference,
@@ -843,7 +649,6 @@ impl OptionSettlementObservation {
         }
     }
 
-    /// Returns the converted settlement amount, when the observation carries one.
     pub fn converted_amount(&self) -> Option<&AssetAmount> {
         match self {
             Self::Quote => None,
@@ -851,12 +656,6 @@ impl OptionSettlementObservation {
         }
     }
 
-    /// Rejects a converted observation that does not belong to this contract.
-    ///
-    /// An option with a conversion reference requires a converted observation that
-    /// names the same reference and is denominated in the cash settlement asset; a
-    /// quote-settled option requires none. Anything else is a caller error and is
-    /// reported instead of being silently reinterpreted.
     pub fn validate_against(
         &self,
         conversion_reference: Option<&PriceReferenceId>,
@@ -885,7 +684,6 @@ impl OptionSettlementObservation {
     }
 }
 
-/// An option strike with an explicit quote asset and price basis.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct StrikePrice {
     #[serde(rename = "value")]
@@ -897,10 +695,6 @@ pub struct StrikePrice {
 }
 
 impl StrikePrice {
-    /// Validates the strike.
-    ///
-    /// The strike must be greater than zero. Its quote asset and basis are
-    /// matched against the option `price_quote` by `OptionTerms::new`.
     pub fn new(value: Price, quote_asset: AssetId, basis: PriceBasis) -> Result<Self, ModelError> {
         if value.is_zero() {
             return Err(ModelError::ZeroValue { field: "strike" });
@@ -912,17 +706,14 @@ impl StrikePrice {
         })
     }
 
-    /// Returns the strike value.
     pub const fn value(&self) -> Price {
         self.value
     }
 
-    /// Returns the strike quote asset.
     pub fn quote_asset(&self) -> &AssetId {
         &self.quote_asset
     }
 
-    /// Returns the strike price basis.
     pub fn basis(&self) -> &PriceBasis {
         &self.basis
     }
@@ -963,10 +754,6 @@ impl<'de> Deserialize<'de> for StrikePrice {
     }
 }
 
-/// How a derivative's profit and loss converts between quote and settlement.
-///
-/// The model applies to both perpetual and dated contracts; a dated contract
-/// must never leave its conversion semantics to an adapter guess.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DerivativePnlModel {
     #[serde(rename = "linear")]
@@ -978,7 +765,6 @@ pub enum DerivativePnlModel {
 }
 
 impl DerivativePnlModel {
-    /// Returns the fixed canonical label of this pnl model.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Linear => "linear",
@@ -994,7 +780,6 @@ impl CanonicalTerms for DerivativePnlModel {
     }
 }
 
-/// The right an option grants its holder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OptionRight {
     #[serde(rename = "call")]
@@ -1004,7 +789,6 @@ pub enum OptionRight {
 }
 
 impl OptionRight {
-    /// Returns the fixed canonical label of this right.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Call => "call",
@@ -1012,11 +796,6 @@ impl OptionRight {
         }
     }
 
-    /// Returns the intrinsic value of one unit of the underlying at `reference`.
-    ///
-    /// A call is worth `max(reference - strike, 0)` and a put is worth
-    /// `max(strike - reference, 0)`; both are expressed in the quote asset of
-    /// the option price. The result is never negative.
     pub fn intrinsic_value(self, reference: Price, strike: Price) -> Quantity {
         let difference = match self {
             Self::Call => reference.inner().saturating_sub(strike.inner()),
@@ -1032,7 +811,6 @@ impl CanonicalTerms for OptionRight {
     }
 }
 
-/// When an option may be exercised.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "kind", content = "style")]
 pub enum ExerciseStyle {
@@ -1048,21 +826,12 @@ pub enum ExerciseStyle {
 }
 
 impl ExerciseStyle {
-    /// Builds a Bermudan exercise schedule and validates it against the expiry.
     pub fn bermudan(exercise_at: Vec<UnixMillis>, expiry: &Expiry) -> Result<Self, ModelError> {
         let style = Self::build(exercise_at)?;
         style.validate(expiry)?;
         Ok(style)
     }
 
-    /// The one entry that builds and validates a Bermudan schedule on its own.
-    ///
-    /// The caller-facing [`ExerciseStyle::bermudan`], the wire decoder and
-    /// [`ExerciseStyle::validate`] all run this function, so the half of the schedule
-    /// rules that needs no expiry is stated once: a schedule is non-empty, strictly
-    /// increasing and made of non-negative instants. The other half — that every
-    /// instant falls inside the contract expiry — is checked by
-    /// [`ExerciseStyle::validate`] once the expiry is known.
     fn build(exercise_at: Vec<UnixMillis>) -> Result<Self, ModelError> {
         require_strictly_sorted(&exercise_at, "exercise_at")?;
         for instant in &exercise_at {
@@ -1071,12 +840,6 @@ impl ExerciseStyle {
         Ok(Self::Bermudan { exercise_at })
     }
 
-    /// Validates the exercise schedule against the contract expiry.
-    ///
-    /// A Bermudan schedule must be non-empty, strictly increasing, made of
-    /// non-negative instants and must not fall after the expiry instant. The
-    /// schedule-local half is re-checked through [`ExerciseStyle::build`], which is
-    /// the entry that built the value.
     pub fn validate(&self, expiry: &Expiry) -> Result<(), ModelError> {
         if let Self::Bermudan { exercise_at } = self {
             Self::build(exercise_at.clone())?;
@@ -1092,7 +855,6 @@ impl ExerciseStyle {
         Ok(())
     }
 
-    /// Returns the exercise schedule of a Bermudan style.
     pub fn exercise_at(&self) -> &[UnixMillis] {
         match self {
             Self::Bermudan { exercise_at } => exercise_at,
@@ -1100,7 +862,6 @@ impl ExerciseStyle {
         }
     }
 
-    /// Returns the fixed canonical label of this exercise style.
     pub const fn label(&self) -> &'static str {
         match self {
             Self::American => "american",
@@ -1141,10 +902,6 @@ pub enum ExerciseStyleWire {
 }
 
 impl ExerciseStyleWire {
-    /// Converts the wire shape through the entry the caller-facing constructor uses,
-    /// so the schedule-local rules are the ones [`ExerciseStyle::build`] states; the
-    /// expiry ordering check runs in the option constructor once the contract expiry
-    /// is known.
     pub fn into_style(self) -> Result<ExerciseStyle, ModelError> {
         match self {
             Self::American => Ok(ExerciseStyle::American),
@@ -1165,7 +922,6 @@ impl<'de> Deserialize<'de> for ExerciseStyle {
     }
 }
 
-/// Why a new instrument identity replaced an existing one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum InstrumentAdjustment {
     #[serde(rename = "corporate_action")]
@@ -1179,7 +935,6 @@ pub enum InstrumentAdjustment {
 }
 
 impl InstrumentAdjustment {
-    /// Returns the fixed canonical label of this adjustment.
     pub const fn label(self) -> &'static str {
         match self {
             Self::CorporateAction => "corporate-action",
@@ -1196,7 +951,6 @@ impl CanonicalTerms for InstrumentAdjustment {
     }
 }
 
-/// An instrument lineage relation between a predecessor and its successor.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InstrumentLineageEdge {
     #[serde(rename = "predecessor")]
@@ -1210,7 +964,6 @@ pub struct InstrumentLineageEdge {
 }
 
 impl InstrumentLineageEdge {
-    /// Validates a lineage edge.
     pub fn new(
         predecessor: InstrumentId,
         successor: InstrumentId,
@@ -1232,12 +985,6 @@ impl InstrumentLineageEdge {
     }
 }
 
-/// A stock split corporate action.
-///
-/// A split changes neither the issued security identity nor the spot instrument
-/// identity. Account and market corporate-action services apply it to position
-/// quantities, cost basis and adjusted prices, and de-duplicate repeated events
-/// by `(security, effective_at, new_shares_per_old_share)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StockSplit {
     #[serde(rename = "security")]
@@ -1249,7 +996,6 @@ pub struct StockSplit {
 }
 
 impl StockSplit {
-    /// Validates a stock split event.
     pub fn new(
         security: SecurityId,
         new_shares_per_old_share: PositiveRatio,
@@ -1263,14 +1009,12 @@ impl StockSplit {
         })
     }
 
-    /// Returns the adjusted quantity of a position held through the split.
     pub fn adjust_quantity(&self, quantity: Quantity) -> Option<Quantity> {
         self.new_shares_per_old_share
             .ratio()
             .checked_mul_quantity(quantity)
     }
 
-    /// Returns the de-duplication key of this corporate action.
     pub fn dedup_key(&self) -> (SecurityId, UnixMillis, Ratio) {
         (
             self.security,
@@ -1280,15 +1024,11 @@ impl StockSplit {
     }
 }
 
-/// A relation between two canonical identities inside a lineage graph.
 pub trait LineageRelation {
-    /// Returns the predecessor identity text of this relation.
     fn predecessor(&self) -> IdentityText;
 
-    /// Returns the successor identity text of this relation.
     fn successor(&self) -> IdentityText;
 
-    /// Returns the instant at which this relation becomes effective.
     fn effective_at(&self) -> UnixMillis;
 }
 
@@ -1306,11 +1046,6 @@ impl LineageRelation for InstrumentLineageEdge {
     }
 }
 
-/// Validates a lineage graph.
-///
-/// The graph must be acyclic, must not repeat a `(predecessor, successor)`
-/// relation, must not give one successor two predecessors, and every successor
-/// must take effect no earlier than the relation that points at it.
 pub fn validate_lineage<E: LineageRelation>(
     edges: &[E],
     invalid: fn(&'static str) -> ModelError,
@@ -1428,8 +1163,6 @@ mod tests {
         .expect("reference should be valid")
     }
 
-    /// The conversion reference of a contract that settles in `settlement` and is
-    /// quoted in `price_quote`.
     fn conversion(settlement: AssetId, price_quote: &AssetId) -> PriceReferenceTerms {
         price_terms(
             UnderlyingRef::Asset(settlement),
@@ -1438,8 +1171,6 @@ mod tests {
         )
     }
 
-    /// A cash delivery that settles in the underlying asset and converts it back
-    /// into the price quote.
     fn settlement(code: &str, price_quote: &AssetId) -> (DeliveryMode, PriceReferenceTerms) {
         let conversion = conversion(venue_token(code), price_quote);
         let delivery = DeliveryMode::cash(venue_token(code), reference(), Some(&conversion))
@@ -1447,14 +1178,12 @@ mod tests {
         (delivery, conversion)
     }
 
-    /// The canonical bytes of one encoded term.
     fn terms_bytes<T: CanonicalTerms>(term: &T) -> Vec<u8> {
         let mut encoder = crate::identifier::CanonicalEncoder::new();
         encoder.write_terms(term);
         encoder.as_bytes().to_vec()
     }
 
-    /// A cash delivery that settles in a currency other than the price quote.
     fn currency_settlement(code: &str, price_quote: &AssetId) -> DeliveryMode {
         let settlement = AssetId::Currency(CurrencyId::new(
             Iso4217Code::new(code).expect("currency code should be valid"),
@@ -1471,9 +1200,6 @@ mod tests {
         )
     }
 
-    /// The canonical instrument terms a listing is identified by are wire schema, so
-    /// the digest of one fixed spot instrument is pinned: a change to the terms
-    /// encoding or to the identity namespace moves this literal.
     #[test]
     fn instrument_identity_should_be_a_pinned_digest() {
         assert_eq!(
@@ -1550,9 +1276,6 @@ mod tests {
         );
     }
 
-    /// The wire shape of a Bermudan schedule runs the entry its constructor runs, so
-    /// a schedule no caller could build is refused while it is decoded and for the
-    /// typed reason that names the rule it broke.
     #[test]
     fn bermudan_exercise_wire_should_refuse_a_schedule_no_caller_could_build() {
         assert_eq!(
@@ -1808,9 +1531,6 @@ mod tests {
         );
     }
 
-    /// The cash delivery shape gained an optional conversion reference, so the
-    /// bytes of the shape without one are pinned: a contract that settles in its
-    /// price quote must keep the identity it had before the field existed.
     #[test]
     fn cash_delivery_without_conversion_should_encode_the_previous_bytes() {
         let delivery =
@@ -1840,8 +1560,6 @@ mod tests {
         );
         assert_eq!(delivery.cash_asset(), Some(&venue_token("BTC")));
 
-        // The conversion reference converts the settlement asset into the price
-        // quote, so a reference that tracks anything else is refused.
         let wrong_underlying = price_terms(
             UnderlyingRef::Asset(venue_token("ETH")),
             usd(),
@@ -1882,8 +1600,6 @@ mod tests {
         );
     }
 
-    /// Only the asset half of the direction is knowable without a price quote, so
-    /// the quote half is left to the instrument constructor that owns one.
     #[test]
     fn cash_delivery_should_accept_a_conversion_quoted_in_another_asset() {
         let quoted_in_eur = price_terms(
@@ -1907,17 +1623,11 @@ mod tests {
         );
     }
 
-    /// A cash delivery and an instrument state the same conversion in the same two ways,
-    /// each at the level it owns. The matches below are exhaustive on purpose: a way of
-    /// stating a conversion that is added to one of the two types stops this test from
-    /// compiling until the other one is reconsidered.
     #[test]
     fn cash_delivery_should_state_a_conversion_the_way_an_instrument_does() {
         #[derive(Debug, PartialEq, Eq)]
         enum Statement<'a> {
-            /// The registry terms behind the reference, or no conversion at all.
             Terms(Option<&'a PriceReferenceTerms>),
-            /// The identity alone, with the instrument-level mirror that may repeat it.
             Identity {
                 carrier: Option<PriceReferenceId>,
                 mirror: Option<PriceReferenceId>,
@@ -1948,8 +1658,6 @@ mod tests {
             .reference_id()
             .expect("reference should be valid");
 
-        // The terms a caller holds are one statement at both levels: the delivery derives
-        // the identity they name, and so does the instrument that resolves the contract.
         assert_eq!(
             delivery_statement(CashConversion::Registry(Some(&conversion))),
             instrument_statement(ConversionSource::Registry {
@@ -1958,8 +1666,6 @@ mod tests {
             }),
             "a delivery derives its identity from the terms an instrument carries"
         );
-        // A delivery has no instrument level, so an identity is the identity alone there,
-        // and the two levels agree on what no conversion at all is.
         assert_eq!(
             delivery_statement(CashConversion::Identity(Some(identity))),
             instrument_statement(ConversionSource::Identity {
@@ -1982,8 +1688,6 @@ mod tests {
             })
         );
 
-        // Both statements of one conversion build one delivery: the terms a caller holds
-        // and the identity a decoded payload carries resolve to the same delivery.
         assert_eq!(
             DeliveryMode::cash(venue_token("BTC"), reference(), Some(&conversion))
                 .expect("the caller states a conversion its delivery can check"),
@@ -2075,9 +1779,6 @@ mod tests {
             serde_json::from_value::<DeliveryMode>(wrong_settlement_asset).is_err(),
             "a settlement asset outside the supported asset kinds must not decode"
         );
-        // The wire arm runs the entry the constructor runs, so the same asset is
-        // refused for the typed reason the constructor states rather than only
-        // failing to decode.
         let refused = AssetId::Security(
             SecurityId::from_identity_value(
                 "v1/0000000000000000000000000000000000000000000000000000000000000000",
@@ -2308,9 +2009,6 @@ mod tests {
 
     #[test]
     fn term_types_should_reject_struct_literal_bypass() {
-        // The fields are private, so no test outside this module can build an
-        // invalid `Expiry` or `ContractSize` without going through `new`; the
-        // compile-time guarantee is asserted by the private-field access below.
         let expiry = Expiry::new(1, None, None).expect("expiry should be valid");
         assert_eq!(expiry.expiration_at(), 1);
     }

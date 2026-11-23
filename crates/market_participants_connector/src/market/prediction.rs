@@ -1,12 +1,3 @@
-//! Event-scoped prediction-market reads.
-//!
-//! A prediction venue publishes events rather than a stable instrument catalog,
-//! so these reads are addressed by an event identity and never resolve a listing
-//! from the catalog. The builder is the one place that knows a venue may publish
-//! its events across several scopes: Hyperliquid serves one scope per outcome
-//! deployer, so the facade asks every loaded scope and merges the answers into one
-//! page. A venue with one event scope passes the server's cursor through.
-
 use std::collections::BTreeMap;
 
 use market_participants_model::{
@@ -27,17 +18,10 @@ use crate::{
     },
 };
 
-/// The page size a caller gets when it does not choose one.
 pub const DEFAULT_PREDICTION_PAGE_SIZE: u16 = 8;
 
-/// The largest page the facade may ask one route for while merging scopes.
 pub const MAX_PREDICTION_PAGE_SIZE: u16 = 500;
 
-/// One page of events a caller asks a venue for.
-///
-/// It names a venue rather than a route: the facade resolves the routes that
-/// publish prediction events and merges them. A caller outside the connector
-/// never builds a route-scoped query.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PredictionEventsRequest {
     pub venue: VenueId,
@@ -48,7 +32,6 @@ pub struct PredictionEventsRequest {
 }
 
 impl PredictionEventsRequest {
-    /// Builds the first page of one venue's events.
     pub fn first(venue: VenueId) -> Self {
         Self {
             venue,
@@ -59,32 +42,27 @@ impl PredictionEventsRequest {
         }
     }
 
-    /// Sets the category filter.
     pub fn category(mut self, category: Option<SmolStr>) -> Self {
         self.category = category;
         self
     }
 
-    /// Sets the search query.
     pub fn search(mut self, search: Option<SmolStr>) -> Self {
         self.search = search;
         self
     }
 
-    /// Sets the cursor.
     pub fn cursor(mut self, cursor: Option<SmolStr>) -> Self {
         self.cursor = cursor;
         self
     }
 
-    /// Sets the page size, clamped to what a selector may ask for.
     pub fn page_size(mut self, page_size: u16) -> Self {
         self.page_size = page_size.clamp(1, MAX_PREDICTION_PAGE_SIZE);
         self
     }
 }
 
-/// Reads one page of prediction events.
 pub struct PredictionEventsBuilder {
     provider: MarketCapability,
     request: PredictionEventsRequest,
@@ -95,7 +73,6 @@ impl PredictionEventsBuilder {
         Self { provider, request }
     }
 
-    /// Fetches the page.
     pub async fn fetch(self) -> Result<PredictionEventsPage, MarketError> {
         let routes = self.routes()?;
         if routes.len() == 1 {
@@ -259,7 +236,6 @@ fn categories_of(
     categories.into_values().collect()
 }
 
-/// Reads one prediction event.
 pub struct PredictionEventBuilder {
     provider: MarketCapability,
     event: PredictionEventRef,
@@ -270,7 +246,6 @@ impl PredictionEventBuilder {
         Self { provider, event }
     }
 
-    /// Fetches the event and every leg it publishes.
     pub async fn fetch(self) -> Result<PredictionEventView, MarketError> {
         let route = self.event.route.clone();
         match execute(
@@ -288,7 +263,6 @@ impl PredictionEventBuilder {
     }
 }
 
-/// Reads the probability series of one prediction event.
 pub struct PredictionSeriesBuilder {
     provider: MarketCapability,
     event: PredictionEventRef,
@@ -311,7 +285,6 @@ impl PredictionSeriesBuilder {
         }
     }
 
-    /// Fetches the series.
     pub async fn fetch(self) -> Result<Vec<PredictionSeries>, MarketError> {
         let route = self.event.route.clone();
         match execute(

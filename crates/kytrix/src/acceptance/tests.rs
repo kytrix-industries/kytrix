@@ -1,22 +1,8 @@
-//! The acceptance script's headless rehearsal.
-//!
-//! The script is the same value in both hosts: the real window's frame route calls
-//! [`Script::tick`] once per frame, and this module calls it once per frame between the
-//! shell's own route and the frame — the production order. What heads-up runs here is
-//! therefore what the acceptance build runs, which is how `cargo test` covers the steps
-//! without a window.
-//!
-//! The rehearsal also proves the **failure** path: a window that goes away before the
-//! script finishes is reported as a failed run, not as a pass nobody reached.
-
 use super::script::Script;
 use crate::test_support::Harness;
 
-/// How many frames the rehearsal may take before it calls the script stuck (the script's
-/// own budget is smaller; this is the test's backstop).
 const REHEARSAL_FRAMES: usize = 400;
 
-/// Runs the script to its end over the headless shell and returns it.
 fn rehearse() -> Script {
     let mut harness = Harness::new();
     let mut script = Script::new(harness.window);
@@ -38,8 +24,6 @@ fn rehearse() -> Script {
     );
 }
 
-/// Every step passes on the real shell over the headless engine, and the log names them in
-/// the order they ran.
 #[test]
 fn the_acceptance_script_should_pass_on_the_shell() {
     let script = rehearse();
@@ -72,8 +56,6 @@ fn the_acceptance_script_should_pass_on_the_shell() {
     );
 }
 
-/// The steps leave the application on the state they ended in: the language and the
-/// appearance writes are committed settings, not drafts.
 #[test]
 fn the_acceptance_steps_should_commit_what_they_wrote() {
     let mut harness = Harness::new();
@@ -101,8 +83,6 @@ fn the_acceptance_steps_should_commit_what_they_wrote() {
     );
 }
 
-/// A window that is closed before the script runs is a failed run whose log names the
-/// host, not a pass that reported nothing.
 #[test]
 fn a_window_that_closed_before_the_script_should_fail_the_run() {
     let mut harness = Harness::new();
@@ -126,8 +106,6 @@ fn a_window_that_closed_before_the_script_should_fail_the_run() {
     assert!(script.report_text().contains("RESULT: FAIL"));
 }
 
-/// `--acceptance-report=<path>` is the evidence a CI run keeps: a passing run writes the
-/// whole log there.
 #[test]
 fn the_report_should_be_written_where_the_run_points_it() {
     let script = rehearse();

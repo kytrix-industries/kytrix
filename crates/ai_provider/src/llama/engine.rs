@@ -1,5 +1,3 @@
-//! The engine handle that owns the worker thread.
-
 use std::{
     sync::mpsc::{self, SyncSender},
     thread::{self, JoinHandle},
@@ -13,25 +11,14 @@ use super::{
 };
 use crate::error::ProviderError;
 
-/// Name of the thread that owns the model and its context.
 const WORKER_THREAD_NAME: &str = "kytrix-llama";
 
-/// A loaded model and the worker thread that serves it.
-///
-/// The handle is `Send + Sync`: each request is handed to the one worker thread, which
-/// is the only place the non-`Send` llama context lives. Requests are serialized, which
-/// is the only shape a single context supports anyway.
 pub struct Engine {
     commands: SyncSender<Command>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Engine {
-    /// Loads `config` and blocks until the worker has created its context.
-    ///
-    /// Loading runs on the worker thread because the model is only ever used there, and
-    /// this call waits for the outcome so a bad model path or an unusable configuration
-    /// fails here rather than on the first request.
     pub fn load(config: EngineConfig) -> Result<Self, ProviderError> {
         config.validate()?;
         if !config.model_path.is_file() {
@@ -72,16 +59,6 @@ impl Engine {
         }
     }
 
-    /// Generates text for `prompt` on the worker thread and returns the raw output.
-    ///
-    /// Control spans are parsed as special tokens; text spans are tokenized as
-    /// plain text, so a document cannot forge a turn marker. The output is not
-    /// trimmed; a caller that wraps the text decides what to strip.
-    ///
-    /// `cancel` is polled by the worker after it receives the request, before each
-    /// prompt prefill chunk and before each sampled token. A check that returns
-    /// `true` ends the request with [`ProviderError::Cancelled`]; the worker clears
-    /// the context and stays available for the next request either way.
     pub fn generate(
         &self,
         prompt: &[PromptSpan],

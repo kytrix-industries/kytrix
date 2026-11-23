@@ -1,17 +1,3 @@
-//! What a frame of the prediction chart actually draws, and what it reuses.
-//!
-//! A chart is a canvas, so what it draws is read back as the canvas' primitives: the
-//! quads (grid dots, the crosshair, label boxes and their bars, dots and pulse rings),
-//! the clip brackets and the registered meshes every series line draws. What a run of
-//! text *says* is not in the scene once shaped, so the paint pass reports the lines it
-//! drew into a small test-only recorder (`super::paint::take_text_log`). What is pinned
-//! here is the hover's whole shape — the crosshair's place, the fade split, the label
-//! column's side and stack, the time label — plus the cache rule that a pointer-only
-//! frame prepares nothing.
-//!
-//! There is no pixel capture: on Windows the test window has no headless renderer, so
-//! a PNG is not possible. These are geometry and paint-call assertions.
-
 use std::{rc::Rc, sync::Arc};
 
 use base_ui::theme::{appearance::Appearance, resolved::Theme, role::Role};
@@ -38,18 +24,13 @@ use crate::{
     test_support::{charted_market, event_ref, event_with},
 };
 
-/// The chart's page. It has to fit the headless host's 800 x 600 window: the engine
-/// clamps a child to the window it is laid out in.
 const WINDOW_WIDTH: f32 = 760.0;
 const WINDOW_HEIGHT: f32 = 248.0;
 
-/// One sample per minute over an hour.
 const SAMPLE_COUNT: i64 = 60;
 const MINUTE: i64 = 60_000;
-/// The step the label boxes keep from each other.
 const LABEL_GAP: f32 = 1.0;
 
-/// The catalogue the chart formats through.
 fn translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(embedded::load().expect("the embedded locales should load")),
@@ -57,7 +38,6 @@ fn translate(language: LanguageCode) -> Translate {
     )
 }
 
-/// One chart mounted under a page of a fixed size.
 struct ChartHarness {
     app: WidgetTestApp,
     chart: ChartCanvas,
@@ -90,7 +70,6 @@ impl ChartHarness {
             .with_cx(|cx| harness.chart.build(cx, page))
             .expect("the chart builds");
         assert!(harness.app.has_canvas(node), "the body built a canvas node");
-        // The first frame lays the page (and the canvas inside it) out.
         harness.app.drain();
         harness
     }
@@ -112,7 +91,6 @@ impl ChartHarness {
         self.chart.node().expect("the chart built a canvas node")
     }
 
-    /// Draws the frame the current pointer and pulse ask for, and reads it back.
     fn draw(&mut self) -> Frame {
         reset_text_log();
         let _ = self.sync();
@@ -137,7 +115,6 @@ impl ChartHarness {
         self.pulse = pulse;
     }
 
-    /// Lays the page out at another size, the way a resize does.
     fn resize(&mut self, width: f32, height: f32) {
         let page = self.page;
         self.app.with_cx(|cx| {
@@ -154,7 +131,6 @@ impl ChartHarness {
     }
 }
 
-/// A box of a fixed size, which is the shape a chart is laid out in.
 fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> ui_core::node::id::NodeId {
     app.with_cx(|cx| {
         let root = cx.tree().root();
@@ -172,7 +148,6 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> ui_core::node::id::
     })
 }
 
-/// One painted frame: its canvas bounds, its primitives and the lines of text.
 struct Frame {
     bounds: Rect,
     primitives: Vec<CanvasPrimitive>,
@@ -180,12 +155,10 @@ struct Frame {
 }
 
 impl Frame {
-    /// The box the chart resolved as its plot.
     fn plot(&self) -> Rect {
         ChartLayout::new(self.bounds).plot
     }
 
-    /// The quads of the frame, in draw order.
     fn quads(&self) -> Vec<CanvasPrimitive> {
         self.primitives
             .iter()
@@ -194,8 +167,6 @@ impl Frame {
             .collect()
     }
 
-    /// The quads of the frame, each with its index in the primitive list (which is what
-    /// [`Frame::enclosing_clip`] reads).
     fn quads_indexed(&self) -> Vec<(usize, CanvasPrimitive)> {
         self.primitives
             .iter()
@@ -205,7 +176,6 @@ impl Frame {
             .collect()
     }
 
-    /// The label boxes, in draw order, which are the only bordered 20 px tall quads.
     fn label_boxes(&self) -> Vec<CanvasPrimitive> {
         self.quads()
             .into_iter()
@@ -218,7 +188,6 @@ impl Frame {
             .collect()
     }
 
-    /// The box a label's text was drawn inside.
     fn label_box(&self, text: &str) -> CanvasPrimitive {
         let record = self
             .text(text)
@@ -236,12 +205,10 @@ impl Frame {
             .expect("every drawn label has its box")
     }
 
-    /// One line of drawn text.
     fn text(&self, text: &str) -> Option<&TextRecord> {
         self.texts.iter().find(|record| record.text == text)
     }
 
-    /// Every primitive that draws a registered mesh, with its index in the frame.
     fn geometry_draws(&self) -> Vec<(usize, CanvasPrimitive)> {
         self.primitives
             .iter()
@@ -251,8 +218,6 @@ impl Frame {
             .collect()
     }
 
-    /// The strokes at the series' own colours, which are the lines rather than the
-    /// halos.
     fn series_lines(&self) -> Vec<CanvasPrimitive> {
         let palette = palette();
         self.geometry_draws()
@@ -266,10 +231,6 @@ impl Frame {
             .collect()
     }
 
-    /// The clip a primitive at `index` is drawn inside.
-    ///
-    /// The paint pass never nests clips more than one deep, so the nearest push before
-    /// the primitive is its mask.
     fn enclosing_clip(&self, index: usize) -> Option<Rect> {
         self.primitives[..index]
             .iter()
@@ -279,27 +240,20 @@ impl Frame {
     }
 }
 
-/// A quad's box.
 fn bounds_of(primitive: CanvasPrimitive) -> Rect {
     primitive.bounds.expect("a quad has bounds")
 }
 
-/// Whether a quad was painted in one of the palette colours at `alpha`.
-///
-/// The engine's [`Color`] keeps its alpha in the value, so the expected colour is the
-/// role resolved by the theme with the same opacity applied.
 fn is_faded(quad: CanvasPrimitive, alpha: f32) -> bool {
     palette()
         .iter()
         .any(|role| quad.color == Some(role.with_opacity(alpha)))
 }
 
-/// The opacity the pulse ring is drawn at, which is the paint pass's own arithmetic.
 fn ring_alpha(phase: f32) -> f32 {
     0.4 * (1.0 - phase)
 }
 
-/// The light appearance's six series colours, in palette order.
 fn palette() -> [Color; 6] {
     let theme = Theme::of(Appearance::Light);
     [
@@ -312,7 +266,6 @@ fn palette() -> [Color; 6] {
     ]
 }
 
-/// One role in the light appearance.
 fn role(role: Role) -> Color {
     Theme::of(Appearance::Light).role(role)
 }
@@ -324,7 +277,6 @@ fn assert_close(actual: f32, expected: f32, tolerance: f32, what: &str) {
     );
 }
 
-/// One point whose probability is `percent` percentage points.
 fn point_at(timestamp: i64, percent: f64) -> PredictionPricePoint {
     PredictionPricePoint {
         timestamp,
@@ -333,10 +285,6 @@ fn point_at(timestamp: i64, percent: f64) -> PredictionPricePoint {
     }
 }
 
-/// Two lines, one sample a minute, running from 20 % to the given end values.
-///
-/// The model keeps the lines in the order the snapshot lists them, so the first line
-/// takes the first palette colour and the second the next.
 fn two_series(yes_end: f64, no_end: f64) -> Arc<PredictionMarketSnapshot> {
     let event = event_ref();
     let (market, legs) = charted_market(&event, "charted");
@@ -368,21 +316,14 @@ fn two_series(yes_end: f64, no_end: f64) -> Arc<PredictionMarketSnapshot> {
     ))
 }
 
-/// The medium chart these tests draw: the lower line ends at 26 %, the higher at 27 %,
-/// so at the middle of the window they are three pixels apart and collide.
 fn snapshot() -> Arc<PredictionMarketSnapshot> {
     two_series(26.0, 27.0)
 }
 
-/// The fixture probabilities the two lines hold at the middle sample.
 fn mid_values() -> (f64, f64) {
     (23.0, 23.5)
 }
 
-/// Two lines whose lower one stops at the middle of the window.
-///
-/// The data grids are normally aligned, so a line that ended earlier is the unusual
-/// case the hover has to leave alone past its last sample.
 fn snapshot_with_an_ended_line() -> Arc<PredictionMarketSnapshot> {
     let event = event_ref();
     let (market, legs) = charted_market(&event, "charted");
@@ -414,10 +355,6 @@ fn snapshot_with_an_ended_line() -> Arc<PredictionMarketSnapshot> {
     ))
 }
 
-/// Twelve lines with distinct values, as a full market draws them.
-///
-/// The market fixture has two sides, so every line names the same leg; the values are
-/// what make the label column twelve boxes tall.
 fn twelve_series() -> Arc<PredictionMarketSnapshot> {
     let event = event_ref();
     let (market, legs) = charted_market(&event, "charted");
@@ -596,8 +533,6 @@ fn a_mid_chart_hover_stacks_its_labels_on_the_right() {
     let frame = harness.draw();
 
     let (lower, higher) = mid_values();
-    // The axis covers the whole snapshot: the higher line ends at 27 %, which rounds
-    // the top of the axis to 30.
     let axis = ValueAxis::new(27.0);
     let crosshair_x = plot.origin.x + plot.size.width / 2.0;
     let lower_y = y_for_percent(lower, &axis, plot);
@@ -657,8 +592,6 @@ fn a_mid_chart_hover_stacks_its_labels_on_the_right() {
 
 #[test]
 fn a_twelve_series_column_keeps_every_label_at_a_distinct_top() {
-    // Twelve 20 px boxes plus their 1 px gaps are taller than the plot, so the
-    // column has to overflow without piling boxes on top of one another.
     let mut harness = ChartHarness::sized(twelve_series(), WINDOW_WIDTH, WINDOW_HEIGHT + 100.0);
     let plot = harness.draw().plot();
     harness.set_pointer(Some(Point::new(
@@ -740,7 +673,6 @@ fn hovering_fades_every_line_to_the_right_of_the_sample() {
             2,
             "each line is painted once per side (line {index})"
         );
-        // The faded half is painted first, so the full-colour half is on top of it.
         strokes.sort_by_key(|(_, primitive)| primitive.color == Some(*color));
         let (faded_index, faded) = strokes[0];
         let (full_index, full) = strokes[1];
@@ -797,7 +729,6 @@ fn a_pulse_phase_draws_the_expanding_ring() {
 
     harness.set_pulse(Some(0.25));
     let early = harness.draw();
-    // The ring at a quarter of its cycle: radius 7, and a quarter of the opacity gone.
     let early_ring = early
         .quads()
         .into_iter()
@@ -1172,8 +1103,6 @@ fn a_line_that_ended_before_the_hover_grows_no_dot_or_label() {
     );
 }
 
-/// Every series line and its halo is one registered mesh; a two-line chart therefore
-/// names four meshes, and the halo is drawn under its line in the body's own colour.
 #[test]
 fn the_frame_draws_one_mesh_per_line_and_a_halo_under_it() {
     let mut harness = ChartHarness::new(snapshot());
@@ -1198,8 +1127,6 @@ fn the_frame_draws_one_mesh_per_line_and_a_halo_under_it() {
     );
 }
 
-/// Every clip the frame opens is closed again: an unbalanced bracket would leak one
-/// series' mask into the primitives after it.
 #[test]
 fn every_clip_the_frame_opens_is_closed() {
     let mut harness = ChartHarness::new(snapshot());
@@ -1225,8 +1152,6 @@ fn every_clip_the_frame_opens_is_closed() {
     assert_eq!(depth, 0, "every clip the frame opened was closed");
 }
 
-/// A resize lays the chart out again: the canvas is rebuilt for the new box, and its
-/// plot is the new box's.
 #[test]
 fn a_resize_redraws_the_chart_in_the_new_box() {
     let mut harness = ChartHarness::new(snapshot());
@@ -1246,8 +1171,6 @@ fn a_resize_redraws_the_chart_in_the_new_box() {
     );
 }
 
-/// The lines the chart's canvas names are registered for as long as it draws them: a
-/// pointer-only frame must not hand its meshes back and draw from freed geometry.
 #[test]
 fn a_pointer_move_keeps_the_meshes_the_canvas_names() {
     let mut harness = ChartHarness::new(snapshot());

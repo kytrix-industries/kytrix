@@ -6,18 +6,6 @@ use serde::{
     de::{IgnoredAny, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer},
 };
 
-/// A node of a locale document.
-///
-/// A leaf is a message, a mapping is a section, and everything else is reported
-/// as [`Error::NotAMessage`](crate::error::Error::NotAMessage). Leaves become
-/// dotted keys, so
-///
-/// ```yaml
-/// menu:
-///   market: Market
-/// ```
-///
-/// is the message `menu.market`.
 #[derive(Debug)]
 pub(super) enum Node {
     Text(Box<str>),
@@ -34,7 +22,6 @@ impl<'de> Deserialize<'de> for Node {
     }
 }
 
-/// Turns one YAML node into a [`Node`].
 struct NodeVisitor;
 
 impl<'de> Visitor<'de> for NodeVisitor {
@@ -63,8 +50,6 @@ impl<'de> Visitor<'de> for NodeVisitor {
     where
         A: SeqAccess<'de>,
     {
-        // Drain the list so the parser reaches its end, then report a node that
-        // cannot hold a message.
         while sequence.next_element::<IgnoredAny>()?.is_some() {}
 
         Ok(Node::Unsupported)

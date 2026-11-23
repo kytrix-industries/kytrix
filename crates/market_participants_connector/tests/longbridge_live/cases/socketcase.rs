@@ -1,6 +1,3 @@
-//! The socket-lifecycle cases: a reconnect replays the handshake, and the venue's own
-//! liveness signalling (§4.4, §10.4; §14.1 item 11).
-
 use std::time::Duration;
 
 use longbridge_proto::quote::{SubType, SubscribeRequest};
@@ -15,8 +12,6 @@ use crate::{
     socket::LiveSocket,
     wire::{COMMAND_CODE_AUTH, SUB_TYPE_QUOTE, SUB_TYPE_TRADE, SUBSCRIBE},
 };
-/// Case 15 — reconnecting replays the whole handshake and the subscription
-/// (§4.4, §10.4).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_15_a_reconnect_replays_the_handshake_and_the_subscription() {
@@ -56,8 +51,6 @@ async fn live_case_15_a_reconnect_replays_the_handshake_and_the_subscription() {
             first_session.expires
         );
 
-        // The drop, without a close handshake: this is the connection loss the
-        // connection layer has to notice and replay from.
         drop(socket);
         println!("  the socket was dropped without a close handshake");
 
@@ -87,9 +80,6 @@ async fn live_case_15_a_reconnect_replays_the_handshake_and_the_subscription() {
             ),
             Err(error) => println!("  the subscription replay failed: {error}"),
         }
-        // The replayed subscription is observed for the same window a fresh one gets:
-        // a closed market's only push is the snapshot `is_first_push` asks for, and
-        // that is exactly what the replay has to produce.
         let after = timeout(PUSH_WINDOW + Duration::from_secs(10), async {
             replayed
                 .drain_pushes(tokio::time::Instant::now() + PUSH_WINDOW)
@@ -122,12 +112,6 @@ async fn live_case_15_a_reconnect_replays_the_handshake_and_the_subscription() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 16 — the venue's own liveness signalling (§14.1 item 11).
-///
-/// This case is a measurement and not an assertion: a WebSocket client answers a
-/// ping inside its own stack and never hands it to the caller, so the only thing
-/// this suite can state is what it observed on the socket it held. The window is
-/// shorter than the design's own 120-second liveness bound on purpose.
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_16_the_liveness_window_is_observed_but_pings_are_not_visible() {

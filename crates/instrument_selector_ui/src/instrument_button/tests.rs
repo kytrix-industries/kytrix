@@ -1,5 +1,3 @@
-//! What the control states, and what its click does.
-
 use std::sync::Arc;
 
 use market_participants_connector::catalog::test_support;
@@ -12,7 +10,6 @@ use crate::{
     test_support::{catalog_with, loaded, scope, translate},
 };
 
-/// The route the fixture publishes on.
 fn fixture_route() -> VenueRoute {
     test_support::spot_route()
 }
@@ -23,7 +20,6 @@ fn selection(symbol: &str) -> InstrumentSelection {
     }
 }
 
-/// A catalogue that published one named listing on the fixture route.
 fn published() -> Arc<Catalog> {
     catalog_with(
         &fixture_route(),
@@ -35,8 +31,6 @@ fn published() -> Arc<Catalog> {
     )
 }
 
-/// The scopes a fixture caller hands its selector: the fixture route beside
-/// another scope of the same venue, so the venue has one to state.
 fn several_scopes() -> Arc<[LoadedScope]> {
     let spot = fixture_route();
     let perpetual = test_support::route(test_support::VENUE, "usd-m-perp");
@@ -47,14 +41,10 @@ fn several_scopes() -> Arc<[LoadedScope]> {
     ])
 }
 
-/// The loaded scopes of a venue that loaded one route only.
 fn one_scope() -> Arc<[LoadedScope]> {
     loaded(vec![scope(fixture_route(), &[CapabilityId::Candlesticks])])
 }
 
-/// The loaded scopes of a venue that publishes a catalog but serves none of what this
-/// caller requires: it is loaded, so the snapshot is not empty, and still none of
-/// its scopes is one the selector may offer.
 fn loaded_without_the_required_capability() -> Arc<[LoadedScope]> {
     loaded(vec![scope(fixture_route(), &[CapabilityId::MarketTrade])])
 }
@@ -69,8 +59,6 @@ fn filters(routes: Arc<[LoadedScope]>) -> InstrumentFilters {
     }
 }
 
-/// The control states the name the publication gave the listing and the route it
-/// is on, because the route is what tells two listings of one name apart.
 #[test]
 fn the_text_should_state_the_published_name_and_the_route_it_is_on() {
     let text = InstrumentButton::text(
@@ -87,8 +75,6 @@ fn the_text_should_state_the_published_name_and_the_route_it_is_on() {
     );
 }
 
-/// A venue the routing registers a single route for has nothing to tell apart, so
-/// the route it is on reads as the venue alone.
 #[test]
 fn a_venue_registered_for_one_route_should_state_the_venue_alone() {
     let text = InstrumentButton::text(
@@ -109,9 +95,6 @@ fn a_venue_registered_for_one_route_should_state_the_venue_alone() {
     );
 }
 
-/// A venue the routing registers several routes for keeps the whole route form,
-/// because the scope is what says which of them the listing is on — and the count
-/// is of every route the snapshot holds for that venue, whatever its capabilities.
 #[test]
 fn a_venue_registered_for_several_routes_should_state_its_whole_route() {
     let spot = fixture_route();
@@ -134,9 +117,6 @@ fn a_venue_registered_for_several_routes_should_state_its_whole_route() {
     );
 }
 
-/// A venue whose loaded scopes do not include the route states the venue alone: a route the
-/// snapshot does not hold is a market that is not loaded, and "not loaded" is a wait rather
-/// than a venue that was proved to have several scopes.
 #[test]
 fn a_scope_of_several_segments_should_be_stated_whole() {
     let perp_dex = test_support::route("hyperliquid", "perp-dex/xyz");
@@ -161,9 +141,6 @@ fn a_scope_of_several_segments_should_be_stated_whole() {
     );
 }
 
-/// A listing the published generation names nothing for is the localized unknown,
-/// and states no route beside it: the name is what a reader looks a listing up
-/// by, and a control that named no listing has nothing to place on a route.
 #[test]
 fn a_listing_no_generation_names_should_state_no_route() {
     let catalog = published();
@@ -185,9 +162,6 @@ fn a_listing_no_generation_names_should_state_no_route() {
     );
 }
 
-/// A generation republished after a text was stated names the listing again: the
-/// control reads the publication every time it states its text, so the superseded
-/// generation's string never covers the key the new one renamed.
 #[test]
 fn a_republished_generation_should_rename_what_the_control_states() {
     let catalog = published();
@@ -201,8 +175,6 @@ fn a_republished_generation_should_rename_what_the_control_states() {
     let before = InstrumentButton::text(&selection("BTCUSDT"), &routes, &catalog, &translate());
     let before_generation = catalog.generation_id();
 
-    // Generation B: the same key, listed against another quote asset, so the
-    // name the generation publishes for it changes while the key does not.
     test_support::publish_fixture_route(
         &catalog,
         &fixture_route(),
@@ -238,8 +210,6 @@ fn a_republished_generation_should_rename_what_the_control_states() {
     );
 }
 
-/// The filters' own answer decides the control: a snapshot with nothing this caller
-/// can read leaves the control disabled, and one scope that admits it makes it live.
 #[test]
 fn only_a_snapshot_that_offers_a_scope_leaves_the_control_live() {
     assert!(
@@ -263,8 +233,6 @@ fn only_a_snapshot_that_offers_a_scope_leaves_the_control_live() {
     );
 }
 
-/// Clicks go through the engine's real pointer path: a live control opens the selector
-/// (the dialog's overlay appears), and a disabled one carries no action at all.
 #[test]
 fn a_click_opens_the_selector_only_when_the_control_is_live() {
     let mut live = crate::test_support::Harness::new();
@@ -330,7 +298,6 @@ fn a_click_opens_the_selector_only_when_the_control_is_live() {
     );
 }
 
-/// The placeholder key is a catalogue message, not a spelling of this module's own.
 #[test]
 fn the_placeholder_is_a_catalogue_key_that_resolves() {
     {
@@ -343,13 +310,6 @@ fn the_placeholder_is_a_catalogue_key_that_resolves() {
     }
 }
 
-/// The handle hands the component back: releasing the control reclaims its signal scope and
-/// unregisters the click handler, so a caller that rebuilds its control does not grow the
-/// value store.
-///
-/// W2a review F2: `build` used to consume the button and answer with only its node, so a
-/// caller could not release the component at all and every rebuild leaked ten live slots
-/// (`live 18 → 28 → 38` over two language switches in the market-trade pane).
 #[test]
 fn releasing_the_control_should_reclaim_its_component() {
     let mut harness = crate::test_support::Harness::new();

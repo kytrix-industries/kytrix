@@ -1,6 +1,3 @@
-//! The tests of the settings shell: the two panes, the page switch, the theme and the language
-//! every control follows, and what releasing the page takes away.
-
 use std::io;
 
 use app_config::settings::{Appearance, Language};
@@ -11,12 +8,10 @@ use ui_core::event::{Action, KeyCode};
 
 use crate::{session::SettingsWriteError, settings_tests::test_support::Harness};
 
-/// The debug id of one page's appearance select trigger.
 fn appearance_key(key: &str) -> String {
     format!("{key}.appearance.appearance")
 }
 
-/// Opens one select and clicks the choice at `index`.
 fn choose(harness: &mut Harness, key: &str, index: usize) {
     harness.click_node(&format!("{key}:trigger"));
     harness.settle(2);
@@ -28,8 +23,6 @@ fn choose(harness: &mut Harness, key: &str, index: usize) {
     harness.settle(2);
 }
 
-/// Choosing dark in the appearance select stores the preference and applies it, without the
-/// composition root being asked to do it: the page projects the setting it owns.
 #[test]
 fn choosing_dark_in_the_appearance_select_should_store_and_apply_it() {
     let mut harness = Harness::new();
@@ -54,8 +47,6 @@ fn choosing_dark_in_the_appearance_select_should_store_and_apply_it() {
     );
 }
 
-/// Choosing a language in the language select stores it, and the page's own text is drawn in it on
-/// the frame that follows.
 #[test]
 fn choosing_a_language_should_store_it_and_redraw_the_page() {
     let mut harness = Harness::new();
@@ -72,7 +63,6 @@ fn choosing_a_language_should_store_it_and_redraw_the_page() {
     );
 }
 
-/// A write that cannot be stored is reported over the page, and leaves the settings as they were.
 #[test]
 fn a_write_that_cannot_be_stored_should_be_reported_over_the_page() {
     let mut harness = Harness::new();
@@ -106,8 +96,6 @@ fn a_write_that_cannot_be_stored_should_be_reported_over_the_page() {
     );
 }
 
-/// Two settings pages in one window do not share the controls: each one's kit keys carry its own
-/// instance prefix, and releasing one leaves the other wired.
 #[test]
 fn a_second_page_should_not_share_the_first_pages_controls() {
     let mut harness = Harness::new();
@@ -140,8 +128,6 @@ fn a_second_page_should_not_share_the_first_pages_controls() {
     );
 }
 
-/// Releasing the page takes its nodes and its sidebar actions away, so a closed page leaves
-/// nothing behind that a later page could dispatch to.
 #[test]
 fn releasing_the_page_should_take_its_nodes_and_actions_away() {
     let mut harness = Harness::new();

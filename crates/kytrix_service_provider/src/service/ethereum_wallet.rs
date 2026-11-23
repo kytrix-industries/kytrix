@@ -195,7 +195,6 @@ pub fn compare_ethereum_wallet_selections(
         .then_with(|| left.address.cmp(&right.address))
 }
 
-/// Returns the address when it is a canonical, lowercase Ethereum address.
 pub fn ethereum_wallet_address(value: &str) -> Option<&str> {
     (value.len() == MAX_ETHEREUM_WALLET_ADDRESS_BYTES
         && value.starts_with("0x")

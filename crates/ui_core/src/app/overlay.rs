@@ -1,7 +1,3 @@
-//! 浮层：创建 / 关闭 / 锚点重定位 / 提层 / 自下而上枚举。
-//!
-//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
-
 use super::{App, input, overlay_style};
 use crate::{
     error::EngineError,
@@ -15,36 +11,11 @@ use crate::{
     window::WindowId,
 };
 
-// ── P10：浮层 ──────────────────────────────────────────────────────────────
-
-/// 打开一个浮层（root 的最后一个子节点 ⇒ `order` 末尾 ⇒ 命中优先）。
-///
-/// 记录打开瞬间的**焦点候选**作为 **opener**（`restore_focus` 时关闭后还给触发按钮，R02-12）；
-/// `trap_focus` 置位时该浮层成为焦点作用域根（Tab 只在子树内循环、外部按下被消费）。
-///
-/// `opener` 的求值见函数体第一步：它是「这个浮层属于谁」的唯一依据
-/// （[`crate::interaction::overlay::in_modal_scope`] 沿 `opener` 链判断浮层是否属于模态）。
-///
-/// # Errors
-/// `UnknownWindow`（窗口已关闭）/ `StaleNode`（树结构被破坏）。
-/// 消费者：`App::create_overlay`。
 pub(crate) fn create_overlay(
     app: &mut App,
     window: WindowId,
     options: OverlayOptions,
 ) -> Result<Overlay, EngineError> {
-    // opener 取「创建浮层时的焦点候选」，**不能**用 `App::focused`：后者把模态作用域外的焦点
-    // 过滤成 `None`，而 `in_modal_scope` 对 `opener == None` 直接判「作用域外」——于是「同一个
-    // 回调里先开对话框、紧接着开它的下拉/菜单」（模态已建立、焦点还没被 `validate_focus`
-    // 修复）会得到 `opener = None`，菜单永久不可点（AR1b N1a）。
-    //
-    // 求值顺序（每一步都要求节点仍存活）：
-    // 1. **未过滤的原始焦点**（`Window::focus`），但只接受当前作用域内的：模态刚建立时焦点
-    //    仍在背景控件上，此时新开的浮层必须归属模态（top-layer 语义），不能被旧焦点带出作用域；
-    // 2. 本次创建前的**命中节点**（点击/滑过打开菜单，而焦点还没落上去）；
-    // 3. **当前焦点作用域根**（模态本身）：模态之上新开的浮层属于该模态。
-    //
-    // 没有模态时作用域为空，1/2 两步恒成立，行为与旧实现一致。
     let opener = app.windows.get(&window).and_then(|target| {
         let tree = target.tree();
         let scope = overlay_util::focus_scope_root(tree, tree.root());
@@ -66,12 +37,8 @@ pub(crate) fn create_overlay(
         return Err(EngineError::UnknownWindow { window });
     };
     let root = target.tree().root();
-    // 新建时还不知道浮层尺寸：`Above` / `Left` 首帧先按零尺寸定位，布局之后由
-    // resolve_overlay_placements 用实测尺寸纠正（P2-6）。
     let origin = interaction::resolve_placement(target.tree(), placement, Size::ZERO);
     let style = overlay_style(origin);
-    // 包装节点的 a11y 角色**只来自显式声明**（E12）：无 `role` ⇒ `GenericContainer`，
-    // 不再按「浮层槽」猜成 `Dialog`（P2-4b R12）。
     let node = NodeBuilder::boxed()
         .style(style)
         .a11y(a11y)
@@ -85,14 +52,10 @@ pub(crate) fn create_overlay(
             restore_focus,
         });
     }
-    // 反向索引：锚点纠位每帧只遍历浮层（`resolve_overlay_placements`）。
     target.tree_mut().note_overlay_container(node);
-    // 模态作用域建立 ⇒ 背景的 a11y `hidden` 语义整体改变：全树标 `A11Y`，下一笔增量交付
-    // 才能把 `inert` 背景送到 AT（否则背景节点没有脏位、影子树里永远留着旧值）。
     if trap_focus {
         crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
     }
-    // 作用域外的悬停立即结束（:hover / tooltip 不得在模态之上继续；与旧 `BlockMouse` 同义）。
     if trap_focus {
         input::revalidate_hover(app, window);
     }
@@ -102,26 +65,14 @@ pub(crate) fn create_overlay(
     Ok(Overlay::new(window, node))
 }
 
-/// 关闭浮层（节点不存在 ⇒ `false`）。
-/// 消费者：`App::close_overlay`。
 pub(crate) fn close_overlay(app: &mut App, overlay: &Overlay) -> bool {
     app.remove_node(overlay.window(), overlay.node()).is_ok()
 }
 
-/// 帧首按**上一帧布局的实测尺寸**重新求值锚点定位（P2-6）。
-///
-/// `Above` / `Left` 需要知道浮层自己的宽/高；新建时按零尺寸定位会让浮层盖住锚点。
-/// 这里是标准的 measure-then-place：**在布局之前**用上一帧的尺寸纠位，纠位写回后本帧
-/// 布局就会用新位置；只做一次（收敛条件：位置差 < 0.5 px 早退）。
-///
-/// **不能放在布局之后**：布局之后写 inset 会被 `settle_frame` 的「本轮已布局」判定吞掉
-/// `LAYOUT` 位，下一帧变 `Idle`，位置永远不生效（P1-2.2 的陷阱）。
-/// 消费者：`App::resolve_overlay_placements`。
 pub(crate) fn resolve_overlay_placements(app: &mut App, window: WindowId) {
     let Some(target) = app.windows.get_mut(&window) else {
         return;
     };
-    // 反向索引（`create_overlay` 时登记）：成本 O(浮层数)，与 root 的子节点数无关。
     let children: smallvec::SmallVec<[NodeId; 4]> =
         target.tree().overlay_containers().iter().copied().collect();
     let mut moved = false;
@@ -147,16 +98,11 @@ pub(crate) fn resolve_overlay_placements(app: &mut App, window: WindowId) {
         let _ = target.tree_mut().set_absolute_inset(node, origin);
         moved = true;
     }
-    // 纠位写回会弄脏布局，必须再调度一帧让它生效：否则第一帧按「零尺寸」定位后，
-    // 泵在没有后续输入时会直接阻塞，`Above` / `Left` 浮层永久盖住锚点（复审发现）。
-    // 收敛条件在上面（< 0.5 px 早退），所以最多多出两帧。
     if moved {
         app.request_frame();
     }
 }
 
-/// 重新定位浮层（相对根的逻辑像素点）。
-/// 消费者：`App::place_overlay`。
 pub(crate) fn place_overlay(app: &mut App, overlay: &Overlay, placement: OverlayPlacement) -> bool {
     let window = overlay.window();
     let node = overlay.node();
@@ -181,8 +127,6 @@ pub(crate) fn place_overlay(app: &mut App, overlay: &Overlay, placement: Overlay
     true
 }
 
-/// 把浮层提到最上层（重挂到 root 末尾）。
-/// 消费者：`App::bring_overlay_to_front`。
 pub(crate) fn bring_overlay_to_front(app: &mut App, overlay: &Overlay) -> bool {
     let window = overlay.window();
     let node = overlay.node();
@@ -198,8 +142,6 @@ pub(crate) fn bring_overlay_to_front(app: &mut App, overlay: &Overlay) -> bool {
         if target.tree_mut().append_child(root, node).is_err() {
             return false;
         }
-        // 多个模态浮层并存时「最上层」决定作用域；提层可能换掉作用域根 ⇒ 背景 hidden 语义
-        // 整体改变（同一份 [mark_modal_scope_changed] 理由）。
         if modal {
             crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
         }
@@ -214,8 +156,6 @@ pub(crate) fn bring_overlay_to_front(app: &mut App, overlay: &Overlay) -> bool {
     true
 }
 
-/// 当前窗口的浮层（自下而上）。
-/// 消费者：`App::overlays`。
 pub(crate) fn overlays(app: &App, window: WindowId) -> Vec<(NodeId, OverlayDismiss)> {
     let Some(target) = app.windows.get(&window) else {
         return Vec::new();
@@ -230,8 +170,6 @@ pub(crate) fn overlays(app: &App, window: WindowId) -> Vec<(NodeId, OverlayDismi
         .collect()
 }
 
-/// `Dismiss` 动作：关掉最上层浮层（含 `Explicit`）。
-/// 消费者：`App::dismiss_overlay`。
 pub(crate) fn dismiss_overlay(app: &mut App, window: WindowId) -> bool {
     let node = app.windows.get(&window).and_then(|target| {
         let tree = target.tree();

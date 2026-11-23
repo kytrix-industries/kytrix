@@ -1,10 +1,3 @@
-//! The fake Ethereum wallet the Ethereum wallet monitor tests answer through.
-//!
-//! It is the seam both the service and the pane read Ethereum wallets through, so it is shared
-//! rather than copied: what a pane's tests need to control is the same session the
-//! service's tests take, refuse and hold, and the same subscription they hand transfers
-//! to.
-
 use std::{
     collections::VecDeque,
     sync::{
@@ -30,10 +23,8 @@ use crate::{
     service::{EthereumWalletEventSubscription, EthereumWalletSession, EthereumWalletSource},
 };
 
-/// The account every fixture scope belongs to.
 pub(crate) const ACCOUNT: &str = "test-account";
 
-/// One reported transfer.
 pub(crate) fn transfer(event_id: &str, timestamp: i64) -> EthereumWalletTransfer {
     EthereumWalletTransfer {
         event_id: SmolStr::new(event_id),
@@ -45,15 +36,10 @@ pub(crate) fn transfer(event_id: &str, timestamp: i64) -> EthereumWalletTransfer
     }
 }
 
-/// One monitored address.
 pub(crate) fn selection(address: &str) -> EthereumWalletSelection {
     selection_at(address, 1)
 }
 
-/// One monitored address, created at `created_at`.
-///
-/// The list is read in the account's recency order, so a test that cares which of two
-/// addresses reads first says when each was added.
 pub(crate) fn selection_at(address: &str, created_at: i64) -> EthereumWalletSelection {
     EthereumWalletSelection {
         address: SmolStr::new(address),
@@ -61,7 +47,6 @@ pub(crate) fn selection_at(address: &str, created_at: i64) -> EthereumWalletSele
     }
 }
 
-/// What a read of the monitored addresses answers with.
 pub(crate) fn selections(
     selections: Vec<EthereumWalletSelection>,
     limit: usize,
@@ -72,11 +57,6 @@ pub(crate) fn selections(
     }
 }
 
-/// A feed a test grows the way a subscription does.
-///
-/// Each snapshot shares the transfers it inherited from the one before it, which is what
-/// makes a later report an edit to a list rather than a new set of rows: a test that built
-/// every snapshot from scratch would describe a feed whose transfers are all new.
 pub(crate) struct FakeFeed {
     state: TransferState,
 }
@@ -88,7 +68,6 @@ impl FakeFeed {
         }
     }
 
-    /// Retains one reported transfer and hands back the feed it produced.
     pub(crate) fn push(&mut self, event_id: &str, timestamp: i64) -> TransferSnapshot {
         self.state.push(transfer(event_id, timestamp));
         self.snapshot()
@@ -110,19 +89,13 @@ struct FakeSourceState {
     acquired: Vec<SmolStr>,
 }
 
-/// What the next `acquire_session` call finds.
 enum FakeSetup {
-    /// A session for the account that was asked for.
     Ready(FakeSession),
-    /// A refusal, the way an account whose credentials are gone answers.
     Failed(KytrixServiceError),
-    /// An acquisition that never answers, so the caller's cancellation is the only way
-    /// out.
     Blocked(Arc<OperationBlock>),
 }
 
 impl FakeSource {
-    /// Queues a session for `account`, which is what the next acquisition finds.
     pub(crate) fn session(&self, account: &str) -> FakeSession {
         let session = FakeSession::new(account);
         self.state()
@@ -131,12 +104,10 @@ impl FakeSource {
         session
     }
 
-    /// Queues a refusal in place of a session.
     pub(crate) fn refuse(&self, error: KytrixServiceError) {
         self.state().sessions.push_back(FakeSetup::Failed(error));
     }
 
-    /// Queues an acquisition that never answers.
     pub(crate) fn block(&self) -> Arc<OperationBlock> {
         let block = Arc::new(OperationBlock::default());
         self.state()
@@ -145,12 +116,10 @@ impl FakeSource {
         block
     }
 
-    /// How many sessions the service has asked for.
     pub(crate) fn sessions(&self) -> usize {
         self.state().acquired.len()
     }
 
-    /// The accounts the service has asked for a session of, in the order it asked.
     pub(crate) fn requested(&self) -> Vec<SmolStr> {
         self.state().acquired.clone()
     }
@@ -188,10 +157,6 @@ impl EthereumWalletSource for FakeSource {
     }
 }
 
-/// One account's session, as a test drives it.
-///
-/// The account is held outside the shared state because it never changes and a session's
-/// own `account_id` is a borrow of it.
 #[derive(Clone)]
 pub(crate) struct FakeSession {
     account_id: SmolStr,
@@ -207,7 +172,6 @@ pub(crate) struct FakeSessionState {
     pub fetches: usize,
     pub add_calls: usize,
     pub delete_calls: usize,
-    /// A change that never answers, held for the next mutation that is asked for.
     pub blocked_mutation: Option<Arc<OperationBlock>>,
     pub blocked_selections: Option<Arc<OperationBlock>>,
 }
@@ -231,7 +195,6 @@ impl FakeSession {
         }
     }
 
-    /// Queues one live subscription and hands back the knobs that drive it.
     pub(crate) fn subscribe(&self) -> FakeSubscriptionControl {
         let (events, receiver) = mpsc::channel(16);
         let (status, _) = watch::channel(SubscriptionStatus::Active);
@@ -251,32 +214,24 @@ impl FakeSession {
         }
     }
 
-    /// Queues a subscription the account is refused.
     pub(crate) fn refuse_subscription(&self, error: KytrixServiceError) {
         self.state().subscriptions.push_back(Err(error));
     }
 
-    /// Queues what a read of the monitored addresses answers with.
     pub(crate) fn answer_selections(&self, response: EthereumWalletSelectionsResponse) {
         self.state().selections.push_back(Ok(response));
     }
 
-    /// Queues a read the account is refused.
     pub(crate) fn refuse_selections(&self, error: EthereumWalletApiError) {
         self.state().selections.push_back(Err(error));
     }
 
-    /// Queues a change that never answers.
     pub(crate) fn block_mutation(&self) -> Arc<OperationBlock> {
         let block = Arc::new(OperationBlock::default());
         self.state().blocked_mutation = Some(block.clone());
         block
     }
 
-    /// Holds the next read of the monitored addresses open.
-    ///
-    /// A read that never answers is what a pane waiting for one is: it is the window in which
-    /// a pane has a live stream and still does not know what it is following.
     pub(crate) fn block_selections(&self) -> Arc<OperationBlock> {
         let block = Arc::new(OperationBlock::default());
         self.state().blocked_selections = Some(block.clone());
@@ -364,7 +319,6 @@ impl EthereumWalletSession for FakeSession {
     }
 }
 
-/// Holds an operation inside the session for as long as the test wants it held.
 async fn block_operation(blocked: Option<Arc<OperationBlock>>) {
     let Some(block) = blocked else {
         return;
@@ -376,13 +330,10 @@ async fn block_operation(blocked: Option<Arc<OperationBlock>>) {
     block.released.notified().await;
 }
 
-/// One live subscription inside the fake session.
 pub(crate) struct FakeSubscription {
     events: mpsc::Receiver<Result<EthereumWalletTransfer, TransportError>>,
     status: watch::Sender<SubscriptionStatus>,
     drops: Arc<AtomicUsize>,
-    /// The status this subscription takes on as it hands the next event over, which is how
-    /// a test puts a credential change and a transfer on the wire at the same moment.
     fail_on_delivery: Arc<Mutex<Option<TransportError>>>,
 }
 
@@ -392,22 +343,14 @@ impl Drop for FakeSubscription {
     }
 }
 
-/// One live subscription, as a test drives it.
 pub(crate) struct FakeSubscriptionControl {
     pub events: mpsc::Sender<Result<EthereumWalletTransfer, TransportError>>,
     pub status: watch::Sender<SubscriptionStatus>,
-    /// How many times this subscription has been dropped, which is how a test sees the
-    /// service let go of an account it no longer follows.
     pub drops: Arc<AtomicUsize>,
     fail_on_delivery: Arc<Mutex<Option<TransportError>>>,
 }
 
 impl FakeSubscriptionControl {
-    /// Fails the subscription as it hands its next event over.
-    ///
-    /// A credential change reaches a subscription as a status of its own, and a transfer
-    /// that was already on the wire is delivered beside it rather than after it. This is
-    /// what a test uses to put those two on the wire together.
     pub(crate) fn fail_on_delivery(&self, error: TransportError) {
         *self
             .fail_on_delivery
@@ -439,11 +382,6 @@ impl EthereumWalletEventSubscription for FakeSubscription {
     }
 }
 
-/// One operation a fake can be held inside.
-///
-/// Holding one is how a test pins the window an operation is open in: a read that is held
-/// is a read that has not answered yet, so what a pane reports while it is in flight is what
-/// the test is looking at rather than a race against the answer.
 #[derive(Default)]
 pub(crate) struct OperationBlock {
     started: Notify,
@@ -470,10 +408,6 @@ impl OperationBlock {
             .expect("the blocked operation should start");
     }
 
-    /// Lets the operation it holds answer.
-    ///
-    /// A held read answers with what the session was told to answer, so a test that waits
-    /// for one to leave the window it pinned does not have to hand it the answer again.
     pub(crate) fn release(&self) {
         self.released.notify_one();
     }
@@ -488,8 +422,6 @@ impl OperationBlock {
         .expect("the blocked operation should be dropped");
     }
 
-    /// Whether the operation has been let go, for a test that turns its own executor rather
-    /// than parking on this one.
     pub(crate) fn is_dropped(&self) -> bool {
         self.dropped.load(Ordering::SeqCst)
     }

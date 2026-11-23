@@ -1,37 +1,3 @@
-//! The updater: the state machine, the requests it runs, and the schedule they run on.
-//!
-//! [`Updater`] is the composition root's one handle on this feature. It is installed
-//! once (`Updater::install`), owns one frame route on the injected router, and is
-//! released with the application. The interface never talks to it through a global:
-//! the indicator and the dialog are handed the signal it writes
-//! ([`UpdaterView`]), and their controls call back into the methods here.
-//!
-//! # Why an inbox
-//!
-//! The asynchronous work — the metadata request, reading the completed payload,
-//! running the platform installer, and the download manager's task events — finishes
-//! off the interface thread. The engine has one way back ([`AppHandle::send`], a
-//! `Send` closure) and this crate's state is `!Send` (it holds the kit handles and the
-//! services aggregate), so the two sides meet in a message queue: a background task
-//! pushes a [`Message`] into a mutex-guarded inbox and wakes the engine, and the frame
-//! route drains the inbox on the interface thread and applies the messages. That is
-//! the same inversion the widget contract's `WidgetBinding` uses, for the same reason.
-//!
-//! # Timers
-//!
-//! The schedule (the delayed first check, the retry after a failed check, the retry of
-//! a refused task delete) runs on engine timers ([`App::after`]): they are dispatched
-//! at frame entry, they are the only clock tests advance, and they need no thread of
-//! their own. A timer callback captures a weak handle, so a released updater is a
-//! no-op rather than a panic.
-//!
-//! # The one read the interface has
-//!
-//! Every state the interface draws maps to exactly one [`UpdaterView`] value, which is
-//! written to one signal when (and only when) it changes. The indicator binds its
-//! existence and the dialog binds its copy to that signal, so a state change is a
-//! signal write, and a frame follows from it. Steady frames write nothing (I3).
-
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -72,54 +38,29 @@ use crate::{
     state::{CANCEL_RETRY_DELAY, FIRST_CHECK_DELAY, UpdaterState, retry_delay},
 };
 
-/// The key prefix the updater's kit controls are built with when the composition root
-/// does not name one.
-///
-/// The updater is one application-level control (one indicator, one dialog), so one
-/// constant prefix is right for it; a test that builds two updaters in one
-/// application passes its own prefix so their action identities cannot meet.
 const DEFAULT_KEY: &str = "kytrix.updater";
 
-/// Which line of a download the dialog draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DownloadPhase {
-    /// The transfer is in flight.
     Downloading,
-    /// The transfer is being stopped.
     Pausing,
-    /// The transfer is stopped at its partial file.
     Paused,
 }
 
-/// What the interface draws, as one value.
-///
-/// [`UpdaterView::offered`] is what the indicator exists for; the rest is what the
-/// dialog's content is built from. A view is `Copy` and small, so the signal that
-/// carries it is cheap to compare and a write only happens when the shape really moved
-/// (a progress report that draws the same percentage does not write).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdaterView {
-    /// A newer release is available and nothing is being done about it.
     Notes,
-    /// The payload of the available release is being downloaded (or stopped).
     Download {
-        /// Bytes accepted so far.
         downloaded: u64,
-        /// The size the response named, when it named one.
         total: Option<u64>,
-        /// Which of the three download lines is current.
         phase: DownloadPhase,
     },
-    /// The payload is downloaded, waiting for the user.
     Downloaded,
-    /// The payload is being installed.
     Installing,
-    /// The last attempt failed, with the catalogue key it is stated with.
     Failure(&'static str),
 }
 
 impl UpdaterView {
-    /// The view of one state, or `None` when there is no release to draw.
     fn of(state: &UpdaterState) -> Option<Self> {
         match state {
             UpdaterState::Idle | UpdaterState::Checking => None,
@@ -145,16 +86,11 @@ impl UpdaterView {
         }
     }
 
-    /// Whether the update indicator exists for this view.
-    ///
-    /// A failed attempt keeps the button: a failure to download is not a release that
-    /// stopped existing.
     #[must_use]
     pub fn offered(self) -> bool {
         matches!(self, Self::Notes | Self::Failure(_))
     }
 
-    /// The download phase, while a download line is drawn.
     #[must_use]
     pub fn phase(self) -> Option<DownloadPhase> {
         match self {
@@ -163,10 +99,6 @@ impl UpdaterView {
         }
     }
 
-    /// The percentage a progress bar is drawn at, when the response named a length.
-    ///
-    /// `None` for a chunked answer (no total to measure against) and for every view
-    /// that is not a download.
     #[must_use]
     pub fn percent(self) -> Option<f32> {
         let Self::Download {
@@ -181,26 +113,13 @@ impl UpdaterView {
     }
 }
 
-/// What the updater needs from the composition root.
-///
-/// The rest of what it uses — translation, language, settings, theme, runtime and the
-/// three application-level registries kit components need — arrives with the
-/// [`WidgetServices`] aggregate the composition root already owns, exactly the way a
-/// widget receives it. The two collaborators here are the ones the toolkit used to
-/// install as globals.
 pub struct UpdaterDeps {
-    /// The application's transport: the routes, the clients and the operation barrier.
     pub transport: Arc<TransportHub>,
-    /// The process-wide download manager, behind the seam this crate asks through.
     pub downloads: Rc<dyn DownloadService>,
-    /// Where the metadata is read from; `None` = the compiled-in endpoint.
-    ///
-    /// A test points this at a loopback server; production leaves it `None`.
     pub endpoint: Option<Url>,
 }
 
 impl UpdaterDeps {
-    /// The deps over the application's transport and download manager.
     #[must_use]
     pub fn new(transport: Arc<TransportHub>, downloads: Rc<dyn DownloadService>) -> Self {
         Self {
@@ -210,7 +129,6 @@ impl UpdaterDeps {
         }
     }
 
-    /// Reads the metadata from `endpoint` instead of the compiled-in one (tests).
     #[must_use]
     pub fn with_endpoint(mut self, endpoint: Url) -> Self {
         self.endpoint = Some(endpoint);
@@ -218,45 +136,34 @@ impl UpdaterDeps {
     }
 }
 
-/// One message the interface thread has to apply.
-///
-/// Every variant is `Send`: the inbox is the only thing that crosses back.
 enum Message {
-    /// The metadata request finished.
     Checked {
         generation: u64,
         result: Result<Option<ReleaseInfo>, UpdaterError>,
     },
-    /// Reading a completed download's file finished.
     PayloadRead {
         generation: u64,
         task: DownloadId,
         result: Result<Vec<u8>, UpdaterError>,
     },
-    /// The platform installer finished.
     Installed {
         generation: u64,
         result: Result<(), InstallError>,
     },
-    /// The download manager published something about one of its tasks.
     Download {
         generation: u64,
         event: DownloadEvent,
     },
 }
 
-/// The mutex-guarded queue the background tasks push messages into.
 type Inbox = Arc<Mutex<VecDeque<Message>>>;
 
-/// Pushes one message, ignoring a poisoned lock (the last thing a panicking frame can
-/// do is drop a background report; nothing reads the queue after that anyway).
 fn push_message(inbox: &Inbox, message: Message) {
     if let Ok(mut queue) = inbox.lock() {
         queue.push_back(message);
     }
 }
 
-/// Takes every message delivered so far, in arrival order.
 fn drain_messages(inbox: &Inbox) -> Vec<Message> {
     match inbox.lock() {
         Ok(mut queue) => queue.drain(..).collect(),
@@ -264,21 +171,12 @@ fn drain_messages(inbox: &Inbox) -> Vec<Message> {
     }
 }
 
-/// The updater the composition root installed.
-///
-/// `Clone` shares the one core, so the interface may hold a handle for as long as it
-/// lives while the composition root keeps the original.
 #[derive(Clone)]
 pub struct Updater {
     core: Rc<RefCell<UpdaterCore>>,
 }
 
 impl Updater {
-    /// Installs the updater over the application's services.
-    ///
-    /// Registers the frame route, subscribes to the download manager, and schedules
-    /// this launch's first check (it is delayed rather than run here, so it does not
-    /// compete with everything else a launch is doing).
     pub fn install(
         app: &mut App,
         window: WindowId,
@@ -288,12 +186,6 @@ impl Updater {
         Self::install_with_key(app, window, services, deps, DEFAULT_KEY)
     }
 
-    /// Installs the updater with a key prefix of the caller's choosing.
-    ///
-    /// The prefix is what the indicator's and the dialog's kit components derive their
-    /// action identities from, so it must be unique among the application's kit keys
-    /// (one updater per application: `kytrix.updater`). Tests that build two updaters
-    /// in one application pass different prefixes.
     pub fn install_with_key(
         app: &mut App,
         window: WindowId,
@@ -365,24 +257,17 @@ impl Updater {
         Self { core }
     }
 
-    /// The view the interface draws, when there is a release to draw.
     #[must_use]
     pub fn view(&self, app: &App) -> Option<UpdaterView> {
         let core = self.core.borrow();
         *app.read(&core.view)
     }
 
-    /// The signal the indicator and the dialog bind to.
     #[must_use]
     pub(crate) fn view_signal(&self) -> Signal<Option<UpdaterView>> {
         self.core.borrow().view
     }
 
-    /// Opens the dialog for the update on offer, if there is one.
-    ///
-    /// This is what the indicator's press does; the dialog follows the updater from
-    /// then on and stays open until it is dismissed (or the application is replaced
-    /// under it by the installer).
     pub fn open_dialog(&self, app: &mut App) {
         let mut core = self.core.borrow_mut();
         if core.released {
@@ -394,22 +279,17 @@ impl Updater {
         }
     }
 
-    /// Whether this updater has been released.
     #[must_use]
     pub fn is_released(&self) -> bool {
         self.core.borrow().released
     }
 
-    /// Releases the updater: route, subscription, timers, dialog components and the
-    /// signals it minted. Idempotent; returns how many signal slots came back.
     pub fn release(&self, app: &mut App) -> usize {
         let mut core = self.core.borrow_mut();
         if core.released {
             return 0;
         }
         core.released = true;
-        // Late reports from work already in flight must not be applied to a released
-        // updater; the generation is what every message carries.
         core.generation = core.generation.saturating_add(1);
         if let Some(route) = core.route.take() {
             core.services.frame_router.unregister(route);
@@ -441,7 +321,6 @@ impl std::fmt::Debug for Updater {
     }
 }
 
-/// The one core behind every handle.
 pub(crate) struct UpdaterCore {
     window: WindowId,
     services: Rc<WidgetServices>,
@@ -457,54 +336,27 @@ pub(crate) struct UpdaterCore {
     inbox: Inbox,
     generation: u64,
     state: UpdaterState,
-    /// The view last written to the signal (a write is a change, never a report).
     last_view: Option<UpdaterView>,
-    /// The check in flight, or the one waiting for its delay.
-    ///
-    /// `Some` exactly while a check is scheduled, so what it holds is also what says
-    /// whether this launch still has an attempt left.
     check_timer: Option<TimerId>,
-    /// Whether a metadata request is in flight (the timer has fired, the result has
-    /// not arrived).
     check_running: bool,
-    /// Whether the installer is running; it is never replaced.
     installing: bool,
-    /// The read of a completed download's temporary file, when one is running.
     reading: Option<DownloadId>,
-    /// The provider task of the attempt the state is about.
-    ///
-    /// Kept when an attempt fails, because the retry resumes that task and its partial
-    /// file instead of adding a second transfer; cleared as soon as the attempt ends
-    /// with nothing left to resume.
     download_task: Option<DownloadId>,
-    /// The tasks whose removal this updater is following, each with how many times its
-    /// delete was already asked for again.
     cleanups: AHashMap<DownloadId, u8>,
-    /// Failed checks spent since the application started, which the backoff counts.
     failed_checks: usize,
-    /// The download manager subscription, held because dropping it would stop the
-    /// events the dialog follows.
     subscription: Option<DownloadSubscription>,
-    /// The dialog, built on first use and kept (closed) afterwards.
     dialog: Option<UpdateDialog>,
-    /// Whether the user asked for the dialog; cleared when it has closed itself.
     dialog_requested: bool,
-    /// The frame route, unregistered on release.
     route: Option<RouteId>,
     released: bool,
-    /// A weak handle on `self`, for the timers and the dialog's controls.
     self_weak: Weak<RefCell<UpdaterCore>>,
 }
 
 impl UpdaterCore {
-    /// The services the updater was installed over (the dialog's open command and
-    /// theme are read through it).
     pub(crate) fn services(&self) -> &WidgetServices {
         &self.services
     }
 
-    /// The one frame route: drain what the background work delivered, publish the view,
-    /// synchronize the kit components.
     fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         if self.released {
             return Ok(());
@@ -516,7 +368,6 @@ impl UpdaterCore {
         self.sync_dialog(app)
     }
 
-    /// Applies one message, if it belongs to this generation of the updater.
     fn apply(&mut self, app: &mut App, message: Message) {
         match message {
             Message::Checked { generation, result } if generation == self.generation => {
@@ -535,13 +386,10 @@ impl UpdaterCore {
             Message::Download { generation, event } if generation == self.generation => {
                 self.download_event(app, &event);
             }
-            // A message from an updater that was released while the work was in
-            // flight: nothing it says is about this interface any more.
             _ => {}
         }
     }
 
-    /// Writes the view when it moved; a steady frame writes nothing (I3).
     fn publish_view(&mut self, app: &mut App) {
         let view = UpdaterView::of(&self.state);
         if view == self.last_view {
@@ -551,12 +399,10 @@ impl UpdaterCore {
         let _ = app.write(&self.view, view);
     }
 
-    /// Starts this launch's update schedule.
     fn start(&mut self, app: &mut App) {
         self.schedule_check(app, FIRST_CHECK_DELAY);
     }
 
-    /// Runs a check once `delay` has passed.
     fn schedule_check(&mut self, app: &mut App, delay: Duration) {
         let weak = self.self_weak.clone();
         self.check_timer = app
@@ -568,7 +414,6 @@ impl UpdaterCore {
             .ok();
     }
 
-    /// Asks the metadata endpoint whether a newer release exists.
     fn check_now(&mut self, app: &mut App) {
         if self.released || self.check_running || !self.state.begin_check() {
             return;
@@ -577,9 +422,6 @@ impl UpdaterCore {
         self.check_running = true;
         self.publish_view(app);
 
-        // The endpoint is compiled in unless the deps name one, so a wrong constant
-        // is a build defect; it is still answered as a failed check rather than a
-        // panic, because that is what the schedule around this already handles.
         let endpoint = match self.endpoint.clone() {
             Some(endpoint) => endpoint,
             None => match Url::parse(publish::METADATA_ENDPOINT) {
@@ -611,7 +453,6 @@ impl UpdaterCore {
         });
     }
 
-    /// Applies what a check found, and schedules the next one when it failed.
     fn finish_check(&mut self, app: &mut App, result: Result<Option<ReleaseInfo>, UpdaterError>) {
         self.check_running = false;
         self.check_timer = None;
@@ -621,10 +462,6 @@ impl UpdaterCore {
                 self.state.check_finished(release);
             }
             Err(error) => {
-                // Nobody asked for this update, so nobody is told it could not be
-                // looked for: the button appearing is the whole of its report. What
-                // is left is to try again a few times, in case this is a machine
-                // whose network is not up yet.
                 log::debug!("the update check failed: {error}");
                 self.state = UpdaterState::Idle;
                 let retry = retry_delay(self.failed_checks);
@@ -637,14 +474,7 @@ impl UpdaterCore {
         self.publish_view(app);
     }
 
-    /// Downloads the offered release through the download manager.
-    ///
-    /// An earlier attempt that failed is retried rather than replaced: the manager
-    /// kept its task and partial file, so the retry continues the bytes that already
-    /// arrived instead of fetching the payload again into a second temporary file.
     fn download(&mut self, app: &mut App) {
-        // A platform that cannot install a payload does not fetch one: it would hold
-        // the whole package on disk for a button it does not have.
         if !install::supported() {
             return;
         }
@@ -654,30 +484,20 @@ impl UpdaterCore {
         if let Some(task) = self.download_task {
             match self.downloads.task(task).map(|task| task.status) {
                 Some(DownloadStatus::Paused { .. } | DownloadStatus::Failed { .. }) => {
-                    // The manager still owns this attempt's partial file, so the retry
-                    // resumes it; `begin_download` is what moves the state on from the
-                    // failure, or from the offer it was dismissed back to.
                     if self.downloads.resume(task) && self.state.begin_download(task).is_some() {
                         self.publish_view(app);
                     }
                     return;
                 }
                 Some(DownloadStatus::Downloading { .. } | DownloadStatus::Pausing { .. }) => {
-                    // The transfer this attempt started is still in flight; a second
-                    // one would write a second file.
                     return;
                 }
                 Some(DownloadStatus::Completed { .. }) => {
-                    // The payload is here, and the read of its file is what finishes
-                    // this download; fetching it again would replace what is being
-                    // read.
                     return;
                 }
                 Some(DownloadStatus::Deleting) | None => self.download_task = None,
             }
         }
-        // A path of this attempt's own: a destination two tasks shared would let one
-        // of them assemble its payload into the other's file.
         let destination = std::env::temp_dir()
             .join(format_smolstr!("kytrix-update-{}.bin", DownloadId::new()).as_str());
         let request = DownloadRequest {
@@ -690,9 +510,6 @@ impl UpdaterCore {
             expected_size: None,
         };
         let task = self.downloads.add(request);
-        // The manager publishes the task while it is added, before this state knows
-        // the task is its own, so the addition is not what moves the state; the event
-        // handler ignores it and the download starts here.
         if self.state.begin_download(task).is_none() {
             log::debug!("the offered update disappeared while its download was being added");
             self.downloads.delete(task);
@@ -703,20 +520,11 @@ impl UpdaterCore {
         self.publish_view(app);
     }
 
-    /// Applies what the download manager reported about one of its tasks.
-    ///
-    /// Every event names its task: a report for a task this state no longer holds —
-    /// a download that was cancelled or replaced — is not about this dialog.
     fn download_event(&mut self, app: &mut App, event: &DownloadEvent) {
         match event {
-            // The task is gone, which is what giving it up asked for: there is
-            // nothing left to follow for it.
             DownloadEvent::TaskRemoved(id) if self.cleanups.remove(id).is_some() => {
                 return;
             }
-            // The task this updater gave up is not the dialog's download any more;
-            // what is left to do for it is getting its task and temporary file
-            // removed.
             DownloadEvent::TaskUpdated(task) if self.cleanups.contains_key(&task.id) => {
                 self.cleanup_failed(app, task);
                 return;
@@ -724,9 +532,6 @@ impl UpdaterCore {
             _ => {}
         }
         let DownloadEvent::TaskUpdated(task) = event else {
-            // A task that left is a delete that settled. Cancelling has already put
-            // the release back on offer, and a completed read has already taken the
-            // file it needed.
             return;
         };
         let Some(download) = self.state.download() else {
@@ -757,8 +562,6 @@ impl UpdaterCore {
                 self.read_payload(task.id, task.destination.clone());
             }
             DownloadStatus::Failed { failure } => {
-                // The manager keeps a failed task and its partial file, so
-                // `download_task` stays: the next download resumes it.
                 self.state.attempt_failed(UpdaterError::Download(*failure));
                 self.publish_view(app);
             }
@@ -766,19 +569,8 @@ impl UpdaterCore {
         }
     }
 
-    /// Follows the delete of a task this updater gave up, which the manager answered
-    /// with a failure.
-    ///
-    /// The dialog has already moved on by the time this runs — the release is on
-    /// offer again, or the payload is waiting to install — so nothing here may touch
-    /// what it draws: what a failure costs is a task the manager keeps and a
-    /// temporary file nobody removes, which one more delete can still fix. A second
-    /// failure is left in the log rather than retried forever, and only for the task
-    /// that failed: another removal being followed still has its own retry.
     fn cleanup_failed(&mut self, app: &mut App, task: &DownloadTask) {
         let DownloadStatus::Failed { failure } = task.status else {
-            // A delete still in flight, or a status only a bug could publish here:
-            // the removal or its failure is still to come.
             return;
         };
         let Some(retries) = self.cleanups.get_mut(&task.id) else {
@@ -799,9 +591,6 @@ impl UpdaterCore {
         *retries = 1;
         let id = task.id;
         let weak = self.self_weak.clone();
-        // One retry, on an engine timer: the delete failed because the attempt that
-        // owns the file is still writing it, and a moment later is enough to outlast
-        // that write.
         let _ = app.after(self.window, CANCEL_RETRY_DELAY, move |_app| {
             if let Some(core) = weak.upgrade() {
                 core.borrow_mut().retry_cleanup(id);
@@ -809,25 +598,15 @@ impl UpdaterCore {
         });
     }
 
-    /// Asks the manager to delete a task this updater follows once more, if it still
-    /// holds it.
     fn retry_cleanup(&mut self, id: DownloadId) {
         if !self.cleanups.contains_key(&id) {
             return;
         }
         if !self.downloads.delete(id) {
-            // The manager no longer holds the task, so its files went with it.
             self.cleanups.remove(&id);
         }
     }
 
-    /// Reads a completed download's file and removes the task that owns it.
-    ///
-    /// The installer takes bytes rather than a path, so the file is read into memory
-    /// first; either way the file has done its job afterwards, which is why the task
-    /// and its file are removed whatever the read produced. The removal is followed
-    /// like a cancel's, so a delete the file system refuses is retried once instead
-    /// of leaving the task and its temporary file behind.
     fn read_payload(&mut self, task: DownloadId, destination: std::path::PathBuf) {
         if self.reading == Some(task) {
             return;
@@ -860,10 +639,6 @@ impl UpdaterCore {
         });
     }
 
-    /// Applies what reading a completed download produced.
-    ///
-    /// A read that finishes after the user gave the download up is dropped: the task
-    /// it names is no longer the one the state holds.
     fn finish_payload(
         &mut self,
         app: &mut App,
@@ -873,15 +648,9 @@ impl UpdaterCore {
         if self.reading == Some(task) {
             self.reading = None;
         }
-        // Reading the payload is what deletes its task, whichever way the read went:
-        // this attempt has nothing left to resume.
         if self.download_task == Some(task) {
             self.download_task = None;
         }
-        // Following the delete is what makes a refused one a retried removal rather
-        // than a task and a file nobody owns. A delete already being followed keeps
-        // its retry count, so accepting the same task again cannot buy it another
-        // retry.
         if self.downloads.delete(task) {
             self.cleanups.entry(task).or_insert(0);
         }
@@ -906,7 +675,6 @@ impl UpdaterCore {
         }
     }
 
-    /// Stops a download in flight at its partial file, so it can be resumed.
     fn pause_download(&mut self, app: &mut App) {
         let UpdaterState::Downloading(download) = &self.state else {
             return;
@@ -917,7 +685,6 @@ impl UpdaterCore {
         }
     }
 
-    /// Continues a stopped download from its partial file.
     fn resume_download(&mut self, app: &mut App) {
         let UpdaterState::Paused(download) = &self.state else {
             return;
@@ -928,38 +695,25 @@ impl UpdaterCore {
         }
     }
 
-    /// Stops the download in flight and offers the release again.
     fn cancel_download(&mut self, app: &mut App) {
         let Some(download) = self.state.download() else {
             return;
         };
         let task = download.task;
-        // A task the manager no longer holds is already gone, which is what the cancel
-        // asks for; only a delete the manager accepted has an outcome to follow,
-        // because a failed one would leave its task and its temporary file behind with
-        // nobody to remove them. Only this task's own removal is put here: another one
-        // being followed is not this cancel's to reset.
         if self.downloads.delete(task) {
             self.cleanups.insert(task, 0);
         }
-        // The manager removes the task and its file, so a later download adds a new
-        // one rather than resuming this.
         self.download_task = None;
         self.state.abandon_attempt();
         self.publish_view(app);
     }
 
-    /// Gives up a downloaded payload: the bytes are dropped and the release is offered
-    /// again.
     fn discard_download(&mut self, app: &mut App) {
-        // The task was deleted once its file was read, so there is nothing here a later
-        // download could resume.
         self.download_task = None;
         self.state.abandon_attempt();
         self.publish_view(app);
     }
 
-    /// Installs the downloaded payload.
     fn install(&mut self, app: &mut App) {
         if self.installing {
             return;
@@ -985,12 +739,6 @@ impl UpdaterCore {
         });
     }
 
-    /// Applies what the install produced.
-    ///
-    /// On Windows nothing arrives here: the library starts the installer and exits the
-    /// process from inside the install call. On macOS and Linux the files are in place
-    /// and the application leaves, so what the user starts next is the version that
-    /// was just installed rather than the one that replaced it.
     fn finish_install(&mut self, app: &mut App, result: Result<(), InstallError>) {
         match result {
             Ok(()) => {
@@ -1005,13 +753,11 @@ impl UpdaterCore {
         }
     }
 
-    /// The dialog closed on a failure: the release is offered again.
     fn dismiss_failure(&mut self, app: &mut App) {
         self.state.failure_dismissed();
         self.publish_view(app);
     }
 
-    /// Opens or closes the dialog so that it shows the state, and synchronizes it.
     fn sync_dialog(&mut self, app: &mut App) -> Result<(), EngineError> {
         let window = self.window;
         let Some(data) = self.dialog_data(app) else {
@@ -1051,7 +797,6 @@ impl UpdaterCore {
         Ok(())
     }
 
-    /// What the dialog is opened with, when there is a release to show.
     fn dialog_data(&self, app: &App) -> Option<DialogData> {
         let view = UpdaterView::of(&self.state)?;
         let release = self.state.release()?;
@@ -1070,7 +815,6 @@ impl UpdaterCore {
         })
     }
 
-    /// The controls the dialog calls back into.
     fn handle_control(&mut self, app: &mut App, control: DialogControl) {
         match control {
             DialogControl::Download => self.download(app),
@@ -1093,8 +837,6 @@ impl UpdaterCore {
         }
     }
 
-    /// Dismisses the dialog: the updater keeps its state, so the offer is still behind
-    /// the indicator when the dialog has gone.
     fn close_dialog(&mut self, app: &mut App) {
         self.dialog_requested = false;
         if let Some(dialog) = self.dialog.as_mut() {
@@ -1103,33 +845,18 @@ impl UpdaterCore {
     }
 }
 
-/// A dialog control that acts on the updater.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DialogControl {
-    /// Start downloading the offered release.
     Download,
-    /// Stop the download in flight at its partial file.
     Pause,
-    /// Continue a stopped download.
     Resume,
-    /// Give up the attempt in flight and offer the release again.
     Cancel,
-    /// Give up a downloaded payload.
     Discard,
-    /// Hand the payload to the installer.
     Install,
-    /// Close the dialog on a failure and offer the release again.
     DismissFailure,
-    /// Close the dialog and change nothing: dismissing an offer is not an answer to it.
     Close,
 }
 
-/// Ends the application the way closing its last window does.
-///
-/// The engine has no separate quit entry: `Application::run` returns once no window is
-/// left. On Windows the installer has already replaced the process by the time this
-/// could run; on macOS and Linux the files are in place and the user restarts the
-/// version that was installed.
 fn quit(app: &mut App) {
     let windows = app.windows().map(|(window, _)| window).collect::<Vec<_>>();
     for window in windows {
@@ -1137,11 +864,6 @@ fn quit(app: &mut App) {
     }
 }
 
-/// Wires one dialog control's press back into the updater.
-///
-/// The callback is what a kit button runs on the interface thread; it upgrades the
-/// weak handle the dialog was built with, so a dialog that outlived a released updater
-/// is a no-op rather than a panic.
 pub(crate) fn control_callback(
     updater: &Weak<RefCell<UpdaterCore>>,
     control: DialogControl,
@@ -1155,26 +877,16 @@ pub(crate) fn control_callback(
     }
 }
 
-/// Test-only accessors over the updater's core.
-///
-/// A trait rather than a second inherent `impl` (the workspace forbids more than one),
-/// and crate-visible rather than private so the dialog's and the indicator's own tests
-/// drive the updater the same way their production code does.
 #[cfg(test)]
 pub(crate) trait UpdaterTestExt {
-    /// The core, for a test in another module of this crate.
     fn test_core(&self) -> Rc<RefCell<UpdaterCore>>;
 
-    /// Puts the updater into a state and publishes what the interface binds to.
     fn test_set_state(&self, app: &mut App, state: UpdaterState);
 
-    /// Runs one dialog control, as its button's press would.
     fn test_control(&self, app: &mut App, control: DialogControl);
 
-    /// Applies a finished check.
     fn test_finish_check(&self, app: &mut App, result: Result<Option<ReleaseInfo>, UpdaterError>);
 
-    /// Applies a finished payload read.
     fn test_finish_payload(
         &self,
         app: &mut App,
@@ -1182,38 +894,26 @@ pub(crate) trait UpdaterTestExt {
         result: Result<Vec<u8>, UpdaterError>,
     );
 
-    /// Applies a finished install.
     fn test_finish_install(&self, app: &mut App, result: Result<(), InstallError>);
 
-    /// Cancels the scheduled check, so a test that advances the clock does not reach
-    /// the network.
     fn test_cancel_check(&self, app: &mut App);
 
-    /// The task the attempt is about.
     fn test_download_task(&self) -> Option<DownloadId>;
 
-    /// How many task removals the updater is following.
     fn test_cleanups(&self) -> usize;
 
-    /// How many failed checks this launch has spent.
     fn test_failed_checks(&self) -> usize;
 
-    /// Whether a check is scheduled (the delayed first one, or a retry).
     fn test_has_scheduled_check(&self) -> bool;
 
-    /// The generation late messages are checked against.
     fn test_generation(&self) -> u64;
 
-    /// Pushes one metadata result into the inbox, as a finished task would.
     fn test_push_checked(&self, generation: u64, result: Result<Option<ReleaseInfo>, UpdaterError>);
 
-    /// Whether the dialog is open.
     fn test_dialog_open(&self, app: &App) -> bool;
 
-    /// Whether the dialog is playing its exit (its content is still drawn).
     fn test_dialog_closing(&self) -> bool;
 
-    /// Presses the dialog's control whose key ends with `.{suffix}`.
     fn test_press(&self, app: &mut App, suffix: &str) -> bool;
 }
 
@@ -1350,8 +1050,6 @@ mod tests {
         test_support::{Harness, release},
     };
 
-    /// A harness with the updater installed and its first check disarmed, so a test
-    /// that advances the clock never reaches the network.
     fn installed() -> (Harness, Updater) {
         let mut harness = Harness::new();
         let updater = harness.install_updater(None);

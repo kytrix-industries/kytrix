@@ -1,13 +1,3 @@
-//! The pane's own behaviour: what it reports, what the header offers, what the body
-//! draws, and what it leaves behind when it goes.
-//!
-//! The contract layer is driven directly — `load`, `sync`, `body`, `header`,
-//! `dispatch` and `release` are the hooks the framework calls — over the engine's
-//! headless host, because these tests are about this pane's decisions rather than
-//! about the framework's dispatch. A headless host composes no market directory (the
-//! connector needs the application's own runtime), so the pane is built over a fixture
-//! directory the same way the service is built over a fake venue.
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -50,10 +40,8 @@ use crate::{
     test_support::{charted_market, event_ref, event_with, order_book},
 };
 
-/// The size the pane's body is laid out in, which is what the canvas is measured from.
 const PAGE: (f32, f32) = (900.0, 520.0);
 
-/// The translator the product ships: what these tests assert is the catalogue's copy.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -69,15 +57,12 @@ fn recovery() -> WidgetAction {
     WidgetAction::new("common.retry", |_| {})
 }
 
-/// The loaded market directory a test drives: which venues are loaded and which
-/// scopes each of them publishes.
 struct FixtureDirectory {
     venues: RefCell<Vec<VenueId>>,
     routes: RefCell<Vec<VenueRoute>>,
 }
 
 impl FixtureDirectory {
-    /// A directory with no venue loaded.
     fn empty() -> Rc<Self> {
         Rc::new(Self {
             venues: RefCell::new(Vec::new()),
@@ -85,7 +70,6 @@ impl FixtureDirectory {
         })
     }
 
-    /// A directory with `venues` loaded, the fixture route among them.
     fn loaded(venues: &[VenueId]) -> Rc<Self> {
         let directory = Self::empty();
         for venue in venues {
@@ -126,8 +110,6 @@ impl MarketDirectory for FixtureDirectory {
     }
 }
 
-/// A source whose reads never answer: the pane's own hooks are what these tests drive,
-/// and a service task that never resolves keeps the binding quiet.
 #[derive(Clone)]
 struct PendingSource;
 
@@ -194,23 +176,16 @@ impl crate::book::PredictionOrderBookSource for PendingSource {
     }
 }
 
-/// A pane the framework would have built, driven by a fake source and a fixture
-/// directory.
 struct Pane {
     widget: PredictionMarketWidget,
     status: WidgetStatus,
-    /// The signal scope the framework would have minted for this pane; a pane built
-    /// beside another gets its own, which is what makes the kit keys differ.
     scope: SignalScope,
-    /// How many times the pane reported a configuration change.
     publishes: Rc<Cell<usize>>,
-    /// The box the body and the header groups are built into.
     page: NodeId,
     header_left: NodeId,
     header_right: NodeId,
 }
 
-/// Runs `body` with this pane's own context, the way the framework would.
 fn with_pane_cx<R>(
     harness: &mut WidgetTestApp,
     pane: &mut Pane,
@@ -223,8 +198,6 @@ fn with_pane_cx<R>(
     body(&mut cx, &mut pane.widget)
 }
 
-/// Releases a pane the way the framework does: the widget hook first (its nodes are
-/// still alive), then the pane's signal scope.
 fn release_pane(harness: &mut WidgetTestApp, pane: &mut Pane) {
     let scope = pane.scope;
     with_pane_cx(harness, pane, |cx, widget| widget.release(cx));
@@ -267,8 +240,6 @@ fn pane_over(
     directory: Rc<FixtureDirectory>,
     config: PredictionMarketConfig,
 ) -> Pane {
-    // Every pane gets the scope the framework would mint for it, so releasing a pane
-    // releases its own values and the host's fixture values stay alive.
     let scope = harness.app_mut().signal_scope();
     let status = WidgetStatus::new(harness.app_mut(), scope);
     let page = page(harness);
@@ -309,7 +280,6 @@ fn pane(harness: &mut WidgetTestApp, directory: &Rc<FixtureDirectory>) -> Pane {
     )
 }
 
-/// A second pane in the same application: its own signal scope, its own status.
 fn peer_pane(harness: &mut WidgetTestApp, directory: &Rc<FixtureDirectory>) -> Pane {
     pane(harness, directory)
 }
@@ -357,8 +327,6 @@ fn select_event(pane: &mut Pane) {
     pane.widget.selection_title = Some("An event".into());
 }
 
-/// One reading of the fixture event's charted market, with one point per side per
-/// `(timestamp, probability)` pair.
 fn reading(
     range: PredictionRange,
     revision: u64,
@@ -441,7 +409,6 @@ fn report_book_snapshot(
     });
 }
 
-/// Reports one fixture book of the leg the panel is pointed at.
 fn report_book(
     harness: &mut WidgetTestApp,
     pane: &mut Pane,
@@ -452,7 +419,6 @@ fn report_book(
     report_book_snapshot(harness, pane, book);
 }
 
-/// The fixture book of the leg the panel is pointed at.
 fn book_of(
     pane: &Pane,
     bids: Vec<(&str, &str)>,
@@ -487,7 +453,6 @@ fn advance(harness: &mut WidgetTestApp, pane: &mut Pane, by: Duration) -> bool {
     painted
 }
 
-/// A pane with a selection and a loaded reading, its body and header built.
 fn ready_pane(harness: &mut WidgetTestApp, directory: &Rc<FixtureDirectory>) -> Pane {
     let mut pane = pane(harness, directory);
     select_event(&mut pane);
@@ -504,8 +469,6 @@ fn ready_pane(harness: &mut WidgetTestApp, directory: &Rc<FixtureDirectory>) -> 
     build_header(harness, &mut pane);
     pane
 }
-
-// ---- identity and configuration ------------------------------------------------
 
 #[test]
 fn the_widget_and_its_config_have_their_stable_identity_and_defaults() {
@@ -580,8 +543,6 @@ fn the_config_should_round_trip() {
 
     assert_eq!(decoded, config);
 }
-
-// ---- the directory gate --------------------------------------------------------
 
 #[test]
 fn a_pane_without_an_event_should_wait_with_the_select_prompt() {
@@ -741,9 +702,6 @@ fn a_terminal_chart_failure_should_release_the_book_lease() {
     assert!(pane.widget.book_pending.is_empty() || true);
 }
 
-/// The venue answers the chart's read with "that catalog is not loaded": the market
-/// the pane follows is not in memory any more, so the reading and the book read for it
-/// are both dropped, and the pane goes back to waiting for its directory.
 #[test]
 fn a_chart_whose_market_is_not_loaded_should_clear_the_book() {
     let mut harness = harness();
@@ -807,8 +765,6 @@ fn a_message_from_another_range_or_an_older_revision_should_be_refused() {
     let mut pane = ready_pane(&mut harness, &directory);
     let held = pane.widget.snapshot.clone().expect("a reading");
 
-    // A snapshot of another range: the key the pane accepts names the range it asked
-    // for, so a message from the old stream is refused outright.
     let stale_key = PredictionMarketStreamKey {
         event: event_ref(),
         market: None,
@@ -824,7 +780,6 @@ fn a_message_from_another_range_or_an_older_revision_should_be_refused() {
         pane.widget.snapshot.as_ref().expect("kept")
     ));
 
-    // An older revision of the stream the pane follows is refused too.
     let key = pane.widget.current_key().expect("a key");
     let older = reading(PredictionRange::Day1, 0, &[(1_000, "0.1")]);
     let message = Arc::new(PredictionMarketStreamMessage::Snapshot(older));
@@ -861,7 +816,6 @@ fn a_reliable_message_should_be_refused_by_key_waiting_and_failure() {
     harness.with_cx(|cx| pane.widget.apply_market_reliable(other_key, &message, cx));
     assert_eq!(state(&harness, &pane), WidgetState::Ready);
 
-    // A failure is terminal: a later status of the stream is not this pane's any more.
     report_market_status(
         &mut harness,
         &mut pane,
@@ -876,8 +830,6 @@ fn a_reliable_message_should_be_refused_by_key_waiting_and_failure() {
     harness.with_cx(|cx| pane.widget.apply_market_reliable(key, &message, cx));
     failed_state(&harness, &pane);
 }
-
-// ---- directory generations -----------------------------------------------------
 
 #[test]
 fn a_directory_generation_should_rerun_load_and_keep_the_reading() {
@@ -963,12 +915,10 @@ fn an_explicit_load_should_start_over_while_a_recovery_keeps_the_reading() {
     let mut pane = ready_pane(&mut harness, &directory);
     let held = pane.widget.snapshot.clone().expect("a reading");
 
-    // An explicit load (another selection/range decides it) drops the reading.
     pane.widget.snapshot = None;
     load(&mut harness, &mut pane);
     assert!(pane.widget.snapshot.is_none());
 
-    // A recovery keeps it: the user is recovering, not choosing another market.
     report_snapshot(&mut harness, &mut pane, held.clone());
     report_market_status(
         &mut harness,
@@ -991,8 +941,6 @@ fn an_explicit_load_should_start_over_while_a_recovery_keeps_the_reading() {
         "the retry is reported as work in progress"
     );
 }
-
-// ---- the body: legend, empty state, chart --------------------------------------
 
 #[test]
 fn an_empty_reading_should_keep_the_legend_and_the_ranges_around_an_empty_chart() {
@@ -1065,8 +1013,6 @@ fn a_reading_with_points_should_draw_the_legend_above_the_chart() {
     );
 }
 
-// ---- the pulse -----------------------------------------------------------------
-
 #[test]
 fn a_live_reading_should_pulse_only_when_the_newest_point_advances() {
     let mut harness = harness();
@@ -1085,7 +1031,6 @@ fn a_live_reading_should_pulse_only_when_the_newest_point_advances() {
         "a first reading is not a new observation"
     );
 
-    // The same newest point drawn again is the same moment, not a breath.
     report_snapshot(
         &mut harness,
         &mut pane,
@@ -1093,7 +1038,6 @@ fn a_live_reading_should_pulse_only_when_the_newest_point_advances() {
     );
     assert!(pane.widget.pulse.is_none());
 
-    // A newer point is a new observation.
     report_snapshot(
         &mut harness,
         &mut pane,
@@ -1125,8 +1069,6 @@ fn a_tick_during_a_running_pulse_should_not_restart_it() {
         "one tick advanced the breath"
     );
 
-    // Another tick at the same newest point (a revision that did not advance the
-    // point) does not restart the breath.
     report_snapshot(
         &mut harness,
         &mut pane,
@@ -1186,8 +1128,6 @@ fn reduce_motion_should_skip_the_pulse() {
         "a reader who asked for less motion is shown the final state"
     );
 }
-
-// ---- the book: requests, region, errors ---------------------------------------
 
 #[test]
 fn a_chart_snapshot_should_start_the_book_request_with_the_markets_legs() {
@@ -1266,9 +1206,6 @@ fn a_book_failure_should_be_shown_in_the_panel_and_recoverable() {
     );
 }
 
-/// A book that fails before any ladder is a failure of the whole region: the way back
-/// is a button of its own, its label is resolved when it is built, and a language
-/// switch rebuilds it (the kit has no text binding on a button, AGENTS §15.1).
 #[test]
 fn a_book_failure_without_a_ladder_should_offer_a_retry() {
     let mut harness = harness();
@@ -1581,7 +1518,6 @@ fn a_splitter_gesture_interrupted_by_hiding_should_not_report_its_notch() {
     });
     harness.with_cx(|cx| pane.widget.dispatch(&moved, cx));
 
-    // Hiding the book aborts the gesture: the bar it was measured on is gone.
     request(&mut harness, &mut pane, HeaderRequest::ToggleBook);
     let publishes = pane.publishes.get();
     let up = Event::Input(InputEvent::PointerUp {
@@ -1600,8 +1536,6 @@ fn a_splitter_gesture_interrupted_by_hiding_should_not_report_its_notch() {
     assert!(pane.widget.split_drag.is_none());
 }
 
-/// A drag that ends where it began moved nothing: the notch is reported only when the
-/// gesture left it somewhere else than the ratio it was built with.
 #[test]
 fn a_splitter_drag_back_to_its_start_should_not_report() {
     let mut harness = harness();
@@ -1944,8 +1878,6 @@ fn a_venue_unload_should_drop_the_book() {
     assert!(pane.widget.book_key.is_none());
 }
 
-// ---- the book: grouping --------------------------------------------------------
-
 #[test]
 fn the_grouping_select_should_appear_only_with_a_book() {
     let mut harness = harness();
@@ -2079,8 +2011,6 @@ fn an_empty_page_should_not_rewrite_the_stored_grouping() {
     );
 }
 
-// ---- stored choices ------------------------------------------------------------
-
 #[test]
 fn a_stored_book_choice_this_build_does_not_offer_should_be_reset_and_reported() {
     let mut harness = harness();
@@ -2121,8 +2051,6 @@ fn a_supported_book_choice_should_be_kept_and_not_reported() {
     assert_eq!(pane.widget.config.order_book_grouping, 10);
     assert_eq!(pane.publishes.get(), 0, "nothing was replaced");
 }
-
-// ---- the header ----------------------------------------------------------------
 
 #[test]
 fn the_header_should_offer_the_event_control_and_the_range_picker() {
@@ -2237,8 +2165,6 @@ fn a_language_switch_should_rewrite_the_empty_state() {
     assert_ne!(zh, empty_text, "the sentence follows the language");
 }
 
-// ---- two panes -----------------------------------------------------------------
-
 #[test]
 fn two_panes_should_keep_their_own_header_handlers() {
     let mut harness = harness();
@@ -2291,8 +2217,6 @@ fn two_panes_should_keep_their_own_header_handlers() {
         "releasing one pane removed another pane's handler"
     );
 }
-
-// ---- release -------------------------------------------------------------------
 
 #[test]
 fn releasing_the_pane_should_reclaim_every_value_slot() {

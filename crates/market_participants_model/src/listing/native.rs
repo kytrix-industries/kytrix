@@ -1,5 +1,3 @@
-//! The typed native identifiers of a route and what they resolve to.
-
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -20,7 +18,6 @@ use crate::{
     routing::ListingIdentifierKind,
 };
 
-/// One closed native lookup key of a listing on one route.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "identifier")]
 pub enum ListingIdentifier {
@@ -78,7 +75,6 @@ pub enum ListingIdentifier {
 }
 
 impl ListingIdentifier {
-    /// Returns the identifier kind of this variant.
     pub fn kind(&self) -> ListingIdentifierKind {
         match self {
             Self::Symbol(_) => ListingIdentifierKind::Symbol,
@@ -95,7 +91,6 @@ impl ListingIdentifier {
         }
     }
 
-    /// Returns the symbol value this identifier normalizes, when it has one.
     pub fn symbol_value(&self) -> Option<&str> {
         match self {
             Self::Symbol(symbol)
@@ -115,7 +110,6 @@ impl ListingIdentifier {
         }
     }
 
-    /// Returns the route scope this identifier is scoped to, when it carries one.
     pub fn scope(&self) -> Option<&VenueScopeId> {
         match self {
             Self::HyperliquidAsset { scope, .. } | Self::HyperliquidOutcome { scope, .. } => {
@@ -126,7 +120,6 @@ impl ListingIdentifier {
     }
 }
 
-/// A native identifier that can resolve to a listing, a group or an event.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "identifier")]
 pub enum NativeIdentifier {
@@ -138,7 +131,6 @@ pub enum NativeIdentifier {
     Event(OutcomeEventIdentifier),
 }
 
-/// The outcome group identifiers of a route.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "identifier")]
 pub enum OutcomeGroupIdentifier {
@@ -155,7 +147,6 @@ pub enum OutcomeGroupIdentifier {
     PolymarketCondition(CtfConditionId),
 }
 
-/// The outcome event identifiers of a route.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "identifier")]
 pub enum OutcomeEventIdentifier {
@@ -163,7 +154,6 @@ pub enum OutcomeEventIdentifier {
     PolymarketEvent(PolymarketEventId),
 }
 
-/// What a native identifier resolved to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "resolved")]
 pub enum NativeIdentifierResolution {
@@ -176,7 +166,6 @@ pub enum NativeIdentifierResolution {
 }
 
 impl NativeIdentifierResolution {
-    /// Returns the canonical label of this resolution level.
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Listing(_) => "listing",

@@ -1,24 +1,3 @@
-//! The top bar's update button.
-//!
-//! A kit ghost button with the update icon, built into the header row the composition
-//! root hands it and drawn while an update is on offer — and at no other time, which
-//! is the whole of what this feature says until the user asks for more: there is no
-//! "nothing available" state to open and no failed check to report, because an update
-//! nobody asked for is not something to interrupt anyone with.
-//!
-//! The button is not rebuilt every frame: it is built when the updater first offers a
-//! release, kept while the offer stands, and removed (with its tooltip) when the
-//! offer goes away. Its frame route syncs the control's hover/press state and its
-//! tooltip; steady frames do nothing (I3). A language switch rebuilds it, because the
-//! a11y name and the tooltip text are baked in at build time.
-//!
-//! # Lifecycle
-//!
-//! `UpdateIndicator::mount` builds the control and registers the route; the host
-//! keeps the handle and calls [`UpdateIndicator::release`] when the header goes away.
-//! **Release the indicator before the updater** it was mounted for: the indicator
-//! reads the updater's view signal, and that signal is minted in the updater's scope.
-
 use std::{cell::RefCell, rc::Rc};
 
 use base_ui::{
@@ -45,18 +24,12 @@ use widget::{frame::RouteId, services::WidgetServices};
 
 use crate::updater::{Updater, UpdaterView};
 
-/// The top bar's update button.
 #[derive(Clone)]
 pub struct UpdateIndicator {
     core: Rc<RefCell<IndicatorCore>>,
 }
 
 impl UpdateIndicator {
-    /// Builds the indicator into `parent` (the header row's slot) over the updater.
-    ///
-    /// `key` prefixes the control's kit identities: it must be unique among the
-    /// application's kit keys, exactly like a widget's `cx.unique_key` suffix (one
-    /// indicator per application: `kytrix.updater`).
     pub fn mount(
         app: &mut App,
         window: WindowId,
@@ -102,19 +75,16 @@ impl UpdateIndicator {
         Self { core }
     }
 
-    /// The node the header row placed (present only while an update is offered).
     #[must_use]
     pub fn node(&self) -> Option<NodeId> {
         self.core.borrow().built.as_ref().map(|built| built.node)
     }
 
-    /// Whether the control is built (an update is on offer).
     #[must_use]
     pub fn is_visible(&self) -> bool {
         self.core.borrow().built.is_some()
     }
 
-    /// Releases the control, its tooltip, its route and its value scope. Idempotent.
     pub fn release(&self, app: &mut App) -> usize {
         let mut core = self.core.borrow_mut();
         if core.released {
@@ -128,7 +98,6 @@ impl UpdateIndicator {
         released + app.release_scope(core.scope)
     }
 
-    /// Whether this indicator has been released.
     #[must_use]
     pub fn is_released(&self) -> bool {
         self.core.borrow().released
@@ -146,7 +115,6 @@ impl std::fmt::Debug for UpdateIndicator {
     }
 }
 
-/// What one built indicator owns.
 struct IndicatorBuilt {
     node: NodeId,
     button: Button,
@@ -154,7 +122,6 @@ struct IndicatorBuilt {
     language: LanguageCode,
 }
 
-/// The state behind the indicator.
 struct IndicatorCore {
     window: WindowId,
     services: Rc<WidgetServices>,
@@ -172,8 +139,6 @@ struct IndicatorCore {
 }
 
 impl IndicatorCore {
-    /// One frame: the control exists exactly while the updater offers a release, and
-    /// its hover / press / tooltip state follows the pointer.
     fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         if self.released {
             return Ok(());
@@ -181,8 +146,6 @@ impl IndicatorCore {
         let offered = app.read(&self.view).is_some_and(UpdaterView::offered);
         let language = *app.read(&self.language);
 
-        // A language switch rebuilds: the a11y name and the tooltip text are baked in
-        // at build time, and the kit has no binding face for either.
         if self
             .built
             .as_ref()
@@ -203,7 +166,6 @@ impl IndicatorCore {
         Ok(())
     }
 
-    /// Builds the button and its tooltip into the header row.
     fn build(&mut self, app: &mut App, language: LanguageCode) -> Result<(), EngineError> {
         let label = t_smol!(&self.translate, "window.updater.available");
         let updater = self.updater.clone();
@@ -240,7 +202,6 @@ impl IndicatorCore {
         Ok(())
     }
 
-    /// Removes the control and gives its components their scopes back.
     fn release_built(&mut self, app: &mut App) -> usize {
         let Some(built) = self.built.take() else {
             return 0;
@@ -266,8 +227,6 @@ mod tests {
         updater::{UpdaterTestExt, UpdaterView},
     };
 
-    /// A harness with the updater installed, its first check disarmed, and the
-    /// indicator mounted into the window's root.
     fn mounted() -> (Harness, UpdateIndicator) {
         let mut harness = Harness::new();
         let updater = harness.install_updater(None);
@@ -333,8 +292,6 @@ mod tests {
         );
     }
 
-    /// The click opens the dialog for the update on offer: it is the indicator's own
-    /// action, and the updater is what opens the dialog.
     #[test]
     fn pressing_the_indicator_should_open_the_dialog_for_the_offered_update() {
         let (mut harness, _indicator) = mounted();
@@ -365,9 +322,6 @@ mod tests {
         );
     }
 
-    /// The control is the icon alone, and what it says is in its tooltip. Focusing it
-    /// is what opens the tip (the kit tooltip triggers on hover or focus inside the
-    /// trigger).
     #[test]
     fn focusing_the_indicator_should_open_its_tooltip() {
         let (mut harness, _indicator) = mounted();
@@ -385,9 +339,6 @@ mod tests {
             harness.app.app_mut().set_focus(window, Some(node)),
             "the button takes the keyboard"
         );
-        // One frame for the tooltip to observe the focus and arm its delay, then the
-        // clock for the delay to elapse (a timer fires at the next frame's entry, and
-        // the tooltip opens on the sync after that).
         harness.drain();
         harness.advance(Duration::from_millis(600));
         harness.drain();

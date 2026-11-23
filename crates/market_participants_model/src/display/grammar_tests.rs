@@ -1,9 +1,3 @@
-//! Unit tests of the product grammars.
-//!
-//! Every family is asserted verbatim: the expected string is the specification's
-//! own example, so a change of the field order, of a rendered position or of an
-//! omission rule is a failing expectation rather than a silently different name.
-
 use smol_str::SmolStr;
 
 use crate::{
@@ -22,18 +16,14 @@ use crate::{
     settlement::OptionRight,
 };
 
-/// Renders one fixture, which every test in this module builds from validated
-/// terms and resolved display codes.
 fn render(details: &InstrumentDisplayDetails) -> InstrumentDisplayString {
     format_instrument(details).expect("a fixture of validated terms renders")
 }
 
-/// A spot instrument of the two given assets.
 fn spot(base: AssetDisplayCode, quote: AssetDisplayCode) -> InstrumentDisplayDetails {
     InstrumentDisplayDetails::Spot { base, quote }
 }
 
-/// A perpetual contract of one underlying, quote and settlement asset.
 fn perpetual(
     underlying: AssetDisplayCode,
     price_quote: AssetDisplayCode,
@@ -46,7 +36,6 @@ fn perpetual(
     }
 }
 
-/// A dated contract of one underlying, quote, settlement and expiry.
 fn future(
     underlying: AssetDisplayCode,
     price_quote: AssetDisplayCode,
@@ -61,7 +50,6 @@ fn future(
     }
 }
 
-/// An option of `right` and `strike` on one underlying, quote and settlement.
 fn option(
     underlying: AssetDisplayCode,
     price_quote: AssetDisplayCode,
@@ -80,7 +68,6 @@ fn option(
     }
 }
 
-/// A quote-settled option of the standard fixture, expiring 2025-12-26.
 fn quote_settled_option(right: OptionRight, strike: Price) -> InstrumentDisplayDetails {
     option(
         token_code("BTC"),
@@ -92,7 +79,6 @@ fn quote_settled_option(right: OptionRight, strike: Price) -> InstrumentDisplayD
     )
 }
 
-/// One member and side of an outcome group.
 fn outcome(
     question: &str,
     member: &str,
@@ -108,11 +94,6 @@ fn outcome(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Spot
-// ---------------------------------------------------------------------------
-
-/// `BTC/USDT`.
 #[test]
 fn spot_btc_usdt_renders_verbatim() {
     assert_eq!(
@@ -121,7 +102,6 @@ fn spot_btc_usdt_renders_verbatim() {
     );
 }
 
-/// `USDC/EUR`, a token quoted in a fiat currency.
 #[test]
 fn spot_usdc_eur_renders_verbatim() {
     assert_eq!(
@@ -130,11 +110,6 @@ fn spot_usdc_eur_renders_verbatim() {
     );
 }
 
-/// `AAPL/USD`, a security quoted in a fiat currency.
-///
-/// the code a route staged for the security is its ticker, so no MIC
-/// and no local code reaches the name — either of them could only appear in one
-/// dotted onto the ticker.
 #[test]
 fn spot_aapl_usd_renders_verbatim() {
     let details = spot(staged_code("AAPL"), currency_code("USD"));
@@ -142,7 +117,6 @@ fn spot_aapl_usd_renders_verbatim() {
     assert!(!render(&details).as_str().contains('.'));
 }
 
-/// `688888/CNY`, a numeric ticker.
 #[test]
 fn spot_688888_cny_renders_verbatim() {
     assert_eq!(
@@ -151,8 +125,6 @@ fn spot_688888_cny_renders_verbatim() {
     );
 }
 
-/// a name states exactly the fields it is given, so one code on both
-/// sides of a pair is stated twice and a name never drops one of its fields.
 #[test]
 fn a_name_states_only_the_fields_it_is_given() {
     assert_eq!(
@@ -165,8 +137,6 @@ fn a_name_states_only_the_fields_it_is_given() {
     );
 }
 
-/// two different assets may resolve to one code, and both render it. A name
-/// says which fields an instrument identifies itself by, not which asset is which.
 #[test]
 fn two_assets_of_one_code_render_the_same_text() {
     let currency = spot(currency_code("USD"), token_code("BTC"));
@@ -176,33 +146,24 @@ fn two_assets_of_one_code_render_the_same_text() {
     assert_eq!(render(&currency), render(&staged));
 }
 
-/// a commodity is named by its own code, without a type prefix.
 #[test]
 fn a_commodity_code_carries_no_type_prefix() {
     let details = spot(commodity_code("XAU"), currency_code("USD"));
     assert_eq!(render(&details).as_str(), "XAU/USD");
 }
 
-// ---------------------------------------------------------------------------
-// Perpetual
-// ---------------------------------------------------------------------------
-
-/// `BTC/USDT:USDT`, the quote-settled default.
 #[test]
 fn perpetual_quote_settled_renders_verbatim() {
     let details = perpetual(token_code("BTC"), token_code("USDT"), token_code("USDT"));
     assert_eq!(render(&details).as_str(), "BTC/USDT:USDT");
 }
 
-/// `BTC/USD:BTC`, an inverse contract.
 #[test]
 fn perpetual_inverse_renders_verbatim() {
     let details = perpetual(token_code("BTC"), currency_code("USD"), token_code("BTC"));
     assert_eq!(render(&details).as_str(), "BTC/USD:BTC");
 }
 
-/// `ABC/USD:USD`, a quanto contract. The pnl model is not part of
-/// the name: what a name states is the asset the contract settles in.
 #[test]
 fn perpetual_quanto_renders_verbatim() {
     let details = perpetual(
@@ -213,8 +174,6 @@ fn perpetual_quanto_renders_verbatim() {
     assert_eq!(render(&details).as_str(), "ABC/USD:USD");
 }
 
-/// `SP/500/USD:USD`, an index underlying. The code of an index is
-/// two halves, so a name nests one more separator.
 #[test]
 fn perpetual_index_underlying_renders_verbatim() {
     let details = perpetual(
@@ -225,8 +184,6 @@ fn perpetual_index_underlying_renders_verbatim() {
     assert_eq!(render(&details).as_str(), "SP/500/USD:USD");
 }
 
-/// an external reference is named by its reference value alone, so its
-/// issuer never reaches a name.
 #[test]
 fn perpetual_external_underlying_renders_its_reference() {
     let details = perpetual(
@@ -237,8 +194,6 @@ fn perpetual_external_underlying_renders_its_reference() {
     assert_eq!(render(&details).as_str(), "BTC-USD-ORACLE/USD:USD");
 }
 
-/// a perpetual always states the asset it settles in — that position is the
-/// one thing that tells it apart from the spot pair of the same two assets.
 #[test]
 fn a_perpetual_states_its_settlement_asset() {
     let details = perpetual(token_code("BTC"), token_code("USDT"), token_code("USDT"));
@@ -249,11 +204,6 @@ fn a_perpetual_states_its_settlement_asset() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Future
-// ---------------------------------------------------------------------------
-
-/// `BTC/USD:USD-20251219`, a cash-settled future.
 #[test]
 fn cash_future_renders_verbatim() {
     let details = future(
@@ -265,7 +215,6 @@ fn cash_future_renders_verbatim() {
     assert_eq!(render(&details).as_str(), "BTC/USD:USD-20251219");
 }
 
-/// `BTC/USD:PHYS-20251219`, a physically delivered future.
 #[test]
 fn physical_future_renders_verbatim() {
     let details = future(
@@ -277,8 +226,6 @@ fn physical_future_renders_verbatim() {
     assert_eq!(render(&details).as_str(), "BTC/USD:PHYS-20251219");
 }
 
-/// a physical delivery and a cash settlement are different names,
-/// and the `:S` position states which one it is.
 #[test]
 fn a_physical_delivery_is_not_a_cash_settlement() {
     let cash = future(
@@ -297,7 +244,6 @@ fn a_physical_delivery_is_not_a_cash_settlement() {
     assert!(render(&physical).as_str().contains(":PHYS-"));
 }
 
-/// `BTC/USD:BTC-20251219`, an inverse dated contract.
 #[test]
 fn inverse_cash_future_renders_verbatim() {
     let details = future(
@@ -309,8 +255,6 @@ fn inverse_cash_future_renders_verbatim() {
     assert_eq!(render(&details).as_str(), "BTC/USD:BTC-20251219");
 }
 
-/// the main date is the expiry, and a non-midnight instant keeps its
-/// time, so two contracts of one day never share a name.
 #[test]
 fn every_expiry_instant_keeps_its_own_name() {
     let midnight = future(
@@ -346,11 +290,6 @@ fn every_expiry_instant_keeps_its_own_name() {
     assert_eq!(render(&millis).as_str(), "BTC/USD:USD-20251219T000000.250Z");
 }
 
-// ---------------------------------------------------------------------------
-// Option
-// ---------------------------------------------------------------------------
-
-/// `BTC/USDT:USDT-20251226-60000-PUT`.
 #[test]
 fn quote_settled_option_renders_verbatim() {
     let details = quote_settled_option(OptionRight::Put, Price::from(60_000_u32));
@@ -360,8 +299,6 @@ fn quote_settled_option_renders_verbatim() {
     );
 }
 
-/// `AAPL/USD:USD-20251219-150-CALL`. The exercise style, the
-/// contract size and the references are not part of the name.
 #[test]
 fn american_equity_option_renders_verbatim() {
     let details = option(
@@ -375,7 +312,6 @@ fn american_equity_option_renders_verbatim() {
     assert_eq!(render(&details).as_str(), "AAPL/USD:USD-20251219-150-CALL");
 }
 
-/// `AAPL/USD:PHYS-20251219-150-CALL`, a physical option.
 #[test]
 fn physical_equity_option_renders_verbatim() {
     let details = option(
@@ -389,7 +325,6 @@ fn physical_equity_option_renders_verbatim() {
     assert_eq!(render(&details).as_str(), "AAPL/USD:PHYS-20251219-150-CALL");
 }
 
-/// `SP/500/USD:USD-20251219-5000-CALL`, an index-point option.
 #[test]
 fn index_point_option_renders_verbatim() {
     let details = option(
@@ -406,8 +341,6 @@ fn index_point_option_renders_verbatim() {
     );
 }
 
-/// a strike goes through the one canonical decimal rule, so a
-/// fractional strike keeps its digits and never becomes a float.
 #[test]
 fn a_fractional_strike_keeps_its_digits() {
     let fractional = quote_settled_option(
@@ -420,7 +353,6 @@ fn a_fractional_strike_keeps_its_digits() {
     );
 }
 
-/// a right is `CALL` or `PUT`, and the two names differ.
 #[test]
 fn an_option_right_is_call_or_put() {
     let call = quote_settled_option(OptionRight::Call, Price::from(150_u16));
@@ -429,8 +361,6 @@ fn an_option_right_is_call_or_put() {
     assert!(render(&put).as_str().ends_with("-PUT"));
 }
 
-/// an option states its underlying, quote, settlement, expiry, strike
-/// and right, and changing any one of them changes the name.
 #[test]
 fn every_option_field_is_stated() {
     let base = quote_settled_option(OptionRight::Call, Price::from(150_u16));
@@ -482,9 +412,6 @@ fn every_option_field_is_stated() {
     }
 }
 
-/// the settlement of a dated contract states the asset it pays in,
-/// so a contract that settles in its own underlying is not the one that settles
-/// in the quote.
 #[test]
 fn a_future_states_its_settlement_asset() {
     let quote_settled = future(
@@ -502,11 +429,6 @@ fn a_future_states_its_settlement_asset() {
     assert_ne!(render(&quote_settled), render(&inverse));
 }
 
-// ---------------------------------------------------------------------------
-// Outcome
-// ---------------------------------------------------------------------------
-
-/// `[WILL BTC EXCEED 100K BY 20251231]/MAIN/YES:USDC-20251231`.
 #[test]
 fn binary_outcome_yes_renders_verbatim() {
     let details = outcome(
@@ -521,8 +443,6 @@ fn binary_outcome_yes_renders_verbatim() {
     );
 }
 
-/// the member and the side are stated, so the two sides of one member are
-/// two names.
 #[test]
 fn an_outcome_states_its_member_and_its_side() {
     let yes = outcome("Will BTC exceed 100k", "main", "yes", token_code("USDC"));
@@ -542,8 +462,6 @@ fn an_outcome_states_its_member_and_its_side() {
     );
 }
 
-/// a question keeps its spaces and a run of
-/// whitespace collapses, so a free text is rendered, not rewritten.
 #[test]
 fn an_outcome_question_keeps_its_spaces() {
     let details = outcome(
@@ -558,8 +476,6 @@ fn an_outcome_question_keeps_its_spaces() {
     );
 }
 
-/// only ASCII letters are uppercased, a non-ASCII question is kept
-/// as it was published and is never transliterated.
 #[test]
 fn a_non_ascii_question_is_preserved() {
     let details = outcome("btc 会超过 10 万吗", "main", "yes", token_code("USDC"));
@@ -569,8 +485,6 @@ fn a_non_ascii_question_is_preserved() {
     );
 }
 
-/// A structure character inside a question is a literal character of
-/// the question, so a name can nest the grammar's own separators.
 #[test]
 fn a_structure_character_inside_a_question_is_literal() {
     let details = outcome(
@@ -585,9 +499,6 @@ fn a_structure_character_inside_a_question_is_literal() {
     );
 }
 
-/// a question the model accepts but the display layer refuses
-/// is an error of the naming step and not a name, so a publication that meets one
-/// is refused rather than published under a partial label.
 #[test]
 fn an_unrenderable_text_is_refused_by_the_naming_step() {
     let blank_question = outcome("   ", "main", "yes", token_code("USDC"));
@@ -608,8 +519,6 @@ fn an_unrenderable_text_is_refused_by_the_naming_step() {
     );
 }
 
-/// an outcome group is named by its own settlement asset, and a group that
-/// settles in another asset is another name.
 #[test]
 fn an_outcome_states_its_settlement_asset() {
     let usdc = outcome("Will BTC exceed 100k", "main", "yes", token_code("USDC"));

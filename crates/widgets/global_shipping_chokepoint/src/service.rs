@@ -1,30 +1,3 @@
-//! The AIS protocol, its background service, and the seams a test drives it through.
-//!
-//! # One stream, keyed by area
-//!
-//! A pane follows one AIS area at a time, and the area is the stream's key: what the
-//! server pushes is a complete picture of an area (`keyframe`) followed by increments
-//! that only apply on top of the picture the pane already holds. Switching areas is
-//! therefore switching streams rather than adding one, and a pane reading an area is
-//! reading exactly one.
-//!
-//! # The request never waits
-//!
-//! Taking the account's session and opening the subscription are both slow operations,
-//! each bounded by the service's own operation timeout, while a widget RPC carries a
-//! shorter deadline. Both therefore happen inside the stream task: `Load` starts the
-//! stream and answers at once, and everything that can fail is reported on the stream
-//! rather than through the reply. A `Load` whose caller already went away starts
-//! nothing, because nobody would read the stream it asked for.
-//!
-//! # A failure is reported once, and then held
-//!
-//! A stream that can no longer deliver publishes its failure on the reliable channel
-//! and waits for the replacement the pane asks for when the user recovers. The task may
-//! not end on its own: a task that ended retires its key's latest entry, and the pane
-//! would have to have read the failure before that happened. Nothing here retries or
-//! backs off — a terminal failure stays terminal until the user acts.
-
 use std::{future::Future, sync::Arc};
 
 use i18n::{t_smol, translate::Translate};
@@ -44,7 +17,6 @@ use widget::{
     stream::StreamPublisher,
 };
 
-/// The account whose AIS picture a stream carries, and the area it covers.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct GlobalShippingChokepointScope {
     pub account: SmolStr,
@@ -52,7 +24,6 @@ pub(super) struct GlobalShippingChokepointScope {
 }
 
 impl GlobalShippingChokepointScope {
-    /// The scope an account follows. A pane reads the one area the map draws.
     pub(super) fn new(account: SmolStr) -> Self {
         Self {
             account,
@@ -61,33 +32,24 @@ impl GlobalShippingChokepointScope {
     }
 }
 
-/// What a pane asks its service to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum GlobalShippingChokepointRequest {
-    /// Follows the scope's area, replacing whatever stream is running.
     Load {
         scope: GlobalShippingChokepointScope,
     },
-    /// Follows nothing, because nobody is signed in.
     Stop,
 }
 
-/// What the service answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum GlobalShippingChokepointResponse {
-    /// The area's stream is running.
     StreamStarted,
-    /// Nothing is followed.
     Stopped,
 }
 
-/// Why a stream stopped, or why it never started.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum AisStreamError {
-    /// The account's session could not be taken, or the subscription was refused.
     #[error(transparent)]
     Service(#[from] KytrixServiceError),
-    /// The subscription closed, or what it delivered could not be read.
     #[error(transparent)]
     Transport(#[from] TransportError),
 }
@@ -95,8 +57,6 @@ pub(super) enum AisStreamError {
 impl TranslatedError for AisStreamError {
     fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            // An account without AIS access is a refusal about the subscription, not a
-            // connection failure that asking again would fix, so it is named as itself.
             Self::Service(KytrixServiceError::Server(ErrorCode::EntitlementRequired)) => {
                 t_smol!(
                     translate,
@@ -109,17 +69,9 @@ impl TranslatedError for AisStreamError {
     }
 }
 
-/// One message of an area's stream.
 #[derive(Clone, Debug)]
 pub(super) enum AisStreamMessage {
-    /// One push from the server: a keyframe, or an increment continuing the picture.
     Update(GlobalShippingChokepointUpdate),
-    /// The stream is over; this travels reliably so the pane is told before the entry
-    /// that would have carried it is retired.
-    ///
-    /// The error is shared rather than cloned into the view's failure state: the view is
-    /// handed the message behind an `Arc`, and what it reports to the framework is also
-    /// an `Arc`, so one failure is one allocation from the stream to the banner.
     Failed(Arc<AisStreamError>),
 }
 
@@ -133,27 +85,16 @@ impl WidgetProtocol for GlobalShippingChokepointProtocol {
     type Error = AisStreamError;
 }
 
-/// The Kytrix service an AIS picture is read through.
-///
-/// The service is written against this seam rather than against the connector, so a test
-/// can drive every state a session and a subscription can be in without one.
 pub(super) trait GlobalShippingChokepointSource: Clone + Send + Sync + 'static {
     type Session: GlobalShippingChokepointSession;
 
-    /// Takes the account's session, which the area's subscription is opened through.
     fn acquire_session(
         &self,
         account_id: &str,
     ) -> impl Future<Output = Result<Self::Session, KytrixServiceError>> + Send;
 }
 
-/// One account's session.
 pub(super) trait GlobalShippingChokepointSession: Clone + Send + Sync + 'static {
-    /// The subscription one area is followed through.
-    ///
-    /// It is an associated type rather than the concrete `Subscription<GlobalShippingChokepointUpdate>` so a
-    /// test can hand in a subscription it drives and counts the drops of: releasing a
-    /// replaced stream's subscription is what keeps the pane off an account it has left.
     type Subscription: GlobalShippingChokepointEventSubscription;
 
     fn subscribe_global_shipping_chokepoint(
@@ -162,7 +103,6 @@ pub(super) trait GlobalShippingChokepointSession: Clone + Send + Sync + 'static 
     ) -> impl Future<Output = Result<Self::Subscription, KytrixServiceError>> + Send;
 }
 
-/// One live AIS subscription.
 pub(super) trait GlobalShippingChokepointEventSubscription: Send + 'static {
     fn recv(
         &mut self,
@@ -194,7 +134,6 @@ impl GlobalShippingChokepointEventSubscription for Subscription<GlobalShippingCh
     }
 }
 
-/// The service that follows one pane's AIS picture.
 pub(super) struct GlobalShippingChokepointService<S = KytrixServiceConnector> {
     source: S,
 }
@@ -223,23 +162,15 @@ where
                     let _ = reply.respond(Ok(GlobalShippingChokepointResponse::Stopped));
                 }
                 GlobalShippingChokepointRequest::Load { scope } => {
-                    // The key is the area, so it is taken before the scope is moved into
-                    // the stream task, which needs the account as well.
                     let key = scope.area;
                     if let Some(previous) = active.replace(key) {
                         context.cancel_stream(&previous);
                     }
-                    // `next_rpc` already dropped expired requests; re-check before
-                    // starting anything, so a caller that went away cannot leave a
-                    // stream behind.
                     if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                         let _ = reply.respond(Ok(GlobalShippingChokepointResponse::StreamStarted));
                         continue;
                     }
                     let source = source.clone();
-                    // No `await` in this branch: the session and the subscription are
-                    // taken inside the stream task, so the RPC deadline never races the
-                    // operation timeout of either.
                     context.start_stream(key, move |publisher| async move {
                         run_stream(source, scope, publisher).await;
                     });
@@ -250,7 +181,6 @@ where
     }
 }
 
-/// Runs one area's subscription until it fails or is replaced.
 async fn run_stream<S>(
     source: S,
     scope: GlobalShippingChokepointScope,
@@ -258,8 +188,6 @@ async fn run_stream<S>(
 ) where
     S: GlobalShippingChokepointSource,
 {
-    // Slow operations all live here, each one interruptible by a replacement or a stop,
-    // and each failure reported on the stream that asked for it.
     let session = tokio::select! {
         biased;
         () = publisher.cancelled() => return,
@@ -302,11 +230,6 @@ async fn run_stream<S>(
     }
 }
 
-/// Publishes the failure a stream ended with, and holds the stream until it is replaced.
-///
-/// A terminal failure is not retried: the pane asks for a new stream when the user takes
-/// the recovery. Until then the task stays where it is rather than returning, because a
-/// task that ended retires the key's latest entry before the pane could read it.
 async fn publish_failure(
     publisher: &StreamPublisher<GlobalShippingChokepointProtocol>,
     error: AisStreamError,
@@ -320,11 +243,6 @@ async fn publish_failure(
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one: the
-    /// streams and RPCs it spawns have to be polled by the same executor the test is
-    /// awaiting on.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the tasks it awaits are the ones it spawned"
@@ -350,7 +268,6 @@ mod tests {
 
     use super::*;
 
-    /// The account every fixture scope belongs to.
     const ACCOUNT: &str = "test-account";
 
     fn scope() -> GlobalShippingChokepointScope {
@@ -415,7 +332,6 @@ mod tests {
         }
     }
 
-    /// Lets everything else on this runtime run until `ready` holds.
     async fn wait_for(what: &str, ready: impl Fn() -> bool) {
         let settled = tokio::time::timeout(Duration::from_secs(2), async {
             while !ready() {
@@ -582,8 +498,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// The whole point of the request not waiting: the answer arrives while the session
-    /// is still being taken, and cancellation is the only way that acquisition ends.
     #[tokio::test]
     async fn a_load_should_answer_before_the_session_is_taken() {
         let source = FakeSource::default();
@@ -604,7 +518,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A subscription that never opens is cancelled the same way an acquisition is.
     #[tokio::test]
     async fn a_subscription_that_never_opens_should_be_cancelled_with_its_stream() {
         let source = FakeSource::default();
@@ -674,8 +587,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A failed stream is replaced rather than retried by itself: the pane asks again,
-    /// and the load is what lets the parked failure task go.
     #[tokio::test]
     async fn a_load_after_a_failure_should_replace_the_failed_stream() {
         let source = FakeSource::default();
@@ -734,8 +645,6 @@ mod tests {
             latest.next_unseen().is_none(),
             "a broken stream publishes no update of its own"
         );
-        // A stream that returned once its failure was published would have retired the
-        // key's latest entry with it, which is the reason the failure is held instead.
         assert!(
             tokio::time::timeout(Duration::from_millis(100), async {
                 while control.drops.load(Ordering::SeqCst) == 0 {
@@ -834,18 +743,13 @@ mod tests {
         acquired: Vec<SmolStr>,
     }
 
-    /// What the next `acquire_session` call finds.
     enum FakeSetup {
-        /// A session for the account that was asked for.
         Ready(FakeSession),
-        /// A refusal, the way an account whose credentials are gone answers.
         Failed(KytrixServiceError),
-        /// An acquisition that never answers, so cancellation is the only way out.
         Blocked(Arc<OperationBlock>),
     }
 
     impl FakeSource {
-        /// Queues a session for `account`, which is what the next acquisition finds.
         fn session(&self, account: &str) -> FakeSession {
             let session = FakeSession::new(account);
             self.state()
@@ -854,12 +758,10 @@ mod tests {
             session
         }
 
-        /// Queues a refusal in place of a session.
         fn refuse(&self, error: KytrixServiceError) {
             self.state().sessions.push_back(FakeSetup::Failed(error));
         }
 
-        /// Queues an acquisition that never answers.
         fn block(&self) -> Arc<OperationBlock> {
             let block = Arc::new(OperationBlock::default());
             self.state()
@@ -868,12 +770,10 @@ mod tests {
             block
         }
 
-        /// The accounts the service has asked for a session of, in the order it asked.
         fn requested(&self) -> Vec<SmolStr> {
             self.state().acquired.clone()
         }
 
-        /// How many sessions the service has asked for.
         fn sessions(&self) -> usize {
             self.state().acquired.len()
         }
@@ -914,7 +814,6 @@ mod tests {
         }
     }
 
-    /// One account's session, as a test drives it.
     #[derive(Clone)]
     struct FakeSession {
         state: Arc<Mutex<FakeSessionState>>,
@@ -927,13 +826,9 @@ mod tests {
         areas: Vec<GlobalShippingChokepointArea>,
     }
 
-    /// What the next `subscribe_global_shipping_chokepoint` call finds.
     enum FakeSubscribe {
-        /// A subscription the test drives.
         Ready(FakeSubscription),
-        /// A subscription the account is refused.
         Failed(KytrixServiceError),
-        /// A subscription that never opens, so cancellation is the only way out.
         Blocked(Arc<OperationBlock>),
     }
 
@@ -944,7 +839,6 @@ mod tests {
             }
         }
 
-        /// Queues one live subscription and hands back the knobs that drive it.
         fn subscribe(&self) -> FakeSubscriptionControl {
             let (events, receiver) = mpsc::channel(8);
             let drops = Arc::new(AtomicUsize::new(0));
@@ -957,14 +851,12 @@ mod tests {
             FakeSubscriptionControl { events, drops }
         }
 
-        /// Queues a subscription the account is refused.
         fn refuse_subscription(&self, error: KytrixServiceError) {
             self.state()
                 .subscriptions
                 .push_back(FakeSubscribe::Failed(error));
         }
 
-        /// Queues a subscription that never opens.
         fn block_subscription(&self) -> Arc<OperationBlock> {
             let block = Arc::new(OperationBlock::default());
             self.state()
@@ -1010,7 +902,6 @@ mod tests {
         }
     }
 
-    /// One live subscription inside the fake session.
     struct FakeSubscription {
         events: mpsc::Receiver<Result<GlobalShippingChokepointUpdate, TransportError>>,
         drops: Arc<AtomicUsize>,
@@ -1031,20 +922,11 @@ mod tests {
         }
     }
 
-    /// One live subscription, as a test drives it.
     struct FakeSubscriptionControl {
         events: mpsc::Sender<Result<GlobalShippingChokepointUpdate, TransportError>>,
-        /// How many times this subscription has been dropped, which is how a test sees
-        /// the service let go of a stream it no longer follows.
         drops: Arc<AtomicUsize>,
     }
 
-    /// One operation a fake can be held inside.
-    ///
-    /// Holding one is how a test pins the window an operation is open in: a session or
-    /// subscription that is held has not answered yet, so what the service does while it
-    /// is in flight is what the test is looking at rather than a race against the
-    /// answer.
     #[derive(Default)]
     struct OperationBlock {
         started: Notify,

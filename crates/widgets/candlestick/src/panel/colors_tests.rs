@@ -1,9 +1,3 @@
-//! Which colours the panel offers, and what each picker is handed.
-//!
-//! The list is a function of the configuration ([`color_fields`]), so these are the answers the
-//! built pickers are checked against in `smoke_tests`: one field per configurable colour, keyed by
-//! the row it belongs to, carrying the colour the configuration holds.
-
 use super::colors::{ColorField, ColorKey, color_fields, field_of};
 use crate::indicator::{
     CandlestickIndicatorConfig, IndicatorId, LineColor, SettingControl, SettingKey, definition_of,
@@ -20,8 +14,6 @@ fn fields_of(config: &CandlestickIndicatorConfig, id: IndicatorId) -> Vec<ColorF
         .collect()
 }
 
-/// The default configuration offers twelve colours: MA's three lines, EMA's one, RSI's three,
-/// MACD's two and KDJ's three — and nothing offers a colour the settings do not hold.
 #[test]
 fn the_default_configuration_should_have_twelve_colour_fields() {
     let fields = color_fields(&default_config());
@@ -42,7 +34,6 @@ fn the_default_configuration_should_have_twelve_colour_fields() {
     assert_eq!(fields_of(&default_config(), IndicatorId::Kdj).len(), 3);
 }
 
-/// A line list has one field per line, keyed by the line's row and carrying that line's colour.
 #[test]
 fn a_line_list_should_have_one_field_per_line_keyed_by_its_row() {
     let config = default_config();
@@ -71,7 +62,6 @@ fn a_line_list_should_have_one_field_per_line_keyed_by_its_row() {
     }
 }
 
-/// A switch row offers the colour key it declares, and the settings hold that colour.
 #[test]
 fn a_switch_row_should_offer_the_colour_key_it_declares() {
     let config = default_config();
@@ -105,8 +95,6 @@ fn a_switch_row_should_offer_the_colour_key_it_declares() {
     assert!(seen > 0, "the default configuration has switch rows");
 }
 
-/// The field a picker is built for reports the stored colour, so a rebuild hands the picker the
-/// value the configuration holds rather than the one it was created with.
 #[test]
 fn fields_should_report_the_colours_the_configuration_holds() {
     let mut config = default_config();

@@ -1,11 +1,3 @@
-//! Shared construction of prediction-event outcome groups.
-//!
-//! Both prediction adapters publish the same canonical shape: one outcome group
-//! per question, one member per selectable option, and one representative side per
-//! option. The venue-specific part is the wire decode; the canonical identity and
-//! the date parsing live here so the two adapters cannot derive different groups
-//! from the same event.
-
 use market_participants_model::{
     asset::AssetId,
     decimal::{Fraction, UnixMillis},
@@ -20,20 +12,8 @@ use smol_str::SmolStr;
 
 use crate::error::MarketParticipantError;
 
-/// The expiry of an event that publishes no end instant.
-///
-/// A prediction event always has a resolution deadline in its own rules, but a
-/// venue may omit the field from a list answer. The fallback is the end of the
-/// century rather than "now": an event without a deadline is not an event that
-/// expired, and a group identity derived from the current instant would move every
-/// time it was read.
 pub(crate) const FALLBACK_EXPIRY_MS: UnixMillis = 4_102_444_800_000;
 
-/// Builds one canonical outcome group from a question and its options.
-///
-/// `members` carries each option's label and the labels of its sides. A binary
-/// group has exactly one member with two sides; a mutually exclusive group has one
-/// member per option, each with its own two sides.
 pub(crate) fn build_group(
     question: SmolStr,
     expiry_at: Option<UnixMillis>,
@@ -67,12 +47,6 @@ pub(crate) fn build_group(
     OutcomeGroup::new(seed, sides, group_members).map_err(model_error)
 }
 
-/// Returns every tradable side of every member of one group.
-///
-/// A binary group has one member with two sides (`Yes`/`No`); a mutually
-/// exclusive group has one side per member. The side label is the label a chart
-/// draws, and the returned leg names exactly the side whose native asset the
-/// adapter maps to it.
 pub(crate) fn group_legs(group: &OutcomeGroup) -> Vec<(OutcomeLegRef, SmolStr)> {
     let mut legs = Vec::with_capacity(group.sides.len());
     for member in &group.members {
@@ -93,22 +67,14 @@ pub(crate) fn group_legs(group: &OutcomeGroup) -> Vec<(OutcomeLegRef, SmolStr)> 
     legs
 }
 
-/// Builds a binary topology.
 pub(crate) const fn binary() -> OutcomeTopology {
     OutcomeTopology::Binary
 }
 
-/// Builds a mutually exclusive topology with exactly one selected member.
 pub(crate) const fn exactly_one() -> OutcomeTopology {
     OutcomeTopology::MutuallyExclusive(SelectionCardinality::ExactlyOne)
 }
 
-/// Truncates a question to the model's scalar-value limit.
-///
-/// The model refuses a longer question rather than truncating it, so a venue whose
-/// title is longer than the limit would lose the whole event. A prediction event's
-/// title is display text rather than identity, so the adapter states the bounded
-/// form once, at the boundary where the venue's title is still authoritative.
 pub(crate) fn truncate_question(question: SmolStr) -> SmolStr {
     let limit = market_participants_model::outcome::MAX_OUTCOME_QUESTION_SCALARS;
     if question.chars().count() <= limit {
@@ -117,16 +83,10 @@ pub(crate) fn truncate_question(question: SmolStr) -> SmolStr {
     SmolStr::new(question.chars().take(limit).collect::<String>())
 }
 
-/// Parses a probability the venue published as a decimal string.
 pub(crate) fn probability(value: &str) -> Option<Fraction> {
     value.parse().ok()
 }
 
-/// Parses a `YYYY-MM-DDTHH:MM:SSZ` instant, including a numeric UTC offset.
-///
-/// Gamma's `endDate` is normally UTC with a `Z` suffix, but the API also
-/// publishes date-only values and records written with a `+HH:MM` offset. A
-/// date without a time is the start of that UTC day.
 pub(crate) fn parse_iso8601_millis(value: &str) -> Option<UnixMillis> {
     let bytes = value.as_bytes();
     if bytes.len() == 10 && bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-') {
@@ -155,7 +115,6 @@ pub(crate) fn parse_iso8601_millis(value: &str) -> Option<UnixMillis> {
     utc.checked_sub(offset_seconds.checked_mul(1_000)?)
 }
 
-/// Parses the suffix of an ISO instant into an offset east of UTC in seconds.
 fn parse_utc_offset(suffix: &str) -> Option<i64> {
     if suffix.is_empty() || suffix == "Z" {
         return Some(0);
@@ -191,7 +150,6 @@ fn parse_utc_offset(suffix: &str) -> Option<i64> {
     Some(sign * (hours * 3_600 + minutes * 60))
 }
 
-/// Parses a `YYYYMMDD-HHMM` instant, the compact form HIP-4 descriptions use.
 pub(crate) fn parse_compact_millis(value: &str) -> Option<UnixMillis> {
     let bytes = value.as_bytes();
     if bytes.len() != 13 || bytes.get(8) != Some(&b'-') {
@@ -205,7 +163,6 @@ pub(crate) fn parse_compact_millis(value: &str) -> Option<UnixMillis> {
     civil_millis(year, month, day, hour, minute, 0)
 }
 
-/// Converts one UTC civil instant to Unix milliseconds.
 fn civil_millis(
     year: i32,
     month: u8,
@@ -231,7 +188,6 @@ fn civil_millis(
     seconds.checked_mul(1_000)
 }
 
-/// Days from 1970-01-01 to one civil date, by Howard Hinnant's algorithm.
 fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -242,7 +198,6 @@ fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
     i64::from(era * 146_097 + day_of_era - 719_468)
 }
 
-/// Converts a model failure to the protocol error that carries it.
 pub(crate) fn model_error(error: ModelError) -> MarketParticipantError {
     MarketParticipantError::MarketModel(Box::new(error))
 }

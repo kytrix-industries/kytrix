@@ -1,5 +1,3 @@
-//! ① 焦点与动作：3 个色块（互斥选择 = `RadioButton`）+ 选中说明
-
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
@@ -13,34 +11,28 @@ use ui_core::{
 
 use super::{Scene, TEXT_RGBA, card, color, ring, text_style};
 
-/// 三个色块的可访问名 / 焦点状态名（顺序 = Tab 序）。
 pub(crate) const LABELS: [&str; 3] = ["色块 1（红）", "色块 2（绿）", "色块 3（蓝）"];
 
-/// 常态颜色（sRGB）。
 const BASES: [[u8; 4]; 3] = [
     [0xE5, 0x48, 0x4D, 0xFF],
     [0x30, 0xA4, 0x6C, 0xFF],
     [0x00, 0x91, 0xFF, 0xFF],
 ];
 
-/// 选中后的高亮颜色。
 const HIGHLIGHTS: [[u8; 4]; 3] = [
     [0xF2, 0x55, 0x5A, 0xFF],
     [0x3C, 0xB1, 0x79, 0xFF],
     [0x2B, 0x9F, 0xFF, 0xFF],
 ];
 
-/// 写入剪贴板的十六进制值（点击色块时）。
 const HEX: [&str; 3] = ["#E5484D", "#30A46C", "#0091FF"];
 
-/// 色块在卡片内的逻辑矩形（x, y, w, h）。
 const SLOTS: [(f32, f32, f32, f32); 3] = [
     (18.0, 42.0, 150.0, 88.0),
     (202.0, 42.0, 150.0, 88.0),
     (386.0, 42.0, 150.0, 88.0),
 ];
 
-/// 建 3 个色块 + 选中说明；返回色块节点（顺序 = Tab 序）。
 pub(crate) fn build(
     app: &mut App,
     window: WindowId,
@@ -92,7 +84,6 @@ pub(crate) fn build(
     swatches
 }
 
-/// 选中说明的文案。
 fn selected_line(active: u8) -> SmolStr {
     let index = usize::from(active);
     if index < LABELS.len() {
@@ -102,7 +93,6 @@ fn selected_line(active: u8) -> SmolStr {
     }
 }
 
-/// 注册色块的动作处理器（同一个 `Action` 被指针点击 / 键盘激活 / AT `Click` 共享）。
 pub(crate) fn install(app: &mut App, scene: &Scene) {
     let swatches = scene.swatches.clone();
     let active = scene.active;
@@ -111,7 +101,6 @@ pub(crate) fn install(app: &mut App, scene: &Scene) {
             return;
         };
         ctx.write(&active, index as u8);
-        // 剪贴板：把该色块的十六进制值写出去（无原生窗口/被占用时失败，不影响 UI）。
         let _ = ctx.app_mut().set_clipboard_text(HEX[index]);
     });
 }
@@ -157,7 +146,6 @@ mod showcase_tests {
         test.enable_a11y_capture();
         frame(&mut test);
 
-        // 色块 2 的中心：卡片原点 + 卡片内 (202,42,150,88)。
         let card = crate::scene::FOCUS_CARD.origin;
         let center = Point::new(card.x + 202.0 + 75.0, card.y + 42.0 + 44.0);
         let _ = test.inject(InputEvent::pointer_down(

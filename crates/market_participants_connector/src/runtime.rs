@@ -1,13 +1,3 @@
-//! Typed market-participants/network runtime snapshots.
-//!
-//! The snapshot answers every transport question a request asks: which origins the
-//! request's **venue** gives its scope, which generation that venue's routing
-//! decision is on, and which generation its credentials are on. A venue is the
-//! connection configuration, so nothing here is keyed by an endpoint or a
-//! credential set: the venue key *is* the key, and a scope the venue's settings do
-//! not publish — a deployed perpetual DEX most of all — is reached through the pair
-//! the venue answers its own non-scoped conversations on.
-
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use app_config::{
@@ -25,25 +15,19 @@ use url::Url;
 
 use crate::routing::CredentialGeneration;
 
-/// Resolved state for one complete credential set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CredentialState<T> {
-    /// No set is stored at all: the market or venue is unconfigured.
     Unconfigured,
-    /// Every required field is present; cryptographic validation is deferred.
     Configured(T),
-    /// A set is stored but incomplete, so it fails closed rather than signing.
     Invalid(MarketParticipantsConfigError),
 }
 
 impl<T> CredentialState<T> {
-    /// Returns whether this state holds a set that can sign a request.
     const fn is_configured(&self) -> bool {
         matches!(self, Self::Configured(_))
     }
 }
 
-/// Original Binance credential values preserved for client construction.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct BinanceCredentialValues {
     pub api_key: SmolStr,
@@ -62,7 +46,6 @@ impl fmt::Debug for BinanceCredentialValues {
     }
 }
 
-/// Original OKX credential values preserved for client construction.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct OkxCredentialValues {
     pub api_key: SmolStr,
@@ -81,7 +64,6 @@ impl fmt::Debug for OkxCredentialValues {
     }
 }
 
-/// Original Hyperliquid credential values preserved for signer construction.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct HyperliquidCredentialValues {
     pub main_account_address: SmolStr,
@@ -98,14 +80,10 @@ impl fmt::Debug for HyperliquidCredentialValues {
     }
 }
 
-/// Original Longbridge credential values preserved for the venue's own requests.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LongbridgeCredentialValues {
-    /// The OpenAPI application key.
     pub app_key: SmolStr,
-    /// The OpenAPI application secret.
     pub app_secret: SmolStr,
-    /// The access token issued for the application.
     pub access_token: SmolStr,
 }
 
@@ -120,33 +98,16 @@ impl fmt::Debug for LongbridgeCredentialValues {
     }
 }
 
-/// What every credential set one venue stores resolves to, as one comparable value.
-///
-/// The fingerprint follows the venue, never a scope: it covers **every** set the
-/// venue holds, so completing a set, emptying one or editing a value in any of them
-/// moves the venue's generation. Binance signs each of its markets with its own
-/// key, so both of its sets are part of the one venue's credentials; every other
-/// venue signs its whole surface with one set, and the set a scope the venue
-/// deploys signs with is that same one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CredentialFingerprint {
-    /// One resolution per market, in `BinanceMarket::ALL` order.
     Binance([CredentialState<BinanceCredentialValues>; 2]),
     Okx(CredentialState<OkxCredentialValues>),
     Hyperliquid(CredentialState<HyperliquidCredentialValues>),
-    /// Longbridge's one stored set, which its own adapter resolves.
-    ///
-    /// The three values are one credential — the access token is what an
-    /// authenticated socket presents, and the key and secret are what it is issued
-    /// and re-signed with — so editing any of them moves the venue's generation, and
-    /// a socket dialled for one data centre is never reused for another.
     Longbridge(CredentialState<LongbridgeCredentialValues>),
-    /// Polymarket's market data is public and stores no credential.
     Polymarket,
 }
 
 impl CredentialFingerprint {
-    /// Returns whether any scope of this venue would authenticate with what is stored.
     fn is_configured(&self) -> bool {
         match self {
             Self::Binance(markets) => markets.iter().any(CredentialState::is_configured),
@@ -164,17 +125,11 @@ struct CredentialRuntime {
     generation: Option<CredentialGeneration>,
 }
 
-/// Runtime configuration consumed by market-participant adapters and connection pools.
-///
-/// The snapshot deliberately contains only the generic network projection and the
-/// persisted venue settings. Application settings, UI state, and ConfigManager are
-/// outside this crate's boundary.
 #[derive(Clone, Debug)]
 pub struct MarketParticipantNetworkSnapshot {
     network: Arc<app_config::network::Config>,
     venues: BTreeMap<VenueId, VenueSettings>,
     credentials: BTreeMap<VenueId, CredentialRuntime>,
-    /// The next counter value this snapshot may hand out.
     next_generation: u64,
 }
 
@@ -185,12 +140,10 @@ impl Default for MarketParticipantNetworkSnapshot {
 }
 
 impl MarketParticipantNetworkSnapshot {
-    /// Creates an initial runtime snapshot from the persisted application settings.
     pub fn new(config: Config) -> Self {
         Self::from_previous(config, None)
     }
 
-    /// Creates a new snapshot while preserving generations for unchanged values.
     pub fn from_previous(config: Config, previous: Option<&Self>) -> Self {
         let network = Arc::new(config.network_config());
         let mut snapshot = Self {
@@ -199,9 +152,6 @@ impl MarketParticipantNetworkSnapshot {
             credentials: BTreeMap::new(),
             next_generation: previous.map_or(1, |previous| previous.next_generation),
         };
-        // What a generation is keyed by is read from the configuration the snapshot
-        // now holds, so the fingerprint and the credential lookups a request makes
-        // are the same answer read twice.
         let fingerprints: Vec<(VenueId, CredentialFingerprint)> = snapshot
             .venues
             .iter()
@@ -234,21 +184,14 @@ impl MarketParticipantNetworkSnapshot {
         snapshot
     }
 
-    /// Returns the persisted network configuration.
     pub fn network(&self) -> &Arc<app_config::network::Config> {
         &self.network
     }
 
-    /// Returns the settings of one venue this build speaks.
     pub(crate) fn venue_settings(&self, venue: &VenueId) -> Option<&VenueSettings> {
         self.venues.get(venue)
     }
 
-    /// Reports whether one venue holds a credential set complete enough to sign.
-    ///
-    /// The answer is the venue's own primary scope: a venue that signs its markets apart
-    /// is half configured when its primary market is, which is exactly the question the
-    /// load gate asks.
     pub(crate) fn credentials_configured(&self, venue: &VenueId) -> bool {
         let Some(settings) = self.venue_settings(venue) else {
             return false;
@@ -259,14 +202,6 @@ impl MarketParticipantNetworkSnapshot {
         )
     }
 
-    /// Returns the origins one scope of one venue is reached on.
-    ///
-    /// A scope the venue publishes answers the pair its own settings give it. A
-    /// scope the venue *deploys* — a perpetual DEX most of all — is not a settings
-    /// key and never becomes one: it is reached through
-    /// [`VenueSettings::deployed_origins`], the pair of the scope the venue answers
-    /// its own non-scoped conversations on. A venue this build does not configure
-    /// answers nothing.
     #[cfg(test)]
     pub(crate) fn origins(
         &self,
@@ -277,11 +212,6 @@ impl MarketParticipantNetworkSnapshot {
             .map(|endpoints| endpoints.primary)
     }
 
-    /// Returns every endpoint one scope of one venue is reached on.
-    ///
-    /// A scope the venue publishes answers its own settings; a scope it deploys
-    /// is reached through the venue's primary scope and carries no metadata
-    /// service of its own.
     pub(crate) fn endpoints(
         &self,
         venue: &VenueId,
@@ -298,17 +228,6 @@ impl MarketParticipantNetworkSnapshot {
         )
     }
 
-    /// Returns whether one venue still resolves the origin a connection dialled.
-    ///
-    /// This is the venue half of "is this connection still current": a connection
-    /// opened through an origin the venue's settings no longer give its scope is
-    /// stale. The comparison is by origin rather than by URL, because an adapter
-    /// dials the configured origin with its own path appended, and the role is read
-    /// off the dialled URL's scheme: a `ws`/`wss` connection was dialled on the
-    /// WebSocket origin and any other scheme on the HTTP one. Comparing against
-    /// both would answer "still served" for a socket whose WebSocket origin moved
-    /// to the HTTP field, which is exactly the reconfiguration a pool has to
-    /// notice.
     pub(crate) fn serves(&self, venue: &VenueId, scope: &VenueScopeId, dialled: &Url) -> bool {
         self.endpoints(venue, scope).is_some_and(|endpoints| {
             let primary = if is_websocket(dialled) {
@@ -328,18 +247,10 @@ impl MarketParticipantNetworkSnapshot {
         })
     }
 
-    /// Returns the proxy generation of one venue's routing decision.
     pub(crate) fn network_route_generation(&self, venue: &VenueId) -> NetworkRouteGeneration {
         self.network.network_route_generation(venue)
     }
 
-    /// Returns the credential generation of one scope of one venue.
-    ///
-    /// The generation is the venue's own — one counter for every set it stores — but
-    /// it is only answered for a scope whose own set can sign: the scope is mapped
-    /// to the set that signs it before anything is read, so a scope the venue
-    /// deploys answers the generation of the scope this build routes it through,
-    /// while a set that is empty or only partly filled answers none at all.
     pub(crate) fn credential_generation(
         &self,
         venue: &VenueId,
@@ -354,14 +265,6 @@ impl MarketParticipantNetworkSnapshot {
         }
     }
 
-    /// Resolves the Binance credentials one scope signs with.
-    ///
-    /// Binance signs each of its markets with its own set, so the scope names the set
-    /// to read. A scope Binance does not publish is a product this venue holds no key
-    /// for, and it answers nothing rather than another market's key. A venue row of
-    /// another kind answers nothing either: credentials are typed per venue, and
-    /// presenting one venue's keys to another host is the one thing a credential
-    /// lookup may never do.
     pub(crate) fn resolve_binance_credentials(
         &self,
         venue: &VenueId,
@@ -377,8 +280,6 @@ impl MarketParticipantNetworkSnapshot {
             Ok(false) => CredentialState::Unconfigured,
             Err(error) => CredentialState::Invalid(error),
             Ok(true) => {
-                // `Ok(true)` is only returned for this same settings' complete `Some` set of
-                // the market mapped above, so no user input reaches this `expect`.
                 let stored = binance
                     .market_credentials(market)
                     .expect("a market whose credentials are complete stores them");
@@ -392,11 +293,6 @@ impl MarketParticipantNetworkSnapshot {
         }
     }
 
-    /// Resolves the OKX credentials one scope signs with.
-    ///
-    /// OKX authenticates its whole surface with one set, so the scope is mapped to
-    /// the one whose credentials sign it: a scope the venue deploys signs with the
-    /// same keys as the scope this build routes it through.
     pub(crate) fn resolve_okx_credentials(
         &self,
         venue: &VenueId,
@@ -410,8 +306,6 @@ impl MarketParticipantNetworkSnapshot {
             Ok(false) => CredentialState::Unconfigured,
             Err(error) => CredentialState::Invalid(error),
             Ok(true) => {
-                // `Ok(true)` is only returned for a complete `Some` set of this same settings,
-                // so no user input reaches this `expect`.
                 let stored = okx
                     .credentials
                     .as_ref()
@@ -425,11 +319,6 @@ impl MarketParticipantNetworkSnapshot {
         }
     }
 
-    /// Resolves the Hyperliquid credentials one scope signs with.
-    ///
-    /// HyperCore authenticates its whole surface with one set, so the scope is mapped
-    /// to the one whose credentials sign it: a scope the venue deploys signs with the
-    /// same keys as the scope this build routes it through.
     pub(crate) fn resolve_hyperliquid_credentials(
         &self,
         venue: &VenueId,
@@ -444,8 +333,6 @@ impl MarketParticipantNetworkSnapshot {
             Ok(false) => CredentialState::Unconfigured,
             Err(error) => CredentialState::Invalid(error),
             Ok(true) => {
-                // `Ok(true)` is only returned for a complete `Some` set of this same settings,
-                // so no user input reaches this `expect`.
                 let stored = hypercore
                     .credentials
                     .as_ref()
@@ -458,12 +345,6 @@ impl MarketParticipantNetworkSnapshot {
         }
     }
 
-    /// Resolves the Longbridge credentials one scope authenticates with.
-    ///
-    /// The venue's one socket session is authenticated by the credential set its
-    /// region belongs to, so the scope is mapped to the one whose credentials
-    /// authenticate it: the region the settings hold decides the endpoints, and the
-    /// three values are what the socket carries to them.
     pub(crate) fn resolve_longbridge_credentials(
         &self,
         venue: &VenueId,
@@ -478,8 +359,6 @@ impl MarketParticipantNetworkSnapshot {
             Ok(false) => CredentialState::Unconfigured,
             Err(error) => CredentialState::Invalid(error),
             Ok(true) => {
-                // `Ok(true)` is only returned for a complete `Some` set of this same settings,
-                // so no user input reaches this `expect`.
                 let stored = longbridge
                     .credentials
                     .as_ref()
@@ -493,11 +372,6 @@ impl MarketParticipantNetworkSnapshot {
         }
     }
 
-    /// Resolves what one venue's stored credentials are, as one comparable value.
-    ///
-    /// A venue that authenticates as a whole is read through its primary scope: every
-    /// other scope it serves — one it deploys most of all — signs with that very set,
-    /// so the primary scope's set is the whole venue's.
     fn credential_fingerprint(
         &self,
         venue: &VenueId,
@@ -529,20 +403,16 @@ impl MarketParticipantNetworkSnapshot {
     }
 }
 
-/// Answers whether one dialled URL is a WebSocket one.
 fn is_websocket(dialled: &Url) -> bool {
     matches!(dialled.scheme(), "ws" | "wss")
 }
 
-/// Returns the Binance market one scope addresses, or nothing for a scope Binance
-/// does not publish.
 fn binance_market(scope: &str) -> Option<BinanceMarket> {
     BinanceMarket::ALL
         .into_iter()
         .find(|market| market.scope() == scope)
 }
 
-/// One statically published scope name, as the routing identity a request addresses.
 fn published_scope(name: &str) -> VenueScopeId {
     VenueScopeId::new(name).expect("a statically published scope name is canonical")
 }
@@ -576,7 +446,6 @@ mod tests {
         VenueScopeId::new(name).expect("the scope should be canonical")
     }
 
-    /// Writes one complete Binance spot credential set into the configuration.
     fn binance_spot(config: &mut Config, api_key: &str, private_key: &str) {
         let Some(VenueSettings::Binance(settings)) = config.venues.get_mut(&VenueId::Binance)
         else {
@@ -592,7 +461,6 @@ mod tests {
         );
     }
 
-    /// Writes one complete Binance USD-M perpetual credential set into the configuration.
     fn binance_perpetual(config: &mut Config, api_key: &str, private_key: &str) {
         let Some(VenueSettings::Binance(settings)) = config.venues.get_mut(&VenueId::Binance)
         else {
@@ -608,7 +476,6 @@ mod tests {
         );
     }
 
-    /// Writes one complete OKX credential set into the configuration.
     fn okx(config: &mut Config, api_key: &str) {
         let Some(VenueSettings::Okx(settings)) = config.venues.get_mut(&VenueId::Okx) else {
             panic!("okx is configured as OKX by the built-in table");
@@ -620,7 +487,6 @@ mod tests {
         });
     }
 
-    /// Writes one complete HyperCore credential set into the configuration.
     fn hyperliquid(config: &mut Config, address: &str, private_key: &str) {
         let Some(VenueSettings::Hyperliquid(settings)) =
             config.venues.get_mut(&VenueId::Hyperliquid)
@@ -633,7 +499,6 @@ mod tests {
         });
     }
 
-    /// Writes one Longbridge credential set into the configuration.
     fn longbridge_credentials(config: &mut Config, app_key: &str, app_secret: &str, token: &str) {
         let Some(VenueSettings::Longbridge(settings)) = config.venues.get_mut(&VenueId::Longbridge)
         else {
@@ -646,7 +511,6 @@ mod tests {
         });
     }
 
-    /// The Binance spot market's own second address choice.
     fn spot_mirror() -> BinanceOrigins {
         BinanceOrigins::new(
             BinanceMarket::Spot,
@@ -695,8 +559,6 @@ mod tests {
         );
     }
 
-    /// A scope the venue deploys is reached through the venue's own primary scope,
-    /// never through a pair of its own: the settings name no scope for it.
     #[test]
     fn a_scope_the_venue_does_not_name_is_reached_through_its_primary_scope() {
         let mut config = Config::default();
@@ -749,10 +611,6 @@ mod tests {
         );
     }
 
-    /// One venue's generation covers every set it stores, and it is answered per
-    /// scope: Binance signs each market apart, so filling in the market the operator
-    /// had not started moves the venue's generation and only then answers for that
-    /// market.
     #[test]
     fn a_venues_generation_covers_every_credential_set_it_stores() {
         let binance = VenueId::Binance;
@@ -795,9 +653,6 @@ mod tests {
         ));
     }
 
-    /// One complete Longbridge credential set resolves, and it answers the venue's
-    /// generation: the three values are the credential its socket authenticates with,
-    /// so a set that is complete is a set this build can dial.
     #[test]
     fn a_complete_longbridge_set_resolves_and_answers_a_generation() {
         let longbridge = VenueId::Longbridge;
@@ -826,13 +681,6 @@ mod tests {
         );
     }
 
-    /// Editing any one of the three Longbridge values moves the venue's generation.
-    ///
-    /// The generation is what a connection key carries, so a value that moved without
-    /// moving the key would let a socket dialled under the old credentials answer for
-    /// the new ones. All three values are edited one at a time, because all three are
-    /// the one credential: the region `x-dc-region` is derived from is a prefix of any
-    /// of them.
     #[test]
     fn every_longbridge_value_is_part_of_its_venues_generation() {
         let longbridge = VenueId::Longbridge;
@@ -862,8 +710,6 @@ mod tests {
         }
     }
 
-    /// A half-filled Longbridge set fails closed: it resolves as invalid rather than
-    /// as the two values that happen to be present.
     #[test]
     fn a_partially_configured_longbridge_venue_is_invalid() {
         let longbridge = VenueId::Longbridge;
@@ -883,8 +729,6 @@ mod tests {
         assert!(!snapshot.credentials_configured(&longbridge));
     }
 
-    /// A venue whose set is only partly filled answers nothing, and it fails closed
-    /// rather than falling back to whatever half of the set happens to be present.
     #[test]
     fn a_partially_configured_venue_has_no_generation() {
         let okx_venue = VenueId::Okx;
@@ -915,9 +759,6 @@ mod tests {
         ));
     }
 
-    /// A Binance market holding a half-filled set fails closed: it resolves as invalid rather
-    /// than as the values it happens to hold, its sibling stays unconfigured, and neither
-    /// answers a generation or reports the venue configured.
     #[test]
     fn a_partially_configured_binance_market_fails_closed() {
         let binance = VenueId::Binance;
@@ -964,9 +805,6 @@ mod tests {
         );
     }
 
-    /// A venue row holding another kind of credential answers nothing for the kind it
-    /// is not: credentials are typed per venue, and one venue's keys are never
-    /// presented to another venue's host.
     #[test]
     fn a_venue_holding_another_kinds_credentials_answers_nothing() {
         let binance = VenueId::Binance;
@@ -1027,8 +865,6 @@ mod tests {
         ));
     }
 
-    /// A venue this build configures nothing for answers nothing at all: no origins,
-    /// no generation, no credentials — and nothing it dials is served.
     #[test]
     fn a_venue_without_settings_answers_nothing() {
         let binance = VenueId::Binance;
@@ -1058,8 +894,6 @@ mod tests {
         ));
     }
 
-    /// Credentials written as Hyperliquid ones are read as Hyperliquid ones, and a
-    /// scope the venue deploys signs with the very same set.
     #[test]
     fn a_configured_venue_resolves_its_own_credentials() {
         let hyperliquid_venue = VenueId::Hyperliquid;
@@ -1121,9 +955,6 @@ mod tests {
         );
     }
 
-    /// A dialled origin is served by the venue that configures it, for the role the
-    /// dialled URL plays and for the scope it was dialled under. A venue this build
-    /// configures nothing for serves nothing.
     #[test]
     fn a_dialled_origin_is_served_only_by_the_venue_that_configures_it() {
         let snapshot = MarketParticipantNetworkSnapshot::new(Config::default());
@@ -1217,8 +1048,6 @@ mod tests {
         );
     }
 
-    /// The built-in table is what every other fixture starts from, so a snapshot of it
-    /// answers every venue this build speaks.
     #[test]
     fn every_venue_of_the_built_in_table_is_configured() {
         let snapshot = MarketParticipantNetworkSnapshot::new(Config::default());

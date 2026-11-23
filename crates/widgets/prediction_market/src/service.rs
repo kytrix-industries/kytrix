@@ -1,12 +1,3 @@
-//! The background service one prediction market widget talks to.
-//!
-//! The chart reads a bounded history once and then follows the venue's live
-//! probability stream. The subscription is opened before the history is requested,
-//! so a tick that lands while the page is in flight is buffered rather than missed.
-//! The stream key is the event, the market and the range: another event, market or
-//! range is another chart, and a message from the previous one is refused by the
-//! view.
-
 use std::{
     collections::VecDeque,
     future::Future,
@@ -36,31 +27,18 @@ use widget::{
 
 use crate::model::PredictionMarketSnapshot;
 
-/// How long one read may take before it is a failure.
 pub(crate) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often accumulated live ticks are published to the chart.
-///
-/// The chart is a full-window repaint, so a venue pushing several ticks a second
-/// must not repaint the window at that rate.
 pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The most live updates buffered between opening the stream and the first
-/// snapshot.
-///
-/// This counts updates, not points: one update carries one new observation per
-/// leg, so it is separate from the per-line point budget.
 pub(crate) const MAX_BUFFERED_UPDATES: usize = 2_000;
 
-/// What the view asks the service to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PredictionMarketRequest {
     Load {
         event: PredictionEventRef,
         market: Option<PredictionMarketRef>,
         range: PredictionRange,
-        /// A local stream epoch. Every explicit load increments it, so messages
-        /// from a replaced stream can never be mistaken for the new one's.
         epoch: u64,
     },
     Retry {
@@ -95,23 +73,19 @@ impl PredictionMarketRequest {
     }
 }
 
-/// What the service answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PredictionMarketResponse {
     StreamStarted,
 }
 
-/// The event, market and range one chart follows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PredictionMarketStreamKey {
     pub event: PredictionEventRef,
     pub market: Option<PredictionMarketRef>,
     pub range: PredictionRange,
-    /// The view-local generation that produced this request.
     pub epoch: u64,
 }
 
-/// Where the stream is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PredictionMarketStatus {
     Connecting,
@@ -119,7 +93,6 @@ pub enum PredictionMarketStatus {
     Failed { error: PredictionMarketFetchError },
 }
 
-/// Why one read produced no snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum PredictionMarketFetchError {
     #[error("the prediction request failed: {0}")]
@@ -136,21 +109,15 @@ impl From<MarketError> for PredictionMarketFetchError {
     }
 }
 
-/// Everything the service publishes.
 #[derive(Clone, Debug)]
 pub enum PredictionMarketStreamMessage {
     Status(PredictionMarketStatus),
     Snapshot(Arc<PredictionMarketSnapshot>),
 }
 
-/// Why a request was refused.
-///
-/// The service has no refusal of its own: a request always starts or replaces a
-/// stream. The type exists because the protocol boundary names one.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum PredictionMarketServiceError {}
 
-/// The seam between the chart and the connector, so a test can answer instead.
 pub trait PredictionMarketSource: Clone + Send + Sync + 'static {
     type Subscription: PredictionSeriesEventSubscription;
 
@@ -173,7 +140,6 @@ pub trait PredictionMarketSource: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
 }
 
-/// One live probability stream.
 pub trait PredictionSeriesEventSubscription: Send + 'static {
     fn recv(
         &mut self,
@@ -232,12 +198,6 @@ impl WidgetProtocol for PredictionMarketProtocol {
 pub struct PredictionMarketService<S = MarketCapability> {
     source: S,
     attempt_timeout: Duration,
-    /// The next snapshot revision this service hands out.
-    ///
-    /// Revisions are service-wide rather than stream-local: replacing a stream
-    /// must never restart at a number the chart is still holding from the stream
-    /// being replaced, or the first snapshot of the new stream would be refused
-    /// as stale.
     revision: Arc<AtomicU64>,
 }
 
@@ -263,9 +223,6 @@ where
                 continue;
             }
             let key = request.key();
-            // The supervisor replaces only the exact key it is given. A chart
-            // follows one event at a time, so a request for another event or
-            // market must retire the previous stream as well.
             if let Some(previous) = active_key
                 .as_ref()
                 .filter(|previous| *previous != &key)
@@ -349,10 +306,6 @@ async fn run_stream<S>(
         }
     };
 
-    // The live stream is open before history is requested, so a tick that lands
-    // while the page is in flight is buffered rather than missed. The buffer is
-    // bounded by an update budget: a tick older than that many ticks is a point
-    // the chart would drop anyway.
     let mut buffered: VecDeque<Vec<PredictionSeries>> = VecDeque::new();
     let fetch = timeout(
         attempt_timeout,
@@ -424,11 +377,6 @@ async fn run_stream<S>(
     {
         return;
     }
-    // Every tick is folded into the snapshot as it arrives, but the snapshot is
-    // published at a bounded cadence: a venue that pushes faster than a screen can
-    // redraw would otherwise repaint the whole window on every tick. The timer
-    // publishes what has accumulated; a cancelled generation publishes nothing,
-    // because the replacement stream starts from its own history.
     let mut flush = tokio::time::interval(PUBLISH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     flush.tick().await;
@@ -476,8 +424,6 @@ async fn run_stream<S>(
     }
 }
 
-/// The market the caller asked for, or an open headline market, or the first
-/// open market the venue published.
 fn selected_market(
     event: &PredictionEventView,
     requested: Option<&PredictionMarketRef>,
@@ -495,11 +441,6 @@ fn selected_market(
         .iter()
         .filter(|market| market.open)
         .find(|market| market.headline)
-        // A grouped event publishes one market per candidate, each with a Yes and
-        // a No side. The venue lists the event's main market first, so a fallback
-        // that ranked sides could only pick an arbitrary candidate: every
-        // candidate's No side is priced near one. The order the venue published
-        // is the one a reader sees on the event page.
         .or_else(|| event.markets.iter().find(|market| market.open))
         .or_else(|| event.markets.iter().find(|market| market.headline))
         .or_else(|| event.markets.first())

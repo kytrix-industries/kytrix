@@ -1,70 +1,3 @@
-//! 应用层文本编辑状态机 + 引擎（`ui_core`）渲染（P2-3）。
-//!
-//! 旧 `input` 模块是 UI 框架之上的一层壳：值/掩码/禁用/只读/占位符/光标与选区全部委托给
-//! 旧输入组件库的 11,955 行编辑状态机。引擎化之后**编辑状态机归应用层**（本模块），引擎只提供
-//! 三件事：文本 shaping 与几何查询（`Window::text_caret_rect` / `Window::text_byte_index_at` /
-//! `NodeTree::text_selection_rects`）、逐帧失效与绘制（`bind_text` / `bind_style` /
-//! `Window::set_canvas`）、以及输入路由（`App::drain_events` / IME caret hint）。
-//!
-//! # 数据流与外壳义务
-//!
-//! ```text
-//! 外壳每轮：drain_events → dispatch(逐条) → sync → 引擎帧（styles → text → layout → paint）
-//!                                  │            │
-//!                                  ▼            ▼
-//!                     Signal<InputState>  ←─ 焦点镜像 / IME 开关与光标区 / caret+选区 Canvas
-//! ```
-//!
-//! 本模块**不装 `App::on_frame`**（引擎只有一个钩子，归外壳所有）。外壳需要：
-//!
-//! 1. [`InputNode::install`]：挂载后调用一次，注册点击定位处理器；
-//! 2. `drain_events` 之后把每条 `Event` 交给 [`InputNode::dispatch`]；
-//! 3. 每轮调用一次 [`InputNode::sync`]（推荐放在外壳自己的 `on_frame` 钩子里，即帧之前）：
-//!    镜像引擎焦点、开关 IME、把 caret/选区画布交给引擎。
-//!
-//! 卸载输入框时调用一次 [`InputNode::release`]：摘除 `install` 注册的两个 Action handler
-//! （幂等；构建期 `disabled` 的输入框 `install` 是 no-op，release 返回 0）。
-//!
-//! 编辑产生的 `Change` / `Blur` 由外壳**读状态信号**观察（`InputState::text` / `is_focused` /
-//! `error`）；`PressEnter` 通过 [`InputSpec::submit`] 动作表达（单行输入在焦点节点上派发）。
-//! 前缀图标 / 密码可见性切换仍属后续批；**清空**能力在 P2-11 补上（[`InputNode::set_clearable`]
-//! 建自绘清空控件，[`InputNode::clear`] 是程序化读点），失焦提交用
-//! [`InputNode::set_submit_on_blur`] 打开（W7 的 period 提交缺口）。
-//!
-//! # 已知边界（引擎没有公开 API，不做变通实现）
-//!
-//! - **字素簇级 Backspace/Delete**：引擎的 grapheme/cluster 划分只在 a11y 内部的
-//!   `pub(crate)` 模块里（`a11y::textrun`），公开面没有「字节 → 簇边界」查询。本模块按 `char`
-//!   删除并保证**永不切断 UTF-8**；组合附加符号 / ZWJ 序列会被拆成多个 `char`。
-//! - **上下方向键**：视觉行不是公开 API（`ShapedLine` 只在 crate 内可达），因此 `↑/↓` 不消费
-//!   （不伪造「跳到段首/段尾」的语义）。左右方向键 / Home / End / Ctrl+Home / Ctrl+End 可用。
-//!   旧输入组件库在单行输入上同样早退，因此当前产品没有回归。
-//! - **密码框 IME 语义**：Linux 的 `Window::set_ime_content_type(ImeContentType::Password)`
-//!   是窗口级接口且属平台批次，未接线。
-//!
-//! # P2-3b 追加能力（审查修复 + 用户裁决）
-//!
-//! - **undo/redo**：快照式、有界历史（100 步）；Ctrl/Cmd+Z 撤销、Ctrl/Cmd+Shift+Z / Ctrl/Cmd+Y
-//!   重做。组合开始时的选区删除与提交合并成一步。
-//! - **拖选**：节点 `on_drag` 借引擎指针捕获，`Start/Move/End/Cancel` 用 `App::drag` 的
-//!   `origin/current` 换算到文本内容坐标。
-//! - **双击选词 / 三击选行**：按字符类别（词字符 / 空白 / 其它）取极大连续段；CJK 连续段为一词。
-//! - **单行水平滚动**：单行文本放进 `*input.viewport*` 横向滚动容器，按 caret 可见性 reveal。
-//! - **单行清洗**：`insert` / 粘贴 / IME 提交 / `set_text` 丢弃 `\r` / `\n` / `\t`。
-//! - **自动重复**：编辑/导航键处理 `repeat`；`Enter`/Submit 与命令快捷键只首按。
-//! - **运行时更新**：[`InputNode::update_value`] / [`InputNode::update_placeholder`]。
-//! - **多输入同窗的 IME 开关**：引擎的 `set_ime_enabled` 是**窗口级**状态。本模块只在
-//!   「本输入框失焦」时关闭、在聚焦时打开，因此同窗多个输入框时以**最后同步者**为准；外壳应
-//!   在焦点转移的那一轮按「先同步失焦者、后同步得焦者」调用 `sync`（或只同步聚焦控件）。
-//!
-//! # P2-3c 复核修复
-//!
-//! - **caret/选区画布用屏幕坐标**：`Window::text_caret_rect` 已含祖先滚动偏移（屏幕绝对坐标），
-//!   Canvas 图元的契约也是绝对坐标 —— 不再 `.translate(-scroll_x)` 重复减一次。
-//! - **程序化写值契约**：[`InputNode::update_value`] 走旧 `set_value` 语义（绕过 `readonly` /
-//!   `disabled`、清空撤销历史、光标到末尾），[`InputState::set_text`] 保持用户输入受限语义；
-//!   两者差异见 `kit-text.md` §4.2.13。
-
 use std::{
     cell::{Cell, RefCell},
     fmt,
@@ -105,58 +38,31 @@ use crate::{
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 
-/// 掩码字符（密码框逐字符显示）。
 const BULLET: char = '•';
-/// 输入框圆角（与旧 `rounded_sm` 的 4 px 一致；主题 token 暂无圆角档位）。
 const CORNER_RADIUS: f32 = 4.0;
-/// 撤销历史最多保留多少步（快照式；超过时丢最旧的一步）。
 const UNDO_HISTORY_LIMIT: usize = 100;
 
-/// 一节输入框的构造参数（挂载期常量；主题/尺寸变化 = 重新挂载）。
 #[derive(Clone, Debug)]
 pub struct InputSpec {
-    /// 节点 id 与动作 key 的前缀（**同一 App 内必须唯一**），同时作为 a11y 的兜底标签。
     pub name: SmolStr,
-    /// 空值占位符。
     pub placeholder: SmolStr,
-    /// 密码框：逐字符显示 `•`，禁用复制/剪切。
     pub masked: bool,
-    /// 多行：Enter 插入换行、文本按宽度换行。
     pub multiline: bool,
-    /// 只读：光标/选区/复制可用，一切修改被拒。
     pub readonly: bool,
-    /// 禁用：不可聚焦、不可命中、不派发点击动作。
     pub disabled: bool,
-    /// 最大字符数（`char` 计数，不是字节）。
     pub max_length: Option<usize>,
-    /// 控件尺寸档（高度 / 字号 / 内边距取自主题 token）。
     pub size: ControlSize,
-    /// 单行输入在焦点节点上按 Enter 时派发的动作（`None` = 只消费按键）。
     pub submit: Option<Action>,
 }
 
-/// 输入框的强类型错误。
-///
-/// `i18n_key` 是稳定的翻译 key：`Empty` / `TooLong` 由本模块产生，`Invalid` 的 key 由应用
-/// 校验后经 [`InputState::set_error`] 写入。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputError {
-    /// 空值（应用在某次 `validate` 里要求非空）。
     Empty,
-    /// 超过最大字符数。
-    TooLong {
-        /// 上限（字符数）。
-        max: usize,
-    },
-    /// 应用自己的校验失败（携带自己的 i18n key）。
-    Invalid {
-        /// 应用的翻译 key。
-        i18n_key: SmolStr,
-    },
+    TooLong { max: usize },
+    Invalid { i18n_key: SmolStr },
 }
 
 impl InputError {
-    /// 翻译 key（错误态渲染/播报的唯一入口）。
     #[must_use]
     pub fn i18n_key(&self) -> &str {
         match self {
@@ -167,40 +73,24 @@ impl InputError {
     }
 }
 
-/// 纯状态层的光标移动（不依赖 `InputSpec`；Home/End 是**行级**，单行时等价文档首尾）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaretMotion {
-    /// 左移一个 `char`。
     CharLeft,
-    /// 右移一个 `char`。
     CharRight,
-    /// 当前行行首（上一个 `\n` 之后）。
     Home,
-    /// 当前行行尾（下一个 `\n` 之前）。
     End,
-    /// 文档首。
     DocStart,
-    /// 文档尾。
     DocEnd,
 }
 
-/// 一次 IME 组合的状态。
-///
-/// **不写进提交文本**：组合串是显示层叠加（`display_text` = 前缀 + preedit + 后缀），提交时才
-/// 进入 [`InputState`] 的正文。`caret_utf16` 是**组合串内**的插入点（UTF-16 码元）。
 #[derive(Clone, Debug, PartialEq)]
 struct Composition {
-    /// 组合起点（提交文本的 UTF-8 字节偏移）。
     start: usize,
-    /// 组合串（UTF-8）。
     text: String,
-    /// 组合串内插入点（UTF-16 码元，相对 `text`）；`None` = 画在末尾。
     caret_utf16: Option<u32>,
-    /// 组合开始前的正文快照：组合开始会删掉选区，提交时这一步删除与随后的提交算**一次**编辑。
     before: EditSnapshot,
 }
 
-/// 一次可撤销编辑的快照（只含正文与选区，不含焦点/错误/组合）。
 #[derive(Clone, Debug, PartialEq)]
 struct EditSnapshot {
     text: String,
@@ -208,40 +98,21 @@ struct EditSnapshot {
     anchor: usize,
 }
 
-/// 输入框的编辑状态（纯数据；`Signal<InputState>` 是唯一真值）。
-///
-/// 坐标空间：
-/// - [`InputState::caret`] 与 [`InputState::display_text`] 用**未脱敏显示文本**的 UTF-8 字节
-///   （组合期 preedit 内联在 `display_text` 里，因此 caret 可以直接喂给引擎的
-///   `text_caret_rect` / `set_ime_cursor_area`；脱敏由本模块在 `sync` 里按字符数换算）；
-/// - [`InputState::selection`] / [`InputState::selection_anchor`] 用**提交文本**的 UTF-8 字节；
-///   组合期选区恒为空（`start..start`）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct InputState {
-    /// 已提交正文。
     text: String,
-    /// 插入点（提交文本 UTF-8 字节，恒在 char boundary）。
     caret: usize,
-    /// 选区锚点（提交文本 UTF-8 字节，恒在 char boundary）。
     anchor: usize,
-    /// 当前 IME 组合（`None` = 未在组合）。
     composition: Option<Composition>,
-    /// 焦点镜像（由外壳每轮 `sync` 从引擎焦点写回）。
     focused: bool,
-    /// 最近一次校验/应用写入的错误。
     error: Option<InputError>,
-    /// 撤销栈（编辑前快照；有界，见 [`UNDO_HISTORY_LIMIT`]）。
     undo: Vec<EditSnapshot>,
-    /// 重做栈（撤销出来的快照；任何新编辑清空）。
     redo: Vec<EditSnapshot>,
-    /// 是否正在按住拖选。
     dragging: bool,
-    /// 拖选起点（文本内容坐标；指针移出窗口时按 `Drag` 的 delta 兜底）。
     drag_origin: Option<Point>,
 }
 
 impl InputState {
-    /// 以初始正文构造（光标在末尾、无选区）。
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
@@ -260,13 +131,11 @@ impl InputState {
         }
     }
 
-    /// 已提交正文（**不含** IME 组合串）。
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// 显示文本：已提交正文 + 内联 preedit；`masked` 时逐字符替换为 `•`（不是逐字节）。
     #[must_use]
     pub fn display_text(&self, masked: bool) -> SmolStr {
         let unmasked = self.display_unmasked();
@@ -279,13 +148,11 @@ impl InputState {
         SmolStr::new(bullets)
     }
 
-    /// 插入点的**未脱敏显示文本** UTF-8 字节（组合期 = 组合起点 + 组合串内 caret）。
     #[must_use]
     pub fn caret(&self) -> usize {
         self.display_caret_byte(false)
     }
 
-    /// 选区（提交文本字节，升序）；组合期为空区间（`start..start`）。
     #[must_use]
     pub fn selection(&self) -> Range<usize> {
         if self.composition.is_some() {
@@ -295,7 +162,6 @@ impl InputState {
         self.selection_range()
     }
 
-    /// 选区锚点（提交文本字节）；组合期 = 组合起点。
     #[must_use]
     pub fn selection_anchor(&self) -> usize {
         match &self.composition {
@@ -304,31 +170,21 @@ impl InputState {
         }
     }
 
-    /// 是否正在 IME 组合。
     #[must_use]
     pub fn is_composing(&self) -> bool {
         self.composition.is_some()
     }
 
-    /// 焦点镜像（引擎焦点的上一轮同步结果；权威源仍是 `App::focused`）。
     #[must_use]
     pub fn is_focused(&self) -> bool {
         self.focused
     }
 
-    /// 当前错误（错误态渲染读它）。
     #[must_use]
     pub fn error(&self) -> Option<&InputError> {
         self.error.as_ref()
     }
 
-    /// 插入文本（替换选区；先提交组合）。`readonly` / `disabled` 直接拒绝；`max_length`
-    /// 按字符裁剪（永不 panic、永不切开字符）。
-    ///
-    /// 单行输入会**清洗**掉换行与制表符（`\r` / `\n` / `\t`）：粘贴多行文本、IME 提交与
-    /// 程序化插入走同一条路径。这次插入作为**一步**进入撤销历史（组合提交与插入合并）。
-    ///
-    /// 返回正文/选区是否变化。
     pub fn insert(&mut self, spec: &InputSpec, text: &str) -> bool {
         if spec.disabled || spec.readonly {
             return false;
@@ -343,7 +199,6 @@ impl InputState {
         changed
     }
 
-    /// 退格：先消掉组合（不删组合文本），否则删选区，再否则删光标前一个 `char`。
     pub fn delete_backward(&mut self, spec: &InputSpec) -> bool {
         if spec.disabled || spec.readonly {
             return false;
@@ -374,7 +229,6 @@ impl InputState {
         true
     }
 
-    /// 删除：先消掉组合，否则删选区，再否则删光标后一个 `char`。
     pub fn delete_forward(&mut self, spec: &InputSpec) -> bool {
         if spec.disabled || spec.readonly {
             return false;
@@ -403,7 +257,6 @@ impl InputState {
         true
     }
 
-    /// 插入换行（仅多行；其余情况 `false`）。
     pub fn insert_newline(&mut self, spec: &InputSpec) -> bool {
         if !spec.multiline {
             return false;
@@ -411,14 +264,12 @@ impl InputState {
         self.insert(spec, "\n")
     }
 
-    /// 全选（取消组合）。
     pub fn select_all(&mut self) {
         self.cancel_composition();
         self.anchor = 0;
         self.caret = self.text.len();
     }
 
-    /// 设置插入点（向下吸附到 char boundary 并 clamp）；`extend` = 保留锚点（扩选）。
     pub fn set_caret(&mut self, byte: usize, extend: bool) {
         self.cancel_composition();
         let byte = snap_char_boundary(&self.text, byte);
@@ -430,7 +281,6 @@ impl InputState {
         }
     }
 
-    /// 移动插入点（取消组合）。Home/End 是**行级**（找当前行两侧的 `\n`）。
     pub fn move_caret(&mut self, motion: CaretMotion, extend: bool) {
         self.cancel_composition();
         let caret = snap_char_boundary(&self.text, self.caret);
@@ -454,9 +304,6 @@ impl InputState {
         }
     }
 
-    /// 更新 IME 组合串（整串替换当前组合串；`caret_utf16` 相对 `text`）。
-    ///
-    /// 没有进行中的组合时从光标处开始（先消掉选区）。`readonly` / `disabled` ⇒ `false`。
     pub fn ime_preedit(&mut self, spec: &InputSpec, text: &str, caret_utf16: Option<u32>) -> bool {
         if spec.disabled || spec.readonly {
             return false;
@@ -481,9 +328,6 @@ impl InputState {
         started || previous_text != composition.text || previous_caret != composition.caret_utf16
     }
 
-    /// 提交组合文本：`text` 替换整个当前组合串并进入正文（先按 `max_length` 裁剪）。
-    ///
-    /// 没有组合时等价于 [`InputState::insert`]。提交与组合开始时的选区删除算**一步**撤销。
     pub fn ime_commit(&mut self, spec: &InputSpec, text: &str) -> bool {
         if spec.disabled || spec.readonly {
             self.ime_cancel();
@@ -500,12 +344,10 @@ impl InputState {
         true
     }
 
-    /// 取消组合（丢弃 preedit，插入点回到组合起点）。
     pub fn ime_cancel(&mut self) {
         self.cancel_composition();
     }
 
-    /// 复制选区到剪贴板（脱敏字段 / 无选区 / 禁用 ⇒ `false`；只读允许复制）。
     pub fn copy(&self, app: &App, spec: &InputSpec) -> bool {
         if spec.disabled || spec.masked {
             return false;
@@ -518,7 +360,6 @@ impl InputState {
         app.set_clipboard_text(&self.text[start..end]).is_ok()
     }
 
-    /// 剪切选区（脱敏 / 只读 / 禁用 ⇒ `false`）。
     pub fn cut(&mut self, app: &App, spec: &InputSpec) -> bool {
         if spec.disabled || spec.readonly || spec.masked {
             return false;
@@ -532,7 +373,6 @@ impl InputState {
         changed
     }
 
-    /// 粘贴剪贴板文本（先提交组合；`readonly` / `disabled` ⇒ `false`）。
     pub fn paste(&mut self, app: &App, spec: &InputSpec) -> bool {
         if spec.disabled || spec.readonly {
             return false;
@@ -543,7 +383,6 @@ impl InputState {
         self.insert(spec, text.as_str())
     }
 
-    /// 写回焦点镜像（失焦时丢弃未提交的组合）。
     pub fn set_focused(&mut self, focused: bool) {
         if !focused {
             self.cancel_composition();
@@ -551,11 +390,6 @@ impl InputState {
         self.focused = focused;
     }
 
-    /// 用 `max_length` + 空值做一次校验并写入错误态。
-    ///
-    /// 只做这两条（应用自己的领域校验经 [`InputState::set_error`] 写入）。**空值校验是无条件的**
-    /// （没有 `required` 概念）：可选字段的调用方不要调用 `validate`（或自行忽略 `Empty`）；
-    /// `TooLong` 也只在初始值超限 / 上限调小时可见——插入/粘贴会静默按上限裁剪。
     pub fn validate(&mut self, spec: &InputSpec) -> Option<InputError> {
         let error = if self.text.is_empty() {
             Some(InputError::Empty)
@@ -568,22 +402,10 @@ impl InputState {
         error
     }
 
-    /// 应用写入错误态（`None` = 清空）。
     pub fn set_error(&mut self, error: Option<InputError>) {
         self.error = error;
     }
 
-    /// 用户级替换整个值（旧 `replace_all` 的语义入口；程序化写值走
-    /// [`InputNode::update_value`]）。
-    ///
-    /// - 单行输入先清洗换行/制表符（与 [`InputState::insert`] 同一条规则）；
-    /// - 超过 `max_length` 的值按字符裁剪，并写入 [`InputError::TooLong`]（**非法值错误语义**：
-    ///   调用方给的值不合法时错误态可见，而不是静默截断）；
-    /// - 合法值清空错误、光标/选区落在末尾、取消组合；
-    /// - `readonly` / `disabled` 拒绝（返回 `false`，状态不变）；
-    /// - 这次替换进入撤销历史（一步）。
-    ///
-    /// 返回正文/选区/错误态是否变化。
     pub fn set_text(&mut self, spec: &InputSpec, text: &str) -> bool {
         if spec.disabled || spec.readonly {
             return false;
@@ -591,7 +413,6 @@ impl InputState {
         self.replace_text(spec, text)
     }
 
-    /// [`InputState::set_text`] 的实际替换（调用方负责用户输入限制）。
     fn replace_text(&mut self, spec: &InputSpec, text: &str) -> bool {
         let before = self.snapshot();
         let sanitized = clean_single_line(text, spec.multiline);
@@ -621,19 +442,16 @@ impl InputState {
         changed
     }
 
-    /// 是否可撤销。
     #[must_use]
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
 
-    /// 是否可重做。
     #[must_use]
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
 
-    /// 撤销一步（恢复正文与选区；组合被取消）。返回是否真的撤销。
     pub fn undo(&mut self) -> bool {
         self.cancel_composition();
         let Some(previous) = self.undo.pop() else {
@@ -645,7 +463,6 @@ impl InputState {
         true
     }
 
-    /// 重做一步。返回是否真的重做。
     pub fn redo(&mut self) -> bool {
         self.cancel_composition();
         let Some(next) = self.redo.pop() else {
@@ -657,11 +474,6 @@ impl InputState {
         true
     }
 
-    /// 双击选词：把光标所在 `char` 的同类连续段选成选区。
-    ///
-    /// 规则（明确、可测）：字符分三类——**词字符**（`char::is_alphanumeric()` 或 `_`，CJK 连续段
-    /// 属于这一类）、**空白**（`char::is_whitespace()`）、**其它**（标点/符号）。选区是包含光标
-    /// 字符的同类极大连续段；光标在文本末尾时取前一个字符。空文本无操作。
     pub fn select_word(&mut self) -> bool {
         self.cancel_composition();
         let caret = snap_char_boundary(&self.text, self.caret);
@@ -677,7 +489,6 @@ impl InputState {
         true
     }
 
-    /// 三击选行：选中光标所在行的整行内容（不含行尾 `\n`；单行输入 = 整段文本）。
     pub fn select_line(&mut self) -> bool {
         self.cancel_composition();
         let caret = snap_char_boundary(&self.text, self.caret);
@@ -693,13 +504,11 @@ impl InputState {
         true
     }
 
-    /// 是否正在拖选。
     #[must_use]
     pub fn is_dragging(&self) -> bool {
         self.dragging
     }
 
-    /// 记录拖选起点（内容坐标）并把选区锚在 `origin_caret`。返回是否开始。
     pub fn begin_drag(&mut self, origin_caret: usize, origin: Point) -> bool {
         self.cancel_composition();
         let origin_caret = snap_char_boundary(&self.text, origin_caret);
@@ -711,13 +520,11 @@ impl InputState {
         true
     }
 
-    /// 结束拖选（保留现行选区）。返回之前是否在拖选。
     pub fn end_drag(&mut self) -> bool {
         self.drag_origin = None;
         std::mem::take(&mut self.dragging)
     }
 
-    /// 拖选落点（`extend = true` 的 caret 移动；不在拖选中时忽略）。返回选区是否变化。
     pub fn drag_to(&mut self, caret: usize, extend: bool) -> bool {
         if !self.dragging {
             return false;
@@ -727,10 +534,6 @@ impl InputState {
         self.caret != before
     }
 
-    /// 引擎感知：把文本节点上的局部点换算成插入点（`extend` = Shift 扩选）。
-    ///
-    /// 入参与 `Window::text_byte_index_at` 同域（文本节点 border box 局部）；脱敏显示与组合串
-    /// 都由本方法按字符数映射回真实正文。文本尚未 shape ⇒ `false`（等下一帧再定位）。
     pub fn set_caret_from_point(
         &mut self,
         window: &Window,
@@ -773,13 +576,6 @@ impl InputState {
         changed
     }
 
-    /// 引擎感知：键盘路由（Ctrl/Cmd+A/C/X/V、Ctrl/Cmd+Z/Shift+Z/Y、Backspace/Delete、
-    /// ←/→ + Shift、Home/End、Enter）。返回是否消费该按键；`Space` 由 `InputEvent::Text` 插入，
-    /// 不在这里处理。
-    ///
-    /// `repeat` 来自平台自动重复：编辑键与导航键**照常处理**（长按退格/方向键是标准行为）；
-    /// `Enter`/`Submit` 与命令快捷键只在首按时处理，重复事件不消费（避免长按回车重复提交、
-    /// 长按 Ctrl+V 重复粘贴）。组合期只处理 `Escape`（取消组合）。
     pub fn handle_key(
         &mut self,
         app: &mut App,
@@ -868,7 +664,6 @@ impl InputState {
                 true
             }
             KeyCode::Escape => {
-                // 先取消组合（上面已处理），再收缩选区；没有选区时不消费，留给外壳关浮层。
                 let selection = self.selection_range();
                 if selection.is_empty() {
                     return false;
@@ -888,10 +683,6 @@ impl InputState {
         }
     }
 
-    /// 引擎感知：IME 事件路由。`replace` 区间（UTF-16，相对当前组合串起点）在这里折算成
-    /// 「整串替换」再交给状态层；`End` 在没收到 `Commit` 时等价取消。
-    ///
-    /// 返回是否消费该事件。
     pub fn handle_ime(
         &mut self,
         app: &mut App,
@@ -934,7 +725,6 @@ impl InputState {
         true
     }
 
-    /// 未脱敏显示文本（正文 + 内联 preedit）。
     fn display_unmasked(&self) -> SmolStr {
         match &self.composition {
             Some(composition) => format_smolstr!(
@@ -947,7 +737,6 @@ impl InputState {
         }
     }
 
-    /// 组合串内的 caret（组合串 UTF-8 字节）。
     fn preedit_caret_utf8(&self) -> usize {
         let Some(composition) = &self.composition else {
             return 0;
@@ -959,7 +748,6 @@ impl InputState {
         utf8_from_utf16_offset(&composition.text, units)
     }
 
-    /// 提交文本偏移 → 未脱敏显示文本偏移（组合串内联展开）。
     fn display_offset(&self, committed: usize) -> usize {
         match &self.composition {
             Some(composition) if committed > composition.start => {
@@ -969,7 +757,6 @@ impl InputState {
         }
     }
 
-    /// 插入点在显示文本里的字节偏移（`masked` 时按「一字符 = 一个 `•`」换算）。
     fn display_caret_byte(&self, masked: bool) -> usize {
         let unmasked = match &self.composition {
             Some(composition) => composition.start + self.preedit_caret_utf8(),
@@ -982,7 +769,6 @@ impl InputState {
         }
     }
 
-    /// 选区在显示文本里的字节区间（组合期为空）。
     fn display_selection(&self, masked: bool) -> Range<usize> {
         let selection = self.selection_range();
         let (start, end) = (selection.start, selection.end);
@@ -996,7 +782,6 @@ impl InputState {
         }
     }
 
-    /// 提交文本里的选区（升序）。
     fn selection_range(&self) -> Range<usize> {
         if self.anchor <= self.caret {
             self.anchor..self.caret
@@ -1005,7 +790,6 @@ impl InputState {
         }
     }
 
-    /// 当前可撤销快照（组合期用组合起点，撤销不会恢复未提交的组合串）。
     fn snapshot(&self) -> EditSnapshot {
         match &self.composition {
             Some(composition) => EditSnapshot {
@@ -1021,7 +805,6 @@ impl InputState {
         }
     }
 
-    /// 恢复快照（撤销/重做的唯一写入点）。
     fn restore(&mut self, snapshot: EditSnapshot) {
         self.text = snapshot.text;
         self.caret = snap_char_boundary(&self.text, snapshot.caret);
@@ -1030,7 +813,6 @@ impl InputState {
         self.error = None;
     }
 
-    /// 一步编辑收尾：有变化才入撤销栈，并清空重做栈。
     fn finish_edit(&mut self, before: EditSnapshot, changed: bool) {
         if !changed {
             return;
@@ -1042,7 +824,6 @@ impl InputState {
         self.redo.clear();
     }
 
-    /// 删除当前选区（提交文本）；返回是否真的删了。
     fn delete_selection(&mut self) -> bool {
         let selection = self.selection_range();
         let (start, end) = (selection.start, selection.end);
@@ -1056,7 +837,6 @@ impl InputState {
         true
     }
 
-    /// 用 `text` 替换选区（单行先清洗换行/制表符；`max_length` 按字符裁剪）。
     fn replace_selection_with(&mut self, spec: &InputSpec, text: &str) -> bool {
         let selection = self.selection_range();
         let (start, end) = (selection.start, selection.end);
@@ -1078,7 +858,6 @@ impl InputState {
         true
     }
 
-    /// 提交当前组合（`true` = 有过组合）。
     fn commit_composition(&mut self, spec: &InputSpec) -> bool {
         let Some(composition) = self.composition.take() else {
             return false;
@@ -1089,7 +868,6 @@ impl InputState {
         true
     }
 
-    /// 开始组合（清掉选区后把组合起点放在插入点）。已有组合 / 只读 / 禁用 ⇒ `false`。
     fn ime_start_inner(&mut self, spec: &InputSpec) -> bool {
         if spec.disabled || spec.readonly || self.composition.is_some() {
             return false;
@@ -1108,7 +886,6 @@ impl InputState {
         true
     }
 
-    /// 取消组合（插入点回到组合起点）；`true` = 之前确实在组合。
     fn cancel_composition(&mut self) -> bool {
         let Some(composition) = self.composition.take() else {
             return false;
@@ -1118,10 +895,6 @@ impl InputState {
         true
     }
 
-    /// 把「组合串内替换区间 + 新片段」折算成整串 preedit，并把 caret 换算到整串坐标。
-    ///
-    /// `replace` 是 UTF-16 码元、相对**当前组合串起点**；`None` = 整个当前组合串。caret 随
-    /// 片段走：最终 caret = 前缀 UTF-16 长度 + 片段内 caret。
     fn preedit_replaced(
         &self,
         fragment: &str,
@@ -1156,9 +929,6 @@ impl InputState {
         (full, caret_full)
     }
 
-    /// 显示文本（未脱敏）里的第 `char_index` 个字符位置 → 提交文本字节偏移。
-    ///
-    /// 落在组合串内部时收敛到组合起点（点击 preedit 视为「放到组合开始处」）。
     fn committed_offset_for_display_char(&self, char_index: usize) -> usize {
         let Some(composition) = &self.composition else {
             return byte_at_char(&self.text, char_index);
@@ -1176,41 +946,22 @@ impl InputState {
     }
 }
 
-/// 挂载一次输入框后返回的节点句柄与状态（所有字段在 [`build`] 里一次确定）。
 #[derive(Clone)]
 pub struct InputNode {
-    /// 可聚焦容器：背景 / 边框 / 内边距 / 点击动作。
     pub root: NodeId,
-    /// 单行输入的水平滚动视口（`None` = 多行，不滚动）。
     pub viewport: Option<NodeId>,
-    /// 文本节点（`bind_text` 读显示文本）。
     pub text: NodeId,
-    /// 占位符节点（空值可见，`opacity` 切换）。
     pub placeholder: NodeId,
-    /// caret / 选区 Canvas 节点（`sync` 用 `Window::set_canvas` 换内容）。
     pub caret: NodeId,
-    /// 编辑状态信号（唯一真值）。
     pub state: Signal<InputState>,
-    /// 占位符文本信号（[`InputNode::update_placeholder`] 的写入口）。
     pub placeholder_state: Signal<SmolStr>,
-    /// 构造参数（`Arc`：点击处理器与订阅方共享）。
     pub spec: Arc<InputSpec>,
-    /// 单行水平滚动句柄（[`InputNode::install`] 里登记）。
     scroll: Arc<OnceLock<ScrollHandle>>,
-    /// caret 颜色来源：外观切换后 `sync` 按 `ThemeHandle` 的当前外观重取（信号依赖在
-    /// `caret` 节点的 `bind_style` 里登记，外观写入时该节点标脏 → 出一帧 → `sync` 重画画布）。
     theme: ThemeHandle,
-    /// 清空控件（[`InputNode::set_clearable`] 之后；`None` = 没有清空能力）。
-    ///
-    /// 它是 `kit::Button`（图标 + a11y 名字 + 自己的信号作用域），不是本模块自绘的点击壳：
-    /// `release` / `release` 一侧必须归还它的作用域（W2a F2 的泄漏）。
     clear: RefCell<Option<Button>>,
-    /// 失焦提交开关（[`InputNode::set_submit_on_blur`]；`false` = 旧语义，只有 Enter 提交）。
     submit_on_blur: Cell<bool>,
 }
 
-/// 手写 `Debug`：`clear` 里的 `Button` 没有 `Debug`，且节点的调试面只需要身份与两个开关
-/// （不是可用的 `Debug` 输出）。
 impl fmt::Debug for InputNode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1226,19 +977,6 @@ impl fmt::Debug for InputNode {
     }
 }
 
-/// 在 `tree` 的 `parent` 下挂载输入框，返回节点句柄。
-///
-/// `placeholder_text` 是占位符文本信号（由调用方用 `App::signal(spec.placeholder.clone())` 创建）：
-/// 节点 `bind_text` 读它，[`InputNode::update_placeholder`] 写它。
-///
-/// **主题响应性**：所有颜色（底色 / 文字 / 占位符 / 边框 / caret / 选区）都在 `bind_style` /
-/// `sync` 里经 [`ThemeHandle`] 读取信号，不写挂载期常量 —— 运行时切换深浅色只重画读过主题的
-/// 节点（本模块的静态载荷只有尺寸 / 文案 / 动作）。`theme` 只用于度量 token（与外观无关）和
-/// 颜色通道，`build` 不需要窗口 / 外观。
-///
-/// # Panics
-/// `parent` 已卸载（陈旧句柄）时 panic：挂载契约与 `NodeBuilder::build` 相同，调用方必须给
-/// 活着的父节点。引擎没有可伪造的 `NodeId`，因此这里不能像查询型 API 那样降级。
 #[must_use]
 pub fn build(
     tree: &mut NodeTree,
@@ -1259,7 +997,6 @@ pub fn build(
     let padding_x = size.padding_x;
     let padding_y = if multiline { size.padding_x } else { 0.0 };
 
-    // ── 容器 ──────────────────────────────────────────────────────────────
     let mut root_style = StyleBuilder::new()
         .flex_row()
         .items_center()
@@ -1271,14 +1008,11 @@ pub fn build(
         .overflow_hidden()
         .build();
     if multiline {
-        // 多行：至少一个控件高，内容更高时随内容长高（不让窗口根把盒子拉满）。
         root_style.inner.min_size.height = LengthPercentageAuto::length(size.height);
         root_style.inner.align_self = Some(taffy::style::AlignSelf::START);
     } else {
         root_style.inner.size.height = taffy::style::Dimension::length(size.height);
     }
-    // 静态绘制载荷只留几何（圆角 / 边框宽度）：颜色由 `bind_style` 在首帧样式 pass 求值，
-    // 早于本帧绘制，因此不会出现「无底色」的中间帧。
     let root_paint = PaintBuilder::new()
         .border(border_width, Color::TRANSPARENT)
         .rounded(CORNER_RADIUS)
@@ -1355,9 +1089,6 @@ pub fn build(
         .build(tree, parent)
         .expect("input: root node mounts under a live parent");
 
-    // ── 单行水平滚动视口 ──────────────────────────────────────────────────
-    // 单行文本 NoWrap 且天然宽于输入框：文本放进一个裁剪视口，`install` 把它登记成横向滚动
-    // 容器；`sync` 按 caret 可见性滚动、`caret_canvas` 把滚动偏移从光标几何里减掉。
     let viewport = if multiline {
         None
     } else {
@@ -1384,10 +1115,7 @@ pub fn build(
         Some(viewport)
     };
 
-    // ── 文本 ──────────────────────────────────────────────────────────────
     let text_state = *state;
-    // 文字色不写进 `TextStyle`（那是静态载荷）：`bind_style.foreground` 是文本/图片共用的动态
-    // 着色通道，首帧样式 pass 求值早于塑形与绘制。
     let text_style = TextStyle::new(size.font_size)
         .with_wrap(if multiline {
             TextWrap::Wrap
@@ -1420,14 +1148,12 @@ pub fn build(
     text_builder = if multiline {
         text_builder.style(StyleBuilder::new().flex_1().min_width_0().build())
     } else {
-        // 单行：不参与收缩（内容宽 = 自然宽），溢出交给视口裁剪 + 滚动。
         text_builder.style(StyleBuilder::new().flex_none().build())
     };
     let text = text_builder
         .build(tree, text_parent)
         .expect("input: text node mounts under the fresh parent");
 
-    // ── 占位符（绝对覆盖在文本位上；空值可见）──────────────────────────────
     let placeholder_state = *placeholder_text;
     let placeholder_style_state = *state;
     let placeholder_theme = theme.clone();
@@ -1451,8 +1177,6 @@ pub fn build(
         .bind_text(move |cx| cx.read(&placeholder_state).clone())
         .bind_style(move |cx| {
             let state = cx.read(&placeholder_style_state);
-            // 组合串可见时即使正文为空也压住占位符（否则 preedit 会叠在占位文字上）。
-            // `interactive: false`：占位符与文本节点完全重叠，必须让命中穿透到文本节点。
             let empty = state.text().is_empty() && !state.is_composing();
             StylePatch {
                 foreground: Some(placeholder_theme.components(cx).input.placeholder),
@@ -1470,7 +1194,6 @@ pub fn build(
         .build(tree, root)
         .expect("input: placeholder node mounts under the fresh root");
 
-    // ── caret / 选区 Canvas（绝对覆盖在文本位上；`sync` 换内容）─────────────
     let caret_theme = theme.clone();
     let caret = NodeBuilder::canvas(Canvas::new(Rect::default()))
         .style(
@@ -1483,8 +1206,6 @@ pub fn build(
                 .build(),
         )
         .bind_style(move |cx| {
-            // 画布内容由 `sync` 生成；这里读外观只是把主题信号登记成依赖：外观写入时本节点
-            // 标脏 → 出一帧 → 组合根的帧钩子（样式 pass 之前）调用 `sync` 用新外观重画画布。
             let _ = caret_theme.appearance(cx);
             StylePatch {
                 interactive: Some(false),
@@ -1517,12 +1238,6 @@ pub fn build(
 }
 
 impl InputNode {
-    /// 挂载后调用一次：登记单行水平滚动容器，并注册点击定位 / 拖选动作的处理器。
-    ///
-    /// 点击：焦点 + 光标定位；`click_count == 2` 选词、`click_count >= 3` 选行（按引擎连击计数）。
-    /// 拖选：引擎 `on_drag` 在移动越过阈值后开启指针捕获并派发 `Drag` 动作；几何直接用
-    /// `App::drag` 的 `origin/current` 窗口坐标（移出窗口也有值），`Start` 把锚点放在按下点、
-    /// `Move/End` 扩展选区，`Cancel` 结束。
     pub fn install(&self, app: &mut App) {
         if self.spec.disabled {
             return;
@@ -1544,7 +1259,6 @@ impl InputNode {
         let root = self.root;
         let text = self.text;
         app.on_action(click_action(&spec), move |ctx| {
-            // 键盘激活（Enter/Space，`hit == None`）不是指针定位：不移动光标。
             let Some(hit) = ctx.hit() else {
                 return;
             };
@@ -1656,15 +1370,10 @@ impl InputNode {
                             true,
                         );
                     }
-                    ui_core::interaction::DragPhase::End => {
-                        // `App::drag_state` 在 End 派发前已被引擎清掉；正常不会走到这里，
-                        // 保留分支只为防御（真正处理见下面的 no-info 路径）。
-                    }
+                    ui_core::interaction::DragPhase::End => {}
                     ui_core::interaction::DragPhase::Cancel => unreachable!("Cancel 已提前返回"),
                 }
             } else {
-                // End 动作在引擎清掉拖拽会话之后派发：用命中点或「按下点 + 位移」兜底，
-                // 然后结束拖选。移出窗口时命中为 `None`，delta 兜底再由 E5 clamp 到文本边界。
                 if phase != ui_core::interaction::DragPhase::End || !next.is_dragging() {
                     return;
                 }
@@ -1690,17 +1399,6 @@ impl InputNode {
         });
     }
 
-    /// 摘除 [`InputNode::install`] 注册的点击定位 / 拖选处理器，以及清空控件的作用域与 handler
-    /// （释放面；幂等）。
-    ///
-    /// 输入框**不持有**编辑状态的信号作用域：编辑状态与占位符信号由调用方创建、归调用方所有
-    /// （见 [`build`] 的参数说明），因此释放面只摘本模块注册的 Action handler（清空控件是
-    /// `kit::Button`，它自己的信号作用域要连带归还 —— W2a F2 的泄漏面）；节点卸载与调用方
-    /// 作用域回收由调用方负责。**先卸载节点再 release**（handler 闭包捕获了状态信号，信号
-    /// 已释放后再求值会读死句柄）。
-    ///
-    /// 返回摘除的 handler / 作用域数：正常输入框首次 2（清空控件开着时再加 1）、重复调用 0；
-    /// 构建期 `disabled` 的输入框 `install` 是 no-op，release 也返回 0。
     pub fn release(&self, app: &mut App) -> usize {
         let mut released = [click_action(&self.spec), drag_action(&self.spec)]
             .iter()
@@ -1712,21 +1410,6 @@ impl InputNode {
         released
     }
 
-    /// 运行时写值（旧 `set_value` 的**程序化契约**；生产调用点在 P2-5 接线时直接换过来）。
-    ///
-    /// 与用户级 [`InputState::set_text`] 的差别（对照旧输入组件库的 `input/base/state.rs`）：
-    /// - **绕过 `readonly` / `disabled`**：这两种模式只拒绝**用户**编辑，程序化写值必须能更新
-    ///   （旧 `replace_text` 在 `with_edits_allowed` 里执行；旧测试
-    ///   `test_readonly_rejects_user_edits_only` 明确「程序化 API 不受只读限制」）；
-    /// - **清空撤销/重做历史**（旧 `undo_manager.clear()`）：程序化写值不可撤销；
-    /// - 单行清洗、`max_length` 裁剪并置 [`InputError::TooLong`]、取消组合、光标/选区落在末尾
-    ///   与 `set_text` 相同（旧 `reset_selection` 的单行分支也是末尾）。
-    ///
-    /// 与旧实现的两处已登记差异（kit-text §4.2.13）：旧 `set_value` 会把单行滚动复位到开头
-    /// （长值显示头部），本实现每帧 `sync` 都 reveal 光标 ⇒ 显示尾部；旧实现多行把选区复位成
-    /// `0..0`，本实现同样落在末尾（当前没有多行生产输入）。
-    ///
-    /// 返回正文/选区/错误态是否变化（清空历史本身不算变化，但状态仍会写回）。
     pub fn update_value(&self, app: &mut App, value: &str) -> bool {
         let before = app.read(&self.state).clone();
         let mut next = before.clone();
@@ -1743,10 +1426,6 @@ impl InputNode {
         changed
     }
 
-    /// 运行时更新占位符（旧 `update_placeholder` 的替代）：写占位符信号并请求重绘。
-    ///
-    /// 占位符是独立文本节点；空值显示逻辑仍由 `text().is_empty()` 决定，更新自身不会改变
-    /// 可见性。返回信号是否真的变化（同值写入被 `App::write` 等值短路）。
     pub fn update_placeholder(&self, app: &mut App, placeholder: impl Into<SmolStr>) -> bool {
         let changed = app.write(&self.placeholder_state, placeholder.into());
         if changed && let Some(window) = self.root.window() {
@@ -1755,29 +1434,10 @@ impl InputNode {
         changed
     }
 
-    /// 程序化清空正文（清空控件点击走同一条路径；P2-11 的 `clear` 读点）。
-    ///
-    /// 走 [`InputNode::update_value`] 的**程序化契约**（与旧 `base.clean()` 同义）：绕过
-    /// `readonly` / `disabled`（禁用输入框的清空控件本身不响应点击，见
-    /// [`InputNode::set_clearable`]）、清空撤销 / 重做历史、取消 IME 组合、光标与选区回到开头。
-    /// 返回正文是否真的变了（已经是空正文时 `false`）。
     pub fn clear(&self, app: &mut App) -> bool {
         self.update_value(app, "")
     }
 
-    /// 加 / 去清空能力（P2-11；W8a F4② / W8b 的 `clearable`，旧 `Input::clearable(true)`）。
-    ///
-    /// `true` = 在输入框右侧建一个 `kit::Button` 清空控件（X 图标、`ghost` / `small`、可访问名
-    /// `Clear`）：正文为空时 `display: none`（不占位、不命中），有正文时显示并可点 —— 与旧
-    /// `ClearButton`「`has_value && clearable` 才渲染」的可见行为一致。点击调用
-    /// [`InputNode::clear`]（程序化清空）。输入框禁用时控件仍显示（旧语义）但按钮一并禁用。
-    ///
-    /// `false` = 摘掉清空控件：`Button::release`（归还它自己的信号作用域与 handler）+ 节点卸载。
-    /// 幂等（重复设同一个值返回 `false`）；根节点已卸载时返回 `false` 且不改能力。
-    /// 必须在 [`InputNode::install`] 之后调用（控件挂在已挂载的根上）。
-    ///
-    /// 已知面：控件是**常驻节点**（显示 / 隐藏切 `display`），因此清空能力只在正文非空时改变
-    /// 行宽；空输入框的布局与不带清空能力时一致。
     pub fn set_clearable(&mut self, app: &mut App, clearable: bool) -> bool {
         if self.clear.borrow().is_some() == clearable {
             return false;
@@ -1816,20 +1476,10 @@ impl InputNode {
         true
     }
 
-    /// 打开 / 关闭**失焦提交**（P2-11；W7 的 period 提交缺口）。
-    ///
-    /// `true` = [`InputNode::sync`] 观察到本输入框**从聚焦变失焦**时，把 [`InputSpec::submit`]
-    /// 动作（若有）以 `ActionSource::Programmatic` 派发到本输入框根节点 —— 与 Enter 提交是同一
-    /// 个动作身份，widget 只需注册一次 handler，不必在自己的 `sync` 里比 `last_focused` 再补一次
-    /// 提交。只对**单行**输入生效（多行输入的 Enter 是换行，失焦提交会与那条语义冲突）。
-    /// `false`（默认）= 旧语义：只有 Enter 派发 submit。返回开关是否真的变了。
     pub fn set_submit_on_blur(&self, submit_on_blur: bool) -> bool {
         self.submit_on_blur.replace(submit_on_blur) != submit_on_blur
     }
 
-    /// 清空控件的显示 / 禁用态同步（正文空 ⇒ `display: none`；输入框禁用 ⇒ 按钮禁用）。
-    ///
-    /// 返回是否改了控件状态。控件不存在时是 no-op（没有清空能力）。
     fn sync_clear_button(&self, app: &mut App) -> bool {
         let Some(button) = self.clear.borrow().clone() else {
             return false;
@@ -1862,16 +1512,6 @@ impl InputNode {
         changed
     }
 
-    /// 每轮同步（外壳在帧之前调用）：焦点镜像、失焦提交、IME 开关与 caret 区域、caret/选区
-    /// Canvas、清空控件的显示态。
-    ///
-    /// 返回是否写入了状态 / 换了画布 / 改了控件。文本尚未在最近一帧 shape 时（刚编辑过）caret
-    /// 几何要等下一帧的 text pass，本方法保留旧画布并在下一轮再同步（最多落后一个泵轮）。
-    ///
-    /// **失焦提交**（[`InputNode::set_submit_on_blur`]）：本方法观察到「上次镜像为聚焦、本帧
-    /// 引擎焦点已离开」时，把 `spec.submit` 以 `ActionSource::Programmatic` 派发到本输入框根节点
-    /// —— 在**同一次 `sync`** 内完成提交，widget 不用再自己比 `last_focused` 并把提交推迟到
-    /// 下一次路由（W7 的「period 提交晚一帧」）。
     pub fn sync(&self, app: &mut App) -> bool {
         let Some(window) = self.root.window() else {
             return false;
@@ -1896,9 +1536,7 @@ impl InputNode {
         if ime_target {
             app.set_ime_enabled(window, true);
             let byte = next.display_caret_byte(self.spec.masked);
-            if app.set_ime_cursor_area(window, self.text, byte).is_err() {
-                // 文本尚未 shape / 节点已卸载：平台会跳过本次 IME 区更新，下一轮再试。
-            }
+            if app.set_ime_cursor_area(window, self.text, byte).is_err() {}
         } else {
             app.clear_ime_cursor_area(window);
             if was_focused {
@@ -1906,8 +1544,6 @@ impl InputNode {
             }
         }
         let scroll_changed = self.sync_horizontal_scroll(app, window, &next);
-        // 外观每次按 `ThemeHandle` 的当前外观重取 caret / 选区色：画布内容与颜色不等价时
-        // `apply_canvas` 会换画布并请求一帧（`caret` 节点的 `bind_style` 保证外观写入时先标脏）。
         let appearance = self.theme.current(app);
         let theme = self.theme.theme_for(appearance);
         let caret_color = theme.role(Role::FgDefault);
@@ -1918,8 +1554,6 @@ impl InputNode {
         if state_changed {
             app.write(&self.state, next);
         }
-        // 失焦提交在焦点镜像**写回之后**派发：handler 看到的状态与新焦点一致；派发在 canvas
-        // 计算之后，handler 的写入不会被本轮的 `next` 覆盖。
         let submitted = if blur_submit {
             if let Some(submit) = &self.spec.submit {
                 app.dispatch_action(
@@ -1939,10 +1573,6 @@ impl InputNode {
         state_changed || scroll_changed || canvas_changed || clear_changed || submitted
     }
 
-    /// 单行 caret 可见性滚动：把文本内容宽 + 当前 caret 的几何交给引擎横向滚动容器。
-    ///
-    /// 文本尚未 shape（刚编辑过）时 [`Window::text_caret_rect`] 返回错误：本帧不动滚动，
-    /// 下一轮重试（与 caret 画布同一约定）。返回是否真的改变了滚动偏移。
     fn sync_horizontal_scroll(&self, app: &mut App, window: WindowId, state: &InputState) -> bool {
         let Some(handle) = self.scroll.get().copied() else {
             return false;
@@ -2001,10 +1631,6 @@ impl InputNode {
         app.scroll_to(&handle, Point::new(next, 0.0)).is_ok()
     }
 
-    /// 事件路由（外壳 `drain_events` 之后逐条调用）。返回是否消费。
-    ///
-    /// 只处理聚焦在本输入框上的 `Text` / `Key(Down)` / `Ime`；其余事件（Tab、Esc 关浮层、
-    /// 指针……）留给外壳与引擎。
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         let Some(window) = self.root.window() else {
             return false;
@@ -2039,8 +1665,6 @@ impl InputNode {
             _ => false,
         };
         if consumed {
-            // `handle_key` 可能派发了 submit 动作，而它的处理器可能已经写过同一个信号
-            // （例如提交后清空输入）：以处理器写入的值为准，不覆盖。
             let current = app.read(&self.state).clone();
             if current == before && next != before {
                 app.write(&self.state, next);
@@ -2049,17 +1673,6 @@ impl InputNode {
         consumed
     }
 
-    /// 构造当前帧的 caret + 选区画布（`None` = 文本尚未 shape，保留旧画布）。
-    ///
-    /// `caret_color` / `selection_color` 由 [`InputNode::sync`] 按主题当前外观解析后传入：
-    /// 外观切换后画布颜色跟着变（画布是自绘内容，不受 `bind_style.foreground` 影响）。
-    ///
-    /// 坐标：Canvas 图元是**窗口绝对（屏幕）坐标**，`paint/canvas.rs` 的契约也这么写。因此：
-    /// - caret 直接用 [`Window::text_caret_rect`]（引擎已补上节点原点、内容偏移与祖先滚动偏移）；
-    /// - 选区矩形来自 `NodeTree::text_selection_rects`（文本盒**局部**坐标），补上「窗口绝对 −
-    ///   局部」的原点差即得屏幕坐标——这个差里已经包含滚动偏移。
-    ///
-    /// 单行水平滚动**不要**在这里再减一次 `scroll.offset.x`：引擎给的已经是屏幕坐标。
     fn caret_canvas(
         &self,
         window: &Window,
@@ -2073,8 +1686,6 @@ impl InputNode {
         let masked = self.spec.masked;
         let caret_byte = state.display_caret_byte(masked);
         let caret_rect = window.text_caret_rect(self.text, caret_byte).ok()?;
-        // 选区矩形是文本盒局部坐标；`Window::text_caret_rect` 是窗口绝对坐标。两者在字节 0
-        // 处的差就是「节点原点 + 内容偏移 + 祖先滚动偏移」。
         let local_zero = window.tree().text_caret_rect(self.text, 0).ok()?;
         let absolute_zero = window.text_caret_rect(self.text, 0).ok()?;
         let origin = Point::new(
@@ -2117,7 +1728,6 @@ impl InputNode {
         Some(canvas)
     }
 
-    /// 把画布交给引擎（同值跳过；变化时请求一帧）。
     fn apply_canvas(&self, app: &mut App, window: WindowId, canvas: Canvas) -> bool {
         let unchanged = app.window(window).is_some_and(|window_ref| {
             match window_ref.tree().get(self.caret) {
@@ -2140,20 +1750,14 @@ impl InputNode {
     }
 }
 
-/// 点击定位动作的 key（`spec.name` 是实例唯一性来源）。
 fn click_action(spec: &InputSpec) -> Action {
     Action::Custom(format_smolstr!("base_ui.input.{}.click", spec.name))
 }
 
-/// 拖选动作的 key（与点击动作同前缀，`name` 保证实例唯一）。
 fn drag_action(spec: &InputSpec) -> Action {
     Action::Custom(format_smolstr!("base_ui.input.{}.drag", spec.name))
 }
 
-/// 命中点 → 文本节点的 **E5 局部坐标**（文本 content box 的布局坐标，含滚动容器内容偏移）。
-///
-/// `HitResult::local_point` 是「命中节点 border box 局部」；加上命中节点的布局原点得到
-/// 内容坐标，再减去文本节点的布局原点。与 `Window::text_byte_index_at` 的入参同域。
 fn text_local_point(tree: &NodeTree, hit: HitResult, text: NodeId) -> Option<Point> {
     let hit_node = tree.get(hit.node).ok()?;
     let text_node = tree.get(text).ok()?;
@@ -2165,16 +1769,11 @@ fn text_local_point(tree: &NodeTree, hit: HitResult, text: NodeId) -> Option<Poi
     ))
 }
 
-/// 未脱敏显示文本字节 → 脱敏显示文本字节（每个字符一个 `•`）。
 fn masked_offset(unmasked_display: &str, byte: usize) -> usize {
     let byte = snap_char_boundary(unmasked_display, byte);
     unmasked_display[..byte].chars().count() * BULLET.len_utf8()
 }
 
-/// 单行输入的清洗：丢掉 `\r` / `\n` / `\t`（多行原样返回）。
-///
-/// 粘贴多行文本、IME 提交、程序化 `set_text` 都经过这条规则；旧实现单行粘贴只删 `\n`，
-/// 本模块同时删 `\r` 与制表符（单行框里的制表符会参与字形布局但不该成为正文）。
 fn clean_single_line(text: &str, multiline: bool) -> String {
     if multiline {
         return text.to_string();
@@ -2184,14 +1783,10 @@ fn clean_single_line(text: &str, multiline: bool) -> String {
         .collect()
 }
 
-/// 双击选词的字符分类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WordClass {
-    /// 词字符：字母/数字/下划线（CJK 连续段是一词）。
     Word,
-    /// 空白。
     Space,
-    /// 标点/符号。
     Other,
 }
 
@@ -2205,9 +1800,6 @@ fn word_class(ch: char) -> WordClass {
     }
 }
 
-/// `caret` 所在 `char` 的同类连续段（UTF-8 字节范围）；空文本返回 `None`。
-///
-/// 光标在文本末尾时取前一个字符（与常见编辑器的双击末尾行为一致）。
 fn word_range_at(text: &str, caret: usize) -> Option<Range<usize>> {
     let anchor = if caret == text.len() && caret > 0 {
         prev_char_boundary(text, caret)?
@@ -2239,7 +1831,6 @@ fn word_range_at(text: &str, caret: usize) -> Option<Range<usize>> {
     Some(start..end)
 }
 
-/// 把字节偏移吸附到 `char` 边界（向下取整，clamp 到文本长度）。
 fn snap_char_boundary(text: &str, byte: usize) -> usize {
     let mut byte = byte.min(text.len());
     while byte > 0 && !text.is_char_boundary(byte) {
@@ -2248,7 +1839,6 @@ fn snap_char_boundary(text: &str, byte: usize) -> usize {
     byte
 }
 
-/// 前一个 `char` 的起点（`byte` 已在 char boundary）。
 fn prev_char_boundary(text: &str, byte: usize) -> Option<usize> {
     text[..byte]
         .char_indices()
@@ -2256,29 +1846,24 @@ fn prev_char_boundary(text: &str, byte: usize) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-/// 后一个 `char` 的起点（`byte` 已在 char boundary）。
 fn next_char_boundary(text: &str, byte: usize) -> Option<usize> {
     text[byte..].chars().next().map(|ch| byte + ch.len_utf8())
 }
 
-/// 第 `char_index` 个字符的字节偏移（越过末尾时返回文本长度）。
 fn byte_at_char(text: &str, char_index: usize) -> usize {
     text.char_indices()
         .nth(char_index)
         .map_or(text.len(), |(byte, _)| byte)
 }
 
-/// UTF-16 码元数（代理对算 2）。
 fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
-/// UTF-16 码元偏移 → UTF-8 字节偏移（clamp + 向下吸附到 `char` 边界）。
 fn utf8_from_utf16_offset(text: &str, offset: u16) -> usize {
     utf8_from_utf16_units(text, usize::from(offset))
 }
 
-/// [`utf8_from_utf16_offset`] 的 `usize` 版本（IME 替换区间是 `Range<usize>`）。
 fn utf8_from_utf16_units(text: &str, offset: usize) -> usize {
     let mut remaining = offset;
     for (byte, ch) in text.char_indices() {
@@ -2327,8 +1912,6 @@ mod tests {
             role::Role,
         },
     };
-
-    // ── 构造工具 ────────────────────────────────────────────────────────────
 
     fn spec() -> InputSpec {
         InputSpec {
@@ -2506,7 +2089,6 @@ mod tests {
                 .collect()
         }
 
-        /// caret 画布上每个 Quad 的填充色（顺序 = 选区若干 + caret 一个）。
         fn caret_fills(&self) -> Vec<Color> {
             let window = self.window();
             let tree = self.app.app().window(window).expect("窗口存在").tree();
@@ -2531,7 +2113,6 @@ mod tests {
             self.app.app().window(self.window()).expect("窗口存在")
         }
 
-        /// 从输入框根向下按调试 id 找节点（清空控件等）。
         fn find(&self, debug_id: &str) -> Option<NodeId> {
             let tree = self
                 .app
@@ -2551,7 +2132,6 @@ mod tests {
             None
         }
 
-        /// 节点的 `display`（清空控件的显示 / 隐藏切换）。
         fn display_of(&self, node: NodeId) -> taffy::style::Display {
             self.app
                 .app()
@@ -2565,7 +2145,6 @@ mod tests {
                 .display
         }
 
-        /// 在主键点击节点的中心（先注入 down/up，不额外 drain）。
         fn click_node(&mut self, node: NodeId) {
             let bounds = self.app.probe().bounds(node).expect("节点已布局");
             let point = Point::new(
@@ -2584,8 +2163,6 @@ mod tests {
             ));
         }
     }
-
-    // ── 纯状态机：基本编辑 ────────────────────────────────────────────────
 
     #[test]
     fn insert_delete_backward_and_forward_edit_ascii() {
@@ -2731,7 +2308,6 @@ mod tests {
         let mut cjk = state("");
         assert!(cjk.insert(&cjk_limit, "你好世界"));
         assert_eq!(cjk.text(), "你好");
-        // 选区替换也按剩余预算裁剪，且永不切开字符。
         cjk.select_all();
         let smaller = InputSpec {
             max_length: Some(1),
@@ -2771,7 +2347,6 @@ mod tests {
         assert!(!state.ime_preedit(&spec, "ni", None));
         assert!(!state.ime_commit(&spec, "ni"));
         assert_eq!(state.text(), "abc");
-        // 选区与光标仍然可用。
         state.select_all();
         assert_eq!(state.selection(), 0..3);
     }
@@ -2817,8 +2392,6 @@ mod tests {
             Some("account.error.nameTaken")
         );
     }
-
-    // ── UTF-16 与 IME ──────────────────────────────────────────────────────
 
     #[test]
     fn utf16_helpers_count_surrogate_pairs_and_snap() {
@@ -2897,8 +2470,6 @@ mod tests {
 
     #[test]
     fn ime_caret_utf16_is_relative_to_the_preedit_not_the_document() {
-        // 组合串前面有 emoji：caret 的 UTF-16 偏移只数组合串内部。把 caret 当成整串偏移的
-        // 实现会在这里多算 2 个码元（本用例是该实现的变异守卫）。
         let mut state = focused_state("🌍ab");
         assert_eq!(state.caret(), 6);
         assert!(state.ime_preedit(&spec(), "你好", Some(1)));
@@ -2910,8 +2481,6 @@ mod tests {
         assert_eq!(state.display_text(false), "🌍ab你好");
         assert!(state.ime_preedit(&spec(), "你好", Some(2)));
         assert_eq!(state.caret(), 6 + 6);
-        // 组合串内再来一个代理对：caret=1 落在 emoji 内部 ⇒ 吸附到 emoji 起点；caret=2 是
-        // emoji 之后。
         assert!(state.ime_preedit(&spec(), "🌍a", Some(2)));
         assert_eq!(
             state.caret(),
@@ -2946,14 +2515,10 @@ mod tests {
         assert_eq!(state.text(), "ab");
     }
 
-    // ── 剪贴板 ──────────────────────────────────────────────────────────────
-
     #[test]
     fn clipboard_copy_cut_paste_through_app() {
         let app = TestApp::new();
         let app_ref = app.app();
-        // headless 测试引擎没有原生窗口 owner：平台会拒绝剪贴板。此时只断言「不 panic 且返回
-        // false」；真正接上原生窗口的宿主会走正向分支。
         let platform = app_ref.set_clipboard_text("seed").is_ok();
         let mut state = state("hello");
         state.set_caret(1, false);
@@ -2969,7 +2534,6 @@ mod tests {
             assert!(!copied, "平台拒绝剪贴板时复制返回 false");
             assert!(!state.paste(app_ref, &spec()));
         }
-        // 掩码字段永不走剪贴板；只读字段不许剪切/粘贴。
         let masked = InputSpec {
             masked: true,
             ..spec()
@@ -2982,12 +2546,9 @@ mod tests {
         };
         assert!(!state.cut(app_ref, &readonly));
         assert!(!state.paste(app_ref, &readonly));
-        // 无选区 ⇒ false（与平台可用性无关）。
         let empty = self::state("");
         assert!(!empty.copy(app_ref, &spec()));
     }
-
-    // ── 引擎集成 ────────────────────────────────────────────────────────────
 
     #[test]
     fn build_renders_background_and_text_and_placeholder() {
@@ -3037,7 +2598,6 @@ mod tests {
             state("ab"),
         );
         harness.focus();
-        // 脱敏显示是「••」，caret 在末尾 = 2 个 `•` 的字节偏移（6），不是真实文本的 2。
         let bullet_caret = 2 * '•'.len_utf8();
         let caret_rect = harness
             .window_ref()
@@ -3090,7 +2650,6 @@ mod tests {
             .expect("文本已 shape");
         assert!((area.origin.x - caret_rect.origin.x).abs() <= 0.5);
         assert!((area.origin.y - caret_rect.origin.y).abs() <= 0.5);
-        // 失焦：IME 区域清空、焦点镜像归 false。
         harness.app.app_mut().set_focus(window, None);
         assert!(harness.node.sync(harness.app.app_mut()));
         assert!(!harness.state().is_focused());
@@ -3130,7 +2689,6 @@ mod tests {
         ));
         assert_eq!(state.caret(), 2, "点在末尾：文本长度");
         assert!(state.text().is_char_boundary(state.caret()));
-        // 非文本节点：返回 false 而不是猜测。
         assert!(!state.set_caret_from_point(window_ref, harness.node.root, Point::ZERO, false));
         let _ = window;
     }
@@ -3166,10 +2724,6 @@ mod tests {
         assert_eq!(harness.state().caret(), 0, "点在文本最左：caret 到 0");
     }
 
-    /// **P2-9 释放面**：`release` 摘掉 `install` 注册的两个 handler，重复调用幂等；之后程序化
-    /// 派发点击动作不再被处理。
-    ///
-    /// 变异防线：release 只摘 click（漏 drag）/ 整体 no-op ⇒ 本用例红。
     #[test]
     fn release_detaches_the_click_and_drag_handlers_and_is_idempotent() {
         let mut harness = harness(spec(), state("hello"));
@@ -3209,7 +2763,6 @@ mod tests {
         assert!(!harness.app.app().has_action_handler(&drag));
     }
 
-    /// 构建期禁用的输入框 `install` 是 no-op：release 返回 0（没有可摘的 handler）。
     #[test]
     fn releasing_a_disabled_input_reports_nothing_to_release() {
         let mut harness = harness(
@@ -3226,8 +2779,6 @@ mod tests {
         );
     }
 
-    /// P2-11（W8a F4② / W8b 的 `clearable`）：清空控件只在正文非空时显示；点它清空正文（程序化
-    /// 清空语义）；关掉能力后控件节点与 `Button` 的作用域 / handler 一并归还。
     #[test]
     fn a_clearable_input_shows_a_clear_control_only_while_it_has_text() {
         let mut harness = harness(spec(), focused_state("50"));
@@ -3271,8 +2822,6 @@ mod tests {
         );
     }
 
-    /// P2-11（W7 的 period 提交缺口）：失焦提交开关 —— 焦点离开的**同一次 sync** 派发
-    /// `spec.submit` 一次；后续 sync 不重复；默认关闭时行为不变（只有 Enter 提交）。
     #[test]
     fn blur_dispatches_the_submit_action_when_the_switch_is_on() {
         let hits = Rc::new(Cell::new(0u32));
@@ -3486,7 +3035,6 @@ mod tests {
     fn error_state_changes_the_border_patch() {
         let mut harness = harness(spec(), state("abc"));
         let window = harness.window();
-        // 初始（未聚焦/无错误）：normal 边框色。
         let normal = {
             let tree = harness.app.app().window(window).expect("窗口存在").tree();
             tree.get(harness.node.root)
@@ -3514,7 +3062,6 @@ mod tests {
             "错误态必须换掉边框颜色（StatusDangerBorder）"
         );
     }
-    // ── P2-3b：undo/redo（快照式、有界）──────────────────────────────────────
 
     #[test]
     fn undo_redo_restores_insert_delete_and_selection_replacement() {
@@ -3534,7 +3081,6 @@ mod tests {
         assert_eq!(state.text(), "hello worl", "重做退格");
         assert!(!state.can_redo() || state.redo());
 
-        // 选区替换 → 撤销恢复正文与选区。
         let mut state = self::state("hello");
         state.set_caret(1, false);
         state.set_caret(4, true);
@@ -3599,8 +3145,6 @@ mod tests {
         harness.drain();
         assert_eq!(harness.state().text(), "ab", "Ctrl+Y 重做");
     }
-
-    // ── P2-3b：单行清洗 / 自动重复 ─────────────────────────────────────────
 
     #[test]
     fn single_line_insert_drops_carriage_returns_newlines_and_tabs() {
@@ -3670,8 +3214,6 @@ mod tests {
         assert_eq!(hits.get(), 1, "自动重复的 Enter 不再派发 submit");
     }
 
-    // ── P2-3b：IME End 派发级 ───────────────────────────────────────────────
-
     #[test]
     fn ime_end_event_cancels_the_composition_through_dispatch() {
         let mut harness = harness(spec(), state(""));
@@ -3694,8 +3236,6 @@ mod tests {
         assert_eq!(harness.state().caret(), 0, "caret 回到组合起点");
     }
 
-    // ── P2-3b：Esc 收缩选区（L5）───────────────────────────────────────────
-
     #[test]
     fn escape_collapses_the_selection_after_cancelling_composition() {
         let mut harness = harness(spec(), state("hello"));
@@ -3715,8 +3255,6 @@ mod tests {
         );
         assert_eq!(harness.state().caret(), 1);
     }
-
-    // ── P2-3b：单行水平滚动（M1）───────────────────────────────────────────
 
     #[test]
     fn long_single_line_scrolls_to_keep_the_caret_visible() {
@@ -3741,7 +3279,6 @@ mod tests {
         );
         let viewport = harness.node.viewport.expect("单行视口");
         let viewport_bounds = harness.app.probe().bounds(viewport).expect("视口布局");
-        // `Window::text_caret_rect` 已经是屏幕坐标（含滚动偏移），直接和视口的屏幕矩形比。
         let caret = harness
             .window_ref()
             .text_caret_rect(harness.node.text, 200)
@@ -3758,7 +3295,6 @@ mod tests {
             caret.origin.x,
             viewport_bounds.origin.x + viewport_bounds.size.width
         );
-        // Canvas 图元是绝对屏幕坐标：caret quad 必须与引擎的屏幕 caret 矩形同源，不能再减滚动偏移。
         let caret_quad = harness
             .caret_quads()
             .last()
@@ -3772,10 +3308,6 @@ mod tests {
         );
     }
 
-    /// 滚动后的 caret 与选区画布都用**屏幕坐标**（不能再减一次滚动偏移）。
-    ///
-    /// 真值：`Window::text_caret_rect`（caret）与 `text_selection_rects` + 「绝对 − 局部」原点
-    /// （选区）。回归症状：旧实现再 `.translate(-scroll_x)` 一次，quad 被画到视口外。
     #[test]
     fn scrolled_caret_and_selection_canvases_use_screen_coordinates() {
         let mut harness = harness(spec(), state(&"a".repeat(200)));
@@ -3886,7 +3418,6 @@ mod tests {
             .probe()
             .bounds(harness.node.text)
             .expect("文本布局");
-        // 视口节点自身不随内容滚动；可见文本区就是视口的屏幕矩形（内容在它下面平移）。
         let position = Point::new(
             viewport_bounds.origin.x + viewport_bounds.size.width - 2.0,
             text_bounds.origin.y + text_bounds.size.height / 2.0,
@@ -3909,8 +3440,6 @@ mod tests {
             scroll.offset.x
         );
     }
-
-    // ── P2-3b：拖选（用户裁决）─────────────────────────────────────────────
 
     fn caret_position(harness: &Harness, byte: usize) -> Point {
         let bounds = harness
@@ -4007,8 +3536,6 @@ mod tests {
         assert_eq!(harness.state().caret(), 8);
     }
 
-    // ── P2-3b：双击选词 / 三击选行（用户裁决）──────────────────────────────
-
     fn click(harness: &mut Harness, position: Point) {
         harness.app.inject(InputEvent::pointer_down(
             position,
@@ -4060,8 +3587,6 @@ mod tests {
         );
     }
 
-    // ── P2-3c：InputSpec 运行时更新（M7 程序化契约）────────────────────────
-
     #[test]
     fn update_value_rewrites_the_signal_and_reports_invalid_values() {
         let mut harness = harness(
@@ -4103,8 +3628,6 @@ mod tests {
         assert_eq!(harness.state().error(), None, "合法值清空错误态");
     }
 
-    /// 旧 `set_value` 契约：`readonly` / `disabled` 只拒绝**用户**编辑，程序化写值必须能更新
-    /// （旧输入组件库的 `test_readonly_rejects_user_edits_only` + `with_edits_allowed`）。
     #[test]
     fn update_value_bypasses_readonly_and_disabled() {
         let mut readonly = harness(
@@ -4137,7 +3660,6 @@ mod tests {
         );
         assert_eq!(disabled.state().text(), "changed");
 
-        // 用户级入口保持受限语义（`set_text` 不绕过 readonly/disabled）。
         let mut state = state("locked");
         let readonly_spec = InputSpec {
             readonly: true,
@@ -4153,7 +3675,6 @@ mod tests {
         assert_eq!(state.text(), "locked");
     }
 
-    /// 程序化写值清空撤销/重做历史（旧 `set_value` 的 `undo_manager.clear()`）。
     #[test]
     fn update_value_clears_the_undo_history() {
         let mut harness = harness(spec(), state(""));
@@ -4195,8 +3716,6 @@ mod tests {
         );
     }
 
-    // ── G3：运行时主题响应性（外观切换 = 只失效读过主题的节点） ─────────────
-
     fn resolved(color: Color) -> [f32; 4] {
         ColorResolver.resolve(color).components
     }
@@ -4215,12 +3734,9 @@ mod tests {
             .clone()
     }
 
-    /// 外观切换后输入框的底色 / 边框 / 文字 / 占位符全部换成新主题的角色色，且不读主题的
-    /// 静态兄弟节点不被失效（G3 + I6/I17 的组件级验收）。
     #[test]
     fn switching_appearance_repaints_every_input_color() {
         let mut harness = harness(spec(), state(""));
-        // 静态兄弟：不读任何信号 —— 主题切换不得触达它。
         let static_node = {
             let window = harness.app.window_id();
             let parent = harness.node.root;
@@ -4331,7 +3847,6 @@ mod tests {
         );
     }
 
-    /// caret / 选区是自绘画布：外观切换后 `sync` 必须用新主题的颜色重画（不再是挂载期常量）。
     #[test]
     fn switching_appearance_repaints_the_caret_and_selection_canvas() {
         let mut harness = harness(spec(), state("abc"));

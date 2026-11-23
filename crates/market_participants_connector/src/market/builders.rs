@@ -1,11 +1,3 @@
-//! Listing-scoped market builders.
-//!
-//! Every builder is about one exact listing. It resolves that listing inside one
-//! catalog generation, validates what it is about to ask against the listing's
-//! own rules and status, and only then encodes a request: the quantity unit, the
-//! order-book depth and the candlestick interval are all checked against the
-//! route's own descriptor and the listing's own rule set.
-
 use std::marker::PhantomData;
 
 use market_participants_model::{
@@ -40,7 +32,6 @@ use crate::{
     },
 };
 
-/// The route and the listing one builder is about.
 struct ListingScope {
     provider: MarketCapability,
     route: VenueRoute,
@@ -48,13 +39,11 @@ struct ListingScope {
 }
 
 impl ListingScope {
-    /// Resolves the listing, rejecting one that is not published on the route.
     fn resolve(&self) -> Result<ResolvedListing, MarketError> {
         self.provider
             .resolve_listing_of_route(&self.route, &self.listing)
     }
 
-    /// Resolves the listing and rejects a status that no longer reads.
     async fn resolve_readable(&self) -> Result<ResolvedListing, MarketError> {
         let resolved = self.resolve()?;
         if matches!(
@@ -71,7 +60,6 @@ impl ListingScope {
         Ok(resolved)
     }
 
-    /// Validates one candlestick interval against the route's own descriptor.
     fn require_timeframe(&self, timeframe: TimeFrame) -> Result<(), MarketError> {
         let limits = self
             .provider
@@ -86,7 +74,6 @@ impl ListingScope {
         .into())
     }
 
-    /// Rejects an adjustment convention this route does not publish.
     fn require_adjustment(&self, adjustment: Adjustment) -> Result<(), MarketError> {
         let limits = self
             .provider
@@ -103,7 +90,6 @@ impl ListingScope {
         )
     }
 
-    /// Caps one order-book depth at what the route's venue accepts.
     fn capped_depth(&self, depth: u16) -> Result<u16, MarketError> {
         let limits = self.provider.limits(&self.route, CapabilityId::OrderBook)?;
         Ok(depth.min(limits.order_book_depth_limit))
@@ -140,7 +126,6 @@ impl CandlestickBuilder {
         }
     }
 
-    /// Sets the price-adjustment convention this request asks for.
     pub fn adjustment(mut self, adjustment: Adjustment) -> Self {
         self.adjustment = adjustment;
         self
@@ -323,11 +308,6 @@ impl AllTickersBuilder {
         Self { provider, route }
     }
 
-    /// Fetches every ticker the route publishes.
-    ///
-    /// A venue keeps reporting rolling statistics for listings its catalog no
-    /// longer publishes. Such a ticker names no listing the published snapshot
-    /// holds, so it is left out rather than failing the whole answer.
     pub async fn fetch(self) -> Result<Vec<ListingTicker>, MarketError> {
         let ensured = self.provider.ensure(&self.route)?;
         let response = execute(
@@ -599,10 +579,6 @@ impl<K> AnalyticsBuilder<K> {
             end_timestamp: None,
             limit: self.limit,
         };
-        // The product family, the window and the limit are validated as one typed
-        // answer: a listing whose product this operation does not serve is a
-        // `ModelError::UnsupportedInstrumentKind`, not a paraphrased string, so a
-        // caller can tell a product rejection from a malformed request.
         query
             .validate_for(resolved.instrument.kind())
             .map_err(MarketError::from)?;
@@ -610,7 +586,6 @@ impl<K> AnalyticsBuilder<K> {
     }
 }
 
-/// Maps one ratio answer, whose subjects the adapter already resolved.
 fn ratios(
     values: Vec<NativeListing<crate::adapter::NativeLongShortRatio>>,
 ) -> Vec<ListingLongShortRatio> {
@@ -754,7 +729,6 @@ mod tests {
         test_support::test_handle,
     };
 
-    /// A market capability whose spot route publishes one fixture listing.
     async fn capability() -> MarketCapability {
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
         let notification = ConfigNotification::new(snapshot);
@@ -775,9 +749,6 @@ mod tests {
                 &[],
             )
             .expect("the Binance routes register");
-        // The route's catalog is rebound to a fixture source, so the listing
-        // resolves through the real connector while the venue behind it is the
-        // fixture.
         let route = test_support::spot_route();
         let source_id =
             CatalogSourceId::new("builder-fixture").expect("the fixture source id is canonical");
@@ -804,8 +775,6 @@ mod tests {
                 &test_support::requirements(std::slice::from_ref(&route)),
             )
             .expect("the fixture catalog route publishes");
-        // The fixture loads the route the way a load does: the registration is
-        // followed by a load of the route's catalog.
         catalog
             .refresh_for_test(&route)
             .await
@@ -813,8 +782,6 @@ mod tests {
         connector.market()
     }
 
-    /// A perpetual-statistics request about a spot listing is a product
-    /// rejection, and it stays the typed model error it is.
     #[tokio::test]
     async fn a_spot_listing_is_refused_by_the_perpetual_statistics_builder() {
         let market = capability().await;
@@ -839,12 +806,6 @@ mod tests {
         );
     }
 
-    /// The adjustment survives the clone `subscribe_with_history` makes.
-    ///
-    /// A history page is fetched through a clone of the builder, so a hand-written
-    /// `Clone` that forgets the field would silently revert the request to the model's
-    /// default: the clone is read directly, and the request it goes on to make is the
-    /// proof that the value reached the route's own check.
     #[tokio::test]
     async fn a_cloned_builder_should_keep_the_adjustment_it_was_asked_for() {
         let market = capability().await;

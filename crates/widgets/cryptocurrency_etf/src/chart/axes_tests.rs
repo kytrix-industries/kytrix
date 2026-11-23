@@ -1,9 +1,3 @@
-//! The two domains, the tick values and the boxes one ETF chart is built from.
-//!
-//! Everything here is a pure function of its arguments, which is what makes the
-//! geometry testable at all: a layout is derived from a box and a few measured widths,
-//! and the same inputs always produce the same boxes.
-
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::math::{Point, Rect, Size};
 
@@ -13,7 +7,6 @@ fn plot() -> Rect {
     Rect::new(10.0, 20.0, 300.0, 200.0)
 }
 
-/// Dated labels, as the time axis holds them.
 fn labels(count: usize) -> Vec<SmolStr> {
     (1..=count)
         .map(|day| format_smolstr!("01-{day:02}"))
@@ -316,12 +309,6 @@ fn a_layout_should_never_be_smaller_than_the_chart_it_draws() {
     assert!(layout.plot.size.height > 0.0);
 }
 
-/// The minimum a chart asks its pane for is what its own labels need.
-///
-/// It is not a function of the pane, which is the point of it: a minimum that grew with
-/// the box the last frame was laid out in could never shrink again, and a pane that was
-/// restored from a maximised window would keep drawing at the width it had when it was
-/// enlarged.
 #[test]
 fn the_content_minimum_should_account_for_both_axes() {
     assert_eq!(

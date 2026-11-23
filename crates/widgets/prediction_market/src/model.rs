@@ -1,10 +1,3 @@
-//! The probability chart one market draws.
-//!
-//! A prediction event is a set of markets, and one market is a set of outcome
-//! sides. The chart follows one market at a time, keeps one line per side, and
-//! caps the lines at [`MAX_LINES`]. Everything here is pure data: the drawing
-//! code never asks the connector for a label or a probability.
-
 use std::{collections::BTreeMap, sync::Arc};
 
 use market_participants_model::{
@@ -18,18 +11,10 @@ use market_participants_model::{
 };
 use smol_str::SmolStr;
 
-/// The most lines one chart draws.
 pub(crate) const MAX_LINES: usize = 12;
 
-/// The most points one line keeps.
 pub(crate) const MAX_POINTS: usize = 4_096;
 
-/// The markets a reader can switch to.
-///
-/// A live event still publishes the markets it has already settled; those are not
-/// choices a reader can act on, so they are hidden. The market being drawn stays in
-/// the list even after it closes, and an event with nothing open keeps every market
-/// so a finished event's history remains chartable.
 fn visible_markets<'a>(
     event: &'a PredictionEventView,
     selected: &'a PredictionMarketRef,
@@ -41,18 +26,15 @@ fn visible_markets<'a>(
         .filter(move |market| !has_open || market.open || &market.market == selected)
 }
 
-/// One line of a prediction market chart.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PredictionMarketSeries {
     pub leg: OutcomeLegRef,
     pub label: SmolStr,
-    /// The index of the chart colour this line is drawn in.
     pub color: usize,
     pub points: Arc<[PredictionPricePoint]>,
     pub latest: Option<Fraction>,
 }
 
-/// One market the header can switch to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PredictionMarketChoice {
     pub market: PredictionMarketRef,
@@ -60,7 +42,6 @@ pub(crate) struct PredictionMarketChoice {
     pub group: PredictionMarketGroup,
 }
 
-/// Appends one live point and keeps the line inside its point budget.
 fn push_live_point(points: &mut Vec<PredictionPricePoint>, point: PredictionPricePoint) {
     points.push(point);
     if points.len() > MAX_POINTS {
@@ -68,42 +49,27 @@ fn push_live_point(points: &mut Vec<PredictionPricePoint>, point: PredictionPric
     }
 }
 
-/// One complete chart reading.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PredictionMarketSnapshot {
     pub revision: u64,
-    /// The range the reading was asked over.
     pub range: PredictionRange,
     pub title: SmolStr,
     pub market: PredictionMarketRef,
-    /// Every side of the drawn market, in the order the venue listed them.
-    ///
-    /// The order is the venue's, because it is what a subscription to the
-    /// market's topic is identified by: a book asked for with these legs shares
-    /// the connection lease the chart already holds.
     pub legs: Arc<[PredictionLeg]>,
-    /// The side the venue calls the market's first outcome.
     pub default_leg: Option<OutcomeLegRef>,
-    /// The markets a reader can switch to, in the order the venue listed them.
     pub markets: Arc<[PredictionMarketChoice]>,
     pub series: Arc<[PredictionMarketSeries]>,
-    /// How many sides the selected market has beyond the lines drawn.
     pub omitted: usize,
 }
 
-/// The book one chart reading points at: the market's sides and the one of them
-/// the panel draws.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PredictionOrderBookTarget {
     pub event: PredictionEventRef,
-    /// Every leg of the drawn market, in venue order.
     pub legs: Vec<PredictionLeg>,
     pub leg: OutcomeLegRef,
 }
 
 impl PredictionMarketSnapshot {
-    /// Builds a chart from one range, one event view, the selected market and
-    /// its series.
     pub(crate) fn new(
         revision: u64,
         range: PredictionRange,
@@ -126,9 +92,6 @@ impl PredictionMarketSnapshot {
                 group: market.group.clone(),
             })
             .collect();
-        // The sides stay in the order the venue published them: the legend and the
-        // colours are read off this list, so sorting it by the latest value would
-        // shuffle both on every tick and again on every reload.
         let mut lines: Vec<PredictionMarketSeries> = series
             .into_iter()
             .map(|mut series| {
@@ -137,8 +100,6 @@ impl PredictionMarketSnapshot {
                     .cloned()
                     .unwrap_or_else(|| SmolStr::new_static("Option"));
                 let latest = series.points.last().map(|point| point.probability);
-                // History is the one read that can exceed the live point budget;
-                // keep the newest points so a line never grows without bound.
                 if series.points.len() > MAX_POINTS {
                     series.points.drain(..series.points.len() - MAX_POINTS);
                 }
@@ -169,12 +130,6 @@ impl PredictionMarketSnapshot {
         }
     }
 
-    /// The book the panel shows: the market's default leg, or the first
-    /// charted leg when the venue named no default.
-    ///
-    /// The leg has to be one of the market's own: a venue that named a side the
-    /// market no longer publishes leaves the panel to the first line the chart
-    /// actually drew. A market with no side at all has no book to ask for.
     pub(crate) fn book_target(&self) -> Option<PredictionOrderBookTarget> {
         if self.legs.is_empty() {
             return None;
@@ -193,7 +148,6 @@ impl PredictionMarketSnapshot {
         })
     }
 
-    /// The newest point any line holds, for the endpoint pulse.
     pub(crate) fn latest_timestamp(&self) -> Option<UnixMillis> {
         self.series
             .iter()
@@ -202,7 +156,6 @@ impl PredictionMarketSnapshot {
             .max()
     }
 
-    /// The market groups in the order the event lists them.
     pub(crate) fn market_groups(&self) -> Vec<&PredictionMarketGroup> {
         let mut groups: Vec<&PredictionMarketGroup> = Vec::with_capacity(8);
         for market in self.markets.iter() {
@@ -213,17 +166,10 @@ impl PredictionMarketSnapshot {
         groups
     }
 
-    /// The choice for one market, if the header offers it.
     pub(crate) fn choice(&self, market: &PredictionMarketRef) -> Option<&PredictionMarketChoice> {
         self.markets.iter().find(|choice| &choice.market == market)
     }
 
-    /// The choice the header shows for a requested market.
-    ///
-    /// A switch inside the event names a market the snapshot already lists, so the
-    /// header moves before the new reading arrives. A market the snapshot does not
-    /// offer — the service fell back to another one — leaves the header on the
-    /// market the snapshot draws.
     pub(crate) fn selected_choice(
         &self,
         selected: Option<&PredictionMarketRef>,
@@ -233,7 +179,6 @@ impl PredictionMarketSnapshot {
             .or_else(|| self.choice(&self.market))
     }
 
-    /// The markets of one group, in the order the event lists them.
     pub(crate) fn markets_in_group<'a>(
         &'a self,
         group: &'a PredictionMarketGroup,
@@ -243,12 +188,6 @@ impl PredictionMarketSnapshot {
             .filter(move |market| market.group.key == group.key)
     }
 
-    /// Appends one live reading to each line it names.
-    ///
-    /// A live tick is a new observation even when it carries the same timestamp
-    /// as the point before it, so it is appended rather than folded into that
-    /// point. Lines keep the order they had when the chart loaded: re-sorting on
-    /// every tick would make the legend and the colours jump.
     pub(crate) fn with_live(mut self, latest: Vec<PredictionSeries>, revision: u64) -> Self {
         let mut by_leg: BTreeMap<OutcomeLegRef, PredictionPricePoint> = latest
             .into_iter()

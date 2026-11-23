@@ -1,58 +1,3 @@
-//! The watch-list widget.
-//!
-//! The widget follows a set of listings the user picked, one stream each, and
-//! draws one row per listing. Everything the widget *does* around a frame —
-//! connecting, loading, failing — is reported through the framework's status
-//! handle; the body only ever draws the listings it follows.
-//!
-//! # The followed set is applied before the service confirms it
-//!
-//! Adding or removing a listing changes the widget's own list immediately, and
-//! then asks the service for the new set. The user sees the row they asked for
-//! without waiting for a round trip, and a request the service refuses is undone
-//! by the command recorded in the in-flight table, which remembers what the
-//! operation replaced. The service only changes the streams it follows once the
-//! caller has the response, so the two sides cannot settle on different sets
-//! without one of them failing — and a failure is what the recovery
-//! re-synchronizes.
-//!
-//! # The tables are built once and kept up to date
-//!
-//! [`WidgetView::body`] builds one kit table per market once and keeps them for the
-//! life of the pane; the rows reach them through [`Table::set_rows`], and every
-//! dynamic value in a row is a `bind_text` / `bind_style` closure (see `table`).
-//! The row controls are the one part a cell cannot build (the kit table's row
-//! factory has no application context), so the factory builds their slot and this
-//! module builds the buttons into it from [`WidgetView::sync`].
-//!
-//! # Every value is drawn with the unit it came with
-//!
-//! A listing publishes the traded quantity of its session in one unit and, when it
-//! publishes one at all, a traded notional in an asset. Both are the listing's own,
-//! so both are named where the row is drawn, and a value the listing does not
-//! publish is drawn as missing rather than as zero or as the other unit.
-//!
-//! # The directory
-//!
-//! Which markets are loaded, whether a followed listing is still published and what
-//! the catalogue calls it are the injected directory's answers — the connector in
-//! the application, a fixture in a test. The pane never loads the directory and
-//! never polls the catalogue: it re-reads the answers its [`WatchListDirectory`]
-//! gives on every load, and re-runs that load when the injected
-//! [`catalog_generation`](widget::services::WidgetServices::catalog_generation)
-//! signal moves (AGENTS §8.3).
-//!
-//! # A generation is one number for the whole directory
-//!
-//! The signal says *that* the directory published a new generation, not *which
-//! venue* changed (§8.3 has no per-venue version). So any write reloads this pane,
-//! even a commit that only touched a venue it does not follow: the rows were written
-//! with names and units of the retired generation, so the entries are rebuilt and
-//! the streams are reopened against the new catalogue. Narrowing it needs the
-//! composition root to publish the scope of a change, which the frozen contract does
-//! not offer. The test `an_unrelated_generation_should_reload_the_pane` pins the
-//! current behaviour.
-
 use std::{cell::RefCell, collections::BTreeMap, mem, rc::Rc, sync::Arc};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
@@ -118,18 +63,11 @@ use super::{
     table::{TableHandle, TablePane, TableRows, TableSignals},
 };
 
-/// What a table frame is drawn under, and the key suffix of its kit table.
 const CONTINUOUS_TABLE_KEY: &str = "watch_list.table.continuous";
 const SESSION_TABLE_KEY: &str = "watch_list.table.session";
 
-/// The header control's key suffix.
 const HEADER_KEY_SUFFIX: &str = "watch_list.header.add";
 
-/// The listings one watch list follows.
-///
-/// The entries are decoded through the same validation the service applies, so a
-/// persisted list is either a list the service can follow or a configuration
-/// error the framework reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct WatchListConfig {
     entries: Vec<VenueListingKey>,
@@ -158,24 +96,10 @@ impl WidgetConfig for WatchListConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// One command this pane sent and has not seen the answer to.
-///
-/// A reply whose identity is not in the table answers a call the pane already
-/// replaced; it is dropped and counted rather than applied to the command that
-/// replaced it (AGENTS §8.2).
 enum PendingCommand {
-    /// The followed set is being replaced by an explicit or recovery load — or by the
-    /// market behind it being loaded again, which asks for the same streams to be
-    /// resolved once more — and none of those changes anything locally.
     Load,
-    /// A listing was added before the service confirmed the new set.
     Add(VenueListingKey),
-    /// A listing was removed before the service confirmed the new set; the entry it had is
-    /// kept until the removal is, and is `None` for a listing whose market was not loaded —
-    /// there was nothing to keep.
     Remove(VenueListingKey, Option<Box<WatchListEntry>>),
-    /// A listing's stream is being reopened; its failure is kept until the retry is
-    /// confirmed.
     Retry {
         key: VenueListingKey,
         error: WatchListStreamError,
@@ -183,7 +107,6 @@ enum PendingCommand {
 }
 
 impl PendingCommand {
-    /// Puts back what this operation changed, now that the service refused it.
     fn undo(
         self,
         config: &mut WatchListConfig,
@@ -211,16 +134,9 @@ impl PendingCommand {
     }
 }
 
-/// A failure of the widget itself, rather than of one followed listing.
-///
-/// A row reports its own stream failure where the row is. Only what the widget as
-/// a whole cannot do is reported through its status, because that is what the
-/// framework turns into a banner or a placeholder.
 #[derive(Debug)]
 enum WatchListFailure {
-    /// The service refused an operation.
     Rpc(RpcCallError<WatchListServiceError>),
-    /// The list already follows as many listings as it can.
     Capacity,
 }
 
@@ -237,25 +153,16 @@ impl TranslatedError for WatchListFailure {
     }
 }
 
-/// What the directory answered about one followed listing.
 struct ListingAnswer {
     key: VenueListingKey,
     support: ListingSupport,
 }
-///
-/// A button handler runs with an application context and no widget context, so it
-/// writes the request into a signal and asks for a frame; the pane applies it in
-/// [`WidgetView::sync`], where it has its own state again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RowRequest {
     Retry(VenueListingKey),
     Remove(VenueListingKey),
 }
 
-/// The static copy a header control was built with.
-///
-/// A kit control resolves its label and its filters when it is built, so the pane
-/// rebuilds it when any of these move and disables it in place otherwise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeaderCopy {
     language: LanguageCode,
@@ -263,7 +170,6 @@ struct HeaderCopy {
     has_directory: bool,
 }
 
-/// The header control and the copy it was built with.
 struct HeaderControl {
     button: Button,
     node: NodeId,
@@ -271,7 +177,6 @@ struct HeaderControl {
     built: HeaderCopy,
 }
 
-/// The per-row controls of one table row, with the copy they were built with.
 struct RowControls {
     slot: NodeId,
     listing: Arc<VenueListingKey>,
@@ -282,7 +187,6 @@ struct RowControls {
     buttons: Vec<Button>,
 }
 
-/// The parts of one row's controls a build depends on.
 #[derive(PartialEq, Eq)]
 struct RowCopy {
     listing: Arc<VenueListingKey>,
@@ -321,60 +225,35 @@ impl RowCopy {
 
 pub struct WatchListWidget {
     config: WatchListConfig,
-    /// The executor bridge, when this host has a directory to drive a service from.
     binding: Option<WidgetBinding<WatchListProtocol>>,
-    /// The commands in flight, keyed by the identity the binding returned.
     pending: Pending<PendingCommand>,
-    /// The loaded directory, when the host has one.
     directory: Option<Rc<dyn WatchListDirectory>>,
     status: WidgetStatus,
-    /// The recovery the framework offers for every failure this widget reports.
     recovery: WidgetAction,
     config_change: WidgetConfigChange,
     translate: Translate,
     theme: ThemeHandle,
     language: Signal<LanguageCode>,
-    /// The directory generation the composition root publishes.
     generation: Signal<u64>,
-    /// The catalogue mirror the cells read, and the revision that says it moved.
     catalog: Rc<RefCell<Arc<Catalog>>>,
     catalog_revision: Signal<u64>,
-    /// Selections confirmed in the header control, waiting for the next `sync`.
     selection_requests: Signal<Option<InstrumentSelection>>,
-    /// Requests from the per-row controls, waiting for the next `sync`.
     row_requests: Signal<Option<RowRequest>>,
-    /// Whether the header control accepts input, as the header control reads it.
     add_enabled: Signal<bool>,
     entries: HashMap<VenueListingKey, WatchListEntry>,
-    /// Whether the service has confirmed the followed set at least once.
-    ///
-    /// It is what an empty list has to say: a list the user emptied is the empty table, while
-    /// a list that has not been agreed to yet is a list still being asked about.
     confirmed: bool,
-    /// Whether a market this list follows was loaded or refreshed again.
-    ///
-    /// Every stream resolves the increments its rows are written at when it is opened, so a
-    /// commit that lands on one of the followed listings' markets replaces the generation
-    /// behind that stream while the stream keeps what it resolved. The list therefore starts
-    /// over, and the request it sends has to be the one that reopens those streams.
     market_reloaded: bool,
-    /// The listings whose streams stopped being readable on their own.
     dropped: HashSet<VenueListingKey>,
-    /// Whether the list is waiting for its markets rather than reading them.
     awaiting_market: bool,
     seen_generation: u64,
     seen_language: LanguageCode,
     published_catalog_revision: u64,
     catalog_moved: bool,
-    /// Whether the rows drawn changed since the tables were last updated.
     rows_dirty: bool,
-    /// Whether what the row controls offer changed since they were last built.
     controls_dirty: bool,
-    /// The body root and the two table frames.
     body_frame: Option<NodeId>,
     continuous_slot: Option<NodeId>,
     session_slot: Option<NodeId>,
-    /// The handles the two tables read through, minted before the tables exist.
     continuous_handle: TableHandle,
     session_handle: TableHandle,
     continuous: Option<TablePane>,
@@ -404,8 +283,6 @@ impl WidgetView for WatchListWidget {
         recovery: WidgetAction,
         cx: &mut WidgetCx<'_>,
     ) -> Result<Self, EngineError> {
-        // A host without a directory has nothing to ask and nothing to start; the pane
-        // reports the neutral notice and waits. Every application supplies one.
         let (binding, directory) = match cx.services().market_participants.clone() {
             Some(connector) => {
                 let source = connector.market();
@@ -432,61 +309,32 @@ impl WidgetView for WatchListWidget {
         ))
     }
 
-    /// The options this widget persists.
     fn config(&self) -> Option<&Self::Config> {
         Some(&self.config)
     }
 
-    /// The list is the content, and it is ready as soon as the service has
-    /// confirmed it — including an empty list. A list with nothing in it is what
-    /// "no listings followed" looks like; it is not a state the widget reports.
-    ///
-    /// A pane whose market is not loaded has content whenever the user follows
-    /// something: those listings are the user's list, and what the body draws for them
-    /// is a table that says which market participant has to be loaded. A list that
-    /// follows nothing has no such row to draw, so it is left to the framework's
-    /// placeholder — the sentence that names every market participant this widget can
-    /// read at all, and the control that loads one.
     fn has_content(&self) -> bool {
         !self.config.entries.is_empty() || self.confirmed
     }
 
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
-        // The markets this list follows have to be loaded before anything else happens
-        // here, and the check is first on purpose: a route the user never loaded, or one
-        // a shrinking commit withdrew, leaves the pane waiting for it instead of reaching
-        // the branches below, which settle the listings the user stored.
         if !self.market_ready(cx) {
             self.wait_for_market(cx);
             return;
         }
-        // Read past the gate: a commit on a market this list follows that took it away
-        // leaves this set while the streams that resolved against the retired generation
-        // are still alive, and the load that brings the market back has to reopen them.
         let retry = self.status.is_failed(cx.app());
         if retry {
-            // A recovery keeps the rows the user is looking at, so a load that was not
-            // allowed to draft a request when the commit landed — every load a failed pane
-            // starts is a recovery — has to reopen their streams itself.
             self.market_reloaded = true;
         } else {
-            // An explicit load starts over, because the widget cannot vouch for
-            // what it was showing.
             self.entries.clear();
             self.confirmed = false;
         }
         let readable = self.readable(cx);
         for key in &self.config.entries {
             if !readable.contains(key) {
-                // The market behind this listing is not in memory: it has no stream to
-                // follow and no row of its own, and what the table draws for it says so.
-                // The entry goes, so a message that was already in flight for it cannot
-                // fill a row nothing backs any more.
                 self.entries.remove(key);
                 continue;
             }
-            // A listing whose stream went dead on its own is opened again rather than
-            // handed the stream it left behind.
             if self.dropped.contains(key) {
                 self.market_reloaded = true;
             }
@@ -494,8 +342,6 @@ impl WidgetView for WatchListWidget {
                 .entry(key.clone())
                 .or_insert_with(|| WatchListEntry::connecting(key));
         }
-        // Every listing that was written down has been read again, whether it was readable
-        // or not: one whose market is still gone is a row that waits.
         self.dropped.clear();
         self.pending.clear();
         self.status.report(cx.app_mut(), WidgetState::Connecting);
@@ -503,11 +349,6 @@ impl WidgetView for WatchListWidget {
         self.start(cx);
     }
 
-    /// The only control this widget puts in its header: adding a listing.
-    ///
-    /// It refuses input while the pane waits for its markets, like every other control
-    /// here: a listing can only be added from a market that is in memory, and the
-    /// sentence the pane is waiting with is what tells the user to load one.
     fn header(
         &mut self,
         group: HeaderGroup,
@@ -517,8 +358,6 @@ impl WidgetView for WatchListWidget {
         if group != HeaderGroup::Left {
             return Ok(());
         }
-        // The pane is building its row; the control this widget built into the previous
-        // one went with it. Only the component is the widget's to take down.
         self.release_header(cx, false);
         self.build_header(parent, cx)
     }
@@ -539,10 +378,6 @@ impl WidgetView for WatchListWidget {
             .build(cx.tree_mut(), parent)?;
         self.body_frame = Some(body);
 
-        // Each table takes half the height when both are drawn. A table with no rows of
-        // its own is not drawn, and the one case where both are empty draws the
-        // continuous table so that the empty list says it is empty instead of leaving
-        // the body blank.
         let continuous_rows = self.continuous_handle.rows;
         let session_rows = self.session_handle.rows;
         let continuous_frame = NodeBuilder::boxed()
@@ -627,35 +462,23 @@ impl WidgetView for WatchListWidget {
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        // The catalogue the cells read is replaced before anything else looks at it, so a
-        // generation that moved is never drawn with the names of the retired one.
         self.sync_catalog(cx);
 
-        // The directory generation is the one signal the framework's surface root also
-        // reads, so a write schedules the frame that runs this hook — including for a
-        // pane that is only waiting and has no body. Nothing else may poll the directory
-        // (AGENTS §8.3).
         let generation = *cx.read(&self.generation);
         if generation != self.seen_generation {
             self.seen_generation = generation;
             if !self.status.is_failed(cx.app()) {
-                // A new generation replaced the one the live streams resolved their
-                // listings against, so the load that follows reopens them.
                 self.market_reloaded = true;
                 self.load(cx);
             }
         }
 
-        // The binding delivers messages instead of calling back into the widget; this is
-        // the one place they are applied, where the widget has a context again.
         if let Some(binding) = self.binding.as_ref() {
             for inbound in binding.take() {
                 self.apply(inbound, cx);
             }
         }
 
-        // A confirmation is applied here rather than in the control's handler, which owns
-        // no widget context (see [`RowRequest`] and the module documentation).
         let request = (*cx.read(&self.row_requests)).clone();
         if let Some(request) = request {
             cx.write(&self.row_requests, None);
@@ -670,9 +493,6 @@ impl WidgetView for WatchListWidget {
             self.add(selection, cx);
         }
 
-        // A language switch changes the table's static copy (headers, empty sentence,
-        // the sentence a waiting row states) and the header control's label, so both are
-        // rebuilt. The cells themselves follow their own language signal.
         let language = *cx.read(&self.language);
         if language != self.seen_language {
             self.seen_language = language;
@@ -686,12 +506,6 @@ impl WidgetView for WatchListWidget {
             self.publish_rows(cx)?;
             cx.request_frame()?;
         }
-        // The tables recycle their mounted row window as the list scrolls or the pane
-        // resizes, and a row's controls are built into the slot its row factory built.
-        // No dirty flag of this widget moves for that — the rows themselves are the same
-        // — so the pairing is rebuilt whenever the tables say the window they draw moved
-        // (they fill the contents of newly mounted rows in `sync`, which is also when
-        // the slot a control belongs in exists for the first time).
         let mut window_moved = false;
         if let Some(pane) = self.continuous.as_ref() {
             window_moved |= pane.table.sync(cx.app_mut())?;
@@ -708,9 +522,6 @@ impl WidgetView for WatchListWidget {
     }
 
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
-        // The tables' and the header row's nodes are removed by the framework after this
-        // hook (or by the pane that owns the row), so only the components are released
-        // here: each controls one click handler and one signal scope.
         for controls in [
             mem::take(&mut self.continuous_controls),
             mem::take(&mut self.session_controls),
@@ -728,7 +539,6 @@ impl WidgetView for WatchListWidget {
         if let Some(mut pane) = self.session.take() {
             pane.release(cx.app_mut());
         }
-        // Dropping the bridge aborts its forwarding tasks and cancels the service.
         if let Some(mut binding) = self.binding.take() {
             binding.cancel();
         }
@@ -740,7 +550,6 @@ impl WidgetView for WatchListWidget {
 }
 
 impl WatchListWidget {
-    /// Builds a widget over the collaborators a caller hands it.
     fn assemble(
         config: WatchListConfig,
         binding: Option<WidgetBinding<WatchListProtocol>>,
@@ -805,12 +614,6 @@ impl WatchListWidget {
         }
     }
 
-    /// Builds a widget over a test's own source and directory.
-    ///
-    /// The framework's headless host composes the services without a directory (the
-    /// connector still needs the old toolkit's runtime to build), so an interface test
-    /// constructs the widget directly with the fixture directory it wants, and drives
-    /// the widget hooks itself.
     #[cfg(test)]
     fn with_source<S: TickerSource>(
         config: WatchListConfig,
@@ -836,7 +639,6 @@ impl WatchListWidget {
         )
     }
 
-    /// The signals and handles both tables read.
     fn table_signals(&self) -> TableSignals {
         TableSignals {
             catalog: Rc::clone(&self.catalog),
@@ -846,7 +648,6 @@ impl WatchListWidget {
         }
     }
 
-    /// The listings this pane can read right now: the followed ones whose market is loaded.
     fn readable(&self, _cx: &WidgetCx<'_>) -> HashSet<VenueListingKey> {
         let Some(directory) = self.directory.as_ref() else {
             return HashSet::default();
@@ -859,7 +660,6 @@ impl WatchListWidget {
             .collect()
     }
 
-    /// The set the service is asked for: the listings this pane reads.
     fn served(&self, cx: &WidgetCx<'_>) -> HashSet<VenueListingKey> {
         let readable = self.readable(cx);
         self.entries
@@ -869,7 +669,6 @@ impl WatchListWidget {
             .collect()
     }
 
-    /// Whether anything this list follows is in memory.
     fn market_ready(&self, _cx: &WidgetCx<'_>) -> bool {
         let Some(directory) = self.directory.as_ref() else {
             return false;
@@ -885,16 +684,10 @@ impl WatchListWidget {
         if !self.config.entries.is_empty() {
             return false;
         }
-        // A list that follows nothing is read through the markets themselves: the picker
-        // that adds a listing is drawn from the loaded venues, so with one of them loaded
-        // there is something to add and the empty list is the empty table's own business.
         directory.any_market_loaded()
     }
 
-    /// Settles the followed set against what the venues still carry, and follows it.
     fn start(&mut self, cx: &mut WidgetCx<'_>) {
-        // The pane reached here only past its own gate, so the markets it was waiting
-        // for are in memory again and messages belong to them once more.
         self.awaiting_market = false;
         let asked = self.config.entries.clone();
         let served = self.served(cx);
@@ -902,17 +695,10 @@ impl WatchListWidget {
             let Some(directory) = self.directory.clone() else {
                 return;
             };
-            // Every lookup is started in one synchronous pass, and every answer is applied
-            // in one settlement: each question was asked about the same set, so settling
-            // them one by one would let a later answer judge a set an earlier one changed.
             let routes = directory.loaded_scopes();
             let answered = asked
                 .iter()
                 .map(|key| {
-                    // A route the reading does not carry is not asked: no question is put
-                    // to a catalog about a scope this pane holds no evidence for. That is
-                    // *not* a withdrawal — see `listing_support`: the venue may have loaded
-                    // since the reading, so the listing stays.
                     let loaded = offers_route(&routes, &key.route, CapabilityId::Tickers);
                     let offered = loaded.then(|| directory.contains(key));
                     (key.clone(), offered)
@@ -931,7 +717,6 @@ impl WatchListWidget {
         self.replace(&served, PendingCommand::Load, cx);
     }
 
-    /// Drops the followed listings the routes no longer offer.
     fn settle_listings(
         &mut self,
         asked: &[VenueListingKey],
@@ -968,7 +753,6 @@ impl WatchListWidget {
         self.rows_dirty = true;
     }
 
-    /// Reports the state a pane with nothing to read is in.
     fn wait_for_market(&mut self, cx: &mut WidgetCx<'_>) {
         self.awaiting_market = true;
         self.entries.clear();
@@ -978,14 +762,6 @@ impl WatchListWidget {
         self.controls_dirty = true;
     }
 
-    /// Reports the state a pane with nothing to read is in.
-    ///
-    /// Two panes are in it: the one that waits for the markets behind the listings it
-    /// follows, whose rows say what has to be loaded, and the one that follows nothing at
-    /// all, whose only way of saying it is the framework's placeholder. Which of the two
-    /// this is depends on what the user follows rather than on why the pane stopped
-    /// reading, so every path that leaves the pane with nothing to read reports it the
-    /// same way.
     fn report_waiting(&mut self, cx: &mut WidgetCx<'_>) {
         self.confirmed = false;
         if !self.has_content() {
@@ -995,7 +771,6 @@ impl WatchListWidget {
         }
     }
 
-    /// Reports the notice naming every market this widget could read at all.
     fn report_markets_not_loaded(&self, cx: &mut WidgetCx<'_>) {
         let venues = market_venues();
         self.status.report(
@@ -1007,12 +782,8 @@ impl WatchListWidget {
         );
     }
 
-    /// Publishes the followed set to the two tables.
     fn publish_rows(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         self.rows_dirty = false;
-        // The body is what mounts the tables; before it exists there is nothing to
-        // publish to, and the dirty flag stays set so the first body publishes the rows
-        // it was built with.
         if self.continuous.is_none() && self.session.is_none() {
             self.rows_dirty = true;
             return Ok(());
@@ -1046,7 +817,6 @@ impl WatchListWidget {
         Ok(())
     }
 
-    /// The tables' static copy moved; rebuild both in place.
     fn rebuild_tables(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let (Some(continuous_slot), Some(session_slot)) = (self.continuous_slot, self.session_slot)
         else {
@@ -1086,13 +856,10 @@ impl WatchListWidget {
         Ok(())
     }
 
-    /// Whether the row controls have to refuse input right now.
     fn controls_disabled(&self, app: &App) -> bool {
         !self.pending.is_empty() || self.status.is_failed(app)
     }
 
-    /// Asks the service to follow exactly `served`, the part of the followed set this pane is
-    /// reading.
     fn replace(
         &mut self,
         served: &HashSet<VenueListingKey>,
@@ -1108,19 +875,13 @@ impl WatchListWidget {
         };
         if let Some(binding) = self.binding.as_mut() {
             let request_id = binding.call(cx, request);
-            // The call replaced whatever was in flight; the table follows it so a late
-            // answer to the replaced one is unknown and counted as dropped.
             self.pending.clear();
             self.pending.track(request_id, command);
         }
         self.controls_dirty = true;
     }
 
-    /// Starts following a listing the user picked.
     fn add(&mut self, selection: InstrumentSelection, cx: &mut WidgetCx<'_>) {
-        // The control refuses input in both of these states, and a confirmation that got
-        // through anyway — the dialog was confirmed after the pane started waiting, say —
-        // must not subscribe to a listing the pane has no market for.
         if self.awaiting_market || self.controls_disabled(cx.app()) {
             return;
         }
@@ -1136,10 +897,6 @@ impl WatchListWidget {
         self.config.entries.push(key.clone());
         sort_entries(&mut self.config.entries);
         self.config_change.publish(cx.app_mut());
-        // What this pane reads is decided by the markets in memory and not by what the
-        // picker offered: a venue that shrank in between leaves the listing it named on a
-        // route nobody loaded. Such a listing is followed all the same — the row says
-        // which market participant has to be loaded — but it has no stream.
         if self.readable(cx).contains(&key) {
             self.entries
                 .insert(key.clone(), WatchListEntry::connecting(&key));
@@ -1149,7 +906,6 @@ impl WatchListWidget {
         self.replace(&served, PendingCommand::Add(key), cx);
     }
 
-    /// Stops following one listing.
     fn remove(&mut self, key: &VenueListingKey, cx: &mut WidgetCx<'_>) {
         if self.controls_disabled(cx.app()) {
             return;
@@ -1162,9 +918,6 @@ impl WatchListWidget {
         self.config_change.publish(cx.app_mut());
 
         if self.awaiting_market {
-            // Taking the last followed listing out of a list that is waiting for a market
-            // leaves a list with no row to say anything with, so the pane goes back to the
-            // placeholder it was waiting with.
             self.rows_dirty = true;
             self.report_waiting(cx);
             return;
@@ -1178,7 +931,6 @@ impl WatchListWidget {
         );
     }
 
-    /// Reopens the stream of one listing the user is retrying.
     fn retry(&mut self, key: &VenueListingKey, cx: &mut WidgetCx<'_>) {
         if self.controls_disabled(cx.app()) {
             return;
@@ -1211,7 +963,6 @@ impl WatchListWidget {
         );
     }
 
-    /// Reports a failure of the widget itself, with the framework's recovery.
     fn fail(&mut self, failure: WatchListFailure, cx: &mut WidgetCx<'_>) {
         let recovery = self.recovery.clone();
         self.pending.clear();
@@ -1222,7 +973,6 @@ impl WatchListWidget {
         self.controls_dirty = true;
     }
 
-    /// Applies the service's answer to the one operation that was in flight.
     fn apply_rpc_result(
         &mut self,
         command: PendingCommand,
@@ -1231,13 +981,9 @@ impl WatchListWidget {
     ) {
         match result {
             Ok(WatchListResponse::Applied) => {
-                // A failure is terminal (§4.4): the answer to a request that was already in
-                // flight when the list failed is not a reason to report it as working again.
                 if self.status.is_failed(cx.app()) {
                     return;
                 }
-                // The request that was answered is the one the reload flag was waiting
-                // for: the streams it reopened were resolved at the retired generation.
                 self.market_reloaded = false;
                 self.controls_dirty = true;
                 if self.awaiting_market {
@@ -1251,8 +997,6 @@ impl WatchListWidget {
                     return;
                 }
                 command.undo(&mut self.config, &mut self.entries);
-                // The followed set is the config, so putting a refused change back is a
-                // config change of its own.
                 self.config_change.publish(cx.app_mut());
                 self.rows_dirty = true;
                 self.fail(WatchListFailure::Rpc(error), cx);
@@ -1260,7 +1004,6 @@ impl WatchListWidget {
         }
     }
 
-    /// Applies one message from one listing's stream.
     fn apply_event(
         &mut self,
         key: &VenueListingKey,
@@ -1273,10 +1016,6 @@ impl WatchListWidget {
         if let WatchListStreamEvent::Error(WatchListStreamError::MarketParticipant(error)) = event
             && market_is_catalog_not_loaded(error)
         {
-            // The listing stops being read: the route cannot answer for it, so it has no
-            // row of its own values any more. Nothing is asked of the service here — the
-            // key is written down instead, because the stream it was opened for is parked
-            // on this error and the service still holds it.
             self.entries.remove(key);
             self.dropped.insert(key.clone());
             self.rows_dirty = true;
@@ -1302,21 +1041,17 @@ impl WatchListWidget {
         }
     }
 
-    /// Applies one RPC reply, once its identity says it answers the command in flight.
     fn apply_rpc(
         &mut self,
         request_id: RequestId,
         result: WidgetRpcResult<WatchListProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
-        // A late or unknown identity answers a request this pane replaced, and the
-        // table has counted it.
         if let Some(command) = self.pending.take(request_id) {
             self.apply_rpc_result(command, result, cx);
         }
     }
 
-    /// Keeps the catalogue mirror the cells read in step with the directory.
     fn sync_catalog(&mut self, cx: &mut WidgetCx<'_>) {
         let Some(directory) = self.directory.as_ref() else {
             return;
@@ -1332,7 +1067,6 @@ impl WatchListWidget {
         self.catalog_moved = true;
     }
 
-    /// The filters the picker this control opens is built with.
     fn instrument_filters(&self) -> InstrumentFilters {
         InstrumentFilters {
             kind_filter: InstrumentKindFilter::All,
@@ -1346,12 +1080,10 @@ impl WatchListWidget {
         }
     }
 
-    /// Whether the add control accepts input.
     fn add_enabled(&self, app: &App) -> bool {
         !self.awaiting_market && !self.controls_disabled(app)
     }
 
-    /// Builds the add control into the header group's container.
     fn build_header(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let filters = self.instrument_filters();
         let enabled = self.add_enabled(cx.app());
@@ -1373,8 +1105,6 @@ impl WatchListWidget {
             .a11y_label(label)
             .disabled(!enabled)
             .on_click(move |ctx| {
-                // A disabled button still dispatches its handler in this kit: the guard is
-                // the real refusal, and the dialog of a pane with no market must not open.
                 if !*ctx.read(&enabled_signal) {
                     return;
                 }
@@ -1406,7 +1136,6 @@ impl WatchListWidget {
         Ok(())
     }
 
-    /// Keeps the header control in step with the copy it was built with.
     fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let enabled = self.add_enabled(cx.app());
         cx.write(&self.add_enabled, enabled);
@@ -1431,7 +1160,6 @@ impl WatchListWidget {
         Ok(())
     }
 
-    /// Takes down the header control's component.
     fn release_header(&mut self, cx: &mut WidgetCx<'_>, remove_node: bool) {
         let Some(header) = self.header.take() else {
             return;
@@ -1443,12 +1171,6 @@ impl WatchListWidget {
         header.button.release(cx.app_mut());
     }
 
-    /// Pairs every mounted row with its controls.
-    ///
-    /// A row's slot is built by the table's row factory and filled here: the factory has
-    /// no application context, so the kit buttons are the widget's own to build, release
-    /// and rebuild. The pairing is keyed by row index and the built copy, so a row whose
-    /// text moved keeps its controls and a row window the table rebuilt gets fresh ones.
     fn sync_row_controls(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let context = ControlsContext {
             language: *cx.read(&self.language),
@@ -1477,7 +1199,6 @@ impl WatchListWidget {
     }
 }
 
-/// What one row-control build reads.
 struct ControlsContext {
     language: LanguageCode,
     disabled: bool,
@@ -1488,7 +1209,6 @@ struct ControlsContext {
     window: WindowId,
 }
 
-/// Pairs one table's mounted rows with their controls.
 fn sync_controls_for(
     market: WatchListMarket,
     pane: &mut Option<TablePane>,
@@ -1501,9 +1221,6 @@ fn sync_controls_for(
         return Ok(());
     };
     let rows = pane.rows.clone();
-    // The mounted rows are the slots whose nodes are still in the tree: the virtual list
-    // recycles its row window, and the slot map keeps the rows it built until they are
-    // pruned here.
     let mut mounted: Vec<(usize, NodeId)> = Vec::new();
     let mut gone: Vec<usize> = Vec::new();
     for (&row, &node) in pane.slots.borrow().iter() {
@@ -1608,7 +1325,6 @@ fn sync_controls_for(
     Ok(())
 }
 
-/// Releases one row's controls; their nodes go with the row window that held them.
 fn release_controls(
     cx: &mut WidgetCx<'_>,
     controls: RowControls,
@@ -1625,7 +1341,6 @@ fn release_controls(
     Ok(())
 }
 
-/// The local name of a table, for the row controls' kit keys.
 fn table_name(market: WatchListMarket) -> &'static str {
     match market {
         WatchListMarket::Continuous => "continuous",
@@ -1633,11 +1348,7 @@ fn table_name(market: WatchListMarket) -> &'static str {
     }
 }
 
-/// What the row controls of one row depend on.
 fn remove_label(row: &WatchListRow, catalog: &Catalog, translate: &Translate) -> SmolStr {
-    // The listing is named beside the verb rather than through the translation: the
-    // catalogue's own remove message has no placeholder for it, and both languages read
-    // verb-first, so the two are joined here — name after verb, the way a reader says it.
     format_smolstr!(
         "{} {}",
         t_smol!(translate, "widget.watch_list.remove"),
@@ -1645,13 +1356,11 @@ fn remove_label(row: &WatchListRow, catalog: &Catalog, translate: &Translate) ->
     )
 }
 
-/// The published name of one listing, or the localized unknown.
 fn listing_name(row: &WatchListRow, catalog: &Catalog, translate: &Translate) -> SmolStr {
     widget::error::ListingErrorPresentation::of(catalog.cached_listing_instrument(row.key()))
         .translated_message(translate)
 }
 
-/// The structural identity of a table's rows: what has to be rebuilt when it moves.
 fn structure_of(rows: &TableRows) -> Vec<(VenueListingKey, bool)> {
     rows.as_slice()
         .iter()

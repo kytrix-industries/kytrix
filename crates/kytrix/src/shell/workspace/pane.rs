@@ -1,18 +1,3 @@
-//! One workspace pane: its frame, its header row, and the widget it hosts.
-//!
-//! A pane is a persistent node subtree — frame, a header slot, and a body slot — plus the
-//! widget mounted into the body. Splitting, closing and resizing other panes never touches
-//! it: the widget keeps its instance, its nodes and the state it has collected, which is
-//! what makes rearranging a workspace cheap.
-//!
-//! # Header
-//!
-//! The header is the one part of the pane that is rebuilt: a widget contributes a left and
-//! a right group, the pane fixes the controls around them, and a kit button's text is baked
-//! in when it is built. The header slot therefore holds the row, and the row is replaced
-//! when the widget changes, when the pane becomes (or stops being) one of several, and
-//! when the language changes. Everything else in the pane is built once.
-
 use app_config::{widget::VersionedWidgetConfig, workspace::WorkspaceWidget};
 use base_ui::{
     kit::{button::Button, icon::IconKind, size::UnifiedSizable},
@@ -43,23 +28,18 @@ use super::{
     tree::{PaneId, PaneOrientation},
 };
 
-/// The debug id of a pane's body slot.
 pub(crate) const PANE_BODY: &str = "PANE_BODY";
 
-/// The debug id of a pane's header row.
 pub(crate) const PANE_HEADER: &str = "PANE_HEADER";
 
-/// The pane's header controls, named so tests find them.
 pub(crate) const PANE_WIDGET_BUTTON: &str = "PANE_WIDGET_BUTTON";
 pub(crate) const PANE_SPLIT_RIGHT: &str = "PANE_SPLIT_RIGHT";
 pub(crate) const PANE_SPLIT_DOWN: &str = "PANE_SPLIT_DOWN";
 pub(crate) const PANE_CLOSE_BUTTON: &str = "PANE_CLOSE_BUTTON";
 
-/// One pane and everything it owns.
 pub(crate) struct Pane {
     pub id: PaneId,
     pub window: WindowId,
-    /// The pane's frame: an absolutely laid-out box the stage hands a rectangle.
     pub container: NodeId,
     header_slot: NodeId,
     body: NodeId,
@@ -74,9 +54,6 @@ pub(crate) struct Pane {
     close_button_visible: bool,
 }
 
-/// The collaborators one pane is mounted with: the application's registry and services,
-/// the widget's config-change sink, the shell's intent queue, and the theme and translator
-/// the pane's own chrome is built from.
 pub(crate) struct PaneParts<'a> {
     pub registry: &'a WidgetRegistry,
     pub services: &'a std::rc::Rc<WidgetServices>,
@@ -87,7 +64,6 @@ pub(crate) struct PaneParts<'a> {
 }
 
 impl Pane {
-    /// Builds a pane and mounts the widget its layout stored.
     pub(crate) fn mount(
         app: &mut App,
         window: WindowId,
@@ -147,7 +123,6 @@ impl Pane {
         Ok(pane)
     }
 
-    /// Mounts `stored`'s widget into the body slot.
     fn mount_widget(
         &mut self,
         app: &mut App,
@@ -199,7 +174,6 @@ impl Pane {
         Ok(())
     }
 
-    /// Writes the pane's widget back as the layout stores it.
     pub(crate) fn snapshot(&self) -> WorkspaceWidget {
         WorkspaceWidget {
             id: self.widget_id.clone(),
@@ -210,12 +184,10 @@ impl Pane {
         }
     }
 
-    /// The widget type this pane shows.
     pub(crate) fn widget_id(&self) -> &str {
         &self.widget_id
     }
 
-    /// Replaces the pane's widget.
     pub(crate) fn set_widget(
         &mut self,
         app: &mut App,
@@ -233,13 +205,11 @@ impl Pane {
         Ok(())
     }
 
-    /// Lays the pane's frame out at `rect` (stage-local coordinates).
     pub(crate) fn set_rect(&mut self, app: &mut App, rect: Rect) -> Result<(), EngineError> {
         let tree = ui::tree(app, self.window)?;
         tree.set_style(self.container, frame_style(rect))
     }
 
-    /// Builds the pane's header row, replacing the one it had.
     pub(crate) fn rebuild_header(
         &mut self,
         app: &mut App,
@@ -307,8 +277,6 @@ impl Pane {
         Ok(())
     }
 
-    /// Updates which controls the header offers (the close button follows the topology)
-    /// and rebuilds the row when that changed.
     pub(crate) fn set_close_button_visible(
         &mut self,
         app: &mut App,
@@ -322,7 +290,6 @@ impl Pane {
         self.rebuild_header(app, window)
     }
 
-    /// Releases the header's controls and removes the row.
     fn release_header(&mut self, app: &mut App) {
         for button in std::mem::take(&mut self.window_buttons) {
             button.release(app);
@@ -332,28 +299,24 @@ impl Pane {
         }
     }
 
-    /// Releases the widget and its surface nodes.
     fn release_widget(&mut self, app: &mut App) {
         if let Some(widget) = self.widget.take() {
             let _ = widget.release(app);
         }
     }
 
-    /// Runs one frame of the pane's kit controls.
     pub(crate) fn sync(&self, app: &mut App) {
         for button in &self.window_buttons {
             let _ = button.sync(app);
         }
     }
 
-    /// Forwards one platform event to the pane's kit controls.
     pub(crate) fn dispatch(&mut self, app: &mut App, event: &Event) {
         for button in &self.window_buttons {
             let _ = button.dispatch(app, event);
         }
     }
 
-    /// Releases everything the pane owns and removes its subtree.
     pub(crate) fn release(&mut self, app: &mut App) {
         self.release_header(app);
         self.release_widget(app);
@@ -361,8 +324,6 @@ impl Pane {
     }
 }
 
-/// The pane frame's layout: an absolutely placed box at `rect` that still lays its children
-/// out (the header slot and the body).
 fn frame_style(rect: Rect) -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .absolute()
@@ -379,7 +340,6 @@ fn frame_style(rect: Rect) -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The pane's frame: the floor the body sits on, inset and bordered like a card.
 fn build_frame(
     app: &mut App,
     window: WindowId,
@@ -408,7 +368,6 @@ fn build_frame(
         .build(ui::tree(app, window)?, parent)
 }
 
-/// The header row's track.
 fn build_header_row(
     app: &mut App,
     window: WindowId,
@@ -448,14 +407,12 @@ fn build_header_row(
         .build(ui::tree(app, window)?, parent)
 }
 
-/// The chrome every header control of one pane is built from.
 struct HeaderChrome<'a> {
     theme: &'a ThemeHandle,
     translate: &'a Translate,
     intents: &'a Intents,
 }
 
-/// One pane header control.
 fn build_header_control(
     app: &mut App,
     window: WindowId,
@@ -494,21 +451,15 @@ fn build_header_control(
     Ok(button)
 }
 
-/// The pane actions a header offers, named once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeaderAction {
-    /// Choose the pane's widget.
     Widget,
-    /// Split the pane, keeping the new pane on the right.
     SplitRight,
-    /// Split the pane, keeping the new pane on the bottom.
     SplitDown,
-    /// Close the pane.
     Close,
 }
 
 impl HeaderAction {
-    /// The intent this header action reports for `pane`.
     pub(crate) const fn intent(self, pane: PaneId) -> Option<Intent> {
         match self {
             Self::Widget => Some(Intent::OpenGallery(pane)),
@@ -526,7 +477,6 @@ impl HeaderAction {
         }
     }
 
-    /// The icon the control draws.
     const fn icon(self) -> IconKind {
         match self {
             Self::Widget => IconKind::PuzzlePiece,
@@ -536,7 +486,6 @@ impl HeaderAction {
         }
     }
 
-    /// The i18n key of the control's label.
     const fn label_key(self) -> &'static str {
         match self {
             Self::Widget => "window.pane.select_widget",
@@ -546,7 +495,6 @@ impl HeaderAction {
         }
     }
 
-    /// The debug id of the control.
     const fn selector(self) -> &'static str {
         match self {
             Self::Widget => PANE_WIDGET_BUTTON,
@@ -557,7 +505,6 @@ impl HeaderAction {
     }
 }
 
-/// The action key one pane's header control registers under.
 pub(crate) fn header_action_key(pane: PaneId, action: HeaderAction) -> SmolStr {
     format_smolstr!("kytrix.pane.{}.{action:?}", pane.index())
 }
@@ -566,8 +513,6 @@ pub(crate) fn header_action_key(pane: PaneId, action: HeaderAction) -> SmolStr {
 mod tests {
     use super::*;
 
-    /// Every header action stands for exactly one intent, and the split directions are the
-    /// ones their labels promise.
     #[test]
     fn every_header_action_should_map_to_its_intent() {
         let pane = PaneId::test(3);
@@ -595,8 +540,6 @@ mod tests {
         ));
     }
 
-    /// Every control has its own label key and debug id: a test that finds a control by id
-    /// finds the control whose label it asserts.
     #[test]
     fn every_header_action_should_have_its_own_identity() {
         let actions = [

@@ -22,8 +22,6 @@ fn new_app() -> (tokio::runtime::Runtime, App) {
     (rt, app)
 }
 
-// ── P05：文本 pass / 字体栈 / B1 失效纪律 ────────────────────────────────
-
 fn text_style(width: Option<f32>) -> crate::paint::style::Style {
     let mut style = crate::paint::style::Style::default();
     style.inner.align_self = Some(taffy::style::AlignSelf::START);
@@ -33,7 +31,6 @@ fn text_style(width: Option<f32>) -> crate::paint::style::Style {
     style
 }
 
-/// P2-9：文本快照被重写后必须标 `PAINT`，否则 lane 复用旧 UV（新纹理 + 旧坐标）。
 #[test]
 fn re_laid_text_marks_paint_for_the_lane() {
     let (_rt, mut app, window, node) = text_app("hello", Some(400.0));
@@ -41,7 +38,6 @@ fn re_laid_text_marks_paint_for_the_lane() {
     layout(&mut app, window);
     text_layout(&mut app, window);
 
-    // 改文本 ⇒ 宽度变化 ⇒ 下一次 `layout_text` 会重写快照。
     set_text(
         &mut app,
         window,
@@ -51,7 +47,6 @@ fn re_laid_text_marks_paint_for_the_lane() {
     );
     refresh(&mut app, window);
     layout(&mut app, window);
-    // 清掉所有脏位，模拟「lane 仍可复用」的稳态：此时没有任何业务脏位。
     clear_dirty(&mut app, window);
 
     let report = text_layout(&mut app, window);
@@ -136,9 +131,6 @@ fn refresh_text_shapes_once_then_reuses() {
     let (_rt, mut app, window, node) = text_app("hello", None);
 
     let first = refresh(&mut app, window);
-    // P1-2.3：脏集合消费后为空 ⇒ 第二次调用不再遍历任何节点。
-    // 旧实现每帧扫整棵树并把「快照未变」计入 `skipped`；现在「没有脏节点」本身就是
-    // 更强的跳过（成本 O(0) 而不是 O(全树)），`skipped` 只统计真正访问到的节点。
     let second = refresh(&mut app, window);
 
     assert_eq!(first.shaped, 1);
@@ -151,7 +143,6 @@ fn refresh_text_shapes_once_then_reuses() {
         0,
         "脏集合必须已被消费"
     );
-    // 显式标记后必须重新进入（证明集合是唯一入口，而不是「永远跳过」）。
     app.window_mut(window)
         .expect("窗口存在")
         .tree_mut()
@@ -159,7 +150,6 @@ fn refresh_text_shapes_once_then_reuses() {
     let third = refresh(&mut app, window);
     assert_eq!(third.skipped, 1, "标记后必须访问该节点并命中快照复用");
     assert_eq!(third.shaped, 0);
-    // 行快照只由第二阶段（layout_text）产出。
     assert!(
         app.window(window)
             .expect("窗口存在")
@@ -253,7 +243,6 @@ fn text_size_change_marks_layout() {
 
 #[test]
 fn text_same_size_still_clears_the_taffy_cache() {
-    // B1：尺寸没变（"ab" → "ba"）也必须清 node..root 的 taffy 缓存，否则陈旧 measure 会留存。
     let (_rt, mut app, window, node) = text_app("ab", None);
     let _ = refresh(&mut app, window);
     let _ = layout(&mut app, window);
@@ -291,7 +280,6 @@ fn text_same_size_still_clears_the_taffy_cache() {
 
 #[test]
 fn text_wrap_change_same_max_width_relayouts() {
-    // B1 的反例：Wrap → Anywhere 的 max-content 宽相同，但定宽（40 px）下的行数/高度不同。
     let (_rt, mut app, window, node) = text_app("aaaaaaaaaa", Some(40.0));
     let _ = refresh(&mut app, window);
     let _ = layout(&mut app, window);
@@ -332,7 +320,6 @@ fn set_font_stack_invalidates_all_text_and_drops_the_shape_cache() {
         .expect("节点存在")
         .dirty();
     assert!(dirty.contains(DirtyFlags::LAYOUT | DirtyFlags::PAINT));
-    // 形状缓存被清空 ⇒ 下一次 refresh_text 重新 shape。
     let report = refresh(&mut app, window);
     assert_eq!(report.shaped, 1);
 }
@@ -348,15 +335,9 @@ fn reload_system_fonts_is_idempotent_but_bumps_the_version() {
     assert!(app.refresh_text(window).is_some());
 }
 
-/// P1-2.6 回归：图集换代必须让**所有窗口**的文本节点重绘。
-///
-/// 图集是进程级共享的，但文本 lane 里存的是生成时的 `AtlasTile`（旧 UV）。旧实现里
-/// `set_text_line` 不标 `PAINT`，paint 的 lane 复用只看 `REUSABLE`/`clip_key` —— 于是
-/// 窗口 A 改 DPI 让图集换代后，窗口 B 仍在使用旧 UV（错字/花字）。
 #[test]
 fn dpi_change_relays_text_without_rebuilding_the_shared_atlas() {
     let (_rt, mut app, window_a, node_a) = text_app("alpha", None);
-    // 第二个窗口：同样的文本节点，但一直不出帧 —— 它的 lane 保留上一帧的 AtlasTile。
     let window_b = app.create_window(WindowOptions::default());
     let node_b = {
         let tree = app.window_mut(window_b).expect("窗口存在").tree_mut();
@@ -366,7 +347,6 @@ fn dpi_change_relays_text_without_rebuilding_the_shared_atlas() {
             .expect("挂载")
     };
 
-    // 两个窗口都完成一次 shape + layout（建立各自的文本 lane / ShapedLine）。
     for window in [window_a, window_b] {
         let _ = refresh(&mut app, window);
         let _ = layout(&mut app, window);
@@ -380,7 +360,6 @@ fn dpi_change_relays_text_without_rebuilding_the_shared_atlas() {
         .expect("快照存在")
         .atlas_generation;
 
-    // 窗口 A 改 DPI：新 ppem 只是**新增** tile（R12-4/R12-1），不清页、不换代。
     app.window_mut(window_a)
         .expect("窗口存在")
         .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
@@ -399,7 +378,6 @@ fn dpi_change_relays_text_without_rebuilding_the_shared_atlas() {
         "DPI 变化不得让全局图集换代（R12-4：逻辑坐标 shaping + 多 ppem 共存）"
     );
 
-    // 窗口 B 不受影响：它的 tile 仍然有效，既不需要 PAINT 也不需要重排。
     let tree_b = app.window(window_b).expect("窗口存在").tree();
     assert_eq!(
         tree_b.text_layout_dirty_len(),
@@ -459,16 +437,11 @@ fn scale_change_relays_the_same_snapshot_at_the_new_ppem() {
     );
 }
 
-/// R12 的 `DigitFastPath` 命中率必须**可观测**（`TextPassReport`）：分母 = 进入判定的塑形数，
-/// 含被静态条件拒绝的候选（D-2：真实命中率，不是只统计 eligible 文本的自证式口径）。
 #[test]
 fn digit_fast_path_hit_rate_is_observable() {
-    // 数字文本：进入判定一次、命中一次。
     let (_rt, mut app, window, _node) = text_app("1,234.56", None);
     let report = refresh(&mut app, window);
     if report.fast_path_shaped == 0 {
-        // 宿主字体对该字号的数字/标点组合验证失败（例如带 kerning）：这是合法的降级，
-        // 不是失败；命中率的可观测性由下面「字母文本计入候选」的断言保证。
         eprintln!("skip: the host font rejects the digit fast path");
         assert_eq!(report.fast_path_queries, 1, "验证降级也计入候选分母");
         assert_eq!(report.fast_path_ineligible, 0);
@@ -479,14 +452,12 @@ fn digit_fast_path_hit_rate_is_observable() {
         assert!(app.digit_fast_path_enabled());
     }
 
-    // 字母文本：不满足字符集 ⇒ 不计命中，但必须计入候选分母与 ineligible（真实命中率）。
     let (_rt2, mut app2, window2, _node2) = text_app("frame a", None);
     let report2 = refresh(&mut app2, window2);
     assert_eq!(report2.fast_path_queries, 1, "字母文本必须计入候选分母");
     assert_eq!(report2.fast_path_shaped, 0);
     assert_eq!(report2.fast_path_ineligible, 1);
 
-    // 开关关闭 ⇒ 连判定都不做（回退验证路径）。
     let (_rt3, mut app3, window3, _node3) = text_app("1,234.56", None);
     app3.set_digit_fast_path(false);
     assert!(!app3.digit_fast_path_enabled());
@@ -501,7 +472,6 @@ fn text_diagnostics_start_empty_for_supported_text() {
     let (_rt, mut app, window, _node) = text_app("ascii only", None);
     let _ = refresh(&mut app, window);
 
-    // 具体诊断依宿主字体而定；这里只要求 API 可用且不 panic。
     let _ = app.text_diagnostics();
 }
 
@@ -715,7 +685,6 @@ fn refresh_styles_is_idempotent() {
 
 #[test]
 fn refresh_styles_escalates_layout_when_patch_affects_layout() {
-    // 双向都要升级（`new || old`）：false→true 本帧开始变；true→false 要把尺寸收回来。
     let (_rt, mut app) = new_app();
     let resized: Signal<bool> = app.signal(false);
     let window = app.create_window(WindowOptions::default());
@@ -791,13 +760,6 @@ fn refresh_styles_updates_deps() {
     );
 }
 
-/// P1-2.5 回归：卸载节点必须同步解开依赖边。
-///
-/// 旧实现只在 `close_window` 里退订仍存活的节点；`remove_node`（以及虚拟列表回收行）
-/// 直接 `tree_mut().remove()`，留下永久死边。死边会随「挂载/卸载」次数无界累积，而
-/// `App::write` 是最高频热路径 —— 每次写都要遍历并过滤这些死 owner。
-///
-/// 本用例读 `test_support::diagnostics::dependency_dump`，因此仅在 `test-support` 特性下编译。
 #[cfg(feature = "test-support")]
 #[test]
 fn removing_a_node_detaches_its_dependencies() {
@@ -805,8 +767,6 @@ fn removing_a_node_detaches_its_dependencies() {
     let signal: Signal<u32> = app.signal(0);
     let window = app.create_window(WindowOptions::default());
 
-    // 两个独立读者：一个用裸 `tree.remove` 卸载（分层上不负责依赖图），一个走
-    // `App::remove_node`（必须在删除的同时 detach）。断言后者不残留、前者残留。
     let bare = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
         opacity: Some(*cx.read(&signal) as f32),
         ..StylePatch::default()
@@ -879,15 +839,9 @@ fn refresh_styles_marks_a11y_on_interactive_change() {
     );
 }
 
-/// R03-12：派生闭包 panic 之后必须**放回**，下一次读重试闭包 —— 不能把一次应用 bug 升级成
-/// 该派生值的永久失效（旧行为：下一次读返回 `CyclicDerived`，伪装成"存在环"）。
-///
-/// 同时钉住 panic 安全的另一半：`EvalGuard::drop` 在展开时出栈、panic 节点自己的 `bind_style`
-/// 闭包丢失后退化为静态节点（这是 `refresh_styles` 的既有语义，不是本条的修复点）。
 #[test]
 fn eval_guard_pops_on_panic_and_the_derived_closure_is_restored() {
     let (_rt, mut app) = new_app();
-    // 第一次求值 panic、之后正常：闭包必须在 panic 展开时被放回。
     let attempts = Rc::new(Cell::new(0u32));
     let counter = Rc::clone(&attempts);
     let flaky: Derived<f32> = app.derived(move |_cx| -> f32 {
@@ -898,12 +852,10 @@ fn eval_guard_pops_on_panic_and_the_derived_closure_is_restored() {
         7.0
     });
     let window = app.create_window(WindowOptions::default());
-    // 第一个节点：本次求值会 panic（它的 `bind_style` 随后丢失 → 退化为静态节点）。
     let doomed = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
         opacity: Some(cx.read_derived(&flaky).map(|v| *v).unwrap_or(0.0)),
         ..StylePatch::default()
     });
-    // 第二个节点：第一次 pass 里没轮到它，panic 之后才求值 —— 它是"闭包是否被放回"的探针。
     let survivor = node_with(&mut app, window, move |cx: &mut ReadCtx<'_>| StylePatch {
         opacity: Some(cx.read_derived(&flaky).map(|v| *v).unwrap_or(0.0)),
         ..StylePatch::default()
@@ -948,7 +900,6 @@ fn eval_guard_pops_on_panic_and_the_derived_closure_is_restored() {
 
 #[test]
 fn write_isolates_sibling_nodes() {
-    // D16/I3 的核心断言：一次写入只沿依赖图命中**读过它的**节点。
     let (_rt, mut app) = new_app();
     let signal_a: Signal<u32> = app.signal(0);
     let signal_b: Signal<u32> = app.signal(0);
@@ -981,7 +932,6 @@ fn write_isolates_sibling_nodes() {
 
 #[test]
 fn write_only_derived_does_not_wake() {
-    // 只有派生失效、没有节点变脏 ⇒ 不该提交帧（I3「空闲不提交帧」）。
     let (_rt, mut app) = new_app();
     let signal: Signal<u32> = app.signal(1);
     let derived: Derived<u32> = app.derived(move |cx| *cx.read(&signal) * 2);
@@ -997,7 +947,6 @@ fn write_only_derived_does_not_wake() {
     let _ = derived;
 }
 
-/// P1-4：被限流挡下的 a11y 变化必须让平台泵「到期补发」。
 #[test]
 fn a11y_retry_pending_reports_throttled_changes() {
     let (_rt, mut app) = new_app();
@@ -1009,7 +958,6 @@ fn a11y_retry_pending_reports_throttled_changes() {
     app.refresh_styles(window).expect("窗口存在");
     assert!(app.a11y_take(window).is_some(), "首笔交付");
 
-    // 限流窗口内再标脏：不能立即交付，但必须有「到期补发」信号。
     app.window_mut(window)
         .expect("窗口")
         .tree_mut()
@@ -1020,14 +968,11 @@ fn a11y_retry_pending_reports_throttled_changes() {
         "必须有到期补发信号，否则最后一次变化永远交付不出去"
     );
 
-    // 时间窗过后：可交付，补发信号消失。
     app.advance_clock(std::time::Duration::from_millis(150));
     assert!(app.a11y_pending(window), "到期后可交付");
     assert!(!app.a11y_retry_pending(), "可交付时不再需要补发信号");
     let _ = app.a11y_take(window);
 }
-/// P2-8：`on_close` 返回 false 必须拦下关闭，返回 true 才真的关。
-/// P2-3：给不存在的窗口注册关闭处理器必须被忽略（否则留下永不调用、却持有闭包的条目）。
 #[test]
 fn on_close_ignores_unknown_windows() {
     let (_rt, mut app) = new_app();
@@ -1042,23 +987,19 @@ fn on_close_ignores_unknown_windows() {
     });
     assert!(!app.request_close(ghost), "已关闭的窗口没有可拦的关闭请求");
     assert_eq!(called.get(), 0, "幽灵处理器不得被调用");
-    // 正常窗口仍可注册。
     app.on_close(window, |_app| false);
     assert!(!app.request_close(window));
 }
 
-/// P2-3：处理器内部重新注册的处理器，不能被 take→put 的旧闭包覆盖。
 #[test]
 fn close_handler_reregistration_is_not_overwritten() {
     let (_rt, mut app) = new_app();
     let window = app.create_window(WindowOptions::default());
     app.on_close(window, move |app| {
-        // 第一次询问后换成一个「永远拦下」的新处理器；再点一次时必须走新的。
         app.on_close(window, |_app| false);
         false
     });
     assert!(!app.request_close(window), "旧处理器拦下");
-    // 新处理器同样是拦下，但关键是它必须在表里（不是旧闭包）。
     assert!(!app.request_close(window), "新处理器也必须被问到");
     assert!(app.window(window).is_some(), "两次都拦下，窗口仍在");
 }
@@ -1078,20 +1019,14 @@ fn close_handler_can_veto_the_close() {
     assert!(app.window(window).is_some(), "被拦下时窗口必须仍然存在");
     assert_eq!(denied.get(), 1, "处理器必须被调用");
 
-    // 第二次也拦下（处理器不能被消费掉）。
     assert!(!app.request_close(window));
     assert_eq!(denied.get(), 2);
 
-    // 换成允许关闭的处理器。
     app.on_close(window, |_app| true);
     assert!(app.request_close(window), "返回 true 必须真的关闭");
     assert!(app.window(window).is_none());
 }
 
-/// AR3 macOS P1-2：退出握手必须**两阶段** —— 任一窗口 veto 时一个窗口都不许关。
-///
-/// 旧实现逐窗 `App::request_close`（批准即关窗）：`[A, B, C]` 里 B veto 时 A 已经被拆掉
-/// （Renderer 已 drop、应用状态丢失），而用户看到的是「退出已取消」。
 #[test]
 fn batch_close_rolls_back_every_window_on_veto() {
     let (_rt, mut app) = new_app();
@@ -1106,7 +1041,6 @@ fn batch_close_rolls_back_every_window_on_veto() {
         counter.set(counter.get() + 1);
         true
     });
-    // 第二个窗口 veto（例如「退出确认框」被用户取消）。
     let counter = asked_second.clone();
     app.on_close(second, move |_app| {
         counter.set(counter.get() + 1);
@@ -1137,7 +1071,6 @@ fn batch_close_rolls_back_every_window_on_veto() {
     );
 }
 
-/// 全部同意时才统一关闭，且每个关闭处理器**恰好跑一次**（关之前再问一遍 = 两次确认框）。
 #[test]
 fn batch_close_closes_every_window_when_all_allow() {
     let (_rt, mut app) = new_app();
@@ -1162,15 +1095,12 @@ fn batch_close_closes_every_window_when_all_allow() {
     assert_eq!(asked_first.get(), 1, "批准后不得再问一次");
     assert_eq!(asked_second.get(), 1);
 
-    // 已经关掉的窗口再进入批量（例如退出握手重跑）：没有可拦的东西，不能否决退出。
     assert!(
         app.request_close_all(&[first, second]),
         "幽灵窗口不得否决退出（复审 §2.3 的 P3）"
     );
 }
 
-/// 处理器在询问阶段自己把窗口关掉：按「已经关了」处理，不算 veto（否则退出被一个不存在的
-/// 窗口永久挡住）。
 #[test]
 fn a_window_that_closes_itself_during_the_inquiry_does_not_veto_the_quit() {
     let (_rt, mut app) = new_app();
@@ -1178,7 +1108,6 @@ fn a_window_that_closes_itself_during_the_inquiry_does_not_veto_the_quit() {
     let closed_by_app = app.create_window(WindowOptions::default());
     app.on_close(closed_by_app, move |app| {
         app.close_window(closed_by_app);
-        // 故意返回 false：窗口已经不在了，这个 false 不应再否决整个退出。
         false
     });
 
@@ -1190,11 +1119,6 @@ fn a_window_that_closes_itself_during_the_inquiry_does_not_veto_the_quit() {
     assert!(app.window(closed_by_app).is_none());
 }
 
-/// AR3 macOS P2-11：Edit 菜单项「启用 ⇔ 应用真的能执行它」。
-///
-/// 引擎没有内建文本控件，复制/粘贴/撤销由应用绑定拥有；菜单点击只是把命令翻译成等价按键
-/// （`MenuCommand::engine_key`）。所以**只有绑定没有处理器**时按键本身会被静默丢弃，菜单项
-/// 必须保持置灰，否则就是「可点但点了没反应」。
 #[test]
 fn edit_menu_availability_requires_a_binding_with_a_handler() {
     use crate::{
@@ -1203,11 +1127,9 @@ fn edit_menu_availability_requires_a_binding_with_a_handler() {
     };
 
     let (_rt, mut app) = new_app();
-    // 没有绑定：即使处于文本编辑态，Edit 菜单也全部置灰。
     let nothing_bound = app.edit_menu_availability(true);
     assert!(!nothing_bound.allows(MenuCommand::Copy));
 
-    // 只绑定 Cmd+C、没注册处理器 ⇒ 按键会被 `dispatch_action_with_hit` 丢掉，仍然置灰。
     let copy = Action::custom("edit.copy");
     app.bind_key(KeyBinding {
         key: KeyCode::KeyC,
@@ -1219,7 +1141,6 @@ fn edit_menu_availability_requires_a_binding_with_a_handler() {
         "只有绑定、没有处理器 ⇒ 必须置灰"
     );
 
-    // 注册处理器后才启用：此时点菜单项与按 Cmd+C 走同一条绑定通路，真的会执行。
     app.on_action(copy, |_ctx| {});
     let available = app.edit_menu_availability(true);
     assert!(available.allows(MenuCommand::Copy), "绑定 + 处理器 ⇒ 启用");
@@ -1232,10 +1153,6 @@ fn edit_menu_availability_requires_a_binding_with_a_handler() {
         "没有文本编辑态时一律置灰（动作会被上抛给 responder chain）"
     );
 }
-/// P2-6：a11y 交付按窗口限流，且时间窗过后继续交付。
-///
-/// 实时行情会让 `A11Y` 脏位每帧为真；不限流时每帧都要全树扫描 + 构造 `TreeUpdate`。
-/// P3-5：同一诊断重复产生时不得刷屏（64 槽环形缓冲会被同一个问题的重复项占满）。
 #[test]
 fn a11y_diagnostics_are_deduplicated() {
     let (_rt, mut app) = new_app();
@@ -1253,7 +1170,6 @@ fn a11y_diagnostics_are_deduplicated() {
         &[diagnostic],
         "同一条诊断只保留一份"
     );
-    // 不同诊断仍可追加。
     app.a11y_note(crate::a11y::A11yDiagnostic::MissingLabel { node: root });
     assert_eq!(app.a11y_diagnostics().len(), 2);
 }
@@ -1271,7 +1187,6 @@ fn a11y_delivery_is_throttled_per_window() {
     assert!(app.a11y_pending(window), "首次交付不受限流影响");
     assert!(app.a11y_take(window).is_some(), "应产出一笔交付");
 
-    // 立刻再标脏：仍在时间窗内 ⇒ 不交付。
     app.window_mut(window)
         .expect("窗口")
         .tree_mut()
@@ -1281,7 +1196,6 @@ fn a11y_delivery_is_throttled_per_window() {
         "时间窗内不得再次交付（高频更新会变成每帧全树扫描）"
     );
 
-    // 推过时间窗 ⇒ 恢复交付。
     app.advance_clock(std::time::Duration::from_millis(150));
     assert!(app.a11y_pending(window), "时间窗过后必须继续交付");
     let _ = app.a11y_take(window);
@@ -1289,8 +1203,6 @@ fn a11y_delivery_is_throttled_per_window() {
 }
 #[test]
 fn changed_text_marks_a11y() {
-    // 文本节点的可访问名/值 = 文本内容。只标 PAINT 时，"70%" → "80%" 这种等宽替换不会触发
-    // LAYOUT，AT 会一直读到旧值（P15 F-153）。
     use smol_str::SmolStr;
 
     let (_rt, mut app) = new_app();
@@ -1302,7 +1214,6 @@ fn changed_text_marks_a11y() {
         .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
         .expect("挂载");
     app.refresh_styles(window).expect("窗口存在");
-    // 消费首帧的 A11Y 位（新节点初始就带 LAYOUT|PAINT|A11Y）。
     let _ = app.a11y_take(window);
     let _ = app.take_wake_request();
     assert!(
@@ -1321,8 +1232,6 @@ fn changed_text_marks_a11y() {
 
 #[test]
 fn writing_a_signal_wakes_the_platform_loop() {
-    // 回投任务（`AppHandle::send` / a11y `ActionRequest`）里写状态时，平台泵已经过了帧门禁；
-    // 只置 `wake_requested` 不唤醒 dispatcher，会让画面与 a11y 更新等到下一条无关消息（F-152）。
     let (_rt, mut app) = new_app();
     let signal: Signal<u32> = app.signal(0);
     let window = app.create_window(WindowOptions::default());
@@ -1334,7 +1243,6 @@ fn writing_a_signal_wakes_the_platform_loop() {
         })
         .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
         .expect("挂载");
-    // 先求值一次样式：依赖边在 `refresh_styles` 里建立，没有边就无从失效。
     app.refresh_styles(window).expect("窗口存在");
     let _ = app.take_wake_request();
     let _ = app.dispatcher().take_frame_wake();
@@ -1440,7 +1348,6 @@ fn bind_style_panic_clears_ghost_deps() {
 
 #[test]
 fn layout_text_breaks_at_the_content_width() {
-    // B1：60 px 宽、16 px 字号的 4 个单词必须断成多行，且选区矩形逐行对齐。
     let (_rt, mut app, window, node) = text_app("aaaa aaaa aaaa aaaa", Some(60.0));
     let _ = refresh(&mut app, window);
     let _ = layout(&mut app, window);
@@ -1524,9 +1431,6 @@ fn ime_cursor_area_requires_text_shape_and_can_be_cleared() {
     );
 }
 
-/// RB-03（用户裁决「焦点移走/窗口失焦统一清 caret hint」）：窗口失焦必须清 IME hint。
-///
-/// 变异检查：删掉 `on_window_focus_lost` 里的 `clear_ime_cursor_request` 调用 ⇒ 本测试红。
 #[test]
 fn losing_window_focus_clears_the_ime_cursor_hint() {
     let (_rt, mut app, window, node) = text_app("abc", None);
@@ -1614,7 +1518,6 @@ fn text_caret_rect_includes_border_padding_and_node_origin() {
 fn close_window_forgets_the_scale_epoch() {
     let (_rt, mut app, window, _node) = text_app("x", None);
     let _ = refresh(&mut app, window);
-    // 首帧的 `refresh_images` 会为窗口登记图片 scale epoch（E7 旁表）。
     let _ = app.frame(window).expect("窗口存在").expect("帧成功");
     assert!(
         app.image_scale_epochs.contains_key(&window),
@@ -1712,8 +1615,6 @@ fn inline_boxes_changes_relayout() {
     assert_eq!(text_layout(&mut app, window).laid, 1);
 }
 
-/// v2.1 E2b（审查 F11/F12）：`App::frame` 把行内盒图片缺失接成 `InlineBoxImageMissing`
-/// 诊断（D17 不静默）；同一 id 的重复帧由 `TextContext` 按值去重，环里始终只有一条。
 #[test]
 fn app_frame_reports_missing_inline_box_images_once() {
     let (_rt, mut app) = new_app();
@@ -1816,8 +1717,6 @@ fn bind_text_preserves_inline_boxes() {
     }
 }
 
-// ── P06：完整帧 ──
-
 #[test]
 fn app_frame_runs_styles_then_paints() {
     let (_rt, mut app) = new_app();
@@ -1838,7 +1737,6 @@ fn app_frame_runs_styles_then_paints() {
     let outcome = app.frame(window).expect("窗口存在").expect("帧成功");
     assert!(matches!(outcome, FrameOutcome::Committed(_)));
 
-    // 改信号 → 下一帧的 Quad 颜色必须变（证明 styles pass 在 paint 之前跑过）。
     app.write(&background, crate::paint::color::Color::BLACK);
     let _ = app.frame(window).expect("窗口存在").expect("帧成功");
     let scene = app.window(window).expect("窗口").scene();
@@ -1865,7 +1763,6 @@ fn app_frame_unknown_window_is_none() {
 fn app_frame_is_idle_without_work() {
     let (_rt, mut app) = new_app();
     let window = app.create_window(WindowOptions::default());
-    // 首帧有布局移动（根从 0 尺寸撑满窗口）⇒ 提交一次；之后无写、无脏 ⇒ 空闲零帧。
     let first = app.frame(window).expect("窗口存在");
     assert!(matches!(first, Ok(FrameOutcome::Committed(_))));
 
@@ -1878,12 +1775,6 @@ fn app_frame_is_idle_without_work() {
     );
 }
 
-// ── R01-12：动作 handler 的重入与 panic 安全 ──────────────────────────────
-
-/// R01-12（重入面）：handler 体内为**同一个** action 注册新处理器时，新条目必须生效。
-///
-/// 旧实现无条件 `handlers.insert(action, 旧闭包)` 收尾，把应用刚注册的新处理器踩掉：下一次
-/// 分发仍然跑旧闭包（应用看到的是"重新订阅无效"）。
 #[test]
 fn a_handler_registered_from_inside_a_handler_survives() {
     let (_rt, mut app) = new_app();
@@ -1914,10 +1805,6 @@ fn a_handler_registered_from_inside_a_handler_survives() {
     assert_eq!(first_hits.get(), 1, "旧处理器不得再被调用");
 }
 
-/// R01-12（panic 面）：handler panic 之后条目必须还在表里。
-///
-/// 旧实现在 `handler(&mut ctx)` 之后才 `insert`：panic 展开时闭包随栈帧被 drop，该动作的
-/// 处理器永久丢失 —— 之后分发静默退化为默认行为（`Action::Custom` ⇒ `false`）。
 #[test]
 fn a_panicking_handler_is_not_lost() {
     let (_rt, mut app) = new_app();
@@ -1946,8 +1833,6 @@ fn a_panicking_handler_is_not_lost() {
     assert_eq!(hits.get(), 2, "处理器必须被再次调用");
 }
 
-// ── X1：owner / modal / 置顶的引擎层语义 ─────────────────────────────────
-
 #[test]
 fn a_modal_window_blocks_its_owners_input_until_it_closes() {
     let (_rt, mut app) = new_app();
@@ -1963,7 +1848,6 @@ fn a_modal_window_blocks_its_owners_input_until_it_closes() {
         "合法 owner 必须保留"
     );
 
-    // 模态窗口自己的输入正常分发。
     app.dispatch(
         modal,
         crate::event::Event::Input(crate::event::InputEvent::key_down(
@@ -1973,7 +1857,6 @@ fn a_modal_window_blocks_its_owners_input_until_it_closes() {
     );
     assert_eq!(app.drain_events().len(), 1, "模态窗口本身不受限");
 
-    // owner 的输入被模态拦截：观测队列也不投递（与原生 EnableWindow 语义一致）。
     app.dispatch(
         owner,
         crate::event::Event::Input(crate::event::InputEvent::key_down(
@@ -1986,11 +1869,9 @@ fn a_modal_window_blocks_its_owners_input_until_it_closes() {
         "owner 在模态期间不得收到输入事件"
     );
 
-    // 系统通知类事件不受模态影响。
     app.dispatch(owner, crate::event::Event::CloseRequested);
     assert_eq!(app.drain_events().len(), 1, "非输入事件必须仍然投递");
 
-    // 模态窗口关闭后 owner 输入恢复。
     app.close_window(modal);
     app.dispatch(
         owner,
@@ -2053,10 +1934,6 @@ fn closing_the_owner_cascades_to_owned_and_modal_windows() {
     assert!(app.window(grandchild).is_none(), "级联必须递归");
 }
 
-// ── E6（P1-E6）：窗口 chrome 的运行时 API ──────────────────────────────
-
-/// E6：`App::set_title` 写窗口参数（泵下一轮对账到原生窗口）并拒绝未知窗口；
-/// 同值写是 no-op（不产生额外的平台系统调用）。
 #[test]
 fn set_title_updates_the_window_and_rejects_unknown_windows() {
     let (_rt, mut app) = new_app();
@@ -2071,7 +1948,6 @@ fn set_title_updates_the_window_and_rejects_unknown_windows() {
         app.window(window).expect("窗口存在").options().title,
         "after"
     );
-    // 同值：仍是 Ok 且不改任何东西（幂等）。
     app.set_title(window, smol_str::SmolStr::new_static("after"))
         .expect("同值标题必须成功");
 
@@ -2084,8 +1960,6 @@ fn set_title_updates_the_window_and_rejects_unknown_windows() {
     );
 }
 
-/// E6：`App::request_window_control` 三端可见（去 `cfg(linux)`）：窗口存在性优先，其次是
-/// 平台能力判定；请求进入单槽，由平台泵取走执行。
 #[test]
 fn request_window_control_queues_supported_controls_and_rejects_unknown_windows() {
     use crate::window::{WindowControl, WindowResizeEdge};
@@ -2110,7 +1984,6 @@ fn request_window_control_queues_supported_controls_and_rejects_unknown_windows(
     );
     assert_eq!(app.take_window_control(), None, "取走后槽必须为空");
 
-    // 平台能力差异：Windows 没有全屏 / 程序化 move / resize；macOS 没有程序化 move / resize。
     let unsupported: &[(&str, WindowControl)] = if cfg!(windows) {
         &[
             ("fullscreen", WindowControl::ToggleFullscreen),
@@ -2144,10 +2017,8 @@ fn request_window_control_queues_supported_controls_and_rejects_unknown_windows(
             "capability 诊断名必须可 grep（期望含 {needle}）：{capability}"
         );
     }
-    // 被拒绝的控制不得留在槽里。
     assert_eq!(app.take_window_control(), None);
 
-    // 三端都支持的控制（Windows/macOS 的 Minimize/ToggleMaximize；Linux 全部）仍可入队。
     app.request_window_control(window, WindowControl::ToggleMaximize)
         .expect("ToggleMaximize 三端都支持");
     assert_eq!(
@@ -2156,8 +2027,6 @@ fn request_window_control_queues_supported_controls_and_rejects_unknown_windows(
     );
 }
 
-/// E6 / I10：非 macOS 的交通灯 API 必须**强类型**报错（setter）或如实返回 None（getter），
-/// 不得静默成功；未知窗口仍然优先。
 #[test]
 fn traffic_light_api_is_unsupported_off_macos() {
     let (_rt, mut app) = new_app();
@@ -2189,8 +2058,6 @@ fn traffic_light_api_is_unsupported_off_macos() {
 
     #[cfg(target_os = "macos")]
     {
-        // 建窗路径（AppKit）由平台层在 real run loop 里完成；headless 的 `App` 没有原生窗口，
-        // 这里只验证 API 契约的两端都存在（`None` 表示「尚未由平台写入」）。
         assert_eq!(app.traffic_light_inset(window), None);
     }
 }

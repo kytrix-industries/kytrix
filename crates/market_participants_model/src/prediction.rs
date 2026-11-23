@@ -1,16 +1,3 @@
-//! Event-scoped prediction-market market data.
-//!
-//! Prediction venues publish events rather than a stable instrument directory: an
-//! event owns a handful of options, each option is one outcome leg, and the
-//! tradable identity of a leg is a venue-native token that is discovered with the
-//! event. The model therefore keeps this vocabulary separate from the catalogued
-//! instrument model: a prediction leg still carries its canonical [`OutcomeLegRef`]
-//! and its [`VenueListingKey`], but nothing here is published as a catalog entry.
-//!
-//! The values are shared by the connector's protocol boundary and the widgets that
-//! draw an event, so they are plain data: no venue name, no endpoint and no HTTP
-//! shape appears in this module.
-
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -26,32 +13,23 @@ use crate::{
     outcome::{OutcomeLegRef, OutcomeSideId},
 };
 
-/// The stable identity of one prediction event on one route.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PredictionEventRef {
     #[serde(rename = "route")]
     pub route: VenueRoute,
-    /// The venue's own event identity.
-    ///
-    /// A Polymarket event id, or a HIP-4 question/outcome identity prefixed with
-    /// `q:` or `o:` so the two namespaces cannot collide.
     #[serde(rename = "native_event")]
     pub native_event: IdentifierValue,
 }
 
-/// One category a prediction selector offers.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PredictionCategory {
-    /// The stable category key used by filters and persisted selections.
     #[serde(rename = "key")]
     pub key: SmolStr,
-    /// The category name shown to a reader.
     #[serde(rename = "label")]
     pub label: SmolStr,
 }
 
 impl PredictionCategory {
-    /// Builds a category from its stable key and its display label.
     pub fn new(key: impl Into<SmolStr>, label: impl Into<SmolStr>) -> Self {
         Self {
             key: key.into(),
@@ -60,21 +38,14 @@ impl PredictionCategory {
     }
 }
 
-/// The stable identity of one market inside a prediction event.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PredictionMarketRef {
     #[serde(rename = "event")]
     pub event: PredictionEventRef,
-    /// The venue's own market identity.
     #[serde(rename = "native_market")]
     pub native_market: IdentifierValue,
 }
 
-/// One group of markets inside a prediction event.
-///
-/// A sports event publishes its markets in groups such as `moneyline`, `spreads`
-/// or `first_half_totals`; an event with one market publishes one group. The key
-/// is stable and filterable, the label is what a reader sees.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PredictionMarketGroup {
     #[serde(rename = "key")]
@@ -84,7 +55,6 @@ pub struct PredictionMarketGroup {
 }
 
 impl PredictionMarketGroup {
-    /// Builds a group from its stable key and display label.
     pub fn new(key: impl Into<SmolStr>, label: impl Into<SmolStr>) -> Self {
         Self {
             key: key.into(),
@@ -93,7 +63,6 @@ impl PredictionMarketGroup {
     }
 }
 
-/// One option as an event card draws it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionOptionCard {
     #[serde(rename = "market")]
@@ -106,7 +75,6 @@ pub struct PredictionOptionCard {
     pub probability: Option<Fraction>,
 }
 
-/// One event as a selector card draws it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionEventCard {
     #[serde(rename = "event")]
@@ -121,21 +89,16 @@ pub struct PredictionEventCard {
     pub volume: Option<Quantity>,
     #[serde(rename = "liquidity")]
     pub liquidity: Option<Quantity>,
-    /// At most six options, ordered by probability descending.
     #[serde(rename = "options")]
     pub options: Vec<PredictionOptionCard>,
-    /// How many options the event has beyond [`Self::options`].
     #[serde(rename = "remaining_options")]
     pub remaining_options: u16,
-    /// How many markets the event publishes.
     #[serde(rename = "market_count")]
     pub market_count: u16,
-    /// How many markets are not represented by [`Self::options`].
     #[serde(rename = "remaining_markets")]
     pub remaining_markets: u16,
 }
 
-/// One page of prediction events.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionEventsPage {
     #[serde(rename = "events")]
@@ -148,7 +111,6 @@ pub struct PredictionEventsPage {
     pub total: Option<u32>,
 }
 
-/// The native tradable identity of one prediction leg.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "native")]
 pub enum PredictionNativeLeg {
@@ -174,14 +136,12 @@ pub enum PredictionNativeLeg {
     },
 }
 
-/// One tradable side of one prediction market.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionLeg {
     #[serde(rename = "leg")]
     pub leg: OutcomeLegRef,
     #[serde(rename = "label")]
     pub label: SmolStr,
-    /// The latest probability the venue published with the event, when it did.
     #[serde(rename = "probability")]
     pub probability: Option<Fraction>,
     #[serde(rename = "listing")]
@@ -190,33 +150,26 @@ pub struct PredictionLeg {
     pub native: PredictionNativeLeg,
 }
 
-/// One market of a prediction event, with every side it publishes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionMarket {
     #[serde(rename = "market")]
     pub market: PredictionMarketRef,
-    /// The market's own question, shown when a reader picks a market.
     #[serde(rename = "question")]
     pub question: SmolStr,
-    /// The short label an event card uses for this market.
     #[serde(rename = "label")]
     pub label: SmolStr,
     #[serde(rename = "group")]
     pub group: PredictionMarketGroup,
-    /// Whether this is one of the event's headline markets.
     #[serde(rename = "headline")]
     pub headline: bool,
-    /// Whether the venue still lists this market as open for trading.
     #[serde(rename = "open")]
     pub open: bool,
-    /// The side that represents the market's first outcome.
     #[serde(rename = "default_leg")]
     pub default_leg: Option<OutcomeLegRef>,
     #[serde(rename = "legs")]
     pub legs: Vec<PredictionLeg>,
 }
 
-/// One event with every market and side it publishes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionEventView {
     #[serde(rename = "event")]
@@ -231,7 +184,6 @@ pub struct PredictionEventView {
     pub markets: Vec<PredictionMarket>,
 }
 
-/// One point of a probability series.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionPricePoint {
     #[serde(rename = "timestamp")]
@@ -240,7 +192,6 @@ pub struct PredictionPricePoint {
     pub probability: Fraction,
 }
 
-/// The probability history of one option.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionSeries {
     #[serde(rename = "leg")]
@@ -249,7 +200,6 @@ pub struct PredictionSeries {
     pub points: Vec<PredictionPricePoint>,
 }
 
-/// One price level of a prediction order book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionBookLevel {
     #[serde(rename = "price")]
@@ -258,7 +208,6 @@ pub struct PredictionBookLevel {
     pub size: Quantity,
 }
 
-/// One changed price level; a zero size removes the level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionBookLevelChange {
     #[serde(rename = "price")]
@@ -267,7 +216,6 @@ pub struct PredictionBookLevelChange {
     pub size: Quantity,
 }
 
-/// One complete prediction order book reading (REST snapshot or normalized state).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionOrderBook {
     #[serde(rename = "leg")]
@@ -284,7 +232,6 @@ pub struct PredictionOrderBook {
     pub timestamp: UnixMillis,
 }
 
-/// One incremental update of a prediction order book.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "update")]
 pub enum PredictionOrderBookUpdate {
@@ -322,12 +269,6 @@ pub enum PredictionOrderBookUpdate {
     },
 }
 
-/// The range a prediction series is read over.
-///
-/// The product offers these six ranges. The range decides both how far back the
-/// series reaches and how coarsely the venue samples it; a venue that states its
-/// span as an explicit timestamp pair, a preset name, or a candle count is the
-/// adapter's problem, not the caller's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PredictionRange {
     #[serde(rename = "hour_1")]
@@ -340,14 +281,12 @@ pub enum PredictionRange {
     Week1,
     #[serde(rename = "month_1")]
     Month1,
-    /// The whole life of the market.
     #[default]
     #[serde(rename = "all")]
     All,
 }
 
 impl PredictionRange {
-    /// Every range, in the order the range selector offers them.
     pub const ALL: [Self; 6] = [
         Self::Hour1,
         Self::Hour6,
@@ -357,8 +296,6 @@ impl PredictionRange {
         Self::All,
     ];
 
-    /// The span the range covers, in milliseconds; `None` for the whole life of
-    /// the market.
     pub const fn span_millis(self) -> Option<i64> {
         match self {
             Self::Hour1 => Some(3_600_000),
@@ -370,7 +307,6 @@ impl PredictionRange {
         }
     }
 
-    /// The sampling fidelity the chart asks for, in minutes.
     pub const fn fidelity_minutes(self) -> u16 {
         match self {
             Self::Hour1 => 1,

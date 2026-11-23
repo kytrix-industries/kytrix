@@ -1,11 +1,3 @@
-//! One dialled, authenticated quote socket, and the framing case that measures it.
-//!
-//! The socket is the suite's own: it dials the venue's published endpoint through the
-//! workspace's transport hub, authenticates with the password the token endpoint handed
-//! out, and records everything it read. The adapter's own connection layer is what the
-//! live suite cannot reach — it is crate-private — so this is how a case states what the
-//! venue does with the frames §4.2 describes.
-
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -23,37 +15,21 @@ use crate::{
     wire::{COMMAND_CODE_AUTH, Failure, FrameStats, Inbound, LOGIN_REFUSAL, refusal},
 };
 
-/// One dialled, authenticated quote socket, with everything it measured.
 pub struct LiveSocket {
     socket: network::transport::websocket::RawWebSocket,
     hub: Arc<network::transport::hub::TransportHub>,
     pub endpoint: Url,
-    /// The one-time password this socket authenticated with. Never printed.
     otp: String,
     next_request_id: u32,
     pub stats: FrameStats,
-    /// Every inbound frame this socket read, in arrival order, as
-    /// `(elapsed millis, header byte, command code, request id, frame length)`.
     pub trace: Vec<(u128, u8, u8, Option<u32>, usize)>,
-    /// The instant this socket recorded its first frame.
     opened: tokio::time::Instant,
-    /// Every push this socket received, kept in arrival order.
-    ///
-    /// A push is not correlated with any request, so it can arrive while a request
-    /// is still waiting for its own answer — a subscription's first push does, on
-    /// this venue: the snapshot is sent before the acknowledgement. A read loop that
-    /// only wanted its acknowledgement would therefore drop the very push the
-    /// subscription was about, so every read records pushes here even when the read
-    /// is looking for something else.
     pushes: Vec<Inbound>,
-    /// How many inbound frames this build decoded, for the framing case.
     pub inbound_decoded: usize,
-    /// Every request command code this socket sent, in order.
     pub commands_sent: Vec<u8>,
 }
 
 impl LiveSocket {
-    /// Dials the venue's quote socket and authenticates it.
     pub async fn connect(
         credentials: &Credentials,
         transport: crate::client::Transport,
@@ -102,7 +78,6 @@ impl LiveSocket {
         })
     }
 
-    /// Sends the AUTH frame and reads its acknowledgement (§4.4).
     pub async fn authenticate(&mut self) -> Result<Inbound, Failure> {
         let body = longbridge_proto::control::AuthRequest {
             token: self.otp.clone(),
@@ -136,7 +111,6 @@ impl LiveSocket {
         }
     }
 
-    /// Sends one command and reads the response with that id.
     pub async fn request_raw(&mut self, command_code: u8, body: &[u8]) -> Result<Inbound, Failure> {
         self.next_request_id += 1;
         let request_id = self.next_request_id;
@@ -163,7 +137,6 @@ impl LiveSocket {
         }
     }
 
-    /// Sends one request message and decodes its answer as `M`.
     pub async fn request<M: prost::Message + Default>(
         &mut self,
         command_code: u8,
@@ -176,7 +149,6 @@ impl LiveSocket {
             .map_err(|error| Failure::Malformed(format!("command {command_code}: {error}")))
     }
 
-    /// Writes one frame to the socket.
     async fn send_raw(&mut self, frame: Bytes, command: u8) -> Result<(), Failure> {
         self.commands_sent.push(command);
         self.socket
@@ -185,7 +157,6 @@ impl LiveSocket {
             .map_err(|error| Failure::Transport(error.to_string()))
     }
 
-    /// Reads one inbound frame before `deadline`.
     async fn read_frame(&mut self, deadline: tokio::time::Instant) -> Result<Inbound, Failure> {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -216,32 +187,16 @@ impl LiveSocket {
                 OpCode::Close => {
                     return Err(Failure::Transport("the venue closed the socket".to_owned()));
                 }
-                // A text frame is not part of this protocol, and a ping is answered
-                // by the client: neither is a frame this suite reads.
                 _ => continue,
             }
         }
     }
 
-    /// Reads everything the venue pushes until `deadline`, returning what arrived.
-    ///
-    /// **Everything already received counts.** This venue sends a subscription's
-    /// first push *before* the subscription's acknowledgement, so the push is read by
-    /// the request that was waiting for the acknowledgement; a drain that returned
-    /// only what it read itself would answer "no push" for every subscription that
-    /// pushed exactly one. A window that has already run out still reads — the venue
-    /// may send the push in the same instant it acknowledges — and the reads are
-    /// bounded by [`MAX_READ`] once it has.
     pub async fn drain_pushes(&mut self, until: tokio::time::Instant) -> Vec<Inbound> {
         while self.read_frame_raw(until).await.is_ok() {}
         std::mem::take(&mut self.pushes)
     }
 
-    /// Reads one frame, allowing the read to run past `deadline` by its own bound.
-    ///
-    /// Returns whether a frame arrived; every push it carried is already recorded.
-    /// The bound is `MAX_READ` once the window has run out, so the last read of a
-    /// window still consumes what the venue has already sent.
     async fn read_frame_raw(&mut self, deadline: tokio::time::Instant) -> Result<(), Failure> {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let bound = if remaining.is_zero() {
@@ -271,18 +226,14 @@ impl LiveSocket {
                 Ok(())
             }
             OpCode::Close => Err(Failure::Transport("the venue closed the socket".to_owned())),
-            // A text frame is not part of this protocol, and a ping is answered by
-            // the client: neither is a frame this suite reads.
             _ => Ok(()),
         }
     }
 
-    /// Releases the transport the socket was dialled through.
     pub async fn shutdown(&self) {
         self.hub.shutdown().await;
     }
 
-    /// The framing invariants every inbound frame of this socket satisfied.
     pub fn assert_framing(&self, case: &str) {
         assert!(
             self.stats.length_mismatches.is_empty(),

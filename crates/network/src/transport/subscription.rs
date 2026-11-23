@@ -1,5 +1,3 @@
-//! Bounded logical subscriptions with observable lifecycle state.
-
 use std::sync::Arc;
 
 use tokio::sync::{Notify, mpsc, watch};
@@ -7,7 +5,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::transport::error::TransportError;
 
-/// Observable lifecycle state for a logical subscription.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscriptionStatus {
     Connecting,
@@ -66,7 +63,6 @@ impl SubscriptionState {
     }
 }
 
-/// The actor-facing half of a bounded logical subscription.
 pub struct SubscriptionPublisher<T> {
     sender: mpsc::Sender<T>,
     state: Arc<SubscriptionState>,
@@ -81,10 +77,6 @@ impl<T> SubscriptionPublisher<T> {
         self.state.reconnecting();
     }
 
-    /// Publishes without waiting on a slow consumer.
-    ///
-    /// A full queue atomically retires this logical subscriber; it does not
-    /// block or affect any other subscriber on the physical session.
     pub fn try_send(&self, value: T) -> Result<(), SubscriptionSendError<T>> {
         if self.state.cancellation.is_cancelled() {
             return Err(SubscriptionSendError::Closed(value));
@@ -126,14 +118,12 @@ impl<T> Drop for SubscriptionPublisher<T> {
     }
 }
 
-/// The reason a non-blocking subscription publish failed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SubscriptionSendError<T> {
     SlowSubscriber(T),
     Closed(T),
 }
 
-/// A cancellation-aware, bounded stream of typed subscription values.
 pub struct Subscription<T> {
     receiver: mpsc::Receiver<T>,
     state: Arc<SubscriptionState>,
@@ -141,15 +131,12 @@ pub struct Subscription<T> {
     terminal_delivered: bool,
 }
 
-/// Creates the actor and consumer halves of a bounded logical subscription.
 pub fn subscription_channel<T>(
     capacity: usize,
 ) -> Result<(SubscriptionPublisher<T>, Subscription<T>), TransportError> {
     subscription_channel_inner(capacity, None)
 }
 
-/// Creates a bounded subscription whose consumer wakes a cleanup task when it
-/// is retired.
 pub fn subscription_channel_with_wake<T>(
     capacity: usize,
     cleanup_wake: Arc<Notify>,
@@ -188,7 +175,6 @@ fn subscription_channel_inner<T>(
 }
 
 impl<T> Subscription<T> {
-    /// Receives the next value or the subscription's typed terminal error.
     pub async fn recv(&mut self) -> Result<T, TransportError> {
         loop {
             match self.status().clone() {
@@ -222,7 +208,6 @@ impl<T> Subscription<T> {
         }
     }
 
-    /// Cancels the subscription and waits for its actor to finish cleanup.
     pub async fn close(mut self) -> Result<(), TransportError> {
         self.receiver.close();
         self.state.transition(SubscriptionStatus::Closing);
@@ -250,13 +235,10 @@ impl<T> Subscription<T> {
         self.status.clone()
     }
 
-    /// Observes the monotonically increasing physical-session reconnect epoch.
     pub fn observe_reconnect_epoch(&self) -> watch::Receiver<u64> {
         self.state.reconnect_epoch.subscribe()
     }
 
-    /// Takes an already-published value without awaiting, for callers asserting
-    /// synchronous publish and replay semantics.
     #[cfg(feature = "test-support")]
     pub fn try_recv_for_test(&mut self) -> Result<T, mpsc::error::TryRecvError> {
         self.receiver.try_recv()

@@ -25,7 +25,6 @@ use crate::{
     workspace::WorkspacesConfig,
 };
 
-/// Wallet account currently associated with this installation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountConfig {
     pub user_id: String,
@@ -33,14 +32,12 @@ pub struct AccountConfig {
     pub wallet_kind: AccountWalletKind,
 }
 
-/// Wallet family that owns [`AccountConfig::wallet_address`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountWalletKind {
     Ethereum,
     Solana,
 }
 
-/// Application display language.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Language {
     #[default]
@@ -61,65 +58,39 @@ impl Language {
     }
 }
 
-/// Application color appearance preference.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Appearance {
-    /// Always use the light style.
     Light,
-    /// Always use the dark style.
     Dark,
-    /// Follow the operating system window appearance.
     #[default]
     System,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-/// Complete application settings snapshot.
 pub struct Config {
-    /// Application color appearance preference.
     #[serde(default)]
     pub appearance: Appearance,
-    /// Application display language.
     #[serde(default)]
     pub language: Language,
-    /// Preferences about the interface itself. A file without this section draws the
-    /// interface the way a fresh installation does.
     #[serde(default)]
     pub ui: UiConfig,
-    /// The time zone every data timestamp is displayed in.
     #[serde(default)]
     pub data_time_zone: DataTimeZone,
-    /// Wallet account currently associated with this installation.
     #[serde(default)]
     pub account: Option<AccountConfig>,
-    /// DiceBear SVG for the current wallet account.
     #[serde(default)]
     pub avatar: Option<String>,
-    /// Named SOCKS5 proxies available to network capability settings.
     pub proxies: BTreeMap<SmolStr, ProxyConfig>,
-    /// Default outbound used by targets without an override.
     pub proxy_default: ProxyRoute,
-    /// Per-target outbound overrides. Absent keys follow [`Self::proxy_default`].
     #[serde(
         serialize_with = "serialize_proxy_applications",
         deserialize_with = "deserialize_proxy_applications"
     )]
     pub proxy_applications: BTreeMap<ServiceTarget, ProxyRoute>,
-    /// Every configured venue, keyed by venue.
-    ///
-    /// Required, and complete: a file that does not name every venue this build
-    /// speaks is not this shape and is refused whole at decode time, so a reader
-    /// never has to answer what a missing venue means. The same holds for the
-    /// scopes a venue's own row names: they must be the scopes this build addresses
-    /// statically.
     #[serde(rename = "venues", deserialize_with = "deserialize_venues")]
     pub venues: BTreeMap<VenueId, VenueSettings>,
-    /// Workspaces of this installation. A file without them has none, which is
-    /// what a first start looks like.
     #[serde(default)]
     pub workspaces: WorkspacesConfig,
-    /// Where the local translation model is stored. A file without this section names the
-    /// models directory beside the settings file, which is what a first start looks like.
     #[serde(default)]
     pub translation: TranslationConfig,
     #[serde(skip)]
@@ -187,35 +158,25 @@ where
     Ok(decoded)
 }
 
-/// A proxy replacement could not preserve the proxy catalog's invariants.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ReplaceProxyError {
-    /// The proxy being replaced is absent from the catalog.
     #[error("proxy {name:?} does not exist")]
     SourceMissing { name: SmolStr },
-    /// Another proxy already owns the requested replacement name.
     #[error("proxy {name:?} already exists")]
     TargetExists { name: SmolStr },
-    /// The requested name collides with a reserved route token.
     #[error("proxy {name:?} uses a reserved name")]
     ReservedName { name: SmolStr },
 }
 
-/// Route-value prefixes reserved for settings encoding (`@inherit`, `@direct`, …).
 pub fn proxy_name_is_reserved(name: &str) -> bool {
     name.starts_with('@')
 }
 
 impl Config {
-    /// Replaces the runtime route generations stamped onto this snapshot.
-    ///
-    /// Only the settings manager stamps generations; every other writer leaves
-    /// them untouched so unchanged routing keeps its resolved connections.
     pub fn set_network_generations(&mut self, generations: NetworkRuntimeGenerations) {
         self.network_generations = generations;
     }
 
-    /// Creates the network-only view of this application snapshot.
     pub fn network_config(&self) -> NetworkConfig {
         let route_generations = self.network_generations.venues.clone();
         let service_routes = self
@@ -227,9 +188,6 @@ impl Config {
             proxies: self.proxies.clone(),
             proxy_default: self.proxy_default.clone(),
             proxy_applications: service_routes,
-            // A venue that names no line of its own is left out rather than
-            // pinned to a placeholder route: the network snapshot answers the
-            // default line for exactly the venues it holds no route for.
             venue_routes: self
                 .venues
                 .iter()
@@ -241,23 +199,10 @@ impl Config {
         }
     }
 
-    /// Returns one venue's settings, or nothing for a venue this build does not
-    /// speak.
-    ///
-    /// A venue this build *does* speak always answers: the decoded shape covers the
-    /// built-in list by construction, so absence here means "this build does not
-    /// speak that venue" rather than a gap a caller has to defend against. Nothing is
-    /// defaulted in: a caller that wanted the built-in table asks
-    /// [`crate::market_participants::settings::default_venues`].
     pub fn venue(&self, venue: &VenueId) -> Option<&VenueSettings> {
         self.venues.get(venue)
     }
 
-    /// Replaces the outbound line one venue's requests take; `None` makes the venue
-    /// follow the document's default line again.
-    ///
-    /// Returns whether the venue is configured at all: a venue this build does not
-    /// speak has no row to edit, and editing one is not this shape.
     pub fn set_venue_proxy(&mut self, venue: &VenueId, proxy: Option<ProxyRoute>) -> bool {
         let Some(settings) = self.venues.get_mut(venue) else {
             return false;
@@ -266,11 +211,6 @@ impl Config {
         true
     }
 
-    /// Replaces the region an OKX account belongs to.
-    ///
-    /// Returns whether the venue is configured as OKX at all: the region is a
-    /// property of that venue alone, so a row of another shape has nowhere to put
-    /// one.
     pub fn set_okx_region(&mut self, venue: &VenueId, region: OkxRegion) -> bool {
         let Some(VenueSettings::Okx(settings)) = self.venues.get_mut(venue) else {
             return false;
@@ -279,7 +219,6 @@ impl Config {
         true
     }
 
-    /// Replaces the Gamma host Polymarket's event directory is read from.
     pub fn set_polymarket_gamma(
         &mut self,
         venue: &VenueId,
@@ -292,7 +231,6 @@ impl Config {
         true
     }
 
-    /// Replaces the CLOB host Polymarket's prices are read from.
     pub fn set_polymarket_clob(
         &mut self,
         venue: &VenueId,
@@ -305,7 +243,6 @@ impl Config {
         true
     }
 
-    /// Replaces the stream host Polymarket's CLOB publishes on.
     pub fn set_polymarket_websocket(
         &mut self,
         venue: &VenueId,
@@ -318,11 +255,6 @@ impl Config {
         true
     }
 
-    /// Replaces the region a Longbridge account belongs to.
-    ///
-    /// Returns whether the venue is configured as Longbridge at all: the region is a
-    /// property of that venue alone, so a row of another shape has nowhere to put
-    /// one.
     pub fn set_longbridge_region(&mut self, venue: &VenueId, region: LongbridgeRegion) -> bool {
         let Some(VenueSettings::Longbridge(settings)) = self.venues.get_mut(venue) else {
             return false;
@@ -331,14 +263,6 @@ impl Config {
         true
     }
 
-    /// Replaces one Binance market's origin choices.
-    ///
-    /// Returns whether the venue holds a Binance row that publishes `market` *and* both
-    /// choices are ones `market` itself is reached on: the choices belong to that market
-    /// alone, so a row of another shape, a market the row does not configure, or its
-    /// sibling's host has nowhere to put them. A choice its own market does not publish is
-    /// refused here for the same reason a file naming one is refused at decode — a spot
-    /// request sent to the futures API is a request to the wrong product.
     pub fn set_binance_market_origins(
         &mut self,
         venue: &VenueId,
@@ -360,10 +284,6 @@ impl Config {
         true
     }
 
-    /// Replaces the address HyperCore is reached on.
-    ///
-    /// Returns whether the venue holds a HyperCore row at all: the address belongs
-    /// to that venue alone.
     pub fn set_hyperliquid_origins(
         &mut self,
         venue: &VenueId,
@@ -378,11 +298,6 @@ impl Config {
         true
     }
 
-    /// Replaces one Binance market's credentials.
-    ///
-    /// Returns whether the venue holds a Binance row at all: the set belongs to that
-    /// market alone, so a row of another shape has nowhere to put it. `None` clears that
-    /// market and leaves its sibling exactly as it was.
     pub fn set_binance_market_credentials(
         &mut self,
         venue: &VenueId,
@@ -396,10 +311,6 @@ impl Config {
         true
     }
 
-    /// Replaces OKX's credentials.
-    ///
-    /// Returns whether the venue is configured as OKX at all: the set belongs to that
-    /// venue alone, so a row of another shape has nowhere to put it.
     pub fn set_okx_credentials(
         &mut self,
         venue: &VenueId,
@@ -412,10 +323,6 @@ impl Config {
         true
     }
 
-    /// Replaces HyperCore's credentials.
-    ///
-    /// Returns whether the venue is configured as HyperCore at all: the set belongs to that
-    /// venue alone, so a row of another shape has nowhere to put it.
     pub fn set_hyperliquid_credentials(
         &mut self,
         venue: &VenueId,
@@ -428,10 +335,6 @@ impl Config {
         true
     }
 
-    /// Replaces Longbridge's credentials.
-    ///
-    /// Returns whether the venue is configured as Longbridge at all: the set belongs to that
-    /// venue alone, so a row of another shape has nowhere to put it.
     pub fn set_longbridge_credentials(
         &mut self,
         venue: &VenueId,
@@ -444,7 +347,6 @@ impl Config {
         true
     }
 
-    /// Returns the process-local generation of one venue's proxy decision.
     pub fn network_route_generation(&self, venue: &VenueId) -> NetworkRouteGeneration {
         self.network_generations
             .venues
@@ -453,11 +355,6 @@ impl Config {
             .unwrap_or(self.network_generations.default_route)
     }
 
-    /// Removes a proxy and every named binding to its name.
-    ///
-    /// A venue that named it is a binding like any other: leaving one pointing at
-    /// a removed entry would fail every request of that venue, which is what the
-    /// reset to the default line avoids.
     pub fn remove_proxy(&mut self, name: &str) -> Option<ProxyConfig> {
         let removed = self.proxies.remove(name)?;
 
@@ -479,10 +376,6 @@ impl Config {
         Some(removed)
     }
 
-    /// Replaces a proxy and, when renamed, updates every named route binding.
-    ///
-    /// The source and target names are validated before any mutation, so an
-    /// error leaves the complete configuration unchanged.
     pub fn replace_proxy(
         &mut self,
         old_name: &str,
@@ -523,14 +416,6 @@ impl Config {
         Ok(())
     }
 
-    /// Effective outbound choice for one Kytrix service after applying the
-    /// default line.
-    ///
-    /// Named for its subject rather than sharing a name with the venue-keyed
-    /// accessor of the network projection: a service target is routed by
-    /// `proxy_applications`, a venue by the line its own configuration names or by
-    /// the default line it names none of, and that answer is read through
-    /// [`Self::network_config`].
     pub fn service_proxy_route_for(&self, target: &ServiceTarget) -> ProxyRoute {
         self.proxy_applications
             .get(target)
@@ -538,24 +423,10 @@ impl Config {
             .unwrap_or_else(|| self.proxy_default.clone())
     }
 
-    /// Returns every configuration item `previous` and `self` disagree on.
-    ///
-    /// The comparison follows the hand-written `PartialEq` of every nested
-    /// settings type: the runtime generations are not settings, and the
-    /// test-support `bindings` of a venue row is not settings either. The
-    /// workspaces are not reported because nothing outside their single writer
-    /// reads them, the sidebar state because the main window reads it rather than a
-    /// subscriber, and the translation settings are not reported because the
-    /// translator reads them when it is called.
-    ///
-    /// The destructuring is exhaustive on purpose: a field added to [`Config`]
-    /// is a compile error here until it is classified as reported or ignored.
     pub fn changes_since(&self, previous: &Self) -> ConfigChangeSet {
         let Config {
             appearance: previous_appearance,
             language: previous_language,
-            // The sidebar state is drawn by the main window and read by nothing that
-            // subscribes to a change: a UI-only write must not wake a single subscriber.
             ui: UiConfig { .. },
             data_time_zone: previous_data_time_zone,
             account: previous_account,
@@ -564,15 +435,8 @@ impl Config {
             proxy_default: previous_proxy_default,
             proxy_applications: previous_proxy_applications,
             venues: previous_venues,
-            // The workspaces have one writer and no external reader: a layout
-            // write must not wake a single subscriber. The field is still named
-            // rather than matched with `_`, which the workspace forbids.
             workspaces: WorkspacesConfig { .. },
-            // The translator reads these settings when it is called, so a change
-            // needs no event of its own.
             translation: TranslationConfig { .. },
-            // Generations are runtime identity, not settings: they never take
-            // part in a diff (see `PartialEq for Config`).
             network_generations: NetworkRuntimeGenerations { .. },
         } = previous;
 
@@ -698,19 +562,12 @@ mod tests {
         VenueId::from_name(name).expect("the venue should be canonical")
     }
 
-    /// A settings snapshot whose venue map holds no row at all.
-    ///
-    /// The decoded shape covers every venue this build speaks, so the only way a
-    /// venue has no row is a configuration that was taken apart by hand — which is
-    /// what a writer has to defend against.
     fn without_rows() -> Config {
         let mut config = Config::default();
         config.venues.clear();
         config
     }
 
-    /// The name of the line one venue names for itself, or `None` while it names
-    /// none — and therefore follows the default line.
     fn venue_named_route(config: &Config, venue: &VenueId) -> Option<SmolStr> {
         let route = config.venue(venue)?.proxy()?;
         route.named_name().map(SmolStr::new)
@@ -721,8 +578,6 @@ mod tests {
         }
     }
 
-    /// Runtime generations that differ from [`NetworkRuntimeGenerations::default`]
-    /// in every field.
     fn different_generations() -> NetworkRuntimeGenerations {
         NetworkRuntimeGenerations {
             default_route: NetworkRouteGeneration::new(7),
@@ -752,8 +607,6 @@ mod tests {
         }
     }
 
-    /// The configured venue section: every venue with the addresses it is reached on
-    /// and, where an operator wrote them, its credentials.
     fn configured_venues() -> BTreeMap<VenueId, VenueSettings> {
         let mut venues = default_venues();
         {
@@ -792,7 +645,6 @@ mod tests {
                 secret_key: SmolStr::new_static("okx-secret-key"),
                 passphrase: SmolStr::new_static("okx-passphrase"),
             });
-            // An operator-chosen region: the shape the settings interface edits.
             okx.region = OkxRegion::Europe;
         }
         {
@@ -819,7 +671,6 @@ mod tests {
                 app_secret: SmolStr::new_static("longbridge-app-secret"),
                 access_token: SmolStr::new_static("longbridge-access-token"),
             });
-            // An operator-chosen region: the shape the settings interface edits.
             longbridge.region = LongbridgeRegion::China;
         }
         venues
@@ -846,9 +697,6 @@ mod tests {
         config
     }
 
-    /// A fresh installation configures every venue this build speaks, on the
-    /// addresses the venues publish and with no credentials: the venue list is an
-    /// invariant of the shape rather than something the operator writes first.
     #[test]
     fn default_should_configure_every_built_in_venue() {
         let config = Config::default();
@@ -879,8 +727,6 @@ mod tests {
         );
     }
 
-    /// The venue list is required: a configuration that omits a venue this build
-    /// speaks is not this shape, and is refused rather than completed.
     #[test]
     fn a_configuration_without_venues_is_refused() {
         let mut json = serde_json::to_value(Config::default()).expect("config should serialize");
@@ -894,8 +740,6 @@ mod tests {
         );
     }
 
-    /// One venue dropped from an otherwise complete file is refused too: the
-    /// invariant is per venue, not "the key exists".
     #[test]
     fn a_configuration_missing_a_built_in_venue_is_refused() {
         let mut json = serde_json::to_value(Config::default()).expect("config should serialize");
@@ -916,8 +760,6 @@ mod tests {
         );
     }
 
-    /// A venue this build does not speak is not this shape either: it would be a
-    /// row nothing can route, authenticate or draw.
     #[test]
     fn a_configuration_naming_an_unknown_venue_is_refused() {
         let mut json = serde_json::to_value(Config::default()).expect("config should serialize");
@@ -936,9 +778,6 @@ mod tests {
         );
     }
 
-    /// The origin rows of one venue are the scopes that venue publishes, and a row
-    /// for a scope this build does not route is refused: a scope the venue deploys
-    /// at runtime is never a configuration key.
     #[test]
     fn a_configuration_naming_a_scope_the_build_does_not_address_is_refused() {
         let mut json = serde_json::to_value(Config::default()).expect("config should serialize");
@@ -968,8 +807,6 @@ mod tests {
         );
     }
 
-    /// One market's address choices are edited apart from its sibling's, and both
-    /// keep the address the other market publishes.
     #[test]
     fn a_market_is_configured_apart_from_its_sibling() {
         let mut config = Config::default();
@@ -994,14 +831,10 @@ mod tests {
             "the sibling market keeps the address it publishes"
         );
 
-        // A venue row of another shape has nowhere to put a Binance market's
-        // choices, and neither has a venue this build does not speak.
         assert!(!config.set_binance_market_origins(&venue("okx"), BinanceMarket::Spot, &spot));
         let mut without_rows = without_rows();
         assert!(!without_rows.set_binance_market_origins(&binance, BinanceMarket::Spot, &spot));
 
-        // A market reached on its sibling's host is nothing to write: the futures API is
-        // not an address the spot API answers on, whatever the venue publishes elsewhere.
         let before = config.venue(&binance).cloned();
         assert!(
             !config.set_binance_market_origins(
@@ -1021,8 +854,6 @@ mod tests {
         );
     }
 
-    /// The OKX region is one value of the venue's own row: choosing it moves every
-    /// scope of the venue, and no address is stored beside it.
     #[test]
     fn an_okx_region_moves_every_scope_of_the_venue() {
         let mut config = Config::default();
@@ -1055,8 +886,6 @@ mod tests {
         assert!(!config.set_okx_region(&venue("binance"), OkxRegion::Europe));
     }
 
-    /// The Longbridge region is one value of the venue's own row: choosing it moves the
-    /// venue's scope, and no address is stored beside it.
     #[test]
     fn a_longbridge_region_moves_the_scope_of_the_venue() {
         let mut config = Config::default();
@@ -1091,8 +920,6 @@ mod tests {
         assert!(!config.set_longbridge_region(&venue("okx"), LongbridgeRegion::Global));
     }
 
-    /// Longbridge's credential set is written into the venue's own row and nowhere else:
-    /// a set of another venue's shape is not a value this row has.
     #[test]
     fn a_longbridge_credential_set_lands_in_the_venue_that_stores_it() {
         let mut config = Config::default();
@@ -1148,8 +975,6 @@ mod tests {
         );
     }
 
-    /// HyperCore's two addresses are one choice of each kind, and the row stores
-    /// both.
     #[test]
     fn hypercore_stores_the_one_address_of_each_kind() {
         let mut config = Config::default();
@@ -1178,8 +1003,6 @@ mod tests {
         ));
     }
 
-    /// One Binance market's credential set lands in that market, and each market keeps
-    /// the set its sibling's writes never touch.
     #[test]
     fn a_binance_market_credential_set_lands_in_that_market() {
         let mut config = Config::default();
@@ -1255,8 +1078,6 @@ mod tests {
         );
     }
 
-    /// A credential set of one market is what signs that market's requests: the two
-    /// sets of one venue are validated apart.
     #[test]
     fn each_binance_market_validates_its_own_credentials() {
         let mut config = Config::default();
@@ -1305,8 +1126,6 @@ mod tests {
         );
     }
 
-    /// Credentials and addresses are stored per venue, and one venue is one key in
-    /// the persisted file.
     #[test]
     fn venue_credentials_and_origins_should_be_stored_per_venue() {
         let config = Config {
@@ -1347,8 +1166,6 @@ mod tests {
         );
     }
 
-    /// A file written before the translation settings existed has no section for them, which
-    /// is the same state as a fresh installation: models are stored beside the settings file.
     #[test]
     fn a_file_without_translation_settings_should_name_the_default_directory() {
         let mut json = serde_json::to_value(Config::default()).expect("config should serialize");
@@ -1369,9 +1186,6 @@ mod tests {
         );
     }
 
-    /// A venue's row carries exactly the settings its own venue has: no scope
-    /// dimension beyond the markets a venue publishes, and no address at all where
-    /// the venue publishes a region instead.
     #[test]
     fn a_venue_row_carries_only_its_own_settings() {
         let config = Config {
@@ -1431,15 +1245,6 @@ mod tests {
         );
     }
 
-    /// A file that carries only the shape this build replaced — no venues, or a
-    /// venue keyed by scope with a default origin — is refused whole, which is what
-    /// resets it.
-    ///
-    /// The refused part of the second file is that its row names *fewer* origins than the venue
-    /// publishes — the superseded shape kept one address per scope and a default beside them,
-    /// where this one keeps a choice per market and both markets. A key this build does not know
-    /// is ignored rather than read, so `default_origin` beside a complete row would decode: what
-    /// makes the old file unreadable is what it is missing, not what it left behind.
     #[test]
     fn the_superseded_venue_shape_is_refused() {
         let mut old = serde_json::to_value(Config::default()).expect("config should serialize");
@@ -1472,9 +1277,6 @@ mod tests {
             "the scope-keyed venue shape is not this shape"
         );
 
-        // The refusal is the missing market, not the keys the old shape left behind: a row that
-        // names both markets and still carries a `default_origin` is a file that holds everything
-        // this build reads, and the key it no longer has is not what reaching the venue turns on.
         let mut complete =
             serde_json::to_value(Config::default()).expect("config should serialize");
         complete["venues"]["binance"]["default_origin"] = json!("https://api.binance.com/");
@@ -1551,10 +1353,6 @@ mod tests {
         assert!(serde_json::from_value::<Config>(json).is_err());
     }
 
-    /// A venue that names no line of its own stores no line: a fresh installation
-    /// writes the key as nothing rather than leaving it out, so a reader never has
-    /// to answer what an absent field means. A file that leaves the key out all the
-    /// same says the same thing, which is how an optional field is read.
     #[test]
     fn a_venue_that_names_no_line_should_store_none() {
         let serialized =
@@ -1712,8 +1510,6 @@ mod tests {
         assert_eq!(decoded.proxy_applications.len(), 1);
     }
 
-    /// A venue that names no line of its own is routed by the document's default
-    /// line, exactly as a Kytrix service without an override is.
     #[test]
     fn a_venue_follows_the_default_route_until_it_has_one_of_its_own() {
         let mut config = Config::default();
@@ -1780,9 +1576,6 @@ mod tests {
         assert!(config.proxy_applications.is_empty());
     }
 
-    /// A venue bound to a removed entry is a binding like any other: the line it
-    /// named is gone, so the venue follows the default line again rather than
-    /// keeping a route nothing can resolve or falling back to a line of its own.
     #[test]
     fn remove_proxy_should_put_a_bound_venue_back_on_the_default_line() {
         let mut config = configured_settings();
@@ -2038,8 +1831,6 @@ mod tests {
         assert_eq!(decoded.language, Language::ZhCn);
     }
 
-    /// A file written before the sidebar state existed holds the full sidebar, which is
-    /// what a first start draws: the section is absent rather than filled with defaults.
     #[test]
     fn a_config_without_ui_should_decode_as_the_full_sidebar() {
         let mut json = serde_json::to_value(configured_settings())
@@ -2062,8 +1853,6 @@ mod tests {
         assert_eq!(Config::default().data_time_zone, DataTimeZone::UTC);
     }
 
-    /// The setting stores the number of hours it adds to UTC, and what is written
-    /// back is what a reader converts by.
     #[test]
     fn data_time_zone_should_round_trip_the_stored_hours() {
         let config = Config {
@@ -2079,8 +1868,6 @@ mod tests {
         );
     }
 
-    /// A file written before the setting existed holds every other value and no
-    /// offset; it reads as UTC, which is the clock those timestamps were drawn in.
     #[test]
     fn legacy_config_without_data_time_zone_should_use_utc() {
         let mut json = serde_json::to_value(configured_settings())
@@ -2095,8 +1882,6 @@ mod tests {
         assert_eq!(decoded.data_time_zone, DataTimeZone::UTC);
     }
 
-    /// An offset no real zone is at is not this shape, exactly as a venue this
-    /// build does not speak is not: the value is refused rather than clamped.
     #[test]
     fn a_data_time_zone_outside_the_offered_range_should_be_refused() {
         for hours in [-13, 15] {
@@ -2111,8 +1896,6 @@ mod tests {
         }
     }
 
-    /// The manager persists a candidate only when it differs from what it holds, so
-    /// an equality that ignored the display time zone would silently drop the edit.
     #[test]
     fn config_equality_should_notice_a_data_time_zone_change() {
         let other = Config {
@@ -2123,8 +1906,6 @@ mod tests {
         assert_ne!(Config::default(), other);
     }
 
-    /// A first start has no workspaces, which is what makes the workspace list
-    /// create its default one.
     #[test]
     fn a_config_without_workspaces_should_decode_as_none() {
         let mut json = serde_json::to_value(configured_settings())
@@ -2141,9 +1922,6 @@ mod tests {
         assert_eq!(decoded.workspaces.active, None);
     }
 
-    /// The manager persists a candidate only when it differs from what it holds,
-    /// so an equality that ignored workspaces would silently drop every workspace
-    /// change.
     #[test]
     fn config_equality_should_notice_a_workspace_change() {
         let with_workspace = |active: &'static str| Config {
@@ -2167,8 +1945,6 @@ mod tests {
         assert_ne!(Config::default(), with_workspace("Workspace 1"));
     }
 
-    /// The manager persists a candidate only when it differs from what it holds, so an
-    /// equality that ignored the sidebar state would silently drop the state change.
     #[test]
     fn config_equality_should_notice_a_sidebar_change() {
         let hidden = Config {
@@ -2190,8 +1966,6 @@ mod tests {
         );
     }
 
-    /// The manager persists a candidate only when it differs from what it holds, so
-    /// an equality that ignored a venue's own settings would silently drop the edit.
     #[test]
     fn config_equality_should_notice_a_venue_change() {
         let configured = Config {
@@ -2337,8 +2111,6 @@ mod tests {
         );
     }
 
-    /// A scalar change carries the new value, not the old one and not merely the
-    /// fact that something moved: that value is what a subscriber projects.
     #[test]
     fn a_changed_scalar_should_be_reported_with_its_new_value() {
         let previous = Config {
@@ -2395,8 +2167,6 @@ mod tests {
         assert!(config.changes_since(&config).is_empty());
     }
 
-    /// The account and its avatar are one domain: changing either, or both, is one
-    /// account change and nothing else.
     #[test]
     fn an_account_and_an_avatar_should_report_one_account_change() {
         let previous = configured_settings();
@@ -2453,9 +2223,6 @@ mod tests {
         );
     }
 
-    /// The proxy catalog is reported by name once per entry: an edit keeps the
-    /// name, an addition names the new entry, a removal names the old one, and a
-    /// rename is an addition and a removal, so it names both.
     #[test]
     fn a_proxy_catalog_edit_should_report_the_name_once() {
         let mut previous = Config::default();
@@ -2584,9 +2351,6 @@ mod tests {
         );
     }
 
-    /// A venue is reported once however its row moved: an added or removed row,
-    /// a credential, an origin choice and its own line are all settings of the
-    /// same venue.
     #[test]
     fn a_venue_edit_should_report_the_venue_once() {
         let previous = configured_settings();
@@ -2674,8 +2438,6 @@ mod tests {
         );
     }
 
-    /// The workspaces have one writer and no external reader: a layout write is a
-    /// real configuration difference that wakes nobody.
     #[test]
     fn a_workspace_only_change_should_report_nothing() {
         let previous = configured_settings();
@@ -2692,8 +2454,6 @@ mod tests {
         assert_eq!(changed.changes_since(&previous), ConfigChangeSet::default());
     }
 
-    /// The sidebar state is drawn by the main window and has no subscriber of its own: a
-    /// state write is a real configuration difference that wakes nobody.
     #[test]
     fn a_sidebar_only_change_should_report_nothing() {
         let previous = configured_settings();
@@ -2704,13 +2464,6 @@ mod tests {
         assert_eq!(changed.changes_since(&previous), ConfigChangeSet::default());
     }
 
-    /// Every settings field the change set covers can reach it: a field that
-    /// could not would be one the exhaustive destructuring names as ignored, and
-    /// this is the runtime guard on that classification.
-    ///
-    /// The ignored settings are checked apart: a workspace write and a sidebar write
-    /// have their own tests, and the network generations are runtime identity that
-    /// `PartialEq` does not compare at all.
     #[test]
     fn every_reported_settings_difference_should_report_something() {
         let previous = configured_settings();

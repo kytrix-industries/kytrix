@@ -1,10 +1,3 @@
-//! Private value objects shared by the market-participants capabilities.
-//!
-//! These types are owned by the capability boundary. Protocol DTOs may use them
-//! internally, but they are not the public model: an order quantity, a price and
-//! a quantity are `market_participants_model` values, and this module never defines a second
-//! unit vocabulary of its own.
-
 use std::{fmt, num::NonZeroU8, str::FromStr};
 
 use market_participants_model::{
@@ -64,7 +57,6 @@ macro_rules! identifier {
 identifier!(PositionId, "position ID");
 identifier!(AccountTradeId, "account trade ID");
 
-/// API namespace used to address a market-participant order.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -74,7 +66,6 @@ pub enum OrderRoute {
     Algo,
 }
 
-/// Market-participant order identity including its API namespace.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct OrderId {
     value: SmolStr,
@@ -132,14 +123,12 @@ impl<'de> Deserialize<'de> for OrderId {
     }
 }
 
-/// Margin accounting mode for a perpetual position or order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MarginMode {
     Isolated,
     Cross,
 }
 
-/// Account-wide perpetual position mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PositionMode {
     #[default]
@@ -147,7 +136,6 @@ pub enum PositionMode {
     Hedge,
 }
 
-/// Price source used to trigger a conditional order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TriggerPriceKind {
     Last,
@@ -155,7 +143,6 @@ pub enum TriggerPriceKind {
     Index,
 }
 
-/// Current lifecycle state of an order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
     Pending,
@@ -167,7 +154,6 @@ pub enum OrderStatus {
     Expired,
 }
 
-/// Market-participant time-in-force instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimeInForce {
     GoodTillCancelled,
@@ -177,10 +163,6 @@ pub enum TimeInForce {
     GoodTillDate(UnixMillis),
 }
 
-/// The direction Hyperliquid reports for one fill.
-///
-/// The venue's own spelling is the wire value; it is not a side, because it also
-/// distinguishes opening from closing an existing position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HyperliquidFillDirection {
     #[serde(rename = "Open Long")]
@@ -222,12 +204,6 @@ pub enum HyperliquidFillDirection {
 }
 
 impl HyperliquidFillDirection {
-    /// Decodes the venue's own spelling.
-    ///
-    /// Every spelling the venue documents is covered, including the flips
-    /// (`Long > Short` and `Short > Long`) and the liquidation and
-    /// auto-deleveraging events: one of them reaching the decoder must not fail
-    /// the whole reading it arrived in.
     pub fn from_raw(value: &str) -> Result<Self, SmolStr> {
         match value {
             "Open Long" => Ok(Self::OpenLong),
@@ -252,7 +228,6 @@ impl HyperliquidFillDirection {
         }
     }
 
-    /// Returns the venue's own spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenLong => "Open Long",
@@ -281,7 +256,6 @@ impl HyperliquidFillDirection {
 mod tests {
     use super::HyperliquidFillDirection;
 
-    /// Every wire spelling the venue documents decodes and round-trips.
     #[test]
     fn every_documented_fill_direction_round_trips() {
         for value in [
@@ -310,7 +284,6 @@ mod tests {
         }
     }
 
-    /// A spelling the venue has not published is still reported rather than guessed.
     #[test]
     fn an_unknown_fill_direction_is_reported() {
         assert_eq!(
@@ -320,7 +293,6 @@ mod tests {
     }
 }
 
-/// Fields whose validity depends on the order category.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum OrderKind {
@@ -357,21 +329,18 @@ pub enum OrderKind {
     },
 }
 
-/// Direction of a non-negative perpetual position quantity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PositionDirection {
     Long,
     Short,
 }
 
-/// Whether an account trade supplied or consumed resting liquidity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LiquidityRole {
     Maker,
     Taker,
 }
 
-/// Authenticated account settings relevant to one perpetual listing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TradingSettings {
     pub position_mode: PositionMode,
@@ -379,7 +348,6 @@ pub struct TradingSettings {
     pub leverage: NonZeroU8,
 }
 
-/// Final state of a closed perpetual position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HistoricalPositionStatus {
     PartiallyClosed,

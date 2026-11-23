@@ -32,7 +32,6 @@ use crate::{
     protocol::AuthenticatedTarget,
 };
 
-/// Account capability handle backed by the shared market-participants runtime.
 pub struct AccountCapability {
     inner: Arc<MarketParticipantsConnectorInner>,
 }
@@ -50,11 +49,6 @@ impl AccountCapability {
         Self { inner }
     }
 
-    /// Builds the authenticated target of one account on one route.
-    ///
-    /// The account name is validated here so every authenticated operation starts
-    /// from a target that exists, and the route is the one the caller names: the
-    /// gateway is what decides whether it is registered.
     pub fn target(
         &self,
         route: VenueRoute,
@@ -64,7 +58,6 @@ impl AccountCapability {
         Ok(AuthenticatedTarget::new(account, route))
     }
 
-    /// Builds the authenticated target of one route's configured account.
     pub fn configured_target(
         &self,
         route: VenueRoute,
@@ -281,7 +274,6 @@ impl AccountCapability {
         Ok(PositionStream::from_handle(handle, resolved))
     }
 
-    /// Fetches one monitored wallet's spot state.
     pub async fn hyperliquid_spot_state(
         &self,
         route: VenueRoute,
@@ -303,7 +295,6 @@ impl AccountCapability {
         }
     }
 
-    /// Fetches one monitored wallet's perpetual state.
     pub async fn hyperliquid_perpetual_state(
         &self,
         route: VenueRoute,
@@ -331,12 +322,6 @@ impl AccountCapability {
         }
     }
 
-    /// Fetches one monitored wallet's fills.
-    ///
-    /// A fills answer is venue-wide — `userFills` names the user alone — so it is read
-    /// once and decoded against every monitored route's catalog: the first route
-    /// addresses the request, and each answered row belongs to the route that published
-    /// its listing.
     pub async fn hyperliquid_user_fills(
         &self,
         routes: &[VenueRoute],
@@ -363,7 +348,6 @@ impl AccountCapability {
         }
     }
 
-    /// Fetches one monitored wallet's fills inside a bounded window.
     pub async fn hyperliquid_user_fills_by_time(
         &self,
         routes: &[VenueRoute],
@@ -399,7 +383,6 @@ impl AccountCapability {
         }
     }
 
-    /// Fetches one monitored wallet's open orders.
     pub async fn hyperliquid_open_orders(
         &self,
         route: VenueRoute,
@@ -424,11 +407,6 @@ impl AccountCapability {
         }
     }
 
-    /// Fetches one monitored wallet's historical orders.
-    ///
-    /// `historicalOrders` names the user alone — a venue-wide read — so the answer is
-    /// decoded against every monitored route's catalog while the first route addresses
-    /// the request.
     pub async fn hyperliquid_historical_orders(
         &self,
         routes: &[VenueRoute],
@@ -451,10 +429,6 @@ impl AccountCapability {
         }
     }
 
-    /// Fetches one monitored wallet's ledger from `start_time` on.
-    ///
-    /// `userNonFundingLedgerUpdates` names the user alone, so the ledger is decoded
-    /// against every monitored route's catalog — the same set the fills read uses.
     pub async fn hyperliquid_user_ledger(
         &self,
         routes: &[VenueRoute],
@@ -475,7 +449,6 @@ impl AccountCapability {
         }
     }
 
-    /// Fetches the spot pairs one Hyperliquid route publishes.
     pub async fn hyperliquid_spot_pairs(
         &self,
         route: VenueRoute,
@@ -501,10 +474,6 @@ impl AccountCapability {
         }
     }
 
-    /// Opens one monitored wallet's fill stream.
-    ///
-    /// One stream carries the fills of every scope its reader monitors, so the decoding
-    /// route set is what the events are resolved with rather than the session's address.
     pub async fn subscribe_hyperliquid_user_fills(
         &self,
         routes: &[VenueRoute],
@@ -519,7 +488,6 @@ impl AccountCapability {
             .await
     }
 
-    /// Opens one monitored wallet's ledger stream.
     pub async fn subscribe_hyperliquid_user_ledger(
         &self,
         routes: &[VenueRoute],
@@ -534,10 +502,6 @@ impl AccountCapability {
             .await
     }
 
-    /// Opens one reader's fast asset-context stream.
-    ///
-    /// The stream carries every scope's contexts, so it is opened once per reader and
-    /// decoded against that reader's whole route set.
     pub async fn subscribe_hyperliquid_fast_contexts(
         &self,
         routes: &[VenueRoute],
@@ -567,14 +531,6 @@ impl AccountCapability {
         Ok(HyperliquidSubscription::new(handle.into_stream(), catalogs))
     }
 
-    /// Reads every route's published catalog for one venue-wide wallet read.
-    ///
-    /// The set is the caller's monitored routes in their own order, so the first is the
-    /// route the request is addressed to. Nothing here reaches the venue: a route
-    /// whose catalog is not published fails the whole read with
-    /// [`crate::catalog::error::CatalogError::CatalogNotLoaded`], because a set that quietly
-    /// dropped one would drop exactly the rows its listings carry — the failure a
-    /// monitored address must not hide.
     async fn decoding_catalogs(
         &self,
         target_route: &VenueRoute,
@@ -587,7 +543,6 @@ impl AccountCapability {
         Ok(WalletCatalogs::new(target_route.clone(), catalogs))
     }
 
-    /// Asserts that one route's catalog is already published, answering the proof.
     fn ensure(&self, route: &VenueRoute) -> Result<EnsuredRoute, AccountError> {
         self.inner
             .catalog()
@@ -596,7 +551,6 @@ impl AccountCapability {
         Ok(EnsuredRoute::new(self.inner.catalog_arc(), route.clone()))
     }
 
-    /// Resolves one listing against a catalog this capability already holds.
     fn resolve_listing(
         &self,
         catalog: &EnsuredRoute,
@@ -607,7 +561,6 @@ impl AccountCapability {
             .map_err(account_error_from_catalog)
     }
 
-    /// Resolves the listing of one authenticated target's route.
     async fn resolve_target(
         &self,
         target: &AuthenticatedTarget,
@@ -615,7 +568,6 @@ impl AccountCapability {
         self.ensure(target.route())
     }
 
-    /// Rebuilds the authenticated target of one resolved route.
     fn configured_target_for(
         &self,
         catalog: &EnsuredRoute,
@@ -623,7 +575,6 @@ impl AccountCapability {
         self.configured_target(catalog.route().clone())
     }
 
-    /// Builds one account query, narrowing it to a listing of the same route.
     fn account_query(
         &self,
         catalog: &EnsuredRoute,
@@ -644,7 +595,6 @@ impl AccountCapability {
         }
     }
 
-    /// Executes one authenticated request of a target's route.
     async fn execute(
         &self,
         target: AuthenticatedTarget,
@@ -659,7 +609,6 @@ impl AccountCapability {
             .map_err(account_error_from_market_participant)
     }
 
-    /// Opens one authenticated subscription of a target's route.
     async fn subscribe(
         &self,
         target: AuthenticatedTarget,
@@ -674,7 +623,6 @@ impl AccountCapability {
             .map_err(account_error_from_market_participant)
     }
 
-    /// Executes one route-scoped request that names no account.
     async fn execute_route(
         &self,
         route: VenueRoute,
@@ -688,9 +636,6 @@ impl AccountCapability {
             .map_err(account_error_from_market_participant)
     }
 
-    /// Builds the request context of one capability call.
-    ///
-    /// The capability is the classifier's answer, so a call site never repeats it.
     fn gateway_context(
         &self,
         route: &VenueRoute,

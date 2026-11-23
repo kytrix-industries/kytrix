@@ -1,11 +1,3 @@
-//! Account protocol-to-domain mappings.
-//!
-//! This is the single account-owned boundary that attaches units and listing keys
-//! to the venue's raw account payloads. A payload keeps the venue's own numbers;
-//! a listing's rules say what its price and quantity mean, and the route's own
-//! published catalog is what says whether an asset the venue named is one the
-//! route knows.
-
 use std::sync::Arc;
 
 use market_participants_model::{
@@ -30,23 +22,14 @@ use crate::{
     market_participants::model,
 };
 
-/// The account name the settings-bound routes authenticate as.
 pub(crate) const PRIMARY_ACCOUNT: &str = "primary";
 
-/// The canonical assets of one route's published listings.
-///
-/// A venue names an asset by its own code and the adapter that read the payload
-/// already turned that code into a canonical asset, so what is left here is the
-/// route's own answer: whether the route published any listing denominated in
-/// that asset. An asset the route never published is reported instead of being
-/// passed on as if the route knew it.
 pub(super) struct RouteAssets {
     route: VenueRoute,
     published: ahash::AHashSet<AssetId>,
 }
 
 impl RouteAssets {
-    /// Indexes the assets of every listing the route published.
     pub(super) fn of(ensured: &EnsuredRoute) -> Self {
         let mut published = ahash::AHashSet::with_capacity(16);
         for entry in ensured.listings().iter() {
@@ -58,12 +41,10 @@ impl RouteAssets {
         }
     }
 
-    /// Returns whether the route published a listing denominated in this asset.
     pub(super) fn has(&self, asset: &AssetId) -> bool {
         self.published.contains(asset)
     }
 
-    /// Accepts one canonical asset the route published.
     pub(super) fn published(&self, asset: &AssetId) -> Result<(), AccountError> {
         if self.has(asset) {
             return Ok(());
@@ -75,31 +56,17 @@ impl RouteAssets {
     }
 }
 
-/// The published catalogs one venue-wide wallet answer is decoded against.
-///
-/// A read whose wire request names no scope — fills, a fills window, the ledger,
-/// historical orders, the fast asset contexts — is answered with the coins of every
-/// scope the venue serves, while the request that reads it is addressed to one route.
-/// Each answered row is therefore resolved with the catalog of the route that published
-/// the listing it names, and validated against that same route's [`RouteAssets`]: a
-/// union of the assets would accept any asset any monitored route published, which would
-/// turn the `UnknownAsset` check into no check at all.
-///
-/// The catalogs are held in the order the caller monitors the routes, the first of which
-/// is the route the read was addressed to.
 pub(super) struct WalletCatalogs {
     target_route: VenueRoute,
     routes: Vec<WalletRoute>,
 }
 
-/// One monitored route's published catalog and the assets it published.
 struct WalletRoute {
     catalog: EnsuredRoute,
     assets: Arc<RouteAssets>,
 }
 
 impl WalletCatalogs {
-    /// Builds the decoding set of a read addressed to `target_route`.
     pub(super) fn new(target_route: VenueRoute, catalogs: Vec<EnsuredRoute>) -> Self {
         Self {
             target_route,
@@ -113,10 +80,6 @@ impl WalletCatalogs {
         }
     }
 
-    /// Resolves one answered listing with the route that published it.
-    ///
-    /// The listing, the catalog that resolves its terms and the asset set that validates
-    /// what the row names all belong to that one route.
     pub(super) fn resolve(
         &self,
         listing: &VenueListingKey,
@@ -129,13 +92,6 @@ impl WalletCatalogs {
         Ok((&route.catalog, resolved, &route.assets))
     }
 
-    /// Accepts one canonical asset any monitored route published.
-    ///
-    /// A ledger entry names a token rather than a listing, so it has no owning route to
-    /// be validated against: the read is venue-wide, and the question left is whether any
-    /// monitored route published the asset. Everything that does name a listing — a
-    /// fill's fee asset, a liquidated position — goes through [`Self::resolve`] and is
-    /// validated by that listing's own route.
     pub(super) fn published(&self, asset: &AssetId) -> Result<(), AccountError> {
         if self.routes.iter().any(|route| route.assets.has(asset)) {
             return Ok(());
@@ -146,7 +102,6 @@ impl WalletCatalogs {
         })
     }
 
-    /// Returns the route that published one listing.
     fn route_of(&self, listing: &VenueListingKey) -> Result<&WalletRoute, AccountError> {
         self.routes
             .iter()
@@ -160,7 +115,6 @@ impl WalletCatalogs {
     }
 }
 
-/// The canonical assets one instrument is built from.
 pub(super) fn assets_of(instrument: &Instrument) -> Vec<AssetId> {
     match instrument.terms() {
         InstrumentTerms::Spot(terms) => vec![terms.base().clone(), terms.quote().clone()],
@@ -188,7 +142,6 @@ pub(super) fn assets_of(instrument: &Instrument) -> Vec<AssetId> {
     }
 }
 
-/// The assets one delivery mode settles in.
 fn delivery_assets(delivery: &market_participants_model::settlement::DeliveryMode) -> Vec<AssetId> {
     match delivery {
         market_participants_model::settlement::DeliveryMode::Cash { asset, .. } => {
@@ -227,7 +180,6 @@ pub(super) fn map_account_trade_id(
         .expect("network trade IDs are validated")
 }
 
-/// Builds one balance of one published asset.
 pub(super) fn map_balance(
     assets: &RouteAssets,
     native: &model::NativeBalance,
@@ -240,7 +192,6 @@ pub(super) fn map_balance(
     })
 }
 
-/// Maps one native order of one resolved listing.
 pub(super) fn map_order(
     native: &model::NativeOrder,
     resolved: &ResolvedListing,
@@ -268,7 +219,6 @@ pub(super) fn map_order(
     })
 }
 
-/// Maps one native position of one resolved listing.
 pub(super) fn map_position(
     native: &model::NativePosition,
     resolved: &ResolvedListing,
@@ -300,7 +250,6 @@ pub(super) fn map_position(
     })
 }
 
-/// Maps one native account trade of one resolved listing.
 pub(super) fn map_account_trade(
     native: &model::NativeAccountTrade,
     resolved: &ResolvedListing,
@@ -326,7 +275,6 @@ pub(super) fn map_account_trade(
     })
 }
 
-/// Maps one native historical position of one resolved listing.
 pub(super) fn map_historical_position(
     native: &model::NativeHistoricalPosition,
     resolved: &ResolvedListing,
@@ -357,7 +305,6 @@ pub(super) fn map_historical_position(
     })
 }
 
-/// Maps one native Hyperliquid spot balance.
 pub(super) fn map_hyperliquid_spot_balance(
     native: &model::NativeHyperliquidSpotBalance,
 ) -> HyperliquidSpotBalance {
@@ -368,23 +315,16 @@ pub(super) fn map_hyperliquid_spot_balance(
     }
 }
 
-/// The canonical base asset of one derivative underlying, when it names one.
 fn underlying_asset(
     underlying: &market_participants_model::asset::DerivativeUnderlying,
 ) -> Option<AssetId> {
     underlying.reference().asset().cloned()
 }
 
-/// Converts one unsigned quantity into the signed value an amount carries.
-///
-/// A position value and a margin used are published as unsigned quantities; an
-/// amount is signed, so the conversion is the only thing that happens here and no
-/// value is reinterpreted.
 fn signed_inner(value: Quantity) -> i128 {
     i128::try_from(value.inner()).unwrap_or(i128::MAX)
 }
 
-/// Maps one native Hyperliquid asset context of one resolved listing.
 pub(super) fn map_hyperliquid_asset_context(
     native: &model::NativeHyperliquidAssetContext,
     resolved: &ResolvedListing,
@@ -397,7 +337,6 @@ pub(super) fn map_hyperliquid_asset_context(
     }
 }
 
-/// Maps one native Hyperliquid perpetual position of one resolved listing.
 pub(super) fn map_hyperliquid_perpetual_position(
     native: &model::NativeHyperliquidPerpetualPosition,
     resolved: &ResolvedListing,
@@ -408,9 +347,6 @@ pub(super) fn map_hyperliquid_perpetual_position(
         size: units
             .quantity(native.size.magnitude())
             .map_err(AccountError::Model)?,
-        // The venue publishes the size as one signed number and a unit-carrying quantity cannot
-        // be negative, so the sign is what the direction is read from — the same reading the
-        // account positions of this venue are mapped with.
         direction: if native.size.inner().is_negative() {
             PositionDirection::Short
         } else {
@@ -430,7 +366,6 @@ pub(super) fn map_hyperliquid_perpetual_position(
     })
 }
 
-/// Maps one native Hyperliquid open order of one resolved listing.
 pub(super) fn map_hyperliquid_open_order(
     native: &model::NativeHyperliquidOpenOrder,
     resolved: &ResolvedListing,
@@ -451,7 +386,6 @@ pub(super) fn map_hyperliquid_open_order(
     })
 }
 
-/// Maps one native Hyperliquid historical order of one resolved listing.
 pub(super) fn map_hyperliquid_historical_order(
     native: &model::NativeHyperliquidHistoricalOrder,
     resolved: &ResolvedListing,
@@ -472,12 +406,6 @@ pub(super) fn map_hyperliquid_historical_order(
     })
 }
 
-/// Maps one native Hyperliquid fill of one resolved listing.
-///
-/// A Hyperliquid fill charges its fee in a token of its own, and the adapter that
-/// decoded the fill already resolved that token to its canonical asset, so the
-/// realized profit is reported in that same asset: the venue's own accounting, not
-/// this crate's guess of a settlement asset.
 pub(super) fn map_hyperliquid_user_fill(
     native: &model::NativeHyperliquidUserFill,
     resolved: &ResolvedListing,
@@ -514,14 +442,6 @@ pub(super) fn map_hyperliquid_user_fill(
     })
 }
 
-/// Maps one native Hyperliquid ledger event.
-///
-/// A ledger entry that names no coin has no asset to be denominated in, so only
-/// its asset-bearing fields are mapped; every asset that is named is the venue's
-/// own token and is carried as the resolved canonical one — a token rather than a
-/// listing, so it is accepted by any monitored route that published it. A liquidation
-/// names the positions it closed, and each of them is resolved — and validated — by the
-/// route that published its listing, then wrapped in that listing's own traded unit.
 pub(super) fn map_ledger_event(
     native: &model::NativeHyperliquidLedgerEvent,
     catalogs: &WalletCatalogs,
@@ -597,8 +517,6 @@ mod tests {
         market_participants::model,
     };
 
-    /// The route's own catalog is what accepts an asset: the fixture route
-    /// publishes a spot listing of two venue-issued tokens.
     async fn assets() -> (RouteAssets, AssetId, AssetId) {
         let route = test_support::spot_route();
         let instrument = test_support::spot_token("binance", "BTC", "USDT");
@@ -613,8 +531,6 @@ mod tests {
         (RouteAssets::of(&ensured), base, quote)
     }
 
-    /// A balance the venue denominated in an asset the route published is
-    /// carried as that asset.
     #[tokio::test]
     async fn a_balance_of_a_published_asset_is_carried_as_that_asset() {
         let (assets, base, _) = assets().await;
@@ -631,14 +547,10 @@ mod tests {
         assert_eq!(balance.available, Quantity::from(1_u64));
     }
 
-    /// A balance the venue denominated in an asset no listing of the route names
-    /// is reported as the typed failure it is, never passed on as if the route
-    /// knew the asset.
     #[tokio::test]
     async fn a_balance_of_an_unpublished_asset_is_reported() {
         let (assets, _, _) = assets().await;
         let native = model::NativeBalance {
-            // The same token code on another venue is another canonical asset.
             asset: test_support::token("okx", "BTC"),
             total: Quantity::from(2_u64),
             available: Quantity::from(1_u64),
@@ -650,8 +562,6 @@ mod tests {
         assert!(matches!(error, AccountError::UnknownAsset { .. }));
     }
 
-    /// The published listing of the fixture route, its key and the route's own
-    /// assets.
     async fn published() -> (
         ResolvedListing,
         VenueListingKey,
@@ -676,8 +586,6 @@ mod tests {
         (resolved, key, RouteAssets::of(&ensured), base, quote)
     }
 
-    /// An order is carried with the listing's own units: the quantity in the
-    /// listing's traded unit and the price in its quote asset and basis.
     #[tokio::test]
     async fn an_order_carries_the_listing_units() {
         let (resolved, key, _, base, quote) = published().await;
@@ -721,8 +629,6 @@ mod tests {
         assert_eq!(order.update_timestamp, 11);
     }
 
-    /// A position's monetary fields are amounts in the listing's quote asset, and
-    /// its quantity is the listing's traded unit.
     #[tokio::test]
     async fn a_position_carries_the_listing_units() {
         let (resolved, key, _, base, quote) = published().await;
@@ -762,8 +668,6 @@ mod tests {
         assert_eq!(position.update_timestamp, 12);
     }
 
-    /// A trade's fee is the asset the venue charged it in, and it is refused when
-    /// the route never published that asset.
     #[tokio::test]
     async fn an_account_trade_carries_its_fee_asset() {
         let (resolved, key, assets, _, quote) = published().await;
@@ -797,8 +701,6 @@ mod tests {
         assert!(matches!(error, AccountError::UnknownAsset { .. }));
     }
 
-    /// A perpetual position carries the direction the venue's own signed size names: the
-    /// magnitude is the size and the sign is the side, so a short is never carried as a long.
     #[tokio::test]
     async fn a_position_keeps_the_direction_of_its_signed_size() {
         let (resolved, key, _, _, _) = published().await;
@@ -834,8 +736,6 @@ mod tests {
         assert_eq!(short.size.unit, long.size.unit);
     }
 
-    /// A liquidation carries the notional the venue closed — in the asset it
-    /// reports it in — and each closed position in its own listing's unit.
     #[tokio::test]
     async fn a_liquidation_carries_its_notional_and_position_units() {
         let (resolved, key, _assets, base, quote) = published().await;
@@ -854,8 +754,6 @@ mod tests {
                 .expect("the fixture address is valid"),
             timestamp: 14,
             hash: "0xabc".parse().expect("the fixture hash is valid"),
-            // The venue reports a liquidation in the quote asset of the positions
-            // it closed.
             coin: Some(quote.clone()),
             kind: "liquidation".parse().expect("the fixture kind is valid"),
             amount: None,
@@ -897,16 +795,13 @@ mod tests {
         assert_eq!(resolved.key, key);
     }
 
-    /// Two monitored routes' catalogs, and the listing each of them published.
     struct TwoRouteCatalogs {
         catalogs: WalletCatalogs,
         first_listing: VenueListingKey,
         second_listing: VenueListingKey,
-        /// The asset only the second route published a listing in.
         second_base: AssetId,
     }
 
-    /// Builds a decoding set of two routes whose catalogs publish different assets.
     async fn two_route_catalogs() -> TwoRouteCatalogs {
         let first = test_support::spot_route();
         let first_instrument = test_support::spot_token("binance", "BTC", "USDT");
@@ -917,9 +812,6 @@ mod tests {
             .await
             .expect("the first route publishes its catalog");
 
-        // A fixture publishes the entries of the route it was built for, so the second
-        // route needs a fixture of its own rather than a second entry set. Its tokens are
-        // the fixture venue's, whose canonical terms the fixture seeds.
         let second = test_support::perp_route();
         let second_instrument = test_support::spot_token(test_support::VENUE, "ETH", "USDC");
         let second_entry = test_support::entry(&second, second_instrument.clone(), "ETHUSDC");
@@ -944,7 +836,6 @@ mod tests {
         }
     }
 
-    /// One fill of the fixture address, in the units of the listing it names.
     fn native_fill(
         listing: VenueListingKey,
         fee_asset: AssetId,
@@ -969,12 +860,6 @@ mod tests {
         }
     }
 
-    /// A row is resolved — and validated — by the route that published its listing.
-    ///
-    /// The first route's catalog is not what decodes the second route's row: its listing is
-    /// only in the second catalog, and the assets that accept the row are only the second
-    /// route's. A union of the two asset sets would accept anything either route published,
-    /// which is the difference between a check and no check.
     #[tokio::test]
     async fn a_row_is_resolved_and_validated_by_the_route_that_published_it() {
         let TwoRouteCatalogs {
@@ -984,8 +869,6 @@ mod tests {
             second_base,
         } = two_route_catalogs().await;
 
-        // The first route's row resolves against the first route's catalog, and the second
-        // route's row against the second's.
         let (first_catalog, first_resolved, _) = catalogs
             .resolve(&first_listing)
             .expect("the first route published its listing");
@@ -997,9 +880,6 @@ mod tests {
         assert_eq!(second_catalog.route(), &test_support::perp_route());
         assert_eq!(second_resolved.key, second_listing);
 
-        // A fill whose fee is charged in an asset only the second route published passes
-        // with the second route's own assets, and is refused when that asset is one no
-        // monitored route published.
         let fill = native_fill(second_listing.clone(), second_base);
         map_hyperliquid_user_fill(&fill, &second_resolved, second_assets)
             .expect("the second route published the fee asset");
@@ -1011,8 +891,6 @@ mod tests {
         .expect_err("an asset no monitored route published must not resolve");
         assert!(matches!(unknown, AccountError::UnknownAsset { .. }));
 
-        // The first route's assets do not accept the second route's fee asset either: the
-        // check belongs to the listing's own route rather than to the set.
         let (_, _, first_assets) = catalogs
             .resolve(&first_listing)
             .expect("the first route published its listing");

@@ -1,6 +1,5 @@
 use std::{error::Error, fmt, hash::Hash, sync::Arc};
 
-/// Defines the business messages exchanged by one widget and its background service.
 pub trait WidgetProtocol: Send + Sync + 'static {
     type Request: Send + 'static;
     type Response: Send + 'static;
@@ -9,7 +8,6 @@ pub trait WidgetProtocol: Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 }
 
-/// Monotonically increasing identifier assigned to an RPC call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RequestId(u64);
 
@@ -29,7 +27,6 @@ impl fmt::Display for RequestId {
     }
 }
 
-/// Value-semantic generation assigned whenever a keyed stream is replaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamGeneration(u64);
 
@@ -39,7 +36,6 @@ impl StreamGeneration {
     }
 }
 
-/// One background stream message with enough metadata to reject stale updates.
 #[derive(Debug)]
 pub struct StreamEnvelope<K, M> {
     key: K,

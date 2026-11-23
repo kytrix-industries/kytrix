@@ -1,19 +1,3 @@
-//! Live mainnet checks for the market participants connector's built-in routes.
-//!
-//! These tests are ignored by default: they resolve the built-in routes against
-//! the real venue origins, so they need working network access. Set
-//! `KYTRIX_NETWORK_TEST_PROXY` to a `socks5://` or `socks5h://` URL when the
-//! venues are reachable through a local proxy.
-//!
-//! What can be checked without credentials is checked here against the live
-//! venues: that every built-in route registers, that each catalog route's own
-//! endpoint publishes a catalog whose typed identifiers agree with the canonical
-//! instrument they claim, and that a public read answers under the exact listing
-//! it was asked about. Everything that needs a trading credential — orders,
-//! balances, positions, wallet monitoring of a private account — has no
-//! credential to run under in this suite; those paths are covered by the
-//! adapters' fixture tests instead.
-
 use std::{env, sync::Arc, time::Duration};
 
 use app_config::{
@@ -43,8 +27,6 @@ const PROXY_NAME: &str = "mainnet-test";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The URL parser exposes userinfo in its percent-encoded form, while the proxy
-/// catalog stores the literal credentials.
 fn decode_proxy_credential(value: &str) -> SmolStr {
     let decoded = percent_encoding::percent_decode_str(value)
         .decode_utf8()
@@ -52,7 +34,6 @@ fn decode_proxy_credential(value: &str) -> SmolStr {
     SmolStr::new(decoded)
 }
 
-/// The network configuration one live check routes through.
 fn mainnet_network() -> NetworkConfig {
     let proxy_url = env::var(PROXY_ENV).unwrap_or_else(|_| DEFAULT_PROXY.to_owned());
     let proxy_url = Url::parse(&proxy_url)
@@ -107,10 +88,6 @@ fn mainnet_input() -> MarketParticipantsConnectorInput {
     .with_runtime(test_handle())
 }
 
-/// One loaded connector together with the routes its venues registered.
-///
-/// Every declared venue is loaded through the load action itself, so the
-/// routes this suite reads are the ones the user's own action registers.
 async fn attached_connector() -> (MarketParticipantsConnector, Arc<Catalog>, Vec<VenueRoute>) {
     let catalog = Arc::new(Catalog::new());
     let connector =
@@ -122,10 +99,6 @@ async fn attached_connector() -> (MarketParticipantsConnector, Arc<Catalog>, Vec
             .unwrap_or_else(|_| panic!("loading {venue} should not time out"))
             .unwrap_or_else(|error| panic!("loading {venue} should load its catalogs: {error}"));
     }
-    // What the projection must hold is every **statically declared** scope, and it may
-    // hold more: a venue that deploys its own partitions registers them when it is
-    // loaded — Hyperliquid's builder-deployed `perp-dex/*` — so the loaded set is a
-    // superset of the declared one and no fixed total can be right by construction.
     let declared = declared_scopes();
     timeout(SETUP_TIMEOUT, async {
         while !declared
@@ -141,14 +114,6 @@ async fn attached_connector() -> (MarketParticipantsConnector, Arc<Catalog>, Vec
     (connector, catalog, routes)
 }
 
-/// The routes this build declares statically, one per scope of one venue's specification
-/// table.
-///
-/// The list is named once rather than totalled: what the projection must hold is exactly
-/// these routes, and whatever a venue discovered on top of them. It is the public
-/// `routing` constants that are named — the same names the specification table is built
-/// from — so a venue that gains a scope is a scope this suite has to be told about rather
-/// than a count that silently drifts.
 fn declared_scopes() -> Vec<VenueRoute> {
     use market_participants_connector::routing::{
         CORE_PERP_SCOPE, CORE_SPOT_SCOPE, LONGBRIDGE_US_SCOPE, PERPETUAL_SCOPE, SPOT_SCOPE,
@@ -172,8 +137,6 @@ fn declared_scopes() -> Vec<VenueRoute> {
     routes
 }
 
-/// Every built-in route registers, and every endpoint a descriptor names has a
-/// built-in origin, so a fresh installation can route without configuration.
 #[tokio::test]
 #[ignore = "requires live network access to the venue origins"]
 async fn built_in_routes_register_with_endpoints_a_fresh_install_can_reach() {
@@ -214,9 +177,6 @@ async fn built_in_routes_register_with_endpoints_a_fresh_install_can_reach() {
     connector.shutdown().await;
 }
 
-/// Each catalog route's own endpoint answers with a catalog, and every published
-/// entry is about that route, declares typed identifiers of the instrument kind
-/// it claims and carries the listing key the route resolved it under.
 #[tokio::test]
 #[ignore = "requires live network access to the venue origins"]
 async fn live_catalogs_publish_entries_about_the_route_they_were_fetched_for() {
@@ -251,13 +211,6 @@ async fn live_catalogs_publish_entries_about_the_route_they_were_fetched_for() {
     connector.shutdown().await;
 }
 
-/// A public ticker read and an order-book snapshot come back under the exact
-/// listing they were asked about.
-///
-/// A candlestick read is deliberately absent: its interval type belongs to the
-/// crate's private protocol vocabulary, so an integration test cannot name the
-/// interval it would ask for. The candlestick path itself is covered by the
-/// adapters' own fixture tests, which live inside the crate.
 #[tokio::test]
 #[ignore = "requires live network access to the venue origins"]
 async fn live_public_reads_answer_under_the_listing_they_were_asked_about() {

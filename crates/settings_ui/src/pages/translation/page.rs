@@ -1,25 +1,3 @@
-//! The translation page: where models are stored, which one is used, and the models that can be
-//! downloaded.
-//!
-//! The page is a view of its own rather than a page of fields: its model list is a table of its
-//! own, its directory is a text field that is committed when the user leaves it, and its download
-//! state belongs to the process-wide [`TranslationDownloads`] rather than to the settings page.
-//! The chosen directory and model are written into the settings as they are chosen, and the
-//! controls read them back from there, so what the page draws is what is stored.
-//!
-//! One repair is made when the page is really drawn: a selection that the stored directory does not
-//! hold is cleared. The page is only built when it is shown, so a page that is never opened writes
-//! nothing.
-//!
-//! Downloading starts from the site the settings hold: the site is a select in the card of model
-//! settings, and both a first download and a retry of a failed one use the chosen site.
-//!
-//! # Frames
-//!
-//! The page holds its kit components (two selects and the directory field) and syncs them from the
-//! settings each frame; the model table syncs from the download manager. Everything is written
-//! through the injected host, so a change made anywhere else is drawn on the frame that follows.
-
 use std::{
     cell::{Cell, RefCell},
     path::PathBuf,
@@ -57,39 +35,26 @@ use crate::{
     translation_downloads::TranslationDownloads,
 };
 
-/// The id of this page's settings.
 const PAGE: &str = "ai.translation";
 
-/// The translation page.
 pub(crate) struct TranslationPage {
     host: SettingsHost,
     key: SmolStr,
     window: Option<WindowId>,
-    /// The process-wide downloads, when the composition host attached them.
     downloads: Option<Rc<TranslationDownloads>>,
-    /// The model directory field, and the state it edits.
     directory: Option<InputNode>,
     directory_state: Option<Signal<InputState>>,
-    /// Set when a committed directory could not be stored, so the field shows the stored one again.
     directory_rejected: Rc<Cell<bool>>,
-    /// The select the download site is chosen from.
     site: Option<Select>,
-    /// The select the model in use is chosen from.
     model: Option<Select>,
-    /// The node the model select is mounted under, for the frames that replace it.
     model_parent: Option<NodeId>,
-    /// The model ids the model select was last given.
     model_items: Vec<SmolStr>,
-    /// Whether the model select was built over a stored directory, which its placeholder names.
     model_has_directory: Option<bool>,
-    /// The models table.
     table: Option<TranslationTable>,
-    /// The action the directory field dispatches when it is committed.
     commit: Option<Action>,
 }
 
 impl TranslationPage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
     pub(crate) fn new(host: SettingsHost, key: &str) -> Self {
         Self {
             host,
@@ -109,11 +74,6 @@ impl TranslationPage {
         }
     }
 
-    /// Clears a selection the stored directory does not hold.
-    ///
-    /// A model is available when its file is in that directory at its published size and its row
-    /// is not being removed: a file that is still there while the engine unloads is not one the
-    /// page can load. Nothing is written when there is nothing to repair.
     fn repair(&self, app: &mut App, window: WindowId) {
         let Some(downloads) = self.downloads.as_deref() else {
             return;
@@ -141,7 +101,6 @@ impl TranslationPage {
         );
     }
 
-    /// Creates the model select over the models the stored directory can load.
     fn create_model_select(
         &self,
         app: &mut App,
@@ -201,7 +160,6 @@ impl TranslationPage {
         }))
     }
 
-    /// Replaces the model select when its placeholder has to name a different reason.
     fn rebuild_model(
         &mut self,
         app: &mut App,
@@ -283,8 +241,6 @@ impl PageView for TranslationPage {
             None,
         )?;
 
-        // The directory field is committed when the user leaves it, and re-shows the stored value
-        // when what they committed could not be stored.
         let directory_state = app.signal(InputState::new(
             directory
                 .as_ref()
@@ -525,8 +481,6 @@ impl PageView for TranslationPage {
             )
         });
 
-        // The directory field shows what is stored, except while it is being typed into: what the
-        // user typed is theirs until it is committed or abandoned.
         let stored = directory
             .as_ref()
             .map(|path| SmolStr::new(path.to_string_lossy()))
@@ -652,7 +606,6 @@ impl PageView for TranslationPage {
     }
 }
 
-/// What one site is called in the interface.
 fn site_label(site: DownloadSite, translate: &Translate) -> SmolStr {
     match site {
         DownloadSite::HuggingFace => t_smol!(translate, "settings_ui.ai.download_site_huggingface"),
@@ -660,7 +613,6 @@ fn site_label(site: DownloadSite, translate: &Translate) -> SmolStr {
     }
 }
 
-/// The stored id of one site, which is what its choice writes.
 fn site_id(site: DownloadSite) -> &'static str {
     match site {
         DownloadSite::HuggingFace => "hugging_face",
@@ -668,20 +620,12 @@ fn site_id(site: DownloadSite) -> &'static str {
     }
 }
 
-/// The site a choice names.
 fn site_of(id: &str) -> Option<DownloadSite> {
     DownloadSite::ALL
         .into_iter()
         .find(|site| site_id(*site) == id)
 }
 
-/// Writes `model` as the model the local translation is loaded from, or clears the selection when
-/// the stored directory cannot load it.
-///
-/// The menu only offers what the directory holds and is not being removed, so what this refuses is
-/// a model that stopped being usable between the frame the menu was drawn in and the choice — a
-/// delete that started while the menu was open. Clearing rather than writing it is what keeps the
-/// settings from naming a file that is on its way out.
 fn select_model(
     app: &mut App,
     host: &SettingsHost,
@@ -710,11 +654,6 @@ fn select_model(
     );
 }
 
-/// Writes `directory` as the model directory, selecting the first model it holds when the stored
-/// selection cannot be loaded from it.
-///
-/// Returns whether the settings accepted the change, so the field knows whether to keep the path it
-/// was committed with.
 fn choose_directory(
     app: &mut App,
     host: &SettingsHost,
@@ -752,7 +691,6 @@ fn choose_directory(
     host.write_all(app, window, changes).is_ok()
 }
 
-/// The child nodes of `parent`, which is what a rebuilt control replaces.
 fn child_nodes(app: &App, window: WindowId, parent: NodeId) -> Vec<NodeId> {
     app.window(window)
         .and_then(|target| target.tree().get(parent).ok())
@@ -760,15 +698,12 @@ fn child_nodes(app: &App, window: WindowId, parent: NodeId) -> Vec<NodeId> {
         .unwrap_or_default()
 }
 
-/// The text this page and its settings are searched by.
 pub(crate) fn search(translate: &Translate) -> PageSearch {
     let title = t_smol!(translate, "settings_ui.ai.translation.title");
     let directory = t_smol!(translate, "settings_ui.ai.model_directory");
     let site = t_smol!(translate, "settings_ui.ai.download_site");
     let model = t_smol!(translate, "settings_ui.ai.model_in_use");
     let models = t_smol!(translate, "settings_ui.ai.models");
-    // The directory is typed into the field now that there is no folder picker to browse with;
-    // the word this catalogue gives it still reaches the page through the search.
     let browse = t_smol!(translate, "settings_ui.ai.browse");
 
     PageSearch {

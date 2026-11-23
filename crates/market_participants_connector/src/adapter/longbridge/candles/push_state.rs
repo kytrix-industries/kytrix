@@ -1,24 +1,3 @@
-//! The state a subscription keeps between the venue's pushes and its candles.
-//!
-//! Two things live here that are neither the wire nor the aggregation. The first is the
-//! market's session table, which a push is bucketed by: an ordinary US day has one, and a
-//! half day has a different one, so the table a push is read against depends on the dates
-//! the venue published as half days (cmd 9). The second is that list of half days itself,
-//! which is read lazily — nothing before the first push has needed it — and refreshed
-//! once a day after that.
-//!
-//! The third thing here is which pushes become prints at all, and that is where the
-//! venue's third gate lives: a **quote** is merged only while the regular session is open
-//! (§4.6 step 0), so a pre-market, post-market or overnight quote builds no candle of any
-//! interval. The aggregation states the other two gates, because they are about where a
-//! print's bucket starts rather than about whether the print exists.
-//!
-//! A read that fails is not an error a reader sees: the venue's own client treats an
-//! unreadable calendar as an ordinary day, and so does this one, with a `log::warn!` as
-//! the only trace. The state that owns the tables is a plain value with no socket in it,
-//! which is what lets the aggregation be tested by installing a table and pushing frames
-//! at it.
-
 use longbridge_proto::quote::{PushQuote, PushTrade};
 use market_participants_model::decimal::{Price, Quantity, UnixMillis};
 
@@ -31,66 +10,36 @@ use super::{
 };
 use crate::{error::MarketParticipantError, market::timeframe::TimeFrame};
 
-/// How long one list of half days is trusted before it is read again (§4.6).
 pub(super) const HALF_DAYS_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// The operation a field of a push that cannot be read is reported as.
 const DECODE_PUSH: &str = "decode the Longbridge push";
 
-/// One subscription's push-path state.
 pub(super) struct PushState {
-    /// The interval the candles are cut into.
     timeframe: TimeFrame,
-    /// The zone the venue opens its candles in.
     zone: jiff::tz::TimeZone,
-    /// The half days the venue last published, with the instant to read them again.
     half_days: Option<HalfDays>,
 }
 
-/// The half days one read of cmd 9 produced.
 struct HalfDays {
-    /// The market-local midnights of the half days, which is what a bucket is compared
-    /// against.
     midnights: ahash::AHashSet<UnixMillis>,
-    /// The earliest instant the list is worth reading again.
     due: std::time::Instant,
 }
 
 impl PushState {
-    /// Opens the push state of one subscription.
     pub(super) fn new(timeframe: TimeFrame) -> Self {
         Self {
             timeframe,
-            // The zone is the market's own and the database ships with `jiff`, so this
-            // cannot fail on a machine without a system time-zone database; UTC is the
-            // fallback the type has, and the market's own rules are the ones every
-            // assertion here is made against.
             zone: jiff::tz::TimeZone::get(MARKET_ZONE).unwrap_or(jiff::tz::TimeZone::UTC),
             half_days: None,
         }
     }
 
-    /// Reports whether the trading-day table is due to be read.
-    ///
-    /// `true` means it has never been read, or the day it was read on has passed; the
-    /// caller reads it and installs the answer with [`Self::install_calendar`].
     pub(super) fn half_days_due(&self, now: std::time::Instant) -> bool {
         self.half_days
             .as_ref()
             .is_none_or(|half_days| now >= half_days.due)
     }
 
-    /// Installs what one read of the venue's calendar found, and when to read it again.
-    ///
-    /// The values are the venue's own `half_trade_day` dates, and one that is not a date
-    /// is dropped with a warning rather than guessed at: a calendar this build cannot
-    /// read is a calendar it does not have, and the tables below then fall back to the
-    /// ordinary day — which is the same fail-open the venue's own client does.
-    ///
-    /// An empty list is therefore a statement rather than a missing value, and it is the
-    /// one a read that failed leaves: the table that follows is the ordinary one, and the
-    /// deadline that follows is a day away, so a calendar the venue would not state is
-    /// asked about once a day rather than once per push.
     pub(super) fn install_calendar(&mut self, days: &[String], now: std::time::Instant) {
         let mut midnights = ahash::AHashSet::with_capacity(days.len());
         for day in days {
@@ -110,8 +59,6 @@ impl PushState {
         });
     }
 
-    /// Returns the market-local midnights of the half days the state holds, which the
-    /// tests read back to state what one read of the calendar installed.
     #[cfg(test)]
     pub(super) fn half_days_midnights(&self) -> ahash::AHashSet<UnixMillis> {
         self.half_days
@@ -120,11 +67,6 @@ impl PushState {
             .unwrap_or_default()
     }
 
-    /// Returns the session table one instant's candle is bucketed by.
-    ///
-    /// A half day's table replaces the whole ordinary one rather than shortening one
-    /// session of it: its post session opens where its regular session closes, so every
-    /// afternoon candle would otherwise be cut on the wrong grid.
     pub(super) fn session_table(&self, millis: UnixMillis) -> &'static SessionTable {
         let Some(half_days) = &self.half_days else {
             return &NORMAL_SESSION_TABLE;
@@ -139,37 +81,12 @@ impl PushState {
         }
     }
 
-    /// Returns the market-local day one instant fell in, as the venue formats it.
-    ///
-    /// The trading-day window is asked about around *this* day rather than around the
-    /// machine's: the venue's calendar is the market's, and a reader whose machine is a
-    /// day ahead would otherwise ask about a window that starts after the session it is
-    /// subscribing to.
     pub(super) fn market_day(&self, millis: UnixMillis) -> Option<jiff::civil::Date> {
         jiff::Timestamp::from_millisecond(millis)
             .ok()
             .map(|timestamp| jiff::Zoned::new(timestamp, self.zone.clone()).date())
     }
 
-    /// Reads one quote push as the print it carries, when it carries one.
-    ///
-    /// A quote of an extended session contributes nothing, which is §4.6's third gate:
-    /// the venue merges quotes only while the regular session is open, so a pre-market or
-    /// overnight quote is not a price of the candle being built.
-    ///
-    /// Of the regular session's quotes, only `Day1` is written from the venue's cumulative
-    /// counters: §4.6 step 1 states the quote merge for `DAY` and the regular session, and
-    /// every other interval — a week, a month, a quarter, a year, an hour — accumulates
-    /// the increment its counters advanced by, because a day's counters are not a week's
-    /// candle. A quote that advanced nothing still states a price, so it is merged as a
-    /// price with no volume rather than dropped; a quote that carried nothing at all —
-    /// no counter, no increment — is the venue repeating the state a reader already has
-    /// and builds nothing.
-    ///
-    /// The frame's own tag is not read here: an end-of-day quote (§4.6) is merged exactly
-    /// as an ordinary one, because the venue merges it before its own end-of-day
-    /// judgement, and the difference the tag makes is that the frame is not forwarded as
-    /// a ticker — which is a surface this build does not serve.
     pub(super) fn quote_print(
         &self,
         quote: &PushQuote,
@@ -193,8 +110,6 @@ impl PushState {
         let volume_delta = match u64::try_from(quote.current_volume) {
             Ok(0) | Err(_) if cumulative.is_none() => None,
             Ok(volume) => Some(Quantity::from(volume)),
-            // A negative increment cannot be added to a candle, and a day's candle does
-            // not need it: the counters above are the whole of what it states.
             Err(_) => None,
         };
         Ok(Some(CandlePrint::quote(QuotePrint {
@@ -206,12 +121,6 @@ impl PushState {
         })))
     }
 
-    /// Reads one trade push as the prints it carries.
-    ///
-    /// Every entry of the frame is one print of the venue's tape, with its own price,
-    /// volume, session and type. A trade states no notional of its own, so the amount a
-    /// candle accumulates is the print's `price × volume × lot_size` with a US share's
-    /// own lot size — one (§4.6).
     pub(super) fn trade_prints(
         &self,
         trades: &PushTrade,
@@ -230,11 +139,6 @@ impl PushState {
     }
 }
 
-/// Reads one wire timestamp as milliseconds.
-///
-/// Every timestamp the venue pushes is Unix **seconds** — the candle path says the same
-/// thing where it decodes history — so a value read as milliseconds would place every
-/// candle in 1970.
 fn seconds_to_millis(seconds: i64) -> Result<UnixMillis, MarketParticipantError> {
     seconds
         .checked_mul(1_000)
@@ -245,7 +149,6 @@ fn seconds_to_millis(seconds: i64) -> Result<UnixMillis, MarketParticipantError>
         })
 }
 
-/// Reads one wire decimal as a price.
 fn decimal(value: &str) -> Result<Price, MarketParticipantError> {
     value
         .parse()
@@ -256,7 +159,6 @@ fn decimal(value: &str) -> Result<Price, MarketParticipantError> {
         })
 }
 
-/// Reads one wire volume as a quantity.
 fn volume_of(volume: i64) -> Result<Quantity, MarketParticipantError> {
     u64::try_from(volume)
         .map(Quantity::from)
@@ -267,7 +169,6 @@ fn volume_of(volume: i64) -> Result<Quantity, MarketParticipantError> {
         })
 }
 
-/// Converts one wire session to the aggregator's own vocabulary.
 fn market_session(number: i32) -> Result<MarketSession, MarketParticipantError> {
     let Some(session) = LongbridgeSession::of(number) else {
         return Err(MarketParticipantError::ProtocolError {
@@ -284,23 +185,10 @@ fn market_session(number: i32) -> Result<MarketSession, MarketParticipantError> 
     })
 }
 
-/// Reads one wire trade type as the table's own vocabulary.
-///
-/// The venue's ordinary case is an empty string, which is the type the table names with
-/// its `""` row rather than a missing value: "the venue named no type" and "the venue
-/// named a type this build does not know" are two different rows, and both are read here
-/// rather than at the table, so the table has one spelling per type.
 fn named_type(trade_type: &str) -> TradeType {
     TradeType::of(trade_type)
 }
 
-/// Reads one `YYYYMMDD` as a date.
-///
-/// The text is the venue's own and arrives off the socket, so its digits are judged
-/// before they are read: slicing a string by byte offsets panics on any input whose
-/// characters are not all one byte wide — `"123é456"` is eight bytes long and its fourth
-/// byte is inside a two-byte character — and a calendar the venue worded differently must
-/// be an ordinary day rather than a panic.
 fn parse_day(text: &str) -> Option<jiff::civil::Date> {
     jiff::civil::Date::new(
         i16::try_from(digits(text, 0..4)?).ok()?,
@@ -310,7 +198,6 @@ fn parse_day(text: &str) -> Option<jiff::civil::Date> {
     .ok()
 }
 
-/// Reads one ASCII run of digits as its number.
 fn digits(text: &str, range: std::ops::Range<usize>) -> Option<i32> {
     let bytes = text.as_bytes().get(range)?;
     if !bytes.iter().all(u8::is_ascii_digit) {
@@ -319,7 +206,6 @@ fn digits(text: &str, range: std::ops::Range<usize>) -> Option<i32> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
-/// The instant one market-local date's midnight is, in milliseconds.
 fn midnight_of(date: jiff::civil::Date, zone: &jiff::tz::TimeZone) -> UnixMillis {
     date.at(0, 0, 0, 0)
         .to_zoned(zone.clone())
@@ -327,7 +213,6 @@ fn midnight_of(date: jiff::civil::Date, zone: &jiff::tz::TimeZone) -> UnixMillis
         .unwrap_or(UnixMillis::MIN)
 }
 
-/// The market-local midnight of the day one instant fell in.
 fn midnight_of_millis(millis: UnixMillis, zone: &jiff::tz::TimeZone) -> UnixMillis {
     jiff::Timestamp::from_millisecond(millis)
         .ok()
@@ -350,7 +235,6 @@ mod tests {
         market::timeframe::TimeFrame,
     };
 
-    /// One market-local wall time as milliseconds since the epoch.
     fn at(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> UnixMillis {
         jiff::civil::date(year, month, day)
             .at(hour, minute, 0, 0)
@@ -360,12 +244,10 @@ mod tests {
             .as_millisecond()
     }
 
-    /// One push state of one subscription, with no calendar read yet.
     fn state() -> PushState {
         PushState::new(TimeFrame::Hour1)
     }
 
-    /// One quote of one session, advancing the venue's own counter by one share.
     fn quote(session: i32, seconds: i64) -> PushQuote {
         PushQuote {
             symbol: "AAPL.US".to_owned(),
@@ -385,11 +267,6 @@ mod tests {
         }
     }
 
-    /// The half-day table is read lazily and then trusted for a day: the state says it is
-    /// due before anything has been read, and again once the day has passed. A read that
-    /// found nothing — the one a failed read leaves — is trusted for the same day, which
-    /// is what keeps a venue that will not state its calendar from being asked once per
-    /// push.
     #[test]
     fn the_half_days_are_read_lazily_and_refreshed_daily() {
         let now = Instant::now();
@@ -423,8 +300,6 @@ mod tests {
         );
     }
 
-    /// A half day replaces the table of its own market day and of no other, and a value
-    /// that is not a date is dropped rather than guessed at.
     #[test]
     fn a_half_day_replaces_the_table_of_its_own_market_day() {
         let mut state = state();
@@ -456,11 +331,6 @@ mod tests {
         );
     }
 
-    /// A date the venue worded with a character wider than one byte is not a date rather
-    /// than a panic: `"123é456"` is eight bytes long and its fourth byte is the middle of
-    /// a two-byte character, which is exactly the input a byte-offset slice would break
-    /// on. The calendar is the venue's own text, so every value of it has to be readable
-    /// as "not a date" without taking the reader down.
     #[test]
     fn a_calendar_value_that_is_not_ascii_digits_is_not_a_date() {
         let mut state = state();
@@ -493,9 +363,6 @@ mod tests {
         );
     }
 
-    /// A quote of an extended session contributes no print at all, a quote of the regular
-    /// session carries the increment the venue's own counter advanced by, and a session
-    /// number the venue has not defined is a failure rather than a guess.
     #[test]
     fn a_quote_outside_the_regular_session_is_no_print() {
         let state = state();
@@ -530,14 +397,6 @@ mod tests {
         );
     }
 
-    /// A daily candle is written from the venue's cumulative counters, so a quote of
-    /// the regular session carries them — including one that advanced no volume at all,
-    /// because the counters are the candle rather than an increment of it.
-    ///
-    /// The frame is an end-of-day one, which §4.6 states is merged exactly as an ordinary
-    /// quote is: the venue merges it before its own end-of-day judgement, and the tag's
-    /// other consequence — that the frame is not forwarded as a ticker — is a surface this
-    /// build does not serve.
     #[test]
     fn an_end_of_day_quote_carries_the_sessions_own_counters() {
         let mut state = PushState::new(TimeFrame::Day1);
@@ -563,10 +422,6 @@ mod tests {
         assert_eq!(cumulative.volume, Quantity::from(1_000_u64));
     }
 
-    /// An interval above a day takes the increment its counters advanced by rather than
-    /// the day's own counters: a quote that states a whole day is not a week's candle, so
-    /// a weekly subscriber sees the day's counters advance rather than replace what it
-    /// has.
     #[test]
     fn an_interval_above_a_day_carries_the_increment() {
         let state = PushState::new(TimeFrame::Week1);
@@ -589,9 +444,6 @@ mod tests {
         assert_eq!(print.volume_delta, Some(Quantity::from(7_u8)));
     }
 
-    /// A quote of the regular session that advanced no volume still states a price, so it
-    /// is merged as a price with nothing added rather than dropped: a reader of an hourly
-    /// candle sees the price move even on a second where the venue's counter did not.
     #[test]
     fn a_quote_that_advanced_no_volume_still_states_its_price() {
         let state = state();
@@ -625,8 +477,6 @@ mod tests {
         );
     }
 
-    /// One trade push is one print per entry of its own tape, each with its own session,
-    /// price, volume and type.
     #[test]
     fn a_trade_push_is_one_print_per_trade() {
         let state = state();

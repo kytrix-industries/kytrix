@@ -1,10 +1,3 @@
-//! ⑤ 输入法：`ImeField` 单行模型 + 输入框。
-//!
-//! 引擎负责把平台 `WM_IME_*` / `NSTextInputClient` / `zwp_text_input` 翻译成
-//! [`ImeEvent`](ui_core::event::ImeEvent) 并交给应用；**组合串的语义**（提交后追加、组合中忽略
-//! Backspace）是应用层的事，这里用值语义的 [`ImeField`] 表达，可脱离窗口单测。P16 另把正文文本节点
-//! 的插入点交给 `App::set_ime_cursor_area`，由引擎计算 caret 并通知三平台 IME。
-
 use std::ops::Range;
 
 use smol_str::{SmolStr, format_smolstr};
@@ -25,26 +18,17 @@ use super::{
     DIM_RGBA, FIELD_BORDER_RGBA, FIELD_RGBA, MUTED_RGBA, TEXT_RGBA, card, color, ring, text_style,
 };
 
-/// 输入框的单行状态（`Signal<ImeField>` 的载荷）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ImeField {
-    /// 已提交文本（真正"输入进去"的内容）。
     committed: SmolStr,
-    /// 组合中的文本（`Preedit`）。系统可能只发 `Start` / `Commit` / `End` 而不发组合串
-    /// （Windows 11 Microsoft Pinyin 实测如此），因此「是否在组合」不靠它判断，见 `composing`。
     preedit: SmolStr,
-    /// `Start` 起、`Commit` / `End` / 失焦止的组合标记。
     composing: bool,
-    /// 最近一条事件的可读形式。
     last_event: SmolStr,
-    /// 最近一次 `Enter` 提交的内容。
     submitted: SmolStr,
-    /// 累计收到的事件数（含 `Text` / Backspace / Enter）。
     events: u32,
 }
 
 impl ImeField {
-    /// 离屏截图用的种子状态：已提交文本 + 组合串 + 一条最近提交。
     pub(crate) fn sample() -> Self {
         Self {
             committed: SmolStr::new_static("你好，Kytrix"),
@@ -56,7 +40,6 @@ impl ImeField {
         }
     }
 
-    /// 平台输入法事件（`Start` / `Preedit` / `Commit` / `End`）。
     pub(crate) fn apply(&mut self, event: &ImeEvent) {
         self.events = self.events.saturating_add(1);
         match event {
@@ -66,8 +49,6 @@ impl ImeField {
             }
             ImeEvent::Preedit { text, replace, .. } => {
                 self.composing = true;
-                // 输入法逐子句更新（macOS `replacementRange`）时只替换组合串的一部分，
-                // 区间外的旧组合串必须保留，否则会丢字。
                 self.preedit = replace_utf16(&self.preedit, replace.as_ref(), text);
                 self.last_event = format_smolstr!("Preedit(\"{text}\")");
             }
@@ -86,14 +67,12 @@ impl ImeField {
         }
     }
 
-    /// 非输入法的字符输入（`WM_CHAR` / 直接键入；IME 提交后平台已抑制重复字符）。
     pub(crate) fn insert(&mut self, text: &str) {
         self.events = self.events.saturating_add(1);
         self.committed = format_smolstr!("{}{text}", self.committed);
         self.last_event = format_smolstr!("Text(\"{text}\")");
     }
 
-    /// 退格：组合中交给系统 IME（不改已提交文本），否则删最后一个 `char`。
     pub(crate) fn backspace(&mut self) {
         self.events = self.events.saturating_add(1);
         if self.composing() {
@@ -107,7 +86,6 @@ impl ImeField {
         self.committed = SmolStr::new(&self.committed[..index]);
     }
 
-    /// 回车：组合中忽略；否则把已提交文本记进「最近提交」并清空输入。
     pub(crate) fn submit(&mut self) {
         self.events = self.events.saturating_add(1);
         if self.composing() {
@@ -122,7 +100,6 @@ impl ImeField {
         self.committed = SmolStr::default();
     }
 
-    /// 无障碍 `SetValue`：AT 直接写入的文本替换整个输入内容（无选区模型，等价于全选替换）。
     pub(crate) fn set_text(&mut self, text: &str) {
         self.committed = SmolStr::new(text);
         self.preedit = SmolStr::default();
@@ -131,7 +108,6 @@ impl ImeField {
         self.last_event = format_smolstr!("SetValue(\"{text}\")");
     }
 
-    /// 焦点离开输入框 / 窗口失焦时收起组合态（否则 `Esc` 会被一直误判成「组合中」）。
     pub(crate) fn cancel_composition(&mut self) {
         if !self.composing {
             return;
@@ -142,17 +118,14 @@ impl ImeField {
         self.last_event = SmolStr::new_static("End（焦点离开输入框）");
     }
 
-    /// 是否正在组合（`Start` / `Preedit` / `Commit` / `End` 驱动，不依赖系统是否发组合串）。
     pub(crate) fn composing(&self) -> bool {
         self.composing
     }
 
-    /// 已提交文本（无障碍 `value` 与断言面）。
     pub(crate) fn committed(&self) -> &str {
         &self.committed
     }
 
-    /// 输入框内显示的文本：已提交 + 组合串 + 焦点时的光标。
     pub(crate) fn display(&self, caret: bool) -> SmolStr {
         let text = format_smolstr!("{}{}", self.committed, self.preedit);
         if caret {
@@ -162,19 +135,16 @@ impl ImeField {
         }
     }
 
-    /// 「组合中：shi li」/「组合中：（输入法处理中）」/「组合中：（未开始）」。
     pub(crate) fn preedit_line(&self) -> SmolStr {
         if !self.composing {
             SmolStr::new_static("组合中：（未开始）")
         } else if self.preedit.is_empty() {
-            // Windows 11 MSPY 只发 Start/Commit/End，组合串由 IME 自己的窗口显示。
             SmolStr::new_static("组合中：（输入法处理中）")
         } else {
             format_smolstr!("组合中：{}", self.preedit)
         }
     }
 
-    /// 「最近 IME 事件：Preedit("shi li")（共 12 次）」。
     pub(crate) fn event_line(&self) -> SmolStr {
         let last = if self.last_event.is_empty() {
             "—"
@@ -184,7 +154,6 @@ impl ImeField {
         format_smolstr!("最近 IME 事件：{last}（共 {} 次）", self.events)
     }
 
-    /// 「最近提交：跨平台 GUI 引擎」/「最近提交：（无）」。
     pub(crate) fn submitted_line(&self) -> SmolStr {
         if self.submitted.is_empty() {
             SmolStr::new_static("最近提交：（无）")
@@ -194,14 +163,6 @@ impl ImeField {
     }
 }
 
-/// 按 UTF-16 区间把组合串的一段替换成 `replacement`；`replace = None` = 整段替换。
-///
-/// 区间来自 [`ImeEvent::Preedit`] / [`ImeEvent::Commit`]（macOS `NSTextInputClient` 的
-/// `replacementRange`；平台层已把 AppKit 的**文档坐标**减去 `markedRange.location` 换算成
-/// 相对组合串起点，并把端点吸附到码点边界）。
-/// 这里是应用侧消费语义：只替换区间里的旧组合串，区间外的部分原样保留（组合串中间的
-/// 逐子句更新/重转换不会丢字）。异常输入（越界、端点落在代理对中间）向最近的码点边界收缩，
-/// 保证 `&str` 切片永远合法。
 fn replace_utf16(text: &str, replace: Option<&Range<usize>>, replacement: &str) -> SmolStr {
     let Some(range) = replace else {
         return SmolStr::new(replacement);
@@ -226,10 +187,6 @@ fn replace_utf16(text: &str, replace: Option<&Range<usize>>, replacement: &str) 
     format_smolstr!("{}{replacement}{}", &text[..start], &text[end..])
 }
 
-/// 建输入框 + 三行状态 + 提示；返回 `(输入框节点, 正文文本节点)`。
-///
-/// 正文文本节点是 IME caret 的几何来源（P16）：它的可见文本不含末尾视觉 `|`，应用用
-/// `display(false).len()` 作为 UTF-8 插入点偏移。
 pub(crate) fn build(
     app: &mut App,
     window: WindowId,
@@ -255,8 +212,6 @@ pub(crate) fn build(
             description: Some(SmolStr::new_static(
                 "点击后用系统输入法输入中文；Enter 提交，Backspace 删除",
             )),
-            // 引擎没有选区模型：只声明 `SetValue`（声明 `SetTextSelection` 而没有 handler 会被引擎
-            // 记为 `UnhandledAction`，demo 不该留下这种噪音）。
             actions: Some(vec![A11yAction::SetValue]),
             ..A11yOverride::default()
         })
@@ -367,8 +322,6 @@ mod tests {
         assert_eq!(field.event_line().as_str(), "最近 IME 事件：End（共 4 次）");
     }
 
-    /// Windows 11 的 Microsoft Pinyin 只发 Start / Commit / End：没有 `Preedit` 时
-    /// `composing` 仍必须为真，否则组合中的 `Esc` 会被当成「退出应用」。
     #[test]
     fn start_alone_marks_the_composition_without_a_preedit_string() {
         let mut field = ImeField::default();
@@ -415,8 +368,6 @@ mod tests {
         assert_eq!(field.display(false).as_str(), "shi");
     }
 
-    /// mac-2 回归：`replacementRange` 不是 `{NSNotFound, 0}` 时只替换组合串内的指定区间
-    /// （UTF-16 码元），区间外的组合串余下文本必须保留，不能整段丢弃/追加。
     #[test]
     fn preedit_replaces_only_the_requested_utf16_range() {
         let mut field = ImeField::default();
@@ -427,7 +378,6 @@ mod tests {
             replace: None,
         });
 
-        // 组合串内 [1, 3)（"ih"）被新的组合串 "í" 替换 → "n" + "í" + "a"。
         field.apply(&ImeEvent::Preedit {
             caret: None,
             clauses: smallvec::SmallVec::new(),
@@ -439,7 +389,6 @@ mod tests {
         assert_eq!(field.committed(), "", "组合串不进正文");
     }
 
-    /// 提交时带替换区间：区间外的组合串余下文本随提交一起落到正文。
     #[test]
     fn commit_replaces_only_the_requested_utf16_range() {
         let mut field = typed("前缀");
@@ -460,7 +409,6 @@ mod tests {
         assert_eq!(field.display(false).as_str(), "前缀nía");
     }
 
-    /// UTF-16 代理对边界：区间端点不会拆开 emoji（平台层已吸附，应用侧再防御一层）。
     #[test]
     fn preedit_replacement_keeps_surrogate_pairs_intact() {
         let mut field = ImeField::default();
@@ -471,7 +419,6 @@ mod tests {
             replace: None,
         });
 
-        // 整个 emoji（2 个 UTF-16 码元）被替换；后面的 'a' 保留。
         field.apply(&ImeEvent::Preedit {
             caret: None,
             clauses: smallvec::SmallVec::new(),
@@ -480,8 +427,6 @@ mod tests {
         });
         assert_eq!(field.display(false).as_str(), "🌏a");
 
-        // 篡改区间（落在代理对中间）时按码点边界收缩，不能 panic/产生非法 UTF-8：
-        // 起点/终点都落在 emoji 的低代理之后 ⇒ 收缩成 emoji 末尾的插入点 "🌏|a" → "🌏xa"。
         field.apply(&ImeEvent::Preedit {
             caret: None,
             clauses: smallvec::SmallVec::new(),
@@ -632,7 +577,6 @@ mod showcase_tests {
         frame(&mut test);
 
         let app = test.app_mut();
-        // Tab 序的最后一个可聚焦节点是输入框。
         let focused = app.focus_prev(window).expect("输入框");
         assert_eq!(app.focused(window), Some(focused));
 
@@ -675,7 +619,6 @@ mod showcase_tests {
         dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Enter)));
         assert_eq!(ime_text(&scene, app).as_str(), "", "Enter 提交后清空输入");
 
-        // 焦点移走后，IME / 文本事件都必须被忽略。
         let _ = app.set_focus(window, None);
         dispatch_event(
             &mut scene,
@@ -709,7 +652,6 @@ mod showcase_tests {
                 .expect("窗口存在")
                 .expect("输入框聚焦后必须有 caret hint")
         };
-        // 输入框：卡片原点 + 字段 (18,40) + 正文子节点内缩 (14,12)。
         let card = crate::scene::IME_CARD.origin;
         assert!(empty.origin.x >= card.x + 18.0 + 14.0, "{empty:?}");
         assert!(empty.origin.y >= card.y + 40.0 + 12.0, "{empty:?}");
@@ -727,7 +669,6 @@ mod showcase_tests {
             );
             tick(&mut scene, app);
         }
-        // 文本信号改了，必须让 text pass 重建 ShapedText 后 caret 几何才可解析。
         assert_eq!(ime_text(&scene, test.app()).as_str(), "你好");
         frame(&mut test);
         let after = test
@@ -759,8 +700,6 @@ mod showcase_tests {
         let app = test.app_mut();
         let _ = app.focus_prev(window).expect("输入框");
 
-        // 覆盖「平台在组合开始时发 Start」的路径（Windows IMM32 IME）；Linux/macOS 平台层不发 Start，
-        // 经 Preedit 进入组合态。本机 Windows 11 MSPY 组合期间不发 Start，属 V-104 的平台边界。
         dispatch_event(&mut scene, app, &Event::Ime(ImeEvent::Start));
         dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Escape)));
         assert!(
@@ -791,7 +730,6 @@ mod showcase_tests {
                 replace: None,
             }),
         );
-        // Tab 离开输入框：钩子必须收起组合态，否则 Esc 会被一直当成「组合中」。
         let _ = app.focus_next(window);
         tick(&mut scene, app);
         dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::Escape)));

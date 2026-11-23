@@ -1,9 +1,3 @@
-//! Where everything on a statistics chart goes.
-//!
-//! The layout is a pure function of the box the chart was given and the labels its axes
-//! will show, so these tests need no engine: they are the whole of what decides where a
-//! box lands.
-
 use smol_str::SmolStr;
 use ui_core::math::{Point, Rect, Size};
 
@@ -19,12 +13,10 @@ use super::{
     rect::RectExt,
 };
 
-/// The box a chart is laid out in for most of these tests.
 fn bounds() -> Rect {
     Rect::new(0.0, 0.0, 640.0, 360.0)
 }
 
-/// A box's centre.
 fn center(plot: Rect) -> Point {
     Point::new(
         plot.origin.x + plot.size.width / 2.0,

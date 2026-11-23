@@ -1,30 +1,3 @@
-//! The order book's model: the snapshot the service publishes and the grouped
-//! book the widget draws.
-//!
-//! A venue publishes hundreds or thousands of levels; a pane shows a few dozen
-//! rows of them, grouped to a price step the user picks. The two are kept apart
-//! deliberately: [`OrderBookSnapshot`] is exactly what the venue said (truncated
-//! to a known depth), and [`GroupedBook`] is the derived state a frame draws.
-//! Regrouping is therefore cheap to repeat — changing the price step or the row
-//! limit rebuilds it from the snapshot the widget already holds, without touching
-//! the subscription.
-//!
-//! # Why the grouping carries animation state
-//!
-//! A depth bar grows and shrinks; easing that movement is what makes a book
-//! readable at a glance. The easing needs to know where the bar *is* right now,
-//! which is neither the previous value nor the new one but the last thing the
-//! frame actually painted, so every level also carries the ratio it was painted
-//! with and the progress that interpolation had reached.
-//!
-//! # Why the labels are formatted here
-//!
-//! Formatting a price costs a decimal rounding plus a string allocation, and a
-//! book is rebuilt several times a second. Each level therefore formats its three
-//! labels at most once and then reuses them for as long as the value it shows
-//! stays the same, and the book as a whole does the same for the mid price, the
-//! spread and the imbalance.
-
 use std::{collections::BTreeMap, sync::Arc};
 
 use market_participants_model::{
@@ -38,23 +11,11 @@ use market_participants_model::{
 };
 use smol_str::{SmolStr, format_smolstr};
 
-/// The price-grouping multipliers, in the order they are offered.
 pub(super) const PRICE_MULTIPLIERS: [u32; 5] = [1, 10, 100, 1_000, 10_000];
-/// The visible rows one side may be limited to, in the order they are offered.
 pub(super) const WINDOW_SIZES: [usize; 3] = [25, 50, 100];
-/// The visible rows a venue that publishes a shallow book is offered.
 pub(super) const SHALLOW_WINDOW_SIZES: [usize; 3] = [5, 10, 20];
-/// The most levels one side keeps. The far end of a book is never drawn, so a
-/// venue that publishes deeper than this is truncated where nothing is read.
 pub(super) const MAX_LEVELS_PER_SIDE: usize = 5_000;
 
-/// The row limits one side of a book `depth` levels deep is offered.
-///
-/// A venue that publishes at most twenty levels per side cannot fill a standard
-/// window at all, so its book offers the shallow ladder instead: a window larger
-/// than the book would only draw the rows that exist under a label that claims
-/// more. A route whose depth the venue has not answered yet keeps the standard
-/// ladder, which is what a book deeper than every window looks like.
 pub(super) fn window_sizes(depth: Option<u16>) -> &'static [usize] {
     match depth {
         Some(depth) if usize::from(depth) < WINDOW_SIZES[0] => &SHALLOW_WINDOW_SIZES,
@@ -62,11 +23,6 @@ pub(super) fn window_sizes(depth: Option<u16>) -> &'static [usize] {
     }
 }
 
-/// The row limit a book of that depth starts with.
-///
-/// The standard default is kept wherever the route can fill it; a shallow route
-/// starts with the deepest window it offers, which is the one closest to the
-/// default without naming rows the book does not have.
 pub(super) fn default_window_size(depth: Option<u16>) -> usize {
     let sizes = window_sizes(depth);
     if sizes.contains(&WINDOW_SIZES[0]) {
@@ -78,8 +34,6 @@ pub(super) fn default_window_size(depth: Option<u16>) -> usize {
 
 #[cfg(test)]
 std::thread_local! {
-    // Counts the labels one test formatted, so a test can prove that a rebuild of
-    // unchanged levels reuses them instead of formatting them again.
     static FORMAT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -89,33 +43,15 @@ fn format_label(format: impl FnOnce() -> SmolStr) -> SmolStr {
     format()
 }
 
-/// The increments and the units every label of one book is written in, and how
-/// deep the venue publishes it.
-///
-/// The increments and the units come from the listing's own rule set, which the
-/// service reads before it opens a stream, and they are carried on the snapshot
-/// because a book cannot be rounded or labelled without them. The depth is the
-/// venue's own bound for the route, read at the same time: it is what decides
-/// which row limits the book can fill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct OrderBookMetadata {
-    /// The increments every price and quantity of the book is written at.
     pub precision: ListingPrecision,
-    /// The asset every price of the listing is quoted in.
     pub quote_asset: AssetId,
-    /// What every quantity of the listing counts.
     pub quantity_unit: QuantityUnit,
-    /// The deepest book the venue publishes per side.
     pub depth: u16,
 }
 
 impl OrderBookMetadata {
-    /// Reads the increments and the units of one book, with the depth its venue
-    /// publishes it at.
-    ///
-    /// A price tick is non-zero by its own type, and a quantity step the rule set
-    /// states as zero leaves the book rounding quantities to whole units rather
-    /// than refusing to draw it.
     pub(super) fn of(rules: &TradingRules, depth: u16) -> Self {
         let price = &rules.common.price;
         Self {
@@ -127,8 +63,6 @@ impl OrderBookMetadata {
     }
 }
 
-/// One published order book: both sides in best-first order, with the sequence
-/// the venue had reached when it was taken.
 #[derive(Clone, Debug)]
 pub(super) struct OrderBookSnapshot {
     pub asks: Arc<[ListingOrderBookLevel]>,
@@ -138,12 +72,6 @@ pub(super) struct OrderBookSnapshot {
 }
 
 impl OrderBookSnapshot {
-    /// Takes a snapshot of a listing's book, keeping at most `maximum_levels`
-    /// levels per side.
-    ///
-    /// The depth is clamped rather than trusted: it decides how much of a venue's
-    /// book is copied on every publish, and a caller asking for more than the
-    /// model can hold would only make that copy larger.
     pub(super) fn from_market_participant(
         book: &ListingOrderBook,
         metadata: OrderBookMetadata,
@@ -159,7 +87,6 @@ impl OrderBookSnapshot {
     }
 }
 
-/// One visible level of a side, ready to draw.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct GroupedLevel {
     pub price: Price,
@@ -168,34 +95,22 @@ pub(super) struct GroupedLevel {
     pub price_text: SmolStr,
     pub quantity_text: SmolStr,
     pub cumulative_quantity_text: SmolStr,
-    /// The depth-bar ratio this level was last painted with, and the ratio it is
-    /// heading for. A frame interpolates between them; the model only decides
-    /// where the movement starts from.
     pub previous_ratio: f32,
     pub current_ratio: f32,
 }
 
-/// One side of a book, grouped to a price step and limited to the visible rows.
 #[derive(Debug)]
 pub(super) struct GroupedBook {
-    /// Asks in ascending price order, bids in descending order: both start at the
-    /// best price, which is the level nearest the mid price on screen.
     pub asks: Arc<[GroupedLevel]>,
     pub bids: Arc<[GroupedLevel]>,
     pub price_tick: Tick,
-    /// The asset the prices are quoted in, which is what the price column is
-    /// labelled with.
     pub quote_asset: AssetId,
-    /// What the quantities count, which is what the quantity columns are labelled
-    /// with.
     pub quantity_unit: QuantityUnit,
     pub mid_price: Option<Price>,
     pub spread_text: Option<SmolStr>,
     pub mid_price_text: Option<SmolStr>,
     pub ask_imbalance_text: SmolStr,
     pub bid_imbalance_text: SmolStr,
-    /// The ask share of the visible quantity when this book was last painted, and
-    /// the share it is heading for.
     pub previous_imbalance: f32,
     pub current_imbalance: f32,
     group_tick: Tick,
@@ -203,7 +118,6 @@ pub(super) struct GroupedBook {
     spread: Option<Price>,
 }
 
-/// The levels one side is grouped from, and the step to group them by.
 struct GroupedBookInput<'a> {
     asks: &'a [ListingOrderBookLevel],
     bids: &'a [ListingOrderBookLevel],
@@ -216,13 +130,6 @@ struct GroupedBookInput<'a> {
 }
 
 impl GroupedBook {
-    /// Groups a snapshot to `price_multiplier` steps, keeping `window_size` rows
-    /// per side.
-    ///
-    /// `previous` is the book that was drawn last and `previous_animation_progress`
-    /// how far its easing had got, which is what makes an unfinished movement
-    /// continue from the ratio on screen instead of jumping back to the value it
-    /// started from.
     pub(super) fn build(
         snapshot: &OrderBookSnapshot,
         previous: Option<&Self>,
@@ -253,8 +160,6 @@ impl GroupedBook {
     ) -> Self {
         let previous_animation_progress = sanitize_ratio(previous_animation_progress);
         let group_tick = multiplied_tick(input.price_tick, input.price_multiplier);
-        // Only a book grouped by the same steps can hand its ratios over: the
-        // indices mean nothing once the rows are cut differently.
         let previous_levels_match = previous.is_some_and(|book| {
             book.group_tick == group_tick && book.quantity_tick == input.quantity_tick
         });
@@ -338,11 +243,6 @@ impl GroupedBook {
         }
     }
 
-    /// Whether this book draws exactly what `other` draws.
-    ///
-    /// A venue publishes far more often than a book changes on screen, and a
-    /// frame that would draw the same pixels is not worth scheduling: this is what
-    /// lets the widget skip the redraw instead of publishing a new book to itself.
     pub(super) fn has_same_current_state(&self, other: &Self) -> bool {
         self.price_tick == other.price_tick
             && self.group_tick == other.group_tick
@@ -356,8 +256,6 @@ impl GroupedBook {
             && current_levels_equal(&self.bids, &other.bids)
     }
 
-    /// The largest movement this book asks a frame to ease, which is what decides
-    /// whether easing it is visible at all.
     pub(super) fn animation_span(&self) -> f32 {
         self.asks
             .iter()
@@ -370,8 +268,6 @@ impl GroupedBook {
     }
 }
 
-/// Which side of the book is being grouped. Asks round up and bids round down,
-/// so a bucket never claims a price the venue did not quote on that side.
 #[derive(Clone, Copy)]
 enum Side {
     Ask,
@@ -384,7 +280,6 @@ struct GroupedSide {
     best_price: Option<Price>,
 }
 
-/// The context one side's levels are built with, shared by every row.
 struct GroupedLevelContext {
     visible_total: Quantity,
     previous_animation_progress: f32,
@@ -392,11 +287,6 @@ struct GroupedLevelContext {
     quantity_tick: Tick,
 }
 
-/// Groups one side's levels into price buckets, best first.
-///
-/// The window is applied while bucketing rather than afterwards: a book has
-/// thousands of levels and only the best few dozen are ever drawn, so the far end
-/// is dropped as it is walked instead of being collected and then cut.
 fn group_side(
     source_levels: &[ListingOrderBookLevel],
     side: Side,
@@ -462,8 +352,6 @@ fn group_side(
         group_tick,
         quantity_tick,
     };
-    // Asks are grouped in ascending order and bids in descending order, so both
-    // start at the best price and walk away from the mid price.
     match side {
         Side::Ask => {
             for (index, (price, quantity)) in buckets.into_iter().enumerate() {
@@ -498,11 +386,6 @@ fn group_side(
     }
 }
 
-/// Adds one row, cumulating the side's quantity as it goes.
-///
-/// Each label is reused from the row that was drawn at the same index when it
-/// still shows the same value, which is what keeps a book that only moved at the
-/// top of the ladder from reformatting every row below it.
 fn push_grouped_level(
     levels: &mut Vec<GroupedLevel>,
     cumulative: &mut Quantity,
@@ -560,8 +443,6 @@ fn midpoint(left: Price, right: Price) -> Price {
     Price::from_inner(low.saturating_add(high.saturating_sub(low) / 2))
 }
 
-/// The ask share of the visible quantity, which is what the imbalance bar splits
-/// on. A book with nothing visible on either side is neutral rather than empty.
 fn imbalance(ask_total: Quantity, bid_total: Quantity) -> f32 {
     let ask = ask_total.inner() as f64;
     let bid = bid_total.inner() as f64;
@@ -585,12 +466,6 @@ pub(super) fn interpolated_ratio(previous: f32, current: f32, progress: f32) -> 
     (previous + (current - previous) * progress).clamp(0.0, 1.0)
 }
 
-/// Whether `sequence` is strictly after `other`.
-///
-/// Two sequences of different representations are not comparable, and an ordering
-/// that cannot be stated is never one this book acts on: the answer is `false`, so
-/// every caller falls back to comparing only what both ends agree on — a whole
-/// snapshot.
 pub(super) fn is_after(sequence: &MarketSequence, other: &MarketSequence) -> bool {
     sequence.is_after(other) == Some(true)
 }
@@ -627,16 +502,11 @@ fn group_price(value: u128, step: u128, side: Side) -> u128 {
     }
 }
 
-/// The step one bucket spans: the venue's price tick multiplied by the user's
-/// grouping choice. A product that no longer fits a tick keeps the venue's own
-/// step rather than inventing one.
 fn multiplied_tick(price_tick: Tick, multiplier: u32) -> Tick {
     let inner = price_tick.inner().saturating_mul(u128::from(multiplier));
     Tick::from_inner(inner).unwrap_or(price_tick)
 }
 
-/// The label of one price-grouping choice: the step it groups to, written the way
-/// the venue writes prices.
 pub(super) fn price_step_label(price_tick: Option<Tick>, multiplier: u32) -> SmolStr {
     let Some(price_tick) = price_tick else {
         return SmolStr::new_static("--");
@@ -650,7 +520,6 @@ pub(super) fn price_step_label(price_tick: Option<Tick>, multiplier: u32) -> Smo
     format_label(|| Price::from_inner(inner).format_and_round_tick(group_tick))
 }
 
-/// Every price-grouping label, in the order the choices are offered.
 pub(super) fn price_step_labels(price_tick: Option<Tick>) -> [SmolStr; PRICE_MULTIPLIERS.len()] {
     PRICE_MULTIPLIERS.map(|multiplier| price_step_label(price_tick, multiplier))
 }
@@ -784,8 +653,6 @@ mod tests {
         assert_eq!((snapshot.asks.len(), snapshot.bids.len()), (2, 2));
     }
 
-    /// The listing key the model's own fixtures publish under. The model never
-    /// reads it, but a book is always the book of one listing.
     fn listing_key() -> VenueListingKey {
         market_participants_connector::catalog::test_support::listing_key(
             &market_participants_connector::catalog::test_support::spot_route(),

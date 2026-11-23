@@ -1,10 +1,3 @@
-//! The Polymarket adapter: Gamma event directory and CLOB probability history.
-//!
-//! Polymarket is one venue with two HTTP hosts. Gamma publishes the event
-//! directory and CLOB publishes prices and history; the execution context carries
-//! both, and this adapter chooses the host by the request it is answering rather
-//! than by a second venue identity.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     pin::Pin,
@@ -66,16 +59,10 @@ use crate::{
     },
 };
 
-/// The Polygon chain id every Polymarket settlement asset lives on.
 const POLYGON_CHAIN: &str = "137";
 
-/// The pUSD settlement asset of both CTF and Protocol V2.
 const PUSD_CONTRACT: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 
-/// The eight fixed categories the selector offers.
-///
-/// The first matching tag wins, in this order. The key is what a filter stores;
-/// the label is what the venue publishes; the id and slug are Gamma's own.
 const CATEGORIES: [(&str, &str, &str, &str); 8] = [
     ("politics", "Politics", "2", "politics"),
     ("sports", "Sports", "1", "sports"),
@@ -87,33 +74,26 @@ const CATEGORIES: [(&str, &str, &str, &str); 8] = [
     ("world", "World", "101970", "world"),
 ];
 
-/// The most options one card draws.
 const CARD_OPTIONS: usize = 6;
 
-/// The most markets one CLOB batch history request accepts.
 const CLOB_BATCH_LIMIT: usize = 20;
 
-/// The largest page Gamma's event directories accept.
 const GAMMA_PAGE_LIMIT: u16 = 100;
 
-/// The path the CLOB market channel answers on.
 const MARKET_CHANNEL_PATH: &str = "/ws/market";
 
-/// The Polymarket adapter.
 #[derive(Clone)]
 pub struct PolymarketAdapter {
     venue: VenueId,
 }
 
 impl PolymarketAdapter {
-    /// Builds the adapter.
     pub fn new() -> Self {
         Self {
             venue: VenueId::Polymarket,
         }
     }
 
-    /// Reads one page of events from Gamma.
     async fn events(
         &self,
         context: &ExecutionContext,
@@ -219,8 +199,6 @@ impl PolymarketAdapter {
         Ok((answer.events.unwrap_or_default(), next, total))
     }
 
-    /// Reads one event from Gamma, including the child events that carry its
-    /// additional markets.
     async fn event(
         &self,
         context: &ExecutionContext,
@@ -231,7 +209,6 @@ impl PolymarketAdapter {
         decode_view(&event).map(|(view, _)| view)
     }
 
-    /// Reads one event and appends the markets of every child event.
     async fn event_with_children(
         &self,
         context: &ExecutionContext,
@@ -243,14 +220,11 @@ impl PolymarketAdapter {
         Ok(event)
     }
 
-    /// Reads the child events Gamma publishes under one parent event.
     async fn event_children(
         &self,
         context: &ExecutionContext,
         id: &str,
     ) -> Result<Vec<GammaEvent>, MarketParticipantError> {
-        // Only the keyset directory accepts `parent_event_id`; the plain event
-        // directory would ignore it and return unrelated events.
         let mut children = Vec::new();
         let mut cursor: Option<SmolStr> = None;
         loop {
@@ -296,7 +270,6 @@ impl PolymarketAdapter {
         get_json(context, &url).await
     }
 
-    /// Reads probability series from CLOB.
     async fn series(
         &self,
         context: &ExecutionContext,
@@ -352,8 +325,6 @@ impl PolymarketAdapter {
                 series[index].points = points
                     .iter()
                     .filter_map(history_point)
-                    // A preset window can reach further back than the caller
-                    // asked for, so the answer is trimmed to the request.
                     .filter(|point| window.contains(point.timestamp))
                     .fold(converted, |mut all, point| {
                         if all
@@ -369,12 +340,6 @@ impl PolymarketAdapter {
         Ok(series)
     }
 
-    /// Opens or reuses the market-channel connection of this route.
-    ///
-    /// The configured address is the stream host: the market channel lives under
-    /// `/ws/market`, so a host configured without a path is given that one. A path
-    /// an operator did configure is kept as it stands, because it is then the
-    /// operator's own route to the channel.
     async fn connection(
         &self,
         context: &ExecutionContext,
@@ -405,11 +370,6 @@ impl PolymarketAdapter {
         .await
     }
 
-    /// Opens or joins the market-channel topic of one prediction event's legs.
-    ///
-    /// The topic is the subscription payload itself, so every subscription that
-    /// states the same assets acquires the same lease: a probability series and an
-    /// order book of one market therefore read one topic on one connection.
     async fn market_channel(
         &self,
         context: &ExecutionContext,
@@ -417,9 +377,6 @@ impl PolymarketAdapter {
     ) -> Result<MarketChannelSubscription, MarketParticipantError> {
         let (subscribe_payload, unsubscribe_payload) = market_channel_payloads(legs)?;
         let connection = self.connection(context).await?;
-        // Subscribe to the connection's frames before the subscription command is
-        // queued: the market channel answers a subscription with a book snapshot,
-        // and a receiver created afterwards could miss it.
         let events = Box::pin(connection.event_stream());
         let topic = SubscriptionTopic::from(subscribe_payload.clone());
         let lease = connection.subscribe(topic, subscribe_payload, unsubscribe_payload)?;
@@ -430,7 +387,6 @@ impl PolymarketAdapter {
         })
     }
 
-    /// Subscribes to the live midpoints of one prediction event's legs.
     async fn subscribe_prediction_series(
         &self,
         context: &ExecutionContext,
@@ -487,7 +443,6 @@ impl PolymarketAdapter {
         ))
     }
 
-    /// Reads one prediction leg's CLOB book snapshot.
     async fn prediction_order_book(
         &self,
         context: &ExecutionContext,
@@ -500,11 +455,6 @@ impl PolymarketAdapter {
         decode_book_snapshot(snapshot, &query.leg)
     }
 
-    /// Subscribes to the live book of one prediction leg.
-    ///
-    /// The subscription joins the whole market's topic, exactly like the
-    /// probability series of the same legs, and its frames are filtered to the
-    /// requested asset before they are decoded.
     async fn subscribe_prediction_order_book(
         &self,
         context: &ExecutionContext,
@@ -551,23 +501,15 @@ impl PolymarketAdapter {
     }
 }
 
-/// One lease on the market-channel topic of one prediction event's legs.
 struct MarketChannelSubscription {
     events: ConnectionFrames,
     cancellation: CancellationToken,
     lease: ConnectionSubscription,
 }
 
-/// The market-channel frames one connection publishes.
 type ConnectionFrames =
     Pin<Box<dyn Stream<Item = Result<Bytes, MarketParticipantError>> + Send + 'static>>;
 
-/// Builds the market-channel payloads of one prediction subscription.
-///
-/// The assets are the Polymarket legs in the order the query states them. A
-/// probability series and an order book of the same market therefore encode the
-/// same bytes, which is what makes their subscriptions share one topic lease on
-/// the connection.
 fn market_channel_payloads(
     legs: &[PredictionLeg],
 ) -> Result<(Bytes, Bytes), MarketParticipantError> {
@@ -613,27 +555,22 @@ impl Default for PolymarketAdapter {
     }
 }
 
-/// The protocol every market-channel connection dials with.
 fn connection_protocol() -> ConnectionProtocol {
     ConnectionProtocol::new(polymarket_response_id)
         .with_keepalive(heartbeat::KEEPALIVE)
         .with_liveness_timeout(heartbeat::LIVENESS_TIMEOUT)
 }
 
-/// The market channel carries no request identifiers.
 fn polymarket_response_id(_: &[u8]) -> Option<u64> {
     None
 }
 
-/// Reads the probability-moving events of one market-channel frame.
 fn decode_market_frame(
     payload: &[u8],
     legs: &[(SmolStr, OutcomeLegRef)],
 ) -> Result<Option<Vec<PredictionSeries>>, MarketParticipantError> {
     let frame: PolymarketMarketFrame = match serde_json::from_slice(payload) {
         Ok(frame) => frame,
-        // The channel also carries frames this build does not read; a frame that
-        // is not one of its typed events is not a failure of the subscription.
         Err(_) => return Ok(None),
     };
     let events = match frame {
@@ -695,8 +632,6 @@ fn decode_market_frame(
                     frame_timestamp(timestamp)?,
                 );
             }
-            // A tick-size or last-trade event moves no midpoint, so the series
-            // reads neither; the order book decodes both.
             PolymarketMarketEvent::TickSizeChange { .. }
             | PolymarketMarketEvent::LastTradePrice { .. }
             | PolymarketMarketEvent::Unknown => {}
@@ -768,27 +703,11 @@ fn midpoint(bid: Fraction, ask: Fraction) -> Option<Fraction> {
     Fraction::new(Ratio::from_inner(sum / 2)).ok()
 }
 
-/// Reads the instant a market-channel frame states.
-///
-/// The channel publishes milliseconds. A frame without one is stamped with the
-/// arrival time. A stated instant is raised to the arrival time when it is older:
-/// the chart appends a live point only when it is not older than the history it
-/// was folded into, so a venue clock running behind the CLOB history endpoint
-/// would otherwise silently freeze every line.
 fn frame_timestamp(value: Option<UnixMillis>) -> Result<UnixMillis, MarketParticipantError> {
     let now = now_millis()?;
     Ok(value.map_or(now, |timestamp| timestamp.max(now)))
 }
 
-/// Reads the instant a market-channel book frame states.
-///
-/// A book update keeps the venue's instant exactly as stated. The reader folds
-/// live updates into a REST snapshot by comparing instants, so raising a stated
-/// one to the arrival time — which the series decoder does on purpose, to keep a
-/// live point from freezing behind history — would make every frame buffered while
-/// the snapshot was in flight look newer than the snapshot, including the full book
-/// dump that opened the subscription. A frame without an instant is stamped with
-/// its arrival time.
 fn book_frame_timestamp(value: Option<UnixMillis>) -> Result<UnixMillis, MarketParticipantError> {
     match value {
         Some(timestamp) => Ok(timestamp),
@@ -796,11 +715,6 @@ fn book_frame_timestamp(value: Option<UnixMillis>) -> Result<UnixMillis, MarketP
     }
 }
 
-/// Returns the CLOB asset id of the leg one prediction order-book query is for.
-///
-/// The leg has to be one of the market's legs, and it has to be a Polymarket leg:
-/// this adapter publishes the CLOB book, so another native outcome leg is a
-/// capability this route does not serve.
 fn prediction_order_book_asset(
     query: &PredictionOrderBookQuery,
 ) -> Result<SmolStr, MarketParticipantError> {
@@ -823,7 +737,6 @@ fn prediction_order_book_asset(
     }
 }
 
-/// Decodes one CLOB book snapshot into a complete prediction order book.
 fn decode_book_snapshot(
     snapshot: ClobBookSnapshot,
     leg: &OutcomeLegRef,
@@ -847,10 +760,6 @@ fn decode_book_snapshot(
     })
 }
 
-/// Normalizes both sides of a venue book to best-first order.
-///
-/// The channel and the REST snapshot both publish bids ascending and asks
-/// descending; a level of size zero is not part of the book.
 fn best_first_levels(
     bids: &[PolymarketBookLevel],
     asks: &[PolymarketBookLevel],
@@ -876,7 +785,6 @@ fn book_levels(
     Ok(decoded)
 }
 
-/// Parses a decimal the venue may omit or publish as an empty string.
 fn optional_fraction(value: Option<&str>) -> Result<Option<Fraction>, MarketParticipantError> {
     match value {
         Some(value) if !value.is_empty() => {
@@ -886,7 +794,6 @@ fn optional_fraction(value: Option<&str>) -> Result<Option<Fraction>, MarketPart
     }
 }
 
-/// Parses the tick size the venue may omit or publish as an empty string.
 fn optional_tick(value: Option<&str>) -> Result<Option<Tick>, MarketParticipantError> {
     match value {
         Some(value) if !value.is_empty() => value.parse::<Tick>().map(Some).map_err(model_error),
@@ -894,11 +801,6 @@ fn optional_tick(value: Option<&str>) -> Result<Option<Tick>, MarketParticipantE
     }
 }
 
-/// Reads the book updates of one market-channel frame for one asset.
-///
-/// Frames are single objects or batches, and only the updates of the requested
-/// asset are published; a batch keeps its frame order. The frame this build does
-/// not read — a global lifecycle event, another venue event — is not an error.
 fn decode_prediction_book_frame(
     payload: &[u8],
     asset_id: &str,
@@ -932,9 +834,6 @@ fn decode_prediction_book_frame(
                     asks,
                     timestamp,
                 });
-                // A live book states its own precision and last trade, so a
-                // subscription that joined a leased topic can seed both before the
-                // REST snapshot is read.
                 if let Some(tick_size) = optional_tick(tick_size.as_deref())? {
                     updates.push(PredictionOrderBookUpdate::TickSize {
                         tick_size,
@@ -956,8 +855,6 @@ fn decode_prediction_book_frame(
                     if change.asset_id.as_str() != asset_id {
                         continue;
                     }
-                    // The size is the new absolute aggregate size of the level, so a
-                    // zero is published as the removal it is rather than dropped.
                     let level = PredictionBookLevelChange {
                         price: change.price.parse::<Fraction>().map_err(model_error)?,
                         size: change.size.parse::<Quantity>().map_err(model_error)?,
@@ -1088,8 +985,6 @@ fn categories() -> Vec<PredictionCategory> {
         .collect()
 }
 
-/// Appends the markets of every child event that the parent does not already
-/// publish.
 fn merge_child_events(event: &mut GammaEvent, children: Vec<GammaEvent>) {
     let mut seen: BTreeSet<SmolStr> = event
         .markets
@@ -1115,8 +1010,6 @@ fn category_of(event: &GammaEvent) -> PredictionCategory {
 }
 
 fn decode_card(event: &GammaEvent) -> Result<PredictionEventCard, MarketParticipantError> {
-    // A card lists what a reader can act on now; the event detail keeps closed
-    // markets so a finished event's history stays chartable.
     let open = GammaEvent {
         markets: event
             .markets
@@ -1150,9 +1043,6 @@ fn decode_card(event: &GammaEvent) -> Result<PredictionEventCard, MarketParticip
             .collect()
     };
     options.sort_by(|left, right| {
-        // An option the venue published no price for sorts after every option
-        // it did price, so a missing quote cannot push a priced option out of
-        // the card's bounded option list.
         right
             .probability
             .is_some()
@@ -1183,8 +1073,6 @@ fn decode_card(event: &GammaEvent) -> Result<PredictionEventCard, MarketParticip
     })
 }
 
-/// Picks the option a card shows for one market: the side marked as the
-/// market's first outcome, otherwise its first side.
 fn best_option(
     options: &[PredictionOptionCard],
     market: &PredictionMarket,
@@ -1230,7 +1118,6 @@ fn decode_view(
         let protocol = match protocol_of(market) {
             Ok(protocol) => protocol,
             Err(error) => {
-                // One stale or future market must not hide the rest of an event.
                 log::debug!("skipped a Polymarket market: {error}");
                 continue;
             }
@@ -1266,10 +1153,6 @@ fn decode_view(
         let mut default_leg = None;
         let mut legs = Vec::new();
         for (leg, side_label) in group_legs(&group) {
-            // The group sorts members and sides by their canonical ids, which need
-            // not be the order Gamma published. Resolve the asset by the side's own
-            // position in the outcome list, never by zipping sorted members to the
-            // wire arrays.
             let Some(index) = display_outcomes
                 .iter()
                 .position(|outcome| outcome == &side_label)
@@ -1390,8 +1273,6 @@ fn market_group(
     } else {
         market.question.clone()
     };
-    // A two-participant market is not binary: its outcomes name the members, so
-    // only the canonical Yes/No set takes the binary topology.
     let binary_market = is_binary_outcome_set(&outcomes);
     let member_label = market
         .group_item_title
@@ -1428,8 +1309,6 @@ fn market_group(
     Ok(Some((group, assets, aligned_prices)))
 }
 
-/// The market group Gamma publishes for a sports market, or the single generic
-/// group of a non-sports event.
 fn market_group_meta(market: &GammaMarket) -> PredictionMarketGroup {
     let Some(kind) = market
         .sports_market_type
@@ -1441,8 +1320,6 @@ fn market_group_meta(market: &GammaMarket) -> PredictionMarketGroup {
     PredictionMarketGroup::new(kind, market_type_label(kind))
 }
 
-/// Turns a Gamma sports market type such as `first_half_spreads` into a label a
-/// reader can scan.
 fn market_type_label(kind: &str) -> SmolStr {
     let (prefix, rest) = if let Some(rest) = kind.strip_prefix("first_half_") {
         (SmolStr::new_static("1st Half"), rest)
@@ -1501,10 +1378,6 @@ fn humanize_market_type(kind: &str) -> SmolStr {
 
 fn protocol_of(market: &GammaMarket) -> Result<PolymarketProtocolVersion, MarketParticipantError> {
     match market.version.as_deref() {
-        // Gamma leaves `version` out of the legacy CTF markets. Those markets
-        // are the original v1 protocol, so absence is the v1 answer rather than
-        // a malformed market. A version the venue does publish must be one this
-        // build knows how to address.
         None | Some("v1") => Ok(PolymarketProtocolVersion::V1),
         Some("v2") => Ok(PolymarketProtocolVersion::V2),
         Some(version) => Err(protocol_error(
@@ -1696,21 +1569,11 @@ fn transport_error(
     }
 }
 
-/// One CLOB history request's window.
-///
-/// The endpoint states a window two ways with different ceilings: an explicit
-/// `start_ts`/`end_ts` pair is exact but refused past fifteen days, and an
-/// `interval` preset reaches a month but silently collapses to one month at a
-/// fine `fidelity`. This picks the shape the span can actually be asked with,
-/// and remembers the instant the caller asked from so a preset answer wider than
-/// the request can be trimmed.
 struct HistoryWindow {
     interval: Option<&'static str>,
     fidelity: u16,
     start_ts: Option<i64>,
     end_ts: Option<i64>,
-    /// The oldest instant the caller asked for, in milliseconds. The whole-life
-    /// range asks from the epoch, so every answer passes the trim.
     since: UnixMillis,
 }
 
@@ -1720,20 +1583,12 @@ impl HistoryWindow {
     }
 }
 
-/// The longest span the endpoint accepts as an explicit timestamp pair.
 const CLOB_EXPLICIT_WINDOW_MILLIS: i64 = 15 * 86_400_000;
 
-/// The longest span the month preset reaches.
 const CLOB_PRESET_WINDOW_MILLIS: i64 = 30 * 86_400_000;
 
-/// The shortest span a request states: a non-positive span is one minute.
 const CLOB_MINIMUM_SPAN_MILLIS: i64 = 60_000;
 
-/// The bucket width the venue serves the whole history at, in minutes.
-///
-/// Below twelve hours the `max` preset silently answers one month instead of the
-/// whole history, so a span past the explicit limit has to be sampled at least
-/// this coarsely to actually reach back that far.
 const CLOB_MAX_PRESET_FIDELITY: u16 = 720;
 
 fn history_window(
@@ -1742,8 +1597,6 @@ fn history_window(
 ) -> Result<HistoryWindow, MarketParticipantError> {
     let end_ts = now_millis()? / 1_000;
     let Some(span) = span else {
-        // The whole life of the market: the preset states the reach and there is
-        // no earlier instant to trim to.
         return Ok(HistoryWindow {
             interval: Some("max"),
             fidelity: fidelity_minutes.max(CLOB_MAX_PRESET_FIDELITY),
@@ -1752,8 +1605,6 @@ fn history_window(
             since: 0,
         });
     };
-    // A span of zero (or less) would ask the venue for an empty pair, so it is
-    // clamped to one minute. The pair itself is stated in whole seconds.
     let span = span.max(CLOB_MINIMUM_SPAN_MILLIS);
     let start_ts = end_ts.saturating_sub(span / 1_000);
     let since = start_ts.saturating_mul(1_000);
@@ -1766,10 +1617,6 @@ fn history_window(
             since,
         });
     }
-    // Past the explicit limit the span is stated by a preset. `1m` is the
-    // venue's one-month window, not one minute: the sample spacing is
-    // `fidelity`, which is a separate field. A span past a month has to be asked
-    // with `max`, which only reaches the whole life at a twelve-hour bucket.
     let interval = if span <= CLOB_PRESET_WINDOW_MILLIS {
         "1m"
     } else {
@@ -1868,8 +1715,6 @@ mod tests {
 
     #[test]
     fn a_history_window_is_asked_the_way_the_endpoint_accepts_it() {
-        // Every range inside fifteen days is an exact timestamp pair at the
-        // fidelity its range asks for.
         for (span, fidelity) in [
             (3_600_000_i64, 1_u16),
             (21_600_000, 5),
@@ -1885,25 +1730,19 @@ mod tests {
             assert_eq!(short.since, start * 1_000);
         }
 
-        // The endpoint refuses an explicit span past fifteen days, so the
-        // boundary itself is the last explicit pair.
         let boundary = history_window(Some(15 * 86_400_000), 60).expect("the clock is readable");
         assert!(boundary.interval.is_none());
         assert!(boundary.start_ts.is_some() && boundary.end_ts.is_some());
 
-        // Past that, the span is stated by the month preset.
         let month = history_window(Some(30 * 86_400_000), 60).expect("the clock is readable");
         assert_eq!(month.interval, Some("1m"));
         assert!(month.start_ts.is_none() && month.end_ts.is_none());
         assert_eq!(month.fidelity, 60);
 
-        // A span longer than a month only reaches back at a twelve-hour bucket.
         let beyond = history_window(Some(30 * 86_400_000 + 1), 60).expect("the clock is readable");
         assert_eq!(beyond.interval, Some("max"));
         assert_eq!(beyond.fidelity, 720);
 
-        // The whole life of the market asks with no explicit bounds and trims
-        // nothing.
         let all = history_window(None, 720).expect("the clock is readable");
         assert_eq!(all.interval, Some("max"));
         assert_eq!(all.fidelity, 720);
@@ -1919,8 +1758,6 @@ mod tests {
         let requested_from = now - 30 * 86_400_000;
 
         assert!(window.contains(requested_from + 2_000));
-        // The request states its bounds in whole seconds, so the trim edge sits
-        // within the second the caller asked from.
         assert!(!window.contains(requested_from - 2_000));
     }
 
@@ -2311,7 +2148,6 @@ mod tests {
         assert_eq!(card.remaining_markets, 0);
     }
 
-    /// The event, legs and first leg of one fixture prediction market.
     fn prediction_market() -> (PredictionEventRef, Vec<PredictionLeg>, OutcomeLegRef) {
         let event = binary_event(binary_market("v1", &["123", "456"]));
         let (view, _) = decode_view(&event).expect("the fixture decodes");
@@ -2320,7 +2156,6 @@ mod tests {
         (view.event, legs, requested)
     }
 
-    /// A book snapshot of the documented CLOB shape.
     fn book_snapshot() -> ClobBookSnapshot {
         serde_json::from_str(
             r#"{
@@ -2551,12 +2386,6 @@ mod tests {
         assert!(*timestamp >= before);
     }
 
-    /// A book update keeps the venue's instant exactly.
-    ///
-    /// A reader folds live updates into the REST snapshot it fetched by comparing
-    /// instants, so a frame buffered while the snapshot was in flight must not look
-    /// newer than the snapshot it belongs with. The series decoder raises a stated
-    /// instant on purpose; the book decoder must not.
     #[test]
     fn a_book_frame_keeps_the_instant_the_venue_stated() {
         let read_at = now_millis().expect("the clock is readable");

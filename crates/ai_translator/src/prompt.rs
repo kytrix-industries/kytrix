@@ -1,10 +1,7 @@
-//! The hand-formatted prompt Hy-MT2 expects.
-
 use ai_provider::llama::prompt::PromptSpan;
 
 use crate::language::TargetLanguage;
 
-/// The control tokens that wrap one translation request.
 struct ChatMarkers {
     begin_of_sentence: &'static str,
     user: &'static str,
@@ -12,7 +9,6 @@ struct ChatMarkers {
 }
 
 impl ChatMarkers {
-    /// Hy-MT2's markers, written as literals because the prompt has to stay byte-exact.
     const HY_MT2: Self = Self {
         begin_of_sentence: "<｜hy_begin▁of▁sentence｜>",
         user: "<｜hy_User｜>",
@@ -20,12 +16,6 @@ impl ChatMarkers {
     };
 }
 
-/// Builds the prompt for one translation request.
-///
-/// The request is hand-formatted rather than rendered through the model's chat template:
-/// the training format is part of the model, and a template update would silently change
-/// the request. The instruction and markers are a control span; `content` is a plain-text
-/// span, so control-token spellings inside a document cannot forge a prompt turn.
 pub fn build(target: TargetLanguage, content: &str) -> Vec<PromptSpan> {
     let markers = ChatMarkers::HY_MT2;
     let instruction = format!(
@@ -44,13 +34,6 @@ pub fn build(target: TargetLanguage, content: &str) -> Vec<PromptSpan> {
     ]
 }
 
-/// Builds the prompt for one batch translation request.
-///
-/// `json` is the object that maps segment ids to their source text. The instruction is the
-/// model card's Structured Data 1 template in English, with JSON as the format type: plain
-/// `###` headings, bold rule labels, and only the card's three rules. The instruction and
-/// markers are a control span; `json` is a plain-text span, so a marker spelling inside a
-/// segment cannot forge a prompt turn.
 pub fn build_batch(target: TargetLanguage, json: &str) -> Vec<PromptSpan> {
     let markers = ChatMarkers::HY_MT2;
     let instruction = format!(
@@ -84,7 +67,6 @@ mod tests {
     use super::{build, build_batch};
     use crate::language::TargetLanguage;
 
-    /// Renders spans back into the byte-exact chat string the model card documents.
     fn render(spans: &[PromptSpan]) -> String {
         spans
             .iter()
@@ -94,8 +76,6 @@ mod tests {
             .collect()
     }
 
-    /// The prompt for `en`, spelled out once so a change to the format has to be a
-    /// conscious edit of this test.
     const ENGLISH: &str = concat!(
         "<｜hy_begin▁of▁sentence｜><｜hy_User｜>",
         "Translate the following text into English. ",
@@ -120,8 +100,6 @@ mod tests {
         "<｜hy_Assistant｜>",
     );
 
-    /// The Structured Data 1 prompt for `zh`, spelled out once so a change to the
-    /// format has to be a conscious edit of this test.
     const STRUCTURED_CHINESE: &str = concat!(
         "<｜hy_begin▁of▁sentence｜><｜hy_User｜>",
         "### Task\n",

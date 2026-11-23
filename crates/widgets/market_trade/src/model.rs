@@ -11,10 +11,8 @@ use market_participants_model::{
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
-/// How many trades the tape keeps. Older ones are evicted as newer arrive.
 pub(super) const MAX_TRADES: usize = 200;
 
-/// An immutable, cheap-to-clone view of the retained trades, oldest first.
 #[derive(Clone, Debug, Default)]
 pub(super) struct MarketTradeSnapshot {
     rows: Arc<[Arc<MarketTradeRow>]>,
@@ -30,13 +28,6 @@ impl MarketTradeSnapshot {
     }
 }
 
-/// Two snapshots are the same read exactly when they share the retained rows.
-///
-/// The tape only rebuilds its row storage when an insert changed what it holds, so
-/// pointer equality is the honest answer to "is this the same tape": a re-read of
-/// an unchanged retention set shares the storage, which is what lets
-/// [`Signal<MarketTradeSnapshot>`](ui_core::node::signal::Signal) skip the write and
-/// the frame it would schedule (AGENTS §3, I3).
 impl PartialEq for MarketTradeSnapshot {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.rows, &other.rows)
@@ -45,14 +36,9 @@ impl PartialEq for MarketTradeSnapshot {
 
 impl Eq for MarketTradeSnapshot {}
 
-/// One retained trade, with the labels it is drawn with filled in on demand.
 #[derive(Debug)]
 pub(super) struct MarketTradeRow {
     trade: ListingTrade,
-    /// The increments of the listing this trade printed on.
-    ///
-    /// The row keeps them because its labels are built long after the generation
-    /// that resolved the listing was published.
     precision: ListingPrecision,
     display: Mutex<Option<(UtcOffset, Arc<MarketTradeDisplay>)>>,
 }
@@ -62,13 +48,6 @@ impl MarketTradeRow {
         &self.trade
     }
 
-    /// The formatted labels of this row, built once per display zone and shared
-    /// afterwards.
-    ///
-    /// Formatting is deferred rather than done on arrival: a trade that is
-    /// evicted before it is ever drawn never costs a single label. The zone the
-    /// time was read in is remembered beside the labels, so a frame that draws the
-    /// same zone reuses them and a frame after the setting moved reads them again.
     pub(super) fn display(&self, zone: UtcOffset) -> Arc<MarketTradeDisplay> {
         let mut cached = self.display.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((cached_zone, display)) = cached.as_ref()
@@ -83,15 +62,6 @@ impl MarketTradeRow {
     }
 }
 
-/// The values one row draws, without their units.
-///
-/// A price is quoted in the asset the trade carries and a quantity is counted in
-/// the unit the trade carries, so both labels are attached where they are drawn:
-/// only the numbers are a property of the row itself.
-///
-/// Both numbers are written at the precision of the listing the trade printed on,
-/// so a price of `90000` on a listing with a tick of `0.01` reads as `90000.00`
-/// rather than as the canonical form that drops the zeroes.
 #[derive(Debug)]
 pub(super) struct MarketTradeDisplay {
     pub price: SmolStr,
@@ -115,29 +85,12 @@ impl MarketTradeDisplay {
     }
 }
 
-/// The trades the tape holds, kept in the order they printed.
 pub(super) struct MarketTradeState {
-    /// Keyed by chronological position rather than by the venue id.
-    ///
-    /// A trade id is unique for a venue and listing but is not required to increase
-    /// with the execution timestamp, so time orders the tape and the id only breaks
-    /// ties inside one millisecond. Keying on the pair is also what makes the map's
-    /// own order the display order: the row to evict is simply the first entry.
     trades: BTreeMap<(UnixMillis, MarketTradeId), Arc<MarketTradeRow>>,
-    /// The venue ids the tape already holds.
-    ///
-    /// The identifier is what tells two reports of the same execution apart, and
-    /// it is the one thing the position key cannot answer: a venue that stamps
-    /// the opening page and the live event differently would otherwise keep both
-    /// copies of one trade.
     retained_ids: BTreeSet<MarketTradeId>,
     snapshot_rows: Arc<[Arc<MarketTradeRow>]>,
     snapshot_dirty: bool,
     maximum_trades: usize,
-    /// The increments of the listing of this tape.
-    ///
-    /// The whole tape belongs to one listing — a stream is opened for exactly one
-    /// — so every row of it is written at this precision.
     precision: ListingPrecision,
 }
 
@@ -153,10 +106,6 @@ impl MarketTradeState {
         }
     }
 
-    /// Inserts a batch, keeping only the newest `maximum_trades` trades.
-    ///
-    /// Returns how many rows the tape gained, so a caller can tell a batch that
-    /// changed what is drawn from one that only repeated trades it already holds.
     pub(super) fn merge(&mut self, trades: impl IntoIterator<Item = ListingTrade>) -> usize {
         trades
             .into_iter()
@@ -164,12 +113,8 @@ impl MarketTradeState {
             .count()
     }
 
-    /// Inserts one trade, reporting whether it became a row.
     pub(super) fn insert(&mut self, trade: &ListingTrade) -> bool {
         if self.retained_ids.contains(&trade.id) {
-            // The same execution reported twice — the opening page and a buffered
-            // live event overlapping — is one row, and the copy that arrived first
-            // is the one kept.
             return false;
         }
 
@@ -180,8 +125,6 @@ impl MarketTradeState {
                 .first_key_value()
                 .is_some_and(|(oldest, _)| key < *oldest)
             {
-                // Older than everything retained: taking it would mean dropping a
-                // newer row to make room for a stale one.
                 return false;
             }
             if let Some((_, evicted)) = self.trades.pop_first() {
@@ -202,10 +145,6 @@ impl MarketTradeState {
         true
     }
 
-    /// The whole tape as one immutable value.
-    ///
-    /// A snapshot that nothing invalidated shares its row storage with the
-    /// previous one, so publishing it again costs a reference count.
     pub(super) fn snapshot(&mut self) -> MarketTradeSnapshot {
         if self.snapshot_dirty {
             let mut rows = Vec::with_capacity(self.trades.len());
@@ -220,11 +159,7 @@ impl MarketTradeState {
     }
 }
 
-/// The time of a trade, read in the zone the settings display data in.
 fn format_time(timestamp: UnixMillis, zone: UtcOffset) -> SmolStr {
-    // The offset can move an instant past the last date the calendar holds — a
-    // timestamp at the far end of the range is one the service cannot publish, and
-    // it is written as a placeholder rather than taken to a date that is not one.
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
         .ok()
         .and_then(|datetime| datetime.checked_to_offset(zone))
@@ -296,8 +231,6 @@ mod tests {
         MarketTradeState::new(maximum_trades, precision())
     }
 
-    /// A price tick of one cent and a quantity step of one thousandth, so a label
-    /// that keeps the listing's precision is told apart from the canonical form.
     fn precision() -> ListingPrecision {
         ListingPrecision {
             price_tick: "0.01".parse::<Tick>().expect("a price tick should parse"),
@@ -335,7 +268,6 @@ mod tests {
         let mut trades = state(10);
         assert!(trades.insert(&trade(7, 10, 100)));
 
-        // The same venue id, stamped differently by the source that reported it.
         assert!(!trades.insert(&trade(7, 20, 999)));
 
         let snapshot = trades.snapshot();
@@ -343,8 +275,6 @@ mod tests {
         assert_eq!(snapshot.rows()[0].trade().price.value, Price::from(100_u64));
     }
 
-    /// A venue identifies a trade either by a number or by its own identifier, and
-    /// the two are different trades even when they read the same.
     #[test]
     fn insert_should_keep_a_native_id_apart_from_the_numeric_one_of_the_same_digits() {
         let mut trades = state(10);
@@ -419,12 +349,6 @@ mod tests {
         assert!(Arc::ptr_eq(&before.rows, &after.rows));
     }
 
-    /// Two reads of an unchanged retention set are the same snapshot; a trade that
-    /// became a row makes a different one.
-    ///
-    /// The table's cells read the snapshot through a signal, so this equality is what
-    /// keeps a repeated publication of an unchanged tape from rewriting the signal and
-    /// scheduling a frame (I3).
     #[test]
     fn an_unchanged_snapshot_should_be_the_same_read() {
         let mut trades = state(2);
@@ -443,8 +367,6 @@ mod tests {
         trades.merge([trade(1, 10, 100), trade(2, 20, 101)]);
         trades.merge([trade(3, 30, 102)]);
 
-        // Id 1 left the tape with the row that held it, so nothing about it is
-        // still remembered.
         assert!(trades.insert(&trade(1, 40, 103)));
 
         assert_eq!(ordered_ids(&mut trades), numeric([3, 1]));
@@ -474,8 +396,6 @@ mod tests {
         );
     }
 
-    /// The display offset can move an instant past the last day the calendar holds.
-    /// That is not a time this can write, so it is a placeholder rather than a panic.
     #[test]
     fn a_time_the_display_zone_cannot_hold_should_read_as_a_placeholder() {
         let boundary = time::Date::MAX
@@ -510,9 +430,6 @@ mod tests {
         );
     }
 
-    /// A number is written at the precision of the listing it printed on, so a
-    /// price that is a whole number keeps the decimals its tick states instead of
-    /// being read as the canonical form that drops trailing zeroes.
     #[test]
     fn row_display_should_write_a_whole_price_at_the_listings_precision() {
         let mut trades = state(1);
@@ -530,9 +447,6 @@ mod tests {
         );
     }
 
-    /// A value the listing publishes at a finer increment than its own rule set
-    /// states is read at that rule set, not at the digits the venue happened to
-    /// print.
     #[test]
     fn row_display_should_round_the_values_to_the_listings_increments() {
         let mut trades = state(1);

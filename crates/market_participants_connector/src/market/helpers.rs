@@ -32,10 +32,6 @@ pub(crate) async fn subscribe(
         .map_err(MarketError::from)
 }
 
-/// Builds the request context of one capability call.
-///
-/// The capability a request needs is the classifier's answer, so a call site
-/// never repeats it.
 fn request_context(route: &VenueRoute, request: &ProtocolRequest) -> RequestIdentity {
     RequestIdentity::new(route.clone(), classify(request).capability())
 }

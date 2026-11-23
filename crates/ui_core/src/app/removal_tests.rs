@@ -1,19 +1,3 @@
-//! E16：节点子树卸载的自动清理（R-21 引擎下沉）的引擎级用例。
-//!
-//! 断言面：
-//! - `RemoveOutcome` 的四类清理计数（节点 / scoped 键绑定 / `after_scoped` 定时器 / 动画槽）
-//!   与 `remove_node_with_scope` 的作用域回收计数；
-//! - 语义边界：祖先删除清理整棵子树、只删后代保留祖先状态、重复删除是强类型 `StaleNode`
-//!   （不是静默 no-op）、root / 跨窗口 / 未知窗口错误且**无副作用**；
-//! - 不清理面（应用义务）：Action handler 与全局键绑定按 `Action` / 按键全局索引，引擎不碰；
-//! - 共享动画的保守归属（部分重绘节点存活 ⇒ 保留并剔除死节点）、滚动动画按 `ScrollHandle`；
-//! - 1000 轮「挂载 → 卸载」：信号槽位 / 绑定 / 定时器 / 动画 / 依赖边零增长；
-//! - 关窗路径行为不变；I3（清理本身不留下帧请求 / 唤醒源）。
-//!
-//! 全部走公开 + `pub(crate)` 面（`App::remove_node` 本身是公开 API；`timer_count_for_test` /
-//! `has_action_handler` / `scoped_key_binding_count` 是 `test-support` 观测面），因此整包
-//! 只在 `--features test-support` 的 lib 测试里编译。
-
 use std::{
     cell::{Cell, RefCell},
     panic::AssertUnwindSafe,
@@ -44,7 +28,6 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
         .build()
         .expect("current-thread runtime");
     let mut app = App::new(rt.handle().clone());
-    // 定时器与动画都用引擎时钟推进（`advance_clock` 是唯一时间源）。
     app.use_engine_clock();
     let window = app.create_window(WindowOptions {
         title: "e16".into(),
@@ -68,7 +51,6 @@ fn boxed_style(width: f32, height: f32) -> Style {
     style
 }
 
-/// 可聚焦的普通容器（`on_click` 让它进入焦点判定；不注册 handler ⇒ 点击没有副作用）。
 fn mount_box(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
     NodeBuilder::boxed()
         .style(boxed_style(40.0, 40.0))
@@ -77,7 +59,6 @@ fn mount_box(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
         .expect("mount box")
 }
 
-/// 绑定信号的容器（`bind_style` 产生一条节点 → 信号依赖边）。
 fn mount_bound(app: &mut App, window: WindowId, parent: NodeId, signal: Signal<u32>) -> NodeId {
     NodeBuilder::boxed()
         .style(boxed_style(40.0, 40.0))
@@ -90,7 +71,6 @@ fn mount_bound(app: &mut App, window: WindowId, parent: NodeId, signal: Signal<u
         .expect("mount bound")
 }
 
-/// 带裁剪的滚动容器（`App::make_scroll` 的前置条件）。
 fn mount_scroll(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
     let mut style = boxed_style(100.0, 100.0);
     style.clip = Clip::Bounds;
@@ -127,7 +107,6 @@ fn animation_count(app: &App) -> usize {
     app.animations.len()
 }
 
-/// 一直出帧到 `Idle`（把挂载 / 依赖边产生的帧请求排干净）。
 fn settle(app: &mut App, window: WindowId) {
     for _ in 0..8 {
         let outcome = app.frame(window).expect("window").expect("frame");
@@ -142,10 +121,6 @@ fn press(app: &mut App, window: WindowId, code: KeyCode) {
     app.dispatch_input(window, InputEvent::key_down(code, Modifiers::empty()));
 }
 
-// ── 清理计数与后置状态 ────────────────────────────────────────────────────
-
-/// 核心用例：删除子树自动清理 scoped 绑定 / `after_scoped` 定时器 / 动画槽，并给出计数；
-/// 祖先与其兄弟不受影响；被取消的公开动画按 `Removed` 入队完成事件。
 #[test]
 fn removing_a_subtree_cleans_bindings_timers_and_animations_with_counts() {
     let (_rt, mut app, window) = setup();
@@ -268,7 +243,6 @@ fn removing_a_subtree_cleans_bindings_timers_and_animations_with_counts() {
         "死节点必须从共享动画的重绘列表里剔除"
     );
 
-    // 完成事件在下一帧入口派发：被取消的公开动画报告 `Removed`（不是 Finished）。
     app.run_frame_hook();
     assert_eq!(
         completions.borrow().as_slice(),
@@ -276,14 +250,12 @@ fn removing_a_subtree_cleans_bindings_timers_and_animations_with_counts() {
         "只有被卸载路径取消的动画报告 Removed"
     );
 
-    // 定时器：子树内的不再派发，子树外的照常到期。
     app.advance_clock(Duration::from_millis(600));
     app.run_frame_hook();
     assert_eq!(inside_hits.get(), 0, "被卸载 scope 的定时器不得再回调");
     assert_eq!(outside_hits.get(), 1, "无关定时器不得被误伤");
 }
 
-/// 共享动画的保守归属已在上面的用例里断言；这里单独覆盖「重绘节点全部存活 ⇒ 不取消」。
 #[test]
 fn animations_that_only_drive_surviving_nodes_are_untouched() {
     let (_rt, mut app, window) = setup();
@@ -314,8 +286,6 @@ fn animations_that_only_drive_surviving_nodes_are_untouched() {
     );
 }
 
-/// 滚动动画按 `ScrollHandle` 的节点归属：容器被卸载 ⇒ 同批取消（终值是滚动状态，不是公开动画，
-/// 因此不产生完成事件）。
 #[test]
 fn scroll_animations_are_cancelled_with_their_container() {
     let (_rt, mut app, window) = setup();
@@ -347,10 +317,6 @@ fn scroll_animations_are_cancelled_with_their_container() {
     );
 }
 
-// ── 语义边界 ──────────────────────────────────────────────────────────────
-
-/// 引擎内部高频卸载路径（虚拟列表行回收）同样清行上的 scoped 资源：否则滚动会留下永不命中
-/// 的绑定、到期回调跑在死行上的定时器、以及给死行标脏的动画（R-21 的引擎内部半边）。
 #[test]
 fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
     let (_rt, mut app, window) = setup();
@@ -413,7 +379,6 @@ fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
     assert_eq!(timer_count(&app), 1);
     assert_eq!(animation_count(&app), 1);
 
-    // 滚到远处：第 0 行被回收，行上的 scoped 状态必须同批清除。
     app.scroll_to(
         &ScrollHandle::new(window, container),
         Point::new(0.0, 2000.0),
@@ -428,7 +393,6 @@ fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
     assert_eq!(animation_count(&app), 0, "回收行的动画槽必须取消");
 }
 
-/// 祖先删除清理整棵子树；只删后代保留祖先状态；重复删除是强类型 `StaleNode` 且无副作用。
 #[test]
 fn removing_an_ancestor_cleans_descendants_and_repeat_removal_is_stale() {
     let (_rt, mut app, window) = setup();
@@ -456,7 +420,6 @@ fn removing_an_ancestor_cleans_descendants_and_repeat_removal_is_stale() {
     )
     .expect("animate");
 
-    // 只删后代（leaf）：动画的重绘节点全在 leaf 子树内 ⇒ 同批取消；祖先绑定 / 定时器保留。
     let outcome = app.remove_node(window, leaf).expect("remove leaf");
     assert_eq!(outcome.removed_nodes, 1);
     assert_eq!(outcome.scoped_key_bindings, 0);
@@ -466,7 +429,6 @@ fn removing_an_ancestor_cleans_descendants_and_repeat_removal_is_stale() {
     assert_eq!(timer_count(&app), 1);
     assert_eq!(animation_count(&app), 0);
 
-    // 重复删除：显式失败（不是静默 no-op），且不改变任何计数。
     assert!(matches!(
         app.remove_node(window, leaf),
         Err(EngineError::StaleNode { node }) if node == leaf
@@ -475,8 +437,6 @@ fn removing_an_ancestor_cleans_descendants_and_repeat_removal_is_stale() {
     assert_eq!(timer_count(&app), 1);
     assert_eq!(animation_count(&app), 0);
 
-    // 祖先删除：整棵子树（inner 自身；leaf 已不在）一并清理。先给 inner 注册一条动画，
-    // 验证「祖先删除 ⇒ 其自身重绘节点的动画同批取消」。
     let value = app.transient(0.0_f32);
     app.animate(
         window,
@@ -496,7 +456,6 @@ fn removing_an_ancestor_cleans_descendants_and_repeat_removal_is_stale() {
     assert_eq!(scoped_count(&app, window, inner), 0);
     assert_eq!(timer_count(&app), 0);
     assert_eq!(animation_count(&app), 0);
-    // 祖先（outer）保留：它自己仍在树里。
     assert!(
         app.window(window)
             .expect("window")
@@ -507,8 +466,6 @@ fn removing_an_ancestor_cleans_descendants_and_repeat_removal_is_stale() {
     );
 }
 
-/// 未知窗口 / root / 跨窗口句柄：强类型错误，且**不产生任何副作用**（绑定 / 定时器 / 动画 /
-/// 节点树都不变）。
 #[test]
 fn removal_errors_are_strongly_typed_and_side_effect_free() {
     let (_rt, mut app, window) = setup();
@@ -568,10 +525,6 @@ fn removal_errors_are_strongly_typed_and_side_effect_free() {
     );
 }
 
-// ── 作用域释放（remove_node_with_scope）────────────────────────────────────
-
-/// 一次调用完成「卸载节点 → 释放作用域」：值槽位回收、引用其瞬态值的窗口级动画同批取消并
-/// 报告 `Released`；节点先卸载保证 `bind_*` 闭包不会被求值到已回收句柄。
 #[test]
 fn remove_node_with_scope_releases_values_after_unloading() {
     let (_rt, mut app, window) = setup();
@@ -583,7 +536,6 @@ fn remove_node_with_scope_releases_values_after_unloading() {
     app.refresh_styles(window).expect("window");
     assert_eq!(app.dependency_edge_count_for_test(), 1);
 
-    // 窗口级动画（`nodes = []`，不归属任何子树）⇒ 只能由 `release_scope` 路径取消。
     let id = app
         .animate(
             window,
@@ -618,7 +570,6 @@ fn remove_node_with_scope_releases_values_after_unloading() {
         &[(id, AnimationEndKind::Released)]
     );
 
-    // 值已回收：旧句柄读确定性 panic（不会读到槽位复用后的新值）。
     let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let _ = *app.read(&signal);
     }))
@@ -630,7 +581,6 @@ fn remove_node_with_scope_releases_values_after_unloading() {
         "panic 必须点名陈旧句柄"
     );
 
-    // 节点已卸载 ⇒ 重复删除是 StaleNode；已释放的作用域在另一个节点上按幂等处理。
     assert!(matches!(
         app.remove_node_with_scope(window, node, scope),
         Err(EngineError::StaleNode { .. })
@@ -642,11 +592,6 @@ fn remove_node_with_scope_releases_values_after_unloading() {
     assert_eq!(outcome.released_values, 0, "重复释放幂等");
 }
 
-// ── 不清理面（应用义务）────────────────────────────────────────────────────
-
-/// `on_action` handler 与全局 `bind_key` 按 `Action` / 按键**全局**索引：无法归属到一棵子树
-/// （同一动作可能被多个组件 / 窗口共享），引擎不得自动摘除（最小安全设计）。scoped 绑定则
-/// 必须被清掉。
 #[test]
 fn action_handlers_and_global_bindings_are_application_owned() {
     let (_rt, mut app, window) = setup();
@@ -682,16 +627,11 @@ fn action_handlers_and_global_bindings_are_application_owned() {
     );
     assert_eq!(app.bindings.len(), global_bindings, "全局键绑定保留");
     assert_eq!(app.scoped_bindings.len(), 0, "scoped 绑定清空");
-    // 焦点已陈旧 ⇒ 按键不得再命中被卸载 scope 的绑定（既不 panic 也不触发 handler）。
     press(&mut app, window, KeyCode::ArrowDown);
     assert_eq!(scoped_hits.get(), 1, "被卸载 scope 的绑定不得再命中");
     assert!(app.off_action(&action), "调用方仍可显式摘除 handler");
 }
 
-// ── 泄漏回归：1000 轮 churn ────────────────────────────────────────────────
-
-/// 1000 轮「挂载子树 + 作用域 + 绑定 + 定时器 + 动画 → 一次调用卸载并回收」：
-/// 信号槽位峰值 / 空闲栈 / 依赖边 / 绑定 / 定时器 / 动画 / 待派发完成事件都不增长。
 #[test]
 fn thousand_node_lifecycles_keep_every_table_flat() {
     const CYCLES: usize = 1000;
@@ -744,7 +684,6 @@ fn thousand_node_lifecycles_keep_every_table_flat() {
         assert_eq!(outcome.animations, 1, "第 {cycle} 轮");
         assert_eq!(outcome.released_values, VALUES_PER_SCOPE, "第 {cycle} 轮");
 
-        // 批次结束：表全部回零；完成事件在下一帧入口派发掉（不留无界队列）。
         app.run_frame_hook();
         assert_eq!(app.scoped_bindings.len(), 0, "第 {cycle} 轮");
         assert_eq!(timer_count(&app), 0, "第 {cycle} 轮");
@@ -770,10 +709,6 @@ fn thousand_node_lifecycles_keep_every_table_flat() {
     assert_eq!(peak, Some(VALUES_PER_SCOPE));
 }
 
-// ── 关窗路径行为不变 + I3 ─────────────────────────────────────────────────
-
-/// 关窗路径沿用既有清理（scoped 绑定 / 定时器 / 动画 / 窗口作用域），且关窗后 `remove_node`
-/// 报 `UnknownWindow`（不是 StaleNode）。
 #[test]
 fn close_window_path_is_unchanged() {
     let (_rt, mut app, window) = setup();
@@ -819,7 +754,6 @@ fn close_window_path_is_unchanged() {
     assert!(!app.close_window(window), "重复关窗仍是 false");
 }
 
-/// I3：清理本身不留下帧请求 / 定时器截止时刻 / 连续帧源；卸载后一个提交帧就回到 Idle。
 #[test]
 fn cleanup_leaves_no_frame_sources_behind() {
     let (_rt, mut app, window) = setup();
@@ -850,7 +784,6 @@ fn cleanup_leaves_no_frame_sources_behind() {
     assert_eq!(outcome.animations, 1);
     assert_eq!(outcome.timers, 1);
 
-    // 卸载本身请求一帧（树变了）；之后必须回到空闲 —— 清理不额外请求帧。
     settle(&mut app, window);
     assert!(!app.take_wake_request(), "清理之后不得残留帧请求");
     assert!(!app.needs_continuous_frames(), "动画已取消 ⇒ 不得连续出帧");
@@ -863,10 +796,6 @@ fn cleanup_leaves_no_frame_sources_behind() {
     assert_eq!(animation_count(&app), 0);
 }
 
-// ── E16b 审查修复（F1 悬停 / F2 帧请求 / F3 虚拟行 / F4 作用域错配）──────────
-
-/// F2（E16b）：删子树必须请求**一帧**，且静止窗口的下一帧真的提交（`FrameIndex + 1`）——
-/// 漏掉这一步画面会停在旧像素直到下一次无关事件（审查变异 M7 曾全绿；本用例必红）。
 #[test]
 fn removing_a_subtree_requests_the_next_frame() {
     let (_rt, mut app, window) = setup();
@@ -874,7 +803,6 @@ fn removing_a_subtree_requests_the_next_frame() {
     let container = mount_box(&mut app, window, root);
     let _leaf = mount_box(&mut app, window, container);
 
-    // 先出到静止，记下最后一次提交的序号。
     let mut last_committed = None;
     for _ in 0..8 {
         match app.frame(window).expect("window").expect("frame") {
@@ -905,14 +833,10 @@ fn removing_a_subtree_requests_the_next_frame() {
     );
 }
 
-/// F1（E16b）：删除「指针正悬停的子树」必须收尾悬停 / 按压 / 命中并派生 `HoverChanged` ——
-/// `update_hover` 的 `previous` 会把已卸载节点过滤成 `None`，删后补调 `revalidate_hover` 会
-/// 早退，应用侧 tooltip / `:hover` 会残留到下一次指针移动（审查探针 P1）。
 #[test]
 fn removing_a_hovered_subtree_derives_a_leave_event() {
     let (_rt, mut app, window) = setup();
     let root = root(&app, window);
-    // 存活祖先挂 `bind_style`：悬停链变化必须让它重算 `:hover`。
     let keep = NodeBuilder::boxed()
         .style(boxed_style(120.0, 120.0))
         .bind_style(|_| StylePatch::default())
@@ -926,7 +850,6 @@ fn removing_a_hovered_subtree_derives_a_leave_event() {
     settle(&mut app, window);
     let _ = app.drain_events();
 
-    // 悬停 + 按下（未越过拖拽阈值 ⇒ 无捕获）：press / last_hit 都指向 inner。
     app.dispatch_input(
         window,
         InputEvent::pointer_move(Point::new(20.0, 20.0), Modifiers::empty()),
@@ -996,7 +919,6 @@ fn removing_a_hovered_subtree_derives_a_leave_event() {
         "存活祖先失去 :hover ⇒ 必须标 BIND 重算 bind_style"
     );
 
-    // 无关悬停不被打扰：悬停另一个节点后删除不相干子树 ⇒ 不派生 HoverChanged。
     let other = NodeBuilder::boxed()
         .layout_override(Rect::new(250.0, 10.0, 40.0, 40.0))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -1019,8 +941,6 @@ fn removing_a_hovered_subtree_derives_a_leave_event() {
     );
 }
 
-/// F3（E16b）：已挂载的虚拟行只能由引擎回收 —— 应用直接删行在 debug 构建里 `debug_assert`
-/// 拒绝且零副作用；删除容器本身仍合法（行随容器一起消失）。
 #[test]
 fn removing_a_mounted_virtual_row_is_rejected_without_side_effects() {
     let (_rt, mut app, window) = setup();
@@ -1080,7 +1000,6 @@ fn removing_a_mounted_virtual_row_is_rejected_without_side_effects() {
         "panic 必须点名虚拟行契约：{message}"
     );
 
-    // 拒绝必须无副作用：行还在、`mounted` 索引原样。
     assert!(
         app.window(window).expect("window").tree().get(row).is_ok(),
         "被拒绝的删除不得触碰节点树"
@@ -1096,7 +1015,6 @@ fn removing_a_mounted_virtual_row_is_rejected_without_side_effects() {
         "被拒绝的删除不得改写 mounted 索引"
     );
 
-    // 删除容器本身仍合法：行随容器一起消失，虚拟槽登记一并清理。
     let outcome = app
         .remove_node(window, container)
         .expect("删除虚拟列表容器本身是合法操作");
@@ -1109,20 +1027,15 @@ fn removing_a_mounted_virtual_row_is_rejected_without_side_effects() {
     );
 }
 
-/// F4（E16b）：`SignalScope` 与 `NodeId` 正交 ⇒ 引擎只能拒绝**可证明**的错配：作用域的存活
-/// 信号若仍被子树外的节点读取，释放必然打断该绑定 ⇒ `ScopeOwnershipMismatch` 且零副作用。
-/// 没有存活读者的错配无法识别（文档契约）；错误面（StaleNode）不得提前释放作用域。
 #[test]
 fn remove_node_with_scope_rejects_provable_scope_mismatch() {
     let (_rt, mut app, window) = setup();
     let root = root(&app, window);
-    // 组件 A：存活节点 + 绑定的作用域信号（依赖边来自 `refresh_styles`）。
     let scope_a = app.signal_scope();
     let signal_a: Signal<u32> = app.signal_scoped(scope_a, 7);
     let node_a = mount_bound(&mut app, window, root, signal_a);
     app.refresh_styles(window).expect("window");
     assert_eq!(app.dependency_edge_count_for_test(), 1);
-    // 组件 B：准备卸载的无关子树。
     let node_b = mount_box(&mut app, window, root);
     let tree_len = app.window(window).expect("window").tree().len();
     let live_slots = app.store.live_slot_count_for_test();
@@ -1138,13 +1051,11 @@ fn remove_node_with_scope_rejects_provable_scope_mismatch() {
         ),
         "错误必须点名子树根 / 作用域 / 子树外的存活读者，得到 {mismatch:?}"
     );
-    // 零副作用：节点未删、值未释放、依赖边与槽位不变。
     assert_eq!(app.window(window).expect("window").tree().len(), tree_len);
     assert_eq!(*app.read(&signal_a), 7, "错误路径不得释放作用域");
     assert_eq!(app.dependency_edge_count_for_test(), 1);
     assert_eq!(app.store.live_slot_count_for_test(), live_slots);
 
-    // 正确归属（读者全在被删子树内）⇒ 照常释放。
     let scope_b = app.signal_scope();
     let bound_signal: Signal<u32> = app.signal_scoped(scope_b, 1);
     let node_c = mount_bound(&mut app, window, root, bound_signal);
@@ -1154,7 +1065,6 @@ fn remove_node_with_scope_rejects_provable_scope_mismatch() {
         .expect("正确归属的作用域");
     assert_eq!(outcome.released_values, 1);
 
-    // 错误面仍先于清理：`StaleNode` 不得提前释放活跃作用域。
     let scope_live = app.signal_scope();
     let signal_live: Signal<u32> = app.signal_scoped(scope_live, 3);
     let stale = mount_box(&mut app, window, root);

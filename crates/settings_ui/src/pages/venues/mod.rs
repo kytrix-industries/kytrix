@@ -1,5 +1,3 @@
-//! The venue pages: one native page per venue this build serves.
-
 pub(crate) mod binance;
 pub(crate) mod credentials;
 pub(crate) mod dispatcher;

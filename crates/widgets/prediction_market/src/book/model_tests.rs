@@ -1,5 +1,3 @@
-//! Unit tests of the grouped order book: buckets, totals, depth and labels.
-
 use market_participants_model::{
     decimal::{Fraction, Quantity, Tick},
     outcome::OutcomeLegRef,
@@ -12,8 +10,6 @@ use super::{
 };
 use crate::test_support::{charted_market, event_ref, level, order_book};
 
-/// One side of the screenshot's ladder: price, size and the running notional the
-/// pane reads off it.
 fn screenshot_asks(leg: OutcomeLegRef) -> PredictionOrderBook {
     order_book(
         leg,
@@ -45,7 +41,6 @@ fn grouping_should_round_bids_down_and_asks_up() {
     let book = order_book(
         leg(),
         "0.01",
-        // Neither level is on the tick, so its bucket is decided by the side.
         vec![level("0.349", "10"), level("0.301", "20")],
         vec![level("0.351", "10"), level("0.399", "20")],
     );
@@ -277,15 +272,12 @@ fn the_last_trade_should_survive_grouping() {
 
 #[test]
 fn a_multiplier_the_tick_cannot_express_should_fall_back_to_the_finest() {
-    // A whole-share tick leaves no finer grouping than the tick itself.
     let coarse = order_book(leg(), "1", vec![level("0", "10")], vec![level("1", "10")]);
     assert_eq!(settle_grouping(coarse.tick_size, 10), 1);
 
-    // Unknown multipliers never reach the book at all.
     let book = screenshot_asks(leg());
     assert_eq!(settle_grouping(book.tick_size, 7), 1);
 
-    // A step of a whole share is not a price grouping.
     let tenth = order_book(leg(), "0.1", Vec::new(), vec![level("0.3", "10")]);
     assert_eq!(
         settle_grouping(tenth.tick_size, 10),

@@ -1,8 +1,3 @@
-//! ② 焦点状态面板：焦点名 / Tab 序 / 操作提示。
-//!
-//! 引擎不派发「焦点变化」事件：应用在每轮帧钩子里读
-//! `App::focused`，把结果写成值语义的 [`FocusView`]，由 `bind_text` 更新文字。
-
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
@@ -13,14 +8,10 @@ use ui_core::{
 
 use super::{DIM_RGBA, MUTED_RGBA, TEXT_RGBA, card, text_style};
 
-/// 焦点面板的值（`Signal<FocusView>` 的载荷）。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FocusView {
-    /// 焦点在 Tab 序里的下标；`None` = 没有焦点。
     index: Option<u8>,
-    /// Tab 序里的可聚焦节点总数。
     total: u8,
-    /// 焦点节点的可访问名。
     label: SmolStr,
 }
 
@@ -35,7 +26,6 @@ impl Default for FocusView {
 }
 
 impl FocusView {
-    /// 直接构造（测试与 [`FocusView::resolve`] 共用；`label` 是静态可访问名）。
     pub(crate) fn new(index: Option<usize>, total: usize, label: &'static str) -> Self {
         Self {
             index: index.and_then(|index| u8::try_from(index).ok()),
@@ -44,7 +34,6 @@ impl FocusView {
         }
     }
 
-    /// 从「当前焦点 + Tab 序表」算出视图。
     pub(crate) fn resolve(focused: Option<NodeId>, targets: &[(NodeId, &'static str)]) -> Self {
         match focused.and_then(|node| targets.iter().position(|(id, _)| *id == node)) {
             Some(index) => Self::new(Some(index), targets.len(), targets[index].1),
@@ -52,7 +41,6 @@ impl FocusView {
         }
     }
 
-    /// 「焦点：色块 1（红）」/「焦点：（无）」。
     pub(crate) fn line(&self) -> SmolStr {
         if self.index.is_some() {
             format_smolstr!("焦点：{}", self.label)
@@ -61,7 +49,6 @@ impl FocusView {
         }
     }
 
-    /// 「Tab 序 3 / 7」/「Tab 序 — / 7」。
     pub(crate) fn position(&self) -> SmolStr {
         match self.index {
             Some(index) => format_smolstr!("Tab 序 {} / {}", u16::from(index) + 1, self.total),
@@ -70,7 +57,6 @@ impl FocusView {
     }
 }
 
-/// 建焦点面板的文字（值来自 `view`）。
 pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, view: Signal<FocusView>) {
     let _ = card::bound_label(
         app,

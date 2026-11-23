@@ -1,11 +1,3 @@
-//! The handshake cases: the token endpoint, the region header, the upgrade, AUTH, and the
-//! market-data profile the account is read as (§4.1, §4.4, §4.9; §14.1 items 1, 6, 7, 10).
-//!
-//! Every case dials its own socket and prints what it measured. The signature the token
-//! request carries is this suite's own implementation of §4.9's algorithm, which is the
-//! point: the adapter's signed `fetch_otp` is checked against the venue by case 17, and
-//! this is the control that states the algorithm the venue accepts on its own.
-
 use longbridge_proto::quote::UserQuoteProfileRequest;
 use prost::Message as _;
 use reqwest::Client;
@@ -24,7 +16,6 @@ use crate::{
     },
 };
 
-/// Reads one header's value as text.
 fn header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -32,7 +23,6 @@ fn header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Case 1 — the one-time password the socket is opened with (§4.9).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_01_the_token_endpoint_answers_with_all_three_fields() {
@@ -94,11 +84,6 @@ async fn live_case_01_the_token_endpoint_answers_with_all_three_fields() {
             measured.limit
         );
 
-        // The presentation §4.9 described before the first live run: two headers and
-        // no signature. This measures what the venue does with it — and the answer is
-        // the finding that run reported, not a failure of this case: the signed
-        // request above is the one whose shape the case asserts, and the adapter's own
-        // OTP request has been signed since that finding (`signature.rs`).
         let unsigned = unsigned_token(&client, &credentials).await;
         println!(
             "  without a signature (what §4.9 described before the first live run, and what this \
@@ -119,8 +104,6 @@ async fn live_case_01_the_token_endpoint_answers_with_all_three_fields() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Asks the token endpoint with the two headers the design describes and no
-/// signature, and renders the status together with the venue's own words.
 async fn unsigned_token(client: &Client, credentials: &Credentials) -> String {
     let Ok(endpoint) = token_endpoint() else {
         return "<the endpoint is malformed>".to_owned();
@@ -146,8 +129,6 @@ async fn unsigned_token(client: &Client, credentials: &Credentials) -> String {
     format!("{status} {}", String::from_utf8_lossy(&body).trim())
 }
 
-/// Case 2 — the data centre header, derived from the credentials, and a control
-/// pass without it (§4.1; §14.1 item 6).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_02_the_data_centre_is_derived_and_the_header_can_be_omitted() {
@@ -170,8 +151,6 @@ async fn live_case_02_the_data_centre_is_derived_and_the_header_can_be_omitted()
         let transport = chosen_transport(&credentials).await;
         println!("{case}: transport={transport:?}");
 
-        // The first pass presents the header the design says every Longbridge
-        // request carries.
         let mut socket = LiveSocket::connect(&credentials, transport, true)
             .await
             .unwrap_or_else(|error| {
@@ -191,8 +170,6 @@ async fn live_case_02_the_data_centre_is_derived_and_the_header_can_be_omitted()
         );
         socket.shutdown().await;
 
-        // The control pass presents no data-centre header at all, which is what the
-        // venue's gateway default reads as `ap`.
         let client = live_http_client(transport).expect("the live HTTP client builds");
         let control = measure_token(&client, &credentials, false)
             .await
@@ -240,8 +217,6 @@ async fn live_case_02_the_data_centre_is_derived_and_the_header_can_be_omitted()
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 3 — the upgrade: the endpoint's shape and the two headers it carries
-/// (§4.1).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_03_the_upgrade_endpoint_and_headers_are_the_designs_own() {
@@ -281,8 +256,6 @@ async fn live_case_03_the_upgrade_endpoint_and_headers_are_the_designs_own() {
             "{case}: the data centre is the credentials' own"
         );
 
-        // The venue's acceptance of the upgrade is what proves the headers travel:
-        // the dial presents exactly these, and a refused handshake would fail here.
         let mut socket =
             LiveSocket::connect(&credentials, chosen_transport(&credentials).await, true)
                 .await
@@ -308,8 +281,6 @@ async fn live_case_03_the_upgrade_endpoint_and_headers_are_the_designs_own() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 4 — the frame codec: a round-trip, the two length identities, and how many
-/// inbound frames carried the gzip and verify bits (§4.2; §14.1 items 9 and 10).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_04_the_codec_round_trips_and_the_venue_frames_measure_clean() {
@@ -386,7 +357,6 @@ async fn live_case_04_the_codec_round_trips_and_the_venue_frames_measure_clean()
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 5 — AUTH: the acknowledgement's shape and its absolute expiry (§4.4).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_05_auth_acknowledges_with_an_absolute_millisecond_expiry() {
@@ -448,9 +418,6 @@ async fn live_case_05_auth_acknowledges_with_an_absolute_millisecond_expiry() {
              value read as absolute would land here",
             answer.expires
         );
-        // The ack's own two counts are recorded, not asserted: the design does not use
-        // them (there is no RECONNECT here), and the measurement below shows they are
-        // not the same numbers the HTTP token endpoint reported.
         println!(
             "  the ack's limit/online are {} / {}; the token endpoint reported them as limit=10 \
              online=0 in case 1 — the two answers count different things",
@@ -462,8 +429,6 @@ async fn live_case_05_auth_acknowledges_with_an_absolute_millisecond_expiry() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 6 — the market-data profile: every rate limit, the market keys, and the US
-/// entry's packages and warning (§4.4; §14.1 items 1 and 7).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_06_the_profile_publishes_the_rate_limits_and_the_us_entry() {

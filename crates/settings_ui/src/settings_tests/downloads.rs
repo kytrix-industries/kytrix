@@ -1,11 +1,3 @@
-//! The tests of the translation model downloads.
-//!
-//! The download manager's own tests: what a row shows for each task snapshot the application's
-//! download manager publishes, what a delete unloads and removes, and which command a pause, a
-//! resume or a retry issues. The manager is driven with a fake download manager
-//! ([`FakeDownloads`]) and the application's setting harness, so no test needs a network, a real
-//! transfer or a sleeping executor.
-
 use std::{
     cell::RefCell,
     io,
@@ -35,15 +27,12 @@ use crate::{
     },
 };
 
-/// How long a test waits for an asynchronous removal before failing.
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
 
-/// The model most download tests use.
 fn model() -> TranslationModel {
     TranslationModel::HyMt218BQ4Km
 }
 
-/// The settings, download manager and translation downloads one test drives.
 struct Downloads {
     app: TestApp,
     window: WindowId,
@@ -51,17 +40,14 @@ struct Downloads {
     config: Signal<Config>,
     fake: FakeDownloads,
     manager: Rc<TranslationDownloads>,
-    /// The configuration snapshots the store published, in write order.
     writes: Rc<RefCell<Vec<Config>>>,
 }
 
 impl Downloads {
-    /// The manager over the default settings and an unload that succeeds.
     fn new() -> Self {
         Self::with(Config::default(), Arc::new(|_: &Path| Ok(())))
     }
 
-    /// The manager over `config` and `unload`.
     fn with(config: Config, unload: Unload) -> Self {
         let mut app = TestApp::new();
         let window = app.window_id();
@@ -103,12 +89,10 @@ impl Downloads {
         }
     }
 
-    /// The settings as they are stored now.
     fn config(&self) -> Config {
         self.app.app().read_with(&self.config, Config::clone)
     }
 
-    /// Writes one change through the session.
     fn write(&mut self, change: SettingsChange) {
         let window = self.window;
         self.store
@@ -116,18 +100,15 @@ impl Downloads {
             .expect("the settings accept the change");
     }
 
-    /// The snapshots the session stored.
     fn writes(&self) -> Vec<Config> {
         self.writes.borrow().clone()
     }
 
-    /// Mirrors the download manager's snapshots onto the rows.
     fn sync(&mut self) -> bool {
         let manager = Rc::clone(&self.manager);
         manager.sync(self.app.app_mut())
     }
 
-    /// Publishes one task snapshot under `model` in `directory`.
     fn publish(
         &mut self,
         model: TranslationModel,
@@ -138,7 +119,6 @@ impl Downloads {
         self.publish_id(model, directory, id, status);
     }
 
-    /// Publishes one task snapshot and answers its identity.
     fn publish_id(
         &mut self,
         model: TranslationModel,
@@ -151,19 +131,16 @@ impl Downloads {
         id
     }
 
-    /// The identity the manager asked its download manager to add last.
     fn added(&self) -> DownloadId {
         self.fake
             .added()
             .expect("a download was added to the fake manager")
     }
 
-    /// The row state of `model` in `directory`.
     fn state(&self, model: TranslationModel, directory: &Path) -> DownloadState {
         self.manager.row_state(model, directory)
     }
 
-    /// Runs frames until `done` holds, failing after [`WAIT_LIMIT`].
     fn spin(&mut self, what: &str, mut done: impl FnMut(&Self) -> bool) {
         let deadline = Instant::now() + WAIT_LIMIT;
         while !done(self) {
@@ -174,7 +151,6 @@ impl Downloads {
     }
 }
 
-/// A callback that signals when a blocking unload started, and the channel it signals on.
 fn entered() -> (Arc<dyn Fn() + Send + Sync>, mpsc::Receiver<()>) {
     let (sender, receiver) = mpsc::channel();
     let sender = Mutex::new(sender);
@@ -188,7 +164,6 @@ fn entered() -> (Arc<dyn Fn() + Send + Sync>, mpsc::Receiver<()>) {
     (entered, receiver)
 }
 
-/// An unload that succeeds, after recording that it ran while the file still existed.
 fn order_unload(order: Arc<Mutex<Vec<&'static str>>>) -> Unload {
     Arc::new(move |path: &Path| {
         let seen = if path.exists() {
@@ -204,14 +179,12 @@ fn order_unload(order: Arc<Mutex<Vec<&'static str>>>) -> Unload {
     })
 }
 
-/// The configuration over `directory`, so a finished download records its selection there.
 fn config_in(directory: &Path) -> Config {
     let mut config = Config::default();
     config.translation.model_directory = Some(directory.to_path_buf());
     config
 }
 
-/// Deleting a file that is already gone is what the row asked for, not a failure.
 #[test]
 fn deleting_a_missing_file_should_succeed() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -230,7 +203,6 @@ fn deleting_a_missing_file_should_succeed() {
     );
 }
 
-/// The engine is unloaded while the file still exists; only then is the file removed.
 #[test]
 fn a_delete_should_unload_before_it_removes_the_file() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -256,8 +228,6 @@ fn a_delete_should_unload_before_it_removes_the_file() {
     );
 }
 
-/// A file the process downloaded is unloaded before the download manager is asked to remove the
-/// task that owns it.
 #[test]
 fn a_delete_should_unload_before_the_manager_removes_a_task() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -312,8 +282,6 @@ fn a_delete_should_unload_before_the_manager_removes_a_task() {
     );
 }
 
-/// A selection that was made while the removal was already running is cleared when the removal
-/// finishes: the files it names are gone by then.
 #[test]
 fn a_finished_removal_should_clear_a_selection_made_while_it_ran() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -344,8 +312,6 @@ fn a_finished_removal_should_clear_a_selection_made_while_it_ran() {
         .recv_timeout(WAIT_LIMIT)
         .expect("the delete should reach its unload");
 
-    // What a stale menu choice or another writer may have stored after the removal started: the
-    // selection was not there when the removal began to look for it.
     downloads.write(SettingsChange::TranslationModelSelected { model: Some(model) });
     release_sender
         .send(())
@@ -361,8 +327,6 @@ fn a_finished_removal_should_clear_a_selection_made_while_it_ran() {
     );
 }
 
-/// A finished removal only clears the selection when it names the directory the removal emptied:
-/// the same model in another directory is still there.
 #[test]
 fn a_finished_removal_should_keep_a_selection_in_another_directory() {
     let removed = TempDir::new().expect("the removed directory builds");
@@ -384,7 +348,6 @@ fn a_finished_removal_should_keep_a_selection_in_another_directory() {
     );
 }
 
-/// A failed unload leaves the row reporting the reason instead of hanging in Deleting.
 #[test]
 fn a_failed_unload_should_be_reported_as_a_failed_delete() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -411,7 +374,6 @@ fn a_failed_unload_should_be_reported_as_a_failed_delete() {
     });
 }
 
-/// A terminate that fails to unload reports it as the failed stop it is, not as a delete.
 #[test]
 fn a_terminate_should_report_its_own_failure() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -438,7 +400,6 @@ fn a_terminate_should_report_its_own_failure() {
     });
 }
 
-/// Stopping a paused download discards its partial file, so the row offers a download again.
 #[test]
 fn a_terminate_should_discard_the_partial_file() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -466,7 +427,6 @@ fn a_terminate_should_discard_the_partial_file() {
     assert!(!path.exists(), "a stopped download leaves no file behind");
 }
 
-/// Stopping a download in flight asks the manager to remove the task that is transferring it.
 #[test]
 fn a_terminate_should_remove_the_task_of_a_download_in_flight() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -513,7 +473,6 @@ fn a_terminate_should_remove_the_task_of_a_download_in_flight() {
     );
 }
 
-/// A failed download is reported on its row.
 #[test]
 fn a_failed_download_should_be_reported_on_its_row() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -543,7 +502,6 @@ fn a_failed_download_should_be_reported_on_its_row() {
     );
 }
 
-/// A pause or a resume of a row without a manager task is refused rather than invented.
 #[test]
 fn pausing_and_resuming_without_a_task_should_be_refused() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -560,7 +518,6 @@ fn pausing_and_resuming_without_a_task_should_be_refused() {
     );
 }
 
-/// A delete worker that never finishes is reported as failed instead of staying Deleting.
 #[test]
 fn a_delete_that_never_finishes_should_be_reported_as_failed() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -607,7 +564,6 @@ fn a_delete_that_never_finishes_should_be_reported_as_failed() {
         .expect("the delete worker is waiting");
 }
 
-/// A file of exactly the expected size counts; a short one does not.
 #[test]
 fn a_file_should_have_to_match_the_expected_size() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -619,8 +575,6 @@ fn a_file_should_have_to_match_the_expected_size() {
     assert!(!file_size_matches(&directory.path().join("absent.gguf"), 4));
 }
 
-/// A forced model is reported downloaded and the list is in page order; a directory with no model
-/// files offers none.
 #[test]
 fn downloaded_models_should_be_reported_in_page_order() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -643,7 +597,6 @@ fn downloaded_models_should_be_reported_in_page_order() {
     );
 }
 
-/// A row state defaults to idle and carries what was injected.
 #[test]
 fn state_should_default_to_idle_and_carry_what_was_injected() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -671,8 +624,6 @@ fn state_should_default_to_idle_and_carry_what_was_injected() {
     );
 }
 
-/// A download that finishes is the row's completion: the task is released and the model is
-/// selected when nothing usable was selected.
 #[test]
 fn a_completed_download_should_be_recorded_and_release_its_task() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -715,7 +666,6 @@ fn a_completed_download_should_be_recorded_and_release_its_task() {
     );
 }
 
-/// A finished download does not replace a model the directory already loads and has selected.
 #[test]
 fn a_completed_download_should_keep_a_usable_selection() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -754,7 +704,6 @@ fn a_completed_download_should_keep_a_usable_selection() {
     );
 }
 
-/// A pause and a resume are commands to the download manager.
 #[test]
 fn a_paused_download_should_be_paused_and_resumed_through_the_manager() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -813,8 +762,6 @@ fn a_paused_download_should_be_paused_and_resumed_through_the_manager() {
     );
 }
 
-/// Asking for a model that already has a paused task continues that task rather than starting a
-/// second download of it.
 #[test]
 fn a_download_should_resume_the_paused_task_it_already_has() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -851,8 +798,6 @@ fn a_download_should_resume_the_paused_task_it_already_has() {
     assert!(downloads.fake.resumed(id), "the paused task is continued");
 }
 
-/// A download started from one site is left alone when another site is asked for: continuing it
-/// would report the bytes of one site under another.
 #[test]
 fn a_download_should_not_change_the_site_of_the_task_it_has() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -893,7 +838,6 @@ fn a_download_should_not_change_the_site_of_the_task_it_has() {
     );
 }
 
-/// A download records the site it was started from, and the request is for that site's address.
 #[test]
 fn a_download_should_record_the_site_it_was_started_from() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -926,7 +870,6 @@ fn a_download_should_record_the_site_it_was_started_from() {
     }
 }
 
-/// A model the directory already holds at its published size is not downloaded again.
 #[test]
 fn a_download_of_a_file_that_is_in_place_should_be_refused() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -949,8 +892,6 @@ fn a_download_of_a_file_that_is_in_place_should_be_refused() {
     );
 }
 
-/// A paused download is discarded when its row is deleted: the manager removes its task and the
-/// row goes back to offering a download.
 #[test]
 fn deleting_a_paused_download_should_remove_its_task() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -993,8 +934,6 @@ fn deleting_a_paused_download_should_remove_its_task() {
     );
 }
 
-/// A failed download can be discarded like a paused one: the manager removes its task and partial
-/// file, and the row settles back to offering the download again.
 #[test]
 fn deleting_a_failed_download_should_reset_the_row() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -1036,8 +975,6 @@ fn deleting_a_failed_download_should_reset_the_row() {
     );
 }
 
-/// A download that completed releases its task; a file removed outside the application is
-/// downloaded again under a new task.
 #[test]
 fn a_model_deleted_outside_the_application_should_download_again() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -1087,8 +1024,6 @@ fn a_model_deleted_outside_the_application_should_download_again() {
     );
 }
 
-/// A delete of a downloaded model unloads the engine and removes the file; the row released its
-/// task when the download completed, so the delete does not wait on one.
 #[test]
 fn deleting_a_downloaded_model_should_unload_and_remove_its_files() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -1134,7 +1069,6 @@ fn deleting_a_downloaded_model_should_unload_and_remove_its_files() {
     );
 }
 
-/// A retry at the site the failed download came from continues that task.
 #[test]
 fn a_same_site_retry_should_continue_the_failed_task() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -1173,8 +1107,6 @@ fn a_same_site_retry_should_continue_the_failed_task() {
     );
 }
 
-/// A retry at another site deletes what the previous site transferred and starts again from it
-/// once the removal has finished.
 #[test]
 fn a_different_site_retry_should_delete_then_restart() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -1236,7 +1168,6 @@ fn a_different_site_retry_should_delete_then_restart() {
     );
 }
 
-/// A restart whose delete fails reports the delete and keeps no intent to restart later.
 #[test]
 fn a_restart_that_cannot_delete_should_report_the_failure() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -1294,7 +1225,6 @@ fn a_restart_that_cannot_delete_should_report_the_failure() {
     );
 }
 
-/// Two deletes of the same row issue one removal.
 #[test]
 fn deleting_a_row_twice_should_issue_one_removal() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -1336,7 +1266,6 @@ fn deleting_a_row_twice_should_issue_one_removal() {
     );
 }
 
-/// A delete of a row the settings do not select writes nothing.
 #[test]
 fn a_delete_of_an_unselected_model_should_write_nothing() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -1356,8 +1285,6 @@ fn a_delete_of_an_unselected_model_should_write_nothing() {
     );
 }
 
-/// Why a download failure is remembered: the row's state is what the page draws, and the failure
-/// survives frames without being overwritten.
 #[test]
 fn a_failed_download_should_stay_reported_across_frames() {
     let directory = TempDir::new().expect("the test directory builds");

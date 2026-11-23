@@ -1,15 +1,3 @@
-//! The supported translation models, drawn as a table: how large each model's file is, and what
-//! the row can do with it.
-//!
-//! The table is native UI built from the page's own rows rather than `kit::table`: a table cell is
-//! built by a closure that is given the node tree but no `&mut App`, and a row's actions are kit
-//! buttons — components that register their action handlers on `App`. Eight fixed rows are also
-//! small enough to build and rebuild directly, so the row content follows the download state by
-//! rebuilding the status cell of the row that changed.
-//!
-//! A row does not download, resume, stop or delete anything itself: its buttons call the injected
-//! [`TranslationDownloads`], and what the manager last reported is what the row draws.
-
 use std::rc::Rc;
 
 use app_config::translation::{DownloadSite, TranslationModel};
@@ -39,50 +27,35 @@ use crate::{
     translation_downloads::{DeleteFailure, DownloadState, TranslationDownloads, UnloadFailure},
 };
 
-/// The height of the header row.
 const HEADER_HEIGHT: f32 = 28.0;
-/// The height of one model row.
 const ROW_HEIGHT: f32 = 34.0;
-/// The width of the size column.
 const SIZE_COLUMN_WIDTH: f32 = 110.0;
-/// The width of the status column: its two action buttons and the line of text beside them.
 const STATUS_COLUMN_WIDTH: f32 = 340.0;
-/// The size of a row's text.
 const TEXT_SIZE: f32 = 11.5;
-/// The appearance a bound colour is seeded from before its style pass evaluates the patch.
 const SEED_APPEARANCE: Appearance = Appearance::Dark;
 
-/// The model, whether its file is in place, and what the download manager last reported for it.
 #[derive(Clone, Debug, PartialEq)]
 struct ModelRow {
     model: TranslationModel,
     downloaded: bool,
     state: DownloadState,
-    /// The site a download of this row starts from.
     site: DownloadSite,
-    /// Whether a download can be started: both the manager and a directory have to exist.
     can_download: bool,
 }
 
-/// The models, drawn as a table.
 pub(crate) struct TranslationTable {
-    /// The key prefix every kit component of the table names itself by.
     key: SmolStr,
-    /// The process-wide downloads, when the composition host attached them.
     downloads: Option<Rc<TranslationDownloads>>,
     rows: Vec<RowView>,
-    /// The rows the table was last drawn for, so a frame that moved nothing rebuilds nothing.
     applied: Vec<ModelRow>,
 }
 
-/// One model's row as it is drawn.
 struct RowView {
     status: NodeId,
     buttons: Vec<Button>,
 }
 
 impl TranslationTable {
-    /// The table over the process-wide downloads, keyed by the settings page instance it belongs to.
     pub(crate) fn new(key: SmolStr, downloads: Option<Rc<TranslationDownloads>>) -> Self {
         Self {
             key,
@@ -92,10 +65,6 @@ impl TranslationTable {
         }
     }
 
-    /// Builds the table under `parent`.
-    ///
-    /// # Errors
-    /// Engine node-building errors, or a kit button that refused to build.
     pub(crate) fn build(
         &mut self,
         app: &mut App,
@@ -152,10 +121,6 @@ impl TranslationTable {
         Ok(())
     }
 
-    /// Draws one row's content again when what it shows changed.
-    ///
-    /// # Errors
-    /// Engine node-building errors, or a kit button that refused to build.
     pub(crate) fn sync(
         &mut self,
         app: &mut App,
@@ -197,7 +162,6 @@ impl TranslationTable {
         Ok(true)
     }
 
-    /// Releases every kit component the table owns.
     pub(crate) fn release(&mut self, app: &mut App) {
         for row in &mut self.rows {
             for button in row.buttons.drain(..) {
@@ -208,7 +172,6 @@ impl TranslationTable {
         self.applied.clear();
     }
 
-    /// Builds the header row: the three column names the rows line up under.
     fn build_header(
         &self,
         app: &mut App,
@@ -271,7 +234,6 @@ impl TranslationTable {
         Ok(())
     }
 
-    /// Builds one model's row: its name and size, and the cell its actions are drawn in.
     fn build_row(
         &self,
         app: &mut App,
@@ -373,7 +335,6 @@ impl TranslationTable {
     }
 }
 
-/// The model rows as the settings and the download manager describe them now.
 fn model_rows(
     downloads: &Option<Rc<TranslationDownloads>>,
     directory: Option<&std::path::Path>,
@@ -385,8 +346,6 @@ fn model_rows(
             let (downloaded, state) = match (downloads.as_deref(), directory) {
                 (Some(downloads), Some(directory)) => {
                     let state = downloads.row_state(model, directory);
-                    // A transfer in progress says whether the file is there: its state is what
-                    // the row draws, so only an idle row pays for looking at the disk.
                     let downloaded = matches!(state, DownloadState::Idle)
                         && downloads.is_downloaded(model, directory);
                     (downloaded, state)
@@ -404,7 +363,6 @@ fn model_rows(
         .collect()
 }
 
-/// Draws the actions and the text of one row's status cell.
 fn build_status(
     app: &mut App,
     window: WindowId,
@@ -460,9 +418,6 @@ fn build_status(
             text = Some((t_smol!(translate, "settings_ui.ai.pausing"), Role::FgMuted));
         }
         DownloadState::Paused { downloaded } => {
-            // A paused download is either continued from its partial file or stopped for good:
-            // there is nothing else the row can do with bytes that are neither in place nor
-            // wanted.
             action(RowAction::Resume, false)?;
             action(RowAction::Terminate, false)?;
             text = Some((
@@ -528,7 +483,6 @@ fn build_status(
     Ok(())
 }
 
-/// One icon-only action button of a row.
 fn action_button(
     app: &mut App,
     window: WindowId,
@@ -592,7 +546,6 @@ fn action_button(
     Ok(button)
 }
 
-/// One line of text that is cut rather than wrapped, in the theme's foreground role.
 fn single_line_text(
     app: &mut App,
     window: WindowId,
@@ -629,7 +582,6 @@ fn single_line_text(
     Ok(())
 }
 
-/// Removes every child of `parent`, which is how a rebuilt status cell is cleaned.
 fn remove_children(app: &mut App, window: WindowId, parent: NodeId) {
     let children = app
         .window(window)
@@ -643,24 +595,19 @@ fn remove_children(app: &mut App, window: WindowId, parent: NodeId) {
     }
 }
 
-/// The icon-only action one row draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RowAction {
     Download,
     Pause,
     Resume,
     Retry,
-    /// Stops a download for good and discards what it wrote.
     Terminate,
     Delete,
-    /// The disabled bin a row is drawn with while its delete is in flight.
     Deleting,
-    /// The disabled stop a row is drawn with while its terminate is in flight.
     Terminating,
 }
 
 impl RowAction {
-    /// The i18n key the action's label and tooltip are drawn with.
     pub(crate) fn label_key(self) -> &'static str {
         match self {
             Self::Download => "settings_ui.ai.download",
@@ -673,7 +620,6 @@ impl RowAction {
         }
     }
 
-    /// The picture the action is drawn with.
     pub(crate) fn icon(self) -> IconKind {
         match self {
             Self::Download => IconKind::DownloadSimple,
@@ -685,7 +631,6 @@ impl RowAction {
         }
     }
 
-    /// The suffix one action's kit key is named by.
     fn key_suffix(self) -> &'static str {
         match self {
             Self::Download => "download",
@@ -699,7 +644,6 @@ impl RowAction {
         }
     }
 
-    /// The suffix of the debug id one action's button is wrapped in.
     fn debug_suffix(self) -> &'static str {
         match self {
             Self::Download => "DOWNLOAD",
@@ -714,8 +658,6 @@ impl RowAction {
     }
 }
 
-/// The published size of a model's file, in the unit that keeps the number short: megabytes up
-/// to 1024 of them, and gigabytes above that. Two decimals are always written, rounded.
 pub(crate) fn size_text(bytes: u64) -> SmolStr {
     const MEBIBYTE: u64 = 1024 * 1024;
     const GIBIBYTE: u64 = 1024 * MEBIBYTE;
@@ -729,9 +671,6 @@ pub(crate) fn size_text(bytes: u64) -> SmolStr {
     format_smolstr!("{value:.2} {unit}")
 }
 
-/// The rate a download is transferring at, in the unit that keeps the number short: kilobytes
-/// below one megabyte per second, megabytes up to 1024 of them, and gigabytes above that. At
-/// most two decimals are written, and trailing zeros are dropped.
 pub(crate) fn speed_text(megabytes_per_second: f32) -> SmolStr {
     let (value, unit) = if megabytes_per_second < 1.0 {
         (megabytes_per_second * 1024.0, "KB/s")
@@ -746,7 +685,6 @@ pub(crate) fn speed_text(megabytes_per_second: f32) -> SmolStr {
     format_smolstr!("{number} {unit}")
 }
 
-/// How much of `model`'s published file `downloaded` bytes are, as a whole percentage.
 pub(crate) fn whole_percent(model: TranslationModel, downloaded: u64) -> u32 {
     let total = model.size_bytes();
     if total == 0 {
@@ -758,7 +696,6 @@ pub(crate) fn whole_percent(model: TranslationModel, downloaded: u64) -> u32 {
         .round() as u32
 }
 
-/// The text a download failure is drawn with, in the interface's language.
 fn download_failure_reason(translate: &Translate, failure: &DownloadFailure) -> SmolStr {
     match failure {
         DownloadFailure::Status { status } => {
@@ -768,9 +705,6 @@ fn download_failure_reason(translate: &Translate, failure: &DownloadFailure) -> 
                 status = status
             )
         }
-        // The transport that could not be started, the request that could not be sent and the
-        // body that could not be read are one message to the reader: the download failed on the
-        // network.
         DownloadFailure::Transport | DownloadFailure::Request | DownloadFailure::Read => {
             t_smol!(translate, "settings_ui.ai.download_failed_transport")
         }
@@ -800,7 +734,6 @@ fn download_failure_reason(translate: &Translate, failure: &DownloadFailure) -> 
     }
 }
 
-/// The text a delete failure is drawn with, in the interface's language.
 fn delete_failure_reason(translate: &Translate, failure: &DeleteFailure) -> SmolStr {
     match failure {
         DeleteFailure::Unload(UnloadFailure::TimedOut) => {

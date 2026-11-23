@@ -1,5 +1,3 @@
-//! Unit tests of the lexical layer.
-
 use crate::{
     display::{
         lexical::{ComponentText, normalize_component_text, scope_display_code},
@@ -9,7 +7,6 @@ use crate::{
     listing::route::VenueRoute,
 };
 
-/// free text is trimmed, collapsed and uppercased.
 #[test]
 fn free_text_is_trimmed_collapsed_and_uppercased() {
     let question = normalize_component_text(ComponentText::FreeText(
@@ -24,9 +21,6 @@ fn free_text_is_trimmed_collapsed_and_uppercased() {
     assert_eq!(collapsed.as_str(), "WILL BTC 100K");
 }
 
-/// a typed value was normalized by its own constructor — which rejects
-/// whitespace and control characters — so the formatter neither collapses nor
-/// trims it a second time; only ASCII case is applied to it.
 #[test]
 fn typed_text_is_not_normalized_again() {
     let typed = normalize_component_text(ComponentText::Typed("btc/usdt"))
@@ -41,8 +35,6 @@ fn typed_text_is_not_normalized_again() {
     );
 }
 
-/// the grammar escapes nothing, so every structure character is a
-/// literal character of the component it appears in.
 #[test]
 fn structure_characters_are_literal_component_text() {
     for value in [
@@ -62,7 +54,6 @@ fn structure_characters_are_literal_component_text() {
             value
         );
     }
-    // A space is not a structure character and stays literal.
     assert_eq!(
         normalize_component_text(ComponentText::FreeText("A B"))
             .expect("a space is renderable")
@@ -71,8 +62,6 @@ fn structure_characters_are_literal_component_text() {
     );
 }
 
-/// only ASCII letters are uppercased and non-ASCII text is kept as
-/// it is, never transliterated.
 #[test]
 fn non_ascii_text_is_preserved() {
     assert_eq!(
@@ -89,13 +78,6 @@ fn non_ascii_text_is_preserved() {
     );
 }
 
-/// a control character is refused in every component, and a format
-/// character is not.
-///
-/// Only Cc is a control character: a zero-width space or a bidi override is a
-/// format character (Cf), and the name is neither parsed nor required to be unique,
-/// so the display layer carries it rather than refusing a question a venue really
-/// asked.
 #[test]
 fn control_characters_are_rejected() {
     for value in ["a\nb", "a\tb", "a\u{7f}b", "\u{1}", "a\u{85}b"] {
@@ -116,14 +98,12 @@ fn control_characters_are_rejected() {
             }
         );
     }
-    // A non-breaking space is whitespace, not a control character.
     assert_eq!(
         normalize_component_text(ComponentText::FreeText("A\u{00a0}B"))
             .expect("a non-breaking space is not a control character")
             .as_str(),
         "A B"
     );
-    // A zero-width space and a right-to-left override are format characters.
     for value in ["A\u{200b}B", "A\u{202e}B"] {
         assert_eq!(
             normalize_component_text(ComponentText::FreeText(value))
@@ -135,8 +115,6 @@ fn control_characters_are_rejected() {
     }
 }
 
-/// empty text is refused, whether it was empty or only
-/// whitespace.
 #[test]
 fn empty_text_is_rejected() {
     for value in ["", "   ", "\u{00a0}"] {
@@ -158,12 +136,6 @@ fn empty_text_is_rejected() {
     );
 }
 
-/// a scope has a user-visible form of its own, which is the
-/// canonical text uppercased — every segment of a multi-segment scope included.
-///
-/// The venue half of a route is not stated here: it is a name the catalogue owns
-/// and the interface layer resolves, so the only spelling of it this crate has is
-/// the canonical identity one.
 #[test]
 fn a_scope_display_code_uppercases_its_own_text() {
     let perp_dex = VenueScopeId::new("perp-dex/xyz").expect("perp-dex/xyz is a scope");
@@ -171,14 +143,10 @@ fn a_scope_display_code_uppercases_its_own_text() {
     let spot = VenueScopeId::new("spot").expect("spot is a scope");
     assert_eq!(scope_display_code(&spot).as_str(), "SPOT");
 
-    // The canonical identity spelling of each half is unchanged.
     assert_eq!(VenueId::Hyperliquid.to_string(), "hyperliquid");
     assert_eq!(perp_dex.to_string(), "perp-dex/xyz");
 }
 
-/// The canonical route spelling is what this crate states, and it is not a
-/// user-visible form: `binance/spot` stays lowercase whatever the interface
-/// shows.
 #[test]
 fn a_route_states_its_canonical_spelling() {
     let binance = VenueRoute::new(

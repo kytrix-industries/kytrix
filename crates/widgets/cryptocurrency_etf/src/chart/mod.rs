@@ -1,27 +1,3 @@
-//! The chart side of the ETF pane: one canvas, and the four layers it is drawn in.
-//!
-//! A chart has the same three parts, separated here because they change at different
-//! times:
-//!
-//! - **what it plots** is replaced when a snapshot arrives, which is at most twice
-//!   a day;
-//! - **what it says** — the axis labels, the dates, the tooltips — is derived from
-//!   that snapshot and from the active locale;
-//! - **what it looks like** is laid out from the box the pane gives it, and is
-//!   re-derived whenever that box changes or the pointer moves.
-//!
-//! The canvas draws its axes, dates, crosshair and tooltip itself rather than
-//! assembling elements: a chart's labels move with its data, and a tooltip that
-//! followed the pointer through a popover layer would escape the clipping that keeps
-//! it inside the plot. The engine's only self-drawing entry point is a `Canvas`, so
-//! that is what the chart produces.
-//!
-//! `axes` is where everything lands, `text` is what turns values into shaped lines,
-//! `palette` is the chart's fixed geometry, `data` is the resolved view, `paint` turns
-//! one frame into canvas primitives, `units` is the one piece of `Rect` arithmetic the
-//! engine does not spell, and `canvas` is the node and the state it keeps between
-//! frames.
-
 mod axes;
 mod canvas;
 mod data;

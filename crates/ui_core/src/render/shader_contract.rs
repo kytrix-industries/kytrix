@@ -1,26 +1,3 @@
-// 三套 shader 的**构建期**契约校验（R06-5）的唯一实现。
-//
-// 本文件被两处编译，因此**只能用 `std`**、不得 `use crate::...`：
-//
-// 1. `crates/ui_core/build.rs` 用 `include!` 把它编进去，在**每次构建**时校验三套源码；
-// 2. `src/render.rs` 的 `#[cfg(test)] mod shader_contract` 编进 lib 测试，覆盖失败路径
-//    （「故意改坏一份源码 ⇒ 必须报出首个差异」这件事本身要有测试，否则校验形同虚设）。
-//
-// 校验三件事（对应 R06-5 的 a/b/c）：
-//
-// - **数学函数体等价**：`sd_rounded_rect` / `erf_approx` / `shadow_cdf` / `analytic_shadow` /
-//   `gradient_eval` / `geometry_world` / `aa_coverage` / `clip_mask` 在 HLSL / MSL / GLSL 里
-//   归一化后必须逐语句相同。归一化抹掉的是**语言拼写**（`float2`/`vec2`、`lerp`/`mix`、
-//   `root.` 前缀、单标量广播构造、`inline`/`constant` 修饰、注释与空白），**不是数学**。
-// - **渲染状态常量**：blend / cull / topology / 附件格式 / MSAA 的取值在三端源码里必须出现
-//   同一组语义锚点（文本锚点校验；缺失即失败）。
-// - **颜色空间**：三端都必须显式声明 sRGB（`render/colorspace.rs` 是唯一决定点）。
-
-// ────────────────────────────────────────────────────────────────────────────
-// 源码集合
-// ────────────────────────────────────────────────────────────────────────────
-
-/// 一种着色语言的方言。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
     Hlsl,
@@ -29,7 +6,6 @@ pub enum Language {
 }
 
 impl Language {
-    /// 人类可读名（诊断输出）。
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -40,13 +16,8 @@ impl Language {
     }
 }
 
-/// 一份语言的源码集合。
-///
-/// 一个函数可能落在多个文件里（GLSL 把用到 `fwidth` 的函数拆到 `common.frag.glsl`；
-/// HLSL / MSL 把 `geometry_world` 放在 `common.*`，GLSL 放在 `common.glsl`）。
 pub struct ShaderSource {
     pub language: Language,
-    /// `(文件名, 内容)`；查找函数体时按顺序扫描。
     pub files: Vec<(String, String)>,
 }
 
@@ -57,18 +28,11 @@ impl ShaderSource {
     }
 }
 
-/// 归一化后的一条语句（诊断时能指回源文件与实际行号）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Statement {
-    /// 语句起始的源文件行号（1 起）。
     pub line: usize,
-    /// 归一化文本（语言拼写已抹平）。
     pub text: String,
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// 词法：注释剥离 + 分词（token 带行号）
-// ────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
@@ -83,7 +47,6 @@ struct Located {
     line: usize,
 }
 
-/// 剥离 `//` 行注释（用空格替换，保留换行以便行号不变）。shader 里没有 `/* */`。
 #[must_use]
 pub fn strip_line_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
@@ -147,7 +110,6 @@ fn tokenize(src: &str) -> Vec<Located> {
                     || chars[index] == '+'
                     || chars[index] == '-')
             {
-                // 只允许指数记号里的 +/-（1e-5）；其余 +/- 一律当标点。
                 if (chars[index] == '+' || chars[index] == '-')
                     && !matches!(chars[index - 1], 'e' | 'E')
                 {
@@ -175,11 +137,6 @@ fn tokenize(src: &str) -> Vec<Located> {
     tokens
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// 归一化
-// ────────────────────────────────────────────────────────────────────────────
-
-/// 语言拼写 → 归一化拼写（只抹平拼写差异，**不动数学**）。
 const TYPE_ALIASES: &[(&str, &str)] = &[
     ("float2", "v2"),
     ("float3", "v3"),
@@ -193,17 +150,11 @@ const TYPE_ALIASES: &[(&str, &str)] = &[
     ("float", "f"),
     ("uint", "u"),
     ("int", "i"),
-    // 导数：GLSL `dFdx`/`dFdy`、HLSL `ddx`/`ddy`、MSL `dfdx`/`dfdy` 是同一个指令
-    // （token 已被 tokenizer 小写成 `dfdx`/`dfdy`）。AR2 P3-③：归一化必须覆盖等价改写，
-    // 否则合法重写会卡构建。
     ("dfdx", "ddx"),
     ("dfdy", "ddy"),
-    // `lerp(a, b, t)` 与 `mix(a, b, t)` 在 HLSL/MSL/GLSL 里逐位等价（HLSL 的 `lerp` 与
-    // GLSL 的 `mix` 都定义为 `a + (b - a) * t`）—— `contract.md` §1 的归一化承诺。
     ("lerp", "mix"),
 ];
 
-/// 归一化时丢弃的修饰关键字（不影响数学）。
 const DROPPED_KEYWORDS: &[&str] = &["inline", "static", "const", "constant"];
 
 fn alias(word: &str) -> &str {
@@ -213,17 +164,10 @@ fn alias(word: &str) -> &str {
         .map_or(word, |(_, to)| *to)
 }
 
-/// 归一化 token 序列：
-///
-/// 1. 去掉 `root.` 前缀（GLSL 走 push constant，HLSL 用全局，MSL 用参数 —— 同一字段三种写法）；
-/// 2. 去掉修饰关键字；
-/// 3. 类型别名（`float2` → `v2` 等）；
-/// 4. 单标量广播构造（`vec2(0.0)` → `0.0`，`max(q, 0.0)` 与 `max(q, vec2(0.0))` 等价）。
 fn normalize(tokens: &[Located]) -> Vec<Located> {
     let mut first: Vec<Located> = Vec::with_capacity(tokens.len());
     let mut index = 0usize;
     while index < tokens.len() {
-        // `root.` 前缀：跳过 `root` 与后面的 `.`
         if let Token::Ident(word) = &tokens[index].token
             && word == "root"
             && matches!(
@@ -301,7 +245,6 @@ fn drop_broadcast_constructors(tokens: &[Located]) -> Vec<Located> {
         .collect()
 }
 
-/// 把归一化 token 序列切成语句（`;`、`{`、`}` 都是分隔符）。
 fn statements(tokens: &[Located]) -> Vec<Statement> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -351,10 +294,6 @@ fn push_token(out: &mut String, token: &Token) {
     }
 }
 
-/// 从一份语言源码里抽出某个函数的**归一化语句列表**。
-///
-/// # Errors
-/// 找不到函数（或花括号不配对）时返回诊断字符串。
 pub fn normalized_body(source: &ShaderSource, name: &str) -> Result<Vec<Statement>, String> {
     let mut last_error = String::new();
     for (file, contents) in &source.files {
@@ -364,7 +303,6 @@ pub fn normalized_body(source: &ShaderSource, name: &str) -> Result<Vec<Statemen
         while index < tokens.len() {
             let matches_name = matches!(&tokens[index].token, Token::Ident(word) if word == name);
             if matches_name {
-                // 跳过签名直到函数体的 `{`
                 let mut cursor = index;
                 while cursor < tokens.len() && !matches!(tokens[cursor].token, Token::Punct('{')) {
                     cursor += 1;
@@ -419,14 +357,6 @@ pub fn normalized_body(source: &ShaderSource, name: &str) -> Result<Vec<Statemen
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// 数学函数体比对
-// ────────────────────────────────────────────────────────────────────────────
-
-/// 一条「语言间必须逐语句等价」的函数。
-///
-/// `to_ndc` 不在表里：它的 Y 方向按后端 NDC 约定不同（D3D12/Metal Y 向上、Vulkan Y 向下），
-/// 差异是**契约的一部分**（`contract.md` §5），由 `render/uniform` 与 golden 共同守护。
 pub const MATH_FUNCTIONS: &[&str] = &[
     "sd_rounded_rect",
     "erf_approx",
@@ -438,7 +368,6 @@ pub const MATH_FUNCTIONS: &[&str] = &[
     "clip_mask",
 ];
 
-/// 首个差异（诊断输出：函数、语句序号、两侧文件与行号、两侧归一化文本）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mismatch {
     pub function: String,
@@ -470,10 +399,6 @@ impl std::fmt::Display for Mismatch {
     }
 }
 
-/// 比对同一函数在两种语言里的归一化语句列表。
-///
-/// # Errors
-/// 任一侧取不到函数体，或语句序列首次出现差异。
 pub fn compare_function(
     expected: &ShaderSource,
     actual: &ShaderSource,
@@ -541,10 +466,6 @@ pub fn compare_function(
     Ok(())
 }
 
-/// 比对三份源码的全套数学函数：所有语言都必须与 `reference` 逐语句相同。
-///
-/// # Errors
-/// 返回**第一条**差异（先函数表顺序、后语言顺序）。
 pub fn compare_math_functions(
     reference: &ShaderSource,
     others: &[&ShaderSource],
@@ -557,14 +478,6 @@ pub fn compare_math_functions(
     Ok(())
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// 渲染状态 / 颜色空间的文本锚点校验
-// ────────────────────────────────────────────────────────────────────────────
-
-/// 校验 `contents` 包含**全部**锚点；返回第一条缺失的描述。
-///
-/// # Errors
-/// 缺失时返回 `"<file>: <what> 应为 `<expected>`（找不到）"`。
 pub fn check_anchors(file: &str, contents: &str, anchors: &[(&str, &str)]) -> Result<(), String> {
     for (what, expected) in anchors {
         if !contents.contains(expected) {
@@ -576,10 +489,6 @@ pub fn check_anchors(file: &str, contents: &str, anchors: &[(&str, &str)]) -> Re
     Ok(())
 }
 
-/// 校验 `contents` **不包含**任何禁用锚点（例如某端又加了 cull、或硬编码了别的 blend 因子）。
-///
-/// # Errors
-/// 命中时返回 `"<file>: <what> 不得出现 `<forbidden>`"`。
 pub fn check_forbidden(
     file: &str,
     contents: &str,
@@ -621,7 +530,6 @@ mod tests {
         )
     }
 
-    /// 注释剥离必须保留行号（否则诊断里的行号全是错的）。
     #[test]
     fn stripping_comments_keeps_line_numbers() {
         let src = "a; // tail\nb;\n";
@@ -630,7 +538,6 @@ mod tests {
         assert!(!stripped.contains("tail"));
     }
 
-    /// 语言拼写差异（类型名 / `lerp` vs `mix` / `root.` 前缀 / 广播构造）不算差异。
     #[test]
     fn spelling_differences_normalize_away() {
         let left = hlsl(
@@ -658,12 +565,10 @@ mod tests {
             compare_function(&left, &right, "g").is_ok(),
             "`root.` 前缀必须被抹平"
         );
-        // MSL 同样要等价（`inline` 修饰被抹平、`root.` 前缀被抹平）。
         let msl = metal("inline float g() {\n  return root.frame.params.x;\n}\n");
         assert!(compare_function(&left, &msl, "g").is_ok());
     }
 
-    /// AR2 P3-③：`lerp ↔ mix` 与三语言的导数拼写必须被归一化（等价改写不得误报）。
     #[test]
     fn equivalent_rewrites_normalize_away() {
         let hlsl = hlsl(
@@ -682,18 +587,6 @@ mod tests {
         assert!(compare_function(&hlsl, &msl, "f").is_ok());
     }
 
-    /// AR2 P1-A / P2-① 的语义锁：三份源码的等价性由 `build.rs` 守着，但「三份一起改错」
-    /// 只有这里能抓住 —— 对**真实** shader 源码做归一化后的结构断言。
-    ///
-    /// - `analytic_shadow` 必须是**完整的可分离高斯**：每轴两条 `shadow_cdf`（近边 + 对边），
-    ///   共 5 处（旧实现只有近边 3 处 ⇒ 小元素四周多出一圈不存在的光晕）；
-    /// - `clip_mask` 必须按 `meta.y` 分流，且 `aa_coverage` **只出现一次**（只有圆角项参与
-    ///   AA 相乘；矩形项是 0/1 scissor —— 否则同边界的矩形 + 圆角 clip 得到 0.25 暗边）；
-    /// - `clip_mask` 的矩形项必须按**像素索引**判定（`floor(world_px)` 与整数吸附后的
-    ///   `[lo, hi)` 比较），**不得**再出现 `world_px ± 0.5` 的浮点单元比较：`world_px` 是插值
-    ///   属性，1 ulp 就会让边界像素翻面，而覆盖率是 0/1 ⇒ 整列像素越界（AR2b P1-N1）；
-    /// - `aa_coverage` 的带宽必须是梯度模长 `length(ddx, ddy)`，不是 `|ddx| + |ddy|`
-    ///   （后者让对角边带宽变成 1.41 px）。
     #[test]
     fn the_math_contract_keeps_the_two_sided_shadow_and_the_scissor_clip() {
         let source = ShaderSource::new(
@@ -742,14 +635,10 @@ mod tests {
             1,
             "aa_coverage 只能乘一次（矩形项是 0/1 scissor）：{body}"
         );
-        // 矩形项的像素索引判定：`floor(world_px)`。三份 shader 的逐语句等价由 `build.rs`
-        // 守护，这里钉住「判定对象是像素索引」这一条语义（AR2b P1-N1 的回归闸门）。
         assert!(
             body.contains("floor(world_px)"),
             "矩形项必须用像素索引 floor(world_px) 判定（不得直接比 world_px）：{body}"
         );
-        // 唯一允许的 `0.5` 是圆角项的 `zw * 0.5`（half_size）。矩形项一旦回到
-        // `world_px.x - 0.5 >= hi.x` 这种浮点单元比较，这个计数就会 > 1。
         assert_eq!(
             body.matches("0.5").count(),
             1,
@@ -768,7 +657,6 @@ mod tests {
         );
     }
 
-    /// 数学差异必须被抓住，并指到正确语句（含行号）。
     #[test]
     fn a_changed_constant_is_reported_with_the_first_difference() {
         let reference = hlsl(
@@ -788,7 +676,6 @@ mod tests {
         assert!(text.contains("common.frag.glsl:2"), "{text}");
     }
 
-    /// 语句数量不同也要报错（不是只比前 N 条）。
     #[test]
     fn a_missing_statement_is_reported() {
         let reference =
@@ -798,7 +685,6 @@ mod tests {
         assert_eq!(error.statement_index, 1);
     }
 
-    /// 函数缺失是硬错误（拼错的函数名不能被静默忽略）。
     #[test]
     fn a_missing_function_is_an_error() {
         let source = hlsl("float f() {\n  return 1.0;\n}\n");
@@ -807,7 +693,6 @@ mod tests {
         assert_eq!(error.function, "sd_rounded_rect");
     }
 
-    /// 渲染状态锚点：三端必须都出现；缺失 ⇒ 失败（R06-5 c）。
     #[test]
     fn render_state_anchors_must_all_be_present() {
         let windows = "SrcBlend: D3D12_BLEND_ONE, DestBlend: D3D12_BLEND_INV_SRC_ALPHA";
@@ -823,7 +708,6 @@ mod tests {
         )
         .expect_err("必须失败");
         assert!(error.contains("D3D12_BLEND_OP_ADD"), "{error}");
-        // 禁用锚点（例如有人给 macOS 加了 cull）也要能抓住。
         let macos = "attachment.setBlendingEnabled(true);\nencoder.setCullMode(MTLCullMode::Back);";
         let forbidden = [("cull", "setCullMode")];
         assert!(check_forbidden("macos/pipeline.rs", macos, &forbidden).is_err());

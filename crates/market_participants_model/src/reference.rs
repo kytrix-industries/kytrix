@@ -1,12 +1,3 @@
-//! Canonical price and external reference terms.
-//!
-//! `PriceReferenceId` and `ExternalReferenceId` are derived from the reference
-//! economic terms only: the underlying or external reference identity, the quote
-//! asset, the price basis, the observation semantics, the aggregation, the
-//! session and settlement conventions and the terms schema version. Oracle
-//! endpoints, refresh rates, fallbacks, transports and adapter implementation
-//! details are listing metadata and never take part in the identity.
-
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -25,7 +16,6 @@ use crate::{
 crate::identifier::identity_type!(PriceReferenceId, PriceReferenceIdentity);
 crate::identifier::identity_type!(ExternalReferenceId, ExternalReferenceIdentity);
 
-/// The economic value semantics of a reference observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ReferenceObservationKind {
     #[serde(rename = "mark")]
@@ -37,7 +27,6 @@ pub enum ReferenceObservationKind {
 }
 
 impl ReferenceObservationKind {
-    /// Returns the fixed canonical label of this observation kind.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Mark => "mark",
@@ -53,7 +42,6 @@ impl CanonicalTerms for ReferenceObservationKind {
     }
 }
 
-/// The source and value semantics of a reference observation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ReferenceObservation {
     #[serde(rename = "source")]
@@ -69,7 +57,6 @@ impl CanonicalTerms for ReferenceObservation {
     }
 }
 
-/// One weighted component of a composite reference.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ReferenceComponent {
     #[serde(rename = "underlying")]
@@ -85,7 +72,6 @@ impl CanonicalTerms for ReferenceComponent {
     }
 }
 
-/// How a reference aggregates its components.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "aggregation")]
 pub enum ReferenceAggregation {
@@ -99,11 +85,6 @@ pub enum ReferenceAggregation {
 }
 
 impl ReferenceAggregation {
-    /// Validates the aggregation.
-    ///
-    /// A composite reference needs at least one component, every component
-    /// weight must be positive, and the components must be sorted by their
-    /// canonical underlying order without repeating an underlying.
     pub fn validate(&self) -> Result<(), ModelError> {
         let Self::Composite { components } = self else {
             return Ok(());
@@ -133,7 +114,6 @@ impl ReferenceAggregation {
         Ok(())
     }
 
-    /// Returns the components of a composite reference.
     pub fn components(&self) -> &[ReferenceComponent] {
         match self {
             Self::Direct => &[],
@@ -154,10 +134,6 @@ impl CanonicalTerms for ReferenceAggregation {
     }
 }
 
-/// The session and time convention of a reference observation.
-///
-/// A 24x7 crypto or prediction reference still states its convention explicitly;
-/// a missing convention never means "always open".
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "convention")]
 pub enum ReferenceSessionConvention {
@@ -173,7 +149,6 @@ pub enum ReferenceSessionConvention {
 }
 
 impl ReferenceSessionConvention {
-    /// Returns the calendar identity of this convention.
     pub fn calendar(&self) -> SmolStr {
         match self {
             Self::Continuous => SmolStr::new_static("continuous"),
@@ -195,7 +170,6 @@ impl CanonicalTerms for ReferenceSessionConvention {
     }
 }
 
-/// How a reference value becomes a settlement value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ReferenceSettlementConvention {
     #[serde(rename = "continuous")]
@@ -207,7 +181,6 @@ pub enum ReferenceSettlementConvention {
 }
 
 impl ReferenceSettlementConvention {
-    /// Returns the fixed canonical label of this settlement convention.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Continuous => "continuous",
@@ -216,7 +189,6 @@ impl ReferenceSettlementConvention {
         }
     }
 
-    /// Returns `true` when this convention observes an official fixing.
     pub const fn is_official_fixing(self) -> bool {
         matches!(self, Self::OfficialFixing)
     }
@@ -228,7 +200,6 @@ impl CanonicalTerms for ReferenceSettlementConvention {
     }
 }
 
-/// The canonical terms of an internal price reference.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct PriceReferenceTerms {
     #[serde(rename = "underlying")]
@@ -250,10 +221,6 @@ pub struct PriceReferenceTerms {
 }
 
 impl PriceReferenceTerms {
-    /// Validates the reference terms.
-    ///
-    /// An index underlying must be priced with a matching `PerIndexPoint` basis,
-    /// because an index is not an asset.
     pub fn validate(&self) -> Result<(), ModelError> {
         if let UnderlyingRef::Index(index) = &self.underlying {
             match &self.basis {
@@ -269,7 +236,6 @@ impl PriceReferenceTerms {
         self.aggregation.validate()
     }
 
-    /// Derives the canonical price reference identity.
     pub fn reference_id(&self) -> Result<PriceReferenceId, ModelError> {
         self.validate()?;
         Ok(PriceReferenceId::of_terms(self))
@@ -290,7 +256,6 @@ impl CanonicalTerms for PriceReferenceTerms {
     }
 }
 
-/// The canonical terms of an external reference such as a HIP-3 custom oracle.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ExternalReferenceTerms {
     #[serde(rename = "issuer")]
@@ -314,12 +279,10 @@ pub struct ExternalReferenceTerms {
 }
 
 impl ExternalReferenceTerms {
-    /// Validates the external reference terms.
     pub fn validate(&self) -> Result<(), ModelError> {
         self.aggregation.validate()
     }
 
-    /// Derives the canonical external reference identity.
     pub fn reference_id(&self) -> Result<ExternalReferenceId, ModelError> {
         self.validate()?;
         Ok(ExternalReferenceId::of_terms(self))
@@ -404,9 +367,6 @@ mod tests {
         }
     }
 
-    /// The canonical price reference terms are an identity, not a description, so
-    /// the digest of one fixed reference is pinned: a change to the encoding or to
-    /// the identity namespace moves this literal.
     #[test]
     fn price_reference_identity_should_be_a_pinned_digest() {
         assert_eq!(

@@ -1,14 +1,3 @@
-//! The application-facing market participants connector.
-//!
-//! [`MarketParticipantsConnector`] owns one gateway, connection pool, registry, and runtime
-//! projection for the application's market-participants capabilities. The `account`,
-//! `market`, and `trading` handles are cheap-to-clone siblings that share that
-//! state and have no dependency on one another.
-//!
-//! Nothing here loads a market on its own: [`MarketParticipantsConnector::load_venue`] is
-//! the one entry point that stages everything a venue publishes and commits it in
-//! one critical section, and the only caller is the user's load action.
-
 use std::{
     future::Future,
     sync::{
@@ -56,10 +45,6 @@ use crate::{
     },
 };
 
-/// Runtime inputs owned by the composition root when constructing an
-/// [`MarketParticipantsConnector`]. The root creates its own connection pool and
-/// gateway from these inputs; lower-level market-participant types are intentionally
-/// absent from this boundary.
 pub struct MarketParticipantsConnectorInput {
     transport: Arc<TransportHub>,
     snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
@@ -67,13 +52,6 @@ pub struct MarketParticipantsConnectorInput {
 }
 
 impl MarketParticipantsConnectorInput {
-    /// Creates MarketParticipantsConnector input from the shared transport and the
-    /// notification carrying the market-participants runtime projection.
-    ///
-    /// The application runtime must be attached with [`Self::with_runtime`]
-    /// before the market participants root is built: every route resolves its proxy through
-    /// it, and a request has to be able to carry that work off whatever executor
-    /// it arrived on.
     pub fn new(
         transport: Arc<TransportHub>,
         snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
@@ -85,20 +63,17 @@ impl MarketParticipantsConnectorInput {
         }
     }
 
-    /// Attaches the application runtime every market-participant operation runs on.
     pub fn with_runtime(mut self, runtime: Handle) -> Self {
         self.runtime = Some(runtime);
         self
     }
 }
 
-/// The single application-level owner of market-participants runtime resources.
 #[derive(Clone)]
 pub struct MarketParticipantsConnector {
     inner: Arc<MarketParticipantsConnectorInner>,
 }
 
-/// Errors raised while creating the application `MarketParticipantsConnector`.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MarketParticipantsConnectorError {
     #[error("MarketParticipantsConnector initialization failed: {0}")]
@@ -109,13 +84,6 @@ pub enum MarketParticipantsConnectorError {
     RouteDescriptors(#[source] routing::RegistryError),
 }
 
-/// Why loading one venue failed.
-///
-/// The variant names the stage that failed and, where a stage is per scope, the
-/// scope it failed on, so a caller can tell "the venue would not say what it
-/// deploys" from "this scope's directory could not be read" and report the right
-/// thing about the right scope. A load that fails at any stage commits nothing:
-/// the variants are reports, not states.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum VenueLoadError {
     #[error("reading what {venue} publishes failed: {source}")]
@@ -162,32 +130,11 @@ pub enum VenueLoadError {
     RevisionChanged { venue: VenueId, scope: VenueScopeId },
     #[error("loading {venue} was cancelled")]
     Interrupted { venue: VenueId },
-    /// A venue this build carries an identity for but serves nothing for.
-    ///
-    /// The identity and the served set are not the same set in principle: a venue whose
-    /// loader and capability names have not landed yet would be carried by [`VenueId`]
-    /// and answered by no definition, and a load of it would be refused here rather than
-    /// panicking. The refusal happens before anything of the venue is read, so it
-    /// commits nothing and leaves no trace.
-    ///
-    /// No [`VenueId`] reaches this variant today: every variant's definition has landed,
-    /// so the definition table answers one for each and cannot answer nothing. Nothing in
-    /// this build constructs it, and it is kept rather than deleted because the load seam
-    /// it belongs to is the one a later phase extends: the day a venue is carried before
-    /// its loader, that arm's absence is what this variant says, and
-    /// `the_definition_table_covers_every_venue_this_build_serves` is the test that would
-    /// fail first — it asserts the lookup answers exactly [`VenueId::ALL`], so a carried
-    /// venue without a definition is caught there rather than silently served.
     #[error("this build serves no market for venue {venue}")]
     UnsupportedVenue { venue: VenueId },
 }
 
 impl VenueLoadError {
-    /// Reports a refused commit as the stage failure it is.
-    ///
-    /// The commit refuses a batch whose route changed while it was staged, which
-    /// is a `(venue, scope)` answer rather than a scope-less one; every other
-    /// refusal names the scope whose directory the commit was publishing.
     fn from_commit(venue: &VenueId, scope: VenueScopeId, error: CatalogError) -> Self {
         match error {
             CatalogError::RouteRevisionChanged { route, .. } => Self::RevisionChanged {
@@ -213,91 +160,35 @@ impl MarketParticipantsConnectorError {
     }
 }
 
-/// The state every market-participants capability handle shares.
-///
-/// The fields are public because the `account`, `market` and `trading` handles are
-/// built from this one value and read the gateway, the pool and the route
-/// projections directly rather than through a second layer. The type itself is
-/// crate-visible, so no field reaches an external caller.
 pub(crate) struct MarketParticipantsConnectorInner {
     pub gateway: MarketParticipantGateway,
     pub pool: Arc<ConnectionPool>,
-    /// The shared catalogue this root loads a venue's catalogs through and every
-    /// reader answers from: the root owns it, so there is one directory and one
-    /// publication, and no attachment step exists.
     pub catalog: Arc<Catalog>,
-    /// The one routing view: which venues a load has committed and what each
-    /// commit published. Catalog content is not answered here — it is answered
-    /// by the published generation of the catalogue.
     pub venues: LoadedVenues,
-    /// The single-flight boundary of one venue's load.
-    ///
-    /// Two loads of the same venue never interleave their stages: the second
-    /// waits for the first to commit, so a venue's revision advances once per
-    /// load and no stage ever plans against a registration another stage is
-    /// about to replace.
     pub loads: Mutex<AHashMap<VenueId, Arc<LoadFlight>>>,
-    /// The cancellation of each venue's in-flight load.
-    ///
-    /// The action that started a load is the one that stops it — a row the user
-    /// left while its venue was loading — so the token is kept per venue and
-    /// observed by the stage between its steps.
     pub cancellations: Mutex<AHashMap<VenueId, LoadCancellation>>,
-    /// The task that invalidates pooled connections whenever the runtime
-    /// projection is published again.
-    ///
-    /// Every root starts it: the projection has exactly one consumer, and a
-    /// publication is the only signal that the settings moved. `shutdown` takes
-    /// the task before it closes the pool.
     pub config_task: Mutex<Option<OwnedTask>>,
     pub closed: AtomicBool,
 }
 
 impl MarketParticipantsConnectorInner {
-    /// Returns the shared catalogue every capability reads through.
     pub(crate) fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    /// Returns the shared catalogue by pointer, for a proof that outlives one
-    /// borrow of this root.
     pub(crate) fn catalog_arc(&self) -> Arc<Catalog> {
         Arc::clone(&self.catalog)
     }
 
-    /// Loads one venue: stages everything it publishes and commits it in one step.
-    ///
-    /// The load is the one writer of the directory, the route registry and the
-    /// venue table, and it is a transaction: the whole scope set, every
-    /// catalog of every scope that publishes one, and the venue's metadata are
-    /// read and validated first, and nothing becomes visible until the commit's
-    /// single critical section writes all three views together. A first load
-    /// that fails leaves nothing behind, and a refresh that fails leaves the
-    /// previous commit byte for byte as it was.
-    ///
-    /// The stage is serial — the "first failure stops the load" rule: the venues
-    /// publish a handful of scopes each, and reporting which scope failed is worth
-    /// more than overlapping the reads.
-    ///
-    /// A venue the definition table answers no definition for would be refused before
-    /// anything is read, naming the venue rather than defaulting it to another venue's
-    /// definition; the table answers one for every venue this build carries, so no
-    /// [`VenueId`] takes that path today.
     async fn load_venue(
         &self,
         venue: VenueId,
         cancellation: &LoadCancellation,
     ) -> Result<(), VenueLoadError> {
         let definition = definition::definition_of(venue);
-        // One load of one venue at a time: a second load of the same venue
-        // waits for the first to commit rather than interleaving a second stage
-        // with it, so a venue's revision advances exactly once per load.
         let flight = self.load_flight(&venue);
         let seen = flight.generation.load(Ordering::Acquire);
         let _flight = flight.lock.lock().await;
-        // A load that waited for another load of the same venue is that load's
-        // answer: it commits nothing a second time, so the venue's revision
-        // advances exactly once per burst of concurrent loads.
         if flight.generation.load(Ordering::Acquire) != seen {
             return Ok(());
         }
@@ -306,20 +197,10 @@ impl MarketParticipantsConnectorInner {
             .await
             .inspect_err(|error| log::debug!("loading {venue} failed: {error}"))?;
         self.commit_venue(stage, cancellation)?;
-        // The load this burst of callers waited for is what answers them: the
-        // counter moves only after a commit actually happened.
         flight.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
-    /// Reads everything one venue publishes, changing nothing.
-    ///
-    /// The loader answers the scope set and the metadata; every catalog scope is
-    /// then fetched through the route the same answer registers, so a batch is
-    /// validated against the registration it will be published under. Any failure
-    /// drops the whole stage: the batches are private pending values until the
-    /// commit installs them, so a refused stage leaves no asset, reference or
-    /// outcome identity behind.
     async fn stage_venue(
         &self,
         definition: &'static VenueDefinition,
@@ -340,9 +221,6 @@ impl MarketParticipantsConnectorInner {
             .iter()
             .map(|entry| specs::descriptor_of_entry(venue, entry))
             .collect();
-        // The candidate is validated against every other venue's routes before
-        // anything is fetched, so the registration each batch is staged under is
-        // the one the commit will write.
         let route_plan = Arc::new(
             self.gateway
                 .plan_venue_routes(&venue, descriptors.clone())
@@ -388,15 +266,6 @@ impl MarketParticipantsConnectorInner {
         })
     }
 
-    /// Fetches and stages every catalog one venue's scope set publishes.
-    ///
-    /// A scope with no catalog source publishes no directory, so it contributes
-    /// nothing here; a scope whose fetch or validation fails fails the whole load
-    /// and names itself, because a venue is loaded whole or not at all.
-    ///
-    /// The fetch is resolved against the metadata the same load read: a catalog is
-    /// derived from the venue's own tables, so staging it is a read of the reading
-    /// rather than a second conversation, and the venue is asked nothing here.
     async fn stage_catalogs(
         &self,
         venue: &VenueId,
@@ -468,13 +337,6 @@ impl MarketParticipantsConnectorInner {
         Ok(pending)
     }
 
-    /// Commits one staged venue as a single indivisible publication.
-    ///
-    /// The four views the commit owns — the venue table, the gateway's route
-    /// registry, the catalogue's route registry and the publication pointer — are
-    /// locked in that order and released together, and the venue's entry is
-    /// replaced inside that same critical section, so a reader observes either the
-    /// previous commit or this one. Nothing in the section awaits.
     fn commit_venue(
         &self,
         staged: StagedVenue,
@@ -519,7 +381,6 @@ impl MarketParticipantsConnectorInner {
         Ok(())
     }
 
-    /// Returns the single-flight lock of one venue's load.
     fn load_flight(&self, venue: &VenueId) -> Arc<LoadFlight> {
         let mut loads = self.loads.lock();
         Arc::clone(
@@ -529,25 +390,15 @@ impl MarketParticipantsConnectorInner {
         )
     }
 
-    /// Records the cancellation of one venue's in-flight load.
     fn cancellation_of(&self, venue: &VenueId) -> LoadCancellation {
         let mut cancellations = self.cancellations.lock();
         cancellations.entry(*venue).or_default().clone()
     }
 
-    /// Empties one venue's cancellation once its load is over.
     fn finish_load(&self, venue: &VenueId) {
         self.cancellations.lock().remove(venue);
     }
 
-    /// Commits one fixture venue without a venue conversation.
-    ///
-    /// The fixture's scope set and listings travel the same commit as a load's:
-    /// the routes are validated and planned, the listings are staged as the
-    /// pending snapshots of the routes that publish a catalog, and the commit
-    /// writes the venue table, the route registry and the directory pointer in one
-    /// critical section. The differences are the ones that make it a fixture: no
-    /// request is sent and the metadata is empty.
     #[cfg(any(test, feature = "test-support"))]
     fn load_fixture_venue(
         &self,
@@ -634,9 +485,6 @@ impl MarketParticipantsConnectorInner {
             })?;
         drop(registry);
         drop(venues);
-        // The fixture commit is recorded the way the load transaction records one:
-        // the entry it published, the generation it pinned and the deployments its
-        // metadata named.
         if let Some(entry) = self.venues.loaded(venue) {
             log::debug!(
                 "fixture committed {venue} at revision {} generation {} with {} deployments",
@@ -649,18 +497,12 @@ impl MarketParticipantsConnectorInner {
     }
 }
 
-/// The single-flight boundary of one venue's load.
-///
-/// The lock serializes the loads of one venue, and the counter records how many
-/// of them have committed: a load that waited for the lock and finds the counter
-/// moved was answered by the load it waited for, so it commits nothing again.
 #[derive(Default)]
 pub(crate) struct LoadFlight {
     lock: tokio::sync::Mutex<()>,
     generation: std::sync::atomic::AtomicU64,
 }
 
-/// Everything one staged load will commit.
 struct StagedVenue {
     venue: VenueId,
     descriptors: Vec<routing::VenueRouteDescriptor>,
@@ -671,12 +513,6 @@ struct StagedVenue {
     metadata: Arc<VenueMetadata>,
 }
 
-/// The venue conversation a loader dials through.
-///
-/// It holds the gateway and the venue identity, so a discovery request is built,
-/// dialed and decoded inside the gateway exactly as any other market-participants call is; the
-/// one thing it does not need is a registered route, because the conversation
-/// addresses the venue itself.
 struct GatewayConversation {
     gateway: MarketParticipantGateway,
     venue: VenueId,
@@ -691,28 +527,12 @@ impl VenueConversation for GatewayConversation {
 }
 
 impl MarketParticipantsConnector {
-    /// Builds the shared market participants root from typed runtime inputs.
-    ///
-    /// The root owns its catalogue: a fetch of a venue's catalogs and every read
-    /// of the published generation answer from the same [`Catalog`], and the
-    /// application runtime is attached to it here so a fetch crosses the same
-    /// blocking boundary whatever executor drives it. The network projection is
-    /// the caller's ([`ConfigNotification`]): it routes every request, and a
-    /// publication — which the composition root makes after each settings commit
-    /// that moved the network or venue settings — closes the pooled connections
-    /// the new projection no longer serves.
     pub fn new(
         input: MarketParticipantsConnectorInput,
     ) -> Result<Self, MarketParticipantsConnectorError> {
         Self::build(input, Arc::new(Catalog::new()))
     }
 
-    /// Builds a root over an existing catalogue.
-    ///
-    /// This is the test seam beside [`Self::new`]: a fixture builds a catalogue,
-    /// seeds it and hands it here, so the root reads and publishes into the
-    /// directory the fixture drives. Production builds its own and never shares
-    /// one.
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_catalog(
         input: MarketParticipantsConnectorInput,
@@ -736,11 +556,6 @@ impl MarketParticipantsConnector {
         catalog.set_runtime(runtime.clone());
         let initial_snapshot = snapshot.current();
         let pool = Arc::new(ConnectionPool::with_transport(Arc::clone(&transport)));
-        // The projection has exactly one consumer: a publication means the settings
-        // moved, so every pooled connection the new projection no longer serves is
-        // closed. The task lives as long as the root and `shutdown` takes it; it is
-        // started only after the root's own construction succeeded, so a refused
-        // construction leaves no detached task waiting on a projection.
         let config_notification = snapshot.clone();
         let task_runtime = runtime.clone();
         let router = MarketParticipantGateway::adapter_router(&initial_snapshot)
@@ -760,8 +575,6 @@ impl MarketParticipantsConnector {
                 invalidating_pool.invalidate_stale(&next).await;
             }
         });
-        // The root owns the venue table from the moment it exists: a commit writes
-        // it, the route registry and the directory pointer in one critical section.
         let venues = LoadedVenues::new();
         let inner = Arc::new(MarketParticipantsConnectorInner {
             gateway,
@@ -776,103 +589,44 @@ impl MarketParticipantsConnector {
         Ok(Self { inner })
     }
 
-    /// Returns the account capability sharing this `MarketParticipantsConnector` runtime.
     pub fn account(&self) -> account::provider::AccountCapability {
         account::provider::AccountCapability::new(Arc::clone(&self.inner))
     }
 
-    /// Returns the market capability sharing this `MarketParticipantsConnector` runtime.
     pub fn market(&self) -> market::provider::MarketCapability {
         market::provider::MarketCapability::new(Arc::clone(&self.inner))
     }
 
-    /// Returns the trading capability sharing this `MarketParticipantsConnector` runtime.
     pub fn trading(&self) -> trading::provider::TradingCapability {
         trading::provider::TradingCapability::new(Arc::clone(&self.inner))
     }
 
-    /// Returns every venue this build serves, in declaration order.
-    ///
-    /// The list is the static definition table's answer: the market menu draws
-    /// one row per venue and the settings page one group per venue, whether or
-    /// not anything is loaded. Whether a venue is loaded is [`Self::venues`]'s
-    /// answer — the two are deliberately different questions.
     pub fn supported_venues(&self) -> Vec<VenueId> {
         definition::supported_venues()
     }
 
-    /// Reports whether a load of this venue has to be refused for want of credentials.
-    ///
-    /// A venue that declares every read signs and stores no complete credential set is
-    /// one a load would leave unreadable: the load itself succeeds — its directory is
-    /// public — and every pane that then read the market would fail on the credential.
-    /// A venue whose reads are public answers false and is offered unconditionally.
-    ///
-    /// This is the one read of the static table a caller outside this crate has, and it
-    /// exists because the interface that asks the question may not read the table
-    /// itself: whether a venue *needs* credentials is a definition's field, and
-    /// whether it *has* them is the runtime snapshot's answer.
     pub fn load_needs_credentials(&self, venue: VenueId) -> bool {
         let definition = definition::definition_of(venue);
         definition.requires_credentials_to_load
             && !self.runtime_snapshot().credentials_configured(&venue)
     }
 
-    /// Returns the runtime snapshot this root's requests resolve against.
-    ///
-    /// It is the shared projection read once: the snapshot every request is
-    /// resolved with is the one this answers from, so an answer about a venue's
-    /// credentials is about the configuration that would serve its next request.
     fn runtime_snapshot(&self) -> Arc<MarketParticipantNetworkSnapshot> {
         self.inner.gateway.runtime.snapshot.current()
     }
 
-    /// Returns the loaded venues.
-    ///
-    /// This is the one routing view: which venues are loaded, which scopes are in
-    /// play and what each scope supports all come from it. It never answers
-    /// catalog content, which is the published generation of the catalogue.
     pub fn venues(&self) -> &LoadedVenues {
         &self.inner.venues
     }
 
-    /// Returns the shared catalogue.
-    ///
-    /// This is the one read face of the directory: a caller names it, a listing
-    /// or an asset, and reads whatever the published generation answers, without
-    /// fetching anything. Writing it is not reachable from outside this crate —
-    /// a venue's catalogs are published by [`Self::load_venue`] alone.
     pub fn catalog(&self) -> &Catalog {
         &self.inner.catalog
     }
 
-    /// Returns the shared catalogue by pointer.
-    ///
-    /// The same read face as [`Self::catalog`], for a holder that outlives one
-    /// borrow of this root — a service, a dialog or an entity that keeps the
-    /// directory across calls.
     pub fn catalog_arc(&self) -> Arc<Catalog> {
         self.inner.catalog_arc()
     }
 
-    /// Loads one venue: everything it publishes, in one transaction.
-    ///
-    /// The load stages the venue's whole scope set, every catalog of every scope
-    /// that publishes one, and its metadata, and commits them together with the
-    /// venue's routes in one critical section. A first load that fails
-    /// leaves nothing behind; a refresh that fails leaves the previous commit
-    /// exactly as it was, down to the revision the venue's entry carries.
-    ///
-    /// A venue this build declares no definition for is refused before anything is
-    /// read: the definition table is what says a venue can be loaded at all. Every
-    /// [`VenueId`] this build carries has an entry there — the identity and the served
-    /// set are one set today — so no load reaches that refusal; the lookup answers a
-    /// definition rather than an option for exactly that reason, and a venue the identity
-    /// gained before its loader landed would be the one that separated them again.
-    ///
-    /// The returned future is the load itself. Cancelling it — see
-    /// [`Self::cancel_venue_load`] — stops the stage before its next step and
-    /// commits nothing.
     pub fn load_venue(
         &self,
         venue: VenueId,
@@ -886,36 +640,12 @@ impl MarketParticipantsConnector {
         }
     }
 
-    /// Cancels the load of one venue, if one is in flight.
-    ///
-    /// The cancellation is observed between the stage's steps, so the request
-    /// already under way finishes and nothing after it starts. A load that was
-    /// cancelled commits nothing and answers [`VenueLoadError::Interrupted`].
     pub fn cancel_venue_load(&self, venue: &VenueId) {
         if let Some(cancellation) = self.inner.cancellations.lock().get(venue) {
             cancellation.cancel();
         }
     }
 
-    /// Loads a fixture market without a venue answering.
-    ///
-    /// This is the one seam a test drives a market through, and it replaces the
-    /// three former registration seams: the venues named are committed exactly as
-    /// [`Self::load_venue`] commits them — their scope set, their catalogs and
-    /// their metadata become visible in one step, the venue table, the route
-    /// registry and the directory pointer together — except that no request is
-    /// sent, no discovery runs and the catalogs are the fixture's own listings
-    /// instead of a fetch.
-    ///
-    /// `scopes` states a scope set a fixture owns — a scope no static table has,
-    /// like a discovered `perp-dex/*` — one entry per venue; a venue whose scopes
-    /// are not stated loads the ones its definition publishes. `catalogs` carries
-    /// the fixture listings of the routes that publish one. A venue named in
-    /// neither list keeps whatever it committed before, and a venue whose stated
-    /// scope set is empty is unloaded.
-    ///
-    /// Production never calls it: a market is loaded by the user's own action, and
-    /// that action is `load_venue`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn load_fixture(
         &self,
@@ -939,7 +669,6 @@ impl MarketParticipantsConnector {
         Ok(())
     }
 
-    /// Closes the shared gateway and stops the root-owned invalidation task.
     pub async fn shutdown(&self) {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -948,8 +677,6 @@ impl MarketParticipantsConnector {
         if let Some(task) = config_task {
             task.cancel_and_wait().await;
         }
-        // The catalogue belongs to this root: shutting the root down drops the
-        // last reference to it and nothing publishes into it again.
         self.inner.gateway.shutdown().await;
         self.inner.pool.close_all().await;
     }
@@ -999,7 +726,6 @@ mod tests {
         )
     }
 
-    /// A root with its own catalogue and no venue loaded.
     fn root() -> MarketParticipantsConnector {
         let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
         let notification = ConfigNotification::new(snapshot);
@@ -1013,8 +739,6 @@ mod tests {
         .expect("the root builds from typed runtime inputs")
     }
 
-    /// The static table is not a registration, and loading a venue publishes both
-    /// of its scopes together with its catalog source bindings.
     #[tokio::test]
     async fn connecting_a_venue_publishes_its_scopes_and_catalog_bindings() {
         let connector = root();
@@ -1063,7 +787,6 @@ mod tests {
         connector.shutdown().await;
     }
 
-    /// Loading one venue leaves another venue's slot exactly as it was.
     #[tokio::test]
     async fn connecting_a_venue_does_not_touch_another() {
         let connector = root();
@@ -1095,15 +818,6 @@ mod tests {
         connector.shutdown().await;
     }
 
-    /// A venue whose every read signs reports the load it needs credentials for, and
-    /// one whose reads are public never does.
-    ///
-    /// This is the one read of the static table a caller outside this crate has: the
-    /// interface that offers a load asks it before starting one, and what it answers is
-    /// the definition's own requirement beside the runtime snapshot's stored set. The
-    /// three market participants answer `false` whether or not anything is stored — their
-    /// directories are public — while the venue whose market is behind its credentials
-    /// answers `true` until a complete set is stored and `false` once it is.
     #[tokio::test]
     async fn a_venue_whose_reads_sign_needs_its_credentials_to_load() {
         let unconfigured = root();
@@ -1148,18 +862,8 @@ mod tests {
         configured.shutdown().await;
     }
 
-    /// How long one publication may take to reach the pool.
-    ///
-    /// The invalidation task is one runtime hop away from the interface, so the bound is
-    /// generous; the wait itself is a poll that returns as soon as the connection it
-    /// watches closes, and this is only what fails a publication that never arrives.
     const INVALIDATION_BOUND: Duration = Duration::from_secs(5);
 
-    /// The key of one venue connection, carrying what the snapshot serves its scope now.
-    ///
-    /// The origin and the route generation are the transport dimensions invalidation
-    /// re-reads off the published snapshot, so a key built from the installed one is
-    /// exactly what a later publication can move.
     fn fixture_key(
         snapshot: &MarketParticipantNetworkSnapshot,
         route: &VenueRoute,
@@ -1178,12 +882,6 @@ mod tests {
         )
     }
 
-    /// Waits for the invalidation task to close one pooled connection.
-    ///
-    /// The task runs on the application runtime rather than on the executor that owns the
-    /// test, so the wait is a bounded poll on that runtime: it returns as soon as the task
-    /// closed the connection, and names the connection that stayed open when no
-    /// publication reached it.
     fn wait_for_close(runtime: &Handle, connection: &Connection, subject: &str) {
         let closed = runtime.block_on(async {
             timeout(INVALIDATION_BOUND, async {
@@ -1199,16 +897,6 @@ mod tests {
         );
     }
 
-    /// The configuration notification has exactly one consumer — the invalidation task
-    /// a constructed root starts — and a publication that moves a venue closes the pooled
-    /// connections of that venue and no other.
-    ///
-    /// Both entries are built from what the constructed snapshot serves, so whether each
-    /// survives is decided by the projection the owner publishes. The first write moves
-    /// OKX's region: the OKX connection closes, which is how the test knows the task
-    /// consumed the publication, and Binance's stays open, which is the negative an
-    /// invalidation that closed every venue would fail. The second write moves Binance's
-    /// stream origin, and Binance's connection closes with it.
     #[test]
     fn a_moved_projection_closes_only_the_connections_it_no_longer_serves() {
         let runtime = test_handle();
@@ -1254,9 +942,6 @@ mod tests {
             "both connections are pooled before anything is published"
         );
 
-        // A publication that moves OKX's region closes the OKX connection and leaves
-        // Binance's: the task demonstrably consumed the publication, and it invalidated
-        // only the venue the publication moved.
         config.set_okx_region(&okx_venue, OkxRegion::Europe);
         notification.publish(Arc::new(MarketParticipantNetworkSnapshot::from_previous(
             config.clone(),
@@ -1272,7 +957,6 @@ mod tests {
             "a configuration write that did not name Binance kept its connection open"
         );
 
-        // A publication that moves the venue itself closes that venue's connection.
         config.set_binance_market_origins(
             &binance_venue,
             BinanceMarket::Spot,
@@ -1297,13 +981,6 @@ mod tests {
 }
 #[cfg(test)]
 mod venue_connection_tests {
-    //! Unit tests of loading one venue.
-    //!
-    //! What a load commits is one candidate set per venue: the venue's statically
-    //! declared routes, their catalog source bindings and their registered catalog
-    //! routes become visible together, the venues are independent of one another, and
-    //! a first load that cannot finish revokes the slot it started so a registered
-    //! venue always has all of its catalogs loaded.
 
     use std::{sync::Arc, time::Duration};
 
@@ -1322,20 +999,16 @@ mod venue_connection_tests {
         test_support::fixture_config,
     };
 
-    /// A discovery conversation is bounded so a test cannot hang on a dead origin.
     const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
-    /// The Binance venue identity.
     fn binance() -> VenueId {
         VenueId::Binance
     }
 
-    /// The Hyperliquid venue identity.
     fn hyperliquid() -> VenueId {
         VenueId::Hyperliquid
     }
 
-    /// The route of one builder-deployed perpetual DEX scope.
     fn deployed_route(name: &str) -> VenueRoute {
         VenueRoute::new(
             hyperliquid(),
@@ -1344,19 +1017,12 @@ mod venue_connection_tests {
         )
     }
 
-    /// A root whose catalog wiring is attached and nothing else.
     fn connector() -> MarketParticipantsConnector {
         let notification =
             ConfigNotification::new(Arc::new(MarketParticipantNetworkSnapshot::default()));
         crate::test_support::connector_over(notification, TransportPolicy::default()).0
     }
 
-    /// A root whose Hyperliquid published addresses resolve at a local fixture.
-    ///
-    /// Where a request goes is the venue's own settings, so a test decides it through the venue
-    /// the request belongs to: pointing the venue at a socket nobody listens on is what makes a
-    /// discovery fail before the wire. The configuration the root is built over carries those
-    /// addresses, so there is nothing to hold beside it.
     fn discovery_connector(origin: &str, policy: TransportPolicy) -> MarketParticipantsConnector {
         let origin: url::Url = origin.parse().expect("the fixture origin parses");
         let fixture = fixture::venues([(hyperliquid(), FixtureAddress::at(&origin))]);
@@ -1366,9 +1032,6 @@ mod venue_connection_tests {
         crate::test_support::connector_over(notification, policy).0
     }
 
-    /// Registering a venue publishes its declared routes, their catalog source
-    /// bindings and their registered catalog routes in one commit, and answers the
-    /// read handle every capability reads the directory through.
     #[tokio::test]
     async fn a_registered_venue_binds_its_catalog_sources_in_one_commit() {
         let connector = connector();
@@ -1401,9 +1064,6 @@ mod venue_connection_tests {
             2,
             "the venue's declared scopes are the two core ones"
         );
-        // The catalog itself is as usable as any other route's: the source is bound in
-        // the catalogue and the route is registered there as a catalog
-        // route.
         let catalog = connector.catalog();
         let route = hyperliquid_spot.clone();
         assert!(
@@ -1420,7 +1080,6 @@ mod venue_connection_tests {
         connector.shutdown().await;
     }
 
-    /// One venue's registration leaves every other venue's slot exactly as it was.
     #[tokio::test]
     async fn a_venue_registration_does_not_touch_another_venue() {
         let connector = connector();
@@ -1455,8 +1114,6 @@ mod venue_connection_tests {
         connector.shutdown().await;
     }
 
-    /// An empty registry holds no route and no catalog source binding at all: that is
-    /// the state a program starts in.
     #[tokio::test]
     async fn an_empty_registry_holds_no_route() {
         let connector = connector();
@@ -1470,13 +1127,6 @@ mod venue_connection_tests {
         connector.shutdown().await;
     }
 
-    /// A first load that cannot read the venue's market list revokes the slot it
-    /// published: the registry never holds a venue whose catalogs were not loaded.
-    ///
-    /// The discovery conversation is addressable end to end — the request is resolved to
-    /// the venue's adapter and dialed on the venue configuration's own origin, with no
-    /// route published first — so an origin nothing answers reports the connection
-    /// failure rather than a capability, route or registry failure.
     #[tokio::test]
     async fn a_first_connection_that_cannot_discover_revokes_the_venue() {
         let connector = discovery_connector("https://127.0.0.1:1", TransportPolicy::default());
@@ -1526,19 +1176,6 @@ mod venue_connection_tests {
 
 #[cfg(test)]
 mod venue_load_tests {
-    //! Unit tests of what loading a venue does to the directory over time.
-    //!
-    //! A load is the only thing that fetches a catalog, so these tests drive it: a
-    //! refresh replaces the snapshots of the venue it refreshes, a refresh that
-    //! discovers fewer scopes revokes the scopes that disappeared together with their
-    //! catalogs, a refresh that fails leaves every committed route and every cached
-    //! snapshot as it was, and two venues loaded at once keep their own routes and their
-    //! own catalogs whichever of them commits first.
-    //!
-    //! The venue behind the requests is the catalogue fixture of this crate's test
-    //! support — a real socket answering each venue's own protocol — so every request
-    //! travels through the real gateway, registry and adapter dispatch, and a test
-    //! decides per catalog route what the venue answers, refuses or holds back.
 
     use std::{sync::Arc, time::Duration};
 
@@ -1561,16 +1198,12 @@ mod venue_load_tests {
         venue::test_support::{fixture_connector, load},
     };
 
-    /// One venue conversation is bounded so a test cannot hang on a fixture that never
-    /// answers.
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-    /// One built-in venue identity.
     fn venue(name: &str) -> VenueId {
         VenueId::from_name(name).expect("the built-in venue identity is canonical")
     }
 
-    /// The route of one built-in scope.
     fn route(venue: &VenueId, scope: &str) -> VenueRoute {
         VenueRoute::new(
             *venue,
@@ -1578,12 +1211,10 @@ mod venue_load_tests {
         )
     }
 
-    /// A root whose Binance and OKX catalogues are the fixture.
     fn connector_with(fixture: &CatalogFixture) -> (MarketParticipantsConnector, Arc<Catalog>) {
         fixture_connector(fixture.origin(), fixture.origin())
     }
 
-    /// The loaded scopes of the root, as `(venue, scope)` pairs in sorted order.
     fn registered(connector: &MarketParticipantsConnector) -> Vec<(SmolStr, SmolStr)> {
         let mut routes: Vec<(SmolStr, SmolStr)> = connector
             .venues()
@@ -1600,7 +1231,6 @@ mod venue_load_tests {
         routes
     }
 
-    /// The native symbols one route publishes, in the order its venue listed them.
     fn symbols_of(catalog: &Catalog, route: &VenueRoute) -> Vec<SmolStr> {
         catalog
             .cached_listings(route)
@@ -1616,7 +1246,6 @@ mod venue_load_tests {
             .collect()
     }
 
-    /// The snapshots one venue holds in the directory right now, route by route.
     fn catalogs_of(
         catalog: &Catalog,
         routes: &[VenueRoute],
@@ -1632,12 +1261,6 @@ mod venue_load_tests {
             .collect()
     }
 
-    /// A refresh replaces the catalogs of the venue it refreshes.
-    ///
-    /// The venue answers the second load with a market list the first one did not carry,
-    /// so the snapshot the directory serves afterwards can only come from the refresh: a
-    /// refresh that served the cache, or that committed nothing, would leave the first
-    /// answer in place.
     #[tokio::test]
     async fn a_refresh_replaces_the_catalogs_of_a_connected_venue() {
         let fixture = CatalogFixture::start().await;
@@ -1660,7 +1283,6 @@ mod venue_load_tests {
         );
         let routes_before = registered(&connector);
 
-        // The venue lists a second pair from here on, and only the refresh asks it again.
         fixture.serve(
             CatalogRoute::BinanceSpot,
             &binance_spot_market_participant_info(&["BTCUSDT", "ETHUSDT"]),
@@ -1700,8 +1322,6 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// A refresh that cannot read a catalog changes nothing that was already committed:
-    /// the venue keeps its slot, and every snapshot it holds is the one it held.
     #[tokio::test]
     async fn a_failed_refresh_keeps_the_registered_venue_and_its_snapshots() {
         let fixture = CatalogFixture::start().await;
@@ -1720,8 +1340,6 @@ mod venue_load_tests {
             .map(|(route, _)| symbols_of(&catalog, route))
             .collect();
 
-        // The venue refuses the first catalog the route order reaches, so no catalog of
-        // this load can be committed at all.
         fixture.refuse(CatalogRoute::BinanceSpot);
         let error = load(&connector, &binance)
             .await
@@ -1772,14 +1390,6 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// Two venues loaded at once each end up registered with their own routes and their
-    /// own catalogs, whichever of them commits first.
-    ///
-    /// The second venue's catalog request is held back, so the first venue finishes while
-    /// the second is mid-load and the second commits into a registry that already holds
-    /// the first: a commit that assembled its candidate from the whole registry instead
-    /// of its own slot would lose the venue that finished first, and one that overwrote
-    /// the other's catalogs would be read back here.
     #[tokio::test]
     async fn two_venues_loaded_concurrently_keep_their_own_routes_and_catalogs() {
         let fixture = CatalogFixture::start().await;
@@ -1800,9 +1410,6 @@ mod venue_load_tests {
             .expect("the Binance load does not panic")
             .expect("Binance connects");
 
-        // Nothing of the venue that is still mid-load is visible yet: its routes,
-        // its catalogs and its metadata are committed together, so a reader sees
-        // the venue that already committed and nothing of the one being loaded.
         assert_eq!(
             registered(&connector),
             [
@@ -1857,16 +1464,6 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// a scope the venue stops publishing is revoked by the refresh that
-    /// discovered fewer scopes, and stays revoked.
-    ///
-    /// One load is one reading of the venue's tables, so the fixture answers the
-    /// first load with two builder-deployed DEXs and every later one with the single
-    /// DEX the venue still publishes: the second load's candidate set is strictly
-    /// smaller than the set the first load committed. The
-    /// disappeared scope must be gone from the registry, from the catalog source
-    /// bindings and from the directory in that same commit, while the scope the
-    /// venue still publishes keeps its route and its catalog.
     #[tokio::test]
     async fn a_refresh_that_discovers_fewer_scopes_revokes_the_scope_that_disappeared() {
         let both = r#"[null,{"name":"xyz"},{"name":"abc"}]"#.to_owned();
@@ -1917,8 +1514,6 @@ mod venue_load_tests {
             [SmolStr::new_static("abc:DEF")]
         );
 
-        // The venue publishes one DEX from here on, so this load's candidate set is
-        // smaller than the one the first load committed.
         load(&connector, &hyperliquid)
             .await
             .expect("the refresh loads the scopes the venue still publishes");
@@ -1963,8 +1558,6 @@ mod venue_load_tests {
             "and the refresh published its catalog again"
         );
 
-        // The venue still publishes one DEX, so the next refresh cannot bring the
-        // revoked scope back: nothing but a discovery that names it again would.
         load(&connector, &hyperliquid)
             .await
             .expect("the second refresh loads the venue again");
@@ -1982,9 +1575,6 @@ mod venue_load_tests {
         server.abort();
     }
 
-    /// A commit is visible only when it succeeds: while its stage is held,
-    /// every reader — the venue table, the route registry and the directory —
-    /// still answers the state before it.
     #[tokio::test]
     async fn a_load_commit_is_invisible_until_it_succeeds() {
         let fixture = CatalogFixture::start().await;
@@ -1992,7 +1582,6 @@ mod venue_load_tests {
         let okx = venue("okx");
         let swap = route(&okx, "swap");
 
-        // The venue holds the swap catalog, so the load is stopped inside its stage.
         fixture.stall(CatalogRoute::OkxSwap);
         let loading = tokio::spawn({
             let connector = connector.clone();
@@ -2040,9 +1629,6 @@ mod venue_load_tests {
             "and so does the catalog the same commit published"
         );
 
-        // The same holds for a refresh: while its stage is held, every reader
-        // still answers the commit before it — the previous entry, the previous
-        // generation it names and the previous catalogs.
         let before = Arc::clone(&entry);
         let generation_before = before.generation();
         let scopes_before = connector.venues().scopes();
@@ -2109,8 +1695,6 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// A first load that fails leaves nothing behind: no venue entry, no
-    /// registered route, no bound source and no published snapshot.
     #[tokio::test]
     async fn a_first_load_that_fails_leaves_nothing() {
         let fixture = CatalogFixture::start().await;
@@ -2151,14 +1735,6 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// A load whose reading cannot verify a deployment the venue named fails whole
-    /// the error names the deployment, and nothing of that venue — no
-    /// entry, no scope, no route binding, no snapshot, no identity — is left behind.
-    ///
-    /// The venue names two deployments and one of them publishes coins that are not
-    /// its own. Registering the other would publish a scope set short of what the
-    /// venue said, so the load reports the deployment instead of skipping it, and
-    /// because the failure happens while staging, the commit never runs.
     #[tokio::test]
     async fn a_deployment_that_cannot_be_verified_fails_the_whole_load() {
         let (origin, _requests, server) = info_fixture_server(
@@ -2188,18 +1764,6 @@ mod venue_load_tests {
         server.abort();
     }
 
-    /// A load whose venue names more deployments than one reading verifies fails
-    /// whole the error carries the count and the bound, and nothing of that
-    /// venue is left behind.
-    ///
-    /// The bound is this build's own answer about how much work one remote answer may
-    /// cause. It is decided from the deployment table alone — the fixture is asked for
-    /// `perpDexs` and nothing else — so a venue over it costs one request and is
-    /// refused rather than truncated.
-    ///
-    /// One of the names is deliberately outside the scope shape the venue reserves:
-    /// the bound counts **every** name the venue published, so a name refused for its
-    /// shape cannot slip out of the count the refusal reports.
     #[tokio::test]
     async fn more_deployments_than_one_reading_verifies_fails_the_whole_load() {
         let claimed = MAX_DEPLOYED_PERP_DEXES + 4;
@@ -2210,7 +1774,6 @@ mod venue_load_tests {
                 (b'a' + (index % 26) as u8) as char
             )
         };
-        // The one name of this fixture that has no scope shape.
         const OUT_OF_SHAPE: &str = "abcde";
         let named: Vec<String> = (0..claimed - 1)
             .map(|index| format!(r#"{{"name":"{}"}}"#, name_of(index)))
@@ -2264,21 +1827,12 @@ mod venue_load_tests {
         server.abort();
     }
 
-    /// A deployment whose name has no scope shape this build reserves fails the
-    /// whole load.
-    ///
-    /// The venue reserves two-to-four lowercase letters for a deployed scope, so a
-    /// venue naming anything else publishes a deployment this build cannot address.
-    /// The name is read and counted like every other one: a name dropped before the
-    /// reading would leave a load successful with that scope silently missing, and
-    /// would not even be part of the bound the reading checks.
     #[tokio::test]
     async fn a_deployment_outside_the_scope_shape_fails_the_whole_load() {
         let (origin, _requests, server) = info_fixture_server(
             vec![r#"[null,{"name":"abcde"}]"#.to_owned()],
             spot_meta_answer(&["USD", "USDC"]),
             dex_meta(&["BTC"]),
-            // The metadata itself verifies: only the scope name is out of shape.
             vec![("abcde".to_owned(), dex_meta(&["abcde:ABC"]))],
         )
         .await;
@@ -2299,15 +1853,6 @@ mod venue_load_tests {
         server.abort();
     }
 
-    /// A deployment whose collateral is not a spot token fails the whole load
-    /// it is reported like any other unverifiable deployment.
-    ///
-    /// The failure is the venue's own answer rather than a transport one — its
-    /// metadata names a collateral index nothing resolves — so it is the reading's
-    /// refusal, not the conversation's, that the load reports. The deployment's name
-    /// is deliberately one the venue reserves a scope shape for: a name outside the
-    /// shape is refused earlier, and a fixture with one would pin that refusal while
-    /// claiming to pin this one.
     #[tokio::test]
     async fn a_deployment_whose_collateral_does_not_resolve_fails_the_whole_load() {
         let (origin, _requests, server) = info_fixture_server(
@@ -2338,9 +1883,6 @@ mod venue_load_tests {
         server.abort();
     }
 
-    /// The core scope's own collateral failing to resolve is a discovery failure:
-    /// the core scope is not a deployment, so there is no deployment to name
-    /// and nothing to leave out — the venue's own metadata does not decode.
     #[tokio::test]
     async fn a_core_scope_whose_collateral_does_not_resolve_is_a_discovery_failure() {
         let (origin, _requests, server) = info_fixture_server(
@@ -2367,11 +1909,6 @@ mod venue_load_tests {
         server.abort();
     }
 
-    /// Asserts that a load of one venue committed nothing at all.
-    ///
-    /// The venue table holds no entry for it, no scope is in play, and the directory
-    /// published neither a route binding, a source nor a snapshot for any of the
-    /// deployments the reading named — and no identity was installed with them.
     fn assert_nothing_was_committed(
         connector: &MarketParticipantsConnector,
         catalog: &Catalog,
@@ -2402,7 +1939,6 @@ mod venue_load_tests {
         );
     }
 
-    /// Asserts one scope left no trace in the published directory.
     fn assert_no_trace(catalog: &Catalog, route: &VenueRoute, scope: &str) {
         assert!(!catalog.is_registered(route), "{scope} is not registered");
         assert!(
@@ -2415,9 +1951,6 @@ mod venue_load_tests {
         );
     }
 
-    /// A refresh that fails leaves the previous commit byte for byte as it was:
-    /// the entry, the generation it pins, its metadata and its revision are
-    /// the values the last successful commit published.
     #[tokio::test]
     async fn a_refresh_that_fails_leaves_the_previous_commit_intact() {
         let fixture = CatalogFixture::start().await;
@@ -2476,14 +2009,11 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// A refresh that discovers fewer scopes drops the vanished scope, its catalog
-    /// and its metadata in the same commit, and keeps the survivors as they were.
     #[tokio::test]
     async fn a_shrinking_refresh_drops_the_vanished_scopes_catalogs_and_metadata() {
         let both = r#"[null,{"name":"xyz"},{"name":"abc"}]"#.to_owned();
         let one = r#"[null,{"name":"xyz"}]"#.to_owned();
         let (origin, _requests, server) = info_fixture_server(
-            // One load is one reading: the first names two deployments, the refresh one.
             vec![both, one],
             spot_meta_answer(&["USD", "USDC", "BTC"]),
             dex_meta(&["BTC"]),
@@ -2552,8 +2082,6 @@ mod venue_load_tests {
         server.abort();
     }
 
-    /// Two venues loaded at once do not interfere: each ends up with its own
-    /// scopes, its own revision and its own catalogs.
     #[tokio::test]
     async fn concurrent_loads_of_two_venues_do_not_interfere() {
         let fixture = CatalogFixture::start().await;
@@ -2621,8 +2149,6 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// Two loads of one venue that overlap commit once: the second waits for
-    /// the first and is answered by it, so the revision advances exactly one.
     #[tokio::test]
     async fn two_loads_of_the_same_venue_do_not_interleave() {
         let fixture = CatalogFixture::start().await;
@@ -2659,8 +2185,6 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// A load cancelled mid-stage leaves nothing: the stage stops before
-    /// its next step and answers [`VenueLoadError::Interrupted`].
     #[tokio::test]
     async fn a_load_cancelled_mid_stage_leaves_nothing() {
         let fixture = CatalogFixture::start().await;
@@ -2694,8 +2218,6 @@ mod venue_load_tests {
         connector.shutdown().await;
     }
 
-    /// The report names the stage that failed and, where a stage is per scope, the
-    /// scope it failed on.
     #[tokio::test]
     async fn a_load_report_names_the_stage_that_failed() {
         let fixture = CatalogFixture::start().await;
@@ -2711,9 +2233,6 @@ mod venue_load_tests {
             "a catalog failure names the venue and the scope it failed on: {error:?}"
         );
 
-        // A discovery that never reaches the venue is the discovery stage's own
-        // failure, and it names the venue rather than a scope: nothing of the
-        // venue's scope set is known when it fails.
         let (unreachable, _catalog) = fixture_connector("http://127.0.0.1:1", "http://127.0.0.1:1");
         let hyperliquid = venue(HYPERLIQUID_VENUE);
         let error = load(&unreachable, &hyperliquid)
@@ -2730,13 +2249,6 @@ mod venue_load_tests {
 
 #[cfg(test)]
 mod venue_request_tests {
-    //! Unit tests of where one request goes.
-    //!
-    //! A request reaches the origin its own venue's configuration gives the scope, and
-    //! a scope the configuration does not name — a deployed perpetual DEX most of all —
-    //! is reached through the same venue's default. Nothing is inferred from a venue
-    //! name: the fixture answers on two sockets, and the test moves the venue's
-    //! configuration from one to the other between two identical requests.
 
     use std::sync::Arc;
 
@@ -2760,11 +2272,8 @@ mod venue_request_tests {
         },
     };
 
-    /// One venue conversation is bounded so a test cannot hang on a fixture that never
-    /// answers.
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-    /// The route of the deployed scope both requests are about.
     fn deployed_route() -> VenueRoute {
         VenueRoute::new(
             VenueId::Hyperliquid,
@@ -2772,7 +2281,6 @@ mod venue_request_tests {
         )
     }
 
-    /// One HTTP info fixture answering the discovery conversation of `xyz`.
     async fn discovery_fixture() -> InfoFixture {
         info_fixture_server(
             vec![r#"[null,{"name":"xyz"}]"#.to_owned()],
@@ -2783,12 +2291,6 @@ mod venue_request_tests {
         .await
     }
 
-    /// Installs one Hyperliquid fixture whose requests are sent to `http` and whose
-    /// streams are opened on `websocket`.
-    ///
-    /// A venue's two roles are one setting, so a fixture that serves one protocol per
-    /// socket names them apart — the load of a venue is an HTTP conversation and its
-    /// streams are WebSocket ones.
     fn fixture_at(
         http: &url::Url,
         websocket: &str,
@@ -2802,7 +2304,6 @@ mod venue_request_tests {
         )])
     }
 
-    /// A root whose Hyperliquid configuration is the snapshot `notification` carries.
     fn connector(
         notification: ConfigNotification<MarketParticipantNetworkSnapshot>,
     ) -> (
@@ -2812,10 +2313,8 @@ mod venue_request_tests {
         crate::test_support::connector_over(notification, crate::test_support::plaintext_policy())
     }
 
-    /// One fixture's request log, in arrival order.
     type RequestLog = Arc<Mutex<Vec<String>>>;
 
-    /// How many requests of one `info` type one HTTP fixture has served.
     fn served(requests: &RequestLog, kind: &str) -> usize {
         requests
             .lock()
@@ -2824,7 +2323,6 @@ mod venue_request_tests {
             .count()
     }
 
-    /// How many candle requests one socket fixture has received.
     fn candles(socket: &InfoSocket) -> usize {
         socket
             .frames()
@@ -2833,21 +2331,6 @@ mod venue_request_tests {
             .count()
     }
 
-    /// The discovery conversation is dialed through the venue's own settings, and a
-    /// scope the venue deploys is reached through the very same pair.
-    ///
-    /// A load asks what the venue deploys before any scope of it is registered, so the
-    /// reading addresses the venue rather than a scope: it is dialed on the venue's
-    /// primary scope — the one a venue that discovers what it deploys answers its own
-    /// non-scoped conversations on. A scope the venue deploys answers the settings with
-    /// no key of its own, so it is reached through that same pair rather than through an
-    /// address beside it.
-    ///
-    /// The two requests after the load are what keep the first half from passing by
-    /// accident: the very same configuration sends a `core-perp` candle request to the
-    /// venue's stream socket and a deployed scope's candle request to the same socket, so
-    /// the configuration the reading arrived through is proven live rather than merely
-    /// written down.
     #[tokio::test]
     async fn discovery_dials_the_venues_own_configuration() {
         let (http_origin, requests, http_server) = discovery_fixture().await;
@@ -2929,15 +2412,6 @@ mod venue_request_tests {
         connector.shutdown().await;
     }
 
-    /// A scope the settings hold no key for is reached through its venue's own
-    /// connection configuration.
-    ///
-    /// The venue is loaded over HTTP and its deployed scope inherits that configuration:
-    /// the candle request for `perp-dex/xyz` arrives at the venue's own stream socket,
-    /// because the scope is not a connection of its own. Moving the venue's streams to a
-    /// second fixture and issuing the same request again sends it there instead — the
-    /// second half is what keeps the first from being met by a request that never left
-    /// the process.
     #[tokio::test]
     async fn a_dynamic_scope_inherits_the_venues_connection_config() {
         let (http_origin, requests, http_server) = discovery_fixture().await;
@@ -2964,7 +2438,6 @@ mod venue_request_tests {
             "the load read the venue over the HTTP socket it is configured with"
         );
 
-        // The deployed scope's own listing, as the catalogue the load published holds it.
         let listing = catalog
             .listings(&deployed)
             .expect("the deployed scope publishes its catalogue")
@@ -2982,8 +2455,6 @@ mod venue_request_tests {
                 .fetch()
         };
 
-        // The fixture answers the candle request with an empty set, so the call itself
-        // succeeds: what this test reads is where the request went.
         candle_request()
             .await
             .expect("the venue's own socket answers the candle request");
@@ -2998,8 +2469,6 @@ mod venue_request_tests {
             "and nothing reached the socket the venue is not configured with"
         );
 
-        // The venue's streams move to the second fixture, and the same request has to
-        // follow them: the settings are where a deployed scope's connection comes from.
         fixture.repoint([(
             hyperliquid,
             FixtureAddress {

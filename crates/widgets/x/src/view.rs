@@ -1,75 +1,3 @@
-//! The X pane: the timeline it follows, and the accounts it manages.
-//!
-//! # What moved, and what it moved to
-//!
-//! The old pane was an element tree of the retired toolkit: a list of rendered rows,
-//! two dialogs owned as entities of their own, and process-global managers for the
-//! settings and the executor. The migrated pane is the framework's
-//! five-phase widget over engine nodes: the feed is a [`List`] whose rows are built
-//! once into their containers and updated through `bind_text` / `bind_style` /
-//! `bind_a11y`, the header is a [`Button`], and the account dialog is a
-//! [`TweetDialog`] built from `base_ui::kit` components over the same signals.
-//!
-//! # What a pane is scoped to
-//!
-//! One account. The account is the pane's scope and the stream key at once, so the
-//! pane never has to decide whether a tweet belongs to the account on screen: a
-//! message published for an account the pane has left is a message the binding does
-//! not deliver, and one that arrives by hand is refused by comparing the key. The
-//! account is read from [`WidgetCx::account`] on every frame and compared — the
-//! settings signal is what schedules the frame, so a sign-in or sign-out is a reload
-//! on the frame that presents it.
-//!
-//! # The pane owns the accounts, the service owns the session
-//!
-//! Following a timeline and managing the accounts it comes from are two things the
-//! same account is asked for, and the same service answers both with the same
-//! session. So the pane is what waits for both, and the accounts the dialog draws are
-//! the pane's rather than the dialog's: they outlive any one dialog, and a dialog
-//! that held them would lose them on the next open. The dialog's own page state (the
-//! typed filter, the query, what one search answered, which page is showing) belongs
-//! to the dialog and dies with it.
-//!
-//! # One call at a time, attributed by identity
-//!
-//! A request reaches the service through the pane's binding, and the binding replaces
-//! the call it holds with the next one. [`WidgetBinding::call`] returns the
-//! [`RequestId`] that identifies the call, and [`Pending`] remembers which command is
-//! waiting for that identity: a reply whose id the table does not know is a late
-//! answer to a replaced call, dropped rather than applied to whatever replaced it.
-//! The stream guards (stream key, terminal failure) and the id attribution are two
-//! independent doors — every entry checks both.
-//!
-//! # The timeline is a list of measured rows
-//!
-//! A tweet is a paragraph, a gallery and a quoted tweet, so its height is the sum of
-//! things only the text system can measure. The body is therefore a bounded variable
-//! list ([`ListOptions::variable`]) that holds the newest tweets and remembers where a
-//! reader is. A newer timeline is reported to it as the tweets it has not been shown
-//! rather than as a new set of rows: a list rebuilt from scratch would re-measure
-//! every row on screen and, worse, move a reader who had scrolled into the timeline
-//! back to the top.
-//!
-//! # Pictures are drawn from what the stream said
-//!
-//! A row draws a picture from the state the service published with the tweets it
-//! belongs to, never by fetching anything itself: the service's media cache writes the
-//! bytes, the pane reads the cached file once and hands it to the engine's resource
-//! cache ([`App::resources_mut`]), and the row holds the resulting
-//! [`ImageSource`] — a pending handle that the engine rewrites in place when the decode
-//! lands, so nothing rebuilds for a picture arriving. A picture whose bytes are not on
-//! disk yet is a tile that says so, and one that failed is a tile a click asks again.
-//! Reading the cached file is the one synchronous disk read this pane does; it happens
-//! once per URL on the frame the media state first arrives.
-//!
-//! # Empty is content
-//!
-//! A live stream whose accounts have not posted has an *empty timeline*, and an empty
-//! timeline is content: the body draws `common.no_data` over the list rather than
-//! leaving the framework's placeholder to say the pane is waiting
-//! (`crates/widgets/AGENTS.md` §6). Only "no account" — nobody to read a timeline for —
-//! is a neutral [`Notice`].
-
 use std::{
     cell::{Cell, RefCell},
     ops::Range,
@@ -145,41 +73,23 @@ use super::{
     },
 };
 
-/// The height a row is estimated at until the list has measured one.
-///
-/// A tweet is a face, a header line, a paragraph and sometimes a gallery; a couple of
-/// rows either side of the viewport keeps a row from appearing a moment after it was
-/// scrolled to. The list replaces the estimate with the measured height.
 const ROW_ESTIMATE: f32 = 240.0;
 
-/// The size of the face a timeline row is drawn with.
 const AVATAR_SIZE: f32 = 40.0;
 
-/// The size of the face a quoted tweet is drawn with.
 const QUOTE_AVATAR_SIZE: f32 = 28.0;
 
-/// How wide a gallery of several pictures is laid out, and how tall.
 const GALLERY_WIDE_WIDTH: f32 = 510.0;
 const GALLERY_HEIGHT: f32 = 320.0;
 
-/// The size a tweet's body text is drawn at, from the kit's size ladder (the theme has
-/// no body typography token yet; the ladder is the same source kit controls read).
 const BODY_SIZE: UnifiedSize = UnifiedSize::Medium;
 
-/// The size secondary lines (handles, times, quoted text) are drawn at.
 const META_SIZE: UnifiedSize = UnifiedSize::Small;
 
-/// The length of the trail of the bounded feed: the newest 50 tweets, as before.
 const FEED_CAPACITY: usize = MAX_TWEETS;
 
-/// The longest search string the service accepts, in bytes.
 const MAX_SEARCH_QUERY_BYTES: usize = 100;
 
-/// The X widget carries no options.
-///
-/// What a pane follows is the account's own list of monitored accounts, which is read
-/// from the service rather than configured here, so there is nothing to persist but the
-/// schema version.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct XConfig;
 
@@ -187,7 +97,6 @@ impl WidgetConfig for XConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// A failure a pane reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum XFailure {
     Stream(TweetStreamError),
@@ -203,62 +112,37 @@ impl TranslatedError for XFailure {
     }
 }
 
-/// What the dialog is doing, or waiting for.
-///
-/// A search is not here: it is a procedure of the dialog's own page rather than
-/// something the accounts are waiting for, and it is carried by the pane apart from what
-/// it waits on the accounts with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SelectionOperation {
-    /// The accounts are being read for a dialog that has none to show.
     Loading,
-    /// The accounts are being read for a dialog that is already showing some.
     Refreshing,
-    /// An account is being monitored.
     Adding,
-    /// An account is being left.
     Deleting,
 }
 
 impl SelectionOperation {
-    /// Whether this operation is a read rather than a change.
     pub(super) const fn is_read(self) -> bool {
         matches!(self, Self::Loading | Self::Refreshing)
     }
 }
 
-/// What the dialog is waiting for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SelectionPending {
     operation: SelectionOperation,
-    /// What the operation is about: the username being monitored or the id being left.
     target: Option<SmolStr>,
-    /// Whether the request is out.
-    ///
-    /// A read asked for before the stream is live is held here instead: there is no
-    /// session behind the account yet, and the readiness that arrives later is what
-    /// makes the read possible.
     sent: bool,
 }
 
-/// What the last change said.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SelectionNotice {
-    /// The account is now being monitored.
     Added,
-    /// Why the last change did not happen, or did not happen for certain.
     Problem(SelectionFailure),
 }
 
-/// Why a change to the monitored accounts did not happen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SelectionFailure {
-    /// The service refused the change.
     Rejected(XApiError),
-    /// The change may or may not have been made, which is what the service answers when
-    /// it could not tell.
     Unknown(XMutationUnknown),
-    /// The call itself failed.
     Rpc(RpcCallError<XApiError>),
 }
 
@@ -272,43 +156,22 @@ impl TranslatedError for SelectionFailure {
     }
 }
 
-/// One command this pane sent and has not seen the answer to.
-///
-/// The binding replaces its one command slot on every call and aborts the call it
-/// replaced, but a reply can already be queued when that happens. The identity the
-/// binding returned is what says whose answer arrived: only a reply tracked here may
-/// steer the pane.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingCommand {
-    /// A read: `Load` or `Retry`.
     Start,
-    /// The stop that lets go of the stream an account left behind.
     Stop,
-    /// A read of the monitored accounts.
     FetchSelections,
-    /// Whether a dialog is showing the accounts' avatars.
     WatchSelections,
-    /// A search of X.
     Search,
-    /// Monitoring one more account.
     Add,
-    /// Leaving one account.
     Delete,
-    /// Fetching one picture again.
     RetryMedia,
 }
 
-/// The image resources the rows and the dialog draw.
 type ImageMap = HashMap<SmolStr, ImageSource>;
 
-/// The bytes-to-resource handles one pane has registered, shared with its row builders.
 type RowImages = Rc<RefCell<ImageMap>>;
 
-/// The icon resources one pane has registered, by kind.
-///
-/// A row builder has no `App` and therefore cannot call [`IconSpec::build_themed`]; the
-/// pane registers the icon PNGs once and hands the row builders the resource ids, and
-/// the image nodes take their colour from `bind_style`'s `foreground` channel.
 #[derive(Clone)]
 struct RowIcons {
     repost: ImageSource,
@@ -318,17 +181,14 @@ struct RowIcons {
     retry: ImageSource,
 }
 
-/// One picture a row draws, resolved from the model at accept time.
 #[derive(Clone, Debug, PartialEq)]
 struct MediaPlan {
     url: SmolStr,
     kind: MediaKind,
     ratio: f32,
-    /// Whether this is a still frame standing in for an animation that is not fetched.
     poster_only: bool,
 }
 
-/// Which of the kinds of picture one tile is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MediaKind {
     Image,
@@ -336,48 +196,29 @@ enum MediaKind {
     Gif,
 }
 
-/// What one frame's row draws, resolved at accept time.
-///
-/// Rows are built by a list closure that has no `App`, so everything structural —
-/// whether there is text, how many pictures there are, what is quoted — is a value in
-/// this plan rather than a read of the frame. The dynamic parts (ages, labels) are
-/// `bind_*` closures over the same plan signal.
 #[derive(Clone, Debug, PartialEq)]
 struct RowPlan {
     tweet_id: SmolStr,
-    /// The top-level row this plan belongs to (its own id, or the quoting tweet's id
-    /// when this plan is the quoted tweet underneath it).
     row_id: SmolStr,
-    /// Whether this plan is a quoted tweet rather than the row's own.
     quote_of: bool,
-    /// The URL a click on the row opens.
     url: SmolStr,
-    /// Who reposted this timeline entry, when it is one.
     reposted_by: Option<SmolStr>,
     author_name: SmolStr,
     author_handle: SmolStr,
     avatar_url: SmolStr,
     verified: bool,
-    /// The timestamp the row's age is derived from.
     published_at: i64,
     text: SmolStr,
-    /// Whether the tweet says anything at all (an empty body is a gallery-only tweet).
     has_text: bool,
-    /// Byte ranges of `text` that are links, with the URLs they open.
     links: Rc<[(Range<usize>, SmolStr)]>,
     media: Arc<[MediaPlan]>,
     quote: Option<Box<RowPlan>>,
 }
 
-/// The images and links a row's descendants are, so the pane's `dispatch` can tell what
-/// a pointer landed on.
 #[derive(Clone, Default)]
 struct RowHits {
-    /// Row root → the tweet URL a click opens.
     rows: Rc<RefCell<HashMap<NodeId, SmolStr>>>,
-    /// Text node → the link ranges inside it.
     links: Rc<RefCell<HashMap<NodeId, Rc<[(Range<usize>, SmolStr)]>>>>,
-    /// A failed picture's tile → the URL to fetch again.
     failed: Rc<RefCell<HashMap<NodeId, SmolStr>>>,
 }
 
@@ -389,7 +230,6 @@ impl RowHits {
     }
 }
 
-/// The state a list row builder is handed, beyond its parent and index.
 #[derive(Clone)]
 struct RowContext {
     plans: Rc<RefCell<Arc<[RowPlan]>>>,
@@ -397,21 +237,12 @@ struct RowContext {
     language: Signal<LanguageCode>,
     config: Signal<SettingsConfig>,
     theme: ThemeHandle,
-    /// The appearance the visible rows were built against.
-    ///
-    /// A text run's colour is a static load the engine does not re-read (there is no
-    /// dynamic channel inside a run), so a link's colour is the brand role of the
-    /// appearance the row was built for: the pane updates this cell and rebuilds the
-    /// visible window when the appearance moves.
     appearance: Rc<Cell<Appearance>>,
     translate: Translate,
     images: RowImages,
-    /// The picture states the rows draw, mirrored from the feed's media map.
     media: Rc<RefCell<MediaStates>>,
     icons: RowIcons,
     hits: RowHits,
-    /// The action a failed picture's tile declares: Enter / Space on the focused tile
-    /// (and an assistive technology's activation) ask for the picture again.
     retry: Action,
 }
 
@@ -421,85 +252,40 @@ impl RowContext {
     }
 }
 
-/// One pane: the timeline it holds, and the accounts it manages.
 pub struct XWidget {
-    /// The executor bridge, absent on a host that installed no Kytrix service.
     binding: Option<WidgetBinding<TweetProtocol>>,
-    /// The commands in flight, keyed by the identity the binding returned.
     pending: Pending<PendingCommand>,
     status: WidgetStatus,
     recovery: WidgetAction,
-    /// Opens a URL through the application's own command.
     open_url: Rc<dyn Fn(&str)>,
-    /// The account the pane reads for, which is its whole scope.
     account_id: Option<SmolStr>,
-    /// The tweets the pane is showing, once a stream has published them.
     feed: Option<TweetSnapshot>,
-    /// What is known about every picture the feed wants.
     media: MediaStates,
-    /// The same picture states as a shared cell the row builders read (they have no
-    /// `App` to read a signal with).
     media_mirror: Rc<RefCell<MediaStates>>,
-    /// How many updates the stream this feed came from has published.
     revision: u64,
-    /// Whether the subscription has reported itself live.
-    ///
-    /// It is what keeps a read of the monitored accounts from being sent before there
-    /// is a session to answer it, and a change from being sent while the stream carrying
-    /// the account is down.
     ready: bool,
-    /// What the list's rows are drawn from, shared with the row builders.
     plans: Rc<RefCell<Arc<[RowPlan]>>>,
-    /// The same plans as an engine signal, so a row's text can follow the language and
-    /// the display time zone without rebuilding the row.
     plan_signal: Signal<Arc<[RowPlan]>>,
-    /// The picture state the rows were last built against, so a media change rebuilds
-    /// the visible window.
     built_media: Option<MediaStates>,
-    /// The appearance the visible rows were built against (a link's colour is a static
-    /// run colour, see [`RowContext::appearance`]).
     appearance: Rc<Cell<Appearance>>,
-    /// The image resources registered for the pictures on screen.
     images: RowImages,
-    /// The action a failed picture's tile declares, registered on the app for the
-    /// keyboard / assistive-technology activation of that tile.
     media_retry_action: Option<Action>,
-    /// The URL a failed picture's tile asked to fetch again, written by the tile's own
-    /// handler or by a pointer landing on it and taken by the next `sync`.
     media_retry: Signal<Option<SmolStr>>,
-    /// The icon resources the rows draw, registered once in `body`.
     icons: Option<RowIcons>,
-    /// What a pointer lands on inside the feed.
     hits: RowHits,
-    /// The list itself, built by [`WidgetView::body`], where its parent is known.
     list: Option<List>,
-    /// The root of the body this pane built.
     body_root: Option<NodeId>,
-    /// The stand-in a feed with nothing in it draws.
     empty: Option<NodeId>,
-    /// The language the stand-in was built in.
     empty_language: Option<LanguageCode>,
-    /// The accounts the account monitors, as the service last answered them.
     selections: Option<SelectionData>,
-    /// The query the binding is carrying a search of X for, if it is carrying one.
     searching: Option<SmolStr>,
-    /// What the dialog is waiting for, if anything.
     selection_pending: Option<SelectionPending>,
-    /// What the dialog says about the last change.
     notice: Option<SelectionNotice>,
-    /// The username of every monitored account that came back without a profile.
     hints: Arc<HashMap<SmolStr, SmolStr>>,
-    /// The open dialog, if one is open.
     dialog: Option<TweetDialog>,
-    /// The control that opens the monitored-accounts dialog.
     manage_button: Option<Button>,
-    /// The header group the control lives in, so a rebuild can find its parent.
     manage_parent: Option<NodeId>,
-    /// What the control was built with: the language, and whether an account scopes the
-    /// pane. A difference is what makes the control rebuild.
     manage_built: Option<(LanguageCode, bool)>,
-    /// Opens the dialog request: the control's handler has no widget to borrow, so it
-    /// asks the next `sync` for the open instead of performing it.
     open_dialog_requests: Signal<u64>,
     seen_open_requests: u64,
 }
@@ -523,10 +309,6 @@ impl WidgetView for XWidget {
         cx: &mut WidgetCx<'_>,
     ) -> Result<Self, EngineError> {
         let source = cx.services().kytrix_service().cloned();
-        // Pictures are fetched by this pane rather than by the service they belong to,
-        // and the transport they are fetched over is the application's own build policy:
-        // the two X image origins are the only hosts a picture URL may name, and they
-        // are always reached over HTTPS.
         let config: NetworkConfig = cx.config_ref(|config| config.network_config());
         let transport = SharedTransport::new(
             Arc::new(TransportHub::new(TransportPolicy::default())),
@@ -550,11 +332,6 @@ impl WidgetView for XWidget {
         }
     }
 
-    /// A pane is content once a stream has published a timeline for it.
-    ///
-    /// An empty timeline is content: the pane has a feed, it is just a feed with nothing
-    /// in it yet, and the body says so with `common.no_data` rather than leaving the
-    /// framework's placeholder to call it waiting.
     fn has_content(&self) -> bool {
         self.feed.is_some()
     }
@@ -582,8 +359,6 @@ impl WidgetView for XWidget {
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        // The settings are the pane's scope: signing in as someone else is another
-        // timeline, and signing out is no timeline at all.
         let account = cx.account();
         if account != self.account_id {
             self.account_id = account;
@@ -609,8 +384,6 @@ impl WidgetView for XWidget {
             }
         }
 
-        // Pictures whose bytes the stream published are registered before anything
-        // draws them: the row builders read this map, and the decode happens after.
         self.register_media(cx);
 
         let requests = *cx.read(&self.open_dialog_requests);
@@ -621,9 +394,6 @@ impl WidgetView for XWidget {
         self.sync_dialog(cx)?;
         self.sync_media_retry(cx);
 
-        // A link's colour is a static run colour, so the rows are built for an
-        // appearance: a theme that moved rebuilds the visible window, as a media change
-        // does.
         self.sync_appearance(cx)?;
 
         if let Some(list) = &self.list {
@@ -632,9 +402,6 @@ impl WidgetView for XWidget {
         self.sync_empty_state(cx)?;
         self.sync_manage_button(cx)?;
 
-        // The body is built by the framework from the answer `has_content` gives, and it
-        // asks that question before this hook runs: content that first appeared here is
-        // one frame away, so ask for that frame.
         if self.feed.is_some() && self.body_root.is_none() {
             cx.request_frame()?;
         }
@@ -642,7 +409,6 @@ impl WidgetView for XWidget {
         Ok(())
     }
 
-    /// The control that opens the monitored-accounts dialog.
     fn header(
         &mut self,
         group: HeaderGroup,
@@ -670,8 +436,6 @@ impl WidgetView for XWidget {
             return false;
         };
 
-        // A link inside a tweet's text is the most specific target: the byte the pointer
-        // is over names which link (if any) was clicked.
         let links = self.hits.links.borrow().get(&hit.node).cloned();
         if let Some(links) = links {
             let byte = cx
@@ -686,9 +450,6 @@ impl WidgetView for XWidget {
             }
         }
 
-        // A failed picture's tile asks for it again rather than opening the tweet. The
-        // hit is one of the tile's children (its icon), so the tile is found by walking
-        // up to the nearest ancestor the pane registered.
         let failed_url = {
             let failed = self.hits.failed.borrow();
             let mut node = Some(hit.node);
@@ -703,16 +464,11 @@ impl WidgetView for XWidget {
             found
         };
         if let Some(url) = failed_url {
-            // The tile's own action is what the engine dispatches for a pointer landing on
-            // it (and for Enter / Space on it); a headless caller reaching this hook
-            // directly asks for the same picture through the same request.
             let _ = cx.write(&self.media_retry, Some(url));
             let _ = cx.request_frame();
             return true;
         }
 
-        // Otherwise the row the pointer is in opens its tweet. The hit is a descendant
-        // of the row container, so the row is the nearest ancestor the pane registered.
         let row_url = {
             let rows = self.hits.rows.borrow();
             let mut node = Some(hit.node);
@@ -734,11 +490,8 @@ impl WidgetView for XWidget {
     }
 
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
-        // Dropping the bridge aborts its forwarding tasks and cancels the service.
         self.binding = None;
         self.pending.clear();
-        // The header's nodes belong to the pane, which removes its row: only the
-        // component's signal scope and action handler are this widget's to release.
         let _ = self.release_manage_button(cx, false);
         if let Some(action) = self.media_retry_action.take() {
             let _ = cx.app_mut().off_action(&action);
@@ -746,7 +499,6 @@ impl WidgetView for XWidget {
         if let Some(mut dialog) = self.dialog.take() {
             dialog.release(cx);
         }
-        // The list documents its own teardown order: its nodes first, then the component.
         if let Some(root) = self.body_root.take() {
             let window = cx.window();
             let _ = cx.app_mut().remove_node(window, root);
@@ -764,11 +516,6 @@ impl WidgetView for XWidget {
 }
 
 impl XWidget {
-    /// The seam the framework and the tests build a pane through.
-    ///
-    /// The pane has no opinion about where its timeline comes from, so the binding is an
-    /// argument: the production constructor answers it with the injected Kytrix service
-    /// connection, and a test with a fake subscription.
     fn assemble(
         binding: Option<WidgetBinding<TweetProtocol>>,
         status: WidgetStatus,
@@ -783,10 +530,6 @@ impl XWidget {
         let account_id = cx.account();
         let appearance = Rc::new(Cell::new(cx.theme().current(cx.app())));
 
-        // A failed picture's tile declares this action: the keyboard (Enter / Space on the
-        // focused tile) and an assistive technology both activate the target node, and the
-        // handler reads the URL that node stands for out of the hit table — a row builder
-        // has no `App` to register a handler of its own.
         let hits = RowHits::default();
         let media_retry = cx.signal(None::<SmolStr>);
         let media_retry_action = Action::Custom(cx.unique_key("x.feed.retry_media"));
@@ -842,7 +585,6 @@ impl XWidget {
         }
     }
 
-    /// A pane over a source the caller answers, for the crate's own tests.
     #[cfg(test)]
     fn new_with_source<S, T>(
         source: S,
@@ -859,36 +601,23 @@ impl XWidget {
         Self::assemble(Some(binding), status, recovery, cx)
     }
 
-    /// The scope this pane follows, which is the account it reads as.
     fn current_scope(&self) -> Option<TweetScope> {
         TweetScope::new(self.account_id.as_ref())
     }
 
-    /// Starts reading, or restarts for a pane the user is recovering.
-    ///
-    /// A recovery keeps the timeline the user is still reading — blanking a feed to
-    /// reconnect would flash it away — while an account change starts over, because the
-    /// pane cannot vouch for what it was showing.
     fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(scope) = self.current_scope() else {
             self.clear(cx)?;
             self.report_no_content_notice(cx);
-            // Nothing is followed, so nothing should stay subscribed on this pane's
-            // behalf: an account that signed out must not keep a seat it is not using.
             self.hand_over(TweetRequest::Stop, PendingCommand::Stop, cx)?;
             cx.request_frame()?;
             return Ok(());
         };
         self.ready = false;
-        // Every stream numbers its own updates from the beginning, so what this pane last
-        // applied belongs to the stream being replaced rather than to the one starting
-        // here.
         self.revision = 0;
         if !retry {
             self.clear(cx)?;
         }
-        // Starting a stream replaces whatever the binding was awaiting, so a change that
-        // was in flight is dropped rather than remembered.
         self.selection_pending = None;
         self.status.report(cx.app_mut(), WidgetState::Connecting);
         let request = if retry {
@@ -907,7 +636,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Drops what a pane is leaving behind.
     fn clear(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         self.feed = None;
         self.media = Arc::new(HashMap::new());
@@ -932,11 +660,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Reports the notice that stands in while the pane has nothing to show.
-    ///
-    /// A pane with no body has no account, and no account is the only neutral notice this
-    /// pane has: a live stream with nothing in it is an empty timeline, which is content
-    /// (`common.no_data`), not a waiting state (AGENTS §6).
     fn report_no_content_notice(&self, cx: &mut WidgetCx<'_>) {
         self.status.report(
             cx.app_mut(),
@@ -944,7 +667,6 @@ impl XWidget {
         );
     }
 
-    /// Reports the state of a pane whose stream is live.
     fn report_ready(&self, cx: &mut WidgetCx<'_>) {
         if self.feed.is_some() {
             self.status.report(cx.app_mut(), WidgetState::Ready);
@@ -955,7 +677,6 @@ impl XWidget {
         }
     }
 
-    /// Reports why a subscription stopped.
     fn fail(&self, error: TweetStreamError, cx: &mut WidgetCx<'_>) {
         let failure = Arc::new(XFailure::Stream(error));
         self.status.report(
@@ -964,17 +685,12 @@ impl XWidget {
         );
     }
 
-    /// Applies one RPC reply, once its identity says it answers the command in flight.
     fn apply_rpc(
         &mut self,
         request_id: RequestId,
         result: widget::binding::WidgetRpcResult<TweetProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
-        // A failure is terminal: only the user's recovery leaves it, and no answer that was
-        // already out can steer a pane that has given up. This is the second of the two
-        // doors every entry checks (AGENTS §4.4 / design §13.12), and it comes before the
-        // identity is attributed so a late answer is not even taken off the table.
         if self.status.is_failed(cx.app()) {
             return;
         }
@@ -984,8 +700,6 @@ impl XWidget {
             Some(PendingCommand::Search) => self.apply_search_result(result, cx),
             Some(PendingCommand::Add) => self.apply_add_result(result, cx),
             Some(PendingCommand::Delete) => self.apply_delete_result(result, cx),
-            // The stop, the watch and a picture fetched again are calls the pane does not
-            // report on: what they answer is either nothing or drawn on the stream.
             Some(
                 PendingCommand::Stop | PendingCommand::WatchSelections | PendingCommand::RetryMedia,
             ) => {}
@@ -1005,8 +719,6 @@ impl XWidget {
         }
         if let Err(error) = result {
             self.ready = false;
-            // A read the dialog is waiting for is answered by the account being taken, so
-            // it does not outlive the failure of the request that would have taken it.
             self.selection_pending = None;
             let failure = Arc::new(XFailure::Rpc(error));
             self.status.report(
@@ -1017,7 +729,6 @@ impl XWidget {
         }
     }
 
-    /// Applies the timeline a subscription published.
     fn apply_latest(
         &mut self,
         key: TweetScope,
@@ -1030,9 +741,6 @@ impl XWidget {
         let TweetStreamMessage::Update(update) = message.as_ref() else {
             return false;
         };
-        // The latest channel coalesces, so an update can arrive after a newer one already
-        // has: what a stream published before the last thing this pane applied is not a
-        // timeline any more.
         if update.revision() <= self.revision {
             return false;
         }
@@ -1046,7 +754,6 @@ impl XWidget {
         true
     }
 
-    /// Applies a status the stream reported.
     fn apply_reliable(
         &mut self,
         key: TweetScope,
@@ -1063,23 +770,15 @@ impl XWidget {
         match status {
             TweetStatus::Connecting => {
                 self.ready = false;
-                // The timeline already read stays: a reconnecting feed is not a reason to
-                // blank what a reader was looking at.
                 self.status.report(cx.app_mut(), WidgetState::Connecting);
             }
             TweetStatus::Ready => {
                 self.ready = true;
                 self.report_ready(cx);
-                // What a pane shows is only as true as the read it came from, and a change
-                // the pane stopped waiting for was never read back. The stream coming up
-                // is what makes reading the accounts possible again.
                 if self.selection_pending.is_some() {
                     let _ = self.send_pending_selections(cx);
                 }
                 if self.dialog.is_some() {
-                    // A search the dialog had out is displaced by the read this asks for:
-                    // a page waiting for an answer the read took the place of would wait
-                    // forever.
                     if let Err(error) = self.watch_selections(true, cx) {
                         log::error!("the x pane could not watch the accounts: {error}");
                     }
@@ -1090,8 +789,6 @@ impl XWidget {
             }
             TweetStatus::Failed(error) => {
                 self.ready = false;
-                // A read that never went out has nothing left to wait for: the stream it
-                // was waiting for failed, and the dialog says so rather than spinning.
                 if self
                     .selection_pending
                     .as_ref()
@@ -1107,15 +804,11 @@ impl XWidget {
         false
     }
 
-    /// Tells the list about the tweets this feed added.
     fn accept(&mut self, update: &TweetUpdate, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let unshown = unshown(
             self.feed.as_ref().map_or(&[], TweetSnapshot::items),
             update.feed().items(),
         );
-        // The service publishes a fresh map with every event, so the question is whether
-        // the picture states changed, not whether this event's map is another allocation:
-        // a pointer comparison would rebuild the window on every update (media or not).
         let media_changed = self
             .built_media
             .as_ref()
@@ -1129,23 +822,16 @@ impl XWidget {
         self.register_media(cx);
 
         let Some(list) = self.list.as_ref() else {
-            // The body is built from `has_content`, which the framework asks before this
-            // hook: the frame that builds it reads the count from the list it creates.
             cx.request_frame()?;
             return Ok(());
         };
         let count = update.feed().items().len();
         match unshown {
-            // The oldest of the tweets it has not been shown goes in first, so the newest
-            // of them ends up where a list that draws its newest tweet first draws it.
             Some(pushed) => {
                 for _ in 0..pushed {
                     list.push(cx.app_mut())?;
                 }
             }
-            // Nothing the list holds survives, so there is no edit it can be told: the
-            // list is rebuilt for the feed it has now, and the reader starts over on the
-            // tweet that feed draws first.
             None => list.set_items(cx.app_mut(), count)?,
         }
         if media_changed {
@@ -1157,13 +843,11 @@ impl XWidget {
         Ok(())
     }
 
-    /// Replaces the plans the rows are built from, and the signal their text follows.
     fn replace_plans(&mut self, plans: Arc<[RowPlan]>, cx: &mut WidgetCx<'_>) {
         *self.plans.borrow_mut() = Arc::clone(&plans);
         cx.write(&self.plan_signal, plans);
     }
 
-    /// Registers every picture the stream says is on disk, once.
     fn register_media(&mut self, cx: &mut WidgetCx<'_>) {
         let mut registered = false;
         for (url, state) in self.media.iter() {
@@ -1203,11 +887,6 @@ impl XWidget {
         }
     }
 
-    /// Takes the request a failed picture's tile made, and asks the service for that
-    /// picture again.
-    ///
-    /// The tile's own action writes the same signal a pointer landing on it does, so the
-    /// keyboard path, an assistive technology and a click are one request.
     fn sync_media_retry(&mut self, cx: &mut WidgetCx<'_>) {
         let request = cx.read(&self.media_retry).clone();
         let Some(url) = request else {
@@ -1217,12 +896,6 @@ impl XWidget {
         self.retry_media(url, cx);
     }
 
-    /// Rebuilds the visible window when the appearance moved.
-    ///
-    /// A link's colour is a static run colour (`TextContent::runs`), which the engine does
-    /// not re-read on a theme change: the rows are built for the appearance showing when
-    /// they are built, so a moved appearance is another window of rows (AGENTS §7 does not
-    /// allow a colour baked at mount time to outlive the appearance it was read from).
     fn sync_appearance(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let appearance = cx.theme().current(cx.app());
         if appearance == self.appearance.get() {
@@ -1240,7 +913,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Builds the list the body draws its feed with.
     fn make_list(&mut self, cx: &mut WidgetCx<'_>, parent: NodeId) -> Result<List, EngineError> {
         let context = RowContext {
             plans: Rc::clone(&self.plans),
@@ -1286,12 +958,6 @@ impl XWidget {
         Ok(list)
     }
 
-    /// Shows `common.no_data` over a feed that holds nothing.
-    ///
-    /// The stand-in is the widget's, not the framework's: an empty timeline is content,
-    /// so this is the body saying there is nothing in it rather than a placeholder
-    /// saying there is no body. Its copy is static, so it is built for the language
-    /// showing now and rebuilt when that moves.
     fn sync_empty_state(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let empty = self.feed.as_ref().is_some_and(TweetSnapshot::is_empty);
         if !empty {
@@ -1341,7 +1007,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Builds the pane's manage control into `parent`.
     fn build_manage_button(
         &mut self,
         parent: NodeId,
@@ -1363,7 +1028,6 @@ impl XWidget {
             .tooltip_text(label);
         if enabled {
             button = button.on_click(move |ctx| {
-                // A button handler owns no widget; it asks the next sync for the open.
                 ctx.update(&requests, |requests| *requests += 1);
                 let window = ctx.window();
                 let _ = ctx.app_mut().request_repaint(window);
@@ -1380,7 +1044,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Rebuilds the manage control when the language or the account moved.
     fn sync_manage_button(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(button) = self.manage_button.as_ref() else {
             return Ok(());
@@ -1393,8 +1056,6 @@ impl XWidget {
         let Some(parent) = self.manage_parent else {
             return Ok(());
         };
-        // The pane may have rebuilt the header row since: its group is not this widget's
-        // node, so a stale parent means the control already went with it.
         if cx.tree().get(parent).is_err() {
             return Ok(());
         }
@@ -1402,8 +1063,6 @@ impl XWidget {
         self.build_manage_button(parent, cx)
     }
 
-    /// Removes the control's node (when the widget owns the teardown) and releases the
-    /// component's scope and action handler.
     fn release_manage_button(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1422,12 +1081,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Hands one request to the service, of which the binding carries one at a time.
-    ///
-    /// The requests that come here are the ones the pane is not waiting for an answer to
-    /// — a stream watched for a dialog that opened, a picture fetched again, a stream
-    /// stopped — so what the binding was carrying is taken over, and the dialog's waiter
-    /// for it is closed out first.
     fn hand_over(
         &mut self,
         request: TweetRequest,
@@ -1443,7 +1096,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Closes out what a call the pane is not waiting on takes the place of.
     fn drop_displaced(&mut self, cx: &mut WidgetCx<'_>) {
         let search = self.searching.take().is_some();
         let sent = self
@@ -1458,7 +1110,6 @@ impl XWidget {
         }
     }
 
-    /// Says whether a dialog is showing the monitored accounts.
     fn watch_selections(
         &mut self,
         watched: bool,
@@ -1477,12 +1128,6 @@ impl XWidget {
         )
     }
 
-    /// Reads the accounts the account monitors.
-    ///
-    /// A read goes over a live stream, because a live stream is what says the service is
-    /// holding the account: before it there is no session to answer one. A read asked
-    /// for too early waits here instead, and the readiness that arrives later is what
-    /// sends it.
     pub(super) fn load_selections(&mut self, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
@@ -1507,7 +1152,6 @@ impl XWidget {
         true
     }
 
-    /// Sends the read a dialog is waiting for.
     fn send_pending_selections(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(scope) = self.current_scope() else {
             return Ok(());
@@ -1540,7 +1184,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Searches X for an account to monitor.
     pub(super) fn search_users(&mut self, query: SmolStr, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
@@ -1559,7 +1202,6 @@ impl XWidget {
         true
     }
 
-    /// Monitors one more account.
     pub(super) fn add_selection(&mut self, username: SmolStr, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
@@ -1586,7 +1228,6 @@ impl XWidget {
         true
     }
 
-    /// Stops monitoring one account.
     pub(super) fn delete_selection(&mut self, x_user_id: SmolStr, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
@@ -1607,7 +1248,6 @@ impl XWidget {
         true
     }
 
-    /// Fetches one picture again.
     fn retry_media(&mut self, url: SmolStr, cx: &mut WidgetCx<'_>) {
         let Some(scope) = self.current_scope() else {
             return;
@@ -1621,7 +1261,6 @@ impl XWidget {
         }
     }
 
-    /// Whether the pane is in a position to ask the service about the monitored accounts.
     fn may_change(&self, cx: &WidgetCx<'_>) -> bool {
         self.ready
             && self.selections.is_some()
@@ -1653,14 +1292,10 @@ impl XWidget {
         self.selection_pending = None;
         match result {
             Ok(TweetResponse::Selections(data)) => {
-                // What is remembered is kept for the rows this read still has and has no
-                // profile for, and for no others.
                 self.hints = Arc::new(retained_hints(&self.hints, data.selections()));
                 self.selections = Some(data);
                 self.notice = None;
             }
-            // The protocol types the answer, so anything else is a service that answered
-            // the wrong question rather than a shape a reader could describe.
             Ok(_) => {}
             Err(error) => {
                 self.notice = Some(SelectionNotice::Problem(SelectionFailure::Rpc(error)));
@@ -1669,15 +1304,11 @@ impl XWidget {
         let _ = cx.request_frame();
     }
 
-    /// Hands what a search answered to the dialog that asked for it.
     fn apply_search_result(
         &mut self,
         result: widget::binding::WidgetRpcResult<TweetProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
-        // An answer arrives only for the call the binding was carrying, so a search the
-        // pane is no longer waiting for — the dialog was dismissed while it was out — has
-        // none to hand over.
         let Some(query) = self.searching.take() else {
             return;
         };
@@ -1711,9 +1342,6 @@ impl XWidget {
             }
         };
         self.notice = match outcome {
-            // What the list becomes is the confirmation applied to it, and an account that
-            // came back without a profile is named by what was asked for rather than
-            // numbered.
             XMutationOutcome::Confirmed(selection) => {
                 let grown = self
                     .selections
@@ -1736,8 +1364,6 @@ impl XWidget {
             XMutationOutcome::Rejected(error) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Rejected(error)))
             }
-            // The change may or may not have been made, so the list the pane holds is not
-            // one it can change: it is left as it was, and the next read settles it.
             XMutationOutcome::Unknown(unknown) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(unknown)))
             }
@@ -1785,7 +1411,6 @@ impl XWidget {
         let _ = cx.request_frame();
     }
 
-    /// The pane's state, read for the frame the dialog draws it in.
     fn dialog_view(&self) -> DialogView {
         DialogView {
             signed_in: self.account_id.is_some(),
@@ -1804,7 +1429,6 @@ impl XWidget {
         }
     }
 
-    /// Opens the monitored-accounts dialog.
     fn open_dialog(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if self.dialog.is_some() {
             return Ok(());
@@ -1826,8 +1450,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Syncs the open dialog: publishes this frame's state, takes the requests the user
-    /// made through it, and closes it when it finishes.
     fn sync_dialog(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let finished = self.dialog.as_ref().is_some_and(TweetDialog::finished);
         if finished {
@@ -1866,8 +1488,6 @@ impl XWidget {
         Ok(())
     }
 
-    /// Takes the dialog down after it closed itself, and stops what it was the reason
-    /// for.
     fn close_dialog(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(mut dialog) = self.dialog.take() else {
             return Ok(());
@@ -1883,7 +1503,6 @@ impl XWidget {
     }
 }
 
-/// Registers the icons the rows draw, once per body.
 fn register_row_icons(cx: &mut WidgetCx<'_>) -> Result<RowIcons, EngineError> {
     let mut register = |kind: IconKind| -> Result<ImageSource, EngineError> {
         let image = cx
@@ -1901,7 +1520,6 @@ fn register_row_icons(cx: &mut WidgetCx<'_>) -> Result<RowIcons, EngineError> {
     })
 }
 
-/// Removes a node this pane built, if it is still in the tree.
 fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) -> Result<(), EngineError> {
     if cx.tree().get(node).is_err() {
         return Ok(());
@@ -1910,7 +1528,6 @@ fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) -> Result<(), EngineErro
     cx.app_mut().remove_node(window, node).map(|_| ())
 }
 
-/// Whether one search string is one X could be asked about.
 pub(super) fn valid_search_query(query: &str) -> bool {
     let query = query.trim();
     !query.is_empty()
@@ -1918,12 +1535,10 @@ pub(super) fn valid_search_query(query: &str) -> bool {
         && !query.chars().any(char::is_control)
 }
 
-/// The URL of one tweet on X.
 pub(super) fn tweet_url(username: &str, tweet_id: &str) -> String {
     format!("https://x.com/{username}/status/{tweet_id}")
 }
 
-/// Resolves the feed into the row plans the list draws.
 fn build_plans(feed: &TweetSnapshot) -> Arc<[RowPlan]> {
     feed.items()
         .iter()
@@ -1934,7 +1549,6 @@ fn build_plans(feed: &TweetSnapshot) -> Arc<[RowPlan]> {
         .collect()
 }
 
-/// Resolves one tweet (and the tweet it quotes) into a row plan.
 fn plan_of(
     item: &Arc<TweetItem>,
     outer_author: &super::model::TweetAuthor,
@@ -1974,7 +1588,6 @@ fn plan_of(
     }
 }
 
-/// Resolves one quoted tweet into a row plan (it has no repost line of its own).
 fn plan_of_quote(tweet: &Arc<TweetItem>, feed: &TweetSnapshot, row_id: SmolStr) -> RowPlan {
     let author = feed.author(&tweet.x_user_id);
     let links: Rc<[(Range<usize>, SmolStr)]> = tweet
@@ -2002,8 +1615,6 @@ fn plan_of_quote(tweet: &Arc<TweetItem>, feed: &TweetSnapshot, row_id: SmolStr) 
     }
 }
 
-/// Finds the plan a row's bind closure draws: the row's own plan, or the quoted plan
-/// nested under it.
 fn plan_in<'a>(
     plans: &'a [RowPlan],
     row_id: &SmolStr,
@@ -2020,7 +1631,6 @@ fn plan_in<'a>(
         .filter(|quote| quote.tweet_id == *tweet_id)
 }
 
-/// The pictures one tweet carries, resolved into what a row needs.
 fn media_plans(media: &[TweetMediaItem]) -> Arc<[MediaPlan]> {
     media
         .iter()
@@ -2043,7 +1653,6 @@ fn media_plans(media: &[TweetMediaItem]) -> Arc<[MediaPlan]> {
         .collect()
 }
 
-/// Builds one row of the timeline into the list's row container.
 fn build_row(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2077,7 +1686,6 @@ fn build_row(
     Ok(())
 }
 
-/// The a11y description of one row: who wrote it, and how long ago.
 fn row_a11y(
     tweet_id: SmolStr,
     context: &RowContext,
@@ -2108,7 +1716,6 @@ fn row_a11y(
     }
 }
 
-/// The line above a repost that says who reposted it.
 fn build_repost_line(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2163,8 +1770,6 @@ fn build_repost_line(
     Ok(())
 }
 
-/// One tweet's own content: its face, its author, its text, its pictures and what it
-/// quotes.
 fn build_tweet(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2208,7 +1813,6 @@ fn build_tweet(
     Ok(())
 }
 
-/// A face, or the stand-in that says there is one to come.
 fn build_avatar(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2231,8 +1835,6 @@ fn build_avatar(
         context.images.borrow().get(&plan.avatar_url).copied()
     };
     let Some(image) = image else {
-        // No bytes yet (or no face to fetch): a surface-toned tile with an `@` is what
-        // the old interface drew for a face that had not arrived.
         let placeholder = NodeBuilder::boxed()
             .style(style)
             .bind_style(themed_background(
@@ -2267,7 +1869,6 @@ fn build_avatar(
     Ok(())
 }
 
-/// Who wrote one tweet, when, and whether X vouches for them.
 fn build_tweet_header(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2378,14 +1979,6 @@ fn build_tweet_header(
     Ok(())
 }
 
-/// One tweet's text, with the runs that are links styled and clickable.
-///
-/// A link's colour is a **static run colour** (`TextContent::runs`): the engine has no
-/// dynamic channel inside a run, so the rows are built for the appearance showing at build
-/// time and the pane rebuilds the visible window when the appearance moves (see
-/// [`RowContext::appearance`]). The run ranges are the plan's link byte ranges, which is
-/// also what `dispatch` hit-tests a click over a link against — one source for what is
-/// coloured and what is clickable.
 fn build_text(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2455,7 +2048,6 @@ fn build_text(
     Ok(())
 }
 
-/// A gallery of the pictures one tweet carries.
 fn build_gallery(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2504,7 +2096,6 @@ fn build_gallery(
     Ok(())
 }
 
-/// One picture: what is known about it, or the way to ask for it again.
 fn build_media_tile(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2542,17 +2133,12 @@ fn build_media_tile(
                 let _language = read.read(&language);
                 let state = media.borrow().get(&url).cloned();
                 match state {
-                    // A picture that could not be fetched is a way to ask for it again:
-                    // it is in the a11y tree with that name, and its activation is the
-                    // retry (see the tile action below).
                     Some(MediaState::Failed) => A11yPatch {
                         label: Some(t_smol!(translate, "common.retry")),
                         description: Some(t_smol!(translate, "widget.x.media_load_failed")),
                         hidden: Some(false),
                         ..A11yPatch::default()
                     },
-                    // A still frame standing in for an animation says what it is; every
-                    // other picture is decoration the row's label already names.
                     Some(MediaState::Ready(_)) if poster_only => A11yPatch {
                         label: Some(SmolStr::new_static("GIF")),
                         hidden: Some(false),
@@ -2566,9 +2152,6 @@ fn build_media_tile(
             }
         });
     if matches!(state, Some(MediaState::Failed)) {
-        // A row builder has no `App` to register a handler, so the tile declares the
-        // pane's retry action: the pointer, Enter / Space on the focused tile and an
-        // assistive technology's activation all reach that one handler.
         tile = tile.on_action(context.retry.clone());
     }
     let tile = tile.build(tree, parent)?;
@@ -2626,7 +2209,6 @@ fn build_media_tile(
             )?;
         }
     }
-    // A video's still frame is not the video; the play mark says so.
     if item.kind == MediaKind::Video {
         build_icon(
             tree,
@@ -2641,7 +2223,6 @@ fn build_media_tile(
     Ok(())
 }
 
-/// A tweet that is quoted under the tweet quoting it.
 fn build_quote(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2697,7 +2278,6 @@ fn build_quote(
     Ok(())
 }
 
-/// Draws one icon image at `size`, toned by a theme role.
 fn build_icon(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2727,7 +2307,6 @@ fn build_icon(
     Ok(())
 }
 
-/// Draws one icon centred in its parent.
 fn build_icon_centered(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2751,7 +2330,6 @@ fn build_icon_centered(
     Ok(())
 }
 
-/// A dynamic foreground colour read through the theme handle.
 fn themed_foreground(
     theme: ThemeHandle,
     role: Role,
@@ -2762,7 +2340,6 @@ fn themed_foreground(
     }
 }
 
-/// A dynamic background colour read through the theme handle.
 fn themed_background(
     theme: ThemeHandle,
     role: Role,
@@ -2773,7 +2350,6 @@ fn themed_background(
     }
 }
 
-/// How long ago a tweet was published, in the reader's language.
 fn age_text(age: TweetAge, translate: &Translate) -> SmolStr {
     match age {
         TweetAge::Seconds(seconds) => t_smol!(translate, "widget.x.age_seconds", count = seconds),
@@ -2795,7 +2371,6 @@ fn age_text(age: TweetAge, translate: &Translate) -> SmolStr {
     }
 }
 
-/// The status of one monitored account, in the reader's language.
 pub(super) fn status_label(status: XSelectionStatus, translate: &Translate) -> SmolStr {
     match status {
         XSelectionStatus::Active => t_smol!(translate, "widget.x.active"),

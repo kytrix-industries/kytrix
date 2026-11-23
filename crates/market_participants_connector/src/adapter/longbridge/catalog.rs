@@ -1,12 +1,3 @@
-//! Construction of the venue's catalog entries from the Nasdaq symbol directory.
-//!
-//! A directory row is two facts — a code and the market it trades on — and
-//! everything a listing needs is derived from them: the issuer and share class the
-//! security is identified by, the spot instrument of that security against USD, the
-//! rules a US share trades under, and the listing key the row is published as. The
-//! derivation happens once, here, so the security a candle request names is the
-//! security the directory published rather than a second reading of the same code.
-
 use std::sync::Arc;
 
 use market_participants_model::{
@@ -42,28 +33,12 @@ use crate::{
     market_participants::model::MarketCatalogQuery,
 };
 
-/// The issuer namespace the venue's securities are identified inside.
 const ISSUER_NAMESPACE: &str = "longbridge";
 
-/// The tick of one US cent in the fixed-point scale of the model.
-///
-/// A price or a tick is a decimal with eighteen fractional digits, so one hundredth
-/// of a US dollar is ten to the sixteenth.
 const CENT: u128 = 10_000_000_000_000_000;
 
-/// The trading calendar the venue's US listings are published under.
-///
-/// It identifies the calendar a listing's sessions are read against; it carries no
-/// session table of its own.
 const US_EQUITY_CALENDAR: &str = "us-equity";
 
-/// Turns one symbol-directory row into a complete catalog entry.
-///
-/// The row's code is the share class designation exactly as the directory published
-/// it — a class separator and all — while the issuer the security is identified
-/// under is the scrubbed root of the same code, and both `SecurityTerms` and
-/// `ListingContinuityTerms` carry the same share class: a security and a listing
-/// derived from two different values would be two identities for one row.
 pub(crate) fn catalog_entry(
     route: &VenueRoute,
     row: SymbolRow,
@@ -156,10 +131,6 @@ pub(crate) fn catalog_entry(
         ticker: row.code.clone(),
         local_code: local_code.clone(),
     });
-    // A security states no display code of its own — its issuer, designation and form
-    // are not a name — so the code the venue published for it is what a name renders,
-    // and the publication refuses a batch whose named asset has none. The directory's
-    // own symbol is that code: it is the ticker the market addresses the security by.
     let security_code = AssetDisplayCode::from_staged_code(row.code.as_str())
         .map_err(|error| model_error("decode the Longbridge display code", error))?;
     let asset_codes = vec![StagedAssetCode {
@@ -186,26 +157,16 @@ pub(crate) fn catalog_entry(
         aliases,
         identifiers,
         rules,
-        // The directory states what is listed, not what is trading: `Financial
-        // Status` is a compliance state (a deficient issuer still trades), so this
-        // is the only honest value a row carries.
         status: ListingStatus::Trading,
         available_from: None,
         available_until: None,
         instrument,
         asset_terms: vec![security, usd],
-        // A spot instrument tracks no price reference of its own.
         reference_terms: Vec::new(),
         asset_codes,
     })
 }
 
-/// Fetches and publishes the venue's symbol directory as its route's catalog.
-///
-/// The directory is one download and one strict parse, and every row that survives
-/// it becomes a listing. The answer is the route's catalog rather than a directory
-/// of its own: the model has one shape of "what a route publishes", and a second
-/// one would be a second thing for every reader of a catalog to know about.
 pub(crate) async fn fetch_markets(
     context: &ExecutionContext,
     query: &MarketCatalogQuery,
@@ -220,18 +181,7 @@ pub(crate) async fn fetch_markets(
     Ok(ProtocolResponse::Markets(entries))
 }
 
-/// Returns the issuer code one directory symbol is identified by.
-///
-/// A `SecurityIssuerId` admits alphanumerics only, and a directory symbol may carry
-/// a class separator, a preferred-share mark or an index caret. The code is
-/// therefore the part before the first separator with everything outside the
-/// admitted alphabet dropped — the directory's own symbol is the share class
-/// designation and stays exactly as published, so nothing here is ever a display
-/// value.
 fn issuer_code(code: &str) -> Result<SmolStr, MarketParticipantError> {
-    // The leading separator has to go first: a preferred share (`$XYZ`) or an index
-    // (`^IXIC`) starts with one, and splitting at index zero would answer an empty
-    // root.
     let trimmed = code.trim_start_matches(['.', '-', '^', '$']);
     let root = trimmed
         .split(['.', '-', '^', '$'])
@@ -253,7 +203,6 @@ fn issuer_code(code: &str) -> Result<SmolStr, MarketParticipantError> {
     Ok(cleaned)
 }
 
-/// Builds one protocol failure that names the operation it was raised in.
 fn protocol_error(operation: &'static str, reason: impl Into<SmolStr>) -> MarketParticipantError {
     MarketParticipantError::ProtocolError {
         operation: operation.into(),
@@ -262,7 +211,6 @@ fn protocol_error(operation: &'static str, reason: impl Into<SmolStr>) -> Market
     }
 }
 
-/// Wraps one model rejection as the protocol failure of an operation.
 fn model_error(operation: &'static str, error: impl std::fmt::Display) -> MarketParticipantError {
     protocol_error(operation, format_smolstr!("{error}"))
 }
@@ -301,8 +249,6 @@ mod tests {
         },
     };
 
-    /// One `nasdaqlisted.txt` body whose third row carries a control character after a
-    /// designator, which is the one shape the parse must drop before this module sees it.
     const NASDAQ_LISTED_WITH_ONE_UNREADABLE_ROW: &str = concat!(
         "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\r\n",
         "AAPL|Apple Inc. Common Stock|Q|N|N|100|N|N\r\n",
@@ -312,14 +258,11 @@ mod tests {
         "File Creation Time: 1009202621:31|||||||\r\n",
     );
 
-    /// The other half of the directory, with no row of its own: a load reads both files,
-    /// and the row this test is about is in the first one.
     const OTHER_LISTED_WITH_NO_ROWS: &str = concat!(
         "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\r\n",
         "File Creation Time: 1009202621:31||||||\r\n",
     );
 
-    /// The route the venue publishes its US listings on.
     fn route() -> VenueRoute {
         VenueRoute::new(
             VenueId::Longbridge,
@@ -327,7 +270,6 @@ mod tests {
         )
     }
 
-    /// One directory row, as the parse would have published it.
     fn row(code: &str, mic: &str) -> SymbolRow {
         SymbolRow {
             code: SmolStr::new(code),
@@ -336,9 +278,6 @@ mod tests {
         }
     }
 
-    /// The normalization the route declares, which is what an echo is compared
-    /// under: a value is verified against the declared symbols in the mode of its
-    /// own identifier kind.
     fn declared_mode(kind: ListingIdentifierKind) -> SymbolNormalization {
         crate::venue::specs::scope_entries(VenueId::Longbridge)
             .into_iter()
@@ -350,8 +289,6 @@ mod tests {
             .map_or(SymbolNormalization::Exact, |rule| rule.mode)
     }
 
-    /// One row of the directory becomes a spot listing of the security it names,
-    /// with the aliases and typed identifiers a request is resolved by.
     #[test]
     fn one_directory_row_becomes_a_spot_listing() {
         let entry = catalog_entry(&route(), row("AAPL", "XNAS")).expect("the row is publishable");
@@ -381,15 +318,11 @@ mod tests {
         assert_eq!(identifiers.local_code.as_str(), "AAPL");
         assert_eq!(identifiers.instrument_kind(), InstrumentKind::Spot);
 
-        // The rules the entry states are the rules the instrument validates under,
-        // which is what the catalogue's publication gate re-runs.
         entry
             .rules
             .validate_for(&entry.instrument)
             .expect("the entry's rules belong to its instrument");
 
-        // The price is quoted in the currency the instrument is quoted in, and the
-        // quantity is measured in the security itself.
         let InstrumentTerms::Spot(spot) = entry.instrument.terms() else {
             panic!("the instrument is a spot instrument");
         };
@@ -412,8 +345,6 @@ mod tests {
         );
     }
 
-    /// Both assets a listing's rules name travel with it, and the security among
-    /// them is the instrument's own base.
     #[test]
     fn the_entry_carries_both_of_its_assets() {
         let entry = catalog_entry(&route(), row("AAPL", "XNAS")).expect("the row is publishable");
@@ -440,9 +371,6 @@ mod tests {
         assert_eq!(spot.quote(), &entry.asset_terms[1].asset_id());
     }
 
-    /// The listing identity is derived from the same security the entry publishes:
-    /// a listing built from the entry's own typed identifiers and its own security
-    /// terms is the listing key the entry states.
     #[test]
     fn the_listing_identity_is_the_security_it_publishes() {
         let entry = catalog_entry(&route(), row("BRK.B", "XNYS")).expect("the row is publishable");
@@ -469,9 +397,6 @@ mod tests {
         assert_eq!(entry.native_symbol.as_str(), "BRK.B.US");
     }
 
-    /// The typed identifiers and the declared symbols are one identity: the code a
-    /// listing is addressed by is the code it echoes, under the mode its route
-    /// declares.
     #[test]
     fn the_listing_echoes_the_code_it_is_addressed_by() {
         let entry = catalog_entry(&route(), row("AAPL", "XNAS")).expect("the row is publishable");
@@ -496,8 +421,6 @@ mod tests {
         );
     }
 
-    /// The market a row states is the market its identifiers carry, including the
-    /// one market-participant code the field definitions omit.
     #[test]
     fn the_row_keeps_the_market_it_states() {
         let entry = catalog_entry(&route(), row("DDS", "TXSE")).expect("the row is publishable");
@@ -509,9 +432,6 @@ mod tests {
         assert_eq!(entry.native_symbol.as_str(), "DDS.US");
     }
 
-    /// The issuer root is the part of a directory code a `SecurityIssuerId` admits:
-    /// a class separator, a preferred-share mark and an index caret all leave the
-    /// root, and a code that is nothing but separators names no issuer at all.
     #[test]
     fn the_issuer_code_scrubs_every_separator_the_directory_uses() {
         for (code, expected) in [
@@ -542,8 +462,6 @@ mod tests {
         }
     }
 
-    /// A directory load becomes the route's catalog, sorted by the symbol each
-    /// listing is addressed by, and the rows a product decision drops are not in it.
     #[tokio::test]
     async fn a_loaded_directory_becomes_the_routes_catalog() {
         let _fixture = SymbolDirectoryFixture::install(vec![
@@ -580,17 +498,6 @@ mod tests {
         }
     }
 
-    /// One row the parse cannot address is one row dropped, not a directory that fails
-    /// to load: a published directory holding `A.B\0C` still becomes the route's catalog,
-    /// and that row is not in it.
-    ///
-    /// This is the failure the alphabet rule exists to remove, measured at the seam it
-    /// happens at: the parse is where a row is judged, so a row that reached
-    /// [`catalog_entry`] would make this whole fetch an `Err` — one row of unsigned
-    /// remote content taking the venue's catalog down with it. The codes below the bad
-    /// one are the other half of the same rule: `$XYZ` and `^IXIC` start with a
-    /// designator and are addressed rather than dropped, which is what their issuer roots
-    /// being `XYZ` and `IXIC` states.
     #[tokio::test]
     async fn a_directory_holding_one_unreadable_row_still_becomes_the_catalog() {
         let _fixture = SymbolDirectoryFixture::install(vec![

@@ -1,36 +1,13 @@
-//! What a fear and greed snapshot is, and how one service answer becomes one.
-//!
-//! The collector upstream of this widget does all of the calendar work: it picks
-//! the point of yesterday, last week, last month and last year, and the highest and
-//! lowest reading of the past 365 days. Nothing here recomputes any of that, so the
-//! only mapping left is the shape of the answer:
-//!
-//! - every score is checked, because a value above 100 is not a reading this widget
-//!   can draw and the gauge must not be drawn from it;
-//! - a date stays the label the service generated rather than becoming a calendar
-//!   value, because it *is* a UTC calendar day and reading it in another time zone
-//!   would move it to a day it does not name;
-//! - a missing field stays missing. The protocol's only expression of a value that
-//!   does not exist is an absent field, so `None` is never turned into a zero.
-//!
-//! The level a reading belongs to is a function of the score alone: there is no
-//! second classification in the answer, and keeping one beside the score would be a
-//! second thing that can disagree with it.
-
 use kytrix_proto::types::v1 as proto_types;
 use smol_str::SmolStr;
 use thiserror::Error;
 
-/// One daily point of the index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CoinMarketCapFearAndGreedIndexRow {
-    /// The UTC calendar day the point belongs to, exactly as the service wrote it.
     pub date: SmolStr,
-    /// The index value of that day, `0..=100`.
     pub score: u8,
 }
 
-/// One complete answer of the index service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CoinMarketCapFearAndGreedIndexSnapshot {
     pub current: u8,
@@ -40,30 +17,14 @@ pub(crate) struct CoinMarketCapFearAndGreedIndexSnapshot {
     pub last_year: Option<CoinMarketCapFearAndGreedIndexRow>,
     pub yearly_high: Option<CoinMarketCapFearAndGreedIndexRow>,
     pub yearly_low: Option<CoinMarketCapFearAndGreedIndexRow>,
-    /// When the collector took the snapshot, in Unix milliseconds; `0` means it has
-    /// not collected anything yet.
     pub collected_at: i64,
 }
 
 impl CoinMarketCapFearAndGreedIndexSnapshot {
-    /// Whether the service has not collected a single reading yet.
-    ///
-    /// It is the only emptiness the snapshot has: a current value of zero is a
-    /// perfectly valid reading — extreme fear at the bottom of the scale — and only
-    /// the collection time says whether the answer carries a collection at all.
     pub(crate) const fn is_empty(&self) -> bool {
         self.collected_at == 0
     }
 
-    /// Whether the pane draws the same thing for both answers.
-    ///
-    /// Only what is on screen counts. The collection time is not drawn and the
-    /// collector answers again every minute whether the index moved or not, so two
-    /// collected answers with the same reading are the same picture — repainting
-    /// one of them would be a frame nobody sees a difference in. Whether the answer
-    /// carries a collection at all *is* drawn, because an uncollected answer draws
-    /// the body's 「暂无数据」, so it never matches a collected answer even when the
-    /// scores and rows are identical.
     pub(crate) fn same_display(&self, other: &Self) -> bool {
         self.is_empty() == other.is_empty()
             && self.current == other.current
@@ -75,7 +36,6 @@ impl CoinMarketCapFearAndGreedIndexSnapshot {
             && self.yearly_low == other.yearly_low
     }
 
-    /// Reads one answer of the service, refusing scores the scale does not have.
     pub(crate) fn parse(
         index: proto_types::CoinMarketCapFearAndGreedIndex,
     ) -> Result<Self, CoinMarketCapFearAndGreedIndexParseError> {
@@ -92,7 +52,6 @@ impl CoinMarketCapFearAndGreedIndexSnapshot {
     }
 }
 
-/// One optional point of an answer, refused when its score is not a reading.
 fn row(
     point: proto_types::CoinMarketCapFearAndGreedIndexPoint,
 ) -> Result<CoinMarketCapFearAndGreedIndexRow, CoinMarketCapFearAndGreedIndexParseError> {
@@ -102,7 +61,6 @@ fn row(
     })
 }
 
-/// One score of the scale, or the failure of an answer that carried something else.
 fn score(value: u32) -> Result<u8, CoinMarketCapFearAndGreedIndexParseError> {
     u8::try_from(value)
         .ok()
@@ -110,7 +68,6 @@ fn score(value: u32) -> Result<u8, CoinMarketCapFearAndGreedIndexParseError> {
         .ok_or(CoinMarketCapFearAndGreedIndexParseError::ScoreOutOfRange { value })
 }
 
-/// The band of the scale a reading belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Level {
     ExtremeFear,
@@ -121,11 +78,6 @@ pub(crate) enum Level {
 }
 
 impl Level {
-    /// The level `score` belongs to.
-    ///
-    /// The bands are `[0, 20)`, `[20, 40)`, `[40, 60)`, `[60, 80)` and the closed
-    /// `[80, 100]`, so a reading of exactly 100 is extreme greed rather than
-    /// nothing at all.
     pub(crate) const fn of(score: u8) -> Self {
         match score {
             0..=19 => Self::ExtremeFear,
@@ -136,7 +88,6 @@ impl Level {
         }
     }
 
-    /// The message key the level is named by.
     pub(crate) const fn key(self) -> &'static str {
         match self {
             Self::ExtremeFear => "widget.coin_market_cap_fear_and_greed_index.level.extreme_fear",
@@ -148,7 +99,6 @@ impl Level {
     }
 }
 
-/// Why an answer could not be read as a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub(crate) enum CoinMarketCapFearAndGreedIndexParseError {
     #[error("the fear and greed snapshot carried score {value}, above 100")]
@@ -163,7 +113,6 @@ mod tests {
 
     use super::*;
 
-    /// One point of a fixture answer.
     fn point(date: &str, score: u32) -> CoinMarketCapFearAndGreedIndexPoint {
         CoinMarketCapFearAndGreedIndexPoint {
             date: date.to_owned(),
@@ -171,7 +120,6 @@ mod tests {
         }
     }
 
-    /// The answer the service gives once it has collected.
     fn collected() -> CoinMarketCapFearAndGreedIndex {
         CoinMarketCapFearAndGreedIndex {
             current: 46,
@@ -185,7 +133,6 @@ mod tests {
         }
     }
 
-    /// An answer carrying only the current reading.
     fn current_only(current: u32) -> CoinMarketCapFearAndGreedIndex {
         CoinMarketCapFearAndGreedIndex {
             current,
@@ -201,8 +148,6 @@ mod tests {
         })
     }
 
-    /// Every field of the answer is kept as the service wrote it: the date is a
-    /// label rather than a calendar value, so it is neither parsed nor reformatted.
     #[test]
     fn a_complete_answer_should_map_every_field() {
         let snapshot = CoinMarketCapFearAndGreedIndexSnapshot::parse(collected())
@@ -223,8 +168,6 @@ mod tests {
         );
     }
 
-    /// The protocol's only expression of a missing value is an absent field, and an
-    /// absent field is not filled in with anything.
     #[test]
     fn an_answer_without_history_should_parse_with_every_row_missing() {
         let snapshot = CoinMarketCapFearAndGreedIndexSnapshot::parse(current_only(47))
@@ -240,8 +183,6 @@ mod tests {
         assert!(!snapshot.is_empty());
     }
 
-    /// A score outside the scale is not a reading, and the answer it arrived in is
-    /// refused rather than drawn with a value the scale cannot place.
     #[test]
     fn a_score_above_the_scale_should_be_refused() {
         for value in [101_u32, 255, 1_000] {
@@ -262,8 +203,6 @@ mod tests {
         }
     }
 
-    /// Both ends of the scale are readings: zero is the most extreme fear there is,
-    /// and one hundred is the most extreme greed.
     #[test]
     fn the_ends_of_the_scale_should_parse_and_name_their_levels() {
         for (score, level) in [(0_u32, Level::ExtremeFear), (100, Level::ExtremeGreed)] {
@@ -276,8 +215,6 @@ mod tests {
         }
     }
 
-    /// The bands meet at 20, 40, 60 and 80, so each boundary belongs to the band
-    /// that starts there and never to the one that ends there.
     #[test]
     fn every_band_boundary_should_belong_to_the_band_it_opens() {
         let boundaries = [
@@ -302,8 +239,6 @@ mod tests {
         }
     }
 
-    /// Every level names a message key of its own, so no two levels read the same
-    /// and the key is a catalogue reference rather than a sentence.
     #[test]
     fn every_level_should_name_its_own_message_key() {
         let levels = [
@@ -331,8 +266,6 @@ mod tests {
         assert_eq!(keys.len(), distinct, "each level reads differently");
     }
 
-    /// Only the collection time says whether the answer carries a collection; a
-    /// current value of zero is a reading rather than the absence of one.
     #[test]
     fn only_a_zero_collection_time_should_be_an_empty_snapshot() {
         let mut uncollected = collected();
@@ -350,8 +283,6 @@ mod tests {
         assert_eq!(zero.current, 0);
     }
 
-    /// The collection time is not drawn, so an index the collector read again
-    /// without moving is the same picture: the pane must not redraw it.
     #[test]
     fn two_answers_collected_at_different_times_should_draw_the_same() {
         let snapshot = CoinMarketCapFearAndGreedIndexSnapshot::parse(collected())
@@ -369,8 +300,6 @@ mod tests {
         );
     }
 
-    /// Everything the pane draws is part of the comparison: the current reading and
-    /// each of the six rows, down to the day a row is labelled with.
     #[test]
     fn a_changed_reading_or_row_should_be_a_different_display() {
         let reference = CoinMarketCapFearAndGreedIndexSnapshot::parse(collected())
@@ -423,9 +352,6 @@ mod tests {
         }
     }
 
-    /// Whether anything was collected at all is drawn — the body says 「暂无数据」
-    /// for an uncollected answer — so two answers with the same scores and rows are
-    /// different displays when only one of them has a collection.
     #[test]
     fn an_uncollected_answer_should_never_read_the_same_as_a_collected_one() {
         let uncollected = CoinMarketCapFearAndGreedIndexSnapshot::parse(
@@ -447,8 +373,6 @@ mod tests {
         );
     }
 
-    /// The yearly rows are the only two fields the widget draws nothing for when
-    /// they are absent, and their absence is not the snapshot's emptiness.
     #[test]
     fn an_answer_without_yearly_extremes_should_still_be_a_snapshot_to_draw() {
         let mut answer = collected();

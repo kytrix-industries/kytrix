@@ -1,33 +1,9 @@
-//! The wallet addresses one pane follows.
-//!
-//! # Why nothing but addresses is here
-//!
-//! A venue splits one account into partitions: Hyperliquid has its core spot, its core perpetual
-//! and the perpetuals of every deployed DEX. Which of them are read is the **venue's** answer
-//! rather than the user's setting — a reading of one address is meant to cover every partition the
-//! venue publishes, and asking the user to choose only turns one address into several rows and
-//! subscribes the same venue-level stream once per partition. So what is
-//! persisted is the address list itself, which is also this widget's only user-visible identity.
-//!
-//! The list's two invariants — an address appears once, and the list stays within its limit — hold
-//! in one place: they are checked when the list is decoded, and every change afterwards goes
-//! through `with` / `without`, so a list the runtime cannot use is never built.
-
 use ahash::AHashSet;
 use market_participants_model::identifier::WalletAddress;
 use serde::{Deserialize, Deserializer};
 
-/// The most wallet addresses one monitor can follow, **in total** rather than per route.
-///
-/// The dialog refuses to add the eleventh, so a stored list that long is one this build cannot have
-/// written — a config that decodes is one the runtime can use.
 pub(super) const MAX_WALLET_ADDRESSES: usize = 10;
 
-/// Why a stored address list cannot be used.
-///
-/// Rule 1 belongs to the framework, but a list this build cannot have written — too long, or
-/// naming one address twice — is not a list it can use, so it is refused here and the whole config
-/// goes back to its default (root `AGENTS.md` §1.1).
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(super) enum WatchListError {
     #[error("at most {MAX_WALLET_ADDRESSES} Hyperliquid wallet addresses are supported")]
@@ -36,9 +12,6 @@ pub(super) enum WatchListError {
     Duplicate { address: WalletAddress },
 }
 
-/// Checks that an address list holds each address once and stays within its limit.
-///
-/// The order is not touched by the check: the list is drawn in the order the user added it.
 pub(super) fn validate(addresses: &[WalletAddress]) -> Result<(), WatchListError> {
     if addresses.len() > MAX_WALLET_ADDRESSES {
         return Err(WatchListError::TooMany);
@@ -54,9 +27,6 @@ pub(super) fn validate(addresses: &[WalletAddress]) -> Result<(), WatchListError
     Ok(())
 }
 
-/// One more address than the list held, with both invariants intact.
-///
-/// The new address goes at the end, so the order a list is drawn in is the order it was added in.
 pub(super) fn with(
     addresses: &[WalletAddress],
     address: WalletAddress,
@@ -73,9 +43,6 @@ pub(super) fn with(
     Ok(next)
 }
 
-/// The list without one address.
-///
-/// Dropping an entry cannot make two others equal, so there is nothing here that can fail.
 pub(super) fn without(addresses: &[WalletAddress], address: &WalletAddress) -> Vec<WalletAddress> {
     addresses
         .iter()
@@ -84,10 +51,6 @@ pub(super) fn without(addresses: &[WalletAddress], address: &WalletAddress) -> V
         .collect()
 }
 
-/// Decodes a stored address list by the list's own rules.
-///
-/// Rule 1 belongs to the framework: a config refused here goes back to its default, so what the
-/// user sees is a rebuilt list rather than an error.
 pub(super) fn deserialize_addresses<'de, D>(deserializer: D) -> Result<Vec<WalletAddress>, D::Error>
 where
     D: Deserializer<'de>,

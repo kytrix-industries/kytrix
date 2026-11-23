@@ -1,16 +1,3 @@
-//! The stored spelling of a proxy line, and the conversions the proxy settings are written
-//! through.
-//!
-//! A line is stored as a [`ProxyRoute`]; a control shows it as the name it was chosen under, with
-//! the two built-in choices spelled as reserved tokens. The conversions live here rather than in
-//! the configure page because the default line, a group of targets and a venue of its own are all
-//! written the same way, and a page that spelled a token differently would write a route the
-//! settings never hold.
-//!
-//! The module is pure: it reads and writes the configuration values and builds nothing. The
-//! configure page draws its rows with these conversions; the server-management page does not use
-//! them, because the catalog it edits is not a line of the routing configuration.
-
 use app_config::{
     network::{ProxyRoute, ServiceTarget},
     settings::Config,
@@ -18,22 +5,15 @@ use app_config::{
 use market_participants_model::identifier::VenueId;
 use smol_str::SmolStr;
 
-/// Follow the default line.
 pub(crate) const PROXY_INHERIT: &str = "@inherit";
-/// Do not use a proxy.
 pub(crate) const PROXY_DIRECT: &str = "@direct";
-/// Use the operating system's proxy.
 pub(crate) const PROXY_SYSTEM: &str = "@system";
-/// The mixed value exists only as a rendered state. Nothing is ever stored as it: it says that
-/// the targets behind one control do not agree, and choosing it would say the same thing back.
 pub(crate) const PROXY_MIXED: &str = "@mixed";
 
-/// Reads the line one target is bound to, or the default line while it is unbound.
 pub(crate) fn proxy_route_of(config: &Config, target: &ServiceTarget) -> SmolStr {
     proxy_route_name(config.proxy_applications.get(target))
 }
 
-/// The line one stored route names, as the control that offers it reads it.
 pub(crate) fn proxy_route_name(route: Option<&ProxyRoute>) -> SmolStr {
     match route {
         None => SmolStr::new_static(PROXY_INHERIT),
@@ -43,10 +23,6 @@ pub(crate) fn proxy_route_name(route: Option<&ProxyRoute>) -> SmolStr {
     }
 }
 
-/// The line a group of targets agrees on.
-///
-/// Targets that disagree are not one of the choices, so the answer is [`PROXY_MIXED`] and the
-/// control offers it as the row that is currently selected.
 pub(crate) fn proxy_route_of_group(
     config: &Config,
     targets: impl IntoIterator<Item = ServiceTarget>,
@@ -64,7 +40,6 @@ pub(crate) fn proxy_route_of_group(
     }
 }
 
-/// Binds every target of a group to one line, or unbinds them when it is the default.
 pub(crate) fn set_proxy_route_of_group(
     config: &mut Config,
     targets: impl IntoIterator<Item = ServiceTarget>,
@@ -86,11 +61,6 @@ pub(crate) fn set_proxy_route_of_group(
     }
 }
 
-/// Decodes the line a value stands for.
-///
-/// A value that is not a reserved token is the name of a catalog entry. An empty or reserved one
-/// that is not a token is nothing, which is what keeps a rendering state from being written back
-/// as a route.
 pub(crate) fn decode_proxy_route(value: &str) -> Option<Option<ProxyRoute>> {
     match value {
         PROXY_INHERIT => Some(None),
@@ -103,13 +73,6 @@ pub(crate) fn decode_proxy_route(value: &str) -> Option<Option<ProxyRoute>> {
     }
 }
 
-/// The line one venue's own requests are bound to.
-///
-/// A venue is configured as a whole, so its line is the venue's own value rather than a set of
-/// per-target overrides: what the row shows is the venue's own settings row. A venue that names
-/// no line of its own follows the default, exactly as a Kytrix service without an override does,
-/// and a venue this build does not speak holds no line at all — the row that would show one does
-/// not exist either.
 pub(crate) fn proxy_route_of_venue(config: &Config, venue: &VenueId) -> SmolStr {
     match config.venue(venue) {
         Some(settings) => proxy_route_name(settings.proxy().as_ref()),
@@ -117,12 +80,6 @@ pub(crate) fn proxy_route_of_venue(config: &Config, venue: &VenueId) -> SmolStr 
     }
 }
 
-/// Binds one venue to one line, or puts it back on the default line.
-///
-/// A venue names a line of its own or nothing at all: a value that stands for no line is what
-/// makes the venue follow the default again, exactly as unbinding a group of services does. A
-/// value that is not a line the settings can store is nothing to write, which is what keeps a
-/// rendered state from being written back as a route.
 pub(crate) fn set_proxy_route_of_venue(config: &mut Config, venue: &VenueId, value: &str) {
     let Some(route) = decode_proxy_route(value) else {
         return;
@@ -131,7 +88,6 @@ pub(crate) fn set_proxy_route_of_venue(config: &mut Config, venue: &VenueId, val
     config.set_venue_proxy(venue, route);
 }
 
-/// The line a whole document asks for when no target overrides it.
 pub(crate) fn proxy_default_of(config: &Config) -> SmolStr {
     match &config.proxy_default {
         ProxyRoute::Direct => SmolStr::new_static(PROXY_DIRECT),
@@ -140,10 +96,6 @@ pub(crate) fn proxy_default_of(config: &Config) -> SmolStr {
     }
 }
 
-/// Sets the default line.
-///
-/// It is never inherited from anything, so a value that would mean "follow the default" is
-/// nothing to write and leaves the stored one where it was.
 pub(crate) fn set_proxy_default(config: &mut Config, value: &str) {
     let Some(route) = decode_proxy_route(value).flatten() else {
         return;
@@ -218,8 +170,6 @@ mod tests {
         assert!(config.proxy_applications.is_empty());
     }
 
-    /// A mixed group is a rendering state, so it is never written back: what a control says the
-    /// group currently is cannot become what the group is bound to.
     #[test]
     fn a_state_that_is_not_a_route_should_not_be_written() {
         let mut config = Config::default();
@@ -250,8 +200,6 @@ mod tests {
         assert_eq!(config.proxy_default, ProxyRoute::Direct);
     }
 
-    /// The default line has nothing above it to inherit from, so a value that would say
-    /// "follow the default" leaves the stored one where it was.
     #[test]
     fn a_default_line_should_not_be_set_to_inherit() {
         let mut config = Config::default();
@@ -261,8 +209,6 @@ mod tests {
         assert_eq!(config.proxy_default, ProxyRoute::Direct);
     }
 
-    /// A venue that names no line of its own reports the default one, and a value standing for no
-    /// line puts it back there.
     #[test]
     fn a_venue_should_follow_the_default_line_until_it_is_bound() {
         let venue = VenueId::Binance;
@@ -280,8 +226,6 @@ mod tests {
         assert_eq!(proxy_route_of_venue(&config, &venue), PROXY_DIRECT);
     }
 
-    /// A state that is not a route is not what a venue is bound to either, and a row the shape has
-    /// no configuration for has no line to write.
     #[test]
     fn a_venue_should_not_take_a_value_that_is_not_a_line() {
         let venue = VenueId::Binance;
@@ -294,8 +238,6 @@ mod tests {
             "a rendered state must not become a binding"
         );
 
-        // The shape covers every venue this build speaks, so the only way a venue has no row is a
-        // configuration that was taken apart by hand.
         let mut without_a_row = config.clone();
         without_a_row.venues.remove(&venue);
         let before = without_a_row.clone();

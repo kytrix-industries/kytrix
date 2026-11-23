@@ -1,8 +1,3 @@
-//! 卡片 / 文字 / 布局样式助手。
-//!
-//! 页面级布局由 [`super`] 的 flex 容器（根列 / 标题列 / 内容列 / 三行）负责；卡片是固定尺寸的
-//! flex 项，卡片内的叶子（文字 / 画布 / 色块）仍用 `LayoutOverride` 相对卡片内容盒定位。
-
 use smol_str::SmolStr;
 use ui_core::{
     app::App,
@@ -18,17 +13,13 @@ use ui_core::{
 
 use super::{CARD_BORDER_RGBA, CARD_RGBA, MUTED_RGBA, color};
 
-/// 卡片标题的字号 / 字重。
 const HEADING_SIZE: f32 = 13.5;
-/// 卡片标题的字重。
 const HEADING_WEIGHT: u16 = 700;
 
-/// 场景窗口的节点树（`window` 必须存在；场景只在有效窗口上建树）。
 pub(crate) fn tree(app: &mut App, window: WindowId) -> &mut NodeTree {
     app.window_mut(window).expect("场景窗口必须存在").tree_mut()
 }
 
-/// 绝对定位 + 固定尺寸的静态样式（相对父节点 border box）。
 pub(crate) fn absolute_style(rect: Rect) -> Style {
     let mut style = Style::default();
     style.inner.position = taffy::style::Position::Absolute;
@@ -45,10 +36,8 @@ pub(crate) fn absolute_style(rect: Rect) -> Style {
     style
 }
 
-/// 正常流内的固定尺寸样式（flex 项）。
 pub(crate) fn flow_style(size: Size) -> Style {
     let mut style = Style::default();
-    // 卡片是 absolute 叶子的包含块（taffy 默认 position: static 不会建立包含块）。
     style.inner.position = taffy::style::Position::Relative;
     style.inner.size = taffy::geometry::Size {
         width: taffy::style::Dimension::length(size.width),
@@ -57,7 +46,6 @@ pub(crate) fn flow_style(size: Size) -> Style {
     style
 }
 
-/// 建一个普通容器（标题列 / 内容列 / 行 / 背景等布局盒子）。
 pub(crate) fn container(app: &mut App, window: WindowId, parent: NodeId, style: Style) -> NodeId {
     NodeBuilder::boxed()
         .style(style)
@@ -65,7 +53,6 @@ pub(crate) fn container(app: &mut App, window: WindowId, parent: NodeId, style: 
         .expect("容器挂载")
 }
 
-/// 建一张卡片（背景 + 1px 边框 + 圆角）并返回卡片节点（子节点坐标相对它）。
 pub(crate) fn card(
     app: &mut App,
     window: WindowId,
@@ -102,7 +89,6 @@ pub(crate) fn card(
     node
 }
 
-/// 静态文字叶子。
 pub(crate) fn label(
     app: &mut App,
     window: WindowId,
@@ -117,7 +103,6 @@ pub(crate) fn label(
         .expect("文字挂载")
 }
 
-/// 动态文字叶子（`bind_text` 每次样式 pass 求值）。
 pub(crate) fn bound_label(
     app: &mut App,
     window: WindowId,
@@ -133,7 +118,6 @@ pub(crate) fn bound_label(
         .expect("动态文字挂载")
 }
 
-/// 装饰性文字叶子：**不**出现在无障碍树里（控件的可访问名由容器声明，避免 AT 重复朗读）。
 pub(crate) fn hidden_label(
     app: &mut App,
     window: WindowId,
@@ -152,7 +136,6 @@ pub(crate) fn hidden_label(
         .expect("装饰文字挂载")
 }
 
-/// 装饰性动态文字叶子（同 [`hidden_label`]，文本由 `bind_text` 求值）。
 pub(crate) fn bound_hidden_label(
     app: &mut App,
     window: WindowId,

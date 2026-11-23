@@ -1,11 +1,3 @@
-//! L1 集成测试：布局与命中（`TestApp` + `Probe`）。
-//!
-//! 只走公开 API（AGENTS §5.2）：`NodeBuilder` + `Style`（taffy 树）、`Probe`（布局盒 / 命中）、
-//! `App::{make_scroll, scroll_to}`（滚动偏移）。与 `src/layout/**` 的内联单测互补：
-//! 这里验证「挂进窗口 → 布局 → 探针/命中」这条**跨模块**链路，不重复 taffy 适配器的单元细节。
-//!
-//! 需要 `--features test-support`（`Cargo.toml` 的 `[[test]] required-features`）。
-
 use smol_str::SmolStr;
 use taffy::style::{Dimension, FlexDirection, LengthPercentage, LengthPercentageAuto, Position};
 use ui_core::{
@@ -28,7 +20,6 @@ fn app() -> TestApp {
     })
 }
 
-/// 一个 taffy 样式壳：可选固定尺寸、内边距、主轴方向、gap。
 fn style(size: Option<Size>, padding: f32, column: bool, gap: f32) -> Style {
     let edge = LengthPercentage::length(padding);
     let gap = LengthPercentage::length(gap);
@@ -61,7 +52,6 @@ fn style(size: Option<Size>, padding: f32, column: bool, gap: f32) -> Style {
     }
 }
 
-/// 固定宽度、高度自适应的纵向容器（顶层面板）。
 fn panel(width: f32) -> Style {
     let mut style = style(None, 0.0, true, 0.0);
     style.inner.size.width = Dimension::length(width);
@@ -96,7 +86,6 @@ fn flex_row_and_column_place_children_on_the_main_axis() {
     let window = app.window_id();
     let root = app.app().window(window).expect("窗口").tree().root();
 
-    // 顶层面板：纵向排列、宽度撑满窗口（根是默认 Row，所以先包一层）。
     let panel = mount(&mut app, root, "panel", panel(WINDOW.width));
     let row = mount(&mut app, panel, "row", style(None, 0.0, false, 8.0));
     mount(
@@ -220,7 +209,6 @@ fn hit_test_finds_the_topmost_node_and_falls_back_to_the_parent() {
     let hit = app.probe().hit(inside_b).expect("b 区域必须命中");
     assert_eq!(hit.node, node(&app, "hit-b"));
 
-    // 两个子项之间是父节点的空白（gap），只能命中父节点。
     let gap = Point::new(
         a.origin.x + a.size.width + 4.0,
         a.origin.y + a.size.height / 2.0,
@@ -228,7 +216,6 @@ fn hit_test_finds_the_topmost_node_and_falls_back_to_the_parent() {
     let hit = app.probe().hit(gap).expect("gap 区域必须命中父节点");
     assert_eq!(hit.node, row);
 
-    // 窗口外：无命中。
     assert!(app.probe().hit(Point::new(-1.0, -1.0)).is_none());
 }
 
@@ -238,12 +225,10 @@ fn scroll_offset_moves_what_hit_test_sees() {
     let window = app.window_id();
     let root = app.app().window(window).expect("窗口").tree().root();
 
-    // 滚动容器：200×100，内容溢出到 400 高。
     let mut viewport = style(Some(Size::new(200.0, 100.0)), 0.0, true, 0.0);
     viewport.clip = Clip::Bounds;
     let container = mount(&mut app, root, "viewport", viewport);
 
-    // 子项放在**内容坐标** y = 150（视口外）。
     let mut deep_style = style(Some(Size::new(200.0, 20.0)), 0.0, true, 0.0);
     deep_style.inner.position = Position::Absolute;
     deep_style.inner.inset = taffy::geometry::Rect {

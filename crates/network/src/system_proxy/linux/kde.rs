@@ -1,5 +1,3 @@
-//! KDE `kioslaverc` proxy discovery.
-
 use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::{
@@ -67,7 +65,6 @@ pub(super) fn kde_config_from_keys(
     }
 }
 
-/// Reads proxy settings straight out of a `kioslaverc` document.
 #[cfg(test)]
 pub(super) fn kde_config_from_kioslaverc(
     text: &str,

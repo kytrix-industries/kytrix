@@ -1,63 +1,3 @@
-//! The dialog a pane opens to manage the addresses its transfers are watched for.
-//!
-//! # What the dialog owns, and what it does not
-//!
-//! It owns what a pane has no use for — what the user is typing, the list of addresses
-//! with the place a reader is in it, the sentences the body stands in with, and the
-//! components those are drawn through — and draws everything else from the pane, which
-//! holds the addresses and the service that answers a read or a change. The state that
-//! outlives any one dialog belongs to the pane.
-//!
-//! # One value channel into the dialog
-//!
-//! The pane is not reachable from the dialog: a kit control's callback owns no widget,
-//! and the engine has no entity the two could hold each other through. So the dialog is
-//! built over **signals**: the pane publishes what it holds into them every frame
-//! ([`EthereumWalletDialog::sync`]), and every dynamic value the dialog draws is a `bind_*`
-//! closure over one of them. What the user does travels back as requests the pane applies
-//! ([`DialogRequest`]) — add, delete and read are all the pane's own operations, sent over
-//! the session the pane's stream is holding.
-//!
-//! # The row controls are built into rows the list owns
-//!
-//! A kit list's row factory is handed a [`NodeTree`] and nothing else: no application
-//! context, and therefore no `Button`. The delete control of an address row is a kit
-//! button all the same, so the row leaves an empty slot for it and the dialog builds the
-//! button into that slot from [`EthereumWalletDialog::sync`], after the list has mounted its
-//! rows. A list that rebuilds its visible rows (a new address count, a language switch)
-//! leaves new slots behind; the sync pairs the buttons with the slots showing now and
-//! releases the ones whose row is gone.
-//!
-//! # Static copy is rebuilt, not re-bound
-//!
-//! The kit components this dialog builds choose their labels when they are built, and a
-//! language switch would otherwise leave them in the language the dialog was opened in.
-//! The buttons the dialog holds (refresh / add / retry / recover / close) are therefore
-//! released and built again into the same parent when the language moves — the same four
-//! steps `crates/widgets/AGENTS.md` §15.1 freezes for static copy, and the rich stand-ins
-//! are parsed again. The dialog's own title is the one piece chosen at open (it is the kit
-//! dialog's accessible name); a language switch while it is open leaves that name in the
-//! language it was opened in, which is registered as a known difference in the W8b ledger.
-//!
-//! # The spinner exists only while it spins
-//!
-//! A kit spinner animates for as long as it is synced, and the engine has no "hidden
-//! animation" state: a spinner that merely sits in a hidden block would keep asking for
-//! frames (I3). It is therefore built when the body enters its loading window and
-//! released when that window closes, which is the framework's own placeholder pattern.
-//! The spinner carries the loading sentence as its accessible name: a kit spinner without
-//! one is a decorative graphic hidden from assistive technology, and a dialog that is
-//! reading its addresses is not decoration (`ProgressIndicator` + the label is what a
-//! screen reader announces).
-//!
-//! # Enter in the address field is the add control
-//!
-//! A kit input only dispatches an action on Enter when its spec names one, and the old
-//! dialog's field added what it held on Enter. The dialog therefore registers its own
-//! submit action (keyed from its instance, like every other control) and answers it with
-//! the same "may this address be monitored" judgement the add button uses — the action
-//! entry point decides again rather than trusting the control's disabled state.
-
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -110,58 +50,34 @@ use super::{
     view::{SelectionNotice, SelectionOperation},
 };
 
-/// The width of the address dialog's panel.
 const DIALOG_WIDTH: f32 = 620.0;
 
-/// The height of the panel's content column (the old dialog's 480 px panel less the title
-/// row and padding the kit dialog's panel brings).
 const CONTENT_HEIGHT: f32 = 400.0;
 
-/// The widest a sentence standing in for the address list is drawn.
 const MESSAGE_WIDTH: f32 = 420.0;
 
-/// What one frame hands the dialog: the pane's selection state, as the dialog draws it.
 #[derive(Clone)]
 pub(super) struct DialogView {
-    /// Whether anybody is signed in.
     pub signed_in: bool,
-    /// Whether the stream carrying the account is live.
     pub ready: bool,
-    /// The addresses the account monitors, once a read has answered.
     pub selections: Option<SelectionData>,
-    /// What the pane is waiting for, if anything.
     pub operation: Option<SelectionOperation>,
-    /// What the pane says about the last change.
     pub notice: Option<SelectionNotice>,
-    /// The recovery the pane itself offers, for a dialog that has no stream.
     pub recovery: WidgetAction,
 }
 
-/// What the user asked the pane for through the dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum DialogRequest {
-    /// Read the addresses again.
     Reload,
-    /// Monitor one more address.
     Add(SmolStr),
-    /// Stop monitoring one address.
     Delete(SmolStr),
 }
 
-/// The dialog a pane opens to manage the addresses its transfers are watched for.
 pub(super) struct EthereumWalletDialog {
     inner: Rc<RefCell<DialogState>>,
 }
 
 impl EthereumWalletDialog {
-    /// Builds the dialog over the pane's window and opens it.
-    ///
-    /// The content is built against signals, so nothing about the pane is needed here:
-    /// what the dialog draws is published by the first frame.
-    ///
-    /// # Errors
-    /// The kit dialog could not be built or opened (the window is gone, or the content
-    /// subtree could not be created).
     pub(super) fn open(cx: &mut WidgetCx<'_>) -> Result<Self, EngineError> {
         let inner = Rc::new(RefCell::new(DialogState::new(cx)));
         inner.borrow_mut().create_kit(cx)?;
@@ -188,12 +104,6 @@ impl EthereumWalletDialog {
         Ok(Self { inner })
     }
 
-    /// One frame of the dialog: follow the language, publish the pane's state, feed the
-    /// field its typed events, and sync every component the dialog owns.
-    ///
-    /// # Errors
-    /// The kit dialog or one of its components failed to sync; the caller releases the
-    /// dialog rather than leaving dead nodes behind.
     pub(super) fn sync(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -210,7 +120,6 @@ impl EthereumWalletDialog {
         Ok(())
     }
 
-    /// Takes the requests the user made through the dialog since the last frame.
     pub(super) fn take_requests(&mut self, cx: &mut WidgetCx<'_>) -> Vec<DialogRequest> {
         if self.finished() {
             return Vec::new();
@@ -245,13 +154,11 @@ impl EthereumWalletDialog {
         requests
     }
 
-    /// Whether the dialog has gone (closed, dismissed, or its window is gone).
     pub(super) fn finished(&self) -> bool {
         let state = self.inner.borrow();
         state.released || state.closed.get()
     }
 
-    /// Releases the dialog's components and its signal scope. Idempotent.
     pub(super) fn release(&mut self, cx: &mut WidgetCx<'_>) {
         let (components, scope) = {
             let mut state = self.inner.borrow_mut();
@@ -261,13 +168,11 @@ impl EthereumWalletDialog {
             state.released = true;
             (state.take_components(), state.scope)
         };
-        // Nodes first (the dialog unmounts the content subtree), components second (E16).
         release_components(cx.app_mut(), components);
         let _ = cx.app_mut().release_scope(scope);
     }
 }
 
-/// The handles the crate's tests read a dialog's components through.
 #[cfg(test)]
 impl EthereumWalletDialog {
     pub(super) fn test_dialog(&self) -> Option<Dialog> {
@@ -311,7 +216,6 @@ impl EthereumWalletDialog {
     }
 }
 
-/// The parts one open dialog owns.
 struct DialogState {
     window: WindowId,
     scope: SignalScope,
@@ -319,10 +223,7 @@ struct DialogState {
     translate: Translate,
     language: Signal<LanguageCode>,
     keys: DialogKeys,
-    /// The language the kit components (the buttons, the parsed stand-ins and the field's
-    /// placeholder) were built in.
     built_language: Option<LanguageCode>,
-    /// The action the address field dispatches when Enter is pressed in it.
     submit: Action,
     dialog: Option<Dialog>,
     list: Option<List>,
@@ -334,9 +235,7 @@ struct DialogState {
     retry: Option<Button>,
     recover: Option<Button>,
     close: Option<Button>,
-    /// The delete control of each mounted address row, keyed by row index.
     delete_buttons: BTreeMap<usize, DeleteButton>,
-    /// The slot each mounted address row left for its delete control.
     slots: Rc<RefCell<BTreeMap<usize, NodeId>>>,
     refresh_parent: Option<NodeId>,
     add_parent: Option<NodeId>,
@@ -345,14 +244,10 @@ struct DialogState {
     close_parent: Option<NodeId>,
     signed_out_parent: Option<NodeId>,
     empty_parent: Option<NodeId>,
-    /// The rich stand-ins, parsed into the language they were mounted in.
     signed_out_markdown: Option<MarkdownMessage>,
     empty_markdown: Option<MarkdownMessage>,
-    /// The number of address rows the list was last told to draw.
     shown_addresses: Option<usize>,
-    /// The recovery the recover control was built for.
     recover_built: Option<WidgetAction>,
-    /// The pane's state as the last frame published it.
     last_view: Option<DialogView>,
     addresses: Signal<Arc<[EthereumWalletSelection]>>,
     limit: Signal<Option<usize>>,
@@ -371,7 +266,6 @@ struct DialogState {
     closed: Rc<Cell<bool>>,
 }
 
-/// The kit keys one dialog mints from its instance identity.
 #[derive(Clone)]
 struct DialogKeys {
     dialog: SmolStr,
@@ -385,19 +279,16 @@ struct DialogKeys {
     close: SmolStr,
 }
 
-/// One mounted row's delete control.
 struct DeleteButton {
     slot: NodeId,
     language: LanguageCode,
     button: Button,
 }
 
-/// A rich sentence standing in for the address list, and the node it is drawn in.
 struct MarkdownMessage {
     node: MarkdownNode,
 }
 
-/// The components one dialog owns, taken as one set on release.
 struct DialogComponents {
     dialog: Option<Dialog>,
     input: Option<InputNode>,
@@ -412,7 +303,6 @@ struct DialogComponents {
     delete_buttons: Vec<Button>,
 }
 
-/// The static-copy controls the dialog rebuilds when the language moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DialogButtonKind {
     Refresh,
@@ -423,7 +313,6 @@ enum DialogButtonKind {
 }
 
 impl DialogState {
-    /// Builds the dialog's signals and keys. No nodes and no kit components yet.
     fn new(cx: &mut WidgetCx<'_>) -> Self {
         let scope = cx.app_mut().signal_scope();
         let language = cx.language();
@@ -494,9 +383,6 @@ impl DialogState {
         }
     }
 
-    /// Builds the list the dialog draws its addresses with, and registers the action its
-    /// address field dispatches on Enter. Called before the dialog is opened, because the
-    /// dialog's content mounts the list.
     fn create_kit(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let addresses = self.addresses;
         let slots = Rc::clone(&self.slots);
@@ -519,9 +405,6 @@ impl DialogState {
         self.shown_addresses = Some(count);
         self.list = Some(list);
 
-        // Enter in the address field is the add control by another route: the same
-        // judgement, made again at the action entry rather than trusting the control's
-        // disabled state (AGENTS §4.2 / §12-7).
         let input_state = self.input_state;
         let addresses = self.addresses;
         let limit = self.limit;
@@ -548,7 +431,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Builds the kit dialog around this dialog's content.
     fn build_dialog(inner: &Weak<RefCell<DialogState>>, cx: &mut WidgetCx<'_>) -> Dialog {
         let (theme, layer, animation, key, title, closed) = {
             let state = inner
@@ -578,7 +460,6 @@ impl DialogState {
             .build(cx.app_mut(), theme, layer, animation, key)
     }
 
-    /// Publishes the pane's state to the signals the dialog's nodes read.
     fn publish(&mut self, cx: &mut WidgetCx<'_>, view: &DialogView) {
         let addresses = view
             .selections
@@ -596,7 +477,6 @@ impl DialogState {
         self.last_view = Some(view.clone());
     }
 
-    /// Tells the list how many addresses the pane holds.
     fn show_addresses(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let count = cx.read(&self.addresses).len();
         if self.shown_addresses == Some(count) {
@@ -611,8 +491,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// The language the dialog was built in is not the one showing now: release the static
-    /// copy and build it again.
     fn rebuild_static_copy(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let language = *cx.read(&self.language);
         if self.built_language == Some(language) {
@@ -651,7 +529,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Rebuilds one static-copy control with the language showing now.
     fn rebuild_button(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -670,7 +547,6 @@ impl DialogState {
         self.build_button(cx.app_mut(), window, parent, kind)
     }
 
-    /// Builds one static-copy control into `parent`.
     fn build_button(
         &mut self,
         app: &mut App,
@@ -791,7 +667,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Takes the control of one kind out of its field.
     fn take_button(&mut self, kind: DialogButtonKind) -> Option<Button> {
         match kind {
             DialogButtonKind::Refresh => self.refresh.take(),
@@ -802,7 +677,6 @@ impl DialogState {
         }
     }
 
-    /// The address the add control would carry, from the signals showing this frame.
     fn addable_now(&self, cx: &WidgetCx<'_>) -> Option<SmolStr> {
         let text = SmolStr::new(cx.read(&self.input_state).text().trim());
         let typed = canonical_address(&text)?;
@@ -818,14 +692,12 @@ impl DialogState {
         Some(typed)
     }
 
-    /// Whether the pane may change its address list at all right now.
     fn may_change(&self) -> bool {
         self.last_view
             .as_ref()
             .is_some_and(|view| view.ready && view.selections.is_some() && view.operation.is_none())
     }
 
-    /// One frame: rebuild static copy, publish, feed the field, sync the components.
     fn frame(&mut self, cx: &mut WidgetCx<'_>, view: &DialogView) -> Result<(), EngineError> {
         if self.released || self.closed.get() {
             return Ok(());
@@ -846,7 +718,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Rebuilds the recover control when the recovery the pane offers moved.
     fn sync_recover_button(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let current = self.last_view.as_ref().map(|view| view.recovery.clone());
         if self.recover_built == current {
@@ -859,11 +730,6 @@ impl DialogState {
         self.rebuild_button(cx, parent, DialogButtonKind::Recover)
     }
 
-    /// Feeds this dialog's own typing to its address field.
-    ///
-    /// A dialog owns **the typed text and key presses of its own window, and only while it
-    /// is that window's modal scope**: the engine has already dispatched the interaction
-    /// events, so what is left in the observation queue is what a text input can consume.
     fn dispatch_text_events(&mut self, cx: &mut WidgetCx<'_>) {
         let Some(input) = self.input.as_ref() else {
             return;
@@ -880,8 +746,6 @@ impl DialogState {
         }
     }
 
-    /// Whether this dialog is the window's modal scope, and therefore the keyboard's
-    /// owner.
     fn owns_modal(&self, app: &App) -> bool {
         let Some(dialog) = self.dialog.as_ref() else {
             return false;
@@ -892,7 +756,6 @@ impl DialogState {
         )
     }
 
-    /// Syncs every component the dialog owns, in the order the engine expects.
     fn sync_components(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if let Some(dialog) = self.dialog.as_ref() {
             dialog
@@ -912,8 +775,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Builds the spinner when the body enters its loading window and releases it when the
-    /// window closes, so a hidden spinner never keeps asking for frames (I3).
     fn sync_spinner(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let loading = self.last_view.as_ref().is_some_and(|view| {
             view.signed_in
@@ -925,9 +786,6 @@ impl DialogState {
                 spinner.sync(cx.app_mut())?;
             } else if let Some(parent) = self.spinner_parent {
                 let key = format_smolstr!("{}:spinner", self.keys.dialog);
-                // A kit spinner with no accessible name is a decorative graphic, and the
-                // dialog is announcing that it is reading the addresses: the label is what
-                // puts it in the a11y tree as a progress indicator (W8a review F3).
                 let label = t_smol!(self.translate, "widget.ethereum_wallet.loading_addresses");
                 let spinner = Spinner::new(cx.app_mut(), self.theme.clone(), key).with_label(label);
                 let window = cx.window();
@@ -940,7 +798,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Keeps the controls' enabled state in step with what the pane may do now.
     fn sync_button_states(&self, cx: &mut WidgetCx<'_>) {
         let operation = self.last_view.as_ref().and_then(|view| view.operation);
         let ready = self.last_view.as_ref().is_some_and(|view| view.ready);
@@ -960,7 +817,6 @@ impl DialogState {
         }
     }
 
-    /// Pairs every mounted address row with its delete control.
     fn sync_delete_buttons(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(list) = self.list.as_ref() else {
             return Ok(());
@@ -1042,7 +898,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Rebuilds the parsed stand-ins when the language moved.
     fn rebuild_markdown(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if let Some(message) = self.signed_out_markdown.take() {
             remove_markdown(cx, message)?;
@@ -1061,7 +916,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Keeps the parsed stand-ins' theme-dependent payload in step with the appearance.
     fn sync_markdown(&mut self, cx: &mut WidgetCx<'_>) {
         if let Some(message) = self.signed_out_markdown.as_mut() {
             message.node.sync(cx.app_mut());
@@ -1071,8 +925,6 @@ impl DialogState {
         }
     }
 
-    /// Builds the dialog's own panel: the count and refresh row, the address field and
-    /// its add control, the notice line, the list area and the footer.
     fn build_content(
         &mut self,
         app: &mut App,
@@ -1080,7 +932,6 @@ impl DialogState {
         body: NodeId,
     ) -> Result<(), EngineError> {
         let Some(list) = self.list.clone() else {
-            // The dialog is being torn down; there is nothing to mount into.
             return Ok(());
         };
         let key = self.keys.dialog.clone();
@@ -1104,7 +955,6 @@ impl DialogState {
                 .build(tree, body)
         })?;
 
-        // The count and the read-again control.
         let header = build_node(app, window, panel, |tree, panel| {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:header"))
@@ -1130,7 +980,6 @@ impl DialogState {
         self.refresh_parent = Some(refresh_holder);
         self.build_button(app, window, refresh_holder, DialogButtonKind::Refresh)?;
 
-        // The address field and the control that monitors what it holds.
         let toolbar = build_node(app, window, panel, |tree, panel| {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:toolbar"))
@@ -1189,7 +1038,6 @@ impl DialogState {
         self.add_parent = Some(add_holder);
         self.build_button(app, window, add_holder, DialogButtonKind::Add)?;
 
-        // The line the last change is reported on.
         let notice = self.notice;
         let notice_language = self.language;
         let notice_translate = translate;
@@ -1239,7 +1087,6 @@ impl DialogState {
             .build(tree, panel)
         })?;
 
-        // The addresses, or the sentence that stands in for them.
         let area = build_node(app, window, panel, |tree, panel| {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:area"))
@@ -1280,7 +1127,6 @@ impl DialogState {
 
         self.build_message_blocks(app, window, area, &key, text_size)?;
 
-        // The way out of the dialog.
         let footer = build_node(app, window, panel, |tree, panel| {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:footer"))
@@ -1315,7 +1161,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// The count line: how many addresses the account monitors, once it is known.
     fn heading_node(
         &self,
         app: &mut App,
@@ -1359,7 +1204,6 @@ impl DialogState {
         })
     }
 
-    /// The five situations the list area can be in, each a stand-in drawn over the list.
     fn build_message_blocks(
         &mut self,
         app: &mut App,
@@ -1374,7 +1218,6 @@ impl DialogState {
         let operation = self.operation;
         let addresses = self.addresses;
 
-        // Nobody signed in.
         let signed_out = message_block(
             app,
             window,
@@ -1395,7 +1238,6 @@ impl DialogState {
             &signed_out_text,
         )?);
 
-        // The addresses are being read.
         let loading = message_block(
             app,
             window,
@@ -1425,7 +1267,6 @@ impl DialogState {
             "widget.ethereum_wallet.loading_addresses",
         )?;
 
-        // Nothing is holding the account: the way out is the pane's own recovery.
         let unavailable = message_block(
             app,
             window,
@@ -1456,7 +1297,6 @@ impl DialogState {
         self.recover_parent = Some(recover_holder);
         self.build_button(app, window, recover_holder, DialogButtonKind::Recover)?;
 
-        // The read failed: the way out is reading again.
         let failed = message_block(
             app,
             window,
@@ -1487,7 +1327,6 @@ impl DialogState {
         self.retry_parent = Some(retry_holder);
         self.build_button(app, window, retry_holder, DialogButtonKind::Retry)?;
 
-        // The account monitors no address.
         let empty = message_block(
             app,
             window,
@@ -1513,7 +1352,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// One plain sentence standing in a message block.
     fn message_text(
         &self,
         app: &mut App,
@@ -1548,8 +1386,6 @@ impl DialogState {
         })
     }
 
-    /// Takes the components out of the state, leaving the nodes to whoever releases them
-    /// first (the dialog's overlay owns the content subtree).
     fn take_components(&mut self) -> DialogComponents {
         let delete_buttons = std::mem::take(&mut self.delete_buttons)
             .into_values()
@@ -1571,14 +1407,6 @@ impl DialogState {
     }
 }
 
-/// The address a reader typed, as the address it names.
-///
-/// An Ethereum address is the same address in either case: a wallet writes one in mixed
-/// case to carry a checksum over its digits, and the service holds the addresses it is
-/// asked about in one case, so what is typed is folded to that case before anything reads
-/// it — a reader pasting the address their wallet shows is pasting the address they meant.
-/// An address that is not written in hex is left as it was typed rather than folded into
-/// something else, and the whitespace a paste can bring along is dropped either way.
 fn canonical_address(typed: &SmolStr) -> Option<SmolStr> {
     let typed = typed.trim();
     if typed.is_empty() {
@@ -1590,7 +1418,6 @@ fn canonical_address(typed: &SmolStr) -> Option<SmolStr> {
     })
 }
 
-/// The address the add control would monitor, from the signals showing on this frame.
 fn addable_from(
     ctx: &ActionCtx<'_>,
     input_state: &Signal<InputState>,
@@ -1614,7 +1441,6 @@ fn addable_from(
     Some(typed)
 }
 
-/// One address row of the list: the address, and the slot its delete control goes in.
 fn build_address_row(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -1674,7 +1500,6 @@ fn build_address_row(
     Ok(())
 }
 
-/// One absolute overlay in the list area, centered.
 fn message_block(
     app: &mut App,
     window: WindowId,
@@ -1704,7 +1529,6 @@ fn message_block(
     })
 }
 
-/// Parses and mounts one rich stand-in under `parent`.
 fn mount_markdown(
     cx: &mut WidgetCx<'_>,
     parent: NodeId,
@@ -1715,7 +1539,6 @@ fn mount_markdown(
     mount_markdown_from(cx.app_mut(), window, parent, theme, source)
 }
 
-/// Parses and mounts one rich stand-in with an application context in hand.
 fn mount_markdown_from(
     app: &mut App,
     window: WindowId,
@@ -1728,7 +1551,6 @@ fn mount_markdown_from(
     Ok(MarkdownMessage { node })
 }
 
-/// Removes one parsed stand-in's node; the document goes with it.
 fn remove_markdown(cx: &mut WidgetCx<'_>, message: MarkdownMessage) -> Result<(), EngineError> {
     let root = message.node.root();
     if cx.tree().get(root).is_err() {
@@ -1738,7 +1560,6 @@ fn remove_markdown(cx: &mut WidgetCx<'_>, message: MarkdownMessage) -> Result<()
     cx.app_mut().remove_node(window, root).map(|_| ())
 }
 
-/// Removes one control's node, if it is still there.
 fn remove_button_node(app: &mut App, window: WindowId, button: &Button) -> Result<(), EngineError> {
     let Some(node) = button.node() else {
         return Ok(());
@@ -1752,7 +1573,6 @@ fn remove_button_node(app: &mut App, window: WindowId, button: &Button) -> Resul
     app.remove_node(window, node).map(|_| ())
 }
 
-/// Releases the components one dialog owns, node-owning component first (E16).
 fn release_components(app: &mut App, components: DialogComponents) {
     if let Some(dialog) = components.dialog {
         dialog.release(app);
@@ -1786,7 +1606,6 @@ fn release_components(app: &mut App, components: DialogComponents) {
     }
 }
 
-/// The product assets, as the markdown parser's image-size seam.
 struct EmbeddedAssets;
 
 impl MarkdownAssets for EmbeddedAssets {
@@ -1795,7 +1614,6 @@ impl MarkdownAssets for EmbeddedAssets {
     }
 }
 
-/// Whether `event` is one only a dialog's own text input can consume.
 fn is_text_input(event: &Event) -> bool {
     matches!(
         event,
@@ -1803,7 +1621,6 @@ fn is_text_input(event: &Event) -> bool {
     )
 }
 
-/// Maps a kit dialog error onto the engine error the widget contract speaks.
 fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
     match error {
         DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
@@ -1813,7 +1630,6 @@ fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
     }
 }
 
-/// Builds one node under `parent` with a window's tree in hand.
 fn build_node(
     app: &mut App,
     window: WindowId,
@@ -1843,11 +1659,8 @@ mod tests {
 
     const FIRST: &str = "0x1111111111111111111111111111111111111111";
     const SECOND: &str = "0x2222222222222222222222222222222222222222";
-    /// One address, in the two cases a wallet may write it in: the mixed case is the
-    /// checksum the address is displayed with, and the lowercase one is the address itself.
     const CHECKSUMMED: &str = "0x52908400098527886E0F7030069857D2E4169EE7";
     const CANONICAL: &str = "0x52908400098527886e0f7030069857d2e4169ee7";
-    /// A Solana address: base58, and therefore not one this pane accepts.
     const SOLANA: &str = "So11111111111111111111111111111111111111112";
     const SETTLE_FRAMES: usize = 8;
 
@@ -1899,8 +1712,6 @@ mod tests {
             .expect("the dialog syncs");
     }
 
-    /// Lets a few production-shaped frames run: nodes built by the frame that created them
-    /// are laid out and painted by the frames after.
     fn settle_frames(
         harness: &mut WidgetTestApp,
         dialog: &mut EthereumWalletDialog,
@@ -1924,7 +1735,6 @@ mod tests {
         SmolStr::new(dialog.test_dialog().expect("the kit dialog is built").key())
     }
 
-    /// The key the address list's rows are drawn under.
     fn list_key(dialog: &EthereumWalletDialog) -> SmolStr {
         dialog.inner.borrow().keys.list.clone()
     }
@@ -1992,7 +1802,6 @@ mod tests {
         );
     }
 
-    /// Presses Enter in the address field: the field dispatches its own submit action.
     fn press_enter(harness: &mut WidgetTestApp, dialog: &EthereumWalletDialog) {
         let input = dialog.test_input().expect("the address field is built");
         let window = harness.window();
@@ -2004,9 +1813,6 @@ mod tests {
         );
     }
 
-    /// An Ethereum address is the address it names in either case, and the whitespace a
-    /// paste can bring along is not part of one — but the case the service holds it in is
-    /// the lowercase one, so a checksummed address is folded before it is read.
     #[test]
     fn an_address_should_be_read_as_the_address_it_names() {
         assert_eq!(
@@ -2066,8 +1872,6 @@ mod tests {
         );
     }
 
-    /// Typing an address offers it to the pane; an address the account already monitors is
-    /// not offered, and neither is one past the quota.
     #[test]
     fn typing_an_address_should_offer_it_to_the_pane() {
         let mut harness = harness();
@@ -2087,8 +1891,6 @@ mod tests {
             "the address the field holds is the one that was asked for"
         );
 
-        // An address already on the list is not a change: the control refuses it rather
-        // than putting a question the service would answer with a conflict.
         type_address(&mut harness, &dialog, FIRST);
         settle_frames(&mut harness, &mut dialog, &view);
         click(&mut harness, &add);
@@ -2098,8 +1900,6 @@ mod tests {
         );
     }
 
-    /// Enter in the address field is the add control by another route: it offers what the
-    /// field holds, and it refuses what the control would refuse.
     #[test]
     fn pressing_enter_in_the_address_field_should_offer_the_typed_address() {
         let mut harness = harness();
@@ -2147,8 +1947,6 @@ mod tests {
         );
     }
 
-    /// A row's trash control is built into the row the list mounts, and asks the pane to
-    /// stop monitoring that row's address.
     #[test]
     fn removing_an_address_should_ask_the_pane() {
         let mut harness = harness();
@@ -2172,8 +1970,6 @@ mod tests {
         );
     }
 
-    /// A list that shrank gives up the controls of the rows it no longer shows: a control
-    /// left behind would draw over whatever row takes that place, and keep its value slots.
     #[test]
     fn a_shrunk_address_list_should_release_the_controls_it_no_longer_shows() {
         let mut harness = harness();
@@ -2207,8 +2003,6 @@ mod tests {
         );
     }
 
-    /// The row controls are static copy: a language switch rebuilds them in the language
-    /// showing now (a kit button's accessible name is chosen when it is built).
     #[test]
     fn the_row_controls_should_follow_the_language() {
         let mut harness = harness();
@@ -2246,8 +2040,6 @@ mod tests {
         );
     }
 
-    /// Reading the addresses is announced: the spinner is a progress indicator with the
-    /// loading sentence as its name, not a decorative graphic a screen reader skips.
     #[test]
     fn a_loading_address_list_should_be_announced_as_a_progress() {
         let mut harness = harness();
@@ -2269,8 +2061,6 @@ mod tests {
         );
     }
 
-    /// The dialog's static copy follows the language: the buttons are rebuilt and the rich
-    /// stand-ins are parsed again in the language showing now.
     #[test]
     fn a_dialog_should_follow_the_language() {
         let mut harness = harness();
@@ -2331,8 +2121,6 @@ mod tests {
         );
     }
 
-    /// A dialog with no stream offers the recovery the pane itself offers, and runs it
-    /// when it is clicked.
     #[test]
     fn a_dialog_without_a_stream_should_offer_the_panes_recovery() {
         let mut harness = harness();

@@ -1,20 +1,3 @@
-//! HTTP Range resumable downloads.
-//!
-//! A download streams into `{file_name}.part` beside its destination and is
-//! renamed into place only after its final size has arrived. The partial file is
-//! the resume point: the next attempt asks for the bytes after its current
-//! length, and the server answers with only those when the entity validator it
-//! was asked about still describes the bytes the partial file holds.
-//!
-//! That resume point is only ever a task's own paused transfer. A fresh download
-//! truncates whatever partial file it finds instead of continuing it, because a
-//! file this task did not write cannot be vouched for.
-//!
-//! Neither request follows redirects itself: the transport's client is built
-//! with `Policy::none()` so that every hop is resolved against the configured
-//! route. The hops are followed here, one at a time, and the budget for them is
-//! the operation class's own.
-
 use std::{
     io,
     path::Path,
@@ -42,15 +25,9 @@ use crate::{
     request::DownloadRequest,
 };
 
-/// The entity validator a partial download is conditional on.
-///
-/// A validator is what makes a resume safe: the server sends the rest only when
-/// the entity it serves is still the one the partial file was taken from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Validator {
-    /// The entity's `ETag`.
     Etag(SmolStr),
-    /// The entity's `Last-Modified` time.
     LastModified(SmolStr),
 }
 
@@ -62,22 +39,6 @@ impl Validator {
     }
 }
 
-/// Downloads `request` into its destination and returns the final file size.
-///
-/// The partial file is the resume point: it is kept on a failure or a
-/// cancellation, replaced into the destination only after the last byte arrives.
-/// `validator` remembers the entity's `ETag`/`Last-Modified` between attempts, so
-/// a resume can ask the server whether its bytes still describe the same entity.
-///
-/// `fresh` decides what the partial file means to this attempt. A fresh attempt
-/// ignores it: the file is truncated, the transfer starts from zero and no
-/// `Range` is asked for. Only a task continuing its own paused or failed transfer
-/// passes `false`.
-///
-/// `progress` is where the transfer records what it has written: the bytes it
-/// resumes at and the size of the entity as soon as the partial file is open, then
-/// the bytes it writes. It runs on the task driving the transfer, so it must not
-/// block; the manager publishes what it records there once an interval.
 pub(crate) async fn download(
     transport: &TransportHub,
     config: &Config,
@@ -100,8 +61,6 @@ pub(crate) async fn download(
     )
     .await;
     if let Err(error) = &outcome {
-        // The typed failure is what the interface draws; the error itself is
-        // recorded here so the transport and file-system cause is not lost.
         log::debug!(
             "the download to {:?} failed ({:?}): {error:?}",
             request.destination,
@@ -112,7 +71,6 @@ pub(crate) async fn download(
     outcome
 }
 
-/// One attempt at the transfer; the caller reduces its error to a failure.
 async fn attempt(
     transport: &TransportHub,
     config: &Config,
@@ -138,11 +96,9 @@ async fn attempt(
             .map_err(DownloadError::Io)?;
     }
 
-    // A fresh download never inherits bytes from a file it did not write.
     let mut offset = if fresh { 0 } else { part_length(&part).await? };
     if let Some(expected) = request.expected_size {
         if offset == expected {
-            // The bytes are already on disk: no request can add anything.
             if offset == 0 {
                 File::create(&part).await.map_err(DownloadError::Io)?;
             }
@@ -159,8 +115,6 @@ async fn attempt(
     }
 
     let mut file = if fresh {
-        // Whatever was on disk is not this attempt's resume point, so it is
-        // truncated rather than appended to.
         File::create(&part).await.map_err(DownloadError::Io)?
     } else {
         open_part(&part, &mut offset).await?
@@ -175,8 +129,6 @@ async fn attempt(
     let mut followed = 0_usize;
 
     let mut response = loop {
-        // Every hop is resolved again: a redirect may cross both hosts and
-        // routes, and the route is what the user chose for the destination.
         let route = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(DownloadError::Cancelled),
@@ -207,8 +159,6 @@ async fn attempt(
         };
 
         let status = response.status();
-        // `304 Not Modified` is a redirection by status code alone and names no
-        // destination; nothing here asks a conditional question, so it is final.
         if !status.is_redirection() || status == StatusCode::NOT_MODIFIED {
             break response;
         }
@@ -222,18 +172,11 @@ async fn attempt(
 
     let body_length = response.content_length();
     let status = response.status();
-    // The range a partial response names, kept for the length check after the
-    // body ends: it is the only length the response promises when no total is
-    // known.
     let mut partial_range = None;
     let total = match status {
         StatusCode::OK => {
-            // The server sent the whole entity, so the bytes already in the
-            // partial file are not where this response starts.
             if offset > 0 {
                 offset = 0;
-                // An append handle cannot be shortened on Windows, so a restart
-                // opens a new, truncated file rather than truncating this one.
                 drop(file);
                 file = File::create(&part).await.map_err(DownloadError::Io)?;
             }
@@ -257,8 +200,6 @@ async fn attempt(
                     actual: range.start,
                 }));
             }
-            // A body that is not the length its range names is not the bytes that
-            // were asked for, even when it arrives without a transfer error.
             if let Some(announced) = body_length
                 && announced != range.length()
             {
@@ -275,8 +216,6 @@ async fn attempt(
                 .or(body_length.map(|length| offset.saturating_add(length)))
         }
         StatusCode::RANGE_NOT_SATISFIABLE => {
-            // The partial file is longer than the entity; the next attempt has
-            // to start over, which is only possible from an empty partial file.
             drop(file);
             File::create(&part).await.map_err(DownloadError::Io)?;
             return Err(DownloadError::Range(RangeFailure::Unsatisfiable));
@@ -284,9 +223,6 @@ async fn attempt(
         _ => return Err(DownloadError::Status { status }),
     };
 
-    // The class budget bounds what this download may ever hold, whatever the
-    // caller knew and whatever the server announced. A partial file of a refusal
-    // could never be completed, so it is removed rather than kept for a resume.
     if body_length.is_some_and(|length| length > size_limit)
         || total.is_some_and(|total| total > size_limit)
     {
@@ -302,8 +238,6 @@ async fn attempt(
         let chunk = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                // The bytes already written are the resume point, so they stay
-                // and the partial file is not removed.
                 let _ = file.flush().await;
                 return Err(DownloadError::Cancelled);
             }
@@ -316,8 +250,6 @@ async fn attempt(
         if let Some(expected) = request.expected_size
             && written > expected
         {
-            // More than the caller knows the file to be: the partial file can
-            // only be wrong, and a resume from it would be wrong too.
             drop(file);
             let _ = File::create(&part).await;
             return Err(DownloadError::SizeMismatch {
@@ -328,9 +260,6 @@ async fn attempt(
         if let Some(range) = partial_range
             && written > range.end.saturating_add(1)
         {
-            // The body has already passed the last byte its range names, so the
-            // bytes past it cannot be part of the entity: the partial file is
-            // emptied rather than kept as a resume point.
             drop(file);
             let _ = File::create(&part).await;
             return Err(DownloadError::Range(RangeFailure::BodyMismatch {
@@ -339,7 +268,6 @@ async fn attempt(
             }));
         }
         if written > size_limit {
-            // A body that announced no length can still outgrow the budget.
             drop(file);
             let _ = tokio::fs::remove_file(&part).await;
             return Err(DownloadError::TooLarge { limit: size_limit });
@@ -352,8 +280,6 @@ async fn attempt(
     if let Some(expected) = total
         && written != expected
     {
-        // A short read leaves the partial file as the resume point; there is
-        // nothing to gain by throwing away the bytes that did arrive.
         return Err(DownloadError::SizeMismatch {
             expected,
             actual: written,
@@ -362,11 +288,6 @@ async fn attempt(
     if let Some(range) = partial_range
         && written != range.end.saturating_add(1)
     {
-        // A partial response promises exactly the bytes its range names. This is
-        // the only length check when the server named no total, and the range
-        // still has to match when it named one. An overlong body was refused
-        // while it streamed, so what is left here stopped early: the bytes that
-        // did arrive stay as the resume point.
         return Err(DownloadError::Range(RangeFailure::BodyMismatch {
             expected: range.length(),
             actual: written.saturating_sub(offset),
@@ -378,7 +299,6 @@ async fn attempt(
     Ok(written)
 }
 
-/// The length of an existing partial file.
 async fn part_length(part: &Path) -> Result<u64, DownloadError> {
     match tokio::fs::metadata(part).await {
         Ok(metadata) => Ok(metadata.len()),
@@ -387,7 +307,6 @@ async fn part_length(part: &Path) -> Result<u64, DownloadError> {
     }
 }
 
-/// Opens the partial file at `offset`, resetting `offset` when it has vanished.
 async fn open_part(part: &Path, offset: &mut u64) -> Result<File, DownloadError> {
     match *offset {
         0 => File::create(part).await.map_err(DownloadError::Io),
@@ -402,7 +321,6 @@ async fn open_part(part: &Path, offset: &mut u64) -> Result<File, DownloadError>
     }
 }
 
-/// Where a redirect response points, or why it cannot be followed.
 fn redirect_target(
     current: &Url,
     location: Option<&str>,
@@ -415,8 +333,6 @@ fn redirect_target(
     if followed >= limit {
         return Err(DownloadError::Redirect(RedirectFailure::HopLimit));
     }
-    // A relative location is resolved against the URL that was asked for, not
-    // against the origin: release assets are siblings of the metadata.
     let next = current
         .join(location)
         .map_err(|_| DownloadError::Redirect(RedirectFailure::MalformedLocation))?;
@@ -430,30 +346,19 @@ fn redirect_target(
     Ok(next)
 }
 
-/// A parsed `Content-Range` byte range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ContentRange {
-    /// The first byte of the entity the response body carries.
     start: u64,
-    /// The last byte of the entity the response body carries.
     end: u64,
-    /// The length of the whole entity, when the server knows it.
     total: Option<u64>,
 }
 
 impl ContentRange {
-    /// The number of bytes the range covers.
     fn length(self) -> u64 {
         self.end.saturating_sub(self.start).saturating_add(1)
     }
 }
 
-/// The byte range a `Content-Range` header describes.
-///
-/// Only the `bytes` unit is a byte range this client can use; the unit is
-/// case-insensitive, and a range that names no bytes or names an end beyond the
-/// entity is not a range at all. `bytes */<total>` is the unsatisfied-range form,
-/// which names no bytes, so it is not one either.
 fn content_range(value: &str) -> Option<ContentRange> {
     let (unit, range) = value.trim().split_once(char::is_whitespace)?;
     if !unit.eq_ignore_ascii_case("bytes") {
@@ -479,11 +384,6 @@ fn content_range(value: &str) -> Option<ContentRange> {
     Some(ContentRange { start, end, total })
 }
 
-/// The validator the response names, if it names one that can condition a range.
-///
-/// The entity tag is preferred: it identifies the exact bytes, where the
-/// modification time only bounds them. A weak entity tag is not one to resume
-/// with — it does not promise the bytes are unchanged — so it is ignored.
 fn response_validator(response: &Response) -> Option<Validator> {
     if let Some(etag) = header(response, ETAG)
         && !etag
@@ -496,7 +396,6 @@ fn response_validator(response: &Response) -> Option<Validator> {
     header(response, LAST_MODIFIED).map(|value| Validator::LastModified(SmolStr::new(value)))
 }
 
-/// The validator that a resume has to be conditional on.
 fn current_validator(slot: &Mutex<Option<Validator>>) -> Option<Validator> {
     match slot.lock() {
         Ok(current) => current.clone(),
@@ -504,8 +403,6 @@ fn current_validator(slot: &Mutex<Option<Validator>>) -> Option<Validator> {
     }
 }
 
-/// Remembers the validator the response named; a response naming none leaves the
-/// previous one in place, because it is still the last known entity.
 fn store_validator(slot: &Mutex<Option<Validator>>, response: &Response) {
     let Some(next) = response_validator(response) else {
         return;
@@ -516,13 +413,10 @@ fn store_validator(slot: &Mutex<Option<Validator>>, response: &Response) {
     }
 }
 
-/// The header as text, when it is present and printable.
 fn header(response: &Response, name: reqwest::header::HeaderName) -> Option<&str> {
     response.headers().get(name)?.to_str().ok()
 }
 
-/// Removes an existing destination and renames the completed partial file into
-/// its place.
 async fn replace_file(part: &Path, destination: &Path) -> Result<(), DownloadError> {
     match tokio::fs::remove_file(destination).await {
         Ok(()) => {}
@@ -574,15 +468,10 @@ mod tests {
         test_support::test_handle,
     };
 
-    /// How much of a paced payload each frame carries.
     const FRAME: usize = 16 * 1024;
-    /// How long a paced server waits between frames.
     const PACE: Duration = Duration::from_millis(25);
-    /// A `Content-Length` one byte past the updater download budget.
     const OVERSIZED: u64 = 1024 * 1024 * 1024 + 1;
 
-    /// The bytes a test downloads, different at every offset so a misplaced
-    /// resume is visible.
     fn payload(length: usize) -> Bytes {
         Bytes::from(
             (0..length)
@@ -591,11 +480,6 @@ mod tests {
         )
     }
 
-    /// A response body the test server hands out one frame at a time.
-    ///
-    /// The pause between frames is what makes a transfer observably in flight;
-    /// without it the whole payload reaches the kernel at once and there is
-    /// nothing left to interrupt.
     struct TestBody {
         frames: VecDeque<Frame<Bytes>>,
         pace: Duration,
@@ -635,7 +519,6 @@ mod tests {
             }
         }
 
-        /// A body that announces `length` bytes but sends only `bytes` of them.
         fn announcing(bytes: Bytes, length: u64, pace: Duration) -> Self {
             let mut body = Self::paced(bytes, pace);
             body.length = length;
@@ -678,7 +561,6 @@ mod tests {
         }
     }
 
-    /// One request the test server answered, reduced to what a download sets.
     #[derive(Clone, Debug)]
     struct Recorded {
         path: String,
@@ -687,18 +569,13 @@ mod tests {
         accept_encoding: Option<String>,
     }
 
-    /// How a partial response without a `Content-Length` fills the range it names.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ChunkedRange {
-        /// The body stops one byte before the range ends.
         Short,
-        /// The body carries one byte past the range.
         Long,
-        /// The body is exactly the range.
         Exact,
     }
 
-    /// The state a test server answers from.
     struct Server {
         payload: Bytes,
         honor_ranges: bool,
@@ -722,31 +599,26 @@ mod tests {
             }
         }
 
-        /// A server that always answers with the whole entity, ignoring `Range`.
         fn ignoring_ranges(mut self) -> Self {
             self.honor_ranges = false;
             self
         }
 
-        /// A server that names an `ETag` and honors `If-Range` against it.
         fn with_etag(mut self, etag: &'static str) -> Self {
             self.etag = Some(etag);
             self
         }
 
-        /// A server that names a `Last-Modified` time instead of an `ETag`.
         fn with_last_modified(mut self, last_modified: &'static str) -> Self {
             self.last_modified = Some(last_modified);
             self
         }
 
-        /// A server whose partial response names a range it does not fill.
         fn with_bad_range(mut self) -> Self {
             self.bad_range = true;
             self
         }
 
-        /// A server whose partial response announces no `Content-Length`.
         fn with_chunked_range(mut self, chunked_range: ChunkedRange) -> Self {
             self.chunked_range = Some(chunked_range);
             self
@@ -785,8 +657,6 @@ mod tests {
                     None,
                     TestBody::announcing(payload(2 * FRAME), OVERSIZED, PACE),
                 ),
-                // No length is announced, so only the bytes themselves can show
-                // that the body outgrows its budget.
                 "/chunked" => Response::builder()
                     .status(StatusCode::OK)
                     .header(TRANSFER_ENCODING, "chunked")
@@ -822,15 +692,12 @@ mod tests {
                     return self.chunked_response(start, chunked_range);
                 }
                 let remaining = self.payload.slice(start as usize..);
-                // A paced response is paced whatever it carries, so a resumed
-                // transfer is observably in flight like a fresh one.
                 let body = if paced {
                     TestBody::paced(remaining, PACE)
                 } else {
                     TestBody::whole(remaining)
                 };
                 let end = if self.bad_range {
-                    // A range that names fewer bytes than the body carries.
                     start + 31
                 } else {
                     length - 1
@@ -851,8 +718,6 @@ mod tests {
             self.reply(StatusCode::OK, None, body)
         }
 
-        /// A `206` that announces no `Content-Length` and names no total, as a
-        /// server streaming an unknown-length entity does.
         fn chunked_response(&self, start: u64, chunked_range: ChunkedRange) -> Response<TestBody> {
             let length = self.payload.len() as u64;
             let end = length - 1;
@@ -873,7 +738,6 @@ mod tests {
                 .expect("the chunked partial response is well formed")
         }
 
-        /// A `206` for a request that named no range.
         fn unsolicited_partial_response(&self) -> Response<TestBody> {
             let length = self.payload.len() as u64;
             Response::builder()
@@ -884,7 +748,6 @@ mod tests {
                 .expect("the unsolicited partial response is well formed")
         }
 
-        /// A `206` whose total is past the download class's budget.
         fn oversized_range_response(&self, range: Option<&str>) -> Response<TestBody> {
             let start = range
                 .and_then(requested_start)
@@ -920,7 +783,6 @@ mod tests {
         }
     }
 
-    /// The first byte a `Range` request asks for.
     fn requested_start(value: &str) -> Option<u64> {
         value
             .strip_prefix("bytes=")?
@@ -945,7 +807,6 @@ mod tests {
             .map(str::to_owned)
     }
 
-    /// Starts a server answering `server` on a loopback port.
     async fn spawn(server: Arc<Server>) -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -972,7 +833,6 @@ mod tests {
         address
     }
 
-    /// The transport a download goes through, over loopback.
     fn transport() -> TransportHub {
         TransportHub::new(TransportPolicy {
             allow_plaintext: true,
@@ -999,10 +859,6 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
-    /// Cancels `cancellation` once `reached` holds for the transfer's progress.
-    ///
-    /// The transfer has no callback a test can hook, so watching the progress it
-    /// records is how a test stops it at a state it wants to observe.
     fn cancel_when(
         progress: &Arc<Progress>,
         cancellation: &CancellationToken,
@@ -1037,10 +893,6 @@ mod tests {
             .expect("the path can be inspected")
     }
 
-    /// A temporary directory and the two paths one download owns inside it.
-    ///
-    /// The directory is returned so the caller keeps it alive for the test; the
-    /// paths inside it are what a download is given.
     fn downloading() -> (TempDir, PathBuf, PathBuf) {
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
@@ -1107,9 +959,6 @@ mod tests {
         );
     }
 
-    /// A destination whose directories do not exist yet is written into a tree created for it:
-    /// the default model directory of a fresh installation is not there before the first
-    /// download.
     #[tokio::test]
     async fn a_download_should_create_the_directories_its_destination_names() {
         let payload = payload(32 * 1024);
@@ -1154,8 +1003,6 @@ mod tests {
         );
     }
 
-    /// A directory that cannot be created is a failed download, and no request is made for a
-    /// file that has nowhere to go.
     #[tokio::test]
     async fn a_destination_directory_that_cannot_be_created_should_fail_before_the_request() {
         let payload = payload(1024);
@@ -1257,9 +1104,6 @@ mod tests {
         );
     }
 
-    /// The resume point and the size of the entity are announced as soon as the
-    /// partial file is open, so the first interval a resume is published at
-    /// already knows where the bytes are being added to.
     #[tokio::test]
     async fn a_transfer_should_announce_its_resume_point_before_it_reads_the_body() {
         let payload = payload(192 * 1024);
@@ -1806,8 +1650,6 @@ mod tests {
         );
     }
 
-    /// A weak entity tag does not promise the bytes are unchanged, so a resume
-    /// must not be conditional on it.
     #[tokio::test]
     async fn a_weak_etag_should_not_make_a_resume_conditional() {
         let payload = payload(96 * 1024);
@@ -1875,7 +1717,6 @@ mod tests {
         assert_eq!(file_content(&destination).await, payload.to_vec());
     }
 
-    /// The modification time is the validator a weak entity tag leaves usable.
     #[tokio::test]
     async fn a_modification_time_should_make_a_resume_conditional() {
         let last_modified = "Wed, 21 Oct 2015 07:28:00 GMT";
@@ -1942,8 +1783,6 @@ mod tests {
         assert_eq!(file_content(&destination).await, payload.to_vec());
     }
 
-    /// A response that announces more than its class allows is refused before it
-    /// is read, so no oversized file is ever written.
     #[tokio::test]
     async fn a_download_past_its_class_budget_is_refused_before_it_is_read() {
         let server = Arc::new(Server::new(payload(1024)));
@@ -1982,8 +1821,6 @@ mod tests {
         assert!(!exists(&destination).await);
     }
 
-    /// A body that announces no length can still outgrow the budget while it
-    /// streams, so the bytes themselves have to stop it.
     #[tokio::test]
     async fn a_streamed_body_past_its_class_budget_is_refused() {
         let server = Arc::new(Server::new(payload(1024)));
@@ -1993,8 +1830,6 @@ mod tests {
         let config = Config::default();
         let runtime = test_handle();
         let mut request = request(address, "/chunked", &destination, None);
-        // The smallest budget stands in for a body that grows past its class
-        // limit without announcing a length.
         request.class = HttpClientClass::UpdaterMetadata;
 
         let outcome = download(
@@ -2023,8 +1858,6 @@ mod tests {
         );
     }
 
-    /// A partial response whose body is not the length of the range it names is
-    /// not the bytes that were asked for.
     #[tokio::test]
     async fn a_partial_response_that_contradicts_its_range_is_refused() {
         let payload = payload(64 * 1024);
@@ -2070,8 +1903,6 @@ mod tests {
         }
     }
 
-    /// A fresh download never continues a partial file it did not write: it
-    /// truncates the file and asks for the whole entity.
     #[tokio::test]
     async fn a_fresh_download_ignores_the_part_it_finds_and_asks_for_everything() {
         let payload = payload(96 * 1024);
@@ -2115,8 +1946,6 @@ mod tests {
         );
     }
 
-    /// A fresh transfer names no range, so a `206` is a partial response nobody
-    /// asked for; the stale partial file is still discarded rather than resumed.
     #[tokio::test]
     async fn a_fresh_download_refuses_an_unsolicited_partial_response() {
         let payload = payload(64 * 1024);
@@ -2163,8 +1992,6 @@ mod tests {
         );
     }
 
-    /// Without a `Content-Length` or a total, the range itself is the length the
-    /// body has to fill; a body that stops early keeps the bytes that arrived.
     #[tokio::test]
     async fn a_chunked_partial_response_that_stops_early_keeps_the_part() {
         let payload = payload(128 * 1024);
@@ -2217,8 +2044,6 @@ mod tests {
         );
     }
 
-    /// A partial body may also outrun its range; those bytes cannot belong to the
-    /// entity, so the partial file is emptied instead of resumed.
     #[tokio::test]
     async fn a_chunked_partial_response_that_runs_long_drops_the_part() {
         let payload = payload(128 * 1024);
@@ -2265,7 +2090,6 @@ mod tests {
         assert!(!exists(&destination).await);
     }
 
-    /// The range is enough to accept a body when the server names no total.
     #[tokio::test]
     async fn a_chunked_partial_response_that_fills_its_range_completes() {
         let payload = payload(128 * 1024);
@@ -2299,8 +2123,6 @@ mod tests {
         assert!(!exists(&part).await);
     }
 
-    /// A partial response that names a total past the class budget is refused
-    /// before any of its body is read.
     #[tokio::test]
     async fn a_chunked_partial_response_past_its_class_budget_is_refused() {
         let server = Arc::new(Server::new(payload(1024)));

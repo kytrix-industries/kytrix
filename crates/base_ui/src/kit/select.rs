@@ -1,56 +1,3 @@
-//! 选择器（P2-4c：旧 `crate::select` 的引擎化重建 + 多选 / 标签）。
-//!
-//! 旧 `Select` 是 `Dropdown` 的一层薄包装：把选中项的 label（可选图标）画进触发器、画一个随 open
-//! 状态旋转的 caret，菜单条目点击时写回选中并回调 `on_change`。新实现沿用同一结构，但把
-//! **选中态、多选、清空、标签**都落在引擎信号上：
-//!
-//! ```text
-//! 触发器（Interactive）: [标签 / 文本] [清空 X] [caret]
-//! 面板（ItemPanel, ListBox 语义）: 选项行 = 文本 + 勾选标记
-//! ```
-//!
-//! # 单选 / 多选
-//!
-//! - 单选（`multiple(false)`，默认）：点击 / 回车选中一行、回调、关闭面板（旧语义）；
-//!   **重复选中同一项不回调**（旧实现的同 id 过滤），面板照常关闭；
-//! - 多选（`multiple(true)`）：点击 / 回车切换一行的选中态，**面板不关**（继续勾选），
-//!   选中集在触发器上以标签展示（[`SelectOptions::max_tags`] 个，超出显示 `+N`）。
-//!
-//! # 图标 / 宽度
-//!
-//! - 条目支持图标（旧 `Select` 的条目是 `MenuItem`，可带 `IconAction`）；单选选中后触发器
-//!   画出选中项图标（多选画首项图标）；
-//! - 面板宽度默认对齐触发器实测宽，但它是**下限**：内容更宽时面板长到内容宽（旧 `min_w` 口径）；
-//!   显式 [`SelectOptions::width`] 时面板按该值**精确**宽（旧 `menu_width` 语义，不随内容增长）。
-//!
-//! 标签的视觉与 [`crate::kit::badge`] 的中性色块同源（`SurfaceControl` 底 / `LineBorder` 边 /
-//! `FgDefault` 字 / 4 px 圆角 / 尺寸档高度）。P2-9 起 `Badge` 有 `bind_label` 绑定面，但标签槽
-//! 的选中项下标映射（`chosen[slot]` → `items`）不是单个信号，替换成 Badge 只会把同一段
-//! `bind_text` 挪进 kit（视觉等价已由测试守护）；本批保留现有实现，登记见 ledger。
-//!
-//! # tooltip（P2-9）
-//!
-//! [`Select::tooltip_text`] 保存 hover 说明的文案（W2c-R1 的 kit 能力缺口：旧 `Select` 有
-//! tooltip 参数，引擎化后没有入口）。选择器不自己画浮层 —— kit 的 [`crate::kit::tooltip`] 是
-//! 独立组件、按触发器节点挂载；调用方用 [`Select::tooltip`] 读出文案后自己建 Tooltip。
-//!
-//! # 键盘 / 关闭
-//!
-//! 触发器上 `↓` / `↑` 打开面板；面板内 `↑` / `↓` / `Home` / `End` 移动高亮、`Enter` / `Space`
-//! 切换 / 选中、`Esc` 关闭（引擎默认 `Action::Dismiss`）、点击外部关闭（浮层 `OutsideClick`）。
-//!
-//! # 搜索过滤
-//!
-//! 旧实现**没有**搜索框（评估 §1.6），本批不新增（AGENTS §1.2：不做没有实际需求的扩展点）；
-//! 需要搜索时由调用方用 `set_items` 过滤后重设条目。登记见 spec-delta。
-//!
-//! # a11y
-//!
-//! 引擎没有 `ComboBox` / `ListBox` 角色：触发器用 `Button`（可访问名 = 显式 label / 选中项文本 /
-//! 多选摘要 `首项 +N` / 占位文本，随选中失效），展开态走 `aria-expanded`；面板行 `ListBoxOption`，
-//! 集合语义由内层 E9 虚拟列表容器（恒 `List`）承担 —— 包装**不**重复声明 `List`（双 List 会让 AT
-//! 读到「列表套列表」）。角色缺位与虚拟容器行 a11y 快照登记引擎批 E15（spec-delta）。
-
 use std::{
     cell::{Cell, RefCell},
     fmt,
@@ -93,29 +40,19 @@ use crate::{
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 
-/// 标签圆角（与 `kit::badge` 一致的 4 px）。
 const TAG_RADIUS: f32 = 4.0;
-/// 标签之间的间隙（逻辑像素）。
 const TAG_GAP: f32 = 4.0;
-/// 勾选标记列宽（逻辑像素，保留列宽以保证行对齐）。
 const CHECK_COLUMN: f32 = 14.0;
 
-/// 选择项。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectItem {
-    /// 条目 id（回调里报告给调用方）。
     pub id: SmolStr,
-    /// 显示文本（同时是可访问名）。
     pub label: SmolStr,
-    /// 条目图标（旧 `Select` 的条目就是 `MenuItem`，支持 `IconAction`）；有图标时整列留槽，
-    /// 单选选中后触发器也画该图标。
     pub icon: Option<IconKind>,
-    /// 禁用（点击不选中）。
     pub disabled: bool,
 }
 
 impl SelectItem {
-    /// 选项。
     #[must_use]
     pub fn new(id: impl Into<SmolStr>, label: impl Into<SmolStr>) -> Self {
         Self {
@@ -126,14 +63,12 @@ impl SelectItem {
         }
     }
 
-    /// 图标。
     #[must_use]
     pub fn icon(mut self, icon: IconKind) -> Self {
         self.icon = Some(icon);
         self
     }
 
-    /// 禁用。
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
@@ -141,31 +76,18 @@ impl SelectItem {
     }
 }
 
-/// 选择器参数。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectOptions {
-    /// 尺寸档。
     pub size: UnifiedSize,
-    /// 触发器视觉变体。
     pub variant: InteractiveVariant,
-    /// 面板宽度（`None` = 对齐触发器实测宽度、内容更宽时长到内容宽；`Some` = 精确宽度，
-    /// 不随内容增长）。
     pub width: Option<f32>,
-    /// 面板最大高度。
     pub max_height: f32,
-    /// 面板定位。
     pub placement: Placement,
-    /// 与触发器的间隙。
     pub gap: f32,
-    /// 触发器可访问名（`None` 用选中文本 / 占位）。
     pub label: Option<SmolStr>,
-    /// 空选中时的占位文本。
     pub placeholder: SmolStr,
-    /// 是否多选。
     pub multiple: bool,
-    /// 是否显示清空按钮。
     pub clearable: bool,
-    /// 多选标签个数上限（超出用 `+N` 表示）。
     pub max_tags: usize,
 }
 
@@ -188,70 +110,60 @@ impl Default for SelectOptions {
 }
 
 impl SelectOptions {
-    /// 尺寸档。
     #[must_use]
     pub fn size(mut self, size: UnifiedSize) -> Self {
         self.size = size;
         self
     }
 
-    /// 触发器变体。
     #[must_use]
     pub fn variant(mut self, variant: InteractiveVariant) -> Self {
         self.variant = variant;
         self
     }
 
-    /// 显式面板宽度（精确宽度，不随内容增长）。
     #[must_use]
     pub fn width(mut self, width: f32) -> Self {
         self.width = Some(width);
         self
     }
 
-    /// 面板最大高度。
     #[must_use]
     pub fn max_height(mut self, max_height: f32) -> Self {
         self.max_height = max_height;
         self
     }
 
-    /// 面板定位。
     #[must_use]
     pub fn placement(mut self, placement: Placement) -> Self {
         self.placement = placement;
         self
     }
 
-    /// 占位文本。
     #[must_use]
     pub fn placeholder(mut self, placeholder: impl Into<SmolStr>) -> Self {
         self.placeholder = placeholder.into();
         self
     }
 
-    /// 触发器可访问名。
     #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
         self
     }
 
-    /// 多选。
     #[must_use]
     pub fn multiple(mut self, multiple: bool) -> Self {
         self.multiple = multiple;
         self
     }
 
-    /// 显示清空按钮。
     #[must_use]
     pub fn clearable(mut self, clearable: bool) -> Self {
         self.clearable = clearable;
         self
     }
 
-    /// 多选标签上限。
     #[must_use]
     pub fn max_tags(mut self, max_tags: usize) -> Self {
         self.max_tags = max_tags.max(1);
@@ -259,7 +171,6 @@ impl SelectOptions {
     }
 }
 
-/// 选择器（`Rc` 浅拷贝）。
 #[derive(Clone)]
 pub struct Select {
     inner: Rc<SelectInner>,
@@ -270,13 +181,10 @@ struct SelectState {
     window: Option<WindowId>,
     trigger: Option<NodeId>,
     trigger_width: f32,
-    /// 上次写进标签槽的选中集（变化时才重排显示，I3）。
     tags_written: Vec<usize>,
     slots: Vec<Option<NodeId>>,
     overflow: Option<NodeId>,
-    /// 触发器前导图标节点（当前选中项有图标时显示）。
     trigger_icon: Option<NodeId>,
-    /// 当前图标节点上的图标（`None` = 尺寸 0 的占位）。
     icon_shown: Option<IconKind>,
 }
 
@@ -291,19 +199,14 @@ struct SelectInner {
     key: SmolStr,
     theme: ThemeHandle,
     options: SelectOptions,
-    /// 本组件自有的信号作用域（`a11y_label` / `revision` / `chosen` 三个信号归属它；
-    /// [`Select::release`] 一次回收，动态创建 / 销毁的选择器因此不泄漏槽位）。
     scope: SignalScope,
     trigger: Interactive,
     panel: ItemPanel,
     icons: IconCache,
     items: Rc<RefCell<Rc<Vec<SelectItem>>>>,
-    /// 条目内容修订号（`set_items` 自增；`bind_text` 读它触发重算）。
     revision: Signal<u64>,
     chosen: Signal<Vec<usize>>,
-    /// 触发器可访问名（显式 label / 选中项文本 / 多选摘要 / 占位文本）。
     a11y_label: Signal<SmolStr>,
-    /// tooltip 文本（P2-9：W2c-R1 的 kit 能力面；hover 浮层由调用方用 `kit::tooltip` 挂）。
     tooltip: RefCell<Option<SmolStr>>,
     on_change: RefCell<Option<Rc<dyn Fn(&mut App, Vec<SmolStr>)>>>,
     actions: SelectActions,
@@ -311,7 +214,6 @@ struct SelectInner {
 }
 
 impl Select {
-    /// 建选择器（关闭态）。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -338,14 +240,10 @@ impl Select {
                 placement: options.placement,
                 gap: options.gap,
                 roles: PanelRoles {
-                    // 包装不声明 `List`：内层 E9 虚拟列表容器已经恒为 `List`（双 List 会被
-                    // AT 读成「列表套列表」）；`ListBox` 角色引擎尚未提供（E15 登记）。
                     panel: None,
                     row: A11yRole::ListBoxOption,
                 },
                 label: options.label.clone(),
-                // 显式 `width` = 精确宽度（旧 `menu_width` 语义，审查 F24）；未给宽时按触发器
-                // 下限对齐、内容更宽时长到内容宽。
                 width: if options.width.is_some() {
                     PanelWidth::Exact
                 } else {
@@ -395,37 +293,31 @@ impl Select {
         select
     }
 
-    /// 选择器键（调试 id / 动作前缀）。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 
-    /// 触发器节点（`build` 之后）。
     #[must_use]
     pub fn trigger_node(&self) -> Option<NodeId> {
         self.inner.state.borrow().trigger
     }
 
-    /// 浮层面板节点（打开时）。
     #[must_use]
     pub fn panel_node(&self) -> Option<NodeId> {
         self.inner.panel.overlay().panel_node()
     }
 
-    /// 打开状态信号。
     #[must_use]
     pub fn open_state(&self) -> Signal<bool> {
         self.inner.panel.open_state()
     }
 
-    /// 是否打开。
     #[must_use]
     pub fn is_open(&self, app: &App) -> bool {
         self.inner.panel.is_open(app)
     }
 
-    /// 选中条目 id（按条目顺序）。
     #[must_use]
     pub fn chosen(&self, app: &App) -> Vec<SmolStr> {
         let items = self.inner.items.borrow();
@@ -437,37 +329,26 @@ impl Select {
         })
     }
 
-    /// 选中条目下标。
     #[must_use]
     pub fn chosen_indices(&self, app: &App) -> Vec<usize> {
         app.read_with(&self.inner.chosen, Vec::clone)
     }
 
-    /// 高亮行（面板打开时）。
     #[must_use]
     pub fn highlighted(&self, app: &App) -> Option<usize> {
         self.inner.panel.highlighted(app)
     }
 
-    /// 条目快照。
     #[must_use]
     pub fn items(&self) -> Rc<Vec<SelectItem>> {
         self.inner.items.borrow().clone()
     }
 
-    /// 占位符文案（空选中时触发器显示的那一句话；P2-11 读点，W7 G-READ）。
-    ///
-    /// 返回**配置值**（[`SelectOptions::placeholder`]），不是触发器当前渲染的文本：有选中条目
-    /// 时触发器显示的是条目标签（[`Select::chosen`] 是读选中项的正路）。构建前后都可读。
     #[must_use]
     pub fn placeholder_text(&self) -> SmolStr {
         self.inner.options.placeholder.clone()
     }
 
-    /// 换一批条目（选中集按 id 保留，找不到的丢弃）。
-    ///
-    /// # Errors
-    /// 引擎虚拟列表失效。
     pub fn set_items(
         &self,
         app: &mut App,
@@ -488,7 +369,6 @@ impl Select {
         self.inner.panel.set_content(app, self.panel_content(app))
     }
 
-    /// 程序化选中（`notify = false` 时不回调）。
     pub fn set_chosen<'a>(
         &self,
         app: &mut App,
@@ -508,7 +388,6 @@ impl Select {
         }
     }
 
-    /// 清空选中（回调一次）。
     pub fn clear(&self, app: &mut App) -> bool {
         if !app.write(&self.inner.chosen, Vec::new()) {
             return false;
@@ -518,46 +397,30 @@ impl Select {
         true
     }
 
-    /// 选中变化回调（用户操作；`set_chosen(..., false)` / `clear` 不触发）。
     pub fn on_change(self, callback: impl Fn(&mut App, Vec<SmolStr>) + 'static) -> Self {
         *self.inner.on_change.borrow_mut() = Some(Rc::new(callback));
         self
     }
 
-    /// tooltip 文本（hover 提示）。
-    ///
-    /// P2-9 补的 W2c-R1 缺口：旧 `Select` 有 tooltip 参数，引擎化后没有入口，筛选器的 hover
-    /// 说明只能删掉。选择器**不自己画浮层**（kit 的 tooltip 是独立组件、按触发器节点挂载），
-    /// 这里保存文案供调用方读取（[`Select::tooltip`]）；构建前后都可读、`mount` 不消费。
     pub fn tooltip_text(self, text: impl Into<SmolStr>) -> Self {
         *self.inner.tooltip.borrow_mut() = Some(text.into());
         self
     }
 
-    /// tooltip 文本读回（[`Select::tooltip_text`] 的原值；`None` = 未设置）。
     #[must_use]
     pub fn tooltip(&self) -> Option<SmolStr> {
         self.inner.tooltip.borrow().clone()
     }
 
-    /// 禁用 / 启用触发器。
     pub fn set_disabled(&self, app: &mut App, disabled: bool) -> bool {
         self.inner.trigger.set_disabled(app, disabled)
     }
 
-    /// 触发器是否禁用（P2-11 读点，W7 G-READ：头部「市场没加载时选择器应拒绝输入」的断言面）。
-    ///
-    /// 读的是触发器自己的禁用信号（[`Select::set_disabled`] 与构建期 `disabled` 的同一条真值），
-    /// 不是条目禁用态：单条目的 `SelectItem::disabled` 用 [`Select::items`] 读。
     #[must_use]
     pub fn is_disabled(&self, app: &App) -> bool {
         *app.read(&self.inner.trigger.disabled_signal())
     }
 
-    /// 建触发器节点（标签 / 文本 + 清空 + 箭头）。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode` / 图标资源错误。
     pub fn build(
         &self,
         app: &mut App,
@@ -582,7 +445,6 @@ impl Select {
         let key = self.inner.key.clone();
         let clear_action = self.inner.actions.clear.clone();
         let trigger_watch = trigger.clone();
-        // 触发器前导图标：当前选中项有图标时显示（旧 select 触发器画选中项图标）。
         let current_icon = self.selected_icon(app);
         self.inner.icons.resolve(
             app,
@@ -622,7 +484,6 @@ impl Select {
                     parent,
                 )?;
             icon_slot_inner.set(Some(icon));
-            // 文本（单选显示选中项；多选只在空选中时显示占位）。
             let theme_text = theme.clone();
             let text_placeholder = placeholder.clone();
             let text = NodeBuilder::text(
@@ -716,7 +577,6 @@ impl Select {
                     built.push(Some(chip));
                 }
                 *slots.borrow_mut() = built;
-                // `+N`（超出标签上限的选中数）。
                 let theme_overflow = theme.clone();
                 let overflow_text = NodeBuilder::text(
                     SmolStr::new_static(""),
@@ -755,7 +615,6 @@ impl Select {
                 )?;
                 overflow.set(Some(overflow_text));
             }
-            // 清空按钮（可见性由 `bind_style.visible` 按选中集切换）。
             if clearable {
                 let theme_clear = theme.clone();
                 let clear = NodeBuilder::boxed()
@@ -804,7 +663,6 @@ impl Select {
                 })
                 .build(tree, clear)?;
             }
-            // caret。
             let theme_caret = theme.clone();
             mount_dynamic_icon(
                 app,
@@ -832,10 +690,6 @@ impl Select {
         Ok(node)
     }
 
-    /// 接引擎：触发器上的 `↓` / `↑` 作用域键（必须在 `build` 之后）。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode`。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let Some(trigger) = self.inner.state.borrow().trigger else {
             return Ok(());
@@ -857,10 +711,6 @@ impl Select {
         Ok(())
     }
 
-    /// 一步完成 `build` + `attach`。
-    ///
-    /// # Errors
-    /// 同 [`Select::build`] / [`Select::attach`]。
     pub fn mount(
         &self,
         app: &mut App,
@@ -872,10 +722,6 @@ impl Select {
         Ok(node)
     }
 
-    /// 打开面板。
-    ///
-    /// # Errors
-    /// 浮层参数 / 引擎建树错误。
     pub fn open(&self, app: &mut App) -> Result<bool, OverlayError> {
         let (Some(window), Some(trigger)) = (
             self.inner.state.borrow().window,
@@ -911,20 +757,14 @@ impl Select {
         Ok(opened)
     }
 
-    /// 关闭面板。
     pub fn close(&self, app: &mut App) -> bool {
         self.inner.panel.close(app)
     }
 
-    /// 立即关闭面板。
     pub fn close_now(&self, app: &mut App) -> bool {
         self.inner.panel.close_now(app)
     }
 
-    /// 帧同步：触发器 / 选中项图标 / 标签槽 / 面板行 / 宽度对齐。
-    ///
-    /// # Errors
-    /// 引擎列表同步错误。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let mut changed = self.inner.trigger.sync(app)?;
         changed |= self.sync_trigger_a11y(app);
@@ -941,21 +781,10 @@ impl Select {
         Ok(changed)
     }
 
-    /// 转发平台事件（触发器按下态；行点击由引擎动作承担，不在这里补激活）。
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         self.inner.trigger.dispatch(app, event)
     }
 
-    /// 释放组件（触发器 / 面板 / 动作 handler / **本组件自有的信号作用域**）。
-    ///
-    /// 清理面：四个 Action handler（[`App::off_action`]）+ 触发器与面板（各自的 handler 与
-    /// 信号作用域）+ 本选择器铸造的作用域（`a11y_label` / `revision` / `chosen` 三个槽位，
-    /// W3c-F7 / W4a / W4b / W5a 的 `PICKER_SCOPE_GAP` / `SELECT_RELEASE_GAP` 缺口）。
-    ///
-    /// 返回被释放的槽位数；重复调用返回 0（幂等 —— 作用域已释放时 `App::release_scope`
-    /// 本身返回 0）。**先卸载节点再释放**：触发器上的 `bind_a11y` 读本作用域的 `a11y_label`，
-    /// 释放后一次求值就会读死句柄 panic（应用可用 `App::remove_node` /
-    /// `App::remove_node_with_scope` 保证顺序）。
     pub fn release(&self, app: &mut App) -> usize {
         for action in [
             &self.inner.actions.trigger_click,
@@ -968,8 +797,6 @@ impl Select {
         let released = self.inner.trigger.release(app) + self.inner.panel.release(app);
         released + app.release_scope(self.inner.scope)
     }
-
-    // ── 内部 ──
 
     fn panel_content(&self, app: &App) -> PanelContent {
         let items = self.inner.items.borrow().clone();
@@ -1100,7 +927,6 @@ impl Select {
         });
     }
 
-    /// 面板行激活：单选取值并关面板；多选切换并保持打开。
     fn activate_row(&self, app: &mut App, row: usize) {
         let item = self.inner.items.borrow().get(row).cloned();
         let Some(item) = item else {
@@ -1120,7 +946,6 @@ impl Select {
             chosen.sort_unstable();
             app.write(&self.inner.chosen, chosen);
         } else {
-            // 重复选中同一项不回调（旧 `select`：`id.ne(selected_id)` 过滤），但仍关闭面板。
             let unchanged = chosen.as_slice() == [row];
             app.write(&self.inner.chosen, vec![row]);
             self.sync_trigger_a11y(app);
@@ -1135,7 +960,6 @@ impl Select {
         self.notify(app);
     }
 
-    /// 触发器可访问名：显式 `label` 优先；否则 = 选中项文本（多选 = 首项 + `+N` 摘要）/ 占位文本。
     fn sync_trigger_a11y(&self, app: &mut App) -> bool {
         if self.inner.options.label.is_some() {
             return false;
@@ -1161,7 +985,6 @@ impl Select {
         app.write(&self.inner.a11y_label, next)
     }
 
-    /// 当前选中集的第一个图标（单选 = 选中项；多选 = 首项）。
     fn selected_icon(&self, app: &App) -> Option<IconKind> {
         let indices = self.chosen_indices(app);
         let first = *indices.first()?;
@@ -1172,7 +995,6 @@ impl Select {
             .and_then(|item| item.icon)
     }
 
-    /// 解析条目图标资源（行工厂拿不到 `App`，行内容建树读快照）。
     fn resolve_icons(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let size = self.inner.options.size.icon_size();
         let items = self.inner.items.borrow().clone();
@@ -1186,7 +1008,6 @@ impl Select {
         Ok(())
     }
 
-    /// 选中集变化 ⇒ 换触发器前导图标的资源与占位尺寸。
     fn sync_trigger_icon(&self, app: &mut App) -> Result<bool, EngineError> {
         let (Some(window), Some(node)) = (
             self.inner.state.borrow().window,
@@ -1226,7 +1047,6 @@ impl Select {
         Ok(changed)
     }
 
-    /// 选中集变化回调。
     fn notify(&self, app: &mut App) {
         if let Some(callback) = self.inner.on_change.borrow().clone() {
             let chosen = self.chosen(app);
@@ -1234,7 +1054,6 @@ impl Select {
         }
     }
 
-    /// 标签槽显示切换（选中集变化时写 `display`，其余帧不写 —— I3）。
     fn sync_tags(&self, app: &mut App) -> bool {
         let multiple = self.inner.options.multiple;
         if !multiple {
@@ -1315,7 +1134,6 @@ impl Select {
     }
 }
 
-/// 写一个节点的 `display`（标签槽显示切换；布局脏由 `set_style` 负责）。
 fn set_display(tree: &mut NodeTree, node: NodeId, display: Display) {
     if let Ok(target) = tree.get(node) {
         let mut style = target.style().clone();
@@ -1327,7 +1145,6 @@ fn set_display(tree: &mut NodeTree, node: NodeId, display: Display) {
     }
 }
 
-/// 标签槽参数（一次建槽需要的共享状态）。
 struct TagChip<'a> {
     parent: NodeId,
     size: UnifiedSize,
@@ -1338,7 +1155,6 @@ struct TagChip<'a> {
     key: &'a str,
 }
 
-/// 一个标签槽（`Badge` 中性色块的等价视觉 + `bind_text` 动态文本）。
 fn build_tag_chip(
     app: &mut App,
     window: WindowId,
@@ -1415,7 +1231,6 @@ fn build_tag_chip(
     Ok(chip)
 }
 
-/// 初始隐藏的样式（标签槽 / `+N` 先不占位，`sync` 按选中集写 `display`）。
 fn hidden_style(mut style: ui_core::paint::style::Style) -> ui_core::paint::style::Style {
     style.inner.display = Display::None;
     style
@@ -1432,7 +1247,6 @@ impl fmt::Debug for Select {
 
 #[cfg(test)]
 mod tests {
-    //! 引擎树上的行为：单选 / 多选 / 标签 / 清空 / 禁用 / 键盘 / 关闭与焦点 / a11y / I3。
 
     use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -1591,7 +1405,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("第 {index} 行未挂载"))
         }
 
-        /// 子树里**有尺寸**的图片节点数（尺寸 0 的图标槽 = 未显示）。
         fn visible_images(&self, node: NodeId) -> usize {
             let tree = self.app.app().window(self.window).expect("窗口").tree();
             let mut stack = vec![node];
@@ -1686,7 +1499,6 @@ mod tests {
         assert!(!select.is_open(harness.app.app()), "单选选中即关");
         assert_eq!(harness.trigger_text(&select), "Beta", "触发器显示选中项");
 
-        // 再点触发器打开，再点一次关闭（旧 `pressing_the_trigger_of_an_open_select_should_close_it`）。
         harness.click(&select, harness.center(trigger));
         assert!(select.is_open(harness.app.app()), "点击触发器打开");
         harness.click(&select, harness.center(trigger));
@@ -1713,7 +1525,6 @@ mod tests {
         );
         assert_eq!(harness.changed.borrow().len(), 2);
 
-        // 标签槽：前两个显示，第三个（不存在）隐藏。
         let tag0 = harness.find("select:tag:0").expect("标签 0");
         let tag1 = harness.find("select:tag:1").expect("标签 1");
         assert_eq!(harness.display_of(tag0), taffy::style::Display::Flex);
@@ -1721,7 +1532,6 @@ mod tests {
         assert_eq!(harness.text_of(tag0), Some(SmolStr::new_static("Alpha")));
         assert_eq!(harness.text_of(tag1), Some(SmolStr::new_static("Beta")));
 
-        // 再点一次取消。
         let first = harness.row_center(0);
         harness.click(&select, first);
         assert_eq!(
@@ -1936,8 +1746,6 @@ mod tests {
 
     #[test]
     fn a_forwarded_pointer_up_does_not_toggle_the_row_twice() {
-        // 审查 P1-2：外壳在 `drain_events` 之后按约定把每条事件转发给 `dispatch`；行点击
-        // 已由引擎动作完成，`dispatch` 不得再激活一次（多选面板会「点一次切两次」净效果 0）。
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions {
             multiple: true,
@@ -1973,7 +1781,6 @@ mod tests {
 
     #[test]
     fn choosing_the_same_single_item_again_does_not_notify() {
-        // 旧 `select` 的 `id.ne(selected_id)` 过滤：重复选中同一项不回调，但面板照常关闭。
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions::default());
         harness.mount(&select, items());
@@ -1995,7 +1802,6 @@ mod tests {
 
     #[test]
     fn a_long_item_grows_the_panel_past_its_trigger() {
-        // 旧 `min_w(trigger)` 是下限：内容更宽时面板长到内容宽（不是精确等宽）。
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions::default());
         harness.mount(
@@ -2021,7 +1827,6 @@ mod tests {
 
     #[test]
     fn an_explicit_width_stays_exact_for_long_items() {
-        // 审查 F24：显式 `width` = 精确宽度（旧 `menu_width` 语义），长条目不得把面板撑宽。
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions::default().width(120.0));
         harness.mount(
@@ -2052,8 +1857,6 @@ mod tests {
 
     #[test]
     fn a_newline_in_a_label_does_not_distort_the_measured_width() {
-        // 审查 F29：label 内的换行会让 caret 的 x 重置；量宽必须按**行段**取最宽行，
-        // 而不是把跨行距离算成宽度（修复前换行 label 会被量窄、显示被截断）。
         let mut single = Harness::new();
         let single_select = single.select(SelectOptions::default());
         single.mount(
@@ -2088,9 +1891,6 @@ mod tests {
 
     #[test]
     fn clicking_a_row_keeps_enter_and_space_activating_it() {
-        // 审查 F25：指针点击把焦点交给行命中壳（默认 `tab_stop=true`）后，键盘 Enter 按
-        // 「焦点节点最近动作」派发到行动作、`ctx.hit()==None` ⇒ 激活被吞。行壳退出 Tab 序，
-        // 行点击再把焦点交回面板 surface，点过行之后 Enter / Space 才继续激活高亮行。
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions {
             multiple: true,
@@ -2128,7 +1928,6 @@ mod tests {
 
     #[test]
     fn row_hit_shells_are_not_in_the_tab_order() {
-        // 审查 F25：命中壳默认 `tab_stop=true` 会让 Tab 逐个遍历行（键鼠焦点模型分裂）。
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions::default());
         harness.mount(&select, items());
@@ -2163,7 +1962,6 @@ mod tests {
 
     #[test]
     fn item_icons_are_drawn_in_the_rows_and_on_the_trigger() {
-        // 旧 `Select` 的条目是 `MenuItem`（可带 `IconAction`），触发器画选中项图标。
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions::default());
         harness.mount(
@@ -2199,7 +1997,6 @@ mod tests {
 
     #[test]
     fn the_trigger_reports_the_selection_and_the_expanded_state() {
-        // 审查 F8：触发器 a11y 可访问名跟选中项走、展开态走 `aria-expanded`。
         let mut harness = Harness::new();
         harness.app.enable_a11y_capture();
         let select = harness.select(SelectOptions::default());
@@ -2250,10 +2047,6 @@ mod tests {
         );
     }
 
-    /// **P2-9 / W2c-R1**：`Select::tooltip_text` 保存 hover 说明，`tooltip()` 读回；构建 /
-    /// 挂载都不消费它（调用方据此自己挂 `kit::tooltip`）。
-    ///
-    /// 变异防线：把 `tooltip_text` 改成 no-op ⇒ 本用例红。
     #[test]
     fn a_select_keeps_the_tooltip_text_the_caller_supplied() {
         let mut harness = Harness::new();
@@ -2276,14 +2069,6 @@ mod tests {
         assert_eq!(bare.tooltip(), None, "没有设置时是 None");
     }
 
-    /// **P2-10**：`release` 归还**自身**的信号作用域（`a11y_label` / `revision` / `chosen`）。
-    ///
-    /// W3c-F7 / W4a / W4b / W5a 四份迁移报告都用常量钉住过这个缺口（`PICKER_SCOPE_GAP = 3`、
-    /// `SELECT_RELEASE_GAP = 3×2×2`）：`Select::new` 铸作用域后没有交还给 `App`，模块内每个
-    /// 选择器每次生命周期泄漏 3 个槽位。本用例按契约「先卸载节点、再 release」跑 N 轮，
-    /// 断言每轮 `live` 回基线、重复释放幂等、槽位被复用而不是持续增长。
-    ///
-    /// 变异防线：`release` 不调 `App::release_scope(scope)` ⇒ 每轮 `live` 停在基线 + 3，红。
     #[test]
     fn releasing_a_select_returns_its_signal_scope() {
         let mut app = TestApp::new();
@@ -2312,7 +2097,6 @@ mod tests {
                 "第 {round} 轮：挂载后占用信号槽（触发器 / 面板 / 自身三个信号）"
             );
 
-            // 契约：先卸载节点再释放作用域（触发器的 a11y / bind_style 读本组件作用域）。
             app.app_mut().remove_node(window, node).expect("卸载触发器");
             let released = select.release(app.app_mut());
             assert!(
@@ -2326,7 +2110,6 @@ mod tests {
             );
             assert_eq!(select.release(app.app_mut()), 0, "重复释放幂等");
 
-            // 第 1 轮建立稳态（键 / handler 的首次分配），之后槽位必须复用而不增长。
             match steady_slots {
                 None => steady_slots = Some(after.slots),
                 Some(slots) => assert_eq!(after.slots, slots, "第 {round} 轮：槽位复用，不增长"),

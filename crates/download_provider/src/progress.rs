@@ -1,24 +1,15 @@
-//! What a transfer in flight has written, as the manager publishes it.
-
 use std::{
     sync::{Mutex, PoisonError},
     time::Duration,
 };
 
-/// The size of a megabyte, which is what a published rate is measured in.
 const MEGABYTE: f32 = 1024.0 * 1024.0;
 
-/// The progress of one transfer, written by the task reading the response and read
-/// by the manager once an interval.
-///
-/// The lock is only ever held to copy the numbers, so a transfer never waits on a
-/// reader.
 #[derive(Default)]
 pub(crate) struct Progress {
     snapshot: Mutex<Snapshot>,
 }
 
-/// What a transfer had written at one moment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     written: u64,
@@ -27,8 +18,6 @@ pub(crate) struct Snapshot {
 }
 
 impl Progress {
-    /// Records the resume point and the size of the entity, once the partial file
-    /// is open and the transfer is about to read its first byte.
     pub(crate) fn opened_at(&self, written: u64, total: Option<u64>) {
         let mut snapshot = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
         *snapshot = Snapshot {
@@ -38,39 +27,29 @@ impl Progress {
         };
     }
 
-    /// Records the bytes written so far, keeping the size the response named.
     pub(crate) fn wrote(&self, written: u64) {
         let mut snapshot = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
         snapshot.written = written;
     }
 
-    /// What the manager publishes from.
     pub(crate) fn snapshot(&self) -> Snapshot {
         *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl Snapshot {
-    /// The bytes written so far, counted from the first byte of the entity.
     pub(crate) fn written(&self) -> u64 {
         self.written
     }
 
-    /// The size of the whole entity, when a response named one.
     pub(crate) fn total(&self) -> Option<u64> {
         self.total
     }
 
-    /// Whether the partial file is open.
-    ///
-    /// It is announced only once an attempt has opened and truncated the file, so
-    /// from then on the bytes on disk are the resume point of that attempt.
     pub(crate) fn opened(&self) -> bool {
         self.opened
     }
 
-    /// The megabytes per second the transfer wrote at, `interval` being how long
-    /// ago the reading of `earlier` bytes was taken.
     pub(crate) fn megabytes_per_second_since(&self, earlier: u64, interval: Duration) -> f32 {
         if interval.is_zero() {
             return 0.0;

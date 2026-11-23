@@ -42,17 +42,7 @@ use crate::{
     venue::{VenueDisplay as _, route_display_string},
 };
 
-/// Renders a typed failure through the injected [`Translate`] context.
-///
-/// Every implementation maps the failure to a message key rather than formatting the
-/// `Display` text, so a widget that renders the value states the catalogue's sentence in
-/// the language the context carries instead of a diagnostic written for developers.
-///
-/// A failure that carries no sentence of its own delegates to the failure it wraps: the
-/// outer type decides how the inner one is stated, and the arm that names it is the one
-/// that supplies the context.
 pub trait TranslatedError {
-    /// Returns the failure as text in the language `translate` renders.
     fn translated_message(&self, translate: &Translate) -> SmolStr;
 }
 
@@ -62,24 +52,6 @@ impl TranslatedError for Infallible {
     }
 }
 
-/// Whether a failure is the directory answering "this route's catalog is not in
-/// memory yet" rather than reporting something wrong.
-///
-/// The answer is a wait, not a failure: the connection action loads a route's
-/// catalog, and a read that arrives first is told to come back rather than being
-/// refused. A widget reports it as its neutral `waiting` notice, because the user's
-/// next move is the 「市场」 button — there is nothing to recover from.
-///
-/// A widget's own gate already asks the directory before it starts anything, so an
-/// answer that reaches here is one the gate could not have seen: the route was
-/// revoked between that question and the request, which is what a venue
-/// re-discovering its scopes does in practice. Treating it as terminal would leave a
-/// pane failed over a route the very next publication is about to bring back.
-///
-/// The variant is asked of the typed field each wrapper carries rather than found by
-/// walking `Error::source`, because the wrappers are boxed: the source of
-/// `MarketError::Catalog` is a boxing adapter, not the `CatalogError` a
-/// reader would hope to downcast to.
 pub fn is_catalog_not_loaded(error: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(error) = error.downcast_ref::<CatalogError>() {
         return matches!(error, CatalogError::CatalogNotLoaded { .. });
@@ -93,12 +65,6 @@ pub fn is_catalog_not_loaded(error: &(dyn std::error::Error + 'static)) -> bool 
     false
 }
 
-/// The same question asked of a market read's own error.
-///
-/// There is one place the directory's answer can be, and this is it:
-/// `market_error_from_catalog` unwraps a source step's failure into
-/// [`MarketError::CatalogSource`] and puts every other answer in
-/// [`MarketError::Catalog`], so the typed error is never behind the source variant.
 pub fn market_is_catalog_not_loaded(error: &MarketError) -> bool {
     match error {
         MarketError::Catalog(error) => {
@@ -108,7 +74,6 @@ pub fn market_is_catalog_not_loaded(error: &MarketError) -> bool {
     }
 }
 
-/// The same question asked of an account read's own error.
 pub fn account_is_catalog_not_loaded(error: &AccountError) -> bool {
     match error {
         AccountError::Catalog(AccountCatalogError::Directory(error)) => {
@@ -118,24 +83,10 @@ pub fn account_is_catalog_not_loaded(error: &AccountError) -> bool {
     }
 }
 
-/// The answer a listing-name read gave, when it produced no name.
-///
-/// The set is closed and carries no text of its own: a listing is either named by
-/// the generation that published it or it falls back to one of these answers, and
-/// every locale spells them itself. No answer is a route, a listing id, a native
-/// symbol or a connector's own message, so a fallback can never smuggle an identity
-/// into a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalizedReason {
-    /// The read produced the published name the presentation carries.
-    ///
-    /// This answer makes the presentation total, so a presentation that names a
-    /// listing states that the read resolved rather than claiming a failure it did
-    /// not have.
     Resolved,
-    /// The listed instance has no published name.
     UnknownListing,
-    /// The published generation holds no value the read could use.
     DisplayUnavailable,
 }
 
@@ -150,35 +101,13 @@ impl TranslatedError for LocalizedReason {
     }
 }
 
-/// The name one listing is presented by, and the answer of the read that produced
-/// it.
-///
-/// The boundary is fixed: a connector-aware caller resolves the name first and
-/// renders this value, so no widget formats a name of its own and none falls back
-/// to a native symbol, an identity digest or a connector reason. `display` is the
-/// name the published generation gave the listing, and `reason` is what a read that
-/// produced no name is shown as.
-///
-/// The name is the connector's own [`InstrumentDisplayString`] rather than a string
-/// of this module's making: the connector is the only place that may render a
-/// published name, so a second string type here would either duplicate that
-/// authority or hold text no publication ever verified. The two types need no
-/// connector instance or runtime — they are plain values the caller fills in at the
-/// boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListingErrorPresentation {
-    /// The published name of the listing, when the read produced one.
     pub display: Option<InstrumentDisplayString>,
-    /// The answer of the read.
     pub reason: LocalizedReason,
 }
 
 impl ListingErrorPresentation {
-    /// Presents the outcome of one published listing-name read.
-    ///
-    /// The read is resolved first, and its outcome decides whether the presentation
-    /// carries the published name or the localized fallback of the failure that
-    /// refused it.
     pub fn of(read: Result<InstrumentDisplayString, DisplayError>) -> Self {
         match read {
             Ok(name) => Self {
@@ -192,12 +121,6 @@ impl ListingErrorPresentation {
         }
     }
 
-    /// Classifies one name read failure.
-    ///
-    /// A read that named no published listing has its own message; every other
-    /// failure of a read — a missing asset or reference term, a generation
-    /// mismatch, a formatter refusal — is the unavailable name, whose cause the
-    /// typed error already carries for a caller that wants it.
     fn reason_of(error: &DisplayError) -> LocalizedReason {
         match error {
             DisplayError::ListingNotFound { .. } => LocalizedReason::UnknownListing,
@@ -215,19 +138,6 @@ impl TranslatedError for ListingErrorPresentation {
     }
 }
 
-/// Renders the typed identity of one listing as `ROUTE:listing_id`.
-///
-/// This is an identity/diagnostic presentation and not a name: the value it
-/// returns is never an [`InstrumentDisplayString`], the listing it names was never
-/// published under it, and no widget may draw it as a main name or a business
-/// label. It exists for the diagnostics of a catalog validation failure, whose
-/// batch was refused before any name existed.
-///
-/// The route half is the user-visible form: the message this is
-/// interpolated into is read by a user, so it states the venue the way the
-/// catalogue names it and the scope in the protocol's own upper case —
-/// `Binance/SPOT` in English, `币安/SPOT` in Chinese — while the canonical
-/// lower-case `VenueRoute::Display` stays with machine logs and serialization.
 fn listing_identity_diagnostic(listing: &VenueListingKey, translate: &Translate) -> SmolStr {
     format_smolstr!(
         "{}:{}",
@@ -236,13 +146,6 @@ fn listing_identity_diagnostic(listing: &VenueListingKey, translate: &Translate)
     )
 }
 
-/// The user-visible name of the scope one stored credential set belongs to.
-///
-/// A credential set is stored under the scope name the settings and the request path both use,
-/// and what a reader sees on the settings page is that name in the protocol's own upper case. A
-/// name that is not a canonical scope cannot have been stored, so the fallback is the name as it
-/// was written rather than a refusal: this is a label, and a label that will not render is worse
-/// than one that is spelled oddly.
 fn credential_scope_display_code(scope: &str) -> SmolStr {
     VenueScopeId::new(scope)
         .map_or_else(|_| SmolStr::new(scope), |scope| scope_display_code(&scope))
@@ -284,10 +187,6 @@ impl TranslatedError for SourceError {
                     operation = operation
                 )
             }
-            // The reason is classified by the source, so each failure of one step
-            // is stated by its own message: a raw source sentence never reaches
-            // the user through this arm, and the one diagnostic that names a
-            // listing keeps the identity in its typed field instead of the text.
             Self::Protocol { operation, reason } => match reason {
                 SourceProtocolRejection::UnexpectedResponse => t_smol!(
                     translate,
@@ -319,10 +218,6 @@ impl TranslatedError for SourceError {
                     reason = reason
                 )
             }
-            // The one catalog failure that is about a market other than the route's:
-            // the directory belongs to the market participant that publishes it, so the venue
-            // is named in the reader's language and the address or cause it failed
-            // with stays the diagnostic detail.
             Self::SymbolDirectory { venue, reason } => t_smol!(
                 translate,
                 "error.instrument_catalog.symbol_directory",
@@ -337,11 +232,6 @@ impl TranslatedError for SourceError {
     }
 }
 
-/// Why one staged catalog batch was refused.
-///
-/// Every variant names the route, the listing key, the typed identifier or the
-/// field that failed, so the message is built from those values instead of from
-/// a free-form reason string.
 impl TranslatedError for CatalogValidationError {
     fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
@@ -460,8 +350,6 @@ impl TranslatedError for CatalogValidationError {
                 count,
             } => {
                 let listing = listing_identity_diagnostic(listing, translate);
-                // The sentence has to agree with its count: one missing object is not
-                // "1 missing outcome group objects".
                 if *count == 1 {
                     t_smol!(
                         translate,
@@ -579,11 +467,6 @@ impl TranslatedError for CatalogValidationError {
     }
 }
 
-/// The display publication and read failures.
-///
-/// The naming gate refuses a whole batch before it is published, so its message
-/// names the identity the failure is about — a listing, an asset, a reference or an
-/// outcome group — and never renders a name the catalog never published.
 impl TranslatedError for DisplayError {
     fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
@@ -912,9 +795,6 @@ impl TranslatedError for MarketError {
             Self::Protocol { operation } => {
                 t_smol!(translate, "error.market.protocol", operation = operation)
             }
-            // The reason is the refusal itself, not a sentence about it: the arm
-            // names the state the listing was refused in, so a listing id the
-            // request carried cannot be read as part of the message.
             Self::InvalidRequest { operation, reason } => {
                 let MarketRequestRejection::ListingNotReadable { status } = reason;
                 let status = status.label();
@@ -974,10 +854,6 @@ impl TranslatedError for AccountError {
                     operation = operation
                 )
             }
-            // The listing and the route stay typed fields of the error and are
-            // drawn as the identity diagnostic a protocol failure is reported by:
-            // an account query that names a listing of another route never had a
-            // published name to show.
             Self::ListingRouteMismatch { listing, route } => {
                 let listing = listing_identity_diagnostic(listing, translate);
                 t_smol!(
@@ -1032,9 +908,6 @@ impl TranslatedError for MarketParticipantError {
                     cause = source.translated_message(translate)
                 )
             }
-            // A venue-level request names the venue rather than a route: it is the
-            // discovery conversation a load opens before any scope of the venue is
-            // registered, so there is no route to report it against.
             Self::VenueRequestFailed {
                 venue,
                 endpoint,
@@ -1100,11 +973,6 @@ impl TranslatedError for MarketParticipantError {
                 market = venue.display_string(translate)
             ),
             Self::IncompleteCredentials { venue, scope } => match scope {
-                // A venue that signs its markets apart can be half configured, and then the
-                // market is what the reader has to finish: a sentence naming only the venue
-                // would send them to a page with two credential sets on it. The market is
-                // spelled the way the settings page spells it, so the name in the sentence is
-                // the name of the section the reader has to open.
                 Some(scope) => t_smol!(
                     translate,
                     "error.market_participants.incomplete_market_credentials",
@@ -1224,10 +1092,6 @@ impl TranslatedError for MarketParticipantError {
                 route = route_display_string(route, translate),
                 adjustment = adjustment
             ),
-            // A symbol directory belongs to the market participant that publishes it rather
-            // than to the route that reads it, so the venue is stated as a typed
-            // market in the reader's language and the address or cause it failed
-            // with is the diagnostic detail.
             Self::SymbolDirectoryFetchFailed { venue, reason } => t_smol!(
                 translate,
                 "error.market_participants.symbol_directory_failed",
@@ -1280,11 +1144,6 @@ impl TranslatedError for AuthError {
                 market = venue.display_string(translate)
             ),
             Self::IncompleteCredentials { venue, scope } => match scope {
-                // A venue that signs its markets apart can be half configured, and then the
-                // market is what the reader has to finish: a sentence naming only the venue
-                // would send them to a page with two credential sets on it. The market is
-                // spelled the way the settings page spells it, so the name in the sentence is
-                // the name of the section the reader has to open.
                 Some(scope) => t_smol!(
                     translate,
                     "error.auth.incomplete_market_credentials",
@@ -1596,10 +1455,6 @@ impl TranslatedError for ModelError {
                 t_smol!(translate, "error.model.contract_size_without_asset")
             }
             Self::ConversionDirectionMismatch { direction } => {
-                // The direction is a fixed role name, so it is rendered from the
-                // locale instead of from the model label: a Chinese sentence that
-                // embedded `underlying`/`quote`/`basis` would switch languages in
-                // the middle of the message.
                 let direction = match direction {
                     ConversionDirection::Underlying => {
                         t_smol!(translate, "error.model.conversion_direction_underlying")
@@ -1646,11 +1501,6 @@ impl TranslatedError for ModelError {
             Self::IndexPointPayoffUnsupported => {
                 t_smol!(translate, "error.model.index_point_payoff_unsupported")
             }
-            // The two assets of a payoff unit mismatch are the ones the contract
-            // tracks and the one its unit is denominated in. Rendering them would
-            // print canonical identities, which no user-facing message may do, and
-            // no display code exists for them yet, so the message states the same
-            // failure without them.
             Self::PayoffUnitMismatch { .. } => {
                 t_smol!(translate, "error.model.payoff_unit_mismatch")
             }
@@ -1688,9 +1538,6 @@ impl TranslatedError for ModelError {
                     "error.model.index_underlying_requires_cash_delivery"
                 )
             }
-            // The field a quantity-unit mismatch carries is an internal path — the
-            // contract unit, a market request field — and no user-facing message may
-            // print it, so the rendering names what the quantity has to be instead.
             Self::QuantityUnitMismatch { expected, .. } => t_smol!(
                 translate,
                 match expected {
@@ -1824,10 +1671,6 @@ impl TranslatedError for ModelError {
                 "error.model.invalid_listing_continuity_terms",
                 field = field
             ),
-            // The four arms below state a route a model error carries as its two typed
-            // parts, and the display layer keeps one user-visible spelling of a route: the
-            // parts are put back into the `VenueRoute` they came from and rendered by
-            // the one formatter, rather than upper-cased here as a second rule.
             Self::AmbiguousListingContinuity { venue, scope } => t_smol!(
                 translate,
                 "error.model.ambiguous_listing_continuity",
@@ -1937,9 +1780,6 @@ impl TranslatedError for ModelError {
             Self::OutcomeConversionCycle => {
                 t_smol!(translate, "error.model.outcome_conversion_cycle")
             }
-            // The settlement asset rule is one rule with three call sites, so the
-            // message names the settlement that was actually refused instead of
-            // describing one of the other two.
             Self::UnsupportedSettlementAsset { asset, role } => t_smol!(
                 translate,
                 match role {
@@ -2307,8 +2147,6 @@ mod tests {
         )
     }
 
-    /// A typed listing key whose identity is a canonical listing id of one repeated
-    /// hex digit, which is all a fixture that compares keys needs.
     fn listing_key(digit: char) -> VenueListingKey {
         let id = format_smolstr!("listing-id/v1/{}", digit.to_string().repeat(64));
         VenueListingKey::new(
@@ -2317,10 +2155,6 @@ mod tests {
         )
     }
 
-    /// A translation context built from the embedded catalogue, rendering `language`.
-    ///
-    /// The composition root builds the same handle from the catalogue it loads; a test can
-    /// build it with no application at all, which is the point of the injected context.
     fn translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -2328,13 +2162,6 @@ mod tests {
         )
     }
 
-    /// The exact text one failure states, in the shipped English and Chinese catalogues.
-    ///
-    /// The expected English sentence is the one the mapping's key defines, so an arm that
-    /// names the wrong key — or binds a placeholder to the wrong value — turns red here
-    /// instead of reaching a user as a sentence about something else. The Chinese render
-    /// only has to be a different, non-empty sentence: the message keys are shared, and a
-    /// locale that lost one would render the failure as nothing at all.
     fn assert_states<E: TranslatedError>(
         error: &E,
         english: &Translate,
@@ -2358,13 +2185,6 @@ mod tests {
         );
     }
 
-    /// The failures the interface renders most often state the catalogue's sentences in
-    /// both languages.
-    ///
-    /// These are the sentences a user reads instead of the failure's `Display` text: the
-    /// message keys, their placeholders and the values bound to them are pinned here, so a
-    /// ported mapping that names another key or loses a placeholder is caught by the text
-    /// it would actually render.
     #[test]
     fn the_websocket_and_service_failures_state_the_catalogue_sentences() {
         let en = translate(LanguageCode::En);
@@ -2414,8 +2234,6 @@ mod tests {
         assert_eq!(unready.translated_message(&zh).as_str(), "服务尚未就绪");
     }
 
-    /// Stating a failure through the injected context needs no application at all: this
-    /// test never creates one, so the mappings cannot be reaching a global.
     #[test]
     fn an_injected_context_renders_a_failure_without_any_application() {
         let translate = translate(LanguageCode::En);
@@ -2440,9 +2258,6 @@ mod tests {
         );
     }
 
-    /// Why a socket never came up is the whole content of these messages, so the
-    /// cause has to survive localization: a key that renders is not enough, since a
-    /// placeholder the code never supplies renders as nothing at all.
     #[test]
     fn a_failed_upgrade_should_render_the_cause_it_was_given() {
         let translate = translate(LanguageCode::En);
@@ -2469,13 +2284,6 @@ mod tests {
         );
     }
 
-    /// The two failures the Longbridge integration added to the market-participant catalogue read as
-    /// sentences in every language the interface ships.
-    ///
-    /// A route that publishes no such adjustment and credentials the venue's own market-data
-    /// profile says carry no permission are both refusals a user meets without a diagnostic
-    /// sentence beside them: the exact text proves the mapping binds the route a reader copies
-    /// and the adjustment the venue publishes.
     #[test]
     fn the_adjustment_and_market_data_failures_should_read_in_every_language() {
         let spot = route("spot");
@@ -2515,9 +2323,6 @@ mod tests {
         }
     }
 
-    /// Every instrument-directory failure the widget framework surfaces renders
-    /// through its own message key: a missing key renders as an empty string, so
-    /// this is what keeps a refused catalog from showing the user nothing at all.
     #[test]
     fn the_instrument_directory_failures_should_render_their_message_keys() {
         let translate = translate(LanguageCode::En);
@@ -2563,14 +2368,6 @@ mod tests {
         );
     }
 
-    /// A symbol directory failure is about the market participant that publishes the
-    /// directory rather than the route that reads it: the sentence names that market
-    /// in the reader's language, and the address or cause it failed with stays the
-    /// diagnostic detail beside it.
-    ///
-    /// The failure is rendered in every language the interface ships, because "the
-    /// venue is named as the reader's language names it" is a claim about each of
-    /// them: the venue's display name is the localised half of the sentence.
     #[test]
     fn a_symbol_directory_failure_should_name_the_market_it_is_about() {
         let fetched = SourceError::SymbolDirectory {
@@ -2623,8 +2420,6 @@ mod tests {
             );
         }
 
-        // The two languages really name the venue differently, which is what makes the
-        // assertions above about the language rather than about one catalogue's word.
         assert_eq!(
             VenueId::Longbridge
                 .display_string(&translate(LanguageCode::En))
@@ -2639,8 +2434,6 @@ mod tests {
         );
     }
 
-    /// The two listing-level model failures keep the key they are about, so a
-    /// widget never has to fall back to `Display` text to say what failed.
     #[test]
     fn the_listing_model_failures_should_name_the_listing_they_are_about() {
         let en = translate(LanguageCode::En);
@@ -2668,17 +2461,6 @@ mod tests {
         );
     }
 
-    /// A route a user reads is the user-visible form, in every template
-    /// that states one: the venue in the language the catalogue is showing, the scope
-    /// in the protocol's own upper case. The canonical route keeps its lower-case
-    /// spelling for machine identity, logs and serialization.
-    ///
-    /// The two spellings are the same identity, so a template that renders the
-    /// canonical one looks correct and is wrong: `binance/spot` reads as a different
-    /// route from `Binance/SPOT`, and a user who copies one into a support request
-    /// names a route that does not exist. Every family of template this module
-    /// renders is checked, because the mistake is per-arm and one arm proves nothing
-    /// about the others.
     #[test]
     fn a_user_visible_route_should_name_the_venue_and_upper_case_the_scope() {
         let translate = translate(LanguageCode::En);
@@ -2771,20 +2553,6 @@ mod tests {
         }
     }
 
-    /// A venue named inside a failure is named by the catalogue, once, in the
-    /// language the interface is showing.
-    ///
-    /// The incomplete-credentials failure used to carry the configuration error's own
-    /// sentence, which spells the canonical identity in English. Interpolated as the
-    /// cause of a template whose own `%{venue}` is the catalogue's name, that named
-    /// the same venue twice — `币安 市场参与者账户认证失败：… the credentials of venue
-    /// binance are incomplete`. The failure carries the typed venue instead, so this
-    /// pins both halves of the promise: the catalogue name is there, and neither the
-    /// canonical spelling nor the diagnostic sentence leaks through beside it.
-    ///
-    /// The scope is the other half of the same promise: a venue that signs its markets
-    /// apart can be half configured, and then the sentence has to name the market, because
-    /// a reader sent to the venue's page finds two credential sets on it.
     #[test]
     fn an_incomplete_credential_failure_should_name_the_venue_once_in_the_shown_language() {
         let translate = translate(LanguageCode::ZhCn);
@@ -2826,8 +2594,6 @@ mod tests {
             );
         }
 
-        // The market is what tells the reader which of the venue's two credential sets to
-        // finish, and it is spelled the way the settings page spells its section.
         for message in &rendered[..2] {
             assert!(
                 message.contains("USD-M-PERP"),
@@ -2841,13 +2607,6 @@ mod tests {
         );
     }
 
-    /// One message that states two routes states both the way a user reads them.
-    ///
-    /// The listing-identifier mismatch names the route that was looked up and the
-    /// route the identifier belongs to, so it is the one template where a single
-    /// missed argument leaves a sentence that contradicts itself: the same failure
-    /// would say `binance/spot` and `hyperliquid/perp-dex/xyz` at once, and a user who
-    /// copies either into a support request names a route that does not exist.
     #[test]
     fn both_routes_of_one_message_should_name_their_venues_and_upper_case_their_scopes() {
         let translate = translate(LanguageCode::En);
@@ -2870,10 +2629,6 @@ mod tests {
         );
     }
 
-    /// The identity diagnostic of an unpublished listing is not a display name: it
-    /// states the typed key, which is the only thing a refused validation has, and
-    /// it carries the route's user-visible form because the template that carries it
-    /// is read by a user.
     #[test]
     fn a_listing_identity_diagnostic_should_state_the_typed_key_and_not_a_name() {
         let translate = translate(LanguageCode::En);
@@ -2897,8 +2652,6 @@ mod tests {
         );
     }
 
-    /// A listing-name read that produced a name is presented by that name and
-    /// nothing else, and the answer of the read says so.
     #[test]
     fn a_published_listing_read_should_be_presented_by_its_published_name() {
         let translate = translate(LanguageCode::En);
@@ -2935,9 +2688,6 @@ mod tests {
         );
     }
 
-    /// A listing-name read that produced no name is the localized unknown, and the
-    /// failure behind it decides which unknown: a listing the generation never named
-    /// is not a generation that holds no value the read could use.
     #[test]
     fn a_refused_listing_read_should_be_presented_by_its_own_localized_unknown() {
         let en = translate(LanguageCode::En);
@@ -3012,8 +2762,6 @@ mod tests {
         );
     }
 
-    /// The listing presentation and its fallback reason state the catalogue's sentences,
-    /// and they are the one mapping a widget renders without touching the venue catalogue.
     #[test]
     fn a_listing_presentation_states_the_catalogue_answers_in_both_languages() {
         let en = translate(LanguageCode::En);
@@ -3051,9 +2799,6 @@ mod tests {
         assert_eq!(absent.translated_message(&zh).as_str(), "未知挂牌");
     }
 
-    /// A market request refused because a listing no longer reads states the
-    /// published state, which is the refusal itself: the request's own listing id
-    /// stays a typed field of the error and never reaches the message as a label.
     #[test]
     fn a_market_request_refusal_should_state_the_state_and_not_the_listing_identity() {
         let translate = translate(LanguageCode::En);
@@ -3076,10 +2821,6 @@ mod tests {
         );
     }
 
-    /// A refused catalog step is stated by the step's own typed answer: the one
-    /// answer that is about a listing keeps the listing as a typed field and prints
-    /// no id, and the one that carries the model's refusal states that refusal in
-    /// the selected language.
     #[test]
     fn a_refused_catalog_step_should_be_stated_by_its_typed_answer() {
         let translate = translate(LanguageCode::En);
@@ -3140,9 +2881,6 @@ mod tests {
         );
     }
 
-    /// An account query that names a listing of another route is a typed refusal
-    /// with a typed identity diagnostic, and the operation an account protocol
-    /// failure is about is a fixed name rather than a formatted sentence.
     #[test]
     fn account_refusals_should_state_their_operation_and_their_typed_identity() {
         let translate = translate(LanguageCode::En);
@@ -3169,11 +2907,6 @@ mod tests {
         );
     }
 
-    /// The directory's "this route's catalog is not in memory" is recognised through
-    /// every wrapper a market or account read reports it in, and nothing else is read
-    /// as it: a wait that was mistaken for a failure leaves a pane failed over a route
-    /// the next publication brings back, and a failure mistaken for a wait is a pane
-    /// that never says what went wrong.
     #[test]
     fn a_directory_that_has_not_loaded_a_catalog_should_be_read_as_a_wait() {
         let not_loaded = CatalogError::CatalogNotLoaded {
@@ -3219,14 +2952,6 @@ mod tests {
         }
     }
 
-    /// A conversion reference disagrees with its contract on one named role, and
-    /// that role is a lexical label rather than a value: rendering it from the model
-    /// label would put an English word inside the Chinese sentence, so each locale
-    /// names the role itself.
-    ///
-    /// All three roles are checked in both languages: the role is the only content
-    /// the message has, so a role the mapping routes to the wrong key — or to a key
-    /// no locale names — is the whole failure the user reads.
     #[test]
     fn a_conversion_direction_failure_should_name_its_role_in_the_selected_language() {
         let en = translate(LanguageCode::En);
@@ -3254,9 +2979,6 @@ mod tests {
         }
     }
 
-    /// Every server code the Kytrix service can answer with states its own sentence in
-    /// both languages: the code is a closed set, and an arm the mapping forgot would
-    /// otherwise render the failure as nothing at all.
     #[test]
     fn every_server_error_code_should_state_its_sentence() {
         let en = translate(LanguageCode::En);
@@ -3358,15 +3080,6 @@ mod tests {
         }
     }
 
-    /// Every error family of this module states a sentence of the catalogue, and the
-    /// sentence says what the typed failure is about.
-    ///
-    /// The families are listed here rather than inferred, because this is the mapping
-    /// contract P3-1 froze: one representative arm per family proves the family has an
-    /// implementation that names a key of the shipped catalogue. The wrappers that
-    /// only delegate (`MarketNetworkError`, `AccountNetworkError`) cannot be built
-    /// without the runtime that classifies them, and their delegation compiles against
-    /// the same trait the covered families implement.
     #[test]
     fn every_error_family_should_state_a_sentence_of_the_catalogue() {
         let en = translate(LanguageCode::En);
@@ -3628,14 +3341,6 @@ mod tests {
         );
     }
 
-    /// Every key the mappings of this module look a message up under is one every locale
-    /// defines and renders.
-    ///
-    /// A key no locale defines translates to an empty string rather than failing, so a key
-    /// that leaves the locales — as `error.model.empty_identifier` did — reaches the user as
-    /// a failure the widget draws with nothing written in it. The keys are read out of this
-    /// module's own mappings rather than listed beside them, so an arm that names a new key
-    /// is covered by the arm that names it.
     #[test]
     fn every_message_key_the_error_mappings_name_should_be_defined_in_every_locale() {
         let i18n = i18n::embedded::load().expect("the embedded locales load");
@@ -3671,33 +3376,6 @@ mod tests {
         }
     }
 
-    /// Every placeholder a message declares is one the mapping that names it supplies.
-    ///
-    /// A placeholder nothing was bound to renders as the empty string rather than as the
-    /// placeholder itself, so a mapping and the message it names can disagree — the code passes
-    /// `route` while the message spells `%{venue}` — and what reaches the user is a sentence
-    /// with a hole in it instead of a failure they can act on. Each message is therefore
-    /// rendered twice: once with exactly the arguments its own mapping binds, and once with
-    /// every placeholder of the catalogue bound to a marker of its own. The two renders have to
-    /// agree, which is only true when the mapping supplies every placeholder the message
-    /// declares, and neither may leave a `%{…}` behind.
-    ///
-    /// The translation call sites of the widget crates that name this catalogue's messages.
-    ///
-    /// Almost every mapping of the catalogue is in this module, so the guard above
-    /// reads its arguments out of this module's own source. A few families belong to
-    /// the widget that states them — the force-order table's caption, the wallet
-    /// monitor's failure notices and the sentence one row of the watch list carries —
-    /// and nothing about "a message and its arguments cannot drift apart" stops at a
-    /// crate boundary: rewording `%{markets}` to `%{market}` on either side would ship a
-    /// sentence with a hole in it with both guards green. The sources are listed rather
-    /// than discovered because `include_str!` takes a literal, and a file that moves is
-    /// a compile error rather than a silently uncovered one.
-    ///
-    /// The guard reads a call site's key from the invocation itself: the reader takes the
-    /// second argument as the key, so an invocation whose key is a constant is read as the
-    /// *name* of that constant, which no locale defines and nothing checks. A listed source
-    /// therefore names every key where it uses it.
     const WIDGET_MESSAGE_SOURCES: &[&str] = &[
         include_str!("../../widgets/force_order/src/view.rs"),
         include_str!("../../widgets/hyperliquid_wallet/src/model.rs"),
@@ -3767,32 +3445,10 @@ mod tests {
         }
     }
 
-    /// The attribute that opens the tests of a source file, which is where the production half
-    /// of it ends.
-    ///
-    /// [`production_source`] tells the attribute that opens a test module from the one marking
-    /// an accessor a test drives, and the readers of these files slice them with it, so spelling
-    /// it out here would be a second one to find.
     const TEST_MODULE_ATTRIBUTE: &str = concat!("#[cfg", "(test)]");
 
-    /// The macros that render one message: the global `t!` the widget crates still use and
-    /// the injected `t_smol!` this module uses.
-    ///
-    /// Both are read by the guards below, because the migration ports the widget crates
-    /// after this crate's contract: a reader that only looked for `t!(` would silently stop
-    /// covering every mapping this module already converted, and the key or placeholder it
-    /// names would be checked by nothing.
     const TRANSLATION_CALLS: &[&str] = &["t_smol!(", "t!("];
 
-    /// The first translation invocation of one source: the offset of its macro name and the
-    /// length of that name.
-    ///
-    /// `t_smol!(` does not contain `t!(` (the `t` is followed by `_`), so each name is searched
-    /// for on its own and the earliest one wins. A match only counts where the name starts a
-    /// token: `t!(` is a substring of `assert!(` and `debug_assert!(` (and `t_smol!(` of any
-    /// name ending in `_t_smol`), so a match preceded by an identifier character is not an
-    /// invocation — reading a condition's message as a translation would fail the locale guard
-    /// on a key no mapping names.
     fn next_translation_call(source: &str) -> Option<(usize, usize)> {
         TRANSLATION_CALLS
             .iter()
@@ -3810,15 +3466,6 @@ mod tests {
             .min_by_key(|(offset, _)| *offset)
     }
 
-    /// The message keys the translation invocations of one source file name, in source order.
-    ///
-    /// Only the production half of the file is read, sliced the way [`production_source`] slices
-    /// it: the keys a test writes for itself are not messages the interface renders. An
-    /// invocation is written both on one line and one argument per line, so the literal is
-    /// looked for after the context the macro is given rather than assumed to follow it on
-    /// the same line. The context is whatever expression the call site hands the macro — a bare
-    /// translator or a path such as `services.translate` — which is also what
-    /// [`message_arguments`] accepts.
     fn message_keys(source: &str) -> Vec<String> {
         let production = production_source(source);
         let mut keys = Vec::new();
@@ -3847,18 +3494,6 @@ mod tests {
         keys
     }
 
-    /// The key and the argument names of every translation invocation of one source file, in
-    /// source order.
-    ///
-    /// The mapping half of the file is what is read — the slice [`production_source`] takes,
-    /// where the first `#[cfg(test)]` would cut the mappings after an accessor a test drives
-    /// short — and the invocations are read out of it rather than listed beside it, so an arm
-    /// that binds a new argument is covered by the arm that binds it.
-    ///
-    /// The first argument is the context the macro renders through: any non-empty expression
-    /// resolves it — a bare `translate`, `&translate`, or the `services.translate` field path
-    /// a widget is handed. That is the same rule [`message_keys`] reads, so both readers
-    /// accept and skip the same call sites.
     fn message_arguments(source: &str) -> Vec<(String, Vec<String>)> {
         let production = production_source(source);
         let mut mappings = Vec::new();
@@ -3870,8 +3505,6 @@ mod tests {
             };
             rest = after;
             let arguments = top_level_arguments(body);
-            // The context the macro is given comes first, and it is an expression rather than
-            // a literal: an invocation written without one is not a mapping of this module.
             if arguments.len() < 2 || arguments[0].trim().is_empty() {
                 continue;
             }
@@ -3887,16 +3520,6 @@ mod tests {
         mappings
     }
 
-    /// Both readers of the widget sources skip the accessor a test drives rather than the
-    /// mappings written after it, and both read the global macro and its injected successor
-    /// alike.
-    ///
-    /// `hyperliquid_wallet` marks such an accessor in the middle of its production half,
-    /// and both readers sliced each source at the first `#[cfg(test)]` until this rule was
-    /// written down: every translation invocation below that accessor was read by nothing, so a
-    /// mapping there could lose a placeholder — or name a key no locale defines — with both
-    /// guards green. The mappings past the accessor and past the test module are what the two
-    /// readers have to disagree about.
     #[test]
     fn a_mapping_after_an_inline_test_accessor_should_still_be_read() {
         let source = concat!(
@@ -3939,16 +3562,6 @@ mod tests {
         );
     }
 
-    /// Both readers accept the context of a translation call as any expression — the bare
-    /// translator, a borrow of it, or the `services.translate` field path a widget is handed —
-    /// and neither reads an assertion's message as a translation.
-    ///
-    /// The key reader always took any expression as the context, but the placeholder reader
-    /// required a single identifier and skipped the field-path form: a `services.translate`
-    /// call site was checked by one guard and silently by neither placeholder check, so a
-    /// mapping could lose a placeholder with both guards green. The macro name was also
-    /// searched as a plain substring, which made `assert!(` and `debug_assert!(` read as
-    /// translation calls. Both cases are pinned here.
     #[test]
     fn both_readers_accept_any_translation_context_and_ignore_assertions() {
         let source = concat!(
@@ -3991,11 +3604,6 @@ mod tests {
         );
     }
 
-    /// The body of one translation invocation and the text that follows its closing parenthesis.
-    ///
-    /// The scan is aware of string literals and of nested groups, so an argument that is itself
-    /// a call — `cause = failure.translated_message(translate)` — does not end the invocation
-    /// early.
     fn invocation_body(source: &str) -> Option<(&str, &str)> {
         let mut depth = 0usize;
         let mut in_string = false;
@@ -4024,7 +3632,6 @@ mod tests {
         None
     }
 
-    /// The top-level comma-separated arguments of one invocation body, in source order.
     fn top_level_arguments(body: &str) -> Vec<&str> {
         let mut arguments = Vec::with_capacity(4);
         let mut depth = 0usize;
@@ -4059,10 +3666,6 @@ mod tests {
         arguments
     }
 
-    /// The name one argument of a translation invocation binds, when it binds one.
-    ///
-    /// The macro takes an argument as `name = value` or as a bare local variable of that name,
-    /// so an argument that is neither names nothing to check.
     fn bound_name(argument: &str) -> Option<String> {
         let argument = argument.trim();
         let name = argument
@@ -4078,13 +3681,6 @@ mod tests {
         (starts && rest).then(|| name.to_owned())
     }
 
-    /// Every placeholder name the locale documents spell, which is the whole set a message in
-    /// them can interpolate.
-    ///
-    /// The translator renders a placeholder nothing supplies as the empty string rather than as
-    /// the placeholder itself, so the names a message declares cannot be read back out of a
-    /// render: the documents the messages are parsed from are the only place they are written
-    /// down.
     fn locale_placeholders(source: &str) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
         let mut rest = source;
@@ -4101,12 +3697,6 @@ mod tests {
         names
     }
 
-    /// The production half of one source file: everything above the test module it declares.
-    ///
-    /// The slice is taken at the test module rather than at the first `#[cfg(test)]`, because
-    /// the widget sources mark accessors a test drives with that attribute in the middle of
-    /// their production half — a slice taken at the first attribute would leave the translation
-    /// calls after it unread. A source that declares no test module is read whole.
     fn production_source(source: &str) -> &str {
         let mut offset = 0usize;
 

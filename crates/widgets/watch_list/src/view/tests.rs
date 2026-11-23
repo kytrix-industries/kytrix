@@ -1,11 +1,3 @@
-//! Interface tests for the watch-list widget.
-//!
-//! Every test drives the widget through the frozen contract: the headless host
-//! ([`WidgetTestApp`]), a fixture directory standing in for the injected connector
-//! (the headless host cannot build one), a fake ticker source, and the widget's own
-//! lifecycle hooks. The service, the streams and the frames are driven by the
-//! host's runtime turns, never by sleeping.
-
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -67,9 +59,6 @@ use crate::{
     table::{ACTIONS_COLUMN, COLUMN_COUNT, MISSING_MARKET_COLUMN, MISSING_VALUE},
 };
 
-// ------------------------------------------------------------------- vocabulary
-
-/// The translator the product ships, in the language a test asks for.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -85,9 +74,6 @@ fn stock_route() -> VenueRoute {
     test_support::route("longbridge", LONGBRIDGE_US_SCOPE)
 }
 
-// The native symbol behind every listing key a test builds, so a catalogue entry
-// can be published for a key a test only names by its key: a `VenueListingKey`
-// carries the canonical identity of the listing, not the venue-native symbol.
 thread_local! {
     static SYMBOLS: RefCell<HashMap<SmolStr, SmolStr>> = RefCell::new(HashMap::default());
 }
@@ -175,7 +161,6 @@ fn instrument_for(listing: &VenueListingKey) -> market_participants_model::instr
     }
 }
 
-/// A catalogue publishing the listings a test follows.
 fn catalog_over(keys: &[VenueListingKey]) -> Arc<Catalog> {
     let fixture = test_support::Fixture::with_source(
         route(),
@@ -187,8 +172,6 @@ fn catalog_over(keys: &[VenueListingKey]) -> Arc<Catalog> {
     fixture.register_route(&stock_route(), "watch-list-session", &session);
     test_support::publish_fixture_route(fixture.catalog(), &route(), continuous)
         .expect("the continuous route publishes its listings");
-    // The extra route publishes through its own source, which stages the canonical
-    // terms of every asset the listings name.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -207,10 +190,6 @@ fn entries_for(keys: &[VenueListingKey], route: &VenueRoute) -> Vec<CatalogEntry
         .collect()
 }
 
-// -------------------------------------------------------------------- directory
-
-/// A directory a test drives: the routes it has loaded, the ones that answer with
-/// tickers, and the catalogue a stream resolves its listings against.
 #[derive(Clone)]
 struct FixtureDirectory {
     loaded: Rc<RefCell<Vec<VenueRoute>>>,
@@ -241,9 +220,6 @@ impl FixtureDirectory {
         self.ticker_routes.borrow_mut().retain(|held| held != route);
     }
 
-    /// Withdraws the ticker capability from a route's loaded scope without
-    /// unloading it: a scope that is loaded and answers no tickers is the proof a
-    /// stored listing left the list.
     fn revoke_tickers(&self, route: &VenueRoute) {
         self.ticker_routes.borrow_mut().remove(route);
     }
@@ -298,8 +274,6 @@ impl WatchListDirectory for FixtureDirectory {
     }
 }
 
-// ----------------------------------------------------------------------- source
-
 type TickerEvent = Result<Arc<ListingTicker>, MarketError>;
 type TickerSender = mpsc::UnboundedSender<TickerEvent>;
 
@@ -324,20 +298,10 @@ impl TickerEventSubscription for FakeSubscription {
     }
 }
 
-/// A ticker source whose subscriptions a test hands out and whose opening fetches
-/// are the tickers the test published.
-///
-/// The service resolves the opening snapshot through whichever reports first, so a
-/// source that already has a subscription in hand and a fetch that answers at once
-/// is a stream that reaches `Ready` on its own; a test that wants to drive one
-/// listing further keeps the sender and pushes messages through it.
 #[derive(Clone, Default)]
 struct FakeSource {
     fetched: Arc<Mutex<HashMap<VenueListingKey, ListingTicker>>>,
     subscriptions: Arc<Mutex<HashMap<VenueListingKey, FakeSubscription>>>,
-    /// One live sender per generation started for a listing: replacing a stream must
-    /// not close the subscription the previous one is still reading (a closed channel
-    /// is a disconnected stream, which the widget would report as a failure).
     senders: Arc<Mutex<HashMap<VenueListingKey, Vec<TickerSender>>>>,
     plans: Arc<Mutex<HashMap<VenueListingKey, VecDeque<Result<(), MarketError>>>>>,
     pending_fetches: Arc<Mutex<HashSet<VenueListingKey>>>,
@@ -351,8 +315,6 @@ impl FakeSource {
         Self::default()
     }
 
-    /// Publishes a ticker and the subscription that will carry the listing's live
-    /// messages.
     fn quote(&self, listing: &VenueListingKey, ticker: ListingTicker) -> TickerSender {
         self.fetched.blocking_lock().insert(listing.clone(), ticker);
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -371,13 +333,10 @@ impl FakeSource {
         sender
     }
 
-    /// Makes the next opening fetch of `listing` wait forever: the stream stays at
-    /// `LoadingSnapshot` with whatever the row showed before.
     fn pend_fetch(&self, listing: &VenueListingKey) {
         self.pending_fetches.blocking_lock().insert(listing.clone());
     }
 
-    /// Hands out one more subscription for `listing`, over a live channel.
     fn rearm(&self, listing: &VenueListingKey, ticker: ListingTicker) -> TickerSender {
         self.pending_fetches.blocking_lock().remove(listing);
         self.plans
@@ -443,16 +402,12 @@ impl TickerSource for FakeSource {
     }
 }
 
-// ---------------------------------------------------------------------- harness
-
 struct Pane {
     widget: WatchListWidget,
     parent: NodeId,
     header_parent: NodeId,
 }
 
-/// One widget under test: the host, the fixture directory, the source, and the
-/// counters the assertions read.
 struct Fixture {
     harness: WidgetTestApp,
     pane: Pane,
@@ -462,12 +417,10 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// A pane over `config`, with every route of the fixture loaded.
     fn new(config: WatchListConfig) -> Self {
         Self::with(config, vec![route()])
     }
 
-    /// A pane over `config`, with `loaded` routes loaded in its directory.
     fn with(config: WatchListConfig, loaded: Vec<VenueRoute>) -> Self {
         Self::with_source(FakeSource::new(), config, loaded)
     }
@@ -551,7 +504,6 @@ impl Fixture {
         self.harness.drain();
     }
 
-    /// Loads, settles the service, builds the body and runs a frame.
     fn start(&mut self) {
         self.load();
         self.settle();
@@ -560,7 +512,6 @@ impl Fixture {
         self.harness.drain();
     }
 
-    /// Drives runtime turns and frames until the widget's rows are current.
     fn settle(&mut self) {
         for _ in 0..32 {
             self.sync();
@@ -571,7 +522,6 @@ impl Fixture {
         self.harness.drain();
     }
 
-    /// Drives runtime turns and frames until `ready` holds.
     fn drive_until(&mut self, ready: impl Fn(&Self) -> bool) {
         for _ in 0..40 {
             if ready(self) {
@@ -634,7 +584,6 @@ impl Fixture {
         .expect("the table exists")
     }
 
-    /// Writes the directory generation the way the composition root does.
     fn publish_generation(&mut self, generation: u64) {
         let signal = self.harness.services().catalog_generation;
         self.harness.app_mut().write(&signal, generation);
@@ -644,7 +593,6 @@ impl Fixture {
         self.harness.switch_language(language);
     }
 
-    /// Reports a terminal failure of the pane, as one of its own paths would.
     fn fail(&mut self, failure: WatchListFailure) {
         self.with_cx(|widget, cx| widget.fail(failure, cx));
     }
@@ -668,7 +616,6 @@ fn service_refused() -> WidgetRpcResult<WatchListProtocol> {
     Err(refused())
 }
 
-/// The laid-out box of one drawn node.
 fn bounds(fixture: &Fixture, node: NodeId) -> ui_core::math::Rect {
     fixture
         .harness
@@ -678,8 +625,6 @@ fn bounds(fixture: &Fixture, node: NodeId) -> ui_core::math::Rect {
         .layout()
         .bounds
 }
-
-// ------------------------------------------------------------------- lifecycle
 
 #[test]
 fn a_list_should_report_connecting_and_then_head_its_rows() {
@@ -887,8 +832,6 @@ fn a_recovery_should_keep_the_rows_it_had_and_reopen_the_streams() {
     );
 }
 
-// ------------------------------------------------------------------ the values
-
 #[test]
 fn a_failed_row_should_keep_its_ticker_and_leave_the_widget_alone() {
     let following = vec![key("BTCUSDT")];
@@ -996,8 +939,6 @@ fn a_row_waiting_for_its_market_should_be_one_cell_where_its_values_would_be() {
         );
     }
 
-    // The one cell stands in for every column but the route and the controls, so its
-    // width is the six columns it replaces rather than any one of them.
     let route = bounds(&fixture, cells[0].expect("the route keeps its own cell"));
     let merged = bounds(&fixture, merged);
     let actions = bounds(
@@ -1130,8 +1071,6 @@ fn the_tables_should_draw_rows_to_read_rather_than_rows_to_pick() {
     fixture.start();
     fixture.frame();
 
-    // The kit table selects rows when it is clicked unless it is told not to, and a
-    // selected row paints in the selection palette for a selection nothing acts on.
     assert_eq!(
         crate::table::table_options(28.0).selection,
         SelectionMode::None,
@@ -1261,8 +1200,6 @@ fn a_row_should_be_named_by_the_published_instrument() {
     );
 }
 
-// ------------------------------------------------------------------- language
-
 #[test]
 fn switching_the_language_should_redraw_the_table_copy_and_keep_the_rows() {
     let following = vec![key("BTCUSDT")];
@@ -1320,8 +1257,6 @@ fn a_row_should_name_the_market_to_load_in_the_language_showing() {
     );
     assert_ne!(english, chinese, "the language moved");
 }
-
-// ---------------------------------------------------------------- the header control
 
 #[test]
 fn the_header_should_be_rebuilt_in_the_language_showing() {
@@ -1388,9 +1323,6 @@ fn a_new_generation_should_rebuild_the_header_picker() {
         .expect("the header control")
         .node;
 
-    // The picker offers the venues the directory has loaded, resolved when the control
-    // is built: a generation that loads one has to rebuild it, or the new venue is never
-    // offered.
     fixture.directory.load(stock_route());
     fixture.publish_generation(11);
     fixture.settle();
@@ -1466,7 +1398,6 @@ fn the_add_control_should_be_available_while_the_list_is_reading() {
     );
 }
 
-/// Cancels the bridge, so the tests below drive the request/answer path by hand.
 fn quiet(fixture: &mut Fixture) {
     if let Some(binding) = fixture.pane.widget.binding.as_mut() {
         binding.cancel();
@@ -1493,9 +1424,6 @@ fn a_click_on_the_waiting_add_control_should_open_nothing() {
     let window = fixture.with_cx(|_, cx| cx.window());
     let nodes = fixture.harness.node_count();
 
-    // The control is disabled, and a disabled control that only paints its state would
-    // still dispatch: the handler's own guard is what refuses. The kit's control also
-    // refuses, so this test drives the click both of them sit on.
     let dispatched =
         fixture
             .harness
@@ -1524,8 +1452,6 @@ fn a_click_on_the_waiting_add_control_should_open_nothing() {
 
 #[test]
 fn a_confirmation_that_lands_while_the_pane_waits_should_be_refused() {
-    // A picker confirmed after the pane started waiting: the dialog is not the gate, the
-    // pane's own entry is. Neither the followed set nor the service may move.
     let mut fixture = Fixture::with(config(vec![stock("AAPL")]), Vec::new());
     fixture.load();
     fixture.frame();
@@ -1681,8 +1607,6 @@ fn a_refused_remove_should_put_the_row_back_with_what_it_showed() {
     fixture.sync();
     assert!(!fixture.pane.widget.config.entries.contains(&following[0]));
 
-    // The refusal puts the entry the removal took back; the test rebuilds that entry
-    // with the ticker the row showed, which is what the pending command held.
     fixture.pane.widget.pending.clear();
     let mut entry = WatchListEntry::connecting(&following[0]);
     entry.apply_event(&WatchListStreamEvent::Snapshot {
@@ -1777,14 +1701,6 @@ fn the_row_controls_should_follow_the_row_state() {
     assert_eq!(controls.buttons.len(), 2, "retry and removal are offered");
 }
 
-// ------------------------------------------------------------- the row window
-//
-// A table mounts only the rows its viewport shows and recycles that window as it
-// scrolls or the pane resizes. The controls of a row are built into the slot its row
-// factory builds, so a window that moved is a pairing that has to be rebuilt — no
-// widget state changes when it does, which is what let the pairing go stale.
-
-/// The row indices one table has mounted right now.
 fn mounted_rows(fixture: &Fixture, market: WatchListMarket) -> Vec<usize> {
     let mut rows: Vec<usize> = fixture
         .table_pane(market)
@@ -1798,7 +1714,6 @@ fn mounted_rows(fixture: &Fixture, market: WatchListMarket) -> Vec<usize> {
     rows
 }
 
-/// The row indices one table has controls for right now.
 fn controlled_rows(fixture: &Fixture, market: WatchListMarket) -> Vec<usize> {
     let controls = match market {
         WatchListMarket::Continuous => &fixture.pane.widget.continuous_controls,
@@ -1807,7 +1722,6 @@ fn controlled_rows(fixture: &Fixture, market: WatchListMarket) -> Vec<usize> {
     controls.keys().copied().collect()
 }
 
-/// Every click handler the row controls of one table hold, with the row it belongs to.
 fn control_actions(fixture: &Fixture, market: WatchListMarket) -> Vec<(usize, Action)> {
     let controls = match market {
         WatchListMarket::Continuous => &fixture.pane.widget.continuous_controls,
@@ -1824,14 +1738,12 @@ fn control_actions(fixture: &Fixture, market: WatchListMarket) -> Vec<(usize, Ac
         .collect()
 }
 
-/// A list long enough that its table mounts only part of it.
 fn long_list() -> Vec<VenueListingKey> {
     (0..40)
         .map(|index| key(&format!("SYM{index:02}")))
         .collect()
 }
 
-/// Pairs every mounted row with its controls on the frame the window moved.
 fn pair_window(fixture: &mut Fixture) {
     fixture.harness.drain();
     fixture.sync();
@@ -1968,8 +1880,6 @@ fn retrying_a_failed_row_should_reopen_it_without_forgetting_the_price() {
         WatchListStatus::Error
     );
 
-    // The retried generation subscribes but its opening fetch never answers, so what
-    // the row shows between the retry and the new snapshot is observable.
     fixture
         .source
         .rearm(&following[0], ticker(&following[0], 100, 130));
@@ -2072,8 +1982,6 @@ fn a_full_list_should_refuse_another_listing() {
     );
 }
 
-// ------------------------------------------------------------------- terminal
-
 #[test]
 fn a_message_that_arrives_after_a_failure_should_be_ignored() {
     let following = vec![key("BTCUSDT")];
@@ -2135,7 +2043,6 @@ fn an_unchanged_steady_state_should_not_request_frames() {
     fixture.build_body();
     fixture.frame();
 
-    // Settle every frame the setup asked for; what follows is the steady state.
     fixture.harness.drain();
     fixture.harness.drain();
     let requests = fixture.harness.frame_requests();
@@ -2148,8 +2055,6 @@ fn an_unchanged_steady_state_should_not_request_frames() {
         "a steady sync asks for no frame (I3)"
     );
 }
-
-// ---------------------------------------------------------------- generation
 
 #[test]
 fn a_directory_generation_should_reload_the_pane_and_reopen_the_streams() {
@@ -2183,8 +2088,6 @@ fn a_directory_generation_should_reload_the_pane_and_reopen_the_streams() {
 
 #[test]
 fn an_unrelated_generation_should_reload_the_pane() {
-    // §8.3 has no per-venue version: every generation write reloads the pane, even a
-    // commit on a venue it does not follow. The test pins that accepted trade.
     let following = vec![key("BTCUSDT")];
     let mut fixture = Fixture::new(config(following.clone()));
     fixture
@@ -2259,9 +2162,6 @@ fn a_row_whose_market_has_no_catalog_should_stop_being_read() {
     );
 }
 
-// ------------------------------------------------------- dropped streams and late answers
-
-/// The error a stream reports for a listing whose catalogue is not in memory.
 fn catalog_not_loaded() -> WatchListStreamError {
     WatchListStreamError::MarketParticipant(MarketError::Catalog(Box::new(
         CatalogError::CatalogNotLoaded { route: route() },
@@ -2278,11 +2178,9 @@ fn a_confirmation_that_lands_after_the_market_is_gone_should_not_report_values()
     fixture.start();
     fixture.frame();
 
-    // The replacement the pane asked for while it still had the market...
     fixture.load();
     fixture.sync();
     assert!(!fixture.pane.widget.pending.is_empty());
-    // ...is answered only now, after the listing's market went away underneath it.
     fixture.with_cx(|widget, cx| {
         widget.apply_event(
             &following[0],
@@ -2339,7 +2237,6 @@ fn a_catalog_error_should_not_take_a_retry_with_it() {
         WatchListStatus::Error
     );
 
-    // The user asks for the failed row to be read again: that is the operation in flight.
     let requests = fixture.pane.widget.row_requests;
     fixture
         .harness
@@ -2351,7 +2248,6 @@ fn a_catalog_error_should_not_take_a_retry_with_it() {
         "the retry is the operation in flight"
     );
 
-    // The other row's catalogue goes away while that retry is still unanswered.
     fixture.with_cx(|widget, cx| {
         widget.apply_event(
             &first,
@@ -2372,7 +2268,6 @@ fn a_catalog_error_should_not_take_a_retry_with_it() {
         "the pane is still reading the market both rows are on"
     );
 
-    // The retry is answered as the user's own answer.
     fixture.with_cx(|widget, cx| {
         widget.apply_rpc(RequestId::new(2), Ok(WatchListResponse::Applied), cx)
     });
@@ -2407,9 +2302,6 @@ fn a_listing_whose_catalog_went_away_should_be_read_by_a_new_stream() {
     );
     assert!(fixture.pane.widget.dropped.contains(&following[0]));
 
-    // The market is refreshed with a catalogue that restates the listing, which is what
-    // brings the listing back into reading — by a stream the service opens now rather
-    // than by handing it back the parked one it left behind.
     fixture
         .source
         .rearm(&following[0], ticker(&following[0], 100, 130));
@@ -2437,7 +2329,6 @@ fn a_listing_should_be_addable_while_another_row_waits_for_its_catalog() {
     let first = key("BTCUSDT");
     let second = key("ETHUSDT");
     let mut fixture = Fixture::new(config(vec![first.clone()]));
-    // The route also publishes the listing the user is about to pick.
     test_support::publish_fixture_route(
         &fixture.directory.catalog,
         &route(),
@@ -2516,8 +2407,6 @@ fn a_recovery_with_no_market_loaded_should_wait_rather_than_stay_failed() {
     );
     fixture.fail(WatchListFailure::Capacity);
 
-    // The recovery asks the gate again; a gate that answers "nothing to read" is a
-    // wait, not a failure that nothing clears.
     fixture.load();
     fixture.frame();
     assert!(
@@ -2577,8 +2466,6 @@ fn a_withdrawn_listing_should_leave_the_list() {
     fixture.start();
     let changes = fixture.config_changes.get();
 
-    // Republish the route without the first listing: the catalogue now proves the
-    // listing is not offered, which is what withdraws it from the followed set.
     test_support::publish_fixture_route(
         &fixture.directory.catalog,
         &route(),
@@ -2620,8 +2507,6 @@ fn a_route_that_stops_answering_tickers_should_withdraw_its_listings() {
 
     assert!(fixture.pane.widget.config.entries.is_empty());
 }
-
-// --------------------------------------------------------------------- config
 
 #[test]
 fn the_followed_set_should_survive_a_config_round_trip() {
@@ -2681,8 +2566,6 @@ fn an_old_payload_that_names_routes_and_instruments_should_be_reset() {
         "the old payload no longer decodes"
     );
 }
-
-// ---------------------------------------------------------------- two panes
 
 #[test]
 fn two_panes_should_keep_their_own_row_controls() {
@@ -2939,8 +2822,6 @@ fn releasing_a_pane_should_reclaim_every_value_slot() {
             widget.sync(cx).expect("the widget syncs");
             widget.release(cx);
         }
-        // The pane is not a mounted widget, so its node subtree and its signal scope
-        // are this test's to hand back.
         let window = harness.window();
         if harness
             .app()

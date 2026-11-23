@@ -1,5 +1,3 @@
-//! Linux desktop proxy settings and their evaluation for a destination.
-
 use app_config::network::{ConfigError, ResolvedProxy, RouteTarget};
 use url::Url;
 
@@ -339,10 +337,6 @@ pub(super) fn linux_config_from_env(
         })
 }
 
-/// Assembles a GNOME-shaped manual/auto/PAC configuration from raw values.
-///
-/// The KDE reader reuses it: both desktops describe the same three modes over
-/// the same endpoint fields.
 pub(super) fn config_from_values(
     mode: &str,
     use_same_proxy: bool,

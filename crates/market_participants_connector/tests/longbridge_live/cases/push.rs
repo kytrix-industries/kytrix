@@ -1,6 +1,3 @@
-//! The push cases: the subscription's two pushes, the day gate, and the half-day grid
-//! (§4.6; §14.1 items 2, 4, 5).
-
 use ahash::AHashSet;
 use jiff::civil;
 use longbridge_proto::quote::{
@@ -32,13 +29,6 @@ use crate::{
     },
 };
 
-/// Reads the venue's own trading days from `beg_day` forward (cmd 9), narrowed until the
-/// venue accepts the window.
-///
-/// The venue refuses a window it calls too many days (`301600 too many query days`) and
-/// does not state the bound, so the range starts at a season's width and halves until an
-/// answer arrives; a refusal of every width stops the case rather than guessing. What is
-/// returned is `trade_day`, which is the venue's own statement of which days trade.
 async fn trading_days(socket: &mut LiveSocket, case: &str, beg_day: &str) -> Vec<String> {
     let start = civil::Date::strptime("%Y%m%d", beg_day).expect("a date this suite formatted");
     let mut refused: Vec<String> = Vec::with_capacity(4);
@@ -65,12 +55,6 @@ async fn trading_days(socket: &mut LiveSocket, case: &str, beg_day: &str) -> Vec
     panic!("{case}: the venue refused every trading-day window this case tried: {refused:?}")
 }
 
-/// Reports whether the venue's own calendar names one instant's market day a trading day.
-///
-/// The session clock cannot answer this: 09:30–16:00 ET on a Sunday is a session the venue
-/// states and a day it does not trade, and the two claims are the venue's own. A case that
-/// needs "the market is trading now" — the opening screen's current bucket, the `104`
-/// clause — reads the calendar here rather than assuming it from the clock.
 pub async fn trading_day(credentials: &Credentials, case: &str, millis: i64) -> bool {
     let day = market_date(millis);
     let mut socket = LiveSocket::connect(credentials, chosen_transport(credentials).await, true)
@@ -124,10 +108,6 @@ async fn live_case_10_a_subscription_pushes_quotes_and_trades() {
             screen_last
         );
 
-        // The venue's own calendar, read on this socket before the subscription: whether
-        // today trades is what decides whether the `104` clause can be judged at all, and
-        // the session clock cannot answer it — 09:30–16:00 ET on a Sunday is a session
-        // with no prints.
         let readings = trading_days(&mut socket, case, &market_date(now_millis())).await;
         println!(
             "{case}: the venue's calendar states {} trade day(s) from {}; half days: {}",
@@ -252,14 +232,6 @@ async fn live_case_10_a_subscription_pushes_quotes_and_trades() {
             assert_quote_snapshot(case, quote, &symbol);
         }
 
-        // The one assertion this case cannot make from a closed market, and the reason it
-        // states which situation it measured: `QUOTE | TRADE` with `is_first_push` answers a
-        // `104` only where the venue has trades to push. Three runs measured three
-        // situations — a closed market on a Saturday evening (one `101`, `session=post`),
-        // the overnight session on a Sunday morning (the same single `101`), and **a
-        // weekend inside the regular session's own clock** (Sunday 10:00 ET): the last one
-        // is why the gate is the venue's *calendar* rather than its session clock, because
-        // 09:30–16:00 ET on a day the venue does not trade is a session with no prints.
         let now = now_millis();
         let trading_day = readings.contains(&market_date(now));
         println!(
@@ -303,10 +275,6 @@ async fn live_case_10_a_subscription_pushes_quotes_and_trades() {
             );
         }
 
-        // The candle rule the design states, applied to what actually arrived: a
-        // quote push only merges inside the regular session, a daily candle only
-        // exists inside the regular session, and a frame outside every session makes
-        // no candle at all.
         let mut minute_buckets: Vec<i64> = Vec::with_capacity(quotes.len());
         let mut day_buckets: AHashSet<i64> = AHashSet::with_capacity(2);
         let mut eod_frames = 0_usize;
@@ -327,9 +295,6 @@ async fn live_case_10_a_subscription_pushes_quotes_and_trades() {
             }
             if quote.tag == PushQuoteTag::Eod as i32 {
                 eod_frames += 1;
-                // The design states that an EOD frame still runs the merge (§4.6):
-                // it can update the day's candle or roll it. What it may not do is
-                // produce a *new* day bucket outside the regular session.
                 let would_be = produces;
                 println!(
                     "      EOD frame observed: session={} -> {} a candle",
@@ -362,10 +327,6 @@ async fn live_case_10_a_subscription_pushes_quotes_and_trades() {
              (§4.6), and {quotes_in_session} did"
         );
         if trading_day {
-            // The candle the trade push opens is the other half of the in-session half of
-            // this case: a `104` inside the regular session reaches that session's own 1m
-            // bucket, which is the rule the aggregator applies. Its gate is the venue's
-            // calendar: without a trading day there are no prints to bucket at all.
             let trades_in_session = trades
                 .iter()
                 .filter(|trade| {
@@ -430,7 +391,6 @@ async fn live_case_10_a_subscription_pushes_quotes_and_trades() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 12 — the half-day calendar (cmd 9; §4.6; §14.1 item 4).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_12_the_half_day_calendar_and_a_half_days_post_session() {
@@ -448,9 +408,6 @@ async fn live_case_12_the_half_day_calendar_and_a_half_days_post_session() {
             .await
             .unwrap_or_else(|error| panic!("{case}: {error}"));
 
-        // The venue refuses a window it calls too many days (`301600 too many query
-        // days`), and it does not say what the bound is; the range starts at the
-        // season's own width and narrows until the venue answers.
         let mut calendar: Option<MarketTradeDayResponse> = None;
         let mut refused: Vec<String> = Vec::with_capacity(3);
         for days in [90_i64, 45, 20, 7] {
@@ -513,9 +470,6 @@ async fn live_case_12_the_half_day_calendar_and_a_half_days_post_session() {
 
         let today_is_half = calendar.half_trade_day.contains(&today);
         println!("  today ({today}) is a half trading day: {today_is_half}");
-        // The most recent half day the venue's own calendar states. Today's own
-        // session is only observable while today *is* a half day; on any other day the
-        // only way to see a half day's grid is to read the most recent one back.
         let probe = calendar
             .half_trade_day
             .iter()
@@ -535,9 +489,6 @@ async fn live_case_12_the_half_day_calendar_and_a_half_days_post_session() {
             "  probing the half day {probe} (today is {today}; this is a read of that day's own \
              1m candles)"
         );
-        // The half day's own candles, read back from its date: a date query would
-        // return as many candles as the venue decides, so the anchored offset query
-        // is used with the day's own closing minute as the anchor.
         let candles: SecurityCandlestickResponse = socket
             .request(
                 GET_SECURITY_HISTORY_CANDLESTICKS,
@@ -601,9 +552,6 @@ async fn live_case_12_the_half_day_calendar_and_a_half_days_post_session() {
             market_clock(first_post),
             market_clock(expected)
         );
-        // Every post candle of that day rests on the half-day table's own grid, and the
-        // 15:00 one is the discriminating case: an ordinary day's regular session would
-        // have put it on the 09:30 grid, and no grid at all would have dropped it.
         let grid: Vec<(i64, Option<i64>)> = post
             .iter()
             .map(|candle| {

@@ -1,13 +1,3 @@
-//! Tests for the order-book pane.
-//!
-//! The framework's headless host composes the services without a market directory
-//! (the connector still needs the old toolkit's runtime to build), so most
-//! interface tests construct the widget directly over a fixture directory and
-//! drive the `WidgetView` hooks — the same shape the market-trade and
-//! cryptocurrency-ETF tests use. The mount-path tests at the end drive the real
-//! framework host, which is what a pane without a directory is (a pane waiting
-//! for the market participant's metadata).
-
 use std::{
     cell::{Cell, RefCell},
     future::Future,
@@ -66,11 +56,8 @@ use widget::{
 use super::*;
 use crate::service::{OrderBookEventSubscription, OrderBookSource};
 
-// ------------------------------------------------------------------- vocabulary
-
 const PAGE: (f32, f32) = (640.0, 360.0);
 
-/// The depth the fixture route publishes: deep enough for the standard ladder.
 const FIXTURE_DEPTH: u16 = 5_000;
 
 fn product_translate(language: LanguageCode) -> Translate {
@@ -206,9 +193,6 @@ fn recovery() -> WidgetAction {
     WidgetAction::new("common.retry", |_| {})
 }
 
-// ---------------------------------------------------------------------- sources
-
-/// A source whose opening subscription never answers.
 #[derive(Clone, Copy)]
 struct PendingSource;
 
@@ -244,10 +228,6 @@ impl OrderBookEventSubscription for PendingSubscription {
     }
 }
 
-// -------------------------------------------------------------------- directory
-
-/// A directory a test drives: the scopes it has loaded and the catalogue they
-/// answer from.
 #[derive(Clone)]
 struct FixtureDirectory {
     catalog: Arc<Catalog>,
@@ -323,10 +303,6 @@ impl MarketDirectory for FixtureDirectory {
     }
 }
 
-// ---------------------------------------------------------------------- harness
-
-/// A pane under test: the framework's headless host, the widget built over the
-/// fixture directory, and the box its body and header are built into.
 struct Fixture {
     harness: WidgetTestApp,
     widget: OrderBookWidget,
@@ -471,21 +447,17 @@ impl Fixture {
         self.with_cx(|widget, cx| widget.apply_rpc(request_id, result, cx));
     }
 
-    /// Accepts a book and reports the ready revision that describes it, in the
-    /// order the two channels can deliver them.
     fn accept(&mut self, snapshot: OrderBookSnapshot) {
         let sequence = snapshot.sequence.clone();
         self.apply_latest(snapshot);
         self.apply_reliable(OrderBookStatus::Ready { revision: sequence });
     }
 
-    /// One production-shaped round: the widget synchronizes, then the frame runs.
     fn frame(&mut self) {
         self.sync();
         self.drain();
     }
 
-    /// Builds the body, lets the layout settle, then draws one frame.
     fn draw(&mut self) {
         self.body();
         self.drain();
@@ -493,7 +465,6 @@ impl Fixture {
         self.frame();
     }
 
-    /// The text one column of one mounted ladder row states.
     fn row_text(&self, side: RowSide, row: usize, column: usize) -> String {
         let list = match side {
             RowSide::Ask => self.widget.ask_list.as_ref(),
@@ -543,14 +514,10 @@ impl Fixture {
     }
 }
 
-// ----------------------------------------------------------------- status & waits
-
-/// A pane over the fixture route's listing, loaded or not.
 fn pane(loaded: bool) -> Fixture {
     Fixture::new(config(Some("BTC")), vec![default_entry()], loaded)
 }
 
-/// A box the pane's body or a header group is built into.
 fn leaf(harness: &mut WidgetTestApp, id: &'static str, size: (f32, f32)) -> NodeId {
     harness.with_cx(|cx| {
         let root = cx.tree().root();
@@ -568,13 +535,6 @@ fn leaf(harness: &mut WidgetTestApp, id: &'static str, size: (f32, f32)) -> Node
     })
 }
 
-// ------------------------------------------------------------------- canvas reads
-
-/// The canvas node one `TEST_*` selector draws into.
-///
-/// The lookups elsewhere use the debug-id *prefix*, which is not enough here: the
-/// imbalance row's own id (`TEST_ORDER_BOOK_IMBALANCE_ROW`) is a prefix match for
-/// the canvas inside it. The debug id has to be exact.
 fn canvas_node(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> NodeId {
     let tree = harness.tree();
     let mut stack = vec![parent];
@@ -598,7 +558,6 @@ fn canvas_node(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> NodeI
     panic!("`{selector}` is not drawn; debug ids: {seen:?}");
 }
 
-/// One canvas node's content, as `set_canvas` last wrote it.
 fn canvas_of(harness: &WidgetTestApp, node: NodeId) -> &Canvas {
     match harness
         .tree()
@@ -611,7 +570,6 @@ fn canvas_of(harness: &WidgetTestApp, node: NodeId) -> &Canvas {
     }
 }
 
-/// One canvas node's shared frame; every `set_canvas` replaces it with a new one.
 fn canvas_arc(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> Arc<Canvas> {
     let node = canvas_node(harness, parent, selector);
     match harness
@@ -625,7 +583,6 @@ fn canvas_arc(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> Arc<Ca
     }
 }
 
-/// The solid quads one canvas draws, in paint order.
 fn canvas_quads(canvas: &Canvas) -> Vec<Quad> {
     canvas
         .primitives()
@@ -637,7 +594,6 @@ fn canvas_quads(canvas: &Canvas) -> Vec<Quad> {
         .collect()
 }
 
-/// The width of every depth bar drawn on one canvas.
 fn canvas_bar_widths(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> Vec<f32> {
     canvas_quads(canvas_of(harness, canvas_node(harness, parent, selector)))
         .into_iter()
@@ -645,7 +601,6 @@ fn canvas_bar_widths(harness: &WidgetTestApp, parent: NodeId, selector: &str) ->
         .collect()
 }
 
-/// Whether the pane's depth-easing timer chain still has a tick to run.
 fn depth_is_ticking(fixture: &Fixture) -> bool {
     fixture
         .widget
@@ -767,7 +722,6 @@ fn a_catalog_lookup_failure_should_preserve_the_selection() {
     assert_eq!(fixture.publishes.get(), 0);
 }
 
-/// A directory whose catalogue cannot answer, which proves nothing.
 struct FailingDirectory {
     failure: CatalogError,
     catalog: Arc<Catalog>,
@@ -821,8 +775,6 @@ impl MarketDirectory for FailingDirectory {
         self.catalog.cached_display()
     }
 }
-
-// ---------------------------------------------------------------------- content
 
 #[test]
 fn an_accepted_book_should_become_content_and_report_ready() {
@@ -923,8 +875,6 @@ fn a_ready_status_that_overtakes_its_book_should_wait_for_it() {
     assert_eq!(fixture.status(), WidgetState::Loading);
     assert!(!fixture.widget.has_content());
 
-    // A book older than the revision the status named is not the book that was
-    // promised: the pane is still working, and only the content moves.
     fixture.apply_latest(snapshot(2, &[("101", "1")], &[("100", "1")]));
     assert_eq!(
         fixture.status(),
@@ -1034,8 +984,6 @@ fn a_retry_after_a_failure_should_keep_the_ladder() {
         "the retry is the command in flight"
     );
 }
-
-// --------------------------------------------------------------------- directory
 
 #[test]
 fn a_directory_generation_change_should_reload_the_book() {
@@ -1162,9 +1110,6 @@ fn a_directory_generation_should_not_revive_a_failed_pane() {
     );
 }
 
-// --------------------------------------------------------------- request identity
-
-/// The directory withdraws a stored listing only on an answer that proves it gone.
 #[test]
 fn a_listing_its_route_still_publishes_should_be_offered() {
     let fixture = test_support::Fixture::new(vec![default_entry()]);
@@ -1238,11 +1183,9 @@ fn the_answer_to_a_replaced_command_should_be_dropped() {
         vec![default_entry(), eth_entry()],
         true,
     );
-    // The first command: the load the fixture ran on construction.
     let replaced = RequestId::new(1);
     fixture.write_selection(selection("ETH"));
     fixture.sync();
-    // The replacement is the new command; the old identity now belongs to nobody.
     assert_eq!(fixture.widget.pending.dropped(), 0);
 
     fixture.apply_rpc(
@@ -1334,8 +1277,6 @@ fn selecting_the_scope_that_is_already_shown_should_not_restart_the_book() {
     );
 }
 
-// ---------------------------------------------------------------------- grouping
-
 #[test]
 fn changing_the_grouping_should_regroup_the_book_without_dropping_it() {
     let mut fixture = pane(true);
@@ -1410,8 +1351,6 @@ fn the_laid_out_height_should_limit_the_grouped_rows() {
     fixture.body();
     fixture.drain();
 
-    // The page is 360 px tall; the two ladders split what the headers and the
-    // mid-price row leave, so each side fits far fewer than the 25 rows asked for.
     fixture.frame();
     fixture.frame();
 
@@ -1465,8 +1404,6 @@ fn a_supported_choice_should_survive_settling() {
     assert_eq!(config.window_size, WINDOW_SIZES[2]);
 }
 
-// ------------------------------------------------------------------- animation
-
 #[test]
 fn reduce_motion_should_put_the_bars_where_they_belong() {
     let mut fixture = pane(true);
@@ -1497,7 +1434,6 @@ fn an_imperceptible_movement_should_not_start_an_animation() {
     let mut fixture = pane(true);
     fixture.accept(snapshot(1, &[("101", "1")], &[("100", "1")]));
 
-    // The second book is the same drawing: no bars moved, so no timer is started.
     fixture.accept(snapshot(2, &[("101", "1")], &[("100", "1")]));
 
     assert!(fixture.widget.depth_ticker.is_none());
@@ -1511,7 +1447,6 @@ fn an_imperceptible_movement_should_not_start_an_animation() {
 fn the_depth_animation_should_ease_the_bars_on_the_canvas_tick_by_tick() {
     let mut fixture = pane(true);
     let reduce_motion = fixture.harness.services().reduce_motion;
-    // The first book arrives settled, so the movement this test watches is the second.
     fixture.harness.app_mut().write(&reduce_motion, true);
     fixture.accept(snapshot(1, &[("101", "1"), ("102", "3")], &[("100", "2")]));
     fixture.draw();
@@ -1524,12 +1459,8 @@ fn the_depth_animation_should_ease_the_bars_on_the_canvas_tick_by_tick() {
     );
     fixture.harness.app_mut().write(&reduce_motion, false);
 
-    // The second book moves the best ask from a quarter to three quarters of the
-    // visible depth. The chain restarts from the frame already painted.
     fixture.accept(snapshot(2, &[("101", "3"), ("102", "1")], &[("100", "2")]));
     fixture.sync();
-    // The sync that publishes the new book asked for a frame; let it commit so the
-    // wait below measures the tick chain only.
     fixture.drain();
     assert!(depth_is_ticking(&fixture), "the movement started a timer");
     let progress = fixture.widget.depth_progress;
@@ -1540,7 +1471,6 @@ fn the_depth_animation_should_ease_the_bars_on_the_canvas_tick_by_tick() {
         "the bars start from where the frame before painted them"
     );
 
-    // One tick is 16 ms of engine time: nothing moves before it is due ...
     fixture.harness.advance(Duration::from_millis(15));
     assert_eq!(
         *fixture.harness.app().read(&progress),
@@ -1552,7 +1482,6 @@ fn the_depth_animation_should_ease_the_bars_on_the_canvas_tick_by_tick() {
         settled,
         "a partial tick writes no canvas"
     );
-    // ... and the due tick asks for the frame that draws the eased bars.
     let before = fixture.harness.frame_requests();
     fixture.harness.advance(Duration::from_millis(1));
     assert!(
@@ -1572,7 +1501,6 @@ fn the_depth_animation_should_ease_the_bars_on_the_canvas_tick_by_tick() {
         "the canvas follows the eased progress: {moved:?}"
     );
 
-    // The chain runs to the ratio the new book asks for and stops there.
     let mut ticks = 1;
     while depth_is_ticking(&fixture) && ticks < 200 {
         fixture.harness.advance(DEPTH_ANIMATION_TICK);
@@ -1624,10 +1552,6 @@ fn the_mid_price_should_take_the_direction_it_moved_in() {
     );
 }
 
-// ------------------------------------------------------------------------ body
-
-/// A book that has not moved draws no frame and writes no canvas: the rows, the
-/// bars and the lists all write only what changed (I3).
 #[test]
 fn a_steady_book_should_not_ask_for_a_frame() {
     let mut fixture = pane(true);
@@ -1697,10 +1621,6 @@ fn the_body_should_draw_the_ladder_it_was_given() {
     assert!(fixture.widget.bid_list.is_some());
 }
 
-/// The bars are what the pane draws itself, so the frame content has to be
-/// asserted on the canvases: one solid quad per visible level, at the level's
-/// share of the side's depth, anchored to the row's right edge, in the themed
-/// side colour — and the imbalance split in the same two colours.
 #[test]
 fn the_depth_bars_should_be_drawn_on_the_canvases_it_owns() {
     let mut fixture = pane(true);
@@ -1715,7 +1635,6 @@ fn the_depth_bars_should_be_drawn_on_the_canvases_it_owns() {
     let ask_color = resolved.role(RowSide::Ask.depth_role());
     let bid_color = resolved.role(RowSide::Bid.depth_role());
 
-    // The ask side: the clip it installs, then one solid quad per visible level.
     let ask_node = canvas_node(&fixture.harness, fixture.page, ASK_BARS_SELECTOR);
     let ask_canvas = canvas_of(&fixture.harness, ask_node);
     assert!(
@@ -1757,7 +1676,6 @@ fn the_depth_bars_should_be_drawn_on_the_canvases_it_owns() {
         "each bar is its level's share of the visible ask depth: {ask_ratios:?}"
     );
 
-    // The bid side is the same drawing in the other role colour.
     let bid_node = canvas_node(&fixture.harness, fixture.page, BID_BARS_SELECTOR);
     let bid_canvas = canvas_of(&fixture.harness, bid_node);
     let bid_quads = canvas_quads(bid_canvas);
@@ -1771,7 +1689,6 @@ fn the_depth_bars_should_be_drawn_on_the_canvases_it_owns() {
     );
     assert!((bid_quads[0].bounds.size.width / bid_canvas.bounds().size.width - 1.0).abs() < 0.01);
 
-    // The imbalance bar: the ask share from the left, the bid share from the right.
     let imbalance_node = canvas_node(
         &fixture.harness,
         fixture.page,
@@ -1918,8 +1835,6 @@ fn a_language_change_should_relabel_the_panes_own_copy() {
     );
 }
 
-// ----------------------------------------------------------------------- header
-
 #[test]
 fn the_header_should_offer_the_instrument_control_and_the_drawing_controls() {
     let mut fixture = pane(true);
@@ -1965,8 +1880,6 @@ fn a_drawing_choice_should_reach_the_next_sync() {
         .price_step
         .clone();
 
-    // The picker's own change path: choosing an item notifies the callback the
-    // widget wired, which parses the id and hands the choice to the next sync.
     price_step.set_chosen(
         fixture.harness.app_mut(),
         [format_smolstr!("{multiplier}").as_str()],
@@ -2058,8 +1971,6 @@ fn the_drawing_pickers_should_be_disabled_until_a_book_is_shown() {
         "a disabled picker does not open its panel"
     );
 
-    // A book makes the choices mean something: the picker is rebuilt enabled and
-    // the same trigger action opens it.
     fixture.accept(snapshot(1, &[("101", "1")], &[("100", "1")]));
     fixture.frame();
     let header = fixture
@@ -2187,8 +2098,6 @@ fn two_panes_should_not_share_a_single_component_key() {
         .control
         .node();
 
-    // The second pane: one more pane of the same widget over the same directory, with
-    // its own signal scope — what `AnyWidget::mount` mints for each pane.
     let right = fixture.right;
     let (peer, peer_keys) = {
         let services = Rc::clone(fixture.harness.services_rc());
@@ -2265,8 +2174,6 @@ fn two_panes_should_not_share_a_single_component_key() {
         );
     }
 
-    // Releasing the first pane takes down only its own controls: the second pane's
-    // handlers and nodes stay standing.
     fixture.with_cx(|widget, cx| widget.release(cx));
     for action in &first_actions {
         assert!(
@@ -2291,12 +2198,9 @@ fn two_panes_should_not_share_a_single_component_key() {
 fn a_rebuilt_header_control_should_not_leak_its_component_scope() {
     let mut fixture = pane(true);
     fixture.headers();
-    // One frame first, so the controls the first build minted are behind us.
     fixture.frame();
     let before = fixture.harness.signal_slot_stats().live;
 
-    // Two language switches rebuild both groups in place; each rebuild releases the
-    // component it replaces — the selectors' own scope included (P2-10).
     for language in [LanguageCode::ZhCn, LanguageCode::En] {
         fixture.harness.switch_language(language);
         fixture.frame();
@@ -2309,8 +2213,6 @@ fn a_rebuilt_header_control_should_not_leak_its_component_scope() {
         "a rebuilt header hands every value slot back: {before} -> {after}"
     );
 }
-
-// ---------------------------------------------------------------------- release
 
 #[test]
 fn mounting_and_releasing_the_pane_should_reuse_its_value_slots() {
@@ -2368,8 +2270,6 @@ fn releasing_the_pane_should_reclaim_its_value_slots_and_canvases() {
     assert!(fixture.widget.depth_ticker.is_none());
     let _ = page;
 }
-
-// ------------------------------------------------------------------------ config
 
 #[test]
 fn a_config_should_round_trip_through_its_persisted_form() {
@@ -2432,8 +2332,6 @@ fn a_row_limit_should_survive_settling_without_a_route() {
     assert!(!config.settle(None));
     assert_eq!(config.window_size, crate::model::SHALLOW_WINDOW_SIZES[0]);
 }
-
-// ------------------------------------------------------------------------ mount
 
 #[test]
 fn a_host_without_a_directory_should_wait_for_its_market() {

@@ -1,8 +1,3 @@
-//! Tests of the book panel: the pure ladder state (row mapping, anchoring,
-//! grouping, depth easing and the splitter's arithmetic) and the engine-level
-//! drawing contract (list rows, depth-bar quads, steady frames, the depth timer
-//! and release).
-
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use base_ui::{
@@ -30,13 +25,10 @@ use super::{
 };
 use crate::test_support::{charted_market, event_ref, level, order_book};
 
-/// The fixed page the fixture mounts the panel into.
 const PAGE: (f32, f32) = (400.0, 400.0);
 
-/// The height of one ladder row, as the depth-bar expectations use it.
 const ROW_HEIGHT: f32 = 22.0;
 
-/// The depth timer's tick.
 const TICK: Duration = Duration::from_millis(16);
 
 const HEADER_SELECTOR: &str = "TEST_PREDICTION_MARKET_BOOK_HEADER";
@@ -60,12 +52,10 @@ fn levels(pairs: &[(&str, &str)]) -> Vec<PredictionBookLevel> {
         .collect()
 }
 
-/// One fixture book of the charted market's first side.
 fn book(tick: &str, bids: &[(&str, &str)], asks: &[(&str, &str)]) -> Arc<PredictionOrderBook> {
     Arc::new(order_book(leg(0), tick, levels(bids), levels(asks)))
 }
 
-/// A ladder deeper than the fixture page, so the list has to scroll.
 fn deep_book(levels_per_side: usize) -> Arc<PredictionOrderBook> {
     let asks: Vec<PredictionBookLevel> = (0..levels_per_side)
         .map(|index| level(&format!("0.{:03}", 200 + index), "10"))
@@ -76,18 +66,14 @@ fn deep_book(levels_per_side: usize) -> Arc<PredictionOrderBook> {
     Arc::new(order_book(leg(0), "0.001", bids, asks))
 }
 
-/// The depth key of one fixture price.
 fn key(is_ask: bool, price: &str) -> (bool, u128) {
     let price: Fraction = price.parse().expect("the fixture price is a fraction");
     (is_ask, price.ratio().inner())
 }
 
-/// The depth key of one grouped level.
 fn level_key(is_ask: bool, level: &GroupedLevel) -> (bool, u128) {
     (is_ask, level.price.ratio().inner())
 }
-
-// ------------------------------------------------------------------ pure state
 
 #[test]
 fn the_ladder_should_put_the_best_ask_directly_above_the_spread_row() {
@@ -263,7 +249,6 @@ fn another_side_or_another_grouping_should_jump_instead_of_moving() {
     panel.set_book(book("0.001", &[], &[("0.341", "10"), ("0.342", "10")]), 1);
     let initial = panel.animation.to.clone();
 
-    // Another grouping is another set of rows, not a movement of the old ones.
     panel.set_multiplier(10);
     assert_eq!(panel.multiplier, 10);
     assert!(!panel.animation.active);
@@ -283,7 +268,6 @@ fn another_side_or_another_grouping_should_jump_instead_of_moving() {
         "the grouped depths are rebuilt at the new step"
     );
 
-    // Another side is another ladder as well.
     panel.clear();
     assert!(panel.is_empty());
     assert!(!panel.anchor_pending);
@@ -358,8 +342,6 @@ fn the_grouping_choice_should_follow_the_book_and_fall_back_to_its_tick() {
     );
     assert_eq!(panel.grouping_label(), None);
 
-    // A half-share tick offers a step of one share, which is not a price: the
-    // ladder is drawn at the venue's own tick, which is also the fallback label.
     panel.set_book(book("0.5", &[("0.4", "10")], &[("0.6", "10")]), 1);
     assert!(!panel.has_grouping_choice());
     assert_eq!(
@@ -401,9 +383,6 @@ fn split_ratio_should_follow_the_pointer_and_stay_inside_the_area() {
     );
 }
 
-// -------------------------------------------------------------- engine drawing
-
-/// The panel mounted into a fixed page over the framework's headless host.
 struct Fixture {
     harness: WidgetTestApp,
     panel: PredictionBookPanel,
@@ -587,8 +566,6 @@ fn an_empty_page_should_leave_the_anchor_pending_for_the_next_ladder() {
     fixture.draw();
     assert!(!fixture.panel.anchor_pending, "the first frame consumed it");
 
-    // A whole-book replace with no level at all is still the same leg and tick,
-    // so it is the same ladder — only an empty one.
     fixture.set_book(book("0.001", &[], &[]), 1);
     assert!(fixture.panel.is_empty());
     assert!(
@@ -606,8 +583,6 @@ fn an_empty_page_should_leave_the_anchor_pending_for_the_next_ladder() {
         "and it draws no row at all"
     );
 
-    // The refill is a new ladder: it is anchored again instead of being dragged
-    // as if its rows had been on screen all along.
     ladder(&mut fixture);
     assert!(fixture.panel.anchor_pending);
     fixture.draw();
@@ -684,7 +659,6 @@ fn a_steady_sync_should_write_no_canvas_and_ask_for_no_frame() {
     fixture.reduce_motion(true);
     fixture.set_book(book("0.01", &[], &[("0.40", "10"), ("0.50", "10")]), 1);
     fixture.set_book(book("0.01", &[], &[("0.40", "10"), ("0.50", "30")]), 1);
-    // Two frames settle the list's own scrollbar geometry as well as the bars.
     fixture.draw();
     fixture.draw();
     assert!(
@@ -715,9 +689,6 @@ fn a_steady_sync_should_write_no_canvas_and_ask_for_no_frame() {
         requests,
         "a steady sync asks for no frame (I3)"
     );
-    // The kit list's scrollbar fades on the engine clock, so the commit cursor is
-    // not the panel's idle surface: it is the frame requests (above) and the
-    // untouched canvas (above) that prove the panel wrote nothing.
     assert!(!fixture.panel.timer_armed());
 }
 
@@ -823,9 +794,6 @@ fn the_depth_bars_should_follow_the_lists_scroll_offset() {
         quads.len()
     );
 
-    // The offset is part of what the canvas was drawn from: the list moving without a
-    // new book is still a frame the depth bars owe, and the bars on screen have to be
-    // laid out from the offset the list is at now.
     fixture
         .panel
         .scroll_to_item_for_test(fixture.harness.app_mut(), 20, ItemAlign::Start)
@@ -944,8 +912,6 @@ fn releasing_the_panel_should_return_its_value_slots() {
         harness.signal_slot_stats().live > baseline.live,
         "a built panel mints values of its own"
     );
-    // A ladder with rows and an armed depth tick is the state the pane releases
-    // after a frame: the list's row contents must go with the list's scope.
     panel.set_book(
         book("0.01", &[("0.30", "10")], &[("0.36", "10"), ("0.40", "10")]),
         1,

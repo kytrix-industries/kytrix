@@ -1,15 +1,3 @@
-//! The persisted network, proxy, and outbound-route configuration model.
-//!
-//! Every outbound request is routed by a [`ProxyRoute`]: a venue by its own line,
-//! a service target by its application, and one that names no line by the
-//! document's default line. The model is persisted with the rest of the
-//! application settings and materialized into [`ResolvedProxy`] hops by the
-//! `network` transport before any request is sent.
-//!
-//! A venue's own line lives in its market-participant settings rather than here: this module
-//! is the proxy catalog and the routes over it, and the market-participant settings name one
-//! of these lines for the venue they configure.
-
 use std::{collections::BTreeMap, fmt, net::Ipv6Addr};
 
 use market_participants_model::identifier::VenueId;
@@ -18,7 +6,6 @@ use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
 use url::{Host, Url};
 
-/// Kytrix service capabilities that use independent outbound routes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum KytrixServiceCapability {
     #[serde(rename = "account")]
@@ -37,37 +24,20 @@ pub enum KytrixServiceCapability {
     SolanaWallet,
     #[serde(rename = "x_media")]
     XMedia,
-    /// The CMC crypto fear and greed index, a snapshot the Kytrix service reads.
     #[serde(rename = "coin_market_cap_fear_and_greed_index")]
     CoinMarketCapFearAndGreedIndex,
-    /// The financial calendar, a snapshot of scheduled economic events.
     #[serde(rename = "financial_calendar")]
     FinancialCalendar,
-    /// The Pentagon Pizza Index, a snapshot the Kytrix service reads.
-    ///
-    /// It is one of Kytrix's own outbound routes rather than a venue's: no market
-    /// participant publishes it, and it has no catalog of its own. The index itself
-    /// needs no account, but the service serves it over the authenticated connection
-    /// the pane already holds, so it is configured here like every other capability
-    /// and shares the cloud line with them.
     #[serde(rename = "pentagon_pizza_index")]
     PentagonPizzaIndex,
     #[serde(rename = "updater_metadata")]
     UpdaterMetadata,
     #[serde(rename = "updater_download")]
     UpdaterDownload,
-    /// The strategic maritime chokepoints vessel feed the Kytrix service pushes for one area.
     #[serde(rename = "global_shipping_chokepoint")]
     GlobalShippingChokepoint,
 }
 
-/// Generic outbound route identity.
-///
-/// The network crate never interprets a target; it forwards it as a typed
-/// configuration key. A venue is not a target: its requests are routed by the
-/// venue's own configuration, which names a line of its own or follows the
-/// default line, so the targets that remain are Kytrix's own services and the
-/// built-in model download.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ServiceTarget {
@@ -76,11 +46,6 @@ pub enum ServiceTarget {
         #[serde(rename = "capability")]
         capability: KytrixServiceCapability,
     },
-    /// A download of one of the local translation models.
-    ///
-    /// The files come from the download site the user chose — HuggingFace or
-    /// ModelScope — rather than from a Kytrix service, but the download still takes
-    /// one of the application's outbound routes, so it is a service target of its own.
     #[serde(rename = "translation_model_download")]
     TranslationModelDownload,
 }
@@ -96,7 +61,6 @@ impl fmt::Display for ServiceTarget {
     }
 }
 
-/// Configured outbound choice for one target.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ProxyRoute {
@@ -129,10 +93,6 @@ impl ProxyRoute {
     }
 }
 
-/// Proxy catalog entry.
-///
-/// Named proxies are always SOCKS5 endpoints. `addr` accepts a host name, an
-/// IPv4 literal, or an IPv6 literal in either bracketed or bare form.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub addr: SmolStr,
@@ -202,10 +162,6 @@ impl fmt::Debug for ProxyCredentials {
     }
 }
 
-/// One outbound hop that a route has been materialized into.
-///
-/// `host` is a URL authority host: a host name, an IPv4 literal, or a bracketed
-/// IPv6 literal.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ResolvedProxy {
     NoProxy,
@@ -224,10 +180,6 @@ pub enum ResolvedProxy {
 }
 
 impl ResolvedProxy {
-    /// Renders the hop as the proxy URL an HTTP client expects.
-    ///
-    /// Credentials are carried in the URL userinfo, which is what both the
-    /// SOCKS5 and the HTTP proxy paths of the HTTP client read them from.
     pub fn endpoint_url(&self) -> Option<String> {
         let (scheme, host, port, credentials) = match self {
             Self::NoProxy => return None,
@@ -269,19 +221,9 @@ impl ResolvedProxy {
     }
 }
 
-/// Who one outbound route is resolved for.
-///
-/// A venue is routed by the venue's own configuration — the line it names, or the
-/// default line it names none of — and a Kytrix service by its application, and
-/// both are resolved through the same network layer, so a resolution that has to
-/// name its subject names one of these. The two are not interchangeable — a venue
-/// is not a service target, and the configuration that routes it is not the map a
-/// service is looked up in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteTarget {
-    /// One venue's requests.
     Venue(VenueId),
-    /// One of Kytrix's own services.
     Service(ServiceTarget),
 }
 
@@ -320,11 +262,6 @@ pub enum ConfigError {
     InvalidSystemProxy { target: RouteTarget },
 }
 
-/// Why a named catalog entry cannot be materialized.
-///
-/// The catalog entry is the same for every target that selects it, so this
-/// error deliberately carries no target: the default route has none, and two
-/// targets sharing a proxy must not disagree about whether it is usable.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum NamedProxyError {
     #[error("proxy {name:?} does not exist")]
@@ -338,7 +275,6 @@ pub enum NamedProxyError {
 }
 
 impl NamedProxyError {
-    /// Attributes this failure to the target that selected the entry.
     pub fn for_target(self, target: &RouteTarget) -> ConfigError {
         match self {
             Self::Missing { name } => ConfigError::DanglingProxyReference {
@@ -361,56 +297,34 @@ impl NamedProxyError {
     }
 }
 
-/// Monotonic version of the proxy routing decision for one target.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NetworkRouteGeneration(u64);
 
 impl NetworkRouteGeneration {
-    /// Creates a generation from a published counter value.
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
-    /// Returns the published counter value.
     pub const fn get(self) -> u64 {
         self.0
     }
 }
 
-/// The generations stamped onto one persisted [`Config`].
-///
-/// Generations advance only when the effective route for a target changes, so
-/// a settings rewrite that leaves routing untouched keeps every consumer's
-/// resolved connections valid. A venue and a Kytrix service are stamped apart:
-/// they are routed by different configuration, and one moving must not
-/// invalidate the other's connections.
 #[derive(Clone, Debug, Default)]
 pub struct NetworkRuntimeGenerations {
     pub default_route: NetworkRouteGeneration,
-    /// The generation of each venue's proxy decision, keyed by venue.
     pub venues: BTreeMap<VenueId, NetworkRouteGeneration>,
-    /// The generation of each service target's route, keyed by service target.
     pub services: BTreeMap<ServiceTarget, NetworkRouteGeneration>,
 }
 
-/// Immutable network-only configuration snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub proxies: BTreeMap<SmolStr, ProxyConfig>,
     pub proxy_default: ProxyRoute,
-    /// The outbound route of each service target, keyed by service target.
     pub proxy_applications: BTreeMap<ServiceTarget, ProxyRoute>,
-    /// The outbound route of each venue that names one of its own, keyed by
-    /// venue.
-    ///
-    /// A venue this map does not name follows [`Self::proxy_default`], which is
-    /// what a venue whose configuration carries no line of its own is projected
-    /// to.
     pub venue_routes: BTreeMap<VenueId, ProxyRoute>,
     pub default_route_generation: NetworkRouteGeneration,
-    /// The generation of each venue's proxy decision, keyed by venue.
     pub route_generations: BTreeMap<VenueId, NetworkRouteGeneration>,
-    /// The generation of each service target's route, keyed by service target.
     pub service_route_generations: BTreeMap<ServiceTarget, NetworkRouteGeneration>,
 }
 
@@ -429,10 +343,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Returns the outbound route one venue's requests take.
-    ///
-    /// A venue that names a line carries it; a venue that names none follows the
-    /// default, exactly as a service without an override does.
     pub fn proxy_route_for(&self, venue: &VenueId) -> ProxyRoute {
         self.venue_routes
             .get(venue)
@@ -440,7 +350,6 @@ impl Config {
             .unwrap_or_else(|| self.proxy_default.clone())
     }
 
-    /// Returns the outbound route one service target takes.
     pub fn service_proxy_route_for(&self, target: &ServiceTarget) -> ProxyRoute {
         self.proxy_applications
             .get(target)
@@ -448,7 +357,6 @@ impl Config {
             .unwrap_or_else(|| self.proxy_default.clone())
     }
 
-    /// Returns the proxy generation of one venue.
     pub fn network_route_generation(&self, venue: &VenueId) -> NetworkRouteGeneration {
         self.route_generations
             .get(venue)
@@ -456,7 +364,6 @@ impl Config {
             .unwrap_or(self.default_route_generation)
     }
 
-    /// Returns the proxy generation of one service target.
     pub fn service_network_route_generation(
         &self,
         target: &ServiceTarget,
@@ -467,10 +374,6 @@ impl Config {
             .unwrap_or(self.default_route_generation)
     }
 
-    /// Materializes a named SOCKS5 catalog entry for one target.
-    ///
-    /// Invalid bindings fail closed: a missing, malformed, or incomplete entry
-    /// never degrades into a direct connection.
     pub fn resolve_named_proxy(
         &self,
         target: &RouteTarget,
@@ -480,11 +383,6 @@ impl Config {
             .map_err(|error| error.for_target(target))
     }
 
-    /// Materializes a named SOCKS5 catalog entry without a target context.
-    ///
-    /// The entry itself is independent of who selects it, which is what lets the
-    /// configuration manager fingerprint the default route — the one route
-    /// without a target.
     pub fn resolve_named_proxy_entry(&self, name: &str) -> Result<ResolvedProxy, NamedProxyError> {
         let proxy = self
             .proxies
@@ -524,12 +422,6 @@ impl Config {
     }
 }
 
-/// Normalizes a configured or discovered proxy address into a URL authority
-/// host: a host name, an IPv4 literal, or a bracketed IPv6 literal.
-///
-/// A bare IPv6 literal is bracketed so that every later endpoint rendering
-/// stays valid URL syntax. This is the single place where both the named-proxy
-/// catalog and the operating-system proxy readers turn an address into a host.
 pub fn normalize_proxy_host(addr: &str) -> Option<SmolStr> {
     let addr = addr.trim();
     if addr.is_empty() {
@@ -559,7 +451,6 @@ mod tests {
         RouteTarget, ServiceTarget,
     };
 
-    /// The venue the proxy tests route for.
     fn venue() -> VenueId {
         VenueId::Binance
     }
@@ -757,8 +648,6 @@ mod tests {
             }),
             resolve_dns_at_remote: true,
         };
-        // The HTTP client percent-decodes the userinfo, so reserved characters
-        // have to survive the round trip through the rendered URL.
         let url = Url::parse(&route.endpoint_url().expect("an endpoint")).unwrap();
         assert_eq!(url.scheme(), "socks5h");
         assert_eq!(url.host_str(), Some("proxy.example"));
@@ -795,8 +684,6 @@ mod tests {
         assert_eq!(ResolvedProxy::NoProxy.endpoint_url(), None);
     }
 
-    /// A venue that names a route is routed by it; one that names none follows the
-    /// default, exactly as a Kytrix service without an override does.
     #[test]
     fn proxy_route_for_falls_back_to_the_default_route() {
         let target = target();
@@ -840,7 +727,6 @@ mod tests {
         assert_eq!(direct, ProxyRoute::Direct);
     }
 
-    /// A venue without its own generation follows the snapshot value.
     #[test]
     fn route_generations_default_to_the_snapshot_value() {
         let mut config = Config::default();
@@ -858,8 +744,6 @@ mod tests {
         assert_eq!(config.network_route_generation(&venue()).get(), 9);
     }
 
-    /// A service target is the only target left: a venue is configured, not
-    /// addressed.
     #[test]
     fn service_target_should_use_the_explicit_wire_shape() {
         assert_eq!(
@@ -933,7 +817,6 @@ mod tests {
         assert_eq!(target.to_string(), "translation model download");
     }
 
-    /// A service target is an ordered key: a rewritten file keeps its order.
     #[test]
     fn service_target_should_keep_a_stable_order_as_a_btree_key() {
         let targets = [
@@ -975,9 +858,6 @@ mod tests {
         );
     }
 
-    /// The model download target is a key of the same map: it sorts after every
-    /// Kytrix service capability and a separate but equal value addresses the same
-    /// entry.
     #[test]
     fn translation_model_download_should_be_an_ordered_and_equal_btree_key() {
         let service = target();
@@ -998,8 +878,6 @@ mod tests {
         assert_ne!(download, target());
     }
 
-    /// A venue that names a route and a generation of its own owns them; the
-    /// venue that names none is the one that follows the snapshot's defaults.
     #[test]
     fn a_venue_owns_the_route_and_generation_it_names() {
         let binance = venue();

@@ -1,11 +1,3 @@
-//! The open-interest chart: two lines over one time axis.
-//!
-//! The two series are the same open interest measured two ways — the size of the
-//! position in the base asset, and what it was worth in the quote asset — so they are
-//! drawn on their own axes rather than on a shared one. A shared axis would have to
-//! compare a number of coins with a number of dollars, and the smaller series would be
-//! flattened against the floor by the larger.
-
 use std::sync::Arc;
 
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -25,14 +17,12 @@ use super::{
 };
 use crate::model::{OpenInterestPoint, StatisticsPoints, quantity_as_f64};
 
-/// The asset each series is measured in, which a tooltip names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Units {
     base: SmolStr,
     quote: SmolStr,
 }
 
-/// The names this chart shows, resolved from the active language.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Labels {
     amount: SmolStr,
@@ -40,7 +30,6 @@ struct Labels {
 }
 
 impl Labels {
-    /// Resolves the series names from the active language.
     fn resolve(translate: &Translate) -> Self {
         Self {
             amount: t_smol!(translate, "widget.perpetual_statistics.amount"),
@@ -49,7 +38,6 @@ impl Labels {
     }
 }
 
-/// The open-interest chart's state.
 pub(crate) struct OpenInterestChart {
     points: Arc<[OpenInterestPoint]>,
     metadata: Option<ListingPrecision>,
@@ -64,12 +52,10 @@ pub(crate) struct OpenInterestChart {
     legend: Box<[SeriesLabel]>,
     amount_title: SmolStr,
     value_title: SmolStr,
-    /// The zone the axis labels and tooltips were written in.
     zone: UtcOffset,
 }
 
 impl OpenInterestChart {
-    /// Builds an empty chart of the two series of `instrument`.
     pub(crate) fn new(translate: &Translate, base: &str, quote: &str, zone: UtcOffset) -> Self {
         Self::build(
             Arc::from(Vec::new()),
@@ -124,12 +110,6 @@ impl OpenInterestChart {
         });
         let amount_label = label_with_unit(labels.amount.as_str(), units.base.as_str());
         let value_label = label_with_unit(labels.value.as_str(), units.quote.as_str());
-        // Neither line of this tooltip is read in a series colour. The two are one
-        // instrument measured two ways, and each is already named by its own label with
-        // the asset it is measured in, so a colour could only be a second, weaker way of
-        // telling them apart — one that has to be read against the legend's swatches to
-        // mean anything. Both lines read in the tooltip's own foreground, the colour the
-        // time above them is written in.
         let tooltips = points
             .iter()
             .map(|point| Tooltip {
@@ -148,9 +128,6 @@ impl OpenInterestChart {
                         color: None,
                     },
                     TooltipEntry {
-                        // An interval the venue published no amount for has no line to
-                        // name: saying so is what keeps a missing reading from reading as
-                        // a value of zero.
                         text: labelled_value(
                             value_label.as_str(),
                             point.quote_asset_volume.map_or_else(
@@ -196,7 +173,6 @@ impl OpenInterestChart {
         }
     }
 
-    /// The chart rebuilt with new names, in the language they were resolved in.
     fn with_labels(&mut self, translate: &Translate) -> bool {
         let labels = Labels::resolve(translate);
         if labels == self.labels {
@@ -264,10 +240,6 @@ impl ChartData for OpenInterestChart {
         self.tooltips.get(index).cloned()
     }
 
-    /// Rewrites the labels in another display zone.
-    ///
-    /// Returns whether anything moved: the same zone is the same labels, and the chart is
-    /// left exactly as it was.
     fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
         if self.zone == zone {
             return false;
@@ -294,8 +266,6 @@ impl ChartData for OpenInterestChart {
         metadata: Option<ListingPrecision>,
         points: Arc<Self::Slice>,
     ) -> bool {
-        // A revision that moved is a new window even when its points are the same
-        // values: the pane asked for this one, and it is the one it is now showing.
         if revision < self.revision
             || (revision == self.revision
                 && Arc::ptr_eq(&self.points, &points)

@@ -1,9 +1,3 @@
-//! The fake venue set the service and the pane both answer through.
-//!
-//! It lives in a module of its own because two test files need it: the loop's
-//! tests drive it to produce maps, and the pane's tests drive it to answer a load.
-//! Everything in here is test scaffolding and is compiled only for tests.
-
 use std::{
     collections::VecDeque,
     future::pending,
@@ -35,12 +29,10 @@ use smol_str::SmolStr;
 use super::stream::VolumeHeatMapSource;
 use crate::model::{RouteListing, RouteTickerAnswer};
 
-/// A fixture spot route of one venue.
 pub(crate) fn route(venue: &str, scope: &str) -> VenueRoute {
     test_support::route(venue, scope)
 }
 
-/// The first spot scope of one fixture venue.
 pub(crate) fn spot(venue: &str) -> VenueRoute {
     match venue {
         "hyperliquid" => route(venue, "core-spot"),
@@ -48,7 +40,6 @@ pub(crate) fn spot(venue: &str) -> VenueRoute {
     }
 }
 
-/// The perpetual scope of one fixture venue.
 pub(crate) fn perp(venue: &str) -> VenueRoute {
     match venue {
         "hyperliquid" => route(venue, "core-perp"),
@@ -57,24 +48,18 @@ pub(crate) fn perp(venue: &str) -> VenueRoute {
     }
 }
 
-/// Binance, the venue most fixtures read.
 pub(crate) fn binance() -> VenueId {
     VenueId::Binance
 }
 
-/// OKX, the venue a fixture reads when what is being tested is that two venues are
-/// two maps.
 pub(crate) fn okx() -> VenueId {
     VenueId::Okx
 }
 
-/// The scopes one round reads: every scope of one venue, which is every market a
-/// map of that venue is drawn from.
 pub(crate) fn routes() -> Arc<[VenueRoute]> {
     Arc::from([spot("binance"), perp("binance")])
 }
 
-/// One fixture reading of a spot pair, before it is given its listing key.
 #[derive(Clone, Debug)]
 pub(crate) struct Reading {
     instrument: market_participants_model::instrument::Instrument,
@@ -84,7 +69,6 @@ pub(crate) struct Reading {
     monotonic_id: i64,
 }
 
-/// One reading whose money is the quote asset's notional.
 pub(crate) fn ticker(base: &str, quote: &str, notional: u64) -> Reading {
     Reading {
         instrument: test_support::spot_token("fixture", base, quote),
@@ -95,13 +79,10 @@ pub(crate) fn ticker(base: &str, quote: &str, notional: u64) -> Reading {
     }
 }
 
-/// A pool of identical readings for one route, which is what the bound tests need.
 pub(crate) fn repeated(base: &str, quote: &str, notional: u64, count: usize) -> Vec<Reading> {
     vec![ticker(base, quote, notional); count]
 }
 
-/// One route's answer, with the listing keys, labels and terms its catalog would
-/// carry.
 fn answer(route: &VenueRoute, readings: Vec<Reading>) -> RouteTickerAnswer {
     let mut listings = Vec::with_capacity(readings.len());
     let mut asset_labels = AHashMap::with_capacity(readings.len() * 2);
@@ -171,17 +152,10 @@ fn price_of(value: &str, quote: &str) -> MarketPrice {
     }
 }
 
-/// How the fake answers one route fetch.
-///
-/// A plan is consumed per fetch, and a source that runs out of plans keeps
-/// answering successfully but emptily: a test that watches how many fetches
-/// happened has to be able to tell a fetch that failed from one that never ran,
-/// and a fake that fails once its queue is empty cannot.
 #[derive(Clone, Debug)]
 pub(crate) enum FetchPlan {
     Tickers(Vec<Reading>),
     Failure,
-    /// Never answers, so the round times out.
     Pending,
 }
 
@@ -192,7 +166,6 @@ pub(crate) struct FakeSource {
 
 pub(crate) struct FakeSourceState {
     plans: Mutex<VecDeque<FetchPlan>>,
-    /// Whether a fetch the queue has no plan for stays in flight instead of answering emptily.
     hangs_when_out_of_plans: bool,
     routes: Mutex<Vec<VenueRoute>>,
     starts: Mutex<Vec<Instant>>,
@@ -216,12 +189,6 @@ impl FakeSource {
         }
     }
 
-    /// A source whose every fetch stays in flight, however many markets a round asks for.
-    ///
-    /// The plans of [`FakeSource::new`] are consumed per fetch, so a fixture that wants a whole
-    /// round to hang has to know how many markets that round reads; one plan short and the rest
-    /// of the round is served with the empty answers an exhausted queue gives. This says it once
-    /// instead, so a fixture that grows more markets cannot half-serve its round by accident.
     pub(crate) fn pending() -> Self {
         Self {
             state: Arc::new(FakeSourceState {
@@ -236,15 +203,10 @@ impl FakeSource {
         }
     }
 
-    /// The routes asked, in the order they were asked.
     pub(crate) fn routes(&self) -> Vec<VenueRoute> {
         self.lock_routes().clone()
     }
 
-    /// The routes asked that belong to `venue`, in the order they were asked.
-    ///
-    /// This is what says which venues the service read: a map is one venue's, so a
-    /// fixture asserts that the venue it named was read and that no other one was.
     pub(crate) fn routes_of(&self, venue: VenueId) -> Vec<VenueRoute> {
         self.lock_routes()
             .iter()
@@ -253,12 +215,10 @@ impl FakeSource {
             .collect()
     }
 
-    /// How many route fetches ran, which is one per scope of the venue being read.
     pub(crate) fn fetch_count(&self) -> usize {
         self.lock_routes().len()
     }
 
-    /// The instant each fetch started, in call order.
     pub(crate) fn starts(&self) -> Vec<Instant> {
         self.state
             .starts
@@ -267,7 +227,6 @@ impl FakeSource {
             .clone()
     }
 
-    /// How many fetches asked the venues at once, at the highest point.
     pub(crate) fn maximum_in_flight(&self) -> usize {
         self.state.maximum_in_flight.load(Ordering::Acquire)
     }
@@ -302,10 +261,6 @@ impl FakeSource {
             state: self.state.clone(),
             completed: false,
         };
-        // One yield before the answer, so that a round which asks several routes at
-        // once can be told from one that asks them in turn: without it every fetch
-        // would run to completion inside the first poll and the highest number in
-        // flight would always be one.
         tokio::task::yield_now().await;
         let plan = self
             .state
@@ -338,8 +293,6 @@ impl VolumeHeatMapSource for FakeSource {
     }
 }
 
-/// Counts a fetch that was dropped rather than answered, which is how a cancelled
-/// round is told from one that never started.
 struct FetchGuard {
     state: Arc<FakeSourceState>,
     completed: bool,

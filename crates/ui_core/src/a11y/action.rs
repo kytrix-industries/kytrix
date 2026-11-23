@@ -1,15 +1,3 @@
-//! `ActionRequest` → 引擎动作（辅助技术动作的唯一入口；效果一律走已有的失效闭环）。
-//!
-//! 执行点**只有主线程**：平台层的 `ActionHandler` 只把请求 `Dispatcher::push` 回主线程，本文件在
-//! drain 时被调用。所有效果都走 P03/P10 已存在的失效闭环（`set_focus` / `dispatch_action` /
-//! `scroll_*` / `App::write`），**不引入第二条写路径**。
-//!
-//! **模态作用域**（AR1b N2）：本文件的 [`dispatch`] 是 a11y 动作的**唯一入口**，入口处统一做
-//! 一次作用域校验（与指针、键盘同一判据 [`crate::interaction::focus::in_scope`]）。`Click` /
-//! `Focus` 之后还会各自经过 `dispatch_action` / `set_focus` 的校验，但 `SetValue` /
-//! `Increment` / `Custom` / `Scroll*` 直接调应用闭包与 `scroll_*`，**不经过**那两个入口 ——
-//! 漏掉入口校验的话，辅助技术在模态打开时仍能改背景控件状态、滚背景容器。
-
 use accesskit::{Action, ActionData, ActionRequest};
 
 use crate::{
@@ -30,15 +18,10 @@ use crate::{
     window::{Window, WindowId},
 };
 
-/// 分发一条 a11y 动作（主线程）。
-///
-/// 陈旧 `NodeId` / 未映射动作 / 无 handler / **模态作用域外的目标**一律忽略 + 诊断，不 panic。
 pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) {
     if request.target_tree != accesskit::TreeId::ROOT {
         return;
     }
-    // A1：`accesskit::NodeId` 是**稳定 id**（`a11y::identity` 分配），不再编码引擎句柄。
-    // 动作解码走窗口的分配器：未挂载 / 被清理的 id ⇒ 陈旧动作（忽略 + 诊断）。
     let target_id = A11yNodeId::from_stable(request.target_node.0);
     let Some(engine) = app
         .window(window)
@@ -55,10 +38,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
 
-    // 模态作用域（AR1b N2）：与指针按下 / 滚轮 / Enter 同一条判据（`in_scope` = 模态子树
-    // ∪ 属于该模态的浮层链）。`Click` 与 `Focus` 在下面还会各自经过 `dispatch_action` /
-    // `set_focus` 的校验，但本入口是**唯一**能让 `SetValue` / `Increment` / `Custom` /
-    // `Scroll*` 落地的地方，所以校验必须在这里做一次。
     let scope = app.modal_scope(window);
     let allowed = app
         .window(window)
@@ -71,9 +50,7 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
 
-    // payload 的所有权先取出：`A11yActionCtx` 借用它。
     let data = request.data;
-    // `Blur` 没有对应的 `A11yAction`（它不是「对某个节点做什么」，而是「把焦点从这个节点拿走」）。
     if request.action == Action::Blur {
         if app.focused(window) == Some(engine) {
             app.set_focus(window, None);
@@ -82,7 +59,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
     }
     let action = match (request.action, data.as_ref()) {
         (Action::CustomAction, Some(ActionData::CustomAction(id))) => A11yAction::Custom(*id),
-        // 引擎没有选区模型时 `ReplaceSelectedText` 与 `SetValue` 等价（整体替换）。
         (Action::ReplaceSelectedText, _) => A11yAction::SetValue,
         (action, _) => match action_from_accesskit(action) {
             Some(action) => action,
@@ -96,9 +72,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         },
     };
 
-    // R13-16：a11y 级 `disabled` 必须与动作能力同源 —— 宣告"不可用"后 AT 的激活不得执行
-    // 任何改变状态的路径（`Click` / `Focus` / `SetValue` / `Increment` / `Decrement` /
-    // `SetTextSelection` / `Expand` / `Collapse`）。滚动动作保留（只改视口）。
     let disabled = app
         .window(window)
         .is_some_and(|target| crate::a11y::mapping::a11y_disabled(target.tree(), engine));
@@ -110,11 +83,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
 
-    // E3：**能力集 = 分发判据**（与 `node_a11y` 的 `effective_actions` 同源）。未在节点能力
-    // 集里的动作一律拒绝 —— 应用 handler 不再收到 AT 对任意节点发来的任意动作；`read_only`
-    // 在这里剔除值变更类能力（`SetValue` / `Increment` / `Decrement`），而不是折叠进 disabled。
-    // 固定例外（滚动容器收敛 / `SetTextSelection` / 已登记的 `Custom`）见
-    // [`crate::a11y::mapping::action_allowed`]。
     let (allowed, read_only) = app
         .window(window)
         .map(|target| {
@@ -141,14 +109,8 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
 
-    // E4a：`SetTextSelection` 的 AT 侧 payload 是 grapheme 下标、`TextPosition.node` 是 TextRun；
-    // 应用边界统一为 **UTF-8 字节偏移**，目标归一为**输入框**（Windows 把动作打在 TextRun 上，
-    // macOS/AT-SPI 打在输入框上）。换算失败（位置节点失效/不是 TextRun 且目标也回退不了）⇒
-    // 拒绝并留 `InvalidActionData` 诊断，绝不把含糊口径交给应用。
     let mut handler_node = engine;
     let payload = match action {
-        // R13-21：`Increment` / `Decrement` 没有 payload 时，AT 的"加一步"只能靠应用自己
-        // 猜当前值与步长。这里用节点自己的 `numeric_value ± numeric_value_step` 补齐。
         A11yAction::Increment | A11yAction::Decrement => {
             increment_payload(app, window, engine, action, data.as_ref())
         }
@@ -167,7 +129,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         _ => payload_of(data.as_ref(), action),
     };
 
-    // ① 应用 handler 优先（`Click` 例外：它必须落到 P10 的 `Action` 表，见 §9.3）。
     if action != A11yAction::Click
         && app.a11y_has_handler(action)
         && run_handler(app, window, handler_node, action, payload)
@@ -175,7 +136,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
 
-    // ② 内置映射。
     let handled = match action {
         A11yAction::Click => on_click(app, window, engine),
         A11yAction::Focus => on_focus(app, window, engine),
@@ -188,7 +148,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
             A11yActionData::ScrollOffset(offset) => scroll_to(app, window, engine, offset),
             _ => false,
         },
-        // 引擎没有文本模型 / 展开语义 / 菜单模型 / 数值模型：只有应用 handler 能落地。
         A11yAction::SetValue
         | A11yAction::Increment
         | A11yAction::Decrement
@@ -206,7 +165,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
     }
 }
 
-/// 该动作是否会改变被禁用控件的数据（R13-16 的剔除名单；滚动动作不在内）。
 const fn is_state_changing(action: A11yAction) -> bool {
     matches!(
         action,
@@ -221,8 +179,6 @@ const fn is_state_changing(action: A11yAction) -> bool {
     )
 }
 
-/// `Increment` / `Decrement` 的 payload：AT 明确给了数值就用它，否则用节点声明的
-/// `numeric_value ± numeric_value_step`（R13-21）。两者都没有 ⇒ 无 payload（应用自行判断）。
 fn increment_payload(
     app: &App,
     window: WindowId,
@@ -258,17 +214,10 @@ fn increment_payload(
     }
 }
 
-/// 把 `accesskit::ActionData` 翻译成引擎 payload。
-///
-/// `SetTextSelection` **不在这里**：它需要把 AT 的 grapheme 下标换算成字节并保留位置宿主的
-/// `TextRun` 身份（见 [`selection_payload`]），是唯一在入口处单独翻译的 payload。
 fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'_> {
     match (action, data) {
         (A11yAction::Custom(id), _) => A11yActionData::Custom(id),
         (_, Some(ActionData::Value(value))) => A11yActionData::Value(value),
-        // UIA 的 `RangeValuePattern.SetValue` 发的是 `NumericValue(f64)` —— 不是文本值。
-        // 旧实现把它落到 `A11yActionData::None`，应用无法知道 AT 要求的目标数值，
-        // 于是「滑块能被 AT 读到数值、却不能被 AT 设值」（review P2-5）。
         (_, Some(ActionData::NumericValue(value))) => A11yActionData::NumericValue(*value),
         (_, Some(ActionData::SetScrollOffset(point))) => {
             A11yActionData::ScrollOffset(Point::new(point.x as f32, point.y as f32))
@@ -277,14 +226,6 @@ fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'
     }
 }
 
-/// E4a/E4b：AT 的文本选区 → 应用层 payload（**UTF-8 字节偏移 + 端点宿主**）+ 归一后的
-/// handler 目标。
-///
-/// `accesskit::TextPosition.character_index` 是 `character_lengths`（grapheme 划分）的下标；
-/// 应用侧（`A11yTextSelection` / IME caret / `String`）统一用字节偏移，所以两端都在这里换算并
-/// 夹紧（越界 = 该 run 文本末尾的 caret）。位置节点的稳定 id 经窗口分配器解回引擎句柄，**两端
-/// 各自保留自己的 `TextRun` 宿主**（多 run 输入框的跨 run 选区据此还原）；任一端解析失败时
-/// 回退到目标自身（仅当目标本身是 TextRun），否则返回 `None` 由调用方拒绝。
 fn selection_payload(
     app: &App,
     window: WindowId,
@@ -316,7 +257,6 @@ fn selection_payload(
     ))
 }
 
-/// 选区一端的 AT 位置（稳定 id + grapheme 下标）→ 宿主 `TextRun` 节点 + 该 run 内的 UTF-8 字节。
 fn selection_position(
     tree: &NodeTree,
     window: &Window,
@@ -336,9 +276,6 @@ fn selection_position(
     })
 }
 
-/// 选区动作的 handler 目标归一：Windows 把 `SetTextSelection` 打在 `TextRun` 上，macOS/AT-SPI
-/// 打在输入框上 —— 应用统一收到**输入框节点**。TextRun 沿父链最多 2 层找输入框（引擎的
-/// 输入框结构是「声明 TextInput 角色的盒子 + 子文本运行」，2 层足够容纳包装层）。
 fn normalized_selection_target(tree: &NodeTree, target: NodeId) -> NodeId {
     if is_text_input(tree, target) {
         return target;
@@ -361,7 +298,6 @@ fn normalized_selection_target(tree: &NodeTree, target: NodeId) -> NodeId {
     target
 }
 
-/// 该节点是否是文本输入框（按合并后的角色判断，与 a11y 快照同源）。
 fn is_text_input(tree: &NodeTree, node: NodeId) -> bool {
     matches!(
         effective_role_of(tree, node),
@@ -369,17 +305,12 @@ fn is_text_input(tree: &NodeTree, node: NodeId) -> bool {
     )
 }
 
-/// 该节点是否是 `TextRun`（`TextPosition.node` 的合法宿主）。
 fn is_text_run(tree: &NodeTree, node: NodeId) -> bool {
     tree.get(node)
         .is_ok_and(|target| matches!(target.kind(), NodeKind::Text(_)))
         && effective_role_of(tree, node) == A11yRole::TextRun
 }
 
-/// 调应用 handler（借用纪律：先摘出闭包 → 建 ctx → 调用 → 放回）。
-///
-/// 放回由 [`HandlerGuard`] 的 `Drop` 保证：应用 handler 里 panic（下单逻辑的 `unwrap`）被
-/// 上层捕获后，该动作的 handler **不会**永久消失（R13-20）。
 fn run_handler(
     app: &mut App,
     window: WindowId,
@@ -404,7 +335,6 @@ fn run_handler(
     true
 }
 
-/// handler 的归还守卫（panic 时 `Drop` 也会把它放回表里）。
 struct HandlerGuard<'a> {
     app: &'a mut App,
     action: A11yAction,
@@ -419,7 +349,6 @@ impl Drop for HandlerGuard<'_> {
     }
 }
 
-/// `Click`：激活节点**声明的**动作（与指针点击 / 键盘 Enter 同一身份）。
 fn on_click(app: &mut App, window: WindowId, node: crate::node::id::NodeId) -> bool {
     let Some((target, action)) = app
         .window(window)
@@ -430,7 +359,6 @@ fn on_click(app: &mut App, window: WindowId, node: crate::node::id::NodeId) -> b
     app.dispatch_action(window, target, action, ActionSource::Programmatic)
 }
 
-/// `Focus`：与 Tab 序同源的 `focusable` 校验。
 fn on_focus(app: &mut App, window: WindowId, node: crate::node::id::NodeId) -> bool {
     let focusable_node = app
         .window(window)
@@ -438,10 +366,6 @@ fn on_focus(app: &mut App, window: WindowId, node: crate::node::id::NodeId) -> b
     focusable_node && app.set_focus(window, Some(node))
 }
 
-/// 把目标收敛到**滚动容器**（自身 → 上提的虚拟窗口 → 最近的祖先容器）。
-///
-/// 与 [`crate::a11y::mapping::action_allowed`] 共用同一份解析（`a11y_scroll_target`）：
-/// E15b/F4 起集合根接管被抑制窗口的滚动语义，AT 对集合根发的滚动动作必须落到那个窗口上。
 fn scroll_container(
     app: &App,
     window: WindowId,
@@ -451,7 +375,6 @@ fn scroll_container(
     crate::a11y::tree::a11y_scroll_target(tree, node)
 }
 
-/// 步进滚动（`ScrollUnit`：`Item` = 一行，`Page` = 一屏）。
 fn scroll_by(
     app: &mut App,
     window: WindowId,
@@ -486,7 +409,6 @@ fn scroll_by(
     apply_scroll(app, window, container, delta)
 }
 
-/// `ScrollIntoView`：把目标矩形滚入视口（最小移动）。
 fn scroll_into_view(app: &mut App, window: WindowId, node: crate::node::id::NodeId) -> bool {
     let Some(container) = scroll_container(app, window, node) else {
         return false;
@@ -515,7 +437,6 @@ fn scroll_into_view(app: &mut App, window: WindowId, node: crate::node::id::Node
     apply_scroll(app, window, container, delta)
 }
 
-/// `SetScrollOffset`：直接写偏移。
 fn scroll_to(
     app: &mut App,
     window: WindowId,
@@ -531,7 +452,6 @@ fn scroll_to(
     app.scroll_to(&handle, offset).is_ok()
 }
 
-/// 相对滚动 + a11y 子树失效（bounds 随偏移变化 ⇒ AT 必须重读几何）。
 fn apply_scroll(
     app: &mut App,
     window: WindowId,
@@ -589,8 +509,6 @@ mod tests {
         target: crate::node::id::NodeId,
         data: Option<ActionData>,
     ) -> ActionRequest {
-        // A1：动作请求的 `NodeId` 是**稳定 id**（由 a11y 分配器发放），不再是引擎句柄。
-        // 先拿已发放的 id；还没交付过就先跑一笔 a11y pass 让分配器建表。
         let stable = app
             .window(window)
             .and_then(|state| state.a11y_stable_id(target))
@@ -608,7 +526,6 @@ mod tests {
         }
     }
 
-    /// 造一条动作请求并立刻分发（测试主体只关心"AT 发了什么、引擎做了什么"）。
     fn dispatch_request(
         app: &mut App,
         window: crate::window::WindowId,
@@ -620,10 +537,6 @@ mod tests {
         dispatch(app, window, request);
     }
 
-    /// 断言"这次分发没有被判未处理 / 被禁用挡下"。
-    ///
-    /// 不能断言 `a11y_diagnostics()` 全空：为了让分配器发放 id，测试必须先跑一笔 a11y pass，
-    /// 它可能产生**与本次分发无关**的诊断（例如测试节点没给名字的 `MissingLabel`）。
     fn assert_no_action_diagnostics(app: &App, message: &str) {
         let offender = app.a11y_diagnostics().iter().find(|diagnostic| {
             matches!(
@@ -638,8 +551,6 @@ mod tests {
         assert!(offender.is_none(), "{message}: {offender:?}");
     }
 
-    /// review P2-5：UIA `RangeValuePattern.SetValue` 发的是 `NumericValue(f64)`，
-    /// 应用 handler 必须能拿到这个数值 —— 旧实现把它落成 `A11yActionData::None`。
     #[test]
     fn numeric_set_value_reaches_the_handler() {
         let (_runtime, mut app, window) = setup();
@@ -671,11 +582,6 @@ mod tests {
         assert_no_action_diagnostics(&app, "有 handler 时不得记未处理诊断");
     }
 
-    /// review P2-5：`Increment` / `Decrement` 必须能映射到引擎动作（此前被静默忽略）。
-    ///
-    /// E3 之后能力集是分发判据：节点必须**声明** `Increment/Decrement`（`Slider` 的角色默认
-    /// 表或显式 `actions`），否则 AT 的动作会被能力门禁拒绝（见
-    /// `undeclared_actions_are_not_dispatched_to_handlers`）。
     #[test]
     fn increment_and_decrement_are_routed_to_the_handler() {
         let (_runtime, mut app, window) = setup();
@@ -733,8 +639,6 @@ mod tests {
         assert_eq!(app.focused(window), None);
     }
 
-    /// a11y 动作在 `Dispatcher` 回投的任务里执行；`set_focus` 必须唤醒平台泵，否则焦点环
-    /// 与 a11y 更新要等下一条无关消息（F-152）。
     #[test]
     fn a11y_focus_wakes_the_event_loop() {
         let (_runtime, mut app, window) = setup();
@@ -754,12 +658,6 @@ mod tests {
         );
     }
 
-    /// AR1b N2（P2 回归）：**模态作用域外的 a11y 动作一律不生效**。
-    ///
-    /// 失败面：只有 `Click`（经 `dispatch_action`）与 `Focus`（经 `set_focus`）过作用域，
-    /// `SetValue` / `Increment` / `Custom` 直接跑应用闭包、`Scroll*` 直接 `scroll_*` ⇒
-    /// 辅助技术在模态打开时仍能改背景控件状态、滚背景容器。修复点在 a11y 动作的唯一入口
-    /// （本文件的 `dispatch`），判据与指针/键盘相同（模态子树 ∪ 属于该模态的浮层链）。
     #[test]
     fn a11y_actions_outside_the_modal_scope_are_rejected() {
         use crate::interaction::{OverlayDismiss, OverlayOptions};
@@ -773,7 +671,6 @@ mod tests {
             })
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
-        // 背景里的滚动容器（AR1b：`Scroll*` 曾完全绕过作用域）。
         let mut inner = taffy::Style::<SmolStr>::DEFAULT;
         inner.size = taffy::geometry::Size {
             width: taffy::style::Dimension::length(100.0),
@@ -804,7 +701,6 @@ mod tests {
             seen_increment.set(seen_increment.get() + 1);
         });
 
-        // 模态对话框（作用域根）。
         let modal = app
             .create_overlay(
                 window,
@@ -826,7 +722,6 @@ mod tests {
             )
             .expect("mount");
 
-        // 模态外：SetValue / Increment / Scroll* 全部拒绝。
         dispatch_request(
             &mut app,
             window,
@@ -858,7 +753,6 @@ mod tests {
             app.a11y_diagnostics()
         );
 
-        // 作用域内：同一批动作照常落地（证明拦截的是位置，不是动作类型）。
         dispatch_request(
             &mut app,
             window,
@@ -878,8 +772,6 @@ mod tests {
         let doomed = NodeBuilder::boxed()
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
-        // 先交付一笔：分配器必须给 doomed 发过稳定 id（AT 侧那笔交付也发生过），
-        // 然后才卸载它 —— 这正是"AT 发来一个已回收节点的动作"的真实时序。
         let _ = app.a11y_take(window).expect("首笔交付");
         let stable = app
             .window(window)
@@ -975,7 +867,6 @@ mod tests {
         assert_eq!(seen.take(), String::from("的"));
     }
 
-    /// 造一个「输入框 + 子文本 `"价🌍ab"`」的夹具，返回 `(input, text_run)` 与已分配的稳定 id。
     fn text_input_fixture(
         app: &mut App,
         window: crate::window::WindowId,
@@ -1007,8 +898,6 @@ mod tests {
         (input, text, stable)
     }
 
-    /// E4a/E4b：AT 的 grapheme 下标在引擎边界换算成**应用层的 UTF-8 字节偏移**，并保留端点
-    /// 宿主 `TextRun` 身份；macOS/AT-SPI 的目标是输入框，`ctx.node()` 必须仍是输入框。
     #[test]
     fn set_text_selection_uses_byte_offsets_in_the_host_run() {
         let (_runtime, mut app, window) = setup();
@@ -1061,8 +950,6 @@ mod tests {
         assert_no_action_diagnostics(&app, "合法选区不得记未处理诊断");
     }
 
-    /// E4a：Windows 把 `SetTextSelection` 打在 **TextRun** 上 —— 应用仍应收到输入框节点
-    /// （三端 target 统一）。
     #[test]
     fn set_text_selection_normalizes_the_target_to_the_input() {
         let (_runtime, mut app, window) = setup();
@@ -1098,8 +985,6 @@ mod tests {
         );
     }
 
-    /// E4a：选区位置节点失效且目标无法回退成 TextRun ⇒ **拒绝**，绝不把含糊的字符索引
-    /// 交给应用（CJK/emoji 下会错位改写文本）。
     #[test]
     fn an_unresolvable_text_selection_is_rejected() {
         let (_runtime, mut app, window) = setup();
@@ -1144,8 +1029,6 @@ mod tests {
         );
     }
 
-    /// 造一个「输入框 + **两个**子文本运行 `"价格"` / `"42"`」的夹具（跨 run 选区用），
-    /// 返回 `(input, first_run, second_run)` 与两个 run 已分配的稳定 id。
     fn two_run_text_input_fixture(
         app: &mut App,
         window: crate::window::WindowId,
@@ -1180,9 +1063,6 @@ mod tests {
         (input, first, second, first_stable, second_stable)
     }
 
-    /// E4a/E4b：输入框有**两个** TextRun 子节点时，跨 run 选区必须分别保留两端的 run 身份与
-    /// 各自的 run 内字节偏移（修复前 payload 只有裸字节区间，应用无法还原「从 run A 的哪个字节
-    /// 到 run B 的哪个字节」；且 `ctx.node()` 仍是归一化的输入框）。
     #[test]
     fn a_selection_across_two_text_runs_keeps_each_end_its_run_identity() {
         let (_runtime, mut app, window) = setup();
@@ -1237,8 +1117,6 @@ mod tests {
         assert_no_action_diagnostics(&app, "合法跨 run 选区不得记未处理诊断");
     }
 
-    /// E4a 现状保持：字符下标越过该 run 的 grapheme 数时**夹紧**到 run 内文本末尾（AT 可能拿着
-    /// 旧快照的位置），宿主身份仍属于这个 run（不漂移到另一端的 run）。
     #[test]
     fn an_out_of_range_character_index_clamps_inside_the_host_run() {
         let (_runtime, mut app, window) = setup();
@@ -1342,7 +1220,6 @@ mod tests {
         );
     }
 
-    /// C12 一致化：祖先 `interactive: false` 时，AT 对后代的激活同样被拒绝。
     #[test]
     fn disabled_ancestors_block_actions_on_descendants() {
         let (_runtime, mut app, window) = setup();
@@ -1377,7 +1254,6 @@ mod tests {
         );
     }
 
-    /// A1：未知 / 已回收的稳定 id 必须判陈旧（忽略 + `StaleAction`），不得 panic。
     #[test]
     fn unknown_stable_ids_are_stale() {
         let (_runtime, mut app, window) = setup();
@@ -1397,7 +1273,6 @@ mod tests {
         ));
     }
 
-    /// R13-16（失败用例先行）：a11y 宣告 `disabled` 后，AT 的激活**不得**真的执行 `on_click`。
     #[test]
     fn disabled_nodes_reject_state_changing_actions() {
         let (_runtime, mut app, window) = setup();
@@ -1411,7 +1286,6 @@ mod tests {
         app.on_action(Action::custom("buy"), move |_ctx| {
             counter.set(counter.get() + 1);
         });
-        // `bind_a11y(disabled: Some(true))` 是最自然的写法 —— 但它必须同时挡住动作。
         app.window_mut(window)
             .expect("window")
             .tree_mut()
@@ -1434,8 +1308,6 @@ mod tests {
         );
     }
 
-    /// R13-21：`Increment` / `Decrement` 必须带"当前值 ± 步长"的 payload，
-    /// 否则应用只能猜（AT 说"加了一步"但值没动）。
     #[test]
     fn increment_payload_uses_the_numeric_value_and_step() {
         let (_runtime, mut app, window) = setup();
@@ -1470,13 +1342,11 @@ mod tests {
         assert_eq!(seen_down.get(), 95.0, "Decrement = 当前值 - 步长");
     }
 
-    /// R13-20：应用 handler panic 后，handler 不得永久丢失（`Drop` 守卫放回）。
     #[test]
     fn a_panicking_handler_is_restored() {
         let (_runtime, mut app, window) = setup();
         let root = app.window(window).expect("window").tree().root();
         let node = NodeBuilder::boxed()
-            // E3：能力集是分发判据 —— 显式声明确实支持 SetValue。
             .a11y(A11yOverride {
                 actions: Some(vec![A11yAction::SetValue]),
                 ..A11yOverride::default()
@@ -1497,7 +1367,6 @@ mod tests {
             app.a11y_has_handler(A11yAction::SetValue),
             "panic 后 handler 必须被放回（否则后续同类动作永久失效）"
         );
-        // 再触发一次：handler 仍然在（计数 +1 后再次 panic）。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             dispatch_request(&mut app, window, AkAction::SetValue, node, None);
         }));
@@ -1505,17 +1374,11 @@ mod tests {
         assert_eq!(calls.get(), 2, "第二次分发仍然命中 handler");
     }
 
-    /// E3：`read_only` 是**独立状态** —— 不宣告、也不执行值变更动作，但既有能力（Focus 等）
-    /// 保持；AT 侧看到的是 `read_only` 而不是 `disabled`。
-    ///
-    /// 变异守卫：把 `read_only` 折叠进 disabled（或让 `effective_actions` 忽略 read_only）⇒
-    /// 能力集里仍有 `SetValue` / handler 被调用 / `IsReadOnly` 为假，三条断言全红。
     #[test]
     fn read_only_text_input_does_not_advertise_or_execute_set_value() {
         let (_runtime, mut app, window) = setup();
         let root = app.window(window).expect("window").tree().root();
         let node = NodeBuilder::boxed()
-            // `on_click` 同时让节点可聚焦（能力集里才会出现 `Focus`）：只读输入框仍应可聚焦。
             .on_click(Action::custom("focus"))
             .a11y(A11yOverride {
                 role: Some(crate::a11y::A11yRole::TextInput),
@@ -1582,7 +1445,6 @@ mod tests {
         );
     }
 
-    /// E3：`read_only` 不阻断**非值变更**能力 —— Blur / Custom / SetTextSelection 仍然可用。
     #[test]
     fn read_only_keeps_blur_custom_and_selection() {
         let (_runtime, mut app, window) = setup();
@@ -1592,7 +1454,6 @@ mod tests {
             label: SmolStr::new_static("加入自选"),
         };
         let node = NodeBuilder::boxed()
-            // `on_click` 同时让节点可聚焦（否则能力集里没有 `Focus`，Blur 用例不成立）。
             .on_click(Action::custom("focus"))
             .a11y(A11yOverride {
                 role: Some(crate::a11y::A11yRole::TextInput),
@@ -1617,7 +1478,6 @@ mod tests {
                     ..A11yPatch::default()
                 },
             );
-        // E4a：`SetTextSelection` 的 `TextPosition.node` 必须是 TextRun；给输入框建一个子文本。
         let text = NodeBuilder::text("搜索框", crate::text::TextStyle::new(12.0))
             .build(app.window_mut(window).expect("window").tree_mut(), node)
             .expect("text run");
@@ -1681,15 +1541,12 @@ mod tests {
             "选区动作的 handler 目标归一为输入框"
         );
 
-        // Blur 在能力门禁之前处理：只读节点必须能被 AT 移走焦点。
         dispatch_request(&mut app, window, AkAction::Focus, node, None);
         assert_eq!(app.focused(window), Some(node));
         dispatch_request(&mut app, window, AkAction::Blur, node, None);
         assert_eq!(app.focused(window), None, "read_only 不阻断 Blur");
     }
 
-    /// E3：滚动动作对**子节点**发出时收敛到可解析的滚动容器再判能力（AT 对列表行发
-    /// `ScrollIntoView` 是常态，不能因为行自身没有滚动槽就被误拒）。
     #[test]
     fn scroll_actions_converge_to_the_scroll_container() {
         let (_runtime, mut app, window) = setup();
@@ -1738,10 +1595,6 @@ mod tests {
         assert_no_action_diagnostics(&app, "滚动容器收敛后不得记能力拒绝");
     }
 
-    /// E3：能力集 = 分发判据 —— 未声明的动作不得落到应用 handler，且留诊断。
-    ///
-    /// 这是应用可观察行为变更（release note）：旧实现只要注册了 handler，AT 就能在任意节点上
-    /// 触发该动作；现在必须显式声明 `A11yOverride/A11yPatch::actions`（或角色默认表包含它）。
     #[test]
     fn undeclared_actions_are_not_dispatched_to_handlers() {
         let (_runtime, mut app, window) = setup();
@@ -1779,8 +1632,6 @@ mod tests {
         );
     }
 
-    /// E3：能力集与分发**同源**的属性断言 —— 快照宣告的每个动作都必须被分发门禁允许；
-    /// 未宣告且不属于固定例外的动作必须被拒。
     #[test]
     fn advertised_actions_are_the_dispatch_trust_boundary() {
         let (_runtime, mut app, window) = setup();
@@ -1843,7 +1694,6 @@ mod tests {
                 }
             }
         }
-        // 反向：未宣告且不属于固定例外的动作必须被拒。
         assert!(!crate::a11y::mapping::action_allowed(
             tree,
             plain,

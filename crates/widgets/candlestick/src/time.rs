@@ -1,17 +1,3 @@
-//! Calendar arithmetic and time labels for the chart.
-//!
-//! Two questions are answered here: how a candle's timestamp reads on an axis
-//! or under the crosshair, and when the candle the venue is currently building
-//! closes. The second drives the countdown next to the latest price, so it has
-//! to agree with the market participant's own boundary rather than with a fixed duration:
-//! monthly, quarterly and yearly candles advance by calendar month, and OKX opens
-//! them on a UTC+8 boundary while the others use UTC.
-//!
-//! The intervals themselves are the market request's closed set, and how an
-//! interval is counted — a second, a calendar month, three of them, twelve — is
-//! read here rather than guessed from the venue: `1M` advances by a calendar
-//! month and `1Q` by three on every route that publishes one.
-
 use std::time::Duration;
 
 use market_participants_connector::market::timeframe::TimeFrame;
@@ -20,7 +6,6 @@ use smol_str::{SmolStr, ToSmolStr, format_smolstr};
 use time::{Date, OffsetDateTime, UtcOffset};
 use widget::util::format_countdown;
 
-/// The unit one interval is counted in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TimeFrameUnit {
     Second,
@@ -34,7 +19,6 @@ pub(crate) enum TimeFrameUnit {
 }
 
 impl TimeFrameUnit {
-    /// The i18n key the interval picker heads this unit's group with.
     pub(crate) const fn group_key(self) -> &'static str {
         match self {
             Self::Second => "widget.candlestick.seconds",
@@ -48,12 +32,6 @@ impl TimeFrameUnit {
         }
     }
 
-    /// The i18n key naming one interval of this unit, which is what a picker entry
-    /// counted by `tick` is labelled with.
-    ///
-    /// A catalogue has no plural rule to read, so the count decides the key: one second
-    /// is "1 Second" and never "1 Seconds", and the group heading keeps the plural the
-    /// unit is named under whatever the count of an entry is.
     pub(crate) const fn label_key(self, tick: u8) -> &'static str {
         if tick == 1 {
             match self {
@@ -72,7 +50,6 @@ impl TimeFrameUnit {
     }
 }
 
-/// The unit groups the interval picker offers, in the order it draws them.
 pub(crate) const TIMEFRAME_GROUPS: [TimeFrameUnit; 8] = [
     TimeFrameUnit::Second,
     TimeFrameUnit::Minute,
@@ -84,13 +61,6 @@ pub(crate) const TIMEFRAME_GROUPS: [TimeFrameUnit; 8] = [
     TimeFrameUnit::Year,
 ];
 
-/// Every interval a market request can carry, in the order the picker offers them.
-///
-/// This is the widget's own table: the closed set a request can express, the order the picker
-/// draws intervals in, and what a route that cannot be asked is offered instead. Which of them
-/// a route serves is that route's own answer ([`offered_timeframes`]), so the table claims
-/// nothing about any venue — `1s` is here because the request can carry it, not because every
-/// venue publishes it.
 pub(crate) const TIMEFRAMES: [TimeFrame; 25] = [
     TimeFrame::Second1,
     TimeFrame::Minute1,
@@ -119,17 +89,6 @@ pub(crate) const TIMEFRAMES: [TimeFrame; 25] = [
     TimeFrame::Year1,
 ];
 
-/// The intervals the picker offers out of [`TIMEFRAMES`] for one route.
-///
-/// A route's own declaration says which of them it serves, so what the picker offers is that
-/// answer read into this table — and because the table is already in display order, filtering
-/// it needs no second ordering table.
-///
-/// `None` is a route this build could not ask. That answer proves nothing about what the venue
-/// serves, so the picker offers the closed set and the choice stays the user's: a request is the
-/// only answer the chart can get from such a route, and the venue's own rejection of one is what
-/// the pane's recovery settles. This is the widget's existing reading of a request rather than a
-/// fallback layer of its own.
 pub(crate) fn offered_timeframes(published: Option<&[TimeFrame]>) -> Vec<TimeFrame> {
     match published {
         Some(published) => TIMEFRAMES
@@ -140,7 +99,6 @@ pub(crate) fn offered_timeframes(published: Option<&[TimeFrame]>) -> Vec<TimeFra
     }
 }
 
-/// The tick and the unit of one interval.
 pub(crate) const fn tick_and_unit(timeframe: TimeFrame) -> (u8, TimeFrameUnit) {
     match timeframe {
         TimeFrame::Second1 => (1, TimeFrameUnit::Second),
@@ -171,21 +129,12 @@ pub(crate) const fn tick_and_unit(timeframe: TimeFrame) -> (u8, TimeFrameUnit) {
     }
 }
 
-/// The interval the picker identifies by `label`.
-///
-/// The picker hands back the label it drew, which is the interval's own spelling
-/// rather than a position in a list, so this is the one place a label becomes an
-/// interval again.
 pub(crate) fn timeframe_of_label(label: &str) -> Option<TimeFrame> {
     TIMEFRAMES
         .into_iter()
         .find(|timeframe| timeframe.label() == label)
 }
 
-/// The widest label [`remaining_time_label`] can produce for `interval`.
-///
-/// The price axis is widened to fit it, so the countdown under the latest price
-/// cannot push the axis tag out of shape when it grows a digit.
 pub(crate) fn maximum_countdown_label(interval: TimeFrame) -> &'static str {
     let (tick, unit) = tick_and_unit(interval);
     match unit {
@@ -198,7 +147,6 @@ pub(crate) fn maximum_countdown_label(interval: TimeFrame) -> &'static str {
     }
 }
 
-/// The time left in the candle that opens at `candle_timestamp`.
 pub(crate) fn remaining_time_label(
     candle_timestamp: i64,
     interval: TimeFrame,
@@ -211,11 +159,6 @@ pub(crate) fn remaining_time_label(
     )
 }
 
-/// How long to wait before the countdown label reads differently.
-///
-/// Waking on the label's own transition rather than on a fixed second keeps the
-/// countdown aligned after a late timer fires, and never overshoots the candle
-/// boundary it is counting down to.
 pub(crate) fn countdown_refresh_delay(
     candle_timestamp: i64,
     interval: TimeFrame,
@@ -235,7 +178,6 @@ pub(crate) fn countdown_refresh_delay(
     Duration::from_millis(u64::try_from(delay_millis).unwrap_or(1_000))
 }
 
-/// How long to wait until the wall clock crosses the next second.
 pub(crate) fn next_second_boundary_delay(now_timestamp: i64) -> Duration {
     let elapsed_millis = now_timestamp.rem_euclid(1_000);
     Duration::from_millis(u64::try_from(1_000 - elapsed_millis).unwrap_or(1_000))
@@ -252,8 +194,6 @@ pub(crate) fn current_timestamp_millis() -> i64 {
     }
 }
 
-/// How a timestamp reads on the time axis, at the resolution `interval` needs and in
-/// the zone the settings display data in.
 pub(crate) fn format_axis_time(timestamp: i64, interval: TimeFrame, zone: UtcOffset) -> SmolStr {
     let Some(datetime) = datetime(timestamp, zone) else {
         return timestamp.to_smolstr();
@@ -285,8 +225,6 @@ pub(crate) fn format_axis_time(timestamp: i64, interval: TimeFrame, zone: UtcOff
     }
 }
 
-/// How a timestamp reads under the crosshair, which has room for the full date and
-/// is read in the zone the settings display data in.
 pub(crate) fn format_crosshair_time(
     timestamp: i64,
     interval: TimeFrame,
@@ -336,16 +274,9 @@ fn format_remaining_time(start_timestamp: i64, end_timestamp: i64, now_timestamp
     let duration_millis = (i128::from(end_timestamp) - i128::from(start_timestamp)).max(0_i128);
     let remaining_millis =
         (i128::from(end_timestamp) - i128::from(now_timestamp)).clamp(0_i128, duration_millis);
-    // The clock is the shared one: it rounds up to the next visible second and hides
-    // the hours field while there are no hours left, which is what a countdown of a
-    // minute, an hour or a month all want.
     format_countdown(i64::try_from(remaining_millis).unwrap_or(i64::MAX))
 }
 
-/// The instant the candle opening at `candle_timestamp` stops being built.
-///
-/// `None` means the timestamp cannot be advanced — an out-of-range value, or a
-/// calendar month that does not exist.
 fn candle_end_timestamp_millis(
     candle_timestamp: i64,
     interval: TimeFrame,
@@ -372,11 +303,6 @@ fn candle_end_timestamp_millis(
         .and_then(|duration| candle_timestamp.checked_add(duration))
 }
 
-/// The offset whose midnight a venue opens its calendar candles on.
-///
-/// A calendar boundary is a venue convention and no capability descriptor carries
-/// one, so the venue that has its own is named here by the identity it is
-/// registered under, never by an inferred product.
 fn candle_boundary_offset(venue: &VenueId) -> UtcOffset {
     if *venue == VenueId::Okx {
         return UtcOffset::from_hms(8, 0, 0).unwrap_or(UtcOffset::UTC);
@@ -384,12 +310,6 @@ fn candle_boundary_offset(venue: &VenueId) -> UtcOffset {
     UtcOffset::UTC
 }
 
-/// Advances a timestamp by whole calendar months in `offset`.
-///
-/// Clamping to the target month's length is what makes the 31st of January plus
-/// one month land on the 28th or 29th of February instead of overflowing, and a
-/// candle that opened on the last day of its month always lands on the last day
-/// of the target month.
 fn add_calendar_months(timestamp: i64, months: u8, offset: UtcOffset) -> Option<i64> {
     let datetime = datetime(timestamp, offset)?;
     let source_year = datetime.year();
@@ -417,12 +337,6 @@ fn add_calendar_months(timestamp: i64, months: u8, offset: UtcOffset) -> Option<
     i64::try_from(target_millis).ok()
 }
 
-/// The instant `timestamp` names, read in `zone`, or nothing when either the
-/// timestamp or its local reading is outside the calendar.
-///
-/// The offset can move an instant past the last date the calendar holds, and a
-/// caller that formatted that would panic: an instant off the end of the range is
-/// one this cannot read.
 fn datetime(timestamp: i64, zone: UtcOffset) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
         .ok()
@@ -440,8 +354,6 @@ mod tests {
         VenueId::from_name(name).expect("the fixture venue should be canonical")
     }
 
-    // The shape of the shared clock is covered by its own tests; what is tested here
-    // is that a candle's countdown reads through it with the clamping a candle needs.
     #[test]
     fn remaining_time_should_round_partial_seconds_up() {
         assert_eq!(format_remaining_time(0, 120_000, 58_001), "01:02");
@@ -461,8 +373,6 @@ mod tests {
 
     #[test]
     fn remaining_time_should_never_exceed_the_candle_it_belongs_to() {
-        // A clock that ran past the next candle's close still counts down to this
-        // one's, because the label belongs to the candle being drawn.
         assert_eq!(format_remaining_time(0, 60_000, -600_000), "01:00");
     }
 
@@ -522,9 +432,6 @@ mod tests {
         );
     }
 
-    /// A quarter and a year are calendar steps too, so they advance the way a month does:
-    /// the candle that opened at the first instant of the window closes at the first
-    /// instant of the next one.
     #[test]
     fn quarter_and_year_ends_should_advance_by_their_calendar_steps() {
         assert_eq!(
@@ -571,11 +478,8 @@ mod tests {
         );
     }
 
-    /// The axis and the crosshair read the instant in the zone the settings display data
-    /// in, so a candle that opened at midnight UTC opens in the afternoon at UTC+14.
     #[test]
     fn axis_and_crosshair_times_should_read_the_instant_in_the_display_zone() {
-        // 2024-01-01T00:00:00Z.
         let timestamp = 1_704_067_200_000;
         let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
 
@@ -602,9 +506,6 @@ mod tests {
         );
     }
 
-    /// An offset can move an instant past the last day the calendar holds. That is
-    /// not a time this can format, so the axis reads the raw stamp rather than
-    /// panicking on a date that is not one.
     #[test]
     fn an_instant_the_display_zone_cannot_hold_should_not_panic() {
         let boundary = time::Date::MAX
@@ -689,8 +590,6 @@ mod tests {
         );
     }
 
-    /// The picker hands back the label it drew, so a label has to name exactly one
-    /// interval: two intervals spelled the same would make a choice ambiguous.
     #[test]
     fn every_interval_should_be_identified_by_its_own_label() {
         for timeframe in TIMEFRAMES {
@@ -711,9 +610,6 @@ mod tests {
         assert_eq!(timeframe_of_label("not-an-interval"), None);
     }
 
-    /// The picker offers a route's own answer, and it offers it in this table's order: a venue
-    /// that declares its intervals in some other order still gets a picker that reads the way
-    /// every other venue's does.
     #[test]
     fn a_routes_answer_should_be_offered_in_the_widgets_own_order() {
         let offered = offered_timeframes(Some(&[
@@ -734,8 +630,6 @@ mod tests {
         );
     }
 
-    /// A route this build cannot ask proves nothing about what it serves, so the picker keeps
-    /// offering the closed set and the request answers for it.
     #[test]
     fn an_unanswerable_route_should_offer_every_interval() {
         assert_eq!(
@@ -745,8 +639,6 @@ mod tests {
         );
     }
 
-    /// The picker groups the intervals by the unit they are counted in, so every
-    /// interval has to belong to exactly one offered group.
     #[test]
     fn every_interval_should_belong_to_one_offered_group() {
         for timeframe in TIMEFRAMES {
@@ -764,8 +656,6 @@ mod tests {
         }
     }
 
-    /// A catalogue has no plural rule, so the count decides the key: an interval of one
-    /// is named in the singular and a group heading keeps the plural either way.
     #[test]
     fn an_interval_of_one_should_be_named_in_the_singular() {
         for timeframe in TIMEFRAMES {

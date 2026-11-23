@@ -1,39 +1,3 @@
-//! The candle series a candlestick chart draws.
-//!
-//! A chart is fed from three directions — the initial history page, older pages
-//! fetched by panning left, and newer pages fetched by panning right — while the
-//! live subscription keeps overwriting the newest candle. All three go through
-//! [`CandlestickSeries`], which keeps one `timestamp -> candle` map bounded by a
-//! capacity and decides what each merge is allowed to evict:
-//!
-//! - history arriving forwards and live updates evict the **oldest** candle,
-//! - a page fetched by panning left evicts whatever the caller allows: with
-//!   [`NewestCandle::Evicted`] the **newest** one, and only while the buffer is
-//!   full, which is the one case that evicts anything at all; with
-//!   [`NewestCandle::Kept`] nothing, because a page that will not fit is trimmed
-//!   instead.
-//!
-//! Which of the two an older page gets is not this module's decision: whether the
-//! newest candle is on screen is a property of the viewport the chart is drawn
-//! with, and the series cannot see it. So the caller states the intent with every
-//! page it asks for, which is why [`CandlestickSeries::merge_older`] takes one.
-//!
-//! That asymmetry is what keeps a historical window stable: the user is looking
-//! at a fixed range, and a live tick must not push it out from under them. It is
-//! also why a page merged with the newest candle kept leaves the chart exactly
-//! where it was: nothing is evicted, so nothing is moved, and
-//! [`CandlestickSeries::at_live_edge`] stays true.
-//!
-//! [`CandlestickSeries::snapshot`] hands the chart an immutable
-//! [`CandlestickSeriesSnapshot`]. The candle data is shared rather than copied,
-//! and [`CandlestickSeriesSnapshot::shares_chart_data_with`] lets the painter
-//! decide in constant time whether the previous drawing is still valid.
-//!
-//! The candles are the listing-scoped values the market facade published, so
-//! every number on the chart carries its unit. What the chart draws is the
-//! number: [`CandlePrices`] is the one place a candle's price legs are resolved,
-//! which keeps the quote asset and the price basis out of every drawing site.
-
 use std::{collections::BTreeMap, sync::Arc};
 
 use market_participants_model::{
@@ -42,11 +6,6 @@ use market_participants_model::{
     market::book::ListingCandlestick,
 };
 
-/// The four prices of one candle, as the chart reads them.
-///
-/// The legs are private because resolving them is what this type is for: every
-/// drawing site reads a price through [`CandlePrices::of`], so the quote asset
-/// and the price basis a candle also carries never reach one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CandlePrices {
     open: Price,
@@ -56,7 +15,6 @@ pub(super) struct CandlePrices {
 }
 
 impl CandlePrices {
-    /// Resolves the price legs of one candle.
     pub(super) fn of(candle: &ListingCandlestick) -> Self {
         Self {
             open: candle.open.value,
@@ -82,17 +40,11 @@ impl CandlePrices {
         self.close
     }
 
-    /// Whether the candle closed at or above its open.
     pub(super) const fn is_up(self) -> bool {
         self.close.inner() >= self.open.inner()
     }
 }
 
-/// One accepted series, as the view and the chart painter see it.
-///
-/// The candle data is behind an [`Arc`], so handing the snapshot to the stream,
-/// to the view and to the painter costs a refcount rather than a copy of up to
-/// `MAXIMUM_CANDLES` candles.
 #[derive(Clone, Debug)]
 pub(super) struct CandlestickSeriesSnapshot {
     candles: Arc<[ListingCandlestick]>,
@@ -118,28 +70,18 @@ impl CandlestickSeriesSnapshot {
         self.candles.last()
     }
 
-    /// The price increment every label on the chart is rounded to.
     pub(super) const fn price_tick(&self) -> Tick {
         self.precision.price_tick
     }
 
-    /// Whether the venue has no more history before the earliest candle.
     pub(super) const fn older_exhausted(&self) -> bool {
         self.older_exhausted
     }
 
-    /// Whether the newest candle is the one the venue is still building.
     pub(super) const fn at_live_edge(&self) -> bool {
         self.at_live_edge
     }
 
-    /// Whether two snapshots would draw the same candles.
-    ///
-    /// Deliberately ignores [`older_exhausted`], which says what more can be
-    /// fetched rather than what is drawn; the painter must not rebuild a chart
-    /// because pagination ran out.
-    ///
-    /// [`older_exhausted`]: CandlestickSeriesSnapshot::older_exhausted
     pub(super) fn shares_chart_data_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.candles, &other.candles)
             && self.precision == other.precision
@@ -147,42 +89,19 @@ impl CandlestickSeriesSnapshot {
     }
 }
 
-/// What an older page may do to the newest candle the series holds.
-///
-/// The question belongs to the viewport rather than to the series: whether the
-/// newest candle is on screen is something only the chart that is drawn can
-/// answer, and the series has no way to see it. So the caller states its intent
-/// with the request, and the series applies it when the page lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NewestCandle {
-    /// The chart follows the newest candle, so it is on screen and stays.
-    ///
-    /// A page that does not fit is trimmed to the room left, keeping the candles
-    /// nearest the buffer: they are the ones that join it without a gap.
     Kept,
-    /// The chart is anchored to a window further back, so the newest candle is
-    /// off screen to the right. Evicting it is what lets the series move back in
-    /// time, and it is also what takes the series off the live edge.
     Evicted,
 }
 
-/// What merging one older page did to the series.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OlderMerge {
-    /// The page added candles before the earliest one held, so the window moved
-    /// back in time.
     Advanced,
-    /// The page was not empty and none of it fitted, because the buffer was
-    /// full. The buffer is what refused it, so this is not an answer about the
-    /// venue's history.
     TrimmedByCapacity,
-    /// The page changed nothing: it was empty, or every candle it carried is one
-    /// the series already held. For a fetched, non-empty page this is the venue
-    /// saying there is nothing older.
     MadeNoProgress,
 }
 
-/// The mutable candle map behind one chart.
 pub(super) struct CandlestickSeries {
     entries: BTreeMap<i64, ListingCandlestick>,
     snapshot_candles: Arc<[ListingCandlestick]>,
@@ -194,10 +113,6 @@ pub(super) struct CandlestickSeries {
 }
 
 impl CandlestickSeries {
-    /// Creates an empty series holding at most `maximum_len` candles.
-    ///
-    /// A zero capacity would make the series unable to hold the candle it is
-    /// currently building, so it is clamped here rather than trusted.
     pub(super) fn new(maximum_len: usize, precision: ListingPrecision) -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -210,19 +125,11 @@ impl CandlestickSeries {
         }
     }
 
-    /// Merges the first history page and settles on the live edge.
     pub(super) fn merge_initial(&mut self, candles: impl IntoIterator<Item = ListingCandlestick>) {
         self.insert_keeping_newest(candles);
         self.at_live_edge = true;
     }
 
-    /// Merges a page fetched by panning left, as the caller's intent allows.
-    ///
-    /// `newest` says whether the candle at the live edge is on screen. With
-    /// [`NewestCandle::Evicted`] evicting it is what takes the series off the live
-    /// edge: the user asked to look at the past, so the window must stop following
-    /// it. With [`NewestCandle::Kept`] it is on screen and stays, so the page is
-    /// trimmed to the room left instead.
     pub(super) fn merge_older(
         &mut self,
         candles: impl IntoIterator<Item = ListingCandlestick>,
@@ -234,16 +141,10 @@ impl CandlestickSeries {
         }
     }
 
-    /// Merges a page fetched by panning right.
     pub(super) fn merge_newer(&mut self, candles: impl IntoIterator<Item = ListingCandlestick>) {
         self.insert_keeping_newest(candles);
     }
 
-    /// Applies one live candle, returning whether it changed anything.
-    ///
-    /// A live update is ignored entirely while the chart shows a historical
-    /// window: the venue is still building a candle that is off-screen, and
-    /// inserting it would move the range the user is reading.
     pub(super) fn upsert_live(&mut self, candle: &ListingCandlestick) -> bool {
         if !self.at_live_edge {
             return false;
@@ -292,23 +193,14 @@ impl CandlestickSeries {
         self.at_live_edge = true;
     }
 
-    /// Whether the venue has no more history before the earliest candle.
     pub(super) const fn older_exhausted(&self) -> bool {
         self.older_exhausted
     }
 
-    /// Whether the newest candle is the one the venue is still building.
     pub(super) const fn at_live_edge(&self) -> bool {
         self.at_live_edge
     }
 
-    /// Returns the current series, rebuilding the shared candle buffer only when
-    /// the candles themselves changed.
-    ///
-    /// Metadata-only changes — running out of history, moving back to the live
-    /// edge — reuse the previous allocation, so a snapshot that differs only in
-    /// flags still compares equal to the previous one by
-    /// [`CandlestickSeriesSnapshot::shares_chart_data_with`].
     pub(super) fn snapshot(&mut self) -> CandlestickSeriesSnapshot {
         if self.snapshot_dirty {
             let mut candles = Vec::with_capacity(self.entries.len());
@@ -337,7 +229,6 @@ impl CandlestickSeries {
                     continue;
                 }
                 self.entries.pop_first();
-                // Capacity was the only reason history looked exhausted.
                 self.older_exhausted = false;
             }
             self.entries.insert(candle.timestamp, candle);
@@ -345,12 +236,6 @@ impl CandlestickSeries {
         }
     }
 
-    /// Inserts an older page without ever evicting, and says what it did.
-    ///
-    /// The page is trimmed to the room left, keeping the candles nearest the
-    /// buffer: they are the ones that join it without a gap. Nothing else is
-    /// touched — a series at capacity that receives this page stays exactly where
-    /// it was, at the live edge it was following.
     fn insert_trimming_to_room(
         &mut self,
         candles: impl IntoIterator<Item = ListingCandlestick>,
@@ -361,8 +246,6 @@ impl CandlestickSeries {
         }
         let room = self.maximum_len.saturating_sub(self.entries.len());
         if room == 0 {
-            // Nothing fits and nothing may be evicted, so the page is dropped
-            // whole. The capacity is what refused it, not the venue.
             return OlderMerge::TrimmedByCapacity;
         }
         let mut inserted = false;
@@ -381,8 +264,6 @@ impl CandlestickSeries {
         }
     }
 
-    /// Inserts an older page by evicting the newest candle when the buffer is
-    /// full, and reports what the page did.
     fn insert_keeping_oldest(
         &mut self,
         candles: impl IntoIterator<Item = ListingCandlestick>,
@@ -408,9 +289,6 @@ impl CandlestickSeries {
             inserted = true;
         }
         if evicted_newest {
-            // Evicting the newest candle is what takes the series off the live
-            // edge, not the page: a page that fitted below capacity moved the
-            // window back without losing the candle the chart was following.
             self.at_live_edge = false;
         }
         if inserted {
@@ -432,18 +310,6 @@ impl CandlestickSeries {
     }
 }
 
-/// Keeps the newest `limit` rows of a page, deduplicated by timestamp.
-///
-/// `limit` must be positive. Both callers take it from a capacity that is clamped
-/// where that capacity enters the module — [`CandlestickSeries::new`] and
-/// `CandlestickService::new` — so a zero here would be a caller bug rather than a
-/// buffer that cannot hold anything, and silently keeping one candle would hide it.
-///
-/// Two callers need the same rule and they must not drift apart: a fetched page
-/// is bounded by the buffer it is going into, and an older page merged with the
-/// newest candle kept is trimmed to the room left. Both keep the candles nearest
-/// the buffer, both let the last value of a repeated timestamp win, and both
-/// answer in ascending timestamp order.
 pub(super) fn bounded_history(
     history: Vec<ListingCandlestick>,
     limit: usize,
@@ -518,7 +384,6 @@ mod tests {
         CandlestickSeries::new(maximum_len, precision())
     }
 
-    /// A price tick of one cent and a quantity step of one thousandth.
     fn precision() -> ListingPrecision {
         ListingPrecision {
             price_tick: Tick::from_str("0.01").expect("price tick should parse"),
@@ -652,14 +517,6 @@ mod tests {
         assert_eq!(series.snapshot().latest_timestamp(), Some(4));
     }
 
-    /// A page merged with the newest candle kept never evicts: at capacity it
-    /// fits nothing and says so, and the candle the chart is following is still
-    /// there afterwards.
-    ///
-    /// This is the case that made an eviction policy of its own unsound: the
-    /// newest candle is on screen, so losing it would move the chart out from
-    /// under the user — and the series would leave the live edge, after which a
-    /// live tick is refused forever.
     #[test]
     fn a_page_merged_with_the_newest_candle_kept_should_never_evict() {
         let mut series = series(3);
@@ -680,8 +537,6 @@ mod tests {
         );
     }
 
-    /// The page is trimmed to the room left, keeping the candles nearest the
-    /// buffer: the ones that join it without a gap.
     #[test]
     fn a_page_merged_with_the_newest_candle_kept_should_keep_the_nearest_older_candles() {
         let mut series = series(5);
@@ -707,8 +562,6 @@ mod tests {
         assert!(series.at_live_edge());
     }
 
-    /// The opposite intent: the newest candle is off screen, so evicting it is
-    /// what moves the series back in time — and what takes it off the live edge.
     #[test]
     fn a_page_merged_with_the_newest_candle_evicted_should_clear_the_live_edge() {
         let mut series = series(3);
@@ -739,9 +592,6 @@ mod tests {
         assert!(kept.at_live_edge() && evicted.at_live_edge());
     }
 
-    /// A page carrying only candles the series already holds changed nothing, so
-    /// it is no progress under either intent — and under the evicting one it must
-    /// not move the edge either.
     #[test]
     fn a_page_of_candles_already_held_should_make_no_progress() {
         let mut kept = series(4);
@@ -814,8 +664,6 @@ mod tests {
         assert!(!changed && Arc::ptr_eq(&before.candles, &after.candles));
     }
 
-    /// The unit is part of a candle, so two candles of one timestamp that were
-    /// published in different units are different candles.
     #[test]
     fn a_live_update_should_notice_a_changed_quantity_unit() {
         let mut series = series(2);
@@ -898,8 +746,6 @@ mod tests {
         assert_eq!(timestamps(&mut series), vec![2]);
     }
 
-    /// Every candle of one series names the listing it was published for, and the
-    /// chart keeps that key: two listings of one instrument are two series.
     #[test]
     fn a_series_should_keep_the_listing_each_candle_names() {
         let mut series = series(4);

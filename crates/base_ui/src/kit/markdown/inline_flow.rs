@@ -1,29 +1,3 @@
-//! 行内片段 → 引擎富文本模型（`TextContent{runs, inline_boxes}`）。
-//!
-//! 旧实现的 `inline_flow.rs` 是一个**自绘 `Element`**（1,546 行）：自己塑形、自己折行、自己
-//! 画行内盒与链接下划线。引擎 E2 把这些能力搬进了文本管线（parley 折行 + 逐 run 样式 +
-//! `TextDecoration` 几何 + `InlineBoxSpec` 落点），所以这里只做**数据映射**：
-//!
-//! - 粗体 / 斜体 / 行内代码 / 链接色 → [`TextRun`]（逐字节区间覆盖样式）；
-//! - 链接下划线 / 删除线 → `TextStyle.decoration`（引擎按行画线，硬换行与 RTL 的裁剪规则见
-//!   引擎 E2 规格，应用不需要再算几何）；
-//! - 行内图片 → [`InlineBoxSpec`]（尺寸在解析期已定，位置由引擎算；`id` = 图片在片段里的
-//!   序数，`InlineBoxPaint` 由视图层按资源通路补）；
-//! - 链接命中 → 本模块自持的**字节区间** + 引擎 E5 的 `Window::text_byte_index_at`（把点变成
-//!   文本字节偏移，簇边界由 parley 决定），见 [`Flow::link_at`]。
-//!
-//! 旧实现里值得保留的语义在映射里逐条对上：
-//!
-//! | 旧行为 | 本模块 |
-//! |---|---|
-//! | `item_spans` 的逻辑索引空间（图片占 1 字节） | 不需要：图片不占文本字节，`InlineBoxSpec.index` 直接挂在插入点的字节偏移上 |
-//! | 硬换行（`LineBreak` → `"\n"`） | 保留：文本里就是一个 `\n`，由 parley 断行 |
-//! | 行尾空白悬挂 / 折行复核循环 | 引擎负责（parley 原生），不再有复核循环 |
-//! | 段落左/中/右对齐 | `TextStyle.alignment`（视图层按块设置） |
-//! | 标题字号倍率 / 粗体 | 视图层传给 [`FlowStyle`] 的基准样式（`scale` + `bold`） |
-//! | kbd 的圆角框（文字 + 边框整体不可拆） | **降级**：引擎 `InlineBoxSpec` 只画盒、不承载文字（"带内容的行内盒"是 E2 遗留项），所以 kbd 内容按等宽字体 + 下划线表达，框记录在 [`Flow::kbd_spans`] 里；见 `spec-deltas/kit-text.md` |
-//! | hover 才画链接下划线 | **降级为常驻下划线**：`runs` 不是动态数据（`bind_style` 只能换整节点前景色），hover 期间无法只给一条链接加线；常驻下划线是引擎能力内的最接近表达 |
-
 use std::ops::Range;
 
 use smol_str::SmolStr;
@@ -40,44 +14,24 @@ use super::{
     source::InlineImageFormat,
 };
 
-/// 行内代码 / kbd 用的等宽字体族。
-///
-/// 引擎（fontique）对不存在的家族静默跳过并回落到系统默认栈，所以这里写一个跨平台最常见的
-/// 等宽家族即可：Linux 上它通常不存在，会回落成正文默认字体（可读性不降级，只是不"等宽"）。
 pub const MONO_FAMILY: &str = "Consolas";
 
-/// 链接 / 删除线的线宽（逻辑像素）。
 pub const DECORATION_THICKNESS: f32 = 1.0;
 
-/// 一段行内内容在引擎文本模型里的展开结果。
-///
-/// `text` 是唯一的源文本：runs 与 inline_boxes 的偏移都对着它。段落级别的字号/对齐/换行
-/// 由视图层写进 `TextContent.style`（本结构不持有段落级字段）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Flow {
-    /// 源文本（`MarkdownPiece::Text` 原样拼接、`LineBreak` 变成一个 `\n`、图片不占字节）。
     pub text: SmolStr,
-    /// 富文本 runs（升序、不重叠、落在 char boundary）。
     pub runs: Vec<TextRun>,
-    /// 行内盒（行内图片）：`index` 是图片插入点的字节偏移，`id` 是从 0 起的图片序数。
     pub inline_boxes: Vec<InlineBoxSpec>,
-    /// 链接的字节区间（按起点升序；命中用它 + E5 的字节索引）。
     pub link_spans: Vec<LinkSpan>,
-    /// 每段 kbd 内容的字节区间（按起点升序；样式已经烘进 runs，这里只供命中/测试/后续扩展）。
     pub kbd_spans: Vec<Range<usize>>,
 }
 
 impl Flow {
-    /// 空内容。
     pub fn is_empty(&self) -> bool {
         self.text.is_empty() && self.inline_boxes.is_empty()
     }
 
-    /// 字节偏移落在哪条链接里；`None` = 不在链接里。
-    ///
-    /// 区间是半开区间：链接末尾的那个字节（下一条链接的起点）不属于它。图片不占文本字节，
-    /// 所以"只有图片的链接"没有可命中的区间（解析层的 `link_spans` 里它是空区间，被跳过）——
-    /// 这是本批已知限制，见 `spec-deltas/kit-text.md`。
     pub fn link_at(&self, byte: usize) -> Option<LinkId> {
         self.link_spans
             .iter()
@@ -85,7 +39,6 @@ impl Flow {
             .map(|span| span.link)
     }
 
-    /// 字节偏移落在哪一段 kbd 内容里。
     pub fn kbd_at(&self, byte: usize) -> Option<KbdId> {
         self.kbd_spans
             .iter()
@@ -94,30 +47,22 @@ impl Flow {
     }
 }
 
-/// 一条链接覆盖的字节区间。
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinkSpan {
     pub range: Range<usize>,
     pub link: LinkId,
 }
 
-/// 行内映射的样式来源（挂载期从 `crate::theme` 解析一次）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlowStyle {
-    /// 本块基准字号（标题 = 正文字号 × 倍率）。
     pub font_size: f32,
-    /// 正文文字色。
     pub color: Color,
-    /// 链接色。
     pub link: Color,
-    /// 行内代码 / kbd 的文字色。
     pub code: Color,
-    /// 本块是否整体加粗（标题）。
     pub bold: bool,
 }
 
 impl FlowStyle {
-    /// 一个基准样式。
     pub fn new(font_size: f32, color: Color, link: Color, code: Color) -> Self {
         Self {
             font_size,
@@ -128,16 +73,13 @@ impl FlowStyle {
         }
     }
 
-    /// 整块加粗（标题）。
     pub fn with_bold(mut self, bold: bool) -> Self {
         self.bold = bold;
         self
     }
 }
 
-/// 一张行内图片的绘制方式：视图层按资源通路决定（`Image` / 占位 `Quad` / 不画）。
 pub trait ImagePaintSource {
-    /// 返回该图片的绘制方式；`None` = 只算落点、不画（引擎语义）。
     fn paint_for(
         &mut self,
         path: &str,
@@ -146,10 +88,8 @@ pub trait ImagePaintSource {
     ) -> Option<InlineBoxPaint>;
 }
 
-/// 默认的图片绘制方式：画一个占位方块（资源通路尚未接线的批次/测试用）。
 #[derive(Clone, Copy, Debug)]
 pub struct PlaceholderImagePaint {
-    /// 占位色。
     pub color: Color,
 }
 
@@ -167,7 +107,6 @@ impl ImagePaintSource for PlaceholderImagePaint {
     }
 }
 
-/// 不画任何行内图片（只保留落点）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InvisibleImages;
 
@@ -177,7 +116,6 @@ impl ImagePaintSource for InvisibleImages {
     }
 }
 
-/// 把一段行内片段展开成引擎富文本模型；`images` 决定行内图片画什么。
 pub fn flow(
     pieces: &[MarkdownPiece],
     style: &FlowStyle,
@@ -218,7 +156,6 @@ pub fn flow(
     builder.finish()
 }
 
-/// 片段上的行内标记（strong/emphasis 等）——单独一个结构体免得 [`flow`] 里参数爆炸。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct MarkStyle {
     strong: bool,
@@ -229,7 +166,6 @@ struct MarkStyle {
     kbd: Option<KbdId>,
 }
 
-/// 累积中的行内流。
 struct FlowBuilder<'a> {
     style: &'a FlowStyle,
     text: String,
@@ -237,9 +173,7 @@ struct FlowBuilder<'a> {
     inline_boxes: Vec<InlineBoxSpec>,
     link_spans: Vec<LinkSpan>,
     kbd_spans: Vec<Range<usize>>,
-    /// 当前打开的 kbd 段（编号 + 起点）。
     open_kbd: Option<(KbdId, usize)>,
-    /// 当前打开的链接（id + 起点）。
     open_link: Option<(LinkId, usize)>,
 }
 
@@ -257,7 +191,6 @@ impl<'a> FlowBuilder<'a> {
         }
     }
 
-    /// 追加一段文字：先按标记算出覆盖样式，区间就是追加前后的字节范围。
     fn push_text(&mut self, text: &str, mark: MarkStyle) {
         if text.is_empty() {
             self.switch_marks(mark, self.text.len());
@@ -271,7 +204,6 @@ impl<'a> FlowBuilder<'a> {
             .push(TextRun::new(start..end, self.run_style(self.style, mark)));
     }
 
-    /// 关闭/开启链接与 kbd 段：标记切换点就是上一段的终点、下一段的起点。
     fn switch_marks(&mut self, mark: MarkStyle, at: usize) {
         if self.open_link.map(|(id, _)| id) != mark.link {
             if let Some((id, start)) = self.open_link.take()
@@ -298,7 +230,6 @@ impl<'a> FlowBuilder<'a> {
         }
     }
 
-    /// 行内图片：不占文本字节，盒子挂在当前插入点。
     fn push_image(
         &mut self,
         path: &str,
@@ -320,13 +251,11 @@ impl<'a> FlowBuilder<'a> {
             index: self.text.len(),
             size,
             baseline: None,
-            // 旧实现的图片在行内垂直居中；引擎的 `Middle` 是同一语义。
             align: InlineAlign::Middle,
             paint: images.paint_for(path, format, size),
         });
     }
 
-    /// 硬换行：文本里一个 `\n`。
     fn push_line_break(&mut self) {
         let mark = MarkStyle::default();
         self.switch_marks(mark, self.text.len());
@@ -336,7 +265,6 @@ impl<'a> FlowBuilder<'a> {
             .push(TextRun::new(at..at + 1, self.run_style(self.style, mark)));
     }
 
-    /// 收尾：关闭还开着的链接 / kbd 段。
     fn finish(mut self) -> Flow {
         let end = self.text.len();
         self.switch_marks(MarkStyle::default(), end);
@@ -349,10 +277,6 @@ impl<'a> FlowBuilder<'a> {
         }
     }
 
-    /// 一个区间覆盖样式 = 兜底样式 + 本片段的标记。
-    ///
-    /// 引擎语义是「逐属性继承 + 可选覆盖」：这里把**所有**要覆盖的属性显式写出来（字号、颜色、
-    /// 字重、字形、家族、装饰），不依赖兜底样式的非默认值。
     fn run_style(&self, base: &FlowStyle, mark: MarkStyle) -> TextStyle {
         let mut style = TextStyle::new(base.font_size);
         style.weight = if base.bold || mark.strong { 700 } else { 400 };

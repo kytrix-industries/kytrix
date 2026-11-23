@@ -1,25 +1,3 @@
-//! The pane's own behaviour: what it reports, what the header offers, what the chart draws,
-//! and what it leaves behind when it goes.
-//!
-//! The contract layer is driven directly — `load`, `sync`, `body`, `header`, `dispatch`,
-//! `release` are the hooks the framework calls — over the engine's headless host, because
-//! these tests are about this pane's decisions rather than about the framework's dispatch.
-//! The stream messages a test needs are injected through the pane's `test_inbox` (or through
-//! the `apply_*` hooks directly), and the candle source is a fixture rather than a live
-//! connection: a headless host has no market directory, so the pane is constructed with
-//! [`CandlestickWidget::with_source`] and every transition past `load`'s market gate is
-//! driven by its own hook.
-//!
-//! # What the headless host cannot reach
-//!
-//! `market_ready` reads `cx.services().market_participants`, and `WidgetTestApp` composes the
-//! services with that slot empty (a `MarketParticipantsConnector` needs a
-//! the toolkit runtime type, which is not a dependency of this crate). Every
-//! behaviour that the directory itself decides — a loaded venue unblocking the pane, a
-//! shrinking commit sending it back to waiting, the instrument control opening over loaded
-//! routes — is therefore asserted on the branch the pane takes with no directory, and the
-//! gaps are named in the delivery report rather than papered over.
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -84,20 +62,11 @@ use crate::{
     time::{TIMEFRAMES, remaining_time_label},
 };
 
-// -------------------------------------------------------------------- vocabulary
-
-/// The symbol the fixture route publishes the charted listing under.
 const SYMBOL: &str = "BTCUSDT";
-/// The size the pane's body is laid out in. Everything drawn is measured from it.
 const PAGE: (f32, f32) = (640.0, 400.0);
-/// A page wide enough that a whole candle buffer fits inside the plot, which is what the
-/// prefetch threshold tests need: they are about the buffer's room, not about the window.
 const WIDE_PAGE: (f32, f32) = (7_800.0, 400.0);
-/// The host window a wide page has to fit in: the root lays its children out inside the
-/// window, so a pane wider than the window is clamped to the window's width.
 const WINDOW_WIDE: (f32, f32) = (7_900.0, 600.0);
 
-/// The translator the product ships: what these tests assert is the catalogue's copy.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -127,7 +96,6 @@ fn venue(name: &str) -> VenueId {
     VenueId::from_name(name).expect("the fixture venue is canonical")
 }
 
-/// A config that already follows the fixture route's published listing.
 fn config() -> CandlestickConfig {
     CandlestickConfig {
         selection: Some(selection(SYMBOL)),
@@ -152,7 +120,6 @@ fn market_price(close: u64) -> MarketPrice {
     }
 }
 
-/// One candle of the fixture listing, with every price at `close`.
 fn candle(timestamp: i64, close: u64) -> ListingCandlestick {
     let price = market_price(close);
     ListingCandlestick {
@@ -172,7 +139,6 @@ fn candle(timestamp: i64, close: u64) -> ListingCandlestick {
     }
 }
 
-/// The two channels a fixture delivers, in the order an inbox holds them.
 fn snapshot_message(snapshot: CandlestickSeriesSnapshot) -> Arc<CandlestickStreamMessage> {
     Arc::new(CandlestickStreamMessage::Snapshot(snapshot))
 }
@@ -195,13 +161,11 @@ fn snapshot_of(candles: impl IntoIterator<Item = ListingCandlestick>) -> Candles
     series.snapshot()
 }
 
-/// A live-edge snapshot of `len` candles whose newest one is at `newest`.
 fn live_edge_snapshot(len: usize, newest: i64) -> CandlestickSeriesSnapshot {
     let oldest = newest - i64::try_from(len).expect("the fixture length fits an i64") + 1;
     snapshot_of((oldest..=newest).map(|timestamp| candle(timestamp, 100)))
 }
 
-/// A live-edge snapshot of `len` candles whose venue has no more history.
 fn exhausted_snapshot(len: usize) -> CandlestickSeriesSnapshot {
     let newest = i64::try_from(len).expect("the fixture length fits an i64");
     let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
@@ -210,8 +174,6 @@ fn exhausted_snapshot(len: usize) -> CandlestickSeriesSnapshot {
     series.snapshot()
 }
 
-/// A snapshot of a window wheeled away from the live edge: a full buffer with one older
-/// candle merged in with [`NewestCandle::Evicted`], which is what leaves the edge.
 fn panned_snapshot() -> CandlestickSeriesSnapshot {
     let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
     let newest = i64::try_from(MAXIMUM_CANDLES).expect("the capacity fits an i64");
@@ -220,9 +182,6 @@ fn panned_snapshot() -> CandlestickSeriesSnapshot {
     series.snapshot()
 }
 
-// ------------------------------------------------------------------------ source
-
-/// The subscription the fixture source opens: it never delivers and never ends.
 struct PendingSubscription;
 
 impl CandlestickEventSubscription for PendingSubscription {
@@ -238,11 +197,6 @@ impl CandlestickEventSubscription for PendingSubscription {
     }
 }
 
-/// A source that answers what a route publishes and never delivers a candle.
-///
-/// The pane's stream messages are injected by the test rather than produced by this source,
-/// so a test is about what the pane does with a push. A stream that is opened is never
-/// answered, which is also what keeps a test from depending on its own timing.
 #[derive(Clone)]
 struct FixtureSource {
     timeframes: Vec<TimeFrame>,
@@ -257,7 +211,6 @@ impl FixtureSource {
         }
     }
 
-    /// The source a fixture route with the default scope publishes.
     fn publishing_all_intervals() -> Self {
         Self::new(TIMEFRAMES.to_vec(), vec![Adjustment::None])
     }
@@ -292,10 +245,6 @@ impl CandlestickSource for FixtureSource {
     }
 }
 
-// ------------------------------------------------------------------------ harness
-
-/// Runs `body` with a [`WidgetCx`] over one pane instance's own scope, which is what a pane
-/// hands its widget and what makes `cx.unique_key` per instance.
 fn with_scope<R>(
     harness: &mut WidgetTestApp,
     scope: SignalScope,
@@ -308,8 +257,6 @@ fn with_scope<R>(
     body(&mut cx)
 }
 
-/// A fixed-size box the pane's body and its header rows are built into.
-/// Resizes the host window, which is the available space the root lays its children out in.
 fn resize_window(harness: &mut WidgetTestApp, size: (f32, f32)) {
     let window = harness.window();
     harness
@@ -337,7 +284,6 @@ fn page(harness: &mut WidgetTestApp, id: &'static str, size: (f32, f32)) -> Node
     })
 }
 
-/// A header row group, as a pane builds its two groups.
 fn header_group(harness: &mut WidgetTestApp, parent: NodeId, id: &'static str) -> NodeId {
     harness.with_cx(|cx| {
         NodeBuilder::boxed()
@@ -348,22 +294,17 @@ fn header_group(harness: &mut WidgetTestApp, parent: NodeId, id: &'static str) -
     })
 }
 
-/// A pane the framework would have built, driven by a fixture source.
 struct Pane {
     widget: CandlestickWidget,
     status: WidgetStatus,
-    /// The pane's own signal scope, which the framework releases after `release`.
     scope: SignalScope,
     chart_page: NodeId,
     left: NodeId,
     right: NodeId,
-    /// How often the widget wrote its persistent configuration back.
     publishes: Rc<Cell<usize>>,
 }
 
 impl Pane {
-    /// Every hook a test drives goes through the pane's own scope, as the framework's cx
-    /// does for one widget instance.
     fn with<R>(
         &mut self,
         harness: &mut WidgetTestApp,
@@ -377,7 +318,6 @@ impl Pane {
         self.with(harness, |widget, cx| widget.load(cx));
     }
 
-    /// Starts the stream the way `load` does once its market gate is past.
     fn start_reading(&mut self, harness: &mut WidgetTestApp) {
         self.with(harness, |widget, cx| {
             widget.start_current(false, false, cx);
@@ -390,7 +330,6 @@ impl Pane {
         });
     }
 
-    /// Builds the body the framework builds once the pane has content.
     fn body(&mut self, harness: &mut WidgetTestApp) {
         let page = self.chart_page;
         self.with(harness, |widget, cx| {
@@ -398,7 +337,6 @@ impl Pane {
         });
     }
 
-    /// Builds both header groups, as a pane builds its header row.
     fn headers(&mut self, harness: &mut WidgetTestApp) {
         let (left, right) = (self.left, self.right);
         self.with(harness, |widget, cx| {
@@ -413,18 +351,14 @@ impl Pane {
 
     fn release(&mut self, harness: &mut WidgetTestApp) {
         self.with(harness, |widget, cx| widget.release(cx));
-        // The framework drops the widget's scope after the surface's nodes are removed
-        // (`AnyWidget::release`); the widget itself never owns the scope's release.
         harness.app_mut().release_scope(self.scope);
     }
 
-    /// One production-shaped round: the widget's hook, then the pipeline that paints it.
     fn frame(&mut self, harness: &mut WidgetTestApp) {
         self.sync(harness);
         harness.drain();
     }
 
-    /// Builds the body, lets the layout settle it, and draws one frame.
     fn draw(&mut self, harness: &mut WidgetTestApp) {
         self.body(harness);
         harness.drain();
@@ -481,14 +415,12 @@ impl Pane {
         });
     }
 
-    /// Accepts one snapshot as the latest stream would, then reports the ready status.
     fn accept(&mut self, harness: &mut WidgetTestApp, snapshot: CandlestickSeriesSnapshot) {
         self.push_snapshot(snapshot);
         self.push_status(CandlestickStatus::Ready);
         self.frame(harness);
     }
 
-    /// The one canvas node the chart draws into.
     fn canvas(&self, harness: &WidgetTestApp) -> NodeId {
         harness
             .find_by_debug_prefix(self.chart_page, ChartCanvas::selector())
@@ -499,7 +431,6 @@ impl Pane {
         harness.canvas_primitives(self.canvas(harness))
     }
 
-    /// The canvas the node tree currently holds, for `Arc::ptr_eq` steady-state assertions.
     fn canvas_handle(&self, harness: &WidgetTestApp) -> Arc<ui_core::paint::canvas::Canvas> {
         harness
             .canvas_handle(self.canvas(harness))
@@ -510,7 +441,6 @@ impl Pane {
         self.widget.chart.layout_width()
     }
 
-    /// The centre of the plot's data area, which is what the chart hit-tests against.
     fn data_center(&self) -> Point {
         let bounds = self
             .widget
@@ -533,7 +463,6 @@ impl Pane {
     }
 }
 
-/// Builds a pane over `source`, with its own scope and header groups, and no work started.
 fn pane_with_source(
     harness: &mut WidgetTestApp,
     config: CandlestickConfig,
@@ -562,7 +491,6 @@ fn pane_with_source(
     }
 }
 
-/// A pane that follows the fixture listing, with nothing started yet.
 fn default_pane(harness: &mut WidgetTestApp) -> Pane {
     pane_with_source(
         harness,
@@ -572,7 +500,6 @@ fn default_pane(harness: &mut WidgetTestApp) -> Pane {
     )
 }
 
-/// A pane over a wide page, for the prefetch thresholds.
 fn wide_pane(harness: &mut WidgetTestApp) -> Pane {
     let pane = pane_with_source(
         harness,
@@ -584,8 +511,6 @@ fn wide_pane(harness: &mut WidgetTestApp) -> Pane {
     pane
 }
 
-/// A pane that has been given a snapshot and drawn once: the shape most assertions start
-/// from.
 fn drawn_pane(harness: &mut WidgetTestApp, snapshot: CandlestickSeriesSnapshot) -> Pane {
     let mut pane = default_pane(harness);
     pane.start_reading(harness);
@@ -594,23 +519,12 @@ fn drawn_pane(harness: &mut WidgetTestApp, snapshot: CandlestickSeriesSnapshot) 
     pane
 }
 
-// ------------------------------------------------------------------ the directory seam
-
-/// A market directory a test loads and unloads venues on.
-///
-/// The headless host can be handed a `MarketParticipantsConnector`, but nothing in this
-/// crate can *load* one (loading needs a live transport, and the loaded-venue table's write
-/// entry is crate-private to the connector). This fixture answers the same questions a loaded
-/// venue would, so the directory's branches are reachable from a view test.
 struct FixtureDirectory {
     catalog: Arc<Catalog>,
-    /// The routes this directory answers as loaded, and the capabilities each one carries.
     loaded: RefCell<Vec<(VenueRoute, Vec<CapabilityId>)>>,
 }
 
 impl FixtureDirectory {
-    /// A directory over `catalog` with nothing loaded: what a host whose directory load never
-    /// committed looks like.
     fn new(catalog: Arc<Catalog>) -> Rc<Self> {
         Rc::new(Self {
             catalog,
@@ -618,7 +532,6 @@ impl FixtureDirectory {
         })
     }
 
-    /// The same directory with the fixture spot route loaded for candlesticks.
     fn with_spot_loaded(catalog: Arc<Catalog>) -> Rc<Self> {
         let directory = Self::new(catalog);
         directory.load(route(), vec![CapabilityId::Candlesticks]);
@@ -629,14 +542,12 @@ impl FixtureDirectory {
         Rc::clone(self) as Rc<dyn MarketDirectory>
     }
 
-    /// Publishes `route` as loaded, with `capabilities`.
     fn load(&self, route: VenueRoute, capabilities: Vec<CapabilityId>) {
         let mut loaded = self.loaded.borrow_mut();
         loaded.retain(|(held, _)| held != &route);
         loaded.push((route, capabilities));
     }
 
-    /// Takes `route` back out of the loaded venues, as a shrinking commit does.
     fn unload(&self, route: &VenueRoute) {
         self.loaded.borrow_mut().retain(|(held, _)| held != route);
     }
@@ -682,7 +593,6 @@ impl MarketDirectory for FixtureDirectory {
     }
 }
 
-/// A published fixture catalogue listing `symbols` on the fixture spot route.
 fn fixture_catalog(symbols: &[&str]) -> Arc<Catalog> {
     let entries = fixture_entries(symbols);
     let fixture = test_support::Fixture::new(entries.clone());
@@ -691,14 +601,11 @@ fn fixture_catalog(symbols: &[&str]) -> Arc<Catalog> {
     Arc::clone(fixture.catalog_arc())
 }
 
-/// The same catalogue registered but never published: a read of it is answered with
-/// [`CatalogError::CatalogNotLoaded`], the directory's "not loaded yet" state.
 fn fixture_catalog_unpublished(symbols: &[&str]) -> Arc<Catalog> {
     let fixture = test_support::Fixture::new(fixture_entries(symbols));
     Arc::clone(fixture.catalog_arc())
 }
 
-/// The catalogue entries a fixture route lists `symbols` under.
 fn fixture_entries(symbols: &[&str]) -> Vec<CatalogEntry> {
     symbols
         .iter()
@@ -712,7 +619,6 @@ fn fixture_entries(symbols: &[&str]) -> Vec<CatalogEntry> {
         .collect()
 }
 
-/// A pane over `directory`, with its own scope and header groups, and no work started.
 fn pane_with_directory(
     harness: &mut WidgetTestApp,
     config: CandlestickConfig,
@@ -750,13 +656,11 @@ fn pane_with_directory(
     }
 }
 
-/// Moves the directory generation the host publishes, which is what wakes a waiting pane.
 fn publish_generation(harness: &mut WidgetTestApp, generation: u64) {
     let signal = harness.services().catalog_generation;
     harness.app_mut().write(&signal, generation);
 }
 
-/// One frame of the surface the framework draws around the body, over the pane's own status.
 fn synced_surface(harness: &mut WidgetTestApp, pane: &Pane, has_content: bool) -> WidgetSurface {
     let mut surface = with_scope(harness, pane.scope, |cx| {
         WidgetSurface::build(cx, pane.chart_page, pane.status).expect("the surface builds")
@@ -814,8 +718,6 @@ fn scroll(position: Point, delta: Point) -> Event {
     })
 }
 
-/// The point the settings panel occupies: the chart's surface is the whole pane, and the
-/// panel is offered the events over its own column first, so a chart never sees them.
 fn over_the_panel(pane: &Pane) -> Point {
     let bounds = pane.widget.chart.bounds().expect("the chart has a box");
     Point::new(
@@ -823,8 +725,6 @@ fn over_the_panel(pane: &Pane) -> Point {
         bounds.origin.y + bounds.size.height / 2.0,
     )
 }
-
-// --------------------------------------------------------------- config & reading
 
 #[test]
 fn the_default_config_should_follow_nothing() {
@@ -840,8 +740,6 @@ fn the_default_config_should_follow_nothing() {
 
 #[test]
 fn a_chart_that_follows_nothing_should_describe_no_venue() {
-    // Nothing is assumed for a chart nobody has pointed anywhere: no venue for the
-    // countdown, and the picker opens wherever its own filters admit.
     assert_eq!(venue_of(&CandlestickConfig::default()), None);
     assert_eq!(venue_of(&config()), Some(&venue("binance")));
 }
@@ -869,8 +767,6 @@ fn an_unselected_config_should_round_trip_through_its_persisted_form() {
 
 #[test]
 fn an_old_payload_should_decode_to_the_default_config() {
-    // A payload written before the listing shape existed names a route and an instrument,
-    // which is not a listing: it cannot decode, so the chart reads the defaults.
     let legacy = concat!(
         r#"{"selection":{"route":{"venue":"binance","scope":"spot"},"#,
         r#""instrument":{"symbol":"BTCUSDT"}},"timeframe":"1m"}"#,
@@ -1027,8 +923,6 @@ fn clearing_the_countdown_should_restore_the_initial_label() {
     );
 }
 
-// ------------------------------------------------------------------ status & waits
-
 #[test]
 fn a_widget_without_a_snapshot_should_report_connecting_and_have_no_content() {
     let mut harness = harness();
@@ -1094,8 +988,6 @@ fn a_widget_without_a_selection_should_ask_for_one() {
         PAGE,
     );
 
-    // The state `load` reports once its market gate is past: nothing chosen is the pane's
-    // own prompt rather than a failure.
     pane.start_reading(&mut harness);
 
     assert_eq!(
@@ -1277,7 +1169,6 @@ fn every_failure_should_offer_the_recovery_that_reloads_the_widget() {
     );
     assert!(failure.action().is_enabled());
 
-    // The rpc path reports the same recovery, so a page that failed offers it too.
     let request_id = RequestId::new(1);
     pane.push(Inbound::Rpc {
         request_id,
@@ -1332,8 +1223,6 @@ fn an_explicit_reload_should_start_over_from_connecting() {
     pane.accept(&mut harness, live_edge_snapshot(10, 10));
     assert!(pane.widget.has_content());
 
-    // What `load` does once its market gate is past, for a pane the user reloaded: it
-    // cannot vouch for what it was showing, so the chart goes.
     pane.with(&mut harness, |widget, cx| {
         widget.start_current(false, false, cx);
     });
@@ -1360,8 +1249,6 @@ fn a_retry_after_a_failure_should_keep_the_chart_and_drop_the_pages_in_flight() 
     pane.frame(&mut harness);
     assert!(pane.status(&harness).is_failed());
 
-    // A retry is the framework's recovery: it reopens the stream for the scope the chart
-    // was reading and keeps the candles the user is still looking at.
     pane.with(&mut harness, |widget, cx| {
         widget.start_current(true, false, cx);
     });
@@ -1377,8 +1264,6 @@ fn a_retry_after_a_failure_should_keep_the_chart_and_drop_the_pages_in_flight() 
     assert_eq!(pane.status(&harness), WidgetState::Connecting);
 }
 
-// ------------------------------------------------------------------------- scope
-
 #[test]
 fn a_snapshot_for_another_scope_should_be_ignored() {
     let mut harness = harness();
@@ -1386,8 +1271,6 @@ fn a_snapshot_for_another_scope_should_be_ignored() {
     pane.start_reading(&mut harness);
     pane.accept(&mut harness, live_edge_snapshot(10, 10));
 
-    // A snapshot for the same instrument on another interval belongs to the scope the
-    // chart replaced; the stream of the old generation may still deliver it.
     let other = CandlestickStreamKey::new(
         listing(SYMBOL),
         TimeFrame::Minute5,
@@ -1477,8 +1360,6 @@ fn a_market_taken_away_mid_flight_should_leave_the_pane_waiting() {
     pane.start_reading(&mut harness);
     pane.accept(&mut harness, live_edge_snapshot(10, 10));
 
-    // The transition a shrinking commit performs: the venue the chart reads is gone, so the
-    // pane reports the neutral notice and drops what it drew.
     pane.with(&mut harness, |widget, cx| widget.wait_for_market(cx));
     pane.frame(&mut harness);
 
@@ -1491,7 +1372,6 @@ fn a_market_taken_away_mid_flight_should_leave_the_pane_waiting() {
         other => panic!("a market taken away is a wait, got {other:?}"),
     }
 
-    // The stream the retired generation opened may still push a snapshot; it is dropped.
     pane.push_snapshot(live_edge_snapshot(20, 40));
     pane.frame(&mut harness);
 
@@ -1536,9 +1416,6 @@ fn a_catalog_generation_change_should_resettle_the_scope_a_pane_was_reading() {
     pane.start_reading(&mut harness);
     pane.accept(&mut harness, live_edge_snapshot(10, 10));
 
-    // The catalogue generation the stream resolved its rules against was replaced. With no
-    // directory holding the chart's market any more, the pane goes back to waiting for it
-    // rather than keeping a stream built on a generation nothing publishes.
     let signal = harness.services().catalog_generation;
     harness.app_mut().write(&signal, 1);
     pane.frame(&mut harness);
@@ -1564,8 +1441,6 @@ fn a_route_rejection_should_be_read_as_the_scope_it_names() {
     interval.start_reading(&mut harness);
     let publishes = interval.publishes.get();
 
-    // The route refuses the interval the chart subscribed to: the chart falls back to the
-    // default rather than reporting a scope it can still chart.
     interval.push_failure(MarketError::from(
         MarketParticipantError::UnsupportedTimeFrame {
             route: route(),
@@ -1584,8 +1459,6 @@ fn a_route_rejection_should_be_read_as_the_scope_it_names() {
     );
     assert!(!interval.status(&harness).is_failed());
 
-    // The route serving no candles at all is not a failure either: nothing is chosen any
-    // more, and the pane asks for an instrument.
     let mut capability = default_pane(&mut harness);
     capability.start_reading(&mut harness);
     capability.push_failure(MarketError::UnsupportedCapability {
@@ -1612,7 +1485,6 @@ fn changing_the_adjustment_should_subscribe_a_new_scope() {
     let generation = pane.widget.generation;
     let publishes = pane.publishes.get();
 
-    // What the adjustment picker's handler asks the pane to do.
     pane.with(&mut harness, |widget, cx| {
         widget.apply_header_request(HeaderRequest::Adjustment(Adjustment::Forward), cx);
     });
@@ -1644,8 +1516,6 @@ fn the_scope_should_be_settled_against_what_the_route_publishes() {
     let mut pane = pane_with_source(&mut harness, stored, source, PAGE);
     let publishes = pane.publishes.get();
 
-    // The two lookups `load` performs before it subscribes: an interval or a convention the
-    // route stopped publishing goes back to the default instead of being subscribed.
     pane.with(&mut harness, |widget, cx| {
         widget.resolve_timeframe(cx);
         widget.resolve_adjustment(cx);
@@ -1658,8 +1528,6 @@ fn the_scope_should_be_settled_against_what_the_route_publishes() {
         "a settled scope is written back to the persisted configuration"
     );
 }
-
-// -------------------------------------------------------------- zones & countdown
 
 #[test]
 fn moving_the_data_time_zone_should_repaint_the_chart() {
@@ -1725,8 +1593,6 @@ fn the_countdown_should_repaint_only_when_its_label_moves() {
     pane.draw(&mut harness);
     let wake = pane.widget.countdown_wake;
     let current = pane.widget.countdown.label.clone();
-    // A timestamp whose label differs: the label moves once a second, so one of the next
-    // minute's seconds reads differently from the one already drawn.
     let moved = (0..60)
         .map(|second| newest + second * 1_000)
         .find(|timestamp| {
@@ -1746,7 +1612,6 @@ fn the_countdown_should_repaint_only_when_its_label_moves() {
     );
     assert!(!Arc::ptr_eq(&before, &pane.canvas_handle(&harness)));
 
-    // The same wake again recomputes the same label: nothing to draw, nothing asked for.
     pane.write(&mut harness, wake, Some(moved));
     let settled = pane.canvas_handle(&harness);
     let requests = harness.frame_requests();
@@ -1773,13 +1638,10 @@ fn advancing_the_clock_should_fire_the_armed_countdown() {
     pane.draw(&mut harness);
     assert!(pane.widget.countdown_timer.is_some());
 
-    // The label moves at least once a second, so a second and a bit fires the one-shot.
     assert!(
         harness.advance(Duration::from_millis(1_100)),
         "the timer's callback asks for the frame that presents its write"
     );
-    // A due timer is dispatched at a frame's entry, which is after that round's frame
-    // routes: the sync that consumes the wake it wrote is the next round's (AGENTS §11).
     pane.frame(&mut harness);
 
     assert_eq!(
@@ -1792,8 +1654,6 @@ fn advancing_the_clock_should_fire_the_armed_countdown() {
         "and re-armed the next one"
     );
 }
-
-// ----------------------------------------------------------------- canvas & input
 
 #[test]
 fn the_chart_should_draw_its_candles_on_the_canvas() {
@@ -1880,7 +1740,6 @@ fn dragging_should_pan_the_viewport_and_stop_at_the_live_edge() {
     );
     assert!(pane.widget.dragging);
 
-    // Dragging right pulls older candles into view: the chart stops following the edge.
     let right = Point::new(center.x + 120.0, center.y);
     assert!(pane.dispatch(&mut harness, pointer_move(right)));
     assert!(
@@ -1888,8 +1747,6 @@ fn dragging_should_pan_the_viewport_and_stop_at_the_live_edge() {
         "a drag away from the edge anchors the viewport"
     );
 
-    // Dragging back past the edge clamps at it, and following is expressed as no anchor.
-    // The drag stays inside the canvas, which is where the chart accepts a pointer at all.
     let bounds = pane.widget.chart.bounds().expect("the chart has a box");
     let left = Point::new(bounds.origin.x + 1.0, center.y);
     assert!(pane.dispatch(&mut harness, pointer_move(left)));
@@ -1928,9 +1785,6 @@ fn scrolling_should_zoom_around_the_pointer() {
     );
 }
 
-/// A wheel with no vertical component is not a zoom step: a trackpad's sideways swipe
-/// arrives as `delta.y == 0`, and reading that as "zoom out" shrinks the chart on every
-/// horizontal event.
 #[test]
 fn a_wheel_without_a_vertical_delta_should_not_zoom() {
     let mut harness = harness();
@@ -1953,8 +1807,6 @@ fn a_wheel_without_a_vertical_delta_should_not_zoom() {
     );
 }
 
-/// The same for a horizontal scroll, which is what a trackpad sends while it pans
-/// sideways: no vertical delta means no zoom, in either direction.
 #[test]
 fn a_horizontal_wheel_should_not_zoom_the_chart() {
     let mut harness = harness();
@@ -1979,9 +1831,6 @@ fn a_horizontal_wheel_should_not_zoom_the_chart() {
     assert_eq!(pane.widget.viewport.cursor, None);
 }
 
-/// A press that started on the chart is released wherever the pointer is. The settings
-/// panel is offered the up over its own column first, so the chart has to end the drag
-/// without the position gate: otherwise it is left dragging for good.
 #[test]
 fn a_release_outside_the_canvas_should_end_the_drag() {
     let mut harness = harness();
@@ -2013,8 +1862,6 @@ fn a_release_outside_the_canvas_should_end_the_drag() {
     );
 }
 
-/// Coming back over the plot after a release over the panel moves the crosshair; it must
-/// not pan from the stale drag position the canvas never got to end.
 #[test]
 fn a_pointer_that_comes_back_to_the_plot_should_not_jump() {
     let mut harness = harness();
@@ -2079,18 +1926,12 @@ fn events_outside_the_chart_should_not_be_consumed_and_leaving_should_clear_the_
     assert_eq!(pane.widget.viewport.cursor, None);
 }
 
-// ---------------------------------------------------------------------- layout
-
-/// Opening the settings panel has to take width away from the plot, and closing it has to
-/// give the width back.
 #[test]
 fn opening_the_panel_should_narrow_the_plot() {
     let mut harness = harness();
     let mut pane = drawn_pane(&mut harness, live_edge_snapshot(60, 60));
     let wide = pane.layout_width().expect("the chart was laid out");
 
-    // The transition the settings control asks the pane for: the panel's column is built
-    // by the sync that opens it, and the frame after it lays the column out.
     pane.with(&mut harness, |widget, cx| {
         widget.toggle_indicator_panel(cx);
     });
@@ -2132,7 +1973,6 @@ fn a_widened_chart_should_ask_for_the_history_it_now_needs() {
         "a narrow plot shows nothing the loaded page does not hold"
     );
 
-    // Widening the pane from the outside makes room for candles the buffer does not hold.
     let page_node = pane.chart_page;
     let wide = StyleBuilder::new()
         .width(WIDE_PAGE.0)
@@ -2189,8 +2029,6 @@ fn the_header_should_offer_the_instrument_control_and_the_settings_button() {
         "the right group carries the interval picker"
     );
 
-    // With no loaded route the instrument control is disabled, and a disabled control is
-    // built without a click handler, so nothing can dispatch an action it does not carry.
     let key = format_smolstr!("candlestick.header.instrument@{}.click", pane.scope.index());
     assert!(
         !harness.app().has_action_handler(&Action::Custom(key)),
@@ -2212,7 +2050,6 @@ fn the_settings_button_should_be_dead_until_the_market_is_loaded() {
         "a control whose market is not loaded draws disabled and registers no handler"
     );
 
-    // The request signal is never written either: the gate is at the action's entry too.
     assert!(
         harness
             .app()
@@ -2261,8 +2098,6 @@ fn the_adjustment_control_should_follow_what_the_route_publishes() {
     );
 }
 
-// -------------------------------------------------------------------- pagination
-
 #[test]
 fn a_live_edge_chart_at_capacity_should_not_ask_for_history() {
     let mut harness = harness();
@@ -2303,7 +2138,6 @@ fn the_history_prefetch_should_need_a_whole_page_of_room() {
         "a page the buffer cannot take whole is not asked for"
     );
 
-    // One candle of room more, and the page fits: the chart asks.
     let fitting = MAXIMUM_CANDLES - usize::from(HISTORY_PAGE_SIZE);
     let newest = i64::try_from(fitting).expect("the fixture length fits an i64");
     pane.accept(&mut harness, live_edge_snapshot(fitting, newest));
@@ -2329,7 +2163,6 @@ fn an_exhausted_series_should_not_be_asked_for_history() {
         "a venue with no more history is not asked for it"
     );
 
-    // The same page without the flag: nothing but the flag can keep the prefetch quiet.
     let mut series = CandlestickSeries::new(MAXIMUM_CANDLES, test_precision());
     series
         .merge_initial((1..=i64::from(HISTORY_PAGE_SIZE)).map(|timestamp| candle(timestamp, 100)));
@@ -2405,7 +2238,6 @@ fn starting_over_should_drop_the_last_requested_pages() {
     assert!(asked.is_some());
     let requests = pane.widget.history_requests;
 
-    // An explicit start over cannot vouch for the pages the previous generation asked for.
     pane.with(&mut harness, |widget, cx| {
         widget.start_current(false, false, cx);
     });
@@ -2429,8 +2261,6 @@ fn a_panned_chart_near_the_end_should_ask_for_newer_candles() {
     let mut harness = harness();
     let mut pane = default_pane(&mut harness);
     pane.start_reading(&mut harness);
-    // A buffer has to be full before an older page evicts the newest candle, which is what
-    // takes the series off the live edge.
     let mut series = CandlestickSeries::new(300, test_precision());
     series.merge_initial((1..=300).map(|index| candle(index, 100)));
     series.merge_older(std::iter::once(candle(0, 100)), NewestCandle::Evicted);
@@ -2459,8 +2289,6 @@ fn an_anchored_chart_should_ask_for_history_with_the_newest_candle_evicted() {
     let mut harness = harness();
     let mut pane = default_pane(&mut harness);
     pane.start_reading(&mut harness);
-    // A window wheeled back from the live edge: the newest candle is off screen, so the
-    // page the chart asks for may evict it.
     pane.widget.viewport.right_timestamp = Some(30);
     let snapshot = live_edge_snapshot(60, 60);
     let earliest = snapshot.earliest_timestamp();
@@ -2475,8 +2303,6 @@ fn an_anchored_chart_should_ask_for_history_with_the_newest_candle_evicted() {
     assert_eq!(pane.widget.history_requested_before, earliest);
     assert_eq!(pane.widget.history_requests, 1);
 
-    // A settle ends the page; a snapshot that does not move the oldest candle keeps the
-    // marker, so the same page is not asked for twice.
     pane.push_page_settled(PageDirection::History);
     pane.frame(&mut harness);
     assert!(!pane.widget.fetching_history);
@@ -2505,17 +2331,12 @@ fn a_page_in_flight_should_not_be_replaced_by_the_other_direction() {
     series.merge_initial((1..=300).map(|index| candle(index, 100)));
     series.merge_older(std::iter::once(candle(0, 100)), NewestCandle::Evicted);
     pane.widget.viewport.right_timestamp = Some(300);
-    // Zoomed in far enough that only the right edge is near the margin: the newer page is
-    // the one this window needs.
     pane.widget.viewport.candle_width = MAX_CANDLE_WIDTH;
     pane.accept(&mut harness, series.snapshot());
     pane.draw(&mut harness);
     assert!(pane.widget.fetching_newer, "the newer page went out");
     assert_eq!(pane.widget.history_requests, 0);
 
-    // Zoomed out the window now wants the older page too. The binding has one RPC slot, so
-    // the page in flight must not be replaced: a cancelled pagination request is one whose
-    // settle never comes.
     pane.widget.viewport.candle_width = MIN_CANDLE_WIDTH;
     pane.frame(&mut harness);
 
@@ -2526,8 +2347,6 @@ fn a_page_in_flight_should_not_be_replaced_by_the_other_direction() {
         "the page in flight is still the newer one"
     );
 
-    // The settle the stream publishes is what ends the page: only then does the other
-    // direction become askable.
     pane.push_page_settled(PageDirection::Newer);
     pane.frame(&mut harness);
 
@@ -2538,8 +2357,6 @@ fn a_page_in_flight_should_not_be_replaced_by_the_other_direction() {
     );
 }
 
-// ------------------------------------------------------------------ rpc attribution
-
 #[test]
 fn the_answer_to_the_load_should_apply_and_an_unknown_one_should_be_dropped() {
     let mut harness = harness();
@@ -2547,7 +2364,6 @@ fn the_answer_to_the_load_should_apply_and_an_unknown_one_should_be_dropped() {
     pane.start_reading(&mut harness);
     let in_flight = RequestId::new(1);
 
-    // A reply the pane is waiting for is applied: this load failed.
     pane.push(Inbound::Rpc {
         request_id: in_flight,
         result: Err(RpcCallError::ServiceClosed {
@@ -2562,7 +2378,6 @@ fn the_answer_to_the_load_should_apply_and_an_unknown_one_should_be_dropped() {
     );
     assert_eq!(pane.widget.pending.dropped(), 0);
 
-    // A reply for a command this pane never issued is counted and dropped.
     let mut recovered = default_pane(&mut harness);
     recovered.start_reading(&mut harness);
     recovered.push(Inbound::Rpc {
@@ -2587,12 +2402,10 @@ fn a_replaced_command_s_answer_should_not_overwrite_a_failure() {
     let mut pane = default_pane(&mut harness);
     pane.start_reading(&mut harness);
     let replaced = RequestId::new(1);
-    // The stream failed for the scope the load opened; the load's own answer is still out.
     pane.push_failure(disconnect());
     pane.frame(&mut harness);
     assert!(pane.status(&harness).is_failed());
 
-    // A new scope replaces the command; the replaced answer arrives afterwards.
     pane.with(&mut harness, |widget, cx| {
         widget.select_timeframe(TimeFrame::Minute5, cx);
     });
@@ -2615,8 +2428,6 @@ fn a_replaced_command_s_answer_should_not_overwrite_a_failure() {
         "and it is counted as a drop"
     );
 }
-
-// ------------------------------------------------------------- panes & release
 
 #[test]
 fn two_panes_should_live_side_by_side() {
@@ -2711,7 +2522,6 @@ fn releasing_one_pane_should_leave_the_other_s_header_controls_alive() {
         Some(surviving_id.as_str()),
         "and the survivor keeps its own identity"
     );
-    // The surviving pane still works: its stream and its hooks are untouched.
     second.start_reading(&mut harness);
     second.accept(&mut harness, live_edge_snapshot(10, 10));
     assert!(second.widget.has_content());
@@ -2742,8 +2552,6 @@ fn releasing_the_pane_should_return_its_value_slots() {
         "releasing the pane reclaims every value slot it minted"
     );
 
-    // The slot table is a high-water mark: what a release has to make sure is that the next
-    // mount fits in it instead of allocating more.
     let reused = harness.signal_slot_stats().slots;
     for _ in 0..8 {
         let mut pane = default_pane(&mut harness);
@@ -2817,8 +2625,6 @@ fn releasing_the_pane_should_remove_its_own_nodes_and_stop_its_timer() {
     );
     assert!(pane.widget.panel.is_none(), "and so is the settings panel");
 
-    // The countdown was the timer's only reason to wake: nothing is left to fire, so the
-    // round that moves the clock past its deadline asks for no frame.
     let requests = harness.frame_requests();
     harness.advance(Duration::from_millis(1_100));
     assert_eq!(
@@ -2828,10 +2634,6 @@ fn releasing_the_pane_should_remove_its_own_nodes_and_stop_its_timer() {
     );
 }
 
-// --------------------------------------------------------------------- the directory
-
-/// A waiting pane recovers from a loaded venue by itself: the published generation moves,
-/// the pane re-runs its load, and the market it was waiting for starts it.
 #[test]
 fn loading_the_venue_should_let_the_waiting_pane_start() {
     let mut harness = harness();
@@ -2853,7 +2655,6 @@ fn loading_the_venue_should_let_the_waiting_pane_start() {
         WidgetState::Waiting(Notice::MarketNotLoaded { .. })
     ));
 
-    // The directory load commits: the venue is loaded and its catalogue is published.
     directory.load(route(), vec![CapabilityId::Candlesticks]);
     publish_generation(&mut harness, 1);
     pane.frame(&mut harness);
@@ -2874,8 +2675,6 @@ fn loading_the_venue_should_let_the_waiting_pane_start() {
     );
 }
 
-/// A listing the published catalogue provably does not list is a scope that cannot be
-/// charted: the pane goes back to having nothing chosen and writes the reset back.
 #[test]
 fn a_selection_missing_from_the_directory_should_be_cleared_and_reported() {
     let mut harness = harness();
@@ -2905,8 +2704,6 @@ fn a_selection_missing_from_the_directory_should_be_cleared_and_reported() {
     );
 }
 
-/// A listing the catalogue publishes but has settled is one no market call reads: the pane
-/// resets it the way it resets a missing one.
 #[test]
 fn a_selection_for_a_terminal_listing_should_be_cleared_and_reported() {
     let mut harness = harness();
@@ -2951,13 +2748,9 @@ fn a_selection_for_a_terminal_listing_should_be_cleared_and_reported() {
     );
 }
 
-/// A lookup that failed proves nothing: the stored selection stays and the stream is asked
-/// for anyway, so a directory that could not answer does not throw the user's choice away.
 #[test]
 fn a_selection_should_survive_a_lookup_that_proves_nothing() {
     let mut harness = harness();
-    // The venue is loaded, but its catalogue is registered and never published: the lookup
-    // is answered with "not loaded yet", which proves nothing about the listing.
     let catalog = fixture_catalog_unpublished(&[SYMBOL]);
     let directory = FixtureDirectory::with_spot_loaded(catalog);
     let mut pane = pane_with_directory(
@@ -2982,9 +2775,6 @@ fn a_selection_should_survive_a_lookup_that_proves_nothing() {
     assert_eq!(pane.publishes.get(), 0, "nothing is written back");
 }
 
-/// A route the loaded venues answer with but the catalogue does not list is a market the
-/// chart waits for, not a scope that stopped serving candles: the selection the user made is
-/// not the pane's to throw away.
 #[test]
 fn a_revoked_route_should_leave_the_selection_alone_and_be_reported() {
     let mut harness = harness();
@@ -3004,7 +2794,6 @@ fn a_revoked_route_should_leave_the_selection_alone_and_be_reported() {
     );
     let publishes = pane.publishes.get();
 
-    // A shrinking commit takes the market away, but the user's choice is theirs.
     directory.unload(&route());
     publish_generation(&mut harness, 1);
     pane.frame(&mut harness);
@@ -3027,8 +2816,6 @@ fn a_revoked_route_should_leave_the_selection_alone_and_be_reported() {
     ));
 }
 
-/// A market whose directory load never committed is a market the pane waits for: the
-/// directory is empty, and the selection it was given is kept untouched.
 #[test]
 fn a_directory_failure_should_preserve_the_selection() {
     let mut harness = harness();
@@ -3059,8 +2846,6 @@ fn a_directory_failure_should_preserve_the_selection() {
     );
 }
 
-/// The lookup is advisory and the loaded venue is the prerequisite: a chart whose market was
-/// never loaded starts no stream at all rather than subscribing to a route nobody has loaded.
 #[test]
 fn a_market_that_is_not_in_memory_should_not_start_a_stream() {
     let mut harness = harness();
@@ -3088,9 +2873,6 @@ fn a_market_that_is_not_in_memory_should_not_start_a_stream() {
     assert!(pane.widget.awaiting_market);
 }
 
-/// A committed refresh of the chart's own venue reopens its stream: the catalogue generation
-/// the live stream resolved its rules against was replaced, so the same scope is asked for
-/// again — and the selection the user made is not what changed.
 #[test]
 fn a_refresh_of_the_charts_own_venue_should_reopen_its_stream() {
     let mut harness = harness();
@@ -3107,7 +2889,6 @@ fn a_refresh_of_the_charts_own_venue_should_reopen_its_stream() {
     assert_eq!(pane.widget.generation, 1, "the chart started one stream");
     let publishes = pane.publishes.get();
 
-    // The venue is loaded and refreshed: its catalogue publishes a new generation.
     publish_generation(&mut harness, 1);
     pane.frame(&mut harness);
 
@@ -3132,8 +2913,6 @@ fn a_refresh_of_the_charts_own_venue_should_reopen_its_stream() {
     assert_eq!(pane.status(&harness), WidgetState::Connecting);
 }
 
-/// A market taken away while the chart was reading goes back to waiting on the generation
-/// change, and the stream it was reading is dropped with it.
 #[test]
 fn a_market_taken_away_after_a_generation_change_should_leave_the_pane_waiting() {
     let mut harness = harness();
@@ -3162,9 +2941,6 @@ fn a_market_taken_away_after_a_generation_change_should_leave_the_pane_waiting()
     );
 }
 
-/// A route whose loaded scope does not offer candlesticks is a scope this chart cannot
-/// follow: the selection the selector offered is refused rather than carried into a stream
-/// nothing will publish.
 #[test]
 fn a_scope_without_candlesticks_should_be_refused() {
     let mut harness = harness();

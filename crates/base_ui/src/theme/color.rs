@@ -1,19 +1,6 @@
-//! 颜色数学：OKLab 混合、明度阶梯、透明度、线性合成与 WCAG 对比度。
-//!
-//! 引擎只提供「颜色值 + 线性预乘解析/插值」（`ui_core::paint::color`，设计 §5.8）。主题需要的另
-//! 一半数学——OKLCH 调色板的 OKLab 混合、`fg.muted = text 30% 混入 canvas` 这类配方、状态色的
-//! 淡染、明暗阶梯——按设计 §5.8.1 归应用层，因此在这里实现：
-//!
-//! - 调色板与角色数据是引擎 [`Color`]（`Oklch` 变体）；混合借助 `color` crate（引擎依赖，
-//!   CSS Color 4 实现）在 OKLab 空间做，混完回到 OKLCH 分量再装回引擎 `Color`；
-//! - **到 GPU 的颜色只有一条路**：[`ColorResolver`] 把 `Color` 解析成线性预乘 RGBA（挂载期一次）；
-//! - 对比度按 WCAG 在**线性亮度**上计算，半透明前景先在**线性预乘**空间合成到底色上——这正是引擎
-//!   的合成空间（§5.8.4），因此断言的比值就是屏幕上的比值。
-
 use color::{ColorSpaceTag, DynamicColor, Flags, HueDirection};
 use ui_core::paint::color::{Color, ColorResolver};
 
-/// 引擎颜色 → `color` crate 的动态颜色（分量空间 + 独立 alpha）。
 fn dynamic(color: Color) -> DynamicColor {
     let (cs, components) = match color {
         Color::Srgb { r, g, b, alpha } => (ColorSpaceTag::Srgb, [r, g, b, alpha]),
@@ -30,7 +17,6 @@ fn dynamic(color: Color) -> DynamicColor {
     }
 }
 
-/// 动态颜色 → 引擎颜色（OKLCH 是主题的规范空间；其它空间先转到 OKLCH）。
 fn from_dynamic(color: DynamicColor) -> Color {
     let components = if matches!(color.cs, ColorSpaceTag::Oklch) {
         color.components
@@ -41,14 +27,12 @@ fn from_dynamic(color: DynamicColor) -> Color {
     Color::oklch(components[0], components[1], components[2], components[3])
 }
 
-/// OKLCH 分量 `[lightness, chroma, hue, alpha]`（诊断、测试与数据对齐用）。
 pub(crate) fn oklch_components(color: Color) -> [f32; 4] {
     let converted = dynamic(color).convert(ColorSpaceTag::Oklch);
 
     converted.components
 }
 
-/// Oklab 分量 `[L, a, b]`（图表系列/恐慌贪婪阶梯的「能否区分」断言用）。
 #[cfg(test)]
 pub(crate) fn oklab(color: Color) -> [f32; 3] {
     let converted = dynamic(color).convert(ColorSpaceTag::Oklab);
@@ -60,8 +44,6 @@ pub(crate) fn oklab(color: Color) -> [f32; 3] {
     ]
 }
 
-/// `target_weight` 比例的 `from → to` 混合，在 **OKLab** 空间（设计 §6.4：同样的明度一步在两种
-/// 外观下读起来一样；两色直线的中点不穿过脏灰）。
 pub(crate) fn mix_oklab(from: Color, to: Color, target_weight: f32) -> Color {
     let mixed = dynamic(from)
         .interpolate(dynamic(to), ColorSpaceTag::Oklab, HueDirection::Shorter)
@@ -70,7 +52,6 @@ pub(crate) fn mix_oklab(from: Color, to: Color, target_weight: f32) -> Color {
     from_dynamic(mixed)
 }
 
-/// 同一个颜色换一个 alpha（颜色分量与空间不变）。
 pub(crate) fn with_alpha(color: Color, alpha: f32) -> Color {
     match color {
         Color::Srgb { r, g, b, .. } => Color::srgb(r, g, b, alpha),
@@ -81,7 +62,6 @@ pub(crate) fn with_alpha(color: Color, alpha: f32) -> Color {
     }
 }
 
-/// 明度方向的一步（chroma 与 hue 不动）：浅色外观变暗、深色外观变亮（设计 §6.4 R2）。
 pub(crate) fn step(color: Color, amount: f32, lighter: bool) -> Color {
     let [lightness, chroma, hue, alpha] = oklch_components(color);
     let lightness = if lighter {
@@ -93,25 +73,14 @@ pub(crate) fn step(color: Color, amount: f32, lighter: bool) -> Color {
     Color::oklch(lightness.clamp(0.0, 1.0), chroma, hue, alpha)
 }
 
-/// 状态色/涨跌色 chip 的底色：把颜色几乎全部混进画布（深色外观混得少一点，因为它向上的空间更小）。
 pub(crate) fn tint(color: Color, canvas: Color, dark: bool) -> Color {
     mix_oklab(color, canvas, if dark { 0.90 } else { 0.96 })
 }
 
-/// 不透明黑加一个 alpha（阴影、遮罩）。
 pub(crate) fn black_with_alpha(alpha: f32) -> Color {
     Color::oklch(0.0, 0.0, 0.0, alpha)
 }
 
-/// `veil` 合成在 `base` 之上：引擎的合成空间（线性预乘，§5.8.4）里的 source-over。
-///
-/// 用在「底色已知且不透明」的组件配方上（tonal 按钮的 hover 洗色）：配方在主题加载时把结果算成
-/// 一个颜色，运行期只有一种颜色要过渡。返回非预乘的线性颜色。
-///
-/// **合成空间是用户裁决的视觉基线**：旧实现（`Hsla::blend` → sRGB 编码通道混合）与这里只对
-/// 半透明洗色的结果不同；对 tonal 的四个不透明填充，8 位 sRGB 差是 Light hover 7、Light active
-/// 12、Dark hover 34、Dark active 43（/255，逐通道最大）。差异表与 golden 在
-/// `theme/components.rs` 的测试里，登记在 `spec-deltas/theme.md` §6；M2 视觉基准确认这一条。
 pub(crate) fn over(base: Color, veil: Color) -> Color {
     let resolver = ColorResolver;
     let base = resolver.resolve(base).components;
@@ -129,12 +98,6 @@ pub(crate) fn over(base: Color, veil: Color) -> Color {
     )
 }
 
-/// WCAG 对比度（`(较亮 + 0.05) / (较暗 + 0.05)`），按**线性亮度**算。
-///
-/// 半透明前景先在**线性预乘**空间合成到（不透明的）背景上：断言的比值就是引擎合成出来的像素。
-/// 旧实现把半透明前景合成在 sRGB 编码空间（旧 UI 层的 `Rgba::blend` 的产物）；本模块改为线性空间，
-/// 与引擎的合成本质一致——两者只在半透明前景的对比度上有可解释的差异，不透明的 58 条对比度地板
-/// 逐位相同。
 pub(crate) fn contrast(foreground: Color, background: Color) -> f32 {
     let resolver = ColorResolver;
     let background = resolver.resolve(background).components;
@@ -161,10 +124,6 @@ pub(crate) fn contrast(foreground: Color, background: Color) -> f32 {
     (brighter + 0.05) / (darker + 0.05)
 }
 
-/// 引擎解析后的颜色 → 8 位 sRGB（`[r, g, b, a]`）：主题审计与旧调色板数值对齐的出口。
-///
-/// 走的是**发布路径**（`ColorResolver`：宽色域色做 CSS Color 4 chroma 二分），所以 `+1` 的容差
-/// 覆盖的是 8 位舍入，不是两种 gamut mapping 的差异。
 #[cfg(test)]
 pub(crate) fn to_srgb8(color: Color) -> [u8; 4] {
     let components = ColorResolver.resolve(color).components;
@@ -223,7 +182,6 @@ mod tests {
         let from = Color::oklch(0.3, 0.1, 20.0, 1.0);
         let to = Color::oklch(0.7, 0.05, 200.0, 1.0);
 
-        // 端点回到 OKLCH 时经过一次 OKLab 往返，允许 f32 噪声（不是设计误差）。
         for (actual, expected, name) in [
             (mix_oklab(from, to, 0.0), from, "from"),
             (mix_oklab(from, to, 1.0), to, "to"),
@@ -264,7 +222,6 @@ mod tests {
         assert!((oklch_components(darker)[0] - 0.425).abs() < 1e-6);
         assert!((oklch_components(lighter)[1] - 0.1).abs() < 1e-6);
         assert!((oklch_components(lighter)[2] - 200.0).abs() < 1e-4);
-        // 越界的 L 被夹紧。
         assert!(oklch_components(step(color, 5.0, true))[0] <= 1.0);
         assert!(oklch_components(step(color, 5.0, false))[0] >= 0.0);
     }
@@ -294,10 +251,6 @@ mod tests {
         );
     }
 
-    /// `over` 的合成空间就是引擎的：线性预乘里的 source-over，不是「先编码成 sRGB 再加权」。
-    ///
-    /// 两种算法对半透明洗色的结果不同（线性合成在 sRGB 编码里更亮），这是 P2-1a 用户裁决接受的
-    /// 视觉变化；本测试把它钉在**算法**这一层，和主题数据无关——把 `over` 改回 sRGB 混合就会红。
     #[test]
     fn a_veil_over_an_opaque_base_is_source_over_in_linear_space() {
         let resolver = ColorResolver;
@@ -317,8 +270,6 @@ mod tests {
             );
         }
 
-        // 同一对颜色在**旧的** sRGB 编码空间混合是 [96, 115, 134]；线性空间是 [130, 137, 148]。
-        // 这一行就是用户裁决的差异在算法层的最小复现（主题里的差异表见 `theme/components.rs`）。
         let old_srgb_blend = |channel: usize| {
             let encode = |linear: f32| {
                 if linear <= 0.003_130_8 {
@@ -361,7 +312,6 @@ mod tests {
         let background = Color::oklch(1.0, 0.0, 0.0, 1.0);
         let half_black = black_with_alpha(0.5);
         let ratio = contrast(half_black, background);
-        // 50% 黑在**线性**空间合成到白上 = 线性 0.5（不是 sRGB 0.5，也不是 OKLCH L 0.5）。
         let reference = contrast(Color::linear_srgb(0.5, 0.5, 0.5, 1.0), background);
 
         assert!(
@@ -383,19 +333,16 @@ mod tests {
         );
         assert_eq!(to_srgb8(Color::oklch(0.0, 0.0, 0.0, 1.0)), [0, 0, 0, 255]);
         assert_eq!(to_srgb8(Color::TRANSPARENT), [0, 0, 0, 0]);
-        // sRGB 0.5 的中灰在 OKLCH 不是 L 0.5，但 8 位往返必须回到 128。
         assert_eq!(
             to_srgb8(Color::srgb(0.5, 0.5, 0.5, 1.0)),
             [128, 128, 128, 255]
         );
-        // 半透明：8 位 alpha 也要跟着走。
         assert_eq!(
             to_srgb8(Color::srgb(1.0, 1.0, 1.0, 0.5)),
             [255, 255, 255, 128]
         );
     }
 
-    /// 引擎解析：sRGB → 线性预乘；alpha 参与预乘。
     #[test]
     fn the_engine_resolver_premultiplies_alpha_and_unpremultiplies_nothing_else() {
         let resolver = ColorResolver;
@@ -410,7 +357,6 @@ mod tests {
         assert_eq!(resolved.components[3], 0.5);
     }
 
-    /// OKLCH 输入：引擎做 sRGB gamut mapping（chroma 二分），结果在 [0,1] 内。
     #[test]
     fn the_engine_resolver_accepts_oklch_and_maps_it_into_gamut() {
         let resolver = ColorResolver;

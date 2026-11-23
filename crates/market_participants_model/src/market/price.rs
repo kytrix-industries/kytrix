@@ -1,10 +1,7 @@
-//! The unit-carrying price of one listing.
-
 use serde::{Deserialize, Serialize};
 
 use crate::{asset::AssetId, decimal::Price, error::ModelError, listing::venue::PriceBasis};
 
-/// A listing-scoped price with its quote asset and price basis.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketPrice {
     #[serde(rename = "value")]
@@ -16,7 +13,6 @@ pub struct MarketPrice {
 }
 
 impl MarketPrice {
-    /// Validates that this price matches a price rule.
     pub fn validate_against(
         &self,
         quote_asset: &AssetId,

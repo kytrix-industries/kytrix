@@ -1,12 +1,3 @@
-//! The venue's per-command pace.
-//!
-//! The market-data profile states, per command, how many requests an account may
-//! make and how large a burst it may spend at once, and this module is that
-//! statement as one bucket per command. A command the profile published no pace for
-//! has no bucket and is not throttled, which is what the official client does with
-//! the same table: the venue's own refusal is what answers a request that is over an
-//! allowance nothing was published for.
-
 use std::time::Duration;
 
 use ahash::AHashMap;
@@ -14,62 +5,22 @@ use longbridge_proto::quote::RateLimit;
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
-/// One thousandth of a token, which is the unit a quota counts in.
-///
-/// A quota drips at the rate its own limit states, which is a fraction of a token
-/// per millisecond as often as not: counting whole tokens would round a first
-/// request away and let a second one through before the venue's own pace allowed it.
 const MILLI: u64 = 1_000;
 
-/// One command's allowance, as the venue's profile published it.
-///
-/// The bucket is a token bucket rather than a fixed window: `burst` tokens are
-/// available at once and `limit` of them drip back every second, so a command that
-/// bursts is paced over the seconds it needs instead of being cut off at a window
-/// boundary. A request waits for its token rather than being refused, which is what
-/// the official client does with the same numbers; a request the venue refuses anyway
-/// is the venue's own answer.
-///
-/// The wait is computed from the bucket's own clock rather than slept off in fixed
-/// steps: each refill adds exactly the whole milliseconds that passed, so a long wait
-/// is one sleep and the sub-millisecond remainder stays in the clock instead of being
-/// rounded away at every request.
 #[derive(Debug)]
 pub(super) struct LongbridgeQuota {
     state: Mutex<QuotaState>,
 }
 
-/// The tokens one quota holds, in thousandths, and when they last dripped.
 #[derive(Debug)]
 struct QuotaState {
-    /// What may be spent right now, in thousandths of a token.
     available: u64,
-    /// The most the bucket ever holds, in thousandths of a token.
     capacity: u64,
-    /// How many thousandths of a token drip back every second.
     per_second: u64,
-    /// When the drip was last accounted for.
-    ///
-    /// The clock is the runtime's rather than the wall's, so the bucket is measured
-    /// by the same clock its own waits are: a test that moves the runtime's time
-    /// moves the bucket with it instead of waiting out the venue's real pace.
     last_refill: Instant,
 }
 
 impl QuotaState {
-    /// Adds the tokens that dripped back since the last refill.
-    ///
-    /// `per_second` counts thousandths of a token per **second**, so the tokens a span of
-    /// `millis` milliseconds earned are `millis * per_second / 1000` — dividing by the
-    /// second, not only by the thousand, is what makes the bucket drip at the pace the
-    /// venue published instead of a thousand times it. `per_second` is always a whole
-    /// number of tokens (`limit * 1000`), so the division is exact and nothing has to be
-    /// carried between refills.
-    ///
-    /// Only whole milliseconds are consumed, so the part of a millisecond that has not
-    /// passed yet is accounted for by the next refill rather than lost: a bucket asked
-    /// once per request would otherwise drip slightly slower than the venue's own rate,
-    /// by up to a millisecond per request.
     fn refill(&mut self, now: Instant) {
         let millis = u64::try_from(now.saturating_duration_since(self.last_refill).as_millis())
             .unwrap_or(u64::MAX);
@@ -81,7 +32,6 @@ impl QuotaState {
         self.last_refill += Duration::from_millis(millis);
     }
 
-    /// How long one token takes to drip back, when none is available.
     fn wait_for_one(&self) -> Duration {
         let missing = MILLI.saturating_sub(self.available);
         Duration::from_millis(missing.saturating_mul(MILLI).div_ceil(self.per_second))
@@ -89,7 +39,6 @@ impl QuotaState {
 }
 
 impl LongbridgeQuota {
-    /// Opens the bucket one command's published pace describes.
     pub(super) fn new(burst: u32, limit: u32) -> Self {
         let capacity = u64::from(burst).saturating_mul(MILLI);
         Self {
@@ -102,11 +51,6 @@ impl LongbridgeQuota {
         }
     }
 
-    /// Takes one token, waiting for as long as the bucket's own rate needs.
-    ///
-    /// A bucket only ever exists for a pace the venue published as positive, so every
-    /// wait here ends: one token drips back within a second at the slowest rate a
-    /// quota can state.
     pub(super) async fn acquire_one(&self) {
         loop {
             let wait = {
@@ -123,12 +67,6 @@ impl LongbridgeQuota {
     }
 }
 
-/// The per-command quotas one published rate-limit table describes.
-///
-/// An entry this build cannot honour — a command outside the byte the packet's own
-/// field carries, or a pace the venue published as zero — is dropped with a warning
-/// rather than installed as a bucket that could never grant a token: a command with
-/// no bucket is sent without waiting, and the venue's own refusal is what answers it.
 pub(super) fn quotas_of(limits: &[RateLimit]) -> AHashMap<u8, LongbridgeQuota> {
     let mut quotas = AHashMap::with_capacity(limits.len());
     for limit in limits {
@@ -164,7 +102,6 @@ mod tests {
 
     use super::{LongbridgeQuota, quotas_of};
 
-    /// One `(command, limit, burst)` row of the venue's rate-limit table.
     fn rate_limit(command: u8, limit: i32, burst: i32) -> RateLimit {
         RateLimit {
             command: i32::from(command),
@@ -173,22 +110,12 @@ mod tests {
         }
     }
 
-    /// A bucket drips at the rate its own table states, not at a thousand times it.
-    ///
-    /// The table counts tokens per second and the bucket counts thousandths, so a refill
-    /// of one millisecond is worth a thousandth of the per-second rate — not the whole
-    /// rate. A bucket that forgot to divide would hand back a whole token after every
-    /// millisecond, which on a real clock is no wait at all: the pace the venue
-    /// published would be measured as satisfied instantly.
     #[tokio::test(start_paused = true)]
     async fn a_refill_drips_at_the_rate_the_table_states() {
         let quota = LongbridgeQuota::new(1, 1);
 
-        // The burst is spent, so the next token is the one that has to drip back.
         quota.acquire_one().await;
 
-        // A tenth of a second is a tenth of a token at one per second, so the request
-        // that wants one is still waiting when that much has passed.
         tokio::time::advance(Duration::from_millis(100)).await;
         assert!(
             tokio::time::timeout(Duration::ZERO, quota.acquire_one())
@@ -206,11 +133,6 @@ mod tests {
         );
     }
 
-    /// A bucket drips one token a second and hands out its burst at once, so a second
-    /// request waits for the token its burst did not cover.
-    ///
-    /// The clock is the test's own, so what is asserted is the bucket's arithmetic
-    /// rather than how fast the machine is.
     #[tokio::test(start_paused = true)]
     async fn a_request_waits_for_the_token_its_burst_did_not_cover() {
         let quota = LongbridgeQuota::new(1, 1);
@@ -226,8 +148,6 @@ mod tests {
         );
     }
 
-    /// A bucket hands out its whole burst before it waits, and the tokens that dripped
-    /// while nothing asked are still there: a pace is a rate rather than a window.
     #[tokio::test(start_paused = true)]
     async fn a_burst_is_spent_before_the_rate_is_waited_for() {
         let quota = LongbridgeQuota::new(3, 1);
@@ -247,8 +167,6 @@ mod tests {
         );
     }
 
-    /// The venue's table becomes one bucket per command code, and an entry this build
-    /// cannot honour is dropped rather than installed as a bucket that never grants.
     #[test]
     fn the_venues_table_becomes_one_bucket_per_command() {
         let quotas = quotas_of(&[

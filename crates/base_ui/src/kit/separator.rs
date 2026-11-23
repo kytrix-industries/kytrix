@@ -1,14 +1,3 @@
-//! 分割线（旧 `crate::separator` 的引擎化重建，P2-4a）。
-//!
-//! 旧实现是一条 1 px 的 div：横向占满宽度、纵向 `self_stretch`，颜色取 `line.divider`。新实现
-//! 是同样的布局，只是颜色走 `bind_style`（主题切换跟着变）。
-//!
-//! # a11y
-//!
-//! 引擎的 `A11yRole` 没有 `Separator`（AccessKit 有，但 §7.4 的映射表没有把它列为引擎角色），
-//! 分割线是纯装饰：显式 `hidden`，不产生 `MissingAltText` 诊断，也不占用可访问名（登记见
-//! spec-delta §4）。
-
 use ui_core::{
     a11y::A11yOverride,
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
@@ -20,16 +9,12 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-/// 分割线方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeparatorOrientation {
-    /// 横向：1 px 高、占满宽度。
     Horizontal,
-    /// 纵向：1 px 宽、拉伸到父容器高度。
     Vertical,
 }
 
-/// 分割线。
 #[derive(Clone)]
 pub struct Separator {
     theme: ThemeHandle,
@@ -37,7 +22,6 @@ pub struct Separator {
 }
 
 impl Separator {
-    /// 横向分割线。
     pub fn horizontal(theme: ThemeHandle) -> Self {
         Self {
             theme,
@@ -45,7 +29,6 @@ impl Separator {
         }
     }
 
-    /// 纵向分割线。
     pub fn vertical(theme: ThemeHandle) -> Self {
         Self {
             theme,
@@ -53,16 +36,11 @@ impl Separator {
         }
     }
 
-    /// 方向。
     #[must_use]
     pub fn orientation(&self) -> SeparatorOrientation {
         self.orientation
     }
 
-    /// 建分割线节点。
-    ///
-    /// # Errors
-    /// `StaleNode`（父节点陈旧）。
     pub fn build(
         &self,
         tree: &mut NodeTree,
@@ -78,7 +56,6 @@ impl Separator {
                 style
             }
         };
-        // 分割线不参与伸缩（旧 `.flex_shrink_0()`）。
         style.inner.flex_shrink = 0.0;
         let theme = self.theme.clone();
         NodeBuilder::boxed()
@@ -144,7 +121,6 @@ mod tests {
         (app, node, theme)
     }
 
-    /// 横向：1 px 高、占满父宽度；纵向：1 px 宽、拉伸到父高度。
     #[test]
     fn horizontal_and_vertical_separators_take_one_pixel_on_their_axis() {
         let (app, node, _) = build(SeparatorOrientation::Horizontal, (200.0, 100.0));
@@ -160,7 +136,6 @@ mod tests {
         );
     }
 
-    /// 颜色是 `line.divider`；a11y 显式隐藏（装饰）。
     #[test]
     fn the_separator_uses_the_divider_role_and_is_decorative() {
         let (app, node, theme) = build(SeparatorOrientation::Horizontal, (200.0, 100.0));

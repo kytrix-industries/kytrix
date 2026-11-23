@@ -1,59 +1,3 @@
-//! DirectComposition 合成目标：`WS_EX_NOREDIRECTIONBITMAP` 窗口的全部像素都由这里合成。
-//!
-//! 语义与 Chrome / Zed 相同：**内容 visual 恒 1:1，不随窗口 resize 缩放**，也从不被拉伸。
-//!
-//! 两层各司其职：
-//! - **内容层**：上一次完成 present 的帧，1:1、按 `presented_surface` 裁剪；
-//! - **背景层**：1×1 纯色（窗口背景色）按客户区放大，只负责**接缝** —— 从「客户区已变」到
-//!   「按新尺寸的真实帧上屏」之间最多一个 vsync 的空档（以及首帧 prime、`WM_DPICHANGED`
-//!   在 WndProc 里同步改尺寸、设备恢复这些没有帧在飞的瞬间）。
-//!
-//! 缩放交互归系统（`WM_NCLBUTTONDOWN` 交 `DefWindowProcW`）：拖动期间系统分派给 `WndProc`
-//! 的每条 `WM_SIZE` 都由 `event_loop/resize.rs` 的 `ResizeFrameDriver` 直接驱动一帧真实帧
-//! （更新客户区 → 对齐本模块的几何 → `App::frame`）。因此**背景层不是拖动期的画面来源**：
-//! 拖动中不会出现「旧内容被拉伸」，也不会出现「只有背景色的稳定态」——每个 resize 步都落到
-//! 一帧真实帧上（DPI 同步改尺寸那一帧的接缝就是这个设计的用途）。
-//!
-//! 视觉树（自下而上）：
-//! - `root`：`SetRoot` 的容器，没有内容；
-//! - `background`：内容 = **1×1** 组合交换链（纯背景色），transform = `background_scale`
-//!   （中心 `(0, 0)`、`scale = client_px`，把 1×1 铺满客户区）；
-//! - `content`：内容 = 真实组合交换链，**没有缩放变换**（恒等 ⇒ 1:1），clip = `content_clip`
-//!   `(0, 0, content_px)`。
-//!
-//! 四条实测约束（probe `dpi.log` / `resize.log` / `caps.log`）：
-//! 1. 交换链与持久目标按 [`buffer_size`] 的**桶**创建（内容 + 64 余量、256 对齐）：内容在桶内
-//!    时只是 CPU 记账（内容 visual 恒 1:1，多出的像素由 `content_clip` 裁掉），内容越过桶才
-//!    `ResizeBuffers` 并重建持久目标（R08-1，前置条件见
-//!    `render::windows::compositor::persist::resize_target`）；`ResizeBuffers` 被驱动拒绝时回退
-//!    成整链替换（`replace_swapchain`：新建交换链 + prime + `SetContent` + `Commit`）。
-//! 2. visual 的单位是**物理像素**（与 DPI 无关）：内容 clip 写内容坐标 `(0, 0, content)`；
-//!    背景层 1×1 内容靠 `scale = client_px` 放大到客户区，两者都不再乘 1/dpi。
-//! 3. 内容 visual 没有 transform，所以 clip 就是客户区里的 `(0, 0, content)`：客户区变大时
-//!    露出背景层（≤1 帧接缝），变小时裁掉右侧/下侧。
-//! 4. `WS_EX_NOREDIRECTIONBITMAP` 的客户区在第一次 `Present` 之前完全透明（不是黑色），
-//!    所以内容**和背景**都必须在 `ShowWindow` 之前提交并 present 一次（见
-//!    `GpuRenderer::new_for_composition`）—— 否则启动期/新区域会露出桌面。
-//!
-//! 线程：DComp 对象**不绑定创建线程**，但同一 visual 的并发 `Commit` 与属性写入批次归属未定义
-//! （文档要求应用自己同步），所以本结构用 `Arc<Mutex<Composition>>` 把**所有** DComp 调用串行化：
-//! UI 线程做 visual 几何 / 关闭，GPU 线程只在内容越过 buffer（`set_content_size` 的
-//! `resize_target` 回退路径）、内容尺寸变化（`set_content`）或背景色变化
-//! （`set_background_content`）时各做一次 `SetContent` + `Commit`。
-//!
-//! 两个错误面：[`Composition::new`] 的 COM 创建阶段失败是 [`EngineError::AppInit`]（窗口还建不
-//! 出来）；**运行时**调用（几何 / 提交 / 交换链切换，含首帧 `SetContent` + `Commit`）失败是
-//! [`EngineError::Composition`]，并带失败操作名。
-//!
-//! ## 合成设备健康检查与重建（C2）
-//!
-//! MS《Best practices for DirectComposition》要求每个 `WM_PAINT` 调
-//! `IDCompositionDevice::CheckDeviceState`，设备失效时新建设备并重建全部内容。本模块的分工：
-//! `WndProc` 只推进无锁代际（[`note_device_check`]），泵的几何 pass 消费代际并检查
-//! （[`Composition::check_device_state`]，复用几何 pass 已有的合成锁），设备失效时请求 GPU 线程
-//! 重建（[`Composition::rebuild`] + 重新挂内容/背景/几何 + 一次 `Commit`）。检查/重建都不在
-//! `WndProc` 里做：DComp 调用可能同步重入消息泵，而重建需要 D3D12 设备与交换链（GPU 线程独占）。
-
 use std::sync::{
     Mutex, MutexGuard,
     atomic::{AtomicU64, Ordering},
@@ -77,86 +21,44 @@ use windows::{
 
 use crate::error::EngineError;
 
-/// `WM_PAINT` 健康检查代际（C2）。
-///
-/// MS《Best practices for DirectComposition》：合成设备失效时 DirectComposition 会向窗口投递
-/// `WM_PAINT`，应用应在每次 `WM_PAINT` 里调 `IDCompositionDevice::CheckDeviceState`。`WndProc`
-/// 不能直接查（要拿 DComp 锁、而 DComp 调用可能同步重入消息泵 —— 违反 `wndproc` 纪律），所以这里
-/// 只推进一个**无锁**代际；泵的几何 pass 消费它（那时本来就持合成锁）并把「需要重建」的请求交给
-/// GPU 线程（真正的重建需要 D3D12 设备与交换链，只能在 GPU 线程做）。
 static DEVICE_CHECK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// `WndProc` 的 `WM_PAINT` 分支调用：只推进代际，不加锁、不做任何 COM 调用。
 pub(crate) fn note_device_check() {
     DEVICE_CHECK_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
-/// 当前健康检查代际（泵的几何 pass 每轮比较一次；进程级单调）。
 pub(crate) fn device_check_epoch() -> u64 {
     DEVICE_CHECK_EPOCH.load(Ordering::Acquire)
 }
 
-/// `IDCompositionDevice::CheckDeviceState` 的三分类（C2）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CompositionState {
-    /// 设备有效且窗口仍然存在。
     #[default]
     Valid,
-    /// 设备失效（DWM 重启 / DComp 内部失效 / 窗口状态被系统改坏）：可以重建恢复。
     Invalid,
-    /// 窗口已销毁或合成树已 `shutdown`：恢复没有意义（GPU 线程/窗口正在退出）。
     WindowClosed,
 }
 
-/// buffer 的硬上限（物理像素；DXGI 纹理上限）。内容超过它显式失败，不静默裁剪。
 const MAX_BUFFER: u32 = 16384;
 
-/// 内容之外的余量：吸收拖动中的小幅增长，避免每越过一像素就重建一次交换链。
-///
-/// 64 px 的物理余量（120 DPI 下约 51 逻辑 px）远大于一次 `WM_SIZE` 的步长；桶同时向上对齐到
-/// 256，因此真实余量在 64…319 px 之间。**不再用 512**：它让 1200×925 的内容常驻 1792×1536 的
-/// 缓冲（≈2.4× 面积），而缩容只回到同一个带余量的桶（DEVIATIONS F-209）。
 const BUFFER_HEADROOM: u32 = 64;
 
-/// buffer 的对齐粒度：把桶限制在有限档位（也符合 DComp / DXGI 的 256 对齐习惯）。
 const BUFFER_ALIGN: u32 = 256;
 
-/// 一个窗口的 DirectComposition 合成树。
-///
-/// 由 `NativeWindow` 与窗口的 `GpuRenderer` 通过 `Arc<Mutex<Composition>>` 共享；所有 DComp
-/// 调用的串行化见模块文档。`shutdown` 之后所有 COM 字段为 `None`。
 pub(crate) struct Composition {
     hwnd: HWND,
-    /// `shutdown` 之后为 `None`：全部 COM 引用在 HWND 销毁**之前**释放。
     device: Option<IDCompositionDevice>,
     target: Option<IDCompositionTarget>,
-    /// 根 visual：`SetRoot` 的容器，没有内容。
     root: Option<IDCompositionVisual>,
-    /// 背景层：内容是一条 1×1 的组合交换链（纯色），由 [`background_scale`] 放大到客户区。
     background: Option<IDCompositionVisual>,
-    /// 内容层：真实组合交换链，**没有缩放变换**（恒等 = 1:1）。
     content: Option<IDCompositionVisual>,
-    /// 背景层唯一的变换：绕 `(0, 0)` 把 1×1 内容放大到客户区。
     background_scale: Option<IDCompositionScaleTransform>,
-    /// 内容层唯一的裁剪：内容坐标里的 `(0, 0, content)`；内容 visual 无 transform，故不缩放。
     content_clip: Option<IDCompositionRectangleClip>,
-    /// 最近一次成功应用的 `(content, client)`（物理像素）；同值 `set_geometry` 是 no-op。
     geometry: Option<((u32, u32), (u32, u32))>,
 }
 
-// SAFETY: `Composition` 只经 `Arc<Mutex<Composition>>` 共享，且下面每个方法都要求调用方先持锁
-// （[`lock`]），因此同一时刻只有一个线程访问这些 COM 对象：没有并发 `SetContent` / 属性写入 /
-// `Commit`。DirectComposition 对象不绑定创建线程（`IDCompositionDevice::CreateVisual` 等返回的
-// 对象可从任意线程使用；文档只把「同一批属性 + Commit」的竞态留给应用同步，互斥锁就是那个同步）。
-// `Send` 足够：`Mutex<T>: Send + Sync` 只要求 `T: Send`，而 `Arc<Mutex<T>>` 的跨线程能力由这两条
-// 自动派生。HWND / `IDCompositionTarget` 的存活期由 `NativeWindow` 覆盖 `GpuRenderer`（关闭顺序：
-// 先 drop `App`（join `kytrix-d3d12` 线程）再 `NativeWindow::destroy`）。
 unsafe impl Send for Composition {}
 
-/// 取合成目标的互斥锁。
-///
-/// 毒化不致命：所有 DComp 调用都返回 `Result`，本结构没有「失败后不可用」的跨调用不变量；
-/// 与 `render/windows/renderer.rs` 的共享槽同一策略（继续使用内部值）。
 pub(crate) fn lock(composition: &Mutex<Composition>) -> MutexGuard<'_, Composition> {
     composition
         .lock()
@@ -164,23 +66,12 @@ pub(crate) fn lock(composition: &Mutex<Composition>) -> MutexGuard<'_, Compositi
 }
 
 impl Composition {
-    /// 为一个**尚未显示**的窗口建立合成树。
-    ///
-    /// 本方法不设置裁剪边界 / 背景缩放（`CreateRectangleClip` 的初始边界没有语义保证）：
-    /// 调用方必须在 `ShowWindow` 之前先挂上两条交换链（`set_content` / `set_background_content`，
-    /// 都已 prime）并 `set_geometry` —— 几何之前内容可见范围未定义，背景层也还只是 1×1。
     pub(crate) fn new(hwnd: HWND) -> Result<Self, EngineError> {
-        // SAFETY: COM 创建调用：不传 rendering device（probe `caps.log`：传 D3D12 设备、或请求
-        // `IDCompositionDevice2`/`IDCompositionDesktopDevice` 的 IID 都不会得到可用对象）；
-        // 输出指针在调用期间存活，失败按 HRESULT 处理。
         let device: IDCompositionDevice =
             unsafe { DCompositionCreateDevice2(None::<&IUnknown>) }
                 .map_err(|error| init_error("DCompositionCreateDevice2", error))?;
-        // SAFETY: `hwnd` 由 `NativeWindow` 持有且晚于本结构销毁（`destroy` 先 `shutdown` 再
-        // `DestroyWindow`）；`topmost = false`：本窗口没有子 HWND，resize 交给自定义边框。
         let target = unsafe { device.CreateTargetForHwnd(hwnd, false) }
             .map_err(|error| init_error("CreateTargetForHwnd", error))?;
-        // SAFETY: 同上的 COM 创建调用；以下对象由本结构持有到窗口销毁。
         let root =
             unsafe { device.CreateVisual() }.map_err(|error| init_error("CreateVisual", error))?;
         let background =
@@ -191,11 +82,6 @@ impl Composition {
             .map_err(|error| init_error("CreateScaleTransform", error))?;
         let content_clip = unsafe { device.CreateRectangleClip() }
             .map_err(|error| init_error("CreateRectangleClip", error))?;
-        // SAFETY: 六个对象都由本函数创建、尚未交给任何其它所有者；这一批属性在最后一次
-        // `Commit` 落盘（中间失败时对象随 `Err` 一起释放）。
-        //
-        // `AddVisual(…, true, None)` 在 `referenceVisual == NULL` 时把新 child 放在**所有 sibling
-        // 之下**（MSDN），所以背景先加、内容再明确插到背景之上。两者都挂好之后 `SetRoot`。
         unsafe {
             background_scale
                 .SetCenterX2(0.0)
@@ -229,36 +115,24 @@ impl Composition {
         })
     }
 
-    /// HWND 的 `isize` 形式（GPU 线程 `PostMessageW` 的目标）。
     pub(crate) fn hwnd_raw(&self) -> isize {
         self.hwnd.0 as isize
     }
 
-    /// 当前 DComp 合成设备的健康状态（C2；GPU 线程 / 泵的几何 pass 调用，调用方持锁）。
-    ///
-    /// `IDCompositionDevice::CheckDeviceState` 返回 `S_OK` + `BOOL`；窗口关闭等失败返回 HRESULT
-    /// 错误（文档未公开具体错误码，且 SDK 头文件不导出该常量）。因此分类不猜错误码：**窗口是否
-    /// 还活着**用 `IsWindow` 判定 —— 窗口已销毁就是 [`CompositionState::WindowClosed`]（退出路径，
-    /// 不恢复）；窗口还在但设备报错/无效就是可重建的 [`CompositionState::Invalid`]。
     pub(crate) fn check_device_state(&self) -> CompositionState {
         let Some(device) = &self.device else {
             return CompositionState::WindowClosed;
         };
-        // SAFETY: device 由本结构持有到 `shutdown`；查询无副作用。
         let result = unsafe { device.CheckDeviceState() };
         classify_device_state(result, self.window_alive())
     }
 
-    /// 窗口句柄是否仍然指向一个存活窗口。
     fn window_alive(&self) -> bool {
-        // SAFETY: `IsWindow` 只读查询；失效句柄返回 `FALSE`，不会解引用窗口对象。
         self.hwnd != HWND::default() && unsafe { IsWindow(Some(self.hwnd)).as_bool() }
     }
 
-    /// 当前客户区（物理像素；最小 1×1）。重建 visual tree 后用客户区恢复背景缩放几何。
     pub(crate) fn client_size(&self) -> (u32, u32) {
         let mut rect = RECT::default();
-        // SAFETY: 只读查询；`RECT` 是栈上输出参数，句柄失效时返回错误。
         if self.hwnd == HWND::default() || unsafe { GetClientRect(self.hwnd, &mut rect) }.is_err() {
             return (1, 1);
         }
@@ -268,12 +142,6 @@ impl Composition {
         )
     }
 
-    /// 重建整个 DirectComposition 设备 / visual tree（C2）。
-    ///
-    /// 保留 HWND 与调用方随后重新挂上的内容：`shutdown()` 先 `SetRoot(NULL)` + `Commit` 并按
-    /// 依赖顺序释放旧对象（`CreateTargetForHwnd` 要求窗口上没有旧 target），再走一次
-    /// [`Composition::new`] 的创建顺序。调用方必须重新 `set_content` / `set_background_content` /
-    /// `set_geometry` 并 `commit`（GPU 线程的 `GpuRenderer::rebuild_composition` 负责）。
     pub(crate) fn rebuild(&mut self) -> Result<(), EngineError> {
         let hwnd = self.hwnd;
         self.shutdown();
@@ -281,18 +149,10 @@ impl Composition {
         Ok(())
     }
 
-    /// 把内容交换链挂到**内容 visual** 上（恒 1:1，不缩放）。
-    ///
-    /// 调用点：首帧 setup（UI 线程、`ShowWindow` 之前）与 `GpuRenderer::grow`（GPU 线程、内容
-    /// 越过 buffer 时；旧的交换链在 `Commit` 之后才丢弃）。
     pub(crate) fn set_content(&self, swapchain: &IDXGISwapChain1) -> Result<(), EngineError> {
         self.set_visual_content(self.content.as_ref(), "Visual::SetContent", swapchain)
     }
 
-    /// 把 1×1 的背景交换链挂到**背景 visual** 上（由 `background_scale` 放大到客户区；
-    /// DEVIATIONS §36 F-205 / S-152）。
-    ///
-    /// 调用点：首帧 setup 与背景色变化（`GpuRenderer::refresh_background`）。
     pub(crate) fn set_background_content(
         &self,
         swapchain: &IDXGISwapChain1,
@@ -313,12 +173,9 @@ impl Composition {
         let visual = visual.ok_or_else(|| EngineError::Composition {
             detail: smol_str::format_smolstr!("{stage} after shutdown"),
         })?;
-        // SAFETY: visual 由本结构持有；swapchain 属于 `GpuRenderer`，调用方保证它在本次
-        // `Commit` 之前不释放。
         unsafe { visual.SetContent(swapchain) }.map_err(|error| runtime_error(stage, error))
     }
 
-    /// 提交本批次的属性变更（`Commit` 之后才进入合成器的下一帧）。
     pub(crate) fn commit(&self) -> Result<(), EngineError> {
         let device = self
             .device
@@ -326,15 +183,9 @@ impl Composition {
             .ok_or_else(|| EngineError::Composition {
                 detail: smol_str::SmolStr::new_static("Device::Commit after shutdown"),
             })?;
-        // SAFETY: device 由本结构持有到 `shutdown`。
         unsafe { device.Commit() }.map_err(|error| runtime_error("Device::Commit", error))
     }
 
-    /// 按「有内容的尺寸 / 客户区尺寸」重设内容裁剪与背景缩放（同值 no-op；DEVIATIONS §36 F-205）。
-    ///
-    /// 内容 visual **不做任何缩放**：`content` 是上一帧的实际尺寸，clip 到 `(0, 0, content)`；
-    /// 客户区比它大时露出背景层，比它小时裁掉右侧/下侧。背景层是 1×1 的纯色交换链，所以
-    /// `scale = client` 恰好把它铺满客户区，和内容尺寸无关。
     pub(crate) fn set_geometry(
         &mut self,
         content: (u32, u32),
@@ -345,15 +196,12 @@ impl Composition {
         if self.geometry == Some((content, client)) {
             return Ok(());
         }
-        // 窗口正在销毁：没有 visual 可改（`shutdown` 之后的调用是 no-op，不是错误）。
         let (Some(background_scale), Some(content_clip), Some(device)) =
             (&self.background_scale, &self.content_clip, &self.device)
         else {
             return Ok(());
         };
         let geometry = visual_geometry(content, client);
-        // SAFETY: 三个 DComp 对象的生命周期见 `new`；参数都是栈上的 f32，且一次 `Commit`
-        // 把整批属性作为同一帧提交（避免「只有裁剪、没有背景缩放」的中间态）。
         unsafe {
             background_scale
                 .SetScaleX2(geometry.background_scale.0)
@@ -369,23 +217,13 @@ impl Composition {
         Ok(())
     }
 
-    /// 把合成树从窗口上摘下来并释放全部 DComp 对象（`NativeWindow::destroy` 在**销毁 HWND
-    /// 之前**调用）。
-    ///
-    /// 顺序：`SetRoot(NULL)` + `Commit` 让 DWM 不再把这棵树关联到窗口；随后在 HWND 仍然
-    /// 存活时按依赖顺序释放 root → 两个子 visual → transform / clip → device → target。
-    /// 窗口正在销毁，失败无法补救（COM 引用仍然随字段置空释放），因此忽略 `Commit` 的错误。
-    /// 重复调用是 no-op。
     pub(crate) fn shutdown(&mut self) {
         if let (Some(target), Some(device)) = (&self.target, &self.device) {
-            // SAFETY: target / device 由本结构持有到本次调用；窗口仍然存活。
             unsafe {
                 let _ = target.SetRoot(None::<&IDCompositionVisual>);
                 let _ = device.Commit();
             }
         }
-        // 依赖顺序：root 引用 background / content，content 引用 content_clip，background 引用
-        // background_scale；`Option` 逐个置空即释放。
         self.root = None;
         self.background = None;
         self.content = None;
@@ -399,19 +237,10 @@ impl Composition {
 
 impl Drop for Composition {
     fn drop(&mut self) {
-        // 字段的默认 drop 顺序是声明顺序：device 会先于 target / visual 释放。统一走
-        // `shutdown`（先 `SetRoot(NULL)`，再按依赖顺序置空）；窗口销毁路径已经显式调过
-        // `shutdown`，这里是 no-op。
         self.shutdown();
     }
 }
 
-/// 纯函数：由内容尺寸与客户区尺寸算两层 visual 的几何（DEVIATIONS §36 F-205；probe `dpi.log`
-/// 21–25 是旧 `scale = client/content` 的历史数据）。
-///
-/// - `content_clip`：内容坐标里的 `(right, bottom)`，与内容尺寸相等；内容 visual 没有缩放
-///   变换，所以它永远是 1:1（**不是** `client / content`）。
-/// - `background_scale`：背景层是 1×1 纯色内容，放大到客户区就是 `client` 像素。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct VisualGeometry {
     content_clip: (f32, f32),
@@ -427,20 +256,6 @@ fn visual_geometry(content: (u32, u32), client: (u32, u32)) -> VisualGeometry {
     }
 }
 
-/// 组合交换链 / 持久目标的 buffer 尺寸（内容 + 余量、256 对齐的桶）。
-///
-/// `round_up_256(content + 64)`，至多 [`MAX_BUFFER`]：64 px 余量吸收拖动中的小幅增长，256 对齐
-/// 把桶限制在有限档位。**不再读虚拟屏幕** —— 旧的固定 buffer 在 6000×3840 的桌面上每个窗口
-/// 白占 ~352 MiB，且显示配置变大后内容必然越界、无法恢复。
-///
-/// 桶尺寸只由**当前内容**决定（`round_up_256(content + 64)`），不是历史高水位：内容缩小跨过
-/// 桶边界时 GPU 侧会 `ResizeBuffers` 到更小的桶，所以 VRAM 会回落而不是永久占用（R08-1；
-/// `render::windows::compositor::persist::set_content_size`）。桶内的小幅变化不碰任何 GPU 资源：
-/// 内容 visual 恒 1:1，多出的像素由 `content_clip` 裁掉。
-///
-/// # Errors
-/// `EngineError::Swapchain`：内容的任一边 > [`MAX_BUFFER`]（DXGI 纹理上限），显式失败而不是
-/// 静默裁剪（裁掉的右下角会露出背景层）。
 pub(crate) fn buffer_size(content: (u32, u32)) -> Result<(u32, u32), EngineError> {
     Ok((
         buffer_extent("width", content.0)?,
@@ -448,8 +263,6 @@ pub(crate) fn buffer_size(content: (u32, u32)) -> Result<(u32, u32), EngineError
     ))
 }
 
-/// 单边的桶尺寸：`content` 超过上限即错误；否则 `content + headroom` 向上取整到 256，封顶 16384
-/// （内容本身 ≤ 16384，因此封顶后仍然覆盖内容）。
 fn buffer_extent(axis: &'static str, content: u32) -> Result<u32, EngineError> {
     if content > MAX_BUFFER {
         return Err(EngineError::Swapchain {
@@ -480,11 +293,6 @@ fn runtime_error(stage: &'static str, error: windows::core::Error) -> EngineErro
     }
 }
 
-/// `CheckDeviceState` 结果的三分类（纯函数，C2）。
-///
-/// 顺序很重要：**窗口已关闭优先**（此时设备失效与「窗口销毁中」无法区分，且恢复没有意义，
-/// GPU 线程/Epoch 消费方必须把它当退出前状态而不是反复重建）；窗口还在时 `Ok(FALSE)` 或错误
-/// 都是可重建的 [`CompositionState::Invalid`]。
 fn classify_device_state(
     result: windows::core::Result<BOOL>,
     window_alive: bool,
@@ -518,9 +326,6 @@ mod tests {
     };
     use crate::error::EngineError;
 
-    /// `CheckDeviceState` 的三分类（C2 的纯逻辑核心）：
-    /// - 窗口已关闭时任何结果都归 `WindowClosed`（退出路径，不触发重建）；
-    /// - 窗口存活时 `Ok(TRUE)` = `Valid`；`Ok(FALSE)` 与任意 HRESULT 错误 = 可重建的 `Invalid`。
     #[test]
     fn device_state_is_classified_without_guessing_the_undocumented_error_code() {
         assert_eq!(
@@ -562,15 +367,12 @@ mod tests {
         );
     }
 
-    /// `WNDCLASSW::lpfnWndProc` 需要 `extern "system"` 函数指针；`DefWindowProcW` 是
-    /// `unsafe fn`（windows crate 的约定），因此包一层。
     unsafe extern "system" fn default_window_proc(
         hwnd: HWND,
         msg: u32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        // SAFETY: 由系统在消息分发时调用，参数就是收到的消息。
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
@@ -578,10 +380,8 @@ mod tests {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// 建一个隐藏窗口（默认窗口过程；本测试只验证 DComp 设备/visual tree 的生命周期）。
     fn hidden_window(tag: &str) -> (HWND, Vec<u16>) {
         let class_name = wide(tag);
-        // SAFETY: 进程级模块句柄；类名是 NUL 结尾宽字符串，`RegisterClassW` 同步拷贝。
         let instance = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let class = WNDCLASSW {
             lpfnWndProc: Some(default_window_proc),
@@ -589,10 +389,8 @@ mod tests {
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()
         };
-        // SAFETY: 同上；每个测试用唯一类名，只注册一次。
         let atom = unsafe { RegisterClassW(&class) };
         assert_ne!(atom, 0, "RegisterClassW");
-        // SAFETY: 类已注册；`WS_OVERLAPPEDWINDOW` 不含 `WS_VISIBLE` ⇒ 窗口保持隐藏。
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -613,11 +411,6 @@ mod tests {
         (hwnd, class_name)
     }
 
-    /// C2：真实 DComp 设备 / visual tree 的健康检查与重建（隐藏窗口，不需要交换链）。
-    ///
-    /// 这是 WM_PAINT 检查路径最终会调到的同一套 API：`new` 之后设备有效；`rebuild` 之后仍然
-    /// 有效（旧 target 已完整释放，`CreateTargetForHwnd` 不会撞 already-composed）；`shutdown`
-    /// 幂等并把状态归为 `WindowClosed`（GPU 线程退出路径不得再触发重建）。
     #[test]
     fn the_composition_tree_can_be_rebuilt_for_a_live_window() {
         let (hwnd, _class) = hidden_window("kytrix-composition-rebuild-test");
@@ -642,10 +435,8 @@ mod tests {
             CompositionState::WindowClosed,
             "shutdown 之后不再有可恢复的合成树"
         );
-        // 幂等：重复 shutdown 不 panic（窗口销毁路径已经显式调过一次）。
         composition.shutdown();
 
-        // SAFETY: 窗口由本测试创建、尚未交给其它所有者。
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
@@ -655,7 +446,6 @@ mod tests {
     fn a_closed_window_is_reported_as_window_closed() {
         let (hwnd, _class) = hidden_window("kytrix-composition-closed-test");
         let composition = Composition::new(hwnd).expect("DCompositionCreateDevice2");
-        // SAFETY: 窗口由本测试创建；销毁后句柄失效，`IsWindow` 返回 FALSE。
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
@@ -683,8 +473,6 @@ mod tests {
 
     #[test]
     fn growing_the_client_never_scales_the_content_and_only_scales_the_background() {
-        // probe `dpi.log` 21 的旧语义是 client/content = 1.25 的拉伸；新语义必须是 Chrome 式
-        // 1:1 + 背景层。
         let geometry = visual_geometry((800, 600), (1000, 700));
         assert_eq!(
             geometry.content_clip,
@@ -696,7 +484,6 @@ mod tests {
             (1000.0, 700.0),
             "只有背景层被放大到客户区"
         );
-        // 与静止状态相比，内容几何完全不变（内容 visual 的 scale 恒为 1,1）。
         assert_eq!(
             geometry.content_clip,
             visual_geometry((800, 600), (800, 600)).content_clip
@@ -724,7 +511,6 @@ mod tests {
 
     #[test]
     fn zero_sizes_are_clamped_to_one_pixel() {
-        // 最小化时客户区是 0x0；0 的 scale 会让背景层消失，直接 clamp 掉。
         let geometry = visual_geometry((0, 0), (0, 0));
         assert_eq!(
             geometry,
@@ -737,27 +523,19 @@ mod tests {
 
     #[test]
     fn the_geometry_is_deterministic_so_reapplying_the_same_sizes_is_a_no_op() {
-        // `Composition::set_geometry` 以 `(content, client)` 为缓存键：同值直接跳过 DComp 调用。
-        // 纯函数必须对同一组输入给出逐位相同的几何，否则缓存会吞掉一次真实更新。
         let first = visual_geometry((800, 600), (1000, 700));
         assert_eq!(first, visual_geometry((800, 600), (1000, 700)));
-        // 任一轴变化都必须产生不同的几何（缓存键的每个分量都参与几何）。
         assert_ne!(first, visual_geometry((801, 600), (1000, 700)));
         assert_ne!(first, visual_geometry((800, 600), (1001, 700)));
     }
 
     #[test]
     fn the_buffer_is_content_plus_headroom_rounded_up_to_256() {
-        // 800×600 的内容 ⇒ 1024×768（64 px 余量后向上取整到 256 网格）。
         assert_eq!(buffer_size((800, 600)).expect("fits"), (1024, 768));
-        // 精确落在 256 网格上的内容 + 余量：768+64 = 832 → 1024、512+64 = 576 → 768。
         assert_eq!(buffer_size((768, 512)).expect("fits"), (1024, 768));
-        // 空内容也至少有一格 256。
         assert_eq!(buffer_size((0, 0)).expect("fits"), (256, 256));
         assert_eq!(buffer_size((1, 1)).expect("fits"), (256, 256));
-        // demo 的真实内容（1200×925）：桶 1280×1024，而不是旧 512 余量的 1792×1536。
         assert_eq!(buffer_size((1200, 925)).expect("fits"), (1280, 1024));
-        // 同一内容必须给出同一个桶（桶是确定性的，不随时间/桌面漂移）。
         assert_eq!(
             buffer_size((800, 600)).expect("fits"),
             buffer_size((800, 600)).expect("fits")
@@ -766,12 +544,10 @@ mod tests {
 
     #[test]
     fn the_buffer_caps_at_16384_and_oversized_content_is_an_error() {
-        // 上限本身仍然覆盖内容（内容 16384 + 余量会被封顶回 16384）。
         assert_eq!(
             buffer_size((16384, 16384)).expect("the cap itself fits"),
             (16384, 16384)
         );
-        // 接近上限的内容不需要精确的 headroom，但必须仍然被覆盖。
         let near = buffer_size((16000, 9000)).expect("fits");
         assert!(near.0 >= 16000 && near.1 >= 9000, "{near:?}");
         assert!(near.0 <= 16384 && near.1 <= 16384, "{near:?}");

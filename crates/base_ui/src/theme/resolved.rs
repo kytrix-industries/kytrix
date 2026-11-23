@@ -1,12 +1,3 @@
-//! 一种外观加载后的完整主题：调色板 + 64 个角色 + 组件颜色配方 + 度量 token。
-//!
-//! 四件东西是一个整体、一个决定：读者不会看到与调色板不一致的角色，或与角色不一致的组件颜色。
-//! 解析在主题加载时做一次（约四十次混合 + 组件的组合），之后一帧只读字段；[`Theme::resolve`] 是
-//! **挂载期**把角色交给引擎 `ColorResolver` 的唯一出口（线性预乘 RGBA，设计 §5.8.2）。
-//!
-//! 谁决定应用画在哪种外观里不在本模块：持久化偏好、操作系统报告的外观与两者的优先级属于设置层；
-//! 它交给 [`ThemeHandle`](crate::theme::handle::ThemeHandle) 的是它解析出来的那个外观。
-
 use ui_core::paint::color::{Color, ColorResolver, LinearPremulRgba};
 
 use super::{
@@ -17,7 +8,6 @@ use super::{
     roles::{RoleColors, resolve_roles},
 };
 
-/// 一种外观，加载完成：它的调色板与从调色板派生的一切。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     appearance: Appearance,
@@ -28,9 +18,6 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// 加载一种外观的主题。
-    ///
-    /// 解析就是主题的全部成本；一次外观切换付一次，之后一帧只读已解析的值、不做转换。
     pub fn of(appearance: Appearance) -> Self {
         let palette = Palette::of(appearance);
         let tokens = ComponentTokens::standard();
@@ -46,40 +33,30 @@ impl Theme {
         }
     }
 
-    /// 这个主题画的外观。
     pub fn appearance(&self) -> Appearance {
         self.appearance
     }
 
-    /// 手写的调色板。
     pub fn palette(&self) -> &Palette {
         &self.palette
     }
 
-    /// 一个语义角色的引擎颜色（挂载期常量）。
-    ///
-    /// 动态取色（深浅切换要失效节点）请走
-    /// [`ThemeHandle::role`](crate::theme::handle::ThemeHandle::role)：它读主题信号并登记依赖。
     pub fn role(&self, role: Role) -> Color {
         self.roles.get(role)
     }
 
-    /// 全部 64 个角色，供调色板审计与测试。
     pub fn resolved_roles(&self) -> impl Iterator<Item = (Role, Color)> + '_ {
         self.roles.iter()
     }
 
-    /// 挂载期解析：角色 → 线性预乘 RGBA（GPU 消费的唯一表示）。
     pub fn resolve(&self, role: Role) -> LinearPremulRgba {
         ColorResolver.resolve(self.role(role))
     }
 
-    /// 组件颜色配方。
     pub fn components(&self) -> &ComponentColors {
         &self.components
     }
 
-    /// 组件度量 token。
     pub fn tokens(&self) -> &ComponentTokens {
         &self.tokens
     }
@@ -104,10 +81,6 @@ mod tests {
         assert_eq!(Theme::of(Appearance::Light), Theme::default());
     }
 
-    /// 主题是一整个：角色与组件颜色来自同一套调色板，从不来自上一套。
-    ///
-    /// 用文本选择做探针：它既是一个角色、又是输入框组件配方的输入，所以"外观换了、画没换"的主题
-    /// 会报出新外观却仍用旧高亮选文字。
     #[test]
     fn a_theme_carries_the_roles_and_components_of_the_appearance_it_names() {
         let dark = Theme::of(Appearance::Dark);
@@ -125,8 +98,6 @@ mod tests {
             "组件配方必须从同一套角色解析"
         );
 
-        // 旧 §7.4 把深色选择色写成品牌混入页面 62%：OKLCH L 0.408、C 0.059。它同时证明"角色与
-        // 组件一起动了"。
         let [lightness, chroma, _, _] =
             crate::theme::color::oklch_components(dark.role(Role::Selection));
         assert!(
@@ -135,7 +106,6 @@ mod tests {
         );
     }
 
-    /// 挂载期解析路径与直接调用引擎解析器逐位一致。
     #[test]
     fn mount_time_resolution_goes_through_the_engine_color_resolver() {
         let theme = Theme::of(Appearance::Light);
@@ -150,7 +120,6 @@ mod tests {
         }
     }
 
-    /// 全部 64 个角色在两种外观下都能读出来（无缺失、无 panic）。
     #[test]
     fn every_role_is_readable_in_both_appearances() {
         for appearance in [Appearance::Light, Appearance::Dark] {
@@ -170,9 +139,6 @@ mod tests {
         }
     }
 
-    /// 旧实现（`style/roles.rs`）的 8 位 sRGB 基线（P5-2 在旧模块删除前逐位冻结）。
-    ///
-    /// (外观, 角色, 是否越出 sRGB 色域, 旧实现画出的 8 位 sRGB)。
     const LEGACY_SRGB: [(Appearance, Role, bool, [u8; 3]); 128] = [
         (
             Appearance::Light,
@@ -594,16 +560,8 @@ mod tests {
         (Appearance::Dark, Role::Scrim, false, [0, 0, 0]),
     ];
 
-    /// 全 128 对（64 角色 × 2 外观）与旧实现 8 位 sRGB 的逐值对照（旧实现已删，基线冻结在
-    /// [`LEGACY_SRGB`]）。
-    ///
-    /// 差异只有一个来源：旧实现逐通道 clamp、引擎做 CSS Color 4 chroma 二分。实测**只有 8 对越界色**
-    /// 受影响（其余 120 对逐位相同），本测试把「只有这 8 对」这个事实钉住：多一对、少一对、或
-    /// in-gamut 角色被改色，都会红。8 对的具体差异由下一个测试锁定，越界映射的裁决见
-    /// `spec-deltas/theme.md` §3（用户裁决：以引擎映射为准）。
     #[test]
     fn every_role_is_compared_with_the_frozen_legacy_srgb_baseline() {
-        // 实测越界清单（角色 × 外观）；顺序与枚举顺序一致，便于阅读。
         let expected_out_of_gamut = [
             (Appearance::Light, Role::LineFocus),
             (Appearance::Light, Role::BrandBase),
@@ -651,13 +609,8 @@ mod tests {
         );
     }
 
-    /// 8 对越界色的新基线：引擎 gamut mapping 的 8 位 sRGB，与旧实现逐通道 clamp 的冻结差异。
-    ///
-    /// 用户裁决：以引擎映射为准，不改调色板源值、不在应用层 clamp。这张表同时锁旧值（冻结）与新值，
-    /// 任何一侧改动（调色板、引擎解析器）都必须重新做 M2 视觉确认。
     #[test]
     fn the_eight_out_of_gamut_roles_are_locked_to_the_engine_gamut_mapping() {
-        // (外观, 角色, 旧逐通道 clamp（冻结）, 引擎 gamut mapping)。
         let cases: [(Appearance, Role, [u8; 3], [u8; 3]); 8] = [
             (
                 Appearance::Light,
@@ -720,7 +673,6 @@ mod tests {
                 role.name()
             );
 
-            // 旧值必须与冻结基线表一致（两张表互相印证）。
             let frozen = LEGACY_SRGB
                 .into_iter()
                 .find(|(frozen_appearance, frozen_role, _, _)| {

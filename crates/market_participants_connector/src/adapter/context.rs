@@ -1,18 +1,3 @@
-//! What one adapter execution is given besides the request itself.
-//!
-//! The execution context is built by the gateway from the venue configuration of
-//! the route the request was validated against. Its only route identity is the
-//! [`RequestIdentity`]: the route and the capability are stated together, so a
-//! context can never disagree with the descriptor that produced it. Its origins
-//! are the **venue's** own — the pair the venue's configuration gives this route's
-//! scope, or the venue's default for a scope the configuration does not name — so
-//! an adapter never picks a host from a venue name or from an endpoint id.
-//!
-//! One conversation is not about a route at all: the [`VenueExecutionContext`],
-//! which a load opens to ask a venue what it publishes. It names the venue instead
-//! of a route, and it dials the venue's **primary scope**, because the read covers
-//! every scope the venue may publish rather than one of them.
-
 use std::{fmt, sync::Arc};
 
 use app_config::{
@@ -34,29 +19,17 @@ use crate::{
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum Authentication {
-    /// An API key signed with a shared secret.
     ApiKey {
         account_id: SmolStr,
         api_key: SmolStr,
         secret: SmolStr,
     },
-    /// An API key of a venue that authenticates with a passphrase as well.
-    ///
-    /// The passphrase is part of the credential rather than a field a venue may
-    /// ignore: a venue that requires one cannot be signed without it, so an
-    /// execution authenticated this way carries it and nothing has to look it up
-    /// again from the venue's stored credentials.
     PassphraseApiKey {
         account_id: SmolStr,
         api_key: SmolStr,
         secret: SmolStr,
         passphrase: SmolStr,
     },
-    /// A credential set a venue authenticates with by an API key pair and a bearer token.
-    ///
-    /// The token is part of the credential rather than a field a venue may ignore: the
-    /// venue hands out a session from it and refuses every command without one, so an
-    /// execution authenticated this way carries it.
     LongbridgeApiKey {
         account_id: SmolStr,
         app_key: SmolStr,
@@ -116,34 +89,17 @@ impl Authentication {
     }
 }
 
-/// Everything one adapter execution needs that is not the request.
 #[derive(Clone)]
 pub struct ExecutionContext {
-    /// The only route and capability identity of this execution.
     identity: RequestIdentity,
-    /// Every endpoint the route's venue configuration gives its scope.
     endpoints: VenueEndpoints,
     pub auth: Option<Authentication>,
     pub proxy: ResolvedProxy,
-    /// Generation of the resolved network route used for this operation.
-    ///
-    /// The generation is part of connection identity so a proxy change cannot
-    /// accidentally reuse a live socket created for an older route.
     network_route_generation: NetworkRouteGeneration,
-    /// Generation of the credentials used by authenticated requests.
     credential_generation: Option<CredentialGeneration>,
     pub http_client: Client,
     pub connection_pool: Arc<ConnectionPool>,
     pub runtime: Option<ConfigNotification<MarketParticipantNetworkSnapshot>>,
-    /// The venue-level route metadata standing behind this execution.
-    ///
-    /// A request path carries the metadata of the loaded venue it was admitted
-    /// against: it is read from the commit that admitted the request, never
-    /// fetched here, so no request path can reach the venue for metadata. A
-    /// load-time conversation carries what that same load read — which is what
-    /// lets a catalog be staged from the metadata its own commit will publish.
-    /// Absent means no venue reading stands behind the execution at all, which is
-    /// the discovery conversation itself.
     metadata: Option<Arc<VenueMetadata>>,
 }
 
@@ -162,7 +118,6 @@ impl fmt::Debug for ExecutionContext {
 }
 
 impl ExecutionContext {
-    /// Builds the context of one validated request.
     #[cfg(test)]
     pub(crate) fn new(
         identity: RequestIdentity,
@@ -181,7 +136,6 @@ impl ExecutionContext {
         )
     }
 
-    /// Builds the context of one request that has a metadata service beside its primary.
     pub(crate) fn new_with_endpoints(
         identity: RequestIdentity,
         endpoints: VenueEndpoints,
@@ -202,46 +156,31 @@ impl ExecutionContext {
         }
     }
 
-    /// Attaches the venue metadata this execution is resolved against.
     pub(crate) fn with_venue_metadata(mut self, metadata: Option<Arc<VenueMetadata>>) -> Self {
         self.metadata = metadata;
         self
     }
 
-    /// Returns the venue metadata this execution is resolved against.
-    ///
-    /// Nothing here fetches: a request path is handed the metadata of the commit
-    /// that admitted it, and an adapter that needs a scope's metadata reads it
-    /// from this value or refuses the request.
     pub(crate) fn venue_metadata(&self) -> Option<&Arc<VenueMetadata>> {
         self.metadata.as_ref()
     }
 
-    /// Returns the identity this execution acts under.
     pub const fn identity(&self) -> &RequestIdentity {
         &self.identity
     }
 
-    /// Returns the venue and scope of this execution.
     pub fn route(&self) -> VenueRoute {
         self.identity().route().clone()
     }
 
-    /// Returns the capability of this execution.
     pub const fn capability(&self) -> CapabilityId {
         self.identity().capability()
     }
 
-    /// Returns the HTTP origin the route's venue configuration gives its scope.
     pub(crate) fn http_origin(&self) -> &Url {
         &self.endpoints.primary.http
     }
 
-    /// Returns the HTTP origin of the venue's metadata service.
-    ///
-    /// A venue with one host answers its primary HTTP origin: the metadata read is
-    /// the same host there, and no adapter has to branch on whether a second one
-    /// exists.
     pub(crate) fn http_metadata(&self) -> &Url {
         self.endpoints
             .metadata
@@ -249,17 +188,14 @@ impl ExecutionContext {
             .map_or(&self.endpoints.primary.http, |service| &service.http)
     }
 
-    /// Returns the WebSocket origin the route's venue configuration gives its scope.
     pub(crate) fn websocket_origin(&self) -> &Url {
         &self.endpoints.primary.websocket
     }
 
-    /// Returns the generation of the resolved network route.
     pub const fn network_route_generation(&self) -> NetworkRouteGeneration {
         self.network_route_generation
     }
 
-    /// Returns the generation of the credentials this execution signs with.
     pub const fn credential_generation(&self) -> Option<CredentialGeneration> {
         self.credential_generation
     }
@@ -300,24 +236,14 @@ impl ExecutionContext {
     }
 }
 
-/// Everything one venue-level read of one venue needs.
-///
-/// The discovery conversation asks a venue what it publishes before anything of it
-/// is registered, so it addresses the venue rather than a route: there is no
-/// [`RequestIdentity`] to carry, and the origins are the venue's **default** pair —
-/// the one a scope the configuration does not name is reached on — because the read
-/// covers every scope the venue may publish rather than one of them.
 #[derive(Clone)]
 pub struct VenueExecutionContext {
-    /// The venue this read asks.
     venue: VenueId,
-    /// The endpoints the venue's own configuration gives a scope it does not name.
     endpoints: VenueEndpoints,
     pub http_client: Client,
 }
 
 impl VenueExecutionContext {
-    /// Builds the context of one venue-level read.
     #[cfg(test)]
     pub(crate) fn new(
         venue: VenueId,
@@ -334,7 +260,6 @@ impl VenueExecutionContext {
         )
     }
 
-    /// Builds the context of one venue-level read with a metadata service.
     pub(crate) fn new_with_endpoints(
         venue: VenueId,
         endpoints: VenueEndpoints,
@@ -347,12 +272,10 @@ impl VenueExecutionContext {
         }
     }
 
-    /// Returns the venue this read asks.
     pub const fn venue(&self) -> &VenueId {
         &self.venue
     }
 
-    /// Returns the HTTP origin this read dials.
     pub(crate) fn http_origin(&self) -> &Url {
         &self.endpoints.primary.http
     }
@@ -428,8 +351,6 @@ mod tests {
         ExecutionContext::new(identity, origins, client, pool)
     }
 
-    /// The identity is the only route identity a context has: the route and the
-    /// capability are stated together, so the two can never disagree.
     #[test]
     fn the_route_and_capability_are_stated_together() {
         let context = context();
@@ -449,8 +370,6 @@ mod tests {
         );
     }
 
-    /// A context defaults to no proxy decision, no credentials and generation
-    /// zero; the gateway replaces all three from the venue configuration it resolved.
     #[test]
     fn a_fresh_context_carries_no_proxy_or_credential_generation() {
         let context = context();

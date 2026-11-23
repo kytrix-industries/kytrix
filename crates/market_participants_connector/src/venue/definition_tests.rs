@@ -1,16 +1,3 @@
-//! Unit tests of the static definition table.
-//!
-//! The table is read the way its two public accessors read it: the venue list is
-//! exactly the venues this build serves and has one stable order, and a
-//! capability name maps to the venues whose loader can produce it. The definitions
-//! are pinned to the scopes their loaders publish, so a definition, its capability
-//! names and its scope set cannot drift apart.
-//!
-//! A loader is asked the way the load transaction asks it: through the venue's own
-//! connection configuration and with a cancellation nobody has cancelled. The
-//! fixture conversation answers no deployment, so a venue that would discover
-//! scopes of its own answers its statically known ones here.
-
 use app_config::market_participants::settings::default_venues;
 use futures::future::BoxFuture;
 use market_participants_model::{
@@ -39,12 +26,10 @@ use crate::{
     },
 };
 
-/// One built-in venue identity.
 fn venue(name: &str) -> VenueId {
     VenueId::from_name(name).expect("the built-in venue identity is canonical")
 }
 
-/// A venue conversation that deploys nothing and publishes no metadata.
 struct NoDeployments;
 
 impl VenueConversation for NoDeployments {
@@ -59,7 +44,6 @@ impl VenueConversation for NoDeployments {
     }
 }
 
-/// Asks one venue's loader what it publishes.
 async fn load(venue: &VenueId) -> VenueLoadData {
     let config = VenueConfig::new(*venue, std::sync::Arc::new(NoDeployments));
     let cancellation = LoadCancellation::new();
@@ -70,7 +54,6 @@ async fn load(venue: &VenueId) -> VenueLoadData {
         .expect("the fixture venue publishes its scopes")
 }
 
-/// The scope names one venue's loader publishes, in order.
 async fn scope_names(venue: &VenueId) -> Vec<String> {
     load(venue)
         .await
@@ -80,12 +63,6 @@ async fn scope_names(venue: &VenueId) -> Vec<String> {
         .collect()
 }
 
-/// The table lists exactly the venues this build serves, in one stable order, and
-/// each of them has a definition that produces the scopes it is defined by.
-///
-/// The capability names of a definition are checked against what its loader
-/// actually produces, so the venue-level list the unloaded hints read cannot
-/// claim a capability no scope of that venue carries.
 #[tokio::test]
 async fn the_definition_table_lists_every_venue() {
     let venues = supported_venues();
@@ -135,10 +112,6 @@ async fn the_definition_table_lists_every_venue() {
     for supported in &venues {
         let definition = definition_of(*supported);
         let mut declared: Vec<CapabilityId> = definition.capabilities.to_vec();
-        // The fixture reading publishes no HIP-4 outcomes, so the dynamic
-        // outcome scopes are absent from the fixture's scope set. The venue's
-        // static definition still states the capabilities a real reading can
-        // publish; the outcome-scope test below covers that half.
         if *supported == venue("hyperliquid") {
             declared.retain(|capability| {
                 !matches!(
@@ -164,22 +137,6 @@ async fn the_definition_table_lists_every_venue() {
     }
 }
 
-/// The definition table lists every venue this build serves, and no other.
-///
-/// The table's entries and [`definition_of`]'s match are one fact stated twice, and
-/// this is the guard that keeps them from drifting apart in either direction: the
-/// served list is exactly the product venues in product order, and every identity the
-/// list names is one the lookup answers. A venue added to [`VenueId`] is already a
-/// compile error in that match; what this closes is the other direction — an entry no
-/// arm answers would still leave `supported_venues()` long, and every caller that
-/// walks it (the market menu, the settings rows, the notices that name markets) would
-/// draw a venue nothing can load. Comparing the table against the identity's own set
-/// is what holds that.
-///
-/// The lookup and the table answer the same set, which is every venue the identity
-/// carries: the venue list has no room left for one that is carried and unserved, and
-/// a venue that becomes unserved again is a compile error in the match above rather
-/// than an absence here.
 #[test]
 fn the_definition_table_covers_every_venue_this_build_serves() {
     let listed = supported_venues();
@@ -204,10 +161,6 @@ fn the_definition_table_covers_every_venue_this_build_serves() {
         "every venue the identity carries is one this build serves"
     );
 
-    // The lookup and the table are one fact stated twice: the match answers one
-    // definition per identity and the table lists the same venues, so an entry nothing
-    // answers and an answer no entry backs are both impossible here. This is also what
-    // makes `VenueLoadError::UnsupportedVenue` unreachable in this build.
     let answered: Vec<VenueId> = VenueId::ALL
         .into_iter()
         .filter(|venue| definition_of(*venue).venue == *venue)
@@ -218,10 +171,6 @@ fn the_definition_table_covers_every_venue_this_build_serves() {
     );
 }
 
-/// A definition answers the capability names its loader produces, and nothing
-/// else: the liquidation stream belongs to the two market participants that publish one, the
-/// wallet monitor to the venue that has one, the whole-scope ticker read to the venues
-/// that answer it, and a capability no loader produces to no venue at all.
 #[test]
 fn a_definition_carries_its_capability_names() {
     assert_eq!(
@@ -256,14 +205,6 @@ fn a_definition_carries_its_capability_names() {
     );
 }
 
-/// The venue's two definitions state whether a load without credentials is worth
-/// offering, and the two answers are the two kinds of read there are.
-///
-/// A venue whose every read signs cannot be read at all without a credential, so a
-/// load of it would leave a market nothing can open; a venue whose reads are public
-/// is offered unconditionally, and none of the three market participants has a read that needs
-/// a key. Longbridge's directory is public and the market behind it is not, which is
-/// the one case where the question has to be asked before a load is started.
 #[test]
 fn a_definition_states_whether_a_load_needs_credentials() {
     for venue_name in ["binance", "okx", "hyperliquid"] {
@@ -280,15 +221,6 @@ fn a_definition_states_whether_a_load_needs_credentials() {
     );
 }
 
-/// The one Longbridge route declares what this build publishes for the venue: one US-equity
-/// scope, the catalog source its directory is bound to, its three capabilities with whether
-/// each needs the venue's credential, and one normalization rule.
-///
-/// This test is what pins the row, through the same [`specs::scope_entries`] the venue's
-/// loader answers with, so a changed scope name, catalog source, capability or rule fails
-/// here rather than reaching a load. The venue's own settings are the other half of the same
-/// facts, and [`every_static_scope_is_named_by_the_venues_settings`] holds the scope name
-/// across the two crates.
 #[test]
 fn the_longbridge_route_declares_one_us_scope() {
     let entries = specs::scope_entries(venue(LONGBRIDGE_VENUE));
@@ -332,21 +264,6 @@ fn the_longbridge_route_declares_one_us_scope() {
     );
 }
 
-/// Every statically published scope of this build is one the venue's own settings
-/// publish — and the settings publish nothing else.
-///
-/// `app_config` cannot depend on this crate, so the scopes a venue's settings carry
-/// and the scope constants this build routes by are two literal tables that nothing
-/// but this test holds together: a rename here that missed the settings would leave
-/// the scope addressed by a route whose venue answers no origins and no credentials
-/// for it, and a name the settings carry while this build routes nothing by it would
-/// be a row nothing can reach. Neither of those would any other test notice. The
-/// scopes are listed by constant, so the assertion is about the names this crate's
-/// own routes carry rather than about strings this test re-typed.
-///
-/// A scope a venue deploys at runtime — HyperCore's `perp-dex/*` — is deliberately
-/// absent from both lists: it is not a scope a venue publishes, and no settings row
-/// names one. It is reached through the venue's own primary scope instead.
 #[test]
 fn every_static_scope_is_named_by_the_venues_settings() {
     let configured = default_venues();

@@ -1,31 +1,8 @@
-//! The AIS ship types the map distinguishes, and the colours it draws them in.
-//!
-//! AIS publishes one raw `ship_type` code per vessel. The code's main type is what the
-//! map needs: a tanker, a cargo ship, a passenger ship and so on. The sub-codes that
-//! qualify a main type — hazard grades and reserved values — are folded into it, because
-//! a reader looking at a marker wants to know what kind of ship it is, not which hazard
-//! grade its cargo carries. A code of zero means the report names no type at all, and a
-//! vessel whose static record has not arrived has no code either; both are
-//! [`ShipType::Unknown`].
-//!
-//! The legend and the header filter offer only the types the picture actually holds, so
-//! the set is derived from the vessels rather than from this table. The table is what
-//! gives each type its name, its stable key and its colour.
-//!
-//! # Colours
-//!
-//! The theme has six chart series, and the map distinguishes twenty ship types. A ship's
-//! colour is a fact about its AIS type rather than about the theme, so the palette is
-//! authored here, one per appearance: the light values are dark enough to read on the
-//! paper land and the pale sea, and the dark values are light enough to read on the night
-//! basemap. Every type has one colour in each appearance and no two types share one.
-
 use std::sync::OnceLock;
 
 use base_ui::theme::appearance::Appearance;
 use ui_core::paint::color::Color;
 
-/// Every ship type the map distinguishes, in the order the legend lists them.
 pub(super) const SHIP_TYPES: [ShipType; 20] = [
     ShipType::Tanker,
     ShipType::Cargo,
@@ -49,57 +26,33 @@ pub(super) const SHIP_TYPES: [ShipType; 20] = [
     ShipType::Unknown,
 ];
 
-/// How many ship types the map distinguishes.
 pub(super) const SHIP_TYPE_COUNT: usize = SHIP_TYPES.len();
 
-/// One AIS main type, or the absence of one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ShipType {
-    /// A tanker: the `80–89` range of `ship_type`.
     Tanker,
-    /// A cargo ship: the `70–79` range. AIS does not distinguish container from bulk,
-    /// so neither does the map.
     Cargo,
-    /// A passenger ship: the `60–69` range.
     Passenger,
-    /// A fishing vessel: `30`.
     Fishing,
-    /// A tug or a vessel towing: `31`, `32` and `52`.
     Towing,
-    /// Dredging or diving work: `33` and `34`.
     Dredging,
-    /// A military vessel: `35`.
     Military,
-    /// A sailing vessel: `36`.
     Sailing,
-    /// A pleasure craft: `37`.
     Pleasure,
-    /// A high-speed craft: the `40–49` range.
     HighSpeed,
-    /// A pilot vessel: `50`.
     Pilot,
-    /// A search-and-rescue vessel: `51`.
     SearchAndRescue,
-    /// A port tender: `53`.
     PortTender,
-    /// Anti-pollution equipment: `54`.
     AntiPollution,
-    /// A law-enforcement vessel: `55`.
     LawEnforcement,
-    /// A medical transport: `58`.
     Medical,
-    /// A noncombatant ship: `59`.
     Noncombatant,
-    /// A wing-in-ground craft: the `20–29` range.
     WingInGround,
-    /// A type the table does not name: the reserved codes and the `90–99` range.
     Other,
-    /// No type at all: `ship_type` zero, or no static record.
     Unknown,
 }
 
 impl ShipType {
-    /// The type one raw AIS `ship_type` code belongs to.
     pub(super) const fn from_code(code: u32) -> Self {
         match code {
             0 => Self::Unknown,
@@ -125,7 +78,6 @@ impl ShipType {
         }
     }
 
-    /// The position this type occupies in [`SHIP_TYPES`], the legend and the palette.
     pub(super) const fn index(self) -> usize {
         match self {
             Self::Tanker => 0,
@@ -151,17 +103,14 @@ impl ShipType {
         }
     }
 
-    /// The stable identifier the filter's menu entries and its selection use.
     pub(super) const fn key(self) -> &'static str {
         KEYS[self.index()]
     }
 
-    /// The catalogue key of this type's name.
     pub(super) const fn label_key(self) -> &'static str {
         LABEL_KEYS[self.index()]
     }
 
-    /// The type one stable key names, or `None` for a key this build does not know.
     pub(super) fn from_key(key: &str) -> Option<Self> {
         SHIP_TYPES
             .iter()
@@ -170,22 +119,14 @@ impl ShipType {
     }
 }
 
-/// What the map is restricted to.
-///
-/// The chosen type is kept even when the picture no longer holds it: the filter is the
-/// reader's decision, and a type that leaves the picture leaves an empty sea rather than
-/// silently widening the selection back to everything.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum ShipTypeFilter {
-    /// Every type the picture holds.
     #[default]
     All,
-    /// One type, which may have left the picture since it was chosen.
     Only(ShipType),
 }
 
 impl ShipTypeFilter {
-    /// The stable identifier the filter's menu entries and its selection use.
     pub(super) const fn key(self) -> &'static str {
         match self {
             Self::All => "all",
@@ -193,7 +134,6 @@ impl ShipTypeFilter {
         }
     }
 
-    /// The filter one stable key names, or `None` for a key this build does not know.
     pub(super) fn from_key(key: &str) -> Option<Self> {
         if key == Self::All.key() {
             return Some(Self::All);
@@ -201,7 +141,6 @@ impl ShipTypeFilter {
         ShipType::from_key(key).map(Self::Only)
     }
 
-    /// Whether a vessel of `ship_type` is drawn under this filter.
     pub(super) fn matches(self, ship_type: ShipType) -> bool {
         match self {
             Self::All => true,
@@ -210,7 +149,6 @@ impl ShipTypeFilter {
     }
 }
 
-/// The stable keys of [`SHIP_TYPES`], in the same order.
 const KEYS: [&str; SHIP_TYPE_COUNT] = [
     "tanker",
     "cargo",
@@ -234,7 +172,6 @@ const KEYS: [&str; SHIP_TYPE_COUNT] = [
     "unknown",
 ];
 
-/// The catalogue keys of [`SHIP_TYPES`]'s names, in the same order.
 const LABEL_KEYS: [&str; SHIP_TYPE_COUNT] = [
     "widget.global_shipping_chokepoint.ship_type.tanker",
     "widget.global_shipping_chokepoint.ship_type.cargo",
@@ -258,13 +195,6 @@ const LABEL_KEYS: [&str; SHIP_TYPE_COUNT] = [
     "widget.global_shipping_chokepoint.ship_type.unknown",
 ];
 
-/// Converts one authored colour into the engine's sRGB.
-///
-/// The formula is the standard CSS `hsl()` one. The hue picks one of six sixty-degree
-/// sectors: `chroma` is how far that sector's full channel sits from the grey of equal
-/// lightness, `second` is the part of it that bleeds into the sector's other channel, and
-/// `base` is the grey itself. The hue is an angle, so it is reduced modulo a full turn before
-/// it picks a sector; saturation and lightness are `0..=1` and the result is opaque.
 fn colour(hue_degrees: f32, saturation: f32, lightness: f32) -> Color {
     let hue = hue_degrees.rem_euclid(360.0) / 60.0;
     let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
@@ -281,48 +211,35 @@ fn colour(hue_degrees: f32, saturation: f32, lightness: f32) -> Color {
     Color::srgb(red + base, green + base, blue + base, 1.0)
 }
 
-/// Resolves the authored triples of one appearance into the colours the canvas draws with.
-///
-/// The triples stay authored numbers because turning them into sRGB is `f32` arithmetic, which
-/// a `const` cannot run; a palette is resolved once and then read for the life of the process.
 fn palette(hsl: &[(f32, f32, f32); SHIP_TYPE_COUNT]) -> [Color; SHIP_TYPE_COUNT] {
     hsl.map(|(hue, saturation, lightness)| colour(hue, saturation, lightness))
 }
 
-/// The hue, saturation and lightness the light appearance draws each type in, in
-/// [`SHIP_TYPES`] order.
-///
-/// The values are dark enough to stay legible on both the paper land and the pale sea.
 const LIGHT_HSL: [(f32, f32, f32); SHIP_TYPE_COUNT] = [
-    (30.0, 0.82, 0.40),  // Tanker: amber
-    (215.0, 0.70, 0.40), // Cargo: blue
-    (275.0, 0.62, 0.42), // Passenger: violet
-    (140.0, 0.68, 0.36), // Fishing: green
-    (0.0, 0.72, 0.40),   // Towing: red
-    (50.0, 0.78, 0.32),  // Dredging: yellow
-    (350.0, 0.55, 0.32), // Military: dark red
-    (190.0, 0.68, 0.38), // Sailing: cyan
-    (320.0, 0.72, 0.40), // Pleasure: magenta
-    (85.0, 0.78, 0.34),  // High-speed: yellow-green
-    (240.0, 0.65, 0.42), // Pilot: blue-violet
-    (15.0, 0.78, 0.40),  // Search and rescue: red-orange
-    (170.0, 0.55, 0.36), // Port tender: teal
-    (100.0, 0.58, 0.38), // Anti-pollution: green-yellow
-    (225.0, 0.60, 0.32), // Law enforcement: dark blue
-    (335.0, 0.55, 0.44), // Medical: pink
-    (260.0, 0.35, 0.40), // Noncombatant: muted purple
-    (120.0, 0.48, 0.42), // Wing in ground: light green
-    (30.0, 0.18, 0.36),  // Other: brown-grey
-    (0.0, 0.00, 0.44),   // Unknown: mid grey
+    (30.0, 0.82, 0.40),
+    (215.0, 0.70, 0.40),
+    (275.0, 0.62, 0.42),
+    (140.0, 0.68, 0.36),
+    (0.0, 0.72, 0.40),
+    (50.0, 0.78, 0.32),
+    (350.0, 0.55, 0.32),
+    (190.0, 0.68, 0.38),
+    (320.0, 0.72, 0.40),
+    (85.0, 0.78, 0.34),
+    (240.0, 0.65, 0.42),
+    (15.0, 0.78, 0.40),
+    (170.0, 0.55, 0.36),
+    (100.0, 0.58, 0.38),
+    (225.0, 0.60, 0.32),
+    (335.0, 0.55, 0.44),
+    (260.0, 0.35, 0.40),
+    (120.0, 0.48, 0.42),
+    (30.0, 0.18, 0.36),
+    (0.0, 0.00, 0.44),
 ];
 
-/// [`LIGHT_HSL`] resolved to engine colours, on first use.
 static LIGHT: OnceLock<[Color; SHIP_TYPE_COUNT]> = OnceLock::new();
 
-/// The hue, saturation and lightness the dark appearance draws each type in, in
-/// [`SHIP_TYPES`] order.
-///
-/// The values are light enough to stay legible on the near-black sea and the dark land.
 const DARK_HSL: [(f32, f32, f32); SHIP_TYPE_COUNT] = [
     (30.0, 0.78, 0.76),
     (215.0, 0.66, 0.70),
@@ -346,10 +263,8 @@ const DARK_HSL: [(f32, f32, f32); SHIP_TYPE_COUNT] = [
     (0.0, 0.00, 0.82),
 ];
 
-/// [`DARK_HSL`] resolved to engine colours, on first use.
 static DARK: OnceLock<[Color; SHIP_TYPE_COUNT]> = OnceLock::new();
 
-/// The palette one appearance draws the ship types with.
 pub(super) fn colours(appearance: Appearance) -> &'static [Color; SHIP_TYPE_COUNT] {
     match appearance {
         Appearance::Light => LIGHT.get_or_init(|| palette(&LIGHT_HSL)),

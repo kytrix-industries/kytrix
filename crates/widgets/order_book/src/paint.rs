@@ -1,36 +1,3 @@
-//! The canvases the book draws its depth bars and its imbalance on.
-//!
-//! A ladder's labels and its depth bars move at very different rates. The labels
-//! are ordinary text nodes and change only when the book does; the bars ease
-//! towards every published ratio, so a frame that follows a moving bar has to
-//! repaint the bars alone. Splitting them is what keeps an easing frame from
-//! re-shaping a hundred lines (the model already reuses each label for as long as
-//! its value is the same).
-//!
-//! # What is on the canvas, and what is not
-//!
-//! The bars are quads, and nothing else: a side's canvas is a [`Canvas`] of
-//! rectangles anchored to the right edge of the row they belong to, drawn behind
-//! the list of row labels. The labels themselves are nodes of the list, so they
-//! are laid out, read by a screen reader and re-shaped by the engine like every
-//! other piece of text; no glyph run is constructed or carried here.
-//!
-//! Because the frame carries no glyph leases and registers no
-//! [`GeometryStore`](ui_core::paint::geometry_store::GeometryStore) meshes, there
-//! is nothing to hand back when a frame is replaced or the pane goes away: a
-//! replaced canvas is simply dropped. What a frame *does* keep is the prepared
-//! key, so a steady `sync` — a book that has not moved since the last frame —
-//! writes no canvas and asks for no repaint (I3).
-//!
-//! # Geometry
-//!
-//! Rows are counted away from the mid price: an ask ladder grows upwards from the
-//! bottom of its box and a bid ladder downwards from the top, which is the only
-//! thing that differs between the two. The box a canvas is drawn into is a
-//! function of the layout pass, so the widget reads it back in `sync` and a box
-//! that changed is what makes the bars be drawn again. Values are window-absolute
-//! logical pixels (the canvas' coordinate space).
-
 use std::sync::Arc;
 
 use base_ui::{style_builder::StyleBuilder, theme::handle::ThemeHandle};
@@ -49,46 +16,28 @@ use widget::cx::WidgetCx;
 
 use super::model::{GroupedLevel, WINDOW_SIZES, interpolated_ratio};
 
-/// The gap between two rows of a ladder, in logical pixels.
-///
-/// The row itself is as tall as the text token plus this widget's own vertical
-/// padding; the gap is the one geometry constant of the ladder that no theme token
-/// states.
 pub(super) const ROW_GAP: f32 = 1.0;
 
-/// The vertical padding a row adds to the text height it is drawn at.
 pub(super) const ROW_TEXT_PADDING: f32 = 4.0;
 
-/// The row height one ladder draws its labels at, from the text size it uses.
 pub(super) fn row_extent(font_size: f32) -> f32 {
     font_size + ROW_TEXT_PADDING
 }
 
-/// The distance from one row's top to the next row's top.
 pub(super) fn row_stride(font_size: f32) -> f32 {
     row_extent(font_size) + ROW_GAP
 }
 
-/// The debug ids of the two bar canvases and of the imbalance bar.
 pub(super) const ASK_BARS_SELECTOR: &str = "TEST_ORDER_BOOK_ASK_BARS";
 pub(super) const BID_BARS_SELECTOR: &str = "TEST_ORDER_BOOK_BID_BARS";
 pub(super) const IMBALANCE_SELECTOR: &str = "TEST_ORDER_BOOK_IMBALANCE";
 
-/// The rows one side of the given box has room for.
-///
-/// The count is capped by the widest window the user may pick: a taller pane shows
-/// empty space below the ladder rather than more levels than the model was asked
-/// to keep.
 pub(super) fn drawable_rows(bounds: Rect, font_size: f32) -> usize {
     let stride = row_stride(font_size);
     let rows = ((bounds.size.height + ROW_GAP) / stride).floor();
     (rows.max(1.0) as usize).min(WINDOW_SIZES[WINDOW_SIZES.len() - 1])
 }
 
-/// The box of one row of `index`, counting away from the mid price.
-///
-/// `offset` is how far the list holding the labels is scrolled, which is what
-/// keeps a bar under its label after the pane was squeezed under the row limit.
 pub(super) fn row_bounds(
     bounds: Rect,
     index: usize,
@@ -110,9 +59,6 @@ pub(super) fn row_bounds(
     )
 }
 
-/// The box of one depth bar: as wide as its share of the visible quantity, and
-/// anchored to the right edge of the row so that every bar starts at the same
-/// place.
 pub(super) fn bar_bounds(row: Rect, ratio: f32) -> Rect {
     let ratio = if ratio.is_finite() {
         ratio.clamp(0.0, 1.0)
@@ -128,7 +74,6 @@ pub(super) fn bar_bounds(row: Rect, ratio: f32) -> Rect {
     )
 }
 
-/// One side's bars, as a canvas of quads over `levels`.
 pub(super) fn bars_canvas(
     bounds: Rect,
     levels: &[GroupedLevel],
@@ -163,8 +108,6 @@ pub(super) fn bars_canvas(
     canvas
 }
 
-/// The imbalance bar: the ask share of the visible quantity from the left, the
-/// bid share from the right.
 pub(super) fn imbalance_canvas(
     bounds: Rect,
     ask_ratio: f32,
@@ -216,12 +159,6 @@ pub(super) fn imbalance_canvas(
     canvas
 }
 
-/// What a prepared side was drawn from.
-///
-/// The levels compare by their shared allocation rather than by their contents:
-/// the widget only ever replaces a grouped side wholesale, so two pointers compare
-/// equal exactly when there is nothing to redraw. The progress is part of the key
-/// because an easing frame draws different bars from the same book.
 struct BarsKey {
     levels: Arc<[GroupedLevel]>,
     bounds: Rect,
@@ -253,7 +190,6 @@ impl BarsKey {
     }
 }
 
-/// One side's canvas node and the frame it was last drawn from.
 pub(super) struct SideCanvas {
     node: Option<NodeId>,
     prepared: Option<BarsKey>,
@@ -267,12 +203,6 @@ impl SideCanvas {
         }
     }
 
-    /// Builds the canvas node into `parent` and remembers it.
-    ///
-    /// The canvas starts empty: the node has no box until the first layout, and
-    /// [`SideCanvas::sync`] is what fills it in. The node registers a theme
-    /// dependency so an appearance switch invalidates it and schedules the frame
-    /// whose `sync` resolves the new colour (G3).
     pub(super) fn build(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -298,7 +228,6 @@ impl SideCanvas {
         Ok(())
     }
 
-    /// Draws `levels` if the frame this one would be is not the one already drawn.
     pub(super) fn sync(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -339,7 +268,6 @@ impl SideCanvas {
     }
 }
 
-/// What a prepared imbalance bar was drawn from.
 struct ImbalanceKey {
     bounds: Rect,
     ask_ratio: f32,
@@ -356,7 +284,6 @@ impl ImbalanceKey {
     }
 }
 
-/// The imbalance bar's canvas node and the frame it was last drawn from.
 pub(super) struct Imbalance {
     node: Option<NodeId>,
     prepared: Option<ImbalanceKey>,
@@ -370,7 +297,6 @@ impl Imbalance {
         }
     }
 
-    /// Builds the canvas node into `parent` and remembers it.
     pub(super) fn build(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -395,7 +321,6 @@ impl Imbalance {
         Ok(())
     }
 
-    /// Draws the ask/bid split if it moved since the frame already drawn.
     pub(super) fn sync(
         &mut self,
         cx: &mut WidgetCx<'_>,

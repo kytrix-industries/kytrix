@@ -1,5 +1,3 @@
-//! Account capability facade and account-facing domain API.
-
 pub mod domain;
 pub mod error;
 pub mod hyperliquid;

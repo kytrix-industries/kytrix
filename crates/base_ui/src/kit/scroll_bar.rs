@@ -1,45 +1,3 @@
-//! 自绘滚动条（P2-2）。
-//!
-//! 引擎没有滚动条控件（评估 G5），按 A2/D-09 的结论由 `base_ui` 自绘：轨道 + 滑块两个普通节点，
-//! 几何由 [`ScrollState`](ui_core::interaction::ScrollState) 的 `offset / content / viewport`
-//! 现算，滑块位置写 `LayoutOverride`（相对轨道的 border box），颜色 / 淡出走 `bind_style` +
-//! `Transient`。
-//!
-//! # 交互
-//!
-//! - **滑块拖拽**：`on_drag` + `capture_pointer`；位移按 `可拖动长度 / 可滚动范围` 比例换算成
-//!   偏移，走唯一写点 `App::scroll_to`（引擎负责 clamp / damage / 取消滚轮动画）。
-//! - **轨道点击**：按点击位置把滑块中心移过去（与 Qt `QScrollBar` 的页面跳转同语义）。
-//! - **悬停 / 淡出**：`ScrollbarMode::Hover` 时滑块 `Transient<f32>` 不透明度在悬停 / 拖拽时
-//!   动画到 1、离开后回到 0（`App::animate` + `AnimationSpec::short()`）；`Always` 恒为 1。
-//!   悬停态由 [`ScrollBar::sync`] 读 `App::hovered` 镜像到 `Signal<bool>`（引擎的 hover 不进
-//!   `ReadCtx`，与本批列表的悬停镜像同一机制）。动画只在**目标变化**时启动：引擎的
-//!   `animate` 每次都用当前值作新起点并重置时长，逐帧重启会把 120 ms 拉长到 0.4–0.5 s。
-//!
-//! # 模式
-//!
-//! [`ScrollbarMode::Always`] 恒显示、[`ScrollbarMode::Hover`] 悬停 / 拖拽时淡入。旧
-//! 旧组件库的第三种模式 `Scrolling`（滚动时显示、空闲后淡出）本批**未实现**：它需要
-//! 时钟 / 超时状态与帧源接入（滚动停止后还要有一次帧来启动淡出），属后续批次；登记为范围
-//! 缺口（P3-01），旧表 / 菜单 / 侧栏在 widget 迁移前依赖默认模式的调用点需要显式选择
-//! `Always` 或 `Hover`。
-//!
-//! # 生命周期
-//!
-//! 组件的信号与瞬态值归属**自有** `SignalScope`（[`ScrollBar::release`] 释放）。动态创建 /
-//! 销毁的滚动条在卸载节点后调用一次；引用淡出瞬态值的动画槽由引擎在释放时同批取消。
-//!
-//! # 轴
-//!
-//! 引擎滚动容器是**单轴**的（`ScrollAxis`），滚动条因此也按轴各建一个：纵向列表 / 表格用
-//! [`ScrollbarAxis::Vertical`]，横向图表 / 表头用 [`ScrollbarAxis::Horizontal`]。
-//!
-//! # 帧同步
-//!
-//! [`ScrollBar::sync`] 是帧驱动入口（组合根在 `on_frame` 钩子里调用；测试直接调）。滚动条几何
-//! 与淡出**只在变化时**写：偏移不变时 `LayoutOverride` 等值 no-op、`Transient` 已到目标时不再
-//! `animate`（I3：静止无帧）。
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -68,12 +26,9 @@ use crate::{
     theme::handle::ThemeHandle,
 };
 
-/// 滚动条轴（与引擎滚动容器的单轴契约一致）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollbarAxis {
-    /// 纵向（右侧竖条）。
     Vertical,
-    /// 横向（底部横条）。
     Horizontal,
 }
 
@@ -100,26 +55,17 @@ impl ScrollbarAxis {
     }
 }
 
-/// 显示模式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollbarMode {
-    /// 恒显示（列表 / 表格默认）。
     Always,
-    /// 指针在滚动条上或拖动时才显示（淡入淡出）。
     Hover,
-    // 旧组件库的 `Scrolling`（滚动时显示、空闲淡出）未实现：见模块文档〈模式〉。
 }
 
-/// 滚动条参数。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollbarOptions {
-    /// 滑块厚度（逻辑像素；旧 `scroll_bar.rs` 的 `width(4.)`）。
     pub thickness: f32,
-    /// 滑块圆角。
     pub corner_radius: f32,
-    /// 滑块最小长度（内容极长时不至于点不到）。
     pub min_thumb: f32,
-    /// 显示模式。
     pub mode: ScrollbarMode,
 }
 
@@ -135,14 +81,12 @@ impl Default for ScrollbarOptions {
 }
 
 impl ScrollbarOptions {
-    /// 悬停淡出模式。
     #[must_use]
     pub fn hover(mut self) -> Self {
         self.mode = ScrollbarMode::Hover;
         self
     }
 
-    /// 滑块厚度。
     #[must_use]
     pub fn thickness(mut self, thickness: f32) -> Self {
         self.thickness = thickness.max(1.0);
@@ -150,7 +94,6 @@ impl ScrollbarOptions {
     }
 }
 
-/// 拖拽开始时的快照（瞬态值：不失效、只给拖拽换算用）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct DragStart {
     start_offset: f32,
@@ -163,16 +106,10 @@ struct ScrollBarInner {
     theme: ThemeHandle,
     axis: ScrollbarAxis,
     options: ScrollbarOptions,
-    /// 组件自有信号作用域（动态创建 / 销毁的滚动条释放它回收槽位）。
     scope: SignalScope,
     hovered: Signal<bool>,
     scrollable: Signal<bool>,
     fade: Transient<f32>,
-    /// 淡出动画**当前目标**：只在目标变化时启动动画。
-    ///
-    /// 旧实现在动画在飞时（`current != target`）每帧重新 `animate`，而引擎每次重启都会用
-    /// **当前值**作新起点、重置时钟 —— 120 ms 的动画被拉长到 0.4–0.5 s。这里记住目标，
-    /// 稳态（目标没变）不再启动。
     fade_target: Cell<Option<f32>>,
     drag: Transient<Option<DragStart>>,
     geometry: RefCell<Geometry>,
@@ -189,14 +126,12 @@ struct Geometry {
     handle: Option<ScrollHandle>,
 }
 
-/// 自绘滚动条句柄（`Rc` 浅拷贝）。
 #[derive(Clone)]
 pub struct ScrollBar {
     inner: Rc<ScrollBarInner>,
 }
 
 impl ScrollBar {
-    /// 建滚动条状态。`build` 建节点、`attach` 接滚动容器。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -231,10 +166,6 @@ impl ScrollBar {
         }
     }
 
-    /// 只建节点：轨道（绝对定位）+ 滑块（`LayoutOverride`）。
-    ///
-    /// # Errors
-    /// `StaleNode`（`parent` 陈旧）。
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let inner = &self.inner;
         let thickness = inner.options.thickness;
@@ -296,7 +227,6 @@ impl ScrollBar {
         Ok(track)
     }
 
-    /// 接滚动容器：取 `ScrollHandle` 并注册交互。
     pub fn attach(&self, app: &mut App, window: WindowId, scroll_node: NodeId) {
         let handle = app.scroll_handle(window, scroll_node);
         {
@@ -308,22 +238,13 @@ impl ScrollBar {
         app.on_action(self.inner.track_action.clone(), move |ctx| {
             track.on_track_click(ctx);
         });
-        app.on_action(self.inner.thumb_action.clone(), move |_ctx| {
-            // 滑块上的点击/拖拽已经消费了事件；保留一个空 handler 是为了让命中**停在这里**
-            // （动作沿命中节点 → 祖先冒泡取第一条），否则同一次点击还会触发轨道的页面跳转。
-        });
+        app.on_action(self.inner.thumb_action.clone(), move |_ctx| {});
         let drag = self.clone();
         app.on_action(self.inner.drag_action.clone(), move |ctx| {
             drag.on_thumb_drag(ctx);
         });
     }
 
-    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的滚动条调用；先卸载节点再释放）。
-    ///
-    /// 清理面：轨道 / 滑块 / 拖拽三个 Action handler（[`App::off_action`]）+ 本组件的信号作用域。
-    /// 只释放信号不摘 handler 会让 `App` 永久持有 `Rc<ScrollBar>` 闭包（P2-2 复核 R2.2 的泄漏）。
-    /// 返回被释放的槽位数（悬停 / 可滚动 / 淡出不透明度 / 拖拽快照）；引用淡出瞬态值的动画
-    /// 由引擎在释放时同批取消。重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
         app.off_action(&self.inner.track_action);
         app.off_action(&self.inner.thumb_action);
@@ -331,14 +252,12 @@ impl ScrollBar {
         app.release_scope(self.inner.scope)
     }
 
-    /// 轨道 / 滑块节点（测试用）。
     #[must_use]
     pub fn nodes(&self) -> (Option<NodeId>, Option<NodeId>) {
         let geometry = self.inner.geometry.borrow();
         (geometry.track, geometry.thumb)
     }
 
-    /// 滑块当前布局矩形（相对轨道；测试用）。
     #[must_use]
     pub fn thumb_rect(&self, app: &App) -> Option<Rect> {
         let geometry = self.inner.geometry.borrow();
@@ -352,28 +271,21 @@ impl ScrollBar {
             .map(|layout| layout.rect)
     }
 
-    /// 滑块不透明度（瞬态值；测试用）。
     #[must_use]
     pub fn opacity(&self, app: &App) -> f32 {
         *app.read_transient(&self.inner.fade)
     }
 
-    /// 不透明度瞬态值（组合控件 / 测试可读）。
     #[must_use]
     pub fn opacity_transient(&self) -> Transient<f32> {
         self.inner.fade
     }
 
-    /// 滑块几何状态是否可滚动（测试用）。
     #[must_use]
     pub fn scrollable(&self, app: &App) -> bool {
         app.read_with(&self.inner.scrollable, |scrollable| *scrollable)
     }
 
-    /// 帧同步：几何 + 悬停镜像 + 淡出（无变化 ⇒ `false`，不请求帧）。
-    ///
-    /// # Errors
-    /// `StaleNode`（节点已卸载）/ `UnknownWindow`。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let (Some(window), Some(track), Some(thumb), Some(handle)) = (
             self.inner.geometry.borrow().window,
@@ -439,8 +351,6 @@ impl ScrollBar {
             }
         };
         let current_opacity = *app.read_transient(&self.inner.fade);
-        // 只在**目标变化**时启动动画：目标不变时（动画在飞）不重启，否则引擎每次都用当前值
-        // 作新起点并重置时钟，120 ms 的规格会被拖长到 0.4–0.5 s（P2-2b）。
         if self.inner.fade_target.get() != Some(target_opacity) {
             if (current_opacity - target_opacity).abs() > 1.0e-4 {
                 app.animate(
@@ -553,7 +463,6 @@ impl ScrollBar {
     }
 }
 
-/// 滑块长度：轨道长度 × 视口 / 内容，夹在 `[min_thumb, track_len]`。
 fn thumb_length(track_len: f32, viewport: f32, content: f32, options: ScrollbarOptions) -> f32 {
     if track_len <= 0.0 || content <= 0.0 {
         return 0.0;
@@ -589,7 +498,6 @@ fn thumb_rect(
     }
 }
 
-/// 轨道点击的目标偏移：把滑块中心移到点击位置。
 fn track_target_offset(track_len: f32, thumb_len: f32, max: f32, click: f32) -> f32 {
     let usable = (track_len - thumb_len).max(0.0);
     if usable <= 0.0 || max <= 0.0 {
@@ -598,7 +506,6 @@ fn track_target_offset(track_len: f32, thumb_len: f32, max: f32, click: f32) -> 
     ((click - thumb_len / 2.0) / usable).clamp(0.0, 1.0) * max
 }
 
-/// 拖拽换算：起点偏移 + 位移 × 可滚动范围 / 可拖动长度。
 fn drag_offset(start: f32, delta: f32, usable: f32, max: f32) -> f32 {
     if max <= 0.0 {
         return start.max(0.0);
@@ -694,7 +601,6 @@ mod tests {
 
     #[test]
     fn track_click_centers_the_thumb() {
-        // 轨道 200、滑块 50、范围 300：点击 100 处 ⇒ 滑块中心在 100 ⇒ 可拖中点 ⇒ 目标 150。
         assert_eq!(track_target_offset(200.0, 50.0, 300.0, 100.0), 150.0);
         assert_eq!(track_target_offset(200.0, 50.0, 300.0, 0.0), 0.0);
         assert_eq!(track_target_offset(200.0, 50.0, 300.0, 200.0), 300.0);
@@ -703,7 +609,6 @@ mod tests {
 
     #[test]
     fn drag_moves_by_the_track_to_content_ratio() {
-        // 可拖动 150、范围 300：拖 75 ⇒ 偏移 150。
         assert_eq!(drag_offset(0.0, 75.0, 150.0, 300.0), 150.0);
         assert_eq!(drag_offset(100.0, -150.0, 150.0, 300.0), 0.0);
         assert_eq!(drag_offset(100.0, 10_000.0, 150.0, 300.0), 300.0);
@@ -885,7 +790,6 @@ mod ui_tests {
             .bar
             .thumb_rect(harness.app.app())
             .expect("thumb rect");
-        // 轨道高 100、视口 100、内容 400 ⇒ 滑块 25；顶部对齐。
         assert!((rect.size.height - 25.0).abs() < 0.5, "{rect:?}");
         assert_eq!(rect.origin.y, 0.0);
         assert!(harness.bar.scrollable(harness.app.app()));
@@ -895,7 +799,6 @@ mod ui_tests {
             .bar
             .thumb_rect(harness.app.app())
             .expect("thumb rect");
-        // 可拖动 75、范围 300 ⇒ 偏移 150 对应 37.5。
         assert!((rect.origin.y - 37.5).abs() < 0.5, "{rect:?}");
     }
 
@@ -932,8 +835,6 @@ mod ui_tests {
         );
     }
 
-    /// 淡出动画只在**目标变化**时启动：16 ms 采样在规格时长（120 ms）内到达端点，
-    /// 动画在飞时 `sync` 不再重复 `animate`（旧实现逐帧重启 ⇒ 128 ms 只到 0.95）。
     #[test]
     fn the_fade_reaches_its_target_within_the_spec_without_restarting() {
         let mut harness = harness(ScrollbarMode::Hover);
@@ -991,7 +892,6 @@ mod ui_tests {
         );
     }
 
-    /// 释放作用域回收信号 / 瞬态槽位；在飞淡出动画被引擎同批取消（无死槽位写入）。
     #[test]
     fn releasing_the_scope_reclaims_state_and_cancels_the_fade() {
         let mut harness = harness(ScrollbarMode::Hover);
@@ -1027,7 +927,6 @@ mod ui_tests {
             0,
             "重复释放幂等"
         );
-        // 动画槽已被取消：推进时钟 + 出帧不得写已回收的瞬态值。
         harness.app.advance(Duration::from_millis(200));
         let _ = harness.app.drain().expect("frame");
     }
@@ -1045,7 +944,6 @@ mod ui_tests {
             PointerButton::Primary,
             Modifiers::empty(),
         ));
-        // 第一次越过阈值只把拖拽会话转正（派发 `DragPhase::Start`），位移在随后的 Move 里应用。
         let promoted = ui_core::math::Point::new(origin.x, origin.y + 10.0);
         let _ = harness
             .app
@@ -1059,7 +957,6 @@ mod ui_tests {
             PointerButton::Primary,
             Modifiers::empty(),
         ));
-        // 可拖动 75、范围 300 ⇒ 拖 30 对应偏移 120。
         let offset = harness
             .app
             .app()
@@ -1076,7 +973,6 @@ mod ui_tests {
         let (track, _) = harness.bar.nodes();
         let track = track.expect("track");
         let bounds = harness.app.probe().bounds(track).expect("track bounds");
-        // 点轨道下方 3/4 处（滑块只有 25 高，点在滑块之外）。
         let point = ui_core::math::Point::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height * 0.75,
@@ -1101,10 +997,6 @@ mod ui_tests {
         assert!(offset > 150.0, "点击轨道下部后偏移过半：{offset}");
     }
 
-    /// `release` 必须摘掉轨道 / 滑块 / 拖拽三个 Action handler。
-    ///
-    /// E8 审查 F1：这三个 handler 只写引擎滚动状态，泄漏后的「重放点击」不会 panic，
-    /// 因此必须直接观察 handler 表项 + `InputOutcome::action`（= handler 真的被调用）。
     #[test]
     fn releasing_the_scrollbar_removes_its_three_action_handlers() {
         let mut harness = harness(ScrollbarMode::Always);
@@ -1123,7 +1015,6 @@ mod ui_tests {
         let (track, _) = harness.bar.nodes();
         let track = track.expect("track");
         let bounds = harness.app.probe().bounds(track).expect("track bounds");
-        // 点轨道下部（避开滑块）触发页面跳转；释放前这次点击必须由 track handler 消费。
         let point = ui_core::math::Point::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height * 0.75,
@@ -1152,7 +1043,6 @@ mod ui_tests {
             );
         }
 
-        // 不卸载节点直接释放：重放同一次点击不得再命中已摘除的 handler。
         let _ = harness.app.inject(InputEvent::pointer_down(
             point,
             PointerButton::Primary,

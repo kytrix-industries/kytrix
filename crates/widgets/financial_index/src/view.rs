@@ -1,73 +1,3 @@
-//! The indices pane: which indices it follows, and how it draws them.
-//!
-//! # What a pane is scoped to
-//!
-//! Two things: the account the service serves it for, and the indices the user selected.
-//! Those two are the *scope*, and the scope is the stream key as well — so the pane never
-//! has to decide whether a quote belongs to the selection on screen: a message that
-//! arrives for a scope it has left is a message the framework does not deliver, and one
-//! that arrives by hand is refused by comparing the key.
-//!
-//! # What it reports, and what it does not
-//!
-//! It reports through the framework's state cell and nothing else: a failure is a failure,
-//! and the framework decides where that is shown and what the recovery looks like. Two
-//! states are *not* failures: nobody signed in, and nothing selected. Both are neutral text
-//! for a pane that has nothing to show yet, which is what `WidgetState::waiting` is for.
-//!
-//! # Two ways of drawing one answer
-//!
-//! The grid and the table are two views of the same rows, not two scopes: switching between
-//! them re-draws what the pane already holds and re-reads nothing. The body is built once
-//! (AGENTS §9) and the content under it is rebuilt only when the mode changes, because a
-//! `kit::table` and a `kit::list` are different components rather than different styles of
-//! one.
-//!
-//! The grid keeps the old cells, not the old scrolling: the engine's list scrolls one axis, so
-//! a pane too narrow for the columns wraps them into more lines instead of scrolling sideways.
-//! The two-axis container the old grid had is registered as **E22**
-//! (`.docs/gui-migration/spec-deltas/E22.md`); until it exists, the columns, the fixed 160×88
-//! cells and the centred column block are the old geometry.
-//!
-//! # The rows are a signal, the cells are bindings
-//!
-//! Neither row factory has an application context (the table's cells and the grid's list
-//! rows are built with a node tree only), so every value inside a row is a `bind_text` /
-//! `bind_style` closure over the signals the pane owns: the accepted rows, the navigation
-//! busy flag, the language, and the flash map. Structural changes (a new answer, a new
-//! selection) go through `Table::set_rows` / `List::set_count`, which rebuild the mounted
-//! window so the factories run against the new model. Those are the only calls that change
-//! how many rows or cells a mounted container draws, so `sync` publishes to them whenever the
-//! row model changed — not only when the body is first built.
-//!
-//! # RPC answers are attributed by identity
-//!
-//! Both bridges replace the call before them, and a replaced call's answer can already be in
-//! the inbox. Each bridge therefore keeps its own in-flight command table (`Pending`): the
-//! identity `WidgetBinding::call` returns is what the answer must carry for the pane to apply
-//! it. An answer the table does not know is a late answer to a command the pane replaced — it
-//! is dropped and counted, never applied to whatever command happens to be in flight (AGENTS
-//! §4.4 / §8.2).
-//!
-//! # Where the flash lives
-//!
-//! A cell flashes when its index moves. The flash is driven by the pane rather than by an
-//! animated node, because the flash's opacity is a function of elapsed time that a test can
-//! read: the pane keeps the moves it has seen, writes the visible opacities into a signal
-//! and arms a one-shot timer (E10) that fires the next frame while one is still visible. The
-//! engine's timer is one-shot, so the timer's callback marks itself fired and asks for a
-//! frame, and the following `sync` arms the next tick; a flash that has run its course leaves
-//! no timer behind (I3). The platform's reduce-motion setting turns the flash off entirely —
-//! it is movement, and a reader who asked for less of it does not want a market's worth of
-//! it.
-//!
-//! # The selector
-//!
-//! Choosing indices is the selector's business (`dialog.rs`): the header's control only
-//! writes the request, `sync` opens the dialog where a `WidgetCx` exists, and a
-//! confirmation arrives as the whole selection through a signal — the dialog never holds a
-//! handle to the pane.
-
 use std::{
     cell::Cell,
     rc::Rc,
@@ -132,24 +62,15 @@ use super::{
     },
 };
 
-/// How long a flash stays on the cell of an index that moved.
 const FLASH_DURATION: Duration = Duration::from_millis(350);
-/// The point of a flash at which it is at its strongest.
 const FLASH_PEAK: Duration = Duration::from_millis(100);
-/// How often a visible flash moves, which is one display frame.
 const FLASH_TICK: Duration = Duration::from_millis(16);
-/// How tall the flash bar across the top of a grid cell is.
 const GRID_FLASH_HEIGHT: f32 = 6.0;
-/// The width of one grid cell, which is also the unit the column count is fitted in.
 const GRID_CELL_WIDTH: f32 = 160.0;
-/// The height of one grid line, which is one cell tall.
 const GRID_CELL_HEIGHT: f32 = 88.0;
-/// The table's columns, in header order.
 const COLUMN_COUNT: usize = 4;
-/// Column widths in header order, as a share of the pane.
 const COLUMN_WEIGHTS: [f32; COLUMN_COUNT] = [0.4, 0.2, 0.2, 0.2];
 
-/// Which of the two ways of drawing an answer a pane uses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FinancialIndexDisplayMode {
     #[default]
@@ -158,10 +79,6 @@ pub enum FinancialIndexDisplayMode {
 }
 
 impl FinancialIndexDisplayMode {
-    /// The glyph this mode is drawn as.
-    ///
-    /// The two are the halves of one switch, so they are drawn as a filled grid of squares
-    /// and as a table: the shape of what the mode draws rather than an abstraction of it.
     const fn icon(self) -> IconKind {
         match self {
             Self::Grid => IconKind::SquaresFour,
@@ -170,11 +87,6 @@ impl FinancialIndexDisplayMode {
     }
 }
 
-/// The indices one pane follows, and how it draws them.
-///
-/// The selection is the pane's scope, so it is decoded through the same validation the
-/// service applies: a persisted selection is either a selection the service can follow or a
-/// configuration error the framework reports.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FinancialIndexConfig {
     selection: Vec<SelectedFinancialIndex>,
@@ -214,7 +126,6 @@ impl<'de> Deserialize<'de> for FinancialIndexConfig {
     }
 }
 
-/// A failure a pane reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FinancialIndexFailure {
     Stream(FinancialIndexStreamError),
@@ -232,14 +143,12 @@ impl TranslatedError for FinancialIndexFailure {
     }
 }
 
-/// One index as a frame draws it: what the pane follows, and what it holds for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FinancialIndexRow {
     index: SelectedFinancialIndex,
     quote: Option<FinancialIndexQuote>,
 }
 
-/// The flash one index left behind the last time its price moved.
 #[derive(Clone, Copy, Debug)]
 struct QuoteFlash {
     direction: FinancialIndexDirection,
@@ -256,22 +165,12 @@ impl QuoteFlash {
     }
 }
 
-/// How strong a flash is at one point of its life, and which way it moved.
-///
-/// It is what a grid cell's bar is drawn from: the pane writes the visible flashes here and
-/// the bar binds its opacity to the entry it owns.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FlashVisual {
     direction: FinancialIndexDirection,
     opacity: f32,
 }
 
-/// The grid's fixed-cell layout.
-///
-/// The viewport width alone decides the column count, and the remaining cells wrap into
-/// lines. The cells keep the width the old grid gave them and a line's cells are centred as
-/// one block, which is what the old canvas did: `floor(width / 160)` cells of exactly 160 px,
-/// with the unused remainder split between the two sides.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GridLayout {
     pub columns: usize,
@@ -279,7 +178,6 @@ pub(crate) struct GridLayout {
     pub cell_height: f32,
 }
 
-/// Resolves the grid's columns from the width it has.
 pub(crate) fn grid_layout(viewport_width: f32, item_count: usize) -> GridLayout {
     if item_count == 0 {
         return GridLayout {
@@ -298,53 +196,37 @@ pub(crate) fn grid_layout(viewport_width: f32, item_count: usize) -> GridLayout 
     }
 }
 
-/// What a header control asks the pane to do.
-///
-/// The control's handler owns no widget, so it writes the request and the pane's `sync`
-/// performs it where a context exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeaderRequest {
-    /// Open the selector over the pane's window.
     Choose,
-    /// Draw the rows the other way.
     Mode(FinancialIndexDisplayMode),
 }
 
-/// The command the stream's binding has in flight, so an answer can be attributed to it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamCommand {
-    /// Follow the scope for the first time after a load.
     Load,
-    /// Reopen a scope whose stream failed.
     Retry,
-    /// Follow nothing (nobody signed in, or nothing selected).
     Stop,
 }
 
-/// What the pane's manifest read was asked for, so an answer can be matched to it.
 #[derive(Clone, Debug)]
 struct ManifestSettlement {
     asked: Vec<SelectedFinancialIndex>,
     retry: bool,
 }
 
-/// The header's left group: the control that opens the selector.
 struct HeaderLeft {
     parent: NodeId,
     wrapper: NodeId,
     choose: Button,
-    /// What the control's static copy was built with: the language, and whether the reader
-    /// had an account to choose indices for.
     built: (LanguageCode, bool),
 }
 
-/// One half of the display-mode switch.
 struct ModeControl {
     wrapper: NodeId,
     button: Button,
 }
 
-/// The header's right group: the two halves of the display-mode switch.
 struct HeaderRight {
     parent: NodeId,
     grid: ModeControl,
@@ -352,27 +234,20 @@ struct HeaderRight {
     built: LanguageCode,
 }
 
-/// The grid's component: one virtualized list of lines, each line holding cells.
 struct GridBody {
     wrapper: NodeId,
     list: List,
-    /// How many cells a line holds, which is what the row factory reads.
     columns: Rc<Cell<usize>>,
-    /// How many cells there are, which is what the row factory reads.
     count: Rc<Cell<usize>>,
-    /// How many columns the mounted rows were built for.
     built_columns: usize,
-    /// How many lines the mounted list holds.
     built_lines: usize,
 }
 
-/// The table's component.
 struct TableBody {
     wrapper: NodeId,
     table: Table,
 }
 
-/// The content under the body's frame: one of the two ways of drawing the rows.
 enum BodyContent {
     Grid(GridBody),
     Table(TableBody),
@@ -387,19 +262,11 @@ impl BodyContent {
     }
 }
 
-/// One pane: the rows it draws, the scope it follows, and its two ways of drawing.
 pub struct FinancialIndexWidget {
     config: FinancialIndexConfig,
-    /// The executor bridge for the scope's stream, when this host has a Kytrix service
-    /// connection to drive. A host without one reports the stream as unavailable rather than
-    /// starting a service it could never answer.
     stream: Option<WidgetBinding<FinancialIndexProtocol>>,
-    /// The executor bridge for the one-shot manifest reads, kept apart from the stream's so a
-    /// catalogue read cannot replace the command that started the subscription.
     manifest: Option<WidgetBinding<FinancialIndexProtocol>>,
-    /// The stream command in flight, keyed by the identity its answer will carry.
     stream_pending: Pending<StreamCommand>,
-    /// What the manifest read in flight was asked about, keyed by its identity.
     manifest_pending: Pending<ManifestSettlement>,
     status: WidgetStatus,
     recovery: WidgetAction,
@@ -407,48 +274,25 @@ pub struct FinancialIndexWidget {
     translate: Translate,
     theme: ThemeHandle,
     language: Signal<LanguageCode>,
-    /// The account the pane reads for, which is half of every scope it opens.
     account_id: Option<SmolStr>,
-    /// The quotes of the scope the pane is following, once some have arrived.
     quotes: Option<Arc<HashMap<FinancialIndexTopic, FinancialIndexQuote>>>,
-    /// The scope those quotes were published for.
-    ///
-    /// It is also what makes the pane content: quotes for a selection the user has left are
-    /// not this pane's to draw.
     accepted: Option<FinancialIndexScope>,
-    /// Whether the scope's subscription has reported itself ready.
     ready: bool,
-    /// The rows a frame draws.\r
     rows: Arc<[FinancialIndexRow]>,
-    /// The rows the cells read.
     rows_signal: Signal<Arc<[FinancialIndexRow]>>,
-    /// Whether the pane behind the rows is working, which is what a row without a quote says
-    /// instead of a number.
     busy: bool,
     busy_signal: Signal<bool>,
-    /// Whether the components under the body are behind the rows the pane holds.
     rows_dirty: bool,
-    /// The flash each index left behind the last time its price moved.
     flashes: HashMap<FinancialIndexTopic, QuoteFlash>,
-    /// The flashes still visible, as the grid's bars draw them.
     flash_signal: Signal<Arc<HashMap<FinancialIndexTopic, FlashVisual>>>,
-    /// The one-shot timer that moves a visible flash to its next frame.
     flash_timer: Option<TimerId>,
-    /// Whether the timer in [`Self::flash_timer`] has fired and the next sync has to arm the
-    /// following tick.
     flash_timer_fired: Rc<Cell<bool>>,
-    /// The node the body's frame was built as; the content is (re)built under it.
     content_slot: Option<NodeId>,
-    /// The content under the frame, once the body has been built.
     content: Option<BodyContent>,
-    /// What the content was built for, so a mode or language change rebuilds it.
     built_mode: Option<FinancialIndexDisplayMode>,
     built_language: Option<LanguageCode>,
-    /// The selector opened from the header, while it is open.
     selector: Option<IndexSelector>,
-    /// The request a header control wrote, waiting for the next `sync`.
     requests: Signal<Option<HeaderRequest>>,
-    /// The selection the selector confirmed, waiting for the next `sync`.
     confirmed: Signal<Option<Vec<SelectedFinancialIndex>>>,
     header_left: Option<HeaderLeft>,
     header_right: Option<HeaderRight>,
@@ -489,18 +333,10 @@ impl WidgetView for FinancialIndexWidget {
         self.start(retry, cx);
     }
 
-    /// The options this widget persists.
-    ///
-    /// The framework asks for these to write the pane back, so this answers with the field
-    /// itself rather than computing anything.
     fn config(&self) -> Option<&Self::Config> {
         Some(&self.config)
     }
 
-    /// A pane is content once it holds quotes for the scope it is following.
-    ///
-    /// Holding quotes for a selection the user has left is not content: the pane is waiting
-    /// for the new selection to arrive, and it says so.
     fn has_content(&self) -> bool {
         self.accepted.is_some() && self.accepted == self.current_scope()
     }
@@ -532,10 +368,6 @@ impl WidgetView for FinancialIndexWidget {
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        // The account is the pane's scope, and the user can change it while the pane is open:
-        // signing out has to take the indices with it, and signing in has to read. The
-        // settings snapshot is read without registering a dependency — the framework's
-        // surface root owns that edge and schedules this frame.
         let account = cx.account();
         if account != self.account_id {
             self.account_id = account;
@@ -553,8 +385,6 @@ impl WidgetView for FinancialIndexWidget {
             }
         }
 
-        // A control's handler owns no widget: it wrote the request, and this is where a
-        // widget context exists to perform it.
         let request = *cx.read(&self.requests);
         if let Some(request) = request {
             cx.write(&self.requests, None);
@@ -575,8 +405,6 @@ impl WidgetView for FinancialIndexWidget {
             }
         }
 
-        // The content is rebuilt only when what it was built for moved: a mode switch, or the
-        // language its static copy is resolved in.
         let language = *cx.read(&self.language);
         let stale = self.built_mode != Some(self.config.mode)
             || (matches!(self.config.mode, FinancialIndexDisplayMode::Table)
@@ -585,9 +413,6 @@ impl WidgetView for FinancialIndexWidget {
             self.rebuild_content(cx)?;
         }
 
-        // The rows a frame draws changed, and the container under the body draws them: telling
-        // only the cells would leave a row the user just selected invisible, and a row they
-        // just removed behind.
         if self.rows_dirty {
             self.rows_dirty = false;
             self.publish_rows(cx);
@@ -597,8 +422,6 @@ impl WidgetView for FinancialIndexWidget {
         self.settle_flashes(cx);
         self.sync_header(cx)?;
 
-        // The framework sampled `has_content` before this hook ran, so a body that first
-        // appeared in this frame shows on the next one; ask for it.
         if self.has_content() && self.content.is_none() {
             let _ = cx.request_frame();
         }
@@ -625,28 +448,20 @@ impl WidgetView for FinancialIndexWidget {
     }
 
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
-        // The flash timer holds no widget, but it would ask for frames for a pane that is
-        // gone: a released pane leaves no wakeup behind.
         self.stop_flash_timer(cx.app_mut());
         if let Some(mut selector) = self.selector.take() {
             selector.release(cx);
         }
-        // The content's nodes are removed by the framework after this hook, so the components
-        // are released here while their nodes are still alive.
         self.release_content(cx);
-        // The header's nodes belong to the pane, which removes its row: only the components'
-        // signal scopes and action handlers are this widget's to release.
         if let Err(error) = self.release_header(cx, false) {
             log::error!("the financial index header could not be released: {error}");
         }
-        // Dropping the bridges aborts their forwarding tasks and cancels the services.
         self.stream = None;
         self.manifest = None;
     }
 }
 
 impl FinancialIndexWidget {
-    /// Builds a pane over the collaborators a caller hands it.
     fn assemble(
         config: FinancialIndexConfig,
         source: Option<KytrixServiceConnector>,
@@ -671,12 +486,6 @@ impl FinancialIndexWidget {
         )
     }
 
-    /// Builds a pane over a test's own source.
-    ///
-    /// The framework's headless host composes the services without a Kytrix service
-    /// connection (the connector still needs the application shell), so an interface test
-    /// constructs the widget directly with the fake source it wants and drives the widget
-    /// hooks itself.
     #[cfg(test)]
     fn with_source<S: FinancialIndexSource>(
         config: FinancialIndexConfig,
@@ -717,8 +526,6 @@ impl FinancialIndexWidget {
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
         let language = cx.language();
-        // The pane records the account it was built for, but it starts nothing: the framework
-        // calls `load` once construction is done.
         let account_id = cx.account();
 
         Self {
@@ -758,22 +565,14 @@ impl FinancialIndexWidget {
         }
     }
 
-    /// The scope this pane follows, which is its account and its selection.
     fn current_scope(&self) -> Option<FinancialIndexScope> {
         FinancialIndexScope::new(self.account_id.as_ref(), &self.config.selection)
     }
 
-    /// Settles the stored selection against what the service carries, and follows it.
-    ///
-    /// A recovery keeps the quotes the user is still reading — blanking them to reconnect
-    /// would flash a screen of numbers away — while an explicit change of scope starts over,
-    /// because the pane cannot vouch for what it was showing.
     fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) {
         self.ready = false;
         self.flashes.clear();
         if self.current_scope().is_none() {
-            // Nothing is going to be read for: the read that was in flight (if any) answers a
-            // command this pane has abandoned, and its answer is a late one.
             self.manifest_pending.clear();
             self.follow(retry, cx);
             return;
@@ -781,16 +580,10 @@ impl FinancialIndexWidget {
         if !retry {
             self.clear_quotes(cx);
         }
-        // A selected index the manifest no longer carries is settled before the pane
-        // subscribes to it: subscribing first would report a failure about a scope the user
-        // cannot return to anyway. The read is work this pane is doing, so it reports
-        // connecting while it is in flight — the request that follows is what connects.
         self.status.report(cx.app_mut(), WidgetState::Connecting);
         let _ = cx.request_frame();
         let asked = self.config.selection.clone();
         let Some(binding) = self.manifest.as_mut() else {
-            // There is no service to ask, so there is nothing to settle: following reports
-            // the failure the reader can recover from.
             self.follow(retry, cx);
             return;
         };
@@ -799,14 +592,9 @@ impl FinancialIndexWidget {
             .track(request_id, ManifestSettlement { asked, retry });
     }
 
-    /// Follows the scope the config now holds, or says what the pane is waiting for.
     fn follow(&mut self, retry: bool, cx: &mut WidgetCx<'_>) {
         let Some(scope) = self.current_scope() else {
             self.clear_quotes(cx);
-            // The key is written where the notice is reported rather than handed to the
-            // framework through a helper, so what the pane says is readable here: with nobody
-            // signed in the pane sends the reader to the account settings, and with an account
-            // it asks for a selection.
             let notice = if self.account_id.is_none() {
                 Notice::message("widget.financial_index.logged_out")
             } else {
@@ -814,8 +602,6 @@ impl FinancialIndexWidget {
             };
             self.status
                 .report(cx.app_mut(), WidgetState::waiting(notice));
-            // Nothing is followed, so nothing should stay subscribed on this pane's behalf: an
-            // account that signed out must not keep a seat it is not using.
             if let Some(binding) = self.stream.as_mut() {
                 let request_id = binding.call(cx, FinancialIndexRequest::Stop);
                 self.stream_pending.track(request_id, StreamCommand::Stop);
@@ -848,7 +634,6 @@ impl FinancialIndexWidget {
         let _ = cx.request_frame();
     }
 
-    /// Drops the quotes of a scope the pane is leaving.
     fn clear_quotes(&mut self, cx: &mut WidgetCx<'_>) {
         self.quotes = None;
         self.accepted = None;
@@ -857,7 +642,6 @@ impl FinancialIndexWidget {
         self.publish_rows(cx);
     }
 
-    /// Applies one message the stream's binding delivered.
     fn apply_stream(&mut self, inbound: Inbound<FinancialIndexProtocol>, cx: &mut WidgetCx<'_>) {
         match inbound {
             Inbound::Reliable { key, message } => self.apply_reliable(key, &message, cx),
@@ -868,13 +652,6 @@ impl FinancialIndexWidget {
         }
     }
 
-    /// Applies the answer to a command the stream's service was given.
-    ///
-    /// The arrival of the stream's own reports is what a row draws its state from; an
-    /// accepted command is only the service saying it took the scope. The answer is applied
-    /// only if the identity is the command this pane is waiting for: an answer to a command
-    /// that was replaced (a load for a scope the user has left, say) is a late answer, and it
-    /// must not fail the pane that is now waiting for something else.
     fn apply_stream_rpc(
         &mut self,
         request_id: RequestId,
@@ -891,7 +668,6 @@ impl FinancialIndexWidget {
             return;
         };
         if !matches!(command, StreamCommand::Load | StreamCommand::Retry) {
-            // A refused stop leaves nothing behind to report: the pane follows nothing.
             return;
         }
         if self.status.is_failed(cx.app()) || self.current_scope().is_none() {
@@ -905,7 +681,6 @@ impl FinancialIndexWidget {
         let _ = cx.request_frame();
     }
 
-    /// Applies one answer the manifest's binding delivered.
     fn apply_manifest(&mut self, inbound: Inbound<FinancialIndexProtocol>, cx: &mut WidgetCx<'_>) {
         let Inbound::Rpc { request_id, result } = inbound else {
             return;
@@ -917,21 +692,14 @@ impl FinancialIndexWidget {
             );
             return;
         };
-        // An answer about a selection the user has left, or a pane that signed out while it
-        // was being read, is not this pane's to act on: what replaced it started a subscription
-        // of its own.
         if self.current_scope().is_none() || self.config.selection != pending.asked {
             return;
         }
         let outcome = match result {
             Ok(FinancialIndexResponse::Manifest { catalog, .. }) => Ok(catalog),
-            // The protocol types the answer, so this is a service that answered the wrong
-            // question rather than a shape a reader could describe.
             Ok(_) => Err(KytrixServiceError::Protocol(SmolStr::new_static(
                 "the service answered a catalogue read with something else",
             ))),
-            // A read that was not answered proves nothing about the selection: the service may
-            // simply not have answered, and the subscription reports its own error.
             Err(_) => Err(KytrixServiceError::Closed),
         };
         if !self.settle_selection(pending.asked, outcome, cx) {
@@ -940,14 +708,6 @@ impl FinancialIndexWidget {
         self.follow(pending.retry, cx);
     }
 
-    /// Drops the selected indices the manifest no longer carries.
-    ///
-    /// Returns whether this answer still describes the selection the pane follows, which is
-    /// what decides whether the subscription for it starts. A read that failed proves nothing
-    /// — the service may simply not have answered — so the selection is kept and the
-    /// subscription reports its own error, which the user can recover from. Losing every index
-    /// goes back to "nothing chosen", which is the pane's own waiting state rather than an
-    /// error.
     fn settle_selection(
         &mut self,
         asked: Vec<SelectedFinancialIndex>,
@@ -984,11 +744,6 @@ impl FinancialIndexWidget {
         true
     }
 
-    /// Applies a status the stream reported.
-    ///
-    /// Returns whether what a frame draws changed, which is what the framework turns into a
-    /// repaint: a status is drawn by the framework around the body, but the rows say what they
-    /// are still waiting for, and those are the widget's.
     fn apply_reliable(
         &mut self,
         key: FinancialIndexScope,
@@ -1009,9 +764,6 @@ impl FinancialIndexWidget {
             }
             FinancialIndexStatus::Ready => {
                 self.ready = true;
-                // Readiness is published at the protocol's own boundary: a ready subscription
-                // is not the same thing as the quotes it describes having arrived, and this is
-                // where the two meet.
                 if self.has_content() {
                     self.status.report(cx.app_mut(), WidgetState::Ready);
                 } else {
@@ -1035,7 +787,6 @@ impl FinancialIndexWidget {
         let _ = cx.request_frame();
     }
 
-    /// Applies the quotes the stream published.
     fn apply_latest(
         &mut self,
         key: FinancialIndexScope,
@@ -1059,12 +810,6 @@ impl FinancialIndexWidget {
         let _ = cx.request_frame();
     }
 
-    /// Notes the indices whose price moved, which is what a cell flashes for.
-    ///
-    /// The first quotes of a scope are where it starts rather than a move, so a pane that
-    /// opens on a market does not flash its whole selection at once. A flash belongs to the
-    /// grid, which is the only one of the two ways of drawing a row with room for it: a table
-    /// that flashed would ask for frames nobody can see.
     fn mark_flashes(
         &mut self,
         quotes: &HashMap<FinancialIndexTopic, FinancialIndexQuote>,
@@ -1097,7 +842,6 @@ impl FinancialIndexWidget {
         }
     }
 
-    /// Rebuilds the rows a frame draws, and tells the cells about them.
     fn publish_rows(&mut self, cx: &mut WidgetCx<'_>) {
         let busy = self.status.is_busy(cx.app());
         let rows = rows_of(&self.config.selection, self.quotes.as_deref());
@@ -1111,12 +855,6 @@ impl FinancialIndexWidget {
         cx.write(&self.busy_signal, busy);
     }
 
-    /// Tells the content under the frame what the rows are now.
-    ///
-    /// A row was added, removed, or the width moved the columns: the mounted container has to
-    /// be told, because its factories only re-run against the model when its count changes.
-    /// Rows whose count did not change are left alone — their cells read the row signal, so a
-    /// quote that moved is a `bind_*` recompute rather than a rebuild.
     fn publish_rows_to_content(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let rows = self.rows.len();
         let width = self.viewport_width(cx);
@@ -1148,7 +886,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Keeps the grid's column count abreast of the width it has.
     fn sync_grid_columns(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let rows = self.rows.len();
         let width = self.viewport_width(cx);
@@ -1173,15 +910,12 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// The width the frame was laid out with, which is what the grid fits its cells into.
     fn viewport_width(&self, cx: &WidgetCx<'_>) -> f32 {
         self.content_slot
             .and_then(|slot| cx.tree().get(slot).ok())
             .map_or(0.0, |node| node.layout().bounds.size.width)
     }
 
-    /// Writes the flashes that are still visible, and keeps the next frame coming while some
-    /// are.
     fn settle_flashes(&mut self, cx: &mut WidgetCx<'_>) {
         let now = Instant::now();
         self.flashes.retain(|_, flash| flash.is_active(now));
@@ -1203,19 +937,10 @@ impl FinancialIndexWidget {
         }
     }
 
-    /// Arms the one-shot timer that moves a visible flash to its next frame.
-    ///
-    /// The engine's `App::after` timer is one-shot: it is dispatched once and removed from the
-    /// table. The callback therefore marks itself fired and asks for a frame; the `sync` that
-    /// frame routes arms the following tick while the flash is still visible. Without that
-    /// second half the pane would only ever be timed once, and a frame whose flash opacity did
-    /// not happen to change would leave the bar half-faded.
     fn arm_flash_timer(&mut self, cx: &mut WidgetCx<'_>) {
         if self.flash_timer.is_some() && !self.flash_timer_fired.get() {
             return;
         }
-        // The fired timer is gone from the engine's table; the id in the field only makes a
-        // `cancel_timer` that is now a no-op.
         self.flash_timer_fired.set(false);
         self.flash_timer = None;
         let fired = Rc::clone(&self.flash_timer_fired);
@@ -1230,14 +955,12 @@ impl FinancialIndexWidget {
         }
     }
 
-    /// Stops the flash timer, if one is armed.
     fn stop_flash_timer(&mut self, app: &mut App) {
         if let Some(timer) = self.flash_timer.take() {
             app.cancel_timer(&timer);
         }
     }
 
-    /// Performs one request a header control wrote.
     fn apply_request(
         &mut self,
         request: HeaderRequest,
@@ -1245,10 +968,6 @@ impl FinancialIndexWidget {
     ) -> Result<(), EngineError> {
         match request {
             HeaderRequest::Choose => {
-                // The control is drawn disabled without an account, and a disabled kit control
-                // only paints its state: the entry is the guard that keeps a handler that
-                // outlived the sign-out from opening a selector with nothing to list (AGENTS
-                // §4.2).
                 if self.account_id.is_none() || self.selector.is_some() {
                     return Ok(());
                 }
@@ -1270,7 +989,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Follows the indices the user confirmed in the selector.
     fn select_indices(&mut self, indices: Vec<SelectedFinancialIndex>, cx: &mut WidgetCx<'_>) {
         let selection = match normalize_selection(&indices) {
             Ok(selection) => selection,
@@ -1295,19 +1013,15 @@ impl FinancialIndexWidget {
         self.start(false, cx);
     }
 
-    /// Switches the way the rows are drawn.
     fn set_mode(&mut self, mode: FinancialIndexDisplayMode, cx: &mut WidgetCx<'_>) {
         if self.config.mode == mode {
             return;
         }
-        // Both modes draw the rows the pane already holds, so this re-reads nothing and
-        // carries no scroll position across: the two do not scroll alike.
         self.config.mode = mode;
         self.config_change.publish(cx.app_mut());
         let _ = cx.request_frame();
     }
 
-    /// Builds the content under the body's frame for the current mode.
     fn build_content(&mut self, slot: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let language = *cx.read(&self.language);
         let content = match self.config.mode {
@@ -1322,7 +1036,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Rebuilds the content after the mode (or the table's static copy) moved.
     fn rebuild_content(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(slot) = self.content_slot else {
             return Ok(());
@@ -1333,8 +1046,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Removes the content's nodes (when this widget owns the teardown) and releases its
-    /// component.
     fn release_content(&mut self, cx: &mut WidgetCx<'_>) {
         let Some(content) = self.content.take() else {
             return;
@@ -1358,7 +1069,6 @@ impl FinancialIndexWidget {
         self.built_language = None;
     }
 
-    /// Builds the grid: fixed-size cells in fixed-height lines of the engine's virtual list.
     fn build_grid(
         &mut self,
         parent: NodeId,
@@ -1378,8 +1088,6 @@ impl FinancialIndexWidget {
         let layout = grid_layout(self.viewport_width(cx), self.rows.len());
         let columns = Rc::new(Cell::new(layout.columns.max(1)));
         let columns_for_rows = Rc::clone(&columns);
-        // The list has not been told about any rows yet: `publish_rows_to_content` is what
-        // mounts them, and it has to see that it still owes the container its count.
         let count = Rc::new(Cell::new(0));
         let count_for_rows = Rc::clone(&count);
         let rows = self.rows_signal;
@@ -1390,8 +1098,6 @@ impl FinancialIndexWidget {
         let font_size = self.theme.tokens().small.font_size;
         let large_font_size = self.theme.tokens().large.font_size;
         let key = cx.unique_key("financial_index.grid");
-        // The cells are exactly as wide as the column count says they are, so the line padding
-        // would shrink the line's width behind the count's back: the grid owns its own layout.
         let options = ListOptions {
             padding_x: 0.0,
             padding_y: 0.0,
@@ -1430,7 +1136,6 @@ impl FinancialIndexWidget {
         })
     }
 
-    /// Builds the table: the shared table draws the header and virtualizes the rows.
     fn build_table(
         &mut self,
         parent: NodeId,
@@ -1488,7 +1193,6 @@ impl FinancialIndexWidget {
         Ok(TableBody { wrapper, table })
     }
 
-    /// Builds the header's left group: the control that opens the selector.
     fn build_header_left(
         &mut self,
         parent: NodeId,
@@ -1526,7 +1230,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Builds the header's right group: the two halves of the display-mode switch.
     fn build_header_right(
         &mut self,
         parent: NodeId,
@@ -1544,12 +1247,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Builds one half of the display-mode switch.
-    ///
-    /// It carries the mode's name as both its accessible name and its tooltip, because a glyph
-    /// on its own is a guess: the mark is the only thing distinguishing the two halves on
-    /// screen. Selecting one is what unselects the other — both read the pane's mode — so
-    /// there is nothing here to keep in step.
     fn build_mode_control(
         &self,
         parent: NodeId,
@@ -1588,7 +1285,6 @@ impl FinancialIndexWidget {
         Ok(ModeControl { wrapper, button })
     }
 
-    /// Rebuilds the header groups whose static copy is no longer the truth.
     fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let language = *cx.read(&self.language);
         let disabled = self.account_id.is_none();
@@ -1643,8 +1339,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Removes the left group's nodes (when this widget owns the teardown) and releases its
-    /// component's scope and action handler.
     fn release_header_left(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1660,8 +1354,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Removes the right group's nodes (when this widget owns the teardown) and releases its
-    /// components.
     fn release_header_right(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1678,7 +1370,6 @@ impl FinancialIndexWidget {
         Ok(())
     }
 
-    /// Releases every header control this widget built.
     fn release_header(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1689,11 +1380,6 @@ impl FinancialIndexWidget {
     }
 }
 
-/// Removes nodes this pane built, if they are still in the tree.
-///
-/// The pane rebuilds its header row, and the control this widget built into the old row went
-/// with it; asking the engine to remove it again would fail the rebuild (`StaleNode`) and
-/// leave the pane without a control.
 fn remove_own_nodes(
     cx: &mut WidgetCx<'_>,
     nodes: impl IntoIterator<Item = NodeId>,
@@ -1708,10 +1394,6 @@ fn remove_own_nodes(
     Ok(())
 }
 
-/// The columns the table declares, in header order.
-///
-/// Built when the table is built, because the kit table takes its headers as resolved text; a
-/// language switch rebuilds the table.
 fn table_columns(translate: &Translate) -> impl Iterator<Item = Column> + '_ {
     [
         t_smol!(translate, "widget.financial_index.index"),
@@ -1732,7 +1414,6 @@ fn table_columns(translate: &Translate) -> impl Iterator<Item = Column> + '_ {
     })
 }
 
-/// The rows a pane draws for one selection.
 fn rows_of(
     selection: &[SelectedFinancialIndex],
     quotes: Option<&HashMap<FinancialIndexTopic, FinancialIndexQuote>>,
@@ -1745,9 +1426,6 @@ fn rows_of(
     rows.into()
 }
 
-/// How strong a flash is at one point of its life: it rises to its peak and falls back to
-/// nothing, which is a triangle rather than a curve because a market does not move smoothly
-/// either.
 fn flash_opacity(elapsed: Duration) -> f32 {
     if elapsed >= FLASH_DURATION {
         return 0.0;
@@ -1759,7 +1437,6 @@ fn flash_opacity(elapsed: Duration) -> f32 {
     }
 }
 
-/// The label of one display mode.
 fn mode_label(mode: FinancialIndexDisplayMode, translate: &Translate) -> SmolStr {
     match mode {
         FinancialIndexDisplayMode::Grid => t_smol!(translate, "widget.financial_index.grid"),
@@ -1767,7 +1444,6 @@ fn mode_label(mode: FinancialIndexDisplayMode, translate: &Translate) -> SmolStr
     }
 }
 
-/// The role an index's move is drawn in.
 fn direction_role(direction: FinancialIndexDirection) -> Role {
     match direction {
         FinancialIndexDirection::Up => Role::MarketUp,
@@ -1776,11 +1452,6 @@ fn direction_role(direction: FinancialIndexDirection) -> Role {
     }
 }
 
-/// The surface an index's cell is tinted with.
-///
-/// A cell is a tinted card, not a depth bar behind one: `market.*_surface` is the chip recipe
-/// §7.5/§7.6 define for a market colour written on its own tint, and it is the pairing §7.8
-/// holds to 4.5:1.
 fn direction_surface(direction: FinancialIndexDirection) -> Role {
     match direction {
         FinancialIndexDirection::Up => Role::MarketUpSurface,
@@ -1789,12 +1460,10 @@ fn direction_surface(direction: FinancialIndexDirection) -> Role {
     }
 }
 
-/// An index's name in the language the interface is reading.
 fn index_name(index: &SelectedFinancialIndex, language: LanguageCode) -> SmolStr {
     SmolStr::new(index.name.get(language))
 }
 
-/// What a row says while it has no quote to show.
 fn pending_text(busy: bool, translate: &Translate) -> SmolStr {
     if busy {
         t_smol!(translate, "common.connecting")
@@ -1803,11 +1472,6 @@ fn pending_text(busy: bool, translate: &Translate) -> SmolStr {
     }
 }
 
-/// One cell of the table, drawn when the table asks for it.
-///
-/// The kit table calls this without an application context, so every dynamic value is a
-/// `bind_*` closure: the text registers its language / rows dependencies, and the colour is
-/// read through the theme on the frame that draws it (AGENTS §7/G3).
 struct TableCellSink {
     rows: Signal<Arc<[FinancialIndexRow]>>,
     busy: Signal<bool>,
@@ -1835,11 +1499,6 @@ impl TableCellSink {
         }
     }
 
-    /// The name of an index, and what its row has to say beside it.
-    ///
-    /// A row that is reconnecting keeps the price it has, so its state is only named when it
-    /// has nothing to show; a market that is closed is a fact about the index rather than
-    /// about the pane, so it is named either way.
     fn build_name(
         &self,
         tree: &mut NodeTree,
@@ -1903,7 +1562,6 @@ impl TableCellSink {
         Ok(())
     }
 
-    /// The latest price, or the dash a row without a quote has for it.
     fn build_price(
         &self,
         tree: &mut NodeTree,
@@ -1938,7 +1596,6 @@ impl TableCellSink {
         Ok(())
     }
 
-    /// The move against the open, in cents.
     fn build_change(
         &self,
         tree: &mut NodeTree,
@@ -1948,7 +1605,6 @@ impl TableCellSink {
         self.build_number(tree, parent, row, NumberColumn::Change)
     }
 
-    /// The move against the open, in percent.
     fn build_change_percent(
         &self,
         tree: &mut NodeTree,
@@ -1994,22 +1650,16 @@ impl TableCellSink {
     }
 }
 
-/// Which number of a row a cell draws.
 #[derive(Clone, Copy)]
 enum NumberColumn {
     Change,
     ChangePercent,
 }
 
-/// The role a price is drawn in.
 fn price_role(quote: Option<FinancialIndexQuote>) -> Role {
     quote.map_or(Role::FgMuted, |quote| direction_role(quote.direction()))
 }
 
-/// One line of the grid, drawn when the list asks for it.
-///
-/// The list calls this without an application context, so the row's dynamic values are
-/// `bind_*` closures over the signals the pane owns (AGENTS §7/G3).
 struct GridSink {
     rows: Signal<Arc<[FinancialIndexRow]>>,
     count: Rc<Cell<usize>>,
@@ -2023,9 +1673,6 @@ struct GridSink {
 }
 
 impl GridSink {
-    /// Builds one line of the grid: one position per column, empty where the line is not full,
-    /// so a cell keeps its column no matter how many rows there are. The line is centred as a
-    /// block, which is what the old grid did with the width the columns did not use.
     fn build(&self, tree: &mut NodeTree, parent: NodeId, line: usize) -> Result<(), EngineError> {
         let columns = self.columns.get().max(1);
         let count = self.count.get();
@@ -2061,7 +1708,6 @@ impl GridSink {
         Ok(())
     }
 
-    /// One cell of the grid: the index it draws, its price, its move and its flash.
     fn build_cell(
         &self,
         tree: &mut NodeTree,
@@ -2075,7 +1721,6 @@ impl GridSink {
         self.build_flash(tree, card, index)
     }
 
-    /// The card a cell is: a tinted surface whose colour follows the move.
     fn build_card(
         &self,
         tree: &mut NodeTree,
@@ -2118,7 +1763,6 @@ impl GridSink {
             .build(tree, parent)
     }
 
-    /// The index's name, in the language the interface is reading.
     fn build_name(
         &self,
         tree: &mut NodeTree,
@@ -2148,7 +1792,6 @@ impl GridSink {
         Ok(())
     }
 
-    /// The price, which is what a cell is read for.
     fn build_price(
         &self,
         tree: &mut NodeTree,
@@ -2189,7 +1832,6 @@ impl GridSink {
         Ok(())
     }
 
-    /// The move, and whether the market behind it is trading.
     fn build_details(
         &self,
         tree: &mut NodeTree,
@@ -2284,12 +1926,6 @@ impl GridSink {
         Ok(details)
     }
 
-    /// The flash bar.
-    ///
-    /// It is always laid out (and transparent when nothing moved), so a move does not shift
-    /// the cell's text. The opacity is the pane's own value rather than an engine animation:
-    /// the flash has a shape (rise, then fall) that a single fade cannot express, and a test
-    /// can read the opacity a frame drew.
     fn build_flash(
         &self,
         tree: &mut NodeTree,
@@ -2349,9 +1985,6 @@ mod tests {
         test_support::{self, ACCOUNT, FakeSource, event, selected, topic},
     };
 
-    // ---------------------------------------------------------------- vocabulary
-
-    /// Settings holding `account`, or holding nobody when it is `None`.
     fn settings(account: Option<&str>) -> Config {
         let mut config = Config::default();
         config.account = account.map(|user_id| AccountConfig {
@@ -2362,7 +1995,6 @@ mod tests {
         config
     }
 
-    /// Signs `account` in, or nobody when it is `None`.
     fn set_account(harness: &mut WidgetTestApp, account: Option<&str>) {
         let config = harness.services().config;
         harness.app_mut().write(&config, settings(account));
@@ -2387,10 +2019,6 @@ mod tests {
         FinancialIndexQuote::from_event(&event(topic(code), latest, i64::from(latest)))
     }
 
-    /// A catalogue the service publishes that carries exactly this selection.
-    ///
-    /// The pane settles its selection against the manifest before it subscribes, so a test
-    /// that wants its selection followed has to say the service carries it.
     fn manifest_carrying(selection: &[SelectedFinancialIndex]) -> proto_types::FinancialIndices {
         proto_types::FinancialIndices {
             categories: vec![proto_types::FinancialIndexCategory {
@@ -2415,19 +2043,14 @@ mod tests {
         }
     }
 
-    // --------------------------------------------------------------------- pane
-
     struct Pane {
         widget: FinancialIndexWidget,
         status: WidgetStatus,
         parent: NodeId,
-        /// The signal scope the pane was mounted with: the kit keys it mints carry it.
         scope: SignalScope,
-        /// How many times the pane asked the framework to persist its config.
         publishes: Rc<Cell<usize>>,
     }
 
-    /// Runs `body` with a context over the pane's own scope, the way the framework drives it.
     fn drive<R>(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -2440,16 +2063,9 @@ mod tests {
         body(&mut pane.widget, &mut cx)
     }
 
-    /// The width a test body is laid out with, which is what the grid fits its cells into.
     const BODY_WIDTH: f32 = 640.0;
-    /// The height a test body is laid out with.
     const BODY_HEIGHT: f32 = 480.0;
 
-    /// A config report that counts the writes the pane publishes, and the counter it feeds.
-    ///
-    /// A pane writes its config back only when it changed the selection: a test that asserts
-    /// the counter did not move is asserting the pane did not "settle" a selection nobody
-    /// asked it to.
     fn change_tracker() -> (WidgetConfigChange, Rc<Cell<usize>>) {
         let publishes: Rc<Cell<usize>> = Rc::new(Cell::new(0));
         let counter = Rc::clone(&publishes);
@@ -2459,11 +2075,6 @@ mod tests {
         )
     }
 
-    /// A second pane of the same host, mounted with its own signal scope.
-    ///
-    /// The framework mints one scope per widget mount, and a kit component key carries it;
-    /// a test that asserts two panes do not collide has to mount them the way the framework
-    /// does, not twice through the same context.
     fn peer_pane(
         harness: &mut WidgetTestApp,
         source: FakeSource,
@@ -2503,8 +2114,6 @@ mod tests {
         source.set_manifest(manifest_carrying(&config.selection));
         let scope = harness.scope();
         let status = WidgetStatus::new(harness.app_mut(), scope);
-        // A body parent with a definite size: the grid fits its columns to the width the
-        // frame was laid out with, and a zero-width parent would fit one cell per line.
         let parent = harness.with_cx(|cx| {
             let root = cx.tree().root();
             NodeBuilder::boxed()
@@ -2539,7 +2148,6 @@ mod tests {
         }
     }
 
-    /// A pane created the way the framework creates one: signed in, then one load.
     fn pane(harness: &mut WidgetTestApp, source: FakeSource, config: FinancialIndexConfig) -> Pane {
         set_account(harness, Some(ACCOUNT));
         let mut pane = pane_with(harness, source, config);
@@ -2547,7 +2155,6 @@ mod tests {
         pane
     }
 
-    /// A pane whose manifest the test arranges after construction and before the load.
     fn pane_over(
         harness: &mut WidgetTestApp,
         source: FakeSource,
@@ -2561,7 +2168,6 @@ mod tests {
         pane
     }
 
-    /// A pane nobody is signed in for.
     fn signed_out_pane(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
         set_account(harness, None);
         let mut pane = pane_with(harness, source, config(&[selected("HSI")]));
@@ -2583,8 +2189,6 @@ mod tests {
         settle_frames(harness, pane);
     }
 
-    /// Lets the frame pipeline run a few turns: the content is built on the sync that
-    /// accepted the answer, and the cells are drawn by the frames after it.
     fn settle_frames(harness: &mut WidgetTestApp, pane: &mut Pane) {
         for _ in 0..4 {
             sync(harness, pane);
@@ -2592,8 +2196,6 @@ mod tests {
         }
     }
 
-    /// Lets the host's runtime deliver what the fake session published, and the pane the
-    /// frames it asked for, until `ready` holds.
     fn settle(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -2618,8 +2220,6 @@ mod tests {
         report_quotes_keeping_the_bridge(harness, pane, quotes);
     }
 
-    /// Reports quotes without stopping the stream's bridge, for a test whose pane still has to
-    /// command the service behind it.
     fn report_quotes_keeping_the_bridge(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -2709,7 +2309,6 @@ mod tests {
         harness.text_of(node)
     }
 
-    /// Every node under `root` whose debug id is exactly `id`, in document order.
     fn nodes_with_id(harness: &WidgetTestApp, root: NodeId, id: &str) -> Vec<NodeId> {
         let tree = harness.tree();
         let mut found = Vec::new();
@@ -2725,12 +2324,10 @@ mod tests {
         found
     }
 
-    /// The first node under `parent` whose debug prefix is `prefix`.
     fn find(harness: &WidgetTestApp, parent: NodeId, prefix: &str) -> Option<NodeId> {
         harness.find_by_debug_prefix(parent, prefix)
     }
 
-    /// Every text a node draws under it, which is what a cell is read by.
     fn texts_of(harness: &WidgetTestApp, root: NodeId) -> Vec<String> {
         let tree = harness.tree();
         let mut texts = Vec::new();
@@ -2747,8 +2344,6 @@ mod tests {
         texts
     }
 
-    /// The laid-out box of a node: `(x, y, width, height)`, which is what a cell's geometry is
-    /// asserted by.
     fn place(harness: &WidgetTestApp, node: NodeId) -> (f32, f32, f32, f32) {
         let bounds = harness
             .tree()
@@ -2764,12 +2359,10 @@ mod tests {
         )
     }
 
-    /// The catalogue an answer carries for exactly `selection`.
     fn catalog_carrying(selection: &[SelectedFinancialIndex]) -> FinancialIndexCatalog {
         prepare_catalog(manifest_carrying(selection)).expect("the fixture catalogue is valid")
     }
 
-    /// An accepted catalogue read that carries `selection`.
     fn manifest_answer(
         selection: &[SelectedFinancialIndex],
     ) -> WidgetRpcResult<FinancialIndexProtocol> {
@@ -2779,7 +2372,6 @@ mod tests {
         })
     }
 
-    /// Delivers one answer to the manifest bridge, the way `sync` takes it from the inbox.
     fn deliver_manifest(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -2791,7 +2383,6 @@ mod tests {
         });
     }
 
-    /// Delivers one answer to the stream bridge, the way `sync` takes it from the inbox.
     fn deliver_stream(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -2824,8 +2415,6 @@ mod tests {
         harness.drain();
         (left, right)
     }
-
-    // --------------------------------------------------------------- identity
 
     #[test]
     fn the_widget_should_have_a_stable_identity() {
@@ -2920,8 +2509,6 @@ mod tests {
         assert_eq!(decoded.selection.len(), 1);
     }
 
-    // ------------------------------------------------------------------ flash
-
     #[test]
     fn a_flash_should_rise_to_its_peak_and_fall_back_to_nothing() {
         assert_eq!(flash_opacity(Duration::ZERO), 0.0);
@@ -2949,12 +2536,8 @@ mod tests {
         assert_eq!(flash.opacity(now + FLASH_PEAK), 1.0);
     }
 
-    // ------------------------------------------------------------------- grid
-
     #[test]
     fn a_grid_layout_should_use_every_column_the_whole_width_fits() {
-        // The count is the old one: 640 px is four 160 px cells and 800 px is five (the list's
-        // scroll bar is an overlay, so it takes no width away).
         let narrow = grid_layout(640.0, 12);
         assert_eq!(narrow.columns, 4, "640 px fits four 160 px cells");
         assert_eq!(narrow.lines, 3);
@@ -3008,9 +2591,6 @@ mod tests {
         assert_eq!(index_name(&index, LanguageCode::ZhCn), "HSI Chinese");
     }
 
-    // ------------------------------------------------------------- state paths
-
-    /// Queues a session for the pane to follow and lets its stream start.
     fn follow(harness: &mut WidgetTestApp, pane: &mut Pane, source: &FakeSource) {
         let _control = source.subscribe();
         settle(
@@ -3130,8 +2710,6 @@ mod tests {
         assert!(pane.widget.content.is_some());
     }
 
-    /// Holding quotes for a selection the user has left is not content: the pane is waiting
-    /// for the new selection to arrive, and it says so.
     #[test]
     fn quotes_for_a_scope_the_pane_has_left_should_not_be_content() {
         let source = FakeSource::with_session(4);
@@ -3141,8 +2719,6 @@ mod tests {
         report_quotes(&mut harness, &mut pane, &[("HSI", 101)]);
         assert!(pane.widget.has_content());
 
-        // A selection that moved without the pane having followed it yet: the quotes on
-        // screen belong to the scope the pane has just left.
         pane.widget.config.selection =
             normalize_selection(&[selected("SPX")]).expect("the fixture selection is valid");
 
@@ -3234,7 +2810,6 @@ mod tests {
         report_quotes(&mut harness, &mut pane, &[("HSI", 101)]);
         build_body(&mut harness, &mut pane);
 
-        // The catalogue carries the index the user picks next, so the pane settles on it.
         source.set_manifest(manifest_carrying(&[selected("SPX")]));
         let _next = source.subscribe();
         drive(&mut harness, &mut pane, |widget, cx| {
@@ -3336,7 +2911,6 @@ mod tests {
         assert!(pane.status.is_failed(harness.app()));
 
         let _next = source.subscribe();
-        // The recovery is the framework's `load` again, on the same widget.
         drive(&mut harness, &mut pane, |widget, cx| widget.load(cx));
         settle(
             &mut harness,
@@ -3348,9 +2922,6 @@ mod tests {
         assert_eq!(source.subscribed().len(), 2);
     }
 
-    /// A recovery re-reads the scope instead of starting over: the quotes the reader was
-    /// looking at stay on screen while the stream is reopened. Only an explicit load clears
-    /// them.
     #[test]
     fn the_recovery_should_keep_the_quotes_the_reader_was_reading() {
         let source = FakeSource::with_session(4);
@@ -3388,8 +2959,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------ flash
-
     #[test]
     fn a_price_that_moved_should_flash_and_the_first_quotes_should_not() {
         let source = FakeSource::with_session(4);
@@ -3424,7 +2993,6 @@ mod tests {
         build_body(&mut harness, &mut pane);
         assert_eq!(pane.widget.flashes.len(), 1, "a visible flash is kept");
 
-        // Where a frame of a flash is a third of a second later than the last one.
         pane.widget.flashes.insert(
             topic("HSI"),
             QuoteFlash {
@@ -3524,9 +3092,6 @@ mod tests {
         build_body(&mut harness, &mut pane);
         let first = pane.widget.flash_timer.expect("a visible flash is timed");
 
-        // The engine's timer is one-shot: this round dispatches it, and the sync after it has to
-        // arm the following tick. A re-armed tick is a new identity — the old one is gone from
-        // the engine's table.
         harness.advance(FLASH_TICK);
         sync(&mut harness, &mut pane);
         let next = pane
@@ -3538,7 +3103,6 @@ mod tests {
             "the pane armed the next tick instead of leaving the dispatched one behind"
         );
 
-        // The next tick is dispatched too, and the one after it is armed again.
         harness.advance(FLASH_TICK);
         sync(&mut harness, &mut pane);
         let third = pane
@@ -3566,8 +3130,6 @@ mod tests {
         );
     }
 
-    /// A released pane leaves no timer behind: the timer holds no widget, but it would keep
-    /// asking for frames for a pane that is gone.
     #[test]
     fn releasing_a_flashing_pane_should_cancel_its_timer() {
         let source = FakeSource::with_session(4);
@@ -3592,8 +3154,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------ the content
-
     #[test]
     fn the_table_should_hold_the_rows_the_pane_draws() {
         let source = FakeSource::with_session(4);
@@ -3615,8 +3175,6 @@ mod tests {
         assert_eq!(cell_text(&harness, &pane, 0, 3), "+1.00%");
     }
 
-    /// A mounted table is told the row count the model holds: without that, a selection the
-    /// user grows keeps drawing the rows it was built with and the new index is invisible.
     #[test]
     fn the_table_should_grow_and_shrink_with_the_selection() {
         let source = FakeSource::with_session(8);
@@ -3788,8 +3346,6 @@ mod tests {
         assert!(find(&harness, grid_node, "TEST_INDICES_GRID_CELL").is_some());
     }
 
-    /// The old grid placed each cell at exactly 160 px and centred the block of columns the
-    /// width did not fill; the migrated grid is the same shape, not an equal-share stretch.
     #[test]
     fn the_grid_should_draw_fixed_width_cells_in_a_centered_block() {
         let source = FakeSource::with_session(4);
@@ -3835,8 +3391,6 @@ mod tests {
         );
     }
 
-    /// The list is told how many lines the rows need when the selection changes size: a
-    /// mounted grid whose count was never updated keeps drawing the old number of rows.
     #[test]
     fn the_grid_should_wrap_new_lines_when_the_selection_grows() {
         let source = FakeSource::with_session(8);
@@ -4013,8 +3567,6 @@ mod tests {
         assert!(matches!(pane.widget.content, Some(BodyContent::Grid(_))));
     }
 
-    // --------------------------------------------------------------- manifest
-
     #[test]
     fn a_selected_index_the_manifest_dropped_should_go_away() {
         let source = FakeSource::with_session(4);
@@ -4040,8 +3592,6 @@ mod tests {
         let source = FakeSource::with_session(4);
         let mut harness = test_support::harness();
         let mut pane = pane_over(&mut harness, source, config(&[selected("HSI")]), |source| {
-            // A catalogue the service could not have published: it references a
-            // category it does not define, which is what a malformed answer looks like.
             source.set_manifest(proto_types::FinancialIndices {
                 categories: Vec::new(),
                 indices: vec![proto_types::FinancialIndexDefinition {
@@ -4110,17 +3660,11 @@ mod tests {
         );
     }
 
-    /// A catalogue read the pane replaced can still be answered: its identity is no longer in
-    /// the in-flight table, so the answer is dropped. Attributed by "a read is pending" instead,
-    /// the old answer settles the *new* selection against the old catalogue — every index looks
-    /// dropped and the empty selection is written back.
     #[test]
     fn a_late_catalogue_answer_should_not_settle_the_new_selection() {
         let source = FakeSource::with_session(4);
         let mut harness = test_support::harness();
         let mut pane = pane(&mut harness, source, config(&[selected("HSI")]));
-        // The load's read (identity 1) is in flight; the user changes the selection before it
-        // answers, so a read for the new selection (identity 2) replaces it.
         drive(&mut harness, &mut pane, |widget, cx| {
             widget.select_indices(vec![selected("SPX")], cx)
         });
@@ -4130,7 +3674,6 @@ mod tests {
             "the new selection was written once"
         );
 
-        // The replaced read answers with the catalogue it was asked about (HSI only).
         deliver_manifest(
             &mut harness,
             &mut pane,
@@ -4154,7 +3697,6 @@ mod tests {
             "the late answer was dropped and counted"
         );
 
-        // The read that is actually in flight still answers, and it is not counted as dropped.
         deliver_manifest(
             &mut harness,
             &mut pane,
@@ -4169,22 +3711,17 @@ mod tests {
         );
     }
 
-    /// The stream bridge replaces the call before it too: a refusal queued for the command that
-    /// was replaced may not paint the pane as failed.
     #[test]
     fn a_replaced_commands_failure_should_not_fail_the_pane() {
         let source = FakeSource::with_session(4);
         let mut harness = test_support::harness();
         let mut pane = pane(&mut harness, source, config(&[selected("HSI")]));
-        // The load's catalogue read answers, which starts the stream's load (identity 1).
         deliver_manifest(
             &mut harness,
             &mut pane,
             RequestId::new(1),
             manifest_answer(&[selected("HSI")]),
         );
-        // The user picks another index: its read (identity 2) answers and the stream's load for
-        // the new scope (identity 2) replaces the first one.
         drive(&mut harness, &mut pane, |widget, cx| {
             widget.select_indices(vec![selected("SPX")], cx)
         });
@@ -4229,8 +3766,6 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------------- header
-
     #[test]
     fn the_header_should_offer_the_selector_a_signed_in_pane_can_open() {
         let source = FakeSource::with_session(4);
@@ -4270,8 +3805,6 @@ mod tests {
         );
     }
 
-    /// A disabled control only paints its state; its handler still runs when the action is
-    /// dispatched. The entry has to refuse the request, not trust the disabled bit.
     #[test]
     fn a_signed_out_pane_should_not_open_the_selector_from_its_header() {
         let mut harness = test_support::harness();
@@ -4342,7 +3875,6 @@ mod tests {
         let mut harness = test_support::harness();
         let mut pane = pane(&mut harness, source.clone(), config(&[selected("HSI")]));
         follow(&mut harness, &mut pane, &source);
-        // The catalogue carries the confirmed index, so the pane settles on it.
         source.set_manifest(manifest_carrying(&[selected("SPX")]));
         let _next = source.subscribe();
 
@@ -4423,8 +3955,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------ many panes
-
     #[test]
     fn two_panes_should_keep_their_own_header_handlers() {
         let source = FakeSource::with_session(4);
@@ -4465,8 +3995,6 @@ mod tests {
         assert!(harness.app().has_action_handler(&first_action));
         assert!(harness.app().has_action_handler(&second_action));
 
-        // The first pane is released the way the framework releases it: its own handler
-        // goes with it, and the second pane's stays.
         drive(&mut harness, &mut first, |widget, cx| widget.release(cx));
         assert!(!harness.app().has_action_handler(&first_action));
         assert!(
@@ -4523,8 +4051,6 @@ mod tests {
             "the content the pane built is removed"
         );
 
-        // The release's own frame first: what follows is only a lingering wakeup, and a pane
-        // that is gone may not ask for one.
         harness.drain();
         let requests = harness.frame_requests();
         harness.drain();

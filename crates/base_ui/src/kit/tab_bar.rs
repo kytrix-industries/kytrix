@@ -1,46 +1,3 @@
-//! 标签栏（旧 `crate::tab_bar` 的引擎化重建，P2-4a）。
-//!
-//! 旧实现依赖 旧输入组件库 的 `Tabs` / `Tab`：轨道（`surface.sunken`）里放标签，`Fade` 模式给每个
-//! 标签做背景色过渡，`Slide` 模式用 `on_prepaint` 量每个标签的 bounds 再驱动一条 `spring` 指示条。
-//! 新引擎没有布局后量测钩子，也没有 spring；本实现用**帧同步**取几何、用 `Transient<f32>` +
-//! `App::animate` 做插值：
-//!
-//! ```text
-//! build: 轨道(List) → 行(relative) → 指示条(LayoutOverride) + N 个标签(Interactive)
-//! sync : 读选中 → 每个标签的 hover/focus/selected；Slide 模式按标签当前布局盒
-//!        算指示条目标，目标变化时 animate(left/width/height)，每帧写 LayoutOverride
-//! ```
-//!
-//! # 交互
-//!
-//! - 点击标签（或焦点标签上的 Enter/Space）选中它并调 `on_change(index)`；
-//! - **键盘方向键**：`Left` / `Right` 用 E8 的 `App::bind_key_scoped` 绑在**行节点**上 —— 只有焦点
-//!   落在本标签栏子树内时才消费，同屏多个标签栏 / 滚动容器的方向键互不干扰；移动后焦点跟到新标签；
-//! - **关闭按钮**：`closable(true)` 且标签数 > 1 时每个标签右侧画一个 X（旧实现同样在只剩一个标签
-//!   时隐藏关闭按钮）；点击只调 `on_close(index)`，不改变选中（调用方负责移除标签并重挂）；尺寸与
-//!   颜色按旧实现（12 / 16 / 20 px 方框 + 满尺寸 X、常态 `fg.muted`、hover 洗色）；
-//! - 标签宽度上限 160 px（旧 `.max_w_40()`），超长文本用 `TextOverflow::Ellipsis` 截断；
-//! - 溢出滚动：旧 `tab_bar` **没有**滚动（评估 §7.1：386 行里无滚动容器），本批同样不做。
-//!
-//! # 动画
-//!
-//! `Fade`：标签背景 / 文字色由 [`Interactive`] 的状态过渡（150 ms）；`Slide`：指示条位置 / 宽度由
-//! 引擎动画时钟插值，**标签自己不画填充**（旧实现把 tab `bg` 强制透明，填充只由指示条承担）。
-//! 两者都不建应用层帧循环，稳态不出帧（I3）。
-//!
-//! # 生命周期
-//!
-//! 标签 / 关闭按钮的 handler 持有 `Rc<TabBarInner>`（选中与关闭回调要能跨帧读配置），因此
-//! [`TabBar::release`] 必须调用：它摘 scoped 键、Action handler、各 Interactive 的 scope，并清空
-//! 标签表以打断 `Rc` 环。
-//!
-//! # a11y
-//!
-//! 引擎 `A11yRole` **没有 `Tab` / `TabList`**（§7.4 只有列表 / 表格 / 树；E9 也没有加）。本批用
-//! `List`（轨道）+ `ListBoxOption`（标签）表达：标签声明可访问名、`pos_in_set` / `size_of_set` 与
-//! `selected`。Tabs 模式的 AT 专有语义（方向键树内导航 / `aria-controls` 关系）登记为缺口，待引擎
-//! 补角色（登记见 spec-delta §4）。
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -76,34 +33,24 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-/// 轨道圆角（旧 `rounded_sm`）。
 const TRACK_RADIUS: f32 = 4.0;
-/// 轨道内边距（旧 `.p_1()` = 4 px）。
 const TRACK_PADDING: f32 = 4.0;
-/// 标签间距（旧 `.gap_1()` = 4 px）。
 const TAB_GAP: f32 = 4.0;
-/// 标签宽度上限（旧 `.max_w_40()` = 160 px；超出用省略号截断）。
 const TAB_MAX_WIDTH: f32 = 160.0;
 
-/// 指示条动画模式。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IndicatorAnimation {
-    /// 选中标签的背景色过渡（旧默认）。
     #[default]
     Fade,
-    /// 一条滑动的选中指示条。
     Slide,
 }
 
-/// 一个标签。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabItem {
-    /// 显示文本（同时是可访问名）。
     pub label: SmolStr,
 }
 
 impl TabItem {
-    /// 文本标签。
     #[must_use]
     pub fn new(label: impl Into<SmolStr>) -> Self {
         Self {
@@ -112,14 +59,10 @@ impl TabItem {
     }
 }
 
-/// 标签栏参数。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TabBarOptions {
-    /// 尺寸档（高度 / 内边距 / 字号）。
     pub size: UnifiedSize,
-    /// 指示条动画。
     pub indicator: IndicatorAnimation,
-    /// 是否显示关闭按钮（标签数 > 1 时才画）。
     pub closable: bool,
 }
 
@@ -133,7 +76,6 @@ impl Default for TabBarOptions {
     }
 }
 
-/// 标签栏（`Rc` 浅拷贝）。
 #[derive(Clone)]
 pub struct TabBar {
     inner: Rc<TabBarInner>,
@@ -174,7 +116,6 @@ struct Geometry {
 }
 
 impl TabBar {
-    /// 建标签栏。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -210,57 +151,48 @@ impl TabBar {
         }
     }
 
-    /// 选中变化回调（用户点击 / 键盘；程序化 `set_selected` 不触发）。
     #[must_use]
     pub fn on_change(self, callback: impl Fn(usize, &mut App) + 'static) -> Self {
         *self.inner.on_change.borrow_mut() = Some(Rc::new(callback));
         self
     }
 
-    /// 关闭回调（只有 `closable` 时会被调用）。
     #[must_use]
     pub fn on_close(self, callback: impl Fn(usize, &mut App) + 'static) -> Self {
         *self.inner.on_close.borrow_mut() = Some(Rc::new(callback));
         self
     }
 
-    /// 当前选中下标。
     #[must_use]
     pub fn selected_index(&self, app: &App) -> usize {
         app.read_with(&self.inner.selected, |selected| *selected)
     }
 
-    /// 标签数。
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.labels.len()
     }
 
-    /// 是否没有标签。
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.labels.is_empty()
     }
 
-    /// 标签节点（`build` 之后可用；测试 / 组合控件用）。
     #[must_use]
     pub fn tab_nodes(&self) -> Vec<NodeId> {
         self.inner.geometry.borrow().tabs.clone()
     }
 
-    /// 轨道节点。
     #[must_use]
     pub fn track_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().track
     }
 
-    /// 指示条节点（`Fade` 模式为 `None`）。
     #[must_use]
     pub fn indicator_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().indicator
     }
 
-    /// 指示条当前矩形（相对行；`Fade` 模式为 `None`）。
     #[must_use]
     pub fn indicator_rect(&self, app: &App) -> Option<Rect> {
         let geometry = self.inner.geometry.borrow();
@@ -274,16 +206,11 @@ impl TabBar {
             .map(|layout| layout.rect)
     }
 
-    /// 程序化选中（不触发 `on_change`；指示条动画由 `sync` 推进）。
     pub fn set_selected(&self, app: &mut App, index: usize) {
         let index = index.min(self.len().saturating_sub(1));
         app.write(&self.inner.selected, index);
     }
 
-    /// 建节点：轨道 + 行 + 指示条 + 标签（含关闭按钮）。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode` / 图标资源错误。
     pub fn build(
         &self,
         app: &mut App,
@@ -414,7 +341,6 @@ impl TabBar {
                     .with_wrap(TextWrap::NoWrap)
                     .with_overflow(TextOverflow::Ellipsis, 1);
                 let text = NodeBuilder::text(label, text_style)
-                    // 旧 `.truncate()`：文本可以被压到内容宽度以下（否则自动最小尺寸会撑破上限）。
                     .style(StyleBuilder::new().min_width_0().build())
                     .bind_style(move |cx| StylePatch {
                         foreground: Some(label_bind.foreground_color(cx)),
@@ -465,17 +391,12 @@ impl TabBar {
             geometry.indicator = indicator;
             geometry.tabs = tab_nodes;
         }
-        // 标签文字色走交互前景（每个标签自己 bind）；这里给标签内容补一个可复用的主题色。
         if inner.options.indicator == IndicatorAnimation::Slide {
             self.sync_indicator_direct(app)?;
         }
         Ok(track)
     }
 
-    /// 接引擎：注册方向键 scoped 绑定（必须在 `build` 之后）。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode`。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let Some(row) = self.inner.geometry.borrow().row else {
             return Ok(());
@@ -505,10 +426,6 @@ impl TabBar {
         Ok(())
     }
 
-    /// 一步完成 `build` + `attach`。
-    ///
-    /// # Errors
-    /// 同 [`TabBar::build`] / [`TabBar::attach`]。
     pub fn mount(
         &self,
         app: &mut App,
@@ -520,10 +437,6 @@ impl TabBar {
         Ok(node)
     }
 
-    /// 帧同步：标签状态、选中态与指示条动画。
-    ///
-    /// # Errors
-    /// 同 [`Interactive::sync`] / `StaleNode`。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let selected = self.selected_index(app);
         let mut changed = false;
@@ -540,7 +453,6 @@ impl TabBar {
         Ok(changed)
     }
 
-    /// 转发按下 / 抬起事件（每个标签与关闭按钮）。
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         let mut changed = false;
         for tab in self.inner.tabs.borrow().iter() {
@@ -552,9 +464,6 @@ impl TabBar {
         changed
     }
 
-    /// 释放组件（方向键绑定 / Action handler / 各 Interactive 的信号作用域）。
-    ///
-    /// 返回释放的信号槽位数；重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
         if let (Some(window), Some(row)) = (
             self.inner.geometry.borrow().window,
@@ -576,7 +485,6 @@ impl TabBar {
         released
     }
 
-    /// 键盘移动选中（`step` = ±1；焦点跟到新标签）。
     fn move_selection(&self, ctx: &mut ActionCtx<'_>, step: isize) {
         let count = self.len();
         if count == 0 {
@@ -594,7 +502,6 @@ impl TabBar {
         }
     }
 
-    /// 首次进入 `Slide`：直接把指示条放到目标位置（不播放入场动画）。
     fn sync_indicator_direct(&self, app: &mut App) -> Result<(), EngineError> {
         let Some((left, width, height)) = self.indicator_target(app) else {
             return Ok(());
@@ -608,7 +515,6 @@ impl TabBar {
         Ok(())
     }
 
-    /// 每帧：目标几何变化时启动动画，然后按当前瞬态值写 `LayoutOverride`。
     fn sync_indicator(&self, app: &mut App) -> Result<bool, EngineError> {
         let Some(target) = self.indicator_target(app) else {
             return Ok(false);
@@ -653,7 +559,6 @@ impl TabBar {
         Ok(changed)
     }
 
-    /// 把当前瞬态值写进指示条的 `LayoutOverride`（没变化则不写）。
     fn write_indicator_override(&self, app: &mut App) -> Result<bool, EngineError> {
         let (Some(window), Some(indicator)) = (
             self.inner.geometry.borrow().window,
@@ -685,7 +590,6 @@ impl TabBar {
         Ok(true)
     }
 
-    /// 选中标签相对行节点的矩形（`None` = 还没布局）。
     fn indicator_target(&self, app: &App) -> Option<(f32, f32, f32)> {
         let geometry = self.inner.geometry.borrow();
         let row = geometry.row?;
@@ -702,14 +606,12 @@ impl TabBar {
         ))
     }
 
-    /// 标签栏 key（调试 id / 动作前缀）。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 }
 
-/// 选中一个标签（写信号 + 可选回调）。
 fn select(inner: &Rc<TabBarInner>, app: &mut App, index: usize, notify: bool) {
     let count = inner.labels.len();
     if count == 0 {
@@ -724,10 +626,6 @@ fn select(inner: &Rc<TabBarInner>, app: &mut App, index: usize, notify: bool) {
     }
 }
 
-/// 标签的四状态角色配方（旧 tab_bar 的选中 / 悬停画法）。
-///
-/// `Slide` 模式下标签**不画自己的填充**（旧实现把 tab `bg` 强制为透明）：滑动指示条是唯一的填充，
-/// 否则指示条滑入时目的标签的背景会先淡入、把滑动遮住。
 fn tab_palette(slide: bool) -> RolePalette {
     RolePalette {
         normal: StateRoles {
@@ -753,8 +651,6 @@ fn tab_palette(slide: bool) -> RolePalette {
     }
 }
 
-/// 关闭按钮的四状态角色配方（旧实现：透明 → `veil.hover` / `veil.active`，前景 `fg.muted` →
-/// `fg.default`）。
 fn close_palette() -> RolePalette {
     RolePalette {
         normal: StateRoles {
@@ -780,7 +676,6 @@ fn close_palette() -> RolePalette {
     }
 }
 
-/// 关闭按钮的方框边长（旧 `size_3/4/5` = 12 / 16 / 20 px，随尺寸档）。
 fn close_side(size: UnifiedSize) -> f32 {
     match size {
         UnifiedSize::Small => 12.0,
@@ -789,7 +684,6 @@ fn close_side(size: UnifiedSize) -> f32 {
     }
 }
 
-/// 标签宽度上限（旧 `.max_w_40()` = 160 px）：超出由文本节点的省略号截断。
 fn set_tab_max_width(app: &mut App, window: WindowId, node: NodeId) -> Result<(), EngineError> {
     let tree = app
         .window_mut(window)
@@ -800,8 +694,6 @@ fn set_tab_max_width(app: &mut App, window: WindowId, node: NodeId) -> Result<()
     tree.set_style(node, style)
 }
 
-/// 关闭按钮是旧实现的「小方框 + 满尺寸 X」：洗净交互根的 chrome（高度 / 内边距 / 布局边框），
-/// 只留一个正方的命中盒。
 fn set_square_close_style(
     app: &mut App,
     window: WindowId,
@@ -943,7 +835,6 @@ mod tests {
         ColorResolver.resolve(color).components
     }
 
-    /// 过渡结束后的线性预乘分量可能差最后一位（1.0 的 lerp 收尾），比较时给 1e-5 容差。
     fn assert_color(actual: Option<Color>, expected: Color, message: &str) {
         let actual = actual.map(resolved);
         let expected = resolved(expected);
@@ -956,7 +847,6 @@ mod tests {
         assert!(close, "{message}（实际 {actual:?} / 期望 {expected:?}）");
     }
 
-    /// 默认选中第一个；点击第二个标签选中它并回调。
     #[test]
     fn clicking_a_tab_selects_it_and_reports_the_index() {
         let mut harness = harness(IndicatorAnimation::Fade, false, 3);
@@ -968,7 +858,6 @@ mod tests {
         assert_eq!(harness.changed.get(), Some(1));
     }
 
-    /// 方向键（E8 scoped）：焦点在标签栏子树内时 Right/Left 移动选中并跟焦点。
     #[test]
     fn arrow_keys_move_the_selection_within_the_scoped_tab_bar() {
         let mut harness = harness(IndicatorAnimation::Fade, false, 3);
@@ -1008,7 +897,6 @@ mod tests {
         );
     }
 
-    /// Slide：指示条最初覆盖第一个标签，选中最后一个后移动到它上面（变异：不写 LayoutOverride → 红）。
     #[test]
     fn the_slide_indicator_moves_to_the_selected_tab() {
         let mut harness = harness(IndicatorAnimation::Slide, false, 3);
@@ -1067,7 +955,6 @@ mod tests {
         );
     }
 
-    /// Fade：没有指示条节点；选中标签的背景是 `surface.overlay`。
     #[test]
     fn fade_mode_paints_the_selected_tab_with_the_overlay_role() {
         let mut harness = harness(IndicatorAnimation::Fade, false, 3);
@@ -1093,7 +980,6 @@ mod tests {
         );
     }
 
-    /// a11y：轨道是 List（集合大小），标签是 ListBoxOption（位置 / 选中）。
     #[test]
     fn the_tab_bar_declares_list_and_list_item_semantics() {
         let mut app = TestApp::new();
@@ -1135,7 +1021,6 @@ mod tests {
         assert_eq!(first.selected, Some(true));
     }
 
-    /// 关闭按钮：点 X 只调 `on_close`，不改变选中；只剩一个标签时不画 X。
     #[test]
     fn the_close_button_reports_the_index_without_selecting() {
         let mut multi = harness(IndicatorAnimation::Fade, true, 3);
@@ -1172,7 +1057,6 @@ mod tests {
         assert_eq!(children, 1, "只剩一个标签时只画文字");
     }
 
-    /// Slide：选中标签自己不画填充（旧实现强制透明），填充只由滑动指示条承担。
     #[test]
     fn slide_mode_does_not_paint_the_selected_tab_background() {
         let harness = harness(IndicatorAnimation::Slide, false, 3);
@@ -1184,7 +1068,6 @@ mod tests {
         );
     }
 
-    /// 长标签：宽度上限 160 px（旧 `.max_w_40()`），文本 `NoWrap + Ellipsis` 截断。
     #[test]
     fn a_long_tab_label_is_capped_and_truncated() {
         let mut app = TestApp::new();
@@ -1229,7 +1112,6 @@ mod tests {
         );
     }
 
-    /// 关闭按钮：恢复旧的 16×16 方框（Medium）+ 满尺寸 X + `fg.muted`，hover 洗色。
     #[test]
     fn the_close_button_keeps_the_legacy_square_size_and_colors() {
         let mut harness = harness(IndicatorAnimation::Fade, true, 3);
@@ -1280,8 +1162,6 @@ mod tests {
         );
     }
 
-    /// release：E8 scoped 键与所有 Action handler 都必须摘除（变异：不调 `unbind_scope_keys`
-    /// / `off_action` → 本测试红）。
     #[test]
     fn releasing_the_tab_bar_unbinds_scoped_keys_and_action_handlers() {
         let mut harness = harness(IndicatorAnimation::Slide, true, 3);
@@ -1339,7 +1219,6 @@ mod tests {
         );
     }
 
-    /// I3：动画结束后的稳态不出帧。
     #[test]
     fn a_settled_tab_bar_produces_no_further_frames() {
         let mut harness = harness(IndicatorAnimation::Slide, false, 3);

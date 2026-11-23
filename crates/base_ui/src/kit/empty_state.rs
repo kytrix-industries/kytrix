@@ -1,23 +1,3 @@
-//! 空态说明（旧 `crate::empty_state` 的引擎化重建，P2-4a）。
-//!
-//! 旧实现的语义原样保留：一句「为什么这里什么都没有」的弱化文字。它**不**画背景 / 边框 / 圆角
-//! （它站在一个已经有这些的面上），**不**自己定尺寸（区域自己决定占多高），只做三件事：
-//! 弱化色（`fg.muted`）、14 px 字号、左右 16 px 内边距与 `max_w_full` 防溢出。
-//!
-//! # a11y
-//!
-//! 它说的是「这里没有内容」，是一个普通文本（引擎按文本叶子给 `Label`），因此根容器不声明角色、
-//! 不隐藏；读屏器会把这句话当作普通文字播报。
-//!
-//! # 与旧 API 的差异
-//!
-//! 旧 API 是 `EmptyState::new(ElementId, text)`；新 API 的 `key` 只用于调试 id，文本在
-//! [`EmptyState::text`]。
-//!
-//! 文案有两种形态（[`TextValue`]）：[`EmptyState::text`] 是构建期静态值（旧语义）；
-//! [`EmptyState::bind_text`] 绑定 `Signal<SmolStr>`，写信号即更新文本（语言切换不再需要
-//! 「先摘节点再重建」，P2-9）。
-
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal, tree::NodeTree},
@@ -31,10 +11,8 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-/// 空态文字的字号（旧 `text_sm` = 0.875 rem = 14 px）。
 const TEXT_SIZE: f32 = 14.0;
 
-/// 空态说明。
 #[derive(Clone)]
 pub struct EmptyState {
     theme: ThemeHandle,
@@ -43,7 +21,6 @@ pub struct EmptyState {
 }
 
 impl EmptyState {
-    /// 建空态（文本随后用 [`EmptyState::text`]）。
     pub fn new(theme: ThemeHandle, key: impl Into<SmolStr>) -> Self {
         Self {
             theme,
@@ -52,24 +29,18 @@ impl EmptyState {
         }
     }
 
-    /// 静态说明文字（构建期固定；语言切换需要由调用方重建节点）。
     #[must_use]
     pub fn text(mut self, text: impl Into<SmolStr>) -> Self {
         self.text = TextValue::Static(text.into());
         self
     }
 
-    /// 绑定说明文字：写信号即更新文本，节点不重建（语言切换的绑定面）。
     #[must_use]
     pub fn bind_text(mut self, text: Signal<SmolStr>) -> Self {
         self.text = TextValue::Bound(text);
         self
     }
 
-    /// 建节点（容器 + 文本叶子）。
-    ///
-    /// # Errors
-    /// `StaleNode`（父节点陈旧）。
     pub fn build(
         &self,
         tree: &mut NodeTree,
@@ -137,7 +108,6 @@ mod tests {
         (app, node)
     }
 
-    /// 文本、字号与弱化色。
     #[test]
     fn the_empty_state_draws_muted_small_text() {
         let (app, node) = build("No trades yet");
@@ -165,7 +135,6 @@ mod tests {
         );
     }
 
-    /// 不画背景 / 边框 / 圆角：容器的动态补丁为空（只有布局与内边距）。
     #[test]
     fn the_empty_state_draws_no_surface_of_its_own() {
         let (app, node) = build("Nothing here");
@@ -185,7 +154,6 @@ mod tests {
         assert!(bounds.size.height > 0.0);
     }
 
-    /// a11y：文字叶子是 Label。
     #[test]
     fn the_empty_state_text_is_a_label() {
         let (mut app, node) = build("No results");
@@ -207,10 +175,6 @@ mod tests {
         assert_eq!(record.label_text(), Some("No results"));
     }
 
-    /// **P2-9 绑定面**：`bind_text(Signal<SmolStr>)` 在语言切换时更新文本，节点与文字叶子
-    /// id 都不变（不重建）。
-    ///
-    /// 变异防线：删掉 `bind_text`（只留初始空串）⇒ 本用例红。
     #[test]
     fn a_bound_text_switches_language_without_rebuilding_the_empty_state() {
         let mut app = TestApp::new();

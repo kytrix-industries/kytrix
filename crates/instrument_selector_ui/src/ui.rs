@@ -1,11 +1,3 @@
-//! Small building blocks shared by the two dialogs.
-//!
-//! Both dialogs build plain engine subtrees next to kit components, and both must do so
-//! without holding a `&mut NodeTree` borrowed from `App` across a kit call (the node tree
-//! lives inside the window, which lives inside `App`, so the two borrows cannot overlap).
-//! [`build_node`] is the one statement that takes the tree borrow, runs the builder, and
-//! gives it back before the next kit call.
-
 use ui_core::{
     app::App,
     error::EngineError,
@@ -14,13 +6,6 @@ use ui_core::{
     window::WindowId,
 };
 
-/// Builds one node under `parent` and returns it.
-///
-/// The tree borrow lives for the duration of `build` only, so the caller can call a kit
-/// component that needs `&mut App` in the next statement.
-///
-/// # Errors
-/// The window is gone (`UnknownWindow`), or the builder failed (usually `StaleNode`).
 pub(crate) fn build_node(
     app: &mut App,
     window: WindowId,
@@ -34,25 +19,12 @@ pub(crate) fn build_node(
     build(tree, parent)
 }
 
-/// Removes one node (and its subtree) from the dialog's window.
-///
-/// A dialog that redraws a region removes the nodes it built last time; the engine's
-/// `remove_node` also releases the scoped bindings and timers of that subtree (E16), so a
-/// rebuilt region cannot leave handlers behind.
 pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) {
     if let Err(error) = app.remove_node(window, node) {
         log::warn!("removing a rebuilt dialog node failed: {error}");
     }
 }
 
-/// Whether `event` is one only a dialog's own text input can consume.
-///
-/// Typed text, a key press and IME input are what kit's
-/// [`InputNode::dispatch`](base_ui::kit::input::InputNode::dispatch) reads while the input
-/// has focus. Every other event is the engine's: the platform pushed it and the engine
-/// already ran the matching interaction dispatch (hit testing, actions, scrolling), so it
-/// is observation for the application rather than a command any dialog may take out of the
-/// queue.
 pub(crate) fn is_text_input(event: &Event) -> bool {
     matches!(
         event,

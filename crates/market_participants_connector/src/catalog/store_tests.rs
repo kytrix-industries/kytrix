@@ -1,6 +1,3 @@
-//! Catalog-level behaviour: pure reads, atomic publication and the resolution
-//! surface.
-
 use std::sync::{Arc, OnceLock};
 
 use futures::future::BoxFuture;
@@ -64,7 +61,6 @@ use crate::{
     test_support::test_handle,
 };
 
-/// The native event lookups a route publishes, read from the public surface.
 fn published_event_lookups(catalog: &Catalog, route: &VenueRoute) -> Vec<PolymarketEventId> {
     let mut natives: Vec<PolymarketEventId> = catalog
         .generation()
@@ -112,16 +108,11 @@ fn btc_key() -> VenueListingKey {
     test_support::listing_key(&spot_route(), "BTCUSDT")
 }
 
-/// The application runtime a load crosses its blocking boundary on.
-///
-/// One runtime for the whole test binary, exactly as the application has one, and a
-/// test that drives a load from its own thread never runs it — which is the\r\n/// situation a frame thread is in.
 fn application() -> Handle {
     static APPLICATION: OnceLock<Handle> = OnceLock::new();
     APPLICATION.get_or_init(test_handle).clone()
 }
 
-/// A source that counts its fetches and reports the thread they ran on.
 struct Threaded {
     entries: Vec<CatalogEntry>,
     fetches: Arc<std::sync::atomic::AtomicUsize>,
@@ -159,9 +150,6 @@ impl CatalogSource for Threaded {
     }
 }
 
-/// reads never fetch. However many readers ask a published route for its
-/// snapshot, the source behind it is never reached — the count is the source's
-/// own, so a read that quietly detached a fetch would be counted here.
 #[tokio::test]
 async fn a_read_never_fetches() {
     let (gate, source) = gated(vec![btc_entry()]);
@@ -195,8 +183,6 @@ async fn a_read_never_fetches() {
     );
 }
 
-/// A route with no published snapshot answers "not loaded" and
-/// reaches no source at all.
 #[tokio::test]
 async fn a_read_of_a_route_with_no_snapshot_fetches_nothing() {
     let (gate, source) = gated(vec![btc_entry()]);
@@ -229,8 +215,6 @@ async fn a_read_of_a_route_with_no_snapshot_fetches_nothing() {
     );
 }
 
-/// The published snapshot is served as it is: a second read answers with the very
-/// pointer the first one read, whatever the route's inputs say.
 #[tokio::test]
 async fn a_published_snapshot_is_served_as_it_is() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -250,8 +234,6 @@ async fn a_published_snapshot_is_served_as_it_is() {
     );
 }
 
-/// a load that fails leaves the snapshot the route already had exactly as
-/// it was.
 #[tokio::test]
 async fn a_failed_refresh_preserves_the_previous_snapshot() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -273,8 +255,6 @@ async fn a_failed_refresh_preserves_the_previous_snapshot() {
     assert!(Arc::ptr_eq(&served, &loaded));
 }
 
-/// A route with no published snapshot answers "not loaded" on every
-/// read entry, and reaches no source at all, however its source would have answered.
 #[tokio::test]
 async fn a_route_with_no_snapshot_is_not_loaded_on_every_read_entry() {
     let fixture = Fixture::failing();
@@ -474,9 +454,6 @@ async fn one_instrument_can_have_several_listings_across_routes() {
 
 #[tokio::test]
 async fn two_instruments_of_one_route_keep_their_own_identity() {
-    // Two distinct economic instruments of one route. What this test asserts is
-    // that each listing keeps its own instrument and its own identity in the
-    // published snapshot, whatever name the two instruments carry.
     let primary = btc_entry();
     let secondary = eth_entry();
     let fixture = Fixture::new(vec![primary.clone(), secondary.clone()]);
@@ -689,7 +666,6 @@ async fn ensure_reports_an_unregistered_route() {
     ));
 }
 
-/// The kind of refusal one catalog error carries.
 fn refused_kind(error: &CatalogError) -> &CatalogValidationError {
     match error {
         CatalogError::InvalidCatalog { error, .. } => error.as_ref(),
@@ -808,8 +784,6 @@ async fn two_catalog_instances_never_produce_the_same_generation() {
             "the shared clock only ever moves forward"
         );
     }
-    // The three catalogs published in lockstep, so their own sequences are the
-    // three interleaved lanes of the same strictly increasing series.
     for lane in 0..3 {
         let own: Vec<CatalogGenerationId> =
             published.iter().skip(lane).step_by(3).copied().collect();
@@ -1057,8 +1031,6 @@ fn an_invalid_source_id_is_refused() {
     assert!(CatalogSourceId::new("binance-spot").is_ok());
 }
 
-/// Both dimensions a declaration is keyed by take part in the revision, so two
-/// registrations of one route differ exactly when one of them differs.
 #[test]
 fn a_route_input_revision_covers_every_declared_input() {
     let bare = RouteInputRevision::of_declaration(&spot_route(), None, &[]);
@@ -1093,13 +1065,6 @@ fn a_route_input_revision_covers_every_declared_input() {
     );
 }
 
-/// P1-D1: a route republished with other declared inputs refuses the batch a load
-/// staged under the declaration it replaced.
-///
-/// The revision a registration carries is derived from the inputs the route is
-/// declared with — its catalog source and its identifier normalization rules — so
-/// re-registering the route under another rule moves its revision, and a fetch
-/// that started under the old declaration must not be written under the new one.
 #[tokio::test]
 async fn a_route_republished_with_other_declared_inputs_discards_its_staged_batch() {
     let (gate, source) = gated(vec![btc_entry()]);
@@ -1116,8 +1081,6 @@ async fn a_route_republished_with_other_declared_inputs_discards_its_staged_batc
     };
     gate.started().await;
     tokio::task::yield_now().await;
-    // The route's declared inputs move while its fetch is in flight, so the answer
-    // it staged belongs to a declaration the route no longer carries.
     fixture.republish_declared_inputs(instrument_normalization(SymbolNormalization::Exact));
     gate.release();
 
@@ -1249,8 +1212,6 @@ async fn an_invalid_catalog_does_not_replace_the_previous_snapshot() {
     assert!(Arc::ptr_eq(&served, &loaded));
 }
 
-/// A published snapshot names its symbols, and a route re-registered under the
-/// same declaration keeps serving it.
 #[tokio::test]
 async fn a_published_snapshot_still_names_its_symbols() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -1291,8 +1252,6 @@ async fn a_listing_of_another_route_is_refused_by_the_ensured_route() {
     assert!(ensured.native_symbol(&other).is_none());
 }
 
-/// A load is not answered by the published snapshot: it asks the source again and
-/// publishes what it answered, while a read of the same route asks nothing.
 #[tokio::test]
 async fn a_load_asks_the_source_again() {
     let (gate, source) = gated(vec![btc_entry()]);
@@ -1337,14 +1296,6 @@ async fn a_load_asks_the_source_again() {
     assert_eq!(symbols_of(&served), ["BTCUSDT"]);
 }
 
-/// The connection action runs on a thread that runs no runtime, and its load still
-/// fetches.
-///
-/// The fetch that answers a load reaches the venue through a blocking pool, and
-/// asking for that pool without a runtime is a panic rather than an error. Attaching
-/// the application runtime to the catalogue is what makes the load work from there,
-/// so this drives a cold route from the test thread — which runs no runtime of its
-/// own — through the one write entry a load has.
 #[test]
 fn a_load_from_a_thread_without_a_runtime_still_fetches() {
     assert!(
@@ -1367,11 +1318,6 @@ fn a_load_from_a_thread_without_a_runtime_still_fetches() {
     assert_eq!(resolved.instrument.id(), btc().id());
 }
 
-/// The fetch itself runs on the application runtime, not on the caller's thread.
-///
-/// Running the load safely is not enough: the venue request has to leave the thread
-/// that draws frames, or a slow venue stalls the window. The source reports the
-/// thread it ran on, and it must not be this one.
 #[test]
 fn a_load_runs_on_the_application_runtime_rather_than_the_caller() {
     let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1412,8 +1358,6 @@ fn a_load_runs_on_the_application_runtime_rather_than_the_caller() {
     );
 }
 
-/// a failed refresh keeps the snapshot the route already had, and a
-/// second refresh asks the venue again instead of replaying the failure.
 #[tokio::test]
 async fn a_manual_refresh_does_not_reuse_a_failure() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -1440,8 +1384,6 @@ async fn a_manual_refresh_does_not_reuse_a_failure() {
     );
 }
 
-/// A route re-registered under the declaration it already carried keeps serving
-/// the snapshot it published: the same inputs are the same registration.
 #[tokio::test]
 async fn a_published_snapshot_is_served_under_the_declaration_it_was_fetched_with() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -1459,8 +1401,6 @@ async fn a_published_snapshot_is_served_under_the_declaration_it_was_fetched_wit
     assert_eq!(symbols_of(&cached), ["BTCUSDT"]);
 }
 
-/// A route re-registered under another declaration serves nothing: its snapshot
-/// was built for the route it used to be, so it is not this route's catalogue.
 #[tokio::test]
 async fn a_snapshot_of_another_declaration_is_not_served() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -1501,8 +1441,6 @@ async fn a_token_and_a_currency_with_one_code_stay_apart() {
     assert_eq!(catalog.listings_for(currency_instrument.id()).len(), 1);
 }
 
-/// A published generation is only replaced by a load: a read that changes nothing
-/// leaves the generation id exactly as it was.
 #[tokio::test]
 async fn the_fixture_catalog_reports_its_own_generation() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -1576,17 +1514,6 @@ async fn a_revoked_route_is_no_longer_resolvable() {
     ));
 }
 
-/// the scope a shrinking commit drops is not merely unregistered — it is
-/// unaskable.
-///
-/// Two scopes are loaded and the commit that follows holds a strictly smaller
-/// set: the perpetual scope and not the spot one. The dropped scope leaves every
-/// answer in that commit — it is out of the registered set, and admission,
-/// listings, native resolution and listing resolution all refuse it with
-/// [`CatalogError::RouteNotRegistered`] instead of answering from the
-/// generation it was last published in. The scope the commit kept stays askable,
-/// so the refusals above are about the dropped scope rather than about the
-/// commit.
 #[tokio::test]
 async fn a_revoked_scope_is_unaskable_not_just_unregistered() {
     let perp = entry(&perp_route(), eth(), "ETH-USDT");
@@ -1616,8 +1543,6 @@ async fn a_revoked_scope_is_unaskable_not_just_unregistered() {
         btc_key()
     );
 
-    // The candidate the next commit publishes holds the perpetual scope alone,
-    // so the spot scope vanishes from the registered set in that publication.
     catalog
         .commit_fixture_routes(
             CatalogRouteUpdate::new(
@@ -1667,8 +1592,6 @@ async fn a_revoked_scope_is_unaskable_not_just_unregistered() {
     assert!(catalog.cached_listings(&spot_route()).is_none());
     assert!(catalog.cached_listing(&btc_key()).is_none());
 
-    // The scope the shrinking commit kept is still askable, so what was refused
-    // above is the dropped scope rather than the commit.
     assert!(
         catalog.registered_route(&perp_route()).is_ok(),
         "the scope the commit kept stays registered"
@@ -1701,12 +1624,6 @@ async fn the_assets_of_a_published_generation_are_the_registry_terms() {
     assert!(!generation.assets().is_empty());
 }
 
-// ---- registry-only publication ------------------------------------------
-
-/// The published registry that carries exactly the given assets.
-///
-/// It goes through the same boundary a real batch does, so what a test installs is a
-/// registry the catalog itself could have published rather than a hand-built map.
 fn registry_of(terms: Vec<AssetTerms>) -> Arc<AssetRegistry> {
     let mut pending = AssetRegistryPending::new();
     let mut referenced = ReferencedTerms::default();
@@ -1721,7 +1638,6 @@ fn registry_of(terms: Vec<AssetTerms>) -> Arc<AssetRegistry> {
     ))
 }
 
-/// The canonical terms of every asset the published generation's registry carries.
 fn registered_terms(catalog: &Catalog) -> Vec<AssetTerms> {
     let generation = catalog.generation();
     generation
@@ -1732,7 +1648,6 @@ fn registered_terms(catalog: &Catalog) -> Vec<AssetTerms> {
         .collect()
 }
 
-/// The display code the published catalog gives one asset.
 fn published_code(catalog: &Catalog, asset: &AssetId) -> SmolStr {
     let generation = catalog.generation();
     SmolStr::new(
@@ -1744,7 +1659,6 @@ fn published_code(catalog: &Catalog, asset: &AssetId) -> SmolStr {
     )
 }
 
-/// The display error inside a refused publication.
 fn refused_display(error: &CatalogError) -> &DisplayError {
     match error {
         CatalogError::InvalidCatalog { error, .. } => match error.as_ref() {
@@ -1755,13 +1669,6 @@ fn refused_display(error: &CatalogError) -> &DisplayError {
     }
 }
 
-/// a registry-only publication is a publication of its own.
-///
-/// The registries are installed under a *fresh* generation id even though not one
-/// route snapshot changed, because the display catalog is rebuilt against them and
-/// every reader of the generation has to see the rebuild. A publication the display
-/// gate refuses publishes nothing: the generation the catalogue served before is the
-/// one it still serves, with the id and the catalog of that generation.
 #[tokio::test]
 async fn a_registry_only_publication_advances_the_generation_and_a_refused_one_keeps_it() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -1824,8 +1731,6 @@ async fn a_registry_only_publication_advances_the_generation_and_a_refused_one_k
     );
 }
 
-// ---- outcome reachability, revocation and route isolation ---------------
-
 fn outcome_expiry() -> Expiry {
     Expiry::new(2_000, Some(1_800), Some(2_100)).expect("the expiry is valid")
 }
@@ -1834,7 +1739,6 @@ fn outcome_settlement_asset() -> AssetId {
     token("binance", "USDC")
 }
 
-/// One binary outcome group of the fixture venue.
 fn outcome_group(question: &str) -> OutcomeGroup {
     let seed = OutcomeGroupSeed {
         question: SmolStr::new(question),
@@ -1852,8 +1756,6 @@ fn outcome_group(question: &str) -> OutcomeGroup {
     OutcomeGroup::new(seed, vec![yes, no], vec![member]).expect("the group is valid")
 }
 
-/// A member of the group's own seed that the group does *not* carry.
-/// One outcome listing that trades `member`/`side` of `group` under `symbol`.
 fn outcome_entry_of(
     route: &VenueRoute,
     group: &OutcomeGroup,
@@ -1878,8 +1780,6 @@ fn outcome_entry_of(
                 .expect("the condition id is valid"),
             asset_id: CtfTokenId::new("12345").expect("the token id is valid"),
             protocol: market_participants_model::listing::venue::PolymarketProtocolVersion::V1,
-            // the protocol label of a fixture echoes the registry label of
-            // the leg it trades, so a test that changes the leg keeps the echo.
             outcome_label: side.label.clone(),
         }),
     )
@@ -1930,7 +1830,6 @@ fn outcome_entry(route: &VenueRoute, group: &OutcomeGroup, symbol: &str) -> Cata
     outcome_entry_of(route, group, &group.members[0], &group.sides[0], symbol)
 }
 
-/// Every route of a fixture with one registered source and one outcome batch.
 fn outcome_fixture(
     groups: Vec<OutcomeGroup>,
     pools: Vec<OutcomeRiskPool>,
@@ -1952,7 +1851,6 @@ fn outcome_fixture(
     )
 }
 
-/// A source that answers every fetch with the same outcome batch.
 struct ScriptedOutcome {
     groups: Vec<OutcomeGroup>,
     pools: Vec<OutcomeRiskPool>,
@@ -1985,7 +1883,6 @@ impl CatalogSource for ScriptedOutcome {
     }
 }
 
-/// Probe 11: revoking the only route that references an outcome group removes it.
 #[tokio::test]
 async fn revoking_the_only_route_removes_its_unreachable_outcome_objects() {
     let group = outcome_group("Will it rain?");
@@ -2014,7 +1911,6 @@ async fn revoking_the_only_route_removes_its_unreachable_outcome_objects() {
     );
 }
 
-/// Probe 5: a group two routes share survives the revocation of one of them.
 #[tokio::test]
 async fn a_group_shared_by_two_routes_survives_one_revocation() {
     let group = outcome_group("Will it rain?");
@@ -2043,7 +1939,6 @@ async fn a_group_shared_by_two_routes_survives_one_revocation() {
         "no route references the group any more"
     );
 
-    // The same group referenced by two routes: revoking one keeps it.
     let shared = outcome_group("Will it rain twice?");
     let shared_spot = outcome_entry(&spot_route(), &shared, "TWICE-A");
     let perp_listing = outcome_entry(&perp_route(), &shared, "TWICE-B");
@@ -2094,7 +1989,6 @@ async fn a_group_shared_by_two_routes_survives_one_revocation() {
     );
 }
 
-/// A revoked route with a surviving snapshot is never served from the cache.
 #[tokio::test]
 async fn a_revoked_route_is_absent_from_the_cache_even_with_a_snapshot() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -2125,7 +2019,6 @@ async fn a_revoked_route_is_absent_from_the_cache_even_with_a_snapshot() {
     ));
 }
 
-/// Probe 14: a synchronous lookup is answered from its own route's snapshot.
 #[tokio::test]
 async fn an_ensured_route_resolves_only_its_own_native_lookups() {
     let spot = outcome_group("Probe 14 spot");
@@ -2205,10 +2098,6 @@ async fn an_ensured_route_resolves_only_its_own_native_lookups() {
     );
 }
 
-/// Publishes one shared group on two routes: the spot route trades the group
-/// without a native lookup of its own, and the perp route trades it too and stages
-/// the given native group lookups for it. Both routes are loaded, so the lookups
-/// of the perp route are published before the fixture is returned.
 async fn two_route_group_lookup_fixture(
     group: &OutcomeGroup,
     lookups: Vec<OutcomeGroupIdentifier>,
@@ -2261,9 +2150,6 @@ async fn two_route_group_lookup_fixture(
     (catalog, ensured_spot, ensured_perp)
 }
 
-/// A native condition another route registered names the shared group on both
-/// resolvers, and a condition nobody registered is refused by both with the same
-/// value.
 #[tokio::test]
 async fn the_group_resolvers_agree_about_a_condition_registered_by_another_route() {
     let shared = outcome_group("N3 shared condition group");
@@ -2273,8 +2159,6 @@ async fn the_group_resolvers_agree_about_a_condition_registered_by_another_route
     let (catalog, ensured_spot, _) =
         two_route_group_lookup_fixture(&shared, vec![registered.clone()]).await;
 
-    // The spot route stages no lookup of its own: the condition was registered by
-    // the perp route's source, and both resolvers answer the shared group.
     let synchronous = ensured_spot.resolve_group_identifier(&registered);
     let asynchronous = catalog.resolve_group_identifier(&spot_route(), &registered);
     assert_eq!(
@@ -2288,7 +2172,6 @@ async fn the_group_resolvers_agree_about_a_condition_registered_by_another_route
         "the asynchronous resolver answers the same: {asynchronous:?}"
     );
 
-    // A condition nobody registered is refused by both, field by field.
     let unknown = OutcomeGroupIdentifier::PolymarketCondition(
         CtfConditionId::new("0x".to_owned() + &"3".repeat(64)).expect("the condition id is valid"),
     );
@@ -2317,9 +2200,6 @@ async fn the_group_resolvers_agree_about_a_condition_registered_by_another_route
     );
 }
 
-/// A native market another route registered names the shared group on both
-/// resolvers, and a market nobody registered is refused by both with the same
-/// value.
 #[tokio::test]
 async fn the_group_resolvers_agree_about_a_market_registered_by_another_route() {
     let shared = outcome_group("N3 shared market group");
@@ -2369,11 +2249,6 @@ async fn the_group_resolvers_agree_about_a_market_registered_by_another_route() 
     );
 }
 
-/// A Hyperliquid question carries its scope, so a question of another scope
-/// belongs to another route: both resolvers refuse it with one and the same value,
-/// on the route that carries the lookup and on the route that does not. A question
-/// of the route's own scope is answered by both, whoever registered it, and one
-/// nobody registered stays a not-found on both sides.
 #[tokio::test]
 async fn the_group_resolvers_agree_about_a_question_of_another_scope() {
     let shared = outcome_group("N3 shared question group");
@@ -2390,8 +2265,6 @@ async fn the_group_resolvers_agree_about_a_question_of_another_scope() {
         two_route_group_lookup_fixture(&shared, vec![own_scope.clone(), foreign_scope.clone()])
             .await;
 
-    // Control: a question of the spot route's own scope, registered by the perp
-    // route's source, names the shared group on both resolvers.
     let synchronous = ensured_spot.resolve_group_identifier(&own_scope);
     let asynchronous = catalog.resolve_group_identifier(&spot_route(), &own_scope);
     assert_eq!(
@@ -2405,8 +2278,6 @@ async fn the_group_resolvers_agree_about_a_question_of_another_scope() {
         "the asynchronous resolver answers the same: {asynchronous:?}"
     );
 
-    // A question of another scope is a route mismatch on both sides, whether or
-    // not this route carries the lookup.
     let scope_refusal = |route: VenueRoute| CatalogError::NativeIdentifierRouteMismatch {
         route,
         identifier: Box::new(ListingIdentifier::HyperliquidOutcome {
@@ -2459,8 +2330,6 @@ async fn the_group_resolvers_agree_about_a_question_of_another_scope() {
         "the two refusals must be the same value, field by field"
     );
 
-    // A question of this route's own scope that nobody registered is a not-found
-    // on both sides, never a scope refusal.
     let unregistered = OutcomeGroupIdentifier::HyperliquidQuestion {
         scope: spot_route().scope,
         question: HyperliquidQuestionId::new("n3-unregistered-question")
@@ -2486,7 +2355,6 @@ async fn the_group_resolvers_agree_about_a_question_of_another_scope() {
     );
 }
 
-/// A source that stages a native group lookup next to the batch it publishes.
 struct GroupLookupSource {
     listing: CatalogEntry,
     group: OutcomeGroup,
@@ -2515,9 +2383,6 @@ impl CatalogSource for GroupLookupSource {
     }
 }
 
-/// The event path of probe 14: the route proof's resolver and the catalog's
-/// answer the same thing for the same `(route, native event)`, in both
-/// directions.
 #[tokio::test]
 async fn an_ensured_route_resolves_only_its_own_native_events() {
     let spot = outcome_group("Fix 1 spot");
@@ -2578,8 +2443,6 @@ async fn an_ensured_route_resolves_only_its_own_native_events() {
     let ensured_spot = test_support::ensured(&catalog, &spot_route()).expect("spot loads");
     let ensured_perp = test_support::ensured(&catalog, &perp_route()).expect("perp loads");
 
-    // The positive direction: each route resolves the event its own listing
-    // declares, and both resolvers answer with the same canonical event.
     let spot_identifier = OutcomeEventIdentifier::PolymarketEvent(spot_native.clone());
     let perp_identifier = OutcomeEventIdentifier::PolymarketEvent(perp_native.clone());
     let sync_spot = ensured_spot
@@ -2600,8 +2463,6 @@ async fn an_ensured_route_resolves_only_its_own_native_events() {
         perp_event.id
     );
 
-    // The negative direction: the event of the other route is refused by both,
-    // with the same strongly typed error.
     let sync_error = ensured_spot
         .resolve_event_identifier(&perp_identifier)
         .expect_err("the synchronous resolver of one route must not answer another route's event");
@@ -2622,7 +2483,6 @@ async fn an_ensured_route_resolves_only_its_own_native_events() {
     );
 }
 
-/// One event of the fixture venue, named by one native event identifier.
 fn native_event_of(group: &OutcomeGroup, native: &str) -> (OutcomeEvent, PolymarketEventId) {
     let native = PolymarketEventId::new(native).expect("the event id is valid");
     let event = OutcomeEvent::new(
@@ -2635,7 +2495,6 @@ fn native_event_of(group: &OutcomeGroup, native: &str) -> (OutcomeEvent, Polymar
     (event, native)
 }
 
-/// The fixture outcome listing of `group`, declaring a native event.
 fn outcome_entry_with_event(
     route: &VenueRoute,
     group: &OutcomeGroup,
@@ -2650,8 +2509,6 @@ fn outcome_entry_with_event(
     entry
 }
 
-/// A source that stages one event with its native lookup next to the batch whose
-/// listing declares it.
 struct EventLookupSource {
     listing: CatalogEntry,
     group: OutcomeGroup,
@@ -2684,9 +2541,6 @@ impl CatalogSource for EventLookupSource {
     }
 }
 
-/// A source of a route that publishes its own event and additionally registers a
-/// second native identifier for the event of another route, as an adapter
-/// tracking a market of a shared event does.
 struct ForeignAliasSource {
     listing: CatalogEntry,
     group: OutcomeGroup,
@@ -2725,14 +2579,6 @@ impl CatalogSource for ForeignAliasSource {
     }
 }
 
-/// The event lifetime is decided by every *surviving* route, never by the batch
-/// that happens to be publishing.
-///
-/// Route A declares event E, route B publishes without declaring it, and B is
-/// then revoked: A's event stays in the generation and all three entries — the
-/// published registry, the handle's native lookup and the synchronous proof —
-/// still answer with it. Only when A itself goes does E leave, which is the
-/// monotonic decrease the event lifetime contract asks for.
 #[tokio::test]
 async fn a_route_keeps_its_event_while_another_route_publishes_and_is_revoked() {
     let spot = outcome_group("Fix 2 spot");
@@ -2809,7 +2655,6 @@ async fn a_route_keeps_its_event_while_another_route_publishes_and_is_revoked() 
         "the spot native lookup survives another route's publication"
     );
 
-    // Revoking the perp route leaves the spot route as the only declarer.
     catalog
         .commit_fixture_routes(
             CatalogRouteUpdate::new(
@@ -2865,7 +2710,6 @@ async fn a_route_keeps_its_event_while_another_route_publishes_and_is_revoked() 
         "the surviving route still publishes exactly its own event"
     );
 
-    // The last declarer going is what takes the event away.
     fixture.revoke_all();
     assert!(
         catalog.outcome_event(&spot_event.id).is_none(),
@@ -2878,8 +2722,6 @@ async fn a_route_keeps_its_event_while_another_route_publishes_and_is_revoked() 
     );
 }
 
-/// An event this route publishes, reached through a native lookup another route
-/// registered, is answered by both resolvers with the same canonical event.
 #[tokio::test]
 async fn a_native_lookup_registered_by_another_route_finds_this_routes_event() {
     let spot = outcome_group("Fix 2 alias spot");
@@ -2946,8 +2788,6 @@ async fn a_native_lookup_registered_by_another_route_finds_this_routes_event() {
         "the alias the perp route registered names the spot event in the registry"
     );
 
-    // The positive direction: the spot route publishes the event the alias names,
-    // even though the lookup that names it was registered by the perp route.
     let identifier = OutcomeEventIdentifier::PolymarketEvent(alias.clone());
     let synchronous = ensured_spot
         .resolve_event_identifier(&identifier)
@@ -2961,8 +2801,6 @@ async fn a_native_lookup_registered_by_another_route_finds_this_routes_event() {
         "both resolvers answer with the same canonical event"
     );
 
-    // The negative direction: a foreign route's own event stays refused, with the
-    // same strongly typed error on both sides.
     let foreign = OutcomeEventIdentifier::PolymarketEvent(perp_native.clone());
     let sync_error = ensured_spot
         .resolve_event_identifier(&foreign)
@@ -2984,8 +2822,6 @@ async fn a_native_lookup_registered_by_another_route_finds_this_routes_event() {
     );
 }
 
-/// One Binance spot listing of `route` whose typed identity is a Hyperliquid
-/// spot asset of the same scope, so a scoped listing identifier names it.
 fn scoped_listing(
     route: &VenueRoute,
     instrument: Instrument,
@@ -3002,9 +2838,6 @@ fn scoped_listing(
     entry
 }
 
-/// Publishes one listing on the spot route and one on the perp route, both
-/// loaded, so every resolver can be asked about this route's own listing, about
-/// a scoped identifier of another scope and about the other route's listing.
 async fn two_route_listing_fixture() -> (
     Arc<Catalog>,
     crate::catalog::resolved::EnsuredRoute,
@@ -3035,9 +2868,6 @@ async fn two_route_listing_fixture() -> (
     (catalog, ensured_spot, ensured_perp)
 }
 
-/// The typed listing identifier of the route's own listing is answered by both
-/// resolvers with one and the same key, and an identifier nobody registered is
-/// refused by both with one and the same value.
 #[tokio::test]
 async fn the_listing_identifier_resolvers_agree() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -3086,10 +2916,6 @@ async fn the_listing_identifier_resolvers_agree() {
     );
 }
 
-/// The normalization a route declares for a typed identifier is the rule its
-/// lookup is folded under: on a route that declares ASCII case folding per typed
-/// identifier and product, every spelling of the identifier it published names that
-/// listing on both resolvers.
 #[tokio::test]
 async fn a_typed_identifier_of_any_case_resolves_on_a_case_insensitive_route() {
     let fixture = Fixture::with_normalization(
@@ -3126,9 +2952,6 @@ async fn a_typed_identifier_of_any_case_resolves_on_a_case_insensitive_route() {
     }
 }
 
-/// The other direction of the same rule: a route that declares exact matching for
-/// the typed identifier it publishes keeps the case apart, so the spelling it did
-/// not publish names no listing, on either resolver.
 #[tokio::test]
 async fn a_typed_identifier_of_another_case_does_not_resolve_on_an_exact_route() {
     let fixture = Fixture::with_normalization(
@@ -3146,7 +2969,6 @@ async fn a_typed_identifier_of_another_case_does_not_resolve_on_an_exact_route()
     let ensured = fixture.ensure().await.expect("the spot route loads");
     let catalog = fixture.catalog();
 
-    // Control: the spelling the route published resolves on both sides.
     let published = ListingIdentifier::BinanceInstrument {
         symbol: NativeSymbol::new("BTCUSDT").expect("the fixture symbol is valid"),
         product: BinanceProduct::Spot,
@@ -3181,8 +3003,6 @@ async fn a_typed_identifier_of_another_case_does_not_resolve_on_an_exact_route()
     assert_eq!(synchronous, expected);
     assert_eq!(asynchronous, expected);
 
-    // The symbol space of the same route matches exactly too, so the declaration is
-    // the route's answer for both lookups a listing can be reached by.
     assert_eq!(
         ensured
             .resolve_native_symbol(&NativeSymbol::new("BTCUSDT").expect("the symbol is valid"))
@@ -3200,9 +3020,6 @@ async fn a_typed_identifier_of_another_case_does_not_resolve_on_an_exact_route()
     );
 }
 
-/// A rule is declared at typed identifier *and* product granularity, so a route that
-/// folds the perpetual instrument identifier does not fold the spot one: the spot
-/// spelling the route did not publish is not folded into the one it did.
 #[tokio::test]
 async fn a_typed_identifier_of_a_product_without_a_rule_is_not_folded() {
     let rules = vec![IdentifierNormalizationRule::new(
@@ -3251,15 +3068,10 @@ async fn a_typed_identifier_of_a_product_without_a_rule_is_not_folded() {
     );
 }
 
-/// the route's own scoped identifier is answered by both resolvers, another
-/// scope is a route mismatch on both, and the same scope without a registered
-/// listing stays a not-found on both.
 #[tokio::test]
 async fn the_listing_identifier_resolvers_agree_about_a_scoped_identifier() {
     let (catalog, ensured_spot, _) = two_route_listing_fixture().await;
 
-    // Control: the scoped identifier of this route's own listing resolves on both
-    // sides and names the same listing key.
     let own = ListingIdentifier::HyperliquidAsset {
         scope: spot_route().scope,
         product: HyperliquidAssetProduct::Spot,
@@ -3277,8 +3089,6 @@ async fn the_listing_identifier_resolvers_agree_about_a_scoped_identifier() {
         "both resolvers answer with the same listing key"
     );
 
-    // A scoped identifier of this route's own scope nobody registered is a
-    // not-found on both sides, never a scope refusal.
     let unregistered = ListingIdentifier::HyperliquidAsset {
         scope: spot_route().scope,
         product: HyperliquidAssetProduct::Perpetual,
@@ -3297,9 +3107,6 @@ async fn the_listing_identifier_resolvers_agree_about_a_scoped_identifier() {
     assert_eq!(synchronous, expected);
     assert_eq!(asynchronous, expected);
 
-    // The cross-scope direction: an identifier of another scope is not this
-    // route's to answer, whoever registered it, and both resolvers say so with
-    // one and the same strongly typed value.
     let foreign = ListingIdentifier::HyperliquidAsset {
         scope: perp_route().scope,
         product: HyperliquidAssetProduct::Spot,
@@ -3330,9 +3137,6 @@ async fn the_listing_identifier_resolvers_agree_about_a_scoped_identifier() {
     );
 }
 
-/// The typed identifier of a listing another route publishes is never answered
-/// by this route's resolvers, even though the catalog publishes both routes: the
-/// per-route index is the only one consulted, and both sides refuse alike.
 #[tokio::test]
 async fn the_listing_identifier_resolvers_agree_about_another_routes_listing() {
     let (catalog, ensured_spot, ensured_perp) = two_route_listing_fixture().await;
@@ -3359,7 +3163,6 @@ async fn the_listing_identifier_resolvers_agree_about_another_routes_listing() {
         "the two refusals must be the same value, field by field"
     );
 
-    // The route that does publish it answers on both sides.
     let synchronous = ensured_perp
         .resolve_listing_identifier(&foreign)
         .expect("the perp route answers its own listing");
@@ -3370,9 +3173,6 @@ async fn the_listing_identifier_resolvers_agree_about_another_routes_listing() {
     assert_eq!(synchronous, asynchronous);
 }
 
-/// The route's own normalization rule is applied by both symbol resolvers, so a
-/// spelling the route folds names the same listing on both sides, and an unknown
-/// symbol is refused by both with one and the same value.
 #[tokio::test]
 async fn the_native_symbol_resolvers_agree() {
     let fixture = Fixture::new(vec![entry_with_aliases(
@@ -3423,9 +3223,6 @@ async fn the_native_symbol_resolvers_agree() {
     );
 }
 
-/// One listing is resolved into the same value by the route proof, the catalog
-/// resolver and the protocol-facing projection, and an absent
-/// listing is refused by both resolvers with one and the same value.
 #[tokio::test]
 async fn the_listing_resolvers_agree() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -3477,9 +3274,6 @@ async fn the_listing_resolvers_agree() {
     );
 }
 
-/// The proof of one route never resolves another route's listing, however
-/// published it is, while the route-unscoped readers of the catalog answer for
-/// the route the listing itself names.
 #[tokio::test]
 async fn the_ensured_route_never_resolves_another_routes_listing() {
     let (catalog, ensured_spot, ensured_perp) = two_route_listing_fixture().await;
@@ -3523,9 +3317,6 @@ async fn the_ensured_route_never_resolves_another_routes_listing() {
     );
 }
 
-/// The published-listing readers answer from one and the same snapshot: the
-/// proof's listings are the catalog's cached ones, and the entry, symbol and
-/// identity readers agree with the resolvers.
 #[tokio::test]
 async fn the_published_listing_readers_agree() {
     let fixture = Fixture::new(vec![btc_entry()]);
@@ -3570,8 +3361,6 @@ async fn the_published_listing_readers_agree() {
     assert_eq!(catalog.listings_for(btc().id()).to_vec(), vec![btc_key()]);
 }
 
-/// A source no venue commit in this module ever fetches through: the commit stages
-/// the listings the test states instead of asking a venue for them.
 struct Unreachable;
 
 impl CatalogSource for Unreachable {
@@ -3590,14 +3379,6 @@ impl CatalogSource for Unreachable {
     }
 }
 
-/// One venue commit is one atomic replacement.
-///
-/// A commit installs the snapshots it staged, revokes the scopes the venue no
-/// longer publishes and moves the publication pointer in one critical section, so
-/// the registered route set and the directory it belongs to move together: every
-/// observation is one whole commit, the generation handed to the commit's
-/// visibility callback is the very pointer the catalogue serves afterwards, and a
-/// generation a reader already holds never changes.
 #[tokio::test]
 async fn a_venue_commit_is_one_atomic_replacement() {
     let catalog = Arc::new(Catalog::new());
@@ -3607,8 +3388,6 @@ async fn a_venue_commit_is_one_atomic_replacement() {
         perp_route(),
     ]);
 
-    // The venue's first commit registers both of its routes and publishes both
-    // catalogs, which is the state the replacement below starts from.
     let registrations = vec![
         test_support::registration(&spot_route(), SPOT_SOURCE),
         test_support::registration(&perp_route(), SPOT_SOURCE),
@@ -3672,8 +3451,6 @@ async fn a_venue_commit_is_one_atomic_replacement() {
         "one commit installed both of the venue's catalogs at once"
     );
 
-    // The replacement: a new snapshot for the spot scope, and the perpetual scope
-    // is gone. Both move in one commit.
     let replacement = test_support::plan_venue_commit(
         &catalog,
         &venue,
@@ -3738,17 +3515,6 @@ async fn a_venue_commit_is_one_atomic_replacement() {
     );
 }
 
-/// A venue commit the catalog refuses changes nothing.
-///
-/// The refusal here is the candidate check's own: a staged batch whose route the
-/// commit does not register is refused before the generation is built, so this
-/// test pins "a refusal at that point leaves every view at the previous
-/// generation" — the published pointer and identity, the registered route set,
-/// the registration of the route the batch belonged to, and the visibility
-/// callback. It is *not* evidence for the commit's write order: for that, see
-/// [`a_venue_commit_the_display_gate_refuses_leaves_every_view_at_the_previous_generation`],
-/// whose refusal happens while the generation is being built, after staging
-/// succeeded.
 #[tokio::test]
 async fn a_refused_venue_commit_leaves_every_view_at_the_previous_generation() {
     let catalog = Arc::new(Catalog::new());
@@ -3759,7 +3525,6 @@ async fn a_refused_venue_commit_leaves_every_view_at_the_previous_generation() {
     ]);
     let registrations = vec![test_support::registration(&spot_route(), SPOT_SOURCE)];
 
-    // The venue's first commit registers the spot route and publishes its catalog.
     let plan = test_support::plan_venue_commit(
         &catalog,
         &venue,
@@ -3795,8 +3560,6 @@ async fn a_refused_venue_commit_leaves_every_view_at_the_previous_generation() {
         .cached_listings(&spot_route())
         .expect("the first commit published the spot catalog");
 
-    // A batch is staged against a route the commit that follows does not register:
-    // the pending's route is absent from the candidate, so the commit is refused.
     let plan = test_support::plan_venue_commit(
         &catalog,
         &venue,
@@ -3860,26 +3623,10 @@ async fn a_refused_venue_commit_leaves_every_view_at_the_previous_generation() {
     );
 }
 
-/// A venue commit the display gate refuses leaves every view at the previous
-/// generation.
-///
-/// Two scopes of one venue stage one batch each, and the two batches stage a
-/// different display code for the same canonical asset. Each stage is accepted —
-/// a batch is validated against the base plus itself — and the refusal happens
-/// while the venue commit folds the second batch into the same generation, which
-/// is exactly the failure that has to be found *before* the route registry is
-/// written. A commit that wrote its candidate first and built the generation
-/// afterwards would leave the route map holding two routes whose snapshots nobody
-/// published, and the route-set and registration assertions below would fail.
-///
-/// The refusal is therefore the one [`a_refused_venue_commit_leaves_every_view_at_the_previous_generation`]
-/// cannot produce: a pending that passed staging, and a generation that refuses it.
 #[tokio::test]
 async fn a_venue_commit_the_display_gate_refuses_leaves_every_view_at_the_previous_generation() {
     let catalog = Arc::new(Catalog::new());
     let venue = spot_route().venue;
-    // Two scopes of one venue, both publishing a spot instrument: the two batches
-    // differ only in the display code they stage for the one asset they share.
     let first = spot_route();
     let second = test_support::route("binance", "spot-b");
     let asset = test_support::security("cik/320193", "AAPL");
@@ -3958,14 +3705,6 @@ async fn a_venue_commit_the_display_gate_refuses_leaves_every_view_at_the_previo
     }
 }
 
-/// Stages one batch of `route` whose listing is based on `asset` and whose batch
-/// stages `code` for that asset.
-///
-/// [`Catalog::stage_fixture_listings`] states no codes, so this builds the fetch
-/// context and the pending the way a venue commit's own stage does, which is what
-/// lets a test stage two codes for one asset across two batches. The asset is a
-/// security because its terms carry no code: a code is what a listing verified,
-/// so a batch is free to stage one.
 fn staged_batch_with_code(
     catalog: &Catalog,
     registered: &crate::catalog::source::RegisteredCatalogRoute,

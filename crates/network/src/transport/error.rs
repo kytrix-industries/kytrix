@@ -1,32 +1,18 @@
-//! Errors produced by HTTP operations, WebSocket sessions, and logical subscriptions.
-
 use smol_str::SmolStr;
 use thiserror::Error;
 
-/// Why a WebSocket upgrade never produced a session.
-///
-/// The handshake is the one operation where the proxy, DNS, TCP, TLS, and HTTP legs
-/// collapse into a single failure, and the legs call for different reactions: a
-/// timeout is worth repeating as it stands, a refusal is not, and a broken transport
-/// has to say which leg broke. Naming the leg is what keeps that decision — and the
-/// sentence a user reads — from being one blanket "could not connect".
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum UpgradeFailure {
-    /// The attempt ran past the connect budget.
     #[error("the connect attempt timed out")]
     Timeout,
-    /// No usable response arrived: the proxy, DNS, TCP, TLS, or HTTP leg broke.
     #[error("the transport failed: {detail}")]
     Transport { detail: SmolStr },
-    /// The peer answered, but not with the protocol switch the handshake needs.
     #[error("the peer answered {status} instead of switching protocols")]
     Rejected { status: u16 },
-    /// The peer switched protocols, but the answer cannot start a session.
     #[error("the peer handshake is not usable: {detail}")]
     Handshake { detail: SmolStr },
 }
 
-/// Typed failures shared by HTTP operations and logical subscriptions.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum TransportError {
     #[error("failed to configure the selected proxy route")]

@@ -1,12 +1,3 @@
-//! The dynamic route registry: descriptors and their capability sets.
-//!
-//! A route is registered as a whole: its capability descriptors, its identifier
-//! normalization rules, its catalog source binding and the source instance itself
-//! become visible together or not at all. Nothing here guesses an endpoint, a
-//! credential or a capability from a venue name: a route's connection
-//! configuration is its venue's own. The registry is a map of one slot per
-//! loaded venue, and a slot is only ever written by a load.
-
 use std::sync::Arc;
 
 use ahash::AHashMap;
@@ -30,34 +21,19 @@ use crate::{
     protocol::RequestIdentity,
 };
 
-/// Monotonic version of one venue's stored credentials.
-///
-/// The generation follows the venue, never a scope: a venue whose markets sign apart still
-/// answers one generation, because a credential set is a field of the venue's own settings
-/// — and two venues never share one.
-/// This is the only credential generation in the crate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CredentialGeneration(u64);
 
 impl CredentialGeneration {
-    /// Creates a generation from a published counter value.
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
-    /// Returns the published counter value.
     pub const fn get(self) -> u64 {
         self.0
     }
 }
 
-/// One capability of one route, and whether it needs the venue's credential.
-///
-/// A capability names no endpoint: which hosts a request dials is the venue's own
-/// connection configuration, and whether one request travels over HTTP or a
-/// WebSocket is the request type's property rather than the capability's.
-/// What a capability states is whether a request for it has to carry the venue's
-/// credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RouteCapabilityDescriptor {
     capability: CapabilityId,
@@ -65,7 +41,6 @@ pub struct RouteCapabilityDescriptor {
 }
 
 impl RouteCapabilityDescriptor {
-    /// Describes one capability of a route.
     pub const fn new(capability: CapabilityId, needs_auth: bool) -> Self {
         Self {
             capability,
@@ -73,18 +48,15 @@ impl RouteCapabilityDescriptor {
         }
     }
 
-    /// Returns the capability this descriptor describes.
     pub const fn capability(&self) -> CapabilityId {
         self.capability
     }
 
-    /// Returns whether a request for this capability needs the venue's credential.
     pub const fn needs_auth(&self) -> bool {
         self.needs_auth
     }
 }
 
-/// Everything one registered route declares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VenueRouteDescriptor {
     route: VenueRoute,
@@ -94,7 +66,6 @@ pub struct VenueRouteDescriptor {
 }
 
 impl VenueRouteDescriptor {
-    /// Declares one route.
     pub fn new(
         route: VenueRoute,
         capabilities: Vec<RouteCapabilityDescriptor>,
@@ -109,28 +80,22 @@ impl VenueRouteDescriptor {
         }
     }
 
-    /// Returns the route this descriptor is about.
     pub const fn route(&self) -> &VenueRoute {
         &self.route
     }
 
-    /// Returns every capability descriptor of this route, in `CapabilityId` order.
     pub fn capabilities(&self) -> &[RouteCapabilityDescriptor] {
         &self.capabilities
     }
 
-    /// Returns the identifier normalization rules of this route.
     pub fn identifier_normalization(&self) -> &[IdentifierNormalizationRule] {
         &self.identifier_normalization
     }
 
-    /// Returns the catalog source this route binds, absent for a scope that publishes
-    /// no catalog.
     pub fn catalog_source(&self) -> Option<&CatalogSourceId> {
         self.catalog_source.as_ref()
     }
 
-    /// Returns the capability descriptor of one capability of this route.
     pub fn capability(&self, capability: CapabilityId) -> Option<&RouteCapabilityDescriptor> {
         self.capabilities
             .binary_search_by_key(&capability, RouteCapabilityDescriptor::capability)
@@ -138,29 +103,24 @@ impl VenueRouteDescriptor {
             .map(|index| &self.capabilities[index])
     }
 
-    /// Returns `true` when this route declares the capability.
     pub fn supports(&self, capability: CapabilityId) -> bool {
         self.capability(capability).is_some()
     }
 
-    /// Returns `true` when this route publishes a market catalog.
     pub fn provides_catalog(&self) -> bool {
         self.supports(CapabilityId::MarketCatalog)
     }
 
-    /// Returns the identity of one capability of this route.
     pub fn identity(&self, capability: CapabilityId) -> RequestIdentity {
         RequestIdentity::new(self.route.clone(), capability)
     }
 
-    /// Returns every identity this route declares.
     pub fn identities(&self) -> impl Iterator<Item = RequestIdentity> + '_ {
         self.capabilities
             .iter()
             .map(|descriptor| self.identity(descriptor.capability))
     }
 
-    /// Returns the normalization mode of one typed identifier at one product granularity.
     pub fn normalization_mode(
         &self,
         identifier: ListingIdentifierKind,
@@ -175,7 +135,6 @@ impl VenueRouteDescriptor {
     }
 }
 
-/// Why a candidate route descriptor set was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DescriptorError {
     #[error("route {route} is registered twice")]
@@ -202,7 +161,6 @@ pub enum DescriptorError {
     },
 }
 
-/// Why a registry update was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RegistryError {
     #[error(transparent)]
@@ -211,10 +169,6 @@ pub enum RegistryError {
     Catalog(#[from] CatalogError),
 }
 
-/// Validated `(route, capability)` pairs with the descriptor behind each of them.
-///
-/// The index is built once per publication and is the only place a route and a
-/// capability are resolved from.
 #[derive(Clone, Debug, Default)]
 pub struct RegisteredRoutes {
     descriptors: Arc<[VenueRouteDescriptor]>,
@@ -222,7 +176,6 @@ pub struct RegisteredRoutes {
 }
 
 impl RegisteredRoutes {
-    /// Builds the index of an already validated descriptor set.
     fn build(descriptors: Vec<VenueRouteDescriptor>) -> Self {
         let mut by_route = AHashMap::with_capacity(descriptors.len());
         for descriptor in &descriptors {
@@ -234,24 +187,20 @@ impl RegisteredRoutes {
         }
     }
 
-    /// Returns every registered route, in canonical route order.
     pub fn routes(&self) -> &[VenueRouteDescriptor] {
         &self.descriptors
     }
 
-    /// Returns the descriptor of one registered route.
     pub fn descriptor(&self, route: &VenueRoute) -> Option<&Arc<VenueRouteDescriptor>> {
         self.by_route.get(route)
     }
 
-    /// Returns `true` when this registry declares the route and the capability.
     pub fn supports(&self, route: &VenueRoute, capability: CapabilityId) -> bool {
         self.by_route
             .get(route)
             .is_some_and(|descriptor| descriptor.supports(capability))
     }
 
-    /// Returns the capability descriptor of one registered `(route, capability)`.
     pub fn capability_descriptor(
         &self,
         route: &VenueRoute,
@@ -262,14 +211,12 @@ impl RegisteredRoutes {
             .and_then(|descriptor| descriptor.capability(capability))
     }
 
-    /// Returns the routes that publish a market catalog, in canonical route order.
     pub fn catalog_routes(&self) -> impl Iterator<Item = &VenueRouteDescriptor> {
         self.descriptors
             .iter()
             .filter(|descriptor| descriptor.provides_catalog())
     }
 
-    /// Returns the routes that sign with the venue's stored credentials, in canonical order.
     pub fn authenticated_routes(&self) -> impl Iterator<Item = &VenueRouteDescriptor> {
         self.descriptors.iter().filter(|descriptor| {
             descriptor
@@ -279,7 +226,6 @@ impl RegisteredRoutes {
         })
     }
 
-    /// Returns the already verified `(route, capability)` pairs of this registry.
     pub fn requirements(&self) -> CatalogRouteRequirements {
         CatalogRouteRequirements::new(self.descriptors.iter().flat_map(|descriptor| {
             descriptor
@@ -290,22 +236,12 @@ impl RegisteredRoutes {
     }
 }
 
-/// The registered route registry: one slot per loaded venue.
-///
-/// The registry owns the descriptor index and the venue slots together: a slot and
-/// the index that serves it are replaced in one step, so a route becomes
-/// addressable at the same instant it belongs to a venue. What the registry does
-/// **not** own any more is the catalog source binding: that is part of the same
-/// venue commit, written by the catalog layer inside the critical section the
-/// commit already holds, so a descriptor and the catalog it publishes are
-/// never registered apart.
 pub struct VenueRouteRegistry {
     venues: AHashMap<VenueId, Arc<[VenueRouteDescriptor]>>,
     index: Arc<RegisteredRoutes>,
 }
 
 impl VenueRouteRegistry {
-    /// Creates an empty registry: no venue is loaded and nothing may be sent.
     pub fn new() -> Self {
         Self {
             venues: AHashMap::new(),
@@ -313,27 +249,18 @@ impl VenueRouteRegistry {
         }
     }
 
-    /// Returns the current descriptor view.
     pub fn routes(&self) -> &Arc<RegisteredRoutes> {
         &self.index
     }
 
-    /// Returns whether the venue holds a registered slot.
     pub fn has_venue(&self, venue: &VenueId) -> bool {
         self.venues.contains_key(venue)
     }
 
-    /// Returns `true` when the route is registered for this capability.
     pub fn supports(&self, route: &VenueRoute, capability: CapabilityId) -> bool {
         self.index.supports(route, capability)
     }
 
-    /// Validates one venue's candidate route set without changing anything.
-    ///
-    /// The candidate the commit will write is assembled here — the routes every
-    /// other venue currently holds plus the descriptors passed in — so the
-    /// transaction can validate the whole set, derive the catalog registrations
-    /// from it and only then enter the critical section that writes both.
     pub fn plan_venue_routes(
         &self,
         venue: &VenueId,
@@ -342,13 +269,6 @@ impl VenueRouteRegistry {
         candidate_routes(self.candidate(venue, descriptors)).map_err(RegistryError::Descriptor)
     }
 
-    /// Replaces one venue's slot, leaving every other venue's routes as they are.
-    ///
-    /// This is the routing half of a venue commit, and it is infallible on purpose:
-    /// the candidate was validated by [`Self::plan_venue_routes`] before the
-    /// critical section began, so entering it means the commit cannot be refused
-    /// halfway through. An empty `descriptors` revokes the venue's slot, which is
-    /// how a venue that no longer publishes a scope stops serving it.
     pub fn commit_venue_routes(
         &mut self,
         venue: &VenueId,
@@ -372,7 +292,6 @@ impl VenueRouteRegistry {
         Arc::clone(&self.index)
     }
 
-    /// Assembles the candidate set of one venue's commit.
     fn candidate(
         &self,
         venue: &VenueId,
@@ -389,7 +308,6 @@ impl VenueRouteRegistry {
         candidate
     }
 
-    /// Returns the source registered for one registered catalog route.
     pub fn source_of(&self, route: &VenueRoute) -> Option<CatalogSourceId> {
         let routes = &self.index;
         let descriptor = routes.descriptor(route)?;
@@ -422,7 +340,6 @@ pub(crate) fn candidate_routes(
     Ok(RegisteredRoutes::build(routes))
 }
 
-/// Validates one candidate route descriptor.
 fn validate_descriptor(descriptor: &mut VenueRouteDescriptor) -> Result<(), DescriptorError> {
     let route = descriptor.route.clone();
     descriptor
@@ -455,12 +372,6 @@ fn validate_descriptor(descriptor: &mut VenueRouteDescriptor) -> Result<(), Desc
     Ok(())
 }
 
-/// Builds the catalog registrations of one venue's committed route set.
-///
-/// A venue commit registers the venue's routes with the catalog layer in the same
-/// critical section that writes them into this registry, so the two views of one
-/// route — the descriptor the request path validates against and the registration
-/// the catalog was fetched under — are derived from one index and written once.
 pub(crate) fn venue_registrations(
     index: &RegisteredRoutes,
     venue: &VenueId,
@@ -500,46 +411,22 @@ pub(crate) fn venue_registrations(
         .collect()
 }
 
-/// The canonical venue identities of the built-in routes.
 pub const BINANCE_VENUE: &str = "binance";
-/// The canonical OKX venue identity.
 pub const OKX_VENUE: &str = "okx";
-/// The canonical Hyperliquid venue identity.
 pub const HYPERLIQUID_VENUE: &str = "hyperliquid";
-/// The canonical Longbridge venue identity.
 pub const LONGBRIDGE_VENUE: &str = "longbridge";
-/// The spot scope of a market participant whose scopes are named after the API product.
 pub const SPOT_SCOPE: &str = "spot";
-/// The USD-M perpetual scope of Binance.
 pub const PERPETUAL_SCOPE: &str = "usd-m-perp";
-/// The swap scope of OKX.
 pub const SWAP_SCOPE: &str = "swap";
-/// The HyperCore spot scope.
 pub const CORE_SPOT_SCOPE: &str = "core-spot";
-/// The HyperCore perpetual scope.
 pub const CORE_PERP_SCOPE: &str = "core-perp";
-/// The canonical name of Polymarket's event scope.
 pub const PREDICT_SCOPE: &str = "predict";
-/// The US-equity scope of Longbridge.
 pub const LONGBRIDGE_US_SCOPE: &str = "us";
-/// The canonical scope every Hyperliquid wallet-monitor connection is keyed by.
-///
-/// One monitored address is read across the core spot scope, the core perpetual
-/// scope and every deployed perpetual DEX, and the venue caps one IP at ten
-/// WebSocket connections, so those reads share one socket and therefore one
-/// connection key. That key cannot carry the scope of whichever request opened it:
-/// it names this scope instead. The core perpetual scope is the canonical one
-/// because wallet reads were historically attributed to it and every scope of the
-/// venue is reached through the same origin.
 pub const HYPERLIQUID_WALLET_SCOPE: &str = CORE_PERP_SCOPE;
 
 #[cfg(test)]
 mod tests {
 
-    /// Plans and commits one candidate route set of one venue.
-    ///
-    /// A commit is reached with a candidate that was planned first, which is the
-    /// order a load transaction uses.
     fn commit(registry: &mut VenueRouteRegistry, venue: &str, routes: Vec<VenueRouteDescriptor>) {
         registry
             .plan_venue_routes(&self::venue(venue), routes.clone())
@@ -582,17 +469,14 @@ mod tests {
         )
     }
 
-    /// Validates one candidate descriptor into its indexed form.
     fn validate(descriptor: VenueRouteDescriptor) -> Result<RegisteredRoutes, DescriptorError> {
         candidate_routes(vec![descriptor])
     }
 
-    /// Validates one candidate descriptor, discarding the accepted index.
     fn validate_outcome(descriptor: VenueRouteDescriptor) -> Result<(), DescriptorError> {
         validate(descriptor).map(|_| ())
     }
 
-    /// Validates a whole candidate set, discarding the accepted index.
     fn validate_all(descriptors: Vec<VenueRouteDescriptor>) -> Result<(), DescriptorError> {
         candidate_routes(descriptors).map(|_| ())
     }
@@ -651,8 +535,6 @@ mod tests {
         );
     }
 
-    /// A route that declares no capability is a legal candidate: it registers a
-    /// scope that answers nothing, and it publishes no catalog.
     #[test]
     fn a_route_without_capabilities_is_accepted() {
         let empty =
@@ -731,8 +613,6 @@ mod tests {
         );
     }
 
-    /// Every `(route, capability)` pair a route declares resolves to its own
-    /// descriptor, and a pair it does not declare resolves to nothing.
     #[test]
     fn every_registered_pair_resolves_to_its_descriptor() {
         let routes = validate(catalog_route()).expect("a valid descriptor should be accepted");
@@ -762,9 +642,6 @@ mod tests {
         );
     }
 
-    /// A capability descriptor states whether its requests sign with the venue's
-    /// credential, and nothing about a host: which origins a request dials is the
-    /// venue's own connection configuration, so no descriptor names one.
     #[test]
     fn a_capability_descriptor_states_whether_it_needs_the_venues_credential() {
         let mut descriptor = catalog_route();
@@ -808,7 +685,6 @@ mod tests {
         );
     }
 
-    /// One catalog route on another venue than the Binance spot fixture.
     fn okx_route() -> VenueRouteDescriptor {
         VenueRouteDescriptor::new(
             route("okx", "spot"),
@@ -832,8 +708,6 @@ mod tests {
         VenueId::from_name(name).expect("the fixture venue is canonical")
     }
 
-    /// An empty registry is a legal state: nothing is registered and nothing may
-    /// be sent.
     #[test]
     fn an_empty_registry_is_a_legal_state() {
         let registry = VenueRouteRegistry::new();
@@ -846,8 +720,6 @@ mod tests {
         );
     }
 
-    /// Publishing one venue's routes leaves every other venue's slot exactly as
-    /// it was.
     #[test]
     fn publishing_a_venue_only_replaces_its_own_slot() {
         let mut registry = VenueRouteRegistry::new();
@@ -860,8 +732,6 @@ mod tests {
         assert!(registry.supports(&route("okx", "spot"), CapabilityId::MarketCatalog));
     }
 
-    /// A route the venue held and a new candidate omits is revoked in the same
-    /// commit that publishes the rest.
     #[test]
     fn a_route_absent_from_the_next_candidate_is_revoked() {
         let mut registry = VenueRouteRegistry::new();
@@ -881,7 +751,6 @@ mod tests {
         );
     }
 
-    /// An empty candidate revokes the venue's slot without touching any other.
     #[test]
     fn an_empty_candidate_revokes_the_venue() {
         let mut registry = VenueRouteRegistry::new();
@@ -898,8 +767,6 @@ mod tests {
         );
     }
 
-    /// A candidate that repeats a route is refused as a whole: the slot the venue
-    /// already held stays exactly as it was.
     #[test]
     fn a_refused_candidate_leaves_the_venue_slot_as_it_was() {
         let mut registry = VenueRouteRegistry::new();

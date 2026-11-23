@@ -1,10 +1,3 @@
-//! The pane's own behaviour: what it reports, what the header offers, what the row of
-//! readings draws, and what it leaves behind when it goes.
-//!
-//! The contract layer is driven directly — `load`, `sync`, `body`, `header`, `release`
-//! are the hooks the framework calls — over the engine's headless host, because these
-//! tests are about this pane's decisions rather than about the framework's dispatch.
-
 use std::{cell::Cell, rc::Rc};
 
 use app_config::settings::{AccountConfig, AccountWalletKind, Config};
@@ -28,13 +21,10 @@ use crate::{
     service::test_support::{DEFAULT_FUNDS, FakeSource, FetchPlan, asset, snapshot_of},
 };
 
-/// The account every fixture pane is scoped to.
 const ACCOUNT: &str = "test-account";
 
-/// The size the pane's body is laid out in, which is what the chart is measured from.
 const PAGE: (f32, f32) = (640.0, 360.0);
 
-/// The translator the product ships: what these tests assert is the catalogue's copy.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -56,7 +46,6 @@ fn write_config(harness: &mut WidgetTestApp, config: Config) -> bool {
     harness.app_mut().write(&signal, config)
 }
 
-/// Signs `user_id` in the way the composition root does: a settings write.
 fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
     let mut config = current_config(harness);
     config.account = Some(AccountConfig {
@@ -67,18 +56,12 @@ fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
     write_config(harness, config);
 }
 
-/// Signs the pane out the way the composition root does: a settings write.
 fn sign_out(harness: &mut WidgetTestApp) {
     let mut config = current_config(harness);
     config.account = None;
     write_config(harness, config);
 }
 
-/// A wall clock the test owns, and how many times the pane read it.
-///
-/// A countdown's label is formatted against the wall clock, which is not the engine
-/// clock [`WidgetTestApp::advance`] moves; the read count is what tells one timer chain
-/// from two (two chains tick twice per round).
 struct TestClock {
     now: Rc<Cell<i64>>,
     reads: Rc<Cell<usize>>,
@@ -100,7 +83,6 @@ impl TestClock {
         self.reads.get()
     }
 
-    /// The wall clock's current reading.
     fn at(&self) -> i64 {
         self.now.get()
     }
@@ -115,13 +97,10 @@ impl TestClock {
     }
 }
 
-/// A pane the framework would have built, driven by a fake source.
 struct Pane {
     widget: CryptocurrencyEtfWidget,
     status: WidgetStatus,
-    /// The box the body and the header are built into.
     page: NodeId,
-    /// The group node a header row is built into.
     header_group: NodeId,
 }
 
@@ -150,7 +129,6 @@ fn pane_with_source(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
     }
 }
 
-/// A pane whose countdown reads a clock the test moves.
 fn pane_at_clock(harness: &mut WidgetTestApp, clock: &TestClock) -> Pane {
     let scope = harness.scope();
     let status = WidgetStatus::new(harness.app_mut(), scope);
@@ -178,7 +156,6 @@ fn pane_at_clock(harness: &mut WidgetTestApp, clock: &TestClock) -> Pane {
     }
 }
 
-/// A pane with no service connection behind it.
 fn pane_without_source(harness: &mut WidgetTestApp) -> Pane {
     let scope = harness.scope();
     let status = WidgetStatus::new(harness.app_mut(), scope);
@@ -199,7 +176,6 @@ fn pane_without_source(harness: &mut WidgetTestApp) -> Pane {
     }
 }
 
-/// A box of the pane's size, which is what the body is laid out in.
 fn page(harness: &mut WidgetTestApp) -> NodeId {
     harness.with_cx(|cx| {
         let root = cx.tree().root();
@@ -232,7 +208,6 @@ fn sync(harness: &mut WidgetTestApp, pane: &mut Pane) {
         .expect("the widget syncs");
 }
 
-/// Builds the body the framework would build once the pane has content, and lays it out.
 fn build_body(harness: &mut WidgetTestApp, pane: &mut Pane) {
     let parent = pane.page;
     harness
@@ -241,7 +216,6 @@ fn build_body(harness: &mut WidgetTestApp, pane: &mut Pane) {
     harness.drain();
 }
 
-/// Builds the header right group, as a pane would.
 fn build_header(harness: &mut WidgetTestApp, pane: &mut Pane) {
     let parent = pane.header_group;
     harness
@@ -250,7 +224,6 @@ fn build_header(harness: &mut WidgetTestApp, pane: &mut Pane) {
     harness.drain();
 }
 
-/// One production-shaped frame: synchronization, then the pipeline.
 fn frame(harness: &mut WidgetTestApp, pane: &mut Pane) {
     sync(harness, pane);
     harness.drain();
@@ -266,13 +239,11 @@ fn key() -> CryptocurrencyEtfStreamKey {
     }
 }
 
-/// Reports a status as the stream would.
 fn report_status(harness: &mut WidgetTestApp, pane: &mut Pane, status: CryptocurrencyEtfStatus) {
     let message = Arc::new(CryptocurrencyEtfStreamMessage::Status(status));
     harness.with_cx(|cx| pane.widget.apply_reliable(key(), message, cx));
 }
 
-/// Reports an answer as the stream would.
 fn report_snapshot(
     harness: &mut WidgetTestApp,
     pane: &mut Pane,
@@ -304,7 +275,6 @@ fn refreshing() -> CryptocurrencyEtfStatus {
     }
 }
 
-/// An answer whose first asset has the funds a test names.
 fn snapshot_with(funds: &[&str]) -> Arc<CryptocurrencyEtfSnapshot> {
     snapshot_of([
         asset(CryptocurrencyEtfAsset::Btc, &[1.0, 2.0], funds),
@@ -314,7 +284,6 @@ fn snapshot_with(funds: &[&str]) -> Arc<CryptocurrencyEtfSnapshot> {
     ])
 }
 
-/// Offers a header request the way a control's handler would, and applies it.
 fn request(harness: &mut WidgetTestApp, pane: &mut Pane, request: HeaderRequest) {
     let signal = pane.widget.requests;
     harness.with_cx(|cx| {
@@ -323,14 +292,11 @@ fn request(harness: &mut WidgetTestApp, pane: &mut Pane, request: HeaderRequest)
     frame(harness, pane);
 }
 
-/// The debug node a test selector names, inside the page.
 fn node(harness: &WidgetTestApp, parent: NodeId, prefix: &str) -> NodeId {
     harness
         .find_by_debug_prefix(parent, prefix)
         .unwrap_or_else(|| panic!("`{prefix}` should be shown"))
 }
-
-// ── what the pane reports ──────────────────────────────────────────────────────────
 
 #[test]
 fn a_pane_without_an_account_should_ask_for_one() {
@@ -353,9 +319,6 @@ fn a_pane_without_an_account_should_ask_for_one() {
     );
 }
 
-/// A pane nobody is signed in for waits in the language the interface shows: the notice
-/// is a reference into the catalogue, resolved on the frame that draws it, so the pane
-/// reports nothing again — no reload, and nothing asked of the service.
 #[test]
 fn a_language_change_should_resolve_the_signed_out_notice_where_it_is_drawn() {
     let mut harness = harness();
@@ -395,9 +358,6 @@ fn an_account_should_be_what_enables_the_controls() {
     let mut harness = harness();
     sign_out(&mut harness);
     let mut signed_out = pane_with_source(&mut harness, FakeSource::new([FetchPlan::Pending]));
-    // The account is the pane's scope: a pane loaded while nobody is signed in reads
-    // nothing, and it is only a later settings write that re-scopes it (see
-    // `signing_out_should_take_the_answer_with_it`).
     load(&mut harness, &mut signed_out);
     sign_in(&mut harness, ACCOUNT);
     let mut signed_in = pane_with_source(&mut harness, FakeSource::new([FetchPlan::Pending]));
@@ -427,11 +387,6 @@ fn an_account_should_be_what_enables_the_controls() {
     );
 }
 
-/// The double-click the refresh control exists to absorb.
-///
-/// A refresh is refused by the service while one is in flight, and the framework shows a
-/// refusal as a failure — so a control that forwarded a second click inside that window
-/// would answer a fast double click with a banner.
 #[test]
 fn a_refresh_should_not_be_forwarded_while_an_answer_is_being_read() {
     let mut harness = harness();
@@ -469,7 +424,6 @@ fn a_refresh_should_not_be_forwarded_while_an_answer_is_being_read() {
     );
 }
 
-/// A failure is the framework's to recover from, not the header's.
 #[test]
 fn a_failed_pane_should_offer_its_recovery_rather_than_a_refresh() {
     let mut harness = harness();
@@ -493,8 +447,6 @@ fn a_failed_pane_should_offer_its_recovery_rather_than_a_refresh() {
         "and the framework's own recovery is the way out of it"
     );
 
-    // Pressing the disabled control changes nothing: the request is refused by the
-    // pane's own gate rather than by the widget's paint state.
     request(&mut harness, &mut pane, HeaderRequest::Refresh);
     assert!(
         pane.status.is_failed(harness.app()),
@@ -637,15 +589,11 @@ fn a_failure_should_be_terminal_until_the_user_recovers() {
         "a failed pane takes no more statuses or answers"
     );
 
-    // The recovery the failure offered is what starts it again.
     load(&mut harness, &mut pane);
     assert!(!pane.status.is_failed(harness.app()));
     assert_eq!(reported(&harness, &pane), WidgetState::Connecting);
 }
 
-/// A failure is terminal on every entry point, the RPC one included: the reply to a
-/// command the failure replaced answers nothing, and reporting it would put the same
-/// failure over the banner under another error object.
 #[test]
 fn a_reply_arriving_after_the_failure_should_not_replace_the_banner() {
     let mut harness = harness();
@@ -655,7 +603,6 @@ fn a_reply_arriving_after_the_failure_should_not_replace_the_banner() {
     let banner = reported(&harness, &pane);
     assert!(banner.is_failed(), "the failure is the pane's state");
 
-    // The load command's reply arrives after the failure it can no longer answer.
     let late = Err(RpcCallError::ServiceClosed {
         request_id: RequestId::new(1),
     });
@@ -680,8 +627,6 @@ fn a_pane_without_a_service_connection_should_report_a_failure() {
         "a host with no Kytrix service cannot read, and that is a failure"
     );
 }
-
-// ── the countdown ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn the_countdown_should_only_run_while_the_pane_is_ready() {
@@ -738,7 +683,6 @@ fn the_countdown_should_only_run_while_the_pane_is_ready() {
     assert!(!pane.widget.refresh_is_disabled(harness.app()));
 }
 
-/// A failure takes the loop off the clock, so there is no countdown to show.
 #[test]
 fn a_failed_pane_should_stop_counting_down() {
     let mut harness = harness();
@@ -763,7 +707,6 @@ fn a_failed_pane_should_stop_counting_down() {
     );
 }
 
-/// The tick chain is one chain: each engine tick writes the label once and re-arms.
 #[test]
 fn the_countdown_should_tick_once_per_engine_round() {
     let mut harness = harness();
@@ -778,17 +721,13 @@ fn the_countdown_should_tick_once_per_engine_round() {
     let countdown = node(&harness, pane.header_group, "TEST_ETF_COUNTDOWN");
     assert_eq!(harness.text_of(countdown), "01:30");
 
-    // Half a tick is not a tick: nothing is re-read and nothing is redrawn.
     assert!(!harness.advance(super::COUNTDOWN_TICK / 2));
     assert_eq!(harness.text_of(countdown), "01:30");
 
-    // The clock moves a second and the tick that is due rewrites the label.
     clock.set(1_001_000);
     assert!(harness.advance(super::COUNTDOWN_TICK));
     assert_eq!(harness.text_of(countdown), "01:29");
 
-    // A tick that does not move the label draws nothing (I3), but it is still exactly
-    // one tick: one chain reads the clock once per round.
     let reads_after_first = clock.reads();
     assert!(!harness.advance(super::COUNTDOWN_TICK));
     assert_eq!(
@@ -825,8 +764,6 @@ fn releasing_a_pane_should_stop_its_countdown() {
     );
 }
 
-// ── the row of readings ───────────────────────────────────────────────────────────
-
 #[test]
 fn the_body_should_draw_the_reading_under_the_pointer() {
     let mut harness = harness();
@@ -844,7 +781,6 @@ fn the_body_should_draw_the_reading_under_the_pointer() {
     assert!(harness.text_of(flow).contains("+$2.00M"));
     assert!(harness.text_of(net_assets).contains("$3.00M"));
 
-    // The chart's canvas is drawn into the host node.
     let chart = node(&harness, pane.page, "TEST_ETF_CHART");
     assert!(
         harness.has_canvas(chart),
@@ -912,8 +848,6 @@ fn a_name_should_follow_the_language_it_is_drawn_in() {
     );
 }
 
-/// The pane shows trading days, not instants: a display time zone moves a clock, and a
-/// trading day is a date the sheet published.
 #[test]
 fn the_display_time_zone_should_not_move_a_trading_day() {
     let mut harness = harness();
@@ -938,8 +872,6 @@ fn the_display_time_zone_should_not_move_a_trading_day() {
         "a trading day is the date the funds reported, not an instant to convert"
     );
 }
-
-// ── the chart's own views ─────────────────────────────────────────────────────────
 
 #[test]
 fn the_window_and_the_fund_should_redraw_without_reading_again() {
@@ -1042,11 +974,6 @@ fn signing_out_should_take_the_answer_with_it() {
     assert!(!pane.widget.has_scope());
 }
 
-// ── the header ────────────────────────────────────────────────────────────────────
-
-/// The whole header is one group, and the order of it is the order a reader narrows the
-/// chart down: how fresh the answer is, which complex, which fund inside it, and how
-/// much of its history.
 #[test]
 fn the_header_should_offer_its_controls_in_the_order_they_narrow_the_chart_down() {
     let mut harness = harness();
@@ -1063,9 +990,6 @@ fn the_header_should_offer_its_controls_in_the_order_they_narrow_the_chart_down(
     );
 }
 
-/// A pane nobody is signed in for draws the same controls, disabled rather than gone: a
-/// header that reflowed when an account signed in would move the controls under the
-/// user's hand.
 #[test]
 fn the_header_should_keep_its_controls_without_an_account() {
     let mut harness = harness();
@@ -1114,8 +1038,6 @@ fn a_language_change_should_rebuild_the_headers_copy() {
     );
 }
 
-/// A rebuild releases the components it replaces: a header rebuilt on every language
-/// switch must not leave one signal scope behind per rebuild.
 #[test]
 fn rebuilding_the_header_should_hand_its_components_back() {
     let mut harness = harness();
@@ -1138,18 +1060,12 @@ fn rebuilding_the_header_should_hand_its_components_back() {
     );
 }
 
-/// A pane hands its components back when it goes: the widget's own values and the four
-/// header controls' action handlers belong to the pane, so releasing it must leave the
-/// application with no value slot the pane minted.
 #[test]
 fn releasing_a_pane_should_hand_its_signals_and_components_back() {
     let mut harness = harness();
     sign_in(&mut harness, ACCOUNT);
     let baseline = harness.signal_slot_stats();
 
-    // A pane that never built its header is the widget's own values: releasing it leaves
-    // the application exactly as it was, and the cycles after the first one — which sets
-    // the peak the slot table has to hold — reuse those slots instead of growing it.
     let mut needed = 0;
     for cycle in 0..3 {
         let pane = harness.mount::<CryptocurrencyEtfWidget>(CryptocurrencyEtfConfig);
@@ -1174,9 +1090,6 @@ fn releasing_a_pane_should_hand_its_signals_and_components_back() {
         }
     }
 
-    // The header's four controls are kit components. They are released with the pane,
-    // and their own scopes go with them: `Select::release` hands its signal scope back
-    // (P2-10), so nothing of the pane or of its controls may remain.
     let pane = harness.mount::<CryptocurrencyEtfWidget>(CryptocurrencyEtfConfig);
     let group = page(&mut harness);
     pane.header(harness.app_mut(), HeaderGroup::Right, group)
@@ -1190,9 +1103,6 @@ fn releasing_a_pane_should_hand_its_signals_and_components_back() {
     );
 }
 
-/// The pane rebuilds the row it calls `header` for, and the controls go with that row. A
-/// sync that runs after it must not touch their old nodes: the components are released,
-/// and the synchronization still succeeds.
 #[test]
 fn a_taken_down_header_row_should_be_released_rather_than_synchronized() {
     let mut harness = harness();
@@ -1212,8 +1122,6 @@ fn a_taken_down_header_row_should_be_released_rather_than_synchronized() {
             .expect("the pane's row is taken down");
     });
 
-    // The sync helper panics if the hook reports an error, which is what touching a stale
-    // control node would do.
     frame(&mut harness, &mut pane);
     assert!(
         pane.widget.header.is_none(),
@@ -1221,17 +1129,10 @@ fn a_taken_down_header_row_should_be_released_rather_than_synchronized() {
     );
 }
 
-// ── two panes ────────────────────────────────────────────────────────────────────
-
-/// Two panes of this widget in one application: the header's four controls are application
-/// level actions, so neither pane may share a key with the other, and releasing one must
-/// leave the other's handlers alone.
 #[test]
 fn two_panes_should_keep_their_own_header_handlers() {
     let mut harness = harness();
     sign_in(&mut harness, ACCOUNT);
-    // Both panes are mounted through the framework, which is what mints one signal
-    // scope per instance — and therefore one component key per instance.
     let first = harness.mount::<CryptocurrencyEtfWidget>(CryptocurrencyEtfConfig);
     let second = harness.mount::<CryptocurrencyEtfWidget>(CryptocurrencyEtfConfig);
     let first_group = page(&mut harness);
@@ -1249,10 +1150,6 @@ fn two_panes_should_keep_their_own_header_handlers() {
         super::FUND_KEY_SUFFIX,
         super::WINDOW_KEY_SUFFIX,
     ];
-    // The keys `cx.unique_key` mints for one instance: the suffix at the instance's own
-    // scope. Asserting the handlers of *these* keys is what pins the widget to them — a
-    // picker built with a constant key registers a handler under that key instead, and no
-    // derived key has one.
     let keys_of = |scope: ui_core::node::signal::SignalScope| {
         suffixes
             .iter()
@@ -1268,8 +1165,6 @@ fn two_panes_should_keep_their_own_header_handlers() {
         );
     }
 
-    // The refresh control is a button, whose click is `<key>.click`; the three pickers are
-    // selects, whose trigger action is what a click on one dispatches.
     let action_of = |key: &SmolStr| {
         if key.starts_with(super::REFRESH_KEY_SUFFIX) {
             ui_core::event::Action::Custom(format_smolstr!("{key}.click"))
@@ -1299,9 +1194,6 @@ fn two_panes_should_keep_their_own_header_handlers() {
     }
 }
 
-// ── the canvas and the pointer ────────────────────────────────────────────────────
-
-/// The pointer follows the reading under it, and only a *reading* that moved is a frame.
 #[test]
 fn a_pointer_move_should_redraw_the_row_and_the_chart() {
     let mut harness = harness();
@@ -1357,8 +1249,6 @@ fn a_pointer_move_should_redraw_the_row_and_the_chart() {
     assert!(changed, "a pointer that left is the pane's to notice too");
 }
 
-// ── pure helpers ─────────────────────────────────────────────────────────────────
-
 #[test]
 fn a_window_should_round_trip_through_the_id_its_picker_uses() {
     for window in CryptocurrencyEtfWindow::ALL {
@@ -1382,8 +1272,6 @@ fn a_fund_choice_should_round_trip_through_the_id_its_picker_uses() {
     );
 }
 
-/// The pane persists nothing, so a fresh one opens on the deepest complex, its most
-/// recent month and every fund in it.
 #[test]
 fn a_fresh_pane_should_open_on_the_deepest_complex_its_recent_month_and_every_fund() {
     let mut harness = harness();

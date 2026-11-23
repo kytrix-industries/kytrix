@@ -1,15 +1,3 @@
-//! Unit tests of the loaded-venue query face.
-//!
-//! The view is read the way its consumers read it: an empty table answers nothing
-//! at all, and a committed venue answers the same entries through both of the
-//! selector's judgements — the ordered scope list and the ordered entry list — as
-//! it does through the single-scope lookup.
-//!
-//! The last two tests drive a real load through the fixtures and then issue a real
-//! market request: the commit is the only place a request path can obtain its
-//! venue's metadata, so a request that is answered without a fetch and a scope that
-//! is refused without a request are both pinned against the wire.
-
 use std::sync::Arc;
 
 use market_participants_model::{
@@ -40,12 +28,10 @@ use crate::{
     test_support::{CatalogFixture, dex_meta, info_fixture_server, spot_meta_answer},
 };
 
-/// One built-in venue identity.
 fn venue(name: &str) -> VenueId {
     VenueId::from_name(name).expect("the built-in venue identity is canonical")
 }
 
-/// The route of one scope of one venue.
 fn route(venue: &VenueId, scope: &str) -> VenueRoute {
     VenueRoute::new(
         *venue,
@@ -53,7 +39,6 @@ fn route(venue: &VenueId, scope: &str) -> VenueRoute {
     )
 }
 
-/// One scope entry of a fixture commit.
 fn entry(scope: &str, provides_catalog: bool, capabilities: &[CapabilityId]) -> Arc<ScopeEntry> {
     Arc::new(ScopeEntry {
         scope: VenueScopeId::new(scope).expect("the fixture scope name is canonical"),
@@ -72,10 +57,6 @@ fn entry(scope: &str, provides_catalog: bool, capabilities: &[CapabilityId]) -> 
     })
 }
 
-/// A table no load has committed to answers nothing: no venue is loaded, no scope
-/// is askable, and neither list has an entry — the static venue list is not a
-/// runtime answer, and a scope no commit published is not askable even when the
-/// venue that would deploy it is one this build speaks.
 #[test]
 fn an_empty_loaded_venues_answers_nothing() {
     let venues = LoadedVenues::new();
@@ -117,10 +98,6 @@ fn an_empty_loaded_venues_answers_nothing() {
     }
 }
 
-/// A commit is one reading of one venue: the scope list and the entry list it
-/// answers agree entry by entry, the single-scope lookup answers the very entry
-/// the list holds, and a later commit replaces the slot whole while the venue's
-/// revision advances once.
 #[test]
 fn scopes_and_entries_agree_for_one_venue() {
     let venues = LoadedVenues::new();
@@ -227,13 +204,6 @@ fn scopes_and_entries_agree_for_one_venue() {
     assert!(venues.scope(&route(&binance, SPOT_SCOPE)).is_some());
 }
 
-/// A request path never fetches metadata.
-///
-/// The load reads the venue's own tables once and commits them with the venue, so
-/// the scope set it registers and the metadata a request is resolved against
-/// describe one moment of the venue. The fixture counts the requests it served, so
-/// what this pins is the wire rather than what the caller got back: the load is one
-/// reading, and a market request after it asks the venue nothing at all.
 #[tokio::test]
 async fn a_request_path_never_fetches_metadata() {
     let (info, requests, server) = info_fixture_server(
@@ -274,10 +244,6 @@ async fn a_request_path_never_fetches_metadata() {
     );
     let after_load = requests.lock().len();
 
-    // The request path is resolved from the commit: the call is answered without a
-    // metadata fetch, and the fixture publishes no asset contexts for its coin, so
-    // an answer that found the metadata is the empty ticker set rather than the
-    // refusal a scope without metadata would draw.
     let tickers = connector
         .market()
         .market(route(&hyperliquid, CORE_PERP_SCOPE))
@@ -299,13 +265,6 @@ async fn a_request_path_never_fetches_metadata() {
     server.abort();
 }
 
-/// A request for an unloaded scope is refused without a request.
-///
-/// The refusal is [`MarketParticipantError::VenueNotLoaded`]: the scope's venue has not
-/// been loaded, which is a different answer from a loaded scope that does not
-/// serve the capability. It happens before the request is encoded and before any
-/// listing is resolved, so nothing reaches the wire — the fixture would panic on a
-/// catalog request it does not know, and it served none.
 #[tokio::test]
 async fn a_request_for_an_unloaded_scope_is_refused_without_a_request() {
     let (info, _requests, server) = info_fixture_server(
@@ -354,8 +313,6 @@ async fn a_request_for_an_unloaded_scope_is_refused_without_a_request() {
         "the refusal happens before the request is encoded: nothing was served"
     );
 
-    // A scope a commit did publish without the capability is a different answer:
-    // the two are not folded into one refusal.
     let hyperliquid = venue(HYPERLIQUID_VENUE);
     load(&connector, &hyperliquid)
         .await

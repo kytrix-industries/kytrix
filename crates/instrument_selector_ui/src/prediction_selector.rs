@@ -1,35 +1,3 @@
-//! The prediction-event selector.
-//!
-//! A prediction venue publishes events rather than a catalog, so this dialog is
-//! not an instrument selector with another filter: it asks the venue for a page of
-//! event cards, draws them as cards with their option probabilities, and reports
-//! the event the user confirmed. The dialog is one venue at a time: switching the
-//! venue resets the category, the search and the page.
-//!
-//! # Where the work runs
-//!
-//! A page is read on the injected tokio runtime and delivered back through a channel
-//! the dialog drains in its frame route; the read never blocks the UI thread, and the
-//! channel send is what requests the frame that applies it. The same shape drives the
-//! translation supervisor: model work runs on the blocking pool, results are delivered
-//! as events, and the deadline is a `tokio::time::timeout` around one chunk at a time —
-//! a translation is one supervisor task, not a poll loop.
-//!
-//! The translation engine is the one the host was opened with. There is no process
-//! global installation point: a build without the model engine simply has no
-//! translator, which is what the button says.
-//!
-//! # The pulse
-//!
-//! Text waiting for its translation is drawn dimmed until the chunk that carries it
-//! arrives. The old implementation drove a repeating opacity animation; the engine's
-//! animations are one-shot (design §3.7 / E13), so the pending state is a static dim
-//! that disappears the moment the text arrives, and `reduce_motion` leaves it
-//! undimmed. The difference is registered in the batch's ledger.
-//!
-//! Like the instrument selector, this dialog is not a widget: it registers one route in
-//! the injected frame router and removes it when the dialog has closed.
-
 use std::{
     cell::{Cell, RefCell},
     future::Future,
@@ -104,37 +72,19 @@ use crate::{
     ui::{build_node, remove_node},
 };
 
-/// The number of cards one page draws.
 const PAGE_SIZE: u16 = DEFAULT_PREDICTION_PAGE_SIZE;
-/// The number of cards one row of the grid draws.
 const GRID_COLUMNS: usize = 4;
-/// How long the search box waits after a keystroke.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
-/// The width of a probability bar at 100%.
 const BAR_WIDTH: f32 = 96.0;
-/// The size of the dialog content.
 const DIALOG_WIDTH: f32 = 960.0;
 const DIALOG_HEIGHT: f32 = 680.0;
-/// The deadline one translation gets after its model finished loading.
 const TRANSLATION_TIMEOUT: Duration = Duration::from_secs(20);
-/// The kit key of the dialog itself.
 const KEY_BASE: &str = "prediction-selector";
-/// The node id of the selector's own content area (and of the nodes inside it), which tests
-/// look for.
-///
-/// Node ids are diagnostics rather than action identities, so they stay the same in every
-/// dialog instance.
 const PANEL_ID: &str = "PREDICTION_EVENT_SELECTOR";
 
-/// One chunk's translation as the blocking pool returns it.
 type TranslationOutcome = Result<Vec<TranslatedSegment>, TranslationFailure>;
 
-/// One source of prediction-event pages.
-///
-/// It is a private seam rather than a public extension point: production answers
-/// through [`MarketCapability`] and a test answers with a fake page.
 pub trait PredictionEventSource: Clone + Send + Sync + 'static {
-    /// Reads one page.
     fn page(
         &self,
         request: PredictionEventsRequest,
@@ -150,7 +100,6 @@ impl PredictionEventSource for MarketCapability {
     }
 }
 
-/// Why one page could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PredictionSelectorError {
     Market(MarketError),
@@ -166,77 +115,49 @@ impl TranslatedError for PredictionSelectorError {
     }
 }
 
-/// What the translate button offers in the frame it is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TranslateAffordance {
-    /// The interface is English, so there is nothing to translate.
     Hidden,
-    /// The button cannot start a translation, and its tooltip is this message key.
     Disabled(&'static str),
-    /// A translation is running.
     Busy,
-    /// The button starts a translation of the visible page.
     Ready,
 }
 
-/// One translation the dialog is waiting for.
 struct TranslationRun {
-    /// The run the supervisor task belongs to; a newer generation supersedes it.
     generation: u64,
-    /// The source texts whose translation has not arrived yet.
     pending: AHashSet<SmolStr>,
-    /// The cancellation shared with the translator, so a run that is no longer
-    /// wanted stops in the model rather than after its next chunk.
     cancel: TranslationCancel,
 }
 
-/// What the translation supervisor reports back to the dialog.
 enum TranslationEvent {
-    /// The model load finished (it does not count against the translation deadline).
     Prepared {
         generation: u64,
         outcome: Result<(), TranslationFailure>,
     },
-    /// One chunk's translation arrived.
     Chunk {
         generation: u64,
         chunk: TranslationChunk,
         outcome: TranslationOutcome,
     },
-    /// The deadline passed before the next chunk finished.
-    TimedOut { generation: u64 },
+    TimedOut {
+        generation: u64,
+    },
 }
 
-/// What the page reader reports back to the dialog.
 struct LoadOutcome {
     generation: u64,
     result: Result<PredictionEventsPage, PredictionSelectorError>,
 }
 
-/// The event selector's content area.
 pub struct PredictionEventSelector<S: PredictionEventSource> {
     inner: RefCell<SelectorState<S>>,
 }
 
 struct SelectorState<S: PredictionEventSource> {
-    /// The selector this state lives in, for the callbacks that run after it was built.
     weak: Weak<PredictionEventSelector<S>>,
     host: SelectorHost,
     window: WindowId,
-    /// The per-instance prefix of every kit key this dialog registers:
-    /// `"prediction-selector@{scope}"`.
-    ///
-    /// The selector is not a widget, so it has no
-    /// [`WidgetCx::unique_key`](widget::cx::WidgetCx::unique_key); it mints its own signal
-    /// scope instead (the engine appends one scope slot per dialog and never recycles an
-    /// index), and this prefix is derived from that scope. Every button, select, tabs bar,
-    /// tooltip, spinner and the card click actions are keyed by it, so a second pane's
-    /// prediction selector cannot overwrite the first one's handlers.
     key: SmolStr,
-    /// The dialog's own signal scope: every signal this dialog mints belongs to it, and
-    /// [`Self::finish`] releases it after the kit components have unmounted their nodes
-    /// (E16). A root-scope signal would never be reclaimed, so every open/close cycle
-    /// would leak its slots for the rest of the process.
     scope: SignalScope,
     source: S,
     venues: Vec<VenueId>,
@@ -255,7 +176,6 @@ struct SelectorState<S: PredictionEventSource> {
     navigation_backup: Option<(Option<SmolStr>, Vec<Option<SmolStr>>, u32)>,
     generation: u64,
     search_generation: u64,
-    /// The last text the search input held, so a change is noticed once.
     search_input_text: SmolStr,
     search_input: Signal<InputState>,
     search_placeholder: Signal<SmolStr>,
@@ -268,7 +188,6 @@ struct SelectorState<S: PredictionEventSource> {
     translation_timeout: Duration,
     language: LanguageCode,
     settings_language: Language,
-    /// Bumped whenever the cards or the messages have to be rebuilt.
     revision: u64,
     drawn_revision: u64,
     dialog: Option<Dialog>,
@@ -279,17 +198,8 @@ struct SelectorState<S: PredictionEventSource> {
     tabs_count: usize,
     body_node: Option<NodeId>,
     body_children: Vec<NodeId>,
-    /// The card click actions this dialog registered with [`App::on_action`], so
-    /// [`Self::finish`] can take them out again: the action identity is per-instance unique,
-    /// and a handler left behind would keep the dialog's callback closure alive for the rest
-    /// of the process.
     card_actions: Vec<Action>,
     page_text: Signal<SmolStr>,
-    /// Whether the translation control is drawn at all: the interface's own language needs
-    /// no translation, and a disabled button on an English interface would be a control the
-    /// user can never use (the old dialog did not build it). Bound to the control's
-    /// container, so the whole control — button, tooltip anchor and the gap it occupied —
-    /// is out of the layout and out of reach of the pointer.
     translate_visible: Signal<bool>,
     translate_button: Option<Button>,
     spinner: Option<Spinner>,
@@ -304,10 +214,6 @@ struct SelectorState<S: PredictionEventSource> {
 }
 
 impl PredictionEventSelector<MarketCapability> {
-    /// Presents the selector against the production market capability.
-    ///
-    /// Returns whether a dialog was presented: with no loaded venue that serves
-    /// prediction events there is nothing to select from.
     pub fn show(
         current: Option<PredictionEventRef>,
         current_title: Option<SmolStr>,
@@ -338,7 +244,6 @@ impl PredictionEventSelector<MarketCapability> {
 }
 
 impl<S: PredictionEventSource> PredictionEventSelector<S> {
-    /// Presents the selector against an explicit source.
     pub fn show_with_source(
         current: Option<PredictionEventRef>,
         current_title: Option<SmolStr>,
@@ -434,9 +339,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
             .as_ref()
             .map(|event| event.route.venue)
             .unwrap_or(venues[0]);
-        // One scope per dialog: every signal below is reclaimed when `finish` releases it, and
-        // the scope's index is what tells this dialog's kit keys from another pane's selector
-        // (see `SelectorState::key`).
         let scope = app.signal_scope();
         let key = format_smolstr!("{KEY_BASE}@{}", scope.index());
         let search_input = app.signal_scoped(scope, InputState::new(""));
@@ -445,9 +347,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
             t_smol!(host.translate(), "prediction_selector.search_placeholder"),
         );
         let page_text = app.signal_scoped(scope, SmolStr::default());
-        // An English interface needs no translation, so the control starts out built for a
-        // language that has something to translate (the first `update_controls` of the open
-        // dialog writes the same value the settings state).
         let translate_visible = app.signal_scoped(
             scope,
             host.config_ref(app, |config| config.language) != Language::En,
@@ -521,9 +420,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
             .page_size(PAGE_SIZE)
     }
 
-    /// Replaces the page the dialog shows with a fresh read of the current request.
     fn reload(&mut self, app: &mut App) {
-        // A page that is being replaced cannot translate text it no longer shows.
         self.cancel_translation(app);
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -549,7 +446,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         });
     }
 
-    /// Applies one read the supervisor delivered.
     fn apply_load(&mut self, outcome: LoadOutcome, app: &mut App) {
         if outcome.generation != self.generation {
             return;
@@ -585,7 +481,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let _ = app.request_repaint(self.window);
     }
 
-    /// Starts (or restarts) the debounce for a search the user typed.
     fn search_changed(&mut self, app: &mut App, query: &str) {
         if self.search == query {
             return;
@@ -595,8 +490,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
         self.navigation_backup = None;
-        // The page is stale from the first keystroke: show the loading state while
-        // the debounce runs and invalidate any read that is still in flight.
         self.generation = self.generation.wrapping_add(1);
         self.loading = true;
         self.cursor = None;
@@ -611,7 +504,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         });
     }
 
-    /// Runs the read a debounce was armed for, if it is still the current one.
     fn finish_search(&mut self, generation: u64, app: &mut App) {
         if self.search_generation != generation {
             return;
@@ -702,10 +594,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    /// What the translate button offers right now.
-    ///
-    /// The settings are read per frame, so a model the user selects while the dialog
-    /// is open takes effect on the next frame without a reload.
     fn translate_affordance(&self, app: &App) -> TranslateAffordance {
         let config = self.host.config_ref(app, |config| config.clone());
         if config.language == Language::En {
@@ -719,8 +607,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         if self.translation.is_some() {
             return TranslateAffordance::Busy;
         }
-        // The engine loads the model from the directory the settings name, so a
-        // selected model without one is as unusable as no selection at all.
         if config.translation.selected_model.is_none()
             || config.translation.model_directory.is_none()
         {
@@ -747,10 +633,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         TranslateAffordance::Ready
     }
 
-    /// Starts translating the page the user is looking at.
     fn start_translation(&mut self, app: &mut App) {
-        // The state was drawn from the settings of the last frame; the click re-reads
-        // them so a change that arrived in between cannot start the wrong work.
         if !matches!(self.translate_affordance(app), TranslateAffordance::Ready) {
             return;
         }
@@ -760,8 +643,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let config = self.host.config_ref(app, |config| config.clone());
         let plan = self.page_translation_plan();
         if plan.is_empty() {
-            // A page whose text is already translated has nothing to ask for: a
-            // second click leaves the finished translation in place.
             return;
         }
 
@@ -801,7 +682,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         });
     }
 
-    /// Supervises one translation: model load, then the chunks one after another.
     async fn supervise_translation(
         runtime: tokio::runtime::Handle,
         translator: Arc<dyn LocalTranslator>,
@@ -858,9 +738,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         if failed || cancel.is_cancelled() {
             return;
         }
-        // The user decision is that the model load does not consume the
-        // translation's deadline: a cold model would otherwise time out the very
-        // translation it was loading for.
         let deadline = tokio::time::Instant::now() + timeout;
         for chunk in plan {
             if cancel.is_cancelled() {
@@ -916,7 +793,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    /// Applies one event the translation supervisor delivered.
     fn apply_translation_event(&mut self, event: TranslationEvent, app: &mut App) {
         match event {
             TranslationEvent::Prepared {
@@ -953,8 +829,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
                         "translating {} texts failed: {failure:?}",
                         chunk.segments().len()
                     );
-                    // The status quo is kept: the texts that did arrive stay, and the
-                    // rest keep showing their source.
                     if let Some(run) = self.translation.take() {
                         run.cancel.cancel();
                     }
@@ -1000,7 +874,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    /// Stops the run and drops everything it produced, for a page that changed.
     fn cancel_translation(&mut self, app: &mut App) {
         self.translation_generation = self.translation_generation.wrapping_add(1);
         if let Some(run) = self.translation.take() {
@@ -1014,7 +887,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    /// The pending translation of the cards this page draws.
     fn page_translation_plan(&self) -> Vec<TranslationChunk> {
         let Some(page) = &self.page else {
             return Vec::new();
@@ -1023,7 +895,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         plan_translation(cards, &self.translations)
     }
 
-    /// The text to draw for `source`, and whether it is still being translated.
     fn display_text(&self, source: &SmolStr) -> (SmolStr, bool) {
         let text = self
             .translations
@@ -1037,7 +908,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         (text, pulsing)
     }
 
-    /// Confirms the selected event and hands it to the caller.
     fn confirm(&mut self, app: &mut App) {
         self.cancel_translation(app);
         let Some(selected) = self.selected.clone() else {
@@ -1049,8 +919,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let on_confirm = self.on_confirm.clone();
         on_confirm(selected, title, app, self.window);
     }
-
-    /* ── building ─────────────────────────────────────────────────────────── */
 
     fn build_dialog(selector: &Rc<PredictionEventSelector<S>>, app: &mut App) -> Dialog {
         let (theme, translate, layer, animation, closed, key) = {
@@ -1103,7 +971,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         })
     }
 
-    /// The static shell: header, tabs row, body holder and footer.
     fn build_content(
         &mut self,
         app: &mut App,
@@ -1131,7 +998,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 .build(tree, body)
         })?;
 
-        // ① venue select + search box
         let header = build_node(app, window, root, |tree, root| {
             NodeBuilder::boxed()
                 .style(
@@ -1216,7 +1082,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         search.install(app);
         self.search_node = Some(search);
 
-        // ② category tabs + translate control
         let tab_row = build_node(app, window, root, |tree, root| {
             NodeBuilder::boxed()
                 .style(
@@ -1290,7 +1155,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         self.translate_tooltip = Some(tooltip);
         self.translate_button = Some(translate_button);
 
-        // ③ body: the cards or the message
         let body_panel = build_node(app, window, root, |tree, root| {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{PANEL_ID}:body"))
@@ -1319,7 +1183,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         })?;
         self.body_node = Some(body_panel);
 
-        // ④ footer: paging
         let footer = build_node(app, window, root, |tree, root| {
             NodeBuilder::boxed()
                 .style(
@@ -1447,8 +1310,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    /* ── per-frame ────────────────────────────────────────────────────────── */
-
     fn sync(&mut self, app: &mut App) {
         if self.closed.get() {
             self.finish(app);
@@ -1502,15 +1363,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    /// Feeds the search box the events this dialog owns.
-    ///
-    /// # Ownership
-    ///
-    /// A dialog owns **the typed text, key presses and IME input of its own window, and
-    /// only while it is that window's modal scope**. Everything else stays in the
-    /// application's observation queue: the engine already dispatched the interaction when
-    /// the platform pushed the event, and the composition root still has to be able to read
-    /// what happened (see [`App::drain_events_where`]).
     fn dispatch_events(&mut self, app: &mut App) {
         let Some(search) = self.search_node.as_ref() else {
             return;
@@ -1526,7 +1378,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    /// Whether this dialog is the window's modal scope, and therefore the keyboard's owner.
     fn owns_modal(&self, app: &App) -> bool {
         let Some(dialog) = self.dialog.as_ref() else {
             return false;
@@ -1537,7 +1388,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         )
     }
 
-    /// Cancels a running translation when the interface language moved.
     fn follow_language(&mut self, app: &mut App) {
         let language = self.host.language(app);
         let settings_language = self.host.config_ref(app, |config| config.language);
@@ -1551,7 +1401,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let _ = app.request_repaint(self.window);
     }
 
-    /// Arms the debounce when the search box text changed.
     fn follow_search(&mut self, app: &mut App) {
         let query = SmolStr::new(app.read(&self.search_input).text().trim());
         if query == self.search_input_text {
@@ -1583,13 +1432,9 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    /// Keeps the buttons, the spinner and the tooltip in step with the state.
     fn update_controls(&mut self, app: &mut App) {
         let affordance = self.translate_affordance(app);
         let translate = self.host.translate().clone();
-        // An English interface hides the control instead of leaving a button that can never
-        // do anything: the container the control is built in is what the user sees, and it
-        // is out of the layout while the interface needs no translation.
         let visible = !matches!(affordance, TranslateAffordance::Hidden);
         let visible_signal = self.translate_visible;
         if *app.read(&visible_signal) != visible {
@@ -1636,7 +1481,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    /// Rebuilds the cards (or the message) when the state they draw changed.
     fn rebuild_body(&mut self, app: &mut App) {
         if self.drawn_revision == self.revision {
             return;
@@ -2058,7 +1902,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         });
     }
 
-    /// Records the card the user clicked and redraws the grid's selection.
     fn select_card(&mut self, app: &mut App, event: PredictionEventRef, title: SmolStr) {
         if self.selected.as_ref() == Some(&event) {
             return;
@@ -2069,12 +1912,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let _ = app.request_repaint(self.window);
     }
 
-    /// Releases every kit component the dialog owns and stops the frame route.
-    ///
-    /// The order is the engine's release contract (E16): the nodes that read this
-    /// dialog's signals are unmounted first (`Dialog::release` unloads the overlay
-    /// subtree; the buttons, tabs, spinner and tooltip own no node of their own any
-    /// more), and only then is the dialog's signal scope released.
     fn finish(&mut self, app: &mut App) {
         self.cancel_translation(app);
         if let Some(dialog) = self.dialog.take() {
@@ -2105,8 +1942,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
             next.release(app);
         }
         if let Some(search) = self.search_node.take() {
-            // Kit's own release face (P2-9): detaches the click-to-place / drag-to-select
-            // handlers; the search input's signals live in this dialog's scope (released below).
             search.release(app);
         }
         for action in self.card_actions.drain(..) {
@@ -2119,7 +1954,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
     }
 }
 
-/// The venues that serve prediction events, in identity order.
 fn loaded_prediction_venues(venues: &LoadedVenues) -> Vec<VenueId> {
     let mut loaded: Vec<VenueId> = VenueId::ALL
         .into_iter()
@@ -2137,7 +1971,6 @@ fn loaded_prediction_venues(venues: &LoadedVenues) -> Vec<VenueId> {
     loaded
 }
 
-/// Formats the day one event ends on, in the display time zone.
 fn format_end(millis: i64, offset: time::UtcOffset) -> Option<String> {
     let seconds = millis.checked_div(1_000)?;
     let date = time::OffsetDateTime::from_unix_timestamp(seconds).ok()?;

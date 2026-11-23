@@ -1,5 +1,3 @@
-//! WinHTTP system proxy evaluation (PAC, WPAD, manual, bypass).
-
 use std::{
     hash::{BuildHasher, Hash, Hasher},
     sync::{Arc, Condvar, LazyLock, Mutex},
@@ -236,7 +234,6 @@ fn detect_wpad_config_url() -> WpadSnapshot {
     }
 }
 
-/// Which Windows proxy decision answers for a destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum IeRoutingMode {
     Automatic,

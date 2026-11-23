@@ -1,35 +1,3 @@
-//! IME 通路（IMM32）：组合串（文本 + 插入点 + 子句）、提交去重、caret 表单、启停上下文。
-//!
-//! 事件通路负责组合开始/更新/结束与 `GCS_RESULTSTR` 提交；caret 区域经
-//! `ImmSetCompositionWindow` + `ImmSetCandidateWindow` 定位（不再使用最后指针位置）。
-//!
-//! ## 三条纪律
-//!
-//! 1. **不在持有 `&mut WndProcState` 时调用会重入的 IMM32 API**（R07-7）。
-//!    `ImmAssociateContext*` / `ImmSetCompositionWindow` / `ImmSetCandidateWindow` 都会
-//!    **同步**派发 `WM_IME_SETCONTEXT` / `WM_IME_NOTIFY`，嵌套进入的 `WndProc` 会再取一次
-//!    `GWLP_USERDATA` 并构造 `&mut WndProcState` —— 同一对象上两个活跃 `&mut` 是别名 UB。
-//!    所以会重入的调用全部包成 [`ImeCommand`]（纯数据）：调用方先在短借用下算出命令
-//!    （[`ImeState::plan_enabled`] 等），**释放借用**，再 [`execute`] 执行，最后短借用写回
-//!    （[`ImeState::store_detached`] 等）。只读的 `ImmGetContext` /
-//!    `ImmGetCompositionStringW` 不派发消息，可以在借用内调用。
-//! 2. **组合串按 flag 分项读取**：`WM_IME_COMPOSITION` 的 lParam 是 bitmask，
-//!    `GCS_COMPSTR` / `GCS_CURSORPOS` / `GCS_COMPATTR` / `GCS_COMPCLAUSE` / `GCS_RESULTSTR`
-//!    各是一次独立的查询；一次消息只 `ImmGetContext` 一次（旧实现每次查询各取一次）。
-//!    位掩码允许**同时**带 `GCS_RESULTSTR` 与 `GCS_COMPSTR`（提交后紧接着开始新组合），因此
-//!    一条消息最多产出**两条**事件，顺序固定为 Commit → Preedit（XML 的求值顺序：先插入提交
-//!    串、再插入新组合串；AR1b N5）。
-//! 3. **提交去重按 UTF-16 码元 + 内容校验**（不是码点计数）：IME 提交后系统补发的 `WM_CHAR`
-//!    是**每码元一条**，提交串里的文本按码元排队，逐条比对 —— 内容不匹配立刻清空队列
-//!    （异常 IME 自愈）。队列还带**事件流位置（消息批次）+ 时间戳**：只在入队批次与其后一轮
-//!    内匹配，失焦 / 重新组合 / 禁用 IME / **任何键按下**（真实键入优先）都清空。这样「候选窗
-//!    提交后系统不补发 `WM_CHAR`、用户随即键入同首码元字符」不会吞键（AR3 §1.5 / P2-2）。
-//!
-//! 应用还可以**主动关闭**本窗口的 IME（自绘搜索框的英文直输模式）：
-//! [`ImeState::plan_enabled`] 用 `ImmAssociateContext(hwnd, NULL)` 把输入上下文从窗口上摘下来
-//! 并保存旧 `HIMC`，重新启用时还回去；禁用期间 `WndProc` 吞掉全部 `WM_IME_*`
-//! （见 [`super::event_loop::wndproc`]）。
-
 use std::collections::VecDeque;
 
 use smallvec::{SmallVec, smallvec};
@@ -54,99 +22,40 @@ use crate::{
     platform::ime::{ClauseRanges, preedit_clauses},
 };
 
-/// `WM_IME_*` 的产物：应用事件 + 需要**在借用释放后**执行的 IMM32 命令。
-///
-/// `events` 是**有序**列表（一条消息最多两条：Commit → Preedit，见文件头纪律 2）：调用方必须
-/// 按顺序全部入队，不能只取第一条（AR1b N5）。
 #[derive(Debug, Default)]
 pub(crate) struct ImeOutcome {
-    /// 交给应用的 IME 事件（有序；`WM_IME_COMPOSITION` 可能同时带 `RESULTSTR` 与 `COMPSTR`）。
     pub events: SmallVec<[ImeEvent; 2]>,
-    /// 会同步重入 `WndProc` 的 IMM32 操作（由调用方在本模块之外执行）。
     pub command: Option<ImeCommand>,
 }
 
-/// 会**同步重入** `WndProc` 的 IMM32 操作（纯数据，执行见 [`execute`]）。
-///
-/// 单独成类型是 soundness 要求，不是抽象癖：`ImmAssociateContext*` / `ImmSet*Window` 会同步
-/// 派发 `WM_IME_SETCONTEXT` / `WM_IME_NOTIFY`，重入的 `WndProc` 会再构造 `&mut WndProcState`；
-/// 只要执行这些调用时不持有 `&mut`，别名 UB 就不成立（R07-7）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImeCommand {
-    /// `ImmAssociateContext(hwnd, context)`：`None` = 摘下（NULL），`Some` = 还回保存的上下文。
     Associate(Option<HIMC>),
-    /// `ImmAssociateContextEx(hwnd, NULL, IACE_DEFAULT)`：让系统关联**默认**上下文。
     AssociateDefault,
-    /// `ImmSetCompositionWindow` + `ImmSetCandidateWindow`（客户区物理像素）。
     SetCaret(PhysicalRect),
 }
 
-/// 一条 [`ImeCommand`] 的执行结果（写回状态的唯一输入）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImeApplied {
-    /// 已应用，无需写回。
     Done,
-    /// 摘下上下文成功；`Some` = 摘下来的旧上下文（由调用方保存，窗口销毁前还回）。
     Detached(Option<HIMC>),
-    /// `ImmAssociateContextEx(IACE_DEFAULT)` 失败：调用方必须把「已应用状态」回滚成禁用，
-    /// 否则 `enabled` 已记账却永不重试 ⇒ IME 静默失效。
     RestoreFailed,
 }
 
-/// IME 组合状态（每个窗口一份，由 `WndProcState` 持有）。
 #[derive(Debug)]
 pub(crate) struct ImeState {
-    /// 应用是否要求本窗口启用 IME（默认启用）。
-    ///
-    /// `false` 时窗口的输入上下文已从 IMM32 上摘下：`WndProc` 吞掉全部 `WM_IME_*`，
-    /// 字母/数字键以普通 `WM_KEYDOWN` 到达应用（不再被 IME 变成 `VK_PROCESSKEY`）。
     enabled: bool,
-    /// 禁用时 `ImmAssociateContext(hwnd, None)` 返回的旧上下文；重新启用 / 窗口销毁时还回去。
-    ///
-    /// IME 上下文由 IMM32 与窗口的关联管理：摘下来之后必须还回去，否则窗口销毁时系统
-    /// 看不到它，上下文会泄漏。禁用时窗口本来就没有上下文（返回 NULL）⇒ `None`。
     saved_context: Option<HIMC>,
-    /// 应用声明的 caret 区域（客户区物理像素）；`None` = 无 hint。
     cursor_area: Option<PhysicalRect>,
-    /// 上一次提交文本的 **UTF-16 码元**队列：随后到达的同内容 `WM_CHAR` 要跳过。
-    ///
-    /// 用队列而不是计数（R07-5）：计数不知道吞的是什么，异常 IME / TSF 通路少发或重发一条
-    /// `WM_CHAR` 就会把余数留给**用户之后真实键入**的字符（「输入 10 手，界面收到 1 手」）。
-    /// 队列逐码元比对，不匹配即清空自愈；多次提交**追加**而不是覆盖（AR3 §1.5 P3：同一批里
-    /// 两次 `GCS_RESULTSTR` 之间可能没有 `WM_CHAR`，覆盖会丢掉第一次的抑制）。
     pending_chars: VecDeque<u16>,
-    /// 队列所属的**消息批次**（[`Self::end_message_batch`] 每轮递增，见 `pump_loop`）。
-    ///
-    /// 队列只在「入队批次 + 紧随其后的一轮」内有效（AR3 §1.5 / P2-2）：规范路径下应用处理
-    /// `GCS_RESULTSTR` 后系统**不会**再补 `WM_CHAR`，残留队列若一直留着，就会在用户之后真实
-    /// 键入与提交首码元相同的字符时吞掉一次按键。
     pending_batch: Option<u64>,
-    /// 队列入队时的消息时间（`MSG.time`，32 位回绕域）：第二个生命周期判据。
-    ///
-    /// 同一批内系统补发的 `WM_CHAR` 紧随提交到达（毫秒级）；跨出 [`PENDING_COMMIT_WINDOW_MS`]
-    /// 的字符不可能是补发，按真实键入放行。
     pending_ticks: u32,
-    /// 当前消息批次序号。
     batch: u64,
-    /// 平台 IME 是否处于**组合中**（`WM_IME_STARTCOMPOSITION` 置位，组合结束 / 失焦 / 禁用清零）。
-    ///
-    /// 这是「失焦时补**恰好一条** [`ImeEvent::End`]」的裁决依据（B6/D6 三端统一语义）：
-    /// Win32 **不保证**失焦时一定先派发 `WM_IME_ENDCOMPOSITION`，所以 WndProc 在
-    /// `WM_KILLFOCUS` 里按这个状态补一条；补完清零后，系统迟到的
-    /// `WM_IME_ENDCOMPOSITION` 不再重复投递（同样由这里判定）。
     composing: bool,
 }
 
-/// 提交抑制队列跨过的**批次**上限：入队批次 + 紧随其后的一轮。
-///
-/// 系统补发的 `WM_CHAR` 可能与提交落在同一次消息排空里，也可能因为 `PostMessage` 落到下一次
-/// 排空；再多一轮就不是补发，而是「提交后系统根本没补发」的残留。
 const PENDING_BATCH_LIFETIME: u64 = 1;
 
-/// 提交抑制队列的**时间窗**（毫秒，`MSG.time` 域）。
-///
-/// 同一次输入事件触发的补发字符必然在毫秒级内到达；这个上界只是第二道保险（第一道是批次号，
-/// 真实键入则由 `WM_KEYDOWN` 直接清空队列），取 250 ms 足以覆盖高负载下的调度抖动。
 const PENDING_COMMIT_WINDOW_MS: u32 = 250;
 
 impl Default for ImeState {
@@ -165,9 +74,6 @@ impl Default for ImeState {
 }
 
 impl ImeState {
-    /// 处理一条 `WM_IME_*`；返回事件（有序，可能两条）+ 待执行的 IMM32 命令（可能都为空）。
-    ///
-    /// `ticks_ms` 是消息的 `MSG.time`：提交入队时记为抑制队列的时间基准（AR3 §1.5）。
     pub(crate) fn handle(
         &mut self,
         hwnd: HWND,
@@ -177,13 +83,8 @@ impl ImeState {
     ) -> ImeOutcome {
         match msg {
             WM_IME_STARTCOMPOSITION => {
-                // 重新组合 ⇒ 上一次提交的待抑制码元已经过期（系统补发的 `WM_CHAR` 早已到达，
-                // 没到达的也不会再来）。清掉队列，避免把新组合之后的真实键入当成残留吞掉
-                // （AR1b P3-2：旧注释承诺了这一点，代码只在失焦/禁用/销毁时清）。
                 self.clear_pending();
                 self.composing = true;
-                // 组合开始时重放 caret 位置（上下文可能在禁用/启用之间换过，表单不保证还在）。
-                // 这里的 `ImmSet*Window` 会重入 `WndProc`，所以只产命令、不在这里调用。
                 ImeOutcome {
                     events: smallvec![ImeEvent::Start],
                     command: self.cursor_area.map(ImeCommand::SetCaret),
@@ -191,20 +92,15 @@ impl ImeState {
             }
             WM_IME_COMPOSITION => {
                 let flags = lparam as u32;
-                // 两个 flag **都**处理（位掩码允许同时置位：提交后紧接着开始新组合）。
-                // 命中 `RESULTSTR` 后直接 return 会让同一消息里的新组合串丢失（AR1b N5）。
                 let committed = if flags & GCS_RESULTSTR.0 != 0 {
                     composition_string(hwnd, GCS_RESULTSTR)
                 } else {
                     None
                 };
                 if let Some(text) = committed.as_ref() {
-                    // 提交去重：按 **UTF-16 码元** 排队（emoji = 2 个码元，中文 = 1 个）。
                     self.queue_commit(text, ticks_ms);
                 }
                 let read = if flags & GCS_COMPSTR.0 != 0 {
-                    // 第三方 IME 可能不发 `WM_IME_STARTCOMPOSITION` 就直接送组合串：只要本报文
-                    // 带组合串就记成「组合中」，失焦 / 禁用路径才补得出 `ImeEvent::End`。
                     self.composing = true;
                     read_composition(hwnd, flags)
                 } else {
@@ -216,8 +112,6 @@ impl ImeState {
                 }
             }
             WM_IME_ENDCOMPOSITION => {
-                // 恰好一条 `End`：只有确实处于组合中才投递。失焦 / 禁用路径可能已经合成过一条
-                //（组合态已清零），系统随后迟到的这条 `WM_IME_ENDCOMPOSITION` 不得重复投递。
                 let composing = std::mem::take(&mut self.composing);
                 ImeOutcome {
                     events: if composing {
@@ -232,26 +126,15 @@ impl ImeState {
         }
     }
 
-    /// 平台 IME 是否处于组合中（失焦 / 禁用的清场路径据此决定是否补 `ImeEvent::End`）。
     pub(crate) fn is_composing(&self) -> bool {
         self.composing
     }
 
-    /// 结束平台组合状态（失焦 / 窗口销毁 / IME 状态切换）：返回**至多一条** `ImeEvent::End`。
-    ///
-    /// 组合中调用恰好返回一条 `End` 并把状态清零：之后系统迟到的 `WM_IME_ENDCOMPOSITION`
-    /// 走 [`Self::handle`] 时组合态已是 false，不会重复投递。不在组合中则返回 `None`。
-    /// 同时清空待抑制码元队列（失焦后的 `WM_CHAR` 不会再来，残留会吞掉之后的真实键入）。
     pub(crate) fn finish_composition(&mut self) -> Option<ImeEvent> {
         self.clear_pending();
         std::mem::take(&mut self.composing).then_some(ImeEvent::End)
     }
 
-    /// `WM_CHAR` 是否应被 IME 提交吞掉（提交后 Windows 会再发同样的字符）。
-    ///
-    /// 只吞**与队首一致**的码元；不一致立刻清空队列并放行（异常 IME 自愈，绝不吞掉真实键入）。
-    /// 过了队列的有效期（批次 / 时间窗，见 [`Self::queue_commit`]）同样清空放行：那不是系统
-    /// 补发，而是用户之后的真实字符（AR3 §1.5）。
     pub(crate) fn consume_char(&mut self, unit: u16, ticks_ms: u32) -> bool {
         if self.pending_chars.is_empty() {
             return false;
@@ -269,7 +152,6 @@ impl ImeState {
                 true
             }
             Some(_) => {
-                // 提交文本与真实到达的字符不一致：队列作废（剩下的码元不会再来）。
                 self.clear_pending();
                 false
             }
@@ -277,7 +159,6 @@ impl ImeState {
         }
     }
 
-    /// 队列是否仍在有效期内（批次号 + 时间窗，两道判据）。
     fn pending_is_live(&self, ticks_ms: u32) -> bool {
         let Some(queued_batch) = self.pending_batch else {
             return false;
@@ -286,73 +167,42 @@ impl ImeState {
             && ticks_ms.wrapping_sub(self.pending_ticks) <= PENDING_COMMIT_WINDOW_MS
     }
 
-    /// 把一次提交的文本排进待抑制队列（随后的 `WM_CHAR` 逐码元比对后跳过）。
-    ///
-    /// 单位是 **UTF-16 码元**：系统在 IME 提交之后补发的 `WM_CHAR` 每码元一条，
-    /// 「🌍a」= 3 条。用码点数（旧实现的 `chars().count()`）会让 emoji 提交后重复插入
-    /// 或漏抑制（R07-5 / R02-13）。
-    ///
-    /// 每笔提交都带自己的**事件流位置**（消息批次号）与**时间戳**（`MSG.time`）：队列只在
-    /// 「入队批次 + 紧随其后的一轮」内匹配，再晚的 `WM_CHAR` 一律按真实键入放行
-    /// （AR3 §1.5：提交后系统不补发时，残留队列会吞掉用户之后键入的同首码元字符）。
     pub(crate) fn queue_commit(&mut self, text: &str, ticks_ms: u32) {
-        // 追加而不是覆盖：同一批里两次提交之间可能没有 `WM_CHAR`（P3）。
         self.pending_chars.extend(text.encode_utf16());
         self.pending_batch = Some(self.batch);
         self.pending_ticks = ticks_ms;
     }
 
-    /// 一轮消息排空结束（泵在每轮 ① 之前调用）：推进消息批次号。
-    ///
-    /// **不**在这里清队列：入队批次 + 紧随其后的一轮内的 `WM_CHAR` 仍要能匹配（`PostMessage`
-    /// 补发的字符可能落在下一次排空里）；更晚的批次由 [`Self::consume_char`] 的批次判据作废。
     pub(crate) fn end_message_batch(&mut self) {
         self.batch = self.batch.wrapping_add(1);
     }
 
-    /// 清空待抑制队列（失焦 / 重新组合 / 禁用 IME / 真实按键）。
     pub(crate) fn clear_pending(&mut self) {
         self.pending_chars.clear();
         self.pending_batch = None;
     }
 
-    /// 本窗口的 IME 当前是否启用（`WndProc` 据此吞掉 `WM_IME_*`）。
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
 
-    /// 计划一次启用/禁用（应用目标状态与已应用状态不同时才调用）。
-    ///
-    /// 记账在**返回命令之前**完成：`ImmAssociateContext*` 会同步派发 `WM_IME_SETCONTEXT`，
-    /// 嵌套进入的 `WndProc` 必须已经看到新状态（禁用期间那条消息要被吞掉，否则默认过程
-    /// 可能把组合窗重新显示出来）。
     pub(crate) fn plan_enabled(&mut self, enabled: bool) -> Option<ImeCommand> {
         if enabled == self.enabled {
             return None;
         }
         self.enabled = enabled;
         if enabled {
-            // 恢复：保存过上下文就还回去，否则让系统给窗口关联默认上下文。
             Some(match self.saved_context.take() {
                 Some(context) => ImeCommand::Associate(Some(context)),
                 None => ImeCommand::AssociateDefault,
             })
         } else {
-            // 禁用：摘下上下文，并清掉未消费的抑制队列与平台组合态（否则重新启用后第一次
-            // 真实输入会被上一次提交的余数吞掉；残留的「组合中」还会让失焦路径补一条过期的
-            // `ImeEvent::End`）。`End` 本身由泵侧 `sync_ime_enabled` 按禁用前的组合快照补发。
             self.clear_pending();
             self.composing = false;
             Some(ImeCommand::Associate(None))
         }
     }
 
-    /// 禁用态下收到 `WM_IME_SETCONTEXT` / `WM_INPUTLANGCHANGE`：把系统**重新关联**回窗口的
-    /// 输入上下文再摘一次（幂等；win-1 P3）。
-    ///
-    /// IMM32 在焦点 / 输入法切换后可能重新给窗口关联上下文（MSDN：系统默认给每个窗口关联
-    /// 默认输入上下文；`WM_IME_SETCONTEXT` 正是「上下文关联状态变了」的通知）。只摘一次的话，
-    /// 禁用期间窗口又有了上下文 ⇒ 字母键重新被 IME 吃成组合输入。
     pub(crate) fn plan_reassert_disabled(&mut self) -> Option<ImeCommand> {
         if self.enabled {
             return None;
@@ -360,57 +210,40 @@ impl ImeState {
         Some(ImeCommand::Associate(None))
     }
 
-    /// 窗口销毁**之前**把摘下来的上下文还回去，让系统随窗口释放它（避免 `HIMC` 泄漏）。
-    ///
-    /// 必须在 `DestroyWindow` 之前、HWND 仍有效时执行。没有保存过上下文则无事可做：
-    /// 禁用时窗口本来就没有上下文，不存在本层拥有的句柄。
     pub(crate) fn plan_release_before_destroy(&mut self) -> Option<ImeCommand> {
         self.enabled = true;
         self.clear_pending();
-        // 窗口销毁 = 平台组合一起消失：清组合态，避免残留状态影响（进程内可能还有别的窗口）。
-        // 应用侧已经收到关闭请求 / 收到窗口销毁，不需要再补 `End`。
         self.composing = false;
         self.saved_context
             .take()
             .map(|context| ImeCommand::Associate(Some(context)))
     }
 
-    /// 保存并计划立刻应用 caret 区域（`None` = 清除 hint）。
     pub(crate) fn plan_cursor_area(&mut self, area: Option<PhysicalRect>) -> Option<ImeCommand> {
         self.cursor_area = area;
         area.map(ImeCommand::SetCaret)
     }
 
-    /// 写回「摘下来的旧上下文」：**覆盖**保存值（禁用路径的唯一写点）。
     pub(crate) fn store_detached(&mut self, detached: Option<HIMC>) {
         self.saved_context = detached;
     }
 
-    /// 写回「禁用态下重新摘下来的上下文」：**只在还没有保存值时**记录。
-    ///
-    /// 已经有保存值时不覆盖：系统这次重新关联出来的上下文只被摘下、不再关联 —— IMM32 的
-    /// 默认输入上下文是线程级的，本层不 `ImmDestroyContext` 它（擅自销毁会让后续 IME 输入
-    /// 失效），由输入法/线程生命周期回收。
     pub(crate) fn store_reasserted(&mut self, detached: Option<HIMC>) {
         if self.saved_context.is_none() {
             self.saved_context = detached;
         }
     }
 
-    /// 写回 [`ImeApplied`]（唯一的状态回写入口，见 [`super::event_loop::WndProcState::note_ime_applied`]）。
     pub(crate) fn note_applied(&mut self, applied: ImeApplied) {
         match applied {
             ImeApplied::Done => {}
             ImeApplied::Detached(context) => self.store_detached(context),
             ImeApplied::RestoreFailed => {
-                // 恢复失败：回滚成「禁用」，下一轮泵会重试；否则 `enabled` 已记账、永远不会
-                // 再试 ⇒ IME 静默失效（复审 W1-4）。
                 self.enabled = false;
             }
         }
     }
 
-    /// 写回「禁用态重新摘除」的结果：**不覆盖**已保存的待恢复上下文。
     pub(crate) fn note_reasserted(&mut self, applied: ImeApplied) {
         match applied {
             ImeApplied::Detached(context) => self.store_reasserted(context),
@@ -419,13 +252,7 @@ impl ImeState {
     }
 }
 
-/// 执行一条 [`ImeCommand`]。
-///
-/// **调用方不得持有 `&mut WndProcState`**：这三个 API 都会同步派发 `WM_IME_*`，嵌套进入的
-/// `WndProc` 会再构造 `&mut WndProcState`（R07-7 的别名 UB 就是从这里来的）。
 pub(crate) fn execute(hwnd: HWND, command: ImeCommand) -> ImeApplied {
-    // SAFETY: `hwnd` 由调用方保证存活（窗口销毁前 / 消息处理期间）；这些 API 只改
-    // 「窗口 ↔ 输入上下文」的关联或组合/候选窗表单，不持有 Rust 引用、不保留指针。
     unsafe {
         match command {
             ImeCommand::Associate(context) => {
@@ -433,8 +260,6 @@ pub(crate) fn execute(hwnd: HWND, command: ImeCommand) -> ImeApplied {
                 if context.is_none() {
                     ImeApplied::Detached((!previous.is_invalid()).then_some(previous))
                 } else {
-                    // 还回保存的上下文：返回值是「被替换出来的旧上下文」（窗口刚被摘下，
-                    // 正常为 NULL；若禁用期间系统又关联了新上下文，它随窗口释放，本层不释放）。
                     ImeApplied::Done
                 }
             }
@@ -453,38 +278,21 @@ pub(crate) fn execute(hwnd: HWND, command: ImeCommand) -> ImeApplied {
     }
 }
 
-/// `WM_IME_SETCONTEXT` 的 lParam 掩码：清掉 IME **自绘**组合窗与 guideline，保留其它位。
-///
-/// 引擎自己画 inline preedit（[`ImeEvent::Preedit`]）；不清 `ISC_SHOWUICOMPOSITIONWINDOW`
-/// 的话 IME 会在 caret 处**同时**画自己的组合窗 —— 用户看到「输入的拼音出现两遍」
-/// （Chrome `RenderWidgetHostViewWin` 与 Qt `QWindowsInputContext` 都清这一位；MS 官方
-/// IME 教程直接示范 `lParam = 0` 再 `DefWindowProc`）。
-///
-/// **候选窗保留**（`ISC_SHOWUICANDIDATEWINDOW`）：引擎只画组合串，候选列表仍由 IME 画。
-/// `wParam == FALSE`（上下文失活）时原样返回：此时只是状态通知，没有可见窗口要改。
 pub(crate) fn mask_setcontext(wparam: usize, lparam: isize) -> isize {
     if wparam == 0 {
         return lparam;
     }
-    // lParam 是 32 位 IME 窗口标志（64 位下由系统符号扩展/零扩展传入），按 u32 处理。
     let flags = lparam as u32;
     let masked = flags & !(ISC_SHOWUICOMPOSITIONWINDOW | ISC_SHOWUIGUIDELINE);
     masked as isize
 }
 
-/// 一次 `WM_IME_COMPOSITION` 读到的组合数据。
 struct CompositionRead {
     text: SmolStr,
-    /// 组合串内插入点（UTF-16 码元，已夹到 `0..=len`）；`None` = 本次消息没带该 flag。
     caret: Option<u32>,
     clauses: ClauseRanges,
 }
 
-/// 一条 `WM_IME_COMPOSITION` 的**纯**事件组装（顺序固定：Commit → Preedit，XML 求值顺序）。
-///
-/// 抽成纯函数是为了能在开发机上钉住「两个 flag 同时置位时不得丢事件」这条契约（AR1b N5）：
-/// 真实读取（`ImmGetCompositionStringW`）需要活着的 HIMC 与真实输入法的组合态，单测构造不出来；
-/// 这里只负责把**已经读到**的数据按 flag 顺序变成事件，可被任意假数据驱动。
 fn composition_events(
     flags: u32,
     committed: Option<SmolStr>,
@@ -496,9 +304,6 @@ fn composition_events(
     {
         events.push(ImeEvent::Commit {
             text,
-            // WIN32 `GCS_RESULTSTR` 就是本次提交的完整串：IMM32 没有 AppKit
-            // `replacementRange` 那种「只替换组合串的一段」的区间信息，
-            // `None` = 替换整个当前组合串。
             replace: None,
         });
     }
@@ -509,16 +314,13 @@ fn composition_events(
             text: read.text,
             caret: read.caret,
             clauses: read.clauses,
-            // `GCS_COMPSTR` 是**完整**组合串（不是增量），所以整体替换。
             replace: None,
         });
     }
     events
 }
 
-/// 按 flag 分项读取组合串（**一次** `ImmGetContext` 覆盖全部查询）。
 fn read_composition(hwnd: HWND, flags: u32) -> Option<CompositionRead> {
-    // SAFETY: `himc` 在函数内成对释放；所有缓冲区都由本函数独占，写入之后才读。
     unsafe {
         let himc: HIMC = ImmGetContext(hwnd);
         if himc.is_invalid() {
@@ -533,17 +335,13 @@ fn read_composition(hwnd: HWND, flags: u32) -> Option<CompositionRead> {
             (flags & GCS_COMPCLAUSE.0 != 0).then(|| composition_dwords(himc, GCS_COMPCLAUSE));
         let _ = ImmReleaseContext(hwnd, himc);
         let text = text?;
-        // 长度必须是 **UTF-16 码元**数：属性字节与子句边界都按码元计数。
         let len = text.encode_utf16().count();
         let clauses = preedit_clauses(
             attrs.as_deref(),
             clause_offsets.as_deref(),
             len,
-            // `ATTR_INPUT`（0）是「仍在输入、不需要高亮」的属性；其余（已转换/转换中/
-            // 已固定/输入错误）都交给文本层高亮。
             ATTR_INPUT as u8,
         );
-        // `caret` 先算：`clamp_caret` 还要借用 `text`（吸附代理对），不能等结构体里先移动它。
         let caret = caret.map(|position| clamp_caret(position, &text));
         Some(CompositionRead {
             text,
@@ -553,14 +351,6 @@ fn read_composition(hwnd: HWND, flags: u32) -> Option<CompositionRead> {
     }
 }
 
-/// 组合串内插入点夹到 `0..=len`，并**吸附到 UTF-16 码点边界**。
-///
-/// `GCS_CURSORPOS` 在第三方 IME / 组合串刚清空时会给出越界值（甚至超过 `i16::MAX` 的伪造值），
-/// 直接交给文本层会切在非码点边界或越界 panic；夹住即可（视觉上退化为末尾）。
-///
-/// 代理对（emoji 等 4 字节字符 = 2 个 UTF-16 码元）**不得被从中间切开**：落在低代理码元上的
-/// 插入点向低位挪一格（回到高代理之前），否则应用按 `caret` 切片会得到非法 UTF-16，候选窗
-/// 定位 / 串内插入点也会错位（AR3 §1.4 / P2-1）。
 fn clamp_caret(position: u32, text: &str) -> u32 {
     let len = text.encode_utf16().count();
     let mut caret = (position as usize).min(len);
@@ -570,28 +360,19 @@ fn clamp_caret(position: u32, text: &str) -> u32 {
     caret as u32
 }
 
-/// UTF-16 低代理码元（`0xDC00..=0xDFFF`）：它前面必然是一个高代理，切在它上面就是切在
-/// 代理对中间。
 fn is_low_surrogate(unit: u16) -> bool {
     (0xDC00..=0xDFFF).contains(&unit)
 }
 
-/// `ImmGetCompositionStringW(GCS_CURSORPOS)`：**返回值就是插入点**，不是字节数。
-///
-/// 这是 IMM32 唯一一个返回「值」而不是「写入字节数」的 flag；把它当字节数去分配缓冲区是
-/// 常见错误（R07-4）。负返回值（`IMM_ERROR_NODATA` / `IMM_ERROR_GENERAL`）⇒ `None`。
 fn cursor_position(himc: HIMC) -> Option<u32> {
-    // SAFETY: `himc` 有效（调用方由 `ImmGetContext` 取得）；不写缓冲区。
     let position = unsafe { ImmGetCompositionStringW(himc, GCS_CURSORPOS, None, 0) };
     (position >= 0).then_some(position as u32)
 }
 
-/// 取组合串（UTF-16 → `SmolStr`）；上下文无效或长度 ≤ 0 时返回 `None`。
 fn composition_string(
     hwnd: HWND,
     flag: windows::Win32::UI::Input::Ime::IME_COMPOSITION_STRING,
 ) -> Option<SmolStr> {
-    // SAFETY: `himc` 成对释放；缓冲区由本函数独占，`written` 之后才读。
     unsafe {
         let himc: HIMC = ImmGetContext(hwnd);
         if himc.is_invalid() {
@@ -603,12 +384,10 @@ fn composition_string(
     }
 }
 
-/// [`composition_string`] 的 `himc` 版本（组合串读取共用一次上下文）。
 fn composition_string_with(
     himc: HIMC,
     flag: windows::Win32::UI::Input::Ime::IME_COMPOSITION_STRING,
 ) -> Option<SmolStr> {
-    // SAFETY: `himc` 有效；先问长度，再按长度分配缓冲区写入。
     unsafe {
         let bytes = ImmGetCompositionStringW(himc, flag, None, 0);
         if bytes <= 0 {
@@ -629,12 +408,10 @@ fn composition_string_with(
     }
 }
 
-/// `ImmGetCompositionStringW` 的按字节输出项（`GCS_COMPATTR`：每码元 1 字节）。
 fn composition_bytes(
     himc: HIMC,
     flag: windows::Win32::UI::Input::Ime::IME_COMPOSITION_STRING,
 ) -> Vec<u8> {
-    // SAFETY: 两段式：先问字节数，再按同一长度写入本函数独占的缓冲区。
     unsafe {
         let bytes = ImmGetCompositionStringW(himc, flag, None, 0);
         if bytes <= 0 {
@@ -651,12 +428,10 @@ fn composition_bytes(
     }
 }
 
-/// `ImmGetCompositionStringW` 的按 `u32` 输出项（`GCS_COMPCLAUSE`：子句边界偏移）。
 fn composition_dwords(
     himc: HIMC,
     flag: windows::Win32::UI::Input::Ime::IME_COMPOSITION_STRING,
 ) -> Vec<u32> {
-    // SAFETY: 同 `composition_bytes`；长度不足一个 `u32` 的尾巴被丢弃。
     unsafe {
         let bytes = ImmGetCompositionStringW(himc, flag, None, 0);
         if bytes < 4 {
@@ -677,10 +452,8 @@ fn composition_dwords(
     }
 }
 
-/// 把 caret 区域写成组合窗 + 候选窗表单（客户区物理像素）。
 fn set_caret_forms(hwnd: HWND, area: PhysicalRect) {
     let (composition, candidate) = caret_forms(area);
-    // SAFETY: `himc` 成对释放；两个 form 都是栈上值，API 不保留指针。
     unsafe {
         let himc: HIMC = ImmGetContext(hwnd);
         if himc.is_invalid() {
@@ -692,13 +465,6 @@ fn set_caret_forms(hwnd: HWND, area: PhysicalRect) {
     }
 }
 
-/// caret 区域 → `(COMPOSITIONFORM, CANDIDATEFORM)`。
-///
-/// - 组合窗落点：caret 区域底边（`CFS_POINT`）；
-/// - 候选窗：左上角 + `CFS_EXCLUDE`，让 IME 避开文字区域。
-///
-/// 坐标相对**客户区**左上角（MSDN：`COMPOSITIONFORM` 与 `CANDIDATEFORM` 都是客户区坐标），
-/// 因此调用方传客户区物理像素即可。
 fn caret_forms(area: PhysicalRect) -> (COMPOSITIONFORM, CANDIDATEFORM) {
     let width = area.width().max(1);
     let height = area.height().max(1);
@@ -760,7 +526,6 @@ mod tests {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        // SAFETY: 测试窗口只用于 IME 表单读写，默认过程不依赖额外状态。
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
@@ -768,10 +533,8 @@ mod tests {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// 建一个隐藏窗口（不 `ShowWindow`）。
     fn hidden_window(tag: &str) -> (HWND, Vec<u16>) {
         let class_name = wide(tag);
-        // SAFETY: 进程级模块句柄；类名是 NUL 结尾宽字符串，`RegisterClassW` 同步拷贝。
         let instance = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         let class = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
@@ -781,7 +544,6 @@ mod tests {
         };
         let atom = unsafe { RegisterClassW(&class) };
         assert_ne!(atom, 0, "RegisterClassW");
-        // SAFETY: 类已注册；`WS_OVERLAPPEDWINDOW` 不含 `WS_VISIBLE` ⇒ 窗口保持隐藏。
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -802,7 +564,6 @@ mod tests {
         (hwnd, class_name)
     }
 
-    /// 两阶段驱动一次命令（与生产 `WndProcState::note_ime_applied` 同序）。
     fn drive(state: &mut ImeState, hwnd: HWND, command: Option<ImeCommand>) {
         if let Some(command) = command {
             let applied = execute(hwnd, command);
@@ -810,7 +571,6 @@ mod tests {
         }
     }
 
-    /// 两阶段驱动一次「禁用态重新摘除」（与生产 `WndProcState::note_ime_reasserted` 同序）。
     fn drive_reassert(state: &mut ImeState, hwnd: HWND, command: Option<ImeCommand>) {
         if let Some(command) = command {
             let applied = execute(hwnd, command);
@@ -852,7 +612,6 @@ mod tests {
         assert_eq!(candidate.rcArea.bottom, 273);
     }
 
-    /// R07-3：引擎自己画 inline preedit ⇒ 必须清掉 IME 自绘组合窗与 guideline，候选窗保留。
     #[test]
     fn setcontext_masking_clears_the_ime_composition_window_and_guideline() {
         let lparam = (ISC_SHOWUICOMPOSITIONWINDOW | ISC_SHOWUIGUIDELINE | ISC_SHOWUICANDIDATEWINDOW)
@@ -877,19 +636,13 @@ mod tests {
         );
     }
 
-    /// 上下文失活（wParam == FALSE）时系统只是通知状态，不得改 lParam。
     #[test]
     fn setcontext_masking_leaves_the_inactive_notification_alone() {
         let lparam = ISC_SHOWUICOMPOSITIONWINDOW as isize;
         assert_eq!(mask_setcontext(0, lparam), lparam);
-        // wParam == TRUE 且没有任何标志位时结果仍是 0（不引入新位）。
         assert_eq!(mask_setcontext(1, 0), 0);
     }
 
-    /// R07-5 / R02-13：提交去重按 **UTF-16 码元** 排队，emoji（2 码元）之后不能多吞。
-    ///
-    /// 走**生产** `queue_commit`（AR3 §9 变异实验 #10：旧用例直接构造私有字段，把生产实现改回
-    /// 码点截断仍然全绿）。
     #[test]
     fn committed_astral_text_queues_one_unit_per_utf16_code_unit() {
         let mut state = ImeState::default();
@@ -905,13 +658,11 @@ mod tests {
         );
     }
 
-    /// 内容不匹配立即自愈：不能把余数留给用户之后真实键入的字符。
     #[test]
     fn a_mismatched_char_clears_the_queue_instead_of_swallowing_later_input() {
         let mut state = ImeState::default();
         state.queue_commit("你好", 0);
 
-        // IME 通路没送来提交后的 `WM_CHAR`，用户直接键入 'x'：不吞、并清空队列。
         assert!(!state.consume_char(u16::from(b'x'), 0));
         assert!(
             !state.consume_char(u16::from(b'y'), 0),
@@ -919,14 +670,9 @@ mod tests {
         );
     }
 
-    /// AR3 §1.5（P2-2）：提交抑制队列的生命周期**限制在入队批次 + 紧随其后的一轮**。
-    ///
-    /// 失败面：候选窗提交后系统不补发 `WM_CHAR`，队列原样留到下一次组合 / 失焦；用户随后键入
-    /// 与提交首码元相同的字符时 `consume_char` 命中，真实按键被吞掉一次。
     #[test]
     fn a_commit_only_suppresses_chars_in_the_following_message_batch() {
         let mut state = ImeState::default();
-        // 第 0 批提交；系统补发的字符落在同批或紧随其后的一轮（第 1 批）都还能抑制。
         state.queue_commit("a", 0);
         assert!(state.consume_char(u16::from(b'a'), 0), "同批补发被抑制");
 
@@ -937,7 +683,6 @@ mod tests {
             "PostMessage 补发的字符可能落在下一次消息排空里"
         );
 
-        // 再往后（第 2 批）就不是补发了：必须放行并清空。
         state.queue_commit("a", 0);
         state.end_message_batch();
         state.end_message_batch();
@@ -948,19 +693,16 @@ mod tests {
         assert!(state.pending_chars.is_empty(), "过期队列必须被清空");
     }
 
-    /// AR3 §1.5：队列还带**消息时间戳**，超出时间窗的 `WM_CHAR` 同样按真实键入放行。
     #[test]
     fn a_commit_queue_expires_outside_the_message_time_window() {
         let mut state = ImeState::default();
         let committed_at = 1_000;
         state.queue_commit("a", committed_at);
-        // 同一批但时间已过窗（异常 IME 补发迟到 / 消息时间被伪造）。
         assert!(
             !state.consume_char(u16::from(b'a'), committed_at + PENDING_COMMIT_WINDOW_MS + 1),
             "时间窗之外不是补发字符"
         );
         assert!(state.pending_chars.is_empty());
-        // 时间戳是 32 位回绕域：跨 0 的时间差仍要算对。
         state.queue_commit("b", u32::MAX - 5);
         assert!(
             state.consume_char(u16::from(b'b'), 3),
@@ -968,7 +710,6 @@ mod tests {
         );
     }
 
-    /// AR3 §1.5（P3）：同一批里两次提交之间可能没有 `WM_CHAR`，队列必须**追加**而不是覆盖。
     #[test]
     fn a_second_commit_in_the_same_batch_appends_to_the_queue() {
         let mut state = ImeState::default();
@@ -982,10 +723,6 @@ mod tests {
         assert!(state.pending_chars.is_empty());
     }
 
-    /// 禁用 IME 会清空待抑制队列（`plan_enabled(false)`）。
-    ///
-    /// 「重新组合也清空队列」由 `starting_a_new_composition_drops_the_pending_commit_queue`
-    /// 覆盖（AR1b P3-2：旧注释承诺了这条，代码此前只在失焦/禁用/销毁时清）。
     #[test]
     fn disabling_the_ime_drops_the_pending_characters() {
         let mut state = ImeState::default();
@@ -1001,7 +738,6 @@ mod tests {
         assert!(!state.enabled());
     }
 
-    /// `GCS_CURSORPOS` 越界（第三方 IME / 组合串刚清空）时必须夹到 `0..=len`。
     #[test]
     fn the_composition_caret_is_clamped_to_the_composition_length() {
         let text = "abc";
@@ -1012,39 +748,24 @@ mod tests {
         assert_eq!(clamp_caret(u32::MAX, ""), 0);
     }
 
-    /// AR3 §1.4 / P2-1：`caret` 不得落在**代理对中间**（向低位挪一格）。
-    ///
-    /// 「🌍a」= `[D83C, DF0D, 0061]`；`GCS_CURSORPOS == 1` 是代理对中点，切片会得到非法
-    /// UTF-16，候选窗定位 / 串内插入点也会错位。所有索引逐个覆盖（含越界）。
     #[test]
     fn the_composition_caret_is_snapped_out_of_surrogate_pairs() {
         let text = "🌍a";
-        let expected = [
-            (0, 0),  // 组合串开头
-            (1, 0),  // 代理对中间 ⇒ 挪回高代理之前
-            (2, 2),  // emoji 之后
-            (3, 3),  // 串尾
-            (4, 3),  // 越界 ⇒ 末尾
-            (99, 3), // 越界 ⇒ 末尾
-        ];
+        let expected = [(0, 0), (1, 0), (2, 2), (3, 3), (4, 3), (99, 3)];
         for (raw, want) in expected {
             assert_eq!(clamp_caret(raw, text), want, "caret {raw} → {want}");
         }
-        // 代理对相邻边界（合法码点边界）原样保留，不会被多挪。
         assert_eq!(clamp_caret(2, text), 2);
-        // 纯代理对串：中点吸附到 0，尾点不动。
         assert_eq!(clamp_caret(1, "🌍"), 0);
         assert_eq!(clamp_caret(2, "🌍"), 2);
     }
 
-    /// 启用态下 `plan_reassert_disabled` 不得产出命令（只在禁用态摘上下文）。
     #[test]
     fn reassert_is_a_no_op_while_the_ime_is_enabled() {
         let mut state = ImeState::default();
         assert!(state.plan_reassert_disabled().is_none());
     }
 
-    /// `ImeApplied::RestoreFailed` 必须把已应用状态回滚成禁用（否则永不重试）。
     #[test]
     fn a_failed_restore_rolls_the_applied_state_back_to_disabled() {
         let mut state = ImeState::default();
@@ -1060,7 +781,6 @@ mod tests {
     #[test]
     fn unknown_messages_do_not_produce_ime_events() {
         let mut state = ImeState::default();
-        // SAFETY: 该消息分支不读 `hwnd`；传空句柄是安全的（只走 `_` 分支）。
         let outcome = state.handle(
             HWND::default(),
             windows::Win32::UI::WindowsAndMessaging::WM_PAINT,
@@ -1072,11 +792,6 @@ mod tests {
         assert!(outcome.command.is_none());
     }
 
-    /// AR1b N5（P2 回归）：`GCS_RESULTSTR | GCS_COMPSTR` 同时置位 ⇒ **两条**事件，顺序
-    /// Commit → Preedit。
-    ///
-    /// 失败面：命中 `RESULTSTR` 后直接 `return`，同一消息里的新组合串被丢弃（提交后紧接着开始
-    /// 新组合时，新 preedit 在这一帧消失，最坏表现为拼音首字母闪断）。
     #[test]
     fn both_result_and_composition_flags_emit_commit_then_preedit() {
         let read = CompositionRead {
@@ -1106,8 +821,6 @@ mod tests {
         );
     }
 
-    /// AR1b N5 的另一半：`RESULTSTR` 读取失败（上下文无效 / 空提交）时**不得**连带吞掉同一
-    /// 消息里的 `COMPSTR`。
     #[test]
     fn a_missing_commit_still_delivers_the_new_preedit() {
         let read = CompositionRead {
@@ -1123,7 +836,6 @@ mod tests {
         );
     }
 
-    /// 只有一个 flag 时行为不变；位掩码里没有这两个 flag ⇒ 不产事件。
     #[test]
     fn a_single_flag_still_produces_exactly_one_event() {
         let read = CompositionRead {
@@ -1149,10 +861,6 @@ mod tests {
         );
     }
 
-    /// AR1b P3-2（文档/实现不符）：`WM_IME_STARTCOMPOSITION` 必须清空上一次提交的待抑制队列。
-    ///
-    /// 旧注释承诺「重新组合也清空队列」，代码只在失焦 / 禁用 / 销毁时清 —— 残留码元会让新组合
-    /// 之后的第一批真实键入被误吞。
     #[test]
     fn starting_a_new_composition_drops_the_pending_commit_queue() {
         let mut state = ImeState::default();
@@ -1170,7 +878,6 @@ mod tests {
         let mut state = ImeState::default();
         let command = state.plan_cursor_area(Some(PhysicalRect::new(100, 200, 101, 220)));
         drive(&mut state, hwnd, command);
-        // SAFETY: 窗口由本用例创建；上下文成对释放，窗口最后销毁。
         unsafe {
             let himc = ImmGetContext(hwnd);
             if himc.is_invalid() {
@@ -1181,7 +888,6 @@ mod tests {
             let mut composition = COMPOSITIONFORM::default();
             let mut candidate = CANDIDATEFORM::default();
             if ImmGetCompositionWindow(himc, &mut composition).as_bool() {
-                // CFS_POINT 允许 IME 调整 ptCurrentPos；这里只核对 rcArea。
                 assert_eq!(composition.rcArea.left, 100);
                 assert_eq!(composition.rcArea.top, 200);
             } else {
@@ -1198,17 +904,10 @@ mod tests {
         }
     }
 
-    /// win-1 P3（任务 2）：窗口销毁前的恢复通路必须真的把摘下的上下文还回去。
-    ///
-    /// 覆盖缺口：删掉 NativeWindow::destroy 里的 plan_ime_release 执行时，既有用例
-    /// 全绿也抓不到。本用例直接驱动保存/恢复状态机（两阶段：命令 + 写回）；
-    /// `platform/windows/window.rs` 的接线用例覆盖 `NativeWindow::sync_ime_enabled` 与
-    /// `NativeWindow::destroy` 这两个调用点（泵每轮调用它们的**节奏**需要真实泵 + 渲染器）。
     #[test]
     fn release_before_destroy_restores_the_saved_ime_context() {
         let (hwnd, _class) = hidden_window("KytrixP16ImeRelease");
         let mut state = ImeState::default();
-        // SAFETY: 窗口由本用例创建且存活；`ImmGetContext` 的句柄成对释放，窗口最后销毁。
         unsafe {
             let baseline = ImmGetContext(hwnd);
             if baseline.is_invalid() {
@@ -1233,11 +932,9 @@ mod tests {
                 "销毁前必须把保存的上下文还回窗口，否则 HIMC 泄漏"
             );
             assert_eq!(restored, baseline, "恢复的必须是被摘下的那个上下文");
-            // 恢复后 `enabled` 必须回到 true：窗口销毁阶段不再有禁用态。
             assert!(state.enabled());
             let _ = ImmReleaseContext(hwnd, restored);
 
-            // 启用态下「幂等再摘除」不得动上下文（只应在禁用态触发）。
             let command = state.plan_reassert_disabled();
             drive_reassert(&mut state, hwnd, command);
             let still_attached = ImmGetContext(hwnd);
@@ -1250,13 +947,10 @@ mod tests {
         }
     }
 
-    /// 禁用态下系统重新关联上下文时，`plan_reassert_disabled` 必须再摘一次，且**不覆盖**
-    /// 已保存的待恢复上下文。
     #[test]
     fn reasserting_a_disabled_ime_detaches_again_without_overwriting_the_saved_context() {
         let (hwnd, _class) = hidden_window("KytrixP16ImeReassert");
         let mut state = ImeState::default();
-        // SAFETY: 窗口由本用例创建且存活。
         unsafe {
             let baseline = ImmGetContext(hwnd);
             if baseline.is_invalid() {
@@ -1271,9 +965,7 @@ mod tests {
             let saved = state.saved_context;
             assert!(saved.is_some(), "禁用时必须保存被摘下的上下文");
 
-            // 系统把上下文重新挂回窗口（模拟焦点/输入法切换）。
             let _ = super::ImmAssociateContext(hwnd, saved.expect("saved context"));
-            // 再摘一次：返回的应是刚才挂回去的那个，但保存值不得被新值覆盖。
             let command = state.plan_reassert_disabled();
             drive_reassert(&mut state, hwnd, command);
             assert!(ImmGetContext(hwnd).is_invalid(), "重新关联后必须再摘一次");
@@ -1283,12 +975,10 @@ mod tests {
         }
     }
 
-    /// `saved_context` 为 `None` 时（禁用时窗口本来无上下文），恢复走 `IACE_DEFAULT`。
     #[test]
     fn restoring_without_a_saved_context_asks_the_system_for_the_default_one() {
         let mut state = ImeState::default();
         state.plan_enabled(false);
-        // 手动把保存值清掉，模拟「禁用时窗口本来就没有上下文」。
         state.saved_context = None;
 
         let command = state.plan_enabled(true);
@@ -1300,7 +990,6 @@ mod tests {
         assert!(state.enabled());
     }
 
-    /// 类型守卫：`HIMC` 是 `Copy` 的句柄，命令可以按值传递（两阶段执行的前提）。
     #[test]
     fn commands_are_plain_data_that_can_outlive_the_borrow() {
         fn takes(_: ImeCommand) {}
@@ -1310,10 +999,6 @@ mod tests {
         takes(ImeCommand::SetCaret(PhysicalRect::new(0, 0, 1, 1)));
     }
 
-    // ── B6/D6：失焦 / 禁用时的组合清场（恰好一条 End）─────────────────────────────
-
-    /// 组合中失焦：清场返回**恰好一条** `ImeEvent::End`；系统随后迟到的
-    /// `WM_IME_ENDCOMPOSITION` 不得重复投递（组合态已清零），再次清场也不得再补。
     #[test]
     fn a_focus_loss_during_composition_emits_exactly_one_end() {
         let (hwnd, _class) = hidden_window("KytrixImeFocusLoss");
@@ -1333,7 +1018,6 @@ mod tests {
         );
     }
 
-    /// 不在组合中失焦：不得凭空补 `End`。
     #[test]
     fn a_focus_loss_outside_composition_emits_no_end() {
         let mut state = ImeState::default();
@@ -1341,8 +1025,6 @@ mod tests {
         assert_eq!(state.finish_composition(), None);
     }
 
-    /// 孤立 `WM_IME_ENDCOMPOSITION`（没有对应 START）不投递 `End`：协议上 END 只配 START，
-    /// 且失焦 / 禁用清场后迟到的 END 必须被吞掉 —— 否则「恰好一条」不成立。
     #[test]
     fn an_end_composition_without_a_live_composition_emits_nothing() {
         let (hwnd, _class) = hidden_window("KytrixImeStrayEnd");
@@ -1351,8 +1033,6 @@ mod tests {
         assert!(outcome.events.is_empty());
     }
 
-    /// 禁用 IME 时平台组合态一起清掉（`End` 由泵侧 `sync_ime_enabled` 按禁用前快照补发）；
-    /// 清掉之后失焦路径不得再补一条过期的 `End`。
     #[test]
     fn disabling_the_ime_clears_the_composition_state() {
         let (hwnd, _class) = hidden_window("KytrixImeDisable");

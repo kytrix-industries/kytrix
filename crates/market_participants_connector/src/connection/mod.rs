@@ -1,5 +1,3 @@
-//! Shared WebSocket connection state and pooling.
-
 mod heartbeat;
 #[cfg(test)]
 mod integration_tests;

@@ -1,23 +1,3 @@
-//! Model-layer fixtures for the product families this build trades nowhere yet.
-//!
-//! The five product families, the outcome relations, the equity identifiers and
-//! the standard series identifiers are asserted against the real semantics of
-//! Polymarket, US equities, SSE/SZSE, OCC options and standard futures. What
-//! makes one of those families what it is is its continuity terms and its typed
-//! identifiers — the MIC, the issuer, the share class, the OCC symbol, the
-//! condition id — and those are what these fixtures pin.
-//!
-//! What they do **not** pin is the venue. A closed venue set means a fixture of a
-//! market this build trades nowhere cannot be addressed at the market participant that really
-//! lists it, so every fixture here is addressed at [`VenueId::Binance`] and the
-//! family is carried by its scope and its own terms. The venue is still one of the
-//! terms a venue listing is hashed from — the pinned listing identity in
-//! `identity_tests` moved when the fixture's route did — so a fixture here is an
-//! addressed-at-Binance market of that family rather than a venue-neutral one, and
-//! it exercises no route-aware validation: no layer refuses a Polymarket condition
-//! on a Binance route, which is the same combination production never produces.
-//! Nothing registers a route, capability or placeholder for those markets.
-
 use crate::{
     asset::{
         AssetId, CryptoTokenId, CryptoTokenOrigin, SecurityForm, SecurityId, SecurityIssuerId,
@@ -118,20 +98,6 @@ fn equity_instrument(issuer: &str, designation: &str, form: SecurityForm) -> Ins
     .expect("instrument should be valid")
 }
 
-/// The route a fixture of a market this build trades nowhere is addressed at.
-///
-/// The scope names the product family the fixture is really about, and the venue
-/// is [`VenueId::Binance`] — a venue this build speaks — because a route is an
-/// addressing key and it cannot name a venue outside the closed set.
-///
-/// The venue is **not** incidental to a listing's identity: it is one of the
-/// continuity terms a venue listing is hashed from, so a fixture here is an
-/// addressed-at-Binance market whose *family* is named by its scope and its own
-/// typed identifiers. That is a combination production does not produce — no
-/// adapter publishes a Polymarket condition or an OCC symbol under Binance — and
-/// it is deliberate: these fixtures exist to pin each family's own terms and
-/// identifier validation, which the venue does not take part in, and the closed
-/// venue set leaves no other way to address them.
 fn fixture_route(scope: &str) -> VenueRoute {
     VenueRoute::new(
         VenueId::Binance,
@@ -189,7 +155,6 @@ fn polymarket_group(question: &str, labels: &[&str], topology: OutcomeTopology) 
         .map(|label| OutcomeSide::new(&seed_id, (*label).into()).expect("side should be valid"))
         .collect();
     let members: Vec<OutcomeMember> = if labels.len() == 2 {
-        // A binary market is exactly one member with two complementary sides.
         vec![
             OutcomeMember::new(&seed_id, "winner".into(), vec![sides[0].id, sides[1].id])
                 .expect("member should be valid"),

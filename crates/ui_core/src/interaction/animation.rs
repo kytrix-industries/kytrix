@@ -1,13 +1,8 @@
-//! 动画：进度采样、标量/点/颜色插值（槽与推进在 `App::{animate, tick_animations}`）。
-//!
-//! 被驱动的值落 `Transient`（不进依赖图）；重绘由**显式注册的节点集合**的 `mark_paint` 给出
-
 use crate::{
     math::Point,
     paint::color::{Color, ColorResolver},
 };
 
-/// 进度（`0..=1`；`duration == 0` ⇒ 立即 1.0）。
 #[must_use]
 pub(crate) fn progress(elapsed: std::time::Duration, duration: std::time::Duration) -> f32 {
     let total = duration.as_secs_f64();
@@ -17,7 +12,6 @@ pub(crate) fn progress(elapsed: std::time::Duration, duration: std::time::Durati
     (elapsed.as_secs_f64() / total).clamp(0.0, 1.0) as f32
 }
 
-/// 标量插值（`t >= 1.0` 时精确返回 `to`）。
 #[must_use]
 pub(crate) fn lerp(from: f32, to: f32, t: f32) -> f32 {
     if t >= 1.0 {
@@ -26,17 +20,11 @@ pub(crate) fn lerp(from: f32, to: f32, t: f32) -> f32 {
     from + (to - from) * t
 }
 
-/// 点插值。
 #[must_use]
 pub(crate) fn lerp_point(from: Point, to: Point, t: f32) -> Point {
     Point::new(lerp(from.x, to.x, t), lerp(from.y, to.y, t))
 }
 
-/// 颜色插值：**线性预乘空间**（R05-7：与合成 / AA / 渐变同一套数学）。
-///
-/// 直接委托 [`ColorResolver::lerp_color`]：两端各自解析成线性预乘 → 在预乘分量上插值 →
-/// 解回非预乘线性色。旧实现在 **sRGB 编码空间**插值（注释自述「按感知/屏幕空间走」），
-/// 于是同一个主题色过渡到一半时，它作为背景（线性合成）与作为动画值（sRGB 插值）是两种颜色。
 #[must_use]
 pub(crate) fn lerp_color(from: Color, to: Color, t: f32) -> Color {
     if t >= 1.0 {
@@ -90,7 +78,6 @@ mod tests {
 
         let mid = lerp_color(from, to, 0.5);
         let components = crate::paint::color::ColorResolver.resolve(mid).to_array();
-        // 线性空间的中点亮度介于两端之间（sRGB 非线性 ⇒ 不会正好是 0.5 的 8 位值）。
         assert!(components[3] > 0.99, "alpha 必须保持不透明");
         for axis in &components[..3] {
             assert!(

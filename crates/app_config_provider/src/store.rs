@@ -1,9 +1,3 @@
-//! Durable persistence of the settings snapshot and its runtime generations.
-//!
-//! [`ConfigStore`] owns the [`Config`] snapshot the application reads and the
-//! file it is stored in. It has no UI-toolkit dependency; [`crate::manager`]
-//! holds it as a plain value.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -26,7 +20,6 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 const CONFIG_FILE_NAME: &str = "config.json";
-/// How many `-N` suffixes a backup name tries before giving up.
 const MAX_BACKUP_ATTEMPTS: u32 = 1_000;
 
 fn config_file_path() -> Option<PathBuf> {
@@ -98,9 +91,6 @@ impl NetworkGenerationTracker {
             runtime.venues.insert(venue, generation);
         }
 
-        // Kytrix's own services and the built-in model download are stamped apart
-        // from the venues: they are routed by their own applications and a venue
-        // moving must not invalidate them.
         for target in all_network_targets(config, self.services.keys().cloned()) {
             let fingerprint = service_route_fingerprint(config, &target);
             let generation = self
@@ -147,21 +137,12 @@ fn all_network_targets(
     .into_iter()
     .map(|capability| ServiceTarget::KytrixService { capability })
     .collect::<BTreeSet<_>>();
-    // The translation model download has no Kytrix capability, but it is a base
-    // target all the same: its route generation has to be computed whether or not
-    // the user has configured a line for it.
     targets.insert(ServiceTarget::TranslationModelDownload);
     targets.extend(config.proxy_applications.keys().cloned());
     targets.extend(known_targets);
     targets
 }
 
-/// Fingerprints the route one venue's requests take.
-///
-/// A venue that names a line of its own carries it; a venue that names none
-/// follows the default, exactly as the network snapshot answers it — so the
-/// default moving rotates every venue that has no line of its own, and no venue
-/// that has one.
 fn effective_route_fingerprint(config: &Config, venue: &VenueId) -> EffectiveRouteFingerprint {
     let route = config
         .venue(venue)
@@ -172,7 +153,6 @@ fn effective_route_fingerprint(config: &Config, venue: &VenueId) -> EffectiveRou
     }
 }
 
-/// Fingerprints the route one service target takes.
 fn service_route_fingerprint(config: &Config, target: &ServiceTarget) -> EffectiveRouteFingerprint {
     let route = config
         .proxy_applications
@@ -184,10 +164,6 @@ fn service_route_fingerprint(config: &Config, target: &ServiceTarget) -> Effecti
     }
 }
 
-/// Fingerprints the effective route itself.
-///
-/// The default route has no target, and two targets that select the same route
-/// must fingerprint alike, so the target never takes part in the fingerprint.
 fn proxy_fingerprint(config: &Config, route: &ProxyRoute) -> ProxyFingerprint {
     match route {
         ProxyRoute::Direct => ProxyFingerprint::Direct,
@@ -198,7 +174,6 @@ fn proxy_fingerprint(config: &Config, route: &ProxyRoute) -> ProxyFingerprint {
     }
 }
 
-/// Owns the persisted settings snapshot and its runtime generations.
 pub struct ConfigStore {
     config: Arc<Config>,
     network_generations: NetworkGenerationTracker,
@@ -206,13 +181,6 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
-    /// Loads settings from `kytrix/config.json` under the platform's config directory, replacing
-    /// an unusable file with defaults.
-    ///
-    /// A missing file starts with [`Config::default`]. A file that cannot be read
-    /// or decoded is moved aside, replaced with [`Config::default`], and reported
-    /// so the user can be told once a window exists to tell them in. Starting up
-    /// is never blocked by a damaged file.
     pub fn load_default() -> (Self, Option<ConfigRecovery>) {
         let Some(path) = config_file_path() else {
             let error = ConfigLoadError::ConfigDirectoryUnavailable;
@@ -230,10 +198,6 @@ impl ConfigStore {
         Self::load_or_recover(path)
     }
 
-    /// Loads settings from an injected path.
-    ///
-    /// A missing file starts with [`Config::default`]. Existing files that cannot
-    /// be read or decoded return an error and are left untouched.
     pub fn from_path(path: impl Into<PathBuf>) -> Result<Self, ConfigLoadError> {
         let path = path.into();
         let config = match load_config(&path) {
@@ -245,29 +209,14 @@ impl ConfigStore {
         Ok(Self::with_path(config, Some(path)))
     }
 
-    /// Creates an in-memory store for injected runtimes and tests.
     pub fn in_memory(config: Config) -> Self {
         Self::with_path(config, None)
     }
 
-    /// Returns the current immutable snapshot.
     pub fn read(&self) -> Arc<Config> {
         self.config.clone()
     }
 
-    /// Stores `config` and reports the change set only once the file holds it.
-    ///
-    /// Nothing the application is running with changes until the file holds the
-    /// submitted settings, so a submission that cannot be stored is reported to
-    /// the caller and leaves the current snapshot exactly as it was. That is what
-    /// lets the user submit the same change again. A store without a file has
-    /// nothing to store and never fails.
-    ///
-    /// An unchanged snapshot is neither stored nor reported, and its network
-    /// generations stay as they are. That is deliberate — there is nothing to
-    /// store — and it has a consequence worth knowing: this is not what repairs
-    /// a file that fell behind the snapshot, which is what a failed
-    /// [`Self::update`] leaves behind. That failure is logged where it happens.
     pub fn write(
         &mut self,
         config: Config,
@@ -278,9 +227,6 @@ impl ConfigStore {
 
         let mut candidate = config;
         self.network_generations.stamp(&mut candidate);
-        // The new snapshot is the receiver and the stored snapshot is `previous`:
-        // `Config::changes_since(&self /* the new snapshot */, previous)`, as the
-        // signature in `settings.rs` defines it.
         let changes = candidate.changes_since(self.config.as_ref());
         self.persist(&candidate)?;
         self.config = Arc::new(candidate);
@@ -288,16 +234,6 @@ impl ConfigStore {
         Ok(Some(changes))
     }
 
-    /// Mutates a cloned candidate and publishes it, persisting it afterwards.
-    ///
-    /// Subsystems that own a part of the settings (the account, the avatar, the
-    /// workspaces, the sidebar state) change a value nobody can be asked to submit again, so the
-    /// candidate is published first and a persistence failure is only logged. A
-    /// change a user submits and can submit again belongs in [`Self::write`],
-    /// which reports the failure instead of dropping it.
-    ///
-    /// Returns the value produced by `update` and the published change set, or
-    /// `None` for an unchanged candidate.
     pub fn update<R>(
         &mut self,
         update: impl FnOnce(&mut Config) -> R,
@@ -309,9 +245,6 @@ impl ConfigStore {
         }
 
         self.network_generations.stamp(&mut candidate);
-        // The new snapshot is the receiver and the stored snapshot is `previous`:
-        // `Config::changes_since(&self /* the new snapshot */, previous)`, as the
-        // signature in `settings.rs` defines it.
         let changes = candidate.changes_since(self.config.as_ref());
         self.config = Arc::new(candidate);
         self.persist_current();
@@ -319,7 +252,6 @@ impl ConfigStore {
         (result, Some(changes))
     }
 
-    /// Wraps an already decoded snapshot, stamping its runtime generations.
     fn with_path(mut config: Config, path: Option<PathBuf>) -> Self {
         let mut network_generations = NetworkGenerationTracker::new();
         network_generations.stamp(&mut config);
@@ -331,10 +263,6 @@ impl ConfigStore {
         }
     }
 
-    /// Loads a config file, falling back to defaults when it is unusable.
-    ///
-    /// The damaged bytes are moved aside before the replacement is written, so a
-    /// start that resets the settings never destroys what the user had.
     fn load_or_recover(path: PathBuf) -> (Self, Option<ConfigRecovery>) {
         match load_config(&path) {
             Ok(Some(config)) => (Self::with_path(config, Some(path)), None),
@@ -355,7 +283,6 @@ impl ConfigStore {
         }
     }
 
-    /// Stores `config`, or succeeds when this store has no file to store it in.
     fn persist(&self, config: &Config) -> Result<(), ConfigPersistenceError> {
         match self.path.as_deref() {
             Some(path) => persist_config(path, config),
@@ -363,7 +290,6 @@ impl ConfigStore {
         }
     }
 
-    /// Stores the current snapshot, logging a failure instead of reporting it.
     fn persist_current(&self) {
         if let Err(error) = self.persist(self.config.as_ref()) {
             log::error!("failed to persist settings config: {error}");
@@ -371,19 +297,12 @@ impl ConfigStore {
     }
 }
 
-/// What was recovered from when a stored config file had to be discarded.
 #[derive(Debug)]
 pub struct ConfigRecovery {
-    /// Where the damaged file was moved, or `None` when it could not be kept.
     pub backup: Option<PathBuf>,
-    /// Why the file was unusable. Logged, never shown to the user.
     pub error: ConfigLoadError,
 }
 
-/// Moves an unusable config file aside so the next start does not read it again.
-///
-/// Losing the old file is worse than starting over, but not bad enough to refuse
-/// to start, so a failure here is logged and reported as "nothing was kept".
 fn back_up_damaged_config(path: &Path) -> Option<PathBuf> {
     let Some(backup) = available_backup_path(path, time::OffsetDateTime::now_utc()) else {
         log::error!("failed to find a free backup name for damaged settings config {path:?}");
@@ -401,11 +320,6 @@ fn back_up_damaged_config(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The first free `config.json.corrupt-<timestamp>[-N]` name next to `path`.
-///
-/// The instant is handed in rather than read here, because the name it produces is what two
-/// backups taken in the same second collide on: a caller that asked the clock itself could not
-/// be tested for that collision without waiting for two calls to share a second.
 fn available_backup_path(path: &Path, instant: time::OffsetDateTime) -> Option<PathBuf> {
     let directory = path.parent()?;
     let file_name = path.file_name()?.to_str()?;
@@ -420,7 +334,6 @@ fn available_backup_path(path: &Path, instant: time::OffsetDateTime) -> Option<P
         .find(|candidate| !candidate.exists())
 }
 
-/// The UTC instant a backup was taken, as `YYYYMMDD-HHMMSS`.
 fn utc_timestamp(instant: time::OffsetDateTime) -> String {
     format!(
         "{:04}{:02}{:02}-{:02}{:02}{:02}",
@@ -519,7 +432,6 @@ pub enum ConfigLoadError {
     },
 }
 
-/// Why a settings snapshot could not be stored.
 #[derive(Debug, Error)]
 pub enum ConfigPersistenceError {
     #[error("failed to create config directory {path:?}: {source}")]
@@ -798,12 +710,6 @@ mod tests {
         ));
     }
 
-    /// The default line is stamped apart from every venue, and the venues that
-    /// name a line of their own keep their stamp when it moves.
-    ///
-    /// A venue that shared the default's stamp would move with it, so the stamps
-    /// the venues hold across the default line's own rotations are what says the
-    /// two are stamped apart.
     #[test]
     fn the_default_route_generation_should_follow_the_route_it_resolves() {
         let bound = venue("binance");
@@ -873,9 +779,6 @@ mod tests {
         );
     }
 
-    /// A write rotates the generation of the venue whose line it moves and leaves
-    /// every other venue's generation alone, so a submission that changes no route
-    /// moves nothing.
     #[test]
     fn a_write_should_rotate_only_the_route_generation_it_moves() {
         let binance = venue("binance");
@@ -917,9 +820,6 @@ mod tests {
         assert_eq!(store.read().network_route_generation(&okx), okx_initial);
     }
 
-    /// Every base network target is a target the store stamps, whether or not anything
-    /// has configured a line of its own for it: a target missing from the list would never
-    /// have its route generation computed, so a proxy change for it would go unnoticed.
     #[test]
     fn every_base_network_target_should_have_a_route_generation() {
         let targets = all_network_targets(&Config::default(), []);
@@ -943,8 +843,6 @@ mod tests {
         );
     }
 
-    /// The model download target's generation moves with the default route, which can
-    /// only happen when the target takes part in route generation.
     #[test]
     fn translation_model_download_should_follow_the_default_route_generation() {
         let target = ServiceTarget::TranslationModelDownload;
@@ -968,9 +866,6 @@ mod tests {
         );
     }
 
-    /// Within one domain a change set names the map's keys in order: the
-    /// add/edit pass first, then the removal pass, both keeping the `BTreeMap`
-    /// order rather than the order the caller applied them.
     #[test]
     fn a_change_set_should_name_each_domain_in_map_order() {
         let mut store = ConfigStore::in_memory(configured_settings());
@@ -1012,9 +907,6 @@ mod tests {
         );
     }
 
-    /// A domain's removal pass follows its added and edited pass, and both keep
-    /// the map's order: keys removed here sort before the added ones and still
-    /// come last.
     #[test]
     fn a_change_set_should_name_removed_keys_after_the_added_and_edited_ones() {
         let account = ServiceTarget::KytrixService {
@@ -1175,14 +1067,6 @@ mod tests {
         );
     }
 
-    /// A configuration written under the previous shape is reset whole.
-    ///
-    /// The file is valid JSON and even names settings this build understands — a
-    /// language, an appearance, the workspaces and the widget selection a user
-    /// had — but it does not name the venues this build speaks, so it is not this
-    /// shape. It is kept aside as a `.corrupt-*` backup and the application starts
-    /// from defaults: nothing is migrated, nothing is completed from the built-in
-    /// table, and every setting the old file carried is gone with it.
     #[test]
     fn an_old_configuration_is_reset_whole_and_reported() {
         let temporary_directory = test_temp("config");
@@ -1190,7 +1074,6 @@ mod tests {
         let mut old = serde_json::to_value(Config::default()).expect("config should serialize");
         {
             let old = old.as_object_mut().expect("config serializes as an object");
-            // The previous shape: a market-participants section and no venue map at all.
             old.remove("venues");
             old.insert(
                 "exchanges".to_owned(),
@@ -1228,8 +1111,6 @@ mod tests {
             "the backup keeps exactly what the user had"
         );
 
-        // Every setting the file carried is gone: the reset is whole rather than
-        // a migration of the parts this build still understands.
         assert_eq!(store.read().as_ref(), &Config::default());
         assert_eq!(
             (
@@ -1255,12 +1136,6 @@ mod tests {
         );
     }
 
-    /// A configuration written under the previous per-market Binance shape is reset whole.
-    ///
-    /// Every venue is named and the file is valid JSON, but Binance's row carries the six-value
-    /// `credentials` object of the previous version instead of the two per-market keys this
-    /// build writes. That row is not this shape: it is kept aside as a `.corrupt-*` backup and
-    /// the application starts from defaults, with the language and appearance it also held gone.
     #[test]
     fn a_previous_per_market_binance_configuration_is_reset_whole_and_reported() {
         let temporary_directory = test_temp("config");
@@ -1313,10 +1188,6 @@ mod tests {
         );
     }
 
-    /// A venue edit submitted the way a settings interface submits one — a mutated
-    /// `Config` handed to a write-back entry — reaches the file and moves the venue's
-    /// outbound generation. The settings page submits each change through `write`; this drives
-    /// `update`, which takes the edit as a closure.
     #[test]
     fn a_venue_edit_should_persist_and_rotate_the_venue_generation() {
         let temporary_directory = test_temp("config");
@@ -1387,8 +1258,6 @@ mod tests {
         );
         fs::write(&first, b"kept").expect("the first backup should be written");
 
-        // The same instant is asked about again, which is the collision the rule is about: a
-        // later instant would be a free name and would say nothing about the numbering.
         let second = available_backup_path(&path, instant)
             .expect("a second backup name should be available");
 
@@ -1595,8 +1464,6 @@ mod tests {
         );
     }
 
-    /// Every venue that names no line of its own is stamped on the default
-    /// line's route, so moving that line rotates each of them.
     #[test]
     fn changing_proxy_default_should_rotate_generation_for_venues_without_their_own_route() {
         let following = venue("binance");
@@ -1623,8 +1490,6 @@ mod tests {
         );
     }
 
-    /// A credential set of one market is what that market's requests sign with, and the
-    /// file keeps the set each configured venue holds.
     #[test]
     fn a_venues_credentials_should_survive_a_stored_file() {
         let temporary_directory = test_temp("config");

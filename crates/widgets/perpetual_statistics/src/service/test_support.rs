@@ -1,9 +1,3 @@
-//! The fake source the service and the pane both answer through.
-//!
-//! It lives in a module of its own because two test files need it: the loop's
-//! tests drive it to produce windows, and the pane's tests drive it to answer a
-//! load. Everything in here is test scaffolding and is compiled only for tests.
-
 use std::{
     collections::VecDeque,
     future::pending,
@@ -31,11 +25,6 @@ use market_participants_model::{
 use super::stream::{StatisticsQuery, StatisticsSource};
 use crate::model::MetricKind;
 
-/// The fixture perpetual route the registry declares these statistics for.
-///
-/// It is the built-in Binance perpetual scope rather than the generic fixture one:
-/// what a pane reads is the route registry's own answer, so a route the registry
-/// does not declare is not a scope a test can drive.
 pub(crate) fn perpetual_route() -> VenueRoute {
     VenueRoute::new(
         VenueId::from_name(test_support::VENUE).expect("the fixture venue is canonical"),
@@ -44,27 +33,17 @@ pub(crate) fn perpetual_route() -> VenueRoute {
     )
 }
 
-/// The listing key of one fixture perpetual listing.
 pub(crate) fn perpetual_listing(symbol: &str) -> VenueListingKey {
     test_support::continuity_key(&perpetual_route(), symbol, BinanceProduct::Perpetual)
 }
 
-/// How the fake answers one fetch.
-///
-/// A plan is consumed per fetch, and a source that runs out of plans keeps
-/// answering successfully: a test that watches how many fetches happened has to
-/// be able to tell a fetch that failed from a fetch that never ran, and a fake
-/// that fails once its queue is empty cannot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FetchPlan {
     Success(i64),
     Failure,
-    /// Never answers, so the attempt times out.
     Pending,
 }
 
-/// The plan a fetch is answered with, and the timestamp a synthetic success
-/// carries.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Answer {
     Success(i64),
@@ -98,8 +77,6 @@ impl FakeSource {
         }
     }
 
-    /// The ratio series differ only in which endpoint asked, so one answer serves
-    /// all three.
     pub(crate) async fn fetch_ratio(
         &self,
         query: StatisticsQuery,
@@ -130,7 +107,6 @@ impl FakeSource {
             Some(FetchPlan::Success(timestamp)) => Answer::Success(timestamp),
             Some(FetchPlan::Failure) => Answer::Failure,
             Some(FetchPlan::Pending) => Answer::Pending,
-            // Past the end of the plans every fetch is observable and distinctive.
             None => Answer::Success(i64::try_from(call).unwrap_or(i64::MAX) + 100),
         }
     }
@@ -173,7 +149,6 @@ impl FakeSource {
     }
 }
 
-/// A traded quantity of the fixture's own base token.
 pub(crate) fn traded(value: Quantity) -> MarketQuantity {
     MarketQuantity {
         value,
@@ -183,7 +158,6 @@ pub(crate) fn traded(value: Quantity) -> MarketQuantity {
     }
 }
 
-/// A monetary amount in the fixture's own quote token.
 pub(crate) fn amount(value: Quantity) -> MarketQuantity {
     MarketQuantity {
         value,
@@ -193,9 +167,6 @@ pub(crate) fn amount(value: Quantity) -> MarketQuantity {
     }
 }
 
-/// The venue's answers, including what it does with a listing it no longer
-/// carries: the pane's own question about a route is answered by the catalog its
-/// test installs, and this flag is what the metadata fetch reads.
 impl StatisticsSource for FakeSource {
     async fn fetch_listing_metadata(
         &self,

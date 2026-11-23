@@ -1,11 +1,3 @@
-//! Protocol-level account payloads.
-//!
-//! Every payload keeps the venue's own value shape: a symbol the wire named, a
-//! price, a quantity and the venue's own order-state label. Which listing a
-//! payload is about is decided by the request that asked for it (or, for a
-//! bulk event, by the coarse native identifier on the wrapper), so a payload
-//! never carries a listing key it could contradict.
-
 use std::num::NonZeroU8;
 
 use market_participants_model::{
@@ -20,11 +12,6 @@ use crate::account::shared::{
     OrderStatus, PositionDirection, PositionId,
 };
 
-/// One protocol order.
-///
-/// An order is always about one listing, so it carries the key the venue's own
-/// identifier resolved to; the account is the query's identity, not the
-/// payload's.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeOrder {
     pub listing: VenueListingKey,
@@ -43,7 +30,6 @@ pub struct NativeOrder {
     pub update_timestamp: UnixMillis,
 }
 
-/// One protocol position.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativePosition {
     pub listing: VenueListingKey,
@@ -64,7 +50,6 @@ pub struct NativePosition {
     pub update_timestamp: UnixMillis,
 }
 
-/// One protocol account trade.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeAccountTrade {
     pub listing: VenueListingKey,
@@ -73,23 +58,19 @@ pub struct NativeAccountTrade {
     pub side: Side,
     pub price: Price,
     pub quantity: Quantity,
-    /// The canonical asset the fee was charged in.
     pub fee_asset: AssetId,
     pub fee: ProfitOrLoss,
     pub liquidity: Option<LiquidityRole>,
     pub timestamp: UnixMillis,
 }
 
-/// One protocol balance entry.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeBalance {
-    /// The canonical asset this balance is held in.
     pub asset: AssetId,
     pub total: Quantity,
     pub available: Quantity,
 }
 
-/// One protocol historical position.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeHistoricalPosition {
     pub listing: VenueListingKey,
@@ -109,11 +90,6 @@ pub struct NativeHistoricalPosition {
     pub closed_timestamp: UnixMillis,
 }
 
-/// One native order-book level, before any unit is attached.
-///
-/// A level is what the venue printed: the diff stream publishes one with a zero
-/// quantity to remove the price level, so the value is not validated here. Which
-/// levels a book may hold is the model's rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeOrderBookLevel {
     pub price: Price,

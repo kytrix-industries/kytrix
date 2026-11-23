@@ -1,15 +1,3 @@
-//! ④ 无障碍：单选组 + 缩放滑块。
-//!
-//! 语义选择：`RadioButton` 的选中态走 `A11yPatch.checked`（→ `set_toggled`），数值用
-//! `Slider.value`；`selected` 只适用于 `ListBoxOption` / `Tab` / `TreeItem` 这类按
-//! `aria-selected` 暴露的角色（P15 F-151：只写 `selected` 的 RadioButton 在 UIA 里没有
-//! `SelectionItemPattern`）。
-//!
-//! 三个展示点：
-//! 1. 角色 + 可访问名 + `checked`（单选）→ UIA / VoiceOver 可读；
-//! 2. `Slider` 的 `value` 与 `SetValue` 动作（AT 写入数值 → 应用 handler 按 `ctx.node()` 落地）；
-//! 3. `Click` 走 P10 的 `Action` 表（指针 / 键盘 / AT 三者同一身份）。
-
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     a11y::{A11yAction, A11yActionData, A11yOverride, A11yPatch, A11yRole},
@@ -28,30 +16,20 @@ use super::{
     ACCENT_RGBA, DIM_RGBA, MUTED_RGBA, RAIL_RGBA, TEXT_RGBA, card, color, ring, text_style,
 };
 
-/// 单选组选项（下标 = `A11yState.radio`）。
 const RADIOS: [&str; 2] = ["选项 A", "选项 B"];
 
-/// 单选的点击动作（两个选项各一条：动作身份里不带载荷）。
 const RADIO_ACTIONS: [&str; 2] = ["a11y.radio.a", "a11y.radio.b"];
 
-/// 滑块的分段数（每段 10%）。
 const SLIDER_SEGMENTS: u8 = 10;
 
-/// 分段宽 / 间距 / 高（逻辑像素）。
 const SEGMENT_WIDTH: f32 = 24.0;
-/// 分段间距。
 const SEGMENT_GAP: f32 = 3.0;
-/// 分段高度。
 const SEGMENT_HEIGHT: f32 = 16.0;
 
-/// 无障碍卡片的状态（`Signal<A11yState>` 的载荷）。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct A11yState {
-    /// 选中的单选下标（0 或 1）。
     radio: u8,
-    /// 滑块档位（1..=10 ⇒ 10%..=100%）。
     scale: u8,
-    /// 最近一次无障碍/点击动作的文案。
     last_action: SmolStr,
 }
 
@@ -66,7 +44,6 @@ impl Default for A11yState {
 }
 
 impl A11yState {
-    /// 离屏截图用的种子状态：单选 B、滑块 70%。
     pub(crate) fn sample() -> Self {
         Self {
             radio: 1,
@@ -75,13 +52,11 @@ impl A11yState {
         }
     }
 
-    /// 选中某个单选（`label` 只进状态文案）。
     pub(crate) fn select_radio(&mut self, index: u8, label: &str) {
         self.radio = index;
         self.last_action = format_smolstr!("Click → {label}");
     }
 
-    /// 点击滑块：循环加一档（10 → 100 → 10）。
     pub(crate) fn next_scale(&mut self) {
         self.scale = if self.scale >= SLIDER_SEGMENTS {
             1
@@ -91,16 +66,12 @@ impl A11yState {
         self.last_action = format_smolstr!("Click → {}%", self.scale * 10);
     }
 
-    /// 方向键调整（钳制在 1..=10，不回绕）。
     pub(crate) fn step_scale(&mut self, step: i8) {
         let next = (i16::from(self.scale) + i16::from(step)).clamp(1, i16::from(SLIDER_SEGMENTS));
         self.scale = u8::try_from(next).unwrap_or(self.scale);
         self.last_action = format_smolstr!("方向键 → {}%", self.scale * 10);
     }
 
-    /// AT 的 `SetValue`：接受 `"70"` / `"70%"`（越界按 10%–100% 钳制）。
-    ///
-    /// 返回 `false` = 文本不是数字（忽略，不改状态）。
     pub(crate) fn set_scale_from_text(&mut self, text: &str) -> bool {
         let trimmed = text.trim().trim_end_matches('%');
         let Ok(percent) = trimmed.parse::<u16>() else {
@@ -112,18 +83,15 @@ impl A11yState {
         true
     }
 
-    /// 「缩放 60%」。
     pub(crate) fn scale_line(&self) -> SmolStr {
         format_smolstr!("缩放 {}%", self.scale * 10)
     }
 
-    /// 「最近 AT 动作：SetValue → 70%」。
     pub(crate) fn status_line(&self) -> SmolStr {
         format_smolstr!("最近 AT 动作：{}", self.last_action)
     }
 }
 
-/// 建单选组 + 滑块 + 状态文字；返回可聚焦节点。
 pub(crate) fn build(
     app: &mut App,
     window: WindowId,
@@ -154,7 +122,6 @@ pub(crate) fn build(
     Controls { radios, slider }
 }
 
-/// 一行单选：圆环 + 圆点（`visible` 切换，不重建节点）+ 标签。
 fn radio_row(
     app: &mut App,
     window: WindowId,
@@ -223,7 +190,6 @@ fn radio_row(
     row
 }
 
-/// 滑块：值文字 + 10 段方块（点亮 = `scale` 档）。
 fn slider(app: &mut App, window: WindowId, panel: NodeId, state: Signal<A11yState>) -> NodeId {
     let slider = NodeBuilder::boxed()
         .style(card::absolute_style(Rect::new(18.0, 98.0, 276.0, 42.0)))
@@ -282,7 +248,6 @@ fn slider(app: &mut App, window: WindowId, panel: NodeId, state: Signal<A11yStat
     slider
 }
 
-/// 注册单选 / 滑块的动作处理器与 a11y `SetValue`。
 pub(crate) fn install(app: &mut App, scene: &super::Scene) {
     let state = scene.a11y;
     for (index, action) in RADIO_ACTIONS.iter().enumerate() {
@@ -308,7 +273,6 @@ pub(crate) fn install(app: &mut App, scene: &super::Scene) {
             return;
         };
         if ctx.node() == input {
-            // 文本输入框：AT 的 SetValue 是「替换整段文本」（引擎 v1 无选区模型）。
             let mut field = (*ctx.read(&ime)).clone();
             field.set_text(text);
             ctx.write(&ime, field);
@@ -325,11 +289,8 @@ pub(crate) fn install(app: &mut App, scene: &super::Scene) {
     );
 }
 
-/// `build` 产出的可聚焦节点。
 pub(crate) struct Controls {
-    /// 两个单选行。
     pub radios: [NodeId; 2],
-    /// 缩放滑块。
     pub slider: NodeId,
 }
 
@@ -477,14 +438,12 @@ mod showcase_tests {
 
         {
             let app = test.app_mut();
-            // 输入框是第 7 个、滑块是第 6 个可聚焦节点：反向两次落在滑块上。
             let _ = app.focus_prev(window).expect("输入框");
             let focused = app.focus_prev(window).expect("滑块");
             assert_eq!(app.focused(window), Some(focused));
             dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::ArrowRight)));
         }
         frame(&mut test);
-        // 第二步：70% → 80%，状态行与上一笔**等宽**（只靠 LAYOUT 变化触发 a11y 重发是不够的）。
         {
             let app = test.app_mut();
             dispatch_event(&mut scene, app, &Event::Input(press(KeyCode::ArrowRight)));

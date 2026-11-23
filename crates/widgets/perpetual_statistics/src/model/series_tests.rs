@@ -23,8 +23,6 @@ fn ratio(value: &str) -> Ratio {
     Ratio::from_str(value).expect("test ratio should parse")
 }
 
-/// One listing of the model's own fixtures. The model never reads it, but a
-/// window is always the window of one listing.
 fn listing() -> VenueListingKey {
     market_participants_connector::catalog::test_support::listing_key(
         &market_participants_connector::catalog::test_support::perp_route(),
@@ -85,7 +83,6 @@ fn open_interest_timestamps(points: &StatisticsPoints) -> Vec<i64> {
 
 #[test]
 fn open_interest_should_sort_deduplicate_and_keep_the_newest_window() {
-    // Oldest last, one timestamp repeated, one interval more than the window.
     let mut items = (1..=31)
         .rev()
         .map(|timestamp| open_interest(timestamp, &timestamp.to_string()))
@@ -107,9 +104,6 @@ fn open_interest_should_sort_deduplicate_and_keep_the_newest_window() {
     assert_eq!(points[29].base_asset_volume, quantity("99"));
 }
 
-/// The amount of an open-interest interval is a monetary amount and its size is a
-/// traded quantity: a reading expressed as anything else is refused rather than
-/// drawn as if it were one.
 #[test]
 fn open_interest_should_refuse_a_reading_that_is_not_expressed_in_its_own_units() {
     let mut amount_only = open_interest(1, "1");
@@ -137,8 +131,6 @@ fn open_interest_should_refuse_a_reading_that_is_not_expressed_in_its_own_units(
     );
 }
 
-/// A venue is not obliged to publish what the open interest was worth: the line is
-/// then absent for that interval rather than drawn from a number nobody published.
 #[test]
 fn an_open_interest_interval_without_an_amount_should_keep_a_missing_value() {
     let mut item = open_interest(1, "2");
@@ -239,8 +231,6 @@ fn invalid_timestamps_should_be_discarded() {
     assert_eq!(ratio_timestamps_of_taker(&points), vec![2]);
 }
 
-/// Both sides of a taker volume are traded quantities, so a volume expressed as a
-/// monetary amount is refused rather than drawn as if it were traded.
 #[test]
 fn taker_volume_should_refuse_a_side_that_is_not_a_traded_quantity() {
     let error = normalize_taker_volume(
@@ -333,7 +323,6 @@ fn a_window_should_hold_the_series_it_was_normalized_from() {
     assert!(matches!(taker, StatisticsPoints::TakerVolume(_)));
 }
 
-/// One rule set of two fixture assets, which is what the metadata is read from.
 fn fixture_rules() -> TradingRules {
     let currency = |code: &str| {
         AssetId::Currency(market_participants_model::asset::CurrencyId::new(
@@ -356,8 +345,6 @@ fn metadata_should_carry_the_listings_own_ticks() {
     );
 }
 
-/// A rule set that carries no quantity step leaves the labels written at whole
-/// units rather than refusing to draw the window.
 #[test]
 fn metadata_should_fall_back_to_whole_units_without_a_quantity_step() {
     let mut rules = fixture_rules();

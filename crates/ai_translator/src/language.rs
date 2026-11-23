@@ -1,15 +1,6 @@
-//! The languages Hy-MT2 translates into.
-
-/// A target language the model supports.
-///
-/// The value is an index into the crate's table. Codes are the only accepted input:
-/// the model's prompt distinguishes `zh` from `zh-Hant`, and a full English name would
-/// be translated rather than understood, so names, aliases such as `zh-CN` and anything
-/// not in the model card are rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TargetLanguage(usize);
 
-/// Every supported language as `(code, English name)`, in model-card order.
 const TABLE: [(&str, &str); 38] = [
     ("en", "English"),
     ("zh", "Chinese"),
@@ -51,7 +42,6 @@ const TABLE: [(&str, &str); 38] = [
     ("yue", "Cantonese"),
 ];
 
-/// Every language, in table order, so [`TargetLanguage::all`] can hand out a slice.
 static ALL: [TargetLanguage; 38] = [
     TargetLanguage(0),
     TargetLanguage(1),
@@ -94,10 +84,6 @@ static ALL: [TargetLanguage; 38] = [
 ];
 
 impl TargetLanguage {
-    /// Parses a model language code such as `"en"`, `"zh-Hant"` or `"yue"`.
-    ///
-    /// Matching is ASCII case-insensitive. English names, aliases such as `"zh-CN"` and
-    /// unknown codes return `None`.
     pub fn parse(code: &str) -> Option<Self> {
         TABLE
             .iter()
@@ -105,17 +91,14 @@ impl TargetLanguage {
             .map(Self)
     }
 
-    /// Returns the model's code for the language, e.g. `"zh-Hant"`.
     pub fn code(self) -> &'static str {
         TABLE[self.0].0
     }
 
-    /// Returns the English name the prompt injects, e.g. `"Traditional Chinese"`.
     pub fn english_name(self) -> &'static str {
         TABLE[self.0].1
     }
 
-    /// Returns every supported language, in model-card order.
     pub fn all() -> &'static [TargetLanguage] {
         &ALL
     }
@@ -177,8 +160,6 @@ mod tests {
         assert_eq!(codes.len(), COUNT);
     }
 
-    /// The full card table, pinned independently of the production table so a
-    /// swapped pair (for example `my`/`km`) cannot pass the other tests.
     const EXPECTED: [(&str, &str); 38] = [
         ("en", "English"),
         ("zh", "Chinese"),

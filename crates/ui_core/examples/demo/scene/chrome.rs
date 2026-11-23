@@ -1,13 +1,3 @@
-//! Linux/Wayland 客户端装饰：自绘标题栏 + 关闭 / 最小化 / 最大化按钮 + 边框缩放热区。
-//!
-//! 只有 Linux 需要这一层：Windows / macOS 使用原生标题栏与系统按钮。标题栏是场景的普通子树
-//! （绝对定位、不参与 flex 流），窗口控制通过 `App::request_window_control` 交给 Wayland 平台层。
-//!
-//! 交互约定：
-//! - 标题栏空白区 = 拖动移动；两次快速按下（500ms / 4px 内）= 最大化/还原。
-//! - 三个按钮各自的 `on_click` 发一条窗口控制请求。
-//! - 四边 / 四角各有透明热区，`on_drag` 的 Start 阶段发 `BeginResize`。
-
 use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
@@ -28,35 +18,25 @@ use ui_core::{
 
 use super::{CARD_BORDER_RGBA, CARD_RGBA, MUTED_RGBA, TEXT_RGBA, TITLE, card, color, text_style};
 
-/// 标题栏高度（与 `scene::WINDOW_TOP_INSET` 同源）。
 pub(crate) const TITLEBAR_HEIGHT: f32 = 36.0;
 
-/// 标题栏按钮宽 / 高。
 const BUTTON_WIDTH: f32 = 40.0;
 
-/// 关闭按钮距右边缘。
 const BUTTON_MARGIN: f32 = 8.0;
 
-/// 边框缩放热区厚度。
 const EDGE_SIZE: f32 = 6.0;
 
-/// 角落缩放热区尺寸。
 const CORNER_SIZE: f32 = 10.0;
 
-/// 双击判定窗口。
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
-/// 双击位置容差。
 const DOUBLE_CLICK_DISTANCE: f32 = 4.0;
 
-/// 标题栏与边框热区的节点句柄。
 #[derive(Clone)]
 pub(crate) struct Chrome {
-    /// 边框缩放热区（节点 → 边）。
     edges: Vec<(NodeId, WindowResizeEdge)>,
 }
 
-/// 建标题栏、三个按钮与八个缩放热区；必须最后挂到 root 上（保证画在最上层）。
 pub(crate) fn build(app: &mut App, window: WindowId, root: NodeId) -> Chrome {
     let tree = card::tree(app, window);
     let bar = NodeBuilder::boxed()
@@ -138,7 +118,6 @@ pub(crate) fn build(app: &mut App, window: WindowId, root: NodeId) -> Chrome {
     Chrome { edges }
 }
 
-/// 注册标题栏 / 按钮 / 边框热区的动作处理器。
 pub(crate) fn install(app: &mut App, scene: &super::Scene) {
     app.on_action(Action::custom("chrome.close"), |ctx| {
         let window = ctx.window();
@@ -210,7 +189,6 @@ pub(crate) fn install(app: &mut App, scene: &super::Scene) {
     });
 }
 
-/// 标题栏按钮：透明点击区 + 居中字形 + 可访问名。
 fn button(
     app: &mut App,
     window: WindowId,
@@ -251,7 +229,6 @@ fn button(
     node
 }
 
-/// 标题栏本体：绝对定位、横跨窗口顶部。
 fn titlebar_style() -> Style {
     absolute_style(
         Some(0.0),
@@ -263,7 +240,6 @@ fn titlebar_style() -> Style {
     )
 }
 
-/// 铺满父节点（拖动区）。
 fn fill_style() -> Style {
     absolute_style(
         Some(0.0),
@@ -275,7 +251,6 @@ fn fill_style() -> Style {
     )
 }
 
-/// 绝对定位样式：`left/top/right/bottom` 为 `None` 时自动。
 fn absolute_style(
     left: Option<f32>,
     top: Option<f32>,
@@ -298,7 +273,6 @@ fn absolute_style(
     style
 }
 
-/// 边框缩放热区的八个位置。
 #[derive(Clone, Copy)]
 enum Edge {
     Top,
@@ -311,7 +285,6 @@ enum Edge {
     BottomRight,
 }
 
-/// 缩放热区样式（贴边、透明、覆盖在内容之上）。
 fn edge_style(edge: Edge) -> Style {
     use taffy::style::Dimension;
 
@@ -331,7 +304,6 @@ fn edge_style(edge: Edge) -> Style {
     absolute_style(left, top, right, bottom, width, height)
 }
 
-/// 标题栏 / 热区的无障碍声明：装饰性，不进入 a11y 树。
 fn hidden() -> A11yOverride {
     A11yOverride {
         hidden: true,

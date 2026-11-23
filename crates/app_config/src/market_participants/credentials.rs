@@ -1,47 +1,19 @@
-//! The credentials each venue's authenticated requests sign with.
-//!
-//! A credential set is a value of exactly one venue's shape, and the shape is
-//! written here rather than derived from a venue name: what a venue signs with is a
-//! property of the venue's API, and the settings hold the typed value the adapters
-//! read.
-//!
-//! Binance is the one venue whose credentials are split: the spot API and the USDⓈ-M
-//! futures API are two products with two key pairs, so a Binance row carries one set
-//! per market and an authenticated request signs with the set of its own scope. Every
-//! other venue authenticates its whole surface with one set.
-//!
-//! A venue — or one of Binance's markets — holding no set is *unconfigured*: the
-//! settings store nothing for it rather than an empty set, and such a request fails
-//! closed. A stored set that is missing a required value is rejected, so a half-filled
-//! set can never sign a request.
-
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
-/// One market's Binance credential set.
-///
-/// The three values are one credential: an API key without its private key signs
-/// nothing, and neither is stored apart from the passphrase its key was created with.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinanceMarketCredentials {
-    /// The market API's Ed25519 API key.
     #[serde(rename = "api_key")]
     pub api_key: SmolStr,
-    /// The market API's Ed25519 private key.
     #[serde(rename = "private_key")]
     pub private_key: SmolStr,
-    /// The market API's optional Ed25519 private-key passphrase.
     #[serde(rename = "passphrase")]
     pub passphrase: SmolStr,
 }
 
 impl BinanceMarketCredentials {
-    /// Reports whether the two required values are present.
-    ///
-    /// The passphrase is optional: Binance creates a key with or without one, so it
-    /// is part of the credential only when the operator's key has one.
     pub fn is_complete(&self) -> bool {
         !self.api_key.trim().is_empty() && !self.private_key.trim().is_empty()
     }
@@ -58,31 +30,23 @@ impl fmt::Debug for BinanceMarketCredentials {
     }
 }
 
-/// Which of Binance's two markets one credential set belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BinanceCredentialMarket {
-    /// The spot API.
     Spot,
-    /// The USDⓈ-M futures API.
     UsdMPerp,
 }
 
-/// OKX API credentials.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OkxCredentials {
-    /// OKX API key.
     #[serde(rename = "api_key")]
     pub api_key: SmolStr,
-    /// OKX secret key.
     #[serde(rename = "secret_key")]
     pub secret_key: SmolStr,
-    /// OKX API passphrase.
     #[serde(rename = "passphrase")]
     pub passphrase: SmolStr,
 }
 
 impl OkxCredentials {
-    /// Reports whether every value is present.
     pub fn is_complete(&self) -> bool {
         !self.api_key.trim().is_empty()
             && !self.secret_key.trim().is_empty()
@@ -101,19 +65,15 @@ impl fmt::Debug for OkxCredentials {
     }
 }
 
-/// Hyperliquid main-account address and API Agent key.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HyperliquidCredentials {
-    /// Main account address whose state and orders the API Agent controls.
     #[serde(rename = "main_account_address")]
     pub main_account_address: SmolStr,
-    /// API Agent secp256k1 private key.
     #[serde(rename = "api_agent_private_key")]
     pub api_agent_private_key: SmolStr,
 }
 
 impl HyperliquidCredentials {
-    /// Reports whether every value is present.
     pub fn is_complete(&self) -> bool {
         !self.main_account_address.trim().is_empty()
             && !self.api_agent_private_key.trim().is_empty()
@@ -130,26 +90,17 @@ impl fmt::Debug for HyperliquidCredentials {
     }
 }
 
-/// Longbridge OpenAPI credentials.
-///
-/// The three values are one credential: the access token is what an authenticated socket
-/// presents, and it is the app key and secret the token is issued and re-signed with, so a
-/// set that holds fewer than all three signs nothing.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LongbridgeCredentials {
-    /// The OpenAPI application key.
     #[serde(rename = "app_key")]
     pub app_key: SmolStr,
-    /// The OpenAPI application secret.
     #[serde(rename = "app_secret")]
     pub app_secret: SmolStr,
-    /// The access token issued for the application.
     #[serde(rename = "access_token")]
     pub access_token: SmolStr,
 }
 
 impl LongbridgeCredentials {
-    /// Reports whether every value is present.
     pub fn is_complete(&self) -> bool {
         !self.app_key.trim().is_empty()
             && !self.app_secret.trim().is_empty()
@@ -186,8 +137,6 @@ mod tests {
         }
     }
 
-    /// A market's credential set is the three values it signs with, and a market the
-    /// operator configured none of stores nothing at all rather than an empty set.
     #[test]
     fn a_market_set_should_encode_the_values_it_signs_with() {
         let stored = market_credentials("api-key", "private-key", "passphrase");
@@ -219,8 +168,6 @@ mod tests {
         );
     }
 
-    /// The two required values are what makes a Binance market's set complete; the
-    /// passphrase is optional, and a value of only whitespace is no value at all.
     #[test]
     fn a_market_set_is_complete_without_its_optional_passphrase() {
         assert!(market_credentials("api-key", "private-key", "").is_complete());
@@ -230,7 +177,6 @@ mod tests {
         assert!(!market_credentials("", "", "").is_complete());
     }
 
-    /// Every other venue's set is complete only when every one of its values is present.
     #[test]
     fn every_venue_set_is_complete_only_when_every_value_is_present() {
         let okx = OkxCredentials {
@@ -278,8 +224,6 @@ mod tests {
         );
     }
 
-    /// Each set stores the field names its venue signs with, and decodes back into the
-    /// same values.
     #[test]
     fn sets_should_encode_the_fields_they_sign_with() {
         let cases = [
@@ -352,9 +296,6 @@ mod tests {
         );
     }
 
-    /// The shape this module replaced is not one a file can carry: the six values a
-    /// Binance row used to hold under one set are not a market's set, and a set that is
-    /// missing a value it signs with is refused rather than decoded incomplete.
     #[test]
     fn a_superseded_credential_shape_should_not_decode() {
         for removed in [

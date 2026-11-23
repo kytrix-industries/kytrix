@@ -1,15 +1,3 @@
-//! The signed-in account as this feature stores it and as the menu shows it.
-//!
-//! The account is **not** owned here: it lives in the application settings, reached through
-//! [`crate::host::AccountSettings`], and this module is where every value the menu draws is
-//! derived from that one record — the shortened address, the wallet family a signed-in user
-//! belongs to, the label an alert names the family with. Signing in and signing out write that
-//! record, so the menu and the rest of the application cannot disagree about who is signed in.
-//!
-//! Everything in here is pure: a value in, a value out. The four write rules of the settings
-//! seam are stated on [`crate::host::AccountSettings`]; this module states the read-side rule
-//! ([`avatar_of`]) on the snapshot type it reads.
-
 use app_config::settings::{AccountConfig, AccountWalletKind};
 use kytrix_service_provider::auth::model::{
     AccountIdentity, AccountWalletKind as ServiceWalletKind,
@@ -18,21 +6,12 @@ use smol_str::{SmolStr, format_smolstr};
 
 use crate::host::AccountSnapshot;
 
-/// Leading characters an Ethereum address keeps when it is shortened.
 const ETHEREUM_ADDRESS_PREFIX: usize = 10;
 
-/// Leading characters a Solana address keeps when it is shortened.
-///
-/// A Solana address has no `0x`, so the prefix counts address characters only.
 const SOLANA_ADDRESS_PREFIX: usize = 8;
 
-/// Trailing characters every shortened address keeps.
 const ADDRESS_SUFFIX: usize = 8;
 
-/// A signed-in account, ready to be drawn.
-///
-/// The shortened address is derived once, when the account is read, rather than on every frame
-/// the menu is open.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignedInAccount {
     wallet_address: SmolStr,
@@ -41,7 +20,6 @@ pub struct SignedInAccount {
 }
 
 impl SignedInAccount {
-    /// Derives the drawn form of an address and its family.
     #[must_use]
     pub fn new(wallet_address: impl Into<SmolStr>, wallet_kind: AccountWalletKind) -> Self {
         let wallet_address = wallet_address.into();
@@ -53,19 +31,16 @@ impl SignedInAccount {
         }
     }
 
-    /// The complete address, which is what "copy" puts on the clipboard.
     #[must_use]
     pub fn wallet_address(&self) -> &SmolStr {
         &self.wallet_address
     }
 
-    /// The address as the menu draws it, shortened to fit one line.
     #[must_use]
     pub fn shortened_address(&self) -> &SmolStr {
         &self.shortened_address
     }
 
-    /// The wallet family the account belongs to, which the menu draws as a mark.
     #[must_use]
     pub const fn wallet_kind(&self) -> AccountWalletKind {
         self.wallet_kind
@@ -78,13 +53,6 @@ impl From<&AccountConfig> for SignedInAccount {
     }
 }
 
-/// Shortens a wallet address to `prefix...suffix`.
-///
-/// An address too short to shorten is returned whole: an address that reads as
-/// `0x0123...4567` while really being eight characters long would misstate which account is
-/// signed in, which is worse than an unshortened label. A cut that would land inside a
-/// multi-byte character is refused for the same reason — the address is shown whole rather than
-/// mangled.
 #[must_use]
 pub fn shortened_wallet_address(wallet_address: &str, wallet_kind: AccountWalletKind) -> SmolStr {
     let prefix_length = match wallet_kind {
@@ -108,7 +76,6 @@ pub fn shortened_wallet_address(wallet_address: &str, wallet_kind: AccountWallet
     )
 }
 
-/// Reads a completed authorization as the account record the settings keep.
 #[must_use]
 pub(crate) fn account_from_identity(identity: &AccountIdentity) -> AccountConfig {
     AccountConfig {
@@ -118,7 +85,6 @@ pub(crate) fn account_from_identity(identity: &AccountIdentity) -> AccountConfig
     }
 }
 
-/// The configured spelling of a wallet family.
 #[must_use]
 pub(crate) const fn configured_wallet_kind(wallet_kind: ServiceWalletKind) -> AccountWalletKind {
     match wallet_kind {
@@ -127,11 +93,6 @@ pub(crate) const fn configured_wallet_kind(wallet_kind: ServiceWalletKind) -> Ac
     }
 }
 
-/// The wallet family as the authorization report writes it.
-///
-/// The report is one line of copy naming the account, and the family it belongs to is named the
-/// way the address is: Ethereum or Solana, as the product spells them. It is not a catalogue key
-/// because it is not a sentence — it is a proper name that travels inside one.
 #[must_use]
 pub(crate) const fn wallet_kind_label(wallet_kind: AccountWalletKind) -> &'static str {
     match wallet_kind {
@@ -140,11 +101,6 @@ pub(crate) const fn wallet_kind_label(wallet_kind: AccountWalletKind) -> &'stati
     }
 }
 
-/// The generated avatar of the account `snapshot` names, if it has one.
-///
-/// An avatar without an account is not readable: it would be a face for nobody. A store that
-/// kept one (a crash between the two writes, a hand-edited file) therefore cannot put it on
-/// screen, and the menu draws the default face instead.
 #[must_use]
 pub(crate) fn avatar_of(snapshot: &AccountSnapshot) -> Option<&SmolStr> {
     snapshot.account.as_ref()?;
@@ -173,7 +129,6 @@ mod tests {
         }
     }
 
-    /// A snapshot holding `account`, with no avatar generated yet.
     fn configured(account: Option<AccountConfig>, avatar: Option<&str>) -> AccountSnapshot {
         AccountSnapshot {
             account,

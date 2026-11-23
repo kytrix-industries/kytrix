@@ -1,5 +1,3 @@
-//! X2 真机证据的实现（真实可见窗口 + `SendInput` 真实鼠标拖动；由 `main.rs` 在 Windows 下调用）。
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -35,23 +33,15 @@ use windows::Win32::{
     },
 };
 
-/// 示例窗口标题（`FindWindowW` 定位用）。
 const TITLE: &str = "kytrix P1-B X2 drag evidence";
-/// 请求的逻辑客户区尺寸。
 const SIZE: Size = Size::new(480.0, 320.0);
-/// 拖动区：客户区顶部 40 逻辑像素（自绘标题栏的典型条带）。
 const DRAG_REGION: Rect = Rect::new(0.0, 0.0, 480.0, 40.0);
-/// 拖动时按下的逻辑点（拖动区内部）。
 const GRAB_POINT: Point = Point::new(120.0, 20.0);
-/// 真实拖动的物理位移与步数（20 步 × 100 ms = 2 s）。
 const DRAG_STEP: (i32, i32) = (8, 4);
 const DRAG_STEPS: i32 = 20;
-/// 整体超时（防止窗口 / 拖动线程挂死）。
 const TIMEOUT: Duration = Duration::from_secs(20);
-/// 等待期唤醒上限（RB-15：失败环境必须有界退出，不得无界打印）。
 const MAX_WAKE_SPINS: u32 = 3000;
 
-/// 真实拖动线程的结果（与 `on_frame` 共享）。
 #[derive(Default)]
 struct DragOutcome {
     before: Option<(i32, i32, i32, i32)>,
@@ -59,14 +49,11 @@ struct DragOutcome {
     drag_started: bool,
 }
 
-/// 证据收集状态。
 #[derive(Default)]
 struct State {
     phase: u8,
     deadline: Option<Instant>,
-    /// `finish` 已执行（关窗后 `on_frame` 可能再被调用：立即返回，不再打印/推进）。
     finished: bool,
-    /// phase 0/1 里等待外部条件时的唤醒次数（RB-15：有界自旋，避免无界打印）。
     wake_spins: u32,
     hit_test_ok: bool,
     drag_ok: bool,
@@ -85,7 +72,6 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         size: SIZE,
         ..WindowOptions::default()
     });
-    // 区域在 `Application::run` 之前声明：泵每轮从 `App` 对账到原生窗口。
     app.set_drag_regions(id, &[DRAG_REGION]);
     let handle = app.handle();
     let state = Rc::new(RefCell::new(State::default()));
@@ -108,7 +94,6 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         match state.phase {
             0 => {
                 let Some(hwnd) = find_window() else {
-                    // RB-15：等待期有界（防止窗口找不到时以 ~100k 行/秒刷日志）。
                     if !spin_wait(&mut state, &handle) {
                         println!("FAIL: 等待窗口出现超时（自旋上限）");
                         finish(app, id, &handle, &hook_passed, &mut state, false);
@@ -116,11 +101,9 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 };
                 println!("== X2 真机证据（自绘标题栏拖动区） ==");
-                // SAFETY: 窗口存活；只做只读查询。
                 let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
                 let scale = f64::from(dpi) / 96.0;
                 let mut origin = POINT::default();
-                // SAFETY: 窗口存活；`ClientToScreen` 只做坐标换算。
                 assert!(
                     unsafe { ClientToScreen(hwnd, &mut origin) }.as_bool(),
                     "ClientToScreen"
@@ -139,18 +122,13 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                     verdict(hit_ok, 1)
                 );
                 state.hit_test_ok = hit_ok;
-                // 真实拖动放到后台线程：UI 线程会随即进入系统 move 模态循环，不能再跑钩子。
                 let drag = Arc::clone(&state.drag);
                 let drag_done = Arc::clone(&state.drag_done);
                 let thread_handle = app.handle();
-                // `HWND` 是裸指针包装（非 `Send`）：线程里用 isize 重建（窗口在本示例存活期内
-                // 不会销毁，见 `run` 的关闭顺序）。
                 let hwnd_raw = hwnd.0 as isize;
                 std::thread::Builder::new()
                     .name("x2-drag-evidence".to_owned())
                     .spawn(move || {
-                        // SAFETY: `hwnd_raw` 是本示例主窗口句柄，线程运行期间主窗口不销毁
-                        //（`finish` 在拖动线程完成后才关窗）。
                         let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
                         drag_with_mouse(hwnd, scale, origin, &drag);
                         drag_done.store(true, Ordering::Release);
@@ -162,14 +140,12 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             1 => {
                 if !state.drag_done.load(Ordering::Acquire) {
-                    // RB-15：等待拖动线程期间同样有界（失败环境里曾无界打印 5.4M 行/554 MB）。
                     if !spin_wait(&mut state, &handle) {
                         println!("FAIL: 真实拖动线程未完成（自旋上限）");
                         finish(app, id, &handle, &hook_passed, &mut state, false);
                     }
                     return;
                 }
-                // 模态循环结束后，泵已把拖动期间的 `WM_MOVE` 收集成 `Event::Moved`。
                 for (window, event) in app.drain_events() {
                     if window == id
                         && let Event::Moved { position } = event
@@ -230,15 +206,11 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// 用 `SendInput` 在拖动区按下并真实移动 ≥2 s（运行在后台线程；UI 线程此时在系统 move
-/// 模态循环里）。`scale` / `origin` 来自按下前的窗口几何。
 fn drag_with_mouse(hwnd: HWND, scale: f64, origin: POINT, outcome: &Mutex<DragOutcome>) {
     {
         let mut outcome = outcome.lock().expect("drag outcome");
         outcome.before = Some(window_rect(hwnd));
     }
-    // 让窗口在最上层并激活：真实点击必须落在本窗口上（其它窗口可能在前面）。
-    // SAFETY: 本进程窗口；只改 Z 序 / 激活，不改位置与尺寸。
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -282,7 +254,6 @@ fn drag_with_mouse(hwnd: HWND, scale: f64, origin: POINT, outcome: &Mutex<DragOu
         let mut outcome = outcome.lock().expect("drag outcome");
         outcome.after = Some(window_rect(hwnd));
     }
-    // SAFETY: 同上；恢复为非置顶。
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -296,10 +267,7 @@ fn drag_with_mouse(hwnd: HWND, scale: f64, origin: POINT, outcome: &Mutex<DragOu
     }
 }
 
-/// 发一条鼠标输入。`position = Some(屏幕物理坐标)` 表示绝对移动（隐含 `MOUSEEVENTF_MOVE`）；
-/// `None` 表示在当前光标位置发按钮事件（`flags` 是按键位）。
 fn send_mouse(flags: MOUSE_EVENT_FLAGS, position: Option<(i32, i32)>) {
-    // SAFETY: 无参数、无副作用的系统度量查询。
     let (left, top, width, height) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -334,10 +302,8 @@ fn send_mouse(flags: MOUSE_EVENT_FLAGS, position: Option<(i32, i32)>) {
             },
         },
     };
-    // SAFETY: `input` 是栈上结构，长度正确；`SendInput` 向本会话输入流注入鼠标事件。
     let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if sent == 0 {
-        // SAFETY: 无参数、线程局部错误查询（SendInput 失败后有效）。
         let error = unsafe { windows::Win32::Foundation::GetLastError() }.0;
         println!("警告：SendInput 失败（GetLastError={error}）");
     }
@@ -349,20 +315,17 @@ fn hit_test(hwnd: HWND, scale: f64, origin: POINT, logical: Point) -> u32 {
         y: origin.y + (logical.y * scale as f32).round() as i32,
     };
     let encoded = ((((point.y as u32) << 16) | (point.x as u32 & 0xFFFF)) as i32) as isize;
-    // SAFETY: 窗口存活；`WM_NCHITTEST` 的 lParam 是两个 16 位屏幕坐标。
     let result = unsafe { SendMessageW(hwnd, WM_NCHITTEST, None, Some(LPARAM(encoded))) };
     result.0 as u32
 }
 
 fn find_window() -> Option<HWND> {
     let title = wide(TITLE);
-    // SAFETY: 标题是栈上 NUL 结尾宽字符串；只查询本进程创建的窗口。
     unsafe { FindWindowW(None, windows::core::PCWSTR(title.as_ptr())) }.ok()
 }
 
 fn window_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
     let mut rect = RECT::default();
-    // SAFETY: 窗口存活；`rect` 是栈上输出。
     unsafe { GetWindowRect(hwnd, &mut rect) }.expect("GetWindowRect");
     (
         rect.left,
@@ -372,8 +335,6 @@ fn window_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
     )
 }
 
-/// 等待外部条件时的有界自旋：最多 [`MAX_WAKE_SPINS`] 次唤醒；进度每 60 次打印一次。
-/// 返回 `false` = 超过上限（调用方必须 `finish(..., false)` 并退出）。
 fn spin_wait(state: &mut State, handle: &AppHandle) -> bool {
     state.wake_spins = state.wake_spins.saturating_add(1);
     if state.wake_spins > MAX_WAKE_SPINS {

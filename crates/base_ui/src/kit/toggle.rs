@@ -1,32 +1,3 @@
-//! 开关 / 复选 / 单选（旧 `crate::toggle` 的引擎化重建，P2-4a）。
-//!
-//! 旧实现用两路 `icons` 交叉叠化（`geometry_color` + `geometry_opacity` 两条 `transition`），
-//! 一个 `on_click` 把 `checked` 取反交给调用方。新引擎**一次只驱动一个目标**（评估 §7.1），所以这里
-//! 把「勾选程度」收成**一条** `Transient<f32>`（0 = 未选，1 = 选中）：
-//!
-//! - 状态机与点击 / Enter / Space 激活、禁用、焦点、a11y 状态都复用 [`Interactive`]（`chrome(false)`
-//!   去掉按钮外壳，视觉画在子节点上）；
-//! - 勾选动画 `App::animate(mix)` 由 `sync` 在 `checked` 变化时启动；子节点的
-//!   `bind_style` 直接按 `mix` 插值（背景 / 边框 / 勾 / 点的透明度 / 滑块的布局偏移）；
-//! - 变体：`Checkbox`（方框 + 勾）、`Radio`（圆框 + 内点）、`Switch`（轨道 + 滑块）。旧实现只有
-//!   复选 / 单选两种；Switch 是本批按任务要求新增，视觉用主题 `toggle` 配方（登记见 spec-delta）。
-//!
-//! # 键盘
-//!
-//! `Space` / `Enter` 走引擎「焦点节点激活」通道（与鼠标点击同一个 Action）；旧实现只有鼠标点击，
-//! 这是本批新增的可访问性语义。方向键不消费。
-//!
-//! # a11y
-//!
-//! 根节点按变体声明 `CheckBox` / `RadioButton` / `Switch`，`checked` 走 `A11yPatch.checked`
-//! （`accesskit::Toggled`；AccessKit 的这三个角色不读 `selected`），标签是可访问名。
-//!
-//! # 视觉差异（登记）
-//!
-//! 旧实现是「两个几何图标交叉叠化」，新实现是「方框/圆框填充 + 勾/点渐显」：勾是 E7 图标
-//! （`IconKind::Check`），其颜色固定为 `FgOnBrand`；未选中态的方框边缘取 `toggle.enabled.unchecked`
-//! 角色。像素与旧实现不同，语义一致；原因见 spec-delta §3。
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -66,19 +37,14 @@ use crate::{
     theme::{components::ToggleColors, handle::ThemeHandle, role::Role},
 };
 
-/// 开关的形状。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToggleKind {
-    /// 复选：方框 + 勾。
     #[default]
     Checkbox,
-    /// 单选：圆框 + 内点。
     Radio,
-    /// 开关：轨道 + 滑块。
     Switch,
 }
 
-/// 开关 / 复选 / 单选。
 #[derive(Clone)]
 pub struct Toggle {
     inner: Rc<ToggleInner>,
@@ -96,7 +62,6 @@ struct ToggleInner {
     interactive: Interactive,
     checked: Signal<bool>,
     mix: Transient<f32>,
-    /// 动画目标（只在目标变化时启动动画）。
     mix_target: Cell<f32>,
     geometry: Rc<RefCell<Geometry>>,
 }
@@ -111,7 +76,6 @@ struct Geometry {
 }
 
 impl Toggle {
-    /// 建开关（默认复选）。`key` 是动作身份与调试 id 前缀。
     pub fn new(app: &mut App, theme: ThemeHandle, key: impl Into<SmolStr>) -> Self {
         let scope = app.signal_scope();
         let checked = app.signal_scoped(scope, false);
@@ -139,94 +103,77 @@ impl Toggle {
         }
     }
 
-    /// 复选。
     #[must_use]
     pub fn checkbox(mut self) -> Self {
         self.kind = ToggleKind::Checkbox;
         self
     }
 
-    /// 单选。
     #[must_use]
     pub fn radio(mut self) -> Self {
         self.kind = ToggleKind::Radio;
         self
     }
 
-    /// 开关。
     #[must_use]
     pub fn switch(mut self) -> Self {
         self.kind = ToggleKind::Switch;
         self
     }
 
-    /// 初始勾选态。
     #[must_use]
     pub fn checked(mut self, checked: bool) -> Self {
         self.initial_checked = checked;
         self
     }
 
-    /// 文字标签（同时是可访问名）。
     #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
         self
     }
 
-    /// 禁用。
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
     }
 
-    /// 勾选变化回调（用户点击 / Enter / Space 触发；程序化 `set_checked` 不触发）。
     #[must_use]
     pub fn on_change(mut self, callback: impl Fn(bool, &mut App) + 'static) -> Self {
         self.callback = Some(Rc::new(callback));
         self
     }
 
-    /// 根节点（`build` 之后可用）。
     #[must_use]
     pub fn node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().node
     }
 
-    /// 几何控制节点（方框 / 圆框 / 轨道；测试用）。
     #[must_use]
     pub fn control_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().control
     }
 
-    /// 滑块节点（仅 Switch；测试用）。
     #[must_use]
     pub fn knob_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().knob
     }
 
-    /// 当前勾选态。
     #[must_use]
     pub fn is_checked(&self, app: &App) -> bool {
         app.read_with(&self.inner.checked, |checked| *checked)
     }
 
-    /// 勾选过渡进度（0 = 未选，1 = 选中）。
     #[must_use]
     pub fn mix(&self, app: &App) -> f32 {
         *app.read_transient(&self.inner.mix)
     }
 
-    /// 程序化设置勾选态（不触发 `on_change`；动画由 `sync` 推进）。
     pub fn set_checked(&self, app: &mut App, checked: bool) -> bool {
         app.write(&self.inner.checked, checked)
     }
 
-    /// 建节点：交互根 + 几何控制 + 标签，并注册点击 / 键盘激活回调。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode` / 图标资源错误。
     pub fn build(
         &self,
         app: &mut App,
@@ -325,10 +272,6 @@ impl Toggle {
         Ok(node)
     }
 
-    /// 帧驱动同步：交互状态 + 勾选动画 + Switch 滑块几何。
-    ///
-    /// # Errors
-    /// 同 [`Interactive::sync`] / `StaleNode`。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let mut changed = self.inner.interactive.sync(app)?;
         let checked = self.is_checked(app);
@@ -359,22 +302,18 @@ impl Toggle {
         Ok(changed)
     }
 
-    /// 转发按下 / 抬起事件。
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         self.inner.interactive.dispatch(app, event)
     }
 
-    /// 运行时禁用。
     pub fn set_disabled(&self, app: &mut App, disabled: bool) -> bool {
         self.inner.interactive.set_disabled(app, disabled)
     }
 
-    /// 释放信号作用域与 Action handler。
     pub fn release(&self, app: &mut App) -> usize {
         self.inner.interactive.release(app) + app.release_scope(self.inner.scope)
     }
 
-    /// 滑块位置 = 轨道内边距 + 进度 × 可移动距离（`LayoutOverride`，相对轨道 border box）。
     fn sync_knob(&self, app: &mut App) -> Result<bool, EngineError> {
         let (Some(window), Some(knob)) = (
             self.inner.geometry.borrow().window,
@@ -414,18 +353,14 @@ impl UnifiedSizable for Toggle {
     }
 }
 
-/// 滑块相对轨道的内边距。
 const KNOB_INSET: f32 = 2.0;
 
-/// 几何控制节点及其可选的滑块 / 勾（内点）。
 struct Control {
     node: NodeId,
     knob: Option<NodeId>,
-    /// 勾（Checkbox）或内点（Radio）：`opacity` 读 `mix` 瞬态，必须登记进动画目标。
     mark: Option<NodeId>,
 }
 
-/// Switch 轨道的尺寸。
 struct TrackMetrics {
     width: f32,
     height: f32,
@@ -441,7 +376,6 @@ fn track_metrics(size: UnifiedSize) -> TrackMetrics {
     }
 }
 
-/// 建几何控制节点（方框 / 圆框 / 轨道），含勾 / 点 / 滑块。
 fn build_control(
     app: &mut App,
     window: WindowId,
@@ -601,7 +535,6 @@ fn build_control(
     }
 }
 
-/// 当前勾选 / 禁用状态下的主题开关配方。
 fn toggle_colors(
     cx: &mut ReadCtx<'_>,
     theme: &ThemeHandle,
@@ -759,7 +692,6 @@ mod tests {
         Theme::of(Appearance::Light)
     }
 
-    /// 点击切换勾选态：信号翻转、回调收到新值、勾选动画推进。
     #[test]
     fn clicking_flips_checked_reports_it_and_animates_the_mark() {
         let mut harness = harness(ToggleKind::Checkbox, false);
@@ -780,7 +712,6 @@ mod tests {
         );
     }
 
-    /// 键盘 Space：焦点节点的 Space 激活与点击同一个 Action。
     #[test]
     fn space_on_the_focused_toggle_flips_it() {
         let mut harness = harness(ToggleKind::Switch, false);
@@ -796,7 +727,6 @@ mod tests {
         assert_eq!(harness.reported.get(), Some(true));
     }
 
-    /// 未选中：方框背景透明；选中：品牌色填充（插值两端）。
     #[test]
     fn the_box_fills_between_the_unchecked_and_checked_roles() {
         let unchecked_case = harness(ToggleKind::Checkbox, false);
@@ -821,7 +751,6 @@ mod tests {
         );
     }
 
-    /// Switch：滑块位置随勾选进度从轨道左侧移到右侧。
     #[test]
     fn the_switch_knob_moves_from_left_to_right() {
         let mut harness = harness(ToggleKind::Switch, false);
@@ -854,7 +783,6 @@ mod tests {
         );
     }
 
-    /// 勾 / 内点是动画目标：点击后 `opacity` 从 0 走到 1（变异：不登记 `watch` → 恒 0，本测试红）。
     #[test]
     fn clicking_fades_the_mark_in() {
         for kind in [ToggleKind::Checkbox, ToggleKind::Radio] {
@@ -874,7 +802,6 @@ mod tests {
         }
     }
 
-    /// 根节点保留旧 `unified_sized` 的行高与水平内边距（`chrome(false)` 也要写）。
     #[test]
     fn the_root_keeps_the_old_row_height_and_left_padding() {
         for size in [
@@ -909,7 +836,6 @@ mod tests {
         }
     }
 
-    /// `checked` 双向：点击后的状态进 a11y 快照（变异：不读 `checked` 信号 → 快照停在 false）。
     #[test]
     fn clicking_updates_the_checked_state_in_the_a11y_snapshot() {
         let mut app = TestApp::new();
@@ -952,7 +878,6 @@ mod tests {
         );
     }
 
-    /// a11y：三种变体的角色与 checked 状态都进快照。
     #[test]
     fn every_toggle_kind_declares_its_role_and_checked_state() {
         for (kind, role) in [
@@ -983,7 +908,6 @@ mod tests {
         }
     }
 
-    /// 禁用：不响应点击，a11y 宣告 disabled。
     #[test]
     fn a_disabled_toggle_ignores_clicks_and_reports_disabled() {
         let mut app = TestApp::new();
@@ -1019,7 +943,6 @@ mod tests {
         assert!(record.disabled);
     }
 
-    /// 标签：文字节点带字号；标签颜色走交互前景（禁用时 `FgDisabled`）。
     #[test]
     fn the_label_is_a_text_node_themed_by_the_interactive_foreground() {
         let harness = harness_with(ToggleKind::Checkbox, false, |toggle| {
@@ -1050,7 +973,6 @@ mod tests {
         );
     }
 
-    /// I3：动画结束后的稳态不出帧。
     #[test]
     fn a_settled_toggle_produces_no_further_frames() {
         let mut harness = harness(ToggleKind::Switch, false);

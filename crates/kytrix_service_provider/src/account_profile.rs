@@ -1,6 +1,5 @@
 use smol_str::SmolStr;
 
-/// Account identity and credential generations bound to authenticated work.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AccountProfile {
     account_id: SmolStr,

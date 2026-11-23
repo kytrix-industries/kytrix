@@ -1,10 +1,3 @@
-//! The Hyperliquid `MarketParticipantAdapter` implementation.
-//!
-//! `venue` is the static attribution this adapter is registered under, and
-//! `read_venue` is the venue-level conversation a load opens before anything of the
-//! venue is registered. Which scopes exist and what each of them serves is the
-//! venue's loader's answer, not this adapter's.
-
 use market_participants_model::{identifier::VenueId, listing::route::VenueRoute};
 
 use super::implementation::{
@@ -20,12 +13,6 @@ impl MarketParticipantAdapter for HyperliquidAdapter {
         self.venue_id()
     }
 
-    /// Reads what the venue publishes, through the venue's own configuration.
-    ///
-    /// A load of this venue asks what it deploys before anything of it is
-    /// registered, so the read addresses the venue rather than a scope of it: it is
-    /// dialed on the origin the venue's own settings resolve and carries no request
-    /// identity.
     fn read_venue(
         &self,
         context: VenueExecutionContext,
@@ -35,11 +22,6 @@ impl MarketParticipantAdapter for HyperliquidAdapter {
         Box::pin(async move { HyperliquidAdapter::read_venue(&adapter, &context).await })
     }
 
-    /// Answers the venue's own bounds for one route.
-    ///
-    /// Hyperliquid publishes a twenty-level order book and its own candle set for
-    /// every scope it serves — one it publishes raw prices on — so every scope is
-    /// answered from the venue's values rather than from a venue-wide guess.
     fn limits(&self, route: &VenueRoute) -> crate::adapter::AdapterLimits {
         let _ = route;
         crate::adapter::AdapterLimits {
@@ -297,9 +279,6 @@ mod tests {
         )
     }
 
-    /// Both scopes answer the venue's own bounds: a twenty-level book and the
-    /// candle intervals Hyperliquid publishes, which are the model's intervals
-    /// without six hours and without two days.
     #[test]
     fn limits_answer_the_venues_own_bounds_per_scope() {
         let adapter = HyperliquidAdapter::new();
@@ -316,7 +295,6 @@ mod tests {
         }
     }
 
-    /// The venue attribution is static and never decides routing.
     #[test]
     fn the_venue_is_the_static_attribution() {
         assert_eq!(HyperliquidAdapter::new().venue().as_str(), "hyperliquid");

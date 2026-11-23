@@ -1,11 +1,3 @@
-//! R01-16：按节点 / 按窗口请求重绘的失效范围。
-//!
-//! 验收判据：
-//! - 节点级入口只把**该节点子树**标 `PAINT`（子树外的兄弟/祖先保持 `REUSABLE` 复用）；
-//! - 祖先链只做有效性校验：祖先不可见 ⇒ 不重建任何 lane、不请求帧；
-//! - damage 只来自被重建的 lane（**不**退化成整窗），窗口级入口才是整窗 `damage_full`；
-//! - 陈旧节点 / 未知窗口返回强类型错误（不静默 no-op）。
-
 use super::App;
 use crate::{
     error::EngineError,
@@ -45,8 +37,6 @@ fn paint() -> PaintSpec {
     }
 }
 
-/// 绝对定位的固定尺寸盒子（**不能**用 `layout_override`：它把节点变成布局叶子，
-/// 不能再挂子节点）。
 fn positioned(rect: Rect) -> Style {
     let mut style = Style::default();
     style.inner.position = taffy::style::Position::Absolute;
@@ -80,7 +70,6 @@ fn dirty(app: &App, window: WindowId, node: NodeId) -> DirtyFlags {
         .dirty()
 }
 
-/// 一棵小树：root → panel →（node → 两个子节点）、sibling。
 struct Fixture {
     root: NodeId,
     panel: NodeId,
@@ -107,7 +96,6 @@ fn fixture(app: &mut App, window: WindowId) -> Fixture {
     }
 }
 
-/// 先出一帧把全部 lane 建好（`REUSABLE` 置位、脏集合清空），再返回。
 fn warm(app: &mut App, window: WindowId) -> Fixture {
     let fixture = fixture(app, window);
     frame(app, window);
@@ -139,7 +127,6 @@ fn node_repaint_marks_only_the_subtree_and_requests_one_frame() {
     assert_eq!(app.frame_requests(), requests + 1, "只唤醒一次");
     assert!(app.take_wake_request(), "必须置帧请求位");
 
-    // 失效集合 = node 子树；祖先 / 兄弟都不重建（保持 REUSABLE 复用）。
     for subtree in [node, child_a, child_b] {
         let flags = dirty(&app, window, subtree);
         assert!(flags.contains(DirtyFlags::PAINT), "子树节点必须标 PAINT");
@@ -161,7 +148,6 @@ fn node_repaint_marks_only_the_subtree_and_requests_one_frame() {
     }
 }
 
-/// 下一帧只重建子树的 lane，damage 只覆盖 node 盒（+1 物理像素 AA 外扩）。
 #[cfg(feature = "test-support")]
 #[test]
 fn node_repaint_rebuilds_only_subtree_lanes_and_stays_within_the_node() {
@@ -195,11 +181,6 @@ fn node_repaint_rebuilds_only_subtree_lanes_and_stays_within_the_node() {
     );
 }
 
-/// AR5 P2-1 回归：内容**收缩**时 damage 必须覆盖旧可见范围（旧 ∪ 新）。
-///
-/// 构造（AR5 的生产路径）：60×20 的文本节点、`Clip::None`、`TextWrap::NoWrap`，14 个 'W'
-/// 的字形显著溢出节点盒（实测宽约 200 px）；改成 'i' 后新图元只覆盖节点盒内，旧实现
-/// damage = 节点盒 +1 px ⇒ 旧字形溢出部分无人重画（残影）。
 #[cfg(feature = "test-support")]
 #[test]
 fn shrinking_text_damage_covers_the_old_glyphs_outside_the_node_box() {
@@ -249,8 +230,6 @@ fn shrinking_text_damage_covers_the_old_glyphs_outside_the_node_box() {
         "前置条件：14 个 W 必须显著溢出 60 px 节点盒（旧字形 {old_bounds:?}）"
     );
 
-    // 内容收缩（布局盒不变）：新字形只剩一个 'i'。`set_text_content` 本身只进 shape 队列，
-    // 不请求帧；生产里改文本通常伴随 `request_node_repaint`（AR5 的复现路径同此）。
     app.window_mut(window)
         .expect("window")
         .tree_mut()

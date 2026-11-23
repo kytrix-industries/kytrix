@@ -1,18 +1,3 @@
-//! 像素读回（L4）：真实 GPU 离屏渲染 + 读回，**带合成端滚动槽偏移表**。
-//!
-//! 为什么需要它：`TestApp::snapshot` 走 `Renderer::render_snapshot`，那条路径给
-//! `FramePayload` 的滚动表恒为空（快照不滚），于是滚动后的内容会以**烘焙坐标**呈现 ——
-//! 像素断言看不到位移。这里复用同一组生产类型（`GpuRenderer` / `FramePayload` /
-//! `submit_snapshot` / `readback`），只是额外接受调用方给定的滚动槽表，与 golden 快照
-//! 链路（`tests/snapshot.rs`）是同一台机器上的同一条 GPU 读回。
-//!
-//! **滚动表从哪来**：生产里 `DeltaBuilder` 把 paint pass 的槽位表填进 `FramePayload.scroll`；
-//! 这里由调用方按公开 API 重建同一结构（`App::scroll_state` 的偏移 + 探针 bounds 换算出的
-//! 物理视口）。生产侧「偏移真的进了 delta」由 `FrameRecord.stats.scroll_offset_frames` 单独
-//! 断言（见 `super::gui_smoke`），两条断言合起来覆盖「滚轮 → 偏移 → 合成 → 呈现」整条链。
-//!
-//! 三平台同一份代码：类型路径统一走 `render::backend`（编译期选定恰好一份后端）。
-
 use crate::{
     app::App,
     error::EngineError,
@@ -30,15 +15,8 @@ use crate::{
     window::{FrameIndex, Window},
 };
 
-/// 一帧的滚动槽表项：`(逻辑滚动位移, 物理视口)`；**下标即槽位**（下标 0 恒是哨兵）。
 pub type ScrollSlot = (Point, PhysicalRect);
 
-/// 渲染当前窗口的实例缓冲并读回（`scroll` 为空 = 不应用滚动偏移，等价于 `TestApp::snapshot`）。
-///
-/// `size` / `scale` 是场景的物理尺寸与 DPI（headless 窗口 = `size × scale` 的 covering）。
-///
-/// # Errors
-/// [`EngineError::AppInit`] / [`EngineError::UnsupportedGpu`]：设备 / 管线 / 渲染 / 读回失败。
 pub fn render_offscreen(
     app: &App,
     window: &Window,
@@ -48,8 +26,6 @@ pub fn render_offscreen(
 ) -> Result<SnapshotImage, EngineError> {
     let (offsets, clip) = scroll_payload(scroll, scale);
     let mut renderer = offscreen_gpu(size)?;
-    // 字形页恒上传（1 层 array）；图片页只在 App 侧有页时上传（与 `TestApp::snapshot` 同一口径），
-    // 数组层数 = 当前打开的图集页数。
     let (glyph_page, glyph_pixels) = app.glyph_page_pixels();
     renderer.queue_atlas_upload(
         AtlasKind::Glyph,
@@ -61,7 +37,6 @@ pub fn render_offscreen(
         glyph_pixels,
         DirtyRects::full(),
     );
-    // 图片图集：多页 texture array ⇒ 逐层整页上传；没有图片页时什么都不传。
     let image_pages = app.resource_page_pixels_all();
     let image_layers = u32::try_from(image_pages.len()).expect("image page count fits u32");
     for (layer, (image_page, image_pixels)) in image_pages.into_iter().enumerate() {
@@ -95,7 +70,6 @@ pub fn render_offscreen(
     })
 }
 
-/// 离屏渲染器：Windows 用 WARP（与 golden 基线同一设备类型），其余平台用真实 GPU 离屏。
 fn offscreen_gpu(size: (u32, u32)) -> Result<GpuRenderer, EngineError> {
     #[cfg(windows)]
     {
@@ -107,7 +81,6 @@ fn offscreen_gpu(size: (u32, u32)) -> Result<GpuRenderer, EngineError> {
     }
 }
 
-/// 槽位表 → `(物理平移量, 屏幕裁剪区)`：直接走生产的 [`ScrollTable`]，不在这里复制符号约定。
 fn scroll_payload(scroll: &[ScrollSlot], scale: Scale) -> (Vec<[f32; 2]>, Vec<[i32; 4]>) {
     let mut table = ScrollTable::new();
     let deltas: Vec<ScrollDelta> = scroll
@@ -127,10 +100,6 @@ fn scroll_payload(scroll: &[ScrollSlot], scale: Scale) -> (Vec<[f32; 2]>, Vec<[i
     (offsets, clip)
 }
 
-/// 读回一张图里的一个像素（RGBA8，预乘 sRGB）。
-///
-/// # Panics
-/// 坐标越界（测试自己写错了断言位置）。
 #[must_use]
 pub fn pixel(image: &SnapshotImage, x: u32, y: u32) -> [u8; 4] {
     assert!(
@@ -145,7 +114,6 @@ pub fn pixel(image: &SnapshotImage, x: u32, y: u32) -> [u8; 4] {
         .expect("4 bytes per pixel")
 }
 
-/// 两个颜色的最大单通道差（含 alpha；预乘空间）。
 #[must_use]
 pub fn channel_span(a: [u8; 4], b: [u8; 4]) -> u8 {
     a.iter()
@@ -155,9 +123,6 @@ pub fn channel_span(a: [u8; 4], b: [u8; 4]) -> u8 {
         .unwrap_or(0)
 }
 
-/// 矩形区域内与 `expected` 的最大单通道差（闭区间 `x0..=x1` / `y0..=y1`）。
-///
-/// 传全透明像素时 `expected` 的 alpha 必须一起对上：读回是预乘的，透明区恒 `[0, 0, 0, 0]`。
 #[must_use]
 pub fn region_max_span(
     image: &SnapshotImage,
@@ -176,10 +141,6 @@ pub fn region_max_span(
     span
 }
 
-/// 两张同尺寸图在矩形区域内的**最大单通道差**（「这块区域真的变了吗」的断言面）。
-///
-/// # Panics
-/// 两张图尺寸不同（读回尺寸不该漂移）。
 #[must_use]
 pub fn region_diff(
     before: &SnapshotImage,
@@ -203,7 +164,6 @@ pub fn region_diff(
     span
 }
 
-/// 矩形区域内满足谓词的像素数（文本覆盖率 / 高亮区域等断言用；闭区间）。
 #[must_use]
 pub fn count_pixels(
     image: &SnapshotImage,
@@ -224,7 +184,6 @@ pub fn count_pixels(
     count
 }
 
-/// `SnapshotError` 的可读摘要（调用方拼断言消息用）。
 #[must_use]
 pub fn describe_error(error: &SnapshotError) -> String {
     match error {

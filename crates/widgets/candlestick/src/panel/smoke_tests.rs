@@ -1,17 +1,3 @@
-//! The panel's behaviour tests.
-//!
-//! What they cover is the panel's life (build / sync / rebuild / release), the steady frame, the
-//! scroll range, the row geometry, the control paths that turn a click or a keystroke into a
-//! configuration request (toggle, caret, add line, period commit and refusal, delete line), one
-//! picker per configurable colour showing the colour the configuration holds, and the drawing rule
-//! a folded card's hover follows. The colour fields themselves are checked against the
-//! configuration in [`super::colors_tests`].
-//!
-//! What they do not cover, and where it is registered (`.docs/gui-migration/test-ledger/
-//! w7-candlestick.md` §7.4): the pointer → card hover chain (`G-HOVER`: the engine writes `hovered`
-//! in its own input dispatch, which a widget crate cannot reach), and the picker's own commit
-//! plumbing (`G-PICKER-COMMIT`: the kit component owns its confirm semantics and handle).
-
 use std::time::Instant;
 
 use base_ui::{
@@ -110,8 +96,6 @@ fn the_panel_builds_syncs_and_releases_cleanly() {
         "MA's line list was built"
     );
 
-    // The frame after the layout publishes the column's measured height as the scroll range;
-    // after it the panel is past its first measurement.
     harness.with_cx(|cx| panel.sync(cx, &config).expect("measure sync"));
     harness.drain();
     assert!(
@@ -126,7 +110,6 @@ fn the_panel_builds_syncs_and_releases_cleanly() {
         "a steady sync asks for no frame"
     );
 
-    // The language moves: the block is rebuilt, and the old tree is gone.
     harness.switch_language(LanguageCode::ZhCn);
     assert!(
         harness.with_cx(|cx| panel.sync(cx, &config).expect("language sync")),
@@ -134,7 +117,6 @@ fn the_panel_builds_syncs_and_releases_cleanly() {
     );
     harness.drain();
 
-    // The appearance moves: colours are dynamic channels, not a rebuild.
     let theme = harness.services().theme.clone();
     theme.set_appearance(harness.app_mut(), Appearance::Dark);
     harness.drain();
@@ -144,7 +126,6 @@ fn the_panel_builds_syncs_and_releases_cleanly() {
     );
     harness.drain();
 
-    // The configuration moves: the rows are rebuilt with it.
     let palette = theme.theme_for(Appearance::Light).components().chart.series;
     let mut next = config.clone();
     assert!(next.add_line(IndicatorId::Ma, &palette));
@@ -160,8 +141,6 @@ fn the_panel_builds_syncs_and_releases_cleanly() {
         "the added line has a row"
     );
 
-    // Releasing removes the panel's own subtree, releases its scopes and leaves the widget's
-    // column in place.
     harness.with_cx(|cx| panel.release(cx));
     assert!(panel.root().is_none(), "the panel forgets its root");
     assert!(
@@ -177,7 +156,6 @@ fn the_panel_builds_syncs_and_releases_cleanly() {
         "a released panel stays idle"
     );
     assert_eq!(panel.root(), None, "a released panel has no root to remove");
-    // Releasing again is a no-op, not a panic.
     harness.with_cx(|cx| panel.release(cx));
     harness.drain();
     assert_eq!(
@@ -236,7 +214,6 @@ fn the_rows_line_up_on_the_checkbox_s_line() {
         "the card is laid out inside the panel: {card_bounds:?}"
     );
 
-    // A settings row starts on the vertical line the checkbox's square is drawn on.
     let index = harness.with_cx(|cx| cx.scope().index());
     let toggle = node(&harness, root, "node.MA.enabled", index);
     let toggle_bounds = bounds(&harness, toggle);
@@ -254,7 +231,6 @@ fn the_rows_line_up_on_the_checkbox_s_line() {
         "the field starts on the checkbox's line: field={field_bounds:?} toggle={toggle_bounds:?}"
     );
 
-    // The invalid hint takes no room while the field holds a period it may take.
     let hint = harness
         .find_by_debug_prefix(root, "TEST_PANEL_INVALID_MA_0")
         .expect("the hint was built");
@@ -282,7 +258,6 @@ fn a_period_field_commits_only_a_period_it_may_take() {
         )
         .expect("MA's first period field was built");
 
-    // Focus the field and type one digit: the text is now "50".
     assert!(harness.with_cx(|cx| cx.app_mut().set_focus(window, Some(field))));
     harness.with_cx(|cx| {
         let event = Event::Input(InputEvent::Text {
@@ -298,7 +273,6 @@ fn a_period_field_commits_only_a_period_it_may_take() {
     harness.with_cx(|cx| panel.sync(cx, &config).expect("typing sync"));
     harness.drain();
 
-    // The caret leaves: the period is committed and asked for.
     harness.with_cx(|cx| cx.app_mut().set_focus(window, None));
     harness.drain();
     assert!(
@@ -323,7 +297,6 @@ fn a_period_field_commits_only_a_period_it_may_take() {
     harness.with_cx(|cx| panel.sync(cx, &config).expect("apply sync"));
     harness.drain();
 
-    // Text that is not a period is refused: the hint appears and nothing is written back.
     let field = harness
         .find_by_debug_prefix(
             root,
@@ -399,7 +372,6 @@ fn the_panel_controls_turn_into_requests_and_rebuilds() {
     harness.with_cx(|cx| panel.sync(cx, &config).expect("measure sync"));
     harness.drain();
 
-    // The checkbox that enables MA: its click becomes an edit, and the edit becomes a request.
     let index = harness.with_cx(|cx| cx.scope().index());
     let toggle = node(&harness, root, "node.MA.enabled", index);
     let action = click_action(index, "node.MA.enabled");
@@ -430,12 +402,10 @@ fn the_panel_controls_turn_into_requests_and_rebuilds() {
             == config.entry(IndicatorId::Ema).expect("EMA").enabled,
         "the request changes nothing else"
     );
-    // The widget applies and hands the configuration back.
     config = next;
     harness.with_cx(|cx| panel.sync(cx, &config).expect("config sync"));
     harness.drain();
 
-    // The caret folds MA: the rows under it go away, and come back when it is pressed again.
     let caret = node(&harness, root, "node.MA.caret", index);
     let action = click_action(index, "node.MA.caret");
     assert!(
@@ -464,7 +434,6 @@ fn the_panel_controls_turn_into_requests_and_rebuilds() {
         "the settings come back"
     );
 
-    // The add-line button appends a line to MA's list.
     let add = node(&harness, root, "add_line.MA", index);
     let action = click_action(index, "add_line.MA");
     assert!(click(&mut harness, add, action), "the add-line handler ran");
@@ -497,8 +466,6 @@ fn the_panel_controls_turn_into_requests_and_rebuilds() {
     harness.drain();
 }
 
-/// A line row's delete button removes that line, and the panel asks the widget for the
-/// configuration without it. The removed line takes its field and its picker with it.
 #[test]
 fn a_line_row_should_delete_the_line_it_belongs_to() {
     let (mut harness, mut panel, _parent, requests, _baseline) = harness();
@@ -552,7 +519,6 @@ fn a_line_row_should_delete_the_line_it_belongs_to() {
         "the line below it moved up"
     );
 
-    // The widget applies what was asked for: the row and its picker are rebuilt away.
     harness.with_cx(|cx| cx.write(&requests, None));
     assert!(harness.with_cx(|cx| panel.sync(cx, &next).expect("apply sync")));
     harness.drain();
@@ -571,8 +537,6 @@ fn a_line_row_should_delete_the_line_it_belongs_to() {
     harness.with_cx(|cx| panel.release(cx));
 }
 
-/// A line list never drops below the minimum its catalogue row declares, so the last line
-/// draws no delete button at all rather than one that can never act.
 #[test]
 fn the_last_line_of_a_line_list_should_not_offer_a_delete() {
     let (mut harness, mut panel, _parent, _requests, _baseline) = harness();
@@ -611,13 +575,10 @@ fn the_last_line_of_a_line_list_should_not_offer_a_delete() {
     harness.with_cx(|cx| panel.release(cx));
 }
 
-/// One picker per configurable colour, and each one is handed the colour the configuration
-/// holds: the trigger's well is painted in it.
 #[test]
 fn every_colour_setting_should_have_one_picker_showing_its_colour() {
     let (mut harness, mut panel, _parent, _requests, _baseline) = harness();
     let mut config = CandlestickIndicatorConfig::default();
-    // A colour no default line holds, so the well can only paint the stored one.
     let stored = LineColor {
         h: 0.33,
         s: 0.8,
@@ -681,14 +642,6 @@ fn every_colour_setting_should_have_one_picker_showing_its_colour() {
     harness.with_cx(|cx| panel.release(cx));
 }
 
-/// A folded card lights up under the pointer and an open one never does: an open card's
-/// children are controls of their own, and a box that lit up around them would say the whole
-/// box is one control.
-///
-/// The pointer-to-card half (`sync_hover`, which reads the engine's hover chain) is not
-/// reachable from the headless host: hover is set by `App`'s input dispatch, and neither
-/// `App::dispatch` nor `TestApp::move_pointer` is reachable from a widget crate. This pins the
-/// drawing rule the chain writes into.
 #[test]
 fn a_folded_card_should_light_up_and_an_open_one_should_not() {
     let theme = Theme::of(Appearance::Light);

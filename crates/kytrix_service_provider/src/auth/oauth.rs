@@ -23,7 +23,6 @@ pub(super) struct OAuthAuthority {
     pub config: ConfigNotification<Config>,
     pub transport: Arc<TransportHub>,
     pub account_origin: Url,
-    /// The application runtime every route resolution of this authority runs on.
     pub runtime: Handle,
 }
 
@@ -196,12 +195,6 @@ async fn refresh_from_authority(
     })
 }
 
-/// Tells the authority to drop a refresh token.
-///
-/// A sign-out does not wait for this answer and does nothing with it: the local
-/// credential is already gone, so the only thing a failure changes is that the
-/// authority keeps a token until it expires, which is why the reason it failed is
-/// reported rather than classified into a local outcome.
 async fn revoke_at_authority(
     client: reqwest::Client,
     endpoint: &Url,

@@ -1,29 +1,3 @@
-//! The order-book protocol, its background service, and the seam the service
-//! reads market depth through.
-//!
-//! One service instance owns at most one live generation, keyed by the listing
-//! and the drawing choices it was started for. Both the widget and the service
-//! compare every message against that scope, so a book that belongs to a listing
-//! the user has already left is dropped on both sides.
-//!
-//! # Why the opening book is synchronized here
-//!
-//! A venue's depth stream is a diff stream: it says what changed, never what the
-//! book is. The only way to learn the latter is to ask the venue for a snapshot,
-//! and the only way to keep that snapshot from being older than the diffs that
-//! arrive behind it is to merge the two — the REST snapshot is fetched while the
-//! live updates are buffered, and the buffer is then applied on top of it. Only
-//! once that has happened does the service publish anything, so the first book a
-//! widget sees is already a complete one.
-//!
-//! # Why every applied update is published
-//!
-//! Updates arrive as fast as the venue publishes them, and the latest channel
-//! keeps one value per key: a frame that has not been drawn yet is replaced
-//! rather than queued. Batching in time on top of that would add latency to the
-//! book the user is watching without saving a repaint, so the service publishes
-//! each update it accepts and lets the channel collapse what nothing has read.
-
 use std::{collections::VecDeque, convert::Infallible, future::Future};
 
 use futures::StreamExt;
@@ -49,42 +23,21 @@ use widget::{
 
 use super::model::{MAX_LEVELS_PER_SIDE, OrderBookMetadata, OrderBookSnapshot, is_after};
 
-/// The depth the service asks a venue for. A venue that publishes shallower than
-/// this answers with what it has.
 const SNAPSHOT_DEPTH: u16 = 5_000;
-/// How many live updates may be held while the opening snapshot is in flight. A
-/// venue that outruns the fetch by more than this is not publishing a book this
-/// widget can follow, and reporting that is better than buffering without bound.
 const SNAPSHOT_SYNC_BUFFER_CAPACITY: usize = 64;
-/// How many opening snapshots may be fetched before the venue is given up on.
-///
-/// A venue serves its REST book from slightly behind the stream it publishes, so
-/// the first snapshot can end up just before the oldest update the subscription
-/// buffered. Fetching again a moment later puts the snapshot inside the buffered
-/// window, which is what makes the two mergeable, and three of them cover the
-/// round trips this takes in practice.
 const SNAPSHOT_SYNC_ATTEMPTS: usize = 3;
 
-/// What the widget asks the service to do with the book.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum OrderBookRequest {
-    /// Starts the stream for this scope. Idempotent while one is already live.
     Load(OrderBookStreamKey),
-    /// Replaces the current generation, for a scope the user is retrying.
     Retry(OrderBookStreamKey),
 }
 
-/// The service accepted the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OrderBookResponse {
     StreamStarted,
 }
 
-/// The scope one live book belongs to.
-///
-/// The drawing choices are part of it because they are part of what the pane
-/// shows: a book grouped to a different step is a different chart, and a message
-/// published for the previous grouping describes a ladder nobody is looking at.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct OrderBookStreamKey {
     listing: VenueListingKey,
@@ -93,7 +46,6 @@ pub(super) struct OrderBookStreamKey {
 }
 
 impl OrderBookStreamKey {
-    /// Creates the key of a scope.
     pub(super) const fn new(
         listing: VenueListingKey,
         price_multiplier: u32,
@@ -107,47 +59,26 @@ impl OrderBookStreamKey {
     }
 }
 
-/// What the stream is doing, as far as the book needs to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum OrderBookStatus {
-    /// Subscribing to the venue's depth stream.
     Connecting,
-    /// Subscribed, and synchronizing the opening book.
     LoadingSnapshot(OrderBookMetadata),
-    /// A book is published and the stream is keeping it current.
-    ///
-    /// The sequence is the one that book was taken at, which is the watermark a
-    /// widget needs: the two channels have no order between them, so this can
-    /// arrive before the book it describes.
     Ready { revision: MarketSequence },
-    /// Terminal. The stream task stays alive until the generation is replaced.
     Error(OrderBookStreamError),
 }
 
 #[derive(Clone, Debug)]
 pub(super) enum OrderBookStreamMessage {
     Status(OrderBookStatus),
-    /// The whole book. Replaces whatever the widget was holding.
     Snapshot(OrderBookSnapshot),
 }
 
-/// Why a book could not be kept current.
-///
-/// Only the first variant is something the venue reported; the rest are the
-/// service saying that what it was sent no longer describes a book it can stand
-/// behind, which is why the widget treats every one of them as terminal. A
-/// sequence that merely skipped a step is not one of them: it is answered with a
-/// whole snapshot instead.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub(super) enum OrderBookStreamError {
     #[error(transparent)]
     MarketParticipant(#[from] MarketError),
-    /// The venue published updates faster than the opening snapshot could be
-    /// synchronized with them.
     #[error("the order-book snapshot could not be synchronized with the live updates")]
     SnapshotSynchronizationFailed,
-    /// Every snapshot the venue served was older than the updates its own stream
-    /// had already published, so the two could not be merged into one book.
     #[error("the order-book snapshot stayed behind the venue's updates")]
     SnapshotBehindUpdates,
     #[error("the order-book snapshot is unavailable")]
@@ -184,17 +115,9 @@ impl WidgetProtocol for OrderBookProtocol {
     type Error = Infallible;
 }
 
-/// The market depth one order book reads through.
-///
-/// The service is written against this seam rather than against the market participants
-/// connector, so a test can drive every ordering a real venue can produce without
-/// a venue. Everything a request needs — the listing's rules, the units its book
-/// is written in and the venue's own depth bound — is resolved inside the
-/// connector, so nothing here reads a capability to decide what it may ask for.
 pub(super) trait OrderBookSource: Clone + Send + Sync + 'static {
     type Subscription: OrderBookEventSubscription;
 
-    /// Opens one depth stream for `listing`, asking for `depth` levels per side.
     fn subscribe_order_book(
         &self,
         listing: VenueListingKey,
@@ -202,23 +125,13 @@ pub(super) trait OrderBookSource: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
 }
 
-/// One live depth stream.
 pub(super) trait OrderBookEventSubscription: Send + 'static {
-    /// The increments and units every price and quantity in the book is written
-    /// in.
-    ///
-    /// They come from the listing's own rules because only the listing knows them,
-    /// and the listing has to be resolved before a stream can be opened anyway.
     fn metadata(&self) -> OrderBookMetadata;
 
-    /// Replaces the book with a complete one: fetches the venue's snapshot and
-    /// merges the updates that arrive while it is in flight.
     fn synchronize(&mut self) -> impl Future<Output = Result<(), OrderBookStreamError>> + Send;
 
-    /// Resolves once the book moved, or reports why it cannot.
     fn recv(&mut self) -> impl Future<Output = Option<Result<(), OrderBookStreamError>>> + Send;
 
-    /// The book as it stands, in best-first order on both sides.
     fn snapshot(&self) -> Option<OrderBookSnapshot>;
 }
 
@@ -230,18 +143,9 @@ impl OrderBookSource for MarketCapability {
         listing: VenueListingKey,
         depth: u16,
     ) -> Result<Self::Subscription, MarketError> {
-        // The listing's own rules say what its book is priced and counted in, so
-        // they are resolved before the stream is opened: a ladder that cannot be
-        // rounded or labelled in the listing's own units is not this listing's
-        // book.
         let resolved = self.resolve_listing(&listing)?;
-        // The venue's own bound is read with the rules: it caps the depth the
-        // connector asks for, and it is what the pane offers its row limits from.
         let venue_depth = self.order_book_depth(&listing.route)?;
         let metadata = OrderBookMetadata::of(&resolved.rules, venue_depth);
-        // The requested depth is narrowed to what the venue publishes, so the copy
-        // this service keeps is the one the book actually has rather than the one
-        // the snapshot cap would allow.
         let depth = depth.clamp(1, SNAPSHOT_DEPTH).min(venue_depth);
         let inner = self
             .market(listing.route.clone())
@@ -262,7 +166,6 @@ impl OrderBookSource for MarketCapability {
     }
 }
 
-/// One depth stream from the market participants connector.
 pub(super) struct ClientOrderBookSubscription {
     inner: OrderBookStream,
     market: MarketCapability,
@@ -271,7 +174,6 @@ pub(super) struct ClientOrderBookSubscription {
     depth: u16,
     maximum_levels: usize,
     book: Option<ListingOrderBook>,
-    /// Whether the book that was just synchronized still has to be published.
     initial_pending: bool,
 }
 
@@ -291,9 +193,6 @@ impl OrderBookEventSubscription for ClientOrderBookSubscription {
     }
 
     async fn synchronize(&mut self) -> Result<(), OrderBookStreamError> {
-        // Whatever the subscription held belongs to the transport that just went
-        // away, so it is dropped before the snapshot is fetched: applying an
-        // update to it would only produce a book that never existed.
         self.book = None;
         self.initial_pending = false;
 
@@ -309,17 +208,12 @@ impl OrderBookEventSubscription for ClientOrderBookSubscription {
 
             loop {
                 match merge_buffered_updates(&mut snapshot, &mut buffered, self.maximum_levels)? {
-                    // The snapshot is older than everything the subscription has
-                    // buffered, so nothing can bridge the two; a fresher snapshot
-                    // is the only way, and the buffered updates are kept for it.
                     MergeOutcome::SnapshotOutdated => break,
                     MergeOutcome::Synchronized => {
                         self.book = Some(snapshot);
                         self.initial_pending = true;
                         return Ok(());
                     }
-                    // Everything buffered is already in the snapshot, so whatever
-                    // the stream publishes next is what continues it.
                     MergeOutcome::AwaitingUpdate => {
                         let Some(event) = self.inner.next().await else {
                             return Err(OrderBookStreamError::SubscriptionClosed);
@@ -332,9 +226,6 @@ impl OrderBookEventSubscription for ClientOrderBookSubscription {
     }
 
     async fn recv(&mut self) -> Option<Result<(), OrderBookStreamError>> {
-        // The book that was just synchronized has not been published yet, and the
-        // service publishes what the subscription holds: reporting it here is what
-        // puts the opening book on screen without waiting for the next update.
         if self.initial_pending {
             self.initial_pending = false;
             return Some(Ok(()));
@@ -347,15 +238,8 @@ impl OrderBookEventSubscription for ClientOrderBookSubscription {
                 Err(error) => return Some(Err(error.into())),
             };
             match apply_live_update(&mut self.book, update, self.maximum_levels) {
-                // An update the book already contains leaves nothing to publish,
-                // so it is skipped rather than reported.
                 Ok(Applied::Unchanged) => {}
                 Ok(Applied::Changed) => return Some(Ok(())),
-                // An update this book cannot be continued with — a sequence that
-                // was never comparable, or one that skipped a step — is answered
-                // with a whole snapshot rather than a stopped stream: the venue is
-                // still publishing, and a fresh snapshot is what the situation
-                // calls for.
                 Ok(Applied::NeedsSnapshot) => return Some(self.resynchronize().await),
                 Err(error) => return Some(Err(error)),
             }
@@ -364,12 +248,6 @@ impl OrderBookEventSubscription for ClientOrderBookSubscription {
 }
 
 impl ClientOrderBookSubscription {
-    /// Fetches a complete book while keeping the live updates that arrive around
-    /// it.
-    ///
-    /// The stream is open before the snapshot is requested, so every update the
-    /// venue publishes while the request is in flight is buffered instead of
-    /// missed: those are what make the snapshot current.
     async fn fetch_opening_book(
         &mut self,
         buffered: &mut VecDeque<ListingOrderBookUpdate>,
@@ -394,22 +272,13 @@ impl ClientOrderBookSubscription {
         }
     }
 
-    /// Replaces the book with a fresh snapshot, and reports the new one as the
-    /// movement it is.
     async fn resynchronize(&mut self) -> Result<(), OrderBookStreamError> {
         self.synchronize().await?;
-        // The book that was just synchronized is published by reporting it here,
-        // the same way the opening book is.
         self.initial_pending = false;
         Ok(())
     }
 }
 
-/// Buffers one live update, refusing to grow without bound.
-///
-/// A venue that publishes faster than a snapshot can be merged is not publishing
-/// a book this widget can follow, and saying so is better than buffering without
-/// end while the next snapshot is fetched.
 fn push_buffered_update(
     buffered: &mut VecDeque<ListingOrderBookUpdate>,
     update: ListingOrderBookUpdate,
@@ -421,41 +290,18 @@ fn push_buffered_update(
     Ok(())
 }
 
-/// What merging the buffered updates into a snapshot said about the two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MergeOutcome {
-    /// The snapshot and the updates are one book now.
     Synchronized,
-    /// The snapshot cannot be continued by what is buffered — it is older than the
-    /// oldest update, numbered in a representation the update cannot be ordered
-    /// against, or followed by a hole — so only a fresher snapshot can bridge the
-    /// two.
     SnapshotOutdated,
-    /// Every buffered update is already in the snapshot; whatever the stream
-    /// publishes next is what continues it.
     AwaitingUpdate,
 }
 
-/// Merges the buffered updates into the snapshot, oldest first.
-///
-/// The venue decides what "continues" means, and the venues do not agree:
-/// Binance's futures stream publishes update ranges that may overlap and carries
-/// `pu`, the update id of the event before them, while its spot stream publishes
-/// ranges that follow each other exactly. What all of them agree on is the
-/// opening: an update the snapshot already contains is dropped, and the oldest
-/// update left has to *cover* the sequence just after the snapshot's, because an
-/// update that starts past it leaves a hole no later update can fill.
-///
-/// A snapshot the updates have already passed is not a failure: the venue serves
-/// its book from slightly behind the stream it publishes, so fetching again is
-/// what the situation calls for, and the caller decides how often.
 fn merge_buffered_updates(
     snapshot: &mut ListingOrderBook,
     buffered: &mut VecDeque<ListingOrderBookUpdate>,
     maximum_levels: usize,
 ) -> Result<MergeOutcome, OrderBookStreamError> {
-    // The snapshot's own sequence is the watermark everything after it follows
-    // from: an update at or below it is one the snapshot was taken after.
     while buffered
         .front()
         .is_some_and(|update| !is_after(&update.last_sequence, &snapshot.sequence))
@@ -467,30 +313,17 @@ fn merge_buffered_updates(
     };
     if !oldest.snapshot {
         match oldest.first_sequence.is_after(&snapshot.sequence) {
-            // The update starts past the snapshot and leaves a hole no later
-            // update can fill.
             Some(true) if !range_covers_successor(&snapshot.sequence, oldest) => {
                 return Ok(MergeOutcome::SnapshotOutdated);
             }
-            // Sequences of different representations cannot be ordered, so the two
-            // cannot be proven to be one book.
             None => return Ok(MergeOutcome::SnapshotOutdated),
-            // A range that starts past the snapshot but covers the sequence just
-            // after it bridges the two, and so does one that starts at or before
-            // the snapshot: it describes an update from before it.
             _ => {}
         }
-        // Nothing that is not a whole snapshot can be replayed as an increment
-        // without numeric counters to order it by.
         if numeric_range(oldest).is_none() {
             return Ok(MergeOutcome::SnapshotOutdated);
         }
     }
 
-    // The opening rule has already accepted this update as the one that continues
-    // the snapshot, so it is applied without checking it against the book: an
-    // update that spans the snapshot describes an update from before it, which
-    // this book never had.
     let boundary = buffered
         .pop_front()
         .expect("a non-empty buffer has an oldest update");
@@ -498,52 +331,26 @@ fn merge_buffered_updates(
     while let Some(update) = buffered.pop_front() {
         match apply_order_book_update(snapshot, update, maximum_levels)? {
             Applied::Unchanged | Applied::Changed => {}
-            // A buffered update the snapshot cannot be continued with means the two
-            // are not one book after all, and a fresher snapshot is the only way to
-            // make them one.
             Applied::NeedsSnapshot => return Ok(MergeOutcome::SnapshotOutdated),
         }
     }
     Ok(MergeOutcome::Synchronized)
 }
 
-/// What applying one update to a book did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Applied {
-    /// The update was already in the book, so nothing a frame draws changed.
     Unchanged,
-    /// The book moved.
     Changed,
-    /// The update cannot be applied to this book, so only a whole snapshot can
-    /// carry it.
     NeedsSnapshot,
 }
 
-/// Applies one update, reporting what it did to the book.
-///
-/// What "continues the book" means is stated by the update itself, and the two
-/// representations a venue can number its stream with do not agree:
-///
-/// - a **numeric** counter names the update it follows in `previous_sequence`, and
-///   its ranges do not begin after that update — a live probe of the BTCUSDT
-///   perpetual showed every event starting well over a hundred ids later — so
-///   `previous_sequence` is the whole check, and comparing the ranges would reject
-///   every event the venue publishes;
-/// - a **native** watermark — a venue that numbers its book by its own timestamp —
-///   has no arithmetic successor, so an update carrying one cannot be ordered
-///   against the book at all. Such a venue publishes whole snapshots, and anything
-///   else is answered with one instead of being replayed as an increment.
 fn apply_order_book_update(
     book: &mut ListingOrderBook,
     update: ListingOrderBookUpdate,
     maximum_levels: usize,
 ) -> Result<Applied, OrderBookStreamError> {
     match update.last_sequence.is_after(&book.sequence) {
-        // The book is already at or past this update, so it is one the book was
-        // taken after.
         Some(false) => return Ok(Applied::Unchanged),
-        // An increment numbered in a representation this book cannot be ordered
-        // against is not something an increment can carry.
         None if !update.snapshot => return Ok(Applied::NeedsSnapshot),
         _ => {}
     }
@@ -555,10 +362,6 @@ fn apply_order_book_update(
     Ok(Applied::Changed)
 }
 
-/// Applies what the live stream published to the book the subscription holds.
-///
-/// A book that was never synchronized cannot be continued by an increment either,
-/// so an absent one reports the same need for a whole snapshot.
 fn apply_live_update(
     book: &mut Option<ListingOrderBook>,
     update: ListingOrderBookUpdate,
@@ -570,13 +373,9 @@ fn apply_live_update(
     apply_order_book_update(book, update, maximum_levels)
 }
 
-/// Whether an increment continues the book it is being applied to.
 fn update_continues(book: &ListingOrderBook, update: &ListingOrderBookUpdate) -> bool {
     match &update.previous_sequence {
-        // The venue names the update this one follows, which is the whole check.
         Some(previous) => previous == &book.sequence,
-        // Without one, the ranges are all there is to go on, and they have to
-        // cover the sequence just after the book's.
         None => {
             let Some(next) = numeric_successor(&book.sequence) else {
                 return false;
@@ -586,8 +385,6 @@ fn update_continues(book: &ListingOrderBook, update: &ListingOrderBookUpdate) ->
     }
 }
 
-/// Whether a range that starts past `sequence` still covers the step just after
-/// it.
 fn range_covers_successor(sequence: &MarketSequence, update: &ListingOrderBookUpdate) -> bool {
     let Some(next) = numeric_successor(sequence) else {
         return false;
@@ -595,8 +392,6 @@ fn range_covers_successor(sequence: &MarketSequence, update: &ListingOrderBookUp
     numeric_range(update).is_some_and(|(first, _)| first <= next)
 }
 
-/// The numeric counters of one update, absent when the venue numbered it with a
-/// watermark that has no arithmetic.
 fn numeric_range(update: &ListingOrderBookUpdate) -> Option<(u64, u64)> {
     match (&update.first_sequence, &update.last_sequence) {
         (MarketSequence::Numeric(first), MarketSequence::Numeric(last)) => Some((*first, *last)),
@@ -604,7 +399,6 @@ fn numeric_range(update: &ListingOrderBookUpdate) -> Option<(u64, u64)> {
     }
 }
 
-/// The sequence one numeric step after `sequence`.
 fn numeric_successor(sequence: &MarketSequence) -> Option<u64> {
     match sequence {
         MarketSequence::Numeric(value) => value.checked_add(1),
@@ -612,17 +406,12 @@ fn numeric_successor(sequence: &MarketSequence) -> Option<u64> {
     }
 }
 
-/// Writes one update into the book, which the caller has already accepted as the
-/// one that continues it.
 fn apply_update(
     book: &mut ListingOrderBook,
     update: ListingOrderBookUpdate,
     maximum_levels: usize,
 ) {
     if update.snapshot {
-        // A complete book replaces both sides at once: it is the venue saying
-        // that everything before it is void, which is also how a resumed stream
-        // recovers a sequence the subscription could not have followed.
         book.bids = update.bids;
         book.asks = update.asks;
     } else {
@@ -639,7 +428,6 @@ fn truncate_order_book(book: &mut ListingOrderBook, maximum_levels: usize) {
     book.asks.truncate(maximum_levels);
 }
 
-/// Applies the levels of one update to one side, keeping the side sorted.
 fn apply_levels(
     levels: &mut Vec<ListingOrderBookLevel>,
     updates: Vec<ListingOrderBookLevel>,
@@ -668,19 +456,12 @@ fn apply_levels(
     });
 }
 
-/// The service that follows one book.
 pub(super) struct OrderBookService<S = MarketCapability> {
     source: S,
     snapshot_depth: u16,
 }
 
 impl<S> OrderBookService<S> {
-    /// Creates a service that asks each venue for up to `snapshot_depth` levels
-    /// per side.
-    ///
-    /// The depth is clamped here rather than trusted: it bounds how much of a
-    /// book is copied on every publish, and the model refuses more than it can
-    /// hold in any case.
     pub(super) fn new(source: S, snapshot_depth: u16) -> Self {
         Self {
             source,
@@ -702,21 +483,13 @@ where
                 OrderBookRequest::Load(key) => (key, false),
                 OrderBookRequest::Retry(key) => (key, true),
             };
-            // A repeated load for the scope that is already running is answered
-            // without touching the live stream: the caller has not asked for
-            // anything new.
             if !retry && active_key.as_ref() == Some(&key) {
                 let _ = reply.respond(Ok(OrderBookResponse::StreamStarted));
                 continue;
             }
-            // `next_rpc` already dropped expired requests; re-check before
-            // starting anything, so a caller that went away cannot leave a stream
-            // behind.
             if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                 continue;
             }
-            // Streams are keyed, so a new scope would otherwise leave the previous
-            // one running and publishing into the same widget.
             if active_key.as_ref() != Some(&key)
                 && let Some(previous) = active_key.take()
             {
@@ -747,14 +520,12 @@ where
     }
 }
 
-/// Everything one book generation was started for.
 #[derive(Clone)]
 struct OrderBookSpec {
     listing: VenueListingKey,
     snapshot_depth: u16,
 }
 
-/// Runs one stream generation until it fails or is cancelled.
 async fn run_stream<S>(
     source: S,
     spec: OrderBookSpec,
@@ -766,8 +537,6 @@ async fn run_stream<S>(
         return;
     }
     if let Err(error) = run_stream_once(&source, &spec, &publisher).await {
-        // A terminal failure must not retry on its own: the view decides when to
-        // ask for a replacement generation, so the task stays alive until then.
         if publish_status(&publisher, OrderBookStatus::Error(error)).await {
             publisher.cancelled().await;
         }
@@ -816,9 +585,6 @@ where
                     return Ok(());
                 };
                 if awaiting_ready {
-                    // The book is on the latest channel and the status that says
-                    // so is on the reliable one; a widget that sees the status
-                    // first waits for a book that has reached this sequence.
                     awaiting_ready = false;
                     if !publish_status(publisher, OrderBookStatus::Ready { revision }).await {
                         return Ok(());
@@ -829,7 +595,6 @@ where
     }
 }
 
-/// Synchronizes the opening book, reporting whether the stream is still alive.
 async fn synchronize<S>(
     subscription: &mut S,
     publisher: &StreamPublisher<OrderBookProtocol>,
@@ -846,10 +611,6 @@ where
     }
 }
 
-/// Publishes the book as it stands, and reports the sequence it was taken at.
-///
-/// `None` means the stream was cancelled while publishing, which is how every
-/// shutdown propagates rather than as an error.
 fn publish_snapshot<S>(
     publisher: &StreamPublisher<OrderBookProtocol>,
     subscription: &S,
@@ -867,7 +628,6 @@ where
     Ok(published.then_some(revision))
 }
 
-/// Publishes a status, reporting whether the stream is still alive.
 async fn publish_status(
     publisher: &StreamPublisher<OrderBookProtocol>,
     status: OrderBookStatus,
@@ -881,13 +641,6 @@ async fn publish_status(
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -927,11 +680,6 @@ mod tests {
 
     type SetupReceiver = oneshot::Receiver<Result<FakeSubscription, MarketError>>;
 
-    /// One thing a fake venue publishes.
-    ///
-    /// The two are kept apart because a venue publishes them differently: a
-    /// snapshot is what a fetch answers with, and an update is what the stream
-    /// pushes.
     enum FakeEvent {
         Book(ListingOrderBook),
         Live(Result<ListingOrderBookUpdate, MarketError>),
@@ -1044,9 +792,6 @@ mod tests {
                     Ok(update) => update,
                     Err(error) => return Some(Err(error.into())),
                 };
-                // Which updates a book accepts is the service's own rule, so the
-                // fake applies them through the same decision the real
-                // subscription does.
                 match apply_live_update(&mut self.book, update, self.maximum_levels) {
                     Ok(Applied::Unchanged) => {}
                     Ok(Applied::Changed) => return Some(Ok(())),
@@ -1125,7 +870,6 @@ mod tests {
         }
     }
 
-    /// One listing of the fixture venue.
     fn listing(base: &str) -> VenueListingKey {
         market_participants_connector::catalog::test_support::listing_key(
             &market_participants_connector::catalog::test_support::spot_route(),
@@ -1147,8 +891,6 @@ mod tests {
         }
     }
 
-    /// The book of one native-watermark venue, which numbers its book by its own
-    /// timestamp.
     fn native_book(sequence: &str, levels: usize) -> ListingOrderBook {
         ListingOrderBook {
             listing: listing("BTC"),
@@ -1188,8 +930,6 @@ mod tests {
         }
     }
 
-    /// A whole book published on the live stream, which is all a venue without
-    /// numeric counters ever publishes.
     fn complete_update(
         sequence: MarketSequence,
         bids: Vec<ListingOrderBookLevel>,
@@ -1253,10 +993,6 @@ mod tests {
         assert_eq!(current, original);
     }
 
-    /// Binance's spot stream publishes no `pu`, so there the ranges are all there
-    /// is to go on and a hole between them is a hole in the book. A hole is not a
-    /// stopped stream: the book is replaced by a whole snapshot instead, which is
-    /// what `NeedsSnapshot` asks the subscription for.
     #[test]
     fn a_range_that_leaves_a_hole_should_ask_for_a_whole_snapshot() {
         let mut current = book(10, 2);
@@ -1287,8 +1023,6 @@ mod tests {
         assert_eq!(current.bids.len(), 2);
     }
 
-    /// A venue removes a price level by publishing it with quantity zero, so the
-    /// book drops the level instead of holding a row nothing is behind.
     #[test]
     fn a_zero_quantity_update_should_remove_the_price_level() {
         let mut current = book(10, 2);
@@ -1310,9 +1044,6 @@ mod tests {
         );
     }
 
-    /// The futures stream names the update it follows and its ranges begin well
-    /// after it: a live probe of the BTCUSDT perpetual showed every event starting
-    /// over a hundred ids past `pu`, which is why the range itself is not compared.
     #[test]
     fn a_futures_range_should_follow_the_update_it_names() {
         let mut current = book(905, 1);
@@ -1342,9 +1073,6 @@ mod tests {
         assert_eq!(current.sequence, MarketSequence::Numeric(905));
     }
 
-    /// A venue that numbers its book by its own timestamp has no arithmetic to
-    /// order an increment by, so an increment is never replayed: only the whole
-    /// snapshots it publishes are.
     #[test]
     fn a_native_increment_should_never_be_replayed_as_an_increment() {
         let mut current = native_book("1000", 1);
@@ -1382,8 +1110,6 @@ mod tests {
         assert!(current.asks.is_empty(), "a snapshot replaces both sides");
     }
 
-    /// Sequences of different representations are not comparable, which only a
-    /// whole snapshot can bridge.
     #[test]
     fn an_update_numbered_differently_should_ask_for_a_whole_snapshot() {
         let mut current = book(10, 1);
@@ -1417,8 +1143,6 @@ mod tests {
         assert_eq!(current.asks[0].price.value, Price::from(101_u64));
     }
 
-    /// Buffers the updates the way `synchronize` does, so a merge test writes the
-    /// same shape the subscription hands over.
     fn buffered(
         deltas: impl IntoIterator<Item = ListingOrderBookUpdate>,
     ) -> VecDeque<ListingOrderBookUpdate> {
@@ -1441,9 +1165,6 @@ mod tests {
         assert_eq!(current.bids.len(), 2);
     }
 
-    /// The boundary update of Binance's futures stream may end exactly at the
-    /// snapshot's sequence, which is an update the snapshot was taken after: it
-    /// contributes nothing and the update after it continues the book.
     #[test]
     fn an_update_ending_at_the_snapshot_should_contribute_nothing() {
         let mut current = book(10, 1);
@@ -1474,8 +1195,6 @@ mod tests {
         assert_eq!(current.bids.len(), 2);
     }
 
-    /// A snapshot newer than everything buffered is not a problem: the update
-    /// that continues it has not been published yet.
     #[test]
     fn a_snapshot_newer_than_every_buffered_update_should_wait_for_the_next_one() {
         let mut current = book(20, 1);
@@ -1492,10 +1211,6 @@ mod tests {
         assert_eq!(current.sequence, MarketSequence::Numeric(20));
     }
 
-    /// This is the case Binance's futures stream produced in practice: its REST
-    /// book was served from behind the updates the subscription had already
-    /// buffered, so the oldest update left started past the snapshot and nothing
-    /// could bridge the two.
     #[test]
     fn a_snapshot_the_updates_have_already_passed_should_ask_for_another_one() {
         let mut current = book(905, 1);
@@ -1523,8 +1238,6 @@ mod tests {
         );
     }
 
-    /// A buffered increment the snapshot cannot be continued with is not one book
-    /// either: a fresher snapshot is what the situation calls for.
     #[test]
     fn a_gap_after_the_boundary_should_ask_for_another_snapshot() {
         let mut current = book(10, 1);
@@ -1571,7 +1284,6 @@ mod tests {
         .expect("subscription attempts should start");
     }
 
-    /// Reads the reliable stream until the expected status arrives.
     async fn receive_status(
         reliable: &mut widget::stream::ReliableStream<OrderBookProtocol>,
         expected: OrderBookStatus,
@@ -1589,7 +1301,6 @@ mod tests {
         }
     }
 
-    /// Reads the reliable stream until the expected error arrives.
     async fn receive_error(
         reliable: &mut widget::stream::ReliableStream<OrderBookProtocol>,
         expected: OrderBookStreamError,
@@ -1650,9 +1361,6 @@ mod tests {
             .await
             .unwrap();
 
-        // The first subscription was still waiting for its venue to answer, and
-        // the scope that replaced it drops that wait rather than leaving it to
-        // finish into a stream nothing will read.
         assert!(first.await.expect("first load task should finish").is_ok());
         tokio::time::timeout(Duration::from_secs(1), first_setup_sender.closed())
             .await
@@ -1668,9 +1376,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// The drawing choices are part of the scope: a grouping the user changed
-    /// while the stream was live is a scope of its own, and the stream that
-    /// describes the previous one is not what the pane is showing.
     #[tokio::test]
     async fn a_changed_grouping_should_start_the_stream_of_the_new_scope() {
         let (first_setup_sender, first_setup) = setup();
@@ -1799,9 +1504,6 @@ mod tests {
         )
         .await;
 
-        // How much of the book the venue is asked for is the one thing the
-        // service decides about depth; the subscription keeps its own book
-        // within that depth, and the model refuses more than it can hold.
         assert_eq!(requested_depths(&source), [7]);
         runtime.shutdown().await;
     }
@@ -1913,8 +1615,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A sequence that skipped a step is answered with a whole snapshot, and the
-    /// service publishes the book it was replaced with.
     #[tokio::test]
     async fn a_gap_in_the_live_stream_should_fall_back_to_a_whole_snapshot() {
         let (setup_sender, setup) = setup();
@@ -1952,8 +1652,6 @@ mod tests {
         assert_eq!(published_revision(&mut latest), MarketSequence::Numeric(1));
         assert_eq!(synchronizations.load(Ordering::Acquire), 1);
 
-        // A ten-step jump is not something an increment can carry, and the venue
-        // is asked for its whole book again instead of the stream stopping.
         events
             .send(FakeEvent::Live(Ok(delta(
                 30,
@@ -2061,8 +1759,6 @@ mod tests {
         latest.changed().await.unwrap();
         assert_eq!(published_revision(&mut latest), MarketSequence::Numeric(1));
 
-        // Nothing is batched in time: each accepted update is published as it
-        // arrives, and the channel keeps only what has not been read yet.
         for sequence in 2..=4 {
             events
                 .send(FakeEvent::Live(Ok(complete_update(
@@ -2243,8 +1939,6 @@ mod tests {
             .expect("shutdown should cancel the blocked reliable publish");
     }
 
-    /// A source whose opening seam reports what a catalog that could not be
-    /// fetched reports.
     #[derive(Clone)]
     struct UnresolvableSource {
         failure: MarketError,
@@ -2262,10 +1956,6 @@ mod tests {
         }
     }
 
-    /// The seam fails with whatever the route's catalog failed with — a fetch that
-    /// never completed, a venue that refused, a catalog that would not decode. That
-    /// failure is what the book is told about, never a symbol resolution failure the
-    /// old, catalog-free lookup produced.
     #[tokio::test]
     async fn a_catalog_failure_on_the_opening_seam_should_be_reported_as_itself() {
         let failure = MarketError::CatalogSource(SourceError::Network {

@@ -1,38 +1,3 @@
-//! The Ethereum wallet protocol, its background service, and the seams a test drives it through.
-//!
-//! # One account, two things a pane does with it
-//!
-//! A pane showing this widget follows the transfers its monitored addresses make, and it
-//! manages the list of addresses being watched. Both belong to the same account and both
-//! are answered with the same session — the transfer stream is subscribed with it and
-//! every change to the list is sent with it — so one service owns both and one run loop
-//! serializes them. A separate service for the dialog would take a second session for the
-//! same account and hold it after the dialog closed.
-//!
-//! # The session is the service's, the list is the pane's
-//!
-//! Nothing about the addresses is kept here. The list a pane shows is the last answer it
-//! was given, and the projection of a confirmed change is [`SelectionData`]'s, so the only
-//! thing this service knows about an account is which session it holds for it. What it
-//! does own is the *session*: a change is only made through the session the stream was
-//! opened with, which is what keeps a dialog acting on an account the pane has left from
-//! changing anything — such a request is refused with the session it disagrees with.
-//!
-//! # Readiness
-//!
-//! `Ready` means the subscription is live, and the transfers are published before it:
-//! being live is what makes the transfers already on the wire the pane's content,
-//! including none at all. A subscription that never came up publishes why instead, and
-//! the pane reads the addresses through the session the service still holds.
-//!
-//! # Transfers are account data
-//!
-//! A transfer names two Ethereum wallets and an amount, and which of them an Ethereum wallet is watching is
-//! the account's business. A transfer that was already on the wire when the credentials
-//! behind the subscription changed therefore belongs to an account the pane is no longer
-//! reading as, and is dropped rather than shown: the subscription's own status is what
-//! says so, and it is checked before a transfer is converted.
-
 use std::future::Future;
 
 use kytrix_service_provider::service::{
@@ -58,56 +23,37 @@ use widget::{
 
 use super::model::{SelectionData, TransferSnapshot, TransferState};
 
-/// What a pane asks its service to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum EthereumWalletRequest {
-    /// Follows an account's transfers, keeping the stream that already follows it.
     Load(EthereumWalletScope),
-    /// Reopens an account's stream, for one whose stream has failed.
     Retry(EthereumWalletScope),
-    /// Follows nothing, because nobody is signed in.
     Stop,
-    /// Reads the addresses the account monitors.
     FetchSelections(EthereumWalletScope),
-    /// Monitors one more address.
     AddSelection {
         scope: EthereumWalletScope,
         address: SmolStr,
     },
-    /// Stops monitoring one address.
     DeleteSelection {
         scope: EthereumWalletScope,
         address: SmolStr,
     },
 }
 
-/// What the service answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum EthereumWalletResponse {
-    /// The account's stream is running.
     StreamStarted,
-    /// Nothing is followed.
     Stopped,
-    /// The addresses the account monitors.
     Selections(SelectionData),
-    /// What became of an address the pane asked to monitor.
     Added(EthereumWalletMutationOutcome<EthereumWalletSelection>),
-    /// What became of an address the pane asked to stop monitoring.
     Deleted(EthereumWalletMutationOutcome<()>),
 }
 
-/// The account whose transfers a stream carries.
-///
-/// Every request names one, including the ones that change the address list: the pane's
-/// account can change while a dialog is still open, and an answer about the account the
-/// pane has left is not one the pane may act on.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct EthereumWalletScope {
     account_id: SmolStr,
 }
 
 impl EthereumWalletScope {
-    /// The scope an account follows, or `None` when nobody is signed in.
     pub(super) fn new(account_id: Option<&SmolStr>) -> Option<Self> {
         let account_id = account_id.filter(|account_id| !account_id.is_empty())?;
         Some(Self {
@@ -120,21 +66,15 @@ impl EthereumWalletScope {
     }
 }
 
-/// What a subscription the pane holds is doing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum EthereumWalletStatus {
-    /// The subscription is being established.
     Connecting,
-    /// The subscription is live.
     Ready,
-    /// The subscription ended; the pane is finished until the user recovers it.
     Failed(EthereumWalletStreamError),
 }
 
-/// Why a subscription stopped, or why it never started.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum EthereumWalletStreamError {
-    /// The account's session could not be taken, or the subscription was refused.
     Service(KytrixServiceError),
     Transport(TransportError),
 }
@@ -148,11 +88,9 @@ impl TranslatedError for EthereumWalletStreamError {
     }
 }
 
-/// One message of an account's stream.
 #[derive(Clone, Debug)]
 pub(super) enum EthereumWalletStreamMessage {
     Status(EthereumWalletStatus),
-    /// Every transfer the subscription retains, newest first.
     Snapshot(TransferSnapshot),
 }
 
@@ -166,27 +104,18 @@ impl WidgetProtocol for EthereumWalletProtocol {
     type Error = EthereumWalletApiError;
 }
 
-/// The Ethereum wallet an account reads through.
-///
-/// The service is written against this seam rather than against the connector, so a test
-/// can drive every state a session and a subscription can be in without one.
 pub(super) trait EthereumWalletSource: Clone + Send + Sync + 'static {
     type Session: EthereumWalletSession;
 
-    /// Takes the account's session, which answers both the stream and every request the
-    /// pane makes about the addresses it monitors.
     fn acquire_session(
         &self,
         account_id: &str,
     ) -> impl Future<Output = Result<Self::Session, KytrixServiceError>> + Send;
 }
 
-/// One account's session.
 pub(super) trait EthereumWalletSession: Clone + Send + Sync + 'static {
     type Subscription: EthereumWalletEventSubscription;
 
-    /// The account this session is for, which is what a stream keyed by another one is
-    /// checked against.
     fn account_id(&self) -> &str;
 
     fn subscribe_ethereum_wallet(
@@ -208,7 +137,6 @@ pub(super) trait EthereumWalletSession: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = EthereumWalletMutationOutcome<()>> + Send;
 }
 
-/// One live transfer subscription.
 pub(super) trait EthereumWalletEventSubscription: Send + 'static {
     fn observe_status(&self) -> watch::Receiver<SubscriptionStatus>;
 
@@ -264,7 +192,6 @@ impl EthereumWalletEventSubscription for Subscription<EthereumWalletTransfer> {
     }
 }
 
-/// The service that follows one pane's Ethereum wallet.
 pub(super) struct EthereumWalletService<S = KytrixServiceConnector> {
     source: S,
 }
@@ -275,7 +202,6 @@ impl<S> EthereumWalletService<S> {
     }
 }
 
-/// The session the account a stream belongs to is answered with.
 struct ActiveSession<S> {
     scope: EthereumWalletScope,
     session: S,
@@ -310,11 +236,6 @@ where
                         continue;
                     }
 
-                    // A stream the service is already holding for this account is the one
-                    // that was asked for: what the pane is waiting for is the account, and
-                    // nothing about the stream changes. A retry is the caller saying the
-                    // stream it has is not one it wants, so it is replaced even when the
-                    // account behind it is the same.
                     if !retry
                         && active.as_ref().is_some_and(|active| active.scope == scope)
                         && context.stream_generation(&scope).is_some()
@@ -336,10 +257,6 @@ where
                             }
                         },
                     };
-                    // The stream is keyed by the account the pane asked for, so a session
-                    // that turned out to be for another one is answered rather than
-                    // streamed: a transfer is not data a pane may show under a name it
-                    // does not belong to.
                     if session.account_id() != scope.account_id() {
                         let _ = reply.respond(Err(EthereumWalletApiError::AccountChanged));
                         continue;
@@ -360,9 +277,6 @@ where
                         .respond(Ok(EthereumWalletResponse::StreamStarted))
                         .is_err()
                     {
-                        // Nobody is waiting for this stream any more, so it is nobody's
-                        // stream: a pane that went away must not leave a subscription
-                        // holding an account it is not reading.
                         context.cancel_stream(&scope);
                         active = None;
                     }
@@ -404,10 +318,6 @@ where
                     tokio::pin!(add);
                     let outcome = tokio::select! {
                         biased;
-                        // A caller that went away takes its question with it. The change
-                        // may or may not have been made, and nothing here decides which:
-                        // the pane reads the list again instead of guessing, and this
-                        // service holds no list that could be guessed wrong.
                         () = reply.cancelled() => continue,
                         outcome = &mut add => outcome,
                     };
@@ -435,12 +345,6 @@ where
     }
 }
 
-/// The session a request about the addresses is answered with.
-///
-/// A request that names an account the service is not holding is refused with what is
-/// wrong rather than answered from another account's session: not holding one at all is a
-/// pane that asked too early, and holding a different one is a pane whose account changed
-/// under it.
 fn matching_session<'a, S>(
     active: &'a Option<ActiveSession<S>>,
     scope: &EthereumWalletScope,
@@ -454,11 +358,6 @@ fn matching_session<'a, S>(
     Ok(&active.session)
 }
 
-/// What a session that could not be taken means to the request that asked for it.
-///
-/// The four that name a condition of their own are named as themselves: an expired login,
-/// a changed account, a timeout and a closed service all read differently to a user than
-/// a service error does.
 fn session_failure(error: KytrixServiceError) -> EthereumWalletApiError {
     match error {
         KytrixServiceError::Authentication(_) => EthereumWalletApiError::Authentication,
@@ -469,7 +368,6 @@ fn session_failure(error: KytrixServiceError) -> EthereumWalletApiError {
     }
 }
 
-/// Runs the account's subscription.
 async fn run_stream<S>(session: S, publisher: StreamPublisher<EthereumWalletProtocol>)
 where
     S: EthereumWalletSession,
@@ -499,8 +397,6 @@ where
     let mut state = TransferState::new();
     let mut feed_published = false;
 
-    // A subscription can already be live before its first change, so where it is now is
-    // where the stream starts.
     let current = status.borrow_and_update().clone();
     if !apply_subscription_status(
         &publisher,
@@ -537,14 +433,9 @@ where
                 }
             }
             event = subscription.recv() => {
-                // A replaced stream is a stream whose account nobody is reading any
-                // more, so what it delivers is not converted either.
                 if publisher.is_cancelled() {
                     return;
                 }
-                // A transfer already on the wire belongs to the credentials the
-                // subscription was opened with. If those are gone, so is the pane's
-                // standing to read it, and the subscription's own status is what says so.
                 let current = status.borrow_and_update().clone();
                 if let Some(error) = ended_subscription(&current) {
                     publish_failure(&publisher, error).await;
@@ -572,10 +463,6 @@ where
     }
 }
 
-/// Applies one subscription status, publishing what it means to the pane.
-///
-/// Returns whether the stream may keep running: a status that ended it has already
-/// published why, and the task settles on the pane that will replace it.
 async fn apply_subscription_status(
     publisher: &StreamPublisher<EthereumWalletProtocol>,
     status: &SubscriptionStatus,
@@ -589,8 +476,6 @@ async fn apply_subscription_status(
     }
 
     match status {
-        // A closing subscription is on its way to a terminal status of its own, and that
-        // is where the failure is reported from.
         SubscriptionStatus::Closing => true,
         SubscriptionStatus::Connecting | SubscriptionStatus::Reconnecting => {
             publish_change(publisher, EthereumWalletStatus::Connecting, published)
@@ -598,9 +483,6 @@ async fn apply_subscription_status(
                 .is_ok()
         }
         SubscriptionStatus::Active => {
-            // The transfers are published with the readiness they come with, once: a pane
-            // that becomes ready holds what the subscription holds, and a reconnect does
-            // not make the transfers the pane already has new again.
             if !*feed_published {
                 if publisher
                     .publish_latest(EthereumWalletStreamMessage::Snapshot(state.snapshot()))
@@ -614,12 +496,10 @@ async fn apply_subscription_status(
                 .await
                 .is_ok()
         }
-        // Handled above, where the failure they carry is published.
         SubscriptionStatus::Closed | SubscriptionStatus::Failed(_) => false,
     }
 }
 
-/// Why a subscription is no longer one a transfer may be read from.
 fn ended_subscription(status: &SubscriptionStatus) -> Option<EthereumWalletStreamError> {
     match status {
         SubscriptionStatus::Closed => {
@@ -635,7 +515,6 @@ fn ended_subscription(status: &SubscriptionStatus) -> Option<EthereumWalletStrea
     }
 }
 
-/// Publishes a status the pane has not been told yet.
 async fn publish_status(
     publisher: &StreamPublisher<EthereumWalletProtocol>,
     status: EthereumWalletStatus,
@@ -645,7 +524,6 @@ async fn publish_status(
         .await
 }
 
-/// Publishes a status change, if it is one.
 async fn publish_change(
     publisher: &StreamPublisher<EthereumWalletProtocol>,
     status: EthereumWalletStatus,
@@ -659,12 +537,6 @@ async fn publish_change(
     Ok(())
 }
 
-/// Publishes the failure a stream ended with, and holds the account it took.
-///
-/// A terminal failure is not retried: the pane asks for a new stream when the user takes
-/// the recovery, and until then this task stays where it is so the framework still sees
-/// the account as taken — and so the addresses the account monitors can still be read
-/// and changed, which is the other half of what the session was taken for.
 async fn publish_failure(
     publisher: &StreamPublisher<EthereumWalletProtocol>,
     error: EthereumWalletStreamError,
@@ -676,13 +548,6 @@ async fn publish_failure(
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -839,7 +704,6 @@ mod tests {
             .collect()
     }
 
-    /// A running service with one account taken and its subscription live.
     async fn live(
         source: &FakeSource,
     ) -> (
@@ -864,9 +728,6 @@ mod tests {
         let (runtime, mut reliable, mut latest) = live(&source).await;
 
         receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
-        // Readiness describes the transfers that came with it, not a feed still on its
-        // way: by the time the pane is told the subscription is live, the feed is on the
-        // stream.
         let live = latest
             .next_unseen()
             .expect("a live feed is published with the readiness it comes with");
@@ -1000,9 +861,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// An Ethereum wallet transfer names the Ethereum wallets an account is watching, so one that was already
-    /// on the wire when the credentials behind the subscription changed is not data the
-    /// pane may be shown: the subscription's own status is checked before it is converted.
     #[tokio::test]
     async fn a_transfer_that_arrived_after_the_credentials_changed_should_not_be_published() {
         let source = FakeSource::default();
@@ -1010,8 +868,6 @@ mod tests {
         let control = session.subscribe();
         let (runtime, mut reliable, mut latest) = live(&source).await;
         receive_status(&mut reliable, EthereumWalletStatus::Ready).await;
-        // The empty feed a live subscription publishes is read before the stale transfer
-        // is sent, so what is left on the latest stream is only what came after it.
         let _ = next_feed(&mut latest, |snapshot| snapshot.items().is_empty()).await;
 
         control
@@ -1019,8 +875,6 @@ mod tests {
             .send(Ok(transfer("stale", 9)))
             .await
             .expect("the transfer should reach the subscription");
-        // The credentials change as the transfer is handed over, which is what puts the two
-        // on the wire together rather than one after the other.
         control.fail_on_delivery(TransportError::CredentialChanged);
 
         assert_eq!(
@@ -1303,9 +1157,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A change whose caller went away is dropped rather than decided: whether it was
-    /// made is something the service cannot know, and it holds no list that could be
-    /// guessed wrong. What it must not do is stay stuck on the question.
     #[tokio::test]
     async fn a_change_the_caller_gave_up_on_should_leave_the_service_answering() {
         let source = FakeSource::default();
@@ -1364,7 +1215,6 @@ mod tests {
             "a subscription nobody waited for is never asked for"
         );
 
-        // The service is free again, and the account can be taken by the next request.
         load(&runtime, scope()).await;
         assert_eq!(source.sessions(), 2);
         runtime.shutdown().await;

@@ -159,8 +159,6 @@ pub struct BinanceOrderResult {
 mod tests {
     use super::{BinanceErrorResponse, BinanceSubscriptionArgs};
 
-    /// The subscription frame the venue expects is asserted rather than derived:
-    /// Binance rejects a stream name that is not a bare string.
     #[test]
     fn a_subscription_frame_carries_the_stream_names_and_the_request_id() {
         let args = BinanceSubscriptionArgs {
@@ -176,7 +174,6 @@ mod tests {
         );
     }
 
-    /// The venue's error body is the code and message it sent, verbatim.
     #[test]
     fn an_error_response_keeps_the_venue_code_and_message() {
         let error: BinanceErrorResponse =

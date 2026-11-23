@@ -1,25 +1,3 @@
-//! `TextContext`：进程级字体库 + 布局 scratch + 字体栈 + 形状缓存 + 诊断（§6）。
-//!
-//! **crate 私有**（F-54）：它持有 `parley::{FontContext, LayoutContext}`，公开即把 parley 拉进公开面。
-//! 应用层的入口是 `App::{set_font_stack, font_stack, font_stack_version, reload_system_fonts, refresh_text,
-//! text_diagnostics}`。
-//!
-//! # 字体栈解析只做一次（R12-2 / R12-3）
-//!
-//! 字体栈的健康状态与「parley 家族列表」**只依赖字体栈 + 系统字体集合**，与文本/字号/样式无关。
-//! 旧实现在**每次形态缓存 miss**（= 每次字符串变化）时重建 `Vec<&str>`、跑一次 fontique 查询
-//! （`set_families` + `first_available_font`，14 次家族查表 + 字体元数据加载），而解析结果被丢弃。
-//! 现在：
-//!
-//! - 状态**懒求值一次**并缓存（`font_stack_status`，换栈/重载系统字体时置空）；
-//! - 家族列表是**真缓存**（`family_list` / `custom_family_lists`）：命中路径只做一次
-//!   `FontFamily::clone`（parley 的 `Cow` 深拷贝，API 限制），不再重建 14 个 `String`。
-//!
-//! # 数字快速路径（R12 最重要的性能项）
-//!
-//! [`DigitFastPath`] 在 miss 路径上先尝试「字符 → glyph id → advance」直拼（Blink
-//! `SimpleLineLayout` 模型）；不适用时原样走 parley。命中率计入 `TextPassReport`。
-
 use std::rc::Rc;
 
 use smallvec::SmallVec;
@@ -33,50 +11,30 @@ use super::{
 };
 use crate::paint::color::ColorBrush;
 
-/// 诊断环形缓冲上限。
 const DIAGNOSTIC_LIMIT: usize = 64;
 
-/// 配置期诊断：由配置决定、长期有效（当前只有字体栈）。字形诊断的洪峰不得把它们挤出
-/// 诊断环 —— 否则「字体栈一个候选都没命中」这类启动期问题几帧后就不可观测（D-4）。
 fn is_config_diagnostic(diagnostic: &TextDiagnostic) -> bool {
     matches!(diagnostic, TextDiagnostic::FontStackMiss { .. })
 }
 
-/// 家族名覆盖的缓存条目上限（超过即整表重建：覆盖家族名是极低频配置）。
 const CUSTOM_FAMILY_LIMIT: usize = 16;
 
-/// 省略号字形的缓存上限（每 `TextStyle` 一条）。
 const ELLIPSIS_LIMIT: usize = 64;
 
-/// 文本引擎（字体库 + 形状缓存）。**进程级一份**（`App` 持有，`Window` 不持有）。
 pub(crate) struct TextContext {
     font_cx: parley::FontContext,
     layout_cx: parley::LayoutContext<ColorBrush>,
     font_stack: FontStack,
-    /// 字体栈的**单调**版本（替换栈 / 重载系统字体都 +1；形状缓存键的一部分）。
-    ///
-    /// `FontStack::version` 是**内容**版本，替换栈时会从 1 重新开始，因此不能直接当缓存键。
     font_stack_version: u32,
-    /// `FontStack` 的 parley 载体（**真缓存**：R12-3；换栈/重载系统字体时重建）。
     family_list: parley::FontFamily<'static>,
-    /// 家族名覆盖的 parley 载体缓存（`TextStyle::family` 非 `None` 时用）。
     custom_family_lists: ahash::HashMap<SmolStr, parley::FontFamily<'static>>,
     cache: ShapeCache,
-    /// 数字快速路径（Blink `SimpleLineLayout` 模型）。
     fast: DigitFastPath,
-    /// 省略号字形（R12-9；按 `TextStyle` 的 shaping 输入缓存）。
     ellipsis: ahash::HashMap<u64, Rc<EllipsisGlyphs>>,
-    /// 字体栈状态缓存（`None` = 尚未求值；R12-2）。
     font_stack_status: Option<FontStackStatus>,
-    /// 字体栈状态真正被求值的次数（测试断言「不是每次 miss 都查」）。
     stack_resolutions: u32,
     diagnostics: SmallVec<[TextDiagnostic; 8]>,
-    /// 字体代际（`set_font_stack` / `reload_system_fonts` 时 +1；字形缓存与图集的失效依据，B2）。
     font_epoch: u32,
-    /// 真正跑 `RangedBuilder::build` 的次数（仅测试构建；E24 的缓存断言观测面）。
-    ///
-    /// 生产路径不需要它：节点路径的塑形次数由 `TextPassReport.shaped` 覆盖，Canvas 文本的
-    /// 次数由调用方自己控制。E24 用它断言「同文本换色命中形状缓存、不重复塑形」。
     #[cfg(test)]
     shapes: u32,
 }
@@ -115,9 +73,6 @@ impl TextContext {
         self.font_epoch
     }
 
-    /// 换字体栈：版本 +1、字体代际 +1、清形状缓存 / 家族载体 / 快速路径表 / 省略号缓存。
-    ///
-    /// 返回**新**的 `font_stack_version`（调用方用它决定是否让所有文本节点失效）。
     pub(crate) fn set_font_stack(&mut self, stack: FontStack) -> u32 {
         self.font_stack = stack;
         self.family_list = shape::family_list(&self.font_stack, None);
@@ -132,12 +87,6 @@ impl TextContext {
         self.font_stack_version
     }
 
-    /// 重载系统字体：**重建 `FontContext`**（R12-12）、字体代际 +1、清全部派生缓存。
-    ///
-    /// fontique 0.12 的 `Collection::load_system_fonts()` 在系统字体已加载后是 **no-op**
-    /// （`collection/mod.rs`：`if self.inner.system.is_none()`），所以「重载」必须换一个新的
-    /// `FontContext` 才会重新枚举系统字体。代价是一次全量扫描（Windows 上 10–80 ms 量级），
-    /// **不要在热路径/每帧调用**。
     pub(crate) fn reload_system_fonts(&mut self) -> u32 {
         self.font_cx = parley::FontContext::new();
         self.family_list = shape::family_list(&self.font_stack, None);
@@ -152,7 +101,6 @@ impl TextContext {
         self.font_stack_version
     }
 
-    /// 数字快速路径开关（回退验证用）：切换后清形状缓存，保证两种模式的快照不混用。
     pub(crate) fn set_digit_fast_path(&mut self, enabled: bool) {
         if self.fast.enabled() == enabled {
             return;
@@ -161,21 +109,14 @@ impl TextContext {
         self.cache.clear();
     }
 
-    /// 数字快速路径是否开启。
     pub(crate) fn digit_fast_path_enabled(&self) -> bool {
         self.fast.enabled()
     }
 
-    /// 取走数字快速路径的统计（`App::refresh_text` 汇总进 `TextPassReport`）。
     pub(crate) fn take_fast_path_stats(&mut self) -> FastPathStats {
         self.fast.take_stats()
     }
 
-    /// 当前字体栈的 parley 家族列表（含家族名覆盖；**缓存**的 `clone`）。
-    ///
-    /// 命中路径的唯一分配就是这次 `FontFamily::clone`：parley 的
-    /// `StyleProperty::FontFamily` 要求 `'static` 持有，`Cow<'static, [_]>` 无法借出，
-    /// 彻底消掉它需要 `StyleRunBuilder` 的样式表（parley 0.12 提供，属后续项）。
     fn family_for(&mut self, custom: Option<&SmolStr>) -> parley::FontFamily<'static> {
         let Some(custom) = custom else {
             return self.family_list.clone();
@@ -192,7 +133,6 @@ impl TextContext {
         list
     }
 
-    /// 形状（命中缓存则复用 `Rc`）。第二个返回值 = 是否命中。
     pub(crate) fn shape_cached(&mut self, content: &TextContent) -> (Rc<ShapedText>, bool) {
         let key = ShapeKey::new(content, self.font_stack_version);
         if let Some(hit) = self.cache.get(&key)
@@ -206,9 +146,6 @@ impl TextContext {
         self.ensure_stack_status();
         let family = self.family_for(content.style.family());
         let font_identity = self.font_identity(content.style.family());
-        // 数字快速路径：先试「字符 → glyph id → advance」直拼（R12 最重要的性能项）。
-        // v2.1 E2：富文本 runs 与文本装饰都不走快速路径（快速路径产出的 ShapedLine 没有
-        // 逐 run 颜色 / 装饰几何；装饰也不是纯数字字形序列的属性）。
         if content.inline_boxes.is_empty()
             && content.runs().is_empty()
             && content.normalized_runs() == 0
@@ -226,7 +163,6 @@ impl TextContext {
             self.cache.insert(key, Rc::clone(&shaped));
             return (shaped, false);
         }
-        // run 的家族覆盖在进入 parley 之前解析（`shape` 不持有 `TextContext`）。
         let run_families: Vec<(core::ops::Range<usize>, parley::FontFamily<'static>)> = content
             .runs()
             .iter()
@@ -252,13 +188,11 @@ impl TextContext {
         (shaped, false)
     }
 
-    /// 真正的 parley 塑形次数（仅测试：E24 断言「换色命中形状缓存、不重复塑形」）。
     #[cfg(test)]
     pub(crate) fn shape_count(&self) -> u32 {
         self.shapes
     }
 
-    /// 该样式的字体栈身份（快速路径验证缓存的键的一部分）。
     fn font_identity(&self, custom: Option<&SmolStr>) -> u64 {
         use core::hash::{Hash, Hasher};
 
@@ -268,10 +202,6 @@ impl TextContext {
         hasher.finish()
     }
 
-    /// 省略号字形（R12-9）：按样式的 shaping 输入缓存。
-    ///
-    /// 省略号必须**参与 shaping**（advance 计入可用宽度）；这里 shape 一次 `…`（字体缺该字形时
-    /// 退成 `...`），把 `(glyph id, advance)` 交给 `ShapedText::rasterize`。
     pub(crate) fn ellipsis_for(&mut self, style: &TextStyle) -> Option<Rc<EllipsisGlyphs>> {
         use core::hash::{Hash, Hasher};
 
@@ -296,18 +226,12 @@ impl TextContext {
         Some(glyphs)
     }
 
-    /// 字体栈的健康状态（N4）：懒求值一次并缓存（R12-2）。
     pub(crate) fn font_stack_status(&mut self) -> FontStackStatus {
         self.ensure_stack_status();
         self.font_stack_status
             .expect("ensure_stack_status always fills the cache")
     }
 
-    /// 求值一次字体栈状态（每栈版本一次），并（若不健康）**每次使用都重压**那条配置诊断。
-    ///
-    /// 配置期诊断是「一次配置、长期有效」的：重压 + 去重（移到最新）保证它不会因为后续字形
-    /// 诊断的洪峰而在诊断环里丢掉「最近诊断」的位置（D-4）。状态求值本身仍然每版本只跑一次
-    /// （`stack_resolutions` 的断言不变）。
     fn ensure_stack_status(&mut self) {
         let status = match self.font_stack_status {
             Some(status) => status,
@@ -333,7 +257,6 @@ impl TextContext {
         }]);
     }
 
-    /// 真正跑一次 fontique 查询（**只在**字体栈版本变化后的首次使用时调用）。
     fn evaluate_stack_status(&mut self) -> FontStackStatus {
         if self.font_stack.families().len() == 0 {
             return FontStackStatus::EmptyStack;
@@ -355,14 +278,6 @@ impl TextContext {
         &self.diagnostics
     }
 
-    /// 追加诊断：同一诊断在窗口内**只保留一条**（重复时移到最新），环仍有界（`DIAGNOSTIC_LIMIT`）。
-    ///
-    /// 「同一诊断」= [`TextDiagnostic`] 逐字段相等（kind + font/glyph/text_range/宽度…）。没有
-    /// 去重时，每轮重排都会把同样的 `MissingGlyph`/`ColorGlyphMonochrome` 再压一遍，64 条环
-    /// 几帧就被同类条目占满、启动期的 `FontStackMiss` 被挤出去（D-4）。
-    ///
-    /// 配置期诊断（[`TextDiagnostic::FontStackMiss`]）**常驻**：环满时优先淘汰最旧的非配置
-    /// 诊断，字体栈问题不会因字形诊断洪峰而消失。
     pub(crate) fn push_diagnostics(&mut self, mut extra: Vec<TextDiagnostic>) {
         if extra.is_empty() {
             return;
@@ -373,7 +288,6 @@ impl TextContext {
                 .iter()
                 .position(|existing| *existing == diagnostic)
             {
-                // 去重 + 移到最新：同一诊断只出现一次，语义上随最近一次使用刷新。
                 self.diagnostics.remove(index);
             } else if self.diagnostics.len() == DIAGNOSTIC_LIMIT {
                 self.evict_oldest_diagnostic();
@@ -382,10 +296,6 @@ impl TextContext {
         }
     }
 
-    /// 淘汰最旧的**非配置期**诊断；全是配置期诊断时（理论上不存在）退化为丢最旧。
-    ///
-    /// `n <= DIAGNOSTIC_LIMIT` 的冷路径：线性扫描比维护 `HashSet` 索引更简单，而
-    /// `TextDiagnostic` 含 `f32` 字段，做 `Hash/Eq` 反而要手写位级实现。
     fn evict_oldest_diagnostic(&mut self) {
         let Some(index) = self
             .diagnostics
@@ -402,25 +312,21 @@ impl TextContext {
         self.diagnostics.clear();
     }
 
-    /// 仅测试：形状缓存条目数。
     #[cfg(test)]
     pub(crate) fn cached_shapes(&self) -> usize {
         self.cache.len()
     }
 
-    /// 仅测试：形状缓存字节估算。
     #[cfg(test)]
     pub(crate) fn cached_bytes(&self) -> usize {
         self.cache.bytes()
     }
 
-    /// 仅测试：字体栈状态被真正求值的次数（R12-2 的「不是每次 miss 都查」断言）。
     #[cfg(test)]
     pub(crate) fn stack_resolutions(&self) -> u32 {
         self.stack_resolutions
     }
 
-    /// 仅测试：系统字体家族数（0 = 宿主没有可用字体，测试应 skip）。
     #[cfg(test)]
     pub(crate) fn family_count(&mut self) -> usize {
         self.font_cx.collection.family_names().count()
@@ -487,10 +393,6 @@ mod tests {
         assert_eq!(context.cached_shapes(), 2);
     }
 
-    /// R12-4：`scale` 不再是形状缓存键的一部分 —— DPI 变化不清形状缓存。
-    ///
-    /// 旧实现把 `scale_bits` 写进 `ShapeKey`，跨显示器拖动等于清空整个形状缓存 + 图集 +
-    /// 整页重传。现在布局是逻辑坐标，scale 只在光栅期乘进去。
     #[test]
     fn scale_is_not_part_of_the_shape_key() {
         use crate::text::cache::ShapeKey;
@@ -501,7 +403,6 @@ mod tests {
             ShapeKey::new(&content, 1),
             "same content + stack version ⇒ same key"
         );
-        // 形状缓存命中与设备 scale 无关：同一个上下文连续取两次必须命中（不存在 scale 入参）。
         let mut context = TextContext::new();
         if context.family_count() == 0 {
             eprintln!("skip: no system fonts");
@@ -512,7 +413,6 @@ mod tests {
         assert!(hit);
     }
 
-    /// R12-11：`color` / `alignment` 不进形状缓存键 —— 红/绿两态共享同一份快照。
     #[test]
     fn color_and_alignment_share_one_shape_snapshot() {
         use crate::{paint::color::Color, text::TextAlign};
@@ -555,7 +455,6 @@ mod tests {
         assert_eq!(context.cached_shapes(), 1);
     }
 
-    /// R12-2：字体栈解析不是「每次 miss 都查一次」—— 只在首次 / 换栈 / 重载后求值。
     #[test]
     fn font_stack_is_resolved_once_per_version() {
         let mut context = TextContext::new();
@@ -602,11 +501,6 @@ mod tests {
         );
     }
 
-    /// R12-12：`reload_system_fonts` 必须真的重建字体集合（不是 no-op）。
-    ///
-    /// fontique 的 `Collection::load_system_fonts()` 在已加载后不做任何事，因此实现换成
-    /// 「新建 `FontContext`」。可观测证据：系统字体家族数在新上下文里仍然 > 0，且字体代际与
-    /// 栈版本都前进（派生缓存全部失效）。
     #[test]
     fn reload_system_fonts_really_reloads() {
         let mut context = TextContext::new();
@@ -671,7 +565,6 @@ mod tests {
             context.diagnostics().last(),
             Some(TextDiagnostic::InlineBoxOffBoundary { id, .. }) if *id as usize == super::DIAGNOSTIC_LIMIT + 9
         ));
-        // 超出上限的 10 条是最旧的：环里应剩 id 10..=73（逐条不同 ⇒ 去重不改变本测试语义）。
         assert!(matches!(
             context.diagnostics().first(),
             Some(TextDiagnostic::InlineBoxOffBoundary { id, .. }) if *id as usize == 10
@@ -680,8 +573,6 @@ mod tests {
         assert!(context.diagnostics().is_empty());
     }
 
-    /// D-4：同一诊断（kind + font + glyph + text_range）在窗口内**只出现一次**；重复压入只把
-    /// 它移到最新，环不增长。
     #[test]
     fn diagnostics_are_deduped() {
         let mut context = TextContext::new();
@@ -719,7 +610,6 @@ mod tests {
         );
     }
 
-    /// D-4：配置期诊断（字体栈）不被字形诊断洪峰淹没，且诊断环仍然有界（<= 64）。
     #[test]
     fn font_stack_miss_survives_a_flood_of_glyph_diagnostics() {
         let mut context = TextContext::new();
@@ -757,13 +647,11 @@ mod tests {
         );
     }
 
-    /// D-4：字体栈不健康时，每次走 shape/refresh 路径都**重压**那条配置诊断 ⇒ 它始终位于
-    /// 最新位置；去重保证不会出现第二条。
     #[test]
     fn unhealthy_font_stack_repushes_its_diagnostic() {
         let mut context = TextContext::new();
         context.set_font_stack(FontStack::new(Vec::<&str>::new()));
-        let _ = context.font_stack_status(); // 首次求值 + 压一条
+        let _ = context.font_stack_status();
         context.push_diagnostics(vec![
             TextDiagnostic::InlineBoxOffBoundary { id: 7, index: 3 },
             TextDiagnostic::InlineBoxOffBoundary { id: 8, index: 5 },
@@ -807,7 +695,6 @@ mod tests {
         );
     }
 
-    /// 快速路径开关：关闭后清形状缓存并回到 parley；重新打开再清一次。
     #[test]
     fn digit_fast_path_switch_clears_the_cache() {
         let mut context = TextContext::new();

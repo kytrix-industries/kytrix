@@ -1,16 +1,3 @@
-//! The dialogs the shell opens: the startup notice, and the workspace naming alerts.
-//!
-//! Every dialog is a kit dialog built on the application's one layer stack and animation
-//! router, opened on demand and driven by this host once per frame. The host owns the
-//! handles so a dialog's fade-out is synchronized until it has finished, and releases a
-//! dialog's nodes and signal scope once it is closed — opening and closing alerts therefore
-//! does not accumulate components.
-//!
-//! # Input alerts
-//!
-//! The workspace list asks for a name in an alert with one field. The field's state is
-//! minted in a signal scope the dialog owns and released with it, not kept process-wide.
-
 use std::rc::Rc;
 
 use base_ui::{
@@ -32,13 +19,10 @@ use ui_core::{
 use super::ui;
 use crate::composition::Composition;
 
-/// The dialogs one window has open.
 pub(crate) struct Dialogs {
     window: WindowId,
     theme: ThemeHandle,
-    /// The open dialogs and the scopes their input fields were minted in.
     open: Vec<OpenDialog>,
-    /// How many dialogs have been opened (their keys must not repeat).
     opened: u64,
 }
 
@@ -47,7 +31,6 @@ struct OpenDialog {
     scope: Option<SignalScope>,
 }
 
-/// What an alert that asks for a decision says.
 pub(crate) struct AlertCopy {
     pub title: SmolStr,
     pub message: SmolStr,
@@ -55,7 +38,6 @@ pub(crate) struct AlertCopy {
     pub cancel: SmolStr,
 }
 
-/// What a naming alert asks for.
 pub(crate) struct NameAlert {
     pub title: SmolStr,
     pub message: SmolStr,
@@ -66,7 +48,6 @@ pub(crate) struct NameAlert {
 }
 
 impl Dialogs {
-    /// Builds the host over the composition root's theme.
     pub(crate) fn new(window: WindowId, composition: &Composition) -> Self {
         Self {
             window,
@@ -76,14 +57,12 @@ impl Dialogs {
         }
     }
 
-    /// The next dialog's identity.
     fn next_key(&mut self) -> SmolStr {
         let key = format_smolstr!("kytrix.dialog.{}", self.opened);
         self.opened += 1;
         key
     }
 
-    /// Opens an alert with one paragraph and a single confirmation.
     pub(crate) fn alert(
         &mut self,
         app: &mut App,
@@ -113,7 +92,6 @@ impl Dialogs {
         self.open_builder(app, composition, builder, None);
     }
 
-    /// Opens an alert with one paragraph and a confirmation and a cancellation.
     pub(crate) fn alert_with_cancel(
         &mut self,
         app: &mut App,
@@ -148,8 +126,6 @@ impl Dialogs {
         self.open_builder(app, composition, builder, None);
     }
 
-    /// Opens an alert with one input field: `on_confirm` receives what was typed once the
-    /// field passed `validate`.
     pub(crate) fn name_alert(
         &mut self,
         app: &mut App,
@@ -217,7 +193,6 @@ impl Dialogs {
         self.open_builder(app, composition, builder, Some(scope));
     }
 
-    /// Builds and opens one dialogue builder.
     fn open_builder(
         &mut self,
         app: &mut App,
@@ -243,7 +218,6 @@ impl Dialogs {
         self.open.push(OpenDialog { dialog, scope });
     }
 
-    /// Runs one frame of every open dialog, releasing the ones that closed.
     pub(crate) fn sync(&mut self, app: &mut App) {
         let mut index = 0;
         while index < self.open.len() {
@@ -263,7 +237,6 @@ impl Dialogs {
         }
     }
 
-    /// Forwards one platform event to the dialogs' kit controls.
     pub(crate) fn dispatch(&mut self, app: &mut App, event: &Event) {
         for open in &mut self.open {
             if let Some(button) = open.dialog.confirm_button() {
@@ -278,7 +251,6 @@ impl Dialogs {
         }
     }
 
-    /// Releases every dialog.
     pub(crate) fn release(&mut self, app: &mut App) {
         for mut open in std::mem::take(&mut self.open) {
             open.dialog.release(app);

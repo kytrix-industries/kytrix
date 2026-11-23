@@ -27,7 +27,6 @@ use super::{
 };
 use crate::composition::Composition;
 
-/// The window the shell draws.
 pub(crate) struct Shell {
     composition: Rc<Composition>,
     window: WindowId,
@@ -36,18 +35,13 @@ pub(crate) struct Shell {
     pages: Pages,
     workspaces: Workspaces,
     dialogs: Dialogs,
-    /// The queue every control and dialog reports into.
     intents: Rc<RefCell<IntentQueue>>,
-    /// The stage's widget-config dirty flag, checked once per frame.
     stage_dirty: Rc<Cell<bool>>,
-    /// The frame route this shell registered (removed when the window closes).
     route: Option<RouteId>,
-    /// Whether the close path already ran.
     closed: bool,
 }
 
 impl Shell {
-    /// Opens the application's main window and builds the shell into it.
     pub(crate) fn open(app: &mut App, composition: Rc<Composition>) -> Result<Self, EngineError> {
         let theme = composition.theme.clone();
         let appearance = theme.current(app);
@@ -56,7 +50,6 @@ impl Shell {
         Self::open_in(app, composition, window)
     }
 
-    /// Builds the shell into a window the caller already created (the headless host's own).
     pub(crate) fn open_in(
         app: &mut App,
         composition: Rc<Composition>,
@@ -82,8 +75,6 @@ impl Shell {
             Rc::clone(&intents),
             &workspaces,
         )?;
-        // The page column leaves room for the title bar the shell draws over it, so the
-        // window's chrome never covers the page's own controls.
         let page_column = ui::container(
             app,
             window,
@@ -132,28 +123,21 @@ impl Shell {
         })
     }
 
-    /// The workspace list the shell shows.
     #[cfg(test)]
     pub(crate) fn workspaces(&self) -> &Workspaces {
         &self.workspaces
     }
 
-    /// The window the shell draws (the acceptance run drives it).
     #[cfg(feature = "acceptance")]
     pub(crate) const fn window_id(&self) -> WindowId {
         self.window
     }
 
-    /// The page area.
     #[cfg(test)]
     pub(crate) fn pages(&self) -> &Pages {
         &self.pages
     }
 
-    /// Installs the shell as the application's one frame route.
-    ///
-    /// The route owns the shell from here on; a recovered settings file is announced over
-    /// the window that just opened.
     pub(crate) fn install(
         app: &mut App,
         mut shell: Shell,
@@ -188,7 +172,6 @@ impl Shell {
         Ok(shell)
     }
 
-    /// One frame: drain the events and requests, apply them, then synchronize every region.
     fn tick(&mut self, app: &mut App) -> Result<(), EngineError> {
         if app.window(self.window).is_none() || self.closed {
             return Ok(());
@@ -227,7 +210,6 @@ impl Shell {
         Ok(())
     }
 
-    /// Feeds one platform event to the regions that understand it.
     fn handle_event(&mut self, app: &mut App, event: &Event) {
         match event {
             Event::CloseRequested => {
@@ -245,7 +227,6 @@ impl Shell {
         self.dialogs.dispatch(app, event);
     }
 
-    /// Applies one request from a control or a dialog.
     fn apply_intent(&mut self, app: &mut App, intent: Intent) -> Result<(), EngineError> {
         if let Some(control) = intent.window_control() {
             let _ = app.request_window_control(self.window, control);
@@ -278,12 +259,9 @@ impl Shell {
         Ok(())
     }
 
-    /// Shows the workspace called `name`, rebuilding the stage when it changed.
     fn select_workspace(&mut self, app: &mut App, name: &SmolStr) -> Result<(), EngineError> {
         self.persist_stage(app)?;
         if !self.workspaces.select(name) {
-            // A press on the workspace that is already active still asks for the workspace to
-            // be shown: that is how the user comes back from the settings page.
             self.pages.show_workspace(app);
             return Ok(());
         }
@@ -297,7 +275,6 @@ impl Shell {
         Ok(())
     }
 
-    /// Adds a workspace and switches to it.
     fn create_workspace(&mut self, app: &mut App, name: SmolStr) -> Result<(), EngineError> {
         self.persist_stage(app)?;
         if let Err(error) = self.workspaces.add(&name) {
@@ -314,7 +291,6 @@ impl Shell {
         Ok(())
     }
 
-    /// Renames a workspace.
     fn rename_workspace(
         &mut self,
         app: &mut App,
@@ -335,7 +311,6 @@ impl Shell {
         Ok(())
     }
 
-    /// Deletes a workspace; the active one's deletion shows the one that follows it.
     fn delete_workspace(&mut self, app: &mut App, name: &SmolStr) -> Result<(), EngineError> {
         self.persist_stage(app)?;
         let changed = self.workspaces.delete_entry(name);
@@ -350,7 +325,6 @@ impl Shell {
         Ok(())
     }
 
-    /// Rebuilds the stage from the active workspace's stored layout.
     fn rebuild_stage(&mut self, app: &mut App) -> Result<(), EngineError> {
         self.pages.rebuild_stage(
             app,
@@ -363,7 +337,6 @@ impl Shell {
         Ok(())
     }
 
-    /// Asks for the name of a new workspace.
     fn ask_add_workspace(&mut self, app: &mut App) {
         let translate = self.composition.translate.clone();
         let suggested = self.workspaces.suggested_name(&translate);
@@ -395,7 +368,6 @@ impl Shell {
         );
     }
 
-    /// Asks for the new name of the named workspace.
     fn ask_rename_workspace(&mut self, app: &mut App, name: &SmolStr) {
         let translate = self.composition.translate.clone();
         let taken: Vec<SmolStr> = self
@@ -438,7 +410,6 @@ impl Shell {
         );
     }
 
-    /// Asks whether the named workspace should be deleted.
     fn ask_delete_workspace(&mut self, app: &mut App, name: &SmolStr) {
         let translate = self.composition.translate.clone();
         let title = t_smol!(translate, "window.workspace.delete_title");
@@ -469,7 +440,6 @@ impl Shell {
         );
     }
 
-    /// Reports a settings write the page could not store.
     fn report_write_failure(&mut self, app: &mut App, reason: SmolStr) {
         let translate = self.composition.translate.clone();
         let title = t_smol!(translate, "settings_ui.save_failed.title");
@@ -478,7 +448,6 @@ impl Shell {
             .alert(app, &self.composition, title, reason, confirm, |_| {});
     }
 
-    /// Persists the stage's layout when a widget reported a config change.
     fn persist_stage_if_dirty(&mut self, app: &mut App) -> Result<(), EngineError> {
         if !self.stage_dirty.get() {
             return Ok(());
@@ -487,7 +456,6 @@ impl Shell {
         self.persist_stage(app)
     }
 
-    /// Writes the stage's layout into the active workspace and the settings.
     fn persist_stage(&mut self, app: &mut App) -> Result<(), EngineError> {
         let layout = self.pages.stage().snapshot();
         self.workspaces.set_active_layout(layout);
@@ -498,19 +466,16 @@ impl Shell {
         Ok(())
     }
 
-    /// The title bar (the window's tests assert its drag region).
     #[cfg(test)]
     pub(crate) fn title_bar(&self) -> &TitleBar {
         &self.title_bar
     }
 
-    /// Closes the window the way the close button does (the tests' shutdown).
     #[cfg(test)]
     pub(crate) fn close_for_test(&mut self, app: &mut App) {
         self.close(app);
     }
 
-    /// Releases the shell's regions and closes the window.
     fn close(&mut self, app: &mut App) {
         if self.closed {
             return;
@@ -528,16 +493,11 @@ impl Shell {
     }
 }
 
-/// The main window's options: the application's one window, frameless on Windows (E6).
 pub(crate) fn main_window_options(background: ui_core::paint::color::Color) -> WindowOptions {
     WindowOptions {
         title: SmolStr::new_static("Kytrix"),
         size: Size::new(1280.0, 960.0),
         min_size: Some(Size::new(800.0, 600.0)),
-        // Windows draws no system title bar: this shell's title bar is the chrome (E6).
-        // The other platforms keep their native decoration: macOS's traffic lights are the
-        // native chrome the shell makes room for, and Linux has no equivalent frameless
-        // path this batch supports.
         decorations: if cfg!(target_os = "windows") {
             Decorations::None
         } else {
@@ -548,7 +508,6 @@ pub(crate) fn main_window_options(background: ui_core::paint::color::Color) -> W
     }
 }
 
-/// Checks a candidate workspace name against the names in use.
 fn validate_workspace_name(
     value: &str,
     taken: &[SmolStr],
@@ -568,8 +527,6 @@ fn validate_workspace_name(
 mod tests {
     use super::*;
 
-    /// An empty name is refused with the catalogue's own sentence, and a name in use with a
-    /// different one: the validator is what the alert shows.
     #[test]
     fn the_name_validator_should_report_what_is_wrong() {
         let translate = crate::test_support::translate(i18n::language::codes::LanguageCode::En);

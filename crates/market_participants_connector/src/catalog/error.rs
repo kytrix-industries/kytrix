@@ -1,9 +1,3 @@
-//! The classified failures of the shared catalogue.
-//!
-//! Every failure is a typed value that names the route, listing key, canonical
-//! identity or field it is about, so a caller can decide what to do without
-//! parsing a message. No catalog failure carries a free-form explanation.
-
 use market_participants_model::{
     asset::AssetId,
     error::ModelError,
@@ -24,7 +18,6 @@ use thiserror::Error;
 
 use crate::catalog::{display::types::DisplayError, source::RouteInputRevision};
 
-/// A classified failure while a market-participant adapter is producing a catalog.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SourceError {
     #[error("instrument catalog network request failed: {reason}")]
@@ -48,13 +41,6 @@ pub enum SourceError {
     },
     #[error("instrument catalog configuration failed: {reason}")]
     Configuration { reason: SmolStr },
-    /// The venue's own symbol directory could not be fetched or read.
-    ///
-    /// The source of a catalog is the market participant that publishes the directory, and
-    /// that market participant is not the route whose listings are being read: the venue is
-    /// carried as a typed identity so the message names the market in the reader's
-    /// language instead of spelling the canonical identity into a sentence, and the
-    /// reason stays the diagnostic detail.
     #[error("the symbol directory of venue {venue} could not be read: {reason}")]
     SymbolDirectory { venue: VenueId, reason: SmolStr },
     #[error("the instrument catalog fetch was lost before it answered")]
@@ -63,50 +49,21 @@ pub enum SourceError {
     Other { reason: SmolStr },
 }
 
-/// Why one catalog source step refused an answer it had already received.
-///
-/// The set is closed rather than a free-form reason, because these failures reach
-/// a localized message: a sentence built by the step would carry whatever value it
-/// was formatting — including a listing id — into a user-visible template. A
-/// refusal that is about a listing therefore keeps the listing as a typed
-/// diagnostic field, and the message states the failure without printing it.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SourceProtocolRejection {
-    /// The adapter answered a request with a response the step cannot read.
     #[error("the adapter returned an unexpected response")]
     UnexpectedResponse,
-    /// A venue answer does not form a value the market-participants model accepts.
     #[error("the venue terms were refused: {error}")]
     Model {
-        /// The model refusal the venue's terms produced.
         #[source]
         error: Box<ModelError>,
     },
-    /// A listing the source staged carries no instrument family and settlement
-    /// asset, so its margin terms cannot be read.
     #[error("listing {listing:?} carries no instrument family and settlement asset")]
-    ListingTermsIncomplete {
-        /// The listing the refused read was about. It stays a typed diagnostic:
-        /// the localized message does not print it.
-        listing: Box<VenueListingKey>,
-    },
-    /// The venue's own protocol layer refused the answer.
-    ///
-    /// The reason is the venue's own statement about its own answer — the same
-    /// class of text as a rejected request's message — and is presented as such
-    /// rather than parsed.
+    ListingTermsIncomplete { listing: Box<VenueListingKey> },
     #[error("the venue refused the answer: {reason}")]
-    Venue {
-        /// The venue's own diagnostic message.
-        reason: SmolStr,
-    },
+    Venue { reason: SmolStr },
 }
 
-/// Why a staged catalog batch was refused.
-///
-/// Every variant names the route and the listing, identifier or field that
-/// failed, so the source and the bridge can classify the refusal instead of
-/// reading a sentence.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CatalogValidationError {
     #[error("listing {listing:?} does not belong to the fetched route {route}")]
@@ -244,14 +201,6 @@ pub enum CatalogValidationError {
     },
     #[error("listing {listing:?} carries neither a symbol nor typed identifiers")]
     ListingWithoutIdentity { listing: VenueListingKey },
-    /// The display publication gate refused the whole batch.
-    ///
-    /// The display gate is a second, catalogue-global validator that runs on the
-    /// same staged batch as the identity validator: a missing registry entry, an
-    /// asset no code was resolved for, two staged codes that disagree, a listing
-    /// whose identifiers contradict their declared symbols or a name that is not the
-    /// rendering of its own details refuses the publication before the generation is
-    /// replaced, so nothing is silently stale.
     #[error("listing {listing:?} cannot be displayed: {error}")]
     DisplayRejected {
         listing: Option<Box<VenueListingKey>>,
@@ -259,33 +208,19 @@ pub enum CatalogValidationError {
     },
 }
 
-/// Errors returned by the shared catalogue.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CatalogError {
     #[error(transparent)]
     Source(#[from] Box<SourceError>),
-    /// The candidate catalog was refused as a whole; nothing was published.
     #[error("the instrument catalog of {route} was refused: {error}")]
     InvalidCatalog {
         route: VenueRoute,
         error: Box<CatalogValidationError>,
     },
-    /// The canonical registries were refused as a whole; nothing was published.
-    ///
-    /// A registry-only publication names no route: the registries it installs are
-    /// the catalog's own rather than a route's, so this is the same refusal as
-    /// [`Self::InvalidCatalog`] for the publication that belongs to no route.
     #[error("the published instrument registries were refused: {error}")]
     InvalidRegistries { error: Box<CatalogValidationError> },
-    /// The route is not in the registered catalog route set, or was revoked.
     #[error("route {route} is not a registered catalog route")]
     RouteNotRegistered { route: VenueRoute },
-    /// The route is registered but nothing has loaded its catalog yet.
-    ///
-    /// This is a waiting state rather than a refusal: the connection action
-    /// loads the route's catalog, and a read that finds none is answered with
-    /// this instead of a request. It is deliberately a variant of its own so
-    /// that "not loaded yet" and "publishes no catalog" stay two answers.
     #[error("route {route} has no published catalog yet")]
     CatalogNotLoaded { route: VenueRoute },
     #[error("listing {listing:?} is absent from the published generation")]
@@ -384,7 +319,6 @@ impl From<SourceError> for CatalogError {
 }
 
 impl CatalogError {
-    /// Wraps a source failure with the id of the source that produced it.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn source_failed(id: SmolStr, error: SourceError) -> Self {
         Self::SourceFailed {
@@ -393,7 +327,6 @@ impl CatalogError {
         }
     }
 
-    /// Wraps a validation failure with the route whose batch was refused.
     pub(crate) fn invalid_catalog(route: VenueRoute, error: CatalogValidationError) -> Self {
         Self::InvalidCatalog {
             route,
@@ -402,21 +335,10 @@ impl CatalogError {
     }
 }
 
-/// Why reading the name of one listing through the loading entry failed.
-///
-/// The two variants are the two failure domains of that read, and a reader acts
-/// on them differently: the route's catalog could not be loaded at all — the
-/// failure is the catalogue's own, classified as [`CatalogError`] —
-/// or the publication that was then captured holds no name for the listing,
-/// which is the [`DisplayError`] the cached read answers with. A name miss is
-/// never reported as a generation mismatch: the read names no generation of its
-/// own, it reads the one that is published.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ListingInstrumentError {
-    /// The listing's route catalog could not be loaded.
     #[error(transparent)]
     Catalog(Box<CatalogError>),
-    /// The captured generation holds no name for the listing.
     #[error(transparent)]
     Display(#[from] DisplayError),
 }
@@ -443,8 +365,6 @@ mod tests {
         )
     }
 
-    /// A route nothing has loaded is told apart from a route that serves
-    /// nothing at all: the first is a wait, the second is a refusal.
     #[test]
     fn a_route_with_no_snapshot_is_not_a_route_that_serves_nothing() {
         assert_ne!(
@@ -453,8 +373,6 @@ mod tests {
         );
     }
 
-    /// A transport failure stays the classified failure it was, whichever read
-    /// it reached the caller through.
     #[test]
     fn a_source_failure_keeps_its_own_variant() {
         let error = CatalogError::Source(Box::new(SourceError::RateLimited {
@@ -469,21 +387,14 @@ mod tests {
     }
 }
 
-/// A failure while a canonical registry derived or validated identity terms.
-///
-/// The model error is boxed because it is the model crate's own error type and
-/// [`market_participants_model::error::ModelError`] is large; the registry never redefines
-/// it, it only transports it without paying for its size on every result.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error(transparent)]
 pub struct RegistryError(Box<ModelError>);
 impl RegistryError {
-    /// Returns the model failure this error carries.
     pub fn model(&self) -> &ModelError {
         &self.0
     }
 
-    /// Returns the model failure this error carries.
     pub fn into_model(self) -> ModelError {
         *self.0
     }

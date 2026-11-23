@@ -1,8 +1,3 @@
-//! Helpers shared by the crate's unit tests.
-//!
-//! Both helpers are deliberately minimal: a SOCKS5 endpoint that records what
-//! the client asked it to reach, and a one-shot HTTP origin.
-
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use tokio::{
@@ -12,31 +7,22 @@ use tokio::{
     task::JoinHandle,
 };
 
-/// Where a client asked the SOCKS5 endpoint to connect.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Socks5Target {
     Domain { host: String, port: u16 },
     Addr(SocketAddr),
 }
 
-/// A single-connection SOCKS5 endpoint that forwards to the requested target.
 pub(crate) struct Socks5Proxy {
     pub address: SocketAddr,
     observed: oneshot::Receiver<Socks5Target>,
 }
 
 impl Socks5Proxy {
-    /// Starts an endpoint that forwards wherever the client asks it to.
-    ///
-    /// It requires RFC 1929 credentials when given.
     pub(crate) async fn start(credentials: Option<(&'static str, &'static str)>) -> Self {
         Self::spawn(credentials, None).await
     }
 
-    /// Starts an endpoint that forwards every requested host name to `upstream`.
-    ///
-    /// A remote-resolving client names a host that only the proxy can reach,
-    /// which is what makes the observed target meaningful.
     pub(crate) async fn start_resolving_domains(
         credentials: Option<(&'static str, &'static str)>,
         upstream: SocketAddr,
@@ -58,7 +44,6 @@ impl Socks5Proxy {
         Self { address, observed }
     }
 
-    /// Resolves with the target of the first `CONNECT` request.
     pub(crate) async fn observed_target(&mut self) -> Socks5Target {
         (&mut self.observed)
             .await
@@ -167,7 +152,6 @@ async fn read_port(socket: &mut TcpStream) -> u16 {
     u16::from_be_bytes(port)
 }
 
-/// Serves one HTTP request with a fixed body, then closes the connection.
 pub(crate) async fn spawn_static_http_server(body: &'static str) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();

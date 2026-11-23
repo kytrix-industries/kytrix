@@ -1,10 +1,3 @@
-//! Strongly typed failures raised by the canonical market-participants model.
-//!
-//! Decimal, timestamp and time-window failures live in the same closed enum as
-//! the identity, unit and settlement failures, so a caller can match one error
-//! type instead of stringly typed reasons. Every variant carries the concrete
-//! field, typed identifier or route that failed validation.
-
 use smol_str::SmolStr;
 use thiserror::Error;
 
@@ -22,35 +15,24 @@ use crate::{
     routing::{IdentifierNormalizationProduct, ListingIdentifierKind},
 };
 
-/// Why one typed native listing identifier did not resolve on one route.
-///
-/// This is the resolver-level failure of a [`ListingIdentifier`]: it names the
-/// route it was looked up in and the identifier that failed, so a caller can
-/// classify the failure without reading a sentence. It is folded into
-/// [`ModelError`] through [`ModelError::ListingIdentifier`], so the crate never
-/// carries two parallel vocabularies for one failure.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ListingIdentifierError {
-    /// The identifier text is not a usable value of its kind.
     #[error("listing identifier `{value}` is not a valid {kind}")]
     InvalidValue {
         kind: ListingIdentifierKind,
         value: SmolStr,
     },
-    /// No listing of the looked-up route carries this identifier.
     #[error("listing identifier {identifier:?} is not present on route {route}")]
     IdentifierNotFound {
         route: VenueRoute,
         identifier: ListingIdentifier,
     },
-    /// The identifier echoes a route of its own that is not the looked-up route.
     #[error("listing identifier {identifier:?} belongs to route {owner}, not to route {route}")]
     NativeIdentifierRouteMismatch {
         route: VenueRoute,
         identifier: ListingIdentifier,
         owner: VenueRoute,
     },
-    /// The identifier kind or product is not the one the route declares.
     #[error(
         "listing identifier {identifier:?} does not match the {product:?} product of route {route}"
     )]
@@ -59,7 +41,6 @@ pub enum ListingIdentifierError {
         identifier: ListingIdentifier,
         product: IdentifierNormalizationProduct,
     },
-    /// The identifier resolves to more than one listing on the route.
     #[error("listing identifier {identifier:?} resolves to {matches} listings on route {route}")]
     NativeIdentifierAmbiguous {
         route: VenueRoute,
@@ -68,20 +49,13 @@ pub enum ListingIdentifierError {
     },
 }
 
-/// Why a listing and its snapshot were refused at the publication boundary.
-///
-/// The payload of this enum is larger than a pointer, so [`ModelError`] carries
-/// it boxed; the variants themselves stay unboxed and carry the concrete keys,
-/// kinds and values that failed.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ListingPublicationError {
-    /// The snapshot key is not the key of the listing it was published with.
     #[error("snapshot key {snapshot:?} does not describe listing {listing:?}")]
     SnapshotKeyMismatch {
         listing: VenueListingKey,
         snapshot: VenueListingKey,
     },
-    /// A typed identifier echoes a symbol the listing does not declare.
     #[error(
         "listing identifier {kind} echoes `{value}` that is not a display symbol of the listing"
     )]
@@ -91,26 +65,14 @@ pub enum ListingPublicationError {
     },
 }
 
-/// Which part of a conversion reference disagreed with the instrument it was
-/// declared for.
-///
-/// A conversion reference is only valid in one direction: its registry terms must
-/// track the settlement asset as the underlying, quote that asset in the price
-/// quote of the instrument, and be expressed per asset unit. The direction is
-/// carried as a value so a caller can report which of the three broke without
-/// parsing a sentence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversionDirection {
-    /// The reference does not track the settlement asset.
     Underlying,
-    /// The reference does not quote the instrument price quote.
     Quote,
-    /// The reference is not expressed per asset unit.
     Basis,
 }
 
 impl ConversionDirection {
-    /// Returns the fixed label used in error rendering.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Underlying => "underlying",
@@ -126,29 +88,14 @@ impl std::fmt::Display for ConversionDirection {
     }
 }
 
-/// What a rejected settlement asset was asked to settle.
-///
-/// One rule decides whether an asset can be settled in — only a currency or a
-/// crypto token can, because a security or a commodity cannot denominate a payoff —
-/// and more than one place applies it. The role is carried as a value so the
-/// rejection names the settlement that was actually refused instead of describing
-/// one of the other places the same rule runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettlementAssetRole {
-    /// The asset of a `DeliveryMode::Cash` settlement.
     CashDelivery,
-    /// The settlement asset of an outcome group.
     OutcomeGroup,
-    /// The settlement asset of an outcome risk pool.
     OutcomeRiskPool,
 }
 
 impl SettlementAssetRole {
-    /// Returns the label used in error rendering.
-    ///
-    /// The label is a noun phrase and carries its own article, because the rejection
-    /// reads "cannot denominate a settlement for {role}" and an article chosen by the
-    /// template would be wrong for at least one of the three.
     pub const fn label(self) -> &'static str {
         match self {
             Self::CashDelivery => "a cash delivery",
@@ -164,27 +111,16 @@ impl std::fmt::Display for SettlementAssetRole {
     }
 }
 
-/// What a quantity comparison expected to find.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuantityUnitExpectation {
-    /// A traded quantity: asset units, contracts or outcome tokens.
     TradedQuantity,
-    /// A monetary amount expressed as a notional of one asset.
     Notional,
-    /// The quantity unit declared by the resolved listing rules.
     ListedUnit,
-    /// A quantity denominated in the asset of the listing notional rule.
     NotionalAsset,
-    /// The group, member and side of the listed outcome instrument.
     OutcomeInstrument,
 }
 
 impl QuantityUnitExpectation {
-    /// Returns the label used in error rendering.
-    ///
-    /// The label is a noun phrase that names what a quantity of this kind is, because it
-    /// is rendered into messages a user reads: the type name of the variant is an
-    /// internal identifier and would say nothing about the quantity it stands for.
     pub const fn label(self) -> &'static str {
         match self {
             Self::TradedQuantity => "asset units, contracts or outcome tokens",
@@ -202,30 +138,15 @@ impl std::fmt::Display for QuantityUnitExpectation {
     }
 }
 
-/// Which index term of a contract or a price reference did not line up.
-///
-/// An index contract has to agree with the index it tracks in more than one place — the
-/// contract unit names it, the unit is quoted in the price quote of the contract, and the
-/// price reference behind the underlying is expressed per index point of the same index —
-/// and one rule covers all of them. The term is carried as a value so the rejection names
-/// the one that broke instead of describing the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexField {
-    /// The basis of a price reference that tracks an index.
     ReferenceBasis,
-    /// The contract unit of an index contract, which has to be an index-point unit.
     ContractUnit,
-    /// The index a contract unit names.
     ContractUnitIndex,
-    /// The quote asset an index-point contract unit is denominated in.
     ContractUnitQuoteAsset,
 }
 
 impl IndexField {
-    /// Returns the label used in error rendering.
-    ///
-    /// The label is a noun phrase, because the rendering reads "{label} does not line up
-    /// with the index terms of the contract".
     pub const fn label(self) -> &'static str {
         match self {
             Self::ReferenceBasis => "the basis of the price reference",
@@ -242,7 +163,6 @@ impl std::fmt::Display for IndexField {
     }
 }
 
-/// Validation failure for a canonical market-participants model value or operation.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ModelError {
     #[error("decimal value is empty")]
@@ -480,7 +400,6 @@ impl From<ListingPublicationError> for ModelError {
     }
 }
 
-/// Ensures a Unix millisecond contract term is non-negative.
 pub fn require_non_negative_time(
     timestamp: UnixMillis,
     field: &'static str,
@@ -488,7 +407,6 @@ pub fn require_non_negative_time(
     validate_timestamp(timestamp, field)
 }
 
-/// Ensures a lower time bound is not later than an upper time bound.
 pub fn require_ordered_time(
     earlier: UnixMillis,
     later: UnixMillis,
@@ -502,7 +420,6 @@ pub fn require_ordered_time(
     }
 }
 
-/// Ensures every element of a non-empty sorted collection is strictly ordered.
 pub fn require_strictly_sorted<T: Ord>(
     values: &[T],
     field: &'static str,
@@ -516,7 +433,6 @@ pub fn require_strictly_sorted<T: Ord>(
     Ok(())
 }
 
-/// Ensures every element of a sorted collection is unique, allowing an empty one.
 pub fn require_sorted_and_unique<T: Ord>(
     values: &[T],
     field: &'static str,
@@ -527,7 +443,6 @@ pub fn require_sorted_and_unique<T: Ord>(
     Ok(())
 }
 
-/// Validates that a quantity is strictly positive.
 pub fn require_positive_quantity(
     quantity: Quantity,
     field: &'static str,
@@ -539,7 +454,6 @@ pub fn require_positive_quantity(
     }
 }
 
-/// Rejects a [`QuantityUnit`] that is not an amount of the given asset.
 pub fn require_notional_unit(unit: &QuantityUnit, field: &'static str) -> Result<(), ModelError> {
     match unit {
         QuantityUnit::Notional { .. } => Ok(()),
@@ -550,7 +464,6 @@ pub fn require_notional_unit(unit: &QuantityUnit, field: &'static str) -> Result
     }
 }
 
-/// Rejects a [`QuantityUnit`] that is not a traded asset or contract quantity.
 pub fn require_traded_quantity_unit(
     unit: &QuantityUnit,
     field: &'static str,
@@ -741,9 +654,6 @@ mod tests {
             .source()
             .expect("a folded identifier error is a source");
 
-        // `thiserror` resolves `#[source]` through `AsDynError`, and `std`
-        // implements `Error` for `Box<T>`, so the source object is the boxed
-        // payload; `&**` recovers the typed error without copying it.
         assert_eq!(
             source
                 .downcast_ref::<Box<ListingIdentifierError>>()

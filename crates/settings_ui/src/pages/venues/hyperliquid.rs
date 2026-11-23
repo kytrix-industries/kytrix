@@ -1,5 +1,3 @@
-//! HyperCore's page: one address of each kind, and the API Agent's credentials.
-
 use app_config::{
     market_participants::{
         origins::{HyperliquidHttpOrigin, HyperliquidWebsocketOrigin},
@@ -25,19 +23,14 @@ use crate::{
     search::FieldSearch,
 };
 
-/// The id of this page's settings.
 const PAGE: &str = "market_participants.hyperliquid";
 
-/// The HTTP address row, as the search filter and the tests name it.
 const HTTP_FIELD: &str = "market_participants.hyperliquid.http";
 
-/// The WebSocket address row, as the search filter and the tests name it.
 const WEBSOCKET_FIELD: &str = "market_participants.hyperliquid.websocket";
 
-/// The id of the card this page's rows are drawn in.
 const SECTION_ID: &str = "market_participants.hyperliquid_0";
 
-/// The HyperCore page.
 pub(crate) struct VenuePage {
     host: SettingsHost,
     selects: Vec<VenueSelect>,
@@ -45,8 +38,6 @@ pub(crate) struct VenuePage {
 }
 
 impl VenuePage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs
-    /// to.
     pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
         Self {
             host,
@@ -178,7 +169,6 @@ impl PageView for VenuePage {
     }
 }
 
-/// The search rows of the settings this page draws.
 pub(crate) fn search_fields(translate: &Translate) -> Vec<FieldSearch> {
     let venue = VenueId::Hyperliquid;
     let page_id = shared::page_id(&venue);

@@ -1,10 +1,3 @@
-//! The protocol boundary: request identity, targets and the request classifier.
-//!
-//! Every market-participants request names exactly one target. A target is either an
-//! authenticated account, a public wallet address, a route-level public stream,
-//! or the route itself; there is no request without one, because a request
-//! without a target could not be validated against a registered scope.
-
 use market_participants_model::{
     identifier::{MarketParticipantAccountId, WalletAddress},
     listing::{listing_impl::ListingStatus, route::VenueRoute},
@@ -13,16 +6,6 @@ use market_participants_model::{
 
 pub(crate) use crate::adapter::{ProtocolRequest, ProtocolResponse, SubscriptionHandle};
 
-/// Routing information supplied by a capability implementation for one protocol call.
-///
-/// The target is the only route/capability source: `route` and `capability` are
-/// The identity of one protocol call: the route it addresses and the capability
-/// it is classified as.
-///
-/// The two are stated rather than derived from a network target: a route and a
-/// capability are what a request is, and the target a persisted configuration is
-/// keyed by is not part of a request any more. The gateway still derives
-/// the target the connection layer needs from these two, once, inside itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestIdentity {
     route: VenueRoute,
@@ -30,27 +13,19 @@ pub struct RequestIdentity {
 }
 
 impl RequestIdentity {
-    /// Builds the identity of one request.
     pub fn new(route: VenueRoute, capability: CapabilityId) -> Self {
         Self { route, capability }
     }
 
-    /// Returns the route this request addresses.
     pub const fn route(&self) -> &VenueRoute {
         &self.route
     }
 
-    /// Returns the capability this request is classified as.
     pub const fn capability(&self) -> CapabilityId {
         self.capability
     }
 }
 
-/// The account one authenticated request acts for.
-///
-/// Only the account and its route are stored: the capability comes from the
-/// request context, so an authenticated target can never disagree with the
-/// descriptor that resolved it.
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -62,42 +37,31 @@ pub struct AuthenticatedTarget {
 }
 
 impl AuthenticatedTarget {
-    /// Builds an authenticated target.
     pub fn new(account: MarketParticipantAccountId, route: VenueRoute) -> Self {
         Self { account, route }
     }
 
-    /// Returns the account this target acts for.
     pub const fn account(&self) -> &MarketParticipantAccountId {
         &self.account
     }
 
-    /// Returns the route this target acts on.
     pub const fn route(&self) -> &VenueRoute {
         &self.route
     }
 }
 
-/// How one wallet-monitor request reaches the wallet it reads.
-///
-/// The two variants are not interchangeable: a public address names the wallet it
-/// reads, while a route-level stream carries no address at all. Neither looks up a
-/// trading credential — a wallet monitored by address is read as public state — and
-/// the type carries no serde derive: nothing outside this crate builds one, so there
-/// is no wire form a target could be decoded from either.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WalletTarget {
-    /// A public address read, which never requires a trading credential.
     Public {
         route: VenueRoute,
         address: WalletAddress,
     },
-    /// A public stream of one route that carries no wallet address.
-    Route { route: VenueRoute },
+    Route {
+        route: VenueRoute,
+    },
 }
 
 impl WalletTarget {
-    /// Returns the route this target reads, whichever access mode it uses.
     pub fn route(&self) -> &VenueRoute {
         match self {
             Self::Public { route, .. } | Self::Route { route } => route,
@@ -105,38 +69,23 @@ impl WalletTarget {
     }
 }
 
-/// What a request does to a listing, which decides whether its status allows it.
-///
-/// The distinction is the model's: opening or changing exposure is a
-/// trading command, and the operations that complete an expiration are
-/// settlement commands that an expired listing still allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandKind {
-    /// Opens or changes exposure: placing an order, setting leverage or margin mode.
     NewTrading,
-    /// Cancels an existing order.
     CancelOrder,
-    /// Completes an expiration: future delivery, option exercise, outcome settlement.
     Settlement,
-    /// Reads state and changes nothing.
     Read,
 }
 
-/// The identity one protocol request addresses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestTarget {
-    /// A route-level request: catalog, all tickers or a force-order subscription.
     Route(VenueRoute),
-    /// A request about one listing.
     Listing(market_participants_model::listing::route::VenueListingKey),
-    /// An authenticated request about the account of one route.
     Account(AuthenticatedTarget),
-    /// A wallet-monitor request.
     Wallet(WalletTarget),
 }
 
 impl RequestTarget {
-    /// Returns the route this request addresses.
     pub fn route(&self) -> &VenueRoute {
         match self {
             Self::Route(route) => route,
@@ -146,24 +95,14 @@ impl RequestTarget {
         }
     }
 
-    /// Returns the authenticated target, when this request authenticates.
     pub fn authenticated(&self) -> Option<&AuthenticatedTarget> {
         match self {
             Self::Account(target) => Some(target),
-            // A wallet-monitor request names no account: it is a public address read or a
-            // route-level stream, and both are read without a trading credential.
             Self::Wallet(_) | Self::Route(_) | Self::Listing(_) => None,
         }
     }
 }
 
-/// What one protocol request declares about itself.
-///
-/// The listing a request is about is not its target: a command and an account
-/// read address an authenticated account *and* name the listing they act on, so
-/// the listing travels with the classification instead of being read out of one
-/// target variant. A request that names no listing — an account-wide balance
-/// read, an account-wide position mode change — declares none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassifiedRequest {
     capability: CapabilityId,
@@ -173,7 +112,6 @@ pub struct ClassifiedRequest {
 }
 
 impl ClassifiedRequest {
-    /// Builds a classification.
     pub fn new(
         capability: CapabilityId,
         target: RequestTarget,
@@ -188,24 +126,20 @@ impl ClassifiedRequest {
         }
     }
 
-    /// Returns the capability the request needs.
     pub const fn capability(&self) -> CapabilityId {
         self.capability
     }
 
-    /// Returns the identity the request addresses.
     pub const fn target(&self) -> &RequestTarget {
         &self.target
     }
 
-    /// Returns the listing key the request is about, when it is about one.
     pub const fn listing(
         &self,
     ) -> Option<&market_participants_model::listing::route::VenueListingKey> {
         self.listing.as_ref()
     }
 
-    /// Returns the account the request authenticates as, when it does.
     pub fn authenticated_account(
         &self,
     ) -> Option<&market_participants_model::identifier::MarketParticipantAccountId> {
@@ -214,18 +148,11 @@ impl ClassifiedRequest {
             .map(AuthenticatedTarget::account)
     }
 
-    /// Returns the command the request is, when it is one.
     pub const fn command(&self) -> Option<CommandKind> {
         self.command
     }
 }
 
-/// Classifies one protocol request into the capability and target it needs.
-///
-/// This is the single table of the protocol: every market-participants request appears here with an
-/// explicit target, and no market-participant variant is absent. The per-variant payload
-/// accessors are the adapter boundary's, so the table never guesses a route from
-/// a venue.
 pub fn classify(request: &ProtocolRequest) -> ClassifiedRequest {
     use CapabilityId as Capability;
     use ProtocolRequest as Request;
@@ -243,9 +170,6 @@ pub fn classify(request: &ProtocolRequest) -> ClassifiedRequest {
         Request::FetchTicker(query) | Request::SubscribeTicker(query) => {
             listing_request(Capability::Tickers, &query.listing, None)
         }
-        // The whole-scope read is its own capability: a venue may answer a ticker one
-        // listing at a time without answering every listing in one request, and the
-        // gateway's admission must refuse that shape on such a route.
         Request::FetchAllTickers(query) => route_request(Capability::AllTickers, query.route()),
         Request::FetchPredictionEvents(query) => {
             route_request(Capability::PredictionEvents, query.route())
@@ -259,8 +183,6 @@ pub fn classify(request: &ProtocolRequest) -> ClassifiedRequest {
         Request::SubscribePredictionSeries(query) => {
             route_request(Capability::PredictionSeries, query.route())
         }
-        // A prediction book is event-scoped rather than listing-scoped: the leg it
-        // is for has no catalog listing, so its identity travels in the query.
         Request::FetchPredictionOrderBook(query) | Request::SubscribePredictionOrderBook(query) => {
             route_request(Capability::PredictionOrderBook, query.route())
         }
@@ -382,12 +304,10 @@ pub fn classify(request: &ProtocolRequest) -> ClassifiedRequest {
     }
 }
 
-/// Classifies a request that addresses a route and changes nothing.
 fn route_request(capability: CapabilityId, route: &VenueRoute) -> ClassifiedRequest {
     ClassifiedRequest::new(capability, RequestTarget::Route(route.clone()), None, None)
 }
 
-/// Classifies a request about one listing of a route.
 fn listing_request(
     capability: CapabilityId,
     listing: &market_participants_model::listing::route::VenueListingKey,
@@ -401,12 +321,6 @@ fn listing_request(
     )
 }
 
-/// Classifies an authenticated request.
-///
-/// The gateway checks the listing route a command or a narrowed account read
-/// names against the context route separately; what authentication resolves is
-/// the account, so that is what the classified target carries, and the listing a
-/// request acts on travels next to it.
 fn account_request(
     capability: CapabilityId,
     target: &AuthenticatedTarget,
@@ -421,7 +335,6 @@ fn account_request(
     )
 }
 
-/// Classifies a wallet-monitor request.
 fn wallet_request(target: &WalletTarget) -> ClassifiedRequest {
     ClassifiedRequest::new(
         CapabilityId::Wallet,
@@ -431,7 +344,6 @@ fn wallet_request(target: &WalletTarget) -> ClassifiedRequest {
     )
 }
 
-/// Classifies a route-level wallet-monitor request.
 fn wallet_route_request(capability: CapabilityId, route: &VenueRoute) -> ClassifiedRequest {
     ClassifiedRequest::new(
         capability,
@@ -443,18 +355,10 @@ fn wallet_route_request(capability: CapabilityId, route: &VenueRoute) -> Classif
     )
 }
 
-/// Validates the listing status against the command a request performs.
-///
-/// The matrix is the model's: `Scheduled`, `Halted`, `Settled` and
-/// `Delisted` never allow new trading, an `Expired` listing still allows the
-/// settlement commands that complete its expiration, and `Delisted` allows
-/// nothing at all. Cancelling an order stays possible while the venue still
-/// holds it, so it is only refused once the listing is gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListingCommandMatrix;
 
 impl ListingCommandMatrix {
-    /// Returns whether one listing status permits one command kind.
     pub const fn allows(status: ListingStatus, command: CommandKind) -> bool {
         match (status, command) {
             (ListingStatus::Trading, _) => true,
@@ -469,7 +373,6 @@ impl ListingCommandMatrix {
         }
     }
 
-    /// Returns whether one status and window permit one command at one instant.
     pub fn permits(
         status: ListingStatus,
         command: CommandKind,
@@ -515,8 +418,6 @@ mod tests {
         CommandKind::Read,
     ];
 
-    /// The documented matrix, written out row by row so a widened permission
-    /// shows up as a failing expectation rather than passing silently.
     const EXPECTED: [[bool; 4]; 6] = [
         [false, false, false, true],
         [true, true, true, true],
@@ -613,7 +514,6 @@ mod tests {
         );
     }
 
-    /// The account a fixture request authenticates as.
     fn account(route: &VenueRoute) -> AuthenticatedTarget {
         AuthenticatedTarget::new(
             MarketParticipantAccountId::new("primary").expect("the fixture account is valid"),
@@ -621,8 +521,6 @@ mod tests {
         )
     }
 
-    /// A command and a narrowed account read declare the listing they act on,
-    /// even though both are classified into the authenticated target.
     #[test]
     fn a_command_declares_the_listing_it_acts_on() {
         let route = test_support::spot_route();
@@ -656,8 +554,6 @@ mod tests {
         assert_eq!(narrowed.command(), None);
     }
 
-    /// An account-wide read names no listing, and neither does a route-scoped
-    /// request or a wallet read.
     #[test]
     fn a_request_that_names_no_listing_declares_none() {
         let route = test_support::spot_route();
@@ -680,9 +576,6 @@ mod tests {
         );
     }
 
-    /// The order book of a prediction leg is its own capability, classed on the
-    /// event's route: it names no catalog listing, so the whole identity travels
-    /// in the query rather than in a listing key.
     #[test]
     fn a_prediction_order_book_request_is_classified_on_the_events_route() {
         use market_participants_model::{

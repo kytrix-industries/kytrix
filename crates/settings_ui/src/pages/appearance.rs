@@ -1,5 +1,3 @@
-//! The appearance page: the application's theme and the language it is drawn in.
-
 use app_config::settings::{Appearance, Language};
 use base_ui::kit::select::Select;
 use i18n::translate::Translate;
@@ -14,36 +12,29 @@ use crate::{
     session::SettingsChange,
 };
 
-/// The id of this page's settings.
 const PAGE: &str = "appearance";
 
-/// The theme choices, in the order the control offers them.
 const APPEARANCE_OPTIONS: [(&str, &str); 3] = [
     ("Light", "settings_ui.appearance.light"),
     ("Dark", "settings_ui.appearance.dark"),
     ("System", "settings_ui.appearance.system"),
 ];
 
-/// The language choices, in the order the control offers them.
 const LANGUAGE_OPTIONS: [(&str, &str); 2] = [
     ("zh-CN", "settings_ui.appearance.language_zh_cn"),
     ("en", "settings_ui.appearance.language_en"),
 ];
 
-/// The appearance page.
 pub(crate) struct AppearancePage {
     host: SettingsHost,
     key: SmolStr,
     window: Option<WindowId>,
     appearance: Option<Select>,
     language: Option<Select>,
-    /// The setting the two controls were last written from, so a frame that moved nothing writes
-    /// nothing.
     applied: Option<(Appearance, Language)>,
 }
 
 impl AppearancePage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
     pub(crate) fn new(host: SettingsHost, key: &str) -> Self {
         Self {
             host,
@@ -198,7 +189,6 @@ impl PageView for AppearancePage {
     }
 }
 
-/// The text this page and its settings are searched by.
 pub(crate) fn search(translate: &Translate) -> PageSearch {
     let title = i18n::t_smol!(translate, "settings_ui.appearance.title");
     let mode = i18n::t_smol!(translate, "settings_ui.appearance.mode");
@@ -249,7 +239,6 @@ pub(crate) fn search(translate: &Translate) -> PageSearch {
     }
 }
 
-/// The id the appearance control names one preference by.
 fn appearance_id(appearance: Appearance) -> &'static str {
     match appearance {
         Appearance::Light => "Light",
@@ -258,7 +247,6 @@ fn appearance_id(appearance: Appearance) -> &'static str {
     }
 }
 
-/// The preference one choice of the appearance control names.
 fn appearance_of(value: &str) -> Appearance {
     match value {
         "Light" => Appearance::Light,
@@ -267,7 +255,6 @@ fn appearance_of(value: &str) -> Appearance {
     }
 }
 
-/// The language one choice of the language control names.
 fn language_of(value: &str) -> Language {
     match value {
         "en" => Language::En,

@@ -9,57 +9,14 @@ use crate::{
     template::interpolate::Template,
 };
 
-/// Renders localized text for a language.
-///
-/// The catalogue is language-agnostic: the language to render is passed to every
-/// call, so one instance renders every loaded language.
-///
-/// Messages live in YAML locale files named after their language code, using the
-/// codes from the
-/// [Google Workspace language list](https://developers.google.com/workspace/admin/directory/v1/languages):
-///
-/// ```yaml
-/// # locales/en.yaml
-/// menu:
-///   market: Market
-/// greeting: "Hello, %{name}!"
-/// ```
-///
-/// ```yaml
-/// # locales/zh-CN.yaml
-/// menu:
-///   market: 行情
-/// greeting: "你好，%{name}！"
-/// ```
-///
-/// # Examples
-///
-/// ```no_run
-/// use i18n::{language::codes::LanguageCode, translator::types::I18n};
-///
-/// let i18n = I18n::builder()
-///     .locales("locales")?
-///     .fallback(LanguageCode::En)
-///     .build()?;
-///
-/// assert_eq!(
-///     i18n.translate(LanguageCode::ZhCn, "menu.market").as_str(),
-///     "行情"
-/// );
-/// # Ok::<(), i18n::error::types::Error>(())
-/// ```
 #[derive(Debug)]
 pub struct I18n {
-    /// Language used for messages the selected language does not define.
     fallback: Option<LanguageCode>,
-    /// Messages of every loaded locale.
     stores: DataStore,
-    /// Cached renderings of messages with placeholders.
     cache: Mutex<RenderedCache>,
 }
 
 impl I18n {
-    /// Assembles an instance from locales loaded by [`I18n::builder`].
     pub(super) fn new(fallback: Option<LanguageCode>, stores: DataStore) -> Self {
         Self {
             fallback,
@@ -68,19 +25,14 @@ impl I18n {
         }
     }
 
-    /// Starts building an instance.
     pub fn builder() -> super::builder::Builder {
         super::builder::Builder::default()
     }
 
-    /// Returns the language used for messages the selected language does not
-    /// define.
     pub fn fallback(&self) -> Option<LanguageCode> {
         self.fallback
     }
 
-    /// Returns the languages with a loaded locale, in the order of the
-    /// [Google Workspace language list](https://developers.google.com/workspace/admin/directory/v1/languages).
     pub fn languages(&self) -> Vec<LanguageCode> {
         let mut languages: Vec<_> = self.stores.languages().collect();
         languages.sort_by_key(|language| {
@@ -92,58 +44,24 @@ impl I18n {
         languages
     }
 
-    /// Returns `true` when `language` has a loaded locale.
     pub fn has_language(&self, language: LanguageCode) -> bool {
         self.stores.get(language).is_some()
     }
 
-    /// Returns the message keys defined by `language`.
-    ///
-    /// Returns `None` when `language` has no loaded locale. Keys are yielded in
-    /// unspecified order.
     pub fn keys(&self, language: LanguageCode) -> Option<impl Iterator<Item = &str>> {
         self.stores.get(language).map(|store| store.keys())
     }
 
-    /// Returns the message registered for `key` in `language`, or an empty
-    /// string.
-    ///
-    /// Use [`I18n::try_translate`] to tell a missing message apart from one that
-    /// is deliberately empty.
     #[inline]
     pub fn translate(&self, language: LanguageCode, key: &str) -> SmolStr {
         self.try_translate(language, key).unwrap_or_default()
     }
 
-    /// Returns the message registered for `key` in `language`.
-    ///
-    /// Messages without placeholders return a clone of the stored text. Messages
-    /// with placeholders are rendered once per language, key and argument values,
-    /// and reused afterwards.
     #[inline]
     pub fn try_translate(&self, language: LanguageCode, key: &str) -> Option<SmolStr> {
         self.try_translate_with(language, key, &[])
     }
 
-    /// Returns the message registered for `key` in `language`, replacing its
-    /// `%{name}` placeholders with `arguments`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use i18n::{language::codes::LanguageCode, translator::types::I18n};
-    /// let i18n = I18n::builder()
-    ///     .locale_yaml(LanguageCode::En, "greeting: \"Hello, %{name}!\"")?
-    ///     .build()?;
-    ///
-    /// let name = "Ada";
-    /// assert_eq!(
-    ///     i18n.translate_with(LanguageCode::En, "greeting", &[("name", &name)])
-    ///         .as_str(),
-    ///     "Hello, Ada!"
-    /// );
-    /// # Ok::<(), i18n::error::types::Error>(())
-    /// ```
     pub fn translate_with(
         &self,
         language: LanguageCode,
@@ -154,8 +72,6 @@ impl I18n {
             .unwrap_or_default()
     }
 
-    /// Returns the message registered for `key` in `language`, replacing its
-    /// `%{name}` placeholders with `arguments`.
     pub fn try_translate_with(
         &self,
         language: LanguageCode,
@@ -191,8 +107,6 @@ impl I18n {
         Some(rendered)
     }
 
-    /// Returns the template of `key` in `language`, then in the fallback
-    /// language.
     #[inline]
     fn template(&self, language: LanguageCode, key: &str) -> Option<&Template> {
         if let Some(template) = self.stores.get(language).and_then(|store| store.get(key)) {

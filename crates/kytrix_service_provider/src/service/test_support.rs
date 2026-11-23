@@ -217,7 +217,6 @@ pub(super) fn financial_index() -> proto_types::FinancialIndices {
     }
 }
 
-/// The fear and greed snapshot the service serves, shaped as the collector publishes it.
 pub(super) fn coin_market_cap_fear_and_greed_index() -> proto_types::CoinMarketCapFearAndGreedIndex
 {
     let point = |date: &str, score: u32| proto_types::CoinMarketCapFearAndGreedIndexPoint {
@@ -236,12 +235,6 @@ pub(super) fn coin_market_cap_fear_and_greed_index() -> proto_types::CoinMarketC
     }
 }
 
-/// The Pentagon Pizza Index snapshot the service serves, shaped as its collector publishes it.
-///
-/// The level is the index's own rung, which counts *down* as the alert rises: five is
-/// the calmest and one the most severe. The collection time follows the moment it
-/// observed rather than preceding it, because a snapshot is taken of a point that
-/// already exists.
 pub(super) fn pentagon_pizza_index() -> proto_types::PentagonPizzaIndex {
     proto_types::PentagonPizzaIndex {
         defcon_level: 3,
@@ -250,7 +243,6 @@ pub(super) fn pentagon_pizza_index() -> proto_types::PentagonPizzaIndex {
     }
 }
 
-/// The financial calendar the service serves, shaped as the collector publishes it.
 pub(super) fn financial_calendar() -> proto_types::FinancialCalendar {
     let event = |seconds_of_day: u32,
                  country: &str,
@@ -325,7 +317,6 @@ pub(super) fn x_profile() -> proto_types::XUserProfile {
     }
 }
 
-/// One AIS push as the collector publishes it: one vessel, one position, one departure.
 pub(super) fn global_shipping_chokepoint_delta() -> proto_types::GlobalShippingChokepointEvent {
     proto_types::GlobalShippingChokepointEvent {
         area: proto_types::GlobalShippingChokepointArea::Hormuz as i32,
@@ -367,9 +358,6 @@ pub(super) fn global_shipping_chokepoint_delta() -> proto_types::GlobalShippingC
     }
 }
 
-/// The keyframe the collector publishes once it has a picture.
-///
-/// A keyframe is the whole picture and therefore carries no departures.
 pub(super) fn global_shipping_chokepoint_keyframe() -> proto_types::GlobalShippingChokepointEvent {
     proto_types::GlobalShippingChokepointEvent {
         keyframe: true,
@@ -390,11 +378,6 @@ pub(super) fn test_x_selection() -> proto_types::XUserSelection {
     }
 }
 
-/// The row the service answers a first-ever add with: it carries no profile until the account
-/// is active, which is the only case the service sends one in.
-///
-/// Both timestamps are the one the service wrote the row with, because adding a selection
-/// stamps `created_at` and `updated_at` from the same reading of the clock.
 pub(super) fn pending_x_selection() -> proto_types::XUserSelection {
     proto_types::XUserSelection {
         x_user_id: "42".to_owned(),
@@ -1168,10 +1151,6 @@ impl TestServiceServer {
         self.drop_next_response.store(true, Ordering::Release);
     }
 
-    /// Answers the next request with `response` instead of the one its kind would produce.
-    ///
-    /// This is how a caller is tested against a service that answers a valid request with
-    /// something else: a response of another kind, or one of the same kind without data.
     pub(super) fn answer_next_request_with(&self, response: proto_response::response::Response) {
         *self
             .override_next_response
@@ -1179,7 +1158,6 @@ impl TestServiceServer {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(response);
     }
 
-    /// Answers the next X add with the row a first-ever add gets back, which has no profile.
     pub(super) fn answer_x_add_with_pending_selection(&self) {
         self.pending_x_add_next.store(true, Ordering::Release);
     }
@@ -1208,9 +1186,6 @@ impl TestServiceServer {
 mod tests {
     use super::*;
 
-    /// The manager stands in for the application's whole route table in every test that
-    /// routes through it, so a capability missing from this list would silently keep the
-    /// generation a route change must advance.
     #[test]
     fn every_kytrix_service_capability_should_be_stamped_when_the_default_line_moves() {
         let mut manager = TestConfigManager::in_memory(Config::default());

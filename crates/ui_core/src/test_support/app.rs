@@ -1,13 +1,3 @@
-//! 无 GPU 的测试引擎（I7 / 设计 §6.6）：`TestApp` / `TestWindow`。
-//!
-//! `TestApp::new()` 的 renderer 恒为 `None`：`Scene` 照常生成、记录照常抓取、present 是 no-op。
-//! `drain()` 是**唯一**帧推进原语：一次最多一帧，不做「等到没事干」的隐式阻塞（设计 §6.2）。
-//!
-//! **按平台泵的顺序推进**：`drain` = 帧 → a11y 交付 → 跨线程回投任务（R13-12）。三者同序是
-//! 有意的：生产里「任务写状态 ⇒ 下一轮才出帧」的时序 bug 只有在测试泵也走 `Dispatcher` 的
-//! push → drain → run 三层时才会现形（旧实现 `TestApp` 根本没有任务泵，a11y 用例全走
-//! `dispatch_request` 直调，把这一层整个跳过了）。
-
 use std::time::{Duration, Instant};
 
 use super::{
@@ -24,26 +14,15 @@ use crate::{
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
-/// 无 GPU 的测试引擎：持有 runtime + `App` + 一个窗口。
 pub struct TestApp {
-    // `App::new` 需要 `Handle`；current_thread runtime 足够（P06 不 spawn）。
-    // 字段只为保活（`App` 只持 `Handle`），不提供访问器。
     _runtime: tokio::runtime::Runtime,
     app: App,
     window: WindowId,
-    /// 最近一次**提交**的绘制快照（空闲帧不会产生 `frame`，oracle 的增量侧要回退到这里）。
     last_rendered: Option<RenderedFrame>,
-    /// 是否在每帧之后交付一笔 a11y 快照（`enable_a11y_capture` 打开）。
     a11y_capture: bool,
-    /// 最近一笔 a11y 交付对应的 **`TreeUpdate`**（与生产 `build_update` 同一条组装路径）。
-    ///
-    /// R13-10：全仓此前没有一处 `TreeUpdate` 断言，语义 bug 全部停在"快照"这一层。
     last_a11y_update: Option<accesskit::TreeUpdate>,
-    /// a11y 影子树（逐笔应用 `TreeUpdate` 并校验 AccessKit 契约）。
     a11y_shadow: ShadowTree,
-    /// 上一笔 `TreeUpdate` 的契约校验错误（`Some` ⇒ 本帧的更新违反 AccessKit 契约）。
     a11y_contract_error: Option<String>,
-    /// 已执行的回投任务数（R13-12 的断言面：push → drain → run 三层真的走通）。
     tasks_run: usize,
 }
 
@@ -54,16 +33,11 @@ impl Default for TestApp {
 }
 
 impl TestApp {
-    /// 默认窗口（800×600、`Scale::ONE`）的 headless 引擎。
     #[must_use]
     pub fn new() -> Self {
         Self::with_options(WindowOptions::default())
     }
 
-    /// 指定建窗参数的 headless 引擎。
-    ///
-    /// # Panics
-    /// 当前线程的 tokio runtime 建不起来时 panic（测试环境的基础设施故障，不是引擎行为）。
     #[must_use]
     pub fn with_options(options: WindowOptions) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -71,8 +45,6 @@ impl TestApp {
             .build()
             .expect("test runtime");
         let mut app = App::new(runtime.handle().clone());
-        // E10c-R01：生产默认活时钟；测试宿主必须切回引擎时钟（`TestApp::advance` 是唯一
-        // 推进源，一次性定时器的 deadline 要能精确断言）。
         app.use_engine_clock();
         let window = app.create_window(options);
         Self {
@@ -88,59 +60,35 @@ impl TestApp {
         }
     }
 
-    /// 当前窗口句柄。
     #[must_use]
     pub fn window_id(&self) -> WindowId {
         self.window
     }
 
-    /// 只读 `App`（写信号 / 建树需要 `app_mut`）。
     #[must_use]
     pub fn app(&self) -> &App {
         &self.app
     }
 
-    /// 可变 `App`（`NodeBuilder::build` / `App::write` / 字体栈）。
     #[must_use]
     pub fn app_mut(&mut self) -> &mut App {
         &mut self.app
     }
 
-    /// 推进**一帧**（空闲帧也返回记录：`rendered == false`）。
-    ///
-    /// 一次 `drain` = 生产泵的一轮：帧 → a11y 交付 → 跨线程回投任务（R13-12）。
-    ///
-    /// 捕获打开时，本帧的 a11y 交付**立即**挂到记录上（不看 `A11Y_THROTTLE`）：
-    /// 这是断言面最直接的语义（「本帧有没有 a11y 工作」）。
-    ///
-    /// # Errors
-    /// `EngineError::InvalidMeasure` / `TextShape` / `AtlasExhausted`：本帧已中止（未提交），
-    /// damage/dirty 保留，下一次 `drain` 重试。
     pub fn drain(&mut self) -> Result<&FrameRecord, EngineError> {
         self.step(A11yGate::Immediate)
     }
 
-    /// 推进一帧，a11y 交付走**平台泵**的闸门：单点数据增量在 `A11Y_THROTTLE`（100 ms）内不
-    /// 交付；焦点变化 / 消费端重置 / 分批未走完（首树、DPI 重建）走不节流旁路（E5）。
-    ///
-    /// 帧脚本（[`super::script`]）用它断言「第 k 帧的 a11y 交付被节流」——节流是平台泵的行为，
-    /// [`Self::drain`] 的立即交付抓不到它。
-    ///
-    /// # Errors
-    /// 同 [`Self::drain`]。
     pub fn drain_pump(&mut self) -> Result<&FrameRecord, EngineError> {
         self.step(A11yGate::Pump)
     }
 
-    /// 两条 drain 路径的共同实现（a11y 交付闸门是唯一差异）。
     fn step(&mut self, gate: A11yGate) -> Result<&FrameRecord, EngineError> {
         let outcome = self
             .app
             .frame(self.window)
             .expect("TestApp's window must exist");
         outcome?;
-        // P11：a11y 交付在**帧之后**（与平台泵的 `update_a11y` 同序）。纯 `A11Y` 变化不提交帧，
-        // 所以这一步与 `FrameOutcome` 无关（`FrameRecord.a11y` 在空闲帧也存在）。
         let deliver = self.a11y_capture
             && match gate {
                 A11yGate::Immediate => true,
@@ -149,7 +97,6 @@ impl TestApp {
         self.last_a11y_update = None;
         self.a11y_contract_error = None;
         if deliver && let Some(snapshot) = self.app.a11y_take(self.window) {
-            // 与生产**完全同一条**组装路径：`to_tree_update` 是平台泵闭包里的那个函数。
             let update = crate::a11y::adapter::to_tree_update(&snapshot);
             if let Err(error) = self.a11y_shadow.apply(&update) {
                 self.a11y_contract_error = Some(error);
@@ -157,9 +104,6 @@ impl TestApp {
             self.last_a11y_update = Some(update);
             self.app.attach_a11y(self.window, snapshot);
         }
-        // ⑤ 跨线程回投的任务（R13-12）：与平台泵**同序**（帧 → a11y → 任务）。任务里写下的
-        // 状态因此在本轮帧之后才可见 —— 依赖 dispatcher 时序的 bug（"任务写状态但当轮不出帧"
-        // 或"任务在帧之前跑"）在这条路径上会直接现形。
         self.pump_tasks();
         if let Some(frame) = self.frame_record().frame.clone() {
             self.last_rendered = Some(frame);
@@ -167,7 +111,6 @@ impl TestApp {
         Ok(self.frame_record())
     }
 
-    /// 执行本轮回投的任务（消费者：`step`；与平台泵的 ⑤ 一一对应）。
     fn pump_tasks(&mut self) {
         let dispatcher = self.app.dispatcher();
         for task in dispatcher.drain_tasks() {
@@ -176,20 +119,16 @@ impl TestApp {
         }
     }
 
-    /// 跨线程句柄（`App::handle` 的转发）：测试可以用 `send` 真走
-    /// `Dispatcher::push → drain_tasks → UserTask::run` 三层（R13-12）。
     #[must_use]
     pub fn handle(&self) -> AppHandle {
         self.app.handle()
     }
 
-    /// 累计执行过的回投任务数（R13-12 的断言面）。
     #[must_use]
     pub fn tasks_run(&self) -> usize {
         self.tasks_run
     }
 
-    /// 最近一次 `drain` 的调度记录。
     #[must_use]
     pub fn frame_record(&self) -> &FrameRecord {
         self.app
@@ -199,13 +138,11 @@ impl TestApp {
             .expect("drain() must have produced a frame record")
     }
 
-    /// 最近一次提交的绘制快照（空闲帧 → `None`）。
     #[must_use]
     pub fn rendered(&self) -> Option<&RenderedFrame> {
         self.frame_record().frame.as_ref()
     }
 
-    /// 探针（节点树 + 场景只读）。
     #[must_use]
     pub fn probe(&self) -> Probe<'_> {
         let window = self
@@ -215,68 +152,45 @@ impl TestApp {
         Probe::new(window.tree())
     }
 
-    /// 打开 a11y 快照捕获：之后每次 `drain` 都把本帧的交付写进 `FrameRecord.a11y`。
-    ///
-    /// 首帧恒为全树（`A11yBridge.full_pending`），捕获开关只允许一个 drainer（生产里是平台
-    /// adapter）：同一时刻只允许一个 drainer。
     pub fn enable_a11y_capture(&mut self) {
         self.a11y_capture = true;
         self.app.set_a11y_capture(self.window, true);
     }
 
-    /// 最近一帧的 a11y 交付（`None` = 本帧没有 a11y 工作，或捕获未打开）。
     #[must_use]
     pub fn a11y(&self) -> Option<&crate::a11y::A11yTreeSnapshot> {
         self.frame_record().a11y.as_ref()
     }
 
-    /// 最近一帧的 **`TreeUpdate`**（生产 `build_update` 的同一条组装路径）。
-    ///
-    /// 与 [`Self::a11y`] 的区别是"测试面与生产面统一"：AT 实际收到的是 `TreeUpdate`，
-    /// 快照只是引擎侧的中间表示（R13-5/R13-10）。
     #[must_use]
     pub fn a11y_update(&self) -> Option<&accesskit::TreeUpdate> {
         self.last_a11y_update.as_ref()
     }
 
-    /// 最近一帧 `TreeUpdate` 的契约校验错误（`None` = 合法）。
     #[must_use]
     pub fn a11y_contract_error(&self) -> Option<&str> {
         self.a11y_contract_error.as_deref()
     }
 
-    /// 最近一帧的 `TreeUpdate` 必须是**合法**的 AccessKit 更新。
-    ///
-    /// # Panics
-    /// 违反契约（错误信息指出哪个 id、哪条规则）。
     pub fn assert_a11y_contract(&self) {
         if let Some(error) = &self.a11y_contract_error {
             panic!("TreeUpdate violates the AccessKit contract: {error}");
         }
     }
 
-    /// a11y 影子树的摘要（`id -> 语义摘要`；全量/增量一致性见 [`Self::a11y_oracle_diff`]）。
     #[must_use]
     pub fn a11y_shadow_summaries(&self) -> ahash::HashMap<accesskit::NodeId, String> {
         self.a11y_shadow.summaries()
     }
 
-    /// a11y oracle：**增量累积**出来的树 vs **强制全树**重建的树。
-    ///
-    /// 这是 a11y 版的 `assert_oracle`（R13-11）：所有"忘记 `mark_a11y`"的 bug 都会让两条路径
-    /// 分叉，变成红灯。比较项：节点集合 / 每节点语义摘要 / 父子结构。
-    ///
-    /// 需要先 `enable_a11y_capture()`（否则没有交付可以比较）。
     pub fn a11y_oracle_diff(&mut self) -> Option<String> {
         assert!(
             self.a11y_capture,
             "a11y oracle requires enable_a11y_capture()"
         );
-        // ① 增量侧：当前状态照常交付，影子树是"逐笔累积"的结果。
         let _ = self.drain().expect("incremental a11y frame");
         let incremental = self.a11y_shadow.summaries();
         let incremental_structure = self.a11y_shadow.structure();
-        // ② 全量侧：强制全树交付，用一份新的影子树描述"从头建"的结果。
         self.app
             .window_mut(self.window)
             .expect("TestApp's window must exist")
@@ -332,32 +246,18 @@ impl TestApp {
         None
     }
 
-    /// 差异即 panic（a11y 版 `assert_oracle`）。
-    ///
-    /// # Panics
-    /// 增量与全量描述的状态不一致（打印第一处差异）。
     pub fn assert_a11y_oracle(&mut self) {
         if let Some(diff) = self.a11y_oracle_diff() {
             panic!("inconsistent a11y tree: {diff}");
         }
     }
 
-    /// 注入一个输入事件：走**与平台泵相同**的 `App::dispatch_input`（命中 / 焦点 / 拖拽 / 动作 / 滚动）。
-    ///
-    /// 事件时间戳被换成**可控时钟**（`App::clock`）：双击窗口、连击计数与拖拽判定都以事件时刻
-    /// 为基准（R02-14），不这样做测试就无法用 `advance` 模拟「两次点击间隔 1 秒」。
     pub fn inject(&mut self, event: InputEvent) -> InputOutcome {
         let stamp = self.app.clock();
         self.app
             .dispatch_input(self.window, event.with_timestamp(stamp))
     }
 
-    /// 投递一个**平台事件**（`Event`：输入 / IME / DPI / 外观 / 焦点 / 尺寸…）。
-    ///
-    /// 走与平台泵**完全相同**的 `App::dispatch`（`crate::app::resources::dispatch`）：
-    /// ① `Event::Input` 立刻走一次交互分发；② 事件同时进有界观测队列（[`App::drain_events`]），
-    /// 应用侧因此真的能「读到」字符输入 / IME 提交（`TestApp::inject` 只做 ①，不排队）。
-    /// 时间戳同样换成可控时钟（双击 / 连击 / 拖拽判定以它为基准）。
     pub fn dispatch_event(&mut self, event: Event) {
         let stamp = self.app.clock();
         let event = match event {
@@ -367,23 +267,15 @@ impl TestApp {
         self.app.dispatch(self.window, event);
     }
 
-    // ── E17：指针位置（注入 + 读取） ──────────────────────────────────────
-    //
-    // 三端平台泵的指针事件最终都走 `App::dispatch_input`，这里与它们**同一条**路径：
-    // 位置记录、hover / 光标解析、拖拽状态机都按真机语义跑，测试不另起一套捷径。
-
-    /// 最新指针位置（转发 [`App::pointer_position`]）。
     #[must_use]
     pub fn pointer_position(&self) -> Option<Point> {
         self.app.pointer_position(self.window)
     }
 
-    /// 注入一次「指针移动」（`PointerMove`）。
     pub fn move_pointer(&mut self, position: Point) -> InputOutcome {
         self.inject(InputEvent::pointer_move(position, Modifiers::empty()))
     }
 
-    /// 注入「指针进入 / 重新进入窗口」（`PointerEnter`，带进入点）。
     pub fn enter_pointer(&mut self, position: Point) -> InputOutcome {
         self.inject(InputEvent::PointerEnter {
             position,
@@ -392,7 +284,6 @@ impl TestApp {
         })
     }
 
-    /// 注入「指针离开窗口」（`PointerLeave`，带离开点）。
     pub fn leave_pointer(&mut self, position: Point) -> InputOutcome {
         self.inject(InputEvent::PointerLeave {
             position,
@@ -401,22 +292,18 @@ impl TestApp {
         })
     }
 
-    /// 推进测试时钟（双击窗口 / 动画 / 拖拽时间都读它；不改任何状态）。
     pub fn advance(&mut self, by: Duration) {
         self.app.advance_clock(by);
     }
 
-    /// 强制整棵树的 lane 失效（oracle 的「全量」路径）。
     pub fn invalidate_all_lanes(&mut self) {
         if let Some(window) = self.app.window_mut(self.window) {
             window.force_full_repaint();
         }
     }
 
-    /// 增量帧 vs 全量帧的差异（`None` = 一致；任何差异即 stale drawing）。
     pub fn oracle_diff(&mut self) -> Option<String> {
         self.drain().expect("incremental frame");
-        // 增量侧可能整帧空闲（lane 全部复用）——那时用最近一次提交的快照。
         let incremental = self
             .rendered()
             .cloned()
@@ -445,25 +332,12 @@ impl TestApp {
         None
     }
 
-    /// 差异即 panic（CI 必跑；设计 §3.8 的 full-refresh oracle）。
-    ///
-    /// # Panics
-    /// 两条路径的 `(primitive, order)` 序列或解析后的 quad 不同。
     pub fn assert_oracle(&mut self) {
         if let Some(diff) = self.oracle_diff() {
             panic!("stale drawing: {diff}");
         }
     }
 
-    /// 像素快照：Windows 上用 WARP 真渲染当前 `Scene`；macOS 用离屏 Metal；Linux 恒 `Gpu`
-    /// （`new_offscreen` 在 Wayland 下需要真实 `wl_surface`，因此 Linux 上没有离屏渲染器）。
-    ///
-    /// 两张图集都会上传：字形页恒上传（1 层）；图片图集的层数 = 已打开的页数，按已打开页逐层
-    /// 整页上传（没有图片时不传）。
-    ///
-    /// # Errors
-    /// [`SnapshotError::NoRenderer`]（本构建没有渲染器）或 [`SnapshotError::Gpu`]
-    /// （设备 / 管线 / 渲染 / 读回失败）。
     pub fn snapshot(&self, case: SnapshotCase) -> Result<SnapshotImage, SnapshotError> {
         debug_assert!(case.scale.factor() > 0.0, "snapshot scale must be positive");
         let window = self.app.window(self.window).ok_or(SnapshotError::Gpu {
@@ -475,8 +349,6 @@ impl TestApp {
             surface.width().max(1) as u32,
             surface.height().max(1) as u32,
         );
-        // 快照的渲染器是临时建的：页尺寸随整页上传一起给出（DEVIATIONS F-211），array 规格
-        // （页边长 + 层数）同样过线 —— 图片层数 = 当前打开的图集页数。
         let (glyph_page, glyph_pixels) = self.app.glyph_page_pixels();
         let mut renderer = Self::offscreen_renderer(size).map_err(gpu_error)?;
         renderer.queue_atlas_upload(
@@ -489,8 +361,6 @@ impl TestApp {
             &glyph_pixels,
             crate::render::DirtyRects::full(),
         );
-        // 图片图集：多页 texture array ⇒ 逐层整页上传；数组层数 = 已打开的页数；没有图片页时
-        // 什么都不传（占位数组 1 层）。
         let image_pages = self.app.resource_page_pixels_all();
         let image_layers = u32::try_from(image_pages.len()).expect("image page count fits u32");
         for (layer, (image_page, image_pixels)) in image_pages.into_iter().enumerate() {
@@ -519,7 +389,6 @@ impl TestApp {
         })
     }
 
-    /// 离屏渲染器（Windows：WARP；macOS：真实 Metal；Linux：构造期返回 `UnsupportedGpu`）。
     #[cfg(windows)]
     fn offscreen_renderer(
         size: (u32, u32),
@@ -534,7 +403,6 @@ impl TestApp {
         crate::render::backend::Renderer::new_offscreen(size)
     }
 
-    /// 当前窗口的**物理读回尺寸**（headless 窗口 = `size × scale` 的 covering）。
     fn readback_surface(&self) -> ((u32, u32), crate::math::Scale) {
         let window = self
             .app
@@ -553,22 +421,10 @@ impl TestApp {
         )
     }
 
-    /// 当前窗口的像素读回（真实 GPU 离屏渲染；**不应用**合成端滚动偏移）。
-    ///
-    /// 与 [`Self::snapshot`] 同一条读回链路，但尺寸取自窗口本身（不是 `SnapshotCase`），
-    /// 供端到端冒烟测试断言「输入 → 绘制 → 呈现」的最后一跳。
-    ///
-    /// # Errors
-    /// 同 [`Self::snapshot`]。
     pub fn read_pixels(&self) -> Result<SnapshotImage, SnapshotError> {
         self.read_pixels_with_scroll(&[])
     }
 
-    /// 当前窗口的像素读回，并**应用调用方给出的合成端滚动槽表**（见
-    /// [`super::pixels::render_offscreen`] 的「表从哪来」）。
-    ///
-    /// # Errors
-    /// 同 [`Self::snapshot`]。
     pub fn read_pixels_with_scroll(
         &self,
         scroll: &[super::pixels::ScrollSlot],
@@ -583,7 +439,6 @@ impl TestApp {
         super::pixels::render_offscreen(&self.app, window, size, scale, scroll).map_err(gpu_error)
     }
 
-    /// 单窗口借用视图（多窗口驱动的入口）。
     pub fn window(&mut self) -> TestWindow<'_> {
         TestWindow {
             app: &mut self.app,
@@ -598,26 +453,18 @@ fn gpu_error(error: EngineError) -> SnapshotError {
     }
 }
 
-/// 一帧的 a11y 交付闸门（平台泵与测试捕获是两条消费路径）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum A11yGate {
-    /// 捕获打开即交付（`TestApp::drain` 的既有语义）。
     Immediate,
-    /// 与平台泵一致：`App::a11y_pending` 为假（含 `A11Y_THROTTLE` 未到期）就不交付。
     Pump,
 }
 
-/// 多窗口驱动：借用 `App` + 一个 `WindowId`。
 pub struct TestWindow<'a> {
     app: &'a mut App,
     id: WindowId,
 }
 
 impl TestWindow<'_> {
-    /// 该窗口推进一帧。
-    ///
-    /// # Errors
-    /// 同 [`TestApp::drain`]。
     pub fn drain(&mut self) -> Result<FrameOutcome, EngineError> {
         match self.app.frame(self.id) {
             Some(result) => result,
@@ -625,7 +472,6 @@ impl TestWindow<'_> {
         }
     }
 
-    /// 最近一次帧记录。
     #[must_use]
     pub fn frame_record(&self) -> &FrameRecord {
         self.app
@@ -635,7 +481,6 @@ impl TestWindow<'_> {
             .expect("drain() must have produced a frame record")
     }
 
-    /// 探针。
     #[must_use]
     pub fn probe(&self) -> Probe<'_> {
         let window = self.app.window(self.id).expect("window must exist");
@@ -755,9 +600,6 @@ mod tests {
         assert!(!app.frame_record().damage.is_empty());
     }
 
-    /// A1（脏子树剪枝）之后 `PaintLog` 只记录**被访问**的 lane：第二帧的脏闭包只有绑定节点
-    /// 及其祖先链，未变化的兄弟子树整棵跳过。语义从「未变化节点必须复用 lane」收敛为
-    /// 「未变化节点不被访问、被访问且未重建的 lane 全部复用」。
     #[test]
     fn second_drain_visits_only_the_changed_closure() {
         let mut app = TestApp::new();
@@ -814,7 +656,6 @@ mod tests {
         assert!(app.oracle_diff().is_none());
     }
 
-    /// 快照在各平台的**类型化**结果（S-124：mac 真读回、Linux 真读回、Windows WARP 真渲染）。
     #[test]
     fn snapshot_result_is_typed_per_platform() {
         let app = TestApp::new();
@@ -826,7 +667,6 @@ mod tests {
         });
         #[cfg(windows)]
         {
-            // Windows：WARP 真渲染（空场景 ⇒ 全透明的 64×64）。
             let image = result.expect("WARP snapshot");
             assert_eq!((image.width, image.height), (64, 64));
             assert_eq!(image.rgba8.len(), 64 * 64 * 4);
@@ -834,15 +674,12 @@ mod tests {
         }
         #[cfg(target_os = "macos")]
         {
-            // macOS：真实 Metal 离屏渲染（F-137：`new_offscreen` 可用，`Readback` 真实读回）。
             let image = result.expect("Metal offscreen snapshot");
             assert_eq!((image.width, image.height), (64, 64));
             assert_eq!(image.rgba8.len(), 64 * 64 * 4);
         }
         #[cfg(target_os = "linux")]
         {
-            // Linux：Vulkan 离屏渲染器（无 surface；F-150）。宿主没有 Vulkan 设备时是
-            // `SnapshotError::Gpu`（构造期失败），有设备时必须真读回一张 64×64。
             match result {
                 Ok(image) => {
                     assert_eq!((image.width, image.height), (64, 64));
@@ -860,10 +697,6 @@ mod tests {
         }
     }
 
-    /// **文本像素级断言**（V-64 的回归面）：黑底白字，离屏读回后必须真有亮像素，
-    /// 且覆盖率既不是 0 也不是整屏。只看 `GlyphRun` 实例/UV 字段抓不到上传或采样的错位。
-    ///
-    /// 仅 Windows（WARP）：这是字形页上传/采样的回归面，宿主无关的断言在 `frame_record` 里。
     #[cfg(windows)]
     #[test]
     fn rendered_text_produces_visible_glyph_pixels() {
@@ -996,7 +829,6 @@ mod tests {
     }
 }
 
-/// P10 的端到端用例（`TestApp::inject` 走与平台泵相同的分发路径）。
 #[cfg(test)]
 mod p10_tests {
     use super::TestApp;
@@ -1093,7 +925,6 @@ mod p10_tests {
             .expect("scroll");
         let record = app.drain().expect("scroll frame");
 
-        // 视口 100×100（物理像素）+ AA 外扩 1 px（`DamageAccumulator::push` 的固定外扩）。
         let allowed = crate::math::PhysicalRect::new(-1, -1, 101, 101);
         assert!(!record.damage.is_empty(), "滚动必须产生 damage");
         for rect in &record.damage {
@@ -1153,7 +984,6 @@ mod p10_tests {
 
         assert_eq!(*app.app().read_transient(&transient), 1.0);
         assert!(!app.app().animations_running(window));
-        // 再推进一帧：没有脏位 ⇒ Idle（不提交、FrameIndex 不变）。
         let before = app.app().window(window).expect("window").frame_index();
         app.drain().expect("idle frame");
         let after = app.app().window(window).expect("window").frame_index();
@@ -1240,7 +1070,6 @@ mod p10_tests {
         app.app_mut()
             .set_scroll_content(&inner_handle, crate::math::Size::new(200.0, 240.0))
             .expect("inner content");
-        // 外层先滚 30（内层屏幕 y = 100 − 30 = 70），把这一帧的 damage 消费掉。
         app.app_mut()
             .scroll_to(&outer_handle, Point::new(0.0, 30.0))
             .expect("outer scroll");
@@ -1251,7 +1080,6 @@ mod p10_tests {
             .expect("inner scroll");
         let record = app.drain().expect("inner frame");
 
-        // 内层视口在屏幕上 = (0, 70, 200, 70+200) + 1 px AA 外扩。
         let allowed = crate::math::PhysicalRect::new(-1, 69, 201, 271);
         assert!(!record.damage.is_empty(), "内层滚动必须产生 damage");
         for rect in &record.damage {
@@ -1308,7 +1136,6 @@ mod p10_tests {
             .expect("move focus");
         let record = app.drain().expect("unfocus frame");
 
-        // 环外扩 = bounds.outset(offset 2 + width 2) ⇒ (6, 6, 48, 48) → 物理像素覆盖 (6,6)-(54,54)。
         assert!(
             record
                 .damage
@@ -1320,7 +1147,6 @@ mod p10_tests {
     }
 }
 
-/// P11 的端到端用例：`TestApp` 在每帧之后交付一笔 a11y 快照（与平台泵同序）。
 #[cfg(test)]
 mod p11_tests {
     use smol_str::SmolStr;
@@ -1361,7 +1187,6 @@ mod p11_tests {
         app.a11y().expect("本帧必须有一笔 a11y 交付")
     }
 
-    /// 虚拟列表容器所需的样式（`Clip::Bounds` + `position: relative`）。
     fn scroll_container_style(width: f32, height: f32) -> Style {
         let mut inner = taffy::Style::<SmolStr>::DEFAULT;
         inner.size = taffy::geometry::Size {
@@ -1375,7 +1200,6 @@ mod p11_tests {
         }
     }
 
-    /// 固定尺寸的普通容器样式（可以挂子节点；`layout_override` 的节点是叶子）。
     fn fixed_size_style(width: f32, height: f32) -> Style {
         let mut inner = taffy::Style::<SmolStr>::DEFAULT;
         inner.size = taffy::geometry::Size {
@@ -1388,7 +1212,6 @@ mod p11_tests {
         }
     }
 
-    /// `parent` 的第一个物理子节点（测试里从容器取刚建出来的子节点）。
     fn child_of(app: &TestApp, parent: NodeId) -> NodeId {
         let window = app.window_id();
         app.app()
@@ -1586,7 +1409,6 @@ mod p11_tests {
             vec![child_id],
             "父的 children 必须与节点树一致（稳定 id）"
         );
-        // 同一笔里父的 children 引用的 id 必须与子节点自身的 id 相同（不是两套编码）。
         assert_eq!(
             snap.node_for(panel).expect("panel").children,
             vec![child_id]
@@ -1716,7 +1538,6 @@ mod p11_tests {
                     ..StylePatch::default()
                 },
             );
-        // 直接写 patch 不经过 `refresh_styles`，这里显式标脏（生产路径由 `refresh_styles` 负责）。
         app.app_mut()
             .window_mut(window)
             .expect("window")
@@ -1821,11 +1642,6 @@ mod p11_tests {
         let _ = Point::ZERO;
     }
 
-    // ── E15：a11y 增量修复（Focus / 容器角色 / 行动态刷新） ──────────────────
-
-    /// E15（P2-4c2 / P2-4d2 的 Focus 增量失败面）：祖先的 `visible` 翻转会改变**后代**的
-    /// 可聚焦性，但后代自己没有脏位。旧实现只标祖先 ⇒ 增量笔里 `Tab` 仍是 `actions=[Click]`
-    /// 的旧记录，全树却是 `[Click, Focus]`，`a11y_oracle_diff` 分叉。
     #[test]
     fn a11y_revealing_an_ancestor_refreshes_descendant_focus_incrementally() {
         let mut app = TestApp::new();
@@ -1881,12 +1697,9 @@ mod p11_tests {
             revealed.id_for_engine(panel),
             "重发记录仍挂原 a11y 父"
         );
-        // 增量 vs 全树 oracle：这正是 P2-4c2/P2-4d2 报告的分叉（修复后必须一致）。
         app.assert_a11y_oracle();
     }
 
-    /// E15：祖先的 `interactive` 翻转同样会改变后代的 `disabled` 与动作能力（命中/焦点/a11y
-    /// 共用同一继承判据）；增量笔必须把后代一起重发。
     #[test]
     fn a11y_enabling_an_ancestor_refreshes_descendant_actions() {
         let mut app = TestApp::new();
@@ -1948,12 +1761,6 @@ mod p11_tests {
         app.assert_a11y_oracle();
     }
 
-    /// E15：标签页的选中态走动态补丁；切换后增量笔必须刷新两个 Tab 的 `selected`。
-    ///
-    /// `Focus` 能力在本用例里只是**不变式**（`Tab` 角色 + `tab_stop`）——本用例走 a11y-only
-    /// pass，退回 `mark_a11y(node)` 也仍会绿，因此**不是** Focus 祖先链增量的回归证据（审查
-    /// F8 的归因收窄；真正的证据是 `a11y_revealing_an_ancestor_refreshes_descendant_focus_incrementally`
-    /// 与 `a11y_enabling_an_ancestor_refreshes_descendant_actions`）。
     #[test]
     fn a11y_tab_switch_refreshes_selection() {
         let mut app = TestApp::new();
@@ -2052,9 +1859,6 @@ mod p11_tests {
         app.assert_a11y_oracle();
     }
 
-    /// E15：祖先的动态 `role` 会改变**后代被推导出来的角色**（输入框里的文本是 `TextRun`，
-    /// 普通容器里的文本是 `Label`）。旧实现只标祖先 ⇒ 后代的角色在增量笔里保持旧值，与全树
-    /// 分叉（`affects_descendants` 的失败面）。
     #[test]
     fn a11y_role_change_refreshes_descendant_derived_roles() {
         let mut app = TestApp::new();
@@ -2112,11 +1916,6 @@ mod p11_tests {
         app.assert_a11y_oracle();
     }
 
-    /// E15b F2：`bind_a11y` 在**普通帧**里的第二个写点（节点同时有 `bind_style`/`bind_text`
-    /// 时帧走 style pass，不进 a11y-only pass）也必须做 `affects_descendants` 子树标记。
-    ///
-    /// 变异守卫：把 `app/style_pass.rs` 的写回退回 `mark_a11y(node)` ⇒ 文本子节点在增量笔里
-    /// 缺席 / 角色停在 `Label`（oracle 红）。
     #[test]
     fn a11y_role_change_through_the_style_pass_refreshes_descendant_roles() {
         let mut app = TestApp::new();
@@ -2129,8 +1928,6 @@ mod p11_tests {
                     label: Some(SmolStr::new_static("价格")),
                     ..A11yOverride::default()
                 })
-                // 与 `bind_a11y` 读同一个信号：节点因此有像素工作，帧走普通 style pass
-                // （`refresh_styles` 里的 bind_a11y 写点），而不是 a11y-only pass。
                 .bind_style(move |cx| StylePatch {
                     opacity: Some(if *cx.read(&as_input) { 0.5 } else { 1.0 }),
                     ..StylePatch::default()
@@ -2179,10 +1976,6 @@ mod p11_tests {
         app.assert_a11y_oracle();
     }
 
-    /// E15b F3：`App::set_a11y_patch`（应用显式通道）与 `bind_a11y` 共用同一份差分 ——
-    /// 祖先 `role` 变化同样必须重发后代（旧实现只标本节点）。
-    ///
-    /// 变异守卫：`set_a11y_patch` 退回 `mark_a11y(node)` ⇒ 本用例红。
     #[test]
     fn a11y_set_patch_refreshes_descendant_derived_roles() {
         let mut app = TestApp::new();
@@ -2235,11 +2028,6 @@ mod p11_tests {
         app.assert_a11y_oracle();
     }
 
-    /// E15b F6（审查 M8 的零测试缺口）：祖先的 `hidden` 变化会改变**被集合领养的后代**的
-    /// 隐藏语义（`hidden_by_skipped_ancestors`：被跳过的物理祖先的隐藏声明沿 a11y 子树继承），
-    /// 但后代没有自己的脏位 —— `affects_descendants` 的 `hidden` 分支必须标子树。
-    ///
-    /// 变异守卫：删掉 `A11yPatch::affects_descendants` 的 `hidden` 比较 ⇒ 本用例红。
     #[test]
     fn a11y_hidden_change_refreshes_adopted_descendant_hidden() {
         let mut app = TestApp::new();
@@ -2256,8 +2044,6 @@ mod p11_tests {
                 .id("table")
                 .build(tree, root)
                 .expect("table");
-            // 包裹层是被集合领养**跳过**的物理祖先：它的 hidden 不沿物理父链继承，而是由
-            // `hidden_by_skipped_ancestors` 折算到 Row 自己的记录上 —— Row 因此没有脏位。
             let wrapper = NodeBuilder::boxed()
                 .style(fixed_size_style(200.0, 20.0))
                 .bind_a11y(move |cx| A11yPatch {
@@ -2302,9 +2088,6 @@ mod p11_tests {
         app.assert_a11y_oracle();
     }
 
-    /// E15：虚拟列表行的 a11y 可以在**面板打开期间**动态刷新（静态快照行补丁 → `set_a11y_patch`
-    /// 通道）。行由列表内核持有、应用拿不到 builder，因此这是 `List::set_row_a11y` 这类静态行
-    /// 快照的动态失效面（P2-4c2 F10 / kit-menu 缺口 3）。
     #[test]
     fn a11y_virtual_rows_refresh_while_the_panel_stays_open() {
         let mut app = TestApp::new();
@@ -2404,8 +2187,6 @@ mod p11_tests {
         app.assert_a11y_oracle();
     }
 
-    /// E15：行 a11y 的 `ReadCtx` 动态通道（推荐给 base_ui 的 `Fn(&mut ReadCtx, usize)` 形态）：
-    /// 行 `bind_a11y` 读选中集信号 ⇒ 信号写自动失效、增量笔刷新 `selected`/`checked`。
     #[test]
     fn a11y_virtual_rows_follow_a_selection_signal() {
         let mut app = TestApp::new();
@@ -2444,7 +2225,6 @@ mod p11_tests {
             })
             .expect("items");
         let _ = app.drain().expect("settle");
-        // 行在布局/挂载后才有 `bind_a11y` 求值；先让绑定落定再开捕获，首笔全树才是稳定状态。
         app.enable_a11y_capture();
         let _ = app.drain().expect("seed");
         let rows: Vec<NodeId> = app
@@ -2531,7 +2311,6 @@ mod p11_fix_tests {
         build(tree, root)
     }
 
-    /// 审查 #1：窗口 resize 后子孙的布局盒变了，增量笔必须把它们重发。
     #[test]
     fn a11y_bounds_follow_window_resize() {
         let mut app = TestApp::new();
@@ -2566,7 +2345,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// 审查 #2：`set_layout_override` / `set_style` 等走 `invalidate_layout` 的路径必须标 `A11Y`。
     #[test]
     fn a11y_bounds_follow_layout_override() {
         let mut app = TestApp::new();
@@ -2602,7 +2380,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// 审查 #3：普通滚动（非 a11y action）也必须让容器的 a11y 子树失效。
     #[test]
     fn a11y_bounds_follow_scroll() {
         let mut app = TestApp::new();
@@ -2667,12 +2444,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// E2 端到端：分批首树尚未跑完时滚动一次，**已交付**的行必须在后续笔重发新 bounds。
-    ///
-    /// 修前行为：滚动把整棵子树标脏（`a11y_note_scroll` → `invalidate_subtree`），但已交付行
-    /// 仍占着 `queued` 去重名额 ⇒ 后续笔只有尚未交付的行，读屏的高亮框/命中区域停在旧位置。
-    ///
-    /// 变异守卫：删掉交付后的 `queued.remove` ⇒ `node_for(rows[0])` 变 None 或 bounds 不变。
     #[test]
     fn a11y_scroll_during_a_batched_first_tree_is_not_lost() {
         let mut app = TestApp::new();
@@ -2694,7 +2465,6 @@ mod p11_fix_tests {
                 .build(tree, root)
                 .expect("container")
         });
-        // 3000 行 ⇒ 首笔 2048 节点后队列还剩 953 个未交付节点（分批运行**未结束**）。
         let rows: Vec<NodeId> = {
             let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
             (0..3000)
@@ -2720,7 +2490,6 @@ mod p11_fix_tests {
         assert!(first.full, "首笔必须是全树");
         let before = first.node_for(rows[0]).expect("行 0 必须已交付").bounds;
 
-        // 分批运行中滚动：整棵子树 bounds 变化。
         app.app_mut()
             .scroll_to(&handle, crate::math::Point::new(0.0, 120.0))
             .expect("scroll to");
@@ -2737,7 +2506,6 @@ mod p11_fix_tests {
         app.assert_a11y_contract();
     }
 
-    /// 审查 #6：写 `bind_a11y` 的信号**不得**产生任何像素（Idle、无 damage、无 PAINT）。
     #[test]
     fn a11y_bind_a11y_write_is_idle_without_damage() {
         let mut app = TestApp::new();
@@ -2798,14 +2566,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// E1 端到端：AT 重新激活（消费端重置）后，**不推进时钟**也必须立即交付全树。
-    ///
-    /// 修前行为：平台激活回调拿到 `None` 后 AccessKit 停在 `Pending`；`drain_pump` 走生产闸门
-    /// `App::a11y_pending`，重置后既没有脏位、也不节流旁路 ⇒ 永远不交付（AT 永久空树）；
-    /// 若有脏位则交付增量（`tree: None`）⇒ `accesskit_consumer::Tree::new` panic。
-    ///
-    /// 变异守卫：删掉 `App::a11y_pending` 的 epoch 旁路（泵不交付）或 `take` 的全树升级
-    /// （`tree: None`）⇒ 本用例红。
     #[test]
     fn a_consumer_epoch_reset_delivers_a_full_tree_without_advancing_the_clock() {
         let mut app = TestApp::new();
@@ -2820,7 +2580,6 @@ mod p11_fix_tests {
                 .build(tree, root)
                 .expect("button")
         });
-        // 首笔全树（生产闸门：首笔不受节流影响）。
         let _ = app.drain_pump().expect("首帧");
         assert!(
             app.a11y_update().expect("首笔").tree.is_some(),
@@ -2828,8 +2587,6 @@ mod p11_fix_tests {
         );
         app.assert_a11y_contract();
 
-        // 标脏一笔增量：时钟不动 ⇒ 仍在 `A11Y_THROTTLE` 窗口内，普通脏位不得交付
-        // （先证明节流仍然有效，否则"不推进时钟"这个前提没有意义）。
         app.app_mut()
             .window_mut(window)
             .expect("window")
@@ -2840,7 +2597,6 @@ mod p11_fix_tests {
             "限流窗口内的普通脏位不得立即交付"
         );
 
-        // 消费端重置（平台 adapter 的激活/停用回调）：必须立即、全量交付。
         let epoch = app
             .app()
             .window(window)
@@ -2857,7 +2613,6 @@ mod p11_fix_tests {
             "重置后的第一笔必须携带 TreeInfo（否则 consumer panic / AT 空树）"
         );
         app.assert_a11y_contract();
-        // 额外用一份**空**影子树应用该笔：模拟 AT 重新接入时消费端从零开始。
         let mut fresh = crate::test_support::a11y::ShadowTree::new();
         fresh
             .apply(&update)
@@ -2865,12 +2620,9 @@ mod p11_fix_tests {
         assert!(fresh.len() >= 2, "全树笔必须覆盖根 + 按钮");
     }
 
-    /// 造一个「输入框 + 单行子文本」的夹具，返回 TextRun 的引擎句柄。
     fn text_run_fixture(app: &mut TestApp, text: &'static str, style: TextStyle) -> NodeId {
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
-        // 输入框必须有真实布局（可容纳子文本节点）：用显式尺寸的 Style，不能用
-        // `layout_override`（那是叶子节点的绝对定位覆盖，禁止带子节点）。
         let mut inner = taffy::Style::<SmolStr>::DEFAULT;
         inner.size = taffy::geometry::Size {
             width: taffy::style::Dimension::length(240.0),
@@ -2902,10 +2654,6 @@ mod p11_fix_tests {
             .expect("text run")
     }
 
-    /// E4b：单行显式 LTR 的 TextRun 必须输出 `character_positions` / `character_widths` +
-    /// `text_direction`，且与真实 caret 一致（AccessKit 的 caret 高亮 / 屏幕放大镜依赖它）。
-    ///
-    /// 两条 shape 路径各测一遍：`"价🌍ab"`（parley，CJK+emoji）与 `"42150"`（数字快速路径）。
     #[test]
     fn text_run_exposes_character_metrics_for_a_single_ltr_line() {
         for (text, expected_lengths, caret_byte, position_index) in [
@@ -2977,7 +2725,6 @@ mod p11_fix_tests {
                 "{text:?}"
             );
 
-            // 与真实 caret 交叉验证：caret 物理 x − 节点 bounds 原点 == positions[i]。
             let caret = app
                 .app()
                 .window(window)
@@ -2995,8 +2742,6 @@ mod p11_fix_tests {
         }
     }
 
-    /// E4b：多行 TextRun **省略**字符度量（AccessKit 的位置模型忽略 y，多行发出去会命中错行）
-    /// —— 策略是"省略而不是发错值"，AT 回退到无 caret 高亮。
     #[test]
     fn multi_line_text_run_omits_character_metrics() {
         let mut app = TestApp::new();
@@ -3036,22 +2781,12 @@ mod p11_fix_tests {
         );
     }
 
-    /// E4b：`TextDirection::Auto`（`TextStyle` 的默认值）**且解析后是 LTR** ⇒ 必须输出字符度量。
-    ///
-    /// 修复前按 `TextStyle.direction` 的**字面值**判（`!= Ltr` 就直接省略）：默认样式的应用
-    /// 与 demo 都拿不到 `character_positions`，读屏的字符级 caret 高亮 / 文本定位不可用
-    /// （Chromium `AXPlatformNodeTextRangeProvider` 与 Qt
-    /// `QAccessibleTextInterface::characterRect` 对文本域恒提供字符度量）。
-    ///
-    /// 两条 shape 路径各测一遍：`"Hello"`（parley，`Auto` 基准方向解析成 LTR）与 `"42150"`
-    /// （数字快速路径，`Simple` 快照）。
     #[test]
     fn auto_direction_text_run_exposes_character_metrics_for_ltr_text() {
         for (text, caret_byte, position_index) in [("Hello", 2_usize, 2_usize), ("42150", 3, 3)] {
             let mut app = TestApp::new();
             app.enable_a11y_capture();
             let window = app.window_id();
-            // `TextStyle::new` 的方向就是 `Auto`（不显式声明）。
             let run = text_run_fixture(&mut app, text, TextStyle::new(20.0));
             let _ = app.drain().expect("frame");
             app.assert_a11y_contract();
@@ -3102,7 +2837,6 @@ mod p11_fix_tests {
                 "{text:?}"
             );
 
-            // 与真实 caret 交叉验证：caret 物理 x − 节点 bounds 原点 == positions[i]。
             let caret = app
                 .app()
                 .window(window)
@@ -3120,8 +2854,6 @@ mod p11_fix_tests {
         }
     }
 
-    /// E4b：`Auto` + CJK/emoji（**非 ASCII**，但都是 LTR 强方向）⇒ 仍然输出字符度量 ——
-    /// 方向判定看解析结果，不是「非 ASCII 就不给」。
     #[test]
     fn auto_direction_cjk_text_run_exposes_character_metrics() {
         let mut app = TestApp::new();
@@ -3163,7 +2895,6 @@ mod p11_fix_tests {
             "CJK/emoji 的 advance 必须为正：{:?}",
             record.character_widths
         );
-        // 与真实 caret 交叉验证：第 2 个 grapheme（🌍）的起点 = 字节 3。
         let caret = app
             .app()
             .window(window)
@@ -3180,8 +2911,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// E4b：`Auto` 但段落里出现 **RTL run** ⇒ 省略字符度量 —— 段内混排表达不了
-    /// （`character_positions` 只有一条 `text_direction` 轴，发出去会让 caret 命中错轴）。
     #[test]
     fn auto_direction_text_run_omits_character_metrics_when_a_run_is_rtl() {
         let mut app = TestApp::new();
@@ -3216,8 +2945,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// E4b：显式 `TextDirection::Rtl` 仍**省略**字符度量（RTL 的 inline 轴与 AccessKit 的 LTR
-    /// 位置模型相反，D6-A；现状保持）。
     #[test]
     fn rtl_direction_text_run_omits_character_metrics() {
         let mut app = TestApp::new();
@@ -3247,9 +2974,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// RE-02：TextRun 的 `A11yPatch::value` 覆盖与真实 shape 文本不一致时，`character_lengths`
-    /// 描述的是 value 串、而位置只能描述真实文本 —— 两者不一致 ⇒ **省略**位置/宽度（AT 回退），
-    /// 绝不再发出「重复位置 + 零宽尾部」的错位 caret 表。
     #[test]
     fn a_value_override_that_disagrees_with_the_shaped_text_omits_character_metrics() {
         let mut app = TestApp::new();
@@ -3310,12 +3034,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// RBA-01：RE-02 守卫的**等长缺口** —— `A11yPatch::value` 覆盖成与 shape 文本**等字节长度、
-    /// 等 grapheme 数**但内容不同的字符串（`"ab"` → `"xy"`）时，`character_lengths` 描述 value 串、
-    /// 位置却只能描述已 shape 的 `"ab"` ⇒ 必须省略度量。
-    ///
-    /// 旧守卫只比「Σ character_lengths == 文本字节数」（2 == 2 ⇒ 通过），于是发出的是 `"ab"` 的
-    /// caret 表 —— AT 会把它当成 `"xy"` 的位置（整表错位）。修复前本用例红。
     #[test]
     fn an_equal_length_value_override_that_differs_from_the_shaped_text_omits_character_metrics() {
         let mut app = TestApp::new();
@@ -3377,11 +3095,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// RBA-03：单行判定的 **y 判据必须是承重的** —— `TextAlign::End` + 尾随硬换行时，末尾 caret
-    /// 的 x 恰好回到行尾（`delta == 0`，非负宽度守卫拦不住），只有「末尾 caret 与首个 grapheme
-    /// 起点同 y」能拦住第二行（空行）。逐 grapheme 的冗余 y 比较已删除。
-    ///
-    /// 修复前（删掉唯一的 y 判据）本用例红：会发出第二行的 caret（AT 的位置模型忽略 y）。
     #[test]
     fn end_aligned_text_with_a_trailing_line_break_omits_character_metrics() {
         let mut app = TestApp::new();
@@ -3412,8 +3125,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// RBA-04：`Auto` + **纯 RTL** 文本（首个强方向字符就是 RTL，段落解析成 RTL）⇒ 省略度量。
-    /// 与混排用例一起覆盖 `has_only_ltr_runs() == false` 的两条主路径。
     #[test]
     fn auto_direction_pure_rtl_text_run_omits_character_metrics() {
         let mut app = TestApp::new();
@@ -3436,7 +3147,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// 造 `count` 个固定几何的行（`layout_override` ⇒ 边界可预测，根的直接子节点）。
     fn rows_fixture(app: &mut TestApp, count: usize) -> Vec<NodeId> {
         let window = app.window_id();
         let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
@@ -3451,13 +3161,6 @@ mod p11_fix_tests {
             .collect()
     }
 
-    /// E5：分批首树**不节流** —— 不推进时钟（模拟时间静止）也必须逐批交付到收敛。
-    ///
-    /// 修前行为：`A11Y_THROTTLE` 对**每一笔**生效（首笔之后每批要等 100 ms），40k 节点 ≈
-    /// 20 × 100 ms ≈ 2 s。修后只有「单点高频增量」被 100 ms 合并；还有待发批次时立即继续。
-    ///
-    /// 变异守卫：删掉 `App::a11y_pending` 的 `a11y_backlog_pending()` 旁路 ⇒ 首笔之后
-    /// `a11y_pending` 为假（时钟未推进），循环一轮都跑不了，本用例红。
     #[test]
     fn a_large_first_tree_is_not_throttled() {
         let mut app = TestApp::new();
@@ -3485,7 +3188,6 @@ mod p11_fix_tests {
             "5000 节点必须分多批（实际 {batches} 笔；若只有 1 笔说明预算/语义被改动）"
         );
 
-        // 增量仍被 100 ms 合并：修复没有把「单点数据更新」也变成连续投递。
         app.app_mut()
             .window_mut(window)
             .expect("window")
@@ -3501,8 +3203,6 @@ mod p11_fix_tests {
         app.assert_a11y_contract();
     }
 
-    /// E5：DPI 变化（`set_scale`）后的整轮全量重建同样**不受节流**、无停顿地分批补齐，
-    /// 且每批 bounds 已乘新 scale。
     #[test]
     fn a_dpi_change_redelivers_all_batches_without_stall() {
         let mut app = TestApp::new();
@@ -3526,7 +3226,6 @@ mod p11_fix_tests {
             "DPI 变化后的第一笔必须是全树"
         );
         app.assert_a11y_contract();
-        // 首笔（DFS 前 2048 节点）含 root + rows[0..2046]：bounds 必须是 逻辑 × 2。
         let first = app.a11y().expect("DPI 首笔 snapshot").clone();
         let record = first.node_for(rows[0]).expect("row 0 在首笔里");
         let logical = app.probe().bounds(rows[0]).expect("logical bounds");
@@ -3546,12 +3245,6 @@ mod p11_fix_tests {
         assert!(batches >= 3, "5000 节点的 DPI 全树必须分多批重发");
     }
 
-    /// E5 / RE-04：三端泵接线所读的 **App 级信号** —— 每笔非最终批次交付后
-    /// `a11y_backlog_pending()` 必须为真（平台泵据此 `dispatcher.wake()` 下一轮），收敛后为假；
-    /// 单点高频增量不得触发（否则泵会被无谓连续唤醒）。
-    ///
-    /// 边界：三端泵本身（`event_loop`/`pump` 里三行 wake 接线）需要真实事件循环，单测不执行；
-    /// 本用例钉住接线读的**唯一信号**，平台接线后的连续交付由真机/验收记录（报告 §8.3）。
     #[test]
     fn a11y_backlog_signals_a_pump_wake_after_every_non_final_batch() {
         let mut app = TestApp::new();
@@ -3585,7 +3278,6 @@ mod p11_fix_tests {
             !app.app().a11y_backlog_pending(),
             "收敛后不得残留 wake 信号（否则泵会空转）"
         );
-        // 单点增量不满足 backlog ⇒ 平台不需要额外唤醒（仍走 100ms 合并）。
         app.app_mut()
             .window_mut(window)
             .expect("window")
@@ -3597,11 +3289,6 @@ mod p11_fix_tests {
         );
     }
 
-    /// E5 / RE-04 / RE-05：三端接线共享的 `App::wake_for_a11y_backlog` —— **只有本轮真的
-    /// 交付过** a11y 且仍有未走完的批次时才 wake；每笔非最终批次恰好一次；收敛后不再 wake。
-    ///
-    /// 变异：删掉 `dispatcher.wake()`、或把判据改回「无条件 backlog」（不看本轮交付标志）⇒
-    /// 本用例 / 无消费者用例红。
     #[test]
     fn the_backlog_wake_helper_wakes_only_after_a_real_delivery() {
         let mut app = TestApp::new();
@@ -3645,14 +3332,8 @@ mod p11_fix_tests {
         );
     }
 
-    /// **RE-05（P0 回归）**：无 AT 客户端 / 无测试捕获时 adapter 永远 Inactive，`a11y_take`
-    /// 不执行；泵轮即使 a11y 仍有「未开始的重建待发」，也**绝不能**自唤醒 —— 否则每轮
-    /// `wake()` 让泵停不下来（单核 100% 忙等，I3「空闲零唤醒」失效）。
-    ///
-    /// 变异：把 `wake_for_a11y_backlog` 判据改回无条件 backlog（不看本轮交付标志）⇒ 本用例红。
     #[test]
     fn a11y_backlog_never_wakes_the_pump_without_a_consumer() {
-        // 不调用 `enable_a11y_capture()`：模拟绝大多数用户的默认状态（无读屏器/自动化客户端）。
         let mut app = TestApp::new();
         let window = app.window_id();
         let _rows = rows_fixture(&mut app, 5000);
@@ -3660,7 +3341,6 @@ mod p11_fix_tests {
         let mut wakes = 0usize;
         for round in 0..10 {
             let _ = app.drain_pump().expect("泵轮（无消费者）");
-            // 丢弃其它来源的帧唤醒，只观察 a11y 自唤醒逻辑。
             let _ = dispatcher.take_frame_wake();
             app.app_mut().wake_for_a11y_backlog(dispatcher.as_ref());
             if dispatcher.take_frame_wake() {
@@ -3682,11 +3362,6 @@ mod p11_fix_tests {
     }
 }
 
-/// R13-12：`UserTask` 回投链的端到端用例（`AppHandle::send` → `Dispatcher::push` →
-/// `drain_tasks` → `UserTask::run`）。
-///
-/// 这条链路在旧实现里**零覆盖**：`TestApp` 没有任务泵，a11y 用例全部 `dispatch_request` 直调，
-/// 于是「任务被丢掉 / 在帧之前执行 / 重复执行 / 空闲轮不执行」四种 bug 都不可能被测出来。
 #[cfg(test)]
 mod dispatcher_tests {
     use std::sync::{
@@ -3704,7 +3379,6 @@ mod dispatcher_tests {
         },
     };
 
-    /// 跨线程 `send` 的任务必须在下一次 `drain` 里执行，且只执行一次。
     #[test]
     fn a_task_posted_from_another_thread_runs_on_the_next_drain() {
         let mut app = TestApp::new();
@@ -3728,10 +3402,6 @@ mod dispatcher_tests {
         assert_eq!(app.tasks_run(), 1, "同一条任务不得重复执行");
     }
 
-    /// 任务在帧**之后**执行：它写下的状态必须等到下一轮才出帧。
-    ///
-    /// 这是生产泵 ④/⑤ 的时序（帧 → a11y → 任务）。若测试泵把任务放在帧之前（或丢了任务泵），
-    /// 这条用例立刻变红 —— 正是「依赖 dispatcher 时序的 bug」的回归面。
     #[test]
     fn a_task_runs_after_the_frame_and_its_write_lands_on_the_next_frame() {
         let mut app = TestApp::new();
@@ -3757,7 +3427,6 @@ mod dispatcher_tests {
         assert!(first.rendered, "首帧必须提交");
         let settled = app.frame_record().frame_index;
 
-        // 任务写状态：发生在**本轮帧之后** ⇒ 本轮不得因此出帧。
         let handle = app.handle();
         handle.send(move |app| {
             app.write(&color, Color::from_rgba8([0, 255, 0, 255]));
@@ -3786,7 +3455,6 @@ mod dispatcher_tests {
         );
     }
 
-    /// 空闲轮也要执行任务（生产泵的 ⑤ 与帧门禁无关：没有帧可出时任务照样回投）。
     #[test]
     fn tasks_run_even_when_the_frame_is_idle() {
         let mut app = TestApp::new();
@@ -3807,7 +3475,6 @@ mod dispatcher_tests {
         );
     }
 
-    /// 一次 drain 执行队列里的**全部**任务，且按 push 顺序（FIFO）。
     #[test]
     fn tasks_run_in_fifo_order_and_only_once() {
         let mut app = TestApp::new();

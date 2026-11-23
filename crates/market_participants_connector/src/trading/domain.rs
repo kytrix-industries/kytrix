@@ -1,11 +1,3 @@
-//! Public trading commands.
-//!
-//! A command names the exact listing it trades and the authenticated target it
-//! acts for; the two must agree on the route before anything is encoded. The
-//! quantity is `market_participants_model`'s order quantity, the one definition of what an
-//! order is denominated in, and it is validated against the resolved listing's
-//! own rules rather than against a second unit vocabulary defined here.
-
 use market_participants_model::{
     decimal::Ratio,
     listing::route::{VenueListingKey, VenueRoute},
@@ -37,11 +29,6 @@ pub struct PlaceOrderCommand {
 }
 
 impl PlaceOrderCommand {
-    /// Validates this order against the listing it trades.
-    ///
-    /// The listing's own rules decide the traded unit and the notional asset, and
-    /// a route the target does not act on is rejected before the venue's wire is
-    /// built.
     pub fn validate_against(
         &self,
         resolved: &ResolvedListing,
@@ -83,7 +70,6 @@ pub struct CancelOrderCommand {
 }
 
 impl CancelOrderCommand {
-    /// Validates that the listing belongs to the target's route.
     pub fn validate_against(
         &self,
         resolved: &ResolvedListing,
@@ -92,10 +78,6 @@ impl CancelOrderCommand {
     }
 }
 
-/// Changes the position mode of one venue account.
-///
-/// Position mode is account-wide, so the command names no listing and there is no
-/// listing route to disagree with the target's.
 #[derive(Clone, Debug)]
 pub struct SetPositionModeCommand {
     pub target: AuthenticatedTarget,
@@ -110,7 +92,6 @@ pub struct SetMarginModeCommand {
 }
 
 impl SetMarginModeCommand {
-    /// Validates that the listing belongs to the target's route.
     pub fn validate_against(
         &self,
         resolved: &ResolvedListing,
@@ -129,7 +110,6 @@ pub struct SetLeverageCommand {
 }
 
 impl SetLeverageCommand {
-    /// Validates that the listing belongs to the target's route.
     pub fn validate_against(
         &self,
         resolved: &ResolvedListing,
@@ -138,10 +118,6 @@ impl SetLeverageCommand {
     }
 }
 
-/// Rejects a listing that the authenticated target does not act on.
-///
-/// A symbol, an asset index or a rules set resolved on one route is never reused
-/// on another, so the check happens before anything is encoded.
 pub(crate) fn require_target_route(
     target: &VenueRoute,
     listing: &VenueListingKey,
@@ -155,11 +131,6 @@ pub(crate) fn require_target_route(
     })
 }
 
-/// Validates one order quantity against the listing's own quantity rule.
-///
-/// The listed unit is the rule's own unit and the only asset a notional order may
-/// name is the listing's notional asset; an outcome quantity must name the exact
-/// group, member and side of the listed outcome instrument.
 fn require_order_quantity(
     quantity: &OrderQuantity,
     resolved: &ResolvedListing,
@@ -174,7 +145,6 @@ fn require_order_quantity(
         .map_err(|error| MarketParticipantError::MarketModel(Box::new(error)))
 }
 
-/// Builds one order rejection.
 pub(crate) const fn order_error(kind: OrderErrorKind) -> MarketParticipantError {
     MarketParticipantError::OrderError {
         kind,

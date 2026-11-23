@@ -1,7 +1,3 @@
-//! The catalogue's own invariants: its order, the settings each indicator
-//! declares, the default value it is completed with, the i18n keys it names and
-//! the period bounds the `period_invalid` message repeats.
-
 use super::{
     config::{SettingsShape, expected_shape},
     definition::{
@@ -10,7 +6,6 @@ use super::{
 };
 use crate::chart::geometry::SUB_PLOT_INLINE;
 
-/// Every indicator, in the order both the panel and the sub plots rely on.
 const CATALOGUE_ORDER: [IndicatorId; 6] = [
     IndicatorId::Ma,
     IndicatorId::Ema,
@@ -27,13 +22,6 @@ fn catalogue_order() -> Vec<IndicatorId> {
         .collect()
 }
 
-/// The settings rows a value of `shape` is edited through, in the order its
-/// fields are declared.
-///
-/// This is the other half of the correspondence `expected_shape` states: that
-/// function says which variant an indicator holds, this one says which rows edit
-/// it. `Lines` is one row because a line list edits every line through the same
-/// control; the two struct variants name their fields one by one.
 fn rows_of(shape: SettingsShape) -> &'static [SettingKey] {
     match shape {
         SettingsShape::None => &[],
@@ -60,11 +48,6 @@ fn declared_keys(rows: &[SettingRow]) -> Vec<SettingKey> {
     rows.iter().map(|row| row.key).collect()
 }
 
-/// Every i18n key the catalogue names: each indicator's title and each of its
-/// rows' labels, sorted and deduplicated.
-///
-/// The three line-list indicators share `…indicator.lines`, so the same key is
-/// collected more than once.
 fn catalog_keys() -> Vec<&'static str> {
     let mut keys: Vec<_> = INDICATOR_CATALOG
         .iter()
@@ -78,7 +61,6 @@ fn catalog_keys() -> Vec<&'static str> {
     keys
 }
 
-// ① Each `IndicatorId` appears exactly once, in catalogue order.
 #[test]
 fn every_indicator_should_appear_exactly_once_in_catalogue_order() {
     assert_eq!(
@@ -88,11 +70,6 @@ fn every_indicator_should_appear_exactly_once_in_catalogue_order() {
     );
 }
 
-// ② The rows an indicator declares are the settings its default value holds:
-// the same shape `expected_shape` names, and the very keys that shape's fields
-// are. A catalogue that says "Lines" while its default is MACD's is caught here
-// rather than by `normalize` quietly repairing it when a configuration is
-// decoded.
 #[test]
 fn every_indicators_rows_should_edit_the_shape_its_defaults_hold() {
     for definition in INDICATOR_CATALOG {
@@ -109,9 +86,6 @@ fn every_indicators_rows_should_edit_the_shape_its_defaults_hold() {
             "{:?} declares rows that edit another settings shape",
             definition.id
         );
-        // Every row's label is part of the element id its panel row is drawn
-        // under, so two rows sharing one would be two rows the window cannot
-        // tell apart.
         for (index, row) in definition.rows.iter().enumerate() {
             assert!(
                 definition.rows[..index]
@@ -125,7 +99,6 @@ fn every_indicators_rows_should_edit_the_shape_its_defaults_hold() {
     }
 }
 
-// ③ Every `Period` control declares a range with room in it.
 #[test]
 fn every_period_row_should_declare_a_non_empty_range() {
     for definition in INDICATOR_CATALOG {
@@ -142,7 +115,6 @@ fn every_period_row_should_declare_a_non_empty_range() {
     }
 }
 
-// ④ A line list always asks for at least the one line its value has to hold.
 #[test]
 fn every_line_list_row_should_require_at_least_one_line() {
     for definition in INDICATOR_CATALOG {
@@ -159,10 +131,6 @@ fn every_line_list_row_should_require_at_least_one_line() {
     }
 }
 
-// ⑤ Every key the catalogue names is defined by every embedded language and
-// renders to something. A key no locale defines renders as the empty string —
-// a blank title or label in the panel rather than an error anywhere — so this
-// is the only place the omission would surface.
 #[test]
 fn every_catalog_key_should_be_defined_and_non_empty_in_every_language() {
     let i18n = i18n::embedded::load().expect("the embedded locales should load");
@@ -182,9 +150,6 @@ fn every_catalog_key_should_be_defined_and_non_empty_in_every_language() {
     }
 }
 
-// ⑥ The sub-plot indicators must fit the inline capacity `ChartLayout` stores
-// them in; a seventh one without raising `SUB_PLOT_INLINE` would silently move
-// the boxes to the heap.
 #[test]
 fn the_sub_plot_indicators_should_fit_the_inline_capacity() {
     let sub_plots = INDICATOR_CATALOG
@@ -198,15 +163,8 @@ fn the_sub_plot_indicators_should_fit_the_inline_capacity() {
     );
 }
 
-// ⑦ Every `Period` row declares the range `period_invalid` names in words. The
-// bounds come from the catalogue while the message is fixed text, so only a
-// test can tie the two together: changing one without the other would leave the
-// panel telling the user a range it does not accept.
 #[test]
 fn every_period_row_should_use_the_bounds_the_message_names() {
-    // `if let` alone would let a row that stopped being a `Period` control drop
-    // out of the check without failing it, so pin the six rows the design
-    // declares: MACD's three periods and KDJ's period and two smoothings.
     let period_rows: Vec<_> = INDICATOR_CATALOG
         .iter()
         .flat_map(|definition| {
@@ -245,10 +203,6 @@ fn every_period_row_should_use_the_bounds_the_message_names() {
     }
 }
 
-// ⑧ Only a switch row names a colour, and each one names the colour of the line
-// it switches. The pair is what puts the picker on that row's right and what the
-// picker writes when the user chooses a colour, so a swapped DIF/DEA pair would
-// edit the wrong line — which is exactly what this test pins.
 #[test]
 fn every_switch_row_should_name_the_colour_it_controls() {
     let mut switch_rows = Vec::new();

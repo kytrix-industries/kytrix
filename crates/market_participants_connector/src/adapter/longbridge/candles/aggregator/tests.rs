@@ -1,9 +1,3 @@
-//! The unit tests of the candle aggregation.
-//!
-//! They are a file of their own rather than a block inside the module because the module
-//! boundary is what they belong to, not the file: what they assert is the state machine
-//! the parent owns, and they reach every private item of it through `super::`.
-
 use longbridge_proto::quote::PushQuote;
 use market_participants_model::decimal::{Price, Quantity};
 
@@ -25,17 +19,14 @@ use crate::{
     market::timeframe::TimeFrame,
 };
 
-/// One price from a whole number of cents.
 fn price(cents: u64) -> Price {
     Price::from(cents)
 }
 
-/// One quantity from a whole number of shares.
 fn shares(count: u64) -> Quantity {
     Quantity::from(count)
 }
 
-/// One market-local wall time as milliseconds since the epoch.
 fn at(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> i64 {
     jiff::civil::date(year, month, day)
         .at(hour, minute, 0, 0)
@@ -45,12 +36,10 @@ fn at(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> i64 {
         .as_millisecond()
 }
 
-/// The market's own zone.
 fn zone() -> jiff::tz::TimeZone {
     jiff::tz::TimeZone::get(MARKET_ZONE).expect("the market zone is in the database")
 }
 
-/// An aggregator whose candle is the one a first screen left off at.
 fn aggregator(timeframe: TimeFrame, bucket: i64) -> CandleAggregator {
     CandleAggregator::from_first_screen(
         timeframe,
@@ -66,16 +55,10 @@ fn aggregator(timeframe: TimeFrame, bucket: i64) -> CandleAggregator {
     )
 }
 
-/// One trade print of the regular session.
 fn trade(timestamp: i64, cents: u64, count: u64, trade_type: TradeType) -> CandlePrint {
     trade_of(MarketSession::Normal, timestamp, cents, count, trade_type)
 }
 
-/// One trade print the venue filed under a stated session.
-///
-/// The session is the print's own fact rather than the fixture's: the wire states it per
-/// print, and two of the rules the aggregation applies — where a bucket starts and which
-/// fields an `I` print may move — are read from it.
 fn trade_of(
     session: MarketSession,
     timestamp: i64,
@@ -92,7 +75,6 @@ fn trade_of(
     })
 }
 
-/// One quote print of the regular session, adding what its counters advanced by.
 fn quote(timestamp: i64, cents: u64, count: u64) -> CandlePrint {
     CandlePrint::quote(QuotePrint {
         timestamp,
@@ -103,7 +85,6 @@ fn quote(timestamp: i64, cents: u64, count: u64) -> CandlePrint {
     })
 }
 
-/// One quote print carrying the session's cumulative counters.
 fn quote_day(timestamp: i64, day: CumulativeDay) -> CandlePrint {
     CandlePrint::quote(QuotePrint {
         timestamp,
@@ -114,14 +95,10 @@ fn quote_day(timestamp: i64, day: CumulativeDay) -> CandlePrint {
     })
 }
 
-/// The ordinary session table.
 fn table() -> SessionTable {
     NORMAL_SESSION_TABLE
 }
 
-/// A test module states the market's wall time and reads the candle's own
-/// timestamp back, so an assertion about a boundary is an assertion about the venue
-/// and not about this build's arithmetic.
 #[track_caller]
 fn assert_bucket(candle: &NativeCandlestick, year: i16, month: i8, day: i8, hour: i8, minute: i8) {
     assert_eq!(
@@ -131,8 +108,6 @@ fn assert_bucket(candle: &NativeCandlestick, year: i16, month: i8, day: i8, hour
     );
 }
 
-/// Two prints in the same minute update one candle, and the volume is what the two
-/// increments add up to.
 #[test]
 fn prints_of_one_bucket_update_one_candle() {
     let timestamp = at(2026, 6, 10, 10, 5);
@@ -169,8 +144,6 @@ fn prints_of_one_bucket_update_one_candle() {
     assert_eq!(aggregator.candle().close, price(95));
 }
 
-/// A quote's volume is the increment the venue's own counter advanced by, and the
-/// candle accumulates it the same way a trade's volume is accumulated.
 #[test]
 fn a_quote_accumulates_its_own_increment() {
     let timestamp = at(2026, 6, 10, 10, 6);
@@ -185,8 +158,6 @@ fn a_quote_accumulates_its_own_increment() {
     assert_eq!(candle.volume, shares(14));
 }
 
-/// A daily candle is written whole from the session's own cumulative counters, which
-/// is the one place a push replaces a candle instead of adding to it.
 #[test]
 fn a_daily_candle_is_the_sessions_own_counters() {
     let mut aggregator = aggregator(TimeFrame::Day1, at(2026, 6, 10, 0, 0));
@@ -219,20 +190,8 @@ fn a_daily_candle_is_the_sessions_own_counters() {
     );
 }
 
-/// The cumulative merge is `Day1`'s and nobody else's: a quote that states the day's own
-/// counters is an increment of every longer interval, so a weekly or monthly candle
-/// accumulates what the counters advanced by instead of being replaced by one day of
-/// them (§4.6 step 1).
-///
-/// The print is built by the wire's own reader rather than by hand, because which of the
-/// two the quote becomes is that reader's decision: a test that constructed the
-/// cumulative counters itself would assert the aggregation's half of the rule and pass
-/// with the reader treating every interval as a day.
 #[test]
 fn a_quote_of_a_longer_interval_accumulates_instead_of_replacing() {
-    // The candle being built is the one a first screen of this interval would have left
-    // off at: the market-local midnight the period is bounded by, which for the week of
-    // 2026-06-08 is that Monday.
     for (timeframe, bucket) in [
         (TimeFrame::Week1, at(2026, 6, 8, 0, 0)),
         (TimeFrame::Month1, at(2026, 6, 1, 0, 0)),
@@ -260,9 +219,6 @@ fn a_quote_of_a_longer_interval_accumulates_instead_of_replacing() {
             "which is still the period the screen left off at"
         );
 
-        // A second push of the same period advances the same candle: the counters are an
-        // increment of the interval, so a candle that took the day's own volume instead
-        // would answer the day rather than the week or the month.
         let CandleOutcome::Updated(second) = aggregator.apply(&state_quote(&state, 5), &table())
         else {
             panic!("a second {timeframe:?} quote updates the same candle");
@@ -276,8 +232,6 @@ fn a_quote_of_a_longer_interval_accumulates_instead_of_replacing() {
     }
 }
 
-/// The day's own counters reach the aggregation as the day's candle and as nothing else:
-/// the same reader that makes a week of them replaces the daily candle outright.
 #[test]
 fn the_day_is_the_only_interval_written_from_the_counters() {
     let state = PushState::new(TimeFrame::Day1);
@@ -298,9 +252,6 @@ fn the_day_is_the_only_interval_written_from_the_counters() {
     );
 }
 
-/// One quote of one push, read by the state that owns the timeframe: the counters of a
-/// `Day1` subscription and the increment of every other one are two different prints,
-/// and which one a frame becomes is that state's answer rather than the test's.
 fn state_quote(state: &PushState, current_volume: i64) -> CandlePrint {
     let quote = PushQuote {
         symbol: "AAPL.US".to_owned(),
@@ -323,11 +274,6 @@ fn state_quote(state: &PushState, current_volume: i64) -> CandlePrint {
         .expect("the fixture quote is read")
         .expect("a regular-session quote is a print")
 }
-/// The `I` row's other half: the session a print was filed under decides whether an `I`
-/// print moves a price, and the venue's own row names the two sessions it is about. This
-/// build publishes no option, so a share's `I` print is the volume-only arm on the
-/// regular session **and on the overnight session**, and the rule's other arm is the pre
-/// and post sessions'.
 #[test]
 fn the_i_row_reads_the_prints_own_session() {
     let regular = trade(at(2026, 6, 10, 10, 5), 500, 4, TradeType::of("I"));
@@ -354,9 +300,6 @@ fn the_i_row_reads_the_prints_own_session() {
         );
     }
 
-    // The venue's row names the pre and post sessions and no others, so an overnight
-    // print is the volume arm: an `I` print in the small hours moves a candle's volume
-    // and leaves its OHLC where they were.
     let overnight = trade_of(
         MarketSession::Overnight,
         at(2026, 6, 11, 1, 15),
@@ -397,9 +340,6 @@ fn the_i_row_reads_the_prints_own_session() {
     );
 }
 
-/// A volume-only print that belongs to a newer bucket rolls the candle before it is
-/// applied, which is §4.6 step 3: the open candle is confirmed, the next one opens at
-/// its close, and the volume this print states is accumulated rather than lost.
 #[test]
 fn a_volume_only_print_of_a_newer_bucket_rolls_and_accumulates() {
     let mut aggregator = aggregator(TimeFrame::Minute1, at(2026, 6, 10, 10, 5));
@@ -442,14 +382,6 @@ fn a_volume_only_print_of_a_newer_bucket_rolls_and_accumulates() {
     );
 }
 
-/// The open a volume-only print left is the previous candle's close rather than a price
-/// the venue traded, so the first print of that bucket which moves a price **rewrites**
-/// it — and the high and the low are that price's order against the value already there,
-/// which is where the venue's own merger leaves the previous candle's close.
-///
-/// The rule is the venue's own (§4.6 step 3): its merger carries an `open_updated` flag
-/// for exactly this case, and a candle that kept the synthetic open would report a price
-/// range the venue never traded.
 #[test]
 fn a_price_print_rewrites_the_open_a_volume_only_print_left() {
     let mut aggregator = aggregator(TimeFrame::Minute1, at(2026, 6, 10, 10, 5));
@@ -485,7 +417,6 @@ fn a_price_print_rewrites_the_open_a_volume_only_print_left() {
     assert_eq!(bucket.low, price(90));
     assert_eq!(bucket.volume, shares(6), "with both prints' volume");
 
-    // A second price print merges into it rather than rewriting the open again.
     let CandleOutcome::Updated(after) = aggregator.apply(
         &trade(at(2026, 6, 10, 10, 6), 95, 1, TradeType::Unnamed),
         &table(),
@@ -499,8 +430,6 @@ fn a_price_print_rewrites_the_open_a_volume_only_print_left() {
     assert_eq!(after.volume, shares(7));
 }
 
-/// A one-hour candle's buckets are counted from the session's open: 09:30 and 10:30
-/// are different candles, and 10:00 belongs to the 09:30 one.
 #[test]
 fn an_hourly_bucket_starts_at_the_sessions_open() {
     let mut aggregator = aggregator(TimeFrame::Hour1, at(2026, 6, 10, 9, 30));
@@ -536,8 +465,6 @@ fn an_hourly_bucket_starts_at_the_sessions_open() {
     assert_eq!(opened.volume, shares(2));
 }
 
-/// A four-hour candle's grid restarts at each session's own open, so the regular
-/// session has 09:30 and 13:30 and the post session has 16:00.
 #[test]
 fn a_four_hour_bucket_restarts_at_each_session() {
     let mut aggregator = aggregator(TimeFrame::Hour4, at(2026, 6, 10, 9, 30));
@@ -573,16 +500,6 @@ fn a_four_hour_bucket_restarts_at_each_session() {
     assert_bucket(&evening, 2026, 6, 10, 16, 0);
 }
 
-/// An overnight print belongs to the venue's one overnight window, whose grid is anchored
-/// at its own open: the window opens at 20:00 of its own day and runs to 04:00 of the next
-/// morning, so a print of either half is counted from 20:00 rather than dropped or counted
-/// from midnight.
-///
-/// Both halves are measurements: the venue's own 45-minute overnight series ran
-/// `20:00 / 20:45 / 21:30 / 22:15 / 23:00 / 23:45 / 00:30`, whose successive distances are
-/// 2700 seconds — the 23:45→00:30 step included, so the grid does not restart at midnight.
-/// The evening's grid therefore opens at 20:00, its last bucket of the day opens at 23:45,
-/// and 00:30 is the next bucket of that same grid (§4.6, §14.1).
 #[test]
 fn an_overnight_bucket_is_counted_from_the_window_it_fell_in() {
     let mut overnight = aggregator(TimeFrame::Hour1, at(2026, 6, 10, 20, 0));
@@ -606,8 +523,6 @@ fn an_overnight_bucket_is_counted_from_the_window_it_fell_in() {
     };
     assert_bucket(&last_hour, 2026, 6, 10, 23, 0);
 
-    // The small hours are the same window's other half, counted from the same 20:00
-    // anchor: a print at 01:15 belongs to the bucket that opened at 01:00 on that grid.
     let CandleOutcome::Rolled {
         opened: after_midnight,
         ..
@@ -627,9 +542,6 @@ fn an_overnight_bucket_is_counted_from_the_window_it_fell_in() {
     assert_eq!(after_midnight.close, price(103));
     assert_eq!(after_midnight.volume, shares(2));
 
-    // A 45-minute candle is the case the venue's own series is stated in: its overnight
-    // grid ran `20:00 / 20:45 / 21:30 / 22:15 / 23:00 / 23:45 / 00:30`, so 23:45 rests on
-    // the evening's grid and 00:30 is the next bucket of that same grid.
     let mut forty_five = aggregator(TimeFrame::Minute45, at(2026, 6, 10, 23, 45));
     let CandleOutcome::Rolled {
         opened: after_midnight,
@@ -643,8 +555,6 @@ fn an_overnight_bucket_is_counted_from_the_window_it_fell_in() {
     };
     assert_bucket(&after_midnight, 2026, 6, 11, 0, 30);
 
-    // 04:00 leaves the overnight session for the pre-market one, whose grid starts at
-    // its own open rather than continuing the small hours'.
     let before = overnight.candle().clone();
     let CandleOutcome::Rolled { confirmed, opened } = overnight.apply(
         &trade(at(2026, 6, 11, 4, 0), 105, 1, TradeType::Unnamed),
@@ -666,8 +576,6 @@ fn an_overnight_bucket_is_counted_from_the_window_it_fell_in() {
     );
 }
 
-/// An out-of-order push belongs to a candle that is already confirmed, and the
-/// aggregator discards it rather than rewriting history.
 #[test]
 fn an_older_bucket_is_stale() {
     let mut aggregator = aggregator(TimeFrame::Minute5, at(2026, 6, 10, 10, 5));
@@ -695,8 +603,6 @@ fn an_older_bucket_is_stale() {
     );
 }
 
-/// A daily candle's bucket is the market's own midnight, so the frame that opens the
-/// day and the frame that closes it are one candle.
 #[test]
 fn a_daily_bucket_is_the_markets_midnight() {
     let mut aggregator = aggregator(TimeFrame::Day1, at(2026, 6, 10, 0, 0));
@@ -719,8 +625,6 @@ fn a_daily_bucket_is_the_markets_midnight() {
     assert_bucket(&opened, 2026, 6, 11, 0, 0);
 }
 
-/// A weekly candle's bucket is the Monday of the market's own week, and a monthly
-/// one is the first of its month.
 #[test]
 fn a_weekly_bucket_is_the_monday_of_the_markets_week() {
     let mut aggregator = aggregator(TimeFrame::Week1, at(2026, 6, 8, 0, 0));
@@ -742,8 +646,6 @@ fn a_weekly_bucket_is_the_monday_of_the_markets_week() {
     assert_bucket(&opened, 2026, 6, 15, 0, 0);
 }
 
-/// The first gate: a pre, post or overnight push never builds a candle of a day or
-/// longer, however far into the calendar the interval reaches.
 #[test]
 fn an_extended_session_never_builds_a_daily_scale_candle() {
     for timeframe in [
@@ -775,10 +677,6 @@ fn an_extended_session_never_builds_a_daily_scale_candle() {
     }
 }
 
-/// The second gate is the same fact read the other way: an extended session's push
-/// reaches only a candle below the daily scale — the venue's own bound is period
-/// `< 100`, which is every minute and every hour — and the bucket it reaches is that
-/// session's own.
 #[test]
 fn an_extended_session_reaches_only_a_below_daily_candle() {
     let mut premarket = aggregator(TimeFrame::Minute1, at(2026, 6, 10, 9, 0));
@@ -806,12 +704,6 @@ fn an_extended_session_reaches_only_a_below_daily_candle() {
     );
 }
 
-/// The third gate is the caller's, not the aggregation's: a quote of an extended
-/// session never reaches this state machine at all, because the state that reads a frame
-/// into a print refuses it first. What the aggregator itself states about an extended
-/// session is the second gate — the bucket such a print belongs to is that session's own
-/// — and the regular-session rule for quotes is applied by the caller that builds the
-/// print.
 #[test]
 fn an_extended_session_print_reaches_only_its_own_bucket() {
     let mut premarket_quote = aggregator(TimeFrame::Day1, at(2026, 6, 10, 0, 0));
@@ -823,8 +715,6 @@ fn an_extended_session_print_reaches_only_its_own_bucket() {
         "a pre-market quote builds no daily candle"
     );
 
-    // 09:20 is inside the pre session's own one-minute grid, so a candle this
-    // aggregator is already building for that bucket is updated rather than opened.
     let mut minute = aggregator(TimeFrame::Minute1, at(2026, 6, 10, 9, 20));
     let CandleOutcome::Updated(updated) = minute.apply(&extended, &table()) else {
         panic!("an extended session's own bucket is a candle below the daily scale");
@@ -834,11 +724,6 @@ fn an_extended_session_print_reaches_only_its_own_bucket() {
     assert_eq!(updated.volume, shares(13));
 }
 
-/// The update table is the venue's own: a type that updates volume only leaves the
-/// price where it was, and a type the table does not name leaves everything.
-/// The `I` row is the one that asks a second question — a print of an option or of an
-/// extended session — and this build publishes US common stock and no options, so on a
-/// share it is the session that answers, which the volume-only case below is.
 #[test]
 fn the_trade_type_table_is_the_venues_own() {
     for value in ["", "A", "B", "D", "E", "F", "K", "S", "X", "1"] {
@@ -884,9 +769,6 @@ fn the_trade_type_table_is_the_venues_own() {
     );
 }
 
-/// Two of those table rows on a real candle: a volume-only print moves the volume
-/// and leaves the OHLC exactly where it was, and a type that updates nothing leaves
-/// the volume too.
 #[test]
 fn a_volume_only_print_leaves_the_price_and_a_named_nothing_leaves_everything() {
     let mut aggregator = aggregator(TimeFrame::Minute1, at(2026, 6, 10, 10, 5));
@@ -915,8 +797,6 @@ fn a_volume_only_print_leaves_the_price_and_a_named_nothing_leaves_everything() 
     );
 }
 
-/// A volume-only print cannot open a bucket nothing has opened: a candle with no
-/// price is not a candle.
 #[test]
 fn a_volume_only_print_opens_no_bucket_out_of_nothing() {
     let gapped = SessionTable::new(
@@ -939,13 +819,6 @@ fn a_volume_only_print_opens_no_bucket_out_of_nothing() {
     assert_eq!(aggregator.candle(), &before);
 }
 
-/// A frame outside every session has no bucket, and the candle being built is left
-/// exactly as it was.
-///
-/// The ordinary table has no gap between its sessions — the post session's close is
-/// the overnight session's evening open — so the case states a table whose post session
-/// ends at 17:00: 17:30 is then outside all of them, which is what an instant between an
-/// early close and the overnight open is.
 #[test]
 fn a_frame_outside_every_session_is_dropped() {
     let mut aggregator = aggregator(TimeFrame::Minute1, at(2026, 6, 10, 10, 5));
@@ -968,12 +841,8 @@ fn a_frame_outside_every_session_is_dropped() {
     assert_eq!(aggregator.candle(), &before);
 }
 
-/// A half day's own table rests the afternoon's grid on 13:00 rather than on 16:00, so
-/// the same instant opens a different candle under the two tables.
 #[test]
 fn a_half_day_rests_the_afternoon_grid_on_thirteen() {
-    // Four-hour candles make the difference one bucket rather than three: an ordinary
-    // day's afternoon opens at 16:00 and a half day's at 13:00.
     let mut ordinary = aggregator(TimeFrame::Hour4, at(2026, 11, 27, 9, 30));
     let mut half = aggregator(TimeFrame::Hour4, at(2026, 11, 27, 9, 30));
 
@@ -1006,14 +875,8 @@ fn a_half_day_rests_the_afternoon_grid_on_thirteen() {
     );
 }
 
-/// The March and November transitions: the same instant read in the market's own
-/// zone, with the daily bucket at that day's own midnight and the hourly grid still
-/// counted from the session's open. This is the reason the adapter carries a zone
-/// database at all.
 #[test]
 fn the_buckets_follow_the_markets_daylight_saving() {
-    // 2026-03-08 is the day the US clocks go forward, so 00:00 local is 05:00 UTC and
-    // 09:30 that morning is 13:30 UTC.
     let mut spring = aggregator(TimeFrame::Day1, at(2026, 3, 8, 0, 0));
     let CandleOutcome::Updated(spring_day) = spring.apply(
         &trade(at(2026, 3, 8, 12, 0), 101, 1, TradeType::Unnamed),
@@ -1046,7 +909,6 @@ fn the_buckets_follow_the_markets_daylight_saving() {
          hours, which is 33.5 UTC hours because the clock moved between them"
     );
 
-    // 2026-11-01 is the day the clocks go back, so 00:00 local is 04:00 UTC.
     let mut autumn = aggregator(TimeFrame::Day1, at(2026, 11, 1, 0, 0));
     let CandleOutcome::Updated(autumn_day) = autumn.apply(
         &trade(at(2026, 11, 1, 12, 0), 101, 1, TradeType::Unnamed),

@@ -1,12 +1,3 @@
-//! Protocol responses and events of the adapter boundary.
-//!
-//! An adapter answers with the venue's own payloads. Everything that has a
-//! tradable subject carries its listing key: a bulk answer whose venue names its
-//! subject only by a native identifier is resolved to a `VenueListingKey` by the
-//! adapter, which is the last place that identifier is authoritative. Units and
-//! products are *not* decided here — a payload keeps the venue's raw numbers, and
-//! the capability boundary attaches the resolved listing's units to them.
-
 use std::pin::Pin;
 
 use futures::Stream;
@@ -42,11 +33,6 @@ use crate::{
     },
 };
 
-/// One venue value and the listing it belongs to.
-///
-/// The pairing is the whole point: a candlestick, a trade, a ticker or a
-/// liquidation is meaningless without the listing that published it, and the
-/// adapter is where the venue's own identifier is still authoritative.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeListing<T> {
     pub listing: VenueListingKey,
@@ -54,13 +40,11 @@ pub struct NativeListing<T> {
 }
 
 impl<T> NativeListing<T> {
-    /// Pairs one venue value with its listing.
     pub const fn new(listing: VenueListingKey, data: T) -> Self {
         Self { listing, data }
     }
 }
 
-/// One OHLCV candlestick, as the venue published it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeCandlestick {
     pub timestamp: UnixMillis,
@@ -71,7 +55,6 @@ pub struct NativeCandlestick {
     pub volume: Quantity,
 }
 
-/// One public market trade, as the venue published it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeTrade {
     pub id: MarketTradeId,
@@ -81,10 +64,8 @@ pub struct NativeTrade {
     pub timestamp: UnixMillis,
 }
 
-/// One ticker snapshot, as the venue published it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeTicker {
-    /// The venue's own rolling-statistics identifier, when it publishes one.
     pub monotonic_id: Option<i64>,
     pub open: Price,
     pub high: Option<Price>,
@@ -94,11 +75,6 @@ pub struct NativeTicker {
     pub traded_notional: Option<Quantity>,
 }
 
-/// One order book snapshot, as the venue numbered it.
-///
-/// The sequence is the venue's own ordering marker. An adapter that cannot
-/// publish a comparable numeric one publishes snapshots only, so a snapshot with
-/// a native or absent sequence never claims to be replayable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeOrderBook {
     pub sequence: MarketSequence,
@@ -107,7 +83,6 @@ pub struct NativeOrderBook {
     pub asks: Vec<NativeOrderBookLevel>,
 }
 
-/// One incremental order book update, as the venue numbered it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeOrderBookUpdate {
     pub snapshot: bool,
@@ -119,7 +94,6 @@ pub struct NativeOrderBookUpdate {
     pub asks: Vec<NativeOrderBookLevel>,
 }
 
-/// One open-interest observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeOpenInterest {
     pub quantity: Quantity,
@@ -127,14 +101,12 @@ pub struct NativeOpenInterest {
     pub timestamp: UnixMillis,
 }
 
-/// One long/short ratio observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeLongShortRatio {
     pub ratio: Ratio,
     pub timestamp: UnixMillis,
 }
 
-/// One taker buy/sell volume observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeTakerVolume {
     pub buy: Quantity,
@@ -142,7 +114,6 @@ pub struct NativeTakerVolume {
     pub timestamp: UnixMillis,
 }
 
-/// One liquidation order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeForceOrder {
     pub position_side: PositionSide,
@@ -151,17 +122,6 @@ pub struct NativeForceOrder {
     pub timestamp: UnixMillis,
 }
 
-/// One node of a route-level catalog answer, before canonical construction.
-///
-/// The catalog source turns this into a complete `CatalogBatch`; a
-/// market capability never normalizes a catalog.
-///
-/// A canonical asset or reference identity is a digest of its own terms, so an
-/// entry that names an `AssetId` or a `PriceReferenceId` carries the terms behind
-/// it: the display contract renders those terms, and a digest cannot be read back
-/// into them. The adapter records them at the one point it translates a venue
-/// value into a canonical one, so nothing downstream has to reconstruct what the
-/// venue already stated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeCatalogEntry {
     pub listing: VenueListingKey,
@@ -173,23 +133,13 @@ pub struct NativeCatalogEntry {
     pub available_from: Option<UnixMillis>,
     pub available_until: Option<UnixMillis>,
     pub instrument: market_participants_model::instrument::Instrument,
-    /// The canonical terms of every asset this instrument is denominated in.
     pub asset_terms: Vec<AssetTerms>,
-    /// The canonical terms of every price reference this instrument names.
     pub reference_terms: Vec<PriceReferenceTerms>,
-    /// The display code of every asset of this entry whose own terms state none.
-    ///
-    /// A currency, a token and a commodity state their own code; a security states
-    /// none — its ticker is a listing fact rather than a canonical term — so a route
-    /// that publishes one has to state the code the venue published for it, and the
-    /// publication refuses the whole batch when a named asset has none.
     pub asset_codes: Vec<StagedAssetCode>,
 }
 
-/// What one protocol call answered.
 #[derive(Debug)]
 pub enum ProtocolResponse {
-    /// A route's catalog, one entry per published listing.
     Markets(Vec<NativeCatalogEntry>),
     Candlesticks(Vec<NativeListing<NativeCandlestick>>),
     Ticker(NativeListing<NativeTicker>),
@@ -220,30 +170,22 @@ pub enum ProtocolResponse {
     HyperliquidLedger(Vec<NativeHyperliquidLedgerEvent>),
 }
 
-/// One event of a live protocol stream.
 pub enum ProtocolEvent {
     Candlestick(NativeListing<NativeCandlestick>),
     Ticker(NativeListing<NativeTicker>),
     OrderBook(NativeListing<NativeOrderBookUpdate>),
     Trade(NativeListing<NativeTrade>),
-    /// One order of an authenticated account stream.
     Order(NativeOrder),
-    /// One position of an authenticated account stream.
     Position(NativePosition),
-    /// One liquidation order of a route-level stream.
     ForceOrder(NativeListing<NativeForceOrder>),
-    /// One live probability reading of a prediction event's legs.
     PredictionSeries(Vec<PredictionSeries>),
-    /// One incremental update batch of a prediction order book.
     PredictionOrderBookUpdate(Vec<PredictionOrderBookUpdate>),
-    /// One update of a Hyperliquid wallet stream.
     HyperliquidWalletUpdate(NativeHyperliquidWalletUpdate),
 }
 
 pub type ProtocolStream =
     Pin<Box<dyn Stream<Item = Result<ProtocolEvent, MarketParticipantError>> + Send>>;
 
-/// Lifecycle state shared by every client subscription.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubscriptionStatus {
     Connecting,

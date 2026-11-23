@@ -1,5 +1,3 @@
-//! OKX's page: the service region the account belongs to, and the credentials it authenticates with.
-
 use app_config::{
     market_participants::{origins::OkxRegion, settings::VenueSettings},
     settings::Config,
@@ -22,16 +20,12 @@ use crate::{
     search::FieldSearch,
 };
 
-/// The id of this page's settings.
 const PAGE: &str = "market_participants.okx";
 
-/// The region row, as the search filter and the tests name it.
 const REGION_FIELD: &str = "market_participants.okx.region";
 
-/// The id of the card this page's rows are drawn in.
 const SECTION_ID: &str = "market_participants.okx_0";
 
-/// The region choices, in the order the control offers them.
 const REGION_OPTIONS: [(OkxRegion, &str); 3] = [
     (
         OkxRegion::Global,
@@ -47,7 +41,6 @@ const REGION_OPTIONS: [(OkxRegion, &str); 3] = [
     ),
 ];
 
-/// The OKX page.
 pub(crate) struct VenuePage {
     host: SettingsHost,
     selects: Vec<VenueSelect>,
@@ -55,8 +48,6 @@ pub(crate) struct VenuePage {
 }
 
 impl VenuePage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs
-    /// to.
     pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
         Self {
             host,
@@ -164,7 +155,6 @@ impl PageView for VenuePage {
     }
 }
 
-/// The search rows of the settings this page draws.
 pub(crate) fn search_fields(translate: &Translate) -> Vec<FieldSearch> {
     let venue = VenueId::Okx;
     let page_id = shared::page_id(&venue);

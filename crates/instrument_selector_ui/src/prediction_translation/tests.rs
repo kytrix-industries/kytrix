@@ -15,7 +15,6 @@ use super::{
     TranslationSetup, page_has_translatable_text, plan_translation,
 };
 
-/// One canonical identity value, spelled the way the model publishes it.
 fn identity(digit: char) -> String {
     format!("v1/{}", digit.to_string().repeat(64))
 }
@@ -44,7 +43,6 @@ fn option(event: &PredictionEventRef, label: &str) -> PredictionOptionCard {
     }
 }
 
-/// One card with `title` and the option labels it draws, in order.
 fn card(index: usize, title: impl Into<SmolStr>, labels: &[&str]) -> PredictionEventCard {
     let event = PredictionEventRef {
         route: VenueRoute::new(
@@ -84,8 +82,6 @@ fn ids(chunk: &super::TranslationChunk) -> Vec<&str> {
         .collect()
 }
 
-/// A full page is eight cards, which is two model requests of four cards each; the
-/// ids restart per request and a card's title comes before its options.
 #[test]
 fn a_full_page_should_split_into_two_chunks_with_local_sequential_ids() {
     let cards: Vec<PredictionEventCard> = (0..8)
@@ -117,8 +113,6 @@ fn a_full_page_should_split_into_two_chunks_with_local_sequential_ids() {
     );
 }
 
-/// A label shared by cards in both requests belongs to the first request that needs
-/// it, so the model is never asked for the same text twice.
 #[test]
 fn shared_labels_should_appear_only_in_the_first_chunk_that_needs_them() {
     let cards: Vec<PredictionEventCard> = (0..8)
@@ -148,8 +142,6 @@ fn shared_labels_should_appear_only_in_the_first_chunk_that_needs_them() {
     }
 }
 
-/// Text translated earlier in the dialog is not requested again, and a request whose
-/// cards contribute nothing but such text is dropped rather than sent empty.
 #[test]
 fn already_translated_text_should_be_skipped_and_a_newly_empty_chunk_dropped() {
     let cards: Vec<PredictionEventCard> = (0..8)
@@ -181,7 +173,6 @@ fn already_translated_text_should_be_skipped_and_a_newly_empty_chunk_dropped() {
     );
 }
 
-/// Empty and whitespace-only text is not a translation request.
 #[test]
 fn empty_and_whitespace_only_text_should_be_skipped() {
     let cards = [card(0, "  ", &["", "\t", "Yes", " \n "])];
@@ -193,8 +184,6 @@ fn empty_and_whitespace_only_text_should_be_skipped() {
     assert_eq!(ids(&chunks[0]), ["s00"]);
 }
 
-/// A page whose cards carry only blank text has nothing the button could ask
-/// for, while one non-blank title or label makes the page translatable.
 #[test]
 fn a_page_should_be_translatable_only_while_a_title_or_label_is_not_blank() {
     assert!(!page_has_translatable_text(&[]));
@@ -207,7 +196,6 @@ fn a_page_should_be_translatable_only_while_a_title_or_label_is_not_blank() {
     assert!(page_has_translatable_text(&[card(0, "Event", &[])]));
 }
 
-/// A page that is not a multiple of the group size keeps a short last request.
 #[test]
 fn a_page_of_five_cards_should_yield_a_four_card_and_a_one_card_chunk() {
     let cards: Vec<PredictionEventCard> = (0..5)
@@ -232,7 +220,6 @@ fn no_cards_should_yield_no_chunks() {
     assert!(chunks.is_empty());
 }
 
-/// Cancellation starts clear, and the flag the engine polls observes it.
 #[test]
 fn a_cancellation_should_start_clear_and_be_observable_through_its_flag() {
     use std::sync::atomic::Ordering;
@@ -248,9 +235,6 @@ fn a_cancellation_should_start_clear_and_be_observable_through_its_flag() {
     assert!(cancel.flag().load(Ordering::Acquire));
 }
 
-/// A translator is an ordinary trait object the host carries: this pins the seam a
-/// build with the model engine implements, without a global installation point (the
-/// removed `install`/`translator` pair) and without touching an application.
 #[test]
 fn a_translator_round_trips_the_segments_a_run_planned() {
     struct Echo;

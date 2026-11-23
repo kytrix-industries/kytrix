@@ -1,6 +1,3 @@
-//! The venue listing identity and the venue-issued value types that never take
-//! part in the economic instrument identity.
-
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -11,26 +8,18 @@ use crate::{
 
 crate::identity_type!(VenueListingId, VenueListingIdentity);
 
-/// The Hyperliquid asset index of a spot or perpetual coin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HyperliquidAssetId(pub u32);
 
-/// The Hyperliquid spot token index of a balance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HyperliquidTokenId(pub u32);
 
-/// The Hyperliquid HIP-4 outcome index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HyperliquidOutcomeId(pub u64);
 
-/// The market/position protocol a Polymarket asset id belongs to.
-///
-/// Both generations are live and both settle in pUSD; they differ in where the
-/// asset id comes from. A V1 market publishes `clobTokenIds`, a V2 market
-/// publishes `positionIds`, and CLOB accepts either as an asset id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PolymarketProtocolVersion {
     #[serde(rename = "v1")]
@@ -40,7 +29,6 @@ pub enum PolymarketProtocolVersion {
 }
 
 impl PolymarketProtocolVersion {
-    /// Returns the fixed canonical label of this protocol generation.
     pub const fn label(self) -> &'static str {
         match self {
             Self::V1 => "v1",
@@ -49,14 +37,8 @@ impl PolymarketProtocolVersion {
     }
 }
 
-/// The uint256 asset id a Polymarket CLOB request addresses.
-///
-/// A V1 CTF token id and a V2 position id are the same wire shape, so the model
-/// names the role rather than keeping two types that would always be converted
-/// into one another.
 pub type PolymarketAssetId = crate::identifier::CtfTokenId;
 
-/// The Hyperliquid product family of an asset identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HyperliquidAssetProduct {
     #[serde(rename = "spot")]
@@ -66,7 +48,6 @@ pub enum HyperliquidAssetProduct {
 }
 
 impl HyperliquidAssetProduct {
-    /// Returns the fixed canonical label of this product.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Spot => "spot",
@@ -74,7 +55,6 @@ impl HyperliquidAssetProduct {
         }
     }
 
-    /// Returns the instrument kind an instrument of this product must have.
     pub const fn instrument_kind(self) -> InstrumentKind {
         match self {
             Self::Spot => InstrumentKind::Spot,
@@ -83,7 +63,6 @@ impl HyperliquidAssetProduct {
     }
 }
 
-/// The Binance product family of an instrument identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BinanceProduct {
     #[serde(rename = "spot")]
@@ -97,7 +76,6 @@ pub enum BinanceProduct {
 }
 
 impl BinanceProduct {
-    /// Returns the fixed canonical label of this product.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Spot => "spot",
@@ -107,7 +85,6 @@ impl BinanceProduct {
         }
     }
 
-    /// Returns the instrument kind an instrument of this product must have.
     pub const fn instrument_kind(self) -> InstrumentKind {
         match self {
             Self::Spot => InstrumentKind::Spot,
@@ -118,7 +95,6 @@ impl BinanceProduct {
     }
 }
 
-/// The OKX instrument type of an instrument identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OkxInstrumentType {
     #[serde(rename = "spot")]
@@ -132,7 +108,6 @@ pub enum OkxInstrumentType {
 }
 
 impl OkxInstrumentType {
-    /// Returns the fixed canonical label of this instrument type.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Spot => "spot",
@@ -142,7 +117,6 @@ impl OkxInstrumentType {
         }
     }
 
-    /// Returns the instrument kind an instrument of this type must have.
     pub const fn instrument_kind(self) -> InstrumentKind {
         match self {
             Self::Spot => InstrumentKind::Spot,
@@ -153,7 +127,6 @@ impl OkxInstrumentType {
     }
 }
 
-/// How a numeric price is expressed.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "basis")]
 pub enum PriceBasis {
@@ -171,7 +144,6 @@ pub enum PriceBasis {
 }
 
 impl PriceBasis {
-    /// Returns the fixed canonical label of this basis.
     pub const fn label(&self) -> &'static str {
         match self {
             Self::PerAssetUnit => "per-asset-unit",
@@ -181,7 +153,6 @@ impl PriceBasis {
         }
     }
 
-    /// Returns the index of an index-point basis.
     pub fn index(&self) -> Option<&IndexId> {
         match self {
             Self::PerIndexPoint { index } => Some(index),

@@ -1,121 +1,3 @@
-//! The framework's test host: an engine application, the injected services, one
-//! mounted widget, and the assertions the contract's tests are written in.
-//!
-//! The previous contract's tests drove its own application context and asserted through
-//! its element tree. This host is the engine's equivalent and the migration carrier for
-//! the twenty widget crates: it builds the same [`WidgetServices`] the composition
-//! root builds through [`WidgetServices::builder`] (minus the market-participants
-//! directory, which still needs a toolkit context to construct — see
-//! [`WidgetServices`]), creates and injects the three composition-root singletons, and
-//! drains frames through [`ui_core::test_support::app::TestApp`].
-//!
-//! # What the headless host does that the platform pump does
-//!
-//! [`TestApp::drain`](ui_core::test_support::app::TestApp::drain) runs the frame
-//! pipeline but **not** the engine's `App::on_frame` hook (that hook belongs to the
-//! platform event loop). [`WidgetTestApp::drain`] therefore ticks the frame router
-//! first and only then drains — the same order the production pump uses. A test that
-//! wants one synchronized frame calls `drain`; a test that wants to inspect the
-//! sync in isolation calls [`WidgetTestApp::tick`].
-//!
-//! # The composition-root singletons
-//!
-//! The host is the composition root of a test: it creates the one
-//! [`Layer`](base_ui::kit::layer::Layer), the one [`FrameRouter`] and the one
-//! [`AnimationRouter`](base_ui::kit::overlay::AnimationRouter), keeps its own handles
-//! ([`WidgetTestApp::layer`], [`WidgetTestApp::router`],
-//! [`WidgetTestApp::animation`]) and injects the same instances through
-//! [`WidgetServices::builder`]. A test therefore asserts against the application-level
-//! instances, not against a copy a widget might have built: an overlay opened through
-//! the widget context shows up in [`WidgetTestApp::layer`], and the first overlay
-//! installs [`WidgetTestApp::animation`] as the engine's completion dispatcher.
-//!
-//! # Driving the widget's async work
-//!
-//! A widget's service, its binding forwarders and its RPC calls spawn on
-//! [`WidgetServices::runtime`]. The host owns that runtime as a **current-thread**
-//! runtime, so nothing advances between `drain` calls: that is what makes a test
-//! deterministic. [`WidgetTestApp::drain_runtime`] advances it by one turn (polling
-//! every task that is ready, without sleeping and without moving any timer), and
-//! [`WidgetTestApp::run_until_idle`] alternates runtime turns with frames until no
-//! work is left. The engine's application handle keeps its own runtime (the one the
-//! test engine built); a widget that uses `WidgetCx::spawn` rather than the injected
-//! runtime is the composition root's business, and a test of such a widget drives a
-//! runtime it owns.
-//!
-//! # Moving time (E10 timers and countdowns)
-//!
-//! The host's engine is on the **engine clock**: [`TestApp`] switches the live clock
-//! off when it is built, so no wall-clock time passes however long a test runs.
-//! [`WidgetTestApp::advance`] is the only thing that moves time: it advances the
-//! engine clock by the duration the test asks for and runs one production-shaped
-//! round, so an [`App::after`] timer becomes due at exactly its deadline and never
-//! earlier. Nothing sleeps and nothing waits.
-//!
-//! One `advance` is one engine round: the frame routes run first, then one frame.
-//! The engine dispatches the timers that are due at the frame's entry — before the
-//! style / text / layout / paint passes — so a callback's writes are painted by the
-//! same round. A timer that re-arms itself (the countdown pattern,
-//! `crates/widgets/AGENTS.md` §11) fires once per call, not once per elapsed delay.
-//!
-//! The engine clock is not a widget's "now": a countdown formats the deadline the
-//! widget holds, and a test moves that state itself. Work that waits on tokio time
-//! belongs to a test-owned `#[tokio::test(start_paused = true)]` runtime, as for
-//! [`WidgetTestApp::drain_runtime`].
-//!
-//! # Injecting the host's collaborators
-//!
-//! The default host composes the same aggregate the application root does, with the
-//! headless absences: no market-participants directory, no Kytrix service connection,
-//! a silent `sound` source and an `open_url` that records nothing. A test that
-//! exercises one of those paths hands its own collaborator in with
-//! [`WidgetTestApp::with_market_participants`],
-//! [`WidgetTestApp::with_kytrix_service`], [`WidgetTestApp::with_open_url`] or
-//! [`WidgetTestApp::with_sound`] — the framework's own crate does not need a private
-//! seam per widget library to test a service path.
-//!
-//! # Selectors
-//!
-//! The contract fixes the debug ids widget surfaces are found by:
-//!
-//! | selector | node |
-//! |---|---|
-//! | `WIDGET_SURFACE` | the widget's root |
-//! | `WIDGET_SLOT` | the content surface (background/border/clip) |
-//! | `WIDGET_CONTENT` | the body slot the widget builds into |
-//! | `WIDGET_PLACEHOLDER` | the stand-in overlay |
-//! | `WIDGET_BANNER` | the failure banner (present only while it applies) |
-//!
-//! and the controls the framework builds carry the instance-derived keys
-//! `widget.placeholder.action.<node>` / `widget.banner.action.<node>`.
-//!
-//! # Reading what a canvas drew (P3-1j)
-//!
-//! A self-drawn widget's canvas is **one opaque primitive** in the engine's paint, so the
-//! old assertions could only see that a canvas node exists — deleting `set_canvas`,
-//! breaking a steady-state short circuit, or dropping `request_repaint` stayed green. The
-//! host now reads the canvas contents as paint:
-//!
-//! - [`WidgetTestApp::paint_entries`] — the node's own paint (its background/border/text/…
-//!   and the opaque `Canvas` entry), for "this node was painted at all".
-//! - [`WidgetTestApp::canvas_primitives`] — the canvas' contents as [`CanvasPrimitive`]s
-//!   (quads, paths, clip brackets, text runs, geometry) with the colors/radii the widget
-//!   wrote.
-//! - [`WidgetTestApp::canvas_handle`] — the tree's canvas value, no frame needed, for
-//!   `Arc::ptr_eq` steady-state assertions (an unchanged widget must not replace it).
-//!
-//! The first two read the **last drained frame**, so an idle round has no paint (assert
-//! after a round where [`WidgetTestApp::rendered`] is true). The four test shapes the
-//! widget crates write (steady state, theme switch, "canvas never written", geometry
-//! handed back) are documented in `crates/widgets/AGENTS.md` §11 and design §13.8.
-//!
-//! # Compiling this module
-//!
-//! It is available to this crate's own tests (`cfg(test)`) and to other crates as
-//! `widget::test_support` when the `test-support` feature is enabled. The feature is
-//! the only thing that turns on `ui_core`'s own test support, so a release build of
-//! `widget` never links the engine's test host.
-
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use base_ui::{
@@ -165,19 +47,8 @@ use crate::{
     view::WidgetView,
 };
 
-/// How many runtime/frame turns [`WidgetTestApp::run_until_idle`] runs before it
-/// gives up on settling.
-///
-/// A test whose subject is genuinely waiting (on a timer, or on work another host
-/// drives) must not hang: the budget bounds it, and the returned turn count says
-/// whether it settled or spent the budget.
 const RUNTIME_TURNS: usize = 32;
 
-/// The messages the framework itself resolves while a widget runs, and the copy its
-/// tests report as a widget's own. `test.waiting` stands for a widget's own notice,
-/// `test.rich` for one the catalogue authors as markdown/HTML (a `<p>` paragraph
-/// with a `<kbd>` icon and an inline image), and `sample.failure` for a widget's
-/// typed failure; the rest are the framework's own labels.
 pub const MESSAGES_EN: &str = r#"
 common:
   connecting: Connecting
@@ -190,7 +61,6 @@ test:
   rich: '<p align="center">Click the <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> button to pick a widget.</p>'
 "#;
 
-/// The same messages in Chinese, so a test can move the language.
 pub const MESSAGES_ZH: &str = r#"
 common:
   connecting: 正在连接
@@ -203,7 +73,6 @@ test:
   rich: '<p align="center">点击 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮选择一个部件</p>'
 "#;
 
-/// A typed failure the contract's tests report into a state cell.
 pub struct FixtureFailure;
 
 impl TranslatedError for FixtureFailure {
@@ -212,7 +81,6 @@ impl TranslatedError for FixtureFailure {
     }
 }
 
-/// The fixture translator: the deterministic catalogue the contract tests render.
 pub fn fixture_translate(language: LanguageCode) -> Translate {
     let i18n = I18n::builder()
         .locale_yaml(LanguageCode::En, MESSAGES_EN)
@@ -226,28 +94,12 @@ pub fn fixture_translate(language: LanguageCode) -> Translate {
     Translate::new(Rc::new(i18n), language)
 }
 
-/// A headless engine host with the framework's services and one widget scope.
-///
-/// ```text
-/// let mut harness = WidgetTestApp::new();
-/// let surface = harness.build_surface();
-/// harness.report(WidgetState::Connecting);
-/// harness.sync_surface(&mut surface, false);
-/// assert!(harness.visible(surface.placeholder_node()));
-/// ```
 pub struct WidgetTestApp {
     app: TestApp,
     window: WindowId,
-    /// The runtime the injected services were handed. The host owns it so a test
-    /// can drive a widget's async work ([`WidgetTestApp::drain_runtime`]); it is a
-    /// current-thread runtime, so nothing runs between drains.
     runtime: tokio::runtime::Runtime,
-    /// The composition root's one layer stack, mirrored into `services`.
     layer: Rc<Layer>,
-    /// The composition root's one frame router, mirrored into `services`.
     router: Rc<FrameRouter>,
-    /// The composition root's one animation-completion router, mirrored into
-    /// `services`.
     animation: Rc<AnimationRouter>,
     services: Rc<WidgetServices>,
     scope: SignalScope,
@@ -261,32 +113,20 @@ impl Default for WidgetTestApp {
 }
 
 impl WidgetTestApp {
-    /// Builds the host: one 800×600 window, the fixture translator, the default
-    /// settings snapshot, a light theme, and a frame router already installed.
     #[must_use]
     pub fn new() -> Self {
         Self::with_translate(fixture_translate(LanguageCode::En))
     }
 
-    /// Builds the host over an explicit translation context.
-    ///
-    /// A test that asserts catalogue-authored copy (a notice the product ships, say)
-    /// needs the product's own catalogue rather than the fixture one; everything else
-    /// is composed exactly as [`WidgetTestApp::new`] composes it.
     #[must_use]
     pub fn with_translate(translate: Translate) -> Self {
         let mut app = TestApp::new();
         let window = app.window_id();
         let theme = ThemeHandle::new(app.app_mut(), base_ui::theme::appearance::Appearance::Light);
-        // The services' runtime is one the host owns (a current-thread runtime, so a
-        // test drives its work explicitly) rather than the engine's: the engine's
-        // test runtime is private to `TestApp` and cannot be pumped from outside.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("the host's runtime builds");
-        // The composition root's three singletons: the host keeps its own handles and
-        // injects the same instances, exactly as the application root does.
         let layer = Rc::new(Layer::new());
         let animation = Rc::new(AnimationRouter::new());
         let router =
@@ -319,13 +159,6 @@ impl WidgetTestApp {
         }
     }
 
-    /// Hands the host a market-participants directory.
-    ///
-    /// The slot is `Option` because the connector's construction still needs the
-    /// application shell (`WidgetServices` documents the transition); a fixture that
-    /// builds one headlessly passes it here, and every widget that reads the
-    /// directory sees it through `services.market_participants()`. See
-    /// `crates/widgets/AGENTS.md` §8 and §11.
     #[must_use]
     pub fn with_market_participants(
         mut self,
@@ -335,176 +168,105 @@ impl WidgetTestApp {
         self
     }
 
-    /// Hands the host a Kytrix service connection.
-    ///
-    /// Like the directory, the connector's `install` still takes the toolkit's
-    /// application context, so a headless test cannot construct one until P4 adds the
-    /// toolkit-free seam (design §13.9 R-1); the setter is what a fixture with one
-    /// will use, and passing `None` is the headless absence the default host has.
     #[must_use]
     pub fn with_kytrix_service(mut self, kytrix_service: Option<KytrixServiceConnector>) -> Self {
         self.services_mut().kytrix_service = kytrix_service;
         self
     }
 
-    /// Replaces the application command a widget opens external links through.
     #[must_use]
     pub fn with_open_url(mut self, open_url: impl Fn(&str) + 'static) -> Self {
         self.services_mut().open_url = Rc::new(open_url);
         self
     }
 
-    /// Replaces the source of the application's audio assets.
-    ///
-    /// The default host has no audio (`None` for every name); a test that asserts a
-    /// widget plays the sound it decided on hands in the bytes it should receive.
     #[must_use]
     pub fn with_sound(mut self, sound: impl Fn(&'static str) -> Option<Bytes> + 'static) -> Self {
         self.services_mut().sound = Rc::new(sound);
         self
     }
 
-    /// The services aggregate, for a builder that replaces one collaborator.
-    ///
-    /// `WidgetTestApp` is the only owner of the aggregate (no context outlives a
-    /// call), so the mutable borrow is always available.
     fn services_mut(&mut self) -> &mut WidgetServices {
         Rc::get_mut(&mut self.services).expect("the host is the only owner of its services")
     }
 
-    /// The engine's test application.
     #[must_use]
     pub fn app(&self) -> &App {
         self.app.app()
     }
 
-    /// The engine's test application, for writes.
     #[must_use]
     pub fn app_mut(&mut self) -> &mut App {
         self.app.app_mut()
     }
 
-    /// The injected services.
     #[must_use]
     pub fn services(&self) -> &WidgetServices {
         &self.services
     }
 
-    /// Delivers one platform event the way the pump does.
-    ///
-    /// Input goes through the engine's interaction dispatch, and every event lands in the
-    /// observation queue [`App::drain_events_where`] reads — which is what a widget that
-    /// owns the text input of its own window consumes (`WidgetView::sync` drains it, the
-    /// way a dialog's fields do). A widget that only builds kit controls never needs this:
-    /// the engine dispatches their actions without the observation queue.
     pub fn dispatch_event(&mut self, event: Event) {
         self.app.dispatch_event(event);
     }
 
-    /// The services aggregate as the shared handle this host owns, like the
-    /// composition root does.
-    ///
-    /// A widget that builds a host owning services takes the same handle through
-    /// [`WidgetCx::services_rc`]; a test compares the two with `Rc::ptr_eq` to pin that
-    /// the widget works over the application's one aggregate rather than a copy.
     #[must_use]
     pub fn services_rc(&self) -> &Rc<WidgetServices> {
         &self.services
     }
 
-    /// The composition root's one layer stack the services carry.
-    ///
-    /// A test asserts an overlay opened through the widget context against this
-    /// instance: it is the same one the services hand out, and a widget that built its
-    /// own stack could not register there.
     #[must_use]
     pub fn layer(&self) -> &Layer {
         &self.layer
     }
 
-    /// The installed frame router.
     #[must_use]
     pub fn router(&self) -> &FrameRouter {
         &self.router
     }
 
-    /// The composition root's one animation-completion router the services carry.
-    ///
-    /// The engine's single completion slot stays with this instance: the first kit
-    /// component built through the widget context installs it
-    /// ([`AnimationRouter::installed`]).
     #[must_use]
     pub fn animation(&self) -> &AnimationRouter {
         &self.animation
     }
 
-    /// The window every widget of this host lives in.
     #[must_use]
     pub const fn window(&self) -> WindowId {
         self.window
     }
 
-    /// The state cell the framework minted for the fixture widget.
     #[must_use]
     pub const fn status(&self) -> WidgetStatus {
         self.status
     }
 
-    /// The fixture widget's scope.
     #[must_use]
     pub const fn scope(&self) -> SignalScope {
         self.scope
     }
 
-    /// Runs `body` with a [`WidgetCx`] over this host.
     pub fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R {
         let services = Rc::clone(&self.services);
         let mut cx = WidgetCx::new(self.app.app_mut(), self.window, &services, self.scope);
         body(&mut cx)
     }
 
-    /// Runs every registered frame route, as the engine hook would.
     pub fn tick(&mut self) {
         self.router
             .tick(self.app.app_mut())
             .expect("the widget frame routes succeed");
     }
 
-    /// One production-shaped frame: the frame hook first, then the pipeline.
     pub fn drain(&mut self) {
         self.tick();
         self.app.drain().expect("the frame commits");
     }
 
-    /// Advances the engine clock by `by` and runs one production-shaped round.
-    ///
-    /// This is the host's only time source: the engine is on the engine clock, so
-    /// an E10 timer ([`App::after`]) becomes due exactly when the accumulated
-    /// `advance` calls reach its deadline — and never because wall-clock time
-    /// passed (see the module docs, "Moving time"). The round is
-    /// [`WidgetTestApp::drain`]: the frame routes first, then one frame; the engine
-    /// dispatches the due timers at that frame's entry, so a callback's writes are
-    /// painted by the same round.
-    ///
-    /// Returns whether the round committed pixels. A callback that writes no render
-    /// state leaves the round idle: `false`, and neither
-    /// [`WidgetTestApp::frame_index`] nor [`WidgetTestApp::frame_requests`] moves
-    /// (I3). A callback whose write a node reads — or one that asks for a repaint —
-    /// has that request presented by this same round: `true`.
-    ///
-    /// One call is one engine round, so a timer that re-arms itself (the countdown
-    /// pattern, `crates/widgets/AGENTS.md` §11) fires once per call, not once per
-    /// elapsed `delay`.
     pub fn advance(&mut self, by: Duration) -> bool {
         self.app.advance(by);
         self.drain();
         self.app.frame_record().rendered
     }
 
-    /// The host window's commit cursor (`0` = nothing committed yet).
-    ///
-    /// A round that paints nothing — an idle [`WidgetTestApp::advance`], say — leaves
-    /// it unchanged (I3).
     #[must_use]
     pub fn frame_index(&self) -> FrameIndex {
         self.app
@@ -514,75 +276,25 @@ impl WidgetTestApp {
             .frame_index()
     }
 
-    /// How many frames the engine has been asked for.
-    ///
-    /// This is the I3 assertion surface: an idle round adds nothing. A signal write
-    /// only asks for a frame when a node (or derived value) reads it; an explicit
-    /// [`App::request_repaint`] always asks.
     #[must_use]
     pub fn frame_requests(&self) -> u64 {
         self.app.app().frame_requests()
     }
 
-    /// The engine's value-slot table statistics (E21).
-    ///
-    /// A widget's signals and transient values live in its scope, and releasing the
-    /// scope returns them to the free stack for the next mount to reuse. That is what
-    /// makes a leak assertion expressible here: mount and release a widget (or open and
-    /// close a component) many times and neither `slots` nor `live` may grow — a
-    /// signal minted into the root scope instead is never reclaimed, and the `live`
-    /// count after a release is where it shows up.
-    ///
-    /// The read is an engine test probe: it draws nothing and asks for no frame.
     #[must_use]
     pub fn signal_slot_stats(&self) -> SignalSlotStats {
         ui_core::test_support::diagnostics::signal_slot_stats(self.app.app())
     }
 
-    /// Whether the last drained round committed pixels.
-    ///
-    /// [`WidgetTestApp::advance`] returns this same fact for the round it ran; this
-    /// reads it after a plain [`WidgetTestApp::drain`].
-    ///
-    /// # Panics
-    /// No round has been drained yet (there is no frame record to read).
     #[must_use]
     pub fn rendered(&self) -> bool {
         self.app.frame_record().rendered
     }
 
-    /// Advances the runtime the widget services were handed by one turn.
-    ///
-    /// A widget's service, its binding forwarders and its RPC replies all spawn on
-    /// [`WidgetServices::runtime`]; the host owns it as a current-thread runtime, so
-    /// its tasks make no progress between calls. One turn polls every task that is
-    /// ready — including the tasks those tasks wake — without sleeping and without
-    /// advancing a timer. The loop goes on until nothing else is ready or the runtime
-    /// has no more work to schedule.
-    ///
-    /// This drives the *services* runtime, which is the one `WidgetBinding`,
-    /// `WidgetRuntime` and the RPC client use. Work a widget sends through
-    /// `WidgetCx::spawn`/`AppHandle` runs on the engine's handle and belongs to the
-    /// composition root; a test of it drives a runtime it owns.
     pub fn drain_runtime(&mut self) {
         self.runtime.block_on(tokio::task::yield_now());
     }
 
-    /// Advances the runtime and the frame pipeline until neither has work left.
-    ///
-    /// Each turn is one [`WidgetTestApp::drain_runtime`] followed by one
-    /// [`WidgetTestApp::drain`] — the production order: widget work first, then the
-    /// frame that presents what it wrote (a binding delivery requests its frame from
-    /// the runtime side, and the pump runs the request on the next frame). The loop
-    /// stops after a turn that changed neither the frame-request counter nor the
-    /// number of dispatched tasks, or after [`RUNTIME_TURNS`] turns; it returns how
-    /// many turns it ran, so a test can assert that its subject settled rather than
-    /// spending the budget.
-    ///
-    /// Nothing sleeps and no clock moves: a widget that waits on wall-clock or tokio
-    /// time is not advanced here. A test of such work drives its own
-    /// `#[tokio::test(start_paused = true)]` runtime (see `crates/widgets/AGENTS.md`
-    /// §11).
     pub fn run_until_idle(&mut self) -> usize {
         let mut turns = 0;
         let mut settled = (self.app.app().frame_requests(), self.app.tasks_run());
@@ -599,7 +311,6 @@ impl WidgetTestApp {
         turns
     }
 
-    /// The window's node tree.
     #[must_use]
     pub fn tree(&self) -> &NodeTree {
         self.app
@@ -609,13 +320,11 @@ impl WidgetTestApp {
             .tree()
     }
 
-    /// The root node of the host window.
     #[must_use]
     pub fn root(&self) -> NodeId {
         self.tree().root()
     }
 
-    /// Reports a state through the fixture widget's cell.
     pub fn report(&mut self, state: WidgetState) {
         assert!(
             self.status.report(self.app.app_mut(), state),
@@ -623,8 +332,6 @@ impl WidgetTestApp {
         );
     }
 
-    /// Switches the language the way the composition root does: translator first,
-    /// then the signal.
     pub fn switch_language(&mut self, language: LanguageCode) {
         self.services.translate.set_language(language);
         assert!(
@@ -633,7 +340,6 @@ impl WidgetTestApp {
         );
     }
 
-    /// Builds one widget surface under the window root.
     pub fn build_surface(&mut self) -> WidgetSurface {
         let status = self.status;
         let services = Rc::clone(&self.services);
@@ -643,7 +349,6 @@ impl WidgetTestApp {
         WidgetSurface::build(&mut cx, root, status).expect("the surface builds")
     }
 
-    /// Runs the surface's sync for one frame and then drains it.
     pub fn sync_surface(&mut self, surface: &mut WidgetSurface, has_content: bool) {
         let services = Rc::clone(&self.services);
         let scope = self.scope;
@@ -656,7 +361,6 @@ impl WidgetTestApp {
         self.drain();
     }
 
-    /// Builds a test body node under `parent` and returns it.
     pub fn build_body(&mut self, parent: NodeId) -> NodeId {
         self.with_cx(|cx| {
             NodeBuilder::boxed()
@@ -666,8 +370,6 @@ impl WidgetTestApp {
         })
     }
 
-    /// Builds a plain container under the root, for tests that exercise a
-    /// placeholder outside a surface.
     pub fn placeholder_parent(&mut self) -> NodeId {
         self.with_cx(|cx| {
             let root = cx.tree().root();
@@ -678,12 +380,10 @@ impl WidgetTestApp {
         })
     }
 
-    /// Mounts a widget through the real registration path and returns its handle.
     pub fn mount<W: WidgetView>(&mut self, config: W::Config) -> AnyWidget {
         self.try_mount::<W>(config).expect("the widget mounts")
     }
 
-    /// Mounts a widget, keeping the error a refused construction reports.
     pub fn try_mount<W: WidgetView>(
         &mut self,
         config: W::Config,
@@ -701,12 +401,6 @@ impl WidgetTestApp {
         )
     }
 
-    /// Mounts a widget under `parent` over a scope the caller minted.
-    ///
-    /// The failure path is what this seam is for: a stale `parent` refuses the
-    /// surface, and the caller still holds the scope, so it can assert that the
-    /// refused attempt released the state cell it minted (a leaked scope has no
-    /// other observable).
     pub fn try_mount_in_scope<W: WidgetView>(
         &mut self,
         parent: NodeId,
@@ -726,9 +420,6 @@ impl WidgetTestApp {
         )
     }
 
-    /// Whether the node draws (its evaluated style patch is visible).
-    ///
-    /// The patch is written by the style pass, so a test reads this after a frame.
     #[must_use]
     pub fn visible(&self, node: NodeId) -> bool {
         self.tree()
@@ -739,8 +430,6 @@ impl WidgetTestApp {
             .unwrap_or(true)
     }
 
-    /// The text the subtree under `node` draws, in document order, one line per text
-    /// node.
     #[must_use]
     pub fn text_of(&self, node: NodeId) -> String {
         let mut texts = Vec::new();
@@ -748,7 +437,6 @@ impl WidgetTestApp {
         texts.join("\n")
     }
 
-    /// Whether any text node in the subtree draws exactly `text`.
     #[must_use]
     pub fn has_text(&self, node: NodeId, text: &str) -> bool {
         let mut texts = Vec::new();
@@ -756,7 +444,6 @@ impl WidgetTestApp {
         texts.iter().any(|drawn| drawn == text)
     }
 
-    /// Whether the subtree under `node` contains a canvas node (a spinner's shape).
     #[must_use]
     pub fn has_canvas(&self, node: NodeId) -> bool {
         let tree = self.tree();
@@ -770,19 +457,6 @@ impl WidgetTestApp {
         false
     }
 
-    /// The primitives the last drained frame painted for `node`.
-    ///
-    /// This is the node's **own** paint in paint order — its background quad, border, text run,
-    /// image, shadows and, for a self-drawn node, the single opaque
-    /// [`PrimitiveKind::Canvas`] entry. A canvas node's contents are not flattened here: read
-    /// them with [`WidgetTestApp::canvas_primitives`].
-    ///
-    /// The read is the last drained frame's paint, not the tree's inputs: a round that painted
-    /// nothing (an idle round, I3) has no paint and answers empty. Assert after a round that
-    /// committed ([`WidgetTestApp::rendered`]).
-    ///
-    /// # Panics
-    /// No round has been drained yet (there is no frame record to read).
     #[must_use]
     pub fn paint_entries(&self, node: NodeId) -> Vec<PrimitiveRecord> {
         self.app
@@ -798,21 +472,6 @@ impl WidgetTestApp {
             .unwrap_or_default()
     }
 
-    /// The primitives a canvas node's canvas holds in the last drained frame.
-    ///
-    /// A self-drawn widget (`NodeBuilder::canvas` + [`WidgetCx::set_canvas`](crate::cx::WidgetCx::set_canvas))
-    /// is one opaque `Primitive::Canvas` in the engine's paint; what the widget drew — quads,
-    /// paths, clip brackets, text runs, geometry — is read here, in the order the widget pushed
-    /// them. Colors are the [`Color`]s the widget wrote (compare them against the theme role it
-    /// read, not against resolved linear-premultiplied values), and every text run is one
-    /// [`PrimitiveKind::GlyphRun`] entry whose `glyphs` is its positioned-glyph count.
-    ///
-    /// The read is the last drained frame's paint: a node with no canvas, a canvas that was not
-    /// painted (hidden/removed), and an idle round all answer empty. Assert after a round that
-    /// committed ([`WidgetTestApp::rendered`]).
-    ///
-    /// # Panics
-    /// No round has been drained yet (there is no frame record to read).
     #[must_use]
     pub fn canvas_primitives(&self, node: NodeId) -> Vec<CanvasPrimitive> {
         self.app
@@ -828,13 +487,6 @@ impl WidgetTestApp {
             .unwrap_or_default()
     }
 
-    /// The canvas the node tree currently holds for `node` (`None` = not a canvas node).
-    ///
-    /// This is the input side and needs no frame. A widget that repaints only when something it
-    /// paints changed leaves the same [`Arc`] in place across steady-state syncs, so
-    /// `Arc::ptr_eq` of two reads is the assertion that `set_canvas` was **not** called between
-    /// them (a widget that rebuilds its canvas every frame replaces it, which is what a
-    /// steady-state mutation breaks).
     #[must_use]
     pub fn canvas_handle(&self, node: NodeId) -> Option<Arc<Canvas>> {
         let NodeKind::Canvas(canvas) = self.tree().get(node).ok()?.kind() else {
@@ -843,10 +495,6 @@ impl WidgetTestApp {
         Some(Arc::clone(canvas))
     }
 
-    /// Clicks the recovery control the framework built under `parent`.
-    ///
-    /// The click goes through the engine's real action dispatch — the control's
-    /// handler is the framework's, and this is the same path a pointer click takes.
     pub fn click_recovery(&mut self, parent: NodeId) {
         let node = self
             .find_by_debug_prefix(parent, "widget.placeholder.action.")
@@ -871,7 +519,6 @@ impl WidgetTestApp {
         );
     }
 
-    /// The nearest node under `parent` whose debug id starts with `prefix`.
     #[must_use]
     pub fn find_by_debug_prefix(&self, parent: NodeId, prefix: &str) -> Option<NodeId> {
         let tree = self.tree();
@@ -895,7 +542,6 @@ impl WidgetTestApp {
         None
     }
 
-    /// Sets an a11y patch through the engine, as a widget's sync would.
     pub fn set_a11y_patch(&mut self, node: NodeId, patch: A11yPatch) {
         self.app
             .app_mut()
@@ -903,20 +549,10 @@ impl WidgetTestApp {
             .expect("the node is alive");
     }
 
-    /// Turns on a11y capture for the following frames.
-    ///
-    /// The first drained frame is the full tree; every later one is the incremental
-    /// delivery. Assertions read [`WidgetTestApp::a11y_hidden`] against the last
-    /// drained frame.
     pub fn enable_a11y_capture(&mut self) {
         self.app.enable_a11y_capture();
     }
 
-    /// Whether the engine marked `node` hidden in the last drained a11y delivery.
-    ///
-    /// This is the engine's own hidden predicate (`A11yPatch.hidden` / `visible` /
-    /// `display:none` resolved by the a11y tree), not the style patch: it is what an
-    /// assistive technology receives.
     #[must_use]
     pub fn a11y_hidden(&self, node: NodeId) -> bool {
         let snapshot = self
@@ -929,8 +565,6 @@ impl WidgetTestApp {
             .hidden
     }
 
-    /// Whether the subtree under `node` contains a text node with inline boxes
-    /// (an inline image or a `<kbd>` span).
     #[must_use]
     pub fn has_inline_boxes(&self, node: NodeId) -> bool {
         let tree = self.tree();
@@ -947,7 +581,6 @@ impl WidgetTestApp {
         false
     }
 
-    /// How many nodes the host window's tree holds (mount-leak assertions).
     #[must_use]
     pub fn node_count(&self) -> usize {
         let tree = self.tree();
@@ -973,33 +606,18 @@ impl WidgetTestApp {
     }
 }
 
-/// One primitive inside a canvas, as the last drained frame painted it.
-///
-/// [`WidgetTestApp::canvas_primitives`] returns these in push order: one entry per
-/// `Canvas::push_*` call, with the fields that call wrote. `ClipPush` / `ClipPop` are the
-/// canvas' bracket instructions (a balanced pair is how a test asserts the widget closed what it
-/// opened); `glyphs` is meaningful on `GlyphRun` entries only (one entry = one text run).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CanvasPrimitive {
-    /// Which primitive this is.
     pub kind: PrimitiveKind,
-    /// Logical-pixel bounds; `None` for instructions without geometry (`ClipPop`, `Geometry`).
     pub bounds: Option<Rect>,
-    /// Four corner radii (logical px) for `Quad`, `Shadow` and `ClipPush`.
     pub corner_radius: Option<[f32; 4]>,
-    /// Solid fill / path fill / text / shadow colour, or a gradient's **start** colour.
     pub color: Option<Color>,
-    /// A quad's inner border (width, colour).
     pub border: Option<(f32, Color)>,
-    /// A gradient quad's end colour and direction; its start colour is [`Self::color`].
     pub gradient: Option<(Color, GradientKind)>,
-    /// Positioned-glyph count for a `GlyphRun` (0 for every other kind).
     pub glyphs: usize,
-    /// The geometry a `Path` / `Geometry` primitive draws from.
     pub geometry: Option<GeometryId>,
 }
 
-/// Snapshots one canvas-inner primitive, keeping the app-written colors unresolved.
 fn canvas_primitive(primitive: &Primitive) -> CanvasPrimitive {
     match primitive {
         Primitive::Quad(quad) => {
@@ -1113,13 +731,6 @@ fn canvas_primitive(primitive: &Primitive) -> CanvasPrimitive {
     }
 }
 
-/// A widget in the shape the framework drives, for the tests that need the whole
-/// path rather than one piece of it.
-///
-/// It reports a [`Notice`](crate::status::Notice) rather than a sentence, draws its
-/// own copy in the language showing now, and counts the states it writes: a language
-/// change has to reach the surface without the widget being asked for anything, and
-/// that count is how a test sees whether it did.
 pub struct WaitingWidget {
     status: WidgetStatus,
     writes: Rc<std::cell::Cell<usize>>,
@@ -1128,19 +739,16 @@ pub struct WaitingWidget {
 }
 
 impl WaitingWidget {
-    /// How many states this fixture has written.
     #[must_use]
     pub fn writes(&self) -> usize {
         self.writes.get()
     }
 
-    /// How many times this fixture has loaded.
     #[must_use]
     pub fn loads(&self) -> usize {
         self.loads.get()
     }
 
-    /// Whether the framework ran the fixture's release hook.
     #[must_use]
     pub fn released(&self) -> bool {
         self.released.get()
@@ -1246,15 +854,11 @@ mod tests {
         view::{ReloadHandle, WidgetView},
     };
 
-    /// The contract's minimum end-to-end example: mount a widget, let the framework
-    /// build its body, move through loading → ready → failed, switch the language,
-    /// and release with nothing left behind.
     #[test]
     fn a_minimal_widget_runs_the_whole_lifecycle() {
         let mut harness = WidgetTestApp::new();
         let widget = harness.mount::<WaitingWidget>(());
 
-        // Registration: the framework built the surface and ran the first load.
         assert_eq!(
             harness.tree().debug_id(widget.surface()),
             Some("WIDGET_SURFACE")
@@ -1264,7 +868,6 @@ mod tests {
             WidgetState::waiting(crate::status::Notice::message("test.waiting"))
         );
 
-        // The surface presents the notice without any content.
         harness.drain();
         let surface_node = widget.surface();
         let placeholder = harness
@@ -1273,8 +876,6 @@ mod tests {
         assert!(harness.visible(placeholder));
         assert!(harness.text_of(placeholder).contains("Waiting for orders"));
 
-        // State switching: the widget reports through its own cell, and the surface
-        // follows on the next frame.
         assert!(
             widget
                 .status()
@@ -1288,8 +889,6 @@ mod tests {
                 .report(harness.app_mut(), WidgetState::Ready)
         );
 
-        // The language switch: the translator and the signal move together, and the
-        // next synchronization redraws the sentence.
         harness.switch_language(LanguageCode::ZhCn);
         assert!(widget.status().report(
             harness.app_mut(),
@@ -1302,8 +901,6 @@ mod tests {
             harness.text_of(placeholder)
         );
 
-        // The failure terminal state: the placeholder carries the typed failure and
-        // its recovery, and the state cell reports it exactly like every other state.
         assert!(widget.status().report(
             harness.app_mut(),
             WidgetState::failed(
@@ -1326,8 +923,6 @@ mod tests {
             "a failed widget with no content draws the failure, not the content"
         );
 
-        // Release: the route is gone, the scope is released, the hook ran, and the
-        // surfaces are no longer in the window's tree.
         assert_eq!(harness.router().len(), 1);
         let released = widget.release(harness.app_mut());
         assert!(released > 0, "the scope owned the widget's signals");
@@ -1339,11 +934,9 @@ mod tests {
         );
         assert!(widget.config().is_none());
 
-        // Idempotent: a second release is a no-op.
         assert_eq!(widget.release(harness.app_mut()), 0);
     }
 
-    /// A released widget's recovery route is gone: the router no longer holds it.
     #[test]
     fn a_released_widget_leaves_no_frame_route() {
         let mut harness = WidgetTestApp::new();
@@ -1356,11 +949,6 @@ mod tests {
         harness.drain();
     }
 
-    /// A mounted widget's values live in its own scope, and releasing it returns them:
-    /// the value-slot table is the leak assertion surface (E21 / W2c-R9). Repeating the
-    /// mount and release must leave neither the allocated slots nor the live count
-    /// growing — an unreclaimed signal shows up in `live`, and a slot table that only
-    /// ever appends shows up in `slots`.
     #[test]
     fn releasing_a_widget_reclaims_every_value_slot() {
         let mut harness = WidgetTestApp::new();
@@ -1391,10 +979,6 @@ mod tests {
         );
     }
 
-    /// Two widget instances live in one application, each with its own signal scope and
-    /// surface: the host is a pane host, not a single-widget fixture. Closing one pane
-    /// removes only its own nodes and frame route — what a multi-pane action key has to
-    /// survive (P3-1h: keys are prefixed by the instance scope).
     #[test]
     fn two_widget_instances_live_side_by_side() {
         let mut harness = WidgetTestApp::new();
@@ -1429,8 +1013,6 @@ mod tests {
         assert!(harness.tree().get(second.surface()).is_err());
     }
 
-    /// The failure path: the fixture refuses its own recovery, and the framework's
-    /// banner is shown above content.
     #[test]
     fn a_recovery_action_offers_the_reload_path() {
         let mut harness = WidgetTestApp::new();
@@ -1450,8 +1032,6 @@ mod tests {
         assert_eq!(retries.get(), 1);
     }
 
-    /// The erasure: `AnyWidget` answers the framework's questions without the
-    /// caller knowing the widget type.
     #[test]
     fn any_widget_answers_through_the_vtable_only() {
         let mut harness = WidgetTestApp::new();
@@ -1464,9 +1044,6 @@ mod tests {
         assert!(!widget.is_released());
     }
 
-    /// The default host composes the headless absences: no market-participants
-    /// directory, no Kytrix service connection, no audio. A widget maps each of them
-    /// to its own business notice or failure.
     #[test]
     fn the_default_host_has_no_directory_service_or_audio() {
         let harness = WidgetTestApp::new();
@@ -1480,11 +1057,6 @@ mod tests {
         );
     }
 
-    /// The host composes the collaborators the application root does, and a test
-    /// injects the one it exercises: the command a widget opens links through records
-    /// what it was asked to open, and the sound source hands back the bytes it was
-    /// asked to play. These are the two W1a had to work around with a crate-private
-    /// seam.
     #[test]
     fn a_test_injects_the_application_collaborators_it_exercises() {
         let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1506,11 +1078,6 @@ mod tests {
         );
     }
 
-    /// A headless fixture builds the market-participants directory over the host's
-    /// own runtime and hands it in, so a widget's directory path is reachable through
-    /// `mount` instead of a crate-private source seam (W1b's gap). The Kytrix
-    /// connection is the collaborator whose construction still needs the toolkit, so
-    /// a headless host states its absence explicitly (design §13.9 R-1).
     #[test]
     fn a_headless_market_participants_directory_can_be_injected() {
         let harness = WidgetTestApp::new();
@@ -1537,10 +1104,6 @@ mod tests {
         assert!(harness.services().kytrix_service().is_none());
     }
 
-    /// The host owns the runtime its services were handed as a current-thread
-    /// runtime, so a widget's async work runs only when the test drives it — which is
-    /// what makes a service test deterministic, and what lets the test drive it here
-    /// instead of building a second host just to pump a runtime (W1a/W1b's gap).
     #[test]
     fn drain_runtime_advances_the_services_runtime() {
         let mut harness = WidgetTestApp::new();
@@ -1561,8 +1124,6 @@ mod tests {
         );
     }
 
-    /// A chain of service work is driven by `run_until_idle` with no sleep: the first
-    /// task wakes the second, and the loop stops as soon as nothing moves.
     #[test]
     fn run_until_idle_drives_a_chain_of_service_work() {
         let mut harness = WidgetTestApp::new();
@@ -1595,9 +1156,6 @@ mod tests {
         );
     }
 
-    /// A service that asks the interface for a frame is presented by the same loop:
-    /// the request goes through the real application handle, and the frame pump runs
-    /// it on the next turn — the production order the host's `drain` implements.
     #[test]
     fn run_until_idle_presents_the_frame_a_service_asked_for() {
         let mut harness = WidgetTestApp::new();
@@ -1623,13 +1181,9 @@ mod tests {
         );
     }
 
-    /// E10 in the host: an [`App::after`] timer fires when [`WidgetTestApp::advance`]
-    /// reaches its deadline, and a callback that writes no render state leaves the
-    /// round idle — no frame request, no commit (I3).
     #[test]
     fn advance_dispatches_a_due_timer_without_asking_for_a_frame() {
         let mut harness = WidgetTestApp::new();
-        // The host's first frame paints the window; settle it before measuring.
         harness.drain();
         let fired = Rc::new(Cell::new(0));
         let counter = Rc::clone(&fired);
@@ -1657,12 +1211,9 @@ mod tests {
         assert!(!harness.rendered());
     }
 
-    /// The timer is never early: half the delay is an idle round, and the second half
-    /// reaches the deadline exactly.
     #[test]
     fn advance_does_not_fire_a_timer_before_its_delay() {
         let mut harness = WidgetTestApp::new();
-        // The host's first frame paints the window; settle it before measuring.
         harness.drain();
         let fired = Rc::new(Cell::new(0));
         let counter = Rc::clone(&fired);
@@ -1692,9 +1243,6 @@ mod tests {
         );
     }
 
-    /// The countdown pattern: a timer's callback writes the state a label reads, and
-    /// the same round presents it — the callback's write is the only frame request the
-    /// advance adds.
     #[test]
     fn a_timer_callback_s_write_is_presented_by_the_same_advance() {
         let mut harness = WidgetTestApp::new();
@@ -1710,8 +1258,6 @@ mod tests {
                 .build(cx.tree_mut(), root)
                 .expect("the countdown label builds")
         });
-        // The first frame evaluates the binding, so the label depends on the signal
-        // before the callback writes it.
         harness.drain();
         assert!(
             harness.has_text(label, "0"),
@@ -1744,18 +1290,10 @@ mod tests {
         assert_eq!(harness.frame_index().get(), index.get() + 1);
     }
 
-    /// How far the canvas fixture animates before it settles.
     const CANVAS_TICKS: u8 = 3;
 
-    /// The canvas box the fixture draws into.
     const CANVAS_BOX: Rect = Rect::new(0.0, 0.0, 120.0, 40.0);
 
-    /// A widget whose body is one self-drawn canvas: it animates a few frames, draws a clipped
-    /// quad + a path over registered geometry + one shaped text run, reads the theme on every
-    /// repaint, and hands the geometry back on release.
-    ///
-    /// It is the subject the canvas observations are tested on (P3-1j): the same `sync → set_canvas
-    /// → frame` path the migrated deep-bar / chart widgets take, without their domain code.
     struct CanvasWidget {
         progress: u8,
         painted: Option<(u8, Appearance)>,
@@ -1794,8 +1332,6 @@ mod tests {
         }
 
         fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-            // A plate that reads a theme role registers the dependency an appearance switch
-            // invalidates, so switching the theme asks for the repaint the canvas follows.
             let theme = cx.theme().clone();
             NodeBuilder::boxed()
                 .id("TEST_PLATE")
@@ -1871,7 +1407,6 @@ mod tests {
         }
     }
 
-    /// Registers one `GeometryPipeline::Ui` triangle in the process-wide store.
     fn register_triangle(app: &mut App) -> Result<GeometryId, EngineError> {
         let mut vertex_bytes = Vec::with_capacity(36);
         for vertex in [[0.0_f32, 0.0, -1.0], [40.0, 0.0, -1.0], [0.0, 20.0, -1.0]] {
@@ -1890,26 +1425,20 @@ mod tests {
         })
     }
 
-    /// The canvas node the fixture built under its surface.
     fn canvas_node(harness: &WidgetTestApp, widget: &AnyWidget) -> NodeId {
         harness
             .find_by_debug_prefix(widget.surface(), "TEST_CANVAS")
             .expect("the fixture built its canvas")
     }
 
-    /// The colour one appearance resolves `role` to.
     fn role_color(harness: &WidgetTestApp, appearance: Appearance, role: Role) -> Color {
         harness.services().theme.theme_for(appearance).role(role)
     }
 
-    /// The kinds of a canvas' primitives, in paint order.
     fn kinds(primitives: &[CanvasPrimitive]) -> Vec<PrimitiveKind> {
         primitives.iter().map(|primitive| primitive.kind).collect()
     }
 
-    /// P3-1j: the canvas fixture's paint is readable primitive by primitive — the clip bracket,
-    /// the quad (bounds/radius/colour), the path over registered geometry and the text run —
-    /// instead of one opaque `Canvas` entry (W4b F1, W5a).
     #[test]
     fn a_canvas_widget_s_draws_are_readable_primitive_by_primitive() {
         let mut harness = WidgetTestApp::new();
@@ -1969,7 +1498,6 @@ mod tests {
             Some(role_color(&harness, Appearance::Light, Role::FgDefault))
         );
 
-        // The animation moved: the next frame draws the next progress.
         harness.drain();
         let grown = harness.canvas_primitives(node);
         assert_eq!(
@@ -1979,8 +1507,6 @@ mod tests {
         );
     }
 
-    /// P3-1j / W4b F1 ②③: a widget that animates requests the frames it draws, and once it
-    /// settles it neither rewrites the canvas (`Arc::ptr_eq`) nor asks for another frame (I3).
     #[test]
     fn a_settled_canvas_is_not_rewritten_and_asks_for_no_more_frames() {
         let mut harness = WidgetTestApp::new();
@@ -2020,9 +1546,6 @@ mod tests {
         );
     }
 
-    /// P3-1j / W4b F1 ②: an animating canvas keeps asking for the frames it draws. A widget that
-    /// only calls `set_canvas` in `sync` without requesting the next frame freezes in production
-    /// (no pump wake), which this reads back through `frame_requests`.
     #[test]
     fn an_animating_canvas_keeps_asking_for_frames() {
         let mut harness = WidgetTestApp::new();
@@ -2040,8 +1563,6 @@ mod tests {
         );
     }
 
-    /// P3-1j / W4b F1 ② (theme half): the canvas repaints in the colours the appearance now
-    /// resolves — the assertion a "colours baked in at mount" regression fails.
     #[test]
     fn switching_the_appearance_repaints_the_canvas_in_the_new_roles() {
         let mut harness = WidgetTestApp::new();
@@ -2083,8 +1604,6 @@ mod tests {
         );
     }
 
-    /// P3-1j / P3-1j C: a canvas node that was never written paints no primitives (the node is
-    /// still one opaque canvas entry) — the "`set_canvas` was removed" assertion shape.
     #[test]
     fn a_canvas_node_that_was_never_written_paints_no_primitives() {
         let mut harness = WidgetTestApp::new();
@@ -2113,8 +1632,6 @@ mod tests {
         );
     }
 
-    /// P3-1j / W5a D: a canvas that draws registered geometry is observable, and releasing the
-    /// widget hands the mesh back to the process-wide store.
     #[test]
     fn releasing_a_canvas_widget_hands_its_geometry_back() {
         let mut harness = WidgetTestApp::new();

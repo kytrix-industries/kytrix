@@ -1,5 +1,3 @@
-//! WebSocket sessions dialled through an HTTP client bound to a resolved route.
-
 use std::time::Duration;
 
 use app_config::network::ResolvedProxy;
@@ -22,14 +20,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The client one upgrade runs on.
-///
-/// It is pinned to HTTP/1.1 because RFC 6455 upgrades an HTTP/1.1 connection: a
-/// server reached over `h2` has no `Upgrade` handshake to answer with, so it resets
-/// the stream instead of switching protocols. Which version a reqwest client offers
-/// in ALPN otherwise follows feature unification — anything in the binary enabling
-/// `reqwest/http2` switches every client in the process to offering `h2` — so the
-/// pin is what keeps the handshake independent of unrelated crates.
 pub(super) fn upgrade_client_spec(headers: HeaderMap) -> ClientSpec {
     ClientSpec {
         connect_timeout: CONNECT_TIMEOUT,
@@ -41,11 +31,6 @@ pub(super) fn upgrade_client_spec(headers: HeaderMap) -> ClientSpec {
     }
 }
 
-/// Classifies what a failed handshake reported.
-///
-/// Only what the error itself proves is classified: a timeout, the status a peer
-/// answered with, and the handshake shapes yawc rejects by name. Everything else is
-/// reported with the chain that says which leg broke.
 pub(super) fn upgrade_failure(error: &WebSocketError) -> UpgradeFailure {
     match error {
         WebSocketError::Reqwest(error) if error.is_timeout() => UpgradeFailure::Timeout,
@@ -62,11 +47,6 @@ pub(super) fn upgrade_failure(error: &WebSocketError) -> UpgradeFailure {
     }
 }
 
-/// Renders an error and everything that caused it as one line.
-///
-/// The part of a transport failure worth reading is usually its cause: the outermost
-/// error only says that a request failed, and the chain below it — a proxy refusal, a
-/// TLS alert, an HTTP/2 reset — says which leg did.
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> SmolStr {
     let mut rendered = SmolStr::new(error.to_string());
     let mut source = error.source();
@@ -77,10 +57,6 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> SmolStr {
     rendered
 }
 
-/// Stable identity for a physical WebSocket endpoint.
-///
-/// The name describes the socket a session was opened on: the configured origin
-/// it dialed, spelled as it was dialed, plus the protocol family it carries.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WsEndpointId {
     pub protocol_family: SmolStr,
@@ -91,33 +67,26 @@ pub struct WsEndpointId {
     pub access: EndpointAccess,
 }
 
-/// Whether a WebSocket endpoint transports public or authenticated traffic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EndpointAccess {
     Public,
     Private,
 }
 
-/// The exact routing identity used to share one physical WebSocket session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WsSessionKey {
     pub endpoint: WsEndpointId,
     pub proxy: ResolvedProxy,
-    /// OS proxy settings hash for System routes; `0` for Direct/Named.
     pub os_proxy_fingerprint: u64,
 }
 
-/// One WebSocket session with cancellation- and timeout-bounded I/O.
 pub struct RawWebSocket {
     inner: HttpWebSocket,
-    /// The client that performed the upgrade is kept alive for as long as the
-    /// upgraded connection runs, so the session never outlives its transport.
     _client: Client,
     cancellation: CancellationToken,
 }
 
 impl RawWebSocket {
-    /// Dials `url` through `route`, sending `headers` with the upgrade request.
     pub async fn connect(
         url: &Url,
         route: &ResolvedProxy,
@@ -139,8 +108,6 @@ impl RawWebSocket {
             !policy.allow_plaintext,
             &policy.extra_root_certificates,
         )?;
-        // `permessage-deflate` stays at yawc's low-latency preset: market and
-        // account streams are latency-sensitive, not bandwidth-bound.
         let options = Options::default()
             .with_max_payload_read(MAX_FRAME_BYTES)
             .with_max_fragment_size(64 * 1024)
@@ -190,7 +157,6 @@ impl RawWebSocket {
         }
     }
 
-    /// Reads the next frame with the caller's own timeout and cancellation.
     pub async fn next_frame(&mut self) -> Result<Frame, WebSocketError> {
         self.inner.next_frame().await
     }

@@ -1,5 +1,3 @@
-//! The tradable listing and its published snapshot.
-
 use ahash::AHashSet;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use smol_str::SmolStr;
@@ -21,11 +19,6 @@ use crate::{
     settlement::InstrumentId,
 };
 
-/// One listing: the canonical instrument it implements plus its native identity.
-///
-/// `identifiers` is the authoritative protocol identity; `native_symbol` and
-/// `aliases` are display and lookup aliases of the same listing and never carry
-/// identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VenueListing {
     #[serde(rename = "key")]
@@ -41,11 +34,6 @@ pub struct VenueListing {
 }
 
 impl VenueListing {
-    /// Builds a listing from its identity and typed native identifiers.
-    ///
-    /// The constructor validates the typed identifiers; the alias uniqueness and
-    /// the instrument agreement are checked by [`VenueListing::validate_for`] at
-    /// publication time.
     pub fn new(
         key: VenueListingKey,
         instrument_id: InstrumentId,
@@ -64,7 +52,6 @@ impl VenueListing {
         Ok(listing)
     }
 
-    /// Validates this listing against the canonical instrument it references.
     pub fn validate_for(&self, instrument: &Instrument) -> Result<(), ModelError> {
         if &self.instrument_id != instrument.id() {
             return Err(ModelError::InstrumentTermsMismatch {
@@ -90,12 +77,10 @@ impl VenueListing {
         Ok(())
     }
 
-    /// Returns the primary native symbol of this listing.
     pub fn symbol(&self) -> Option<&NativeSymbol> {
         self.native_symbol.as_ref()
     }
 
-    /// Validates that this listing belongs to the fetched route.
     pub fn validate_route(&self, route: &VenueRoute) -> Result<(), ModelError> {
         if &self.key.route == route {
             return Ok(());
@@ -107,7 +92,6 @@ impl VenueListing {
         })
     }
 
-    /// Validates that `snapshot` describes this listing key.
     pub fn validate_snapshot(&self, snapshot: &ListingSnapshot) -> Result<(), ModelError> {
         if snapshot.key == self.key {
             return Ok(());
@@ -119,22 +103,6 @@ impl VenueListing {
         .into())
     }
 
-    /// Validates every symbol, ticker, coin or local code echoed by the typed
-    /// identifiers against the display symbols of this listing.
-    ///
-    /// The typed identifiers are the authoritative protocol identity and
-    /// `native_symbol`/`aliases` are display aliases of the same listing, so an
-    /// echoed value must be one of them under the route normalization of its own
-    /// identifier kind. The returned status distinguishes the two outcomes a
-    /// caller has to treat differently: an echoed value that contradicts the
-    /// declared symbols is a publication error, while a listing whose family has
-    /// no comparable typed field — or that declares no display symbol to compare
-    /// against — is publishable but has not had its native symbol verified.
-    ///
-    /// The status describes only the relationship between the typed identifiers
-    /// and the declared aliases. It never promotes a native symbol into a name: a
-    /// symbol a listing echoes is an alias a reader may search by, and the economic
-    /// name of the listing is its instrument's name.
     pub fn validate_echoed_identifiers(
         &self,
         mode_of: impl Fn(ListingIdentifierKind) -> SymbolNormalization,
@@ -153,11 +121,6 @@ impl VenueListing {
             declared.insert(mode_of(ListingIdentifierKind::Symbol).apply(symbol)?);
         }
         if declared.is_empty() {
-            // A listing does not have to declare a native symbol: equity and
-            // outcome listings are published from typed identifiers alone, and
-            // equity tickers are typed metadata rather than route aliases. With
-            // nothing on the native side there is no echo to verify, so the
-            // listing is publishable but its native symbols stay unverified.
             return Ok(EchoValidationStatus::NoComparableIdentifier);
         }
         for (kind, value) in echoed {
@@ -171,19 +134,6 @@ impl VenueListing {
         Ok(EchoValidationStatus::Verified)
     }
 
-    /// Returns the typed identifier values this listing can echo.
-    ///
-    /// A family echoes every verified identifier its own variant carries, each
-    /// under its own [`ListingIdentifierKind`], so the comparison of
-    /// [`VenueListing::validate_echoed_identifiers`] runs at the granularity the
-    /// route declared: a route that declares one family verifies that family's
-    /// value and nothing else, and a route that declares none leaves every value
-    /// unverified instead of treating the missing comparison as a success.
-    ///
-    /// Only a family whose typed identifier names a value at all has an echo: a
-    /// Hyperliquid spot listing carries a numeric asset index and a Polymarket
-    /// listing carries a CLOB token, neither of which is a displayable symbol, so
-    /// those families have no comparable identifier and can never be verified.
     fn echoed_identifiers(&self) -> Vec<(ListingIdentifierKind, &str)> {
         match &self.identifiers {
             VenueListingIdentifiers::Equity(identifiers) => vec![
@@ -219,14 +169,6 @@ impl VenueListing {
         }
     }
 
-    /// Returns the typed protocol outcome label of this listing, when it declares
-    /// one.
-    ///
-    /// A Polymarket listing states the label the protocol publishes for the leg it
-    /// trades. The echo check compares that label with the registry label of the same leg;
-    /// it is never a name of its own, and the comparison is not an echo of a
-    /// native display symbol, so it is not part of
-    /// [`VenueListing::validate_echoed_identifiers`].
     pub fn protocol_outcome_label(&self) -> Option<&str> {
         match &self.identifiers {
             VenueListingIdentifiers::Polymarket(identifiers) => {
@@ -236,17 +178,6 @@ impl VenueListing {
         }
     }
 
-    /// Validates this listing together with its route, instrument and snapshot.
-    ///
-    /// This is the model-layer publication gate: the route must be the fetched
-    /// route, the snapshot must describe this listing key, the instrument must be
-    /// the one the listing declares, the snapshot rules must hold for that
-    /// instrument, and every echoed identifier must agree with the display
-    /// symbols under the route normalization.
-    ///
-    /// Only a contradicted echo refuses publication: a listing whose typed
-    /// identifier has no declared symbol to compare against stays publishable,
-    /// because no declared symbol contradicts it.
     pub fn validate_publication(
         &self,
         route: &VenueRoute,
@@ -266,11 +197,6 @@ impl VenueListing {
         }
     }
 
-    /// Returns the normalized native lookup keys of this listing.
-    ///
-    /// Every symbol-bearing identifier is normalized with its own rule, so two
-    /// listings can only collide when the route explicitly declared the same
-    /// normalization for the same typed identifier.
     pub fn normalized_keys(
         &self,
         mode_of: impl Fn(ListingIdentifierKind) -> SymbolNormalization,
@@ -316,11 +242,6 @@ impl VenueListing {
     }
 }
 
-/// Returns the echoed values of one future series, in the registry's own order.
-///
-/// Each verified identifier is echoed under its own [`ListingIdentifierKind`], so
-/// a route that declares only one family of a series verifies that family's value
-/// and leaves the others unverified.
 fn future_series_echoes(series: &FutureSeriesIdentifiers) -> Vec<(ListingIdentifierKind, &str)> {
     let mut echoed: Vec<(ListingIdentifierKind, &str)> = Vec::with_capacity(3);
     if let Some(id) = &series.market_participant_series_id {
@@ -335,7 +256,6 @@ fn future_series_echoes(series: &FutureSeriesIdentifiers) -> Vec<(ListingIdentif
     echoed
 }
 
-/// Returns the echoed values of one option series, in the registry's own order.
 fn option_series_echoes(series: &OptionSeriesIdentifiers) -> Vec<(ListingIdentifierKind, &str)> {
     let mut echoed: Vec<(ListingIdentifierKind, &str)> = Vec::with_capacity(3);
     if let Some(symbol) = &series.occ_symbol {
@@ -381,7 +301,6 @@ impl<'de> Deserialize<'de> for VenueListing {
     }
 }
 
-/// The lifecycle status of one listing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ListingStatus {
     #[serde(rename = "scheduled")]
@@ -399,7 +318,6 @@ pub enum ListingStatus {
 }
 
 impl ListingStatus {
-    /// Returns the fixed canonical label of this status.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Scheduled => "scheduled",
@@ -411,25 +329,19 @@ impl ListingStatus {
         }
     }
 
-    /// Returns `true` when the status allows new trading commands.
     pub const fn allows_new_trading(self) -> bool {
         matches!(self, Self::Trading)
     }
 
-    /// Returns `true` when the status allows settlement-side commands such as
-    /// delivery, exercise or outcome settlement.
     pub const fn allows_settlement(self) -> bool {
         matches!(self, Self::Trading | Self::Halted | Self::Expired)
     }
 
-    /// Returns `true` when the status blocks every command that changes
-    /// settlement state.
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Settled | Self::Delisted)
     }
 }
 
-/// The current rules, status and availability window of one listing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ListingSnapshot {
     #[serde(rename = "key")]
@@ -445,10 +357,6 @@ pub struct ListingSnapshot {
 }
 
 impl ListingSnapshot {
-    /// Builds and validates a snapshot at the non-persisted instant `as_of`.
-    ///
-    /// `Scheduled` must carry `available_from = Some(t)` with `t > as_of`; a
-    /// missing lower bound never means "about to be enabled".
     pub fn new(
         key: VenueListingKey,
         rules: TradingRules,
@@ -468,7 +376,6 @@ impl ListingSnapshot {
         Ok(snapshot)
     }
 
-    /// Validates the availability window and the status/window agreement.
     pub fn validate(&self, as_of: UnixMillis) -> Result<(), ModelError> {
         if let (Some(from), Some(until)) = (self.available_from, self.available_until) {
             require_non_negative_time(from, "available_from")?;
@@ -490,23 +397,19 @@ impl ListingSnapshot {
         Ok(())
     }
 
-    /// Validates the snapshot rules against the listed instrument.
     pub fn validate_for(&self, instrument: &Instrument) -> Result<(), ModelError> {
         self.rules.validate_for(instrument)
     }
 
-    /// Validates that this snapshot describes `listing`.
     pub fn validate_listing(&self, listing: &VenueListing) -> Result<(), ModelError> {
         listing.validate_snapshot(self)
     }
 
-    /// Returns `true` when `instant` is inside the half-open availability window.
     pub fn is_available_at(&self, instant: UnixMillis) -> bool {
         self.available_from.is_none_or(|from| instant >= from)
             && self.available_until.is_none_or(|until| instant < until)
     }
 
-    /// Returns `true` when new trading is allowed at `instant`.
     pub fn allows_new_trading_at(&self, instant: UnixMillis) -> bool {
         self.status.allows_new_trading() && self.is_available_at(instant)
     }

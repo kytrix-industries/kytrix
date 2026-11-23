@@ -1,21 +1,8 @@
-//! The owner-local handoff from the interface thread to a background consumer.
-
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
-/// The latest complete projection an owner's background consumer works from.
-///
-/// - `shared` always holds the latest projection; the request path and the
-///   background consumer both read it.
-/// - `notify` only wakes the consumer; it carries no value.
-///
-/// There is no pending slot: the value is in `shared`, and a consumer that is
-/// woken reads it. Exactly one background consumer may
-/// [`ConfigNotification::wait`]. `notify_one` wakes at most one waiter; when no
-/// waiter is registered it leaves one permit (which is what makes a
-/// publish-before-wait not lost).
 pub struct ConfigNotification<P> {
     shared: Arc<RwLock<Arc<P>>>,
     notify: Arc<Notify>,
@@ -31,7 +18,6 @@ impl<P> Clone for ConfigNotification<P> {
 }
 
 impl<P: Send + Sync + 'static> ConfigNotification<P> {
-    /// Creates the notification over the projection the owner starts with.
     pub fn new(initial: Arc<P>) -> Self {
         Self {
             shared: Arc::new(RwLock::new(initial)),
@@ -39,36 +25,20 @@ impl<P: Send + Sync + 'static> ConfigNotification<P> {
         }
     }
 
-    /// Replaces the shared projection and wakes the consumer.
-    ///
-    /// The owner publishes after it has applied the change the projection names:
-    /// it drains its [`crate::manager::ConfigManager`] subscription and projects
-    /// the current snapshot itself after each settings commit.
     pub fn publish(&self, projection: Arc<P>) {
-        // The write must precede the wake: a woken consumer reads `current()`.
         *self.shared.write() = projection;
         self.notify.notify_one();
     }
 
-    /// Test-only publish for fakes that drive an owner's state.
     #[cfg(any(test, feature = "test-support"))]
     pub fn publish_for_test(&self, projection: Arc<P>) {
         self.publish(projection);
     }
 
-    /// Returns the latest projection without waiting.
     pub fn current(&self) -> Arc<P> {
         self.shared.read().clone()
     }
 
-    /// Waits for one publish, then returns the latest projection.
-    ///
-    /// Exactly one background consumer may call this. `notify_one` wakes at most
-    /// one waiter; when no waiter is registered it leaves one permit (which is
-    /// what makes a publish-before-wait not lost).
-    ///
-    /// A publish that happens between two `current` reads can only leave the
-    /// shared value newer; the wake is idempotent.
     pub async fn wait(&self) -> Arc<P> {
         self.notify.notified().await;
 
@@ -90,8 +60,6 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     struct Projection(u32);
 
-    /// A bound long enough not to race the wake, short enough that a lost wake
-    /// fails the test instead of hanging the suite.
     const WAIT_BOUND: Duration = Duration::from_secs(2);
 
     #[tokio::test]
@@ -120,15 +88,10 @@ mod tests {
         assert_eq!(projection, Arc::new(Projection(2)));
     }
 
-    /// A wait that no publish answers must keep waiting: the notification has no
-    /// answer of its own to hand back.
     #[tokio::test]
     async fn a_wait_should_not_return_without_a_publish() {
         let notification = ConfigNotification::new(Arc::new(Projection(1)));
 
-        // This negative wait only has to outlive scheduling jitter; waiting
-        // longer cannot strengthen the assertion because the wait must never
-        // return at all.
         assert!(
             timeout(Duration::from_millis(75), notification.wait())
                 .await
@@ -199,18 +162,6 @@ mod tests {
         );
     }
 
-    /// A race test that fails a notify-before-store inversion with high
-    /// probability, complementing (not replacing) the sequential-semantics tests
-    /// above. On a multi-threaded runtime, moving `notify_one` before the shared
-    /// write is caught with high probability because the woken consumer may read
-    /// the slot before the store lands. The waiter is not provably registered
-    /// when `publish` runs, so the guard is probabilistic: an independent
-    /// reviewer measured 98/100 failing runs with 4 workers and 1000 rounds;
-    /// 2/100 runs still passed.
-    ///
-    /// The correct implementation cannot fail it: the publisher waits for each
-    /// round's acknowledgement before publishing the next value, so a consumer
-    /// woken by a publish can only find that round's store.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_woken_consumer_should_read_the_projection_that_woke_it() {
         const ROUNDS: u32 = 1000;

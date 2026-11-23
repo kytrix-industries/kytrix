@@ -1,5 +1,3 @@
-//! Order quantities and the exact listing a consumer selected.
-
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -15,10 +13,6 @@ use crate::{
     outcome::{OutcomeGroupId, OutcomeMemberId, OutcomeSideId},
 };
 
-/// The quantity of an order command.
-///
-/// A notional order is the only amount a command may carry, and it is the only
-/// way to express a cash quantity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "quantity")]
 pub enum OrderQuantity {
@@ -52,7 +46,6 @@ pub enum OrderQuantity {
 }
 
 impl OrderQuantity {
-    /// Returns the unit this order quantity is expressed in.
     pub fn unit(&self) -> QuantityUnit {
         match self {
             Self::AssetUnits { asset, .. } => QuantityUnit::AssetUnits {
@@ -75,7 +68,6 @@ impl OrderQuantity {
         }
     }
 
-    /// Returns the ordered quantity value.
     pub const fn value(&self) -> Quantity {
         match self {
             Self::AssetUnits { value, .. }
@@ -85,11 +77,6 @@ impl OrderQuantity {
         }
     }
 
-    /// Validates this order quantity against the resolved listing rules.
-    ///
-    /// A traded quantity must equal the listed unit. A notional is accepted only
-    /// when the listing declares a notional asset and the order names it, and it
-    /// is then validated against the instrument like any other unit.
     pub fn validate_against(
         &self,
         listed_unit: &QuantityUnit,
@@ -115,17 +102,12 @@ impl OrderQuantity {
         })
     }
 }
-/// The exact listing a consumer selected.
-///
-/// A selection never carries an instrument and a route separately: the full
-/// listing key is the only thing a command or a widget propagates.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InstrumentSelection {
     #[serde(rename = "listing")]
     pub listing: VenueListingKey,
 }
 
-/// One normalized ticker for one listing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListingTicker {
     #[serde(rename = "listing")]
@@ -147,10 +129,6 @@ pub struct ListingTicker {
 }
 
 impl ListingTicker {
-    /// Validates the optional OHLC range and both volume units.
-    ///
-    /// A venue may omit the session high and low, so the range is only checked
-    /// when both bounds were published.
     pub fn validate(&self) -> Result<(), ModelError> {
         if let (Some(low), Some(high)) = (&self.low, &self.high)
             && low.value > high.value

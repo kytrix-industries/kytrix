@@ -1,5 +1,4 @@
 use super::App;
-// 只有 Windows 的离屏上传测试用得到 array 规格（其它平台没有离屏 App 渲染器）。
 #[cfg(windows)]
 use crate::render::AtlasArraySpec;
 use crate::{
@@ -30,12 +29,10 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     (rt, app, window)
 }
 
-/// 4×4 的不透明 PNG（解码后逐字节可预测：BGRA = 源 RGB 交换）。
 fn png() -> Vec<u8> {
     png_rgba([10, 20, 30, 255])
 }
 
-/// 指定颜色的 4×4 不透明 PNG。
 fn png_rgba(rgba: [u8; 4]) -> Vec<u8> {
     let pixels: Vec<u8> = std::iter::repeat_n(rgba, 16).flatten().collect();
     let image = image::RgbaImage::from_raw(4, 4, pixels).expect("raw");
@@ -46,13 +43,11 @@ fn png_rgba(rgba: [u8; 4]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// 字形图集的 array 规格（恒 1 层）。只在 Windows 的离屏 App 上传测试里用。
 #[cfg(windows)]
 fn glyph_spec(page: u32) -> AtlasArraySpec {
     AtlasArraySpec { page, layers: 1 }
 }
 
-/// 图集页内某个 tile 内容区左上角的 BGRA 字节。
 fn tile_pixel(app: &App, image: crate::resources::ResourceImage) -> [u8; 4] {
     let (page, pixels) = app.resources().page_pixels().expect("image page");
     let page_width = page.0 as usize;
@@ -73,7 +68,6 @@ fn resources_are_process_level() {
         (2048, 2048),
         "图片页固定最大档（P1-2.7：页尺寸与插入顺序无关）"
     );
-    // 另一窗口共享同一份缓存（单 GPU 设备、进程级一份）。
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: Size::new(64.0, 64.0),
@@ -83,7 +77,6 @@ fn resources_are_process_level() {
     assert_ne!(second, window);
     assert_eq!(app.resources().len(), 1);
 
-    // 内容区写进了页缓冲（BGR 顺序）。
     let (page, pixels) = app.resources().page_pixels().expect("page");
     let page_width = page.0 as usize;
     let origin_x = (image.tile.u0 * page.0 as f32).round() as usize;
@@ -130,7 +123,6 @@ fn atlas_upload_without_renderers_keeps_windows_unsynced() {
     let (_rt, mut app, window) = setup();
     let _ = app.resources_mut().insert(&png()).expect("insert");
 
-    // headless：没有 renderer ⇒ 不上传，窗口保持「未收到整页」（换渲染器后会自动补整页）。
     app.upload_atlas_pages();
     app.upload_atlas_pages();
     let target = app.window(window).expect("window");
@@ -160,8 +152,6 @@ fn atlas_upload_marks_only_windows_with_a_renderer() {
     }
 }
 
-/// 评审阻塞 ②：`frame_all` 逐窗提交，图集页必须**广播**给每个窗口的渲染器，
-/// 否则第一个窗口消费脏行后，其余窗口的纹理永远收不到内容。
 #[cfg(windows)]
 #[test]
 fn atlas_pages_are_broadcast_to_every_window() {
@@ -191,15 +181,12 @@ fn atlas_pages_are_broadcast_to_every_window() {
         assert!(target.image_page_received(), "图片页必须广播到每个窗口");
     }
 
-    // 第二次调用：没有新写入 ⇒ 不重复上传（脏旗标已被统一消费）。
     app.upload_atlas_pages();
     for window in [first, second] {
         assert!(app.window(window).expect("window").image_page_received());
     }
 }
 
-/// 忙窗口不能拖住其它窗口：它的共享槽还没录制完时，本帧脏行攒在它自己的队列里，
-/// 空闲窗口照常收到增量（DEVIATIONS F-211 的 BLOCKER 回归面）。
 #[cfg(windows)]
 #[test]
 fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
@@ -220,7 +207,6 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
             .expect("offscreen renderer");
     }
     let page = app.atlas.page().0;
-    // 图集缓冲已经按这一页尺寸建好（真实路径由上一帧的上传完成）。
     app.glyph_page_extent = Some(page);
     app.glyph_page = vec![0u8; (page * page) as usize];
     for window in [first, second] {
@@ -228,7 +214,6 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
             .expect("window")
             .mark_atlas_page_received(AtlasKind::Glyph, glyph_spec(page));
     }
-    // 让 second 的共享槽停在「已入队、未录制」：这就是忙窗口。
     let full = DirtyRects::full();
     assert!(
         app.window_mut(second).expect("second").queue_atlas_upload(
@@ -247,7 +232,6 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
         "入队之后、录制之前必须是忙的"
     );
 
-    // 一帧的脏矩形：第 0..4 行、整页宽（等价于旧的行区间语义，但现在是矩形）。
     let frame_dirty = PhysicalRect::new(0, 0, i32::MAX, 4);
     app.pending_dirty.mark(frame_dirty);
     app.upload_atlas_pages();
@@ -276,8 +260,6 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
     );
 }
 
-/// 页尺寸变化必须重建并清零整页缓冲：旧页的行宽不同，残留字节会被当成新页内容上传
-/// （1 纹素 padding 的线性采样会把它读进 tile 边缘）。
 #[test]
 fn a_page_change_rebuilds_the_glyph_page_buffer_from_zero() {
     let (_rt, mut app, _window) = setup();
@@ -294,7 +276,6 @@ fn a_page_change_rebuilds_the_glyph_page_buffer_from_zero() {
     );
 }
 
-/// 图集行没赶上帧时，App 必须请求补帧：否则静态窗口会把缺字的画面一直留着。
 #[cfg(windows)]
 #[test]
 fn a_deferred_atlas_frame_requests_a_follow_up() {
@@ -312,7 +293,6 @@ fn a_deferred_atlas_frame_requests_a_follow_up() {
     app.window_mut(window)
         .expect("window")
         .mark_atlas_page_received(AtlasKind::Glyph, glyph_spec(page));
-    // 共享槽停在「已入队、未录制」：本帧的图集矩形只能攒着。
     let full = DirtyRects::full();
     assert!(app.window_mut(window).expect("window").queue_atlas_upload(
         AtlasKind::Glyph,
@@ -334,7 +314,6 @@ fn a_deferred_atlas_frame_requests_a_follow_up() {
         "补帧必须请求一次帧唤醒（否则静态窗口不会重试）"
     );
 
-    // 补帧：上一帧的 publish 已经消费了共享槽，这一帧必须把矩形入队并清掉。
     let _ = app.frame(window).expect("follow-up").expect("ok");
     assert!(
         !app.window(window).expect("window").atlas_rects_pending(),
@@ -342,8 +321,6 @@ fn a_deferred_atlas_frame_requests_a_follow_up() {
     );
 }
 
-/// 平台层在窗口创建之后才挂渲染器：这一帧没有新脏行，但整页必须包含**已有**字形
-/// （否则新窗口永远拿到一张空页，且记账为已同步）。
 #[cfg(windows)]
 #[test]
 fn a_late_renderer_receives_the_current_glyph_page() {
@@ -354,7 +331,6 @@ fn a_late_renderer_receives_the_current_glyph_page() {
         .layout_override(Rect::new(0.0, 0.0, 120.0, 40.0))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("text");
-    // 没有渲染器的帧：字形记录进 `GlyphAtlas`，整页缓冲此时还不能代表它。
     let _ = app.frame(window).expect("frame").expect("headless frame");
 
     app.window_mut(window)
@@ -386,12 +362,6 @@ fn image_atlas_page_is_lazy_until_the_first_insert() {
     assert_eq!(pixels.len(), 2048 * 2048 * 4, "整页 = page² × BGRA8");
 }
 
-/// D9-c：图片图集是多层 texture array（层数 = 打开的页数），逐层独立上传。
-///
-/// 用 16² 的小图片页让「第 2 页」在 3 张 4×4 图后必然出现；再在不丢矩形的前提下验证：
-/// - 新页的写入只攒到 **layer 1**（layer 0 不得被整页重传）；
-/// - 同页增量只带 AOI 矩形（字节数 << 整页）；
-/// - 忙槽空闲后矩形只入队一次并清空。
 #[cfg(windows)]
 #[test]
 fn image_pages_upload_to_their_own_texture_array_layers() {
@@ -399,7 +369,6 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
-    // 16² 的图片页：每个 4×4 tile（含 padding 6×6）一页只放得下 2 个（etagere 装箱实测）。
     app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
     for index in 0..3u8 {
         let _ = app
@@ -426,7 +395,6 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
         );
         assert!(!target.atlas_rects_pending(), "首帧上传后不得留待传矩形");
     }
-    // 让首帧的整层上传真正录制进 GPU 槽（离屏渲染器在下一帧提交时消费待上传层）。
     app.window_mut(window).expect("window").request_repaint();
     let _ = app.frame(window).expect("frame").expect("ok");
     assert!(
@@ -436,7 +404,6 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
         "首帧上传必须已经录制，图片图集槽才能再次入队"
     );
 
-    // 让图片图集的共享槽停在「已入队、未录制」：后续写入只能攒在该窗口的层队列里。
     let page_bytes = (extent as usize) * (extent as usize) * 4;
     let layers = app.resources().page_count() as u32;
     assert!(
@@ -459,7 +426,6 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
         "入队之后、录制之前图片图集必须是忙的"
     );
 
-    // 页 0 已满 ⇒ 这张新图落在第 2 页（layer 1）。
     let inserted = app
         .resources_mut()
         .insert(&png_rgba([200, 1, 2, 255]))
@@ -487,7 +453,6 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
         );
     }
 
-    // 忙槽在下一帧被录制；随后的上传只发 layer 1 并清掉它的矩形。
     app.window_mut(window).expect("window").request_repaint();
     let _ = app.frame(window).expect("frame").expect("ok");
     app.upload_atlas_pages();
@@ -499,12 +464,6 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
     assert_eq!(target.atlas_rects(AtlasKind::Image, 0).rects().len(), 0);
 }
 
-/// **P2-B3 核心语义**：图片 array 的层数 = 当前打开的图集页数。页数 1 → 2 时 App 必须
-/// 扩层（数组重建为 2 层），并且对**每个已打开的层**整页重传 —— 只补新层会让重建后的数组
-/// 丢掉 layer 0 的图。
-///
-/// 变异：App 的「数组缺失」判据忽略层数（只比页边长）⇒ 扩层帧只入队 layer 1 ⇒ 本测试的
-/// 待上传层断言失败。
 #[cfg(windows)]
 #[test]
 fn growing_the_image_array_reuploads_every_open_layer() {
@@ -512,7 +471,6 @@ fn growing_the_image_array_reuploads_every_open_layer() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
-    // 16² 图片页：每页放 2 个 4×4 tile（6² 含 padding）⇒ 2 张图占一页，第 3 张开第 2 页。
     app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
     for index in 0..2u8 {
         let _ = app
@@ -526,7 +484,6 @@ fn growing_the_image_array_reuploads_every_open_layer() {
         .enable_offscreen_renderer()
         .expect("offscreen renderer");
 
-    // 一页：数组 1 层，首帧只上传 layer 0。
     app.upload_atlas_pages();
     assert_eq!(
         app.window(window).expect("window").image_array_spec(),
@@ -543,11 +500,9 @@ fn growing_the_image_array_reuploads_every_open_layer() {
         Some(vec![0]),
         "首帧只上传已打开的 layer 0"
     );
-    // 让离屏渲染器录制首帧，槽位回到空闲。
     app.window_mut(window).expect("window").request_repaint();
     let _ = app.frame(window).expect("frame").expect("ok");
 
-    // 第 3 张图 ⇒ 第 2 页。扩层帧：两个已打开的层都必须整页重传。
     let _ = app
         .resources_mut()
         .insert(&png_rgba([200, 1, 2, 255]))
@@ -573,14 +528,6 @@ fn growing_the_image_array_reuploads_every_open_layer() {
     assert!(app.window(window).expect("window").image_layer_received(1));
 }
 
-/// RBT-01 不变量 1（编码期过滤）：扩层还没发生时，引用新层的 `Primitive::Image` **不产生实例**
-/// —— 不画占位、不画错层；旧层的图照画（不变量 3）。上限变化的那一帧由合成端强制重编码 +
-/// 全量载荷，所以这里连续两帧能直接看到实例层的集合变化。
-///
-/// 断言读的是 `Window::instance_buffer()`（inline 合成器的编码产物），该 API 只在
-/// `feature = "test-support"` 构建里存在（它把 `InstanceBuffer` 拉进测试面），因此本用例
-/// 必须带同一个 feature 守卫 —— 否则 `cargo check -p ui_core --all-targets`（默认特性）
-/// 会因「方法不存在」失败，而 `--features test-support` 下照常运行。
 #[cfg(feature = "test-support")]
 #[test]
 fn images_on_layers_without_an_established_array_are_not_drawn() {
@@ -617,7 +564,6 @@ fn images_on_layers_without_an_established_array_are_not_drawn() {
         .set_canvas(canvas_node, canvas)
         .expect("节点存活");
 
-    // 没有渲染器的窗口不参与 App 图集记账：上限由测试直接设定（= 数组只有 1 层）。
     app.window_mut(window)
         .expect("窗口存在")
         .set_image_drawable_layers(1);
@@ -634,7 +580,6 @@ fn images_on_layers_without_an_established_array_are_not_drawn() {
         "层 1 还没有建立 ⇒ 它的 Image 图元不得产生实例；层 0 照画"
     );
 
-    // 上限抬到 2（= 扩层已完成）：两层的图元都上屏。
     app.window_mut(window)
         .expect("窗口存在")
         .set_image_drawable_layers(2);
@@ -652,8 +597,6 @@ fn images_on_layers_without_an_established_array_are_not_drawn() {
     );
 }
 
-/// RBT-01 回归（忙槽 + 扩层，单窗口形态）：窗口的上传槽还在消费上一笔时页数 1 → 2，
-/// 这一帧**不扩层、不入队新层**（旧层照画、新层不可画），槽空闲后的下一帧才前进。
 #[cfg(windows)]
 #[test]
 fn a_busy_upload_slot_defers_the_image_array_growth() {
@@ -687,7 +630,6 @@ fn a_busy_upload_slot_defers_the_image_array_growth() {
     app.window_mut(window).expect("window").request_repaint();
     let _ = app.frame(window).expect("frame").expect("ok");
 
-    // 第 3 张图 ⇒ 第 2 页；同时让槽停在「已入队、未录制」（旧 spec 的增量，不触发扩层）。
     let _ = app
         .resources_mut()
         .insert(&png_rgba([200, 1, 2, 255]))
@@ -733,7 +675,6 @@ fn a_busy_upload_slot_defers_the_image_array_growth() {
         "新页的写入必须留在该窗口的待传队列里，不能丢"
     );
 
-    // 槽空闲之后：数组前进到 2 层，且对两个已打开层整组重传。
     app.window_mut(window).expect("window").request_repaint();
     let _ = app.frame(window).expect("frame").expect("ok");
     app.upload_atlas_pages();
@@ -753,8 +694,6 @@ fn a_busy_upload_slot_defers_the_image_array_growth() {
         "扩层帧必须整组重传（layer 0 也要）"
     );
 }
-/// RBT-01 不变量 2 / 3：**所有**带渲染器的窗口都能整组入队时数组才扩层；任一窗口的共享槽还在
-/// 消费上一笔上传 ⇒ 这一帧不推进（旧 spec 的层照画、新层不可画），下一帧补上。
 #[cfg(windows)]
 #[test]
 fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
@@ -765,7 +704,6 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
-    // 16² 图片页：每页 2 个 4×4 tile（6² 含 padding）⇒ 2 张图占 1 页，第 3 张开第 2 页。
     app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
     for index in 0..2u8 {
         let _ = app
@@ -787,7 +725,6 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
         })
     );
 
-    // 第二个窗口：同一数组（非增长路径补齐），随后两帧把首帧上传录制掉。
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: Size::new(64.0, 64.0),
@@ -817,7 +754,6 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
         );
     }
 
-    // 第 3 张图 ⇒ 第 2 页（扩层待定）。让第二个窗口的槽停在「已入队、未录制」。
     let _ = app
         .resources_mut()
         .insert(&png_rgba([200, 1, 2, 255]))
@@ -860,7 +796,6 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
         );
     }
 
-    // 槽空闲之后才扩层：两个窗口都必须前进到 2 层，且扩层帧整组重传。
     for window in [second, first] {
         app.window_mut(window).expect("window").request_repaint();
         let _ = app.frame(window).expect("frame").expect("ok");
@@ -889,11 +824,6 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
         "扩层帧必须对每个已打开层整页重传"
     );
 }
-/// RBT-13：**部分层入队失败** ⇒ 数组不推进、可画层不抬、设备侧只会看到 fail-closed 错误。
-///
-/// 这是 P1 修复（RBT-01 不变量 2「数组只在全层就绪时扩张」）的核心安全前提：`advanced` 必须
-/// 要求**每一个已打开层**都入队成功，而不是「至少入队了一层」。变异 M18（判据改成
-/// `!enqueued.is_empty()`）⇒ 本测试红。
 #[cfg(windows)]
 #[test]
 fn a_partial_layer_enqueue_does_not_advance_the_image_array() {
@@ -923,7 +853,6 @@ fn a_partial_layer_enqueue_does_not_advance_the_image_array() {
     app.window_mut(first).expect("first").request_repaint();
     let _ = app.frame(first).expect("frame").expect("ok");
 
-    // 第 3 张图 ⇒ 第 2 页；注入「layer 0 成功、layer 1 起失败」的部分入队。
     let _ = app
         .resources_mut()
         .insert(&png_rgba([200, 1, 2, 255]))
@@ -961,8 +890,6 @@ fn a_partial_layer_enqueue_does_not_advance_the_image_array() {
         Some(vec![0]),
         "只有第 0 层被入队（部分层），设备侧不应收到完整扩层请求"
     );
-    // 再跑一次（注入仍生效）：仍不得推进；设备侧的 release 校验由
-    // `reconcile_pages_rejects_growth_without_a_full_page_upload_for_every_layer` 单独覆盖。
     app.upload_atlas_pages();
     assert_eq!(
         app.image_array_established_for_test(),
@@ -974,11 +901,6 @@ fn a_partial_layer_enqueue_does_not_advance_the_image_array() {
     );
 }
 
-/// RBT-09：扩层被忙槽挡住时，可画层必须**按窗口**收敛。
-///
-/// macOS 的图片数组是每窗口一份：新窗口 / 刚重挂渲染器的窗口此时仍是 1×1×1 占位
-/// （`image_array_spec() == None`），若用 App 级 `established` 给所有窗口写上限，它会拿到 1 层
-/// 并采样占位。这个测试用「新窗口未同步 + 扩层被挡」构造该边界。
 #[cfg(windows)]
 #[test]
 fn a_new_window_without_an_array_gets_zero_drawable_layers_while_growth_is_blocked() {
@@ -1078,10 +1000,6 @@ fn a_new_window_without_an_array_gets_zero_drawable_layers_while_growth_is_block
     }
 }
 
-/// RBT-10 的初始化例外：数组**建立**（`image_array_established == None`）不能被
-/// 「窗口暂时不参与渲染」挡住。Windows 窗口在 `ShowWindow` 之前是 hidden，GPU 循环按遮挡
-/// 跳过；若把首次建数组也排除在外，图集建立会被拖到可见之后，并与后续扩层叠加放大首帧尖峰。
-/// 这个边界用 `set_atlas_participating_for_test(false)` 在单窗口上直接构造。
 #[cfg(windows)]
 #[test]
 fn initial_array_establishment_ignores_participation() {
@@ -1118,8 +1036,6 @@ fn initial_array_establishment_ignores_participation() {
     );
 }
 
-/// RBT-10：不参与渲染（遮挡 / 最小化被 GPU 循环跳过）的窗口**不参与扩层闸门**；它恢复后
-/// 按「整组重传」重新同步，而不是沿用旧记账假装已入队。
 #[cfg(windows)]
 #[test]
 fn an_occluded_window_does_not_block_growth_and_resyncs_when_it_returns() {
@@ -1215,8 +1131,6 @@ fn an_occluded_window_does_not_block_growth_and_resyncs_when_it_returns() {
     );
 }
 
-/// RBT-10 有界兜底：某窗口长期不消费上传（不恢复）时，闸门不能**永久**挡住其它窗口 ——
-/// 连续 N 次被挡后按「不参与」降级推进（记账作废，恢复后整组重传）。
 #[cfg(windows)]
 #[test]
 fn growth_degrades_after_a_window_stops_consuming_uploads() {
@@ -1302,10 +1216,6 @@ fn growth_degrades_after_a_window_stops_consuming_uploads() {
     );
 }
 
-/// D9-c：晚挂上的窗口必须补齐**每一个已打开页**的整层内容（texture array 每层独立）。
-///
-/// 新建窗口时进程级资源页可能早就有内容、而脏矩形早已被旧窗口消费 —— 这时只能按
-/// `page_pixels_at(layer)` 逐层整页上传；只补 layer 0 会让 layer 1 的 tile 采样到未定义内容。
 #[cfg(windows)]
 #[test]
 fn a_new_window_receives_every_open_image_layer() {
@@ -1350,14 +1260,12 @@ fn a_new_window_receives_every_open_image_layer() {
         );
     }
 
-    // 再跑一次：没有任何新写入，两边都不得重复上传。
     app.upload_atlas_pages();
     for window in [first, second] {
         assert!(!app.window(window).expect("window").atlas_rects_pending());
     }
 }
 
-/// D-7：关窗必须归还该窗口 `insert_owned` 的引用；去重共享的内容不得被误回收。
 #[test]
 fn closing_a_window_releases_its_owned_resources() {
     let (_rt, mut app, left) = setup();
@@ -1382,7 +1290,6 @@ fn closing_a_window_releases_its_owned_resources() {
 
     assert!(app.close_window(left), "左窗口存在");
     assert_eq!(app.resources().len(), 1, "右窗口仍持有引用，不得回收");
-    // 右窗口的 tile 仍有效：去重命中说明条目与内容索引都还在。
     let still_alive = app
         .resources_mut()
         .insert(&bytes)
@@ -1406,7 +1313,6 @@ fn closing_a_window_releases_its_owned_resources() {
     );
 }
 
-/// D-7：重复 close 幂等，且不得释放其它窗口的引用（窗口不存在时提前返回）。
 #[test]
 fn closing_a_window_is_idempotent_with_resources() {
     let (_rt, mut app, left) = setup();
@@ -1436,7 +1342,6 @@ fn closing_a_window_is_idempotent_with_resources() {
         1,
         "重复 close 不得释放其它窗口的引用"
     );
-    // 右窗口的资源仍可用（内容索引与 tile 都还在）。
     let still_alive = app
         .resources_mut()
         .insert(&right_bytes)
@@ -1449,9 +1354,6 @@ fn closing_a_window_is_idempotent_with_resources() {
     assert_eq!(app.resources().len(), 0);
 }
 
-/// D-6 测试用 runtime：`insert_async` 现在先 spawn 一个 async 任务等并发许可再投 blocking 解码，
-/// `current_thread` runtime 需要被 `block_on` 驱动；这里用单 worker 的 multi_thread 让任务在
-/// 后台 worker 上跑，测试线程可以同步轮询 `run_frame_hook`。
 fn decode_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -1460,7 +1362,6 @@ fn decode_runtime() -> tokio::runtime::Runtime {
         .expect("multi-thread runtime")
 }
 
-/// 轮询直到 `predicate` 为真（上限 `attempts` × `sleep`）。
 fn wait_until(attempts: usize, mut predicate: impl FnMut() -> bool) -> bool {
     for _ in 0..attempts {
         if predicate() {
@@ -1471,7 +1372,6 @@ fn wait_until(attempts: usize, mut predicate: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// D-6：`insert_async` 的结果必须由帧钩子（`run_frame_hook` → `poll`）交付，且只交付一次。
 #[test]
 fn async_decode_is_delivered_by_the_frame_hook() {
     let rt = decode_runtime();
@@ -1504,20 +1404,17 @@ fn async_decode_is_delivered_by_the_frame_hook() {
     );
     assert_eq!(app.resources().len(), 1, "交付后条目已装箱");
     assert!(app.take_resource_results().is_empty(), "每项只交付一次");
-    // 再跑一轮钩子也不得重复交付 / 开新帧。
     let requests = app.frame_requests();
     app.run_frame_hook();
     assert!(app.take_resource_results().is_empty());
     assert_eq!(app.frame_requests(), requests, "没有新交付就不会每轮请求帧");
 }
 
-/// D-6：解码完成必须唤醒平台泵（否则空闲时泵阻塞在 GetMessageW/poll，`poll` 永不发生）。
 #[test]
 fn async_decode_wakes_the_pump() {
     let rt = decode_runtime();
     let mut app = App::new(rt.handle().clone());
     let _window = app.create_window(WindowOptions::default());
-    // 清掉构造期可能留下的唤醒位。
     let _ = app.dispatcher().take_frame_wake();
     let _pending = app
         .resources_mut()
@@ -1527,7 +1424,6 @@ fn async_decode_wakes_the_pump() {
         wait_until(400, || app.dispatcher().take_frame_wake()),
         "解码完成必须唤醒泵（Dispatcher 电平位）"
     );
-    // 收尾：把结果交付掉，避免 pending 残留影响其它断言。
     let mut delivered = Vec::new();
     assert!(wait_until(200, || {
         app.run_frame_hook();
@@ -1537,7 +1433,6 @@ fn async_decode_wakes_the_pump() {
     assert_eq!(delivered.len(), 1);
 }
 
-/// D-6：`Window::set_canvas` 替换 Canvas 节点内容 ⇒ 标子树 PAINT、下一帧新图元上屏。
 #[test]
 fn set_canvas_replaces_canvas_content_and_marks_subtree_paint() {
     let (_rt, mut app, window) = setup();
@@ -1603,7 +1498,6 @@ fn set_canvas_replaces_canvas_content_and_marks_subtree_paint() {
     );
 }
 
-/// D-6：`Window::set_canvas` 的类型/生命周期契约。
 #[test]
 fn set_canvas_rejects_non_canvas_nodes_and_stale_handles() {
     let (_rt, mut app, window) = setup();
@@ -1639,8 +1533,6 @@ fn set_canvas_rejects_non_canvas_nodes_and_stale_handles() {
     );
 }
 
-/// D-6 完整闭环：异步入库的图片 → 帧钩子交付 Ready → `set_canvas` 把新 tile 应用到已有节点
-/// → 下一帧上屏（素材/节点生命周期由调用方持有 `ResourceImage` 的引用决定）。
 #[test]
 fn async_ready_tile_can_be_applied_to_an_existing_node() {
     let rt = decode_runtime();

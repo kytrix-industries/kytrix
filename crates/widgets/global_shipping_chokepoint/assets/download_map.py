@@ -33,20 +33,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-#: Where the sources land: next to this script, i.e. in the asset directory.
 ASSET_DIR = Path(__file__).resolve().parent
 
-#: Refuse to start a download with less free space than this.
 MIN_FREE_BYTES = 2 * 1024**3
 
-#: curl exit codes that mean "the resume is impossible", not "the network broke":
-#: 33 is "the server does not support byte ranges", 36 "bad download resume".
 RESUME_REFUSED_CODES = frozenset({33, 36})
 
-#: The command `build_map.py` tells the user to run when a source is missing.
 DOWNLOAD_COMMAND = "python crates/widgets/global_shipping_chokepoint/assets/download_map.py"
 
-#: The build command printed once every source is in place.
 BUILD_COMMAND = "python crates/widgets/global_shipping_chokepoint/assets/build_map.py"
 
 
@@ -54,17 +48,12 @@ BUILD_COMMAND = "python crates/widgets/global_shipping_chokepoint/assets/build_m
 class Source:
     """One file `build_map.py` reads."""
 
-    #: File name inside the asset directory.
     name: str
-    #: The public download URL.
     url: str
-    #: Size of the snapshot this script was written against, in bytes.
     snapshot_bytes: int
-    #: SHA256 of that snapshot, the same value `README.md` records.
     sha256: str
 
 
-#: The four sources, in the order the README lists them.
 SOURCES: tuple[Source, ...] = (
     Source(
         name="land-polygons-split-4326.zip",
@@ -135,8 +124,6 @@ def download(
     """Download one source to `target`, resuming `target.part` when it exists."""
     part = target.with_name(target.name + ".part")
     if fresh:
-        # `--force` means from zero: a leftover `.part` may be a prefix of the
-        # previous snapshot, and appending the new one would corrupt the file.
         part.unlink(missing_ok=True)
     resumed = part.exists() and part.stat().st_size > 0
     print(f"  downloading {source.url}", flush=True)
@@ -145,9 +132,6 @@ def download(
 
     code = curl_once(curl, source, part, proxy)
     if code in RESUME_REFUSED_CODES and resumed:
-        # The server does not honour `Range` (33) or the partial file does not
-        # match it (36); a fresh download is the only way forward. Every other
-        # failure keeps the `.part` so the next run resumes it.
         print(f"  curl exited {code} while resuming; restarting from zero", flush=True)
         part.unlink(missing_ok=True)
         code = curl_once(curl, source, part, proxy)

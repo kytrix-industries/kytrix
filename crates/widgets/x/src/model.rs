@@ -1,28 +1,3 @@
-//! The tweets a pane holds, the authors they are read with, and how a newer snapshot changes
-//! the rows a list already holds.
-//!
-//! # A feed is ordered, bounded and shared
-//!
-//! The service publishes tweets in the order a timeline reads them: newest first, and for two
-//! tweets stamped in the same second the larger id first, which is the order X itself numbers
-//! them in. A row is an [`Arc`] shared with every snapshot that holds it, so a snapshot is a
-//! slice of pointers and two snapshots that differ by one tweet share every other row. What
-//! bounds the feed is [`MAX_TWEETS`]: a timeline is what a reader is looking at, not an
-//! archive, and the service publishes history rather than a growing log.
-//!
-//! # Authors are resolved separately from tweets
-//!
-//! A tweet names its author by id, and the profile that id stands for arrives as its own
-//! event with a revision: the same author can be corrected while a tweet is on screen, and a
-//! tweet whose author is not known yet still has to be drawn. So the snapshot carries both
-//! and the view resolves one against the other.
-//!
-//! # Display text is derived where it is needed
-//!
-//! Nothing here formats anything. A timestamp is turned into an *age* ([`TweetAge`]) and the
-//! view names that age in the reader's language, because the same feed is read in every
-//! language the application ships and an age is only true for the moment it is asked.
-
 use std::{collections::VecDeque, ops::Range, path::PathBuf, sync::Arc};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -33,33 +8,22 @@ use kytrix_service_provider::service::{
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
-/// The newest tweets a pane keeps.
 pub(super) const MAX_TWEETS: usize = 50;
 
-/// How many authors one tweet can name: itself, and the tweet it reposts or quotes with that
-/// tweet's own reference.
 const MAX_TWEET_AUTHORS: usize = 3;
 
-/// Every URL one stream can be asked for media of: the timeline's own images and avatars, the
-/// avatars of the monitored accounts, and those of the search results a dialog shows.
 pub(super) const MAX_MEDIA_URLS: usize =
     MAX_TWEETS * MAX_TWEET_AUTHORS * 5 + MAX_X_SELECTIONS + MAX_X_SEARCH_PROFILES;
 
-/// What is known about one URL the pane wants a picture of.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum MediaState {
-    /// The picture is being fetched.
     Loading,
-    /// The picture is on disk, at this path.
     Ready(PathBuf),
-    /// The picture could not be fetched.
     Failed,
 }
 
-/// Every picture state the pane holds, shared with the frame that draws them.
 pub(super) type MediaStates = Arc<HashMap<SmolStr, MediaState>>;
 
-/// One author a tweet is read with.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TweetAuthor {
     pub username: SmolStr,
@@ -82,10 +46,6 @@ impl From<XProfileEvent> for TweetAuthor {
 }
 
 impl TweetAuthor {
-    /// The author a tweet is drawn with before its profile has arrived.
-    ///
-    /// The id is all that is known, so it is what the row says: an author that has not been
-    /// read yet is still an author, and a row that waited for one would be a hole in the feed.
     pub(super) fn fallback(x_user_id: &str) -> Self {
         Self {
             username: SmolStr::new(x_user_id),
@@ -97,14 +57,12 @@ impl TweetAuthor {
     }
 }
 
-/// The tweet a repost or a quote carries.
 #[derive(Debug)]
 pub(super) enum TweetReferenceItem {
     Repost(Arc<TweetItem>),
     Quote(Arc<TweetItem>),
 }
 
-/// One picture attached to a tweet.
 #[derive(Debug)]
 pub(super) enum TweetMediaItem {
     Image {
@@ -112,7 +70,6 @@ pub(super) enum TweetMediaItem {
         width: u32,
         height: u32,
     },
-    /// A video, of which only the still frame is ever fetched.
     Video {
         thumbnail_url: SmolStr,
         width: u32,
@@ -122,14 +79,11 @@ pub(super) enum TweetMediaItem {
         image_url: SmolStr,
         width: u32,
         height: u32,
-        /// Whether the picture is a still frame standing in for an animation that is not
-        /// fetched, which is what the tile is labelled for.
         poster_only: bool,
     },
 }
 
 impl TweetMediaItem {
-    /// The shape of the picture, which is what a gallery lays its tiles out from.
     pub(super) fn aspect_ratio(&self) -> f32 {
         let (width, height) = match self {
             Self::Image { width, height, .. }
@@ -143,7 +97,6 @@ impl TweetMediaItem {
         }
     }
 
-    /// The URL this item is fetched from, which for a video is its still frame.
     pub(super) fn url(&self) -> &SmolStr {
         match self {
             Self::Image { image_url, .. } | Self::Gif { image_url, .. } => image_url,
@@ -189,19 +142,12 @@ impl From<XTweetMedia> for TweetMediaItem {
     }
 }
 
-/// One run of a tweet's text that stands for a link.
 #[derive(Debug)]
 pub(super) struct TweetTextLink {
-    /// The byte range of the link within the tweet's whole text.
     pub range: Range<usize>,
     pub url: SmolStr,
 }
 
-/// The text of a tweet, joined into one string with the ranges that are links.
-///
-/// The segments arrive as the service decoded them — a mention, a link and plain prose are
-/// each their own segment — and are joined here because a reader reads one paragraph: a row
-/// built from one element per segment cannot wrap a line in the middle of a sentence.
 #[derive(Debug)]
 pub(super) struct TweetText {
     text: SmolStr,
@@ -229,7 +175,6 @@ impl TweetText {
         }
     }
 
-    /// The text itself, for a row that draws it as one paragraph.
     pub(super) fn shared(&self) -> SmolStr {
         self.text.clone()
     }
@@ -243,7 +188,6 @@ impl TweetText {
     }
 }
 
-/// One tweet, as the pane holds it.
 #[derive(Debug)]
 pub(super) struct TweetItem {
     tweet_id: SmolStr,
@@ -259,19 +203,10 @@ impl TweetItem {
         &self.tweet_id
     }
 
-    /// When this tweet was published, in Unix seconds.
-    ///
-    /// The row's age is derived on the frame that draws it, in the reader's zone and
-    /// language, so the plan stores the instant rather than a formatted age.
     pub(super) const fn timestamp(&self) -> i64 {
         self.timestamp
     }
 
-    /// The tweet this row shows, and whether it is a repost of it.
-    ///
-    /// A repost is drawn as the tweet that was reposted — its text, its author, its pictures —
-    /// under a line naming who reposted it, so the row's content is the inner tweet and the
-    /// outer one only says that it happened.
     pub(super) fn displayed(&self) -> (&Self, bool) {
         match self.reference.as_ref() {
             Some(TweetReferenceItem::Repost(tweet)) => (tweet, true),
@@ -300,7 +235,6 @@ impl From<XTweetEvent> for TweetItem {
     }
 }
 
-/// Every tweet a pane is showing, with the authors they are read with.
 #[derive(Clone, Debug)]
 pub(super) struct TweetSnapshot {
     items: Arc<[Arc<TweetItem>]>,
@@ -320,7 +254,6 @@ impl TweetSnapshot {
         self.items.is_empty()
     }
 
-    /// The author of one id, or the stand-in a row uses until the profile arrives.
     pub(super) fn author(&self, x_user_id: &str) -> TweetAuthor {
         self.profiles
             .get(x_user_id)
@@ -329,16 +262,9 @@ impl TweetSnapshot {
     }
 }
 
-/// The tweets a stream holds, at the order and bound a feed reads at.
 pub(super) struct TweetState {
     items: VecDeque<Arc<TweetItem>>,
     profiles: HashMap<SmolStr, TweetAuthor>,
-    /// The authors whose profile arrived before a tweet named them, newest last.
-    ///
-    /// A profile is only kept for an author a tweet names, and a profile that arrives first
-    /// has no tweet to be kept for yet — so it is remembered here until one does, bounded to
-    /// the authors a single tweet can name so a stream of profiles nothing refers to cannot
-    /// grow.
     pending_profiles: VecDeque<SmolStr>,
     snapshot: Arc<[Arc<TweetItem>]>,
     snapshot_profiles: Arc<HashMap<SmolStr, TweetAuthor>>,
@@ -357,11 +283,6 @@ impl TweetState {
         }
     }
 
-    /// Files one tweet, returning whether it is one the feed did not have.
-    ///
-    /// A tweet the feed already holds is dropped by id, and a tweet older than the oldest one
-    /// a full feed holds is dropped as well: what a full feed keeps is the newest
-    /// [`MAX_TWEETS`] of them, and one that belongs past the end is not one of those.
     pub(super) fn push(&mut self, tweet: XTweetEvent) -> bool {
         if self
             .items
@@ -390,13 +311,6 @@ impl TweetState {
         true
     }
 
-    /// Files one author's profile, returning whether it is one the feed did not have.
-    ///
-    /// Profiles carry a revision, and a revision that is not newer than the one held is not
-    /// an update: a stale correction arriving late must not replace a newer name. A revision
-    /// of zero is the service saying it has no revision for this profile, which is what a
-    /// profile read outside the timeline stream looks like, and one of those replaces
-    /// whatever is held.
     pub(super) fn upsert_profile(&mut self, profile: XProfileEvent) -> bool {
         let x_user_id = profile.x_user_id.clone();
         let profile = TweetAuthor::from(profile);
@@ -428,7 +342,6 @@ impl TweetState {
         true
     }
 
-    /// Keeps a profile nothing refers to yet, at the bound of one tweet's authors.
     fn track_pending_profile(&mut self, x_user_id: &SmolStr) -> bool {
         if let Some(index) = self
             .pending_profiles
@@ -451,11 +364,6 @@ impl TweetState {
         true
     }
 
-    /// Drops the authors no tweet on screen names any more.
-    ///
-    /// A timeline is bounded, so the authors of tweets that fell off its end are authors
-    /// nothing reads, and keeping them would let a long session grow with profiles whose
-    /// tweets are long gone.
     pub(super) fn prune_profiles(&mut self) -> bool {
         let mut visible = HashSet::with_capacity(MAX_TWEETS * MAX_TWEET_AUTHORS);
         for item in &self.items {
@@ -472,7 +380,6 @@ impl TweetState {
         true
     }
 
-    /// The tweets as one shared slice, which is only rebuilt when something changed.
     pub(super) fn snapshot(&mut self) -> TweetSnapshot {
         if self.dirty {
             let mut items = Vec::with_capacity(self.items.len());
@@ -484,7 +391,6 @@ impl TweetState {
         TweetSnapshot::new(self.snapshot.clone(), self.snapshot_profiles.clone())
     }
 
-    /// The media URLs the tweets on screen want: every author's avatar and every picture.
     pub(super) fn media_urls(&self) -> Vec<SmolStr> {
         let mut urls = Vec::with_capacity(MAX_MEDIA_URLS);
         let mut seen = HashSet::with_capacity(MAX_MEDIA_URLS);
@@ -498,7 +404,6 @@ impl TweetState {
     }
 }
 
-/// Every author id one tweet names, including the tweet it carries.
 fn collect_author_ids<'a>(tweet: &'a TweetItem, ids: &mut HashSet<&'a str>) {
     ids.insert(tweet.x_user_id.as_str());
     if let Some(TweetReferenceItem::Repost(tweet) | TweetReferenceItem::Quote(tweet)) =
@@ -508,7 +413,6 @@ fn collect_author_ids<'a>(tweet: &'a TweetItem, ids: &mut HashSet<&'a str>) {
     }
 }
 
-/// Whether one tweet names an author, directly or through the tweet it carries.
 fn contains_author(tweet: &TweetItem, x_user_id: &str) -> bool {
     if tweet.x_user_id == x_user_id {
         return true;
@@ -521,7 +425,6 @@ fn contains_author(tweet: &TweetItem, x_user_id: &str) -> bool {
     }
 }
 
-/// Every picture one tweet wants, resolving its authors against the profiles held.
 fn collect_media_urls(
     tweet: &TweetItem,
     profiles: &HashMap<SmolStr, TweetAuthor>,
@@ -554,15 +457,10 @@ fn push_media_url(url: &str, urls: &mut Vec<SmolStr>, seen: &mut HashSet<SmolStr
     }
 }
 
-/// Two ids whose tweets share a second, ordered the way X numbers them.
-///
-/// Ids are decimal and grow with time, so the longer one is the larger one, and two of the
-/// same length compare as text.
 fn numeric_id_gt(left: &str, right: &str) -> bool {
     left.len() > right.len() || (left.len() == right.len() && left > right)
 }
 
-/// Whether a GIF's own URL is the animation rather than a still frame of it.
 fn is_animated_image_url(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     let path = value.split(['?', '#']).next().unwrap_or_default();
@@ -575,45 +473,22 @@ fn is_animated_image_url(value: &str) -> bool {
         })
 }
 
-/// How long ago a tweet was published, in the buckets a reader reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TweetAge {
     Seconds(u64),
     Minutes(u64),
     Hours(u64),
-    /// Older than a day, within the same year: a date without a year.
-    Date {
-        month: u8,
-        day: u8,
-    },
-    /// Older than a year: a date with one.
-    FullDate {
-        year: i32,
-        month: u8,
-        day: u8,
-    },
-    /// The service sent a timestamp that is not a time.
+    Date { month: u8, day: u8 },
+    FullDate { year: i32, month: u8, day: u8 },
     Unknown,
 }
 
-/// How long ago a tweet stamped `timestamp` was published, as of `now`.
-///
-/// Both instants are UTC and the difference between them is what an age is, so the reader's
-/// own clock never enters into it: a tweet is the same number of minutes old wherever it is
-/// read. The date an age older than a day reads as is the day it was published *in `zone`*,
-/// because that is the day the reader saw on their own clock.
 pub(super) fn tweet_age(timestamp: i64, now: OffsetDateTime, zone: UtcOffset) -> TweetAge {
     let Ok(time) = OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
     else {
         return TweetAge::Unknown;
     };
-    // A timestamp in the future is a clock that disagrees with the service rather than a
-    // tweet from tomorrow, and the newest thing it can be is now.
     let seconds = (now - time).whole_seconds().max(0);
-    // The offset can move an instant past the last date the calendar holds. Nothing an
-    // age says would describe a date that is not one, so a dated age reads as the one
-    // answer for a timestamp that is not a time. An age short enough to be a duration is
-    // not read in any zone at all, so the offset never touches it.
     let published = || time.checked_to_offset(zone);
     match seconds {
         0..60 => TweetAge::Seconds(seconds.unsigned_abs()),
@@ -631,11 +506,7 @@ pub(super) fn tweet_age(timestamp: i64, now: OffsetDateTime, zone: UtcOffset) ->
     }
 }
 
-/// When a tweet was published, read in `zone`, to the second.
 pub(super) fn absolute_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
-    // The offset can move an instant past the last date the calendar holds — a
-    // timestamp at the far end of the range is one the service cannot publish, and
-    // it is written as a placeholder rather than taken to a date that is not one.
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
         .ok()
         .and_then(|time| time.checked_to_offset(zone))
@@ -655,13 +526,6 @@ pub(super) fn absolute_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
         )
 }
 
-/// The name one monitored account is known by, or `None` when nothing names it.
-///
-/// A row carries a profile only once the account behind it is active: one that is still waiting
-/// to be activated has none, and the only name it has is the username the pane asked for it
-/// under, remembered against its id. Every question about what a row is called — what it is
-/// drawn as, whether an account is already monitored, which rows a filter matches — is asked
-/// here, so no two answers can disagree about one row.
 pub(super) fn selection_name<'a>(
     selection: &'a XSelection,
     hints: &'a HashMap<SmolStr, SmolStr>,
@@ -672,14 +536,6 @@ pub(super) fn selection_name<'a>(
     }
 }
 
-/// The hints that still name a row of `selections`.
-///
-/// A hint names a row the account monitors that has no profile. What the pane remembers is
-/// pruned against the set as it is read rather than against each change to it, because a row
-/// can leave the set by more than one road — it was deleted, the read no longer carries it, or
-/// it came back with a profile that names it better than the username it was asked for under.
-/// What is left is a memo beside the rows rather than a second list of accounts, which is what
-/// keeps a name from outliving the row it belongs to.
 pub(super) fn retained_hints(
     hints: &HashMap<SmolStr, SmolStr>,
     selections: &[XSelection],
@@ -694,7 +550,6 @@ pub(super) fn retained_hints(
     retained
 }
 
-/// The accounts one account monitors, as the service last answered them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SelectionData {
     selections: Arc<[XSelection]>,
@@ -702,10 +557,6 @@ pub(super) struct SelectionData {
 }
 
 impl SelectionData {
-    /// The accounts one service answer holds.
-    ///
-    /// The answer has already been checked by the service client, so this is what it said
-    /// rather than a second opinion about it.
     pub(super) fn new(response: XSelectionsResponse) -> Self {
         Self {
             selections: response.selections.into(),
@@ -717,8 +568,6 @@ impl SelectionData {
         &self.selections
     }
 
-    /// The rows themselves, for a list that is told which of them to draw: what the list was
-    /// given is what it draws, so a set that is the same set is not given to it again.
     pub(super) fn shared_selections(&self) -> Arc<[XSelection]> {
         self.selections.clone()
     }
@@ -727,19 +576,10 @@ impl SelectionData {
         self.limit
     }
 
-    /// Whether the account may monitor nothing further.
-    ///
-    /// Every account counts, including one that is still waiting to be activated: the limit
-    /// is what the account is allowed to have selected, not what it is currently following.
     pub(super) fn quota_full(&self) -> bool {
         self.selections.len() >= self.limit
     }
 
-    /// Whether one account is already monitored, by name.
-    ///
-    /// This is [`selection_name`] asked of every row, which is the same question the rows on
-    /// screen answer: a row with a profile is named by it, and a row waiting to be activated
-    /// by the username it was asked for under.
     pub(super) fn contains_username(
         &self,
         username: &str,
@@ -750,11 +590,6 @@ impl SelectionData {
         })
     }
 
-    /// The accounts this set becomes once the service confirms one was added.
-    ///
-    /// A confirmation for an account already in the set replaces that row: an account that
-    /// was waiting to be activated has a profile now, and the confirmed row is the newer of
-    /// the two.
     pub(super) fn with_added(&self, selection: XSelection) -> Self {
         let mut selections = Vec::with_capacity(self.selections.len() + 1);
         selections.extend(
@@ -770,7 +605,6 @@ impl SelectionData {
         }
     }
 
-    /// The accounts this set becomes once the service confirms one was removed.
     pub(super) fn with_deleted(&self, x_user_id: &str) -> Self {
         let selections = self
             .selections
@@ -785,21 +619,11 @@ impl SelectionData {
     }
 }
 
-/// How many of a newer feed's tweets a list holding `held` has not been shown.
-///
-/// A feed and the list that draws it are both newest first and both bounded to the same number
-/// of tweets, so a tweet the list has not been shown is one at the head of the feed, and what
-/// follows it is the run the list already holds. `None` is a feed the list cannot be extended
-/// into — a tweet that arrived late enough to belong in the middle of it, or one that shares no
-/// tweet with what the list holds — and the list a pane draws is built again for it instead.
 pub(super) fn unshown(held: &[Arc<TweetItem>], next: &[Arc<TweetItem>]) -> Option<usize> {
-    // A list that holds nothing has been shown nothing.
     if held.is_empty() {
         return Some(next.len());
     }
 
-    // Everything the new feed added is at its head, so the first tweet of it the list already
-    // holds is the first tweet the two have in common.
     let unshown = next
         .iter()
         .position(|row| held.iter().any(|held| Arc::ptr_eq(held, row)))?;
@@ -1120,8 +944,6 @@ mod tests {
     #[test]
     fn ages_should_cover_every_boundary() {
         let now = now();
-        // A timestamp on this wire is in milliseconds, which is what the boundaries are
-        // measured in.
         let ago = |seconds: i64| now.unix_timestamp() * 1_000 - seconds * 1_000;
 
         assert_eq!(
@@ -1173,11 +995,8 @@ mod tests {
         assert_eq!(tweet_age(i64::MAX, now, UtcOffset::UTC), TweetAge::Unknown);
     }
 
-    /// A date an age reads as is the day the tweet was published in the display zone,
-    /// which is the day the reader saw on their own clock.
     #[test]
     fn a_dated_age_should_read_the_day_in_the_display_zone() {
-        // 2024-01-01T23:00:00Z: the same instant is already the 2nd at UTC+14.
         let timestamp = 1_704_150_000_000;
         let now = OffsetDateTime::from_unix_timestamp(1_704_150_000 + 86_400)
             .expect("the fixture is a time");
@@ -1213,11 +1032,6 @@ mod tests {
         assert_eq!(absolute_time(i64::MAX, UtcOffset::UTC).as_str(), "--");
     }
 
-    /// The display offset can move an instant past the last day the calendar holds, so
-    /// no date can be written for it: the absolute time is the placeholder. What an age
-    /// says is still the difference between two UTC instants — a stamp at the far end of
-    /// the calendar is a future one, which reads as now, and an ancient one needs a date
-    /// the calendar cannot give it, which reads as unknown.
     #[test]
     fn a_tweet_the_display_zone_cannot_hold_should_read_without_a_date() {
         let boundary = time::Date::MAX
@@ -1255,9 +1069,6 @@ mod tests {
         );
     }
 
-    /// An age short enough to be a duration is the difference between two UTC instants,
-    /// so it is the same answer whatever the display zone is — even one whose local
-    /// reading of the instant has no date at all.
     #[test]
     fn a_relative_age_should_not_depend_on_the_display_zone() {
         let now = time::Date::MAX
@@ -1324,9 +1135,6 @@ mod tests {
         assert!(!removed.quota_full());
     }
 
-    /// Whether an account is already monitored has to be the question the rows on screen
-    /// answer: a row with a profile is named by it, and a row that is still waiting to be
-    /// activated by the name the pane remembers under that id.
     #[test]
     fn contains_username_should_name_pending_rows_by_the_remembered_hint() {
         let data = SelectionData::new(XSelectionsResponse {
@@ -1365,9 +1173,6 @@ mod tests {
         );
     }
 
-    /// What a row is drawn as and what it answers to are one question, asked once: a row with
-    /// a profile is named by it, and one waiting to be activated by what is remembered for its
-    /// id — and by nothing at all when nothing is.
     #[test]
     fn a_row_should_be_named_by_its_profile_or_by_what_is_remembered_for_its_id() {
         let hints = HashMap::from([(SmolStr::new_static("2"), SmolStr::new_static("two"))]);
@@ -1389,8 +1194,6 @@ mod tests {
         );
     }
 
-    /// What the pane remembers is pruned against the set as it is read: a hint survives while
-    /// it names a row that is monitored and has no profile, and no longer than that.
     #[test]
     fn remembered_hints_should_be_pruned_to_the_rows_they_still_name() {
         let hints = HashMap::from([
@@ -1425,8 +1228,6 @@ mod tests {
         );
     }
 
-    /// A feed that grew at its head is the tweets at the head of it a list has not been shown,
-    /// and what the list holds is what follows them however many left at its tail.
     #[test]
     fn unshown_should_count_the_tweets_at_the_head_of_a_feed() {
         let mut state = TweetState::new();
@@ -1440,7 +1241,6 @@ mod tests {
         }
         let first = state.snapshot().items().to_vec();
 
-        // One more tweet at the head, nothing dropped.
         push(&mut state, "d");
         let second = state.snapshot().items().to_vec();
         assert_eq!(
@@ -1449,8 +1249,6 @@ mod tests {
             "every tweet the list has not been shown is one of them"
         );
 
-        // A full feed drops its oldest tweet as the newest arrives, which moves what it holds
-        // rather than what it has not been shown.
         let mut full = TweetState::new();
         for index in 0..MAX_TWEETS as i64 {
             full.push(tweet(&index.to_string(), index));
@@ -1466,8 +1264,6 @@ mod tests {
         );
     }
 
-    /// A list that holds nothing has been shown nothing, so every tweet of a feed is one it has
-    /// not been shown.
     #[test]
     fn unshown_should_ask_for_every_tweet_of_a_feed_a_list_holds_nothing_of() {
         let mut state = TweetState::new();
@@ -1498,8 +1294,6 @@ mod tests {
         assert_eq!(unshown(&held, &next), None);
     }
 
-    /// A tweet that belongs in the middle of a feed is not a feed a list can be extended into:
-    /// what it holds is replaced rather than rearranged.
     #[test]
     fn unshown_should_ask_for_a_replacement_when_a_tweet_belongs_in_the_middle() {
         let mut state = TweetState::new();
@@ -1534,7 +1328,6 @@ mod tests {
         }
     }
 
-    /// A row the service has not activated yet, which by contract carries no profile.
     fn pending_selection(x_user_id: &str) -> XSelection {
         XSelection {
             status: XSelectionStatus::Pending,

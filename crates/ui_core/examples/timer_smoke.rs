@@ -1,27 +1,3 @@
-//! E10 **一次性定时器实机冒烟**：泵在空闲阻塞时，定时器到点必须自己唤醒一次。
-//!
-//! ```text
-//! cargo run -p ui_core --example timer_smoke
-//! ```
-//!
-//! 冒烟验证的事实（对应 P2-4b R02 的「500 ms 延迟永远等不到」根因 + E10c 的 macOS 真机失败）：
-//! 1. **登记基准**：定时器从**回投任务**（`AppHandle::send` → 泵尾）里登记，登记前泵已经做完
-//!    本轮的窗口/状态/出帧工作。基准 `Instant` 紧邻 `App::after` 调用入口取（应用能观测到的
-//!    最早登记时刻）；到点必须在 `基准 + delay` **之后**（允许相等）。旧实现的 deadline 用
-//!    「泵起点同步的引擎时钟」，会把泵前置工作算进 delay ⇒ macOS 真机实测
-//!    `398.648 ms < 400 ms`（提前触发）。
-//! 2. 第一只定时器等待期间**没有输入、没有 `AppHandle::wake` 节拍**，只靠平台定时器唤醒；
-//! 3. 等待期间的**空闲应用轮**很少：只统计「`on_frame` 被调用但 `FrameIndex` 没有推进」的
-//!    **应用轮**（macOS 修复前实测 54 轮 / 400 ms；修复后 1 轮，Windows 0–1）。首帧收尾的
-//!    合法补帧会推进 `FrameIndex`，不计入。该指标**不是 OS 唤醒计数**：macOS 的 display link
-//!    在最后一次工作后仍按刷新率唤醒主 run loop ≤`IDLE_GRACE`（250 ms，R06-8 的渲染器取舍，
-//!    已登记为残余）；这些 vsync 心跳只做 pacing / 状态预扫描，不调用应用回调。本冒烟没有
-//!    能耗 / 泵入口计数，因此 PASS 只声明「等待期无周期性**应用轮**唤醒」，不声明 OS 级零唤醒。
-//! 4. 回调里再注册的 200 ms 定时器同样触发（链式一次性定时器）；
-//! 5. 关窗后事件循环干净退出（退出码 0）。
-//!
-//! 退出码：`0` = PASS；`2` = 定时器从未触发（看门狗关窗）；`3` = 自检失败。
-
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -35,53 +11,21 @@ use ui_core::{
     window::WindowOptions,
 };
 
-/// 第一次等待时长（毫秒）。
 const FIRST_DELAY_MS: u64 = 400;
-/// 第二次等待时长（毫秒）。
 const SECOND_DELAY_MS: u64 = 200;
-/// 看门狗（秒）：超时即关窗并报告定时器未触发。
 const WATCHDOG: Duration = Duration::from_secs(20);
-/// 登记那一轮的「应用前置工作」模拟时长。
-///
-/// E10c M1 的确定性复现：泵在**轮首**同步引擎时钟，应用在 on_frame 里做完工作后才登记定时器。
-/// 旧实现用泵起点的引擎时钟当 deadline 基准 ⇒ 这段工作被算进 delay，定时器必然早到。留出 20 ms
-/// 让「提前量」远大于平台定时器的唤醒抖动（macOS CFRunLoopTimer 通常 <10 ms、Windows
-/// WM_TIMER ~15.6 ms），M1 的 ired_at < 基准 + delay 断言才能稳定变红；修复后（登记瞬间
-/// 取基准则）不受影响。
 const REGISTRATION_ROUND_WORK: Duration = Duration::from_millis(20);
-/// 第一次等待期允许的**空闲应用轮**上限。
-///
-/// 口径（E10c2-R03）：只数**应用轮** —— `on_frame` 被调用但 `FrameIndex` 没有推进。合法补帧
-/// （图集 / a11y / 首帧收尾 / Wayland 合成器回调）会推进 `FrameIndex`，不计入；真正按刷新率
-/// 空转才会（E10c 前 macOS 实测 54 个空闲轮 / 400 ms）。它**不**是 OS 唤醒计数：macOS 的
-/// display link 仍会在 `IDLE_GRACE`（250 ms）内唤醒 run loop（R06-8 已登记残余），只是不再
-/// 调用应用回调 —— PASS 文案按此口径写明。
-///
-/// 阈值：macOS 修复后实测 1、Windows 0–1 ⇒ 非 Linux 端按「应用轮 ≤1」判定。Linux 的 Wayland
-/// 事件循环在首帧后有**既有**的启动补轮（基线 b3e98dd 旧冒烟实测 6 轮），登记为本批之外的
-/// 残余，沿用旧门槛 8（远低于「按刷新率空转」的 54）。
 const MAX_FIRST_IDLE_ROUNDS: u32 = if cfg!(target_os = "linux") { 8 } else { 1 };
-/// 链式第二次等待期允许的空闲应用轮上限。
-///
-/// 比第一次多 1：第一次回调本身占一轮（回调在 `on_frame` 之前派发，该轮 `FrameIndex` 不变），
-/// 而 Windows 的 `WM_TIMER` 粒度又可能提前唤醒一次（`run_due` 不派发、下一轮重新挂表）。
 const MAX_SECOND_IDLE_ROUNDS: u32 = 2;
 
 #[derive(Default)]
 struct Report {
-    /// 应用轮数：`on_frame` 调用次数（含首帧收尾的合法补帧）。
     rounds: u32,
-    /// 应用轮中「`on_frame` 被调用但 `FrameIndex` 没有推进」的累计轮数（应用级空转判据；
-    /// **不是** OS 唤醒计数，见模块文档口径）。
     idle_rounds: u32,
-    /// 上一次 `on_frame` 看到的 `FrameIndex`。
     last_frame_index: Option<u32>,
-    /// 登记第一只定时器时：基准时刻、累计 `on_frame` 轮数、累计空闲轮数、`FrameIndex`。
     registered: Option<(Instant, u32, u32, u32)>,
-    /// 第一只定时器回调：触发时刻、累计轮数、累计空闲轮数、`FrameIndex`。
     first_fired: Option<(Instant, u32, u32, u32)>,
     second_fired: Option<(Instant, u32, u32, u32)>,
-    /// 第一只定时器是从回投任务里登记的（证明测的是「泵尾登记」）。
     first_task_ran: bool,
     failures: Vec<String>,
 }
@@ -98,7 +42,6 @@ fn idle_rounds(report: &Arc<Mutex<Report>>) -> u32 {
     report.lock().expect("report lock").idle_rounds
 }
 
-/// 一次 `on_frame`（应用轮）的记账：总应用轮数 +「本帧有没有推进 FrameIndex」。
 fn note_round(report: &Arc<Mutex<Report>>, frame_index: u32) {
     let mut report = report.lock().expect("report lock");
     report.rounds = report.rounds.saturating_add(1);
@@ -120,7 +63,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..WindowOptions::default()
     });
 
-    // 看门狗：定时器永不触发时不能把泵留在平台等待上（冒烟必须自己结束）。
     let watchdog = app.handle();
     watchdog.clone().spawn(async move {
         tokio::time::sleep(WATCHDOG).await;
@@ -143,12 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         scheduled = true;
-        // 模拟应用在本轮钩子里的前置工作：泵的引擎时钟在轮首同步，这段时间正是旧实现把它
-        // 算进 delay 的来源（M1 的确定性复现窗口）。
         std::thread::sleep(REGISTRATION_ROUND_WORK);
-        // 通过回投任务登记：任务在泵尾（帧之后）执行，此时引擎时钟仍是本轮**起点**同步的值 ——
-        // 真正的「登记瞬间」只能由应用自己取。这既是生产里最常见的异步登记路径，也让
-        // 「拿泵起点时钟当基准会把本轮前置工作算进 delay」变成可复现的失败（E10c M1）。
         let task_state = Arc::clone(&state);
         app.handle().send(move |app| {
             task_state.lock().expect("report lock").first_task_ran = true;
@@ -180,7 +117,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ));
                     }
                 }
-                // 链式一次性定时器：第二次等待同样必须自己唤醒。
                 let second_at = Instant::now();
                 let second_state = Arc::clone(&chained);
                 let error_state = Arc::clone(&chained);

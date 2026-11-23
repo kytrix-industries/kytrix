@@ -1,43 +1,15 @@
-//! 光标：`wp_cursor_shape_v1` 的形状码映射（首选路径）与 Xcursor 主题解析（回退路径），R10-3。
-//!
-//! Wayland 上**光标图像唯一的来源是客户端**：`wl_pointer.set_cursor(serial, surface, hotspot)`
-//! 或 `wp_cursor_shape_device_v1.set_shape(serial, shape)`。不调用 ⇒ compositor 用它的默认箭头，
-//! 并且在整个窗口生命周期内不变 —— 文本域没有 I-beam、边框 resize 没有形状反馈（R10-3）。
-//!
-//! 两条路径的 `serial` 都必须是**最近一次 `wl_pointer.enter` 的 serial**（协议：
-//! *"The cursor actually changes only if the pointer focus … is one of the requesting client's
-//! surfaces"*，而 enter 的 serial 是新焦点下第一个合法凭证）。
-//!
-//! 本模块只做纯逻辑：形状映射表、Xcursor 文件解析、主题目录/继承链解析、尺寸选择、以及
-//! **下发去重键**（[`CursorApplyState`]：设备代数 + 形状 + 尺寸，AR3 §3.6）。协议对象与
-//! `wl_shm` 上传在 `platform/linux/cursor.rs`。
-
 use std::path::PathBuf;
 
 use smol_str::SmolStr;
 
 use crate::paint::style::Cursor;
 
-/// 一个引擎光标形状的两条下发通道所需的全部信息。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CursorSpec {
-    /// `wp_cursor_shape_device_v1::Shape` 的协议值（[cursor-shape-v1] 的枚举）。
-    ///
-    /// 值直接写死而不用 `wayland_protocols` 的枚举：本模块必须能在没有 wayland 依赖的
-    /// 平台上单测（见模块文档），协议侧只是 `Shape::try_from(code)`。
-    ///
-    /// [cursor-shape-v1]: https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/cursor-shape/cursor-shape-v1.xml
     pub shape: u32,
-    /// 回退路径（`wl_cursor` 主题）的候选文件名，**顺序即偏好**（不同主题的别名不同：
-    /// `left_ptr` 是 X11 传统名、`default` 是 CSS 名、`hand2` 是 Xcursor 常见名）。
     pub theme_names: &'static [&'static str],
 }
 
-/// 引擎 [`Cursor`] → 协议形状码 + 主题候选名（表驱动，R10-3）。
-///
-/// 形状码与 CSS `cursor` 关键字的对应关系取自 cursor-shape-v1 的枚举名（`default` /
-/// `pointer` / `text` / `not_allowed` / `grab` / `grabbing` / `ew_resize` / `ns_resize`），
-/// 与 Chromium `WaylandCursor::SetCursor`、Qt `QWaylandCursor` 的映射一致。
 #[must_use]
 pub(crate) fn spec(cursor: Cursor) -> CursorSpec {
     match cursor {
@@ -76,7 +48,6 @@ pub(crate) fn spec(cursor: Cursor) -> CursorSpec {
     }
 }
 
-// cursor-shape-v1 的 `Shape` 枚举值（只列本引擎用到的；其余按 CSS 语义无关）。
 const SHAPE_DEFAULT: u32 = 1;
 const SHAPE_POINTER: u32 = 4;
 const SHAPE_TEXT: u32 = 9;
@@ -86,17 +57,11 @@ const SHAPE_GRABBING: u32 = 17;
 const SHAPE_EW_RESIZE: u32 = 26;
 const SHAPE_NS_RESIZE: u32 = 27;
 
-/// 主题里没有 `XCURSOR_SIZE` 时的逻辑尺寸（X11 传统默认 24 px，与 GTK/Qt 一致）。
 pub(crate) const DEFAULT_CURSOR_SIZE: u32 = 24;
 
-/// 主题尺寸的合理区间：太小无法辨识，太大在 4K 上会吃掉半屏。
 pub(crate) const MIN_CURSOR_SIZE: u32 = 8;
 pub(crate) const MAX_CURSOR_SIZE: u32 = 128;
 
-/// 回退路径要用的主题图像尺寸（逻辑尺寸 × 整数 scale，夹紧到合理区间）。
-///
-/// 回退路径没有 `wp_cursor_shape_v1` 那样的「compositor 帮你按缩放选图」：图像按目标像素
-/// 尺寸选档，buffer scale 恒 1（热点也按原始像素给），因此这里的尺寸必须是**物理像素**。
 #[must_use]
 pub(crate) fn theme_size(hint: Option<u32>, scale: i32) -> u32 {
     let base = hint.unwrap_or(DEFAULT_CURSOR_SIZE);
@@ -104,53 +69,29 @@ pub(crate) fn theme_size(hint: Option<u32>, scale: i32) -> u32 {
     scaled.clamp(MIN_CURSOR_SIZE, MAX_CURSOR_SIZE)
 }
 
-// ── 下发去重（AR3 §3.6）────────────────────────────────────────────────────
-
-/// 一次光标下发的去重键：**pointer 设备代数** + 形状 + 回退图像尺寸。
-///
-/// 为什么不能只按形状去重：`wl_pointer.set_cursor` 与 `wp_cursor_shape_device_v1.set_shape`
-/// 都是 **per-pointer（per-device）状态**，不是「本进程的光标属性」：
-///
-/// - `zwp_cursor_shape_device_v1` 是 `wl_pointer.get_pointer` 的**子对象**，pointer 被重建
-///   （seat 能力撤销后恢复）之后旧 device 随之销毁，新 device 上是空白状态；
-/// - `wl_pointer.leave` 之后 compositor 隐藏光标（我们也主动 `set_cursor(None)`），下一帧的
-///   `enter` 不带任何光标信息，必须重新下发一次，即使形状没变；
-/// - 回退路径的图像按尺寸选档，窗口换到另一个 scale 的输出上时同一形状要换一张图。
-///
-/// 因此去重键带上「设备代数」与「尺寸」，代数在 pointer 创建 / 销毁时前进。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CursorApplyKey {
-    /// pointer 设备代数（`pointer_created` / `pointer_gone` 各前进一次）。
     pub generation: u32,
-    /// 引擎光标形状。
     pub cursor: Cursor,
-    /// 回退路径选中的图像像素尺寸（cursor-shape 路径不消费它，但多一次重发无害）。
     pub size: u32,
 }
 
-/// 光标下发去重状态机（纯逻辑；协议对象在 `platform/linux/cursor.rs`）。
 #[derive(Debug, Default)]
 pub(crate) struct CursorApplyState {
-    /// 当前 pointer 设备的代数（每次重建前进一次）。
     generation: u32,
-    /// 最近一次**成功下发**的键（`None` = 未下发 / 已隐藏）。
     applied: Option<CursorApplyKey>,
 }
 
 impl CursorApplyState {
-    /// pointer 被创建 / 销毁：代数前进，已下发记录作废（新设备上是空白状态）。
     pub(crate) fn pointer_recreated(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.applied = None;
     }
 
-    /// `wl_pointer.leave`（或 `set_cursor(None)`）：compositor 侧光标已隐藏，
-    /// 再次 `enter` 时必须重新下发，即使形状没变。
     pub(crate) fn hidden(&mut self) {
         self.applied = None;
     }
 
-    /// 这次是否**必须**下发（同 `(代数, 形状, 尺寸)` 已经下发过 ⇒ 不必）。
     #[must_use]
     pub(crate) fn needs_apply(&self, cursor: Cursor, size: u32) -> bool {
         self.applied
@@ -161,8 +102,6 @@ impl CursorApplyState {
             })
     }
 
-    /// 下发成功后记账。**只在真的发出请求之后调用**（两条通道都不可用时不能记账，
-    /// 否则下一次 enter 会被误判为「已下发」而永远不重试）。
     pub(crate) fn note_applied(&mut self, cursor: Cursor, size: u32) {
         self.applied = Some(CursorApplyKey {
             generation: self.generation,
@@ -172,50 +111,30 @@ impl CursorApplyState {
     }
 }
 
-// ── Xcursor 文件解析（回退路径）─────────────────────────────────────────────
-
-/// Xcursor 文件魔数（小端读出来的 `Xcur`）。
 const XCURSOR_MAGIC: u32 = 0x7275_6358;
 const XCURSOR_MAGIC_SWAPPED: u32 = 0x5863_7572;
-/// 支持的文件版本（1.0）。
 const XCURSOR_FILE_VERSION: u32 = 0x0001_0000;
-/// 图像 chunk 的类型码（`XCURSOR_IMAGE_TYPE`）。
 const XCURSOR_IMAGE_TYPE: u32 = 0xfffd_0002;
-/// 文件头固定 16 字节；每个 TOC 项 12 字节；图像 chunk 头 36 字节。
 const FILE_HEADER_LEN: usize = 16;
 const TOC_ENTRY_LEN: usize = 12;
 const IMAGE_HEADER_LEN: usize = 36;
 
-/// Xcursor 文件里的一个图像。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct XcursorImage<'a> {
-    /// 该图像的标称尺寸（Xcursor 用 `subtype` 表示，24 / 32 / 48 …）。
     pub nominal_size: u32,
-    /// 实际像素宽。
     pub width: u32,
-    /// 实际像素高。
     pub height: u32,
-    /// 热点 x（必须落在图像内）。
     pub xhot: u32,
-    /// 热点 y。
     pub yhot: u32,
-    /// `width × height` 个小端 ARGB32（**预乘 alpha**）—— 与 `wl_shm::Format::Argb8888`
-    /// 的内存布局完全一致，可以直接 memcpy 进 shm 池。
     pub pixels: &'a [u8],
 }
 
-/// Xcursor 解析失败的原因（只在回退路径里用于「换下一个候选文件」，不冒泡给用户）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum XcursorError {
-    /// magic 不是 `Xcur`（不是 Xcursor 文件，或根本不是光标文件）。
     BadMagic,
-    /// 大端字节序的 Xcursor 文件（Linux/macOS 桌面全是小端；遇到就跳过这个候选）。
     UnsupportedEndianness,
-    /// 版本不是 1.0。
     UnsupportedVersion,
-    /// 文件被截断 / chunk 位置越界。
     Truncated,
-    /// 没有任何可用的图像 chunk。
     NoImages,
 }
 
@@ -225,10 +144,6 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-/// 解析一个 Xcursor 文件，返回其中**全部**图像（按文件顺序）。
-///
-/// 只接受小端文件（Linux/macOS 桌面全部如此）；损坏的 TOC 项被跳过而不是整体失败，只有
-/// 「一个图像都没解析出来」才是 `NoImages`（与 libXcursor 的容错行为一致）。
 pub(crate) fn parse_xcursor(bytes: &[u8]) -> Result<Vec<XcursorImage<'_>>, XcursorError> {
     let magic = read_u32(bytes, 0).ok_or(XcursorError::Truncated)?;
     if magic == XCURSOR_MAGIC_SWAPPED {
@@ -243,7 +158,6 @@ pub(crate) fn parse_xcursor(bytes: &[u8]) -> Result<Vec<XcursorImage<'_>>, Xcurs
     }
     let ntoc = read_u32(bytes, 12).ok_or(XcursorError::Truncated)?;
     let toc_start = FILE_HEADER_LEN;
-    // 每个 TOC 项 12 字节；`ntoc` 来自文件，先做溢出/越界检查再分配。
     let toc_len = (ntoc as usize)
         .checked_mul(TOC_ENTRY_LEN)
         .ok_or(XcursorError::Truncated)?;
@@ -297,8 +211,6 @@ pub(crate) fn parse_xcursor(bytes: &[u8]) -> Result<Vec<XcursorImage<'_>>, Xcurs
             nominal_size: subtype,
             width,
             height,
-            // 热点越界在真实主题里存在（生成工具不校验），夹紧到图像内避免 compositor 收到
-            // 非法热点（协议不校验，但越界热点会让指针定位不可预测）。
             xhot: xhot.min(width - 1),
             yhot: yhot.min(height - 1),
             pixels,
@@ -310,9 +222,7 @@ pub(crate) fn parse_xcursor(bytes: &[u8]) -> Result<Vec<XcursorImage<'_>>, Xcurs
     Ok(images)
 }
 
-/// 选标称尺寸最接近 `size` 的图像下标（平局取**较大**的那张：宁可略大也不模糊）。
 pub(crate) fn choose_image(images: &[XcursorImage<'_>], size: u32) -> Option<usize> {
-    // (与目标尺寸的距离, 标称尺寸, 下标)
     let mut best: Option<(u32, u32, usize)> = None;
     for (index, image) in images.iter().enumerate() {
         let delta = image.nominal_size.abs_diff(size);
@@ -329,11 +239,6 @@ pub(crate) fn choose_image(images: &[XcursorImage<'_>], size: u32) -> Option<usi
     best.map(|(_, _, index)| index)
 }
 
-// ── 主题目录 / 继承链（回退路径）────────────────────────────────────────────
-
-/// 光标主题的搜索根，顺序与 libXcursor 的 `XcursorGetTheme`/`XcursorLibraryLoadImages` 一致：
-/// 用户目录优先，其次是 `$XDG_DATA_DIRS/icons`（默认 `/usr/local/share` + `/usr/share`），
-/// 最后是历史遗留的 `/usr/share/pixmaps`（老主题只放这里）。
 #[must_use]
 pub(crate) fn icon_roots(home: Option<PathBuf>, data_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = Vec::with_capacity(data_dirs.len() + 2);
@@ -347,12 +252,10 @@ pub(crate) fn icon_roots(home: Option<PathBuf>, data_dirs: &[PathBuf]) -> Vec<Pa
     roots
 }
 
-/// `index.theme` 里的 `Inherits=`（主题继承链），逗号分隔、允许空白。
 #[must_use]
 pub(crate) fn inherits(index_theme: &str) -> Option<SmolStr> {
     for line in index_theme.lines() {
         let line = line.trim();
-        // 只认 `[Icon Theme]` 段里的键：无关段里的同名键（理论上不存在，但主题文件是外部输入）。
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -366,10 +269,6 @@ pub(crate) fn inherits(index_theme: &str) -> Option<SmolStr> {
     None
 }
 
-/// 主题继承链：`theme` → 它声明的 `Inherits`（可多级）→ 兜底 `default`。
-///
-/// `lookup` 负责给一个主题名返回它的 `index.theme` 内容（`None` = 主题不存在）。
-/// 深度上限 8 且去重：主题文件是外部输入，`A Inherits B` / `B Inherits A` 的环必须收敛。
 #[must_use]
 pub(crate) fn theme_chain(
     theme: &str,
@@ -388,7 +287,6 @@ pub(crate) fn theme_chain(
         let index_theme = lookup(name.as_str());
         chain.push(name);
         if let Some(inherited) = index_theme.as_deref().and_then(inherits) {
-            // 继承列表按声明顺序入栈的反序压栈（pop 后按声明顺序处理）。
             for next in inherited.split(',').rev() {
                 pending.push(SmolStr::new(next.trim()));
             }
@@ -400,9 +298,6 @@ pub(crate) fn theme_chain(
     chain
 }
 
-/// 候选光标文件路径：**主题优先于别名，别名优先于搜索根**（与 libXcursor 的查找顺序一致）。
-///
-/// 只生成路径，不碰文件系统 —— 调用方按顺序 `std::fs::read` 第一个存在的即可。
 #[must_use]
 pub(crate) fn cursor_candidates(
     roots: &[PathBuf],
@@ -431,7 +326,6 @@ mod tests {
     };
     use crate::paint::style::Cursor;
 
-    /// 全部 8 个 [`Cursor`] 变体（新增变体时这里少一项 ⇒ 下面的覆盖测试会失败）。
     const ALL: [Cursor; 8] = [
         Cursor::Default,
         Cursor::Pointer,
@@ -443,8 +337,6 @@ mod tests {
         Cursor::ResizeVertical,
     ];
 
-    /// R10-3 的形状映射表：每个引擎光标必须映射到**唯一**的 cursor-shape-v1 形状码，
-    /// 且回退主题名非空（否则回退路径永远找不到图像）。
     #[test]
     fn every_cursor_maps_to_a_distinct_protocol_shape() {
         let mut shapes = Vec::new();
@@ -468,7 +360,6 @@ mod tests {
         assert_eq!(shapes.len(), ALL.len());
     }
 
-    /// 具体的 CSS 对应关系（照 cursor-shape-v1 的枚举实现，回退时改错会让用户看到错的箭头）。
     #[test]
     fn cursor_shapes_match_the_protocol_enum() {
         assert_eq!(spec(Cursor::Default).shape, 1, "default");
@@ -481,8 +372,6 @@ mod tests {
         assert_eq!(spec(Cursor::ResizeVertical).shape, 27, "ns_resize");
     }
 
-    /// 主题别名必须覆盖 X11 传统名（`left_ptr` / `hand2` / `xterm`）：绝大多数发行版主题只装
-    /// 传统名，只写 CSS 名会回退失败。
     #[test]
     fn theme_aliases_cover_the_x11_names() {
         assert!(spec(Cursor::Default).theme_names.contains(&"left_ptr"));
@@ -517,35 +406,33 @@ mod tests {
         );
     }
 
-    /// 构造一个最小可用的 Xcursor 文件（两个图像：24 与 48）。
     fn sample_xcursor() -> (Vec<u8>, Vec<(u32, u32, u32, u32)>) {
-        // 返回 (文件字节, 每个图像的 (nominal, width, height, offset))
         let images = [(24u32, 2u32, 2u32), (48, 1, 1)];
         let header_len = 16 + images.len() * 12;
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&0x7275_6358u32.to_le_bytes()); // magic "Xcur"
-        bytes.extend_from_slice(&16u32.to_le_bytes()); // header size
-        bytes.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // version 1.0
+        bytes.extend_from_slice(&0x7275_6358u32.to_le_bytes());
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&0x0001_0000u32.to_le_bytes());
         bytes.extend_from_slice(&(images.len() as u32).to_le_bytes());
         let mut positions = Vec::new();
         let mut offset = header_len;
         for (nominal, width, height) in images {
             positions.push(offset as u32);
-            bytes.extend_from_slice(&0xfffd_0002u32.to_le_bytes()); // image type
-            bytes.extend_from_slice(&nominal.to_le_bytes()); // subtype = nominal size
-            bytes.extend_from_slice(&(offset as u32).to_le_bytes()); // position
+            bytes.extend_from_slice(&0xfffd_0002u32.to_le_bytes());
+            bytes.extend_from_slice(&nominal.to_le_bytes());
+            bytes.extend_from_slice(&(offset as u32).to_le_bytes());
             offset += 36 + (width * height * 4) as usize;
         }
         for (nominal, width, height) in images {
-            bytes.extend_from_slice(&36u32.to_le_bytes()); // chunk header size
-            bytes.extend_from_slice(&0xfffd_0002u32.to_le_bytes()); // type
-            bytes.extend_from_slice(&nominal.to_le_bytes()); // subtype
-            bytes.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // image version
+            bytes.extend_from_slice(&36u32.to_le_bytes());
+            bytes.extend_from_slice(&0xfffd_0002u32.to_le_bytes());
+            bytes.extend_from_slice(&nominal.to_le_bytes());
+            bytes.extend_from_slice(&0x0001_0000u32.to_le_bytes());
             bytes.extend_from_slice(&width.to_le_bytes());
             bytes.extend_from_slice(&height.to_le_bytes());
-            bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // xhot（越界，测试夹紧）
-            bytes.extend_from_slice(&0u32.to_le_bytes()); // yhot
-            bytes.extend_from_slice(&1u32.to_le_bytes()); // delay
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
             let pixels = vec![0xABu8; (width * height * 4) as usize];
             bytes.extend_from_slice(&pixels);
         }
@@ -569,7 +456,6 @@ mod tests {
             );
             assert_eq!(image.xhot, width - 1, "越界热点被夹紧到图像内");
             assert_eq!(image.yhot, 0);
-            // 像素必须落在 chunk 之后（位置由 TOC 给出），而不是把头部当成像素。
             assert_eq!(
                 u32::from_le_bytes([
                     bytes[*position as usize],
@@ -609,7 +495,6 @@ mod tests {
             XcursorError::UnsupportedVersion
         );
 
-        // 只有非图像 chunk：没有可用图像。
         let mut no_images = Vec::new();
         no_images.extend_from_slice(&0x7275_6358u32.to_le_bytes());
         no_images.extend_from_slice(&16u32.to_le_bytes());
@@ -627,7 +512,6 @@ mod tests {
     #[test]
     fn truncated_toc_is_reported_instead_of_panicking() {
         let (mut bytes, _) = sample_xcursor();
-        // TOC 声称有 100 项，但文件只有 2 项的空间。
         bytes[12..16].copy_from_slice(&100u32.to_le_bytes());
         assert_eq!(parse_xcursor(&bytes).unwrap_err(), XcursorError::Truncated);
     }
@@ -657,7 +541,6 @@ mod tests {
         assert_eq!(choose_image(&[], 24), None);
     }
 
-    /// 一个手写的图像数组（`choose_image` 的边界：等距 / 单图）。
     #[test]
     fn choose_image_handles_a_single_image() {
         let pixels = [0u8; 4];
@@ -691,7 +574,6 @@ mod tests {
                 PathBuf::from("/usr/share/pixmaps"),
             ]
         );
-        // 没有 HOME（容器里的服务进程）时只剩系统目录。
         let roots = icon_roots(None, &[PathBuf::from("/usr/share")]);
         assert_eq!(
             roots,
@@ -731,16 +613,13 @@ mod tests {
             vec![smoll("Adwaita"), smoll("hicolor"), smoll("default")]
         );
 
-        // 无 index.theme 的主题：直接兜底 default。
         let chain = theme_chain("Custom", |_| None);
         assert_eq!(chain, vec![smoll("Custom"), smoll("default")]);
 
-        // 主题本身就是 default：不重复。
         let chain = theme_chain("default", |_| None);
         assert_eq!(chain, vec![smoll("default")]);
     }
 
-    /// 主题继承成环（外部输入）必须收敛，不能无限展开。
     #[test]
     fn theme_chain_terminates_on_cycles() {
         let chain = theme_chain("A", |name| {
@@ -775,9 +654,6 @@ mod tests {
         assert_eq!(candidates, expected);
     }
 
-    // ── 下发去重键（AR3 §3.6）────────────────────────────────────────────
-
-    /// 同一形状、同一尺寸重复下发是纯浪费（每次 enter / 每帧都可能走到）。
     #[test]
     fn the_same_shape_and_size_is_not_resent() {
         let mut state = CursorApplyState::default();
@@ -799,8 +675,6 @@ mod tests {
         );
     }
 
-    /// AR3 §3.6 P2：8 种形状都缓存之后，`Text → Pointer → Text` 必须每次都重发 ——
-    /// 回退路径所有形状复用一个光标 surface，命中缓存不重新 attach 就会显示上一个形状。
     #[test]
     fn every_shape_switch_reapplies_even_when_all_shapes_are_cached() {
         let mut state = CursorApplyState::default();
@@ -808,20 +682,16 @@ mod tests {
             assert!(state.needs_apply(cursor, 24), "{cursor:?} 首次下发");
             state.note_applied(cursor, 24);
         }
-        // 稳态：三种形状都缓存过，surface 当前挂的是 Default。
         assert!(
             state.needs_apply(Cursor::Default, 24),
             "缓存命中不等于已下发：surface 上现在是 Text 的 buffer"
         );
         state.note_applied(Cursor::Default, 24);
-        // 全部「已缓存」之后再切回来：形状不同 ⇒ 必须重发（命中缓存也要重新 attach）。
         assert!(state.needs_apply(Cursor::Text, 24));
         state.note_applied(Cursor::Text, 24);
         assert!(state.needs_apply(Cursor::Pointer, 24));
     }
 
-    /// 设备代数前进（pointer 重建 / 能力撤销恢复）⇒ 即使形状与尺寸都没变也必须重发：
-    /// `wp_cursor_shape_device_v1` 是 pointer 的子对象，新 device 上是空白状态。
     #[test]
     fn a_recreated_pointer_device_forces_a_reapply() {
         let mut state = CursorApplyState::default();
@@ -843,7 +713,6 @@ mod tests {
         );
     }
 
-    /// `wl_pointer.leave` 之后光标已被隐藏：下一次 enter 即使形状没变也要重新下发。
     #[test]
     fn a_hidden_cursor_is_reapplied_on_the_next_enter() {
         let mut state = CursorApplyState::default();
@@ -855,7 +724,6 @@ mod tests {
         );
     }
 
-    /// 窗口换到另一个 scale 的输出上：回退路径的图像尺寸变了，同一形状也要换图。
     #[test]
     fn a_scale_change_reapplies_the_theme_image() {
         let mut state = CursorApplyState::default();
@@ -867,11 +735,9 @@ mod tests {
         );
     }
 
-    /// 两条通道都不可用时**不得**记账：否则下一次 enter 会被误判成「已下发」而永不重试。
     #[test]
     fn an_unsent_shape_is_not_recorded_as_applied() {
         let state = CursorApplyState::default();
-        // 没有调用 note_applied（下发失败）⇒ 下一次仍然要求下发。
         assert!(state.needs_apply(Cursor::NotAllowed, 24));
         assert!(state.needs_apply(Cursor::NotAllowed, 24));
     }

@@ -1,36 +1,3 @@
-//! The pictures a timeline shows: where they come from, and where they are kept.
-//!
-//! # Why the pane fetches them itself
-//!
-//! A picture is not part of what the service streams. The service names the URL of every image
-//! and still frame a tweet carries, and the bytes behind that URL come from X's own image
-//! hosts over plain HTTPS — no account, no session, and no service in the path. So the pane
-//! fetches them, which is also what lets it keep them: a picture that was fetched once is on
-//! disk, and a timeline that scrolls back to it does not fetch it again.
-//!
-//! # What is fetched, and what is refused
-//!
-//! Only the two X image origins, over HTTPS on the default port, with every redirect hop
-//! checked against the same policy: a picture URL is data from the service, and data that
-//! could redirect the fetcher anywhere would make it a request forger. A body is bounded while
-//! it is read rather than after, so an origin that streams forever cannot fill the cache.
-//!
-//! # What the cache is
-//!
-//! A content-addressed directory of finished downloads: the file name is a hash of the URL, a
-//! download lands in a temporary file and is renamed into place, and a reader only ever sees
-//! whole files. What it holds is bounded by count and by size, evicted oldest first, so it
-//! cannot grow with a session — a picture evicted and asked for again is simply fetched again.
-//!
-//! # Route resolution runs on the fetching task
-//!
-//! The route a media host is reached over is resolved synchronously by the pane's own task. For
-//! a System route that evaluation reads the OS proxy settings and, for PAC, downloads and
-//! executes the PAC document, so it is blocking work on the task that asked for the client.
-//! This is a registered degradation: the previous implementation crossed the application
-//! runtime's blocking pool before awaiting the route, and a media client built here can now
-//! hold its caller for the length of the OS/PAC read.
-
 use std::{
     fs,
     future::Future,
@@ -49,24 +16,15 @@ use tokio::{fs::File, io::AsyncWriteExt, sync::OnceCell, time::Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-/// The largest body this pane accepts, which is also the largest file the cache keeps.
 pub(super) const MEDIA_MAX_BYTES: u64 = 32 * 1_024 * 1_024;
 
-/// The longest URL this pane will parse, which bounds what one hash is computed over.
 const MEDIA_URL_MAX_BYTES: usize = 2_048;
 
-/// How long one picture has to arrive, headers and body together.
 pub(super) const MEDIA_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How many files, and how many bytes, the cache keeps before it starts evicting.
 const CACHE_FILE_LIMIT: usize = 512;
 const CACHE_BYTE_LIMIT: u64 = 512 * 1_024 * 1_024;
 
-/// Whether a URL is one this pane will even consider, without parsing it.
-///
-/// The download itself checks the parsed URL against [`valid_x_media_url`], which is the
-/// policy; this is what keeps a URL that cannot pass it from being tracked, queued, or given a
-/// state of its own in the first place.
 pub(super) fn plausible_media_url(url: &str) -> bool {
     url.len() <= MEDIA_URL_MAX_BYTES
         && ["https://pbs.twimg.com", "https://video.twimg.com"]
@@ -78,10 +36,6 @@ pub(super) fn plausible_media_url(url: &str) -> bool {
             })
 }
 
-/// Accepts only the two X media origins, over default-port HTTPS.
-///
-/// Media requests and every redirect hop are checked against this policy, so a compromised or
-/// misconfigured origin cannot redirect the client elsewhere.
 fn valid_x_media_url(url: &Url) -> bool {
     url.scheme() == "https"
         && url.username().is_empty()
@@ -90,7 +44,6 @@ fn valid_x_media_url(url: &Url) -> bool {
         && matches!(url.host_str(), Some("pbs.twimg.com" | "video.twimg.com"))
 }
 
-/// Why one picture is not on disk.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum MediaError {
     #[error("the X media URL is invalid")]
@@ -124,10 +77,6 @@ impl From<MediaCacheError> for MediaError {
     }
 }
 
-/// Builds the client one media destination is fetched with.
-///
-/// The pane is written against this seam rather than against the transport hub, so a test can
-/// fetch from a server of its own without a proxy route or a build policy.
 pub(super) trait MediaTransport: Clone + Send + Sync + 'static {
     fn client(
         &self,
@@ -136,11 +85,6 @@ pub(super) trait MediaTransport: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Client, MediaError>> + Send;
 }
 
-/// The application's shared transports, resolving the route a media host is reached over.
-///
-/// The route is resolved from a snapshot of the application's network settings taken when the
-/// transport is built, and it is resolved on the task that asks for the client: see the module
-/// documentation for what that costs.
 #[derive(Clone)]
 pub(super) struct SharedTransport {
     hub: Arc<TransportHub>,
@@ -161,8 +105,6 @@ impl MediaTransport for SharedTransport {
     ) -> Result<Client, MediaError> {
         let route = network::proxy::resolve(
             &self.config,
-            // What a media request is addressed through is the Kytrix service that serves it,
-            // which is what its line is configured under — see the applications page.
             &RouteTarget::Service(ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::XMedia,
             }),
@@ -176,7 +118,6 @@ impl MediaTransport for SharedTransport {
     }
 }
 
-/// One URL fetched, once, into the cache.
 #[derive(Clone)]
 pub(super) struct MediaDownloader<T = SharedTransport> {
     transport: T,
@@ -184,7 +125,6 @@ pub(super) struct MediaDownloader<T = SharedTransport> {
 }
 
 impl<T> MediaDownloader<T> {
-    /// A downloader over the application's own cache directory.
     pub(super) fn new(transport: T) -> Self {
         Self {
             transport,
@@ -192,8 +132,6 @@ impl<T> MediaDownloader<T> {
         }
     }
 
-    /// A downloader over a cache of the caller's choosing, which is what a test drives one
-    /// into a directory of its own with.
     #[cfg(test)]
     pub(super) const fn with_cache(transport: T, cache: MediaCache) -> Self {
         Self { transport, cache }
@@ -204,10 +142,6 @@ impl<T> MediaDownloader<T>
 where
     T: MediaTransport,
 {
-    /// The path one URL's picture is on, fetching it if it is not there yet.
-    ///
-    /// A URL this pane may not fetch is refused before anything is asked for, and a URL whose
-    /// picture is already on disk is answered without a request at all.
     pub(super) async fn fetch(
         &self,
         url: &str,
@@ -226,7 +160,6 @@ where
         self.store(response, deadline, &url, cancellation).await
     }
 
-    /// The URL one string stands for, if it is one this pane may fetch.
     fn parse(&self, url: &str) -> Result<Url, MediaError> {
         if url.len() > MEDIA_URL_MAX_BYTES {
             return Err(MediaError::InvalidUrl);
@@ -238,11 +171,6 @@ where
         Ok(url)
     }
 
-    /// Sends one request, following redirects the policy allows.
-    ///
-    /// Redirects are followed here rather than by the client so that every hop is checked
-    /// against the same policy the first URL was: what a redirect may reach is exactly what a
-    /// picture URL may name.
     async fn request(
         &self,
         initial_url: &Url,
@@ -266,8 +194,6 @@ where
                     deadline,
                     client
                         .get(current.clone())
-                        // The body is measured while it is read, so a transfer encoding that
-                        // changed its length would make the measurement a guess.
                         .header(reqwest::header::ACCEPT_ENCODING, "identity")
                         .send(),
                 ) => result.map_err(|_| MediaError::Timeout)?.map_err(network_error)?,
@@ -292,11 +218,6 @@ where
         Err(MediaError::Redirect)
     }
 
-    /// Reads one response into the cache, whole or not at all.
-    ///
-    /// The body is written to a temporary file and renamed into place once it is complete, so
-    /// a download that fails, is cancelled, or arrives short leaves the cache as it was: what
-    /// a later reader finds at a cache key is a picture, never a fragment of one.
     async fn store(
         &self,
         response: Response,
@@ -349,7 +270,6 @@ where
     }
 }
 
-/// Why one response could not be read.
 fn network_error(error: reqwest::Error) -> MediaError {
     if error.is_timeout() {
         MediaError::Timeout
@@ -358,7 +278,6 @@ fn network_error(error: reqwest::Error) -> MediaError {
     }
 }
 
-/// Why the cache could not answer.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum MediaCacheError {
     #[error("the X media cache directory is unavailable")]
@@ -369,7 +288,6 @@ pub(super) enum MediaCacheError {
     Cancelled,
 }
 
-/// The directory finished pictures are kept in.
 #[derive(Clone)]
 pub(super) struct MediaCache {
     inner: Arc<MediaCacheInner>,
@@ -377,20 +295,17 @@ pub(super) struct MediaCache {
 
 struct MediaCacheInner {
     root: Option<PathBuf>,
-    /// Whether the directory is ready, resolved once per process.
     initialized: OnceCell<Result<(), MediaCacheError>>,
     file_limit: usize,
     byte_limit: u64,
 }
 
 impl MediaCache {
-    /// The application's cache directory.
     pub(super) fn new() -> Self {
         let root = dirs::cache_dir().map(|root| root.join("kytrix").join("x"));
         Self::with_options(root, CACHE_FILE_LIMIT, CACHE_BYTE_LIMIT)
     }
 
-    /// A cache at a root and a bound of the caller's choosing.
     pub(super) fn with_options(root: Option<PathBuf>, file_limit: usize, byte_limit: u64) -> Self {
         Self {
             inner: Arc::new(MediaCacheInner {
@@ -402,11 +317,6 @@ impl MediaCache {
         }
     }
 
-    /// The directory, created and swept of interrupted downloads.
-    ///
-    /// A temporary file is a download that was running when the process ended, and nothing
-    /// will ever finish it: the URL it was for may be asked for again, and that download will
-    /// make its own.
     async fn initialize(&self, cancellation: &CancellationToken) -> Result<&Path, MediaCacheError> {
         let root = self
             .inner
@@ -439,11 +349,6 @@ impl MediaCache {
         Ok(root)
     }
 
-    /// The path one URL's picture is at, if a whole one is there.
-    ///
-    /// A file that is empty, larger than the bound, or not a file at all is not a picture and
-    /// is removed as it is found: a cache key nobody can use is a key that should not be
-    /// there.
     pub(super) async fn lookup(
         &self,
         url: &Url,
@@ -455,7 +360,6 @@ impl MediaCache {
         lookup_file(path, max_entry_bytes, cancellation).await
     }
 
-    /// Opens one URL's download, which is not a cache hit until it is committed.
     pub(super) async fn begin(
         &self,
         url: &Url,
@@ -486,7 +390,6 @@ impl MediaCache {
         })
     }
 
-    /// Evicts what the cache holds beyond its bounds, keeping `keep`.
     async fn enforce_limits(
         &self,
         keep: PathBuf,
@@ -498,10 +401,6 @@ impl MediaCache {
         enforce_limits(&root, &keep, file_limit, byte_limit, cancellation).await
     }
 
-    /// Puts one finished picture in the cache.
-    ///
-    /// This is what a test that wants a row to draw a picture, without a server to fetch one
-    /// from, writes the bytes with.
     #[cfg(test)]
     pub(super) async fn seed(&self, url: &Url, bytes: &[u8]) -> PathBuf {
         let cancellation = CancellationToken::new();
@@ -517,7 +416,6 @@ impl MediaCache {
     }
 }
 
-/// One download on its way into the cache.
 pub(super) struct MediaCacheWrite {
     cache: MediaCache,
     file: Option<File>,
@@ -552,7 +450,6 @@ impl MediaCacheWrite {
         }
     }
 
-    /// Puts the download in its place, or leaves the cache as it was.
     pub(super) async fn commit(
         mut self,
         cancellation: &CancellationToken,
@@ -564,7 +461,6 @@ impl MediaCacheWrite {
         result
     }
 
-    /// Gives up on the download.
     pub(super) async fn abort(mut self) -> Result<(), MediaCacheError> {
         self.cleanup().await
     }
@@ -592,8 +488,6 @@ impl MediaCacheWrite {
         })?;
         let final_path = self.final_path.clone();
         let committed = commit_file(&temp_path, &final_path, cancellation).await?;
-        // Keep ownership until the atomic rename succeeds so commit errors use the same
-        // awaited cleanup path as cancelled downloads.
         self.temp_path.take();
         self.cache
             .enforce_limits(committed.clone(), cancellation)
@@ -641,7 +535,6 @@ async fn cleanup_temporary_file(
     }
 }
 
-/// The file name one URL's picture is kept under.
 fn cache_key(url: &Url) -> String {
     const_hex::encode(Sha256::digest(url.as_str().as_bytes()))
 }
@@ -716,14 +609,12 @@ async fn commit_file(
     Ok(final_path.to_path_buf())
 }
 
-/// One file the cache holds, with what it costs and when it was last written.
 struct CacheEntry {
     path: PathBuf,
     bytes: u64,
     modified: SystemTime,
 }
 
-/// Brings the directory back within its bounds, oldest first, never evicting `keep`.
 async fn enforce_limits(
     root: &Path,
     keep: &Path,
@@ -795,7 +686,6 @@ async fn enforce_limits(
     Ok(())
 }
 
-/// Whether one directory entry is a finished download rather than a temporary file.
 fn is_cache_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -819,7 +709,6 @@ mod tests {
     use super::*;
     use crate::test_support::test_temp;
 
-    /// A transport that reaches a server the test started, with no proxy in the path.
     #[derive(Clone, Copy)]
     struct LoopbackTransport;
 
@@ -829,8 +718,6 @@ mod tests {
             _destination: &Url,
             _cancellation: &CancellationToken,
         ) -> Result<Client, MediaError> {
-            // The pool a stream fetches through resolves redirects itself, so the client it
-            // builds does not: this is the same policy, for the same reason.
             Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -839,7 +726,6 @@ mod tests {
         }
     }
 
-    /// One server that answers its first request and then stops.
     struct TestServer {
         address: SocketAddr,
         task: JoinHandle<Vec<u8>>,
@@ -891,7 +777,6 @@ mod tests {
     }
 
     impl MediaCache {
-        /// How many unfinished downloads the directory holds, for the tests about them.
         async fn temporary_file_count(&self) -> usize {
             let Some(root) = self.inner.root.as_deref() else {
                 return 0;
@@ -933,9 +818,6 @@ mod tests {
         ] {
             assert!(!valid_x_media_url(&Url::parse(rejected).unwrap()));
         }
-        // The cheap check a URL is tracked by is not the policy itself: a URL that only
-        // looks like X media is refused when it is fetched, and one that cannot even look
-        // like it is never tracked at all.
         for untracked in [
             "http://pbs.twimg.com/media/image.jpg",
             "https://example.com/media/image.jpg",
@@ -1040,8 +922,6 @@ mod tests {
             .request(&url, deadline(), &cancellation)
             .await
             .unwrap();
-        // A body shorter than the length it declared is a transport that ended early, which
-        // is an error either way: what matters is that nothing of it reaches the cache.
         assert!(
             downloader
                 .store(response, deadline(), &url, &cancellation)

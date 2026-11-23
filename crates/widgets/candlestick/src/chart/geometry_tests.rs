@@ -1,5 +1,3 @@
-//! The chart's box arithmetic: where every plot, axis and separator goes.
-
 use market_participants_connector::catalog::test_support;
 use market_participants_model::{
     decimal::{Price, Quantity},
@@ -16,17 +14,14 @@ use super::geometry::*;
 
 const CHART: Rect = Rect::new(0.0, 0.0, 800.0, 500.0);
 
-/// The right edge of a box.
 fn right(rect: Rect) -> f32 {
     rect.max().x
 }
 
-/// The bottom edge of a box.
 fn bottom(rect: Rect) -> f32 {
     rect.max().y
 }
 
-/// The middle of a box.
 fn center(rect: Rect) -> Point {
     Point::new(
         rect.origin.x + rect.size.width / 2.0,
@@ -237,12 +232,6 @@ fn candle_geometry_should_clamp_a_slot_outside_the_visible_range() {
     assert_eq!(CandleGeometry::new(plot, 0, 10.0).slot_at(1.0), None);
 }
 
-/// The height distribution table from the design's §6.2 (D17), row for row.
-///
-/// `(total, sub_count, time, content, sub_budget, per_sub, sub_total, price_height)`.
-/// The values are what the formula produces, not estimates: `time` is the one
-/// column that is `f32` (`min(26, total * 0.24)`), so 80 and 60 px panes carry
-/// 19.2 and 14.4 rather than their integer truncations.
 const HEIGHT_TABLE: [(f32, usize, f32, f32, f32, f32, f32, f32); 18] = [
     (500.0, 0, 26.0, 474.0, 0.0, 0.0, 0.0, 474.0),
     (500.0, 1, 26.0, 474.0, 113.76, 113.76, 114.76, 359.24),
@@ -291,8 +280,6 @@ fn layout_should_match_the_height_table() {
 
         assert_close(actual_time, time, &format!("{label}: time"));
         assert_close(actual_content, content, &format!("{label}: content"));
-        // The ceiling is not reached by any row of the table, so the effective
-        // budget is the per-sub height spread over the sub plots.
         assert_close(
             actual_per_sub * sub_count as f32,
             sub_budget,
@@ -304,9 +291,6 @@ fn layout_should_match_the_height_table() {
     }
 }
 
-/// The ceiling is an upper bound on one sub plot, and the sub total is computed
-/// from the capped height rather than the wish. A 1200px pane wishes for 281.76
-/// per sub plot and must get 200.
 #[test]
 fn layout_should_cap_a_sub_plot_at_the_ceiling() {
     let layout = layout_with_height(1200.0, 1);
@@ -324,9 +308,6 @@ fn layout_should_cap_a_sub_plot_at_the_ceiling() {
     assert_close(layout.price_plot.size.height, 973.0, "price height");
 }
 
-/// The three invariants from the design's §6.2, over the whole input space the
-/// callers use — including the `content == 0` pane at 0px, where the formula is
-/// most likely to divide by zero or go negative.
 #[test]
 fn layout_should_preserve_the_height_invariants() {
     const HEIGHTS: [f32; 8] = [0.0, 40.0, 60.0, 80.0, 120.0, 240.0, 500.0, 1200.0];

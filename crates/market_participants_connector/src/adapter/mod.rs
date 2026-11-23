@@ -1,5 +1,3 @@
-//! Capability-oriented market-participant adapter interfaces.
-
 pub(crate) mod binance;
 pub(crate) mod context;
 pub(crate) mod error;

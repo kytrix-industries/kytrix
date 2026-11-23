@@ -1,14 +1,3 @@
-//! Market-data facade owned by the market capability.
-//!
-//! Every request is listing-scoped: it names the exact `VenueListingKey` it is
-//! about, and it can only be validated against the listing's own rules, status and
-//! window. Which routes publish which capability is the route registry's answer,
-//! so nothing in this module guesses a product from a venue.
-//!
-//! The request types themselves are the protocol boundary's: a market call
-//! constructs the same `market_participants::model` query an adapter encodes with, so there
-//! is exactly one shape of every request in the crate.
-
 use market_participants_model::listing::route::{VenueListingKey, VenueRoute};
 use smol_str::SmolStr;
 
@@ -96,13 +85,6 @@ impl From<crate::adapter::SubscriptionStatus> for SubscriptionStatus {
     }
 }
 
-/// The exact listing one market request is about.
-///
-/// A selector is route-scoped and a builder is listing-scoped: the key is
-/// resolved inside one catalog generation, and the resolution is what carries the
-/// rules, the status and the typed native identifiers a request is built from. A
-/// listing whose own route is not the selector's is rejected before anything is
-/// encoded.
 #[derive(Clone)]
 pub struct MarketSelector {
     provider: MarketCapability,
@@ -114,7 +96,6 @@ impl MarketSelector {
         Self { provider, route }
     }
 
-    /// Returns the route this selector is about.
     pub const fn route(&self) -> &VenueRoute {
         &self.route
     }
@@ -153,7 +134,6 @@ impl MarketSelector {
     }
 }
 
-/// Rejects a listing that does not belong to the route a selector is about.
 pub(crate) fn require_listing_route(
     route: &VenueRoute,
     listing: &VenueListingKey,

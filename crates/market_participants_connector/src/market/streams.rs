@@ -1,11 +1,3 @@
-//! Listing-scoped market streams.
-//!
-//! Every stream carries the listing of the event it publishes: the adapter
-//! resolved the venue's own identifier to a `VenueListingKey`, and this layer
-//! attaches the listing's units to the venue's raw numbers. A stream never
-//! guesses a listing from a route, and a route-level stream that publishes a
-//! subject it cannot name is a failure, not a silent skip.
-
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -46,7 +38,6 @@ fn map_status(
     receiver
 }
 
-/// Declares the shared lifecycle surface of one stream wrapper.
 macro_rules! stream_lifecycle {
     ($name:ident) => {
         impl $name {
@@ -61,7 +52,6 @@ macro_rules! stream_lifecycle {
     };
 }
 
-/// Declares one listing-scoped stream over one native payload.
 macro_rules! unit_stream {
     ($name:ident, $item:ty, $variant:ident, $map:path) => {
         pub struct $name {
@@ -163,7 +153,6 @@ impl Stream for TickerStream {
     }
 }
 
-/// One live probability stream of one prediction event.
 pub struct PredictionSeriesStream {
     inner: ProtocolStream,
     status: tokio::sync::watch::Receiver<SubscriptionStatus>,
@@ -199,7 +188,6 @@ impl Stream for PredictionSeriesStream {
     }
 }
 
-/// The live order book updates of one prediction leg.
 pub struct PredictionOrderBookStream {
     inner: ProtocolStream,
     status: tokio::sync::watch::Receiver<SubscriptionStatus>,
@@ -257,12 +245,6 @@ stream_lifecycle!(ForceOrderStream);
 impl Stream for ForceOrderStream {
     type Item = Result<ListingForceOrder, MarketError>;
 
-    /// Publishes one liquidation order of one perpetual listing.
-    ///
-    /// A route-level stream may report a subject that is not a perpetual; that
-    /// is a product rejection, so it is reported as one instead of being dropped,
-    /// while a subject the published catalog does not hold is not a listing this
-    /// route offers and is left out.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match self.inner.as_mut().poll_next(cx) {
@@ -330,19 +312,12 @@ mod tests {
         catalog::test_support,
     };
 
-    /// One perpetual fixture entry on the fixture perpetual route.
-    ///
-    /// A liquidation is only ever published for a perpetual listing, so the
-    /// fixture publishes a real perpetual instrument with perpetual rules rather
-    /// than a spot one wearing a perpetual key.
     fn perpetual_entry() -> (
         VenueRoute,
         VenueListingKey,
         crate::catalog::batch::CatalogEntry,
     ) {
         let route = test_support::perp_route();
-        // The fixture vocabulary is the one the display contract resolves back from
-        // an `AssetId`, so the fixture assets carry its issuer.
         let base = test_support::token(test_support::VENUE, "BTC");
         let quote = test_support::token(test_support::VENUE, "USDT");
         let contract_size = ContractSize::new(
@@ -459,8 +434,6 @@ mod tests {
         )
     }
 
-    /// A route-level stream resolves every event against the published snapshot
-    /// and publishes one listing's liquidation with that listing's key.
     #[tokio::test]
     async fn force_orders_are_published_with_the_listing_key_of_their_own_listing() {
         let (_route, listing, entry) = perpetual_entry();
@@ -498,8 +471,6 @@ mod tests {
         assert!(orders.next().await.is_none());
     }
 
-    /// A prediction book stream publishes the update batch of the frame it was
-    /// handed, in the order the adapter decoded it.
     #[tokio::test]
     async fn prediction_book_updates_are_published_as_the_adapter_decoded_them() {
         let updates = vec![

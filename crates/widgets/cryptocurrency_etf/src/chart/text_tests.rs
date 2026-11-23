@@ -1,6 +1,3 @@
-//! Everything that turns chart values into text: the money formats, the two date
-//! formats, and the precision an axis label is written at.
-
 use smol_str::SmolStr;
 use time::Month;
 

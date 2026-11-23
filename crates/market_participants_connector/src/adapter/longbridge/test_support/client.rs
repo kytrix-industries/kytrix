@@ -1,11 +1,3 @@
-//! The clients that read the fixture: the configuration that makes the venue reachable,
-//! the credentials it resolves, the route a read is addressed to and the listing a read
-//! is about.
-//!
-//! A test builds those the way production does — the credentials go through the venue's
-//! own settings row and the listing through the venue's own catalogue — so what it
-//! drives is the adapter's real path rather than a second one written for the test.
-
 use std::sync::Arc;
 
 use app_config::{
@@ -34,13 +26,6 @@ use crate::{
     runtime::{LongbridgeCredentialValues, MarketParticipantNetworkSnapshot},
 };
 
-/// One execution context that reads the fixture's sockets.
-///
-/// The configuration is what makes the venue reachable and what its credentials are
-/// resolved from: the three values are stored in the venue's own settings row and the
-/// snapshot is what a request's runtime receiver carries, so the adapter resolves its
-/// credentials exactly the way it does in production. A venue holding no set is the
-/// one a file stores nothing for.
 pub(crate) fn execution(
     fixture: &LongbridgeFixture,
     credentials: Option<LongbridgeCredentials>,
@@ -76,7 +61,6 @@ pub(crate) fn execution(
     .with_runtime(notification)
 }
 
-/// One complete Longbridge credential set.
 pub(crate) fn credentials() -> LongbridgeCredentials {
     LongbridgeCredentials {
         app_key: SmolStr::new_static(APP_KEY),
@@ -85,7 +69,6 @@ pub(crate) fn credentials() -> LongbridgeCredentials {
     }
 }
 
-/// The same set as the resolved values an adapter dials with.
 pub(crate) fn credential_values() -> LongbridgeCredentialValues {
     LongbridgeCredentialValues {
         app_key: SmolStr::new_static(APP_KEY),
@@ -94,13 +77,10 @@ pub(crate) fn credential_values() -> LongbridgeCredentialValues {
     }
 }
 
-/// The three values the fixture stores, in one place because the stored settings and
-/// the resolved values have to be the same credential.
 pub(crate) const APP_KEY: &str = "longbridge-app-key";
 pub(crate) const APP_SECRET: &str = "longbridge-app-secret";
 pub(crate) const ACCESS_TOKEN: &str = "longbridge-access-token";
 
-/// The route every fixture reads the venue on.
 pub(crate) fn route() -> VenueRoute {
     VenueRoute::new(
         VenueId::Longbridge,
@@ -108,12 +88,6 @@ pub(crate) fn route() -> VenueRoute {
     )
 }
 
-/// The one listing these fixtures are about, as a published catalogue resolves it.
-///
-/// An adapter receives a resolved listing rather than a key: the venue's own symbol and
-/// the typed identifiers are what a request is encoded from, and both come out of the
-/// catalogue the row was published into. This is that resolution, through the venue's own
-/// adapter entry, so a test drives the wire with what production hands it.
 pub(crate) async fn resolved_listing() -> crate::catalog::resolved::ResolvedListingRef {
     let entry = crate::adapter::longbridge::catalog::catalog_entry(
         &route(),
@@ -147,19 +121,11 @@ pub(crate) async fn resolved_listing() -> crate::catalog::resolved::ResolvedList
         .expect("the published catalogue resolves its own listing")
 }
 
-/// The venue's own catalogue, as the market-participant source publishes it.
-///
-/// The venue's adapter answers with entries that name the display codes their terms do
-/// not state — a security's code is the directory's own ticker — so a fixture that held
-/// only the listings would be publishing an entry the naming gate refuses. The batch is
-/// built by the same function the market-participant source calls, so a fixture publishes exactly
-/// what a load publishes.
 struct LongbridgeCatalog {
     batch: crate::catalog::batch::CatalogBatch,
 }
 
 impl LongbridgeCatalog {
-    /// Builds the source of one adapter entry.
     fn of(entry: crate::adapter::NativeCatalogEntry) -> Self {
         Self {
             batch: crate::catalog::market_participants::markets_batch(vec![entry])

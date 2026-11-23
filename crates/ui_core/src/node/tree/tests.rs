@@ -68,7 +68,6 @@ fn append_child_rejects_cycle() {
     let a = boxed(&mut tree, root);
     let a1 = boxed(&mut tree, a);
 
-    // 把祖先挂成后代的子节点：结构环。
     let _ = tree.append_child(a1, a);
 }
 
@@ -184,8 +183,6 @@ fn node_and_handle_sizes() {
         "size_of::<Option<Box<crate::a11y::tree::NodeA11y>>>() = {}",
         size_of::<Option<Box<crate::a11y::tree::NodeA11y>>>()
     );
-    // E13（审查 F6）：**精确 pin** 实测值，而不是只 pin 上界 —— 336 B 是当前上限且**已无余量**，
-    // 任何让 Node 变小的改动都应该同步改这条基线（否则「无余量」结论会悄悄失效）。
     assert_eq!(
         node_size, 336,
         "Node 尺寸基线: {node_size} B（上限 336 B：冷字段必须装箱，见 R03-3；X5 起多 lane 集合占 24 B；\
@@ -233,7 +230,6 @@ fn slot_reuse_drops_cache() {
     let root = tree.root();
     let doomed = boxed(&mut tree, root);
     let index = doomed.index();
-    // 建一个缓存条目
     let _ = tree.taffy_cache(doomed);
     assert!(tree.layout_cache(doomed).is_some(), "缓存条目必须建立");
 
@@ -269,8 +265,6 @@ fn set_style_clears_caches_to_root() {
         "布局后兄弟必须有缓存条目"
     );
 
-    // R04-6：**等值**写入是 no-op（见 `node::tree::layout::tests::writing_an_equal_style_is_a_no_op`），
-    // 因此这里必须写一份**不同**的样式才谈得上"清缓存到根"。
     tree.set_style(child, fixed_style(10.0, 10.0))
         .expect("节点存活");
 
@@ -306,7 +300,6 @@ fn remove_drops_cache_and_hoisted_entries() {
     );
     assert!(!tree.hoisted.contains_key(&child));
 
-    // N5：别的包含块若把被卸载节点记在自己的列表里，也必须被逐表剔除
     let other = boxed(&mut tree, root);
     let victim = boxed(&mut tree, root);
     tree.hoisted_push(other, &[victim]);
@@ -356,9 +349,6 @@ fn node_debug_prints_layout_fields() {
 
 #[test]
 fn damage_covers_current_layout_on_touch() {
-    // B5 之后不再保存 `prev_layout`：**旧位置**由 `place_subtree` 在写新盒时并入
-    // （`damage ∪ old ∪ new`，见 `layout::place_subtree` 与 taffy 侧的
-    // `set_layout_override_updates_bounds_and_damage`）。`touch` 只补当前盒。
     let mut tree = NodeTree::new();
     let root = tree.root();
     let node = boxed(&mut tree, root);
@@ -448,8 +438,6 @@ fn append_child_marks_moved_subtree_paint() {
     );
 }
 
-// ── P05：文本节点 ────────────────────────────────────────────────────────
-
 fn text_tree(text: &str) -> (NodeTree, NodeId) {
     let mut tree = NodeTree::new();
     let root = tree.root();
@@ -517,8 +505,6 @@ fn text_caret_rect_reports_preconditions() {
     assert!(matches!(error, EngineError::TextShape { .. }));
 }
 
-/// E5/§11.5：点 → 字节索引的前置条件全部收敛到 `StaleNode`（语义 =「该节点不能作为文本命中
-/// 目标」）：未 shape 的文本 / 非文本节点（盒子、Canvas）/ 已卸载节点。
 #[test]
 fn text_byte_index_at_reports_preconditions() {
     let (mut tree, node) = text_tree("abcdef");
@@ -596,8 +582,6 @@ fn text_bind_text_round_trips() {
     assert!(tree.take_bind_text(node).is_some(), "放回后仍可取");
 }
 
-// ── P06：settle / lane / debug id / clip key ──
-
 fn layout_box(bounds: Rect) -> LayoutBox {
     LayoutBox {
         bounds,
@@ -626,8 +610,6 @@ fn settle_frame_resets_damage_bits_and_prev_layout() {
         "布局盒保留（不再有 prev_layout 字段）"
     );
     assert!(node.dirty().contains(DirtyFlags::REUSABLE));
-    // R03-9：帧结算**不再**清 `PAINT`（唯一清除点是 paint pass）与 `LAYOUT`（唯一清除点是
-    // `set_local_layout`）。这里保留脏位是正确语义：本测试没有跑 paint / layout pass。
     assert!(node.dirty().contains(DirtyFlags::PAINT));
     assert!(node.dirty().contains(DirtyFlags::LAYOUT));
     assert!(
@@ -642,7 +624,6 @@ fn remove_unions_subtree_bounds_into_parent_damage() {
     let root = tree.root();
     let parent = boxed(&mut tree, root);
     let child = boxed(&mut tree, parent);
-    // 出流子节点在父盒之外。
     let _ = tree.set_layout_for_test(parent, layout_box(Rect::new(0.0, 0.0, 10.0, 10.0)));
     let outside = Rect::new(100.0, 100.0, 20.0, 20.0);
     let _ = tree.set_layout_for_test(child, layout_box(outside));
@@ -675,11 +656,6 @@ fn remove_reports_released_lanes() {
     assert_eq!(tree.drain_removed_lanes().count(), 0, "取走即清空");
 }
 
-/// RX-4（review-x 覆盖探针）：多块几何节点卸载时**每一条** lane 都要交回。
-///
-/// 探针：把 `arena.rs` 的回收改成「只取第一条 lane」后全量测试仍绿（既有删除测试只有单
-/// lane 普通节点）。多块几何节点（每块一条 lane）卸载 / 关窗时漏回收会永久泄漏 `Scene`
-/// lane 槽与编码器实例段（7×24 场景）。
 #[test]
 fn remove_reports_every_lane_of_a_multi_lane_node() {
     use crate::paint::scene::LaneId;
@@ -710,15 +686,6 @@ fn remove_reports_every_lane_of_a_multi_lane_node() {
     assert_eq!(tree.drain_removed_lanes().count(), 0, "取走即清空");
 }
 
-/// Canvas 内容里引用的几何必须登记在反向绑定表：数据更新能自动标脏 Canvas 节点，
-/// 内容替换与卸载会解绑（绑定表是树内私有旁表，只有树单测能直接观察）。
-///
-/// 两条公开几何引用路径都必须覆盖：`push_geometry(GeometryDraw)` 与
-/// `push_path(Path{geometry})`（前者在 delta 侧有测试，但绑定表侧曾漏掉后者，审查 RBG-01）。
-///
-/// 探针：删掉 `arena::insert_child` 的 Canvas 分支 ⇒ 首段断言红；删掉 `set_canvas` 的
-/// 解绑/重建 ⇒ 第二段红；删掉 `arena::remove` 的 Canvas 解绑 ⇒ 末段红；
-/// 删掉 `canvas_geometry_ids` 的 `Path` 分支（G10）⇒ 首段 Path 断言红。
 #[test]
 fn canvas_referenced_geometries_are_bound_and_unbound() {
     use crate::paint::{
@@ -761,7 +728,6 @@ fn canvas_referenced_geometries_are_bound_and_unbound() {
     );
     assert!(!tree.geometry_bindings.contains_key(&second));
 
-    // 内容替换：旧引用（Geometry 与 Path 两种来源）解绑、新引用登记。
     let mut fresh = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
     fresh.push_path(path(second));
     assert!(tree.set_canvas(node, fresh), "替换 Canvas 内容");
@@ -780,7 +746,6 @@ fn canvas_referenced_geometries_are_bound_and_unbound() {
         "新内容（`push_path`）引用的几何必须登记"
     );
 
-    // 标脏路径：Canvas 节点必须被标 PAINT（整条 lane 重建）并清 REUSABLE。
     tree.clear_all_dirty_for_test();
     assert_eq!(tree.mark_geometry_updated(second), 1);
     let state = tree.get(node).expect("节点存在");
@@ -794,7 +759,6 @@ fn canvas_referenced_geometries_are_bound_and_unbound() {
         "Canvas 没有块级 revision 判据 ⇒ 必须清 REUSABLE 让 lane 重建"
     );
 
-    // 卸载：反向绑定清空。
     tree.remove(node).expect("卸载 Canvas");
     assert!(
         !tree.geometry_bindings.contains_key(&second),
@@ -838,19 +802,11 @@ fn clip_key_roundtrip_and_clear() {
 fn node_size_after_p06() {
     let size = size_of::<Node>();
     println!("size_of::<Node>() = {size}");
-    // wave-2 瘦身后预算 320 B；wave-6 的 NodeId 带窗口身份（8→12 B）后仍必须守住
-    // （`Node.id` 与 `Node.parent` 各 +4 B；`Option<NodeId>` 靠 NonZeroU32 的 niche 保持 12 B）。
-    // X5 起 `Node.lane: Option<LaneId>` 改为 `SmallVec<[LaneId; 2]>`（几何节点每块一条块 lane），
-    // 集合本身 24 B，预算 +16 B（328 B 实测；仍是「冷字段必须装箱」的同一约束）。
-    // E13 的组不透明度复用戳 `Node.paint_opacity: f32` 再 +4 B ⇒ **336 B（= 上限，已无余量）**。
-    // E13（审查 F6）：精确 pin（不是上界）。336 B = 上限且已无余量，缩小也必须同步基线。
     assert_eq!(
         size, 336,
         "Node 尺寸基线：{size} B（备选瘦身：删掉未被读取的 `Node.id` 字段）"
     );
 }
-
-// ── B7：设备像素吸附（只吸附边界）────────────────────────────────────────
 
 fn fixed_style(width: f32, height: f32) -> Style {
     let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
@@ -888,7 +844,6 @@ fn device_scale_snaps_committed_bounds_not_taffy_layout() {
     tree.set_device_scale(Some(2.0));
     layout_to(&mut tree, 200.0, 200.0);
 
-    // 10.3dp × 2 = 20.6px → 21px → 10.5dp；高度同理。
     assert_eq!(bounds_of(&tree, child), Rect::new(0.0, 0.0, 10.5, 4.5));
 }
 
@@ -911,7 +866,6 @@ fn device_scale_off_keeps_fractional_layout() {
 
 #[test]
 fn device_scale_does_not_accumulate_rounding_across_depth() {
-    // 三层嵌套、每层偏移 0.3dp：递归引用系必须是**未圆整**坐标，否则误差逐层累积。
     let mut tree = NodeTree::new();
     let root = tree.root();
     let mut parent = root;
@@ -936,7 +890,6 @@ fn device_scale_does_not_accumulate_rounding_across_depth() {
     tree.set_device_scale(Some(1.0));
     layout_to(&mut tree, 200.0, 200.0);
 
-    // 未圆整的绝对坐标：0.3 / 0.6 / 0.9 → 吸附后 0 / 1 / 1（floor(v+0.5)）。
     let origins: Vec<f32> = chain
         .iter()
         .map(|node| bounds_of(&tree, *node).origin.x)
@@ -969,9 +922,6 @@ fn device_scale_change_republishes_bounds() {
     );
 }
 
-// ── A1：paint 脏子树剪枝的侧表 / 代际 / 计数 ─────────────────────────────────
-
-/// 脏节点的**祖先闭包**：自身 + 到 root 的完整路径；兄弟与无关子树不标记。
 #[test]
 fn paint_closure_marks_dirty_ancestors() {
     let mut tree = NodeTree::new();
@@ -988,17 +938,14 @@ fn paint_closure_marks_dirty_ancestors() {
     assert!(!tree.paint_marked(a2), "兄弟不得入闭包");
     assert!(!tree.paint_marked(b), "无关子树不得入闭包");
 
-    // 第二个脏节点与 a1 共享祖先：重复命中即停不得漏标。
     tree.mark_paint_closure(&[a2, b]);
     assert!(tree.paint_marked(a2));
     assert!(tree.paint_marked(b));
     assert!(tree.paint_marked(a));
     assert!(tree.paint_marked(root));
-    // 上一轮的独有标记随代次前进失效（`0` 代次恒为假）。
     assert!(!tree.paint_marked(a1));
 }
 
-/// 闭包是**代次**语义：清空脏集合后的下一帧，上一帧的标记不得复活。
 #[test]
 fn paint_closure_is_epoch_scoped() {
     let mut tree = NodeTree::new();
@@ -1012,7 +959,6 @@ fn paint_closure_is_epoch_scoped() {
     assert!(!tree.paint_marked(child), "空闭包之后旧标记必须失效");
 }
 
-/// 结构 / 滚动容器登记 / 强制全量三种「硬全量」判据；`note_paint_frame` 提交已见代际。
 #[test]
 fn structure_and_scroll_epochs_force_the_next_full_frame() {
     let mut tree = NodeTree::new();
@@ -1040,7 +986,6 @@ fn structure_and_scroll_epochs_force_the_next_full_frame() {
     assert!(!tree.paint_epoch_changed(), "强制标志只消费一次");
 }
 
-/// 滚动槽缓存：全量入口统一失效（隐藏 / 未访问的容器因此必须重新分配）。
 #[test]
 fn scroll_slot_cache_is_invalidated_by_the_full_entry() {
     let mut tree = NodeTree::new();
@@ -1054,7 +999,6 @@ fn scroll_slot_cache_is_invalidated_by_the_full_entry() {
     assert_eq!(tree.scroll_slot_cached(child), 0, "全量入口必须清空缓存");
 }
 
-/// 计数：一帧访问数 + 累计帧数 / 绘制序兜底次数。
 #[test]
 fn paint_counters_track_frames_visits_and_order_rebuilds() {
     let mut tree = NodeTree::new();

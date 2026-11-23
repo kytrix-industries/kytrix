@@ -1,11 +1,3 @@
-//! Canonical outcome relations: events, groups, members, sides and risk pools.
-//!
-//! An [`crate::instrument::Instrument`] outcome is one member's side; an
-//! [`OutcomeGroup`] describes how those instruments settle together, and an
-//! [`OutcomeRiskPool`] models the negative-risk conversions between groups.
-//! Condition ids, market ids, CLOB token ids and question indexes are native
-//! lookup identifiers only and never take part in these identities.
-
 use std::collections::BTreeSet;
 
 use ahash::{AHashMap, AHashSet};
@@ -32,14 +24,8 @@ crate::identifier::identity_type!(OutcomeMemberId, OutcomeMemberIdentity);
 crate::identifier::identity_type!(OutcomeSideId, OutcomeSideIdentity);
 crate::identifier::identity_type!(OutcomeRiskPoolId, OutcomeRiskPoolIdentity);
 
-/// The maximum length of an outcome question, counted in Unicode scalar values.
-///
-/// The limit is a scalar-value count rather than a byte length so that a question
-/// written in a multi-byte script is neither silently truncated nor refused
-/// earlier than the same question written in ASCII.
 pub const MAX_OUTCOME_QUESTION_SCALARS: usize = 128;
 
-/// The selection constraint of a mutually exclusive outcome group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SelectionCardinality {
     #[serde(rename = "at_most_one")]
@@ -49,7 +35,6 @@ pub enum SelectionCardinality {
 }
 
 impl SelectionCardinality {
-    /// Returns the fixed canonical label of this cardinality.
     pub const fn label(self) -> &'static str {
         match self {
             Self::AtMostOne => "at-most-one",
@@ -64,11 +49,6 @@ impl CanonicalTerms for SelectionCardinality {
     }
 }
 
-/// The settlement topology of an outcome group.
-///
-/// `Binary` is exactly one member with two complementary sides.
-/// `MutuallyExclusive` constrains several members and states explicitly whether
-/// at most or exactly one of them is selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "cardinality")]
 pub enum OutcomeTopology {
@@ -79,7 +59,6 @@ pub enum OutcomeTopology {
 }
 
 impl OutcomeTopology {
-    /// Returns the fixed canonical label of this topology.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Binary => "binary",
@@ -87,7 +66,6 @@ impl OutcomeTopology {
         }
     }
 
-    /// Returns the selection cardinality of a mutually exclusive topology.
     pub const fn cardinality(self) -> Option<SelectionCardinality> {
         match self {
             Self::MutuallyExclusive(cardinality) => Some(cardinality),
@@ -108,10 +86,6 @@ impl CanonicalTerms for OutcomeTopology {
     }
 }
 
-/// A settlement fraction rule for an outcome group.
-///
-/// `Binary` only accepts `0` or `1`; `AnyFraction` allows a fractional
-/// `settleFraction` such as `0.5`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SettlementFractionRule {
     #[serde(rename = "binary")]
@@ -121,7 +95,6 @@ pub enum SettlementFractionRule {
 }
 
 impl SettlementFractionRule {
-    /// Returns the fixed canonical label of this rule.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Binary => "binary",
@@ -129,7 +102,6 @@ impl SettlementFractionRule {
         }
     }
 
-    /// Validates a settlement fraction against this rule.
     pub fn validate_fraction(
         &self,
         group: &OutcomeGroupId,
@@ -151,7 +123,6 @@ impl CanonicalTerms for SettlementFractionRule {
     }
 }
 
-/// How a group resolves.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "rule")]
 pub enum ResolutionRule {
@@ -170,7 +141,6 @@ pub enum ResolutionRule {
 }
 
 impl ResolutionRule {
-    /// Validates the resolution rule against the group expiry window.
     pub fn validate(&self, expiry: &Expiry) -> Result<(), ModelError> {
         match self {
             Self::FixedAt { at } => {
@@ -194,7 +164,6 @@ impl ResolutionRule {
         }
     }
 
-    /// Returns the instant at which the group must be resolved.
     pub fn deadline(&self) -> UnixMillis {
         match self {
             Self::FixedAt { at } => *at,
@@ -202,7 +171,6 @@ impl ResolutionRule {
         }
     }
 
-    /// Returns the external resolution source, when the rule has one.
     pub fn source(&self) -> Option<&ResolutionSourceId> {
         match self {
             Self::External { source, .. } => Some(source),
@@ -227,13 +195,6 @@ impl CanonicalTerms for ResolutionRule {
     }
 }
 
-/// The canonical terms of a group before its members exist.
-///
-/// The seed is what makes a member or side identity belong to one group: the
-/// question, expiry, topology, settlement asset and resolution terms are encoded
-/// first, and the resulting seed identity is part of every member and side
-/// identity of that group. A renamed question therefore produces a new group and
-/// new member identities instead of silently reusing the old ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutcomeGroupSeed {
     pub question: smol_str::SmolStr,
@@ -245,15 +206,10 @@ pub struct OutcomeGroupSeed {
 }
 
 impl OutcomeGroupSeed {
-    /// Validates the seed terms.
-    ///
-    /// A seed carries the question, so building one is the first place the model
-    /// can refuse a question it will never be able to display.
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_question(&self.question)
     }
 
-    /// Returns the seed identity of these group terms.
     pub fn seed_id(&self) -> OutcomeGroupId {
         OutcomeGroupId::of_terms(self)
     }
@@ -271,7 +227,6 @@ impl CanonicalTerms for OutcomeGroupSeed {
     }
 }
 
-/// The canonical terms of an outcome side.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 struct OutcomeSideTerms {
     seed: OutcomeGroupId,
@@ -286,7 +241,6 @@ impl CanonicalTerms for OutcomeSideTerms {
     }
 }
 
-/// The canonical terms of an outcome member.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 struct OutcomeMemberTerms {
     seed: OutcomeGroupId,
@@ -303,7 +257,6 @@ impl CanonicalTerms for OutcomeMemberTerms {
     }
 }
 
-/// The canonical terms of an outcome event index.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 struct OutcomeEventTerms {
     source: ResolutionSourceId,
@@ -318,11 +271,6 @@ impl CanonicalTerms for OutcomeEventTerms {
     }
 }
 
-/// One tradable side of an outcome member.
-///
-/// The side identity is derived from its group and its semantic label, so
-/// renaming a side is a terms change: it produces a new group identity and an
-/// [`OutcomeGroupLineageEdge`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct OutcomeSide {
     #[serde(rename = "id")]
@@ -332,7 +280,6 @@ pub struct OutcomeSide {
 }
 
 impl OutcomeSide {
-    /// Derives a side identity from its group seed and semantic label.
     pub fn new(seed: &OutcomeGroupId, label: smol_str::SmolStr) -> Result<Self, ModelError> {
         if label.is_empty() {
             return Err(ModelError::EmptyIdentifier {
@@ -350,10 +297,6 @@ impl OutcomeSide {
     }
 }
 
-/// One selectable outcome of a group, together with its tradable sides.
-///
-/// A multi-outcome market without a complementary token declares a single side
-/// instead of inventing a `No` token.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct OutcomeMember {
     #[serde(rename = "id")]
@@ -365,7 +308,6 @@ pub struct OutcomeMember {
 }
 
 impl OutcomeMember {
-    /// Derives a member identity from its group seed, label and sides.
     pub fn new(
         seed: &OutcomeGroupId,
         label: smol_str::SmolStr,
@@ -405,12 +347,6 @@ impl CanonicalTerms for OutcomeMember {
     }
 }
 
-/// The canonical terms that determine an [`OutcomeGroupId`].
-///
-/// The fixed set is the question text, the expiry, the topology, the settlement
-/// asset, the resolution rule, the fraction rule and the canonical member/side
-/// semantic topology. Native condition, market, token and question indexes are
-/// lookup identifiers and never appear here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutcomeGroupTerms {
     pub question: smol_str::SmolStr,
@@ -423,7 +359,6 @@ pub struct OutcomeGroupTerms {
 }
 
 impl OutcomeGroupTerms {
-    /// Returns the canonical group identity of these terms.
     pub fn group_id(&self) -> OutcomeGroupId {
         OutcomeGroupId::of_terms(self)
     }
@@ -490,12 +425,6 @@ impl CanonicalTerms for OutcomeGroupTerms {
     }
 }
 
-/// Validates the display question of an outcome group.
-///
-/// The question is canonical display text rather than a native question index, so
-/// the model owns its bound: an empty question cannot name a group and a question
-/// longer than [`MAX_OUTCOME_QUESTION_SCALARS`] is refused here, which is the only
-/// place a group or a group seed can be built.
 pub fn validate_question(question: &smol_str::SmolStr) -> Result<(), ModelError> {
     if question.is_empty() {
         return Err(ModelError::OutcomeGroupUnresolved {
@@ -510,7 +439,6 @@ pub fn validate_question(question: &smol_str::SmolStr) -> Result<(), ModelError>
     Ok(())
 }
 
-/// An immutable outcome group: how one question's sides settle together.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutcomeGroup {
     pub id: OutcomeGroupId,
@@ -525,11 +453,6 @@ pub struct OutcomeGroup {
 }
 
 impl OutcomeGroup {
-    /// Builds and validates an outcome group from its canonical terms.
-    ///
-    /// The group seed is derived from the question, expiry, topology, settlement
-    /// asset, resolution and fraction rule first, so sides and members can be
-    /// derived inside that group identity.
     pub fn new(
         seed: OutcomeGroupSeed,
         sides: Vec<OutcomeSide>,
@@ -574,7 +497,6 @@ impl OutcomeGroup {
         })
     }
 
-    /// Validates the group invariants and that the identity matches the terms.
     pub fn validate(&self) -> Result<(), ModelError> {
         let terms = OutcomeGroupTerms {
             question: self.question.clone(),
@@ -597,19 +519,16 @@ impl OutcomeGroup {
         Ok(())
     }
 
-    /// Returns the member of this group.
     pub fn member(&self, member: &OutcomeMemberId) -> Option<&OutcomeMember> {
         self.members
             .iter()
             .find(|candidate| &candidate.id == member)
     }
 
-    /// Returns the side of this group.
     pub fn side(&self, side: &OutcomeSideId) -> Option<&OutcomeSide> {
         self.sides.iter().find(|candidate| &candidate.id == side)
     }
 
-    /// Returns every tradable `(member, side)` leg of this group.
     pub fn tradable_legs(&self) -> Vec<(&OutcomeMemberId, &OutcomeSideId)> {
         self.members
             .iter()
@@ -782,7 +701,6 @@ impl TryFrom<OutcomeGroupWire> for OutcomeGroup {
     }
 }
 
-/// Why a new outcome group replaced an existing one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OutcomeGroupAdjustment {
     #[serde(rename = "question_change")]
@@ -797,7 +715,6 @@ pub enum OutcomeGroupAdjustment {
     SettlementRuleChange,
 }
 
-/// An outcome group lineage relation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OutcomeGroupLineageEdge {
     #[serde(rename = "predecessor")]
@@ -811,7 +728,6 @@ pub struct OutcomeGroupLineageEdge {
 }
 
 impl OutcomeGroupLineageEdge {
-    /// Validates a group lineage edge.
     pub fn new(
         predecessor: OutcomeGroupId,
         successor: OutcomeGroupId,
@@ -847,7 +763,6 @@ impl LineageRelation for OutcomeGroupLineageEdge {
     }
 }
 
-/// Why a new outcome risk pool replaced an existing one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OutcomeRiskPoolAdjustment {
     #[serde(rename = "group_membership_change")]
@@ -858,7 +773,6 @@ pub enum OutcomeRiskPoolAdjustment {
     SettlementAssetChange,
 }
 
-/// An outcome risk pool lineage relation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OutcomeRiskPoolLineageEdge {
     #[serde(rename = "predecessor")]
@@ -872,7 +786,6 @@ pub struct OutcomeRiskPoolLineageEdge {
 }
 
 impl OutcomeRiskPoolLineageEdge {
-    /// Validates a risk pool lineage edge.
     pub fn new(
         predecessor: OutcomeRiskPoolId,
         successor: OutcomeRiskPoolId,
@@ -908,7 +821,6 @@ impl LineageRelation for OutcomeRiskPoolLineageEdge {
     }
 }
 
-/// A reference to one tradable leg of a risk pool conversion.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OutcomeLegRef {
     #[serde(rename = "group")]
@@ -927,7 +839,6 @@ impl CanonicalTerms for OutcomeLegRef {
     }
 }
 
-/// One output leg of an atomic outcome conversion.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OutcomeConversionOutput {
     #[serde(rename = "leg")]
@@ -943,10 +854,6 @@ impl CanonicalTerms for OutcomeConversionOutput {
     }
 }
 
-/// An atomic outcome conversion: one input leg produces several output legs.
-///
-/// This expresses relations such as "one No converts into the Yes of every other
-/// market" without inventing a synthetic `No` token.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OutcomeConversion {
     #[serde(rename = "input")]
@@ -956,7 +863,6 @@ pub struct OutcomeConversion {
 }
 
 impl OutcomeConversion {
-    /// Normalizes the conversion: outputs are sorted by leg and de-duplicated.
     pub fn normalized(mut self) -> Result<Self, ModelError> {
         if self.outputs.is_empty() {
             return Err(ModelError::OutcomeRiskPoolUnresolved {
@@ -988,11 +894,6 @@ impl CanonicalTerms for OutcomeConversion {
     }
 }
 
-/// The canonical terms that determine an [`OutcomeRiskPoolId`].
-///
-/// The terms are the settlement asset, the id-sorted member group set and the
-/// normalized conversions with their factors. Any change creates a new pool
-/// identity instead of rewriting an existing pool.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutcomeRiskPoolTerms {
     pub settlement_asset: AssetId,
@@ -1001,7 +902,6 @@ pub struct OutcomeRiskPoolTerms {
 }
 
 impl OutcomeRiskPoolTerms {
-    /// Returns the canonical risk pool identity of these terms.
     pub fn risk_pool_id(&self) -> OutcomeRiskPoolId {
         OutcomeRiskPoolId::of_terms(self)
     }
@@ -1016,7 +916,6 @@ impl CanonicalTerms for OutcomeRiskPoolTerms {
     }
 }
 
-/// An immutable negative-risk pool over several groups.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OutcomeRiskPool {
     #[serde(rename = "id")]
@@ -1030,11 +929,6 @@ pub struct OutcomeRiskPool {
 }
 
 impl OutcomeRiskPool {
-    /// Builds and validates a risk pool.
-    ///
-    /// Members are sorted by canonical id and must be unique, every conversion
-    /// leg must reference a member group, and the conversion graph must be
-    /// acyclic.
     pub fn new(
         settlement_asset: AssetId,
         mut groups: Vec<OutcomeGroupId>,
@@ -1061,7 +955,6 @@ impl OutcomeRiskPool {
         Ok(pool)
     }
 
-    /// Validates the risk pool invariants.
     pub fn validate(&self) -> Result<(), ModelError> {
         let incomplete = |field: &'static str| ModelError::OutcomeRiskPoolIncomplete {
             pool: self.id,
@@ -1119,7 +1012,6 @@ impl OutcomeRiskPool {
         Ok(())
     }
 
-    /// Returns `true` when the group is a member of this pool.
     pub fn contains(&self, group: &OutcomeGroupId) -> bool {
         self.groups.iter().any(|candidate| candidate == group)
     }
@@ -1145,12 +1037,6 @@ struct OutcomeRiskPoolWire {
     conversions: Vec<OutcomeConversion>,
 }
 
-/// An index of the groups and risk pools that belong to one outcome event.
-///
-/// The member lists can be refreshed with a catalog generation; the group and
-/// risk pool settlement identities never change with them. The event identity
-/// itself comes from the resolution source and the source's own event
-/// identifier, so it does not drift when the index is refreshed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OutcomeEvent {
     #[serde(rename = "id")]
@@ -1166,7 +1052,6 @@ pub struct OutcomeEvent {
 }
 
 impl OutcomeEvent {
-    /// Builds an event index from its identity terms and membership.
     pub fn new(
         source: ResolutionSourceId,
         native_event: IdentifierValue,
@@ -1214,7 +1099,6 @@ struct OutcomeEventWire {
     risk_pools: Vec<OutcomeRiskPoolId>,
 }
 
-/// How one side of one member settled.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OutcomeSettlementLeg {
     #[serde(rename = "member")]
@@ -1225,10 +1109,6 @@ pub struct OutcomeSettlementLeg {
     pub settle_fraction: Fraction,
 }
 
-/// One atomic outcome settlement event.
-///
-/// The legs must cover every tradable side of the group, including sides that
-/// settle to `0`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OutcomeSettlement {
     #[serde(rename = "group")]
@@ -1242,7 +1122,6 @@ pub struct OutcomeSettlement {
 }
 
 impl OutcomeSettlement {
-    /// Validates a settlement event against its group.
     pub fn validate_against(&self, group: &OutcomeGroup) -> Result<(), ModelError> {
         require_non_negative_time(self.settled_at, "settled_at")?;
         if self.group != group.id {
@@ -1324,12 +1203,6 @@ impl OutcomeSettlement {
     }
 }
 
-/// Validates that no outcome group belongs to more than one risk pool.
-///
-/// Negative-risk conversion is a relation between groups, so a group that is a
-/// member of two pools would make the conversion graph ambiguous: the same
-/// settlement asset would back two different topologies. The registry runs this
-/// before it stages a batch.
 pub fn validate_risk_pool_membership(pools: &[OutcomeRiskPool]) -> Result<(), ModelError> {
     let mut owner: AHashMap<&OutcomeGroupId, &OutcomeRiskPoolId> = AHashMap::new();
     for pool in pools {
@@ -1345,19 +1218,11 @@ pub fn validate_risk_pool_membership(pools: &[OutcomeRiskPool]) -> Result<(), Mo
     Ok(())
 }
 
-/// Validates that a group lineage and a risk pool lineage stay in step.
-///
-/// A pool references groups by canonical identity, so whenever one of its member
-/// groups gets a successor the pool must get a successor at the same time;
-/// otherwise the successor group would silently drop out of negative-risk
-/// conversion. Pools whose members have no successor edge are unaffected.
 pub fn validate_pool_successors(
     group_edges: &[OutcomeGroupLineageEdge],
     pool_edges: &[OutcomeRiskPoolLineageEdge],
     pools: &[OutcomeRiskPool],
 ) -> Result<(), ModelError> {
-    // The predecessor set is keyed by the identity itself: an identity is a
-    // `Copy` digest now, so a set of them costs no string storage at all.
     let mut has_successor: AHashSet<OutcomeGroupId> = AHashSet::with_capacity(group_edges.len());
     for edge in group_edges {
         has_successor.insert(edge.predecessor);
@@ -1385,14 +1250,12 @@ pub fn validate_pool_successors(
     Ok(())
 }
 
-/// Validates an outcome group lineage graph.
 pub fn validate_outcome_group_lineage(edges: &[OutcomeGroupLineageEdge]) -> Result<(), ModelError> {
     validate_lineage(edges, |field| ModelError::OutcomeGroupLineageInvalid {
         field,
     })
 }
 
-/// Validates an outcome risk pool lineage graph.
 pub fn validate_outcome_risk_pool_lineage(
     edges: &[OutcomeRiskPoolLineageEdge],
 ) -> Result<(), ModelError> {
@@ -1401,7 +1264,6 @@ pub fn validate_outcome_risk_pool_lineage(
     })
 }
 
-/// Renders an outcome leg for diagnostics without exposing it to identity.
 pub fn leg_label(leg: &OutcomeLegRef) -> smol_str::SmolStr {
     smol_str::format_smolstr!("{}/{}/{}", leg.group, leg.member, leg.side)
 }
@@ -1552,9 +1414,6 @@ mod tests {
         }
     }
 
-    /// An outcome group is identified by its economic terms, so the digest of one
-    /// fixed binary group is pinned: a change to the encoded terms, to the seed,
-    /// side or member namespaces, or to the identity namespace moves this literal.
     #[test]
     fn outcome_group_identity_should_be_a_pinned_digest() {
         assert_eq!(
@@ -1682,8 +1541,6 @@ mod tests {
         assert_ne!(member.id, first.members[0].id);
     }
 
-    /// The question limit counts Unicode scalar values, not bytes, so a question
-    /// written in a multi-byte script gets the same budget as an ASCII one.
     #[test]
     fn question_should_be_limited_by_scalar_value_count() {
         let question = |scalars: usize| SmolStr::new("測".repeat(scalars));

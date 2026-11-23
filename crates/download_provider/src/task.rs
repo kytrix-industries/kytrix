@@ -1,5 +1,3 @@
-//! A download's identity, its observable state, and the events that publish it.
-
 use std::{fmt, path::PathBuf};
 
 use url::Url;
@@ -7,17 +5,14 @@ use uuid::Uuid;
 
 use crate::error::DownloadFailure;
 
-/// The identity of one download.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DownloadId(Uuid);
 
 impl DownloadId {
-    /// Creates an identity that no other download in this process shares.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
-    /// The underlying UUID.
     pub fn as_uuid(self) -> Uuid {
         self.0
     }
@@ -35,7 +30,6 @@ impl fmt::Display for DownloadId {
     }
 }
 
-/// One download as its observers see it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DownloadTask {
     pub id: DownloadId,
@@ -44,43 +38,34 @@ pub struct DownloadTask {
     pub status: DownloadStatus,
 }
 
-/// What a download is doing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DownloadStatus {
-    /// The transfer is in flight.
     Downloading {
         downloaded: u64,
         total: Option<u64>,
-        /// The rate the transfer wrote at over the interval this state was last
-        /// published at, in megabytes per second, where a megabyte is 1024 × 1024
-        /// bytes.
-        ///
-        /// It is zero while nothing arrives, so a stalled transfer reports zero
-        /// rather than its last speed.
         mb_per_second: f32,
     },
-    /// The transfer is being stopped and will settle as [`Self::Paused`].
-    Pausing { downloaded: u64, total: Option<u64> },
-    /// The transfer is stopped at a partial file, and can be resumed.
-    Paused { downloaded: u64, total: Option<u64> },
-    /// The task and its files are being removed.
+    Pausing {
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    Paused {
+        downloaded: u64,
+        total: Option<u64>,
+    },
     Deleting,
-    /// The destination file is complete.
-    Completed { downloaded: u64, total: u64 },
-    /// The transfer stopped with a failure.
-    ///
-    /// The partial file is kept when what it holds is still a resume point; a
-    /// partial file that cannot be continued — one that outgrew the entity or
-    /// the response budget — is removed.
-    Failed { failure: DownloadFailure },
+    Completed {
+        downloaded: u64,
+        total: u64,
+    },
+    Failed {
+        failure: DownloadFailure,
+    },
 }
 
-/// What changed about a download.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DownloadEvent {
-    /// The task was created or its status changed.
     TaskUpdated(DownloadTask),
-    /// The task and its files are gone.
     TaskRemoved(DownloadId),
 }
 

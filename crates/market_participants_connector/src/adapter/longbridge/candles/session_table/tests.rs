@@ -1,12 +1,3 @@
-//! What the venue's session table answers: which window an instant fell in, and where
-//! that window's grid puts its bucket.
-//!
-//! Every wall clock below is stated in the market's own zone, because that is the
-//! vocabulary the venue's session table is written in: a test that restated an instant
-//! in UTC would be asserting this build's conversion rather than the venue's windows.
-//! The two grids the venue's own published series states — the 45-minute overnight one
-//! and the regular session's hourly one — are the discriminating cases.
-
 use jiff::{civil, tz::TimeZone};
 
 use super::{
@@ -17,7 +8,6 @@ use super::{
 };
 use crate::market::timeframe::TimeFrame;
 
-/// One market-local wall time, as the zone's own instant.
 fn local(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> jiff::Zoned {
     civil::date(year, month, day)
         .at(hour, minute, 0, 0)
@@ -25,30 +15,15 @@ fn local(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> jiff::Zoned {
         .expect("the fixture wall time is a real instant")
 }
 
-/// The zone of every assertion here.
 fn zone() -> TimeZone {
     TimeZone::get(MARKET_ZONE).expect("the market zone is in the database")
 }
 
-/// The session one market-local minute falls in, with the window it matched.
-///
-/// The date is the fixture day every wall clock below is stated on: a window that
-/// runs past midnight resolves its own open against the *previous* day, which is
-/// what this helper leaves to the table.
 fn session_of(table: SessionTable, hour: i8, minute: i8, second: i8) -> Option<MatchedWindow> {
     let date = civil::date(2026, 6, 10);
     table.window_of(civil::time(hour, minute, second, 0), date, &zone())
 }
 
-/// One session is one window, and the venue's overnight session is the window that
-/// spans midnight: it opens at 20:00 and runs to 04:00 of the following morning, so
-/// the minutes either side of midnight belong to the same session.
-///
-/// The venue's own `US` entry lists it as two windows (`00:00–04:00` and
-/// `20:00–23:59:59`), and its published series is what says they are one span: the
-/// 45-minute overnight candles the live run read were `20:00 / 20:45 / 21:30 / 22:15 /
-/// 23:00 / 23:45 / 00:30`, whose successive distances are 2700 seconds across
-/// midnight. A grid that restarted at 00:00 would have published `00:00` there.
 #[test]
 fn the_overnight_session_spans_midnight() {
     let table = NORMAL_SESSION_TABLE;
@@ -76,13 +51,6 @@ fn the_overnight_session_spans_midnight() {
     );
 }
 
-/// The overnight grid is counted from the window's own open, which is on the
-/// **previous** market day: a 00:30 print belongs to the bucket that opened at 20:00
-/// plus a whole number of intervals, not to one counted from midnight.
-///
-/// The buckets asserted below are the venue's own: the live run read
-/// `20:00 / 20:45 / 21:30 / 22:15 / 23:00 / 23:45 / 00:30` from its 45-minute series,
-/// so 23:45→00:30 is 2700 seconds and 00:30 is a bucket rather than a boundary.
 #[test]
 fn the_overnight_grid_is_counted_from_the_evening_before() {
     let table = NORMAL_SESSION_TABLE;
@@ -106,9 +74,6 @@ fn the_overnight_grid_is_counted_from_the_evening_before() {
         "and 23:45, the venue's own last evening bucket, rests on the same grid"
     );
 
-    // Midnight is inside a bucket rather than the start of one: the small hours are
-    // counted from the previous evening's open, which is what the venue's own series
-    // shows.
     let after_midnight = local(2026, 6, 11, 0, 0).timestamp().as_millisecond();
     assert_eq!(
         table.fixed_bucket(local(2026, 6, 11, 0, 0), hour, &zone()),
@@ -130,8 +95,6 @@ fn the_overnight_grid_is_counted_from_the_evening_before() {
         "the fixture dates are the right way round"
     );
 
-    // The venue's own 45-minute series is the discriminating case: its last two
-    // candles are 23:45 and 00:30, and both rest on the one grid this table computes.
     let forty_five =
         fixed_interval_millis(TimeFrame::Minute45).expect("45 minutes are fixed length");
     assert_eq!(
@@ -162,8 +125,6 @@ fn the_overnight_grid_is_counted_from_the_evening_before() {
     );
 }
 
-/// An instant falls in the session the market's own clock says it does, and one
-/// outside every window has no session at all.
 #[test]
 fn the_sessions_are_the_markets_own_clock() {
     let table = NORMAL_SESSION_TABLE;
@@ -248,8 +209,6 @@ fn the_sessions_are_the_markets_own_clock() {
     );
 }
 
-/// A fixed-length bucket starts at its session's open, not at a UTC hour: the
-/// regular session's one-hour candles are 09:30, 10:30 and so on.
 #[test]
 fn a_fixed_length_bucket_starts_at_its_sessions_open() {
     let table = NORMAL_SESSION_TABLE;
@@ -271,8 +230,6 @@ fn a_fixed_length_bucket_starts_at_its_sessions_open() {
     );
     assert_eq!(next - open, hour, "and 10:30 opens the candle after it");
 
-    // A four-hour candle of the same session opens at 09:30 and 13:30, and the
-    // post session's own grid starts again at 16:00.
     let four = fixed_interval_millis(TimeFrame::Hour4).expect("four hours are fixed length");
     assert_eq!(
         table.fixed_bucket(local(2026, 6, 10, 13, 0), four, &zone()),
@@ -297,9 +254,6 @@ fn a_fixed_length_bucket_starts_at_its_sessions_open() {
     );
 }
 
-/// The half-day table replaces the whole day rather than shortening one session: the
-/// regular session ends at 13:00 and the post session starts there, so the whole
-/// afternoon is one grid that begins at 13:00 rather than two that begin at 16:00.
 #[test]
 fn the_half_day_table_starts_the_post_session_at_thirteen() {
     let hour = fixed_interval_millis(TimeFrame::Hour1).expect("an hour is fixed length");
@@ -364,8 +318,6 @@ fn the_half_day_table_starts_the_post_session_at_thirteen() {
     );
 }
 
-/// A calendar bucket is the market's own midnight: a day is the local date, a week
-/// starts on Monday, and a quarter is the first day of its three months.
 #[test]
 fn a_calendar_bucket_is_the_markets_own_boundary() {
     assert_eq!(
@@ -397,15 +349,6 @@ fn a_calendar_bucket_is_the_markets_own_boundary() {
     );
 }
 
-/// The two daylight-saving transitions of 2026 are the zone's rules rather than a
-/// fixed offset: the day a US year starts and ends its summer is still one local
-/// day, and the hour candles around it are still counted from the session's own
-/// open. This is why the adapter carries a zone database.
-///
-/// The instants below are the market's own wall times converted through the zone,
-/// and the two pairs of them are the point of the test: 09:30 on the Friday before
-/// the March transition is 14:30 UTC (EST, -05:00) while 09:30 on the Monday after it
-/// is 13:30 UTC (EDT, -04:00), and the November transition reverses the two.
 #[test]
 fn the_bucket_boundaries_follow_the_markets_daylight_saving() {
     assert_eq!(
@@ -424,9 +367,6 @@ fn the_bucket_boundaries_follow_the_markets_daylight_saving() {
         "2026-11-02T09:30 in New York is 14:30 UTC, because the offset is back to -05:00"
     );
 
-    // The bucket of each of those instants is the session's own open, whichever side
-    // of a transition it falls on — so the same wall time is a different instant and
-    // still the same bucket.
     let four = fixed_interval_millis(TimeFrame::Hour4).expect("four hours are fixed length");
     for (label, day) in [("the Friday before", 6), ("the Monday after", 9)] {
         let bucket = NORMAL_SESSION_TABLE
@@ -439,9 +379,6 @@ fn the_bucket_boundaries_follow_the_markets_daylight_saving() {
         );
     }
 
-    // A day candle is that day's own midnight, on both sides of both transitions:
-    // 2026-03-08T00:00 is 05:00 UTC (the transition happens at 02:00 local) and
-    // 2026-11-01T00:00 is 04:00 UTC.
     for (date, expected, reason) in [
         (civil::date(2026, 3, 8), 1_772_946_000_000, "05:00 UTC"),
         (civil::date(2026, 11, 1), 1_793_505_600_000, "04:00 UTC"),
@@ -468,8 +405,6 @@ fn the_bucket_boundaries_follow_the_markets_daylight_saving() {
     }
 }
 
-/// The calendar periods are the venue's own five, and every other timeframe is a
-/// fixed-length one with a duration the venue's table states.
 #[test]
 fn the_two_kinds_of_period_are_the_venues_own() {
     for (timeframe, unit) in [

@@ -1,32 +1,3 @@
-//! Painting one ETF chart.
-//!
-//! A frame is built from three parts, separated because they change at different
-//! times:
-//!
-//! - [`measure`] shapes the axis labels and answers how wide each axis has to be,
-//!   which is what the layout is built from;
-//! - [`prepare`] folds the resolved window into the boxes and points a frame draws,
-//!   using the box the layout gave it. It runs only when that box changed or a new
-//!   snapshot arrived;
-//! - [`paint`] turns those boxes into quads and those points into a line, plus the
-//!   crosshair and the tooltip, which are the only parts that follow the pointer.
-//!
-//! Everything a label *says* was written when the snapshot arrived; this module
-//! places text, it never formats it. The output is one engine [`Canvas`], because
-//! that is the engine's only self-drawing entry point: a chart's labels move with its
-//! data, and a tooltip that followed the pointer through a popover layer would escape
-//! the clipping that keeps it inside the plot.
-//!
-//! # The net-assets line is static geometry
-//!
-//! The engine has no path builder: a line is a registered mesh (`GeometryDesc`) drawn
-//! with [`GeometryDraw`](ui_core::paint::primitive::GeometryDraw). [`line_geometry`]
-//! builds that mesh — a two-pixel-wide ribbon, one quad per segment and a square at
-//! every joint — and the chart registers it once per prepared frame, releasing the
-//! previous one. The ribbon carries no anti-aliasing distance (every vertex is marked
-//! as interior), so the line is drawn with a hard edge rather than the feather the
-//! old path painter gave it; that is registered as a W3c difference.
-
 use base_ui::theme::{resolved::Theme, role::Role};
 use bytes::Bytes;
 use ui_core::{
@@ -55,64 +26,38 @@ use super::{
     units::RectExt,
 };
 
-/// One point under the pointer, and how high the pointer was.
-///
-/// The height is kept rather than the whole position: the x a hover resolves to is
-/// the reading's own, and the height is rounded to whole pixels before it is stored,
-/// so a pointer that moved a fraction of a pixel is not a change worth a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Hover {
     pub index: usize,
     pub cursor_y: f32,
 }
 
-/// What the axes need before a layout can be built.
-///
-/// Nothing is known before the first frame — no text has been shaped, so no label
-/// has a width — and that is spelled out rather than guessed at: the layout then
-/// falls back to its own minimum axis width for that one frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Measurements {
     pub left_axis_width: f32,
-    /// Absent while a single fund is shown, which is what keeps its width for the
-    /// plot.
     pub right_axis_width: Option<f32>,
 }
 
-/// The inputs one prepared frame was built from.
-///
-/// Everything a frame reads has to be in here, or a change to it would keep serving
-/// the frame from before the change: the box it was laid out in, and the revision of
-/// the resolved window — a new snapshot, another asset, another fund or another
-/// window all rebuild the data and move the revision with it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CacheKey {
     pub bounds: Rect,
     pub revision: u64,
 }
 
-/// One flow bar, already placed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PreparedBar {
     pub bounds: Rect,
     pub value: f64,
 }
 
-/// The boxes and points one frame draws, prepared from its layout.
 #[derive(Default, Debug, PartialEq)]
 pub(crate) struct PreparedFrame {
     pub bars: Box<[PreparedBar]>,
-    /// The net-asset line, when the window has more than one day to draw it over.
-    /// A day that is not a reading is `None`, which breaks the line rather than
-    /// drawing the segment across the gap.
     pub line: Option<Box<[Option<Point>]>>,
-    /// The single reading a window of one day has, which is a point rather than a
-    /// line.
     pub marker: Option<Point>,
     pub time_ticks: Box<[PositionedTimeTick]>,
 }
 
-/// Which way a label hangs off the box it is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Align {
     Left,
@@ -120,11 +65,6 @@ enum Align {
     Right,
 }
 
-/// Measures the axis labels, which is what the layout is built from.
-///
-/// Each axis is measured against everything drawn in it, its title included: a title
-/// wider than its axis would be drawn off the edge of the chart and clipped away, so
-/// the axis grows instead.
 pub(crate) fn measure(
     app: &mut App,
     data: &PreparedData,
@@ -156,7 +96,6 @@ pub(crate) fn measure(
     }
 }
 
-/// The widest label of one axis, counting its title.
 fn widest_label_width(
     app: &mut App,
     text: &mut ChartTextCache,
@@ -173,7 +112,6 @@ fn widest_label_width(
         .fold(0.0, f32::max)
 }
 
-/// Folds the resolved window into the boxes and points one frame draws.
 pub(crate) fn prepare(data: &PreparedData, layout: ChartLayout) -> PreparedFrame {
     let point_count = data.points.len();
     let mut bars = Vec::with_capacity(point_count);
@@ -243,25 +181,10 @@ pub(crate) fn prepare(data: &PreparedData, layout: ChartLayout) -> PreparedFrame
     }
 }
 
-/// The mesh of the net-asset line: a ribbon of `width` through the points.
-///
-/// A run of consecutive readings becomes one quad per segment plus a square at every
-/// joint, which is what keeps the ribbon continuous around a corner. A day that is
-/// not a reading is a break rather than a zero, so the runs on either side are drawn
-/// as separate lines — the segment across the gap is not drawn as if the gap were
-/// data.
-///
-/// Every vertex is marked as interior (a negative distance, which the engine's
-/// coverage shader reads as full coverage), because this mesh is not anti-aliased:
-/// the engine's `Ui` pipeline is a coverage-distance pipeline and a filled ribbon is
-/// its degenerate case.
 pub(crate) fn line_geometry(points: &[Option<Point>], width: f32) -> Option<GeometryDesc> {
     let half = (width / 2.0).max(0.5);
     let mut vertices = Vec::<[f32; 3]>::with_capacity(points.len() * 8);
     let mut indices = Vec::<u32>::with_capacity(points.len() * 12);
-    // The mesh's AABB is accumulated from the corners themselves rather than from
-    // rectangles: a zero-size rect is "empty" to the geometry helpers, and a union of
-    // empty rects is the last one of them.
     let mut min = Point::new(f32::INFINITY, f32::INFINITY);
     let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
     let mut push_quad = |corners: [Point; 4]| {
@@ -286,8 +209,6 @@ pub(crate) fn line_geometry(points: &[Option<Point>], width: f32) -> Option<Geom
     for slot in points.iter().chain(std::iter::once(&None)) {
         let Some(point) = *slot else {
             if run.len() == 1 {
-                // A run of one reading is a dot: a circle is not a quad, so it is
-                // drawn as the square the joint of a longer run would have.
                 push_quad(square(run[0]));
             } else {
                 for window in run.windows(2) {
@@ -338,17 +259,6 @@ pub(crate) fn line_geometry(points: &[Option<Point>], width: f32) -> Option<Geom
     })
 }
 
-/// Draws one frame of a chart into a canvas.
-///
-/// The canvas is built whole rather than patched: an engine canvas is a value, and a
-/// chart whose box, data or pointer moved is a different value. The chart keeps the
-/// last one it built and only rebuilds when [`CacheKey`] or the pointer says so.
-///
-/// The second half of the answer says whether every label reached the canvas. A line
-/// whose atlas lease died before it could be pushed is refused by the engine rather
-/// than encoded from reused texture, so the frame that ran into it is missing that run:
-/// it is not a frame the chart can keep (see [`ChartTextCache::has_stale`] for the other
-/// half of the same guard).
 pub(crate) fn paint(
     app: &mut App,
     data: &PreparedData,
@@ -378,8 +288,6 @@ pub(crate) fn paint(
     paint_bars(&mut canvas, prepared, layout.plot, theme);
     let foreground = theme.role(Role::FgDefault);
     if let Some((id, color)) = line {
-        // The mesh is registered and released by the chart, which owns the geometry
-        // store entry for as long as the canvas that draws it is the current one.
         canvas.push_geometry(GeometryDraw::full(id, Transform::IDENTITY, color));
     } else if let Some(center) = prepared.marker {
         push_quad(&mut canvas, marker_bounds(center), foreground);
@@ -401,21 +309,14 @@ pub(crate) fn paint(
     (canvas, whole)
 }
 
-/// Paints one frame with the shaped text and the theme it needs.
 struct PaintContext<'a> {
     app: &'a mut App,
     theme: &'a Theme,
     text: &'a mut ChartTextCache,
-    /// Whether every line this pass placed reached the canvas; see [`paint`].
     whole: bool,
 }
 
 impl PaintContext<'_> {
-    /// Places one line of text inside `[x, x + width]`, at the top edge `y`.
-    ///
-    /// Alignment is resolved here rather than by the shaper: a label's box is its
-    /// axis, and where inside that box it starts is what says which side of the plot
-    /// it names.
     fn text(
         &mut self,
         canvas: &mut Canvas,
@@ -436,19 +337,12 @@ impl PaintContext<'_> {
             Align::Center => x + (width - line_width) / 2.0,
             Align::Right => x + width - line_width,
         };
-        // A refused line is one whose atlas lease died between being shaped and being
-        // pushed: its glyphs have been reused, so the run is left out rather than drawn
-        // from stale texture, and the pass is not a whole frame any more.
         if !canvas.push_shaped_text(&line, Point::new(origin_x, y)) {
             self.whole = false;
         }
     }
 }
 
-/// Draws the two rules that bound the plot from above and below.
-///
-/// There is no background: the pane body behind the canvas is the background, so the
-/// chart never paints over the body's rounded corners.
 fn paint_plot_rules(canvas: &mut Canvas, layout: ChartLayout, color: Color) {
     push_quad(
         canvas,
@@ -472,10 +366,6 @@ fn paint_plot_rules(canvas: &mut Canvas, layout: ChartLayout, color: Color) {
     );
 }
 
-/// Draws the horizontal grid line of every tick of the flow axis.
-///
-/// One axis drives the grid, not two: the flow axis is the one the bars are read
-/// against, and a second set of lines a few pixels away would read as neither.
 fn paint_value_grid(canvas: &mut Canvas, data: &PreparedData, layout: ChartLayout, color: Color) {
     for tick in &data.flow.ticks {
         let y = value_y(tick.value, data.flow.domain, layout.plot);
@@ -487,11 +377,6 @@ fn paint_value_grid(canvas: &mut Canvas, data: &PreparedData, layout: ChartLayou
     }
 }
 
-/// Draws both y-axes: the title above each, and a label per tick beside it.
-///
-/// Each title sits over its own axis at the top of the chart, and the title is where
-/// the unit comes from: the numbers an axis carries are bare, so what they count and
-/// what they are counted in are written once, above the axis they belong to.
 fn paint_axes(
     canvas: &mut Canvas,
     data: &PreparedData,
@@ -502,7 +387,6 @@ fn paint_axes(
     let style = label_style(AXIS_FONT_SIZE, AXIS_LINE_HEIGHT, color);
     let title_y = layout.content.origin.y + 2.0;
     let inset = AXIS_TICK_TEXT_INSET;
-    // The flow axis is the one every chart of a flow has, whatever is selected.
     context.text(
         canvas,
         data.left_axis_title.as_str(),
@@ -513,8 +397,6 @@ fn paint_axes(
         &style,
     );
     paint_value_axis(canvas, &data.flow, AxisSide::Left, layout, context, &style);
-    // The net-asset axis is the one only the whole complex has: a single fund has a
-    // flow but no assets of its own to report.
     if let Some(scale) = data.net_assets.as_ref() {
         context.text(
             canvas,
@@ -529,19 +411,12 @@ fn paint_axes(
     }
 }
 
-/// Which side of the plot a y-axis is on, which is what says where its labels go.
 #[derive(Clone, Copy)]
 enum AxisSide {
     Left,
     Right,
 }
 
-/// Draws one y-axis: a label per tick, beside the line that tick draws.
-///
-/// The two axes of a chart share the plot's rows but not their values, so each is
-/// labelled from its own scale: the flow is read against the left axis and the net
-/// assets against the right, and a reader who mixed them up would be off by
-/// whatever the two happen to differ by.
 fn paint_value_axis(
     canvas: &mut Canvas,
     scale: &AxisScale,
@@ -573,7 +448,6 @@ fn paint_value_axis(
     }
 }
 
-/// Draws the date of every labelled position under the plot.
 fn paint_time_axis(
     canvas: &mut Canvas,
     ticks: &[PositionedTimeTick],
@@ -598,17 +472,10 @@ fn paint_time_axis(
     }
 }
 
-/// Draws every bar of the window.
-///
-/// Bars are a presentation layer: later bars may cover earlier ones when slots are
-/// dense, and the canvas draws them in the series order, so the later day is the one
-/// on top — the order the series is read in.
 fn paint_bars(canvas: &mut Canvas, prepared: &PreparedFrame, plot: Rect, theme: &Theme) {
     let muted = theme.role(Role::MarketFlat);
     for bar in &prepared.bars {
         let color = flow(theme, bar.value, muted);
-        // A bar is a slice of the plot: one that reaches past the edge (a value at
-        // the very end of the axis) is drawn clipped, like the old content mask did.
         let clipped = bar.bounds.intersect(plot);
         if clipped.is_empty() {
             continue;
@@ -617,12 +484,6 @@ fn paint_bars(canvas: &mut Canvas, prepared: &PreparedFrame, plot: Rect, theme: 
     }
 }
 
-/// Draws the crosshair: a dashed line down the hovered day.
-///
-/// The line stands where the reading does, and nowhere else: a hover is about the day
-/// under the pointer, so a line that also followed the pointer's own height would move
-/// with the hand rather than with the data. The pointer's height is still what the
-/// tooltip hangs from, which is the one thing about it a reader needs.
 fn paint_crosshair(
     canvas: &mut Canvas,
     index: usize,
@@ -639,10 +500,6 @@ fn paint_crosshair(
     }
 }
 
-/// Draws the square at the hovered reading and the tooltip that names it.
-///
-/// The marker sits on the net-asset line, which is the series the hover follows;
-/// the flow of the same day is the bar the crosshair already stands on.
 fn paint_hover(
     canvas: &mut Canvas,
     data: &PreparedData,
@@ -672,7 +529,6 @@ fn paint_hover(
     );
 }
 
-/// Draws the tooltip of one day: the date, its flow, and what the funds hold.
 fn paint_tooltip(
     canvas: &mut Canvas,
     data: &PreparedData,
@@ -728,21 +584,11 @@ fn paint_tooltip(
                 Align::Left,
                 line_style,
             );
-            // The next run of the line starts where this one ended, which is the only
-            // placement a line drawn in more than one colour can use: the two runs are
-            // one reading, not two columns.
             cursor_x += width;
         }
     }
 }
 
-/// The lines one tooltip shows, and the colour each run of a line is drawn in.
-///
-/// A tooltip is the window's own surface rather than a colour of the chart's, so
-/// it is drawn in the two colours the framework draws its own tooltip in. Only a
-/// day's flow is more than one colour: what the day did is read in the tooltip's own
-/// text colour, and the amount it moved keeps the colour the bar under it is drawn
-/// in.
 pub(crate) fn tooltip_lines<'a>(
     point: &'a PreparedPoint,
     show_net_assets: bool,
@@ -781,7 +627,6 @@ fn paint_tooltip_surface(canvas: &mut Canvas, bounds: Rect, style: TooltipStyle,
     });
 }
 
-/// Pushes one solid quad.
 fn push_quad(canvas: &mut Canvas, bounds: Rect, fill: Color) {
     canvas.push_quad(Quad {
         bounds,

@@ -1,13 +1,7 @@
-//! ③ CJK 排版：四条脚本样例 + 一段中英混排自动换行
-//!
-//! 引擎的字体栈（`FontStack::system_ui`）显式列出 CJK 家族，缺字形时继续往后找；本模块只给文本与
-//! 宽度，断行 / 光栅 / 图集全部由文本 pass 完成。集成测试断言**没有** `MissingGlyph`（豆腐块）。
-
 use ui_core::{app::App, math::Rect, node::id::NodeId, text::TextStyle, window::WindowId};
 
 use super::{MUTED_RGBA, TEXT_RGBA, card, color, text_style};
 
-/// 单行脚本样例（顺序即绘制序）。
 const SAMPLES: [&str; 4] = [
     "简体中文：布局由 taffy 计算，字形由 swash 光栅化，支持中英混排。",
     "繁體中文：斷行依 Unicode 規則處理全形標點，例如「引號」與、頓號。",
@@ -15,10 +9,8 @@ const SAMPLES: [&str; 4] = [
     "한국어: 포커스, 입력기, 접근성을 하나의 트리에서 다룹니다.",
 ];
 
-/// 中英混排 + 全角标点的自动换行段落（544px 内应折成多行）。
 const MIXED: &str = "混排断行：Kytrix GUI 用 Parley 的 Unicode 断行，中英混排与全角标点（，。！？）都能正确换行；这一段在 544px 内自动折行，不出现豆腐块。";
 
-/// 建 CJK 样例（无交互；不参与 Tab 序）。
 pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId) {
     for (index, sample) in SAMPLES.iter().enumerate() {
         let y = 40.0 + index as f32 * 26.0;
@@ -47,7 +39,6 @@ pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId) {
 mod tests {
     use super::{MIXED, SAMPLES};
 
-    /// 粗略的 CJK 判定：CJK 统一表意文字 / 扩展 A / 假名 / 谚文 / CJK 标点。
     fn is_cjk(character: char) -> bool {
         matches!(
             character as u32,
@@ -101,8 +92,6 @@ mod showcase_tests {
             .as_ref()
             .expect("提交帧必须有绘制快照");
 
-        // 混排段落：卡片 x + 18 起、宽 544；只数 CJK 卡片里的字形 run，否则右侧 ④ 卡片
-        // 同 y 区间的状态/提示文字也会被算进来。
         let card = crate::scene::CJK_CARD;
         let lower = card.origin.y + 142.0;
         let upper = lower + 44.0;

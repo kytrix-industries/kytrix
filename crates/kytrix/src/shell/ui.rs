@@ -1,10 +1,3 @@
-//! Node-building helpers shared by the shell's views.
-//!
-//! The shell builds one persistent node subtree per region and keeps the handles it needs
-//! to synchronize it, so these helpers are the small vocabulary every region speaks: a
-//! themed box, a themed label, an icon, a separator, and the queue actions are reported
-//! through. Nothing here owns state.
-
 use std::{cell::RefCell, rc::Rc};
 
 use base_ui::{
@@ -28,17 +21,12 @@ use ui_core::{
 
 use super::intent::{Intent, IntentQueue};
 
-/// The window's node tree.
-///
-/// # Errors
-/// The window is gone.
 pub(crate) fn tree(app: &mut App, window: WindowId) -> Result<&mut NodeTree, EngineError> {
     app.window_mut(window)
         .ok_or(EngineError::UnknownWindow { window })
         .map(|target| target.tree_mut())
 }
 
-/// A plain container.
 pub(crate) fn container(
     app: &mut App,
     window: WindowId,
@@ -50,7 +38,6 @@ pub(crate) fn container(
         .build(tree(app, window)?, parent)
 }
 
-/// A container with a debug id.
 pub(crate) fn named(
     app: &mut App,
     window: WindowId,
@@ -61,7 +48,6 @@ pub(crate) fn named(
     named_owned(app, window, parent, SmolStr::new_static(id), style)
 }
 
-/// A container with a debug id built at run time (a row's workspace name, for instance).
 pub(crate) fn named_owned(
     app: &mut App,
     window: WindowId,
@@ -75,7 +61,6 @@ pub(crate) fn named_owned(
         .build(tree(app, window)?, parent)
 }
 
-/// A label with a debug id of its own.
 pub(crate) fn label_named(
     app: &mut App,
     window: WindowId,
@@ -93,12 +78,10 @@ pub(crate) fn label_named(
     Ok(wrapper)
 }
 
-/// The fill a role resolves to in the appearance showing now.
 pub(crate) fn color(theme: &ThemeHandle, app: &App, role: Role) -> Color {
     theme.theme_for(theme.current(app)).role(role)
 }
 
-/// A box painted from a theme role, following appearance changes.
 pub(crate) fn themed_box(
     app: &mut App,
     window: WindowId,
@@ -119,7 +102,6 @@ pub(crate) fn themed_box(
         .build(tree(app, window)?, parent)
 }
 
-/// A label whose colour follows the appearance.
 pub(crate) fn label(
     app: &mut App,
     window: WindowId,
@@ -143,7 +125,6 @@ pub(crate) fn label(
     )
 }
 
-/// A label on a node tree that is already borrowed (row factories).
 pub(crate) fn themed_label(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -166,7 +147,6 @@ pub(crate) fn themed_label(
     .build(tree, parent)
 }
 
-/// A horizontal separator with a themed colour.
 pub(crate) fn separator_horizontal(
     app: &mut App,
     window: WindowId,
@@ -177,7 +157,6 @@ pub(crate) fn separator_horizontal(
     Separator::horizontal(theme.clone()).build(tree, parent)
 }
 
-/// The window's backdrop: the canvas role, painted below everything the window shows.
 pub(crate) fn window_backdrop(
     app: &mut App,
     window: WindowId,
@@ -214,15 +193,12 @@ pub(crate) fn window_backdrop(
     Ok(())
 }
 
-/// The intents every control of the shell reports, shared by the views.
 pub(crate) type Intents = Rc<RefCell<IntentQueue>>;
 
-/// A fresh intent queue.
 pub(crate) fn intents() -> Intents {
     Rc::new(RefCell::new(IntentQueue::default()))
 }
 
-/// Reports `intent` and asks for the frame that applies it.
 pub(crate) fn report(ctx: &mut ActionCtx<'_>, queue: &Intents, intent: Intent) {
     queue.borrow_mut().push(intent);
     let window = ctx.window();

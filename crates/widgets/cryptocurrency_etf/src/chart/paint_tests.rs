@@ -1,6 +1,3 @@
-//! What one frame is prepared from, and what the shaped labels cost: the bars, the
-//! line, the time ticks, the hover, and the mesh the line is drawn as.
-
 use base_ui::theme::{appearance::Appearance, resolved::Theme};
 use smol_str::SmolStr;
 use ui_core::{
@@ -245,7 +242,6 @@ fn the_line_mesh_should_cover_every_segment_and_joint() {
     assert_eq!(desc.vertex_stride, GeometryPipeline::Ui.vertex_stride());
     assert_eq!(desc.index_type, IndexType::U32);
     assert_eq!(desc.topology, Topology::TriangleList);
-    // Two segments + three joints, one quad each: 4 vertices and 6 indices each.
     assert_eq!(desc.vertex_bytes.len(), 5 * 4 * 12);
     assert_eq!(desc.index_bytes.len(), 5 * 6 * 4);
     assert!(desc.bounds.size.width >= 20.0, "{:?}", desc.bounds);
@@ -261,7 +257,6 @@ fn the_line_mesh_should_break_where_a_day_is_not_a_reading() {
     ];
     let desc = line_geometry(&points, LINE_WIDTH).expect("two runs of one point each");
 
-    // Two single-reading runs: one square each.
     assert_eq!(desc.vertex_bytes.len(), 2 * 4 * 12);
 }
 

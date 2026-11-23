@@ -1,18 +1,3 @@
-//! wave-6 状态/布局/命中热路径基准（criterion；**非合并门禁**）。
-//!
-//! 三项对应审查报告里"状态写入 / 布局后置 / 命中测试不得回退"的行为面：
-//!
-//! - `state_write_*`：`App::write`（等值短路 → 失效传播 → 唤醒位）的固定成本；
-//! - `layout_single_change_10k`：10k 节点树里改**一个**叶子后的增量布局（taffy cache +
-//!   wave-6 的增量子树包络维护，B9）；
-//! - `hit_test_grid_10k`：10k 节点网格（100 行 × 100 列）中心点的命中测试（子树包络剪枝）。
-//!
-//! **可复现性**：headless（无 renderer）、输入全字面量、fixture 在 `iter_batched` 的 setup 段
-//! （**不计时**）。采样 50 samples / 1 s warmup / 3 s 测量，与 `perf.rs` 同口径。
-//!
-//! 本文件**同时**能在 wave-6 之前的分支上编译（只用两版都存在的公开 API），
-//! 因此可以直接对比"整改前/后"的数值（见整改报告的基准表）。
-
 use std::{hint::black_box, time::Duration};
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -25,10 +10,8 @@ use ui_core::{
     window::{WindowId, WindowOptions},
 };
 
-/// 逻辑视口（固定，避免窗口尺寸影响布局/命中成本）。
 const VIEWPORT: Size = Size::new(1000.0, 1000.0);
 
-/// 网格：100 行 × 100 列 = 10k 个 8×8 节点。
 const GRID_SIDE: usize = 100;
 const CELL: f32 = 8.0;
 
@@ -61,7 +44,6 @@ fn fixed(width: f32, height: f32) -> ui_core::paint::style::Style {
     }
 }
 
-/// 建 100 行 × 100 列的网格（行是 column flex，列是 row flex）。
 fn mount_grid(app: &mut App, window: WindowId) -> Vec<NodeId> {
     let root = app.window(window).expect("window").tree().root();
     let mut leaves = Vec::with_capacity(GRID_SIDE * GRID_SIDE);
@@ -89,7 +71,6 @@ fn benches(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
 
-    // ── 状态写入：无读者（最短路径：等值短路失败 → store 写 → 反查表空） ──
     {
         let (mut app, _window) = fixture(rt.handle());
         let signal: ui_core::node::signal::Signal<u32> = app.signal(0);
@@ -102,15 +83,12 @@ fn benches(c: &mut Criterion) {
         });
     }
 
-    // ── 状态写入：一个读者（失效传播 → 标脏 → 唤醒位） ──
     {
         let (mut app, window) = fixture(rt.handle());
         let signal: ui_core::node::signal::Signal<SmolStr> = app.signal(SmolStr::new_static("0"));
         let root = app.window(window).expect("window").tree().root();
         let _node = NodeBuilder::boxed()
             .bind_style(move |cx| StylePatch {
-                // `clone().len()` 而不是 `*read(...)`：让同一份基准源码在 wave-6 前后都能编译
-                // （旧 API 返回 T，新 API 返回 `SignalRef<T>`，两者都能 `.clone()`）。
                 opacity: Some(cx.read(&signal).clone().len() as f32),
                 ..StylePatch::default()
             })
@@ -126,7 +104,6 @@ fn benches(c: &mut Criterion) {
         });
     }
 
-    // ── 布局：10k 节点网格里改一个叶子的高度（不推挤任何兄弟） ──
     {
         let (mut app, window) = fixture(rt.handle());
         let leaves = mount_grid(&mut app, window);
@@ -151,7 +128,6 @@ fn benches(c: &mut Criterion) {
         });
     }
 
-    // ── 命中：10k 节点网格的中心点（子树包络剪枝） ──
     {
         let (mut app, window) = fixture(rt.handle());
         let _ = mount_grid(&mut app, window);

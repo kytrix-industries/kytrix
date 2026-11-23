@@ -1,20 +1,3 @@
-//! The pane's interface tests: the state machine, the body it draws, and the
-//! controls it offers, driven through the framework's headless host.
-//!
-//! # How a pane is built here
-//!
-//! The pane's source is the Kytrix service connection, which no headless host can
-//! construct (the connector still needs the toolkit's context — design §13.9 R-1), so
-//! the tests build the widget directly over the crate's [`FakeSource`] and drive its
-//! hooks themselves: `load`, `sync`, `body`, `header`, `release`. The host still
-//! supplies everything else the application would — the injected services, the
-//! composition-root singletons, the engine, the frame pipeline — so nothing here
-//! reaches a global.
-//!
-//! A test that needs a *live* service drives the host's current-thread runtime
-//! ([`settle`]): one runtime turn, one `sync`, one frame, until the thing it is
-//! waiting for happened. Nothing sleeps and no wall clock moves.
-
 use std::{rc::Rc, sync::Arc};
 
 use app_config::{
@@ -50,11 +33,8 @@ use crate::{
     test_support::{ACCOUNT, COLLECTED_AT, FakeSource, FetchPlan, empty_snapshot, row, snapshot},
 };
 
-/// How many runtime/frame turns a [`settle`] may take before it calls the test a
-/// failure.
 const SETTLE_TURNS: usize = 64;
 
-/// The translator the product ships: what these tests assert is the catalogue's copy.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -62,7 +42,6 @@ fn product_translate(language: LanguageCode) -> Translate {
     )
 }
 
-/// The framework's headless host, over the product catalogue.
 fn harness() -> WidgetTestApp {
     WidgetTestApp::with_translate(product_translate(LanguageCode::En))
 }
@@ -77,7 +56,6 @@ fn write_config(harness: &mut WidgetTestApp, config: Config) -> bool {
     harness.app_mut().write(&signal, config)
 }
 
-/// Signs `user_id` in the way the composition root does: a settings write.
 fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
     let mut config = current_config(harness);
     config.account = Some(AccountConfig {
@@ -91,17 +69,12 @@ fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
     );
 }
 
-/// Signs the pane out the way the composition root does: a settings write.
-///
-/// A host that has nobody signed in already is not a change, and that is fine: the
-/// write is idempotent, and every fixture starts from the host's own settings.
 fn sign_out(harness: &mut WidgetTestApp) {
     let mut config = current_config(harness);
     config.account = None;
     let _ = write_config(harness, config);
 }
 
-/// Replaces the display time zone the way the settings screen does.
 fn set_data_time_zone(harness: &mut WidgetTestApp, hours: i8) {
     let mut config = current_config(harness);
     config.data_time_zone = DataTimeZone::from_hours(hours).expect("the offset is offered");
@@ -111,8 +84,6 @@ fn set_data_time_zone(harness: &mut WidgetTestApp, hours: i8) {
     );
 }
 
-/// A host node with a real box: the body is `size_full`, so it needs a parent that
-/// has a size before the gauge can be laid out.
 fn body_parent(harness: &mut WidgetTestApp) -> NodeId {
     harness.with_cx(|cx| {
         let root = cx.tree().root();
@@ -124,7 +95,6 @@ fn body_parent(harness: &mut WidgetTestApp) -> NodeId {
     })
 }
 
-/// A pane the framework would have built, driven by a fake source.
 struct Pane {
     widget: CoinMarketCapFearAndGreedIndexWidget,
     status: WidgetStatus,
@@ -156,7 +126,6 @@ fn pane(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
     pane_in_scope(harness, scope, source)
 }
 
-/// A pane over a source, scoped to `account` (or to nobody).
 fn pane_for(harness: &mut WidgetTestApp, account: Option<&str>, source: FakeSource) -> Pane {
     match account {
         Some(account) => sign_in(harness, account),
@@ -175,7 +144,6 @@ fn sync(harness: &mut WidgetTestApp, pane: &mut Pane) {
         .expect("the pane syncs");
 }
 
-/// Builds the body the framework would build once the pane has content.
 fn build_body(harness: &mut WidgetTestApp, pane: &mut Pane) {
     let parent = pane.parent;
     harness
@@ -183,20 +151,12 @@ fn build_body(harness: &mut WidgetTestApp, pane: &mut Pane) {
         .expect("the body builds");
 }
 
-/// One production-shaped round: lay the tree out, let the pane synchronize against
-/// it, and present what it wrote.
-///
-/// The layout pass comes first because the gauge reads its canvas' measured box: a
-/// `sync` before the first layout has no box to draw into (the same one-frame
-/// ordering the framework's own pump has).
 fn frame(harness: &mut WidgetTestApp, pane: &mut Pane) {
     harness.drain();
     sync(harness, pane);
     harness.drain();
 }
 
-/// Lets the host's runtime deliver what the fake source published, and the pane the
-/// frames it asked for, until `ready` holds.
 fn settle(
     harness: &mut WidgetTestApp,
     pane: &mut Pane,
@@ -220,7 +180,6 @@ fn key() -> CoinMarketCapFearAndGreedIndexStreamKey {
     }
 }
 
-/// Reports a snapshot as the stream would.
 fn report_snapshot(
     harness: &mut WidgetTestApp,
     pane: &mut Pane,
@@ -237,7 +196,6 @@ fn report_snapshot(
     })
 }
 
-/// Reports the failure the stream would.
 fn report_failure(harness: &mut WidgetTestApp, pane: &mut Pane) -> bool {
     harness.with_cx(|cx| {
         pane.widget.apply_reliable(
@@ -252,7 +210,6 @@ fn report_failure(harness: &mut WidgetTestApp, pane: &mut Pane) -> bool {
     })
 }
 
-/// The failure the pane published.
 fn published_failure(harness: &WidgetTestApp, pane: &Pane) -> Failure {
     pane.status
         .state(harness.app())
@@ -261,7 +218,6 @@ fn published_failure(harness: &WidgetTestApp, pane: &Pane) -> Failure {
         .expect("a failure should be published")
 }
 
-/// The reading of `snapshot(current)` as a later poll collected it.
 fn recollected(current: u8, collected_at: i64) -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
     Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
         collected_at,
@@ -269,7 +225,6 @@ fn recollected(current: u8, collected_at: i64) -> Arc<CoinMarketCapFearAndGreedI
     })
 }
 
-/// A snapshot of `current` with two rows missing, so a test can see the dash.
 fn partial(current: u8) -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
     let mut partial = (*snapshot(current)).clone();
     partial.yesterday = None;
@@ -282,7 +237,6 @@ fn found(harness: &WidgetTestApp, pane: &Pane, selector: &str) -> Option<NodeId>
     harness.find_by_debug_prefix(pane.parent, selector)
 }
 
-/// The canvas the gauge drew on.
 fn gauge_canvas(harness: &WidgetTestApp, pane: &Pane) -> Arc<Canvas> {
     let node = found(harness, pane, GAUGE_SELECTOR).expect("the gauge is drawn");
     match harness.tree().get(node).expect("the node exists").kind() {
@@ -302,7 +256,6 @@ fn path_count(canvas: &Canvas) -> usize {
         .count()
 }
 
-/// The fill of each band, in draw order.
 fn band_fills(canvas: &Canvas) -> Vec<ui_core::paint::color::Color> {
     primitives(canvas)
         .into_iter()
@@ -313,7 +266,6 @@ fn band_fills(canvas: &Canvas) -> Vec<ui_core::paint::color::Color> {
         .collect()
 }
 
-/// What the scale's five roles resolve to in `theme`.
 fn band_colours(theme: &base_ui::theme::resolved::Theme) -> Vec<ui_core::paint::color::Color> {
     [
         Role::FearGreedExtremeFear,
@@ -343,8 +295,6 @@ fn glyph_run_count(canvas: &Canvas) -> usize {
         .count()
 }
 
-/// The score's font size the gauge would use for `bounds`, so a test can assert the
-/// text really is sized from the band rather than from the canvas height.
 fn node_bounds(harness: &WidgetTestApp, node: NodeId) -> ui_core::math::Rect {
     harness
         .tree()
@@ -353,8 +303,6 @@ fn node_bounds(harness: &WidgetTestApp, node: NodeId) -> ui_core::math::Rect {
         .layout()
         .bounds
 }
-
-// ── identity, copy, and the pure helpers ────────────────────────────────────────
 
 #[test]
 fn the_widget_should_have_a_stable_identity() {
@@ -384,8 +332,6 @@ fn the_pane_should_persist_nothing() {
     );
 }
 
-/// A missing key is an empty string on screen rather than an error, so a gap in the
-/// interface is what a typo looks like: this is the test that turns it into a failure.
 #[test]
 fn every_message_this_pane_shows_should_resolve_to_text() {
     let translate = product_translate(LanguageCode::En);
@@ -472,8 +418,6 @@ fn a_row_without_a_reading_should_draw_a_dash_rather_than_nothing() {
     );
 }
 
-// ── the state machine ──────────────────────────────────────────────────────────
-
 #[test]
 fn a_pane_without_an_account_should_ask_for_one() {
     let mut harness = harness();
@@ -540,9 +484,6 @@ fn a_snapshot_should_be_drawn_as_content() {
     );
 }
 
-/// The reading the pane draws is what it compares: a later poll of an index that has
-/// not moved carries a new collection time but the same pixels, so it is not a frame
-/// and the allocation it replaced is kept.
 #[test]
 fn a_snapshot_that_changed_nothing_should_not_ask_for_a_frame() {
     let mut harness = harness();
@@ -585,9 +526,6 @@ fn a_snapshot_that_changed_nothing_should_not_ask_for_a_frame() {
     ));
 }
 
-/// An uncollected answer draws 「暂无数据」, so the first collected answer is a change
-/// even when its rows are still the empty defaults: the empty state goes away, and
-/// the pane has to keep the collected answer rather than the old one.
 #[test]
 fn a_collected_answer_should_replace_an_empty_one_with_the_same_rows() {
     let mut harness = harness();
@@ -625,8 +563,6 @@ fn a_collected_answer_should_replace_an_empty_one_with_the_same_rows() {
     ));
 }
 
-/// A refresh is one command and one answer: even when the answer draws exactly what
-/// is already on screen, it still ends the wait and re-enables the header's control.
 #[test]
 fn an_unchanged_answer_should_end_a_pending_refresh() {
     let mut harness = harness();
@@ -657,8 +593,6 @@ fn an_unchanged_answer_should_end_a_pending_refresh() {
     assert!(!pane.widget.refresh_is_disabled(harness.app()));
 }
 
-/// A retry keeps the reading and reports `Connecting`, so the answer that draws the
-/// same is still the answer that finishes it.
 #[test]
 fn an_unchanged_answer_should_still_finish_a_retry() {
     let mut harness = harness();
@@ -791,8 +725,6 @@ fn a_snapshot_from_another_account_should_be_ignored() {
     assert!(!pane.widget.has_content());
 }
 
-/// Another account is another scope: the answer the pane is showing was served to
-/// the previous one, so the settings write that moves the account drops it.
 #[test]
 fn another_account_should_take_the_reading_with_it() {
     let mut harness = harness();
@@ -837,8 +769,6 @@ fn another_account_should_take_the_reading_with_it() {
     assert!(pane.widget.current_key().is_none());
 }
 
-/// Another account is another read: what the new account is owed is fetched for it,
-/// and signing out takes the reading away.
 #[test]
 fn an_account_change_should_read_the_new_account() {
     let mut harness = harness();
@@ -886,11 +816,6 @@ fn an_account_change_should_read_the_new_account() {
     );
 }
 
-/// The answer to a command this pane replaced is not the answer to the command now in
-/// flight. Changing the account replaces the `Load` (and `sync` drains after that), so
-/// the replaced command's failure arrives when the new account's read is waiting: it
-/// has to be dropped — counted as late — rather than reported as the new pane's
-/// failure, which would leave the pane terminal until the user recovered it.
 #[test]
 fn an_answer_to_a_replaced_load_should_not_fail_the_pane() {
     let mut harness = harness();
@@ -939,8 +864,6 @@ fn an_answer_to_a_replaced_load_should_not_fail_the_pane() {
     );
 }
 
-/// A refresh is one command and one answer, and the control is closed between them:
-/// the service refuses a second command while one is in flight.
 #[test]
 fn a_refresh_should_close_the_control_until_the_answer_arrives() {
     let mut harness = harness();
@@ -1019,8 +942,6 @@ fn a_refused_refresh_should_be_reported_as_a_failure() {
     harness.with_cx(|cx| {
         pane.widget.refresh(cx).expect("the refresh is sent");
         assert!(pane.widget.refresh_is_disabled(cx.app()));
-        // The pane issued a `Load` (identity 1) and then this refresh (identity 2);
-        // the service refuses the refresh it was given.
         pane.widget.apply_rpc(
             RequestId::new(2),
             Err(RpcCallError::Service {
@@ -1054,8 +975,6 @@ fn a_refused_refresh_should_be_reported_as_a_failure() {
     assert_eq!(failure.action().label_key(), "common.retry");
 }
 
-/// A host that installed no Kytrix service connection cannot answer a reading, and
-/// says so through the same typed failure every other failure uses.
 #[test]
 fn a_host_without_the_service_connection_should_report_a_failure() {
     let mut harness = harness();
@@ -1072,11 +991,6 @@ fn a_host_without_the_service_connection_should_report_a_failure() {
     assert!(!failure.text(&harness.services().translate).is_empty());
 }
 
-// ── the body: rows, empty state, and the gauge canvas ─────────────────────────
-
-/// A missing row is drawn as a dash rather than as a missing snapshot: the pane is
-/// content, the gauge is drawn, and the six rows are in the tree with a dash where a
-/// reading is absent.
 #[test]
 fn a_snapshot_with_missing_rows_should_draw_six_rows_and_dashes() {
     let mut harness = harness();
@@ -1152,8 +1066,6 @@ fn a_snapshot_with_missing_rows_should_draw_six_rows_and_dashes() {
     }
 }
 
-/// Nothing collected yet is a healthy empty answer: the body says so, and no gauge is
-/// drawn from a reading that does not exist.
 #[test]
 fn an_empty_snapshot_should_say_there_is_no_data_instead_of_drawing_a_gauge() {
     let mut harness = harness();
@@ -1210,8 +1122,6 @@ fn an_empty_snapshot_should_say_there_is_no_data_instead_of_drawing_a_gauge() {
     );
 }
 
-/// The gauge is one canvas frame: the five bands as triangle meshes, the ten end caps
-/// and the indicator as circles, and the two text lines as shaped glyph runs.
 #[test]
 fn a_collected_reading_should_draw_the_gauge_frame() {
     let mut harness = harness();
@@ -1274,10 +1184,6 @@ fn a_collected_reading_should_draw_the_gauge_frame() {
     }
 }
 
-/// The two decorative icons are drawn at the 12 px the reference drew them
-/// (`Icon::size_3()`): the section headings' info icon and the header's refresh icon.
-/// Both sit in a `Small` control, whose icon step is 8 px, so the size has to be asked
-/// for explicitly — the reference decoupled the icon from the control's size step.
 #[test]
 fn the_two_decorative_icons_should_keep_the_reference_size() {
     let mut harness = harness();
@@ -1294,8 +1200,6 @@ fn the_two_decorative_icons_should_keep_the_reference_size() {
         .expect("the header builds");
     frame(&mut harness, &mut pane);
 
-    // The card's children are the gauge, the first heading, its rows, the second
-    // heading and its rows; a heading's children are its label and its info icon.
     let body = found(&harness, &pane, BODY_SELECTOR).expect("the body is built");
     let card = harness.tree().get(body).expect("the body node").children()[0];
     let heading = harness.tree().get(card).expect("the card node").children()[1];
@@ -1310,7 +1214,6 @@ fn the_two_decorative_icons_should_keep_the_reference_size() {
         "the heading's info icon is drawn at the reference's 12 px"
     );
 
-    // The control's node wraps the kit button, whose first child is its icon.
     let control = found(&harness, &pane, REFRESH_SELECTOR).expect("the refresh control");
     let button = harness
         .tree()
@@ -1329,8 +1232,6 @@ fn the_two_decorative_icons_should_keep_the_reference_size() {
     );
 }
 
-/// The reading walks across the half circle: a higher score puts the dot further
-/// right, which is the one thing a test can read out of a painted frame.
 #[test]
 fn the_indicator_should_move_with_the_reading() {
     let mut harness = harness();
@@ -1363,8 +1264,6 @@ fn the_indicator_should_move_with_the_reading() {
     );
 }
 
-/// The theme's fear-and-greed ramp is what colours the bands and the dot, and the
-/// level's name is the default foreground.
 #[test]
 fn the_gauge_should_read_its_colours_from_the_theme() {
     let mut harness = harness();
@@ -1393,9 +1292,6 @@ fn the_gauge_should_read_its_colours_from_the_theme() {
     assert_eq!(*fill, theme.role(Role::FgDefault));
 }
 
-/// The colours a frame is drawn in are part of what the prepared frame was made from,
-/// so switching to the dark appearance has to prepare it again — a canvas that kept
-/// the light roles would be a pane drawn in the theme the user just left.
 #[test]
 fn a_dark_appearance_should_repaint_the_gauge() {
     let mut harness = harness();
@@ -1435,8 +1331,6 @@ fn a_dark_appearance_should_repaint_the_gauge() {
     );
 }
 
-/// A new reading redraws the values, not the tree: the body is built once and every
-/// changing value is a binding on nodes that stay where they are.
 #[test]
 fn a_new_reading_should_not_rebuild_the_body() {
     let mut harness = harness();
@@ -1466,8 +1360,6 @@ fn a_new_reading_should_not_rebuild_the_body() {
     );
 }
 
-/// A row that loses or gains its reading changes shape (no dot, no level name), so
-/// the row nodes are replaced rather than re-bound.
 #[test]
 fn a_missing_row_should_come_and_go_with_the_reading() {
     let mut harness = harness();
@@ -1504,7 +1396,6 @@ fn a_missing_row_should_come_and_go_with_the_reading() {
     assert!(found(&harness, &pane, MISSING_YESTERDAY).is_none());
 }
 
-/// A steady frame does no work: nothing is written, so no frame is asked for (I3).
 #[test]
 fn a_steady_frame_should_do_no_work() {
     let mut harness = harness();
@@ -1533,11 +1424,6 @@ fn a_steady_frame_should_do_no_work() {
     );
 }
 
-/// A steady frame keeps the canvas it is drawn from rather than preparing it again.
-///
-/// The request count above cannot see this: `Window::set_canvas` writes a node's canvas
-/// without asking for a frame, so a pane that rebuilt its canvas every frame would look
-/// quiet. The canvas' own identity is what says whether it was replaced.
 #[test]
 fn a_steady_canvas_should_be_kept() {
     let mut harness = harness();
@@ -1566,12 +1452,6 @@ fn a_steady_canvas_should_be_kept() {
     );
 }
 
-// ── language, time zone, and the info notes ────────────────────────────────────
-
-/// A level's name and the notes beside the headings are resolved on the frame that
-/// draws them, and the gauge keeps its prepared text until that text, the reading or
-/// the canvas changes — so a language change has to redraw the pane and rebuild that
-/// prepared frame.
 #[test]
 fn a_language_change_should_redraw_the_level_name_in_the_new_language() {
     let mut harness = harness();
@@ -1617,8 +1497,6 @@ fn a_language_change_should_redraw_the_level_name_in_the_new_language() {
     assert!(body.contains("贪婪"), "the row's level follows: {body}");
 }
 
-/// The stand-in's copy is a build-time string, so the language switch rebuilds it
-/// (the same rule the surface follows for its notices).
 #[test]
 fn the_empty_stand_in_should_follow_the_language() {
     let mut harness = harness();
@@ -1650,7 +1528,6 @@ fn the_empty_stand_in_should_follow_the_language() {
     );
 }
 
-/// A tooltip's content is a resolved sentence, so the language switch replaces it.
 #[test]
 fn the_info_notes_should_follow_the_language() {
     let mut harness = harness();
@@ -1707,8 +1584,6 @@ fn the_info_notes_should_follow_the_language() {
     );
 }
 
-/// A row's date is the UTC calendar day the service generated, not a calendar value:
-/// the display time zone must not move it to a day the service did not name.
 #[test]
 fn the_display_time_zone_should_not_move_a_service_date() {
     let mut harness = harness();
@@ -1738,10 +1613,6 @@ fn the_display_time_zone_should_not_move_a_service_date() {
     );
 }
 
-// ── the header control ────────────────────────────────────────────────────────
-
-/// The click sends a refresh command, not a reload: the pane stays `Ready`, keeps the
-/// reading on screen and waits for the answer it asked for.
 #[test]
 fn the_header_should_refresh_without_starting_over() {
     let mut harness = harness();
@@ -1822,8 +1693,6 @@ fn the_header_should_refresh_without_starting_over() {
     );
 }
 
-/// The control is drawn disabled while the first answer is outstanding, and the
-/// action's entry guard is what keeps its click from reaching the service.
 #[test]
 fn a_disabled_refresh_should_not_forward_a_click() {
     let mut harness = harness();
@@ -1862,10 +1731,6 @@ fn a_disabled_refresh_should_not_forward_a_click() {
     );
     assert_eq!(pane.status.state(harness.app()), WidgetState::Connecting);
 
-    // The kit control guards its own dispatch while it is drawn disabled, so the
-    // click above cannot reach the pane's handler at all. The action's entry guard is
-    // the pane's own defence for a dispatch that bypasses the control (an AT
-    // activation, a programmatic call): it is asserted at the seam it protects.
     harness
         .with_cx(|cx| pane.widget.refresh(cx))
         .expect("a refused refresh is not an engine failure");
@@ -1875,8 +1740,6 @@ fn a_disabled_refresh_should_not_forward_a_click() {
     );
     assert_eq!(source.fetch_count(), 1);
 }
-
-// ── release, and two panes ────────────────────────────────────────────────────
 
 fn with_scope<R>(
     harness: &mut WidgetTestApp,
@@ -1889,9 +1752,6 @@ fn with_scope<R>(
     body(&mut cx)
 }
 
-/// Release takes everything the widget owns: the service bridge, the header
-/// component's handler and scope, the tooltips, the canvas' registered meshes, and
-/// its own nodes.
 #[test]
 fn release_should_take_everything_down() {
     let mut harness = harness();
@@ -1945,8 +1805,6 @@ fn release_should_take_everything_down() {
     assert!(pane.widget.tooltips.iter().all(Option::is_none));
 }
 
-/// Taking the card down (an uncollected answer replacing a collected one) gives the
-/// meshes back: they are not scoped to a window, so nothing else would.
 #[test]
 fn a_card_that_goes_away_should_release_its_geometries() {
     let mut harness = harness();
@@ -1971,11 +1829,6 @@ fn a_card_that_goes_away_should_release_its_geometries() {
     );
 }
 
-/// A redraw registers the five meshes of the frame it prepared and gives the five of
-/// the frame it replaced back. The store is process-wide rather than scoped to a
-/// window, so a redraw that did not return them would grow it by five per reading —
-/// and nothing would ever give them back, because the widget only holds the newest
-/// frame.
 #[test]
 fn changing_the_reading_should_keep_five_meshes_alive() {
     let mut harness = harness();
@@ -2009,8 +1862,6 @@ fn changing_the_reading_should_keep_five_meshes_alive() {
     );
 }
 
-/// Two panes in one application mint two header identities: the keys carry the
-/// instance's signal scope, so each pane's click reaches its own widget.
 #[test]
 fn two_panes_should_mint_different_header_keys_and_keep_both_handlers() {
     let mut harness = harness();

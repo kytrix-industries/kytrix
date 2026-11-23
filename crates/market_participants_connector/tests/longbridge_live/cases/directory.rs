@@ -1,10 +1,3 @@
-//! The catalog cases: a dotted symbol, and the Nasdaq directory the venue's listings are
-//! read from (§6.1–§6.4; §14.1 items 8 and 11).
-//!
-//! The directory cases download the market participant's own files and apply the design's filter to
-//! them, so what they assert is the state of the published directory rather than this
-//! build's reading of it. The parser here is the suite's own restatement of §6.2.
-
 use bytes::Bytes;
 use longbridge_proto::quote::{Direction, Period, SecurityCandlestickResponse};
 use prost::Message as _;
@@ -20,12 +13,10 @@ use crate::{
     wire::{Failure, GET_SECURITY_HISTORY_CANDLESTICKS},
 };
 
-/// The Nasdaq symbol directory the venue's catalog is built from (§6.1).
 const NASDAQ_SYMBOL_DIRECTORY: &str = "https://www.nasdaqtrader.com/dynamic/SymDir/";
 const NASDAQ_LISTED_FILE: &str = "nasdaqlisted.txt";
 const OTHER_LISTED_FILE: &str = "otherlisted.txt";
 
-/// One row of one Nasdaq symbol file, before the design's filter.
 struct DirectoryRow {
     code: String,
     name: String,
@@ -36,14 +27,12 @@ struct DirectoryRow {
     kept: bool,
 }
 
-/// One downloaded directory file.
 struct Downloaded {
     body: Bytes,
     bytes: usize,
     rows: usize,
 }
 
-/// Downloads one symbol file, bounded by the case's own timeout.
 async fn download(client: &Client, file: &'static str, case: &str) -> Downloaded {
     let url = url::Url::parse(NASDAQ_SYMBOL_DIRECTORY)
         .and_then(|base| base.join(file))
@@ -71,7 +60,6 @@ async fn download(client: &Client, file: &'static str, case: &str) -> Downloaded
         body,
     }
 }
-/// Case 13 — a dotted symbol (§6.3; §14.1 item 8).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_13_a_dotted_symbol_is_accepted_or_refused_on_the_record() {
@@ -124,8 +112,6 @@ async fn live_case_13_a_dotted_symbol_is_accepted_or_refused_on_the_record() {
             Err(error) => panic!("{case}: {error}"),
         }
 
-        // The control: the same command for a symbol with no dot, so a refusal of
-        // the dotted one can be told apart from a broken request.
         let control = socket
             .request_raw(
                 GET_SECURITY_HISTORY_CANDLESTICKS,
@@ -178,15 +164,11 @@ async fn live_case_13_a_dotted_symbol_is_accepted_or_refused_on_the_record() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 14 — the Nasdaq directory (§6.1–§6.4).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_14_the_nasdaq_directory_downloads_and_filters_as_designed() {
     let case = "case 14 (directory)";
     timeout(CASE_TIMEOUT, async {
-        // The directory belongs to the market participant that publishes it, not to the venue,
-        // so this case needs no credential — but it still takes the run's own route,
-        // which the first case to hold credentials establishes.
         let transport = match Credentials::load() {
             Some(credentials) => chosen_transport(&credentials).await,
             None => Transport::Direct,
@@ -305,11 +287,7 @@ async fn live_case_14_the_nasdaq_directory_downloads_and_filters_as_designed() {
     .await
     .expect("the case must finish inside its own bound");
 }
-// ---------------------------------------------------------------------------
-// Directory parsing (§6.1–§6.4)
-// ---------------------------------------------------------------------------
 
-/// One row of one Nasdaq symbol file, before the design's filter.
 fn parse_directory(file: &str, body: &[u8], is_nasdaq: bool) -> Vec<DirectoryRow> {
     const NASDAQ_HEADER: &str = "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares";
     const OTHER_HEADER: &str =

@@ -1,10 +1,3 @@
-//! The fakes the news tests answer through.
-//!
-//! They are the seam both the service and the pane read through, so they are shared rather
-//! than copied: what a pane's tests need to control is the same subscription the service's
-//! tests refuse, hold and close, and what a pane's tests need to hear is the same play a
-//! machine with an output device would make.
-
 use std::{
     collections::VecDeque,
     sync::{
@@ -27,10 +20,8 @@ use crate::{
     sound::NotificationSound,
 };
 
-/// The account every fixture scope belongs to.
 pub(crate) const ACCOUNT: &str = "test-account";
 
-/// One reported item.
 pub(crate) fn event(timestamp: i64) -> NewsEvent {
     NewsEvent {
         timestamp,
@@ -40,11 +31,6 @@ pub(crate) fn event(timestamp: i64) -> NewsEvent {
     }
 }
 
-/// A feed a test grows the way a subscription does.
-///
-/// Each snapshot shares the items it inherited from the one before it, which is what
-/// makes a later report an edit to a list rather than a new set of rows: a test that
-/// built every snapshot from scratch would describe a feed whose items are all new.
 pub(crate) struct FakeFeed {
     state: NewsState,
 }
@@ -56,7 +42,6 @@ impl FakeFeed {
         }
     }
 
-    /// Retains one reported item and hands back the feed it produced.
     pub(crate) fn push(&mut self, timestamp: i64) -> NewsSnapshot {
         self.state.push(event(timestamp));
         self.snapshot()
@@ -78,20 +63,12 @@ struct FakeState {
     subscriptions: usize,
 }
 
-/// What the next `subscribe_news` call finds.
 enum FakeSetup {
-    /// A live subscription.
     Ready(FakeSubscription),
-    /// A refusal, the way a session without the entitlement answers.
     Failed(KytrixServiceError),
-    /// A setup that never answers, so the caller's cancellation is the only way out.
     Blocked(Arc<OperationBlock>),
 }
 
-/// One live subscription inside the fake source.
-///
-/// It is named by the crate because it is the associated type the source's own seam
-/// publishes it as.
 pub(crate) struct FakeSubscription {
     events: mpsc::Receiver<Result<NewsEvent, TransportError>>,
     status: watch::Sender<SubscriptionStatus>,
@@ -104,16 +81,12 @@ impl Drop for FakeSubscription {
     }
 }
 
-/// One live subscription, as a test drives it.
 pub(crate) struct FakeSubscriptionControl {
     pub events: mpsc::Sender<Result<NewsEvent, TransportError>>,
     pub status: watch::Sender<SubscriptionStatus>,
-    /// How many times this subscription has been dropped, which is how a test sees the
-    /// service let go of an account it no longer follows.
     pub drops: Arc<AtomicUsize>,
 }
 
-/// One operation a fake source can be held inside.
 #[derive(Default)]
 pub(crate) struct OperationBlock {
     started: Notify,
@@ -151,7 +124,6 @@ impl OperationBlock {
 }
 
 impl FakeSource {
-    /// Queues one live subscription.
     pub(crate) fn subscribe(&self) -> FakeSubscriptionControl {
         let (events, receiver) = mpsc::channel(16);
         let (status, _) = watch::channel(SubscriptionStatus::Active);
@@ -170,7 +142,6 @@ impl FakeSource {
         }
     }
 
-    /// Queues a refusal, the way a session without news access answers.
     pub(crate) fn refuse_entitlement(&self) {
         self.refuse(KytrixServiceError::Server(ErrorCode::EntitlementRequired));
     }
@@ -179,7 +150,6 @@ impl FakeSource {
         self.state().setups.push_back(FakeSetup::Failed(error));
     }
 
-    /// Queues a subscription setup that never answers.
     pub(crate) fn block(&self) -> Arc<OperationBlock> {
         let block = Arc::new(OperationBlock::default());
         self.state()
@@ -188,7 +158,6 @@ impl FakeSource {
         block
     }
 
-    /// How many subscriptions the service has asked for.
     pub(crate) fn subscriptions(&self) -> usize {
         self.state().subscriptions
     }
@@ -239,15 +208,9 @@ impl NewsEventSubscription for FakeSubscription {
     }
 }
 
-/// What a pane asked of its sound, in the order it asked.
-///
-/// Whether a clip would be audible is the machine's business, so this answers for a device
-/// that is always there and records the plays instead: what a pane decides is whether to ask.
 #[derive(Default)]
 pub(crate) struct RecordedSound {
     plays: AtomicUsize,
-    /// The device a pane reads, which is there from the start: a sound that is not one the
-    /// pane may be heard on is what the tests that say so send through it.
     available: AtomicBool,
 }
 
@@ -259,12 +222,10 @@ impl RecordedSound {
         sound
     }
 
-    /// How many plays the pane asked for.
     pub(crate) fn plays(&self) -> usize {
         self.plays.load(Ordering::SeqCst)
     }
 
-    /// Says whether this sound is one a device could be heard on.
     pub(crate) fn set_available(&self, available: bool) {
         self.available.store(available, Ordering::SeqCst);
     }

@@ -1,5 +1,3 @@
-//! The trading capability: the only place a command becomes an order.
-
 use std::sync::Arc;
 
 use market_participants_model::{
@@ -22,7 +20,6 @@ use crate::{
     protocol::{RequestIdentity, classify},
 };
 
-/// Trading capability handle backed by the shared market-participants runtime.
 pub struct TradingCapability {
     inner: Arc<MarketParticipantsConnectorInner>,
 }
@@ -40,7 +37,6 @@ impl TradingCapability {
         Self { inner }
     }
 
-    /// Returns the current ticker of one listing.
     pub async fn ticker(&self, listing: &VenueListingKey) -> Result<ListingTicker, TradingError> {
         let resolved = self.resolve_listing(listing)?;
         let response = self
@@ -61,7 +57,6 @@ impl TradingCapability {
         }
     }
 
-    /// Places one order against the listing it names.
     pub async fn place_order(&self, command: PlaceOrderCommand) -> Result<OrderId, TradingError> {
         let resolved = self.resolve_listing(&command.listing)?;
         command
@@ -90,7 +85,6 @@ impl TradingCapability {
         }
     }
 
-    /// Cancels one order of the listing it names.
     pub async fn cancel_order(&self, command: CancelOrderCommand) -> Result<OrderId, TradingError> {
         let resolved = self.resolve_listing(&command.listing)?;
         command
@@ -112,12 +106,6 @@ impl TradingCapability {
         }
     }
 
-    /// Changes the position mode of one venue account.
-    ///
-    /// No adapter implements this operation yet, so the request reaches the
-    /// adapter dispatcher and fails there. A successful dispatch therefore means
-    /// the request was routed to a handler that cannot honour it, which is
-    /// reported as a protocol error.
     pub async fn set_position_mode(
         &self,
         command: SetPositionModeCommand,
@@ -133,7 +121,6 @@ impl TradingCapability {
         Err(Self::protocol_error("set position mode"))
     }
 
-    /// Changes the margin mode of one listing. See [`Self::set_position_mode`].
     pub async fn set_margin_mode(&self, command: SetMarginModeCommand) -> Result<(), TradingError> {
         let resolved = self.resolve_listing(&command.listing)?;
         command
@@ -151,7 +138,6 @@ impl TradingCapability {
         Err(Self::protocol_error("set margin mode"))
     }
 
-    /// Changes the leverage of one listing. See [`Self::set_position_mode`].
     pub async fn set_leverage(&self, command: SetLeverageCommand) -> Result<(), TradingError> {
         let resolved = self.resolve_listing(&command.listing)?;
         command
@@ -171,7 +157,6 @@ impl TradingCapability {
         Err(Self::protocol_error("set leverage"))
     }
 
-    /// Resolves one listing into the value a command validates against.
     fn resolve_listing(&self, listing: &VenueListingKey) -> Result<ResolvedListing, TradingError> {
         self.inner
             .catalog()

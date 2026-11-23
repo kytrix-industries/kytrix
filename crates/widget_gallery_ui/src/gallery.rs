@@ -1,90 +1,3 @@
-//! The widget gallery: the page in which a pane's widget is chosen.
-//!
-//! The gallery is a page rather than a window dialog: the workspace overlay embeds it
-//! and owns what happens to a choice, while the gallery only reports one. It is built
-//! from the registry rather than from a list of its own — the categories are
-//! [`WidgetCategory::ALL`] and the widgets of a category are the registered widgets
-//! that declare it and may be chosen — so a widget added to the catalogue appears here
-//! without anything being written here. The one registration that is not listed is the
-//! widget a pane falls back to: the framework builds it, the user never picks it, and
-//! it is the pane's starting point rather than an answer to this page.
-//!
-//! # The page is engine nodes and kit components
-//!
-//! There is no render function and no rebuild-every-frame tree: [`WidgetGallery::mount`]
-//! builds one persistent subtree, a route registered with the application's
-//! [`FrameRouter`](widget::frame::FrameRouter) synchronizes it every frame, and only what
-//! actually changed is rebuilt:
-//!
-//! - the search field and the decision buttons are kit components, owned by the page and
-//!   released with it; the category filter in the sidebar is kit buttons too;
-//! - the catalogue rows are rebuilt when the search, the category, the language or the
-//!   catalogue itself changes — never otherwise;
-//! - the widget selected in the catalogue is mounted as a live preview in the right-hand
-//!   pane through [`GalleryCatalogue`]; selecting another widget releases the previous
-//!   preview first, so a page moved through its catalogue holds at most one widget
-//!   instance;
-//! - the whole page is released in one call: preview, kit components, keyboard bindings,
-//!   action handlers, nodes and the page's signal scope.
-//!
-//! # Where the services come from
-//!
-//! A widget may not build its own collaborators, and neither may this page: the
-//! application's one [`WidgetServices`] aggregate is passed in. Its
-//! [`Layer`](base_ui::kit::layer::Layer), [`FrameRouter`](widget::frame::FrameRouter) and
-//! [`AnimationRouter`](base_ui::kit::overlay::AnimationRouter) are the composition root's
-//! single instances — the preview widgets mounted here register their routes on the same
-//! router the page does, and every kit component a preview builds resolves the same layer
-//! and completion router. The page never constructs a second one.
-//!
-//! # i18n
-//!
-//! Every user-visible sentence is a catalogue key resolved with `t_smol!`. A language
-//! switch does not re-report anything: the page notices the injected language signal in
-//! its next sync and rebuilds the components whose text is baked in at build time (the
-//! search field, the category buttons, the decision buttons and the rows) while the
-//! preview keeps running — a widget resolves its own copy on the frame that draws it.
-//!
-//! # What the page holds across frames
-//!
-//! Only what the user has done in it: the widget selected, the search text and the
-//! category filter. The page opens on the widget the pane is already showing, so opening
-//! it on a pane that has one is opening it on the answer that pane already has.
-//!
-//! # What a selection means
-//!
-//! Selecting a row previews that widget and changes what a confirmation would carry; the
-//! pane's widget is not touched until the confirmation leaves this page. Cancelling
-//! therefore changes nothing, and the confirm control refuses to confirm while nothing is
-//! selected.
-//!
-//! # Where the search narrows
-//!
-//! The field searches the whole catalogue rather than one category: a section a search
-//! leaves empty is not drawn, and a search that matches nothing is drawn as a search that
-//! found nothing rather than as a page with nothing on it. A widget matches when its
-//! localized name or the description in the language the page is drawn in contains the
-//! text, case-insensitively. The category filter narrows within that.
-//!
-//! # Where the keyboard goes
-//!
-//! The page takes the keyboard when it opens — the search field is focused, so typing
-//! narrows the catalogue at once — and holds it for as long as it is open: Escape and
-//! Enter are the page's own keys and Tab keeps the keyboard in the field. The bindings are
-//! scoped to the page's own root node, so they only fire while the keyboard is inside the
-//! page; the pane behind it keeps its own bindings. The page is also the only owner of its
-//! window's text and IME events while it has the focus, which it hands to the search
-//! field — the kit input has no binding face of its own. A pointer press in the catalogue
-//! chooses a row rather than moving the keyboard, so what the reader types after a click
-//! still narrows the list.
-//!
-//! # What the page reports
-//!
-//! A confirmation and a cancellation are [`WidgetGalleryEvent`]s, read back with
-//! [`WidgetGallery::take_event`]. The page does not close itself and does not know what is
-//! behind it: what a confirmation changes, and whether the page goes away, belongs to
-//! whoever embedded it.
-
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -130,62 +43,35 @@ use widget::{
 
 use crate::{catalogue::GalleryCatalogue, widget_icon};
 
-/// The size of a widget's icon in the catalogue rows.
 const ICON_SIZE: f32 = 20.0;
 
-/// The height of one row: icon, name, description and the selection mark.
 const ROW_HEIGHT: f32 = 56.0;
 
-/// The vertical gap between two rows and the height of one category heading.
 const ROW_GAP: f32 = 4.0;
 const HEADING_HEIGHT: f32 = 20.0;
 
-/// The gap between a category heading and its first row.
 const HEADING_GAP: f32 = 8.0;
 
-/// The gap between two categories.
 const CATEGORY_GAP: f32 = 16.0;
 
-/// The width of the field the gallery is searched with.
 const SEARCH_WIDTH: f32 = 240.0;
 
-/// The width of the sidebar that filters the catalogue by category.
 const SIDEBAR_WIDTH: f32 = 168.0;
 
-/// The width of the preview pane.
 const PREVIEW_WIDTH: f32 = 320.0;
 
-/// The padding around the catalogue's content column.
 const CONTENT_PADDING: f32 = 16.0;
 
-/// The width of the selection mark at the right of a row.
 const MARK_SIZE: f32 = 14.0;
 
-/// How many galleries this process has built, so two pages never share a component key.
-///
-/// kit keys are application-level action identities (`"<key>.click"`), so two pages that
-/// used the same constant key would overwrite each other's handlers — the second page's
-/// click would run the first page's callback, and releasing either would remove the
-/// other's handler. This counter is what the page's key prefix comes from; the same page
-/// keeps its prefix for its whole life, so rebuilds and releases pair up.
 static NEXT_PAGE: AtomicU64 = AtomicU64::new(1);
 
-/// What a choice made in the gallery is.
-///
-/// It is the page's whole output: [`WidgetGalleryEvent::Confirm`] carries the widget the
-/// user selected and [`WidgetGalleryEvent::Cancel`] is the user leaving without choosing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WidgetGalleryEvent {
-    /// The user confirmed the selection.
     Confirm(WidgetId),
-    /// The user cancelled, by pressing the cancel control or Escape.
     Cancel,
 }
 
-/// The key prefix of one gallery page.
-///
-/// Every engine debug id and every kit action identity the page builds is derived from it,
-/// which is what lets two pages live in one application without colliding.
 #[derive(Clone, Debug)]
 struct GalleryKeys {
     prefix: SmolStr,
@@ -199,22 +85,15 @@ impl GalleryKeys {
         }
     }
 
-    /// The key of one control inside the page.
     fn control(&self, suffix: &str) -> SmolStr {
         format_smolstr!("{}.{suffix}", self.prefix)
     }
 
-    /// The action identity of one element inside the page.
     fn action(&self, suffix: &str) -> Action {
         Action::Custom(self.control(suffix))
     }
 }
 
-/// The kit components whose text is baked in at build time.
-///
-/// A language switch releases them and builds them again in the new language
-/// (`crates/widgets/AGENTS.md` §15.1); everything with a binding face (the header copy,
-/// the preview title, the preview hint) is not here.
 struct Chrome {
     input: InputNode,
     categories: Vec<(WidgetCategory, Button)>,
@@ -222,16 +101,11 @@ struct Chrome {
     confirm: Button,
 }
 
-/// One catalogue row the page built: the node a click lands on and the widget it names.
 struct Row {
     node: NodeId,
     widget: WidgetId,
 }
 
-/// What the row list was built against.
-///
-/// The page rebuilds the list only when this changes; a steady frame compares it and
-/// returns, so an idle gallery asks for no nodes (I3).
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RowsBuilt {
     query: SmolStr,
@@ -239,7 +113,6 @@ struct RowsBuilt {
     language: LanguageCode,
 }
 
-/// Everything one mounted page owns.
 struct GalleryCore {
     window: WindowId,
     keys: GalleryKeys,
@@ -248,19 +121,14 @@ struct GalleryCore {
     theme: ThemeHandle,
     translate: Translate,
     scope: SignalScope,
-    /// The page's root node; keyboard bindings are scoped to it.
     panel: NodeId,
-    /// The stable containers whose children a language rebuild replaces.
     header: NodeId,
     sidebar: NodeId,
     footer: NodeId,
-    /// The stable catalogue viewport and the node the rows are built into.
     content: NodeId,
     scroll: Option<ScrollHandle>,
     scrollbar: ScrollBar,
-    /// The stable preview pane: the host for the mounted surface.
     preview_host: NodeId,
-    /// The page's own state.
     selection: Signal<Option<WidgetId>>,
     input_state: Signal<InputState>,
     placeholder: Signal<SmolStr>,
@@ -273,20 +141,15 @@ struct GalleryCore {
     rows: Vec<Row>,
     rows_by_node: HashMap<NodeId, WidgetId>,
     chrome: Option<Chrome>,
-    /// The mounted preview and the selection it was mounted for.
     preview: Option<AnyWidget>,
     preview_selection: Option<WidgetId>,
-    /// What a host reads back.
     event: Option<WidgetGalleryEvent>,
-    /// The page's frame route, unregistered on release.
     route: Option<widget::frame::RouteId>,
-    /// The page's key actions, whose handlers are removed on release.
     actions: Vec<Action>,
     released: bool,
 }
 
 impl GalleryCore {
-    /// Builds one page under `parent` and registers its frame route.
     fn mount(
         app: &mut App,
         window: WindowId,
@@ -312,9 +175,6 @@ impl GalleryCore {
             .into_iter()
             .filter(WidgetDescriptor::selectable)
             .collect::<Vec<_>>();
-        // The page opens on the widget the pane is showing, when it is still an answer the
-        // catalogue offers. A pane showing the framework's fallback opens with nothing
-        // selected: there is no answer of the user's to preselect.
         let selected = current.filter(|current| entries.iter().any(|entry| entry.id() == current));
         app.write(&selection, selected.clone());
 
@@ -468,8 +328,6 @@ impl GalleryCore {
             let entries = core.entries.clone();
             core.rebuild_rows(app, &entries)?;
             core.route = Some(register_route(&weak, &core.services));
-            // The page opens with the caret in the field, so the reader narrows the
-            // catalogue by typing rather than by finding the field first.
             let input = core.chrome.as_ref().map(|chrome| chrome.input.root);
             if let Some(input) = input {
                 app.set_focus(window, Some(input));
@@ -479,11 +337,6 @@ impl GalleryCore {
         Ok(WidgetGallery { core })
     }
 
-    /// Binds the page's own keys, scoped to its root node.
-    ///
-    /// The bindings only fire while the keyboard is inside the page's subtree; the pane
-    /// behind the page keeps its own bindings. The returned actions are kept by the page so
-    /// releasing it removes their handlers.
     fn bind_actions(
         &mut self,
         app: &mut App,
@@ -551,8 +404,6 @@ impl GalleryCore {
                     let mut core = core.borrow_mut();
                     core.select(ctx.app_mut(), widget);
                 }
-                // A pointer press chooses a row; it does not move the keyboard out of the
-                // field, so what the reader types next still narrows the list.
                 if let Some(input) = input {
                     ctx.app_mut().set_focus(window, Some(input));
                 }
@@ -579,7 +430,6 @@ impl GalleryCore {
         Ok(vec![cancel, confirm, focus_search, row])
     }
 
-    /// Builds the language-dependent chrome: search field, category buttons, decisions.
     fn build_chrome(
         &mut self,
         app: &mut App,
@@ -640,8 +490,6 @@ impl GalleryCore {
                             core.chrome.as_ref().map(|chrome| chrome.input.root)
                         };
                         let _ = ctx.app_mut().request_repaint(window);
-                        // Filtering is a press in the sidebar; the caret stays in the field
-                        // so the reader can keep narrowing by typing.
                         if let Some(input) = input {
                             ctx.app_mut().set_focus(window, Some(input));
                         }
@@ -713,7 +561,6 @@ impl GalleryCore {
         Ok(())
     }
 
-    /// Replaces the chrome after a language switch.
     fn rebuild_chrome(
         &mut self,
         app: &mut App,
@@ -744,7 +591,6 @@ impl GalleryCore {
         Ok(())
     }
 
-    /// Rebuilds the row list for the current query, filter and language.
     fn rebuild_rows(
         &mut self,
         app: &mut App,
@@ -840,7 +686,6 @@ impl GalleryCore {
         }
     }
 
-    /// Tells the scroll container how tall the catalogue became.
     fn update_scroll_content(&mut self, app: &mut App, height: f32) {
         if let Some(handle) = self.scroll
             && let Err(error) = app.set_scroll_content(&handle, Size::new(1.0, height))
@@ -849,8 +694,6 @@ impl GalleryCore {
         }
     }
 
-    /// Puts the catalogue back to the top: what the reader was looking at was the list the
-    /// old search left.
     fn reset_scroll(&mut self, app: &mut App) {
         if let Some(handle) = self.scroll
             && let Err(error) = app.scroll_to(&handle, Point::new(0.0, 0.0))
@@ -859,7 +702,6 @@ impl GalleryCore {
         }
     }
 
-    /// Selects one widget of the catalogue.
     fn select(&mut self, app: &mut App, widget: WidgetId) {
         let current = { (*app.read(&self.selection)).clone() };
         if current.as_ref() == Some(&widget) {
@@ -869,7 +711,6 @@ impl GalleryCore {
         app.write(&self.selection, Some(widget));
     }
 
-    /// Narrows the catalogue to one category, or clears the filter when it is already set.
     fn toggle_filter(&mut self, category: WidgetCategory) {
         self.filter = if self.filter == Some(category) {
             None
@@ -878,12 +719,10 @@ impl GalleryCore {
         };
     }
 
-    /// Records the page's one pending report.
     fn emit(&mut self, event: WidgetGalleryEvent) {
         self.event = Some(event);
     }
 
-    /// The page's one frame hook: the part of the page that changes between frames.
     fn sync(
         &mut self,
         app: &mut App,
@@ -923,11 +762,6 @@ impl GalleryCore {
         Ok(())
     }
 
-    /// Forwards this window's text, key and IME events to the search field.
-    ///
-    /// The kit input has no binding face: its owner drains the platform events and hands
-    /// them to the field, which consumes the ones aimed at the focused input. Pointer,
-    /// focus and size events stay in the queue — the engine already dispatched them.
     fn drain_input_events(&mut self, app: &mut App) {
         if !self.has_focus(app) {
             return;
@@ -946,11 +780,6 @@ impl GalleryCore {
         let search = self.chrome.as_ref().map(|chrome| chrome.input.root);
         let mut forward = Vec::with_capacity(events.len());
         for (_, event) in events {
-            // Enter in the focused search field is the page's confirmation. The engine
-            // spends Enter on the focused node's activation before scoped bindings are
-            // consulted, so the page takes it from the event queue instead of from a
-            // binding — the field's caret is in the page, and confirming is what Enter
-            // means there.
             if let Event::Input(InputEvent::Key {
                 code: KeyCode::Enter | KeyCode::NumpadEnter,
                 state: ui_core::event::KeyState::Down,
@@ -979,7 +808,6 @@ impl GalleryCore {
         }
     }
 
-    /// Whether the keyboard is inside the page's subtree.
     fn has_focus(&self, app: &App) -> bool {
         let Some(focused) = app.focused(self.window) else {
             return false;
@@ -998,7 +826,6 @@ impl GalleryCore {
         false
     }
 
-    /// Keeps the components that only paint state in step with the page's state.
     fn sync_chrome(&mut self, app: &mut App) {
         let no_selection = app.read(&self.selection).is_none();
         let filter = self.filter;
@@ -1013,7 +840,6 @@ impl GalleryCore {
         let _ = scrollbar.sync(app);
     }
 
-    /// Mounts the selected widget as the preview, releasing whatever was previewed before.
     fn sync_preview(&mut self, app: &mut App) -> Result<(), EngineError> {
         let selection = app.read(&self.selection).clone();
         if selection == self.preview_selection {
@@ -1041,7 +867,6 @@ impl GalleryCore {
         }
     }
 
-    /// Releases everything the page owns.
     fn release(&mut self, app: &mut App) -> usize {
         if self.released {
             return 0;
@@ -1067,10 +892,6 @@ impl GalleryCore {
     }
 }
 
-/// Registers the page's frame route on the application's one router.
-///
-/// The route holds a weak reference: a page that is dropped without being released stops
-/// being synchronized instead of keeping itself alive through the router.
 fn register_route(
     weak: &Weak<RefCell<GalleryCore>>,
     services: &Rc<WidgetServices>,
@@ -1084,28 +905,12 @@ fn register_route(
     })
 }
 
-/// A mounted page.
-///
-/// The host embeds [`WidgetGallery::panel`] where the page belongs, reads
-/// [`WidgetGallery::take_event`] after frames, and calls [`WidgetGallery::release`] when
-/// the page goes away. The page synchronizes itself: it registers a route on the
-/// application's frame router when it is mounted, and removes it when it is released.
 #[derive(Clone)]
 pub struct WidgetGallery {
     core: Rc<RefCell<GalleryCore>>,
 }
 
 impl WidgetGallery {
-    /// Builds the gallery under `parent` over the application's services and catalogue.
-    ///
-    /// `current` is the widget the pane has now, which is selected when the catalogue
-    /// still offers it. The page registers itself on the services' frame router and takes
-    /// the keyboard into its search field.
-    ///
-    /// # Errors
-    ///
-    /// The engine's node errors when the page cannot be built under `parent` (a window that
-    /// is gone, a parent that is not in its tree).
     pub fn mount(
         app: &mut App,
         window: WindowId,
@@ -1117,31 +922,25 @@ impl WidgetGallery {
         GalleryCore::mount(app, window, parent, services, catalogue, current)
     }
 
-    /// The page's root node: where the host embeds it.
     #[must_use]
     pub fn panel(&self) -> NodeId {
         self.core.borrow().panel
     }
 
-    /// Takes the one report the page made, if any.
     pub fn take_event(&self) -> Option<WidgetGalleryEvent> {
         self.core.borrow_mut().event.take()
     }
 
-    /// The widget a confirmation would carry.
     #[must_use]
     pub fn selection(&self) -> Option<WidgetId> {
         self.core.borrow().selected.clone()
     }
 
-    /// Whether the page has been released.
     #[must_use]
     pub fn is_released(&self) -> bool {
         self.core.borrow().released
     }
 
-    /// Releases the preview, the kit components, the keyboard bindings, the nodes and the
-    /// page's signal scope. Idempotent.
     pub fn release(&self, app: &mut App) -> usize {
         let mut core = self.core.borrow_mut();
         if core.released {
@@ -1171,16 +970,12 @@ impl std::fmt::Debug for WidgetGallery {
     }
 }
 
-// ── node builders ───────────────────────────────────────────────────────────────────────
-
-/// The window's node tree.
 fn tree(app: &mut App, window: WindowId) -> &mut NodeTree {
     app.window_mut(window)
         .expect("the gallery's window exists")
         .tree_mut()
 }
 
-/// Builds a container under `parent` with `style`.
 fn build_container(
     app: &mut App,
     window: WindowId,
@@ -1192,11 +987,6 @@ fn build_container(
         .build(tree(app, window), parent)
 }
 
-/// Removes every child of `node`, leaving the node itself in place.
-///
-/// Removing a node also clears the scoped keyboard bindings and the action declarations it
-/// carried, which is why the page rebuilds by clearing and re-adding rather than by keeping
-/// dead nodes around.
 fn clear_children(app: &mut App, window: WindowId, node: NodeId) {
     let children = app
         .window(window)
@@ -1208,7 +998,6 @@ fn clear_children(app: &mut App, window: WindowId, node: NodeId) {
     }
 }
 
-/// The page's root: the surface colour, a row of the catalogue column and the preview pane.
 fn build_panel(
     app: &mut App,
     window: WindowId,
@@ -1234,10 +1023,6 @@ fn build_panel(
         .build(tree(app, window), parent)
 }
 
-/// The page's header: what it is for and the field it is searched with.
-///
-/// The search field itself is built with the rest of the language-dependent chrome; the
-/// header node is stable and a language rebuild replaces its children.
 fn build_header(
     app: &mut App,
     window: WindowId,
@@ -1296,7 +1081,6 @@ fn build_header(
     Ok(header)
 }
 
-/// The footer container; its separator and buttons are built with the chrome.
 fn build_footer(
     app: &mut App,
     window: WindowId,
@@ -1315,7 +1099,6 @@ fn build_footer(
         .build(tree(app, window), parent)
 }
 
-/// The preview pane: the selected widget's name and the host its surface is mounted in.
 #[allow(clippy::too_many_arguments)]
 fn build_preview(
     app: &mut App,
@@ -1414,7 +1197,6 @@ fn build_preview(
     Ok(host)
 }
 
-/// One catalogue row: icon, name, description, and whether the row is the selection.
 #[allow(clippy::too_many_arguments)]
 fn build_row(
     app: &mut App,
@@ -1557,7 +1339,6 @@ fn build_row(
     Ok(Row { node: row, widget })
 }
 
-/// A text leaf whose colour follows the theme.
 fn static_label(
     app: &mut App,
     window: WindowId,
@@ -1576,7 +1357,6 @@ fn static_label(
         .build(tree(app, window), parent)
 }
 
-/// A text leaf whose copy is a catalogue key resolved on every draw.
 #[allow(clippy::too_many_arguments)]
 fn bound_label(
     app: &mut App,
@@ -1604,7 +1384,6 @@ fn bound_label(
         .build(tree(app, window), parent)
 }
 
-/// The groups the search and the filter leave, in [`WidgetCategory::ALL`] order.
 fn groups<'a>(
     entries: &'a [WidgetDescriptor],
     query: &str,
@@ -1624,11 +1403,6 @@ fn groups<'a>(
         .collect()
 }
 
-/// Whether one widget is named by the search.
-///
-/// The name and the description are both the localized ones, because both are what the
-/// reader sees. They are compared case-insensitively, and a search of nothing names
-/// everything.
 fn matches(descriptor: &WidgetDescriptor, query: &str, translate: &Translate) -> bool {
     if query.is_empty() {
         return true;
@@ -1641,7 +1415,6 @@ fn matches(descriptor: &WidgetDescriptor, query: &str, translate: &Translate) ->
             .is_some_and(|key| t_smol!(translate, key).to_lowercase().contains(query))
 }
 
-/// The position of a category in the page's fixed order; part of a component key.
 fn category_index(category: WidgetCategory) -> usize {
     WidgetCategory::ALL
         .iter()
@@ -1651,9 +1424,6 @@ fn category_index(category: WidgetCategory) -> usize {
 
 #[cfg(test)]
 mod tests {
-    // The page is driven through the framework's headless host, the same host a widget's
-    // tests use: one window, the product catalogue, one composition root, and the frame
-    // router ticked before every frame.
 
     use std::{rc::Rc, time::Instant};
 
@@ -1686,8 +1456,6 @@ mod tests {
 
     use super::{WidgetGallery, WidgetGalleryEvent};
     use crate::catalogue::{GalleryCatalogue, GalleryError};
-
-    // ── the catalogue the page is tested over ──────────────────────────────────────────
 
     macro_rules! fake_widget {
         ($widget:ident, $id:literal, $name:literal, $description:literal, $icon:literal,
@@ -1772,7 +1540,6 @@ mod tests {
         "TEST_PREVIEW_NEWS"
     );
 
-    /// The widget a pane falls back to: registered, with metadata, but never offered.
     struct HiddenFake;
 
     impl WidgetView for HiddenFake {
@@ -1826,7 +1593,6 @@ mod tests {
         descriptor
     }
 
-    /// The test catalogue: the same list every test, in registry order.
     struct TestCatalogue {
         entries: Vec<WidgetDescriptor>,
     }
@@ -1912,8 +1678,6 @@ mod tests {
         }
     }
 
-    // ── harness ───────────────────────────────────────────────────────────────────────
-
     fn product_translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -1967,7 +1731,6 @@ mod tests {
         )));
     }
 
-    /// One page over the test catalogue, hosted in one headless application.
     struct Harness {
         app: WidgetTestApp,
         gallery: WidgetGallery,
@@ -1998,8 +1761,6 @@ mod tests {
             harness
         }
 
-        /// Two frames: the page's route runs in the first, a preview mounted during it
-        /// registers its route for the second.
         fn settle(&mut self) {
             self.app.drain();
             self.app.drain();
@@ -2132,7 +1893,6 @@ mod tests {
             self.gallery.take_event()
         }
 
-        /// Every text node under `parent`, in tree order.
         fn texts_under(&self, parent: NodeId) -> Vec<String> {
             let tree = self.app.tree();
             let mut texts = Vec::new();
@@ -2154,7 +1914,6 @@ mod tests {
                 .any(|text| text.contains(needle))
         }
 
-        /// Whether the row's subtree carries the kit icon (an image node).
         fn row_has_icon(&self, id: &str) -> bool {
             let row = self.must_find(&smol_str::format_smolstr!("row.{id}"));
             let tree = self.app.tree();
@@ -2171,9 +1930,6 @@ mod tests {
         }
     }
 
-    // ── listing, grouping, opening state ──────────────────────────────────────────────
-
-    /// The page offers each widget the catalogue says may be chosen, once, and nothing else.
     #[test]
     fn the_gallery_should_list_every_widget_that_may_be_chosen_once() {
         let harness = Harness::mount(None);
@@ -2207,8 +1963,6 @@ mod tests {
         );
     }
 
-    /// A pane showing a widget opens the gallery on that widget, which is the answer the
-    /// pane already has — and the page previews it.
     #[test]
     fn a_pane_with_a_widget_should_open_on_it() {
         let harness = Harness::mount(Some("kytrix.test.news"));
@@ -2224,8 +1978,6 @@ mod tests {
         );
     }
 
-    /// The widget a pane falls back to is not an answer this page offers, so a pane showing
-    /// it opens with nothing selected and nothing previewed.
     #[test]
     fn a_pane_showing_the_fallback_should_open_with_nothing_selected() {
         let harness = Harness::mount(Some("kytrix.test.hidden"));
@@ -2235,9 +1987,6 @@ mod tests {
         assert_eq!(harness.app.router().len(), 1, "only the page is routed");
     }
 
-    /// The catalogue is drawn in the categories of `WidgetCategory::ALL`: a category the
-    /// page has something to list gets a heading, its rows follow it, and a category the
-    /// page has nothing for is not drawn.
     #[test]
     fn the_gallery_should_group_widgets_under_their_category() {
         let harness = Harness::mount(None);
@@ -2264,13 +2013,9 @@ mod tests {
                 "the heading says {label}"
             );
         }
-        // Market has two rows, Statistics one and Monitoring one; the page lists no
-        // fourth category.
         assert_eq!(harness.rows().len(), 4);
     }
 
-    /// A widget that declares no kit picture is still drawn with one: every row carries an
-    /// icon node.
     #[test]
     fn every_listed_widget_should_get_a_kit_icon() {
         let harness = Harness::mount(None);
@@ -2285,10 +2030,6 @@ mod tests {
         }
     }
 
-    // ── search and category filter ────────────────────────────────────────────────────
-
-    /// The field searches the name a reader sees, case-insensitively, and the sections it
-    /// leaves empty are not drawn.
     #[test]
     fn typing_a_name_should_narrow_the_gallery() {
         let mut harness = Harness::mount(None);
@@ -2305,7 +2046,6 @@ mod tests {
         assert_eq!(harness.query(), "candle");
     }
 
-    /// The search matches the description a widget declares as well as its name.
     #[test]
     fn typing_a_description_should_narrow_the_gallery() {
         let mut harness = Harness::mount(None);
@@ -2320,8 +2060,6 @@ mod tests {
         );
     }
 
-    /// The name a search matches is translated: with the interface in Chinese the widget's
-    /// Chinese name narrows the list.
     #[test]
     fn typing_a_localized_name_should_narrow_the_gallery() {
         let mut harness = Harness::mount(None);
@@ -2338,8 +2076,6 @@ mod tests {
         );
     }
 
-    /// The description a search matches is translated with the interface: the Chinese
-    /// sentence narrows the list in the Chinese interface, and the English one does not.
     #[test]
     fn typing_a_localized_description_should_narrow_the_gallery() {
         let mut harness = Harness::mount(None);
@@ -2363,8 +2099,6 @@ mod tests {
         );
     }
 
-    /// Choosing a row is a pointer press in the catalogue, not a move of the keyboard: the
-    /// search field keeps the caret, so what the reader types next still narrows the list.
     #[test]
     fn typing_after_choosing_a_widget_should_still_narrow_the_gallery() {
         let mut harness = Harness::mount(None);
@@ -2386,8 +2120,6 @@ mod tests {
         );
     }
 
-    /// The category filter narrows the catalogue to one group, and choosing it again
-    /// clears the filter.
     #[test]
     fn the_sidebar_should_filter_the_catalogue_by_category() {
         let mut harness = Harness::mount(None);
@@ -2410,8 +2142,6 @@ mod tests {
         assert_eq!(harness.gallery.core.borrow().filter, None);
     }
 
-    /// A search that matches nothing is drawn as a search that found nothing rather than as
-    /// a catalogue with nothing in it.
     #[test]
     fn a_search_that_matches_nothing_should_say_so() {
         let mut harness = Harness::mount(None);
@@ -2429,8 +2159,6 @@ mod tests {
         assert!(harness.find("row.kytrix.test.candlestick").is_none());
     }
 
-    /// Clearing the field restores the whole catalogue, because the page is drawn from what
-    /// the field holds.
     #[test]
     fn clearing_the_search_should_restore_the_whole_gallery() {
         let mut harness = Harness::mount(None);
@@ -2445,10 +2173,6 @@ mod tests {
         assert_eq!(harness.rows().len(), 4);
     }
 
-    // ── selection and the two decisions ───────────────────────────────────────────────
-
-    /// Selecting a row replaces the selection and the preview: the page carries the one
-    /// widget a confirmation would name, and it holds one widget instance at a time.
     #[test]
     fn choosing_another_widget_should_replace_the_selection_and_the_preview() {
         let mut harness = Harness::mount(None);
@@ -2473,7 +2197,6 @@ mod tests {
         );
     }
 
-    /// The confirm control reports the widget the page has selected.
     #[test]
     fn the_confirm_control_should_confirm_the_selection() {
         let mut harness = Harness::mount(Some("kytrix.test.news"));
@@ -2487,8 +2210,6 @@ mod tests {
         );
     }
 
-    /// The confirm control refuses input while nothing is selected: the disabled paint does
-    /// not stop the handler on its own, so the page's own guard is what refuses.
     #[test]
     fn the_confirm_control_should_refuse_while_nothing_is_selected() {
         let mut harness = Harness::mount(None);
@@ -2505,7 +2226,6 @@ mod tests {
         );
     }
 
-    /// The cancel control leaves without choosing anything.
     #[test]
     fn the_cancel_control_should_emit_cancel() {
         let mut harness = Harness::mount(Some("kytrix.test.news"));
@@ -2516,8 +2236,6 @@ mod tests {
         assert_eq!(harness.take_event(), Some(WidgetGalleryEvent::Cancel));
     }
 
-    /// Escape leaves the page, and Enter confirms, while the caret is in the search field —
-    /// the page's own keys fire inside its subtree and only once per press.
     #[test]
     fn escape_should_cancel_and_enter_should_confirm_from_the_search_field() {
         let mut harness = Harness::mount(Some("kytrix.test.news"));
@@ -2534,8 +2252,6 @@ mod tests {
         );
     }
 
-    /// The search narrows what is listed, not what a confirmation would carry: a widget
-    /// selected before the search is still the answer when the search hides its row.
     #[test]
     fn a_selection_the_search_hides_should_still_be_confirmable() {
         let mut harness = Harness::mount(Some("kytrix.test.news"));
@@ -2553,7 +2269,6 @@ mod tests {
         );
     }
 
-    /// Tab keeps the keyboard in the page: it is the field's tab cycle, not the window's.
     #[test]
     fn tab_should_keep_the_keyboard_in_the_search_field() {
         let mut harness = Harness::mount(None);
@@ -2571,10 +2286,6 @@ mod tests {
         }
     }
 
-    // ── language ──────────────────────────────────────────────────────────────────────
-
-    /// A language switch redraws the page's copy and its placeholder, and keeps the widget
-    /// it previews: the page is not re-created.
     #[test]
     fn switching_the_language_should_redraw_the_page() {
         let mut harness = Harness::mount(Some("kytrix.test.news"));
@@ -2606,8 +2317,6 @@ mod tests {
         );
     }
 
-    /// A language switch keeps the search text and the caret: switching is not a reason to
-    /// lose what the reader was doing.
     #[test]
     fn a_language_switch_should_keep_the_search_text_and_the_caret() {
         let mut harness = Harness::mount(None);
@@ -2631,10 +2340,6 @@ mod tests {
         );
     }
 
-    // ── lifetime: release, two pages, no growth ───────────────────────────────────────
-
-    /// Releasing the page releases the preview, the kit components, the nodes and the value
-    /// slots; repeated mount/release rounds reuse the slots instead of growing the table.
     #[test]
     fn releasing_the_page_should_leave_nothing_behind() {
         let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
@@ -2695,8 +2400,6 @@ mod tests {
         }
     }
 
-    /// Moving through the catalogue mounts one preview at a time: the page's node count and
-    /// value slots stay where the first preview left them.
     #[test]
     fn moving_through_the_catalogue_should_not_grow_the_page() {
         let mut harness = Harness::mount(Some("kytrix.test.candlestick"));
@@ -2723,8 +2426,6 @@ mod tests {
         assert_eq!(after.live, slots.live);
     }
 
-    /// Two pages in one application keep their own keys, their own previews and their own
-    /// reports, and releasing one leaves the other working.
     #[test]
     fn two_pages_should_keep_their_own_keys_previews_and_reports() {
         let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));

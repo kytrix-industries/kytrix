@@ -1,21 +1,9 @@
-//! `ui_core` 的构建脚本：编译三套 shader + 构建期契约静态校验。
-//!
-//! 契约：`src/render/shaders/contract.md`。
-//!
-//! - 零依赖（std only）：不引 `regex`（手写扫描器）、不引 `sha2`（Cargo 的 fingerprint 就是缓存）。
-//! - 只编译本平台：Windows → `dxc`（DXIL）、macOS → `xcrun metal`（metallib）、Linux → `glslangValidator`（SPIR-V）。
-//! - `ui_core_SKIP_SHADERS=1` 或 host ≠ target 时只写**占位产物**（P09 的 `include_bytes!` 仍可解析）。
-//! - Windows 目标额外把**本仓自带**的进程清单（`RT_MANIFEST`，DPI awareness = PerMonitorV2，
-//!   R07-1）编进 `.res` 并链接到每个链接本 crate 的可执行文件 —— 清单归本仓所有，不依赖任何
-//!   外部依赖的资源合并副作用；清单内容与 `1 RT_MANIFEST` 锚点在构建期静态校验。
-
 use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
-/// 契约里的 15 个源文件（相对 `src/render/shaders`）。静态校验与 `rerun-if-changed` 的唯一清单。
 const SOURCES: [&str; 15] = [
     "common.hlsl",
     "quad.hlsl",
@@ -34,10 +22,8 @@ const SOURCES: [&str; 15] = [
     "geometry.textured_glyph.frag.glsl",
 ];
 
-/// 每套语言里声明共享结构的文件。
 const COMMON_FILES: [&str; 3] = ["common.hlsl", "common.metal", "common.glsl"];
 
-/// `paint/instance.rs` 中的字段顺序（唯一事实源；三套 shader 必须一致）。
 const GPU_FIELDS: [&str; 8] = [
     "bounds",
     "corner_radius",
@@ -52,14 +38,6 @@ const CLIP_FIELDS: [&str; 3] = ["rect", "corner_radius", "meta"];
 const FRAME_FIELDS: [&str; 2] = ["viewport", "params"];
 const DRAW_FIELDS: [&str; 5] = ["basis", "translation", "color0", "clip_rect", "clip"];
 
-/// 与 `paint/instance.rs` 的 `const NAME: f32` 逐一比对的常量（去掉 `KYTRIX_` 前缀）。
-///
-/// 覆盖**全部**跨端数值契约：`kind` 取值、clip 项类型 / 链上界、阴影 σ（= blur/2 及其下限）。
-/// AR2 P1-⑤：这张表漏掉任何一个，单端改动都会静默通过（实验 E4/E10b/E15/E16/E13 的教训）。
-///
-/// D-9-c 起 `params1.y` 不再是「选哪张图集」（`TEXTURE_GLYPH/TEXTURE_IMAGE` 已删），而是
-/// 图集页（texture array 层号）：采样哪张图集由 `params1.z` 的 `KIND_*` 决定；层号取值由
-/// `paint/atlas.rs` 的 `MAX_IMAGE_PAGES` 约束（shader 不读该常量，故不进本表）。
 const CONSTANTS: [&str; 13] = [
     "KIND_QUAD",
     "KIND_GLYPH",
@@ -76,11 +54,8 @@ const CONSTANTS: [&str; 13] = [
     "SHADOW_SIGMA_MIN",
 ];
 
-/// 只在 shader 侧存在的常量：Rust 侧没有同名常量（只被 shader 读），因此三方比对
-/// **只比三份源码之间**。漏掉它们时单端分叉同样静默通过（AR2 实验 E10b / E15）。
 const SHADER_ONLY_CONSTANTS: [&str; 2] = ["KYTRIX_CLIP_VERTEX_SLACK", "KYTRIX_AA_INSIDE"];
 
-/// 禁止出现在任何 shader 源码里的位重解释构造（contract §9）。
 const FORBIDDEN: [&str; 6] = [
     "asuint(",
     "asfloat(",
@@ -90,7 +65,6 @@ const FORBIDDEN: [&str; 6] = [
     "bitcast",
 ];
 
-/// `contract.md` 必须包含的锚点（防止契约文档被删改而构建仍通过）。
 const CONTRACT_ANCHORS: [&str; 7] = [
     "TriangleStrip",
     "cull = NONE",
@@ -101,18 +75,12 @@ const CONTRACT_ANCHORS: [&str; 7] = [
     "instance_base",
 ];
 
-/// 三套 uber-quad 顶点着色器必须都按 `draw.clip.y` 加实例基址（P0-1.1 的防回归锚点）。
-///
-/// 三个图形 API 的硬件实例基址语义不同：D3D12 的 `SV_InstanceID` **不含** `StartInstanceLocation`，
-/// 而 Vulkan 的 `gl_InstanceIndex` / Metal 的 `instance_id` **含** `firstInstance` / `baseInstance`。
-/// 所以三平台都必须把硬件基址传 0、只经 uniform 加偏移；任一 shader 回退到硬件基址都会静默错位。
 const INSTANCE_BASE_ANCHORS: [(&str, &str); 3] = [
     ("quad.hlsl", "instances[instance_id + base]"),
     ("quad.vert.glsl", "instances[instance]"),
     ("quad.metal", "instances[instance]"),
 ];
 
-/// D3D12 的 7 个 entry：(源文件, profile, 入口名, 产物名)。
 const D3D12_ENTRIES: [(&str, &str, &str, &str); 7] = [
     ("quad.hlsl", "vs_6_2", "vs_main", "quad.vs.dxil"),
     ("quad.hlsl", "ps_6_2", "ps_main", "quad.ps.dxil"),
@@ -138,7 +106,6 @@ const D3D12_ENTRIES: [(&str, &str, &str, &str); 7] = [
     ),
 ];
 
-/// Vulkan 的 7 个 stage 文件 → SPIR-V 产物（入口恒为 `main`）。
 const VULKAN_ENTRIES: [(&str, &str); 7] = [
     ("quad.vert.glsl", "quad.vs.spv"),
     ("quad.frag.glsl", "quad.ps.spv"),
@@ -155,26 +122,16 @@ const VULKAN_ENTRIES: [(&str, &str); 7] = [
     ),
 ];
 
-/// Metal：每个文件一个 metallib（内含该族的全部入口）。
 const METAL_LIBS: [(&str, &str); 2] = [
     ("quad.metal", "quad.metallib"),
     ("geometry.metal", "geometry.metallib"),
 ];
 
-/// R07-1：本仓自带的进程清单（`RT_MANIFEST`）与其 rc 包装。
-///
-/// 清单只声明「期望的 awareness」，实际值由 OS / 宿主决定，所以运行期还会再校验一次
-/// （`src/platform/windows/dpi_awareness.rs`）。这里要守的是：清单必须**本仓拥有** ——
-/// 依赖自带的清单只是副作用，依赖一换就没了。
 const MANIFEST_RC: &str = "src/platform/windows/ui_core_manifest.rc";
 const MANIFEST_XML: &str = "src/platform/windows/ui_core.manifest.xml";
 
-/// 清单里缺失即构建失败的锚点：老/新 Windows 读不同的元素（1607 及更早读 `dpiAware`，
-/// 1703+ 读 `dpiAwareness`），少一条就会在对应版本上静默退回 96 dpi。
 const MANIFEST_XML_ANCHORS: [&str; 2] = [">true/pm</dpiAware>", ">PerMonitorV2</dpiAwareness>"];
 
-/// rc 侧锚点：清单必须是 `RT_MANIFEST` 的 **ID 1**（`CREATEPROCESS_MANIFEST_RESOURCE_ID`）。
-/// ID 不对时资源不会生效，但构建仍然成功 —— 所以必须静态校验。
 const MANIFEST_RC_ANCHOR: &str = "1 RT_MANIFEST";
 
 fn main() {
@@ -188,10 +145,6 @@ fn main() {
     build(&shader_dir, &out_dir);
 }
 
-// ---------------------------------------------------------------------------
-// 构建触发
-// ---------------------------------------------------------------------------
-
 fn emit_rerun(manifest: &Path, shader_dir: &Path) {
     for source in SOURCES.iter().chain(["contract.md"].iter()) {
         println!(
@@ -199,14 +152,6 @@ fn emit_rerun(manifest: &Path, shader_dir: &Path) {
             shader_dir.join(source).display()
         );
     }
-    // 静态校验读的**全部** Rust 文件都必须登记，否则增量构建会放过漂移：
-    // - 契约常量 / 结构体布局：`paint/instance.rs`、`paint/scene.rs`；
-    // - 渲染状态锚点：`RENDER_STATE_ANCHORS` / `RENDER_STATE_FORBIDDEN` 指向的三端
-    //   `{pipeline,swapchain}.rs` 与共享层 `colorspace.rs`。这些文件既不在 rerun 清单里、
-    //   也不被 `include!` 进 crate，漏登记 ⇒ 改 blend/cull 后 build script 不重跑、门禁静默
-    //   （AR2b P2-N3 复现：改 `SrcBlend` 后 BUILD-PASS）。
-    //
-    // 清单**从锚点表本身汇聚**，不另立一份手写列表（那正是漂移的来源）。
     let mut watched: Vec<&str> = vec!["build.rs", "src/paint/instance.rs", "src/paint/scene.rs"];
     watched.extend(RENDER_STATE_ANCHORS.iter().map(|(file, _, _)| *file));
     watched.extend(RENDER_STATE_FORBIDDEN.iter().map(|(file, _, _)| *file));
@@ -219,15 +164,6 @@ fn emit_rerun(manifest: &Path, shader_dir: &Path) {
     println!("cargo:rerun-if-env-changed=KYTRIX_DXC");
 }
 
-// ---------------------------------------------------------------------------
-// 进程清单（R07-1；只对 Windows 目标）
-// ---------------------------------------------------------------------------
-
-/// 把本仓自带的进程清单编成 `.res` 并让**最终 exe** 链接它（R07-1）。
-///
-/// 传播链：`cargo:rustc-link-search` + `cargo:rustc-link-lib` 写进 ui_core 的 rlib 元数据，
-/// 依赖本 crate 的每个可执行文件在链接时都会带上这条 `-l` —— 清单因此由**本仓声明**，
-/// 而不是某个依赖的资源合并副作用。
 fn embed_manifest(project: &Path) {
     if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
         return;
@@ -255,8 +191,6 @@ fn embed_manifest(project: &Path) {
         );
     }
 
-    // `rc.exe` 只覆盖 MSVC 目标（`windows-gnu` 走 windres，本仓构建矩阵没有这一格）。
-    // 宁可构建失败，也不要静默产出一个没有清单的 exe。
     if env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc" {
         panic!(
             "ui_core: R07-1 的进程清单只支持 MSVC 目标（需要 rc.exe）。\n  \
@@ -264,7 +198,6 @@ fn embed_manifest(project: &Path) {
         );
     }
 
-    // 清单本身已通过锚点校验；下面把它编成资源并链进下游 exe。
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let artifact = out_dir.join("ui_core_manifest.lib");
     let rc_tool = find_rc().unwrap_or_else(|| {
@@ -285,8 +218,6 @@ fn embed_manifest(project: &Path) {
         .output();
     report(output, "rc.exe（进程清单）");
 
-    // 产物是 `.res` 格式（**不是** COFF 库，只是沿用 `.lib` 扩展名给 link.exe 当输入）：
-    // 32 字节空头，首两个 dword 恒为 `0` / `0x20`。
     let bytes = fs::read(&artifact)
         .unwrap_or_else(|err| panic!("无法读取进程清单产物 {}：{err}", artifact.display()));
     if !bytes.starts_with(b"\0\0\0\0\x20\0\0\0") {
@@ -296,22 +227,14 @@ fn embed_manifest(project: &Path) {
         );
     }
 
-    // 注意：同一条 `-l` 若被两个清单资源满足，`link.exe` 会以
-    // `CVT1100: duplicate resource. type:MANIFEST, name:1` 硬失败 —— 这正是「清单只能有
-    // 一份」的机器证明；本仓清单是唯一来源。
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=dylib=ui_core_manifest");
 }
-
-// ---------------------------------------------------------------------------
-// 静态校验（永远执行，不受 SKIP 影响）
-// ---------------------------------------------------------------------------
 
 fn validate(manifest: &Path, shader_dir: &Path) {
     let instance_path = manifest.join("src/paint/instance.rs");
     let instance_src = strip_comments(&read(&instance_path));
 
-    // 1) Rust 侧参照：字段顺序 + 类型。
     let rust_fields = rust_struct(&instance_src, "GpuPrimitive", "src/paint/instance.rs");
     let rust_names: Vec<&str> = rust_fields.iter().map(|(_, name)| name.as_str()).collect();
     if rust_names != GPU_FIELDS {
@@ -326,7 +249,6 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         fail("src/paint/instance.rs", "GpuPrimitive", "[f32; 4]", ty);
     }
 
-    // 2) 三套 common.* 的结构体字段顺序。
     let mut shader_sources = Vec::new();
     for file in COMMON_FILES {
         let src = strip_comments(&read(&shader_dir.join(file)));
@@ -355,7 +277,6 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         shader_sources.push((file, defines(&src)));
     }
 
-    // 3) 常量：三套源码一致 + 与 Rust 一致。
     let instance_consts = rust_consts(&instance_src);
     for name in CONSTANTS {
         let key = format!("KYTRIX_{name}");
@@ -373,7 +294,6 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         }
     }
 
-    // 4) MAX_CLIP_DEPTH：三套源码 == 8 == Rust `paint/scene.rs`。
     let scene_src = strip_comments(&read(&manifest.join("src/paint/scene.rs")));
     let scene_consts = rust_consts(&scene_src);
     let rust_depth = const_value(&scene_consts, "MAX_CLIP_DEPTH", "src/paint/scene.rs");
@@ -387,8 +307,6 @@ fn validate(manifest: &Path, shader_dir: &Path) {
                 &depth.to_string(),
             );
         }
-        // 4b) 链上界与预算的关系：KYTRIX_MAX_CLIP_ITEMS = KYTRIX_MAX_CLIP_DEPTH + 1
-        //（链上至多一条矩形项 + MAX_CLIP_DEPTH 条圆角项；AR2 P1-A / P1-⑥）。
         let items = const_value(values, "KYTRIX_MAX_CLIP_ITEMS", file);
         if items != depth + 1.0 {
             fail(
@@ -400,7 +318,6 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         }
     }
 
-    // 4c) 只在 shader 侧存在的常量：三份源码必须逐值相同（Rust 侧没有参照）。
     for name in SHADER_ONLY_CONSTANTS {
         let mut reference: Option<(&str, f32)> = None;
         for (file, values) in &shader_sources {
@@ -418,7 +335,6 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         }
     }
 
-    // 5) 禁用 token（位重解释）。
     for file in SOURCES {
         let src = read(&shader_dir.join(file));
         for token in FORBIDDEN {
@@ -433,7 +349,6 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         }
     }
 
-    // 6) contract.md 锚点。
     let contract = read(&shader_dir.join("contract.md"));
     for anchor in CONTRACT_ANCHORS {
         if !contract.contains(anchor) {
@@ -441,7 +356,6 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         }
     }
 
-    // 7) 实例基址：三套 quad 顶点着色器都必须经 uniform 加偏移，且都读 `draw.clip.y`。
     for (file, anchor) in INSTANCE_BASE_ANCHORS {
         let src = read(&shader_dir.join(file));
         if !src.contains(anchor) {
@@ -462,14 +376,11 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         }
     }
 
-    // 8) 数学函数体跨语言等价（R06-5 a）：归一化后逐语句比对，首个差异带文件与行号。
     validate_math_equivalence(shader_dir);
 
-    // 9) 渲染状态 / 色彩空间的文本锚点（R06-5 c / R06-10）。
     validate_render_state(manifest);
 }
 
-/// 三套 shader 的数学函数体必须逐语句等价（只允许语言拼写差异）。
 fn validate_math_equivalence(shader_dir: &Path) {
     let load = |files: &[&str]| {
         files
@@ -508,13 +419,7 @@ fn validate_math_equivalence(shader_dir: &Path) {
     }
 }
 
-/// 渲染状态与呈现色彩空间的锚点：三端源码必须同时出现同一组取值。
-///
-/// 文本锚点而不是"读结构体值"：D3D12 / Metal / Vulkan 的状态枚举类型互不兼容，抽成共享常量
-/// 会强迫三端共享一个抽象层（`render::state`），而真正要守的是「三端语义相同」这一条。
-/// 锚点缺失即构建失败，因此任何一端被改成别的因子/格式都会立刻暴露（R06-5 c）。
 const RENDER_STATE_ANCHORS: &[(&str, &str, &str)] = &[
-    // ── Windows / D3D12 ──
     (
         "src/render/windows/pipeline.rs",
         "blend enable",
@@ -595,7 +500,6 @@ const RENDER_STATE_ANCHORS: &[(&str, &str, &str)] = &[
         "呈现色彩空间（R06-10）",
         "SetColorSpace1",
     ),
-    // ── macOS / Metal ──
     (
         "src/render/macos/pipeline.rs",
         "blend enable",
@@ -651,7 +555,6 @@ const RENDER_STATE_ANCHORS: &[(&str, &str, &str)] = &[
         "呈现色彩空间（R06-10）",
         "kCGColorSpaceSRGB",
     ),
-    // ── Linux / Vulkan ──
     (
         "src/render/linux/pipeline.rs",
         "blend enable",
@@ -727,7 +630,6 @@ const RENDER_STATE_ANCHORS: &[(&str, &str, &str)] = &[
         "呈现色彩空间（R06-10）",
         "SRGB_NONLINEAR",
     ),
-    // ── 共享层：色彩空间的唯一决定点 ──
     (
         "src/render/colorspace.rs",
         "唯一呈现色彩空间声明",
@@ -735,7 +637,6 @@ const RENDER_STATE_ANCHORS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// 不得出现的东西：某端偷偷加 cull / 换 fill 模式会让三端像素分叉。
 const RENDER_STATE_FORBIDDEN: &[(&str, &str, &str)] = &[
     (
         "src/render/macos/pipeline.rs",
@@ -794,10 +695,6 @@ fn check_struct(file: &str, src: &str, name: &str, expected: &[&str], allowed_ty
     }
 }
 
-// ---------------------------------------------------------------------------
-// 编译
-// ---------------------------------------------------------------------------
-
 fn build(shader_dir: &Path, out_dir: &Path) {
     fs::create_dir_all(out_dir)
         .unwrap_or_else(|err| panic!("无法创建 {}：{err}", out_dir.display()));
@@ -819,7 +716,6 @@ fn build(shader_dir: &Path, out_dir: &Path) {
     }
 }
 
-/// `ui_core_SKIP_SHADERS` 只认 `1` / `true`（大小写不敏感）；其它值视为未设置，并打印说明。
 fn skip_requested() -> bool {
     match env::var("ui_core_SKIP_SHADERS") {
         Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => true,
@@ -894,8 +790,6 @@ fn build_linux(shader_dir: &Path, out_dir: &Path) {
 
     for (source, artifact) in VULKAN_ENTRIES {
         let output = out_dir.join(artifact);
-        // glslang 的 `-I` **必须**紧贴目录（`-I<dir>`）；写成两个参数会直接报
-        // `-I<dir> include path must immediately follow option (no spaces)` 并退出 1。
         let status = Command::new("glslangValidator")
             .args(["-V", "--target-env", "vulkan1.2"])
             .arg(format!("-I{}", shader_dir.display()))
@@ -943,9 +837,6 @@ fn find_dxc() -> Option<PathBuf> {
     })
 }
 
-/// Windows SDK 的 `rc.exe`（资源编译器；编进程清单用，R07-1）。
-///
-/// `KYTRIX_RC` 可覆盖（与 `KYTRIX_DXC` 同规矩）：构建机把 SDK 装在非标准位置时用。
 fn find_rc() -> Option<PathBuf> {
     if let Some(raw) = env::var_os("KYTRIX_RC") {
         let path = PathBuf::from(raw);
@@ -965,10 +856,6 @@ fn find_rc() -> Option<PathBuf> {
     })
 }
 
-/// Windows SDK 里的宿主工具（`<root>/bin/<version>/<arch>/<tool>`，取版本号最大的一个）。
-///
-/// 按**宿主**架构选：`dxc.exe` / `rc.exe` 都在构建机上运行，产物与目标架构无关，
-/// build script 的 `cfg!(target_arch)` 就是宿主架构。
 fn find_windows_sdk_tool(tool: &str) -> Option<PathBuf> {
     let arch = if cfg!(target_arch = "aarch64") {
         "arm64"
@@ -992,7 +879,6 @@ fn find_windows_sdk_tool(tool: &str) -> Option<PathBuf> {
         .find_map(|root| newest_sdk_tool(&root, arch, tool))
 }
 
-/// 在 `<root>/bin/<version>/<arch>/<tool>` 中取版本号最大的一个。
 fn newest_sdk_tool(root: &Path, arch: &str, tool: &str) -> Option<PathBuf> {
     let entries = fs::read_dir(root.join("bin")).ok()?;
     let mut versions: Vec<(Vec<u32>, PathBuf)> = entries
@@ -1051,15 +937,10 @@ fn check_non_empty(path: &Path) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 文本解析（手写扫描器；无 regex）
-// ---------------------------------------------------------------------------
-
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|err| panic!("无法读取 {}：{err}", path.display()))
 }
 
-/// 剥离 `//` 行注释（用空格替换、保留换行）。必须先做：`float4 bounds; // 112` 的分号会把注释粘到下一字段。
 fn strip_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     for line in src.split_inclusive('\n') {
@@ -1103,7 +984,6 @@ fn struct_body<'a>(src: &'a str, name: &str, file: &str) -> &'a str {
     fail(file, name, "结构体闭合", "未闭合")
 }
 
-/// C 系（HLSL / MSL / GLSL）：按 `;` 切分，每段「类型 字段名」。
 fn c_struct(src: &str, name: &str, file: &str) -> Vec<(String, String)> {
     struct_body(src, name, file)
         .split(';')
@@ -1127,7 +1007,6 @@ fn c_struct(src: &str, name: &str, file: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Rust：按 `,` 切分，剥 `pub `，按 `:` 切（`[f32; 4]` 里有分号，绝不能按 `;` 切）。
 fn rust_struct(src: &str, name: &str, file: &str) -> Vec<(String, String)> {
     struct_body(src, name, file)
         .split(',')
@@ -1190,9 +1069,6 @@ fn fail(file: &str, item: &str, expected: &str, actual: &str) -> ! {
     )
 }
 
-// 三套 shader 的构建期契约校验（归一化函数体比对 / 渲染状态锚点）的唯一实现：
-// 与 lib 测试共用同一份源码（`src/render/shader_contract.rs`），`#[cfg(test)]` 的测试
-// 在 build script 里不参与编译。只用 std，不得依赖 crate 内符号。
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/render/shader_contract.rs"

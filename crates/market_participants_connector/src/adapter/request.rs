@@ -1,12 +1,3 @@
-//! The protocol request vocabulary of the adapter boundary.
-//!
-//! Every variant names the identity it addresses and nothing more: a
-//! listing-scoped request carries the exact `VenueListingKey` it is about, a
-//! route-scoped request carries its `VenueRoute`, and an authenticated request
-//! carries its `AuthenticatedTarget`. The gateway resolves the listing into the
-//! [`PreparedRequest`] an adapter encodes with, so an adapter never reads a
-//! catalog and never keeps a second directory.
-
 use crate::{
     market_participants::model::{
         AuthenticatedQuery, CancelOrderCommand, CandlestickFetchQuery,
@@ -21,10 +12,8 @@ use crate::{
     protocol::{AuthenticatedTarget, WalletTarget},
 };
 
-/// One protocol request.
 #[derive(Clone, Debug)]
 pub enum ProtocolRequest {
-    // ---- route-scoped -------------------------------------------------
     FetchMarkets(MarketCatalogQuery),
     FetchAllTickers(TickersQuery),
     FetchPredictionEvents(PredictionEventsQuery),
@@ -37,7 +26,6 @@ pub enum ProtocolRequest {
     FetchHyperliquidSpotPairs(MarketCatalogQuery),
     SubscribeHyperliquidFastContexts(HyperliquidWalletQuery),
 
-    // ---- listing-scoped -----------------------------------------------
     FetchCandlesticks(CandlestickFetchQuery),
     SubscribeCandlesticks(CandlestickSubscriptionQuery),
     FetchTicker(TickerQuery),
@@ -52,7 +40,6 @@ pub enum ProtocolRequest {
     FetchTopTraderPositionRatio(PerpetualStatisticsQuery),
     FetchTakerVolume(PerpetualStatisticsQuery),
 
-    // ---- authenticated account ----------------------------------------
     FetchTradingSettings(TradingSettingsQuery),
     FetchBalances(AuthenticatedQuery),
     FetchActiveOrders(AuthenticatedQuery),
@@ -68,7 +55,6 @@ pub enum ProtocolRequest {
     SetMarginMode(SetMarginModeCommand),
     SetLeverage(SetLeverageCommand),
 
-    // ---- Hyperliquid wallet monitor -----------------------------------
     FetchHyperliquidSpotState(HyperliquidWalletQuery),
     FetchHyperliquidPerpetualState(HyperliquidWalletQuery),
     FetchHyperliquidOpenOrders(HyperliquidWalletQuery),
@@ -87,7 +73,6 @@ pub enum ProtocolRequest {
 }
 
 impl ProtocolRequest {
-    /// Returns the authenticated target this request acts for, when it acts for one.
     pub fn target(&self) -> Option<&AuthenticatedTarget> {
         match self {
             Self::FetchTradingSettings(query) => Some(&query.target),
@@ -128,8 +113,6 @@ impl ProtocolRequest {
             | Self::FetchTakerVolume(_)
             | Self::FetchHyperliquidSpotPairs(_)
             | Self::SubscribeHyperliquidFastContexts(_)
-            // Every wallet-monitor request is a public address read or a route-level
-            // stream, so none of them authenticates.
             | Self::FetchHyperliquidSpotState(_)
             | Self::FetchHyperliquidPerpetualState(_)
             | Self::FetchHyperliquidOpenOrders(_)
@@ -142,7 +125,6 @@ impl ProtocolRequest {
         }
     }
 
-    /// Returns the wallet-monitor target this request reads, when it reads one.
     pub fn wallet_target(&self) -> Option<&WalletTarget> {
         match self {
             Self::FetchHyperliquidSpotState(query)
@@ -160,13 +142,6 @@ impl ProtocolRequest {
     }
 }
 
-/// One protocol request together with the listing the gateway resolved for it.
-///
-/// This is what an adapter receives: the request names the listing key, and the
-/// reference is that key resolved inside one catalog generation. An adapter that
-/// needs the venue's own identity reads it from the reference and never invents
-/// one, and a reference is `None` exactly when the request addresses no listing
-/// at all.
 #[derive(Clone, Debug)]
 pub struct PreparedRequest {
     request: ProtocolRequest,
@@ -174,7 +149,6 @@ pub struct PreparedRequest {
 }
 
 impl PreparedRequest {
-    /// Pairs one request with the listing the gateway resolved for it.
     pub(crate) fn new(
         request: ProtocolRequest,
         listing: Option<crate::catalog::resolved::ResolvedListingRef>,
@@ -182,17 +156,14 @@ impl PreparedRequest {
         Self { request, listing }
     }
 
-    /// Returns the request being made.
     pub const fn request(&self) -> &ProtocolRequest {
         &self.request
     }
 
-    /// Returns the resolved listing of this request, when it is about one.
     pub const fn listing(&self) -> Option<&crate::catalog::resolved::ResolvedListingRef> {
         self.listing.as_ref()
     }
 
-    /// Consumes this prepared request and returns its parts.
     pub fn into_parts(
         self,
     ) -> (

@@ -7,18 +7,12 @@ use crate::{
     store::{ConfigLoadError, ConfigPersistenceError, ConfigStore},
 };
 
-/// Owns the current settings snapshot and publishes its domain changes.
-///
-/// This is a plain value: the composition root holds it mutably and every write
-/// goes through that borrow. There is no process-global installation step, so a
-/// caller decides where the manager lives and on which thread it is written.
 pub struct ConfigManager {
     store: ConfigStore,
     events: ConfigEvents,
 }
 
 impl ConfigManager {
-    /// Wraps an already loaded store.
     pub fn new(store: ConfigStore) -> Self {
         Self {
             store,
@@ -26,30 +20,18 @@ impl ConfigManager {
         }
     }
 
-    /// Creates an in-memory manager for injected runtimes and tests.
     pub fn in_memory(config: Config) -> Self {
         Self::new(ConfigStore::in_memory(config))
     }
 
-    /// Loads a file-backed manager from an injected path.
-    ///
-    /// A missing file starts with [`Config::default()`]; existing files that
-    /// cannot be read or decoded are reported to the caller.
     pub fn from_path(path: impl Into<PathBuf>) -> Result<Self, ConfigLoadError> {
         Ok(Self::new(ConfigStore::from_path(path)?))
     }
 
-    /// Returns a cheaply cloned immutable snapshot of the current settings.
     pub fn read(&self) -> Arc<Config> {
         self.store.read()
     }
 
-    /// Stores a submitted snapshot and only then publishes it.
-    ///
-    /// An unchanged snapshot is neither stored nor published: that write returns
-    /// `Ok(())` and publishes nothing. A write that stores a changed snapshot
-    /// has published exactly one change set (possibly empty only for state that
-    /// raises no domain event: the workspaces and the sidebar state).
     pub fn write(&mut self, config: Config) -> Result<(), ConfigPersistenceError> {
         if let Some(changes) = self.store.write(config)? {
             self.events.publish(changes);
@@ -58,10 +40,6 @@ impl ConfigManager {
         Ok(())
     }
 
-    /// Mutates a cloned candidate and publishes it, persisting it afterwards.
-    ///
-    /// A persistence failure is logged by the store, not returned; the in-memory
-    /// snapshot is still published. Returns the closure's value.
     pub fn update<R>(&mut self, update: impl FnOnce(&mut Config) -> R) -> R {
         let (result, changes) = self.store.update(update);
         if let Some(changes) = changes {
@@ -71,10 +49,6 @@ impl ConfigManager {
         result
     }
 
-    /// Adds one subscriber to this manager's change channel.
-    ///
-    /// A subscription only receives events published after it was created; the
-    /// current snapshot is always available through [`Self::read`].
     pub fn subscribe(&self) -> ConfigSubscription {
         self.events.subscribe()
     }
@@ -100,11 +74,6 @@ mod tests {
         test_support::test_temp,
     };
 
-    // The former `a_subscriber_that_defers_its_write_should_not_reenter_the_emit`
-    // test was deleted with the UI-toolkit migration: deferral was a context
-    // feature of that toolkit. This design publishes to channels instead of
-    // running callbacks, so a subscriber cannot re-enter a write at all.
-
     fn account() -> AccountConfig {
         AccountConfig {
             user_id: String::from("11111111-1111-4111-8111-111111111111"),
@@ -120,7 +89,6 @@ mod tests {
         }
     }
 
-    /// Stores `change` applied to the current snapshot, as a settings submission does.
     fn write_settings(
         manager: &mut ConfigManager,
         change: impl FnOnce(&mut Config),
@@ -130,7 +98,6 @@ mod tests {
         manager.write(next)
     }
 
-    /// Takes every event published so far, in delivery order.
     fn drain(subscription: &mut ConfigSubscription) -> Vec<ConfigEvent> {
         std::iter::from_fn(|| subscription.try_recv()).collect()
     }
@@ -348,8 +315,6 @@ mod tests {
         );
     }
 
-    /// Two service routes and two venues are published in the maps' order, at
-    /// their documented positions, whatever order the mutation applied them in.
     #[test]
     fn events_should_follow_the_map_order_of_the_change_set() {
         let mut manager = ConfigManager::in_memory(Config::default());
@@ -371,8 +336,6 @@ mod tests {
                 .proxies
                 .insert(SmolStr::new_static("local"), proxy(1080));
             config.proxy_default = ProxyRoute::System;
-            // Applied in reverse key order, so the assertion proves the emission
-            // follows the maps rather than the order this closure applied.
             config
                 .proxy_applications
                 .insert(news_service.clone(), ProxyRoute::System);

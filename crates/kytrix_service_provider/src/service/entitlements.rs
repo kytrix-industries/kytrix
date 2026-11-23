@@ -1,10 +1,7 @@
-//! The entitlement feature behind each Kytrix service capability.
-
 use app_config::network::KytrixServiceCapability;
 
 use super::engine::ServiceTopic;
 
-/// The entitlement feature a subscription topic is gated by.
 pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
     match topic {
         ServiceTopic::News => Some("news"),
@@ -16,10 +13,6 @@ pub fn topic_feature_key(topic: &ServiceTopic) -> Option<&'static str> {
     }
 }
 
-/// The entitlement feature an outbound capability is gated by.
-///
-/// `Account`, `XMedia` and the two updater capabilities are not user
-/// entitlements and therefore have no feature.
 pub fn capability_feature_key(capability: KytrixServiceCapability) -> Option<&'static str> {
     match capability {
         KytrixServiceCapability::News => Some("news"),

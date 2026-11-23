@@ -1,20 +1,9 @@
-//! The tests of the page's layout: the shell around the pages, and the rows, cards, lines and
-//! scroll region every page draws its settings with.
-//!
-//! The geometry is read off the debug ids the shell and [`crate::layout`] give their nodes; the
-//! old page's `debug_bounds` lookups became [`Harness::bounds`] over [`Harness::find`], because the
-//! engine has no selector tree of its own.
-
 use market_participants_connector::venue::definition::supported_venues;
 use smol_str::SmolStr;
 use ui_core::math::{Point, Rect};
 
 use crate::{pages::registry, settings_tests::test_support::Harness};
 
-/// The box of the first node whose debug id starts with `selector`.
-///
-/// # Panics
-/// No node matches, or it has not been laid out (the test did not settle a frame).
 fn bounds(harness: &Harness, selector: &str) -> Rect {
     let node = harness
         .find(selector)
@@ -47,20 +36,16 @@ fn centre(rect: Rect) -> Point {
     )
 }
 
-/// Whether two layout edges name the same line, within the one-pixel tolerance layout rounding
-/// leaves between one box's edge and the next box's edge.
 fn aligned(first: f32, second: f32) -> bool {
     (first - second).abs() < 1.0
 }
 
-/// Laid out the way a settings page is: one window, the default page, a settled frame.
 fn settled() -> Harness {
     let mut harness = Harness::new();
     harness.settle(3);
     harness
 }
 
-/// The page the settings open on is the appearance page, and the sidebar lists the page it shows.
 #[test]
 fn the_settings_should_open_on_the_appearance_page() {
     let harness = settled();
@@ -77,12 +62,6 @@ fn the_settings_should_open_on_the_appearance_page() {
     );
 }
 
-/// The header is the gallery's: the title on the left and the search field at the end of the row,
-/// above the two columns. The field still narrows the sidebar; what moved is where it is drawn.
-///
-/// The old page centred a 1000-wide column in the window; the engine page fills the window and
-/// leaves the sidebar its own column, so the column-width and centring assertions of the old test
-/// are gone (the `SETTINGS_CONTENT` column is the remaining one).
 #[test]
 fn the_header_should_hold_the_search_above_the_columns() {
     let harness = settled();
@@ -122,8 +101,6 @@ fn the_header_should_hold_the_search_above_the_columns() {
     );
 }
 
-/// The settings page has no footer: there is nothing to confirm and nothing to cancel, so the body
-/// is the page's last block.
 #[test]
 fn the_page_should_not_draw_a_footer() {
     let harness = settled();
@@ -143,7 +120,6 @@ fn the_page_should_not_draw_a_footer() {
     );
 }
 
-/// Selecting a page shows it.
 #[test]
 fn selecting_a_page_should_show_it() {
     let mut harness = settled();
@@ -157,8 +133,6 @@ fn selecting_a_page_should_show_it() {
     );
 }
 
-/// The page drawn and the row that names it are one thing: a control of the page does not move the
-/// page, because the sidebar follows the page rather than driving it a second time.
 #[test]
 fn selecting_a_page_should_move_the_sidebar_with_it() {
     let mut harness = settled();
@@ -170,8 +144,6 @@ fn selecting_a_page_should_move_the_sidebar_with_it() {
         "the sidebar should list the page it opened"
     );
 
-    // Working in the page is what the sidebar used to answer with its own selection: a control of
-    // the page is pressed, and a sidebar that disagreed put its own page back under it.
     harness.click_node("SETTINGS_CONTROL_data-format.offset");
     harness.settle(1);
 
@@ -182,8 +154,6 @@ fn selecting_a_page_should_move_the_sidebar_with_it() {
     );
 }
 
-/// A row is what opens the page it names: the rows are the only way into a page besides the search,
-/// so a row that does not reach its page is a page with no way in.
 #[test]
 fn clicking_a_sidebar_row_should_open_its_page() {
     let mut harness = settled();
@@ -198,8 +168,6 @@ fn clicking_a_sidebar_row_should_open_its_page() {
     );
 }
 
-/// The AI group sits between the general settings and the proxies, and its one page is the
-/// translation page.
 #[test]
 fn the_ai_group_should_open_the_translation_page() {
     let mut harness = settled();
@@ -222,11 +190,6 @@ fn the_ai_group_should_open_the_translation_page() {
     assert_eq!(harness.page().current_page(), "ai.translation");
 }
 
-/// Every page is drawn, one after another.
-///
-/// What this is for is the frames rather than the pixels: a page is built while the window is
-/// being rendered, so a field that reached back into the page — or a view that read it while it
-/// drew itself — would be a panic rather than a wrong colour, and this is what would find it.
 #[test]
 fn every_page_should_be_drawable() {
     let mut harness = settled();
@@ -246,8 +209,6 @@ fn every_page_should_be_drawable() {
     }
 }
 
-/// A setting is one row: its name and explanation on the left, its control on the right, and the
-/// row belongs to the card its group is drawn as.
 #[test]
 fn a_setting_should_be_a_row_with_its_control_at_the_card_edge() {
     let harness = settled();
@@ -282,7 +243,6 @@ fn a_setting_should_be_a_row_with_its_control_at_the_card_edge() {
     );
 }
 
-/// The rows of one group share one card, and the card draws a line between them.
 #[test]
 fn one_group_should_be_one_card_with_a_line_between_its_rows() {
     let harness = settled();
@@ -314,8 +274,6 @@ fn one_group_should_be_one_card_with_a_line_between_its_rows() {
     );
 }
 
-/// A group whose heading repeats the only row it holds is drawn without that heading: the row
-/// already names the setting, and two titles for one setting is one too many.
 #[test]
 fn a_heading_that_repeats_its_only_row_should_not_be_drawn() {
     let mut harness = settled();
@@ -337,8 +295,6 @@ fn a_heading_that_repeats_its_only_row_should_not_be_drawn() {
     );
 }
 
-/// The lines of the venues share one card: a card per venue would be one card per line under the
-/// same heading, and the heading already says what the rows have in common.
 #[test]
 fn the_venue_group_should_be_one_card_for_every_venue() {
     let mut harness = settled();
@@ -365,8 +321,6 @@ fn the_venue_group_should_be_one_card_for_every_venue() {
     }
 }
 
-/// Every page the registry offers is drawn as a sidebar row, and every row leads to one: a page
-/// nobody can select is a page that does not exist, and a row that opens nothing is a dead end.
 #[test]
 fn the_sidebar_and_the_pages_should_name_each_other() {
     let harness = settled();
@@ -388,8 +342,6 @@ fn the_sidebar_and_the_pages_should_name_each_other() {
     );
 }
 
-/// The page's content lives in the scroll region the page is drawn in: the rows are inside the
-/// scroll content, the content fills the viewport, and the scroll bar is drawn beside it.
 #[test]
 fn the_page_content_should_scroll_inside_the_settings_page() {
     let harness = settled();

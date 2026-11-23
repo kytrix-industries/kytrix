@@ -1,30 +1,11 @@
-//! The guard that keeps the settings' text and the locales in step.
-//!
-//! A key no locale defines renders as an empty string, which is a label that is simply not there
-//! rather than a failure anyone sees; a key a locale defines but nothing draws is text that sits
-//! in every locale until somebody reuses the name for something else. The sources are read here
-//! as text rather than through a declaration of the pages, because the pages are native UI: a
-//! literal is the one statement of a key every page already has to write.
-//!
-//! # Keeping the list of sources honest
-//!
-//! The list below is the crate's production sources, spelled out by hand and held to the
-//! directory: a source that is missing from it would silently escape both halves of the guard.
-//! A new file in `src/` therefore has to be added here, and the first test says so.
-
 use std::path::Path;
 
 const TEST_MODULE_ATTRIBUTE: &str = concat!("#[cfg", "(test)]");
 
 const TEST_MODULE_SHAPES: [&str; 4] = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "];
 
-/// The directory the settings page's tests live in, which the guard does not read.
 const TEST_SOURCES_DIRECTORY: &str = "settings_tests";
 
-/// Every production source of this crate, as the file it was written in beside its text.
-///
-/// The list is spelled out by hand and held to the directory below: a source that is not in it
-/// would silently escape both halves of the guard.
 const SETTINGS_SOURCES: [(&str, &str); 31] = [
     ("appearance.rs", include_str!("../appearance.rs")),
     ("host.rs", include_str!("../host.rs")),
@@ -113,8 +94,6 @@ const SETTINGS_SOURCES: [(&str, &str); 31] = [
     ),
 ];
 
-/// The half of one source that names the settings: everything above the test module it declares,
-/// or the whole file when it declares none.
 fn production_half(source: &'static str) -> &'static str {
     let mut offset = 0usize;
 
@@ -132,7 +111,6 @@ fn production_half(source: &'static str) -> &'static str {
     source
 }
 
-/// Every statement key the sources of this crate name.
 fn declared_keys() -> Vec<&'static str> {
     SETTINGS_SOURCES
         .iter()
@@ -141,7 +119,6 @@ fn declared_keys() -> Vec<&'static str> {
         .collect()
 }
 
-/// The names of the production sources on disk, which the list above has to hold.
 fn source_names_on_disk() -> Vec<String> {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
     let mut names = Vec::new();
@@ -152,11 +129,6 @@ fn source_names_on_disk() -> Vec<String> {
     names
 }
 
-/// Adds every production `.rs` file under `directory` to `names`, named from the crate's `src`
-/// directory.
-///
-/// The walk follows the directories rather than a list of them, so a page added under a
-/// directory is read by the guard without the list above having to learn about the directory.
 fn collect_sources(directory: &Path, prefix: &str, names: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -177,7 +149,6 @@ fn collect_sources(directory: &Path, prefix: &str, names: &mut Vec<String>) {
     }
 }
 
-/// Every source of this crate is read by the guard.
 #[test]
 fn every_settings_source_should_be_read_by_the_key_guard() {
     let declared = SETTINGS_SOURCES
@@ -193,7 +164,6 @@ fn every_settings_source_should_be_read_by_the_key_guard() {
     );
 }
 
-/// Every key the settings name is one every locale defines, and renders as something.
 #[test]
 fn every_key_the_settings_name_should_be_defined_in_every_locale() {
     let i18n = i18n::embedded::load().expect("embedded locales should load");
@@ -216,7 +186,6 @@ fn every_key_the_settings_name_should_be_defined_in_every_locale() {
     }
 }
 
-/// Every key a locale defines for the settings is one the settings name.
 #[test]
 fn every_settings_key_is_named_by_a_source() {
     let i18n = i18n::embedded::load().expect("embedded locales should load");

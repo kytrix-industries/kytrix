@@ -1,8 +1,3 @@
-//! Browser sign-in handoff creation against the Kytrix API.
-//!
-//! The desktop session authorizes the request with its ordinary access token and a
-//! DPoP proof; the API answers with the one-time code the browser will redeem.
-
 use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceTarget};
 use bytes::BytesMut;
 use network::transport::{http::HttpClientClass, hub::TransportHub};

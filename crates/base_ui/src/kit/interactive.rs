@@ -1,59 +1,3 @@
-//! 通用交互状态机（旧 `crate::interactive` 的引擎化重建，P2-4a）。
-//!
-//! 旧实现把 hover / active 存在 旧 UI 层的 keyed state 里、把三种颜色交给 `transition()` 做隐式过渡，
-//! 点击由调用方用 `InteractiveElement::on_click` 注入。新引擎只提供两样东西：节点上的 `Action`
-//! 声明（指针点击 + 焦点节点的 Enter/Space 激活走同一条分发）和 `bind_style` 的 `StylePatch`。
-//! 本模块因此是**应用层**的状态机：
-//!
-//! ```text
-//! Event(PointerDown/Up) ──dispatch──▶ pressed ┐
-//! App::hovered ────────sync──────────▶ hovered ├─ state ─▶ animate(mix) ─▶ bind_style(StylePatch)
-//! Window::focus ───────sync──────────▶ focused ┘                          │
-//!                                                                  background/foreground/border/cursor
-//! ```
-//!
-//! # 状态与颜色
-//!
-//! - 状态枚举直接复用主题的 [`InteractiveState`]（`Normal` / `Hover` / `Active` / `Disabled`）与
-//!   [`InteractiveVariant`]（`Filled` / `Tonal` / `Outline` / `Ghost`），颜色配方来自
-//!   `ThemeHandle::components()`（**不在这里维护任何色值**）；
-//! - `loading` 与 `disabled` 共用 `Disabled` 配方（禁用 = 不可交互；加载 = 暂时不可交互，a11y 的
-//!   `busy` 区分二者）；`selected` 映射到 `Active`（旧交互元素的选中态就是这个画法）；
-//! - 状态切换用 `Transient<f32>` 的 `mix` 做 150 ms 过渡（旧 `ANIMATION_TICK`）：`bind_style` 在
-//!   `previous` 与 `current` 两个状态的配方之间按 `mix` 插值，**不读**颜色瞬态 —— 主题切换时两端
-//!   颜色一起重算，动画期间也不会停在旧主题的颜色上。
-//!
-//! # 指针按下
-//!
-//! 引擎只在抬起时派发 click（评估 G3），`App` 也没有公开的「按键是否按下」查询。按下态因此由
-//! [`Interactive::dispatch`] 从外壳转发的事件流里取：外壳像对待 [`crate::kit::input::InputNode`]
-//! 一样，把 `App::drain_events` 的事件逐条交给每个组件；按下时指针必须悬停在本节点子树内
-//! （`App::hovered`），抬起 / 取消 / 离开一律清除。**键盘激活不需要本模块**：焦点节点的
-//! Enter/Space 由引擎按 `NodeBuilder::on_click` 的声明分发。
-//!
-//! # 焦点
-//!
-//! 焦点环走动态 `StylePatch.border`（2 px `LineFocus`），而不是 `NodeBuilder::focus_ring`：引擎的
-//! focus ring 颜色是挂载期常量，主题切换时不会更新；`bind_style` 每次求值都读当前外观，行为与
-//! 其它动态色一致（登记见 `spec-deltas/kit-controls.md` §4）。
-//!
-//! # tooltip
-//!
-//! tooltip 组件在 P2-4b 建立。本模块只保留挂点：`tooltip_text` 存
-//! 一段文本、`tooltip()` 读出，由 P2-4b 的 tooltip 层按节点几何挂载；本批不画任何浮层。
-//!
-//! # 生命周期
-//!
-//! 组件自有 `SignalScope`（[`Interactive::release`] 回收）与一个可选的 Action handler（回调注册
-//! 时才有）。动态创建 / 销毁的控件在卸载节点后调用一次 `release`；重复调用幂等。
-//!
-//! # 与旧 API 的形态差异
-//!
-//! 旧 `Interactive` 是 UI 元素（`Styled` / `ParentElement` / `InteractiveElement`），新组件是
-//! **挂载期 builder**：`new(app, theme, key)` 建状态，`build(app, window, parent, content)` 建节点
-//! 并注册回调（content 拿 `&mut App` 是因为图标节点要写引擎资源缓存），`sync(app)` 帧驱动镜像，
-//! `dispatch(app, event)` 转发指针事件。没有 `Styled` / `refine_style`（D24）。
-
 use std::{cell::RefCell, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
@@ -90,40 +34,25 @@ use crate::{
     },
 };
 
-/// 圆角（旧 `rounded_sm` 的 4 px；主题 token 暂无圆角档位）。
 const CORNER_RADIUS: f32 = 4.0;
 
-/// 默认动作 key 的后缀（没有显式名字的 `on_click` 用它生成身份）。
 const CLICK_ACTION_SUFFIX: &str = ".click";
 
-/// 一种状态的三块颜色来源（`None` = 透明；角色在 `bind_style` 里按当前外观解析）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateRoles {
-    /// 背景角色（`None` = 透明）。
     pub background: Option<Role>,
-    /// 前景角色。
     pub foreground: Role,
-    /// 边框角色（`None` = 透明）。
     pub border: Option<Role>,
 }
 
-/// 一个变体的四状态角色配方。
-///
-/// 主题的 `components.interactive` 只覆盖四种通用变体；`danger` 按钮与 tab 选中态这类
-/// **控件特有**的画法用本类型表达：颜色仍是主题角色（随外观重算），只是不落在通用配方里。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RolePalette {
-    /// 未接触。
     pub normal: StateRoles,
-    /// 指针所在。
     pub hover: StateRoles,
-    /// 按下 / 选中。
     pub active: StateRoles,
-    /// 禁用 / 加载。
     pub disabled: StateRoles,
 }
 
-/// 通用交互状态机（`Rc` 浅拷贝；组件持有它调 `sync` / `dispatch`）。
 #[derive(Clone)]
 pub struct Interactive {
     inner: Rc<InteractiveInner>,
@@ -135,9 +64,7 @@ pub struct Interactive {
     selected: bool,
     force_hover: bool,
     label: Option<SmolStr>,
-    /// 动态可访问名（信号；优先于 `label`）。
     a11y_label_signal: Option<Signal<SmolStr>>,
-    /// 展开态来源（`aria-expanded`）。
     a11y_expanded: Option<Signal<bool>>,
     a11y_role: A11yRole,
     checked: Option<Signal<bool>>,
@@ -161,18 +88,11 @@ struct InteractiveInner {
     loading: Signal<bool>,
     selected: Signal<bool>,
     force_hover: Signal<bool>,
-    /// 当前视觉状态（`Normal` / `Hover` / `Active` / `Disabled`）。
     state: Signal<InteractiveState>,
-    /// 上一个视觉状态（`mix` 插值的起点）。
     previous: Signal<InteractiveState>,
-    /// 状态过渡进度（0 = 上一个状态，1 = 当前状态）。
     mix: Transient<f32>,
-    /// 节点几何（`build` 之后可用）。
     geometry: RefCell<Geometry>,
-    /// 本组件注册过的 Action（`release` 摘除；没有回调时是 `None`）。
     registered: RefCell<Option<Action>>,
-    /// 需要随状态过渡一起重绘的子节点（文本 / 图标 / 几何；`bind_style` 读瞬态值的节点必须登记，
-    /// 因为瞬态值不是依赖、引擎只重绘显式注册的节点集合）。
     watched: RefCell<Vec<NodeId>>,
 }
 
@@ -183,7 +103,6 @@ struct Geometry {
 }
 
 impl Interactive {
-    /// 建状态机。`key` 是动作身份前缀与调试 id 前缀（同一 App 内唯一）。
     pub fn new(app: &mut App, theme: ThemeHandle, key: impl Into<SmolStr>) -> Self {
         let scope = app.signal_scope();
         Self {
@@ -227,153 +146,125 @@ impl Interactive {
         }
     }
 
-    /// 变体（填充 / 控件色 / 描边 / 静默）。
     #[must_use]
     pub fn variant(mut self, variant: InteractiveVariant) -> Self {
         self.variant = variant;
         self
     }
 
-    /// 用主题角色写的四状态配方（覆盖 `variant` 的通用配方；见 [`RolePalette`]）。
     #[must_use]
     pub fn role_palette(mut self, palette: RolePalette) -> Self {
         self.palette = Some(palette);
         self
     }
 
-    /// 禁用（不可交互、`Disabled` 配方、`cursor: NotAllowed`）。
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
     }
 
-    /// 加载态（不可交互 + `Disabled` 配方；a11y `busy`）。
     #[must_use]
     pub fn loading(mut self, loading: bool) -> Self {
         self.loading = loading;
         self
     }
 
-    /// 选中态（画成 `Active`；a11y `selected`）。
     #[must_use]
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
     }
 
-    /// 强制画成悬停（弹层盖住控件时的旧 `force_hover` 语义）。
     #[must_use]
     pub fn force_hover(mut self, force_hover: bool) -> Self {
         self.force_hover = force_hover;
         self
     }
 
-    /// 可访问名（a11y `label`；组件通常把可见文字传进来）。
     #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
         self
     }
 
-    /// a11y 角色（默认 `Button`；tab / toggle 各自覆盖）。
     #[must_use]
     pub fn a11y_role(mut self, role: A11yRole) -> Self {
         self.a11y_role = role;
         self
     }
 
-    /// a11y 勾选态来源（`CheckBox` / `RadioButton` / `Switch` 用；写进 `A11yPatch.checked`）。
     #[must_use]
     pub fn checked_signal(mut self, checked: Signal<bool>) -> Self {
         self.checked = Some(checked);
         self
     }
 
-    /// a11y 集合语义（`pos_in_set` / `size_of_set`；tab / 列表项用）。
     #[must_use]
     pub fn a11y_set(mut self, index: usize, count: usize) -> Self {
         self.a11y_set = Some((index, count));
         self
     }
 
-    /// 动态可访问名来源（信号变化即 a11y 失效；优先于 [`Interactive::label`] 的静态值）。
-    ///
-    /// 下拉 / 选择的触发器用：可访问名 = 当前选中项的文本（`None` 时是占位文本），不能是构造期
-    /// 固定的静态字符串。
     #[must_use]
     pub fn a11y_label_signal(mut self, label: Signal<SmolStr>) -> Self {
         self.a11y_label_signal = Some(label);
         self
     }
 
-    /// 展开态来源（写进 `A11yPatch.expanded`，即 `aria-expanded`）。
     #[must_use]
     pub fn a11y_expanded(mut self, expanded: Signal<bool>) -> Self {
         self.a11y_expanded = Some(expanded);
         self
     }
 
-    /// 去掉控件外壳的**绘制**（背景 / 边框）：toggle 这类「状态机在根、视觉在子节点」的组合控件用。
-    /// 尺寸阶梯的高度 / 水平内边距仍然写进布局（旧 `unified_sized` 的行密度语义），前景 / 光标 /
-    /// 命中开关照常输出。
     #[must_use]
     pub fn chrome(mut self, chrome: bool) -> Self {
         self.chrome = chrome;
         self
     }
 
-    /// tooltip 文本挂点（P2-4b 的 tooltip 层读取；本批不画）。
     #[must_use]
     pub fn tooltip_text(mut self, text: impl Into<SmolStr>) -> Self {
         self.tooltip = Some(text.into());
         self
     }
 
-    /// 显式动作身份（不注册回调时由调用方自己 `App::on_action`）。
     #[must_use]
     pub fn action(mut self, action: Action) -> Self {
         self.action = Some(action);
         self
     }
 
-    /// 点击 / Enter / Space 激活的回调。`build` 时为它注册一个 Action handler；禁用或加载中的
-    /// 程序化派发也会被回调守卫拦下（指针路径另由 `StylePatch.interactive = false` 拦）。
     #[must_use]
     pub fn on_click(mut self, callback: impl Fn(&mut ActionCtx<'_>) + 'static) -> Self {
         self.callback = Some(Rc::new(callback));
         self
     }
 
-    /// 四角圆角（拼接控件用；默认 4 px）。
     #[must_use]
     pub fn corner_radius(mut self, radius: f32) -> Self {
         self.corner_radii = [radius; 4];
         self
     }
 
-    /// 四角各自圆角（CSS 顺序 `[tl, tr, br, bl]`；拼接控件用 [`crate::kit::join`] 的结果）。
     #[must_use]
     pub fn corner_radii(mut self, radii: [f32; 4]) -> Self {
         self.corner_radii = radii;
         self
     }
 
-    /// 是否进入 Tab 焦点序（默认 `true`）。
     #[must_use]
     pub fn tab_stop(mut self, tab_stop: bool) -> Self {
         self.tab_stop = tab_stop;
         self
     }
 
-    /// 尺寸档（子节点文本 / 图标取字号与图标边长用）。
     #[must_use]
     pub fn unified_size(&self) -> UnifiedSize {
         self.size
     }
 
-    /// 动作身份（显式给的，或由回调自动生成的）。`build` 之前也返回自动生成的身份，
-    /// 供组合控件 / 测试在挂载后按同一 key 派发。
     #[must_use]
     pub fn action_identity(&self) -> Option<Action> {
         self.action.clone().or_else(|| {
@@ -383,101 +274,72 @@ impl Interactive {
         })
     }
 
-    /// tooltip 文本（P2-4b 挂点）。
     #[must_use]
     pub fn tooltip(&self) -> Option<&str> {
         self.tooltip.as_deref()
     }
 
-    /// 动作 key / 调试 id 前缀。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 
-    /// 组件节点（`build` 之后可用）。
     #[must_use]
     pub fn node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().node
     }
 
-    /// 组件所属窗口（`build` 之后可用）。
     #[must_use]
     pub fn window(&self) -> Option<WindowId> {
         self.inner.geometry.borrow().window
     }
 
-    /// 视觉状态（测试 / 组合控件用）。
     #[must_use]
     pub fn state(&self, app: &App) -> InteractiveState {
         app.read_with(&self.inner.state, |state| *state)
     }
 
-    /// 是否悬停（帧同步后的镜像）。
     #[must_use]
     pub fn hovered(&self, app: &App) -> bool {
         app.read_with(&self.inner.hovered, |hovered| *hovered)
     }
 
-    /// 是否按下（`dispatch` 转发按下 / 抬起事件后的镜像）。
     #[must_use]
     pub fn pressed(&self, app: &App) -> bool {
         app.read_with(&self.inner.pressed, |pressed| *pressed)
     }
 
-    /// 是否聚焦。
     #[must_use]
     pub fn focused(&self, app: &App) -> bool {
         app.read_with(&self.inner.focused, |focused| *focused)
     }
 
-    /// 状态过渡进度（0 = 上一状态，1 = 当前状态）。
     #[must_use]
     pub fn mix(&self, app: &App) -> f32 {
         *app.read_transient(&self.inner.mix)
     }
 
-    /// 禁用态信号（组合控件的子节点要在自己的 `bind_style` 里读它，例如 toggle 的几何颜色）。
     #[must_use]
     pub fn disabled_signal(&self) -> Signal<bool> {
         self.inner.disabled
     }
 
-    /// 运行时禁用。写信号 → 下次 `bind_style` 求值重画。
     pub fn set_disabled(&self, app: &mut App, disabled: bool) -> bool {
         app.write(&self.inner.disabled, disabled)
     }
 
-    /// 运行时加载态。
     pub fn set_loading(&self, app: &mut App, loading: bool) -> bool {
         app.write(&self.inner.loading, loading)
     }
 
-    /// 运行时选中态。
     pub fn set_selected(&self, app: &mut App, selected: bool) -> bool {
         app.write(&self.inner.selected, selected)
     }
 
-    /// 运行时强制悬停。
     pub fn set_force_hover(&self, app: &mut App, force_hover: bool) -> bool {
         app.write(&self.inner.force_hover, force_hover)
     }
 
-    /// 建根节点并挂 `content`（子图标 / 文本由调用方建；`content` 需要 `App` 是因为图标要走
-    /// 引擎资源缓存）。
-    ///
-    /// 语义：
-    /// - 布局：flex row + `items_center` + 尺寸阶梯的高度 / 间隙 / 水平内边距 + 1 px **布局**边框
-    ///   （旧 `.border_1()` 的占位语义，`StyleBuilder::border`）；`chrome(false)` 去掉绘制外壳，
-    ///   但高度 / 水平内边距仍写（旧 `unified_sized`）；圆角走静态 `PaintSpec`；
-    /// - 动态：`bind_style` 输出背景 / 前景 / 边框 / 光标 / 命中开关；`bind_a11y` 输出
-    ///   `disabled` / `busy` / `selected`；
-    /// - 动作：显式 `action`，或由 `on_click` 自动生成 `"<key>.click"`；回调在 `build` 里注册，
-    ///   并带禁用 / 加载守卫；
-    /// - 焦点：`tab_stop` 与动态焦点边框。
-    ///
-    /// # Errors
-    /// [`EngineError::UnknownWindow`]（窗口已关闭）/ `StaleNode`（父节点陈旧）/ 引擎建树错误。
     pub fn build(
         &self,
         app: &mut App,
@@ -489,7 +351,6 @@ impl Interactive {
             return Err(EngineError::UnknownWindow { window });
         }
         let inner = &self.inner;
-        // 初始值：build 之前写（尚无依赖者，等值短路不产生帧）。
         app.write(&inner.disabled, self.disabled);
         app.write(&inner.loading, self.loading);
         app.write(&inner.selected, self.selected);
@@ -545,8 +406,6 @@ impl Interactive {
                 .border(theme.tokens().border_width)
                 .build()
         } else {
-            // 旧 `unified_sized` 的布局仍要写：toggle 这类「状态机在根、视觉在子节点」的组合控件
-            // 根上没有外壳，但行高与左侧留白是它布局的一部分（旧 toggle 根 = h 30 / gap 6 / px 6）。
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
@@ -633,10 +492,6 @@ impl Interactive {
         Ok(node)
     }
 
-    /// 建一个没有任何子节点的交互根（图标 / 文本由调用方之后自己挂）。
-    ///
-    /// # Errors
-    /// 同 [`Interactive::build`]。
     pub fn build_bare(
         &self,
         app: &mut App,
@@ -646,10 +501,6 @@ impl Interactive {
         self.build(app, window, parent, |_, _, _| Ok(()))
     }
 
-    /// 子节点的动态前景色（文本 / E7 图标共用：`StylePatch::foreground`）。
-    ///
-    /// 组件把它包进自己的 `bind_style`：`move |cx| StylePatch { foreground: Some(interactive
-    /// .foreground_color(cx)), ..StylePatch::default() }`。
     pub fn foreground_color(&self, cx: &mut ReadCtx<'_>) -> Color {
         let (current, last, progress) = {
             let current = *cx.read(&self.inner.state);
@@ -669,12 +520,6 @@ impl Interactive {
         .foreground
     }
 
-    /// 帧驱动同步：镜像悬停 / 焦点，并在状态变化时启动 150 ms 过渡。
-    ///
-    /// 返回是否写入了状态（`false` = 本帧无事发生，不请求帧 —— I3）。
-    ///
-    /// # Errors
-    /// 动画注册失败（窗口已关闭）。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let (window, node) = {
             let geometry = self.inner.geometry.borrow();
@@ -725,10 +570,6 @@ impl Interactive {
         Ok(changed)
     }
 
-    /// 转发一个平台事件（外壳在 `App::drain_events` 之后调用）。
-    ///
-    /// 只消费主键的按下 / 抬起 / 取消 / 离开：按下时光标必须在本节点子树内；禁用 / 加载中不记录。
-    /// 返回是否改了按下态。键盘激活由引擎分发 `on_click` 的动作，**不经过**这里。
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         let (window, node) = {
             let geometry = self.inner.geometry.borrow();
@@ -765,10 +606,6 @@ impl Interactive {
         }
     }
 
-    /// 登记一个「随状态过渡重绘」的子节点（文本 / 图标 / 几何节点）。
-    ///
-    /// `bind_style` 读 `Transient` 不产生依赖边，动画只给**显式注册的节点**标脏；所以子节点上
-    /// 读 `foreground_color` / `mix` 的 `bind_style` 必须在这里登记，否则过渡期间会停在旧值。
     pub fn watch(&self, node: NodeId) {
         let mut watched = self.inner.watched.borrow_mut();
         if !watched.contains(&node) {
@@ -776,7 +613,6 @@ impl Interactive {
         }
     }
 
-    /// 本组件的动画目标节点（根 + 已登记的子树节点）。
     #[must_use]
     pub fn animation_nodes(&self) -> Vec<NodeId> {
         let mut nodes = Vec::with_capacity(1 + self.inner.watched.borrow().len());
@@ -787,10 +623,6 @@ impl Interactive {
         nodes
     }
 
-    /// 释放本组件的 Action handler 与信号作用域（动态创建 / 销毁的控件调用；先卸载节点）。
-    ///
-    /// 返回被释放的槽位数（9 个信号 / 瞬态槽）；重复调用返回 0（幂等）。释放后清掉几何句柄：
-    /// `sync` 不再拿陈旧 `NodeId` 去查树。
     pub fn release(&self, app: &mut App) -> usize {
         if let Some(action) = self.inner.registered.borrow_mut().take() {
             app.off_action(&action);
@@ -807,7 +639,6 @@ impl UnifiedSizable for Interactive {
     }
 }
 
-/// 初始视觉状态（`build` 时与信号一起写；`mix` 从 1 开始，不播放入场动画）。
 fn initial_state(disabled: bool, loading: bool, selected: bool) -> InteractiveState {
     if disabled || loading {
         InteractiveState::Disabled
@@ -818,7 +649,6 @@ fn initial_state(disabled: bool, loading: bool, selected: bool) -> InteractiveSt
     }
 }
 
-/// 一个变体的四状态配方。
 fn variant_colors(
     components: &ComponentColors,
     variant: InteractiveVariant,
@@ -831,7 +661,6 @@ fn variant_colors(
     }
 }
 
-/// 两个状态配方之间的线性预乘插值（与引擎渐变 / 动画同一插值空间）。
 fn lerped_colors(
     cx: &mut ReadCtx<'_>,
     theme: &ThemeHandle,
@@ -851,7 +680,6 @@ fn lerped_colors(
     }
 }
 
-/// 一个状态的三块颜色（主题通用配方，或控件自带的 [`RolePalette`]）。
 fn state_colors(
     cx: &mut ReadCtx<'_>,
     theme: &ThemeHandle,
@@ -879,7 +707,6 @@ fn state_colors(
     *state_entry(variant_colors(theme.components(cx), variant), state)
 }
 
-/// 状态 → 配方条目。
 fn state_entry(
     colors: &InteractiveStateColors,
     state: InteractiveState,
@@ -892,7 +719,6 @@ fn state_entry(
     }
 }
 
-/// `candidate` 是否等于 `root` 或在其子树内（悬停 / 焦点镜像用）。
 fn node_in_subtree(app: &App, window: WindowId, root: NodeId, candidate: Option<NodeId>) -> bool {
     let Some(target) = app.window(window) else {
         return false;
@@ -908,13 +734,6 @@ fn node_in_subtree(app: &App, window: WindowId, root: NodeId, candidate: Option<
     false
 }
 
-/// 挂一张可动态着色的 E7 图标（`StylePatch::foreground` 调制）。
-///
-/// 为什么不直接用 [`crate::kit::icon::IconSpec::build`]：它把颜色写死成挂载期
-/// `image_modulation`，而按钮 / tab 的前景色随状态与外观变化。`IconSpec::resource_for` 是
-/// `icon.rs` 的私有实现（本批写作用域外），这里按同一公开口径复刻 15 行：按窗口 DPI 选
-/// [`RasterTier`]，以「逻辑尺寸 × scale」为物理目标取图集变体（D-10），窗口归属登记。节点本身与
-/// `IconSpec` 一致：显式正方形 `Style` + `ImageFit::Fill` + 装饰性 a11y `hidden`。
 pub(crate) fn mount_dynamic_icon(
     app: &mut App,
     window: WindowId,
@@ -1006,7 +825,6 @@ mod tests {
         harness_with(std::convert::identity)
     }
 
-    /// 让状态过渡动画走完，并刷新最后一帧的样式补丁。
     fn settle(harness: &mut Harness) {
         for _ in 0..4 {
             harness.app.advance(Duration::from_millis(60));
@@ -1054,8 +872,6 @@ mod tests {
         Theme::of(Appearance::Light)
     }
 
-    /// 颜色的颜色空间可能不同（主题角色是 OKLCH、渲染补丁是线性预乘），按引擎解析后的
-    /// 线性预乘分量比较 —— 这也是「看起来一样」的唯一口径。
     fn resolved(color: Color) -> [f32; 4] {
         ColorResolver.resolve(color).components
     }
@@ -1064,7 +880,6 @@ mod tests {
         assert_eq!(actual.map(resolved), Some(resolved(expected)), "{message}");
     }
 
-    /// 悬停：`sync` 把 `App::hovered` 镜像成 `Hover`，`bind_style` 输出悬停配方。
     #[test]
     fn hovering_switches_the_state_and_the_patch_to_the_hover_recipe() {
         let mut harness = harness();
@@ -1096,7 +911,6 @@ mod tests {
         );
     }
 
-    /// 按下态：`dispatch` 收到主键按下 → `Active`；抬起 → 回到悬停态。
     #[test]
     fn pressing_and_releasing_the_primary_button_moves_through_active() {
         let mut harness = harness();
@@ -1136,7 +950,6 @@ mod tests {
         );
     }
 
-    /// 禁用：`Disabled` 配方 + 不可交互 + `NotAllowed`；按下事件被忽略。
     #[test]
     fn a_disabled_control_paints_the_disabled_recipe_and_ignores_the_pointer() {
         let mut harness = harness_with(|interactive| interactive.disabled(true));
@@ -1163,7 +976,6 @@ mod tests {
         assert!(!harness.interactive.pressed(harness.app.app()));
     }
 
-    /// 加载：与禁用同配方，但 a11y `busy` 为真（语义区分）。
     #[test]
     fn loading_paints_disabled_but_reports_busy_to_a11y() {
         let mut app = TestApp::new();
@@ -1182,7 +994,6 @@ mod tests {
         assert!(record.busy, "加载态必须宣告 busy");
     }
 
-    /// 焦点：`set_focus` + `sync` 后 `bind_style` 画出 2 px `LineFocus` 边框。
     #[test]
     fn a_focused_control_draws_the_focus_border() {
         let mut harness = harness();
@@ -1204,7 +1015,6 @@ mod tests {
         assert_eq!(patch(&harness).border.expect("普通边框").width, 1.0);
     }
 
-    /// 键盘激活：焦点节点上的 Enter / Space 由引擎按 `on_click` 声明分发到同一个回调。
     #[test]
     fn enter_and_space_on_the_focused_control_invoke_the_callback() {
         let calls = Rc::new(Cell::new(0usize));
@@ -1225,7 +1035,6 @@ mod tests {
         assert_eq!(calls.get(), 2, "Enter / Space 各激活一次");
     }
 
-    /// 鼠标点击：按下 + 抬起（指针路径）触发同一个回调。
     #[test]
     fn a_click_invokes_the_callback_and_a_press_does_not() {
         let calls = Rc::new(Cell::new(0usize));
@@ -1248,7 +1057,6 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
-    /// 禁用 / 加载中的程序化派发也被回调守卫拦下（引擎的 `interactive=false` 只拦指针路径）。
     #[test]
     fn programmatic_dispatch_cannot_click_a_disabled_control() {
         let calls = Rc::new(Cell::new(0usize));
@@ -1272,7 +1080,6 @@ mod tests {
         assert_eq!(calls.get(), 0, "禁用按钮的程序化 click 不得触发 on_click");
     }
 
-    /// 四种变体 × 四种状态：`bind_style` 的补丁与主题配方逐色相等。
     #[test]
     fn every_variant_and_state_matches_the_theme_recipe() {
         let cases = [
@@ -1320,7 +1127,6 @@ mod tests {
         }
     }
 
-    /// I3：稳态 `sync` 不写状态、不出帧。
     #[test]
     fn a_settled_control_produces_no_further_frames() {
         let mut harness = harness();
@@ -1337,7 +1143,6 @@ mod tests {
         assert!(!record.rendered, "稳态不得出帧（I3）");
     }
 
-    /// 运行时 `set_disabled` / `set_loading` 只写一次信号；之后 `sync` 走状态迁移。
     #[test]
     fn runtime_flags_drive_the_state_machine() {
         let mut harness = harness();
@@ -1365,7 +1170,6 @@ mod tests {
         );
     }
 
-    /// `force_hover`：弹层盖住控件时不动指针也画成悬停；清除后回到普通态。
     #[test]
     fn force_hover_paints_the_hover_recipe_without_the_pointer() {
         let mut harness = harness_with(|interactive| interactive.force_hover(true));
@@ -1396,7 +1200,6 @@ mod tests {
         );
     }
 
-    /// tooltip 挂点：文本在 `build` 前后都可读（P2-4b 的 tooltip 层按它挂浮层）。
     #[test]
     fn the_tooltip_text_is_kept_for_the_tooltip_layer() {
         let mut app = TestApp::new();
@@ -1413,8 +1216,6 @@ mod tests {
         assert_eq!(interactive.node(), Some(node));
     }
 
-    /// 失效通道：悬停只重算动态属性 + 重绘，**不**标 `LAYOUT`
-    /// （变异：`StylePatch` 加 `affects_layout: true` → 本测试红）。
     #[test]
     fn hovering_repaints_without_marking_layout() {
         let mut harness = harness();
@@ -1448,7 +1249,6 @@ mod tests {
         );
     }
 
-    /// 状态过渡真的由引擎动画时钟推进（`mix` 从 0 到 1）。
     #[test]
     fn the_state_transition_is_animated_by_the_engine() {
         let mut harness = harness();
@@ -1475,7 +1275,6 @@ mod tests {
         );
     }
 
-    /// a11y：角色 / 标签 / 选中态都进快照（变异：删掉 `.a11y` 的 role → 本测试红）。
     #[test]
     fn the_control_declares_role_label_and_state_to_a11y() {
         let mut app = TestApp::new();
@@ -1501,7 +1300,6 @@ mod tests {
         assert_eq!(record.selected, Some(true));
     }
 
-    /// 停用：信号作用域回收，重复调用幂等。
     #[test]
     fn releasing_the_control_reclaims_its_slots() {
         let mut harness = harness();
@@ -1510,7 +1308,6 @@ mod tests {
         assert_eq!(harness.interactive.release(harness.app.app_mut()), 0);
     }
 
-    /// 尺寸阶梯写进布局样式（高度 / 间隙 / 水平内边距），布局盒首帧可读。
     #[test]
     fn the_size_ladder_is_written_into_the_layout_style() {
         let mut app = TestApp::new();

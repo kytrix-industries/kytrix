@@ -1,21 +1,3 @@
-//! The news a subscription retains, and how much of a newer snapshot a list has not been
-//! shown.
-//!
-//! # Order
-//!
-//! News is held newest first, ordered by the timestamp the service stamped it with. A
-//! report that arrives late still belongs where its timestamp says rather than at the
-//! head, and two reports of one timestamp keep the order they arrived in: news is
-//! ordered by the time it happened, not by the order this process happened to see it.
-//!
-//! # Identity
-//!
-//! An item's identity is the allocation that holds it, which a snapshot shares with the
-//! snapshot it inherited it from. That is what makes the difference between two
-//! snapshots the difference between two sets of pointers, and it is why a report that
-//! repeats another one exactly is still its own row — the service reports news, not a
-//! set of strings.
-
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, PoisonError},
@@ -25,13 +7,8 @@ use kytrix_service_provider::service::engine::{NewsEvent, NewsKind};
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
-/// How many items one subscription retains.
-///
-/// A feed is read from the top, so what a pane keeps is what a reader can reach: older
-/// news is dropped rather than kept behind a bound nobody scrolls past.
 pub(super) const MAX_NEWS_ITEMS: usize = 50;
 
-/// The kind of news an item is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NewsCategory {
     General,
@@ -49,7 +26,6 @@ impl From<NewsKind> for NewsCategory {
     }
 }
 
-/// One retained item, and the text its row reads.
 #[derive(Debug)]
 pub(super) struct NewsItem {
     timestamp: i64,
@@ -82,13 +58,6 @@ impl NewsItem {
         self.category
     }
 
-    /// The text of an item that is produced only once something draws it.
-    ///
-    /// A report is retained the moment it arrives, while most of what a feed holds is
-    /// never on screen: formatting a timestamp is the one part of a row that costs
-    /// anything, so it happens here rather than when the item is retained. The clock
-    /// it was formatted in is remembered beside the text, so a frame that draws the
-    /// same zone reuses it and a frame after the setting moved formats it again.
     pub(super) fn display(&self, zone: UtcOffset) -> Arc<NewsItemDisplay> {
         let mut cached = self.display.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((cached_zone, display)) = cached.as_ref()
@@ -103,7 +72,6 @@ impl NewsItem {
     }
 }
 
-/// The part of an item's row that is built rather than borrowed.
 #[derive(Debug)]
 pub(super) struct NewsItemDisplay {
     pub time: SmolStr,
@@ -117,19 +85,11 @@ impl NewsItemDisplay {
     }
 }
 
-/// An immutable, cheap-to-clone view of the retained news.
 #[derive(Clone, Debug, Default)]
 pub(super) struct NewsSnapshot {
     items: Arc<[Arc<NewsItem>]>,
 }
 
-/// Two snapshots are one feed only when they share the allocation holding it.
-///
-/// A snapshot is handed to an engine signal, whose writes are short-circuited when the
-/// value is equal. The retained items are shared between the snapshots a feed grows
-/// through, and a rebuilt feed is a new allocation, so comparing the allocation is the
-/// same distinction the widget itself draws: the same reports in new allocations are a
-/// new feed (see [`has_new_news`] and [`unshown`]).
 impl PartialEq for NewsSnapshot {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.items, &other.items)
@@ -137,20 +97,17 @@ impl PartialEq for NewsSnapshot {
 }
 
 impl NewsSnapshot {
-    /// The news of this snapshot, newest first.
     pub(super) fn items(&self) -> &[Arc<NewsItem>] {
         &self.items
     }
 }
 
-/// The news one subscription retains.
 pub(super) struct NewsState {
     items: VecDeque<Arc<NewsItem>>,
     maximum_items: usize,
 }
 
 impl NewsState {
-    /// Retains up to `maximum_items` items, never more than a feed may hold.
     pub(super) fn new(maximum_items: usize) -> Self {
         let maximum_items = maximum_items.clamp(1, MAX_NEWS_ITEMS);
         Self {
@@ -159,10 +116,6 @@ impl NewsState {
         }
     }
 
-    /// Retains one reported item.
-    ///
-    /// Returns whether the feed changed: a report older than everything a full feed
-    /// holds is refused rather than displacing news that is newer than it.
     pub(super) fn push(&mut self, event: NewsEvent) -> bool {
         if self.items.len() == self.maximum_items
             && self
@@ -174,8 +127,6 @@ impl NewsState {
         }
 
         let item = Arc::new(NewsItem::new(event));
-        // A report that repeats the timestamp of one already held goes in front of it, so
-        // the newest arrival of that instant is the one read first.
         let insertion = self
             .items
             .iter()
@@ -190,7 +141,6 @@ impl NewsState {
         true
     }
 
-    /// The retained news, newest first.
     pub(super) fn snapshot(&self) -> NewsSnapshot {
         let mut items = Vec::with_capacity(self.items.len());
         items.extend(self.items.iter().cloned());
@@ -200,29 +150,6 @@ impl NewsState {
     }
 }
 
-/// Whether a feed a pane is showing is a feed a reader has news to hear in.
-///
-/// A pane that has just opened is not being told news — it is being told what the feed is,
-/// and everything in it happened before the reader was looking. So the first feed a pane
-/// holds is not an arrival, and neither is the feed a reconnect publishes, because a
-/// reconnect publishes the same reports it published before. A feed leading with nothing is
-/// not one a pane was told anything by either: a live subscription that holds no news yet is
-/// what a pane starts from, and the first report to fill it is the first news that pane has.
-///
-/// After that, news is a feed whose lead is not the report it was leading with: the feed is
-/// ordered by the instant its reports happened, so its lead is the newest report the service
-/// has published, and a feed led by somewhere else is a feed the service has published
-/// something new to. The instant is never what is compared — two reports can share one — and
-/// neither is a report that arrived late enough to belong *below* the lead: that report is
-/// news the feed is carrying now, but the feed is quiet about when it got there, and a pane
-/// that announced every reordering of a feed it is showing would be announcing news it has
-/// already shown. What is compared is the allocation holding the report, which a newer feed
-/// shares with the feed it grew from, so news the pane already held is never news twice.
-///
-/// A feed led by a report the pane holds is answered the same way whether or not the rest of
-/// it moved, and a feed rebuilt from scratch leads somewhere else by definition: two feeds
-/// that share reports share the ones they have in common, which is what makes the comparison
-/// mean anything at all.
 pub(super) fn has_new_news(shown: Option<&NewsSnapshot>, published: &NewsSnapshot) -> bool {
     let Some(shown) = shown else {
         return false;
@@ -237,22 +164,11 @@ pub(super) fn has_new_news(shown: Option<&NewsSnapshot>, published: &NewsSnapsho
         .is_some_and(|held| Arc::ptr_eq(held, head))
 }
 
-/// How many of a newer feed's newest reports a list holding `held` has not been shown.
-///
-/// A feed and the list that draws it are both newest first and both bounded to the same
-/// number of reports, so a report the list has not been shown is one at the head of the feed,
-/// and what follows it is the run the list already holds. `None` is a feed the list cannot be
-/// extended into — a report that arrived late enough to belong in the middle of it, or one
-/// that shares no report with what the list holds — and the list a pane draws is built again
-/// for it instead.
 pub(super) fn unshown(held: &[Arc<NewsItem>], next: &[Arc<NewsItem>]) -> Option<usize> {
-    // A list that holds nothing has been shown nothing.
     if held.is_empty() {
         return Some(next.len());
     }
 
-    // Everything the new feed added is at its head, so the first report of it the list
-    // already holds is the first report the two have in common.
     let unshown = next
         .iter()
         .position(|row| held.iter().any(|held| Arc::ptr_eq(held, row)))?;
@@ -267,14 +183,7 @@ pub(super) fn unshown(held: &[Arc<NewsItem>], next: &[Arc<NewsItem>]) -> Option<
         .then_some(unshown)
 }
 
-/// The time of an item, read in the zone the settings display data in.
-///
-/// The service stamps news in UTC, so what a reader sees is that instant converted
-/// by the offset the caller read from the settings.
 fn format_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
-    // The offset can move an instant past the last date the calendar holds — a
-    // timestamp at the far end of the range is one the service cannot publish, and
-    // it is written as a placeholder rather than taken to a date that is not one.
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
         .ok()
         .and_then(|time| time.checked_to_offset(zone))
@@ -323,8 +232,6 @@ mod tests {
 
     #[test]
     fn time_should_read_as_the_instant_the_service_stamped() {
-        // 2023-11-14T22:13:20Z, so a formatter that reads seconds as milliseconds, or
-        // that drops the date, does not pass.
         assert_eq!(
             format_time(1_700_000_000_000, UtcOffset::UTC).as_str(),
             "2023-11-14 22:13:20"
@@ -345,8 +252,6 @@ mod tests {
         assert_eq!(format_time(i64::MAX, UtcOffset::UTC).as_str(), "--");
     }
 
-    /// The display offset can move an instant past the last day the calendar holds.
-    /// That is not a date this can write, so it is a placeholder rather than a panic.
     #[test]
     fn time_the_display_zone_cannot_hold_should_read_as_a_placeholder() {
         let boundary = time::Date::MAX
@@ -484,8 +389,6 @@ mod tests {
         );
     }
 
-    /// A feed that grew at its head is the reports at the head of it a list has not been
-    /// shown, and what the list holds is what follows them however many left at its tail.
     #[test]
     fn unshown_should_count_the_reports_at_the_head_of_a_feed() {
         let mut full = state(
@@ -511,8 +414,6 @@ mod tests {
         );
     }
 
-    /// A list that holds nothing has been shown nothing, so every report of a feed is one it
-    /// has not been shown.
     #[test]
     fn unshown_should_ask_for_every_report_of_a_feed_a_list_holds_nothing_of() {
         let next = state(3, &[2, 1]).snapshot();
@@ -535,8 +436,6 @@ mod tests {
         assert_eq!(unshown(current.items(), next.items()), None);
     }
 
-    /// A report that belongs in the middle of a feed is not a feed a list can be extended
-    /// into: what it holds is replaced rather than rearranged.
     #[test]
     fn unshown_should_ask_for_a_replacement_when_a_report_belongs_in_the_middle() {
         let current = state(MAX_NEWS_ITEMS, &[3, 1]).snapshot();
@@ -548,8 +447,6 @@ mod tests {
         assert_eq!(unshown(current.items(), next.items()), None);
     }
 
-    /// A feed that lost the report a list holds at its head is not one the list can be
-    /// extended into either: what it holds no longer starts where the feed does.
     #[test]
     fn unshown_should_ask_for_a_replacement_when_a_feed_lost_its_head() {
         let current = state(MAX_NEWS_ITEMS, &[3, 2]).snapshot();
@@ -570,16 +467,12 @@ mod tests {
         assert_eq!(unshown(current.items(), next.items()), None);
     }
 
-    /// A pane that has just opened is being told what the feed is, not what arrived.
     #[test]
     fn has_new_news_should_say_nothing_arrived_before_a_pane_had_a_feed() {
         assert!(!has_new_news(None, &state(1, &[1]).snapshot()));
         assert!(!has_new_news(None, &NewsSnapshot::default()));
     }
 
-    /// A live subscription that holds no news yet is what a pane starts from, so the first
-    /// report to fill it is the first news that pane ever has: a pane that said nothing had
-    /// arrived here would be a pane that stayed silent through the arrival it exists for.
     #[test]
     fn has_new_news_should_say_the_first_report_a_pane_ever_has_arrived() {
         let empty = NewsSnapshot::default();
@@ -598,10 +491,6 @@ mod tests {
         assert!(!has_new_news(Some(&snapshot), &snapshot));
     }
 
-    /// A report older than the whole feed is refused by the feed itself, and the one that
-    /// belongs in the middle of it is not the report a feed leads with: a feed says it has
-    /// news by leading somewhere else, and news that arrived late enough to belong below the
-    /// lead is news the pane has already been shown.
     #[test]
     fn has_new_news_should_say_the_lead_is_what_arrived() {
         let mut feed = state(3, &[2, 1]);
@@ -628,11 +517,6 @@ mod tests {
         );
     }
 
-    /// A feed is ordered by the instant its reports happened, so a report that reached the
-    /// service late can be inserted below the lead of a feed a pane is already showing. The
-    /// row is drawn — the list is built again for it — but the feed is quiet about when that
-    /// report got there, and what the sound answers is "the feed has published something new
-    /// to lead with", so this is not an arrival.
     #[test]
     fn has_new_news_should_say_nothing_arrived_for_a_report_below_the_lead() {
         let mut feed = state(MAX_NEWS_ITEMS, &[3, 1]);
@@ -651,10 +535,6 @@ mod tests {
         assert!(!has_new_news(Some(&current), &published));
     }
 
-    /// A feed that shares nothing with what a pane holds is a list built again, not a list
-    /// extended: what it dropped is not news, so whether it is an arrival is whether it leads
-    /// somewhere else. A feed whose newest report is one the pane was already reading is a
-    /// pane being told about the same news in a new set of allocations.
     #[test]
     fn has_new_news_should_compare_a_replaced_feed_by_its_lead() {
         let all = state(
@@ -679,9 +559,6 @@ mod tests {
         );
     }
 
-    /// What makes two feeds comparable is that they share the reports they have in common:
-    /// a feed rebuilt from scratch describes the same news as a set of allocations the pane
-    /// has never been shown, which is why a pane that is handed one starts over.
     #[test]
     fn has_new_news_should_not_be_fooled_by_a_feed_that_repeats_itself() {
         let current = state(2, &[2, 1]).snapshot();

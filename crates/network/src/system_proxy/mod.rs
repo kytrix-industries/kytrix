@@ -1,5 +1,3 @@
-//! Operating-system proxy discovery and PAC evaluation.
-
 #[cfg(any(windows, target_os = "linux"))]
 pub(super) mod bypass;
 mod core;

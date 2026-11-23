@@ -1,10 +1,3 @@
-//! The day-gate case: what a daily candle is bounded by, and what a non-regular print
-//! may reach (§4.6; §14.1 item 5).
-//!
-//! The session table this case checks against is [`crate::grid`]'s — the one table the
-//! suite states — so a change to the venue's windows shows up here as a failing
-//! assertion rather than as a diagnostic nobody reads.
-
 use ahash::{AHashMap, AHashSet};
 use longbridge_proto::quote::{
     AdjustType, Direction, Period, SecurityCandlestickResponse, TradeSession,
@@ -23,8 +16,6 @@ use crate::{
     socket::LiveSocket,
     wire::{GET_SECURITY_CANDLESTICKS, GET_SECURITY_HISTORY_CANDLESTICKS},
 };
-/// Case 11 — the day gate: a `DAY` candle's boundary, and what a non-regular
-/// session may not produce (§4.6; §14.1 item 5).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_11_a_day_candle_starts_at_the_markets_midnight() {
@@ -92,9 +83,6 @@ async fn live_case_11_a_day_candle_starts_at_the_markets_midnight() {
             days.candlesticks.len()
         );
 
-        // Non-regular prints and the buckets they may reach: a pre or post print
-        // may only reach a minute bucket, and the day bucket it would fall in is
-        // reported so a reader can see that it is the same day the venue published.
         let mut non_regular: AHashMap<String, usize> = AHashMap::with_capacity(3);
         let mut pre_post_minute_buckets: AHashSet<i64> = AHashSet::with_capacity(16);
         let published_days: AHashSet<i64> = days
@@ -129,13 +117,6 @@ async fn live_case_11_a_day_candle_starts_at_the_markets_midnight() {
              candles"
         );
 
-        // The overnight session is the one window the venue's own series states (§4.6,
-        // §4.8), asserted rather than described: it opens at 20:00 and runs to 04:00 of
-        // the next morning, crossing the market's midnight, and the venue's own 45-minute
-        // series is what says so — `23:45` is followed by `00:30` on the same 2700-second
-        // grid. The half-day table's own gap is the control: 17:30 of a half day is between
-        // its post session's 17:00 close and the evening window's 20:00 open, so it is
-        // inside no session at all.
         let today = market_date(now_millis());
         for (hour, ordinary, half_day) in [
             (2, Some(TradeSession::OvernightTrade), Some(TradeSession::OvernightTrade)),
@@ -162,12 +143,6 @@ async fn live_case_11_a_day_candle_starts_at_the_markets_midnight() {
                  post session's close and the evening window's open"
             );
         }
-        // The overnight grid's own buckets, named by the venue's series: its 45-minute
-        // overnight candles are `20:00 / 20:45 / 21:30 / 22:15 / 23:00 / 23:45 / 00:30`, so
-        // the last bucket it published before this run's window closed is 00:30 and the
-        // minute the screen's 1m series ends on (00:39) belongs to it. `01:15` is the next
-        // bucket on that same grid, which is why the assertion below is stated on an instant
-        // that is *inside* one rather than on a boundary.
         let last_small_hour = market_instant(&today, 0, 39);
         assert_eq!(
             bucket_start(last_small_hour, Some(45 * 60_000)).map(market_clock),

@@ -1,29 +1,16 @@
-//! The calendar side of a candle: which period of the market's own calendar it is
-//! bounded by, and the instant that period opens at.
-//!
-//! A calendar candle is not a fixed length — a week is not seven days of trading and a
-//! year is not 365 of them — so its boundary is a date in the market's zone rather than
-//! an interval counted from a session's open. Resolving that date back to an instant
-//! goes through the zone's own rules, which is why the market's midnight rather than
-//! UTC's is what a day candle starts at.
-
 use jiff::{Timestamp, Zoned, civil, tz::TimeZone};
 
 use crate::market::timeframe::TimeFrame;
 
-/// Where one instant's candle starts, in the market's own terms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CandleBucket {
-    /// A fixed-length candle: the instant the bucket opened, in milliseconds.
     Start(i64),
-    /// A calendar candle: the market-local midnight of the period it belongs to.
     Calendar {
         date: civil::Date,
         unit: CalendarUnit,
     },
 }
 
-/// The calendar period a calendar-scale candle is bounded by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CalendarUnit {
     Day,
@@ -34,12 +21,6 @@ pub(crate) enum CalendarUnit {
 }
 
 impl CandleBucket {
-    /// The instant this bucket opens at, in the market's own zone.
-    ///
-    /// A fixed-length bucket carries its opening instant outright. A calendar bucket is
-    /// a market-local midnight, which is where the zone's rules matter: the instant is
-    /// resolved through `jiff` rather than computed from an offset, so the two days a
-    /// US year changes its offset are the ones a reader can check against the venue.
     pub(crate) fn start(self, zone: &TimeZone) -> Option<Zoned> {
         match self {
             Self::Start(millis) => {
@@ -51,11 +32,6 @@ impl CandleBucket {
     }
 }
 
-/// The market-local midnight a calendar-scale candle of one instant belongs to.
-///
-/// The period is read in the market's own zone and then resolved back to an instant
-/// through the same zone, so a week starts on a Monday the venue would agree with and a
-/// day starts at the market's midnight rather than at UTC's.
 pub(crate) fn calendar_bucket(local: Zoned, unit: CalendarUnit) -> Option<civil::Date> {
     let date = local.date();
     Some(match unit {
@@ -76,7 +52,6 @@ pub(crate) fn calendar_bucket(local: Zoned, unit: CalendarUnit) -> Option<civil:
     })
 }
 
-/// The calendar period one timeframe is bounded by, when it is a calendar one.
 pub(crate) const fn calendar_unit(timeframe: TimeFrame) -> Option<CalendarUnit> {
     match timeframe {
         TimeFrame::Day1 => Some(CalendarUnit::Day),
@@ -88,12 +63,6 @@ pub(crate) const fn calendar_unit(timeframe: TimeFrame) -> Option<CalendarUnit> 
     }
 }
 
-/// How long one fixed-length timeframe is, when it is a fixed-length one.
-///
-/// The durations are read off the venue's own period table rather than derived from the
-/// interval's name: a `4h` candle is the venue's `FOUR_HOUR`, which is 240 minutes, and
-/// the two are the same number stated twice on purpose — the table is the wire's and
-/// this is the grid's.
 pub(crate) const fn fixed_interval_millis(timeframe: TimeFrame) -> Option<i64> {
     let minutes = match timeframe {
         TimeFrame::Minute1 => 1,

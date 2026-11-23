@@ -1,59 +1,3 @@
-//! One wallet's last six hours of fills, drawn as an axis with a marker per bucket.
-//!
-//! # Why it is painted rather than laid out
-//!
-//! A bucket can hold dozens of fills and the axis is rebuilt whenever the window changes, so
-//! the markers are painted by one canvas instead of being built as elements: a hundred
-//! absolutely positioned divs would be a hundred elements the layout engine has to place on
-//! every frame, and none of them would be cheaper to draw than a rectangle.
-//!
-//! The canvas is a **value**: the node is built once by the row factory and every frame that
-//! has something new to draw hands it a [`Canvas`] through
-//! [`WidgetCx::set_canvas`](widget::cx::WidgetCx::set_canvas). What a frame *keeps* is the
-//! prepared key beside the canvas, so a steady `sync` — a snapshot that has not moved, at the
-//! same box, in the same appearance, language and with the pointer where it was — writes no
-//! canvas and asks for no frame (I3). Everything the drawing is a function of is in that key:
-//! the snapshot's identity, the node's bounds, the axis geometry the labels give, the hovered
-//! marker, the colours an appearance resolves, the language and the raster scale the labels
-//! were shaped at.
-//!
-//! # What is cached, and against what
-//!
-//! The geometry of a timeline is a pure function of three things — the buckets, the plot width
-//! and the width of the start label — so it is cached against exactly those three and thrown
-//! away when one of them changes. Shaped text is cached the same way, against the text and its
-//! style (which carries the colour and the size), which is what keeps a frame that only moves
-//! the pointer from re-shaping the same labels. A handle whose atlas lease has gone is
-//! re-shaped rather than drawn: the engine refuses to encode stale glyph runs, and the frame
-//! that ran into one is rebuilt instead of kept.
-//!
-//! # The reader's fills are drawn, not laid out
-//!
-//! A marker's fills used to be a hover card on the toolkit's popup primitive with a scrollable
-//! uniform list in it; both are gone. The pointer's position is passed in by the row, the
-//! margin the marker occupies is hit-tested here, and the newest fills of that one bucket are
-//! painted over the axis as a compact panel — up to [`TOOLTIP_VISIBLE_ROWS`] of them, fewer if
-//! the band is too short to hold them. Two behaviours of the old card are therefore gone with
-//! it, and they are the only behavioural differences of this port:
-//!
-//! - **no hover delays**: the open/close delays belonged to the popup primitive, so the panel
-//!   is drawn for the marker under the pointer immediately. The panel still keeps itself open
-//!   while the pointer is inside *it*, because two positions inside one panel are one drawing;
-//! - **no scrollable list**: the panel draws the newest rows it has room for instead of a
-//!   scroll handle per bucket. That is also why the old per-bucket `UniformListScrollHandle`
-//!   map and its release are gone.
-//!
-//! The old timeline also scrolled horizontally below its minimum content width; the row now
-//! gives the canvas the list's width and a narrow pane simply draws a narrower plot (the
-//! bucket count follows the width, down to one bucket).
-//!
-//! # The axis labels are furniture
-//!
-//! The two ends of the axis are its time ticks, so they are read in the chart's own axis
-//! colour, not in a text role: a chart's labels are its furniture. The letter inside a marker
-//! is painted in the window's own background, which reads as a cut-out whatever colour the
-//! marker is.
-
 use std::sync::Arc;
 
 use ahash::AHashMap;
@@ -93,20 +37,12 @@ use widget::cx::WidgetCx;
 
 use super::model::{AgeBucket, DisplayPrecision, TimelineSnapshot, age_bucket, now_millis};
 
-/// The height of one wallet's timeline band.
-///
-/// The row builds a box of this height under the account line and the canvas fills it; the
-/// geometry below is centred in it, so the axis does not depend on where in the row it sits.
 pub(super) const HEIGHT: f32 = 136.0;
 
-/// The window a timeline covers, which is also the window one request asks for.
 pub(super) const WINDOW_MILLIS: i64 = 6 * 60 * 60 * 1_000;
 
-/// The width one bucket occupies, which decides how many of them there are.
 const BUCKET_WIDTH: f32 = 24.0;
-/// The gap between the axis and the label at either end of it.
 const AXIS_LABEL_GAP: f32 = 8.0;
-/// Where the axis sits inside the band: the middle of it.
 const AXIS_Y: f32 = HEIGHT / 2.0;
 const AXIS_LINE_HEIGHT: f32 = 1.0;
 const AXIS_TICK_HEIGHT: f32 = 8.0;
@@ -116,30 +52,18 @@ const MARKER_GAP: f32 = 6.0;
 const MARKER_AXIS_GAP: f32 = 4.0;
 const MARKER_RADIUS_RATIO: f32 = 0.22;
 const MARKER_FONT_RATIO: f32 = 0.68;
-/// The smallest a letter inside a marker is drawn.
 const MARKER_MIN_FONT_SIZE: f32 = 10.0;
 const CONNECTOR_WIDTH: f32 = 1.0;
-/// The widest the panel of a marker's fills is drawn.
 const TOOLTIP_WIDTH: f32 = 320.0;
 const TOOLTIP_ROW_HEIGHT: f32 = 18.0;
-/// How many fills of a bucket the panel shows at most.
 const TOOLTIP_VISIBLE_ROWS: usize = 6;
 const TOOLTIP_PADDING: f32 = 4.0;
-/// The gap between the panel and the marker it opens beside, and between it and the band.
 const TOOLTIP_GAP: f32 = 4.0;
-/// The panel's corner radius: the toolkit's `rounded_sm` at this application's rem.
 const TOOLTIP_CORNER_RADIUS: f32 = 4.0;
-/// How many shaped lines one timeline keeps.
-///
-/// The two axis labels, the two marker letters and three lines for each of the panel's rows:
-/// twice the working set of one frame, so a language or appearance change does not evict the
-/// lines the frame before was drawn from.
 const TEXT_CACHE_CAPACITY: usize = 64;
 
-/// The debug id of the canvas node one row's timeline is drawn on.
 const TIMELINE_SELECTOR: &str = "TEST_HYPERLIQUID_WALLET_TIMELINE";
 
-/// One side of one bucket: the fills that were traded in that slot of the axis.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TimelineBucket {
     pub side: Side,
@@ -147,7 +71,6 @@ pub(super) struct TimelineBucket {
     pub fill_indices: Vec<usize>,
 }
 
-/// What a fill did to the position it landed on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FillDirection {
     Long,
@@ -159,11 +82,6 @@ pub(super) enum FillDirection {
     Unknown,
 }
 
-/// One fill of a bucket, as the panel shows it.
-///
-/// A row carries the units it was read with rather than text: what a quantity counts and what
-/// its price is quoted in are properties of the listing, so a panel that is drawn while another
-/// reading arrives still names its own units.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TooltipRow {
     timestamp: i64,
@@ -175,7 +93,6 @@ struct TooltipRow {
 }
 
 impl TooltipRow {
-    /// The quantity of this row, named in the unit its listing publishes it in.
     fn quantity_text(&self, precision: &DisplayPrecision, translate: &Translate) -> SmolStr {
         let value = precision
             .format_listing_quantity(&self.listing, self.quantity.value)
@@ -186,7 +103,6 @@ impl TooltipRow {
         }
     }
 
-    /// The price of this row, in the quote asset its listing publishes it against.
     fn price_text(&self, precision: &DisplayPrecision, translate: &Translate) -> SmolStr {
         let value = precision
             .format_listing_price(&self.listing, self.price.value)
@@ -198,10 +114,6 @@ impl TooltipRow {
     }
 }
 
-/// One marker's place on the axis, and the connector that joins it to the axis.
-///
-/// Coordinates are the canvas' own: the origin is the top-left of the box the node was laid
-/// out in, and painting translates the whole geometry by that box's origin.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MarkerGeometry {
     side: Side,
@@ -210,7 +122,6 @@ struct MarkerGeometry {
     connector: Rect,
 }
 
-/// Where everything on one timeline is drawn.
 #[derive(Debug, PartialEq)]
 struct TimelineGeometry {
     axis: Rect,
@@ -292,17 +203,12 @@ impl TimelineGeometry {
         }
     }
 
-    /// The marker of one bucket side, once the geometry was built.
     fn marker(&self, side: Side, bucket_index: usize) -> Option<&MarkerGeometry> {
         self.markers
             .iter()
             .find(|marker| marker.side == side && marker.bucket_index == bucket_index)
     }
 
-    /// The marker under `point`, if any.
-    ///
-    /// The markers of one bucket are painted in order, so the last one that contains the
-    /// point is the one a reader is pointing at.
     fn marker_at(&self, point: Point) -> Option<&MarkerGeometry> {
         self.markers
             .iter()
@@ -329,18 +235,10 @@ fn finite_width(width: f32) -> f32 {
     }
 }
 
-/// The width the plot is drawn at inside a canvas `width` wide.
-///
-/// The canvas *is* the plot: the row lays it out across the list's width and the two end
-/// labels are shaped into the margins of the axis in [`TimelinePaint::sync`]. The guard is the
-/// one old entry point had — a layout that has not run yet answers `0`, and a non-finite box
-/// must not reach the bucket math — so a canvas that is not laid out yet draws nothing rather
-/// than one degenerate plot.
 pub(super) fn plot_width(width: f32) -> f32 {
     finite_width(width)
 }
 
-/// The width of the axis itself, once both labels have their room.
 fn axis_line_width(total_width: f32, start_label_width: f32, end_label_width: f32) -> f32 {
     if !total_width.is_finite() || total_width <= 0.0 {
         return 1.0;
@@ -349,7 +247,6 @@ fn axis_line_width(total_width: f32, start_label_width: f32, end_label_width: f3
     (total_width - occupied).max(1.0)
 }
 
-/// How many buckets a plot of `width` is divided into.
 fn bucket_count(width: f32) -> usize {
     if !width.is_finite() || width <= 0.0 {
         return 1;
@@ -357,14 +254,11 @@ fn bucket_count(width: f32) -> usize {
     (width / BUCKET_WIDTH).floor().max(1.0) as usize
 }
 
-/// How long one bucket covers.
 fn bucket_width_millis(width: f32) -> i64 {
-    // A sub-millisecond bucket could not represent another timestamp boundary.
     let count = bucket_count(width).min(WINDOW_MILLIS as usize) as i64;
     (WINDOW_MILLIS + count - 1) / count
 }
 
-/// Assigns every fill of a snapshot to the slot of the side it was traded on.
 fn build_buckets(snapshot: &TimelineSnapshot, width: f32) -> Vec<TimelineBucket> {
     let count = bucket_count(width);
     let bucket_width = bucket_width_millis(width);
@@ -401,7 +295,6 @@ fn build_buckets(snapshot: &TimelineSnapshot, width: f32) -> Vec<TimelineBucket>
     result
 }
 
-/// The fills of one bucket, newest first.
 fn tooltip_rows(
     snapshot: &TimelineSnapshot,
     bucket: &TimelineBucket,
@@ -439,11 +332,6 @@ fn tooltip_rows(
         .collect()
 }
 
-/// Whether a fill opened or closed a long or a short position.
-///
-/// The venue's own answer is used when it gave one, and a fill that only says where the
-/// position started is read from that: a settlement, or a fill with no direction at all, is
-/// still on the side the position was on when it happened.
 fn perpetual_direction(fill: &HyperliquidUserFill) -> FillDirection {
     match fill.direction.as_ref() {
         Some(HyperliquidFillDirection::OpenLong | HyperliquidFillDirection::CloseLong) => {
@@ -489,7 +377,6 @@ fn side_rank(side: Side) -> u8 {
     }
 }
 
-/// What a fill's panel row says about the position it moved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FillTone {
     Up,
@@ -497,10 +384,6 @@ enum FillTone {
     Neutral,
 }
 
-/// The label and tone of one fill's panel row.
-///
-/// A fill is read by what it did to a position, so a perpetual fill is named by the move it
-/// made; a spot fill names the market it happened on.
 fn fill_label(row: &TooltipRow, side: Side, translate: &Translate) -> (SmolStr, FillTone) {
     match row.kind {
         InstrumentKind::Spot => (
@@ -552,10 +435,6 @@ fn fill_label(row: &TooltipRow, side: Side, translate: &Translate) -> (SmolStr, 
     }
 }
 
-/// The age of a moment, as the one relative time every row of this widget is read by.
-///
-/// The detail tables are the widget's other reader of it: a table's time cell and a timeline's
-/// tooltip are the same sentence about the same clock, so they are one function.
 pub(super) fn age_text(now: i64, timestamp: i64, translate: &Translate) -> SmolStr {
     match age_bucket(now, timestamp) {
         AgeBucket::Seconds(value) => {
@@ -589,7 +468,6 @@ pub(super) fn age_text(now: i64, timestamp: i64, translate: &Translate) -> SmolS
     }
 }
 
-/// The two labels the axis is drawn between.
 fn axis_labels(translate: &Translate) -> (SmolStr, SmolStr) {
     (
         t_smol!(translate, "widget.hyperliquid_wallet.timeline_start"),
@@ -597,25 +475,16 @@ fn axis_labels(translate: &Translate) -> (SmolStr, SmolStr) {
     )
 }
 
-/// The colours one frame of a timeline is drawn with, resolved from the theme.
-///
-/// The canvas bakes them in, which is why the appearance is one of the prepared key's inputs:
-/// a canvas built for the light appearance is the wrong value for the dark one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TimelineColors {
-    /// The axis line, its ticks and the connectors: chart grid, not a text colour.
     axis: Color,
-    /// The two end labels: chart furniture, read in the axis colour.
     axis_label: Color,
-    /// Marker outlines and the panel's edge.
     divider: Color,
     up: Color,
     down: Color,
-    /// The letter inside a marker, painted in the surface it cuts out of.
     marker_text: Color,
     neutral: Color,
     muted: Color,
-    /// The panel a marker's fills are drawn on, which sits over everything else.
     panel: Color,
 }
 
@@ -657,11 +526,9 @@ fn solid_quad(bounds: Rect, fill: Color) -> Quad {
     }
 }
 
-/// What a timeline is showing, and the buckets its fills were assigned to.
 struct TimelineData {
     snapshot: Option<Arc<TimelineSnapshot>>,
     buckets: Arc<[TimelineBucket]>,
-    /// The plot width the buckets were assigned for.
     plot_width: f32,
 }
 
@@ -676,10 +543,6 @@ impl Default for TimelineData {
 }
 
 impl TimelineData {
-    /// Takes a published snapshot, and says whether anything a frame draws changed.
-    ///
-    /// The ten-second cadence publishes the same window whenever a wallet has not traded, so an
-    /// unchanged snapshot is recognised by identity rather than by comparing fills.
     fn replace_snapshot(&mut self, snapshot: Option<&Arc<TimelineSnapshot>>) -> bool {
         let same = match (&self.snapshot, snapshot) {
             (Some(current), Some(next)) => Arc::ptr_eq(current, next),
@@ -697,11 +560,6 @@ impl TimelineData {
         true
     }
 
-    /// Records the plot width the timeline was laid out at, and rebuckets if it changed.
-    ///
-    /// A width that moved by less than half a pixel is the same width — layout rounding must
-    /// not throw the buckets away — but a move that crosses a bucket boundary is a new plot
-    /// even when the pixel width barely changed.
     fn set_plot_width(&mut self, plot_width: f32) -> bool {
         let plot_width = finite_width(plot_width);
         let rebucket = bucket_count(self.plot_width) != bucket_count(plot_width);
@@ -727,7 +585,6 @@ impl TimelineData {
     }
 }
 
-/// One shaped line, kept until the text or the style it was shaped for changes.
 struct CachedTextLine {
     text: SmolStr,
     style: TextStyle,
@@ -740,7 +597,6 @@ impl CachedTextLine {
     }
 }
 
-/// The geometry one prepared frame was laid out from.
 struct GeometryCacheEntry {
     buckets: Arc<[TimelineBucket]>,
     plot_width: f32,
@@ -748,9 +604,6 @@ struct GeometryCacheEntry {
     geometry: Arc<TimelineGeometry>,
 }
 
-/// Everything one timeline remembers between frames.
-///
-/// It is bounded: one geometry and a fixed number of shaped lines.
 #[derive(Default)]
 struct PaintCache {
     geometry: Option<GeometryCacheEntry>,
@@ -788,18 +641,12 @@ impl PaintCache {
         geometry
     }
 
-    /// A shaped line for `text`, from the cache when it is already there.
-    ///
-    /// A handle whose atlas lease has gone is dropped and shaped again: the glyphs it named
-    /// have been reused, so drawing it would be drawing another line's pixels.
     fn line(&mut self, app: &mut App, text: &str, style: &TextStyle) -> Arc<ShapedTextHandle> {
         if let Some(index) = self
             .text_lines
             .iter()
             .position(|entry| entry.matches(text, style))
         {
-            // Refreshing recency by moving the entry to the back is what makes the capacity
-            // below evict the least recently used line.
             let entry = self.text_lines.remove(index);
             if !entry.line.is_stale() {
                 let line = entry.line.clone();
@@ -809,8 +656,6 @@ impl PaintCache {
         }
 
         let line = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
-            // Text that cannot be shaped at all is drawn as nothing rather than failing the
-            // frame: a label is not worth a dropped frame, and the next frame tries again.
             app.shape_text("", style, None, &[])
                 .expect("an empty line always shapes")
         }));
@@ -826,7 +671,6 @@ impl PaintCache {
     }
 }
 
-/// The width of the two axis labels, and the lines they were shaped with.
 struct LabelMetrics {
     labels: (SmolStr, SmolStr),
     color: Color,
@@ -851,12 +695,6 @@ impl LabelMetrics {
     }
 }
 
-/// The inputs one canvas was built from.
-///
-/// Everything a frame reads has to be in here, or a change to it would keep serving the canvas
-/// from before the change: the snapshot's identity, the box the node was laid out in, the two
-/// label widths the axis geometry was a function of, the hovered marker, the colours the
-/// appearance resolves, the language and the raster scale the labels were shaped at.
 struct PreparedKey {
     snapshot: Option<Arc<TimelineSnapshot>>,
     bounds: Rect,
@@ -896,29 +734,15 @@ impl PreparedKey {
     }
 }
 
-/// One wallet's timeline: the canvas node it draws into, what it last drew, and the caches a
-/// frame reuses.
 pub(super) struct TimelinePaint {
     node: Option<NodeId>,
     data: TimelineData,
     cache: PaintCache,
     labels: Option<LabelMetrics>,
-    /// What the canvas on screen was built from.
     prepared: Option<PreparedKey>,
-    /// The shaped lines the canvas on screen was built from.
-    ///
-    /// A canvas is a value and the timeline keeps the one it built, but the *glyphs* a canvas
-    /// names are leased from a shared atlas: an atlas generation change or a per-tile eviction
-    /// leaves the handles it was built from pointing at reused texture, and the engine drops
-    /// such runs at encode time. The lines recorded here are the ones whose lease a steady
-    /// frame has to check.
     painted_text: Vec<Arc<ShapedTextHandle>>,
-    /// The marker the panel is open on, kept so the pointer can move from the marker into the
-    /// panel without the panel closing underneath it.
     hovered: Option<(Side, usize)>,
-    /// The box the canvas was last cleared for, while the row has no reading to draw.
     empty_bounds: Option<Rect>,
-    /// The language the canvas' accessible name was last written in.
     a11y_language: Option<LanguageCode>,
 }
 
@@ -937,11 +761,6 @@ impl TimelinePaint {
         }
     }
 
-    /// Repaints only when the frame this one would be is not the one already drawn.
-    ///
-    /// `hover` is the pointer inside the canvas, in the canvas' own coordinates, when the row
-    /// is hovered. A canvas whose box the layout has not given yet has no width to divide into
-    /// buckets, so it is left alone and the next `sync` draws it.
     pub(super) fn sync(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -958,14 +777,10 @@ impl TimelinePaint {
         };
         let bounds = target.layout().bounds;
         if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 || !bounds.is_finite() {
-            // The frame that laid the node out has not run yet; the next one will.
             return Ok(());
         }
 
         let Some(snapshot) = snapshot else {
-            // The row's own overlay says why there is nothing to draw: an empty canvas is what
-            // the node holds until a reading arrives, and a second frame for the same box is
-            // not a change.
             if self.empty_bounds == Some(bounds) {
                 return Ok(());
             }
@@ -997,8 +812,6 @@ impl TimelinePaint {
             colors.axis_label,
             text_scale,
         );
-        // A canvas too narrow to keep both labels beside the axis draws the axis alone rather
-        // than over painting the box it was given.
         let (start_label_width, end_label_width) =
             if label_widths.0 + label_widths.1 + AXIS_LABEL_GAP * 2.0 < plot_width {
                 label_widths
@@ -1027,8 +840,6 @@ impl TimelinePaint {
             return Ok(());
         }
 
-        // A canvas is an image to assistive technology: the title the row's account line says
-        // in words is what its drawing is called.
         if self.a11y_language != Some(language_now) {
             cx.set_a11y_patch(
                 node,
@@ -1080,19 +891,12 @@ impl TimelinePaint {
             });
             self.painted_text = painted_text;
         } else {
-            // An incomplete canvas is not what the timeline draws: leaving the key unrecorded
-            // is what makes the next frame build it again (I3 still holds — a whole frame is
-            // still a short circuit).
             self.prepared = None;
             self.painted_text.clear();
         }
         Ok(())
     }
 
-    /// Drops everything the timeline remembered about the row it was drawn in.
-    ///
-    /// The row's list removes the canvas node itself; a timeline that registered geometry
-    /// would hand it back here, and this one registers none (quads and glyph runs only).
     pub(super) fn release(&mut self, _cx: &mut WidgetCx<'_>) {
         self.node = None;
         self.data = TimelineData::default();
@@ -1105,7 +909,6 @@ impl TimelinePaint {
         self.a11y_language = None;
     }
 
-    /// Shapes the two end labels, or reuses the lines and widths a frame already has.
     fn ensure_labels(
         &mut self,
         app: &mut App,
@@ -1143,10 +946,6 @@ impl TimelinePaint {
         )
     }
 
-    /// Records where the pointer is, answering the marker whose panel is open.
-    ///
-    /// Moving inside one marker is not a movement, and neither is moving from the marker into
-    /// the panel it opened: the marker's panel staying open is what lets a reader point at it.
     fn resolve_hover(
         &mut self,
         hover: Option<Point>,
@@ -1185,13 +984,6 @@ impl TimelinePaint {
     }
 }
 
-/// Builds the canvas node inside a list row.
-///
-/// There is no `App` in a row factory: the node is built empty (`Rect::default()`) and the
-/// first [`TimelinePaint::sync`] after it was laid out is what fills it in. The node registers
-/// a theme dependency so an appearance switch invalidates it and schedules the frame whose
-/// `sync` resolves the new colours (G3); the language dependency is the row's own bound title
-/// text, whose write schedules the same frame.
 pub(super) fn build_canvas(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -1223,7 +1015,6 @@ fn tooltip_row_limit(height: f32) -> usize {
     rows.min(TOOLTIP_VISIBLE_ROWS)
 }
 
-/// Where the panel of one marker's fills is drawn, in the canvas' coordinates.
 fn tooltip_panel(marker: &MarkerGeometry, width: f32, height: f32, rows: usize) -> Rect {
     let panel_width = TOOLTIP_WIDTH.min((width - TOOLTIP_GAP * 2.0).max(1.0));
     let panel_height = (rows as f32 * TOOLTIP_ROW_HEIGHT + TOOLTIP_PADDING * 2.0)
@@ -1244,17 +1035,14 @@ fn tooltip_panel(marker: &MarkerGeometry, width: f32, height: f32, rows: usize) 
     Rect::new(left, top, panel_width, panel_height)
 }
 
-/// The shaped text one frame pushes, and whether every line reached the canvas.
 struct TextPainter<'a> {
     app: &'a mut App,
     cache: &'a mut PaintCache,
-    /// The lines this frame pushed, which are the canvas' text.
     used: Vec<Arc<ShapedTextHandle>>,
     whole: bool,
 }
 
 impl TextPainter<'_> {
-    /// The shaped line of `text`, or `None` for text that has nothing to draw.
     fn line(&mut self, text: &str, style: &TextStyle) -> Option<Arc<ShapedTextHandle>> {
         if text.is_empty() {
             return None;
@@ -1262,11 +1050,6 @@ impl TextPainter<'_> {
         Some(self.cache.line(self.app, text, style))
     }
 
-    /// Pushes one shaped line at `origin`.
-    ///
-    /// A refused line is one whose atlas lease died between being shaped and being pushed: its
-    /// glyphs have been reused, so the run is left out rather than drawn from stale texture,
-    /// and the pass is not a whole frame any more.
     fn place(&mut self, canvas: &mut Canvas, line: &Arc<ShapedTextHandle>, origin: Point) {
         if canvas.push_shaped_text(line, origin) {
             self.used.push(line.clone());
@@ -1276,7 +1059,6 @@ impl TextPainter<'_> {
     }
 }
 
-/// One frame's drawing, ready to be built into a canvas.
 struct Frame<'a> {
     app: &'a mut App,
     bounds: Rect,
@@ -1295,10 +1077,6 @@ struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    /// Draws one frame of a timeline into a canvas.
-    ///
-    /// Commands below the connectors first: a bucket whose two sides meet at the axis still
-    /// shows a continuous join under both markers.
     fn paint(self, cache: &mut PaintCache) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
         let Self {
             app,
@@ -1318,8 +1096,6 @@ impl Frame<'_> {
         } = self;
         let origin = bounds.origin;
         let mut canvas = Canvas::new(bounds);
-        // The masked drawing the reference did: the frame is clipped to the box the node ended
-        // up with, so a rounding error cannot paint over a sibling.
         let _ = canvas.push_clip(ClipRect {
             rect: bounds,
             corner_radius: [0.0; 4],
@@ -1418,7 +1194,6 @@ impl Frame<'_> {
     }
 }
 
-/// The panel one hovered marker opens, drawn over the axis.
 struct TooltipFrame<'a> {
     bounds: Rect,
     colors: TimelineColors,
@@ -1523,7 +1298,6 @@ mod tests {
         address, empty_timeline, fill, listing_key, perpetual_route, precision_for, test_routes,
     };
 
-    /// The listing every test fill was traded on.
     fn listing() -> VenueListingKey {
         listing_key(&perpetual_route(), "ETH")
     }
@@ -1539,8 +1313,6 @@ mod tests {
     fn precision() -> DisplayPrecision {
         precision_for(test_routes())
     }
-
-    // ── the pure behaviour the old module specified ─────────────────────────
 
     #[test]
     fn each_fill_is_assigned_to_one_side_bucket() {
@@ -1893,9 +1665,6 @@ mod tests {
         assert_eq!(bucket_count(data.plot_width), 1);
     }
 
-    // ── the canvas: what one frame actually paints ──────────────────────────
-
-    /// One timeline drawn into a page of a fixed size, the way a list row lays it out.
     struct TimelineHarness {
         app: WidgetTestApp,
         node: NodeId,
@@ -1904,7 +1673,6 @@ mod tests {
         snapshot: Option<Arc<TimelineSnapshot>>,
     }
 
-    /// The translator the product ships: what these tests assert is the catalogue's copy.
     fn product_translate(language: LanguageCode) -> Translate {
         Translate::new(
             std::rc::Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -1960,7 +1728,6 @@ mod tests {
         })
     }
 
-    /// Builds one timeline over a page, lays it out, and paints the first frame.
     fn harness(snapshot: Option<Arc<TimelineSnapshot>>) -> TimelineHarness {
         let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
         let window_page = page(&mut app, 720.0, HEIGHT);
@@ -1977,8 +1744,6 @@ mod tests {
             precision: precision(),
             snapshot,
         };
-        // The first frame lays the page (and the canvas inside it) out; the sync after it is
-        // the frame that paints the box the canvas was measured for.
         harness.app.drain();
         harness.sync(None);
         harness.app.drain();
@@ -2036,8 +1801,6 @@ mod tests {
             .expect("the canvas builds");
         app.drain();
 
-        // The node was laid out, but no frame wrote a canvas: the node's own paint is still the
-        // one opaque canvas entry, and there is nothing inside it.
         assert!(app.canvas_handle(node).is_some());
         assert!(app.canvas_primitives(node).is_empty());
         assert!(
@@ -2073,10 +1836,6 @@ mod tests {
         let mut harness = a_timeline();
         let before = harness.canvas().expect("the timeline drew a canvas");
 
-        // An atlas reset under the same font stack: every handle the canvas was painted from is
-        // leased from an atlas that no longer exists, while the glyphs would shape back the same.
-        // The engine drops runs whose lease is gone at encode time, so the timeline owes a frame
-        // even though nothing a reader asked for moved.
         let stack = harness.app.app().font_stack().clone();
         harness.app.app_mut().set_font_stack(stack);
 
@@ -2151,7 +1910,6 @@ mod tests {
                 .collect::<Vec<_>>(),
         ))));
         let before = harness.primitives().len();
-        // One bucket holds all eight fills: the oldest is at the left of the plot.
         let marker = harness
             .paint
             .cache
@@ -2195,7 +1953,6 @@ mod tests {
             "the two labels, the marker's letter, and three lines for each of the newest six fills"
         );
 
-        // Moving off the marker and its panel closes it.
         harness.sync(Some(Point::new(1.0, 1.0)));
         harness.app.drain();
         assert_eq!(
@@ -2221,8 +1978,6 @@ mod tests {
             ),
             "the labels are shaped in the language showing now"
         );
-        // A line is one glyph run per font it needs, and the Chinese start label mixes a digit
-        // with CJK, so the count is a lower bound rather than the English frame's count.
         assert!(
             glyph_runs(&harness) >= 2 + 2,
             "the two labels and the two marker letters are drawn in the new language"
@@ -2252,8 +2007,6 @@ mod tests {
         let precision = precision();
         let language = app.services().language;
 
-        // No frame has been drained when the sync runs: the node has no box yet, so nothing is
-        // written and the next sync is what paints it.
         app.with_cx(|cx| paint.sync(cx, Some(&snapshot), &precision, language, None))
             .expect("the timeline syncs");
         app.drain();
@@ -2286,7 +2039,6 @@ mod tests {
         assert!(harness.paint.prepared.is_none());
         assert!(harness.paint.painted_text.is_empty());
 
-        // A released timeline draws nothing more, even if the pane asks once more.
         harness.sync(None);
         harness.app.drain();
         assert!(Arc::ptr_eq(

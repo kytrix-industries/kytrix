@@ -1,11 +1,3 @@
-//! GPU timestamp。
-//!
-//! 每 in-flight 槽 2 个 timestamp（帧起 / 帧末）+ 一块 READBACK buffer；fence 到达后读回
-//! 两个 `u64` 并换算成 ns。计时是**可选能力**：`new` 失败时返回 `None`，像素路径不受影响。
-//!
-//! 每个窗口一份：timestamp 槽位 / 读回缓冲按**本窗口**的 in-flight 槽轮转，多个窗口共享一条
-//! command queue 时各窗口的样本互不覆盖（query heap 本身是设备对象，可以每窗口各建一个）。
-
 use windows::Win32::Graphics::{
     Direct3D12::*,
     Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC},
@@ -25,7 +17,6 @@ use crate::{
 
 const TIMESTAMPS_PER_FRAME: u32 = 2;
 
-/// timestamp query heap + 每槽读回缓冲。
 pub(crate) struct GpuTimer {
     heap: ID3D12QueryHeap,
     resolve: Vec<ID3D12Resource>,
@@ -33,7 +24,6 @@ pub(crate) struct GpuTimer {
 }
 
 impl GpuTimer {
-    /// 建计时器；不支持时返回 `Ok(None)`（不是错误）。
     pub(crate) fn new(
         shared: &SharedGpu,
         stream: &CommandStream,
@@ -42,7 +32,6 @@ impl GpuTimer {
             return Ok(None);
         };
         let mut heap_out: Option<ID3D12QueryHeap> = None;
-        // SAFETY: 设备句柄由进程级 `SharedGpu` 持有，调用期间有效；错误按 HRESULT 返回。
         if unsafe {
             shared.raw().CreateQueryHeap(
                 &D3D12_QUERY_HEAP_DESC {
@@ -72,9 +61,7 @@ impl GpuTimer {
         }))
     }
 
-    /// 帧起 timestamp（在列表开头调用）。
     pub(crate) fn begin(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
-        // SAFETY: 列表 / query heap 由调用方持有，调用期间有效。
         unsafe {
             list.EndQuery(
                 &self.heap,
@@ -84,11 +71,9 @@ impl GpuTimer {
         };
     }
 
-    /// 帧末 timestamp + resolve 到本槽的读回缓冲。
     pub(crate) fn end(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
         let index = (slot as u32) * TIMESTAMPS_PER_FRAME + 1;
         let resolve = &self.resolve[slot];
-        // SAFETY: 列表 / query heap / 读回缓冲由调用方持有，调用期间有效。
         unsafe {
             list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
             list.ResolveQueryData(
@@ -102,18 +87,14 @@ impl GpuTimer {
         }
     }
 
-    /// fence 到达后读两个 `u64`（失败返回 `None`，不打断帧）。
     pub(crate) fn resolve(&self, slot: usize) -> Option<GpuTimerSample> {
         let buffer = &self.resolve[slot];
         let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该槽缓冲的创建尺寸保证。
         unsafe { buffer.Map(0, None, Some(&mut pointer)) }.ok()?;
-        // SAFETY: READBACK heap 的 16 B 映射区，两个 u64 由 `ResolveQueryData` 写入。
         let (start, end) = unsafe {
             let base = pointer.cast::<u64>();
             (*base, *base.add(1))
         };
-        // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
         unsafe { buffer.Unmap(0, None) };
         let ticks = end.wrapping_sub(start);
         Some(GpuTimerSample {
@@ -147,7 +128,6 @@ fn create_readback(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, 
         VisibleNodeMask: 1,
     };
     let mut out: Option<ID3D12Resource> = None;
-    // SAFETY: COM 调用：设备句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
     unsafe {
         device.CreateCommittedResource(
             &heap,

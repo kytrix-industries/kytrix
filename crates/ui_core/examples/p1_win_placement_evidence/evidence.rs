@@ -1,4 +1,3 @@
-//! B3 真机证据的实现（真实窗口 + 真实事件循环；由 `main.rs` 在 Windows 下调用）。
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -26,23 +25,16 @@ use windows::Win32::{
     },
 };
 
-/// 主证据窗口标题（进程内唯一，`FindWindowW` 定位用）。
 const TITLE: &str = "kytrix P1-B B3 placement evidence";
-/// clamp 证据窗口标题（请求位置在所有显示器之外）。
 const CLAMP_TITLE: &str = "kytrix P1-B B3 clamp evidence";
-/// 请求的逻辑客户区尺寸 / 位置 / 尺寸约束。
 const SIZE: Size = Size::new(640.0, 480.0);
 const POSITION: Point = Point::new(120.0, 90.0);
 const MIN_SIZE: Size = Size::new(480.0, 360.0);
 const MAX_SIZE: Size = Size::new(900.0, 700.0);
-/// 程序化移动的物理位移。
 const MOVE_BY: (i32, i32) = (160, -60);
-/// 跨屏 / 越界请求的逻辑位置（虚拟桌面左上方向很远的地方）。
 const OFF_SCREEN: Point = Point::new(-5000.0, -5000.0);
-/// 整体超时（防止窗口找不到 / 事件不来时挂死）。
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 证据收集状态（`on_frame` 闭包与 `run` 共享）。
 #[derive(Default)]
 struct State {
     phase: u8,
@@ -114,7 +106,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .window(id)
                     .map(|window| window.scale().factor())
                     .unwrap_or(1.0);
-                // 1) position：客户区左上角（屏幕物理）= 逻辑点 × 窗口所在显示器 scale。
                 let expected = (
                     (POSITION.x * scale).round() as i32,
                     (POSITION.y * scale).round() as i32,
@@ -131,9 +122,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 state.position_ok = within;
 
-                // 2) WM_GETMINMAXINFO：min/max 跟踪尺寸（窗口外框物理像素）。
                 let mut info = MINMAXINFO::default();
-                // SAFETY: `hwnd` 是本进程窗口；`WM_GETMINMAXINFO` 只写 `lParam` 指向的栈上结构。
                 unsafe {
                     SendMessageW(
                         hwnd,
@@ -156,13 +145,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 state.min_max_ok = min_max_ok;
 
-                // 3) 程序化 SetWindowPos 越界尺寸：系统按 min/max 跟踪尺寸约束。
                 println!(
                     "SetWindowPos 越界尝试前：窗口外框 {:?}",
                     physical_size(hwnd)
                 );
                 for (width, height, tag) in [(100, 80, "小于 min"), (3000, 3000, "大于 max")] {
-                    // SAFETY: 本进程窗口；只改尺寸、不移动/不激活/不改 Z 序。
                     unsafe {
                         let _ = SetWindowPos(
                             hwnd,
@@ -180,9 +167,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         client_size(hwnd)
                     );
                 }
-                // 恢复请求尺寸（窗口外框物理值）。
                 let restore = window_size_for_client(physical_client(SIZE, scale), dpi);
-                // SAFETY: 同上。
                 unsafe {
                     let _ = SetWindowPos(
                         hwnd,
@@ -199,7 +184,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     physical_size(hwnd)
                 );
 
-                // 4) 第二个窗口请求所有显示器之外的位置：平台必须 clamp 回工作区。
                 let clamp_id = app.create_window(WindowOptions {
                     title: smol_str::SmolStr::new_static(CLAMP_TITLE),
                     size: Size::new(320.0, 240.0),
@@ -214,7 +198,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 handle.wake();
             }
             1 => {
-                // 等运行时窗口被泵创建出来（`sync_native_windows`），再验证 clamp。
                 let Some(clamp_id) = state.clamp_window else {
                     state.phase = 0;
                     return;
@@ -238,13 +221,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 state.clamp_ok = inside;
 
-                // 关掉 clamp 窗口，准备程序化移动主窗口。
                 let _ = app.close_window(clamp_id);
                 let _ = app.drain_events();
                 let (client_x, client_y) = client_origin(find_window(TITLE).expect("主窗口"));
                 let (window_x, window_y, ..) = window_rect(find_window(TITLE).expect("主窗口"));
                 let window_target = (window_x + MOVE_BY.0, window_y + MOVE_BY.1);
-                // SAFETY: 主窗口是本进程窗口；只改位置、不改尺寸。
                 unsafe {
                     let _ = SetWindowPos(
                         find_window(TITLE).expect("主窗口"),
@@ -300,7 +281,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         [state.clamp_window].into_iter().flatten().collect();
                     finish(app, id, &handle, &hook_passed, &state, &clamp_windows, ok);
                 } else {
-                    // 事件在下一轮泵的 ② 才派发：自唤醒一次让泵继续转。
                     handle.wake();
                 }
             }
@@ -317,7 +297,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// 判定 + 收尾：关闭窗口、唤醒泵；`RESULT` 是调用方读取的唯一结论行。
 fn finish(
     app: &mut App,
     id: WindowId,
@@ -345,14 +324,11 @@ fn finish(
 
 fn find_window(title: &str) -> Option<HWND> {
     let title = wide(title);
-    // SAFETY: 标题是栈上 NUL 结尾宽字符串；只查询本进程创建的窗口。
     unsafe { FindWindowW(None, windows::core::PCWSTR(title.as_ptr())) }.ok()
 }
 
-/// 全部显示器的工作区 `(x0, y0, x1, y1)`（物理像素，虚拟桌面坐标）。
 fn host_work_areas() -> Vec<(i32, i32, i32, i32)> {
     let mut areas: Vec<(i32, i32, i32, i32)> = Vec::new();
-    // SAFETY: 回调经 `LPARAM` 拿到栈上 `areas` 的可变引用；枚举同步完成后引用失效。
     unsafe {
         let _ = EnumDisplayMonitors(
             None,
@@ -364,20 +340,17 @@ fn host_work_areas() -> Vec<(i32, i32, i32, i32)> {
     areas
 }
 
-/// `EnumDisplayMonitors` 回调：`LPARAM` 指向 `Vec<(x0, y0, x1, y1)>`。
 unsafe extern "system" fn collect_work_area(
     monitor: HMONITOR,
     _hdc: HDC,
     _rect: *mut RECT,
     data: LPARAM,
 ) -> windows::core::BOOL {
-    // SAFETY: `data` 是 `host_work_areas` 里 `&mut Vec` 的指针，枚举同步进行。
     let areas = unsafe { &mut *(data.0 as *mut Vec<(i32, i32, i32, i32)>) };
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    // SAFETY: `monitor` 由系统给出；`info` 是栈上结构且已填 `cbSize`。
     if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
         areas.push((
             info.rcWork.left,
@@ -389,8 +362,6 @@ unsafe extern "system" fn collect_work_area(
     windows::core::BOOL::from(true)
 }
 
-/// 引擎 `dpi::track_size` 的等价换算（客户区逻辑尺寸 → 窗口外框物理尺寸）：
-/// 先按显示器 scale 取整到物理客户区，再用系统边框换算。
 fn track_size(client: Size, dpi: u32) -> (i32, i32) {
     let scale = f64::from(dpi) / 96.0;
     let physical = (
@@ -407,7 +378,6 @@ fn physical_client(size: Size, scale: f64) -> (u32, u32) {
     )
 }
 
-/// 客户区物理尺寸 → 窗口外框物理尺寸（`AdjustWindowRectExForDpi`）。
 fn window_size_for_client(client: (u32, u32), dpi: u32) -> (i32, i32) {
     let mut frame = RECT {
         left: 0,
@@ -415,7 +385,6 @@ fn window_size_for_client(client: (u32, u32), dpi: u32) -> (i32, i32) {
         right: client.0.max(1) as i32,
         bottom: client.1.max(1) as i32,
     };
-    // SAFETY: `frame` 是栈上结构；`AdjustWindowRectExForDpi` 只读写它。
     unsafe {
         AdjustWindowRectExForDpi(
             &mut frame,
@@ -431,7 +400,6 @@ fn window_size_for_client(client: (u32, u32), dpi: u32) -> (i32, i32) {
 
 fn window_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
     let mut rect = RECT::default();
-    // SAFETY: 窗口存活；`rect` 是栈上输出。
     unsafe { GetWindowRect(hwnd, &mut rect) }.expect("GetWindowRect");
     (
         rect.left,
@@ -443,7 +411,6 @@ fn window_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
 
 fn client_origin(hwnd: HWND) -> (i32, i32) {
     let mut point = POINT::default();
-    // SAFETY: 窗口存活；只做坐标换算。
     assert!(
         unsafe { ClientToScreen(hwnd, &mut point) }.as_bool(),
         "ClientToScreen"
@@ -453,7 +420,6 @@ fn client_origin(hwnd: HWND) -> (i32, i32) {
 
 fn client_size(hwnd: HWND) -> (i32, i32) {
     let mut rect = RECT::default();
-    // SAFETY: 窗口存活；`rect` 是栈上输出。
     let _ = unsafe { GetClientRect(hwnd, &mut rect) };
     (rect.right - rect.left, rect.bottom - rect.top)
 }

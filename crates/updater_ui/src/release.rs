@@ -1,5 +1,3 @@
-//! `latest.json` as the release workflow publishes it, and what one build takes from it.
-
 use ahash::HashMap;
 use i18n::language::codes::LanguageCode;
 use semver::Version;
@@ -10,52 +8,33 @@ use url::Url;
 
 use crate::error::{MetadataError, UpdaterError};
 
-/// How one platform's update package is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub enum ReleaseFormat {
-    /// The Windows NSIS installer.
     #[serde(rename = "nsis")]
     Nsis,
-    /// The macOS application bundle, as a `.tar.gz`.
     #[serde(rename = "app")]
     App,
-    /// The Linux AppImage.
     #[serde(rename = "appimage")]
     AppImage,
 }
 
-/// One platform of a release: what to download, and how it is installed.
 #[derive(Clone, Debug, Deserialize)]
 pub struct PlatformRelease {
-    /// Where the payload is downloaded from.
     pub url: Url,
-    /// How the payload is installed.
     pub format: ReleaseFormat,
 }
 
-/// The platform keys a release is published under.
-///
-/// The spelling is the updater library's own, which is what
-/// [`PlatformKey::wire`] returns and what `cargo_packager_updater::target()`
-/// produces for the running platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlatformKey {
-    /// `windows-x86_64`.
     WindowsX64,
-    /// `windows-aarch64`.
     WindowsArm64,
-    /// `macos-x86_64`.
     MacosX64,
-    /// `macos-aarch64`.
     MacosArm64,
-    /// `linux-x86_64`.
     LinuxX64,
-    /// `linux-aarch64`.
     LinuxArm64,
 }
 
 impl PlatformKey {
-    /// The key of the platform this build runs on, when it is one the application is packaged for.
     pub fn current() -> Option<Self> {
         if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
             Some(Self::WindowsX64)
@@ -74,7 +53,6 @@ impl PlatformKey {
         }
     }
 
-    /// The key as a release spells it.
     pub const fn wire(self) -> &'static str {
         match self {
             Self::WindowsX64 => "windows-x86_64",
@@ -87,27 +65,19 @@ impl PlatformKey {
     }
 }
 
-/// The language every release publishes notes in, and the fallback for the rest.
 const FALLBACK_LANGUAGE: &str = "en";
 
-/// The release notes, keyed by the language code each translation is published under.
-///
-/// `latest.json` publishes one entry per language, e.g.
-/// `{"en": "...", "zh-CN": "..."}`, and the dialog draws the one for the language
-/// the interface is in.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(transparent)]
 pub struct ReleaseNotes(HashMap<SmolStr, SmolStr>);
 
 impl ReleaseNotes {
-    /// The notes in `language`, or English when that language was not published.
     pub fn in_language(&self, language: LanguageCode) -> Option<&SmolStr> {
         self.0
             .get(language.as_str())
             .or_else(|| self.0.get(FALLBACK_LANGUAGE))
     }
 
-    /// Notes built from `entries`, for a test that draws one.
     #[cfg(test)]
     pub(crate) fn for_test(entries: &[(&'static str, &'static str)]) -> Self {
         Self(
@@ -119,31 +89,20 @@ impl ReleaseNotes {
     }
 }
 
-/// The release the metadata endpoint announces.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReleaseManifest {
-    /// The version the release is of.
     pub version: Version,
-    /// The release notes, by language, which the dialog draws as markdown.
     pub notes: Option<ReleaseNotes>,
-    /// When the release was published, as RFC 3339 text.
     pub pub_date: Option<SmolStr>,
-    /// One entry per platform the release is published for.
     pub platforms: HashMap<SmolStr, PlatformRelease>,
 }
 
 impl ReleaseManifest {
-    /// Reads a manifest out of the response body.
     pub fn parse(body: &[u8]) -> Result<Self, UpdaterError> {
         serde_json::from_slice(body)
             .map_err(|source| UpdaterError::Metadata(MetadataError::Json(source)))
     }
 
-    /// The update one platform would install from this release, when it is newer than `current`.
-    ///
-    /// `Ok(None)` is a release that is not newer than the running build, which is
-    /// most checks. A release that is newer but names no entry for `key` is not an
-    /// update this build can install at all, which is a failure rather than silence.
     pub fn select(
         &self,
         key: PlatformKey,
@@ -172,18 +131,12 @@ impl ReleaseManifest {
     }
 }
 
-/// One release reduced to what downloading and installing it needs.
 #[derive(Clone, Debug)]
 pub struct ReleaseInfo {
-    /// The platform key the payload was published under.
     pub key: PlatformKey,
-    /// The version the release is of.
     pub version: Version,
-    /// The release notes, by language, when the release published any.
     pub notes: Option<ReleaseNotes>,
-    /// When the release was published, when it says.
     pub pub_date: Option<OffsetDateTime>,
-    /// The payload for this platform.
     pub asset: PlatformRelease,
 }
 
@@ -191,7 +144,6 @@ pub struct ReleaseInfo {
 mod tests {
     use super::*;
 
-    /// A manifest that names every platform the release workflow publishes.
     const COMPLETE: &str = r####"{
         "version": "9.9.9",
         "notes": {"en": "## Notes\n\nWhat changed.", "zh-CN": "## 说明\n\n更新内容。"},

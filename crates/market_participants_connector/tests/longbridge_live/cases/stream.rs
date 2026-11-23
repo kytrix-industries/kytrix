@@ -1,11 +1,3 @@
-//! The market-data cases: paging (cmd 27), the opening screen (cmd 19), and the two
-//! commands agreeing candle for candle (§4.5, §4.6; §14.1 items 3, 5, 8).
-//!
-//! What these cases are for is the **grid**: a US equity's candles rest on its sessions'
-//! own opens rather than on UTC hours, so the timestamp differences a venue publishes are
-//! the evidence for the table §4.6 states. The grid this suite computes against is
-//! [`crate::grid`]'s, which is the same five windows the adapter uses.
-
 use longbridge_proto::quote::{
     AdjustType, Direction, Period, SecurityCandlestickRequest, SecurityCandlestickResponse,
     SecurityHistoryCandlestickRequest,
@@ -29,7 +21,6 @@ use crate::{
     },
 };
 
-/// One offset query of cmd 27 (§4.5).
 pub fn offset_query(
     symbol: &str,
     period: Period,
@@ -56,7 +47,6 @@ pub fn offset_query(
     }
 }
 
-/// The opening screen of a subscription, cmd 19 (§4.6).
 pub fn first_screen(
     symbol: &str,
     period: Period,
@@ -72,7 +62,6 @@ pub fn first_screen(
     }
 }
 
-/// Case 7 — history paging: §4.5's four shapes, once each.
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() {
@@ -89,7 +78,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             .await
             .unwrap_or_else(|error| panic!("{case}: {error}"));
 
-        // The first screen, so the two anchored shapes have anchors to state.
         let newest: SecurityCandlestickResponse = socket
             .request(
                 GET_SECURITY_CANDLESTICKS,
@@ -112,9 +100,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             market_clock(anchor)
         );
 
-        // The four shapes below send the design's own numbering, so the numbering is
-        // asserted before anything is sent with it: a direction or a query type the
-        // venue numbers differently would make all four shapes one shape.
         assert_eq!(
             (QUERY_BY_OFFSET, DIRECTION_BACKWARD, DIRECTION_FORWARD),
             (
@@ -138,7 +123,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             "{case}: the design's numbering for the two pushes (§4.3)"
         );
 
-        // Shape 1: only an end — the widget's "page into history".
         let backward: SecurityCandlestickResponse = socket
             .request(
                 GET_SECURITY_HISTORY_CANDLESTICKS,
@@ -153,7 +137,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             )
             .await
             .unwrap_or_else(|error| panic!("{case}: the end-only shape failed: {error}"));
-        // Shape 2: only a start — the widget's "page towards the newest".
         let forward_anchor = anchor - 20 * 3_600_000;
         let forward_date = market_date(forward_anchor);
         let forward_minute = market_local(forward_anchor).strftime("%H%M").to_string();
@@ -171,7 +154,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             )
             .await
             .unwrap_or_else(|error| panic!("{case}: the start-only shape failed: {error}"));
-        // Shape 3: neither anchor — the widget's opening screen.
         let unanchored: SecurityCandlestickResponse = socket
             .request(
                 GET_SECURITY_HISTORY_CANDLESTICKS,
@@ -186,7 +168,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             )
             .await
             .unwrap_or_else(|error| panic!("{case}: the anchorless shape failed: {error}"));
-        // Shape 4: both anchors — the builder's `from(..).to(..)`.
         let both_start = anchor - 30 * 3_600_000;
         let both_end = anchor;
         let both: SecurityCandlestickResponse = socket
@@ -228,9 +209,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             }
         }
 
-        // The both-anchors shape is the one shape the adapter filters after the read,
-        // and the filter's whole contract is that nothing earlier than `start`
-        // survives (§4.5).
         let kept: Vec<i64> = both
             .candlesticks
             .iter()
@@ -254,9 +232,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             );
         }
 
-        // The gaps between adjacent candles are what the session grid is checked
-        // against: on a normal day the grid is 09:30–16:00 plus the pre and post
-        // sessions, so the gaps name their boundaries.
         for (name, answer) in [("end only", &backward), ("forty-five minute", &unanchored)] {
             let gaps: Vec<i64> = answer
                 .candlesticks
@@ -266,9 +241,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             println!("  {name}: gaps between adjacent timestamps (s) = {gaps:?}");
         }
 
-        // The 1h grid must be the session-anchored one, not UTC hours: 09:30, 10:30,
-        // … are what a US equity prints, and this suite checks a 45m read as well
-        // because that is the interval a UTC grid cannot produce at all.
         let forty_five: SecurityCandlestickResponse = {
             let mut socket =
                 LiveSocket::connect(&credentials, chosen_transport(&credentials).await, true)
@@ -318,11 +290,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
             "  45m candles whose timestamp is not the session-anchored bucket this build \
              computes: {off_grid:?}"
         );
-        // The diagnostic above is an assertion rather than a note: a venue bucket that
-        // this build's own grid does not produce is exactly the mis-gridding §4.6 is
-        // about, and a list that is only printed can stay a silent false positive. Every
-        // 45m candle the venue publishes — the evening's `20:00 / 20:45 / …` included —
-        // rests on its window's own open plus whole 45-minute intervals.
         assert!(
             off_grid.is_empty(),
             "{case}: every 45m candle the venue published must rest on the session-anchored \
@@ -347,8 +314,6 @@ async fn live_case_07_history_paging_covers_the_four_shapes_the_design_states() 
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 8 — the history and the opening screen agree candle for candle (§4.5,
-/// §4.6).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_08_history_and_the_opening_screen_agree_candle_for_candle() {
@@ -482,8 +447,6 @@ async fn live_case_08_history_and_the_opening_screen_agree_candle_for_candle() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 9 — the opening screen's parameters and the last candle's bucket (§4.6;
-/// §14.1 item 5).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_09_the_opening_screen_asks_a_thousand_and_lands_on_the_current_bucket() {
@@ -555,10 +518,6 @@ async fn live_case_09_the_opening_screen_asks_a_thousand_and_lands_on_the_curren
             .expect("an opening screen of a listed symbol states candles");
         let now = now_millis();
         let local = market_local(now);
-        // `bucket_start` answers Some only for an instant the venue's table places in a
-        // session: the five windows cover the market's whole day, so the answer is
-        // `None` only for the hours a table with a gap leaves — the afternoon of a half
-        // day after its post session closed, which is not what this assertion is about.
         let computed = bucket_start(now, Some(5 * 60_000));
         println!(
             "  last candle: t={} ({}) session={}; now={now} ({} ET, {}); this build's current \
@@ -584,11 +543,6 @@ async fn live_case_09_the_opening_screen_asks_a_thousand_and_lands_on_the_curren
         );
         let in_session =
             session_of(&local) == Some(longbridge_proto::quote::TradeSession::NormalTrade);
-        // The equality below needs the venue to have **traded** the current bucket, so its
-        // gate is the venue's own trading-day calendar rather than the session clock: the
-        // session clock says `regular` at 10:00 ET on a Sunday, and the newest candle of
-        // that run was Friday's last one, 137,700 seconds behind the bucket this build
-        // computes. The wire-level case 10 reads the same calendar for the same reason.
         let trading_day = crate::cases::push::trading_day(&credentials, case, now).await;
         println!(
             "  the venue's calendar names {} a trading day: {trading_day}; the session clock \
@@ -620,9 +574,6 @@ async fn live_case_09_the_opening_screen_asks_a_thousand_and_lands_on_the_curren
                     last.timestamp * 1_000
                 );
             } else {
-                // The run is inside the hours a table with a gap leaves — the afternoon of a
-                // half day — so there is no local bucket to measure a distance from; the
-                // newest candle is still the venue's last published one.
                 assert!(
                     last.timestamp * 1_000 < now,
                     "{case}: the newest candle cannot be in the future"
@@ -635,9 +586,6 @@ async fn live_case_09_the_opening_screen_asks_a_thousand_and_lands_on_the_curren
             }
         }
 
-        // The two adjustment conventions are two different reads; what the case
-        // asserts is that the parameter reached the venue at all. Equal answers are
-        // possible for a symbol with no corporate action in the window.
         let equal = screen.candlesticks.len() == forward.candlesticks.len()
             && screen
                 .candlesticks

@@ -4,12 +4,8 @@ use smol_str::SmolStr;
 
 use crate::language::codes::LanguageCode;
 
-/// Upper bound of cached rendered messages. Each entry holds one rendered text
-/// per distinct `(language, key, arguments)` combination, so the cache only grows
-/// with runtime-generated text, such as file names in a dialog.
 const MAX_ENTRIES: usize = 64;
 
-/// Cached rendering of one message.
 #[derive(Debug)]
 struct Entry {
     language: LanguageCode,
@@ -18,24 +14,13 @@ struct Entry {
     text: SmolStr,
 }
 
-/// Rendered messages, keyed by language, message key and argument values.
-///
-/// Returning a cached [`SmolStr`] costs one clone, and a heap-backed
-/// `SmolStr` clones by bumping the reference count of its `Arc<str>`, so no
-/// text is copied and no template is walked again.
-///
-/// The cache is a short vector rather than a map: interface messages carry few
-/// arguments, so a scan costs a handful of string comparisons and avoids hashing
-/// every argument on each lookup.
 #[derive(Debug, Default)]
 pub(crate) struct RenderedCache {
     entries: Vec<Entry>,
-    /// Reused buffer for rendering argument values during a lookup.
     scratch: String,
 }
 
 impl RenderedCache {
-    /// Returns the cached rendering of `language` + `key` + `arguments`.
     pub fn get(
         &mut self,
         language: LanguageCode,
@@ -66,10 +51,6 @@ impl RenderedCache {
         None
     }
 
-    /// Caches the rendering of `language` + `key` + `arguments`.
-    ///
-    /// When the cache is full the oldest entries are dropped, which costs one
-    /// re-render each the next time they are displayed.
     pub fn insert(
         &mut self,
         language: LanguageCode,
@@ -93,7 +74,6 @@ impl RenderedCache {
     }
 }
 
-/// Renders `value` into `output`, returning the rendered text.
 fn write_value<'a>(output: &'a mut String, value: &dyn Display) -> Option<&'a str> {
     fmt::Write::write_fmt(output, format_args!("{value}")).ok()?;
 

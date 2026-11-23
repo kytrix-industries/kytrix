@@ -324,7 +324,6 @@ fn order_book_should_reject_an_unsorted_side() {
     );
 }
 
-/// One level of one side, with the quantity the test asks for.
 fn order_book_level(value: u32, quantity: Quantity) -> ListingOrderBookLevel {
     ListingOrderBookLevel {
         price: MarketPrice {
@@ -338,7 +337,6 @@ fn order_book_level(value: u32, quantity: Quantity) -> ListingOrderBookLevel {
     }
 }
 
-/// A snapshot at a fixed sequence, so a test only has to state its two sides.
 fn order_book(
     bids: Vec<ListingOrderBookLevel>,
     asks: Vec<ListingOrderBookLevel>,
@@ -372,8 +370,6 @@ fn a_snapshot_level_must_name_a_price() {
     );
 }
 
-/// A venue removes a price level by publishing it with quantity zero, so an update
-/// carrying one is a valid update and not an empty level.
 #[test]
 fn an_update_level_may_carry_the_zero_quantity_that_removes_it() {
     let sequence = MarketSequence::Numeric(1);

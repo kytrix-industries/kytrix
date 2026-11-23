@@ -1,9 +1,3 @@
-//! The fake source the service and the pane both answer through.
-//!
-//! It lives in a module of its own because two test files need it: the loop's
-//! tests drive it to produce snapshots, and the pane's tests drive it to answer a
-//! load. Everything in here is test scaffolding and is compiled only for tests.
-
 use std::{
     collections::VecDeque,
     future::pending,
@@ -23,22 +17,13 @@ use crate::model::{
     CryptocurrencyEtfSnapshot,
 };
 
-/// How the fake answers one fetch.
-///
-/// A plan is consumed per fetch, and a source that runs out of plans keeps
-/// answering with a later snapshot: a test that watches how many fetches happened
-/// has to be able to tell a fetch that failed from a fetch that never ran, and a
-/// fake that fails once its queue is empty cannot.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FetchPlan {
-    /// The whole snapshot a history of one day with this total flow makes.
     Snapshot(f64),
     Failure,
-    /// Never answers, so the attempt times out.
     Pending,
 }
 
-/// The answer one fetch is given.
 #[derive(Clone, Debug, PartialEq)]
 enum Answer {
     Snapshot(Arc<CryptocurrencyEtfSnapshot>),
@@ -72,7 +57,6 @@ impl FakeSource {
         }
     }
 
-    /// Takes the next plan, counting the fetch as started.
     fn begin(&self) -> (Answer, FetchGuard) {
         let call = self.state.calls.fetch_add(1, Ordering::AcqRel);
         let plan = self
@@ -82,9 +66,6 @@ impl FakeSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
             .unwrap_or_else(|| {
-                // Past the end of the plans every fetch is a distinct snapshot, so
-                // a fetch that happened is visible in the data as well as in the
-                // count.
                 let flow = i64::try_from(call).unwrap_or(i64::MAX) as f64;
                 FetchPlan::Snapshot(flow)
             });
@@ -131,7 +112,6 @@ impl FakeSource {
         self.state.in_flight.load(Ordering::Acquire)
     }
 
-    /// How many fetches were dropped before they answered.
     pub(crate) fn cancelled_fetches(&self) -> usize {
         self.state.cancelled_fetches.load(Ordering::Acquire)
     }
@@ -159,14 +139,12 @@ impl Drop for FetchGuard {
     }
 }
 
-/// A whole snapshot whose every asset has the same one-day history.
 pub(crate) fn snapshot(flow: f64) -> Arc<CryptocurrencyEtfSnapshot> {
     snapshot_of(core::array::from_fn(|index| {
         asset(ALL[index], &[flow], DEFAULT_FUNDS)
     }))
 }
 
-/// The assets a snapshot carries, in the order the model stores them.
 const ALL: [CryptocurrencyEtfAsset; 4] = [
     CryptocurrencyEtfAsset::Btc,
     CryptocurrencyEtfAsset::Eth,
@@ -174,17 +152,13 @@ const ALL: [CryptocurrencyEtfAsset; 4] = [
     CryptocurrencyEtfAsset::Hyp,
 ];
 
-/// The funds a fixture asset has when a test does not name its own.
 pub(crate) const DEFAULT_FUNDS: &[&str] = &["FUND"];
 
-/// One asset's history: a fund list, and one day per flow.
 pub(crate) fn asset(
     asset: CryptocurrencyEtfAsset,
     flows: &[f64],
     funds: &[&str],
 ) -> Arc<CryptocurrencyEtfDataset> {
-    // Julian days from a fixed start rather than ordinals of one year: a fixture is
-    // allowed to be longer than a year, and an ordinal is not.
     let first = Date::from_calendar_date(2024, Month::January, 1)
         .expect("the fixture start should be valid")
         .to_julian_day();
@@ -214,7 +188,6 @@ pub(crate) fn asset(
     })
 }
 
-/// A whole snapshot from four assets' histories.
 pub(crate) fn snapshot_of(
     datasets: [Arc<CryptocurrencyEtfDataset>; 4],
 ) -> Arc<CryptocurrencyEtfSnapshot> {

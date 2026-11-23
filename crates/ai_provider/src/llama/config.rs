@@ -1,33 +1,20 @@
-//! Configuration for loading the model and sampling generated tokens.
-
 use std::path::PathBuf;
 
 use smol_str::SmolStr;
 
 use crate::error::ProviderError;
 
-/// How the engine loads the model and creates its context.
 #[derive(Debug)]
 pub struct EngineConfig {
-    /// Path to the GGUF file to load.
     pub model_path: PathBuf,
-    /// Size of the context window, in tokens.
     pub context_tokens: u32,
-    /// Maximum number of tokens decoded in one batch.
-    ///
-    /// llama.cpp aborts when a single decode call carries more tokens than this,
-    /// so the worker splits a longer prompt itself.
     pub batch_tokens: u32,
-    /// Number of threads the context uses, or `None` for llama.cpp's own default.
     pub threads: Option<i32>,
-    /// Number of model layers to offload to the GPU.
     pub gpu_layers: u32,
-    /// Whether llama.cpp's own diagnostics are written to stderr.
     pub log_llama: bool,
 }
 
 impl EngineConfig {
-    /// Creates a configuration for `model_path` with the translation-sized defaults.
     pub fn new(model_path: impl Into<PathBuf>) -> Self {
         Self {
             model_path: model_path.into(),
@@ -39,7 +26,6 @@ impl EngineConfig {
         }
     }
 
-    /// Rejects values llama.cpp cannot be given.
     pub(super) fn validate(&self) -> Result<(), ProviderError> {
         if self.context_tokens == 0 {
             return Err(ProviderError::InvalidConfig {
@@ -70,24 +56,15 @@ impl EngineConfig {
     }
 }
 
-/// How the worker samples each generated token.
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
-    /// Maximum number of tokens to generate.
     pub max_tokens: u32,
-    /// Temperature applied before the top-k and top-p filters.
     pub temperature: f32,
-    /// Nucleus sampling probability.
     pub top_p: f32,
-    /// Number of highest-probability tokens kept before top-p.
     pub top_k: i32,
-    /// Repetition penalty applied to recent tokens.
     pub repetition_penalty: f32,
-    /// Seed of the deterministic distribution sampler.
     pub seed: u32,
-    /// Token ids that end generation without being part of the output.
     pub stop_token_ids: Vec<i32>,
-    /// Text that ends generation, truncated from the output.
     pub stop_strings: Vec<String>,
 }
 
@@ -107,11 +84,6 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
-    /// Rejects values the sampler chain cannot be given.
-    ///
-    /// A `NaN` temperature or an empty stop string silently changes what the model
-    /// produces, and llama.cpp itself does not validate any of these, so they are
-    /// checked before a request reaches the worker.
     pub(super) fn validate(&self) -> Result<(), ProviderError> {
         if self.max_tokens == 0 {
             return Err(ProviderError::InvalidConfig {

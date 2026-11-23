@@ -1,26 +1,3 @@
-//! The transfers one subscription retains, and the addresses one account monitors.
-//!
-//! # Order
-//!
-//! Transfers are held newest first, ordered by the time the service stamped them with.
-//! One that arrives late still belongs where its time says rather than at the head, and
-//! two of one instant are ordered by their identifiers, newest first, so a feed reads
-//! the same however the arrivals happened to be interleaved.
-//!
-//! # Identity
-//!
-//! A transfer is identified by its event, which is what the service deduplicates on: the
-//! same transfer reported twice is one row, because a transfer is an event that happened
-//! rather than a value that was observed.
-//!
-//! # The monitored addresses
-//!
-//! The addresses belong to the account rather than to a pane, and the service client
-//! already checks and orders every answer it returns. What is kept here is therefore what
-//! the service said, plus the one projection the client cannot make for us: what the list
-//! becomes once a change is confirmed, which arrives as the single row it changed rather
-//! than as the list.
-
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, PoisonError},
@@ -39,13 +16,8 @@ use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 use widget::error::TranslatedError;
 
-/// How many transfers one subscription retains.
-///
-/// A feed is read from the top, so what a pane keeps is what a reader can reach: older
-/// transfers are dropped rather than kept behind a bound nobody scrolls past.
 pub(super) const MAX_TRANSFERS: usize = 50;
 
-/// One retained transfer, and the text its row reads.
 #[derive(Debug)]
 pub(super) struct TransferItem {
     event_id: SmolStr,
@@ -70,11 +42,6 @@ impl TransferItem {
         }
     }
 
-    /// The event a transfer is, which is what a feed deduplicates on.
-    ///
-    /// A row is drawn by the index of the list rather than by its event — the list is what
-    /// remembers where a reader is — so the event is only what a test tells two rows apart
-    /// by.
     #[cfg(test)]
     pub(super) fn event_id(&self) -> &str {
         &self.event_id
@@ -88,13 +55,6 @@ impl TransferItem {
         &self.to_address
     }
 
-    /// The text of a transfer that is produced only once something draws it.
-    ///
-    /// A transfer is retained the moment it arrives, while most of what a feed holds is
-    /// never on screen: joining and formatting are the one part of a row that costs
-    /// anything, so they happen here rather than when the transfer is retained. The zone
-    /// the time was read in is remembered beside the text, so a frame that draws the same
-    /// zone reuses it and a frame after the setting moved reads it again.
     pub(super) fn display(&self, zone: UtcOffset) -> Arc<TransferDisplay> {
         let mut cached = self.display.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((cached_zone, display)) = cached.as_ref()
@@ -109,10 +69,8 @@ impl TransferItem {
     }
 }
 
-/// The part of a transfer's row that is built rather than borrowed.
 #[derive(Debug)]
 pub(super) struct TransferDisplay {
-    /// The amount and what it is denominated in, which a row reads as one value.
     pub amount: SmolStr,
     pub time: SmolStr,
 }
@@ -126,14 +84,12 @@ impl TransferDisplay {
     }
 }
 
-/// An immutable, cheap-to-clone view of the retained transfers.
 #[derive(Clone, Debug)]
 pub(super) struct TransferSnapshot {
     items: Arc<[Arc<TransferItem>]>,
 }
 
 impl TransferSnapshot {
-    /// The transfers of this snapshot, newest first.
     pub(super) fn items(&self) -> &[Arc<TransferItem>] {
         &self.items
     }
@@ -147,11 +103,6 @@ impl Default for TransferSnapshot {
     }
 }
 
-/// Two snapshots are the same feed when they are the same retained set.
-///
-/// A feed is published as one immutable value: a snapshot the service publishes is a
-/// fresh `Arc`, so a signal holding it is told apart from the one before it by the
-/// value's own identity rather than by comparing up to fifty transfers.
 impl PartialEq for TransferSnapshot {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.items, &other.items)
@@ -160,7 +111,6 @@ impl PartialEq for TransferSnapshot {
 
 impl Eq for TransferSnapshot {}
 
-/// The transfers one subscription retains.
 pub(super) struct TransferState {
     items: VecDeque<Arc<TransferItem>>,
 }
@@ -172,11 +122,6 @@ impl TransferState {
         }
     }
 
-    /// Retains one reported transfer.
-    ///
-    /// Returns whether the feed changed: a transfer the feed already holds is the same
-    /// event reported twice, and one older than everything a full feed holds is refused
-    /// rather than displacing transfers that are newer than it.
     pub(super) fn push(&mut self, transfer: EthereumWalletTransfer) -> bool {
         if self
             .items
@@ -205,7 +150,6 @@ impl TransferState {
         true
     }
 
-    /// The retained transfers, newest first.
     pub(super) fn snapshot(&self) -> TransferSnapshot {
         let mut items = Vec::with_capacity(self.items.len());
         items.extend(self.items.iter().cloned());
@@ -215,22 +159,11 @@ impl TransferState {
     }
 }
 
-/// How many of a newer feed's newest transfers a list holding `held` has not been shown.
-///
-/// A feed and the list that draws it are both newest first and both bounded to the same
-/// number of transfers, so a transfer the list has not been shown is one at the head of the
-/// feed, and what follows it is the run the list already holds. `None` is a feed the list
-/// cannot be extended into — a transfer that arrived late enough to belong in the middle of
-/// it, or one that shares no transfer with what the list holds — and the list a pane draws is
-/// built again for it instead.
 pub(super) fn unshown(held: &[Arc<TransferItem>], next: &[Arc<TransferItem>]) -> Option<usize> {
-    // A list that holds nothing has been shown nothing.
     if held.is_empty() {
         return Some(next.len());
     }
 
-    // Everything the new feed added is at its head, so the first transfer of it the list
-    // already holds is the first transfer the two have in common.
     let unshown = next
         .iter()
         .position(|row| held.iter().any(|held| Arc::ptr_eq(held, row)))?;
@@ -245,7 +178,6 @@ pub(super) fn unshown(held: &[Arc<TransferItem>], next: &[Arc<TransferItem>]) ->
         .then_some(unshown)
 }
 
-/// The addresses one account monitors, as the service last answered them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SelectionData {
     selections: Arc<[EthereumWalletSelection]>,
@@ -253,10 +185,6 @@ pub(super) struct SelectionData {
 }
 
 impl SelectionData {
-    /// The addresses one service answer holds.
-    ///
-    /// The answer has already been checked and ordered by the service client, so this is
-    /// what it said rather than a second opinion about it.
     pub(super) fn new(response: EthereumWalletSelectionsResponse) -> Self {
         Self {
             selections: response.selections.into(),
@@ -268,7 +196,6 @@ impl SelectionData {
         &self.selections
     }
 
-    /// The rows themselves, for a list that is built once and read on every frame.
     pub(super) fn shared_selections(&self) -> Arc<[EthereumWalletSelection]> {
         self.selections.clone()
     }
@@ -277,19 +204,10 @@ impl SelectionData {
         self.limit
     }
 
-    /// Whether the account may monitor nothing further.
-    ///
-    /// The limit is what the account is allowed to have selected.
     pub(super) fn quota_full(&self) -> bool {
         self.selections.len() >= self.limit
     }
 
-    /// The addresses this set becomes once the service confirms one was added.
-    ///
-    /// A confirmation the list cannot hold means the list and the account have gone out
-    /// of step — the service accepted an address the pane believes is beyond the quota,
-    /// already there, or not the one it asked about — and the next read is what settles
-    /// which of the two is right.
     pub(super) fn with_added(
         &self,
         requested: &str,
@@ -308,8 +226,6 @@ impl SelectionData {
         let mut selections = Vec::with_capacity(self.selections.len() + 1);
         selections.extend(self.selections.iter().cloned());
         selections.push(selection);
-        // The order is the account's recency order, which is the one a fresh read
-        // returns: a list the pane projects itself must read like the one it fetches.
         selections.sort_by(compare_ethereum_wallet_selections);
         Ok(Self {
             selections: selections.into(),
@@ -317,7 +233,6 @@ impl SelectionData {
         })
     }
 
-    /// The addresses this set becomes once the service confirms one was removed.
     pub(super) fn with_deleted(&self, address: &str) -> Self {
         let selections = self
             .selections
@@ -335,7 +250,6 @@ impl SelectionData {
     }
 }
 
-/// Why a confirmed change cannot be applied to the addresses a pane is holding.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(super) enum EthereumWalletDataError {
     #[error("the confirmed ethereum_wallet address does not fit the list it was added to")]
@@ -352,14 +266,7 @@ impl TranslatedError for EthereumWalletDataError {
     }
 }
 
-/// The time of a transfer, read in the zone the settings display data in.
-///
-/// The service stamps transfers in UTC, so what a reader sees is that instant
-/// converted by the offset the caller read from the settings.
 fn format_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
-    // The offset can move an instant past the last date the calendar holds — a
-    // timestamp at the far end of the range is one the service cannot publish, and
-    // it is written as a placeholder rather than taken to a date that is not one.
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp) * 1_000_000)
         .ok()
         .and_then(|time| time.checked_to_offset(zone))
@@ -545,8 +452,6 @@ mod tests {
         assert_eq!(item.display(UtcOffset::UTC).time, "--");
     }
 
-    /// The display offset can move an instant past the last day the calendar holds.
-    /// That is not a date this can write, so it is a placeholder rather than a panic.
     #[test]
     fn a_transfer_the_display_zone_cannot_hold_should_read_without_a_time() {
         let boundary = time::Date::MAX
@@ -688,8 +593,6 @@ mod tests {
         );
     }
 
-    /// The projection a pane makes has to read like the list a service answer returns,
-    /// which is the order the service client sorts by.
     #[test]
     fn a_projected_list_should_read_like_a_fetched_one() {
         let data = SelectionData::new(response(vec![selection(FIRST, 1)], 4));
@@ -702,8 +605,6 @@ mod tests {
         assert_eq!(addresses(&projected), addresses(&fetched));
     }
 
-    /// The order a projection ends in is the service's own comparison, so a change of a
-    /// tie is a change of that comparison rather than of this projection alone.
     #[test]
     fn a_projection_should_order_ties_the_way_the_service_does() {
         let mut expected = [selection(SECOND, 5), selection(FIRST, 5)];
@@ -723,11 +624,6 @@ mod tests {
         );
     }
 
-    /// A feed whose rows read in the order they are given, and which a test then grows.
-    ///
-    /// The rows are ordered by the time they were stamped with, so the first identifier is
-    /// the newest and each following one is ten milliseconds older — which leaves room for
-    /// a transfer stamped between two of them.
     fn feed(ids: &[&str]) -> TransferState {
         let mut state = TransferState::new();
         for (offset, id) in ids.iter().enumerate() {
@@ -736,8 +632,6 @@ mod tests {
         state
     }
 
-    /// A feed that grew at its head is the transfers at the head of it a list has not been
-    /// shown, and what the list holds is what follows them however many left at its tail.
     #[test]
     fn unshown_should_count_the_transfers_at_the_head_of_a_feed() {
         let mut full = TransferState::new();
@@ -770,8 +664,6 @@ mod tests {
         assert_eq!(unshown(snapshot.items(), snapshot.items()), Some(0));
     }
 
-    /// A list that holds nothing has been shown nothing, so every transfer of a feed is one
-    /// it has not been shown.
     #[test]
     fn unshown_should_ask_for_every_transfer_of_a_feed_a_list_holds_nothing_of() {
         let next = feed(&["a", "b"]).snapshot();
@@ -787,8 +679,6 @@ mod tests {
         assert_eq!(unshown(current.items(), next.items()), None);
     }
 
-    /// A feed that lost every transfer a list holds has nothing to extend it with, so what
-    /// the list holds is replaced rather than left standing behind an empty feed.
     #[test]
     fn unshown_should_ask_for_a_replacement_when_a_feed_lost_every_transfer() {
         let held = feed(&["a"]).snapshot();
@@ -797,8 +687,6 @@ mod tests {
         assert_eq!(unshown(held.items(), next.items()), None);
     }
 
-    /// A transfer that belongs in the middle of a feed is not a feed a list can be extended
-    /// into: what it holds is replaced rather than rearranged.
     #[test]
     fn unshown_should_ask_for_a_replacement_when_a_transfer_belongs_in_the_middle() {
         let mut state = feed(&["a", "c"]);
@@ -814,8 +702,6 @@ mod tests {
         assert_eq!(unshown(current.items(), next.items()), None);
     }
 
-    /// A feed that lost the transfer a list holds at its head is not one the list can be
-    /// extended into either: what it holds no longer starts where the feed does.
     #[test]
     fn unshown_should_ask_for_a_replacement_when_a_feed_lost_its_head() {
         let current = feed(&["a", "b"]).snapshot();

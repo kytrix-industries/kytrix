@@ -334,7 +334,6 @@ impl ServiceSessionActor {
             let can_poll_renewal = renewal_pollable(&self.renewal);
             tokio::pin!(timer);
             tokio::pin!(sweep);
-            // The timer must remain fair with continuously arriving frames or commands.
             let incoming = tokio::select! {
                 () = self.cancellation.cancelled() => {
                     self.websocket = None;
@@ -567,8 +566,6 @@ impl ServiceSessionActor {
                     let keep_connection =
                         matches!(error, KytrixServiceError::Server(_)) || reuse_socket;
                     if reuse_socket {
-                        // The server accepted the previous set and the socket stays open,
-                        // but this subscriber gave it up: flush the smaller set.
                         self.subscriptions_dirty = true;
                     }
                     let _ = respond_to.send(Err(error));
@@ -747,8 +744,6 @@ impl ServiceSessionActor {
                             && route_change_reuses_socket
                             && !self.subscribers.is_empty();
                         if reuse_socket {
-                            // Same as the disconnected path: the accepted remote set is
-                            // now too large and the socket is kept, so flush it.
                             self.subscriptions_dirty = true;
                         }
                         let _ = respond_to.send(Err(error.clone()));
@@ -893,17 +888,6 @@ impl ServiceSessionActor {
             })
     }
 
-    /// Whether the fence still names a route the latest published configuration
-    /// resolves.
-    ///
-    /// The fence compares against the latest *published* owner projection, not
-    /// against the settings a write already holds: the owner publishes the network\r\n    /// projection after it has committed the write (`ConfigNotification::publish`),\r\n    /// so a configuration write becomes visible to this fence when that publication\r\n    /// lands, not synchronously.
-    ///
-    /// The fence must consult the current configuration, not only the subscriber
-    /// map: `Command::Reconfigure` is what retires a route that a publication
-    /// changed, and it cannot run while the actor is parked inside `wait_for_ack`
-    /// or `await_control_with_routes`. Checking the route here is what turns that
-    /// queued retire into a result the waiting operation can observe.
     pub(super) fn subscription_route_is_current(&self, fence: &SubscriptionRouteFence) -> bool {
         self.capability_route_is_current(fence.capability, fence.route_generation)
             && self
@@ -1170,12 +1154,6 @@ impl ServiceSessionActor {
         }
     }
 
-    /// Hands a joining subscriber a snapshot of each AIS area the session already follows.
-    ///
-    /// The server sends a keyframe only when a connection adds the topic, and two panes
-    /// of one account share this session's connection. The session therefore applies
-    /// deltas to its own copy of the picture and synthesizes the snapshot here; a new
-    /// topic is still left to the server's own snapshot.
     pub(super) fn replay_global_shipping_chokepoint_snapshot(
         &mut self,
         id: u64,
@@ -1475,8 +1453,6 @@ impl ServiceSessionActor {
         route_fence: Option<&SubscriptionRouteFence>,
     ) -> Result<(), KytrixServiceError> {
         let id = self.next_request_id();
-        // Request IDs distinguish this acknowledgement from an overlapping
-        // connection-level reauthentication response.
         let request = ClientRequest {
             id,
             request: Some(ClientRequestKind::SetSubscriptionsRequest(
@@ -2016,8 +1992,6 @@ impl ServiceSessionActor {
         self.latest_financial_index.clear();
         self.global_shipping_chokepoint_states.clear();
         self.global_shipping_chokepoint_awaiting_snapshot.clear();
-        // A reconnected session receives a fresh snapshot for every area it still
-        // follows; until each one arrives, its increments belong to no baseline.
         let areas = self
             .topics
             .keys()
@@ -2066,9 +2040,6 @@ impl ServiceSessionActor {
                 .global_shipping_chokepoint_awaiting_snapshot
                 .contains(area)
             {
-                // Increments queued by a previous subscription precede the new snapshot.
-                // They belong to a picture this session no longer holds, so they are
-                // dropped until the snapshot establishes the new baseline.
                 if !update.keyframe {
                     return;
                 }
@@ -2102,11 +2073,6 @@ impl ServiceSessionActor {
         self.publish_to_ids(ids, message);
     }
 
-    /// Drops an area whose picture a delta no longer continues.
-    ///
-    /// Every subscriber fails with `ResyncFailed` and the remote topic is removed, so a
-    /// retry subscribes again and the server answers with a fresh snapshot. Keeping the
-    /// topic alive would leave every retry with the same untrustworthy baseline.
     fn fail_global_shipping_chokepoint_area(&mut self, area: GlobalShippingChokepointArea) {
         let topic = ServiceTopic::GlobalShippingChokepoint(area);
         self.global_shipping_chokepoint_states.remove(&area);
@@ -2355,8 +2321,6 @@ mod tests {
         assert_eq!(first_events.try_recv_for_test(), Ok(keyframe));
         assert_eq!(first_events.try_recv_for_test(), Ok(delta.clone()));
 
-        // The topic was already subscribed, so the server is not told the second pane
-        // joined and will not send another snapshot: this session has to.
         let (second_publisher, mut second_events) =
             network::transport::subscription::subscription_channel(4).unwrap();
         assert!(
@@ -2460,7 +2424,6 @@ mod tests {
                 .contains(&GlobalShippingChokepointArea::Hormuz)
         );
 
-        // An increment cannot be applied to the cleared picture.
         actor.publish_topic(
             topic.clone(),
             Ok(KytrixServiceEvent::GlobalShippingChokepoint(
@@ -2538,8 +2501,6 @@ mod tests {
             NetworkRouteGeneration::default(),
         );
 
-        // A frame left over from the previous subscription reaches the session before
-        // the server's new snapshot: it must not be treated as a gap.
         actor.publish_topic(
             topic.clone(),
             Ok(KytrixServiceEvent::GlobalShippingChokepoint(delta.clone())),
@@ -2806,7 +2767,6 @@ mod tests {
                 .contains_key(&GlobalShippingChokepointArea::Hormuz)
         );
 
-        // A retry re-adds the topic; the server answers with a fresh snapshot.
         let (retry_publisher, mut retry_events) =
             network::transport::subscription::subscription_channel(4).unwrap();
         assert_eq!(
@@ -2912,8 +2872,6 @@ mod tests {
                 .insert(target, ProxyRoute::named("alternate"));
         });
 
-        // The subscriber entry is untouched; only the configuration moved. A
-        // fence that read the subscriber map alone would still accept it.
         assert!(actor.subscribers.contains_key(&1));
         assert!(
             !actor.subscription_route_is_current(&fence),

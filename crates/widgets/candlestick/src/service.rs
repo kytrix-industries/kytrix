@@ -1,17 +1,3 @@
-//! The candlestick protocol, its background service, and the seam the service
-//! reads market data through.
-//!
-//! One service instance owns at most one live generation, keyed by the exact
-//! listing and interval it was started for. Everything that crosses the boundary
-//! is expressed in those two dimensions, so a message that belongs to an
-//! interval the user has already left — or to a listing the pane has moved off —
-//! can be recognized and dropped by both sides.
-//!
-//! The service keeps the whole series it publishes. A page fetched by panning
-//! and a live tick both end up in the same [`CandlestickSeries`], which is why
-//! the chart never sees the seam between history and realtime: by the time a
-//! snapshot is published, the two are already merged and deduplicated.
-
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use futures::StreamExt;
@@ -46,33 +32,27 @@ use super::model::{
     CandlestickSeries, CandlestickSeriesSnapshot, NewestCandle, OlderMerge, bounded_history,
 };
 
-/// Commands the UI may queue for a running stream.
 const STREAM_COMMAND_CAPACITY: usize = 8;
 
 #[derive(Debug)]
 pub(super) enum CandlestickRequest {
-    /// Starts the stream for this scope. Idempotent while one is already live.
     Load {
         listing: VenueListingKey,
         timeframe: TimeFrame,
         adjustment: Adjustment,
     },
-    /// Replaces the current generation, for a scope the user is retrying.
     Retry {
         listing: VenueListingKey,
         timeframe: TimeFrame,
         adjustment: Adjustment,
     },
-    /// Fetches the page before the oldest candle the stream currently holds.
-    ///
-    /// The page is older candles, so what it may do to the newest one is the
-    /// caller's decision: only the chart knows whether that candle is on screen.
     FetchHistory {
         before_timestamp: UnixMillis,
         newest: NewestCandle,
     },
-    /// Fetches the page after the newest candle the stream currently holds.
-    FetchNewer { after_timestamp: UnixMillis },
+    FetchNewer {
+        after_timestamp: UnixMillis,
+    },
 }
 
 #[derive(Debug)]
@@ -82,12 +62,6 @@ pub(super) enum CandlestickResponse {
     NewerQueued,
 }
 
-/// The scope one live candle stream belongs to.
-///
-/// The adjustment is one of the scope's dimensions rather than a property of the
-/// candles: two streams that asked for different conventions hold different
-/// prices for the same timestamp, so a snapshot of one may not be shown as the
-/// other.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct CandlestickStreamKey {
     listing: VenueListingKey,
@@ -108,54 +82,30 @@ impl CandlestickStreamKey {
         }
     }
 
-    /// The venue whose candle close a snapshot from this scope is counted down to.
-    ///
-    /// A candle closes on its venue's clock, so the countdown follows the scope
-    /// the candles came from rather than whatever the widget is configured with
-    /// when it happens to be drawn.
     pub(super) const fn venue(&self) -> &VenueId {
         &self.listing.route.venue
     }
 }
 
-/// What the stream is doing, as far as the chart needs to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CandlestickStatus {
-    /// Subscribing to the live candle stream.
     Connecting,
-    /// Subscribed, and waiting for the first history page.
     LoadingHistory,
-    /// A snapshot is published and the stream is keeping it current.
     Ready,
-    /// Terminal. The stream task stays alive until the generation is replaced.
     Error(MarketError),
 }
 
-/// Which page a [`CandlestickStreamMessage::PageSettled`] is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PageDirection {
-    /// The page before the oldest candle the stream held.
     History,
-    /// The page after the newest candle the stream held.
     Newer,
 }
 
 #[derive(Clone, Debug)]
 pub(super) enum CandlestickStreamMessage {
     Status(CandlestickStatus),
-    /// The whole series, merged. Replaces whatever the chart was holding.
     Snapshot(CandlestickSeriesSnapshot),
-    /// One pagination request is finished, with or without a page.
-    ///
-    /// Published for every accepted request, including the ones the stream drops
-    /// as stale or exhausted and the ones whose page turned out to be empty: the
-    /// reply to the RPC only says the command was queued, so this is the only
-    /// thing that tells the chart its request is over. It is deliberately not a
-    /// [`CandlestickStatus`]: a status describes what the widget reports, and a
-    /// pane that is ready stays ready while it fills a wider window.
-    PageSettled {
-        direction: PageDirection,
-    },
+    PageSettled { direction: PageDirection },
 }
 
 pub(super) struct CandlestickProtocol;
@@ -168,7 +118,6 @@ impl WidgetProtocol for CandlestickProtocol {
     type Error = CandlestickServiceError;
 }
 
-/// Failure of a request against the running stream.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub(super) enum CandlestickServiceError {
     #[error("candlestick stream is not active")]
@@ -189,11 +138,6 @@ impl TranslatedError for CandlestickServiceError {
     }
 }
 
-/// One page of candles the service reads through its source.
-///
-/// The page is listing-scoped, interval-scoped and adjustment-scoped, which is
-/// everything a market request carries: the venue's own wire symbol is resolved
-/// inside the builder, so nothing here names a symbol or a market.
 #[derive(Clone, Debug)]
 pub(super) struct CandlestickPageQuery {
     listing: VenueListingKey,
@@ -205,7 +149,6 @@ pub(super) struct CandlestickPageQuery {
 }
 
 impl CandlestickPageQuery {
-    /// Names the page one request asks a source for.
     pub(super) const fn new(
         listing: VenueListingKey,
         timeframe: TimeFrame,
@@ -225,38 +168,18 @@ impl CandlestickPageQuery {
     }
 }
 
-/// The market data one candlestick service reads through.
 pub(super) trait CandlestickSource: Clone + Send + Sync + 'static {
     type Subscription: CandlestickEventSubscription;
 
-    /// The intervals one route publishes.
-    ///
-    /// A route's own descriptor answers which intervals it serves, and the chart asks
-    /// before it subscribes: an interval this build persisted may have stopped being
-    /// published, and resetting it here is what keeps the service from ever being asked for
-    /// an interval the route does not serve. The query is a lookup rather than a request, so
-    /// it is the one question the chart asks its source directly.
     fn supported_timeframes(&self, route: &VenueRoute) -> Result<Vec<TimeFrame>, MarketError>;
 
-    /// The price-adjustment conventions one route publishes.
-    ///
-    /// The same lookup as [`Self::supported_timeframes`], for the other dimension of a
-    /// candlestick request: a convention this build persisted may have stopped being
-    /// published, and the route's own descriptor is what answers whether it still is.
     fn supported_adjustments(&self, route: &VenueRoute) -> Result<Vec<Adjustment>, MarketError>;
 
-    /// Fetches one page of candles for one listing, interval and adjustment.
     fn fetch_candlesticks(
         &self,
         query: CandlestickPageQuery,
     ) -> impl Future<Output = Result<Vec<ListingCandlestick>, MarketError>> + Send;
 
-    /// Opens one live candle stream for one listing, interval and adjustment.
-    ///
-    /// Opening the stream is also what validates the scope: the request is
-    /// listing-scoped and the interval and adjustment are checked against the route's
-    /// own descriptor, so a value this route does not publish is reported as the
-    /// market's own rejection rather than as an empty chart.
     fn subscribe_candlesticks(
         &self,
         listing: VenueListingKey,
@@ -265,14 +188,7 @@ pub(super) trait CandlestickSource: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
 }
 
-/// One live candle stream.
 pub(super) trait CandlestickEventSubscription: Send + 'static {
-    /// The listing's precision, whose price increment every price label is rounded
-    /// to.
-    ///
-    /// It comes from the listing's own rules, which the request resolved on its
-    /// way to the stream: the tick belongs to the listing, not to the venue's
-    /// wire.
     fn precision(&self) -> ListingPrecision;
 
     fn recv(
@@ -321,9 +237,6 @@ impl CandlestickSource for MarketCapability {
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send {
         let market = self.clone();
         async move {
-            // The listing's own rules carry the increments the chart's labels are
-            // rounded to, and resolving the listing is what rejects one this route no
-            // longer publishes before a stream is opened for it.
             let resolved = market.resolve_listing(&listing)?;
             let route = resolved.key.route.clone();
             let inner = market
@@ -362,10 +275,6 @@ pub(super) struct CandlestickService<S = MarketCapability> {
 }
 
 impl<S> CandlestickService<S> {
-    /// Creates a service holding at most `maximum_candles` candles.
-    ///
-    /// A zero capacity would make the series unable to hold even the candle it
-    /// is building, so it is clamped here rather than trusted.
     pub(super) const fn new(source: S, history_limit: u16, maximum_candles: usize) -> Self {
         Self {
             source,
@@ -406,18 +315,10 @@ where
                         | CandlestickRequest::FetchNewer { .. } => continue,
                     };
                     let key = CandlestickStreamKey::new(listing.clone(), timeframe, adjustment);
-                    // A repeated load for the scope that is already running is
-                    // answered without touching the live stream: the caller
-                    // has not asked for anything new.
                     if !retry && active_key.as_ref() == Some(&key) {
                         let _ = reply.respond(Ok(CandlestickResponse::StreamStarted));
                         continue;
                     }
-                    // Streams are keyed, so a new scope would otherwise leave
-                    // the previous one running and publishing into the same
-                    // widget. The previous command sender is dropped when the
-                    // new one replaces it below, which also lets the old
-                    // generation notice that nobody can page it any more.
                     if active_key.as_ref() != Some(&key)
                         && let Some(previous) = active_key.take()
                     {
@@ -538,7 +439,6 @@ enum StreamCommand {
     },
 }
 
-/// Runs one stream generation until it fails or is cancelled.
 async fn run_stream<S>(
     source: S,
     spec: StreamSpec,
@@ -552,8 +452,6 @@ async fn run_stream<S>(
     }
     if let Err(error) = run_stream_once(&source, &spec, commands, &publisher).await {
         log::warn!("candlestick stream failed: {error}");
-        // A terminal failure must not retry on its own: the view decides when to
-        // ask for a replacement generation, so the task stays alive until then.
         if publish_status(&publisher, CandlestickStatus::Error(error)).await {
             publisher.cancelled().await;
         }
@@ -572,9 +470,6 @@ where
     let listing = spec.listing.clone();
     let timeframe = spec.timeframe;
     let adjustment = spec.adjustment;
-    // The subscription is the request that validates the scope: it resolves the
-    // listing inside the published catalog and rejects an interval or an adjustment
-    // this route's own descriptor does not publish.
     let subscription = source.subscribe_candlesticks(listing.clone(), timeframe, adjustment);
     tokio::pin!(subscription);
     let mut subscription = tokio::select! {
@@ -588,8 +483,6 @@ where
         return Ok(());
     }
 
-    // The live stream is open before history is requested, so candles that move
-    // while the page is in flight are buffered rather than missed.
     let (history, buffered) = fetch_while_buffering(
         source,
         CandlestickPageQuery::new(
@@ -610,8 +503,6 @@ where
     series.merge_initial(history);
     series.merge_initial(buffered.into_values().map(|candle| candle.as_ref().clone()));
     if history_is_empty {
-        // Nothing before the first candle exists, so panning left is already at
-        // the end of history and must not keep asking for more.
         series.mark_older_exhausted();
     }
     if !publish_snapshot(publisher, series.snapshot()) {
@@ -634,12 +525,6 @@ where
                         before_timestamp,
                         newest,
                     } => {
-                        // A duplicate or stale request is dropped here rather
-                        // than passed on: the view may have panned further
-                        // while this one was queued. Dropping it still has to
-                        // answer, or the view's in-flight flag would stay set
-                        // and the chart would never ask again — hence the
-                        // settle below, which every accepted command publishes.
                         if series.older_exhausted()
                             || series
                                 .earliest_timestamp()
@@ -697,23 +582,8 @@ where
                 )
                 .await?;
                 let page_len = page.len();
-                // `newest` is `Some` exactly for a history request: the match above
-                // builds the intent and the direction together, because which candle
-                // an older page may evict is the only question that has an intent at
-                // all.
                 match newest {
-                    // The intent the page was asked with decides what it may
-                    // do to the candle at the live edge; see
-                    // [`CandlestickSeries::merge_older`].
                     Some(newest) => {
-                        // What a page that changed nothing means depends on
-                        // why it changed nothing. A fetched, non-empty page
-                        // that added no older candle is the venue answering
-                        // that there is nothing older, so history is
-                        // exhausted. A page the merge could not fit is the
-                        // buffer's own answer, and marking history exhausted
-                        // for it would stop the chart asking for the page it
-                        // still has room for once the buffer moves on.
                         match series.merge_older(page, newest) {
                             OlderMerge::MadeNoProgress => series.mark_older_exhausted(),
                             OlderMerge::Advanced | OlderMerge::TrimmedByCapacity => {}
@@ -721,9 +591,6 @@ where
                     }
                     None => {
                         series.merge_newer(page);
-                        // A short page means the venue had nothing more to
-                        // give, so the window has reached the newest candle
-                        // again.
                         if page_len < usize::from(spec.history_limit) {
                             series.mark_at_live_edge();
                         }
@@ -762,7 +629,6 @@ where
     }
 }
 
-/// Publishes a status, reporting whether the stream is still alive.
 async fn publish_status(
     publisher: &StreamPublisher<CandlestickProtocol>,
     status: CandlestickStatus,
@@ -773,7 +639,6 @@ async fn publish_status(
         .is_ok()
 }
 
-/// Publishes a snapshot, reporting whether the stream is still alive.
 fn publish_snapshot(
     publisher: &StreamPublisher<CandlestickProtocol>,
     snapshot: CandlestickSeriesSnapshot,
@@ -783,12 +648,6 @@ fn publish_snapshot(
         .is_ok()
 }
 
-/// Publishes the end of one pagination request, reporting whether the stream is
-/// still alive.
-///
-/// It travels on the reliable channel because it is state rather than a
-/// replaceable snapshot: a chart whose request is already answered must not lose
-/// that answer to a newer one.
 async fn publish_settled(
     publisher: &StreamPublisher<CandlestickProtocol>,
     direction: PageDirection,
@@ -799,11 +658,6 @@ async fn publish_settled(
         .is_ok()
 }
 
-/// Fetches one page while keeping the live stream drained.
-///
-/// History requests take seconds on a slow venue. Any candle published while one
-/// is in flight is newer than the page being fetched, so it is buffered instead
-/// of dropped, and the caller merges the buffer once the page has landed.
 async fn fetch_while_buffering<S>(
     source: &S,
     query: CandlestickPageQuery,
@@ -844,7 +698,6 @@ where
     }
 }
 
-/// Buffers one live candle that arrived while a page was in flight.
 fn buffer_candle(
     buffered: &mut BTreeMap<UnixMillis, Arc<ListingCandlestick>>,
     candle: Arc<ListingCandlestick>,
@@ -859,13 +712,6 @@ fn buffer_candle(
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -913,7 +759,6 @@ mod tests {
         Tick::from_str("0.01").expect("price tick should parse")
     }
 
-    /// The precision the fake subscriptions report for their listing.
     fn test_precision() -> ListingPrecision {
         ListingPrecision {
             price_tick: test_price_tick(),
@@ -967,7 +812,6 @@ mod tests {
         }
     }
 
-    /// A source whose subscription and history page are supplied by the test.
     #[derive(Clone)]
     struct FakeSource {
         subscription: Arc<Mutex<Option<FakeSubscription>>>,
@@ -1051,7 +895,6 @@ mod tests {
         }
     }
 
-    /// One source, one subscription, and the handles a test drives them with.
     struct Harness {
         runtime: WidgetRuntime<CandlestickProtocol>,
         events: mpsc::Sender<Result<Arc<ListingCandlestick>, MarketError>>,
@@ -1134,7 +977,6 @@ mod tests {
             .await
             .expect("load request should start a stream");
         harness.fetch_started.notified().await;
-        // The live candle arrives while the history page is still in flight.
         harness
             .events
             .send(Ok(Arc::new(candle(1, 25))))
@@ -1235,21 +1077,6 @@ mod tests {
         harness.runtime.shutdown().await;
     }
 
-    /// A source whose pages are served by the query it is asked for, and which records
-    /// every page query it receives.
-    ///
-    /// The pages are shaped so both pagination directions have something to fetch: the
-    /// initial page fills the limit without exhausting history (so panning left is still
-    /// possible) and is old enough to be off the live edge (so panning right is too). What
-    /// each page *is* follows from which bound the query carries — a page fetched by
-    /// panning left ends where the request asks it to, one fetched by panning right
-    /// starts there — so the fake never has to be told which direction it is serving.
-    ///
-    /// A request is answered before the command that asked for it is finished with, so a
-    /// test that read the recorded queries right after asking for a page could read them
-    /// before that page was fetched. A test therefore waits on the snapshot the page is
-    /// merged into — the stream publishes one per answered command — rather than on the
-    /// request it sent.
     #[derive(Clone)]
     struct RecordingSource {
         subscription: Arc<Mutex<Option<FakeSubscription>>>,
@@ -1264,7 +1091,6 @@ mod tests {
             }
         }
 
-        /// The adjustment convention of every page query this source received, in order.
         async fn page_adjustments(&self) -> Vec<Adjustment> {
             self.queries
                 .lock()
@@ -1294,16 +1120,12 @@ mod tests {
             query: CandlestickPageQuery,
         ) -> Result<Vec<ListingCandlestick>, MarketError> {
             let page = match (query.start_timestamp, query.end_timestamp) {
-                // The first page of a stream. Three candles is the whole window the test
-                // gives the chart, so a live candle takes it to its capacity.
                 (None, None) => vec![candle(10, 10), candle(20, 20), candle(30, 30)],
-                // Panning right: the venue answers from where the request starts.
                 (Some(start), _) => vec![
                     candle(start, 40),
                     candle(start + 1, 50),
                     candle(start + 2, 60),
                 ],
-                // Panning left: the page ends where the request asks it to.
                 (None, Some(end)) => vec![candle(end - 2, 1), candle(end - 1, 2), candle(end, 3)],
             };
             self.queries.lock().await.push(query);
@@ -1324,13 +1146,6 @@ mod tests {
         }
     }
 
-    /// Waits for one more page to reach the source than `seen`, and returns the new count.
-    ///
-    /// A page is fetched by the stream task rather than by the request that asked for it —
-    /// the request is answered as soon as the command is queued — so a test that read the
-    /// recorded queries right after sending one would read them before that page was
-    /// fetched. Waiting for the count to move is the wait that actually holds, and it is
-    /// bounded so a page that never comes fails the test instead of hanging it.
     async fn pages_recorded(source: &RecordingSource, seen: usize) -> usize {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -1347,19 +1162,6 @@ mod tests {
         })
     }
 
-    /// Both pagination directions carry the convention the stream was opened with.
-    ///
-    /// The adjustment is a dimension of the scope, not a property of the first page: a
-    /// request for the history before the window, or for the window after it, that went
-    /// out as `None` would merge raw prices into a series the chart is pricing the other
-    /// way — exactly the defect this phase fixed, where the platform's own paging calls
-    /// hard-coded the neutral convention. The page queries are read off the source,
-    /// because the service hands them to it and nowhere else.
-    ///
-    /// Each direction is exercised in the state its own guard admits. A chart at the live
-    /// edge never asks for the page after the window, so a pushed candle takes the window
-    /// off it first; and a window with room to grow never asks for the page before it, so
-    /// the older page is fetched from a window that is full.
     #[tokio::test]
     async fn pagination_should_carry_the_streams_adjustment() {
         let (events, event_receiver) = mpsc::channel(2);
@@ -1370,8 +1172,6 @@ mod tests {
         });
         let runtime = WidgetRuntime::spawn(
             current_test_handle(),
-            // The window holds exactly one page, which is what lets a pushed candle or a
-            // page of history move the edge the pagination guards are read from.
             CandlestickService::new(source.clone(), 3, 3),
         );
         let client = runtime.client();
@@ -1392,9 +1192,6 @@ mod tests {
         let mut recorded = pages_recorded(&source, 0).await;
         assert_eq!(recorded, 1, "the first page is the stream's own request");
 
-        // A candle the venue pushed takes the window to its capacity, and panning left is
-        // what takes it off the edge it was following: the page after the window is one the
-        // chart asks for only once it has left it.
         events
             .send(Ok(Arc::new(candle(40, 70))))
             .await
@@ -1469,15 +1266,6 @@ mod tests {
         harness.runtime.shutdown().await;
     }
 
-    /// Both pagination directions are settled on the reliable channel even when the
-    /// stream answers them without fetching anything.
-    ///
-    /// The RPC reply only says the command was queued, so a dropped command that
-    /// published nothing would leave the view's in-flight flag set for its whole
-    /// life and the chart would never ask again. The two drops are reached the way
-    /// production reaches them: an empty first page marks history exhausted, so a
-    /// request before it is redundant, and a series at the live edge has nothing
-    /// newer to fetch.
     #[tokio::test]
     async fn a_dropped_pagination_request_should_still_settle_its_direction() {
         let harness = harness(100, 1_000);
@@ -1501,9 +1289,6 @@ mod tests {
             .changed()
             .await
             .expect("the empty first page should be published");
-        // The stream answers its own page with a status; draining the channel past
-        // that status is what makes the reads below the answer to a dropped request
-        // alone.
         while !matches!(
             reliable
                 .recv()
@@ -1567,11 +1352,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A source whose first page is fixed and whose later pages come from a queue.
-    ///
-    /// It is what the history merge outcomes are observed through: whether a page
-    /// advanced the window, was trimmed by the buffer, or added nothing is the
-    /// stream's decision, and only the series it publishes shows that decision.
     #[derive(Clone)]
     struct ScriptedSource {
         subscription: Arc<Mutex<Option<FakeSubscription>>>,
@@ -1636,12 +1416,6 @@ mod tests {
         }
     }
 
-    /// Runs one stream over a scripted source, delivers the pages in order as answers
-    /// to history requests, and returns the snapshot each of them produced.
-    ///
-    /// Every request goes through the same `FetchHistory` the view sends, so the
-    /// outcome under test is the one production reaches. `newest` is the intent the
-    /// view states with it, and the capacity is what decides whether a page fits.
     async fn history_pages_over(
         capacity: usize,
         initial: Vec<ListingCandlestick>,
@@ -1676,8 +1450,6 @@ mod tests {
         for index in 0..page_count {
             client
                 .call(CandlestickRequest::FetchHistory {
-                    // One before the oldest candle held, which is what the view asks
-                    // for and what the stream's own guard admits.
                     before_timestamp: earliest
                         .map(|earliest| earliest.saturating_sub(1))
                         .expect("the first page left a candle to page from"),
@@ -1702,12 +1474,9 @@ mod tests {
         produced
     }
 
-    /// A page that added nothing older is the venue saying there is nothing older.
     #[tokio::test]
     async fn a_history_page_that_makes_no_progress_should_mark_history_exhausted() {
         let initial = vec![candle(10, 10), candle(20, 20), candle(30, 30)];
-        // The same candles the buffer already holds: deduplicated away, so the
-        // window does not move.
         let repeat = vec![candle(10, 10), candle(20, 20)];
         let produced = history_pages_over(10, initial, vec![repeat], NewestCandle::Kept).await;
 
@@ -1718,10 +1487,6 @@ mod tests {
         assert_eq!(produced[0].earliest_timestamp(), Some(10), "nothing moved");
     }
 
-    /// A page the buffer could not fit is the buffer's answer, not the venue's.
-    ///
-    /// Marking history exhausted here would stop the chart asking for a page it still
-    /// has room for as soon as the buffer moves on — so the flag must stay clear.
     #[tokio::test]
     async fn a_history_page_trimmed_by_capacity_should_not_mark_history_exhausted() {
         let initial = vec![candle(10, 10), candle(20, 20), candle(30, 30)];
@@ -1743,7 +1508,6 @@ mod tests {
         );
     }
 
-    /// A page that advanced the window is not an answer about running out either.
     #[tokio::test]
     async fn a_history_page_that_advances_should_not_mark_history_exhausted() {
         let initial = vec![candle(10, 10), candle(20, 20), candle(30, 30)];
@@ -1759,12 +1523,6 @@ mod tests {
         assert!(produced[0].at_live_edge());
     }
 
-    /// An accepted page settles its direction too, not just a dropped one.
-    ///
-    /// The view learns that a request is finished from this message alone — the reply
-    /// to the RPC only says the command was queued — so a fetched page that published
-    /// its snapshot and nothing else would leave the direction's in-flight flag set
-    /// and the chart would never page again.
     #[tokio::test]
     async fn a_fetched_page_should_settle_its_direction_after_its_snapshot() {
         let (events, event_receiver) = mpsc::channel(1);
@@ -1787,8 +1545,6 @@ mod tests {
             .call(load(TimeFrame::Minute1))
             .await
             .expect("the load should start a stream");
-        // The stream's own page is announced by a status; draining past it makes the
-        // reads below the answer to the paging request alone.
         while !matches!(
             reliable
                 .recv()
@@ -1932,7 +1688,6 @@ mod tests {
             .await
             .expect("first history request should start");
         blocked_fetch_started.notified().await;
-        // Fill the command queue so the next request cannot be accepted.
         for _ in 0..STREAM_COMMAND_CAPACITY {
             client
                 .call(CandlestickRequest::FetchHistory {
@@ -2039,8 +1794,6 @@ mod tests {
         }
     }
 
-    /// A source whose first subscription never resolves, so a replacement can be
-    /// observed cancelling it.
     #[derive(Clone)]
     struct PendingSubscriptionSource {
         attempts: Arc<AtomicUsize>,
@@ -2163,8 +1916,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// Another listing is another scope: loading it replaces the generation of the
-    /// listing before it rather than leaving two streams publishing into one chart.
     #[tokio::test]
     async fn loading_another_listing_should_subscribe_to_that_listing() {
         let (_events, event_receiver) = mpsc::channel(1);
@@ -2281,8 +2032,6 @@ mod tests {
         }
     }
 
-    /// A source handing out one subscription per stream attempt, so the test can
-    /// see the previous generation's subscription being dropped.
     #[derive(Clone)]
     struct DropTrackedSource {
         subscriptions: Arc<Mutex<VecDeque<DropTrackedSubscription>>>,
@@ -2376,8 +2125,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A source whose subscription reports what a catalog that could not be
-    /// fetched reports.
     #[derive(Clone)]
     struct UnresolvableSource {
         failure: MarketError,
@@ -2414,10 +2161,6 @@ mod tests {
         }
     }
 
-    /// The scope the chart asks for is resolved against the route's catalog before a
-    /// stream is opened, and a catalog that could not be fetched fails there. That
-    /// failure is what the chart is told about: it must never arrive as an empty
-    /// series or as a rejection of the listing itself.
     #[tokio::test]
     async fn a_catalog_failure_on_the_subscription_seam_should_be_reported_as_itself() {
         let failure = MarketError::CatalogSource(SourceError::Network {

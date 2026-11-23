@@ -93,7 +93,6 @@ fn drag_regions_are_stored_and_cleared_by_an_empty_slice() {
         "区域按逻辑窗口坐标原样保存（含顺序）"
     );
 
-    // 同值重复设置不改变任何东西（调用方可每帧无条件刷新）。
     window.set_drag_regions(&[strip, handle]);
     assert_eq!(window.drag_regions(), &[strip, handle]);
 
@@ -115,19 +114,16 @@ fn set_background_color_updates_options_and_ignores_the_same_value() {
         "改色必须标一帧，否则背景色可能永不被 present"
     );
 
-    // 同值 no-op：清掉 damage 之后再调同值，不得重新置位。
     window.full_damage_pending = false;
     window.set_background_color(Color::WHITE);
     assert_eq!(window.options().background, Color::WHITE);
     assert!(!window.full_damage_pending, "同值 no-op 不得标 damage");
 }
 
-/// 接线：`commit_frame` 的 frame 用真实 surface（不是 `size × scale` 的 covering）。
 #[cfg(all(windows, feature = "test-support"))]
 #[test]
 fn a_committed_frame_uses_the_platform_surface_not_the_covering_size() {
     let (mut window, _node) = painted_window();
-    // 800×600 的 covering 与 449×300 不同：记录里的整帧矩形能区分两者。
     window.set_surface((449, 300));
 
     let outcome = window.frame().expect("帧成功");
@@ -141,39 +137,31 @@ fn a_committed_frame_uses_the_platform_surface_not_the_covering_size() {
     );
 }
 
-/// Linux：`frame_rect` 用平台层写入的真实 Wayland buffer 尺寸（`set_surface`），
-/// 不再是 `size × scale` 的 covering（文字按 buffer 像素 1:1）。
 #[cfg(target_os = "linux")]
 #[test]
 fn frame_rect_uses_the_platform_buffer_on_linux() {
     let mut window = window();
-    // 初值是 covering（800×600）；平台层随后在 event_loop 里写入 round 后的 buffer。
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
     window.set_surface((999, 777));
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
 
-    // 平台已写入真值：`set_size` 不得把它重算成 covering（F-186 / V-122）。
     window.set_size(Size::new(256.8, 100.5));
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
     window.set_surface((449, 176));
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
 
-    // 0 尺寸由 `set_surface` 钳到 1 px（不能给 swapchain 0 尺寸）。
     window.set_surface((0, 0));
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1, 1));
 }
 
-/// macOS：`frame_rect` 用平台层写入的真实 backing surface，不再是 covering（文字 1:1）。
 #[cfg(target_os = "macos")]
 #[test]
 fn frame_rect_uses_the_platform_backing_on_macos() {
     let mut window = window();
-    // 初值是 covering（800×600）；平台层随后写入真实 backing。
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
     window.set_surface((1234, 777));
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1234, 777));
 
-    // 平台已写入真值：`set_size` 不得把它重算成 covering（F-186 / V-122）。
     window.set_size(Size::new(256.8, 100.5));
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1234, 777));
     window.set_surface((449, 176));
@@ -191,8 +179,6 @@ fn surface_starts_and_tracks_the_covering_size() {
     );
     assert_eq!(window.physical_surface(), (800, 600));
 
-    // 125 / 150 / 175%：`set_scale` / `set_size` 先把 surface 重算成 covering（向外取整）；
-    // 平台层随后用 `set_surface` 写真值（Linux 是 round 的 Wayland buffer）。
     for (factor, expected) in [
         (1.25, (1000, 750)),
         (1.5, (1200, 900)),
@@ -207,14 +193,12 @@ fn surface_starts_and_tracks_the_covering_size() {
         );
     }
 
-    // 亚像素：covering 向外取整（256.8 × 1.75 = 449.4 → 450），不是 round。
     window.set_size(Size::new(256.8, 100.5));
     assert_eq!(window.physical_surface(), (450, 176));
     assert_eq!(
         window.physical_surface(),
         covering_surface(window.size(), window.scale())
     );
-    // 零尺寸至少 1 px（不能给 DXGI 0 尺寸的 swapchain）。
     window.set_size(Size::new(0.0, 0.0));
     assert_eq!(window.physical_surface(), (1, 1));
 }
@@ -252,7 +236,6 @@ fn set_surface_clamps_marks_full_damage_and_ignores_the_same_value() {
     assert!(window.full_damage_pending);
 }
 
-/// Linux：整数回退的 buffer scale 默认 1（fractional 路径也固定 1），钳到 ≥1。
 #[cfg(target_os = "linux")]
 #[test]
 fn buffer_scale_defaults_to_one_and_clamps() {
@@ -269,8 +252,6 @@ fn buffer_scale_defaults_to_one_and_clamps() {
     assert_eq!(window.buffer_scale, 2, "整数回退写入 N");
 }
 
-/// F-186 / F-189 / V-122：平台写入真实目标之后，`set_size` / `set_scale` 只做布局 / DPI
-/// 失效，不得把 `surface` 重置成 `size × scale` 的 covering。
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 #[test]
 fn set_size_and_set_scale_keep_a_platform_written_surface() {
@@ -321,12 +302,9 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
     );
     assert_eq!(window.scale_epoch(), epoch + 1, "scale_epoch 照常递增");
 
-    // 平台层下一次显式写入仍然生效。
     window.set_surface((449, 176));
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
 
-    // 同值 `set_surface` 也必须把 `surface` 的所有权交给平台（flag 先于 early-return）：
-    // 之后 `set_scale` 不得把它重算成 covering（1000×750）。
     let mut same_value = Window::new(WindowId::for_test(1), WindowOptions::default());
     same_value.set_surface(covering_surface(Size::new(800.0, 600.0), Scale::ONE));
     same_value.set_scale(Scale::new(1.25).expect("合法比例"));
@@ -403,8 +381,6 @@ fn dpi_scale_only_shifts_logical_boxes_by_device_snapping() {
     window.set_scale(Scale::new(1.5).expect("合法比例"));
     let _ = window.compute_layout().expect("布局成功");
 
-    // B7：`scale != 1` 时提交给绘制的边界吸附到设备像素网格（`round(dp × scale) / scale`）。
-    // 布局输入（taffy 的父相对几何 / 内容宽）仍然与 scale 无关，差异**只**来自吸附。
     let after = window.tree().get(child).expect("存在").layout().bounds;
     assert_eq!(
         after,
@@ -495,8 +471,6 @@ fn scale_epoch_bumps_on_dpi_change() {
     assert_eq!(window.scale().factor(), 2.0);
 }
 
-// ── P06：帧推进 ──
-
 use crate::paint::style::{PaintSpec, StylePatch};
 
 fn painted_window() -> (Window, crate::node::id::NodeId) {
@@ -513,8 +487,6 @@ fn painted_window() -> (Window, crate::node::id::NodeId) {
     (window, node)
 }
 
-/// v2.1 E2b（审查 F11，D17）：`Window::frame` 没有 `ResourceCache`，行内盒图片一律跳过 ——
-/// 跳过不能静默：本帧跳过的 id 必须出现在 `Window::inline_box_image_diagnostics`。
 #[test]
 fn window_frame_reports_skipped_inline_box_images() {
     use crate::text::{
@@ -580,8 +552,6 @@ fn window_frame_reports_skipped_inline_box_images() {
     let _ = node;
 }
 
-/// V-122 ⑧：提交判据的纯函数（不碰 GPU）。Full/Partial 有工作；Idle 只在目标尺寸变化时
-/// 才有工作；没有 renderer 的 headless 帧恒有工作。
 #[test]
 fn frame_reaches_gpu_tracks_plan_and_target_size() {
     let mut rects = DamageRects::new();
@@ -611,8 +581,6 @@ fn frame_reaches_gpu_tracks_plan_and_target_size() {
     );
 }
 
-/// P2-4：Windows 的目标尺寸变化必须变成非 `Idle` 计划 —— `set_content_size` 在 buffer 内
-/// 只是 CPU 记账，`Idle` 发布会让 GPU 线程消费 waitable token 却不 present。
 #[cfg(windows)]
 #[test]
 fn a_windows_surface_change_never_publishes_an_idle_plan() {
@@ -657,18 +625,6 @@ fn a_windows_surface_change_never_publishes_an_idle_plan() {
     ));
 }
 
-/// P2-1 / V-122 ⑧（端到端）：真实 renderer 下「有像素但 `plan == Plan::Idle`、目标尺寸
-/// 未变」的帧不 publish、不递增 `FrameIndex`，但 paint 已消费 lane 与 damage，必须像已提交
-/// 帧一样 `settle_frame` 复位节点状态（否则后续 over-damage / a11y 多标）。
-///
-/// 构造：节点从一开始就在 800×600 目标之外（900,900 起）；先跑一帧结算 root 的初始布局
-/// damage（首帧必定是全帧，会掩掉被测的 `Plan::Idle`），再只改节点颜色（PAINT-only，
-/// 不冒泡到 root）。被测帧的 damage 只来自越界节点，被 `plan` 全部裁空 ⇒ `Plan::Idle`；
-/// 离屏渲染器目标仍是 800×600 ⇒ 没有 GPU 工作。
-///
-/// 回归保护：旧实现只有 `!has_pixels` 一道门禁，本帧 `has_pixels == true`（paint 重建了
-/// lane 并产出 damage），因此会返回 `Committed(FrameIndex(2))` 并推进序号 —— 本测试的
-/// `Idle` / `FrameIndex(1)` 断言会失败。
 #[cfg(windows)]
 #[test]
 fn an_idle_plan_with_a_real_renderer_settles_node_damage() {
@@ -702,7 +658,6 @@ fn an_idle_plan_with_a_real_renderer_settles_node_damage() {
         "预热帧提交后节点 damage 已复位"
     );
 
-    // 只改颜色：PAINT-only，不触发 root 布局，因此本帧 damage 只来自越界节点。
     let patch = StylePatch {
         background: Some(Color::BLACK),
         ..StylePatch::default()
@@ -779,11 +734,6 @@ fn paint_only_frame_skips_layout_and_reuses_lanes() {
     assert!(matches!(outcome, FrameOutcome::Committed(_)));
 }
 
-/// P1-2.4 回归：帧内 panic 之后窗口必须还能出帧。
-///
-/// 旧实现里 `FrameTicket` 没有 `Drop`，panic 展开只是把它丢掉，`FrameScheduler` 永久停在
-/// `Draining` —— `request_frame()` 之后恒 false，`App::frame` 永远返回 `Idle`，窗口冻结且
-/// 无 API 可复位。这里用一个会 panic 的 measure 闭包复现，然后断言第二帧仍能提交。
 #[test]
 fn a_panicking_frame_does_not_freeze_the_scheduler() {
     let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
@@ -801,7 +751,6 @@ fn a_panicking_frame_does_not_freeze_the_scheduler() {
     assert!(caught.is_err(), "闭包 panic 必须冒泡出 frame");
     assert_eq!(window.frame_index().get(), 0, "panic 帧不得递增序号");
 
-    // 关键断言：调度器没有卡在 `Draining`。移除会 panic 的 measure 之后必须仍能出帧。
     let mut healthy = NodeBuilder::boxed();
     window.tree_mut().remove(node).expect("移除会 panic 的节点");
     healthy = healthy.paint(crate::paint::style::PaintSpec {
@@ -852,7 +801,6 @@ fn frame_rejects_bound_nodes_without_styles() {
     let _ = window.frame();
 }
 
-/// A4：呈现快照的公开消费面 —— 每帧落账、历史有界、Linux 的异步 presented 回填按 index 生效。
 #[test]
 fn frame_presentations_are_recorded_and_bounded() {
     let mut window = window();
@@ -884,7 +832,6 @@ fn frame_presentations_are_recorded_and_bounded() {
         Some(std::time::Duration::from_millis(3)),
         "publish → presented（下界）"
     );
-    // Linux 的 presented 事件晚于反馈：按 index 回填（只影响对应条目），陌生 index 不伪造。
     window.note_frame_presented(
         FrameIndex::from_raw(10),
         Some(base + std::time::Duration::from_millis(9)),
@@ -906,12 +853,6 @@ fn frame_presentations_are_recorded_and_bounded() {
     );
 }
 
-// ── E6（P1-E6）：窗口 chrome 的数据面 ───────────────────────────────────
-
-/// E6：`Decorations` 与平台能力决定 `WindowState` 的**建窗初值**：Windows `None` ⇒ 应用自绘、
-/// 且 `can_fullscreen` 初值就是 `false`（没有全屏控制，不能等首轮泵校正 —— 审查 F8）；macOS
-/// `client_decoration` **恒 `false`**（原生交通灯，`Decorations::None` 是文档化降级）。
-/// 默认值保持 `Native`（默认路径回归）。
 #[test]
 fn decorations_drive_the_initial_client_decoration_state() {
     let native = window();
@@ -951,10 +892,6 @@ fn decorations_drive_the_initial_client_decoration_state() {
     }
 }
 
-/// E6 / §8.6.4 / I3：`set_state` 同值 no-op；值变化时给**根节点**标 `PAINT`（应用据此重画
-/// 最大化 / 还原按钮），平台泵随后请求一帧。
-///
-/// 变异守卫：删掉 `set_state` 里的 `mark_paint(root)` ⇒ 第二条断言红。
 #[test]
 fn set_state_is_idempotent_and_marks_the_root_for_paint_when_it_changes() {
     let mut window = window();
@@ -978,8 +915,6 @@ fn set_state_is_idempotent_and_marks_the_root_for_paint_when_it_changes() {
     assert!(window.state().maximized);
 }
 
-/// E6：`WindowOptions::icon` 只是建窗参数，三端都可设置；`PartialEq`（含 `Bytes`）保持可派生
-/// —— `WindowOptions` 的 clone/比较是平台层对账的基础。
 #[test]
 fn window_options_carry_an_optional_icon() {
     assert_eq!(WindowOptions::default().icon, None);
@@ -991,10 +926,6 @@ fn window_options_carry_an_optional_icon() {
     assert!(options.icon.is_some());
 }
 
-// ── E5/§11.5：点 → 字节索引（`Window::text_byte_index_at`） ────────────────
-
-/// 文本节点 fixture：非零 border + padding（覆盖内容偏移换算）、固定内容宽（覆盖断行）、
-/// 左对齐且 `align_self: START`（根节点铺满窗口时文本盒仍然贴左上）。
 fn text_style(width: f32) -> Style {
     let mut style = Style::default();
     style.inner.align_self = Some(taffy::style::AlignSelf::START);
@@ -1018,7 +949,6 @@ fn text_window(text: &str, width: f32) -> (tokio::runtime::Runtime, App, WindowI
     text_window_with_style(text, width, TextStyle::new(16.0))
 }
 
-/// 同 [`text_window`]，但指定文本样式（对齐 / 字号等命中相关输入）。
 fn text_window_with_style(
     text: &str,
     width: f32,
@@ -1045,7 +975,6 @@ fn commit_frame(app: &mut App, window: WindowId) {
     assert!(matches!(outcome, FrameOutcome::Committed(_)), "{outcome:?}");
 }
 
-/// §11.5 规定的往返：`text_caret_rect` → 点 → `HitResult.local_point` → `text_byte_index_at`。
 fn assert_caret_round_trip(app: &App, window: WindowId, node: NodeId, byte_index: usize) {
     let window = app.window(window).expect("窗口存在");
     let caret = window
@@ -1066,7 +995,6 @@ fn assert_caret_round_trip(app: &App, window: WindowId, node: NodeId, byte_index
     );
 }
 
-/// 单行 LTR：往返一致 + 入参是 border box 局部坐标（caret 绝对坐标已含 border/padding/原点）。
 #[test]
 fn text_byte_index_at_round_trips_with_caret_rect() {
     let (_rt, mut app, window, node) = text_window("hello world", 200.0);
@@ -1094,7 +1022,6 @@ fn text_byte_index_at_round_trips_with_caret_rect() {
     }
 }
 
-/// 数字快速路径（单行 ASCII，不走 parley）也必须给出同一套语义：半簇取整 + 垂直 clamp。
 #[test]
 fn text_byte_index_at_round_trips_the_numeric_fast_path() {
     let (_rt, mut app, window, node) = text_window("1234567890", 200.0);
@@ -1136,7 +1063,6 @@ fn text_byte_index_at_round_trips_the_numeric_fast_path() {
     );
 }
 
-/// 多行：每一行的行首都往返一致（点落在哪一行就命中哪一行）。
 #[test]
 fn text_byte_index_at_round_trips_every_line_of_wrapped_text() {
     let (_rt, mut app, window, node) = text_window("alpha beta gamma delta", 70.0);
@@ -1171,7 +1097,6 @@ fn text_byte_index_at_round_trips_every_line_of_wrapped_text() {
     assert_eq!(seen_lines.len(), line_count, "每行至少要抽样一个行首");
 }
 
-/// clamp：点落在文本盒外时 —— 上方 `0`、下方 `len`、行内水平越界取行首/行尾；负坐标不 panic。
 #[test]
 fn text_byte_index_at_clamps_in_border_box_local_coordinates() {
     let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
@@ -1216,7 +1141,6 @@ fn text_byte_index_at_clamps_in_border_box_local_coordinates() {
     );
 }
 
-/// CJK / emoji：命中点必须吸附到字素簇边界（多字节字符内部不是合法返回）。
 #[test]
 fn text_byte_index_at_never_splits_cjk_or_emoji_clusters() {
     let text = "a中b🌍";
@@ -1239,7 +1163,6 @@ fn text_byte_index_at_never_splits_cjk_or_emoji_clusters() {
         assert_caret_round_trip(&app, window, node, index);
     }
 
-    // 3 字节 CJK 字符中点：只能落在 1 或 4。
     let cjk_middle = Point::new((local_x(1) + local_x(4)) * 0.5, line_center_y);
     let cjk_index = window_ref
         .text_byte_index_at(node, cjk_middle)
@@ -1248,7 +1171,6 @@ fn text_byte_index_at_never_splits_cjk_or_emoji_clusters() {
         cjk_index == 1 || cjk_index == 4,
         "CJK 簇中点必须吸附到边界，实际 {cjk_index}"
     );
-    // 4 字节 emoji 中点：只能落在 5 或 9。
     let emoji_middle = Point::new((local_x(5) + local_x(9)) * 0.5, line_center_y);
     let emoji_index = window_ref
         .text_byte_index_at(node, emoji_middle)
@@ -1262,14 +1184,11 @@ fn text_byte_index_at_never_splits_cjk_or_emoji_clusters() {
     }
 }
 
-/// 错误：非文本节点 / 文本尚未 shape（窗口还没有文本 pass）/ 已卸载节点 → `StaleNode`，
-/// 且绝不 panic。
 #[test]
 fn text_byte_index_at_rejects_non_text_and_unshaped_nodes() {
     let (_rt, mut app, window, node) = text_window("abc", 100.0);
     let point = Point::new(1.0, 1.0);
 
-    // 首帧之前：文本节点还没有 ShapedLine。
     assert!(matches!(
         app.window(window)
             .expect("窗口存在")
@@ -1309,7 +1228,6 @@ fn text_byte_index_at_rejects_non_text_and_unshaped_nodes() {
     ));
 }
 
-/// I6：只读 —— 调用前后帧请求数与节点脏位都不变（不登记依赖、不请求帧、不改状态）。
 #[test]
 fn text_byte_index_at_is_read_only() {
     let (_rt, mut app, window, node) = text_window("read only", 120.0);
@@ -1347,9 +1265,6 @@ fn text_byte_index_at_is_read_only() {
     assert!(!tree.has_paint_work(), "I6：不得留下待绘制工作");
 }
 
-// ── E5b/§11.5：命中前的就绪判据（F2）+ 对齐/空文本（F4/F6）──────────────
-
-/// 「当前快照不能作为命中目标」：必须是 `StaleNode { node }`（不是旧快照的索引、不 panic）。
 fn assert_stale_byte_index_at(app: &App, window: WindowId, node: NodeId) {
     let window_ref = app.window(window).expect("窗口存在");
     assert!(
@@ -1361,13 +1276,11 @@ fn assert_stale_byte_index_at(app: &App, window: WindowId, node: NodeId) {
     );
 }
 
-/// 帧门禁只在有唤醒/脏位时推进：改完内容后显式请求一帧，再走完整帧让文本 pass 追上。
 fn commit_frame_after_repaint(app: &mut App, window: WindowId) {
     app.request_repaint(window).expect("窗口存在");
     commit_frame(app, window);
 }
 
-/// 就绪判据 ①：文本内容在文本 pass 之后变了（旧 `ShapedLine` 文本不一致）。
 #[test]
 fn text_byte_index_at_rejects_text_changed_after_the_text_pass() {
     let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
@@ -1382,7 +1295,6 @@ fn text_byte_index_at_rejects_text_changed_after_the_text_pass() {
     }
     assert_stale_byte_index_at(&app, window, node);
 
-    // 下一帧文本 pass 之后即可命中新内容（不是永久失效）。
     commit_frame_after_repaint(&mut app, window);
     let index = app
         .window(window)
@@ -1392,7 +1304,6 @@ fn text_byte_index_at_rejects_text_changed_after_the_text_pass() {
     assert!(index <= 3, "命中不得越过新文本长度，实际 {index}");
 }
 
-/// 就绪判据 ②：样式（shaping 输入）在文本 pass 之后变了。
 #[test]
 fn text_byte_index_at_rejects_style_changed_after_the_text_pass() {
     let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
@@ -1417,7 +1328,6 @@ fn text_byte_index_at_rejects_style_changed_after_the_text_pass() {
     );
 }
 
-/// 就绪判据 ③：行内盒在文本 pass 之后变了。
 #[test]
 fn text_byte_index_at_rejects_inline_boxes_changed_after_the_text_pass() {
     let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
@@ -1452,7 +1362,6 @@ fn text_byte_index_at_rejects_inline_boxes_changed_after_the_text_pass() {
     );
 }
 
-/// 就绪判据 ④：断行宽度（taffy 内容宽）在文本 pass 之后变了。
 #[test]
 fn text_byte_index_at_rejects_layout_width_changed_after_the_text_pass() {
     let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
@@ -1477,7 +1386,6 @@ fn text_byte_index_at_rejects_layout_width_changed_after_the_text_pass() {
     );
 }
 
-/// F4：数字快速路径的 Center/Right 对齐偏移必须参与命中（删掉 offset 后往返变红）。
 #[test]
 fn text_byte_index_at_guards_the_numeric_fast_path_alignment_offset() {
     for alignment in [TextAlign::Center, TextAlign::Right] {
@@ -1504,8 +1412,6 @@ fn text_byte_index_at_guards_the_numeric_fast_path_alignment_offset() {
             "{alignment:?} 的快速路径对齐偏移必须非零（否则本用例测不到 offset）"
         );
 
-        // Right 对齐的末尾 caret 恰好落在 border box 右边界（`Rect` 半开区间不含右边界），
-        // 用它做 round-trip 会先命中剪枝而不是对齐偏移 ⇒ 跳过末尾（用 9 替代 10）。
         let last = if matches!(alignment, TextAlign::Right) {
             9
         } else {
@@ -1517,7 +1423,6 @@ fn text_byte_index_at_guards_the_numeric_fast_path_alignment_offset() {
     }
 }
 
-/// F6：Window 层空文本 —— 文本 pass 之后任意点（含盒外/负坐标）恒 `0`。
 #[test]
 fn text_byte_index_at_returns_zero_for_empty_text_at_window_level() {
     let (_rt, mut app, window, node) = text_window("", 100.0);

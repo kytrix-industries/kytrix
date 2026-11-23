@@ -1,6 +1,3 @@
-//! What a market quantity counts, which side a market event belongs to and the
-//! units a comparison expects.
-
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -14,7 +11,6 @@ use crate::{
     outcome::{OutcomeGroupId, OutcomeMemberId, OutcomeSideId},
 };
 
-/// Which side of the book a public market event belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Side {
     #[serde(rename = "buy")]
@@ -23,7 +19,6 @@ pub enum Side {
     Sell,
 }
 
-/// The position-mode side of a perpetual event or order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PositionSide {
     #[serde(rename = "net")]
@@ -34,7 +29,6 @@ pub enum PositionSide {
     Short,
 }
 
-/// What a quantity counts.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "unit")]
 pub enum QuantityUnit {
@@ -62,7 +56,6 @@ pub enum QuantityUnit {
 }
 
 impl QuantityUnit {
-    /// Returns the asset this unit is denominated in, when it has one.
     pub fn asset(&self) -> Option<&AssetId> {
         match self {
             Self::AssetUnits { asset } | Self::Notional { asset } => Some(asset),
@@ -70,26 +63,18 @@ impl QuantityUnit {
         }
     }
 
-    /// Returns `true` when this unit expresses a monetary amount.
     pub const fn is_notional(&self) -> bool {
         matches!(self, Self::Notional { .. })
     }
 
-    /// Validates that this unit is a traded quantity rather than an amount.
     pub fn require_traded(&self, field: &'static str) -> Result<(), ModelError> {
         require_traded_quantity_unit(self, field)
     }
 
-    /// Validates that this unit is a monetary amount.
     pub fn require_notional(&self, field: &'static str) -> Result<(), ModelError> {
         require_notional_unit(self, field)
     }
 
-    /// Validates that this unit is compatible with a listed instrument.
-    ///
-    /// An outcome quantity must name the exact group, member and side of the
-    /// listed outcome instrument; a spot listing is traded in its base asset, so
-    /// neither its quote asset nor a contract count is a traded unit.
     pub fn validate_for_instrument(&self, instrument: &Instrument) -> Result<(), ModelError> {
         match (self, instrument.terms()) {
             (
@@ -130,7 +115,6 @@ impl QuantityUnit {
     }
 }
 
-/// A listing-scoped quantity with its declared unit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketQuantity {
     #[serde(rename = "value")]
@@ -140,24 +124,20 @@ pub struct MarketQuantity {
 }
 
 impl MarketQuantity {
-    /// Builds a monetary amount that must be expressed as a notional.
     pub fn amount(value: Quantity, unit: QuantityUnit) -> Result<Self, ModelError> {
         unit.require_notional("market_amount")?;
         Ok(Self { value, unit })
     }
 
-    /// Builds a traded quantity that must not be expressed as an amount.
     pub fn traded(value: Quantity, unit: QuantityUnit) -> Result<Self, ModelError> {
         unit.require_traded("market_quantity")?;
         Ok(Self { value, unit })
     }
 
-    /// Validates that this quantity is a monetary amount.
     pub fn validate_amount(&self, field: &'static str) -> Result<(), ModelError> {
         self.unit.require_notional(field)
     }
 
-    /// Validates that this quantity is a traded quantity.
     pub fn validate_traded(&self, field: &'static str) -> Result<(), ModelError> {
         self.unit.require_traded(field)
     }

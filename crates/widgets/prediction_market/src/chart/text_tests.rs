@@ -1,9 +1,3 @@
-//! The chart's formatters, asserted at fixed instants and offsets.
-//!
-//! Both interface languages are pinned: the axis and the hovered time have to follow
-//! the language showing, not the venue's English spelling. The shaped-line cache is
-//! asserted through the engine's own test host, because a lease is what it manages.
-
 use std::{rc::Rc, sync::Arc};
 
 use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
@@ -19,7 +13,6 @@ use super::{
     },
 };
 
-/// The catalogue the chart formats through, rendering `language`.
 fn translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(embedded::load().expect("the embedded locales should load")),
@@ -27,12 +20,10 @@ fn translate(language: LanguageCode) -> Translate {
     )
 }
 
-/// One axis label at UTC.
 fn axis(timestamp: i64, label: TimeLabelKind, language: LanguageCode) -> String {
     format_axis_time(timestamp, label, UtcOffset::UTC, &translate(language)).to_string()
 }
 
-/// One axis label in a display zone.
 fn axis_in(
     timestamp: i64,
     label: TimeLabelKind,
@@ -42,12 +33,10 @@ fn axis_in(
     format_axis_time(timestamp, label, zone, &translate(language)).to_string()
 }
 
-/// One hovered time at UTC.
 fn hover(timestamp: i64, language: LanguageCode) -> String {
     format_hover_time(timestamp, UtcOffset::UTC, &translate(language)).to_string()
 }
 
-/// The instant 2026-01-05 08:00:00 UTC, in milliseconds.
 fn january_fifth_eight() -> i64 {
     Date::from_calendar_date(2026, Month::January, 5)
         .expect("the fixture date is valid")
@@ -58,7 +47,6 @@ fn january_fifth_eight() -> i64 {
         * 1_000
 }
 
-/// The instant 2026-01-05 00:00:00 UTC, in milliseconds.
 fn midnight() -> i64 {
     Date::from_calendar_date(2026, Month::January, 5)
         .expect("the fixture date is valid")
@@ -68,7 +56,6 @@ fn midnight() -> i64 {
         * 1_000
 }
 
-/// The style the chart's axis labels are shaped in.
 fn axis_style() -> ui_core::text::TextStyle {
     label_style(12.0, 14.0, Color::WHITE, REGULAR_WEIGHT)
 }
@@ -279,8 +266,6 @@ fn the_axis_and_legend_round_to_whole_percent() {
     assert_eq!(format_percent_integer(100.0).as_str(), "100%");
 }
 
-/// A shaped line is shaped once: the second read of the same text and style is the
-/// same handle, which is what makes a hover re-shape nothing.
 #[test]
 fn the_text_cache_shapes_a_line_once() {
     let mut app = WidgetTestApp::new();
@@ -294,7 +279,6 @@ fn the_text_cache_shapes_a_line_once() {
     assert_eq!(cache.cached_len(), 1);
 }
 
-/// A different style is a different line: colour and weight are part of its identity.
 #[test]
 fn the_text_cache_keeps_a_line_per_style() {
     let mut app = WidgetTestApp::new();
@@ -309,8 +293,6 @@ fn the_text_cache_keeps_a_line_per_style() {
     assert_eq!(cache.cached_len(), 2);
 }
 
-/// The cache is bounded and drops the least recently used label: reads refresh an
-/// entry, so the label that falls out is the one furthest from the last read.
 #[test]
 fn the_text_cache_keeps_a_bounded_lru_window() {
     let mut app = WidgetTestApp::new();
@@ -326,8 +308,6 @@ fn the_text_cache_keeps_a_bounded_lru_window() {
     let second = second.expect("the third label was shaped");
     assert_eq!(cache.cached_len(), TEXT_CACHE_CAPACITY);
 
-    // Two recent reads: `label-0` and `label-1` are no longer the least recently used,
-    // so the next miss has to evict `label-2`.
     cache.line(app.app_mut(), "label-0", &style);
     let first = cache.line(app.app_mut(), "label-1", &style);
     cache.line(app.app_mut(), "new-label", &style);
@@ -345,8 +325,6 @@ fn the_text_cache_keeps_a_bounded_lru_window() {
     );
 }
 
-/// A handle whose atlas lease moved is re-shaped rather than drawn from reused
-/// texture: the engine refuses to encode it, so keeping it would lose the label.
 #[test]
 fn the_text_cache_reshapes_a_line_whose_atlas_lease_is_gone() {
     let mut app = WidgetTestApp::new();
@@ -354,8 +332,6 @@ fn the_text_cache_reshapes_a_line_whose_atlas_lease_is_gone() {
     let style = axis_style();
     let before = cache.line(app.app_mut(), "8:00 AM", &style);
 
-    // An atlas reset under the same font stack: every handle shaped so far is leased
-    // from an atlas that no longer exists.
     let stack = app.app().font_stack().clone();
     app.app_mut().set_font_stack(stack);
 
@@ -370,7 +346,6 @@ fn the_text_cache_reshapes_a_line_whose_atlas_lease_is_gone() {
     assert_eq!(cache.cached_len(), 1);
 }
 
-/// The width the cache reports is the shaped line's own advance width.
 #[test]
 fn the_text_cache_measures_the_line_it_shaped() {
     let mut app = WidgetTestApp::new();

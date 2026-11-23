@@ -1,11 +1,3 @@
-//! The tests of the venue pages: the pages the served venues offer and the values written through
-//! them.
-//!
-//! The helpers below are the three interactions a venue page is driven with — opening the page from
-//! the sidebar, choosing an option of one of its selectors, and typing into the credential dialog —
-//! and the geometry reads the layout assertions use. They live here because the venue pages are the
-//! only pages that draw them, and [`crate::settings_tests::credentials`] uses the same helpers.
-
 use app_config::{
     market_participants::{
         credentials::BinanceMarketCredentials,
@@ -29,34 +21,28 @@ use crate::{
     settings_tests::test_support::{Harness, configured_settings, translate_in},
 };
 
-/// The page key every test harness mounts the settings under.
 pub(crate) const HARNESS_KEY: &str = "settings.test";
 
-/// The configured fixture with the interface drawn in English.
 pub(crate) fn english_settings() -> Config {
     let mut config = configured_settings();
     config.language = Language::En;
     config
 }
 
-/// Opens one venue's page from the sidebar.
 pub(crate) fn open_page(harness: &mut Harness, page: &str) {
     harness.settle(2);
     harness.select_page(page);
     harness.settle(1);
 }
 
-/// The application-level key the credential controls of one set are named by.
 pub(crate) fn credentials_key(kind: CredentialsKind) -> SmolStr {
     format_smolstr!("{HARNESS_KEY}.{}", kind.row_id())
 }
 
-/// The key the dialog that edits one set is named by.
 pub(crate) fn dialog_key(kind: CredentialsKind) -> SmolStr {
     format_smolstr!("{}.dialog", credentials_key(kind))
 }
 
-/// One value of one set, as the set declares it.
 pub(crate) fn field_of(kind: CredentialsKind, id: &str) -> &'static credentials::CredentialField {
     kind.fields()
         .iter()
@@ -64,22 +50,16 @@ pub(crate) fn field_of(kind: CredentialsKind, id: &str) -> &'static credentials:
         .unwrap_or_else(|| panic!("{kind:?} declares no value {id}"))
 }
 
-/// The id one value of one set is keyed under.
 pub(crate) fn field_id(kind: CredentialsKind, id: &str) -> SmolStr {
     kind.field_id(field_of(kind, id))
 }
 
-/// Runs the frames a dialog's fade needs, the way the platform's clock advances it.
-///
-/// A dialog that is fading out still holds the layer its modal scope is over: until the fade
-/// finishes, a click on the row underneath it would go to the scrim rather than the row.
 pub(crate) fn settle_animation(harness: &mut Harness) {
     for _ in 0..20 {
         harness.advance(16);
     }
 }
 
-/// Opens the dialog that edits one set from its row.
 pub(crate) fn open_credentials_dialog(harness: &mut Harness, kind: CredentialsKind) {
     harness.click_node(kind.edit_selector().as_ref());
     harness.settle(3);
@@ -89,19 +69,16 @@ pub(crate) fn open_credentials_dialog(harness: &mut Harness, kind: CredentialsKi
     );
 }
 
-/// Clicks the dialog's confirm button.
 pub(crate) fn confirm_dialog(harness: &mut Harness) {
     harness.click_node(CONFIRM_SELECTOR);
     settle_animation(harness);
 }
 
-/// Clicks the dialog's cancel button.
 pub(crate) fn cancel_dialog(harness: &mut Harness) {
     harness.click_node(CANCEL_SELECTOR);
     settle_animation(harness);
 }
 
-/// Types `text` into one value of the open dialog.
 pub(crate) fn type_into(harness: &mut Harness, kind: CredentialsKind, id: &str, text: &str) {
     let name = field_id(kind, id);
     harness.click_node(&format!("{name}.root"));
@@ -110,7 +87,6 @@ pub(crate) fn type_into(harness: &mut Harness, kind: CredentialsKind, id: &str, 
     harness.settle(1);
 }
 
-/// The text one field's line of the open dialog reports, or nothing while it reports nothing.
 pub(crate) fn field_error(harness: &Harness, kind: CredentialsKind, id: &str) -> String {
     let selector = kind.error_selector(field_of(kind, id));
     let node = harness
@@ -119,7 +95,6 @@ pub(crate) fn field_error(harness: &Harness, kind: CredentialsKind, id: &str) ->
     harness.text_of(node)
 }
 
-/// Chooses one option of a selector a venue page draws.
 pub(crate) fn choose_option(harness: &mut Harness, field: &str, index: usize) {
     harness.click_node(&format!("SETTINGS_CONTROL_{field}"));
     harness.settle(2);
@@ -128,11 +103,6 @@ pub(crate) fn choose_option(harness: &mut Harness, field: &str, index: usize) {
     harness.settle(2);
 }
 
-/// The node whose debug id ends with `suffix`.
-///
-/// A kit component some of these tests click is named by a key the component mints rather than by
-/// an id the page chooses (the alert's two buttons are the case): the whole tree is walked once and
-/// the last segment is what tells the one button from the other.
 pub(crate) fn find_ending(harness: &Harness, suffix: &str) -> Option<NodeId> {
     let ids = harness.debug_ids();
     let nodes = harness.find_all("");
@@ -147,7 +117,6 @@ pub(crate) fn find_ending(harness: &Harness, suffix: &str) -> Option<NodeId> {
         .map(|(_, node)| node)
 }
 
-/// Clicks one button of the alert that is open (`"ok"` or `"cancel"`).
 pub(crate) fn click_alert(harness: &mut Harness, button: &str) {
     let suffix = format_smolstr!(".{button}:interactive");
     let node = find_ending(harness, suffix.as_str())
@@ -162,12 +131,10 @@ pub(crate) fn click_alert(harness: &mut Harness, button: &str) {
     settle_animation(harness);
 }
 
-/// Whether an alert is open (its OK button is what only an alert draws).
 pub(crate) fn alert_is_open(harness: &Harness) -> bool {
     find_ending(harness, ".ok:interactive").is_some()
 }
 
-/// The layout box of the first node whose debug id starts with `prefix`.
 pub(crate) fn bounds(harness: &Harness, prefix: &str) -> Rect {
     let node = harness
         .find(prefix)
@@ -177,7 +144,6 @@ pub(crate) fn bounds(harness: &Harness, prefix: &str) -> Rect {
         .unwrap_or_else(|| panic!("{prefix} has not been laid out"))
 }
 
-/// The centre of a layout box.
 pub(crate) fn center(bounds: Rect) -> Point {
     Point::new(
         bounds.origin.x + bounds.size.width / 2.0,
@@ -185,7 +151,6 @@ pub(crate) fn center(bounds: Rect) -> Point {
     )
 }
 
-/// The `(top, right, bottom, left)` edges of a layout box.
 pub(crate) fn edges(bounds: Rect) -> (f32, f32, f32, f32) {
     (
         bounds.origin.y,
@@ -195,7 +160,6 @@ pub(crate) fn edges(bounds: Rect) -> (f32, f32, f32, f32) {
     )
 }
 
-/// A page title is the venue's own name, and every other page is named by its message key.
 #[test]
 fn a_venue_page_should_be_named_by_the_venue_it_configures() {
     let mut harness = Harness::new();
@@ -212,7 +176,6 @@ fn a_venue_page_should_be_named_by_the_venue_it_configures() {
     );
 }
 
-/// A group is a heading over the pages under it, and every page under it is drawn.
 #[test]
 fn a_group_should_draw_every_page_under_it() {
     let mut harness = Harness::with_config(english_settings());
@@ -231,8 +194,6 @@ fn a_group_should_draw_every_page_under_it() {
     }
 }
 
-/// A page at the top of the registry is a part of its own rather than another page of the group
-/// above it: a query that names it leaves it alone in the sidebar.
 #[test]
 fn a_root_page_should_be_drawn_without_the_group_above_it() {
     let mut harness = Harness::with_config(english_settings());
@@ -251,7 +212,6 @@ fn a_root_page_should_be_drawn_without_the_group_above_it() {
     );
 }
 
-/// A build that has loaded nothing still offers the rows of its own venues.
 #[test]
 fn a_venue_page_should_offer_its_settings_before_anything_is_loaded() {
     let mut harness = Harness::new();
@@ -265,8 +225,6 @@ fn a_venue_page_should_offer_its_settings_before_anything_is_loaded() {
     );
 }
 
-/// A write through one market's credential dialog lands in that market's set, and the venue's other
-/// market keeps its own.
 #[test]
 fn a_binance_markets_credentials_should_be_written_apart() {
     let mut harness = Harness::with_config(english_settings());
@@ -303,8 +261,6 @@ fn a_binance_markets_credentials_should_be_written_apart() {
     );
 }
 
-/// A write through the futures market's dialog lands in that market's set, and a clear through the
-/// same market's row takes only that set: the spot set is exactly as it was either way.
 #[test]
 fn a_binance_usd_m_perp_dialog_should_leave_the_spot_set_alone() {
     let mut harness = Harness::with_config(english_settings());
@@ -362,8 +318,6 @@ fn a_binance_usd_m_perp_dialog_should_leave_the_spot_set_alone() {
     );
 }
 
-/// Each Binance market's credential row is one row of that market's own card, drawn under the
-/// market's two addresses.
 #[test]
 fn each_binance_market_should_draw_its_credentials_under_its_own_addresses() {
     let mut harness = Harness::with_config(english_settings());
@@ -420,7 +374,6 @@ fn each_binance_market_should_draw_its_credentials_under_its_own_addresses() {
     }
 }
 
-/// A credential value is edited in the dialog rather than drawn as a row of its own.
 #[test]
 fn a_venues_credentials_should_be_edited_in_a_dialog_rather_than_in_rows() {
     let mut harness = Harness::with_config(english_settings());
@@ -475,7 +428,6 @@ fn a_venues_credentials_should_be_edited_in_a_dialog_rather_than_in_rows() {
     }
 }
 
-/// A Binance market's origin row writes the address it chose and carries the other role over.
 #[test]
 fn a_binance_origin_row_should_write_the_chosen_address() {
     let mut harness = Harness::with_config(english_settings());
@@ -507,8 +459,6 @@ fn a_binance_origin_row_should_write_the_chosen_address() {
     );
 }
 
-/// A selector shows the value the settings hold, not the value it was built with: a change made
-/// from elsewhere (another view, the composition root) is what the next frame draws.
 #[test]
 fn an_origin_row_should_show_the_address_the_settings_hold() {
     let mut harness = Harness::with_config(english_settings());
@@ -550,8 +500,6 @@ fn an_origin_row_should_show_the_address_the_settings_hold() {
     );
 }
 
-/// A search that names one row draws that row alone: the filter the shell answers the query with is
-/// what decides whether a venue page draws a setting.
 #[test]
 fn a_search_that_names_one_row_should_draw_only_that_row() {
     let mut harness = Harness::with_config(english_settings());
@@ -573,7 +521,6 @@ fn a_search_that_names_one_row_should_draw_only_that_row() {
     );
 }
 
-/// Longbridge is a page of the settings a user can open, not one that exists only in a builder.
 #[test]
 fn longbridges_page_should_be_a_page_of_the_served_settings() {
     let mut harness = Harness::with_config(english_settings());
@@ -618,8 +565,6 @@ fn longbridges_page_should_be_a_page_of_the_served_settings() {
     }
 }
 
-/// What a user configures on Longbridge's page is what the settings hold: the region moves the
-/// site the venue is reached on, and the credential dialog writes the venue's own set.
 #[test]
 fn longbridges_page_should_write_the_region_and_the_credentials() {
     let mut harness = Harness::new();
@@ -669,8 +614,6 @@ fn longbridges_page_should_write_the_region_and_the_credentials() {
     );
 }
 
-/// A venue page is drawn in the language the interface is rebuilt in: the labels are the catalogue's
-/// sentences, not the ones the page was first built with.
 #[test]
 fn a_venue_page_should_be_drawn_in_the_language_it_is_rebuilt_in() {
     let mut config = configured_settings();

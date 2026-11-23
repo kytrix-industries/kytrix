@@ -33,11 +33,6 @@ use crate::account_profile::AccountProfile;
 #[cfg(any(test, feature = "test-support"))]
 use crate::test_support::test_handle;
 
-/// The credential a sign-out pulled out of the session, kept only long enough to tell
-/// the authority to drop it.
-///
-/// It is deliberately not the session: the sign-out is already finished as far as this
-/// process is concerned, and nothing here can bring it back.
 #[derive(Clone)]
 pub struct Revocation {
     refresh_token: String,
@@ -45,8 +40,6 @@ pub struct Revocation {
 }
 
 impl Revocation {
-    /// Builds the token a sign-out would hand over, for a caller that has no session to
-    /// take one from.
     pub fn new(refresh_token: impl Into<String>, key: DpopKey) -> Self {
         Self {
             refresh_token: refresh_token.into(),
@@ -54,30 +47,21 @@ impl Revocation {
         }
     }
 
-    /// The token the authority is to be told about.
     pub fn refresh_token(&self) -> &str {
         &self.refresh_token
     }
 }
 
-/// What a sign-out did on this machine.
 pub struct DiscardedSession {
-    /// The token the authority still holds, when the session had one to hand over.
     revocation: Option<Revocation>,
-    /// Whether the credential store is known to hold nothing that grants access.
     removed: bool,
 }
 
 impl DiscardedSession {
-    /// Whether the credential store is known to hold nothing of this account any more.
-    ///
-    /// A store that refused both the replacement and the removal is the one case where
-    /// this is false: a usable credential may still be there.
     pub fn removed(&self) -> bool {
         self.removed
     }
 
-    /// Takes what the authority needs to be told, leaving this report behind.
     pub fn into_revocation(self) -> Option<Revocation> {
         self.revocation
     }
@@ -91,15 +75,11 @@ pub struct AuthSession {
 struct AuthSessionInner {
     commands: Mutex<Option<mpsc::Sender<AuthCommand>>>,
     actor: Mutex<Option<JoinHandle<()>>>,
-    /// Where the credential that proves the session lives. Shared with the actor thread
-    /// rather than owned by it, so a sign-out removes the record from the same place the
-    /// session reads it, from the caller and without waiting for a command.
     store: Arc<dyn CredentialStore>,
     control: Arc<SessionControl>,
     cancellation: CancellationToken,
     actor_completion: Arc<ActorCompletion>,
     authority: Arc<dyn AuthAuthority>,
-    /// The application runtime the actor thread is joined on at shutdown.
     runtime: Handle,
 }
 
@@ -141,8 +121,6 @@ impl Drop for ActorCompletionGuard {
 }
 
 impl AuthSession {
-    /// Starts an OAuth session using the Account capability route from `config`.
-    /// A persisted login credential is refreshed once before commands are served.
     pub fn spawn(
         config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
@@ -361,7 +339,6 @@ impl AuthSession {
         self.local_status().await
     }
 
-    /// Returns the plan snapshot in the active in-memory session without loading or refreshing it.
     pub async fn current_plan(
         &self,
         expected_user_id: &str,
@@ -377,37 +354,18 @@ impl AuthSession {
         .await
     }
 
-    /// Ends this machine's account session and removes the credential that proves it.
-    ///
-    /// This is a sign-out, not a request: it runs entirely on the caller, it never waits
-    /// for the actor thread or for the network, and it succeeds whether or not any of
-    /// that is in a usable state. What it cannot do is tell the authority to drop the
-    /// refresh token — see [`Self::revoke_session`] for what does.
     pub fn discard_local_session(&self) -> DiscardedSession {
-        // Set before anything is removed, and before the credential is read: a refresh
-        // that is already in flight holds its own copy of the token, and without this it
-        // would write a rotated credential back after the removal — signing the next
-        // start in again. Every later command that would refresh is refused by it too.
         self.inner.control.mark_credential_discarded();
         let revocation = match load_credential(&self.inner.store) {
             Ok(LoadedCredential::Active {
                 refresh_token, key, ..
             }) => Some(Revocation { refresh_token, key }),
-            // A record that grants nothing is nothing to report; one that cannot be read
-            // at all is not usable either, so a sign-out does not fail over it.
             Ok(LoadedCredential::RefreshOutcomeUnknown | LoadedCredential::Invalidated)
             | Err(_) => None,
         };
 
-        // The session stops being available here rather than at the actor's next command:
-        // the record that proves it is already gone, and every watcher — the menu, the
-        // service supervisor — is told so at once.
         self.inner.control.publish_discard();
 
-        // The entry is removed, and the removal is what a sign-out is for. A credential
-        // store that refuses to remove it keeps the record it had — which is exactly the
-        // one that can sign the user back in — so it is replaced with one that grants
-        // nothing before this returns.
         let removed = retire_stored_credential(&self.inner.store);
         DiscardedSession {
             revocation,
@@ -415,13 +373,6 @@ impl AuthSession {
         }
     }
 
-    /// Reports a finished sign-out to the authority.
-    ///
-    /// The caller owns this future and is expected to drop its result on the floor:
-    /// whether the authority accepted the revocation changes nothing about a sign-out
-    /// that already happened here. Telling the authority is a request, so it has to be
-    /// driven by a runtime that can make one — an executor without a reactor panics inside
-    /// the request instead of sending it.
     pub async fn revoke_session(&self, revocation: Revocation) {
         let Revocation { refresh_token, key } = revocation;
         let result = self.inner.authority.revoke(&refresh_token, &key).await;
@@ -549,13 +500,6 @@ impl AuthSession {
         .expect("the test auth actor should start")
     }
 
-    /// Builds the signed-out session a UI test's connector runs over.
-    ///
-    /// The store starts empty and nothing seeds it: the session has no credential to
-    /// load, and the authority answers every request itself, so the actor never reads the
-    /// operating system keyring and never reaches the account service. A startup refresh
-    /// is off as well, so the first command is served without asking the authority
-    /// anything.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn for_test_signed_out() -> Result<Self, AuthError> {
         let store = Arc::new(InMemoryCredentialStore::default());
@@ -623,8 +567,6 @@ async fn run_auth_session(
             command = commands.recv() => command,
         };
         let Some(command) = command else { break };
-        // A sign-out runs on the caller, so the session it ended is retired here, before
-        // the next command is served with it.
         if let Err(error) = control.retire_discarded_session(&mut current)
             && !matches!(error, AuthError::SequenceExhausted)
         {
@@ -1286,8 +1228,6 @@ mod tests {
                 .await,
             Err(AuthError::SequenceExhausted)
         ));
-        // A sign-out is not a command, so an exhausted sequence does not refuse it: the
-        // credential here is removed whether or not the session was still usable.
         assert!(session.discard_local_session().removed());
         assert!(matches!(
             session
@@ -1308,8 +1248,6 @@ mod tests {
             Err(AuthError::SequenceExhausted)
         ));
         assert_eq!(session.current_plan(TEST_USER_ID).await.unwrap(), None);
-        // The sign-out reads the record to know which token the authority still holds, and
-        // removes it: the load and the removal are its own, on top of the session's.
         assert_eq!(store.loads.load(Ordering::Acquire), 2);
         assert_eq!(store.stores.load(Ordering::Acquire), 2);
         assert_eq!(store.deletes.load(Ordering::Acquire), 1);

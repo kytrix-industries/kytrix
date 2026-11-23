@@ -1,26 +1,11 @@
-//! Unit tests of the market capability's own answers about a route.
-//!
-//! What a market can be asked is answered from the registry — the one view that
-//! says what a load has committed. A scope a venue deploys under discovery
-//! answers the venue's own bounds exactly as a declared scope does, an unloaded
-//! route answers nothing at all (neither its bounds nor admission into the
-//! catalogue), and every route a load committed answers the bounds of every
-//! capability it declares.
-//!
-//! The venues behind the requests are this crate's fixtures: the catalogue
-//! fixture is a real socket answering the catalogue protocol of the built-in
-//! venues, and the info fixture answers Hyperliquid's discovery conversation, so
-//! a load travels through the real gateway, registry and adapter dispatch.
-
 use market_participants_model::{
     identifier::{VenueId, VenueScopeId},
     listing::route::VenueRoute,
     routing::CapabilityId,
 };
 
-/// The two directory files the venue's catalogue is published from.
-use crate::adapter::longbridge::{NASDAQ_LISTED_FILE, OTHER_LISTED_FILE};
 use crate::{
+    adapter::longbridge::{NASDAQ_LISTED_FILE, OTHER_LISTED_FILE},
     catalog::error::CatalogError,
     error::MarketParticipantError,
     market::{
@@ -38,12 +23,10 @@ use crate::{
     },
 };
 
-/// One built-in venue identity.
 fn venue(name: &str) -> VenueId {
     VenueId::from_name(name).expect("the built-in venue identity is canonical")
 }
 
-/// The route of one built-in scope.
 fn route(venue: &VenueId, scope: &str) -> VenueRoute {
     VenueRoute::new(
         *venue,
@@ -51,11 +34,6 @@ fn route(venue: &VenueId, scope: &str) -> VenueRoute {
     )
 }
 
-/// The discovery conversation one builder-deployed DEX `xyz` is loaded through.
-///
-/// The venue answers its DEX table with the core DEX and the one deployed scope,
-/// and serves that scope's metadata by name: the request the discovery makes and
-/// the request the deployed scope's catalogue read makes.
 async fn hyperliquid_fixture() -> (String, tokio::task::JoinHandle<()>) {
     let (origin, _requests, server) = info_fixture_server(
         vec![r#"[null,{"name":"xyz"}]"#.to_owned()],
@@ -67,15 +45,6 @@ async fn hyperliquid_fixture() -> (String, tokio::task::JoinHandle<()>) {
     (origin, server)
 }
 
-/// Every route a load committed answers the bounds of every capability it
-/// declares.
-///
-/// The view this pins is the registry: the bounds are looked up there, so a scope
-/// the venue deployed under discovery is answered from the venue's own numbers
-/// exactly as a declared route is, and no registered `(route, capability)` pair is
-/// left without an answer. The check runs over the whole registry of a root that
-/// loaded all three venues, so a route that is registered but unanswerable fails
-/// the test rather than passing unnoticed.
 #[tokio::test]
 async fn every_loaded_route_answers_its_bounds() {
     let (info, server) = hyperliquid_fixture().await;
@@ -100,8 +69,6 @@ async fn every_loaded_route_answers_its_bounds() {
     );
 
     let mut checked = 0_usize;
-    // The scope list and the entry list are one reading of one commit, so an
-    // entry at an index belongs to the route at that index.
     let scopes = venues.scopes();
     let entries = venues.entries();
     for (index, route) in scopes.iter().enumerate() {
@@ -126,29 +93,10 @@ async fn every_loaded_route_answers_its_bounds() {
     server.abort();
 }
 
-/// Every route that serves candlesticks publishes the neutral convention.
-///
-/// It is what a caller's fallback stands on. A stored adjustment a route no longer
-/// publishes goes back to [`Adjustment::None`] — the chart's own default — and that
-/// is only the route's answer while every route serving candlesticks publishes the
-/// neutral convention: a route publishing `[Forward]` alone would make the fallback
-/// a value the route does not serve, and the fallback would have to become "the
-/// route's first published value". The check runs over every venue this build says
-/// serves candlesticks, so a route that stopped publishing the neutral convention
-/// fails here rather than in a chart.
-///
-/// Which venues those are is read off the definition table rather than listed here:
-/// a venue the build starts serving candlesticks for is one this test has to load
-/// and check, and a list written out by hand is exactly what would let it escape
-/// the guard unnoticed. The loaded set is asserted against that table as well, so a
-/// load that silently registered nothing cannot make the loop vacuous.
 #[tokio::test]
 async fn every_candlestick_route_publishes_the_neutral_convention() {
     let (info, server) = hyperliquid_fixture().await;
     let catalogs = CatalogFixture::start().await;
-    // The venue whose directory is published by the market participant rather than by the
-    // venue reads it from a fixture of its own, so no load in this test can leave
-    // the process.
     let _directory = SymbolDirectoryFixture::install(vec![
         (
             NASDAQ_LISTED_FILE,
@@ -188,8 +136,6 @@ async fn every_candlestick_route_publishes_the_neutral_convention() {
     );
 
     let mut checked = 0_usize;
-    // The scope list and the entry list are one reading of one commit, so an
-    // entry at an index belongs to the route at that index.
     for (index, route) in scopes.iter().enumerate() {
         let serves_candlesticks = entries[index]
             .1
@@ -221,13 +167,6 @@ async fn every_candlestick_route_publishes_the_neutral_convention() {
     server.abort();
 }
 
-/// A scope a venue deploys answers the venue's own bounds.
-///
-/// `perp-dex/xyz` is named only by the venue's discovery, so this is the answer
-/// that proves the bounds are read from the route the load committed: an answer
-/// read from the compile-time table refuses the capability outright. The interval
-/// set is the venue's own fourteen — the same one the adapter answers for its
-/// core scopes.
 #[tokio::test]
 async fn a_discovered_scope_answers_the_venues_own_bounds() {
     let (info, server) = hyperliquid_fixture().await;
@@ -260,16 +199,6 @@ async fn a_discovered_scope_answers_the_venues_own_bounds() {
     server.abort();
 }
 
-/// An unloaded venue is not a runtime answer.
-///
-/// Nothing is loaded, so `binance/spot` is a route this build *declares* — which
-/// is what offers it to the settings interface — and nothing more. Both answers a
-/// caller makes about a market it can use are refused, and refused as the two
-/// different things they are: the route's bounds answer that the market is not
-/// loaded, because that is what a caller waits on, while admission into the catalogue
-/// answers that no registration names the route. The static table read as a runtime
-/// answer would answer the first and leave a scope no load ever committed looking
-/// usable.
 #[tokio::test]
 async fn an_unloaded_venue_is_not_a_runtime_answer() {
     let (info, server) = hyperliquid_fixture().await;
@@ -312,13 +241,6 @@ async fn an_unloaded_venue_is_not_a_runtime_answer() {
     server.abort();
 }
 
-/// the two answers, and neither of them costs a request.
-///
-/// A scope that loaded without a capability and a scope no load has committed are
-/// different answers about different situations: the first is a scope this build does
-/// not serve, the second is a market the user has not loaded — or one a shrinking
-/// commit has taken away — which a caller waits for instead of giving up on. Both are
-/// decided against the loaded venues, so neither reaches the venue.
 #[tokio::test]
 async fn the_two_refusals_are_decided_against_the_loaded_venues_alone() {
     let (info, server) = hyperliquid_fixture().await;
@@ -362,18 +284,9 @@ async fn the_two_refusals_are_decided_against_the_loaded_venues_alone() {
     server.abort();
 }
 
-/// A scope a shrinking commit took away is a market to wait for again.
-///
-/// The commit is a successful load that finds fewer deployments, so the scope that
-/// disappeared is no longer in the loaded venues. Asking for its bounds after that has
-/// to answer "not loaded" — the answer a caller waits on — rather than "this build does
-/// not serve it", which is what a pane settles by clearing the user's own selection.
-/// The answer is decided against the loaded venues, so it costs no request, and the
-/// scopes the venue still publishes keep answering.
 #[tokio::test]
 async fn a_scope_a_shrinking_commit_took_away_answers_not_loaded() {
     let (info, requests, server) = info_fixture_server(
-        // One load is one reading: the first names two deployments, the refresh one.
         vec![
             r#"[null,{"name":"xyz"},{"name":"abc"}]"#.to_owned(),
             r#"[null,{"name":"xyz"}]"#.to_owned(),

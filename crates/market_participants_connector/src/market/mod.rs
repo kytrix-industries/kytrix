@@ -1,5 +1,3 @@
-//! Market capability implementation and market-facing domain API.
-
 pub mod builders;
 pub mod domain;
 pub mod error;

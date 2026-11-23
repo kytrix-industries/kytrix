@@ -1,5 +1,3 @@
-//! 焦点、指针与文本插入点（含 IME caret hint）。
-
 use super::{ImeCursorRequest, Window};
 use crate::{
     error::EngineError,
@@ -8,26 +6,14 @@ use crate::{
     node::id::NodeId,
 };
 
-// 消费者：`impl Window::focus` 的薄委托（外部调用点见该方法文档）。
-/// 焦点状态（只读；写入口是 `App::{set_focus, focus_next, focus_prev}`）。
 pub(crate) fn focus(window: &Window) -> &FocusScope {
     &window.focus
 }
 
-// 消费者：`impl Window::focus_mut` 的薄委托（外部调用点见该方法文档）。
-/// 焦点状态的可写引用（写入口是 `App::set_focus`，它负责标脏）。
 pub(crate) fn focus_mut(window: &mut Window) -> &mut FocusScope {
     &mut window.focus
 }
 
-// 消费者：`impl Window::text_caret_rect` 的薄委托（外部调用点见该方法文档）。
-/// 文本插入点的窗口绝对矩形（逻辑像素）。
-///
-/// `NodeTree::text_caret_rect` 给出文本盒局部矩形；本方法补上节点 border box 原点、
-/// 内容盒偏移（border + padding）与祖先滚动偏移。
-///
-/// # Errors
-/// `StaleNode`：节点不存在；`TextShape`：不是已 shape 的文本节点或 `byte_index` 非法。
 pub(crate) fn text_caret_rect(
     window: &Window,
     node: NodeId,
@@ -47,16 +33,6 @@ pub(crate) fn text_caret_rect(
     ))
 }
 
-// 消费者：`impl Window::text_byte_index_at` 的薄委托（外部调用点见该方法文档）。
-/// 节点 border box 局部坐标 → 文本节点最近的合法字节边界（E5/§11.5）。
-///
-/// 引擎先减去内容盒偏移（border + padding）把点换到**文本盒局部坐标**（与
-/// `NodeTree::text_caret_rect` 的输出同域），再交给 `NodeTree::text_byte_index_at` 按 shaping
-/// 结果命中字素簇。入参与 `HitResult::local_point` 同域，因此调用方不需要自己做坐标换算。
-///
-/// # Errors
-/// `StaleNode`：节点不存在 / 不是可命中的文本节点 / 文本尚未 shape 或文本 pass 尚未重建
-/// 当前内容与断行宽度（语义见 `Window::text_byte_index_at`）。
 pub(crate) fn text_byte_index_at(
     window: &Window,
     node: NodeId,
@@ -72,10 +48,6 @@ pub(crate) fn text_byte_index_at(
     )
 }
 
-// 消费者：`impl Window::set_ime_cursor_request` 的薄委托（外部调用点见该方法文档）。
-// ── P16：IME caret hint ────────────────────────────────────────────────────
-
-/// 登记 IME caret hint；返回是否真的变化（同值 no-op）。
 pub(crate) fn set_ime_cursor_request(window: &mut Window, node: NodeId, byte_index: usize) -> bool {
     let next = ImeCursorRequest { node, byte_index };
     if window.ime_cursor == Some(next) {
@@ -85,17 +57,10 @@ pub(crate) fn set_ime_cursor_request(window: &mut Window, node: NodeId, byte_ind
     true
 }
 
-// 消费者：`impl Window::clear_ime_cursor_request` 的薄委托（外部调用点见该方法文档）。
-/// 清除 IME caret hint；返回是否真的变化。
 pub(crate) fn clear_ime_cursor_request(window: &mut Window) -> bool {
     window.ime_cursor.take().is_some()
 }
 
-// 消费者：`impl Window::ime_cursor_area` 的薄委托（外部调用点见该方法文档）。
-/// 解析当前 IME caret hint（窗口客户区逻辑坐标）。
-///
-/// `Ok(None)` = 没有 hint；`Err(TextShape)` = 已登记但文本尚未 shape / 文本已变化，
-/// 平台层应跳过本次更新并保留上一次有效区域。
 pub(crate) fn ime_cursor_area(window: &Window) -> Result<Option<Rect>, EngineError> {
     let Some(request) = window.ime_cursor else {
         return Ok(None);

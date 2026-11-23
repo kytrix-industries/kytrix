@@ -1,48 +1,3 @@
-//! The canvas that draws one heat map.
-//!
-//! A map is twenty coloured rounded blocks with two labels each, and it is redrawn
-//! whenever the pointer moves across it. The tiles are laid out edge to edge and each
-//! block is then drawn inside its own box, so what separates two neighbours is the pane
-//! body showing through rather than an edge they share. Two things therefore have to be
-//! cheap, and they are what this module is organised around:
-//!
-//! - **The geometry.** The tiles are laid out by a binary split that halves the
-//!   remaining weight, which makes every tile's box a function of the box the canvas
-//!   was given. A frame whose box and whose map are the ones the frame before already
-//!   had keeps that geometry rather than computing it again, and the pointer is
-//!   resolved against it instead of against a second copy.
-//! - **The text.** Every label is a shaped line, which is the expensive part of a
-//!   frame. The shaped lines of the map that is on screen are kept in a small bounded
-//!   cache, keyed by everything that decides how a line looks, so a hover — which
-//!   changes no text at all — re-shapes nothing.
-//!
-//! # The engine's canvas is a value
-//!
-//! A body is built once and the map is a [`NodeKind::Canvas`] node inside it; what a
-//! frame draws is a [`Canvas`] value the widget hands to
-//! [`WidgetCx::set_canvas`](widget::cx::WidgetCx::set_canvas) when, and only when, what
-//! it would draw moved. The frame it was built from is kept beside it: a steady frame
-//! therefore replaces nothing and asks for nothing (I3), and a frame that *did* have to
-//! be built is recognised by a key that names every input the drawing is a function of —
-//! the box, the map, the pointer, the appearance and the atlas generation the labels were
-//! shaped against.
-//!
-//! The tiles themselves are plain quads: a rounded corner and an inner border are two
-//! properties of one [`Quad`], so a block is one primitive and nothing here registers
-//! GPU geometry. Only the labels are shaped (through [`App::shape_text`]) and pushed as
-//! glyph runs, and a handle whose atlas lease is gone is re-shaped rather than drawn from
-//! stale texture.
-//!
-//! # The pointer is followed one reading behind, on purpose
-//!
-//! A mouse crossing the map produces one move event per pixel, so a move only records the
-//! tile it resolved to and the frame that follows draws from it: two positions inside one
-//! tile are one drawing, so a movement that does not change the tile is not a frame.
-//!
-//! The canvas paints no background of its own: the pane body behind it is the
-//! background, so the map never covers the body's rounded corners — and it is what shows
-//! between two blocks.
-
 use std::sync::Arc;
 
 use base_ui::{
@@ -69,37 +24,17 @@ use widget::cx::WidgetCx;
 
 use crate::model::{HeatMapEntry, PriceDirection, TILE_LIMIT};
 
-/// The inset every label keeps from the edges of its block.
 const TILE_TEXT_INSET: f32 = 4.0;
-/// The smallest label of the map.
 const TILE_MIN_FONT_SIZE: f32 = 10.0;
-/// The largest label of the map.
 const TILE_MAX_FONT_SIZE: f32 = 30.0;
-/// How much taller a label's line is than its font, so two labels do not touch.
 const TILE_LINE_HEIGHT_EXTRA: f32 = 3.0;
-/// The outline of one block.
 const TILE_BORDER_WIDTH: f32 = 1.0;
-/// The radius one block's corners are rounded to.
-///
-/// It is the framework's `rounded_sm`, which is a quarter of the window's rem:
-/// four pixels at the sixteen-pixel rem this application runs at, and the same
-/// value the pane body's own corners are cut to.
 const TILE_CORNER_RADIUS: f32 = 4.0;
-/// How far a block is drawn inside the box the layout gave it.
-///
-/// Two neighbours therefore part by two pixels of pane body, which is what makes
-/// the map read as separate blocks instead of a grid of cells that touch.
 const TILE_GUTTER: f32 = 1.0;
-/// How many shaped lines a map keeps.
-///
-/// Two per tile: a map has at most two labels each, and the labels of the map
-/// before are still worth keeping while a new one arrives.
 const TEXT_CACHE_CAPACITY: usize = TILE_LIMIT * 2;
 
-/// The debug id of the canvas node the map draws on.
 pub(crate) const HEATMAP_SELECTOR: &str = "TEST_VOLUME_HEATMAP_CANVAS";
 
-/// One tile, ready to paint: what it says and which way its price went.
 #[derive(Clone, Debug)]
 struct PreparedTile {
     base_asset_label: SmolStr,
@@ -107,15 +42,12 @@ struct PreparedTile {
     direction: PriceDirection,
 }
 
-/// One tile's share of the layout.
 #[derive(Clone, Copy, Debug)]
 struct LayoutItem {
     index: usize,
     weight: f64,
 }
 
-/// The map as a frame draws it: the labels already lifted out of the model, and
-/// the weights the layout is a function of.
 struct PreparedHeatMap {
     entries: Arc<[HeatMapEntry]>,
     tiles: Box<[PreparedTile]>,
@@ -123,7 +55,6 @@ struct PreparedHeatMap {
 }
 
 impl PreparedHeatMap {
-    /// Lifts one map's labels out of the model, so a frame formats nothing.
     fn new(entries: Arc<[HeatMapEntry]>) -> Self {
         let maximum = entries
             .iter()
@@ -145,10 +76,6 @@ impl PreparedHeatMap {
                 notional_label: entry.notional_label.clone(),
                 direction: entry.direction,
             });
-            // A tile with no volume has no share of the map and is not laid out at
-            // all: it would otherwise be given a sliver of the smallest size the
-            // layout can express, which is a tile drawn for a market that did not
-            // trade.
             if weight.is_finite() && weight > 0.0 {
                 layout_items.push(LayoutItem { index, weight });
             }
@@ -162,23 +89,12 @@ impl PreparedHeatMap {
     }
 }
 
-/// One shaped line, and the style it was shaped in.
 struct CachedText {
     text: SmolStr,
     style: TextStyle,
     handle: Arc<ShapedTextHandle>,
 }
 
-/// The shaped lines of the map that is on screen.
-///
-/// A cache of forty entries with the least recently used one dropped is enough for
-/// a map of twenty tiles twice over, and it is what makes a hover free: the tiles
-/// all keep the same labels, so a frame that only moves the highlight finds every
-/// line it needs.
-///
-/// The cache keeps lines a later map no longer draws until they are evicted, so it is
-/// not what a steady frame asks about its atlas leases: only the lines the canvas on
-/// screen was built from matter, and the chart records those ([`VolumeHeatMapChart::painted_text`]).
 struct ChartTextCache {
     entries: Vec<CachedText>,
 }
@@ -190,18 +106,12 @@ impl ChartTextCache {
         }
     }
 
-    /// Shapes `text` in `style`, or returns the line that was shaped before.
-    ///
-    /// A handle whose atlas lease is gone is dropped and shaped again: the glyphs it
-    /// named have been reused, so drawing it would be drawing another line's pixels.
     fn line(&mut self, app: &mut App, text: &str, style: &TextStyle) -> Arc<ShapedTextHandle> {
         if let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.text == text && entry.style == *style)
         {
-            // Refreshing recency by moving the entry to the back is what makes the
-            // capacity below evict the least recently used label.
             let entry = self.entries.remove(index);
             if !entry.handle.is_stale() {
                 let handle = Arc::clone(&entry.handle);
@@ -210,9 +120,6 @@ impl ChartTextCache {
             }
         }
         let handle = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
-            // Text that cannot be shaped at all is drawn as nothing rather
-            // than failing the frame: a label is not worth a dropped frame,
-            // and the next frame tries again.
             app.shape_text("", style, None, &[])
                 .expect("an empty line always shapes")
         }));
@@ -228,24 +135,12 @@ impl ChartTextCache {
     }
 }
 
-/// The geometry of the frame that is already laid out.
-///
-/// It is keyed by the map and the box, which are the only two things the geometry
-/// is a function of: a pointer position is resolved against the tiles rather than
-/// against a second computation of them.
 struct Layout {
-    /// The box the map was laid out in, in window coordinates.
     bounds: Rect,
-    /// The revision of the map it was laid out from.
     revision: u64,
-    /// The tiles' boxes, in window coordinates.
     tiles: Box<[Rect]>,
 }
 
-/// The colours one frame of the map is drawn with, resolved from the theme.
-///
-/// The canvas bakes them in, which is why an appearance switch is one of the key's
-/// inputs: a canvas built for the light appearance is the wrong value for the dark one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ChartColors {
     bullish: Color,
@@ -258,23 +153,18 @@ struct ChartColors {
 }
 
 impl ChartColors {
-    /// The colours the theme resolves, for one appearance.
     fn resolve(theme: &Theme) -> Self {
         Self {
             bullish: theme.components().chart.bullish,
             bearish: theme.components().chart.bearish,
             flat: theme.role(Role::SurfaceRaised),
             border: theme.role(Role::LineDivider),
-            // A tile keeps the colour of its direction under the pointer: a hover is a
-            // neutral wash laid over the block rather than a second colour for it, so one
-            // veil is correct on a bullish, a bearish and a flat tile alike.
             hover: theme.role(Role::VeilHover),
             on_brand: theme.role(Role::FgOnBrand),
             on_surface: theme.role(Role::FgDefault),
         }
     }
 
-    /// The fill of one tile.
     fn tile(self, direction: PriceDirection) -> Color {
         match direction {
             PriceDirection::Up => self.bullish,
@@ -283,10 +173,6 @@ impl ChartColors {
         }
     }
 
-    /// The label colour of one tile.
-    ///
-    /// A label on a saturated block is drawn in the colour the theme pairs with a filled
-    /// surface; a flat block is a neutral surface, so its label is ordinary text.
     fn label(self, direction: PriceDirection) -> Color {
         match direction {
             PriceDirection::Up | PriceDirection::Down => self.on_brand,
@@ -295,11 +181,6 @@ impl ChartColors {
     }
 }
 
-/// The inputs one canvas was built from.
-///
-/// Everything a frame reads has to be in here, or a change to it would keep serving
-/// the canvas from before the change: the box it was laid out in, the map it draws,
-/// the pointer, the colours, and the raster scale the labels were shaped at.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaintedKey {
     bounds: Rect,
@@ -309,34 +190,18 @@ struct PaintedKey {
     text_scale: f32,
 }
 
-/// One heat map: the map it holds, the cache a frame reuses, and the node it draws into.
 pub(crate) struct VolumeHeatMapChart {
-    /// The canvas node, once the body built it.
     node: Option<NodeId>,
     data: PreparedHeatMap,
-    /// Moves whenever `data` is rebuilt, which is how a prepared frame knows the map
-    /// under it changed.
     revision: u64,
     layout: Option<Layout>,
-    /// What the canvas on screen was built from.
     painted: Option<PaintedKey>,
-    /// The shaped lines the canvas on screen was built from.
-    ///
-    /// A canvas is a value and the chart keeps the one it built, but the *glyphs* a
-    /// canvas names are leased from a shared atlas: an atlas generation change or a
-    /// per-tile eviction leaves the handles it was built from pointing at reused
-    /// texture, and the engine drops such runs at encode time. The lines recorded here
-    /// are the ones whose lease a steady frame has to check — a line the cache still
-    /// holds from a map that is no longer drawn is not on the canvas, so it cannot
-    /// keep a steady chart rebuilding.
     painted_text: Vec<Arc<ShapedTextHandle>>,
     text: ChartTextCache,
-    /// The tile the pointer is over.
     hover: Option<usize>,
 }
 
 impl VolumeHeatMapChart {
-    /// An empty map, with no canvas node yet.
     pub(crate) fn new() -> Self {
         Self {
             node: None,
@@ -350,8 +215,6 @@ impl VolumeHeatMapChart {
         }
     }
 
-    /// Rebuilds the map from a new snapshot, reporting whether there is anything
-    /// to redraw.
     pub(crate) fn set_entries(&mut self, entries: Arc<[HeatMapEntry]>) -> bool {
         if Arc::ptr_eq(&self.data.entries, &entries) {
             return false;
@@ -359,38 +222,20 @@ impl VolumeHeatMapChart {
         self.data = PreparedHeatMap::new(entries);
         self.revision = self.revision.wrapping_add(1);
         self.painted = None;
-        // Where the pointer was is an index into the map that was just replaced: the
-        // frame that lays the new one out would drop it anyway, and doing it here as
-        // well is what makes a hover that is already drawn impossible to see over the
-        // new map for even one frame.
         self.layout = None;
         self.hover = None;
         true
     }
 
-    /// Whether the map holds nothing to draw.
-    ///
-    /// A published map that covers no instrument is a fact about the venue rather
-    /// than a pane that is still waiting, so the pane has to be able to tell the two
-    /// apart: it says so over the empty canvas instead of leaving it blank.
     pub(crate) fn is_empty(&self) -> bool {
         self.data.entries.is_empty()
     }
 
-    /// The canvas node, once the body built it.
     #[cfg(test)]
     pub(crate) fn node(&self) -> Option<NodeId> {
         self.node
     }
 
-    /// Builds the canvas node into `parent` and remembers it.
-    ///
-    /// The node starts empty (`Rect::default()`): it has no box until the first layout,
-    /// and [`Self::sync`] is what fills it in. It registers two dependencies on purpose:
-    /// the appearance (a canvas bakes its colours in, so an appearance switch has to
-    /// schedule the frame that rebuilds it) and the language (the canvas' accessible name
-    /// is resolved in the language showing now, and the read is what makes a language
-    /// switch schedule the frame that rebuilds the pane's own copy).
     pub(crate) fn build(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -430,12 +275,6 @@ impl VolumeHeatMapChart {
         Ok(())
     }
 
-    /// Rebuilds the canvas the map is drawn on, reporting whether it changed.
-    ///
-    /// The work is split in two: the *geometry* is rebuilt only when the box or the map
-    /// moved, and the *canvas* is rebuilt only when what it would draw moved — the
-    /// geometry, the pointer, the colours, the raster scale, or the atlas lease of a
-    /// label it was built from.
     pub(crate) fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<bool, EngineError> {
         let Some(node) = self.node else {
             return Ok(false);
@@ -445,13 +284,9 @@ impl VolumeHeatMapChart {
         };
         let bounds = target.layout().bounds;
         if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
-            // The frame that laid the node out has not run yet; the next one will.
             return Ok(false);
         }
 
-        // A frame that had to lay the map out again is a map whose tiles moved, so the
-        // pointer that described the frame before it is dropped rather than carried
-        // over rectangles that are not there any more.
         if self.ensure_layout(bounds) {
             self.hover = None;
         }
@@ -482,9 +317,6 @@ impl VolumeHeatMapChart {
         };
         let (canvas, whole, painted_text) = paint(cx.app_mut(), data, layout, *hover, colors, text);
         let changed = cx.set_canvas(node, canvas)?;
-        // An incomplete canvas is not what the chart draws: leaving the key unrecorded is
-        // what makes the next frame build it again (I3 holds — a whole frame is still a
-        // short circuit).
         if whole {
             self.painted = Some(key);
             self.painted_text = painted_text;
@@ -492,7 +324,6 @@ impl VolumeHeatMapChart {
         Ok(changed)
     }
 
-    /// Lays the map out for `bounds`, reporting whether that was a computation.
     fn ensure_layout(&mut self, bounds: Rect) -> bool {
         if self
             .layout
@@ -514,7 +345,6 @@ impl VolumeHeatMapChart {
         true
     }
 
-    /// The tile under `position`, which is a window position rather than a local one.
     fn hit_test(&self, position: Point) -> Option<usize> {
         let layout = self.layout.as_ref()?;
         if !position.x.is_finite() || !position.y.is_finite() {
@@ -526,10 +356,6 @@ impl VolumeHeatMapChart {
             .position(|bounds| contains_half_open(*bounds, position))
     }
 
-    /// Records where the pointer is, reporting whether the tile under it moved.
-    ///
-    /// Moving inside one tile is not a movement: the drawing is the same, so a frame
-    /// would draw the same pixels.
     pub(crate) fn point_at(&mut self, position: Point) -> bool {
         let next = self.hit_test(position);
         if self.hover == next {
@@ -539,16 +365,10 @@ impl VolumeHeatMapChart {
         true
     }
 
-    /// Records that the pointer left the map, reporting whether it had been on it.
     pub(crate) fn clear_hover(&mut self) -> bool {
         self.hover.take().is_some()
     }
 
-    /// Releases the node this chart draws into.
-    ///
-    /// The node is the chart's own: the pane's body is built once, so a chart that goes
-    /// away takes its canvas node with it. A node the pane already removed is not a
-    /// failure — the framework tears the body down after this hook.
     pub(crate) fn release(&mut self, cx: &mut WidgetCx<'_>) {
         if let Some(node) = self.node.take()
             && cx.tree().get(node).is_ok()
@@ -562,13 +382,11 @@ impl VolumeHeatMapChart {
         self.hover = None;
     }
 
-    /// The tile the last painted frame drew as hovered.
     #[cfg(test)]
     pub(crate) fn hovered(&self) -> Option<usize> {
         self.hover
     }
 
-    /// The tiles of the frame that is laid out, in window coordinates.
     #[cfg(test)]
     pub(crate) fn tile_bounds(&self) -> Vec<Rect> {
         self.layout
@@ -577,7 +395,6 @@ impl VolumeHeatMapChart {
             .unwrap_or_default()
     }
 
-    /// The canvas node's current content.
     #[cfg(test)]
     pub(crate) fn canvas_for_test<'a>(
         &self,
@@ -593,20 +410,6 @@ impl VolumeHeatMapChart {
     }
 }
 
-/// Draws one frame of a map into a canvas.
-///
-/// Two passes, and the order is the whole of the drawing: every block, then every
-/// label. A block is one quad — its fill, its rounded corners and its outline are
-/// the same primitive — and the blocks share one scene order because the layout
-/// produces disjoint boxes. Each label is clipped to its own block, which is what
-/// lets it be drawn without measuring it: a label wider than its block is cut off at
-/// the edge instead of spilling into the gutter or into the next block.
-///
-/// The returned flag says whether every label reached the canvas. A line whose atlas
-/// lease died between being shaped and being pushed is refused by the engine rather
-/// than encoded from reused texture, so the frame that ran into it is missing that run:
-/// it is not a frame the chart can keep. The returned handles are the lines the canvas
-/// was built from — the only ones whose lease the next steady frame has to check.
 fn paint(
     app: &mut App,
     data: &PreparedHeatMap,
@@ -616,8 +419,6 @@ fn paint(
     text: &mut ChartTextCache,
 ) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
     let mut canvas = Canvas::new(layout.bounds);
-    // The masked drawing the reference did: the frame is clipped to the box the node
-    // ended up with, so a rounding error cannot paint over a sibling.
     let _ = canvas.push_clip(ClipRect {
         rect: layout.bounds,
         corner_radius: [0.0; 4],
@@ -690,21 +491,14 @@ fn paint(
     (canvas, whole, painted_text)
 }
 
-/// The shaped text one frame pushes, and whether every line reached the canvas.
 struct TextContext<'a> {
     app: &'a mut App,
     text: &'a mut ChartTextCache,
-    /// The lines this frame pushed, which are the canvas' text.
     used: Vec<Arc<ShapedTextHandle>>,
     whole: bool,
 }
 
 impl TextContext<'_> {
-    /// Pushes one shaped label at `origin`.
-    ///
-    /// A refused line is one whose atlas lease died between being shaped and being
-    /// pushed: its glyphs have been reused, so the run is left out rather than drawn
-    /// from stale texture, and the pass is not a whole frame any more.
     fn label(&mut self, canvas: &mut Canvas, text: &str, origin: Point, style: &TextStyle) {
         if text.is_empty() {
             return;
@@ -718,11 +512,6 @@ impl TextContext<'_> {
     }
 }
 
-/// The box one tile is drawn in: the box the layout gave it, pulled in by the
-/// gutter on every side.
-///
-/// A tile too small to keep a pixel in both directions after that is not drawn at
-/// all, rather than drawn as the sliver the gutter would leave of it.
 fn tile_block_bounds(bounds: Rect) -> Option<Rect> {
     let block = Rect::new(
         bounds.origin.x + TILE_GUTTER,
@@ -733,23 +522,11 @@ fn tile_block_bounds(bounds: Rect) -> Option<Rect> {
     has_positive_area(block).then_some(block)
 }
 
-/// The corner radii of one block: the same radius on all four corners, and never
-/// more than half of the block's short side.
-///
-/// Without the clamp a block smaller than its radius would get the sharp corners
-/// that arcs larger than their box meet at, which is what a sliver of a tile looks
-/// like; clamped, it is a pill or a dot.
 fn tile_corner_radii(block: Rect) -> [f32; 4] {
     let limit = block.size.width.min(block.size.height) / 2.0;
     [TILE_CORNER_RADIUS.min(limit); 4]
 }
 
-/// How large a tile's labels are, which follows the share of the map it takes.
-///
-/// The ratio is taken to its square root because a font size is a length while the
-/// share is an area: a tile four times the size of another then reads twice as
-/// large rather than four times, which is what keeps the biggest tile from
-/// drowning the rest.
 fn tile_font_size(block: Rect, chart_bounds: Rect) -> f32 {
     let chart_area = bounds_area(chart_bounds);
     let area_ratio = if chart_area > 0.0 {
@@ -773,10 +550,6 @@ fn tile_line_height(font_size: f32) -> f32 {
     font_size + TILE_LINE_HEIGHT_EXTRA
 }
 
-/// The style one tile's label is shaped in.
-///
-/// Alignment is *not* part of the placement: the label is placed from its block's own
-/// corner, and its clipping is what keeps it inside.
 fn label_style(font_size: f32, line_height: f32, color: Color) -> TextStyle {
     let mut style = TextStyle::new(font_size);
     style.color = color;
@@ -785,11 +558,6 @@ fn label_style(font_size: f32, line_height: f32, color: Color) -> TextStyle {
     style
 }
 
-/// Places every tile of the map in the box the canvas was given.
-///
-/// The result is indexed by tile rather than by layout item: a tile with no weight
-/// is not laid out and keeps an empty box, so the caller can zip it against the
-/// tiles without tracking which ones were skipped.
 fn layout_tiles(items: &[LayoutItem], tile_count: usize, canvas_size: Size) -> Vec<Rect> {
     let empty = Rect::new(0.0, 0.0, 0.0, 0.0);
     let mut result = vec![empty; tile_count];
@@ -810,12 +578,6 @@ fn layout_tiles(items: &[LayoutItem], tile_count: usize, canvas_size: Size) -> V
     result
 }
 
-/// Splits the remaining box in two, along its longer side, and recurses.
-///
-/// The split is chosen so that the first half carries half of the weight, which is
-/// what makes big tiles big and keeps a tile's box from becoming a sliver: a
-/// one-dimensional split of a two-dimensional share is only an approximation, but
-/// it is one that never leaves a gap and never overlaps.
 fn layout_binary(items: &[LayoutItem], total: f64, bounds: Rect, result: &mut [Rect]) {
     let Some(first) = items.first() else {
         return;
@@ -873,7 +635,6 @@ fn layout_binary(items: &[LayoutItem], total: f64, bounds: Rect, result: &mut [R
     layout_binary(&items[split..], total - first_total, second_bounds, result);
 }
 
-/// The split whose first half comes closest to carrying half of the weight.
 fn balanced_split(items: &[LayoutItem], total: f64) -> (usize, f64) {
     let target = total / 2.0;
     let mut prefix = 0.0;
@@ -908,11 +669,6 @@ fn bounds_area(bounds: Rect) -> f32 {
     bounds.size.width * bounds.size.height
 }
 
-/// Whether a point is inside a box, with the right and bottom edges belonging to
-/// the tile after it.
-///
-/// Half-open edges are what make two neighbouring tiles exactly one pixel of
-/// border apart instead of sharing the pixel the pointer is on.
 fn contains_half_open(bounds: Rect, position: Point) -> bool {
     has_positive_area(bounds)
         && position.x >= bounds.origin.x
@@ -935,7 +691,6 @@ mod tests {
 
     use super::*;
 
-    /// The room the map is laid out in.
     const WIDTH: f32 = 480.0;
     const HEIGHT: f32 = 320.0;
 
@@ -997,7 +752,6 @@ mod tests {
         }
     }
 
-    /// One chart, drawn into a page of a fixed size.
     struct ChartHarness {
         app: WidgetTestApp,
         chart: VolumeHeatMapChart,
@@ -1027,7 +781,6 @@ mod tests {
             theme.set_appearance(self.app.app_mut(), appearance);
         }
 
-        /// Lays the page out at another size, the way a resize does.
         fn resize(&mut self, width: f32, height: f32) {
             let Self { app, page, .. } = self;
             let style = StyleBuilder::new()
@@ -1041,7 +794,6 @@ mod tests {
         }
     }
 
-    /// Builds a chart over a page of `width` × `height`, lays it out, and paints it.
     fn harness_in(width: f32, height: f32, entries: Arc<[HeatMapEntry]>) -> ChartHarness {
         let mut app = WidgetTestApp::new();
         let window = app.window();
@@ -1050,8 +802,6 @@ mod tests {
         chart.set_entries(entries);
         app.with_cx(|cx| chart.build(cx, page))
             .expect("the chart builds");
-        // The first frame lays the page (and the canvas inside it) out; the sync after
-        // it is the frame that paints the map the box was measured for.
         app.drain();
         let mut harness = ChartHarness {
             app,
@@ -1067,7 +817,6 @@ mod tests {
         harness_in(WIDTH, HEIGHT, entries(&["BTC", "ETH", "SOL"]))
     }
 
-    /// A box of a fixed size, which is the shape a chart is laid out in.
     fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
         app.with_cx(|cx| {
             let root = cx.tree().root();
@@ -1085,12 +834,10 @@ mod tests {
         })
     }
 
-    /// The canvas node's rendered primitives.
     fn primitives(harness: &ChartHarness) -> Vec<&Primitive> {
         harness.canvas().primitives().iter().collect()
     }
 
-    /// The canvas value the chart's node holds, which says whether a frame rebuilt it.
     fn canvas_arc(harness: &ChartHarness) -> Arc<Canvas> {
         match harness
             .app
@@ -1114,7 +861,6 @@ mod tests {
             .collect()
     }
 
-    /// The generation of the atlas the canvas' glyphs were rasterized in, if it has any.
     fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
         primitives(harness)
             .into_iter()
@@ -1125,7 +871,6 @@ mod tests {
             .map(|glyph| glyph.tile.generation)
     }
 
-    /// A pointer in the middle of one of the laid-out tiles.
     fn middle_of(harness: &ChartHarness, index: usize) -> Point {
         let tile = harness.chart.tile_bounds()[index];
         Point::new(
@@ -1198,8 +943,6 @@ mod tests {
         );
     }
 
-    /// Two neighbours part by two gutters, which is what makes the map read as
-    /// separate blocks: the seam is the pane body rather than an edge they share.
     #[test]
     fn two_neighbours_should_part_by_two_gutters() {
         let entries: Arc<[HeatMapEntry]> = Arc::from([entry("BTC", 1, "1"), entry("ETH", 1, "1")]);
@@ -1484,8 +1227,6 @@ mod tests {
         assert_eq!(harness.chart.hovered(), Some(2));
         let tiles_before = harness.chart.tile_bounds();
 
-        // The page is laid out again at another size: what moved is the geometry, not
-        // the pointer.
         harness.resize(WIDTH + 64.0, HEIGHT + 64.0);
 
         assert!(harness.sync(), "a new box is a new drawing");
@@ -1552,7 +1293,6 @@ mod tests {
         );
     }
 
-    /// A tile is one quad — its fill, its corners and its outline — at the block's box.
     #[test]
     fn a_tile_should_be_painted_as_one_inset_rounded_quad() {
         let harness = harness();
@@ -1583,7 +1323,6 @@ mod tests {
         }
     }
 
-    /// A map of one tile draws one label pair, so a hover re-shapes nothing.
     #[test]
     fn a_hover_should_not_shape_any_label_again() {
         let mut harness = harness_in(WIDTH, HEIGHT, entries(&["BTC"]));
@@ -1636,18 +1375,12 @@ mod tests {
         );
     }
 
-    /// The atlas a canvas' glyphs were leased from can be reset under a chart that would
-    /// otherwise look steady. The engine drops runs whose lease is gone at encode time, so
-    /// a chart that kept the canvas it already had would lose its labels for good. A moved
-    /// lease is a frame the chart owes.
     #[test]
     fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
         let mut harness = harness_in(WIDTH, HEIGHT, entries(&["BTC"]));
         let primitives_before = harness.canvas().primitives().len();
         let generation = glyph_generation(&harness).expect("the map labels its tiles");
 
-        // An atlas reset under the same font stack: every handle the canvas was built from
-        // is leased from an atlas that no longer exists, while the glyphs shape back the same.
         let stack = harness.app.app().font_stack().clone();
         harness.app.app_mut().set_font_stack(stack);
 
@@ -1671,11 +1404,6 @@ mod tests {
         );
     }
 
-    /// The labels of a map that replaced a bigger one stay in the text cache until they
-    /// are evicted. An atlas reset makes those lines stale, but they are not on the
-    /// canvas any more: only the lines the canvas was built from may keep a frame from
-    /// being steady, or the chart would rebuild its canvas on every frame after such a
-    /// reset.
     #[test]
     fn a_map_that_left_its_labels_behind_should_still_be_steady() {
         let big_map: Arc<[HeatMapEntry]> = Arc::from(
@@ -1698,8 +1426,6 @@ mod tests {
             "the canvas on screen is drawn from the two lines of the map that is there"
         );
 
-        // An atlas reset under the same font stack: every line shaped so far is leased
-        // from an atlas that no longer exists.
         let stack = harness.app.app().font_stack().clone();
         harness.app.app_mut().set_font_stack(stack);
         assert!(harness.sync(), "the lines on the canvas are shaped again");
@@ -1724,8 +1450,6 @@ mod tests {
         );
     }
 
-    /// A quad-only map registers no GPU geometry, and the store it does not use stays as
-    /// it was: a frame that starts registering a mesh has to hand the previous one back.
     #[test]
     fn preparing_and_releasing_should_leave_the_geometry_store_alone() {
         let mut harness = harness();
@@ -1758,7 +1482,6 @@ mod tests {
         app.with_cx(|cx| chart.build(cx, root))
             .expect("the chart builds");
 
-        // No frame has laid the node out yet: it has no box, so there is nothing to draw.
         assert!(
             !app.with_cx(|cx| chart.sync(cx)).expect("the chart syncs"),
             "a chart that was not laid out draws nothing"

@@ -1,8 +1,3 @@
-//! 读回：persist（`*_SRGB` image）→ host-visible buffer → map。
-//!
-//! 字节语义与 D3D12 / Metal 同契约：存储字节是 **sRGB 编码后的预乘值**，读回后只做 BGRA→RGBA 交换。
-//! 仅测试 / `test-support` 构建存在；缓冲是本窗口独占的（共享设备只提供 `VkDevice` / 内存类型）。
-
 use ash::vk;
 
 use crate::{
@@ -13,16 +8,13 @@ use crate::{
     },
 };
 
-/// 读回的一帧像素（RGBA8，预乘，sRGB 编码字节）。
 pub(crate) struct ReadbackImage {
     pub width: u32,
     pub height: u32,
     pub rgba8: Vec<u8>,
 }
 
-/// 复用的 host-visible buffer。
 pub(crate) struct Readback {
-    /// 第一次 `record` 时填（在此之前没有任何 Vulkan 句柄）。
     device: Option<ash::Device>,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -39,10 +31,6 @@ impl Readback {
         }
     }
 
-    /// 把 image 拷进 host-visible buffer 并读回（调用方保证 image 处于
-    /// `COLOR_ATTACHMENT_OPTIMAL`，且命令缓冲在之后立即提交 + 等待）。
-    /// 只**录制** barrier + `cmd_copy_image_to_buffer`；映射必须在提交并等到 fence
-    /// 之后由 [`Readback::fetch`] 做（否则读到的是提交前的旧内容）。
     pub(crate) fn record(
         &mut self,
         shared: &SharedGpu,
@@ -66,7 +54,6 @@ impl Readback {
             .subresource_range(range)
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        // SAFETY: barrier / copy 的目标都是调用方持有的资源；范围在 image 边界内。
         unsafe {
             shared.raw().cmd_pipeline_barrier(
                 command,
@@ -115,14 +102,12 @@ impl Readback {
         Ok(())
     }
 
-    /// 提交并等待之后的读取（map → 拷贝 → BGRA→RGBA 交换）。
     pub(crate) fn fetch(&mut self, size: (u32, u32)) -> Result<ReadbackImage, EngineError> {
         let bytes = u64::from(size.0) * u64::from(size.1) * 4;
         let Some(device) = self.device.as_ref() else {
             return Err(init_error("readback", "buffer is not allocated"));
         };
         let mut rgba8 = vec![0u8; bytes as usize];
-        // SAFETY: buffer 至少 `bytes`（`record` 已按需扩容）；映射范围在分配内。
         unsafe {
             let pointer = device
                 .map_memory(self.memory, 0, bytes, vk::MemoryMapFlags::empty())
@@ -130,7 +115,6 @@ impl Readback {
             std::ptr::copy_nonoverlapping(pointer.cast::<u8>(), rgba8.as_mut_ptr(), bytes as usize);
             device.unmap_memory(self.memory);
         }
-        // 目标格式是 B8G8R8A8（persist 的固定格式）：统一换成交给 `SnapshotImage` 的 RGBA8。
         for pixel in rgba8.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
@@ -143,7 +127,6 @@ impl Readback {
 
     fn allocate(&mut self, shared: &SharedGpu, bytes: u64) -> Result<(), EngineError> {
         self.release();
-        // SAFETY: 句柄归本结构独占；失败时由 `release` 兜底。
         unsafe {
             self.buffer = shared
                 .raw()
@@ -187,7 +170,6 @@ impl Readback {
         let Some(device) = self.device.as_ref() else {
             return;
         };
-        // SAFETY: 句柄归本结构独占；调用方保证 GPU 空闲。
         unsafe {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);

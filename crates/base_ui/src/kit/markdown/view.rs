@@ -1,23 +1,3 @@
-//! markdown 视图层：只读 IR → 引擎节点树。
-//!
-//! 旧的 `view.rs` 是 `Entity<MarkdownState>` + 自绘 `Element`（每块一个 `TextFlow`）；引擎化后
-//! 这里只做两件事：
-//!
-//! 1. **块 → 节点**：标题/段落挂一个引擎文本节点（行内混排由 [`super::inline_flow`] 展开成
-//!    `runs` + `inline_boxes`）；代码块/引用/列表/表格/分隔线各自按节点树表达（表格是简单的
-//!    行列 `flex` 布局，不依赖容器的 `table` 组件批次）。
-//! 2. **样式**：从 [`crate::theme`] 解析的 [`MarkdownStyle`]（挂载期常量），
-//!    布局/绘制走 `crate::style_builder::{StyleBuilder, PaintBuilder}`。
-//!    静态用法是 [`MarkdownView`]（样式定死）；主题响应式用法是 [`MarkdownNode`]：外观变化时
-//!    按新主题重建子树（逐 run 颜色没有动态通道，见 `MarkdownNode` 的文档）。
-//!
-//! 链接命中不在节点树上做（引擎只有节点级命中），而是 [`MarkdownHandles`] 自持每条文本节点的
-//! 链接字节区间，再用引擎 E5 的 `Window::text_byte_index_at` 把点变成字节偏移：见
-//! [`MarkdownHandles::link_at`]。
-//!
-//! 空行（[`MarkdownBlock::BlankLine`]）是一个固定高度的空节点——旧实现同样用一个
-//! `div().h(line_height)` 占位，源码里的空行不折叠。
-
 use std::sync::Arc;
 
 use smol_str::{SmolStr, format_smolstr};
@@ -42,54 +22,32 @@ use crate::{
     theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
 };
 
-/// 正文行高倍率（与旧 `window.text_style()` 的行高比例一致：1.4）。
 const LINE_HEIGHT: f32 = 1.4;
-/// 相邻两块之间的最小间距（源码里没写空行时）。
 const BLOCK_GAP: f32 = 8.0;
-/// 非首块标题与上一块之间的额外间距。
 const HEADING_SPACE_ABOVE: f32 = 8.0;
-/// 代码块内边距。
 const CODE_PADDING: f32 = 8.0;
-/// 代码块圆角。
 const CODE_RADIUS: f32 = 4.0;
-/// 引用块左侧竖线的宽度。
 const QUOTE_BORDER_WIDTH: f32 = 3.0;
-/// 引用块内容与竖线的距离。
 const QUOTE_PADDING: f32 = 8.0;
-/// 列表标记列宽（同一列表的文本从这里开始，对齐）。
 const LIST_MARKER_WIDTH: f32 = 20.0;
-/// 表格单元格内边距。
 const CELL_PADDING: f32 = 4.0;
 
-/// markdown 的挂载期样式（从主题解析一次；主题切换 = 重新挂载，与 P2-1a 的挂载期常量约定一致）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownStyle {
-    /// 正文字号（标题按 `HeadingLevel::scale` 放大）。
     pub body_size: f32,
-    /// 行高倍率。
     pub line_height: f32,
-    /// 正文文字色。
     pub foreground: Color,
-    /// 次要文字色（列表标记）。
     pub muted: Color,
-    /// 链接色。
     pub link: Color,
-    /// 行内代码 / 代码块文字色。
     pub code_foreground: Color,
-    /// 代码块背景。
     pub code_background: Color,
-    /// 引用块左侧竖线色。
     pub quote_border: Color,
-    /// 分隔线 / 表格行线色。
     pub divider: Color,
-    /// 行内图片占位色（资源通路未接线时的默认绘制方式）。
     pub image_placeholder: Color,
-    /// 等宽字体族（代码块 / 行内代码）。
     pub mono_family: SmolStr,
 }
 
 impl MarkdownStyle {
-    /// 从主题解析一套默认样式。
     pub fn from_theme(theme: &Theme) -> Self {
         let tokens = theme.tokens();
         Self {
@@ -107,12 +65,10 @@ impl MarkdownStyle {
         }
     }
 
-    /// 一行正文的行高（像素；空行占位用它）。
     pub fn line_height(&self) -> f32 {
         self.body_size * self.line_height
     }
 
-    /// 一块文本的段落级兜底样式（字号、颜色、字重、行高、对齐、换行）。
     fn text_style(&self, size: f32, bold: bool, align: ParagraphAlign) -> TextStyle {
         TextStyle::new(size)
             .with_color(self.foreground)
@@ -122,7 +78,6 @@ impl MarkdownStyle {
             .with_wrap(TextWrap::Wrap)
     }
 
-    /// 行内映射的样式来源。
     fn flow_style(&self, size: f32, bold: bool) -> FlowStyle {
         FlowStyle {
             font_size: size,
@@ -134,7 +89,6 @@ impl MarkdownStyle {
     }
 }
 
-/// `ParagraphAlign` → 引擎 `TextAlign`。
 fn text_align(align: ParagraphAlign) -> TextAlign {
     match align {
         ParagraphAlign::Left => TextAlign::Left,
@@ -143,14 +97,8 @@ fn text_align(align: ParagraphAlign) -> TextAlign {
     }
 }
 
-/// 行内图片的资源通路：把 `MarkdownAssets` 的字节喂给引擎 `ResourceCache`，拿到 `ResourceId`。
-///
-/// `svg` 需要构建期预栅格（资产批次），这里不画（返回 `None`，引擎只算落点）；位图缺资源时
-/// 也返回 `None`——不静默画占位块，由调用方决定是否用 [`PlaceholderImages`]。
 pub struct ResourceImages<'a> {
-    /// 引擎图片资源缓存。
     pub cache: &'a mut ResourceCache,
-    /// markdown 解析期同一份资源面（路径 → 字节）。
     pub assets: &'a dyn MarkdownAssets,
 }
 
@@ -173,20 +121,12 @@ impl ImagePaintSource for ResourceImages<'_> {
     }
 }
 
-/// 一个挂载好的富文本节点（供 markdown 之外的行内混排用法复用）。
 #[derive(Clone, Debug)]
 pub struct RichText {
-    /// 文本节点 id。
     pub node: NodeId,
-    /// 该节点的链接字节区间（链接命中用，见 [`MarkdownHandles::link_at`]）。
     pub links: Arc<[LinkSpan]>,
 }
 
-/// 把一段行内片段挂成一个引擎文本节点（`TextContent{runs, inline_boxes}`）。
-///
-/// `base` 是段落级样式（[`MarkdownStyle::text_style`] 的产物），`align` 覆盖它的对齐方式；
-/// 行内标记由 `style`（基准色、链接色、代码色）与片段自己的 strong/emphasis/strike/code/link/kbd
-/// 决定。
 pub fn rich_text(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -200,8 +140,6 @@ pub fn rich_text(
     if flow.is_empty() {
         return None;
     }
-    // 只有行内图片的块在文本上没有任何字节：parley 的空文本不产生行，补一个零宽字符当锚点，
-    // 图片盒子因此仍能落在唯一的行上（旧实现的逻辑索引空间里图片也占 1 个字节）。
     let text = if flow.text.is_empty() {
         SmolStr::new_static("\u{200B}")
     } else {
@@ -221,25 +159,13 @@ pub fn rich_text(
     })
 }
 
-/// 一份挂载好的 markdown 视图：根节点 + 所有文本节点的链接区间（命中用）。
 #[derive(Clone, Debug)]
 pub struct MarkdownHandles {
-    /// 视图根节点。
     pub root: NodeId,
-    /// 挂载出来的文本块（DFS 顺序；每个都可能是链接命中目标）。
     pub text_blocks: Vec<RichText>,
 }
 
 impl MarkdownHandles {
-    /// 窗口绝对坐标 → 落在哪条链接上（`None` = 不在链接上 / 不在任何文本块里）。
-    ///
-    /// 命中链路：节点级几何（`Node::layout().bounds`）→ 点转节点局部坐标 →
-    /// 引擎 E5 `Window::text_byte_index_at`（簇边界由 parley 决定）→ 自持的链接字节区间。
-    /// 引擎错误（未成形 / 非文本 / 快照过期）一律按"未命中"处理，不 panic。
-    ///
-    /// **已知边界（登记 E2b，不扩引擎）**：纯图片链接没有字节区间（行内图片不占文本字节），
-    /// 因此 `link_at` 无法命中图片；`span.range` 是半开区间，点在最后一个字符右半边时 E5 返回
-    /// `byte == span.end`，同样不命中（E5 边界语义）。
     pub fn link_at(&self, window: &Window, point: Point) -> Option<LinkId> {
         for block in &self.text_blocks {
             if block.links.is_empty() {
@@ -268,7 +194,6 @@ impl MarkdownHandles {
     }
 }
 
-/// markdown 视图（IR → 节点树）。
 #[derive(Clone, Debug)]
 pub struct MarkdownView {
     document: Arc<MarkdownDocument>,
@@ -276,27 +201,22 @@ pub struct MarkdownView {
 }
 
 impl MarkdownView {
-    /// 用已解析的文档 + 样式构造视图。
     pub fn new(document: Arc<MarkdownDocument>, style: MarkdownStyle) -> Self {
         Self { document, style }
     }
 
-    /// 从主题解析样式（`Theme::of(appearance)` / `ThemeHandle::theme_for(..)` 的挂载期用法）。
     pub fn from_theme(theme: &Theme, document: Arc<MarkdownDocument>) -> Self {
         Self::new(document, MarkdownStyle::from_theme(theme))
     }
 
-    /// 当前文档。
     pub fn document(&self) -> &MarkdownDocument {
         &self.document
     }
 
-    /// 当前样式。
     pub fn style(&self) -> &MarkdownStyle {
         &self.style
     }
 
-    /// 挂载：行内图片画占位方块（资源通路未接线时的默认）。
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> MarkdownHandles {
         let mut images = super::inline_flow::PlaceholderImagePaint {
             color: self.style.image_placeholder,
@@ -304,10 +224,6 @@ impl MarkdownView {
         self.build_with_images(tree, parent, &mut images)
     }
 
-    /// 挂载：行内图片走调用方给的绘制方式（生产用 [`ResourceImages`]）。
-    ///
-    /// 根节点的 `build` 失败只可能是 `parent` 已不在树里（调用方错误），因此在根上 `expect`；
-    /// 子节点不会失败（父节点刚建出来），失败时按"这一块不画"跳过，不 panic。
     pub fn build_with_images(
         &self,
         tree: &mut NodeTree,
@@ -328,7 +244,6 @@ impl MarkdownView {
         self.build_into(tree, root, images)
     }
 
-    /// 在已存在的 `root` 下建全部块（`build_with_images` 与主题重建共用）。
     fn build_into(
         &self,
         tree: &mut NodeTree,
@@ -349,19 +264,6 @@ impl MarkdownView {
     }
 }
 
-/// 主题化 markdown 组件：静态载荷（`runs` / 装饰 / 代码块颜色）在挂载期按**当前外观**烘焙，
-/// 外观变化时由 [`MarkdownNode::sync`] 用新主题**重建子树**。
-///
-/// 为什么是重建而不是 `bind_style`：markdown 的行内颜色是**逐 run** 的（链接 / 行内代码 /
-/// 列表标记），而 `StylePatch::foreground` 是整段文本的统一覆盖（`paint/pass.rs` 的文本分支），
-/// 绑它会把一行里的多种颜色压成一种。逐 run 颜色没有动态通道，重建是正确的语义。
-///
-/// 失效链路：根节点绑一个只读主题依赖的空补丁（组件不产出挂载期颜色之外的静态色），外观
-/// 信号写入 → 根节点标脏 → 出现一帧 → 组合根的帧钩子（样式 pass **之前**）调用 `sync` 重建，
-/// 同帧完成新颜色的塑形与绘制。没有读主题的节点（其它静态子树）不受影响。
-///
-/// 生命周期：[`MarkdownNode::release`] 卸载挂载时建出的根子树（P2-11）——富文本块是纯静态
-/// 子树（没有 `bind_*` / 作用域 / handler），根上的外观依赖边随节点卸载由引擎交还。
 pub struct MarkdownNode {
     root: NodeId,
     document: Arc<MarkdownDocument>,
@@ -371,11 +273,6 @@ pub struct MarkdownNode {
 }
 
 impl MarkdownNode {
-    /// 在 `parent` 下挂载（根节点 debug id = `MARKDOWN`），样式取 `theme` 的**当前外观**。
-    ///
-    /// # Errors
-    /// [`EngineError::UnknownWindow`]（`window` 已关闭）/ 根节点建树错误（`parent` 已卸载，
-    /// 只可能是调用方给了陈旧句柄）。失败时不留半建的子树：根节点就是建树的全部前置。
     pub fn mount(
         app: &mut App,
         window: WindowId,
@@ -399,7 +296,6 @@ impl MarkdownNode {
             )
             .id("MARKDOWN")
             .bind_style(move |cx| {
-                // 只登记依赖：外观写入时本节点标脏 → 一帧 → `sync` 重建子树。
                 let _ = dependency_theme.appearance(cx);
                 StylePatch::default()
             })
@@ -428,14 +324,6 @@ impl MarkdownNode {
         })
     }
 
-    /// 外观变化时按新主题重建子树；返回是否重建（帧钩子里、样式 pass 之前调用）。
-    ///
-    /// 子树节点是纯静态载荷（没有 `bind_*` / 没有自持信号依赖），因此直接 `NodeTree::remove`
-    /// 不残留依赖边。**不变量**：markdown 子树不得挂 `bind_*` —— `NodeTree::remove` 只把被删
-    /// 节点仍持有的**非空**依赖边交还调用方（由 `App` 逐条 `detach`），所以「返回空」就等于
-    /// 「子树无绑定」；忽略返回值只有在子树无绑定时才安全，由 `debug_assert` 守护（F6）。根节点
-    /// 原地保留（外部持有的 probe / 布局锚点不失效；回归测试
-    /// `rebuilding_keeps_the_markdown_root_identity_and_the_page_offset`）。
     pub fn sync(&mut self, app: &mut App) -> bool {
         let appearance = self.theme.current(app);
         if appearance == self.appearance {
@@ -471,30 +359,16 @@ impl MarkdownNode {
         true
     }
 
-    /// 视图根节点。
     #[must_use]
     pub fn root(&self) -> NodeId {
         self.root
     }
 
-    /// 当前子树挂载出来的文本块（链接命中用；重建后是新的一组）。
     #[must_use]
     pub fn handles(&self) -> &MarkdownHandles {
         &self.handles
     }
 
-    /// 卸载组件：摘掉 `mount` 建出的整棵子树（幂等；P2-11，W8a/W8b 缺口）。
-    ///
-    /// 生命周期契约：`MarkdownNode` = **一棵节点子树 + 根上的外观依赖边**，没有自有
-    /// `SignalScope`、也没有 Action handler；因此释放面就是卸载根子树 —— [`App::remove_node`]
-    /// 同时交还根上的依赖边并清理 scoped 绑定，widget 不必再自己 `remove_node(root)` 并记住
-    /// 根句柄（W8 的 `remove_markdown` 绕行）。返回 `true` = 本次真的卸载了根；根已被父级
-    /// 卸载（父树先删）或重复调用返回 `false`。
-    ///
-    /// 释放后组件不可再用（`sync` 变成 no-op，`handles()` 清空）；需要内容请重新 [`mount`]。
-    /// 只卸载**自己**的根：挂在同一个父节点下的其它节点属于调用方。
-    ///
-    /// [`mount`]: MarkdownNode::mount
     pub fn release(&mut self, app: &mut App) -> bool {
         let Some(window) = self.root.window() else {
             return false;
@@ -507,7 +381,6 @@ impl MarkdownNode {
     }
 }
 
-/// 一次挂载的上下文：样式、图片画法、已建文本块、节点 id 计数。
 struct BuildCtx<'a> {
     view: &'a MarkdownView,
     images: &'a mut dyn ImagePaintSource,
@@ -526,14 +399,6 @@ impl BuildCtx<'_> {
         index
     }
 
-    /// 一列块：块间距与旧 `MarkdownState::render` 同一规则。
-    ///
-    /// - 空行自己就是间距：空行两侧**不再**叠 `BLOCK_GAP`（`previous_blank` 抑制）；
-    /// - 非空行相邻的两块留 `BLOCK_GAP`；
-    /// - 非首块的标题在以上间距之上**再加** `HEADING_SPACE_ABOVE`——空行之后也是 +8，
-    ///   与旧实现一致（空行不吞标题的额外上间距，也不额外放大段落间距）。
-    ///
-    /// `index` 是枚举下标（含空行，只用于空行节点 id 的稳定性）；首/非首看的是**非空块**计数。
     fn build_blocks(&mut self, tree: &mut NodeTree, parent: NodeId, blocks: &[MarkdownBlock]) {
         let mut previous_blank = false;
         let mut block_index = 0usize;
@@ -557,7 +422,6 @@ impl BuildCtx<'_> {
         }
     }
 
-    /// 一个块：外面永远套一个"间距 + 宽度"的盒子，里面的内容按块类型挂。
     fn build_block(
         &mut self,
         tree: &mut NodeTree,
@@ -615,7 +479,6 @@ impl BuildCtx<'_> {
         }
     }
 
-    /// 一个行内块：展开成文本节点，并记住它的链接区间。
     fn push_inline(
         &mut self,
         tree: &mut NodeTree,
@@ -931,7 +794,6 @@ mod tests {
         }
     }
 
-    /// 建一个 TestApp，把视图挂到根节点，跑一帧，返回 (TestApp, handles)。
     fn mount(view: &MarkdownView) -> (TestApp, super::MarkdownHandles) {
         let mut app = TestApp::new();
         let window = app.window_id();
@@ -1014,7 +876,6 @@ mod tests {
         let node = handles.text_blocks[0].node;
         let bounds = app.probe().bounds(node).expect("布局盒");
 
-        // 装饰：链接下划线在引擎里编码成 Quad 图元（压在字形之上）。
         let record = app.frame_record();
         let frame = record.frame.as_ref().expect("首帧");
         assert!(
@@ -1025,7 +886,6 @@ mod tests {
             frame.quads
         );
 
-        // 命中：点落在链接文字上 → LinkId(0)；点落在文字左侧空白 → None。
         let window = app.app().window(app.window_id()).expect("窗口");
         let point = Point::new(
             bounds.origin.x + 20.0,
@@ -1256,7 +1116,6 @@ mod tests {
         assert!(app.probe().bounds(handles.text_blocks[0].node).is_some());
     }
 
-    /// 空文档的 link_at 不 panic。
     #[test]
     fn link_at_without_links_is_none() {
         let view = MarkdownView::new(document(vec![paragraph(vec![text("plain")])]), style());
@@ -1275,7 +1134,6 @@ mod tests {
         );
     }
 
-    /// 根节点 id 是静态的（测试用 `Probe` 找它）。
     #[test]
     fn root_uses_the_static_probe_id() {
         let view = MarkdownView::new(document(Vec::new()), style());
@@ -1287,11 +1145,6 @@ mod tests {
         assert_eq!(by_id, handles.root);
     }
 
-    /// 间距规则（旧 `MarkdownState::render` 语义；P2-3 复核 M4）。
-    ///
-    /// 空行自己就是间距，两侧**不再叠** `BLOCK_GAP`；非首块标题在之上再加
-    /// `HEADING_SPACE_ABOVE`。因此空行之后：段落 +0、标题 +8（不是 8/16）。
-    /// 源码里没有空行的相邻块保留 `BLOCK_GAP`：段落 +8、标题 +16。
     #[test]
     fn a_heading_after_a_blank_line_keeps_the_extra_space_above_it() {
         let heading = || MarkdownBlock::Heading {
@@ -1355,7 +1208,6 @@ mod tests {
             "标题的额外上间距必须大于普通段落：{heading_gap} vs {body_gap}"
         );
 
-        // 无空行的相邻块：BLOCK_GAP 仍然生效。
         let adjacent_heading = document(vec![heading(), paragraph(vec![text("Body")])]);
         let adjacent_view = MarkdownView::new(adjacent_heading, style());
         let (adjacent_app, adjacent_handles) = mount(&adjacent_view);
@@ -1395,9 +1247,6 @@ mod tests {
         );
     }
 
-    // ── G3：主题化挂载（外观切换 = 按新主题重建子树） ─────────────────────
-
-    /// 子树里第一个文本节点的兜底文字色（markdown 的逐 run 颜色烘焙在 `TextStyle` 里）。
     fn first_text_color(
         app: &TestApp,
         root: ui_core::node::id::NodeId,
@@ -1421,8 +1270,6 @@ mod tests {
             .components
     }
 
-    /// `MarkdownNode`：外观切换后 `sync` 重建子树，文本颜色换成新主题（逐 run 颜色没有
-    /// 动态通道，重建是正确语义）；同一外观再调用是 no-op。
     #[test]
     fn switching_appearance_rebuilds_the_markdown_with_the_new_theme() {
         let mut app = TestApp::new();
@@ -1470,8 +1317,6 @@ mod tests {
         );
     }
 
-    /// P2-11（W8a/W8b 缺口）：`MarkdownNode::release` 卸载挂载时建出的根子树（幂等）；释放后
-    /// `sync` 是 no-op、不再持有文本块句柄，外观写入也不会为已卸载的根留下可求值的依赖边。
     #[test]
     fn releasing_the_markdown_unloads_its_root_and_stops_syncing() {
         let mut app = TestApp::new();
@@ -1515,24 +1360,17 @@ mod tests {
         assert!(!node.release(app.app_mut()), "重复释放幂等");
         assert!(!node.sync(app.app_mut()), "释放后 sync 是 no-op");
 
-        // 外观写入不再为已卸载的根留下可求值依赖：帧不 panic、sync 仍 no-op。
         assert!(theme.set_appearance(app.app_mut(), Appearance::Dark));
         let _ = app.drain().expect("外观帧");
         assert!(!node.sync(app.app_mut()));
     }
 
-    /// F8（契约测试）：重建**原地保留根节点身份**（外部 probe / 布局锚点不失效），且页面滚动
-    /// 位置不被重建移动。
-    ///
-    /// 变异验证：把 `sync` 改成「删根重建新根」时本用例必须红（根 `NodeId` 变化 / 页面偏移
-    /// 被 clamp）。文档里「根节点原地保留」此前没有测试守护。
     #[test]
     fn rebuilding_keeps_the_markdown_root_identity_and_the_page_offset() {
         let mut app = TestApp::new();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
-        // 可滚动页面：容器 600 高、内容 1800 高；markdown 挂在容器里。
         let page = {
             let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
             NodeBuilder::boxed()
@@ -1607,12 +1445,6 @@ mod tests {
         );
     }
 
-    /// F6：markdown 子树的**不变量** —— 不得挂 `bind_*`。
-    ///
-    /// `MarkdownNode::sync` 用 `NodeTree::remove` 重建子树并忽略返回的依赖边；子树若挂绑定，
-    /// 这些边会留在依赖图里（`App::write` 退化 + 泄漏）。观测面：`NodeTree::remove` **只**交还
-    /// 仍持有非空依赖边的被删节点 —— markdown 子树必须返回空，根节点自己的 `bind_style`
-    /// （外观失效通道）必须返回非空（否则这条断言测不到东西）。
     #[test]
     fn the_markdown_subtree_holds_no_signal_dependency_edges() {
         let mut app = TestApp::new();
@@ -1660,8 +1492,6 @@ mod tests {
                 "markdown 子树不得挂 bind_*（remove 只交还非空依赖边）：{removed:?}"
             );
         }
-        // 检测面自检：根节点的 `bind_style`（外观依赖）必须在移除时被交还 —— 非空即证明
-        // `remove` 的交还通道确实在收集依赖边，上面的「子树返回空」才有意义。
         let removed_root = app
             .app_mut()
             .window_mut(window)

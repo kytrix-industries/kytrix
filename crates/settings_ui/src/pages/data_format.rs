@@ -1,5 +1,3 @@
-//! The data formatting page: the time zone every widget displays data timestamps in.
-
 use app_config::time_zone::DataTimeZone;
 use base_ui::kit::select::Select;
 use i18n::translate::Translate;
@@ -14,20 +12,15 @@ use crate::{
     session::SettingsChange,
 };
 
-/// The id of this page's setting.
 const PAGE: &str = "data-format";
 
-/// The data formatting page.
 pub(crate) struct DataFormatPage {
     host: SettingsHost,
-    /// The offset control, once the page has been built.
     offset: Option<Select>,
-    /// The setting the control was last written from, so a frame that moved nothing writes nothing.
     applied: Option<DataTimeZone>,
 }
 
 impl DataFormatPage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
     pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
         Self {
             host,
@@ -143,7 +136,6 @@ impl PageView for DataFormatPage {
     }
 }
 
-/// The text this page and its settings are searched by.
 pub(crate) fn search(translate: &Translate) -> PageSearch {
     let title = i18n::t_smol!(translate, "settings_ui.data_format.title");
     let label = i18n::t_smol!(translate, "settings_ui.data_format.time_zone");

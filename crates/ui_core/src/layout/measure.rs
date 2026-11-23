@@ -1,12 +1,3 @@
-//! measure：自定义叶子测量的求值 + 违规检测。
-//!
-//! **没有**独立的 `(measure_version, available_space)` 缓存：taffy `Cache` 的 key 已经是
-//! `(known_dimensions, available_space, sizing_mode, run_mode, parent_size, mode)`
-//! （`taffy-0.15.0/src/tree/cache.rs` 的 `CacheKey::from`），再建一份就是双份真相（AGENTS §1.2/§1.4）。
-//! 「闭包捕获的状态变了」由 [`NodeTree::invalidate_measure`] 表达的**失效**（清 node..root 的缓存），
-//! 不是一个版本号字段（没有读者的字段按 AGENTS §2.1 不加）。
-//!
-
 use std::cell::Cell;
 
 use taffy::{LayoutInput, LayoutOutput, Size as TaffySize};
@@ -17,13 +8,7 @@ use crate::{
     node::{id::NodeId, tree::NodeTree},
 };
 
-/// 求值一个叶子节点：taffy 的 `compute_leaf_layout`（padding/border/aspect-ratio/min-max 全由它处理）
-/// + 引擎的 [`crate::layout::MeasureFn`]。
-///
-/// 违规检测做在**闭包的原始返回值**上：`compute_leaf_layout` 之后会 min/max clamp 并加 padding/border
-/// （`compute/leaf.rs:148-156`），NaN 可能被吞掉或被放大，只有原始值能定位到应用代码的错误。
 pub(crate) fn compute_leaf(tree: &mut NodeTree, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
-    // 首条违规（按 taffy 的求值顺序）；`Cell` 让闭包在共享借用下记录。
     let violation: Cell<Option<(Axis, f32)>> = Cell::new(None);
 
     let output = {
@@ -32,13 +17,10 @@ pub(crate) fn compute_leaf(tree: &mut NodeTree, node: NodeId, inputs: LayoutInpu
         taffy::compute_leaf_layout(
             inputs,
             style,
-            // v1 不解析 `calc()`：`Calc` 是不透明指针（`style/dimension.rs:106-109`），taffy 只提供
-            // `calc_value() -> *const ()`，没有公开的求值器；它自带的 `TaffyTree` 同样返回 0.0。
             |_ptr, _basis| 0.0,
             |known, available| {
                 let size = match measure {
                     Some(measure) => measure(known, available),
-                    // 无 measure 的空叶子：0×0（与 taffy `TaffyTree::compute_layout` 的默认闭包一致）
                     None => Size::ZERO,
                 };
                 let width_ok = size.width.is_finite() && size.width >= 0.0;
@@ -48,10 +30,6 @@ pub(crate) fn compute_leaf(tree: &mut NodeTree, node: NodeId, inputs: LayoutInpu
                 } else if !height_ok {
                     violation.set(Some((Axis::Y, size.height)));
                 }
-                // R04-10：违规值**不得**交给 taffy。旧实现把 NaN/负数原样返回，taffy 会用它
-                // 算出整棵子树的 NaN 盒（`Rect::is_empty` 再把 NaN 当空 ⇒ 静默塌成 0×0），
-                // 而诊断仍只报"首条违规"。替换成 0 让这一轮至少是**确定**的几何；
-                // 错误帧的可恢复性由 `taffy_tree::run` + `set_local_layout` 保证（不消费 `LAYOUT`）。
                 TaffySize {
                     width: if width_ok { size.width } else { 0.0 },
                     height: if height_ok { size.height } else { 0.0 },
@@ -118,7 +96,6 @@ mod tests {
 
     #[test]
     fn measure_fn_is_boxed_fn() {
-        // 类型即契约：必须是 `Fn`（不是 `FnMut`），两个参数分别是已知尺寸与可用空间。
         let measure: MeasureFn = Box::new(|_known, _available| Size::new(1.0, 1.0));
         let available = taffy::geometry::Size {
             width: taffy::AvailableSpace::MaxContent,
@@ -150,9 +127,6 @@ mod tests {
 
     #[test]
     fn fixed_style_leaf_does_not_call_measure() {
-        // 两侧 `known_dimensions` 都已知（`RunMode::ComputeSize`）时 taffy 直接早退，不调 measure。
-        // 布局路径上父算法（flex）的第一趟会先用 Min/MaxContent 探固有尺寸，那是**应该**调的，
-        // 所以这里用 `compute_leaf` 的单元口径固定该早退语义（与 taffy `compute/leaf.rs:98-115` 一致）。
         let mut tree = NodeTree::new();
         let root = tree.root();
         let calls = Rc::new(Cell::new(0usize));
@@ -211,7 +185,6 @@ mod tests {
         let _ = layout(&mut tree).expect("布局成功");
 
         assert_eq!(observed.get(), 100.0, "block 容器把确定宽度传给 measure");
-        // block 布局里 auto 宽度子节点会撑满包含块 ⇒ 布局盒 100 宽，measure 宽度只用于固有尺寸。
         assert_eq!(bounds(&tree, node).size.width, 100.0);
         assert_eq!(bounds(&tree, node).size.height, 10.0, "高度来自 measure");
     }
@@ -220,7 +193,6 @@ mod tests {
     fn measure_records_all_available_space_variants() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        // flex 容器会先用 Min/MaxContent 探固有尺寸，再用确定宽度排布 ⇒ 三种都会到达闭包。
         let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
         let record = seen.clone();
         let row = {
@@ -256,14 +228,6 @@ mod tests {
         );
     }
 
-    /// R04-10（第一半）：违规值**不得**交给 taffy。
-    ///
-    /// 旧实现记录违规后仍把 NaN/负数原样返回，taffy 用它算整棵子树的盒（`Rect::is_empty`
-    /// 再把 NaN 当空 ⇒ 静默塌成 0×0，且兄弟/祖先的坐标也会被 NaN/∞ 污染）。
-    /// 现在违规轴按 0 提交，错误仍如实上报（`InvalidMeasure` 在 `taffy_tree::run` 里返回）。
-    ///
-    /// 用例取 `(NaN, ∞)`：实测 taffy 的 `compute_leaf_layout` 会在部分路径把 NaN 宽度 clamp
-    /// 成 0，只有 `∞` 高度原样穿过 —— 两个轴都必须归一化，不能依赖 taffy 的偶然 clamp。
     #[test]
     fn an_invalid_measure_is_replaced_with_zero_before_it_reaches_taffy() {
         let mut tree = NodeTree::new();
@@ -444,12 +408,6 @@ mod tests {
         ));
     }
 
-    /// B8：文本 measure 与布局提交**同源**（三态可用空间 + `max_lines` 截断）。
-    ///
-    /// 复刻 `app/text_pass` 的接线（`ShapedText::measure` 作为节点 measure），断言：
-    /// 1. `Definite(w)` 的测量高度 == taffy 写进 `layout.bounds` 的高度（测的和排的是同一次断行）；
-    /// 2. `max_lines` 在三态里都生效（可见高度 = 截断后的行高和，不是全部行高）；
-    /// 3. `MinContent <= Definite(w) <= MaxContent` 的宽度序（w 取两者之间）。
     #[test]
     fn text_measure_matches_the_committed_layout_for_all_three_available_spaces() {
         use taffy::AvailableSpace;
@@ -493,7 +451,6 @@ mod tests {
             "min-content 会换更多行（被 max_lines=2 截断后仍 ≥ 单行高度）：{min_content:?} vs {max_content:?}"
         );
 
-        // 取两者之间、且必然触发换行的宽度。
         let width = ((min_content.width + max_content.width) / 2.0).max(min_content.width);
         let measured = shaped.measure(
             taffy::Size {
@@ -510,9 +467,6 @@ mod tests {
             "Definite(w) 的测量宽不得超过可用宽：{measured:?}（w={width}）"
         );
 
-        // 把同一份 measure 接进节点，跑真实布局（宽度固定、高度 auto）。
-        // 根设 `align_items: flex-start`，否则 flex 的 stretch 会把子节点高度拉满根高，
-        // 看不到"测量高度 → 提交高度"的链路。
         let measure_shaped = Rc::clone(&shaped);
         let mut tree = NodeTree::new();
         let root = tree.root();

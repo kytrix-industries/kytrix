@@ -8,8 +8,6 @@ layout(location = 1) out vec2 v_uv;
 layout(location = 2) flat out uint v_instance;
 
 void main() {
-    // 实例基址由 push constant `root.draw.clip.y` 显式给出，三平台一致（contract §6 / §7）。
-    // 不依赖 firstInstance：gl_InstanceIndex 会包含它，而 D3D12 的 SV_InstanceID 不会。
     uint base = uint(root.draw.clip.y);
     uint instance = uint(gl_InstanceIndex) + base;
     GpuPrimitive p = instances[instance];
@@ -22,7 +20,6 @@ void main() {
 
     vec2 lo = origin - pad;
     vec2 hi = origin + size + pad;
-    // 未夹紧的四角：UV 必须按**原始**（未夹紧）位置求比例（contract §7）。
     vec2 full_lo = lo;
     vec2 full_hi = hi;
 
@@ -34,12 +31,8 @@ void main() {
 
     vec2 world_px = lerp(lo, hi, corner);
     vec2 center = origin + size * 0.5;
-    // 夹紧只是省片元，不能改变图元自身的纹理映射 —— 否则被裁剪的文本/图标会被拉伸
-    // 压缩（滚动列表边缘的经典症状）。
     vec2 uv_t = (world_px - full_lo) / max(full_hi - full_lo, vec2(1e-6));
 
-    // B6-2 合成端滚动偏移：只作用在最终的屏幕映射上，local_px / uv / clip 判定留在烘焙坐标空间
-    // （实例字节里与偏移无关），因此滚动帧不需要重编码任何实例。
     gl_Position = vec4(to_ndc(world_px + root.frame.params.yz), 0.0, 1.0);
     v_local_px = world_px - center;
     v_uv = lerp(p.uv.xy, p.uv.zw, uv_t);

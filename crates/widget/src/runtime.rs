@@ -9,12 +9,10 @@ use super::{
     stream::{self, LatestStream, ReliableStream, StreamSupervisor, TaskDrain},
 };
 
-/// Background implementation owned by one widget instance.
 pub trait WidgetService<P: WidgetProtocol>: Send + 'static {
     fn run(self, context: ServiceContext<P>) -> impl Future<Output = ()> + Send;
 }
 
-/// Capacity and deadline defaults for one widget runtime.
 #[derive(Clone, Copy, Debug)]
 pub struct WidgetRuntimeConfig {
     rpc_capacity: NonZeroUsize,
@@ -48,7 +46,6 @@ impl Default for WidgetRuntimeConfig {
     }
 }
 
-/// UI-side handle for one service plus its reliable and latest-value outputs.
 pub struct WidgetRuntime<P: WidgetProtocol> {
     client: RpcClient<P>,
     reliable_stream: Option<ReliableStream<P>>,
@@ -112,12 +109,10 @@ impl<P: WidgetProtocol> WidgetRuntime<P> {
         self.client.clone()
     }
 
-    /// Takes the single reliable-event receiver used by the widget binding.
     pub fn take_reliable_stream(&mut self) -> Option<ReliableStream<P>> {
         self.reliable_stream.take()
     }
 
-    /// Creates a new latest-value receiver. Slow readers observe only the newest snapshot.
     pub fn latest_stream(&self) -> LatestStream<P> {
         self.latest_stream.clone()
     }
@@ -173,7 +168,6 @@ pub enum RuntimeExit {
     Panicked(String),
 }
 
-/// Service-side context that owns RPC input and all supervised stream tasks.
 pub struct ServiceContext<P: WidgetProtocol> {
     rpc_receiver: RpcReceiver<P>,
     streams: StreamSupervisor<P>,
@@ -203,11 +197,6 @@ impl<P: WidgetProtocol> ServiceContext<P> {
         self.streams.replace(key, task)
     }
 
-    /// Starts a stream only when the key has no active generation.
-    ///
-    /// Repeated initialization requests are intentionally idempotent: an active
-    /// publisher, snapshot, and generation remain untouched. Use
-    /// [`Self::replace_stream`] only for an explicit identity change or retry.
     pub fn start_stream<F, Fut>(&mut self, key: P::StreamKey, task: F) -> StreamGeneration
     where
         F: FnOnce(super::stream::StreamPublisher<P>) -> Fut + Send + 'static,
@@ -245,13 +234,6 @@ impl<P: WidgetProtocol> fmt::Debug for ServiceContext<P> {
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"

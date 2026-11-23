@@ -1,9 +1,3 @@
-//! The unit tests of the candle wire.
-//!
-//! They are a file of their own rather than a block inside the module because the module
-//! boundary is what they belong to, not the file: what they assert is what the wire sends
-//! and what it makes of a frame, and they reach every private item of it through `super::`.
-
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -41,7 +35,6 @@ use crate::{
     market_participants::model::{CandlestickFetchQuery, CandlestickSubscriptionQuery},
 };
 
-/// One market-local wall time as milliseconds since the epoch.
 fn at(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> UnixMillis {
     jiff::civil::date(year, month, day)
         .at(hour, minute, 0, 0)
@@ -51,22 +44,14 @@ fn at(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> UnixMillis {
         .as_millisecond()
 }
 
-/// One market-local wall time as the venue's Unix seconds.
 fn seconds(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> i64 {
     at(year, month, day, hour, minute) / 1_000
 }
 
-/// The one listing every case here is about, as the gateway would resolve it.
-///
-/// The reference is produced by publishing the venue's own adapter entry through a
-/// catalogue and resolving it back, which is where the adapter's references come from:
-/// the wire reads the venue's symbol and the typed identifiers off the resolution, and
-/// a reference assembled by hand could say anything.
 async fn listing() -> ResolvedListingRef {
     resolved_listing().await
 }
 
-/// One fetch query with the anchors the case states.
 fn fetch_query(
     listing: &ResolvedListingRef,
     start: Option<UnixMillis>,
@@ -82,7 +67,6 @@ fn fetch_query(
     }
 }
 
-/// One subscription query of the fixture listing.
 fn subscription_query(listing: &ResolvedListingRef) -> CandlestickSubscriptionQuery {
     CandlestickSubscriptionQuery {
         listing: listing.key.clone(),
@@ -91,7 +75,6 @@ fn subscription_query(listing: &ResolvedListingRef) -> CandlestickSubscriptionQu
     }
 }
 
-/// Runs one fetch over the fixture and answers what the venue received.
 async fn sent_history(
     fixture: &LongbridgeFixture,
     query: &CandlestickFetchQuery,
@@ -113,7 +96,6 @@ async fn sent_history(
     )
 }
 
-/// The offset request one fetch sent, which every shape below is read through.
 fn offset_of(
     request: &SecurityHistoryCandlestickRequest,
 ) -> &longbridge_proto::quote::security_history_candlestick_request::OffsetQuery {
@@ -123,8 +105,6 @@ fn offset_of(
         .expect("every shape this build sends is an offset query")
 }
 
-/// 1. A `start` alone pages **forward** from it, anchored at the start's own
-/// market-local time.
 #[tokio::test]
 async fn the_start_alone_pages_forward_from_its_own_market_local_anchor() {
     let fixture = LongbridgeFixture::install(
@@ -157,9 +137,6 @@ async fn the_start_alone_pages_forward_from_its_own_market_local_anchor() {
     assert_eq!(offset.count, 300, "count is the request's own limit");
 }
 
-/// 2. An `end` alone pages **backward** from it, and the anchor is the market's own
-/// wall time on the day after the March transition — which is what makes this about
-/// the market's clock rather than about UTC.
 #[tokio::test]
 async fn the_end_alone_pages_backward_from_its_own_market_local_anchor() {
     let fixture = LongbridgeFixture::install(
@@ -188,9 +165,6 @@ async fn the_end_alone_pages_backward_from_its_own_market_local_anchor() {
     assert_eq!(offset.count, 300);
 }
 
-/// 3. Neither anchor pages **backward** from the venue's newest candle, with both
-/// anchor fields left empty: an empty `date`/`minute` is what "no anchor" means on
-/// this wire.
 #[tokio::test]
 async fn neither_anchor_pages_backward_with_no_anchor_at_all() {
     let fixture = LongbridgeFixture::install(
@@ -209,9 +183,6 @@ async fn neither_anchor_pages_backward_with_no_anchor_at_all() {
     assert_eq!(offset.count, 300);
 }
 
-/// 4. Both anchors page **backward** from `end`, and the caller's `start` is applied
-/// by the adapter: the venue has no way to say "backwards from here, but not before
-/// there".
 #[tokio::test]
 async fn both_anchors_page_backward_from_the_end() {
     let fixture = LongbridgeFixture::install(
@@ -242,8 +213,6 @@ async fn both_anchors_page_backward_from_the_end() {
     assert_eq!(offset.count, 300);
 }
 
-/// The same instant formats differently on either side of a daylight-saving change,
-/// because the anchor is the market's wall time rather than a fixed offset.
 #[test]
 fn the_anchor_is_the_markets_own_wall_time() {
     let winter = at(2026, 1, 15, 9, 30);
@@ -266,7 +235,6 @@ fn the_anchor_is_the_markets_own_wall_time() {
     );
 }
 
-/// The venue's timestamps are Unix seconds and the model's are milliseconds.
 #[test]
 fn seconds_become_milliseconds() {
     let candle = FixtureCandle::flat(15_000, 1_772_807_400);
@@ -280,7 +248,6 @@ fn seconds_become_milliseconds() {
     );
 }
 
-/// One response frame of the protocol, as the venue sends it.
 fn answer_frame(command: u8, request_id: u32, status: u8, body: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(10 + body.len());
     frame.push(2);
@@ -292,11 +259,6 @@ fn answer_frame(command: u8, request_id: u32, status: u8, body: &[u8]) -> Vec<u8
     frame
 }
 
-/// Every answer this build reads is decoded into the command it answers rather than
-/// into one command's answer: a subscribe frame's answer is what a stream recognises,
-/// and a trading-day frame's answer is what the calendar reader recognises, and a
-/// decoder that answered only one of them would leave the other reading a push that
-/// never arrived.
 #[test]
 fn an_answer_is_decoded_with_the_command_it_answers() {
     for command in [codec::SUBSCRIBE, codec::GET_TRADING_DAYS] {
@@ -331,11 +293,6 @@ fn an_answer_is_decoded_with_the_command_it_answers() {
     );
 }
 
-/// The topic one subscription is shared under states every term its frame states, and
-/// the adjustment is one of them: the venue's subscribe frame carries no adjustment, so
-/// two readers of one symbol and interval under different conventions are two frames,
-/// and a topic that merged them would leave the second reader waiting for an answer that
-/// names the first reader's id.
 #[test]
 fn the_subscription_topic_states_the_adjustment() {
     let symbol = SmolStr::new_static("AAPL.US");
@@ -361,8 +318,6 @@ fn the_subscription_topic_states_the_adjustment() {
     );
 }
 
-/// The history is answered in ascending order however the venue sent it, because the
-/// widget reads a page shorter than the request as "the newest edge is reached".
 #[tokio::test]
 async fn the_history_is_answered_in_ascending_order() {
     let fixture = LongbridgeFixture::install_with(
@@ -411,8 +366,6 @@ async fn the_history_is_answered_in_ascending_order() {
     );
 }
 
-/// The "both anchors" shape drops the candles the caller excluded: the venue pages
-/// backwards from `end` and has no way to say "but not before here".
 #[tokio::test]
 async fn the_two_anchored_shape_drops_what_the_start_excludes() {
     let fixture = LongbridgeFixture::install_with(
@@ -461,8 +414,6 @@ async fn the_two_anchored_shape_drops_what_the_start_excludes() {
     );
 }
 
-/// The subscription asks for its opening screen before it registers, with the
-/// request's own adjustment rather than the official client's fixed one.
 #[tokio::test]
 async fn the_subscription_asks_for_its_screen_with_the_requests_adjustment() {
     let fixture = LongbridgeFixture::install_with(
@@ -527,13 +478,6 @@ async fn the_subscription_asks_for_its_screen_with_the_requests_adjustment() {
     assert!(!unsubscribe.unsub_all, "only this symbol is unsubscribed");
 }
 
-/// The opening screen is answered first and in full, and the pushes that follow it are
-/// read in the order the venue sent them: a quote of the candle the screen left off at,
-/// a book this build does not read, and a trade of the next bucket.
-///
-/// What one print does to the candle it belongs to is the aggregation's own case; what
-/// this one states is the stream's: the screen precedes every push, a frame no
-/// subscription reads produces no event, and a roll is two events rather than one.
 #[tokio::test]
 async fn the_screen_is_answered_before_the_pushes_and_the_open_candle_rolls() {
     let fixture = LongbridgeFixture::install_with(
@@ -547,9 +491,6 @@ async fn the_screen_is_answered_before_the_pushes_and_the_open_candle_rolls() {
         QuoteAnswer::default(),
     )
     .await;
-    // The venue's own pushes, queued before the subscription so they follow its frames.
-    // The fixture delivers one per frame the subscription sends after it subscribes, in
-    // the order it was given them, which is the order the venue sends pushes in.
     fixture.push_quote(&PushQuote {
         symbol: "AAPL.US".to_owned(),
         last_done: "101.00".to_owned(),
@@ -660,8 +601,6 @@ async fn the_screen_is_answered_before_the_pushes_and_the_open_candle_rolls() {
     );
 }
 
-/// A subscription the venue refuses ends the stream with the venue's own words: the
-/// subscribe answer is not a pending request, so this is the one place it is read.
 #[tokio::test]
 async fn a_refused_subscription_ends_the_stream_with_the_venues_own_words() {
     let fixture = LongbridgeFixture::install_with(
@@ -691,8 +630,6 @@ async fn a_refused_subscription_ends_the_stream_with_the_venues_own_words() {
     .await
     .expect("the screen is granted even though the subscription is refused");
 
-    // The venue refuses the subscription while granting this screen, which is the case
-    // only the stream can read: the subscribe frame is not a pending request.
     fixture.serve_candles(CandleAnswer {
         status: 0,
         candles: vec![FixtureCandle::flat(10_000, seconds(2026, 6, 10, 10, 0))],
@@ -729,15 +666,6 @@ async fn a_refused_subscription_ends_the_stream_with_the_venues_own_words() {
     );
 }
 
-/// The half-day table reaches the aggregation over the wire: the venue's own cmd 9
-/// answer is decoded, its half day is installed, and a push on that day is bucketed by
-/// the half day's own grid rather than the ordinary one.
-///
-/// The assertion is discriminating because the two grids rest the afternoon on different
-/// instants: a half day's post session opens at 13:00 where an ordinary day's opens at
-/// 16:00, so the candle 13:35 belongs to opens at 13:00 on one table and at 13:30 on the
-/// other. The screen is the market's own open, which both tables agree about, so the
-/// candle whose boundary is asserted is one only the calendar can explain.
 #[tokio::test]
 async fn a_half_day_from_the_venue_moves_the_afternoon_grid() {
     let screen_at = seconds(2026, 6, 11, 9, 30);
@@ -752,8 +680,6 @@ async fn a_half_day_from_the_venue_moves_the_afternoon_grid() {
     )
     .await;
     fixture.serve_half_days(vec![market_day(trade_at * 1_000)]);
-    // The first push is what the calendar is read before, and it carries the half day's
-    // own date; the second is the print the two grids disagree about.
     fixture.push_quote(&PushQuote {
         symbol: "AAPL.US".to_owned(),
         last_done: "101.00".to_owned(),
@@ -860,11 +786,6 @@ async fn a_half_day_from_the_venue_moves_the_afternoon_grid() {
     assert_eq!(request.end_day, "20260711", "and thirty days after it");
 }
 
-/// The two tables the case above reads apart, stated as instants: a half day's post
-/// session opens where its regular one closes, so 13:35 belongs to a candle that opened
-/// at 13:00 on one table and to one that opened at 13:30 on the other. The screen's own
-/// instant is the market's open, which both tables agree about — which is why the wire
-/// case can start from it and still tell the two grids apart.
 #[test]
 fn the_two_tables_rest_the_afternoon_on_different_instants() {
     let quote = CandlePrint::quote(QuotePrint {
@@ -901,7 +822,6 @@ fn the_two_tables_rest_the_afternoon_on_different_instants() {
     );
 }
 
-/// The instant one print's bucket opens at, under one table.
 fn bucket_open(
     print: &CandlePrint,
     table: &crate::adapter::longbridge::candles::session_table::SessionTable,
@@ -923,22 +843,14 @@ fn bucket_open(
     .map(|opened| opened.timestamp().as_millisecond())
 }
 
-/// One price of one whole cent, in the model's own scaled units.
 fn quote_price(cents: u64) -> market_participants_model::decimal::Price {
     market_participants_model::decimal::Price::from(cents)
 }
 
-/// The market's own zone.
 fn clock_zone() -> jiff::tz::TimeZone {
     jiff::tz::TimeZone::get(ZONE).expect("the market zone is in the database")
 }
 
-/// A calendar the venue will not state is asked about once, not once per push: the
-/// stream records the read — and what it found, which is nothing — and the ordinary
-/// table stays in force (§4.6's fail-open).
-///
-/// The count of cmd 9 frames is the assertion, because the failure mode is a request
-/// repeated for every frame the venue ever sends.
 #[tokio::test]
 async fn a_refused_calendar_is_asked_about_once() {
     let fixture = LongbridgeFixture::install_with(
@@ -956,8 +868,6 @@ async fn a_refused_calendar_is_asked_about_once() {
         status: 1,
         half_days: Vec::new(),
     });
-    // Two pushes of the same hourly bucket, so the stream merges twice and each merge is
-    // a chance to ask the venue again.
     for minute in [35, 40] {
         fixture.push_trades(&PushTrade {
             symbol: "AAPL.US".to_owned(),
@@ -1011,11 +921,6 @@ async fn a_refused_calendar_is_asked_about_once() {
     );
 }
 
-/// The market-local hour and minute of one instant, as the assertion above reads it.
-///
-/// A boundary is a statement about the market's own clock, so the test asserts the
-/// clock rather than an epoch millisecond: the two are the same fact, and the clock is
-/// the one a reader of this test can check against the venue's calendar.
 fn market_clock(millis: UnixMillis) -> (i8, i8) {
     let local = jiff::Zoned::new(
         jiff::Timestamp::from_millisecond(millis).expect("the fixture instant is real"),
@@ -1025,7 +930,6 @@ fn market_clock(millis: UnixMillis) -> (i8, i8) {
     (local.hour(), local.minute())
 }
 
-/// The market-local day one instant fell in, as the venue's own `YYYYMMDD`.
 fn market_day(millis: UnixMillis) -> String {
     let local = jiff::Zoned::new(
         jiff::Timestamp::from_millisecond(millis).expect("the fixture instant is real"),
@@ -1035,7 +939,6 @@ fn market_day(millis: UnixMillis) -> String {
     format!("{}{:02}{:02}", local.year(), local.month(), local.day())
 }
 
-/// The name of one event, for a failure message that does not print a whole value.
 fn event_name(event: &ProtocolEvent) -> &'static str {
     match event {
         ProtocolEvent::Candlestick(_) => "a candle",
@@ -1051,11 +954,6 @@ fn event_name(event: &ProtocolEvent) -> &'static str {
     }
 }
 
-/// Reads the first `count` events of one subscription, failing rather than hanging.
-///
-/// The events read so far travel with a failure: a stream that answered two of three
-/// is a different diagnosis from one that answered none, and a bare "the fixture did
-/// not answer" would hide which.
 async fn drain(
     handle: SubscriptionHandle,
     count: usize,

@@ -1,71 +1,3 @@
-//! Where a widget's state becomes what the user sees.
-//!
-//! This is the single implementation of the presentation rule. Widgets report
-//! state; they never decide where it is shown, and they never assemble a banner or
-//! a placeholder.
-//!
-//! Two rules, and the whole table follows from them:
-//!
-//! 1. **The banner is for failures only, and it needs content to sit above.** It is
-//!    built only for a failure, so with none — or with no content for it to sit
-//!    above — it is not in the tree at all and reserves no row. Neutral text is
-//!    never a banner: a widget that has content and nothing wrong with it draws
-//!    that content and nothing else.
-//! 2. **A placeholder stands in for content that is not there.** It is reached
-//!    only while the widget has no body — so nothing a widget reports can ever cost
-//!    its own content its space. What it shows, in order of precedence, is the
-//!    failure, then the widget's own [`Notice`], then the name of the work it is
-//!    busy with.
-//!
-//! | what the widget has | its state | result |
-//! | --- | --- | --- |
-//! | content | `Failed` | the failure in a banner above the content |
-//! | content | anything else | the content alone |
-//! | no content | `Failed` | the failure in a placeholder, with its recovery |
-//! | no content | `Waiting` | the notice's sentence (or, for a rich notice, its markdown) in a placeholder |
-//! | no content | `Connecting` | a spinner under the name of the connection |
-//! | no content | `Loading` or `Ready` | a spinner with no message of its own |
-//!
-//! So a failure never replaces content the user can still read, and a notice never
-//! costs content its space. A failure appears in exactly one of the two surfaces, so
-//! the same text never appears twice.
-//!
-//! # One tree, then sync
-//!
-//! The surface is built **once**: the root, the content slot and the placeholder
-//! overlay exist for the widget's whole life, and only the banner — which reserves
-//! layout space — is mounted and unmounted as failures come and go. Everything else
-//! is switched by the presentation signal, which the slot's `bind_style` /
-//! `bind_a11y` closures read: `StylePatch.visible` and `A11yPatch.hidden`, never
-//! `display: none` (R-28: a display change is not re-sent through the a11y tree, so
-//! a hidden descendant would stay announced).
-//!
-//! [`WidgetSurface::sync`] is the frame-driven half: it reads the state once, writes
-//! the presentation signal when the picture changed, rebuilds the placeholder when
-//! the state (or the language) moved, and drives the stateful components it owns.
-//! The body itself is not its business: the widget builds it once when content
-//! first appears.
-//!
-//! # The words are resolved on the frame that draws them
-//!
-//! Nothing this module draws was resolved when it was reported. A notice is a
-//! catalogue reference and a failure is a typed error, and both are turned into
-//! sentences here, through the translation context the frame was handed. A notice is
-//! rebuilt when the language moves; a failure's text is a `bind_text` closure that
-//! reads the language signal, so it follows a switch without a rebuild. A notice
-//! whose catalogue value is authored as markdown/HTML — `common.market_not_loaded`
-//! is, and so are several widgets' own messages such as `widget.news.logged_out` —
-//! is drawn by the engine's markdown component, not as its source text; see
-//! [`ui::placeholder`](crate::ui::placeholder) and [`Notice::is_markdown`].
-//!
-//! # The body is the widget's; the box around it is the framework's
-//!
-//! The content slot is what the user reads as the pane's content surface, and the
-//! framework draws it: a sunken background, a divider border, a rounded corner and a
-//! clip, all read from the theme through the style pass so an appearance switch
-//! redraws them. Nothing a widget builds fills that box with a background of its
-//! own, so every pane's body reads the same whatever is embedded in it.
-
 use base_ui::{
     kit::button::Button,
     style_builder::{PaintBuilder, StyleBuilder},
@@ -89,27 +21,15 @@ use crate::{
     ui::placeholder::{self, Placeholder},
 };
 
-/// The banner's text size: small, so it sits beside its control rather than
-/// competing with the content below.
 const BANNER_TEXT_SIZE: f32 = 12.0;
-/// The radius of the surface's boxes.
 const SURFACE_RADIUS: f32 = 6.0;
 
-/// Which of the surface's two interchangeable slots is drawn.
-///
-/// It is a signal so that writing it invalidates exactly the nodes that read it —
-/// the style pass owns the visibility patch, the surface does not touch node state
-/// directly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Presentation {
     content: bool,
     placeholder: bool,
 }
 
-/// What the placeholder currently shows, and the language it was resolved in.
-///
-/// The language is part of the key because a notice's sentence is resolved into a
-/// static text node: moving the language means rebuilding the stand-in.
 #[derive(Clone, Debug, PartialEq)]
 enum PlaceholderKey {
     Busy { connecting: bool },
@@ -117,10 +37,6 @@ enum PlaceholderKey {
     Failure(Failure),
 }
 
-/// A widget's body, plus whatever the state it reported requires around it.
-///
-/// It holds the nodes it built, the state cell it presents, and the components it
-/// must drive. It never holds the body: the widget builds and owns that.
 pub struct WidgetSurface {
     root: NodeId,
     slot: NodeId,
@@ -136,12 +52,6 @@ pub struct WidgetSurface {
 }
 
 impl WidgetSurface {
-    /// Builds the shell under `parent` and presents `status`.
-    ///
-    /// The widget's body is not built here: the framework calls
-    /// [`WidgetView::body`](crate::view::WidgetView::body) the first frame
-    /// [`WidgetView::has_content`](crate::view::WidgetView::has_content) answers
-    /// `true`, into [`WidgetSurface::content_slot`].
     pub fn build(
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
@@ -166,22 +76,6 @@ impl WidgetSurface {
                     .min_height_0()
                     .build(),
             )
-            // The root is the surface's dependency anchor: a state report, a language
-            // switch, a new catalogue generation or a new settings snapshot invalidates
-            // it, which is what requests the frame that runs `sync`. It draws nothing
-            // itself.
-            //
-            // The directory dependency belongs here rather than in the widget's body:
-            // a widget waiting for the market has no body, yet it is exactly the one
-            // that must re-check the gate when the directory publishes. The widget
-            // compares the value in `sync` and reloads; it never schedules the frame
-            // itself.
-            //
-            // The settings dependency belongs here for the same reason: a widget that
-            // follows a setting (the account a pane is scoped to, the display time
-            // zone) compares it in `sync`, and while it has no body there is no
-            // `bind_*` in its own tree to carry the edge — a signed-out pane that has
-            // no content yet must still wake when the settings move.
             .bind_style(move |read| {
                 let _state = read.read(&root_deps);
                 let _language = read.read(&root_language);
@@ -194,8 +88,6 @@ impl WidgetSurface {
         let built = build_shell(cx, root, theme, presentation);
         let (slot, content, placeholder) = match built {
             Ok(shell) => shell,
-            // A surface that failed halfway must not leave the nodes it already
-            // built behind: a pane would keep a shell no widget will ever present.
             Err(error) => {
                 let window = cx.window();
                 let _ = cx.app_mut().remove_node(window, root);
@@ -218,25 +110,18 @@ impl WidgetSurface {
         })
     }
 
-    /// The surface's root node: what a pane embeds.
     pub const fn root(&self) -> NodeId {
         self.root
     }
 
-    /// The node a widget builds its body into.
     pub const fn content_slot(&self) -> NodeId {
         self.content
     }
 
-    /// The state cell this surface presents.
     pub const fn status(&self) -> WidgetStatus {
         self.status
     }
 
-    /// Applies the presentation the current state requires.
-    ///
-    /// `has_content` is the widget's answer for this frame; the wrapper that owns the
-    /// widget asks it before calling this, so the surface never reaches into a view.
     pub fn sync(&mut self, cx: &mut WidgetCx<'_>, has_content: bool) -> Result<(), EngineError> {
         let state = self.status.state(cx.app());
         let language = *cx.read(&self.language);
@@ -253,8 +138,6 @@ impl WidgetSurface {
         self.sync_banner(cx, has_content, &state, language)?;
 
         if has_content {
-            // A hidden spinner must not keep an animation alive: the stand-in is
-            // released, not hidden, once content is on screen.
             self.clear_placeholder(cx);
         } else {
             let key = placeholder_key(&state);
@@ -276,9 +159,6 @@ impl WidgetSurface {
         Ok(())
     }
 
-    /// Forwards one platform event to the controls the surface built.
-    ///
-    /// Returns whether one of them consumed it.
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         let banner = self
             .rendered_banner
@@ -293,10 +173,6 @@ impl WidgetSurface {
         banner || placeholder
     }
 
-    /// Releases the stateful components the surface owns.
-    ///
-    /// The nodes are removed by the owner of the widget, after this call and before
-    /// the scope is released — the order the engine documents for teardown.
     pub fn release(&self, app: &mut App) -> usize {
         let banner = self
             .rendered_banner
@@ -311,7 +187,6 @@ impl WidgetSurface {
         banner + placeholder
     }
 
-    /// Synchronizes (or mounts, unmounts) the failure banner.
     fn sync_banner(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -335,8 +210,6 @@ impl WidgetSurface {
         if stale {
             self.clear_banner(cx)?;
             let (node, button) = build_banner(cx, self.root, &failure)?;
-            // The banner belongs above the slot. The slot was built first, so it is
-            // moved to the end: reparenting keeps its subtree and its node identity.
             cx.tree_mut()
                 .append_child(self.root, self.slot)
                 .map_err(|_| EngineError::StaleNode { node: self.slot })?;
@@ -350,7 +223,6 @@ impl WidgetSurface {
         Ok(())
     }
 
-    /// Removes the banner: its nodes first, then its component's scope and handler.
     fn clear_banner(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let button = self
             .rendered_banner
@@ -367,7 +239,6 @@ impl WidgetSurface {
         Ok(())
     }
 
-    /// Removes the placeholder's contents, then releases its components.
     fn clear_placeholder(&mut self, cx: &mut WidgetCx<'_>) {
         let children: Vec<NodeId> = cx
             .tree()
@@ -395,9 +266,6 @@ impl std::fmt::Debug for WidgetSurface {
     }
 }
 
-/// What the placeholder must show, as an equality key: the same key means the
-/// stand-in on screen is still the right one. The language is compared beside it,
-/// because a notice's sentence is resolved into a static text node.
 fn placeholder_key(state: &WidgetState) -> PlaceholderKey {
     match state {
         WidgetState::Failed(failure) => PlaceholderKey::Failure(failure.clone()),
@@ -407,7 +275,6 @@ fn placeholder_key(state: &WidgetState) -> PlaceholderKey {
     }
 }
 
-/// Builds the stand-in the state asks for under `parent`.
 fn build_placeholder(
     cx: &mut WidgetCx<'_>,
     parent: NodeId,
@@ -425,10 +292,6 @@ fn build_placeholder(
     }
 }
 
-/// Builds the shell's three interchangeable nodes under `root`.
-///
-/// Split out of [`WidgetSurface::build`] so a half-built shell can be removed as a
-/// whole when one of the nodes cannot be created.
 fn build_shell(
     cx: &mut WidgetCx<'_>,
     root: NodeId,
@@ -522,7 +385,6 @@ fn build_shell(
     Ok((slot, content, placeholder))
 }
 
-/// Builds the failure banner under `root`, returning its node and its control.
 fn build_banner(
     cx: &mut WidgetCx<'_>,
     root: NodeId,
@@ -599,7 +461,6 @@ mod tests {
         )
     }
 
-    /// The translator the product ships, in the language a test asks for.
     fn product_translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -627,14 +488,11 @@ mod tests {
         );
     }
 
-    /// The six-row truth table, one case at a time. See the module documentation for
-    /// the rule each row comes from.
     #[test]
     fn the_six_rows_of_the_presentation_table() {
         let mut harness = WidgetTestApp::new();
         let mut surface = harness.build_surface();
 
-        // 1. content + Failed → banner above, content visible, no placeholder.
         harness.report(failure());
         harness.sync_surface(&mut surface, true);
         let banner = surface.banner.expect("the banner is mounted");
@@ -646,14 +504,12 @@ mod tests {
         assert!(harness.visible(surface.content_slot()));
         assert!(!harness.visible(surface.placeholder));
 
-        // 2. content + anything else → the content alone.
         harness.report(WidgetState::Ready);
         harness.sync_surface(&mut surface, true);
         assert!(surface.banner.is_none(), "no failure, no banner");
         assert!(harness.visible(surface.content_slot()));
         assert!(!harness.visible(surface.placeholder));
 
-        // 3. no content + Failed → the failure in the placeholder.
         harness.report(failure());
         harness.sync_surface(&mut surface, false);
         assert!(surface.banner.is_none());
@@ -661,7 +517,6 @@ mod tests {
         assert!(harness.visible(surface.placeholder));
         assert!(harness.has_text(surface.placeholder, "the fixture failed"));
 
-        // 4. no content + Waiting → the notice's sentence.
         harness.report(WidgetState::waiting(Notice::message("test.waiting")));
         harness.sync_surface(&mut surface, false);
         assert!(
@@ -670,13 +525,11 @@ mod tests {
                 .contains("Waiting for orders")
         );
 
-        // 5. no content + Connecting → a spinner under the name of the connection.
         harness.report(WidgetState::Connecting);
         harness.sync_surface(&mut surface, false);
         assert!(harness.has_canvas(surface.placeholder));
         assert!(harness.text_of(surface.placeholder).contains("Connecting"));
 
-        // 6. no content + Loading / Ready → a spinner with no message of its own.
         harness.report(WidgetState::Loading);
         harness.sync_surface(&mut surface, false);
         assert!(harness.has_canvas(surface.placeholder));
@@ -688,8 +541,6 @@ mod tests {
         assert_eq!(harness.text_of(surface.placeholder), "");
     }
 
-    /// A language switch redraws the sentence the placeholder shows without the
-    /// widget reporting anything again.
     #[test]
     fn a_waiting_placeholder_should_come_back_in_the_language_showing_now() {
         let mut harness = WidgetTestApp::new();
@@ -714,8 +565,6 @@ mod tests {
         );
     }
 
-    /// A failure's detail follows the language through its live binding, and the
-    /// control's label is rebuilt in the new language with the banner.
     #[test]
     fn a_failure_banner_should_read_in_the_language_showing_now() {
         let mut harness = WidgetTestApp::new();
@@ -737,8 +586,6 @@ mod tests {
         );
     }
 
-    /// The failing row's recovery runs the widget's action through the engine's real
-    /// action dispatch.
     #[test]
     fn a_recovery_should_be_clickable_from_the_placeholder() {
         let mut harness = WidgetTestApp::new();
@@ -769,8 +616,6 @@ mod tests {
         ));
         harness.sync_surface(&mut surface, false);
 
-        // A control that refuses input registered no handler; the click finds no
-        // action identity and changes nothing.
         let button = harness
             .find_by_debug_prefix(surface.placeholder, "widget.placeholder.action.")
             .expect("the control is drawn");
@@ -785,7 +630,6 @@ mod tests {
         assert_eq!(retries.get(), 0);
     }
 
-    /// A widget with content and nothing wrong shows its body and nothing else.
     #[test]
     fn a_widget_with_content_and_no_failure_shows_only_its_body() {
         let mut harness = WidgetTestApp::new();
@@ -799,8 +643,6 @@ mod tests {
         assert!(surface.banner.is_none());
     }
 
-    /// I3: a steady surface does not request frames. Synchronizing an unchanged
-    /// state and language writes nothing and schedules nothing.
     #[test]
     fn a_steady_surface_requests_no_frame() {
         let mut harness = WidgetTestApp::new();
@@ -818,10 +660,6 @@ mod tests {
         );
     }
 
-    /// The surface's root is the dependency anchor: it reads the language signal
-    /// while it renders, so writing that signal requests the frame which presents the
-    /// new language. A read that is not inside a `bind_*` closure would not register
-    /// the edge, and the switch would leave the old language on screen.
     #[test]
     fn writing_the_language_signal_requests_the_redrawing_frame() {
         let mut harness = WidgetTestApp::new();
@@ -840,10 +678,6 @@ mod tests {
         );
     }
 
-    /// The surface root is the directory dependency anchor: a widget waiting for the
-    /// market has no body of its own, so the framework registers the generation read
-    /// here — a published generation is what schedules the frame which lets the widget
-    /// re-check its gate.
     #[test]
     fn writing_the_directory_generation_requests_the_redrawing_frame() {
         let mut harness = WidgetTestApp::new();
@@ -862,8 +696,6 @@ mod tests {
         );
     }
 
-    /// `WidgetStatus::report` is a signal write: when a node renders from the state
-    /// cell, reporting a new state requests the frame that presents it.
     #[test]
     fn reporting_a_state_requests_the_presenting_frame() {
         let mut harness = WidgetTestApp::new();
@@ -880,11 +712,6 @@ mod tests {
         );
     }
 
-    /// The surface root is also the **settings** dependency anchor. A widget that
-    /// follows a setting (the account its pane is scoped to, the display time zone)
-    /// compares it in `sync`, and while it has no content it has no `bind_*` of its
-    /// own to carry the edge — a signed-out pane that has nothing to show must still
-    /// wake when the settings move.
     #[test]
     fn writing_the_settings_signal_requests_the_redrawing_frame() {
         let mut harness = WidgetTestApp::new();
@@ -906,9 +733,6 @@ mod tests {
         );
     }
 
-    /// R-28: the slot that is not drawn is hidden in the a11y tree, not merely
-    /// invisible in the style pass. Assistive technology receives the same switch the
-    /// user sees, and the hidden subtree is not announced.
     #[test]
     fn the_swapped_out_subtree_is_hidden_from_assistive_technology() {
         let mut harness = WidgetTestApp::new();
@@ -938,9 +762,6 @@ mod tests {
         );
     }
 
-    /// A notice the catalogue authors as markdown/HTML is drawn by the markdown
-    /// component: the reader gets the sentence, the kbd icon and the venue list, not
-    /// `<p align="center">…` / `<kbd>` / `![](file://…)` source text.
     #[test]
     fn a_rich_notice_is_drawn_as_rich_text() {
         let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
@@ -973,12 +794,6 @@ mod tests {
         );
     }
 
-    /// The catalogue also authors widgets' **own** messages as rich text
-    /// (`widget.news.logged_out` is a `<p align="center">` paragraph, and W1's news
-    /// pane reported it as a plain `Notice::message`), so the markdown decision is
-    /// made from the resolved value rather than from the notice variant. A rich
-    /// message goes through the markdown component exactly like
-    /// `common.market_not_loaded`, and its source markup never reaches the reader.
     #[test]
     fn a_rich_message_notice_is_drawn_as_rich_text() {
         for (key, has_inline_box) in [

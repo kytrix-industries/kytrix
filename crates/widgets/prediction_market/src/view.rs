@@ -1,46 +1,3 @@
-//! The prediction market pane.
-//!
-//! The pane follows one event and draws one line per option. It loads a bounded
-//! history and then follows the venue's live probability stream; the event selector
-//! is the header's left control, and a venue reload drops the chart it can no longer
-//! vouch for. The range the history is read over is one of the pane's four persisted
-//! options; the book's toggle, notch and price grouping are the others.
-//!
-//! # The shape is the framework's
-//!
-//! State is reported through [`WidgetStatus`] only (connecting / loading / ready /
-//! waiting / failed); the banner, spinner and placeholder are drawn by
-//! `widget::surface`. [`WidgetView::body`] builds the body **once** — the legend, the
-//! chart's canvas, the splitter and the book region — and everything that moves after
-//! that goes through the canvas ([`ChartCanvas`]), the book panel's list and the
-//! `bind_*` closures over the signals the pane owns.
-//!
-//! # The directory
-//!
-//! The pane never loads the directory and never polls the catalogue: it re-reads the
-//! answers its [`MarketDirectory`] gives on every load, and re-runs that load when the
-//! injected [`catalog_generation`](widget::services::WidgetServices::catalog_generation)
-//! signal moves (AGENTS §8.3). A generation refresh keeps the reading the user is
-//! looking at while the new one is requested — the chart on screen is still the one
-//! the reader was reading — and only the user's own explicit load drops it.
-//!
-//! # Confirmation is a signal, not a re-entry
-//!
-//! The header controls' handlers run with an application context and no widget
-//! context, so they write the confirmed choice into [`PredictionMarketWidget::requests`]
-//! and ask for a frame; the next `sync` applies it and publishes the configuration
-//! change. The kit keys are minted with [`WidgetCx::unique_key`], one suffix per
-//! control, so two panes built side by side never share a handler (AGENTS §9).
-//!
-//! # Static copy is rebuilt, not re-bound
-//!
-//! The event button, the market/group/range/grouping pickers and the book's retry
-//! buttons take their copy at build time (kit components have no `bind_text` on those
-//! surfaces yet, AGENTS §15). The pane records the values each was built with and
-//! [`PredictionMarketWidget::sync`] rebuilds the block — after removing its own nodes
-//! and releasing the component — when a language switch, a new selection or a
-//! directory generation changes what it states.
-
 use std::{mem, rc::Rc, sync::Arc};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
@@ -106,25 +63,16 @@ use crate::{
     },
 };
 
-/// The one-cycle breathing effect at the newest point.
 const PULSE_DURATION_MS: u32 = 700;
 
-/// One frame of an animation: the pulse and the book's depth easing advance by this
-/// much per timer tick. The engine has no clock read for widgets, so a tick is the
-/// unit of time a frame-driven effect consumes (AGENTS §8, E10).
 const FRAME_TICK_MS: u32 = 16;
 
-/// The engine tick an effect is scheduled at.
 const FRAME_TICK: std::time::Duration = std::time::Duration::from_millis(16);
 
-/// The height of the splitter between the chart and the book.
 const BOOK_SPLITTER_HEIGHT: f32 = 7.0;
 
-/// The shortest the book panel is drawn, so a short pane still shows its failure and
-/// the way back rather than a clipped strip of both.
 const MIN_BOOK_HEIGHT: f32 = 56.0;
 
-/// The widget-local names of the header controls' kit keys.
 const EVENT_KEY_SUFFIX: &str = "prediction_market.header.event";
 const GROUP_KEY_SUFFIX: &str = "prediction_market.header.market_group";
 const MARKET_KEY_SUFFIX: &str = "prediction_market.header.market";
@@ -134,7 +82,6 @@ const BOOK_GROUPING_KEY_SUFFIX: &str = "prediction_market.header.book_grouping";
 const BOOK_RETRY_STRIP_SUFFIX: &str = "prediction_market.book.retry.strip";
 const BOOK_RETRY_PANEL_SUFFIX: &str = "prediction_market.book.retry.panel";
 
-/// A failure the pane reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PredictionMarketError {
     Fetch(PredictionMarketFetchError),
@@ -170,19 +117,14 @@ impl TranslatedError for PredictionMarketServiceError {
     }
 }
 
-/// The options the prediction market persists.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PredictionMarketConfig {
-    /// The range the history is read over.
     #[serde(rename = "range")]
     pub range: PredictionRange,
-    /// Whether the order book is drawn below the chart.
     #[serde(rename = "order_book_visible")]
     pub order_book_visible: bool,
-    /// The share of the body the order book takes.
     #[serde(rename = "order_book_ratio")]
     pub order_book_ratio: f32,
-    /// The book's price grouping, as a multiple of the venue's own tick.
     #[serde(rename = "order_book_grouping")]
     pub order_book_grouping: u32,
 }
@@ -199,12 +141,6 @@ impl Default for PredictionMarketConfig {
 }
 
 impl PredictionMarketConfig {
-    /// Settles the book's two drawing choices against what this build offers.
-    ///
-    /// A stored ratio or grouping can stop being valid — a layout written by another
-    /// build, a hand-edited file — and such a choice goes back to the default one
-    /// rather than being drawn at a value nobody picked. Answers whether anything was
-    /// replaced, which is what the pane reports so the replacement is written back.
     fn settle(&mut self) -> bool {
         let defaults = Self::default();
         let mut settled = false;
@@ -224,41 +160,30 @@ impl WidgetConfig for PredictionMarketConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// The breathing effect at the newest point, started by a live reading that advanced
-/// the newest point.
-///
-/// The phase is derived from how many animation ticks the effect has run rather than
-/// stored frame by frame, so a frame that arrives late draws the phase that is
-/// actually true and the effect still ends on time.
 #[derive(Clone, Copy, Debug)]
 struct Pulse {
     elapsed_ms: u32,
 }
 
 impl Pulse {
-    /// The phase in `0..1`, or `None` once the effect has ended.
     fn phase(&self) -> Option<f32> {
         (self.elapsed_ms < PULSE_DURATION_MS)
             .then(|| self.elapsed_ms as f32 / PULSE_DURATION_MS as f32)
     }
 }
 
-/// Where a splitter drag started: the book's share when the pointer went down and the
-/// pointer's window y at that moment.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SplitDragStart {
     start_ratio: f32,
     start_y: f32,
 }
 
-/// One command this pane sent and has not seen the answer to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingCommand {
     Load,
     Retry,
 }
 
-/// One command the book binding sent and has not seen the answer to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BookPendingCommand {
     Load,
@@ -266,10 +191,6 @@ enum BookPendingCommand {
     Retry,
 }
 
-/// What one header control asked the next `sync` to apply.
-///
-/// A control's handler runs without a widget context, so it writes the request into a
-/// signal and asks for a frame instead of re-entering the pane.
 #[derive(Clone, Debug, PartialEq)]
 enum HeaderRequest {
     Event(PredictionEventRef, SmolStr),
@@ -280,33 +201,22 @@ enum HeaderRequest {
     RetryBook,
 }
 
-/// What the book region is showing, as one comparable value.
 #[derive(Clone, Debug, PartialEq)]
 enum BookRegion {
-    /// The panel is waiting for its first page.
     Loading,
-    /// The panel has a book and its levels are all settled (no ladder to draw).
     Empty,
-    /// The panel failed before it ever had a reading.
     Failed(Arc<PredictionOrderBookError>),
-    /// The panel is drawing a ladder; a failure that arrived after the first reading
-    /// sits above it as a strip rather than replacing it.
     Reading {
         failed: Option<Arc<PredictionOrderBookError>>,
     },
 }
 
 impl BookRegion {
-    /// Whether a ladder is on screen.
     fn is_reading(&self) -> bool {
         matches!(self, Self::Reading { .. })
     }
 }
 
-/// What the header states, as one comparable value.
-///
-/// A difference is what makes the pane rebuild the controls: their labels, their item
-/// lists and their handlers are chosen at build time (AGENTS §15.1).
 #[derive(Clone, Debug, PartialEq)]
 struct HeaderState {
     selection: Option<PredictionEventRef>,
@@ -321,14 +231,12 @@ struct HeaderState {
     grouping: Option<(u32, Vec<(u32, SmolStr)>)>,
 }
 
-/// One kit component a header group owns, kept for release.
 enum HeaderComponent {
     Button(Button),
     Select(Select),
 }
 
 impl HeaderComponent {
-    /// The node the component built.
     fn node(&self) -> Option<NodeId> {
         match self {
             Self::Button(button) => button.node(),
@@ -336,7 +244,6 @@ impl HeaderComponent {
         }
     }
 
-    /// Releases the component: its action handlers and its signal scope.
     fn release(self, app: &mut App) -> usize {
         match self {
             Self::Button(button) => button.release(app),
@@ -345,20 +252,17 @@ impl HeaderComponent {
     }
 }
 
-/// The controls one header group holds.
 struct HeaderGroupControls {
     parent: NodeId,
     components: Vec<HeaderComponent>,
 }
 
-/// Both header groups and the state they were built from.
 struct HeaderControls {
     left: Option<HeaderGroupControls>,
     right: Option<HeaderGroupControls>,
     built: HeaderState,
 }
 
-/// The book region's chrome: the nodes the pane built around the panel.
 struct BookChrome {
     area: NodeId,
     splitter: NodeId,
@@ -374,13 +278,11 @@ struct BookChrome {
     retry_language: LanguageCode,
 }
 
-/// The prediction market.
 pub struct PredictionMarketWidget {
     config: PredictionMarketConfig,
     config_change: WidgetConfigChange,
     status: WidgetStatus,
     recovery: WidgetAction,
-    /// The executor bridge, when this host has a directory to drive a service from.
     binding: Option<WidgetBinding<PredictionMarketProtocol>>,
     book_binding: Option<WidgetBinding<PredictionOrderBookProtocol>>,
     pending: Pending<PendingCommand>,
@@ -390,20 +292,14 @@ pub struct PredictionMarketWidget {
     selection_title: Option<SmolStr>,
     market: Option<PredictionMarketRef>,
     snapshot: Option<Arc<PredictionMarketSnapshot>>,
-    /// The reading the body's `bind_*` closures draw.
     snapshots: Signal<Option<Arc<PredictionMarketSnapshot>>>,
-    /// The book region's state, for the strip and status overlays.
     book_region: Signal<BookRegion>,
-    /// The empty state's sentence: `common.no_data` in the language showing now.
     empty_text: Signal<SmolStr>,
-    /// Header requests waiting for the next `sync`.
     requests: Signal<Option<HeaderRequest>>,
-    /// The animation ticks the pulse's timer has delivered.
     pulse_ticks: Signal<u64>,
     pulse_seen_ticks: u64,
     pulse: Option<Pulse>,
     pulse_timer: Option<ui_core::app::TimerId>,
-    /// The pointer's window position while it is over the pane.
     pointer: Option<Point>,
     chart: ChartCanvas,
     book_panel: PredictionBookPanel,
@@ -429,8 +325,6 @@ pub struct PredictionMarketWidget {
     empty_text_language: Option<LanguageCode>,
     split_drag: Option<SplitDragStart>,
     split_dragging: bool,
-    /// The layout each book-region node was last given, so a region change rebuilds
-    /// only the branches whose visibility actually moved.
     book_status_shown: Option<bool>,
     book_strip_shown: Option<bool>,
     book_ladder_shown: Option<bool>,
@@ -465,8 +359,6 @@ impl WidgetView for PredictionMarketWidget {
         let requests = cx.signal(None::<HeaderRequest>);
         let pulse_ticks = cx.signal(0_u64);
 
-        // A host without a directory has nothing to ask and nothing to start; the pane
-        // reports the neutral notice and waits. Every application supplies one.
         let Some(connector) = cx.services().market_participants.clone() else {
             return Ok(Self::assemble(
                 config,
@@ -516,8 +408,6 @@ impl WidgetView for PredictionMarketWidget {
     }
 
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
-        // The stored book choices are judged before any work is started, so the pane
-        // never draws or requests a notch and a grouping this build does not offer.
         if self.config.settle() {
             log::warn!(
                 "the prediction market's stored book ratio or grouping is not offered here; \
@@ -533,8 +423,6 @@ impl WidgetView for PredictionMarketWidget {
             self.wait_for_market(cx);
             return;
         }
-        // The pane reached here only past its own gate, so the markets it was waiting
-        // for are in memory again and messages belong to them once more.
         self.awaiting_market = false;
         let Some(selection) = self.selection.clone() else {
             self.status.report(
@@ -548,16 +436,10 @@ impl WidgetView for PredictionMarketWidget {
         let market_reloaded = mem::take(&mut self.market_reloaded);
         let retry = self.status.is_failed(cx.app());
         if !retry && !market_reloaded {
-            // An explicit load starts over, because the pane cannot vouch for what it
-            // was showing. A retry — or the reload a new directory generation asks for
-            // — keeps the reading the user is still looking at.
             self.snapshot = None;
             self.forget_chart_state(cx);
             self.clear_book(cx);
         } else if market_reloaded {
-            // The book stream resolved against the generation that was just retired,
-            // so it is retired with the reading it belonged to; the ladder stays on
-            // screen until the next reading points the panel at a new one.
             self.stop_book(cx);
         }
         self.epoch = self.epoch.wrapping_add(1);
@@ -616,8 +498,6 @@ impl WidgetView for PredictionMarketWidget {
             .build(cx.tree_mut(), parent)?;
         self.body_root = Some(root);
 
-        // The legend: one dot and one label per drawn side, in the order the venue
-        // published them, and the count of sides the chart did not have room for.
         let legend = NodeBuilder::boxed()
             .id("TEST_PREDICTION_MARKET_LEGEND")
             .style(
@@ -726,8 +606,6 @@ impl WidgetView for PredictionMarketWidget {
             })
             .build(cx.tree_mut(), legend)?;
 
-        // The chart and the book share what the legend leaves; the splitter divides
-        // the area both are laid out in.
         let split_area = NodeBuilder::boxed()
             .id("PredictionMarketChartArea")
             .style(
@@ -791,9 +669,6 @@ impl WidgetView for PredictionMarketWidget {
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        // The directory generation is the one signal the framework's surface root also
-        // reads, so a write schedules the frame that runs this hook — including for a
-        // pane that only waits and has no body (AGENTS §8.3).
         let generation = *cx.read(&self.generation);
         if generation != self.seen_generation {
             self.seen_generation = generation;
@@ -803,8 +678,6 @@ impl WidgetView for PredictionMarketWidget {
             }
         }
 
-        // The bindings deliver messages instead of calling back into the widget; this is
-        // the one place they are applied, where the widget has a context again.
         if let Some(binding) = self.binding.as_ref() {
             for inbound in binding.take() {
                 self.apply_market(inbound, cx);
@@ -816,8 +689,6 @@ impl WidgetView for PredictionMarketWidget {
             }
         }
 
-        // A control's confirmation is applied here rather than in its handler, which owns
-        // no widget context (see the module documentation).
         let requested = (*cx.read(&self.requests)).clone();
         if let Some(request) = requested {
             cx.write(&self.requests, None);
@@ -826,8 +697,6 @@ impl WidgetView for PredictionMarketWidget {
 
         self.advance_pulse(cx);
 
-        // The reading the body draws is published before the canvas is prepared, so a
-        // pointer frame after a new reading paints the same snapshot the legend names.
         let snapshot_moved = match (&self.last_published_snapshot, &self.snapshot) {
             (None, None) => false,
             (Some(published), Some(current)) => !Arc::ptr_eq(published, current),
@@ -863,8 +732,6 @@ impl WidgetView for PredictionMarketWidget {
         if self.awaiting_market || !self.market_ready_now() {
             return Ok(());
         }
-        // The pane is building its row; the controls this widget built into the previous
-        // one went with it. Only the components are the widget's to take down.
         self.release_header_group(group, cx, false);
         let state = self.header_state(cx);
         self.build_header_group(group, parent, &state, cx)?;
@@ -929,29 +796,20 @@ impl WidgetView for PredictionMarketWidget {
     }
 
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
-        // Dropping the bridges aborts their forwarding tasks and cancels the services.
         if let Some(mut binding) = self.binding.take() {
             binding.cancel();
         }
         if let Some(mut binding) = self.book_binding.take() {
             binding.cancel();
         }
-        // The header's group nodes belong to the pane, which removes its row: only the
-        // components' signal scopes and action handlers are this widget's to release.
         self.release_header_group(HeaderGroup::Left, cx, false);
         self.release_header_group(HeaderGroup::Right, cx, false);
         self.header = None;
-        // The chart's canvas node and the book's nodes live in the body, which the
-        // framework removes after this hook; what they own — the chart's geometry and
-        // the panel's list — goes here, while the nodes are still alive.
         self.chart.release(cx);
         self.book_panel.release(cx);
         if let Some(timer) = self.pulse_timer.take() {
             cx.app_mut().cancel_timer(&timer);
         }
-        // The region's nodes belong to the body the framework removes after this
-        // hook; the two retry buttons are components, so their handlers and scopes
-        // are this widget's to hand back.
         if let Some(chrome) = self.book_chrome.take() {
             let _ = chrome.strip_retry.release(cx.app_mut());
             let _ = chrome.status_retry.release(cx.app_mut());
@@ -966,7 +824,6 @@ impl WidgetView for PredictionMarketWidget {
 }
 
 impl PredictionMarketWidget {
-    /// Assembles the widget's fields; `new` is the only caller.
     fn assemble(
         config: PredictionMarketConfig,
         config_change: WidgetConfigChange,
@@ -1039,12 +896,6 @@ impl PredictionMarketWidget {
         }
     }
 
-    /// Builds a widget over a test's own source and directory.
-    ///
-    /// The framework's headless host composes the services without a directory (the
-    /// connector still needs the old toolkit's runtime to build), so an interface
-    /// test constructs the widget directly with the fixture directory it wants, and
-    /// drives the widget hooks itself.
     #[cfg(test)]
     pub(crate) fn with_source<S>(
         config: PredictionMarketConfig,
@@ -1093,24 +944,19 @@ impl PredictionMarketWidget {
         )
     }
 
-    /// Whether this build can read the order book of `event`'s venue.
     fn book_supported(event: &PredictionEventRef) -> bool {
         book_venues().contains(&event.route.venue)
     }
 
-    /// The book the drawn reading points at, when this build can read it.
     fn supported_book_target(&self) -> Option<PredictionOrderBookTarget> {
         let target = self.snapshot.as_ref()?.book_target()?;
         Self::book_supported(&target.event).then_some(target)
     }
 
-    /// Whether the chart-and-book area is divided with a book.
     fn shows_book(&self) -> bool {
         self.config.order_book_visible && self.supported_book_target().is_some()
     }
 
-    /// Whether what this pane needs is in memory: a venue that publishes prediction
-    /// events, and the route of the event it follows among them.
     fn market_ready(&self, directory: &dyn MarketDirectory) -> bool {
         if !directory.any_event_market_loaded() {
             return false;
@@ -1121,15 +967,12 @@ impl PredictionMarketWidget {
         }
     }
 
-    /// Whether the pane's gate passes with the directory it was handed.
     fn market_ready_now(&self) -> bool {
         self.directory
             .as_ref()
             .is_some_and(|directory| self.market_ready(directory.as_ref()))
     }
 
-    /// Reports the neutral notice for the market this pane follows, and drops the
-    /// reading it was showing.
     fn wait_for_market(&mut self, cx: &mut WidgetCx<'_>) {
         self.awaiting_market = true;
         self.snapshot = None;
@@ -1140,7 +983,6 @@ impl PredictionMarketWidget {
         self.report_markets_not_loaded(cx);
     }
 
-    /// Reports the notice naming the market this pane follows.
     fn report_markets_not_loaded(&self, cx: &mut WidgetCx<'_>) {
         let supported = event_venues();
         let venues = self
@@ -1154,7 +996,6 @@ impl PredictionMarketWidget {
         );
     }
 
-    /// The stream scope this pane would accept messages from.
     fn current_key(&self) -> Option<PredictionMarketStreamKey> {
         self.selection
             .as_ref()
@@ -1166,7 +1007,6 @@ impl PredictionMarketWidget {
             })
     }
 
-    /// Applies one header request as one configuration transition.
     fn apply_request(&mut self, request: HeaderRequest, cx: &mut WidgetCx<'_>) {
         match request {
             HeaderRequest::Event(event, title) => self.select_event(event, title, cx),
@@ -1201,11 +1041,6 @@ impl PredictionMarketWidget {
         let _ = cx.request_frame();
     }
 
-    /// Switches the range the chart is read over.
-    ///
-    /// The reading on screen answers the window the user just left, so it is dropped
-    /// before the request: the pane has no content while the new reading is fetched,
-    /// and the framework draws its connecting spinner in the body.
     fn select_range(&mut self, range: PredictionRange, cx: &mut WidgetCx<'_>) {
         if self.config.range == range {
             return;
@@ -1229,7 +1064,6 @@ impl PredictionMarketWidget {
         let _ = cx.request_frame();
     }
 
-    /// Regroups the book on screen at `multiplier`, and reports the choice.
     fn select_book_grouping(&mut self, multiplier: u32, cx: &mut WidgetCx<'_>) {
         let Some(book) = self.book_snapshot.as_ref() else {
             return;
@@ -1244,7 +1078,6 @@ impl PredictionMarketWidget {
         let _ = cx.request_frame();
     }
 
-    /// Retires the book stream, keeping whatever the panel is drawing.
     fn stop_book(&mut self, cx: &mut WidgetCx<'_>) {
         self.split_drag = None;
         self.split_dragging = false;
@@ -1256,7 +1089,6 @@ impl PredictionMarketWidget {
         self.book_key = None;
     }
 
-    /// Forgets the book on screen and retires the stream that fed it.
     fn clear_book(&mut self, cx: &mut WidgetCx<'_>) {
         self.stop_book(cx);
         self.book_snapshot = None;
@@ -1265,7 +1097,6 @@ impl PredictionMarketWidget {
         self.book_panel.clear();
     }
 
-    /// Points the book panel at the market the chart is drawing.
     fn sync_book_target(&mut self, cx: &mut WidgetCx<'_>) {
         if !self.config.order_book_visible {
             return;
@@ -1285,8 +1116,6 @@ impl PredictionMarketWidget {
         {
             return;
         }
-        // Showing the book again is instant: the ladder of the same leg is still drawn
-        // while the new request runs, and only another leg replaces it.
         let same_ladder = self
             .book_snapshot
             .as_ref()
@@ -1316,7 +1145,6 @@ impl PredictionMarketWidget {
         let _ = cx.request_frame();
     }
 
-    /// Re-reads the book the panel is pointed at.
     fn retry_book(&mut self, cx: &mut WidgetCx<'_>) {
         let Some(target) = self.supported_book_target() else {
             return;
@@ -1342,12 +1170,10 @@ impl PredictionMarketWidget {
         let _ = cx.request_frame();
     }
 
-    /// Whether the panel is waiting for its first reading.
     fn book_loading(&self) -> bool {
         self.book_key.is_some() && self.book_snapshot.is_none() && self.book_error.is_none()
     }
 
-    /// The label of the side the panel is reading, from the venue's own list.
     fn book_leg_label(&self) -> Option<SmolStr> {
         let (Some(key), Some(snapshot)) = (self.book_key.as_ref(), self.snapshot.as_ref()) else {
             return None;
@@ -1359,7 +1185,6 @@ impl PredictionMarketWidget {
             .map(|leg| leg.label.clone())
     }
 
-    /// The region the book area is showing now.
     fn book_region(&self) -> BookRegion {
         if self.book_snapshot.is_some() {
             BookRegion::Reading {
@@ -1373,8 +1198,6 @@ impl PredictionMarketWidget {
             BookRegion::Empty
         }
     }
-
-    // ---- bindings -------------------------------------------------------------
 
     fn apply_market(&mut self, inbound: Inbound<PredictionMarketProtocol>, cx: &mut WidgetCx<'_>) {
         match inbound {
@@ -1415,17 +1238,11 @@ impl PredictionMarketWidget {
                     self.awaiting_market = true;
                     self.snapshot = None;
                     self.forget_chart_state(cx);
-                    // The market the book was read for is not in memory: the book
-                    // stream is retired with the reading it belonged to.
                     self.clear_book(cx);
                     self.report_markets_not_loaded(cx);
                     let _ = cx.request_frame();
                     return;
                 }
-                // A terminal chart failure is the pane's own: the chart's stream is
-                // gone, so the book's lease is released too. The last ladder stays on
-                // screen — it is what the reader was reading — but nothing reads it any
-                // more.
                 self.stop_book(cx);
                 let recovery = self.recovery.clone();
                 self.status.report(
@@ -1468,14 +1285,8 @@ impl PredictionMarketWidget {
         let newest = snapshot.latest_timestamp();
         self.snapshot = Some(snapshot.clone());
         self.selection_title = Some(snapshot.title.clone());
-        // The book follows the market the reading draws, so a switch of market re-points
-        // it here rather than in the header's handler: only a reading knows which sides
-        // the market it fell back to actually publishes.
         self.sync_book_target(cx);
         self.status.report(cx.app_mut(), WidgetState::Ready);
-        // The pulse marks a *new observation*, not a first reading, and a tick that lands
-        // while a breath is still running does not restart it: a venue pushing several
-        // ticks a second would otherwise pin the effect to its first phase.
         let breathing = self.pulse.and_then(|pulse| pulse.phase()).is_some();
         let reduce_motion = *cx.read(&cx.services().reduce_motion.clone());
         if !reduce_motion
@@ -1506,8 +1317,6 @@ impl PredictionMarketWidget {
                     );
                 }
             }
-            // Late or unknown: the reply answers a call this pane replaced, and the
-            // table has counted it.
             None => {}
         }
     }
@@ -1568,17 +1377,9 @@ impl PredictionMarketWidget {
         let PredictionOrderBookStreamMessage::Snapshot(book) = message else {
             return;
         };
-        // A failure is the answer until a retry starts a new generation: a snapshot of
-        // the failed stream that arrives late describes the book the panel already gave
-        // up on.
         if self.book_error.is_some() {
             return;
         }
-        // The stored grouping is settled against the tick this book published, not
-        // against the config alone: which steps exist depends on the tick. An empty page
-        // has no level to group, and the tick it is stated at is a fallback rather than
-        // the venue's, so it must not rewrite a grouping the user chose on a book that
-        // does have levels.
         let has_levels = !book.bids.is_empty() || !book.asks.is_empty();
         let multiplier = if has_levels {
             let settled = settle_grouping(book.tick_size, self.config.order_book_grouping);
@@ -1593,8 +1394,6 @@ impl PredictionMarketWidget {
         self.book_snapshot = Some(book.clone());
         self.book_panel.set_leg_label(self.book_leg_label());
         self.book_panel.set_book(book.clone(), multiplier);
-        // The state is stored while the panel is hidden — showing it again draws the
-        // newest ladder at once — but a hidden body is not repainted.
         if self.config.order_book_visible {
             let _ = cx.request_frame();
         }
@@ -1614,16 +1413,10 @@ impl PredictionMarketWidget {
                     let _ = cx.request_frame();
                 }
             }
-            // A stop is housekeeping, not a reading: whether the service was already
-            // closed is not something the panel reports.
             Some(BookPendingCommand::Stop) | None => {}
         }
     }
 
-    // ---- body upkeep ---------------------------------------------------------
-
-    /// Builds the splitter and the book region when a book is shown, and takes them
-    /// down when it is hidden or this build cannot read one.
     fn ensure_book_region(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let shows = self.shows_book();
         match (shows, self.book_chrome.is_some()) {
@@ -1638,11 +1431,6 @@ impl PredictionMarketWidget {
         }
     }
 
-    /// Builds the splitter and the book region: the failure strip, the status
-    /// overlay and the panel's ladder. The region's three branches are all built once
-    /// and their heights are toggled by [`Self::sync_book_region`] — a visibility
-    /// patch would hide a node without giving its layout space back, and the chart
-    /// must get the whole area back while no ladder is drawn.
     fn build_book_region(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(area_parent) = self.split_area else {
             return Ok(());
@@ -1697,7 +1485,6 @@ impl PredictionMarketWidget {
             .style(area_style)
             .build(cx.tree_mut(), area_parent)?;
 
-        // The one-line failure a book that was already on screen can leave behind.
         let strip = NodeBuilder::boxed()
             .id("TEST_PREDICTION_MARKET_BOOK_ERROR")
             .style(book_strip_style())
@@ -1725,8 +1512,6 @@ impl PredictionMarketWidget {
             .style(StyleBuilder::new().flex_none().build())
             .build(cx.tree_mut(), strip)?;
 
-        // The status region: the empty state, the loading/failure sentence and the way
-        // back, each in its own overlay so hiding one does not move another.
         let status = NodeBuilder::boxed()
             .id("TEST_PREDICTION_MARKET_BOOK_STATUS")
             .style(book_status_style())
@@ -1805,7 +1590,6 @@ impl PredictionMarketWidget {
             })
             .build(cx.tree_mut(), status)?;
 
-        // The ladder: the column header, the depth bars and the rows the panel owns.
         let ladder = NodeBuilder::boxed()
             .id("PredictionMarketBookLadder")
             .style(book_ladder_style())
@@ -1870,8 +1654,6 @@ impl PredictionMarketWidget {
         let _ = chrome.status_retry.release(cx.app_mut());
     }
 
-    /// Syncs the book area: the region signal, the branch heights, the panel and the
-    /// retry buttons' language.
     fn sync_book_region(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let region = self.book_region();
         if self.last_published_region.as_ref() != Some(&region) {
@@ -1882,9 +1664,6 @@ impl PredictionMarketWidget {
             return Ok(());
         }
         self.sync_book_region_layout(cx, &region)?;
-        // The notch divides the area the chart and the book share: the engine has no
-        // percentage setter, so the percent height the region was built with is
-        // replaced when the drag moved it.
         let ratio = clamp_ratio(self.config.order_book_ratio);
         let area = self.book_chrome.as_ref().map(|chrome| chrome.area);
         if self.book_style_ratio != Some(ratio)
@@ -1901,8 +1680,6 @@ impl PredictionMarketWidget {
             cx.tree_mut().set_style(area, style)?;
             self.book_style_ratio = Some(ratio);
         }
-        // The retry buttons' label is resolved when they are built; a language switch
-        // rebuilds the two of them.
         let language = *cx.read(&self.language);
         let retry_language = self
             .book_chrome
@@ -1917,10 +1694,6 @@ impl PredictionMarketWidget {
         Ok(())
     }
 
-    /// Shows the one branch of the book region the current state calls for.
-    ///
-    /// Heights rather than visibility: a `visible: false` node still holds its layout
-    /// space, and a hidden status overlay would push the ladder out of the region.
     fn sync_book_region_layout(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -2014,8 +1787,6 @@ impl PredictionMarketWidget {
         cx.write(&self.empty_text, text);
     }
 
-    // ---- header --------------------------------------------------------------
-
     fn selector_host(&self, cx: &WidgetCx<'_>) -> SelectorHost {
         let host = SelectorHost::new(Rc::clone(cx.services_rc()));
         match &self.directory {
@@ -2024,7 +1795,6 @@ impl PredictionMarketWidget {
         }
     }
 
-    /// What the header controls would state now.
     fn header_state(&self, cx: &WidgetCx<'_>) -> HeaderState {
         let snapshot = self.snapshot.as_ref();
         let mut markets = Vec::new();
@@ -2042,8 +1812,6 @@ impl PredictionMarketWidget {
             }
         }
         let selected = snapshot.and_then(|snapshot| snapshot.selected_choice(self.market.as_ref()));
-        // The panel owns the grouped ladder, so it is what says whether its book offers
-        // a grouping at all; the steps are read off the tick the book published.
         let grouping = self.book_snapshot.as_ref().and_then(|book| {
             self.book_panel.has_grouping_choice().then(|| {
                 (
@@ -2070,7 +1838,6 @@ impl PredictionMarketWidget {
         }
     }
 
-    /// Builds one header group's controls into the pane's container.
     fn build_header_group(
         &mut self,
         group: HeaderGroup,
@@ -2124,12 +1891,6 @@ impl PredictionMarketWidget {
         Ok(())
     }
 
-    /// Takes down one group's controls.
-    ///
-    /// `remove_nodes` is true when the pane's row is still there and the widget is
-    /// replacing its own controls in it; a row the pane already took down needs no node
-    /// removal (`StaleNode`). The component — its click handler and its signal scope —
-    /// is this widget's in every case.
     fn release_header_group(
         &mut self,
         group: HeaderGroup,
@@ -2156,7 +1917,6 @@ impl PredictionMarketWidget {
         }
     }
 
-    /// Keeps the header controls in step with the copy they were built from.
     fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(built) = self.header.as_ref().map(|header| header.built.clone()) else {
             return Ok(());
@@ -2180,8 +1940,6 @@ impl PredictionMarketWidget {
                 continue;
             };
             if cx.tree().get(parent).is_err() {
-                // The pane took its row down; the controls went with it, and only the
-                // components are left to release.
                 self.release_header_group(group, cx, false);
                 continue;
             }
@@ -2473,9 +2231,6 @@ impl PredictionMarketWidget {
         Ok(button)
     }
 
-    // ---- pulse ---------------------------------------------------------------
-
-    /// The phase of the pulse to draw this frame.
     fn pulse_phase(&mut self, cx: &WidgetCx<'_>) -> Option<f32> {
         if *cx.read(&cx.services().reduce_motion) {
             self.pulse = None;
@@ -2489,7 +2244,6 @@ impl PredictionMarketWidget {
         pulse.phase()
     }
 
-    /// Advances the pulse by one animation tick.
     fn advance_pulse(&mut self, cx: &mut WidgetCx<'_>) {
         let ticks = *cx.read(&self.pulse_ticks);
         if ticks == self.pulse_seen_ticks {
@@ -2506,7 +2260,6 @@ impl PredictionMarketWidget {
         }
     }
 
-    /// Schedules the next animation tick of the pulse.
     fn schedule_pulse_tick(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if self.pulse_timer.is_some() {
             return Ok(());
@@ -2526,7 +2279,6 @@ impl PredictionMarketWidget {
         Ok(())
     }
 
-    /// Forgets every derived piece of a reading the pane can no longer vouch for.
     fn forget_chart_state(&mut self, cx: &mut WidgetCx<'_>) {
         self.pointer = None;
         self.pulse = None;
@@ -2536,8 +2288,6 @@ impl PredictionMarketWidget {
         self.chart.clear();
     }
 
-    // ---- splitter ------------------------------------------------------------
-
     fn begin_book_split(&mut self, position: Point) {
         self.split_drag = Some(SplitDragStart {
             start_ratio: clamp_ratio(self.config.order_book_ratio),
@@ -2546,11 +2296,6 @@ impl PredictionMarketWidget {
         self.split_dragging = false;
     }
 
-    /// Moves the notch to the ratio the pointer asks for.
-    ///
-    /// The config is updated in memory on every move, and reported only when the
-    /// gesture ends: a write at pointer speed would rewrite the layout file at the rate
-    /// of the pointer.
     fn drag_book_splitter(&mut self, position: Point, cx: &mut WidgetCx<'_>) {
         let Some(start) = self.split_drag else {
             return;
@@ -2578,8 +2323,6 @@ impl PredictionMarketWidget {
         let _ = cx.request_frame();
     }
 
-    /// Ends a splitter gesture, reporting the notch only when the gesture moved it away
-    /// from where it started.
     fn finish_book_split(&mut self, cx: &mut WidgetCx<'_>) {
         let start = self.split_drag.take();
         let dragged = mem::take(&mut self.split_dragging);
@@ -2592,14 +2335,12 @@ impl PredictionMarketWidget {
     }
 }
 
-/// Whether a pointer position is inside a node's laid-out box.
 fn pointer_over(cx: &WidgetCx<'_>, node: NodeId, position: Point) -> bool {
     cx.tree()
         .get(node)
         .is_ok_and(|node| node.layout().bounds.contains(position))
 }
 
-/// The style of the book region's failure strip.
 fn book_strip_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .flex_none()
@@ -2613,7 +2354,6 @@ fn book_strip_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The style of the book region's status area (the region with no ladder).
 fn book_status_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .flex_1()
@@ -2622,7 +2362,6 @@ fn book_status_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The style of the book region's ladder area.
 fn book_ladder_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .flex_1()
@@ -2631,7 +2370,6 @@ fn book_ladder_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The style of a book-region branch that is not shown: no height, no space.
 fn collapsed_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .flex_none()
@@ -2641,7 +2379,6 @@ fn collapsed_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The style of an overlay centered over the region it covers.
 fn overlay_center_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .absolute()
@@ -2654,12 +2391,10 @@ fn overlay_center_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// Whether a reading has any point to draw.
 fn has_points(snapshot: &PredictionMarketSnapshot) -> bool {
     snapshot.series.iter().any(|line| !line.points.is_empty())
 }
 
-/// The role one series' colour is read from.
 fn series_role(index: usize) -> Role {
     const ROLES: [Role; 6] = [
         Role::ChartSeries0,
@@ -2672,7 +2407,6 @@ fn series_role(index: usize) -> Role {
     ROLES[index % ROLES.len()]
 }
 
-/// One legend label: the side's name and its latest integer percentage.
 fn series_label(line: &PredictionMarketSeries) -> SmolStr {
     match line.latest {
         Some(latest) => format_smolstr!(
@@ -2684,7 +2418,6 @@ fn series_label(line: &PredictionMarketSeries) -> SmolStr {
     }
 }
 
-/// The sentence the book region states while it has no ladder.
 fn book_status_text(region: &BookRegion, translate: &Translate) -> SmolStr {
     match region {
         BookRegion::Loading => t_smol!(translate, "common.loading"),
@@ -2693,7 +2426,6 @@ fn book_status_text(region: &BookRegion, translate: &Translate) -> SmolStr {
     }
 }
 
-/// Builds one of the book region's retry buttons.
 fn build_retry_button(
     cx: &mut WidgetCx<'_>,
     parent: NodeId,
@@ -2715,7 +2447,6 @@ fn build_retry_button(
     Ok(button)
 }
 
-/// Hands a confirmed choice over to the next `sync`.
 fn hand_over_request(
     requests: Signal<Option<HeaderRequest>>,
     request: HeaderRequest,
@@ -2726,7 +2457,6 @@ fn hand_over_request(
     let _ = app.request_repaint(window);
 }
 
-/// The message key of one range's label.
 fn range_label(range: PredictionRange, translate: &Translate) -> SmolStr {
     match range {
         PredictionRange::Hour1 => t_smol!(translate, "widget.prediction_market.range.hour_1"),
@@ -2738,7 +2468,6 @@ fn range_label(range: PredictionRange, translate: &Translate) -> SmolStr {
     }
 }
 
-/// The stable picker id of one range, independent of its translated label.
 fn range_id(range: PredictionRange) -> &'static str {
     match range {
         PredictionRange::Hour1 => "hour_1",
@@ -2750,7 +2479,6 @@ fn range_id(range: PredictionRange) -> &'static str {
     }
 }
 
-/// The range a picker id names.
 fn range_of_id(id: &str) -> Option<PredictionRange> {
     PredictionRange::ALL
         .into_iter()

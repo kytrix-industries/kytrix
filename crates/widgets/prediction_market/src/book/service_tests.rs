@@ -1,6 +1,3 @@
-//! Unit tests of the book service: the page, the channel and the order the two
-//! are applied in.
-
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -39,7 +36,6 @@ use crate::{
     test_support::{change, charted_market, event_ref, level, order_book},
 };
 
-/// The handle of the runtime this test runs on.
 #[allow(
     clippy::disallowed_methods,
     reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -48,17 +44,14 @@ fn current_test_handle() -> &'static tokio::runtime::Handle {
     Box::leak(Box::new(tokio::runtime::Handle::current()))
 }
 
-/// The legs every fixture request names.
 fn legs() -> Vec<PredictionLeg> {
     charted_market(&event_ref(), "charted").0.legs
 }
 
-/// The leg the fixture book is for.
 fn leg() -> OutcomeLegRef {
     legs()[0].leg.clone()
 }
 
-/// The book target every fixture request names.
 fn target() -> PredictionOrderBookTarget {
     PredictionOrderBookTarget {
         event: event_ref(),
@@ -67,7 +60,6 @@ fn target() -> PredictionOrderBookTarget {
     }
 }
 
-/// One book with a bid, an ask, a last trade and a stated instant.
 fn book(timestamp: UnixMillis) -> PredictionOrderBook {
     let mut book = order_book(
         leg(),
@@ -98,17 +90,10 @@ fn stop() -> PredictionOrderBookRequest {
     PredictionOrderBookRequest::Stop
 }
 
-/// The live CLOB body refusing a token that has no book at all.
-///
-/// The venue states it inside a JSON envelope. The adapter trims the body's
-/// trailing newline, which is what the error's message holds.
 const LIVE_NO_BOOK_BODY: &str = r#"{"error":"No orderbook exists for the requested token id"}"#;
 
-/// The same refusal without an envelope: the venue's sentence is the whole body.
 const PLAIN_NO_BOOK_BODY: &str = "No orderbook exists for the requested token id";
 
-/// One 404 refusing a token because it has no CLOB book, carrying `body` as the
-/// venue's own words.
 fn no_book_error(body: &'static str) -> MarketError {
     MarketError::Network(MarketNetworkError::from(MarketParticipantError::Rejected {
         code: SmolStr::new_static("404"),
@@ -118,7 +103,6 @@ fn no_book_error(body: &'static str) -> MarketError {
     }))
 }
 
-/// The queued answers of the fake source: one page and one channel per call.
 #[derive(Clone, Default)]
 struct FakeSource {
     fetches: Arc<Mutex<VecDeque<oneshot::Receiver<Result<PredictionOrderBook, MarketError>>>>>,
@@ -159,11 +143,8 @@ impl PredictionOrderBookSource for FakeSource {
     }
 }
 
-/// One live book channel the test drives.
 struct FakeSubscription {
     updates: mpsc::Receiver<Result<Vec<PredictionOrderBookUpdate>, MarketError>>,
-    /// Fires once per message the service took from this channel, so a test can
-    /// tell that a frame was buffered before it let the page answer.
     taken: mpsc::UnboundedSender<()>,
 }
 
@@ -175,7 +156,6 @@ impl PredictionOrderBookEventSubscription for FakeSubscription {
     }
 }
 
-/// One service, its fake source, and the handles a test drives them with.
 struct Harness {
     runtime: WidgetRuntime<PredictionOrderBookProtocol>,
     source: FakeSource,
@@ -191,7 +171,6 @@ impl Harness {
         Self { runtime, source }
     }
 
-    /// Queues one page answer and gives the test the handle that sends it.
     fn fetch(&self) -> oneshot::Sender<Result<PredictionOrderBook, MarketError>> {
         let (sender, receiver) = oneshot::channel();
         self.source
@@ -202,8 +181,6 @@ impl Harness {
         sender
     }
 
-    /// Queues one live channel and gives the test the handles that feed and
-    /// watch it.
     fn subscribe(
         &self,
     ) -> (
@@ -230,8 +207,6 @@ impl Harness {
     }
 }
 
-/// The next snapshot a book stream publishes, with the key it was published
-/// under.
 async fn next_snapshot_keyed(
     latest: &mut LatestStream<PredictionOrderBookProtocol>,
 ) -> (PredictionOrderBookStreamKey, Arc<PredictionOrderBook>) {
@@ -251,14 +226,12 @@ async fn next_snapshot_keyed(
     }
 }
 
-/// The next snapshot a book stream publishes.
 async fn next_snapshot(
     latest: &mut LatestStream<PredictionOrderBookProtocol>,
 ) -> Arc<PredictionOrderBook> {
     next_snapshot_keyed(latest).await.1
 }
 
-/// Reads the reliable channel until `expected` arrives.
 async fn receive_status(
     reliable: &mut ReliableStream<PredictionOrderBookProtocol>,
     expected: PredictionOrderBookStatus,
@@ -337,8 +310,6 @@ async fn a_buffered_frame_newer_than_the_page_should_be_applied_and_an_older_one
         .call(load(1))
         .await
         .expect("the load request starts a stream");
-    // Both frames land while the page is in flight: the service takes the
-    // channel before it asks for the page.
     updates
         .send(Ok(vec![
             PredictionOrderBookUpdate::Replace {
@@ -510,8 +481,6 @@ async fn a_frame_older_than_the_book_should_be_dropped() {
         }]))
         .await
         .expect("the fake channel is open");
-    // A stale batch publishes nothing at all, so the next reading is the one
-    // the following (accepted) frame produces.
     updates
         .send(Ok(vec![PredictionOrderBookUpdate::Levels {
             bids: vec![change("0.33", "4")],
@@ -595,7 +564,6 @@ async fn a_failed_fetch_should_fail_the_stream() {
 async fn a_fetch_that_never_answers_should_time_out() {
     let mut harness = Harness::new();
     let (_updates, _taken) = harness.subscribe();
-    // No page is queued, so the fetch never answers.
     let mut reliable = harness.take_reliable();
     harness
         .runtime
@@ -619,7 +587,6 @@ async fn a_fetch_that_never_answers_should_time_out() {
 #[tokio::test(start_paused = true)]
 async fn a_subscription_that_never_opens_should_time_out() {
     let mut harness = Harness::new();
-    // No channel is queued, so the subscription never opens.
     let mut reliable = harness.take_reliable();
     harness
         .runtime
@@ -779,8 +746,6 @@ async fn a_new_epoch_should_replace_the_old_stream() {
         "the replaced stream's page is the one that is drawn"
     );
 
-    // The old channel is no longer followed: the task that read it is gone, and
-    // with it the receiver, so nothing can be published under the retired key.
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
@@ -813,9 +778,6 @@ async fn a_buffered_levels_at_the_pages_own_instant_should_be_applied() {
         .call(load(1))
         .await
         .expect("the load request starts a stream");
-    // Both frames land while the page is in flight. The replace states the whole
-    // book as it was queued before the page was read, so it loses to the page;
-    // the absolute sizes are newer by construction, even at the same instant.
     updates
         .send(Ok(vec![
             PredictionOrderBookUpdate::Replace {
@@ -878,8 +840,6 @@ async fn a_live_replace_at_the_pages_own_instant_should_be_refused() {
         }]))
         .await
         .expect("the fake channel is open");
-    // A refused frame publishes nothing, so the next reading is the one the
-    // following accepted frame produces.
     updates
         .send(Ok(vec![PredictionOrderBookUpdate::Levels {
             bids: vec![change("0.33", "4")],
@@ -950,9 +910,6 @@ async fn a_replace_tick_and_trade_at_the_same_newer_instant_should_all_apply() {
     harness.runtime.shutdown().await;
 }
 
-/// Drives one no-book refusal through the service: the page becomes an empty
-/// snapshot, Ready follows it, and the channel opened before the page is still
-/// followed afterwards.
 async fn empty_page_for(body: &'static str) {
     let mut harness = Harness::new();
     let (updates, _taken) = harness.subscribe();
@@ -979,8 +936,6 @@ async fn empty_page_for(body: &'static str) {
     assert!(empty.bids.is_empty() && empty.asks.is_empty());
     assert_eq!(empty.last_trade_price, None);
     assert_eq!(empty.timestamp, 0);
-    // A Ready can only be read after the snapshot; a failure would have ended the
-    // stream before either was published.
     receive_status(&mut reliable, PredictionOrderBookStatus::Ready).await;
 
     updates
@@ -1018,8 +973,6 @@ async fn a_404_that_is_not_the_missing_book_answer_should_fail_the_stream() {
     let (_updates, _taken) = harness.subscribe();
     let fetch = harness.fetch();
     let mut reliable = harness.take_reliable();
-    // A missing token and a missing book are both 404s; only the venue's own
-    // sentence says the book is what does not exist.
     let refusal =
         MarketError::Network(MarketNetworkError::from(MarketParticipantError::Rejected {
             code: SmolStr::new_static("404"),
@@ -1081,7 +1034,6 @@ async fn a_stop_should_cancel_the_active_stream_and_keep_serving() {
         PredictionOrderBookResponse::Stopped
     );
 
-    // The stream the stop retired is gone, and with it the channel it read.
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
@@ -1096,7 +1048,6 @@ async fn a_stop_should_cancel_the_active_stream_and_keep_serving() {
         "the stopped stream took its channel with it"
     );
 
-    // The service is still waiting for requests.
     let (_second_updates, _second_taken) = harness.subscribe();
     let second_fetch = harness.fetch();
     let mut latest = harness.runtime.latest_stream();

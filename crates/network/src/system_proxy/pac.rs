@@ -1,9 +1,3 @@
-//! PAC script download, JavaScript evaluation, and process cache.
-//!
-//! This path serves the Linux and macOS system proxy implementations. Windows
-//! evaluates PAC through WinHTTP instead, so no JavaScript engine is involved
-//! there.
-
 use std::{
     io::Read,
     sync::{Arc, Condvar, LazyLock, Mutex},
@@ -208,7 +202,6 @@ fn fetch_pac_script(url: &Url) -> Result<String, NetworkError> {
         })?
 }
 
-/// Reads a PAC document, refusing anything past the script size limit.
 pub(super) fn read_bounded_pac_body(mut reader: impl Read) -> Result<String, NetworkError> {
     let mut body = BytesMut::with_capacity(8192);
     let mut buffer = [0_u8; 8192];

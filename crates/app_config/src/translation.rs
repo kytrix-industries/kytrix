@@ -1,20 +1,7 @@
-//! Settings for the local translation model.
-//!
-//! The model is chosen from the models this build supports, and loaded from that model's
-//! local file in the directory stored here. The directory is a setting rather than a
-//! build-time location because the models are large, user-provided files that may live on
-//! any drive.
-
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// One site the translation models can be downloaded from.
-///
-/// It is a stored setting: a download, and a retry of a failed one, starts from the site
-/// named here. A completed download is saved under the model's own file name, whichever
-/// site it came from, but a retry that finds another site chosen discards the partial file
-/// the previous site left rather than continuing it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DownloadSite {
     #[default]
@@ -25,11 +12,9 @@ pub enum DownloadSite {
 }
 
 impl DownloadSite {
-    /// Every site, in the order the settings page offers them.
     pub const ALL: [Self; 2] = [Self::HuggingFace, Self::ModelScope];
 }
 
-/// One downloadable Hy-MT2 GGUF model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TranslationModel {
     #[serde(rename = "hy_mt2_1_8b_q4_k_m")]
@@ -51,7 +36,6 @@ pub enum TranslationModel {
 }
 
 impl TranslationModel {
-    /// Every model, in the order the settings page offers them.
     pub const ALL: [Self; 8] = [
         Self::HyMt218BQ4Km,
         Self::HyMt218BQ6K,
@@ -63,7 +47,6 @@ impl TranslationModel {
         Self::HyMt27BQ8,
     ];
 
-    /// The name the settings page shows and [`Self::from_name`] accepts.
     pub fn display_name(self) -> &'static str {
         match self {
             Self::HyMt218BQ4Km => "HY-MT2-1.8B-Q4_K_M",
@@ -77,7 +60,6 @@ impl TranslationModel {
         }
     }
 
-    /// The local file name the model is saved under.
     pub fn file_name(self) -> &'static str {
         match self {
             Self::HyMt218BQ4Km => "HY-MT2-1.8B-Q4_K_M.gguf",
@@ -91,7 +73,6 @@ impl TranslationModel {
         }
     }
 
-    /// The published size of the model's file, in bytes.
     pub fn size_bytes(self) -> u64 {
         match self {
             Self::HyMt218BQ4Km => 1_133_080_448,
@@ -105,7 +86,6 @@ impl TranslationModel {
         }
     }
 
-    /// The URL the model is downloaded from on `site`.
     pub fn download_url(self, site: DownloadSite) -> &'static str {
         match site {
             DownloadSite::HuggingFace => match self {
@@ -163,10 +143,6 @@ impl TranslationModel {
         }
     }
 
-    /// Resolves a settings value to the model it names.
-    ///
-    /// Only the exact display name is accepted: the name is the value the settings
-    /// page shows, not a file name or a case-insensitive alias.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL
             .iter()
@@ -175,21 +151,12 @@ impl TranslationModel {
     }
 }
 
-/// Where the local translation model is stored and which model it is.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranslationConfig {
-    /// The directory holding the GGUF model files.
-    ///
-    /// It defaults to the `models` directory beside the settings file: the models are large,
-    /// user-provided files, and a first start has nowhere else to put them. A platform that
-    /// names no config directory has no default to name, and the value stays `None` until the
-    /// user picks one.
     #[serde(default = "crate::paths::default_model_directory")]
     pub model_directory: Option<PathBuf>,
-    /// The selected model, or `None` until the user chooses one.
     #[serde(default)]
     pub selected_model: Option<TranslationModel>,
-    /// The site the models are downloaded from.
     #[serde(default)]
     pub download_site: DownloadSite,
 }
@@ -212,7 +179,6 @@ mod tests {
 
     use super::{DownloadSite, TranslationConfig, TranslationModel};
 
-    /// Every published fact, in the order the page offers the models.
     const CATALOG: [(&str, &str, u64); 8] = [
         (
             "HY-MT2-1.8B-Q4_K_M",
@@ -232,7 +198,6 @@ mod tests {
         ("HY-MT2-7B-Q8_0", "HY-MT2-7B-Q8_0.gguf", 7_981_928_896),
     ];
 
-    /// Every model's stable wire id and its URL on each site, in the same order.
     const URLS: [(&str, &str, &str); 8] = [
         (
             "hy_mt2_1_8b_q4_k_m",
@@ -276,7 +241,6 @@ mod tests {
         ),
     ];
 
-    /// The file name each URL must end with, as the repository publishes it.
     const REMOTE_FILE_NAMES: [&str; 8] = [
         "Hy-MT2-1.8B-Q4_K_M.gguf",
         "Hy-MT2-1.8B-Q6_K.gguf",
@@ -305,8 +269,6 @@ mod tests {
         );
     }
 
-    /// A translation section written without a directory names the default one, so a file that
-    /// predates the directory being stored still has a place to download to.
     #[test]
     fn a_translation_section_without_a_directory_should_name_the_default_one() {
         let config: TranslationConfig =
@@ -336,8 +298,6 @@ mod tests {
         );
     }
 
-    /// A file written before the download site was stored has no value of its own, which is
-    /// the same state as a fresh installation: downloads come from HuggingFace.
     #[test]
     fn a_config_without_a_download_site_should_download_from_huggingface() {
         let config: TranslationConfig =

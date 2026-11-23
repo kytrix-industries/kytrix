@@ -1,5 +1,3 @@
-//! Polymarket's page: the event directory, the CLOB and the CLOB stream.
-
 use app_config::{
     market_participants::{
         origins::{PolymarketClobOrigin, PolymarketGammaOrigin, PolymarketWebsocketOrigin},
@@ -22,30 +20,22 @@ use crate::{
     search::FieldSearch,
 };
 
-/// The id of this page's settings.
 const PAGE: &str = "market_participants.polymarket";
 
-/// The event directory row, as the search filter and the tests name it.
 const GAMMA_FIELD: &str = "market_participants.polymarket.gamma";
 
-/// The CLOB row, as the search filter and the tests name it.
 const CLOB_FIELD: &str = "market_participants.polymarket.clob";
 
-/// The CLOB stream row, as the search filter and the tests name it.
 const WEBSOCKET_FIELD: &str = "market_participants.polymarket.websocket";
 
-/// The id of the card this page's rows are drawn in.
 const SECTION_ID: &str = "market_participants.polymarket_0";
 
-/// The Polymarket page.
 pub(crate) struct VenuePage {
     host: SettingsHost,
     selects: Vec<VenueSelect>,
 }
 
 impl VenuePage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs
-    /// to.
     pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
         Self {
             host,
@@ -206,7 +196,6 @@ impl PageView for VenuePage {
     }
 }
 
-/// The search rows of the settings this page draws.
 pub(crate) fn search_fields(translate: &Translate) -> Vec<FieldSearch> {
     let venue = VenueId::Polymarket;
     let page_id = shared::page_id(&venue);

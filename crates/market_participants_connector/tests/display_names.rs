@@ -1,33 +1,3 @@
-//! The display names the real adapter path publishes, against the name table.
-//!
-//! Every name in this file is produced by the built-in routes of the four
-//! implemented venues from hand-written, protocol-shaped fixture answers served
-//! over a real socket to the real adapter code: the fixture below answers each
-//! request with the JSON the venue's own protocol defines — Binance's
-//! `exchangeInfo`, OKX's `instruments` and Hyperliquid's `info` — carrying the
-//! values those protocols carry, such as the OKX `ctVal = 0.01` that no name states.
-//! The built-in descriptors are registered against that origin and the catalog of
-//! each route is read through the market participants root's own catalogue exactly as the
-//! application reads it. No venue is contacted and no recorded venue response is
-//! replayed, so what these names prove is the shape of the real
-//! `catalog → route → adapter → canonical terms → publication` path and the strings it publishes for the routes registered today — not live venue
-//! acceptance, which is the limit this stage draws for itself. They are not a
-//! synthetic catalog handed to the naming gate either: the adapter itself parses
-//! each answer and builds the listings from it.
-//!
-//! Longbridge is the one row whose directory is not the venue's own origin: its
-//! listings come from the market participant's published symbol directory, so the row below is
-//! served by [`SymbolDirectoryFixture`] on the address the adapter's download dials,
-//! and its venue origin — which no catalog read touches — is the same fixture as the
-//! others.
-//!
-//! What this file is the outside view of: a canonical identity is a digest of its
-//! terms, so the adapter stages the terms it built beside every listing, and the
-//! publication that renders a name refuses the whole batch when one of them is
-//! missing. The venue-native spellings (`BTCUSDT`, `BTC-USDT`, `BTC-USDT-SWAP`,
-//! the Hyperliquid `@10` pair and the HIP-3 `xyz:ABC` coin) stay search aliases:
-//! none of them reaches a name.
-
 use std::{sync::Arc, time::Duration};
 
 use app_config::market_participants::fixture::{self, FixtureAddress};
@@ -57,42 +27,27 @@ use tokio::{
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The venue names the fixture routes belong to.
 const BINANCE: &str = "binance";
 const OKX: &str = "okx";
 const HYPERLIQUID: &str = "hyperliquid";
 const LONGBRIDGE: &str = "longbridge";
 
-/// The spot symbol Binance publishes for the row of the name table.
 const BINANCE_SPOT: &str = r#"{"timezone":"UTC","serverTime":1700000000000,"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","onboardDate":1500000000000,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","stepSize":"0.00001000","minQty":"0.00001000","maxQty":"9000.00000000"},{"filterType":"NOTIONAL","minNotional":"5.00000000"}]}]}"#;
 
-/// The USD-M perpetual Binance publishes for the row of the name table.
 const BINANCE_PERPETUAL: &str = r#"{"timezone":"UTC","serverTime":1700000000000,"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","marginAsset":"USDT","contractType":"PERPETUAL","onboardDate":1569398400000,"requiredMarginPercent":"2.0000","maintMarginPercent":"1.0000","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]}]}"#;
 
-/// The OKX spot instruments of the row of the name table.
 const OKX_SPOT: &str = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","baseCcy":"BTC","quoteCcy":"USDT","tickSz":"0.1","lotSz":"0.000001","minSz":"0.00001","maxLmtSz":"1000","state":"live","listTime":"1500000000000"}]}"#;
 
-/// The OKX swaps of the route: the linear contract of the name table and the
-/// inverse one whose settlement is converted through its own mark of the asset it
-/// tracks.
 const OKX_SWAP: &str = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","baseCcy":"","quoteCcy":"","settleCcy":"USDT","tickSz":"0.1","lotSz":"0.01","minSz":"0.01","maxLmtSz":"10000","ctVal":"0.01","ctType":"linear","uly":"BTC-USDT","instFamily":"BTC-USDT","state":"live"},{"instId":"BTC-USD-SWAP","baseCcy":"","quoteCcy":"","settleCcy":"BTC","tickSz":"1","lotSz":"0.1","minSz":"0.1","maxLmtSz":"10000","ctVal":"100","ctValCcy":"USD","ctType":"inverse","uly":"BTC-USD","instFamily":"BTC-USD","state":"live"}]}"#;
 
-/// The core perpetual DEX: its universe and the spot token it settles in.
 const HYPERLIQUID_CORE_META: &str = r#"{"universe":[{"name":"BTC","szDecimals":3,"maxLeverage":10}],"marginTables":[],"collateralToken":1}"#;
 
-/// The builder-deployed DEX: its coins carry the `{dex}:{coin}` form and it
-/// settles in a spot token of its own.
 const HYPERLIQUID_DEX_META: &str = r#"{"universe":[{"name":"xyz:ABC","szDecimals":3,"maxLeverage":10}],"marginTables":[],"collateralToken":0}"#;
 
-/// A second builder-deployed DEX that lists the core coin spelled the way a
-/// deployed scope spells it, and settles in the core collateral.
 const HYPERLIQUID_CORE_COIN_DEX_META: &str = r#"{"universe":[{"name":"abc:BTC","szDecimals":3,"maxLeverage":10}],"marginTables":[],"collateralToken":1}"#;
 
-/// The venue's spot token table and tradable pairs: the core pair of the name table is the
-/// `@10` pair, which exchanges the BTC token for the USDC token.
 const HYPERLIQUID_SPOT_META: &str = r#"{"tokens":[{"name":"USD","szDecimals":8,"index":0},{"name":"USDC","szDecimals":8,"index":1},{"name":"BTC","szDecimals":8,"index":2}],"universe":[{"name":"@10","tokens":[2,1],"index":10}]}"#;
 
-/// One request the fixture answers.
 struct FixtureRequest {
     method: SmolStr,
     path: SmolStr,
@@ -101,12 +56,10 @@ struct FixtureRequest {
 }
 
 impl FixtureRequest {
-    /// Returns whether the request addressed one path with one query parameter.
     fn asks(&self, path: &str, parameter: &str) -> bool {
         self.path == path && self.query.split('&').any(|pair| pair == parameter)
     }
 
-    /// Returns the JSON body the request carried, when it carried one.
     fn payload(&self) -> Option<serde_json::Value> {
         (!self.body.is_empty())
             .then(|| serde_json::from_str(self.body.as_str()).ok())
@@ -114,11 +67,6 @@ impl FixtureRequest {
     }
 }
 
-/// The answer one venue request is served with.
-///
-/// The fixture is the wire, not a stub of the adapter's own functions: every
-/// answer is selected by what the adapter's encoder asked for, on the path and
-/// with the JSON body that venues' own protocols define.
 fn answer_of(request: &FixtureRequest) -> Option<String> {
     match request.path.as_str() {
         "/api/v3/exchangeInfo" => Some(BINANCE_SPOT.to_owned()),
@@ -166,10 +114,6 @@ fn answer_of(request: &FixtureRequest) -> Option<String> {
     }
 }
 
-/// Serves one conversation of every venue endpoint the built-in routes read.
-///
-/// Every configured endpoint points at this one origin, so a request is answered
-/// by the path and body its own venue's protocol defines.
 async fn venue_fixture() -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -202,7 +146,6 @@ async fn venue_fixture() -> (String, JoinHandle<()>) {
     (format!("http://{address}"), task)
 }
 
-/// Reads one HTTP request and the JSON body it carried.
 async fn read_request(socket: &mut TcpStream) -> Option<FixtureRequest> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -247,14 +190,6 @@ async fn read_request(socket: &mut TcpStream) -> Option<FixtureRequest> {
     })
 }
 
-/// The market participants root every row of this file is published by.
-///
-/// Each venue named is configured as a venue: every scope it publishes — and every
-/// scope it deploys, which is reached through its own primary scope — resolves at the
-/// fixture origin, so the requests travel through the real gateway, registry and
-/// adapter dispatch without a live venue behind them. The configuration the root is
-/// built over is what carries those addresses, so one root per test dials its own
-/// fixture whatever any other test in this binary is doing.
 fn connector_with(venues: &[&str], origin: &str) -> (MarketParticipantsConnector, Arc<Catalog>) {
     let origin = url::Url::parse(origin).expect("the fixture origin is a URL");
     let fixture = fixture::venues(venues.iter().map(|venue| {
@@ -267,10 +202,6 @@ fn connector_with(venues: &[&str], origin: &str) -> (MarketParticipantsConnector
         &fixture,
     )));
     let notification = ConfigNotification::new(snapshot);
-    // The fixture speaks plain HTTP on a loopback socket, so the transport is
-    // built with the plaintext policy that a test owns; every other transport
-    // decision is the production one, and the venue requests below go through the
-    // same gateway, registry and adapter dispatch as a live run.
     let policy = TransportPolicy {
         allow_plaintext: true,
         extra_root_certificates: Vec::new(),
@@ -285,10 +216,6 @@ fn connector_with(venues: &[&str], origin: &str) -> (MarketParticipantsConnector
     (connector, catalog)
 }
 
-/// Loads the venues named through the load action itself.
-///
-/// Every route of a loaded venue is registered and its catalogs are loaded, so
-/// a row below is read through the same publication a pane reads.
 async fn connect(connector: &MarketParticipantsConnector, venues: &[VenueId]) {
     for venue in venues {
         timeout(SETUP_TIMEOUT, connector.load_venue(*venue))
@@ -298,7 +225,6 @@ async fn connect(connector: &MarketParticipantsConnector, venues: &[VenueId]) {
     }
 }
 
-/// One route of the built-in set.
 fn route(venue: &str, scope: &str) -> VenueRoute {
     VenueRoute::new(
         VenueId::from_name(venue).expect("the fixture venue is canonical"),
@@ -306,22 +232,12 @@ fn route(venue: &str, scope: &str) -> VenueRoute {
     )
 }
 
-/// The name one listing must come out as, and what must stay secondary.
 struct ExpectedRow {
-    /// The venue's own symbol of the listing this row is about.
     native: &'static str,
-    /// The name of the instrument the listing implements, which is the name the
-    /// listing carries.
     name: &'static str,
-    /// The venue-native spellings that may only appear as search aliases.
     secondary: &'static [&'static str],
 }
 
-/// Every row of the name table, on the route that publishes it.
-///
-/// The OKX perpetual is the live contract of the route and its venue states
-/// `ctVal = 0.01`, which no name mentions: a contract size is a term of the
-/// contract and not a clause of its name.
 fn design_table() -> [(VenueRoute, ExpectedRow); 8] {
     [
         (
@@ -369,8 +285,6 @@ fn design_table() -> [(VenueRoute, ExpectedRow); 8] {
             ExpectedRow {
                 native: "BTC",
                 name: "BTC/USDC:USDC",
-                // A coin is the name's own base, so the venue-native value of this
-                // row is its numeric asset index rather than a spelling.
                 secondary: &[],
             },
         ),
@@ -387,20 +301,12 @@ fn design_table() -> [(VenueRoute, ExpectedRow); 8] {
             ExpectedRow {
                 native: "AACG.US",
                 name: "AACG/USD",
-                // The directory's ticker is the name's own base, so the venue-native
-                // value of this row is the market-suffixed symbol rather than a
-                // spelling the name could carry.
                 secondary: &[],
             },
         ),
     ]
 }
 
-/// every built-in route publishes its row of the name table word for word.
-///
-/// The batch that carries one of these names carries the canonical terms the adapter
-/// translated out of the answer the fixture served: a batch that withheld them is
-/// refused by the publication gate, which is what its own refusal tests cover.
 #[tokio::test]
 async fn every_built_in_catalog_route_publishes_the_names_of_the_design_table() {
     let (origin, server) = venue_fixture().await;
@@ -435,13 +341,10 @@ async fn every_built_in_catalog_route_publishes_the_names_of_the_design_table() 
     server.abort();
 }
 
-/// The Hyperliquid venue identity.
 fn hyperliquid_venue() -> VenueId {
     VenueId::Hyperliquid
 }
 
-/// Asserts the published names of one listing and that its native spelling stayed
-/// a search alias.
 async fn assert_row(catalog: &Catalog, route: &VenueRoute, expected: &ExpectedRow) {
     let listings = catalog
         .listings(route)
@@ -493,12 +396,6 @@ async fn assert_row(catalog: &Catalog, route: &VenueRoute, expected: &ExpectedRo
     }
 }
 
-/// the inverse swap of the OKX route states the asset it settles in, which
-/// is the asset it tracks, and nothing about the conversion it performs.
-///
-/// The venue's own mark of BTC in USD is the rate that settlement converts through,
-/// and a conversion is a listing fact: the contract carries it, and its name does
-/// not state it.
 #[tokio::test]
 async fn an_inverse_swap_publishes_its_settlement_conversion_of_the_same_reference() {
     let (origin, server) = venue_fixture().await;
@@ -551,19 +448,6 @@ async fn an_inverse_swap_publishes_its_settlement_conversion_of_the_same_referen
     server.abort();
 }
 
-/// the same economic terms of two routes are one instrument, and
-/// the route is what tells the two listings apart.
-///
-/// The `abc` DEX below lists the core coin under the `{dex}:{coin}` spelling the
-/// venue reserves for builder-deployed assets and settles in the core collateral,
-/// so its contract and the core perpetual are the same canonical terms. The two
-/// listings share one `InstrumentId` and one `PriceReferenceId` and publish one
-/// economic name under two routes; the `xyz` DEX, which tracks another asset quoted
-/// in another asset, names a second reference and therefore a second instrument.
-///
-/// The canonical base of the deployed listing is the coin and not the coin's DEX
-/// prefix: a deployed scope is a listing route and never part of an economic
-/// identity.
 #[tokio::test]
 async fn a_deployed_dex_coin_shares_the_economic_instrument_of_the_core_coin() {
     let (origin, server) = venue_fixture().await;
@@ -610,8 +494,6 @@ async fn a_deployed_dex_coin_shares_the_economic_instrument_of_the_core_coin() {
         "the venue's own deployed coin stays a search alias"
     );
 
-    // Both contracts track one reference: the venue's own mark of the coin quoted
-    // in the collateral, which is what its terms are.
     let generation = catalog.generation();
     let reference_of = |listing: &market_participants_connector::catalog::batch::CatalogEntry| {
         let market_participants_model::instrument::InstrumentTerms::Perpetual(terms) =
@@ -632,9 +514,6 @@ async fn a_deployed_dex_coin_shares_the_economic_instrument_of_the_core_coin() {
         core_reference,
         "another tracked asset quoted in another asset is another reference"
     );
-    // Every reference a listing names is registered with the terms its identity was
-    // derived from, which is what the adapter staged beside the listing: a
-    // reference without registered terms refuses the publication.
     assert!(
         generation
             .references()
@@ -647,10 +526,6 @@ async fn a_deployed_dex_coin_shares_the_economic_instrument_of_the_core_coin() {
         "the terms of both references reached the registry of the generation"
     );
 
-    // The canonical base asset of a deployed listing is the coin alone: the DEX
-    // prefix is the deployed scope's namespace and not part of the asset. That is
-    // what makes the deployed `abc:BTC` contract the core `BTC` contract and not a
-    // second asset named after the DEX.
     for (listing, code) in [(&deployed_listing, "BTC"), (&other_listing, "ABC")] {
         let market_participants_model::instrument::InstrumentTerms::Perpetual(terms) =
             listing.instrument.terms()
@@ -682,7 +557,6 @@ async fn a_deployed_dex_coin_shares_the_economic_instrument_of_the_core_coin() {
     server.abort();
 }
 
-/// Reads the catalog of one route and returns the entry of one native symbol.
 async fn listing_named(
     catalog: &Catalog,
     route: &VenueRoute,
@@ -704,8 +578,6 @@ async fn listing_named(
         .clone()
 }
 
-/// the venue's own spelling of a Hyperliquid pair is a search alias
-/// of its listing and never part of its name.
 #[tokio::test]
 async fn the_hyperliquid_asset_index_of_a_listing_stays_a_search_alias() {
     let (origin, server) = venue_fixture().await;

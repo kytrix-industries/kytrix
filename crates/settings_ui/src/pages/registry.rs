@@ -1,9 +1,3 @@
-//! Every page the settings offer, and the search index over them.
-//!
-//! This is navigation metadata, not a description of a page's UI: a page is named, placed in the
-//! sidebar and given the words a search reaches it by, and its module draws the page itself. A new
-//! setting is added in the page module that holds it; only a new page is added here.
-
 use i18n::translate::Translate;
 use market_participants_connector::venue::definition::supported_venues;
 use market_participants_model::identifier::VenueId;
@@ -18,10 +12,8 @@ use crate::{
     search::{PageSearch, SearchFilter, SearchNode, words},
 };
 
-/// The page the settings open on.
 pub(crate) const DEFAULT_PAGE: &str = "appearance";
 
-/// One page of the settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PageId {
     Appearance,
@@ -34,7 +26,6 @@ pub(crate) enum PageId {
 }
 
 impl PageId {
-    /// The id a selection and a search both name this page by.
     pub(crate) fn id(self) -> SmolStr {
         match self {
             Self::Appearance => SmolStr::new_static("appearance"),
@@ -47,7 +38,6 @@ impl PageId {
         }
     }
 
-    /// The name this page is drawn with.
     pub(crate) fn title(self, translate: &Translate) -> SmolStr {
         match self {
             Self::Appearance => i18n::t_smol!(translate, "settings_ui.appearance.title"),
@@ -62,7 +52,6 @@ impl PageId {
         }
     }
 
-    /// The text this page and its settings are searched by.
     pub(crate) fn search(self, translate: &Translate) -> PageSearch {
         match self {
             Self::Appearance => appearance::search(translate),
@@ -92,7 +81,6 @@ impl PageId {
     }
 }
 
-/// One heading of the sidebar and the pages under it.
 pub(crate) struct Group {
     pub id: &'static str,
     pub label_key: &'static str,
@@ -100,7 +88,6 @@ pub(crate) struct Group {
     pub pages: Vec<PageId>,
 }
 
-/// The groups of the sidebar, in the order it draws them.
 pub(crate) fn groups() -> Vec<Group> {
     vec![
         Group {
@@ -137,12 +124,10 @@ pub(crate) fn groups() -> Vec<Group> {
     ]
 }
 
-/// The pages drawn after the groups rather than inside one.
 pub(crate) fn root_pages() -> Vec<PageId> {
     vec![PageId::About]
 }
 
-/// Every page, in the order the sidebar offers them.
 pub(crate) fn pages() -> Vec<PageId> {
     groups()
         .into_iter()
@@ -151,7 +136,6 @@ pub(crate) fn pages() -> Vec<PageId> {
         .collect()
 }
 
-/// The page one id names, or nothing for an id no page stands for.
 pub(crate) fn page(id: &str) -> Option<PageId> {
     match id {
         "appearance" => Some(PageId::Appearance),
@@ -168,11 +152,6 @@ pub(crate) fn page(id: &str) -> Option<PageId> {
     }
 }
 
-/// Whether one page is reachable through the current query.
-///
-/// A page is reached by its own label and keywords, or through any setting it holds: a query that
-/// names a setting on a page is a query that can open that page, and the page draws only the
-/// settings that matched.
 pub(crate) fn page_is_reachable(
     page: PageId,
     filter: &SearchFilter,
@@ -187,14 +166,12 @@ pub(crate) fn page_is_reachable(
             .any(|field| filter.admits_field(id.as_ref(), field.id.as_ref()))
 }
 
-/// The first page a filter leaves reachable, in the order the sidebar draws them.
 pub(crate) fn first_admitted_page(filter: &SearchFilter, translate: &Translate) -> Option<PageId> {
     pages()
         .into_iter()
         .find(|page| page_is_reachable(*page, filter, translate))
 }
 
-/// The search index the sidebar and the pages are filtered by.
 pub(crate) fn search_nodes(translate: &Translate) -> Vec<SearchNode> {
     let mut nodes = Vec::new();
 
@@ -233,10 +210,6 @@ fn page_node(page: PageId, translate: &Translate) -> SearchNode {
     }
 }
 
-/// Opens the page one id names, the way a page switch opens it.
-///
-/// The two views that own their layout — the translation page and the proxy catalog — are values of
-/// their own; the pages that are a list of setting rows are built by their module.
 pub(crate) fn page_view(page: PageId, host: &SettingsHost, key: &str) -> Box<dyn PageView> {
     match page {
         PageId::Appearance => Box::new(appearance::AppearancePage::new(host.clone(), key)),

@@ -1,12 +1,3 @@
-//! The fake auth fixtures this crate's tests share: an in-memory credential store and
-//! authorities that answer every request themselves, without a network.
-//!
-//! The module is also compiled with the `test-support` feature, because the signed-out
-//! session the connector's `install_for_test` builds is constructed from the store and
-//! authority here. Only those two and the `cfg`-gated `AuthSession` constructors in
-//! `auth::session` are needed outside `cfg(test)`; every other fixture below stays
-//! test-only.
-
 #[cfg(test)]
 use std::sync::Arc;
 pub(crate) use std::sync::atomic::Ordering;
@@ -52,10 +43,6 @@ pub(crate) use crate::auth::session::AuthSession;
 #[cfg(test)]
 use crate::test_support::test_handle;
 
-/// The transport policy every test session shares.
-///
-/// Production callers construct their own policy; tests reach the loopback
-/// `/oauth` and `/rpc` fixtures over `http://` and `ws://`.
 #[cfg(test)]
 pub(crate) fn test_transport_policy() -> TransportPolicy {
     TransportPolicy {
@@ -64,7 +51,6 @@ pub(crate) fn test_transport_policy() -> TransportPolicy {
     }
 }
 
-/// Builds the plaintext-tolerant transport that policy backs.
 #[cfg(test)]
 pub(crate) fn test_transport() -> Arc<TransportHub> {
     Arc::new(TransportHub::new(test_transport_policy()))
@@ -840,9 +826,6 @@ pub(super) fn test_session_with_authority_and_control(
 mod tests {
     use super::*;
 
-    /// The session the UI tests' connector installs starts with nothing: the store is
-    /// empty, so the status has no available or unavailable record to report, the
-    /// in-memory session has no plan, and no startup refresh has asked the authority.
     #[tokio::test]
     async fn the_signed_out_test_session_should_start_without_a_credential() {
         let session =

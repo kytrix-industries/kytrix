@@ -1,9 +1,3 @@
-//! 读回：persist（Private）/ 图集 texture array 的某一层 → blit 到 Shared buffer → `getBytes`
-//! 语义的 CPU 读取
-//!
-//! 字节语义与 D3D12 同契约：`BGRA8Unorm_sRGB` 的存储字节是 **sRGB 编码后的预乘值**，
-//! 读回后只做 BGRA→RGBA 交换（不再做色彩转换）。仅测试 / `test-support` 构建存在。
-
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLOrigin,
@@ -18,14 +12,12 @@ use crate::{
     },
 };
 
-/// 读回的一帧像素（RGBA8，预乘，sRGB 编码字节）。
 pub(crate) struct ReadbackImage {
     pub width: u32,
     pub height: u32,
     pub rgba8: Vec<u8>,
 }
 
-/// 复用的 staging buffer（容量按 surface 的 `row_pitch * height`）。
 pub(crate) struct Readback {
     staging: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     capacity: usize,
@@ -39,9 +31,6 @@ impl Readback {
         }
     }
 
-    /// persist(Private) → blit 到 Shared buffer → 逐行去 padding → BGRA→RGBA。
-    ///
-    /// `layer` 是 texture array 的层号（非数组纹理传 0；D-9-c 的图集读回按层验证）。
     pub(crate) fn capture(
         &mut self,
         device: &Device,
@@ -67,8 +56,6 @@ impl Readback {
         let blit = buffer
             .blitCommandEncoder()
             .ok_or_else(|| init_error("readback", "blitCommandEncoder returned nil"))?;
-        // SAFETY: 源纹理与目标 buffer 都由本结构独占；尺寸与行 pitch 在两者容量内；
-        // `layer` 由调用方保证在源 texture array 的层数内。
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
                 texture,
@@ -100,7 +87,6 @@ impl Readback {
         }
 
         let mut rgba8 = vec![0u8; total];
-        // SAFETY: staging 至少 total 字节（上方按 total 分配/扩容）；映射是 CPU 可见的 shared 内存。
         unsafe {
             std::ptr::copy_nonoverlapping(
                 staging.contents().as_ptr().cast::<u8>(),

@@ -1,10 +1,3 @@
-//! HIP-4 event market data.
-//!
-//! The venue publishes outcome metadata and a template table rather than a
-//! catalog. A question is a set of named outcomes that settle together; a
-//! standalone outcome is one binary or scalar question. Both are decoded from the
-//! metadata the venue load committed, so an event view never reaches the venue.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::{SystemTime, UNIX_EPOCH},
@@ -45,21 +38,12 @@ use crate::{
     venue::metadata::{OutcomeRouteMeta, ScopeMetadata},
 };
 
-/// The most events one page can carry.
 const PAGE_LIMIT: usize = 500;
 
-/// The most options one card draws.
 const CARD_OPTIONS: usize = 6;
 
-/// The most candles the venue answers one snapshot with.
-///
-/// The venue applies this cap itself; it is not encoded in the API document this
-/// adapter reads, so the number is a documented approximation of the venue's
-/// behaviour rather than a verified contract. It only bounds how far back the
-/// whole-life range asks from.
 const HYPERLIQUID_CANDLE_LIMIT: i64 = 5_000;
 
-/// Reads one page of HIP-4 events from the loaded metadata.
 pub(crate) async fn events(
     context: &ExecutionContext,
     query: &PredictionEventsQuery,
@@ -122,7 +106,6 @@ pub(crate) async fn events(
     })
 }
 
-/// Reads one event from the loaded metadata, without a network request.
 pub(crate) fn event(
     context: &ExecutionContext,
     query: &PredictionEventQuery,
@@ -148,7 +131,6 @@ pub(crate) fn event(
     Err(not_found(native))
 }
 
-/// Reads probability series for the requested legs.
 pub(crate) async fn series(
     context: &ExecutionContext,
     query: &PredictionSeriesQuery,
@@ -163,14 +145,11 @@ pub(crate) async fn series(
     .await
 }
 
-/// One of the venue's candle intervals: the name the venue knows it by and its
-/// width.
 struct CandleInterval {
     name: SmolStr,
     millis: i64,
 }
 
-/// Maps a requested bucket width to one of the venue's candle intervals.
 fn candle_interval(fidelity_minutes: u16) -> CandleInterval {
     let (name, millis) = match fidelity_minutes {
         0..=1 => ("1m", 60_000),
@@ -201,8 +180,6 @@ async fn history(
 ) -> Result<Vec<PredictionSeries>, MarketParticipantError> {
     let end = now_millis()?;
     let interval = candle_interval(fidelity_minutes);
-    // The venue caps an answer at [`HYPERLIQUID_CANDLE_LIMIT`] candles, so a
-    // range with no lower bound asks for exactly that many and no further.
     let start = match span {
         Some(span) => end.saturating_sub(span.max(1)),
         None => end.saturating_sub(HYPERLIQUID_CANDLE_LIMIT.saturating_mul(interval.millis)),
@@ -366,9 +343,6 @@ fn question_view(
         let occurrence = used_labels.entry(label.clone()).or_default();
         *occurrence += 1;
         if *occurrence > 1 {
-            // A member identity is derived from its label, so two outcomes with
-            // the same rendered name would make the group invalid. Keep both
-            // options and make the repeated name readable and stable.
             label = SmolStr::new(format_smolstr!("{label} ({occurrence})"));
         }
         native_sides.insert(
@@ -595,8 +569,6 @@ fn categories_of(cards: &[PredictionEventCard]) -> Vec<PredictionCategory> {
 fn settlement_asset(
     quote_token: Option<&str>,
 ) -> Result<market_participants_model::asset::AssetId, MarketParticipantError> {
-    // HIP-4 settles in the outcome's quote token. The live core markets all use
-    // USDC, which is also the fallback when the venue omits the field.
     super::catalog::token_asset(quote_token.unwrap_or("USDC")).map(|terms| terms.asset_id())
 }
 
@@ -635,15 +607,10 @@ fn render_outcome_name(
     if is_fallback_outcome(outcome) {
         return SmolStr::new_static("Other");
     }
-    // An outcome's own description carries placeholders the question does not,
-    // such as `participant` for a team in a contest. The question's pairs remain
-    // the base so a template can still read a shared field from it.
     let mut values = pairs.clone();
     let own = description_pairs(&outcome.description);
     values.extend(own.clone());
     let template = template_of(meta, &outcome.name);
-    // Only the outcome's own description decides a machine-readable title; the
-    // question's `class` describes the question, not each of its members.
     let name = description_title(&own)
         .or_else(|| {
             template
@@ -661,17 +628,10 @@ fn render_outcome_name(
     truncate_question(name)
 }
 
-/// Whether an outcome is the fallback member of a multi-outcome question.
 fn is_fallback_outcome(outcome: &HyperliquidOutcomeSpec) -> bool {
     outcome.name == "template fallback" || outcome.description == "other"
 }
 
-/// Renders the machine-readable description the core recurring markets use.
-///
-/// The core `outcomeMeta` entries have no template name: a price-binary outcome
-/// is called `Recurring` and its description carries the asset and target. Using
-/// only the name would collapse every core market into one title and, because a
-/// group identity is derived from that title, into one group identity.
 fn description_title(pairs: &BTreeMap<SmolStr, SmolStr>) -> Option<SmolStr> {
     let class = pairs.get("class")?.as_str();
     let asset = pairs
@@ -704,7 +664,6 @@ fn description_title(pairs: &BTreeMap<SmolStr, SmolStr>) -> Option<SmolStr> {
     }
 }
 
-/// Names one price-bucket member from the question's ordered thresholds.
 fn bucket_label(asset: &str, thresholds: &[SmolStr], index: usize) -> Option<SmolStr> {
     let upper = thresholds.get(index);
     let lower = index.checked_sub(1).and_then(|index| thresholds.get(index));
@@ -945,8 +904,6 @@ mod tests {
         assert_eq!(options.len(), 2);
     }
 
-    /// A participant template reads the outcome's own description, not only the
-    /// question's; otherwise every team would render as the literal `{participant}`.
     #[test]
     fn a_question_outcome_reads_its_own_description_for_template_placeholders() {
         let mut alpha = outcome(11, "template:sportsContestParticipant2");
@@ -998,9 +955,6 @@ mod tests {
         assert!(labels.contains(&"Beta"));
     }
 
-    /// A venue can publish two outcomes whose rendered names collide. Their member
-    /// identities are label-derived, so the group must disambiguate them rather
-    /// than reject the whole event.
     #[test]
     fn repeated_outcome_names_stay_distinct_and_valid() {
         let meta = OutcomeRouteMeta {
@@ -1175,8 +1129,6 @@ mod tests {
 
     #[test]
     fn the_whole_life_range_reaches_back_one_venue_candle_cap() {
-        // The whole-life range has no lower bound of its own, so its reach is
-        // the venue's candle cap at the interval the fidelity selects.
         assert_eq!(
             super::HYPERLIQUID_CANDLE_LIMIT * super::candle_interval(720).millis,
             5_000 * 12 * 3_600_000

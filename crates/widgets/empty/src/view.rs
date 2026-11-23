@@ -1,48 +1,3 @@
-//! The pane that has nothing yet: the hint that a widget is chosen from the pane's own
-//! controls.
-//!
-//! This is the widget a pane falls back to. A pane the user has not given a widget, a
-//! pane split off its neighbour, and a pane whose stored widget this build no longer has
-//! all show it, so it is the one state every pane starts from. It is registered like any
-//! other widget — a pane is restored by ID, so the fallback has to be creatable by ID —
-//! but it is not offered for selection: the gallery lists the widgets a user may pick,
-//! and this is what a pane shows instead of one of them.
-//!
-//! # The smallest a widget can be
-//!
-//! This pane is the contract's minimal shape, and it is deliberately the one widget with
-//! no data source of its own: it reports the hint and draws nothing else.
-//!
-//! - [`WidgetView::new`] only keeps the state cell; it starts no work and reports
-//!   nothing.
-//! - [`WidgetView::load`] reports the hint as a [`Notice`] — a catalogue reference, not
-//!   a sentence. There is nothing to wait for, so the pane leaves `Connecting` on that
-//!   one report and never reports another state.
-//! - [`WidgetView::has_content`] is always `false`: the hint *is* the pane's content, and
-//!   a pane with nothing of its own to show is exactly what the framework's stand-in
-//!   draws.
-//! - [`WidgetView::body`] is therefore never reached; it is implemented empty because the
-//!   contract requires the method, not because the pane has a body.
-//! - there is no `sync`, `header` or `release` work: the pane owns no kit component, no
-//!   action key, no timer and no node of its own, so the trait's no-op defaults are the
-//!   whole of those phases.
-//!
-//! # Why the pane does not draw the hint itself
-//!
-//! The copy names the control the user has to reach for, at the top right of the pane's
-//! own header. The catalogue authors it as rich text: the button's name is bound by the
-//! same `<kbd>` the rest of the interface uses for keys, and the control's own puzzle
-//! icon precedes it, so the sentence points at the control the way the control is drawn.
-//!
-//! A widget with nothing to show and a notice to say instead of it is the framework's
-//! `Waiting` placeholder, and that placeholder resolves the notice in the language
-//! showing on the frame that draws it, handing a rich one to the markdown component
-//! (`crates/widget/src/ui/placeholder.rs`, decided by [`Notice::is_markdown`]). So the
-//! pane holds no copy and parses no markdown: a language switch invalidates the surface,
-//! which rebuilds the stand-in in the language now showing. What is left of the widget is
-//! the contract itself, which is what makes this crate the skeleton the content widgets
-//! grow from.
-
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use serde::{Deserialize, Serialize};
 use ui_core::{error::EngineError, node::id::NodeId};
@@ -55,14 +10,8 @@ use widget::{
     view::{ReloadHandle, WidgetView},
 };
 
-/// The message the hint is read from.
-///
-/// It is a catalogue key, not copy: the surface resolves it on the frame that draws it,
-/// in the language showing then.
 const HINT: &str = "widget.empty.hint";
 
-/// The pane persists nothing about this widget; the type exists because every widget
-/// carries the schema version its config is stored under.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EmptyConfig;
 
@@ -70,10 +19,6 @@ impl WidgetConfig for EmptyConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// The pane nothing has been chosen for.
-///
-/// There is nothing to keep but the state cell: the pane owns no data, no component and
-/// no node.
 pub struct EmptyWidget {
     status: WidgetStatus,
 }
@@ -84,8 +29,6 @@ impl WidgetView for EmptyWidget {
     const ID: WidgetId = WidgetId::new_static("kytrix.empty");
     const DISPLAY_NAME: &'static str = "widget.names.empty";
     const CATEGORY: WidgetCategory = WidgetCategory::Market;
-    /// The framework builds this widget; it is never something the user picks, so the
-    /// gallery does not list it.
     const SELECTABLE: bool = false;
 
     fn new(
@@ -97,31 +40,18 @@ impl WidgetView for EmptyWidget {
         _recovery: WidgetAction,
         _cx: &mut WidgetCx<'_>,
     ) -> Result<Self, EngineError> {
-        // The pane has nothing to wait for and nothing to fail at, so the state cell is
-        // the whole of its construction; the framework calls `load` once this returns.
         Ok(Self { status })
     }
 
-    /// A pane with nothing to read has nothing to wait for: it is ready the moment it
-    /// exists, and the one thing it has to say is the hint.
-    ///
-    /// The notice is a catalogue reference, so this report does not have to be repeated
-    /// when the language moves: the surface resolves the key in the language showing on
-    /// the frame that draws it.
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
         self.status
             .report(cx.app_mut(), WidgetState::waiting(Notice::message(HINT)));
     }
 
-    /// The hint is the pane's whole content, and the framework draws it: this widget
-    /// never has a body of its own.
     fn has_content(&self) -> bool {
         false
     }
 
-    /// Never called: [`has_content`](WidgetView::has_content) is `false`, so the framework
-    /// always presents the hint instead of building a body. The contract requires the
-    /// method, and a widget with content of its own builds that subtree here.
     fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         Ok(())
     }
@@ -144,8 +74,6 @@ mod tests {
 
     use super::{EmptyConfig, EmptyWidget, HINT};
 
-    /// The translator the product ships: the hint is catalogue copy, so these tests
-    /// assert what the reader actually gets.
     fn product_translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -153,12 +81,10 @@ mod tests {
         )
     }
 
-    /// The framework's headless host, over the product catalogue.
     fn harness() -> WidgetTestApp {
         WidgetTestApp::with_translate(product_translate(LanguageCode::En))
     }
 
-    /// The hint's sentence in `language`.
     fn hint_in(language: LanguageCode) -> String {
         let translate = product_translate(language);
         t_smol!(&translate, HINT).to_string()
@@ -203,8 +129,6 @@ mod tests {
         assert_eq!(decode_or_default::<EmptyConfig>(None), EmptyConfig);
     }
 
-    /// A missing key is an empty string on screen rather than an error, so a gap in the
-    /// catalogue is what a typo looks like: this is the test that turns it into a failure.
     #[test]
     fn every_message_this_widget_shows_should_resolve_to_text() {
         for language in [LanguageCode::En, LanguageCode::ZhCn] {
@@ -224,8 +148,6 @@ mod tests {
         let mut harness = harness();
         let widget = harness.mount::<EmptyWidget>(EmptyConfig);
 
-        // Registration: the framework built the surface and ran the first load. There is
-        // nothing to wait for, so the pane goes straight from `Connecting` to the hint.
         assert_eq!(
             harness.tree().debug_id(widget.surface()),
             Some("WIDGET_SURFACE")
@@ -271,8 +193,6 @@ mod tests {
         );
         assert!(harness.rendered(), "the hint is what the frame painted");
 
-        // The widget has no body of its own, so the content slot the framework offers it
-        // is hidden and stays empty.
         let content = harness
             .find_by_debug_prefix(surface, "WIDGET_CONTENT")
             .expect("the surface's content slot exists");
@@ -292,8 +212,6 @@ mod tests {
         );
     }
 
-    /// The pane has nothing that changes on its own: once the hint is up, a frame paints
-    /// nothing, asks for nothing and rebuilds nothing (I3).
     #[test]
     fn the_pane_should_ask_for_no_frames_once_the_hint_is_up() {
         let mut harness = harness();
@@ -323,8 +241,6 @@ mod tests {
         assert_eq!(harness.text_of(placeholder), text);
     }
 
-    /// The hint follows a language chosen after the pane was mounted: the widget reports a
-    /// catalogue reference, and the surface redraws it in the language showing now.
     #[test]
     fn the_hint_should_follow_a_language_chosen_after_the_pane_was_mounted() {
         let mut harness = harness();
@@ -372,9 +288,6 @@ mod tests {
         );
     }
 
-    /// Two panes on one application: each has its own surface, both show the hint, and
-    /// one pane's release leaves the other's surface and state alone (the pane owns no
-    /// kit key, so there is no action identity to collide over either).
     #[test]
     fn two_panes_should_show_the_hint_side_by_side() {
         let mut harness = harness();
@@ -394,7 +307,6 @@ mod tests {
         assert!(harness.visible(first_placeholder));
         assert!(harness.visible(second_placeholder));
 
-        // One language write reaches both panes on the frame it schedules.
         harness.switch_language(LanguageCode::ZhCn);
         harness.drain();
         for placeholder in [first_placeholder, second_placeholder] {
@@ -425,10 +337,6 @@ mod tests {
         );
     }
 
-    /// Releasing a pane gives back everything the mount took: its nodes, its frame route
-    /// and its value slots. Release is idempotent, and mounting again reuses the slots
-    /// instead of growing the table (a leaked pane shows up in `live`, a table that only
-    /// ever appends in `slots`).
     #[test]
     fn releasing_the_pane_should_leave_nothing_behind() {
         let mut harness = harness();
@@ -465,8 +373,6 @@ mod tests {
             "a second release is a no-op"
         );
 
-        // The first mount grew the table to the pane's peak; every later round has to
-        // reuse those slots instead of growing it further.
         let released = harness.signal_slot_stats();
         for _ in 0..8 {
             let widget = harness.mount::<EmptyWidget>(EmptyConfig);

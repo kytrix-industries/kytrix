@@ -1,24 +1,7 @@
-//! swapchain / 设备选择的**纯决策**（R11-7 / R11-8 / R11-9 / R11-13 / R11-15）。
-//!
-//! 本模块不碰任何 Vulkan 句柄：输入是 `vkGetPhysicalDeviceSurface*` 的**查询结果**（值类型），
-//! 输出是「该建什么链 / 该不该重建 / 该选哪张卡」。放在一起的唯一理由：这四类判断互为前提
-//! （extent 依赖 transform 与 caps，重建必要性依赖一次成功建链的全部参数，选卡依赖能不能建链），
-//! 分散到 `swapchain.rs` / `device.rs` 里就必然出现两份不一致的判断（旧实现正是如此：
-//! `swapchain.rs` 判 format / present mode，`device.rs` 只看 `device_type` 打分）。
-//!
-//! 每一项都在本文件底部有单元测试（Linux 目标：`cargo test -p ui_core --all-features`）。
-
 use smol_str::SmolStr;
 
 use crate::render::{frame::MAX_FRAMES_IN_FLIGHT, linux::pipeline::RENDER_FORMAT};
 
-/// swapchain 建链的全部参数（**一次成功建链的事实**）。
-///
-/// 两个用途：
-/// 1. `GpuCaps::describe()` 把它写进诊断行（旧实现完全不记录 swapchain 的格式 / 色彩空间，
-///    「HDR 合成器上整屏偏色」只能靠猜）；
-/// 2. `SUBOPTIMAL` / `OUT_OF_DATE` 的重建必要性判断（R11-7）：只有这些字段真的变了才重建，
-///    否则会退化成「每帧重建」自旋。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SwapchainKey {
     pub extent: (u32, u32),
@@ -30,11 +13,8 @@ pub(crate) struct SwapchainKey {
     pub image_count: u32,
 }
 
-/// `currentExtent` 的「应用决定尺寸」哨兵值（`0xFFFFFFFF`）。
 pub(crate) const EXTENT_SENTINEL: u32 = u32::MAX;
 
-/// 90°/270° 的 transform 会让宽高互换（`vkGetPhysicalDeviceSurfaceCapabilitiesKHR` 的约定：
-/// `min/max/currentImageExtent` 都是**旋转前**的尺寸，而旋转 90° 后屏幕上的宽高互换）。
 pub(crate) fn transform_swaps_axes(transform: ash::vk::SurfaceTransformFlagsKHR) -> bool {
     transform.intersects(
         ash::vk::SurfaceTransformFlagsKHR::ROTATE_90
@@ -42,10 +22,6 @@ pub(crate) fn transform_swaps_axes(transform: ash::vk::SurfaceTransformFlagsKHR)
     )
 }
 
-/// 按 `preTransform` 把「屏幕上的逻辑像素尺寸」换成「image 的尺寸」。
-///
-/// 旋转 90°/270° 时 image 的宽高是屏幕上的高宽（合成器自己做旋转），提交给
-/// `VkSwapchainCreateInfoKHR::imageExtent` 的必须是 image 的尺寸。
 pub(crate) fn image_extent_for_transform(
     logical: (u32, u32),
     pre_transform: ash::vk::SurfaceTransformFlagsKHR,
@@ -57,16 +33,6 @@ pub(crate) fn image_extent_for_transform(
     }
 }
 
-/// 计算 `VkSwapchainCreateInfoKHR::imageExtent`（R11-9）。
-///
-/// 三条规则（逐字对齐规范）：
-/// 1. `currentExtent != 0xFFFFFFFF` ⇒ **必须**用它：surface 决定了尺寸，应用的自选值会被判
-///    `SUBOPTIMAL`（持续 SUBOPTIMAL + 无条件重建 = 每帧重建自旋，R11-7 的触发条件之一）。
-/// 2. `0xFFFFFFFF`（Wayland 常见）⇒ 用请求值，并按 `min/maxImageExtent` 夹紧
-///    （越界会被 `vkCreateSwapchainKHR` 拒绝）。
-/// 3. 请求值先按 `preTransform` 换轴。
-///
-/// 返回 `None` 表示 caps 退化（`min > max`），调用方必须报强类型错误而不是硬建链。
 pub(crate) fn choose_extent(
     current_extent: (u32, u32),
     min_extent: (u32, u32),
@@ -75,7 +41,6 @@ pub(crate) fn choose_extent(
     pre_transform: ash::vk::SurfaceTransformFlagsKHR,
 ) -> Option<(u32, u32)> {
     if current_extent.0 != EXTENT_SENTINEL && current_extent.1 != EXTENT_SENTINEL {
-        // surface 已经决定：即使与请求值不同也必须遵从（否则永久 SUBOPTIMAL）。
         return Some((current_extent.0.max(1), current_extent.1.max(1)));
     }
     if min_extent.0 > max_extent.0 || min_extent.1 > max_extent.1 {
@@ -88,11 +53,6 @@ pub(crate) fn choose_extent(
     ))
 }
 
-/// `minImageCount` 的选择（R11-15）。
-///
-/// 规则：**至少** `minImageCount`，且至少 `MAX_FRAMES_IN_FLIGHT`（否则下一帧的 acquire 会先于
-/// 前一帧的 fence 阻塞 —— 不是错误，是白丢性能），再按 `maxImageCount`（0 = 无上限）夹紧。
-/// `minImageCount + 1` 是「多一张缓冲」的常规做法（避免 present 与 acquire 抢同一张）。
 pub(crate) fn choose_image_count(min_image_count: u32, max_image_count: u32) -> u32 {
     let wanted = min_image_count
         .saturating_add(1)
@@ -103,15 +63,6 @@ pub(crate) fn choose_image_count(min_image_count: u32, max_image_count: u32) -> 
     }
 }
 
-/// 选 surface format（R11-8）：**format 与 colorSpace 必须同时匹配**引擎的呈现契约。
-///
-/// `VkSurfaceFormatKHR` 是 (format, colorSpace) 二元组：同一个 `B8G8R8A8_SRGB` 可以报
-/// `SRGB_NONLINEAR`、`EXTENDED_SRGB_LINEAR`、`HDR10_ST2084`、`DISPLAY_P3`。旧实现只看 format、
-/// 把合成器给的 colorSpace 原样透传，于是 HDR 合成器上我们写入的 sRGB 字节被按 PQ/HLG 解释，
-/// 整屏亮度 / 对比度错误 —— 这是**只会在 Linux 上出现**的跨后端不一致。
-///
-/// 找不到精确匹配时返回 `None`（D8 硬基线：不做「format 对但色彩空间不对」的降级，那等于
-/// 明知会偏色还继续）。
 pub(crate) fn choose_surface_format(
     formats: &[ash::vk::SurfaceFormatKHR],
     color_space: impl Fn(ash::vk::ColorSpaceKHR) -> bool,
@@ -122,10 +73,6 @@ pub(crate) fn choose_surface_format(
         .copied()
 }
 
-/// present mode：Wayland surface 必须报告 `MAILBOX`（最新帧替换待呈现帧，与「最新帧槽」同构）。
-///
-/// 返回 `None` 表示不满足基线（不做 FIFO 静默回退：FIFO 会让「丢帧 + 合并 damage」的语义
-/// 变成「排队」，与引擎的帧模型冲突）。
 pub(crate) fn choose_present_mode(
     modes: &[ash::vk::PresentModeKHR],
 ) -> Option<ash::vk::PresentModeKHR> {
@@ -134,10 +81,6 @@ pub(crate) fn choose_present_mode(
         .then_some(ash::vk::PresentModeKHR::MAILBOX)
 }
 
-/// composite alpha：只能从 `supportedCompositeAlpha` 里挑（很多合成器只给 OPAQUE/INHERIT）。
-///
-/// 优先级：OPAQUE > INHERIT > PRE_MULTIPLIED > POST_MULTIPLIED（前两个在 Wayland 上语义
-/// 完全相同；PRE/POST 会让合成器再做一次混合，与引擎「persist 已是不透明结果」的假设不符）。
 pub(crate) fn choose_composite_alpha(
     supported: ash::vk::CompositeAlphaFlagsKHR,
 ) -> Option<ash::vk::CompositeAlphaFlagsKHR> {
@@ -152,63 +95,37 @@ pub(crate) fn choose_composite_alpha(
     .find(|candidate| supported.contains(*candidate))
 }
 
-/// 建链必需的 usage：`COLOR_ATTACHMENT`（渲染）与 `TRANSFER_DST`（persist → image）。
-///
-/// 函数而不是常量：ash 的位标志类型只提供 `BitOr`（不是 `const fn`），常量表达式里拼不出来。
 pub(crate) fn required_usage() -> ash::vk::ImageUsageFlags {
     ash::vk::ImageUsageFlags::COLOR_ATTACHMENT | ash::vk::ImageUsageFlags::TRANSFER_DST
 }
 
-/// 一个候选设备的选卡事实（全是选卡阶段就能廉价查到的值）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DeviceFacts {
     pub device_type: Option<ash::vk::PhysicalDeviceType>,
-    /// 有 `GRAPHICS` 队列族。
     pub graphics_queue: bool,
-    /// `VkPhysicalDeviceProperties.apiVersion`（**D8 基线**：`>= 1.2`）。
     pub api_version: u32,
-    /// `VkPhysicalDeviceVulkan12Features.descriptorIndexing`（D8 基线；`api_version < 1.2`
-    /// 的设备无法查询，恒 `false`）。
     pub descriptor_indexing: bool,
-    /// `VkPhysicalDeviceVulkan12Features.timelineSemaphore`（D8 基线；`FrameSync` 的 retire
-    /// 记账依赖它，所以两条路径都必须要求）。
     pub timeline_semaphore: bool,
-    /// 该队列族能把图像呈现到这个 surface（离屏路径恒 `true`）。
     pub surface_queue: bool,
-    /// 设备扩展含 `VK_KHR_swapchain`。
     pub swapchain_extension: bool,
-    /// surface formats 里有 `RENDER_FORMAT` + 声明的 colorSpace。
     pub surface_format: bool,
-    /// present modes 含 `MAILBOX`。
     pub present_mode: bool,
-    /// `supportedUsageFlags ⊇ COLOR_ATTACHMENT | TRANSFER_DST`。
     pub usage: bool,
-    /// `minImageExtent <= maxImageExtent` 且非退化。
     pub extent: bool,
 }
 
-/// 一个候选设备的选卡输入（设备枚举阶段的**值**快照；诊断 / 覆盖匹配需要名字与下标）。
 #[derive(Clone, Debug)]
 pub(crate) struct CandidateFacts {
-    /// `vkEnumeratePhysicalDevices` 的下标（`KYTRIX_VK_DEVICE=<index>` 与诊断行用）。
     pub index: u32,
-    /// `VkPhysicalDeviceProperties.deviceName`。
     pub name: SmolStr,
-    /// 选卡事实。
     pub facts: DeviceFacts,
 }
 
-/// 一个候选设备被跳过的原因（写进 `UnsupportedGpu.actual`，R11-13 的「不要只说 no device」）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceRejection {
     NoGraphicsQueue,
-    /// D8 基线：Vulkan 1.2 是 descriptorIndexing / timelineSemaphore 被启用与使用的前提。
-    ApiVersionBelow12 {
-        actual: u32,
-    },
-    /// D8 基线：`VkPhysicalDeviceVulkan12Features.descriptorIndexing`。
+    ApiVersionBelow12 { actual: u32 },
     MissingDescriptorIndexing,
-    /// D8 基线：`VkPhysicalDeviceVulkan12Features.timelineSemaphore`。
     MissingTimelineSemaphore,
     NoSurfaceQueue,
     MissingSwapchainExtension,
@@ -219,7 +136,6 @@ pub(crate) enum DeviceRejection {
 }
 
 impl DeviceRejection {
-    /// 诊断行里的稳定文案（`SmolStr`：apiVersion 需要格式化，其余是静态短串）。
     pub(crate) fn describe(self) -> SmolStr {
         match self {
             Self::NoGraphicsQueue => SmolStr::new_static("no GRAPHICS queue family"),
@@ -255,20 +171,6 @@ impl DeviceRejection {
     }
 }
 
-/// 给候选设备打分（`window_path = false` 时只要求图形队列与 D8 基线）。
-///
-/// 打分顺序：独显 4 > 集显 3 > 虚拟/其它 2 > CPU 软件光栅器 1。**CPU 不排除**：无头 CI /
-/// 远程主机常常只有 lavapipe，把它彻底拒掉会让引擎在那类环境里跑不起来（Chrome 同样保留
-/// SwiftShader 兜底）；硬件与软件都在时硬件必然胜出。
-///
-/// 过滤条件分两层：
-/// 1. **D8 基线**（C10）：`apiVersion >= 1.2` + `descriptorIndexing` + `timelineSemaphore`。
-///    这三项是 `create_device` 启用的 feature 与 `FrameSync` 的 retire 记账的前提；旧实现把它们
-///    放在「选中之后」的 `GpuCaps::check()`，于是多 GPU（旧 dGPU + 新 iGPU / lavapipe）上会先
-///    选中不合格的高分卡、再在启动阶段硬失败，而本可回退到合规设备。window / headless 两条
-///    路径都要求（离屏也要 timeline）。对齐 Chromium `VulkanDeviceQueue::Initialize`（选卡循环
-///    先过滤 `apiVersion` / 队列 / present 支持再打分）。
-/// 2. **能不能真的把这个 surface 呈现出来**（R11-13）：只在 window 路径要求。
 pub(crate) fn score_device(facts: &DeviceFacts, window_path: bool) -> Result<u32, DeviceRejection> {
     if !facts.graphics_queue {
         return Err(DeviceRejection::NoGraphicsQueue);
@@ -313,26 +215,16 @@ pub(crate) fn score_device(facts: &DeviceFacts, window_path: bool) -> Result<u32
     })
 }
 
-/// 用户覆盖入口（R11-13）：`KYTRIX_VK_DEVICE` 强制选卡。
-///
-/// 取值：`<index>`（`vkEnumeratePhysicalDevices` 的下标）或 `<deviceName 子串>`（大小写不敏感）。
-/// 现场排障的刚需：多 GPU 机器上要能强制走 iGPU / dGPU 复现问题（`DRI_PRIME` 只影响 Mesa 的
-/// 默认选择，管不到 Vulkan 的显式枚举）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceSelector {
-    /// 自动打分（默认）。
     Auto,
-    /// 按枚举下标。
     Index(u32),
-    /// 按 `deviceName` 子串（大小写不敏感）。
     Name(SmolStr),
 }
 
-/// 环境变量名（产品路径读取；`Auto` 时不设置）。
 pub(crate) const DEVICE_OVERRIDE_ENV: &str = "KYTRIX_VK_DEVICE";
 
 impl DeviceSelector {
-    /// 解析环境变量的值；空串 / 纯空白视为 `Auto`。
     pub(crate) fn parse(value: &str) -> Self {
         let value = value.trim();
         if value.is_empty() {
@@ -344,19 +236,16 @@ impl DeviceSelector {
         }
     }
 
-    /// 该候选是否被强制选中。
     pub(crate) fn matches(&self, index: u32, name: &str) -> bool {
         match self {
             Self::Auto => false,
             Self::Index(expected) => *expected == index,
-            // 大小写不敏感的**子串**匹配：`KYTRIX_VK_DEVICE=llvmpipe` / `=NVIDIA` 都直观。
             Self::Name(name_filter) => name
                 .to_ascii_lowercase()
                 .contains(&name_filter.to_ascii_lowercase()),
         }
     }
 
-    /// 诊断文案。
     pub(crate) fn describe(&self) -> SmolStr {
         match self {
             Self::Auto => SmolStr::new_static("auto"),
@@ -366,13 +255,6 @@ impl DeviceSelector {
     }
 }
 
-/// 选卡决策（**纯逻辑**，可单测）：过滤 → 打分 → 取最高分；`selector` 命中时直接采用。
-///
-/// 返回选中候选在 `candidates` 里的位置。错误是 `UnsupportedGpu.actual` 的完整文案：
-/// - 全部不合格：逐个列出 `#index name: reason`（现场排障要能区分「没有驱动」与「独显不提供
-///   这个 surface 的 SRGB 格式」）；
-/// - `KYTRIX_VK_DEVICE` 强制命中不合格设备：错误里带上覆盖来源与该设备的原因（保留原有语义）；
-/// - 强制指定了不存在的设备：明确失败（静默回退 auto 会让「强制选卡复现问题」失效）。
 pub(crate) fn pick_best(
     candidates: &[CandidateFacts],
     window_path: bool,
@@ -399,7 +281,6 @@ pub(crate) fn pick_best(
                 continue;
             }
         };
-        // 覆盖入口：命中即立刻采用（不再比较得分）。
         if forced {
             return Ok(position);
         }
@@ -452,11 +333,8 @@ mod tests {
         color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
     }
 
-    // ── R11-9：extent / transform ────────────────────────────────────────────
-
     #[test]
     fn a_concrete_current_extent_overrides_the_request() {
-        // surface 决定尺寸（0xFFFFFFFF 之外的形态）：请求值必须被忽略，否则永久 SUBOPTIMAL。
         assert_eq!(
             choose_extent(
                 (800, 600),
@@ -529,7 +407,6 @@ mod tests {
             image_extent_for_transform((800, 600), vk::SurfaceTransformFlagsKHR::ROTATE_90),
             (600, 800)
         );
-        // 旋转 + 应用决定尺寸：夹紧发生在换轴**之后**（夹的是 image 尺寸）。
         assert_eq!(
             choose_extent(
                 (u32::MAX, u32::MAX),
@@ -543,27 +420,18 @@ mod tests {
         );
     }
 
-    // ── R11-15：image count ─────────────────────────────────────────────────
-
     #[test]
     fn the_image_count_never_drops_below_the_minimum_or_the_frame_slots() {
-        // 常规：min+1 且至少 3。
         assert_eq!(choose_image_count(2, 0), 3);
         assert_eq!(choose_image_count(3, 0), 4);
-        // `maxImageCount` 是**硬上界**（`VUID-VkSwapchainCreateInfoKHR-imageExtent-...` 同族的
-        // `minImageCount <= maxImageCount` 约束）：min=2/max=2 时唯一合法值是 2。
-        // 「至少 MAX_FRAMES_IN_FLIGHT」只是**期望**，不能压过 surface 的合法区间 —— 只有 2 张图时
-        // 第三帧会先在槽 fence 上等一等（性能损失），但链本身合法。
         assert_eq!(
             choose_image_count(2, 2),
             2,
             "max=2 时必须夹回 2（3 会被驱动判 VUID）"
         );
         assert_eq!(choose_image_count(4, 3), 4, "max < min：仍必须满足 min");
-        // 无上限。
         assert_eq!(choose_image_count(0, 0), 3, "至少 MAX_FRAMES_IN_FLIGHT");
         assert_eq!(choose_image_count(3, 8), 4);
-        // 不变式：任何输入下都落在 [min, max] 内（max=0 表示无上限）。
         for (min, max) in [(0, 0), (1, 1), (2, 2), (2, 3), (4, 3), (5, 5), (1, 9)] {
             let count = choose_image_count(min, max);
             assert!(count >= min.max(1), "min={min} max={max} count={count}");
@@ -572,8 +440,6 @@ mod tests {
             }
         }
     }
-
-    // ── R11-8：format / colorSpace ──────────────────────────────────────────
 
     #[test]
     fn the_surface_format_requires_both_format_and_color_space() {
@@ -592,9 +458,7 @@ mod tests {
             )),
             "同一 format 的 HDR 色彩空间必须被跳过"
         );
-        // 只有 HDR 色彩空间：明确失败（不做「format 对就凑合」的降级）。
         assert_eq!(choose_surface_format(&formats[..1], srgb_color_space), None);
-        // 格式不对也不行（整面 cmdCopyImage 要求格式兼容）。
         assert_eq!(
             choose_surface_format(
                 &[surface_format(
@@ -639,13 +503,10 @@ mod tests {
         );
     }
 
-    // ── R11-13：选卡 ────────────────────────────────────────────────────────
-
     fn windowed_facts(device_type: vk::PhysicalDeviceType) -> DeviceFacts {
         DeviceFacts {
             device_type: Some(device_type),
             graphics_queue: true,
-            // D8 基线（C10）：合规设备的默认值。
             api_version: vk::API_VERSION_1_2,
             descriptor_indexing: true,
             timeline_semaphore: true,
@@ -668,7 +529,6 @@ mod tests {
 
     #[test]
     fn a_device_that_cannot_present_is_rejected_instead_of_failing_later() {
-        // 独显「更强」但不能呈现这个 surface（PRIME / 远程合成器）：必须被跳过。
         let mut discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
         discrete.surface_format = false;
         assert_eq!(
@@ -693,7 +553,6 @@ mod tests {
             score_device(&discrete, true),
             Err(DeviceRejection::UnsupportedUsage)
         );
-        // 能呈现的那张（集显）必须被接受：这正是「退到能工作的 GPU」的意义。
         assert_eq!(
             score_device(
                 &windowed_facts(vk::PhysicalDeviceType::INTEGRATED_GPU),
@@ -788,7 +647,6 @@ mod tests {
         ] {
             assert!(!rejection.describe().is_empty());
         }
-        // apiVersion 必须格式化成可读版本号，而不是裸 `u32`。
         let text = DeviceRejection::ApiVersionBelow12 {
             actual: vk::make_api_version(0, 1, 1, 0),
         }
@@ -797,10 +655,6 @@ mod tests {
         assert!(text.contains("1.2"), "{text}");
     }
 
-    // ── C10：D8 基线作为选卡过滤条件 ─────────────────────────────────────
-
-    /// 3 个新 rejection 在 window / headless 两条路径上都生效：timeline 被 `FrameSync` 使用、
-    /// descriptorIndexing 在 `create_device` 里启用，与是否呈现无关。
     #[test]
     fn the_d8_baseline_is_enforced_on_both_the_window_and_headless_paths() {
         let mut below_12 = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
@@ -830,7 +684,6 @@ mod tests {
         }
     }
 
-    /// I10-b：高分但 api < 1.2 的独显必须被跳过，合规的集显被选中（多 GPU / PRIME 的真实现场）。
     #[test]
     fn a_high_scoring_but_incompatible_device_is_skipped_for_a_compliant_one() {
         let mut discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
@@ -840,7 +693,6 @@ mod tests {
             candidate(0, "Old Discrete GPU", discrete),
             candidate(1, "New Integrated GPU", integrated),
         ];
-        // window 与 headless 两条路径都必须退到合规的集显。
         for window_path in [true, false] {
             let selected = pick_best(&candidates, window_path, &DeviceSelector::Auto)
                 .expect("合规的集显必须被接受");
@@ -850,7 +702,6 @@ mod tests {
                 Ok(3)
             );
         }
-        // 只有那张不合规的独显：列出原因而不是静默启动失败。
         let error = pick_best(&candidates[..1], true, &DeviceSelector::Auto)
             .expect_err("没有合规设备时必须报错");
         assert!(error.contains("no usable device"), "{error}");
@@ -858,7 +709,6 @@ mod tests {
         assert!(error.contains("below the required 1.2"), "{error}");
     }
 
-    /// I10-b：高分但缺 timelineSemaphore 的独显同样被跳过。
     #[test]
     fn a_high_scoring_device_without_timeline_semaphore_is_rejected() {
         let mut discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
@@ -875,7 +725,6 @@ mod tests {
         );
     }
 
-    /// I10-c：全部不合格时错误逐个列出每台设备的原因（含下标与名字）。
     #[test]
     fn pick_best_lists_every_candidate_reason_when_no_device_is_usable() {
         let mut first = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
@@ -898,7 +747,6 @@ mod tests {
         );
     }
 
-    /// I10-c：`KYTRIX_VK_DEVICE` 强制命中不合格设备时，错误必须说明覆盖来源与该设备的原因。
     #[test]
     fn a_forced_selector_that_hits_an_incompatible_device_reports_the_override() {
         let mut discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
@@ -914,7 +762,6 @@ mod tests {
         assert!(error.contains("name~llvmpipe rejected"), "{error}");
     }
 
-    /// 覆盖入口命中合规设备时直接采用（即使不是最高分）：现场排障要能强制走 iGPU / dGPU。
     #[test]
     fn a_forced_selector_that_hits_a_compatible_device_wins_over_the_auto_score() {
         let discrete = windowed_facts(vk::PhysicalDeviceType::DISCRETE_GPU);
@@ -927,7 +774,6 @@ mod tests {
             pick_best(&candidates, true, &DeviceSelector::Index(1)),
             Ok(1)
         );
-        // 指定了不存在的设备：明确失败，不静默回退 auto。
         let error = pick_best(&candidates, true, &DeviceSelector::Index(7))
             .expect_err("覆盖不存在的设备必须报错");
         assert!(
@@ -936,7 +782,6 @@ mod tests {
         );
     }
 
-    /// 合规的低分设备（CPU / lavapipe）必须被接受：无头 CI / 远程主机常常只有软件光栅器。
     #[test]
     fn a_compliant_low_score_device_is_accepted() {
         let cpu = windowed_facts(vk::PhysicalDeviceType::CPU);
@@ -948,7 +793,6 @@ mod tests {
         );
     }
 
-    /// `SwapchainKey` 是重建必要性的判据来源：任一字段变化都必须被认为不同。
     #[test]
     fn the_swapchain_key_covers_every_build_parameter() {
         let base = SwapchainKey {

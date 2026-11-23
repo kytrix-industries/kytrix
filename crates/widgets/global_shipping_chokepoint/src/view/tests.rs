@@ -1,13 +1,3 @@
-//! The pane's own behaviour: what it reports, what the header offers, what the map draws,
-//! and what it leaves behind when it goes.
-//!
-//! The contract layer is driven directly — `load`, `sync`, `body`, `header`, `dispatch`,
-//! `release` are the hooks the framework calls — over the engine's headless host, because
-//! these tests are about this pane's decisions rather than about the framework's dispatch.
-//! Its AIS source is injected the way the service's own tests inject a venue: a headless
-//! host cannot build a Kytrix connection, so the pane is assembled over a source that
-//! records what it was asked for and never answers.
-
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -54,14 +44,10 @@ use crate::{
     ship::SHIP_TYPES,
 };
 
-/// The account every fixture pane is signed in as.
 const ACCOUNT: &str = "11111111-1111-4111-8111-111111111111";
-/// The account a pane is signed in as after a change.
 const OTHER_ACCOUNT: &str = "22222222-2222-4222-8222-222222222222";
-/// The size the pane's body is laid out in, which is what the canvas is measured from.
 const PAGE: (f32, f32) = (640.0, 400.0);
 
-/// The translator the product ships: what these tests assert is the catalogue's copy.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -69,7 +55,6 @@ fn product_translate(language: LanguageCode) -> Translate {
     )
 }
 
-/// The framework's headless host over the product catalogue.
 fn harness() -> WidgetTestApp {
     WidgetTestApp::with_translate(product_translate(LanguageCode::En))
 }
@@ -84,7 +69,6 @@ fn write_config(harness: &mut WidgetTestApp, config: Config) -> bool {
     harness.app_mut().write(&signal, config)
 }
 
-/// Signs `user_id` in the way the composition root does: a settings write.
 fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
     let mut config = current_config(harness);
     config.account = Some(AccountConfig {
@@ -98,7 +82,6 @@ fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
     );
 }
 
-/// Signs the pane out the way the composition root does: a settings write.
 fn sign_out(harness: &mut WidgetTestApp) {
     let mut config = current_config(harness);
     config.account = None;
@@ -108,7 +91,6 @@ fn sign_out(harness: &mut WidgetTestApp) {
     );
 }
 
-/// Moves the display time zone the way the composition root does: a settings write.
 fn set_data_time_zone(harness: &mut WidgetTestApp, hours: i8) {
     let mut config = current_config(harness);
     config.data_time_zone = DataTimeZone::from_hours(hours).expect("an offered offset");
@@ -118,19 +100,12 @@ fn set_data_time_zone(harness: &mut WidgetTestApp, hours: i8) {
     );
 }
 
-/// A source that records the accounts it was asked for and never answers.
-///
-/// The pane's messages are reported to it directly rather than through a subscription, so a
-/// test is about what the pane does with a push rather than about the service that delivers
-/// one. A stream that is opened is never answered, which is also what keeps a test from
-/// depending on its own timing.
 #[derive(Clone, Default)]
 struct RecordingSource {
     accounts: Arc<Mutex<Vec<SmolStr>>>,
 }
 
 impl RecordingSource {
-    /// The accounts this source has been asked for a session of, in order.
     fn requested(&self) -> Vec<SmolStr> {
         self.accounts
             .lock()
@@ -151,7 +126,6 @@ impl GlobalShippingChokepointSource for RecordingSource {
     }
 }
 
-/// A session whose subscription never opens.
 #[derive(Clone)]
 struct PendingSession;
 
@@ -166,7 +140,6 @@ impl GlobalShippingChokepointSession for PendingSession {
     }
 }
 
-/// A subscription that never delivers anything.
 struct PendingSubscription;
 
 impl GlobalShippingChokepointEventSubscription for PendingSubscription {
@@ -179,19 +152,14 @@ fn recovery() -> WidgetAction {
     WidgetAction::new("common.retry", |_| {})
 }
 
-/// A pane the framework would have built, driven by a fake source.
 struct Pane {
     widget: GlobalShippingChokepointWidget,
     status: WidgetStatus,
-    /// The pane's own signal scope, which the framework releases after `release`.
     scope: ui_core::node::signal::SignalScope,
-    /// The box the body is built into.
     page: NodeId,
-    /// The group node a header row is built into.
     header_group: NodeId,
 }
 
-/// A box of the pane's size, which is what the body is laid out in.
 fn page(harness: &mut WidgetTestApp) -> NodeId {
     harness.with_cx(|cx| {
         let root = cx.tree().root();
@@ -209,11 +177,6 @@ fn page(harness: &mut WidgetTestApp) -> NodeId {
     })
 }
 
-/// A pane over `source`, signed in as whatever the settings hold.
-///
-/// Every pane mints its own `SignalScope`, which is what the framework does for a widget
-/// instance and what makes two panes' kit keys differ (`cx.unique_key` stamps the suffix
-/// with the scope index).
 fn pane_with_source(harness: &mut WidgetTestApp, source: RecordingSource) -> Pane {
     let scope = harness.app_mut().signal_scope();
     let status = WidgetStatus::new(harness.app_mut(), scope);
@@ -246,7 +209,6 @@ fn pane_with_source(harness: &mut WidgetTestApp, source: RecordingSource) -> Pan
     }
 }
 
-/// A signed-in pane, loaded once (the framework's own sequence).
 fn pane(harness: &mut WidgetTestApp) -> Pane {
     sign_in(harness, ACCOUNT);
     let mut pane = pane_with_source(harness, RecordingSource::default());
@@ -264,7 +226,6 @@ fn sync(harness: &mut WidgetTestApp, pane: &mut Pane) {
         .expect("the widget syncs");
 }
 
-/// Builds the body the framework would build once the pane has content, and lays it out.
 fn build_body(harness: &mut WidgetTestApp, pane: &mut Pane) {
     let parent = pane.page;
     harness
@@ -273,8 +234,6 @@ fn build_body(harness: &mut WidgetTestApp, pane: &mut Pane) {
     harness.drain();
 }
 
-/// Runs `body` with a context over one widget instance's own scope, which is what a pane
-/// hands its widget and what makes `cx.unique_key` per instance.
 fn with_scope<R>(
     harness: &mut WidgetTestApp,
     scope: ui_core::node::signal::SignalScope,
@@ -287,7 +246,6 @@ fn with_scope<R>(
     body(&mut cx)
 }
 
-/// Builds the left header group, as a pane would.
 fn build_header(harness: &mut WidgetTestApp, pane: &mut Pane) {
     let parent = pane.header_group;
     let scope = pane.scope;
@@ -298,17 +256,11 @@ fn build_header(harness: &mut WidgetTestApp, pane: &mut Pane) {
     .expect("the header builds");
 }
 
-/// Runs one frame the way the production pump would see it: the widget's hook, then the
-/// pipeline that paints what it wrote.
-///
-/// **One** drain: the frame reads (`canvas_primitives`) answer for the last drain, and an
-/// idle drain that follows a painted one replaces the record with nothing.
 fn frame(harness: &mut WidgetTestApp, pane: &mut Pane) {
     sync(harness, pane);
     harness.drain();
 }
 
-/// Reports one push as the latest stream would.
 fn report_update(pane: &mut Pane, update: GlobalShippingChokepointUpdate, cx: &mut WidgetCx<'_>) {
     pane.widget.apply_latest(
         GlobalShippingChokepointArea::Hormuz,
@@ -317,12 +269,10 @@ fn report_update(pane: &mut Pane, update: GlobalShippingChokepointUpdate, cx: &m
     );
 }
 
-/// Reports one push on the latest stream through the host.
 fn push(harness: &mut WidgetTestApp, pane: &mut Pane, update: GlobalShippingChokepointUpdate) {
     harness.with_cx(|cx| report_update(pane, update, cx));
 }
 
-/// Reports one failure as the reliable stream would.
 fn fail_with(harness: &mut WidgetTestApp, pane: &mut Pane, error: AisStreamError) {
     harness.with_cx(|cx| {
         pane.widget.apply_reliable(
@@ -333,11 +283,6 @@ fn fail_with(harness: &mut WidgetTestApp, pane: &mut Pane, error: AisStreamError
     });
 }
 
-/// The vertices of one position in the strait, as a report carries them.
-///
-/// The longitudes are spaced far enough apart that two fixtures are two hulls a pointer
-/// can tell apart: a hit is resolved within [`crate::model::HIT_RADIUS_PX`], and a
-/// fixture pair on the same point would make the nearest one ambiguous.
 fn position(mmsi: u32) -> GlobalShippingChokepointPosition {
     GlobalShippingChokepointPosition {
         mmsi,
@@ -351,7 +296,6 @@ fn position(mmsi: u32) -> GlobalShippingChokepointPosition {
     }
 }
 
-/// One vessel's ship record, with every value a report can carry.
 fn ships(mmsi: u32) -> GlobalShippingChokepointShip {
     GlobalShippingChokepointShip {
         mmsi,
@@ -374,15 +318,12 @@ fn ships(mmsi: u32) -> GlobalShippingChokepointShip {
     }
 }
 
-/// One vessel's ship record with the AIS type `ship_type` and every other value as
-/// [`ships`] carries it.
 fn ship_of_type(mmsi: u32, ship_type: u32) -> GlobalShippingChokepointShip {
     let mut ship = ships(mmsi);
     ship.ship_type = ship_type;
     ship
 }
 
-/// A representative AIS `ship_type` code for one main type.
 fn code_of(ship_type: ShipType) -> u32 {
     match ship_type {
         ShipType::Tanker => 80,
@@ -408,7 +349,6 @@ fn code_of(ship_type: ShipType) -> u32 {
     }
 }
 
-/// A keyframe of `positions`, each with its ship record.
 fn keyframe(
     epoch: u64,
     sequence: u64,
@@ -430,7 +370,6 @@ fn keyframe(
     }
 }
 
-/// A keyframe of `positions`, each with the AIS type `ship_type`.
 fn keyframe_of_type(
     epoch: u64,
     sequence: u64,
@@ -446,7 +385,6 @@ fn keyframe_of_type(
     update
 }
 
-/// A push the server stamped with no time, which holds no state.
 fn timeless_keyframe(
     epoch: u64,
     sequence: u64,
@@ -457,7 +395,6 @@ fn timeless_keyframe(
     update
 }
 
-/// A delta continuing `base` with nothing in it but one removal.
 fn removal(epoch: u64, base: u64, sequence: u64, mmsi: u32) -> GlobalShippingChokepointUpdate {
     GlobalShippingChokepointUpdate {
         epoch,
@@ -471,19 +408,16 @@ fn removal(epoch: u64, base: u64, sequence: u64, mmsi: u32) -> GlobalShippingCho
     }
 }
 
-/// The map's canvas node, once the body has built it.
 fn map_node(harness: &WidgetTestApp, pane: &Pane) -> NodeId {
     harness
         .find_by_debug_prefix(pane.page, MAP_SELECTOR)
         .expect("the body built the map")
 }
 
-/// The map's rendered primitives.
 fn primitives(harness: &WidgetTestApp, pane: &Pane) -> Vec<CanvasPrimitive> {
     harness.canvas_primitives(map_node(harness, pane))
 }
 
-/// The positioned glyphs the canvas drew.
 fn glyph_count(harness: &WidgetTestApp, pane: &Pane) -> usize {
     harness
         .canvas_primitives(map_node(harness, pane))
@@ -493,7 +427,6 @@ fn glyph_count(harness: &WidgetTestApp, pane: &Pane) -> usize {
         .sum()
 }
 
-/// How many registered meshes the canvas draws.
 fn geometry_draws(harness: &WidgetTestApp, pane: &Pane) -> usize {
     harness
         .canvas_primitives(map_node(harness, pane))
@@ -502,21 +435,18 @@ fn geometry_draws(harness: &WidgetTestApp, pane: &Pane) -> usize {
         .count()
 }
 
-/// The canvas' content, which is what a steady frame keeps and a rebuilding frame replaces.
 fn canvas_handle(harness: &WidgetTestApp, pane: &Pane) -> Arc<ui_core::paint::canvas::Canvas> {
     harness
         .canvas_handle(map_node(harness, pane))
         .expect("the map is a canvas node")
 }
 
-/// Pushes one keyframe of one tanker and paints it.
 fn paint_one_vessel(harness: &mut WidgetTestApp, pane: &mut Pane) {
     push(harness, pane, keyframe(7, 1, vec![position(1)]));
     build_body(harness, pane);
     frame(harness, pane);
 }
 
-/// The window position one vessel is drawn at, from the camera and box the map holds.
 fn hull_of(pane: &Pane, mmsi: u32) -> Point {
     let bounds = pane.widget.map.bounds().expect("the map has a box");
     let projection = Projection::new(
@@ -533,7 +463,6 @@ fn hull_of(pane: &Pane, mmsi: u32) -> Point {
     Point::new(bounds.origin.x + at[0], bounds.origin.y + at[1])
 }
 
-/// Sends one pointer move to the pane, reporting whether it was consumed.
 fn pointer_move(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
@@ -547,7 +476,6 @@ fn pointer_move(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -
     })
 }
 
-/// Sends one pointer-leave to the pane.
 fn pointer_leave(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
@@ -561,7 +489,6 @@ fn pointer_leave(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) 
     });
 }
 
-/// Sends one primary press to the pane, reporting whether it was consumed.
 fn pointer_down(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
@@ -576,7 +503,6 @@ fn pointer_down(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -
     })
 }
 
-/// Sends one primary release to the pane, reporting whether it was consumed.
 fn pointer_up(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
@@ -591,7 +517,6 @@ fn pointer_up(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> 
     })
 }
 
-/// Sends one cancelled pointer session to the pane, reporting whether it was consumed.
 fn pointer_cancel(harness: &mut WidgetTestApp, pane: &mut Pane) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
@@ -603,7 +528,6 @@ fn pointer_cancel(harness: &mut WidgetTestApp, pane: &mut Pane) -> bool {
     })
 }
 
-/// Sends one wheel notch to the pane, reporting whether it was consumed.
 fn wheel(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point, step: f32) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
@@ -644,11 +568,6 @@ fn a_pane_nobody_signed_in_for_should_wait_for_a_sign_in() {
     }
 }
 
-/// A host with no Kytrix connection has nothing to subscribe over.
-///
-/// That is a failure between the application and the service, not a link that is still
-/// being established: a pane that reported `Connecting` here would spin for a connection
-/// nobody is going to install and would never say what is wrong.
 #[test]
 fn a_host_without_a_kytrix_service_should_fail_the_pane_with_the_retry() {
     let mut harness = harness();
@@ -733,7 +652,6 @@ fn a_gap_should_fail_the_pane_while_the_picture_stays() {
     let mut pane = pane(&mut harness);
     push(&mut harness, &mut pane, keyframe(7, 1, vec![position(1)]));
 
-    // A delta that does not continue the picture: sequence 5 after 1.
     push(
         &mut harness,
         &mut pane,
@@ -768,7 +686,6 @@ fn a_stale_pane_should_ignore_pushes_until_the_user_retries() {
     );
     assert!(pane.status.is_failed(harness.app()));
 
-    // A push that arrives after the failure belongs to a stream the pane stopped reading.
     push(&mut harness, &mut pane, keyframe(8, 1, vec![position(2)]));
 
     assert!(
@@ -787,11 +704,9 @@ fn a_silent_link_should_fail_the_pane_after_the_staleness_window() {
     frame(&mut harness, &mut pane);
     assert!(!pane.status.is_failed(harness.app()));
 
-    // Half the window: still silent, not yet failed.
     assert!(!harness.advance(STALE_AFTER / 2));
     assert!(!pane.status.is_failed(harness.app()));
 
-    // The rest of it: the timer the push armed reports the silence.
     harness.advance(STALE_AFTER);
     assert!(
         pane.status.is_failed(harness.app()),
@@ -810,8 +725,6 @@ fn a_new_push_should_cancel_the_staleness_clock() {
     harness.advance(STALE_AFTER / 2);
     push(&mut harness, &mut pane, keyframe(7, 2, vec![position(1)]));
     frame(&mut harness, &mut pane);
-    // The first push's timer was due now; the second push replaced it, so this is the
-    // middle of the new window rather than a silence.
     harness.advance(STALE_AFTER / 2);
 
     assert!(
@@ -871,8 +784,6 @@ fn a_message_after_signing_out_should_be_refused() {
 
     sign_out(&mut harness);
     sync(&mut harness, &mut pane);
-    // The stop that follows a sign-out is asynchronous: a push already in flight must not
-    // put the old account's vessels back on screen.
     push(&mut harness, &mut pane, keyframe(8, 1, vec![position(2)]));
 
     assert!(!pane.widget.has_content(), "the picture stays cleared");
@@ -920,8 +831,6 @@ fn an_account_change_should_load_the_new_account() {
     sign_in(&mut harness, ACCOUNT);
     let mut pane = pane_with_source(&mut harness, source.clone());
     load(&mut harness, &mut pane);
-    // Let the first load reach the service before it is replaced, so the fixture records
-    // both accounts rather than only the one whose command survived.
     harness.run_until_idle();
     assert_eq!(
         pane.widget.account_id.as_deref(),
@@ -943,9 +852,6 @@ fn an_account_change_should_load_the_new_account() {
         WidgetState::Connecting,
         "the pane starts the new account's stream"
     );
-    // The service answers a load by taking the account's session, which is what the source
-    // records. The first command has to reach the service before it is replaced, or a
-    // headless test would only ever see the last one.
     harness.run_until_idle();
     assert_eq!(
         source.requested(),
@@ -961,7 +867,6 @@ fn an_account_change_should_load_the_new_account() {
 fn a_replaced_command_should_drop_its_late_answer() {
     let mut harness = harness();
     let mut pane = pane(&mut harness);
-    // The first load is the framework's (id 1); a retry replaces it (id 2).
     load(&mut harness, &mut pane);
 
     harness.with_cx(|cx| {
@@ -1082,8 +987,6 @@ fn a_lease_that_moved_should_repaint_the_labels() {
     paint_one_vessel(&mut harness, &mut pane);
     let before = canvas_handle(&harness, &pane);
 
-    // A font stack change moves the atlas generation, so every shaped handle the canvas
-    // holds is stale: the map owes a frame even though nothing it reads changed.
     let stack = harness.app().font_stack().clone();
     harness.app_mut().set_font_stack(stack);
     frame(&mut harness, &mut pane);
@@ -1094,29 +997,19 @@ fn a_lease_that_moved_should_repaint_the_labels() {
     );
 }
 
-/// A lease that moved rebuilds the canvas once, and the frame after it is steady.
-///
-/// The stale entries a rebuild leaves behind — the labels of the language that was left,
-/// the card of a pointer that moved away — are dropped by the question that finds them.
-/// Keeping them would answer "stale" on every later frame and rebuild the canvas, and
-/// every mesh it registers, for glyphs nothing on screen names any more (I3).
 #[test]
 fn a_moved_lease_should_settle_back_into_a_steady_frame() {
     let mut harness = harness();
     let mut pane = pane(&mut harness);
     paint_one_vessel(&mut harness, &mut pane);
-    // Two sets of entries nothing draws from again: the other language's labels...
     harness.switch_language(LanguageCode::ZhCn);
     frame(&mut harness, &mut pane);
-    // ...and the card's rows, once the pointer left the vessel they describe.
     let at = hull_of(&pane, 1);
     pointer_move(&mut harness, &mut pane, at);
     frame(&mut harness, &mut pane);
     pointer_leave(&mut harness, &mut pane, at);
     frame(&mut harness, &mut pane);
 
-    // The atlas generation moves: every handle the canvas holds is stale, and the frame
-    // that follows is owed a rebuild.
     let stack = harness.app().font_stack().clone();
     harness.app_mut().set_font_stack(stack);
     frame(&mut harness, &mut pane);
@@ -1195,7 +1088,6 @@ fn the_selected_type_should_survive_its_disappearance() {
             .select_filter(ShipTypeFilter::Only(ShipType::Tanker), cx)
     });
 
-    // The next picture holds no tanker at all.
     push(
         &mut harness,
         &mut pane,
@@ -1243,7 +1135,6 @@ fn the_pointer_over_a_vessel_should_show_its_card() {
         "the card's rows were drawn"
     );
 
-    // A pointer that leaves takes the card with it.
     pointer_leave(&mut harness, &mut pane, at);
     frame(&mut harness, &mut pane);
     assert_eq!(pane.widget.map.hovered(), None);
@@ -1258,8 +1149,6 @@ fn the_pointer_over_a_vessel_should_show_its_card() {
 fn a_removed_vessel_should_not_keep_its_card() {
     let mut harness = harness();
     let mut pane = pane(&mut harness);
-    // Two hulls of one type: removing one leaves the legend's entry in place, so the only
-    // glyphs that can disappear are the card's own.
     push(
         &mut harness,
         &mut pane,
@@ -1277,7 +1166,6 @@ fn a_removed_vessel_should_not_keep_its_card() {
     pointer_move(&mut harness, &mut pane, at);
     frame(&mut harness, &mut pane);
 
-    // A delta that continues the picture and removes the hull.
     push(&mut harness, &mut pane, removal(7, 1, 2, 1));
     frame(&mut harness, &mut pane);
 
@@ -1321,14 +1209,12 @@ fn the_credit_should_open_the_copyright_page() {
             recorded.borrow_mut().push(url.to_owned());
         });
     let mut pane = pane_with_source(&mut harness, RecordingSource::default());
-    // A signed-out pane still draws no body, so this pane is signed in before it is built.
     sign_in(&mut harness, ACCOUNT);
     load(&mut harness, &mut pane);
     push(&mut harness, &mut pane, keyframe(7, 1, vec![position(1)]));
     build_body(&mut harness, &mut pane);
     frame(&mut harness, &mut pane);
 
-    // The credit is drawn in the pane's bottom-left corner.
     let bounds = pane.widget.map.bounds().expect("the map was laid out");
     let credit = Point::new(
         bounds.origin.x + 12.0,
@@ -1358,12 +1244,6 @@ fn the_credit_should_open_the_copyright_page() {
     assert_eq!(opened.borrow().as_slice(), [ATTRIBUTION_URL]);
 }
 
-/// A cancelled pointer session ends the drag it began and drops its credit press.
-///
-/// The engine reports a cancel instead of the release when the system takes the pointer
-/// away (capture lost, focus lost, a modal opened). Treating it as nothing would leave the
-/// map panning on a button nothing is holding, and would open the credit on a release that
-/// was never a click.
 #[test]
 fn a_cancelled_pointer_should_not_pan_or_open_the_credit() {
     let opened = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -1380,8 +1260,6 @@ fn a_cancelled_pointer_should_not_pan_or_open_the_credit() {
     frame(&mut harness, &mut pane);
 
     let bounds = pane.widget.map.bounds().expect("the map was laid out");
-    // The press starts on the credit, which is the one interaction a cancelled session
-    // must not commit.
     let credit = Point::new(
         bounds.origin.x + 12.0,
         bounds.origin.y + bounds.size.height - 10.0,
@@ -1397,7 +1275,6 @@ fn a_cancelled_pointer_should_not_pan_or_open_the_credit() {
         "a cancelled press is not a click on the credit"
     );
 
-    // The drag the press began is not still held: a later move does not pan the map.
     let before = pane.widget.map.camera();
     pointer_move(
         &mut harness,
@@ -1411,12 +1288,6 @@ fn a_cancelled_pointer_should_not_pan_or_open_the_credit() {
     );
 }
 
-/// A press beside the canvas is not the map's: it begins no drag and consumes no wheel.
-///
-/// The pane hands this hook every event it routes, while the old element-level handlers
-/// only saw the events over the canvas. The box the map is laid out in is what makes the
-/// difference visible: without it a press 40 px outside the map starts a pan that moves
-/// the camera on the next move, and a wheel beside it zooms a map it is not over.
 #[test]
 fn a_pointer_outside_the_canvas_should_not_be_the_map_s() {
     let mut harness = harness();
@@ -1515,7 +1386,6 @@ fn the_header_key_should_be_the_pane_s_own() {
         "two panes of this widget never share one action identity"
     );
 
-    // Releasing one pane leaves the other one's handler in place.
     harness.with_cx(|cx| first.widget.release(cx));
     assert!(
         harness
@@ -1570,8 +1440,6 @@ fn releasing_the_pane_should_return_its_geometry_and_its_value_slots() {
     );
 
     harness.with_cx(|cx| pane.widget.release(cx));
-    // The framework drops the widget's scope after the surface's nodes are removed
-    // (`AnyWidget::release`); the widget itself never owns the scope's release.
     harness.app_mut().release_scope(pane.scope);
 
     assert_eq!(
@@ -1591,8 +1459,6 @@ fn the_map_should_paint_only_once_the_body_is_laid_out() {
     let mut harness = harness();
     let mut pane = pane(&mut harness);
     push(&mut harness, &mut pane, keyframe(7, 1, vec![position(1)]));
-    // The body has not been built, so there is no canvas to inspect: the pane's own
-    // `has_content` is what the framework builds it from.
     assert!(pane.widget.has_content());
     assert!(
         harness
@@ -1612,7 +1478,6 @@ fn the_map_should_paint_only_once_the_body_is_laid_out() {
     );
 }
 
-/// The ship types are the map's legend order, and the filter's keys round-trip.
 #[test]
 fn every_ship_type_should_round_trip_through_the_filter() {
     for ship_type in SHIP_TYPES {

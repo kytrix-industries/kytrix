@@ -1,18 +1,3 @@
-//! The headless host the menu's tests drive it against.
-//!
-//! A title-bar menu is not a widget, so the contract layer's `WidgetTestApp` (which is built
-//! around `WidgetView`) does not fit it. This harness composes the same aggregate the
-//! application root composes — the frozen [`WidgetServices`], the layer stack, the frame
-//! router and the animation router — over `ui_core::test_support::TestApp`, and adds the
-//! three things a menu test needs: a directory whose loads the test settles by hand, a real
-//! pointer click, and the platform pump's order (frame hook first, then the frame).
-//!
-//! The directory is a fake on purpose: the connector's constructor still needs the old
-//! toolkit's runtime type, so a test that built one would be testing the connector, not the
-//! menu. Every decision the menu makes — which venue to list, whether it is loaded, whether
-//! its load is gated on credentials, what one load reported — is a decision over
-//! [`VenueDirectory`], and the fake is that trait with the answers a test states.
-
 use std::{
     rc::Rc,
     sync::{Arc, Mutex},
@@ -46,19 +31,12 @@ use crate::{
     menu::MarketParticipants,
 };
 
-/// The runtime seam a headless menu is handed: the futures are pumped by the harness.
-///
-/// The engine's test host owns a current-thread runtime nothing polls, so a load started
-/// through it would never make progress. The harness polls the tasks itself, which also keeps
-/// every load deterministic — a load settles exactly when a test settles it.
 #[derive(Default)]
 pub(crate) struct TestExecutor {
     tasks: std::cell::RefCell<Vec<BoxFuture<'static, ()>>>,
 }
 
 impl TestExecutor {
-    /// Polls every task once; tasks that finished are dropped, the rest wait for the next
-    /// poll.
     fn pump(&self) {
         let waker = noop_waker();
         let mut context = TaskContext::from_waker(&waker);
@@ -79,16 +57,10 @@ impl RuntimeExecutor for TestExecutor {
     }
 }
 
-/// The translation context a test renders through: the product's own catalogue, so a test
-/// asserts the sentence the user reads rather than a fixture of this crate's making.
 pub(crate) fn translate() -> Translate {
     translate_in(LanguageCode::En)
 }
 
-/// The product's catalogue in one language.
-///
-/// # Panics
-/// The embedded catalogue does not load (a build fault, not a test condition).
 pub(crate) fn translate_in(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -96,20 +68,14 @@ pub(crate) fn translate_in(language: LanguageCode) -> Translate {
     )
 }
 
-/// The venues every test's directory speaks, in declaration order.
 pub(crate) fn supported_venues() -> Vec<VenueId> {
     definition::supported_venues()
 }
 
-/// One built-in venue by its canonical name.
-///
-/// # Panics
-/// The name is not one this build carries (a test bug).
 pub(crate) fn venue(name: &str) -> VenueId {
     VenueId::from_name(name).expect("the built-in venue identity is canonical")
 }
 
-/// The state one test's fake directory keeps.
 #[derive(Default)]
 struct DirectoryState {
     loaded: ahash::AHashSet<VenueId>,
@@ -119,14 +85,12 @@ struct DirectoryState {
     pending: ahash::AHashMap<VenueId, oneshot::Sender<Result<(), VenueLoadError>>>,
 }
 
-/// The directory a test hands the menu: every load waits until the test settles it.
 pub(crate) struct FakeDirectory {
     venues: Vec<VenueId>,
     state: Mutex<DirectoryState>,
 }
 
 impl FakeDirectory {
-    /// A directory that speaks `venues` and has loaded none of them.
     pub(crate) fn new(venues: Vec<VenueId>) -> Arc<Self> {
         Arc::new(Self {
             venues,
@@ -134,7 +98,6 @@ impl FakeDirectory {
         })
     }
 
-    /// Makes loading `venue` require credentials, as a venue whose reads are signed does.
     pub(crate) fn require_credentials(&self, venue: VenueId) {
         self.state
             .lock()
@@ -143,7 +106,6 @@ impl FakeDirectory {
             .insert(venue);
     }
 
-    /// Makes `venue` read as loaded without a load, as a directory a previous run filled does.
     pub(crate) fn mark_loaded(&self, venue: VenueId) {
         self.state
             .lock()
@@ -152,7 +114,6 @@ impl FakeDirectory {
             .insert(venue);
     }
 
-    /// The loads started, in the order they were requested.
     pub(crate) fn loads(&self) -> Vec<VenueId> {
         self.state
             .lock()
@@ -161,7 +122,6 @@ impl FakeDirectory {
             .clone()
     }
 
-    /// The loads the menu asked the directory to cancel.
     pub(crate) fn cancelled(&self) -> Vec<VenueId> {
         self.state
             .lock()
@@ -170,7 +130,6 @@ impl FakeDirectory {
             .clone()
     }
 
-    /// How many loads are still waiting for their answer.
     pub(crate) fn pending(&self) -> usize {
         self.state
             .lock()
@@ -179,7 +138,6 @@ impl FakeDirectory {
             .len()
     }
 
-    /// Settles one load with `result`, as the connector's own future would settle it.
     pub(crate) fn complete(&self, venue: VenueId, result: Result<(), VenueLoadError>) {
         let sender = self
             .state
@@ -198,7 +156,6 @@ impl FakeDirectory {
         let _ = sender.send(result);
     }
 
-    /// Cancels one load from the directory side, answering it the way the connector does.
     fn cancel(&self, venue: VenueId) {
         let sender = self
             .state
@@ -258,7 +215,6 @@ impl VenueDirectory for FakeDirectory {
     }
 }
 
-/// The headless host every menu test runs against.
 pub(crate) struct Harness {
     app: TestApp,
     services: Rc<WidgetServices>,
@@ -269,12 +225,10 @@ pub(crate) struct Harness {
 }
 
 impl Harness {
-    /// A harness whose directory speaks every venue this build declares.
     pub(crate) fn new() -> Self {
         Self::with_venues(supported_venues())
     }
 
-    /// A harness whose directory speaks exactly `venues`.
     pub(crate) fn with_venues(venues: Vec<VenueId>) -> Self {
         let mut app = TestApp::with_options(WindowOptions {
             size: Size::new(1280.0, 900.0),
@@ -330,12 +284,10 @@ impl Harness {
         harness
     }
 
-    /// The injected services, as the shared handle another menu is built from.
     pub(crate) fn services_rc(&self) -> Rc<WidgetServices> {
         Rc::clone(&self.services)
     }
 
-    /// The directory the menu loads through.
     pub(crate) fn directory(&self) -> Arc<FakeDirectory> {
         Arc::clone(&self.directory)
     }
@@ -360,8 +312,6 @@ impl Harness {
         self.app.window_id()
     }
 
-    /// Runs one production-shaped round: the load futures the runtime would have driven, the
-    /// frame hook's routes, then one frame.
     pub(crate) fn drain(&mut self) {
         self.executor.pump();
         let _ = self.router.tick(self.app.app_mut());
@@ -371,32 +321,25 @@ impl Harness {
         self.app.drain().expect("the harness frame");
     }
 
-    /// The executor a second menu of the same test is handed.
     pub(crate) fn executor(&self) -> Rc<TestExecutor> {
         Rc::clone(&self.executor)
     }
 
-    /// Runs `frames` production-shaped rounds.
     pub(crate) fn settle(&mut self, frames: usize) {
         for _ in 0..frames {
             self.drain();
         }
     }
 
-    /// The layout box of one node, if it is laid out.
     pub(crate) fn bounds(&self, node: NodeId) -> Option<ui_core::math::Rect> {
         self.app.probe().bounds(node)
     }
 
-    /// Clicks one node's centre with the primary button, the way the platform pump delivers
-    /// a press: down, a frame, up, then the frames that settle what it opened.
     pub(crate) fn click(&mut self, node: NodeId) {
         let position = centre_of(
             self.bounds(node)
                 .unwrap_or_else(|| panic!("the harness draws the node it is asked to click")),
         );
-        // The platform pump reports where the pointer is before the button goes down; a kit
-        // control's press handling reads that position.
         let _ = self.app.move_pointer(position);
         self.app.inject(InputEvent::pointer_down(
             position,
@@ -412,14 +355,11 @@ impl Harness {
         self.drain();
     }
 
-    /// Clicks one held button (one whose node the component built).
     pub(crate) fn click_button(&mut self, button: &base_ui::kit::button::Button) {
         let node = button.node().expect("the button is built");
         self.click(node);
     }
 
-    /// Clicks one window position, the way the platform pump delivers a press outside every
-    /// control.
     pub(crate) fn click_point(&mut self, position: Point) {
         self.app.inject(InputEvent::pointer_down(
             position,
@@ -435,8 +375,6 @@ impl Harness {
         self.drain();
     }
 
-    /// Advances the clock past every fade this menu starts and drains the frames that finish
-    /// them, so a panel or an alert that is closing really closes.
     pub(crate) fn settle_fade(&mut self) {
         for _ in 0..3 {
             self.app.advance(Duration::from_millis(200));
@@ -444,12 +382,10 @@ impl Harness {
         }
     }
 
-    /// The first node under the window root whose debug id starts with `prefix`.
     pub(crate) fn find(&self, prefix: &str) -> Option<NodeId> {
         self.find_all(prefix).into_iter().next()
     }
 
-    /// Every node under the window root whose debug id starts with `prefix`, in DFS order.
     pub(crate) fn find_all(&self, prefix: &str) -> Vec<NodeId> {
         let Some(window) = self.app.app().window(self.window()) else {
             return Vec::new();
@@ -468,7 +404,6 @@ impl Harness {
         found
     }
 
-    /// The text the subtree under `node` draws, one line per text node, in DFS order.
     pub(crate) fn text_of(&self, node: NodeId) -> String {
         let mut lines = Vec::new();
         let Some(window) = self.app.app().window(self.window()) else {
@@ -488,12 +423,10 @@ impl Harness {
         lines.join("\n")
     }
 
-    /// Whether the subtree under `node` draws `text` anywhere.
     pub(crate) fn has_text(&self, node: NodeId, text: &str) -> bool {
         self.text_of(node).lines().any(|line| line == text)
     }
 
-    /// Whether the window's tree draws `text` anywhere.
     pub(crate) fn has_text_anywhere(&self, text: &str) -> bool {
         let Some(window) = self.app.app().window(self.window()) else {
             return false;
@@ -512,7 +445,6 @@ impl Harness {
         false
     }
 
-    /// Removes one node from the harness window, the way the caller remounts its title bar.
     pub(crate) fn remove_node(&mut self, node: NodeId) {
         let window = self.window();
         self.app
@@ -521,17 +453,14 @@ impl Harness {
             .expect("the harness removes a node it built");
     }
 
-    /// Releases the harness's menu (the caller removes the trigger first).
     pub(crate) fn release_menu(&mut self) {
         self.menu.release(self.app.app_mut());
     }
 
-    /// Runs one row's action for the harness's menu, without a press.
     pub(crate) fn start_load(&mut self, venue: VenueId) -> Result<(), crate::error::MenuError> {
         self.menu.start_load(self.app.app_mut(), venue)
     }
 
-    /// The number of nodes in the harness window's tree.
     pub(crate) fn tree_len(&self) -> usize {
         self.app
             .app()
@@ -541,23 +470,18 @@ impl Harness {
             .len()
     }
 
-    /// The open overlays of the harness window (the panel is one; the alert another).
     pub(crate) fn overlay_count(&self) -> usize {
         self.app.app().overlays(self.window()).len()
     }
 
-    /// The engine's frame-request counter (the I3 assertion face: a steady frame does not
-    /// grow it).
     pub(crate) fn frame_requests(&self) -> u64 {
         self.app.app().frame_requests()
     }
 
-    /// The row a venue is drawn as, by its stable debug id.
     pub(crate) fn row(&self, venue: VenueId) -> Option<NodeId> {
         self.find(&format!("TEST_MARKET_PARTICIPANTS_ROW_{venue:?}"))
     }
 
-    /// The action one venue's row offers, by its stable debug id.
     pub(crate) fn action(&self, venue: VenueId, loaded: bool) -> Option<NodeId> {
         let state = if loaded { "REFRESH" } else { "LOAD" };
         self.find(&format!(
@@ -565,25 +489,19 @@ impl Harness {
         ))
     }
 
-    /// Whether one venue's row carries a mark of `state` (`LOADING` / `LOADED` / `UNLOADED`).
     pub(crate) fn shows_mark(&self, venue: VenueId, state: &str) -> bool {
         self.find(&format!("TEST_MARKET_PARTICIPANTS_{state}_{venue:?}"))
             .is_some()
     }
 
-    /// Whether the row a venue is drawn as is drawn at all.
     pub(crate) fn shows_row(&self, venue: VenueId) -> bool {
         self.row(venue).is_some()
     }
 
-    /// The panel's own rows are drawn inside a popup overlay; this says whether the panel is
-    /// up by looking for a venue row.
     pub(crate) fn shows_panel(&self) -> bool {
         self.find("TEST_MARKET_PARTICIPANTS_ROW_").is_some()
     }
 
-    /// Switches the language the way the composition root does: the translator first, then
-    /// the signal every `bind_text` closure reads.
     pub(crate) fn switch_language(&mut self, language: LanguageCode) {
         self.services.translate.set_language(language);
         let signal = self.services.language;
@@ -591,7 +509,6 @@ impl Harness {
     }
 }
 
-/// The centre of a laid-out box, in window coordinates.
 fn centre_of(rect: ui_core::math::Rect) -> Point {
     Point {
         x: rect.origin.x + rect.size.width / 2.0,
@@ -601,8 +518,6 @@ fn centre_of(rect: ui_core::math::Rect) -> Point {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        // A menu released after its window is gone holds handles into a tree that no longer
-        // exists; the order the application uses is "release, then close".
         self.menu.release(self.app.app_mut());
     }
 }

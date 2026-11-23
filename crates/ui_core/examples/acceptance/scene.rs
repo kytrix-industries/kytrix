@@ -1,22 +1,3 @@
-//! 最终验收的**固定合成负载**（`.docs/ui_core-整改计划.md` 的验收负载定义）。
-//!
-//! 单窗口 1280×800，三平台同一负载、同一更新脚本：
-//!
-//! | 区域 | 规模 | 更新方式 | 走哪条通道 |
-//! |---|---|---|---|
-//! | 盘口 | 5000 行 × 8 列数字文本（40 000 个文本节点） | 每增量帧只改 5 行 | 文本塑形 + 增量 lane 编码 |
-//! | 成交明细 | 500 笔 × 4 列（2 000 个文本节点） | 每帧追加 1 笔 + 列表滚动 1 行 | 文本 + **滚动偏移**（不重建 lane） |
-//! | 折线图 | 200 000 点（40 万顶点 / 120 万索引的静态几何） | 每帧平移窗口 0.5 px | 几何通道的 per-draw 变换（顶点不重建） |
-//! | 头部 / 侧栏 | 固定文本与面板底色 | 不更新 | lane 整段复用 |
-//!
-//! 数字全部落在 `DigitFastPath` 的字符集里（`0-9 . , + - %`，见
-//! `text/fast_path.rs::ALPHABET`），因此「等宽数字字体路径」被真实覆盖：盘口的每一格都是
-//! 数字串，命中快速路径后跳过 parley 的 itemize/shaping。
-//!
-//! 所有位置都是**绝对定位**（`LayoutOverride` / 绝对 `Style`）：表格与看盘类界面的真实做法，
-//! 也让「增量帧 CPU」不被 taffy 的整树布局淹没。固定头部/侧栏不在任何滚动容器里，
-//! 它们的存在用来验证滚动帧不会波及不相关子树。
-
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
@@ -34,59 +15,34 @@ use ui_core::{
     window::WindowId,
 };
 
-// ── 窗口与布局（写进报告，三平台一致） ──────────────────────────────────────
-
-/// 验收窗口的逻辑宽度（`.docs/ui_core-整改计划.md`：单窗口 1280×800）。
 pub const WINDOW_WIDTH: f32 = 1280.0;
-/// 验收窗口的逻辑高度。
 pub const WINDOW_HEIGHT: f32 = 800.0;
-/// 验收窗口的逻辑尺寸。
 pub const WINDOW_SIZE: Size = Size::new(WINDOW_WIDTH, WINDOW_HEIGHT);
 
-/// 盘口行数。
 pub const BOOK_ROWS: usize = 5_000;
-/// 盘口列数（每行 8 个数字文本节点）。
 pub const BOOK_COLUMNS: usize = 8;
-/// 成交明细行数。
 pub const TRADE_ROWS: usize = 500;
-/// 成交明细列数。
 pub const TRADE_COLUMNS: usize = 4;
-/// 折线图的点数。
 pub const CHART_POINTS: usize = 200_000;
-/// 「1000 单元文本同时更新」的行数（125 × 8 = 1000 个文本节点）。
 pub const TEXT_UPDATE_ROWS: usize = 125;
 
-/// 每增量帧改写的盘口行数。
 pub const INCREMENTAL_ROWS: usize = 5;
 
-/// 头部高度（固定，不在滚动容器里）。
 const HEADER_HEIGHT: f32 = 44.0;
-/// 侧栏宽度（固定，不在滚动容器里）。
 const SIDEBAR_WIDTH: f32 = 180.0;
 
-/// 盘口面板矩形。
 const BOOK_RECT: Rect = Rect::new(SIDEBAR_WIDTH, HEADER_HEIGHT, 520.0, 756.0);
-/// 折线面板矩形。
 const CHART_RECT: Rect = Rect::new(700.0, HEADER_HEIGHT, 580.0, 420.0);
-/// 成交面板矩形。
 const TAPE_RECT: Rect = Rect::new(700.0, 464.0, 580.0, 336.0);
 
-/// 盘口面板内表头高度（标题 + 列名）。
 const BOOK_HEADER_HEIGHT: f32 = 44.0;
-/// 成交面板内表头高度。
 const TAPE_HEADER_HEIGHT: f32 = 36.0;
-/// 盘口行高。
 const BOOK_ROW_HEIGHT: f32 = 16.0;
-/// 成交行高。
 const TRADE_ROW_HEIGHT: f32 = 16.0;
-/// 盘口列宽。
 const BOOK_CELL_WIDTH: f32 = 65.0;
-/// 成交列宽。
 const TRADE_CELL_WIDTH: f32 = 145.0;
-/// 文本字号（盘口 / 成交 / 标签同一档；数字路径按字号缓存）。
 const TEXT_SIZE: f32 = 12.0;
 
-/// 折线图绘图区（**绝对内容坐标**；几何顶点与它同空间）。
 const CHART_PLOT: Rect = Rect::new(
     CHART_RECT.origin.x + 8.0,
     CHART_RECT.origin.y + 34.0,
@@ -94,80 +50,50 @@ const CHART_PLOT: Rect = Rect::new(
     CHART_RECT.size.height - 44.0,
 );
 
-/// 背景色（`#0B0E13`）。
 const BG_RGBA: [u8; 4] = [0x0B, 0x0E, 0x13, 0xFF];
-/// 面板底色（`#141A22`）。
 const CARD_RGBA: [u8; 4] = [0x14, 0x1A, 0x22, 0xFF];
-/// 面板边框（`#222C38`）。
 const CARD_BORDER_RGBA: [u8; 4] = [0x22, 0x2C, 0x38, 0xFF];
-/// 正文色（`#E6E8EB`）。
 const TEXT_RGBA: [u8; 4] = [0xE6, 0xE8, 0xEB, 0xFF];
-/// 次要文字（`#93A4B5`）。
 const MUTED_RGBA: [u8; 4] = [0x93, 0xA4, 0xB5, 0xFF];
-/// 强调色（`#4C9AFF`）。
 const ACCENT_RGBA: [u8; 4] = [0x4C, 0x9A, 0xFF, 0xFF];
-/// 折线色（`#F0B429`）。
 const CHART_RGBA: [u8; 4] = [0xF0, 0xB4, 0x29, 0xFF];
 
-/// 平台等宽字体（数字表格的常规选择；缺失时由字体回退兜底）。
 #[cfg(windows)]
 const MONO_FAMILY: &str = "Consolas";
-/// 平台等宽字体。
 #[cfg(target_os = "macos")]
 const MONO_FAMILY: &str = "Menlo";
-/// 平台等宽字体。
 #[cfg(target_os = "linux")]
 const MONO_FAMILY: &str = "DejaVu Sans Mono";
 
-/// 盘口列名（与 [`book_text`] 的列语义一一对应）。
 const BOOK_COLUMN_NAMES: [&str; BOOK_COLUMNS] = [
     "价格", "数量", "累计", "买量", "卖量", "笔数", "占比", "涨跌",
 ];
-/// 成交列名。
 const TRADE_COLUMN_NAMES: [&str; TRADE_COLUMNS] = ["时间", "价格", "数量", "方向"];
 
-// ── 场景句柄 ────────────────────────────────────────────────────────────────
-
-/// 一行业务数据（8 列：价格分、数量、累计、买量、卖量、笔数、占比千分比、涨跌分）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BookRow(pub [u32; BOOK_COLUMNS]);
 
-/// 一笔成交（`seq` 是单调序号，其余列由它派生）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TradeRow(pub u32);
 
-/// 建树期产出的句柄（拆出来是为了让整棵树在**一次** `&mut NodeTree` 借用里建完）。
 struct Handles {
     chart: NodeId,
     book_viewport: NodeId,
     tape_viewport: NodeId,
 }
 
-/// 场景句柄：驱动更新需要的全部句柄与状态。
 pub struct Load {
-    /// 窗口。
     pub window: WindowId,
-    /// 盘口每行一个信号（写 1 行 ⇒ 只失效该行的 8 个文本节点）。
     book_rows: Vec<Signal<BookRow>>,
-    /// 成交每行一个信号。
     trade_rows: Vec<Signal<TradeRow>>,
-    /// 折线图几何节点。
     pub chart: NodeId,
-    /// 成交列表滚动句柄。
     tape_scroll: ScrollHandle,
-    /// 折线窗口平移量（逻辑像素）。
     chart_pan: f32,
-    /// 已推进的脚本步数（成交序号 / 值生成共用）。
     step: u32,
-    /// 成交序号。
     trade_seq: u32,
 }
 
 impl Load {
-    /// 挂载整份合成负载。
-    ///
-    /// # Errors
-    /// 建树 / 几何注册 / 滚动容器创建失败（应用错误，验收脚本直接终止）。
     pub fn build(app: &mut App, window: WindowId) -> Result<Self, EngineError> {
         let root = app
             .window(window)
@@ -175,7 +101,6 @@ impl Load {
             .tree()
             .root();
 
-        // 信号与几何先建好：建树期间的 `&mut NodeTree` 借用不能再碰 `App`。
         let mut book_rows = Vec::with_capacity(BOOK_ROWS);
         for row in 0..BOOK_ROWS {
             let values = std::array::from_fn(|column| book_value(row, column, 0));
@@ -226,14 +151,12 @@ impl Load {
         })
     }
 
-    /// 场景的节点数（报告用）。
     #[must_use]
     pub fn node_count(&self, app: &App) -> usize {
         app.window(self.window)
             .map_or(0, |window| window.tree().len())
     }
 
-    /// 一行负载描述（报告抬头；三平台必须一致）。
     #[must_use]
     pub fn describe(&self, app: &App) -> String {
         format!(
@@ -247,7 +170,6 @@ impl Load {
         )
     }
 
-    /// 增量帧：改 5 行盘口 + 追加 1 笔成交并滚动 1 行 + 折线窗口平移 0.5 px。
     pub fn incremental_step(&mut self, app: &mut App) {
         self.step = self.step.wrapping_add(1);
         for k in 0..INCREMENTAL_ROWS {
@@ -258,7 +180,6 @@ impl Load {
         self.pan_chart(app);
     }
 
-    /// 「1000 单元文本同时更新」帧：125 行 × 8 列 = 1000 个文本节点全部换值。
     pub fn text_update_step(&mut self, app: &mut App) {
         self.step = self.step.wrapping_add(1);
         for k in 0..TEXT_UPDATE_ROWS {
@@ -267,42 +188,35 @@ impl Load {
         }
     }
 
-    /// 只平移折线窗口（隔离「几何通道 per-draw 变换」的成本）。
     pub fn pan_step(&mut self, app: &mut App) {
         self.step = self.step.wrapping_add(1);
         self.pan_chart(app);
     }
 
-    /// 只滚动成交列表 1 行（隔离滚动偏移通道的成本）。
     pub fn scroll_step(&mut self, app: &mut App) {
         self.step = self.step.wrapping_add(1);
         self.scroll_tape(app);
     }
 
-    /// 不写任何状态（空闲帧：帧门禁必须退化为 `Idle`）。
     pub fn idle_step(&mut self) {
         self.step = self.step.wrapping_add(1);
     }
 
-    /// 当前脚本步数。
     #[must_use]
     pub fn step(&self) -> u32 {
         self.step
     }
 
-    /// 折线窗口的当前平移量（逻辑像素）。
     #[must_use]
     pub fn chart_pan(&self) -> f32 {
         self.chart_pan
     }
 
-    /// 把一行盘口的 8 列改成 `self.step` 对应的新值（值恒变 ⇒ 8 个文本节点必然失效）。
     fn write_book_row(&mut self, app: &mut App, row: usize) {
         let values = std::array::from_fn(|column| book_value(row, column, self.step));
         let _ = app.write(&self.book_rows[row], BookRow(values));
     }
 
-    /// 追加一笔成交：写下一行的 4 个文本格，并把列表滚动 1 行。
     fn append_trade(&mut self, app: &mut App) {
         let row = (self.trade_seq as usize) % TRADE_ROWS;
         self.trade_seq = self.trade_seq.wrapping_add(1);
@@ -310,7 +224,6 @@ impl Load {
         self.scroll_tape(app);
     }
 
-    /// 成交列表滚动：每帧下移 1 行，到末尾回到顶部（数据是环形 500 行）。
     fn scroll_tape(&mut self, app: &mut App) {
         let viewport = TAPE_RECT.size.height - TAPE_HEADER_HEIGHT - 4.0;
         let content = TRADE_ROWS as f32 * TRADE_ROW_HEIGHT;
@@ -319,7 +232,6 @@ impl Load {
         let _ = app.scroll_to(&self.tape_scroll, Point::new(0.0, offset));
     }
 
-    /// 折线窗口平移：0.5 px / 帧，0…7.5 px 循环（**只改 per-draw 变换**）。
     fn pan_chart(&mut self, app: &mut App) {
         self.chart_pan = f32::from((self.step % 16) as u8) * 0.5;
         let _ = app.set_geometry_transform(
@@ -330,9 +242,6 @@ impl Load {
     }
 }
 
-// ── 建树 ────────────────────────────────────────────────────────────────────
-
-/// 挂载全部节点（一次 `&mut NodeTree` 借用完成，建树期不再查窗口）。
 fn build_tree(
     tree: &mut NodeTree,
     root: NodeId,
@@ -346,7 +255,6 @@ fn build_tree(
     let muted = Color::from_rgba8(MUTED_RGBA);
     let accent = Color::from_rgba8(ACCENT_RGBA);
 
-    // 整窗背景（fixed，不随任何滚动移动）。
     let _ = NodeBuilder::boxed()
         .style(absolute_box(0.0, 0.0, WINDOW_WIDTH, WINDOW_HEIGHT))
         .paint(PaintSpec {
@@ -356,7 +264,6 @@ fn build_tree(
         .build(tree, root)
         .expect("背景");
 
-    // ── 固定头部 ─────────────────────────────────────────────────────────
     let header = NodeBuilder::boxed()
         .style(absolute_box(0.0, 0.0, WINDOW_WIDTH, HEADER_HEIGHT))
         .paint(PaintSpec {
@@ -396,7 +303,6 @@ fn build_tree(
         );
     }
 
-    // ── 固定侧栏 ─────────────────────────────────────────────────────────
     let sidebar = NodeBuilder::boxed()
         .style(absolute_box(
             0.0,
@@ -431,7 +337,6 @@ fn build_tree(
         );
     }
 
-    // ── 盘口（5000 行 × 8 列） ───────────────────────────────────────────
     let book = panel(tree, root, BOOK_RECT, "盘口 · 5000 行 × 8 列（等宽数字）");
     for (column, name) in BOOK_COLUMN_NAMES.iter().enumerate() {
         label(
@@ -476,7 +381,6 @@ fn build_tree(
         }
     }
 
-    // ── 折线图（20 万点静态几何） ────────────────────────────────────────
     let chart_panel = panel(tree, root, CHART_RECT, "折线 · 200 000 点（静态几何通道）");
     label(
         tree,
@@ -499,7 +403,6 @@ fn build_tree(
         .build(tree, chart_panel)
         .expect("折线图节点");
 
-    // ── 成交明细（500 笔 × 4 列） ────────────────────────────────────────
     let tape = panel(tree, root, TAPE_RECT, "成交明细 · 500 笔（追加 + 滚动）");
     for (column, name) in TRADE_COLUMN_NAMES.iter().enumerate() {
         label(
@@ -551,7 +454,6 @@ fn build_tree(
     }
 }
 
-/// 面板：绝对定位 + 底色 + 边框 + 标题。
 fn panel(tree: &mut NodeTree, root: NodeId, rect: Rect, title: &str) -> NodeId {
     let panel = NodeBuilder::boxed()
         .style(absolute_box(
@@ -581,7 +483,6 @@ fn panel(tree: &mut NodeTree, root: NodeId, rect: Rect, title: &str) -> NodeId {
     panel
 }
 
-/// 绝对定位的文本叶子（标签 / 列名 / 表头）。
 fn label(tree: &mut NodeTree, parent: NodeId, rect: Rect, content: &str, style: TextStyle) {
     let _ = NodeBuilder::text(content, style)
         .layout_override(rect)
@@ -589,13 +490,6 @@ fn label(tree: &mut NodeTree, parent: NodeId, rect: Rect, content: &str, style: 
         .expect("验收标签");
 }
 
-// ── 值生成与文本格式（确定性：同一步在任何平台给出同一串） ──────────────────
-
-/// 盘口单元格的值：列 0 是价格（分），列 6 是占比（千分比），列 7 是涨跌（分，带符号），
-/// 其余是无量纲计数。
-///
-/// **每步必然变化**：取值 = 列内基准 + `step`，相邻两步的文本一定不同（否则
-/// `App::write` 会退化成 no-op，那一帧少一条脏 lane，报告里的 `encoded_lanes` 就对不齐）。
 #[must_use]
 pub fn book_value(row: usize, column: usize, step: u32) -> u32 {
     let seed = (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -609,7 +503,6 @@ pub fn book_value(row: usize, column: usize, step: u32) -> u32 {
     }
 }
 
-/// 盘口单元格的文本（全部落在 `DigitFastPath` 字符集里）。
 #[must_use]
 pub fn book_text(value: u32, column: usize) -> SmolStr {
     match column {
@@ -623,7 +516,6 @@ pub fn book_text(value: u32, column: usize) -> SmolStr {
     }
 }
 
-/// 成交单元格的文本。
 #[must_use]
 pub fn trade_text(seq: u32, column: usize) -> SmolStr {
     let price = 900_000 + seq.wrapping_mul(7_919) % 200_000;
@@ -636,9 +528,6 @@ pub fn trade_text(seq: u32, column: usize) -> SmolStr {
     }
 }
 
-// ── 建树小工具 ──────────────────────────────────────────────────────────────
-
-/// 数字/表格文本样式：等宽族 + 不换行。
 fn mono_style(size: f32, color: Color) -> TextStyle {
     TextStyle::new(size)
         .with_family(MONO_FAMILY)
@@ -646,7 +535,6 @@ fn mono_style(size: f32, color: Color) -> TextStyle {
         .with_wrap(TextWrap::NoWrap)
 }
 
-/// 绝对定位盒（`left/top` 定死，`width/height` 定死；不参与父级 flex 流）。
 fn absolute_box(left: f32, top: f32, width: f32, height: f32) -> Style {
     use taffy::{
         geometry::Rect as TaffyRect,
@@ -668,27 +556,15 @@ fn absolute_box(left: f32, top: f32, width: f32, height: f32) -> Style {
     style
 }
 
-/// 滚动视口：绝对定位 + 裁剪到自身边框盒。
 fn viewport_style(left: f32, top: f32, width: f32, height: f32) -> Style {
     let mut style = absolute_box(left, top, width, height);
     style.clip = Clip::Bounds;
     style
 }
 
-/// 注册 20 万点的折线几何（三角列表，2 顶点/点，6 索引/段）。
-///
-/// 顶点布局是 `GeometryPipeline::Ui` 的 12 B：`[x, y, coverage]`（逻辑像素 + 有符号覆盖率距离）。
-/// 顶点用**绝对内容坐标**（与 `GeometryDesc::bounds` 同空间）；平移走 `App::set_geometry_transform`，
-/// 顶点字节一次注册、永不重建。
-///
-/// # Errors
-/// 几何注册校验失败（`GeometryRegister`）。
 fn register_chart(app: &mut App) -> Result<GeometryId, EngineError> {
-    /// `GeometryPipeline::Ui` 的每顶点字节数（位置 ×2 + 覆盖率距离）。
     const VERTEX_BYTES: usize = 12;
-    /// 折线半厚度（逻辑像素）。
     const HALF_THICKNESS: f32 = 0.5;
-    /// 覆盖率的距离字段：恒在半厚度内侧（形状内部 ⇒ 不透出 AA 带）。
     const COVERAGE: f32 = -HALF_THICKNESS;
 
     let mut vertices = Vec::with_capacity(CHART_POINTS * 2 * VERTEX_BYTES);
@@ -697,7 +573,6 @@ fn register_chart(app: &mut App) -> Result<GeometryId, EngineError> {
     let dx = CHART_PLOT.size.width / (CHART_POINTS - 1) as f32;
 
     for point in 0..CHART_POINTS {
-        // 确定性随机游走（无堆分配、无外部随机源；验收脚本要求同一步在平台间可复现）。
         let noise = book_value(point, 3, 0);
         let delta = (noise % 2_001) as f32 / 1_000.0 - 1.0;
         y = (y + delta * 1.8).clamp(0.0, CHART_PLOT.size.height);
@@ -723,7 +598,6 @@ fn register_chart(app: &mut App) -> Result<GeometryId, EngineError> {
         vertex_stride: VERTEX_BYTES as u32,
         index_type: IndexType::U32,
         topology: Topology::TriangleList,
-        // 窗口平移范围（0…7.5 px）留出余量：damage 取「变换前后 AABB 的并集」。
         bounds: Rect::new(
             CHART_PLOT.origin.x - 16.0,
             CHART_PLOT.origin.y - 16.0,

@@ -1,32 +1,3 @@
-//! The window's title bar: the shell's own chrome, drawn over everything the window shows.
-//!
-//! The window is frameless on Windows (E6): the platform draws no title bar, and this strip
-//! is what the user sees instead. It carries the sidebar toggle, the market participants
-//! menu, the update indicator, the account control, and — everywhere but macOS, where the
-//! system draws its traffic lights — the window's minimize / maximize / close buttons.
-//!
-//! # Dragging the window
-//!
-//! The bar is not a drag handle by itself: the shell publishes the strip between its
-//! controls as the window's drag region every frame ([`TitleBar::drag_regions`]), and the
-//! platform answers `WM_NCHITTEST` over it with `HTCAPTION`, which is what keeps Aero Snap,
-//! the system menu and double-click-to-maximize working. The controls sit above the region
-//! and keep their own presses.
-//!
-//! # Rebuilding
-//!
-//! The bar is built once. Its maximize button is rebuilt when the window's maximized state
-//! changes (the icon is the state), and its toggle is rebuilt when the language changes
-//! (the label is catalogue copy). The market participants menu synchronizes itself and
-//! follows the language on its own; the account control and the updater synchronize
-//! themselves once per frame.
-//!
-//! # Release order
-//!
-//! The update indicator reads the updater's view signal, and that signal is minted in the
-//! updater's own scope: the indicator is released first, then the updater. The account
-//! control owns its own signal scope and components and is released independently.
-
 use base_ui::{
     kit::{button::Button, icon::IconKind, size::UnifiedSizable},
     style_builder::StyleBuilder,
@@ -53,18 +24,14 @@ use super::{
 };
 use crate::composition::Composition;
 
-/// The toggle's wrapper debug id, which the window's tests also find it by.
 pub(crate) const TITLE_BAR_SIDEBAR_TOGGLE: &str = "TITLE_BAR_SIDEBAR_TOGGLE";
 
-/// The debug id of the strip itself.
 pub(crate) const TITLE_BAR: &str = "TITLE_BAR";
 
-/// The window's system buttons.
 pub(crate) const WINDOW_MINIMIZE: &str = "WINDOW_MINIMIZE";
 pub(crate) const WINDOW_MAXIMIZE: &str = "WINDOW_MAXIMIZE";
 pub(crate) const WINDOW_CLOSE: &str = "WINDOW_CLOSE";
 
-/// Which window button a control is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SystemButton {
     Minimize,
@@ -72,7 +39,6 @@ enum SystemButton {
     Close,
 }
 
-/// The title bar and the controls it keeps.
 pub(crate) struct TitleBar {
     window: WindowId,
     node: NodeId,
@@ -82,27 +48,18 @@ pub(crate) struct TitleBar {
     theme: ThemeHandle,
     translate: Translate,
     language: LanguageCode,
-    /// The sidebar toggle (rebuilt on a language change).
     toggle: Option<Button>,
-    /// The window's system buttons, kept for event dispatch and release.
     system_buttons: Vec<(SystemButton, Button)>,
-    /// The market participants menu the bar draws, when the build has a connector.
     market: Option<MarketParticipants>,
     market_host: Option<MarketParticipantsHost>,
-    /// The account control (who is signed in, and the flows that change it).
     profile: Option<ProfileMenu>,
-    /// The updater this launch installed, and the indicator it draws while a release is on
-    /// offer. Released indicator first, then updater (see the module documentation).
     updater: Option<Updater>,
     indicator: Option<UpdateIndicator>,
-    /// Whether the window was maximized when the bar last synchronized.
     maximized: bool,
-    /// The strip between the controls, published as the window's drag region.
     drag_regions: Vec<Rect>,
 }
 
 impl TitleBar {
-    /// Builds the bar into `root` (the window's root node), drawn above the window's views.
     pub(crate) fn build(
         app: &mut App,
         window: WindowId,
@@ -138,9 +95,6 @@ impl TitleBar {
                 .padding_x(metrics::bar_inset())
                 .build(),
         )?;
-        // The flexible strip between the controls is the window's drag region (E6). Its own
-        // node is what the drag rectangles are computed from, so a control added to either
-        // cluster narrows the region without the region's code changing.
         let drag_strip = ui::container(
             app,
             window,
@@ -211,7 +165,6 @@ impl TitleBar {
         Ok(bar)
     }
 
-    /// Builds the sidebar toggle into the left cluster.
     fn build_toggle(&mut self, app: &mut App) -> Result<(), EngineError> {
         let label = t_smol!(self.translate, "window.sidebar.toggle");
         let intents = self.intents.clone();
@@ -226,8 +179,6 @@ impl TitleBar {
         .tooltip_text(label.clone())
         .a11y_label(label)
         .on_click(move |ctx| ui::report(ctx, &intents, Intent::ToggleSidebar));
-        // The wrapper is what the tests measure: it is the control's square, and it is what
-        // a window drag region excludes from the drag strip.
         let wrapper = ui::named(
             app,
             self.window,
@@ -241,7 +192,6 @@ impl TitleBar {
         Ok(())
     }
 
-    /// Releases the toggle's component and removes its nodes before a rebuild.
     fn release_toggle(&mut self, app: &mut App) {
         if let Some(toggle) = self.toggle.take()
             && let Some(node) = toggle.node()
@@ -251,7 +201,6 @@ impl TitleBar {
         }
     }
 
-    /// Builds the market participants menu the title bar hosts.
     fn build_market_menu(
         &mut self,
         app: &mut App,
@@ -274,10 +223,6 @@ impl TitleBar {
         Ok(())
     }
 
-    /// Installs the updater and mounts its indicator into the right cluster.
-    ///
-    /// The indicator is created even while nothing is on offer: its route is what watches
-    /// the updater's view signal, and it builds the button only once an update appears.
     fn build_updater(
         &mut self,
         app: &mut App,
@@ -303,7 +248,6 @@ impl TitleBar {
         Ok(())
     }
 
-    /// Builds the account control into the right cluster.
     fn build_profile(
         &mut self,
         app: &mut App,
@@ -316,7 +260,6 @@ impl TitleBar {
         Ok(())
     }
 
-    /// Builds one system button into the right cluster.
     fn build_system_button(
         &mut self,
         app: &mut App,
@@ -374,8 +317,6 @@ impl TitleBar {
         Ok(button)
     }
 
-    /// Runs one frame of the bar: the market menu, the account control, the window's state
-    /// and the drag region.
     pub(crate) fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         if app.window(self.window).is_none() {
             return Ok(());
@@ -399,7 +340,6 @@ impl TitleBar {
         Ok(())
     }
 
-    /// Rebuilds the maximize button when the window's state changed.
     fn sync_window_state(&mut self, app: &mut App) -> Result<(), EngineError> {
         let Some(state): Option<WindowState> = app.window(self.window).map(|target| target.state())
         else {
@@ -427,7 +367,6 @@ impl TitleBar {
         Ok(())
     }
 
-    /// Rebuilds the toggle when the language changed.
     fn sync_language(&mut self, app: &mut App) -> Result<(), EngineError> {
         let language = self
             .market_host
@@ -444,7 +383,6 @@ impl TitleBar {
         Ok(())
     }
 
-    /// Publishes the strip between the controls as the window's drag region (E6).
     fn publish_drag_regions(&mut self, app: &mut App) {
         let Some(target) = app.window(self.window) else {
             return;
@@ -474,13 +412,11 @@ impl TitleBar {
         }
     }
 
-    /// The drag region the bar published on the last frame.
     #[cfg(test)]
     pub(crate) fn drag_regions(&self) -> &[Rect] {
         &self.drag_regions
     }
 
-    /// Forwards one platform event to the bar's kit controls.
     pub(crate) fn dispatch(&mut self, app: &mut App, event: &Event) {
         if let Some(toggle) = &self.toggle {
             let _ = toggle.dispatch(app, event);
@@ -493,10 +429,6 @@ impl TitleBar {
         }
     }
 
-    /// Releases every component and node the bar owns.
-    ///
-    /// The indicator goes before the updater: it reads the updater's view signal, which the
-    /// updater's release takes back.
     pub(crate) fn release(&mut self, app: &mut App) {
         if let Some(profile) = &mut self.profile {
             if let Some(node) = profile.trigger_node() {
@@ -524,19 +456,16 @@ impl TitleBar {
         let _ = app.remove_node(self.window, self.node);
     }
 
-    /// The update indicator (the shell's tests assert it was mounted and released).
     #[cfg(test)]
     pub(crate) fn indicator(&self) -> Option<&UpdateIndicator> {
         self.indicator.as_ref()
     }
 
-    /// The updater (the shell's tests assert it was installed and released).
     #[cfg(test)]
     pub(crate) fn updater(&self) -> Option<&Updater> {
         self.updater.as_ref()
     }
 
-    /// The account control (the shell's tests assert the trigger was built).
     #[cfg(test)]
     pub(crate) fn profile(&self) -> Option<&ProfileMenu> {
         self.profile.as_ref()
@@ -548,8 +477,6 @@ mod tests {
 
     use super::*;
 
-    /// Every window button maps to the control the shell requests, and the shell's own
-    /// buttons (toggle, sidebar, gallery) do not.
     #[test]
     fn the_window_buttons_should_map_to_window_controls() {
         assert_eq!(

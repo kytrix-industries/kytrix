@@ -1,71 +1,27 @@
-//! 绘制桶（`Lane`）、clip 深度上限、以及一帧的绘制场景（`Scene`/`LaneId`）。
-//!
-//! **`Scene` / `LaneId` / lane 分配与绘制序在 P03 落地**
-//! `Lane` 与 `MAX_CLIP_DEPTH` 保持 crate 私有：应用层通过
-//! [`Canvas`] 与 [`Scene`] 的只读方法间接观测。
-//!
-//! [`Canvas`]: crate::paint::canvas::Canvas
-
 use crate::{
     node::id::{Arena, ArenaKey},
     paint::primitive::{ClipOp, Primitive},
 };
 
-/// clip 栈深度上限：**类型是 `u8`**，值 8。
-///
-/// 它约束的是**圆角层数**（本文件的 `Lane` 计数、`Canvas::push_clip` 的 `bool` 门限、
-/// `paint/instance.rs` 编码期的 `EngineError::ClipDepthExceeded` 三处同口径）；矩形 clip 在
-/// 编码期求交合并成**一条**像素精确 scissor、不占该预算，所以 GPU 裁剪链的长度上界是
-/// `MAX_CLIP_ITEMS = MAX_CLIP_DEPTH + 1`（三套 shader 的 `KYTRIX_MAX_CLIP_ITEMS` 是那段定长
-/// 循环的上界，由 `build.rs` 与 `paint/instance.rs` 双向校验）。注意它也不是「嵌套了几层容器」：
-/// 祖先容器的矩形 clip 会被折叠。
 pub(crate) const MAX_CLIP_DEPTH: u8 = 8;
 
-/// 一个绘制输出桶。内容按绘制序排列；`clip_depth` 是 C2/C3 的**增量校验状态**。
-///
-/// 只在 crate 内可见：应用层通过 `Canvas` 构造与读取。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Lane {
     primitives: Vec<Primitive>,
     clip_depth: u8,
-    /// 该 lane 的图元烘焙在哪个滚动槽的**内容空间**（`0` = 不随滚动偏移）。
-    ///
-    /// 见 `render/delta.rs` 的坐标系约定：槽位 > 0 时图元的坐标**不含**该滚动容器自己的
-    /// 偏移，绘制期由 GPU 的 `frame.params.yz` 加上；`0` 表示图元已经烘焙成最终屏幕坐标。
-    /// 槽位变化必须让版本 +1（编码器的段复用判据里含槽位）。
-    ///
-    /// `u16` 而不是 `u32`：`Lane` 必须保持 32 B（`Canvas` = 48 B 的静态断言，见
-    /// `paint/canvas.rs`），`Vec` 占 24 B 之后只剩 8 B 给三个字段。
     scroll: u16,
-    /// 内容版本（**增量实例编码的复用判据**，`docs` B6 §2）：
-    ///
-    /// 任何会改变 lane 内容（图元序列）的操作都 `+1`：`push`（追加图元）与 `clear`
-    /// （重建 / 隐藏清空 / `clear_frame`）。编码器把「版本未变」当作「实例段可以整段复用」，
-    /// 因此**严禁**在任何内容修改点漏掉版本递增 —— 漏掉会让下游一直画旧像素。
-    ///
-    /// `u32` 环绕是安全的：判据是「与上次编码的版本相等」，不依赖顺序。
     version: u32,
 }
 
 impl Lane {
-    /// 空 lane。消费者：`Canvas::new`。
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// 当前内容版本（消费者：`InstanceEncoder` 的 lane 复用判据）。
     pub(crate) fn version(&self) -> u32 {
         self.version
     }
 
-    /// 唯一的压入点：更新 `clip_depth`（消费者：`Canvas` 的 `push_*`、`Scene::push`）。
-    ///
-    /// **深度上限不在这里判定**（R05-5）。一个 lane 的 clip 括号 = 祖先 clip（`paint/pass.rs`
-    /// 压入）加自身 content clip 加 `Canvas` 内部 clip；三层叠加后是否超限只有编码期知道
-    /// （矩形 clip 会被求交合并成一项，圆角 clip 逐层计数）。因此这里只维护计数（供
-    /// `Canvas::pop_clip` 的空栈判据与 [`Lane::rounded_clip_depth`] 使用），越界由
-    /// `InstanceEncoder::encode` 返回 `EngineError::ClipDepthExceeded`，debug 与 release 行为
-    /// 一致，不再有 debug panic。
     pub(crate) fn push(&mut self, primitive: Primitive) {
         match &primitive {
             Primitive::Clip(ClipOp::Push(_)) => {
@@ -81,26 +37,20 @@ impl Lane {
         self.primitives.push(primitive);
     }
 
-    /// 清空内容并复位 clip 深度，但**保留 `Vec` 容量**（消费者：`Scene::clear_frame`）。
     pub(crate) fn clear(&mut self) {
         self.primitives.clear();
         self.clip_depth = 0;
         self.version = self.version.wrapping_add(1);
     }
 
-    /// 当前 clip 嵌套深度。消费者：`Lane::push`（内部）与 `Canvas` 的 `pop_clip` 空栈判据。
     pub(crate) fn clip_depth(&self) -> u8 {
         self.clip_depth
     }
 
-    /// 本 lane 的滚动槽（`0` = 不随滚动偏移；消费者：`LaneSource::lane_scroll`）。
     pub(crate) fn scroll(&self) -> u32 {
         u32::from(self.scroll)
     }
 
-    /// 写滚动槽；**槽位变化必须让内容版本前进**（编码器的段复用判据含槽位，段归属变了要重编码）。
-    ///
-    /// 消费者：`paint/pass.rs` 的 `rebuild_lane`（每次重建都写一次）。
     pub(crate) fn set_scroll(&mut self, slot: u32) {
         let slot = u16::try_from(slot).unwrap_or(u16::MAX);
         if self.scroll != slot {
@@ -109,13 +59,6 @@ impl Lane {
         }
     }
 
-    /// 当前**未弹出**的 clip 里，四角半径非全 0（= 编码期会各占一层、计入 `MAX_CLIP_DEPTH`
-    /// 预算）的层数 —— 与编码器的预算口径一致（矩形 clip 求交合并成一条，不占层数）。
-    ///
-    /// 为什么从图元序列回溯而不是另外记一个计数器：`Lane` 只有 32 B 的预算（`Canvas` = 48 B，
-    /// 见 `canvas_size_is_48_bytes`），而 `ClipOp::Pop` **不携带**被弹层的 payload —— 要正确
-    /// 递减就必须再存一个栈，那会把 `Canvas` 撑大。栈深 ≤ `MAX_CLIP_DEPTH`（8），回溯扫描
-    /// 的代价是 O(8)，且只在 `Canvas::push_clip` / 编码期预算判定时调用（每帧至多几次）。
     pub(crate) fn rounded_clip_depth(&self) -> usize {
         let mut open = 0usize;
         let mut rounded = 0usize;
@@ -135,20 +78,15 @@ impl Lane {
         rounded
     }
 
-    /// 只读切片。消费者：`Canvas::primitives`、`Scene::lane_primitives`。
     pub(crate) fn primitives(&self) -> &[Primitive] {
         &self.primitives
     }
 
-    /// 消费者：`Canvas::is_empty`。
     pub(crate) fn is_empty(&self) -> bool {
         self.primitives.is_empty()
     }
 }
 
-/// lane 句柄（P02 §7.2 冻结形状：私有字段 + 代际）。8 B，`Copy + Eq + Hash`。
-///
-/// 释放后代际 +1，旧句柄立即失效（否则会往**别人的** lane 里写图元）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LaneId {
     index: u32,
@@ -166,58 +104,35 @@ impl ArenaKey for LaneId {
 }
 
 impl LaneId {
-    /// arena 槽位下标（**crate 内**：编码器的段表按它索引；应用层不暴露，避免依赖槽位布局）。
     pub(crate) const fn slot(self) -> u32 {
         self.index
     }
 
-    /// 代际（**crate 内**：编码器用它判定「槽位已被新 lane 复用 ⇒ 旧段失效」）。
     pub(crate) const fn generation(self) -> u32 {
         self.generation
     }
 
-    /// arena 槽位下标（**仅测试**：公开面不暴露内部下标，避免应用层依赖槽位布局）。
     #[cfg(test)]
     pub(crate) const fn index(self) -> u32 {
         self.index
     }
 
-    /// 仅测试：直接构造句柄（layout 侧表与 `remove` 的 lane 归还用例需要）。
     #[cfg(test)]
     pub(crate) const fn for_test(index: u32, generation: u32) -> Self {
         Self { index, generation }
     }
 }
 
-/// 一帧的绘制指令（I2）。**持久**：lane id 跨帧稳定（`Node.lanes` 持有）。
-///
-/// **派生约束**：只 `derive(Debug)`。不 `Clone`（lane 复用是搬不是拷，P02 S-15）、不 `Default`
-/// （`new_without_default` 用私有构造器规避），且**无公开构造器**：应用层只能读 `Window::scene()`。
 #[derive(Debug)]
 pub struct Scene {
     lanes: Arena<Lane, LaneId>,
-    /// 本帧的 lane 绘制序（P06 的 paint 阶段用 `set_order` 写入）。
     order: Vec<LaneId>,
-    /// 自上次 [`Scene::take_dirty_lanes`] 以来内容变过的 lane（**不查重**：一条 lane 的多次
-    /// `push` 会各记一条，消费端用版本判据去重 —— 代价只是一次槽位比较）。
-    ///
-    /// 由 `Scene` 的写入点自己记录，而不是让 paint pass 在调用点逐个上报：lane 内容的唯一真相
-    /// 在这个类型里，这样任何新增写入路径都不可能"忘记录"（漏记 = 漏画，视觉 bug；多记只是
-    /// 一次白跑的比较）。UI 侧的增量采集（`DeltaBuilder`）因此不必每帧扫 10k 条 lane。
     dirty: Vec<LaneId>,
-    /// `false` = 本帧的脏表**不完整**（`clear_frame` 这类全表复位没有逐条登记），消费端必须
-    /// 回退全量扫描。
     dirty_complete: bool,
-    /// 几何节点**块 lane** 的绘制范围（X5）：`lane → (geometry, chunk)`。
-    ///
-    /// 只有几何节点的块 lane 有条目（数量 = 块数，通常几条到几十条），因此用按需
-    /// `HashMap` 而不是按 arena 槽位预分配（10k lane × 12 B 的白付）。编码器据此把该 lane
-    /// 编码成「只画第 chunk 块」的几何 op，而不是整块几何的全部块。
     geometry_chunks: ahash::HashMap<LaneId, (crate::paint::geometry::GeometryId, u32)>,
 }
 
 impl Scene {
-    /// **唯一的构造点**（`pub(crate)`）：消费者 `Window::new`。应用层不可构造。
     pub(crate) fn empty() -> Self {
         Self {
             lanes: Arena::<Lane, LaneId>::new(),
@@ -228,20 +143,15 @@ impl Scene {
         }
     }
 
-    /// engine-internal, 应用层不得调用 —— 分配一条空 lane。
     pub fn new_lane(&mut self) -> LaneId {
         self.lanes.insert_with(|_| Lane::new())
     }
 
-    /// engine-internal, 应用层不得调用 —— 释放 lane（代际 +1，旧句柄立即失效）；陈旧句柄 → 无操作。
     pub fn release_lane(&mut self, id: LaneId) {
         let _ = self.lanes.remove(id);
         self.geometry_chunks.remove(&id);
     }
 
-    /// engine-internal —— 登记几何块 lane 的绘制范围（`None` = 该 lane 画整块几何 / 非几何）。
-    ///
-    /// 消费者：`paint/pass.rs` 的块 lane 重建；读取者：编码器（`LaneSource::lane_geometry_chunk`）。
     pub(crate) fn set_lane_geometry_chunk(
         &mut self,
         lane: LaneId,
@@ -257,7 +167,6 @@ impl Scene {
         }
     }
 
-    /// 一条 lane 的几何块绘制范围（`None` = 整块几何 / 非几何 lane）。
     #[must_use]
     pub(crate) fn lane_geometry_chunk(
         &self,
@@ -266,9 +175,6 @@ impl Scene {
         self.geometry_chunks.get(&lane).copied()
     }
 
-    /// engine-internal, 应用层不得调用 —— 向 lane 追加一条图元（**唯一**写入点）。
-    ///
-    /// 返回 `false` = lane 句柄陈旧。内部转调 `Lane::push`（更新 `clip_depth` 并做 C2/C3 的 debug 断言）。
     #[must_use]
     pub fn push(&mut self, lane: LaneId, primitive: Primitive) -> bool {
         match self.lanes.get_mut(lane) {
@@ -281,20 +187,14 @@ impl Scene {
         }
     }
 
-    /// engine-internal, 应用层不得调用 —— 清空**所有** lane 的内容但保留分配与容量（每帧 paint 的起点）。
     pub fn clear_frame(&mut self) {
         self.geometry_chunks.clear();
         for lane in self.lanes.values_mut() {
             lane.clear();
         }
-        // 全表复位：逐条登记的成本与这里已有的 O(lanes) 遍历无关，但也没有收益 —— 直接把脏表
-        // 标记为不可信，让消费端回退一次全量扫描（可观测：`DeltaBuilder::full_scans`）。
         self.dirty_complete = false;
     }
 
-    /// engine-internal, 应用层不得调用 —— 清空**一条** lane 的内容并复位 `clip_depth`（保留容量）。
-    ///
-    /// 返回 `false` = lane 句柄陈旧。消费者：P06 的 paint pass（按节点重建 lane 的起点）。
     #[must_use]
     pub fn clear_lane(&mut self, id: LaneId) -> bool {
         match self.lanes.get_mut(id) {
@@ -307,25 +207,15 @@ impl Scene {
         }
     }
 
-    /// 取走本帧的脏 lane 表（消费者：`DeltaBuilder` 的增量采集）。
-    ///
-    /// 返回 `false` = 脏表**不完整**（`clear_frame` 等全表复位之后），调用方必须回退全量扫描。
-    /// `into` 由调用方持有并跨帧复用（`DeltaBuilder` 保留容量 ⇒ 稳态零分配）；返回后它内容
-    /// 就是本帧的脏表（**可能有重复**，版本判据会去重）。
     pub(crate) fn take_dirty_lanes(&mut self, into: &mut Vec<LaneId>) -> bool {
         std::mem::swap(into, &mut self.dirty);
-        // 换回来的缓冲区清空保留容量：下一帧的写入点直接往里推。
         self.dirty.clear();
         let complete = self.dirty_complete;
         self.dirty_complete = true;
         complete
     }
 
-    /// engine-internal, 应用层不得调用 —— 写入本帧绘制序。
-    ///
-    /// **契约**：`order` 由调用方（P06 的 paint 阶段）保证**无重复**；本方法不查重（查重是 O(n)）。
     pub fn set_order(&mut self, order: &[LaneId]) {
-        // 增量帧的绘制序通常与上一帧完全一致（只有内容变化）：相等时跳过 10k × 8 B 的拷贝。
         if self.order == order {
             return;
         }
@@ -333,21 +223,15 @@ impl Scene {
         self.order.extend_from_slice(order);
     }
 
-    /// engine-internal, 应用层不得调用 —— 撤销绘制序。
     pub fn clear_order(&mut self) {
         self.order.clear();
     }
 
-    /// 一条 lane 的图元切片。**不**返回 `&Lane`（`Lane` 是 crate 私有，见 F-38）。
     #[must_use]
     pub fn lane_primitives(&self, id: LaneId) -> Option<&[Primitive]> {
         self.lanes.get(id).map(Lane::primitives)
     }
 
-    /// 一条 lane 的**内容版本 + 图元切片**（增量实例编码的复用判据）。
-    ///
-    /// 编码器热路径只查一次 arena：`None` = 句柄陈旧/已释放；版本与上次编码时相同 ⇒ 该 lane
-    /// 的实例段整段复用（不重编码、不重传）。
     #[must_use]
     pub(crate) fn lane_state(&self, id: LaneId) -> Option<(u32, &[Primitive])> {
         self.lanes
@@ -355,24 +239,16 @@ impl Scene {
             .map(|lane| (lane.version(), lane.primitives()))
     }
 
-    /// 已分配的 lane 数。
     #[must_use]
     pub fn lane_count(&self) -> usize {
         self.lanes.len()
     }
 
-    /// 一条 lane 的滚动槽（`0` = 图元已烘焙成屏幕坐标；见 `render/delta.rs` 的坐标系约定）。
-    ///
-    /// 消费者：`LaneSource::lane_scroll`（inline 编码）与 `DeltaBuilder`（把槽位带上总线）。
     #[must_use]
     pub(crate) fn lane_scroll(&self, id: LaneId) -> u32 {
         self.lanes.get(id).map_or(0, Lane::scroll)
     }
 
-    /// 写一条 lane 的滚动槽（消费者：`paint/pass.rs` 的 `rebuild_lane`）。
-    ///
-    /// 返回 `false` = lane 句柄陈旧。槽位变化会让内容版本 +1（`Lane::set_scroll`），因此
-    /// 编码器与 `DeltaBuilder` 都会看到「这条 lane 变了」—— 段归属变化必须重编码。
     #[must_use]
     pub(crate) fn set_lane_scroll(&mut self, id: LaneId, slot: u32) -> bool {
         match self.lanes.get_mut(id) {
@@ -388,13 +264,11 @@ impl Scene {
         }
     }
 
-    /// 本帧绘制序。
     #[must_use]
     pub fn order(&self) -> &[LaneId] {
         &self.order
     }
 
-    /// 按 `order` 展平（陈旧 `LaneId` 静默跳过，不 panic）。
     pub fn iter(&self) -> impl Iterator<Item = &Primitive> + Clone + '_ {
         self.order
             .iter()
@@ -402,13 +276,11 @@ impl Scene {
             .flatten()
     }
 
-    /// 图元总数（**按绘制序统计**；未进 `order` 的 lane 不计，因此它回答的是「这一帧要画多少」）。
     #[must_use]
     pub fn primitive_count(&self) -> usize {
         self.iter().count()
     }
 
-    /// 是否没有任何图元（**按绘制序统计**：未进 `order` 的 lane 不计）。
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.primitive_count() == 0
@@ -526,11 +398,6 @@ mod tests {
         lane.push(Primitive::Clip(ClipOp::Pop));
     }
 
-    /// R05-5：深度上限**不在 Lane 上判定**（不再 debug panic / release 静默分叉）。
-    ///
-    /// Lane::push 只计数（Canvas::push_clip 的 8 层门限用它）；真正的上限是编码期的
-    /// **序列化链长**（矩形 clip 合并 ⇒ 常见嵌套远低于 8），越界由
-    /// EngineError::ClipDepthExceeded 返回，debug 与 release 行为一致。
     #[test]
     fn depth_cap_is_not_enforced_on_the_lane() {
         let mut lane = Lane::new();
@@ -538,7 +405,6 @@ mod tests {
             lane.push(Primitive::Clip(ClipOp::Push(clip())));
         }
         assert_eq!(lane.clip_depth(), MAX_CLIP_DEPTH);
-        // 第 9 层不 panic（也不再饱和成错误值）：计数如实反映已压入的层数。
         lane.push(Primitive::Clip(ClipOp::Push(clip())));
         assert_eq!(lane.clip_depth(), MAX_CLIP_DEPTH + 1);
         assert_eq!(lane.primitives().len(), usize::from(MAX_CLIP_DEPTH) + 1);
@@ -549,8 +415,6 @@ mod tests {
         let depth: u8 = MAX_CLIP_DEPTH;
         assert_eq!(depth, 8);
     }
-
-    // ── P03：Scene / LaneId ──
 
     #[test]
     fn scene_empty_is_empty() {
@@ -684,14 +548,11 @@ mod tests {
             assert!(scene.push(a, Primitive::Clip(ClipOp::Push(clip()))));
         }
         scene.clear_frame();
-        // 若 clear 没有把 clip_depth 复位为 0，下一次 push(Push) 会立刻触发深度上限断言。
         for _ in 0..MAX_CLIP_DEPTH {
             assert!(scene.push(a, Primitive::Clip(ClipOp::Push(clip()))));
         }
         assert_eq!(scene.lane_primitives(a).map(<[Primitive]>::len), Some(8));
     }
-
-    // ── P06：clear_lane ──
 
     #[test]
     fn clear_lane_keeps_capacity_and_resets_clip_depth() {
@@ -702,7 +563,6 @@ mod tests {
         }
         assert!(scene.clear_lane(a));
         assert_eq!(scene.lane_primitives(a).map(<[Primitive]>::len), Some(0));
-        // clip_depth 已复位：可以再压满 8 层而不触发 C3 断言。
         for _ in 0..MAX_CLIP_DEPTH {
             assert!(scene.push(a, Primitive::Clip(ClipOp::Push(clip()))));
         }
@@ -728,12 +588,6 @@ mod tests {
         assert!(!scene.is_empty());
     }
 
-    // ── B6：lane 版本（增量实例编码的复用判据）──────────────────────────────
-
-    /// 任何内容修改都必须推进版本：`push` / `clear_lane` / `clear_frame`。
-    ///
-    /// 漏掉任何一处都会让下游（`InstanceEncoder`）把「内容已变」的 lane 当成可复用段，
-    /// 于是画面停在旧内容上 —— 这条测试就是那个不变量的守卫。
     #[test]
     fn lane_version_advances_on_every_content_mutation() {
         let mut scene = Scene::empty();

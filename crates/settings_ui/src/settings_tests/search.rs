@@ -1,13 +1,9 @@
-//! The tests of the search: what it admits, what it keeps, and what it answers.
-
 use crate::{
     pages::registry,
     search::SearchFilter,
     settings_tests::test_support::{Harness, configured_settings},
 };
 
-/// A query keeps the heading of a group a page under it matches in: the rows are the pages, and a
-/// page drawn without the heading over it would be a page whose group the search left behind.
 #[test]
 fn a_query_should_keep_the_group_of_a_page_it_matches() {
     let mut harness = Harness::with_config(configured_settings());
@@ -30,8 +26,6 @@ fn a_query_should_keep_the_group_of_a_page_it_matches() {
     );
 }
 
-/// A page the query does not admit is a page that is no longer drawn, so what is drawn moves to the
-/// first page the query does admit.
 #[test]
 fn a_query_should_move_the_page_to_one_it_admits() {
     let mut harness = Harness::with_config(configured_settings());
@@ -52,9 +46,6 @@ fn a_query_should_move_the_page_to_one_it_admits() {
     );
 }
 
-/// A query that matches nothing is answered in both columns: the sidebar has no row left and the
-/// page that was open is not drawn behind it, so the two do not disagree the way they would if the
-/// page stayed selected while the sidebar went empty.
 #[test]
 fn a_query_that_matches_nothing_should_say_so_in_both_columns() {
     let mut harness = Harness::with_config(configured_settings());
@@ -94,7 +85,6 @@ fn a_query_that_matches_nothing_should_say_so_in_both_columns() {
     );
 }
 
-/// Clearing a query brings the whole sidebar back, and with it the page that was drawn.
 #[test]
 fn clearing_a_query_should_admit_everything_again() {
     let mut harness = Harness::new();
@@ -112,7 +102,6 @@ fn clearing_a_query_should_admit_everything_again() {
     );
 }
 
-/// A page is reached by its own label in the language the interface is drawn in.
 #[test]
 fn a_page_should_be_reachable_by_its_localized_label() {
     let mut harness = Harness::new();
@@ -127,7 +116,6 @@ fn a_page_should_be_reachable_by_its_localized_label() {
     assert_eq!(harness.page().current_page(), "appearance");
 }
 
-/// The sidebar's rows are the pages the query admits, and the page behind them is one of them.
 #[test]
 fn the_sidebar_should_draw_only_the_pages_the_query_admits() {
     let mut harness = Harness::new();

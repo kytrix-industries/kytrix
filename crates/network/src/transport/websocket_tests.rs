@@ -16,17 +16,11 @@ use crate::transport::{
     },
 };
 
-/// An upgrade is an HTTP/1.1 exchange, and the version a reqwest client offers in
-/// ALPN is decided by feature unification: a dependency enabling `reqwest/http2`
-/// anywhere in the binary makes every client offer `h2`, and a server that takes it
-/// answers a reset stream instead of `101`. Nothing about the default test build
-/// would notice the pin going missing, so the invariant is asserted here.
 #[test]
 fn an_upgrade_client_never_offers_http2() {
     assert!(upgrade_client_spec(HeaderMap::new()).http1_only);
 }
 
-/// Serves one HTTP response for the upgrade request this test sends.
 async fn spawn_upgrade_answer(response: &'static str) -> std::net::SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -67,8 +61,6 @@ async fn dial(address: std::net::SocketAddr) -> TransportError {
     .expect("the upgrade must fail")
 }
 
-/// An answer that is not a protocol switch is the peer's decision, and the status is
-/// what tells a rejected token from a rejected route.
 #[tokio::test]
 async fn an_upgrade_the_peer_refuses_reports_the_status() {
     let address = spawn_upgrade_answer(
@@ -84,8 +76,6 @@ async fn an_upgrade_the_peer_refuses_reports_the_status() {
     );
 }
 
-/// A connection that dies before it answers says nothing about the peer, so the
-/// cause has to come from the transport chain.
 #[tokio::test]
 async fn a_transport_that_breaks_before_answering_reports_the_chain() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -106,7 +96,6 @@ async fn a_transport_that_breaks_before_answering_reports_the_chain() {
     let _ = server.await;
 }
 
-/// The connect budget is the one failure worth repeating exactly as it stands.
 #[tokio::test]
 async fn an_attempt_that_runs_out_of_time_reports_a_timeout() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -115,7 +104,6 @@ async fn an_attempt_that_runs_out_of_time_reports_a_timeout() {
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
-        // Hold the connection open without ever answering.
         let _held = stream;
         std::future::pending::<()>().await;
     });
@@ -143,7 +131,6 @@ async fn an_attempt_that_runs_out_of_time_reports_a_timeout() {
     let _ = server.await;
 }
 
-/// yawc names the handshake shapes it will not start a session from.
 #[test]
 fn a_completed_handshake_that_cannot_start_a_session_is_named() {
     assert_eq!(
@@ -154,7 +141,6 @@ fn a_completed_handshake_that_cannot_start_a_session_is_named() {
     );
 }
 
-/// A redirect is the peer's answer, not a broken transport.
 #[test]
 fn a_redirected_upgrade_reports_the_status() {
     assert_eq!(

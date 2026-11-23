@@ -1,22 +1,3 @@
-//! What an ETF flow snapshot is, and how one service answer becomes one.
-//!
-//! The service publishes the whole history of every asset it tracks in a single
-//! response: four maps of dated rows, one per asset, each row carrying one string
-//! per fund. Everything the chart needs is derived here, once, at that boundary,
-//! and shared through an `Arc`:
-//!
-//! - the rows are keyed by date rather than appended, because a map has no order
-//!   and a date may be corrected inside the interval it belongs to;
-//! - each fund's flow is read in the fund order of the asset, not in the order the
-//!   response happened to name it, so a fund keeps its own column;
-//! - net assets are *accumulated* over the whole history rather than over the part
-//!   a chart is showing, because the number is "how much these funds hold", which
-//!   does not restart when the user picks a shorter window.
-//!
-//! Everything a row contains is validated: a venue answer that does not parse, or
-//! that repeats a date, or that is large enough to suggest the endpoint is not
-//! what was asked of it, is an error rather than a chart drawn from it.
-
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::Arc,
@@ -28,14 +9,8 @@ use smol_str::SmolStr;
 use thiserror::Error;
 use time::{Date, Month};
 
-/// The most dated rows one asset may carry.
-///
-/// The funds traded for a few years, so this is far beyond any real history: it is
-/// the point at which the answer stops being an ETF history and starts being a
-/// response this widget should not be holding in memory.
 pub(crate) const MAX_ETF_DAYS_PER_ASSET: usize = 16_384;
 
-/// The asset whose ETF complex a chart is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum CryptocurrencyEtfAsset {
     #[default]
@@ -50,7 +25,6 @@ pub(crate) enum CryptocurrencyEtfAsset {
 }
 
 impl CryptocurrencyEtfAsset {
-    /// Every asset the service publishes, in the order the tabs offer them.
     pub(crate) const ALL: [Self; 4] = [Self::Btc, Self::Eth, Self::Sol, Self::Hyp];
 
     pub(crate) const fn index(self) -> usize {
@@ -62,8 +36,6 @@ impl CryptocurrencyEtfAsset {
         }
     }
 
-    /// The ticker the tab is labelled with. It is a fund's name, not a
-    /// translated word: `HYPE` reads the same in every locale.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Btc => "BTC",
@@ -74,7 +46,6 @@ impl CryptocurrencyEtfAsset {
     }
 }
 
-/// How much of the history a chart shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum CryptocurrencyEtfWindow {
     #[default]
@@ -91,7 +62,6 @@ pub(crate) enum CryptocurrencyEtfWindow {
 }
 
 impl CryptocurrencyEtfWindow {
-    /// Every window the picker offers, in the order it offers them.
     pub(crate) const ALL: [Self; 5] = [
         Self::Days30,
         Self::Days90,
@@ -100,12 +70,6 @@ impl CryptocurrencyEtfWindow {
         Self::All,
     ];
 
-    /// How many of the most recent rows the window keeps, or `None` for all of
-    /// them.
-    ///
-    /// The limit counts *rows*, not calendar days: the funds trade on weekdays
-    /// only, and a window of thirty calendar days would show about twenty bars —
-    /// a number nobody chose.
     const fn day_limit(self) -> Option<usize> {
         match self {
             Self::Days30 => Some(30),
@@ -117,42 +81,31 @@ impl CryptocurrencyEtfWindow {
     }
 }
 
-/// Which funds a chart is showing together.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum CryptocurrencyEtfFundSelection {
-    /// Every fund of the asset, which is what its total flow is.
     #[default]
     #[serde(rename = "all")]
     All,
-    /// One fund, named by its ticker.
     #[serde(rename = "named")]
     Named(SmolStr),
 }
 
-/// One trading day of one asset.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CryptocurrencyEtfDay {
     pub date: Date,
-    /// One flow per fund, in the asset's own fund order, in millions of dollars.
     pub fund_flows: Arc<[f64]>,
-    /// What every fund together moved that day.
     pub total_flow: f64,
-    /// What the funds hold after that day, accumulated from the first row.
     pub net_assets: f64,
 }
 
-/// The history of one asset.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CryptocurrencyEtfDataset {
     pub asset: CryptocurrencyEtfAsset,
-    /// The funds the rows are read in, in the order they were read.
     pub funds: Arc<[SmolStr]>,
-    /// The rows, oldest first.
     pub days: Arc<[CryptocurrencyEtfDay]>,
 }
 
 impl CryptocurrencyEtfDataset {
-    /// The most recent rows a window keeps, borrowed from the same history.
     pub(crate) fn days_for_window(
         &self,
         window: CryptocurrencyEtfWindow,
@@ -163,15 +116,10 @@ impl CryptocurrencyEtfDataset {
         &self.days[start..]
     }
 
-    /// Where a fund sits in the row's own fund order.
     pub(crate) fn fund_index(&self, name: &str) -> Option<usize> {
         self.funds.iter().position(|fund| fund == name)
     }
 
-    /// What one row moved, for the funds a chart is showing.
-    ///
-    /// A named fund the asset does not have has no flow rather than a zero one:
-    /// the two are different readings, and only one of them is a number.
     pub(crate) fn flow_for(
         &self,
         day: &CryptocurrencyEtfDay,
@@ -186,10 +134,8 @@ impl CryptocurrencyEtfDataset {
     }
 }
 
-/// Every asset's history, which is what one service answer becomes.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CryptocurrencyEtfSnapshot {
-    /// One history per asset, in [`CryptocurrencyEtfAsset::ALL`] order.
     pub datasets: [Arc<CryptocurrencyEtfDataset>; 4],
 }
 
@@ -199,11 +145,6 @@ impl CryptocurrencyEtfSnapshot {
     }
 }
 
-/// Why an answer could not become a snapshot.
-///
-/// Every variant names the asset it came from: one malformed row invalidates the
-/// whole answer, and a message that did not say which asset it was about would
-/// leave the reader looking through four of them.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub(crate) enum CryptocurrencyEtfParseError {
     #[error("{asset:?} ETF response contains no dated rows")]
@@ -242,15 +183,11 @@ pub(crate) enum CryptocurrencyEtfParseError {
     },
 }
 
-/// One row before the running total is folded into it.
 struct ParsedDay {
     fund_flows: Arc<[f64]>,
     total_flow: f64,
 }
 
-/// The funds each asset's rows are read in, in the order the wire format names
-/// them. A row is a fixed struct on the wire, so the fund list of an asset is a
-/// property of the asset rather than of the answer.
 const BTC_FUNDS: [&str; 12] = [
     "IBIT", "FBTC", "BITB", "ARKB", "BTCO", "EZBC", "BRRR", "HODL", "BTCW", "MSBT", "GBTC", "BTC",
 ];
@@ -260,11 +197,6 @@ const ETH_FUNDS: [&str; 10] = [
 const SOL_FUNDS: [&str; 6] = ["BSOL", "VSOL", "FSOL", "TSOL", "SOEZ", "GSOL"];
 const HYPE_FUNDS: [&str; 3] = ["BHYP", "THYP", "HYPG"];
 
-/// Reads one service answer into the history of every asset.
-///
-/// It is all or nothing: an answer that cannot be read for one asset is not used
-/// for the other three either, because a snapshot is a single reading of the
-/// market and half of one would be a chart that disagrees with itself.
 pub(crate) fn parse_etf(
     snapshot: proto_types::CryptocurrencyEtf,
 ) -> Result<CryptocurrencyEtfSnapshot, CryptocurrencyEtfParseError> {
@@ -345,7 +277,6 @@ pub(crate) fn parse_etf(
     })
 }
 
-/// Reads the dated rows of one asset into its history.
 fn parse_rows<'a, I, const N: usize>(
     asset: CryptocurrencyEtfAsset,
     funds: &[&'static str; N],
@@ -373,8 +304,6 @@ where
             }
             fund_flows.push(flow);
         }
-        // The limit is checked before the insert rather than after, so a response
-        // that is too large is refused instead of being built and then measured.
         let at_capacity = parsed_days.len() == MAX_ETF_DAYS_PER_ASSET;
         match parsed_days.entry(date) {
             Entry::Occupied(_) => {
@@ -420,7 +349,6 @@ where
     })
 }
 
-/// Reads an ISO trading date, refusing anything a `Date` would have to guess at.
 fn parse_date(
     asset: CryptocurrencyEtfAsset,
     value: &str,
@@ -451,12 +379,6 @@ fn parse_date(
     Date::from_calendar_date(year, month, day).map_err(|_| invalid_date())
 }
 
-/// Reads one cell of a row.
-///
-/// The upstream sheet is a spreadsheet export, so a cell is empty, a dash, a
-/// number with thousands separators, or a number in accounting parentheses. All
-/// four are readings; anything else is not, and `NaN` in particular must not
-/// become a point the chart would draw.
 fn parse_number(value: &str) -> Option<f64> {
     let value = value.trim();
     if value.is_empty() || value == "-" {

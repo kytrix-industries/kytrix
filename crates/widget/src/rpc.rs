@@ -18,7 +18,6 @@ use tokio::{
 
 use super::protocol::{RequestId, WidgetProtocol};
 
-/// Successful RPC response paired with the framework-generated request identifier.
 #[derive(Debug)]
 pub struct RpcResponse<T> {
     request_id: RequestId,
@@ -35,7 +34,6 @@ impl<T> RpcResponse<T> {
     }
 }
 
-/// Failure returned to the UI while submitting or awaiting an RPC call.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RpcCallError<E> {
     #[error("RPC request {request_id} exceeded its deadline")]
@@ -63,7 +61,6 @@ impl<E> RpcCallError<E> {
     }
 }
 
-/// Cloneable, bounded RPC client used by a widget UI.
 pub struct RpcClient<P: WidgetProtocol> {
     sender: mpsc::Sender<RpcRequest<P>>,
     lifecycle: Arc<ChannelLifecycle>,
@@ -73,12 +70,6 @@ pub struct RpcClient<P: WidgetProtocol> {
 }
 
 impl<P: WidgetProtocol> RpcClient<P> {
-    /// Reserves the identity of the next call this client submits.
-    ///
-    /// A caller that has to attribute the reply before the request is sent reserves
-    /// the identity here and submits the same identity with [`RpcClient::call_with_id`].
-    /// [`RpcClient::call`] and [`RpcClient::call_with_timeout`] reserve internally, so
-    /// every identity on one client's channel comes from this one counter.
     pub fn reserve_request_id(&self) -> RequestId {
         RequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -99,12 +90,6 @@ impl<P: WidgetProtocol> RpcClient<P> {
             .await
     }
 
-    /// Submits `request` under an identity reserved with [`RpcClient::reserve_request_id`].
-    ///
-    /// The identity must come from this client's counter: it is the identity the
-    /// service sees ([`RpcRequest::request_id`]) and the reply carries
-    /// ([`RpcResponse::request_id`] / [`RpcCallError::request_id`]), which is what lets
-    /// a UI that has not seen the reply yet match it.
     pub async fn call_with_id(
         &self,
         request_id: RequestId,
@@ -129,7 +114,6 @@ impl<P: WidgetProtocol> RpcClient<P> {
             state.clone(),
         ));
         let _abort_on_drop = AbortOnDrop(task.abort_handle());
-        // Declared after the abort guard so caller cancellation wins synchronously on drop.
         let mut caller_on_drop = CallerOnDrop::new(state.clone());
 
         let result = match task.await {
@@ -268,7 +252,6 @@ impl<P: WidgetProtocol> Drop for RpcReceiver<P> {
     }
 }
 
-/// RPC request delivered to a background widget service.
 pub struct RpcRequest<P: WidgetProtocol> {
     request: P::Request,
     response: ResponseGuard<P>,
@@ -304,7 +287,6 @@ impl<P: WidgetProtocol> fmt::Debug for RpcRequest<P> {
     }
 }
 
-/// Reply handle and cancellation metadata for one in-flight RPC request.
 pub struct RpcRequestContext<P: WidgetProtocol> {
     response: ResponseGuard<P>,
 }
@@ -326,7 +308,6 @@ impl<P: WidgetProtocol> RpcRequestContext<P> {
         self.response.state.cancelled().await;
     }
 
-    /// Delivers a response only if neither caller cancellation nor the absolute deadline won.
     pub fn respond(self, result: Result<P::Response, P::Error>) -> Result<(), RpcResponseDropped> {
         let request_id = self.request_id();
         self.response
@@ -455,7 +436,6 @@ impl<P: WidgetProtocol> CallState<P> {
         permit: mpsc::Permit<'_, RpcRequest<P>>,
         request: RpcRequest<P>,
     ) -> bool {
-        // Lock order is lifecycle then per-request status; this section has no await.
         let lifecycle = lifecycle.lock();
         if !*lifecycle {
             drop(permit);
@@ -671,13 +651,6 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
 
-    /// The handle of the runtime this test runs on.
-    ///
-    /// A test drives its subject on its own runtime rather than on a shared one. The
-    /// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-    /// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-    /// whose clock was paused. Work started on another runtime keeps waiting on real
-    /// time while the test advances a clock it never reads.
     #[allow(
         clippy::disallowed_methods,
         reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -1161,8 +1134,6 @@ mod tests {
         ));
     }
 
-    /// The bridge's whole reason for reserving: the identity the caller knows before
-    /// the request is sent is the identity the service sees and the reply carries.
     #[tokio::test(start_paused = true)]
     async fn a_reserved_identity_is_the_one_the_service_and_the_reply_carry() {
         let (client, mut requests) = channel::<TestProtocol>(
@@ -1196,8 +1167,6 @@ mod tests {
         assert_eq!(response.into_value(), 7);
     }
 
-    /// A call that reserves internally continues the same sequence, so a bridge that
-    /// reserved an identity cannot collide with one the client allocates itself.
     #[tokio::test(start_paused = true)]
     async fn an_internally_numbered_call_continues_the_reserved_sequence() {
         let (client, mut requests) = channel::<TestProtocol>(

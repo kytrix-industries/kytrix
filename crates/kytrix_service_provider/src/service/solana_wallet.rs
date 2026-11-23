@@ -193,7 +193,6 @@ pub fn compare_solana_wallet_selections(
         .then_with(|| left.address.cmp(&right.address))
 }
 
-/// Returns the address when it is a canonical base58 encoding of 32 bytes.
 pub fn solana_wallet_address(value: &str) -> Option<&str> {
     if value.len() > MAX_SOLANA_WALLET_ADDRESS_BYTES {
         return None;

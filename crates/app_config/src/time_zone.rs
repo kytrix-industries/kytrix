@@ -1,42 +1,19 @@
-//! The clock data timestamps are displayed in.
-//!
-//! Every timestamp a market participant or a Kytrix service publishes is a UTC
-//! instant. What a user reads on screen is that instant converted by one offset,
-//! and this module owns the setting that names it: the whole-hour offset from UTC,
-//! constrained to the range real zones live in.
-//!
-//! The offset is stored as hours rather than as a zone identity because that is
-//! the whole of what a display conversion needs: there is no daylight-saving rule
-//! to apply, no zone database to consult, and no second answer a reader could
-//! arrive at. The bytes on disk are the number of hours, so a file stays readable
-//! whatever clock library a future reader uses.
-
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use smol_str::{SmolStr, format_smolstr};
 
-/// The time zone data timestamps are displayed in.
-///
-/// The value is the whole-hour offset from UTC, in `-12..=14`. Every widget that
-/// draws a timestamp the service published in UTC converts it by this offset
-/// before it reaches the screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DataTimeZone {
     hours: i8,
 }
 
 impl DataTimeZone {
-    /// The westernmost offset the setting offers.
     pub const MIN_HOURS: i8 = -12;
-    /// The easternmost offset the setting offers.
     pub const MAX_HOURS: i8 = 14;
-    /// The offset the setting starts at.
     pub const UTC: Self = Self { hours: 0 };
-    /// How many offsets the setting offers.
     pub const COUNT: usize = (Self::MAX_HOURS - Self::MIN_HOURS + 1) as usize;
 
-    /// Every offset the setting offers, west to east.
     pub const ALL: [Self; Self::COUNT] = {
         let mut all = [Self::UTC; Self::COUNT];
         let mut index = 0;
@@ -49,12 +26,10 @@ impl DataTimeZone {
         all
     };
 
-    /// The offset this zone adds to UTC, in whole hours.
     pub const fn hours(self) -> i8 {
         self.hours
     }
 
-    /// The zone `hours` east of UTC, or nothing when no real zone is that far.
     pub const fn from_hours(hours: i8) -> Option<Self> {
         if hours < Self::MIN_HOURS || hours > Self::MAX_HOURS {
             return None;
@@ -62,7 +37,6 @@ impl DataTimeZone {
         Some(Self { hours })
     }
 
-    /// The name the setting is drawn under, such as `UTC+8` or `UTC-12`.
     pub fn label(self) -> SmolStr {
         format_smolstr!("UTC{:+}", self.hours)
     }
@@ -103,8 +77,6 @@ impl<'de> Deserialize<'de> for DataTimeZone {
 mod tests {
     use super::*;
 
-    /// Every offset the setting offers is one the file can hold, and the two agree
-    /// on what it is called.
     #[test]
     fn every_offered_offset_should_round_trip_through_the_file() {
         for zone in DataTimeZone::ALL {
@@ -123,9 +95,6 @@ mod tests {
         }
     }
 
-    /// The offered offsets are every whole hour of the range exactly once, in order:
-    /// a gap would be a setting a user cannot choose, and a repeat two choices that
-    /// store the same value.
     #[test]
     fn the_offered_offsets_should_be_the_whole_range() {
         let hours: Vec<i8> = DataTimeZone::ALL.iter().map(|zone| zone.hours()).collect();

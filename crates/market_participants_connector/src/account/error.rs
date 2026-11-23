@@ -8,7 +8,6 @@ use thiserror::Error;
 
 use crate::catalog::error::{CatalogError, SourceError};
 
-/// Network failure returned by an account operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountNetworkError(Arc<crate::error::MarketParticipantError>);
 
@@ -17,7 +16,6 @@ impl AccountNetworkError {
         self.0.is_retryable()
     }
 
-    /// Returns the classified market-participant failure behind this account error.
     pub fn error(&self) -> &crate::error::MarketParticipantError {
         &self.0
     }
@@ -35,10 +33,6 @@ pub(crate) fn network_error(error: crate::error::MarketParticipantError) -> Acco
     AccountNetworkError(Arc::new(error))
 }
 
-/// Account-owned failures while resolving a listing or one of its values.
-///
-/// The catalog implementation and its market-participant error remain private to the
-/// market-participants runtime. Only account-facing context crosses this boundary.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AccountCatalogError {
     #[error(transparent)]
@@ -54,7 +48,6 @@ pub enum AccountCatalogError {
     },
 }
 
-/// Strongly typed failures for account capability operations.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AccountError {
     #[error("account network request failed: {0}")]
@@ -68,22 +61,11 @@ pub enum AccountError {
         route: VenueRoute,
         asset: Box<market_participants_model::asset::AssetId>,
     },
-    /// The account query named a listing of another route.
-    ///
-    /// The listing and the route stay typed diagnostics: an unpublished or
-    /// misaddressed listing never had a display name, so a message about it is the
-    /// identity diagnostic a protocol failure is reported by.
     #[error("listing {listing:?} does not belong to route {route}")]
     ListingRouteMismatch {
         listing: Box<VenueListingKey>,
         route: VenueRoute,
     },
-    /// The account protocol answered an operation with a response the adapter
-    /// cannot read.
-    ///
-    /// The operation is a fixed name of the account capability and never a reason:
-    /// the field is typed so a formatted explanation — which would carry a raw
-    /// route or listing id with it — cannot be passed here at all.
     #[error("account protocol returned an invalid response while performing {operation}")]
     Protocol { operation: &'static str },
 }

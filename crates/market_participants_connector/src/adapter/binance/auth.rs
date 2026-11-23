@@ -137,8 +137,6 @@ impl ListenKeyManager {
                 raw_data: bytes::Bytes::new(),
             })?;
         if !status.is_success() {
-            // The endpoint a failure names never carries the listen key it
-            // addressed: that key is the account's stream credential.
             return Err(BinanceCodec.response_error(route, self.endpoint.as_str(), status, body));
         }
         Ok(())
@@ -200,7 +198,6 @@ mod tests {
     use super::{Ed25519Signer, ListenKeyManager, ListenKeyResponse};
     use crate::error::MarketParticipantError;
 
-    /// The route a listen-key control call is reported against.
     fn route() -> VenueRoute {
         VenueRoute::new(
             VenueId::Binance,

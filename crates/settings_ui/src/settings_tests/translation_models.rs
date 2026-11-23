@@ -1,5 +1,3 @@
-//! The tests of the translation models: what is offered, selected, and deleted.
-
 use std::{
     path::Path,
     rc::Rc,
@@ -23,12 +21,9 @@ use crate::{
     translation_downloads::{DownloadState, TranslationDownloads},
 };
 
-/// The key prefix of the harness settings page and of the translation page under it.
 const KEY: &str = "settings.test";
-/// The page id the translation page is keyed under.
 const PAGE: &str = "ai.translation";
 
-/// Settings with a stored model directory.
 fn config_in(directory: &Path) -> Config {
     let mut config = Config::default();
     config.language = Language::En;
@@ -36,7 +31,6 @@ fn config_in(directory: &Path) -> Config {
     config
 }
 
-/// A harness with the translation downloads attached, moved to the translation page.
 fn page(config: Config) -> (Harness, Rc<TranslationDownloads>, FakeDownloads) {
     let mut harness = Harness::with_config(config);
     let (downloads, fake) = fake_downloads(&mut harness, Arc::new(|_: &Path| Ok(())));
@@ -47,7 +41,6 @@ fn page(config: Config) -> (Harness, Rc<TranslationDownloads>, FakeDownloads) {
     (harness, downloads, fake)
 }
 
-/// A harness with the translation downloads attached, prepared before the page is opened.
 fn page_prepared(
     config: Config,
     prepare: impl FnOnce(&TranslationDownloads, &mut Harness),
@@ -61,18 +54,15 @@ fn page_prepared(
 
     (harness, downloads, fake)
 }
-/// The model select's kit key.
 fn model_key() -> String {
     format!("{KEY}.{PAGE}.model")
 }
 
-/// Opens the model select and settles the panel it builds.
 fn open_model_select(harness: &mut Harness) {
     harness.click_node("SETTINGS_AI_MODEL_SELECT");
     harness.settle(1);
 }
 
-/// The text the open model panel draws.
 fn model_panel_text(harness: &Harness) -> String {
     let panel = harness
         .find(&format!("{}:panel:surface", model_key()))
@@ -80,13 +70,11 @@ fn model_panel_text(harness: &Harness) -> String {
     harness.text_of(panel)
 }
 
-/// Clicks the model at `index` in the open panel.
 fn choose_model(harness: &mut Harness, index: usize) {
     harness.click_node(&format!("{}:panel:list:hit:{index}", model_key()));
     harness.settle(1);
 }
 
-/// Runs rounds until `done` holds, with a real-time limit, without sleeping the executor.
 fn spin(harness: &mut Harness, what: &str, mut done: impl FnMut(&Harness) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done(harness) {
@@ -96,7 +84,6 @@ fn spin(harness: &mut Harness, what: &str, mut done: impl FnMut(&Harness) -> boo
     }
 }
 
-/// Types `text` into the directory field after selecting what it held, and commits it with Enter.
 fn commit_directory(harness: &mut Harness, text: &str) {
     harness.click_node("SETTINGS_AI_DIRECTORY_INPUT");
     press_key(
@@ -119,7 +106,6 @@ fn commit_directory(harness: &mut Harness, text: &str) {
     harness.settle(2);
 }
 
-/// Delivers one key press through the pump's path.
 fn press_key(
     harness: &mut Harness,
     code: ui_core::event::KeyCode,
@@ -136,8 +122,6 @@ fn press_key(
         }),
     );
 }
-/// The model select offers exactly the models whose files are present at their published size,
-/// in page order.
 #[test]
 fn the_model_select_should_list_only_downloaded_models() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -187,7 +171,6 @@ fn the_model_select_should_list_only_downloaded_models() {
     );
 }
 
-/// Choosing a model from the select stores the selection at once.
 #[test]
 fn choosing_a_model_should_store_the_selection_at_once() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -206,8 +189,6 @@ fn choosing_a_model_should_store_the_selection_at_once() {
     );
 }
 
-/// A model whose files are being removed is not offered: it is not one the page can load, so it
-/// is not one the user can pick.
 #[test]
 fn a_model_being_deleted_should_not_be_offered() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -236,7 +217,6 @@ fn a_model_being_deleted_should_not_be_offered() {
     );
 }
 
-/// The select's trigger shows the model the settings hold.
 #[test]
 fn the_model_select_should_show_the_model_in_use() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -256,8 +236,6 @@ fn the_model_select_should_show_the_model_in_use() {
     );
 }
 
-/// A selection the stored directory does not hold is cleared when the page is opened, and the
-/// directory itself is kept.
 #[test]
 fn a_selection_the_directory_does_not_hold_should_be_cleared() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -277,8 +255,6 @@ fn a_selection_the_directory_does_not_hold_should_be_cleared() {
     );
 }
 
-/// A selection whose files are on their way out is cleared even though the file is still there
-/// when the page opens.
 #[test]
 fn a_selection_that_is_being_removed_should_be_cleared() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -301,7 +277,6 @@ fn a_selection_that_is_being_removed_should_be_cleared() {
     );
 }
 
-/// A page that draws a selection the directory holds writes nothing.
 #[test]
 fn the_page_should_not_write_when_the_settings_are_consistent() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -322,7 +297,6 @@ fn the_page_should_not_write_when_the_settings_are_consistent() {
     );
 }
 
-/// A directory change clears a selection whose file the new directory does not hold.
 #[test]
 fn changing_the_directory_should_clear_the_selection_it_does_not_hold() {
     let first = TempDir::new().expect("the first directory builds");
@@ -347,8 +321,6 @@ fn changing_the_directory_should_clear_the_selection_it_does_not_hold() {
     );
 }
 
-/// A selection the background manager made in the stored directory is cleared when the user
-/// chooses another directory.
 #[test]
 fn a_background_selection_should_be_cleared_by_the_directory_change() {
     let stored_directory = TempDir::new().expect("the stored directory builds");
@@ -356,8 +328,6 @@ fn a_background_selection_should_be_cleared_by_the_directory_change() {
     let selected = TranslationModel::HyMt27BQ8;
     let (mut harness, downloads, _fake) = page(config_in(stored_directory.path()));
     downloads.force_downloaded_for_test(selected, stored_directory.path().to_path_buf());
-    // What the download manager writes when a download finishes while the page is open: it
-    // selects the model in the directory the settings still name.
     harness.update_config(|config| config.translation.selected_model = Some(selected));
     harness.settle(2);
 
@@ -378,7 +348,6 @@ fn a_background_selection_should_be_cleared_by_the_directory_change() {
     );
 }
 
-/// A model choice that could not be stored leaves the stored selection as it was and reports why.
 #[test]
 fn a_failed_model_selection_should_keep_the_stored_selection() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -411,8 +380,6 @@ fn a_failed_model_selection_should_keep_the_stored_selection() {
     );
 }
 
-/// Deleting a model clears the selection that named it when the removal starts, before the file
-/// goes.
 #[test]
 fn deleting_a_selected_model_should_clear_the_selection() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -438,7 +405,6 @@ fn deleting_a_selected_model_should_clear_the_selection() {
     assert!(!path.exists(), "the model file is deleted");
 }
 
-/// Deleting a model that is not the selected one leaves the selection alone.
 #[test]
 fn deleting_another_model_should_keep_the_selected_model() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -468,7 +434,6 @@ fn deleting_another_model_should_keep_the_selected_model() {
     );
 }
 
-/// A finished download becomes the stored selection when nothing usable was selected.
 #[test]
 fn a_completed_download_should_select_the_stored_model() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -499,7 +464,6 @@ fn a_completed_download_should_select_the_stored_model() {
     );
 }
 
-/// The table's headers are named in the interface's language.
 #[test]
 fn the_table_headers_should_be_named_in_the_interface_language() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -520,7 +484,6 @@ fn the_table_headers_should_be_named_in_the_interface_language() {
     assert_eq!(harness.node_text(status), "Status");
 }
 
-/// The same page drawn in Chinese names its headers in Chinese.
 #[test]
 fn the_table_headers_should_follow_the_language() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -537,7 +500,6 @@ fn the_table_headers_should_follow_the_language() {
     assert_eq!(harness.node_text(size), "大小");
 }
 
-/// Every supported model's published size is drawn in the unit that keeps the number short.
 #[test]
 fn a_model_size_should_be_drawn_in_the_unit_that_keeps_it_short() {
     for (model, expected) in [

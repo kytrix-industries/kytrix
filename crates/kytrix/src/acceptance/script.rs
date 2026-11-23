@@ -1,38 +1,3 @@
-//! The acceptance self-check's script: the steps a real window must pass.
-//!
-//! The script is driven one step per frame by [`Script::tick`]. It is deliberately
-//! **host-agnostic**: the tick takes `&mut App` and the settings hub, nothing else, so the
-//! same steps run in the real window (the binary's frame route calls `tick`) and in the
-//! headless rehearsal (`acceptance::tests` calls `tick` between the shell's route and the
-//! frame). There is one implementation of the steps, not one for the window and one for
-//! the test.
-//!
-//! # What a step may assume
-//!
-//! Coordinates come from [`Window::size`](ui_core::window::Window::size) and the shell's
-//! own metrics ([`metrics`]): the pane's centre is the centre of the area below the
-//! self-drawn title bar and right of the sidebar, and a shell control is clicked at the
-//! centre of the node carrying its debug id (found by walking the tree, never by hard-coded
-//! pixel positions). A layout change therefore moves the script with the shell instead of
-//! breaking it; a step that cannot find its target fails with the step's name and what was
-//! looked for.
-//!
-//! # What makes a step pass
-//!
-//! - **A frame commits**: the window's committed `frame_index` advances (the engine only
-//!   advances it on a commit; an idle turn does not).
-//! - **The input arrives**: [`App::inject_input`](ui_core::app::App::inject_input) returns
-//!   the dispatch's receipt — a hit for the pointer steps, the dispatched action for the
-//!   click.
-//! - **The change is drawn**: a language write changes the text payloads the tree draws
-//!   and a theme write changes the quad fills the scene carries, both after the write's
-//!   frames; the sidebar click changes the stored mode and commits frames.
-//! - **Nothing panics**: a panic anywhere in the pump kills the process, so a run that
-//!   reaches its report has exercised the window without one.
-//!
-//! A failure seals the report with the failed step's name and closes the window: the
-//! process exits non-zero with the log naming the step.
-
 use std::{
     io,
     path::Path,
@@ -63,115 +28,60 @@ use crate::{
     shell::{metrics, title_bar::TITLE_BAR_SIDEBAR_TOGGLE},
 };
 
-/// How many committed frames the script waits for before its first assertion.
-///
-/// A fresh window needs a frame to measure the shell and another to apply the geometry that
-/// measurement produced (the headless host's own two ticks); the third is the margin that
-/// makes the painted-primitive assertion about a settled window rather than a half-built
-/// one.
 const STARTUP_FRAMES: u32 = 3;
 
-/// How many frames a state change (sidebar mode / language / appearance) is given to reach
-/// the window: one turn applies the write in the shell's route, the next draws it.
 const SETTLE_FRAMES: u32 = 2;
 
-/// The painted-primitive floor. A shell draws hundreds; an empty or failed frame draws none.
 const MINIMUM_PRIMITIVES: usize = 10;
 
-/// A run that has not finished after this many pump turns is stuck. The script ticks once per
-/// pump turn (not once per commit: a turn with a deferred frame still runs the routes), so
-/// this is a much larger number than the run's frame count.
 const TICK_BUDGET: u32 = 20_000;
 
-/// A run that has not finished after this long is stuck (frames are arriving far too
-/// slowly).
 const TIME_BUDGET: Duration = Duration::from_secs(90);
 
-/// The label the sidebar's settings entry draws in each language: the one sentence the
-/// language step can name without depending on the window's contents.
 const SETTINGS_LABEL_EN: &str = "Settings";
 const SETTINGS_LABEL_ZH_CN: &str = "设置";
 
-/// What the script is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// Wait for the first frames.
     Startup,
-    /// The window committed pixels and text.
     Painted,
-    /// A pointer move reaches the shell's page area.
     PointerMove,
-    /// A language write changes the text the tree draws.
     Language,
-    /// An appearance write changes the palette the scene draws.
     Theme,
-    /// A scroll is delivered to the page area.
     Scroll,
-    /// A click on the title bar's sidebar toggle changes the stored mode and redraws.
     PointerClick,
-    /// Everything passed.
     Done,
 }
 
-/// What one tick of a step asks for.
 enum StepOutcome {
-    /// The step held; the next tick runs the next one.
     Pass,
-    /// The step needs `n` more committed frames before its second half runs.
     Wait(u32),
-    /// The script is done.
     Done,
-    /// The step failed: `(step name, what was observed)`.
     Fail(&'static str, SmolStr),
 }
 
-/// The acceptance self-check's script.
 pub(crate) struct Script {
-    /// The window under test.
     window: WindowId,
-    /// When the run started (the wall-clock budget and the report's duration).
     started: Instant,
-    /// The step being run.
     phase: Phase,
-    /// Whether the tick entered with a completed wait: the phase handler runs its
-    /// "after the wait" half.
     resumed: bool,
-    /// The committed frame a wait is waiting for (`None` = not waiting).
     wait_until: Option<u32>,
-    /// Ticks run so far (the frame budget).
     ticks: u32,
-    /// The window's committed frame at the last tick.
     last_index: u32,
-    /// The step log.
     report: Report,
-    /// The step that stopped the run.
     failure: Option<SmolStr>,
-    /// Whether the run is over (pass or fail).
     finished: bool,
-    /// How long the run took.
     elapsed: Duration,
-    /// The frame the current phase's second half compares against.
     index_before: u32,
-    /// The text payloads before the language write.
     texts_before: Vec<SmolStr>,
-    /// The quad fills before the appearance write.
     colors_before: Vec<Color>,
-    /// The sidebar mode before the toggle click.
     mode_before: SidebarMode,
-    /// The language before the language write.
     language_before: Language,
-    /// The committed frame a repaint was requested for (Some(index) = a frame is in\n    /// flight; requesting again would wake the pump for nothing and spin the route).
     requested_at: Option<u32>,
-    /// Whether the palette before the appearance write was the dark one.
-    ///
-    /// The stored preference can be `System`, so the *written* value is not what decides
-    /// whether the palette changes: the resolved appearance is. The step picks the other
-    /// palette from this, not from the stored preference.
     was_dark: bool,
 }
 
 impl Script {
-    /// A script for `window`, ready to run.
     pub(crate) fn new(window: WindowId) -> Self {
         Self {
             window,
@@ -195,12 +105,6 @@ impl Script {
         }
     }
 
-    /// Runs one step (or one waiting frame). Returns whether the run is over.
-    ///
-    /// The host calls this once per frame **after** the shell's route, then submits the
-    /// frame: that is the production order, so the state a step observes is the state the
-    /// frame before it produced. A step that needs more frames returns with a repaint
-    /// requested and the same phase runs again once the frames have committed.
     pub(crate) fn tick(&mut self, app: &mut App, composition: &Composition) -> bool {
         if self.finished {
             return true;
@@ -282,37 +186,27 @@ impl Script {
         }
     }
 
-    /// Whether the run is over.
     pub(crate) fn finished(&self) -> bool {
         self.finished
     }
 
-    /// Whether the run is over and failed.
     pub(crate) fn failed(&self) -> bool {
         self.failure.is_some()
     }
 
-    /// The failure reason (`step: what was observed`), for the headless rehearsal.
     #[cfg(test)]
     pub(crate) fn failure(&self) -> Option<&SmolStr> {
         self.failure.as_ref()
     }
 
-    /// The step log as text (what the process log and `--acceptance-report` carry).
     pub(crate) fn report_text(&self) -> String {
         self.report.render()
     }
 
-    /// Writes the step log to `path`.
-    ///
-    /// # Errors
-    /// The file could not be created or written.
     pub(crate) fn write_report(&self, path: &Path) -> io::Result<()> {
         self.report.write(path)
     }
 
-    /// Ends the run as a failure from **outside** the steps: the pump reported an error, or
-    /// the window closed before the script finished.
     pub(crate) fn abandon(&mut self, reason: SmolStr) {
         if self.finished {
             return;
@@ -320,13 +214,11 @@ impl Script {
         self.stop("host", reason);
     }
 
-    /// The step log, for the headless rehearsal's assertions.
     #[cfg(test)]
     pub(crate) fn report(&self) -> &Report {
         &self.report
     }
 
-    /// Records one tick's step.
     fn step(&mut self, app: &mut App, composition: &Composition, index: u32) -> StepOutcome {
         match self.phase {
             Phase::Startup => self.step_startup(index),
@@ -340,7 +232,6 @@ impl Script {
         }
     }
 
-    /// Waits for the first frames, then records the committed cursor.
     fn step_startup(&mut self, index: u32) -> StepOutcome {
         if !std::mem::take(&mut self.resumed) {
             return StepOutcome::Wait(STARTUP_FRAMES);
@@ -359,7 +250,6 @@ impl Script {
         StepOutcome::Pass
     }
 
-    /// The window drew: it has a size, a non-trivial scene and text.
     fn step_painted(&mut self, app: &App, index: u32) -> StepOutcome {
         let Some(window) = app.window(self.window) else {
             return StepOutcome::Fail("painted", SmolStr::new_static("the window is gone"));
@@ -395,8 +285,6 @@ impl Script {
         StepOutcome::Pass
     }
 
-    /// A pointer move reaches the page area: the receipt's hit is what the engine hovered,
-    /// and the pointer position it recorded is the one the event carried.
     fn step_pointer_move(&mut self, app: &mut App, composition: &Composition) -> StepOutcome {
         let Some(centre) = pane_centre(app, self.window, composition) else {
             return StepOutcome::Fail("pointer.move", SmolStr::new_static("no window to aim at"));
@@ -436,8 +324,6 @@ impl Script {
         StepOutcome::Pass
     }
 
-    /// A click on the title bar's sidebar toggle is dispatched as an action and the shell
-    /// applies it: the stored mode moves one step and the window commits the new layout.
     fn step_pointer_click(
         &mut self,
         app: &mut App,
@@ -512,8 +398,6 @@ impl Script {
         StepOutcome::Pass
     }
 
-    /// A language write reaches the drawn text: the tree's text payloads change and the
-    /// catalogue's own label for the new language is among them.
     fn step_language(
         &mut self,
         app: &mut App,
@@ -577,8 +461,6 @@ impl Script {
         StepOutcome::Pass
     }
 
-    /// An appearance write reaches the palette: the resolved appearance flips and the quad
-    /// fills the scene carries change.
     fn step_theme(&mut self, app: &mut App, composition: &Composition, index: u32) -> StepOutcome {
         if !std::mem::take(&mut self.resumed) {
             self.was_dark = composition.theme.current(app) == ThemeAppearance::Dark;
@@ -648,8 +530,6 @@ impl Script {
         StepOutcome::Pass
     }
 
-    /// A scroll over the page area is delivered (receipt + recorded position); no scrolling
-    /// content is required, the pane may have none.
     fn step_scroll(&mut self, app: &mut App, composition: &Composition) -> StepOutcome {
         let Some(centre) = pane_centre(app, self.window, composition) else {
             return StepOutcome::Fail("scroll", SmolStr::new_static("no window to aim at"));
@@ -678,18 +558,11 @@ impl Script {
         StepOutcome::Pass
     }
 
-    /// Moves to the next phase.
     fn advance(&mut self, phase: Phase) {
         self.phase = phase;
         self.resumed = false;
     }
 
-    /// Asks for the next frame: the script's own steps are what keeps the pump ticking.
-    ///
-    /// At most one request is outstanding per committed frame. The pump runs the routes once
-    /// per turn (a turn with a deferred frame still runs them), so requesting on every turn
-    /// would keep a wake message in flight and spin the route; while a request is pending the
-    /// engine's own budget deferral schedules the wake that brings the frame.
     fn request_frame(&mut self, app: &mut App) {
         if self.requested_at == Some(self.last_index) {
             return;
@@ -698,7 +571,6 @@ impl Script {
         let _ = app.request_repaint(self.window);
     }
 
-    /// Ends the run as a failure with a step's name.
     fn stop(&mut self, name: &'static str, detail: SmolStr) {
         self.report.fail(name, detail.clone());
         self.failure = Some(format_smolstr!("{name}: {detail}"));
@@ -708,8 +580,6 @@ impl Script {
     }
 }
 
-/// The centre of the shell's page area: below the self-drawn title bar and right of the
-/// sidebar, both from the window's own size and the shell's metrics.
 fn pane_centre(app: &App, window: WindowId, composition: &Composition) -> Option<Point> {
     let size = app.window(window)?.size();
     let sidebar = metrics::width(composition.hub.read(|config| config.ui.sidebar));
@@ -719,12 +589,6 @@ fn pane_centre(app: &App, window: WindowId, composition: &Composition) -> Option
     ))
 }
 
-/// The click target of the shell control carrying `debug_id`, and its box.
-///
-/// The debug id may match more than one node: the title bar rebuilds its toggle when the
-/// language changes and leaves the previous wrapper behind without its children, so the
-/// wrapper that carries an interactive box is the live one. Of the boxes that exist, the
-/// largest is the control's own square (decorations inside it are smaller).
 fn click_target_for_debug_id(
     app: &App,
     window: WindowId,
@@ -748,13 +612,6 @@ fn click_target_for_debug_id(
         .max_by(|(_, left), (_, right)| area(left).total_cmp(&area(right)))
 }
 
-/// The largest node at or below `wrapper` that takes pointer input and has a real box.
-///
-/// A shell control is a wrapper (for its debug id) around the kit component that owns the
-/// action; the component builds several nodes, and only its square is both interactive and
-/// laid out. Clicking the largest one is the component's own square rather than a decoration
-/// inside it (`kytrix::test_support` clicks the same node). The wrapper itself is the
-/// fallback: a control that carries its own interaction has no interactive child.
 fn click_target(app: &App, window: WindowId, wrapper: NodeId) -> Option<(NodeId, Rect)> {
     let tree = app.window(window)?.tree();
     let mut best: Option<(NodeId, Rect)> = None;
@@ -782,7 +639,6 @@ fn click_target(app: &App, window: WindowId, wrapper: NodeId) -> Option<(NodeId,
     })
 }
 
-/// The node's layout rectangle (window coordinates).
 fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
     app.window(window)?
         .tree()
@@ -791,7 +647,6 @@ fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
         .map(|entry| entry.layout().bounds)
 }
 
-/// The centre of `bounds`.
 fn centre_of(bounds: Rect) -> Point {
     Point::new(
         bounds.origin.x + bounds.size.width / 2.0,
@@ -799,10 +654,6 @@ fn centre_of(bounds: Rect) -> Point {
     )
 }
 
-/// Every quad fill the window's scene carries, in paint order.
-///
-/// This is the appearance step's observation: the engine resolves the theme into `Color`s
-/// before they reach the scene, so a palette that did not repaint leaves the same list.
 fn painted_colors(app: &App, window: WindowId) -> Vec<Color> {
     let Some(window) = app.window(window) else {
         return Vec::new();

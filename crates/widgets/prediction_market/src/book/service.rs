@@ -1,16 +1,3 @@
-//! The background service the prediction order book panel talks to.
-//!
-//! One book is one leg of one market, and the panel follows it in two parts: a
-//! REST page that states the book at an instant, and the venue's live channel
-//! that carries the changes. The subscription is opened before the page is
-//! requested, so a frame that lands while the page is in flight is buffered
-//! rather than missed — and the page is authoritative at its own timestamp, so a
-//! buffered frame older than it is dropped instead of rolling the book back.
-//!
-//! The stream key is the event, the leg and a local epoch: switching to another
-//! leg is another book, and a request for one replaces the stream the previous
-//! one was reading.
-
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -48,16 +35,10 @@ use widget::{
 
 use crate::model::PredictionOrderBookTarget;
 
-/// How long one read may take before it is a failure.
 pub(crate) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The most live batches buffered between opening the stream and the first
-/// snapshot.
-///
-/// A frame older than this many frames is one the panel would overwrite anyway.
 pub(crate) const MAX_BUFFERED_UPDATES: usize = 2_000;
 
-/// What the view asks the book service to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PredictionOrderBookRequest {
     Load {
@@ -68,31 +49,22 @@ pub(crate) enum PredictionOrderBookRequest {
         target: PredictionOrderBookTarget,
         epoch: u64,
     },
-    /// Retires the stream the panel follows and leaves the service waiting for
-    /// another request.
-    ///
-    /// A hidden panel holds no lease on the venue: the stream is cancelled
-    /// instead of publishing into a channel nobody draws.
     Stop,
 }
 
-/// What the service answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PredictionOrderBookResponse {
     StreamStarted,
     Stopped,
 }
 
-/// The event, leg and generation one book follows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PredictionOrderBookStreamKey {
     pub event: PredictionEventRef,
     pub leg: OutcomeLegRef,
-    /// The view-local generation that produced this request.
     pub epoch: u64,
 }
 
-/// Where the stream is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PredictionOrderBookStatus {
     Connecting,
@@ -100,14 +72,12 @@ pub(crate) enum PredictionOrderBookStatus {
     Failed { error: PredictionOrderBookError },
 }
 
-/// Everything the book service publishes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PredictionOrderBookStreamMessage {
     Status(PredictionOrderBookStatus),
     Snapshot(Arc<PredictionOrderBook>),
 }
 
-/// Why one book produced no reading.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub(crate) enum PredictionOrderBookError {
     #[error("the order book request failed: {0}")]
@@ -128,10 +98,6 @@ impl TranslatedError for PredictionOrderBookError {
     }
 }
 
-/// Why a request was refused.
-///
-/// The service never refuses one: a request always starts or replaces a stream.
-/// The type exists because the protocol boundary names one.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub(crate) enum PredictionOrderBookServiceError {}
 
@@ -151,12 +117,6 @@ impl WidgetProtocol for PredictionOrderBookProtocol {
     type Error = PredictionOrderBookServiceError;
 }
 
-/// The seam between the book panel and the connector, so a test can answer
-/// instead.
-///
-/// One book is one leg of one market: the target names the event, every leg of
-/// the market — the payload a venue's market channel subscribes with — and the
-/// leg the ladder is drawn for.
 pub(crate) trait PredictionOrderBookSource: Clone + Send + Sync + 'static {
     type Subscription: PredictionOrderBookEventSubscription;
 
@@ -171,7 +131,6 @@ pub(crate) trait PredictionOrderBookSource: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Subscription, MarketError>> + Send;
 }
 
-/// One live order book stream.
 pub(crate) trait PredictionOrderBookEventSubscription: Send + 'static {
     fn recv(
         &mut self,
@@ -245,9 +204,6 @@ where
                     },
                     target.clone(),
                 ),
-                // A stop names no stream of its own: it retires whatever the
-                // panel was following and answers, leaving the service ready for
-                // the next request.
                 PredictionOrderBookRequest::Stop => {
                     if let Some(previous) = active_key.take() {
                         context.cancel_stream(&previous);
@@ -256,9 +212,6 @@ where
                     continue;
                 }
             };
-            // A panel follows one leg at a time, so a request for another leg —
-            // or for a new epoch of the same one — retires the previous stream
-            // instead of leaving it publishing into a channel nobody reads.
             if let Some(previous) = active_key
                 .as_ref()
                 .filter(|previous| *previous != &key)
@@ -318,10 +271,6 @@ async fn run_stream<S>(
             }
         };
 
-    // The channel is open before the page is requested, so a frame that lands
-    // while the page is in flight is buffered instead of missed. The buffer is
-    // bounded: a panel that fell this far behind redraws the newest state
-    // anyway.
     let mut buffered: VecDeque<Vec<PredictionOrderBookUpdate>> = VecDeque::new();
     let fetch = timeout(attempt_timeout, source.fetch_order_book(target.clone()));
     tokio::pin!(fetch);
@@ -350,10 +299,6 @@ async fn run_stream<S>(
     };
     let book = match book {
         Ok(Ok(book)) => book,
-        // A token no CLOB book exists for answers 404. Many placeholder markets
-        // have no resting level at all, and that is an empty page rather than a
-        // failure: the panel says there is no data and the channel stays open,
-        // because a book can still appear later.
         Ok(Err(error)) if is_missing_order_book(&error) => missing_order_book(&target.leg),
         Ok(Err(error)) => {
             fail(&publisher, PredictionOrderBookError::Market(error)).await;
@@ -369,12 +314,6 @@ async fn run_stream<S>(
         }
     };
 
-    // The page is authoritative at its own timestamp: the channel usually opens
-    // with a dump of the whole book that was queued before the page was read, so
-    // applying it would roll the reading back to an older instant. A whole-book
-    // replace from the page's own instant is such a dump too — the page was read
-    // at that instant and the frame may describe an earlier moment — while an
-    // absolute change at that instant happened after the page by construction.
     let page_timestamp = book.timestamp;
     let mut state = BookState::from_snapshot(&book);
     for batch in buffered {
@@ -441,11 +380,8 @@ async fn run_stream<S>(
     }
 }
 
-/// The state one book is drawn from: the normalized book the page and the
-/// channel agree on.
 struct BookState {
     tick: Tick,
-    /// Ascending by price; the bid side is read in reverse.
     bids: BTreeMap<Fraction, Quantity>,
     asks: BTreeMap<Fraction, Quantity>,
     last_trade: Option<Fraction>,
@@ -463,11 +399,6 @@ impl BookState {
         }
     }
 
-    /// Applies one update, dropping it when the book cannot carry it: a
-    /// whole-book replace states an instant that has to be strictly newer than
-    /// the one the state already holds, while a tick change, a last trade and a
-    /// set of absolute sizes are idempotent and may land on that same instant.
-    /// Answers whether the state changed.
     fn apply(&mut self, update: &PredictionOrderBookUpdate) -> bool {
         let timestamp = timestamp_of(update);
         let ordered = match update {
@@ -499,8 +430,6 @@ impl BookState {
         PredictionOrderBook {
             leg: leg.clone(),
             tick_size: self.tick,
-            // The map runs from the worst price upwards; a book is read from
-            // the best one, and the bid side is the side that runs downwards.
             bids: self
                 .bids
                 .iter()
@@ -524,7 +453,6 @@ impl BookState {
     }
 }
 
-/// The instantaneous timestamp an update states.
 fn timestamp_of(update: &PredictionOrderBookUpdate) -> UnixMillis {
     match update {
         PredictionOrderBookUpdate::Replace { timestamp, .. }
@@ -534,7 +462,6 @@ fn timestamp_of(update: &PredictionOrderBookUpdate) -> UnixMillis {
     }
 }
 
-/// The levels of one side, dropping the ones that hold no shares.
 fn levels(levels: &[PredictionBookLevel]) -> BTreeMap<Fraction, Quantity> {
     levels
         .iter()
@@ -543,7 +470,6 @@ fn levels(levels: &[PredictionBookLevel]) -> BTreeMap<Fraction, Quantity> {
         .collect()
 }
 
-/// Applies one side's absolute size changes; a zero size removes its level.
 fn apply_changes(side: &mut BTreeMap<Fraction, Quantity>, changes: &[PredictionBookLevelChange]) {
     for change in changes {
         if change.size.is_zero() {
@@ -554,18 +480,10 @@ fn apply_changes(side: &mut BTreeMap<Fraction, Quantity>, changes: &[PredictionB
     }
 }
 
-/// The tick a token with no book at all is read at.
-///
-/// Polymarket quotes its CLOB in cents, so a cent is the fallback precision an
-/// empty page is stated at. The panel hides its grouping control because the
-/// book has no level to group.
 fn missing_book_tick() -> Tick {
-    // A hundredth of one share, in the model's eighteen-digit fixed point: the
-    // value is not zero, so it is always a valid tick.
     Tick::from_inner(10_000_000_000_000_000).expect("a cent is a valid tick")
 }
 
-/// The empty page a token with no CLOB book is drawn from.
 fn missing_order_book(leg: &OutcomeLegRef) -> PredictionOrderBook {
     PredictionOrderBook {
         leg: leg.clone(),
@@ -577,20 +495,8 @@ fn missing_order_book(leg: &OutcomeLegRef) -> PredictionOrderBook {
     }
 }
 
-/// The sentence Polymarket answers a token with no CLOB book with.
-///
-/// The live CLOB states it inside a JSON envelope —
-/// `{"error":"No orderbook exists for the requested token id"}` — and the same
-/// words are the whole body when the envelope is absent. The venue's refusal is
-/// whichever of the two arrived, so its sentence is looked for inside the
-/// message rather than compared to the whole of it.
 const MISSING_ORDER_BOOK_SENTENCE: &str = "No orderbook exists for the requested token id";
 
-/// Whether the venue answered that the requested token has no CLOB book.
-///
-/// Polymarket returns a `404` whose body says no order book exists for the
-/// token; every other refusal — a rate limit, an unknown token, a transport
-/// failure — stays a failure.
 fn is_missing_order_book(error: &MarketError) -> bool {
     matches!(
         error,

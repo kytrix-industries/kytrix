@@ -1,6 +1,3 @@
-//! The chart's geometry, asserted directly: the plot inside the box, the two
-//! domains, the ticks, and the decimation that folds a series onto the plot.
-
 use std::rc::Rc;
 
 use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
@@ -17,7 +14,6 @@ use super::{
     text::format_axis_labels,
 };
 
-/// The catalogue and the language the labels are written in.
 fn translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(embedded::load().expect("the embedded locales should load")),
@@ -29,7 +25,6 @@ fn plot() -> Rect {
     Rect::new(8.0, 18.0, 880.0, 200.0)
 }
 
-/// The layout of the reference chart's box: 928 x 248 gives an 880 x 200 plot.
 fn layout() -> ChartLayout {
     ChartLayout::new(Rect::new(0.0, 0.0, 928.0, 248.0))
 }
@@ -47,7 +42,6 @@ fn millis(year: i32, month: Month, day: u8) -> i64 {
         * 1_000
 }
 
-/// The label of every tick the axis chose, formatted the way the chart formats them.
 fn labels(ticks: &TimeTicks, zone: UtcOffset) -> Vec<String> {
     format_axis_labels(
         &ticks.timestamps,
@@ -60,7 +54,6 @@ fn labels(ticks: &TimeTicks, zone: UtcOffset) -> Vec<String> {
     .collect()
 }
 
-/// Asserts that no two non-empty labels in a list read the same.
 fn assert_unique(labels: &[String]) {
     let mut non_empty: Vec<String> = labels
         .iter()
@@ -298,9 +291,6 @@ fn decimation_keeps_a_single_sample_as_one_point() {
 
 #[test]
 fn a_subpixel_probability_step_should_not_be_drawn_as_a_second_line() {
-    // A 0.05 point dip over a 900 px plot is 0.45 px: real history, but below the
-    // resolution of the line. It used to paint a parallel antialiased run beside the
-    // flat line, which reads as a duplicated stroke.
     let plot = Rect::new(8.0, 18.0, 880.0, 900.0);
     let samples = [
         sample(0, 99.95),

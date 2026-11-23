@@ -1,17 +1,3 @@
-//! The local translation model seam of the composition root.
-//!
-//! The model is loaded lazily on the first real translation. The directory it is loaded
-//! from is read from the settings on every call, so a directory the user changes is used
-//! by the next translation without a restart. Startup only proves that the translation
-//! crate is linked and accepts the language codes the app uses; it must not pay for a
-//! multi-second model load before the first window.
-//!
-//! [`AiTranslator`] is the engine the prediction-event dialog translates through. The
-//! dialog owns the batching, the deadline and the cancellation; this module only adapts
-//! its seam to the model crate. The composition root owns the one adapter this build has
-//! and hands it to the [`SelectorHost`](instrument_selector_ui::host::SelectorHost) it
-//! builds — it is a field of the root, not a process-global slot (design §11.7).
-
 use std::sync::Arc;
 
 use ai_translator::{
@@ -24,7 +10,6 @@ use instrument_selector_ui::prediction_translation::{
     TranslationSetup,
 };
 
-/// The local model engine behind the prediction-event dialog's translation seam.
 pub(crate) struct AiTranslator;
 
 impl LocalTranslator for AiTranslator {
@@ -73,15 +58,10 @@ impl LocalTranslator for AiTranslator {
     }
 }
 
-/// The translator the prediction-event dialog is handed by the composition root.
 pub(crate) fn production() -> Arc<dyn LocalTranslator> {
     Arc::new(AiTranslator)
 }
 
-/// The model code for a display language.
-///
-/// The model rejects the settings locale `zh-CN` and translates Chinese from the code `zh`,
-/// so the display language is mapped rather than handed over as its locale.
 fn target_code(language: Language) -> &'static str {
     match language {
         Language::ZhCn => "zh",
@@ -89,13 +69,6 @@ fn target_code(language: Language) -> &'static str {
     }
 }
 
-/// Maps an engine failure to the failure the dialog logs.
-///
-/// The dialog draws no error text and does not branch on the variants: it logs the failure,
-/// stops, and keeps the texts that did arrive translated. The mapping keeps the log precise
-/// where the engine is precise and folds together failures that mean the same thing to the
-/// caller — an unload timeout is a busy model from the caller's side, and an unusable model
-/// answer is a response failure rather than an engine one.
 fn failure(error: TranslationError) -> TranslationFailure {
     match error {
         TranslationError::Cancelled => TranslationFailure::Cancelled,
@@ -116,13 +89,6 @@ fn failure(error: TranslationError) -> TranslationFailure {
     }
 }
 
-/// Proves the translation path is usable, without loading the GGUF before the first window.
-///
-/// Empty content is answered before the model is touched, so this keeps the whole
-/// translation path in the binary and fails only for a build that lost it. A failed probe
-/// does not abort startup: the composition root logs it and opens the prediction-event
-/// dialogs without a translator, which is what a headless build without a model looks
-/// like (P4-3 ledger §4-③).
 pub(crate) fn probe(config: &Config) -> Result<(), TranslationError> {
     let directory = config.translation.model_directory.as_deref();
     let selected_model = config.translation.selected_model;
@@ -144,8 +110,6 @@ mod tests {
 
     use super::{AiTranslator, failure, probe, target_code};
 
-    /// The dialog's display language reaches the model as one of its own codes, so the
-    /// settings locale `zh-CN` — which the model rejects — never does.
     #[test]
     fn the_dialog_languages_map_to_codes_the_model_accepts() {
         assert_eq!(target_code(Language::ZhCn), "zh");
@@ -159,8 +123,6 @@ mod tests {
         }
     }
 
-    /// Every engine failure the dialog can see, and the failure it is handled as. No model
-    /// is involved: these are the error values the engine answers with.
     #[test]
     fn engine_failures_map_to_the_dialog_failures() {
         let cases = [
@@ -234,8 +196,6 @@ mod tests {
         }
     }
 
-    /// A batch with no segments is answered before the model is touched, so the adapter
-    /// needs no model files to be exercised end to end.
     #[test]
     fn an_empty_batch_translates_without_a_model() {
         let setup = TranslationSetup {
@@ -250,8 +210,6 @@ mod tests {
         assert!(translated.is_empty());
     }
 
-    /// The cancellation the dialog hands over is the flag the engine polls, and a
-    /// request cancelled up front stops before it needs a model.
     #[test]
     fn a_cancelled_batch_is_reported_as_cancelled() {
         let setup = TranslationSetup {
@@ -276,8 +234,6 @@ mod tests {
         assert_eq!(error, TranslationFailure::Cancelled);
     }
 
-    /// Preparing without a configured directory reports it unset; the dialog only logs that
-    /// failure and stops. No model is needed.
     #[test]
     fn preparing_without_a_directory_reports_it_unset() {
         let setup = TranslationSetup {
@@ -292,9 +248,6 @@ mod tests {
         assert_eq!(error, TranslationFailure::ModelDirectoryUnset);
     }
 
-    /// The startup probe answers empty content without a configured model, which is the
-    /// state a fresh installation starts in: it proves the path is linked without loading
-    /// anything.
     #[test]
     fn the_startup_probe_succeeds_on_a_fresh_installation() {
         probe(&Config::default()).expect("an empty probe must not need a model");

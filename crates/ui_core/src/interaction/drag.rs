@@ -1,16 +1,10 @@
-//! 拖拽：阈值判定与位移（会话状态在 `Window.pointer.drag`）。
-//!
-//! 引擎**不**在拖拽里改布局：应用在自己的 handler 里写 `LayoutOverride` 或 `Signal`
-
 use crate::math::Point;
 
-/// 位移是否超过「拖动 vs 点击」阈值（超过即抑制点击）。
 #[must_use]
 pub(crate) fn crosses_threshold(delta: Point, distance: f32) -> bool {
     delta.x.abs() > distance || delta.y.abs() > distance
 }
 
-/// 两点之间的曼哈顿式「超阈值」判定（用于双击距离：任一轴超过即不算同一击）。
 #[must_use]
 pub(crate) fn within(a: Point, b: Point, distance: f32) -> bool {
     (a.x - b.x).abs() <= distance && (a.y - b.y).abs() <= distance

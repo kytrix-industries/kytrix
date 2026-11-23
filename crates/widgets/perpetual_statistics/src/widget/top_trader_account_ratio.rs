@@ -1,11 +1,8 @@
-//! the top-trader account-ratio pane.
-
 use widget::identity::WidgetId;
 
 use super::display::{StatisticsMetric, StatisticsWidget};
 use crate::model::MetricKind;
 
-/// The perpetual series this pane plots.
 pub struct TopTraderAccountRatioWidgetSeries;
 
 impl StatisticsMetric for TopTraderAccountRatioWidgetSeries {
@@ -16,5 +13,4 @@ impl StatisticsMetric for TopTraderAccountRatioWidgetSeries {
     const METRIC: MetricKind = MetricKind::TopTraderAccountRatio;
 }
 
-/// Top traders' long and short account ratio.
 pub type TopTraderAccountRatioWidget = StatisticsWidget<TopTraderAccountRatioWidgetSeries>;

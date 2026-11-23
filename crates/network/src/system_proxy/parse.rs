@@ -1,5 +1,3 @@
-//! Shared host/port and PAC-decision parsing.
-
 #[cfg(target_os = "macos")]
 use std::net::Ipv6Addr;
 
@@ -20,11 +18,6 @@ pub(super) fn http_system_proxy(
     })
 }
 
-/// Materializes a SOCKS5 hop for a host name, an IPv4 literal, or a bracketed
-/// IPv6 literal.
-///
-/// The target host name always stays with the proxy to resolve, which is the
-/// only form that survives a proxy without a route to the local address family.
 pub(super) fn socks_system_proxy(
     endpoint: &str,
     target: &RouteTarget,
@@ -106,7 +99,6 @@ fn parse_port(
     }
 }
 
-/// Parses a PAC `FindProxyForURL` return list and takes the first usable hop.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn parse_pac_decision(
     raw: &str,

@@ -1,11 +1,3 @@
-//! What the updater knows and what it is doing about it.
-//!
-//! Every transition lives on [`UpdaterState`] and is pure, so the whole machine —
-//! what a check offers, what a download does to it, what cancelling leaves behind —
-//! is exercised without a network, a window or an engine. [`Updater`](crate::updater::Updater)
-//! is the value around it: it owns the requests, the schedule they run on, and the
-//! signal the interface repaints from.
-
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,99 +5,57 @@ use download_provider::task::DownloadId;
 
 use crate::{error::UpdaterError, release::ReleaseInfo};
 
-/// How long after startup the first check runs.
-///
-/// Startup is already a burst of work — settings, the window, the first market
-/// data — and an update check competing with it buys nothing: nobody is waiting
-/// for the answer.
 pub(crate) const FIRST_CHECK_DELAY: Duration = Duration::from_secs(5);
 
-/// How long the retry that follows a failed check waits, by the checks already failed.
-///
-/// A check that fails says nothing to the user: the button appearing is the whole
-/// of what this feature reports, so a failure is retried quietly a few times —
-/// startup is exactly when a machine may have no usable network yet — and then
-/// left until the next launch.
 const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(60),
     Duration::from_secs(5 * 60),
     Duration::from_secs(15 * 60),
 ];
 
-/// How long the retry after `spent` failed checks waits, or `None` when this
-/// launch has spent its attempts.
 pub(crate) fn retry_delay(spent: usize) -> Option<Duration> {
     RETRY_DELAYS.get(spent).copied()
 }
 
-/// How long the retry after a failed delete of a download this updater gave up
-/// waits.
-///
-/// A delete fails when the attempt that owns the file is still writing it. A retry
-/// a moment later is enough to outlast that write, and what is at stake is a task
-/// and a temporary file rather than the download the user gave up, so one retry is
-/// all this asks for.
 pub(crate) const CANCEL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// What the updater knows and what it is doing about it.
 #[derive(Debug)]
 pub(crate) enum UpdaterState {
-    /// Nothing newer is known, and no check is running.
     Idle,
-    /// The metadata request is in flight.
     Checking,
-    /// A newer release is available and nothing is being done about it yet.
     Available(ReleaseInfo),
-    /// The payload of the available release is being downloaded.
     Downloading(Download),
-    /// The transfer is being stopped and will settle as [`Self::Paused`].
     Pausing(Download),
-    /// The transfer is stopped at its partial file and can be resumed.
     Paused(Download),
-    /// The payload is downloaded, waiting for the user.
     ReadyToInstall(DownloadedUpdate),
-    /// The payload is being installed.
     Installing(ReleaseInfo),
-    /// The last attempt failed; the dialog says so, and the release stays on offer.
     Failed(FailedUpdate),
 }
 
-/// A download in flight.
 #[derive(Clone, Debug)]
 pub(crate) struct Download {
     pub release: ReleaseInfo,
-    /// The download manager's task, which is what names this transfer's events.
     pub task: DownloadId,
-    /// Bytes accepted so far; it does not decrease, except when the server answers
-    /// a resumed `Range` request with `200` and the transfer starts over from zero.
     downloaded: u64,
-    /// The exact payload size, when the response named one.
     total: Option<u64>,
 }
 
 impl Download {
-    /// What the response has handed over so far.
     pub(crate) fn accepted(&self) -> u64 {
         self.downloaded
     }
 
-    /// The size the response named, when it named one.
-    ///
-    /// A chunked answer has no length to draw a bar against, so what reports it draws
-    /// something else.
     pub(crate) fn named_total(&self) -> Option<u64> {
         self.total
     }
 }
 
-/// A payload that was downloaded, waiting to be installed.
 #[derive(Debug)]
 pub(crate) struct DownloadedUpdate {
     pub release: ReleaseInfo,
     pub bytes: Bytes,
 }
 
-/// A failed attempt, with the release it was about so it can be tried again.
 #[derive(Debug)]
 pub(crate) struct FailedUpdate {
     pub release: ReleaseInfo,
@@ -113,7 +63,6 @@ pub(crate) struct FailedUpdate {
 }
 
 impl UpdaterState {
-    /// The release this state is about, when one is known.
     pub(crate) fn release(&self) -> Option<&ReleaseInfo> {
         match self {
             Self::Available(release)
@@ -127,7 +76,6 @@ impl UpdaterState {
         }
     }
 
-    /// The release the interface offers, which is one no attempt is in flight for.
     pub(crate) fn offered(&self) -> Option<&ReleaseInfo> {
         match self {
             Self::Available(release) | Self::Failed(FailedUpdate { release, .. }) => Some(release),
@@ -135,7 +83,6 @@ impl UpdaterState {
         }
     }
 
-    /// The failure the dialog speaks for, when the last attempt failed.
     #[cfg(test)]
     pub(crate) fn failure(&self) -> Option<&UpdaterError> {
         match self {
@@ -144,7 +91,6 @@ impl UpdaterState {
         }
     }
 
-    /// The download this state is about, while one of the download states is current.
     pub(crate) fn download(&self) -> Option<&Download> {
         match self {
             Self::Downloading(download) | Self::Pausing(download) | Self::Paused(download) => {
@@ -154,7 +100,6 @@ impl UpdaterState {
         }
     }
 
-    /// Starts a check, unless one is already running.
     pub(crate) fn begin_check(&mut self) -> bool {
         if matches!(self, Self::Checking) {
             return false;
@@ -164,7 +109,6 @@ impl UpdaterState {
         true
     }
 
-    /// Applies what a finished check found.
     pub(crate) fn check_finished(&mut self, release: Option<ReleaseInfo>) {
         *self = match release {
             Some(release) => Self::Available(release),
@@ -172,7 +116,6 @@ impl UpdaterState {
         };
     }
 
-    /// Starts a download of the offered release, which is what it returns.
     pub(crate) fn begin_download(&mut self, task: DownloadId) -> Option<ReleaseInfo> {
         let release = self.offered()?.clone();
         *self = Self::Downloading(Download {
@@ -185,10 +128,6 @@ impl UpdaterState {
         Some(release)
     }
 
-    /// Records what the transfer reported; `true` when what is drawn moved.
-    ///
-    /// Only the transfer in flight takes a report: a report for a task the state no
-    /// longer holds is not about this download.
     pub(crate) fn record_progress(
         &mut self,
         task: DownloadId,
@@ -202,11 +141,6 @@ impl UpdaterState {
             return false;
         }
         let before = (download.downloaded, download.total);
-        // The transfer reports what it has written, so a number below what is
-        // already known is a stale report rather than news — except zero, which is
-        // the server restarting the entity it would not range. The bar has to
-        // follow that restart down, or it stays where the abandoned attempt left
-        // it while the new one starts over underneath.
         if downloaded == 0 || downloaded >= download.downloaded {
             download.downloaded = downloaded;
         }
@@ -217,7 +151,6 @@ impl UpdaterState {
         (download.downloaded, download.total) != before
     }
 
-    /// The transfer is being stopped; it settles as [`Self::Paused`] once it has.
     pub(crate) fn pause_started(&mut self) -> bool {
         let Self::Downloading(download) = self else {
             return false;
@@ -228,12 +161,6 @@ impl UpdaterState {
         true
     }
 
-    /// The stopped transfer keeps its partial file, which is what a resume continues.
-    ///
-    /// `downloaded` and `total` are what the transfer itself reports as stopped: a
-    /// chunk that was still in flight when the pause was asked for lands in the
-    /// numbers the provider publishes with the paused status, not in the ones this
-    /// state had at the click.
     pub(crate) fn pause_finished(&mut self, downloaded: u64, total: Option<u64>) -> bool {
         let Self::Pausing(download) = self else {
             return false;
@@ -248,7 +175,6 @@ impl UpdaterState {
         true
     }
 
-    /// The stopped transfer started again from its partial file.
     pub(crate) fn resume_started(&mut self) -> bool {
         let Self::Paused(download) = self else {
             return false;
@@ -259,12 +185,6 @@ impl UpdaterState {
         true
     }
 
-    /// Applies a payload that arrived.
-    ///
-    /// Only the download this attempt still owns becomes ready to install: a payload
-    /// that arrives after the user cancelled, or after the state moved on, is dropped
-    /// here. A download being stopped, or already stopped, still takes its payload:
-    /// the file is complete whichever of the two reported last.
     pub(crate) fn download_finished(&mut self, task: DownloadId, bytes: Bytes) -> bool {
         let (Self::Downloading(download) | Self::Pausing(download) | Self::Paused(download)) = self
         else {
@@ -279,7 +199,6 @@ impl UpdaterState {
         true
     }
 
-    /// Moves to installing and hands out what the installer needs, once.
     pub(crate) fn begin_install(&mut self) -> Option<(ReleaseInfo, Bytes)> {
         let Self::ReadyToInstall(update) = self else {
             return None;
@@ -291,7 +210,6 @@ impl UpdaterState {
         Some((release, bytes))
     }
 
-    /// The attempt failed: the release stays on offer, and the dialog says why.
     pub(crate) fn attempt_failed(&mut self, error: UpdaterError) {
         let Some(release) = self.release().cloned() else {
             return;
@@ -299,11 +217,6 @@ impl UpdaterState {
         *self = Self::Failed(FailedUpdate { release, error });
     }
 
-    /// The attempt is over without installing anything: whatever it produced is
-    /// dropped and the release is on offer again.
-    ///
-    /// Cancelling a download and closing the dialog on a downloaded payload both land
-    /// here, which is what makes each of them safe to reach twice.
     pub(crate) fn abandon_attempt(&mut self) {
         let Some(release) = self.release().cloned() else {
             return;
@@ -311,7 +224,6 @@ impl UpdaterState {
         *self = Self::Available(release);
     }
 
-    /// The dialog closed on a failure: the release is on offer again.
     pub(crate) fn failure_dismissed(&mut self) {
         let Self::Failed(FailedUpdate { release, .. }) = self else {
             return;
@@ -319,7 +231,6 @@ impl UpdaterState {
         *self = Self::Available(release.clone());
     }
 
-    /// A download in flight, for a test that drives the updater without a network.
     #[cfg(test)]
     pub(crate) fn downloading_for_test(
         release: ReleaseInfo,
@@ -335,7 +246,6 @@ impl UpdaterState {
         })
     }
 
-    /// A download being stopped, for a test that drives the updater without a network.
     #[cfg(test)]
     pub(crate) fn pausing_for_test(
         release: ReleaseInfo,
@@ -351,7 +261,6 @@ impl UpdaterState {
         })
     }
 
-    /// A stopped download, for a test that drives the updater without a network.
     #[cfg(test)]
     pub(crate) fn paused_for_test(
         release: ReleaseInfo,
@@ -367,13 +276,11 @@ impl UpdaterState {
         })
     }
 
-    /// A payload that was downloaded, for a test that drives the updater without a network.
     #[cfg(test)]
     pub(crate) fn ready_for_test(release: ReleaseInfo, bytes: Bytes) -> Self {
         Self::ReadyToInstall(DownloadedUpdate { release, bytes })
     }
 
-    /// A failed attempt, for a test that drives the updater without a network.
     #[cfg(test)]
     pub(crate) fn failed_for_test(release: ReleaseInfo, error: UpdaterError) -> Self {
         Self::Failed(FailedUpdate { release, error })
@@ -486,9 +393,6 @@ mod tests {
         );
     }
 
-    /// A server that answers `200` after a range request restarts the entity, which
-    /// the manager reports as a report of zero: that is the new attempt's start, not
-    /// a stale number, and the bar has to follow it back down.
     #[test]
     fn progress_should_follow_a_server_that_restarts_the_entity() {
         let mut state = UpdaterState::Idle;
@@ -583,8 +487,6 @@ mod tests {
         );
     }
 
-    /// A pause and a completed transfer can race: whichever report arrives last,
-    /// the file is complete and the payload is what the user is waiting to install.
     #[test]
     fn a_payload_that_arrives_while_paused_should_still_be_ready_to_install() {
         let mut state = UpdaterState::Idle;
@@ -655,10 +557,6 @@ mod tests {
         );
     }
 
-    /// The transfer knows how much it actually wrote when it stopped: a frame that
-    /// was in flight at the click is in the numbers it publishes with the pause, so
-    /// the settled state takes those rather than the ones it had when the pause
-    /// started.
     #[test]
     fn a_stopped_transfer_should_settle_on_the_bytes_it_reported() {
         let mut state = UpdaterState::Idle;
@@ -715,8 +613,6 @@ mod tests {
         );
     }
 
-    /// A paused download is still an attempt: giving it up puts the release back on
-    /// offer rather than leaving the dialog with nothing to do.
     #[test]
     fn abandoning_a_paused_download_should_offer_the_release_again() {
         let mut state = UpdaterState::Idle;

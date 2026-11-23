@@ -1,5 +1,3 @@
-//! The thread that owns the model and its context.
-
 use std::sync::mpsc::{Receiver, SyncSender};
 
 use llama_sys::ffi;
@@ -17,31 +15,22 @@ use super::{
 };
 use crate::error::{DetokenizeError, ProviderError};
 
-/// One request for the worker thread.
 pub(super) enum Command {
-    /// Generate text for `prompt` and answer through `reply`.
     Generate {
         prompt: Vec<PromptSpan>,
         params: SamplingParams,
         cancel: Option<CancelCheck>,
         reply: SyncSender<Result<String, ProviderError>>,
     },
-    /// Stop serving and let the thread end.
     Shutdown,
 }
 
-/// The model owner that runs on the `kytrix-llama` thread.
-///
-/// The worker is created, used and dropped on one thread. Its context borrows the
-/// model, so the two live together in [`Worker::run`] rather than in a struct that
-/// could be sent elsewhere.
 pub(super) struct Worker {
     model: Model,
     config: EngineConfig,
 }
 
 impl Worker {
-    /// Loads the model. The caller runs this on the worker thread.
     pub(super) fn load(config: EngineConfig) -> Result<Self, ProviderError> {
         backend::init(config.log_llama);
         let model = Model::load(&config.model_path, config.gpu_layers)?;
@@ -49,7 +38,6 @@ impl Worker {
         Ok(Self { model, config })
     }
 
-    /// Creates the one context and serves commands until the engine shuts down.
     pub(super) fn run(
         self,
         commands: Receiver<Command>,
@@ -84,11 +72,6 @@ impl Worker {
         }
     }
 
-    /// Tokenizes, decodes and samples one request on the reused context.
-    ///
-    /// `cancel` is polled before tokenization, before each prefill chunk and before
-    /// each sampled token. Returning early is safe: [`Worker::run`] clears the KV
-    /// cache after every request, including a cancelled one.
     fn generate(
         &self,
         context: &mut Context<'_>,
@@ -122,8 +105,6 @@ impl Worker {
             }
         }
         if tokens.is_empty() {
-            // llama.cpp refuses to decode an empty batch, and a prompt that tokenizes to
-            // nothing has no text to condition on.
             return Ok(String::new());
         }
 
@@ -179,9 +160,6 @@ impl Worker {
                 break;
             }
 
-            // A control token that is not in the stop list has no text. Skipping
-            // it here keeps one unusual marker from failing the whole request;
-            // it is still decoded below so the next position is correct.
             if !is_special_token(&self.model, token) {
                 let piece = detokenizer
                     .push(token)
@@ -217,13 +195,6 @@ impl Worker {
     }
 }
 
-/// Tokenizes user text while preventing any added token from being recognized.
-///
-/// llama.cpp's `parse_special = false` still pretokenizes USER_DEFINED tokens
-/// (`<think>`, `<tool_call>`, ...), so a plain plaintext pass is not enough. If
-/// the first pass contains a control/user-defined/unknown token, retry with the
-/// text split before every `<`; that breaks the added-token match while keeping
-/// the rest of the text intact.
 fn tokenize_text_span(model: &Model, text: &str) -> Result<Vec<ffi::llama_token>, ProviderError> {
     let tokens = model
         .tokenize(text, false)
@@ -244,8 +215,6 @@ fn tokenize_text_span(model: &Model, text: &str) -> Result<Vec<ffi::llama_token>
         return Ok(split);
     }
 
-    // A special token that does not start with `<` would survive the split. A
-    // character-by-character pass cannot match any multi-character added token.
     let mut characters = Vec::new();
     for character in text.chars() {
         let mut buffer = [0_u8; 4];
@@ -265,7 +234,6 @@ fn tokenize_text_span(model: &Model, text: &str) -> Result<Vec<ffi::llama_token>
     Ok(characters)
 }
 
-/// Whether a token must never leak into a prompt text span or the output text.
 fn is_special_token(model: &Model, token: ffi::llama_token) -> bool {
     let attributes = model.token_attr(token);
     attributes & ffi::LLAMA_TOKEN_ATTR_CONTROL != 0
@@ -273,7 +241,6 @@ fn is_special_token(model: &Model, token: ffi::llama_token) -> bool {
         || attributes & ffi::LLAMA_TOKEN_ATTR_UNKNOWN != 0
 }
 
-/// Splits text before each `<`, so an added token like `<think>` cannot match.
 fn split_before_angle_brackets(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut start = 0;
@@ -292,11 +259,6 @@ fn split_before_angle_brackets(text: &str) -> Vec<&str> {
     pieces
 }
 
-/// Appends the detokenizer's final complete text.
-///
-/// Hitting `max_tokens` can stop in the middle of a byte-fallback character. The
-/// complete prefix is still a valid translation, so the unfinished tail is
-/// dropped rather than turning the whole request into an error.
 fn append_tail(
     output: &mut String,
     finished: Result<String, DetokenizeError>,
@@ -309,9 +271,7 @@ fn append_tail(
     Ok(())
 }
 
-/// Builds the parameters of the one context the worker creates.
 fn context_params(config: &EngineConfig) -> ffi::llama_context_params {
-    // SAFETY: this only fills a plain C struct with llama.cpp's defaults.
     let mut params = unsafe { ffi::llama_context_default_params() };
     params.n_ctx = config.context_tokens;
     params.n_batch = config.batch_tokens;
@@ -362,8 +322,6 @@ mod tests {
         assert_eq!(output, "你好!");
     }
 
-    /// Every field of a queued request crosses the worker channel, so the command and
-    /// the result it carries must both be `Send`.
     #[test]
     fn commands_can_cross_the_worker_channel() {
         fn assert_send<T: Send>() {}

@@ -1,10 +1,3 @@
-//! The parts every venue page shares: the published origins and their search rows.
-//!
-//! A venue page is native UI written for the settings that venue's API has, so this module holds
-//! only the conversions that are the same for every venue: how one Binance market's origin pair is
-//! updated, how a published address is offered as a choice, and how a row is described to the
-//! search. The layout of a page stays in the page that draws it.
-
 use std::rc::Rc;
 
 use app_config::{
@@ -27,7 +20,6 @@ use crate::{
     session::SettingsChange,
 };
 
-/// Which of one scope's two addresses a row writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OriginKind {
     Http,
@@ -35,7 +27,6 @@ pub(crate) enum OriginKind {
 }
 
 impl OriginKind {
-    /// The name the row is drawn under.
     pub(crate) const fn label_key(self) -> &'static str {
         match self {
             Self::Http => "settings_ui.market_participants.http_api_endpoint",
@@ -43,7 +34,6 @@ impl OriginKind {
         }
     }
 
-    /// The line under the row that says what the endpoint is for.
     pub(crate) const fn description_key(self) -> &'static str {
         match self {
             Self::Http => "settings_ui.market_participants.http_api_endpoint_description",
@@ -52,8 +42,6 @@ impl OriginKind {
     }
 }
 
-/// The address choices one Binance market holds, or nothing while the venue is not configured as
-/// Binance.
 pub(crate) fn binance_origins(
     config: &Config,
     venue: &VenueId,
@@ -65,12 +53,6 @@ pub(crate) fn binance_origins(
     }
 }
 
-/// Writes one Binance market's choice of one of its two addresses.
-///
-/// The pair is written as a whole — the other role is carried over unchanged — because a market is
-/// reached at one pair of addresses and not at two values of different shapes. A value no table
-/// publishes writes nothing: the choices are the venue's own, and a control that offered one this
-/// build does not know is not a control it drew.
 pub(crate) fn write_binance_origin(
     config: &mut Config,
     venue: &VenueId,
@@ -106,7 +88,6 @@ pub(crate) fn write_binance_origin(
     config.set_binance_market_origins(venue, market, &origins);
 }
 
-/// The search row of one origin.
 pub(crate) fn origin_search_field(
     id: SmolStr,
     label: SmolStr,
@@ -123,24 +104,14 @@ pub(crate) fn origin_search_field(
     FieldSearch { id, text }
 }
 
-/// The page id one venue's settings are drawn under.
 pub(crate) fn page_id(venue: &VenueId) -> SmolStr {
     format_smolstr!("market_participants.{}", venue.as_str())
 }
 
-/// The application-level key one control of a venue page is named by.
-///
-/// It is the settings page instance's key followed by the row's field id, which already names the
-/// page: two panes showing the same page are two settings page instances, so their controls are
-/// two identities and one pane's control never dispatches the other pane's handler.
 pub(crate) fn control_key(cx: &PageBuild<'_>, field_id: &str) -> SmolStr {
     format_smolstr!("{}.{field_id}", cx.key)
 }
 
-/// A select over the published addresses of one origin row.
-///
-/// The choices are the addresses themselves: a published address is its own id and its own label,
-/// and a value no table publishes writes nothing (see [`write_binance_origin`]).
 pub(crate) fn address_select(
     app: &mut App,
     host: &SettingsHost,
@@ -159,25 +130,13 @@ pub(crate) fn address_select(
     VenueSelect::new(app, host, window, key, current, choices, label, apply)
 }
 
-/// One setting of a venue page as the page draws it: the value the settings hold and the selector
-/// that writes it.
-///
-/// The selector is a value the page keeps: it is what `sync` writes the settings of the frame into
-/// and what `release` gives back. A value the settings hold that no choice names is still handed to
-/// the selector — the row shows what the settings hold, not what the table offers — and the address
-/// writers ignore a value they do not publish, so such a row writes nothing until it is changed.
 pub(crate) struct VenueSelect {
     host: SettingsHost,
     select: Select,
-    /// The value the settings hold for this row, read for the frame's `sync`.
     current: Box<dyn Fn(&Config) -> SmolStr>,
 }
 
 impl VenueSelect {
-    /// The selector over `choices`, writing what the user chose through `apply`.
-    ///
-    /// `current` reads the value the row draws from the settings; it is read once here for the
-    /// first frame and on every `sync` afterwards.
     pub(crate) fn new(
         app: &mut App,
         host: &SettingsHost,
@@ -216,7 +175,6 @@ impl VenueSelect {
         }
     }
 
-    /// The row this selector is drawn in.
     pub(crate) fn row(
         &self,
         theme: &ThemeHandle,
@@ -231,10 +189,6 @@ impl VenueSelect {
         })
     }
 
-    /// Makes the selector show the value the settings hold for this frame.
-    ///
-    /// # Errors
-    /// The selector refused a write (`StaleNode`, or a selector whose nodes were removed).
     pub(crate) fn sync(&self, app: &mut App) -> Result<(), EngineError> {
         let value = self.host.config(app, |config| (self.current)(config));
         self.select.set_chosen(app, [value.as_str()], false);
@@ -242,12 +196,10 @@ impl VenueSelect {
         Ok(())
     }
 
-    /// Offers one platform event to the selector.
     pub(crate) fn dispatch(&self, app: &mut App, event: &Event) -> bool {
         self.select.dispatch(app, event)
     }
 
-    /// Releases the selector.
     pub(crate) fn release(&self, app: &mut App) {
         self.select.release(app);
     }

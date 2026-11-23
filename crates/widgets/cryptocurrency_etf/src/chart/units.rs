@@ -1,18 +1,7 @@
-//! The one thing the engine's `Rect` does not spell: its far edges.
-//!
-//! Every box on a chart is placed from the box before it — the plot from the content,
-//! the axes from the plot, a label from its tick — and that arithmetic reads from an
-//! edge far more often than from an origin. `Rect` stores the origin and the size, so
-//! the two derived readings live here rather than being written out as
-//! `origin.x + size.width` in every placement.
-
 use ui_core::math::Rect;
 
-/// A box's far edges.
 pub(crate) trait RectExt {
-    /// `origin.x + size.width`.
     fn right(self) -> f32;
-    /// `origin.y + size.height`.
     fn bottom(self) -> f32;
 }
 

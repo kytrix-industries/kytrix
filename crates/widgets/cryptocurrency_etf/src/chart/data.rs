@@ -1,20 +1,3 @@
-//! What one ETF chart is showing, prepared once per snapshot.
-//!
-//! A chart is the same drawing whatever the user picked; what changes is *what it
-//! says*. So the picking — which asset, how much history, which fund — is resolved
-//! here, at the boundary where a snapshot arrives, and everything a frame draws is
-//! derived from that resolution: the points, their labels, the axis scales and the
-//! tooltips.
-//!
-//! The drawing code therefore never formats a number and never asks the translator
-//! for a string. That is what makes a frame cheap, and it is also what makes a
-//! language change visible: the locale a chart was prepared in is kept, so the pane
-//! can tell that the labels on screen are the ones of the language it just left.
-//!
-//! Net assets are read from [`CryptocurrencyEtfDataset::days_for_window`]'s rows, but they are
-//! *accumulated* over the whole history by the model: the total is a level the
-//! funds hold, not a sum over the window a chart happens to show.
-
 use std::sync::Arc;
 
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -28,60 +11,32 @@ use crate::model::{
     CryptocurrencyEtfDataset, CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow,
 };
 
-/// One trading day, as the frame draws it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PreparedPoint {
-    /// The day, written in full, which is the tooltip's title and the pane's own
-    /// date field.
     pub header_date: SmolStr,
-    /// The day, written for the time axis.
     pub date_label: SmolStr,
-    /// What the funds moved that day, in millions of dollars.
     pub flow: f64,
-    /// The flow, as a person reads an amount of money.
     pub flow_label: SmolStr,
-    /// The flow, named as an inflow or an outflow.
     pub flow_caption: SmolStr,
-    /// The flow, in a tooltip: what the day's reading is called, written with the
-    /// separator its amount follows.
-    ///
-    /// The amount is [`PreparedPoint::flow_label`] rather than part of this string:
-    /// a tooltip draws the day's direction in its own text colour and the amount in
-    /// the colour the day went, so the reading is kept as the two runs it is drawn
-    /// from.
     pub flow_tooltip_caption: SmolStr,
-    /// What the funds hold after that day.
     pub net_assets: f64,
     pub net_assets_label: SmolStr,
     pub net_assets_tooltip: SmolStr,
 }
 
-/// Everything one chart draws, and everything it says about it.
 pub(crate) struct PreparedData {
-    /// The history this was read from, kept so a caller can tell one dataset from
-    /// another by pointer.
     pub source: Arc<CryptocurrencyEtfDataset>,
     pub selection: CryptocurrencyEtfFundSelection,
     pub window: CryptocurrencyEtfWindow,
-    /// The language the labels were written in.
     pub locale: LanguageCode,
-    /// What each axis counts, and the unit its numbers are read in. The numbers on
-    /// an axis are bare, so the title is the only thing that says what they are.
     pub left_axis_title: SmolStr,
     pub right_axis_title: SmolStr,
     pub points: Box<[PreparedPoint]>,
     pub flow: AxisScale,
-    /// The net-asset axis, which only a chart of every fund has: a single fund has
-    /// a flow but no assets of its own to report.
     pub net_assets: Option<AxisScale>,
     pub show_net_assets: bool,
 }
 
-/// The two readings and the day they belong to, as the pane's own row shows them.
-///
-/// The flow arrives both as the text to draw and as the number it was written from,
-/// because the row colours the reading by the direction it went while the text is
-/// already the reader's.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Metrics {
     pub date: SmolStr,
@@ -92,7 +47,6 @@ pub(crate) struct Metrics {
 }
 
 impl PreparedData {
-    /// Resolves one view of one history.
     pub(crate) fn new(
         translate: &Translate,
         source: Arc<CryptocurrencyEtfDataset>,
@@ -102,9 +56,6 @@ impl PreparedData {
         let locale = translate.language();
         let left_axis_title = t_smol!(translate, "widget.cryptocurrency_etf.flow_axis");
         let right_axis_title = t_smol!(translate, "widget.cryptocurrency_etf.net_assets_axis");
-        // A fund the asset does not have is a view of no data rather than of the
-        // total: showing the total under a fund's name would report a number the
-        // user did not ask for and cannot tell apart from the one they did.
         let selection_valid = match &selection {
             CryptocurrencyEtfFundSelection::All => true,
             CryptocurrencyEtfFundSelection::Named(name) => {
@@ -147,9 +98,6 @@ impl PreparedData {
                 date_label: format_date(day.date),
                 flow,
                 flow_caption: flow_caption(translate, flow, flow_name.as_str()),
-                // The caption is the label half of the reading the pane writes
-                // everywhere else: the template that says how a label and its amount
-                // are read together, with the amount left off.
                 flow_tooltip_caption: t_smol!(
                     translate,
                     "widget.cryptocurrency_etf.value",
@@ -186,20 +134,12 @@ impl PreparedData {
         }
     }
 
-    /// The point under a hover, or the last one when the pointer is elsewhere.
     pub(crate) fn current(&self, hover: Option<usize>) -> Option<&PreparedPoint> {
         hover
             .and_then(|index| self.points.get(index))
             .or_else(|| self.points.last())
     }
 
-    /// What the pane's own row shows for the point under the pointer.
-    ///
-    /// It is the same reading the tooltip carries: the day, the amount, and which way
-    /// the day went. Only the caption differs, because the two name different things
-    /// — the row labels the amount with the series it belongs to, the tooltip labels
-    /// it with the day it is about — while the amount itself is spelled the same in
-    /// both, which is what keeps one value from reading as two.
     pub(crate) fn metrics(&self, hover: Option<usize>) -> Option<Metrics> {
         let point = self.current(hover)?;
         Some(Metrics {
@@ -212,8 +152,6 @@ impl PreparedData {
     }
 }
 
-/// What one day's flow is called: a direction when it has one, and its name when
-/// it does not.
 fn flow_caption(translate: &Translate, value: f64, name: &str) -> SmolStr {
     if value > 0.0 {
         t_smol!(
@@ -232,13 +170,6 @@ fn flow_caption(translate: &Translate, value: f64, name: &str) -> SmolStr {
     }
 }
 
-/// What one day's flow is called in a tooltip: the direction the day went, named for
-/// the day rather than for the series.
-///
-/// The row above the chart is where a reading is labelled with the series it belongs
-/// to, because the row is what a reader compares against the pane's own controls; a
-/// tooltip has the date on the line above, so the only thing left for it to name is
-/// which way that day went.
 fn day_caption(translate: &Translate, value: f64) -> SmolStr {
     if value > 0.0 {
         t_smol!(translate, "widget.cryptocurrency_etf.day_net_inflow")

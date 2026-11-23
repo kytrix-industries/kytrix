@@ -1,5 +1,3 @@
-//! WPAD URL discovery through NetworkManager and the resolver search list.
-
 use std::process::Command;
 
 use crate::system_proxy::linux::command::bounded_command_output;

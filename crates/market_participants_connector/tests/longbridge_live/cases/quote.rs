@@ -1,11 +1,3 @@
-//! The real-time quote cases: the pull (cmd 11) and the incremental semantics of the
-//! subscription's pushes (cmd 6, push 101).
-//!
-//! These two are what the watch list's ticker path stands on. The pull is the snapshot a
-//! row is first drawn from, and the pushes are what move it afterwards; the venue's own
-//! documentation says a push fills in only the fields that changed, and this module is
-//! where that statement is measured rather than believed.
-
 use longbridge_proto::quote::{
     MultiSecurityRequest, PushQuote, SecurityQuoteResponse, SubType, SubscribeRequest,
 };
@@ -23,17 +15,8 @@ use crate::{
     wire::{Failure, PUSH_REALTIME_QUOTE, QUERY_SECURITY_QUOTE, SUBSCRIBE},
 };
 
-/// How recently a timestamp read as seconds or as milliseconds has to fall.
 const RECENT: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Case 18 — what the real-time quote command answers (§3.3, §9.1 items 1 and 2).
-///
-/// The design reads the venue's own documentation for the field meanings and the vendor's
-/// proto for their numbers. What documentation cannot answer is the unit of `timestamp`
-/// and the dimension of `volume` against the currency of `turnover`, so both are measured
-/// here: the timestamp is resolved to whichever of its two readings falls in the recent
-/// past, and `turnover / volume` is compared against `last_done` on the one occasion the
-/// comparison means anything.
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_18_the_real_time_quote_command_reads_back() {
@@ -60,8 +43,6 @@ async fn live_case_18_the_real_time_quote_command_reads_back() {
             .await
         {
             Ok(answer) => answer,
-            // An account without US market data is not a broken case: the suite has no
-            // permission to measure, and says so rather than failing the run.
             Err(Failure::Refused { code, message, .. }) => {
                 println!(
                     "SKIP {case}: the venue refused cmd 11 with code {code}: {message} (the \
@@ -110,9 +91,6 @@ async fn live_case_18_the_real_time_quote_command_reads_back() {
             );
         }
 
-        // The unit of `timestamp` is not documented (§9.1 item 1), so both readings are
-        // printed and the assertion is the one fact either reading must satisfy: exactly
-        // one of them is recent.
         let now = now_millis();
         let as_seconds = quote.timestamp.saturating_mul(1_000);
         let as_millis = quote.timestamp;
@@ -151,11 +129,6 @@ async fn live_case_18_the_real_time_quote_command_reads_back() {
             quote.turnover
         );
 
-        // The dimension evidence (§9.1 item 2) only means anything on the day's own
-        // cumulative figures inside the regular session: `last_done` may come from the
-        // overnight or post session, whose price divided by the day's cumulative VWAP can
-        // reasonably be far from one. Every precondition is stated, and a run that does
-        // not meet one reports that it could not judge the clause rather than passing it.
         let volume = quote.volume;
         let turnover = quote.turnover.parse::<f64>().unwrap_or_default();
         let last = quote.last_done.parse::<f64>().unwrap_or_default();
@@ -203,12 +176,6 @@ async fn live_case_18_the_real_time_quote_command_reads_back() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 19 — a subscription's pushes state only what changed (§3.1, §4.2).
-///
-/// This is the measurement the adapter's merge exists for. The baseline is pulled with
-/// cmd 11 first, exactly as the adapter pulls it, and the subscription asks for no opening
-/// push because the adapter asks for none; what the venue then sends is recorded field by
-/// field, so the run can report which fields a push leaves at their decoded defaults.
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_19_a_subscription_pushes_only_what_changed() {
@@ -225,9 +192,6 @@ async fn live_case_19_a_subscription_pushes_only_what_changed() {
             .await
             .unwrap_or_else(|error| panic!("{case}: {error}"));
 
-        // The baseline, read with the command the adapter reads it with. A venue refusal
-        // here is the same situation case 18 skips on: an account without US market data
-        // is not a broken case, and the suite says so rather than failing the run.
         let baseline: SecurityQuoteResponse = match socket
             .request(
                 QUERY_SECURITY_QUOTE,
@@ -262,8 +226,6 @@ async fn live_case_19_a_subscription_pushes_only_what_changed() {
             baseline.turnover
         );
 
-        // The frame the adapter sends: quotes alone, and no opening push, because the
-        // baseline was already pulled.
         let subscribe = SubscribeRequest {
             symbol: vec![symbol.clone()],
             sub_type: vec![SubType::Quote as i32],
@@ -319,7 +281,6 @@ async fn live_case_19_a_subscription_pushes_only_what_changed() {
                 .collect::<Vec<_>>()
         );
 
-        // Which fields each frame left at the default prost decodes an unset field into.
         let mut empty_open = 0_usize;
         let mut empty_last = 0_usize;
         let mut empty_turnover = 0_usize;
@@ -403,7 +364,6 @@ async fn live_case_19_a_subscription_pushes_only_what_changed() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Reports whether one instant falls inside the recent past.
 fn within(millis: i64, now: i64) -> bool {
     let recent = i64::try_from(RECENT.as_millis()).unwrap_or(i64::MAX);
     millis > 0 && millis <= now && now - millis <= recent

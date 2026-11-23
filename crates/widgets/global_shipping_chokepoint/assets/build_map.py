@@ -55,139 +55,52 @@ from shapely.geometry import LineString, Point, Polygon, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import linemerge, nearest_points, unary_union
 
-# The asset directory is inside the repository: importing `download_map` must not
-# leave a `__pycache__` next to the committed files.
 sys.dont_write_bytecode = True
 
-import download_map  # noqa: E402  (after the bytecode switch above)
+import download_map
 
-#: The map box: the user's screenshot, extended half a degree north and south so
-#: a cover fit never leaves an ocean-coloured band above or below the viewport.
 WEST, SOUTH, EAST, NORTH = 47.802, 21.443, 61.875, 30.042
 
-#: The asset grid. Cell `row * GRID_COLS + col`, column 0 at the west edge and
-#: row 0 at the south edge.
 GRID_COLS, GRID_ROWS = 64, 32
 
-#: The KHL2 version this script writes, and how many sections it packs.
-#:
-#: Version 3 adds the 0.002° land tier to version 2's three tiers, so the section
-#: count and the kinds after the land both move. The parser rejects every other
-#: version: there is no migration and no second layout to maintain.
 VERSION = 3
 SECTION_COUNT = 6
 
-#: Section kinds of the KHL2 asset, in the order the file stores them: the four
-#: land tiers coarse-last, then the two line layers. `LAND_KINDS` is the single
-#: source for the land kinds; `KIND_BORDERS`/`KIND_ROADS` follow them.
 LAND_KINDS = (1, 2, 3, 4)
 KIND_BORDERS = LAND_KINDS[-1] + 1
 KIND_ROADS = KIND_BORDERS + 1
 
-#: Road flags: bit 0 is "primary", bit 1 is "this piece belongs to the middle
-#: copy", bit 2 is "this piece belongs to the coarse copy", bit 3 is "this piece
-#: belongs to a class-0 chain shorter than `SHORT_CHAIN_KM`". The runtime rejects a
-#: piece whose flags hold any other bit.
 FLAG_PRIMARY = 1 << 0
 FLAG_MIDDLE = 1 << 1
 FLAG_COARSE = 1 << 2
 FLAG_SHORT_CHAIN = 1 << 3
 
-#: The road classes the asset keeps, as `highway` tag values.
 ROAD_CLASSES = frozenset({"motorway", "trunk", "primary"})
 
-#: The four land tiers, one per section, coarsest last, in degrees.
-#:
-#: Every tier is simplified from the *same* clipped land, so the four are the
-#: same coastline at four resolutions rather than four independent readings of
-#: the source. `0.001` is about 100 m on the ground at this latitude, which is
-#: what the map drew before the tiers existed and stays the visual reference;
-#: `0.006` is about 600 m, and its worst deviation from tier 0 measures 1.04
-#: pixels at the fitted zoom (see `src/model.rs`, where the runtime's thresholds
-#: are derived from the same measurements). The runtime picks a tier by metres
-#: per pixel, never by zoom.
 LAND_TIERS = (0.001, 0.002, 0.003, 0.006)
-#: Islands smaller than this are dropped, in every tier. The area is converted to
-#: km² first: a raw square degree is about 11,200 km² here and would drop almost
-#: every island.
 LAND_MIN_AREA_KM2 = 0.01
-#: The places a coarser tier must not erase on the strait itself, as a point on a
-#: piece of land big enough to survive the area filter. Checked by point-in-polygon
-#: against every tier's kept polygons and printed by the build.
 NAMED_PLACES = {
     "Qeshm": (55.85, 26.85),
     "Hormuz": (56.46, 27.06),
     "Khasab": (56.25, 26.18),
 }
-#: Borders are simplified to 0.0005° (about 55 m).
 BORDER_SIMPLIFY = 0.0005
-#: The margin a border point gets when it is tested against the drawn land.
-#:
-#: The land mask is the tier 0 geometry, simplified to 0.001°, so the drawn
-#: coastline sits up to about 100 m off the real one and a border point that is
-#: truly on the coast can fall just outside the drawn polygon. Twice that keeps
-#: such a point: the Saudi–Qatar connector's nearest point reads 57 m from the
-#: drawn coast. The sea-only stretches the mask exists for are a kilometre or
-#: more out — the two Abu Dhabi rings read 877 m and 1,486 m — so nothing in
-#: between is ambiguous.
 BORDER_LAND_MASK_TOLERANCE = 0.002
-#: Roads are simplified to 0.002° (about 200 m).
 ROAD_SIMPLIFY = 0.002
-#: The coarse copy of the motorways and trunks is simplified to 0.008° (about
-#: 800 m). One pixel at the fitted zoom is about a kilometre, so the copy is
-#: under a pixel off where it is drawn, and its vertices are the only ones a 1×
-#: frame pays for.
 COARSE_ROAD_SIMPLIFY = 0.008
-#: The middle copy is simplified to 0.004° (about 400 m), for the scales between
-#: the coarse copy's 742 m/px threshold and the fine copy: 0.004° is 445.3 m on the
-#: latitude axis, and 445.3 / 1.2 = 371 m/px is the coarsest scale at which it is
-#: still inside the runtime's 1.2 px budget. It is built from the same long chains
-#: as the coarse copy, so a short chain is drawn only by the fine copy — at the
-#: scales the middle copy covers it would be under a pixel wide.
 MIDDLE_ROAD_SIMPLIFY = 0.004
-#: Chains shorter than this many kilometres are feature-dropped: the class-0
-#: middle and coarse copies leave them out and the fine copy marks them so the
-#: runtime draws them only once a pixel is finer than
-#: `model::ROAD_SHORT_CHAIN_METRES_PER_PIXEL`; the primary copy leaves them out
-#: at build time, because it only draws at the closest zoom. A chain is a whole
-#: road between junctions, so dropping one keeps every drawn road continuous;
-#: dropping a piece of a longer chain would not. The build prints the
-#: distributions this is chosen from.
 SHORT_CHAIN_KM = 0.3
 
-#: Degrees to kilometres at the equator; every area scales it by the cosine of
-#: the latitude.
 DEGREE_KM = 111.32
-#: Degrees to metres at the equator, for the build's own length statistics.
-#:
-#: It is 111,320 m, while the runtime's `metres_per_pixel` uses the mean Earth
-#: radius (111,195 m per degree); after both are scaled by the same cosine the
-#: build's figure is 0.1125% larger. That is far below the 0.3 km feature drop's
-#: resolution, and the runtime's 1.2 px thresholds deliberately do not use it.
 DEGREE_M = 111_320.0
 
-#: The latitude the map's scale is quoted at, in degrees: the box's own middle. The
-#: runtime reads its metres-per-pixel at the same row (`model::MAP_SCALE_LATITUDE`).
 SCALE_LATITUDE = (SOUTH + NORTH) / 2
-#: The fitted zoom's scale on the user's 1,404 × 900 pane, in metres per pixel.
-#:
-#: Documentation only: it turns the Hausdorff distances printed below into the
-#: pixels the plan's §8 measures them in. The runtime computes the real figure from
-#: the projection, and this is that figure for the pane the design is checked on.
 FITTED_METRES_PER_PIXEL = 1_003.95
-#: The runtime's worst-error budget at a land tier's switch, in pixels.
-#:
-#: `src/model.rs` holds the same 1.2 as `LAND_TIER_WORST_CASE_AT_THRESHOLD_PX`; the
-#: build prints each tier's derived threshold with it so the number in the model can
-#: be checked against the measurement rather than against the nominal tolerance.
 TIER_PIXEL_BUDGET = 1.2
 
-#: Below these sizes a source is not a plausible download of that file.
 PBF_MIN_BYTES = 20 * 1024**2
 LAND_ZIP_MIN_BYTES = 500 * 1024**2
 
-#: The asset budget from the plan: 2 MiB for the whole base map. The three extra
-#: land tiers add about 0.2 MiB of points, so four tiers still fit.
 MAX_ASSET_BYTES = 2 * 1024 * 1024
 
 
@@ -198,12 +111,7 @@ class Piece:
     coords: list[tuple[float, float]]
     flags: int = 0
     length_m: int = 0
-    #: The latitude every segment's length is scaled at. A cell cut inherits it, which
-    #: makes the cut piece lengths exactly additive: a chain's fragments sum to its own
-    #: length at the same reference latitude, so a missing fragment cannot hide.
     reference_latitude: float = 0.0
-    #: The chain a road piece came from, as an index into its LOD's chain list. A cell
-    #: cut inherits it; it is not packed.
     source: int = -1
 
 
@@ -211,28 +119,15 @@ class Piece:
 class LandTier:
     """One land section: the simplification it was built at and the rings it kept."""
 
-    #: The simplification tolerance, in degrees.
     tolerance: float
-    #: The simplified geometry the rings were cut out of; tier 0's is the border mask.
     geometry: BaseGeometry
-    #: The kept polygons, before their rings were cut out.
     polygons: int
-    #: The dropped polygons, as the count under `LAND_MIN_AREA_KM2` plus the
-    #: degenerate rings `make_valid` can leave at a coarser tolerance.
     dropped: int
-    #: The largest polygon this tier's own area filter dropped, in km².
     largest_dropped_km2: float
-    #: Where that polygon sat, as longitude and latitude in degrees.
     largest_dropped_at: tuple[float, float]
-    #: The closed rings, one per exterior or interior ring of a kept polygon.
     rings: list[Piece]
-    #: The worst distance from tier 0's drawn coastline: the discrete Hausdorff
-    #: distance between the two simplified geometries, in degrees. Zero on tier 0.
     hausdorff_deg: float = 0.0
-    #: The same distance measured in metres on the local equirectangular plane, which
-    #: is what the runtime's thresholds are derived from. Zero on tier 0.
     hausdorff_m: float = 0.0
-    #: The pair of points that attains `hausdorff_m`, as longitude and latitude.
     worst_pair: tuple[tuple[float, float], tuple[float, float]] = (
         (0.0, 0.0),
         (0.0, 0.0),
@@ -243,9 +138,7 @@ class LandTier:
 class Land:
     """The four land tiers and the land the border mask tests against."""
 
-    #: Coarsest last, in the order the asset stores them.
     tiers: list[LandTier]
-    #: The drawn land of tier 0, which is what "on land" means to the borders.
     mask: BaseGeometry
 
 
@@ -253,17 +146,11 @@ class Land:
 class RoadChain:
     """One merged class-0 chain and the three resolutions the asset stores it at."""
 
-    #: The chain's true length in metres, measured on its source geometry.
     length_m: float
-    #: The latitude the chain's length and every fragment's length are measured at.
     reference_latitude: float
-    #: The source geometry's segment count, for the build's distribution table.
     source_segments: int
-    #: The geometry the fine copy stores, simplified at `ROAD_SIMPLIFY`.
     fine: list[tuple[float, float]]
-    #: The geometry the middle copy stores, simplified at `MIDDLE_ROAD_SIMPLIFY`.
     middle: list[tuple[float, float]]
-    #: The geometry the coarse copy stores, simplified at `COARSE_ROAD_SIMPLIFY`.
     coarse: list[tuple[float, float]]
 
 
@@ -290,10 +177,8 @@ class Collector(osmium.SimpleHandler):
 
     def __init__(self, member_ways: set[int]) -> None:
         super().__init__()
-        # The member ways of every national relation of the three extracts.
         self.member_ways = member_ways
         self.borders: dict[int, list[tuple[float, float]]] = {}
-        # The packed border ways that carry no boundary tag of their own.
         self.relation_only: set[int] = set()
         self.roads: dict[int, tuple[str, list[tuple[float, float]]]] = {}
         self.admin_level_2 = 0
@@ -330,10 +215,6 @@ class Collector(osmium.SimpleHandler):
             self.admin_level_2 += 1
         if is_member:
             self.members_seen += 1
-        # The two tags a national boundary relation's member way may carry that make
-        # it a border the runtime can never check: a maritime stretch and the coastline
-        # the land already draws. Both are filtered here, for member ways as well as
-        # for the ones selected by their own tags.
         if tags.get("maritime") == "yes":
             self.maritime_rejected += 1
             self.maritime_ids.add(handler.id)
@@ -540,11 +421,6 @@ def read_pbfs(paths: list[Path]) -> Collector:
         f"border, {collector.road_duplicates:,} road",
         flush=True,
     )
-    # The two border tags the runtime cannot check are asserted here: such a way must
-    # never reach the packed border set, and the extracts must contain some, or the
-    # filter is never exercised. The second count proves the filter runs over the
-    # member ways a relation contributes, not only over the ways tagged in their own
-    # right.
     rejected = collector.maritime_ids | collector.coastline_ids
     leaked = rejected.intersection(collector.borders)
     if leaked:
@@ -584,8 +460,6 @@ def load_land(zip_path: Path, clip_box) -> Land:
         shapes_seen = 0
         with archive.open(shp_name) as shp_file, archive.open(shx_name) as shx_file:
             reader = shapefile.Reader(shp=shp_file, shx=shx_file)
-            # The .dbf holds names and codes only; the geometry does not need it,
-            # and opening it would decompress another file for nothing.
             for record in reader.iterShapes(bbox=(WEST, SOUTH, EAST, NORTH)):
                 if record is None:
                     continue
@@ -658,11 +532,6 @@ def load_land(zip_path: Path, clip_box) -> Land:
             )
         )
 
-    # How far each coarser tier moved the coast: the discrete Hausdorff distance to
-    # tier 0's drawn boundary, measured in metres on the same local equirectangular
-    # plane `length_metres` uses. The degree figure is kept for reference; the metres
-    # are what the runtime's thresholds are derived from (`src/model.rs`), and the
-    # point pair is printed so the number can be checked by hand.
     tier0_local = local_metres(tiers[0].geometry.boundary)
     for tier in tiers[1:]:
         tier.hausdorff_deg = shapely.hausdorff_distance(
@@ -693,9 +562,6 @@ def load_land(zip_path: Path, clip_box) -> Land:
             flush=True,
         )
 
-    # The places a coarser tier must not erase, checked by point-in-polygon against
-    # each tier's kept polygons (a point whose own polygon fell under the area
-    # filter would be gone from the map).
     for tier in tiers:
         kept_polygons = [
             polygon
@@ -855,7 +721,6 @@ def cut_per_cell(
                             source.source,
                         )
                     )
-            # Deterministic order inside the cell, independent of STRtree order.
             found.sort(key=piece_key)
             cells.append((len(ordered), len(found)))
             ordered.extend(found)
@@ -924,8 +789,6 @@ def assert_chain_partition(
             f"error: {len(gaps):,} {label} cut endpoints are neither a source chain "
             "endpoint, a cell edge, a point on a chain, nor shared by two pieces"
         )
-    # The fixed reference latitude makes the fragment lengths additive. The metre of
-    # slack is the f32 rounding of the cut points; a missing fragment is much longer.
     for index, (source_length, cut_length) in enumerate(
         zip(source_lengths, cut_lengths, strict=True)
     ):
@@ -1042,8 +905,6 @@ def build(assets: Path, out: Path) -> None:
         f"{max(longitudes):.6f} {max(latitudes):.6f}",
         flush=True,
     )
-    # The border land mask: the drawn land grown by the margin a border point gets, prepared
-    # once for the point test every candidate way is put through.
     land_mask = land.mask.buffer(BORDER_LAND_MASK_TOLERANCE)
     shapely.prepare(land_mask)
 
@@ -1055,10 +916,6 @@ def build(assets: Path, out: Path) -> None:
         line = LineString(coords)
         if not line.intersects(clip_box):
             continue
-        # A member way of a national relation can be a sea boundary that carries no
-        # `maritime=yes` tag, which the tag filter cannot see. A way with a single point on
-        # land is a border that also crosses water — the two Saudi–Bahrain ways at the coast
-        # are exactly that — so the test is "none of its points", never a share of them.
         if not way_touches_land(land_mask, coords):
             sea_only.append(way_id)
             continue
@@ -1103,13 +960,6 @@ def build(assets: Path, out: Path) -> None:
                 continue
             class_zero.append(part)
 
-    # All three copies of class 0 are the network joined into the chains its shared
-    # endpoints allow. A per-way simplification cannot thin a two-node way, and most of
-    # the network's ways are exactly that, so joining them first is what makes the
-    # coarser copies coarse at all. Building the fine copy from the same chains is what
-    # lets the short ones be dropped as whole roads: the copies then carry the same
-    # chain identity, and a chain is either entirely drawn or entirely absent at a
-    # given scale.
     coarse_chains = merge_lines(class_zero)
     chains: list[RoadChain] = []
     for chain in coarse_chains:
@@ -1124,8 +974,6 @@ def build(assets: Path, out: Path) -> None:
         coarse = clean_coords(
             chain.simplify(COARSE_ROAD_SIMPLIFY, preserve_topology=False).coords
         )
-        # A chain shorter than the tolerance can simplify to a single point. Keep its
-        # own geometry rather than dropping it: a chain that is drawn must be complete.
         if len(fine) < 2:
             fine = source
         if len(middle) < 2:
@@ -1148,9 +996,6 @@ def build(assets: Path, out: Path) -> None:
     ):
         raise SystemExit("error: a class-0 chain has no geometry")
 
-    # The chain-length distribution is what the low-zoom feature dropping is chosen
-    # from: a chain is a whole road between junctions, so dropping a short one leaves
-    # the drawn network continuous while a short *piece* of a long chain would not.
     print("  class-0 chains by length", flush=True)
     for low, high in [(0, 1), (1, 2), (2, 5), (5, 10), (10, 20), (20, None)]:
         selected = [
@@ -1212,10 +1057,6 @@ def build(assets: Path, out: Path) -> None:
         for index, chain in enumerate(kept)
     ]
 
-    # The primary network gets the same chain treatment and the same 0.3 km feature
-    # dropping. It is drawn only at the closest zoom, where 0.3 km is 1.2 px, so there
-    # is no coarser primary scale at which a dropped chain would come back: the drop is
-    # build-time, not a runtime gate.
     primary_chains = merge_lines(primary_parts)
     primary_geometry: list[tuple[float, float, list[tuple[float, float]]]] = []
     for chain in primary_chains:
@@ -1272,10 +1113,6 @@ def build(assets: Path, out: Path) -> None:
         border_pieces, "borders", measure_lengths=False
     )
     road_pieces, road_cells = cut_per_cell(road_pieces, "roads", measure_lengths=True)
-    # Every copy's cell cut has to rejoin to its own chain geometry, not a sample of
-    # pieces. The fine copy is the only one that holds the short chains, so it proves
-    # the whole network; the middle and coarse copies prove the long chains they store,
-    # and the primary copy proves its own chains.
     assert_chain_partition(
         [
             piece
@@ -1307,8 +1144,6 @@ def build(assets: Path, out: Path) -> None:
     blob += struct.pack("<I", VERSION)
     blob += struct.pack("<4f", WEST, SOUTH, EAST, NORTH)
     blob += struct.pack("<III", GRID_COLS, GRID_ROWS, SECTION_COUNT)
-    # Every land tier stores rings rather than a cell table: the parser tessellates
-    # them and bins the triangles by centroid at run time.
     sections = [
         (kind, tier.rings, [], 3)
         for kind, tier in zip(LAND_KINDS, land.tiers, strict=True)
@@ -1357,10 +1192,6 @@ def build(assets: Path, out: Path) -> None:
         f"{len(lods['MIDDLE']):,}, coarse kept {len(lods['COARSE']):,} "
         "(the middle and coarse copies are subsets of the fine one)"
     )
-    # The coarse copy is the long chains at the fitted zoom; the short ones are
-    # feature-dropped and come back through the fine copy. The dangling endpoints are
-    # the junctions whose short connector is gone, the build's own measure of that
-    # visual cost.
     dangling, pieces_with_dangling = dangling_endpoints(lods["COARSE"])
     print(
         f"  COARSE dangling endpoints: {dangling:,} "
@@ -1376,9 +1207,6 @@ def build(assets: Path, out: Path) -> None:
     )
 
     temporary = out.with_name(out.name + ".tmp")
-    # A `.tmp` from an interrupted earlier build is never reused: the rename is
-    # what publishes the asset, so start from a clean file and drop it again if
-    # this write does not finish.
     temporary.unlink(missing_ok=True)
     try:
         temporary.write_bytes(blob)

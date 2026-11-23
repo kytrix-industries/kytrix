@@ -22,12 +22,6 @@ fn connector() -> MarketParticipantsConnector {
     .expect("MarketParticipantsConnector should build from typed runtime inputs")
 }
 
-/// A fresh root is empty: building it registers no route, and only a load can
-/// put a venue in the registry.
-///
-/// What loading a venue publishes — its market routes, its account routes and
-/// the catalog source bindings behind them — is covered by the root's own unit
-/// tests, which drive the load seam without a venue answering.
 #[tokio::test]
 async fn root_constructs_with_an_empty_registry() {
     let connector = connector();
@@ -55,10 +49,6 @@ async fn root_constructs_with_an_empty_registry() {
         "a declared venue is not a loaded one"
     );
 
-    // This root was built from typed runtime inputs rather than installed, so it owns no
-    // configuration bridge and no invalidation task: nothing publishes into its snapshot.
-    // With no venue loaded, its venue table is empty either way, and it stays empty across
-    // the reads this test made.
     assert!(
         connector.venues().scopes().is_empty(),
         "a root with no loaded venue keeps its own venue table empty"

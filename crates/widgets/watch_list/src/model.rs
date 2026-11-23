@@ -1,56 +1,3 @@
-//! What one watch list holds, and what each followed listing is doing.
-//!
-//! A watch list follows up to [`MAX_WATCH_LIST_ENTRIES`] listings at once, one
-//! stream each. Everything that arrives for a listing goes through its
-//! [`WatchListEntry`], which is the only place that decides what a stream event
-//! means: the entry keeps the last accepted ticker, the status the stream
-//! reported, and the failure that ended it.
-//!
-//! # Ready is a boundary, not "the first snapshot arrived"
-//!
-//! The reliable channel and the latest-value channel are independent, so a
-//! `Ready` status and the snapshot it refers to can arrive in either order. An
-//! entry therefore holds a snapshot that arrived *before* `Ready` as pending and
-//! commits it when `Ready` arrives, and remembers `Ready` as received and commits
-//! the next snapshot. Either way a row is only ever reported ready with a ticker
-//! that belongs to the stream generation that reported it.
-//!
-//! # A row is immutable
-//!
-//! Formatting is not free: every price, change and traded value is turned into
-//! shared text. So an entry builds its [`WatchListRow`] once per accepted change
-//! and keeps it, the row builds its [`WatchListRowDisplay`] the first time it is
-//! drawn, and a row that did not change is handed to the table again as the same
-//! `Arc` rather than rebuilt.
-//!
-//! # Values are stored, units are attached while drawing
-//!
-//! A ticker carries each value together with the unit it is measured in: a traded
-//! quantity is counted in the listing's own traded unit and a traded notional in
-//! the asset the venue reports the amount in. Neither is a property of the row, so
-//! the row keeps the values with their units and the unit labels are resolved where
-//! the row is drawn.
-//!
-//! # Precision travels with the ticker
-//!
-//! The increments a number is written at belong to the listing and not to the row,
-//! so they are resolved once with the stream that carries the listing's tickers and
-//! kept beside the ticker they describe. A row is therefore written at the precision
-//! of the stream generation that published the snapshot it shows, and a price of
-//! `90000` on a listing with a tick of `0.01` reads as `90000.00` rather than as the
-//! canonical form that drops the zeroes.
-//!
-//! # A row outlives the market behind it
-//!
-//! The listings of a market the user has not loaded are still the user's list, so
-//! their rows are still drawn: what the widget follows is a configuration, and the
-//! market behind it comes and goes. Such a row says which market participant has to
-//! be loaded instead of carrying values, and it is filled as soon as that market
-//! commits. Which of the two tables it is drawn in is therefore read off the
-//! listing's own route rather than off the directory: the scope a listing is quoted
-//! on is what decides whether its venue keeps a session, and a directory is not
-//! consulted for a fact that has to be known before one is loaded.
-
 use std::{
     cmp::Ordering,
     sync::{Arc, OnceLock},
@@ -68,14 +15,8 @@ use market_participants_model::{
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
 
-/// The most listings one watch list follows.
 pub(super) const MAX_WATCH_LIST_ENTRIES: usize = 100;
 
-/// What one followed listing is doing.
-///
-/// A stream publishes `Connecting`, `LoadingSnapshot` and `Ready`. `Error` is the
-/// state an entry settles into once its stream has failed; it is never published,
-/// because a failure carries its reason in [`WatchListStreamEvent::Error`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WatchListStatus {
     Connecting,
@@ -84,7 +25,6 @@ pub(super) enum WatchListStatus {
     Error,
 }
 
-/// Why one listing's stream stopped.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub(super) enum WatchListStreamError {
     #[error(transparent)]
@@ -96,36 +36,26 @@ pub(super) enum WatchListStreamError {
     },
 }
 
-/// One message published by one listing's stream.
 #[derive(Clone, Debug)]
 pub(super) enum WatchListStreamEvent {
     Status(WatchListStatus),
     Snapshot {
         ticker: Arc<ListingTicker>,
-        /// The increments of the listing the ticker belongs to, read from the same
-        /// resolution that opened the stream.
         precision: ListingPrecision,
     },
     Error(WatchListStreamError),
 }
 
-/// One accepted ticker, with the increments of the listing that published it.
-///
-/// The two always travel together: a price is only readable at the precision of
-/// the listing it was quoted on, so a ticker kept without one could not be drawn. It is
-/// named outside this module because a row's ticker is part of what a row says it holds.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct TickerState {
     ticker: Arc<ListingTicker>,
     precision: ListingPrecision,
 }
 
-/// Everything the widget knows about one followed listing.
 #[derive(Debug)]
 pub(super) struct WatchListEntry {
     status: WatchListStatus,
     ticker: Option<TickerState>,
-    /// A snapshot that arrived before the `Ready` status that refers to it.
     pending_snapshot: Option<TickerState>,
     ready_received: bool,
     error: Option<WatchListStreamError>,
@@ -133,8 +63,6 @@ pub(super) struct WatchListEntry {
 }
 
 impl WatchListEntry {
-    /// Creates the state a followed listing starts in: connecting, with nothing
-    /// to draw yet.
     pub(super) fn connecting(key: &VenueListingKey) -> Self {
         Self {
             status: WatchListStatus::Connecting,
@@ -146,7 +74,6 @@ impl WatchListEntry {
         }
     }
 
-    /// Applies one stream event, reporting whether the drawn row changed.
     pub(super) fn apply_event(&mut self, event: &WatchListStreamEvent) -> bool {
         match event {
             WatchListStreamEvent::Status(status) => self.apply_status(*status),
@@ -157,10 +84,6 @@ impl WatchListEntry {
         }
     }
 
-    /// Restarts this entry for the stream generation a retry opened.
-    ///
-    /// The last ticker is kept: the user asked for the stream to be reopened, not
-    /// for the prices the row is showing to be forgotten.
     pub(super) fn begin_retry(&mut self) -> bool {
         self.status = WatchListStatus::Connecting;
         self.pending_snapshot = None;
@@ -184,8 +107,6 @@ impl WatchListEntry {
 
     fn apply_status(&mut self, status: WatchListStatus) -> bool {
         match status {
-            // An entry starts connecting, and a stream that reconnects re-reports
-            // it without changing anything a row draws.
             WatchListStatus::Connecting => false,
             WatchListStatus::LoadingSnapshot => {
                 if matches!(self.status, WatchListStatus::Ready | WatchListStatus::Error) {
@@ -202,30 +123,21 @@ impl WatchListEntry {
                     return false;
                 }
                 self.ready_received = true;
-                // `Ready` may have overtaken the snapshot it refers to. The entry
-                // then waits for the next snapshot instead of reporting a ready
-                // row that still has nothing to show.
                 let Some(ticker) = self.pending_snapshot.take() else {
                     return false;
                 };
                 self.commit(ticker)
             }
-            // A failure is published as an event, which carries its reason.
             WatchListStatus::Error => false,
         }
     }
 
     fn apply_snapshot(&mut self, ticker: Arc<ListingTicker>, precision: ListingPrecision) -> bool {
-        // A failed entry keeps the ticker it has and ignores everything else: the
-        // stream that produced this snapshot is not the one the user is looking at
-        // any more, and only an explicit retry may open a new one.
         if self.status == WatchListStatus::Error {
             return false;
         }
         let state = TickerState { ticker, precision };
         if !self.ready_received {
-            // The latest-value channel only ever hands over the newest snapshot of
-            // a key, so keeping the last pending one is keeping the newest.
             self.pending_snapshot = Some(state);
             return false;
         }
@@ -269,15 +181,9 @@ impl WatchListEntry {
     }
 }
 
-/// One followed listing, as the table draws it.
-///
-/// A row is immutable. An entry replaces its row whenever the entry changes, so
-/// an unchanged row can be handed to the table again as the same `Arc`, and the
-/// text of a row is formatted at most once.
 #[derive(Debug)]
 pub(super) struct WatchListRow {
     key: Arc<VenueListingKey>,
-    /// Which of the two tables this row is drawn in.
     market: WatchListMarket,
     state: WatchListRowState,
     display: OnceLock<WatchListRowDisplay>,
@@ -294,11 +200,6 @@ impl WatchListRow {
         )
     }
 
-    /// The row of a listing whose market is not in memory.
-    ///
-    /// The listing is still followed — it is the user's own list — but nothing about
-    /// it can be read until the market participant's metadata is loaded, so the row
-    /// carries the venue that has to be loaded instead of a stream status.
     pub(super) fn awaiting_market(key: &VenueListingKey) -> Self {
         Self::of(key, WatchListRowState::AwaitingMarket)
     }
@@ -325,7 +226,6 @@ impl WatchListRow {
         &self.key
     }
 
-    /// Which table this row belongs to, read off its own route.
     pub(super) fn market(&self) -> WatchListMarket {
         self.market
     }
@@ -334,7 +234,6 @@ impl WatchListRow {
         &self.state
     }
 
-    /// The stream status of this row, which a row waiting for its market has none of.
     pub(super) fn status(&self) -> WatchListStatus {
         match &self.state {
             WatchListRowState::AwaitingMarket => WatchListStatus::Connecting,
@@ -346,7 +245,6 @@ impl WatchListRow {
         matches!(&self.state, WatchListRowState::Ticker { ticker, .. } if ticker.is_some())
     }
 
-    /// The labels of this row, built the first time the row is drawn.
     pub(super) fn display(&self) -> Option<&WatchListRowDisplay> {
         let WatchListRowState::Ticker {
             ticker: Some(state),
@@ -362,18 +260,9 @@ impl WatchListRow {
     }
 }
 
-/// What one followed listing is doing, and how the row says it.
-///
-/// The two are mutually exclusive, which is the whole point of the sum: a listing
-/// the directory cannot answer for is not a listing whose stream is connecting, and
-/// a row that carried both would say two things about one listing.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum WatchListRowState {
-    /// The market participant this listing is on is not loaded, so there is nothing
-    /// to draw but the name of the market that has to be loaded.
     AwaitingMarket,
-    /// The listing is read: its stream is at `status`, and it carries the last
-    /// accepted ticker once it has one.
     Ticker {
         status: WatchListStatus,
         ticker: Option<TickerState>,
@@ -381,26 +270,18 @@ pub(super) enum WatchListRowState {
 }
 
 impl WatchListRowState {
-    /// Whether this row is backed by a stream.
-    ///
-    /// What a row is *doing* is not the same question: a row that failed before its first
-    /// ticker is still a row with a stream, and reopening that stream is a thing the user
-    /// can do, while a row waiting for a market has no stream at all.
     pub(super) const fn is_read(&self) -> bool {
         matches!(self, Self::Ticker { .. })
     }
 }
 
-/// The values one row draws, each still carrying its own unit.
 #[derive(Debug)]
 pub(super) struct WatchListRowDisplay {
     pub price: SmolStr,
     pub quote_asset: AssetId,
     pub change: SmolStr,
     pub change_percent: SmolStr,
-    /// The traded quantity of the session, in the unit the listing publishes it in.
     pub traded_quantity: Option<MarketQuantity>,
-    /// The traded notional of the session, in the asset the venue states it in.
     pub traded_notional: Option<MarketQuantity>,
     pub direction: PriceDirection,
 }
@@ -417,9 +298,6 @@ impl WatchListRowDisplay {
             quote_asset: ticker.close.quote_asset.clone(),
             change,
             change_percent,
-            // A listing that publishes no traded quantity, or no traded notional,
-            // has nothing for that column: neither zero nor the other unit may be
-            // shown in its place.
             traded_quantity: ticker.traded_quantity.clone(),
             traded_notional: ticker.traded_notional.clone(),
             direction: PriceDirection::of(ticker),
@@ -427,7 +305,6 @@ impl WatchListRowDisplay {
     }
 }
 
-/// Which way the listing moved over the period the ticker covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PriceDirection {
     Up,
@@ -445,13 +322,6 @@ impl PriceDirection {
     }
 }
 
-/// The absolute and relative change from the listing's open to its close.
-///
-/// The change is measured away from the open price and its direction is carried
-/// separately, so a price that fell reads as the fall it was rather than as a
-/// difference that lost its sign. It is written at the listing's price tick, like
-/// the price it is measured from. The percentage is hidden when the open price is
-/// zero, because there is no denominator to measure against.
 pub(super) fn format_change(ticker: &ListingTicker, price_tick: Tick) -> (SmolStr, SmolStr) {
     let current = ticker.close.value;
     let open = ticker.open.value;
@@ -482,10 +352,6 @@ pub(super) fn format_change(ticker: &ListingTicker, price_tick: Tick) -> (SmolSt
     (change, change_percent)
 }
 
-/// Compacts a traded value into a scale a column can hold.
-///
-/// A 24-hour traded value is routinely eighteen digits wide, which no column shows
-/// usefully, so it is scaled down to millions or thousands with two decimals.
 pub(super) fn format_volume(volume: Quantity) -> SmolStr {
     const SCALE: f64 = 1_000_000_000_000_000_000.0;
     let volume = volume.inner() as f64 / SCALE;
@@ -498,24 +364,10 @@ pub(super) fn format_volume(volume: Quantity) -> SmolStr {
     }
 }
 
-/// Orders the followed listings by their canonical key.
-///
-/// The order is the displayed order, so it is settled here rather than by the
-/// table: two lists that follow the same listings read the same way, whatever
-/// order the user added them in.
 pub(super) fn sort_entries(entries: &mut [VenueListingKey]) {
     entries.sort_unstable();
 }
 
-/// Splits the followed listings into the two markets, in configured order.
-///
-/// Returns `(continuous, session)`, in that order. The rows of the listings the widget
-/// holds an entry for are handed over as they are, and every other followed listing is
-/// drawn as a row waiting for its market: a listing whose market participant is not
-/// loaded yet is still a listing the user follows, so it is drawn rather than skipped —
-/// which is what a list opened before its market is loaded consists of. A row that did
-/// not change is handed back as the same `Arc`, which is what lets a table see that
-/// nothing it draws has moved.
 pub(super) fn split_rows(
     keys: &[VenueListingKey],
     entries: &HashMap<VenueListingKey, WatchListEntry>,
@@ -535,34 +387,13 @@ pub(super) fn split_rows(
     (continuous.into(), session.into())
 }
 
-/// The two markets one watch list draws: the ones that trade around the clock, and the
-/// ones whose market keeps a calendar.
-///
-/// The two are the two shapes of statistics this build can state, not two directories: a
-/// session's numbers belong to a session that closes and an around-the-clock market's roll
-/// over a day, so the two never share a heading. Which one a listing belongs to is read off
-/// the scope it is quoted on, which is part of its own key — see [`WatchListMarket::of`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WatchListMarket {
-    /// The venues that trade around the clock.
     Continuous,
-    /// The venues whose session keeps a calendar, which today is one US-equity market.
     Session,
 }
 
 impl WatchListMarket {
-    /// Which table one listing is drawn in.
-    ///
-    /// The route a listing is quoted on decides it, and both halves of the route are read: the
-    /// scope this build carries for a session market is Longbridge's US-equity one, and a scope
-    /// is only ever one venue's — a route on another venue that happened to use the same scope
-    /// name is not that market, and drawing it under the session headings would be a table
-    /// saying session statistics over rows no session market quotes. Every other route is a
-    /// market that trades around the clock. The route is part of the listing's own key, so this
-    /// is an answer about the listing rather than about the directory — which is what makes a
-    /// row drawable before the market behind it is loaded. A route the build does not carry
-    /// would be one no user could have stored, and it is read as the continuous market rather
-    /// than as a table nothing heads.
     pub(super) fn of(listing: &VenueListingKey) -> Self {
         let route = &listing.route;
         if route.venue == VenueId::Longbridge && route.scope.as_str() == LONGBRIDGE_US_SCOPE {
@@ -572,16 +403,6 @@ impl WatchListMarket {
         }
     }
 
-    /// The four column labels of this market, in column order: change, change percent,
-    /// traded quantity, traded notional.
-    ///
-    /// The labels are keys rather than text, because the language a table is drawn in is
-    /// the frame's and not the table's. The two sets say different things about the
-    /// period they cover — one market's statistics roll over a day, the other's belong to
-    /// a session that closes — so neither set may be shown under the other's heading.
-    /// They are read whether or not the market behind the table is loaded: a row waiting
-    /// for its market is drawn under the headings of the market it belongs to, and the
-    /// merged cell below them says what is missing rather than the headings lying.
     pub(super) fn column_keys(self) -> [&'static str; 4] {
         match self {
             Self::Continuous => [
@@ -612,7 +433,6 @@ mod tests {
         test_support::listing_key(&test_support::spot_route(), symbol)
     }
 
-    /// The same, on the one scope this build quotes a session market on.
     fn stock_listing(symbol: &str) -> VenueListingKey {
         test_support::listing_key(
             &test_support::route("longbridge", LONGBRIDGE_US_SCOPE),
@@ -670,8 +490,6 @@ mod tests {
         }
     }
 
-    /// A price tick of one cent and a quantity step of one thousandth, so a label
-    /// that keeps the listing's precision is told apart from the canonical form.
     fn price_tick() -> Tick {
         "0.01".parse::<Tick>().expect("a price tick should parse")
     }
@@ -706,8 +524,6 @@ mod tests {
         );
     }
 
-    /// The change is written at the listing's own tick, so a difference that is a
-    /// whole number of coins keeps the decimals the tick states.
     #[test]
     fn format_change_should_write_the_change_at_the_listings_price_tick() {
         let (change, _) = format_change(&ticker(90_000, 90_010), price_tick());
@@ -741,9 +557,6 @@ mod tests {
         assert_eq!(format_volume(Quantity::from(1_500_u64)), "1.50K");
     }
 
-    /// A price is written at the price tick of the listing it was quoted on, so a
-    /// whole price keeps the decimals the tick states instead of being read as the
-    /// canonical form that drops them.
     #[test]
     fn a_committed_ticker_should_write_its_price_at_the_listings_tick() {
         let key = listing("BTCUSDT");
@@ -771,8 +584,6 @@ mod tests {
         assert_eq!(keys, vec![listing("BTCUSDT"), listing("ETHUSDT")]);
     }
 
-    /// Two listings of one instrument are two scopes, and the order they are
-    /// followed in is the order of their keys rather than of the instrument.
     #[test]
     fn sort_entries_should_keep_two_listings_of_one_instrument_apart() {
         let first = listing("BTCUSDT");
@@ -918,9 +729,6 @@ mod tests {
         );
     }
 
-    /// The row keeps each traded value with the unit the ticker published it in, and a
-    /// unit the listing does not publish stays missing instead of becoming the other
-    /// one.
     #[test]
     fn a_row_should_carry_the_units_its_listing_publishes() {
         let key = listing("BTCUSDT");
@@ -1011,8 +819,6 @@ mod tests {
         assert!(std::ptr::addr_eq(first, second));
     }
 
-    /// The scope a listing is quoted on decides which table it is drawn in, and the two
-    /// answers are the two kinds of scope this build carries.
     #[test]
     fn market_of_should_read_the_scope_a_listing_is_quoted_on() {
         assert_eq!(
@@ -1027,9 +833,6 @@ mod tests {
         );
     }
 
-    /// The partition reads the listing's own route rather than the directory, which is what
-    /// lets it place a listing whose market participant is not loaded — the state this
-    /// build has no calendar for at all.
     #[test]
     fn market_of_should_answer_for_a_listing_no_generation_holds() {
         let stock = stock_listing("AAPL");
@@ -1058,8 +861,6 @@ mod tests {
         );
     }
 
-    /// The two tables together hold every followed listing exactly once, in the order the
-    /// configuration states, and a row that did not change is still the same `Arc`.
     #[test]
     fn split_rows_should_keep_the_configured_order_and_share_unchanged_rows() {
         let keys = vec![listing("BTCUSDT"), listing("ETHUSDT")];

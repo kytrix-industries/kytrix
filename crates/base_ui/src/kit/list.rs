@@ -1,92 +1,3 @@
-//! 列表内核（P2-2）：等高 / 变高、静态 / 双端列表的统一实现。
-//!
-//! # 结构
-//!
-//! 外层容器（`outer`，裁剪 + `relative`）包一个**虚拟列表容器**（`viewport`：`Clip::Bounds` +
-//! `position: relative`，引擎 `make_virtual_list` 的落点）和一个自绘滚动条
-//! （[`crate::kit::scroll_bar`]）。行由引擎按可见窗口挂载 / 回收（`VirtualListConfig` /
-//! `rewindow` / `set_virtual_extents` / `scroll_to_item`，E3）。
-//!
-//! # 行内容的挂载时机（引擎约束）
-//!
-//! 引擎的行工厂是 `FnMut(usize) -> NodeBuilder`，一次只能返回**单个**节点；列表行通常是复合
-//! 子树（表格单元格、树缩进 + 折叠标 + 文本）。因此内核把一行拆成两层：
-//!
-//! 1. 引擎挂载的**行容器**（背景 / padding / 选中态绑定样式，调试 id `"{key}:row:{index}"`）；
-//! 2. 内核在 [`List::sync`] 里给还没有子节点的行容器补一个**内容容器**
-//!    （`"{key}:row:{index}:content"`），再调用应用的行内容回调把子树建进内容容器。
-//!
-//! `sync` 与重建路径（`set_items` / `set_count` / `push`）都**同步**补内容；`attach` 末尾还会
-//! 主动跑一次布局并按真实视口重挂（[`List::attach`] 的「首帧同步建行」），因此**首帧与重建
-//! 路径首帧都有行内容**。唯一残留：`scroll_to_item` / 树选中滚动在**帧内**挂载的新行，内容在
-//! 下一帧 `sync` 补（滚动时 overscan 的新行多在视口外，影响小）。定义「行工厂返回单个节点」
-//! 的引擎形态决定了内容子树只能由调用方在行容器挂载后补建。
-//!
-//! # 生命周期
-//!
-//! 组件的信号（选中 / 悬停 / 条目数，以及滚动条的状态）都归属**组件自有** `SignalScope`
-//! （[`List::release`] 释放，槽位立即回收）。动态创建 / 销毁列表（对话框、选择面板）必须在
-//! 卸载节点后调用 `release`；常驻组件可以不调（与根作用域等价）。
-//!
-//! # 行高
-//!
-//! - [`RowHeight::Fixed`]：所有行同高，引擎按 `index * extent` 布局；
-//! - [`RowHeight::Variable`]：先用 `estimate` 挂载，`sync` 逐行量内容容器的实测高度并
-//!   `set_virtual_extents` 回写（引擎重算前缀和并按锚点补偿偏移，E3 语义）。未挂载的行保持
-//!   估计值，滚动到那里后再量。重建（`set_items` / `set_count` / `push`）与 `attach` 在同步
-//!   建完行内容后先 settle 一次布局（[`settle_layout`]）：真实泵序里 `sync` 早于帧布局，不
-//!   settle 的话首轮实测会读到未布局的 0 高并写进全零 extents（G2，行会被引擎永久回收）。
-//!   含**文本**的行例外：文本 measure 要等帧内 text pass 的 shape，帧前的 settle 只能量到
-//!   padding（4 px 左右）；`sync` 对这些行延后一帧实测（`pending_text_measure`，F2），否则
-//!   padding-only 高度写进 extents 会把 `set_count` 保留的滚动偏移 clamp 到 0。显式行高的行
-//!   不依赖文本 shape，settle 后首轮即可测 —— G2 的回归测试钉住这点。
-//!
-//! 应用层的 `RowHeights` 只服务双端列表锚点换算与测量回写，滚动帧不重建它（前缀和只在行高
-//! 变更时重建）。
-//!
-//! # 行间分隔线（P2-9）
-//!
-//! [`ListOptions::separator`] 在行容器里挂一条绝对定位的 1 px `LineDivider`（每行顶部、首行
-//! 不画）。它是行容器的**第二个**子节点（内容容器仍是首子，`row_content_node` / 变高实测按首
-//! 子读的契约不变），因此不挤占行内容布局、也不改变行高与 `set_virtual_extents` 的实测值。
-//! 引擎的虚拟行本身就是绝对定位（[`ui_core::interaction::virtual_list`] 的契约），行容器因此
-//! 天然是分隔线的包含块，不需要额外的 `position` 声明。
-//! overscan 仍按**行数**（[`ListOptions::overscan`]）：像素级 overscan 估计（旧 news 的
-//! 150 px vs 变高估计 76 px）没有等价入口，登记见 ledger —— 需要时用「估计行高 × 行数」自行
-//! 折算，内核不做像素预算。
-//!
-//! # a11y（E9 集合语义下的纯列表）
-//!
-//! 纯列表**不声明**表格 / 树角色：虚拟列表容器由引擎按种类推导成 `List`（`size_of_set` 由
-//! 容器上的 `bind_a11y` 声明），每行自动推导成 `ListBoxOption`（`pos_in_set` / `selected` /
-//! `disabled` 由行基线声明）。E9 的逻辑父领养**只认显式声明的集合角色**（`Row` / `Cell` /
-//! `TreeItem`），所以裸列表的 a11y 父子仍是物理父子（行的父 = 虚拟窗口），不会被 `Table` /
-//! `Tree` 的领养规则误领养（回归测试 `a_plain_list_is_not_adopted_by_collection_semantics`）。
-//! 组合控件（表格 / 树 / 菜单）通过 [`List::set_row_a11y`] 在行基线上叠加集合角色；应用的普通
-//! 列表也用同一个公开入口给行容器补可访问名或覆盖角色（W8a F3：行的 a11y 身份属于**行容器**，
-//! widget 不得在行内容根上另行声明 `A11yRole::Row` —— 行容器本来就是 `ListBoxOption`）。补丁
-//! 闭包拿到的是 [`ReadCtx`](ui_core::node::dependency::ReadCtx)，因此行文案可以读语言 / 选中
-//! 信号，写信号即让这些行重新求值，**不需要重建行**（E15 D4 的推荐形态）。
-//!
-//! # 像素滚动（P2-11）
-//!
-//! [`List::scroll_by`] 是给「内容整体平移、读者看的那一行要留在原像素位置」的调用方的入口
-//! （W5b-G1：盘口 live ask 每级 22 px 的补偿）：偏移越界由引擎夹到可用范围，滚走之后
-//! `keep_on_newest` 的下一次 `push` 不再跟随尾部（读者位置由偏移重新判定），滚回尾部后恢复。
-//!
-//! # 双端列表（deque）
-//!
-//! [`ListOptions::capacity`] + [`List::push`]：容量满时丢最旧一条。数据在应用侧（行内容回调按
-//! 展示下标取值），内核只维护「条目数 + 行高 + 滚动锚点」：
-//!
-//! - 非倒序（最新在末尾）：满时丢首项，读者读的那条下标 −1；
-//! - 倒序（最新在开头）：新项插到头部，读者读的那条下标 +1；
-//! - `keep_on_newest` 只对「已经在最新一条上」的读者生效：非倒序跟随尾部，倒序回到顶部。
-//!
-//! 引擎没有「同条目数下强制重建已挂载行」的入口，双端 push 走
-//! `set_virtual_items(0)` → `set_virtual_items(n)` 强制重建可见窗口（行内容按新下标重新生成）；
-//! 代价是每次 push 重挂可见行，与旧实现 `splice` 保测量不同，登记为已知差异。
-
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
@@ -120,20 +31,13 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-/// 行高策略。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RowHeight {
-    /// 所有行同高（逻辑像素，`> 0`）。
     Fixed(f32),
-    /// 逐行实测：挂载时用 `estimate` 估高，`sync` 量到真实高度后回写。
-    Variable {
-        /// 初始 / 未挂载行的估计高度（逻辑像素，`> 0`）。
-        estimate: f32,
-    },
+    Variable { estimate: f32 },
 }
 
 impl RowHeight {
-    /// 挂载期使用的行高（固定值或估计值）。
     #[must_use]
     pub fn extent(self) -> f32 {
         match self {
@@ -141,59 +45,36 @@ impl RowHeight {
         }
     }
 
-    /// 是否需要实测回写。
     #[must_use]
     pub fn is_variable(self) -> bool {
         matches!(self, Self::Variable { .. })
     }
 }
 
-/// 选中策略。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SelectionMode {
-    /// 不选中（行仍可点击，用于纯展示列表）。
     #[default]
     None,
-    /// 单选。
     Single,
-    /// 多选：Ctrl 切换、Shift 区间、普通点击单选。
     Multi,
 }
 
-/// 列表参数。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListOptions {
-    /// 行高策略。
     pub row_height: RowHeight,
-    /// 视口外上下各多挂几行（**行数**口径，不是像素）。
-    ///
-    /// 像素余量 ≈ `overscan × 行高`：固定行高列表就是精确值；变高列表用
-    /// [`RowHeight::Variable`] 的 `estimate` 折算，实测行高与估计不同则像素余量随之偏移 ——
-    /// W2/W4 登记的「旧 150 px vs 新 76 px」正是这层口径差（旧实现按像素预算，内核按行数；
-    /// 需要等价余量时调用方自己用「估计行高 × 行数」折算，[`ListOptions::overscan`] 只收行数）。
     pub overscan: usize,
-    /// 选中策略。
     pub selection: SelectionMode,
-    /// 双端列表容量（`None` = 静态列表，条目数由 [`List::set_items`] / [`List::set_count`] 给）。
     pub capacity: Option<usize>,
-    /// 倒序：最新条目画在第一个位置（双端列表）。
     pub reverse: bool,
-    /// 读者在最新一条上时，push 后跟着它走（双端列表）。
     pub keep_on_newest: bool,
-    /// 行左 / 右内边距（构建期用 [`ListOptions::padding_x`] 改）。
     pub padding_x: f32,
-    /// 行上 / 下内边距（变高列表的实测会把两侧加回去；构建期用 [`ListOptions::padding_y`] 改）。
     pub padding_y: f32,
-    /// 行内容是否拉满行高（表格单元格用 `true`；普通列表 `false` = 内容垂直居中）。
     pub row_stretch: bool,
-    /// 是否画自绘滚动条。
     pub scrollbar: bool,
-    /// 行间是否画内置分隔线（行顶部 1 px，首行不画；不参与行高 / 变高实测）。
     pub separator: bool,
 }
 
 impl ListOptions {
-    /// 固定行高的静态列表参数。
     #[must_use]
     pub fn fixed(extent: f32) -> Self {
         Self {
@@ -211,7 +92,6 @@ impl ListOptions {
         }
     }
 
-    /// 变高静态列表参数。
     #[must_use]
     pub fn variable(estimate: f32) -> Self {
         Self {
@@ -220,32 +100,24 @@ impl ListOptions {
         }
     }
 
-    /// 变成双端列表（容量 = 保留的最新条目数）。
     #[must_use]
     pub fn deque(mut self, capacity: usize) -> Self {
         self.capacity = Some(capacity.max(1));
         self
     }
 
-    /// 倒序（最新条目在第一个位置）。
     #[must_use]
     pub fn reverse(mut self) -> Self {
         self.reverse = true;
         self
     }
 
-    /// 读者在最新一条上时跟随新条目。
     #[must_use]
     pub fn keep_on_newest(mut self) -> Self {
         self.keep_on_newest = true;
         self
     }
 
-    /// 行内边距（左右 `x` / 上下 `y`，负值夹到 `0`）。
-    ///
-    /// 行容器用 `padding_sides(y, x, y, x)`；变高列表的实测行高 = 内容高 + `2 × y`，因此
-    /// 改上下内边距会直接反映到 extent 回写。`x` / `y` 只影响行内容的可用宽度 / 垂直居中，
-    /// 不改变固定行高列表的 extent。
     #[must_use]
     pub fn padding(mut self, x: f32, y: f32) -> Self {
         self.padding_x = x.max(0.0);
@@ -253,47 +125,36 @@ impl ListOptions {
         self
     }
 
-    /// 行左右内边距（负值夹到 `0`）。
     #[must_use]
     pub fn padding_x(mut self, padding: f32) -> Self {
         self.padding_x = padding.max(0.0);
         self
     }
 
-    /// 行上下内边距（负值夹到 `0`；变高列表的实测把两侧加回去）。
     #[must_use]
     pub fn padding_y(mut self, padding: f32) -> Self {
         self.padding_y = padding.max(0.0);
         self
     }
 
-    /// 视口外多挂的行数（上下各 `rows` 行；**行数**口径，像素余量 = 行数 × 行高）。
     #[must_use]
     pub fn overscan(mut self, rows: usize) -> Self {
         self.overscan = rows;
         self
     }
 
-    /// 选中策略。
     #[must_use]
     pub fn selection(mut self, mode: SelectionMode) -> Self {
         self.selection = mode;
         self
     }
 
-    /// 行内容拉满行高（表格用；行内容不再垂直居中）。
     #[must_use]
     pub fn row_stretch(mut self) -> Self {
         self.row_stretch = true;
         self
     }
 
-    /// 行间内置分隔线（1 px `LineDivider`，画在每行顶部、首行不画；绝对定位，不参与行高与
-    /// 变高实测）。
-    ///
-    /// P2-9 能力面：旧 news 的 `DequeUnsizedList::separator` 只能在行内容里自建
-    /// `kit::separator`（行内元素会挤占内容行的布局）；内置分隔线把这条线放在行容器里、脱离
-    /// 内容布局。
     #[must_use]
     pub fn separator(mut self) -> Self {
         self.separator = true;
@@ -301,9 +162,6 @@ impl ListOptions {
     }
 }
 
-/// 选中集（纯逻辑；单选用 `len() <= 1`）。
-///
-/// `anchor` 是 Shift 区间选择的起点，也是最近一次单击的落点。
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Selection {
     indices: BTreeSet<usize>,
@@ -321,48 +179,40 @@ impl std::fmt::Debug for Selection {
 }
 
 impl Selection {
-    /// 空选中。
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 是否没有选中项。
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }
 
-    /// 选中项个数。
     #[must_use]
     pub fn len(&self) -> usize {
         self.indices.len()
     }
 
-    /// 是否选中 `index`。
     #[must_use]
     pub fn contains(&self, index: usize) -> bool {
         self.indices.contains(&index)
     }
 
-    /// 最小下标选中项（单选语义的直接消费面）。
     #[must_use]
     pub fn first(&self) -> Option<usize> {
         self.indices.first().copied()
     }
 
-    /// 选中项迭代（升序）。
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.indices.iter().copied()
     }
 
-    /// 清空。
     pub fn clear(&mut self) {
         self.indices.clear();
         self.anchor = None;
     }
 
-    /// 丢弃 `>= count` 的下标（条目数变小时调用）；返回是否变化。
     pub fn retain_below(&mut self, count: usize) -> bool {
         let before = self.indices.len();
         self.indices.retain(|index| *index < count);
@@ -372,14 +222,12 @@ impl Selection {
         self.indices.len() != before
     }
 
-    /// 单选 `index`。
     pub fn select(&mut self, index: usize) {
         self.indices.clear();
         self.indices.insert(index);
         self.anchor = Some(index);
     }
 
-    /// Ctrl 点击：切换一项（锚点跟随到最后点击的那一项）。
     pub fn toggle(&mut self, index: usize) {
         if !self.indices.remove(&index) {
             self.indices.insert(index);
@@ -387,7 +235,6 @@ impl Selection {
         self.anchor = Some(index);
     }
 
-    /// Shift 点击：从锚点选到 `index`（含两端）。
     pub fn select_range(&mut self, index: usize) {
         let Some(anchor) = self.anchor else {
             self.select(index);
@@ -403,7 +250,6 @@ impl Selection {
     }
 }
 
-/// 一次点击对选中集的作用（纯函数：`Ctrl` 切换、`Shift` 区间、普通单选）。
 pub(crate) fn apply_click(
     selection: &mut Selection,
     index: usize,
@@ -426,13 +272,6 @@ pub(crate) fn apply_click(
     }
 }
 
-/// 应用层的逐项高度表 + 前缀和缓存。
-///
-/// 引擎 `VirtualSlot` 里已有一份同语义的前缀和（布局真相）；这里再存一份是给应用层的
-/// **双端列表锚点换算**与测量回写用（需要在 `&mut App` 之外做纯计算、且可单测）。
-/// 只有测量 / 双端 push 会改它，滚动帧不碰（I3 的预算前提）。
-///
-/// 实现细节（`pub(crate)`）：没有下游消费者，公开面只保留组件本身。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RowHeights {
     heights: Vec<f32>,
@@ -440,7 +279,6 @@ pub(crate) struct RowHeights {
 }
 
 impl RowHeights {
-    /// 以 `count` 项、每项 `height` 构建（前缀和立即建立）。
     #[must_use]
     pub fn filled(count: usize, height: f32) -> Self {
         let height = height.max(0.0);
@@ -462,33 +300,28 @@ impl RowHeights {
         }
     }
 
-    /// 当前条目数。
     #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.heights.len()
     }
 
-    /// 是否为空。
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.heights.is_empty()
     }
 
-    /// 逐项高度。
     #[must_use]
     pub fn as_slice(&self) -> &[f32] {
         &self.heights
     }
 
-    /// 第 `index` 项的高度。
     #[cfg(test)]
     #[must_use]
     pub(crate) fn get(&self, index: usize) -> Option<f32> {
         self.heights.get(index).copied()
     }
 
-    /// 第 `index` 项的顶边（前缀和）。
     #[must_use]
     pub fn top(&self, index: usize) -> f32 {
         self.prefix
@@ -497,13 +330,11 @@ impl RowHeights {
             .unwrap_or_else(|| self.total())
     }
 
-    /// 内容总高度。
     #[must_use]
     pub fn total(&self) -> f32 {
         self.prefix.last().copied().unwrap_or(0.0)
     }
 
-    /// 偏移处的 `(首个可见条目下标, 行内偏移)`（零内容 ⇒ `(0, offset)`）。
     #[must_use]
     pub fn index_at(&self, offset: f32) -> (usize, f32) {
         if self.heights.is_empty() || self.total() <= 0.0 {
@@ -517,7 +348,6 @@ impl RowHeights {
         (index, (offset - tops[index]).max(0.0))
     }
 
-    /// 改一项的高度；返回是否真的变了（`false` ⇒ 不重建前缀和）。
     pub fn set(&mut self, index: usize, height: f32) -> bool {
         let height = height.max(0.0);
         let Some(slot) = self.heights.get_mut(index) else {
@@ -531,19 +361,16 @@ impl RowHeights {
         true
     }
 
-    /// 头部插入一项（倒序双端列表 push）：所有下标 +1。
     pub fn insert_front(&mut self, height: f32) {
         self.heights.insert(0, height.max(0.0));
         self.rebuild_prefix();
     }
 
-    /// 尾部追加一项。
     pub fn push_back(&mut self, height: f32) {
         self.heights.push(height.max(0.0));
         self.rebuild_prefix();
     }
 
-    /// 丢掉头部一项（非倒序双端列表满容量时）。
     pub fn pop_front(&mut self) -> Option<f32> {
         if self.heights.is_empty() {
             return None;
@@ -553,7 +380,6 @@ impl RowHeights {
         Some(removed)
     }
 
-    /// 丢掉尾部一项（倒序双端列表满容量时）。
     pub fn pop_back(&mut self) -> Option<f32> {
         let removed = self.heights.pop();
         if removed.is_some() {
@@ -562,7 +388,6 @@ impl RowHeights {
         removed
     }
 
-    /// 调整为 `count` 项：多退（尾部）/ 少补（`fallback`）。
     pub fn resize(&mut self, count: usize, fallback: f32) {
         if self.heights.len() == count {
             return;
@@ -572,21 +397,13 @@ impl RowHeights {
     }
 }
 
-/// 双端 push 之前的读者位置。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PushAnchor {
-    /// 读者读的条目在旧下标里的位置。
     pub index: usize,
-    /// 该条目内的偏移。
     pub inner: f32,
-    /// 读者是否已经在最新一条上（`keep_on_newest` 的判定输入）。
     pub at_newest: bool,
 }
 
-/// 双端 push 之后的锚点换算（纯函数）。
-///
-/// 返回 `None` = 没有可保持的位置（列表此前为空），调用方按 0 处理；否则是
-/// `(新下标, 行内偏移)`。`full` 表示 push 前容量已满（会丢最旧一条）。
 #[must_use]
 pub(crate) fn push_anchor_after(
     anchor: PushAnchor,
@@ -607,13 +424,8 @@ pub(crate) fn push_anchor_after(
     Some((new_index.min(new_count - 1), anchor.inner))
 }
 
-/// 行内容回调：把一行（或单元格）的子树建进 `parent`（应用侧建树，内核不解释内容）。
 pub type RowContent = dyn Fn(&mut NodeTree, NodeId, usize) -> Result<(), EngineError>;
 
-/// 把 `over` 里 `Some` 的 a11y 字段覆盖到 `base`（`None` 保留基线）。
-///
-/// `A11yPatch` 是值语义的「本帧补丁」：两条来源（列表行基线 + 组合控件的行补丁）必须合并成
-/// 一份，`bind_a11y` 一个节点只能有一条通道。
 fn merge_a11y(base: &mut A11yPatch, over: A11yPatch) {
     macro_rules! cover {
         ($($field:ident),+ $(,)?) => {
@@ -661,7 +473,6 @@ fn merge_a11y(base: &mut A11yPatch, over: A11yPatch) {
     );
 }
 
-/// 列表的内核句柄（`Rc` 浅拷贝：`bind_style` / Action handler 里各持一份）。
 #[derive(Clone)]
 pub struct List {
     inner: Rc<ListInner>,
@@ -672,21 +483,13 @@ struct ListInner {
     theme: ThemeHandle,
     options: ListOptions,
     content: Rc<RowContent>,
-    /// 本组件自有的信号作用域（动态创建 / 销毁的列表释放它回收槽位）。
     scope: SignalScope,
     selection: Signal<Selection>,
     hovered: Signal<Option<usize>>,
     count: Signal<usize>,
-    /// 不可交互行（树用它表达 `TreeItem::disabled`）：命中 / 选中 / 激活都跳过。
     disabled: RefCell<BTreeSet<usize>>,
-    /// 行级 a11y 补丁（表 / 树在列表基线上叠加角色 / 标签 / 展开态）。
-    ///
-    /// 公开入口是 [`List::set_row_a11y`]；这里存的是它的闭包（`ReadCtx` 让补丁可以读信号）。
     row_a11y: RefCell<Option<Rc<dyn Fn(&mut ReadCtx<'_>, usize) -> A11yPatch>>>,
     heights: RefCell<RowHeights>,
-    /// 重建 / 首帧建行发生在哪一帧（F2）：该帧的布局跑在 text pass **之前**，行内容里的文本
-    /// 尚未 shape（量到 0），含文本的行的实测因此不可信 —— `sync` 只在 `frame_index` 前进
-    /// 后（文本已 shape、帧内布局已跑）才测量这些行。`None` = 没有待测的文本行。
     pending_text_measure: Cell<Option<FrameIndex>>,
     geometry: RefCell<Geometry>,
     select_action: Action,
@@ -704,8 +507,6 @@ struct Geometry {
 }
 
 impl List {
-    /// 建内核：状态信号 + 自绘滚动条。之后用 [`List::build`] + [`List::attach`]（或
-    /// [`List::mount`]）接进引擎。
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
@@ -744,61 +545,29 @@ impl List {
         }
     }
 
-    /// 列表键（调试 id / Action key 的前缀）。
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.key
     }
 
-    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的列表必须调用一次）。
-    ///
-    /// 清理面：点击 Action handler（[`App::off_action`]）+ 滚动条的 handler / 信号作用域 + 本
-    /// 列表的信号作用域。只释放信号不摘 handler 会让 `App` 永久持有 `Rc<List>` 闭包（P2-2
-    /// 复核 R2.2 的泄漏）。**先卸载节点再释放**：`bind_style` / `bind_a11y` 闭包捕获了这些
-    /// 句柄，释放后一次求值就会读死句柄 panic。重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
         app.off_action(&self.inner.select_action);
         self.inner.scrollbar.release(app) + app.release_scope(self.inner.scope)
     }
 
-    /// 登记不可交互行（组合控件用：树的 `TreeItem::disabled`）。
-    ///
-    /// 内核在点击 / 程序化选中 / 键盘激活入口过滤这些行；行内容本身仍会渲染（弱化色由调用方
-    /// 的 `bind_style` 决定）。
     pub(crate) fn set_disabled_rows(&self, rows: impl IntoIterator<Item = usize>) {
         *self.inner.disabled.borrow_mut() = rows.into_iter().collect();
     }
 
-    /// 该行是否不可交互。
     #[must_use]
     pub(crate) fn is_disabled(&self, index: usize) -> bool {
         self.inner.disabled.borrow().contains(&index)
     }
 
-    /// 行级 a11y 补丁：在列表行基线上叠加可访问名 / 角色 / 展开态等语义（P2-11 公开缝）。
-    ///
-    /// 行容器的 a11y 身份由内核声明：虚拟窗口是 `List`、每行是 `ListBoxOption`；`selected` /
-    /// `pos_in_set` / `size_of_set` / `disabled` 来自行基线。本方法的补丁里 `Some` 的字段**覆盖**
-    /// 这些基线（`None` 保留基线），用于：
-    ///
-    /// - 组合控件叠加集合角色（表格的行 `Row`、树的 `TreeItem`、菜单的 `MenuItem`）；
-    /// - 应用的普通列表把行文案挂到**行容器**上（W8a F3：不要再给行内容根声明 `Row`，那只属于
-    ///   真实表格 / 网格；裸列表的行容器本身就是可读的选项语义）。
-    ///
-    /// 闭包的 `&mut ReadCtx` 是 `bind_a11y` 的同一个读上下文：读信号会登记成该行的依赖边，写
-    /// 信号后行补丁重新求值（语言 / 选中集变化不需要重建行）。应该在建树之前调用一次（`build`
-    /// 之前），行挂载时按当时的闭包求值；之后再换闭包不重发已挂载行的补丁（引擎没有对应的失效
-    /// 通道，`App::set_a11y_patch` 是逐节点的显式动态通道）。
     pub fn set_row_a11y(&self, row_a11y: impl Fn(&mut ReadCtx<'_>, usize) -> A11yPatch + 'static) {
         *self.inner.row_a11y.borrow_mut() = Some(Rc::new(row_a11y));
     }
 
-    /// 只建节点（外层 + 虚拟列表容器 + 滚动条），不接引擎。
-    ///
-    /// 调用方随后必须调 [`List::attach`]（或用 [`List::mount`] 一步完成）。
-    ///
-    /// # Errors
-    /// `StaleNode`（`parent` 陈旧）。
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let key = &self.inner.key;
         let outer_style = StyleBuilder::new()
@@ -824,8 +593,6 @@ impl List {
             .id(format_smolstr!("{key}:viewport"))
             .style(viewport_style)
             .on_click(self.inner.select_action.clone())
-            // a11y：虚拟列表容器的角色由引擎按种类推导成 `List`；这里补集合大小，
-            // 屏幕阅读器才能播报「第 N 项，共 M 项」（§7.4）。
             .bind_a11y(move |cx| A11yPatch {
                 size_of_set: Some(*cx.read(&count)),
                 ..A11yPatch::default()
@@ -840,21 +607,6 @@ impl List {
         Ok(outer)
     }
 
-    /// 接进引擎：`make_virtual_list` + 行工厂 + 点击 Action + 滚动条。
-    ///
-    /// 必须先 [`List::build`]；未 build 时是 no-op（`Ok(())`）。成功返回时首帧的可见行内容
-    /// 已经建好（见 [`List::populate_first_frame`]）。
-    ///
-    /// # Errors
-    ///
-    /// - [`EngineError::UnknownWindow`] / [`EngineError::StaleNode`]：窗口已关闭，或 `build`
-    ///   时的节点已不在该窗口（`make_virtual_list` / `set_virtual_items` / `fill_row_contents`
-    ///   的引擎校验）；
-    /// - [`EngineError::NotVirtualList`] / [`EngineError::InvalidVirtualExtent`]：`viewport`
-    ///   不是可虚拟化容器 / 行高预置非法；
-    /// - [`EngineError::InvalidMeasure`]：首帧同步建行时跑一次
-    ///   `Window::compute_layout`，measure 闭包返回非有限 / 负尺寸时从这里冒泡；
-    /// - 行工厂（`content`）建树失败时原样传播（通常是 `StaleNode`）。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let (Some(viewport), Some(outer)) = (
             self.inner.geometry.borrow().viewport,
@@ -890,15 +642,10 @@ impl List {
         app.on_action(self.inner.select_action.clone(), move |ctx| {
             select.on_click(ctx);
         });
-        // 首帧同步建行（P2-2 复核遗留）：让首帧就有行内容，而不是空行容器。
         self.populate_first_frame(app, window)?;
         Ok(())
     }
 
-    /// 一步完成 `build` + `attach`，返回外层容器节点。
-    ///
-    /// # Errors
-    /// 同 [`List::build`] / [`List::attach`]。
     pub fn mount(
         &self,
         app: &mut App,
@@ -915,76 +662,64 @@ impl List {
         Ok(outer)
     }
 
-    /// 外层容器节点（`build` 之后可用）。
     #[must_use]
     pub fn outer_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().outer
     }
 
-    /// 虚拟列表容器节点（`build` 之后可用）。
     #[must_use]
     pub fn viewport_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().viewport
     }
 
-    /// 当前条目数。
     #[must_use]
     pub fn count(&self, app: &App) -> usize {
         app.read_with(&self.inner.count, |count| *count)
     }
 
-    /// 条目数信号（组合控件用：表格空态、树的行数派生）。
     #[must_use]
     pub fn count_signal(&self) -> Signal<usize> {
         self.inner.count
     }
 
-    /// 初始条目数（`build` 之前由应用设定；`attach` 用它建首窗）。
     pub fn set_initial_count(&self, app: &mut App, count: usize) {
         self.inner.ensure_heights(count);
         app.write(&self.inner.count, count);
     }
 
-    /// 选中集快照。
     #[must_use]
     pub fn selection(&self, app: &App) -> Selection {
         app.read_with(&self.inner.selection, Selection::clone)
     }
 
-    /// 选中集信号（组合控件用）。
     #[must_use]
     pub fn selection_signal(&self) -> Signal<Selection> {
         self.inner.selection
     }
 
-    /// 悬停行信号（`sync` 镜像引擎 hover；组合控件可读）。
     #[must_use]
     pub fn hovered_signal(&self) -> Signal<Option<usize>> {
         self.inner.hovered
     }
 
-    /// 行高表快照（变高列表的测量结果；固定行高时为空表）。测试专用：没有下游消费者。
     #[cfg(test)]
     #[must_use]
     pub(crate) fn row_heights(&self) -> RowHeights {
         self.inner.heights.borrow().clone()
     }
 
-    /// 引擎虚拟列表状态（可见窗口 / 偏移 / 视口）。
     #[must_use]
     pub fn state(&self, app: &App) -> Option<VirtualListState> {
         let list = self.inner.geometry.borrow().list?;
         app.virtual_list_state(&list)
     }
 
-    /// 当前滚动偏移（逻辑像素，垂直）。
     #[must_use]
     pub fn offset(&self, app: &App) -> Option<f32> {
         let handle = self.inner.geometry.borrow().handle?;
         app.scroll_state(&handle).map(|state| state.offset.y)
     }
 
-    /// 已挂载的 `(下标, 行容器节点)`（按升序；测试与组合控件用）。
     #[must_use]
     pub fn mounted_rows(&self, app: &App) -> Vec<(usize, NodeId)> {
         let geometry = self.inner.geometry.borrow();
@@ -1011,9 +746,6 @@ impl List {
         rows
     }
 
-    /// 选中 `index`（单选语义；`None` = 清空）。
-    ///
-    /// 不可交互行（[`List::set_disabled_rows`]）不接受程序化选中：返回 `false` 且不改选中集。
     pub fn select(&self, app: &mut App, index: Option<usize>) -> bool {
         if index.is_some_and(|index| self.is_disabled(index)) {
             return false;
@@ -1025,20 +757,14 @@ impl List {
         app.write(&self.inner.selection, selection)
     }
 
-    /// 清空选中。
     pub fn clear_selection(&self, app: &mut App) -> bool {
         app.write(&self.inner.selection, Selection::new())
     }
 
-    /// 行激活回调（双击行 / 键盘 Enter 时调用；表格的行激活、树的折叠切换用）。
     pub fn on_activate(&self, callback: impl Fn(&mut App, usize) + 'static) {
         *self.inner.activate.borrow_mut() = Some(Rc::new(callback));
     }
 
-    /// 设置条目数（静态列表的「换一批数据」）：重建可见窗口，**滚回顶部**并清空选中。
-    ///
-    /// # Errors
-    /// 引擎侧错误（虚拟列表失效等）。
     pub fn set_items(&self, app: &mut App, count: usize) -> Result<(), EngineError> {
         self.inner.ensure_heights(count);
         self.rebuild(app, count, Some(0.0))?;
@@ -1046,10 +772,6 @@ impl List {
         Ok(())
     }
 
-    /// 设置条目数但**保留滚动位置与选中**（活数据刷新：表格行数变化、树展开/折叠）。
-    ///
-    /// # Errors
-    /// 引擎侧错误。
     pub fn set_count(&self, app: &mut App, count: usize) -> Result<(), EngineError> {
         self.inner.ensure_heights(count);
         let offset = self.offset(app).unwrap_or(0.0);
@@ -1060,13 +782,6 @@ impl List {
         Ok(())
     }
 
-    /// 双端列表 push 一条：条目数 +1（容量满则丢最旧一条），并按锚点保持读者位置。
-    ///
-    /// 应用的 deque 数据必须**先**按同样的 `capacity` / `reverse` 语义更新（追加或头插），
-    /// 内核只维护条目数 / 行高 / 滚动位置。
-    ///
-    /// # Errors
-    /// 引擎侧错误。
     pub fn push(&self, app: &mut App) -> Result<(), EngineError> {
         let capacity = self.inner.options.capacity.unwrap_or(usize::MAX).max(1);
         let old_count = self.count(app);
@@ -1125,10 +840,6 @@ impl List {
         self.rebuild(app, new_count, Some(target))
     }
 
-    /// 把第 `index` 行按 `align` 对齐到视口（E3 `scroll_to_item`）。
-    ///
-    /// # Errors
-    /// `NotVirtualList` / `VirtualListExtents`。
     pub fn scroll_to_item(
         &self,
         app: &mut App,
@@ -1141,24 +852,6 @@ impl List {
         app.scroll_to_item(&list, index, align)
     }
 
-    /// 相对滚动（垂直，逻辑像素；正数向下、负数向上）。
-    ///
-    /// W5b-G1 的入口：旧盘口面板在 live ask 增删一级（`ROW_HEIGHT` = 22 px）时按行高平移偏移，
-    /// 让读者正在读的那一行留在原像素位置，而不是整体跳一行。引擎在写入前把目标偏移夹到
-    /// `[0, 内容高 − 视口高]`，越界量被吃掉（不会滚出空白 / 负偏移）；内容比视口短或列表还没
-    /// `attach` 时是 no-op。`delta` 非有限时 [`EngineError::NotScrollable`]（引擎拒绝 NaN / inf
-    /// 偏移，否则偏移会每帧自请求重绘）。
-    ///
-    /// 固定行高与变高列表走同一条路径（内容高由引擎的 extents 提供，变高列表在
-    /// [`List::sync`] 实测回写之后就是真实前缀和）。锚点语义：偏移是唯一真值 —— 滚动离开
-    /// 尾部后 [`List::push`] 的 `keep_on_newest` 判定（`at_newest`）不再成立，push 保持读者
-    /// 读的那一条；滚回尾部（偏移到最大）后恢复跟随。
-    ///
-    /// 行内容时机与 [`List::scroll_to_item`] 相同：帧内新挂载的行由下一帧 [`List::sync`] 补
-    /// 内容（见模块文档〈行内容的挂载时机〉）。
-    ///
-    /// # Errors
-    /// `StaleNode`（节点已卸载）/ `NotScrollable`（不是滚动容器 / 非有限偏移）。
     pub fn scroll_by(&self, app: &mut App, delta: f32) -> Result<(), EngineError> {
         let Some(handle) = self.inner.geometry.borrow().handle else {
             return Ok(());
@@ -1166,38 +859,21 @@ impl List {
         app.scroll_by(&handle, Point::new(0.0, delta))
     }
 
-    /// 帧驱动同步：补行内容 → 镜像悬停 → 实测行高回写 → 滚动条几何。
-    ///
-    /// 返回 `true` = 本次真的改了东西（写信号 / 挂内容 / 行高变化）。无变化时不写状态、
-    /// 不请求帧（I3）。组合根应在 `App::on_frame` 钩子里调用（测试里手动调用）。
-    ///
-    /// # Errors
-    /// 行内容建树或引擎状态错误。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let Some(window) = self.inner.geometry.borrow().window else {
             return Ok(false);
         };
         let mut changed = false;
         let rows = self.mounted_rows(app);
-        // ① 补行内容（引擎只挂了行容器）。
         let populated_now = self.fill_row_contents(app, window)?;
         if !populated_now.is_empty() {
             changed = true;
         }
-        // ② 悬停行镜像（引擎的 hover 是全局 Event，ReadCtx 读不到；P2-4 的机制前移到本批的
-        //    最小镜像：sync 时比对一次，变了才写信号）。
         let hovered = self.row_index_at_node(app, app.hovered(window));
         if app.write(&self.inner.hovered, hovered) {
             changed = true;
         }
-        // ③ 变高列表：实测内容容器高度并回写（引擎按锚点补偿偏移）。
         if self.inner.options.row_height.is_variable() {
-            // G2/F2：rebuild / attach 的首帧建行发生在帧钩子里，settle 跑在该帧 text pass
-            // **之前** ⇒ 行内容里的文本尚未 shape，布局量到 0（只剩 padding）。这类行的实测
-            // 不可信：写进 extents 会把内容高度压成 padding-only，引擎重算前缀和时把
-            // `set_count` 保留的偏移 clamp 到 0（文本行高列表的既有缺陷）。等 `frame_index`
-            // 前进（帧内 text pass + layout 已完成）后再量。显式行高的行（菜单 / 表格形态）
-            // 不依赖文本 shape，settle 后立即可测 —— G2 的两条真实泵序回归依赖这一点。
             let pending = self.inner.pending_text_measure.get();
             let defer_text = pending.is_some_and(|pending| {
                 app.window(window)
@@ -1246,19 +922,12 @@ impl List {
                 changed = true;
             }
         }
-        // ④ 滚动条（几何 / 淡出 / 悬停色）。
         if self.inner.scrollbar.sync(app)? {
             changed = true;
         }
         Ok(changed)
     }
 
-    /// 给「已挂载但还没有子节点」的行补内容容器 + 应用行内容；返回本次补了内容的下标。
-    ///
-    /// 同步建树（不是帧驱动）：`sync`、`rebuild`（`set_items` / `set_count` / `push`）与
-    /// `attach` 的首帧建行（[`List::populate_first_frame`]）都调它，因此首帧与重建路径首帧
-    /// 就有行内容。只有**引擎在帧内挂载**的新行（`scroll_to_item` 跳跃）要等下一帧的 `sync` 才
-    /// 补 —— 见模块文档〈行内容的挂载时机〉。
     fn fill_row_contents(
         &self,
         app: &mut App,
@@ -1291,8 +960,6 @@ impl List {
                 .style(content_style)
                 .build(tree, row)?;
             content(tree, parent, index)?;
-            // 内置分隔线：行顶部 1 px（首行不画）。绝对定位 ⇒ 不参与行内容布局与变高实测；
-            // 内容容器保持行容器的**第一个**子节点（`row_content_node` / 变高实测按首子读）。
             if self.inner.options.separator && index > 0 {
                 let theme = self.inner.theme.clone();
                 NodeBuilder::boxed()
@@ -1322,7 +989,6 @@ impl List {
             }
             populated.push(index);
         }
-        // P3-11：只标本次真的补了内容的行（旧实现把整个可见窗口都标脏）。
         for &(index, row) in &rows {
             if populated.contains(&index) {
                 app.request_node_repaint(window, row)?;
@@ -1331,7 +997,6 @@ impl List {
         Ok(populated)
     }
 
-    /// 行容器节点（已挂载时）。
     #[must_use]
     pub fn row_node(&self, app: &App, index: usize) -> Option<NodeId> {
         self.mounted_rows(app)
@@ -1339,7 +1004,6 @@ impl List {
             .find_map(|(mounted, node)| (mounted == index).then_some(node))
     }
 
-    /// 行内容容器节点（行已填充内容时）。
     #[must_use]
     pub fn row_content_node(&self, app: &App, index: usize) -> Option<NodeId> {
         let row = self.row_node(app, index)?;
@@ -1348,7 +1012,6 @@ impl List {
         tree.get(row).ok()?.children().first().copied()
     }
 
-    /// 送达点击 Action 的落点行下标（命中链 → 已挂载行）。
     fn row_index_at_node(&self, app: &App, start: Option<NodeId>) -> Option<usize> {
         let geometry = self.inner.geometry.borrow();
         let (Some(window), Some(viewport), Some(list)) =
@@ -1372,8 +1035,6 @@ impl List {
     }
 
     fn on_click(&self, ctx: &mut ActionCtx<'_>) {
-        // 键盘 Enter / Space 是对焦点节点的「激活」：引擎把它按 Click 派发到这同一个动作上
-        // （`ActionSource::Click` 且没有指针命中）。此时作用在选中行上，不改选中集。
         let hit_node = ctx.hit().map(|hit| hit.node);
         if hit_node.is_none() {
             let selected = self.selection(ctx.app_mut()).first();
@@ -1390,7 +1051,6 @@ impl List {
         let Some(index) = self.row_index_at_node(ctx.app_mut(), hit_node) else {
             return;
         };
-        // 不可交互行：点击既不选中也不激活（旧实现 `Button::disabled` 语义）。
         if self.is_disabled(index) {
             return;
         }
@@ -1460,9 +1120,6 @@ impl List {
                         ..StylePatch::default()
                     }
                 })
-                // a11y 行基线（§7.4：虚拟列表行 = `ListBoxOption`，位置走 `pos_in_set` /
-                // `size_of_set`）：选中 / 禁用 / 集合位置由内核声明；组合控件（表格 / 树）的
-                // `set_row_a11y` 补丁在此基础上叠加角色 / 标签 / 展开态。
                 .bind_a11y(move |cx| {
                     let mut patch = A11yPatch {
                         selected: Some(cx.read(&selection).contains(index)),
@@ -1480,7 +1137,6 @@ impl List {
         }
     }
 
-    /// 重建可见窗口（`set_items` / `set_count` / `push` 的共同路径）。
     fn rebuild(
         &self,
         app: &mut App,
@@ -1501,7 +1157,6 @@ impl List {
             None
         };
         app.batch(|app| {
-            // 强制重建：条目内容按新下标重排后，引擎必须丢掉旧行（否则已挂载行还是旧内容）。
             app.set_virtual_items(&list, 0, self.row_builder())?;
             app.set_virtual_items(&list, count, self.row_builder())?;
             if let Some(heights) = heights.as_deref()
@@ -1515,19 +1170,10 @@ impl List {
             Ok(())
         })?;
         app.write(&self.inner.count, count);
-        // 同步补行内容（P2-2b）：`set_virtual_items` 已把行容器挂上，这里立刻建内容子树，
-        // 重建路径的首帧就不是空行。`scroll_to_item` 在帧内挂载的新行仍走下一帧 `sync`。
         if let Some(window) = window {
             let populated = self.fill_row_contents(app, window)?;
-            // G2（P2-6c）：真实泵序是「钩子（派发 + `sync`）→ 帧（text → layout）」，重建
-            // 发生在钩子里，下一轮 `sync` 的变高实测早于任何布局 —— 刚建的内容子树还是
-            // `0` 高，实测会写进全零 extents，引擎按契约把可见窗口回收成 `0..0`（行永久
-            // 消失）。建完立即 settle，首轮实测就能读到真实行高。
             if !populated.is_empty() && self.inner.options.row_height.is_variable() {
                 settle_layout(app, window)?;
-                // F2：本帧的布局在 text pass 之前，文本行只量到 padding；这些行等到下一帧
-                // （`frame_index` 前进）再实测，避免把 padding-only 高度写进 extents 后
-                // clamp 掉 `set_count` 保留的滚动偏移。
                 self.inner
                     .pending_text_measure
                     .set(app.window(window).map(|target| target.frame_index()));
@@ -1536,38 +1182,6 @@ impl List {
         Ok(())
     }
 
-    /// 首帧同步建行（P2-2 复核遗留）：让**首帧**就有行内容，而不是空行容器。
-    ///
-    /// # 前置条件依赖（重要）
-    ///
-    /// 本方法在帧外调用 [`Window::compute_layout`]，而该 API 的文档要求「文本节点必须先在本帧
-    /// 调用 `App::refresh_text`（shape）后再测量，否则文本测量为 0×0」。这里的正确性**不是**
-    /// 靠满足那个前置条件，而是靠两个已成立的性质，改动其中任一个都可能把未 shape 的文本冻结
-    /// 成 0 高度：
-    ///
-    /// 1. `set_text_shaped`（`node::tree::content`）无条件清掉 `node..root` 的 taffy 缓存 ——
-    ///    首帧 `refresh_text` 把真实文本 shape 完之后，缓存已失效，布局会重新测量；
-    /// 2. 本次 `set_virtual_items` 新挂的行容器 / 内容子树带 `LAYOUT` 脏位 —— 首帧一定重跑
-    ///    布局，不会沿用这次冷路径布局的 0 高度结果。
-    ///
-    /// 若未来把本路径改成引擎级 `App::settle_layout(window)`（E8.md §9.3 的候选），这些依赖由
-    /// 引擎入口承担，这里的注释随之更新。
-    ///
-    /// 引擎在视口未知（首次布局前）时按「挂首行 + overscan」处理可见窗口
-    /// （`interaction::virtual_list` 的「视口未知」分支），其余可见行要等首帧
-    /// `rewindow_virtuals`（布局之后）才挂 —— 而列表只能在 `sync` 里补内容，于是首帧画出来
-    /// 是空行。`attach` 是冷路径，这里主动 measure-then-place：
-    ///
-    /// 1. `Window::compute_layout` 跑一次布局拿到真实视口尺寸（幂等；尚未 shape 的文本测量为 0，
-    ///    但只影响文本自身，不影响外层 / 行容器几何）；
-    /// 2. 再 `set_virtual_items` 让引擎按真实视口重挂可见窗口（**同步**挂载行容器）；
-    /// 3. `fill_row_contents` 同步建内容子树；
-    /// 4. 变高列表再 settle 一次：同一轮真实泵序的 `sync` 早于帧布局，不 settle 的话首轮实测
-    ///    读到未布局的 `0` 高，会把全零 extents 写进引擎（与 [`List::rebuild`] 同一个 G2 根因）。
-    ///
-    /// 新挂的内容子树是 `LAYOUT` 脏节点：首帧的 `refresh_text` + 布局会正常处理它们（内容文本
-    /// 在强制布局时还不存在，因此不会被 0 测量冻结）。程序化 `scroll_to_item` 在**帧内**挂载的
-    /// 新行仍要等下一帧 `sync`（引擎行工厂形态的残余，见模块文档〈行内容的挂载时机〉）。
     fn populate_first_frame(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         {
             let Some(target) = app.window_mut(window) else {
@@ -1583,7 +1197,6 @@ impl List {
         let populated = self.fill_row_contents(app, window)?;
         if !populated.is_empty() && self.inner.options.row_height.is_variable() {
             settle_layout(app, window)?;
-            // F2：同 `rebuild` —— 文本行在帧内 text pass 之前量不到真实高度，延后一帧实测。
             self.inner
                 .pending_text_measure
                 .set(app.window(window).map(|target| target.frame_index()));
@@ -1592,19 +1205,6 @@ impl List {
     }
 }
 
-/// 布局沉降：让同步建好的行内容子树拿到真实布局盒。
-///
-/// 真实泵序是「钩子（事件派发 + 各组件 `sync`）→ 帧（text → layout）」；重建 / `attach` 在钩子
-/// 里同步建内容，下一轮 `sync` 的变高实测**早于**任何布局。不 settle 的话实测读到内容节点的
-/// `layout().bounds.height == 0`，`set_virtual_extents` 写进全零 extents，引擎按「零高条目折叠」
-/// 契约把可见窗口算成 `0..0` 并回收全部行 —— 之后没有行可测，列表永久空白（G2；根因链见
-/// spec-delta `kit-gallery.md` §10.2）。
-///
-/// 与 [`List::populate_first_frame`] 的首次 `compute_layout`（measure-then-place 拿真实视口）同一
-/// 入口：幂等，taffy 缓存让重复调用只算脏子树。
-///
-/// # Errors
-/// `EngineError::InvalidMeasure`：某个 measure 闭包返回非有限 / 负尺寸。
 fn settle_layout(app: &mut App, window: WindowId) -> Result<(), EngineError> {
     if let Some(target) = app.window_mut(window) {
         target.compute_layout()?;
@@ -1612,11 +1212,6 @@ fn settle_layout(app: &mut App, window: WindowId) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// 内容子树里是否含文本节点（F2 的实测延后判据）。
-///
-/// 文本的 measure 闭包由帧内 text pass 的 `set_text_shaped` 安装；在那之前布局把它量成
-/// `0×0`（`Window::compute_layout` 的文档前置条件）。因此**只对含文本的行**延后实测：
-/// 显式行高的行（菜单 / 表格）在 settle 后已有真实布局盒，不需要等帧（G2 依赖这一点）。
 fn subtree_contains_text(tree: &NodeTree, node: NodeId) -> bool {
     let Ok(target) = tree.get(node) else {
         return false;
@@ -1694,14 +1289,12 @@ impl ListInner {
     }
 }
 
-/// 一行容器的调试 id（测试用：生产侧只解析、不拼装）。
 #[cfg(test)]
 #[must_use]
 pub(crate) fn row_debug_id(key: &str, index: usize) -> SmolStr {
     format_smolstr!("{key}:row:{index}")
 }
 
-/// 从行容器的调试 id 解析下标（内容容器 / 其他 id 返回 `None`）。
 #[must_use]
 pub(crate) fn parse_row_index(key: &str, id: &str) -> Option<usize> {
     id.strip_prefix(key)?.strip_prefix(":row:")?.parse().ok()
@@ -1872,7 +1465,6 @@ mod ui_tests {
         mounted_harness(app, list, rows)
     }
 
-    /// 把已建好的（可能已 `set_row_a11y` 的）列表挂进固定尺寸父节点并收敛。
     fn mounted_harness(mut app: TestApp, list: List, rows: usize) -> Harness {
         list.set_initial_count(app.app_mut(), rows);
         let window = app.window_id();
@@ -1928,7 +1520,6 @@ mod ui_tests {
         ));
     }
 
-    /// 点击并返回抬起事件的 outcome（`action = Some(..)` ⇔ 点击真的调用了 handler）。
     fn click_outcome(
         app: &mut TestApp,
         point: ui_core::math::Point,
@@ -1957,7 +1548,6 @@ mod ui_tests {
         }
     }
 
-    /// 子树里第一个文本节点（首帧测量断言用）。
     fn first_text_node(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
         let target = tree.get(node).ok()?;
         for child in target.children() {
@@ -1989,10 +1579,6 @@ mod ui_tests {
         out
     }
 
-    /// P2-2 复核遗留：初始 `mount` 的**首帧**就有行内容。
-    ///
-    /// `attach` 末尾按真实视口同步建行（先 `compute_layout` 拿到视口尺寸，再按视口重挂可见
-    /// 窗口并补内容），因此 `mount` 返回时/首帧 `drain` 后都不存在空行容器。
     #[test]
     fn mounting_populates_row_contents_before_the_first_frame() {
         let mut app = TestApp::new();
@@ -2021,8 +1607,6 @@ mod ui_tests {
         };
         list.mount(app.app_mut(), window, parent).expect("mount");
 
-        // mount 返回时（任何帧 / sync 之前）可见窗口已按**真实视口**挂满：视口 120 / 行高 30
-        // + overscan 2 ⇒ 6 行；如果 `attach` 不主动布局，引擎只能按「视口未知」挂首行+overscan。
         let mounted = list.mounted_rows(app.app());
         assert_eq!(mounted.len(), 6, "首帧前必须按真实视口挂满可见窗口");
         for (index, _) in &mounted {
@@ -2047,7 +1631,6 @@ mod ui_tests {
             );
         }
 
-        // 一次渲染即 Idle：首帧之后没有新脏位 / 帧请求，不得持续出帧。
         for frame_number in 0..5 {
             let record = app.drain().expect("frame");
             assert!(
@@ -2057,7 +1640,6 @@ mod ui_tests {
             );
         }
 
-        // 首帧行文本必须已 shape + 布局（不是 0×0 的空文本节点）。
         let row0 = list.row_node(app.app(), 0).expect("row 0");
         let text = first_text_node(app.app().window(window).expect("window").tree(), row0)
             .expect("第 0 行必须有文本节点");
@@ -2068,11 +1650,6 @@ mod ui_tests {
         );
     }
 
-    /// 组件 release 必须摘掉点击 Action handler。
-    ///
-    /// 「重放点击不 panic」不足以证明清理生效：`List` 的指针路径对死句柄只做 `ctx.update`
-    /// （no-op，不 panic）。这里直接观察 handler 表项，并用 `InputOutcome::action`（= handler
-    /// 真的被调用）验证重放点击不再命中。
     #[test]
     fn releasing_the_list_removes_its_click_handler() {
         let mut harness = harness(5);
@@ -2101,14 +1678,12 @@ mod ui_tests {
             "release 必须摘掉点击 handler（否则 App 永久持有 Rc<List>）"
         );
 
-        // 不卸载节点直接释放（正常契约是先卸载再 release）：重放点击不得再调用已摘除的 handler。
         let row1 = harness.list.row_node(harness.app.app(), 1).expect("row 1");
         let point1 = center(&harness.app, row1);
         let click1 = click_outcome(&mut harness.app, point1);
         assert_eq!(click1.action, None, "释放后重放点击不得再命中列表 handler");
     }
 
-    /// 重建路径（`set_items` / `set_count` / `push`）同步补行内容：调用返回时行内容已经挂好。
     #[test]
     fn rebuilding_items_populates_row_contents_in_the_same_call() {
         let mut harness = harness(10);
@@ -2117,7 +1692,6 @@ mod ui_tests {
             .set_items(harness.app.app_mut(), 5)
             .expect("set items");
         assert_eq!(harness.list.count(harness.app.app()), 5);
-        // 不 drain、不 sync：重建路径在 `set_virtual_items` 之后同步建内容容器 + 行内容。
         assert_eq!(
             row_texts(harness.app.app(), harness.app.window_id(), &harness.list, 0),
             vec![SmolStr::new_static("row0")],
@@ -2132,7 +1706,6 @@ mod ui_tests {
         assert_eq!(harness.list.count(harness.app.app()), 5);
     }
 
-    /// 禁用行：点击不选中、程序化选中被拒绝（旧实现 `Button::disabled` 语义）。
     #[test]
     fn disabled_rows_reject_clicks_and_programmatic_selection() {
         let mut harness = harness(5);
@@ -2160,7 +1733,6 @@ mod ui_tests {
         assert!(harness.list.select(harness.app.app_mut(), Some(2)));
     }
 
-    /// 行信号暴露 a11y 语义（§7.4）：容器 `List`、行 `ListBoxOption`、选中 / 位置 / 集合大小。
     #[test]
     fn rows_declare_list_semantics_to_a11y() {
         let mut harness = harness(4);
@@ -2188,9 +1760,6 @@ mod ui_tests {
         assert_eq!(row.selected, Some(true), "选中态进 a11y");
     }
 
-    /// P2-11（W8a F3）：应用可以给**行容器**补可访问名 / 覆盖角色（公开缝
-    /// [`List::set_row_a11y`]）；补丁在行基线上合并，未覆盖字段（`pos_in_set` / `size_of_set`）
-    /// 保留。补丁读信号 ⇒ 文案变化只让行重新求值 a11y，不重建行。
     #[test]
     fn an_application_row_a11y_patch_overrides_the_row_baseline() {
         let mut app = TestApp::new();
@@ -2221,7 +1790,6 @@ mod ui_tests {
             assert_eq!(row.size_of_set, Some(4));
         }
 
-        // 写信号 = 语言 / 文案切换：同一行节点重新求值补丁（`bind_a11y` 的依赖边）。
         assert!(
             harness
                 .app
@@ -2238,8 +1806,6 @@ mod ui_tests {
         assert_eq!(a11y_of(snapshot, row0).label_text(), Some("列表行 #0"));
     }
 
-    /// E9 回归：纯列表保持 `List` / `ListBoxOption`，**不被**表格 / 树的集合领养规则误领养
-    /// （行父仍是虚拟窗口；快照里不出现任何集合角色）。
     #[test]
     fn a_plain_list_is_not_adopted_by_collection_semantics() {
         use ui_core::{a11y::A11yRole, interaction::ItemAlign};
@@ -2284,7 +1850,6 @@ mod ui_tests {
                 );
             }
         }
-        // 滚动换页：新行仍挂窗口下（不会被别的集合领养），逐笔 TreeUpdate 过影子树契约。
         let mut updates = A11yUpdates::new();
         updates.apply(&harness.app);
         harness
@@ -2315,7 +1880,6 @@ mod ui_tests {
         );
     }
 
-    /// 组件自有信号作用域：`release` 回收槽位（动态列表不泄漏），重复调用幂等。
     #[test]
     fn releasing_the_list_scope_reclaims_its_signal_slots() {
         let mut app = TestApp::new();
@@ -2388,7 +1952,6 @@ mod ui_tests {
             vec![SmolStr::new_static("row10")]
         );
 
-        // 滚轮：引擎的平滑滚动动画推进后偏移真的变了。
         let viewport = harness.list.viewport_node().expect("viewport");
         let point = center(&harness.app, viewport);
         let _ = harness.app.inject(InputEvent::scroll_lines(
@@ -2404,10 +1967,9 @@ mod ui_tests {
         assert!(offset > 300.0, "滚轮下滚后偏移增大：{offset}");
     }
 
-    /// P2-11（W5b-G1）：像素级相对滚动 —— 偏移按 delta 走、前缀行回收；上下越界由引擎夹紧。
     #[test]
     fn scrolling_by_pixels_moves_the_window_and_clamps_at_both_ends() {
-        let mut harness = harness(20); // 内容 600、视口 120 ⇒ 可用范围 0..=480
+        let mut harness = harness(20);
         harness
             .list
             .scroll_by(harness.app.app_mut(), 100.0)
@@ -2449,7 +2011,6 @@ mod ui_tests {
         );
     }
 
-    /// `scroll_by` 在变高列表上用实测前缀和（`set_virtual_extents` 回写后的内容高）算可用范围。
     #[test]
     fn scrolling_by_pixels_uses_the_measured_heights() {
         let mut harness = harness_with(
@@ -2469,8 +2030,6 @@ mod ui_tests {
                 Ok(())
             },
         );
-        // 实测行高：可见窗口内 0..N 逐行回写，未挂载行仍持有估计值 30（不是 6 × 44 + 6 × 24）。
-        // 断言口径用**当前 extents 快照**的总高：scroll_by 的夹紧来自它，而不是 `行数 × 估计`。
         assert_eq!(harness.list.row_heights().get(0), Some(44.0));
         let heights = harness.list.row_heights();
         let total: f32 = (0..12).map(|index| heights.get(index).unwrap_or(0.0)).sum();
@@ -2494,7 +2053,6 @@ mod ui_tests {
         );
     }
 
-    /// 非有限 delta 是强类型错误（引擎拒绝 NaN / inf 偏移，否则每帧自请求重绘）。
     #[test]
     fn scrolling_by_a_non_finite_delta_is_rejected() {
         let mut harness = harness(4);
@@ -2647,7 +2205,6 @@ mod ui_tests {
             .expect("scroll");
         let _ = harness.app.drain().expect("frame");
         assert_eq!(harness.list.offset(harness.app.app()), Some(60.0));
-        // 应用侧 deque 先更新（容量满 ⇒ 丢最旧），再通知内核。
         {
             let mut data = data.borrow_mut();
             if data.len() == 8 {
@@ -2753,8 +2310,6 @@ mod ui_tests {
         let _ = RowHeight::Fixed(1.0);
     }
 
-    /// 真实泵序下的变高列表：`mount` / `set_items` / `set_count` / `push` 返回后**不先 drain**
-    /// （= 帧布局尚未发生）。
     fn variable_list_without_frames_with(
         options: ListOptions,
         rows: usize,
@@ -2782,10 +2337,6 @@ mod ui_tests {
         (app, list)
     }
 
-    /// 显式行高的变高行（菜单行 / 表格单元格的真实形态）：偶数行 60、奇数行 30。
-    ///
-    /// 列表默认 `padding_y = 2.0` ⇒ 实测行高 64 / 34。测量与文本 shape 无关（G2 的修法在
-    /// settle 后即可测），因此和 `estimate = 26` 明显不同 —— 首轮读到 64/34 才证明 settle 生效。
     fn explicit_height_row(
         tree: &mut NodeTree,
         parent: NodeId,
@@ -2804,7 +2355,6 @@ mod ui_tests {
         Ok(())
     }
 
-    /// 显式行高的真实泵序 fixture（`mount` 返回后不先 drain）。
     fn variable_list_without_frames() -> (TestApp, List) {
         const ROWS: usize = 8;
         const VARIABLE_EXTENT: f32 = 26.0;
@@ -2829,8 +2379,6 @@ mod ui_tests {
         )
     }
 
-    /// 实测回写断言：`sync` 开始时已挂载的行 = 内容显式高 + `padding_y × 2`（列表默认 2.0）；
-    /// 内容高度（前缀和）必须 > 0、可见行不得被引擎回收。
     fn assert_first_measurement_is_real(app: &TestApp, list: &List, measured: &[usize]) {
         const ROWS: usize = 8;
         fn real_height(index: usize) -> f32 {
@@ -2857,8 +2405,6 @@ mod ui_tests {
         );
     }
 
-    /// G2 回归（真实泵序）：`mount` 后不先 drain 直接 `sync` —— `attach` 的首帧建行必须已 settle，
-    /// 首轮实测读到真实行高（否则全零 extents 会把可见行永久回收）。
     #[test]
     fn the_first_sync_after_mount_measures_real_row_heights_without_a_frame_first() {
         let (mut app, list) = variable_list_without_frames();
@@ -2872,10 +2418,6 @@ mod ui_tests {
         assert_first_measurement_is_real(&app, &list, &measured);
     }
 
-    /// G2 回归（真实泵序）：重建路径（`set_items`）建完行内容后不先 drain 直接 `sync`。
-    ///
-    /// 真实窗口里重建发生在帧钩子内（`ItemPanel::open` → `list.set_items`），下一轮 `sync`
-    /// 早于帧布局 —— 这正是 P2-6a §10.2 定位的「菜单面板行全零、永久空白」路径。
     #[test]
     fn the_first_sync_after_a_rebuild_measures_real_row_heights_without_a_frame_first() {
         let (mut app, list) = variable_list_without_frames();
@@ -2890,12 +2432,6 @@ mod ui_tests {
         assert_first_measurement_is_real(&app, &list, &measured);
     }
 
-    /// F1 回归（真实泵序）：`set_count`（活数据刷新，承诺**保留滚动位置**）走的是 `rebuild`
-    /// 共同路径，但既有 G2 回归只覆盖 `mount` 与 `set_items`。
-    ///
-    /// 把 settle 收窄成「仅 `set_items`」（`target_offset == Some(0.0)`）时本用例必须红：
-    /// `set_count` 不 settle ⇒ 新建行内容尚未布局 ⇒ 首轮实测读到 padding-only（4.0），
-    /// 偏移被 clamp。显式行高（菜单 / 表格形态）不依赖文本 shape，首轮就该读到 64 / 34。
     #[test]
     fn the_first_sync_after_set_count_measures_real_heights_and_keeps_the_offset() {
         let (mut app, list) =
@@ -2942,12 +2478,6 @@ mod ui_tests {
         );
     }
 
-    /// F1 回归（真实泵序）：`push`（双端列表，容量满时丢最旧一条 + 锚点保持）同样走
-    /// `rebuild` 共同路径。
-    ///
-    /// 行内容高度取自 deque 数据（数据随 push 位移，行高表也随位移对齐）；settle 收窄成
-    /// 「仅 `set_items`」时本用例必须红：新建行未布局 ⇒ 首轮实测 padding-only ⇒ 锚点偏移被
-    /// clamp 到 0。断言读者贴顶的条目（旧下标 2 → 新下标 1）仍在顶部。
     #[test]
     fn the_first_sync_after_push_measures_real_heights_and_keeps_the_reader_anchor() {
         let data: Rc<RefCell<VecDeque<f32>>> =
@@ -3022,13 +2552,6 @@ mod ui_tests {
         );
     }
 
-    /// F2 回归（真实泵序，文本行高）：`set_count` 的「保留滚动位置」契约在**文本行高**列表上
-    /// 必须成立。
-    ///
-    /// 文本的 measure 要等帧内 text pass 的 shape；重建发生在帧钩子里，帧前的 settle 只能量到
-    /// padding（≈4.0）。若把 padding-only 高度写进 extents，内容高度塌到视口以下，`set_count`
-    /// 保留的偏移被 clamp 到 0（合并后审查实测 80 → 0 的既有缺陷）。修法：含文本的行延后一帧
-    /// 实测（`pending_text_measure`），帧后由 shape 完成的布局补齐真实高度且不移动读者。
     #[test]
     fn set_count_on_a_text_row_height_list_keeps_the_scroll_offset() {
         let (mut app, list) = variable_list_without_frames_with(
@@ -3040,7 +2563,6 @@ mod ui_tests {
                 Ok::<(), EngineError>(())
             },
         );
-        // 先让文本 shape、变高实测稳定（真实窗口里滚动之前也已经过若干帧）。
         for _ in 0..3 {
             let _ = app.drain().expect("frame");
             let _ = list.sync(app.app_mut()).expect("sync");
@@ -3071,7 +2593,6 @@ mod ui_tests {
             "set_count 必须保留文本行高列表的滚动偏移（修好前实测 80 → 0）"
         );
 
-        // 下一帧 shape + layout 之后延后的实测补齐：所有挂载行都是真实高度，读者不动。
         let _ = app.drain().expect("frame");
         list.sync(app.app_mut()).expect("帧后 sync");
         assert_eq!(
@@ -3096,13 +2617,6 @@ mod ui_tests {
         }
     }
 
-    /// **P2-10**（W3b）：行内边距 builder（迁移批此前只能直接改 `ListOptions` 字段）。
-    ///
-    /// 断言两件事：① builder 写字段（负值夹到 0，`padding_*` 单独可调用）；② 几何真的生效
-    /// —— 内容容器内缩 `(padding_x, padding_y)`、可用宽 = 行宽 − 2×`padding_x`，变高列表的
-    /// 实测 extent = 内容高 + 2×`padding_y`。
-    ///
-    /// 变异防线：`padding` / `padding_x` / `padding_y` 任一改成 no-op ⇒ 几何 / 实测断言红。
     #[test]
     fn the_padding_builders_shape_the_row_boxes_and_measurements() {
         let options = ListOptions::fixed(ROW_EXTENT).padding(3.0, 5.0);
@@ -3125,9 +2639,6 @@ mod ui_tests {
             "overscan builder 是行数口径"
         );
 
-        // 行盒几何：内容容器内缩 `(padding_x, padding_y)`、可用宽 = 行宽 − 2×padding_x。
-        // 用 `row_stretch` 固定「内容盒 = 行内边距盒」（默认 `items_center` 还会再加垂直居中
-        // 偏移，padding 的贡献就不能单独断言）。
         let harness = harness_with(
             ListOptions::fixed(ROW_EXTENT)
                 .padding(3.0, 5.0)
@@ -3155,7 +2666,6 @@ mod ui_tests {
             "内容可用宽 = 行宽 − 2×padding_x（行 {row_bounds:?} / 内容 {content_bounds:?}）"
         );
 
-        // 变高列表：实测 extent = 内容高 + 2 × padding_y（这里是 5.0 × 2）。
         let mut variable = harness_with(
             ListOptions::variable(10.0).padding(3.0, 5.0),
             3,
@@ -3265,7 +2775,6 @@ mod deque_tests {
         let list = fixed_deque(&mut app, false, data.clone());
         mount_list(&mut app, &list, 8, window);
 
-        // 读在尾部：push 后跟随新条目（内容总高不变 ⇒ 偏移停在最大偏移）。
         list.scroll_to_item(app.app_mut(), 7, ItemAlign::End)
             .expect("scroll end");
         let _ = app.drain().expect("frame");
@@ -3283,7 +2792,6 @@ mod deque_tests {
             "读者在最新一条上 ⇒ 跟随尾部"
         );
 
-        // 读在中间（滚走了）：push 后仍停在原来读的那一条上（下标 −1、偏移回退一行）。
         list.scroll_to_item(app.app_mut(), 2, ItemAlign::Start)
             .expect("scroll mid");
         let _ = app.drain().expect("frame");
@@ -3303,8 +2811,6 @@ mod deque_tests {
         assert_eq!(list.count(app.app()), 8);
     }
 
-    /// P2-11：像素滚动改变读者位置 —— 滚离尾部后 `keep_on_newest` 的下一次 push 不再跟随，
-    /// 滚回尾部（偏移到最大）后恢复跟随。
     #[test]
     fn scrolling_by_pixels_leaves_and_rejoins_the_newest_reader() {
         let mut app = TestApp::new();
@@ -3312,7 +2818,6 @@ mod deque_tests {
         let data: Rc<RefCell<VecDeque<usize>>> = Rc::new(RefCell::new((0..8).collect()));
         let list = fixed_deque(&mut app, false, data.clone());
         mount_list(&mut app, &list, 8, window);
-        // 内容 240、视口 120 ⇒ 最大偏移 120（读者在最新一条上）。
         list.scroll_to_item(app.app_mut(), 7, ItemAlign::End)
             .expect("scroll end");
         let _ = app.drain().expect("frame");
@@ -3429,7 +2934,6 @@ mod deque_tests {
         assert!((list.offset(app.app()).expect("offset") - expected).abs() < 0.5);
         list.push(app.app_mut()).expect("push");
         settle(&mut app, &list);
-        // 丢首项后原第 2 条移到下标 1，其顶边 = 旧高度表第 1 项。
         let expected = heights.get(1).expect("height 1");
         let offset = list.offset(app.app()).expect("offset");
         let _ = expected;
@@ -3441,7 +2945,6 @@ mod deque_tests {
         assert!(offset > 0.0);
     }
 
-    /// 纯文本行列表（内置分隔线用例的装置：不依赖 `ui_tests` 的私有 helper）。
     fn separator_list(options: ListOptions, rows: usize) -> (TestApp, List) {
         let mut app = TestApp::new();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
@@ -3461,10 +2964,6 @@ mod deque_tests {
         (app, list)
     }
 
-    /// **P2-9 内置分隔线**：首行不画、其后每行顶部一条 1 px `LineDivider`；分隔线是行容器的
-    /// 第二个子节点（内容容器仍是首子），绝对定位、不改变行高。
-    ///
-    /// 变异防线：`if index > 0` 写成无条件（首行也画）/ 删掉分隔线构建 ⇒ 本用例红。
     #[test]
     fn the_builtin_separator_draws_one_divider_per_row_except_the_first() {
         let (app, list) = separator_list(ListOptions::fixed(ROW_EXTENT).separator(), 4);
@@ -3514,7 +3013,6 @@ mod deque_tests {
                 taffy::style::LengthPercentageAuto::length(0.0),
                 "分隔线贴行顶部"
             );
-            // 引擎的虚拟行是绝对定位（`interaction::virtual_list` 契约）：行容器就是包含块。
             assert_eq!(
                 tree.get(row).expect("row").style().inner.position,
                 taffy::style::Position::Absolute,
@@ -3543,7 +3041,6 @@ mod deque_tests {
             );
         }
 
-        // 未开选项：行里没有分隔线（现有布局不变）。
         let (plain, plain_list) = separator_list(ListOptions::fixed(ROW_EXTENT), 4);
         let window = plain.window_id();
         for (_, row) in plain_list.mounted_rows(plain.app()) {

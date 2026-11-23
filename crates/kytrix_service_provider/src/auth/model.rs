@@ -8,10 +8,6 @@ use tokio::sync::oneshot;
 use super::dpop::DpopKey;
 use crate::account_profile::AccountProfile;
 
-/// Subscription tier returned by the account OAuth service.
-///
-/// This value is part of the account JSON response (`kytrix_plan_code`), not
-/// the Kytrix websocket protobuf protocol.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum PlanCode {
     #[serde(rename = "free")]
@@ -176,17 +172,12 @@ pub(super) enum TokenWalletKind {
     Solana,
 }
 
-/// Wallet family that owns [`AccountIdentity::wallet_address`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AccountWalletKind {
     Ethereum,
     Solana,
 }
 
-/// Account identity established by a completed OAuth authorization.
-///
-/// The address is validated against its wallet family before it appears here,
-/// so callers can persist the value without re-deriving the family.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountIdentity {
     user_id: String,

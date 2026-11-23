@@ -1,5 +1,3 @@
-//! The indicator catalogue, its persisted configuration and the series derived from the loaded candles.
-
 mod compute;
 mod config;
 mod definition;

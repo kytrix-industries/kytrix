@@ -1,5 +1,3 @@
-//! Network-behavior proxy routing.
-
 use std::sync::Arc;
 
 use app_config::network::{
@@ -12,19 +10,12 @@ use url::Url;
 
 use crate::system_proxy;
 
-/// A resolved proxy together with the OS settings it was derived from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedRoute {
     pub proxy: ResolvedProxy,
     pub os_proxy_fingerprint: u64,
 }
 
-/// Resolves one target's current route. Invalid bindings fail closed.
-///
-/// This is the only place Direct/Named/System choices are materialized into a
-/// [`ResolvedProxy`]. Direct and Named never read the environment or OS proxy.
-/// System evaluates the OS proxy, including PAC/WPAD, for `destination` — a
-/// destination on this machine excepted, which the OS proxy never answers for.
 pub fn resolve(
     config: &Config,
     target: &RouteTarget,
@@ -33,7 +24,6 @@ pub fn resolve(
     resolve_route(config, target, destination).map(|route| route.proxy)
 }
 
-/// Returns the outbound route one target's requests take.
 fn proxy_route(config: &Config, target: &RouteTarget) -> ProxyRoute {
     match target {
         RouteTarget::Venue(venue) => config.proxy_route_for(venue),
@@ -41,7 +31,6 @@ fn proxy_route(config: &Config, target: &RouteTarget) -> ProxyRoute {
     }
 }
 
-/// Returns the generation of the route one target's requests take.
 fn route_generation(config: &Config, target: &RouteTarget) -> NetworkRouteGeneration {
     match target {
         RouteTarget::Venue(venue) => config.network_route_generation(venue),
@@ -67,13 +56,6 @@ fn resolve_route(
     }
 }
 
-/// Resolves a route without running system/PAC evaluation on a Tokio worker.
-///
-/// The synchronous resolver remains available for synchronous callers. System
-/// discovery may perform blocking OS calls, download a PAC document, and
-/// execute JavaScript, so async facades must cross this blocking boundary
-/// before awaiting the result: they do it on `runtime`, never on the thread that
-/// happens to be driving the caller's future.
 pub async fn resolve_async(
     config: &Config,
     target: &RouteTarget,
@@ -90,9 +72,6 @@ pub async fn resolve_async(
     .await
 }
 
-/// Async system-route resolution that can be abandoned when its operation is
-/// cancelled. The blocking worker is detached by Tokio after cancellation;
-/// importantly, no PAC/OS work remains on the async runtime worker.
 pub async fn resolve_async_cancellable(
     config: &Config,
     target: &RouteTarget,
@@ -105,8 +84,6 @@ pub async fn resolve_async_cancellable(
         .map(|route| route.proxy)
 }
 
-/// Async route resolution that also reports the OS proxy fingerprint the route
-/// was derived from.
 pub async fn resolve_route_async_cancellable(
     config: &Config,
     target: &RouteTarget,
@@ -121,8 +98,6 @@ pub async fn resolve_route_async_cancellable(
     let config = config.clone();
     let destination = destination.clone();
     let task_target = target.clone();
-    // The runtime is the one that owns the blocking pool, so the OS calls and
-    // the PAC evaluation run there whatever executor the caller is on.
     let task = runtime.spawn_blocking(move || resolve_route(&config, &task_target, &destination));
     tokio::select! {
         biased;
@@ -131,7 +106,6 @@ pub async fn resolve_route_async_cancellable(
     }
 }
 
-/// Cheap OS-settings hash for System route fences. Direct/Named are `0`.
 pub fn system_route_fingerprint(config: &Config, target: &RouteTarget) -> u64 {
     match proxy_route(config, target) {
         ProxyRoute::System => system_proxy::cached_os_proxy_fingerprint(),
@@ -139,8 +113,6 @@ pub fn system_route_fingerprint(config: &Config, target: &RouteTarget) -> u64 {
     }
 }
 
-/// Refreshes the process-wide OS proxy fingerprint off the async runtime.
-/// Session actors call this before comparing their cached System route fence.
 pub async fn refresh_system_proxy_fingerprint(
     cancellation: CancellationToken,
     runtime: &Handle,
@@ -148,7 +120,6 @@ pub async fn refresh_system_proxy_fingerprint(
     system_proxy::refresh_os_proxy_fingerprint(cancellation, runtime).await
 }
 
-/// Route fence: System compares OS settings only; Direct/Named re-materialize.
 pub fn session_route_matches(
     config: &Config,
     target: &RouteTarget,
@@ -179,24 +150,16 @@ fn resolve_system_proxy(
     })
 }
 
-/// Resolves effective proxy routes from the owner's current network projection.
 #[derive(Clone)]
 pub struct ProxyResolver {
     config: Arc<dyn Fn() -> Arc<Config> + Send + Sync>,
 }
 
 impl ProxyResolver {
-    /// Builds a resolver over `config`, which must answer the owner's latest
-    /// complete network projection.
     pub fn new(config: Arc<dyn Fn() -> Arc<Config> + Send + Sync>) -> Self {
         Self { config }
     }
 
-    /// Resolves one venue's current route and reports the generation it is on.
-    ///
-    /// A venue is routed by the venue's own configuration — the line it names, or
-    /// the default line it names none of — so the venue is the subject: there is
-    /// no service target standing in for it.
     pub async fn resolve_for_venue_with_generation(
         &self,
         venue: &VenueId,
@@ -257,12 +220,6 @@ mod tests {
 
     use super::{ProxyResolver, resolve};
 
-    /// The runtime every test in the process shares.
-    ///
-    /// A handle to a runtime built inside one test would be shut down when the test
-    /// ends, failing the blocking work a still-running peer started; one runtime for
-    /// the whole test binary is what makes the handle a stand-in for the application
-    /// runtime rather than a second one.
     fn test_handle() -> Handle {
         static SHARED: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 

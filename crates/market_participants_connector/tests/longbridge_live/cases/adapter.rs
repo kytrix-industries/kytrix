@@ -1,18 +1,3 @@
-//! The adapter's own path to the venue: the cases that drive production code.
-//!
-//! Every other case in this suite speaks the wire itself, which is what makes its
-//! measurements independent of the code they check — and it is also the gap the final
-//! review named: the adapter's signed `fetch_otp`, its pooled handshake with the declared
-//! upgrade headers, its `establish` (AUTH then cmd 4), its permission gate and its cmd 27
-//! request had never faced the venue, because the suite dialled its own socket and
-//! computed its own signature.
-//!
-//! Case 17 closes that gap for the candle commands and case 20 for the ticker ones, with
-//! no fixture seam: the credentials are the real ones, the origins are the published ones
-//! (`LongbridgeRegion`'s own pair, not a fixture binding), the listing comes from the live
-//! catalog the venue's directory built, and the market data is fetched through
-//! `MarketCapability` — the same call the widgets make.
-
 use std::sync::Arc;
 
 use app_config::{
@@ -45,22 +30,9 @@ use crate::{
     skip_without_credentials,
 };
 
-/// The ticker the catalog is asked for.
 const TICKER: &str = "AAPL.US";
-/// The route the venue publishes its US listings under.
 const SCOPE: &str = "us";
 
-/// Case 17 — the adapter's public path, with real credentials and published origins.
-///
-/// The measurement this case produces is what §14.1 item 10's second half was waiting
-/// for: the loopback fixture proves the adapter's OTP request is signed the way §4.9
-/// states, and the venue proves that algorithm is accepted — but only this case proves
-/// the adapter's **own** signing path is the one the venue accepts, end to end, together
-/// with the handshake, the permission gate and the candle command behind it.
-///
-/// It asserts what the design states: the venue grants this account US market data, the
-/// adapter establishes its session and the marketplace answers a candle read with candles
-/// about the listing that was asked for. Everything it measures is printed.
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_17_the_adapter_reaches_the_venue_on_its_own_path() {
@@ -100,12 +72,6 @@ async fn live_case_17_the_adapter_reaches_the_venue_on_its_own_path() {
             listing.listing_id.as_str()
         );
 
-        // The candle read is the whole chain at once: `MarketCapability` resolves the
-        // listing inside one catalog generation, the gateway asks the adapter for a
-        // session, the session is established the first time any market-data command
-        // arrives (OTP with the signed request, the upgrade with its two headers, AUTH,
-        // then cmd 4 for the profile and its permission), and the command itself is
-        // paced by the quota the profile published.
         let candles = timeout(
             READ_TIMEOUT,
             connector
@@ -161,16 +127,6 @@ async fn live_case_17_the_adapter_reaches_the_venue_on_its_own_path() {
             "{case}: the candles must be ascending and distinct"
         );
 
-        // The subscription is the other half of the adapter's candle surface, and the half
-        // nothing else in this suite can reach: the pooled socket's own subscribe lease,
-        // the opening screen (cmd 19) that precedes the subscribe frame, the cmd 6
-        // acknowledgement the stream recognises for itself, and the aggregation of
-        // whatever the venue then pushes. The first event is the screen's oldest candle, so
-        // the subscription is answered even on a closed market — and which of the two
-        // situations this run measured is the venue's **calendar**'s answer rather than the
-        // session clock's, the way cases 9 and 10 already read it: 09:30–16:00 ET on a
-        // Sunday is a session the venue states and a day it does not trade, so a clock-only
-        // gate would report pushes being merged on a market that pushed nothing.
         let mut stream = timeout(
             READ_TIMEOUT,
             connector
@@ -219,19 +175,6 @@ async fn live_case_17_the_adapter_reaches_the_venue_on_its_own_path() {
     .expect("the case must finish inside its own bound");
 }
 
-/// Case 20 — the adapter's public path to a live ticker (§2.4, §4.2, §4.3).
-///
-/// Case 17 proved the adapter's own session, gate and candle command against the venue.
-/// This case proves the other half of the market-data surface on the same path: the
-/// capability declaration that lets a caller ask for a ticker at all, the catalog that
-/// resolves the listing, the session and the quota, and the pull (cmd 11) whose answer is
-/// the snapshot a watch-list row is first drawn from.
-///
-/// The subscription is the second half, and the assertion it makes is deliberately about
-/// **arrival** rather than about a price: the adapter's stream opens with the snapshot it
-/// pulled itself, so its first event is answered whether or not the venue is pushing
-/// anything — which is exactly the property that must hold on a closed market, and the
-/// reason the first event is not "the venue's first push" (§4.2).
 #[tokio::test]
 #[ignore = "requires live network access to the Longbridge OpenAPI"]
 async fn live_case_20_the_adapter_reads_a_live_ticker() {
@@ -270,10 +213,6 @@ async fn live_case_20_the_adapter_reads_a_live_ticker() {
         .expect("the adapter's ticker read must not time out");
         let ticker = match read {
             Ok(ticker) => ticker,
-            // An account without US market data is not a broken case: the suite has no
-            // permission to measure, and says so rather than failing the run — the same
-            // situation case 18 skips on. The refusal is the adapter's own permission
-            // gate, wrapped by the market capability in its network error.
             Err(MarketError::Network(network))
                 if matches!(
                     network.error(),
@@ -320,10 +259,6 @@ async fn live_case_20_the_adapter_reads_a_live_ticker() {
             ticker.close.value >= market_participants_model::decimal::Price::ZERO,
             "{case}: a price is not negative"
         );
-        // A quote of a market that is not trading is legitimately all zeroes — a halted
-        // listing, a session that has not opened, a venue with no prints today — so the
-        // stronger statement is only made where the venue itself states that something
-        // traded.
         if ticker.traded_quantity.as_ref().is_some_and(|quantity| {
             quantity.value > market_participants_model::decimal::Quantity::ZERO
         }) {
@@ -339,8 +274,6 @@ async fn live_case_20_the_adapter_reads_a_live_ticker() {
             );
         }
 
-        // The subscription's first event is the adapter's own baseline, so it arrives
-        // without the venue having to push anything.
         let mut stream = timeout(
             READ_TIMEOUT,
             connector
@@ -376,12 +309,6 @@ async fn live_case_20_the_adapter_reads_a_live_ticker() {
     .expect("the case must finish inside its own bound");
 }
 
-/// One market participant whose Longbridge settings carry the live credentials and the published
-/// origins.
-/// The proxy is the same environment variable every live case of this suite takes, so the
-/// adapter's own requests travel the route the wire-level cases travel. Nothing here
-/// points the venue at a fixture: `LongbridgeRegion`'s own pair is what the adapter dials,
-/// which is the point of the case.
 fn live_connector(case: &str, values: &Credentials) -> (MarketParticipantsConnector, Arc<Catalog>) {
     let mut settings = LongbridgeSettings {
         region: LongbridgeRegion::Global,
@@ -427,10 +354,8 @@ fn live_connector(case: &str, values: &Credentials) -> (MarketParticipantsConnec
     (connector, catalog)
 }
 
-/// The proxy name this case's network configuration routes through.
 const PROXY_NAME: &str = "longbridge-live";
 
-/// The proxies one live run dials through, as the wire-level cases' environment states.
 fn live_proxies() -> std::collections::BTreeMap<SmolStr, ProxyConfig> {
     let raw = std::env::var(crate::client::PROXY_ENV)
         .unwrap_or_else(|_| crate::client::DEFAULT_PROXY.to_owned());

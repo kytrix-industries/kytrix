@@ -1,5 +1,3 @@
-//! End-to-end WebSocket session against a real upgrade server.
-
 use std::{net::Ipv4Addr, time::Duration};
 
 use app_config::network::ResolvedProxy;
@@ -11,8 +9,6 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use tokio::{net::TcpListener, sync::mpsc};
 use url::Url;
 
-/// Starts a server that reports the handshake `Authorization` header and then
-/// echoes every data frame it receives.
 async fn spawn_echo_server() -> (std::net::SocketAddr, mpsc::UnboundedReceiver<String>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();

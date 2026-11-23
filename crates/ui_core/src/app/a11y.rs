@@ -1,7 +1,3 @@
-//! 无障碍：动作 handler 表、诊断环、限流交付与快照捕获。
-//!
-//! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
-
 use smallvec::SmallVec;
 
 use super::{A11Y_DIAGNOSTIC_CAPACITY, A11Y_THROTTLE, App};
@@ -11,13 +7,6 @@ use crate::{
     window::{Window, WindowId},
 };
 
-// ── P11：无障碍（动作 / 诊断 / 交付） ──────────────────────────────────
-
-/// 注册 a11y 动作的处理器（同 `A11yAction` 后写覆盖）。
-///
-/// 返回 `false` = 该动作**不能**注册：`A11yAction::Click` 必须落到 P10 的 `Action` 表
-/// （`App::on_action`），让指针点击 / 键盘 Enter / AT 激活共享同一身份。
-/// 消费者：`App::on_a11y_action`。
 pub(crate) fn on_a11y_action(
     app: &mut App,
     action: crate::a11y::A11yAction,
@@ -30,44 +19,29 @@ pub(crate) fn on_a11y_action(
     true
 }
 
-/// 删除 a11y 动作的处理器（返回是否真的删了）。
-/// 消费者：`App::off_a11y_action`。
 pub(crate) fn off_a11y_action(app: &mut App, action: crate::a11y::A11yAction) -> bool {
     app.a11y_handlers.remove(&action).is_some()
 }
 
-/// a11y 诊断（与 `text_diagnostics` 同型；上限 `A11Y_DIAGNOSTIC_CAPACITY`，超出丢最旧）。
-/// 消费者：`App::a11y_diagnostics`。
 #[must_use]
 pub(crate) fn a11y_diagnostics(app: &App) -> &[crate::a11y::A11yDiagnostic] {
     &app.a11y_diagnostics
 }
 
-/// 记录一条 a11y 诊断（唯一入口：计数与容量在这里统一）。
-/// 消费者：`App::a11y_note`。
 pub(crate) fn a11y_note(app: &mut App, diagnostic: crate::a11y::A11yDiagnostic) {
-    // 去重：同一诊断会在**每次** a11y 交付里重复产生（例如同一个缺标签的交互节点）。
-    // 旧实现每条都 push，64 槽环形缓冲很快被同一个问题的重复项占满，把真正的新问题挤出去，
-    // 而且已经修好的旧诊断会长期残留（复审 P3-5）。
     if app.a11y_diagnostics.contains(&diagnostic) {
         return;
     }
     if app.a11y_diagnostics.len() >= A11Y_DIAGNOSTIC_CAPACITY {
-        // 容量固定为 64：这里的一次 memmove 有界，不值得为它引入 VecDeque
-        // （公开访问器返回 `&[A11yDiagnostic]`）。
         app.a11y_diagnostics.remove(0);
     }
     app.a11y_diagnostics.push(diagnostic);
 }
 
-/// 该动作是否注册了 handler（`a11y::action` 的分派判据）。
-/// 消费者：`App::a11y_has_handler`。
 pub(crate) fn a11y_has_handler(app: &App, action: crate::a11y::A11yAction) -> bool {
     app.a11y_handlers.contains_key(&action)
 }
 
-/// 摘出 handler（借用纪律：调用期间它不在表里）。
-/// 消费者：`App::a11y_take_handler`。
 pub(crate) fn a11y_take_handler(
     app: &mut App,
     action: crate::a11y::A11yAction,
@@ -75,8 +49,6 @@ pub(crate) fn a11y_take_handler(
     app.a11y_handlers.remove(&action)
 }
 
-/// 放回 handler。
-/// 消费者：`App::a11y_put_handler`。
 pub(crate) fn a11y_put_handler(
     app: &mut App,
     action: crate::a11y::A11yAction,
@@ -85,15 +57,6 @@ pub(crate) fn a11y_put_handler(
     app.a11y_handlers.insert(action, handler);
 }
 
-/// 该窗口本轮是否有 a11y 工作（O(1)；平台泵每轮用它过滤 `update_if_active`）。
-/// 消费者：`App::a11y_pending`。
-///
-/// 三条不节流旁路（`A11Y_THROTTLE` 只约束**已接入后**的高频数据增量）：
-/// - **焦点变化**（R13-5）：读屏用户的"位置感"绑定在焦点反馈的时效上；
-/// - **消费端重置**（E1）：AT 重新激活 / adapter 停用后 AccessKit 停在 `Pending`，在收到全树
-///   之前 AT 看到的是空树；此时也没有脏位可供到期补发，必须立刻交付；
-/// - **未交付批次**（E5）：分批首树 / DPI 全量重建只发了一部分时必须连续推进 —— 否则
-///   40k 节点 ≈ 20 批 × 100 ms 节流 ≈ 2 s 的首屏可访问性延迟（审查 §3.10 P1）。
 #[must_use]
 pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
     let Some(target) = app.windows.get(&window) else {
@@ -104,9 +67,7 @@ pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
     }
     target.a11y_focus_pending()
         || target.a11y_consumer_epoch_pending()
-        // 未开始交付的全量重建（首树/DPI）：被叫醒就立刻发第一笔。
         || target.a11y_rebuild_pending()
-        // 已开始的批次未走完：被叫醒就继续推进（平台自唤醒另见 `wake_for_a11y_backlog`）。
         || target.a11y_backlog_pending()
         || app
             .a11y_delivered
@@ -114,31 +75,11 @@ pub(crate) fn a11y_pending(app: &App, window: WindowId) -> bool {
             .is_none_or(|last| app.clock.saturating_duration_since(*last) >= A11Y_THROTTLE)
 }
 
-/// 是否有**任一窗口**还有未交付的 a11y 批次（平台泵交付后据此自唤醒；E5 / RE-04）。
-///
-/// 平台泵每轮只交付**一笔**（三端 `update_a11y` 各调一次）。分批首树 / DPI 全量重建期间，
-/// 交付完这一笔后若本函数为真，平台层必须立刻 `Dispatcher::wake()` 下一轮 —— 否则 Windows
-/// 只能等 `A11Y_RETRY_MS = 100 ms` 的兜底定时器，40k 首树又回到 ≈19×100ms≈1.9s；
-/// Linux/macOS 也会退化为既有 retry 定时器的 ≈16ms/轮。`App::a11y_pending` 的 backlog 旁路
-/// 只保证「被叫醒后立刻交付」，**叫醒本身**是平台层这三行接线的职责。
-/// 消费者：三端泵的 a11y 交付步骤。
 #[must_use]
 pub(crate) fn a11y_backlog_pending(app: &App) -> bool {
     app.windows.values().any(Window::a11y_backlog_pending)
 }
 
-/// 本轮泵**交付过** a11y 且仍有未走完的批次时，唤醒平台泵
-/// （三端唯一入口；E5/RE-04/RE-05）。
-///
-/// 判据必须同时满足：
-/// 1. **本轮确实交付过** a11y（`a11y_delivered_round`：`a11y_take` 产出过快照才置位）。
-///    adapter Inactive（无 AT 客户端 / 无测试捕获）时 `update_if_active` 不执行闭包 ⇒ 标志
-///    恒 false；
-/// 2. 交付后仍有**已开始**的剩余批次（[`A11yBridge::backlog`]，不含 `full_pending`）。
-///
-/// 只有第 2 条的实现会让无 AT 的默认场景每轮自唤醒 = 单核 100% 忙等（RE-05，I3 失效）。
-/// 标志在每次调用时消费并清零，语义是「本轮」；三端泵各留一行调用，真实事件循环不在单测
-/// 执行（App 层测试 + 真机 `acceptance idle` 覆盖，见实现报告 §6.2/§8.3）。
 pub(crate) fn wake_for_a11y_backlog(app: &mut App, dispatcher: &Dispatcher) {
     let delivered = std::mem::take(&mut app.a11y_delivered_round);
     if delivered && app.a11y_backlog_pending() {
@@ -146,11 +87,6 @@ pub(crate) fn wake_for_a11y_backlog(app: &mut App, dispatcher: &Dispatcher) {
     }
 }
 
-/// 是否有窗口「a11y 脏但正被限流」——平台泵据此安排**到期补发**唤醒。
-///
-/// 没有这条，被限流挡下的最后一次变化永远不会交付：脏位留着，但没有任何机制在
-/// `A11Y_THROTTLE` 之后把泵叫醒（复审 P1-4）。
-/// 消费者：`App::a11y_retry_pending`。
 pub(crate) fn a11y_retry_pending(app: &App) -> bool {
     app.windows.keys().any(|window| {
         app.windows.get(window).is_some_and(Window::a11y_pending)
@@ -161,13 +97,6 @@ pub(crate) fn a11y_retry_pending(app: &App) -> bool {
     })
 }
 
-/// 建窗路径的 a11y 消费端代际句柄（三端唯一入口；RE-01）。
-/// 消费者：`App::window_a11y_epoch`。
-///
-/// **必须返回窗口 `A11yBridge` 里的那一份句柄**（同一 `Arc`）：平台 adapter 的激活/停用回调
-/// `bump()` 它之后，引擎 `A11yBridge` 的 `seen_consumer_epoch` 才能观察到变化并强制下一笔全树。
-/// 另起一份 `A11yConsumerEpoch` 是断开的（bump 永远到不了引擎），因此该类型不向平台层开放
-/// 构造入口 —— 三个平台只能经由本函数取句柄。
 #[must_use]
 pub(crate) fn window_a11y_epoch(
     app: &App,
@@ -176,11 +105,6 @@ pub(crate) fn window_a11y_epoch(
     app.windows.get(&window).map(Window::a11y_consumer_epoch)
 }
 
-/// 产出一笔 a11y 交付（消费 `A11Y` 反向集合与 `full_pending`）。
-///
-/// **必须在 `accesskit_windows::Adapter::update_if_active` 的闭包里调用**（adapter 不活跃时
-/// 闭包不执行 ⇒ 零开销），或由 `test-support` 的捕获路径调用。
-/// 消费者：`App::a11y_take`。
 pub(crate) fn a11y_take(app: &mut App, window: WindowId) -> Option<crate::a11y::A11yTreeSnapshot> {
     let mut diagnostics = Vec::new();
     let snapshot = {
@@ -192,37 +116,11 @@ pub(crate) fn a11y_take(app: &mut App, window: WindowId) -> Option<crate::a11y::
     }
     if snapshot.is_some() {
         app.a11y_delivered.insert(window, app.clock);
-        // RE-05：标记「本轮泵确实交付过 a11y」，平台泵的 `wake_for_a11y_backlog` 消费它；
-        // 无 AT 客户端时（adapter Inactive，本函数不执行）绝不会因此自唤醒。
         app.a11y_delivered_round = true;
     }
     snapshot
 }
 
-/// 写一个节点的**动态** a11y 补丁并登记交付（E15；E15b F3/F5 收敛）。
-///
-/// 与 `NodeBuilder::bind_a11y` 是同一条写入通道的**应用侧求值形态**（合并方向不变：
-/// `patch` > `A11yOverride` > 由节点种类/结构推导）。应用在**引擎外**观察到状态变化（虚拟
-/// 列表行的选中集、筛选项的勾选态……）后把新的 [`crate::a11y::A11yPatch`] 推进来；行节点由
-/// 列表内核持有、应用拿不到 builder，因此这是「静态快照行 a11y」的动态失效面（P2-4c2/4d2：
-/// `List::set_row_a11y` 捕获的行 `selected` / `checked` 在面板打开期间不刷新）。首选形态仍是
-/// `bind_a11y` 的 `ReadCtx` 形态（信号依赖自动失效），本通道只给「写入时点由应用自己掌握」
-/// 的场合。
-///
-/// 写入语义与 `bind_a11y` 完全一致（共用 [`crate::a11y::tree::write_a11y_patch`]）：整值替换
-/// 并做等值短路；`role` / `hidden` 变化按 `affects_descendants` 把整棵子树标 `A11Y`（后代
-/// 派生角色、被集合领养跳过的祖先隐藏语义），其余字段只标本节点。
-///
-/// **请求一帧**（E15b F5）：`mark_a11y` 只进 `A11Y` 反向集合，`Window::needs_frame` 不看
-/// A11Y 位。泵尾回投任务里调用本方法时循环已经过了帧门禁、即将阻塞 —— 不唤醒平台，TreeUpdate
-/// 会等到下一次无关唤醒（不丢，但读屏反馈迟到；I6 的交互时效）。该帧是 a11y-only 帧：不重绘、
-/// 不提交像素（`A11yBridge` 只重发快照字段）。批处理内由 `App::batch` 合并成一次唤醒。
-///
-/// 与 `bind_a11y` 同时存在时的覆盖关系：下一次 `bind_a11y` 求值整体覆盖本通道写入的补丁
-/// （`bind` 的求值结果是唯一真相；本方法的语义因此只在两次信号失效之间有效）。
-///
-/// # Errors
-/// `EngineError::UnknownWindow`（窗口已关闭）/ `EngineError::StaleNode`（节点已卸载）。
 pub(crate) fn set_a11y_patch(
     app: &mut App,
     window: WindowId,
@@ -241,19 +139,6 @@ pub(crate) fn set_a11y_patch(
     Ok(())
 }
 
-/// 只重算 `bind_a11y` 的 pass（R13-6 的 `refresh_a11y_bindings`）。
-///
-/// **不产生任何像素工作**：不标 `BIND`/`PAINT`、不清 `REUSABLE`、不产生 damage。消费者：
-/// `App::refresh_styles`（每帧的样式 pass 之后调用一次；空队列时 O(1) 直接返回），因此
-/// 公开 API 的语义仍是"全部动态属性都已重算"。
-///
-/// 为什么单独成 pass：只有 `bind_a11y` 的节点被写信号时，整条帧管线里**唯一**必需的步骤就是
-/// 重算 patch；把它从 `refresh_styles` 的 `dirty_bind` 通道里解耦后，这类帧可以整段跳过
-/// 文本/布局/paint/编码（判据见 `Window::a11y_only_frame`），而 TreeUpdate 照常在平台泵里
-/// 投递 —— 节流（`A11Y_THROTTLE`）因此只约束投递，不再被"整帧 pass"摊薄。
-///
-/// 依赖边处理与 `refresh_styles` 完全一致（同一 `Owner`、同一差分替换）：一个节点只有一份
-/// 依赖边集，`bind_style` / `bind_text` / `bind_a11y` 三条动态通道共享它。
 pub(crate) fn refresh_a11y_bindings(app: &mut App, window: WindowId) {
     if !app
         .windows
@@ -281,9 +166,6 @@ pub(crate) fn refresh_a11y_bindings(app: &mut App, window: WindowId) {
             continue;
         }
         let Some(bind) = tree.take_bind_a11y(node) else {
-            // 闭包不见了 ⇒ 上次求值 **panic** 后没放回（与 `refresh_styles` 的同一分支同义）。
-            // 那次 pass 在 `replace_deps` 之前就中断了，节点仍带着上一次成功的 deps：它们是
-            // 「幽灵边」—— 节点已不会再求值，但写这些信号仍会把它标脏。这里显式退订。
             let ghost_deps = tree.deps(node).unwrap_or(&[]);
             graph.replace_deps(Owner::Node { window, node }, ghost_deps, &[]);
             tree.set_deps(node, SmallVec::new());
@@ -291,7 +173,6 @@ pub(crate) fn refresh_a11y_bindings(app: &mut App, window: WindowId) {
         };
         let (values, derived) = store.split();
         let mut tracker = ReadTracker::new();
-        // 作用域块结束即释放 `ReadCtx` 的借用（`ReadCtx` 不是 `Drop` 类型，不能用 `drop`）。
         let (value, owner) = {
             let mut ctx = ReadCtx::new(
                 values,
@@ -306,16 +187,12 @@ pub(crate) fn refresh_a11y_bindings(app: &mut App, window: WindowId) {
         let old_deps = tree.deps(node).unwrap_or(&[]);
         graph.replace_deps(owner, old_deps, tracker.as_slice());
         tree.set_deps(node, tracker.into_inner());
-        // E15b F2/F3：三个写入点共用同一份差分（等值短路 + `affects_descendants` 子树标记），
-        // 避免「a11y-only pass 修了、普通帧的 style pass 没修」这类分叉。
         let _ = crate::a11y::tree::write_a11y_patch(tree, node, value);
         tree.put_bind_a11y(node, bind);
     }
     target.a11y_recycle_bindings(nodes);
 }
 
-/// 打开/关闭某个窗口的 a11y 快照捕获（`TestApp` 专用）。
-/// 消费者：`App::set_a11y_capture`。
 #[cfg(feature = "test-support")]
 pub(crate) fn set_a11y_capture(app: &mut App, window: WindowId, on: bool) {
     if let Some(target) = app.windows.get_mut(&window) {
@@ -323,8 +200,6 @@ pub(crate) fn set_a11y_capture(app: &mut App, window: WindowId, on: bool) {
     }
 }
 
-/// 该窗口的捕获是否打开。
-/// 消费者：`App::attach_a11y`。
 #[cfg(feature = "test-support")]
 pub(crate) fn attach_a11y(
     app: &mut App,
@@ -359,10 +234,6 @@ mod tests {
         }
     }
 
-    /// 夹具：一个窗口 + `10` 个静态实色 box（有 lane）+ 一个**只**绑 `bind_a11y` 的实色 box。
-    ///
-    /// 返回 `(runtime, app, window, label_signal, label_node)`；`runtime` 必须保活（`App` 只持
-    /// `Handle`）。
     fn fixture() -> (
         tokio::runtime::Runtime,
         App,
@@ -403,21 +274,9 @@ mod tests {
         (runtime, app, window, label_signal, label)
     }
 
-    /// R13-6 的验收：**只改一个节点的 a11y label** 不得触发重绘。
-    ///
-    /// 判据（全部确定性，不依赖机器负载）：
-    /// 1. 本帧是 `Idle`（不提交，`FrameIndex` 不变）；
-    /// 2. `record.a11y_only == true` 且 `record.repainted == false`；
-    /// 3. `damage` 空、`painted_lanes == 0`、`encoded_lanes == 0`、paint pass 没有访问任何 lane；
-    /// 4. `stats.a11y_only_frames == 1`（a11y-only 快速路径真的在跑，不是"碰巧没画"）；
-    /// 5. a11y 树**确实更新了**（TreeUpdate 只重建，不重绘）。
-    ///
-    /// 变异守卫：把 `App::invalidate` 的 a11y-only 分支退回「一律重绘」（标 `PAINT`）⇒ 第 2/3
-    /// 条变红；删掉 a11y-only 快速路径 ⇒ 第 4 条变红。
     #[test]
     fn an_a11y_only_change_does_not_repaint() {
         let (_runtime, mut app, window, label_signal, label) = fixture();
-        // 首帧：全量（新节点带 LAYOUT|PAINT|BIND）⇒ 正常提交；随后把全树交付消费掉。
         let first = app.frame(window).expect("window").expect("first frame");
         assert!(
             matches!(first, FrameOutcome::Committed(_)),
@@ -481,11 +340,6 @@ mod tests {
         );
     }
 
-    /// R13-6 的配套约束：**有像素工作的帧**里，`bind_a11y` 也必须在同一帧重算。
-    ///
-    /// 同一个信号同时被一个 `bind_style` 节点和一个只绑 `bind_a11y` 的节点读取：帧仍是
-    /// 绘制帧（按 PAINT 走完整管线），但 a11y 绑定 pass 也必须在 paint 之前跑完 —— 否则
-    /// a11y 交付会落后一帧（读屏读到旧 label）。
     #[test]
     fn a_paint_frame_also_refreshes_a11y_bindings() {
         let (_runtime, mut app, window, label_signal, label) = fixture();
@@ -534,17 +388,12 @@ mod tests {
         let _ = styled;
     }
 
-    /// E1：消费端重置（AT 重新激活 / adapter 停用）必须**立即**交付全树，不受 `A11Y_THROTTLE`。
-    ///
-    /// 变异守卫：删掉 `a11y_pending` 的 `a11y_consumer_epoch_pending()` 旁路 ⇒ 第一个
-    /// `assert!(app.a11y_pending(...))` 变红（时钟未推进，节流窗口内普通脏位不会交付）。
     #[test]
     fn a_consumer_epoch_reset_bypasses_the_a11y_throttle() {
         let (_runtime, mut app, window, _label_signal, label) = fixture();
         let _ = app.frame(window).expect("window").expect("first frame");
         assert!(app.a11y_take(window).is_some(), "首笔 a11y 交付必为全树");
 
-        // 首笔刚交付：时钟未推进，普通脏位落在 100 ms 节流窗口内。
         app.window_mut(window)
             .expect("window")
             .tree_mut()
@@ -554,7 +403,6 @@ mod tests {
             "限流窗口内的普通脏位不得立即交付（否则旁路测试没有意义）"
         );
 
-        // 消费端重置：不推进时钟也必须立即交付，且下一笔是全树。
         let epoch = app.window(window).expect("window").a11y_consumer_epoch();
         epoch.bump();
         assert!(
@@ -565,12 +413,6 @@ mod tests {
         assert!(snapshot.full, "重置后的第一笔必须是全树");
     }
 
-    /// E15b F5/P3：`set_a11y_patch` 必须**请求一帧**（`mark_a11y` 只进 A11Y 反向集合，
-    /// `Window::needs_frame` 不看 A11Y 位）。
-    ///
-    /// 变异守卫：删掉 `app.request_frame()` ⇒ 下一次 `App::frame` 在帧门禁前就返回空闲帧
-    /// （`a11y_only_frames == 0`），本用例红 —— 泵尾回投任务里的写入会等到下一次无关唤醒才
-    /// 投递 TreeUpdate。
     #[test]
     fn set_a11y_patch_requests_an_a11y_only_frame() {
         let (_runtime, mut app, window, _label_signal, label) = fixture();
@@ -612,8 +454,6 @@ mod tests {
         );
     }
 
-    /// E15b P4：`set_a11y_patch` 的两条错误路径（`UnknownWindow` / `StaleNode`，与既有节点
-    /// API 同型；错误面是公开契约的一部分，必须有测试）。
     #[test]
     fn set_a11y_patch_reports_unknown_window_and_stale_node() {
         let (_runtime, mut app, window, _label_signal, label) = fixture();
@@ -633,7 +473,6 @@ mod tests {
         ));
     }
 
-    /// E15 P4（审查 F8）：5 个新角色加入「没有名字就没有语义」诊断名单（`MissingLabel`）。
     #[test]
     fn new_roles_without_a_name_are_diagnosed() {
         let (_runtime, mut app, window, _label_signal, _label) = fixture();
@@ -674,11 +513,6 @@ mod tests {
         }
     }
 
-    /// RE-01：建窗路径取到的代际必须是窗口 `A11yBridge` 的**同一份** `Arc` —— 否则平台回调
-    /// bump 的是另一份计数器，引擎永远看不到重置（E1 在生产上失效但测试全绿）。
-    ///
-    /// 变异守卫：把 `window_a11y_epoch` 改成 `A11yConsumerEpoch::new()`（不可编译）或返回
-    /// 断开句柄 ⇒ 本用例红；三端平台层只允许经由本 helper 取句柄。
     #[test]
     fn window_a11y_epoch_is_the_bridge_handle_of_that_window() {
         let (_runtime, mut app, window, _label_signal, _label) = fixture();

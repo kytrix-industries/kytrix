@@ -1,9 +1,3 @@
-//! Authenticated account streams.
-//!
-//! An order and a position event carries the listing the venue resolved it to;
-//! this layer attaches that listing's units to the raw numbers, so a caller never
-//! receives a quantity whose meaning it would have to guess.
-
 use std::{
     pin::Pin,
     task::{Context, Poll},

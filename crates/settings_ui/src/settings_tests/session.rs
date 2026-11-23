@@ -1,5 +1,3 @@
-//! The tests of the settings session: what one write stores, and what it refuses.
-
 use std::{error::Error as _, io, path::PathBuf};
 
 use app_config::{
@@ -13,7 +11,6 @@ use smol_str::SmolStr;
 
 use crate::{session::SettingsChange, settings_tests::test_support::Harness};
 
-/// The settings a session writes are stored at once, not held for a later confirmation.
 #[test]
 fn a_change_should_reach_the_settings_at_once() {
     let mut harness = Harness::new();
@@ -36,8 +33,6 @@ fn a_change_should_reach_the_settings_at_once() {
     );
 }
 
-/// A change is applied to the settings as they are when it is written, so what another subsystem
-/// wrote while the page was open survives it.
 #[test]
 fn a_change_should_keep_what_was_written_while_the_page_was_open() {
     let mut harness = Harness::new();
@@ -87,7 +82,6 @@ fn service_target() -> ServiceTarget {
     }
 }
 
-/// Adding an entry is one commit: the settings hold it as soon as the change is written.
 #[test]
 fn adding_a_proxy_should_store_it_at_once() {
     let mut harness = Harness::new();
@@ -105,7 +99,6 @@ fn adding_a_proxy_should_store_it_at_once() {
     );
 }
 
-/// Renaming an entry moves every named route with it, in the same commit.
 #[test]
 fn replacing_a_proxys_name_should_move_the_routes_bound_to_it() {
     let mut harness = Harness::new();
@@ -147,7 +140,6 @@ fn replacing_a_proxys_name_should_move_the_routes_bound_to_it() {
     );
 }
 
-/// Removing an entry resets every route that named it, in the same commit.
 #[test]
 fn removing_a_proxy_should_reset_the_routes_bound_to_it() {
     let mut harness = Harness::new();
@@ -187,8 +179,6 @@ fn removing_a_proxy_should_reset_the_routes_bound_to_it() {
     );
 }
 
-/// A directory change and the selection it invalidates are applied to one candidate, so the
-/// snapshot the settings publish holds the new directory and no selection naming the old one.
 #[test]
 fn a_directory_change_should_clear_the_selection_it_invalidates() {
     let first = tempfile::tempdir().expect("a temporary directory should be created");
@@ -231,8 +221,6 @@ fn a_directory_change_should_clear_the_selection_it_invalidates() {
     );
 }
 
-/// A write that cannot be stored leaves the settings alone and keeps its reason until the page
-/// takes it, once.
 #[test]
 fn a_write_that_cannot_be_stored_should_be_kept_for_the_page_once() {
     let mut harness = Harness::new();
@@ -274,7 +262,6 @@ fn a_write_that_cannot_be_stored_should_be_kept_for_the_page_once() {
     );
 }
 
-/// A change that stores what is stored already is not a write and has no reason to report.
 #[test]
 fn an_unchanged_change_should_be_accepted_without_a_report() {
     let mut harness = Harness::new();
@@ -301,14 +288,10 @@ fn an_unchanged_change_should_be_accepted_without_a_report() {
     );
 }
 
-/// A setter that refuses its value leaves the settings as they are; the user's choice is kept as
-/// the old value and there is nothing to report.
 #[test]
 fn a_change_a_setter_refuses_should_be_accepted_without_a_report() {
     let mut harness = Harness::new();
     harness.update_config(|config| {
-        // A venue this build does not hold a row for is the one shape whose setter writes nothing:
-        // the settings have no place for the value the dialog stands for.
         config.venues.remove(&VenueId::Okx);
     });
     let before = harness.config();

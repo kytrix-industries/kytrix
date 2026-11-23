@@ -1,38 +1,3 @@
-//! What the service and the pane are tested through — GUI-free.
-//!
-//! The venue is faked rather than the service: a fake answers what Hyperliquid would answer, and
-//! every reading the service makes — which routes it read, how often it re-read a timeline,
-//! whether a subscription is still held — is then something a test can assert against the fake's
-//! own record.
-//!
-//! A test session carries the catalog the reads are validated and displayed against, so a test
-//! names the listings a route publishes and gets listings, ticks and asset names from the same
-//! publication. The listings it publishes are Hyperliquid's own: a listing is identified by the
-//! route and the venue's asset index, so a fixture that used another venue's identifiers would
-//! be a catalog this build refuses.
-//!
-//! # The seam is the service's source, not the widget host
-//!
-//! The old toolkit harness lived here too: it installed an application-global connector, a theme
-//! and a Tokio runtime, and drove a pane by sleeping on the wall clock until a predicate held.
-//! None of that survives the frozen widget contract:
-//!
-//! - The service is driven on the test's **own** runtime. [`runtime`] spawns the real
-//!   `WalletService` over a [`TestSource`] on the runtime the test is running, so a
-//!   `#[tokio::test(start_paused = true)]` test owns the paused clock its subject reads;
-//!   [`next_reliable`], [`wait_for_status`], [`until`] and [`latest_reading`] wait by yielding to
-//!   that runtime, never by sleeping.
-//! - The pane is driven through `widget::test_support::WidgetTestApp` in the view's own tests: it
-//!   builds the framework services, the fixture directory and the frame pump, so there is no
-//!   application-global connector or theme to install here. A frame-host test delivers live
-//!   updates by awaiting [`TestSource::publish`] on the runtime the host handed its services, and
-//!   states the effect it wants with the host's own `drain` / `drain_runtime` / `advance`.
-//! - The catalog is a value (`Arc<Catalog>`) rather than an installed global: [`fixture`] publishes
-//!   the fixture routes into it and every builder here reads from it. A test that fakes the
-//!   pane's directory seam hands the same catalog to its own fixture directory.
-//!
-//! Everything below is `#[cfg(test)]`-only (declared by `lib.rs`); production never sees it.
-
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -102,19 +67,11 @@ use super::{
     view::HyperliquidWalletConfig,
 };
 
-/// The venue every test route belongs to.
 pub(super) const VENUE: &str = "hyperliquid";
-/// The scope of the test perpetual route.
-///
-/// The scopes are the market participant's own: the pane asks the registry which routes may be watched,
-/// and a test route under a scope the market participant does not publish is a route no watch may name.
 pub(super) const PERPETUAL_SCOPE: &str = "core-perp";
-/// The scope of the test spot route.
 pub(super) const SPOT_SCOPE: &str = "core-spot";
-/// The token codes every fixture catalog registers, which is what a test reading names.
 const FIXTURE_CODES: &[&str] = &["ETH", "BTC", "HYPE", "SOL", "USDC", "USDT", "USDH"];
 
-/// A test route of the venue.
 pub(super) fn route(scope: &str) -> VenueRoute {
     VenueRoute::new(
         venue(),
@@ -122,25 +79,18 @@ pub(super) fn route(scope: &str) -> VenueRoute {
     )
 }
 
-/// The venue identity every test route belongs to.
 pub(super) fn venue() -> VenueId {
     VenueId::Hyperliquid
 }
 
-/// The test perpetual route.
 pub(super) fn perpetual_route() -> VenueRoute {
     route(PERPETUAL_SCOPE)
 }
 
-/// The test spot route.
 pub(super) fn spot_route() -> VenueRoute {
     route(SPOT_SCOPE)
 }
 
-/// A wallet address from a short, readable suffix, repeated to the address's own length.
-///
-/// The digits are the ones a test wrote, so an address in a fixture is readable as the reading
-/// it stands for rather than as a run of zeroes.
 pub(super) fn address(suffix: &str) -> WalletAddress {
     let repeated = suffix.repeat(40_usize.div_ceil(suffix.len()));
     format!("0x{}", &repeated[..40])
@@ -148,7 +98,6 @@ pub(super) fn address(suffix: &str) -> WalletAddress {
         .expect("a test address should be valid")
 }
 
-/// The canonical identity of a test token the venue issues.
 pub(super) fn token(code: &str) -> AssetId {
     AssetId::CryptoToken(
         CryptoTokenId::new(CryptoTokenOrigin::VenueIssued {
@@ -162,10 +111,6 @@ pub(super) fn token(code: &str) -> AssetId {
     )
 }
 
-/// The venue's own index of one test token.
-///
-/// A code the fixture does not register is not a token this fixture can publish; the shared
-/// fallback index would alias it onto whichever other unregistered code a test used.
 fn token_index(code: &str) -> HyperliquidAssetId {
     let index = FIXTURE_CODES
         .iter()
@@ -174,12 +119,6 @@ fn token_index(code: &str) -> HyperliquidAssetId {
     HyperliquidAssetId(100 + index as u32)
 }
 
-/// The venue's own index of one test spot book.
-///
-/// A spot book is indexed by the pair it trades, not by the two codes run together: the venue
-/// indexes every book it lists, so two books of one base are two indexes. It only has to be
-/// stable within a test, and every test pair is drawn from this table, so the order here is the
-/// fixture's own book numbering.
 const FIXTURE_SPOT_BOOKS: &[(&str, &str)] = &[
     ("HYPE", "USDC"),
     ("HYPE", "USDT"),
@@ -189,11 +128,6 @@ const FIXTURE_SPOT_BOOKS: &[(&str, &str)] = &[
     ("BTC", "USDT"),
 ];
 
-/// The venue's own index of one test spot pair.
-///
-/// A pair the table does not name is not a pair this fixture can publish: answering with a shared
-/// fallback index would silently alias two pairs into one listing, which is exactly the shape that
-/// hid the production defect this fixture exists to guard.
 fn spot_book_index(base: &str, quote: &str) -> HyperliquidAssetId {
     let index = FIXTURE_SPOT_BOOKS
         .iter()
@@ -204,7 +138,6 @@ fn spot_book_index(base: &str, quote: &str) -> HyperliquidAssetId {
     HyperliquidAssetId(200 + index as u32)
 }
 
-/// A perpetual instrument tracking one test token, settled in the venue's stablecoin.
 pub(super) fn perp_instrument(asset: &str) -> Instrument {
     let underlying = market_participants_model::asset::DerivativeUnderlying::new(
         market_participants_model::asset::UnderlyingRef::Asset(token(asset)),
@@ -231,7 +164,6 @@ pub(super) fn perp_instrument(asset: &str) -> Instrument {
     .expect("the test perpetual instrument should be valid")
 }
 
-/// A spot instrument of two test tokens.
 pub(super) fn spot_instrument(base: &str, quote: &str) -> Instrument {
     Instrument::new(InstrumentTerms::Spot(
         SpotTerms::new(token(base), token(quote)).expect("the test spot terms should be valid"),
@@ -239,7 +171,6 @@ pub(super) fn spot_instrument(base: &str, quote: &str) -> Instrument {
     .expect("the test spot instrument should be valid")
 }
 
-/// The canonical price reference of one test asset.
 fn price_reference(asset: &str) -> market_participants_model::reference::PriceReferenceId {
     use market_participants_model::{
         identifier::ReferenceTermsVersion,
@@ -267,7 +198,6 @@ fn price_reference(asset: &str) -> market_participants_model::reference::PriceRe
     .expect("the test price reference should be valid")
 }
 
-/// The listing key of one Hyperliquid listing.
 fn hyperliquid_key(
     route: &VenueRoute,
     product: HyperliquidAssetProduct,
@@ -294,7 +224,6 @@ fn hyperliquid_key(
     .expect("the test continuity key should be valid")
 }
 
-/// The venue's identifiers of one Hyperliquid listing.
 fn hyperliquid_identifiers(route: &VenueRoute, instrument: &Instrument) -> VenueListingIdentifiers {
     match instrument.terms() {
         InstrumentTerms::Spot(terms) => {
@@ -325,7 +254,6 @@ fn hyperliquid_identifiers(route: &VenueRoute, instrument: &Instrument) -> Venue
     }
 }
 
-/// The test token code one test asset was built from.
 fn code_of(asset: &AssetId) -> Option<&'static str> {
     let AssetId::CryptoToken(id) = asset else {
         return None;
@@ -336,17 +264,14 @@ fn code_of(asset: &AssetId) -> Option<&'static str> {
         .find(|code| &CryptoTokenId::of_terms(&test_support::token_terms(VENUE, code)) == id)
 }
 
-/// The listing key of one test perpetual listing.
 pub(super) fn listing_key(route: &VenueRoute, symbol: &str) -> VenueListingKey {
     hyperliquid_key(route, HyperliquidAssetProduct::Perpetual, symbol)
 }
 
-/// The perpetual listing of one test route, as the fixture publishes it.
 pub(super) fn published_perpetual(asset: &str) -> VenueListingKey {
     listing_key(&perpetual_route(), asset)
 }
 
-/// The spot listing of one test route, as the fixture publishes it.
 pub(super) fn published_spot(base: &str, quote: &str) -> VenueListingKey {
     let symbol = format_smolstr!("{base}/{quote}");
     hyperliquid_key(
@@ -356,17 +281,10 @@ pub(super) fn published_spot(base: &str, quote: &str) -> VenueListingKey {
     )
 }
 
-/// The listing key of the spot pair two test assets form.
 pub(super) fn pair_listing(base: &str, quote: &str) -> VenueListingKey {
     published_spot(base, quote)
 }
 
-/// One listing of one test route, as the venue publishes it.
-///
-/// The price rule is quoted in the asset the listing's own terms are quoted in, which is what a
-/// venue's catalog states: a spot pair is quoted in its own quote token, and a perpetual in the
-/// collateral of the DEX that lists it. A fixture that hardcoded one quote asset would make two
-/// pairs of one base look like one market.
 pub(super) fn entry(
     route: &VenueRoute,
     instrument: Instrument,
@@ -484,7 +402,6 @@ pub(super) fn entry(
     }
 }
 
-/// One perpetual listing of the test perpetual route with the ticks a test names.
 pub(super) fn perp_entry(
     route: &VenueRoute,
     asset: &str,
@@ -500,7 +417,6 @@ pub(super) fn perp_entry(
     )
 }
 
-/// One spot listing of the test spot route with the ticks a test names.
 pub(super) fn spot_entry(
     route: &VenueRoute,
     base: &str,
@@ -517,12 +433,6 @@ pub(super) fn spot_entry(
     )
 }
 
-/// A catalog whose routes publish the given listings.
-///
-/// Every route is published in one commit at one generation, which is what the display and the
-/// market-participant registry both read: a test that reports readings about two routes reads one venue's
-/// listings either way, and the route set it installs carries the generation the registry was
-/// built at.
 pub(super) fn fixture(routes: &[(VenueRoute, Vec<CatalogEntry>)]) -> Arc<Catalog> {
     let catalog = Arc::new(Catalog::new());
     let sources: Vec<_> = routes
@@ -538,26 +448,11 @@ pub(super) fn fixture(routes: &[(VenueRoute, Vec<CatalogEntry>)]) -> Arc<Catalog
     let routes_of_update: Vec<VenueRoute> = routes.iter().map(|(route, _)| route.clone()).collect();
     publish_test_routes(&catalog, sources, registrations, &routes_of_update);
     publish_test_terms(&catalog, FIXTURE_CODES);
-    // A display code belongs to the generation that published a listing using the
-    // asset, so the fixture loads every route's listings the way the connection
-    // action does: the names a test asserts are then the codes of a generation that
-    // published something. A test that is already inside a runtime has no thread to
-    // block on, and a route whose entries are only meant to be registered may not be
-    // publishable at all: both leave the terms this fixture staged, which is what
-    // those tests read.
     let loaded: Vec<VenueRoute> = routes.iter().map(|(route, _)| route.clone()).collect();
     load_routes(Arc::clone(&catalog), routes, loaded);
     catalog
 }
 
-/// Publishes every route's listings into one fixture catalog.
-///
-/// The batch goes through the catalog's own publication path, so a fixture
-/// snapshot is the same kind of value a fetch produces, and the terms of every
-/// asset the fixture names travel with it — a canonical identity is a digest of its
-/// terms, so a batch that carried only identities could not be displayed. Nothing
-/// here awaits: a fixture is built from inside the test's own context, which has no
-/// thread to block on.
 fn load_routes(
     catalog: Arc<Catalog>,
     entries: &[(VenueRoute, Vec<CatalogEntry>)],
@@ -574,7 +469,6 @@ fn load_routes(
     }
 }
 
-/// Publishes one candidate set of test routes into a catalog.
 pub(super) fn publish_test_routes(
     catalog: &Catalog,
     sources: Vec<CatalogSourceBinding>,
@@ -589,7 +483,6 @@ pub(super) fn publish_test_routes(
     .expect("the test routes should publish");
 }
 
-/// Publishes the terms of every asset a fixture catalog is read with.
 fn publish_test_terms(catalog: &Catalog, codes: &[&str]) {
     let terms: Vec<AssetTerms> = codes
         .iter()
@@ -598,18 +491,15 @@ fn publish_test_terms(catalog: &Catalog, codes: &[&str]) {
     test_support::install_asset_terms(catalog, &terms);
 }
 
-/// The catalog source id one test route publishes under.
 fn source_id(route: &VenueRoute) -> SmolStr {
     let scope = route.scope.as_str().replace('/', "-");
     format_smolstr!("{VENUE}-{scope}")
 }
 
-/// The display precision of one route's listings.
 pub(super) fn precision_of(route: &VenueRoute, entries: Vec<CatalogEntry>) -> DisplayPrecision {
     precision_for(vec![(route.clone(), entries)])
 }
 
-/// The display precision of several routes' listings.
 pub(super) fn precision_for(routes: Vec<(VenueRoute, Vec<CatalogEntry>)>) -> DisplayPrecision {
     let catalog = fixture(&routes);
     DisplayPrecision::from_catalogs(
@@ -619,13 +509,6 @@ pub(super) fn precision_for(routes: Vec<(VenueRoute, Vec<CatalogEntry>)>) -> Dis
     .expect("the test catalog should be valid")
 }
 
-/// Why one set of catalogs cannot be indexed.
-///
-/// The catalogs are handed to the index exactly as the caller built them, without
-/// publishing them into a catalog first: the refusal under test is the index's own
-/// answer to a catalog whose listing belongs to another route, and the catalog
-/// refuses such a batch before it could ever be published. The refusal is returned
-/// as it is, so the caller asserts on the error rather than on a literal beside it.
 pub(super) fn precision_failure(routes: Vec<(VenueRoute, Vec<CatalogEntry>)>) -> WalletDataError {
     let placeholder = Arc::new(Catalog::new());
     DisplayPrecision::from_catalogs(
@@ -635,7 +518,6 @@ pub(super) fn precision_failure(routes: Vec<(VenueRoute, Vec<CatalogEntry>)>) ->
     .expect_err("the test catalogs should be refused")
 }
 
-/// The catalogs of one set of test routes, as the display indexes them.
 fn catalogs_of(
     routes: Vec<(VenueRoute, Vec<CatalogEntry>)>,
 ) -> Vec<(VenueRoute, Arc<[CatalogEntry]>)> {
@@ -645,7 +527,6 @@ fn catalogs_of(
         .collect()
 }
 
-/// Money without a market behind it.
 pub(super) fn money() -> DisplayPrecision {
     DisplayPrecision::money_only(super::model::AssetLabels::new(
         Catalog::new().cached_display(),
@@ -693,7 +574,6 @@ pub(super) fn position(
     }
 }
 
-/// One signed amount of one test asset.
 pub(super) fn amount_of(asset: &str, value: &str) -> AssetAmount {
     AssetAmount {
         asset: token(asset),
@@ -701,7 +581,6 @@ pub(super) fn amount_of(asset: &str, value: &str) -> AssetAmount {
     }
 }
 
-/// One price of one test asset, quoted in the venue's stablecoin.
 pub(super) fn price_in(quote: &str, value: &str) -> MarketPrice {
     MarketPrice {
         value: value.parse().expect("a price should be valid"),
@@ -767,7 +646,6 @@ pub(super) fn fill(
     }
 }
 
-/// One market price in the venue's stablecoin.
 pub(super) fn market_price(price: &str) -> MarketPrice {
     price_in("USDC", price)
 }
@@ -846,7 +724,6 @@ pub(super) fn historical_order(
     }
 }
 
-/// Which live subscription a test is pushing to.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum SubscriptionKind {
     Fills,
@@ -854,7 +731,6 @@ pub(super) enum SubscriptionKind {
     FastContexts,
 }
 
-/// One live subscription the venue would have opened.
 pub(super) struct FakeSubscription {
     events: mpsc::Receiver<Result<HyperliquidWalletUpdate, AccountError>>,
     drops: Arc<Mutex<usize>>,
@@ -876,7 +752,6 @@ impl WalletSubscription for FakeSubscription {
     }
 }
 
-/// Everything a fake source answers with, and everything it was asked.
 struct FakeState {
     spot: HyperliquidSpotState,
     perpetual: HyperliquidPerpetualState,
@@ -886,14 +761,10 @@ struct FakeState {
     open_orders: Vec<HyperliquidOpenOrder>,
     historical_orders: Vec<HyperliquidHistoricalOrder>,
     fills_by_time: VecDeque<Result<Vec<HyperliquidUserFill>, AccountError>>,
-    /// Every address a wallet read was made for, in the order the reads were made.
     read_addresses: Vec<WalletAddress>,
-    /// The routes whose account state this venue answers with a failure.
     failed_states: AHashSet<VenueRoute>,
-    /// The routes whose catalog this venue answers with a failure.
     failed_catalogs: AHashSet<VenueRoute>,
     counters: Counters,
-    /// Every subscription this fake has opened, by the kind of update it carries.
     subscriptions: AHashMap<
         SubscriptionKind,
         Vec<mpsc::Sender<Result<HyperliquidWalletUpdate, AccountError>>>,
@@ -926,7 +797,6 @@ impl Default for FakeState {
     }
 }
 
-/// What one fake source was asked for.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct Counters {
     pub spot_states: usize,
@@ -937,8 +807,6 @@ pub(super) struct Counters {
     pub ledger: usize,
     pub open_orders: usize,
     pub historical_orders: usize,
-    /// How many route catalogs were read. One route publishes one catalog, so a reading that
-    /// covers N routes reads N of them.
     pub catalogs: usize,
     pub fills_subscriptions: usize,
     pub ledger_subscriptions: usize,
@@ -946,28 +814,23 @@ pub(super) struct Counters {
 }
 
 impl Counters {
-    /// Every wallet subscription this fake opened.
     pub(super) fn subscriptions(&self) -> usize {
         self.fills_subscriptions + self.ledger_subscriptions
     }
 
-    /// Every stream this fake opened, the route-level one included.
     pub(super) fn streams(&self) -> usize {
         self.subscriptions() + self.fast_context_subscriptions
     }
 }
 
-/// The venue, as a test drives it.
 #[derive(Clone)]
 pub(super) struct TestSource {
     catalog: Arc<Catalog>,
-    /// The routes this fake venue publishes, which is what one reading of an address covers.
     routes: Vec<VenueRoute>,
     state: Arc<Mutex<FakeState>>,
 }
 
 impl TestSource {
-    /// A venue whose routes publish the given listings.
     pub(super) fn new(routes: &[(VenueRoute, Vec<CatalogEntry>)]) -> Self {
         let catalog = fixture(routes);
         Self {
@@ -1005,7 +868,6 @@ impl TestSource {
         self
     }
 
-    /// Queues the answer of the next timeline read.
     pub(super) fn push_timeline(
         &self,
         answer: Result<Vec<HyperliquidUserFill>, AccountError>,
@@ -1018,12 +880,10 @@ impl TestSource {
         self.with(|state| state.counters)
     }
 
-    /// The address every wallet read was made for, in the order the reads were made.
     pub(super) fn read_addresses(&self) -> Vec<WalletAddress> {
         self.with(|state| state.read_addresses.clone())
     }
 
-    /// Reads one route's catalog as the catalog failure the route answers with.
     pub(super) fn fail_catalog_of(&self, route: &VenueRoute) -> &Self {
         self.with(|state| {
             state.failed_catalogs.insert(route.clone());
@@ -1031,15 +891,10 @@ impl TestSource {
         self
     }
 
-    /// Records one wallet read.
     fn read_address(&self, address: &WalletAddress) {
         self.with(|state| state.read_addresses.push(address.clone()));
     }
 
-    /// Reads one route's account state as the provider failure the route answers with.
-    ///
-    /// It is what pins the attribution of a reading that covers several partitions: the failure
-    /// belongs to the partition that could not answer, not to the address as a whole.
     pub(super) fn fail_state_of(&self, route: &VenueRoute) -> &Self {
         self.with(|state| {
             state.failed_states.insert(route.clone());
@@ -1047,14 +902,12 @@ impl TestSource {
         self
     }
 
-    /// Pushes one live update to a subscription that is open.
     pub(super) async fn publish(&self, kind: SubscriptionKind, update: HyperliquidWalletUpdate) {
         for sender in self.senders(kind) {
             let _ = sender.send(Ok(update.clone())).await;
         }
     }
 
-    /// Reports a subscription failure, as a refused subscription would.
     pub(super) async fn fail_subscription(&self, kind: SubscriptionKind) {
         for sender in self.senders(kind) {
             let _ = sender
@@ -1063,7 +916,6 @@ impl TestSource {
         }
     }
 
-    /// How many subscriptions have been dropped.
     pub(super) fn subscription_drops(&self) -> usize {
         *self
             .state
@@ -1263,10 +1115,6 @@ impl WalletSource for TestSource {
     }
 }
 
-/// The routes one test session publishes, with the listings every test reading names.
-///
-/// One route publishes a perpetual and the other a spot pair, so a test that reports a reading
-/// about a perpetual position and one about a spot balance uses one venue for both.
 pub(super) fn test_routes() -> Vec<(VenueRoute, Vec<CatalogEntry>)> {
     vec![
         (
@@ -1280,12 +1128,10 @@ pub(super) fn test_routes() -> Vec<(VenueRoute, Vec<CatalogEntry>)> {
     ]
 }
 
-/// The config that follows the given addresses.
 pub(super) fn config(addresses: Vec<WalletAddress>) -> HyperliquidWalletConfig {
     HyperliquidWalletConfig::monitoring(addresses)
 }
 
-/// One overview reading a test can hand to a pane.
 pub(super) fn overview_snapshot(
     spot: HyperliquidSpotState,
     perpetual: HyperliquidPerpetualState,
@@ -1306,7 +1152,6 @@ pub(super) fn overview_snapshot(
     })
 }
 
-/// A timeline reading with no fills.
 pub(super) fn empty_timeline() -> Arc<TimelineSnapshot> {
     Arc::new(TimelineSnapshot {
         window_start: 0,
@@ -1315,7 +1160,6 @@ pub(super) fn empty_timeline() -> Arc<TimelineSnapshot> {
     })
 }
 
-/// A reading of the spot tab.
 pub(super) fn spot_snapshot(
     balances: Vec<HyperliquidSpotBalance>,
     precision: DisplayPrecision,
@@ -1337,31 +1181,26 @@ pub(super) fn spot_snapshot(
     )
 }
 
-/// The messages one stream publishes, as a pane receives them.
 pub(super) fn message(message: WalletStreamMessage) -> Arc<WalletStreamMessage> {
     Arc::new(message)
 }
 
-/// The status one stream reports.
 pub(super) fn status(status: WalletStatus) -> Arc<WalletStreamMessage> {
     Arc::new(WalletStreamMessage::Status(status))
 }
 
-/// A key of the overview of one wallet.
 pub(super) fn overview_key(address: &WalletAddress) -> WalletStreamKey {
     WalletStreamKey::Overview {
         address: address.clone(),
     }
 }
 
-/// A key of the timeline of one wallet.
 pub(super) fn timeline_key(address: &WalletAddress) -> WalletStreamKey {
     WalletStreamKey::Timeline {
         address: address.clone(),
     }
 }
 
-/// A key of one tab of one wallet.
 pub(super) fn detail_key(address: &WalletAddress, tab: super::model::DetailTab) -> WalletStreamKey {
     WalletStreamKey::Detail {
         address: address.clone(),
@@ -1369,13 +1208,6 @@ pub(super) fn detail_key(address: &WalletAddress, tab: super::model::DetailTab) 
     }
 }
 
-/// The handle of the runtime this test runs on.
-///
-/// A test drives its subject on its own runtime rather than on a shared one. The
-/// clock these tests read is the runtime's: `#[tokio::test(start_paused = true)]`
-/// pauses it and `tokio::time::advance` moves it, and both only affect the runtime
-/// whose clock was paused. Work started on another runtime keeps waiting on real
-/// time while the test advances a clock it never reads.
 #[allow(
     clippy::disallowed_methods,
     reason = "a test drives its subject on its own runtime so the paused clock it advances is the one the subject reads"
@@ -1384,7 +1216,6 @@ fn current_test_handle() -> &'static tokio::runtime::Handle {
     Box::leak(Box::new(tokio::runtime::Handle::current()))
 }
 
-/// Runs the widget service until it stops, for a service a test drives end to end.
 pub(super) fn runtime<S>(source: S) -> WidgetRuntime<WalletProtocol>
 where
     S: WalletSource,
@@ -1395,11 +1226,6 @@ where
     )
 }
 
-/// Waits for one reliable message, and returns it.
-///
-/// The wait is counted in yields rather than in wall time: every test here drives a paused
-/// clock, so a stream that has something to say says it on the next turn of the runtime rather
-/// than a second later.
 pub(super) async fn next_reliable(
     stream: &mut ReliableStream<WalletProtocol>,
 ) -> (WalletStreamKey, Arc<WalletStreamMessage>) {
@@ -1416,7 +1242,6 @@ pub(super) async fn next_reliable(
     panic!("a reliable message should arrive");
 }
 
-/// Waits until the reliable stream reports a status for one key.
 pub(super) async fn wait_for_status(
     stream: &mut ReliableStream<WalletProtocol>,
     key: &WalletStreamKey,
@@ -1434,7 +1259,6 @@ pub(super) async fn wait_for_status(
     panic!("the expected status should arrive");
 }
 
-/// Waits until a predicate holds, driving the widget runtime in between.
 pub(super) async fn until(mut predicate: impl FnMut() -> bool) {
     for _ in 0..128 {
         if predicate() {
@@ -1445,7 +1269,6 @@ pub(super) async fn until(mut predicate: impl FnMut() -> bool) {
     assert!(predicate(), "the expected condition should be reached");
 }
 
-/// Waits for the next reading published under one key.
 pub(super) async fn latest_reading(
     latest: &mut LatestStream<WalletProtocol>,
     key: &WalletStreamKey,

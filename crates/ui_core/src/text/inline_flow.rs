@@ -1,8 +1,3 @@
-//! 行内流：`InlineBoxSpec → parley::InlineBox` 与 `(anchor, focus)` 选区的几何映射（§12）。
-//!
-//! Markdown AST → `Vec<InlineFragment>` 的**数据管线不在本阶段**（P15 的消费者还不存在）；
-//! 本模块只把「盒的输入面」和「选区的输出面」钉死。
-
 use parley::{
     Affinity, BoundingBox, InlineBox, InlineBoxKind, VerticalAlign,
     editing::{Cursor, Selection},
@@ -14,10 +9,6 @@ use crate::{
     paint::color::ColorBrush,
 };
 
-/// `InlineBoxSpec` → parley `InlineBox`（逻辑像素 → 物理像素）。
-///
-/// `index` 必须落在 char boundary（parley 的硬要求，`inline_box.rs:14-16`）：非法时吸附到**前一个**
-/// 合法边界并返回诊断（不 panic —— 应用给错偏移不该炸窗口）。
 pub(crate) fn to_inline_box(
     spec: &InlineBoxSpec,
     text: &str,
@@ -33,7 +24,6 @@ pub(crate) fn to_inline_box(
             }),
         )
     };
-    // 逻辑坐标（R12-4）：行内盒尺寸/基线与文本一样用逻辑像素，scale 只在光栅/落点阶段相乘。
     let inline_box = InlineBox {
         id: spec.id,
         kind: InlineBoxKind::InFlow,
@@ -46,7 +36,6 @@ pub(crate) fn to_inline_box(
     (inline_box, diagnostic)
 }
 
-/// 向下取最近的合法字节边界；`index > len` 时取 `len`。
 fn floor_boundary(index: usize, text: &str) -> usize {
     let mut candidate = index.min(text.len());
     while candidate > 0 && !text.is_char_boundary(candidate) {
@@ -55,7 +44,6 @@ fn floor_boundary(index: usize, text: &str) -> usize {
     candidate
 }
 
-/// `InlineAlign` → parley `VerticalAlign`（1:1 的 8 个常量）。
 pub(crate) fn vertical_align(align: InlineAlign) -> VerticalAlign {
     match align {
         InlineAlign::Baseline => VerticalAlign::BASELINE,
@@ -69,9 +57,6 @@ pub(crate) fn vertical_align(align: InlineAlign) -> VerticalAlign {
     }
 }
 
-/// `(anchor, focus)` 字节偏移 → 每行的选区矩形（文本盒局部逻辑像素）。
-///
-/// 用 parley 的 `Selection` 而不是自算：bidi/连字/簇边界只有它知道（§12.5）。
 pub(crate) fn selection_rects(
     layout: &parley::Layout<ColorBrush>,
     anchor: usize,
@@ -90,20 +75,11 @@ pub(crate) fn selection_rects(
         .collect()
 }
 
-/// `byte_index` 处的 caret 矩形（文本盒局部逻辑像素，宽 1 逻辑像素）。
 pub(crate) fn caret_rect(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> Rect {
     let cursor = Cursor::from_byte_index(layout, byte_index, Affinity::Downstream);
     to_rect(cursor.geometry(layout, 1.0))
 }
 
-/// 文本盒局部逻辑坐标 → 最近的**合法字节边界**（[`caret_rect`] 的逆向，E5/§11.5）。
-///
-/// 簇边界 / bidi / 行内盒偏移只有 parley 知道，因此命中统一走 `Cursor::from_point`：
-/// 同一行内水平越界由其收敛到该行首/行尾（半簇取整）。**垂直**越界按规格显式 clamp ——
-/// 文本盒上方 `0`、下方 `text.len()`；盒内取最近行（`line_for_offset` 的行命中）。
-/// 返回索引再做一次 char boundary 收敛（parley 已保证，这里只是契约的兜底）。
-///
-/// `text` 必须与该 `layout` 的源文本是同一份（调用方保证），仅用于 clamp 上界与边界收敛。
 pub(crate) fn byte_index_at(
     layout: &parley::Layout<ColorBrush>,
     text: &str,
@@ -118,7 +94,6 @@ pub(crate) fn byte_index_at(
     floor_boundary(Cursor::from_point(layout, point.x, point.y).index(), text)
 }
 
-/// parley 的 bounding box → 逻辑像素矩形（布局本身已是逻辑坐标，R12-4）。
 fn to_rect(bounds: BoundingBox) -> Rect {
     Rect::new(
         bounds.x0 as f32,
@@ -150,12 +125,10 @@ mod tests {
         }
     }
 
-    /// 直接建一个 parley 布局（不经过 `ShapedText`，避免测试互相依赖）；逻辑坐标（scale = 1）。
     fn layout_of(text: &str) -> parley::Layout<ColorBrush> {
         layout_of_width(text, 400.0)
     }
 
-    /// 指定断行宽度的布局（多行用例需要窄宽度）。
     fn layout_of_width(text: &str, width: f32) -> parley::Layout<ColorBrush> {
         let mut font_cx = parley::FontContext::new();
         let mut layout_cx: parley::LayoutContext<ColorBrush> = parley::LayoutContext::new();
@@ -171,7 +144,6 @@ mod tests {
         layout
     }
 
-    /// `byte_index` 处 caret 几何的中心点（文本盒局部）—— 命中它的返回值必须回到同一索引。
     fn caret_center(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> Point {
         let rect = caret_rect(layout, byte_index);
         Point::new(rect.origin.x + 0.5, rect.origin.y + rect.size.height * 0.5)
@@ -179,7 +151,7 @@ mod tests {
 
     #[test]
     fn floor_boundary_only_returns_char_boundaries() {
-        let text = "a中b"; // 边界：0, 1, 4, 5
+        let text = "a中b";
 
         assert_eq!(floor_boundary(0, text), 0);
         assert_eq!(floor_boundary(1, text), 1);
@@ -274,9 +246,6 @@ mod tests {
         );
     }
 
-    /// R12-4：布局是逻辑坐标 ⇒ 选区几何**不再除以 scale**（旧实现把物理坐标除回逻辑）。
-    ///
-    /// 这里用「同一布局的 caret 位移」做交叉验证：选区右边界必须等于 focus 处的 caret x。
     #[test]
     fn selection_geometry_matches_caret_offsets() {
         let layout = layout_of("abcdef");
@@ -316,7 +285,6 @@ mod tests {
         assert!(rect.size.height > 0.0);
     }
 
-    /// R12-4：caret 宽度恒为 1 **逻辑**像素（布局逻辑化后不再有 `scale` 参数）。
     #[test]
     fn caret_rect_is_one_logical_pixel_wide() {
         let layout = layout_of("abc");
@@ -338,9 +306,6 @@ mod tests {
         assert!(rect.size.height > 0.0, "{rect:?}");
     }
 
-    // ── E5（§11.5）：点 → 字节索引 ─────────────────────────────────────────
-
-    /// 单行 LTR：caret 几何的中心点必须命中回同一个字节索引（行内任意位置）。
     #[test]
     fn byte_index_at_maps_line_points_to_caret_boundaries() {
         let layout = layout_of("abcdef");
@@ -355,7 +320,6 @@ mod tests {
         }
     }
 
-    /// 盒外四方向 clamp：上方 `0`、下方 `len`、同一行内水平越界取行首/行尾。
     #[test]
     fn byte_index_at_clamps_points_outside_the_text_box() {
         let text = "abcdef";
@@ -392,7 +356,6 @@ mod tests {
         );
     }
 
-    /// 多行：每行行首的 caret 中心命中该行首（最近行 = 点所在行）；点在行间取最近行。
     #[test]
     fn byte_index_at_picks_the_line_under_the_point() {
         let text = "alpha beta gamma delta";
@@ -412,7 +375,6 @@ mod tests {
             );
         }
 
-        // 行间点（每行垂直中心 + 行首 x）落在该行的文本范围内。
         for (line_index, line) in layout.lines().enumerate() {
             let metrics = line.metrics();
             let point = Point::new(
@@ -428,7 +390,6 @@ mod tests {
         }
     }
 
-    /// 显式换行：第二行行首的 caret 中心命中换行后的字节（不是换行符前）。
     #[test]
     fn byte_index_at_maps_explicit_line_breaks_to_the_next_line_start() {
         let text = "ab\ncd";
@@ -443,7 +404,6 @@ mod tests {
             second_start,
             "换行后行首 {point:?}"
         );
-        // 第一行的行中点仍落在第一行（不会跳过换行符）。
         let first_line = layout.lines().next().expect("第一行");
         let first_point = Point::new(
             first_line.metrics().inline_min_coord + 0.5,
@@ -452,7 +412,6 @@ mod tests {
         assert!(byte_index_at(&layout, text, first_point) <= 2);
     }
 
-    /// CJK：返回的索引必须是 char boundary，绝不能落进 3 字节字符内部。
     #[test]
     fn byte_index_at_never_splits_cjk_characters() {
         let text = "a中b";
@@ -481,7 +440,6 @@ mod tests {
         }
     }
 
-    /// emoji：多码元字素簇（含 ZWJ 序列）不可被拆开，返回值必须是 char boundary 且落在簇边界。
     #[test]
     fn byte_index_at_never_splits_emoji_grapheme_clusters() {
         let text = "a👨\u{200D}👩\u{200D}👧b";
@@ -513,7 +471,6 @@ mod tests {
         }
     }
 
-    /// 空文本：恒返回 0（盒外也一样，`text.len() == 0`）。
     #[test]
     fn byte_index_at_returns_zero_for_empty_text() {
         let layout = layout_of("");
@@ -527,7 +484,6 @@ mod tests {
         }
     }
 
-    /// 多行：同一行内水平越界必须收敛到**该行**行首/行尾，不得退化为整段 `0`/`len`。
     #[test]
     fn byte_index_at_clamps_horizontally_within_each_wrapped_line() {
         let text = "alpha beta gamma delta";
@@ -554,7 +510,6 @@ mod tests {
             right_hits.push(right);
         }
 
-        // 中间行左右越界必须收敛到该行行首/行尾：若退化成「整段 0/len」，中间行会失守。
         assert!(
             left_hits
                 .iter()
@@ -571,13 +526,6 @@ mod tests {
         );
     }
 
-    // ── bidi 命中（§11.5 测试要求：bidi 文本）─────────────────────────────
-    //
-    // 口径：命中点是 caret 的**精确边界 x**（`caret_rect(..).origin.x`），断言返回值与该点
-    // **共享视觉位置**（某个 affinity 的 caret x 相同）。不能用 `caret.center()`（+0.5px）：
-    // bidi 重排后同一视觉 x 可对应两个逻辑边界，+0.5px 会落进相邻 run，往返本身就无定义。
-
-    /// 指定段落基准方向的布局（bidi 用例需要显式 RTL/LTR 段落方向）。
     fn layout_of_direction(
         text: &str,
         width: f32,
@@ -586,7 +534,6 @@ mod tests {
         layout_of_direction_with_run(text, width, direction, 0..0)
     }
 
-    /// 指定段落方向 + 一个额外 run（字号不同 ⇒ 切成两个 run）的布局。
     fn layout_of_direction_with_run(
         text: &str,
         width: f32,
@@ -611,7 +558,6 @@ mod tests {
         layout
     }
 
-    /// 同一逻辑边界的两个视觉 caret x（bidi 边界上 Downstream/Upstream 可能落在不同 x）。
     fn caret_xs(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> [f32; 2] {
         [parley::Affinity::Downstream, parley::Affinity::Upstream].map(|affinity| {
             parley::editing::Cursor::from_byte_index(layout, byte_index, affinity)
@@ -620,7 +566,6 @@ mod tests {
         })
     }
 
-    /// 点在 caret 的精确边界 x：返回值必须是 char boundary，且与点共享视觉位置。
     fn assert_exact_boundary_hit(
         layout: &parley::Layout<ColorBrush>,
         text: &str,
@@ -641,7 +586,6 @@ mod tests {
         );
     }
 
-    /// 纯 RTL 段落：bidi 重排后逻辑递增的字符视觉 x 递减；每个 caret 精确边界都能命中同一视觉位置。
     #[test]
     fn byte_index_at_handles_a_pure_rtl_paragraph() {
         let text = "אבג abc";
@@ -649,7 +593,6 @@ mod tests {
         assert_eq!(layout.lines().count(), 1, "fixture 必须单行");
         let x = |index: usize| caret_rect(&layout, index).origin.x;
 
-        // 希伯来簇（逻辑 0/2/4）在 RTL 段落里视觉反转：x(0) > x(2) > x(4)。
         assert!(
             x(0) > x(2) + 1.0 && x(2) > x(4) + 1.0,
             "RTL 段落必须视觉反转：x = {:?}",
@@ -662,7 +605,6 @@ mod tests {
             }
         }
 
-        // 段落末尾（视觉最左）的精确边界：命中必须落在末尾附近，而不是逻辑 0。
         let last = caret_rect(&layout, text.len());
         let hit = byte_index_at(
             &layout,
@@ -675,7 +617,6 @@ mod tests {
         );
     }
 
-    /// LTR 段落内的 RTL run：run 内视觉反转，精确边界命中同一视觉位置。
     #[test]
     fn byte_index_at_handles_an_rtl_run_inside_an_ltr_paragraph() {
         let text = "abc אבג xyz";
@@ -683,7 +624,6 @@ mod tests {
         assert_eq!(layout.lines().count(), 1, "fixture 必须单行");
         let x = |index: usize| caret_rect(&layout, index).origin.x;
 
-        // 逻辑 4/6/8 是 RTL run 的簇起点：视觉 x 递减（run 内反转），且整段仍是单行。
         assert!(
             x(4) > x(6) + 1.0 && x(6) > x(8) + 1.0,
             "LTR 段内的 RTL run 必须视觉反转：x = {:?}",
@@ -697,18 +637,15 @@ mod tests {
         }
     }
 
-    /// RTL 跨 run：同一 RTL 段落切成两个 run，视觉顺序仍按 bidi 重排；命中按视觉位置而非 run 顺序。
     #[test]
     fn byte_index_at_handles_rtl_text_across_runs() {
         let text = "אבגדהו";
-        // 两个 run（字号不同）：0..4 与 4..12 都是合法 char boundary。
         let layout = layout_of_direction_with_run(text, 400.0, parley::BaseDirection::Rtl, 0..4);
         assert_eq!(layout.lines().count(), 1, "fixture 必须单行");
         let run_count = layout.lines().next().expect("单行").runs().count();
         assert!(run_count >= 2, "fixture 必须切成多个 run，实际 {run_count}");
         let x = |index: usize| caret_rect(&layout, index).origin.x;
 
-        // RTL 段落：逻辑递增 ⇒ 视觉 x 递减（跨 run 仍然成立）。
         assert!(
             x(0) > x(4) + 1.0 && x(4) > x(8) + 1.0 && x(8) > x(12) + 1.0,
             "跨 run 的 RTL 段落必须视觉反转：x = {:?}",
@@ -721,7 +658,6 @@ mod tests {
             }
         }
 
-        // 视觉右半（逻辑 0..4 的 run）的中间点必须命中该 run 的逻辑区间，而不是另一个 run。
         let y = caret_center(&layout, 0).y;
         let right_mid = Point::new((x(0) + x(4)) * 0.5, y);
         let right_hit = byte_index_at(&layout, text, right_mid);
@@ -729,7 +665,6 @@ mod tests {
             right_hit <= 4,
             "视觉右半必须命中逻辑 0..=4 的 run，实际 {right_hit}"
         );
-        // 视觉左半（逻辑 4..12 的 run）同理。
         let left_mid = Point::new((x(4) + x(12)) * 0.5, y);
         let left_hit = byte_index_at(&layout, text, left_mid);
         assert!(

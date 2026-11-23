@@ -35,40 +35,18 @@ use crate::{
     error::{AuthError, MarketParticipantError},
 };
 
-/// The liveness window of a venue whose protocol does not declare a longer one.
-///
-/// Measured server push cadences: Binance spot and OKX prove liveness every 20 seconds and
-/// the Binance futures endpoints every 3 minutes, so a venue that pushes or pings slower
-/// than this has to say so through [`ConnectionProtocol::with_liveness_timeout`].
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a connection nothing is subscribed to is kept for reuse.
-///
-/// A pane that changes instrument or interval releases one subscription and takes another
-/// within moments, so the connection behind it is kept for a while rather than rebuilt each
-/// time; one that is never subscribed to again is closed instead of sitting in the pool for
-/// the life of the process.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REAUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Extracts a request identifier from a market-participant WebSocket response frame.
 pub type ResponseIdExtractor = fn(&[u8]) -> Option<u64>;
 
-/// A response id extractor for a protocol whose frames carry no response id.
-///
-/// It is the extractor of every fixture connection that is not exercising response
-/// correlation, so the fixtures that build such a protocol share this one.
 #[cfg(test)]
 pub(crate) fn no_response_id(_: &[u8]) -> Option<u64> {
     None
 }
 
-/// Classifies a dial that never became a socket.
-///
-/// A failed upgrade already says which leg broke, and that is the part a widget can
-/// act on — a timeout is worth repeating, a refusal is not, a settings mistake is
-/// neither — so it is carried through instead of flattened into a message. Only the
-/// failures that say nothing beyond themselves stay generic.
 fn connect_failure(endpoint: SmolStr, error: TransportError) -> NetworkError {
     match error {
         TransportError::WebSocketConnect { failure } => {
@@ -80,34 +58,12 @@ fn connect_failure(endpoint: SmolStr, error: TransportError) -> NetworkError {
     }
 }
 
-/// Market-participant-specific behavior used by a physical connection.
 #[derive(Clone)]
 pub struct ConnectionProtocol {
     pub response_id_extractor: ResponseIdExtractor,
-    /// Headers the WebSocket upgrade request has to carry, besides the handshake's own,
-    /// in the canonical form [`ConnectionKey`] compares and every dial materialises.
-    ///
-    /// A venue that routes or identifies its data centre by a request header has to see
-    /// that header on the upgrade itself, not only on its HTTP calls: it is the header
-    /// that decides which gateway the socket is served from, and a header set after the
-    /// handshake cannot change where the socket already is. The headers belong to the
-    /// protocol rather than to one dial because the connection outlives any single
-    /// socket: every reconnect of it is the same connection to the same venue and
-    /// carries what the first dial carried.
-    ///
-    /// They are the one declaration of this connection, not a copy of one: the key reads
-    /// them from here rather than taking a map of its own, so the pool never hands back a
-    /// socket whose key says one gateway while the dial asked for another. Changing them
-    /// changes both, which is why a declaration that follows something the key does not
-    /// otherwise name — a credential, and the region a venue derives from it — is safe to
-    /// keep here.
     pub upgrade_headers: UpgradeHeaders,
-    /// How the venue keeps a connection that stops carrying data open, if it needs to.
     pub keepalive: Option<Keepalive>,
-    /// How long this connection may go without hearing anything before it stops being
-    /// trusted. It has to cover the venue's own push and ping cadence.
     pub liveness_timeout: Duration,
-    /// How long a connection nothing is subscribed to is kept before it is collected.
     pub idle_timeout: Duration,
 }
 
@@ -122,62 +78,25 @@ impl ConnectionProtocol {
         }
     }
 
-    /// Declares the headers this venue's WebSocket upgrade request has to carry.
-    ///
-    /// A protocol with none — every venue that does not route its sockets by a request
-    /// header — dials with the handshake's own headers alone: a declaration starts empty,
-    /// and a venue that makes one makes it in this canonical form rather than as a map the
-    /// key would have to be kept in step with.
-    ///
-    /// This is the production seam the upgrade headers exist for, and it is also what the
-    /// connection key of that connection is built from
-    /// ([`ConnectionKey::for_route`] reads the declaration off this protocol), so a
-    /// caller declares the headers once and both the key and the dial carry that one
-    /// value. The caller this seam was added for is Longbridge's adapter (design §10.4:
-    /// `x-dc-region`, derived from the credentials, required on the upgrade), which is
-    /// also the only venue that declares any; every other venue this build serves dials
-    /// without them.
-    ///
-    /// A declaration is the canonical form, which an adapter that holds its headers as a
-    /// map can read off with [`UpgradeHeaders::from_header_map`] or declare with
-    /// [`ConnectionProtocol::with_upgrade_header_map`].
     pub fn with_upgrade_headers(mut self, headers: UpgradeHeaders) -> Self {
         self.upgrade_headers = headers;
         self
     }
 
-    /// Declares the headers this venue's upgrade request has to carry, as a header map.
-    ///
-    /// This is the shape an adapter has its headers in — a `HeaderMap` is what it also
-    /// puts on its HTTP requests, where the same region header is required — so the
-    /// conversion into the canonical form lives here rather than in the caller, and the
-    /// connection key [`ConnectionKey::for_route`] builds from this protocol carries what
-    /// this map declared. Entries no upgrade request could carry are left out by
-    /// [`UpgradeHeaders::from_header_map`], which is the same rule every other
-    /// declaration is read by; a venue declares the headers it can dial with.
     pub fn with_upgrade_header_map(self, headers: &HeaderMap) -> Self {
         self.with_upgrade_headers(UpgradeHeaders::from_header_map(headers))
     }
 
-    /// Declares the keepalive this venue expects from a connection that goes silent.
     pub const fn with_keepalive(mut self, keepalive: Keepalive) -> Self {
         self.keepalive = Some(keepalive);
         self
     }
 
-    /// Declares how long this venue's connection may stay silent and still be trusted.
-    ///
-    /// A venue that pushes or pings slowly needs a window that covers it: judging a
-    /// connection by a window shorter than its own cadence discards healthy sockets.
     pub const fn with_liveness_timeout(mut self, liveness_timeout: Duration) -> Self {
         self.liveness_timeout = liveness_timeout;
         self
     }
 
-    /// Declares how long a connection nothing is subscribed to is kept for reuse.
-    ///
-    /// Production keeps the default window: how long an unused socket is worth holding is
-    /// the same question for every venue. Tests dial it down to wait it out.
     #[cfg(test)]
     pub const fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
@@ -185,11 +104,6 @@ impl ConnectionProtocol {
     }
 }
 
-/// Payload and acknowledgement contract for a stateful reconnect.
-///
-/// The connection actor owns the socket and therefore waits for the market participant
-/// acknowledgement before changing the state to authenticated.  Adapters only
-/// provide the market-participant-specific matcher.
 pub type ReauthenticationAcknowledgement =
     Arc<dyn Fn(&[u8]) -> Result<Option<()>, MarketParticipantError> + Send + Sync>;
 
@@ -258,39 +172,20 @@ struct ConnectionInner {
     last_heartbeat: Instant,
     liveness_timeout: Duration,
     idle_timeout: Duration,
-    /// When the idle clock was started for this connection: by the release that left nothing
-    /// subscribed to it, for a stateless connection or a retired one, or by the retirement of
-    /// a connection whose subscriptions had already drained. `None` for a connection that is
-    /// subscribed, and for one that never was.
     idle_since: Option<Instant>,
-    /// Whether the pool that dialled this connection has retired it: it is no longer the
-    /// connection its key is answered from, so the pool never hands it out again and the
-    /// subscriptions already bound to it are its only reason to stay open.
     retired: bool,
     io_error: bool,
     reauthentication: Option<Reauthentication>,
-    /// Where inbound frames are published. Taking it away on close is what ends every
-    /// subscription stream sharing this connection.
     events: Option<broadcast::Sender<Bytes>>,
-    /// Why this connection stopped publishing, which its streams report as their last item.
     termination: Option<MarketParticipantError>,
 }
 
-/// A reusable physical connection with request correlation and health tracking.
 pub struct Connection {
     key: ConnectionKey,
     inner: Mutex<ConnectionInner>,
     outbound: Option<mpsc::Sender<PendingRequest>>,
     subscription_outbound: Option<mpsc::UnboundedSender<PendingRequest>>,
     cancellation: CancellationToken,
-    /// Signalled when a retirement starts the idle clock from outside the actor.
-    ///
-    /// Sampling the deadline at the top of a cycle cannot see a start that lands after
-    /// that sample, and a retirement has no command behind it for the actor to wake on, so
-    /// retirement signals this. A release needs no signal of its own: the unsubscribe it
-    /// enqueues under the same lock is what the cycle's select waits on, and the pass after
-    /// the one that carries it to the socket reads the deadlines again. Clearing the clock
-    /// needs no signal either: it travels with the subscription command the actor wakes on.
     idle_wakeup: Notify,
     response_id_extractor: ResponseIdExtractor,
 }
@@ -303,9 +198,6 @@ struct OutboundReceivers {
 struct SocketActorConfig {
     endpoint: Url,
     proxy: ResolvedProxy,
-    /// What every dial this actor makes has to carry, not only the one that opened the
-    /// connection: the venue routes each socket by these. It is the same declaration the
-    /// connection's key was built from, and the actor materialises it per dial.
     upgrade_headers: UpgradeHeaders,
     keepalive: Option<Keepalive>,
     cancellation: CancellationToken,
@@ -359,7 +251,6 @@ impl Connection {
         })
     }
 
-    /// Establishes a WebSocket-backed connection and starts its I/O actor.
     #[cfg(test)]
     pub async fn connect(
         key: ConnectionKey,
@@ -608,7 +499,6 @@ impl Connection {
         Ok(request_id)
     }
 
-    /// Acquires a topic lease and sends the subscription on its first acquisition.
     pub fn subscribe(
         self: &Arc<Self>,
         topic: SubscriptionTopic,
@@ -619,10 +509,6 @@ impl Connection {
         self.subscribe_with_id(id, topic, payload, unsubscribe_payload)
     }
 
-    /// Acquires a topic lease using a caller-selected wire request ID.
-    ///
-    /// Adapters use this when the market participant echoes the subscription ID in its
-    /// acknowledgement. The ID must come from [`Connection::allocate_request_id`].
     pub fn subscribe_with_id(
         self: &Arc<Self>,
         id: u64,
@@ -662,7 +548,6 @@ impl Connection {
                 subscriber_count: 1,
             },
         );
-        // A connection with a subscription is never an idle one, however quiet it is.
         inner.idle_since = None;
         if outbound.send(PendingRequest { id, payload }).is_err() {
             inner.subscriptions.remove(&topic);
@@ -687,29 +572,10 @@ impl Connection {
         let Some(subscription) = inner.subscriptions.remove(topic) else {
             return;
         };
-        // The last subscription is what made this connection worth keeping. A stateless
-        // connection exists for its subscriptions alone, so it starts the idle clock the
-        // actor collects it on; a stateful one carries credentials and is kept for the
-        // requests that use them, and there is one of those per account rather than one per
-        // instrument. A retired one is kept by nobody — the pool that would have asked it
-        // for those requests has replaced it — so its last subscription starts that clock
-        // too.
         let armed = inner.subscriptions.is_empty() && (!inner.state.is_stateful() || inner.retired);
         if armed {
             inner.idle_since = Some(Instant::now());
         }
-        // The unsubscribe is enqueued inside the critical section, which is the only thing
-        // that orders it against a concurrent subscribe of the same topic: sent once the
-        // lock is released, a subscribe that took the lock in between would enqueue its
-        // subscribe first, and the venue would end up unsubscribed while this connection
-        // books the topic as subscribed. An unbounded send never waits, so holding the lock
-        // across it is free.
-        //
-        // Enqueuing it is also what wakes the actor for the clock started above: the command
-        // is a branch of the cycle's select, so a parked actor is woken by it, and the pass
-        // after the one that carries it to the socket reads the deadlines again. A
-        // retirement has no command behind it, which is why that path signals the idle
-        // wake-up and this one does not.
         if !inner.closed
             && let Some(outbound) = &self.subscription_outbound
         {
@@ -736,11 +602,6 @@ impl Connection {
             .collect()
     }
 
-    /// The frames this connection publishes, ending with the reason it stopped.
-    ///
-    /// The stream outlives the socket: a reconnect keeps publishing into the same channel,
-    /// and a connection that is taken down ends every stream by closing it and reporting
-    /// why. A subscription that only ever saw frames would otherwise wait forever.
     pub fn event_stream(
         self: &Arc<Self>,
     ) -> impl futures::Stream<Item = Result<Bytes, MarketParticipantError>> + Send + 'static {
@@ -769,8 +630,6 @@ impl Connection {
                             state.receiver = Some(receiver);
                             return Some((Ok(payload), state));
                         }
-                        // A subscription that fell behind loses the frames it missed rather
-                        // than the stream, exactly as it did while the connection published.
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => {
                             state.finished = true;
@@ -782,7 +641,6 @@ impl Connection {
         )
     }
 
-    /// Publishes one inbound frame to every subscription sharing this connection.
     pub fn publish(&self, payload: Bytes) {
         let inner = self.inner.lock();
         if let Some(events) = inner.events.as_ref() {
@@ -790,7 +648,6 @@ impl Connection {
         }
     }
 
-    /// Why this connection stopped publishing, for the streams that outlive it.
     fn termination(&self) -> MarketParticipantError {
         self.inner
             .lock()
@@ -799,10 +656,6 @@ impl Connection {
             .unwrap_or(MarketParticipantError::ServiceClosed)
     }
 
-    /// When this connection became idle, if nothing is subscribed to it.
-    ///
-    /// A connection that has never carried a subscription is not idle: it is kept for the
-    /// requests it serves, and those are what the pool holds it for.
     fn idle_deadline(&self) -> Option<Instant> {
         let inner = self.inner.lock();
         inner
@@ -814,16 +667,6 @@ impl Connection {
         !self.inner.lock().subscriptions.is_empty()
     }
 
-    /// Retires this connection from the pool that dialled it.
-    ///
-    /// The pool retires a connection it replaced while it still had subscribers: the
-    /// streams bound to it outlive the dial that lost it, so it stays open and keeps
-    /// publishing, but it is out of the pool and the key it was dialled under is answered
-    /// by the new dial from here on. That is what makes its own subscriptions its only
-    /// reason to stay open, so the last one draining starts the idle clock the actor
-    /// collects it on — whatever its state — instead of the connection being kept for
-    /// requests a connection out of the pool is no longer asked for. A connection whose
-    /// subscriptions have already drained is idle from here on rather than kept.
     pub(crate) fn retire(&self) {
         let mut inner = self.inner.lock();
         inner.retired = true;
@@ -832,9 +675,6 @@ impl Connection {
             inner.idle_since = Some(Instant::now());
         }
         drop(inner);
-        // A connection retired with nothing subscribed to it arms the clock from a task
-        // other than the actor's, while the actor may be parked in a cycle that sampled it
-        // unarmed; the signal is what brings that cycle back around to read it.
         if armed {
             self.idle_wakeup.notify_one();
         }
@@ -883,8 +723,6 @@ impl Connection {
         inner.termination = Some(error.clone());
         let pending = std::mem::take(&mut inner.pending);
         inner.subscriptions.clear();
-        // Taking the publisher away closes the broadcast channel, which is how every
-        // subscription sharing this connection learns that no further frame will come.
         let events = inner.events.take();
         self.cancellation.cancel();
         drop(inner);
@@ -899,14 +737,8 @@ impl Connection {
     }
 }
 
-/// The state of one subscription's stream.
-///
-/// A subscription reads a connection that outlives the socket it publishes from, so closing
-/// the channel is not enough on its own to end the stream: it also has to say what closed
-/// it, which a stream ending with a bare `None` cannot.
 struct ConnectionEvents {
     connection: Arc<Connection>,
-    /// `None` once the connection has stopped publishing, which ends the stream.
     receiver: Option<broadcast::Receiver<Bytes>>,
     finished: bool,
 }
@@ -970,8 +802,6 @@ async fn run_socket_actor(
         {
             Ok(next_socket) => {
                 socket = next_socket;
-                // A fresh socket has its own silence window, and nothing has been asked
-                // of it yet.
                 heartbeat = Heartbeat::start(keepalive);
                 connection.mark_heartbeat();
                 backoff.reset();
@@ -1077,8 +907,6 @@ async fn run_reauthentication(
                         account: connection.key.account.as_ref().map(|account| account.as_str().into()),
                         source: AuthError::ServiceClosed,
                     }),
-                    // An inbound ping is the venue saying the connection is alive, so it
-                    // counts as a heartbeat even though it carries no data.
                     OpCode::Ping => connection.mark_heartbeat(),
                     OpCode::Continuation => {}
                 }
@@ -1087,11 +915,6 @@ async fn run_reauthentication(
     }
 }
 
-/// Runs one socket until it fails, the caller stops it, or nothing is subscribed to it.
-///
-/// Returns whether the connection is worth re-establishing. A cycle that ends because the
-/// connection was closed — by its absent subscribers, or by a cancelled actor — returns
-/// `false`, which is what keeps the actor from rebuilding a socket nobody wants.
 async fn run_socket_cycle(
     connection: &Arc<Connection>,
     socket: &mut RawWebSocket,
@@ -1101,37 +924,20 @@ async fn run_socket_cycle(
     heartbeat: &mut Heartbeat,
 ) -> bool {
     loop {
-        // The idle clock can be started from another task, and a deadline read cannot see a
-        // start that lands after it. A release is carried by the command it enqueues, but a
-        // retirement has none, so it signals the `Notify` waited on below: a `Notify` with no
-        // waiter stores its permit rather than dropping the wake-up, so a start that lands
-        // between this line and the idle read below fires here, and the pass that follows
-        // reads the deadlines again.
         let idle_armed = connection.idle_wakeup.notified();
         let keepalive_due = heartbeat.deadline();
         let idle_due = connection.idle_deadline();
         tokio::select! {
             biased;
             () = cancellation.cancelled() => return false,
-            // A `Notify` nobody is waiting on stores a permit rather than losing the
-            // wake-up, so an arm that landed before this future was polled still fires, and
-            // a `Notified` that loses the race to another branch hands the permit on rather
-            // than swallowing it. A permit buys one more pass, which re-reads the deadlines
-            // before it can park, so the branch cannot spin on its own.
             () = idle_armed => continue,
-            // A connection nothing is subscribed to any more is closed instead of sitting
-            // in the pool until the process ends.
             () = wait_for_deadline(idle_due) => {
-                // A subscription that arrived while this timer ran is what the connection
-                // is for, so it is not idle after all.
                 if connection.has_subscriptions() {
                     continue;
                 }
                 connection.close();
                 return false;
             }
-            // A venue that closes a silent connection is kept open by one message; a venue
-            // that needs none waits here for as long as the connection lives.
             () = wait_for_deadline(keepalive_due) => {
                 if let Some(message) = heartbeat.message()
                     && socket.send(Frame::text(message)).await.is_err()
@@ -1162,9 +968,6 @@ async fn run_socket_cycle(
                     OpCode::Text | OpCode::Binary => {
                         let payload = frame.payload().clone();
                         connection.mark_heartbeat();
-                        // The venue's answer to a keepalive is liveness rather than
-                        // subscription data, so it stops here instead of being published
-                        // to every subscription sharing this connection.
                         if heartbeat.on_inbound(&payload) {
                             continue;
                         }
@@ -1174,8 +977,6 @@ async fn run_socket_cycle(
                             connection.publish(payload);
                         }
                     }
-                    // An inbound ping is the venue saying the connection is alive, so it
-                    // counts as a heartbeat even though it carries no data.
                     OpCode::Ping => connection.mark_heartbeat(),
                     OpCode::Pong => connection.mark_heartbeat(),
                     OpCode::Close => return true,
@@ -1186,7 +987,6 @@ async fn run_socket_cycle(
     }
 }
 
-/// Waits for a deadline; a connection with nothing due waits forever.
 async fn wait_for_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
@@ -1226,10 +1026,6 @@ mod tests {
     };
     use crate::error::MarketParticipantError;
 
-    /// The protocol of a fixture connection that declares no upgrade headers.
-    ///
-    /// A fixture key is built from the protocol its dial would use, so this is what a
-    /// fixture names instead of an empty map.
     fn protocol() -> ConnectionProtocol {
         ConnectionProtocol::new(no_response_id)
     }
@@ -1563,14 +1359,6 @@ mod tests {
         drop(switched_widget);
     }
 
-    /// A connection retired once its subscriptions have already drained is idle rather than
-    /// kept.
-    ///
-    /// The pool chooses between retiring and closing on a check the last lease of the
-    /// connection can drain under, so this is the other side of that window, and the side
-    /// no release reaches: a stateful connection that stayed kept from here on is a socket
-    /// whose key is answered by another dial, with its actor and its listen-key refresh
-    /// running for the rest of the process.
     #[test]
     fn retiring_a_connection_whose_last_subscription_already_drained_starts_its_idle_clock() {
         let (sender, _receiver) = mpsc::channel::<PendingRequest>(1);

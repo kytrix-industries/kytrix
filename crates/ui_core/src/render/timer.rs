@@ -1,22 +1,12 @@
-//! 分段时间（数值语义）。
-//!
-//! P08 有生产者的段只有 `Upload` / `Gpu` / `Present`；`Build`/`Layout`/`Shape`/`Paint` 属
-//! P09 的 App 级计时，届时 additive 追加。
-
 use crate::window::FrameIndex;
 
-/// 有生产者的一段。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Section {
-    /// 实例/裁剪/图集上传的 CPU 时间。
     Upload,
-    /// GPU 执行时间（timestamp query）。
     Gpu,
-    /// `Present1` 的 CPU 时间。
     Present,
 }
 
-/// 一段的采样；`gpu_ns` 只在 [`Section::Gpu`] 上有值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GpuTimerSample {
     pub section: Section,
@@ -24,7 +14,6 @@ pub(crate) struct GpuTimerSample {
     pub gpu_ns: u64,
 }
 
-/// 一帧的采样集合（容量复用；与 `FrameIndex` 对齐）。
 pub(crate) struct FrameTimings {
     frame: FrameIndex,
     samples: Vec<GpuTimerSample>,
@@ -38,7 +27,6 @@ impl FrameTimings {
         }
     }
 
-    /// 帧初重置（保留容量）。
     pub(crate) fn reset(&mut self, frame: FrameIndex) {
         self.frame = frame;
         self.samples.clear();
@@ -56,7 +44,6 @@ impl FrameTimings {
         self.frame
     }
 
-    /// 某一分段的本帧采样（P17 HUD）。同段最多一条，顺序由后端写入。
     #[cfg(feature = "hud")]
     pub(crate) fn sample(&self, section: Section) -> Option<GpuTimerSample> {
         self.samples

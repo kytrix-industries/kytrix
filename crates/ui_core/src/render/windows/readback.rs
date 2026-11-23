@@ -1,8 +1,3 @@
-//! offscreen → readback heap → CPU。
-//!
-//! 只在 test / `test-support` 构建里存在（像素快照是 L3 的测试面；发布物不带读回路径）。
-//! 读回的字节是**资源格式** `B8G8R8A8_UNORM` 里已编码好的 sRGB 值（DEVIATIONS F-80）。
-
 use windows::Win32::Graphics::{
     Direct3D12::*,
     Dxgi::Common::{
@@ -18,14 +13,12 @@ use crate::{
     },
 };
 
-/// 一次读回的 RGBA8 图像（BGRA→RGBA 已交换；alpha 是预乘值）。
 pub(crate) struct ReadbackImage {
     pub width: u32,
     pub height: u32,
     pub rgba8: Vec<u8>,
 }
 
-/// 读回缓冲（按 surface 尺寸复用）。
 pub(crate) struct Readback {
     buffer: Option<ID3D12Resource>,
     size: (u32, u32),
@@ -43,7 +36,6 @@ impl Readback {
         }
     }
 
-    /// 把 `source`（持久 offscreen，状态 `RENDER_TARGET`）读回 CPU。
     pub(crate) fn capture(
         &mut self,
         shared: &SharedGpu,
@@ -62,9 +54,6 @@ impl Readback {
         )
     }
 
-    /// 指定源资源的出入状态（图集等非 RT 资源用）。
-    ///
-    /// `layer` 是 texture array 的子资源层号（mip 0；非数组纹理传 0）。
     pub(crate) fn capture_from(
         &mut self,
         shared: &SharedGpu,
@@ -106,12 +95,9 @@ impl Readback {
                 pResource: core::mem::ManuallyDrop::new(Some(source.clone())),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    // texture array 的 mip0 子资源下标 = 层号（MipLevels = 1）。
                     SubresourceIndex: u32::from(layer),
                 },
             };
-            // 显式给源盒：源资源可能比要读回的矩形大（窗口路径的持久目标按桶尺寸分配，
-            // 内容只是左上角的子矩形），`pSrcBox = NULL` 会把整块源塞进更小的 footprint。
             let region = D3D12_BOX {
                 left: 0,
                 top: 0,
@@ -120,12 +106,9 @@ impl Readback {
                 bottom: size.1,
                 back: 1,
             };
-            // SAFETY: footprint 由 `GetCopyableFootprints` 计算，源纹理处于 COPY_SOURCE，
-            // 源盒在源资源内且与 footprint 同尺寸。
             unsafe {
                 list.CopyTextureRegion(&destination, 0, 0, 0, &source_location, Some(&region))
             };
-            // SAFETY: `pResource` 是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（DEVIATIONS F-86）。
             unsafe {
                 core::mem::ManuallyDrop::drop(&mut destination.pResource);
                 core::mem::ManuallyDrop::drop(&mut source_location.pResource);
@@ -135,7 +118,6 @@ impl Readback {
         })?;
 
         let mut pointer: *mut core::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: 映射区间由 `Map` 独占，直到同一函数的 `Unmap`；容量由该槽缓冲的创建尺寸保证。
         unsafe { buffer.Map(0, None, Some(&mut pointer)) }
             .map_err(|error| init_error_from("Map(readback)", error))?;
         let mut rgba8 = Vec::with_capacity((size.0 * size.1 * 4) as usize);
@@ -143,7 +125,6 @@ impl Readback {
             format,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM
         );
-        // SAFETY: buffer 容量 = row_pitch * height，读取范围在映射区内。
         unsafe {
             for y in 0..size.1 {
                 let row = pointer.cast::<u8>().add((y * row_pitch) as usize);
@@ -165,7 +146,6 @@ impl Readback {
                 }
             }
         }
-        // SAFETY: `Unmap` 与同一函数的 `Map` 成对，映射期间无并发访问。
         unsafe { buffer.Unmap(0, None) };
         Ok(ReadbackImage {
             width: size.0,
@@ -199,7 +179,6 @@ impl Readback {
         let mut rows = 0u32;
         let mut row_size = 0u64;
         let mut total = 0u64;
-        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             shared.raw().GetCopyableFootprints(
                 &desc,
@@ -235,7 +214,6 @@ impl Readback {
             VisibleNodeMask: 1,
         };
         let mut out: Option<ID3D12Resource> = None;
-        // SAFETY: COM 调用：设备 / 工厂 / swapchain 句柄有效，参数与输出指针在调用期间存活，失败按 HRESULT 处理。
         unsafe {
             shared.raw().CreateCommittedResource(
                 &heap,
@@ -275,9 +253,7 @@ fn transition(
             }),
         },
     };
-    // SAFETY: `barrier` 在本次调用期间独占；`slice::from_ref` 不转移所有权。
     unsafe { list.ResourceBarrier(core::slice::from_ref(&barrier)) };
-    // SAFETY: union 载荷与 `pResource` 都是 `ManuallyDrop`，结构体 drop 不释放 COM 引用（F-86）。
     unsafe {
         let transition: &mut D3D12_RESOURCE_TRANSITION_BARRIER = &mut barrier.Anonymous.Transition;
         core::mem::ManuallyDrop::drop(&mut transition.pResource);

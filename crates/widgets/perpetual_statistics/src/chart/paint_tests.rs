@@ -1,5 +1,3 @@
-//! What a chart prepares for one frame, and the line mesh it registers.
-
 use market_participants_model::{
     decimal::{Quantity, Ratio},
     listing::rules::ListingPrecision,
@@ -297,7 +295,6 @@ fn the_line_mesh_should_cover_every_segment_and_joint() {
     ];
     let desc = line_geometry_mesh(&points.map(Some), 2.0).expect("three points make a mesh");
 
-    // Two segments and three joints, four vertices and six indices each.
     assert_eq!(desc.vertex_bytes.len(), 5 * 4 * 12);
     assert_eq!(desc.index_bytes.len(), 5 * 6 * 4);
     assert!(desc.bounds.size.width > 20.0);
@@ -442,8 +439,6 @@ fn a_tooltip_entry_should_name_the_series_colour_it_is_read_in() {
 
 #[test]
 fn a_listing_precision_is_not_needed_to_prepare_a_frame() {
-    // Preparing reads the scales and the points, never the instrument metadata: the
-    // metadata only decides how the labels are written in the first place.
     let metadata = ListingPrecision {
         price_tick: "0.01".parse().expect("a price tick parses"),
         quantity_tick: "0.001".parse().expect("a quantity tick parses"),

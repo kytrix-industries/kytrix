@@ -1,25 +1,3 @@
-//! 最终合成负载验收 harness：命令行入口（只做参数解析与模式分发）。
-//!
-//! 四个模式（三平台同一份二进制）：
-//!
-//! ```text
-//! cargo run --release -p ui_core --example acceptance -- cpu          # 无窗口 CPU 测量（生产特性）
-//! cargo run --release -p ui_core --example acceptance -- window       # 真实窗口帧率/抖动（+UI 线程 CPU）
-//! cargo run --release -p ui_core --example acceptance -- idle         # 真实窗口空闲 60 s 的进程 CPU
-//! cargo run --release -p ui_core --features test-support \
-//!     --example acceptance -- interaction                             # GUI 端到端冒烟（交互闭环）
-//! ```
-//!
-//! 口径边界（写进报告）：
-//! - **CPU 测量必须用默认特性构建**：`--features test-support` 会在每帧采集 `FrameRecord`
-//!   （遍历 scene/tree），本 harness 检测到该特性时会打印警告，且只把 `FrameRecord` 计数当证据；
-//! - `cpu` 模式是 headless（`renderer = None`）：编码在 UI 线程内联完成，因此测的是
-//!   「样式 + 文本 + 布局 + 绘制 + 实例编码」的**完整 CPU 成本**，不受窗口前台化 / 组合器影响；
-//! - `window` / `idle` 模式必须真机真窗口：帧间隔由平台帧时钟给出（vsync 节拍）；
-//! - `interaction` 模式反过来：**必须** `--features test-support`，且 headless（真实输入分发 +
-//!   离屏 GPU 读回），无显示服务器也能跑 —— 交互正确性的断言在
-//!   `ui_core::test_support::gui_smoke`（同样的套件也由 `tests/gui_smoke.rs` 在 CI 里跑）。
-
 mod headless;
 mod interaction;
 mod report;
@@ -28,33 +6,19 @@ mod windowed;
 
 use std::process::ExitCode;
 
-/// 命令行参数（默认值 = 报告里使用的那一套）。
 pub struct Config {
-    /// 增量帧测量帧数（默认 250，对应「300 帧里 250 帧增量」）。
     pub incremental_frames: usize,
-    /// 预热帧数（增量帧，不计入统计；默认 50）。
     pub warmup_frames: usize,
-    /// 「1000 单元文本同时更新」帧数（默认 30）。
     pub text_frames: usize,
-    /// 只平移折线窗口的帧数（默认 30）。
     pub pan_frames: usize,
-    /// 只滚动成交列表的帧数（默认 30）。
     pub scroll_frames: usize,
-    /// 空闲帧数（默认 10；必须全部退化为 `Idle`）。
     pub idle_frames: usize,
-    /// 真实窗口模式的测量时长（秒，默认 20）。
     pub window_seconds: f64,
-    /// 真实窗口模式的数据泵目标频率（Hz，默认 60；`120` 用来验证 120 Hz 节拍能力）。
     pub hz: u32,
-    /// 真实窗口模式的预热时长（秒，默认 3）。
     pub window_warmup_seconds: f64,
-    /// 空闲 CPU 的采样时长（秒，默认 60）。
     pub idle_seconds: u64,
-    /// 空闲 CPU 的预热时长（秒，默认 3；首帧的 a11y 补发等收尾工作不算空闲）。
     pub idle_warmup_seconds: u64,
-    /// 打开引擎内置 Debug HUD（仅 `--features hud` 构建有效）。
     pub hud: bool,
-    /// 打印逐帧原始样本（`raw,<scenario>,<micros>`；供外部复核分位数）。
     pub raw: bool,
 }
 
@@ -78,7 +42,6 @@ impl Default for Config {
     }
 }
 
-/// 用法。
 const USAGE: &str = "\
 usage: acceptance [cpu|breakdown|window|idle|interaction] [options]
 
@@ -121,7 +84,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// 解析参数并跑对应模式；返回 `true` = 全部指标达标。
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut mode = String::from("cpu");
@@ -183,7 +145,6 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     }
 }
 
-/// 字符串错误 → `Box<dyn Error>`（显式类型，避免 `.into()` 的多候选歧义）。
 fn failure(message: String) -> Box<dyn std::error::Error> {
     Box::<dyn std::error::Error>::from(message)
 }

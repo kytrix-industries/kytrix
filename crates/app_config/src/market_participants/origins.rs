@@ -1,51 +1,9 @@
-//! The origins every venue this build speaks is reached on.
-//!
-//! An origin is a fact of the market participant rather than something a user types: the
-//! operator *chooses* one of the addresses the venue publishes, and this module is
-//! the table those choices come from. Each choice is a variant of a closed enum, so
-//! the stored value and the address it stands for are one list — a settings page
-//! draws exactly the variants its venue declares, and a value outside them is a
-//! configuration file this build refuses rather than a host nobody vetted.
-//!
-//! The addresses are transcribed from the venues' own API documentation:
-//!
-//! * Binance spot: `https://api.binance.com` beside the `api1`–`api4` mirrors, and
-//!   the streams `wss://stream.binance.com:9443` and `wss://stream.binance.com:443`.
-//! * Binance USDⓈ-M futures: `https://fapi.binance.com` and
-//!   `wss://fstream.binance.com`.
-//! * OKX: one host per service region — global, US & Australia, and the EEA.
-//! * Longbridge: one site per service region — the international site beside the
-//!   mainland-China one — for requests and for the quote stream.
-//! * Hyperliquid: one host for requests and one for streams.
-//!
-//! OKX and Longbridge state their origins per region rather than per API product, so their
-//! tables are keyed by [`OkxRegion`] and [`LongbridgeRegion`], and every scope of either venue
-//! is reached through the region the operator selected. Hyperliquid states exactly one address
-//! of each kind, so its table holds one variant each: the choice exists because the setting
-//! does, and it is a choice with one answer.
-//!
-//! # Where an address resolves
-//!
-//! A choice *is* its published address, and a value can only be built from one of the
-//! tables here, so a host this build does not publish is not a value it can hold. A
-//! test is the one caller that has to reach a *fixture* instead, and no published
-//! address names a loopback socket. `crate::market_participants::fixture` is that seam: it
-//! replaces where a published address resolves, never what it is called, so a
-//! settings file written from a fixture is still a file this build decodes. The seam
-//! exists only when the `test-support` feature is on, which in this workspace no crate but a
-//! test's dev-dependency edge enables.
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use smol_str::SmolStr;
 use url::Url;
 
 use crate::market_participants::credentials::BinanceCredentialMarket;
 
-/// The origin pair of one scope of one venue.
-///
-/// Both origins are required: a venue whose transport is one host for both requests
-/// and subscriptions names it twice, so no request path has to decide what an absent
-/// origin means.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginPair {
     #[serde(rename = "http")]
@@ -54,67 +12,35 @@ pub struct OriginPair {
     pub websocket: Url,
 }
 
-/// One secondary HTTP service of a venue, with an optional stream address.
-///
-/// A venue that serves one product from more than one host states the host it
-/// primarily dials as its [`OriginPair`] and the additional service here. The
-/// stream is optional because a metadata service usually publishes no stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceOrigin {
     pub http: Url,
     pub websocket: Option<Url>,
 }
 
-/// Every endpoint one scope of one venue is reached on.
-///
-/// The primary pair is the transport the venue's market data is read from; the
-/// metadata service is the second host some venues publish their event directory
-/// on. A venue with one host answers `metadata: None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VenueEndpoints {
     pub primary: OriginPair,
     pub metadata: Option<ServiceOrigin>,
 }
 
-/// The address one choice of an origin table resolves at.
-///
-/// The value is the address as the venue publishes it, and it is the only shape a choice
-/// has: the tables below are the sole constructors, so a host this build does not publish is
-/// not a value that exists. What a settings file holds is a *choice*, which serializes as
-/// that same published address — never a variant name, and never a fixture's socket.
-///
-/// A test that has to reach a *fixture* instead does not change this value: it binds the
-/// address to a socket of its own on the settings it builds — see
-/// `crate::market_participants::fixture` — so the choice keeps the spelling this build stores and the
-/// configuration carries where a request dials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OriginRef(&'static str);
 
 impl OriginRef {
-    /// Declares one published address.
     pub(crate) const fn published(published: &'static str) -> Self {
         Self(published)
     }
 
-    /// Returns the address as the venue publishes it.
     pub const fn as_str(&self) -> &'static str {
         self.0
     }
 }
 
-/// Parses one published address.
-///
-/// Every address the tables below state is a URL this build dials, so a value that is not one
-/// is a table this build cannot read rather than anything a caller can cause.
 pub(crate) fn published_url(origin: &OriginRef) -> Url {
     Url::parse(origin.as_str()).expect("a published origin is a URL")
 }
 
-/// Decodes one choice from the address a file stores.
-///
-/// An address no table publishes is refused rather than decoded into the nearest
-/// match: the choices are the venue's own, and a file that names a host nobody
-/// documented is not a file this build knows how to reach.
 fn deserialize_origin<'de, D>(
     deserializer: D,
     published: &'static [&'static str],
@@ -134,18 +60,6 @@ where
         })
 }
 
-/// Declares one closed set of published origins.
-///
-/// The variants, the spellings a file stores and the parser are one statement: an address
-/// added to the set is a variant, and a file naming an address the set does not hold is
-/// refused.
-///
-/// A table's variants are not all one scope's: Binance's two markets are reached on hosts of
-/// their own, so those tables hold both and each market narrows them with `for_market`. What
-/// that means for a default is that a table spanning two markets has none — the default of a
-/// market's own enum is the market's own host, and stating it once for the whole table would
-/// answer the *other* market's address to whichever one asked. A table that is one scope's, or
-/// that has one variant, declares its `default` beside the variants.
 macro_rules! published_origins {
     ($(#[$meta:meta])* $name:ident { $($variant:ident => $origin:literal),+ $(,)? }) => {
         published_origins! {
@@ -171,17 +85,14 @@ macro_rules! published_origins {
         }
 
         impl $name {
-            /// Every address this table offers, in the order it is drawn.
             pub const ALL: &'static [Self] = &[$(Self::$variant),+];
 
-            /// Returns the address as the venue publishes it.
             pub const fn as_str(&self) -> &'static str {
                 match self {
                     $(Self::$variant => $origin),+
                 }
             }
 
-            /// Returns the choice that publishes `address`, or nothing when none does.
             pub fn from_url(address: &str) -> Option<Self> {
                 Self::ALL
                     .iter()
@@ -215,13 +126,6 @@ macro_rules! published_origins {
 }
 
 published_origins! {
-    /// One HTTP address the Binance spot API answers on.
-    ///
-    /// The venue publishes `api.binance.com` first and four mirrors beside it. They
-    /// serve the same API — the mirrors exist so a client can spread its request
-    /// weight and survive one host being slow — so the choice is which host this
-    /// installation addresses, and the venue's USDⓈ-M futures API has one host of
-    /// its own.
     BinanceHttpOrigin {
         Api => "https://api.binance.com",
         Api1 => "https://api1.binance.com",
@@ -233,7 +137,6 @@ published_origins! {
 }
 
 impl BinanceHttpOrigin {
-    /// The addresses one market's requests may be sent to.
     pub const fn for_market(market: BinanceMarket) -> &'static [Self] {
         match market {
             BinanceMarket::Spot => &[Self::Api, Self::Api1, Self::Api2, Self::Api3, Self::Api4],
@@ -243,11 +146,6 @@ impl BinanceHttpOrigin {
 }
 
 published_origins! {
-    /// One WebSocket address the Binance spot API streams on.
-    ///
-    /// The venue publishes the stream on two ports of one host — `9443` and the
-    /// `443` a network that blocks the first still carries — and its USDⓈ-M futures
-    /// streams on a host of their own.
     BinanceWebsocketOrigin {
         Stream => "wss://stream.binance.com:9443",
         StreamAlt => "wss://stream.binance.com:443",
@@ -256,7 +154,6 @@ published_origins! {
 }
 
 impl BinanceWebsocketOrigin {
-    /// The addresses one market's streams may be opened on.
     pub const fn for_market(market: BinanceMarket) -> &'static [Self] {
         match market {
             BinanceMarket::Spot => &[Self::Stream, Self::StreamAlt],
@@ -265,38 +162,17 @@ impl BinanceWebsocketOrigin {
     }
 }
 
-/// The service region an OKX account belongs to.
-///
-/// OKX publishes one API per region and refuses the others, so the region is what decides
-/// where the venue is reached: a global account answers on `openapi.okx.com` and streams on
-/// `ws.okx.com`, a US or Australian account — the one registered on the venue's US
-/// application — answers on `us.okx.com` and streams on `wsus.okx.com`, and an EEA account
-/// answers on `eea.okx.com` and streams on `wseea.okx.com`. Every scope of the venue moves
-/// with the region: the venue serves spot and swap from the one host it publishes there.
-///
-/// The stream addresses are written the way the venue's own reference writes them, with no
-/// port: OKX answers its v5 streams on the default TLS port, and the `:8443` a client
-/// integration often carries is a second port it also accepts rather than the one its
-/// documentation publishes.
-///
-/// A region is one choice with two addresses, because the venue publishes them together and
-/// the operator picks the region they registered in rather than a host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OkxRegion {
-    /// The international API.
     #[default]
     Global,
-    /// The United States and Australia API.
     UnitedStatesAustralia,
-    /// The European Economic Area API.
     Europe,
 }
 
 impl OkxRegion {
-    /// Every region this table offers, in the order it is drawn.
     pub const ALL: &'static [Self] = &[Self::Global, Self::UnitedStatesAustralia, Self::Europe];
 
-    /// Returns the stored spelling of this region.
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Global => "global",
@@ -305,7 +181,6 @@ impl OkxRegion {
         }
     }
 
-    /// Returns the request address the venue publishes for this region.
     pub const fn http_str(&self) -> &'static str {
         match self {
             Self::Global => "https://openapi.okx.com",
@@ -314,7 +189,6 @@ impl OkxRegion {
         }
     }
 
-    /// Returns the stream address the venue publishes for this region.
     pub const fn websocket_str(&self) -> &'static str {
         match self {
             Self::Global => "wss://ws.okx.com",
@@ -323,11 +197,6 @@ impl OkxRegion {
         }
     }
 
-    /// Returns the origin pair this region is reached on.
-    ///
-    /// Every scope of the venue is reached through it: OKX publishes its regions rather than
-    /// its API products, so the venue's spot and swap scopes differ in nothing but the request
-    /// path.
     pub fn origins(&self) -> OriginPair {
         OriginPair {
             http: published_url(&OriginRef::published(self.http_str())),
@@ -364,38 +233,16 @@ impl<'de> Deserialize<'de> for OkxRegion {
     }
 }
 
-/// The service region a Longbridge account belongs to.
-///
-/// Longbridge publishes one site per region and refuses the other, so the region is what
-/// decides where the venue is reached: an account on the international site answers on
-/// `openapi.longbridge.com` and streams on `openapi-quote.longbridge.com/v2`, and an account on
-/// the mainland-China site answers on `openapi.longbridge.cn` and streams on
-/// `openapi-quote.longbridge.cn/v2`. Every scope of the venue moves with the region: the venue
-/// serves its one scope from the site it publishes there.
-///
-/// The stream address is written with the whole path the venue serves its quote stream under,
-/// `…/v2`, rather than as a host a request path appends to: the path is part of the published
-/// address, and the venue names no stream outside it.
-///
-/// A region is one choice with two addresses, because the venue publishes them together and
-/// the operator picks the site their account was opened on rather than a host. Choosing the
-/// two roles apart would let an installation state a pair the venue never publishes — the
-/// request role of one region beside the stream role of another — which is why there is one
-/// choice here rather than two.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LongbridgeRegion {
-    /// The international site.
     #[default]
     Global,
-    /// The mainland-China site.
     China,
 }
 
 impl LongbridgeRegion {
-    /// Every region this table offers, in the order it is drawn.
     pub const ALL: &'static [Self] = &[Self::Global, Self::China];
 
-    /// Returns the stored spelling of this region.
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Global => "global",
@@ -403,7 +250,6 @@ impl LongbridgeRegion {
         }
     }
 
-    /// Returns the request address the venue publishes for this region.
     pub const fn http_str(&self) -> &'static str {
         match self {
             Self::Global => "https://openapi.longbridge.com",
@@ -411,7 +257,6 @@ impl LongbridgeRegion {
         }
     }
 
-    /// Returns the stream address the venue publishes for this region.
     pub const fn websocket_str(&self) -> &'static str {
         match self {
             Self::Global => "wss://openapi-quote.longbridge.com/v2",
@@ -419,10 +264,6 @@ impl LongbridgeRegion {
         }
     }
 
-    /// Returns the origin pair this region is reached on.
-    ///
-    /// Every scope of the venue is reached through it: the venue publishes its regions rather
-    /// than its API products, so its one scope differs in nothing but the request path.
     pub fn origins(&self) -> OriginPair {
         OriginPair {
             http: published_url(&OriginRef::published(self.http_str())),
@@ -460,66 +301,44 @@ impl<'de> Deserialize<'de> for LongbridgeRegion {
 }
 
 published_origins! {
-    /// One HTTP address the Polymarket Gamma event directory answers on.
     PolymarketGammaOrigin: Api {
         Api => "https://gamma-api.polymarket.com",
     }
 }
 
 published_origins! {
-    /// One HTTP address the Polymarket CLOB answers on.
     PolymarketClobOrigin: Api {
         Api => "https://clob.polymarket.com",
     }
 }
 
 published_origins! {
-    /// One WebSocket address the Polymarket CLOB streams on.
     PolymarketWebsocketOrigin: Api {
         Api => "wss://ws-subscriptions-clob.polymarket.com",
     }
 }
 
 published_origins! {
-    /// One HTTP address Hyperliquid answers on.
-    ///
-    /// Hyperliquid publishes exactly one production host for requests, so the page offers the
-    /// one address `https://api.hyperliquid.xyz/` and this build reaches nothing else.
     HyperliquidHttpOrigin: Api {
         Api => "https://api.hyperliquid.xyz/",
     }
 }
 
 published_origins! {
-    /// One WebSocket address Hyperliquid streams on.
-    ///
-    /// Hyperliquid publishes exactly one production host for streams, so the page offers the one
-    /// address `wss://api.hyperliquid.xyz/ws` and this build opens streams on nothing else.
-    ///
-    /// The stream address is the whole address rather than the host it belongs to: the venue
-    /// serves its streams under a path of their own, so `wss://api.hyperliquid.xyz/` — the host
-    /// without that path — is not an address it answers on. Every other venue in this table
-    /// publishes a stream *host* whose path the request path appends, which is why this is the
-    /// one entry that carries a path.
     HyperliquidWebsocketOrigin: Api {
         Api => "wss://api.hyperliquid.xyz/ws",
     }
 }
 
-/// The API product a Binance market serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BinanceMarket {
-    /// The spot API.
     Spot,
-    /// The USDⓈ-margined futures API.
     UsdMPerp,
 }
 
 impl BinanceMarket {
-    /// Every Binance market this build speaks, in the order its page draws them.
     pub const ALL: [Self; 2] = [Self::Spot, Self::UsdMPerp];
 
-    /// Returns the canonical name of the scope this market is routed by.
     pub const fn scope(self) -> &'static str {
         match self {
             Self::Spot => "spot",
@@ -527,7 +346,6 @@ impl BinanceMarket {
         }
     }
 
-    /// Returns the credential set this market signs with.
     pub const fn credential_market(self) -> BinanceCredentialMarket {
         match self {
             Self::Spot => BinanceCredentialMarket::Spot,
@@ -535,11 +353,6 @@ impl BinanceMarket {
         }
     }
 
-    /// Returns the HTTP address this market's requests are sent to while the operator
-    /// chooses none.
-    ///
-    /// The table spans both markets, so a market's own address is stated here rather than
-    /// as a default on the table: one `Default` for both would answer the sibling's host.
     pub const fn http(self) -> BinanceHttpOrigin {
         match self {
             Self::Spot => BinanceHttpOrigin::Api,
@@ -547,8 +360,6 @@ impl BinanceMarket {
         }
     }
 
-    /// Returns the WebSocket address this market's streams are opened on while the operator
-    /// chooses none.
     pub const fn websocket(self) -> BinanceWebsocketOrigin {
         match self {
             Self::Spot => BinanceWebsocketOrigin::Stream,
@@ -562,10 +373,6 @@ mod tests {
     use super::*;
     use crate::market_participants::settings::BinanceOrigins;
 
-    /// Every market reaches the addresses its own API publishes, and no market borrows its
-    /// sibling's: a Binance spot request sent to the futures API is a request to the wrong
-    /// product, and that is what the per-market narrowing in the decoder and the page exists to
-    /// prevent.
     #[test]
     fn every_binance_market_is_reached_on_its_own_hosts() {
         for market in BinanceMarket::ALL {
@@ -605,8 +412,6 @@ mod tests {
         );
     }
 
-    /// The addresses one market is reached on, as the settings resolve them for a market that
-    /// is configured exactly as a fresh installation configures it.
     fn market_address(market: BinanceMarket) -> OriginPair {
         BinanceOrigins {
             http: market.http(),
@@ -615,8 +420,6 @@ mod tests {
         .addresses()
     }
 
-    /// The two Binance markets reach disjoint hosts, and the mirrors of the spot API are all
-    /// offered: an address a market may be reached on is one of that market's own choices.
     #[test]
     fn binance_markets_offer_disjoint_hosts() {
         let spot: Vec<&str> = BinanceHttpOrigin::for_market(BinanceMarket::Spot)
@@ -655,8 +458,6 @@ mod tests {
         );
     }
 
-    /// Every region of OKX answers a host of its own, one per role, and no two regions share
-    /// one.
     #[test]
     fn every_okx_region_answers_its_own_hosts() {
         let mut hosts: Vec<&str> = Vec::with_capacity(OkxRegion::ALL.len());
@@ -687,8 +488,6 @@ mod tests {
         );
     }
 
-    /// Every region of Longbridge answers a site of its own, one per role, and no two regions
-    /// share one.
     #[test]
     fn every_longbridge_region_answers_its_own_hosts() {
         let mut hosts: Vec<&str> = Vec::with_capacity(LongbridgeRegion::ALL.len());
@@ -731,8 +530,6 @@ mod tests {
         );
     }
 
-    /// Hyperliquid offers exactly one address of each kind, and it is the one the venue
-    /// publishes.
     #[test]
     fn hyperliquid_offers_one_address_of_each_kind() {
         assert_eq!(HyperliquidHttpOrigin::ALL.len(), 1);
@@ -747,8 +544,6 @@ mod tests {
         );
     }
 
-    /// A stored choice decodes back to the variant it was written from, and an address this
-    /// build does not publish is refused.
     #[test]
     fn a_published_origin_round_trips_and_an_unpublished_one_is_refused() {
         for origin in BinanceHttpOrigin::ALL {
@@ -804,8 +599,6 @@ mod tests {
         );
     }
 
-    /// A choice is looked up by the address it publishes, and an address no table states names
-    /// no choice.
     #[test]
     fn a_choice_is_found_by_the_address_it_publishes() {
         for origin in BinanceHttpOrigin::ALL {
@@ -824,8 +617,6 @@ mod tests {
         );
     }
 
-    /// The origin pair is one scope's two addresses, under the names the request path reads them
-    /// by.
     #[test]
     fn an_origin_pair_stores_both_members() {
         let pair = market_address(BinanceMarket::Spot);

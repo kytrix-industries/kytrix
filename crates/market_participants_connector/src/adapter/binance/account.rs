@@ -24,14 +24,9 @@ use crate::{
 };
 
 pub(super) const RECV_WINDOW_MS: u64 = 5_000;
-/// The largest history page the venue serves in one answer.
 const HISTORY_PAGE_LIMIT: u16 = 1_000;
 const MAX_HISTORY_LIMIT: u16 = 10_000;
 
-/// Keeps one account's listen key alive for as long as its connection lives.
-///
-/// The key belongs to one route, so every control call reports that route when it
-/// fails instead of collapsing it into the venue.
 pub(super) fn spawn_listen_key_refresh(
     manager: super::ListenKeyManager,
     client: reqwest::Client,
@@ -122,12 +117,6 @@ struct PerpetualBalance {
     available_balance: SmolStr,
 }
 
-/// Decodes one balance answer of `product`.
-///
-/// The venue names an asset by its own code, and the code is what this adapter
-/// turns into a canonical asset before anything else sees the balance: the code
-/// is the only form in which the venue ever names it, so resolving it anywhere
-/// else would mean keeping a second table of what a code means.
 pub(crate) fn decode_balances(
     product: BinanceProduct,
     body: &[u8],
@@ -933,10 +922,6 @@ struct AlgoOrderEvent {
     update_time: WireId,
 }
 
-/// Decodes one private-stream payload into the events a subscriber asked for.
-///
-/// `filter` is the listing the subscription named, when it named one: an order
-/// of another listing of the same account is not an event of that subscription.
 pub(super) fn decode_private_events(
     payload: &[u8],
     route: &market_participants_model::listing::route::VenueRoute,
@@ -1102,10 +1087,6 @@ fn decode_event_order(
         .collect())
 }
 
-/// The query parameters of one history page of one listing.
-///
-/// The venue serves at most [`HISTORY_PAGE_LIMIT`] rows per answer, so the window
-/// is paged by that bound and the caller truncates to its own limit.
 pub(super) fn history_parameters(
     symbol: &NativeSymbol,
     query: &crate::market_participants::model::AuthenticatedQuery,
@@ -1246,8 +1227,6 @@ mod tests {
         assert_eq!(request_count.load(Ordering::Relaxed), 1);
     }
 
-    /// A signed request without a configured account is refused before it reaches
-    /// the network, and it says which route failed.
     #[tokio::test]
     async fn signed_request_rejects_missing_account_identity_with_typed_authentication_error() {
         let adapter = BinanceAdapter::new();

@@ -1,11 +1,3 @@
-//! The fake source the service's and the pane's tests answer through.
-//!
-//! It is shared rather than copied because both halves of the widget test the same
-//! seam: the loop's tests drive the answers it gives, and the pane's tests count the
-//! reads it was asked for. A source that runs out of plans never answers again, so a
-//! test that expects an absence can tell "the read never happened" from "the answer
-//! went somewhere else" by the count.
-
 use std::{
     collections::VecDeque,
     future::pending,
@@ -24,13 +16,10 @@ use crate::{
     service::{CalendarFetchError, CalendarSource},
 };
 
-/// The account every fixture pane is scoped to.
 pub(crate) const ACCOUNT: &str = "test-account";
 
-/// The instant the fixtures were collected at.
 pub(crate) const COLLECTED_AT: i64 = 1_790_000_000_000;
 
-/// The instant of `day` October 2026 at `hour` UTC, in Unix milliseconds.
 pub(crate) fn at(day: u8, hour: u8) -> i64 {
     Date::from_calendar_date(2026, Month::October, day)
         .expect("a day of October 2026")
@@ -41,7 +30,6 @@ pub(crate) fn at(day: u8, hour: u8) -> i64 {
         * 1_000
 }
 
-/// One event of a fixture answer, due at `at` — a clock, even at midnight.
 pub(crate) fn proto_event(
     at: i64,
     country: &str,
@@ -75,7 +63,6 @@ pub(crate) fn proto_event(
     }
 }
 
-/// One answer of `events` events, one an hour from 09:00 UTC on the fixture day.
 pub(crate) fn snapshot(events: usize) -> Arc<CalendarSnapshot> {
     let events = (0..events)
         .map(|index| {
@@ -91,9 +78,6 @@ pub(crate) fn snapshot(events: usize) -> Arc<CalendarSnapshot> {
     read(events)
 }
 
-/// The answer whose day boundary moves with the display zone: two events, the first
-/// late in the UTC day and the second early in the next one, which are one day eight
-/// hours east of UTC.
 pub(crate) fn boundary_snapshot() -> Arc<CalendarSnapshot> {
     read(vec![
         proto_event(at(25, 23), "US", "late", Importance::High, Some("SEP")),
@@ -101,8 +85,6 @@ pub(crate) fn boundary_snapshot() -> Arc<CalendarSnapshot> {
     ])
 }
 
-/// Reads a fixture answer through the production path, so a fixture is as valid as
-/// the data a service sends.
 fn read(events: Vec<proto_types::FinancialCalendarEvent>) -> Arc<CalendarSnapshot> {
     Arc::new(
         CalendarSnapshot::parse(proto_types::FinancialCalendar {
@@ -113,14 +95,10 @@ fn read(events: Vec<proto_types::FinancialCalendarEvent>) -> Arc<CalendarSnapsho
     )
 }
 
-/// How the fake answers one read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FetchPlan {
-    /// Answers with an answer of this many events.
     Snapshot(usize),
-    /// Answers with a service failure.
     Failure,
-    /// Never answers, so the read stays in flight.
     Pending,
 }
 
@@ -148,7 +126,6 @@ impl FakeSource {
         }
     }
 
-    /// Takes the next plan, counting the read as started.
     fn begin(&self) -> (FetchPlan, FetchGuard) {
         let plan = self
             .state
@@ -169,17 +146,14 @@ impl FakeSource {
         )
     }
 
-    /// How many reads were started.
     pub(crate) fn fetch_count(&self) -> usize {
         self.state.calls.load(Ordering::Acquire)
     }
 
-    /// How many reads have not answered yet.
     pub(crate) fn in_flight(&self) -> usize {
         self.state.in_flight.load(Ordering::Acquire)
     }
 
-    /// How many reads were dropped before they answered.
     pub(crate) fn cancelled_fetches(&self) -> usize {
         self.state.cancelled_fetches.load(Ordering::Acquire)
     }
@@ -201,7 +175,6 @@ impl CalendarSource for FakeSource {
     }
 }
 
-/// Counts the read it belongs to as in flight until it answers or is dropped.
 struct FetchGuard {
     state: Arc<FakeSourceState>,
     completed: bool,

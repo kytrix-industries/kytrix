@@ -16,15 +16,7 @@ use crate::account_profile::AccountProfile;
 pub(super) struct SessionControl {
     revision: AtomicU64,
     epoch: AtomicU64,
-    /// Whether the credential on this machine has been discarded by a sign-out.
-    ///
-    /// A refresh that was already in flight when the user signed out still holds the
-    /// token it loaded, so it would otherwise write a rotated credential back after the
-    /// sign-out deleted the old one — signing the user back in on the next start. While
-    /// this is set, nothing may persist a credential; the next login is what clears it.
     discarded: AtomicBool,
-    /// Wakes the work a sign-out interrupts, so a command that is waiting for the
-    /// authority stops waiting for an answer it can no longer commit.
     signed_out: Notify,
     changes: watch::Sender<SessionChange>,
 }
@@ -40,26 +32,15 @@ impl SessionControl {
         }
     }
 
-    /// Records that the local credential is gone, and refuses every later write.
     pub(super) fn mark_credential_discarded(&self) {
         self.discarded.store(true, Ordering::Release);
         self.signed_out.notify_waiters();
     }
 
-    /// Lets the login that has just finished persist the credential it carries.
-    ///
-    /// A sign-out refuses every write the session it ended would make, so that a refresh
-    /// still in flight cannot put the record back. A login is not that session: it is the
-    /// user asking for a new one, and the actor serves one command at a time, so nothing
-    /// of the signed-out session can still be running here.
     pub(super) fn begin_new_session(&self) {
         self.discarded.store(false, Ordering::Release);
     }
 
-    /// Waits for the sign-out that ends the session an in-flight command belongs to.
-    ///
-    /// A sign-out runs on the caller while a command is already waiting for the authority;
-    /// this is what lets that command stop waiting for an answer it can no longer commit.
     pub(super) async fn wait_for_sign_out(&self) {
         loop {
             let notified = self.signed_out.notified();
@@ -70,10 +51,6 @@ impl SessionControl {
         }
     }
 
-    /// Refuses a credential the session is no longer entitled to persist.
-    ///
-    /// A sign-out sets this until the next login clears it: a credential that was removed
-    /// by the user is not one the session it was removed from may put back.
     pub(super) fn credential_is_current(&self) -> Result<(), AuthError> {
         if self.discarded.load(Ordering::Acquire) {
             Err(AuthError::SessionClosed)
@@ -97,12 +74,6 @@ impl SessionControl {
         self.changes.send_replace(change);
     }
 
-    /// Says the session is over because its credential was signed out and removed.
-    ///
-    /// The availability published is the one every watcher already treats as a sign-out,
-    /// so nothing has to learn a second way of being told. A sequence that has already run
-    /// out is left as it is: its change is the last thing watchers are ever told, and a
-    /// sign-out cannot make a session identity available again.
     pub(super) fn publish_discard(&self) {
         if self.changes.borrow().is_exhausted() {
             return;
@@ -112,11 +83,6 @@ impl SessionControl {
         }
     }
 
-    /// Retires the session behind a credential that was signed out.
-    ///
-    /// The sign-out itself runs on the caller and cannot touch this state, so the actor
-    /// gives up on it here — before any command is served with a session whose credential
-    /// the user has already removed.
     pub(super) fn retire_discarded_session(
         &self,
         current_session: &mut SessionState,
@@ -371,9 +337,6 @@ pub(super) async fn refresh_with_replay_barrier(
     store_refresh_outcome_unknown(store, control)?;
     let refreshed = tokio::select! {
         biased;
-        // The sign-out removed the record this refresh belongs to while the request was
-        // out: there is nothing left to commit the answer to, so the wait ends here rather
-        // than holding the session until a response it cannot use comes back.
         () = control.wait_for_sign_out() => return Err(AuthError::SessionClosed),
         result = authority.refresh(user_id, refresh_token, key) => result,
     };
@@ -590,9 +553,6 @@ pub(super) async fn install_session(
         .checked_add(response.expires_in)
         .ok_or(AuthError::InvalidResponse)?;
     let (revision, credential_epoch, change) = allocate_session_identity(current_session, control)?;
-    // The login the caller just completed is the user asking for a session again: the
-    // record it carries is a new one, not the one a sign-out refused to let anything
-    // write back.
     control.begin_new_session();
     store_credential(
         store,
@@ -1003,9 +963,6 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
-    /// A refresh the authority refuses is what retires the record, and the tombstone it
-    /// leaves is what every owner after it reads: none of them asks the authority again,
-    /// and only a login that completes replaces it.
     #[tokio::test]
     async fn invalid_grant_tombstone_survives_owner_rebuild_and_failed_install() {
         let key = DpopKey::from_signing_key(SigningKey::generate());
@@ -1050,8 +1007,6 @@ mod tests {
         ));
         drop(session_a);
 
-        // The next owner reads the tombstone and refuses the record without asking the
-        // authority anything, whatever the caller asks for.
         let authority_b = Arc::new(FakeRefreshAuthority::new());
         let (session_b, changes_b) =
             test_session_with_authority(store.clone(), 0, 0, authority_b.clone());
@@ -1068,8 +1023,6 @@ mod tests {
         assert!(authority_b.calls().is_empty());
         assert!(!changes_b.has_changed().unwrap());
 
-        // A login that cannot be persisted leaves the tombstone in place: the session it
-        // would carry never happened, so nothing may serve it.
         store.fail_next_store();
         assert!(matches!(
             session_b
@@ -1172,9 +1125,6 @@ mod tests {
         assert!(!changes_b.has_changed().unwrap());
     }
 
-    /// The tombstone is what records that a rejected refresh retired the session. A store
-    /// that refuses it cannot make the session that could not be retired usable again: the
-    /// owner gives up the credential rather than serving one it can no longer vouch for.
     #[tokio::test]
     async fn a_rejected_refresh_that_cannot_be_recorded_is_still_refused_a_credential() {
         let key = DpopKey::from_signing_key(SigningKey::generate());
@@ -1185,9 +1135,6 @@ mod tests {
         ))));
         let authority = Arc::new(FakeRefreshAuthority::new());
         authority.fail_next(AuthError::InvalidGrant);
-        // The refresh writes its replay barrier before the authority is asked, and that
-        // write is the one thing a rejection does not replace: it is the tombstone the
-        // store refuses here.
         store.fail_next_store();
         let (session, mut changes) =
             test_session_with_authority(store.clone(), 0, 0, authority.clone());
@@ -1218,8 +1165,6 @@ mod tests {
         assert_eq!(store.stores.load(Ordering::Acquire), 2);
         drop(session);
 
-        // What the store kept is the barrier, so the next start gives up on the record by
-        // itself instead of replaying a token the authority has already refused.
         let replacement_authority = Arc::new(FakeRefreshAuthority::new());
         let (replacement, mut replacement_changes) =
             test_session_with_authority(store.clone(), 0, 0, replacement_authority.clone());
@@ -1348,9 +1293,6 @@ mod tests {
         assert_eq!(authority.calls().len(), 1);
     }
 
-    /// A stale access token costs a rotation, and a rotation writes its replay barrier
-    /// before it asks the authority: until that write lands there is nothing submitted and
-    /// nothing published, and once it does the command commits what it was waiting for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expired_rotation_persists_barrier_before_authority_submission() {
         let store = Arc::new(StallingCredentialStore::new(None));
@@ -1429,7 +1371,6 @@ mod tests {
             session.profile(TEST_USER_ID).await,
             Err(AuthError::InvalidCredential)
         ));
-        // Nothing has been said to the authority yet: the report is the caller's to send.
         assert!(authority.revocations().is_empty());
 
         let revocation = discarded
@@ -1477,9 +1418,6 @@ mod tests {
         ));
     }
 
-    /// A store that refuses both the removal and the record that replaces it is the one
-    /// case a sign-out cannot finish: what is left there still grants access, and the
-    /// report says so instead of calling the machine clean.
     #[tokio::test]
     async fn a_sign_out_a_store_refuses_reports_the_credential_it_left_behind() {
         let store = Arc::new(StallingCredentialStore::new(None));
@@ -1506,8 +1444,6 @@ mod tests {
         );
         assert_eq!(store.deletes.load(Ordering::Acquire), 1);
         assert_eq!(stored_active_credential(&store).1, "refresh-1");
-        // The session is over here whatever the store kept of it: what survived is not
-        // something this process will serve again.
         assert_eq!(
             changes.borrow_and_update().availability(),
             SessionAvailability::Unavailable
@@ -1522,10 +1458,6 @@ mod tests {
         ));
     }
 
-    /// A sign-out can land while a rotation is already inside the store, and the record
-    /// then arrives after the removal. It belongs to the session the user signed out of —
-    /// the token in it is the rotated one, which is what the next start would sign back in
-    /// with — so the operation that wrote it takes it away again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rotation_that_lands_after_a_sign_out_is_taken_back() {
         let store = Arc::new(StallingCredentialStore::new(None));
@@ -1544,8 +1476,6 @@ mod tests {
             )
             .await
             .expect("the active session should install");
-        // The rotation commit is the write that stalls: the barrier is written and the
-        // authority has answered by then, so the store is about to take a rotated token.
         store.stall_next_store();
         let session = Arc::new(session);
         let request_session = session.clone();
@@ -1627,8 +1557,6 @@ mod tests {
             session.profile(TEST_USER_ID).await,
             Err(AuthError::InvalidCredential)
         ));
-        // The record was removed rather than tombstoned: there is nothing left for a
-        // later start to turn back into a session.
         assert!(store.load().is_err());
         assert!(server.requests.try_recv().is_err());
 
@@ -2075,13 +2003,6 @@ mod tests {
         );
     }
 
-    /// A sign-out that lands while a refresh is waiting for the authority is the case the
-    /// credential store is most at risk from: that refresh loaded its own copy of the
-    /// token and would write the rotated one back the moment it came home.
-    ///
-    /// The store it writes through is the real one, so the sign-out is taken once the
-    /// refresh has stopped touching it and is waiting on the authority: what the two can
-    /// still contend over is the record, which is exactly what this asserts about.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_sign_out_during_a_refresh_leaves_no_credential_to_write_back() {
         let key = DpopKey::from_signing_key(SigningKey::generate());
@@ -2116,9 +2037,6 @@ mod tests {
             SessionAvailability::Unavailable
         );
 
-        // The refresh was holding a token that no longer belongs to anything: the command
-        // it was serving is refused instead of waiting for it, and the request it had out
-        // goes with it rather than holding the session until an unusable answer arrives.
         assert!(matches!(
             refresh
                 .await
@@ -2166,8 +2084,6 @@ mod tests {
         let discarded = session.discard_local_session();
 
         assert!(discarded.removed());
-        // A session that was never loaded still knows which token it holds: the credential
-        // is where the token is, and the sign-out reads it rather than asking the actor.
         let revocation = discarded
             .into_revocation()
             .expect("the stored credential still held a token");
@@ -2181,9 +2097,6 @@ mod tests {
             session.profile(TEST_USER_ID).await,
             Err(AuthError::InvalidCredential)
         ));
-        // Nothing was asked of the authority, and no identity was allocated for a
-        // session that never existed: the only change is the credential's removal and
-        // the change that says the session is unavailable.
         assert!(authority.calls().is_empty());
         assert_eq!(control.revision.load(Ordering::Acquire), 0);
         assert_eq!(control.epoch.load(Ordering::Acquire), 2);

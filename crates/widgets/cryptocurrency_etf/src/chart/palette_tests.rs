@@ -1,6 +1,3 @@
-//! The two style-derived decisions a frame makes: the colour a reading is drawn in,
-//! and the geometry a tooltip is drawn at.
-
 use base_ui::theme::{
     appearance::Appearance, components::ComponentTokens, resolved::Theme, role::Role,
 };

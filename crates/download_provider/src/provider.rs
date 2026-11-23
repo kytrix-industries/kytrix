@@ -1,21 +1,3 @@
-//! The download manager: the tasks it owns, the states they settle in, and the
-//! events that publish them.
-//!
-//! A task is one transfer, started on the application runtime and reported back to
-//! this value from two runtime tasks — one publishing the progress it writes once an
-//! interval, one for the outcome. Pausing cancels the attempt and settles at the
-//! partial file once it has stopped; deleting cancels it too, and only removes the
-//! files once both tasks have finished.
-//!
-//! # Engine shape (P4-5)
-//!
-//! The manager is a plain value, not a toolkit entity: it holds its state behind a
-//! lock and hands every change to one injected sink ([`DownloadProvider::subscribe`]),
-//! because the engine has no entity system and the composition root is what knows how
-//! to wake the interface (the updater's inbox, the settings page's signal). The work
-//! itself runs on the application runtime the composition root passes in, and the
-//! only other collaborator is the transport the transfers route through.
-
 use std::{
     io,
     path::Path,
@@ -42,98 +24,53 @@ use crate::{
     task::{DownloadEvent, DownloadId, DownloadStatus, DownloadTask},
 };
 
-/// How often a transfer's progress is published.
 pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
-/// How long a delete waits for the cancelled attempt to settle.
 const ATTEMPT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a delete waits for its file removal to finish.
 const FILE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What the download manager needs from the composition root.
 pub struct DownloadProviderDeps {
-    /// The application's transport: the routes, the clients and the operation barrier.
     pub transport: Arc<TransportHub>,
-    /// The application runtime every transfer runs on.
     pub runtime: Handle,
 }
 
-/// One download as the manager holds it.
 struct Entry {
-    /// What the caller asked for; every attempt is started from this.
     request: DownloadRequest,
-    /// What observers currently see.
     status: DownloadStatus,
-    /// The entity validator a resume is conditional on, shared with the transfer.
     validator: Arc<Mutex<Option<Validator>>>,
-    /// Whether the next attempt still has to start from zero.
-    ///
-    /// A task is fresh from the moment it is added until one of its transfers has
-    /// opened the partial file. That is announced only after the attempt has
-    /// opened and truncated the file, so from then on the bytes on disk are this
-    /// task's own resume point. A pause before that opening leaves the flag set,
-    /// and the next resume truncates again instead of continuing a partial file
-    /// this task never wrote.
     fresh: bool,
-    /// The transfer in flight, or the last one when nothing is running.
-    ///
-    /// The tasks are what keep the attempt running: an aborted interface task is a
-    /// cancelled one, so the entry owns them until the next attempt replaces them
-    /// or a delete moves them into its own task.
     attempt: Option<Attempt>,
 }
 
-/// One started transfer: its cancellation boundary and the tasks that report it.
 struct Attempt {
     cancellation: CancellationToken,
-    /// What this transfer has written, as the publishing task reads it.
     progress: Arc<Progress>,
     tasks: Vec<JoinHandle<()>>,
 }
 
-/// The state one manager serialises every operation against.
 struct State {
     entries: AHashMap<DownloadId, Entry>,
-    /// The insertion order [`DownloadProvider::tasks`] answers in.
     order: Vec<DownloadId>,
-    /// The one observer every task event is delivered to.
     sink: Option<Arc<dyn Fn(DownloadEvent) + Send + Sync>>,
 }
 
-/// The download manager: every task in this process, and their states.
-///
-/// Cheap to clone by `Rc`/`Arc` as the composition root does: every method takes
-/// `&self` and the state is behind the manager's own lock.
 pub struct DownloadProvider {
     inner: Arc<Inner>,
 }
 
-/// The shared body of one manager.
 struct Inner {
     transport: Arc<TransportHub>,
     runtime: Handle,
     config: ConfigNotification<Config>,
     state: Mutex<State>,
-    /// The delete tasks that have not finished yet.
-    ///
-    /// A delete task belongs here rather than in the entry it deletes: the task
-    /// is what removes that entry, so holding it in the entry would drop it while
-    /// it is doing the removing. A finished task is dropped when the next delete
-    /// starts, so a long session does not keep one task per delete it ever ran.
     delete_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// Keeps a [`DownloadProvider::subscribe`] registration alive.
-///
-/// Dropping it unsubscribes: the updater releases its subscription when it is
-/// itself released, so a closed window stops receiving download events.
 pub struct DownloadSubscription {
     inner: Weak<Inner>,
     sink: Option<Arc<dyn Fn(DownloadEvent) + Send + Sync>>,
 }
 
 impl DownloadSubscription {
-    /// A handle for a manager that has no subscription to withdraw (tests, or a host
-    /// that only reads snapshots).
     #[must_use]
     pub const fn none() -> Self {
         Self {
@@ -172,12 +109,6 @@ impl std::fmt::Debug for DownloadProvider {
 }
 
 impl DownloadProvider {
-    /// The manager over the composition root's dependencies.
-    ///
-    /// `config` is the network projection every transfer routes with; the composition
-    /// root publishes a new one after each settings commit
-    /// ([`ConfigNotification::publish`]), so a route change reaches the transfers
-    /// started after it.
     #[must_use]
     pub fn new(deps: DownloadProviderDeps, config: ConfigNotification<Config>) -> Self {
         Self {
@@ -195,67 +126,32 @@ impl DownloadProvider {
         }
     }
 
-    /// Adds a download under `id` and starts it immediately.
-    ///
-    /// The identity is the caller's: the page that draws the row and the updater
-    /// that reads the payload both mint it before they add the task, so what they
-    /// hold and what the manager publishes cannot disagree.
     pub fn add(&self, id: DownloadId, request: DownloadRequest) {
         self.inner.add(id, request);
     }
 
-    /// Every task, in the order the caller added them.
-    ///
-    /// A task stays here after it completes or fails; only [`Self::delete`]
-    /// removes it.
     #[must_use]
     pub fn tasks(&self) -> Vec<DownloadTask> {
         self.inner.tasks()
     }
 
-    /// The task `id` names, when it is still held.
     #[must_use]
     pub fn task(&self, id: DownloadId) -> Option<DownloadTask> {
         self.inner.task(id)
     }
 
-    /// Stops a transfer that is in flight, keeping its partial file for a resume.
-    ///
-    /// The task is `Pausing` until the transfer has stopped and settled as
-    /// [`DownloadStatus::Paused`]. Any other state refuses the pause, because
-    /// there is nothing running that could be stopped.
     pub fn pause(&self, id: DownloadId) -> bool {
         self.inner.pause(id)
     }
 
-    /// Starts a transfer again from the partial file it left.
-    ///
-    /// Accepted from `Paused` and from `Failed`: a failed transfer is retried the
-    /// same way a paused one is continued, from the bytes the partial file holds.
-    ///
-    /// A task that has not opened a partial file yet starts from zero even here:
-    /// no attempt of it ever got as far as opening the partial file, so a resume
-    /// keeps the fresh transfer's guarantee rather than continuing a file this
-    /// task did not write.
     pub fn resume(&self, id: DownloadId) -> bool {
         self.inner.resume(id)
     }
 
-    /// Removes a task and the files it owns.
-    ///
-    /// A running transfer is cancelled first, and its files are only removed once
-    /// the attempt has stopped writing them. Deleting the same task twice is
-    /// refused while the first delete is still in flight.
     pub fn delete(&self, id: DownloadId) -> bool {
         self.inner.delete(id)
     }
 
-    /// Registers the one sink every task event is delivered to.
-    ///
-    /// An implementation replaces the previous sink rather than adding a second one,
-    /// because the application has exactly one observer: the updater either owns the
-    /// event stream or does not exist. The settings page reads snapshots
-    /// ([`Self::tasks`]) instead.
     pub fn subscribe(
         &self,
         sink: Arc<dyn Fn(DownloadEvent) + Send + Sync>,
@@ -288,7 +184,6 @@ impl Drop for Inner {
 }
 
 impl Inner {
-    /// Adds one task and starts it; the caller's identity names it.
     fn add(self: &Arc<Self>, id: DownloadId, request: DownloadRequest) {
         let status = DownloadStatus::Downloading {
             downloaded: 0,
@@ -313,7 +208,6 @@ impl Inner {
         self.publish(id);
     }
 
-    /// Every task snapshot, in the order the caller added them.
     fn tasks(&self) -> Vec<DownloadTask> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tasks = Vec::with_capacity(state.order.len());
@@ -326,13 +220,11 @@ impl Inner {
         tasks
     }
 
-    /// The snapshot `id` names, when it is still held.
     fn task(&self, id: DownloadId) -> Option<DownloadTask> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.entries.get(&id).map(|entry| task_snapshot(id, entry))
     }
 
-    /// Stops a running transfer at its partial file.
     fn pause(&self, id: DownloadId) -> bool {
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -347,8 +239,6 @@ impl Inner {
             };
             match &entry.attempt {
                 Some(attempt) => {
-                    // The attempt stays owned: cancelling only asks it to stop, and
-                    // its outcome task is what settles the state as `Paused`.
                     attempt.cancellation.cancel();
                     entry.status = DownloadStatus::Pausing { downloaded, total };
                 }
@@ -360,7 +250,6 @@ impl Inner {
         true
     }
 
-    /// Starts another attempt at a paused or failed task.
     fn resume(self: &Arc<Self>, id: DownloadId) -> bool {
         let fresh = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -391,7 +280,6 @@ impl Inner {
         true
     }
 
-    /// Cancels the task's attempt and removes it with its files.
     fn delete(self: &Arc<Self>, id: DownloadId) -> bool {
         let (request, pending) = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -441,17 +329,12 @@ impl Inner {
             .delete_tasks
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // Only a delete that is still running needs its task held.
         delete_tasks.retain(|task| !task.is_finished());
         delete_tasks.push(delete);
 
         true
     }
 
-    /// Starts one transfer for `id`, replacing whatever attempt the entry held.
-    ///
-    /// `fresh` is what the transfer does with an existing partial file: a new
-    /// task's first attempt truncates it, while a resumed task continues it.
     fn start_attempt(self: &Arc<Self>, id: DownloadId, fresh: bool) {
         let attempt = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -466,7 +349,6 @@ impl Inner {
                 return;
             };
             let starting_from = *starting_from;
-            // A replaced attempt must stop writing: its files belong to this new one.
             if let Some(previous) = entry.attempt.take() {
                 previous.cancellation.cancel();
                 for task in &previous.tasks {
@@ -557,9 +439,6 @@ impl Inner {
         }
     }
 
-    /// Publishes what a transfer has written since the last interval and the rate
-    /// it wrote at; `false` once the task is no longer downloading, which is what
-    /// ends the task that publishes.
     fn publish_progress(&self, id: DownloadId, snapshot: Snapshot, rate: f32) -> bool {
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -574,12 +453,7 @@ impl Inner {
             else {
                 return false;
             };
-            // A number below the last one is a server that answered `200` after a
-            // range request, which restarts the file at zero; it is progress, not a
-            // stale report.
             *downloaded = snapshot.written();
-            // The caller's expected size is not news a response can take back: only a
-            // size the transfer named replaces it.
             if let Some(named) = snapshot.total() {
                 *total = Some(named);
             }
@@ -590,21 +464,15 @@ impl Inner {
         true
     }
 
-    /// Applies what an attempt produced: the final size, a cancellation that the
-    /// pause asked for, or a failure.
     fn finish_attempt(&self, id: DownloadId, result: Result<u64, DownloadError>) {
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(entry) = state.entries.get_mut(&id) else {
                 return;
             };
-            // A delete cancelled this attempt; the delete task owns the files and the
-            // state from here on, so the outcome only has to stop being a download.
             if matches!(entry.status, DownloadStatus::Deleting) {
                 return;
             }
-            // The transfer opened the partial file, so from here on the bytes on disk
-            // are this task's own resume point, whichever outcome it stopped with.
             if entry
                 .attempt
                 .as_ref()
@@ -619,10 +487,6 @@ impl Inner {
                 },
                 Err(error) => match &entry.status {
                     DownloadStatus::Pausing { total, .. } => DownloadStatus::Paused {
-                        // A task that never opened its partial file has nothing to
-                        // resume; the next attempt truncates the file and starts from
-                        // zero, so the paused state announces that same starting point
-                        // instead of the length of a file this task never wrote.
                         downloaded: if entry.fresh {
                             0
                         } else {
@@ -639,8 +503,6 @@ impl Inner {
         self.publish(id);
     }
 
-    /// Applies what a delete produced: a removed task, or a failure the user can
-    /// retry the delete from.
     fn finish_delete(&self, id: DownloadId, result: Result<(), DownloadFailure>) {
         if let Err(failure) = result {
             {
@@ -663,14 +525,12 @@ impl Inner {
         }
     }
 
-    /// Publishes the snapshot observers react to.
     fn publish(&self, id: DownloadId) {
         if let Some(task) = self.task(id) {
             self.emit(DownloadEvent::TaskUpdated(task));
         }
     }
 
-    /// Delivers one event to the registered sink, if there is one.
     fn emit(&self, event: DownloadEvent) {
         let sink = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -681,8 +541,6 @@ impl Inner {
         }
     }
 
-    /// Puts one entry in the manager without starting a transfer (the state-machine
-    /// tests drive [`Self::finish_attempt`] over one).
     #[cfg(test)]
     fn insert_pausing_for_test(
         &self,
@@ -716,8 +574,6 @@ impl Inner {
         state.order.push(id);
     }
 
-    /// Whether the entry still says its next attempt starts from zero (the
-    /// state-machine tests read the flag the outcome writes).
     #[cfg(test)]
     fn fresh_for_test(&self, id: DownloadId) -> bool {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -725,7 +581,6 @@ impl Inner {
     }
 }
 
-/// The snapshot one entry is drawn from.
 fn task_snapshot(id: DownloadId, entry: &Entry) -> DownloadTask {
     DownloadTask {
         id,
@@ -735,17 +590,12 @@ fn task_snapshot(id: DownloadId, entry: &Entry) -> DownloadTask {
     }
 }
 
-/// The bytes a partial file already holds, `0` when there is none to continue.
 fn part_length(destination: &Path) -> u64 {
     crate::partial::path(destination)
         .and_then(|part| std::fs::metadata(part).ok())
         .map_or(0, |metadata| metadata.len())
 }
 
-/// Waits for a cancelled attempt's tasks to finish.
-///
-/// The deadline is what keeps an attempt that never stops from pinning the task in
-/// `Deleting`.
 async fn wait_for_attempts(pending: Vec<JoinHandle<()>>) -> bool {
     let joined = async move {
         for task in pending {
@@ -756,12 +606,6 @@ async fn wait_for_attempts(pending: Vec<JoinHandle<()>>) -> bool {
     timeout(ATTEMPT_STOP_TIMEOUT, joined).await.is_ok()
 }
 
-/// Removes the partial file and the destination a task owns.
-///
-/// The removal runs on the runtime's blocking pool. A file that is already gone
-/// is already deleted; the first real failure is reported. When the destination
-/// has no file name this task could not have created a file there, so there is
-/// nothing to remove.
 async fn remove_download_files(
     runtime: &Handle,
     destination: &Path,
@@ -837,15 +681,10 @@ mod tests {
         test_support::test_handle,
     };
 
-    /// How much of a paced payload each frame carries.
     const FRAME: usize = 16 * 1024;
-    /// How long a paced server waits between frames.
     const PACE: Duration = Duration::from_millis(25);
-    /// How long a test waits for an asynchronous outcome before failing.
     const WAIT_LIMIT: Duration = Duration::from_secs(10);
 
-    /// The bytes a test downloads, different at every offset so a misplaced
-    /// resume is visible.
     fn payload(length: usize) -> Bytes {
         Bytes::from(
             (0..length)
@@ -854,11 +693,6 @@ mod tests {
         )
     }
 
-    /// A response body the test server hands out one frame at a time.
-    ///
-    /// The pause between frames is what makes a transfer observably in flight;
-    /// without it the whole payload reaches the kernel at once and there is
-    /// nothing left to interrupt.
     struct TestBody {
         frames: VecDeque<Frame<Bytes>>,
         pace: Duration,
@@ -929,14 +763,12 @@ mod tests {
         }
     }
 
-    /// One request the test server answered, reduced to what a download sets.
     #[derive(Clone, Debug)]
     struct Recorded {
         path: String,
         range: Option<String>,
     }
 
-    /// The state the test server answers from.
     struct Server {
         payload: Bytes,
         pace: Option<Duration>,
@@ -944,7 +776,6 @@ mod tests {
     }
 
     impl Server {
-        /// A server that sends the whole entity as fast as the connection takes it.
         fn whole(payload: Bytes) -> Self {
             Self {
                 payload,
@@ -953,7 +784,6 @@ mod tests {
             }
         }
 
-        /// A server that sends the whole entity one paced frame at a time.
         fn paced(payload: Bytes) -> Self {
             Self {
                 payload,
@@ -1044,7 +874,6 @@ mod tests {
         }
     }
 
-    /// The first byte a `Range` request asks for.
     fn requested_start(value: &str) -> Option<u64> {
         value
             .strip_prefix("bytes=")?
@@ -1061,10 +890,6 @@ mod tests {
             .map(str::to_owned)
     }
 
-    /// Starts a server answering `server` on a loopback port.
-    ///
-    /// The accept loop runs on the shared test runtime for the rest of the
-    /// process; a test only needs the address.
     fn spawn_server(server: Arc<Server>) -> SocketAddr {
         let runtime = test_handle();
         let listener = runtime
@@ -1096,10 +921,6 @@ mod tests {
         Url::parse(&format!("http://{address}{path}")).expect("the request URL is a URL")
     }
 
-    /// Starts a server that accepts a connection and never answers it.
-    ///
-    /// A transfer to it stays in flight writing nothing, which is what a stalled
-    /// download looks like from the manager's side.
     fn spawn_stalled_server() -> SocketAddr {
         let runtime = test_handle();
         let listener = runtime
@@ -1112,8 +933,6 @@ mod tests {
                     return;
                 };
                 tokio::spawn(async move {
-                    // Holding the connection open without writing to it is what
-                    // keeps the transfer waiting for headers that never arrive.
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     drop(stream);
                 });
@@ -1138,7 +957,6 @@ mod tests {
         }
     }
 
-    /// The provider over a plaintext transport, without a composition root.
     fn provider() -> DownloadProvider {
         DownloadProvider::new(
             DownloadProviderDeps {
@@ -1152,10 +970,8 @@ mod tests {
         )
     }
 
-    /// The event log one test subscribes the provider to.
     struct EventLog {
         recorded: Arc<Mutex<Vec<DownloadEvent>>>,
-        /// Kept alive for the test: dropping it unsubscribes.
         _subscription: super::DownloadSubscription,
     }
 
@@ -1167,7 +983,6 @@ mod tests {
                 .clone()
         }
 
-        /// The statuses the log holds for `id`, in the order they were published.
         fn published(&self, id: DownloadId) -> Vec<DownloadStatus> {
             self.recorded()
                 .into_iter()
@@ -1179,7 +994,6 @@ mod tests {
         }
     }
 
-    /// Subscribes `provider`'s events into a log the test asserts on.
     fn events(provider: &DownloadProvider) -> EventLog {
         let recorded: Arc<Mutex<Vec<DownloadEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&recorded);
@@ -1217,8 +1031,6 @@ mod tests {
         provider.delete(id)
     }
 
-    /// Polls `condition` until it holds, with real time passing so the transfer it
-    /// observes can make progress.
     fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + WAIT_LIMIT;
         loop {
@@ -1230,8 +1042,6 @@ mod tests {
         }
     }
 
-    /// The starting state is published under the caller's identity, and every added
-    /// task gets an identity of its own.
     #[test]
     fn adding_a_download_should_create_a_unique_task_and_publish_it() {
         let payload = payload(192 * 1024);
@@ -1299,7 +1109,6 @@ mod tests {
         );
     }
 
-    /// A destination that could not name a file is a failed task, never a panic.
     #[test]
     fn a_destination_without_a_file_name_should_fail_instead_of_panicking() {
         let provider = provider();
@@ -1372,10 +1181,6 @@ mod tests {
 
     #[test]
     fn pausing_a_download_should_keep_the_part_and_resuming_should_ask_for_it() {
-        // Big enough that the transfer is still running when the first interval
-        // publishes what it has written.
-        // Long enough that the transfer is still running when the interval publishes
-        // the first progress the test waits for.
         let payload = payload(2 * 1024 * 1024);
         let server = Arc::new(Server::paced(payload.clone()));
         let address = spawn_server(Arc::clone(&server));
@@ -1517,10 +1322,6 @@ mod tests {
 
     #[test]
     fn deleting_a_download_in_flight_should_cancel_it_and_remove_the_part() {
-        // Big enough that the transfer is still running when the first interval
-        // publishes what it has written.
-        // Long enough that the transfer is still running when the interval publishes
-        // the first progress the test waits for.
         let payload = payload(2 * 1024 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
         let provider = provider();
@@ -1651,9 +1452,6 @@ mod tests {
         );
     }
 
-    /// The progress of a task is published once an interval whether or not bytes
-    /// arrive: a stalled transfer still reports its state, at zero rather than at
-    /// the rate it last managed.
     #[test]
     fn progress_should_be_published_once_an_interval_even_while_nothing_arrives() {
         let address = spawn_stalled_server();
@@ -1696,11 +1494,8 @@ mod tests {
         }
     }
 
-    /// The rate is what the transfer wrote over the interval since it last
-    /// published, in megabytes per second.
     #[test]
     fn a_download_should_publish_the_rate_it_writes_at() {
-        // Long enough to still be transferring one interval after it started.
         let payload = payload(2 * 1024 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
         let provider = provider();
@@ -1725,9 +1520,6 @@ mod tests {
         });
     }
 
-    /// The bytes on disk are a task's resume point only once an attempt of it has
-    /// opened the partial file: a pause before that settles at zero, and the next
-    /// resume truncates whatever file it finds.
     #[test]
     fn a_pause_should_settle_at_what_the_partial_file_holds_once_it_was_opened() {
         use crate::error::DownloadError;
@@ -1761,8 +1553,6 @@ mod tests {
                 .finish_attempt(id, Err(DownloadError::Cancelled));
         };
 
-        // No attempt of this task ever opened the file, so there is nothing for a
-        // resume to continue.
         let unopened = insert_pausing(true, false);
         settle(unopened);
         assert_eq!(
@@ -1778,7 +1568,6 @@ mod tests {
             "the next attempt of that task still starts from zero",
         );
 
-        // The attempt opened the file, so the bytes that arrived are its own.
         let opened = insert_pausing(true, true);
         settle(opened);
         assert_eq!(
@@ -1794,8 +1583,6 @@ mod tests {
             "the bytes on disk are the next attempt's resume point",
         );
 
-        // An attempt that stopped before opening keeps the resume point an earlier
-        // attempt of the same task made.
         let resumed = insert_pausing(false, false);
         settle(resumed);
         assert_eq!(
@@ -1811,10 +1598,6 @@ mod tests {
 
     #[test]
     fn a_pause_should_be_refused_unless_the_download_is_running() {
-        // Big enough that the transfer is still running when the first interval
-        // publishes what it has written.
-        // Long enough that the transfer is still running when the interval publishes
-        // the first progress the test waits for.
         let payload = payload(2 * 1024 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
         let provider = provider();
@@ -1911,8 +1694,6 @@ mod tests {
         assert!(provider.tasks().is_empty());
     }
 
-    /// A new task starts from zero, whatever partial file it finds at its
-    /// destination: nothing else in this process wrote it, so it is not resumed.
     #[test]
     fn adding_a_download_should_discard_a_partial_file_it_did_not_write() {
         let payload = payload(96 * 1024);
@@ -1951,8 +1732,6 @@ mod tests {
         );
     }
 
-    /// Dropping the subscription stops the delivery: the sink is the updater's, and
-    /// a closed window must not keep receiving events.
     #[test]
     fn a_dropped_subscription_should_stop_the_events() {
         let provider = provider();

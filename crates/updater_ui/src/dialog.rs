@@ -1,33 +1,3 @@
-//! The dialog an offered update is read about, downloaded through and installed from.
-//!
-//! It is a kit modal dialog: the shell, the scrim, the focus trap, the fade and the
-//! a11y role belong to [`DialogBuilder`], and what this module owns is the content —
-//! the release notes (a [`MarkdownNode`]), the progress line (a [`Progress`] bar or a
-//! [`Spinner`]), the two lines a downloaded payload says, the failure sentence, and
-//! the row of [`Button`]s that acts on the updater.
-//!
-//! # Rebuilt, not re-rendered
-//!
-//! The toolkit drew a fresh element tree every frame from the updater's state. The
-//! engine has no render function, so the dialog content is built once per **shape**:
-//! the notes, one of the three download lines, the downloaded line, the installing
-//! line or a failure. A shape change (starting a download, pausing, a failure) closes
-//! the open dialog and opens a new one with the new content; a progress report inside
-//! the download shape rebuilds nothing — the percentage is a `bind_text` node reading
-//! the view signal and the bar is a `Progress` the frame route moves.
-//!
-//! A language switch rebuilds too: the button labels, the dialog's a11y name and the
-//! notes' markdown are baked in at build time (the kit has no label-binding face).
-//!
-//! # Who owns what
-//!
-//! The dialog owns its own [`SignalScope`] and its kit components, and gives them back
-//! in [`UpdateDialog::release`] in the engine's order (the markdown subtree first, then
-//! the components, then the dialog, then the scope). The dialog handle itself is
-//! replaced on every rebuild, so a reopened dialog never reuses a released signal. The
-//! updater ([`crate::updater`]) drives it: it says what data to show, when the dialog
-//! has closed itself, and where the button presses go.
-
 use std::{
     cell::RefCell,
     rc::{Rc, Weak},
@@ -73,50 +43,26 @@ use crate::{
     updater::{DialogControl, DownloadPhase, UpdaterCore, UpdaterView, control_callback},
 };
 
-/// How wide the panel is while the release notes are read.
 const NOTES_WIDTH: f32 = 1040.0;
 
-/// How wide the panel is for everything that is not the notes.
-///
-/// A download in flight, a payload waiting to be installed and what a failed attempt
-/// says are a line or two of text each: drawn at the notes' width they would be a wide
-/// band of empty panel around two words.
 const STATUS_WIDTH: f32 = 640.0;
 
-/// How tall the release notes are drawn before they scroll.
 const NOTES_MAX_HEIGHT: f32 = 640.0;
 
-/// How wide the band the notes' scrollbar is drawn in.
-///
-/// The scrollbar paints a 4 px thumb hard against its own right edge, so the band is
-/// what keeps the thumb off the notes' text rather than over it.
 const SCROLLBAR_WIDTH: f32 = 8.0;
 
-/// The content column's gap (the toolkit's `.gap_2()`).
 const CONTENT_GAP: f32 = 8.0;
 
-/// The font size of the dialog's body lines (the kit's medium text tier).
 const BODY_SIZE: f32 = 14.0;
 
-/// What the dialog is showing, as the shape its content was built for.
-///
-/// One value per content tree: a progress report does not change it, and everything
-/// that does changes what is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// The release notes, and what a platform that cannot install in place is told.
     Notes,
-    /// A download in flight: what it has accepted, and the size the response named.
     Downloading,
-    /// A download being stopped: what it has accepted, and the size the response named.
     Pausing,
-    /// A stopped download: what it has accepted, and the size the response named.
     Paused,
-    /// The payload is downloaded, waiting for the user.
     Downloaded,
-    /// Nothing left to press: the application is being replaced underneath it.
     Installing,
-    /// The last attempt failed, with the catalogue key the interface says it with.
     Failure,
 }
 
@@ -135,7 +81,6 @@ impl Shape {
         }
     }
 
-    /// The panel width this shape is drawn at.
     fn width(self) -> f32 {
         match self {
             Self::Notes => NOTES_WIDTH,
@@ -144,21 +89,14 @@ impl Shape {
     }
 }
 
-/// What the dialog is opened with.
 pub(crate) struct DialogData {
-    /// The state the content is built for and the percentage binds to.
     pub view: UpdaterView,
-    /// The dialog's a11y name (there is no title row: the notes are the content).
     pub title: SmolStr,
-    /// The release notes in the interface's language, when the release published any.
     pub notes: Option<SmolStr>,
-    /// The language the static copy is built in.
     pub language: LanguageCode,
-    /// Whether this platform can install a payload over itself.
     pub install_supported: bool,
 }
 
-/// What the open dialog's content built, and what its frame sync owns.
 pub(crate) struct Built {
     shape: Shape,
     language: LanguageCode,
@@ -186,8 +124,6 @@ impl Built {
         }
     }
 
-    /// Releases the components (their nodes are the dialog's; this gives their scopes
-    /// and action handlers back).
     fn release(&mut self, app: &mut App) -> usize {
         let mut released = 0;
         if let Some(markdown) = self.markdown.as_mut() {
@@ -214,20 +150,12 @@ impl Built {
     }
 }
 
-/// The kit dialog the update indicator opens.
 pub(crate) struct UpdateDialog {
     key: SmolStr,
     services: Rc<WidgetServices>,
     theme: ThemeHandle,
     translate: Translate,
-    /// The updater's live view (what the dialog should show next).
     view: Signal<Option<UpdaterView>>,
-    /// What the dialog is drawn from.
-    ///
-    /// It follows `view` while the dialog is open and **stops following it once the
-    /// exit starts**: the fade draws the frame the user dismissed, not what dismissing
-    /// the dialog turned the updater into (cancelling a download puts the notes back
-    /// behind the indicator, and the leaving panel must not swap to them).
     shown: Signal<Option<UpdaterView>>,
     language: Signal<LanguageCode>,
     updater: Weak<RefCell<UpdaterCore>>,
@@ -238,7 +166,6 @@ pub(crate) struct UpdateDialog {
 }
 
 impl UpdateDialog {
-    /// Builds the dialog handle (closed) over the updater's services.
     pub(crate) fn new(
         app: &mut App,
         services: Rc<WidgetServices>,
@@ -264,8 +191,6 @@ impl UpdateDialog {
         }
     }
 
-    /// Shows the dialog for `data`, rebuilding its content when the shape, the
-    /// language or the notes changed.
     pub(crate) fn show(
         &mut self,
         app: &mut App,
@@ -290,9 +215,6 @@ impl UpdateDialog {
             return Ok(());
         }
 
-        // The previous content is released while its nodes still exist (the engine's
-        // E16 order), then the dialog is closed and dropped: a rebuild is a new dialog
-        // because the panel's width is fixed when it is built.
         self.release_built(app);
         if let Some(dialog) = self.dialog.take() {
             dialog.close_now(app);
@@ -339,8 +261,6 @@ impl UpdateDialog {
         Ok(())
     }
 
-    /// One frame of the dialog: progress, the components that animate, and the close
-    /// bookkeeping.
     pub(crate) fn sync(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         if self.released {
             return Ok(());
@@ -349,8 +269,6 @@ impl UpdateDialog {
             return Ok(());
         };
         if dialog.is_open(app) {
-            // The live view is what the dialog should draw, except while it leaves:
-            // then `shown` keeps the frame the user dismissed (see the field's doc).
             if !dialog.is_closing() {
                 let live = *app.read(&self.view);
                 if *app.read(&self.shown) != live {
@@ -389,29 +307,24 @@ impl UpdateDialog {
         Ok(())
     }
 
-    /// Starts the dialog's exit (it keeps drawing the frame it was dismissed in until
-    /// the fade finishes).
     pub(crate) fn close(&mut self, app: &mut App) {
         if let Some(dialog) = self.dialog.as_ref() {
             dialog.close(app);
         }
     }
 
-    /// Whether the dialog is open (including its fade-out).
     pub(crate) fn is_open(&self, app: &App) -> bool {
         self.dialog
             .as_ref()
             .is_some_and(|dialog| dialog.is_open(app))
     }
 
-    /// Whether the dialog is playing its exit.
     pub(crate) fn is_closing(&self) -> bool {
         self.dialog
             .as_ref()
             .is_some_and(|dialog| dialog.is_closing())
     }
 
-    /// Releases the content and the dialog (idempotent).
     pub(crate) fn release(&mut self, app: &mut App) -> usize {
         if self.released {
             return 0;
@@ -426,7 +339,6 @@ impl UpdateDialog {
         released
     }
 
-    /// Releases what the content built.
     fn release_built(&mut self, app: &mut App) -> usize {
         let Some(mut built) = self.built.borrow_mut().take() else {
             return 0;
@@ -435,7 +347,6 @@ impl UpdateDialog {
     }
 }
 
-/// Everything the content closure needs, captured once per build.
 struct Plan {
     shape: Shape,
     notes: Option<SmolStr>,
@@ -445,7 +356,6 @@ struct Plan {
     secondary_size: f32,
 }
 
-/// Builds one dialog's content under its body node.
 fn build_content(
     app: &mut App,
     window: WindowId,
@@ -533,7 +443,6 @@ fn build_content(
     Ok(())
 }
 
-/// Builds the release notes, and what a platform that cannot install in place is told.
 fn build_notes(
     app: &mut App,
     window: WindowId,
@@ -621,8 +530,6 @@ fn build_notes(
     Ok(())
 }
 
-/// Builds the download line: what the transfer has accepted, against the size it
-/// named when it named one.
 fn build_download(
     app: &mut App,
     window: WindowId,
@@ -711,7 +618,6 @@ fn build_download(
     Ok(())
 }
 
-/// Builds what a downloaded payload says.
 fn build_downloaded(
     app: &mut App,
     window: WindowId,
@@ -738,7 +644,6 @@ fn build_downloaded(
     Ok(())
 }
 
-/// Builds the sentence a failed attempt is stated with.
 fn build_failure(
     app: &mut App,
     window: WindowId,
@@ -771,7 +676,6 @@ fn build_failure(
     Ok(())
 }
 
-/// One centered body text node.
 fn build_text(
     app: &mut App,
     window: WindowId,
@@ -791,7 +695,6 @@ fn build_text(
     })
 }
 
-/// Builds the controls the shape offers, the primary one last.
 fn build_buttons(
     app: &mut App,
     window: WindowId,
@@ -944,8 +847,6 @@ fn build_buttons(
     Ok(())
 }
 
-/// The control that gives a download up: it hands the dialog to the user's next
-/// choice and asks the updater to stop the transfer.
 fn cancel_button(
     app: &mut App,
     window: WindowId,
@@ -970,14 +871,12 @@ fn cancel_button(
     )
 }
 
-/// The two button looks this dialog uses.
 #[derive(Clone, Copy)]
 enum ButtonVariant {
     Primary,
     Secondary,
 }
 
-/// One control that acts on the updater.
 fn control_button(
     app: &mut App,
     window: WindowId,
@@ -1008,8 +907,6 @@ fn control_button(
     Ok(button)
 }
 
-/// The control that opens the release page, for a platform that cannot install in
-/// place.
 fn release_page_button(
     app: &mut App,
     window: WindowId,
@@ -1026,8 +923,6 @@ fn release_page_button(
         .a11y_label(label.clone())
         .label(label)
         .on_click(move |_ctx| {
-            // The services carry the application's open command; the dialog keeps its
-            // own weak handle, so a released updater is a no-op rather than a panic.
             let Some(core) = opener.upgrade() else {
                 return;
             };
@@ -1038,8 +933,6 @@ fn release_page_button(
     Ok(button)
 }
 
-/// The release notes carry no bundled assets: an inline image has no intrinsic size to
-/// read, and the view draws its placeholder.
 struct ReleaseNotesAssets;
 
 impl MarkdownAssets for ReleaseNotesAssets {
@@ -1064,7 +957,6 @@ fn tree_mut(app: &mut App, window: WindowId) -> Result<&mut NodeTree, EngineErro
         .tree_mut())
 }
 
-/// Maps a kit dialog error onto the engine error the frame route speaks.
 fn dialog_error(error: DialogError, window: WindowId) -> EngineError {
     match error {
         DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
@@ -1087,8 +979,6 @@ mod tests {
         updater::{DownloadPhase, Updater, UpdaterTestExt, UpdaterView},
     };
 
-    /// A harness with the updater installed, the offer set to `view`'s state, and the
-    /// dialog opened.
     fn shown(view: UpdaterView) -> (Harness, Updater) {
         let mut harness = Harness::new();
         let updater = harness.install_updater(None);
@@ -1136,7 +1026,6 @@ mod tests {
         updater.test_set_state(harness.app.app_mut(), state);
     }
 
-    /// The content column of the open dialog.
     fn content(harness: &Harness) -> NodeId {
         harness
             .find("test.updater.dialog:content")
@@ -1149,7 +1038,6 @@ mod tests {
             })
     }
 
-    /// Presses the dialog's control whose key ends with `.{suffix}` and settles.
     fn press(harness: &mut Harness, updater: &Updater, suffix: &str) {
         assert!(
             updater.test_press(harness.app.app_mut(), suffix),
@@ -1158,7 +1046,6 @@ mod tests {
         harness.settle(2);
     }
 
-    /// Lets the dialog's exit finish.
     fn settle_close(harness: &mut Harness, updater: &Updater) {
         for _ in 0..16 {
             if !updater.test_dialog_open(harness.app.app()) {
@@ -1189,7 +1076,6 @@ mod tests {
         );
     }
 
-    /// The notes are chosen in the language the interface is in when it opens.
     #[test]
     fn the_dialog_should_draw_the_notes_in_the_language_the_interface_is_in() {
         let mut harness = Harness::new();
@@ -1213,7 +1099,6 @@ mod tests {
         );
     }
 
-    /// A language the release published no notes in is drawn in English.
     #[test]
     fn the_dialog_should_fall_back_to_the_english_notes() {
         let (harness, updater) = {
@@ -1409,9 +1294,6 @@ mod tests {
         settle_close(&mut harness, &updater);
     }
 
-    /// The notes are read in a wider panel than the status lines: a download's
-    /// progress and a downloaded payload's two lines are not worth a wide band of
-    /// empty panel.
     #[test]
     fn the_notes_should_be_drawn_wider_than_the_status_the_dialog_turns_into() {
         let (harness, _updater) = shown(UpdaterView::Notes);
@@ -1449,8 +1331,6 @@ mod tests {
         );
     }
 
-    /// The scrollbar beside the notes does not wait for the pointer or for a scroll
-    /// to appear: it is drawn for as long as the notes can be taller than the box.
     #[test]
     fn the_notes_should_be_drawn_with_their_scrollbar() {
         let mut harness = Harness::new();
@@ -1480,9 +1360,6 @@ mod tests {
         );
     }
 
-    /// The dialog is drawn for the length of its exit transition after it has been
-    /// dismissed, and by then the updater has already moved on. What it drew while it
-    /// was open is what it has to keep drawing.
     #[test]
     fn a_dismissed_dialog_should_keep_drawing_the_frame_it_was_dismissed_in() {
         let (mut harness, updater) = shown(UpdaterView::Download {
@@ -1490,8 +1367,6 @@ mod tests {
             total: Some(8_192),
             phase: DownloadPhase::Downloading,
         });
-        // Let the entry fade finish: a close before it has started is the kit's
-        // immediate unmount, which is not the frame this test is about.
         harness.advance(Duration::from_millis(300));
         let content_before = content(&harness);
         assert!(harness.text_of(content_before).contains("Downloading"));

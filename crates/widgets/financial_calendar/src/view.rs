@@ -1,77 +1,3 @@
-//! The financial calendar pane: the answer it reads, the table it draws, and the
-//! schedule it keeps.
-//!
-//! # What this pane is
-//!
-//! A calendar is a whole answer rather than a stream: the service reads all of it,
-//! every ten minutes, and one read replaces the last one entirely. So the pane never
-//! asks for a part of the calendar — it asks for *the* calendar, and everything on
-//! screen is a view of the one answer it holds. A read that answers with a different
-//! calendar rebuilds the table's rows from nothing rather than patching the rows that
-//! moved: a revision can add an event in the middle of a day that is already drawn,
-//! and a row-by-row merge would have to decide what "the same event" means.
-//!
-//! # What moves without an answer
-//!
-//! Two things, and neither of them is data: the day a row belongs to (which follows
-//! the zone the settings display data in) and the header's countdown (which counts
-//! down to the next read). The zone is read when the answer is grouped and again on
-//! the frame that draws a time, so moving it regroups the rows and redraws the clock
-//! without asking the service for anything.
-//!
-//! # The body is built once
-//!
-//! [`WidgetView::body`] builds a frame and mounts the kit table in it. The table's row
-//! factory runs **without an application context**, so a cell cannot read the theme,
-//! the settings, or the translation context while it is built: every dynamic value is
-//! a `bind_text` / `bind_style` closure over the signals the pane owns — the accepted
-//! table model, the display zone, and the language. Structural changes (an answer, a
-//! filter, a zone move) go through [`Table::set_rows`], which rebuilds the mounted row
-//! window so the row factory runs against the new model; every value inside a row is
-//! still resolved by the frame that draws it.
-//!
-//! # A day label spans the table
-//!
-//! A day's label heads the events below it rather than saying anything about one
-//! column, so the label row is one cell across all four columns. That is the kit
-//! table's per-row span callback (`Table::set_column_span`), which the table consults
-//! while it builds a row — and because a model change re-runs the row window, a filter
-//! or a zone move that turns an event row into a label row re-spans it in the same
-//! frame.
-//!
-//! # The countdown is one-shot timers
-//!
-//! The header's countdown is the only thing the pane draws that moves on its own. It
-//! is driven by [`App::after`] (the engine's one-shot timer, E10): the pane keeps one
-//! timer armed while a deadline is ahead, the timer re-arms itself on each tick, and
-//! **the write that changed the label is what asks for a frame** — a tick that leaves
-//! the label where it was draws nothing. No thread and no interval task is started;
-//! the wait itself requests no frame (I3), and releasing the widget cancels the timer.
-//!
-//! # The table's static copy
-//!
-//! The kit table takes its column headers and its empty-state sentence as resolved
-//! text when it is built, and the header's filter triggers carry the choice they hold
-//! as the trigger's placeholder. A language switch or a filter change therefore
-//! rebuilds that static copy (and only that), which is the one place this pane cannot
-//! express a dependency as a binding.
-//!
-//! # What it does with a failure
-//!
-//! A refused read is a failure the user sees: the pane reports it through the
-//! framework, which puts a banner over the calendar that is still on screen. The
-//! service stops its schedule at that point, so the banner's recovery is what starts
-//! it again — a service that is briefly unreachable does not turn into a request
-//! every ten minutes until someone notices.
-//!
-//! # Who may see it
-//!
-//! The service serves this data to an account, so a pane with no account behind it
-//! reads nothing and says so. That is a *waiting* state rather than a failure:
-//! nothing has gone wrong, the pane is just not for an anonymous reader. The account
-//! is read from the settings snapshot on every frame, so signing in or out re-scopes
-//! the pane, and a host without a Kytrix service connection is a failure of its own.
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -136,22 +62,12 @@ use crate::{
     },
 };
 
-/// How often the pane re-reads the clock behind its countdown.
-///
-/// It is not a read: it only re-checks how long is left, and the label's own
-/// resolution is a second. One tick per second is therefore the cheapest wakeup this
-/// pane can ask for: a shorter period would wake the engine (and run every mounted
-/// widget's `sync`) more often without ever drawing anything new, because the label
-/// can only change once a second.
 pub(crate) const COUNTDOWN_TICK: Duration = Duration::from_secs(1);
 
-/// The size of one importance mark.
 const MARK_SIZE: f32 = 6.0;
 
-/// The stable id of the "all" option every filter offers.
 const ALL_CHOICE: &str = "all";
 
-/// The pane has nothing to persist, so its config carries the schema version alone.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinancialCalendarConfig;
 
@@ -201,40 +117,26 @@ impl TranslatedError for CalendarFetchError {
     }
 }
 
-/// One request the header's controls ask the pane to perform.
-///
-/// A kit control's callback owns no widget: it writes the request the pane should
-/// perform, and the pane's `sync` performs it. Selecting "all" and the choice a filter
-/// already holds are the same request, which is why the option is an `Option` twice —
-/// the outer one says a request is waiting, the inner one says which choice it names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HeaderRequest {
-    /// A filter to an importance level, or to every level.
     Importance(Option<Importance>),
-    /// A filter to one day, or to every day.
     Date(Option<Date>),
-    /// A filter to one country, or to every country.
     Country(Option<SmolStr>),
-    /// Every filter back to "all".
     Reset,
-    /// A read that does not wait for the interval.
     Refresh,
 }
 
-/// The options a filter's menu offers, as the pane last built it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct HeaderOptions {
     dates: Vec<Date>,
     countries: Vec<SmolStr>,
 }
 
-/// One filter's trigger, menu and the node that carries them.
 struct FilterControl {
     wrapper: NodeId,
     select: Select,
 }
 
-/// The header's left group: the three filters and the control that clears them.
 struct HeaderLeft {
     parent: NodeId,
     language: LanguageCode,
@@ -245,7 +147,6 @@ struct HeaderLeft {
     reset_wrapper: NodeId,
 }
 
-/// The header's right group: the refresh control and the time left until the next read.
 struct HeaderRight {
     parent: NodeId,
     language: LanguageCode,
@@ -253,20 +154,10 @@ struct HeaderRight {
     refresh: Button,
 }
 
-/// The countdown the header draws, and the one-shot timer that keeps it moving.
-///
-/// It is shared with the timer callback (`Rc`), which has only `&mut App`: the
-/// deadline the label is counting to lives in a `Cell`, the label itself is a signal,
-/// and the timer re-arms itself from the callback.
 struct Countdown {
     window: WindowId,
-    /// The wall-clock millisecond the next read is due at, or nothing worth counting
-    /// to (a read in flight, a failure, a schedule that stopped).
     deadline: Cell<Option<i64>>,
-    /// The time left, as the header draws it.
     label: Signal<Option<SmolStr>>,
-    /// The wall clock, which is what a deadline published in Unix milliseconds is
-    /// comparable against; a test hands in a clock it can move.
     now: Rc<dyn Fn() -> i64>,
     timer: RefCell<Option<TimerId>>,
 }
@@ -282,16 +173,10 @@ impl Countdown {
         }
     }
 
-    /// The deadline the label is counting to.
     fn deadline(&self) -> Option<i64> {
         self.deadline.get()
     }
 
-    /// Moves the countdown to a new deadline (or stops it), and re-arms the timer.
-    ///
-    /// The label is written here as well as on every tick: a new answer carries a new
-    /// deadline, and the header has to state it on the frame that shows the answer
-    /// rather than up to a tick later.
     fn update(self: &Rc<Self>, app: &mut App, deadline: Option<i64>) {
         self.deadline.set(deadline);
         if let Some(id) = self.timer.borrow_mut().take() {
@@ -303,7 +188,6 @@ impl Countdown {
         }
     }
 
-    /// Stops the countdown: no deadline, no label, no timer.
     fn stop(self: &Rc<Self>, app: &mut App) {
         self.deadline.set(None);
         if let Some(id) = self.timer.borrow_mut().take() {
@@ -312,7 +196,6 @@ impl Countdown {
         app.write(&self.label, None);
     }
 
-    /// Recomputes the label from the clock; returns whether it changed.
     fn write_label(&self, app: &mut App) -> bool {
         let label = self
             .deadline
@@ -321,7 +204,6 @@ impl Countdown {
         app.write(&self.label, label)
     }
 
-    /// Arms the one-shot timer for the next tick, if there is anything to count to.
     fn arm(self: &Rc<Self>, app: &mut App) {
         if self.deadline.get().is_none() {
             return;
@@ -332,8 +214,6 @@ impl Countdown {
         }
     }
 
-    /// One tick: write the label, ask for the frame that draws it if it moved, and
-    /// re-arm the timer for the next one.
     fn tick(self: &Rc<Self>, app: &mut App) {
         *self.timer.borrow_mut() = None;
         if self.write_label(app) {
@@ -343,74 +223,37 @@ impl Countdown {
     }
 }
 
-/// One command this pane sent and has not seen the answer to.
-///
-/// The pane replaces its one command slot on every call (start, refresh, stop), and the
-/// binding aborts the replaced call — but an answer can already be queued when that
-/// happens. The identity [`WidgetBinding::call`] returned is what says whose answer
-/// arrived: an answer this table does not know answers a command the pane has replaced,
-/// and it is dropped and counted rather than reported as the command now in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingCommand {
-    /// The read that starts or restarts the stream: `Load` or `Retry`.
     Load,
-    /// The read the refresh control brought forward.
     Refresh,
-    /// The stop of a stream nobody follows any more: its answer is nothing to report.
     Stop,
 }
 
-/// One financial calendar pane: the account it follows, the table it draws, and its
-/// refresh control.
 pub struct FinancialCalendarWidget {
-    /// The executor bridge, when this host has a Kytrix service connection to drive.
-    ///
-    /// A host without one has nothing to ask: the pane reports that its stream is
-    /// unavailable rather than starting a service it could never answer.
     binding: Option<WidgetBinding<CalendarProtocol>>,
-    /// The command in flight, keyed by the identity the binding returned.
     pending: Pending<PendingCommand>,
     status: WidgetStatus,
     recovery: WidgetAction,
     translate: Translate,
     theme: ThemeHandle,
-    /// The settings snapshot, for the display zone the times are read in.
     config: Signal<Config>,
     language: Signal<LanguageCode>,
-    /// The table model the cells read. A row factory has no `App`, so the model it
-    /// draws is a signal it registers a dependency on.
     table_model: Signal<Arc<CalendarTable>>,
-    /// The same model, readable from the span callback (which is given no context).
     spans: Rc<RefCell<Arc<CalendarTable>>>,
-    /// The countdown label the header draws, and its timer.
     countdown: Rc<Countdown>,
-    /// The request the header's controls wrote, waiting for the next `sync`.
     requests: Signal<Option<HeaderRequest>>,
-    /// Everything the table draws, as one answer and the choices narrowing it.
     model: Arc<CalendarTable>,
-    /// The kit table, once the body has been built (the framework builds a body only
-    /// once the pane has content).
     table: Option<Table>,
-    /// The node the table was built into; a language switch rebuilds the table there.
     table_slot: Option<NodeId>,
-    /// What the table's static copy was built with: the language and whether the
-    /// filter is on "all" (an answer with nothing in it says "no data" while a filter
-    /// that matched nothing says "no matches").
     table_built: Option<(LanguageCode, bool)>,
-    /// The answer this pane accepted, or nothing before the first one arrives.
     snapshot: Option<Arc<CalendarSnapshot>>,
-    /// When the next automatic read is due, as the service published it with the
-    /// answer it belongs to.
     next_refresh_at: Option<i64>,
-    /// Whether a refresh this pane sent has been answered *and its answer reported*.
     refresh_pending: bool,
-    /// The account this pane is for, or `None` while nobody is signed in.
     account_id: Option<SmolStr>,
-    /// The display zone the rows are grouped for, so a move regroups them once.
     seen_zone: UtcOffset,
     header_left: Option<HeaderLeft>,
     header_right: Option<HeaderRight>,
-    /// Whether the accepted rows changed since the table was last updated.
     rows_dirty: bool,
 }
 
@@ -443,24 +286,15 @@ impl WidgetView for FinancialCalendarWidget {
     }
 
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
-        // A retry keeps the calendar the user is still reading — blanking it to
-        // reconnect would flash a screen of data away — while an explicit load starts
-        // over, because the pane cannot vouch for what it was showing.
         let retry = self.status.is_failed(cx.app());
         self.account_id = cx.account();
         self.start(retry, cx);
     }
 
-    /// A pane is content once an answer has arrived for the account it follows.
-    ///
-    /// Having the last answer is not the same thing: it may have been served to an
-    /// account that has since signed out.
     fn has_content(&self) -> bool {
         self.snapshot.is_some()
     }
 
-    /// The body is the content slot's whole surface: the kit table draws the header
-    /// and the rows, and the frame exists for the accessible name over them.
     fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let translate = self.translate.clone();
         let language = self.language;
@@ -494,19 +328,12 @@ impl WidgetView for FinancialCalendarWidget {
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        // The account is the pane's scope, and the user can change it while the pane
-        // is open: signing out has to take the calendar with it, and signing in has to
-        // read. The settings snapshot is read without registering a dependency — the
-        // framework's surface root owns that edge and schedules this frame.
         let account = cx.account();
         if account != self.account_id {
             self.account_id = account;
             self.start(false, cx);
         }
 
-        // A day and a time are read from the rows the table holds, and those rows are
-        // grouped for one zone: moving the setting regroups them. The times inside the
-        // rows read the zone themselves; only the grouping needs this hook.
         let zone = cx.data_time_zone();
         if zone != self.seen_zone {
             self.seen_zone = zone;
@@ -517,33 +344,23 @@ impl WidgetView for FinancialCalendarWidget {
             let _ = cx.request_frame();
         }
 
-        // A control's handler owns no widget: it wrote the request, and this is where
-        // a widget context exists to perform it.
         let request = cx.read(&self.requests).clone();
         if let Some(request) = request {
             cx.write(&self.requests, None);
             self.apply_request(request, cx);
         }
 
-        // The binding delivers messages instead of calling back into the widget; this
-        // is the one place they are applied, where the widget has a context again.
         if let Some(binding) = self.binding.as_ref() {
             for inbound in binding.take() {
                 self.apply(inbound, cx);
             }
         }
 
-        // The table's own copy (headers and the empty sentence) is resolved when the
-        // table is built, and a filter that narrows to nothing uses a different
-        // sentence, so that is the one part of the body a language or filter change
-        // rebuilds.
         let language = *cx.read(&self.language);
         if self.table_built != Some((language, self.model.filter().is_all())) {
             self.rebuild_table(cx)?;
         }
 
-        // Structural row changes go to the table, whose row factory has no application
-        // context; every dynamic value inside a row is a `bind_*` closure instead.
         if self.rows_dirty {
             self.rows_dirty = false;
             if let Some(table) = self.table.as_ref() {
@@ -555,7 +372,6 @@ impl WidgetView for FinancialCalendarWidget {
             table.sync(cx.app_mut())?;
         }
 
-        // The countdown belongs to a ready pane with a schedule ahead of it.
         let deadline = self.countdown_deadline(cx.app());
         if deadline != self.countdown.deadline() {
             Countdown::update(&self.countdown, cx.app_mut(), deadline);
@@ -563,8 +379,6 @@ impl WidgetView for FinancialCalendarWidget {
 
         self.sync_header(cx)?;
 
-        // The framework sampled `has_content` before this hook ran, so a body that
-        // first appeared in this frame shows on the next one; ask for it.
         if self.snapshot.is_some() && self.table.is_none() {
             let _ = cx.request_frame();
         }
@@ -591,27 +405,19 @@ impl WidgetView for FinancialCalendarWidget {
     }
 
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
-        // The countdown's timer holds an `Rc` to the pane's state and would outlive the
-        // signals the scope release is about to drop.
         Countdown::stop(&self.countdown, cx.app_mut());
-        // The table's nodes are removed by the framework after this hook, so the
-        // component is released here while its nodes are still alive.
         if let Some(table) = self.table.take() {
             table.release(cx.app_mut());
         }
         self.table_slot = None;
-        // The header's nodes belong to the pane, which removes its row: only the
-        // components' signal scopes and action handlers are this widget's to release.
         if let Err(error) = self.release_header(cx, false) {
             log::error!("the financial calendar header could not be released: {error}");
         }
-        // Dropping the bridge aborts its forwarding tasks and cancels the service.
         self.binding = None;
     }
 }
 
 impl FinancialCalendarWidget {
-    /// Builds a widget over the collaborators a caller hands it.
     fn assemble<S: CalendarSource>(
         source: Option<S>,
         now: Rc<dyn Fn() -> i64>,
@@ -630,8 +436,6 @@ impl FinancialCalendarWidget {
         let seen_zone = cx.data_time_zone();
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
-        // The pane records the account it was built for, but it does not start
-        // anything: the framework calls `load` once construction is done.
         let account_id = cx.account();
 
         Self {
@@ -662,12 +466,6 @@ impl FinancialCalendarWidget {
         }
     }
 
-    /// Builds a widget over a test's own source.
-    ///
-    /// The framework's headless host composes the services without a Kytrix service
-    /// connection (the connector still needs the application shell), so an interface
-    /// test constructs the widget directly with the fake source it wants and drives
-    /// the widget hooks itself.
     #[cfg(test)]
     fn with_source<S: CalendarSource>(
         source: S,
@@ -678,7 +476,6 @@ impl FinancialCalendarWidget {
         Self::assemble(Some(source), Rc::new(unix_millis), status, recovery, cx)
     }
 
-    /// A widget whose countdown reads a clock the test owns.
     #[cfg(test)]
     fn with_clock<S: CalendarSource>(
         source: S,
@@ -690,18 +487,12 @@ impl FinancialCalendarWidget {
         Self::assemble(Some(source), now, status, recovery, cx)
     }
 
-    /// The account this pane would accept an answer from.
     fn current_key(&self) -> Option<CalendarStreamKey> {
         self.account_id
             .clone()
             .map(|account_id| CalendarStreamKey { account_id })
     }
 
-    /// The deadline this pane counts down to, if it has one.
-    ///
-    /// A countdown belongs to a ready pane: while a read is in flight there is
-    /// nothing to count down to — the deadline the answer will carry belongs to the
-    /// read after the one being waited for — and a failed pane has no schedule left.
     fn countdown_deadline(&self, app: &App) -> Option<i64> {
         let status = self.status.state(app);
         if self.refresh_pending || status.is_busy() || status.is_failed() {
@@ -710,25 +501,17 @@ impl FinancialCalendarWidget {
         self.next_refresh_at
     }
 
-    /// Whether the refresh control has nothing to do.
     fn refresh_is_disabled(&self, app: &App) -> bool {
         self.countdown_deadline(app).is_none()
     }
 
-    /// Starts reading, or restarts for an account the user is retrying.
     fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) {
         self.refresh_pending = false;
-        // The command that was in flight belongs to the scope this call replaces, so
-        // its answer is not something to wait for any more.
         self.pending.clear();
         let key = self.current_key();
         let has_service = self.binding.is_some();
         match key {
             None => {
-                // There is nothing to read for a reader the service does not know, and
-                // nothing has gone wrong, so the pane says what it is waiting for. The
-                // stream the previous account was reading is stopped rather than left
-                // polling for a reader who is no longer there.
                 self.clear_answer(cx);
                 if let Some(binding) = self.binding.as_mut() {
                     let request_id = binding.call(cx, CalendarRequest::Stop);
@@ -772,7 +555,6 @@ impl FinancialCalendarWidget {
         }
     }
 
-    /// Drops the answer and the rows drawn from it.
     fn clear_answer(&mut self, cx: &mut WidgetCx<'_>) {
         self.snapshot = None;
         self.next_refresh_at = None;
@@ -785,7 +567,6 @@ impl FinancialCalendarWidget {
         let _ = cx.request_frame();
     }
 
-    /// Mirrors the model into the signal the cells read and the span callback's view.
     fn publish_model(&mut self, cx: &mut WidgetCx<'_>) {
         let model = Arc::clone(&self.model);
         *self.spans.borrow_mut() = Arc::clone(&model);
@@ -794,11 +575,6 @@ impl FinancialCalendarWidget {
         }
     }
 
-    /// Replaces every row the table draws with the answer it now holds.
-    ///
-    /// A read answers with the whole calendar, so this is a rebuild rather than a
-    /// merge: a day may have gained an event, lost one, or moved to another day as
-    /// the setting moved.
     fn apply_snapshot(
         &mut self,
         calendar: Arc<CalendarSnapshot>,
@@ -817,19 +593,11 @@ impl FinancialCalendarWidget {
         let _ = cx.request_frame();
     }
 
-    /// Reads the account's calendar again without waiting for the next interval.
-    ///
-    /// Only a ready pane gets here, and the control that calls it carries the same
-    /// guard at its action's entry: a click the pane has nothing to do for is not a
-    /// refresh left waiting.
     fn refresh(&mut self, cx: &mut WidgetCx<'_>) {
         if self.refresh_is_disabled(cx.app()) {
             return;
         }
         self.refresh_pending = true;
-        // The countdown belongs to the schedule this click is stepping ahead of; a
-        // disabled control that kept drawing it would read as if the read were still
-        // on its way at the old time.
         Countdown::update(&self.countdown, cx.app_mut(), None);
         if let Some(binding) = self.binding.as_mut() {
             let request_id = binding.call(cx, CalendarRequest::Refresh);
@@ -838,7 +606,6 @@ impl FinancialCalendarWidget {
         let _ = cx.request_frame();
     }
 
-    /// Performs one request a header control wrote.
     fn apply_request(&mut self, request: HeaderRequest, cx: &mut WidgetCx<'_>) {
         if matches!(request, HeaderRequest::Refresh) {
             self.refresh(cx);
@@ -858,7 +625,6 @@ impl FinancialCalendarWidget {
         let _ = cx.request_frame();
     }
 
-    /// Applies one message the binding delivered.
     fn apply(&mut self, inbound: Inbound<CalendarProtocol>, cx: &mut WidgetCx<'_>) {
         match inbound {
             Inbound::Reliable { key, message } => self.apply_reliable(key, &message, cx),
@@ -869,7 +635,6 @@ impl FinancialCalendarWidget {
         }
     }
 
-    /// Applies the failure the stream reported.
     fn apply_reliable(
         &mut self,
         key: CalendarStreamKey,
@@ -883,8 +648,6 @@ impl FinancialCalendarWidget {
             return;
         };
         self.refresh_pending = false;
-        // The loop that owned the schedule has ended, so the label it left behind is
-        // not a time anything will happen at.
         Countdown::stop(&self.countdown, cx.app_mut());
         self.status.report(
             cx.app_mut(),
@@ -893,7 +656,6 @@ impl FinancialCalendarWidget {
         let _ = cx.request_frame();
     }
 
-    /// Applies the calendar the stream published.
     fn apply_latest(
         &mut self,
         key: CalendarStreamKey,
@@ -913,27 +675,6 @@ impl FinancialCalendarWidget {
         self.apply_snapshot(Arc::clone(calendar), *next_refresh_at, cx);
     }
 
-    /// Applies the answer to a command, attributed by the identity the binding returned.
-    ///
-    /// An accepted command stays pending until the calendar it asked for is reported:
-    /// the acknowledgement and the answer are two different messages, and the service
-    /// refuses a second command in between.
-    ///
-    /// The entry checks are the terminal rule and the command slot's identity:
-    ///
-    /// - `failed` is terminal (AGENTS §4.4): a message that arrives after the user's
-    ///   failure was reported may not repaint or "un-end" it. The old pane guarded
-    ///   this entry; the migration dropped the guard, and one late refusal from a
-    ///   replaced call was enough to rewrite the failure sentence the user is reading.
-    /// - The pane replaces its command slot on every call, and the binding aborts the
-    ///   replaced call — but an answer can already be queued when the replacement
-    ///   happens. Only the identity [`WidgetBinding::call`] returned answers a command
-    ///   this pane waits for; an answer the table does not know answers a command that
-    ///   was replaced and is dropped and counted (a refused old refresh failing a pane
-    ///   that signed out, say).
-    /// - A pane nobody is signed in for is waiting, not failing: signing out replaces
-    ///   the read with a `Stop`, and a refusal of the read it replaced is not a reason
-    ///   to leave the waiting state.
     fn apply_rpc_result(
         &mut self,
         request_id: RequestId,
@@ -953,7 +694,6 @@ impl FinancialCalendarWidget {
                     ) => {}
                     Err(error) => {
                         self.refresh_pending = false;
-                        // A failed read has no schedule left to count down to.
                         Countdown::stop(&self.countdown, cx.app_mut());
                         self.status.report(
                             cx.app_mut(),
@@ -963,7 +703,6 @@ impl FinancialCalendarWidget {
                     }
                 }
             }
-            // The answer to the stop of a stream nobody follows: nothing to report.
             Some(PendingCommand::Stop) => {}
             None => log::debug!(
                 "the financial calendar pane ignored reply {request_id}: no command is waiting for it"
@@ -971,7 +710,6 @@ impl FinancialCalendarWidget {
         }
     }
 
-    /// Builds the table into the body slot, over the rows accepted so far.
     fn build_table(&self, cx: &mut WidgetCx<'_>) -> Result<Table, EngineError> {
         let theme = self.theme.clone();
         let cell_theme = self.theme.clone();
@@ -1014,10 +752,6 @@ impl FinancialCalendarWidget {
         Ok(table)
     }
 
-    /// Rebuilds the table after the language (or the empty sentence) moved.
-    ///
-    /// The kit table's headers and empty sentence are resolved text rather than
-    /// bindings, so this is the one part of the body that has to be rebuilt.
     fn rebuild_table(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let (Some(slot), Some(previous)) = (self.table_slot, self.table.take()) else {
             return Ok(());
@@ -1038,7 +772,6 @@ impl FinancialCalendarWidget {
         Ok(())
     }
 
-    /// Builds the header's left group: the three filters and the reset control.
     fn build_header_left(
         &mut self,
         parent: NodeId,
@@ -1050,8 +783,6 @@ impl FinancialCalendarWidget {
         let all = t_smol!(self.translate, "widget.financial_calendar.all");
         let mut controls = Vec::with_capacity(3);
 
-        // The importance scale is the page's own fixed scale, so it is offered whole
-        // whether or not the answer holds an event of each level.
         let importance_name = t_smol!(self.translate, "widget.financial_calendar.importance");
         let importance_choice = filter.importance.map_or_else(
             || all.clone(),
@@ -1179,12 +910,6 @@ impl FinancialCalendarWidget {
         Ok(())
     }
 
-    /// Builds one filter's trigger and menu into the header group.
-    ///
-    /// The trigger states the choice the filter holds as its placeholder, which the kit
-    /// select resolves when it is built; a choice the reader picks closes the menu and
-    /// asks the next `sync` to apply it, which rebuilds this control with the new
-    /// trigger text (see [`Self::sync_header`]).
     fn build_filter_control(
         &self,
         parent: NodeId,
@@ -1231,7 +956,6 @@ impl FinancialCalendarWidget {
         Ok(FilterControl { wrapper, select })
     }
 
-    /// Builds the header's right group: the refresh control and its countdown.
     fn build_header_right(
         &mut self,
         parent: NodeId,
@@ -1296,12 +1020,6 @@ impl FinancialCalendarWidget {
         Ok(())
     }
 
-    /// Rebuilds the header groups whose static copy is no longer the truth.
-    ///
-    /// A filter's trigger states the choice it holds as the trigger's placeholder, and
-    /// the kit select resolves that text when it is built, so a filter (or language)
-    /// change rebuilds the group in place. The nodes that were rebuilt belong to this
-    /// widget; the pane's header row removes them with itself when it is rebuilt.
     fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let language = *cx.read(&self.language);
         let filter = self.model.filter().clone();
@@ -1358,8 +1076,6 @@ impl FinancialCalendarWidget {
         Ok(())
     }
 
-    /// Removes the left group's nodes (when this widget owns the teardown) and releases
-    /// its components' scopes and action handlers.
     fn release_header_left(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1379,8 +1095,6 @@ impl FinancialCalendarWidget {
         Ok(())
     }
 
-    /// Removes the right group's node (when this widget owns the teardown) and releases
-    /// its component.
     fn release_header_right(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1396,7 +1110,6 @@ impl FinancialCalendarWidget {
         Ok(())
     }
 
-    /// Releases every header control this widget built.
     fn release_header(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1407,11 +1120,6 @@ impl FinancialCalendarWidget {
     }
 }
 
-/// Removes nodes this pane built, if they are still in the tree.
-///
-/// The pane rebuilds its header row, and the control this widget built into the old
-/// row went with it; asking the engine to remove it again would fail the rebuild
-/// (`StaleNode`) and leave the pane without a control.
 fn remove_own_nodes(
     cx: &mut WidgetCx<'_>,
     nodes: impl IntoIterator<Item = NodeId>,
@@ -1426,10 +1134,6 @@ fn remove_own_nodes(
     Ok(())
 }
 
-/// The columns the table declares, in header order.
-///
-/// Built when the table is built, because the kit table takes its headers as resolved
-/// text; a language switch rebuilds the table.
 fn columns(translate: &Translate) -> impl Iterator<Item = Column> + '_ {
     [
         t_smol!(translate, "widget.financial_calendar.importance"),
@@ -1442,23 +1146,10 @@ fn columns(translate: &Translate) -> impl Iterator<Item = Column> + '_ {
     .map(|(header, weight)| Column::flex(header, weight).align(ColumnAlign::Start))
 }
 
-/// The options the calendar dataset needs from the kit table: a fixed row height (the
-/// dataset declares one) and **no row selection**.
-///
-/// The old dataset drew rows to read, not rows to pick: it had no selection state, no
-/// click handling and no selected-row styling. The kit table defaults to
-/// [`SelectionMode::Multi`], so the pane turns selection off explicitly here — the one
-/// place the decision is made.
 fn table_options(row_height: f32) -> TableOptions {
     TableOptions::fixed(row_height).selection(SelectionMode::None)
 }
 
-/// Everything one cell build reads: the signals a row factory cannot resolve itself,
-/// and the shared model mirror it needs for structural decisions.
-///
-/// The mirror is the same `Rc` the span callback reads: a row factory has no `App`, so
-/// "is this row a day label or an event" is answered from the model the pane mirrored
-/// on the frame that changed the rows.
 struct CellSink {
     table: Signal<Arc<CalendarTable>>,
     model: Rc<RefCell<Arc<CalendarTable>>>,
@@ -1471,12 +1162,6 @@ struct CellSink {
 }
 
 impl CellSink {
-    /// Builds one cell of the calendar table.
-    ///
-    /// The kit table calls this without an application context, so every dynamic value
-    /// is a `bind_*` closure: the text registers its language / zone / model
-    /// dependencies, and the colour is read through the theme on the frame that draws
-    /// it (AGENTS §7/G3).
     fn build(&self, tree: &mut NodeTree, parent: NodeId, row: usize, column: usize) {
         if let Err(error) = self.build_cell(tree, parent, row, column) {
             log::error!("a financial calendar cell could not be built: {error}");
@@ -1503,8 +1188,6 @@ impl CellSink {
         }
     }
 
-    /// The head of a day: the day the events below it fall on, in the language showing
-    /// now.
     fn build_day_label(
         &self,
         tree: &mut NodeTree,
@@ -1544,8 +1227,6 @@ impl CellSink {
         Ok(())
     }
 
-    /// How much the event matters: one mark per level, and none where the page states
-    /// no importance.
     fn build_importance(
         &self,
         tree: &mut NodeTree,
@@ -1593,7 +1274,6 @@ impl CellSink {
         Ok(())
     }
 
-    /// When an event is due, on the clock the settings display data in.
     fn build_time(
         &self,
         tree: &mut NodeTree,
@@ -1623,11 +1303,6 @@ impl CellSink {
         Ok(())
     }
 
-    /// The country an event belongs to.
-    ///
-    /// The code is what the service publishes and what a reader of a calendar scans
-    /// for, so it is drawn as it arrives — upper-cased — rather than translated into a
-    /// country name the answer does not carry.
     fn build_country(
         &self,
         tree: &mut NodeTree,
@@ -1655,7 +1330,6 @@ impl CellSink {
         Ok(())
     }
 
-    /// What happened, with the period the reading is for beside it.
     fn build_name(
         &self,
         tree: &mut NodeTree,
@@ -1713,7 +1387,6 @@ impl CellSink {
     }
 }
 
-/// The label of one importance level.
 fn importance_label(translate: &Translate, importance: Importance) -> SmolStr {
     let key = match importance {
         Importance::Low => "widget.financial_calendar.importance_level.low",
@@ -1725,10 +1398,6 @@ fn importance_label(translate: &Translate, importance: Importance) -> SmolStr {
     t_smol!(translate, key)
 }
 
-/// The id an importance level is chosen by.
-///
-/// It is the level's name rather than its label, so the choice survives a change of
-/// language the way a day's does.
 fn importance_choice_id(importance: Importance) -> SmolStr {
     match importance {
         Importance::Low => SmolStr::new_static("low"),
@@ -1738,23 +1407,16 @@ fn importance_choice_id(importance: Importance) -> SmolStr {
     }
 }
 
-/// The level a menu entry names, or every level when it names none of them.
 fn importance_of_choice_id(choice: &str) -> Option<Importance> {
     Importance::LEVELS
         .into_iter()
         .find(|importance| importance_choice_id(*importance) == choice)
 }
 
-/// The id a day is chosen by.
-///
-/// It is the date itself, written the way a date is read from an answer rather than the
-/// way it is drawn: the label is a word of the language showing now, and a choice has
-/// to survive a change of it.
 fn date_choice_id(date: Date) -> SmolStr {
     format_smolstr!("{date}")
 }
 
-/// One filter's trigger: the column it narrows and the choice it holds.
 fn filter_trigger(translate: &Translate, filter: &SmolStr, value: &SmolStr) -> SmolStr {
     t_smol!(
         translate,
@@ -1764,7 +1426,6 @@ fn filter_trigger(translate: &Translate, filter: &SmolStr, value: &SmolStr) -> S
     )
 }
 
-/// The theme role an importance level is drawn in.
 fn importance_role(importance: Importance) -> Role {
     match importance {
         Importance::Unspecified => Role::FgSubtle,
@@ -1798,9 +1459,6 @@ mod tests {
         test_support::{self, ACCOUNT, FakeSource, FetchPlan},
     };
 
-    // ---------------------------------------------------------------- vocabulary
-
-    /// The translator the product ships: what these tests assert is the catalogue's copy.
     fn product_translate(language: LanguageCode) -> Translate {
         Translate::new(
             Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -1808,7 +1466,6 @@ mod tests {
         )
     }
 
-    /// The framework's headless host, over the product catalogue.
     fn harness() -> WidgetTestApp {
         WidgetTestApp::with_translate(product_translate(LanguageCode::En))
     }
@@ -1823,7 +1480,6 @@ mod tests {
         harness.app_mut().write(&signal, config)
     }
 
-    /// Signs `user_id` in the way the composition root does: a settings write.
     fn sign_in(harness: &mut WidgetTestApp) {
         let mut config = current_config(harness);
         config.account = Some(AccountConfig {
@@ -1837,7 +1493,6 @@ mod tests {
         );
     }
 
-    /// Signs the pane out the way the composition root does: a settings write.
     fn sign_out(harness: &mut WidgetTestApp) {
         let mut config = current_config(harness);
         config.account = None;
@@ -1847,7 +1502,6 @@ mod tests {
         );
     }
 
-    /// Moves the display zone the way the composition root does: a settings write.
     fn set_zone(harness: &mut WidgetTestApp, hours: i8) {
         let mut config = current_config(harness);
         config.data_time_zone =
@@ -1861,7 +1515,6 @@ mod tests {
         }
     }
 
-    /// The answer the fixtures are built from, through the production parse path.
     fn snapshot_with(events: Vec<proto_types::FinancialCalendarEvent>) -> Arc<CalendarSnapshot> {
         Arc::new(
             CalendarSnapshot::parse(proto_types::FinancialCalendar {
@@ -1872,7 +1525,6 @@ mod tests {
         )
     }
 
-    /// An answer of `events` medium events on one UTC day, named `name`.
     fn named_snapshot(events: usize, name: &str) -> Arc<CalendarSnapshot> {
         snapshot_with(
             (0..events)
@@ -1888,8 +1540,6 @@ mod tests {
                 .collect(),
         )
     }
-
-    // -------------------------------------------------------------------- pane
 
     struct Pane {
         widget: FinancialCalendarWidget,
@@ -1920,12 +1570,6 @@ mod tests {
         pane_with(harness, FakeSource::new([FetchPlan::Pending]))
     }
 
-    /// A pane whose countdown reads a clock the test owns.
-    ///
-    /// The engine's clock (the one `WidgetTestApp::advance` moves) schedules the
-    /// countdown's timer; the pane formats the deadline against the wall clock the
-    /// service published it in Unix milliseconds, which is this cell. A test moves both
-    /// to see a tick change the label.
     fn pane_with_clock(
         harness: &mut WidgetTestApp,
         source: FakeSource,
@@ -1951,8 +1595,6 @@ mod tests {
         }
     }
 
-    /// Accepts an answer that schedules the next read `in_ms` milliseconds from the
-    /// test's wall clock, and runs the sync that arms the countdown.
     fn accept_answer(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -1986,8 +1628,6 @@ mod tests {
         settle_frames(harness, pane);
     }
 
-    /// Lets the frame pipeline run a few turns: rows are built on the sync that
-    /// accepted the answer, and the cells are drawn by the frames after it.
     fn settle_frames(harness: &mut WidgetTestApp, pane: &mut Pane) {
         for _ in 0..4 {
             sync(harness, pane);
@@ -1995,8 +1635,6 @@ mod tests {
         }
     }
 
-    /// Reports a calendar as the stream would, with the binding taken out of the way so
-    /// the reported answer is the only input the pane has.
     fn report_snapshot(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -2018,7 +1656,6 @@ mod tests {
         });
     }
 
-    /// Reports a failure as the stream would.
     fn report_failure(harness: &mut WidgetTestApp, pane: &mut Pane) {
         if let Some(binding) = pane.widget.binding.as_mut() {
             binding.cancel();
@@ -2048,22 +1685,16 @@ mod tests {
             .text(&harness.services().translate)
     }
 
-    /// The label the header binds: the time left until the next read.
     fn countdown_label(harness: &WidgetTestApp, pane: &Pane) -> Option<SmolStr> {
         harness.app().read(&pane.widget.countdown.label).clone()
     }
 
-    /// Whether the pane currently holds a one-shot timer for its countdown.
     fn timer_armed(pane: &Pane) -> bool {
         pane.widget.countdown.timer.borrow().is_some()
     }
 
-    /// How many runtime/frame turns [`settle`] may take before it calls the test a
-    /// failure.
     const SETTLE_TURNS: usize = 64;
 
-    /// Lets the host's runtime deliver what the fake source published, and the pane the
-    /// frames it asked for, until `ready` holds.
     fn settle(
         harness: &mut WidgetTestApp,
         pane: &mut Pane,
@@ -2080,8 +1711,6 @@ mod tests {
         }
         panic!("{what} should happen");
     }
-
-    // ------------------------------------------------------------------- table
 
     fn table(pane: &Pane) -> &Table {
         pane.widget
@@ -2105,7 +1734,6 @@ mod tests {
         harness.text_of(node)
     }
 
-    /// The foreground the first text node under `node` draws in.
     fn first_foreground(harness: &WidgetTestApp, node: NodeId) -> Color {
         let tree = harness.tree();
         let mut stack = vec![node];
@@ -2122,7 +1750,6 @@ mod tests {
         panic!("the cell has a text node");
     }
 
-    /// The foreground of every text node under `node`.
     fn foregrounds(harness: &WidgetTestApp, node: NodeId) -> Vec<Color> {
         let tree = harness.tree();
         let mut found = Vec::new();
@@ -2139,7 +1766,6 @@ mod tests {
         found
     }
 
-    /// The background of every node under `node` that has one.
     fn backgrounds(harness: &WidgetTestApp, node: NodeId) -> Vec<Color> {
         let tree = harness.tree();
         let mut found = Vec::new();
@@ -2154,9 +1780,6 @@ mod tests {
         found
     }
 
-    // ------------------------------------------------------------------ header
-
-    /// Builds a parent node the pane's header can be built into.
     fn header_parent(harness: &mut WidgetTestApp, id: &'static str) -> NodeId {
         harness.with_cx(|cx| {
             let root = cx.tree().root();
@@ -2187,7 +1810,6 @@ mod tests {
         harness.text_of(node)
     }
 
-    /// Dispatches the click a kit button's action identity names.
     fn click(harness: &mut WidgetTestApp, node: NodeId) {
         let debug = harness
             .tree()
@@ -2207,14 +1829,11 @@ mod tests {
         );
     }
 
-    /// Writes the request a filter's menu would have written.
     fn request(harness: &mut WidgetTestApp, pane: &mut Pane, request: HeaderRequest) {
         let requests = pane.widget.requests;
         assert!(harness.app_mut().write(&requests, Some(request)));
         sync(harness, pane);
     }
-
-    // ----------------------------------------------------------------- checks
 
     #[test]
     fn every_message_this_pane_shows_should_resolve_to_text() {
@@ -2240,8 +1859,6 @@ mod tests {
             assert!(!t_smol!(translate, key).is_empty(), "{key} has no copy");
         }
     }
-
-    // ------------------------------------------------------------------ state
 
     #[test]
     fn a_pane_without_an_account_should_ask_for_one() {
@@ -2300,8 +1917,6 @@ mod tests {
         );
     }
 
-    /// A read answers with the whole calendar, so an answer of another length is a
-    /// table of another length.
     #[test]
     fn a_second_answer_should_rebuild_the_table_rather_than_append_to_it() {
         let mut harness = harness();
@@ -2330,8 +1945,6 @@ mod tests {
         );
     }
 
-    /// An answer is taken from the account the pane follows and from no other, in
-    /// both directions.
     #[test]
     fn a_late_answer_should_be_ignored_for_either_account_it_does_not_belong_to() {
         let mut harness = harness();
@@ -2407,8 +2020,6 @@ mod tests {
         assert_eq!(rows(&pane), 3, "and so do its rows");
     }
 
-    /// A command the service refused is a failure the pane reports, with the recovery
-    /// every other failure offers.
     #[test]
     fn a_refused_refresh_should_be_reported_as_a_failure() {
         let mut harness = harness();
@@ -2481,11 +2092,6 @@ mod tests {
         );
     }
 
-    /// A message the binding delivers after the pane reported a failure is late by
-    /// definition: `failed` is terminal, and the sentence the user is reading names the
-    /// read that failed. The old pane guarded this entry; the migration dropped the
-    /// guard, and a refusal queued before the stream failed rewrote the banner into
-    /// "a refresh is already waiting".
     #[test]
     fn a_failure_should_not_be_rewritten_by_a_late_command_reply() {
         let mut harness = harness();
@@ -2534,8 +2140,6 @@ mod tests {
         );
     }
 
-    /// Signing out is a waiting state, not a failure: the read the pane replaced with a
-    /// `Stop` can still have a refusal queued, and it may not paint the pane as failed.
     #[test]
     fn signing_out_should_not_be_failed_by_a_late_command_reply() {
         let mut harness = harness();
@@ -2582,8 +2186,6 @@ mod tests {
         );
     }
 
-    /// The request identity decides whose answer arrived: a reply older than the command
-    /// in flight answers a command the pane already replaced, and is dropped and counted.
     #[test]
     fn a_command_reply_older_than_the_one_already_applied_should_be_ignored() {
         let mut harness = harness();
@@ -2604,8 +2206,6 @@ mod tests {
                 Ok(CalendarResponse::RefreshQueued),
                 cx,
             );
-            // A refusal queued before the refresh replaced its call would carry the
-            // older identity; it answers a command the pane no longer waits for.
             pane.widget.apply_rpc_result(
                 RequestId::new(1),
                 Err(RpcCallError::Service {
@@ -2631,7 +2231,6 @@ mod tests {
         );
     }
 
-    /// A failed pane has no schedule left, so it has nothing to count down to.
     #[test]
     fn a_failed_pane_should_stop_counting_down() {
         let mut harness = harness();
@@ -2662,8 +2261,6 @@ mod tests {
         );
     }
 
-    /// The double click the refresh control exists to absorb: the command and the
-    /// answer are two messages, and the service refuses a second command in between.
     #[test]
     fn an_acknowledged_refresh_should_keep_the_control_closed_until_the_answer() {
         let mut harness = harness();
@@ -2722,8 +2319,6 @@ mod tests {
         );
     }
 
-    /// One click is one read and one answer: what the control asks for reaches the
-    /// service, and the answer it waited for is what reopens the control.
     #[test]
     fn a_refresh_should_read_again_and_reopen_the_control() {
         let mut harness = harness();
@@ -2791,7 +2386,6 @@ mod tests {
         );
     }
 
-    /// A whole answer ends the wait even when it draws exactly what was on screen.
     #[test]
     fn an_unchanged_answer_should_end_a_pending_refresh() {
         let mut harness = harness();
@@ -2809,8 +2403,6 @@ mod tests {
         assert_eq!(pane.status.state(harness.app()), WidgetState::Ready);
     }
 
-    /// The zone is the one thing outside the data that decides where a day begins, so
-    /// moving it regroups the rows the pane already has without reading anything.
     #[test]
     fn a_zone_change_should_regroup_the_rows_without_reading_again() {
         let mut harness = harness();
@@ -2873,8 +2465,6 @@ mod tests {
         );
     }
 
-    /// Signing out does not just hide the answer: it ends the poll loop that was
-    /// reading it, so a signed-out pane asks the service for nothing.
     #[test]
     fn signing_out_should_stop_the_poll_loop() {
         let mut harness = harness();
@@ -2932,8 +2522,6 @@ mod tests {
         );
     }
 
-    /// Another account is another read, and the pane hears about it from the settings
-    /// snapshot rather than from a reload.
     #[test]
     fn an_account_change_should_read_the_new_account() {
         let mut harness = harness();
@@ -2987,8 +2575,6 @@ mod tests {
         );
     }
 
-    /// A host with no Kytrix service connection has nothing to ask: that is the pane's
-    /// own failure, with the recovery every failure offers.
     #[test]
     fn a_pane_without_a_service_connection_should_report_a_failure() {
         let mut harness = harness();
@@ -3010,10 +2596,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------- table
-
-    /// The table keeps the four-column dataset semantics: four columns, the declared
-    /// weights, the alignments, and no sorting (the old dataset never sorted).
     #[test]
     fn the_table_should_keep_the_four_column_dataset_semantics() {
         let mut harness = harness();
@@ -3047,7 +2629,6 @@ mod tests {
         assert_eq!(table.rows(), 3, "the accepted row count reaches the table");
     }
 
-    /// The old dataset was a table to read, so the pane keeps row selection off.
     #[test]
     fn the_table_should_not_offer_row_selection() {
         let options = table_options(30.0);
@@ -3063,8 +2644,6 @@ mod tests {
         );
     }
 
-    /// A day's label heads the events below it rather than saying anything about one
-    /// column, so its row is one cell across all four columns.
     #[test]
     fn the_day_labels_should_span_every_column() {
         let mut harness = harness();
@@ -3098,8 +2677,6 @@ mod tests {
         }
     }
 
-    /// The body draws the day head and every column of an event row, each dynamic
-    /// value resolved by the frame that draws it.
     #[test]
     fn the_body_should_draw_the_day_head_and_event_cells() {
         let mut harness = harness();
@@ -3129,8 +2706,6 @@ mod tests {
         );
     }
 
-    /// The time and country columns draw in a muted tone, the name in the default
-    /// foreground and the period in the subtle one.
     #[test]
     fn the_cells_should_draw_in_the_theme_colours() {
         let mut harness = harness();
@@ -3171,8 +2746,6 @@ mod tests {
         );
     }
 
-    /// A language switch rebuilds the table's static copy — its headers and its empty
-    /// sentence are resolved text rather than bindings — while the accepted rows stay.
     #[test]
     fn a_language_change_should_rebuild_the_tables_static_copy() {
         let mut harness = harness();
@@ -3241,8 +2814,6 @@ mod tests {
         );
     }
 
-    /// An answer with nothing in it is content, and the table says so under its
-    /// columns rather than leaving a blank pane.
     #[test]
     fn an_answer_with_nothing_in_it_should_draw_the_no_data_sentence() {
         let mut harness = harness();
@@ -3265,8 +2836,6 @@ mod tests {
         );
     }
 
-    /// A table narrowed to nothing says the filter matched nothing, which is a
-    /// different fact from an answer that carried nothing.
     #[test]
     fn a_filter_that_matches_nothing_should_draw_the_no_matches_sentence() {
         let mut harness = harness();
@@ -3299,9 +2868,6 @@ mod tests {
         );
     }
 
-    /// Structural row changes reach the table's row window even when the number of
-    /// rows is the same: every value inside a row is a binding, so the row remounts
-    /// and then reads the new model.
     #[test]
     fn the_table_should_redraw_the_rows_when_the_answer_changes() {
         let mut harness = harness();
@@ -3334,8 +2900,6 @@ mod tests {
         );
     }
 
-    /// The numbers are read in the display time zone, which the cell resolves inside
-    /// `bind_text`: moving the setting redraws the time column without reading again.
     #[test]
     fn moving_the_display_zone_should_redraw_the_time_column() {
         let mut harness = harness();
@@ -3400,8 +2964,6 @@ mod tests {
         );
     }
 
-    /// `release` hands the table back to the kit component: the handlers the table
-    /// registered are removed with it.
     #[test]
     fn releasing_the_widget_should_release_the_table() {
         let mut harness = harness();
@@ -3433,7 +2995,6 @@ mod tests {
         );
     }
 
-    /// `has_content` is content, not a state: a failed pane still reports its answer.
     #[test]
     fn a_failure_should_not_throw_away_the_answer() {
         let mut harness = harness();
@@ -3452,10 +3013,6 @@ mod tests {
         assert_eq!(pane.widget.model.len(), 3);
     }
 
-    // ------------------------------------------------------------------ header
-
-    /// The header carries the filters on the left and the refresh control on the
-    /// right, with the time left until the next read beside it.
     #[test]
     fn the_header_should_carry_the_filters_the_refresh_and_its_countdown() {
         let mut harness = harness();
@@ -3496,8 +3053,6 @@ mod tests {
         assert!(!pane.widget.refresh_is_disabled(harness.app()));
     }
 
-    /// The four controls of the left group, in the order a reader narrows a calendar
-    /// down: how much it matters, when, where, and the control that clears all three.
     #[test]
     fn the_header_should_draw_the_filters_in_order_and_the_reset_last() {
         let mut harness = harness();
@@ -3531,8 +3086,6 @@ mod tests {
         );
     }
 
-    /// A filter's trigger names the column it narrows and the choice it holds, while
-    /// the menu keeps the choices the answer offers.
     #[test]
     fn a_filter_trigger_should_name_its_filter_and_its_choice() {
         let translate = product_translate(LanguageCode::En);
@@ -3556,8 +3109,6 @@ mod tests {
         );
     }
 
-    /// A filter's menu offers the answer's own days and countries, and the fixed
-    /// importance scale, every one under its "all" option.
     #[test]
     fn a_filter_menu_should_offer_the_answers_options() {
         let mut harness = harness();
@@ -3594,8 +3145,6 @@ mod tests {
         assert_eq!(importance[1].label.as_str(), "Low");
     }
 
-    /// A choice narrows the rows without reading the calendar again, and the reset
-    /// control is what brings every row back.
     #[test]
     fn a_choice_should_narrow_the_rows_and_the_reset_should_bring_them_back() {
         let mut harness = harness();
@@ -3642,8 +3191,6 @@ mod tests {
         assert!(pane.widget.model.filter().is_all());
     }
 
-    /// The reset is a control rather than a method the tests call: the click it
-    /// carries is what clears the choices, and it is the same click a reader makes.
     #[test]
     fn clicking_the_reset_control_should_clear_every_choice() {
         let mut harness = harness();
@@ -3679,8 +3226,6 @@ mod tests {
         assert!(pane.widget.model.filter().is_all());
     }
 
-    /// The options belong to the answer, so a choice the new one no longer offers goes
-    /// back to "all" rather than emptying the table.
     #[test]
     fn a_choice_the_new_answer_no_longer_offers_should_be_reset() {
         let mut harness = harness();
@@ -3715,8 +3260,6 @@ mod tests {
         assert_eq!(rows(&pane), 4, "and every event of it is drawn again");
     }
 
-    /// The importance scale is the page's own rather than the answer's, so a level the
-    /// new answer happens to have no event of is still a choice a reader may keep.
     #[test]
     fn an_importance_choice_should_outlive_an_answer_with_no_event_of_that_level() {
         let mut harness = harness();
@@ -3751,8 +3294,6 @@ mod tests {
         assert_eq!(rows(&pane), 0, "and nothing of the new answer is of it");
     }
 
-    /// The days an answer holds move with the zone, so a day the new grouping does not
-    /// hold is a choice it cannot keep either.
     #[test]
     fn a_day_the_zone_takes_away_should_reset_the_choice() {
         let mut harness = harness();
@@ -3818,8 +3359,6 @@ mod tests {
         assert_eq!(rows(&pane), 0);
     }
 
-    /// A language is not a reason to read the calendar again: the frame that draws a
-    /// label or a day asks the catalogue in the language showing then.
     #[test]
     fn a_language_change_should_neither_read_again_nor_drop_the_rows() {
         let mut harness = harness();
@@ -3849,9 +3388,6 @@ mod tests {
         assert!(pane.widget.has_content());
     }
 
-    /// A language switch rebuilds the header's trigger text (the choice a filter holds
-    /// is the trigger's placeholder, resolved when the select is built) without
-    /// leaving the old group behind.
     #[test]
     fn a_language_change_should_rebuild_the_header_copy() {
         let mut harness = harness();
@@ -3881,8 +3417,6 @@ mod tests {
         );
     }
 
-    /// A ready pane in the steady state draws nothing and asks for no frame (I3): the
-    /// countdown's timer wakes the engine once a tick, not the frame pipeline.
     #[test]
     fn a_ready_pane_should_not_request_frames_in_the_steady_state() {
         let mut harness = harness();
@@ -3912,10 +3446,6 @@ mod tests {
         );
     }
 
-    // --------------------------------------------------------------- countdown
-
-    /// A pane whose countdown reads a clock the test owns, loaded and with its body
-    /// built: what every countdown test starts from before it accepts an answer.
     fn countdown_pane(harness: &mut WidgetTestApp, clock: &Rc<StdCell<i64>>) -> Pane {
         let mut pane = pane_with_clock(
             harness,
@@ -3927,8 +3457,6 @@ mod tests {
         pane
     }
 
-    /// The countdown is written by the answer and ticks once per interval, and only
-    /// the tick that changed the label asks for a frame (I3).
     #[test]
     fn a_countdown_tick_should_ask_for_a_frame_only_when_its_label_changed() {
         let mut harness = harness();
@@ -3937,16 +3465,12 @@ mod tests {
         let mut pane = countdown_pane(&mut harness, &clock);
         accept_answer(&mut harness, &mut pane, &clock, 600_000);
         let (_, right) = build_header(&mut harness, &mut pane);
-        // The header's own first frame settles its text; measure after it.
         harness.drain();
 
         assert_eq!(countdown_text(&harness, right), "10:00");
         assert!(timer_armed(&pane), "a ready pane keeps one timer armed");
         let frames = harness.frame_requests();
 
-        // A tick that leaves the label where it was draws nothing. `frame_requests` is
-        // I3's assertion surface (AGENTS §11): the idle round asks for no frame, even
-        // though the engine may still present a frame an earlier build left pending.
         harness.advance(COUNTDOWN_TICK);
         assert_eq!(countdown_text(&harness, right), "10:00");
         assert_eq!(
@@ -3955,8 +3479,6 @@ mod tests {
             "a tick that leaves the label where it was asks for nothing"
         );
 
-        // A second later the label moved, and the write asks for the frame that draws
-        // it.
         clock.set(1_000);
         harness.advance(COUNTDOWN_TICK);
         assert_eq!(countdown_text(&harness, right), "09:59");
@@ -3966,8 +3488,6 @@ mod tests {
         );
     }
 
-    /// The timer re-arms itself for the next tick, so the label keeps moving without
-    /// any polling task.
     #[test]
     fn a_countdown_should_rearm_its_timer_for_each_tick() {
         let mut harness = harness();
@@ -4015,8 +3535,6 @@ mod tests {
         );
     }
 
-    /// A failure takes the countdown off at once rather than a tick later, and the
-    /// timer is gone with it.
     #[test]
     fn a_failure_should_stop_the_countdown_timer() {
         let mut harness = harness();
@@ -4033,8 +3551,6 @@ mod tests {
         assert!(countdown_label(&harness, &pane).is_none());
     }
 
-    /// The countdown belongs to a ready pane: a read in flight has nothing to count
-    /// down to.
     #[test]
     fn an_accepted_command_should_leave_nothing_to_count_down_to() {
         let mut harness = harness();
@@ -4055,8 +3571,6 @@ mod tests {
         assert!(!timer_armed(&pane));
     }
 
-    /// The countdown is a signal drawn beside the refresh control: an idle pane draws
-    /// no countdown at all, and an accepted answer states the time left.
     #[test]
     fn the_header_should_draw_the_countdown_beside_the_refresh_control() {
         let mut harness = harness();

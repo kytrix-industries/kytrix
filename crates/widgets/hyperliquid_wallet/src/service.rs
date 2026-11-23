@@ -1,52 +1,3 @@
-//! What a Hyperliquid wallet asks the venue for, and how it keeps the answer current.
-//!
-//! # What one stream is about
-//!
-//! A stream is about one wallet address and nothing else. The pane follows addresses, and which of
-//! the venue's partitions an address holds data in is the venue's answer rather than a choice the
-//! user made, so no route appears in a request, in a stream key or in the configuration — and an
-//! address is drawn once however many partitions it trades on.
-//!
-//! # How one reading covers every partition
-//!
-//! The venue answers about a wallet in two shapes. Some requests name a partition — the account
-//! state and the open orders carry a DEX parameter, so each perpetual partition is read once — and
-//! some name only the user (fills, ledger, historical orders and the fast asset contexts), so they
-//! are read once and decoded against the union of every partition's catalog. An address therefore
-//! reads its partitions concurrently and merges them by listing, which is unique to the partition
-//! that published it. [`WalletRouteKinds`] decides which partition is read which way, from the
-//! catalogs rather than from the routes' names.
-//!
-//! # Three streams, because a wallet is read three ways
-//!
-//! A wallet's overview is a live total, its timeline is a window of fills that is re-read every
-//! ten seconds, and a detail tab is a reading taken when it is opened. They fail independently
-//! — a rate-limited timeline request says nothing about the totals beside it — so they are
-//! three streams under three keys rather than one, and the pane decides which of them it is
-//! showing.
-//!
-//! # Why the overview rebases
-//!
-//! The venue's account state arrives two ways: as a total the venue computed, and as the
-//! events that moved it. Applying an event to a total is only correct while the total is the
-//! one that event follows, and a reconnecting subscription replays a snapshot of the events it
-//! has seen — which the HTTP totals may already include. So a replayed snapshot is what makes
-//! the totals stale, and it is answered by reading them again while the events that arrive
-//! during that read are held in order and replayed onto the fresh totals.
-//!
-//! # Why an event is applied once
-//!
-//! The replayed snapshot overlaps both the HTTP history and the live stream, so every event is
-//! reduced to an identifier and applied only the first time it is seen. The identifiers are
-//! kept in a bounded set: what matters is the overlaps around a rebase, not the history.
-//!
-//! # Where the money comes from
-//!
-//! The venue's own mark and mid prices arrive on a separate, route-level subscription, and a
-//! total is only as true as the prices it is valued at. So the overview and the two valuation
-//! tabs subscribe to it and revalue on every update, which is why a wallet's total moves
-//! without a fill.
-
 use std::{collections::VecDeque, convert::Infallible, future::Future, sync::Arc, time::Duration};
 
 use ahash::AHashSet;
@@ -101,19 +52,12 @@ use super::{
     watch::MAX_WALLET_ADDRESSES,
 };
 
-/// How often a wallet's timeline is read again.
 const TIMELINE_INTERVAL: Duration = Duration::from_secs(10);
-/// How much ledger history one wallet is read with.
 const LEDGER_WINDOW: i64 = 30 * 24 * 60 * 60 * 1_000;
-/// How many events one rebase may hold while the fresh totals are being read.
 const MAX_REBASE_INCREMENT_EVENTS: usize = 4_096;
-/// How many applied events are remembered, which is what makes a replay apply once.
 const MAX_APPLIED_INCREMENT_IDS: usize = 4_096;
-/// The venue caps one `userFillsByTime` answer at this many fills, so a larger one is refused
-/// rather than drawn as if it were the window it claims to be.
 const MAX_TIMELINE_FILLS: usize = 2_000;
 
-/// What one wallet reading could not be made from.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub(super) enum WalletStreamError {
     #[error(transparent)]
@@ -127,12 +71,6 @@ pub(super) enum WalletStreamError {
         operation: &'static str,
         capacity: usize,
     },
-    /// One partition of one reading could not be made.
-    ///
-    /// An address's reading covers every partition the venue publishes, and a reading with one
-    /// partition missing is not the number it claims to be. So the failure is attributed to the
-    /// partition rather than flattened into a general one: the user can see which partition
-    /// broke, and the retry control restarts that address's whole reading.
     #[error("reading the Hyperliquid wallet data of {route} failed: {source}")]
     DexRead {
         route: VenueRoute,
@@ -146,8 +84,6 @@ pub(super) enum WalletStreamError {
 
 impl TranslatedError for WalletStreamError {
     fn translated_message(&self, translate: &Translate) -> SmolStr {
-        // The venue this widget reads is named by the catalogue rather than spelled
-        // into each message, so a sentence about it follows a rename of it.
         let market = VenueId::Hyperliquid.display_string(translate);
         match self {
             Self::Account(error) => error.translated_message(translate),
@@ -184,46 +120,35 @@ impl TranslatedError for WalletStreamError {
     }
 }
 
-/// What the pane asks its service to do.
 #[derive(Clone, Debug)]
 pub(super) enum WalletRequest {
-    /// Follows these addresses, starting whatever is not already running.
-    Load { addresses: Vec<WalletAddress> },
-    /// Follows these addresses, reading every one of their totals again.
-    ///
-    /// The market this pane reads was loaded again: a wallet's totals are displayed with the
-    /// precision its stream resolved from the catalogs when it was opened, so every one of those
-    /// streams has to resolve again. The addresses are the whole set to follow, the way a load
-    /// states it, because the request this stands in for may have been replaced before the
-    /// service saw it.
-    Reload { addresses: Vec<WalletAddress> },
-    /// Starts the overview of the addresses that failed again.
-    Retry { addresses: Vec<WalletAddress> },
-    /// Reads one wallet's timeline again.
-    RetryTimeline { address: WalletAddress },
-    /// Reads one tab of one wallet.
+    Load {
+        addresses: Vec<WalletAddress>,
+    },
+    Reload {
+        addresses: Vec<WalletAddress>,
+    },
+    Retry {
+        addresses: Vec<WalletAddress>,
+    },
+    RetryTimeline {
+        address: WalletAddress,
+    },
     LoadDetail {
         address: WalletAddress,
         tab: DetailTab,
     },
-    /// Reads one tab of one wallet again.
     RetryDetail {
         address: WalletAddress,
         tab: DetailTab,
     },
 }
 
-/// What the service answers a pane that asked for something.
 #[derive(Clone, Debug)]
 pub(super) enum WalletResponse {
     StreamsStarted,
 }
 
-/// Which reading a stream is.
-///
-/// A key names one address, which is the whole identity of a reading: a discovery that makes a
-/// partition appear does not turn a reading about an address into another reading, it only changes
-/// what that reading covers.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum WalletStreamKey {
     Overview {
@@ -238,7 +163,6 @@ pub(super) enum WalletStreamKey {
     },
 }
 
-/// What one stream reports about itself.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WalletStatus {
     Connecting,
@@ -246,7 +170,6 @@ pub(super) enum WalletStatus {
     Failed(WalletStreamError),
 }
 
-/// What one stream publishes.
 #[derive(Clone, Debug)]
 pub(super) enum WalletStreamMessage {
     Status(WalletStatus),
@@ -265,49 +188,30 @@ impl WidgetProtocol for WalletProtocol {
     type Error = Infallible;
 }
 
-/// Everything one pane reads a wallet through.
-///
-/// The seam is the venue itself rather than the questions a pane asks: what a detail tab is
-/// made of is this service's business, and a fake only has to answer what the venue would.
 pub(super) trait WalletSource: Clone + Send + Sync + 'static {
     type Subscription: WalletSubscription;
 
-    /// The routes one reading of an address covers.
-    ///
-    /// They come from the registry rather than from the pane: which partitions this venue
-    /// publishes is its own answer, and every route that monitors wallets and publishes a catalog
-    /// is one of them. The set is read at the moment of the read, so a registry that moved between
-    /// two readings is picked up by the next one.
     fn wallet_routes(&self) -> Vec<VenueRoute>;
-    /// One wallet's spot balances.
-    ///
-    /// A balance is held in an asset rather than on a partition, so any of the venue's routes can
-    /// be asked for it; the route given is the one whose catalog this reading is ensured against.
     fn fetch_spot_state(
         &self,
         route: &VenueRoute,
         address: &WalletAddress,
     ) -> impl Future<Output = Result<HyperliquidSpotState, AccountError>> + Send;
-    /// One wallet's perpetual positions on one partition.
     fn fetch_perpetual_state(
         &self,
         route: &VenueRoute,
         address: &WalletAddress,
     ) -> impl Future<Output = Result<HyperliquidPerpetualState, AccountError>> + Send;
-    /// The spot pairs one route publishes, which is route metadata rather than a
-    /// wallet's own state.
     fn fetch_spot_pairs(
         &self,
         route: &VenueRoute,
     ) -> impl Future<Output = Result<Vec<HyperliquidSpotPair>, AccountError>> + Send;
-    /// One wallet's fills, decoded across every route given.
     fn fetch_fills(
         &self,
         address: &WalletAddress,
         aggregate_by_time: bool,
         routes: &[VenueRoute],
     ) -> impl Future<Output = Result<Vec<HyperliquidUserFill>, AccountError>> + Send;
-    /// One wallet's fills inside a bounded window, decoded across every route given.
     fn fetch_fills_by_time(
         &self,
         address: &WalletAddress,
@@ -315,51 +219,37 @@ pub(super) trait WalletSource: Clone + Send + Sync + 'static {
         end_timestamp: i64,
         routes: &[VenueRoute],
     ) -> impl Future<Output = Result<Vec<HyperliquidUserFill>, AccountError>> + Send;
-    /// One wallet's ledger from `start_time` on, decoded across every route given.
     fn fetch_ledger(
         &self,
         address: &WalletAddress,
         start_time: i64,
         routes: &[VenueRoute],
     ) -> impl Future<Output = Result<Vec<HyperliquidLedgerEvent>, AccountError>> + Send;
-    /// One wallet's open orders on one partition.
     fn fetch_open_orders(
         &self,
         route: &VenueRoute,
         address: &WalletAddress,
     ) -> impl Future<Output = Result<Vec<HyperliquidOpenOrder>, AccountError>> + Send;
-    /// One wallet's historical orders, decoded across every route given.
     fn fetch_historical_orders(
         &self,
         address: &WalletAddress,
         routes: &[VenueRoute],
     ) -> impl Future<Output = Result<Vec<HyperliquidHistoricalOrder>, AccountError>> + Send;
-    /// One route's published catalog, which is what a reading is displayed with.
-    ///
-    /// A route publishes one catalog rather than one per market: the spot partition's carries its
-    /// pairs, and every other partition's carries its perpetual listings.
     fn fetch_catalog(
         &self,
         route: &VenueRoute,
     ) -> impl Future<Output = Result<Arc<[CatalogEntry]>, AccountError>> + Send;
-    /// The display generation this source reads its catalogs from.
     fn display_generation(&self) -> DisplaySnapshot;
-    /// One wallet's fills stream, decoded across every route given.
     fn subscribe_fills(
         &self,
         address: &WalletAddress,
         routes: &[VenueRoute],
     ) -> impl Future<Output = Result<Self::Subscription, AccountError>> + Send;
-    /// One wallet's ledger stream, decoded across every route given.
     fn subscribe_ledger(
         &self,
         address: &WalletAddress,
         routes: &[VenueRoute],
     ) -> impl Future<Output = Result<Self::Subscription, AccountError>> + Send;
-    /// The venue's fast asset-context stream, decoded across every route given.
-    ///
-    /// It names no wallet: the venue broadcasts every partition's contexts on one subscription,
-    /// and the set is what the answer is filtered to.
     fn subscribe_fast_contexts(
         &self,
         routes: &[VenueRoute],
@@ -368,32 +258,19 @@ pub(super) trait WalletSource: Clone + Send + Sync + 'static {
         Self::Subscription: Sized;
 }
 
-/// One wallet's live updates, as the venue reports them.
 pub(super) trait WalletSubscription: Send + 'static {
     fn recv(
         &mut self,
     ) -> impl Future<Output = Option<Result<HyperliquidWalletUpdate, AccountError>>> + Send;
 }
 
-/// One loaded scope, as a wallet reading sees it.
-///
-/// The three facts are one reading of one commit: the route, whether it monitors
-/// wallets and whether it publishes a catalog a reading can be displayed with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WalletScope {
-    /// The route of this scope.
     pub route: VenueRoute,
-    /// Whether this scope serves the wallet monitor.
     pub monitors_wallets: bool,
-    /// Whether this scope publishes a catalog.
     pub provides_catalog: bool,
 }
 
-/// Reads every scope the loaded venues answer, as a wallet reading sees them.
-///
-/// The routes and the entries they are read from come from one reading of one commit —
-/// [`LoadedVenues::entries`] takes the venue table's lock once — so a route a reading
-/// covers and the capabilities it is filtered by are the same commit's.
 pub(crate) fn loaded_scopes(venues: &LoadedVenues) -> Vec<WalletScope> {
     venues
         .entries()
@@ -409,13 +286,6 @@ pub(crate) fn loaded_scopes(venues: &LoadedVenues) -> Vec<WalletScope> {
         .collect()
 }
 
-/// The routes one wallet reading covers, among the loaded scopes.
-///
-/// This widget is Hyperliquid's: its readings are decoded against that venue's catalogs, and it
-/// knows nothing about anybody else's accounts. So a route of another venue that also monitors a
-/// wallet monitor is not one of them — reading it would fail every address with a partition error
-/// the pane can do nothing about. A route counts when it belongs to this venue, monitors wallets,
-/// and publishes a catalog a reading can be displayed with.
 pub(crate) fn wallet_routes_of(scopes: &[WalletScope]) -> Vec<VenueRoute> {
     scopes
         .iter()
@@ -428,7 +298,6 @@ pub(crate) fn wallet_routes_of(scopes: &[WalletScope]) -> Vec<VenueRoute> {
         .collect()
 }
 
-/// The venue, through the market participants connector.
 #[derive(Clone)]
 pub(super) struct ClientWalletSource {
     connector: MarketParticipantsConnector,
@@ -595,7 +464,6 @@ impl WalletSubscription for ClientWalletSubscription {
     }
 }
 
-/// One wallet's three live subscriptions, as one source of updates.
 struct WalletSubscriptions<S: WalletSubscription> {
     fills: S,
     ledger: S,
@@ -603,7 +471,6 @@ struct WalletSubscriptions<S: WalletSubscription> {
 }
 
 impl<S: WalletSubscription> WalletSubscriptions<S> {
-    /// The next update from any of them, whichever arrives first.
     async fn recv(&mut self) -> Result<HyperliquidWalletUpdate, WalletStreamError> {
         let update = tokio::select! {
             update = self.fills.recv() => update,
@@ -616,7 +483,6 @@ impl<S: WalletSubscription> WalletSubscriptions<S> {
     }
 }
 
-/// What one pane reads its wallets through.
 pub(super) struct WalletService<S = ClientWalletSource> {
     source: S,
 }
@@ -638,8 +504,6 @@ where
             if reply.deadline() <= Instant::now() || reply.is_cancelled() {
                 continue;
             }
-            // An address of a load starts two streams, its totals and its timeline; a detail
-            // stream is started by the one request that opens its tab.
             let mut started = Vec::with_capacity(MAX_WALLET_ADDRESSES * 2);
             match request {
                 WalletRequest::Load { addresses } => {
@@ -664,10 +528,6 @@ where
                 WalletRequest::Reload { addresses } => {
                     follow_addresses(&mut context, &mut followed, addresses.clone());
                     for address in &addresses {
-                        // The totals are what a reload is about: that reading is displayed with
-                        // the precision its stream resolved when it was opened. A timeline reads
-                        // the current catalogs on every tick of its own, so it is only started
-                        // for an address that is not being read at all.
                         start_overview(
                             &mut context,
                             self.source.clone(),
@@ -685,9 +545,6 @@ where
                     }
                 }
                 WalletRequest::Retry { addresses } => {
-                    // A recovery restarts what failed and nothing else: the addresses that are
-                    // still reading keep their streams, and the set being followed is whatever
-                    // the last load settled on.
                     for address in addresses {
                         if !is_followed(&followed, &address) {
                             continue;
@@ -755,17 +612,12 @@ where
     }
 }
 
-/// Whether the addresses one pane follows still hold this one.
 fn is_followed(followed: &Option<Vec<WalletAddress>>, address: &WalletAddress) -> bool {
     followed
         .as_deref()
         .is_some_and(|current| current.contains(address))
 }
 
-/// Follows a new address set, stopping the streams of the addresses that left it.
-///
-/// A list that did not move leaves every stream running: a repeated load is not a reason to
-/// re-read a wallet that is already being read.
 fn follow_addresses(
     context: &mut ServiceContext<WalletProtocol>,
     followed: &mut Option<Vec<WalletAddress>>,
@@ -784,21 +636,18 @@ fn follow_addresses(
     }
 }
 
-/// The key of one wallet's totals.
 fn overview_key(address: &WalletAddress) -> WalletStreamKey {
     WalletStreamKey::Overview {
         address: address.clone(),
     }
 }
 
-/// The key of one wallet's timeline.
 fn timeline_key(address: &WalletAddress) -> WalletStreamKey {
     WalletStreamKey::Timeline {
         address: address.clone(),
     }
 }
 
-/// The key of one tab of one wallet.
 fn detail_key(address: &WalletAddress, tab: DetailTab) -> WalletStreamKey {
     WalletStreamKey::Detail {
         address: address.clone(),
@@ -806,7 +655,6 @@ fn detail_key(address: &WalletAddress, tab: DetailTab) -> WalletStreamKey {
     }
 }
 
-/// Stops following one wallet a pane no longer holds.
 fn cancel_wallet(context: &mut ServiceContext<WalletProtocol>, address: &WalletAddress) {
     context.cancel_stream(&overview_key(address));
     context.cancel_stream(&timeline_key(address));
@@ -877,7 +725,6 @@ fn start_detail<S: WalletSource>(
     }
 }
 
-/// Publishes a status a pane reports.
 async fn publish_status(
     publisher: &StreamPublisher<WalletProtocol>,
     status: WalletStatus,
@@ -887,16 +734,11 @@ async fn publish_status(
         .await
 }
 
-/// Reports why a stream stopped, and waits for the pane to replace it.
-///
-/// A failure is terminal: nothing is retried here, and the stream parks until the pane asks for
-/// it again.
 async fn fail(publisher: &StreamPublisher<WalletProtocol>, error: WalletStreamError) {
     let _ = publish_status(publisher, WalletStatus::Failed(error)).await;
     publisher.cancelled().await;
 }
 
-/// One wallet's totals, kept current from the venue's live account updates.
 async fn run_overview<S: WalletSource>(
     source: S,
     address: WalletAddress,
@@ -916,9 +758,6 @@ async fn run_overview_once<S: WalletSource>(
     address: WalletAddress,
     publisher: &StreamPublisher<WalletProtocol>,
 ) -> Result<(), WalletStreamError> {
-    // One route set and one grouping for the whole stream: a reading is internally consistent,
-    // and a registry that moves while a stream is running is picked up by the next reading
-    // rather than by half of this one.
     let routes = source.wallet_routes();
     let labels = source.display_generation();
     let start_time = ledger_start()?;
@@ -944,9 +783,6 @@ async fn run_overview_once<S: WalletSource>(
             },
         )
     };
-    // Both halves are awaited together: a subscription that opens before the totals were read
-    // would deliver events the totals do not yet include, and the totals read before the
-    // subscription opened would be missing whatever happened in between.
     let baseline = read_baseline(source, &routes, &address, start_time);
     let ((fills, ledger, fast_contexts), baseline) = tokio::select! {
         biased;
@@ -1022,11 +858,8 @@ async fn run_overview_once<S: WalletSource>(
     }
 }
 
-/// One address's totals, as every partition of the venue answered for it.
 struct WalletBaseline {
-    /// Which partitions are read which way, decided from the catalogs below.
     kinds: WalletRouteKinds,
-    /// Every route's published catalog, which is what the reading is decoded and displayed with.
     catalogs: Vec<(VenueRoute, Arc<[CatalogEntry]>)>,
     spot: HyperliquidSpotState,
     perpetual: HyperliquidPerpetualState,
@@ -1035,11 +868,6 @@ struct WalletBaseline {
     ledger: Vec<HyperliquidLedgerEvent>,
 }
 
-/// Reads one address's totals, at one moment.
-///
-/// The catalogs come first because they are what decides which partition is read which way; the
-/// reads that follow them run concurrently. A partition that fails fails the address: a reading
-/// missing one partition is not the total it claims to be.
 async fn read_baseline<S: WalletSource>(
     source: &S,
     routes: &[VenueRoute],
@@ -1076,18 +904,10 @@ async fn read_baseline<S: WalletSource>(
     })
 }
 
-/// The route a spot balance is read through, when the venue published one.
-///
-/// A balance is held in an asset rather than on a partition, so any route answers for it; a route
-/// that published spot listings is preferred because this read ensures its catalog first.
 fn spot_route<'a>(kinds: &'a WalletRouteKinds, routes: &'a [VenueRoute]) -> Option<&'a VenueRoute> {
     kinds.spot().first().or_else(|| routes.first())
 }
 
-/// Every route's published catalog, one read per route.
-///
-/// This is the union a reading is displayed with: a listing's precision belongs to the partition
-/// that published it, so all of them are needed at once (门禁 G1).
 async fn read_catalogs<S: WalletSource>(
     source: &S,
     routes: &[VenueRoute],
@@ -1106,10 +926,6 @@ async fn read_catalogs<S: WalletSource>(
     Ok(catalogs)
 }
 
-/// One wallet's spot balances.
-///
-/// A reading with no partition to ask is a failure rather than an empty reading: the registry
-/// publishes the routes a wallet is read from, so an empty set means nothing could be read at all.
 async fn read_spot_state<S: WalletSource>(
     source: &S,
     route: Option<&VenueRoute>,
@@ -1128,10 +944,6 @@ async fn read_spot_state<S: WalletSource>(
         .map_err(WalletStreamError::from)
 }
 
-/// One wallet's positions across every perpetual partition, at one moment.
-///
-/// A listing belongs to exactly one partition, so the merge is a concatenation rather than a
-/// choice between two answers about the same market.
 async fn read_perpetual_states<S: WalletSource>(
     source: &S,
     routes: &[VenueRoute],
@@ -1151,7 +963,6 @@ async fn read_perpetual_states<S: WalletSource>(
     Ok(HyperliquidPerpetualState { positions })
 }
 
-/// One wallet's open orders across every perpetual partition.
 async fn read_open_orders<S: WalletSource>(
     source: &S,
     routes: &[VenueRoute],
@@ -1167,7 +978,6 @@ async fn read_open_orders<S: WalletSource>(
     Ok(orders.into_iter().flatten().collect())
 }
 
-/// The spot pairs every spot partition publishes.
 async fn read_spot_pairs<S: WalletSource>(
     source: &S,
     routes: &[VenueRoute],
@@ -1182,22 +992,16 @@ async fn read_spot_pairs<S: WalletSource>(
     Ok(pairs.into_iter().flatten().collect())
 }
 
-/// One wallet's totals, and what has already been applied to them.
 struct OverviewState {
     spot: HyperliquidSpotState,
     perpetual: HyperliquidPerpetualState,
     pairs: Vec<HyperliquidSpotPair>,
     contexts: Vec<HyperliquidAssetContext>,
     applied_increment_ids: AppliedIncrementIds,
-    /// Whether a replayed fills snapshot has already been seen once.
-    ///
-    /// The first one is what a fresh subscription always sends, so only a second one means the
-    /// subscription was replaced under totals that had moved on.
     fills_snapshot_received: bool,
 }
 
 impl OverviewState {
-    /// What this wallet is worth right now.
     fn summary(&self, precision: &DisplayPrecision) -> AccountSummary {
         AccountSummary::from_states(
             &self.spot,
@@ -1220,10 +1024,6 @@ impl OverviewState {
     }
 }
 
-/// What has already been applied to a wallet's totals.
-///
-/// It is bounded in both directions: an identifier is remembered once, and the oldest is
-/// forgotten at capacity, which is what keeps a long-lived pane from growing with its history.
 struct AppliedIncrementIds {
     ids: AHashSet<AppliedIncrementId>,
     order: VecDeque<AppliedIncrementId>,
@@ -1248,7 +1048,6 @@ impl AppliedIncrementIds {
         }
     }
 
-    /// Remembers an identifier, and says whether this is the first time it was seen.
     fn insert(&mut self, id: AppliedIncrementId) -> bool {
         if self.ids.contains(&id) {
             return false;
@@ -1269,7 +1068,6 @@ impl AppliedIncrementIds {
     }
 }
 
-/// What makes one event the same event as another.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum AppliedIncrementId {
     Fill {
@@ -1306,10 +1104,6 @@ impl AppliedIncrementId {
     }
 }
 
-/// Reads the totals again, and replays what arrived while it was reading.
-///
-/// The contexts are cleared first: a total valued at a price from before the rebase would be
-/// stale in a way nothing later corrects.
 async fn rebase_overview<S: WalletSource>(
     source: &S,
     address: &WalletAddress,
@@ -1343,14 +1137,11 @@ async fn rebase_overview<S: WalletSource>(
     }
 }
 
-/// The events that arrived while the totals were being read again.
 #[derive(Default)]
 struct RebaseUpdateBuffer {
     account_updates: VecDeque<HyperliquidWalletUpdate>,
     account_event_count: usize,
-    /// The contexts are a cache rather than a log, so only the newest one is worth replaying.
     latest_fast_contexts: Option<Vec<HyperliquidAssetContext>>,
-    /// Whether another replay arrived while this rebase was running.
     rebase_requested: bool,
 }
 
@@ -1410,7 +1201,6 @@ impl RebaseUpdateBuffer {
     }
 }
 
-/// Applies one live update to a wallet's totals.
 fn apply_update(
     update: HyperliquidWalletUpdate,
     state: &mut OverviewState,
@@ -1448,12 +1238,6 @@ fn apply_update(
     }
 }
 
-/// Moves one perpetual position by a fill.
-///
-/// A fill says where the position started and which way it went, so the size after it is the
-/// start plus the fill and the entry price is only what the fill changed: an addition averages
-/// the two entries, a reduction leaves the entry alone, and a flip is a new position at the
-/// fill's price.
 fn apply_perpetual_fill(
     state: &mut HyperliquidPerpetualState,
     fill: &HyperliquidUserFill,
@@ -1490,8 +1274,6 @@ fn apply_perpetual_fill(
         }
         return Ok(());
     }
-    // The size is a magnitude, so where the fill left the position is what its direction says:
-    // a fill that crosses zero leaves a position on the other side, not the same one.
     let direction = if end.inner().is_negative() {
         PositionDirection::Short
     } else {
@@ -1569,14 +1351,6 @@ fn apply_perpetual_fill(
     Ok(())
 }
 
-/// Moves one spot balance by a transfer.
-///
-/// Five ledger deltas move the USDC a wallet holds on the spot side: a deposit and a withdrawal
-/// cross the venue's boundary, an internal transfer or a sub-account transfer moves it between
-/// wallets, and an account class transfer moves it between the spot and perpetual balances of
-/// one wallet. Every other kind the venue reports — a token transfer, a vault, a staking reward
-/// — is a record of something this does not account for here, and the next reading of the spot
-/// state is what settles it.
 fn apply_spot_ledger(
     state: &mut HyperliquidSpotState,
     event: &HyperliquidLedgerEvent,
@@ -1653,7 +1427,6 @@ fn publish_overview(
         .map_err(|_| WalletStreamError::StreamClosed)
 }
 
-/// One wallet's fills over the window a timeline shows, re-read on a fixed cadence.
 async fn run_timeline<S: WalletSource>(
     source: S,
     address: WalletAddress,
@@ -1691,8 +1464,6 @@ async fn run_timeline<S: WalletSource>(
             .await;
             return;
         };
-        // The window is re-read against the routes the registry publishes right now, so a
-        // partition that appeared since the last tick is covered by the next one.
         let routes = source.wallet_routes();
         let result = tokio::select! {
             biased;
@@ -1737,8 +1508,6 @@ async fn run_timeline<S: WalletSource>(
                 return;
             }
         }
-        // The cadence is measured from when the request went out, so a slow answer does not
-        // push the next one later and later.
         next_tick = request_started + TIMELINE_INTERVAL;
         let now = Instant::now();
         while next_tick <= now {
@@ -1747,7 +1516,6 @@ async fn run_timeline<S: WalletSource>(
     }
 }
 
-/// One tab of one wallet, revalued while it is open if it holds a live value.
 async fn run_detail<S: WalletSource>(
     source: S,
     address: WalletAddress,
@@ -1849,10 +1617,6 @@ async fn run_detail<S: WalletSource>(
     }
 }
 
-/// Reads one tab of one wallet, as the venue answers it.
-///
-/// Every tab is displayed against the union of every route's catalog: a reading is one shape of one
-/// account, and the account holds its markets on whichever partition listed them.
 async fn fetch_detail<S: WalletSource>(
     source: &S,
     address: &WalletAddress,
@@ -1891,8 +1655,6 @@ async fn fetch_detail<S: WalletSource>(
             )?)
         }
         DetailTab::Trades => {
-            // A fill can be a spot fill, so the union carries the spot partitions' listings as
-            // well: the reading is refused rather than drawn without the precision it needs.
             let (precision, _) = precision_of(source, routes, labels).await?;
             let fills = source.fetch_fills(address, true, routes).await?;
             Ok(DetailSnapshot::new(
@@ -1909,8 +1671,6 @@ async fn fetch_detail<S: WalletSource>(
             )?)
         }
         DetailTab::Ledger => {
-            // The ledger's own read is what ensures every route's catalog here: its amounts are
-            // money, and the rows it carries are resolved against that union by the connector.
             let events = source
                 .fetch_ledger(address, ledger_start()?, routes)
                 .await?;
@@ -1922,7 +1682,6 @@ async fn fetch_detail<S: WalletSource>(
     }
 }
 
-/// The precision every route's catalog describes, with the grouping derived from them.
 async fn precision_of<S: WalletSource>(
     source: &S,
     routes: &[VenueRoute],
@@ -1934,7 +1693,6 @@ async fn precision_of<S: WalletSource>(
     Ok((precision, kinds))
 }
 
-/// The start of the ledger history one wallet is read with.
 fn ledger_start() -> Result<i64, WalletStreamError> {
     let now = now_millis().ok_or_else(time_error)?;
     now.checked_sub(LEDGER_WINDOW).ok_or_else(time_error)
@@ -1965,22 +1723,18 @@ mod tests {
         wait_for_status, wallet_balance,
     };
 
-    /// The address list one test drives the service with.
     fn wallets(addresses: &[WalletAddress]) -> Vec<WalletAddress> {
         addresses.to_vec()
     }
 
-    /// A venue whose routes publish the test listings.
     fn venue() -> TestSource {
         TestSource::new(&test_routes())
     }
 
-    /// The perpetual listing every test reading is about.
     fn listing() -> VenueListingKey {
         crate::test_support::listing_key(&perpetual_route(), "ETH")
     }
 
-    /// The overview reading one message carries.
     fn overview_of(message: &WalletStreamMessage) -> &Arc<WalletOverviewSnapshot> {
         match message {
             WalletStreamMessage::Overview(snapshot) => snapshot,
@@ -1988,7 +1742,6 @@ mod tests {
         }
     }
 
-    /// The detail reading one message carries.
     fn detail_of(message: &WalletStreamMessage) -> &Arc<DetailSnapshot> {
         match message {
             WalletStreamMessage::Detail(snapshot) => snapshot,
@@ -1996,11 +1749,6 @@ mod tests {
         }
     }
 
-    /// The routes a reading covers are this venue's wallet routes and nothing else.
-    ///
-    /// The scopes are built here rather than taken from the loaded venues so that the rule has
-    /// something to refuse: another venue that monitors wallets and publishes a catalog
-    /// passes every other test the filter makes, and it is still not a route this widget may read.
     #[test]
     fn wallet_routes_should_be_the_wallet_routes_of_this_venue_only() {
         let wallet = |route: VenueRoute, provides_catalog: bool| WalletScope {
@@ -2016,18 +1764,13 @@ mod tests {
             ),
             true,
         );
-        // A wallet route of this venue that publishes no catalog: a reading displayed without one
-        // would draw numbers it cannot stand behind, so it is not read either.
         let no_catalog = wallet(crate::test_support::spot_route(), false);
-        // A scope of this venue that does not monitor wallets.
         let control = WalletScope {
             route: crate::test_support::route("discovery"),
             monitors_wallets: false,
             provides_catalog: false,
         };
 
-        // The fixtures must differ in the venue and nothing else, or the case would be decided by
-        // another clause of the filter instead of the one it is about.
         assert!(
             this_venue.route.venue == VenueId::Hyperliquid
                 && this_venue.monitors_wallets
@@ -2050,9 +1793,6 @@ mod tests {
         );
     }
 
-    /// A catalog that cannot be read fails the address it was read for, and names the partition:
-    /// a reading displayed without the catalog of one of its partitions would draw a number it
-    /// cannot stand behind.
     #[tokio::test(start_paused = true)]
     async fn a_catalog_that_cannot_be_read_should_fail_the_address() {
         let wallet = address("1");
@@ -2115,12 +1855,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// One base asset quoted against two assets is one asset with two markets, and both of them
-    /// are indexed: the reading is drawn, not failed.
-    ///
-    /// This is the shape the live venue publishes — HYPE trades against USDC, USDE, USDH and
-    /// USDT0, and a dozen other tokens quote against two assets — so a catalog with one pair per
-    /// base is the fixture that hid it.
     #[tokio::test(start_paused = true)]
     async fn a_base_asset_quoted_against_two_assets_should_still_be_read() {
         let spot = crate::test_support::spot_route();
@@ -2163,8 +1897,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A public watch never reads the route's configured account, so the wallets it follows are
-    /// exactly the addresses it names.
     #[tokio::test(start_paused = true)]
     async fn a_public_scope_should_read_one_stream_set_per_address() {
         let source = venue();
@@ -2192,11 +1924,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A partition that cannot answer fails the address it was read for, and names itself.
-    ///
-    /// An address is read from every partition the venue publishes, so a reading with one of them
-    /// missing is not the account it claims to be: it fails rather than being drawn from whatever
-    /// the other partitions answered.
     #[tokio::test(start_paused = true)]
     async fn a_partition_that_fails_should_fail_the_address_and_name_itself() {
         let wallet = address("1");
@@ -2280,7 +2007,6 @@ mod tests {
             .expect("the second load should be answered");
         until(|| source.counters().streams() == 6 && source.subscription_drops() == 3).await;
 
-        // The three streams of the wallet that left are gone, and three new ones are open.
         assert_eq!(source.subscription_drops(), 3);
         runtime.shutdown().await;
     }
@@ -2308,14 +2034,10 @@ mod tests {
             })
             .await
             .expect("the retry should be answered");
-        // The wallet that failed is read once more, and the wallet beside it is not read at all:
-        // the venue was asked for three more streams, which is one wallet's worth.
         until(|| source.counters().subscriptions() == 6).await;
 
         assert_eq!(source.counters().fills_subscriptions, 3);
         assert_eq!(source.counters().ledger_subscriptions, 3);
-        // The two streams the wallet already had were replaced, and the other wallet's were not
-        // touched at all.
         assert_eq!(source.subscription_drops(), 3);
         runtime.shutdown().await;
     }
@@ -2343,8 +2065,6 @@ mod tests {
             })
             .await
             .expect("the reload should be answered");
-        // Every wallet the reload names has its totals read again — whether or not this service
-        // was already following it — and the one it leaves out is not read at all.
         until(|| source.counters().fills_subscriptions == 4).await;
         assert_eq!(
             source.counters().ledger_subscriptions,
@@ -2355,8 +2075,6 @@ mod tests {
             source.subscription_drops() >= 3,
             "the wallet the reload left out is no longer followed"
         );
-        // A wallet that is already being read keeps its timeline: that reading fetches the
-        // current catalogs on every tick, so the reload only starts the one the new wallet needs.
         until(|| source.counters().fills_by_time == 3).await;
         runtime.shutdown().await;
     }
@@ -2502,7 +2220,6 @@ mod tests {
             "10"
         );
 
-        // The venue's own mark price arrives on the route-level fast-context subscription.
         source
             .publish(
                 SubscriptionKind::FastContexts,
@@ -2539,7 +2256,6 @@ mod tests {
             .expect("the load should be answered");
         until(|| source.counters().spot_states == 1).await;
 
-        // The first snapshot is what a fresh subscription always sends.
         source
             .publish(
                 SubscriptionKind::Fills,
@@ -2552,7 +2268,6 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(source.counters().spot_states, 1);
 
-        // A second one means the subscription was replaced under totals that had moved on.
         source
             .publish(
                 SubscriptionKind::Fills,
@@ -2606,7 +2321,6 @@ mod tests {
             "20"
         );
 
-        // The venue replays the same fill as a live update, which the totals already include.
         source
             .publish(
                 SubscriptionKind::Fills,
@@ -2666,8 +2380,6 @@ mod tests {
             "200"
         );
 
-        // A replayed snapshot describes the totals the venue already reported, so it moves
-        // nothing: only the position it names would change, and it is the same position.
         source
             .publish(
                 SubscriptionKind::Fills,
@@ -2833,7 +2545,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// How many balance rows one spot reading of a detail tab holds.
     fn spot_rows_of(snapshot: &DetailSnapshot) -> usize {
         let DetailData::Spot(spot) = &snapshot.data else {
             panic!("a spot tab reading should be the spot tab");
@@ -2920,8 +2631,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// A wallet the scope does not hold is not read: the pane is the authority on what it
-    /// follows, and a request for anything else is not this service's work.
     #[tokio::test(start_paused = true)]
     async fn a_detail_of_a_wallet_the_scope_no_longer_holds_should_not_be_read() {
         let wallet = address("1");
@@ -2954,8 +2663,6 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    /// An address list is read as the list it is: an address the pane removed is one the service
-    /// no longer follows, and one it still holds is read whatever the order says.
     #[test]
     fn an_address_list_should_hold_exactly_the_addresses_it_names() {
         let first = address("1");
@@ -2989,13 +2696,11 @@ mod tests {
         newest.tid = (MAX_APPLIED_INCREMENT_IDS - 1) as u64;
         assert!(!ids.insert(AppliedIncrementId::from_fill(&newest)));
 
-        // The oldest is what makes room for the one past capacity…
         let mut overflow = fill(&address, &listing, Side::Buy, "1", "100", 1, 0);
         overflow.tid = MAX_APPLIED_INCREMENT_IDS as u64;
         assert!(ids.insert(AppliedIncrementId::from_fill(&overflow)));
         assert_eq!(ids.len(), MAX_APPLIED_INCREMENT_IDS);
 
-        // …which is why it is seen as a first observation again, and only once.
         let mut oldest = fill(&address, &listing, Side::Buy, "1", "100", 1, 0);
         oldest.tid = 0;
         assert!(ids.insert(AppliedIncrementId::from_fill(&oldest)));
@@ -3203,7 +2908,6 @@ mod tests {
         let mut state = spot_state(vec![wallet_balance("USDC", "10")]);
         let mut event = deposit(&address, "3", 1);
         event.kind = SmolStr::new_static("subAccountTransfer");
-        // A master account reading what its sub-accounts did is not told which way it went.
         event.transfer_direction = None;
 
         apply_spot_ledger(&mut state, &event).expect("an undirected transfer should be a no-op");
@@ -3225,8 +2929,6 @@ mod tests {
         assert_eq!(state.positions[0].size.value.to_string(), "2");
     }
 
-    /// A ledger event that names another asset than the one it moves is not a balance movement
-    /// this can apply.
     #[test]
     fn a_ledger_event_whose_amount_names_another_asset_should_be_refused() {
         let address = address("1");
@@ -3274,8 +2976,6 @@ mod tests {
                 .await;
             let reading = latest_reading(&mut latest, &key).await;
             assert!(matches!(reading.as_ref(), WalletStreamMessage::Overview(_)));
-            // A reading that moved a total is published, and no second status follows it: the
-            // ready state was reported once, when the stream became live.
             assert!(!matches!(
                 reading.as_ref(),
                 WalletStreamMessage::Status(WalletStatus::Ready)

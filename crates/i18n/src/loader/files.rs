@@ -8,15 +8,6 @@ use crate::{
     template::interpolate::Template,
 };
 
-/// Loads every `.yaml` and `.yml` file in `directory`, using each file's stem as
-/// its language code.
-///
-/// # Errors
-///
-/// Fails when the directory cannot be listed, when a file is not valid YAML or
-/// not valid UTF-8, when a file name is not a
-/// [Google Workspace language code](LanguageCode), when a message is not a valid
-/// template, and when a message key is defined twice.
 pub(crate) fn load_directory(directory: &Path) -> Result<Vec<(LanguageCode, MessageStore)>, Error> {
     let entries = fs::read_dir(directory).map_err(|source| Error::ReadLocaleDirectory {
         path: directory.to_path_buf(),
@@ -36,8 +27,6 @@ pub(crate) fn load_directory(directory: &Path) -> Result<Vec<(LanguageCode, Mess
             paths.push(path);
         }
     }
-    // A stable order keeps error reporting deterministic when several files are
-    // broken at once.
     paths.sort_unstable();
 
     let mut locales = Vec::with_capacity(paths.len());
@@ -48,11 +37,6 @@ pub(crate) fn load_directory(directory: &Path) -> Result<Vec<(LanguageCode, Mess
     Ok(locales)
 }
 
-/// Loads one locale file.
-///
-/// # Errors
-///
-/// See [`load_directory`].
 pub(crate) fn load_file(path: &Path) -> Result<(LanguageCode, MessageStore), Error> {
     let stem = path
         .file_stem()
@@ -72,12 +56,6 @@ pub(crate) fn load_file(path: &Path) -> Result<(LanguageCode, MessageStore), Err
     Ok((code, load_str(&text, path)?))
 }
 
-/// Parses one locale document into a message store.
-///
-/// # Errors
-///
-/// See [`load_directory`]. `path` only points at the offending file in error
-/// messages.
 pub(crate) fn load_str(text: &str, path: &Path) -> Result<MessageStore, Error> {
     let document: AHashMap<Box<str>, Node> =
         serde_saphyr::from_str(text).map_err(|source| Error::ParseLocaleFile {
@@ -100,7 +78,6 @@ pub(crate) fn load_str(text: &str, path: &Path) -> Result<MessageStore, Error> {
     Ok(store)
 }
 
-/// Adds `node` and everything below it to `store`, prefixing keys with `prefix`.
 fn flatten(node: Node, prefix: &str, path: &Path, store: &mut MessageStore) -> Result<(), Error> {
     match node {
         Node::Text(text) => {
@@ -118,8 +95,6 @@ fn flatten(node: Node, prefix: &str, path: &Path, store: &mut MessageStore) -> R
             }
         }
         Node::Section(section) => {
-            // `a.b` in the file is the same message as `b` under section `a`, so
-            // there is no separator to add for a top-level leaf.
             for (key, child) in section {
                 let child_prefix: Box<str> = if prefix.is_empty() {
                     key
@@ -141,7 +116,6 @@ fn flatten(node: Node, prefix: &str, path: &Path, store: &mut MessageStore) -> R
     Ok(())
 }
 
-/// Returns `true` for files the loader accepts.
 fn is_locale_file(path: &Path) -> bool {
     let is_yaml = path
         .extension()

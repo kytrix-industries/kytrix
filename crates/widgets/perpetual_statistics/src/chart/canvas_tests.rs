@@ -1,10 +1,3 @@
-//! The canvas one chart draws: the box it fills, the pointer it follows, and the frames a
-//! change is worth.
-//!
-//! These are the interface tests of the chart: they go through the engine's own
-//! `WidgetTestApp`, because what they assert is what the engine ended up holding — a canvas
-//! node, its primitives, and the frames a change is worth.
-
 use std::sync::Arc;
 
 use base_ui::{style_builder::StyleBuilder, theme::appearance::Appearance};
@@ -29,7 +22,6 @@ use crate::{
 const WIDTH: f32 = 640.0;
 const HEIGHT: f32 = 360.0;
 
-/// The translator the product ships.
 fn translate(language: LanguageCode) -> i18n::translate::Translate {
     i18n::translate::Translate::new(
         std::rc::Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -88,7 +80,6 @@ impl ChartHarness {
         });
         app.with_cx(|cx| chart.build(cx, page))
             .expect("the chart builds");
-        // The first frame lays the page (and the canvas inside it) out.
         app.drain();
         app.with_cx(|_| chart.set_snapshot(&snapshot(1, count)));
         Self {
@@ -137,7 +128,6 @@ impl ChartHarness {
     }
 }
 
-/// A box of a fixed size, which is the shape a chart is laid out in.
 fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
     app.with_cx(|cx| {
         let root = cx.tree().root();
@@ -155,7 +145,6 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
     })
 }
 
-/// The middle of the plot, which is over one of the fixture's intervals.
 fn middle_of_plot(harness: &ChartHarness) -> Point {
     let plot = harness.layout().plot;
     Point::new(
@@ -164,10 +153,6 @@ fn middle_of_plot(harness: &ChartHarness) -> Point {
     )
 }
 
-/// The atlas generation the chart's glyphs were rasterized in, if it draws any.
-///
-/// The leases a canvas holds are what an atlas reset invalidates, so reading the
-/// generation back is how a test tells a canvas that was rebuilt from one that was kept.
 fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
     harness
         .canvas()
@@ -180,7 +165,6 @@ fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
         .map(|glyph| glyph.tile.generation)
 }
 
-/// Every primitive kind the canvas holds.
 fn kinds(canvas: &ui_core::paint::canvas::Canvas) -> Vec<&'static str> {
     canvas
         .primitives()
@@ -383,11 +367,6 @@ fn a_language_switch_should_rewrite_the_labels() {
     );
 }
 
-/// The labels are drawn from shaped handles that lease glyph tiles from the atlas. When a
-/// lease is gone — the atlas was reset, a font stack changed, a tile was evicted — the
-/// engine refuses to encode those runs rather than draw reused texture, so a chart that
-/// kept the canvas it already had would lose its labels for good. A moved lease is a frame
-/// the chart owes.
 #[test]
 fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
     let mut harness = ChartHarness::new(3);
@@ -396,8 +375,6 @@ fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
     let generation =
         glyph_generation(&harness).expect("a chart of three intervals labels its axes");
 
-    // An atlas reset under the same font stack: every handle the canvas was built from is
-    // leased from an atlas that no longer exists, while the glyphs shape back the same.
     let stack = harness.app.app().font_stack().clone();
     harness.app.app_mut().set_font_stack(stack);
 
@@ -456,7 +433,6 @@ fn another_appearance_should_repaint_the_canvas() {
     assert_ne!(light, dark, "the canvas carries the new colours");
 }
 
-/// The fill of every quad a canvas holds, in drawing order.
 fn quad_fills(canvas: &ui_core::paint::canvas::Canvas) -> Vec<ui_core::paint::color::Color> {
     canvas
         .primitives()

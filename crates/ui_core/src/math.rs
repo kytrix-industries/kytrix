@@ -1,27 +1,8 @@
-//! 逻辑像素几何与「逻辑 → 物理像素」的唯一换算点（I11）。
-//!
-//! 所有几何以逻辑像素 `f32` 存储，只在 paint / present 边界做一次缩放与舍入。换算分四种语义，
-//! 职责严格分离：
-//!
-//! - [`Rect::to_physical_f32`]：不取整的物理浮点矩形，用于 SDF 图元的 `GpuPrimitive.bounds` 与 `clip_rect`；
-//! - [`Rect::to_physical`]：逐边取整，用于图集图元（`GlyphRun` / `Image`）的四边形；
-//! - [`Rect::to_physical_rounded`]：尺寸整体 `round`（half away from zero），用于窗口 buffer 尺寸；
-//! - [`Rect::to_physical_covering`]：向外 floor/ceil，用于 damage 与 scissor 的安全侧。
-//!
-//! 逐边取整保证相邻图元共享边精确重合（无 1px 缝）：同一逻辑坐标只有一种表达式，
-//! 舍入输入逐位相同则输出相同。
-//!
-//! 第五条规则是**描边宽度**（[`snap_stroke_width`]）：线宽在物理像素域按同一取整吸附到
-//! 整数像素且至少 1 px（Skia hairline / WebRender 边框吸附），宽度与位置共用
-//! [`snap_physical`] 这一条取整表达式。
-
 use std::ops::{Add, Mul, Sub};
 
-/// `i32` 可表示范围的安全端点；浮点转整型前先夹到此区间。
 const I32_MIN_F: f32 = i32::MIN as f32;
 const I32_MAX_F: f32 = i32::MAX as f32;
 
-/// 逻辑像素坐标点（左上原点，y 向下）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Point {
     pub x: f32,
@@ -35,7 +16,6 @@ impl Point {
         Self { x, y }
     }
 
-    /// 两个分量都有限（命中测试的 NaN/∞ 防御入口）。
     #[must_use]
     pub fn is_finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite()
@@ -75,7 +55,6 @@ impl Mul<f32> for Point {
     }
 }
 
-/// 逻辑像素尺寸。允许 0 与负数（负数一律视为空，不做静默归一化）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Size {
     pub width: f32,
@@ -92,7 +71,6 @@ impl Size {
         Self { width, height }
     }
 
-    /// 宽度或高度非有限或 `<= 0` 即空（NaN / ±∞ 也算空，安全方向）。
     pub fn is_empty(self) -> bool {
         !self.width.is_finite()
             || !self.height.is_finite()
@@ -116,7 +94,6 @@ impl Mul<f32> for Size {
     }
 }
 
-/// 逻辑像素轴对齐矩形，`origin + size` 表示，半开区间 `[min, max)`。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub origin: Point,
@@ -146,12 +123,10 @@ impl Rect {
         }
     }
 
-    /// 同 [`Size::is_empty`]（非有限或 `<= 0`）；另外原点非有限（无法绘制）也判空。
     pub fn is_empty(self) -> bool {
         self.size.is_empty() || !self.origin.x.is_finite() || !self.origin.y.is_finite()
     }
 
-    /// 四边与尺寸都有限（命中测试的 NaN/∞ 防御入口）。
     #[must_use]
     pub fn is_finite(self) -> bool {
         self.origin.x.is_finite()
@@ -160,19 +135,6 @@ impl Rect {
             && self.size.height.is_finite()
     }
 
-    /// **设备像素对齐**（B7）：四边各自吸附到 `round(dp × scale) / scale`，宽高由吸附后的
-    /// 两条边界**相减**得到。
-    ///
-    /// 语义边界（与"内部尺寸不吸附"配套，见 `NodeTree::set_device_scale`）：
-    /// - 只吸附**边界坐标**（左/上/右/下），因此相邻兄弟共享同一条边界时吸附到同一个设备像素，
-    ///   **不会产生 0.5 px 缝**；
-    /// - 宽高**不**单独 `round(宽 × scale)`：那会让"边界对齐了、内部尺寸却被单独圆整"的两套
-    ///   真相叠加，多层嵌套后误差累积（Skia 的 `roundOut` 只用于外接矩形，也是先算边界）；
-    /// - 非有限 / 非正 scale / 非有限矩形 ⇒ **原样返回**（防御，不做半吊子吸附）。
-    ///
-    /// 取整规则：`floor(v·scale + 0.5)`，与 Skia `SkScalarRoundToScalar`
-    /// （`floorf(x + 0.5f)`）逐位一致；CSS `roundOut`/`roundIn` 是把矩形**向外/向内**扩到像素网格，
-    /// 对相邻盒会同时引入缝隙或重叠，因此引擎用"每边就近吸附"而不是 `roundOut`。
     #[must_use]
     pub fn snap_to_device(self, scale: f32) -> Self {
         if !scale.is_finite() || scale <= 0.0 || !self.is_finite() {
@@ -191,7 +153,6 @@ impl Rect {
         }
     }
 
-    /// 半开区间判定：`min <= p < max`；空矩形恒 `false`。
     pub fn contains(self, point: Point) -> bool {
         let max = self.max();
         !self.is_empty()
@@ -208,7 +169,6 @@ impl Rect {
         }
     }
 
-    /// 四边内缩；负值即外扩。结果可能为空，不做 clamp。
     pub fn inset(self, edges: Edges) -> Self {
         Self {
             origin: Point {
@@ -222,13 +182,10 @@ impl Rect {
         }
     }
 
-    /// 四边等量外扩（物理像素域的外扩由 `render/damage` 负责，这里只做逻辑量）。
     pub fn outset(self, amount: f32) -> Self {
         self.inset(Edges::uniform(-amount))
     }
 
-    /// 并集：任一为空时返回另一个（`∅ ∪ R = R`）；两个不同的空矩形 union 仍为空，
-    /// 但不保证返回哪一个的值（空矩形的位置没有几何意义）。
     pub fn union(self, other: Self) -> Self {
         if self.is_empty() {
             return other;
@@ -255,7 +212,6 @@ impl Rect {
         }
     }
 
-    /// 交集；不相交时返回零面积矩形。
     pub fn intersect(self, other: Self) -> Self {
         if !self.is_convertible() || !other.is_convertible() {
             return Self::default();
@@ -275,13 +231,10 @@ impl Rect {
         }
     }
 
-    /// 半开区间重叠判定；任一不可换算（非有限或负尺寸）返回 `false`，空矩形恒 `false`。
     pub fn intersects(self, other: Self) -> bool {
         !self.intersect(other).is_empty()
     }
 
-    /// 未取整的物理浮点矩形：`x0 = x·s`、`x1 = (x + w)·s`、`w = x1 − x0`（y 同理）。
-    /// 非有限或负尺寸返回 `[0.0; 4]`。
     pub fn to_physical_f32(self, scale: Scale) -> [f32; 4] {
         if !self.is_convertible() {
             return [0.0; 4];
@@ -300,7 +253,6 @@ impl Rect {
         let width = x1 - x0;
         let height = y1 - y0;
 
-        // 两个有限端点相减仍可能溢出为 ±inf（例如 `-9.19e37` 到 `f32::MAX`）。
         if !width.is_finite() || !height.is_finite() {
             return [0.0; 4];
         }
@@ -308,7 +260,6 @@ impl Rect {
         [x0, y0, width, height]
     }
 
-    /// 逐边取整的物理像素矩形：图集图元四边形。
     pub fn to_physical(self, scale: Scale) -> PhysicalRect {
         if !self.is_convertible() {
             return EMPTY_PHYSICAL;
@@ -323,13 +274,6 @@ impl Rect {
         PhysicalRect::from_edges(x0, y0, x1, y1)
     }
 
-    /// 尺寸 `round`（half away from zero）的物理像素矩形：窗口 buffer 尺寸。
-    ///
-    /// 与 [`Rect::to_physical`] 的逐边取整不同，原点逐坐标取整、**尺寸整体取整**：
-    /// `Rect::new(0, 0, w, h)` 的结果恰好是 `(round(w·s), round(h·s))`。Wayland 的
-    /// `wp_fractional_scale_v1` 要求 toplevel 的 buffer 尺寸按 `round(logical × scale)` 计算
-    /// （half away from zero），对两条边分别取整会让宽度差 1 px —— 整面 buffer 被 compositor
-    /// 以 0.999× 重采样（1.25 / 1.75 下文字发虚）。
     pub fn to_physical_rounded(self, scale: Scale) -> PhysicalRect {
         if !self.is_convertible() {
             return EMPTY_PHYSICAL;
@@ -341,11 +285,9 @@ impl Rect {
         let width = round_physical(self.size.width * factor);
         let height = round_physical(self.size.height * factor);
 
-        // 饱和相加：`round_physical` 已夹到 `i32` 端点，直接相加仍可能溢出。
         PhysicalRect::from_edges(x0, y0, x0.saturating_add(width), y0.saturating_add(height))
     }
 
-    /// 向外 floor/ceil 的物理像素矩形：damage 与 scissor 的安全侧。
     pub fn to_physical_covering(self, scale: Scale) -> PhysicalRect {
         if !self.is_convertible() {
             return EMPTY_PHYSICAL;
@@ -360,7 +302,6 @@ impl Rect {
         PhysicalRect::from_edges(x0, y0, x1, y1)
     }
 
-    /// 换算前置条件：四个分量有限且尺寸非负。
     fn is_convertible(self) -> bool {
         self.origin.x.is_finite()
             && self.origin.y.is_finite()
@@ -371,7 +312,6 @@ impl Rect {
     }
 }
 
-/// 逻辑像素四边距离（CSS 顺序：上 / 右 / 下 / 左）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Edges {
     pub top: f32,
@@ -407,15 +347,12 @@ impl Edges {
     }
 }
 
-/// DPI 缩放因子：逻辑像素 × factor = 物理像素。构造即校验（有限且 > 0）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scale(f32);
 
 impl Scale {
     pub const ONE: Self = Self(1.0);
 
-    /// `None` 仅当 `factor` 非有限或 `<= 0`；调用方必须转成 `EngineError::InvalidDpiScale`，
-    /// 不得静默回退到 1.0（I10）。
     pub fn new(factor: f32) -> Option<Self> {
         (factor.is_finite() && factor > 0.0).then_some(Self(factor))
     }
@@ -424,16 +361,11 @@ impl Scale {
         self.0
     }
 
-    /// 物理 → 逻辑（输入事件换算）。这是唯一的反向换算点。
     pub fn to_logical(self, physical: f32) -> f32 {
         physical / self.0
     }
 }
 
-/// 2D 仿射变换：`x' = m11·x + m21·y + tx`，`y' = m12·x + m22·y + ty`（列向量约定）。
-///
-/// GPU uniform 契约：打包为两个 `vec4` —— `(m11, m12, m21, m22)` 与 `(tx, ty, 0, 0)`
-/// （6 个有效 float + 2 padding），P10 的 `contract.md` 必须镜像该布局。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
     m11: f32,
@@ -476,9 +408,6 @@ impl Transform {
         }
     }
 
-    /// 绕原点旋转 `radians`（顺时针为正，与屏幕 y 向下一致）。
-    ///
-    /// 只在命中测试的语义测试与应用的 per-draw 变换里用；布局本身不做旋转。
     pub fn rotate(radians: f32) -> Self {
         let (sin, cos) = radians.sin_cos();
         Self {
@@ -491,7 +420,6 @@ impl Transform {
         }
     }
 
-    /// 复合：先应用 `self`，再应用 `next`（即 `next × self`）。
     pub fn then(self, next: Self) -> Self {
         Self {
             m11: next.m11 * self.m11 + next.m21 * self.m12,
@@ -510,16 +438,6 @@ impl Transform {
         }
     }
 
-    /// 逆变换（命中测试的必经路径，B7/C11）。
-    ///
-    /// 返回 `None` = **不可逆**：
-    /// - 行列式为 0 / 非有限（`scale(0, …)`、退化投影、NaN 输入）；
-    /// - 相对奇异（`|det| <= ε·‖A‖²`）：吸附到机器精度的"压扁"变换，求逆会放大成 1e7 级坐标，
-    ///   命中判定失去意义。调用方（`layout::hit_test`）必须**跳过该子树并记账诊断**，
-    ///   不得 panic，也不得把点当作命中。
-    ///
-    /// 数学：列向量约定 `p' = A·p + t` ⇒ `p = A⁻¹·(p' − t)`，
-    /// `A⁻¹ = 1/det · [m22, −m21; −m12, m11]`。
     #[must_use]
     pub fn inverse(self) -> Option<Self> {
         let det = self.m11 * self.m22 - self.m12 * self.m21;
@@ -546,15 +464,11 @@ impl Transform {
         })
     }
 
-    /// 该变换是否可逆（[`Transform::inverse`] 的谓词形态；诊断/测试用）。
     #[must_use]
     pub fn is_invertible(self) -> bool {
         self.inverse().is_some()
     }
 
-    /// 矩形经该变换后的**轴对齐包围盒**（四角变换后取 min/max）。
-    ///
-    /// 非有限输入 / 非有限输出 ⇒ 返回空矩形（调用方必须把它当"不可命中"而不是"命中原点"）。
     #[must_use]
     pub fn transform_rect(self, rect: Rect) -> Rect {
         let corners = [
@@ -585,13 +499,11 @@ impl Transform {
         Rect::new(x0, y0, x1 - x0, y1 - y0)
     }
 
-    /// `[m11, m12, m21, m22, tx, ty]`，与 uniform 契约前 6 项同序。
     pub fn to_array(self) -> [f32; 6] {
         [self.m11, self.m12, self.m21, self.m22, self.tx, self.ty]
     }
 }
 
-/// 物理像素矩形，半开区间 `[x0, x1) × [y0, y1)`，左上原点；不变量 `x0 <= x1 && y0 <= y1`。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhysicalRect {
     pub x0: i32,
@@ -601,14 +513,12 @@ pub struct PhysicalRect {
 }
 
 impl PhysicalRect {
-    /// 要求调用方已保证有序；debug 下断言，release 由调用方不变量保证。
     pub fn new(x0: i32, y0: i32, x1: i32, y1: i32) -> Self {
         debug_assert!(x0 <= x1 && y0 <= y1, "PhysicalRect must be ordered");
 
         Self { x0, y0, x1, y1 }
     }
 
-    /// 由任意端点构造，自动 clamp 为有序（换算路径专用）。
     fn from_edges(x0: i32, y0: i32, x1: i32, y1: i32) -> Self {
         Self {
             x0,
@@ -618,29 +528,22 @@ impl PhysicalRect {
         }
     }
 
-    /// 宽 = `x1.saturating_sub(x0)`（任何输入都不下溢）。
-    ///
-    /// debug 下断言 `x0 <= x1`：公开字段的不变量由构造方保证，库内一律经 [`PhysicalRect::new`]
-    /// 或 `from_edges` 构造。
     pub fn width(self) -> i32 {
         debug_assert!(self.x0 <= self.x1, "PhysicalRect x invariant violated");
 
         self.x1.saturating_sub(self.x0)
     }
 
-    /// 高 = `y1.saturating_sub(y0)`；不变量断言同 [`PhysicalRect::width`]。
     pub fn height(self) -> i32 {
         debug_assert!(self.y0 <= self.y1, "PhysicalRect y invariant violated");
 
         self.y1.saturating_sub(self.y0)
     }
 
-    /// 宽或高为 0 即空。饱和矩形（宽/高溢出到 `i32::MAX`）不为空。
     pub fn is_empty(self) -> bool {
         self.width() == 0 || self.height() == 0
     }
 
-    /// 面积（`i64`，避免 `i32` 溢出）：damage 阈值与测试断言共用的唯一实现。
     #[must_use]
     pub fn area(self) -> i64 {
         i64::from(self.width()) * i64::from(self.height())
@@ -662,7 +565,6 @@ impl PhysicalRect {
         }
     }
 
-    /// 不相交时退化为零面积矩形。
     pub fn intersect(self, other: Self) -> Self {
         let x0 = self.x0.max(other.x0);
         let y0 = self.y0.max(other.y0);
@@ -689,10 +591,6 @@ fn saturate(value: f32) -> f32 {
     value.clamp(I32_MIN_F, I32_MAX_F)
 }
 
-/// 物理像素取整（**唯一表达式**）：`floor(v + 0.5)`，非有限原样返回。
-///
-/// 布局边界吸附（[`Rect::snap_to_device`]）与描边宽度吸附（[`snap_stroke_width`]）共用，
-/// 保证「只有一套吸附取整规则」（Skia `SkScalarRoundToScalar` 同式）。
 fn snap_physical(value: f32) -> f32 {
     let shifted = value + 0.5;
     if shifted.is_finite() {
@@ -702,7 +600,6 @@ fn snap_physical(value: f32) -> f32 {
     }
 }
 
-/// 逻辑坐标 → 设备像素吸附（`floor(v·scale + 0.5) / scale`）。
 fn snap_scalar(value: f32, scale: f32) -> f32 {
     let physical = value * scale;
     if physical.is_finite() {
@@ -712,24 +609,6 @@ fn snap_scalar(value: f32, scale: f32) -> f32 {
     }
 }
 
-/// 设备像素吸附的「至少 1 物理像素」描边宽度（返回**物理像素**）。
-///
-/// Skia 的 hairline（`SkPaint::kHairline_Width` 恒为 1 设备像素）/ WebRender 的边框设备像素
-/// 吸附 / Blink 的 `PixelSnappedSize` 是同一语义：1 逻辑像素的边框在 125% / 150% / 175% 下
-/// 落到 **1 / 2 / 2 物理像素**，而不是 1.25 / 1.5 / 1.75 px 的 AA 带。
-///
-/// 取整与 [`Rect::snap_to_device`] **逐位同源**（共用 [`snap_physical`]），没有第二套规则：
-/// - 宽度先在物理像素域按 `floor(v + 0.5)` 吸附成整数，再夹到**至少 1**（亚像素细线不消失，
-///   这是 hairline 的定义）；
-/// - 吸附后的带宽是整数物理像素；调用方以**布局提交值**（`layout.bounds` 已按
-///   `snap_to_device` 吸附过的边界）为锚点向内展开，因此边框的两条边都落在设备像素网格上，
-///   **位置不再二次取整**（位置就是布局提交值）；
-/// - 「居中于边界（外半 + 内半）」的落地：理想带是 `[edge − w·s, edge]`，先把它按理想中心线
-///   对称展开/收缩到整数带宽（外半 + 内半），再逐边按同一规则吸附；外半被盒边界挡回盒内
-///   （CSS 边框画在 border box 内侧），结果等价于「整数带宽从已吸附的外边界向内展开」，
-///   内边界同样落在整数物理像素上；
-/// - 非有限 / 非正 `scale` / 非正 `width` ⇒ `0.0`（无描边）：与 `snap_to_device` 的防御方向
-///   一致（只吸附确定能吸附的量，不制造半吊子吸附）。
 #[must_use]
 pub fn snap_stroke_width(width: f32, scale: f32) -> f32 {
     if !width.is_finite() || width <= 0.0 || !scale.is_finite() || scale <= 0.0 {
@@ -739,7 +618,6 @@ pub fn snap_stroke_width(width: f32, scale: f32) -> f32 {
     if !physical.is_finite() {
         return 0.0;
     }
-    // 至少 1 物理像素：宽度吸附到 0 的细线仍然可见（Skia hairline）。
     snap_physical(physical).max(1.0)
 }
 
@@ -973,7 +851,6 @@ mod tests {
         );
     }
 
-    /// `wp_fractional_scale_v1` 的 toplevel buffer 尺寸：`round(logical × scale)`。
     #[test]
     fn physical_rounded_buffer_size_table() {
         for (factor, expected) in [
@@ -992,7 +869,6 @@ mod tests {
         }
     }
 
-    /// 非整数积：`round` 与 `ceil` 的差异必须被钉住（1.75 下 256.8 × 100.5）。
     #[test]
     fn physical_rounded_non_integer_product_rounds_not_ceils() {
         let rect = Rect::new(0.0, 0.0, 256.8, 100.5);
@@ -1016,19 +892,16 @@ mod tests {
     fn physical_rounded_rounds_half_away_from_zero() {
         let scale = scale(1.0);
 
-        // 正好 .5：远离零（不是银行家舍入）。
         assert_eq!(
             Rect::new(0.0, 0.0, 2.5, 3.5).to_physical_rounded(scale),
             PhysicalRect::new(0, 0, 3, 4)
         );
-        // 负坐标：原点逐坐标远离零，尺寸仍按正数取整。
         assert_eq!(
             Rect::new(-2.5, -1.5, 4.0, 6.0).to_physical_rounded(scale),
             PhysicalRect::new(-3, -2, 1, 4)
         );
     }
 
-    /// 尺寸**整体**取整（不是两条边分别取整）：`round(w·s)` 与 `round(x·s)` 分开算。
     #[test]
     fn physical_rounded_rounds_the_size_not_the_edges() {
         let rect = Rect::new(0.3, 0.0, 10.3, 10.0).to_physical_rounded(scale(1.5));
@@ -1208,7 +1081,6 @@ mod tests {
 
     #[test]
     fn to_physical_f32_overflow_is_empty() {
-        // 两个有限端点相减溢出为 +inf：浮点路径必须返回空，整型路径按饱和语义处理。
         let overflow = Rect::new(-9.191715e37, 0.0, f32::MAX, 10.0);
         let scale = scale(1.0);
 
@@ -1254,7 +1126,6 @@ mod tests {
         let rect = Rect::new(1.3, 0.0, 0.4, 1.0);
         let scale = scale(2.0);
 
-        // x0 = 2.6 → floor 2 / round 3；x1 = 3.4 → ceil 4 / round 3。
         assert_eq!(rect.to_physical(scale), PhysicalRect::new(3, 0, 3, 2));
         assert_eq!(
             rect.to_physical_covering(scale),
@@ -1262,8 +1133,6 @@ mod tests {
         );
     }
 
-    /// 事实记录：175% 下 `256.8 × 1.75 = 449.4` 物理像素 —— round/floor 得到 449，但窗口
-    /// surface 必须 covering 到 450（少 1 px 就是右侧一条未绘制像素）。
     #[test]
     fn covering_at_175_percent_rounds_the_fractional_edge_up() {
         let rect = Rect::new(0.0, 0.0, 256.8, 1.0);
@@ -1274,12 +1143,10 @@ mod tests {
 
     #[test]
     fn rect_inset_asymmetric_edges() {
-        // CSS 顺序 (top, right, bottom, left)。
         assert_eq!(
             Rect::new(0.0, 0.0, 10.0, 10.0).inset(Edges::new(1.0, 2.0, 3.0, 4.0)),
             Rect::new(4.0, 1.0, 4.0, 6.0)
         );
-        // 等价几何（left=1, top=2, right=3, bottom=4）：left/top 在前才得到 (1, 2, 6, 4)。
         assert_eq!(
             Rect::new(0.0, 0.0, 10.0, 10.0).inset(Edges::new(2.0, 3.0, 4.0, 1.0)),
             Rect::new(1.0, 2.0, 6.0, 4.0)
@@ -1301,20 +1168,14 @@ mod tests {
         assert!(!Size::new(4.0, 4.0).is_empty());
     }
 
-    // ── B7：设备像素吸附（只吸附边界）────────────────────────────────────
-
     #[test]
     fn snap_rounds_edges_not_sizes() {
-        // 10.3dp @2x = 20.6px → 21px → 10.5dp；宽高由吸附后的边相减（10.6 − 0 = 10.5）。
         let snapped = Rect::new(0.0, 0.0, 10.3, 4.4).snap_to_device(2.0);
         assert_eq!(snapped, Rect::new(0.0, 0.0, 10.5, 4.5));
 
-        // 边界坐标 3.3 @1x → 3；宽 2.6 → 右边界 5.9 → 6 ⇒ 宽 3（不是 round(2.6)=3 的巧合）。
         let fractional = Rect::new(3.3, 0.7, 2.6, 1.2).snap_to_device(1.0);
         assert_eq!(fractional, Rect::new(3.0, 1.0, 3.0, 1.0));
 
-        // **区分"吸附边界"与"吸附尺寸"的判例**：原点与宽都 < 0.5，但右边界跨过半像素。
-        // 边界语义：左 0.3→0、右 0.6→1 ⇒ 宽 1（0.3 + 0.3 会得到宽 0 —— 那是错误实现）。
         let edge_only = Rect::new(0.3, 0.0, 0.3, 0.3).snap_to_device(1.0);
         assert_eq!(
             edge_only,
@@ -1325,7 +1186,6 @@ mod tests {
 
     #[test]
     fn snap_keeps_adjacent_edges_coincident() {
-        // 相邻兄弟共享同一条逻辑边界 ⇒ 吸附后仍然逐位相同（无 0.5px 缝）。
         let left = Rect::new(0.0, 0.0, 10.3, 5.0).snap_to_device(1.0);
         let right = Rect::new(10.3, 0.0, 9.7, 5.0).snap_to_device(1.0);
         assert_eq!(left.max().x, right.min().x);
@@ -1337,7 +1197,6 @@ mod tests {
         let rect = Rect::new(1.3, 2.7, 3.1, 4.9);
         let once = rect.snap_to_device(1.5);
         assert_eq!(once.snap_to_device(1.5), once, "吸附必须幂等");
-        // NaN 与自身不相等：逐字段断言"原样返回"。
         let nan = Rect::new(f32::NAN, 0.0, 1.0, 1.0).snap_to_device(1.5);
         assert!(
             nan.origin.x.is_nan() && nan.origin.y == 0.0 && nan.size.width == 1.0,
@@ -1346,8 +1205,6 @@ mod tests {
         assert_eq!(rect.snap_to_device(0.0), rect, "非法 scale 原样返回");
         assert_eq!(rect.snap_to_device(f32::NAN), rect);
     }
-
-    // ── C11：Transform::inverse / transform_rect ─────────────────────────
 
     #[test]
     fn transform_inverse_roundtrips_points() {
@@ -1398,9 +1255,6 @@ mod tests {
         assert!((bounds.size.height - 14.1421).abs() < 1e-3, "{bounds:?}");
     }
 
-    // ── R04-4：描边宽度吸附（≥1 物理像素，与边界吸附同一取整）────────────────
-
-    /// 1 逻辑像素边框在 125% / 150% / 175% 下落到 1 / 2 / 2 物理像素，而不是 1.25/1.5/1.75。
     #[test]
     fn stroke_width_snaps_to_integer_device_pixels() {
         for (factor, expected) in [
@@ -1422,7 +1276,6 @@ mod tests {
         }
     }
 
-    /// hairline：亚像素宽度也**不消失**（Skia `kHairline_Width` = 恒 1 设备像素）。
     #[test]
     fn stroke_width_is_at_least_one_physical_pixel() {
         for factor in SCALES {
@@ -1436,7 +1289,6 @@ mod tests {
         }
     }
 
-    /// 防御：非有限 / 非正输入不制造半吊子吸附（与 `snap_to_device` 同方向）。
     #[test]
     fn stroke_width_defends_against_invalid_input() {
         assert_eq!(snap_stroke_width(0.0, 1.25), 0.0);
@@ -1447,15 +1299,10 @@ mod tests {
         assert_eq!(snap_stroke_width(1.0, -2.0), 0.0);
         assert_eq!(snap_stroke_width(1.0, f32::NAN), 0.0);
         assert_eq!(snap_stroke_width(1.0, f32::INFINITY), 0.0);
-        // 乘积极大但不溢出：饱和到 f32::MAX 域内的整数（不 panic、不返回 NaN）。
         let huge = snap_stroke_width(1e30, 1.25);
         assert!(huge.is_finite() && huge >= 1.0);
     }
 
-    /// R04-4 的验收判据：**同一逻辑宽度在不同亚像素位置渲染出的物理行数相同**。
-    ///
-    /// 布局提交值已把外边界吸附到整数物理像素（`snap_to_device`）；边框宽度再用同一取整
-    /// 吸成整数 ⇒ 内外两条边都落在整数物理像素上，与节点的亚像素相位无关。
     #[test]
     fn stroke_width_is_phase_independent_at_fractional_scales() {
         for factor in [1.25f32, 1.5, 1.75] {
@@ -1478,7 +1325,6 @@ mod tests {
         }
     }
 
-    /// 整数 DPI 下吸附是恒等（宽度 1/2 dp 在 100% 与 200% 下不变），golden 不应移位。
     #[test]
     fn stroke_width_is_identity_at_integer_device_scales() {
         for (factor, width) in [(1.0, 1.0), (1.0, 2.0), (2.0, 1.0), (2.0, 2.0)] {

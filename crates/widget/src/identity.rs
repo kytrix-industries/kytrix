@@ -11,23 +11,10 @@ use smol_str::SmolStr;
 
 const MAX_WIDGET_ID_LEN: usize = 128;
 
-/// A stable identifier for a widget type.
-///
-/// IDs are persisted and must not depend on Rust type or module names. They use
-/// the grammar `[a-z][a-z0-9_-]*(.[a-z][a-z0-9_-]*)*` and are capped at 128
-/// bytes. A namespaced ID such as `kytrix.candlestick` is recommended.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WidgetId(SmolStr);
 
 impl WidgetId {
-    /// Constructs and validates an ID whose value is known at compile time.
-    ///
-    /// Using this function in a `const` declaration turns an invalid ID into a
-    /// compile-time error.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `value` does not follow the canonical widget ID grammar.
     #[track_caller]
     pub const fn new_static(value: &'static str) -> Self {
         match validate_widget_id(value) {
@@ -36,7 +23,6 @@ impl WidgetId {
         }
     }
 
-    /// Tries to construct an ID whose value is known at compile time.
     pub const fn try_new_static(value: &'static str) -> Result<Self, InvalidWidgetId> {
         match validate_widget_id(value) {
             Ok(()) => Ok(Self(SmolStr::new_static(value))),
@@ -44,14 +30,12 @@ impl WidgetId {
         }
     }
 
-    /// Parses and validates a runtime ID, such as one loaded from persistence.
     pub fn parse(value: impl AsRef<str>) -> Result<Self, InvalidWidgetId> {
         let value = value.as_ref();
         validate_widget_id(value)?;
         Ok(Self(SmolStr::new(value)))
     }
 
-    /// Returns the canonical string representation.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -102,18 +86,12 @@ impl<'de> Deserialize<'de> for WidgetId {
     }
 }
 
-/// The reason a [`WidgetId`] failed validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidWidgetId {
-    /// The ID was empty.
     Empty,
-    /// The ID exceeded the maximum supported byte length.
     TooLong { length: usize, maximum: usize },
-    /// A namespace segment did not start with a lowercase ASCII letter.
     InvalidSegmentStart { index: usize, byte: u8 },
-    /// A byte was not part of the canonical ID grammar.
     InvalidCharacter { index: usize, byte: u8 },
-    /// The ID ended with an empty namespace segment.
     EmptyTrailingSegment,
 }
 
@@ -184,19 +162,10 @@ const fn validate_widget_id(value: &str) -> Result<(), InvalidWidgetId> {
     }
 }
 
-/// A per-process identifier for one widget instance.
-///
-/// This ID is intended for routing and diagnostics. It is not stable across
-/// application runs and must not be used as a persisted widget type ID.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WidgetInstanceId(u64);
 
 impl WidgetInstanceId {
-    /// Allocates a process-unique widget instance ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the process exhausts the `u64` instance ID space.
     #[must_use]
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -209,7 +178,6 @@ impl WidgetInstanceId {
         }
     }
 
-    /// Returns the numeric representation of this process-local ID.
     pub const fn as_u64(self) -> u64 {
         self.0
     }

@@ -1,5 +1,3 @@
-//! HTTP client pool and bounded response reading.
-
 use std::{sync::Mutex, time::Duration};
 
 use app_config::network::ResolvedProxy;
@@ -16,18 +14,12 @@ use crate::transport::{
 
 const MIB: usize = 1024 * 1024;
 const STANDARD_RESPONSE_BODY_LIMIT: usize = 30 * MIB;
-/// The response-body budget for a model download.
-///
-/// A model is streamed to disk rather than buffered, so this only has to exceed the
-/// largest published model. 16 GiB leaves room for every model in the catalog; a
-/// 32-bit target cannot express that number and uses its own maximum instead.
 #[cfg(target_pointer_width = "64")]
 const MODEL_DOWNLOAD_RESPONSE_BODY_LIMIT: usize = 16 * 1024 * MIB;
 #[cfg(not(target_pointer_width = "64"))]
 const MODEL_DOWNLOAD_RESPONSE_BODY_LIMIT: usize = usize::MAX;
 const MAX_HTTP_CLIENTS: usize = 64;
 
-/// A fixed HTTP policy for one class of network operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HttpClientClass {
     Public,
@@ -83,14 +75,6 @@ impl HttpClientClass {
                 connect_timeout: Duration::from_secs(10),
                 request_timeout: Some(Duration::from_secs(30)),
                 redirect_limit: 10,
-                // Not a small budget: this is the whole of `latest.json`, which the
-                // release job publishes with both `release_notes/vX.Y.Z/{en,zh-CN}.md`
-                // files as its `notes` plus one entry per platform. 4 KiB was smaller
-                // than the metadata this pipeline actually writes: the assembled
-                // v0.1.0 file measured 5294 bytes with one language, and every check
-                // would have failed with `ResponseBodyTooLarge` — silently, because a
-                // failed check only retries. The release job asserts the assembled
-                // file stays under this number.
                 response_body_limit: 64 * 1024,
                 user_agent: concat!("Kytrix/", env!("CARGO_PKG_VERSION")),
             },
@@ -111,18 +95,15 @@ impl HttpClientClass {
         }
     }
 
-    /// Maximum decompressed response bytes accepted by [`read_response_body`].
     pub fn response_body_limit(self) -> usize {
         self.profile().response_body_limit
     }
 
-    /// Hop budget for callers that resolve redirects themselves.
     pub fn redirect_limit(self) -> usize {
         self.profile().redirect_limit
     }
 }
 
-/// A proxy- and policy-isolated pool of HTTP clients.
 pub struct HttpClientPool {
     clients: Mutex<InsertionOrderedCache<(ResolvedProxy, HttpClientClass), Client>>,
     policy: TransportPolicy,
@@ -136,11 +117,6 @@ impl HttpClientPool {
         }
     }
 
-    /// Returns a client for the exact resolved route and operation class.
-    ///
-    /// Environment and system proxies stay disabled, and reqwest's implicit
-    /// retries are off. A bad route fails closed: it is never replaced with a
-    /// direct client.
     pub fn client(
         &self,
         route: &ResolvedProxy,
@@ -180,7 +156,6 @@ impl HttpClientPool {
         )
     }
 
-    /// Number of cached clients, for callers asserting cache keying.
     #[cfg(feature = "test-support")]
     pub fn client_count(&self) -> usize {
         self.clients
@@ -189,7 +164,6 @@ impl HttpClientPool {
             .unwrap_or_default()
     }
 
-    /// Whether a client is cached for the exact route and class.
     #[cfg(feature = "test-support")]
     pub fn contains(&self, route: &ResolvedProxy, class: HttpClientClass) -> bool {
         self.clients
@@ -197,7 +171,6 @@ impl HttpClientPool {
             .is_ok_and(|clients| clients.contains_key(&(route.clone(), class)))
     }
 
-    /// Seeds a client so a caller can exercise a transport it cannot build.
     #[cfg(feature = "test-support")]
     pub fn insert_for_test(&self, route: ResolvedProxy, class: HttpClientClass, client: Client) {
         if let Ok(mut clients) = self.clients.lock() {
@@ -206,41 +179,6 @@ impl HttpClientPool {
     }
 }
 
-/// Reads a response with the selected class's decompressed body limit, reporting
-/// the accepted bytes as they arrive.
-///
-/// `on_chunk` receives `(bytes_read, total)`:
-///
-/// * `bytes_read` is the cumulative number of decompressed body bytes accepted
-///   so far, so it never decreases.
-/// * `total` is the exact decoded body size the response exposes — its
-///   `Content-Length` — when that is known, and `None` when it is not: a chunked
-///   response, or a response reqwest decodes, whose decoded length cannot be
-///   known up front. It is read once, before the first byte, and is the same
-///   value on every call.
-///
-/// The callback is invoked in this order, on the task driving the read:
-///
-/// 1. Exactly one `(0, total)` call, after both checks below have passed and
-///    before any body byte is read. A caller therefore knows the total as soon
-///    as the response headers are available and can show a determinate bar
-///    without waiting for the first byte; with `total` of `None` the same call
-///    still announces that the read has started.
-/// 2. One call per chunk returned by the response, after that chunk passes the
-///    limit check and is appended, with `bytes_read` including it.
-///
-/// A successful read of a non-empty body always produces at least one call
-/// after the `(0, total)` call, and its final call reports the full body
-/// length, matching the returned [`Bytes`]. The callback must not block.
-///
-/// Nothing is reported before the first read. An already-cancelled `cancellation`
-/// returns [`TransportError::Cancelled`] and a `Content-Length` above the class
-/// limit returns [`TransportError::ResponseBodyTooLarge`] without any call. A
-/// chunk that would push the body past the limit is rejected without being
-/// reported, so a reported count never exceeds the limit and the error leaves
-/// the accepted bytes reported exactly as far as they were accumulated. The
-/// same holds for [`TransportError::Cancelled`] and [`TransportError::ResponseReadFailed`]
-/// raised after some chunks were accepted.
 pub async fn read_response_body_with_progress(
     mut response: Response,
     class: HttpClientClass,
@@ -275,10 +213,6 @@ pub async fn read_response_body_with_progress(
     }
 }
 
-/// Reads a response with the selected class's decompressed body limit.
-///
-/// Reports no progress; the call sequence and the failure behaviour are those of
-/// [`read_response_body_with_progress`].
 pub async fn read_response_body(
     response: Response,
     class: HttpClientClass,

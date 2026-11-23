@@ -1,33 +1,3 @@
-//! The widget registry: descriptors, mount factories, and lookup by persisted ID.
-//!
-//! Every widget is compiled into the application, so the complete catalogue is known at
-//! build time and nothing registers widgets at runtime. This crate owns the one list of
-//! them: the descriptor a selection surface lists and the erased mount a pane calls.
-//!
-//! # What a registration is, and what it is not
-//!
-//! A registration is *identity plus a monomorphized mount*. It is not a widget
-//! instance: [`WidgetView`] is not object safe (its `Config` is an associated type and
-//! its state belongs to its own type), so the registry keeps a function pointer built
-//! once per registered type rather than a trait object.
-//!
-//! The registry no longer builds the state cell, the presentation shell, the recovery
-//! control, or the header. Those are the framework's and they belong to one mount, in
-//! `AnyWidget::mount`'s documented order: scope → `WidgetStatus` (an engine `Signal`,
-//! not a toolkit entity) → surface shell → body cell and `ReloadHandle` → `W::new` →
-//! `load` → frame route. The pane supplies what only it knows — the window, the parent
-//! node, and the composition root's `Rc<WidgetServices>` — and [`WidgetRegistration`]
-//! supplies the part that is the same for all 24 entries: decoding a stored config
-//! into the widget's own type and erasing the result.
-//!
-//! # No process global
-//!
-//! The catalogue used to be installed as a toolkit global that panes looked up by
-//! type. The engine has no global registry and no global lookup: the composition root
-//! (the widget gallery, the application shell) builds [`crate::catalogue::registry`]
-//! once and passes the `WidgetRegistry` to whatever mounts a pane, exactly as it passes
-//! `Rc<WidgetServices>` — see `crates/widgets/AGENTS.md` §8.1.
-
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     fmt,
@@ -47,12 +17,6 @@ use widget::{
     view::WidgetView,
 };
 
-/// The erased mount one registration performs.
-///
-/// [`WidgetView`] is not object safe, so the registry keeps a function pointer
-/// monomorphized for the registered type instead of a trait object: the stored config
-/// is decoded into that type inside the function, and what comes back is the erased
-/// [`AnyWidget`] the pane hosts.
 type MountFn = fn(
     &mut App,
     WindowId,
@@ -63,7 +27,6 @@ type MountFn = fn(
     WidgetConfigChange,
 ) -> Result<AnyWidget, EngineError>;
 
-/// A descriptor paired with its statically linked mount.
 #[derive(Clone)]
 pub struct WidgetRegistration {
     descriptor: WidgetDescriptor,
@@ -71,12 +34,6 @@ pub struct WidgetRegistration {
 }
 
 impl WidgetRegistration {
-    /// Registers one statically linked view type.
-    ///
-    /// The descriptor and the mounted widget's own descriptor come from the same
-    /// declarations (`ID`, `DISPLAY_NAME`, `CATEGORY`, `DESCRIPTION`, `ICON`,
-    /// `SELECTABLE`, `Config::SCHEMA_VERSION`), so a pane's widget and the registry's
-    /// entry for it cannot disagree about any of them.
     pub fn for_view<W: WidgetView>() -> Self {
         Self {
             descriptor: descriptor_of::<W>(),
@@ -84,22 +41,10 @@ impl WidgetRegistration {
         }
     }
 
-    /// Returns this registration's immutable descriptor.
     pub const fn descriptor(&self) -> &WidgetDescriptor {
         &self.descriptor
     }
 
-    /// Mounts one instance of this widget under `parent`.
-    ///
-    /// `config` is the envelope the pane stored for this instance, or `None` when the
-    /// pane has none; `config_change` is the pane's own report, so a widget mounted
-    /// here writes its config back to the pane hosting it.
-    ///
-    /// Nothing here can fail on the config: a stored envelope this build cannot read —
-    /// another schema version, a payload that no longer decodes — becomes the config
-    /// type's default rather than an error, because a pane the application cannot
-    /// rebuild is worse than a pane that lost its settings. The mount itself can fail
-    /// on the engine (`EngineError`): the window or the parent node it names is gone.
     pub fn mount(
         &self,
         app: &mut App,
@@ -130,10 +75,6 @@ impl fmt::Debug for WidgetRegistration {
     }
 }
 
-/// Decodes one stored config into the widget's own type and mounts it.
-///
-/// The registry's whole share of a mount: the widget is constructed from the config its
-/// type declares and the framework does the rest (see the module documentation).
 fn mount_of<W: WidgetView>(
     app: &mut App,
     window: WindowId,
@@ -154,11 +95,6 @@ fn mount_of<W: WidgetView>(
     )
 }
 
-/// The descriptor one registered type declares.
-///
-/// One construction serves both the registry's entry and the mounted widget, so the two
-/// can never disagree about the identity, the description, the icon, or whether the
-/// widget may be offered by a selection surface.
 fn descriptor_of<W: WidgetView>() -> WidgetDescriptor {
     let mut descriptor = WidgetDescriptor::new(
         W::ID,
@@ -177,17 +113,12 @@ fn descriptor_of<W: WidgetView>() -> WidgetDescriptor {
     descriptor
 }
 
-/// Registry for statically linked widget factories.
-///
-/// A `BTreeMap` gives deterministic ID ordering and logarithmic lookup without
-/// maintaining a second index for gallery presentation.
 #[derive(Clone, Debug, Default)]
 pub struct WidgetRegistry {
     registrations: BTreeMap<WidgetId, WidgetRegistration>,
 }
 
 impl WidgetRegistry {
-    /// Registers a statically linked widget and rejects duplicate stable IDs.
     pub fn register(
         &mut self,
         registration: WidgetRegistration,
@@ -202,18 +133,10 @@ impl WidgetRegistry {
         }
     }
 
-    /// Looks up a registration by a persisted or static ID.
     pub fn get(&self, id: &str) -> Option<&WidgetRegistration> {
         self.registrations.get(id)
     }
 
-    /// Mounts a widget by ID under `parent`, with the config its pane stored.
-    ///
-    /// This is what a pane does to fill itself: the ID it restored from the layout is
-    /// looked up, and the registration mounts one instance with the pane's own config
-    /// report. A pane whose stored ID this build does not know gets
-    /// [`WidgetMountError::NotRegistered`] and shows the catalogue's fallback widget
-    /// instead (`crates/widgets/AGENTS.md` §1, `app_config::workspace::DEFAULT_WIDGET_ID`).
     pub fn mount(
         &self,
         id: &str,
@@ -231,7 +154,6 @@ impl WidgetRegistry {
         Ok(registration.mount(app, window, parent, services, config, config_change)?)
     }
 
-    /// Mounts a widget by ID with its config type's default value.
     pub fn mount_default(
         &self,
         id: &str,
@@ -244,27 +166,21 @@ impl WidgetRegistry {
         self.mount(id, app, window, parent, services, None, config_change)
     }
 
-    /// Iterates registrations in stable widget ID order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &WidgetRegistration> {
         self.registrations.values()
     }
 }
 
-/// A widget registration failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum WidgetRegistryError {
-    /// A second registration attempted to claim an existing stable ID.
     #[error("widget id `{0}` is already registered")]
     DuplicateId(WidgetId),
 }
 
-/// A widget lookup or mount failure.
 #[derive(Debug, Error)]
 pub enum WidgetMountError {
-    /// No registration exists for the ID a pane or a selection surface asked for.
     #[error("widget id `{0}` is not registered")]
     NotRegistered(SmolStr),
-    /// The engine refused the mount: the window or the parent node it names is gone.
     #[error(transparent)]
     Mount(#[from] EngineError),
 }
@@ -294,22 +210,12 @@ mod tests {
     const ALPHA_ID: WidgetId = WidgetId::new_static("kytrix.test.alpha");
     const BETA_ID: WidgetId = WidgetId::new_static("kytrix.test.beta");
 
-    /// The notice the fixture widgets report while they have nothing to show.
-    ///
-    /// It is a key of the test host's fixture catalogue (`test.waiting`), which is the
-    /// one `WidgetTestApp::new` renders.
     const TEST_WAITING: &str = "test.waiting";
 
     thread_local! {
-        /// How many times the fixture's `load` ran on this test's thread.
-        ///
-        /// The framework calls `load` with no handle the registry could keep, so the
-        /// fixture counts its own calls. Each test runs on its own thread, so the count
-        /// does not leak from one test to the next.
         static LOADS: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// How many times a fixture widget was loaded on this test's thread.
     fn loads() -> usize {
         LOADS.with(Cell::get)
     }
@@ -322,11 +228,6 @@ mod tests {
     impl WidgetConfig for TestConfig {
         const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
     }
-    /// A widget that persists one option and reports a waiting notice while it loads.
-    ///
-    /// Its own state cell is the one the framework minted; a widget keeps the handle it
-    /// was given rather than a copy of the state, which is how what it is doing reaches
-    /// the pane showing it.
     struct TestView {
         status: WidgetStatus,
         config: TestConfig,
@@ -372,10 +273,6 @@ mod tests {
         }
     }
 
-    /// A widget that changes its persisted option while it loads and reports the change.
-    ///
-    /// The envelope a pane stores is built from the config the widget holds **now**, and
-    /// the report is what gets that change written out.
     struct MutatingView {
         config: TestConfig,
         config_change: WidgetConfigChange,
@@ -421,7 +318,6 @@ mod tests {
         }
     }
 
-    /// A view that persists nothing, so the registry stores no config for it.
     struct StatelessView;
 
     impl WidgetView for StatelessView {
@@ -454,7 +350,6 @@ mod tests {
         }
     }
 
-    /// A view with the alpha ID, so ordering can be asserted across two types.
     struct AlphaView;
 
     impl WidgetView for AlphaView {
@@ -487,7 +382,6 @@ mod tests {
         }
     }
 
-    /// The same, under the beta ID.
     struct BetaView;
 
     impl WidgetView for BetaView {
@@ -519,22 +413,12 @@ mod tests {
             Ok(())
         }
     }
-    /// The selection the linked fixture propagates, written as the payload a pane
-    /// stores rather than built from the model types.
-    ///
-    /// The registry is the framework crate: what it has to carry through a mount without
-    /// translating is the link a view offers, and the widget API is the only listing
-    /// shape it depends on. The payload is therefore decoded into whatever selection
-    /// [`InstrumentLink::new`] takes — its field names are the ones the link's own wire
-    /// shape declares — and every assertion below compares against the payload itself.
     const LINKED_SELECTION: &str = r#"{"listing":{"route":{"venue":"binance","scope":"spot"},"listing_id":"listing-id/v1/9999999999999999999999999999999999999999999999999999999999999999"}}"#;
 
-    /// The payload above, as the JSON both the fixture and its assertions read.
     fn linked_selection() -> Value {
         serde_json::from_str(LINKED_SELECTION).expect("the fixture selection is JSON")
     }
 
-    /// A chart-like view, the only kind that offers an instrument link.
     struct LinkedView;
 
     impl WidgetView for LinkedView {
@@ -575,9 +459,6 @@ mod tests {
         }
     }
 
-    /// A view the framework builds for itself rather than offering to the user: it
-    /// carries a picture and a description like any other widget, and the only thing that
-    /// keeps it out of a selection surface is its own answer.
     struct InternalView;
 
     impl WidgetView for InternalView {
@@ -613,10 +494,6 @@ mod tests {
         }
     }
 
-    /// A view that builds one control into the header group it is asked for.
-    ///
-    /// The pane owns the header row's layout and hands the widget the container of one
-    /// group, which is the whole of the old `WidgetHeader { left, right }` shape.
     struct HeaderedView;
 
     impl WidgetView for HeaderedView {
@@ -664,8 +541,6 @@ mod tests {
         }
     }
 
-    /// A view whose first load fails and whose recovery's load settles: the state it
-    /// reports is how a test sees which path ran.
     struct RecoveringView {
         status: WidgetStatus,
         recovery: WidgetAction,
@@ -718,7 +593,6 @@ mod tests {
             Ok(())
         }
     }
-    /// A registry holding one fixture registration, which is what a test mounts by ID.
     fn fixture_registry<W: WidgetView>() -> WidgetRegistry {
         let mut registry = WidgetRegistry::default();
         registry
@@ -728,8 +602,6 @@ mod tests {
         registry
     }
 
-    /// Mounts one widget by ID the way a pane does: through the registry, with the
-    /// composition root's services and the pane's own config report.
     fn mount_by_id(
         registry: &WidgetRegistry,
         harness: &mut WidgetTestApp,
@@ -739,7 +611,6 @@ mod tests {
         mount_with_change(registry, harness, id, config, WidgetConfigChange::default())
     }
 
-    /// The same, over an explicit config report.
     fn mount_with_change(
         registry: &WidgetRegistry,
         harness: &mut WidgetTestApp,
@@ -806,10 +677,6 @@ mod tests {
         assert_eq!(descriptor.icon(), InternalView::ICON);
     }
 
-    /// The metadata a mounted widget reports is the metadata it was registered with —
-    /// identity, description, icon and selectability alike. One construction serves both,
-    /// so a pane's widget and the registry's entry for it cannot disagree about any of
-    /// them.
     #[test]
     fn a_mounted_widget_should_report_the_descriptor_it_was_registered_with() {
         let registry = fixture_registry::<InternalView>();
@@ -997,8 +864,6 @@ mod tests {
         );
     }
 
-    /// A stored config a build cannot read is a pane that comes back with default
-    /// settings, not one the application refuses to rebuild.
     #[test]
     fn an_unreadable_config_should_become_the_defaults() {
         let registry = fixture_registry::<TestView>();
@@ -1030,10 +895,6 @@ mod tests {
             "the pane then writes the rebuilt config back"
         );
     }
-    /// The recovery control a mounted widget offers is the framework's: the registry
-    /// hands the mount to `AnyWidget::mount`, a failure the widget reports carries that
-    /// action, a click goes through the engine's real action dispatch, and the action
-    /// runs the widget's `load` again.
     #[test]
     fn a_failed_first_load_should_offer_the_frameworks_recovery() {
         let registry = fixture_registry::<RecoveringView>();
@@ -1054,9 +915,6 @@ mod tests {
         );
     }
 
-    /// The link a pane receives is the exact one the view offered, listing key included:
-    /// the mount reads it once and nothing on the way to the pane is allowed to translate
-    /// it into another venue or another listing of the same canonical instrument.
     #[test]
     fn a_widget_should_hand_its_instrument_link_to_the_pane_unchanged() {
         let registry = fixture_registry::<LinkedView>();
@@ -1084,8 +942,6 @@ mod tests {
         );
     }
 
-    /// A view that offers no link gives the pane nothing to coordinate with, which is how
-    /// a widget declares that it has no instrument of its own.
     #[test]
     fn a_widget_without_an_instrument_link_should_leave_the_pane_without_one() {
         let registry = fixture_registry::<StatelessView>();
@@ -1095,8 +951,6 @@ mod tests {
         assert!(widget.instrument_link().is_none());
     }
 
-    /// The pane builds a header row and hands the widget the container of one group; the
-    /// widget builds into that container and an empty group occupies nothing.
     #[test]
     fn a_widget_should_build_its_header_into_the_group_it_is_asked_for() {
         let registry = fixture_registry::<HeaderedView>();
@@ -1122,9 +976,6 @@ mod tests {
         );
     }
 
-    /// A parent node the pane removed is the engine's refusal, not the registry's: the
-    /// mount reports it as its own error and rolls the shell back, so a pane is handed no
-    /// half-built widget.
     #[test]
     fn mounting_into_a_stale_parent_should_report_the_engine_error() {
         let registry = fixture_registry::<TestView>();
@@ -1167,9 +1018,6 @@ mod tests {
         );
     }
 
-    /// Two panes on one application: each mounts the same registration, so each has its
-    /// own surface, instance identity, state and frame route, and releasing one leaves the
-    /// other alone.
     #[test]
     fn two_panes_should_mount_the_same_registration_side_by_side() {
         let registry = fixture_registry::<TestView>();
@@ -1196,10 +1044,6 @@ mod tests {
         );
     }
 
-    /// Releasing a pane gives back everything the mount took: its nodes, its frame route
-    /// and its value slots. Release is idempotent, and mounting again reuses the slots
-    /// instead of growing the table (a leaked pane shows up in `live`, a table that only
-    /// ever appends in `slots`).
     #[test]
     fn releasing_a_mounted_widget_should_leave_nothing_behind() {
         let registry = fixture_registry::<TestView>();
@@ -1237,8 +1081,6 @@ mod tests {
             "a second release is a no-op"
         );
 
-        // The first mount grew the table to the pane's peak; every later round has to
-        // reuse those slots instead of growing it further.
         let released = harness.signal_slot_stats();
         for _ in 0..8 {
             let widget = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);

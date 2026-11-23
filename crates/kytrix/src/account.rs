@@ -1,17 +1,3 @@
-//! The application's account record, as the account control reads and writes it.
-//!
-//! The control ([`profile_ui::profile::ProfileMenu`]) owns no settings: it is handed
-//! [`AccountSettings`], and this module is that seam over the composition root's
-//! [`ConfigHub`]. The rules are the trait's (see its documentation): the avatar always
-//! travels with the account it was generated for, so storing an account drops the previous
-//! avatar in the same write, and an avatar whose wallet is no longer signed in is not
-//! written at all.
-//!
-//! Every write goes through [`ConfigHub::edit`], so it is persisted first, then published
-//! as the settings signal, then projected (language, appearance) — the same path every
-//! settings page write takes. The control's next `sync` reads the published snapshot and
-//! redraws the face.
-
 use std::rc::Rc;
 
 use app_config::settings::AccountConfig;
@@ -21,13 +7,11 @@ use ui_core::app::App;
 
 use crate::composition::ConfigHub;
 
-/// The account record in the application settings.
 pub(crate) struct StoredAccounts {
     hub: Rc<ConfigHub>,
 }
 
 impl StoredAccounts {
-    /// The seam over the composition root's settings.
     pub(crate) fn new(hub: Rc<ConfigHub>) -> Self {
         Self { hub }
     }
@@ -44,7 +28,6 @@ impl AccountSettings for StoredAccounts {
     fn store_account(&self, app: &mut App, account: AccountConfig) {
         let _ = self.hub.edit(app, |config| {
             config.account = Some(account);
-            // The face belongs to the account that just went away.
             config.avatar = None;
         });
     }
@@ -57,9 +40,6 @@ impl AccountSettings for StoredAccounts {
     }
 
     fn store_avatar_if_current(&self, app: &mut App, wallet: &str, svg: String) -> bool {
-        // Generation is a background task: it can finish after the user signed out or
-        // after a different wallet signed in, and writing it then would put one
-        // account's face on another.
         let current = self.hub.read(|config| {
             config
                 .account
@@ -83,7 +63,6 @@ mod tests {
     use super::*;
     use crate::composition::ConfigHub;
 
-    /// A settings root the seam can write through, over an in-memory store.
     fn settings() -> (ui_core::test_support::app::TestApp, Rc<ConfigHub>) {
         let mut app = ui_core::test_support::app::TestApp::new();
         let hub = ConfigHub::for_test(app.app_mut(), ConfigStore::in_memory(Config::default()));
@@ -98,8 +77,6 @@ mod tests {
         }
     }
 
-    /// Storing an account replaces the record and drops the avatar in one write, and
-    /// the read answers both.
     #[test]
     fn storing_an_account_should_drop_the_previous_face() {
         let (mut app, hub) = settings();
@@ -119,8 +96,6 @@ mod tests {
         assert_eq!(accounts.read(app.app()), AccountSnapshot::default());
     }
 
-    /// An avatar is written only while the wallet it was generated for is still the
-    /// signed-in one.
     #[test]
     fn an_avatar_should_only_be_stored_for_the_current_wallet() {
         let (mut app, hub) = settings();

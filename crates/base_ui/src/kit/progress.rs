@@ -1,24 +1,3 @@
-//! 确定性进度条（旧 `crate::progress` 的引擎化重建，P2-4a）。
-//!
-//! 旧实现是 `Progress` + `ProgressTrack` + `ProgressIndicator` 三层 UI 元素，值在构造时决定。
-//! 新实现只有两个节点：轨道（背景 `components.progress.track`）与指示器（`components.progress.progress`），
-//! 指示器宽度是**布局百分比**（`taffy::Dimension::percent`），值变化时 `sync` 用 `set_style` 重写。
-//!
-//! # 动态值
-//!
-//! - 初值在 `build` 时写进 `Signal<f32>` 与指示器样式（首帧就是正确宽度，不经过 0 → value 的可见跳变）；
-//! - [`Progress::set_value`] 写信号（clamp 到 `0..=100`）；
-//! - [`Progress::sync`] 读信号：值变了才重写布局样式（返回 `true`），稳态返回 `false`
-//!   （I3：不请求帧）；
-//! - a11y 数值通道（`numeric_value` / `min` / `max`）走 `bind_a11y`，值变了由引擎 `BIND` 通道重发
-//!   （纯 a11y 更新，不产生视觉 damage）。
-//!
-//! # 与旧 API 的差异
-//!
-//! 旧 `value()` 是构造器参数、没有运行时更新；新 API 两者都有。旧实现的指示器圆角在 100% 时去掉
-//! 右圆角（`rounded_r(1.0)`），新引擎的圆角是绘制属性、宽度是布局属性，二者无法在同一节点上按值
-//! 条件化；这里统一用 2 px 圆角（登记见 spec-delta §3）。
-
 use std::{cell::Cell, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
@@ -41,10 +20,8 @@ use crate::{
     theme::handle::ThemeHandle,
 };
 
-/// 轨道高度（旧 `.h_2()` = 8 px）。
 const TRACK_HEIGHT: f32 = 8.0;
 
-/// 进度条。
 #[derive(Clone)]
 pub struct Progress {
     inner: Rc<ProgressInner>,
@@ -57,7 +34,6 @@ struct ProgressInner {
     theme: ThemeHandle,
     scope: SignalScope,
     value: Signal<f32>,
-    /// 已写进指示器布局样式的值（只在变化时 `set_style`）。
     applied: Cell<f32>,
     geometry: std::cell::RefCell<Geometry>,
 }
@@ -69,7 +45,6 @@ struct Geometry {
 }
 
 impl Progress {
-    /// 建进度条（初值 0）。`key` 是调试 id 前缀。
     pub fn new(app: &mut App, theme: ThemeHandle, key: impl Into<SmolStr>) -> Self {
         let scope = app.signal_scope();
         Self {
@@ -86,24 +61,18 @@ impl Progress {
         }
     }
 
-    /// 初值（`0..=100`，越界收紧）。
     #[must_use]
     pub fn value(mut self, value: f32) -> Self {
         self.initial = clamp_percent(value);
         self
     }
 
-    /// 可访问名（屏幕阅读器播报「加载中 40%」时用）。
     #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
         self
     }
 
-    /// 建轨道 + 指示器（并把初值写进信号与布局）。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode`。
     pub fn build(
         &self,
         app: &mut App,
@@ -171,33 +140,25 @@ impl Progress {
         Ok(track)
     }
 
-    /// 轨道节点（`build` 之后可用）。
     #[must_use]
     pub fn track_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().track
     }
 
-    /// 指示器节点（`build` 之后可用）。
     #[must_use]
     pub fn indicator_node(&self) -> Option<NodeId> {
         self.inner.geometry.borrow().indicator
     }
 
-    /// 当前值。
     #[must_use]
     pub fn current_value(&self, app: &App) -> f32 {
         app.read_with(&self.inner.value, |value| *value)
     }
 
-    /// 运行时写值（clamp 到 `0..=100`；下次 `sync` 写布局）。
     pub fn set_value(&self, app: &mut App, value: f32) -> bool {
         app.write(&self.inner.value, clamp_percent(value))
     }
 
-    /// 帧驱动：值变了才重写指示器宽度。
-    ///
-    /// # Errors
-    /// `UnknownWindow`（窗口已关闭）/ `StaleNode`（指示器已卸载）。
     pub fn sync(&self, app: &mut App, window: WindowId) -> Result<bool, EngineError> {
         let Some(indicator) = self.inner.geometry.borrow().indicator else {
             return Ok(false);
@@ -214,20 +175,17 @@ impl Progress {
         Ok(true)
     }
 
-    /// 释放信号作用域。
     pub fn release(&self, app: &mut App) -> usize {
         app.release_scope(self.inner.scope)
     }
 }
 
-/// 指示器样式：宽度 = 百分比，高度撑满轨道。
 fn indicator_style(value: f32) -> Style {
     let mut style = StyleBuilder::new().height_full().min_width_0().build();
     style.inner.size.width = Dimension::percent(clamp_percent(value) / 100.0);
     style
 }
 
-/// clamp 到 `0..=100`（NaN → 0）。
 fn clamp_percent(value: f32) -> f32 {
     if value.is_finite() {
         value.clamp(0.0, 100.0)
@@ -281,7 +239,6 @@ mod tests {
         }
     }
 
-    /// 初值决定首帧宽度：200 px 轨道上的 40% = 80 px。
     #[test]
     fn the_initial_value_sets_the_indicator_width_on_the_first_frame() {
         let harness = harness(40.0);
@@ -300,7 +257,6 @@ mod tests {
         );
     }
 
-    /// `set_value` + `sync` 重写布局；稳态 `sync` 返回 false（I3）。
     #[test]
     fn set_value_rewrites_the_indicator_and_then_settles() {
         let mut harness = harness(40.0);
@@ -334,7 +290,6 @@ mod tests {
         assert!(!record.rendered, "稳态不得出帧（I3）");
     }
 
-    /// 越界与 NaN 收紧到 `0..=100`。
     #[test]
     fn values_are_clamped_to_the_percentage_range() {
         let mut harness = harness(0.0);
@@ -346,7 +301,6 @@ mod tests {
         assert_eq!(harness.progress.current_value(harness.app.app()), 0.0);
     }
 
-    /// a11y：`ProgressIndicator` + 数值通道。
     #[test]
     fn the_progress_bar_declares_its_numeric_value_to_a11y() {
         let mut app = TestApp::new();
@@ -368,7 +322,6 @@ mod tests {
         assert_eq!(record.max_numeric_value, Some(100.0));
     }
 
-    /// 颜色：轨道 / 指示器取主题进度配方。
     #[test]
     fn the_track_and_indicator_use_the_theme_progress_recipe() {
         let harness = harness(50.0);

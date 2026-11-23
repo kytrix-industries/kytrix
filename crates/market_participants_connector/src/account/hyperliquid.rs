@@ -1,5 +1,3 @@
-//! Hyperliquid wallet streams and their mapping into account values.
-
 use super::{
     domain::{HyperliquidUserFill, HyperliquidWalletUpdate},
     error::{AccountError, account_error_from_market_participant},
@@ -9,12 +7,6 @@ use super::{
 };
 use crate::{adapter::ProtocolEvent, market_participants::model};
 
-/// Stream of wallet-facing Hyperliquid updates mapped to account values.
-///
-/// The stream holds the proof that its monitored routes' catalogs are published, so a
-/// fill that names a coin resolves to the listing of whichever route published it — and
-/// to that listing's units — without awaiting a fetch. A wallet stream is venue-wide:
-/// one stream carries the coins of every scope its reader monitors.
 pub struct HyperliquidSubscription {
     inner: crate::adapter::ProtocolStream,
     catalogs: WalletCatalogs,

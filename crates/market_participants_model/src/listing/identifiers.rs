@@ -1,5 +1,3 @@
-//! The typed native identifiers of one listing on one route.
-
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -22,7 +20,6 @@ use crate::{
     routing::ListingIdentifierKind,
 };
 
-/// The Binance listing identifiers.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct BinanceListingIdentifiers {
     #[serde(rename = "product")]
@@ -34,7 +31,6 @@ pub struct BinanceListingIdentifiers {
 }
 
 impl BinanceListingIdentifiers {
-    /// Validates the product and series combination.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.future_series.is_some() && self.product != BinanceProduct::Future {
             return Err(ModelError::InvalidListingContinuityTerms {
@@ -55,7 +51,6 @@ impl BinanceListingIdentifiers {
         Ok(())
     }
 
-    /// Returns the instrument kind this identifier must resolve to.
     pub const fn instrument_kind(&self) -> InstrumentKind {
         self.product.instrument_kind()
     }
@@ -87,16 +82,10 @@ impl<'de> Deserialize<'de> for BinanceListingIdentifiers {
     }
 }
 
-/// The OKX listing identifiers.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct OkxListingIdentifiers {
     #[serde(rename = "instrument_type")]
     pub instrument_type: OkxInstrumentType,
-    /// The venue's own instrument family (`instFamily`).
-    ///
-    /// A perpetual is margined and levelled by family — the venue publishes its
-    /// position tiers for a family rather than for one contract — so a perpetual
-    /// carries the family it belongs to as part of its identity.
     #[serde(rename = "instrument_family")]
     pub instrument_family: Option<NativeSymbol>,
     #[serde(rename = "future_series")]
@@ -106,7 +95,6 @@ pub struct OkxListingIdentifiers {
 }
 
 impl OkxListingIdentifiers {
-    /// Validates the instrument type, the family and the series combination.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.instrument_family.is_none() && self.instrument_type == OkxInstrumentType::Perpetual
         {
@@ -133,7 +121,6 @@ impl OkxListingIdentifiers {
         Ok(())
     }
 
-    /// Returns the instrument kind this identifier must resolve to.
     pub const fn instrument_kind(&self) -> InstrumentKind {
         self.instrument_type.instrument_kind()
     }
@@ -168,10 +155,6 @@ impl<'de> Deserialize<'de> for OkxListingIdentifiers {
     }
 }
 
-/// The Hyperliquid typed listing metadata.
-///
-/// `dex` and `venue` echo the protocol scope: they must equal the route scope
-/// and never become a second route identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "identifiers")]
 pub enum HyperliquidListingIdentifiers {
@@ -211,7 +194,6 @@ pub enum HyperliquidListingIdentifiers {
 }
 
 impl HyperliquidListingIdentifiers {
-    /// Validates the echoed scope against the route and the required metadata.
     pub fn validate(&self, route: &VenueRoute) -> Result<(), ModelError> {
         match self {
             Self::Spot { .. } => Ok(()),
@@ -249,7 +231,6 @@ impl HyperliquidListingIdentifiers {
         }
     }
 
-    /// Returns the route scope this identifier claims, when it echoes one.
     pub fn scope(&self) -> Option<&VenueScopeId> {
         match self {
             Self::Spot { .. } => None,
@@ -258,7 +239,6 @@ impl HyperliquidListingIdentifiers {
         }
     }
 
-    /// Returns the instrument kind this identifier must resolve to.
     pub const fn instrument_kind(&self) -> InstrumentKind {
         match self {
             Self::Spot { .. } => InstrumentKind::Spot,
@@ -268,7 +248,6 @@ impl HyperliquidListingIdentifiers {
     }
 }
 
-/// The Polymarket typed listing metadata.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PolymarketListingIdentifiers {
     #[serde(rename = "event_id")]
@@ -286,7 +265,6 @@ pub struct PolymarketListingIdentifiers {
 }
 
 impl PolymarketListingIdentifiers {
-    /// Validates the required CTF identifiers and the outcome label.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.condition_id.as_str().is_empty() || self.asset_id.as_str().is_empty() {
             return Err(ModelError::InvalidListingContinuityTerms {
@@ -306,18 +284,11 @@ impl PolymarketListingIdentifiers {
         Ok(())
     }
 
-    /// Returns the instrument kind this identifier must resolve to.
     pub const fn instrument_kind(&self) -> InstrumentKind {
         InstrumentKind::Outcome
     }
 }
 
-/// The equity listing metadata of one market segment.
-///
-/// The segment is named by its ISO 10383 market identifier code, which is the
-/// market the listing is quoted on: a venue identity is not part of it, because
-/// the venue of the *route* is the venue this build addresses the listing at,
-/// and the venue the shares actually trade on is what the MIC says.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EquityListingIdentifiers {
     #[serde(rename = "mic")]
@@ -331,7 +302,6 @@ pub struct EquityListingIdentifiers {
 }
 
 impl EquityListingIdentifiers {
-    /// Validates the displayed ticker and the local code.
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.ticker.is_empty() {
             return Err(ModelError::InvalidListingContinuityTerms {
@@ -346,37 +316,21 @@ impl EquityListingIdentifiers {
         Ok(())
     }
 
-    /// Returns the instrument kind this identifier must resolve to.
     pub const fn instrument_kind(&self) -> InstrumentKind {
         InstrumentKind::Spot
     }
 }
 
-/// The outcome of comparing a listing's typed identifiers with its native symbols.
-///
-/// The status is a closed enum because the three cases lead to different
-/// publication decisions: a contradicted echo refuses the listing, a missing
-/// comparison keeps it publishable, and only an exact echo means the typed
-/// identifier and the native symbols agree. It describes that relationship and
-/// nothing more — in particular, a symbol that echoes a typed identifier stays a
-/// search alias and never becomes the name a listing is drawn by.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EchoValidationStatus {
-    /// Every comparable typed identifier is echoed by a declared symbol.
     Verified,
-    /// The listing has no typed identifier with a native display symbol, or it
-    /// declares no display symbol to compare against, so no echo exists.
     NoComparableIdentifier,
-    /// A typed identifier names a value none of the declared symbols carries.
     Mismatch {
-        /// The identifier kind whose echo disagreed.
         kind: ListingIdentifierKind,
-        /// The typed value that was not echoed.
         value: SmolStr,
     },
 }
 
-/// The authoritative protocol identifiers of one listing.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "identifiers")]
 pub enum VenueListingIdentifiers {
@@ -397,7 +351,6 @@ pub enum VenueListingIdentifiers {
 }
 
 impl VenueListingIdentifiers {
-    /// Validates the product metadata and its route-specific requirements.
     pub fn validate(&self, route: &VenueRoute) -> Result<(), ModelError> {
         match self {
             Self::Binance(identifiers) => identifiers.validate(),
@@ -410,7 +363,6 @@ impl VenueListingIdentifiers {
         }
     }
 
-    /// Validates this identifier against the route and the listed kind.
     pub fn validate_for(&self, route: &VenueRoute, kind: InstrumentKind) -> Result<(), ModelError> {
         self.validate(route)?;
         if self.instrument_kind() == kind {
@@ -421,7 +373,6 @@ impl VenueListingIdentifiers {
         })
     }
 
-    /// Returns the instrument kind these identifiers must resolve to.
     pub const fn instrument_kind(&self) -> InstrumentKind {
         match self {
             Self::Binance(identifiers) => identifiers.instrument_kind(),
@@ -434,7 +385,6 @@ impl VenueListingIdentifiers {
         }
     }
 
-    /// Returns the primary identifier kind of this variant.
     pub const fn primary_kind(&self) -> ListingIdentifierKind {
         match self {
             Self::Binance(_) => ListingIdentifierKind::BinanceInstrument,

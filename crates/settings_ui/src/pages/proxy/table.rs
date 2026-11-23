@@ -1,24 +1,3 @@
-//! The server-management page: the proxy catalog as a table, and the form its rows open.
-//!
-//! The catalog is one row per saved endpoint. A catalog with nothing in it draws one line across
-//! the body rather than a row whose every column says it holds nothing.
-//!
-//! The table is the page's own: the page is drawn without the shell's scroll region
-//! ([`PageView::scrolls`]) because the table scrolls its rows itself, and the page sits at the
-//! height the settings give it — the row above the catalog and the catalog under it.
-//!
-//! # Who opens the form
-//!
-//! The table's rows are built without an application context (a kit table's row factory is handed
-//! only the node tree), so a row cannot open a dialog. A row records what it asked for in a signal
-//! and the page opens the form on the frame that follows — see [`ProxyTablePage::sync`]. The same
-//! request signal is what the button above the catalog writes, so there is one path into the form
-//! rather than two.
-//!
-//! Deleting is the one row action that cannot be taken back, because removing an entry puts every
-//! route that named it back on the default line. It is put to the user as an alert over the
-//! settings, and only what the alert confirms is written.
-
 use std::borrow::Cow;
 
 use app_config::{
@@ -67,17 +46,12 @@ use crate::{
     session::SettingsChange,
 };
 
-/// The id of this page.
 const PAGE: &str = "server-management";
 
-/// The columns of the catalog, in the order they are drawn: the name, the endpoint, the
-/// authentication it asks for and the mode it resolves names in, then the row's own controls.
 const COLUMN_COUNT: usize = 8;
 
-/// The share of the table each column takes.
 const COLUMN_WEIGHTS: [f32; COLUMN_COUNT] = [0.14, 0.14, 0.06, 0.12, 0.12, 0.10, 0.10, 0.22];
 
-/// How each column aligns its text.
 const COLUMN_ALIGNS: [ColumnAlign; COLUMN_COUNT] = [
     ColumnAlign::Start,
     ColumnAlign::Start,
@@ -89,59 +63,36 @@ const COLUMN_ALIGNS: [ColumnAlign; COLUMN_COUNT] = [
     ColumnAlign::Center,
 ];
 
-/// The text a password is drawn as, whatever it holds: a catalog entry's password is the one
-/// value the settings hold that the page must not draw back.
 const PASSWORD_MASK: &str = "••••••";
 
-/// The height of one row of the catalog.
 const ROW_GAP: f32 = 6.0;
 
-/// One entry of the catalog as the table draws it: the name it is stored under and what it holds.
 type Rows = Vec<(SmolStr, ProxyConfig)>;
 
-/// What one control of the page asked it to do, waiting for the frame that does it.
-///
-/// The table's rows are built without an application context, so a row records the form it wants
-/// and the page opens it: a request is opened once, on the frame the page takes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProxyIntent {
-    /// Open the form that adds a new entry.
     Add,
-    /// Open the form that edits `name`, started from what it currently holds.
     Edit(SmolStr),
-    /// Ask the user to confirm removing `name`.
     Delete(SmolStr),
 }
 
-/// The server-management page.
 pub(crate) struct ProxyTablePage {
     host: SettingsHost,
     window: Option<WindowId>,
-    /// The key prefix every kit component of this page and every dialog it opens is named by.
     prefix: Option<SmolStr>,
-    /// The catalog the table's cells read, so a value that changed under a mounted row is drawn
-    /// on the next frame without rebuilding the row.
     rows: Option<Signal<Rows>>,
-    /// What a control of the page asked for, waiting for the frame that opens it.
     request: Option<Signal<Option<ProxyIntent>>>,
-    /// The signal scope the page's two signals belong to, released with the page.
     scope: Option<SignalScope>,
     table: Option<Table>,
     add_button: Option<Button>,
-    /// The actions the catalog's rows dispatch, by the order they were registered in.
     row_actions: Vec<Action>,
-    /// The form the page opened, until it is confirmed or walked away from.
     editor: Option<ProxyEditor>,
-    /// The alert a delete is asked in, until it is answered.
     alert: Option<Dialog>,
-    /// The catalog the table was last told to draw.
     applied: Option<Rows>,
-    /// How many rows the table was last told to draw.
     applied_rows: usize,
 }
 
 impl ProxyTablePage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
     pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
         Self {
             host,
@@ -160,10 +111,6 @@ impl ProxyTablePage {
         }
     }
 
-    /// The catalog as the settings hold it, in the order the table draws it.
-    ///
-    /// The catalog is a map keyed by name, so its order is the name order: the rows do not move
-    /// because a proxy was added, and two rows never trade places.
     fn catalog(&self, app: &App) -> Rows {
         self.host.config(app, |config: &Config| {
             config
@@ -174,7 +121,6 @@ impl ProxyTablePage {
         })
     }
 
-    /// Takes what a control asked for, so it is opened once.
     fn take_request(&self, app: &mut App) -> Option<ProxyIntent> {
         let signal = self.request?;
         let request = { app.read(&signal).clone() };
@@ -184,10 +130,7 @@ impl ProxyTablePage {
         request
     }
 
-    /// Opens what one request asked for: the form of an entry, or the alert a delete is asked in.
     fn adopt(&mut self, app: &mut App, request: ProxyIntent) {
-        // A modal owns the page while it is up: a request that arrives while one is open is the
-        // frame behind the modal asking for another, not a user opening two forms at once.
         if self.editor.is_some() || self.alert.is_some() {
             return;
         }
@@ -215,7 +158,6 @@ impl ProxyTablePage {
         }
     }
 
-    /// Opens the alert that asks whether one entry may be removed.
     fn open_delete(&mut self, app: &mut App, window: WindowId, prefix: &SmolStr, name: SmolStr) {
         let translate = self.host.translate().clone();
         let title = i18n::t_smol!(translate, "settings_ui.proxies.delete_title");
@@ -260,11 +202,6 @@ impl ProxyTablePage {
         }
     }
 
-    /// Registers the actions the catalog's rows dispatch, for the rows there are now.
-    ///
-    /// A row's action identity carries the row's place in the catalog rather than its name: the
-    /// handler reads the name of the row the click landed on, so a rename that moves a row keeps
-    /// every button pointing at the entry it is drawn under.
     fn register_row_actions(&mut self, app: &mut App) {
         for action in self.row_actions.drain(..) {
             app.off_action(&action);
@@ -292,7 +229,6 @@ impl ProxyTablePage {
     }
 }
 
-/// Asks the page to open the form of one row, reading the name the row is drawn under now.
 fn open_row(
     ctx: &mut ActionCtx<'_>,
     rows: Signal<Rows>,
@@ -361,8 +297,6 @@ impl PageView for ProxyTablePage {
                 .build(tree, parent)
         })?;
 
-        // The row above the catalog is the way to add to it and nothing else, so what it holds is
-        // the right end of it.
         let toolbar = layout::build_node(app, window, page, |tree, parent| {
             NodeBuilder::boxed()
                 .id("SETTINGS_PROXY_ADD_ROW")
@@ -443,8 +377,6 @@ impl PageView for ProxyTablePage {
         table.mount(app, window, frame)?;
         self.table = Some(table);
 
-        // A catalog that holds nothing says so once, across the body, rather than in every
-        // column of a row that has no entry behind it.
         let empty = layout::build_node(app, window, frame, move |tree, parent| {
             NodeBuilder::boxed()
                 .id("SETTINGS_PROXY_EMPTY")
@@ -571,12 +503,6 @@ impl PageView for ProxyTablePage {
     }
 }
 
-/// The labels the catalog's cells draw: what an entry's authentication and DNS mode are called,
-/// and the text a password is drawn as.
-///
-/// They are resolved when the page is built rather than per cell, because a cell is built in a
-/// frame and the catalogue does not move under a drawn page: a language that moves on rebuilds
-/// the page, and with it every label here.
 struct CellLabels {
     no_authorization: SmolStr,
     username_password: SmolStr,
@@ -586,7 +512,6 @@ struct CellLabels {
 }
 
 impl CellLabels {
-    /// The labels of one built page.
     fn new(translate: &Translate) -> Self {
         Self {
             no_authorization: i18n::t_smol!(translate, "settings_ui.proxies.no_authorization"),
@@ -598,8 +523,6 @@ impl CellLabels {
     }
 }
 
-/// What one cell of the table is built from: the labels it draws, the theme it follows and the
-/// page's row-action prefix.
 struct CellBuild<'a> {
     labels: &'a CellLabels,
     theme: &'a ThemeHandle,
@@ -608,7 +531,6 @@ struct CellBuild<'a> {
     delete_label: &'a SmolStr,
 }
 
-/// The columns the catalog declares, in header order.
 fn columns(translate: &Translate) -> Vec<Column> {
     let headers = [
         i18n::t_smol!(translate, "settings_ui.proxies.name"),
@@ -618,8 +540,6 @@ fn columns(translate: &Translate) -> Vec<Column> {
         i18n::t_smol!(translate, "settings_ui.proxies.username"),
         i18n::t_smol!(translate, "settings_ui.proxies.password"),
         i18n::t_smol!(translate, "settings_ui.proxies.dns_mode"),
-        // The last column is the row's own controls, which carry no label: nothing is written
-        // over a column whose content is a button.
         SmolStr::default(),
     ];
 
@@ -631,11 +551,6 @@ fn columns(translate: &Translate) -> Vec<Column> {
         .collect()
 }
 
-/// Builds one cell of one row of the table.
-///
-/// A table's row factory is handed no application context, so a cell is either a text node bound
-/// to the catalog signal or a pair of controls that dispatch the action the page registered for
-/// its row.
 fn build_cell(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -649,7 +564,6 @@ fn build_cell(
     }
 }
 
-/// Builds one cell, reporting what the table's node tree refused.
 fn cell_node(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -690,7 +604,6 @@ fn cell_node(
     Ok(())
 }
 
-/// The text one cell of one row draws.
 fn cell_text(rows: &Rows, row: usize, column: usize, labels: &CellLabels) -> SmolStr {
     let Some((name, proxy)) = rows.get(row) else {
         return SmolStr::default();
@@ -727,7 +640,6 @@ fn cell_text(rows: &Rows, row: usize, column: usize, labels: &CellLabels) -> Smo
     }
 }
 
-/// Builds the controls of one row: the way into its form and the way out of the catalog.
 fn row_controls(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -774,10 +686,6 @@ fn row_controls(
     Ok(())
 }
 
-/// The sentence a delete is confirmed by, as the plain text the alert draws.
-///
-/// The catalogue value is rich text (it aligns its paragraph); a kit alert draws plain text, so
-/// the sentence is read as the words it says — the markup is parsed away rather than shown.
 fn delete_message(translate: &Translate, name: &SmolStr) -> SmolStr {
     let rich = i18n::t_smol!(
         translate,
@@ -788,7 +696,6 @@ fn delete_message(translate: &Translate, name: &SmolStr) -> SmolStr {
     parse_document(rich.as_ref(), &NoMarkdownAssets).plain_text()
 }
 
-/// No resource is read while a sentence is read as text: the delete message names no image.
 struct NoMarkdownAssets;
 
 impl MarkdownAssets for NoMarkdownAssets {

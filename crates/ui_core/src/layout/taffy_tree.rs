@@ -1,11 +1,3 @@
-//! 为 `NodeTree` 实现 taffy 0.15.0 的低级 trait（+ 布局运行入口）。
-//!
-//! 事实基线：`E:\.cargo\registry\...\taffy-0.15.0\src\`（`tree/traits.rs`、`compute/{mod,leaf,oof}.rs`）。
-//!
-//! **本文件的 impl 都是 trait impl**，不新增 inherent `impl NodeTree` 块
-//! （`clippy::multiple_inherent_impl = "forbid"` + AGENTS §1.3「严禁拆分多个 impl 到不同文件」）；
-//! 需要 `&mut NodeTree` 的算法逻辑一律写成**自由函数**（`run` / `dispatch_child_layout`）。
-
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 use taffy::{
@@ -22,26 +14,14 @@ use crate::{
     node::{id::NodeId, tree::NodeTree},
 };
 
-/// 引擎 `NodeId` → taffy `NodeId`。
-///
-/// 编码复用 P03 的 `NodeId::to_bits()`：`generation << 32 | index`，双向无损
-/// （`taffy::NodeId` 是 `u64` 的 newtype，`new`/`From<u64>`，见 `tree/node.rs:13-32`）。
 fn to_taffy(node: NodeId) -> TaffyNode {
     TaffyNode::new(node.to_bits())
 }
 
-/// 迭代器元素版本（`ChildIter` 的元素类型需要 `fn(&NodeId) -> TaffyNode`）。
 fn to_taffy_ref(node: &NodeId) -> TaffyNode {
     TaffyNode::new(node.to_bits())
 }
 
-/// taffy `NodeId` → 引擎 `NodeId`；非法编码回落根（`debug_assert`，release 安全）。
-///
-/// **必须补上树的窗口 tag**：taffy 只携带 64 位的 tree-local 编码（`(gen << 32) | index`），
-/// 直接 `NodeId::from_bits` 得到的是"未绑定"句柄（tag 0）。未绑定句柄在 `arena.get` 里是通配的
-/// （查得到），但作为 `HashMap` 的键与 arena 铸出的带 tag 句柄**不相等** —— `layout_cache` /
-/// `hoisted` / `geometry_transforms` 的失效会因此漏清（wave-6 的实测回归：文本 measure 缓存
-/// 清不掉，根 cache 命中 ⇒ 文本改动不重排）。
 fn to_engine(tree: &NodeTree, node: TaffyNode) -> NodeId {
     let tag = tree.window_tag();
     NodeId::from_bits(u64::from(node))
@@ -55,7 +35,6 @@ fn to_engine(tree: &NodeTree, node: TaffyNode) -> NodeId {
         })
 }
 
-/// 一次布局运行：**不**做圆整（P01 §7.5 / I11；引擎永不调用 taffy 的圆整入口）。
 pub(crate) fn run(
     tree: &mut NodeTree,
     available: taffy::Size<Option<f32>>,
@@ -71,44 +50,27 @@ pub(crate) fn run(
             .map_or(AvailableSpace::MaxContent, AvailableSpace::Definite),
     };
 
-    // 低级入口：内部只写 `set_unrounded_layout`，不做任何圆整。
     compute_root_layout(tree, root, available_space);
 
-    // R04-10：错误帧既**不推进绝对坐标**，也不消费 `LAYOUT`（见 `set_local_layout` 的同款守卫）。
-    //
-    // 旧实现在 `absolutize()` 之后才 `take_invalid_measure()`，此时整轮已经跑完、`LAYOUT` 已被
-    // 清掉：应用修好 measure 闭包后没有任何失效源（`layout_if_dirty` 只看 `LAYOUT`），
-    // 该子树永远停在错误帧的盒子上。这里把「出错节点 → 根」的 taffy 缓存清掉并重新标 `LAYOUT`，
-    // 于是修复本身（闭包返回合法值）就足以让下一帧自愈，不需要外部 `mark_layout`。
-    // R04-10：错误帧既**不推进绝对坐标**，也不消费 `LAYOUT`。旧实现在 `absolutize()` 之后才
-    // `take_invalid_measure()`，此时整轮已跑完、`LAYOUT` 已被清掉：应用修好 measure 闭包后
-    // 没有任何失效源（`layout_if_dirty` 只看 `LAYOUT`），该子树永远停在错误帧的盒子上。
-    // 这里把「出错节点 → 根」的 taffy 缓存清掉并重新标 `LAYOUT`，于是修复本身（闭包返回合法值）
-    // 就足以让下一帧自愈，不需要外部 `mark_layout`。
     if let Some(error) = tree.take_invalid_measure() {
         let node = match &error {
             EngineError::InvalidMeasure { node, .. } => *node,
-            // `NodeTree::invalid_measure` 的唯一写者是 `note_invalid_measure`（只装这一种错误）。
             _ => tree.root(),
         };
         tree.invalidate_layout(node);
         return Err(error);
     }
-    // 引擎 post-pass：父相对 → 窗口绝对（含出流/hoisted 子树）。
     tree.absolutize();
 
     Ok(tree.take_report())
 }
 
-/// `LayoutPartialTree::compute_child_layout` + `LayoutBlockContainer::compute_block_child_layout`
-/// 的统一实现（与 taffy `TaffyView::compute_child_layout` 的结构逐字对应）。
 fn dispatch_child_layout(
     tree: &mut NodeTree,
     taffy_node: TaffyNode,
     inputs: LayoutInput,
     block_ctx: Option<&mut BlockContext<'_>>,
 ) -> LayoutOutput {
-    // 祖先 `display:none` ⇒ 隐藏布局，不进 cache（taffy 的固定入口顺序）。
     if inputs.run_mode == taffy::RunMode::PerformHiddenLayout {
         return compute_hidden_layout(tree, taffy_node);
     }
@@ -116,37 +78,29 @@ fn dispatch_child_layout(
     compute_cached_layout(tree, taffy_node, inputs, |tree, taffy_node, inputs| {
         let node = to_engine(tree, taffy_node);
         if inputs.run_mode == taffy::RunMode::PerformLayout {
-            // 只有完整布局且 cache 未命中的节点计入 `laid_out`（「只重算脏子树」的度量）。
             tree.stats_mut().note_laid_out();
         }
         let display = tree.taffy_style(node).display;
         let has_children = !tree.taffy_children(node).is_empty();
 
         let mut output = if matches!(display, Display::None) {
-            // N3：隐藏优先于 override —— 隐藏的覆盖节点不得有非零盒。
             compute_hidden_layout(tree, taffy_node)
         } else if let Some(overridden) = tree.layout_override_of(node) {
-            // root 逃生口：尺寸由应用给定，位置由 post-pass 落（`NodeTree::absolutize`）。
             LayoutOutput::from_outer_size(TaffySize {
                 width: overridden.rect.size.width,
                 height: overridden.rect.size.height,
             })
         } else {
             match (display, has_children) {
-                // N2：`FlowRoot` 不透传 `block_ctx`（与 taffy `TaffyView` 的
-                // `(Display::FlowRoot, true) => compute_block_layout(.., None)` 一致）。
                 (Display::Block, true) => compute_block_layout(tree, taffy_node, inputs, block_ctx),
                 (Display::FlowRoot, true) => compute_block_layout(tree, taffy_node, inputs, None),
                 (Display::Flex, true) => compute_flexbox_layout(tree, taffy_node, inputs),
                 (Display::Grid, true) => compute_grid_layout(tree, taffy_node, inputs),
-                // 仅 `Display::None` 能走到这里（上面已提前返回），保守按隐藏处理。
                 (_, true) => compute_hidden_layout(tree, taffy_node),
                 (_, false) => measure::compute_leaf(tree, node, inputs),
             }
         };
 
-        // 出流盒的定位 pass 只在完整布局里跑（measure pass 写 hoisted 布局，而「最终布局 cache 命中」
-        // 时不会重写它们 —— taffy `tree/taffy_tree.rs:337` 的同一理由）。
         if inputs.run_mode == taffy::RunMode::PerformLayout {
             compute_oof_layout(tree, taffy_node, &mut output);
         }
@@ -476,7 +430,6 @@ mod tests {
 
     #[test]
     fn fractional_sizes_are_not_rounded() {
-        // P01 §7.5：不做圆整 ⇒ 10.5 / 3.25 必须原样保留。
         let mut tree = NodeTree::new();
         let root = tree.root();
         let a = add(&mut tree, root, fixed(10.5, 3.25));
@@ -715,7 +668,6 @@ mod tests {
     fn out_of_flow_hoisted_to_ancestor_uses_containing_block() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        // 定位祖先（relative, padding 10）
         let mut container_style = taffy::Style::<smol_str::SmolStr>::DEFAULT;
         container_style.position = Position::Relative;
         container_style.size = taffy::geometry::Size {
@@ -736,9 +688,7 @@ mod tests {
                 clip: Clip::None,
             },
         );
-        // 静态中间节点（不是包含块）
         let static_mid = add(&mut tree, container, fixed(50.0, 50.0));
-        // 出流孙节点：包含块是 container，树父是 static_mid
         let mut abs_style = taffy::Style::<smol_str::SmolStr>::DEFAULT;
         abs_style.position = Position::Absolute;
         abs_style.inset = taffy::geometry::Rect {
@@ -762,9 +712,6 @@ mod tests {
 
         let _ = layout(&mut tree, 200.0, 200.0);
 
-        // container 在 (0,0) 100×100；出流盒的 local 相对**包含块 border box**
-        // （taffy `absolute_position_offset = border`，不含 padding，见
-        //  `taffy-0.15.0/src/compute/flexbox.rs:511`），因此 inset 5/7 直接落到 (5,7)。
         assert_eq!(
             bounds(&tree, absolute),
             Rect::new(5.0, 7.0, 20.0, 20.0),
@@ -797,7 +744,6 @@ mod tests {
         let c = add(&mut tree, root, fixed(10.0, 10.0));
         let _ = layout(&mut tree, 100.0, 100.0);
 
-        // 只改 b 的宽度（生产路径：`NodeTree::set_style` → 标 LAYOUT + 清 node..root 的缓存）
         tree.set_style(b, fixed(40.0, 10.0)).expect("节点存活");
         let report = layout(&mut tree, 100.0, 100.0);
 
@@ -969,7 +915,6 @@ mod tests {
             "B1：override 相对树父 border box（父在 y=40）"
         );
 
-        // 父被推开：override 必须跟随（不依赖任何 hoisted 的包含块 local）
         tree.set_style(spacer, fixed(200.0, 100.0)).expect("存活");
         let _ = layout(&mut tree, 200.0, 200.0);
         assert_eq!(
@@ -1039,7 +984,6 @@ mod tests {
             "可见时正常"
         );
 
-        // 隐藏父：出流后代的幽灵盒必须清零（N1）
         let mut hidden = taffy::Style::<smol_str::SmolStr>::DEFAULT;
         hidden.display = Display::None;
         tree.set_style(
@@ -1090,9 +1034,6 @@ mod tests {
         assert_eq!(bounds(&tree, second).origin.y, 10.0);
     }
 
-    // ── B9：布局后置遍历的增量性（不再全树重算子树包围盒）────────────────────
-
-    /// 快照全树的子树包围盒（与 `recompute_subtree_bounds` 的全量结果做逐位对比）。
     fn snapshot_subtree_bounds(tree: &NodeTree) -> Vec<(NodeId, Rect)> {
         tree.dfs_ids()
             .into_iter()
@@ -1102,12 +1043,6 @@ mod tests {
 
     #[test]
     fn incremental_post_pass_touches_only_the_changed_path() {
-        // 两级树：root → 100 行 × 100 列 = 10_001 个节点。
-        //
-        // 说明（为什么不是"root 直接挂 10k 叶子"）：taffy 每轮会把它**直接子节点**的布局写回
-        // （`set_unrounded_layout`），于是这些子节点在 `place_subtree` 里必然被访问一次 ——
-        // 这是布局算法本身的工作，不是 post-pass 的额外扫描。B9 要证明的是：**布局后置步骤**
-        // 不再全树重算包络（旧实现固定 = 节点总数），而是与"被布局算法访问过的节点数"同阶。
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut root_style = fixed(1000.0, 1000.0);
@@ -1132,7 +1067,6 @@ mod tests {
             "首轮布局每个节点都要写一次包围盒（{first:?}）"
         );
 
-        // 改**最后一个**叶子：不推挤任何兄弟（位置全不变），只有它自己重排。
         let last = *leaves.last().expect("非空");
         tree.set_style(last, fixed(8.0, 9.0)).expect("节点存活");
         let second = layout(&mut tree, 1000.0, 1000.0);
@@ -1148,7 +1082,6 @@ mod tests {
 
     #[test]
     fn incremental_subtree_bounds_match_a_full_recompute() {
-        // 覆盖：普通流、嵌套祖先链、出流盒（hoisted）、`LayoutOverride`。
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut root_style = fixed(200.0, 200.0);
@@ -1198,12 +1131,10 @@ mod tests {
         let _ = layout(&mut tree, 200.0, 200.0);
         verify(&mut tree, "首轮");
 
-        // 1) 推挤容器（出流盒随包含块移动 → 树祖先的包络需要只增修正）。
         tree.set_style(spacer, fixed(200.0, 60.0)).expect("存活");
         let _ = layout(&mut tree, 200.0, 200.0);
         verify(&mut tree, "祖先移动后");
 
-        // 2) 覆盖节点换位置（扩大容器子树包络）。
         tree.set_layout_override(
             canvas,
             Some(LayoutOverride::new(Rect::new(150.0, 150.0, 40.0, 40.0))),
@@ -1212,23 +1143,15 @@ mod tests {
         let _ = layout(&mut tree, 200.0, 200.0);
         verify(&mut tree, "override 移动后");
 
-        // 3) 出流盒改 inset（自己的 local 变化）。
         tree.set_absolute_inset(out_of_flow, crate::math::Point::new(40.0, 40.0));
         let _ = layout(&mut tree, 200.0, 200.0);
         verify(&mut tree, "出流盒移动后");
 
-        // 4) 卸载整棵子树（包络必须收紧，不能留幽灵范围）。
         tree.remove(static_mid).expect("卸载成功");
         let _ = layout(&mut tree, 200.0, 200.0);
         verify(&mut tree, "卸载后");
     }
 
-    /// wave-9 性能回归的确定性钉板：**大量出流兄弟**时，祖先包络修正必须去重（每个受波及祖先
-    /// 只重算一次），不能是 `O(移动出流盒数 × 祖先数 × 直接子节点数)`。
-    ///
-    /// 计数用 `LayoutReport::bounds_updated`（`store_subtree_bounds` 的调用次数）：
-    /// 200 个绝对定位子节点 ⇒ 首轮 = 根 + 200 个孩子 = 201 次放置写入 + **1** 次根包络修正；
-    /// 未去重的实现会在每个移动子节点上重写根一次（+200），> 300 就会失败。
     #[test]
     fn many_out_of_flow_siblings_recompute_each_ancestor_once() {
         let mut tree = NodeTree::new();
@@ -1248,14 +1171,12 @@ mod tests {
             "首轮包络写入必须 ≈ 节点数（根 1 + 200），实际 {} —— 祖先修正没有去重",
             report.bounds_updated
         );
-        // 第二次布局：结构没变 ⇒ 没有移动出流盒 ⇒ 只重贴根（以及被 taffy 写回的孩子）。
         let second = layout(&mut tree, 400.0, 400.0);
         assert!(
             second.bounds_updated <= 300,
             "稳定态包络写入必须 O(被布局节点数)，实际 {}",
             second.bounds_updated
         );
-        // 正确性：增量包络与全量重算逐位一致（去重/自底向上顺序不能改变结果）。
         let incremental = children
             .iter()
             .map(|child| tree.subtree_bounds(*child))
@@ -1268,10 +1189,6 @@ mod tests {
         assert_eq!(incremental, exact, "增量包络必须与全量重算一致");
     }
 
-    /// `LayoutOverride` 节点由树父就地放置（B1），包络天然精确 ⇒ **不得**进入跨界的祖先修正。
-    ///
-    /// 未修版本把 512 个 override 兄弟当"出流跨界"处理：每个都重扫根的 512 个孩子
-    /// （实测 `layout_512` 1.5 ms，修复后 ≈ 180 µs）。计数断言把它变成确定性测试。
     #[test]
     fn layout_overrides_never_enter_the_ancestor_fixup() {
         let mut tree = NodeTree::new();
@@ -1291,7 +1208,6 @@ mod tests {
             report.bounds_updated, 513,
             "根 + 512 个 override 各写一次包络；override 不得触发祖先修正"
         );
-        // 包络正确性：根 = 根自身 (800×600) ∪ 全部 override 盒（最后一格 y = 63 × 32 + 28）。
         assert_eq!(bounds(&tree, children[0]), Rect::new(0.0, 0.0, 90.0, 28.0));
         assert_eq!(
             bounds(&tree, children[511]),
@@ -1305,12 +1221,6 @@ mod tests {
 
     #[test]
     fn device_snapping_descends_when_only_the_subpixel_reference_moved() {
-        // B7 的正确性边角：父/中间盒吸附后**没变**，但未圆整的位移让**孙子**的边界跨过半像素。
-        //
-        // 链：root → spacer + container → mid（margin 0.15）→ leaf（margin 0.3）。
-        // spacer 10.0 → 10.2 让整条链的未圆整 y 各 +0.2：container 10.0→10.2（吸附 10/10）、
-        // mid 10.15→10.35（吸附 10/10，**不变** ⇒ 会触发早期退出）、
-        // leaf 10.45→10.65（吸附 10→**11**，必须重贴）。
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut root_style = fixed(200.0, 200.0);
@@ -1370,12 +1280,6 @@ mod tests {
         );
     }
 
-    /// R04-10 验收：measure 违规帧**不得**消费 `LAYOUT`，也不得把 NaN 交给 taffy。
-    ///
-    /// 第一轮 measure 返回 NaN（`InvalidMeasure`），第二轮返回 10 —— 期间不调用任何
-    /// `mark_layout` / `invalidate_measure`，节点必须自己回到 10×10。
-    /// 旧实现：错误帧已把 `LAYOUT` 清掉（`set_local_layout` 无条件 `remove`）、且 taffy 缓存里
-    /// 留着 NaN 布局 ⇒ 第二轮 cache 命中、第二/三次不再调 measure，节点永久停在坏盒子上。
     #[test]
     fn an_invalid_measure_is_recoverable_without_an_external_invalidation() {
         use std::rc::Rc;
@@ -1425,7 +1329,6 @@ mod tests {
             })
             .expect("第二轮必须自愈");
         let committed = bounds(&tree, node);
-        // flex 行会沿交叉轴拉伸子节点高度，因此只断言 measure 决定的主轴宽度。
         assert_eq!(committed.size.width, 10.0, "第二轮必须重跑 measure");
         assert!(report.laid_out > 0, "{report:?}");
         assert!(calls.get() > 1, "measure 必须被重新调用：{}", calls.get());

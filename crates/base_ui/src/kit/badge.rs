@@ -1,23 +1,3 @@
-//! 状态标签（旧 `crate::badge` 的引擎化重建，P2-4a）。
-//!
-//! 旧实现的两个选择保持不变：**颜色**（中性 / 信息 / 成功 / 警告 / 受限 / 错误）与**形状**
-//! （`tonal` 状态浅底 / `solid` 实心块 / `outline` 只描边）。颜色仍然全部来自主题角色
-//! （中性 `surface` / `fg` / `line` 三组；状态色用 `Status*Base/Surface/Border`），因此浅深切换
-//! 自动跟着变 —— 但没有旧实现的「状态色只给 tonal」的隐式差异：默认形状仍是「中性 solid、
-//! 状态 tonal」（与旧 `shape.unwrap_or(match color { .. })` 一致）。
-//!
-//! # 与旧 API 的差异
-//!
-//! - 旧 `Badge` 是 UI 元素（`ParentElement` 任意子元素）；新实现只画**一段文字**（标签的语义
-//!   就是一段文字），图标 / 复合内容用 [`crate::kit::interactive::Interactive`] 自己搭；
-//! - 静态绘制改成 `bind_style`（主题切换要跟着换色）；布局占位边框仍用 `StyleBuilder::border`，
-//!   与绘制边框成对写；
-//! - 文案有两种形态（[`TextValue`]）：[`Badge::text`] 是构建期静态值（旧语义）；
-//!   [`Badge::bind_label`] 绑定 `Signal<SmolStr>`，写信号即更新文本与可访问名、**不重建节点**
-//!   （语言切换不再需要「先摘节点再重建」，P2-9）；
-//! - a11y：根声明 `Label` + 文本（绑定形态在同一个 `bind_a11y` pass 里补 label），文字叶子显式
-//!   `hidden`（避免同一句话被播报两遍）。
-
 use smol_str::SmolStr;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
@@ -35,36 +15,24 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-/// 标签颜色。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BadgeColor {
-    /// 中性（页面对比色块）。
     #[default]
     Neutral,
-    /// 信息。
     Info,
-    /// 成功。
     Success,
-    /// 警告。
     Warning,
-    /// 受限（warning 与 error 之间的一档）。
     Elevated,
-    /// 错误 / 危险。
     Error,
 }
 
-/// 标签形状（颜色怎么穿在身上）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadgeShape {
-    /// 状态浅底 + 状态色文字。
     Tonal,
-    /// 实心块（中性 = 页面反色；状态 = 饱和状态色）。
     Solid,
-    /// 只有一条描边。
     Outline,
 }
 
-/// 状态标签。
 #[derive(Clone)]
 pub struct Badge {
     theme: ThemeHandle,
@@ -75,7 +43,6 @@ pub struct Badge {
 }
 
 impl Badge {
-    /// 建标签（空文本；通常随后调 [`Badge::text`]）。
     pub fn new(theme: ThemeHandle) -> Self {
         Self {
             theme,
@@ -86,84 +53,72 @@ impl Badge {
         }
     }
 
-    /// 静态文本（构建期固定；语言切换需要由调用方重建节点）。
     #[must_use]
     pub fn text(mut self, text: impl Into<SmolStr>) -> Self {
         self.label = TextValue::Static(text.into());
         self
     }
 
-    /// 绑定文本：写信号即更新标签文本与可访问名，节点不重建（语言切换的绑定面）。
     #[must_use]
     pub fn bind_label(mut self, label: Signal<SmolStr>) -> Self {
         self.label = TextValue::Bound(label);
         self
     }
 
-    /// 中性。
     #[must_use]
     pub fn neutral(mut self) -> Self {
         self.color = BadgeColor::Neutral;
         self
     }
 
-    /// 信息色。
     #[must_use]
     pub fn info(mut self) -> Self {
         self.color = BadgeColor::Info;
         self
     }
 
-    /// 成功色。
     #[must_use]
     pub fn success(mut self) -> Self {
         self.color = BadgeColor::Success;
         self
     }
 
-    /// 警告色。
     #[must_use]
     pub fn warning(mut self) -> Self {
         self.color = BadgeColor::Warning;
         self
     }
 
-    /// 受限色（warning 之上、error 之下）。
     #[must_use]
     pub fn elevated(mut self) -> Self {
         self.color = BadgeColor::Elevated;
         self
     }
 
-    /// 错误色。
     #[must_use]
     pub fn error(mut self) -> Self {
         self.color = BadgeColor::Error;
         self
     }
 
-    /// 状态浅底。
     #[must_use]
     pub fn tonal(mut self) -> Self {
         self.shape = Some(BadgeShape::Tonal);
         self
     }
 
-    /// 实心块。
     #[must_use]
     pub fn solid(mut self) -> Self {
         self.shape = Some(BadgeShape::Solid);
         self
     }
 
-    /// 只描边。
     #[must_use]
     pub fn outline(mut self) -> Self {
         self.shape = Some(BadgeShape::Outline);
         self
     }
 
-    /// 当前形状（未显式设置时按颜色取默认：中性 solid、状态 tonal）。
     #[must_use]
     pub fn shape(&self) -> BadgeShape {
         self.shape.unwrap_or(match self.color {
@@ -176,10 +131,6 @@ impl Badge {
         })
     }
 
-    /// 建标签节点（容器 + 文本叶子）。
-    ///
-    /// # Errors
-    /// `StaleNode`（父节点陈旧）。
     pub fn build(
         &self,
         tree: &mut NodeTree,
@@ -218,7 +169,6 @@ impl Badge {
             })
             .a11y(A11yOverride {
                 role: Some(A11yRole::Label),
-                // 静态文案仍是构建期声明；绑定文案的初始值为空串，由同一个动态 pass 写入。
                 label: (!label.is_bound()).then(|| initial.clone()),
                 ..A11yOverride::default()
             });
@@ -258,7 +208,6 @@ impl UnifiedSizable for Badge {
     }
 }
 
-/// 一个标签的三块颜色（读当前外观）。
 fn badge_colors(
     cx: &mut ReadCtx<'_>,
     theme: &ThemeHandle,
@@ -301,7 +250,6 @@ fn badge_colors(
     }
 }
 
-/// 状态色的 base / surface / border 三元组。
 fn status_roles(color: BadgeColor) -> (Role, Role, Role) {
     match color {
         BadgeColor::Neutral => (Role::FgDefault, Role::SurfaceControl, Role::LineBorder),
@@ -389,7 +337,6 @@ mod tests {
         ColorResolver.resolve(color).components
     }
 
-    /// 默认形状：中性 solid、状态 tonal（与旧实现一致）。
     #[test]
     fn the_default_shape_depends_on_the_color() {
         let neutral = harness(|badge| badge.text("3"));
@@ -410,7 +357,6 @@ mod tests {
         );
     }
 
-    /// 形状覆盖：tonal / solid / outline 各取对应角色。
     #[test]
     fn explicit_shapes_pick_their_roles() {
         let outline = harness(|badge| badge.success().outline().text("OK"));
@@ -437,7 +383,6 @@ mod tests {
         );
     }
 
-    /// 默认形状表：中性 solid，其余 tonal；显式形状覆盖默认。
     #[test]
     fn shape_defaults_follow_the_color() {
         let mut app = TestApp::new();
@@ -451,7 +396,6 @@ mod tests {
         assert_eq!(BadgeColor::default(), BadgeColor::Neutral);
     }
 
-    /// 文本叶子：文字与字号来自尺寸阶梯；a11y 根是 Label 且文字叶子隐藏（不重复播报）。
     #[test]
     fn the_badge_draws_its_text_once_and_declares_a_label_role() {
         let mut app = TestApp::new();
@@ -488,7 +432,6 @@ mod tests {
         assert!(text_record.hidden, "文字叶子隐藏，避免重复播报");
     }
 
-    /// 尺寸阶梯写进布局（small 高度 20、水平内边距 4）。
     #[test]
     fn the_size_ladder_reaches_the_layout() {
         let harness = harness(|badge| badge.text("x").small());
@@ -501,10 +444,6 @@ mod tests {
         );
     }
 
-    /// **P2-9 绑定面**：`bind_label(Signal<SmolStr>)` 在语言切换时更新文本与可访问名，
-    /// 节点与文字叶子 id 都不变（不重建）。
-    ///
-    /// 变异防线：把 `bind_text` / `bind_a11y` 删掉（只留初始空串）⇒ 本用例红。
     #[test]
     fn a_bound_label_switches_language_without_rebuilding_the_badge() {
         let mut app = TestApp::new();

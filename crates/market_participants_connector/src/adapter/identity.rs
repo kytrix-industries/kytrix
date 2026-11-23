@@ -1,21 +1,3 @@
-//! Binding one execution's own identity onto the connection key it opens.
-//!
-//! A key built by [`ConnectionKey::for_route`] carries the origin, the venue route
-//! and the generations, but not the account the socket authenticates as. The
-//! account is not a detail: the reauthentication handshake reads it back off the
-//! key, so a socket whose key has no account can never complete a re-authentication
-//! and every authenticated subscription on it fails. The credential generation is
-//! bound with it, because the credentials are part of what a socket is: two
-//! generations that share an origin are two credential sets and must never be
-//! served by one connection.
-//!
-//! Both values come from the execution the request was validated against — the
-//! account from the resolved authentication, the generation from the venue's
-//! credentials — and neither is guessed. The credential identity itself is the
-//! venue, which the key already names.
-//!
-//! [`ConnectionKey::for_route`]: crate::connection::ConnectionKey::for_route
-
 use market_participants_model::identifier::MarketParticipantAccountId;
 
 use crate::{
@@ -24,7 +6,6 @@ use crate::{
     error::{AuthError, MarketParticipantError},
 };
 
-/// Binds the account and credential generation of one execution.
 pub(crate) fn bind_execution_identity(
     mut key: ConnectionKey,
     context: &ExecutionContext,
@@ -69,7 +50,6 @@ mod tests {
         routing::CredentialGeneration,
     };
 
-    /// The route whose credential one execution signs with.
     fn route() -> VenueRoute {
         VenueRoute::new(
             VenueId::Binance,
@@ -109,8 +89,6 @@ mod tests {
         )
     }
 
-    /// The account, the route and the generation of one execution reach the key,
-    /// which is what a reauthentication reads them back from.
     #[test]
     fn the_execution_identity_is_bound_onto_the_key() {
         let bound = bind_execution_identity(key(), &context("account"))
@@ -127,8 +105,6 @@ mod tests {
         );
     }
 
-    /// Two accounts of one route are two connections: a socket opened for one is
-    /// never reused for the other.
     #[test]
     fn two_accounts_of_one_route_are_different_connections() {
         let first = bind_execution_identity(key(), &context("account"))

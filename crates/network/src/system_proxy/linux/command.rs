@@ -1,5 +1,3 @@
-//! Bounded execution of desktop discovery commands.
-
 use std::{
     io::Read,
     process::{Command, Output, Stdio},

@@ -38,7 +38,6 @@ fn thirteen_sides_keep_twelve_lines_in_venue_order_and_report_the_rest() {
         });
         markets.push(market);
     }
-    // Every side is a leg of the drawn market, so each line has its venue label.
     let mut drawn = markets[0].clone();
     drawn.legs = markets
         .iter()
@@ -189,7 +188,6 @@ fn an_empty_snapshot_has_no_latest_timestamp() {
 fn the_lines_keep_the_order_the_venue_published_them_in() {
     let event = event_ref();
     let (market, legs) = charted_market(&event, "charted");
-    // The first side is the weakest, so a value sort would move it last.
     let series = vec![
         PredictionSeries {
             leg: legs[0].clone(),
@@ -474,7 +472,6 @@ fn a_market_without_a_default_falls_back_to_the_first_charted_leg() {
     let (mut market, legs) = charted_market(&event, "charted");
     market.default_leg = None;
     let view = event_with(vec![market.clone()]);
-    // The chart drew the second side first, so that is the side to read.
     let series = vec![
         PredictionSeries {
             leg: legs[1].clone(),
@@ -500,8 +497,6 @@ fn a_default_leg_the_market_no_longer_publishes_falls_back_to_a_drawn_one() {
     let event = event_ref();
     let (mut market, legs) = charted_market(&event, "charted");
     let (other, other_legs) = charted_market(&event, "other");
-    // The venue named a side of a different market, which this one has no
-    // side for.
     market.default_leg = Some(other_legs[0].clone());
     let view = event_with(vec![market.clone(), other]);
     let series = vec![PredictionSeries {

@@ -1,9 +1,3 @@
-//! Tests for the X pane: the state it reports, the rows it draws and the pictures it
-//! registers.
-//!
-//! (The migrated suite is written in place of the old element-tree tests; the
-//! per-test ledger lives in `.docs/gui-migration/test-ledger/w9-x.md`.)
-
 use std::{path::PathBuf, rc::Rc, time::Instant};
 
 use app_config::{
@@ -39,14 +33,10 @@ use crate::{
     },
 };
 
-/// The account every fixture of this test module is *not* read as.
 const OTHER_ACCOUNT: &str = "someone-else";
 
-/// How many runtime / frame turns a settle loop may take before it calls the test a
-/// failure.
 const SETTLE_TURNS: usize = 64;
 
-/// The translator the product ships, in `language`.
 fn translate(language: LanguageCode) -> Translate {
     Translate::new(
         Rc::new(i18n::embedded::load().expect("the embedded locales load")),
@@ -54,7 +44,6 @@ fn translate(language: LanguageCode) -> Translate {
     )
 }
 
-/// The framework's headless host, over the product catalogue.
 fn harness() -> WidgetTestApp {
     WidgetTestApp::with_translate(translate(LanguageCode::En))
 }
@@ -69,7 +58,6 @@ fn write_config(harness: &mut WidgetTestApp, config: Config) -> bool {
     harness.app_mut().write(&signal, config)
 }
 
-/// Signs `user_id` in the way the composition root does: a settings write.
 fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
     let mut config = current_config(harness);
     config.account = Some(AccountConfig {
@@ -80,7 +68,6 @@ fn sign_in(harness: &mut WidgetTestApp, user_id: &str) {
     write_config(harness, config);
 }
 
-/// Signs the pane out the way the composition root does: a settings write.
 fn sign_out(harness: &mut WidgetTestApp) {
     let mut config = current_config(harness);
     config.account = None;
@@ -98,7 +85,6 @@ fn with_cx_of<R>(
     body(&mut cx)
 }
 
-/// A pane the framework would have built, over a source the test answers.
 struct Pane {
     widget: XWidget,
     status: WidgetStatus,
@@ -108,14 +94,11 @@ struct Pane {
     _cache_root: tempfile::TempDir,
 }
 
-/// A pane over `source` in the scope of the caller's choosing.
 fn pane_in_scope(harness: &mut WidgetTestApp, source: FakeSource, scope: SignalScope) -> Pane {
     let (cache, cache_root) = media_cache();
     let downloader = MediaDownloader::with_cache(FakeTransport::failing(), cache.clone());
     let services = Rc::clone(harness.services_rc());
     let window = harness.window();
-    // The body has to be built under a parent with a size: the framework's slot is the
-    // whole pane, and a row that is laid out against nothing draws nothing.
     let root = harness.root();
     let parent = harness.with_cx(|cx| {
         NodeBuilder::boxed()
@@ -151,19 +134,15 @@ fn pane_with(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
     pane_in_scope(harness, source, scope)
 }
 
-/// A pane reading an account with the service it was given, as `load` would start it.
 fn pane(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
     sign_in(harness, ACCOUNT);
     pane_with(harness, source)
 }
 
-/// A pane nobody is signed in for.
 fn signed_out_pane(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
     pane_with(harness, source)
 }
 
-/// A pane no message of which arrives from the binding: the tests below report
-/// statuses and feeds by hand, and a live service would report its own.
 fn quiet_pane(harness: &mut WidgetTestApp, source: FakeSource) -> Pane {
     let mut pane = pane(harness, source);
     cancel_binding(&mut pane);
@@ -176,10 +155,6 @@ fn cancel_binding(pane: &mut Pane) {
     }
 }
 
-/// A pane reading an account whose stream is live, with what history published for it.
-///
-/// The subscription's control is returned with the pane: what keeps a fake subscription
-/// fed is the sender the control holds, so it has to outlive the call.
 fn live_pane(
     harness: &mut WidgetTestApp,
     source: &FakeSource,
@@ -197,7 +172,6 @@ fn live_pane(
     (pane, subscription)
 }
 
-/// A quiet pane whose stream is live and whose monitored accounts are known.
 fn ready_pane(harness: &mut WidgetTestApp) -> Pane {
     let mut pane = quiet_pane(harness, FakeSource::default());
     pane.widget.ready = true;
@@ -213,7 +187,6 @@ fn sync(harness: &mut WidgetTestApp, pane: &mut Pane) {
     with_cx_of(harness, pane.scope, |cx| pane.widget.sync(cx)).expect("the widget syncs");
 }
 
-/// Builds the body the framework would build once the pane has content.
 fn build_body(harness: &mut WidgetTestApp, pane: &mut Pane) {
     let parent = pane.parent;
     with_cx_of(harness, pane.scope, |cx| pane.widget.body(parent, cx)).expect("the body builds");
@@ -225,8 +198,6 @@ fn frame(harness: &mut WidgetTestApp, pane: &mut Pane) {
     harness.drain();
 }
 
-/// Lets the host's runtime deliver what the fake source published, and the pane the
-/// frames it asked for, until `ready` holds.
 fn settle(
     harness: &mut WidgetTestApp,
     pane: &mut Pane,
@@ -244,7 +215,6 @@ fn settle(
     panic!("{what} should happen");
 }
 
-/// Reports a feed as the stream would, with the binding taken out of the way.
 fn report_update(
     harness: &mut WidgetTestApp,
     pane: &mut Pane,
@@ -273,7 +243,6 @@ fn report_feed(
     report_update(harness, pane, revision, feed, MediaStates::default())
 }
 
-/// Reports a status as the stream would.
 fn report_status(harness: &mut WidgetTestApp, pane: &mut Pane, status: TweetStatus) -> bool {
     let scope = pane
         .widget
@@ -361,7 +330,6 @@ fn mounted_rows(harness: &WidgetTestApp, pane: &Pane) -> Vec<NodeId> {
     })
 }
 
-/// Whether the subtree under `root` holds an image node.
 fn has_image_node(harness: &WidgetTestApp, root: NodeId) -> bool {
     let tree = harness.tree();
     let mut stack = vec![root];
@@ -375,8 +343,6 @@ fn has_image_node(harness: &WidgetTestApp, root: NodeId) -> bool {
     false
 }
 
-/// The widest image node under `root`, which is the picture itself rather than one of the
-/// small placeholder marks a tile draws when it has none.
 fn largest_image_node(harness: &WidgetTestApp, root: NodeId) -> Option<NodeId> {
     let tree = harness.tree();
     let mut stack = vec![root];
@@ -394,7 +360,6 @@ fn largest_image_node(harness: &WidgetTestApp, root: NodeId) -> Option<NodeId> {
     best.map(|(node, _)| node)
 }
 
-/// Dispatches the click a kit control's action identity names.
 fn click_button(harness: &mut WidgetTestApp, button: &Button) {
     let node = button.node().expect("the control is built");
     let action = button
@@ -409,7 +374,6 @@ fn click_button(harness: &mut WidgetTestApp, button: &Button) {
     );
 }
 
-/// Builds the header control the pane would build into the window's header row.
 fn build_header(harness: &mut WidgetTestApp, pane: &mut Pane) {
     let root = harness.root();
     with_cx_of(harness, pane.scope, |cx| {
@@ -418,7 +382,6 @@ fn build_header(harness: &mut WidgetTestApp, pane: &mut Pane) {
     .expect("the header control builds");
 }
 
-/// Sends a primary-button pointer-up at `position` through the pane's own dispatch.
 fn click_at(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
     let event = Event::Input(InputEvent::PointerUp {
         position,
@@ -429,7 +392,6 @@ fn click_at(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bo
     with_cx_of(harness, pane.scope, |cx| pane.widget.dispatch(&event, cx))
 }
 
-/// Clicks the centre of `node`, as a reader would.
 fn click_node(harness: &mut WidgetTestApp, pane: &mut Pane, node: NodeId) -> bool {
     let bounds = harness
         .tree()
@@ -444,12 +406,10 @@ fn click_node(harness: &mut WidgetTestApp, pane: &mut Pane, node: NodeId) -> boo
     click_at(harness, pane, centre)
 }
 
-/// A picture's URL on X's media host.
 fn picture_url(name: &str) -> Url {
     Url::parse(&format!("https://pbs.twimg.com/media/{name}.jpg")).expect("a picture URL")
 }
 
-/// Puts one finished picture on disk, so a row can draw it without fetching it.
 fn land_picture(cache: &MediaCache, url: &Url) -> PathBuf {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -473,8 +433,6 @@ fn selection_data(entries: Vec<XSelection>, limit: usize) -> SelectionData {
     })
 }
 
-/// One account X was asked about, still waiting for its profile: the state a row is
-/// named by what the pane remembers about it.
 fn selection_without_profile(x_user_id: &str) -> XSelection {
     XSelection {
         x_user_id: x_user_id.into(),
@@ -520,11 +478,6 @@ fn media_tweet(tweet_id: &str, timestamp: i64, url: &Url) -> XTweetEvent {
     event
 }
 
-/// A feed a test grows the way a subscription does.
-///
-/// The same state is kept between snapshots, so a later snapshot shares the tweets it
-/// inherited from the one before it — which is what makes a report an edit to the list
-/// rather than a new set of rows.
 struct Feed {
     state: TweetState,
 }
@@ -550,7 +503,6 @@ impl Feed {
     }
 }
 
-/// The timestamp a fixture five minutes old is stamped with.
 fn five_minutes_ago() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp() * 1_000 - 5 * 60 * 1_000
 }
@@ -577,9 +529,6 @@ fn the_empty_config_should_round_trip_through_its_envelope() {
     assert_eq!(decode_or_default::<XConfig>(None), XConfig);
 }
 
-/// What a pane follows is the account's own list of monitored accounts, so the pane has
-/// nothing of its own to persist: a config it returned would make every save write an
-/// empty envelope into the layout (AGENTS §4.3).
 #[test]
 fn a_pane_should_persist_no_config() {
     let mut harness = harness();
@@ -591,11 +540,6 @@ fn a_pane_should_persist_no_config() {
     );
 }
 
-/// The i18n keys one source file names, as the catalogue literals it reads.
-///
-/// Scanning the sources rather than keeping a hand-written list is what keeps the guard
-/// from going stale: the dialog's keys fell out of the list once already, and a missing
-/// key is an empty string on screen rather than an error.
 fn keys_in(source: &'static str) -> Vec<&'static str> {
     let bytes = source.as_bytes();
     let mut keys = Vec::new();
@@ -623,12 +567,6 @@ fn keys_in(source: &'static str) -> Vec<&'static str> {
     keys
 }
 
-/// A missing key is an empty string on screen rather than an error, so a gap in the
-/// interface is what a typo looks like: this is the test that turns it into a failure.
-///
-/// Every key the crate's sources name must resolve to non-empty copy in **both** locales
-/// the pane ships, so a key added to one catalogue and not the other (or renamed in the
-/// source and not in the catalogues) fails here rather than showing a blank.
 #[test]
 fn every_message_this_pane_shows_should_resolve_to_text() {
     let mut keys: Vec<&'static str> = Vec::new();
@@ -647,8 +585,6 @@ fn every_message_this_pane_shows_should_resolve_to_text() {
     }
     keys.sort_unstable();
 
-    // The floor is the scan's own failure mode: a parser that stops finding keys would
-    // otherwise make this test pass without checking anything.
     assert!(
         keys.len() >= 40,
         "the guard must cover the pane's whole vocabulary: {keys:?}"
@@ -791,8 +727,6 @@ fn a_pane_should_be_content_only_once_a_timeline_arrives() {
     assert_eq!(state_of(&harness, &pane), WidgetState::Ready);
 }
 
-/// An empty snapshot is content (AGENTS §6): the pane has a feed, it just has nothing
-/// in it yet, and the body says so rather than calling the pane waiting.
 #[test]
 fn an_empty_timeline_should_be_content() {
     let mut harness = harness();
@@ -894,8 +828,6 @@ fn a_status_after_a_failure_should_be_refused() {
     );
 }
 
-/// The latest channel coalesces, so a report can arrive more than once: a report that
-/// says nothing new writes nothing and asks for no frame (I3).
 #[test]
 fn a_duplicate_timeline_should_not_notify() {
     let mut harness = harness();
@@ -1021,9 +953,6 @@ fn signing_out_should_take_the_feed_with_it() {
     );
 }
 
-/// A waiting pane follows the language without being reloaded: the notice is a
-/// reference into the catalogue, resolved on the frame that draws it, so the language
-/// moving writes no state at all.
 #[test]
 fn a_language_change_should_relabel_the_sentence_of_a_signed_out_pane() {
     let mut harness = harness();
@@ -1431,14 +1360,11 @@ fn the_header_control_should_follow_the_language() {
     assert!(harness.app().has_action_handler(&rebuilt_action));
 }
 
-/// A tweet's age is read in the zone the settings display data in: the day it was
-/// published is the day the reader saw on their own clock.
 #[test]
 fn moving_the_display_zone_should_move_the_date_boundary() {
     let mut harness = harness();
     let mut pane = quiet_pane(&mut harness, FakeSource::default());
     report_status(&mut harness, &mut pane, TweetStatus::Ready);
-    // 2020-01-01T20:30:00Z: the evening of the first in UTC, already the second at +8.
     let published = 1_577_910_600_000;
     let mut feed = Feed::new();
     feed.profile(profile_event("42", "kytrix"));
@@ -1528,8 +1454,6 @@ fn a_row_with_a_picture_should_draw_a_tile() {
     );
 }
 
-/// A picture the stream says is on disk is read once and handed to the engine's
-/// resource cache; the row then draws it as an image node.
 #[test]
 fn a_picture_that_landed_should_be_drawn_as_an_image() {
     let mut harness = harness();
@@ -1540,8 +1464,6 @@ fn a_picture_that_landed_should_be_drawn_as_an_image() {
     let mut feed = Feed::new();
     feed.profile(profile_event("42", "kytrix"));
     let snapshot = feed.push(media_tweet("1", 1_700_000_000_000, &url));
-    // The timeline arrives first with the picture still out; once the pane has drawn it,
-    // the picture arriving is the only thing that changes.
     report_update(
         &mut harness,
         &mut pane,
@@ -1657,8 +1579,6 @@ fn a_frame_should_offer_a_failed_picture_again() {
         .expect("the window root")
         .layout()
         .bounds;
-    // The newest row sits against the bottom of the list, so part of its gallery is off
-    // the top of the window: the click has to land on the part a reader could see.
     let point = Point::new(
         bounds.origin.x + 2.0,
         bounds.origin.y.max(window.origin.y) + 2.0,
@@ -1683,8 +1603,6 @@ fn a_frame_should_offer_a_failed_picture_again() {
     );
 }
 
-/// The failed picture's tile is reachable without a pointer: it is in the a11y tree
-/// (not hidden) and it is focusable, and activating it asks for the picture again.
 #[test]
 fn a_failed_picture_should_be_offered_again_from_the_keyboard() {
     let mut harness = harness();
@@ -1704,8 +1622,6 @@ fn a_failed_picture_should_be_offered_again_from_the_keyboard() {
     );
     build_body(&mut harness, &mut pane);
     sync(&mut harness, &mut pane);
-    // The a11y snapshot is delivered by the frame that draws the rows: the frame after it
-    // is idle and carries none, so the read is of the drawing frame.
     harness.drain();
 
     let tile = harness
@@ -1744,8 +1660,6 @@ fn a_failed_picture_should_be_offered_again_from_the_keyboard() {
     );
 }
 
-/// One tweet whose whole body is one link, so a pointer anywhere over the text is over
-/// the link.
 fn linked_tweet(tweet_id: &str, timestamp: i64, text: &str, url: &str) -> XTweetEvent {
     let mut event = tweet_event(tweet_id, timestamp, "42", text);
     event.text_segments = vec![XTweetTextSegment {
@@ -1755,7 +1669,6 @@ fn linked_tweet(tweet_id: &str, timestamp: i64, text: &str, url: &str) -> XTweet
     event
 }
 
-/// A click on a row opens the tweet it draws.
 #[test]
 fn a_click_on_a_row_should_open_its_tweet() {
     let opened = Rc::new(RefCell::new(Vec::new()));
@@ -1789,9 +1702,6 @@ fn a_click_on_a_row_should_open_its_tweet() {
     assert_eq!(opened.borrow().as_slice(), [tweet_url("kytrix", "1")]);
 }
 
-/// A link inside a tweet is drawn in the theme's link colour, and the colour follows the
-/// appearance: a run's colour is a static load, so the rows are built for an appearance
-/// and rebuilt when it moves (AGENTS §7).
 #[test]
 fn a_link_should_be_drawn_in_the_brand_colour() {
     let mut harness = harness();
@@ -1838,7 +1748,6 @@ fn a_link_should_be_drawn_in_the_brand_colour() {
     );
 }
 
-/// The runs a text node draws, which is where a link's colour lives.
 fn run_colours(harness: &WidgetTestApp, node: NodeId) -> Vec<ui_core::paint::color::Color> {
     match harness.tree().get(node).expect("the text node").kind() {
         NodeKind::Text(content) => content.runs().iter().map(|run| run.style.color).collect(),
@@ -1846,8 +1755,6 @@ fn run_colours(harness: &WidgetTestApp, node: NodeId) -> Vec<ui_core::paint::col
     }
 }
 
-/// A click over a link opens the link, not the tweet the link is in: the byte the pointer
-/// is over names which link was clicked, which is the same range the run is coloured for.
 #[test]
 fn a_click_on_a_link_should_open_the_link_not_the_tweet() {
     let opened = Rc::new(RefCell::new(Vec::new()));
@@ -1873,8 +1780,6 @@ fn a_click_on_a_link_should_open_the_link_not_the_tweet() {
     let text = harness
         .find_by_debug_prefix(body_root(&pane), "TEST_TWEET_TEXT:1")
         .expect("the tweet's text node is drawn");
-    // The text node fills the column, so its centre is past the glyphs: a click over the
-    // link has to land on the glyphs the link is drawn as, near the start of the line.
     let bounds = harness
         .tree()
         .get(text)
@@ -1924,8 +1829,6 @@ fn the_manage_control_should_ask_the_pane_to_open_the_dialog() {
     );
 }
 
-/// Opening the dialog is the pane asking for the accounts and for their avatars: the
-/// read waits for the stream, because a read goes over a live one.
 #[test]
 fn opening_the_dialog_should_watch_and_read_the_accounts() {
     let mut harness = harness();
@@ -2101,9 +2004,6 @@ fn a_search_that_is_not_one_should_not_be_sent() {
     assert_eq!(pane.widget.searching.as_deref(), Some("nine"));
 }
 
-/// A search is not a change to the accounts, but while one is out the pane is not in a
-/// position to ask about them: a change waits until the search is answered or the dialog
-/// that asked for it goes.
 #[test]
 fn a_search_that_is_out_should_turn_a_change_away() {
     let mut harness = harness();
@@ -2126,8 +2026,6 @@ fn a_search_that_is_out_should_turn_a_change_away() {
         "the accounts to arrive",
         |_, pane| pane.widget.selections.is_some(),
     );
-    // Nothing answers the search: what the search being out is asserted against is the
-    // change the pane turns away for as long as it is out.
     session.block_search();
     assert!(with_cx_of(&mut harness, pane.scope, |cx| pane
         .widget
@@ -2179,9 +2077,6 @@ fn a_change_should_be_refused_while_the_stream_is_not_live() {
     assert!(pane.widget.pending.is_empty());
 }
 
-/// A change the pane stopped waiting for — because the user recovered the stream — is
-/// dropped rather than decided: a change that is in flight when the stream is restarted
-/// is let go, and the read that follows settles the list.
 #[test]
 fn a_change_a_started_stream_displaced_should_be_forgotten() {
     let mut harness = harness();
@@ -2195,8 +2090,6 @@ fn a_change_a_started_stream_displaced_should_be_forgotten() {
         vec![tweet_event("1", 1_700_000_000_000, "42", "tweet 1")],
         vec![profile_event("42", "kytrix")],
     );
-    // The accounts are read first, because a change goes over the session the read came
-    // from.
     assert!(with_cx_of(&mut harness, pane.scope, |cx| pane
         .widget
         .load_selections(cx)));
@@ -2250,9 +2143,6 @@ fn a_change_a_started_stream_displaced_should_be_forgotten() {
     );
 }
 
-/// The answer to a command the binding replaced is a late one: its identity is not in
-/// the table, so it is dropped and counted rather than applied to the command that
-/// replaced it (AGENTS §8.2). The answer to the command that is in flight is applied.
 #[test]
 fn the_answer_to_a_replaced_command_should_be_dropped() {
     let mut harness = harness();
@@ -2280,7 +2170,6 @@ fn the_answer_to_a_replaced_command_should_be_dropped() {
         "the late answer is dropped and counted"
     );
 
-    // The command the binding is carrying now is answered by its own identity.
     load(&mut harness, &mut pane);
     with_cx_of(&mut harness, pane.scope, |cx| {
         pane.widget.apply_rpc(
@@ -2306,10 +2195,6 @@ fn the_answer_to_a_replaced_command_should_be_dropped() {
     );
 }
 
-/// A failure is terminal: a reply that was already out when the pane gave up does not
-/// steer it, and it is not even taken off the table as if it answered something
-/// (AGENTS §4.4 — the identity attribution and the failure gate are two doors, and every
-/// entry checks both).
 #[test]
 fn a_reply_after_a_failure_should_not_be_applied() {
     let mut harness = harness();
@@ -2322,8 +2207,6 @@ fn a_reply_after_a_failure_should_not_be_applied() {
     );
     assert!(state_of(&harness, &pane).is_failed());
 
-    // A read of the monitored accounts was in flight when the stream failed; its answer
-    // arrives after the pane gave up.
     pane.widget
         .pending
         .track(RequestId::new(2), PendingCommand::FetchSelections);
@@ -2348,8 +2231,6 @@ fn a_reply_after_a_failure_should_not_be_applied() {
     );
 }
 
-/// A search is a procedure of the page that ran it, so an answer that arrives after the
-/// dialog is gone has nothing to be handed to.
 #[test]
 fn a_search_answer_for_a_dialog_that_is_gone_should_be_dropped() {
     let mut harness = harness();
@@ -2376,9 +2257,6 @@ fn a_search_answer_for_a_dialog_that_is_gone_should_be_dropped() {
     assert!(pane.widget.pending.is_empty());
 }
 
-/// The calls the pane makes for the dialog are ones it is not waiting for an answer to:
-/// what they displace is closed out rather than left waiting for an answer that can no
-/// longer arrive.
 #[test]
 fn a_call_the_pane_does_not_wait_for_should_close_out_what_it_displaced() {
     let mut harness = harness();
@@ -2540,8 +2418,6 @@ fn a_confirmed_delete_should_leave_the_list() {
     );
 }
 
-/// A read the account refuses is a problem the pane holds for the dialog rather than a
-/// list it reads as empty, and what the pane had read stays as it was.
 #[test]
 fn a_change_that_could_not_be_read_should_be_a_problem() {
     let mut harness = harness();
@@ -2574,9 +2450,6 @@ fn a_change_that_could_not_be_read_should_be_a_problem() {
     assert!(pane.widget.selections.is_none());
 }
 
-/// What is remembered about a row waiting to be activated is a memo beside the rows: a
-/// read of the accounts keeps it for the rows the read still holds, and an account
-/// change is a pane starting over with a set of rows that are not the ones it named.
 #[test]
 fn a_remembered_name_should_survive_a_read_and_not_an_account_change() {
     let mut harness = harness();
@@ -2654,8 +2527,6 @@ fn a_remembered_name_should_survive_a_read_and_not_an_account_change() {
     );
 }
 
-/// Two panes of one application build the same control with different keys: releasing
-/// one pane's control leaves the other's handler registered (AGENTS §9).
 #[test]
 fn two_panes_should_keep_their_own_header_handlers() {
     let mut harness = harness();
@@ -2745,9 +2616,6 @@ fn two_panes_should_not_share_their_feed_state() {
     assert_eq!(feed_ids(&first), ["1"]);
 }
 
-/// The framework drops a pane by releasing the scope it was mounted in; everything the
-/// pane built has to be gone by then, or the scope's values leak and the next mount
-/// mints fresh slots (AGENTS §11).
 #[test]
 fn releasing_the_pane_should_reclaim_what_it_built() {
     let mut harness = harness();
@@ -2787,7 +2655,6 @@ fn releasing_the_pane_should_reclaim_what_it_built() {
             "the header control is released"
         );
         drop(pane);
-        // The framework releases the pane's scope after dropping it.
         harness.app_mut().release_scope(scope);
 
         assert_eq!(
@@ -2834,7 +2701,6 @@ fn releasing_the_pane_should_be_idempotent() {
     );
 }
 
-/// A pane with nothing changing does not ask for a frame (I3).
 #[test]
 fn a_steady_pane_should_not_ask_for_a_frame() {
     let mut harness = harness();
@@ -2865,9 +2731,6 @@ fn a_steady_pane_should_not_ask_for_a_frame() {
     );
 }
 
-/// A picture state arriving is a change the rows are built against, so the visible
-/// window is rebuilt for it; a report whose picture states are equal does not rebuild
-/// anything — even though the service hands every event its own map.
 #[test]
 fn a_media_only_update_should_rebuild_the_visible_window() {
     let mut harness = harness();
@@ -2900,9 +2763,6 @@ fn a_media_only_update_should_rebuild_the_visible_window() {
     );
     assert_eq!(row_count(&harness, &pane), 1);
 
-    // The service publishes a fresh map with every event (a new `Arc` even when nothing
-    // about the pictures changed): the rebuild is decided by what the states are, not by
-    // which allocation they came in.
     report_update(
         &mut harness,
         &mut pane,

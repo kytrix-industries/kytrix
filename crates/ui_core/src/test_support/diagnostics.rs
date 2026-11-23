@@ -1,14 +1,3 @@
-//! 诊断导出：`FrameDump` / `DependencyGraphDump` /
-//! `A11yTreeDump` / `DamageOverlay`。
-//!
-//! 四条纪律：
-//!
-//! 1. 只挂**既有** `test-support` feature（`lib.rs` 的 `pub mod test_support` 门控），发布物零符号；
-//! 2. DTO 只含标量 / `enum` / `PhysicalRect` / `NodeId` / `WindowId` / `SmolStr`，
-//!    **不出现任何平台句柄**（本模块不 `use` 平台模块）；
-//! 3. 文本格式稳定、逐行、可 diff（`Display`），顺序全部显式排序（HashMap 迭代序不可复现）；
-//! 4. 不是 replay 引擎：`FrameDump` 只用于 bug 报告与 diff（F-145）。
-
 use std::fmt;
 
 use smol_str::SmolStr;
@@ -28,75 +17,43 @@ use crate::{
     window::WindowId,
 };
 
-/// 一帧的**可 diff 结构化记录**（不是 replay 引擎：v1 没有 `--replay` 工具，见 F-145）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameDump {
-    /// 提交序号。
     pub frame_index: u32,
-    /// 视口（物理像素）。
     pub viewport: PhysicalRect,
-    /// 设备比例。
     pub scale: f32,
-    /// 本帧 damage（物理像素）。
     pub damage: Vec<PhysicalRect>,
-    /// 实例表（按编码序）。
     pub instances: Vec<InstanceDump>,
-    /// 绘制序。
     pub ops: Vec<OpDump>,
-    /// 裁剪表（表项 0 是哨兵）。
     pub clips: Vec<ClipDump>,
 }
 
-/// 一个 `GpuPrimitive` 的明文镜像（字段与 128 B 契约一一对应）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InstanceDump {
-    /// `params1.z`（`1` = Glyph、`2` = Image、其余 = SDF quad/shadow）。
     pub kind: u32,
-    /// `params1.y`：图集 texture array 的层号（图集页索引；字形恒 `0`、图片 `0..4`）。
     pub atlas_page: u32,
-    /// `bounds`（物理像素 `x, y, w, h`）。
     pub bounds: [f32; 4],
-    /// 四角半径（物理像素）。
     pub corner_radius: [f32; 4],
-    /// 预乘线性色（实色 / 描边 / 阴影 / 字形 / 图片调制）。
     pub color0: [f32; 4],
-    /// 渐变终点 / 描边色 / 阴影参数载体。
     pub color1: [f32; 4],
-    /// `.x` = 边框宽、`.y` = 阴影 blur、`.z` = 渐变类型、`.w` = AA 外扩。
     pub params0: [f32; 4],
-    /// `.x` = clip 链索引。
     pub clip_index: u32,
-    /// 图集 UV（非图集为 0）。
     pub uv: [f32; 4],
-    /// clip 交集 AABB（物理像素）。
     pub clip_rect: [f32; 4],
 }
 
-/// `FrameOp` 的镜像。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpDump {
-    /// `Some((start, len))` = `FrameOp::Instances`。
     pub instances: Option<(u32, u32)>,
-    /// `Some(index)` = `FrameOp::Geometry`。
     pub geometry: Option<u32>,
-    /// 该 op 的 clip 链索引（0 = 无裁剪）。
     pub clip_index: u32,
 }
 
-/// 一条 clip 链的镜像（`GpuClipEntry` 的明文形态）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipDump {
-    /// `(x, y, w, h)`，物理像素。矩形项恒为整数（编码期 `roundOut` 吸附）。
     pub rect: [f32; 4],
-    /// `(tl, tr, br, bl)`，物理像素。
     pub corner_radius: [f32; 4],
-    /// `meta.y`：`1` = 矩形项（像素精确 scissor）、`2` = 圆角项（解析 AA）。
-    ///
-    /// 暴露成明文是 AR2b P2-N1 的要求：`meta.y` 是 shader 分流两种覆盖率语义的**唯一**依据，
-    /// 但它是 GPU 契约里最容易「写反了也没有像素级断言」的一项，测试必须能直接读到它
-    /// （`ClipKind` 的映射由 `paint/instance.rs` 的 headless 断言钉住）。
     pub kind: u32,
-    /// 父链索引（`None` = 无父）。
     pub parent: Option<u32>,
 }
 
@@ -164,7 +121,6 @@ impl fmt::Display for FrameDump {
     }
 }
 
-/// 从 `TestApp` 最近一帧捕获（**未 `drain` 时**帧号 0、damage 为空、实例为空，不 panic）。
 #[must_use]
 pub fn frame_dump(app: &TestApp) -> FrameDump {
     let window = app
@@ -174,13 +130,11 @@ pub fn frame_dump(app: &TestApp) -> FrameDump {
     let Some(buffer) = window.instance_buffer() else {
         panic!("frame_dump requires an inline (headless) window");
     };
-    // 实例环有空洞（增量编码的段搬移会留下），诊断只导出**存活**实例（按实例环下标升序）。
     let instances: Vec<InstanceDump> = buffer
         .live_instances()
         .flatten()
         .map(instance_dump)
         .collect();
-    // 不能用 `TestApp::frame_record()`：它在从未 `drain()` 时会 panic（`record` 是 `Option`）。
     let record = window.record();
     FrameDump {
         frame_index: record.map_or(0, |record| record.frame_index.get()),
@@ -237,7 +191,6 @@ fn clip_dump(chain: &crate::paint::instance::ClipChain) -> ClipDump {
     }
 }
 
-/// `f32` 里的整数索引（`params1`）→ `u32`；非有限/负值归 0（诊断不 panic）。
 fn quantize(value: f32) -> u32 {
     if value.is_finite() && value > 0.0 {
         value as u32
@@ -246,60 +199,37 @@ fn quantize(value: f32) -> u32 {
     }
 }
 
-/// 值槽位表（信号 + 瞬态值）的分配统计。
-///
-/// 槽位在作用域释放时归还空闲栈并被下次分配复用，因此「反复开关一个面板后 `slots` / `live`
-/// 不增长」是可断言的（泄漏面：用根作用域铸造的信号永不回收）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SignalSlotStats {
-    /// 分配过的槽位总数（存活 + 空闲）。
     pub slots: usize,
-    /// 存活槽位数。
     pub live: usize,
-    /// 空闲（已回收、可复用）槽位数。
     pub free: usize,
 }
 
-/// 值槽位统计的公开捕获入口（自由函数：`impl App` 只能在 `app.rs`）。
 #[must_use]
 pub fn signal_slot_stats(app: &App) -> SignalSlotStats {
     let (slots, live, free) = app.signal_slot_counts_for_test();
     SignalSlotStats { slots, live, free }
 }
 
-/// 依赖图（`SignalId → Owner`）的明文快照。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DependencyGraphDump {
-    /// 按 `SignalId::index()` 升序。
     pub signals: Vec<SignalDump>,
-    /// 依赖边总数（= 所有 `owners` 之和）。
     pub edges: u32,
 }
 
-/// 一个信号及其读者。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignalDump {
-    /// 信号 id。
     pub signal: SignalId,
-    /// 读者（排序后）。
     pub owners: Vec<DependencyOwnerDump>,
 }
 
-/// `Owner` 的公开镜像（`Owner` 本身是 crate 私有）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DependencyOwnerDump {
-    /// 一个节点的 `bind_*` 闭包。
-    Node {
-        /// 所属窗口。
-        window: WindowId,
-        /// 节点。
-        node: NodeId,
-    },
-    /// 另一个派生值。
+    Node { window: WindowId, node: NodeId },
     Derived(crate::node::signal::DerivedId),
 }
 
-/// 依赖图的公开捕获入口（自由函数：`impl App` 只能在 `app.rs`）。
 #[must_use]
 pub fn dependency_dump(app: &App) -> DependencyGraphDump {
     let dependents = app.dependency_graph().dependents();
@@ -367,43 +297,27 @@ impl fmt::Display for DependencyGraphDump {
     }
 }
 
-/// 一笔 a11y 交付的明文快照（`full == false` 时只含变更节点 + 祖先链）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct A11yTreeDump {
-    /// 本次是否发出全树。
     pub full: bool,
-    /// 焦点身份。
     pub focus: A11yNodeId,
-    /// 本次交付触发的诊断条数。
     pub diagnostics: usize,
-    /// 节点（`A11yTreeSnapshot::nodes` 的原序）。
     pub nodes: Vec<A11yNodeDump>,
 }
 
-/// 一个 a11y 节点的明文镜像（只保留诊断真正需要的字段）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct A11yNodeDump {
-    /// 引擎节点（诊断与节点树的唯一桥梁）。
     pub engine: NodeId,
-    /// 角色。
     pub role: A11yRole,
-    /// 可访问名。
     pub label: Option<SmolStr>,
-    /// 值。
     pub value: Option<SmolStr>,
-    /// 物理像素边界。
     pub bounds: PhysicalRect,
-    /// 隐藏。
     pub hidden: bool,
-    /// 禁用。
     pub disabled: bool,
-    /// 支持的动作。
     pub actions: Vec<A11yAction>,
-    /// 直接子节点。
     pub children: Vec<A11yNodeId>,
 }
 
-/// 从一笔 a11y 交付捕获（纯转换，不触达平台 adapter）。
 #[must_use]
 pub fn a11y_dump(snapshot: &A11yTreeSnapshot) -> A11yTreeDump {
     A11yTreeDump {
@@ -459,16 +373,12 @@ impl fmt::Display for A11yTreeDump {
     }
 }
 
-/// 把 damage 矩形画成可叠加的 `Canvas`（洋红 1px 描边 + 12.5% 填充），走**正常管线**：
-/// 没有平台 overlay 窗口，因此能截进快照、能在三平台一致。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DamageOverlay {
-    /// 本帧的 damage（物理像素）。
     pub rects: Vec<PhysicalRect>,
 }
 
 impl DamageOverlay {
-    /// 从一帧记录取 damage。
     #[must_use]
     pub fn of(frame: &FrameRecord) -> Self {
         Self {
@@ -476,11 +386,9 @@ impl DamageOverlay {
         }
     }
 
-    /// 生成叠在视口之上的 `Canvas`（1 物理像素描边，按 `scale` 反算逻辑坐标）。
     #[must_use]
     pub fn canvas(&self, scale: Scale) -> Canvas {
         let outline = scale.to_logical(1.0);
-        // canvas 的 bounds 必须 ⊇ 所有图元（含描边的 1 px 外扩）：先求并集再建。
         let mut union: Option<Rect> = None;
         for rect in &self.rects {
             let bounds = logical_of(rect, scale).outset(outline);
@@ -500,7 +408,6 @@ impl DamageOverlay {
                     border: None,
                 },
             });
-            // 四边各一条 1 物理像素的描边。
             let edges = [
                 Rect::new(bounds.origin.x, bounds.origin.y, bounds.size.width, outline),
                 Rect::new(
@@ -537,7 +444,6 @@ impl DamageOverlay {
     }
 }
 
-/// 物理矩形 → 逻辑矩形（逐边 `to_logical`，不取整）。
 fn logical_of(rect: &PhysicalRect, scale: Scale) -> Rect {
     Rect::new(
         scale.to_logical(rect.x0 as f32),
@@ -547,14 +453,6 @@ fn logical_of(rect: &PhysicalRect, scale: Scale) -> Rect {
     )
 }
 
-/// macOS 设备恢复验收计数：进程成功安装过几个 `GpuCore`（首次创建 = 1，每次设备重建 +1）。
-///
-/// 消费者：`examples/acceptance` 的 `window` 模式 —— 在
-/// `KYTRIX_METAL_INJECT_DEVICE_LOST=1` 下注入一次 `DeviceLost` 之后必须恰好为 `2`
-/// （= 一次整设备重建；0 次说明恢复分支没跑，≥3 说明恢复风暴/重复删建设备）。
-///
-/// 只在 macOS + `test-support` 构建存在：这是测试基建的观测口，不是生产 API
-/// （恢复本身不依赖它；生产构建没有本函数也没有计数器消费者）。
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn metal_gpu_core_generation() -> u64 {
@@ -575,8 +473,6 @@ mod tests {
         test_support::{app::TestApp, record::FrameRecord},
     };
 
-    /// 绝对定位的 `Style`（带 `size` / `inset`，可挂 clip）：容器节点需要真实布局盒，
-    /// 而 `layout_override` 会把节点变成布局叶子（禁止挂子节点）。
     fn absolute_style(
         rect: crate::math::Rect,
         clip: crate::paint::style::Clip,
@@ -648,7 +544,6 @@ mod tests {
 
     #[test]
     fn frame_dump_on_a_fresh_app_is_empty() {
-        // 评审阻塞 ①：从未 `drain()` 时 `frame_record()` 会 panic；`frame_dump` 必须安全降级。
         let app = TestApp::new();
         let dump = frame_dump(&app);
 
@@ -659,8 +554,6 @@ mod tests {
         assert!(dump.to_string().starts_with("frame 0 "));
     }
 
-    /// AR2b P2-N1：诊断必须暴露 `meta.y`（`ClipDump.kind`），否则 GPU 契约里最容易写反的
-    /// 一项在 headless 侧根本读不到。顺带钉住「矩形项的表项是整数物理像素」（P1-N1 的吸附）。
     #[test]
     fn frame_dump_exposes_the_clip_kind_and_the_snapped_rect() {
         use crate::paint::{
@@ -672,7 +565,6 @@ mod tests {
         let mut app = TestApp::new();
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
-        // 分数坐标的 `Clip::Bounds` 容器（矩形项会被 `roundOut` 吸附到整数物理像素）。
         let container = NodeBuilder::boxed()
             .style(absolute_style(
                 crate::math::Rect::new(8.25, 4.5, 40.5, 20.25),
@@ -680,7 +572,6 @@ mod tests {
             ))
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
             .expect("container");
-        // 容器里放一个有像素的盒子：内容 clip 只在子树真会产生图元时压栈。
         let _ = NodeBuilder::boxed()
             .layout_override(crate::math::Rect::new(0.0, 0.0, 10.0, 10.0))
             .paint(PaintSpec {
@@ -693,7 +584,6 @@ mod tests {
                 container,
             )
             .expect("content");
-        // 根层 Canvas 内的圆角 clip：链上第二个表项（`meta.y = ROUNDED`）。
         let mut canvas = Canvas::new(crate::math::Rect::new(8.0, 4.0, 40.0, 20.0));
         assert!(canvas.push_clip(ClipRect {
             rect: crate::math::Rect::new(8.0, 4.0, 40.0, 20.0),
@@ -717,7 +607,6 @@ mod tests {
 
         let dump = frame_dump(&app);
         assert_eq!(dump.clips.len(), 3, "哨兵 + 矩形 + 圆角：{:?}", dump.clips);
-        // 表项 0 = 哨兵：kind 写 Rect 但 `clip_index == 0` 时 shader 直接早退。
         assert_eq!((dump.clips[0].kind, dump.clips[0].parent), (1, None));
         let rect_clip = dump.clips[1];
         assert_eq!(
@@ -744,7 +633,6 @@ mod tests {
         let mut app = app_with_boxes(1);
         let _ = app.drain().expect("idle frame");
         let dump = frame_dump(&app);
-        // 空闲帧不重新编码：实例表沿用上一提交，dump 结构必须仍然自洽。
         assert!(!dump.instances.is_empty());
         assert_eq!(dump.frame_index, app.frame_record().frame_index.get());
     }
@@ -875,7 +763,6 @@ mod tests {
 
         let scale = Scale::new(2.0).expect("scale");
         let canvas = overlay.canvas(scale);
-        // 每个 damage 矩形产出 1 个填充 + 4 条边。
         assert_eq!(canvas.primitives().len(), overlay.rects.len() * 5);
         assert!(canvas.bounds().size.width > 15.0);
     }

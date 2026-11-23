@@ -1,14 +1,8 @@
 use std::fmt;
 
-/// Failure reasons for parsing an interpolated message template.
-///
-/// Positions are byte offsets into the raw template text, so an error points at
-/// the exact `%{` that could not be parsed.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TemplateError {
-    /// A `%{` sequence is not closed by a `}`.
     UnclosedPlaceholder { at: usize },
-    /// A `%{` sequence closes immediately, as in `%{}`.
     EmptyPlaceholder { at: usize },
 }
 

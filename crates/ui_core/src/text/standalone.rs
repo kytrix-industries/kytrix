@@ -1,33 +1,3 @@
-//! E1：**无节点归属**的文本 shaping（`App::shape_text` 的实现，`§11.1`）。
-//!
-//! 与节点路径（`App::refresh_text` → `Window::compute_layout` → `App::layout_text`）的分工：
-//! 节点路径的内容宽来自 taffy 布局；canvas 内文本没有节点，宽度由应用显式给出
-//! （`max_width = None` ⇒ 单行、按 max-content 宽断行）。两条路径共用同一份形状缓存
-//! （`text::cache::ShapeKey`）、同一条光栅/装箱路径（`ShapedText::rasterize`）与同一个字形
-//! 图集，因此同一文本 + 同一 shaping 输入重复 shape 命中缓存、不重复塑形。颜色不进缓存键
-//! （R12-11）：同文本换色同样命中布局、**不重复 shape**，但光栅按本次 `style.color` 重写基础
-//! run（E24 / W6b F22）—— Canvas 文本没有节点绘制期的重上色通道。
-//!
-//! # 图集租约（D-5 的等价面）
-//!
-//! 句柄记录构造时的图集租约 `(AtlasAllocator::generation, GlyphAtlas::eviction_epoch)`；
-//! `App` 侧另存一份**当前**租约（打包的 `AtomicU64`），任何可能改变图集状态的入口
-//! （`App::{layout_text, set_font_stack, reload_system_fonts, shape_text}` 等）都会同步它。
-//! 换代**或**任何 tile 被 LRU 淘汰后 [`super::ShapedTextHandle::is_stale`] 为真，
-//! `Canvas::push_shaped_text` 不编码旧 UV —— 这正是 D-5 修掉的花字问题。本次 shape 自身触发
-//! 的扩容 / 清空 / 淘汰会让**本进程其它窗口**的文本行与 Canvas 一起失效，调用方
-//! （`App::shape_text`）负责把它们重新入队。
-//!
-//! # 设备 scale
-//!
-//! `§11.1` 的 `App::shape_text` 签名没有 window / scale 参数，因此本实现使用 **App 级默认
-//! scale**（v2.1 E1b 用户裁决）：`App` 跟踪当前焦点窗口的 DPI 作为默认值，并提供显式覆盖
-//! （`App::set_text_scale`）供离屏 / 测试 / 固定 DPI 场景使用。`ShapedLine::scale` 与句柄的
-//! [`super::ShapedTextHandle::scale`] 都是该值；paint 阶段仍按窗口 `Scale` 放大。
-//!
-//! **应用义务**：句柄的 tile 位图按 shape 时刻的 scale 光栅。多窗口不同 DPI、或窗口被拖到
-//! 另一块屏（DPI 变化）后，应用必须丢弃句柄并重新 `shape_text` —— 引擎不会自动重光栅。
-
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -46,16 +16,8 @@ use crate::{
     render::{AtlasAllocator, DirtyRects},
 };
 
-/// 单次 `shape_text` 因图集换代（阶梯扩容 / 容量逃逸清空）重跑光栅的最大轮数。
-///
-/// 与 `app::text_pass::MAX_LAYOUT_TEXT_PASSES` 同量级：换代只由扩容（512→1024→2048，最多 2 次）
-/// 或满页清空触发，正常一轮即收敛；超过上限说明图集在持续换代，按容量失败上报。
 const MAX_SHAPE_ATTEMPTS: u32 = 4;
 
-/// 无节点归属的 shaping：校验 → 形状缓存 → 光栅/装箱 → 带代际租约的句柄。
-///
-/// `pending_dirty` 是图集脏矩形（`App::pending_dirty`）：新装箱的字形必须进入下一帧的
-/// 图集页上传，否则 GPU 纹理里对应 tile 是未定义内容。
 pub(crate) fn shape(
     text_context: &mut TextContext,
     raster: &mut GlyphRasterizer,
@@ -69,7 +31,6 @@ pub(crate) fn shape(
     inline_boxes: &[InlineBoxSpec],
     scale: f32,
 ) -> Result<ShapedTextHandle, EngineError> {
-    // 入口校验：宽度约束必须是有限非负值（NaN 会让 parley 的断行结果不可复现）。
     if let Some(width) = max_width
         && (!width.is_finite() || width < 0.0)
     {
@@ -77,28 +38,20 @@ pub(crate) fn shape(
             detail: format_smolstr!("max_width {width} must be finite and non-negative"),
         });
     }
-    // 空字体栈没有任何候选：与节点路径不同，这里没有节点槽可挂诊断，按 `§11.1` 的错误表
-    // 返回强类型错误（非空栈但家族名不存在 ⇒ 走 fontique 回退，不报错）。
     if text_context.font_stack().families().len() == 0 {
         return Err(EngineError::TextShapeStandalone {
             detail: SmolStr::new_static("font stack is empty"),
         });
     }
-    // 字体换代（set_font_stack / reload_system_fonts）后光栅器的字体 epoch 可能尚未同步
-    // （节点路径由 `refresh_text` 每帧同步；canvas 文本可能在任何时刻被 shape）。
     let font_epoch = text_context.font_epoch();
     raster.set_font_epoch(font_epoch);
 
     let content =
         TextContent::new(text, style.clone()).with_inline_boxes(inline_boxes.iter().copied());
-    // 形状缓存（`ShapeKey`：文本 + shaping 输入的样式 + 行内盒 + font_stack_version）；
-    // 命中路径不重建 parley Layout，只按新的内容宽断行 + 光栅（颜色不在键里，由
-    // `ShapedText::rasterize` 按本次 `style.color` 重写基础画刷；E24）。
     let (shaped, _hit) = text_context.shape_cached(&content);
     let width = max_width.unwrap_or_else(|| shaped.max_content_size().width);
     let ellipsis = text_context.ellipsis_for(style);
 
-    // 本 pass 的字形 tile 在本 pass 内不可被 LRU 淘汰（与 `App::layout_text` 同口径）。
     glyph_atlas.begin_pass();
     let mut attempt = 0u32;
     loop {
@@ -121,8 +74,6 @@ pub(crate) fn shape(
         };
         text_context.push_diagnostics(diagnostics);
         pending_dirty.merge(&mut atlas.take_dirty_rects());
-        // 软失败（整页都是本次 shape 的工作集）：canvas 没有「下一帧自动重排」的节点槽，
-        // 少画字形不可接受 —— 按 `§11.1` 的错误表上报容量失败（可见失败优于静默缺字）。
         if stats.skipped > 0 {
             return Err(EngineError::AtlasExhausted {
                 kind: AtlasKind::Glyph,
@@ -138,9 +89,6 @@ pub(crate) fn shape(
                     ShapedTextItem::GlyphRun(_) => None,
                 })
                 .collect();
-            // 句柄记录上**最终**租约：换代在 pass 内发生后已重跑，产出的 tile 属于这一代；
-            // 本次 pass 自身造成的逐 tile 淘汰也把纪元带到最新（本 pass 用过的 tile 不会被
-            // 自己淘汰，因此这份快照对刚产出的行仍然有效）。
             let eviction_epoch = glyph_atlas.eviction_epoch();
             lease.store(
                 pack_atlas_lease(generation, eviction_epoch),
@@ -155,8 +103,6 @@ pub(crate) fn shape(
                 Arc::clone(lease),
             ));
         }
-        // 本次 rasterize 触发了图集换代（扩容 / 清空）：已产出的 `ShapedLine` 烘焙的是旧 UV，
-        // 必须用新代际重跑（与 `App::layout_text` 的重跑语义一致）。
         attempt = attempt.saturating_add(1);
         if attempt >= MAX_SHAPE_ATTEMPTS {
             return Err(EngineError::AtlasExhausted {
@@ -189,7 +135,6 @@ mod tests {
         (runtime, app)
     }
 
-    /// 快照里的字形总数（`GlyphRun` 逐个累加；空 run 计 0）。
     fn glyph_count(line: &ShapedLine) -> usize {
         line.glyph_runs().map(|run| run.glyphs.len()).sum()
     }
@@ -208,7 +153,6 @@ mod tests {
         assert!(handle.line().lines.is_empty());
         assert_eq!(glyph_count(handle.line()), 0);
         assert!(!handle.is_stale());
-        // 空句柄仍然有效：push 返回 true，只是没有可画内容。
         let mut canvas = canvas();
         assert!(canvas.push_shaped_text(&handle, Point::ZERO));
         assert!(canvas.primitives().is_empty());
@@ -224,14 +168,12 @@ mod tests {
         assert_eq!(mixed.line().lines.len(), 1, "max_width = None ⇒ 单行");
         assert!(mixed.size().width > 0.0);
         assert!(mixed.size().height > 0.0);
-        // 空格没有覆盖度位图（不产生 PositionedGlyph）：5 个 Latin + 2 个 CJK = 7。
         assert_eq!(
             glyph_count(mixed.line()),
             7,
             "ASCII + CJK 混排的每个非空白字符都要有字形：{:?}",
             mixed.line()
         );
-        // 测宽：更长的文本更宽、更大的字号更宽。
         let longer = app
             .shape_text("Hello 世界!!!", &style, None, &[])
             .expect("更长文本");
@@ -282,8 +224,6 @@ mod tests {
             "max_width 必须触发断行：{:?}",
             wrapped.line().lines
         );
-        // 尾随空白**允许悬挂**（CSS hanging whitespace）：行推进 = 可见内容 + 行末空格，
-        // 因此上限是 `max_width + 一个空格宽`（16 px 字号下 < 8 px）。
         let hanging = 8.0;
         assert!(
             wrapped.size().width <= 80.0 + hanging,
@@ -296,7 +236,6 @@ mod tests {
             wrapped.size().height,
             single.size().height
         );
-        // 每一行的可见推进都放得进 max_width（单词都能断开）。
         for line in &wrapped.line().lines {
             assert!(
                 line.advance <= 80.0 + hanging,
@@ -306,8 +245,6 @@ mod tests {
         }
     }
 
-    /// 超宽截断：`max_lines + Ellipsis` 在末行保留前缀 + 省略号，行推进不超过 `max_width`
-    /// （省略号重排逻辑本身由 `text/shape.rs` 的单测覆盖，这里只断言 canvas 句柄上的可观测结果）。
     #[test]
     fn max_lines_with_ellipsis_truncates_overflow() {
         let (_runtime, mut app) = new_app();
@@ -331,7 +268,6 @@ mod tests {
             line.advance
         );
         assert!(glyph_count(shaped.line()) > 0, "截断后仍要有可见字形");
-        // 同样的文本在「不限行数」下必须断成多行，否则上面的断言没有区分力。
         let untruncated = app
             .shape_text(text, &TextStyle::new(16.0), Some(120.0), &[])
             .expect("不截断");
@@ -375,7 +311,6 @@ mod tests {
             "LTR 文本里先出现的行内盒必须在左边：{:?}",
             boxes
         );
-        // 快照内部项的顺序与落点顺序同源。
         let item_boxes: Vec<ShapedInlineBox> = handle
             .line()
             .lines
@@ -438,7 +373,6 @@ mod tests {
         let before = canvas.primitives().len();
         assert!(before > 0);
 
-        // 换字体栈 = 清空字形图集并换代（§11.1 的图集换代路径之一）。
         app.set_font_stack(FontStack::new(["Kytrix No Such Family"]));
         assert!(handle.is_stale(), "图集换代后句柄必须失活");
         assert!(
@@ -473,7 +407,6 @@ mod tests {
                 other => panic!("宽度 {width} 必须返回 TextShapeStandalone，实际 {other:?}"),
             }
         }
-        // 零宽是合法约束（断行到 0 宽），不是错误：与「非有限 / 负值」分开。
         assert!(app.shape_text("x", &style, Some(0.0), &[]).is_ok());
     }
 
@@ -489,8 +422,6 @@ mod tests {
         }
     }
 
-    /// 非空但没有任何候选命中的字体栈走 fontique 回退（不静默换字体、也不报错）；
-    /// 节点路径的同一语义由 `TextDiagnostic::FontStackMiss` 可观测。
     #[test]
     fn unknown_family_falls_back_instead_of_failing() {
         let (_runtime, mut app) = new_app();
@@ -523,12 +454,6 @@ mod tests {
         assert!(!second.is_stale());
     }
 
-    /// E24（W6b 审查 F22）：Canvas 文本换色必须真的换色。
-    ///
-    /// `ShapeKey` 不含 `color`（R12-11：颜色不是 shaping 输入）：同文本第二次以不同颜色 shape
-    /// 时命中同一份布局快照、**不重复塑形**；但光栅必须按本次 `style.color` 重写基础 run ——
-    /// Canvas 文本没有节点绘制期的 `foreground` 重上色，旧实现里 halo 副本永远画首次的颜色
-    /// （chokepoint 的 halo 8 副本环视觉不存在的根因）。
     #[test]
     fn canvas_text_recolors_on_a_shaping_cache_hit() {
         let red = Color::Srgb {
@@ -575,7 +500,6 @@ mod tests {
             "缓存命中后 run 的颜色必须来自本次 style.color：{blue_colors:?}"
         );
 
-        // 布局缓存复用：字形落点逐位相同（只换颜色）。
         let positions = |handle: &ShapedTextHandle| -> Vec<(f32, f32)> {
             handle
                 .line()
@@ -587,7 +511,6 @@ mod tests {
         assert_eq!(positions(&red_handle), positions(&blue_handle));
         assert_eq!(red_handle.size(), blue_handle.size());
 
-        // Canvas 图元（编码期的最终颜色）：Canvas 文本没有绘制期重上色，必须直接是本次颜色。
         let mut canvas = canvas();
         assert!(canvas.push_shaped_text(&blue_handle, Point::ZERO));
         let mut pushed = 0usize;
@@ -601,8 +524,6 @@ mod tests {
         assert!(pushed > 0, "「Halo」必须至少推一条字形 run");
     }
 
-    // ── E1b：App 级默认 scale（hidpi 用户裁决）────────────────────────────────
-
     #[test]
     fn default_text_scale_is_one() {
         let (_runtime, mut app) = new_app();
@@ -614,8 +535,6 @@ mod tests {
         assert_eq!(handle.line().scale, 1.0, "快照与句柄记录的 scale 同源");
     }
 
-    /// 显式覆盖：进入光栅（同一文本在 2.0 下按 32 ppem 出 tile，与 1.0 的 16 ppem 不同），
-    /// 且非法值返回强类型错误、不改变当前值。
     #[test]
     fn explicit_text_scale_override_enters_the_raster_and_is_validated() {
         let (_runtime, mut app) = new_app();
@@ -629,7 +548,6 @@ mod tests {
         assert_eq!(two.scale(), 2.0);
         assert_eq!(two.line().scale, 2.0);
 
-        // `ShapeKey` 不含 scale（§4.5，逻辑坐标 shaping）：命中同一份快照，但 tile 属于不同 ppem。
         let first_tile = |handle: &ShapedTextHandle| {
             handle
                 .line()
@@ -657,8 +575,6 @@ mod tests {
         }
     }
 
-    /// 焦点窗口 DPI → App 级默认 scale：获得焦点 / DPI 变化时跟随；失焦保留上次值；
-    /// 显式覆盖优先；取消覆盖后恢复跟随（多窗口不同 DPI 下应用义务见 `App::text_scale` 文档）。
     #[test]
     fn focused_window_dpi_drives_the_default_text_scale() {
         let (_runtime, mut app) = new_app();
@@ -676,8 +592,6 @@ mod tests {
         assert_eq!(handle.scale(), 1.5);
         assert_eq!(handle.line().scale, 1.5);
 
-        // 窗口被拖到另一块屏：`DpiChanged` 自带新 scale（Win/mac 先镜像 `Window::scale` 再派发；
-        // Wayland 在派发之后镜像 —— 事件值才是权威，见下一条用例）。
         let two = Scale::new(2.0).expect("有限正数");
         app.window_mut(window).expect("窗口存在").set_scale(two);
         app.dispatch(
@@ -689,11 +603,9 @@ mod tests {
         );
         assert_eq!(app.text_scale(), 2.0);
 
-        // 失焦保留上次值（「无焦点窗口时保持上次值」）。
         app.dispatch(window, Event::FocusChanged { focused: false });
         assert_eq!(app.text_scale(), 2.0);
 
-        // 显式覆盖优先于 DPI 跟随；取消覆盖后回到焦点窗口 DPI。
         app.set_text_scale(1.0).expect("合法覆盖");
         app.dispatch(window, Event::FocusChanged { focused: true });
         assert_eq!(app.text_scale(), 1.0, "覆盖期间不跟随焦点窗口 DPI");
@@ -701,10 +613,6 @@ mod tests {
         assert_eq!(app.text_scale(), 2.0);
     }
 
-    /// F14（复核轮次 2）：Wayland 的 `DpiChanged` 在事件循环镜像 `Window::set_scale` **之前**
-    /// 派发（`platform/linux/event_loop.rs` 的「① 事件 → ② 平台真值镜像」顺序）。默认 scale
-    /// 必须取事件自带的 `scale`，不能读还停在旧值的 `Window::scale`（否则 text_scale 落后一次
-    /// DPI，与 Windows / macOS 不一致）。
     #[test]
     fn dpi_event_scale_is_authoritative_before_the_window_mirror() {
         let (_runtime, mut app) = new_app();
@@ -715,7 +623,6 @@ mod tests {
         app.dispatch(window, Event::FocusChanged { focused: true });
         assert_eq!(app.text_scale(), 1.0);
 
-        // Wayland 顺序：先派发事件；窗口镜像在同一轮事件循环稍后发生。
         let two = Scale::new(2.0).expect("有限正数");
         app.dispatch(
             window,
@@ -735,11 +642,9 @@ mod tests {
             "默认 scale 必须取事件自带的 scale，而不是旧的 `Window::scale`"
         );
 
-        // 事件循环随后镜像 `Window::scale`：同一事件不得再改变默认 scale。
         app.window_mut(window).expect("窗口存在").set_scale(two);
         assert_eq!(app.text_scale(), 2.0);
 
-        // 显式覆盖期间 DPI 事件不跟随（三端语义一致）。
         app.set_text_scale(1.25).expect("合法覆盖");
         let three = Scale::new(3.0).expect("有限正数");
         app.dispatch(
@@ -752,14 +657,9 @@ mod tests {
         assert_eq!(app.text_scale(), 1.25, "覆盖期间不跟随 DPI 事件");
     }
 
-    // ── E1b F1/F3：淘汰纪元与错误路径收尾 ────────────────────────────────────
-
-    /// F1：长期句柄的 tile 在容量压力下被 LRU 淘汰 ⇒ `is_stale()`（代际不变、淘汰纪元前进）⇒
-    /// push 拒绝 ⇒ 重新 shape 恢复。
     #[test]
     fn tile_eviction_makes_long_lived_handles_stale_and_reshaping_recovers() {
         let (_runtime, mut app) = new_app();
-        // 32² 的页只放得下一两个 16 ppem 字形 ⇒ 十几个单字 shape 就必然触发逐 tile LRU 淘汰。
         app.cap_glyph_atlas_page_for_test(32);
         let generation = app.glyph_atlas_generation_for_test();
         let first = app
@@ -793,7 +693,6 @@ mod tests {
             "stale 句柄不得产生任何图元"
         );
 
-        // 重新 shape：在淘汰腾出的空间里重新装箱，句柄属于当前租约。
         let fresh = app
             .shape_text("A", &TextStyle::new(16.0), None, &[])
             .expect("重新 shape");
@@ -801,10 +700,6 @@ mod tests {
         assert!(canvas.push_shaped_text(&fresh, Point::new(1.0, 2.0)));
     }
 
-    /// F3：`App::shape_text` 的失败路径同样必须完成「淘汰失效 + 租约同步」收尾。
-    ///
-    /// 变异守卫：把收尾改回 `?` 早退（返回前跳过 `take_evicted` / lease 同步）本用例必须变红
-    /// （句柄假活 + 节点文本行不失效）。
     #[test]
     fn failed_shape_still_invalidates_text_lines_and_syncs_the_lease() {
         let (_runtime, mut app) = new_app();
@@ -816,7 +711,6 @@ mod tests {
                 .build(target.tree_mut(), root)
                 .expect("文本节点")
         };
-        // 先跑一帧：节点文本的 `ShapedLine` 落进槽位（后续断言「失效」的前置）。
         app.frame(window).expect("窗口存在").expect("首帧成功");
         assert!(
             app.window(window)
@@ -827,7 +721,6 @@ mod tests {
             "前置：节点文本必须已排版"
         );
 
-        // 小页：cap 自身换代后两级缓存清空，之后 32² 页只放得下一个 tile。
         app.cap_glyph_atlas_page_for_test(32);
         let handle = app
             .shape_text("A", &TextStyle::new(16.0), None, &[])
@@ -835,7 +728,6 @@ mod tests {
         assert!(!handle.is_stale());
         let generation = app.glyph_atlas_generation_for_test();
 
-        // 一串互不相同的字形：先淘汰旧 tile（句柄 / 节点文本），随后以 AtlasExhausted 失败。
         let error = app
             .shape_text(
                 "abcdefghijklmnopqrstuvwxyz",
@@ -868,11 +760,6 @@ mod tests {
         );
     }
 
-    // ── E1b F5：§11.1 明列的 emoji 与 L2 FrameRecord 断言 ─────────────────────
-
-    /// §11.1 测试要求「CJK + emoji」：emoji 走彩色字形（COLR/CBDT）的 alpha 压平路径
-    /// （`TextDiagnostic::ColorGlyphMonochrome`），这里只要求不 panic、度量单调（宿主字体不一定
-    /// 带 emoji 字形，缺失走 tofu / 回退也必须成功）。
     #[test]
     fn cjk_and_emoji_mix_shapes_with_monotonic_metrics() {
         let (_runtime, mut app) = new_app();
@@ -895,15 +782,12 @@ mod tests {
             more.size().width > mixed.size().width,
             "多一个 emoji 必须更宽（度量单调）"
         );
-        // 限宽断行也不得 panic。
         let wrapped = app
             .shape_text("Hello 🌍🚀 世界", &style, Some(60.0), &[])
             .expect("限宽");
         assert!(wrapped.line().lines.len() > 1);
     }
 
-    /// E1b F2：canvas 编码期安全网。push 之后同帧换代（换字体栈 ⇒ 图集换代），编码输出不得
-    /// 含失效 run、`FrameRecord::stale_canvas_runs` 逐条计数；同代际帧正常编码。
     #[cfg(feature = "test-support")]
     #[test]
     fn stale_canvas_glyph_runs_are_dropped_at_encode_time_and_counted() {
@@ -930,7 +814,6 @@ mod tests {
             .count();
         assert!(run_count > 0);
         let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 200.0, 40.0));
-        // 一个非文本图元：过滤只应删失效 run，Canvas 本身仍要上屏。
         canvas.push_quad(Quad {
             bounds: Rect::new(0.0, 0.0, 200.0, 40.0),
             corner_radius: [0.0; 4],
@@ -950,7 +833,6 @@ mod tests {
                 .expect("Canvas 节点")
         };
 
-        // 同代际：正常编码，Canvas 内的 GlyphRun 数 = 非空 run 数。
         let record = app.drain().expect("帧成功");
         assert_eq!(record.stale_canvas_runs, 0, "同代际不得丢弃任何 run");
         let rendered = record.frame.as_ref().expect("已提交帧");
@@ -968,8 +850,6 @@ mod tests {
             "同代际：Canvas 内 GlyphRun 图元数 = 非空 run 数"
         );
 
-        // 换字体栈 ⇒ 图集换代；应用持有的 Canvas 仍是旧 tile（没有重建）。应用侧标重绘
-        //（本测试没有 a11y 消费者，单靠唤醒会被 a11y-only 快速路径吞掉）后引擎重绘。
         app.app_mut()
             .set_font_stack(FontStack::new(["Kytrix No Such Family"]));
         assert!(handle.is_stale(), "换代后句柄必须失活");
@@ -1001,14 +881,6 @@ mod tests {
         );
     }
 
-    /// E1d（F15 方案①）：push 之后发生的**逐 tile LRU 淘汰**（`generation` 不变）同样会让
-    /// Canvas 里已写入的 `AtlasTile` 失效；编码期逐 tile `is_alive` 必须在编码前过滤并计数。
-    ///
-    /// 这正是 F15 记录的场景：旧实现只比「tile 代际 == 当前代际」，逐 tile 淘汰不换代 ⇒
-    /// 过滤 0 条、把被复用的旧 UV 编码上屏（花字 + 无诊断）。本用例断言：代际不变、淘汰纪元
-    /// 前进的帧里，Canvas 的旧 run 被**全部**丢弃、计数 = run 数、诊断可观测。
-    ///
-    /// 变异守卫：`AtlasAllocator::is_alive` 恒真 ⇒ `stale_canvas_runs == 0` ⇒ 本用例 RED。
     #[cfg(feature = "test-support")]
     #[test]
     fn evicted_canvas_tiles_are_filtered_at_encode_time_without_a_generation_bump() {
@@ -1023,7 +895,6 @@ mod tests {
 
         let mut app = TestApp::new();
         let window = app.window_id();
-        // 32² 的小页只放得下一两块 16 ppem 字形 ⇒ 十几个单字 shape 就必然触发 LRU 淘汰。
         app.app_mut().cap_glyph_atlas_page_for_test(32);
         let generation = app.app().glyph_atlas_generation_for_test();
         let handle = app
@@ -1038,7 +909,6 @@ mod tests {
             .count();
         assert!(run_count > 0);
         let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 200.0, 40.0));
-        // 非文本图元：编码期安全网只丢弃失效 run，Canvas 本身仍要上屏。
         canvas.push_quad(Quad {
             bounds: Rect::new(0.0, 0.0, 200.0, 40.0),
             corner_radius: [0.0; 4],
@@ -1047,7 +917,6 @@ mod tests {
                 border: None,
             },
         });
-        // push 时句柄有效：旧实现的「正常路径」把 tile 写进 Canvas 值。
         assert!(canvas.push_shaped_text(&handle, Point::new(2.0, 3.0)));
         let canvas_node = {
             let target = app.app_mut().window_mut(window).expect("窗口存在");
@@ -1059,7 +928,6 @@ mod tests {
                 .expect("Canvas 节点")
         };
 
-        // 淘汰前：租约未变 ⇒ 正常编码、零过滤（回归：正常路径零额外过滤）。
         let record = app.drain().expect("帧成功");
         assert_eq!(record.stale_canvas_runs, 0, "淘汰前不得丢弃任何 run");
         assert_eq!(
@@ -1068,8 +936,6 @@ mod tests {
             "淘汰前 Canvas 文本必须正常编码"
         );
 
-        // 容量压力：小页 + 一串互不相同的单字 ⇒ 逐 tile LRU 淘汰（不换代）。句柄因此失活，
-        // 但 Canvas 里已经写好的 tile 仍指向被复用的矩形 —— F15 的失效面。
         for glyph in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"] {
             app.app_mut()
                 .shape_text(glyph, &TextStyle::new(16.0), None, &[])
@@ -1086,7 +952,6 @@ mod tests {
         );
         assert!(handle.is_stale(), "淘汰后旧句柄必须失活");
 
-        // 编码：`App::shape_text` 的淘汰收尾已把 Canvas 节点标 PAINT，本帧重建 lane。
         let record = app.drain().expect("帧成功");
         assert_eq!(
             record.stale_canvas_runs, run_count,
@@ -1117,13 +982,6 @@ mod tests {
             "过滤只丢弃失效 run，Canvas 节点本身必须在场"
         );
     }
-    /// F13（复核轮次 2）：Canvas 失效 run 在编码期被丢弃后必须**有界补帧**。
-    ///
-    /// 静态窗口不会因为「应用还没重建 Canvas」而自然再出帧：不补帧 ⇒ 应用义务（在下一帧的
-    /// `on_frame` 钩子里重新 `shape_text` + `set_canvas`）不可执行，canvas 文本会无限期缺失。
-    /// 补帧必须按图集代际有界：同一代际至多一次，应用忽略义务时不能变成 I3 空转。
-    ///
-    /// 变异守卫：删掉 `App::frame` 里 `stale_canvas_runs > 0` 分支的补帧请求 ⇒ 本用例变红。
     #[cfg(feature = "test-support")]
     #[test]
     fn stale_canvas_runs_request_exactly_one_bounded_follow_up_frame() {
@@ -1149,7 +1007,6 @@ mod tests {
             .count();
         assert!(run_count > 0);
         let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 240.0, 40.0));
-        // 非文本图元：编码期安全网只丢弃失效 run，Canvas 本身仍要上屏。
         canvas.push_quad(Quad {
             bounds: Rect::new(0.0, 0.0, 240.0, 40.0),
             corner_radius: [0.0; 4],
@@ -1169,7 +1026,6 @@ mod tests {
                 .expect("Canvas 节点")
         };
 
-        // 无失效 run：静态窗口不产生任何额外帧（I3）。
         let record = app.drain().expect("帧成功");
         assert_eq!(record.stale_canvas_runs, 0);
         let requests = app.app().frame_requests();
@@ -1181,7 +1037,6 @@ mod tests {
             "无失效 run 时不得请求补帧（0 额外帧）"
         );
 
-        // 换代（换字体栈）⇒ 已 push 的 tile 失活；应用侧请求一次重绘（生产里同构）。
         app.app_mut()
             .set_font_stack(FontStack::new(["Kytrix No Such Family"]));
         assert!(handle.is_stale());
@@ -1205,7 +1060,6 @@ mod tests {
             "本帧不得编码任何失效 run"
         );
 
-        // 补帧之前（= 应用在补帧的 `on_frame` 钩子里）：重新 shape + 重建 Canvas。
         let fresh = app
             .app_mut()
             .shape_text("Canvas follow-up", &style, None, &[])
@@ -1229,7 +1083,6 @@ mod tests {
                 .expect("节点存活")
         );
 
-        // 引擎请求的补帧：重建后的文本恢复上屏，且不再丢弃 run。
         let record = app.drain().expect("帧成功");
         assert!(record.rendered, "补帧必须真的运行（应用义务依赖它）");
         assert_eq!(record.stale_canvas_runs, 0);
@@ -1238,13 +1091,10 @@ mod tests {
             run_count,
             "重 push 后 canvas 文本必须恢复"
         );
-        // 同一图集代际只补一帧：补帧后窗口重新回到 Idle（不空转）。
         let record = app.drain().expect("帧成功");
         assert!(!record.rendered, "同一图集代际只补一帧（I3）");
     }
 
-    /// 场景里所有 Canvas 图元的内部 `GlyphRun` 数（E1b 的 L2 断言面：FrameRecord 把 Canvas 当
-    /// 不透明图元，内层图元数只能在场景上核对）。
     #[cfg(feature = "test-support")]
     fn canvas_scene_glyph_run_count(app: &App, window: WindowId) -> usize {
         let target = app.window(window).expect("窗口存在");
@@ -1264,8 +1114,6 @@ mod tests {
         runs
     }
 
-    /// L2（§11.1）：节点文本走帧后，`FrameRecord` 里的 `Primitive::GlyphRun` 全部落在节点盒内，
-    /// 且 lane 的 GlyphRun 图元数 = 非空 run 数（与 canvas 的 `push_shaped_text` 同一套 run 语义）。
     #[cfg(feature = "test-support")]
     #[test]
     fn frame_record_glyph_runs_stay_inside_the_text_node_box() {
@@ -1283,7 +1131,6 @@ mod tests {
                 .expect("文本节点")
         };
         let record = app.drain().expect("帧成功");
-        // 先把帧记录里的断言面拷出来，结束对 `app` 的独占借用。
         let glyph_runs: Vec<(NodeId, Rect)> = record
             .frame
             .as_ref()

@@ -1,18 +1,14 @@
-//! Incremental detokenization for streamed model output.
-
 use llama_sys::ffi;
 
 use super::model::Model;
 use crate::error::DetokenizeError;
 
-/// A stateful detokenizer that buffers an incomplete trailing UTF-8 sequence.
 pub(super) struct StreamDetokenizer<'a> {
     model: &'a Model,
     buffer: Vec<u8>,
 }
 
 impl<'a> StreamDetokenizer<'a> {
-    /// Creates a detokenizer over `model`.
     pub(super) fn new(model: &'a Model) -> Self {
         Self {
             model,
@@ -20,14 +16,12 @@ impl<'a> StreamDetokenizer<'a> {
         }
     }
 
-    /// Feeds one token and returns the text that became complete.
     pub(super) fn push(&mut self, token: ffi::llama_token) -> Result<String, DetokenizeError> {
         let piece = self.model.token_to_piece(token, false)?;
         self.buffer.extend_from_slice(&piece);
         self.drain_complete()
     }
 
-    /// Finishes the stream, returning any remaining complete text.
     pub(super) fn finish(mut self) -> Result<String, DetokenizeError> {
         let text = self.drain_complete()?;
         if self.buffer.is_empty() {
@@ -37,16 +31,11 @@ impl<'a> StreamDetokenizer<'a> {
         }
     }
 
-    /// Moves the longest valid UTF-8 prefix out of the buffer.
     fn drain_complete(&mut self) -> Result<String, DetokenizeError> {
         take_valid_utf8(&mut self.buffer)
     }
 }
 
-/// Drains the longest valid UTF-8 prefix from `buffer`.
-///
-/// Returns an error only for genuinely malformed bytes; a merely unfinished
-/// trailing multi-byte sequence stays buffered for the next token.
 fn take_valid_utf8(buffer: &mut Vec<u8>) -> Result<String, DetokenizeError> {
     let valid = match std::str::from_utf8(buffer) {
         Ok(_) => buffer.len(),

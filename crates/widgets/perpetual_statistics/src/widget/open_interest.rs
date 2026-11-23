@@ -1,11 +1,8 @@
-//! the open-interest pane.
-
 use widget::identity::WidgetId;
 
 use super::display::{StatisticsMetric, StatisticsWidget};
 use crate::model::MetricKind;
 
-/// The perpetual series this pane plots.
 pub struct OpenInterestWidgetSeries;
 
 impl StatisticsMetric for OpenInterestWidgetSeries {
@@ -16,5 +13,4 @@ impl StatisticsMetric for OpenInterestWidgetSeries {
     const METRIC: MetricKind = MetricKind::OpenInterest;
 }
 
-/// Perpetual open interest, in the base and quote asset.
 pub type OpenInterestWidget = StatisticsWidget<OpenInterestWidgetSeries>;

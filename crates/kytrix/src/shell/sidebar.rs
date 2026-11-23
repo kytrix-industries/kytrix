@@ -1,27 +1,3 @@
-//! The window's left sidebar: the workspace list, and the way into the settings.
-//!
-//! The panel is drawn in one of three states, chosen by the stored interface preference
-//! and walked by the title bar's toggle: hidden (no width at all), icons only (a 40 px rail)
-//! and full (icons and labels). The full state also offers the active row's rename and
-//! delete controls.
-//!
-//! # One panel, rebuilt when its state changes
-//!
-//! The panel is a plain node subtree built per state. A mode change or a language change
-//! releases the kit controls and rebuilds the panel, which is the engine's way of
-//! expressing "the labels changed": a kit button's text is baked in when it is built, and
-//! the shell has no render function that would rebuild it every frame. A row press reports
-//! an intent rather than calling back into the shell — the shell's route applies it — so a
-//! control never re-enters the view that is drawing it.
-//!
-//! # What is not here (P4-3 scope)
-//!
-//! The previous shell animated the panel's width between states and floated a preview of
-//! the full panel over the collapsed rail on hover. The engine's layout is not animated by
-//! this shell: the state changes at once instead of travelling, and the floating preview is
-//! deferred to the shell-polish batch (the collapsed states stay usable through the
-//! toggle). Both are recorded in the batch's ledger.
-
 use app_config::ui::SidebarMode;
 use base_ui::{
     kit::{button::Button, icon::IconKind, size::UnifiedSizable},
@@ -46,37 +22,27 @@ use super::{
 };
 use crate::composition::Composition;
 
-/// The panel's debug id.
 pub(crate) const SIDEBAR: &str = "SIDEBAR";
 
-/// The divide drawn on the panel's right edge.
 pub(crate) const SIDEBAR_DIVIDER: &str = "SIDEBAR_DIVIDER";
 
-/// The button that adds a workspace, and the label beside its mark.
 pub(crate) const SIDEBAR_NEW_WORKSPACE: &str = "SIDEBAR_NEW_WORKSPACE";
 pub(crate) const SIDEBAR_NEW_WORKSPACE_LABEL: &str = "SIDEBAR_NEW_WORKSPACE_LABEL";
 
-/// The divider between the add button and the list.
 pub(crate) const SIDEBAR_WORKSPACE_SEPARATOR: &str = "SIDEBAR_WORKSPACE_SEPARATOR";
 
-/// The name drawn inside a full row.
 pub(crate) const SIDEBAR_WORKSPACE_NAME: &str = "SIDEBAR_WORKSPACE_NAME";
 
-/// The prefix of a row's selector, and of its rename / delete controls.
 const SIDEBAR_ITEM: &str = "SIDEBAR_ITEM";
 const SIDEBAR_WORKSPACE_CLOSE: &str = "SIDEBAR_WORKSPACE_CLOSE";
 const SIDEBAR_WORKSPACE_RENAME: &str = "SIDEBAR_WORKSPACE_RENAME";
 
-/// The settings entry at the foot of the panel.
 pub(crate) const SIDEBAR_FOOTER_SETTINGS: &str = "SIDEBAR_FOOTER_SETTINGS";
 pub(crate) const SIDEBAR_FOOTER_SETTINGS_LABEL: &str = "SIDEBAR_FOOTER_SETTINGS_LABEL";
 
-/// The panel and the controls it owns.
 pub(crate) struct Sidebar {
     window: WindowId,
-    /// The node the panel hangs under (the window's root).
     parent: NodeId,
-    /// The panel's root node, replaced when the panel is rebuilt.
     node: Option<NodeId>,
     mode: SidebarMode,
     theme: ThemeHandle,
@@ -84,12 +50,10 @@ pub(crate) struct Sidebar {
     intents: Intents,
     language_signal: Signal<LanguageCode>,
     language: LanguageCode,
-    /// Every kit control the panel owns, kept for event dispatch and release.
     buttons: Vec<Button>,
 }
 
 impl Sidebar {
-    /// Builds the panel into `parent` (the window's root node).
     pub(crate) fn build(
         app: &mut App,
         window: WindowId,
@@ -118,17 +82,10 @@ impl Sidebar {
         Ok(sidebar)
     }
 
-    /// The mode the panel is drawn in.
     pub(crate) fn mode(&self) -> SidebarMode {
         self.mode
     }
 
-    /// Draws the panel in `mode`, releasing whatever the previous state owned.
-    ///
-    /// The panel's own node survives a rebuild: only its contents are dropped and built
-    /// again. Appending a fresh root would put the panel after the title bar in the
-    /// window's child order, and the window paints its children in that order — a rebuilt
-    /// sidebar would cover the self-drawn chrome (P2-④).
     fn build_panel(
         &mut self,
         app: &mut App,
@@ -188,8 +145,6 @@ impl Sidebar {
                 .width(1.0)
                 .build(),
         )?;
-        // The title bar is drawn over the window, so the panel's background reaches the top
-        // of the window while its content starts below the bar.
         ui::container(
             app,
             self.window,
@@ -253,7 +208,6 @@ impl Sidebar {
         Ok(())
     }
 
-    /// The button above the list.
     fn build_add_button(
         &mut self,
         app: &mut App,
@@ -299,8 +253,6 @@ impl Sidebar {
         Ok(())
     }
 
-    /// One workspace row: the select button, and in the full panel the active row's rename
-    /// and delete controls.
     fn build_row(
         &mut self,
         app: &mut App,
@@ -354,7 +306,6 @@ impl Sidebar {
         Ok(())
     }
 
-    /// The active row's rename and delete controls, over the row's right end.
     fn build_row_actions(
         &mut self,
         app: &mut App,
@@ -422,7 +373,6 @@ impl Sidebar {
         Ok(())
     }
 
-    /// The settings entry at the foot of the panel.
     fn build_settings_button(
         &mut self,
         app: &mut App,
@@ -468,7 +418,6 @@ impl Sidebar {
         Ok(())
     }
 
-    /// Runs one frame of the panel: the language, and nothing else.
     pub(crate) fn sync(
         &mut self,
         app: &mut App,
@@ -487,8 +436,6 @@ impl Sidebar {
         Ok(())
     }
 
-    /// Rebuilds the panel from the workspace list (a workspace was added, renamed or
-    /// removed, and the rows are the list).
     pub(crate) fn rebuild(
         &mut self,
         app: &mut App,
@@ -498,7 +445,6 @@ impl Sidebar {
         self.build_panel(app, mode, workspaces)
     }
 
-    /// Changes the drawn state, rebuilding the panel at its new width.
     pub(crate) fn set_mode(
         &mut self,
         app: &mut App,
@@ -511,21 +457,18 @@ impl Sidebar {
         self.build_panel(app, mode, workspaces)
     }
 
-    /// Releases every kit control and the panel's nodes.
     fn release_controls(&mut self, app: &mut App) {
         for button in std::mem::take(&mut self.buttons) {
             button.release(app);
         }
     }
 
-    /// Forwards one platform event to the panel's kit controls.
     pub(crate) fn dispatch(&mut self, app: &mut App, event: &Event) {
         for button in &self.buttons {
             let _ = button.dispatch(app, event);
         }
     }
 
-    /// Releases every component and node the panel owns.
     pub(crate) fn release(&mut self, app: &mut App) {
         self.release_controls(app);
         if let Some(node) = self.node.take() {
@@ -538,7 +481,6 @@ impl Sidebar {
 mod tests {
     use super::*;
 
-    /// Only the full panel draws labels, and only it offers the row controls.
     #[test]
     fn only_the_full_panel_should_draw_labels() {
         assert!(metrics::draws_labels(SidebarMode::Full));

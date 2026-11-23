@@ -1,14 +1,3 @@
-//! Validated identifiers and the versioned canonical identity encoding.
-//!
-//! Every canonical identifier in this crate shares one encoding contract:
-//! canonical terms are encoded field by field in structure definition order,
-//! collections are sorted by their validated identity, fixed-point decimals use
-//! their 18-digit fixed-point integer representation and enums use fixed
-//! lowercase labels. The encoded bytes are hashed with a full 32-byte SHA-256
-//! digest and rendered as `<namespace>/v1/<64 lowercase hexadecimal digits>`.
-//! Display aliases, native identifiers, routes, listings, rules, mutable state
-//! and Rust `Display`/`Debug` output never take part in that encoding.
-
 use std::{fmt, str::FromStr};
 
 use bytes::BytesMut;
@@ -18,89 +7,44 @@ use smol_str::{SmolStr, format_smolstr};
 
 use crate::error::ModelError;
 
-/// The identity encoding version shared by every persisted canonical identity.
-///
-/// `v1` is frozen once published: the encoder's field order, its decimal and
-/// collection canonicalisation, its enum labels and the full 32-byte lowercase
-/// SHA-256 rendering are all wire schema, and any change to them changes the
-/// digest of terms whose economic meaning did not change.
-///
-/// An incompatible change to the canonical encoding therefore requires a new
-/// identity version and namespace rather than an edit to this constant. The cost
-/// is stated rather than absorbed: every persisted identity written under the old
-/// version stops decoding, so stored listing/instrument selections, link groups
-/// and `WatchListKey` entries fail under the current schema, and a widget load
-/// restores its defaults and writes them back. That full reset is a deliberate
-/// persistence schema breaking change, not an accident to be papered over — this
-/// crate provides no old-identity migration, no fallback and no dual-version
-/// parsing, and none may be added around it.
 pub const IDENTITY_VERSION: &str = "v1";
 
-/// The venue listing identity label, pinned by the listing design.
 pub const VENUE_LISTING_IDENTITY_LABEL: &str = "listing-id/v1";
 
-/// Digits of the lowercase hexadecimal SHA-256 digest inside an identity value.
 pub const IDENTITY_DIGEST_LENGTH: usize = 64;
 
-/// The decimal digits used by the `Digest` hexadecimal rendering.
 fn is_lowercase_hex_digit(byte: u8) -> bool {
     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
 
-/// A type whose canonical terms can be encoded into an identity digest.
 pub trait CanonicalTerms {
-    /// Writes the canonical encoding of these terms into `encoder`.
     fn encode(&self, encoder: &mut CanonicalEncoder);
 }
 
-/// A canonical identity family.
-///
-/// The `namespace` is mixed into the digest input so that two families with
-/// structurally identical terms can never collide, and the `label` is the
-/// stable wire prefix of the rendered identity value.
 pub trait IdentityFamily {
-    /// The stable prefix of this family, such as `v1` or `listing-id/v1`.
     fn label() -> &'static str;
 
-    /// The family label mixed into the digest input.
     fn namespace() -> &'static str;
 }
 
-/// A checked canonical identity type of one [`IdentityFamily`].
 pub trait IdentityKind: IdentityFamily + Sized {
-    /// Builds the identity from an identity value.
     fn from_identity(value: CanonicalId) -> Self;
 
-    /// Returns the identity value.
     fn identity(&self) -> &CanonicalId;
 }
 
-/// A type whose canonical terms determine an identity of one family.
 pub trait CanonicalIdentityTerms: CanonicalTerms + IdentityFamily {}
 
-/// The longest family label any identity renders under.
-///
-/// [`IDENTITY_VERSION`] is `v1` and [`VENUE_LISTING_IDENTITY_LABEL`] is
-/// `listing-id/v1`, the longest label this build states; the buffer an identity's
-/// text is rendered into is sized from these two constants rather than guessed.
 const IDENTITY_LABEL_MAX: usize = VENUE_LISTING_IDENTITY_LABEL.len();
 
-/// The rendered text buffer of one identity: `<label>/<64 lowercase hex>`.
 const IDENTITY_TEXT_CAPACITY: usize = IDENTITY_LABEL_MAX + 1 + IDENTITY_DIGEST_LENGTH;
 
-/// The rendered text of one identity, held on the stack.
-///
-/// An identity stores only its digest, so its text is rendered when someone asks
-/// for it. This type is that rendering: a fixed buffer plus the length that was
-/// filled, with no allocation and no heap block to free. It dereferences to
-/// `str`, so a caller reads it exactly like the string the identity used to store.
 pub struct IdentityText {
     buffer: [u8; IDENTITY_TEXT_CAPACITY],
     length: usize,
 }
 
 impl IdentityText {
-    /// Renders `<label>/<64 lowercase hex digits>` for one digest.
     #[doc(hidden)]
     pub fn render(label: &str, digest: Digest) -> Self {
         let mut buffer = [0_u8; IDENTITY_TEXT_CAPACITY];
@@ -117,7 +61,6 @@ impl IdentityText {
         Self { buffer, length: at }
     }
 
-    /// Returns the text as a string slice.
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.buffer[..self.length]).expect("an identity is ASCII")
     }
@@ -208,68 +151,48 @@ impl serde::Serialize for IdentityText {
     }
 }
 
-/// Appends primitives to a deterministic byte buffer.
-///
-/// Lengths are written as fixed width big-endian integers so that no two
-/// different term sequences can produce the same byte stream, every numeric
-/// term is written through its fixed-point or fixed-width representation rather
-/// than through `Display`, and enum labels are written as their fixed canonical
-/// spelling rather than as their `Debug` rendering.
 #[derive(Debug, Default)]
 pub struct CanonicalEncoder {
     bytes: BytesMut,
 }
 
 impl CanonicalEncoder {
-    /// Creates an encoder with room for a typical instrument term set.
     pub fn new() -> Self {
         Self {
             bytes: BytesMut::with_capacity(256),
         }
     }
 
-    /// Writes a fixed lowercase enum or field label.
     pub fn write_label(&mut self, label: &str) {
         self.write_bytes(label.as_bytes());
     }
 
-    /// Writes raw bytes with a length prefix.
     pub fn write_bytes(&mut self, value: &[u8]) {
         self.bytes
             .extend_from_slice(&(value.len() as u64).to_be_bytes());
         self.bytes.extend_from_slice(value);
     }
 
-    /// Writes a boolean as a single fixed byte.
     pub fn write_bool(&mut self, value: bool) {
         self.bytes.extend_from_slice(&[u8::from(value)]);
     }
 
-    /// Writes an unsigned integer as fixed width big-endian bytes.
     pub fn write_u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
-    /// Writes a signed integer as fixed width big-endian bytes.
     pub fn write_i64(&mut self, value: i64) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
-    /// Writes a fixed-point value through its 18-digit integer representation.
-    ///
-    /// The integer representation carries no trailing fractional zeroes, so it
-    /// is the unique canonical form of the decimal and never depends on a
-    /// `Display` implementation.
     pub fn write_u128(&mut self, value: u128) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
-    /// Writes a signed fixed-point value through its 18-digit representation.
     pub fn write_i128(&mut self, value: i128) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
-    /// Writes an optional value, encoding the presence with one fixed byte.
     pub fn write_optional<T>(&mut self, value: Option<&T>, write: impl FnOnce(&mut Self, &T)) {
         match value {
             Some(value) => {
@@ -280,16 +203,10 @@ impl CanonicalEncoder {
         }
     }
 
-    /// Encodes `value` by delegating to its canonical terms.
     pub fn write_terms<T: CanonicalTerms + ?Sized>(&mut self, value: &T) {
         value.encode(self);
     }
 
-    /// Encodes an already sorted, duplicate-free collection in canonical order.
-    ///
-    /// Callers own the ordering: term sets must be sorted by their validated
-    /// identity before they reach the encoder, so that the same economic terms
-    /// always produce the same digest.
     pub fn write_terms_slice<T: CanonicalTerms>(&mut self, values: &[T]) {
         self.write_u64(values.len() as u64);
         for value in values {
@@ -297,44 +214,33 @@ impl CanonicalEncoder {
         }
     }
 
-    /// Returns the encoded bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 }
 
-/// The lowercase hexadecimal SHA-256 digest of a canonical encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Digest([u8; 32]);
 
 impl Digest {
-    /// Hashes canonical terms into a full 32-byte SHA-256 digest.
     pub fn of_terms<T: CanonicalTerms + ?Sized>(terms: &T) -> Self {
         let mut encoder = CanonicalEncoder::new();
         terms.encode(&mut encoder);
         Self::of_bytes(encoder.as_bytes())
     }
 
-    /// Hashes raw canonical bytes into a full 32-byte SHA-256 digest.
     pub fn of_bytes(bytes: &[u8]) -> Self {
         Self(Sha256::digest(bytes).into())
     }
 
-    /// Returns the raw digest bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
-    /// Renders the digest as 64 lowercase hexadecimal digits.
     pub fn to_hex(self) -> SmolStr {
         format_smolstr!("{}", const_hex::encode(self.0))
     }
 
-    /// Writes the digest as 64 lowercase hexadecimal digits into `out`.
-    ///
-    /// The rendering a display code needs is a `&str` of exactly this length, and
-    /// a digest is the only thing an identity has to render: filling a buffer the
-    /// caller already owns keeps an identity's text off the heap.
     fn write_hex(self, out: &mut [u8; IDENTITY_DIGEST_LENGTH]) {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         for (index, byte) in self.0.iter().enumerate() {
@@ -344,48 +250,14 @@ impl Digest {
     }
 }
 
-/// A versioned canonical identity value such as `v1/<64 lowercase hex digits>`.
-///
-/// The digest is not invertible: an identity only ever carries the digest value,
-/// and the associated canonical terms always come from a registry that keeps the
-/// terms-to-identity association.
-///
-/// The value is stored as its **32 digest bytes**, not as its rendered text. The
-/// rendered form is 67 characters, which is past [`SmolStr`]'s 23-byte inline
-/// capacity, so storing text made every identity — and every independently
-/// constructed copy of one — a separate heap allocation. A catalogue of four
-/// venues holds over a hundred thousand identity references whose texts collapse
-/// to a few tens of thousands of distinct digests, and those copies were the
-/// largest cost of a loaded catalogue after the entries themselves. A digest is 32
-/// bytes of plain data, so the value is `Copy` and needs neither an allocation nor
-/// a reference count.
-///
-/// The family label is deliberately **not** part of this value: it is a property
-/// of the identity family, which the checked newtype of that family knows as a
-/// type-level fact. The value is therefore exactly its digest, and the text a
-/// caller sees is rendered by the newtype through [`identity_text`]. Keeping the
-/// label out saves the 16 bytes a `&'static str` would add to every identity in
-/// every structure.
-///
-/// The wire form is unchanged: the rendered text is the same
-/// `<label>/<64 lowercase hex>`, and the canonical encoding of a family's terms is
-/// byte-for-byte what it was, because the encoder is handed that same text.
-/// [`IDENTITY_VERSION`] therefore does not move, and no persisted identity stops
-/// decoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CanonicalId(Digest);
 
 impl CanonicalId {
-    /// Builds the identity of one family from a digest.
     pub const fn of_digest(digest: Digest) -> Self {
         Self(digest)
     }
 
-    /// Rehydrates an already published identity value of a family.
-    ///
-    /// Only the wire shape is checked; the digest is not invertible and the
-    /// associated canonical terms always come from a registry, never from an
-    /// identifier alone.
     pub fn identify(label: &'static str, value: &str) -> Result<Self, ModelError> {
         let invalid = || ModelError::InvalidIdentityValue {
             version: label,
@@ -395,8 +267,6 @@ impl CanonicalId {
             .strip_prefix(label)
             .and_then(|rest| rest.strip_prefix('/'))
             .ok_or_else(invalid)?;
-        // The canonical spelling is lowercase: a digest written in uppercase is not
-        // the value this build publishes, and `decode_to_slice` would accept it.
         if encoded.len() != IDENTITY_DIGEST_LENGTH || !encoded.bytes().all(is_lowercase_hex_digit) {
             return Err(invalid());
         }
@@ -405,7 +275,6 @@ impl CanonicalId {
         Ok(Self(Digest(digest)))
     }
 
-    /// Returns the digest bytes behind this identity.
     pub const fn digest(&self) -> &Digest {
         &self.0
     }
@@ -429,17 +298,6 @@ impl<'de> Deserialize<'de> for CanonicalId {
     }
 }
 
-/// Renders the digest of an encoder as an identity value of `family`.
-///
-/// This is the encoding entry point every canonical identity goes through, and
-/// it is where the frozen contract of [`IDENTITY_VERSION`] is applied: the
-/// family namespace is mixed in first so two families with structurally
-/// identical terms cannot collide, the terms are hashed as-is, and the result is
-/// rendered under the family's own stable label. Because the value is persisted,
-/// changing what this function encodes invalidates every identity already
-/// written; such a change must ship as a new identity version, and the persisted
-/// selections that no longer decode are reset to defaults and written back
-/// instead of being migrated.
 pub fn identity_from_encoder<F: IdentityFamily>(encoder: &CanonicalEncoder) -> CanonicalId {
     let mut prelude = CanonicalEncoder::new();
     prelude.write_label(F::namespace());
@@ -447,7 +305,6 @@ pub fn identity_from_encoder<F: IdentityFamily>(encoder: &CanonicalEncoder) -> C
     CanonicalId::of_digest(Digest::of_bytes(prelude.as_bytes()))
 }
 
-/// Renders the digest of canonical terms as an identity value of `family`.
 pub fn identity_from_terms<F: IdentityFamily, T: CanonicalTerms + ?Sized>(
     terms: &T,
 ) -> CanonicalId {
@@ -502,10 +359,6 @@ identity_family!(
     "venue-listing"
 );
 
-/// Builds the checked identity newtype of one [`IdentityFamily`].
-///
-/// The macro takes the calling module's visibility so the generated newtype is
-/// exactly as visible as the module declares it.
 #[macro_export]
 macro_rules! identity_type {
     ($name:ident, $family:ident) => {
@@ -514,16 +367,10 @@ macro_rules! identity_type {
         pub struct $name($crate::identifier::CanonicalId);
 
         impl $name {
-            /// Derives the identity from canonical terms of this family.
-            ///
-            /// Terms are the only identity input: display aliases, native
-            /// identifiers, routes, listings and mutable state never reach this
-            /// entry point.
             pub fn of_terms<T: $crate::identifier::CanonicalTerms + ?Sized>(terms: &T) -> Self {
                 Self($crate::identifier::identity_from_terms::<$family, T>(terms))
             }
 
-            /// Rehydrates an already published identity of this family.
             pub fn from_identity_value(value: &str) -> Result<Self, $crate::error::ModelError> {
                 Ok(Self($crate::identifier::CanonicalId::identify(
                     <$family as $crate::identifier::IdentityFamily>::label(),
@@ -531,12 +378,6 @@ macro_rules! identity_type {
                 )?))
             }
 
-            /// Returns the identity text, which is this family's label, a `/` and
-            /// the 64 lowercase hexadecimal digits of the digest.
-            ///
-            /// The text is rendered into a buffer this call owns on the stack and
-            /// returned as a borrow of it, so the identity itself stays 32 bytes
-            /// and nothing is allocated to answer with its spelling.
             pub fn as_str(&self) -> $crate::identifier::IdentityText {
                 $crate::identifier::IdentityText::render(
                     <$family as $crate::identifier::IdentityFamily>::label(),
@@ -631,15 +472,12 @@ fn is_uppercase_alphanumeric(value: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
-/// Validates an EVM-style contract address: `0x` and 40 hexadecimal digits.
 pub fn is_evm_address(value: &str) -> bool {
     value
         .strip_prefix("0x")
         .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-/// Validates a base58-encoded chain address as used by Solana and other non-EVM
-/// chains.
 pub fn is_base58_address(value: &str) -> bool {
     (32..=44).contains(&value.len())
         && value
@@ -647,18 +485,15 @@ pub fn is_base58_address(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() && !matches!(byte, b'0' | b'O' | b'I' | b'l'))
 }
 
-/// Validates an EVM checksum-agnostic address or a base58 chain address.
 pub fn is_chain_address(value: &str) -> bool {
     is_evm_address(value) || is_base58_address(value)
 }
 
-/// The issuing or routing namespace used by venue-issued token origins.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct IdentifierNamespace(SmolStr);
 
 impl IdentifierNamespace {
-    /// Validates a lowercase namespace such as `binance`.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         if !is_namespace_text(value) {
@@ -669,7 +504,6 @@ impl IdentifierNamespace {
         Ok(Self(SmolStr::new(value)))
     }
 
-    /// Returns the canonical namespace text.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -713,13 +547,11 @@ impl<'de> Deserialize<'de> for IdentifierNamespace {
     }
 }
 
-/// A non-empty protocol value such as a token code or a reference handle.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct IdentifierValue(SmolStr);
 
 impl IdentifierValue {
-    /// Validates a protocol value without whitespace or control characters.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         if value.is_empty() {
@@ -733,7 +565,6 @@ impl IdentifierValue {
         Ok(Self(SmolStr::new(value)))
     }
 
-    /// Returns the canonical value text.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -783,17 +614,11 @@ impl<'de> Deserialize<'de> for IdentifierValue {
     }
 }
 
-/// A symbol exactly as it appears in a market-participant protocol.
-///
-/// The type deliberately carries no venue-specific parsing rules: it only
-/// guarantees a non-empty value without whitespace or control characters.
-/// Display aliases never take part in canonical identity encoding.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct NativeSymbol(SmolStr);
 
 impl NativeSymbol {
-    /// Validates a protocol symbol.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         if value.is_empty() {
@@ -809,7 +634,6 @@ impl NativeSymbol {
         Ok(Self(SmolStr::new(value)))
     }
 
-    /// Returns the protocol spelling of the symbol.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -865,24 +689,6 @@ impl<'de> Deserialize<'de> for NativeSymbol {
     }
 }
 
-/// A venue this build carries an identity for.
-///
-/// The venue set is closed rather than a namespace: a venue is addressable
-/// because this build carries an adapter, a connection configuration and a
-/// catalogue for it, so a name outside this set is not a venue the program can
-/// be asked about at all. That is what lets a venue be *named* rather than
-/// merely identified — a name a reader sees is a fact about the venue, and a
-/// venue that is one closed value can be given the one display form every
-/// surface reads (see the interface layer, not this crate: the model has no
-/// language).
-///
-/// [`as_str`](Self::as_str) is the machine spelling and never a display form:
-/// it is what canonical identity digests, catalog source ids, route revisions
-/// and persisted keys are built from, so it stays the frozen canonical text
-/// whatever the interface shows. Variants are declared in canonical text order
-/// so the derived `Ord` is that same order — every `BTreeMap` keyed by a venue,
-/// and the persisted `venues` object of the settings file, keep the order they
-/// had when the identity was a string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum VenueId {
     #[serde(rename = "binance")]
@@ -898,21 +704,6 @@ pub enum VenueId {
 }
 
 impl VenueId {
-    /// Every venue this build carries an identity for, in canonical order.
-    ///
-    /// Nothing can make this array complete on its own: adding a variant forces an arm
-    /// in [`Self::as_str`] and in every match over a venue, but nothing forces a list
-    /// that enumerates venues to grow — this one, and the interface's own venue order
-    /// in the venue crate's definition table. Keep both in
-    /// step by hand — it is what the tables and loops that walk the venue set are built
-    /// from, and a venue left out of it disappears from those callers rather than
-    /// failing.
-    ///
-    /// An identity and a served market are the same set today: every venue carried here
-    /// is answered by the connector's definition table, so a caller that means "the
-    /// venues this build serves" reads either. The distinction the two sets could take
-    /// again is stated on that table, which is the one that would answer nothing for a
-    /// venue carried before its loader lands.
     pub const ALL: [Self; 5] = [
         Self::Binance,
         Self::Hyperliquid,
@@ -921,11 +712,6 @@ impl VenueId {
         Self::Polymarket,
     ];
 
-    /// Returns the canonical venue identity.
-    ///
-    /// The text is part of the wire schema: it is hashed into canonical identity
-    /// digests and written into persisted keys, so it is never a display form and
-    /// never changes with the language the interface is showing.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Binance => "binance",
@@ -936,7 +722,6 @@ impl VenueId {
         }
     }
 
-    /// Validates a canonical venue identity such as `binance`.
     pub fn from_name(value: &str) -> Result<Self, ModelError> {
         Self::ALL
             .into_iter()
@@ -953,17 +738,11 @@ impl fmt::Display for VenueId {
     }
 }
 
-/// A routing namespace inside a venue, such as `perp-dex/xyz`.
-///
-/// The value is only checked for its canonical representation. Whether the scope
-/// is registered is a runtime decision of the route registry; being able to
-/// decode a scope from configuration never grants permission to send requests.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct VenueScopeId(SmolStr);
 
 impl VenueScopeId {
-    /// Validates a lowercase scope made of `/`-separated canonical segments.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         let valid = !value.is_empty()
@@ -979,7 +758,6 @@ impl VenueScopeId {
         Ok(Self(SmolStr::new(value)))
     }
 
-    /// Returns the canonical scope.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -1021,13 +799,11 @@ impl<'de> Deserialize<'de> for VenueScopeId {
     }
 }
 
-/// A version label for a canonical reference terms schema.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ReferenceTermsVersion(SmolStr);
 
 impl ReferenceTermsVersion {
-    /// Validates a short printable version label such as `v1`.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         if value.is_empty() {
@@ -1043,7 +819,6 @@ impl ReferenceTermsVersion {
         Ok(Self(SmolStr::new(value)))
     }
 
-    /// Returns the version label.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -1255,13 +1030,8 @@ text_identifier!(ResolutionSourceId, "resolution source");
 text_identifier!(TradingCalendarId, "trading calendar");
 
 impl TradingCalendarId {
-    /// The explicit calendar of a venue that trades around the clock.
-    ///
-    /// Crypto and prediction listings must declare this calendar instead of
-    /// representing all-day trading as a missing session calendar.
     pub const CONTINUOUS_24X7: &'static str = "continuous-24x7";
 
-    /// Builds the explicit around-the-clock calendar identity.
     pub fn continuous_24x7() -> Self {
         Self(SmolStr::new_static(Self::CONTINUOUS_24X7))
     }
@@ -1296,17 +1066,11 @@ normalized_identifier!(CtfTokenId, "CTF token id", normalize_uint256, |value| {
     ModelError::InvalidCtfTokenId { value }
 });
 
-/// A chain identity used by on-chain token origins.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ChainId(SmolStr);
 
 impl ChainId {
-    /// Validates a canonical chain identity.
-    ///
-    /// Numeric EVM chain ids and lowercase named chains such as `solana` are
-    /// accepted. Wrapped, bridged and native assets stay distinct because the
-    /// chain identity is part of the canonical token terms.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         let numeric = !value.is_empty()
@@ -1322,7 +1086,6 @@ impl ChainId {
         })
     }
 
-    /// Returns the canonical chain identity.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -1364,13 +1127,11 @@ impl<'de> Deserialize<'de> for ChainId {
     }
 }
 
-/// A chain wallet address used by wallet monitoring.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct WalletAddress(SmolStr);
 
 impl WalletAddress {
-    /// Validates a chain wallet address.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         if is_chain_address(value) {
@@ -1381,7 +1142,6 @@ impl WalletAddress {
         })
     }
 
-    /// Returns the wallet address as published by the chain.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -1423,11 +1183,6 @@ impl<'de> Deserialize<'de> for WalletAddress {
     }
 }
 
-/// A validated IANA time-zone identifier.
-///
-/// The crate checks the canonical IANA syntax and rejects reserved names; the
-/// existence of the zone in a real time-zone database is validated by the
-/// catalog source that resolves a trading calendar.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct TimeZoneId(SmolStr);
@@ -1435,7 +1190,6 @@ pub struct TimeZoneId(SmolStr);
 const RESERVED_TIME_ZONE_PREFIXES: [&str; 4] = ["Etc/", "Factory", "localtime", "posix"];
 
 impl TimeZoneId {
-    /// Validates an IANA time-zone identifier such as `America/New_York` or `UTC`.
     pub fn new(value: impl AsRef<str>) -> Result<Self, ModelError> {
         let value = value.as_ref();
         let invalid = || ModelError::InvalidTimeZoneId {
@@ -1454,7 +1208,6 @@ impl TimeZoneId {
         Ok(Self(SmolStr::new(value)))
     }
 
-    /// Returns the canonical IANA identifier.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -1505,8 +1258,6 @@ impl<'de> Deserialize<'de> for TimeZoneId {
     }
 }
 
-/// Returns `true` when `value` is a lowercase hexadecimal digest of `length`
-/// digits, which is the only accepted persisted identity shape.
 pub fn is_lowercase_hex_digest(value: &str, length: usize) -> bool {
     value.len() == length && value.bytes().all(is_lowercase_hex_digit)
 }
@@ -1529,7 +1280,6 @@ mod tests {
     identity_type!(TestInstrumentId, InstrumentIdentity);
     identity_type!(TestVenueListingId, VenueListingIdentity);
 
-    /// The digest one fixed terms body produces, pinned against the encoder.
     const PINNED_ENCODER_DIGEST: &str =
         "v1/58ff05273e77d54f198ec94ff331c99e7bda1e0732aec5ac984630ec1103dbe4";
 
@@ -1550,10 +1300,6 @@ mod tests {
         }
     }
 
-    /// The encoder's byte stream is part of the wire schema, so the digest one fixed
-    /// terms body produces is pinned: equal terms built twice are one digest, a
-    /// different body is another, and the rendered identity is the full lowercase
-    /// SHA-256 of that stream under the `v1` namespace.
     #[test]
     fn canonical_encoder_should_be_deterministic_for_the_same_terms() {
         let terms = Terms {
@@ -1764,9 +1510,6 @@ mod tests {
         );
     }
 
-    /// The canonical text is the machine spelling, and the display form is that same text:
-    /// the model has no language, so naming a venue for a reader is the interface's rather
-    /// than an identity's.
     #[test]
     fn a_venue_reads_as_the_canonical_text_it_is_written_as() {
         for venue in VenueId::ALL {

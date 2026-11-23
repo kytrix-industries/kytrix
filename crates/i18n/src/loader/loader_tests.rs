@@ -94,8 +94,6 @@ fn quoted_scalars_keep_their_text() {
 
 #[test]
 fn node_visitor_is_reachable() {
-    // Guards the visitor against a deserializer that resolves typed scalars,
-    // which is what an untagged enum would have produced.
     let node: Node = serde_saphyr::from_str("42").expect("a scalar deserializes");
     assert!(matches!(node, Node::Unsupported));
 }

@@ -1,5 +1,3 @@
-//! The tests of the settings session at the page: a failure reported once, and a retry.
-
 use std::io;
 
 use app_config::settings::Appearance;
@@ -11,7 +9,6 @@ use crate::{
     settings_tests::test_support::Harness,
 };
 
-/// One store failure, written the way the store reports an unwritable directory.
 fn store_failure(reason: &'static str) -> SettingsWriteError {
     SettingsWriteError::new(ConfigPersistenceError::CreateDirectory {
         path: std::path::PathBuf::from("unwritable"),
@@ -19,7 +16,6 @@ fn store_failure(reason: &'static str) -> SettingsWriteError {
     })
 }
 
-/// A write that could not be stored can be made again once the store takes it.
 #[test]
 fn a_write_that_could_not_be_stored_should_be_stored_when_it_is_tried_again() {
     let mut harness = Harness::new();
@@ -45,7 +41,6 @@ fn a_write_that_could_not_be_stored_should_be_stored_when_it_is_tried_again() {
     assert_eq!(harness.config().appearance, Appearance::Dark);
 }
 
-/// A failure waiting to be reported is handed to whoever takes the page away, and only once.
 #[test]
 fn a_write_failure_waiting_to_be_reported_should_be_handed_to_whoever_leaves() {
     let mut harness = Harness::new();
@@ -74,7 +69,6 @@ fn a_write_failure_waiting_to_be_reported_should_be_handed_to_whoever_leaves() {
     );
 }
 
-/// The report the page opens names the reason in the language the interface is drawn in.
 #[test]
 fn the_failure_alert_should_name_the_reason_in_both_languages() {
     let mut harness = Harness::new();

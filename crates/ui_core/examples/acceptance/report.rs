@@ -1,16 +1,5 @@
-//! 验收报告的数据面：分位数、抖动、进程 CPU 采样与统一格式化。
-//!
-//! 只做统计与打印，不碰引擎状态（`headless` / `windowed` 两个模式共用）。
-//!
-//! 口径（写进报告，避免「数字对不上」）：
-//! - 分位数用 nearest-rank（`ceil(p·n)-1`），小样本下不插值；
-//! - 「帧间隔抖动」= 帧间隔相对**中位数**的 RMS 偏差（标准差口径），单帧尖刺会把它抬高；
-//! - 进程 CPU 是**累计 CPU 时间**（用户 + 内核），百分比按「占单核」给出（`ps %cpu` 同口径），
-//!   同时给出「占整机」的换算（除以逻辑核数），后者才是任务管理器口径。
-
 use std::time::{Duration, Instant};
 
-/// 一组时长样本（微秒）。容量预留在构造时给足，测量期不分配。
 #[derive(Clone)]
 pub struct Samples {
     label: String,
@@ -18,7 +7,6 @@ pub struct Samples {
 }
 
 impl Samples {
-    /// 建一个样本集（`capacity` 是预计帧数；避免测量期扩容干扰缓存）。
     #[must_use]
     pub fn new(label: impl Into<String>, capacity: usize) -> Self {
         Self {
@@ -27,30 +15,25 @@ impl Samples {
         }
     }
 
-    /// 追加一次测量。
     pub fn push(&mut self, duration: Duration) {
         self.values.push(duration.as_secs_f64() * 1e6);
     }
 
-    /// 样本数。
     #[must_use]
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
-    /// 原始样本（微秒）。
     #[must_use]
     pub fn values(&self) -> &[f64] {
         &self.values
     }
 
-    /// 统计摘要；空样本返回 `None`。
     #[must_use]
     pub fn summary(&self) -> Option<Summary> {
         Summary::of(&self.values)
     }
 
-    /// 一行报告（`label p50=… p95=… p99=… max=… mean=…`，单位毫秒）。
     #[must_use]
     pub fn line(&self) -> String {
         match self.summary() {
@@ -60,7 +43,6 @@ impl Samples {
     }
 }
 
-/// 一组微秒样本的摘要（毫秒显示，微秒精度保留在 `*_us` 字段）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Summary {
     pub count: usize,
@@ -74,7 +56,6 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// 从微秒样本计算（nearest-rank 分位数；`stddev` 是总体标准差）。
     #[must_use]
     pub fn of(values: &[f64]) -> Option<Self> {
         if values.is_empty() {
@@ -105,7 +86,6 @@ impl Summary {
         })
     }
 
-    /// 一行摘要（毫秒显示，三位小数）。
     #[must_use]
     pub fn line(&self) -> String {
         format!(
@@ -121,7 +101,6 @@ impl Summary {
     }
 }
 
-/// nearest-rank 分位数（`sorted` 已升序；`p ∈ (0, 1]`）。
 #[must_use]
 pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
@@ -130,19 +109,14 @@ pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[index]
 }
 
-/// 帧间隔分布（窗口模式）：间隔本身 + 抖动（相对中位数的 RMS 偏差）+ 等效 FPS。
 pub struct IntervalReport {
     pub intervals: Samples,
-    /// 相对中位数的 RMS 偏差（微秒）。
     pub jitter_us: f64,
-    /// 中位间隔换算的等效 FPS。
     pub fps: f64,
-    /// 间隔落在「中位数 ±1 ms」之外的帧数。
     pub outside_1ms: usize,
 }
 
 impl IntervalReport {
-    /// 由帧间隔样本计算。
     #[must_use]
     pub fn new(intervals: &Samples) -> Option<Self> {
         let summary = intervals.summary()?;
@@ -171,7 +145,6 @@ impl IntervalReport {
         })
     }
 
-    /// 多行报告。
     #[must_use]
     pub fn lines(&self) -> String {
         let summary = self.intervals.summary().unwrap_or(Summary {
@@ -204,23 +177,18 @@ impl IntervalReport {
     }
 }
 
-/// 逻辑核数（「占整机 CPU」的换算分母）。
 #[must_use]
 pub fn cores() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
-/// 一段空闲窗口的进程 CPU 采样结果。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IdleCpu {
-    /// 采样窗口（秒）。
     pub wall_secs: f64,
-    /// 窗口内消耗的 CPU 时间（秒，用户 + 内核，全部线程）。
     pub cpu_secs: f64,
 }
 
 impl IdleCpu {
-    /// 占**单核**的百分比（`ps %cpu` 同口径）。
     #[must_use]
     pub fn percent_of_core(&self) -> f64 {
         if self.wall_secs > 0.0 {
@@ -230,13 +198,11 @@ impl IdleCpu {
         }
     }
 
-    /// 占**整机**的百分比（任务管理器口径；分母是逻辑核数）。
     #[must_use]
     pub fn percent_of_machine(&self) -> f64 {
         self.percent_of_core() / cores() as f64
     }
 
-    /// 一行报告。
     #[must_use]
     pub fn line(&self) -> String {
         format!(
@@ -250,9 +216,6 @@ impl IdleCpu {
     }
 }
 
-/// 让当前进程在 `duration` 内保持运行并测量累计 CPU 时间。
-///
-/// **阻塞**：调用方应放在后台线程里（窗口模式的空闲测量）。
 #[must_use]
 pub fn sample_idle_cpu(duration: Duration) -> Option<IdleCpu> {
     let before = process_cpu_seconds()?;
@@ -266,7 +229,6 @@ pub fn sample_idle_cpu(duration: Duration) -> Option<IdleCpu> {
     })
 }
 
-/// 当前进程的累计 CPU 时间（秒，用户 + 内核，含全部线程）。
 #[cfg(windows)]
 #[must_use]
 pub fn process_cpu_seconds() -> Option<f64> {
@@ -279,7 +241,6 @@ pub fn process_cpu_seconds() -> Option<f64> {
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    // SAFETY: 四个输出指针都指向本栈帧上的 `FILETIME`；`GetCurrentProcess` 是伪句柄。
     unsafe {
         GetProcessTimes(
             GetCurrentProcess(),
@@ -293,33 +254,23 @@ pub fn process_cpu_seconds() -> Option<f64> {
     Some(filetime_seconds(&kernel) + filetime_seconds(&user))
 }
 
-/// `FILETIME`（100 ns 为单位）→ 秒。
 #[cfg(windows)]
 fn filetime_seconds(time: &windows::Win32::Foundation::FILETIME) -> f64 {
     let ticks = (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
     ticks as f64 / 1e7
 }
 
-/// 当前进程的累计 CPU 时间（秒）。
-///
-/// `/proc/self/stat` 的 `utime`/`stime` 以 `USER_HZ`（内核固定 100，x86_64 / aarch64 同值）为单位；
-/// 这两个字段是 14/15 号字段，`comm` 里可能有空格与 `)`，因此从最后一个 `)` 之后开始数。
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn process_cpu_seconds() -> Option<f64> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     let tail = &stat[stat.rfind(')')? + 1..];
     let fields: Vec<&str> = tail.split_whitespace().collect();
-    // fields[0] = state（3 号字段）⇒ utime 是 14 号 = fields[11]，stime 是 15 号 = fields[12]。
     let utime: u64 = fields.get(11)?.parse().ok()?;
     let stime: u64 = fields.get(12)?.parse().ok()?;
     Some((utime + stime) as f64 / 100.0)
 }
 
-/// 当前进程的累计 CPU 时间（秒）。
-///
-/// macOS 没有 `/proc`，也没有可用的 std 接口读 `getrusage`（引擎不引入 `libc`）：用 `ps -o time=`
-/// 的累计时间列（格式 `MM:SS.ss` / `HH:MM:SS`）。只在空闲测量里调用（不在帧循环里）。
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn process_cpu_seconds() -> Option<f64> {
@@ -334,7 +285,6 @@ pub fn process_cpu_seconds() -> Option<f64> {
     parse_ps_time(text.trim())
 }
 
-/// `ps -o time=` 的时间格式：`[HH:]MM:SS[.cc]`（也可能是 `MM:SS`）。
 #[cfg(target_os = "macos")]
 #[must_use]
 fn parse_ps_time(text: &str) -> Option<f64> {
@@ -367,7 +317,6 @@ mod tests {
         assert_eq!(percentile(&values, 0.50), 2.0);
         assert_eq!(percentile(&values, 0.75), 3.0);
         assert_eq!(percentile(&values, 1.0), 4.0);
-        // 小样本下 p99 必须仍落在最大值上，不能越界。
         assert_eq!(percentile(&values, 0.99), 4.0);
     }
 
@@ -395,7 +344,6 @@ mod tests {
             intervals.push_us(micros);
         }
         let report = IntervalReport::new(intervals).expect("间隔报告");
-        // 中位数 16,667；偏差 = -667 / 0 / +333 / -167 / +1333。
         let expected = ((-667.0f64).powi(2)
             + 0.0
             + 333.0f64.powi(2)

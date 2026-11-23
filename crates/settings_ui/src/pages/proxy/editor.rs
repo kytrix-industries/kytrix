@@ -1,21 +1,3 @@
-//! The form that adds a proxy to the catalog or changes one already in it.
-//!
-//! The form is a kit dialog the server-management page owns: it is drawn over the settings on the
-//! window layer, and it holds nothing but a draft of one entry. What it holds is not written to
-//! the settings until the user confirms, so a cancelled form leaves the catalog exactly as it
-//! was. Confirming writes the entry as one change: an added entry is added, and an edited one is
-//! replaced together with every route bound to its name. A form whose entry cannot be stored
-//! stays open with what the user typed, and the settings page reports why; a rejected form
-//! reports every problem at once rather than one field at a time.
-//!
-//! The name is the one field an edit may change, and renaming moves every route bound to the old
-//! one: the catalog and its references are one value, so they are changed together.
-//!
-//! The form is built when it is opened and released when it is closed. Its content is a kit
-//! dialog body (fields, two selects and a footer of its own), so the cancel and confirm buttons
-//! are the form's, not the dialog builder's: a rejected submission must leave the form open, and
-//! the builder's own confirm button closes before its callback runs.
-
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use app_config::{
@@ -52,56 +34,38 @@ use ui_core::{
 
 use crate::{host::SettingsHost, layout, session::SettingsChange};
 
-/// How wide the form is drawn.
 const FORM_WIDTH: f32 = 480.0;
 
-/// The size of a field's label.
 const LABEL_SIZE: f32 = 13.0;
 
-/// The size of the line a field's problem is drawn on.
 const ERROR_SIZE: f32 = 11.0;
 
-/// The height that line keeps, whether or not it says anything, so a form that is rejected does
-/// not move everything below the field it complains about.
 const ERROR_LINE_HEIGHT: f32 = 16.0;
 
-/// The first port a user can choose, and the last.
 const MIN_PORT: u16 = 1;
 const MAX_PORT: u16 = u16::MAX;
 
-/// What the form of a new entry is drawn under, which is what a test reads its bounds by.
 pub(crate) const ADD_SELECTOR: &str = "SETTINGS_PROXY_ADD";
 
-/// What the form of a stored entry is drawn under.
 pub(crate) const EDIT_SELECTOR: &str = "SETTINGS_PROXY_EDIT";
 
-/// What the button that records the entry is drawn under.
 pub(crate) const CONFIRM_SELECTOR: &str = "SETTINGS_PROXY_CONFIRM";
 
-/// What the button that leaves the entry alone is drawn under.
 pub(crate) const CANCEL_SELECTOR: &str = "SETTINGS_PROXY_CANCEL";
 
-/// What the row the form ends in is drawn under: the line across it and the two buttons under
-/// that line, which is where the form says what it does rather than what it holds.
 pub(crate) const FOOTER_SELECTOR: &str = "SETTINGS_PROXY_FOOTER";
 
-/// What the control the entry's authorization is chosen in is drawn under.
 pub(crate) const AUTHORIZATION_SELECTOR: &str = "SETTINGS_PROXY_AUTHORIZATION";
 
-/// What the control the entry's DNS mode is chosen in is drawn under.
 pub(crate) const DNS_MODE_SELECTOR: &str = "SETTINGS_PROXY_DNS_MODE";
 
-/// How the form was opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProxyFormKind {
-    /// Add a new entry.
     Add,
-    /// Change the entry currently stored under `original`, which the name may move.
     Edit { original: SmolStr },
 }
 
 impl ProxyFormKind {
-    /// The title the form is drawn with.
     fn title_key(&self) -> &'static str {
         match self {
             Self::Add => "settings_ui.proxies.add",
@@ -109,7 +73,6 @@ impl ProxyFormKind {
         }
     }
 
-    /// The selector the form is drawn under.
     fn selector(&self) -> &'static str {
         match self {
             Self::Add => ADD_SELECTOR,
@@ -118,7 +81,6 @@ impl ProxyFormKind {
     }
 }
 
-/// One catalog entry as an add or edit form holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProxyDraft {
     name: SmolStr,
@@ -131,10 +93,6 @@ struct ProxyDraft {
 }
 
 impl ProxyDraft {
-    /// The form that adds a new entry.
-    ///
-    /// What it starts from is what a user who touches nothing records, so a new entry resolves
-    /// names here: the mode that asks nothing of the proxy is the one to opt out of.
     fn empty() -> Self {
         Self {
             name: SmolStr::default(),
@@ -147,7 +105,6 @@ impl ProxyDraft {
         }
     }
 
-    /// The form that edits an existing entry, including the name it is stored under.
     fn from_proxy(name: &SmolStr, proxy: &ProxyConfig) -> Self {
         let (username, password, authenticated) = match &proxy.authorization {
             ProxyAuthorizationConfig::None => (SmolStr::default(), SmolStr::default(), false),
@@ -167,7 +124,6 @@ impl ProxyDraft {
         }
     }
 
-    /// The text one field of the form holds.
     fn text(&self, field: Field) -> &SmolStr {
         match field {
             Field::Name => &self.name,
@@ -178,7 +134,6 @@ impl ProxyDraft {
         }
     }
 
-    /// Takes the text of one field from the form.
     fn set_text(&mut self, field: Field, value: SmolStr) {
         match field {
             Field::Name => self.name = value,
@@ -190,7 +145,6 @@ impl ProxyDraft {
     }
 }
 
-/// Whether the form asks for credentials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Authorization {
     None,
@@ -200,7 +154,6 @@ enum Authorization {
 impl Authorization {
     const ALL: [Self; 2] = [Self::None, Self::UsernameAndPassword];
 
-    /// The label the control offers this choice under.
     const fn label_key(self) -> &'static str {
         match self {
             Self::None => "settings_ui.proxies.no_authorization",
@@ -208,7 +161,6 @@ impl Authorization {
         }
     }
 
-    /// The identity the control selects and reports this choice by.
     const fn id(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -216,7 +168,6 @@ impl Authorization {
         }
     }
 
-    /// The choice one control identity names.
     fn of_id(id: &str) -> Self {
         match id {
             "username-password" => Self::UsernameAndPassword,
@@ -224,7 +175,6 @@ impl Authorization {
         }
     }
 
-    /// The choice a draft's flag is.
     fn of_draft(authenticated: bool) -> Self {
         if authenticated {
             Self::UsernameAndPassword
@@ -234,24 +184,15 @@ impl Authorization {
     }
 }
 
-/// Which side of a proxy connection resolves the names it is made to.
-///
-/// An entry stores this as one flag, so the two modes are the two readings of it: a name resolved
-/// here is one the proxy is handed the address of, and a name resolved there is one the proxy
-/// looks up itself. The form and the catalog both read an entry through this, so the mode a row
-/// is listed under is the mode the form that wrote it showed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DnsMode {
-    /// This machine resolves the names, and the proxy is handed addresses.
     Local,
-    /// The proxy resolves the names.
     Proxy,
 }
 
 impl DnsMode {
     pub(crate) const ALL: [Self; 2] = [Self::Local, Self::Proxy];
 
-    /// The label the control offers this mode under, and the catalog lists a row by.
     pub(crate) const fn label_key(self) -> &'static str {
         match self {
             Self::Local => "settings_ui.proxies.dns_mode_local",
@@ -259,7 +200,6 @@ impl DnsMode {
         }
     }
 
-    /// The mode one stored entry is in.
     pub(crate) fn of(resolve_dns_at_remote: bool) -> Self {
         if resolve_dns_at_remote {
             Self::Proxy
@@ -268,12 +208,10 @@ impl DnsMode {
         }
     }
 
-    /// The flag one mode is stored as.
     const fn resolve_dns_at_remote(self) -> bool {
         matches!(self, Self::Proxy)
     }
 
-    /// The identity the control selects and reports this mode by.
     const fn id(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -281,7 +219,6 @@ impl DnsMode {
         }
     }
 
-    /// The mode one control identity names.
     fn of_id(id: &str) -> Self {
         match id {
             "proxy" => Self::Proxy,
@@ -290,7 +227,6 @@ impl DnsMode {
     }
 }
 
-/// Every problem the form found with one submission.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct FormErrors {
     name: Option<&'static str>,
@@ -301,7 +237,6 @@ struct FormErrors {
 }
 
 impl FormErrors {
-    /// Whether the submission had any problem at all.
     fn any(&self) -> bool {
         self.name.is_some()
             || self.addr.is_some()
@@ -310,7 +245,6 @@ impl FormErrors {
             || self.password.is_some()
     }
 
-    /// The problem one field was rejected with, as the message key it is drawn by.
     fn of(&self, field: Field) -> Option<&'static str> {
         match field {
             Field::Name => self.name,
@@ -322,7 +256,6 @@ impl FormErrors {
     }
 }
 
-/// One editable field of the form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Field {
     Name,
@@ -341,7 +274,6 @@ impl Field {
         Self::Password,
     ];
 
-    /// Where the field sits in the form's arrays.
     const fn index(self) -> usize {
         match self {
             Self::Name => 0,
@@ -352,7 +284,6 @@ impl Field {
         }
     }
 
-    /// How the field's wrapper node is drawn under, which is what a test reads its bounds by.
     const fn id(self) -> &'static str {
         match self {
             Self::Name => "name",
@@ -363,7 +294,6 @@ impl Field {
         }
     }
 
-    /// The message key the field is labelled with.
     const fn label_key(self) -> &'static str {
         match self {
             Self::Name => "settings_ui.proxies.name",
@@ -375,12 +305,6 @@ impl Field {
     }
 }
 
-/// What every field of one submission says, or every problem with it.
-///
-/// A reserved name is rejected because the routing values are stored as names a user could
-/// otherwise type: `@direct` typed into the catalog would be a proxy that can never be chosen,
-/// resolved, or removed. The address is normalized the way the catalog stores it, so confirming
-/// a form records the entry the settings would have normalized anyway.
 fn validate(
     draft: &ProxyDraft,
     kind: &ProxyFormKind,
@@ -452,23 +376,17 @@ fn validate(
     ))
 }
 
-/// The controls one open form built, kept so a frame can drive and release them.
 struct FormControls {
-    /// The five text fields, in [`Field::ALL`] order.
     inputs: Vec<InputNode>,
     authorization: Option<Select>,
     dns_mode: Option<Select>,
     confirm: Option<Button>,
     cancel: Option<Button>,
-    /// The line under each field that says what is wrong with it.
     errors: [Signal<SmolStr>; 5],
-    /// Whether the form asks for credentials, which is what the two credential fields are drawn
-    /// by.
     authenticated: Signal<bool>,
 }
 
 impl FormControls {
-    /// Mints the state the form reads and writes across frames.
     fn new(app: &mut App, scope: SignalScope, authenticated: bool) -> Self {
         Self {
             inputs: Vec::with_capacity(Field::ALL.len()),
@@ -482,24 +400,15 @@ impl FormControls {
     }
 }
 
-/// One proxy form: the dialog it is drawn in and the state it holds until it is confirmed.
 pub(crate) struct ProxyEditor {
     dialog: Dialog,
     draft: Rc<RefCell<ProxyDraft>>,
     controls: Rc<RefCell<FormControls>>,
-    /// The dialog's own handle, which its footer buttons close it through: the content is built
-    /// inside the dialog and the buttons are built before the handle exists.
     handle: Rc<RefCell<Option<Dialog>>>,
-    /// The signal scope every value of the form belongs to, released with it so a form opened
-    /// and closed repeatedly does not grow the engine's value slots.
     scope: SignalScope,
 }
 
 impl ProxyEditor {
-    /// Opens the form that adds an entry.
-    ///
-    /// # Errors
-    /// The dialog could not be drawn (the window is gone, or a node could not be built).
     pub(crate) fn add(
         app: &mut App,
         host: &SettingsHost,
@@ -516,13 +425,6 @@ impl ProxyEditor {
         )
     }
 
-    /// Opens the form that changes one entry, started from what the catalog holds now.
-    ///
-    /// Returns nothing when the entry is no longer in the catalog: a form opened from a row is
-    /// always started from what the settings hold, so a row that outlived its entry opens none.
-    ///
-    /// # Errors
-    /// The dialog could not be drawn.
     pub(crate) fn edit(
         app: &mut App,
         host: &SettingsHost,
@@ -618,11 +520,6 @@ impl ProxyEditor {
         })
     }
 
-    /// Drives the form for one frame: the dialog first (a closed form is not drawn), then the
-    /// draft the fields now hold and the controls that draw it.
-    ///
-    /// # Errors
-    /// A kit component refused a write (a node the form built is gone).
     pub(crate) fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         if let Err(error) = self.dialog.sync(app) {
             log::warn!("syncing the proxy form failed: {error}");
@@ -652,8 +549,6 @@ impl ProxyEditor {
         Ok(())
     }
 
-    /// Takes what every field holds into the draft, and drops the errors of a field the user has
-    /// changed since the form was rejected.
     fn follow_fields(&self, app: &mut App) {
         let errors = self.controls.borrow().errors;
         let mut draft = self.draft.borrow_mut();
@@ -669,12 +564,10 @@ impl ProxyEditor {
         }
     }
 
-    /// Whether the form is still drawn.
     pub(crate) fn is_open(&self, app: &App) -> bool {
         self.dialog.is_open(app)
     }
 
-    /// Offers one platform event to the form's controls.
     pub(crate) fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
         let controls = self.controls.borrow();
         let mut consumed = false;
@@ -690,7 +583,6 @@ impl ProxyEditor {
         consumed
     }
 
-    /// Releases every kit component the form built and the dialog it was drawn in.
     pub(crate) fn release(self, app: &mut App) {
         {
             let mut controls = self.controls.borrow_mut();
@@ -716,7 +608,6 @@ impl ProxyEditor {
     }
 }
 
-/// The values one open form is built from.
 struct FormBuild<'a> {
     host: &'a SettingsHost,
     theme: &'a ThemeHandle,
@@ -731,7 +622,6 @@ struct FormBuild<'a> {
 }
 
 impl FormBuild<'_> {
-    /// Builds the form into the dialog's body.
     fn build(&self, app: &mut App, body: NodeId) -> Result<(), EngineError> {
         let form = layout_box(
             app,
@@ -766,7 +656,6 @@ impl FormBuild<'_> {
         Ok(())
     }
 
-    /// Builds one labelled text field with the line its problem is drawn on.
     fn field(
         &self,
         app: &mut App,
@@ -848,7 +737,6 @@ impl FormBuild<'_> {
         Ok(input)
     }
 
-    /// Builds the row the entry's authentication is chosen in.
     fn authorization_select(
         &self,
         app: &mut App,
@@ -897,7 +785,6 @@ impl FormBuild<'_> {
         Ok(select)
     }
 
-    /// Builds the row the entry's DNS mode is chosen in.
     fn dns_mode_select(
         &self,
         app: &mut App,
@@ -935,8 +822,6 @@ impl FormBuild<'_> {
         Ok(select)
     }
 
-    /// Builds one row that is chosen from a control: what the choice is called, and the control
-    /// it is made in.
     fn choice_row(
         &self,
         app: &mut App,
@@ -972,7 +857,6 @@ impl FormBuild<'_> {
         Ok(())
     }
 
-    /// Builds the foot of the form: a line across it, and the two buttons under that line.
     fn footer(&self, app: &mut App, parent: NodeId) -> Result<(), EngineError> {
         let footer = layout_box(
             app,
@@ -1070,11 +954,6 @@ impl FormBuild<'_> {
     }
 }
 
-/// Records what the form holds, or reports every problem with it.
-///
-/// An entry that was stored takes the form away, which uncovers the settings it was opened over.
-/// One that could not be stored leaves the form open with what the user typed: the settings page
-/// reports the reason, and the form is where the entry is submitted again from.
 fn confirm(
     app: &mut App,
     host: &SettingsHost,
@@ -1127,12 +1006,9 @@ fn confirm(
     {
         dialog.close(app);
     }
-    // The reason a write could not be stored is the settings page's to report, and the form
-    // stays where the user can submit it again.
     let _ = app.request_repaint(window);
 }
 
-/// Builds one box node under `parent` with a debug id and the style it is drawn with.
 fn layout_box(
     app: &mut App,
     window: WindowId,
@@ -1146,8 +1022,6 @@ fn layout_box(
     })
 }
 
-/// Builds one box node under `parent` with a debug id, a style and, when it has one, the
-/// visibility it follows.
 fn layout_builder(
     app: &mut App,
     window: WindowId,
@@ -1191,8 +1065,6 @@ mod tests {
         }
     }
 
-    /// A draft is the form's copy of one entry: the name it is stored under and the values the
-    /// form edits, so confirming it can write the entry the user saw.
     #[test]
     fn a_draft_should_hold_the_entry_the_form_edits() {
         let draft = ProxyDraft::from_proxy(&SmolStr::new_static("hk"), &proxy());
@@ -1206,10 +1078,6 @@ mod tests {
         assert!(!draft.resolve_dns_at_remote);
     }
 
-    /// A mode is one reading of the flag an entry stores, and the choice a form reports is one of
-    /// the choices it offered: a mode and its stored flag that disagreed would record the
-    /// opposite of what the form showed, and an identity that did not come back would leave the
-    /// control holding nothing.
     #[test]
     fn every_dns_mode_should_be_the_flag_it_is_stored_as() {
         for mode in DnsMode::ALL {
@@ -1240,7 +1108,6 @@ mod tests {
         );
     }
 
-    /// Every authorization choice round travels the identity the control reports.
     #[test]
     fn every_authorization_should_be_the_choice_it_is_reported_as() {
         for choice in Authorization::ALL {
@@ -1253,7 +1120,6 @@ mod tests {
         assert_eq!(Authorization::of_draft(false), Authorization::None);
     }
 
-    /// A form with nothing in it is rejected field by field, and nothing is written.
     #[test]
     fn a_form_with_nothing_in_it_should_report_every_required_field() {
         let config = Config::default();
@@ -1266,8 +1132,6 @@ mod tests {
         assert_eq!(errors.port, Some("settings_ui.proxies.invalid_port"));
     }
 
-    /// A name the routing writes as a token is not an entry a user may add, and one already in
-    /// the catalog is not one either — except the name the edited entry already has.
     #[test]
     fn a_name_should_be_new_and_not_a_routing_token() {
         let mut config = Config::default();
@@ -1302,7 +1166,6 @@ mod tests {
         );
     }
 
-    /// Credentials are required exactly while the form asks for them.
     #[test]
     fn credentials_should_be_required_only_while_the_form_asks_for_them() {
         let config = Config::default();
@@ -1329,7 +1192,6 @@ mod tests {
         );
     }
 
-    /// A confirmed entry is trimmed and its address normalized, which is what the catalog holds.
     #[test]
     fn a_confirmed_entry_should_be_normalized_the_way_the_catalog_stores_it() {
         let config = Config::default();
@@ -1347,8 +1209,6 @@ mod tests {
         assert_eq!(proxy.authorization, ProxyAuthorizationConfig::None);
     }
 
-    /// The port is a number the settings can store, which is the whole of a `u16` beside the
-    /// zero no port is chosen as.
     #[test]
     fn a_port_should_be_an_integer_from_one_to_the_largest_port() {
         let config = Config::default();
@@ -1376,8 +1236,6 @@ mod tests {
         }
     }
 
-    /// The draft's text is addressed by the field that holds it, which is what the form and the
-    /// confirmation share.
     #[test]
     fn every_field_should_be_read_and_written_through_its_index() {
         let mut draft = ProxyDraft::empty();

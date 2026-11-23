@@ -1,5 +1,3 @@
-//! The pages that are drawn as native setting rows.
-
 mod about;
 mod appearance;
 mod configure;

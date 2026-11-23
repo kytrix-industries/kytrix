@@ -1,9 +1,3 @@
-//! The catalog source registry: candidate updates and route bindings.
-//!
-//! A whole candidate update is accepted or refused as one: a route that provides
-//! a catalog must bind exactly one registered source, a route without one must
-//! bind none, and a route that is absent from the update is revoked.
-
 use market_participants_model::{
     error::ModelError,
     identifier::NativeSymbol,
@@ -420,7 +414,6 @@ fn a_source_binding_carries_its_id() {
     assert!(format!("{binding:?}").contains(SPOT_SOURCE));
 }
 
-/// One route registration built from an explicit rule set.
 fn registered(normalization: Vec<IdentifierNormalizationRule>) -> RouteRegistration {
     RouteRegistration {
         normalization,
@@ -429,7 +422,6 @@ fn registered(normalization: Vec<IdentifierNormalizationRule>) -> RouteRegistrat
     }
 }
 
-/// A rule at one identifier and product granularity.
 fn rule(
     identifier: ListingIdentifierKind,
     product: Option<IdentifierNormalizationProduct>,
@@ -438,9 +430,6 @@ fn rule(
     IdentifierNormalizationRule::new(identifier, product, mode)
 }
 
-/// A product-qualified rule is the one a lookup at that product resolves, and a
-/// lookup at a product the route never declared falls back to the route-wide
-/// rule — the precedence the model documents.
 #[test]
 fn a_product_rule_wins_and_a_route_wide_rule_is_the_fallback() {
     let registration = registered(vec![
@@ -485,8 +474,6 @@ fn a_product_rule_wins_and_a_route_wide_rule_is_the_fallback() {
     );
 }
 
-/// A product that does not belong to the identifier kind is reported instead of
-/// being answered with another product's mode.
 #[test]
 fn a_product_of_another_identifier_family_is_a_normalization_mismatch() {
     let registration = registered(vec![rule(
@@ -510,9 +497,6 @@ fn a_product_of_another_identifier_family_is_a_normalization_mismatch() {
     );
 }
 
-/// The bare kind-only lookup folds under the product the route declared for that
-/// kind, so a product-qualified declaration is not a dead rule; and the typed
-/// identifier lookup folds under the product the variant itself carries.
 #[test]
 fn the_symbol_kind_is_folded_under_the_product_its_route_declared() {
     let registration = registered(vec![
@@ -557,9 +541,6 @@ fn the_symbol_kind_is_folded_under_the_product_its_route_declared() {
     );
 }
 
-/// A Hyperliquid asset is indexed by the product its own variant names: a HIP-3
-/// perpetual is exact, and a spot asset the route declared no rule for is exact
-/// too rather than another product's fold.
 #[test]
 fn a_hyperliquid_asset_is_normalized_at_its_own_product() {
     let registration = registered(vec![rule(
@@ -596,8 +577,6 @@ fn a_hyperliquid_asset_is_normalized_at_its_own_product() {
     );
 }
 
-/// A route that declared two products for one kind has no single product of its
-/// own, so the bare lookup answers the route-wide rule instead of one of them.
 #[test]
 fn an_ambiguous_kind_answers_the_route_wide_rule() {
     let registration = registered(vec![
@@ -628,8 +607,6 @@ fn an_ambiguous_kind_answers_the_route_wide_rule() {
     );
 }
 
-/// The OKX instruments a route declares are folded under the instrument type its
-/// own variant names.
 #[test]
 fn an_okx_instrument_is_folded_under_its_own_instrument_type() {
     let registration = registered(vec![

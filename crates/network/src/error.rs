@@ -1,11 +1,8 @@
-//! Errors produced by generic network, proxy, and transport operations.
-
 use smol_str::SmolStr;
 use thiserror::Error;
 
 use crate::transport::error::UpgradeFailure;
 
-/// Typed failures that do not depend on any market participant or trading capability domain.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum NetworkError {
     #[error("DNS resolution failed for {host}")]

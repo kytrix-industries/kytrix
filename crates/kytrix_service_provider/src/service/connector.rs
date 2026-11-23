@@ -85,7 +85,6 @@ use crate::{
     },
 };
 
-/// A cloneable handle to the single Kytrix service connection actor.
 #[derive(Clone)]
 pub struct KytrixServiceConnector {
     inner: Arc<KytrixServiceConnectorInner>,
@@ -492,9 +491,6 @@ impl KytrixAccountSession {
             return XMutationOutcome::Unknown(XMutationUnknown::InvalidResponse);
         };
         match x::decode_x_selection(selection) {
-            // A profile is what the service sends once the account is active, so an answer
-            // without one is the row a first-ever add gets back rather than a wrong account:
-            // the username is only there to check against when the row carries a profile.
             Ok(selection)
                 if selection
                     .profile
@@ -595,17 +591,6 @@ impl KytrixServiceConnector {
         )
     }
 
-    /// Connects the application to the Kytrix service.
-    ///
-    /// This is the production entry point: it creates the auth session (D1) and starts
-    /// the supervisor over the runtime it is handed. The caller owns the configuration
-    /// notification and republishes the network projection after every settings commit
-    /// ([`ConfigNotification::publish`]); the connector's forwarding task is that
-    /// notification's single waiter.
-    ///
-    /// # Errors
-    ///
-    /// The auth session (its actor thread) could not be started.
     pub fn spawn(
         runtime: Handle,
         config: ConfigNotification<Config>,
@@ -622,12 +607,6 @@ impl KytrixServiceConnector {
         ))
     }
 
-    /// Connects the application over the signed-out in-memory test session.
-    ///
-    /// `AuthSession::for_test_signed_out` builds a session whose credential store is empty
-    /// and in memory and whose authority is a fake, so spawning it touches no keyring
-    /// entry, performs no startup refresh, and sends no account request. The connector
-    /// then serves the signed-out status a UI test reads.
     #[cfg(feature = "test-support")]
     pub fn spawn_signed_out(
         runtime: Handle,
@@ -735,7 +714,6 @@ impl KytrixServiceConnector {
         }
     }
 
-    /// Gracefully stops all shared Kytrix service sessions.
     pub async fn shutdown(&self) {
         self.shutdown_with_timeout(SHUTDOWN_TIMEOUT).await;
     }
@@ -772,13 +750,6 @@ impl KytrixServiceConnector {
         self.inner().session_state.subscribe()
     }
 
-    /// Returns a read-only view of the network projection this connector routes with.
-    ///
-    /// The clone observes the same owner state. A caller may read
-    /// [`ConfigNotification::current`] at request time, but must never
-    /// [`ConfigNotification::wait`]: this connector's own forwarding task is the
-    /// single waiter, and a second one would consume the publication that task
-    /// needs to reconfigure the sessions.
     pub fn network_notification(&self) -> ConfigNotification<Config> {
         self.inner().config.clone()
     }
@@ -787,7 +758,6 @@ impl KytrixServiceConnector {
         self.inner().auth.session_changes()
     }
 
-    /// Inspects the local credential record without contacting the OAuth authority.
     pub async fn local_account_session_status(&self) -> Result<LocalSessionStatus, AuthError> {
         let _operation = self
             .inner()
@@ -797,8 +767,6 @@ impl KytrixServiceConnector {
         self.inner().auth.local_session_status().await
     }
 
-    /// Returns the plan cached in the active account session without loading credentials or
-    /// contacting the OAuth authority.
     pub async fn current_account_plan(
         &self,
         expected_user_id: &str,
@@ -811,10 +779,6 @@ impl KytrixServiceConnector {
         self.inner().auth.current_plan(expected_user_id).await
     }
 
-    /// Creates a one-time code that signs this account into the web dashboard.
-    ///
-    /// The request goes to the API host the access token was issued for, carrying the
-    /// same DPoP proof every other authenticated call carries.
     pub async fn create_account_dashboard_handoff(&self) -> Result<String, AuthError> {
         let _operation = self
             .inner()
@@ -869,23 +833,10 @@ impl KytrixServiceConnector {
             .await
     }
 
-    /// Ends the account session held on this machine and removes the credential.
-    ///
-    /// Synchronous on purpose: signing out is not a request to the service, and a
-    /// sign-out that waited for the network — or for whatever the account session is in
-    /// the middle of — would be one that can fail. What comes back is what
-    /// [`Self::revoke_account_session`] needs to report it, when there is anything to
-    /// report.
     pub fn discard_account_session(&self) -> Option<Revocation> {
         self.inner().auth.discard_local_session().into_revocation()
     }
 
-    /// Tells the account authority to drop the refresh token of a finished sign-out.
-    ///
-    /// This is a report, not a step: the session is already gone, and the caller is
-    /// expected to discard the result. It is still a request to the account service, so it
-    /// has to be driven by a runtime that can make one — an executor without a reactor
-    /// panics inside the request instead of sending it.
     pub async fn revoke_account_session(&self, revocation: Revocation) {
         self.inner().auth.revoke_session(revocation).await;
     }
@@ -1046,8 +997,6 @@ impl KytrixServiceConnector {
         }
     }
 
-    /// Resolves the current credential generation and idempotently installs it
-    /// as the shared Kytrix service account session.
     pub async fn acquire_account_session(
         &self,
         expected_account_id: &str,
@@ -1206,7 +1155,6 @@ impl KytrixServiceConnector {
         })
     }
 
-    /// Fetches the current cryptocurrency ETF snapshot over WebSocket RPC.
     pub async fn fetch_etf(&self) -> Result<proto_types::CryptocurrencyEtf, KytrixServiceError> {
         let response = self
             .call_rpc(
@@ -1227,7 +1175,6 @@ impl KytrixServiceConnector {
         })
     }
 
-    /// Fetches the current financial indices over WebSocket RPC.
     pub async fn fetch_financial_index(
         &self,
     ) -> Result<proto_types::FinancialIndices, KytrixServiceError> {
@@ -1250,7 +1197,6 @@ impl KytrixServiceConnector {
         })
     }
 
-    /// Fetches the latest financial calendar snapshot over WebSocket RPC.
     pub async fn fetch_financial_calendar(
         &self,
     ) -> Result<proto_types::FinancialCalendar, KytrixServiceError> {
@@ -1272,7 +1218,6 @@ impl KytrixServiceConnector {
         })
     }
 
-    /// Fetches the latest CMC fear and greed snapshot over WebSocket RPC.
     pub async fn fetch_coin_market_cap_fear_and_greed_index(
         &self,
     ) -> Result<proto_types::CoinMarketCapFearAndGreedIndex, KytrixServiceError> {
@@ -1300,7 +1245,6 @@ impl KytrixServiceConnector {
             })
     }
 
-    /// Fetches the latest Pentagon Pizza Index snapshot over WebSocket RPC.
     pub async fn fetch_pentagon_pizza_index(
         &self,
     ) -> Result<proto_types::PentagonPizzaIndex, KytrixServiceError> {
@@ -2088,10 +2032,6 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// A first-ever add is answered with the row that is waiting to be activated, and that row
-    /// has no profile: the service sends one only once the account is active. The answer is
-    /// still the account that was asked for, so it is a confirmation rather than an outcome the
-    /// caller has to treat as unknown.
     #[tokio::test]
     async fn confirmed_x_add_without_a_profile_is_confirmed_as_pending() {
         let mut server = TestServiceServer::spawn(false).await;
@@ -2412,11 +2352,6 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// A second pane of the same account joins a topic this session already follows.
-    ///
-    /// The server sends a snapshot only when a connection adds a topic, and both panes
-    /// share this connection: the session applies the deltas it received and synthesizes
-    /// the joining pane's snapshot from the picture it already holds.
     #[tokio::test]
     async fn a_second_global_shipping_chokepoint_subscription_should_start_from_the_session_snapshot()
      {
@@ -2713,12 +2648,6 @@ mod tests {
                 .topic,
             index
         );
-        // The FinancialIndex event is the FIFO barrier for the stale News frame: both
-        // travel over the same socket and the retired frame was sent first, so
-        // the actor has already processed it. `recv` cannot prove that (after a
-        // terminal status it answers `Closed` immediately, whatever was
-        // buffered), so inspect the queue directly: a delivered stale frame
-        // would still be there.
         assert!(
             news.try_recv_for_test().is_err(),
             "a frame published after retirement must not reach the retired subscription"
@@ -2735,10 +2664,6 @@ mod tests {
         server.shutdown().await;
     }
 
-    /// A route change that lands while a subscription acknowledgement is still in
-    /// flight is only visible to the ack fence: the queued reconfigure cannot run
-    /// until the actor leaves `wait_for_ack`. The subscription must fail with
-    /// `RouteChanged` instead of becoming active on the old route.
     #[tokio::test]
     async fn withheld_ack_should_fail_the_subscription_when_its_route_changed() {
         let mut server = TestServiceServer::spawn(false).await;

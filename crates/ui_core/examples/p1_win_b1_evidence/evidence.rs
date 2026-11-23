@@ -1,23 +1,3 @@
-//! B1 真机证据的实现：真实可见窗口（真 GPU）+ `SendInput` 按住系统标题栏拖动 3.2 s。
-//!
-//! 观测链是怎么来的：UI 线程在拖动期间处于系统 move 模态循环里，应用代码（`on_frame`）**只**在
-//! 帧真正发生时被调用。因此本文件：
-//! - `on_frame` 钩子每拍把 `Window::frame_index()` / `last_frame_presentation()` / 已提交帧计数
-//!   写进 [`Metrics`]（原子量），这是「应用能观察到什么」的唯一口径；
-//! - 后台拖动线程每 ~50 ms 读一次这些原子量并打印采样序列（窗口冻结时采样照常进行，序列会
-//!   停在同一个数字上 —— 这正是冻结证据）；
-//! - 拖动线程再用 `GetProcessTimes` 量进程 CPU、用帧时刻表算最大帧间隔、用
-//!   `GetGUIThreadInfo` 的 `GUI_INMOVESIZE` 证明系统 move 模态循环确实在跑；
-//! - 松手后 500 ms 再采一段，比较「拖动态势」与「松手后帧率」判定有没有堆积爆发。
-//!
-//! **拖动必须是真实输入**：`SetCursorPos` 把光标放到系统标题栏中点 → `SendInput(LEFTDOWN)` →
-//! 连续 `SendInput(MOUSEEVENTF_MOVE)` ≥3 s → `SendInput(LEFTUP)`。程序化
-//! `SendMessage(WM_NCLBUTTONDOWN)` 虽然也能进入同一个系统 move 循环，但没有真实按键状态，
-//! 窗口**不会移动** —— 那样就无法证明「拖动期出帧来自模态 tick 而不是泵的 ④」。本程序因此
-//! 断言 `GetWindowRect` 位移 > 100 px 且尺寸不变，并在拖动中采样 `GUI_INMOVESIZE`。
-//!
-//! 由 `main.rs` 在 Windows 下调用；正常 / `--edge`（拖动中关闭最后一个窗口）两种模式。
-
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -63,99 +43,60 @@ use windows::Win32::{
     },
 };
 
-/// 证据窗口标题（`FindWindowW` 定位用）。
 const TITLE: &str = "kytrix P1-B B1 modal frame evidence";
-/// 请求的逻辑客户区尺寸。
 const SIZE: Size = Size::new(420.0, 260.0);
-/// 数据泵周期（≈60 Hz 行情 / HUD 更新）。
 const DATA_PERIOD: Duration = Duration::from_millis(16);
-/// 拖动步数 × 步间隔 = 3.2 s。
 const DRAG_STEPS: u32 = 32;
-/// 每一步的采样 / 移动周期（每步拆成两半；采样 ≈50 ms）。
 const SAMPLE_PERIOD: Duration = Duration::from_millis(50);
-/// 拖动中段左右往复的幅度（物理像素）：让系统 move 循环持续收到真实鼠标移动。
 const DRAG_SWAY: i32 = 40;
-/// 最后一步单程拉开的距离（物理像素）：拖动前后 `GetWindowRect` 的位移必须稳定超过
-/// [`MIN_REAL_MOVE`]（要求 >100 px），这里留 60 px 余量。
 const DRAG_TRAVEL: i32 = 160;
-/// 「窗口真实移动」的位移下限（物理像素；远大于 DPI 换算抖动与非客户区边框噪声）。
 const MIN_REAL_MOVE: i32 = 100;
-/// 最多尝试几次「真实按下标题栏」：前台锁 / 窗口被遮挡 / 首击只做激活都可能让某次尝试
-/// 起不来（窗口没移动），松手后重试。
 const DRAG_ATTEMPTS: u32 = 3;
-/// 松手后的观测窗口：不得出现堆积爆发。
 const POST_RELEASE_WINDOW: Duration = Duration::from_millis(500);
-/// 单帧最大间隔上限（持续出帧判据；60 Hz 数据泵下正常 ≤ ~35 ms）。
 const MAX_FRAME_GAP: Duration = Duration::from_millis(200);
-/// 拖动期间最少提交帧数（3.2 s 内 ≥10 fps 才算持续出帧；正常 60 Hz ≈190 帧）。
 const MIN_DRAG_FRAMES: u64 = 32;
-/// 边界模式：拖动进行到 1.2 s 时程序化关闭最后一个窗口。
 const EDGE_CLOSE_AFTER: Duration = Duration::from_millis(1200);
-/// 等窗口出现的上限。
 const FIND_TIMEOUT: Duration = Duration::from_secs(10);
-/// 整体超时（防止窗口 / 拖动线程挂死）。
 const RUN_TIMEOUT: Duration = Duration::from_secs(40);
 
-/// UI 线程每拍写、拖动线程每 ~50 ms 读的观测原子量（`Window` 的公开观测面的快照）。
 #[derive(Default)]
 struct Metrics {
-    /// 已提交帧计数（`frame_index()` 前进一次 +1）。
     committed: AtomicU64,
-    /// 最近一次观察到的 `Window::frame_index()`。
     last_frame_index: AtomicU32,
-    /// 观察到 `last_frame_presentation() == Some(_)` 的提交帧数（A4 呈现反馈）。
     presentations: AtomicU64,
-    /// `on_frame` 钩子被调用的次数（拖动态势下它必须持续推进）。
     hooks: AtomicU64,
-    /// 应用收到的 `Event::Moved` 条数。
     moved: AtomicU64,
-    /// 数据泵已回投的任务数（诊断：关窗后它是否仍在跑）。
     data_ticks: AtomicU64,
 }
 
-/// 一帧的提交时刻 + `FrameIndex`（最大帧间隔的原始数据；UI 线程写、拖动线程读）。
 type FrameLog = Arc<Mutex<Vec<(Instant, u32)>>>;
 
-/// 拖动线程的测量结果（写进 `Arc<Mutex<Option<DragResult>>>`）。
 #[derive(Clone, Copy, Default)]
 struct DragResult {
-    /// 真的按下了鼠标并进入了拖动。
     started: bool,
-    /// `SendInput(LEFTDOWN)` 之后左键确实处于按下状态（注入被系统拒绝时为 false）。
     pressed: bool,
-    /// 本轮的拖动触发方式（恒为真实 `SendInput`；保留字段是为了日志自证）。
     trigger: &'static str,
-    /// 边界模式：拖动中已通过 `AppHandle` 回投任务请求关闭最后一个窗口。
     edge_close_sent: bool,
     rect_before: Option<(i32, i32, i32, i32)>,
     rect_after: Option<(i32, i32, i32, i32)>,
-    /// 按下 → 松手的墙钟时长。
     duration: Duration,
-    /// 拖动窗口内的提交帧数（按 `frame_index` 前进计）。
     drag_frames: u64,
-    /// 松手后 500 ms 内的提交帧数。
     post_frames: u64,
     frames_in_drag: u64,
     first_index: Option<u32>,
     last_index: Option<u32>,
-    /// 拖动窗口内相邻两帧的最大间隔（样本 <2 时为 `None` = 冻结）。
     max_gap: Option<Duration>,
-    /// 拖动期间 `GUI_INMOVESIZE`（系统 move 模态循环）为真的采样数。
     move_loop_samples: u32,
-    /// 拖动期间的总采样数。
     sample_total: u32,
-    /// 进程 user+kernel 时间增量与量测墙钟（CPU 百分比）。
     cpu: Duration,
     cpu_wall: Duration,
 }
 
 impl DragResult {
-    /// 拖动线程没能开始拖动（窗口没出现 / 被遮挡 / SendInput 失败）时的结果。
     fn failed() -> Self {
         Self::default()
     }
 
-    /// 拖动前后的外框变化 `(dx, dy, dw, dh)`。
     fn moved(&self) -> Option<(i32, i32, i32, i32)> {
         let before = self.rect_before?;
         let after = self.rect_after?;
@@ -168,7 +109,6 @@ impl DragResult {
     }
 }
 
-/// 证据收集状态（只在 UI 线程访问；拖动线程只碰里面的 `Arc` 字段）。
 struct Evidence {
     window: WindowId,
     edge: bool,
@@ -194,7 +134,6 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         size: SIZE,
         ..WindowOptions::default()
     });
-    // 真实内容：一个按 60 Hz 数据泵改透明度（HUD / 行情推进）的白色面板。
     let source = app.signal(0u8);
     let root = app.window(id).expect("窗口存在").tree().root();
     let _node = NodeBuilder::boxed()
@@ -213,8 +152,6 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(Metrics::default());
     let frames: FrameLog = Arc::new(Mutex::new(Vec::with_capacity(600)));
     let result = Arc::new(Mutex::new(None));
-    // 拖动线程句柄：edge 模式里窗口可能先于拖动线程结束（`Application::run` 先返回），
-    // 必须等线程收尾才能读到完整结果并确认没有 panic。
     let drag_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     let state = Rc::new(RefCell::new(Evidence {
         window: id,
@@ -233,7 +170,6 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     app.on_frame(move |app| on_frame(app, &hook_state));
     let handle = app.handle();
 
-    // 数据泵：60 Hz 回投任务（写信号 → 标脏 → 请求一帧），模拟行情 / HUD 更新。
     let stop = Arc::new(AtomicBool::new(false));
     let data_handle = handle.clone();
     let data_stop = Arc::clone(&stop);
@@ -258,7 +194,6 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let run_result = Application::new().run(app);
     stop.store(true, Ordering::Release);
-    // 先回收拖动线程（`Application::run` 可能在拖动线程收尾前返回），把 panic 直接暴露出来。
     let joined = drag_thread
         .lock()
         .ok()
@@ -271,7 +206,6 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if edge {
-        // 边界模式：窗口由拖动线程在拖动中关闭，事件循环必须正常退出、窗口必须已销毁。
         let dragged = result.lock().ok().and_then(|result| *result);
         let window_gone = find_window().is_none();
         let dragged_detail = dragged.filter(|result| result.started);
@@ -312,7 +246,6 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// 每拍：记录已提交帧 / 钩子 / `Event::Moved`；首拍拉起拖动线程；拿不到结果时超时失败。
 fn on_frame(app: &mut App, state: &Rc<RefCell<Evidence>>) {
     let mut evidence = state.borrow_mut();
     if evidence.finished {
@@ -393,7 +326,6 @@ fn on_frame(app: &mut App, state: &Rc<RefCell<Evidence>>) {
     }
 }
 
-/// 拖动结束：打印拖动期间 / 松手后的帧数、最大帧间隔、CPU、`Event::Moved`，判定并收尾。
 fn finish_normal(evidence: &mut Evidence, app: &mut App, result: DragResult) {
     evidence.finished = true;
     let metrics = Arc::clone(&evidence.metrics);
@@ -415,8 +347,6 @@ fn finish_normal(evidence: &mut Evidence, app: &mut App, result: DragResult) {
     let sustained = result.drag_frames >= MIN_DRAG_FRAMES;
     let gap_ok = result.max_gap.is_some_and(|gap| gap <= MAX_FRAME_GAP);
     let no_burst = result.post_frames as f64 <= allowed_post;
-    // 「窗口真实移动」= 位移 > MIN_REAL_MOVE 且**尺寸不变**（系统 move 循环只改位置；尺寸
-    // 变化说明触发的其实是 resize 循环或程序化改动，不能作为 B1 的模态 move 证据）。
     let real_move = moved_delta.is_some_and(|(dx, dy, dw, dh)| {
         dx.abs().max(dy.abs()) > MIN_REAL_MOVE && dw == 0 && dh == 0
     });
@@ -479,7 +409,6 @@ fn finish_normal(evidence: &mut Evidence, app: &mut App, result: DragResult) {
     let _ = app.close_window(evidence.window);
 }
 
-/// 拉起后台拖动线程（UI 线程随后进入系统 move 模态循环，不能再跑钩子以外的采样）。
 fn spawn_drag(
     window: WindowId,
     handle: AppHandle,
@@ -508,17 +437,6 @@ fn spawn_drag(
     }
 }
 
-/// 拖动线程体：等窗口 → 置顶 / 尽力带到前台 → 真实 `SendInput` 按住系统标题栏拖动 3.2 s →
-/// 松手 → 观测 500 ms → 写结果。
-///
-/// **为什么必须是真实输入**：程序化 `SendMessage(WM_NCLBUTTONDOWN)` 也会进入同一个系统 move
-/// 模态循环，但没有真实按键状态，窗口**不会随鼠标移动**（旧实现实测位移 (0,0)）—— 于是无法
-/// 证明「拖动期间泵被系统循环占住、出帧完全依赖模态 tick」。这里走与用户完全相同的输入通路
-/// （`SetCursorPos` + `SendInput` 按住 / 连续移动 / 松手），并断言 `GetWindowRect` 位移
-/// > [`MIN_REAL_MOVE`]、尺寸不变；拖动中再用 `GUI_INMOVESIZE` 采样证明系统 move 循环确实在跑。
-///
-/// 前台**不是必要条件**（真实点击标题栏会激活窗口并由系统进入 move 循环），前台锁只影响
-/// 日志；单次尝试若「按下后窗口没动」（首击只做激活 / 落点被遮挡），松手后重试。
 fn drag(
     window: WindowId,
     handle: &AppHandle,
@@ -530,8 +448,6 @@ fn drag(
         println!("FAIL: {FIND_TIMEOUT:?} 内没找到证据窗口（标题 {TITLE}）");
         return DragResult::failed();
     };
-    // 置顶 + 显示：真实点击必须落在本窗口标题栏上（其它窗口可能盖住它）。
-    // SAFETY: 本进程窗口；只改 Z 序 / 可见性，不改位置与尺寸。
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -545,16 +461,13 @@ fn drag(
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
     std::thread::sleep(Duration::from_millis(300));
-    // 尽力把窗口带到前台；失败不影响有效性（真实点击自己会激活它）。
     let foreground = activate_window(hwnd);
-    // SAFETY: 只读查询当前前台窗口与窗口可见 / 最小化状态。
     println!(
         "前台={foreground}（当前前台窗口={:?}）；本窗口 visible={} iconic={}",
         unsafe { GetForegroundWindow() },
         unsafe { IsWindowVisible(hwnd) }.as_bool(),
         unsafe { IsIconic(hwnd) }.as_bool()
     );
-    // SAFETY: 只读查询；本 example 的窗口不跨屏，DPI 在拖动期间稳定。
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
     let scale = f64::from(dpi) / 96.0;
     for attempt in 1..=DRAG_ATTEMPTS {
@@ -567,12 +480,8 @@ fn drag(
             return DragResult::failed();
         };
         let grab = caption_grab_point(before, origin);
-        // 光标先移到标题栏按下点：随后的按钮事件发生在光标当前位置（不先移动就会按到别的
-        // 窗口上，那次拖动会被那个窗口的模态循环吃掉，本 example 会误判成「窗口没移动」）。
-        // SAFETY: 设置本会话光标位置；窗口存活。
         let cursor_moved = unsafe { SetCursorPos(grab.0, grab.1) }.is_ok();
         std::thread::sleep(Duration::from_millis(150));
-        // SAFETY: 只读查询指定屏幕点上的窗口。
         let under = unsafe {
             WindowFromPoint(POINT {
                 x: grab.0,
@@ -583,7 +492,6 @@ fn drag(
             println!(
                 "尝试 {attempt}/{DRAG_ATTEMPTS}: 标题栏按下点不可用（SetCursorPos={cursor_moved}，WindowFromPoint={under:?}，期望 {hwnd:?}）；重新置顶后重试"
             );
-            // SAFETY: 本进程窗口；重新置顶。
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,
@@ -610,7 +518,6 @@ fn drag(
             "拖动开始（尝试 {attempt}/{DRAG_ATTEMPTS}）：提交帧={committed_before}（frame_index={}）",
             metrics.last_frame_index.load(Ordering::Acquire)
         );
-        // 真实按下：与用户按住系统标题栏完全同一条输入通路。
         send_mouse(MOUSEEVENTF_LEFTDOWN, None);
         std::thread::sleep(Duration::from_millis(80));
         let pressed = left_button_down();
@@ -644,12 +551,10 @@ fn drag(
                 if window_rect(hwnd).is_some_and(|current| current != before) {
                     moved = true;
                 } else if !pressed || step >= 3 {
-                    // 系统 move 循环没启动（按下后窗口始终没动）：中止本次尝试。
                     break;
                 }
             }
         }
-        // 末步已把光标拉到 `DRAG_TRAVEL`：等系统把最后一段位移应用到窗口，再松手。
         std::thread::sleep(Duration::from_millis(100));
         send_mouse(MOUSEEVENTF_LEFTUP, None);
         let drag_end = Instant::now();
@@ -661,7 +566,6 @@ fn drag(
             println!(
                 "尝试 {attempt}/{DRAG_ATTEMPTS}: 真实按下后窗口没有移动（外框 {before:?} → {after:?}）；松手后重试"
             );
-            // SAFETY: 本进程窗口；重新置顶。
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,
@@ -676,7 +580,6 @@ fn drag(
             std::thread::sleep(Duration::from_millis(250));
             continue;
         }
-        // 松手后再观测 500 ms（同样每 ~50 ms 采样一次帧计数）。
         let post_begin = Instant::now();
         while post_begin.elapsed() < POST_RELEASE_WINDOW {
             std::thread::sleep(SAMPLE_PERIOD);
@@ -707,7 +610,6 @@ fn drag(
             cpu: cpu_after.saturating_sub(cpu_before),
             cpu_wall,
         };
-        // SAFETY: 本进程窗口；恢复为非置顶。
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
@@ -725,7 +627,6 @@ fn drag(
     DragResult::failed()
 }
 
-/// 打印一条采样序列（拖动线程；窗口冻结时数字停在原处，正是证据）。
 fn sample(metrics: &Metrics, at: Duration, phase: &str) {
     println!(
         "采样 {phase} t=+{:.2}s：提交帧={} frame_index={} 呈现反馈={} 钩子={}",
@@ -737,7 +638,6 @@ fn sample(metrics: &Metrics, at: Duration, phase: &str) {
     );
 }
 
-/// 从帧时刻表取 `[begin, end]` 区间：帧数、首末 `FrameIndex`、相邻最大间隔。
 fn frame_history(
     frames: &FrameLog,
     begin: Instant,
@@ -769,13 +669,11 @@ fn frame_history(
     (count, Some(first), Some(last), max_gap)
 }
 
-/// 进程 user + kernel 的 CPU 时间（`GetProcessTimes`；失败返回 0）。
 fn process_cpu() -> Duration {
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    // SAFETY: 本进程伪句柄；四个输出指针都指向本函数栈上的值。
     let ok = unsafe {
         GetProcessTimes(
             GetCurrentProcess(),
@@ -790,22 +688,14 @@ fn process_cpu() -> Duration {
     }
     let to_u64 =
         |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
-    // FILETIME 单位 = 100 ns。
     Duration::from_nanos(to_u64(kernel).saturating_add(to_u64(user)) * 100)
 }
 
-/// 拖动 3.2 s 的墙钟时长（只用于打印）。
 fn drag_seconds() -> f64 {
     (SAMPLE_PERIOD * 2 * DRAG_STEPS).as_secs_f64()
 }
 
-/// 强制把 `hwnd` 变成前台窗口（尽力而为）。
-///
-/// 后台线程直接 `SetForegroundWindow` 会被系统前台锁拒绝（返回 FALSE、不报错）；标准做法是
-/// 先 `AttachThreadInput` 到当前前台线程，再调用，最后解除。拿不到前台不影响本证据：真实
-/// `SendInput` 点击标题栏会走系统的激活路径，拖动是否真的开始由 [`drag`] 的窗口位移检测判定。
 fn force_foreground(hwnd: HWND) {
-    // SAFETY: 本进程窗口；线程 id 查询与 AttachThreadInput 都是窗口管理器协作调用。
     unsafe {
         let foreground = GetForegroundWindow();
         let foreground_thread = GetWindowThreadProcessId(foreground, None);
@@ -833,70 +723,44 @@ fn wait_for_window() -> Option<HWND> {
 
 fn find_window() -> Option<HWND> {
     let title = wide(TITLE);
-    // SAFETY: 标题是栈上 NUL 结尾宽字符串；`FindWindowW` 只读查询。
     unsafe { FindWindowW(None, windows::core::PCWSTR(title.as_ptr())) }.ok()
 }
 
-/// 把证据窗口尽力带到前台（返回是否成功）。
-///
-/// 拖动本身**不依赖**前台：真实点击标题栏会激活窗口并由系统进入 move 循环（前台锁只决定
-/// 「谁在最前」）。这里做一次 `AttachThreadInput` + `SetForegroundWindow` 的尽力尝试，目的只是
-/// 减少「首击只做激活、不进循环」的尝试次数；失败不影响证据有效性。
 fn activate_window(hwnd: HWND) -> bool {
     force_foreground(hwnd);
     std::thread::sleep(Duration::from_millis(150));
-    // SAFETY: 只读查询当前前台窗口。
     (unsafe { GetForegroundWindow() }) == hwnd
 }
 
-/// 系统标题栏中点的屏幕物理坐标。
-///
-/// 系统标题栏 = 窗口外框顶边到客户区原点之间（`WS_OVERLAPPEDWINDOW` 的上边框 + 标题栏）；
-/// 取其中点保证命中 `HTCAPTION` 而不是缩放的粗边框。`rect` 的后两位是**宽高**，横坐标取
-/// 外框中心。
 fn caption_grab_point(rect: (i32, i32, i32, i32), client_origin: POINT) -> (i32, i32) {
     let caption_y = rect.1 + ((client_origin.y - rect.1) / 2).max(4);
     (rect.0 + rect.2 / 2, caption_y)
 }
 
-/// 客户区原点（屏幕物理坐标）。
 fn client_origin(hwnd: HWND) -> Option<POINT> {
     let mut origin = POINT::default();
-    // SAFETY: 窗口存活；`ClientToScreen` 只做坐标换算，`origin` 是栈上输出。
     unsafe { ClientToScreen(hwnd, &mut origin) }
         .as_bool()
         .then_some(origin)
 }
 
-/// 系统 move / size 模态循环是否在窗口所属 UI 线程上运行（`GUITHREADINFO::GUI_INMOVESIZE`）。
-///
-/// 这是「拖动期间泵的 ④ 确实被系统循环占住」的直接证据：只看帧数无法排除「泵自己在出帧」。
-/// 查询的是 UI 线程的 GUI 状态，从拖动线程调用同样有效。
 fn move_loop_active(hwnd: HWND) -> bool {
     let mut info = GUITHREADINFO {
         cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
         ..GUITHREADINFO::default()
     };
-    // SAFETY: 只读查询；窗口句柄可能已失效（edge 模式），此时返回 0 而不是解引用。
     let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
     if thread == 0 {
         return false;
     }
-    // SAFETY: `thread` 来自窗口句柄；`GetGUIThreadInfo` 只读查询该线程的 GUI 状态。
     let ok = unsafe { GetGUIThreadInfo(thread, &mut info) }.is_ok();
     ok && info.flags.contains(GUI_INMOVESIZE)
 }
 
-/// `SendInput(LEFTDOWN)` 之后左键是否真的处于按下状态（注入被 UIPI / 前台策略拒绝时不会）。
 fn left_button_down() -> bool {
-    // SAFETY: `GetKeyState` 是无副作用的线程局部查询（高位置位 = 按下）。
     unsafe { GetKeyState(i32::from(VK_LBUTTON.0)) < 0 }
 }
 
-/// 拖动中每一步的光标目标偏移（相对按下点，物理像素）。
-///
-/// 中段左右往复（[`DRAG_SWAY`]）让系统 move 循环持续收到真实鼠标移动；最后一步单程拉出
-/// [`DRAG_TRAVEL`]，使拖动前后 `GetWindowRect` 的位移稳定超过 [`MIN_REAL_MOVE`]。
 fn drag_offset(step: u32) -> i32 {
     if step >= DRAG_STEPS {
         DRAG_TRAVEL
@@ -906,11 +770,8 @@ fn drag_offset(step: u32) -> i32 {
         -DRAG_SWAY
     }
 }
-/// 窗口外框 `(left, top, width, height)`；`None` = 查询失败（edge 模式下窗口在拖动中已被
-/// 真正销毁，之后不能再 `expect` 一个已失效的句柄）。
 fn window_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     let mut rect = RECT::default();
-    // SAFETY: 窗口存活期内查询；`rect` 是栈上输出。句柄失效时返回错误（不 UB）。
     unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
     Some((
         rect.left,
@@ -920,10 +781,7 @@ fn window_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
     ))
 }
 
-/// 发一条鼠标输入。`position = Some(屏幕物理坐标)` 表示绝对移动（隐含 `MOUSEEVENTF_MOVE`）；
-/// `None` 表示在当前光标位置发按钮事件（`flags` 是按键位）。
 fn send_mouse(flags: MOUSE_EVENT_FLAGS, position: Option<(i32, i32)>) {
-    // SAFETY: 无参数、无副作用的系统度量查询。
     let (left, top, width, height) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -958,10 +816,8 @@ fn send_mouse(flags: MOUSE_EVENT_FLAGS, position: Option<(i32, i32)>) {
             },
         },
     };
-    // SAFETY: `input` 是栈上结构，长度正确；`SendInput` 向本会话输入流注入鼠标事件。
     let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
     if sent == 0 {
-        // SAFETY: 无参数、线程局部错误查询（SendInput 失败后有效）。
         let error = unsafe { windows::Win32::Foundation::GetLastError() }.0;
         println!("警告：SendInput 失败（GetLastError={error}）");
     }

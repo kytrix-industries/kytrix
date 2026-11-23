@@ -1,34 +1,5 @@
-//! Persisted widget configuration.
-//!
-//! A widget owns its own configuration type, but the envelope that type is
-//! persisted in and the schema version guarding it belong to the configuration
-//! vocabulary: a pane's layout stores an envelope, not a widget type. Keeping
-//! both here is what lets the layout describe which widget a pane shows without
-//! the configuration model depending on `widget`.
-//!
-//! Reading a widget's persisted config never fails. An envelope that was written
-//! under another schema version, or whose payload no longer decodes, yields the
-//! widget's default configuration; whether that replaced what was stored is
-//! answered by comparing the two envelopes, not by an error. There is no migration
-//! between schema versions: a version this build does not support has no meaning
-//! here, and inventing one would be the compatibility layer this project does not
-//! keep.
-
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-/// Persistable config envelope independent of a concrete widget's config type.
-///
-/// The payload is the widget's own serialized config, and for every
-/// listing-scoped widget that config holds canonical identities: a
-/// `VenueListingKey` and its `InstrumentSelection`, a `WatchListKey` entry, a
-/// `ServiceTarget` or a link group. Those identities are versioned by
-/// `market_participants_model`'s frozen identity encoding, so an incompatible change to that
-/// encoding makes a stored payload undecodable even though this envelope's own
-/// `schema_version` did not move. That is handled by the current V1 rule and
-/// nothing else: the whole config is dropped, the widget's default is restored,
-/// and the default is written back to the layout. There is no migration of old
-/// identifiers, no fallback to a previous shape and no dual-version parsing —
-/// see [`VersionedWidgetConfig::decode`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VersionedWidgetConfig {
     schema_version: WidgetConfigSchemaVersion,
@@ -36,7 +7,6 @@ pub struct VersionedWidgetConfig {
 }
 
 impl VersionedWidgetConfig {
-    /// Wraps one concrete configuration in its versioned envelope.
     pub fn encode<C: WidgetConfig>(config: &C) -> Result<Self, WidgetConfigError> {
         Ok(Self {
             schema_version: C::SCHEMA_VERSION,
@@ -44,26 +14,10 @@ impl VersionedWidgetConfig {
         })
     }
 
-    /// Returns the schema version this envelope was written with.
     pub const fn schema_version(&self) -> WidgetConfigSchemaVersion {
         self.schema_version
     }
 
-    /// Decodes the payload into the widget's current configuration type.
-    ///
-    /// A schema version this build does not support and a payload this build
-    /// cannot read both yield `C::default()`: the widget is always creatable, and
-    /// the caller learns that its stored config was replaced by comparing this
-    /// envelope with the one the widget now reports.
-    ///
-    /// "Cannot read" covers the identity case as well as the shape case. A
-    /// payload written before an incompatible canonical-identity change names a
-    /// listing or an instrument selection this build has no identity for, so it
-    /// fails to decode exactly like a payload of the wrong shape; the widget then
-    /// starts from its defaults and writes them back. Resetting the whole config
-    /// — not the offending entry alone — is the accepted cost of keeping one
-    /// decode rule, and it is deliberately preferred to migrating old identifiers
-    /// or parsing two identity versions at once.
     pub fn decode<C: WidgetConfig>(self) -> C {
         if self.schema_version != C::SCHEMA_VERSION {
             return C::default();
@@ -73,63 +27,28 @@ impl VersionedWidgetConfig {
     }
 }
 
-/// Versioned persisted configuration owned by a concrete widget.
 pub trait WidgetConfig: Clone + Default + Serialize + DeserializeOwned + 'static {
-    /// The persisted schema version this widget's config is written under.
-    ///
-    /// Every widget in the workspace is at `V1`, and `V1` is not a compatibility
-    /// window: it is the only shape this build reads. A widget whose persisted
-    /// fields change incompatibly deletes the old structure and keeps `V1`, and a
-    /// canonical-identity change in `market_participants_model` needs no version bump here at
-    /// all — the old payload simply stops decoding, and
-    /// [`VersionedWidgetConfig::decode`] resets the whole config to its default and
-    /// writes it back. No old-identifier migration, fallback or dual-version
-    /// parsing is provided by this trait or by any widget implementing it.
     const SCHEMA_VERSION: WidgetConfigSchemaVersion;
 }
 
-/// The config of a widget that persists no options.
-///
-/// Such a widget still needs a config type, so the persisted schema version is
-/// owned by the widget rather than inferred from the absence of a config. It is
-/// `V1` for the same reason every other widget is: this build reads one shape, and
-/// a payload it cannot read becomes the default and is written back rather than
-/// migrated.
 impl WidgetConfig for () {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
-/// A widget configuration could not be written out.
-///
-/// Only encoding can fail: a configuration that cannot be turned into JSON is a
-/// configuration that cannot be persisted at all, and the caller has to decide
-/// what to write in its place. Reading never fails — see
-/// [`VersionedWidgetConfig::decode`].
 #[derive(Debug, thiserror::Error)]
 #[error("failed to encode widget config: {0}")]
 pub struct WidgetConfigError(#[source] serde_json::Error);
 
-/// Decodes an optional envelope, where an absent envelope means "defaults".
 pub fn decode_or_default<C: WidgetConfig>(config: Option<VersionedWidgetConfig>) -> C {
     config.map_or_else(C::default, VersionedWidgetConfig::decode)
 }
 
-/// A monotonically increasing schema version for one widget's persisted config.
-///
-/// This is deliberately separate from application and widget implementation
-/// versions. Increment it only when the persisted config schema changes.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WidgetConfigSchemaVersion(u32);
 
 impl WidgetConfigSchemaVersion {
-    /// The first persisted config schema version.
     pub const V1: Self = Self(1);
 
-    /// Constructs a schema version whose value is known at compile time.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `value` is zero.
     #[track_caller]
     pub const fn new_static(value: u32) -> Self {
         if value == 0 {
@@ -138,7 +57,6 @@ impl WidgetConfigSchemaVersion {
         Self(value)
     }
 
-    /// Constructs a non-zero config schema version.
     pub const fn new(value: u32) -> Result<Self, InvalidWidgetConfigSchemaVersion> {
         if value == 0 {
             Err(InvalidWidgetConfigSchemaVersion)
@@ -147,7 +65,6 @@ impl WidgetConfigSchemaVersion {
         }
     }
 
-    /// Returns the numeric schema version.
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -178,7 +95,6 @@ impl<'de> Deserialize<'de> for WidgetConfigSchemaVersion {
     }
 }
 
-/// A zero config schema version is invalid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidWidgetConfigSchemaVersion;
 
@@ -217,9 +133,6 @@ mod tests {
         };
     }
 
-    /// Stands in for a listing-scoped widget's config: the selected listing is a
-    /// required field, so a payload that names a route and an instrument, or a
-    /// selection without its listing key, cannot decode into it at all.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     struct ListingConfig {
         selection: InstrumentSelection,

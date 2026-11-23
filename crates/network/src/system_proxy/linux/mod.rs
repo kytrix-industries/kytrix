@@ -1,5 +1,3 @@
-//! Chromium `proxy_config_service_linux` discovery plus PAC/WPAD evaluation.
-
 mod command;
 mod endpoint;
 mod gnome;

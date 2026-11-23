@@ -1,10 +1,3 @@
-//! The tests of the proxy catalog: the server-management page, the form on the window layer and
-//! the alert a delete is confirmed by.
-//!
-//! The page is opened the way the sidebar opens it, and the form is opened the way its own
-//! controls open it — a click on the button above the catalog, or on one row's edit control. What
-//! the assertions read is therefore the page a user reaches, not a request handed to it.
-
 use std::{io, path::PathBuf};
 
 use app_config::{
@@ -25,26 +18,18 @@ use crate::{
     settings_tests::test_support::{Harness, configured_settings, translate_in},
 };
 
-/// The key prefix every control of the page is named by: the harness mounts the settings page
-/// under `settings.test`, and the page it draws is `server-management`.
 const PREFIX: &str = "settings.test.server-management.proxy";
 
-/// The key prefix of the controls the form that adds an entry builds.
 const ADD_FORM: &str = "settings.test.server-management.proxy.add-form";
 
-/// The key prefix of the controls the form that edits an entry builds.
 const EDIT_FORM: &str = "settings.test.server-management.proxy.edit-form";
 
-/// The key prefix of the dialog that adds an entry.
 const ADD_DIALOG: &str = "settings.test.server-management.proxy.add-form.editor";
 
-/// The key prefix of the dialog that edits an entry.
 const EDIT_DIALOG: &str = "settings.test.server-management.proxy.edit-form.editor";
 
-/// The proxy the configured settings hold.
 const CONFIGURED: &str = "hk";
 
-/// A proxy entry with the given endpoint.
 fn proxy(addr: &'static str, port: u16) -> ProxyConfig {
     ProxyConfig {
         addr: SmolStr::new_static(addr),
@@ -54,64 +39,51 @@ fn proxy(addr: &'static str, port: u16) -> ProxyConfig {
     }
 }
 
-/// A settings snapshot with the configured proxy in it, as the settings page is opened over.
 fn configured() -> Config {
     let mut config = configured_settings();
-    // The interface labels this file asserts are the English ones; the page is opened over a
-    // settings snapshot, and the language of that snapshot is what it is drawn in.
     config.language = Language::En;
     config
 }
 
-/// The node whose debug id is exactly `id` (the harness's `find` matches a prefix).
 fn find_exact(harness: &Harness, id: &str) -> Option<NodeId> {
     let ids = harness.debug_ids();
     let index = ids.iter().position(|debug| debug == id)?;
     harness.find_all("").into_iter().nth(index)
 }
 
-/// Opens the server-management page the way the sidebar opens it.
 fn open_catalog(harness: &mut Harness) {
-    // The settings page is mounted before its first frame; the sidebar rows are only laid out by
-    // one, and a click is aimed at laid-out bounds.
     harness.settle(2);
     harness.select_page("server-management");
     harness.settle(2);
 }
 
-/// Opens the form that adds an entry the way the button above the catalog opens it.
 fn open_add_form(harness: &mut Harness) {
     open_catalog(harness);
     harness.click_node("SETTINGS_PROXY_ADD_BUTTON");
     harness.settle(2);
 }
 
-/// Opens the form that edits one row the way that row's edit control opens it.
 fn open_edit_form(harness: &mut Harness, row: usize) {
     open_catalog(harness);
     harness.click_node(&format!("SETTINGS_PROXY_ROW_{row}_edit"));
     harness.settle(2);
 }
 
-/// Clicks one field of the open form, so the typing that follows is typed into it.
 fn click_field(harness: &mut Harness, field: &str) {
     harness.click_node(&format!("SETTINGS_PROXY_FIELD_{field}"));
     harness.settle(1);
 }
 
-/// Types into the field the form's click left focused.
 fn type_text(harness: &mut Harness, text: &str) {
     harness.type_text(text);
     harness.settle(1);
 }
 
-/// Clicks one field of the open form and types into it.
 fn type_into(harness: &mut Harness, field: &str, text: &str) {
     click_field(harness, field);
     type_text(harness, text);
 }
 
-/// Clicks the button of the alert a delete is asked in.
 fn click_alert(harness: &mut Harness, suffix: &str) {
     let target = harness
         .debug_ids()
@@ -122,7 +94,6 @@ fn click_alert(harness: &mut Harness, suffix: &str) {
     harness.settle(2);
 }
 
-/// The text one cell of the catalog's table draws.
 fn cell_text(harness: &Harness, row: usize, column: usize) -> String {
     let node = harness
         .find(&format!("{PREFIX}.table:cell:{row}:{column}"))
@@ -131,7 +102,6 @@ fn cell_text(harness: &Harness, row: usize, column: usize) -> String {
     harness.text_of(node)
 }
 
-/// The text one column header of the catalog's table draws.
 fn header_text(harness: &Harness, column: usize) -> SmolStr {
     let node = harness
         .find(&format!("{PREFIX}.table:header:{column}"))
@@ -140,7 +110,6 @@ fn header_text(harness: &Harness, column: usize) -> SmolStr {
     SmolStr::new(harness.text_of(node))
 }
 
-/// Whether `node` is `ancestor` or under it.
 fn is_inside(harness: &Harness, node: NodeId, ancestor: NodeId) -> bool {
     let Some(window) = harness.app().window(harness.window()) else {
         return false;
@@ -156,7 +125,6 @@ fn is_inside(harness: &Harness, node: NodeId, ancestor: NodeId) -> bool {
     false
 }
 
-/// The failure a write reports when the settings cannot be stored.
 fn unwritable() -> SettingsWriteError {
     SettingsWriteError::new(ConfigPersistenceError::CreateDirectory {
         path: PathBuf::from("blocked"),
@@ -167,8 +135,6 @@ fn unwritable() -> SettingsWriteError {
     })
 }
 
-/// The catalog the page draws is the settings it was opened over: its columns, its rows in name
-/// order, and the one value it must not draw back — a stored password.
 #[test]
 fn the_catalog_should_be_drawn_with_its_columns_and_entries() {
     let mut harness = Harness::with_config(configured());
@@ -220,9 +186,6 @@ fn the_catalog_should_be_drawn_with_its_columns_and_entries() {
     );
 }
 
-/// The catalog is a map keyed by name, so the table draws its entries in name order rather than
-/// in the order they were written, and a click on a header does not reorder them: the old catalog
-/// had no sorting to offer and this one adds none.
 #[test]
 fn the_catalog_should_be_drawn_in_name_order_and_not_sorted_by_a_click() {
     let mut config = Config::default();
@@ -261,8 +224,6 @@ fn the_catalog_should_be_drawn_in_name_order_and_not_sorted_by_a_click() {
     );
 }
 
-/// A catalog with nothing in it says so once, across the body, rather than drawing a row of
-/// columns that each say the catalog is empty.
 #[test]
 fn an_empty_catalog_should_draw_the_message_it_has_to_say() {
     let mut harness = Harness::new();
@@ -290,7 +251,6 @@ fn an_empty_catalog_should_draw_the_message_it_has_to_say() {
     );
 }
 
-/// A catalog with an entry draws the entry rather than the message that it holds none.
 #[test]
 fn a_catalog_with_an_entry_should_draw_the_entry_rather_than_the_empty_message() {
     let mut harness = Harness::with_config(configured());
@@ -311,8 +271,6 @@ fn a_catalog_with_an_entry_should_draw_the_entry_rather_than_the_empty_message()
     );
 }
 
-/// The way to add an entry is the right end of the row above the catalog, and the catalog below
-/// that row is the rest of the page: the page is as tall as the settings give it.
 #[test]
 fn the_add_button_should_sit_above_a_table_that_fills_the_page() {
     let mut harness = Harness::new();
@@ -370,8 +328,6 @@ fn the_add_button_should_sit_above_a_table_that_fills_the_page() {
     );
 }
 
-/// An entry the user types into the form and confirms is written at once, from the button to the
-/// settings.
 #[test]
 fn a_typed_entry_should_reach_the_settings_when_the_form_is_confirmed() {
     let mut harness = Harness::new();
@@ -405,8 +361,6 @@ fn a_typed_entry_should_reach_the_settings_when_the_form_is_confirmed() {
     );
 }
 
-/// A new entry resolves names on this side of the proxy until the form is asked for the other
-/// mode: what a user who touches nothing gets is the mode the form opened on.
 #[test]
 fn a_new_entry_should_resolve_names_here_until_the_form_is_asked_otherwise() {
     let mut harness = Harness::new();
@@ -429,8 +383,6 @@ fn a_new_entry_should_resolve_names_here_until_the_form_is_asked_otherwise() {
     );
 }
 
-/// The mode the control shows is the mode the entry is recorded with, and the other choice of it
-/// is what a user picks to have the proxy resolve the names.
 #[test]
 fn choosing_the_proxy_mode_should_be_what_the_entry_is_recorded_with() {
     let mut harness = Harness::new();
@@ -458,8 +410,6 @@ fn choosing_the_proxy_mode_should_be_what_the_entry_is_recorded_with() {
     );
 }
 
-/// The form that changes an entry is opened on the mode the entry is stored under: a form that
-/// started from the default would record the entry as a mode the user never chose.
 #[test]
 fn an_edit_form_should_open_on_the_mode_the_entry_is_stored_under() {
     let mut harness = Harness::with_config(configured());
@@ -491,8 +441,6 @@ fn an_edit_form_should_open_on_the_mode_the_entry_is_stored_under() {
     );
 }
 
-/// A form the user walks away from is not a change of the settings: what it held is dropped
-/// rather than written, and the settings it was opened over are still drawn under it.
 #[test]
 fn a_cancelled_form_should_leave_the_settings_alone() {
     let mut harness = Harness::with_config(configured());
@@ -543,8 +491,6 @@ fn a_cancelled_form_should_leave_the_settings_alone() {
     );
 }
 
-/// The form ends the way the application's other dialogs end: a line across it, and the two
-/// buttons under that line rather than in among the fields.
 #[test]
 fn the_form_buttons_should_sit_under_a_line_at_the_foot_of_the_form() {
     let mut harness = Harness::with_config(configured());
@@ -598,8 +544,6 @@ fn the_form_buttons_should_sit_under_a_line_at_the_foot_of_the_form() {
     );
 }
 
-/// Confirming the form writes its entry into the settings at once; the page under it is the one
-/// that was always there and is still the one left showing.
 #[test]
 fn a_form_over_the_settings_should_write_the_entry_at_once() {
     let mut harness = Harness::with_config(configured());
@@ -638,8 +582,6 @@ fn a_form_over_the_settings_should_write_the_entry_at_once() {
     );
 }
 
-/// Renaming an entry moves every route bound to its name: the catalog and its references are one
-/// value, so they are written together.
 #[test]
 fn renaming_an_entry_should_move_every_route_bound_to_it() {
     let mut config = Config::default();
@@ -687,8 +629,6 @@ fn renaming_an_entry_should_move_every_route_bound_to_it() {
     );
 }
 
-/// A submission that says nothing is rejected field by field, and nothing is written: the form
-/// stays open where the user can correct it.
 #[test]
 fn a_rejected_form_should_stay_open_and_report_every_problem() {
     let mut harness = Harness::new();
@@ -715,7 +655,6 @@ fn a_rejected_form_should_stay_open_and_report_every_problem() {
     );
 }
 
-/// A name the catalog already holds is not one a second entry may take.
 #[test]
 fn a_name_the_catalog_holds_should_not_be_taken_twice() {
     let mut harness = Harness::with_config(configured());
@@ -740,8 +679,6 @@ fn a_name_the_catalog_holds_should_not_be_taken_twice() {
     );
 }
 
-/// The port is a number the settings can store, so a port outside the range is rejected where
-/// the user typed it.
 #[test]
 fn a_port_outside_the_range_should_be_rejected() {
     let mut harness = Harness::new();
@@ -749,7 +686,6 @@ fn a_port_outside_the_range_should_be_rejected() {
 
     type_into(&mut harness, "name", "osaka");
     type_into(&mut harness, "addr", "127.0.0.1");
-    // Zero parses as a port, so the range is what has to reject it.
     type_into(&mut harness, "port", "0");
     harness.click_node(CONFIRM_SELECTOR);
     harness.settle(2);
@@ -767,7 +703,6 @@ fn a_port_outside_the_range_should_be_rejected() {
     );
 }
 
-/// The form writes the credentials it was given exactly while it asks for them.
 #[test]
 fn an_authenticated_entry_should_be_recorded_with_its_credentials() {
     let mut harness = Harness::new();
@@ -799,8 +734,6 @@ fn an_authenticated_entry_should_be_recorded_with_its_credentials() {
     );
 }
 
-/// A delete is the one row action that takes something away, so it is asked about before it is
-/// written: walking away from the alert leaves the catalog exactly as it was.
 #[test]
 fn a_delete_should_ask_before_it_takes_the_entry_out_of_the_catalog() {
     let mut harness = Harness::with_config(configured());
@@ -830,7 +763,6 @@ fn a_delete_should_ask_before_it_takes_the_entry_out_of_the_catalog() {
     );
 }
 
-/// The alert a delete raises names the entry it is about, and confirms it away at once.
 #[test]
 fn a_delete_alert_should_write_the_removal_at_once() {
     let mut harness = Harness::with_config(configured());
@@ -871,7 +803,6 @@ fn a_delete_alert_should_write_the_removal_at_once() {
     );
 }
 
-/// The alert a delete raises names the entry it is about, in either language.
 #[test]
 fn the_delete_alert_should_name_the_entry_in_both_languages() {
     for language in [LanguageCode::En, LanguageCode::ZhCn] {
@@ -898,8 +829,6 @@ fn the_delete_alert_should_name_the_entry_in_both_languages() {
     }
 }
 
-/// The form is drawn over the settings and takes the mouse from them: a click aimed at the
-/// settings under it reaches the form instead, so they are out of reach while it is up.
 #[test]
 fn a_form_should_keep_the_settings_under_it_out_of_reach() {
     let mut harness = Harness::with_config(configured());
@@ -925,8 +854,6 @@ fn a_form_should_keep_the_settings_under_it_out_of_reach() {
     );
 }
 
-/// A form whose entry could not be stored stays open with what was typed, and the settings page
-/// reports why rather than publishing the entry as if it had been stored.
 #[test]
 fn a_failed_add_should_keep_the_form_open_and_report() {
     let mut harness = Harness::new();
@@ -954,7 +881,6 @@ fn a_failed_add_should_keep_the_form_open_and_report() {
     );
 }
 
-/// A delete that could not be stored keeps the entry and reports why.
 #[test]
 fn a_failed_delete_should_keep_the_entry_and_report() {
     let mut harness = Harness::with_config(configured());
@@ -976,7 +902,6 @@ fn a_failed_delete_should_keep_the_entry_and_report() {
     );
 }
 
-/// Escape leaves the form without writing it, the way the cancel button does.
 #[test]
 fn escape_should_leave_the_form_without_writing_it() {
     let mut harness = Harness::with_config(configured());
@@ -1002,7 +927,6 @@ fn escape_should_leave_the_form_without_writing_it() {
     );
 }
 
-/// Tab moves the focus inside the form, so the form is reachable from the keyboard alone.
 #[test]
 fn tab_should_move_the_focus_inside_the_form() {
     let mut harness = Harness::with_config(configured());
@@ -1031,7 +955,6 @@ fn tab_should_move_the_focus_inside_the_form() {
     assert_ne!(second, first, "tab should move the focus on");
 }
 
-/// Enter activates the focused control, so the form can be confirmed from the keyboard.
 #[test]
 fn enter_should_activate_the_confirm_button() {
     let mut harness = Harness::new();
@@ -1062,8 +985,6 @@ fn enter_should_activate_the_confirm_button() {
     );
 }
 
-/// Closing the form releases the controls it built: a control whose handler outlived its form
-/// would answer a click on the next form built under the same key.
 #[test]
 fn closing_the_form_should_release_its_control_handlers() {
     let mut harness = Harness::with_config(configured());
@@ -1084,8 +1005,6 @@ fn closing_the_form_should_release_its_control_handlers() {
     );
 }
 
-/// Leaving the page releases the catalog's controls and the form it opened: the actions the page
-/// registered are gone with it.
 #[test]
 fn leaving_the_page_should_release_the_catalog_and_its_dialogs() {
     let mut harness = Harness::with_config(configured());
@@ -1133,7 +1052,6 @@ fn leaving_the_page_should_release_the_catalog_and_its_dialogs() {
     );
 }
 
-/// The `Server management` page is searched for by the words the old page was reachable by.
 #[test]
 fn the_page_should_be_reachable_through_the_search() {
     let mut harness = Harness::new();
@@ -1150,8 +1068,6 @@ fn the_page_should_be_reachable_through_the_search() {
     );
 }
 
-/// A window that is only one page tall still opens the page's dialogs: the dialog is drawn by
-/// the frame the request asks for, not by a frame the page's own layout would have to request.
 #[test]
 fn a_form_should_be_drawn_by_the_frame_the_click_asks_for() {
     let mut harness = Harness::with_config(configured());
@@ -1166,8 +1082,6 @@ fn a_form_should_be_drawn_by_the_frame_the_click_asks_for() {
     );
 }
 
-/// The form draws a control the entry's authentication is chosen in, and one the DNS mode is
-/// chosen in: the two values an entry stores beside its endpoint.
 #[test]
 fn the_form_should_draw_the_choices_an_entry_stores() {
     let mut harness = Harness::with_config(configured());
@@ -1196,8 +1110,6 @@ fn the_form_should_draw_the_choices_an_entry_stores() {
     }
 }
 
-/// The form of an entry that is already stored starts from what the entry holds, so confirming
-/// it without touching anything stores the entry it was opened on.
 #[test]
 fn an_edit_form_should_start_from_the_entry_it_edits() {
     let mut harness = Harness::with_config(configured());
@@ -1230,8 +1142,6 @@ fn an_edit_form_should_start_from_the_entry_it_edits() {
     );
 }
 
-/// One entry's row is its own: two rows of the catalog draw their own controls and ask for their
-/// own entry.
 #[test]
 fn each_row_should_ask_for_its_own_entry() {
     let mut config = Config::default();
@@ -1264,8 +1174,6 @@ fn each_row_should_ask_for_its_own_entry() {
     );
 }
 
-/// A language change rebuilds the page the catalog is drawn by: the labels it carries and the
-/// handlers its rows dispatch are the new page's, not the one that was released.
 #[test]
 fn a_language_change_should_redraw_the_catalog() {
     let mut harness = Harness::with_config(configured());
@@ -1284,8 +1192,6 @@ fn a_language_change_should_redraw_the_catalog() {
     );
 }
 
-/// Opening and closing the form repeatedly is one form at a time: a form that left its state
-/// behind would answer the next one with the values of the one before it.
 #[test]
 fn opening_and_closing_the_form_should_leave_one_form_behind() {
     let mut harness = Harness::with_config(configured());
@@ -1317,8 +1223,6 @@ fn opening_and_closing_the_form_should_leave_one_form_behind() {
     );
 }
 
-/// A language change rebuilds the page, and the form the page owned is released with it: the
-/// dialog is not left over a page that is no longer the one that opened it.
 #[test]
 fn a_language_change_should_release_the_form_the_page_owned() {
     let mut harness = Harness::with_config(configured());
@@ -1347,7 +1251,6 @@ fn a_language_change_should_release_the_form_the_page_owned() {
     );
 }
 
-/// A fresh page with a proxy whose authentication is `None` draws no mask and no username.
 #[test]
 fn an_entry_without_authentication_should_draw_no_credentials() {
     let mut config = Config::default();

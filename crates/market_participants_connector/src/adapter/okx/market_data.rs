@@ -1,10 +1,3 @@
-//! OKX market-data operation helpers and REST response decoders.
-//!
-//! Every decoder answers with the venue's own numbers paired with the listing
-//! the venue named: the public market-data endpoints are addressed by `instId`,
-//! so the identity of a row is resolved here, at the last place where the
-//! venue's own identifier is authoritative.
-
 use bytes::Bytes;
 use market_participants_model::{
     decimal::{Price, Quantity},
@@ -31,7 +24,6 @@ use crate::{
     market_participants::model::NativeOrderBookLevel,
 };
 
-/// One public OKX REST GET against the endpoint this request was resolved for.
 pub(crate) async fn public_get(
     context: &ExecutionContext,
     path: &str,
@@ -69,7 +61,6 @@ pub(crate) async fn public_get(
     Ok(body)
 }
 
-/// Decodes one `{ code, msg, data }` OKX response and returns its rows.
 pub(crate) fn decode_public<T: DeserializeOwned>(
     body: &[u8],
     operation: &'static str,
@@ -89,19 +80,8 @@ pub(crate) fn decode_public<T: DeserializeOwned>(
     Ok(response.data)
 }
 
-/// The position of the traded volume in one OKX candlestick row.
-///
-/// OKX counts the volume of a candle in the unit the instrument's own quantity
-/// rule names, and publishes it at this one position for every product line: a
-/// spot row counts the base currency, a derivative row counts contracts, and the
-/// base amount of a derivative follows in the next field. The model labels this
-/// field with the listing's own `QuantityUnit`, so reading the base amount of a
-/// derivative here would publish a base amount under the `Contracts` unit its
-/// listing sizes orders in; the `candle` channel pushes the same position and is
-/// therefore decoded into the same field-to-unit mapping.
 const CANDLE_VOLUME_FIELD: usize = 5;
 
-/// Decodes one candlestick answer.
 pub(crate) fn decode_candlesticks(
     body: &[u8],
 ) -> Result<Vec<NativeCandlestick>, MarketParticipantError> {
@@ -145,7 +125,6 @@ pub(crate) fn decode_candlesticks(
     Ok(values)
 }
 
-/// Decodes the one ticker of one instrument.
 pub(crate) fn decode_ticker(
     instrument_type: OkxInstrumentType,
     listing: &VenueListingKey,
@@ -172,12 +151,6 @@ pub(crate) fn decode_ticker(
     ))
 }
 
-/// Decodes every ticker of one route, each under the listing the venue named.
-///
-/// A route answers for instruments its published catalog also holds: the listing
-/// key is derived from the venue's own identifier, and a ticker whose instrument
-/// the venue named cannot resolve is a protocol failure rather than a row
-/// silently attributed to another listing.
 pub(crate) fn decode_tickers(
     route: &VenueRoute,
     instrument_type: OkxInstrumentType,
@@ -194,8 +167,6 @@ pub(crate) fn decode_tickers(
     Ok(tickers)
 }
 
-/// The ticker of one instrument, as OKX publishes it on the HTTP endpoint and on
-/// the `tickers` channel.
 pub(crate) fn ticker_of(
     instrument_type: OkxInstrumentType,
     item: &OkxTickerData,
@@ -210,8 +181,6 @@ pub(crate) fn ticker_of(
         body,
     )?;
     Ok(NativeTicker {
-        // OKX publishes no separate rolling-statistics counter, so the `ts` of
-        // the snapshot is the venue's own marker for the statistics it carries.
         monotonic_id: Some(parse_i64(&item.ts, body, "decode OKX ticker timestamp")?),
         open: parse_price(&item.open_24h, body, "decode OKX ticker open")?,
         high: Some(parse_price(&item.high_24h, body, "decode OKX ticker high")?),
@@ -222,18 +191,6 @@ pub(crate) fn ticker_of(
     })
 }
 
-/// The 24-hour volumes of one ticker, as a traded amount and a monetary amount.
-///
-/// OKX switches the unit of both fields with the instrument type, and each field
-/// is read for the unit the listing's own quantity rule names. A spot ticker
-/// counts base currency in `vol24h` and quote currency in `volCcy24h`; a
-/// derivative counts *contracts* in `vol24h` and base currency in `volCcy24h`.
-/// The quote amount of a derivative is therefore its base amount priced at the
-/// ticker's last price, while its traded quantity is the contract count — the
-/// same unit OKX sizes a derivative order in.
-///
-/// The HTTP ticker and the `tickers` channel publish the two fields with the
-/// same units, so both decoders read them through this function.
 pub(crate) fn decode_ticker_volumes(
     instrument_type: OkxInstrumentType,
     vol_24h: &SmolStr,
@@ -263,7 +220,6 @@ pub(crate) fn decode_ticker_volumes(
     }
 }
 
-/// Decodes one order-book snapshot of one listing.
 pub(crate) fn decode_order_book(
     listing: &VenueListingKey,
     body: &[u8],
@@ -276,9 +232,6 @@ pub(crate) fn decode_order_book(
                 reason: "order-book response must contain exactly one item".into(),
                 raw_data: Some(Bytes::copy_from_slice(body)),
             })?;
-    // OKX numbers its books; a snapshot that carries no `seqId` cannot be
-    // replayed against a later update, so its absence is a protocol failure
-    // rather than a zero this adapter would have invented.
     let sequence = item
         .seq_id
         .ok_or_else(|| MarketParticipantError::ProtocolError {
@@ -302,7 +255,6 @@ pub(crate) fn decode_order_book(
     ))
 }
 
-/// Decodes the recent market trades of one listing.
 pub(crate) fn decode_trades(
     listing: &VenueListingKey,
     instrument_id: &str,
@@ -360,11 +312,6 @@ fn decode_levels(
         .collect()
 }
 
-/// Orders one book the way its own sides are published.
-///
-/// OKX pushes the removal of a level as a row of quantity zero, and its sides
-/// arrive in the order the venue's matching engine holds them; the levels that
-/// remain are sorted by price so the book is the one the model requires.
 fn normalize_order_book(
     mut value: NativeOrderBook,
 ) -> Result<NativeOrderBook, MarketParticipantError> {
@@ -433,7 +380,6 @@ fn parse_quantity(
         })
 }
 
-/// One OKX candlestick row, which is a positional array of strings.
 #[derive(Debug, Deserialize)]
 struct OkxCandleRow(Vec<SmolStr>);
 
@@ -475,7 +421,6 @@ pub(crate) struct OkxTickerData {
 }
 
 impl OkxTickerData {
-    /// Returns the venue instrument this ticker is about.
     pub(crate) fn inst_id(&self) -> &NativeSymbol {
         &self.inst_id
     }
@@ -634,10 +579,6 @@ mod tests {
         assert_eq!(trades[0].data.quantity.to_string(), "2.5");
     }
 
-    /// OKX switches the unit of both 24-hour volumes with the instrument type:
-    /// the derivative branch reads the contract count as the traded quantity —
-    /// the unit its listing declares — and prices the base amount into the quote
-    /// amount.
     #[test]
     fn ticker_volumes_follow_the_unit_of_the_instrument_type() {
         let (_, spot_listing) = listing(SPOT_SCOPE, OkxInstrumentType::Spot, "BTC-USDT");
@@ -681,9 +622,6 @@ mod tests {
         );
     }
 
-    /// One real OKX swap answer: the two volume fields differ by the contract
-    /// multiplier, so reading the wrong one reports the base amount as if it were
-    /// the contract count.
     #[test]
     fn a_derivative_volume_is_read_as_contracts_not_as_base_currency() {
         let (_, swap_listing) = listing(SWAP_SCOPE, OkxInstrumentType::Perpetual, "BTC-USDT-SWAP");
@@ -709,10 +647,6 @@ mod tests {
         );
     }
 
-    /// A derivative candle counts contracts first and the base amount second, so
-    /// reading the base amount would report a hundred times the traded quantity of
-    /// a swap whose contract is worth a hundredth of its base currency. The value
-    /// the model labels with the listing's unit is the contract count.
     #[test]
     fn derivative_candles_read_the_contract_count_not_the_base_amount() {
         let candles = decode_candlesticks(&Bytes::from_static(
@@ -733,8 +667,6 @@ mod tests {
         );
     }
 
-    /// A route-level ticker answer names its instruments, and each row keeps the
-    /// listing key its own instrument derives.
     #[test]
     fn route_level_tickers_keep_each_rows_own_listing() {
         let swap = route(SWAP_SCOPE);
@@ -758,8 +690,6 @@ mod tests {
         assert_eq!(tickers[1].listing, eth);
     }
 
-    /// An order-book answer without a sequence cannot be replayed, so it is
-    /// refused instead of being published under an invented sequence of zero.
     #[test]
     fn an_order_book_without_a_sequence_is_refused() {
         let (_, spot_listing) = listing(SPOT_SCOPE, OkxInstrumentType::Spot, "BTC-USDT");
@@ -778,8 +708,6 @@ mod tests {
         ));
     }
 
-    /// OKX pushes the removal of a level as a zero-quantity row, and a book is
-    /// only the model's book once its sides are ordered.
     #[test]
     fn order_book_levels_drop_zero_quantities_and_are_ordered() {
         let (_, spot_listing) = listing(SPOT_SCOPE, OkxInstrumentType::Spot, "BTC-USDT");

@@ -1,6 +1,3 @@
-//! The tests of the connection module: the plan one dial is declared by, the handshake
-//! it reaches the wire with, and the refusals each step of it is answered with.
-
 use std::sync::Arc;
 
 use market_participants_model::routing::CapabilityId;
@@ -23,7 +20,6 @@ use crate::{
     runtime::LongbridgeCredentialValues,
 };
 
-/// One header of one request the fixture answered, as the request spelled it.
 fn read(headers: &[(String, String)], name: &str) -> SmolStr {
     headers
         .iter()
@@ -32,7 +28,6 @@ fn read(headers: &[(String, String)], name: &str) -> SmolStr {
         .unwrap_or_else(|| panic!("the request carries no {name} header: {headers:?}"))
 }
 
-/// One credential set whose first value is `value`.
 fn starting_with(value: &'static str) -> LongbridgeCredentialValues {
     LongbridgeCredentialValues {
         app_key: SmolStr::new(value),
@@ -41,14 +36,10 @@ fn starting_with(value: &'static str) -> LongbridgeCredentialValues {
     }
 }
 
-/// One plan of one fixture execution.
 fn plan(context: &crate::adapter::ExecutionContext) -> ConnectionPlan {
     ConnectionPlan::of(context, &credential_values()).expect("the fixture connection is planned")
 }
 
-/// The data centre is the credentials' own: any one of the three values that
-/// starts with `us_` is a US credential, and everything else is the gateway's
-/// Asian default.
 #[test]
 fn the_data_centre_is_derived_from_the_credentials() {
     assert_eq!(data_centre(&credential_values()), "ap");
@@ -70,8 +61,6 @@ fn the_data_centre_is_derived_from_the_credentials() {
     );
 }
 
-/// Both headers every Longbridge request carries are the design's own: the
-/// language the venue words its answers in, and the region of the credentials.
 #[test]
 fn the_two_region_headers_are_the_designs_own() {
     let headers = region_headers(&starting_with("us_app-key"));
@@ -87,9 +76,6 @@ fn the_two_region_headers_are_the_designs_own() {
     assert_eq!(headers.len(), 2, "and nothing else is declared");
 }
 
-/// The endpoint is the region's own origin with the protocol's query appended, the
-/// account is the venue itself, and the key counts exactly the headers the dial
-/// presents — so a region change is a different key rather than a reused socket.
 #[tokio::test]
 async fn the_planned_connection_is_the_regions_own() {
     let fixture = LongbridgeFixture::install(
@@ -128,9 +114,6 @@ async fn the_planned_connection_is_the_regions_own() {
     );
 }
 
-/// The handshake reaches the wire in the venue's own order: the OTP over HTTP with
-/// both headers, then AUTH with request id zero, then the market-data profile —
-/// and the socket's own upgrade carried the two headers the venue routes by.
 #[tokio::test]
 async fn the_handshake_reaches_the_wire_in_the_venues_own_order() {
     let fixture = LongbridgeFixture::install(
@@ -200,11 +183,6 @@ async fn the_handshake_reaches_the_wire_in_the_venues_own_order() {
         token_headers[0]
     );
 
-    // The request that reaches the venue is signed, and the signature is the one
-    // §4.9 states for the values it presented: the fixture recomputes it the way
-    // the venue does — over the token, the key and the instant the headers carry —
-    // and the two have to agree. An unsigned request, or one that signed a value
-    // it then changed, is what the live run measured as `403201 signature invalid`.
     let signings = fixture.token_signings();
     assert_eq!(signings.len(), 1, "one signed token request");
     let (presented, computed) = &signings[0];
@@ -246,10 +224,6 @@ async fn the_handshake_reaches_the_wire_in_the_venues_own_order() {
     );
 
     assert!(session.us_market_data, "the profile granted US market data");
-    // The first handshake writes the same authenticated state the connection layer
-    // writes for every reconnection: the venue-level account and the password the
-    // socket was opened with. A socket whose state said otherwise would be
-    // handshaken a second time by the next request that found it in the pool.
     let ConnectionState::Stateful {
         authenticated,
         account_id,
@@ -274,10 +248,6 @@ async fn the_handshake_reaches_the_wire_in_the_venues_own_order() {
     );
 }
 
-/// A socket the pool already holds and that this build already authenticated is
-/// not handshaken again: the state the first call wrote is what the second call
-/// reads, so the venue sees one AUTH frame and hands out one password per socket
-/// rather than one of each per request.
 #[tokio::test]
 async fn a_healthy_pooled_socket_is_not_handshaken_twice() {
     let fixture = LongbridgeFixture::install(
@@ -320,13 +290,6 @@ async fn a_healthy_pooled_socket_is_not_handshaken_twice() {
     );
 }
 
-/// A venue that is out of connection slots is refused with its own numbers, and
-/// the refusal is worth retrying: another session may already have ended.
-///
-/// The password is what answers the refusal, and it is fetched before anything is
-/// dialled, so the socket this build would have counted towards the venue's own
-/// `online` is never opened: a refusal that cost a socket would be a refusal that
-/// made the account's own situation worse.
 #[tokio::test]
 async fn a_venue_with_no_free_connection_slot_states_its_own_numbers() {
     let fixture = LongbridgeFixture::install(
@@ -378,10 +341,6 @@ async fn a_venue_with_no_free_connection_slot_states_its_own_numbers() {
     );
 }
 
-/// A token endpoint the venue refuses is the refusal it is, and the code a reader
-/// gets is the venue's own envelope code rather than the transport status: a 5xx
-/// that states its own reason is answered with that reason, and the failure is worth
-/// retrying because it is the venue failing to answer rather than declining.
 #[tokio::test]
 async fn a_refused_token_endpoint_is_the_refusal_it_is() {
     let fixture = LongbridgeFixture::install(
@@ -415,8 +374,6 @@ async fn a_refused_token_endpoint_is_the_refusal_it_is() {
     assert!(fixture.frames().is_empty(), "no socket was opened");
 }
 
-/// A refused authentication fails the whole acquisition, typed as the credential
-/// failure it is, and the profile is never asked for.
 #[tokio::test]
 async fn a_refused_authentication_fails_the_connection() {
     let fixture = LongbridgeFixture::install(
@@ -449,9 +406,6 @@ async fn a_refused_authentication_fails_the_connection() {
     );
 }
 
-/// A refused profile fails the whole acquisition as the venue's own refusal, which
-/// is what a market-data profile that cannot be read is: there is no pace to honour
-/// and no permission to judge a command by.
 #[tokio::test]
 async fn a_refused_profile_fails_the_connection() {
     let fixture = LongbridgeFixture::install(
@@ -479,15 +433,6 @@ async fn a_refused_profile_fails_the_connection() {
     );
 }
 
-/// The OTP request the adapter actually sends is signed, and the signature is the
-/// one §4.9's algorithm states for the values it presents.
-///
-/// The live run is the reason this is an assertion rather than a description: the
-/// venue answered `401 {"code":401001,"message":"token empty"}` to the two-header
-/// request this build sent before, so a request without the four signing headers is
-/// not one the venue serves. The fixture asserts on what arrived rather than on
-/// what was configured, and the arm computed over a different message is the
-/// control: it fails whenever the signature is a value merely compared with itself.
 #[tokio::test]
 async fn the_otp_request_is_signed_with_the_algorithm_the_venue_accepts() {
     let fixture = LongbridgeFixture::install(
@@ -505,9 +450,6 @@ async fn the_otp_request_is_signed_with_the_algorithm_the_venue_accepts() {
     let headers = fixture.token_header_blocks();
     assert_eq!(headers.len(), 1, "the dial asked for one password");
     let presented: Vec<&str> = headers[0].iter().map(|(name, _)| name.as_str()).collect();
-    // The six this build states: the two the venue routes by, the three the
-    // signature covers, and the signature itself. The client adds its own transport
-    // headers beside them, which is why the list is not asserted to be exactly six.
     for name in [
         "accept-language",
         "x-dc-region",
@@ -522,9 +464,6 @@ async fn the_otp_request_is_signed_with_the_algorithm_the_venue_accepts() {
         );
     }
 
-    // What the request signed is read off the request itself, and the signature it
-    // carried is recomputed from those same values: a request that signed a stale
-    // instant, or a value it then changed, is exactly what the venue refuses.
     let credentials = credential_values();
     let signed_values = format!(
         "authorization:{}\nx-api-key:{}\nx-timestamp:{}\n",

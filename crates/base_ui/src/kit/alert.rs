@@ -1,58 +1,3 @@
-//! 对话框内容面板（旧 `crate::alert` 的引擎化重建，P2-4a）。
-//!
-//! 旧 `Alert` 是**浮层内容**：`LayerExt::alert` 把它挂在窗口层的 alert 槽里，遮罩 / 面板 / 进出场
-//! 动画由 `dialog` 层负责；它自己只画「标题 + 消息 + 可选输入 + 按钮行」。本批（P2-4a）没有迁移
-//! 浮层（`crate::layer` / `crate::dialog` 属 P2-4b），所以这里交付**同一块内容面板**，四种形状原样
-//! 保留：
-//!
-//! | 构造器 | 形状 |
-//! |---|---|
-//! | [`AlertBuilder::ok`] | 标题 + 消息 + OK |
-//! | [`AlertBuilder::ok_cancel`] | 标题 + 消息 + OK + Cancel |
-//! | [`AlertBuilder::input_ok`] | 标题 + 消息 + 输入 + OK |
-//! | [`AlertBuilder::input_ok_cancel`] | 标题 + 消息 + 输入 + OK + Cancel |
-//!
-//! `build` 返回 [`Alert`]，其中 `root` 是要挂进对话框面板的节点；P2-4b 的 `LayerExt::alert` 只是把它
-//! 包进遮罩 + 面板 + 进出场动画，面板内容不需要重写。
-//!
-//! # 排版（按旧实现）
-//!
-//! 面板宽 384 px、列间距 8 px、裁剪子树；消息 16 px；输入框与错误行同列（间距 4 px），错误行
-//! 14 px + `status.danger.base` 前景；按钮行由本模块自己布局 —— 单按钮铺满面板，双按钮各占一半
-//! 且内容居中（旧 `Join + flex_1 + justify_center`；`Button` 不新增 flex 拉伸语义）。
-//!
-//! # 校验（旧语义原样保留）
-//!
-//! `validate` 在点 OK 时跑：`Err(message)` 把 message 写进错误行、**不**关闭（不调用 `ok_action`）；
-//! `Ok(())` 清掉错误并调用 `ok_action(value)`（没有输入框的 alert 传 `None`）。旧实现用
-//! `MarkdownState` 画消息与错误，新实现是纯文本（`kit::markdown` 的 view 是 P2-3 的独立组件，
-//! 对话框内容的富文本接线随 P2-4b；登记见 spec-delta §3）。
-//!
-//! # 与 `kit::dialog` 组合（P2-4d1 / P2-4a3）
-//!
-//! alert 只是内容面板：容器 / 模态 / 焦点 / 遮罩 / 动画 / 对话框 a11y 角色都归
-//! [`crate::kit::dialog`]（E12-R1：包装节点声明 `Dialog` / `AlertDialog`）。因此：
-//!
-//! - **内容根不声明对话框角色**，只是 `GenericContainer`（P2-4a3 修 P2-4d1 审查 D6：P2-4a
-//!   交付时内容根声明 `Dialog`，与包装层重复，AT 会读两层对话框）；标题仍由标题文本节点提供；
-//! - **关闭中守卫**：内容按钮（OK / Cancel）在容器开始关闭（淡出）后不再跑用户动作 —— 由
-//!   dialog 挂载内容时经 `AlertBuilder::closing_guard` 注入。旧 dialog 在面板上
-//!   `capture_any_mouse_down` 吞掉退场窗口内的按下；引擎化后内容节点仍是活节点，必须由容器
-//!   告知（P2-4d1 审查 D2 的 alert 内容按钮同类缺陷）；
-//! - **Esc / X 归 dialog**：alert 恒无关闭按钮（旧 alert 没有 X）；Esc 由引擎立即卸载浮层并报
-//!   `Dismissed`，**不跑** `cancel_action`（引擎没有应用层关闭钩子，见 [`crate::kit::dialog`]
-//!   模块文档「alert 的 Esc 语义」）；
-//! - **按钮行**：铺满 / 等分 / 文字居中由 `kit::button` 的 `stretch_button` 统一实现，
-//!   dialog 的确认 / 取消按钮行共用同一份（P2-4a3 去重，AGENTS §6）。
-//!
-//! # 与旧 API 的差异
-//!
-//! - 旧 builder 的输入是 `Entity<InputState>`；新 API 收一个**输入框工厂**（`FnOnce(&mut NodeTree,
-//!   NodeId) -> InputNode`），因为新引擎的输入框是挂载期节点、必须由持有 `Theme` 的调用方建；
-//! - 旧 alert 自己关闭（`window.dismiss_alert`）；新 alert 通过回调把关闭决定交给 P2-4b 的浮层；
-//! - 旧 alert 没有关闭按钮、没有超时（确认：旧 `alert.rs` 全文无 `close` / timeout 分支），本批
-//!   同样不提供 —— 关闭只有 OK / Cancel 两条路。
-
 use std::{
     rc::Rc,
     sync::{
@@ -87,51 +32,38 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-/// 面板宽度（旧 `.w_96()` = 24 rem = 384 px）。
 const PANEL_WIDTH: f32 = 384.0;
 
-/// alert 的四种形状。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlertKind {
-    /// 标题 + 消息 + OK。
     Ok,
-    /// 标题 + 消息 + OK + Cancel。
     OkCancel,
-    /// 标题 + 消息 + 输入 + OK。
     InputOk,
-    /// 标题 + 消息 + 输入 + OK + Cancel。
     InputOkCancel,
 }
 
 impl AlertKind {
-    /// 是否有 Cancel 按钮。
     #[must_use]
     pub fn with_cancel(&self) -> bool {
         matches!(self, AlertKind::OkCancel | AlertKind::InputOkCancel)
     }
 
-    /// 是否有输入框。
     #[must_use]
     pub fn with_input(&self) -> bool {
         matches!(self, AlertKind::InputOk | AlertKind::InputOkCancel)
     }
 }
 
-/// 输入框工厂：调用方在 alert 的面板里挂一个 [`InputNode`]（持有 `Theme` 与状态信号）。
 pub type InputFactory = Rc<dyn Fn(&mut NodeTree, NodeId) -> InputNode>;
 
-/// 校验函数：`Err(message)` 显示在输入框下并阻止关闭。
 pub type Validator = Rc<dyn Fn(&str) -> Result<(), SmolStr>>;
 
-/// OK 动作：参数是输入值（没有输入框时为 `None`）。
 pub type OkAction = Rc<dyn Fn(Option<SmolStr>, &mut App)>;
 
-/// Cancel 动作。
 pub type CancelAction = Rc<dyn Fn(&mut App)>;
 
 static ALERT_SEQUENCE: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
-/// alert 面板的 builder（形状 / 文案 / 动作都选好之后 `build`）。
 pub struct AlertBuilder {
     kind: AlertKind,
     title: SmolStr,
@@ -142,12 +74,10 @@ pub struct AlertBuilder {
     validate: Option<Validator>,
     ok_action: Option<OkAction>,
     cancel_action: Option<CancelAction>,
-    /// 容器「关闭中」探针（由 [`crate::kit::dialog`] 注入，见 [`AlertBuilder::closing_guard`]）。
     closing: Option<Rc<dyn Fn() -> bool>>,
 }
 
 impl AlertBuilder {
-    /// 空 builder（默认 `Ok` 形状、`OK` / `Cancel` 文案）。
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -164,7 +94,6 @@ impl AlertBuilder {
         }
     }
 
-    /// 标题 + 消息 + OK。
     #[must_use]
     pub fn ok(mut self, title: impl Into<SmolStr>, message: impl Into<SmolStr>) -> Self {
         self.kind = AlertKind::Ok;
@@ -173,7 +102,6 @@ impl AlertBuilder {
         self
     }
 
-    /// 标题 + 消息 + OK + Cancel。
     #[must_use]
     pub fn ok_cancel(mut self, title: impl Into<SmolStr>, message: impl Into<SmolStr>) -> Self {
         self.kind = AlertKind::OkCancel;
@@ -182,7 +110,6 @@ impl AlertBuilder {
         self
     }
 
-    /// 标题 + 消息 + 输入 + OK。
     #[must_use]
     pub fn input_ok(
         mut self,
@@ -197,7 +124,6 @@ impl AlertBuilder {
         self
     }
 
-    /// 标题 + 消息 + 输入 + OK + Cancel。
     #[must_use]
     pub fn input_ok_cancel(
         mut self,
@@ -212,55 +138,41 @@ impl AlertBuilder {
         self
     }
 
-    /// OK 按钮文案。
     #[must_use]
     pub fn ok_text(mut self, text: impl Into<SmolStr>) -> Self {
         self.ok_text = text.into();
         self
     }
 
-    /// Cancel 按钮文案。
     #[must_use]
     pub fn cancel_text(mut self, text: impl Into<SmolStr>) -> Self {
         self.cancel_text = text.into();
         self
     }
 
-    /// 校验（点 OK 时跑；`Err` 显示错误并保持打开）。
     #[must_use]
     pub fn validate(mut self, validate: impl Fn(&str) -> Result<(), SmolStr> + 'static) -> Self {
         self.validate = Some(Rc::new(validate));
         self
     }
 
-    /// OK 动作（关闭之后由调用方通过 P2-4b 的浮层执行，或直接在这里处理）。
     #[must_use]
     pub fn ok_action(mut self, action: impl Fn(Option<SmolStr>, &mut App) + 'static) -> Self {
         self.ok_action = Some(Rc::new(action));
         self
     }
 
-    /// Cancel 动作。
     #[must_use]
     pub fn cancel_action(mut self, action: impl Fn(&mut App) + 'static) -> Self {
         self.cancel_action = Some(Rc::new(action));
         self
     }
 
-    /// 「关闭中」守卫（crate 内部：由 [`crate::kit::dialog`] 挂载 alert 内容时注入）。
-    ///
-    /// 返回 `true`（容器已开始关闭、正在淡出）时内容按钮不再运行用户动作 —— 旧 dialog 在面板上
-    /// `capture_any_mouse_down` 吞掉退场窗口内的按下，引擎化后内容按钮仍是活节点，由容器告知，
-    /// 避免删除类确认在 150 ms 淡出窗口内被双击执行两次（P2-4d1 审查 D2；P2-4a3 修 alert 内容）。
     pub(crate) fn closing_guard(mut self, closing: impl Fn() -> bool + 'static) -> Self {
         self.closing = Some(Rc::new(closing));
         self
     }
 
-    /// 建面板（标题 / 消息 / 输入 + 错误行 / 按钮行）。
-    ///
-    /// # Errors
-    /// `UnknownWindow` / `StaleNode` / 按钮或图标资源错误。
     pub fn build(
         self,
         app: &mut App,
@@ -289,8 +201,6 @@ impl AlertBuilder {
                 ..StylePatch::default()
             })
             .a11y(A11yOverride {
-                // E12-R1：对话框角色只由 `kit::dialog` 的包装节点声明；内容根只是通用容器
-                // （P2-4a 曾声明 `Dialog`，与包装层形成两层对话框角色，P2-4d1 审查 D6）。
                 role: Some(A11yRole::GenericContainer),
                 ..A11yOverride::default()
             });
@@ -318,7 +228,6 @@ impl AlertBuilder {
             root,
         )?;
         let msg_theme = message_color;
-        // 旧实现的消息是 Markdown，继承窗口默认字号（16 px）；新实现是纯文本，按旧字号写死。
         NodeBuilder::text(self.message.clone(), TextStyle::new(16.0))
             .bind_style(move |cx| StylePatch {
                 foreground: Some(msg_theme.role(cx, Role::FgDefault)),
@@ -332,7 +241,6 @@ impl AlertBuilder {
             )?;
         let mut input_node = None;
         if let Some(factory) = &self.input {
-            // 旧实现把输入框与错误行放在内层列里、列间距 4 px（旧 `.gap_1()`）。
             let input_column = NodeBuilder::boxed()
                 .style(StyleBuilder::new().flex_col().gap(4.0).build())
                 .build(
@@ -452,7 +360,6 @@ impl Default for AlertBuilder {
     }
 }
 
-/// 建好的 alert 面板。
 pub struct Alert {
     root: NodeId,
     title: SmolStr,
@@ -464,52 +371,41 @@ pub struct Alert {
 }
 
 impl Alert {
-    /// 面板根节点（挂进 P2-4b 的对话框面板）。
     #[must_use]
     pub fn root_node(&self) -> NodeId {
         self.root
     }
 
-    /// 标题（a11y 名 / 测试用）。
     #[must_use]
     pub fn title(&self) -> &str {
         &self.title
     }
 
-    /// OK 按钮。
     #[must_use]
     pub fn ok_button(&self) -> &Button {
         &self.ok_button
     }
 
-    /// Cancel 按钮（没有取消形状时 `None`）。
     #[must_use]
     pub fn cancel_button(&self) -> Option<&Button> {
         self.cancel_button.as_ref()
     }
 
-    /// 输入框节点（没有输入形状时 `None`）。
     #[must_use]
     pub fn input(&self) -> Option<&InputNode> {
         self.input.as_ref()
     }
 
-    /// 当前错误文案（`None` = 无错误）。
     #[must_use]
     pub fn error(&self, app: &App) -> Option<SmolStr> {
         app.read_with(&self.error, |error| error.clone())
     }
 
-    /// 错误行是否可见。
     #[must_use]
     pub fn has_error(&self, app: &App) -> bool {
         self.error(app).is_some()
     }
 
-    /// 帧同步（按钮状态；输入框由调用方按 `InputNode` 的契约同步）。
-    ///
-    /// # Errors
-    /// 同 [`Button::sync`]。
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let mut changed = self.ok_button.sync(app)?;
         if let Some(cancel) = &self.cancel_button {
@@ -518,7 +414,6 @@ impl Alert {
         Ok(changed)
     }
 
-    /// 释放组件（按钮信号 / Action + 错误信号作用域）。
     pub fn release(&self, app: &mut App) -> usize {
         let buttons = self.ok_button.release(app)
             + self
@@ -632,7 +527,6 @@ mod tests {
         let _ = app.drain().expect("frame");
     }
 
-    /// 四种形状：取消 / 输入的组合与旧实现一致。
     #[test]
     fn the_four_alert_kinds_keep_their_old_shapes() {
         let shapes = [
@@ -673,7 +567,6 @@ mod tests {
         }
     }
 
-    /// 旧断言恢复：单按钮铺满面板（按钮行是 `kit::alert` 自己建的，不归 P2-4b 面板）。
     #[test]
     fn an_alert_without_a_cancel_button_should_draw_one_filling_button() {
         let harness = harness(|builder, _, _| builder.ok("Saved", "The file has been written."));
@@ -713,7 +606,6 @@ mod tests {
         }
     }
 
-    /// 旧断言恢复：两个按钮均分并铺满面板，内容居中（旧 `Join + flex_1 + justify_center`）。
     #[test]
     fn two_buttons_should_share_the_panel() {
         let harness = harness(|builder, _, _| builder.ok_cancel("Discard", "Lose changes?"));
@@ -762,7 +654,6 @@ mod tests {
         }
     }
 
-    /// OK：跑 `ok_action(None)`（没有输入框）。
     #[test]
     fn the_ok_button_runs_the_ok_action_with_no_value() {
         let reported: Rc<RefCell<Option<Option<smol_str::SmolStr>>>> = Rc::new(RefCell::new(None));
@@ -782,7 +673,6 @@ mod tests {
         );
     }
 
-    /// Cancel：跑 `cancel_action`，不跑 OK 动作。
     #[test]
     fn the_cancel_button_runs_only_the_cancel_action() {
         let cancelled = Rc::new(Cell::new(0usize));
@@ -807,7 +697,6 @@ mod tests {
         assert_eq!(oks.get(), 0);
     }
 
-    /// 输入形状：OK 收到输入框的当前值。
     #[test]
     fn the_ok_action_of_an_input_alert_receives_the_value() {
         let reported: Rc<RefCell<Option<Option<smol_str::SmolStr>>>> = Rc::new(RefCell::new(None));
@@ -827,7 +716,6 @@ mod tests {
         );
     }
 
-    /// 校验：空值被拒 → 错误可见、OK 动作不跑；改成合法值后通过。
     #[test]
     fn a_refused_value_keeps_the_alert_open_and_runs_nothing() {
         let calls = Rc::new(Cell::new(0usize));
@@ -858,7 +746,6 @@ mod tests {
         assert_eq!(calls.get(), 1, "通过后调用 ok_action");
     }
 
-    /// a11y：内容根只是通用容器（对话框角色归 `kit::dialog` 包装层），按钮是 Button。
     #[test]
     fn the_alert_content_root_is_a_generic_container_not_a_dialog() {
         let mut harness = harness(|builder, _, _| builder.ok("Saved", "Written."));
@@ -884,7 +771,6 @@ mod tests {
         );
     }
 
-    /// 调用方给的文案（本地化）同时是按钮可见文字与 a11y 名；默认英文不得残留。
     #[test]
     fn the_alert_uses_the_callers_localized_button_labels() {
         let harness = harness(|builder, _, _| {
@@ -922,8 +808,6 @@ mod tests {
         }
     }
 
-    /// `closing_guard`：容器开始关闭后，OK / Cancel 都不再跑用户动作（dialog 集成测试另见
-    /// `kit::dialog::a_second_click_on_alert_content_during_the_fade_runs_no_action`）。
     #[test]
     fn a_closing_alert_content_runs_no_button_actions() {
         let closing = Rc::new(Cell::new(false));
@@ -956,7 +840,6 @@ mod tests {
         assert_eq!(cancel_runs.get(), 0, "关闭中不得跑 Cancel 动作");
     }
 
-    /// 错误行初始不可见（`visible = false`），错误出现后可见。
     #[test]
     fn the_error_line_is_hidden_until_a_refusal() {
         let harness = harness(|builder, app, theme| {
@@ -980,7 +863,6 @@ mod tests {
             Some(true),
             "错误出现后错误行可见"
         );
-        // 旧语义：错误行 `text_sm`（14 px）+ `status.danger.base` 前景；与输入框同列、列间距 4 px。
         match tree.get(error).expect("error").kind() {
             NodeKind::Text(content) => assert_eq!(content.style.size, 14.0, "错误行字号 14 px"),
             other => panic!("expected Text, got {other:?}"),

@@ -1,5 +1,3 @@
-//! The tests of the translation page: its directory, its rows, and its downloads.
-
 use std::{path::Path, rc::Rc, sync::Arc, time::Instant};
 
 use app_config::{
@@ -22,10 +20,8 @@ use crate::{
     translation_downloads::{DeleteFailure, DownloadState, TranslationDownloads, UnloadFailure},
 };
 
-/// The key prefix the harness mounts the settings page under.
 const KEY: &str = "settings.test.ai.translation";
 
-/// Settings with a stored model directory.
 fn config_in(directory: &Path) -> Config {
     let mut config = Config::default();
     config.language = Language::En;
@@ -33,8 +29,6 @@ fn config_in(directory: &Path) -> Config {
     config
 }
 
-/// A harness with the translation downloads attached, prepared before the translation page is
-/// opened.
 fn page_prepared(
     config: Config,
     prepare: impl FnOnce(&TranslationDownloads),
@@ -49,17 +43,14 @@ fn page_prepared(
     (harness, downloads, fake)
 }
 
-/// A harness with the translation downloads attached, moved to the translation page.
 fn page(config: Config) -> (Harness, Rc<TranslationDownloads>, FakeDownloads) {
     page_prepared(config, |_| {})
 }
 
-/// The same page over the default settings, with a directory of its own.
 fn page_with(directory: &TempDir) -> (Harness, Rc<TranslationDownloads>, FakeDownloads) {
     page(config_in(directory.path()))
 }
 
-/// Delivers one key press through the pump's path.
 fn press_key(harness: &mut Harness, code: KeyCode, modifiers: ui_core::event::Modifiers) {
     send_event(
         harness,
@@ -73,7 +64,6 @@ fn press_key(harness: &mut Harness, code: KeyCode, modifiers: ui_core::event::Mo
     );
 }
 
-/// Commits `text` into the directory field after clearing what it held.
 fn replace_directory(harness: &mut Harness, text: &str) {
     harness.click_node("SETTINGS_AI_DIRECTORY_INPUT");
     press_key(harness, KeyCode::KeyA, ui_core::event::Modifiers::CONTROL);
@@ -88,14 +78,12 @@ fn replace_directory(harness: &mut Harness, text: &str) {
     harness.settle(2);
 }
 
-/// Whether the row action's button is drawn.
 fn action_drawn(harness: &Harness, action: &str, index: usize) -> bool {
     harness
         .find(&format!("SETTINGS_AI_MODEL_{action}_{index}"))
         .is_some()
 }
 
-/// The number of model rows the table draws.
 fn row_count(harness: &Harness) -> usize {
     (0..8)
         .filter(|index| {
@@ -106,7 +94,6 @@ fn row_count(harness: &Harness) -> usize {
         .count()
 }
 
-/// The translation page draws the directory field, the two selects, and the eight model rows.
 #[test]
 fn the_translation_page_should_draw_its_settings_and_models() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -178,8 +165,6 @@ fn the_translation_page_should_draw_its_settings_and_models() {
     }
 }
 
-/// A page without the process-wide downloads draws the models but offers no download: there is
-/// no download manager a click could start a transfer on.
 #[test]
 fn a_page_without_downloads_should_offer_no_download() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -199,7 +184,6 @@ fn a_page_without_downloads_should_offer_no_download() {
         "a page without downloads starts nothing"
     );
 }
-/// A stored directory is shown in the field, on one line that keeps the control column's width.
 #[test]
 fn a_stored_directory_should_be_shown_in_its_field() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -227,7 +211,6 @@ fn a_stored_directory_should_be_shown_in_its_field() {
     );
 }
 
-/// A directory committed from the field is stored at once, and the field keeps showing it.
 #[test]
 fn a_committed_directory_should_be_stored() {
     let stored = TempDir::new().expect("the stored directory builds");
@@ -253,8 +236,6 @@ fn a_committed_directory_should_be_stored() {
     );
 }
 
-/// A selection the new directory does not hold is replaced by the first model the directory
-/// holds, and one it does hold is kept.
 #[test]
 fn committing_a_directory_should_repair_the_selection() {
     let stored = TempDir::new().expect("the stored directory builds");
@@ -296,7 +277,6 @@ fn committing_a_directory_should_repair_the_selection() {
     );
 }
 
-/// A committed directory that holds models selects the first one their display names sort to.
 #[test]
 fn a_committed_directory_should_select_the_first_model_it_holds() {
     let stored = TempDir::new().expect("the stored directory builds");
@@ -318,8 +298,6 @@ fn a_committed_directory_should_select_the_first_model_it_holds() {
         "HY-MT2-1.8B-1.25Bit sorts first among the models the directory holds"
     );
 }
-/// A directory that could not be stored is not shown as if it had been: the field keeps the stored
-/// directory and the failure is reported.
 #[test]
 fn a_failed_directory_write_should_keep_the_stored_directory() {
     let stored = TempDir::new().expect("the stored directory builds");
@@ -354,7 +332,6 @@ fn a_failed_directory_write_should_keep_the_stored_directory() {
     );
 }
 
-/// The site select stores the chosen site at once, and a failed write keeps the stored one.
 #[test]
 fn the_site_select_should_store_the_chosen_site() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -376,7 +353,6 @@ fn the_site_select_should_store_the_chosen_site() {
     );
 }
 
-/// A site that could not be stored leaves the stored site as it was and reports why.
 #[test]
 fn a_failed_site_write_should_keep_the_stored_site() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -403,8 +379,6 @@ fn a_failed_site_write_should_keep_the_stored_site() {
     );
 }
 
-/// The status column of each row follows the download state: buttons only where the state has an
-/// action, and the text of the state beside them.
 #[test]
 fn the_rows_should_draw_download_retry_progress_and_delete_states() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -487,7 +461,6 @@ fn the_rows_should_draw_download_retry_progress_and_delete_states() {
     assert!(harness.find("SETTINGS_AI_MODEL_PROGRESS_7").is_none());
 }
 
-/// Clicking a download with nothing chosen downloads from HuggingFace.
 #[test]
 fn a_download_without_a_chosen_site_should_use_huggingface() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -503,8 +476,6 @@ fn a_download_without_a_chosen_site_should_use_huggingface() {
     );
 }
 
-/// A retry follows the stored site: the same site continues the failed task, another site removes
-/// it first.
 #[test]
 fn clicking_retry_should_follow_the_stored_site() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -543,8 +514,6 @@ fn clicking_retry_should_follow_the_stored_site() {
     );
 }
 
-/// Stopping a paused download from its row discards what it wrote: the partial file goes and the
-/// row offers a download again.
 #[test]
 fn a_paused_download_should_be_stopped_from_its_row() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -575,7 +544,6 @@ fn a_paused_download_should_be_stopped_from_its_row() {
         "the stopped download's partial file is gone"
     );
 }
-/// The stopping states draw their own disabled action and their own failure.
 #[test]
 fn the_rows_should_draw_the_stopping_states() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -603,7 +571,6 @@ fn the_rows_should_draw_the_stopping_states() {
     assert!(!action_drawn(&harness, "RETRY", 1));
 }
 
-/// A status line and a failure reason stay on the one line the row has room for.
 #[test]
 fn the_row_text_should_stay_on_one_line() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -641,7 +608,6 @@ fn the_row_text_should_stay_on_one_line() {
     assert!(size.size.height < 25.0, "the size stays on one line");
 }
 
-/// Clicking a download starts it from the site the settings hold.
 #[test]
 fn clicking_download_should_use_the_stored_site() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -665,7 +631,6 @@ fn clicking_download_should_use_the_stored_site() {
     );
 }
 
-/// Clicking resume continues the paused task the row has.
 #[test]
 fn clicking_resume_should_continue_the_paused_task() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -696,7 +661,6 @@ fn clicking_resume_should_continue_the_paused_task() {
     );
 }
 
-/// Clicking stop on a running download asks the manager to remove its task.
 #[test]
 fn clicking_terminate_should_stop_the_running_download() {
     let directory = TempDir::new().expect("the test directory builds");
@@ -733,7 +697,6 @@ fn clicking_terminate_should_stop_the_running_download() {
     );
 }
 
-/// The downloading status names the speed before the progress, in both languages.
 #[test]
 fn the_downloading_status_should_name_the_speed_before_the_progress() {
     let english = translate_in(LanguageCode::En);
@@ -763,8 +726,6 @@ fn the_downloading_status_should_name_the_speed_before_the_progress() {
     );
 }
 
-/// The label and the icon of every row action, which are the copy and the picture the status
-/// column was designed with.
 #[test]
 fn every_row_action_should_keep_its_copy_and_its_icon() {
     for (action, label_key, icon) in [
@@ -802,7 +763,6 @@ fn every_row_action_should_keep_its_copy_and_its_icon() {
     }
 }
 
-/// A normal model's published file is what the progress percentage is a share of.
 #[test]
 fn whole_percent_should_measure_a_download_against_the_published_file() {
     let model = TranslationModel::HyMt218BQ4Km;
@@ -815,8 +775,6 @@ fn whole_percent_should_measure_a_download_against_the_published_file() {
     assert_eq!(whole_percent(model, u64::MAX), 100);
 }
 
-/// A rate is drawn in the unit that keeps its number short, with at most two decimals and no
-/// trailing zeros.
 #[test]
 fn a_speed_should_be_drawn_in_the_unit_that_keeps_it_short() {
     for (rate, expected) in [
@@ -836,7 +794,6 @@ fn a_speed_should_be_drawn_in_the_unit_that_keeps_it_short() {
     }
 }
 
-/// A model's published size is drawn in the unit that keeps the number short.
 #[test]
 fn a_model_size_should_be_drawn_in_the_unit_that_keeps_it_short() {
     for model in TranslationModel::ALL {
@@ -851,7 +808,6 @@ fn a_model_size_should_be_drawn_in_the_unit_that_keeps_it_short() {
     assert_eq!(size_text(1024 * 1024 * 1024 + 1).as_str(), "1.00 GB");
 }
 
-/// Releasing the page takes its nodes away and drops the action handlers it registered.
 #[test]
 fn releasing_the_page_should_take_its_nodes_away() {
     let directory = TempDir::new().expect("the test directory builds");

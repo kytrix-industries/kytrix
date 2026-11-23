@@ -1,10 +1,3 @@
-//! Attaching one listing's units to the venue's raw numbers.
-//!
-//! A venue publishes numbers; the listing it published them for says what they
-//! mean. The quote asset and the price basis come from the listing's price rule,
-//! and the quantity unit from its quantity rule, so no field name — `base`,
-//! `quote` or `fee_token` — is ever read as a unit.
-
 use market_participants_model::{
     decimal::{Price, Quantity},
     error::ModelError,
@@ -29,7 +22,6 @@ use crate::{
     market_participants::model::NativeOrderBookLevel,
 };
 
-/// Everything one resolved listing says about the units of its own market data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ListingUnits {
     quote_asset: market_participants_model::asset::AssetId,
@@ -39,7 +31,6 @@ pub(crate) struct ListingUnits {
 }
 
 impl ListingUnits {
-    /// Reads the units of one rule set.
     pub(crate) fn of(rules: &TradingRules) -> Self {
         Self {
             quote_asset: rules.common.price.quote_asset.clone(),
@@ -53,7 +44,6 @@ impl ListingUnits {
         }
     }
 
-    /// Wraps one raw price in this listing's terms.
     pub(crate) fn price(&self, value: Price) -> MarketPrice {
         MarketPrice {
             value,
@@ -62,12 +52,10 @@ impl ListingUnits {
         }
     }
 
-    /// Wraps one traded quantity in this listing's unit.
     pub(crate) fn traded(&self, value: Quantity) -> Result<MarketQuantity, ModelError> {
         MarketQuantity::traded(value, self.quantity.clone())
     }
 
-    /// Wraps one monetary amount in this listing's quote asset.
     pub(crate) fn amount(&self, value: Quantity) -> Result<MarketQuantity, ModelError> {
         MarketQuantity::amount(
             value,
@@ -77,7 +65,6 @@ impl ListingUnits {
         )
     }
 
-    /// Wraps one optional monetary amount.
     pub(crate) fn optional_amount(
         &self,
         value: Option<Quantity>,
@@ -85,7 +72,6 @@ impl ListingUnits {
         value.map(|value| self.amount(value)).transpose()
     }
 
-    /// Wraps one optional traded quantity.
     pub(crate) fn optional_traded(
         &self,
         value: Option<Quantity>,
@@ -93,7 +79,6 @@ impl ListingUnits {
         value.map(|value| self.traded(value)).transpose()
     }
 
-    /// Wraps one native order-book level.
     pub(crate) fn level(
         &self,
         level: &NativeOrderBookLevel,
@@ -104,7 +89,6 @@ impl ListingUnits {
         })
     }
 
-    /// Wraps every level of one native side.
     pub(crate) fn levels(
         &self,
         levels: &[NativeOrderBookLevel],
@@ -113,7 +97,6 @@ impl ListingUnits {
     }
 }
 
-/// Maps one native candlestick of one listing.
 pub(crate) fn candlestick(
     listing: &market_participants_model::listing::route::VenueListingKey,
     native: &NativeCandlestick,
@@ -139,7 +122,6 @@ pub(crate) fn candlestick(
     Ok(value)
 }
 
-/// Maps one native ticker of one listing.
 pub(crate) fn ticker(
     listing: &market_participants_model::listing::route::VenueListingKey,
     native: &NativeTicker,
@@ -165,7 +147,6 @@ pub(crate) fn ticker(
     Ok(value)
 }
 
-/// Maps one native trade of one listing.
 pub(crate) fn trade(
     listing: &market_participants_model::listing::route::VenueListingKey,
     native: &NativeTrade,
@@ -187,7 +168,6 @@ pub(crate) fn trade(
     Ok(value)
 }
 
-/// Maps one native order book snapshot of one listing.
 pub(crate) fn order_book(
     listing: &market_participants_model::listing::route::VenueListingKey,
     native: &NativeOrderBook,
@@ -210,7 +190,6 @@ pub(crate) fn order_book(
     Ok(value)
 }
 
-/// Maps one native order book update of one listing.
 pub(crate) fn order_book_update(
     listing: &market_participants_model::listing::route::VenueListingKey,
     native: &NativeOrderBookUpdate,
@@ -236,7 +215,6 @@ pub(crate) fn order_book_update(
     Ok(value)
 }
 
-/// Maps one native taker-volume row of one listing.
 pub(crate) fn taker_volume(
     listing: &market_participants_model::listing::route::VenueListingKey,
     native: &NativeTakerVolume,

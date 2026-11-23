@@ -1,23 +1,3 @@
-//! 命中测试：逆绘制序 + clip 链 + per-draw 逆变换 + `hit_shape`。
-//!
-//! 坐标契约：`bounds` 是窗口绝对逻辑像素；`HitResult::local_point` 是**目标节点 border box 局部坐标**
-//! （原点 = 节点左上角）。`clip_chain` 是沿途每个 `Clip::Bounds` **祖先**的 padding box（窗口绝对，祖先→子），
-//! **不含目标自己的 clip**。
-//!
-//! # 命中语义（与绘制、焦点、a11y 对齐）
-//!
-//! - **可见性**：`display:none` / `visible:false` 的节点及其子树不参与命中（与焦点遍历共用
-//!   `NodeTree::is_visible_locally`）。
-//! - **禁用（`interactive: Some(false)`）**：整棵子树不命中（**祖先禁用 ⇒ 子树不命中**），
-//!   与焦点遍历（`is_effectively_interactive`）和 a11y 的 `disabled` 属性同源。旧实现只让
-//!   被标记的节点自己"透明"，子节点仍可命中（R04-9 的"点击穿透"）。
-//! - **变换（C11）**：几何节点的 per-draw `Transform` 在命中时走**逆变换** —— 旋转/缩放后的
-//!   内容按视觉范围命中，`local_point` 回到未变换的内容坐标。不可逆变换（det≈0 / NaN / ∞）
-//!   跳过该节点并在 `NodeTree::hit_test_skips` 记账，**不 panic、不误判命中**。
-//! - **数值防御（C13）**：非有限的点/布局盒/裁剪矩形/clip 偏移一律视为"不命中"并跳过该子树；
-//!   NaN 永不返回 `true`。
-//!
-
 use std::sync::Arc;
 
 use crate::{
@@ -26,58 +6,23 @@ use crate::{
     paint::style::Clip,
 };
 
-/// clip 栈深度上限：**复用** `paint::scene::MAX_CLIP_DEPTH`（`u8`，值 8），不新增第四份常量。
 const MAX_CLIP_DEPTH: usize = crate::paint::scene::MAX_CLIP_DEPTH as usize;
 
-/// 节点命中形状（节点 border box **局部坐标**，逻辑像素）。
-///
-/// R04-8：命中区域从"调用方自造闭包"升级为**可表达的数据**（CSS `clip-path` /
-/// `pointer-events` 与 Skia 的路径命中）：形状可枚举、可缓存/共享（`Arc`）、可被 a11y 复用。
-/// 绘制与命中共用同一份圆角规范化（`paint::instance::normalize_corner_radius`），不会出现
-/// "画得出、点不到"的第二套真相。
-///
-/// # 语义
-///
-/// - 坐标空间 = 目标节点 border box 局部坐标（原点 = 节点左上角，与 [`HitResult::local_point`]
-///   和 `GeometryDraw` 的局部空间相同）；
-/// - 判定口径是半开区间 `[min, max)`（与 [`Rect::contains`] 一致）；非有限点恒 `false`（C13）；
-/// - 形状**可以超出布局盒**：命中剪枝用 `布局盒 ∪ 形状 AABB`，且该包络已并入
-///   `subtree_bounds`（见 `node::tree::layout`）。这是"画布内容画在节点盒之外仍可命中"的
-///   表达力（旧 `Fn(Point) -> bool` 只能把命中**缩小**到布局盒以内）；
-/// - 未设置命中形状的节点等价于 `Rect(布局盒)`（旧行为不变）。
-///
-/// # 逃生舱
-///
-/// [`HitShape::Custom`] 保留任意谓词（动画/外部状态相关、无法静态表达的形状）。它是
-/// **过滤器**：谓词的 AABB 未知，因此自定义形状仍以布局盒为剪枝边界（不扩大命中范围）。
 #[derive(Clone)]
 pub enum HitShape {
-    /// 轴对齐矩形（局部坐标；可超出布局盒）。
     Rect(Rect),
-    /// 圆角矩形（CSS `border-radius` 语义，四角半径 `[tl, tr, br, bl]`）。
     RoundedRect { rect: Rect, corner_radius: [f32; 4] },
-    /// 圆（圆心 + 半径，局部坐标）。
     Circle { center: Point, radius: f32 },
-    /// 椭圆（中心 + 半轴，局部坐标）。
     Ellipse { center: Point, radius: Size },
-    /// 多边形路径（局部坐标顶点环，首尾隐式闭合；even-odd 填充规则，与 SVG `fill-rule`
-    /// 的 `fill-rule: evenodd` 一致）。
-    Path {
-        points: Arc<[Point]>,
-        /// 构造时算好的局部 AABB（命中剪枝每帧都要读，不在热路径上重算顶点）。
-        bounds: Rect,
-    },
-    /// 逃生舱：任意谓词（局部坐标）。命中范围仍以布局盒剪枝。
+    Path { points: Arc<[Point]>, bounds: Rect },
     Custom(Arc<dyn Fn(Point) -> bool>),
 }
 
 impl HitShape {
-    /// 由任意谓词构造逃生舱形状。
     pub fn custom(predicate: impl Fn(Point) -> bool + 'static) -> Self {
         Self::Custom(Arc::new(predicate))
     }
 
-    /// 由顶点环构造多边形路径；少于 3 个点 / 含非有限点 ⇒ 空路径（永不命中）。
     #[must_use]
     pub fn path(points: impl Into<Arc<[Point]>>) -> Self {
         let points: Arc<[Point]> = points.into();
@@ -97,9 +42,6 @@ impl HitShape {
         Self::Path { points, bounds }
     }
 
-    /// 形状的局部 AABB（`None` = 无法静态得知，仅 [`HitShape::Custom`]）。
-    ///
-    /// 消费者：命中剪枝（`bounds ∪ 形状 AABB`）、`subtree_bounds` 维护、a11y 几何。
     #[must_use]
     pub fn bounds(&self) -> Option<Rect> {
         match self {
@@ -125,9 +67,6 @@ impl HitShape {
         }
     }
 
-    /// 局部坐标点是否在形状内（命中、a11y 与 `interactive` 判定的**唯一**判据）。
-    ///
-    /// 非有限点 / 非有限形状 / 负半径 / 空路径恒 `false`（C13：NaN 永不命中）。
     #[must_use]
     pub fn contains(&self, point: Point) -> bool {
         if !point.is_finite() {
@@ -158,7 +97,6 @@ impl HitShape {
                 nx * nx + ny * ny <= 1.0
             }
             Self::Path { points, bounds } => {
-                // even-odd 射线法：`(a.y > p.y) != (b.y > p.y)` 的半开边规则避免顶点重复计数。
                 if points.len() < 3 || bounds.is_empty() || !bounds.contains(point) {
                     return false;
                 }
@@ -180,10 +118,6 @@ impl HitShape {
     }
 }
 
-/// 圆角矩形包含判定：布局盒内，且落在四个角框里的点必须在角圆弧内。
-///
-/// 圆角半径复用绘制侧的 `normalize_corner_radius`（CSS 规则 + SDF 合法域 clamp），
-/// 因此命中与绘制对同一个 `corner_radius` 得到同一个轮廓（R05-8 的唯一规范化）。
 fn rounded_rect_contains(rect: Rect, corner_radius: [f32; 4], point: Point) -> bool {
     if !rect.contains(point) {
         return false;
@@ -191,7 +125,6 @@ fn rounded_rect_contains(rect: Rect, corner_radius: [f32; 4], point: Point) -> b
     let (width, height) = (rect.size.width, rect.size.height);
     let radii = crate::paint::instance::normalize_corner_radius(corner_radius, width, height);
     let local = Point::new(point.x - rect.origin.x, point.y - rect.origin.y);
-    // CSS 顺序 [tl, tr, br, bl]；角圆心在各自的内角点上。
     let corners = [
         (0.0, 0.0, radii[0]),
         (width, 0.0, radii[1]),
@@ -301,14 +234,12 @@ impl PartialEq for HitShape {
                     bounds: bb,
                 },
             ) => ab == bb && ap == bp,
-            // 闭包无法结构比较：同一份 `Arc` 才算相等（可比较/可缓存是同一张形状的两个句柄）。
             (Self::Custom(a), Self::Custom(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
 }
 
-/// 命中路径上的 clip 矩形（定长、`Copy`、零分配；祖先 → 目标顺序）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipChain {
     len: u8,
@@ -325,28 +256,21 @@ impl Default for ClipChain {
 }
 
 impl ClipChain {
-    /// 由祖先到目标顺序的 clip 矩形切片（窗口绝对）。
     #[must_use]
     pub fn as_slice(&self) -> &[Rect] {
         &self.rects[..usize::from(self.len)]
     }
 
-    /// 已压入的 clip 数。
     #[must_use]
     pub fn len(&self) -> usize {
         usize::from(self.len)
     }
 
-    /// 是否为空（未被任何祖先裁剪）。
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// 压入一个 clip 矩形；达到深度上限时**折叠**为与栈顶求交（P2-7）。
-    ///
-    /// 与 `PaintPass` 的 `ClipContext::push` 同一策略：轴对齐矩形求交无损，因此深层嵌套
-    /// 不会让命中路径丢矩形（旧实现直接丢弃，超深子树的命中判定会比绘制宽松）。
     fn push(&mut self, rect: Rect) {
         if usize::from(self.len) >= MAX_CLIP_DEPTH {
             let last = &mut self.rects[usize::from(self.len) - 1];
@@ -358,38 +282,24 @@ impl ClipChain {
     }
 }
 
-/// 命中结果（设计 §4.4：`HitResult { node, local_point, clip_chain }`）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HitResult {
-    /// 命中的节点（逆绘制序的第一个）。
     pub node: NodeId,
-    /// 命中点在目标节点 border box 局部坐标下的位置。
     pub local_point: Point,
-    /// 到达目标节点经过的 clip 矩形（窗口绝对；**不含**目标自己的 clip）。
     pub clip_chain: ClipChain,
 }
 
-/// 取负（`Point` 没有 `Neg`；屏幕 = 内容 − 偏移）。
 fn negate(offset: Point) -> Point {
     Point::new(-offset.x, -offset.y)
 }
 
-/// 几何节点的**可见范围**（窗口绝对，AABB）：`bounds.origin + transform(node-local box)`。
-///
-/// 与绘制侧 `paint::pass::geometry_damage` 用同一算法（四角变换取极值）；非单位变换时内容
-/// 可以落在节点布局盒之外，子树剪枝与命中都必须用这个范围（否则"看得见点不到"）。
 fn transformed_box(bounds: Rect, transform: Transform) -> Rect {
     let local = Rect::new(0.0, 0.0, bounds.size.width, bounds.size.height);
     let visual = transform.transform_rect(local);
     Rect::from_origin_size(bounds.origin + visual.origin, visual.size)
 }
 
-/// 逆绘制序（`children` 的 DFS 先序 ⇒ 兄弟逆序 + 先子树后自身）+ 按布局盒与 clip 剪枝。
-///
-/// **屏幕坐标**：`point` 是窗口逻辑像素；布局盒是**内容坐标**，因此进入滚动容器的子树时按它的 `offset`
-/// 把点换算到内容空间。根不是滚动容器 ⇒ 顶层偏移恒为零。
 pub(crate) fn hit_test(tree: &NodeTree, point: Point) -> Option<HitResult> {
-    // C13：非有限的指针坐标永不命中（NaN 参与任何比较都是 false，但显式短路让诊断确定）。
     if !point.is_finite() {
         tree.note_hit_test_skip();
         return None;
@@ -397,9 +307,8 @@ pub(crate) fn hit_test(tree: &NodeTree, point: Point) -> Option<HitResult> {
     let root = tree.root();
     let root_bounds = tree.get(root).ok()?.layout().bounds;
     if !root_bounds.is_finite() || !root_bounds.contains(point) {
-        return None; // 窗口外（根 100% 撑满 ⇒ 等价于「点在窗口外」）
+        return None;
     }
-    // 绝大多数窗口没有任何 per-draw 变换：一次 O(1) 判定后，热路径不再为几何节点做额外检查。
     let transforms = tree.has_geometry_transforms();
     pick(
         tree,
@@ -422,27 +331,15 @@ fn pick(
     transforms: bool,
 ) -> Option<HitResult> {
     let slot = tree.get(node).ok()?;
-    // 本节点的**屏幕**布局盒（内容坐标减去祖先滚动偏移）。
     let bounds = slot.layout().bounds.translate(negate(offset));
-    // 本节点**未**入链前的链：`clip_chain` 只含祖先的 clip（目标自己的 padding box 由应用自己算）。
-    // `ClipChain` 是 `Copy`，按值传递即可，不需要「截断回某深度」这种容易出错的手工回溯。
     let ancestors = chain;
 
-    // 不可见的节点整体不参与命中（对目标自身也成立，与 P06 的「不绘制」一致）。
-    // 规则与焦点遍历共用 `NodeTree::is_visible_locally` —— 两处各写一份是本项目历史上的
-    // 分歧来源（Tab 能落到不可见控件上）。
     if !tree.is_visible_locally(node) {
         return None;
     }
 
-    // C12：`interactive: Some(false)` 的**整棵子树**不命中（祖先禁用 ⇒ 子树禁用）。本地判据是
-    // `NodeTree::is_hittable`（与 `a11y::mapping::a11y_disabled`、焦点遍历的
-    // `is_effectively_interactive` **同一个函数**，R04-9 的一致化）；祖先继承用沿途的
-    // `inherited_disabled` 传下去，避免每节点重新走一遍祖先链（命中是逐指针事件的热路径）。
     let disabled = inherited_disabled || !tree.is_hittable(node);
 
-    // 本节点的 clip **只作用于子树**（CSS：overflow 裁剪内容，不裁剪自身的 border/background）。
-    // 点在 clip 外时仍可命中本节点，但不能下钻。
     let mut clipped = false;
     if slot.clip() == Clip::Bounds {
         let clip_rect = bounds.inset(slot.layout().border);
@@ -458,7 +355,6 @@ fn pick(
     }
 
     if !clipped {
-        // 子节点的参照系：容器挂了滚动槽时，内容整体按 `offset` 上移（屏幕 = 内容 − 累计偏移）。
         let child_offset = offset
             + tree
                 .scroll_slot(node)
@@ -467,20 +363,11 @@ fn pick(
             tree.note_hit_test_skip();
             return None;
         }
-        // 子节点逆序：最后一个子节点绘制在最上层，因此先测。
         for child in slot.children().iter().rev() {
             let Ok(child_slot) = tree.get(*child) else {
                 continue;
             };
-            // 子树剪枝（P2-2）：用**子树包围盒**（自身 + 全部后代布局盒的并集）判断整棵
-            // 子树是否可能被命中。只看节点自己的布局盒不行 —— 出流 / 溢出子节点可以落在
-            // 父盒之外（B2），按父盒剪枝会漏命中；并集只会偏大，绝不偏小。
-            //
-            // C13：非有限包络不需要单独判定 —— `Rect::contains` 对非有限矩形恒 `false`
-            // （`is_empty` 已含非有限判定），因此这里直接 `continue`，热路径不为诊断多付一次检查。
             let mut subtree = tree.subtree_bounds(*child).translate(negate(child_offset));
-            // C11：几何节点的 per-draw 变换可能把内容缩放到布局盒之外（可见范围更大），
-            // 剪枝必须用**变换后的**可见范围，否则缩放后的图表"看得见点不到"。
             if transforms && child_slot.kind().is_geometry() {
                 let transform = tree.geometry_transform(*child);
                 if transform != Transform::IDENTITY {
@@ -507,24 +394,14 @@ fn pick(
         }
     }
 
-    // 自身：先看布局盒（允许溢出后代，但自身不声称盒外命中），再看 `hit_shape`（局部坐标）。
     if disabled {
-        // 禁用的节点既不是命中目标，也不再把命中透给它的祖先（CSS `pointer-events:none`
-        // 的子树语义：事件穿过**整棵**子树，而不是落到父背景上）。
         return None;
     }
     let local_point = Point::new(point.x - bounds.origin.x, point.y - bounds.origin.y);
-    // C13：布局盒/滚动偏移出现 NaN/∞ 时"本节点不命中 + 诊断"，**不 panic、不误判**。
-    // 放在自身判定前（而不是入口）：被剪枝的子树根本走不到这里，热路径不为诊断付每次访问的成本；
-    // NaN 盒的 `contains` 本来就恒 false（`Rect::is_empty` 含非有限判定），因此正确性不依赖这条检查。
     if !bounds.is_finite() {
         tree.note_hit_test_skip();
         return None;
     }
-    // C11：几何节点的 per-draw 变换在命中时走逆变换（命中范围 = `transform(节点盒)` 的 AABB，
-    // `local_point` 回到未变换的内容坐标）。绝大多数窗口没有任何变换：`transforms` 是整次
-    // 命中测试前的 O(1) 判定，因此热路径只有一次可预测的分支；真正的逆变换逻辑在
-    // `#[inline(never)]` 的冷函数里，不会把 `pick` 的指令缓存撑大。
     if transforms && slot.kind().is_geometry() {
         let transform = tree.geometry_transform(node);
         if transform != Transform::IDENTITY {
@@ -540,8 +417,6 @@ fn pick(
             );
         }
     }
-    // 自身：命中区域 = 布局盒 ∪ 命中形状的局部 AABB（R04-8：形状可以**超出**布局盒，
-    // 如平移/缩放后的自绘内容；`Custom` 谓词无法静态得知范围 ⇒ 仍以布局盒剪枝）。
     let shape = slot.hit_shape();
     let region = match shape.and_then(HitShape::bounds) {
         Some(shape_bounds) => bounds.union(Rect::from_origin_size(
@@ -565,11 +440,6 @@ fn pick(
     })
 }
 
-/// 带 per-draw 变换的几何节点命中（冷路径）。
-///
-/// - 命中范围 = `transform(节点盒)` 的 AABB（旋转/缩放的**视觉**范围，可以超出布局盒）；
-/// - `local_point` 回到**未变换**的内容坐标（与 `hit_shape`、应用拿到的局部坐标同一空间）；
-/// - 不可逆变换 ⇒ 跳过并记账（不 panic、不当作命中）。
 #[inline(never)]
 fn hit_transformed(
     tree: &NodeTree,
@@ -586,7 +456,6 @@ fn hit_transformed(
         return None;
     };
     let local = inverse.apply(local_point);
-    // R04-8：未变换的内容区域同样是「布局盒 ∪ 命中形状 AABB」，因此形状可以超出盒。
     let local_box = Rect::new(0.0, 0.0, bounds.size.width, bounds.size.height);
     let shape = slot.hit_shape();
     let local_region = match shape.and_then(HitShape::bounds) {
@@ -677,7 +546,6 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let container = add(&mut tree, root, fixed(100.0, 100.0));
-        // 两个完全重叠的浮层（绝对定位，同位置同尺寸）⇒ 后创建的在最上层
         let lower = add(&mut tree, container, absolute(100.0));
         let upper = add(&mut tree, container, absolute(100.0));
         layout(&mut tree);
@@ -714,7 +582,6 @@ mod tests {
             bottom: taffy::style::LengthPercentage::length(2.0),
         };
         let scroller = add(&mut tree, root, scroller_style);
-        // 尺寸超出父、且被父裁剪（taffy 允许溢出，不做裁剪）
         let overflowing = add(&mut tree, scroller, fixed(100.0, 100.0));
         layout(&mut tree);
 
@@ -727,8 +594,6 @@ mod tests {
             "padding box = border box 内缩 border"
         );
 
-        // 点仍在 scroller 的 bounds 内但在 padding box 外 ⇒ 子节点被裁剪，命中父自身；
-        // 父自己的 clip **不进** chain。
         let border_band = hit_test(&tree, Point::new(1.0, 1.0)).expect("命中父");
         assert_eq!(border_band.node, scroller, "被裁剪的子节点不可命中");
         assert!(
@@ -736,33 +601,25 @@ mod tests {
             "目标自身的 clip 不进 clip_chain"
         );
 
-        // 父 bounds 之外 ⇒ 落到根背景
         assert_eq!(hit_node(&tree, 60.0, 60.0), Some(root));
     }
 
-    /// P2-7：超过 `MAX_CLIP_DEPTH` 后，clip 折叠为求交，且**回到兄弟子树时必须还原**。
-    ///
-    /// 折叠把新 clip 求交进栈顶矩形（轴对齐矩形无损）。若不还原，父层的 clip 会被子层的
-    /// 矩形永久收窄，兄弟子树就会被过度裁剪、命中丢失。
     #[test]
     fn clip_folding_does_not_leak_into_sibling_subtrees() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        // 先叠满 `MAX_CLIP_DEPTH` 层（外加一层触发折叠）。
         let mut parent = root;
         for _ in 0..=super::MAX_CLIP_DEPTH {
             let mut style = fixed(100.0, 100.0);
             style.clip = Clip::Bounds;
             parent = add(&mut tree, parent, style);
         }
-        // 折叠层下面挂两个兄弟：左窄右宽，右边那个落在左边子树的盒子外。
         let mut narrow = fixed(10.0, 10.0);
         narrow.clip = Clip::Bounds;
         let left = add(&mut tree, parent, narrow);
         let right = add(&mut tree, parent, fixed(80.0, 80.0));
         layout(&mut tree);
 
-        // 访问左兄弟会让折叠发生（深度已满）；随后访问右兄弟时必须是**未收窄**的祖先链。
         let _ = hit_node(&tree, 5.0, 5.0);
         assert_eq!(
             hit_node(&tree, 40.0, 40.0),
@@ -826,7 +683,6 @@ mod tests {
     fn hit_shape_filters_local_points() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        // 自绘节点：只有左半边可命中（局部坐标 x < 20）
         let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 40.0, 20.0)))
             .style(fixed(40.0, 20.0))
             .hit_shape(HitShape::custom(|local: Point| local.x < 20.0))
@@ -847,7 +703,6 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let parent = add(&mut tree, root, fixed(100.0, 100.0));
-        // 节点在父的 (10, 20) 处
         let node = NodeBuilder::boxed()
             .style({
                 let mut style = fixed(30.0, 30.0);
@@ -860,7 +715,6 @@ mod tests {
                 style
             })
             .hit_shape(HitShape::custom(|local: Point| {
-                // 局部坐标原点必须是节点自己的左上角
                 local.x >= 0.0 && local.y >= 0.0 && local.x < 30.0 && local.y < 30.0
             }))
             .build(&mut tree, parent)
@@ -931,7 +785,6 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let base = add(&mut tree, root, fixed(100.0, 100.0));
-        // 浮层：绝对定位在最后，尺寸小 ⇒ 必须 append 到父的 children 末尾（P10 的 Overlay 契约）
         let overlay = add(&mut tree, root, absolute(20.0));
         layout(&mut tree);
 
@@ -988,7 +841,6 @@ mod tests {
     fn overlapping_siblings_later_wins() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        // 完全重叠的两个兄弟（后创建的在上层）⇒ 后者胜出（N6）
         let first = add(&mut tree, root, absolute(100.0));
         let second = add(&mut tree, root, absolute(100.0));
         layout(&mut tree);
@@ -1027,7 +879,6 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let parent = add(&mut tree, root, fixed(100.0, 100.0));
-        // 出流子节点落在父盒之外（父无 clip ⇒ 允许溢出命中，B2）
         let mut abs = taffy::Style::<smol_str::SmolStr>::DEFAULT;
         abs.position = taffy::style::Position::Absolute;
         abs.inset = taffy::geometry::Rect {
@@ -1102,9 +953,6 @@ mod tests {
         );
     }
 
-    /// P2-2：子树包围盒必须包含**溢出**后代（命中测试的唯一安全剪枝依据）。
-    ///
-    /// 只看节点自己的布局盒会漏命中出流 / 溢出子节点（B2）；并集偏大但绝不偏小。
     #[test]
     fn subtree_bounds_cover_overflowing_descendants() {
         let mut tree = NodeTree::new();
@@ -1152,7 +1000,6 @@ mod tests {
     fn override_is_hittable_under_offset_parent() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        // B1：override 相对**树父** border box，父被 spacer 推到 y=40
         let mut root_style = fixed(200.0, 200.0);
         root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
         tree.set_style(root, root_style).expect("root 存活");
@@ -1181,8 +1028,6 @@ mod tests {
         );
     }
 
-    // ── C11：per-draw 变换的逆变换命中 ─────────────────────────────────────
-
     fn geometry_node(tree: &mut NodeTree, parent: NodeId, rect: Rect) -> NodeId {
         NodeBuilder::geometry(crate::paint::geometry::GeometryId::for_test(0, 1))
             .layout_override(rect)
@@ -1200,7 +1045,6 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = geometry_node(&mut tree, root, Rect::new(100.0, 50.0, 40.0, 20.0));
-        // 90°：局部 (x, y) → (−y, x)；局部盒 (0,0,40,20) 的 AABB = (−20, 0, 20, 40)。
         with_transform(
             &mut tree,
             node,
@@ -1208,7 +1052,6 @@ mod tests {
         );
         layout(&mut tree);
 
-        // 屏幕 (90, 60) 在变换后的 AABB 内（80..120 × 50..90），逆变换后 = 局部 (10, 10)。
         let hit = hit_test(&tree, Point::new(90.0, 60.0)).expect("旋转后可命中");
         assert_eq!(hit.node, node);
         assert!(
@@ -1216,8 +1059,6 @@ mod tests {
             "local_point 必须回到**未变换**的内容坐标：{hit:?}"
         );
 
-        // 未变换时能被命中的 (140, 60)（局部 (40,10) 恰在边界外/旋转后被移走）现在应为
-        // 变换后的形状之外 —— 逆变换把点映射到局部 (10, -40)，y 越界。
         assert_eq!(
             hit_node(&tree, 140.0, 60.0),
             Some(root),
@@ -1233,16 +1074,13 @@ mod tests {
         with_transform(&mut tree, node, crate::math::Transform::scale(3.0, 3.0));
         layout(&mut tree);
 
-        // 布局盒 20×10，视觉盒 60×30：点 (50, 25) 在布局盒外、视觉盒内。
         assert_eq!(
             hit_node(&tree, 50.0, 25.0),
             Some(node),
             "缩放后的内容必须在视觉范围内可命中（子树剪枝用变换后的包络）"
         );
-        // 局部坐标 = 屏幕 / 3。
         let hit = hit_test(&tree, Point::new(50.0, 25.0)).expect("命中");
         assert!((hit.local_point.x - 50.0 / 3.0).abs() < 1e-3);
-        // 视觉盒之外不命中。
         assert_eq!(hit_node(&tree, 70.0, 25.0), Some(root));
     }
 
@@ -1266,20 +1104,16 @@ mod tests {
         );
     }
 
-    // ── C12：interactive/disabled 在命中与焦点上同源 ───────────────────────
-
     #[test]
     fn disabled_ancestor_makes_its_whole_subtree_unhittable() {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let container = add(&mut tree, root, fixed(100.0, 100.0));
-        // 子节点**声明动作**：如果没有继承禁用规则，它会是一个合法的命中目标与可聚焦节点。
         let child = NodeBuilder::boxed()
             .style(fixed(50.0, 50.0))
             .on_click(crate::event::Action::custom("press"))
             .build(&mut tree, container)
             .expect("挂载成功");
-        // 对照：同样的子节点挂在未禁用的容器下 ⇒ 既可命中也可聚焦（证明下面的 false 来自继承）。
         let active_container = add(&mut tree, root, fixed(100.0, 100.0));
         let active_child = NodeBuilder::boxed()
             .style(fixed(50.0, 50.0))
@@ -1333,17 +1167,12 @@ mod tests {
                 ..StylePatch::default()
             },
         );
-        // 两个 100×100 兄弟在 flex 行里并排；各自命中自己的区域。
         layout(&mut tree);
 
         assert_eq!(hit_node(&tree, 10.0, 10.0), Some(root), "禁用盒不命中");
         assert_eq!(hit_node(&tree, 150.0, 10.0), Some(sibling), "兄弟不受影响");
     }
 
-    /// C12 的三处一致性：命中/焦点用的继承谓词与 a11y 的 `disabled` 判据在**同一节点**上一致。
-    ///
-    /// a11y 的 `disabled` 属性是每节点值（`a11y::mapping::is_disabled`），祖先禁用由 AT 的
-    /// 父节点语义继承；引擎侧命中/焦点的继承规则由 `is_effectively_interactive` 表达。
     #[test]
     fn hit_focus_and_a11y_agree_on_the_interactive_flag() {
         let mut tree = NodeTree::new();
@@ -1376,8 +1205,6 @@ mod tests {
         assert!(tree.is_effectively_interactive(plain));
     }
 
-    // ── C13：NaN / ∞ 防御 ────────────────────────────────────────────────
-
     #[test]
     fn non_finite_points_never_hit() {
         let mut tree = NodeTree::new();
@@ -1403,7 +1230,6 @@ mod tests {
         let root = tree.root();
         let node = add(&mut tree, root, fixed(100.0, 100.0));
         layout(&mut tree);
-        // 造一个 NaN 布局盒（模拟 measure 产出坏值后残留的状态）。
         tree.set_layout_for_test(
             node,
             crate::node::tree::LayoutBox {
@@ -1411,21 +1237,15 @@ mod tests {
                 border: crate::math::Edges::ZERO,
             },
         );
-        // 根盒仍有效 ⇒ 命中落到根；坏盒子树被跳过且记账。
         let before = tree.hit_test_skips();
         assert_eq!(hit_node(&tree, 10.0, 10.0), Some(root));
         assert!(tree.hit_test_skips() > before, "非有限布局盒必须记账");
     }
 
-    // ── R04-8：枚举式 HitShape ─────────────────────────────────────────────
-
-    /// 命中形状可以**大于布局盒**（自绘内容平移/缩放后的可见范围）：布局盒外、形状内的点
-    /// 必须命中；`subtree_bounds` 也要因此并入形状 AABB（否则父级剪枝会漏掉）。
     #[test]
     fn hit_shape_admits_points_outside_the_layout_box() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        // 容器盒 = 节点盒（20×20 @ (50,50)）；形状向外扩 20 px。
         let container = add(&mut tree, root, {
             let mut style = fixed(20.0, 20.0);
             style.inner.margin = taffy::geometry::Rect {
@@ -1461,13 +1281,6 @@ mod tests {
         );
     }
 
-    /// AR5 P1-1：`hit_envelope` 的形状 AABB 必须叠加**节点自身**的布局盒原点。
-    ///
-    /// 生产路径复现（不需要测试逃生口）：父 20×20 @ margin(50,50)，
-    /// `HitShape(-20,-20,60,60)`（绝对 `(30,30)-(90,90)`）；子绝对定位 `inset(-30,-30)`
-    /// 被 taffy hoist 到根 ⇒ `expand_hoisted_ancestors` 拿到的并集原点是 `(-30,-30)`。
-    /// 旧实现把形状按并集原点再平移一次，包络变成 `(-50,-50,120,120)`（右/下只到 (70,70)），
-    /// `hit_test(80,80)` 在父级剪枝处跳过整棵子树、返回 root。
     #[test]
     fn hit_shape_envelope_uses_the_node_origin_not_the_subtree_union_origin() {
         let mut tree = NodeTree::new();
@@ -1484,7 +1297,6 @@ mod tests {
             .hit_shape(HitShape::Rect(Rect::new(-20.0, -20.0, 60.0, 60.0)))
             .build(&mut tree, root)
             .expect("父节点挂载成功");
-        // 父非 positioned ⇒ 绝对定位子的包含块是根；负 inset 把父的并集原点拉到 (-30,-30)。
         let mut child_style = fixed(10.0, 10.0);
         child_style.inner.position = taffy::style::Position::Absolute;
         child_style.inner.inset = taffy::geometry::Rect {
@@ -1505,7 +1317,6 @@ mod tests {
             expected,
             "包络 = 节点盒 ∪ 子盒 ∪ 形状绝对 AABB；旧实现按并集原点平移形状 ⇒ (-50,-50,120,120)"
         );
-        // 增量维护（`place_subtree` + `expand_hoisted_ancestors`）必须与全量重算逐位一致。
         let incremental = tree.subtree_bounds(parent);
         tree.recompute_subtree_bounds();
         assert_eq!(
@@ -1513,7 +1324,6 @@ mod tests {
             incremental,
             "增量包络必须与全量重算逐位一致"
         );
-        // 布局盒外、形状内的点必须命中父节点；旧实现被父级剪枝跳过 ⇒ root。
         assert_eq!(
             hit_node(&tree, 80.0, 80.0),
             Some(parent),
@@ -1525,8 +1335,6 @@ mod tests {
             "形状左上必须可命中"
         );
 
-        // 卸载出流子节点走 `recompute_bounds_upwards`：包络必须收紧回「节点盒 ∪ 形状」，
-        // 并继续与全量重算一致（4 个维护点里的第 3 条）。
         tree.remove(child).expect("卸载成功");
         assert_eq!(
             tree.subtree_bounds(parent),
@@ -1543,7 +1351,6 @@ mod tests {
         );
     }
 
-    /// 圆角矩形：四角按 CSS 圆角轮廓判定（与绘制共用 `normalize_corner_radius`）。
     #[test]
     fn rounded_rect_hit_shape_follows_css_corners() {
         let shape = HitShape::RoundedRect {
@@ -1560,7 +1367,6 @@ mod tests {
         assert!(!shape.contains(Point::new(-1.0, 50.0)), "盒外不命中");
         assert!(!shape.contains(Point::new(f32::NAN, 50.0)), "NaN 永不命中");
 
-        // 半径大于半边长时按 CSS 比例因子缩小（与绘制同一套规范化）。
         let clamped = HitShape::RoundedRect {
             rect: Rect::new(0.0, 0.0, 40.0, 10.0),
             corner_radius: [40.0; 4],
@@ -1569,7 +1375,6 @@ mod tests {
         assert!(!clamped.contains(Point::new(-1.0, 5.0)));
     }
 
-    /// 圆 / 椭圆 / 多边形路径的包含判定（半开区间 + 非有限防御）。
     #[test]
     fn circle_ellipse_and_path_hit_shapes() {
         let circle = HitShape::Circle {
@@ -1590,7 +1395,6 @@ mod tests {
         assert!(ellipse.contains(Point::new(50.0, 69.0)));
         assert!(!ellipse.contains(Point::new(50.0, 71.0)));
 
-        // 凹多边形（L 形）：even-odd 填充规则，凹口必须不命中。
         let path = HitShape::path(vec![
             Point::new(0.0, 0.0),
             Point::new(40.0, 0.0),
@@ -1620,7 +1424,6 @@ mod tests {
         );
     }
 
-    /// `Custom` 是过滤式逃生舱：AABB 未知 ⇒ 仍以布局盒剪枝（不扩大命中范围）。
     #[test]
     fn custom_hit_shape_still_prunes_to_the_layout_box() {
         let shape = HitShape::custom(|_| true);
@@ -1649,8 +1452,6 @@ mod tests {
         );
     }
 
-    /// 命中、焦点（interactive）与 a11y 三处共用同一个「可交互」判据
-    /// （`NodeTree::is_hittable` / `is_effectively_interactive` / `a11y::mapping::a11y_disabled`）。
     #[test]
     fn interactive_criterion_is_shared_by_hit_focus_and_a11y() {
         fn absolute_at(x: f32, y: f32, width: f32, height: f32) -> Style {

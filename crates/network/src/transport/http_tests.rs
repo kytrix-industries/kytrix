@@ -43,21 +43,12 @@ fn pool() -> HttpClientPool {
     HttpClientPool::new(plaintext_policy())
 }
 
-/// The body budget of the class the over-limit paths are exercised against.
-///
-/// The metadata class has the smallest budget in the pool, so a fixture one byte
-/// over it is the smallest fixture that proves a limit is enforced. Taking the
-/// number from the class rather than writing it out keeps those tests true when the
-/// budget moves.
 fn metadata_limit() -> usize {
     HttpClientClass::UpdaterMetadata.response_body_limit()
 }
 
 #[test]
 fn client_classes_have_fixed_body_and_redirect_limits() {
-    // The updater metadata endpoint serves `latest.json`: both language files of the
-    // release notes plus six signed platform entries. The release job asserts the
-    // assembled file stays under this limit, so the two numbers move together.
     assert_eq!(
         HttpClientClass::UpdaterMetadata.response_body_limit(),
         64 * 1024
@@ -386,7 +377,6 @@ async fn a_stalled_body_read_is_cancelled_mid_read() {
     assert_eq!(result, Ok(Err(TransportError::Cancelled)));
 }
 
-/// Records every progress report so a test can assert the call sequence.
 #[derive(Clone, Default)]
 struct ProgressLog(Arc<Mutex<Vec<(u64, Option<u64>)>>>);
 
@@ -400,10 +390,6 @@ impl ProgressLog {
     }
 }
 
-/// Serves one response whose body is written in `parts`, waiting for `progress`
-/// between parts so each part after the first is written only once the reader has
-/// reported the previous one. `content_length` selects the framing: `Some`
-/// declares the length, `None` sends a chunked body terminated by the last chunk.
 async fn streamed_response(
     parts: &[&[u8]],
     content_length: Option<usize>,
@@ -614,11 +600,6 @@ async fn a_streaming_read_cancelled_mid_body_reports_cancelled() {
 
 #[tokio::test]
 async fn the_start_of_the_read_is_reported_before_the_first_body_byte() {
-    // The first part is empty, so the server sends the headers and then waits:
-    // the body cannot be written until the reader has announced the total, and
-    // the reader cannot read a byte until the body is written. Only a report made
-    // before the first read can open the gate; announcing it any later deadlocks
-    // the exchange and the timeout reports it.
     let gate = Arc::new(Notify::new());
     let response = streamed_response(&[b"", b"abcd"], Some(4), Arc::clone(&gate)).await;
     let progress = ProgressLog::default();
@@ -680,9 +661,6 @@ async fn a_body_that_ends_before_its_content_length_is_never_reported_as_complet
     )
     .await;
 
-    // A body that stops two bytes short of its own `Content-Length` is a failed
-    // read, not a short one: the progress must show what arrived and never the
-    // advertised total, so a caller can never mistake it for a finished download.
     assert_eq!(result, Err(TransportError::ResponseReadFailed));
     let entries = progress.entries();
     assert_eq!(entries.first(), Some(&(0, Some(4))));

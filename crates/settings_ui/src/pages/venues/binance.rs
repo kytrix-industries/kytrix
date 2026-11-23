@@ -1,5 +1,3 @@
-//! Binance's page: the two markets the venue publishes, each with its origins and credentials.
-
 use app_config::{
     market_participants::origins::{BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin},
     settings::Config,
@@ -22,10 +20,8 @@ use crate::{
     search::FieldSearch,
 };
 
-/// The id of this page's settings.
 const PAGE: &str = "market_participants.binance";
 
-/// The Binance page.
 pub(crate) struct VenuePage {
     host: SettingsHost,
     selects: Vec<VenueSelect>,
@@ -33,8 +29,6 @@ pub(crate) struct VenuePage {
 }
 
 impl VenuePage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs
-    /// to.
     pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
         Self {
             host,
@@ -180,7 +174,6 @@ impl PageView for VenuePage {
     }
 }
 
-/// The search rows of the settings this page draws.
 pub(crate) fn search_fields(translate: &Translate) -> Vec<FieldSearch> {
     let venue = VenueId::Binance;
     let page_id = shared::page_id(&venue);
@@ -212,7 +205,6 @@ pub(crate) fn search_fields(translate: &Translate) -> Vec<FieldSearch> {
     fields
 }
 
-/// The id one market's choice of its HTTP address is drawn and searched under.
 const fn http_id(market: BinanceMarket) -> &'static str {
     match market {
         BinanceMarket::Spot => "market_participants.binance.spot.http",
@@ -220,7 +212,6 @@ const fn http_id(market: BinanceMarket) -> &'static str {
     }
 }
 
-/// The id one market's choice of its WebSocket address is drawn and searched under.
 const fn websocket_id(market: BinanceMarket) -> &'static str {
     match market {
         BinanceMarket::Spot => "market_participants.binance.spot.websocket",
@@ -228,7 +219,6 @@ const fn websocket_id(market: BinanceMarket) -> &'static str {
     }
 }
 
-/// The id of the card one market's rows are drawn in.
 const fn section_id(market: BinanceMarket) -> &'static str {
     match market {
         BinanceMarket::Spot => "market_participants.binance_0",

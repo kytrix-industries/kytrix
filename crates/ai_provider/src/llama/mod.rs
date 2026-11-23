@@ -1,5 +1,3 @@
-//! The llama.cpp backend, configuration, engine handle and worker thread.
-
 mod backend;
 mod batch;
 pub mod cancel;

@@ -1,77 +1,3 @@
-//! The dialog a pane opens to manage the accounts its timeline is read from.
-//!
-//! # Two pages, one list of accounts
-//!
-//! The dialog shows the accounts being monitored and, behind a control of its own, a search of
-//! X for one more. The two pages draw different state. What is monitored, what the last change
-//! said and which request is outstanding belong to the pane, because the service answering them
-//! is the pane's and the accounts outlive any one dialog: a dialog that held them would lose
-//! them on the next open. The search belongs to the dialog: the query is typed in its field and
-//! the request is made for it, so what a search found is the page's own and goes when the dialog
-//! goes — which is the point, because an answer drawn under a query a later dialog never asked
-//! is worse than no answer at all.
-//!
-//! # One value channel into the dialog
-//!
-//! The pane is not reachable from the dialog: a kit control's callback owns no widget, and the
-//! engine has no entity the two could hold each other through. So the dialog is built over
-//! **signals**: the pane publishes what it holds into them every frame ([`TweetDialog::sync`]),
-//! and every dynamic value the dialog draws is a `bind_*` closure over one of them. What the
-//! user does travels back as requests the pane applies ([`DialogRequest`]) — a read, a search, a
-//! new account and a cancelled one are all the pane's own operations, sent over the session the
-//! pane's stream is holding.
-//!
-//! # The pages are toggled, not slid over one another
-//!
-//! **Registered degradation**: the old dialog pushed the search page onto a [`NavStack`], so one
-//! page slid in over the other and each kept its own place. The engine has no navigation-stack
-//! transition (no presence phases, no per-page progress), so the two pages are two containers in
-//! one column area, each bound to a [`Signal<DialogPage>`] through `bind_style.visible`. The
-//! search page appears and disappears in place: the change is instant rather than animated, and
-//! there is no depth drift. Everything else a page holds — its field, its list, its place in that
-//! list — is still the page's own, because each page's list is a component of its own.
-//!
-//! # The row controls are built into rows the list owns
-//!
-//! A kit list's row factory is handed a [`NodeTree`] and nothing else: no application context,
-//! and therefore no `Button`. The delete control of an account row and the monitor control of a
-//! search result are kit buttons all the same, so a row leaves an empty slot for its control and
-//! the dialog builds the button into that slot from [`DialogState::sync_row_controls`], after the
-//! list has mounted its rows. A list that rebuilds its visible rows (a new account count, a
-//! language switch, a picture that arrived) leaves new slots behind; the sync pairs the buttons
-//! with the slots showing now and releases the ones whose row is gone.
-//!
-//! # Static copy is rebuilt, not re-bound
-//!
-//! The kit components this dialog builds choose their labels when they are built, and a language
-//! switch would otherwise leave them in the language the dialog was opened in. The buttons the
-//! dialog holds (add / refresh / back / search / retry / recover / close) are therefore released
-//! and built again into the same parent when the language moves — the same four steps
-//! `crates/widgets/AGENTS.md` §15.1 freezes for static copy — the fields' placeholders are
-//! re-written through `InputNode::update_placeholder`, and the visible rows are rebuilt so their
-//! status badges are in the language showing now. The kit dialog's own title and its close
-//! button's accessible name are the pieces chosen at open; a language switch while the dialog is
-//! open leaves those two in the language it was opened in, which is the same known difference the
-//! W8a solana dialog registered.
-//!
-//! # The spinner exists only while it spins
-//!
-//! A kit spinner animates for as long as it is synced, and the engine has no "hidden animation"
-//! state: a spinner that merely sits in a hidden block would keep asking for frames (I3). It is
-//! therefore built when the search page enters its searching window and released when that window
-//! closes, which is the framework's own placeholder pattern.
-//!
-//! # What a change says is reported in an alert
-//!
-//! An account that joined the list and a change that was refused are the two things a change has
-//! to say, and either of them is one alert over the dialog with the one button that says it was
-//! read: a service's answer is not a line of a page, which a reader looks past. What the alert is
-//! raised for is the report the pane is holding and not the frames it is held for, so a change is
-//! one alert; a change the dialog was not there to hear — it was dismissed before the answer
-//! arrived, or the pane was already holding the report when this dialog opened — is not raised.
-//! A search is the search page's own procedure rather than a change to the accounts, so what came
-//! of one is drawn where it was asked for and never as an alert.
-
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -125,109 +51,56 @@ use super::{
     view::{SelectionNotice, SelectionOperation, status_label, valid_search_query},
 };
 
-/// The width of the dialog's panel.
 const DIALOG_WIDTH: f32 = 580.0;
 
-/// The height of the panel's content column (the old dialog's 640 px panel less the title row
-/// and padding the kit dialog's panel brings).
 const CONTENT_HEIGHT: f32 = 520.0;
 
-/// The widest a sentence standing in for one of the lists is drawn.
 const MESSAGE_WIDTH: f32 = 420.0;
 
-/// The size of the face one row of either list is drawn with.
 const ROW_AVATAR_SIZE: f32 = 42.0;
 
-/// The height one row of either list is drawn at.
-///
-/// A list measures the first row it draws and lays every other one out at that height, so what a
-/// row is worth has to be the row's own height rather than whatever its content asks for: the row
-/// is given one here, which is the face, the lines beside it and a little room around them. A
-/// control's own size is not one — a control has the height of a control, and a row drawn at it
-/// would be laid out at that height and overflow it.
 const ROW_HEIGHT: f32 = 72.0;
 
-/// The size of the check beside a name X vouches for.
 const VERIFIED_ICON_SIZE: f32 = 12.0;
 
-/// Which of the dialog's two pages is showing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DialogPage {
-    /// The accounts being monitored, which is the page the dialog opens on.
     Monitored,
-    /// A search of X for one more.
     Add,
 }
 
-/// What one frame hands the dialog: the pane's selection state, as the dialog draws it.
 #[derive(Clone)]
 pub(super) struct DialogView {
-    /// Whether anybody is signed in.
     pub signed_in: bool,
-    /// Whether the stream carrying the account is live.
     pub ready: bool,
-    /// The accounts the account monitors, once a read has answered.
     pub selections: Option<SelectionData>,
-    /// The query the pane is carrying a search for, while it is carrying one.
     pub searching: Option<SmolStr>,
-    /// What the pane is waiting for, if anything.
     pub operation: Option<SelectionOperation>,
-    /// What the pane says about the last change.
     pub notice: Option<SelectionNotice>,
-    /// What is remembered about the accounts no profile names yet, keyed by their id.
     pub hints: Arc<HashMap<SmolStr, SmolStr>>,
-    /// What is known about every picture the pane wants.
     pub media: MediaStates,
-    /// The engine picture resources the pane has registered, keyed by the URL they came from.
-    ///
-    /// A row builder has no `App` and cannot register a picture itself, so the pane registers
-    /// them and the dialog draws what is there: a face with no resource yet draws as its
-    /// stand-in and is rebuilt when the resource arrives.
     pub images: Rc<RefCell<HashMap<SmolStr, ImageSource>>>,
-    /// The recovery the pane itself offers, for a dialog with no stream.
     pub recovery: WidgetAction,
 }
 
-/// What the user asked the pane for through the dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum DialogRequest {
-    /// Read the accounts again.
     Reload,
-    /// Search X for the account the query names.
     Search(SmolStr),
-    /// Monitor one more account.
     Add(SmolStr),
-    /// Stop monitoring one account.
     Delete(SmolStr),
 }
 
-/// What one search of X answered.
-///
-/// A search is a procedure of the page that runs it rather than a change to the accounts, so what
-/// it answered is that page's state rather than the pane's: it is handed to the dialog that asked
-/// for it and dies with it. "Found nothing" is [`SearchAnswer::Found`] with no profile in it,
-/// which is an answer; a query nothing has been searched with is not one at all.
 pub(super) enum SearchAnswer {
-    /// The accounts the search found, which may be none of them.
     Found(Arc<[XProfile]>),
-    /// Why the search could not be answered.
     Failed(RpcCallError<XApiError>),
 }
 
-/// The dialog a pane opens to manage the accounts its timeline is read from.
 pub(super) struct TweetDialog {
     inner: Rc<RefCell<DialogState>>,
 }
 
 impl TweetDialog {
-    /// Builds every component and opens the kit dialog over the pane's window.
-    ///
-    /// The content is built against signals, so nothing about the pane is needed here: what the
-    /// dialog draws is published by the first frame.
-    ///
-    /// # Errors
-    /// The kit dialog could not be built or opened (the window is gone, or the content subtree
-    /// could not be created).
     pub(super) fn show(cx: &mut WidgetCx<'_>) -> Result<Self, EngineError> {
         let inner = Rc::new(RefCell::new(DialogState::new(cx)));
         inner.borrow_mut().create_kit(cx)?;
@@ -254,12 +127,6 @@ impl TweetDialog {
         Ok(Self { inner })
     }
 
-    /// One frame of the dialog: follow the language, publish the pane's state, sync the
-    /// components, pair the row slots with their controls and raise what the pane reports.
-    ///
-    /// # Errors
-    /// The kit dialog, a list or one of the controls failed to sync; the caller closes the
-    /// dialog rather than leaving dead nodes behind.
     pub(super) fn sync(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -271,7 +138,6 @@ impl TweetDialog {
         self.inner.borrow_mut().frame(cx, view)
     }
 
-    /// Takes the requests the user made through the dialog since the last frame.
     pub(super) fn take_requests(&mut self, cx: &mut WidgetCx<'_>) -> Vec<DialogRequest> {
         if self.finished() {
             return Vec::new();
@@ -312,12 +178,6 @@ impl TweetDialog {
         requests
     }
 
-    /// Hands a search answer to the page that asked for it.
-    ///
-    /// An answer belongs to the query that asked for it: a reader who edited the query while the
-    /// search was out asked about something else, and an answer to a question they no longer have
-    /// is not one this page may draw. So the answer is dropped rather than shown under a query it
-    /// does not stand for.
     pub(super) fn answered_search(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -334,13 +194,11 @@ impl TweetDialog {
         state.adopt_answer(cx, query, answer);
     }
 
-    /// Whether the dialog closed (its close button / footer / Esc or a dismissal).
     pub(super) fn finished(&self) -> bool {
         let state = self.inner.borrow();
         state.released || state.closed.get()
     }
 
-    /// Releases every kit component and the dialog's own signal scope. Idempotent.
     pub(super) fn release(&mut self, cx: &mut WidgetCx<'_>) {
         let (components, scope) = {
             let mut state = self.inner.borrow_mut();
@@ -350,14 +208,11 @@ impl TweetDialog {
             state.released = true;
             (state.take_components(), state.scope)
         };
-        // The dialog unmounts the content subtree, so it goes first; the controls that own
-        // nodes go before the ones that do not (E16); the scope is the last thing handed back.
         release_components(cx.app_mut(), components);
         let _ = cx.app_mut().release_scope(scope);
     }
 }
 
-/// The kit keys one dialog mints from its instance identity.
 #[derive(Clone)]
 struct DialogKeys {
     dialog: SmolStr,
@@ -375,16 +230,12 @@ struct DialogKeys {
     recover: SmolStr,
 }
 
-/// One mounted row's control, and what it was built with.
 struct RowControl {
-    /// The slot the row left for the control, which a rebuilt row replaces.
     slot: NodeId,
-    /// The language the control's accessible name is written in.
     language: LanguageCode,
     button: Button,
 }
 
-/// The controls whose copy is chosen when they are built and rebuilt when the language moves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaticButton {
     AddAccount,
@@ -396,13 +247,11 @@ enum StaticButton {
     Recover,
 }
 
-/// The components one dialog owns, taken as one set on release.
 struct DialogComponents {
     dialog: Option<Dialog>,
     alert: Option<Dialog>,
     filter: Option<InputNode>,
     query: Option<InputNode>,
-    /// The query field's submit action handler, which is the dialog's own registration.
     query_submit: Option<Action>,
     accounts: Option<List>,
     results: Option<List>,
@@ -417,7 +266,6 @@ struct DialogComponents {
     row_controls: Vec<Button>,
 }
 
-/// The parts one open dialog owns.
 struct DialogState {
     window: WindowId,
     scope: SignalScope,
@@ -425,9 +273,7 @@ struct DialogState {
     translate: Translate,
     language: Signal<LanguageCode>,
     keys: DialogKeys,
-    /// The language the static copy was built in.
     built_language: Option<LanguageCode>,
-    /// The recovery control's label and enabled state, which a change rebuilds it for.
     recover_built: Option<WidgetAction>,
     dialog: Option<Dialog>,
     alert: Option<Dialog>,
@@ -445,13 +291,9 @@ struct DialogState {
     close: Option<Button>,
     retry: Option<Button>,
     recover: Option<Button>,
-    /// The controls of the mounted monitored rows, keyed by the row's place in the filtered list.
     delete_buttons: BTreeMap<usize, RowControl>,
-    /// The monitor controls of the mounted search results, on the same terms.
     monitor_buttons: BTreeMap<usize, RowControl>,
-    /// The slot each mounted monitored row left for its delete control.
     account_slots: Rc<RefCell<BTreeMap<usize, NodeId>>>,
-    /// The slot each mounted result row left for its monitor control.
     result_slots: Rc<RefCell<BTreeMap<usize, NodeId>>>,
     add_account_parent: Option<NodeId>,
     refresh_parent: Option<NodeId>,
@@ -460,44 +302,24 @@ struct DialogState {
     close_parent: Option<NodeId>,
     retry_parent: Option<NodeId>,
     recover_parent: Option<NodeId>,
-    /// The rows the monitored list is drawing, which its row builders read for structure.
     account_rows_held: Rc<RefCell<Arc<[XSelection]>>>,
-    /// The results the search list is drawing, on the same terms.
     result_rows_held: Rc<RefCell<Arc<[XProfile]>>>,
-    /// The hints the row builders and the row controls name unresolved accounts by.
     hints_held: Rc<RefCell<Arc<HashMap<SmolStr, SmolStr>>>>,
-    /// What the pane's picture resources hold, mirrored for the row builders (which have no
-    /// `App` to read a signal with). Adopted from the pane's own map on every frame.
     images: Rc<RefCell<HashMap<SmolStr, ImageSource>>>,
     images_source: Option<Rc<RefCell<HashMap<SmolStr, ImageSource>>>>,
-    /// What is known about every picture, mirrored for the row builders on the same terms.
     media: Rc<RefCell<MediaStates>>,
-    /// The check beside a name X vouches for, registered once for every row to draw.
     verified: Option<ImageSource>,
-    /// Which of the pane's rows the filter left the last time, in the order they are held.
     shown_indices: Vec<usize>,
-    /// Whether another set of rows is showing now, which is what puts the reader back at the top.
     rows_moved: bool,
-    /// The structure of the monitored rows the list was last built with, and what a rebuild would
-    /// have to be told about besides it.
     account_shape: Vec<AccountRowShape>,
     account_language: Option<LanguageCode>,
     account_images: usize,
     shown_accounts: Option<usize>,
-    /// The profiles the search list was last built with, and the same two extras.
     result_rows: Option<Arc<[XProfile]>>,
     result_language: Option<LanguageCode>,
     result_images: usize,
-    /// The pane's state as the last frame published it.
     last_view: Option<DialogView>,
-    /// The query a search answer stands for, while one stands.
     answered_query: Option<SmolStr>,
-    /// What the pane was holding the last time the dialog reported it.
-    ///
-    /// `None` is the record not being taken yet: the first frame records what the pane already
-    /// held, because a report made before the dialog opened was made to a dialog that is gone (or
-    /// to none at all), and raising it would report something the reader did in a session that is
-    /// over.
     reported: Option<Option<SelectionNotice>>,
     signed_in: Signal<bool>,
     ready: Signal<bool>,
@@ -526,26 +348,15 @@ struct DialogState {
     closed: Rc<Cell<bool>>,
 }
 
-/// Which part of a search's life the search page is drawing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SearchPhase {
-    /// Nothing has been searched for — or the query was edited since — so there is nothing to
-    /// draw above the field.
     #[default]
     Idle,
-    /// The search found these accounts, of which there is at least one.
     Found,
-    /// The search was answered and found nothing.
     Empty,
-    /// The search could not be answered.
     Failed,
 }
 
-/// What one monitored row's structure has to be told about before it can be built.
-///
-/// A row's text is bound to the signals the frame publishes, so text changes are not a reason to
-/// rebuild; a face, a badge and the parts of the line a profile decides are built once, and this
-/// is the record of what they were built for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AccountRowShape {
     avatar_url: SmolStr,
@@ -556,7 +367,6 @@ struct AccountRowShape {
 }
 
 impl DialogState {
-    /// Builds the dialog's keys and signals. No nodes and no kit components yet.
     fn new(cx: &mut WidgetCx<'_>) -> Self {
         let scope = cx.app_mut().signal_scope();
         let language = cx.language();
@@ -667,8 +477,6 @@ impl DialogState {
         }
     }
 
-    /// Builds the two lists the dialog draws rows with, and the icons those rows draw. Called
-    /// before the dialog is opened, because the dialog's content mounts them.
     fn create_kit(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let verified = {
             let image = cx
@@ -734,7 +542,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Builds the kit dialog around this dialog's content.
     fn build_dialog(inner: &Weak<RefCell<DialogState>>, cx: &mut WidgetCx<'_>) -> Dialog {
         let (theme, layer, animation, key, title, close_label, closed) = {
             let state = inner
@@ -770,8 +577,6 @@ impl DialogState {
             .build(cx.app_mut(), theme, layer, animation, key)
     }
 
-    /// One frame: rebuild the static copy, publish the pane's state, feed the lists, sync every
-    /// component, and report what the pane says about the last change.
     fn frame(&mut self, cx: &mut WidgetCx<'_>, view: &DialogView) -> Result<(), EngineError> {
         if self.released || self.closed.get() {
             return Ok(());
@@ -795,7 +600,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Publishes the pane's state to the signals the dialog's nodes read.
     fn publish(&mut self, cx: &mut WidgetCx<'_>, view: &DialogView) {
         let selections = view
             .selections
@@ -814,10 +618,6 @@ impl DialogState {
         let _ = cx.write(&self.operation, view.operation);
         *self.hints_held.borrow_mut() = Arc::clone(&hints);
 
-        // The pane's picture resources are the pane's own map: the row builders hold a mirror of
-        // it, which is adopted whenever the pane hands over a different map or grows the one it
-        // has. A mirror that is a copy rather than the same `Rc` is what lets the rows see what
-        // the pane registered after the dialog was built.
         let source = Rc::clone(&view.images);
         let changed = self
             .images_source
@@ -829,9 +629,6 @@ impl DialogState {
         self.images_source = Some(source);
         *self.media.borrow_mut() = Arc::clone(&view.media);
 
-        // The rows the monitored list draws: the pane's accounts the filter leaves, in the order
-        // they are held. The rows themselves read text off the signals, so what is written here
-        // is the identity of the set — another set is another place in the list.
         let filter = self.filter_text(cx);
         let indices = filtered_selection_indices(&selections, &hints, filter.as_deref());
         let moved = indices != self.shown_indices;
@@ -870,12 +667,6 @@ impl DialogState {
         self.last_view = Some(view.clone());
     }
 
-    /// Feeds this dialog's own typing to its two fields.
-    ///
-    /// A dialog owns **the typed text and key presses of its own window, and only while it is
-    /// that window's modal scope**: the engine has already dispatched the interaction events, so
-    /// what is left in the observation queue is what a text input can consume. An alert over the
-    /// dialog is the modal scope while it is up, so the fields are left alone then.
     fn dispatch_text_events(&mut self, cx: &mut WidgetCx<'_>) {
         if !self.owns_modal(cx.app()) {
             return;
@@ -896,7 +687,6 @@ impl DialogState {
         }
     }
 
-    /// Whether this dialog is the window's modal scope, and therefore the keyboard's owner.
     fn owns_modal(&self, app: &App) -> bool {
         let Some(dialog) = self.dialog.as_ref() else {
             return false;
@@ -907,11 +697,6 @@ impl DialogState {
         )
     }
 
-    /// Clears what a search found once the query it was asked with has moved.
-    ///
-    /// The query is what asks for a search, so an answer stands for the query it was asked with
-    /// and for no other: editing the query takes the answer away rather than leaving it under a
-    /// query it does not stand for.
     fn follow_typed_query(&mut self, cx: &mut WidgetCx<'_>) {
         if self.answered_query == self.typed_query(cx) {
             return;
@@ -923,7 +708,6 @@ impl DialogState {
         let _ = cx.write(&self.search_error, None);
     }
 
-    /// Shows what a search answered, for the query it was asked with.
     fn adopt_answer(&mut self, cx: &mut WidgetCx<'_>, query: &SmolStr, answer: SearchAnswer) {
         let (phase, profiles, error) = match answer {
             SearchAnswer::Found(profiles) if profiles.is_empty() => {
@@ -940,17 +724,14 @@ impl DialogState {
         let _ = cx.request_frame();
     }
 
-    /// The query the field holds, once it is one a search could be asked with.
     fn typed_query(&self, cx: &WidgetCx<'_>) -> Option<SmolStr> {
         typed_text(&self.query_state, cx)
     }
 
-    /// The filter the field holds.
     fn filter_text(&self, cx: &WidgetCx<'_>) -> Option<SmolStr> {
         typed_text(&self.filter_state, cx)
     }
 
-    /// Whether the pane may change its account list right now.
     fn may_change(&self) -> bool {
         self.last_view.as_ref().is_some_and(|view| {
             view.ready
@@ -960,7 +741,6 @@ impl DialogState {
         })
     }
 
-    /// What one search result's control does, from the state the last frame published.
     fn search_rows(&self) -> Option<SearchRows<'_>> {
         let view = self.last_view.as_ref()?;
         Some(SearchRows {
@@ -974,8 +754,6 @@ impl DialogState {
         })
     }
 
-    /// The language the dialog was built in is not the one showing now: release the static copy
-    /// and build it again.
     fn rebuild_static_copy(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let language = *cx.read(&self.language);
         if self.built_language == Some(language) {
@@ -1006,8 +784,6 @@ impl DialogState {
                 },
             );
         }
-        // A spinner's accessible name is chosen when it is built as well: a language switch while
-        // the search is out rebuilds it in the language showing now.
         if let Some(spinner) = self.spinner.take() {
             spinner.release(cx.app_mut());
         }
@@ -1029,7 +805,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Rebuilds the recovery control when the recovery the pane offers moved.
     fn sync_recover(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let current = self.last_view.as_ref().map(|view| view.recovery.clone());
         if self.recover_built == current {
@@ -1042,7 +817,6 @@ impl DialogState {
         self.rebuild_button(cx, parent, StaticButton::Recover)
     }
 
-    /// Rebuilds one static-copy control with the language showing now.
     fn rebuild_button(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1061,7 +835,6 @@ impl DialogState {
         self.build_button(cx.app_mut(), window, parent, kind)
     }
 
-    /// Builds one static-copy control into `parent`.
     fn build_button(
         &mut self,
         app: &mut App,
@@ -1218,7 +991,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Takes the control of one kind out of its field.
     fn take_button(&mut self, kind: StaticButton) -> Option<Button> {
         match kind {
             StaticButton::AddAccount => self.add_account.take(),
@@ -1231,15 +1003,12 @@ impl DialogState {
         }
     }
 
-    /// Tells each list how many rows it draws, and rebuilds the visible ones when what a row has
-    /// to be built for moved.
     fn sync_lists(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         self.sync_account_list(cx)?;
         self.sync_result_list(cx)?;
         Ok(())
     }
 
-    /// The monitored list's rows: their number, their badges' language, and their faces.
     fn sync_account_list(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(list) = self.accounts.clone() else {
             return Ok(());
@@ -1259,8 +1028,6 @@ impl DialogState {
         if !rebuild {
             return Ok(());
         }
-        // Another set of rows is another place in the list: being given them is what puts the
-        // reader back at the top. A rebuild of the rows themselves keeps the place they were at.
         if moved || shown.is_none() {
             list.set_items(cx.app_mut(), count)?;
         } else {
@@ -1274,7 +1041,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// The search list's rows, on the same terms.
     fn sync_result_list(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(list) = self.results.clone() else {
             return Ok(());
@@ -1297,8 +1063,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Syncs every component the dialog owns, in the order the engine expects, and pairs the row
-    /// slots with the controls they are for.
     fn sync_components(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let window = self.window;
         if let Some(dialog) = self.dialog.as_ref() {
@@ -1324,16 +1088,12 @@ impl DialogState {
         Ok(())
     }
 
-    /// Builds the search spinner when the page enters its searching window and releases it when
-    /// that window closes, so a hidden spinner never keeps asking for frames (I3).
     fn sync_spinner(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if *cx.read(&self.searching) {
             if let Some(spinner) = self.spinner.as_ref() {
                 spinner.sync(cx.app_mut())?;
             } else if let Some(parent) = self.spinner_parent {
                 let key = format_smolstr!("{}:spinner", self.keys.dialog);
-                // A spinner with no name is a decorative shape to assistive technology: the name
-                // is what makes the searching window audible.
                 let label = t_smol!(self.translate, "widget.x.searching_users");
                 let spinner = Spinner::new(cx.app_mut(), self.theme.clone(), key).with_label(label);
                 let window = self.window;
@@ -1346,7 +1106,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Keeps the controls' enabled state in step with what the pane may do now.
     fn sync_button_states(&mut self, cx: &mut WidgetCx<'_>) {
         let ready = *cx.read(&self.ready);
         let known = *cx.read(&self.known);
@@ -1377,8 +1136,6 @@ impl DialogState {
         }
     }
 
-    /// Pairs every mounted row with the control its slot is for, and releases the controls of
-    /// the rows that are gone.
     fn sync_row_controls(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let language = *cx.read(&self.language);
         let may_change = self.may_change();
@@ -1386,7 +1143,6 @@ impl DialogState {
         let theme = self.theme.clone();
         let translate = self.translate.clone();
 
-        // ── the monitored list's delete controls ─────────────────────────────
         if let Some(list) = self.accounts.clone() {
             let mounted: BTreeMap<usize, NodeId> =
                 list.mounted_rows(cx.app()).into_iter().collect();
@@ -1461,7 +1217,6 @@ impl DialogState {
             }
         }
 
-        // ── the search list's monitor controls ───────────────────────────────
         if let Some(list) = self.results.clone() {
             let mounted: BTreeMap<usize, NodeId> =
                 list.mounted_rows(cx.app()).into_iter().collect();
@@ -1553,21 +1308,12 @@ impl DialogState {
         Ok(())
     }
 
-    /// Reports what the last change said, in an alert over the dialog.
-    ///
-    /// What the pane holds is reported once: an alert is opened at the end of the frame that
-    /// opens it and asks for a frame of its own, so a dialog that reported the same thing on the
-    /// frame after that would be drawing frames for an alert rather than for the accounts it is
-    /// there for. What clears the record is the pane holding nothing, which is what makes the
-    /// next change reported whether or not it says what the last one did.
     fn report_notice(
         &mut self,
         cx: &mut WidgetCx<'_>,
         view: &DialogView,
     ) -> Result<(), EngineError> {
         match &self.reported {
-            // The first frame records what the pane was already holding: it was said before this
-            // dialog opened, so it is already reported as far as this dialog is concerned.
             None => {
                 self.reported = Some(view.notice.clone());
                 Ok(())
@@ -1583,7 +1329,6 @@ impl DialogState {
         }
     }
 
-    /// Opens the alert one report is read in.
     fn raise_alert(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -1618,7 +1363,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Syncs the alert, and releases it once it has gone.
     fn sync_alert(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(alert) = self.alert.clone() else {
             return Ok(());
@@ -1634,7 +1378,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// Builds the dialog's own panel: the two pages over one another, and the way out.
     fn build_content(
         &mut self,
         app: &mut App,
@@ -1676,8 +1419,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// The page that manages the accounts: the count and the controls over them, the filter, the
-    /// list, and the sentence that stands in for it when there is nothing to list.
     fn build_monitored_page(
         &mut self,
         app: &mut App,
@@ -1725,7 +1466,6 @@ impl DialogState {
         self.refresh_parent = Some(refresh_holder);
         self.build_button(app, window, refresh_holder, StaticButton::Refresh)?;
 
-        // The field the accounts are filtered by, on the page that manages them.
         let toolbar = build_node(app, window, root, |tree, root| {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:monitored:toolbar"))
@@ -1792,7 +1532,6 @@ impl DialogState {
         );
         self.filter = Some(filter);
 
-        // The accounts, inside the frame the page draws them in.
         let area = build_node(app, window, root, |tree, root| {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:monitored:area"))
@@ -1854,8 +1593,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// The five sentences that stand in for the monitored list, each live while its own situation
-    /// holds and none of them drawn over a list that has rows.
     fn build_monitored_messages(
         &mut self,
         app: &mut App,
@@ -1872,7 +1609,6 @@ impl DialogState {
         let count = self.count;
         let shown = self.shown_rows;
 
-        // Nobody is signed in.
         let signed_out = message_block(app, window, area, format_smolstr!("{key}:signed-out"), {
             let signed_in = self.signed_in;
             move |read| !*read.read(&signed_in)
@@ -1893,7 +1629,6 @@ impl DialogState {
             },
         )?;
 
-        // A read is on its way, whether it is out or waiting for the stream.
         let loading = message_block(app, window, area, format_smolstr!("{key}:loading"), {
             let operation = self.operation;
             let known = self.known;
@@ -1922,9 +1657,6 @@ impl DialogState {
             },
         )?;
 
-        // Nothing is holding the account, so a read has nothing to answer it: the way out is the
-        // recovery the pane itself offers, which is the same control the pane shows behind this
-        // dialog.
         let unavailable =
             message_block(app, window, area, format_smolstr!("{key}:unavailable"), {
                 let operation = self.operation;
@@ -1963,8 +1695,6 @@ impl DialogState {
         self.recover_parent = Some(recover_holder);
         self.build_button(app, window, recover_holder, StaticButton::Recover)?;
 
-        // The read was answered with a failure, which the alert over the dialog names: what is
-        // left to draw here is the way to read the accounts again.
         let failed = message_block(app, window, area, format_smolstr!("{key}:failed"), {
             let operation = self.operation;
             let known = self.known;
@@ -2002,7 +1732,6 @@ impl DialogState {
         self.retry_parent = Some(retry_holder);
         self.build_button(app, window, retry_holder, StaticButton::Retry)?;
 
-        // The account monitors no account at all.
         let empty = message_block(app, window, area, format_smolstr!("{key}:empty"), {
             let signed_in = self.signed_in;
             let known = self.known;
@@ -2024,7 +1753,6 @@ impl DialogState {
             },
         )?;
 
-        // The filter leaves nothing of what the account does monitor.
         let no_matches = message_block(
             app,
             window,
@@ -2055,8 +1783,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// The page that searches X for one more account: the way back, the query and the control
-    /// that sends it, the results, and what became of the search instead.
     fn build_add_page(
         &mut self,
         app: &mut App,
@@ -2110,9 +1836,6 @@ impl DialogState {
                 .style(StyleBuilder::new().flex_1().min_width_0().build())
                 .build(tree, toolbar)
         })?;
-        // Enter in the field is the search control's keyboard path: the kit input dispatches the
-        // action it is given, and the action re-checks at entry what the control checks, because
-        // a disabled control is drawn disabled rather than enforced (AGENTS §4.2).
         let submit = Action::Custom(format_smolstr!("{}.submit", self.keys.query));
         let submit_query_state = self.query_state;
         let submit_ready = self.ready;
@@ -2189,7 +1912,6 @@ impl DialogState {
                 .build(tree, root)
         })?;
 
-        // The results, inside the frame the page draws them in.
         let frame = build_node(app, window, area, |tree, area| {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:add:frame"))
@@ -2239,8 +1961,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// What the search page says instead of a list: the searching window, the words of a failure,
-    /// and the answer that found nothing.
     fn build_add_messages(
         &mut self,
         app: &mut App,
@@ -2253,7 +1973,6 @@ impl DialogState {
         let translate = self.translate.clone();
         let language = self.language;
 
-        // Nobody is signed in: there is nothing either page's field could be asked about.
         let signed_out = message_block(
             app,
             window,
@@ -2280,8 +1999,6 @@ impl DialogState {
             },
         )?;
 
-        // The searching window: a spinner, which exists only while it spins, and the sentence
-        // that says what is being waited for.
         let searching =
             message_block(app, window, area, format_smolstr!("{key}:add:searching"), {
                 let searching = self.searching;
@@ -2311,7 +2028,6 @@ impl DialogState {
             },
         )?;
 
-        // A search that could not be answered is drawn in the words the failure itself gives.
         let failed = message_block(app, window, area, format_smolstr!("{key}:add:failed"), {
             let searching = self.searching;
             let phase = self.search_phase;
@@ -2343,7 +2059,6 @@ impl DialogState {
             },
         )?;
 
-        // The search was answered and found nothing: an answer, drawn where it was asked for.
         let no_results = message_block(app, window, area, format_smolstr!("{key}:add:empty"), {
             let searching = self.searching;
             let phase = self.search_phase;
@@ -2372,7 +2087,6 @@ impl DialogState {
         Ok(())
     }
 
-    /// The count line both pages carry: how many accounts the account monitors, once it is known.
     fn heading_node(
         &self,
         app: &mut App,
@@ -2411,7 +2125,6 @@ impl DialogState {
         })
     }
 
-    /// The way out of the dialog, which belongs to both pages and so is drawn once under them.
     fn build_footer(
         &mut self,
         app: &mut App,
@@ -2453,8 +2166,6 @@ impl DialogState {
         self.build_button(app, window, close_holder, StaticButton::Close)
     }
 
-    /// Takes the components out of the state, leaving the nodes to whoever releases them first
-    /// (the dialog's overlay owns the content subtree).
     fn take_components(&mut self) -> DialogComponents {
         let mut row_controls: Vec<Button> = std::mem::take(&mut self.delete_buttons)
             .into_values()
@@ -2486,7 +2197,6 @@ impl DialogState {
     }
 }
 
-/// The layout both pages share: a column filling the page area.
 fn page_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .absolute()
@@ -2501,7 +2211,6 @@ fn page_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The layout a page's header row is drawn in.
 fn header_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .width_full()
@@ -2513,7 +2222,6 @@ fn header_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The layout a page's toolbar row is drawn in.
 fn toolbar_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .width_full()
@@ -2525,14 +2233,12 @@ fn toolbar_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The query one field holds, once it is one a search could be asked with.
 fn typed_text(signal: &Signal<InputState>, cx: &WidgetCx<'_>) -> Option<SmolStr> {
     let state = cx.read(signal);
     let typed = state.text().trim();
     (!typed.is_empty()).then(|| SmolStr::new(typed))
 }
 
-/// Whether a control may send a search, from the signals showing on this frame.
 fn searchable_now(
     ctx: &ActionCtx<'_>,
     query_state: &Signal<InputState>,
@@ -2551,11 +2257,6 @@ fn searchable_now(
     Some(SmolStr::new(typed))
 }
 
-/// Offers the query the field holds to the pane, when the pane may search with it now.
-///
-/// The search control and Enter in the field both come through here: what the control is drawn
-/// with is a hint, and the judgement that keeps a request from leaving is this action-entry check
-/// (AGENTS §4.2).
 fn offer_search(
     ctx: &mut ActionCtx<'_>,
     query_state: &Signal<InputState>,
@@ -2572,11 +2273,6 @@ fn offer_search(
     let _ = ctx.app_mut().request_repaint(window);
 }
 
-/// What one report says: the title of the alert it is raised in, and what that alert is about.
-///
-/// Which way the change went is the title, and what the service answered is the message: a
-/// failure is read in the words the failure itself gives, rather than in a sentence written
-/// around it here.
 fn report_text(notice: &SelectionNotice, translate: &Translate) -> (SmolStr, SmolStr) {
     match notice {
         SelectionNotice::Added => (
@@ -2590,22 +2286,14 @@ fn report_text(notice: &SelectionNotice, translate: &Translate) -> (SmolStr, Smo
     }
 }
 
-/// What one search-result row needs to decide what its control does.
 struct SearchRows<'a> {
-    /// The accounts being monitored, which is what says whether this one already is.
     monitored: Option<&'a SelectionData>,
-    /// The names those accounts are known by, which is what they are asked about by name.
     hints: &'a HashMap<SmolStr, SmolStr>,
     quota_full: bool,
     enabled: bool,
 }
 
 impl SearchRows<'_> {
-    /// What the control beside one search result does.
-    ///
-    /// Whether an account is already monitored is the question the rows of the accounts list
-    /// answer, asked of the same set by the same rule: there is no second list of names here that
-    /// could say something the list itself would not.
     fn action(&self, username: &str) -> SearchProfileAction {
         let monitored = self
             .monitored
@@ -2614,12 +2302,9 @@ impl SearchRows<'_> {
     }
 }
 
-/// What the control beside one search result is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SearchProfileAction {
-    /// The account may be monitored.
     Add { disabled: bool },
-    /// The account is already monitored.
     Selected,
 }
 
@@ -2647,11 +2332,6 @@ impl SearchProfileAction {
     }
 }
 
-/// Which of the monitored accounts a filter leaves, in the order they are held.
-///
-/// The filter is a convenience over what is already on screen: an account is matched by its
-/// username, its display name, the username it is waiting to be activated under, or any part of
-/// its numeric id.
 fn filtered_selection_indices(
     selections: &[XSelection],
     hints: &HashMap<SmolStr, SmolStr>,
@@ -2672,8 +2352,6 @@ fn filtered_selection_indices(
                 fields.push(profile.username.as_str());
                 fields.push(profile.display_name.as_str());
             }
-            // A row waiting to be activated is matched by the name it is drawn with, which is
-            // the only one it has.
             if let Some(name) = selection_name(selection, hints) {
                 fields.push(name);
             }
@@ -2685,11 +2363,6 @@ fn filtered_selection_indices(
         .collect()
 }
 
-/// What one monitored account is called, and what it is called while it waits.
-///
-/// A row is named by what is known about it — its profile, or the username it was added under
-/// while it waits to be activated — which is the same rule that decides whether an account is
-/// already monitored, asked in the same place.
 fn account_name(selection: &XSelection, hints: &HashMap<SmolStr, SmolStr>) -> SmolStr {
     match selection_name(selection, hints) {
         Some(name) => format_smolstr!("@{name}"),
@@ -2697,12 +2370,6 @@ fn account_name(selection: &XSelection, hints: &HashMap<SmolStr, SmolStr>) -> Sm
     }
 }
 
-/// How many followers an account has, at the width a row has for it.
-///
-/// A row is one line, so a count is read in the largest unit that keeps it under a thousand, to
-/// one tenth: 1250 is "1.3K". A count whose tenth rounds up to the next unit reads as that unit —
-/// 999_950 is "1M" rather than "1000.0K" — which is what makes a row's width depend on the number
-/// rather than on the unit it happens to be near.
 fn format_follower_count(count: u64) -> SmolStr {
     const UNITS: [(u64, &str); 3] = [(1_000, "K"), (1_000_000, "M"), (1_000_000_000, "B")];
     let mut formatted: Option<SmolStr> = None;
@@ -2712,8 +2379,6 @@ fn format_follower_count(count: u64) -> SmolStr {
         }
         let tenths = (count % scale) * 10 + scale / 2;
         if tenths >= scale * 10 {
-            // The tenth carried into the unit above this one, and a larger unit that also fits
-            // replaces whatever this turn would have written.
             formatted = match UNITS.get(index + 1) {
                 Some((next_scale, next_suffix)) => Some(format_smolstr!(
                     "{}{next_suffix}",
@@ -2734,12 +2399,9 @@ fn format_follower_count(count: u64) -> SmolStr {
     formatted.unwrap_or_else(|| format_smolstr!("{count}"))
 }
 
-/// The signal a row builder reads: the accounts, and what they are named by.
 struct AccountRows {
     key: SmolStr,
-    /// The rows themselves, for the structure a row is built with.
     held: Rc<RefCell<Arc<[XSelection]>>>,
-    /// The same rows as a signal, for the text the row's nodes follow.
     rows: Signal<Arc<[XSelection]>>,
     hints: Signal<Arc<HashMap<SmolStr, SmolStr>>>,
     language: Signal<LanguageCode>,
@@ -2751,7 +2413,6 @@ struct AccountRows {
     slots: Rc<RefCell<BTreeMap<usize, NodeId>>>,
 }
 
-/// The signal a search-result row builder reads: the profiles a search found.
 struct ResultRows {
     key: SmolStr,
     held: Rc<RefCell<Arc<[XProfile]>>>,
@@ -2765,7 +2426,6 @@ struct ResultRows {
     slots: Rc<RefCell<BTreeMap<usize, NodeId>>>,
 }
 
-/// What one monitored row's structure has to be told about, row by row.
 fn account_row_shape(rows: &[XSelection]) -> Vec<AccountRowShape> {
     rows.iter()
         .map(|selection| {
@@ -2782,8 +2442,6 @@ fn account_row_shape(rows: &[XSelection]) -> Vec<AccountRowShape> {
         .collect()
 }
 
-/// One monitored account: which account it is, what is known about it, and the slot its delete
-/// control goes in.
 fn build_account_row(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2826,7 +2484,6 @@ fn build_account_row(
         )
         .build(tree, row)?;
     match selection.profile.as_ref() {
-        // The profile line already names the account, so the name is not repeated above it.
         Some(profile) => {
             let names = rows.rows;
             let handles = rows.rows;
@@ -2871,8 +2528,6 @@ fn build_account_row(
                 },
             )?;
         }
-        // An account that is waiting to be activated has no profile yet, so what is known about
-        // it is its name, its state and its id.
         None => {
             let rows_signal = rows.rows;
             let hints = rows.hints;
@@ -2941,7 +2596,6 @@ fn build_account_row(
         }
     }
 
-    // The state of the account, which the header line of a profiled row does not carry.
     build_status_badge(tree, row, index, rows)?;
     build_row_slot(
         tree,
@@ -2954,7 +2608,6 @@ fn build_account_row(
     Ok(())
 }
 
-/// One account a search found: who they are, and the slot the control that monitors them goes in.
 fn build_result_row(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -3017,8 +2670,6 @@ fn build_result_row(
                 })
         },
     )?;
-    // Counts a search did not carry are both zero, and a line of zeros says nothing about the
-    // account.
     if !profile.description.is_empty() {
         build_description(
             tree,
@@ -3056,7 +2707,6 @@ fn build_result_row(
                 return SmolStr::default();
             }
             let formatted = format_follower_count(followers);
-            // A count of one is the singular word: "1 follower".
             if followers == 1 {
                 t_smol!(
                     translate,
@@ -3086,7 +2736,6 @@ fn build_result_row(
     Ok(())
 }
 
-/// The layout one row of either list is drawn in.
 fn row_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .flex_row()
@@ -3099,10 +2748,6 @@ fn row_style() -> ui_core::paint::style::Style {
         .build()
 }
 
-/// The name line of one account: what it is called, and whether X vouches for it.
-///
-/// Both lists draw the same line over different rows, so the shape is built here once and what
-/// the two texts read is each list's own.
 fn profile_line(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -3180,7 +2825,6 @@ fn profile_line(
     Ok(())
 }
 
-/// The one line of secondary text under a name.
 fn build_description(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -3200,7 +2844,6 @@ fn build_description(
     Ok(())
 }
 
-/// The state of one monitored account, as a badge.
 fn build_status_badge(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -3220,7 +2863,6 @@ fn build_status_badge(
     Ok(())
 }
 
-/// The slot a row leaves for the control the dialog builds into it.
 fn build_row_slot(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -3245,7 +2887,6 @@ fn build_row_slot(
     Ok(())
 }
 
-/// A face, or the stand-in that says there is one to come.
 fn build_avatar(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -3260,15 +2901,11 @@ fn build_avatar(
         .height(ROW_AVATAR_SIZE)
         .flex_none()
         .build();
-    // What can be drawn is what the pane registered; what the pane knows about the picture says
-    // whether there is anything to wait for at all.
     let ready = !url.is_empty()
         && matches!(media.get(url), Some(MediaState::Ready(_)))
         && images.contains_key(url);
     let image = ready.then(|| images.get(url).copied()).flatten();
     let Some(image) = image else {
-        // No bytes yet (or no face to fetch): a surface-toned tile with an `@` is what the old
-        // interface drew for a face that had not arrived.
         let placeholder = NodeBuilder::boxed()
             .id(id)
             .style(style)
@@ -3304,7 +2941,6 @@ fn build_avatar(
     Ok(())
 }
 
-/// Draws one icon image at `size`, toned by a theme role.
 fn build_icon(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -3333,7 +2969,6 @@ fn build_icon(
     Ok(())
 }
 
-/// One absolute block in a page's list area, centred, drawn while `visible` holds.
 fn message_block(
     app: &mut App,
     window: WindowId,
@@ -3363,7 +2998,6 @@ fn message_block(
     })
 }
 
-/// One plain sentence standing in a message block.
 fn sentence_node(
     app: &mut App,
     window: WindowId,
@@ -3392,7 +3026,6 @@ fn sentence_node(
     })
 }
 
-/// A `bind_style` that only decides whether the node is drawn.
 fn visible_if(
     visible: impl Fn(&mut ReadCtx<'_>) -> bool + 'static,
 ) -> impl Fn(&mut ReadCtx<'_>) -> StylePatch + 'static {
@@ -3402,7 +3035,6 @@ fn visible_if(
     }
 }
 
-/// A dynamic foreground colour read through the theme handle.
 fn themed_foreground(
     theme: ThemeHandle,
     role: Role,
@@ -3413,7 +3045,6 @@ fn themed_foreground(
     }
 }
 
-/// A dynamic background colour read through the theme handle.
 fn themed_background(
     theme: ThemeHandle,
     role: Role,
@@ -3424,7 +3055,6 @@ fn themed_background(
     }
 }
 
-/// Removes one control's node, if it is still there.
 fn remove_button_node(app: &mut App, window: WindowId, button: &Button) -> Result<(), EngineError> {
     let Some(node) = button.node() else {
         return Ok(());
@@ -3438,7 +3068,6 @@ fn remove_button_node(app: &mut App, window: WindowId, button: &Button) -> Resul
     app.remove_node(window, node).map(|_| ())
 }
 
-/// Releases the components one dialog owns, the node-owning ones first (E16).
 fn release_components(app: &mut App, components: DialogComponents) {
     if let Some(dialog) = components.dialog {
         dialog.release(app);
@@ -3483,7 +3112,6 @@ fn release_components(app: &mut App, components: DialogComponents) {
     }
 }
 
-/// Whether `event` is one only a dialog's own text inputs can consume.
 fn is_text_input(event: &Event) -> bool {
     matches!(
         event,
@@ -3491,7 +3119,6 @@ fn is_text_input(event: &Event) -> bool {
     )
 }
 
-/// Maps a kit dialog error onto the engine error the widget contract speaks.
 fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
     match error {
         DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
@@ -3501,7 +3128,6 @@ fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
     }
 }
 
-/// Builds one node under `parent` with a window's tree in hand.
 fn build_node(
     app: &mut App,
     window: WindowId,
@@ -3529,8 +3155,6 @@ mod tests {
     use super::*;
     use crate::view::SelectionFailure;
 
-    /// How many production-shaped frames a test lets run: nodes built by the frame that created
-    /// them are laid out and painted by the frames after.
     const SETTLE_FRAMES: usize = 8;
 
     fn translate(language: LanguageCode) -> Translate {
@@ -3567,7 +3191,6 @@ mod tests {
         harness.with_cx(|cx| dialog.take_requests(cx))
     }
 
-    /// The click a reader makes on one of the dialog's controls.
     fn click(harness: &mut WidgetTestApp, button: &Button) {
         let node = button.node().expect("the control is built");
         let action = button
@@ -3582,7 +3205,6 @@ mod tests {
         );
     }
 
-    /// Puts `text` in the dialog's search field.
     fn set_query(harness: &mut WidgetTestApp, dialog: &TweetDialog, text: &str) {
         let state = dialog.inner.borrow().query_state;
         harness.with_cx(|cx| {
@@ -3590,7 +3212,6 @@ mod tests {
         });
     }
 
-    /// One monitored account, under an id and a name of the test's choosing.
     fn monitored(x_user_id: &str, username: Option<&str>) -> XSelection {
         XSelection {
             x_user_id: SmolStr::new(x_user_id),
@@ -3601,7 +3222,6 @@ mod tests {
         }
     }
 
-    /// One account a search could have found.
     fn profile(x_user_id: &str, username: &str) -> XProfile {
         XProfile {
             x_user_id: SmolStr::new(x_user_id),
@@ -3638,11 +3258,6 @@ mod tests {
         }
     }
 
-    /// The alert a change is reported in says which way it went, in either language.
-    ///
-    /// The title and the message are all an alert is made of, and a key a locale does not define
-    /// translates to an empty string rather than failing: a typo in one of them would otherwise
-    /// reach the user as an alert with a blank panel, which is what both are read for here.
     #[test]
     fn a_report_should_be_written_in_both_languages() {
         for (language, error_title, success_title) in [
@@ -3677,8 +3292,6 @@ mod tests {
         }
     }
 
-    /// A change the pane reports while the dialog is open is raised once, in an alert over it,
-    /// and a report the pane was already holding when the dialog opened is not raised at all.
     #[test]
     fn a_report_should_be_raised_once_over_the_dialog() {
         let mut harness = harness();
@@ -3732,7 +3345,6 @@ mod tests {
         ];
         let hints = HashMap::from([(SmolStr::new_static("43"), SmolStr::new_static("pending"))]);
 
-        // Nothing typed is everything on screen, and a filter that matches nothing is nothing.
         assert_eq!(
             filtered_selection_indices(&selections, &hints, None),
             [0, 1, 2]
@@ -3743,7 +3355,6 @@ mod tests {
         );
         assert!(filtered_selection_indices(&selections, &hints, Some("nobody")).is_empty());
 
-        // A username, a display name, a hint and a numeric id are all things a reader reads.
         assert_eq!(
             filtered_selection_indices(&selections, &hints, Some("kytrix")),
             [0]
@@ -3779,9 +3390,6 @@ mod tests {
         }
     }
 
-    /// Whether a search result is one already monitored is the question the monitored list
-    /// answers, asked of the same rows by the same rule: the control beside a result never reads
-    /// as monitored for a name the list itself would not show.
     #[test]
     fn a_search_result_should_offer_to_monitor_it_unless_it_already_is() {
         let hints = HashMap::from([
@@ -3874,7 +3482,6 @@ mod tests {
         );
     }
 
-    /// The way out of the footer ends the dialog, and a dialog that has gone says so.
     #[test]
     fn the_close_control_should_finish_the_dialog() {
         let mut harness = harness();
@@ -3905,8 +3512,6 @@ mod tests {
         assert!(dialog.finished(), "the close control ends the dialog");
     }
 
-    /// Every control the dialog holds writes the request the pane reads: a read, a search, an
-    /// account to monitor and one to stop monitoring.
     #[test]
     fn the_requests_the_controls_write_should_reach_the_pane() {
         let mut harness = harness();
@@ -3983,8 +3588,6 @@ mod tests {
         );
     }
 
-    /// Releasing the dialog hands every value slot it minted back, and releasing it twice does
-    /// not take anything else with it.
     #[test]
     fn releasing_the_dialog_should_hand_its_values_back() {
         let mut harness = harness();
@@ -4017,8 +3620,6 @@ mod tests {
             assert!(dialog.finished(), "a released dialog is finished");
         }
 
-        // Opening and releasing again reuses the pool the first dialog sized: the capacity the
-        // engine keeps is not the leak, growth across cycles is.
         let mut capacity = None;
         for _ in 0..8 {
             let mut dialog = open(&mut harness);
@@ -4038,8 +3639,6 @@ mod tests {
         }
     }
 
-    /// The dialog's node with the given debug suffix (the page containers, the message
-    /// blocks and the fields are addressed by the dialog's own key).
     fn node(dialog: &TweetDialog, harness: &WidgetTestApp, suffix: &str) -> NodeId {
         let key = dialog.inner.borrow().keys.dialog.clone();
         let prefix = format_smolstr!("{key}:{suffix}");
@@ -4048,7 +3647,6 @@ mod tests {
             .unwrap_or_else(|| panic!("the dialog draws {suffix}"))
     }
 
-    /// The text one of the two fields holds.
     fn typed(harness: &WidgetTestApp, dialog: &TweetDialog, query: bool) -> SmolStr {
         let state = {
             let state = dialog.inner.borrow();
@@ -4061,8 +3659,6 @@ mod tests {
         SmolStr::new(harness.app().read(&state).text())
     }
 
-    /// The pages are one under the other with only the one being worked on drawn: the
-    /// control on the managed page pushes the search page, and the way back pops it.
     #[test]
     fn the_dialog_should_show_one_page_at_a_time() {
         let mut harness = harness();
@@ -4107,8 +3703,6 @@ mod tests {
         assert!(!harness.visible(search));
     }
 
-    /// A search that is out is drawn as a spinner, and the spinner exists only while the
-    /// search is: a hidden spinner is released rather than spinning off screen (I3).
     #[test]
     fn a_search_that_is_out_should_be_drawn_as_a_spinner() {
         let mut harness = harness();
@@ -4150,8 +3744,6 @@ mod tests {
         assert!(!harness.visible(searching));
     }
 
-    /// The copy chosen when a control is built follows the language: the controls are
-    /// rebuilt, and the fields' placeholders and accessible names with them.
     #[test]
     fn the_dialog_s_static_copy_should_follow_the_language() {
         let mut harness = harness();
@@ -4213,9 +3805,6 @@ mod tests {
         );
     }
 
-    /// The typed text and an IME commit reach the dialog's own fields, and only while the
-    /// dialog is the window's modal scope: the fields are fed from the observation queue
-    /// the engine leaves to a modal dialog's owner.
     #[test]
     fn typing_and_ime_should_reach_the_dialog_s_fields() {
         let mut harness = harness();
@@ -4261,7 +3850,6 @@ mod tests {
             "an IME commit reaches the field the keyboard is on"
         );
 
-        // The other field is the search page's, and it is not the focused one.
         assert_eq!(
             typed(&harness, &dialog, true).as_str(),
             "",
@@ -4269,8 +3857,6 @@ mod tests {
         );
     }
 
-    /// An answer to a question the reader no longer has is not drawn: editing the query
-    /// takes the answer away, and the answer to the query showing now is drawn.
     #[test]
     fn a_search_answer_should_belong_to_the_query_that_asked_for_it() {
         let mut harness = harness();
@@ -4291,7 +3877,6 @@ mod tests {
         settle_frames(&mut harness, &mut dialog, &view);
         assert!(harness.visible(node(&dialog, &harness, "add:list")));
 
-        // The reader edits the query while an answer for the old one is what is drawn.
         set_query(&mut harness, &dialog, "someone-else");
         settle_frames(&mut harness, &mut dialog, &view);
         assert!(
@@ -4299,7 +3884,6 @@ mod tests {
             "an answer does not stand under a query it was not asked with"
         );
 
-        // The answer to the old query, arriving late, is not drawn either.
         harness.with_cx(|cx| {
             dialog.answered_search(
                 cx,
@@ -4310,7 +3894,6 @@ mod tests {
         settle_frames(&mut harness, &mut dialog, &view);
         assert!(!harness.visible(node(&dialog, &harness, "add:list")));
 
-        // The answer to the query showing now is.
         harness.with_cx(|cx| {
             dialog.answered_search(
                 cx,
@@ -4322,8 +3905,6 @@ mod tests {
         assert!(harness.visible(node(&dialog, &harness, "add:list")));
     }
 
-    /// A search that was answered and found nothing says so on the page that asked, rather
-    /// than leaving the page blank or opening an alert.
     #[test]
     fn an_empty_search_answer_should_say_so_on_the_page_that_asked() {
         let mut harness = harness();
@@ -4360,8 +3941,6 @@ mod tests {
         assert!(dialog.inner.borrow().alert.is_none(), "it is not a failure");
     }
 
-    /// A search that could not be answered is drawn in the words the failure itself gives,
-    /// on the page that asked — not as an alert over the dialog.
     #[test]
     fn a_search_that_could_not_be_answered_should_be_drawn_where_it_was_asked() {
         let mut harness = harness();

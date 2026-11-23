@@ -1,17 +1,3 @@
-//! The configure page: which proxy each network target is reached through.
-//!
-//! Every row is a line of the network configuration: the default line, the line one market
-//! participant's requests take, and the line a group of Kytrix services shares. A control offers the
-//! built-in lines beside the entries of the proxy catalog, and the row's setting is written through
-//! the session the way every other setting is.
-//!
-//! # Why the choices are compared every frame
-//!
-//! The catalog is a runtime value: another pane can add, rename or remove an entry while this page
-//! is drawn. The old page read the catalog every time it was rendered; this one reads it in `sync`
-//! and replaces a control's items only when the list they would offer changed, so an unchanged
-//! catalog costs a comparison rather than a write and the page keeps the old page's freshness.
-
 use app_config::{
     network::{KytrixServiceCapability, ServiceTarget},
     settings::Config,
@@ -42,10 +28,8 @@ use crate::{
     session::SettingsChange,
 };
 
-/// The id of this page.
 const PAGE: &str = "configure";
 
-/// The Kytrix services the configure page reaches through one line.
 const KYTRIX_CLOUD: &[ServiceTarget] = &[
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::Account,
@@ -82,7 +66,6 @@ const KYTRIX_CLOUD: &[ServiceTarget] = &[
     },
 ];
 
-/// The application's own updates, which are fetched through their own line.
 const APP_UPDATES: &[ServiceTarget] = &[
     ServiceTarget::KytrixService {
         capability: KytrixServiceCapability::UpdaterMetadata,
@@ -92,15 +75,12 @@ const APP_UPDATES: &[ServiceTarget] = &[
     },
 ];
 
-/// The translation model downloads, which have a line of their own.
 const AI_MODELS: &[ServiceTarget] = &[ServiceTarget::TranslationModelDownload];
 
-/// The media service, which the Kytrix group covers beside its own services.
 const X_MEDIA: &[ServiceTarget] = &[ServiceTarget::KytrixService {
     capability: KytrixServiceCapability::XMedia,
 }];
 
-/// The group of Kytrix services each row of the third section binds.
 const KYTRIX_GROUPS: [(&str, &str, &str, &[ServiceTarget]); 4] = [
     (
         "configure.kytrix.cloud",
@@ -128,7 +108,6 @@ const KYTRIX_GROUPS: [(&str, &str, &str, &[ServiceTarget]); 4] = [
     ),
 ];
 
-/// The field id one venue's line row is drawn under.
 const fn venue_field_id(venue: VenueId) -> &'static str {
     match venue {
         VenueId::Binance => "configure.binance",
@@ -139,7 +118,6 @@ const fn venue_field_id(venue: VenueId) -> &'static str {
     }
 }
 
-/// The explanation one venue's row carries.
 const fn venue_description_key(venue: VenueId) -> &'static str {
     match venue {
         VenueId::Binance => "settings_ui.proxies.binance_description",
@@ -150,24 +128,18 @@ const fn venue_description_key(venue: VenueId) -> &'static str {
     }
 }
 
-/// What one row of the page binds.
 #[derive(Clone, Copy)]
 enum LineKind {
-    /// The line the whole document asks for when no target overrides it.
     Default,
-    /// The line one venue's own requests take.
     Venue(VenueId),
-    /// The line a group of Kytrix services shares.
     Group(&'static [ServiceTarget]),
 }
 
 impl LineKind {
-    /// Whether the row is the default line, which has nothing above it to inherit from.
     fn default_line(self) -> bool {
         matches!(self, Self::Default)
     }
 
-    /// The line the settings currently bind the row to, as the control spells it.
     fn value(self, config: &Config) -> SmolStr {
         match self {
             Self::Default => proxy_default_of(config),
@@ -176,7 +148,6 @@ impl LineKind {
         }
     }
 
-    /// Makes the change one choice of the row's control names.
     fn apply(self, config: &mut Config, value: &str) {
         match self {
             Self::Default => set_proxy_default(config, value),
@@ -187,13 +158,6 @@ impl LineKind {
         }
     }
 
-    /// The choices the row's control offers, the chosen line included.
-    ///
-    /// The entries of the catalog are read while the control is drawn, because the catalog is a
-    /// runtime value. The line the row holds is always one of the choices: a group whose targets
-    /// disagree, and an entry the catalog no longer carries, are the two lines a row can hold that
-    /// no other choice names, and both are offered as themselves — a control that showed anything
-    /// else would report a binding the settings do not have.
     fn choices(self, config: &Config, selected: &str, translate: &Translate) -> Vec<SelectItem> {
         let mut choices = Vec::with_capacity(config.proxies.len() + 4);
 
@@ -236,21 +200,17 @@ impl LineKind {
     }
 }
 
-/// One row of the page, with the control that draws it.
 struct ProxyLine {
     kind: LineKind,
     select: Select,
-    /// The items the control currently offers, so a frame that changed none of them writes none.
     items: Vec<SelectItem>,
 }
 
-/// The configure page.
 pub(crate) struct ConfigurePage {
     host: SettingsHost,
     rows: Vec<ProxyLine>,
 }
 
-/// The fixed text and binding of one row, assembled before its control is built.
 struct RowSpec {
     id: &'static str,
     kind: LineKind,
@@ -259,7 +219,6 @@ struct RowSpec {
 }
 
 impl ConfigurePage {
-    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
     pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
         Self {
             host,
@@ -267,10 +226,6 @@ impl ConfigurePage {
         }
     }
 
-    /// Builds one row's control and row, and keeps the control for the frames that follow.
-    ///
-    /// The control is created here rather than in the row's closure because the page keeps it: the
-    /// closure only draws it inside the card the row belongs to.
     fn row(
         &mut self,
         app: &mut App,
@@ -484,7 +439,6 @@ impl PageView for ConfigurePage {
     }
 }
 
-/// The text this page and its settings are searched by.
 pub(crate) fn search(translate: &Translate) -> PageSearch {
     let title = i18n::t_smol!(translate, "settings_ui.proxies.configure");
     let default_label = i18n::t_smol!(translate, "settings_ui.proxies.default_proxy");
