@@ -167,7 +167,7 @@ impl UpdaterDownloads for AppDownloads {
 ///
 /// The engine may hold the model open; a removal asks it to release the file first, and a
 /// hung unload is bounded by the page's own deadline ([`UnloadFailure::TimedOut`]).
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+#[cfg(ai_translation)]
 pub(crate) fn translation_unload() -> Arc<dyn Fn(&Path) -> Result<(), UnloadFailure> + Send + Sync>
 {
     Arc::new(|path| {
@@ -178,8 +178,9 @@ pub(crate) fn translation_unload() -> Arc<dyn Fn(&Path) -> Result<(), UnloadFail
     })
 }
 
-/// Windows ARM64 has no llama.cpp build, so there is no engine that could hold a file.
-#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+/// A build without the local translation engine (the `ai` feature is off, or the target has
+/// no llama.cpp build) has nothing that could hold a model file open.
+#[cfg(not(ai_translation))]
 pub(crate) fn translation_unload() -> Arc<dyn Fn(&Path) -> Result<(), UnloadFailure> + Send + Sync>
 {
     Arc::new(|_: &Path| Ok(()))

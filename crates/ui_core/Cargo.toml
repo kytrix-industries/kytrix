@@ -9,6 +9,9 @@ build = "build.rs"
 # 测试基建（`TestApp`/`Probe`/`FrameRecord`/oracle/诊断）。**不进发布物**（I7 / §6.6）；
 # 集成测试 `tests/frame_record.rs` 与 `tests/snapshot.rs` 通过 `required-features` 依赖它。
 test-support = []
+# 生产可见的自动化面（P6-1 / E25）：注入输入 + 只读观测（帧游标 / 图元数 / 文本）。
+# 与 test-support 无关：验收构建（kytrix `--acceptance`）在真实窗口上跑，不带测试基建。
+automation = []
 # P17：内置 Debug HUD（`App::set_debug_hud`）。默认关闭；example `demo` 显式 `--features hud` 打开。
 hud = []
 

@@ -138,6 +138,12 @@ impl Shell {
         &self.workspaces
     }
 
+    /// The window the shell draws (the acceptance run drives it).
+    #[cfg(feature = "acceptance")]
+    pub(crate) const fn window_id(&self) -> WindowId {
+        self.window
+    }
+
     /// The page area.
     #[cfg(test)]
     pub(crate) fn pages(&self) -> &Pages {

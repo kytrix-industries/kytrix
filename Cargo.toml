@@ -327,7 +327,9 @@ watch_list = { path = "crates/widgets/watch_list" }
 x = { path = "crates/widgets/x" }
 widget = { path = "crates/widget" }
 widget_gallery_ui = { path = "crates/widget_gallery_ui" }
-widget_registry = { path = "crates/widget_registry" }
+# The registry's default enables the notification audio backend; the application's `audio`
+# feature decides whether its build has one (the acceptance build may run without ALSA).
+widget_registry = { path = "crates/widget_registry", default-features = false }
 
 [workspace.lints.clippy]
 self_named_module_files = "allow"

@@ -23,7 +23,7 @@ mod intent;
 pub(crate) mod metrics;
 pub(crate) mod pages;
 mod sidebar;
-mod title_bar;
+pub(crate) mod title_bar;
 mod ui;
 mod workspace;
 mod workspaces;

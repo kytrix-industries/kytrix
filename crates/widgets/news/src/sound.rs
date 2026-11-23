@@ -30,16 +30,28 @@
 //! to count it. The window is measured from the last play that was actually heard, so a
 //! burst is one sound and the next one is a full window later, rather than a burst
 //! releasing a sound every time the window happens to roll over.
+//!
+//! # The backend is a feature
+//!
+//! The device half is behind this crate's `audio` feature (`rodio` -> `cpal` -> ALSA on
+//! Linux): the acceptance build (`cargo build -p kytrix --no-default-features --features
+//! acceptance`) runs on hosts where ALSA's development files are not installed, so it
+//! links no audio backend at all. Everything above the device — the seam, the throttle and
+//! the silent host — is backend-free and always compiled, so a pane in a build without
+//! audio draws exactly what a pane with audio draws, it just has nothing to play.
 
+use std::time::{Duration, Instant};
+#[cfg(feature = "audio")]
 use std::{
     error::Error,
     io::Cursor,
     sync::mpsc::{self, Receiver, SyncSender},
     thread,
-    time::{Duration, Instant},
 };
 
+#[cfg(feature = "audio")]
 use bytes::Bytes;
+#[cfg(feature = "audio")]
 use rodio::{Decoder, Source, buffer::SamplesBuffer, stream::DeviceSinkBuilder};
 
 /// How often a pane may make itself heard.
@@ -50,10 +62,13 @@ pub(super) const MINIMUM_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The name of the clip a pane asks the host for.
 ///
-/// It is a key into the application's own asset table, not a path this crate reads.
+/// It is a key into the application's own asset table, not a path this crate reads. A build
+/// without the `audio` feature never asks for one: it has no backend to hand it to.
+#[cfg(feature = "audio")]
 pub(super) const NOTIFICATION_CLIP: &str = "sounds/news_notification.wav";
 
 /// The name the thread that owns an output device is given.
+#[cfg(feature = "audio")]
 const DEVICE_THREAD: &str = "news-notification-sound";
 
 /// What a pane asks of the sound it was built with.
@@ -75,11 +90,13 @@ pub(super) trait NotificationSound: Send + Sync + 'static {
 }
 
 /// A sound whose clip a pane hears again and again without one device per play.
+#[cfg(feature = "audio")]
 pub(super) struct SoundPlayer {
     /// The requests left for the thread that owns the device. A send never blocks a frame.
     requests: SyncSender<()>,
 }
 
+#[cfg(feature = "audio")]
 impl SoundPlayer {
     /// Builds the player, and with it the thread that will own the device.
     ///
@@ -104,6 +121,7 @@ impl SoundPlayer {
     }
 }
 
+#[cfg(feature = "audio")]
 impl NotificationSound for SoundPlayer {
     fn play(&self) {
         // A request the thread is not there for is a sound with no device to be heard on,
@@ -134,6 +152,7 @@ impl NotificationSound for SilentSound {
 }
 
 /// Owns an output device for as long as it is asked to play, which is the whole point.
+#[cfg(feature = "audio")]
 fn serve(requests: Receiver<()>, clip: Bytes) {
     let device = match open_and_decode(&clip) {
         Ok(device) => device,
@@ -152,6 +171,7 @@ fn serve(requests: Receiver<()>, clip: Bytes) {
 }
 
 /// An output device, and the clip it is to play.
+#[cfg(feature = "audio")]
 struct Device {
     /// Dropping the sink is what closes the device, so a pane holds it for its whole life.
     sink: rodio::MixerDeviceSink,
@@ -160,6 +180,7 @@ struct Device {
     samples: Vec<f32>,
 }
 
+#[cfg(feature = "audio")]
 impl Device {
     /// Plays the clip over the device that is already open.
     ///
@@ -178,6 +199,7 @@ impl Device {
 }
 
 /// Opens the default output device and reads the clip into it.
+#[cfg(feature = "audio")]
 fn open_and_decode(clip: &[u8]) -> Result<Device, Box<dyn Error>> {
     let mut sink = DeviceSinkBuilder::open_default_sink()?;
     // A pane closes its device whenever the pane goes, which is not something a reader
@@ -195,6 +217,7 @@ fn open_and_decode(clip: &[u8]) -> Result<Device, Box<dyn Error>> {
 }
 
 /// The clip a pane plays, decoded once.
+#[cfg(feature = "audio")]
 fn notification_samples(
     clip: &[u8],
 ) -> Result<(rodio::ChannelCount, rodio::SampleRate, Vec<f32>), Box<dyn Error>> {
@@ -290,6 +313,7 @@ mod tests {
 
     /// A 16-bit PCM WAV of `frames` stereo frames at 44.1 kHz, as the application's own
     /// clip would arrive: the same reader the pane uses is what decodes it.
+    #[cfg(feature = "audio")]
     fn stereo_44k_wav(frames: u32) -> Vec<u8> {
         const CHANNELS: u16 = 2;
         const SAMPLE_RATE: u32 = 44_100;
@@ -324,6 +348,7 @@ mod tests {
     /// The clip is bytes the host handed over, so this is the test that says the decoder
     /// a play runs through is the reader the application's WAV format needs: a clip that
     /// a `curl` and a text editor would accept must not decode to silence.
+    #[cfg(feature = "audio")]
     #[test]
     fn the_clip_the_host_hands_over_should_decode_to_the_samples_a_device_plays() {
         let wav = stereo_44k_wav(441);
@@ -355,6 +380,7 @@ mod tests {
 
     /// A host whose asset is not audio, or whose device never opens, loses the sound —
     /// not the frame: building the player and asking it to play must not panic.
+    #[cfg(feature = "audio")]
     #[test]
     fn a_clip_that_is_not_audio_should_be_dropped_instead_of_panicking() {
         assert!(notification_samples(b"not a wav").is_err());
