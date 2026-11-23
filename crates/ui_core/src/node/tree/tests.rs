@@ -902,6 +902,36 @@ fn device_scale_does_not_accumulate_rounding_across_depth() {
 }
 
 #[test]
+fn a_layout_override_is_positioned_against_the_parents_snapped_box() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let mut root_style = fixed_style(100.0, 100.0);
+    root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+    tree.set_style(root, root_style).expect("根节点存活");
+    let _spacer = NodeBuilder::boxed()
+        .style(fixed_style(100.0, 10.3))
+        .build(&mut tree, root)
+        .expect("挂载成功");
+    let parent = NodeBuilder::boxed()
+        .style(fixed_style(20.0, 20.0))
+        .build(&mut tree, root)
+        .expect("挂载成功");
+    let child = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.3, 5.0, 5.0))
+        .build(&mut tree, parent)
+        .expect("挂载成功");
+    tree.set_device_scale(Some(1.0));
+    layout_to(&mut tree, 100.0, 100.0);
+
+    assert_eq!(bounds_of(&tree, parent).origin.y, 10.0);
+    assert_eq!(
+        bounds_of(&tree, child).origin.y,
+        10.0,
+        "布局覆盖必须相对父的已吸附盒定位，不能相对未吸附的布局原点"
+    );
+}
+
+#[test]
 fn device_scale_change_republishes_bounds() {
     let mut tree = NodeTree::new();
     let root = tree.root();

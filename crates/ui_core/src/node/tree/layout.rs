@@ -307,7 +307,12 @@ pub(crate) fn place_subtree(
         {
             continue;
         }
-        tree.place_subtree(child, abs.origin, epoch, false, children_hidden);
+        let reference = if tree.layout_override_of(child).is_some() {
+            committed.origin
+        } else {
+            abs.origin
+        };
+        tree.place_subtree(child, reference, epoch, false, children_hidden);
     }
     for child in hoisted.iter().copied() {
         if tree.layout_override_of(child).is_some() {
