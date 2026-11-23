@@ -3,17 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use image::ImageEncoder;
-
 const ICON_SOURCE_DIR: &str = "assets/icons/phosphoricons";
-
-const RASTER_TIERS: [u32; 2] = [48, 96];
 
 const SOURCE_FILL: &str = "fill=\"#000000\"";
 
 const WHITE_FILL: &str = "fill=\"#FFFFFF\"";
 
-const MATTE_RGB: u8 = 0xFF;
+const FORBIDDEN: [&str; 4] = ["stroke=", "fill=\"url(", "style=", "<image"];
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -39,24 +35,15 @@ fn main() {
                 path.display()
             ))
         });
-        let svg = white_glyph_svg(&stem, &svg);
-        let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).unwrap_or_else(|error| {
+        let svg = white_template(&stem, &svg);
+        let artifact = out_dir.join(format!("{stem}.svg"));
+        fs::write(&artifact, svg.as_bytes()).unwrap_or_else(|error| {
             fail(&format!(
-                "图标 `{stem}` 的 SVG 解析失败：{error}\n  修复：Phosphor 图标必须是纯路径（本构建脚本不支持 \
-                 文本 / 内嵌位图 / 外部引用）"
+                "无法写入图标产物 `{}`（{} B）：{error}",
+                artifact.display(),
+                svg.len()
             ))
         });
-        for tier in RASTER_TIERS {
-            let png = rasterize(&stem, &tree, tier);
-            let artifact = out_dir.join(format!("{stem}-{tier}.png"));
-            fs::write(&artifact, &png).unwrap_or_else(|error| {
-                fail(&format!(
-                    "无法写入图标产物 `{}`（{} B）：{error}",
-                    artifact.display(),
-                    png.len()
-                ))
-            });
-        }
         built.push(stem);
     }
 
@@ -98,17 +85,17 @@ fn icon_sources(source_dir: &Path) -> Vec<(String, PathBuf)> {
     sources
 }
 
-fn white_glyph_svg(stem: &str, svg: &str) -> String {
+fn white_template(stem: &str, svg: &str) -> String {
     if !svg.contains(SOURCE_FILL) {
         fail(&format!(
             "图标 `{stem}` 的 SVG 里没有 `{SOURCE_FILL}`\n  修复：Phosphor 单色字形的根元素必须声明 \
              `fill=\"#000000\"`；若是多色/描边图标，需要先决定它在主题里的染色语义"
         ));
     }
-    for forbidden in ["stroke=", "fill=\"url(", "style=", "<image"] {
+    for forbidden in FORBIDDEN {
         if svg.contains(forbidden) {
             fail(&format!(
-                "图标 `{stem}` 的 SVG 含不支持的写法 `{forbidden}`\n  修复：构建期只支持纯路径单色填充 \
+                "图标 `{stem}` 的 SVG 含不支持的写法 `{forbidden}`\n  修复：只支持纯填充路径 \
                  （描边 / 渐变 / 内联样式 / 内嵌图片都会让运行期调制失真）"
             ));
         }
@@ -116,62 +103,9 @@ fn white_glyph_svg(stem: &str, svg: &str) -> String {
     svg.replace(SOURCE_FILL, WHITE_FILL)
 }
 
-fn rasterize(stem: &str, tree: &usvg::Tree, side: u32) -> Vec<u8> {
-    let source = tree.size();
-    if source.width() <= 0.0
-        || source.height() <= 0.0
-        || (source.width() - source.height()).abs() > f32::EPSILON
-    {
-        fail(&format!(
-            "图标 `{stem}` 的 SVG 画布不是正方形（{}×{}）\n  修复：Phosphor 图标是正方形画布；\
-             非正方形图标需要先补「等比 fit」策略再进生成器",
-            source.width(),
-            source.height()
-        ));
-    }
-    let scale = side as f32 / source.width();
-    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(side, side).unwrap_or_else(|| {
-        fail(&format!(
-            "无法分配 {side}×{side} 的图标像素缓冲（图标 `{stem}`）"
-        ))
-    });
-    resvg::render(tree, transform, &mut pixmap.as_mut());
-
-    let mut rgba = Vec::with_capacity((side * side * 4) as usize);
-    for pixel in pixmap.pixels() {
-        let alpha = pixel.alpha();
-        let (red, green, blue) = if alpha == 0 {
-            (MATTE_RGB, MATTE_RGB, MATTE_RGB)
-        } else {
-            let unmultiply = |component: u8| -> u8 {
-                let alpha = u32::from(alpha);
-                ((u32::from(component) * 255 + alpha / 2) / alpha) as u8
-            };
-            (
-                unmultiply(pixel.red()),
-                unmultiply(pixel.green()),
-                unmultiply(pixel.blue()),
-            )
-        };
-        rgba.extend_from_slice(&[red, green, blue, alpha]);
-    }
-
-    let mut png = Vec::new();
-    let encoder = image::codecs::png::PngEncoder::new(&mut png);
-    encoder
-        .write_image(&rgba, side, side, image::ExtendedColorType::Rgba8)
-        .unwrap_or_else(|error| {
-            fail(&format!(
-                "图标 `{stem}`（{side}px）的 PNG 编码失败：{error}"
-            ))
-        });
-    png
-}
-
 fn write_manifest(out_dir: &Path, built: &[String]) {
     let mut manifest = String::from(
-        "// 由 crates/ui_kit/build.rs 生成：全部已光栅化图标的 stem（字母序）。不要手改。\npub const \
+        "// 由 crates/ui_kit/build.rs 生成：全部白色模板图标的 stem（字母序）。不要手改。\npub const \
          BUILT_ICON_FILES: &[&str] = &[\n",
     );
     for stem in built {

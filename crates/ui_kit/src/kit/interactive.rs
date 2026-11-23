@@ -751,12 +751,12 @@ pub(crate) fn mount_dynamic_icon(
         .ok_or(EngineError::UnknownWindow { window })?
         .scale()
         .factor();
-    let tier = crate::kit::icon::RasterTier::for_scale(scale);
-    let bytes = crate::kit::icon::raster(kind, tier);
-    let target = ui_core::math::Size::new(size * scale, size * scale);
-    let resource = app
-        .resources_mut()
-        .insert_owned_at_size(window, bytes, target)?;
+    let resource = app.resources_mut().insert_owned_svg_for_display(
+        window,
+        crate::kit::icon::svg(kind).as_bytes(),
+        ui_core::math::Size::new(size, size),
+        scale,
+    )?;
     let mut style = ui_core::paint::style::Style::default();
     style.inner.size.width = taffy::style::Dimension::length(size);
     style.inner.size.height = taffy::style::Dimension::length(size);

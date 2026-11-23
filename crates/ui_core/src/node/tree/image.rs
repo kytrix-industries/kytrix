@@ -81,6 +81,36 @@ pub(crate) fn resolve_pending(
     count
 }
 
+pub(crate) fn refresh_for_scale(
+    tree: &mut NodeTree,
+    resources: &mut ResourceCache,
+    scale: f32,
+) -> Vec<ResourceId> {
+    let scale = sane_scale(scale);
+    let mut candidates: Vec<(NodeId, ResourceId)> = Vec::new();
+    tree.for_each_dfs(|node| {
+        if let Ok(target) = tree.get(node)
+            && let Some(content) = target.kind.image()
+            && let Some(id) = content.source().resource()
+        {
+            candidates.push((node, id));
+        }
+    });
+    let mut applied = Vec::new();
+    for (node, id) in candidates {
+        let Some(image) = resources.reselect(id, scale) else {
+            continue;
+        };
+        if image.id == id {
+            continue;
+        }
+        if apply_ready(tree, node, image, scale) {
+            applied.push(image.id);
+        }
+    }
+    applied
+}
+
 pub(crate) fn set_resource(tree: &mut NodeTree, node: NodeId, resource: ResourceId) -> bool {
     {
         let Some(target) = tree.arena.get_mut(node) else {

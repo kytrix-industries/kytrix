@@ -212,44 +212,14 @@ impl IconKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum RasterTier {
-    Small48,
-    Large96,
-}
-
-impl RasterTier {
-    pub const ALL: [RasterTier; 2] = [RasterTier::Small48, RasterTier::Large96];
-
-    #[must_use]
-    pub const fn pixels(self) -> u32 {
-        match self {
-            RasterTier::Small48 => 48,
-            RasterTier::Large96 => 96,
-        }
-    }
-
-    #[must_use]
-    pub fn for_scale(scale: f32) -> Self {
-        if scale.is_finite() && scale > 1.0 {
-            RasterTier::Large96
-        } else {
-            RasterTier::Small48
-        }
-    }
-}
-
-macro_rules! raster_table {
+macro_rules! svg_table {
     ($($kind:ident => $stem:literal),* $(,)?) => {
         #[must_use]
-        pub fn raster(kind: IconKind, tier: RasterTier) -> &'static [u8] {
-            match (kind, tier) {
+        pub fn svg(kind: IconKind) -> &'static str {
+            match kind {
                 $(
-                    (IconKind::$kind, RasterTier::Small48) => {
-                        include_bytes!(concat!(env!("OUT_DIR"), "/icons/", $stem, "-48.png"))
-                    }
-                    (IconKind::$kind, RasterTier::Large96) => {
-                        include_bytes!(concat!(env!("OUT_DIR"), "/icons/", $stem, "-96.png"))
+                    IconKind::$kind => {
+                        include_str!(concat!(env!("OUT_DIR"), "/icons/", $stem, ".svg"))
                     }
                 )*
             }
@@ -257,7 +227,7 @@ macro_rules! raster_table {
     };
 }
 
-raster_table! {
+svg_table! {
     X => "x",
     XBold => "x-bold",
     Circle => "circle",
@@ -422,43 +392,19 @@ impl IconSpec {
             .map_err(IconError::Node)
     }
 
-    pub fn reselect(
-        self,
-        app: &mut App,
-        window: WindowId,
-        node: NodeId,
-    ) -> Result<ResourceImage, IconError> {
-        if !self.size.is_finite() || self.size <= 0.0 {
-            return Err(IconError::InvalidSize { size: self.size });
-        }
-        let scale = app
-            .window(window)
-            .ok_or(IconError::UnknownWindow { window })?
-            .scale()
-            .factor();
-        let resource = self.resource_for(app, window, scale)?;
-        let accepted = app
-            .window_mut(window)
-            .ok_or(IconError::UnknownWindow { window })?
-            .set_image_resource(node, resource.id)
-            .map_err(IconError::Node)?;
-        if !accepted {
-            return Err(IconError::NotImageNode { node });
-        }
-        app.request_repaint(window).map_err(IconError::Node)?;
-        Ok(resource)
-    }
-
     fn resource_for(
         self,
         app: &mut App,
         window: WindowId,
         scale: f32,
     ) -> Result<ResourceImage, IconError> {
-        let tier = RasterTier::for_scale(scale);
-        let physical = Size::new(self.size * scale, self.size * scale);
         app.resources_mut()
-            .insert_owned_at_size(window, raster(self.kind, tier), physical)
+            .insert_owned_svg_for_display(
+                window,
+                svg(self.kind).as_bytes(),
+                Size::new(self.size, self.size),
+                scale,
+            )
             .map_err(IconError::Decode)
     }
 }
@@ -468,7 +414,6 @@ pub enum IconError {
     UnknownWindow { window: WindowId },
     InvalidSize { size: f32 },
     UnknownKind { name: SmolStr },
-    NotImageNode { node: NodeId },
     Decode(EngineError),
     Node(EngineError),
 }
@@ -488,13 +433,7 @@ impl fmt::Display for IconError {
                     "unknown icon kind `{name}` (not a Phosphor icon name)"
                 )
             }
-            IconError::NotImageNode { node } => {
-                write!(
-                    formatter,
-                    "icon reselect target {node:?} is not an image node"
-                )
-            }
-            IconError::Decode(error) => write!(formatter, "icon raster decode failed: {error}"),
+            IconError::Decode(error) => write!(formatter, "icon rasterization failed: {error}"),
             IconError::Node(error) => write!(formatter, "icon node mount failed: {error}"),
         }
     }
@@ -506,15 +445,13 @@ impl std::error::Error for IconError {
             IconError::Decode(error) | IconError::Node(error) => Some(error),
             IconError::UnknownWindow { .. }
             | IconError::InvalidSize { .. }
-            | IconError::UnknownKind { .. }
-            | IconError::NotImageNode { .. } => None,
+            | IconError::UnknownKind { .. } => None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use image::{GenericImageView, ImageFormat, imageops::FilterType};
     use ui_core::{
         a11y::{A11yDiagnostic, A11yDrawKind, A11yRole},
         math::{Rect, Scale, Size},
@@ -527,7 +464,7 @@ mod tests {
         test_support::app::TestApp,
     };
 
-    use super::{DEFAULT_ICON_SIZE, IconError, IconKind, IconSpec, RasterTier, raster};
+    use super::{DEFAULT_ICON_SIZE, IconError, IconKind, IconSpec, svg};
     use crate::{
         kit::test_support::{bounds, image_primitives, test_app, test_app_with_scale},
         theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
@@ -536,7 +473,7 @@ mod tests {
     include!(concat!(env!("OUT_DIR"), "/icons/built.rs"));
 
     #[test]
-    fn every_icon_variant_has_a_unique_name_and_a_built_raster() {
+    fn every_icon_variant_has_a_unique_name_and_a_built_svg() {
         assert_eq!(
             IconKind::ALL.len(),
             IconKind::COUNT,
@@ -550,7 +487,7 @@ mod tests {
         assert_eq!(
             BUILT_ICON_FILES.len(),
             IconKind::COUNT,
-            "构建期生成的 PNG 数必须等于枚举数：{BUILT_ICON_FILES:?}"
+            "构建期生成的 SVG 数必须等于枚举数：{BUILT_ICON_FILES:?}"
         );
         for kind in IconKind::ALL {
             assert!(
@@ -576,144 +513,42 @@ mod tests {
     }
 
     #[test]
-    fn every_icon_raster_is_a_white_glyph_png_of_the_expected_tier() {
+    fn every_icon_svg_is_a_white_template_without_strokes_or_gradients() {
         for kind in IconKind::ALL {
-            for tier in RasterTier::ALL {
-                let bytes = raster(kind, tier);
+            let source = svg(kind);
+            assert!(source.starts_with("<svg"), "{kind:?} 的模板不是 SVG 文本");
+            assert!(
+                source.contains("fill=\"#FFFFFF\""),
+                "{kind:?} 的模板必须是白色字形（运行期靠 modulation 染色）"
+            );
+            for forbidden in ["fill=\"#000000\"", "stroke=", "fill=\"url(", "<image"] {
                 assert!(
-                    matches!(image::guess_format(bytes), Ok(ImageFormat::Png)),
-                    "{kind:?}/{tier:?} 的产物不是 PNG"
-                );
-                let decoded = image::load_from_memory(bytes)
-                    .unwrap_or_else(|error| panic!("{kind:?}/{tier:?} 的 PNG 无法解码：{error}"));
-                let (width, height) = decoded.dimensions();
-                assert_eq!(
-                    (width, height),
-                    (tier.pixels(), tier.pixels()),
-                    "{kind:?}/{tier:?} 的像素尺寸不符"
-                );
-                let rgba = decoded.to_rgba8();
-                let mut opaque = 0usize;
-                for pixel in rgba.pixels() {
-                    let [red, green, blue, alpha] = pixel.0;
-                    assert_eq!(
-                        (red, green, blue),
-                        (0xFF, 0xFF, 0xFF),
-                        "{kind:?}/{tier:?} 的像素 {pixel:?} 不是 white matte（alpha={alpha}）：\
-                         RGB 必须全白，否则引擎缩放会把透明区的暗色插值进边缘"
-                    );
-                    if alpha > 0 {
-                        opaque += 1;
-                    }
-                }
-                assert!(opaque > 0, "{kind:?}/{tier:?} 整张图都是透明的（空字形）");
-            }
-        }
-    }
-
-    fn engine_downscale(bytes: &[u8], side: u32) -> image::RgbaImage {
-        let decoded = image::load_from_memory(bytes).expect("图标 PNG 可解码");
-        assert_eq!(
-            decoded.color(),
-            image::ColorType::Rgba8,
-            "图标产物必须是直通 alpha 的 RGBA8"
-        );
-        image::imageops::resize(&decoded.to_rgba8(), side, side, FilterType::CatmullRom)
-    }
-
-    fn srgb_decode(value: u8) -> f32 {
-        let encoded = f32::from(value) / 255.0;
-        if encoded <= 0.040_45 {
-            encoded / 12.92
-        } else {
-            ((encoded + 0.055) / 1.055).powf(2.4)
-        }
-    }
-
-    fn srgb_encode(linear: f32) -> u8 {
-        let value = linear.clamp(0.0, 1.0);
-        let encoded = if value <= 0.003_130_8 {
-            value * 12.92
-        } else {
-            1.055 * value.powf(1.0 / 2.4) - 0.055
-        };
-        (encoded * 255.0 + 0.5) as u8
-    }
-
-    fn engine_premultiplied(color: u8, alpha: u8) -> u8 {
-        srgb_encode(srgb_decode(color) * (f32::from(alpha) / 255.0))
-    }
-
-    #[test]
-    fn downscaled_icon_edges_have_no_dark_fringe() {
-        let representatives = [
-            IconKind::CheckCircle,
-            IconKind::CircleNotch,
-            IconKind::CaretDown,
-            IconKind::X,
-            IconKind::MagnifyingGlass,
-            IconKind::GearSix,
-        ];
-        for tier_side in [48u32, 96] {
-            let target = tier_side / 3;
-            for kind in representatives {
-                let bytes = raster(
-                    kind,
-                    if tier_side == 48 {
-                        RasterTier::Small48
-                    } else {
-                        RasterTier::Large96
-                    },
-                );
-                let resized = engine_downscale(bytes, target);
-
-                let mut fringe_pixels = 0usize;
-                let mut worst_darkening = 0u8;
-                for pixel in resized.pixels() {
-                    let [red, green, blue, alpha] = pixel.0;
-                    if alpha == 0 {
-                        continue;
-                    }
-                    if alpha < 255 {
-                        fringe_pixels += 1;
-                        let darkest = red.min(green).min(blue);
-                        worst_darkening = worst_darkening.max(255 - darkest);
-                    }
-                    let expected = srgb_encode(f32::from(alpha) / 255.0);
-                    for component in [red, green, blue] {
-                        let stored = engine_premultiplied(component, alpha);
-                        assert!(
-                            expected.abs_diff(stored) <= 1,
-                            "{kind:?}/{tier_side}→{target} 的边缘像素 {pixel:?} 存储值 {stored} \
-                             偏离期望 {expected} > 1：图标会带暗边"
-                        );
-                    }
-                }
-                assert!(
-                    fringe_pixels > 0,
-                    "{kind:?}/{tier_side}→{target} 没有部分覆盖像素（用例没有真的踩到边缘）"
-                );
-                assert_eq!(
-                    worst_darkening, 0,
-                    "{kind:?}/{tier_side}→{target} 的边缘像素最暗被压了 {worst_darkening}/255：\
-                     透明像素的 RGB 不是 white matte"
+                    !source.contains(forbidden),
+                    "{kind:?} 的模板含 `{forbidden}`：构建期应该已经拒绝"
                 );
             }
         }
     }
 
     #[test]
-    fn the_raster_tier_follows_the_window_scale() {
-        assert_eq!(RasterTier::for_scale(1.0), RasterTier::Small48);
-        assert_eq!(RasterTier::for_scale(0.75), RasterTier::Small48);
-        assert_eq!(RasterTier::for_scale(1.25), RasterTier::Large96);
-        assert_eq!(RasterTier::for_scale(1.5), RasterTier::Large96);
-        assert_eq!(RasterTier::for_scale(2.0), RasterTier::Large96);
-        assert_eq!(RasterTier::for_scale(3.0), RasterTier::Large96);
-        assert_eq!(RasterTier::for_scale(f32::NAN), RasterTier::Small48);
-        assert_eq!(RasterTier::for_scale(0.0), RasterTier::Small48);
-        assert_eq!(RasterTier::Small48.pixels(), 48);
-        assert_eq!(RasterTier::Large96.pixels(), 96);
+    fn the_raster_is_produced_at_the_physical_pixel_size() {
+        for scale in [1.0f32, 1.5, 2.0] {
+            let mut app = test_app_with_scale(scale);
+            let window = app.window_id();
+            let root = app.app().window(window).expect("test window").tree().root();
+            let node = IconSpec::new(IconKind::GearSix)
+                .with_size(16.0)
+                .build(app.app_mut(), window, root)
+                .expect("图标挂载");
+            let _ = app.drain().expect("首帧");
+            let image = resource(&app, window, node);
+            let expected = (16.0 * scale).round() as u32;
+            assert_eq!(
+                (image.width, image.height),
+                (expected, expected),
+                "scale {scale}: 图标必须按物理像素栅格（16 × {scale} = {expected}）"
+            );
+        }
     }
 
     #[test]
@@ -767,31 +602,31 @@ mod tests {
     }
 
     #[test]
-    fn a_2x_window_pays_for_the_96_pixel_raster() {
-        let used_bytes = |scale: f32| {
-            let mut app = test_app_with_scale(scale);
-            let window = app.window_id();
-            let root = app.app().window(window).expect("test window").tree().root();
-            let _ = IconSpec::new(IconKind::GearSix)
-                .with_size(16.0)
-                .build(app.app_mut(), window, root)
-                .expect("图标挂载");
-            app.app().resources().stats().used_bytes
-        };
+    fn a_dpi_change_reselects_the_physical_svg_raster() {
+        let mut app = test_app_with_scale(1.0);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let node = IconSpec::new(IconKind::GearSix)
+            .with_size(16.0)
+            .build(app.app_mut(), window, root)
+            .expect("图标挂载");
+        let _ = app.drain().expect("1× 首帧");
+        assert_eq!(resource(&app, window, node).width, 16, "1× 是 16 物理像素");
 
-        let one_x = used_bytes(1.0);
-        let two_x = used_bytes(2.0);
-        let expected = (raster(IconKind::GearSix, RasterTier::Large96).len()
-            - raster(IconKind::GearSix, RasterTier::Small48).len()) as u64;
-        assert!(
-            expected > 0,
-            "两档 PNG 必须有不同的字节长度（否则本用例证明不了档位）"
+        set_window_scale(&mut app, 2.0);
+        let _ = app.drain().expect("2× 首帧");
+        let image = resource(&app, window, node);
+        assert_eq!(
+            (image.width, image.height),
+            (32, 32),
+            "DPI 变化后引擎必须自动把节点切到新物理尺寸的栅格"
         );
         assert_eq!(
-            two_x.checked_sub(one_x),
-            Some(expected),
-            "2× 窗口必须保留 96 档的源字节（1× = {one_x} B，2× = {two_x} B，期望差 {expected} B）"
+            bounds(&app, node),
+            Some(Rect::new(0.0, 0.0, 16.0, 16.0)),
+            "显式 Style 尺寸：DPI 变化不得让图标布局跳动"
         );
+        assert_eq!(image_primitives(&app).len(), 1, "换变体不得复制图元");
     }
 
     #[test]
@@ -911,106 +746,25 @@ mod tests {
         assert_eq!(text_nodes, 0, "图标树里不得残留占位空格文本节点");
     }
 
-    #[test]
-    fn reselecting_after_a_dpi_change_swaps_to_the_96_pixel_tier() {
-        let mut app = test_app_with_scale(1.0);
-        let window = app.window_id();
-        let root = app.app().window(window).expect("test window").tree().root();
-        let spec = IconSpec::new(IconKind::GearSix).with_size(16.0);
-        let node = spec.build(app.app_mut(), window, root).expect("图标挂载");
-        let _ = app.drain().expect("1× 首帧");
-
-        set_window_scale(&mut app, 2.0);
-        let _ = app.drain().expect("2× 首帧（E7 只重解析内在尺寸）");
-        assert_eq!(
-            bounds(&app, node),
-            Some(Rect::new(0.0, 0.0, 16.0, 16.0)),
-            "显式 Style 尺寸：DPI 变化不得让图标布局跳动"
-        );
-        assert_eq!(image_primitives(&app).len(), 1, "换变体前旧图元照常绘制");
-
-        let resource = spec
-            .reselect(app.app_mut(), window, node)
-            .expect("重选档位");
-        let expected = app
-            .app_mut()
-            .resources_mut()
-            .insert_for_display(
-                raster(IconKind::GearSix, RasterTier::Large96),
-                Size::new(16.0, 16.0),
-                2.0,
-            )
-            .expect("引擎的 E7 显示变体");
-        assert_eq!(
-            resource, expected,
-            "reselect 必须等价于 insert_for_display(96 档, 2×)"
-        );
-        assert_eq!(
-            (resource.width, resource.height),
-            (32, 32),
-            "96 档在 2× 下的物理目标"
-        );
-
-        let _ = app.drain().expect("换句柄后一帧");
-        let after = image_primitives(&app);
-        assert_eq!(after.len(), 1, "换句柄不得复制图元：{after:?}");
-        assert_eq!(after[0].tile, resource.tile, "图元必须用新变体的 tile");
-        assert_eq!(
-            after[0].bounds,
-            Rect::new(0.0, 0.0, 16.0, 16.0),
-            "换档不改变布局盒"
-        );
-    }
-
-    #[test]
-    fn reselect_rejects_non_image_and_stale_nodes() {
-        let mut app = test_app_with_scale(1.0);
-        let window = app.window_id();
-        let root = app.app().window(window).expect("test window").tree().root();
-        let spec = IconSpec::new(IconKind::X).with_size(16.0);
-
-        let container = ui_core::node::builder::NodeBuilder::boxed()
-            .build(
-                app.app_mut()
-                    .window_mut(window)
-                    .expect("test window")
-                    .tree_mut(),
-                root,
-            )
-            .expect("容器");
-        let error = spec
-            .reselect(app.app_mut(), window, container)
-            .expect_err("非图片节点必须失败");
-        assert!(
-            matches!(error, IconError::NotImageNode { node } if node == container),
-            "非图片节点的错误分类不对：{error:?}"
-        );
-
-        let stale = spec.build(app.app_mut(), window, root).expect("临时图标");
-        app.app_mut()
-            .window_mut(window)
-            .expect("test window")
-            .tree_mut()
-            .remove(stale)
-            .expect("移除临时图标");
-        let error = spec
-            .reselect(app.app_mut(), window, stale)
-            .expect_err("陈旧节点必须失败");
-        assert!(
-            matches!(
-                error,
-                IconError::Node(ui_core::error::EngineError::StaleNode { node }) if node == stale
-            ),
-            "陈旧节点的错误分类不对：{error:?}"
-        );
-    }
-
     fn set_window_scale(app: &mut TestApp, scale: f32) {
         let window = app.window_id();
         app.app_mut()
             .window_mut(window)
             .expect("test window")
             .set_scale(Scale::new(scale).expect("测试 DPI 必须是有限正数"));
+    }
+
+    fn resource(
+        app: &TestApp,
+        window: ui_core::window::WindowId,
+        node: NodeId,
+    ) -> ui_core::resources::ResourceImage {
+        let tree = app.app().window(window).expect("test window").tree();
+        let NodeKind::Image(content) = tree.get(node).expect("图标节点").kind() else {
+            panic!("图标必须是图片节点");
+        };
+        let id = content.source().resource().expect("图标必须是就绪资源");
+        app.app().resources().image(id).expect("资源必须仍然存活")
     }
 
     fn resolved(color: Color) -> [f32; 4] {

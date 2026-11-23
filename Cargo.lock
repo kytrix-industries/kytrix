@@ -6916,6 +6916,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "parley",
+ "resvg",
  "skrifa",
  "smallvec",
  "smol_str",
@@ -6925,6 +6926,7 @@ dependencies = [
  "tokio",
  "unicode-linebreak",
  "unicode-segmentation",
+ "usvg",
  "wayland-client",
  "wayland-protocols",
  "windows",
@@ -6940,12 +6942,10 @@ dependencies = [
  "color",
  "comrak",
  "image",
- "resvg",
  "smol_str",
  "taffy",
  "tokio",
  "ui_core",
- "usvg",
 ]
 
 [[package]]

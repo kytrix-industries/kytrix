@@ -16,19 +16,62 @@ use crate::{
     render::{DirtyRects, ImageAtlasPager},
     resources::{
         cache::{ContentKey, DedupeEntry, Entry, Page, VariantEntry},
-        image::{DecodedImage, MAX_TILE_DIM, SourceColor},
+        image::{DecodedImage, MAX_TILE_DIM, SourceColor, SourceKind},
     },
     window::WindowId,
 };
 
 mod cache;
 mod image;
+mod svg;
 
 const ORIGINAL_TARGET: (u32, u32) = (0, 0);
 
 const DEFAULT_BYTE_BUDGET: u64 = 320 * 1024 * 1024;
 
 const MAX_CONCURRENT_DECODES: usize = 2;
+
+fn physical_target(logical: Size, scale: f32) -> Size {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    Size::new(logical.width * scale, logical.height * scale)
+}
+
+fn sane_logical(logical: Size) -> Option<Size> {
+    (logical.width.is_finite()
+        && logical.width > 0.0
+        && logical.height.is_finite()
+        && logical.height > 0.0)
+        .then_some(logical)
+}
+
+fn probe_source(kind: SourceKind, bytes: &[u8]) -> Result<(u32, u32), DecodeCause> {
+    match kind {
+        SourceKind::Bitmap => image::probe_dimensions(bytes),
+        SourceKind::Svg => svg::probe_dimensions(bytes),
+    }
+}
+
+fn resolve_target(kind: SourceKind, target: Size, source: (u32, u32)) -> (u32, u32) {
+    match kind {
+        SourceKind::Bitmap => image::resolve_target(target, source),
+        SourceKind::Svg => svg::resolve_target(target, source),
+    }
+}
+
+fn decode_source(
+    kind: SourceKind,
+    bytes: &[u8],
+    target: Option<(u32, u32)>,
+) -> Result<DecodedImage, DecodeCause> {
+    match kind {
+        SourceKind::Bitmap => image::decode(bytes, target),
+        SourceKind::Svg => svg::decode(bytes, target),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResourceId {
@@ -310,6 +353,9 @@ struct PendingJob {
     source: Bytes,
     reservation: u64,
     target: (u32, u32),
+    intrinsic: (u32, u32),
+    kind: SourceKind,
+    logical: Option<Size>,
 }
 
 impl ResourceCache {
@@ -376,7 +422,7 @@ impl ResourceCache {
     }
 
     pub fn insert(&mut self, bytes: &[u8]) -> Result<ResourceImage, EngineError> {
-        self.insert_inner(bytes, None)
+        self.insert_inner(bytes, None, SourceKind::Bitmap, None)
             .map_err(|cause| EngineError::ResourceDecode { cause })
     }
 
@@ -385,7 +431,7 @@ impl ResourceCache {
         bytes: &[u8],
         target: Size,
     ) -> Result<ResourceImage, EngineError> {
-        self.insert_inner(bytes, Some(target))
+        self.insert_inner(bytes, Some(target), SourceKind::Bitmap, None)
             .map_err(|cause| EngineError::ResourceDecode { cause })
     }
 
@@ -395,38 +441,68 @@ impl ResourceCache {
         logical: Size,
         scale: f32,
     ) -> Result<ResourceImage, EngineError> {
-        let scale = if scale.is_finite() && scale > 0.0 {
-            scale
-        } else {
-            1.0
-        };
-        self.insert_at_size(
+        self.insert_inner(
             bytes,
-            Size::new(logical.width * scale, logical.height * scale),
+            Some(physical_target(logical, scale)),
+            SourceKind::Bitmap,
+            Some(logical),
         )
+        .map_err(|cause| EngineError::ResourceDecode { cause })
+    }
+
+    pub fn insert_svg(&mut self, bytes: &[u8]) -> Result<ResourceImage, EngineError> {
+        self.insert_inner(bytes, None, SourceKind::Svg, None)
+            .map_err(|cause| EngineError::ResourceDecode { cause })
+    }
+
+    pub fn insert_svg_at_size(
+        &mut self,
+        bytes: &[u8],
+        target: Size,
+    ) -> Result<ResourceImage, EngineError> {
+        self.insert_inner(bytes, Some(target), SourceKind::Svg, None)
+            .map_err(|cause| EngineError::ResourceDecode { cause })
+    }
+
+    pub fn insert_svg_for_display(
+        &mut self,
+        bytes: &[u8],
+        logical: Size,
+        scale: f32,
+    ) -> Result<ResourceImage, EngineError> {
+        self.insert_inner(
+            bytes,
+            Some(physical_target(logical, scale)),
+            SourceKind::Svg,
+            Some(logical),
+        )
+        .map_err(|cause| EngineError::ResourceDecode { cause })
     }
 
     fn insert_inner(
         &mut self,
         bytes: &[u8],
         target: Option<Size>,
+        kind: SourceKind,
+        logical: Option<Size>,
     ) -> Result<ResourceImage, DecodeCause> {
+        let logical = logical.and_then(sane_logical);
         image::check_source_bytes(bytes.len())?;
         if target.is_none()
-            && let Some(image) = self.dedupe_hit(bytes, ORIGINAL_TARGET)
+            && let Some(image) = self.dedupe_hit(bytes, ORIGINAL_TARGET, kind)
         {
             return Ok(image);
         }
-        let (source_width, source_height) = image::probe_dimensions(bytes)?;
+        let (source_width, source_height) = probe_source(kind, bytes)?;
         let variant = match target {
             None => ORIGINAL_TARGET,
-            Some(target) => image::resolve_target(target, (source_width, source_height)),
+            Some(target) => resolve_target(kind, target, (source_width, source_height)),
         };
-        if let Some(image) = self.dedupe_hit(bytes, variant) {
+        if let Some(image) = self.dedupe_hit(bytes, variant, kind) {
             return Ok(image);
         }
         let reservation = self.admit_decode(source_width, source_height, bytes.len())?;
-        let decoded = match image::decode(bytes, target.map(|_| variant)) {
+        let decoded = match decode_source(kind, bytes, target.map(|_| variant)) {
             Ok(decoded) => decoded,
             Err(cause) => {
                 self.release_reservation(reservation);
@@ -434,7 +510,14 @@ impl ResourceCache {
             }
         };
         self.release_reservation(reservation);
-        self.insert_decoded(Bytes::copy_from_slice(bytes), decoded, variant)
+        self.insert_decoded(
+            Bytes::copy_from_slice(bytes),
+            decoded,
+            variant,
+            kind,
+            logical,
+            (source_width, source_height),
+        )
     }
 
     pub fn insert_owned(
@@ -458,32 +541,82 @@ impl ResourceCache {
         Ok(image)
     }
 
+    pub fn insert_owned_svg_for_display(
+        &mut self,
+        owner: WindowId,
+        bytes: &[u8],
+        logical: Size,
+        scale: f32,
+    ) -> Result<ResourceImage, EngineError> {
+        let image = self.insert_svg_for_display(bytes, logical, scale)?;
+        self.owners.entry(owner).or_default().push(image.id);
+        Ok(image)
+    }
+
+    pub(crate) fn record_owner(&mut self, owner: WindowId, id: ResourceId) {
+        self.owners.entry(owner).or_default().push(id);
+    }
+
+    pub(crate) fn reselect(&mut self, id: ResourceId, scale: f32) -> Option<ResourceImage> {
+        let (key, target, intrinsic, logical, kind) = {
+            let entry = self.entries.get(id)?;
+            (
+                entry.key,
+                entry.target,
+                entry.intrinsic,
+                entry.logical?,
+                entry.kind,
+            )
+        };
+        let variant = resolve_target(kind, physical_target(logical, scale), intrinsic);
+        if variant == target {
+            return self.entries.get(id).map(|entry| entry.image);
+        }
+        let bytes = self.dedupe.get(&key)?.bytes.clone();
+        if let Some(image) = self.dedupe_hit(&bytes, variant, kind) {
+            return Some(image);
+        }
+        let decoded = decode_source(kind, &bytes, Some(variant)).ok()?;
+        self.insert_decoded(bytes, decoded, variant, kind, Some(logical), intrinsic)
+            .ok()
+    }
+
     pub fn insert_async(&mut self, bytes: Bytes) -> PendingResource {
-        self.insert_async_inner(bytes, None)
+        self.insert_async_inner(bytes, None, SourceKind::Bitmap, None)
     }
 
     pub fn insert_async_at_size(&mut self, bytes: Bytes, target: Size) -> PendingResource {
-        self.insert_async_inner(bytes, Some(target))
+        self.insert_async_inner(bytes, Some(target), SourceKind::Bitmap, None)
     }
 
-    fn insert_async_inner(&mut self, bytes: Bytes, target: Option<Size>) -> PendingResource {
+    pub fn insert_svg_async_at_size(&mut self, bytes: Bytes, target: Size) -> PendingResource {
+        self.insert_async_inner(bytes, Some(target), SourceKind::Svg, None)
+    }
+
+    fn insert_async_inner(
+        &mut self,
+        bytes: Bytes,
+        target: Option<Size>,
+        kind: SourceKind,
+        logical: Option<Size>,
+    ) -> PendingResource {
         if let Err(cause) = image::check_source_bytes(bytes.len()) {
             return self.push_failed(cause);
         }
         if target.is_none()
-            && let Some(image) = self.dedupe_hit(&bytes, ORIGINAL_TARGET)
+            && let Some(image) = self.dedupe_hit(&bytes, ORIGINAL_TARGET, kind)
         {
             return self.push_ready(image);
         }
-        let (source_width, source_height) = match image::probe_dimensions(&bytes) {
+        let (source_width, source_height) = match probe_source(kind, &bytes) {
             Ok(dimensions) => dimensions,
             Err(cause) => return self.push_failed(cause),
         };
         let variant = match target {
             None => ORIGINAL_TARGET,
-            Some(target) => image::resolve_target(target, (source_width, source_height)),
+            Some(target) => resolve_target(kind, target, (source_width, source_height)),
         };
-        if let Some(image) = self.dedupe_hit(&bytes, variant) {
+        if let Some(image) = self.dedupe_hit(&bytes, variant, kind) {
             return self.push_ready(image);
         }
         let reservation = match self.admit_decode(source_width, source_height, bytes.len()) {
@@ -491,10 +624,13 @@ impl ResourceCache {
             Err(cause) => return self.push_failed(cause),
         };
         let decode_target = target.map(|_| variant);
+        let intrinsic = (source_width, source_height);
         let Some(runtime) = self.runtime.clone() else {
             self.release_reservation(reservation);
-            let state = match image::decode(&bytes, decode_target) {
-                Ok(decoded) => self.finish_decoded(bytes, decoded, variant),
+            let state = match decode_source(kind, &bytes, decode_target) {
+                Ok(decoded) => {
+                    self.finish_decoded(bytes, decoded, variant, intrinsic, kind, logical)
+                }
                 Err(cause) => DecodeState::Failed(cause),
             };
             return self.push_pending(PendingJob {
@@ -503,6 +639,9 @@ impl ResourceCache {
                 source: Bytes::new(),
                 reservation: 0,
                 target: variant,
+                intrinsic,
+                kind,
+                logical,
             });
         };
         let (sender, receiver) = oneshot::channel();
@@ -538,7 +677,7 @@ impl ResourceCache {
                     }
                     decode_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                let result = image::decode(&source, decode_target);
+                let result = decode_source(kind, &source, decode_target);
                 guard.deliver(result);
             });
         });
@@ -548,6 +687,9 @@ impl ResourceCache {
             source: bytes,
             reservation,
             target: variant,
+            intrinsic,
+            kind,
+            logical,
         })
     }
 
@@ -577,7 +719,14 @@ impl ResourceCache {
             };
             self.release_reservation(job.reservation);
             let state = match completion {
-                Ok(decoded) => self.finish_decoded(job.source, decoded, job.target),
+                Ok(decoded) => self.finish_decoded(
+                    job.source,
+                    decoded,
+                    job.target,
+                    job.intrinsic,
+                    job.kind,
+                    job.logical,
+                ),
                 Err(cause) => DecodeState::Failed(cause),
             };
             out.push((id, state));
@@ -593,7 +742,7 @@ impl ResourceCache {
     }
 
     #[must_use]
-    pub(crate) fn image(&self, id: ResourceId) -> Option<ResourceImage> {
+    pub fn image(&self, id: ResourceId) -> Option<ResourceImage> {
         self.entries.get(id).map(|entry| entry.image)
     }
 
@@ -610,6 +759,9 @@ impl ResourceCache {
             source: Bytes::new(),
             reservation: 0,
             target: ORIGINAL_TARGET,
+            intrinsic: ORIGINAL_TARGET,
+            kind: SourceKind::Bitmap,
+            logical: None,
         })
     }
 
@@ -620,6 +772,9 @@ impl ResourceCache {
             source: Bytes::new(),
             reservation: 0,
             target: ORIGINAL_TARGET,
+            intrinsic: ORIGINAL_TARGET,
+            kind: SourceKind::Bitmap,
+            logical: None,
         })
     }
 
@@ -650,18 +805,26 @@ impl ResourceCache {
         source: Bytes,
         decoded: DecodedImage,
         target: (u32, u32),
+        intrinsic: (u32, u32),
+        kind: SourceKind,
+        logical: Option<Size>,
     ) -> DecodeState {
-        if let Some(image) = self.dedupe_hit(&source, target) {
+        if let Some(image) = self.dedupe_hit(&source, target, kind) {
             return DecodeState::Ready(image);
         }
-        match self.insert_decoded(source, decoded, target) {
+        match self.insert_decoded(source, decoded, target, kind, logical, intrinsic) {
             Ok(image) => DecodeState::Ready(image),
             Err(cause) => DecodeState::Failed(cause),
         }
     }
 
-    fn dedupe_hit(&mut self, bytes: &[u8], target: (u32, u32)) -> Option<ResourceImage> {
-        let key = ContentKey::new(bytes);
+    fn dedupe_hit(
+        &mut self,
+        bytes: &[u8],
+        target: (u32, u32),
+        kind: SourceKind,
+    ) -> Option<ResourceImage> {
+        let key = ContentKey::new(bytes, kind);
         let existing = self.dedupe.get(&key)?;
         if existing.bytes.as_ref() != bytes {
             return None;
@@ -686,10 +849,13 @@ impl ResourceCache {
         source: Bytes,
         decoded: DecodedImage,
         target: (u32, u32),
+        kind: SourceKind,
+        logical: Option<Size>,
+        intrinsic: (u32, u32),
     ) -> Result<ResourceImage, DecodeCause> {
         let color = decoded.color;
-        let key = ContentKey::new(&source);
-        let image = self.place(decoded, key, target)?;
+        let key = ContentKey::new(&source, kind);
+        let image = self.place(decoded, key, target, kind, logical, intrinsic)?;
         match color {
             SourceColor::Srgb => {}
             SourceColor::Converted => {
@@ -775,6 +941,9 @@ impl ResourceCache {
         decoded: DecodedImage,
         key: ContentKey,
         target: (u32, u32),
+        kind: SourceKind,
+        logical: Option<Size>,
+        intrinsic: (u32, u32),
     ) -> Result<ResourceImage, DecodeCause> {
         let (width, height) = (decoded.width, decoded.height);
         let epoch = self.next_epoch();
@@ -832,6 +1001,9 @@ impl ResourceCache {
             last_used: epoch,
             key,
             target,
+            intrinsic,
+            kind,
+            logical,
         });
         self.used_pixels = self
             .used_pixels
@@ -2242,5 +2414,156 @@ mod tests {
                 "{format:?} 的峰值估算必须覆盖 RGBA 输出下界"
             );
         }
+    }
+
+    fn svg(width: f32, height: f32) -> Vec<u8> {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
+             viewBox=\"0 0 {width} {height}\"><path d=\"M2 2H{width}V{height}H2Z\" \
+             fill=\"#FFFFFF\"/></svg>"
+        )
+        .into_bytes()
+    }
+
+    fn svg_cache() -> ResourceCache {
+        ResourceCache::with_page_for_test((128, 128))
+    }
+
+    #[test]
+    fn svg_resources_rasterize_at_the_requested_physical_size() {
+        let mut cache = svg_cache();
+        let bytes = svg(16.0, 16.0);
+        let small = cache
+            .insert_svg_at_size(&bytes, Size::new(16.0, 16.0))
+            .expect("16px 栅格");
+        assert_eq!((small.width, small.height), (16, 16));
+        let large = cache
+            .insert_svg_at_size(&bytes, Size::new(32.0, 32.0))
+            .expect("32px 栅格");
+        assert_eq!((large.width, large.height), (32, 32));
+        assert_ne!(small.id, large.id, "不同物理尺寸必须是不同变体");
+        let again = cache
+            .insert_svg_at_size(&bytes, Size::new(16.0, 16.0))
+            .expect("去重命中");
+        assert_eq!(again.id, small.id, "同内容同尺寸必须命中已有变体");
+        assert_eq!(cache.stats().entries, 2, "只应有两份变体");
+    }
+
+    #[test]
+    fn svg_resources_upscale_above_the_intrinsic_size() {
+        let mut cache = svg_cache();
+        let image = cache
+            .insert_svg_at_size(&svg(16.0, 16.0), Size::new(48.0, 48.0))
+            .expect("48px 栅格");
+        assert_eq!(
+            (image.width, image.height),
+            (48, 48),
+            "SVG 必须能向上栅格（位图不会放大）"
+        );
+    }
+
+    #[test]
+    fn svg_targets_keep_the_intrinsic_aspect_ratio() {
+        let mut cache = svg_cache();
+        let image = cache
+            .insert_svg_at_size(&svg(20.0, 10.0), Size::new(40.0, 40.0))
+            .expect("fit 栅格");
+        assert_eq!(
+            (image.width, image.height),
+            (40, 20),
+            "非方形 SVG 必须等比装进目标盒"
+        );
+    }
+
+    #[test]
+    fn svg_reselect_follows_the_scale_and_reuses_variants() {
+        let mut cache = svg_cache();
+        let bytes = svg(16.0, 16.0);
+        let one_x = cache
+            .insert_svg_for_display(&bytes, Size::new(16.0, 16.0), 1.0)
+            .expect("1× 变体");
+        assert_eq!((one_x.width, one_x.height), (16, 16));
+        let two_x = cache.reselect(one_x.id, 2.0).expect("2× 变体");
+        assert_eq!((two_x.width, two_x.height), (32, 32));
+        assert_ne!(two_x.id, one_x.id);
+        let back = cache.reselect(two_x.id, 1.0).expect("切回 1×");
+        assert_eq!(back.id, one_x.id, "切回旧 scale 必须复用已有变体");
+    }
+
+    #[test]
+    fn bitmap_display_variants_also_reselect_with_the_scale() {
+        let mut cache = svg_cache();
+        let bytes = png(80, 40, [200, 10, 10, 255]);
+        let one_x = cache
+            .insert_for_display(&bytes, Size::new(40.0, 20.0), 1.0)
+            .expect("1× 变体");
+        assert_eq!((one_x.width, one_x.height), (40, 20));
+        let two_x = cache.reselect(one_x.id, 2.0).expect("2× 变体");
+        assert_eq!((two_x.width, two_x.height), (80, 40));
+    }
+
+    #[test]
+    fn svg_decode_failures_are_typed() {
+        let mut cache = svg_cache();
+        let error = cache.insert_svg(b"<svg").expect_err("损坏的 SVG 必须失败");
+        assert!(
+            matches!(
+                error,
+                EngineError::ResourceDecode {
+                    cause: DecodeCause::Corrupt { .. }
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn svg_probe_uses_the_declared_size() {
+        assert_eq!(
+            super::svg::probe_dimensions(&svg(16.0, 16.0)).expect("probe"),
+            (16, 16)
+        );
+        assert_eq!(
+            super::svg::probe_dimensions(&svg(20.0, 10.0)).expect("probe"),
+            (20, 10)
+        );
+        assert_eq!(
+            super::svg::resolve_target(Size::new(40.0, 40.0), (20, 10)),
+            (40, 20),
+            "目标解析必须等比"
+        );
+        assert_eq!(
+            super::svg::resolve_target(Size::new(20.0, 20.0), (16, 16)),
+            (20, 20),
+            "SVG 允许向上栅格"
+        );
+    }
+
+    #[test]
+    fn svg_decode_produces_premultiplied_bgra_with_analytic_edges() {
+        let decoded = super::svg::decode(&svg(16.0, 16.0), Some((16, 16))).expect("decode");
+        assert_eq!((decoded.width, decoded.height), (16, 16));
+        assert_eq!(
+            &decoded.bgra[(8 * 16 + 8) * 4..(8 * 16 + 8) * 4 + 4],
+            &[255, 255, 255, 255],
+            "白色填充的中心像素必须是 BGRA 全白不透明"
+        );
+        assert_eq!(
+            &decoded.bgra[0..4],
+            &[0, 0, 0, 0],
+            "premultiplied 的空白像素必须是全 0（不需要白 matte）"
+        );
+
+        let triangle = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" \
+                         viewBox=\"0 0 16 16\"><path d=\"M8 0L16 16L0 16Z\" fill=\"#FFFFFF\"/>\
+                         </svg>";
+        let decoded = super::svg::decode(triangle, Some((16, 16))).expect("decode triangle");
+        assert!(
+            (0..decoded.width as usize * decoded.height as usize).any(|index| {
+                let alpha = decoded.bgra[index * 4 + 3];
+                alpha > 0 && alpha < 255
+            }),
+            "斜边必须带解析抗锯齿（部分 alpha 像素）"
+        );
     }
 }

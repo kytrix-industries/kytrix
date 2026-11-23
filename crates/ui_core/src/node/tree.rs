@@ -815,6 +815,13 @@ impl NodeTree {
     ) -> usize {
         image::refresh_intrinsics(self, resources, scale)
     }
+    pub(crate) fn refresh_images_for_scale(
+        &mut self,
+        resources: &mut crate::resources::ResourceCache,
+        scale: f32,
+    ) -> Vec<ResourceId> {
+        image::refresh_for_scale(self, resources, scale)
+    }
     pub(crate) fn resolve_pending_images(
         &mut self,
         resolved: &ahash::HashMap<

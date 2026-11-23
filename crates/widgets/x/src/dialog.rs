@@ -33,7 +33,7 @@ use ui_kit::{
         badge::Badge,
         button::Button,
         dialog::{Dialog, DialogBuilder, DialogClose, DialogError},
-        icon::{IconKind, RasterTier, raster},
+        icon::{IconKind, svg},
         input::{self, InputNode, InputSpec, InputState},
         list::{List, ListOptions, SelectionMode},
         overlay::OverlayError,
@@ -479,10 +479,16 @@ impl DialogState {
 
     fn create_kit(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let verified = {
-            let image = cx
-                .app_mut()
-                .resources_mut()
-                .insert(raster(IconKind::CheckCircle, RasterTier::Small48))?;
+            let (window, scale) = {
+                let window = cx.window_mut();
+                (window.id(), window.scale().factor())
+            };
+            let image = cx.app_mut().resources_mut().insert_owned_svg_for_display(
+                window,
+                svg(IconKind::CheckCircle).as_bytes(),
+                ui_core::math::Size::new(12.0, 12.0),
+                scale,
+            )?;
             ImageSource::Ready(image.id)
         };
         self.verified = Some(verified);

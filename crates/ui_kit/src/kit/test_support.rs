@@ -333,14 +333,13 @@ mod tests {
     #[test]
     fn the_decode_host_delivers_async_results() {
         let mut host = DecodeApp::new();
-        let bytes = crate::kit::icon::raster(
-            crate::kit::icon::IconKind::User,
-            crate::kit::icon::RasterTier::Small48,
+        let bytes = bytes::Bytes::copy_from_slice(
+            crate::kit::icon::svg(crate::kit::icon::IconKind::User).as_bytes(),
         );
         let pending = host
             .app_mut()
             .resources_mut()
-            .insert_async(bytes::Bytes::from_static(bytes));
+            .insert_svg_async_at_size(bytes, ui_core::math::Size::new(48.0, 48.0));
         let delivered = host.poll_until(600, |app| {
             let results = app.take_resource_results();
             results
@@ -355,7 +354,7 @@ mod tests {
             DecodeState::Ready(image) => {
                 assert_eq!((image.width, image.height), (48, 48));
             }
-            other => panic!("图标 PNG 应解码成功，实际 {other:?}"),
+            other => panic!("图标 SVG 应栅格成功，实际 {other:?}"),
         }
     }
 }

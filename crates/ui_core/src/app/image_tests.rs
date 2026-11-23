@@ -675,3 +675,89 @@ fn explicitly_decorative_images_have_no_missing_alt_diagnostic() {
     assert_eq!(record.role, A11yRole::Image);
     assert!(record.hidden, "装饰图仍然 hidden（只是免诊断）");
 }
+
+fn svg_asset(side: f32) -> Vec<u8> {
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{side}\" \
+         viewBox=\"0 0 {side} {side}\"><path d=\"M2 2H14V14H2Z\" fill=\"#FFFFFF\"/></svg>"
+    )
+    .into_bytes()
+}
+
+fn mounted_resource(fixture: &Fixture, node: NodeId) -> crate::resources::ResourceImage {
+    let tree = fixture.app.window(fixture.window).expect("window").tree();
+    let crate::node::tree::NodeKind::Image(content) = tree.get(node).expect("node").kind() else {
+        panic!("expected an image node");
+    };
+    let id = content.source().resource().expect("ready resource");
+    fixture.app.resources().image(id).expect("resource alive")
+}
+
+#[test]
+fn an_svg_display_variant_is_rerasterized_when_the_scale_changes() {
+    let mut fixture = Fixture::new();
+    let bytes = svg_asset(16.0);
+    let one_x = fixture
+        .app
+        .resources_mut()
+        .insert_svg_for_display(&bytes, Size::new(16.0, 16.0), 1.0)
+        .expect("1× 变体");
+    assert_eq!((one_x.width, one_x.height), (16, 16));
+    let node = fixture.mount(|tree, root| {
+        NodeBuilder::image(one_x.id, ImageFit::Fill)
+            .build(tree, root)
+            .expect("image")
+    });
+    let _ = fixture.committed();
+    assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 16.0, 16.0));
+
+    fixture
+        .app
+        .window_mut(fixture.window)
+        .expect("window")
+        .set_scale(Scale::new(2.0).expect("finite scale"));
+    let _ = fixture.committed();
+    let two_x = mounted_resource(&fixture, node);
+    assert_eq!(
+        (two_x.width, two_x.height),
+        (32, 32),
+        "scale 变化必须把节点自动切到新物理尺寸的栅格"
+    );
+    assert_ne!(two_x.id, one_x.id, "换的是变体，不是同一张栅格");
+    assert_eq!(
+        fixture.bounds(node),
+        Rect::new(0.0, 0.0, 16.0, 16.0),
+        "物理栅格变了，逻辑内在尺寸不变（32 ÷ 2）"
+    );
+}
+
+#[test]
+fn a_bitmap_display_variant_is_rerasterized_when_the_scale_changes() {
+    let mut fixture = Fixture::new();
+    let bytes = png(80, 40);
+    let one_x = fixture
+        .app
+        .resources_mut()
+        .insert_for_display(&bytes, Size::new(40.0, 20.0), 1.0)
+        .expect("1× 变体");
+    let node = fixture.mount(|tree, root| {
+        NodeBuilder::image(one_x.id, ImageFit::Fill)
+            .build(tree, root)
+            .expect("image")
+    });
+    let _ = fixture.committed();
+
+    fixture
+        .app
+        .window_mut(fixture.window)
+        .expect("window")
+        .set_scale(Scale::new(2.0).expect("finite scale"));
+    let _ = fixture.committed();
+    let two_x = mounted_resource(&fixture, node);
+    assert_eq!(
+        (two_x.width, two_x.height),
+        (80, 40),
+        "位图的 for_display 变体同样按新 scale 重解"
+    );
+    assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 40.0, 20.0));
+}

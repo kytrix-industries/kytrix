@@ -32,6 +32,12 @@ pub(crate) enum SourceColor {
     AssumedSrgb,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    Bitmap,
+    Svg,
+}
+
 enum SourceIcc {
     Absent,
     Present(Vec<u8>),
@@ -222,7 +228,7 @@ fn decode_limits() -> image::Limits {
     limits
 }
 
-fn check_source_size(width: u32, height: u32) -> Result<(), DecodeCause> {
+pub(crate) fn check_source_size(width: u32, height: u32) -> Result<(), DecodeCause> {
     let pixels = u64::from(width) * u64::from(height);
     if pixels > MAX_SOURCE_PIXELS || width > MAX_SOURCE_DIM || height > MAX_SOURCE_DIM {
         return Err(DecodeCause::TooLarge {

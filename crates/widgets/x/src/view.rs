@@ -40,7 +40,7 @@ use ui_kit::{
     kit::{
         button::Button,
         empty_state::EmptyState,
-        icon::{IconKind, RasterTier, raster},
+        icon::{IconKind, svg},
         list::{List, ListOptions, SelectionMode},
         size::{UnifiedSizable, UnifiedSize},
     },
@@ -1504,11 +1504,17 @@ impl XWidget {
 }
 
 fn register_row_icons(cx: &mut WidgetCx<'_>) -> Result<RowIcons, EngineError> {
+    let (window, scale) = {
+        let window = cx.window_mut();
+        (window.id(), window.scale().factor())
+    };
     let mut register = |kind: IconKind| -> Result<ImageSource, EngineError> {
-        let image = cx
-            .app_mut()
-            .resources_mut()
-            .insert(raster(kind, RasterTier::Small48))?;
+        let image = cx.app_mut().resources_mut().insert_owned_svg_for_display(
+            window,
+            svg(kind).as_bytes(),
+            ui_core::math::Size::new(16.0, 16.0),
+            scale,
+        )?;
         Ok(ImageSource::Ready(image.id))
     };
     Ok(RowIcons {

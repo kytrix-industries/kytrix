@@ -1238,9 +1238,9 @@ fn icon_error(error: IconError, parent: NodeId) -> EngineError {
     match error {
         IconError::Decode(error) | IconError::Node(error) => error,
         IconError::UnknownWindow { window } => EngineError::UnknownWindow { window },
-        IconError::InvalidSize { .. }
-        | IconError::UnknownKind { .. }
-        | IconError::NotImageNode { .. } => EngineError::StaleNode { node: parent },
+        IconError::InvalidSize { .. } | IconError::UnknownKind { .. } => {
+            EngineError::StaleNode { node: parent }
+        }
     }
 }
 

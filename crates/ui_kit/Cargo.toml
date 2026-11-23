@@ -15,11 +15,6 @@ taffy = { workspace = true }
 ui_core = { workspace = true }
 
 
-[build-dependencies]
-image = { workspace = true }
-resvg = { workspace = true }
-usvg = { workspace = true }
-
 [dev-dependencies]
 tokio = { workspace = true }
 ui_core = { workspace = true, features = ["test-support"] }

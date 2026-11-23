@@ -4,8 +4,8 @@ use ahash::AHasher;
 use bytes::Bytes;
 
 use crate::{
-    math::PhysicalRect,
-    resources::{DecodeCause, ResourceId, ResourceImage},
+    math::{PhysicalRect, Size},
+    resources::{DecodeCause, ResourceId, ResourceImage, image::SourceKind},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -15,8 +15,9 @@ pub(crate) struct ContentKey {
 }
 
 impl ContentKey {
-    pub(crate) fn new(bytes: &[u8]) -> Self {
+    pub(crate) fn new(bytes: &[u8], kind: SourceKind) -> Self {
         let mut hasher = AHasher::default();
+        hasher.write_u8(kind as u8);
         hasher.write(bytes);
         Self {
             len: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
@@ -43,6 +44,9 @@ pub(crate) struct Entry {
     pub last_used: u64,
     pub key: ContentKey,
     pub target: (u32, u32),
+    pub intrinsic: (u32, u32),
+    pub kind: SourceKind,
+    pub logical: Option<Size>,
 }
 
 pub(crate) struct Page {
@@ -127,7 +131,10 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::{ContentKey, Page};
-    use crate::{math::PhysicalRect, resources::DecodeCause};
+    use crate::{
+        math::PhysicalRect,
+        resources::{DecodeCause, image::SourceKind},
+    };
 
     fn page(width: u32, height: u32) -> Page {
         Page::new(width, height).expect("测试页缓冲分配（小页，不应失败）")
@@ -219,12 +226,20 @@ mod tests {
 
     #[test]
     fn content_key_is_stable_for_equal_bytes_and_splits_different_lengths() {
-        let first = ContentKey::new(b"logo");
-        let second = ContentKey::new(b"logo");
-        let longer = ContentKey::new(b"logos");
+        let first = ContentKey::new(b"logo", SourceKind::Bitmap);
+        let second = ContentKey::new(b"logo", SourceKind::Bitmap);
+        let longer = ContentKey::new(b"logos", SourceKind::Bitmap);
 
         assert_eq!(first, second, "同一份字节的内容键必须相同");
         assert_ne!(first, longer, "长度进键：不同长度不该互相命中");
-        assert_ne!(ContentKey::new(b"logo"), ContentKey::new(b"olgo"));
+        assert_ne!(
+            ContentKey::new(b"logo", SourceKind::Bitmap),
+            ContentKey::new(b"logo", SourceKind::Svg),
+            "来源类型进键：同一份字节不能跨 PNG/SVG 复用变体"
+        );
+        assert_ne!(
+            ContentKey::new(b"logo", SourceKind::Bitmap),
+            ContentKey::new(b"olgo", SourceKind::Bitmap)
+        );
     }
 }

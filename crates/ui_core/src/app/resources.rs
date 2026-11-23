@@ -69,9 +69,17 @@ pub(crate) fn refresh_images(app: &mut App, window: WindowId) -> usize {
     if !marked && !scale_changed {
         return 0;
     }
-    image_scale_epochs.insert(window, scale_epoch);
     let scale = target.scale().factor();
-    target.tree_mut().refresh_image_intrinsics(resources, scale)
+    let mut reselected = 0;
+    if scale_changed {
+        let applied = target.tree_mut().refresh_images_for_scale(resources, scale);
+        for id in applied {
+            resources.record_owner(window, id);
+            reselected += 1;
+        }
+        image_scale_epochs.insert(window, scale_epoch);
+    }
+    reselected + target.tree_mut().refresh_image_intrinsics(resources, scale)
 }
 
 pub(crate) fn unload_resource(app: &mut App, id: crate::resources::ResourceId) -> bool {

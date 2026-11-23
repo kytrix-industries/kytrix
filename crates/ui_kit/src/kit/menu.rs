@@ -25,7 +25,7 @@ use ui_core::{
 
 use crate::{
     kit::{
-        icon::{IconKind, RasterTier, raster},
+        icon::{IconKind, svg},
         layer::{Band, Layer, LayerSlot},
         list::{List, ListOptions, RowHeight, Selection, SelectionMode},
         overlay::{
@@ -52,7 +52,7 @@ pub(crate) struct IconCache {
 struct CachedIcon {
     kind: IconKind,
     size: f32,
-    tier: RasterTier,
+    scale_bits: u32,
     resource: ResourceId,
 }
 
@@ -69,24 +69,25 @@ impl IconCache {
             .ok_or(EngineError::UnknownWindow { window })?
             .scale()
             .factor();
-        let tier = RasterTier::for_scale(scale);
+        let scale_bits = scale.to_bits();
         if self
             .entries
             .borrow()
             .iter()
-            .any(|entry| entry.kind == kind && entry.size == size && entry.tier == tier)
+            .any(|entry| entry.kind == kind && entry.size == size && entry.scale_bits == scale_bits)
         {
             return Ok(());
         }
-        let bytes = raster(kind, tier);
-        let target = Size::new(size * scale, size * scale);
-        let image = app
-            .resources_mut()
-            .insert_owned_at_size(window, bytes, target)?;
+        let image = app.resources_mut().insert_owned_svg_for_display(
+            window,
+            svg(kind).as_bytes(),
+            Size::new(size, size),
+            scale,
+        )?;
         self.entries.borrow_mut().push(CachedIcon {
             kind,
             size,
-            tier,
+            scale_bits,
             resource: image.id,
         });
         Ok(())

@@ -108,6 +108,9 @@ etagere = { workspace = true }
 image = { workspace = true }
 # P13 资源色彩管理（D-8）：ICC → sRGB（8-bit）。image 0.25.10 的非可选依赖，锁内已有 0.8.1。
 moxcms = { workspace = true }
+# 图标矢量栅格：SVG 资源按目标物理像素用 resvg 渲染（纯 Rust；默认特性关闭，无字体/系统字体）。
+resvg = { workspace = true }
+usvg = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
