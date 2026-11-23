@@ -78,7 +78,9 @@ const SETTLE_FRAMES: u32 = 2;
 /// The painted-primitive floor. A shell draws hundreds; an empty or failed frame draws none.
 const MINIMUM_PRIMITIVES: usize = 10;
 
-/// A run that has not finished after this many pump turns is stuck. The script ticks once per\n/// pump turn (not once per commit: a turn with a deferred frame still runs the routes), so\n/// this is a much larger number than the run's frame count.
+/// A run that has not finished after this many pump turns is stuck. The script ticks once per
+/// pump turn (not once per commit: a turn with a deferred frame still runs the routes), so
+/// this is a much larger number than the run's frame count.
 const TICK_BUDGET: u32 = 20_000;
 
 /// A run that has not finished after this long is stuck (frames are arriving far too

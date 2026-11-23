@@ -686,15 +686,9 @@ pub(crate) fn open_url(url: &str) {
         command
     };
     #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("open");
-        command
-    };
+    let mut command = std::process::Command::new("open");
     #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command
-    };
+    let mut command = std::process::Command::new("xdg-open");
     #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
     let mut command = std::process::Command::new("true");
 
