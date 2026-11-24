@@ -124,9 +124,13 @@ impl FramePayload {
         let mut kept: Vec<InstanceChunk> = Vec::with_capacity(dropped_chunks.len());
         let exhaustive = dropped_chunks.len().saturating_mul(self.chunks.len()) <= 4096;
         for older in dropped_chunks {
+            let range = older.range();
+            if range.end > self.instance_count {
+                continue;
+            }
             let covered = exhaustive
                 && self.chunks.iter().any(|newer| {
-                    newer.range().start <= older.start && older.range().end <= newer.range().end
+                    newer.range().start <= range.start && range.end <= newer.range().end
                 });
             if !covered {
                 kept.push(older);
@@ -406,13 +410,10 @@ impl InstanceMirror {
             let range = chunk.range();
             let start = range.start as usize * INSTANCE_BYTES;
             let end = start + chunk.bytes.len();
-            debug_assert!(
+            assert!(
                 end <= bytes.len(),
                 "payload chunk escapes the instance arena"
             );
-            if end > bytes.len() {
-                continue;
-            }
             bytes[start..end].copy_from_slice(&chunk.bytes);
             payload_ranges.push(range);
         }
@@ -974,6 +975,28 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(newer.chunks[0].start, 0);
+    }
+
+    #[test]
+    fn a_dropped_frame_never_contributes_bytes_outside_a_smaller_arena() {
+        let older = manual_payload(&[(0, &[7u8; 12 * 128])], 12);
+        let mut newer = manual_payload(&[(0, &[9u8; 5 * 128])], 5);
+        newer.absorb(older);
+        let ranges: Vec<std::ops::Range<u32>> =
+            newer.chunks().iter().map(InstanceChunk::range).collect();
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range.end <= newer.instance_count()),
+            "合并后的块必须落在实例环内（块 {ranges:?}，环 0..{}）",
+            newer.instance_count()
+        );
+        let mut mirror = InstanceMirror::new(1);
+        assert!(mirror.prepare(0, &newer), "合并后的载荷必须整块写进镜像");
+        assert!(
+            mirror.bytes().iter().all(|byte| *byte == 9),
+            "镜像里只允许出现新帧的字节"
+        );
     }
 
     #[test]

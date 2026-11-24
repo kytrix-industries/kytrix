@@ -154,7 +154,7 @@ mod tests {
         render::{
             compositor::{DamageRects, Plan},
             delta::{DeltaBuilder, FrameHeader, SceneDelta},
-            frame::{InstanceMirror, MAX_FRAMES_IN_FLIGHT},
+            frame::{FrameRequest, InstanceMirror, LatestFrame, MAX_FRAMES_IN_FLIGHT},
         },
         window::{FrameIndex, WindowId},
     };
@@ -613,6 +613,44 @@ mod tests {
             rebuilt_without_signal.bytes(),
             before.as_slice(),
             "增量载荷喂给重建后的空镜像 ⇒ 内容与重建前不一致（所以 full 信号不可省）"
+        );
+    }
+
+    #[test]
+    fn a_shrinking_relayout_survives_two_full_frames_being_coalesced() {
+        const LANES: usize = 4;
+        let mut fixture = Fixture::new(LANES);
+        let first = fixture.frame(Plan::Full, true, &[]);
+        assert!(first.full);
+        let older = fixture.compose(&first).payload;
+        assert_eq!(older.instance_count(), LANES as u32);
+
+        assert!(fixture.scene.clear_lane(fixture.lane));
+        let shrunk = fixture.frame(Plan::Full, true, &[]);
+        assert!(shrunk.full, "重排后的帧必须整帧发布");
+        let newer = fixture.compose(&shrunk).payload;
+        assert_eq!(
+            newer.instance_count(),
+            LANES as u32 - 1,
+            "清空一条 lane ⇒ 实例环缩小"
+        );
+
+        let mut slot = LatestFrame::new();
+        slot.publish(FrameRequest::from_header(
+            header(1, Plan::Full, DevicePixelRatio::ONE),
+            older,
+        ));
+        slot.publish(FrameRequest::from_header(
+            header(2, Plan::Full, DevicePixelRatio::ONE),
+            newer,
+        ));
+        let merged = slot.take().expect("latest frame").payload;
+        let mut mirror = InstanceMirror::new(MAX_FRAMES_IN_FLIGHT);
+        assert!(mirror.prepare(0, &merged), "合并后的载荷必须能写进实例环");
+        assert_eq!(
+            mirror.bytes().len(),
+            (LANES - 1) * 128,
+            "镜像只覆盖新的实例环"
         );
     }
 }
