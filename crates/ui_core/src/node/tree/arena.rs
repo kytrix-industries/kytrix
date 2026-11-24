@@ -15,6 +15,7 @@ use crate::{
         signal::SignalId,
     },
     paint::style::{PaintSpec, Style, StylePatch},
+    text_edit::EditableText,
 };
 
 pub(crate) fn new() -> NodeTree {
@@ -66,6 +67,7 @@ pub(crate) fn new() -> NodeTree {
         hit_test_skips: std::cell::Cell::new(0),
         layout_cache: ahash::HashMap::default(),
         text_slots: vec![None],
+        editable_slots: vec![None],
         debug_ids: vec![None],
         clip_keys: vec![None],
         subtree_bounds: vec![LogicalRect::default()],
@@ -170,6 +172,7 @@ pub(crate) fn insert_child(
         hit_shape,
         layout_override,
         bind_text,
+        editable,
         paint,
         debug_id,
         action,
@@ -217,6 +220,12 @@ pub(crate) fn insert_child(
         lane_offset: LogicalPoint::ZERO,
         paint_opacity: 1.0,
     });
+    if let Some(spec) = &editable
+        && let Err(detail) = spec.validate()
+    {
+        let _ = tree.arena.remove(id);
+        return Err(EngineError::TextEditSpecInvalid { node: id, detail });
+    }
     if tree
         .arena
         .get(id)
@@ -238,6 +247,10 @@ pub(crate) fn insert_child(
         tree.text_slots.resize_with(index + 1, || None);
     }
     tree.text_slots[index] = None;
+    if tree.editable_slots.len() <= index {
+        tree.editable_slots.resize_with(index + 1, || None);
+    }
+    tree.editable_slots[index] = editable.map(|spec| Box::new(EditableText::new(spec)));
     if tree
         .arena
         .get(id)
@@ -377,6 +390,9 @@ pub(crate) fn remove(
         if let Some(slot) = tree.text_slots.get_mut(index) {
             *slot = None;
         }
+        if let Some(slot) = tree.editable_slots.get_mut(index) {
+            *slot = None;
+        }
         if let Some(slot) = tree.debug_ids.get_mut(index) {
             *slot = None;
         }
@@ -482,6 +498,7 @@ impl NodeSpec {
             hit_shape: None,
             layout_override: None,
             bind_text: None,
+            editable: None,
             paint: None,
             debug_id: None,
             action: None,
@@ -556,6 +573,11 @@ impl NodeSpec {
         bind_text: Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>,
     ) -> Self {
         self.bind_text = Some(bind_text);
+        self
+    }
+
+    pub(crate) fn with_editable(mut self, editable: crate::text_edit::EditableSpec) -> Self {
+        self.editable = Some(editable);
         self
     }
 }

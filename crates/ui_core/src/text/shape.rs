@@ -15,7 +15,7 @@ use taffy::AvailableSpace;
 use super::{
     InlineBoxSpec, ShapedDecoration, ShapedGlyphRun, ShapedInlineBox, ShapedLine, ShapedTextItem,
     ShapedTextLine, TextAlign, TextContent, TextDecoration, TextDiagnostic, TextDirection,
-    TextLineBreak, TextOverflow, TextRun, TextSlant, TextStyle, TextWrap,
+    TextLineBreak, TextLineMetrics, TextOverflow, TextRun, TextSlant, TextStyle, TextWrap,
     atlas::{GlyphAtlas, GlyphAtlasStats},
     fast_path::SimpleShaped,
     inline_flow,
@@ -78,6 +78,8 @@ struct ParleySnapshot {
     max_size: LogicalSize,
     broken_at: Option<u32>,
     aligned_at: Option<u8>,
+    #[cfg(test)]
+    breaks: Cell<u32>,
 }
 
 impl ParleySnapshot {
@@ -94,6 +96,8 @@ impl ParleySnapshot {
             max_size,
             broken_at: None,
             aligned_at: None,
+            #[cfg(test)]
+            breaks: Cell::new(0),
         }
     }
 
@@ -103,6 +107,8 @@ impl ParleySnapshot {
             self.layout.break_all_lines(width.map(LogicalPx::value));
             self.broken_at = key;
             self.aligned_at = None;
+            #[cfg(test)]
+            self.breaks.set(self.breaks.get() + 1);
         }
         let align_key = alignment_key(alignment);
         if self.aligned_at != Some(align_key) {
@@ -312,6 +318,73 @@ impl ShapedText {
                     size
                 }
             },
+        }
+    }
+
+    pub(crate) fn measure_editable(
+        &self,
+        known: taffy::Size<Option<f32>>,
+        available: taffy::Size<AvailableSpace>,
+    ) -> LogicalSize {
+        if !self.text.is_empty() {
+            return self.measure(known, available);
+        }
+        let line_height = match &self.kind {
+            ShapedKind::Simple(simple) => simple.metrics().line_height,
+            ShapedKind::Parley(snapshot) => {
+                let snapshot = snapshot.borrow();
+                let line = snapshot.layout.lines().next();
+                debug_assert!(
+                    line.is_some(),
+                    "an empty parley layout always carries a strut line"
+                );
+                line.map_or_else(
+                    || self.style.size * self.style.line_height.unwrap_or(1.0),
+                    |line| px(line.metrics().line_height),
+                )
+            }
+        };
+        LogicalSize::new(LogicalPx::ZERO, line_height)
+    }
+
+    pub(crate) fn line_metrics(
+        &self,
+        width: LogicalPx,
+        alignment: TextAlign,
+    ) -> Option<TextLineMetrics> {
+        match &self.kind {
+            ShapedKind::Parley(snapshot) => {
+                let mut snapshot = snapshot.borrow_mut();
+                snapshot.break_and_align(Some(width.max(LogicalPx::ZERO)), align_of(alignment));
+                let line_height = snapshot
+                    .layout
+                    .lines()
+                    .next()
+                    .map(|line| px(line.metrics().line_height))?;
+                Some(TextLineMetrics {
+                    line_height,
+                    first_baseline: snapshot.layout.first_baseline().map(px),
+                    line_count: snapshot.layout.lines().count(),
+                    content_height: px(snapshot.layout.height()),
+                })
+            }
+            ShapedKind::Simple(simple) => {
+                let metrics = simple.metrics();
+                Some(TextLineMetrics {
+                    line_height: metrics.line_height,
+                    first_baseline: Some(metrics.baseline),
+                    line_count: 1,
+                    content_height: metrics.line_height,
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout_breaks(&self) -> u32 {
+        match &self.kind {
+            ShapedKind::Parley(snapshot) => snapshot.borrow().breaks.get(),
+            ShapedKind::Simple(_) => 0,
         }
     }
 

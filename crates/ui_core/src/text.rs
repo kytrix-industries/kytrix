@@ -790,6 +790,14 @@ impl ShapedLine {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextLineMetrics {
+    pub line_height: LogicalPx,
+    pub first_baseline: Option<LogicalPx>,
+    pub line_count: usize,
+    pub content_height: LogicalPx,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ShapedTextLine {
     pub text_range: Range<usize>,

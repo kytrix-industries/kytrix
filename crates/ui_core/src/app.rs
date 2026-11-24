@@ -1657,6 +1657,31 @@ impl App {
         text_pass::layout_text(self, window)
     }
 
+    pub fn text_edit_value(
+        &self,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<smol_str::SmolStr, EngineError> {
+        crate::text_edit::value(self, window, node)
+    }
+
+    pub fn text_edit_set_value(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        text: &str,
+    ) -> Result<bool, EngineError> {
+        crate::text_edit::set_value(self, window, node, text)
+    }
+
+    pub fn text_edit_metrics(
+        &self,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<crate::text_edit::TextEditMetrics, EngineError> {
+        crate::text_edit::metrics(self, window, node)
+    }
+
     #[must_use]
     pub fn measure_text(
         &mut self,
@@ -1769,6 +1794,9 @@ impl App {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod text_edit_tests;
 
 #[cfg(test)]
 mod interaction_tests;

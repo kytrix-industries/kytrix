@@ -18,6 +18,7 @@ use crate::{
         style::{PaintSpec, Style, StylePatch},
     },
     text::{TextContent, TextStyle},
+    text_edit::EditableSpec,
 };
 
 pub struct NodeBuilder {
@@ -28,6 +29,7 @@ pub struct NodeBuilder {
     hit_shape: Option<HitShape>,
     layout_override: Option<LayoutOverride>,
     bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
+    editable: Option<EditableSpec>,
     paint: Option<PaintSpec>,
     debug_id: Option<SmolStr>,
     action: Option<Action>,
@@ -55,6 +57,7 @@ impl NodeBuilder {
             hit_shape: None,
             layout_override: None,
             bind_text: None,
+            editable: None,
             paint: None,
             debug_id: None,
             action: None,
@@ -174,6 +177,16 @@ impl NodeBuilder {
     }
 
     #[must_use]
+    pub fn editable_text(spec: EditableSpec) -> Self {
+        let content = TextContent::new(SmolStr::new_static(""), spec.text_style.clone());
+        Self {
+            kind: NodeKind::Text(Box::new(content)),
+            editable: Some(spec),
+            ..Self::boxed()
+        }
+    }
+
+    #[must_use]
     pub fn inline_boxes(
         mut self,
         boxes: impl IntoIterator<Item = crate::text::InlineBoxSpec>,
@@ -256,6 +269,10 @@ impl NodeBuilder {
             "leaf nodes cannot have children: canvas/geometry/override nodes do not lay out \
              children, so the subtree would never produce layout boxes or pixels"
         );
+        debug_assert!(
+            self.editable.is_none() || self.bind_text.is_none(),
+            "editable text nodes own their display mirror; bind_text would overwrite it"
+        );
         let mut spec = NodeSpec::new(self.kind, self.style, self.bind_style);
         if let Some(measure) = self.measure {
             spec = spec.with_measure(measure);
@@ -268,6 +285,9 @@ impl NodeBuilder {
         }
         if let Some(bind_text) = self.bind_text {
             spec = spec.with_bind_text(bind_text);
+        }
+        if let Some(editable) = self.editable {
+            spec = spec.with_editable(editable);
         }
         if let Some(paint) = self.paint {
             spec = spec.with_paint(paint);

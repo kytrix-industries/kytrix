@@ -1,14 +1,19 @@
 use smallvec::smallvec;
+use smol_str::SmolStr;
 
 use super::{LayoutBox, Node, NodeKind, NodeSpec, NodeTree};
 use crate::{
+    a11y::A11yRole,
     error::EngineError,
     math::{LogicalEdges, LogicalPoint, LogicalRect, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId, signal::SignalId},
     paint::{
+        color::Color,
         style::{Clip, Style, StylePatch},
         style_builder::StyleBuilder,
     },
+    text::TextStyle,
+    text_edit::EditableSpec,
 };
 
 fn boxed(tree: &mut NodeTree, parent: NodeId) -> NodeId {
@@ -466,6 +471,76 @@ fn remove_drops_the_text_slot() {
 
     assert!(tree.text_slot(node).is_none(), "槽位必须随卸载清空（N5）");
     assert!(tree.text_line(node).is_none());
+}
+
+fn editable_spec(label: &'static str) -> EditableSpec {
+    EditableSpec {
+        role: A11yRole::TextInput,
+        label: SmolStr::new_static(label),
+        placeholder: SmolStr::new_static(""),
+        multiline: false,
+        masked: false,
+        max_length: None,
+        submit: None,
+        text_style: TextStyle::new(px(16.0)),
+        caret_color: Color::BLACK,
+        selection_color: Color::BLACK,
+        placeholder_color: Color::BLACK,
+        composition_color: Color::BLACK,
+    }
+}
+
+fn editable_tree(label: &'static str) -> (NodeTree, NodeId) {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let node = NodeBuilder::editable_text(editable_spec(label))
+        .build(&mut tree, root)
+        .expect("挂载可编辑文本");
+    (tree, node)
+}
+
+#[test]
+fn remove_drops_the_editable_slot() {
+    let (mut tree, node) = editable_tree("temp");
+    assert!(tree.editable(node).is_some());
+    assert!(tree.editable_slot_for_test(node).is_some());
+
+    assert!(tree.remove(node).is_ok());
+
+    assert!(
+        tree.editable_slot_for_test(node).is_none(),
+        "editable 槽位必须随卸载清空（N5）"
+    );
+    assert!(tree.editable(node).is_none());
+}
+
+#[test]
+fn reused_index_replaces_the_editable_slot() {
+    let (mut tree, first) = editable_tree("first");
+    assert!(tree.remove(first).is_ok());
+
+    let root = tree.root();
+    let plain = NodeBuilder::text("plain", TextStyle::new(px(16.0)))
+        .build(&mut tree, root)
+        .expect("挂载文本");
+    assert_eq!(plain.index(), first.index(), "前置：arena 必须复用 index");
+    assert!(
+        tree.editable_slot_for_test(plain).is_none(),
+        "不可编辑节点不得继承旧槽位"
+    );
+
+    let root = tree.root();
+    assert!(tree.remove(plain).is_ok());
+    let second = NodeBuilder::editable_text(editable_spec("second"))
+        .build(&mut tree, root)
+        .expect("挂载可编辑文本");
+    assert_eq!(second.index(), first.index(), "前置：arena 必须复用 index");
+    let editable = tree
+        .editable_slot_for_test(second)
+        .expect("新可编辑节点必须重建槽位");
+    assert_eq!(editable.committed(), "", "新节点的 committed 不得残留旧值");
+    assert_eq!(editable.spec().label, "second", "槽位必须指向新的 spec");
+    assert!(tree.editable(first).is_none(), "旧句柄不得命中新槽位");
 }
 
 #[test]

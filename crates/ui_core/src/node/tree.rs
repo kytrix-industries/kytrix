@@ -41,6 +41,7 @@ use crate::{
     },
     resources::ResourceId,
     text::{ShapedLine, TextContent},
+    text_edit::{EditableSpec, EditableText},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -96,6 +97,7 @@ pub(crate) struct NodeSpec {
     hit_shape: Option<HitShape>,
     layout_override: Option<LayoutOverride>,
     bind_text: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
+    editable: Option<EditableSpec>,
     paint: Option<Box<PaintSpec>>,
     debug_id: Option<SmolStr>,
     action: Option<Action>,
@@ -328,6 +330,7 @@ pub struct NodeTree {
     hit_test_skips: std::cell::Cell<u64>,
     layout_cache: ahash::HashMap<NodeId, taffy::Cache>,
     text_slots: Vec<Option<TextSlot>>,
+    editable_slots: Vec<Option<Box<EditableText>>>,
     debug_ids: Vec<Option<SmolStr>>,
     clip_keys: Vec<Option<(u8, Option<DeviceRect>)>>,
     subtree_bounds: Vec<LogicalRect>,
@@ -391,10 +394,13 @@ impl NodeTree {
     pub(crate) fn bind_window(&mut self, window: crate::window::WindowId) {
         arena::bind_window(self, window)
     }
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn window(&self) -> Option<crate::window::WindowId> {
         self.window
+    }
+    #[must_use]
+    pub(crate) fn text_dirty_pending(&self, node: NodeId) -> bool {
+        content::text_dirty_pending(self, node)
     }
     #[must_use]
     pub(crate) fn window_tag(&self) -> u32 {
@@ -922,8 +928,18 @@ impl NodeTree {
         dpi_epoch: u32,
         measured: LogicalSize,
         size_changed: bool,
+        editable: bool,
     ) -> bool {
-        content::set_text_shaped(self, node, shaped, key, dpi_epoch, measured, size_changed)
+        content::set_text_shaped(
+            self,
+            node,
+            shaped,
+            key,
+            dpi_epoch,
+            measured,
+            size_changed,
+            editable,
+        )
     }
     #[cfg(test)]
     pub(crate) fn install_text_line_for_test(
@@ -955,6 +971,28 @@ impl NodeTree {
     }
     pub(crate) fn text_slot(&self, node: NodeId) -> Option<&TextSlot> {
         content::text_slot(self, node)
+    }
+    #[must_use]
+    pub(crate) fn editable(&self, node: NodeId) -> Option<&EditableText> {
+        content::editable(self, node)
+    }
+    pub(crate) fn editable_mut(&mut self, node: NodeId) -> Option<&mut EditableText> {
+        content::editable_mut(self, node)
+    }
+    #[must_use]
+    pub(crate) fn text_layout_width(&self, node: NodeId) -> Option<LogicalPx> {
+        let slot = self.text_slot(node)?;
+        Some(content::expected_layout_width(self, slot.shaped(), node))
+    }
+    #[must_use]
+    pub(crate) fn text_laid_width(&self, node: NodeId) -> Option<LogicalPx> {
+        content::laid_width(self, node)
+    }
+    #[cfg(test)]
+    pub(crate) fn editable_slot_for_test(&self, node: NodeId) -> Option<&EditableText> {
+        self.editable_slots
+            .get(node.index() as usize)
+            .and_then(|slot| slot.as_deref())
     }
     pub fn text_selection_rects(
         &self,

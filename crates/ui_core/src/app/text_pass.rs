@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use super::App;
 use crate::{
     error::EngineError,
-    math::{LogicalPx, LogicalSize},
+    math::LogicalSize,
     text::{FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport},
     window::WindowId,
 };
@@ -488,7 +488,12 @@ pub(crate) fn refresh_text(
             continue;
         }
 
-        let measured = shaped.measure(known, available);
+        let editable = tree.editable(node).is_some();
+        let measured = if editable {
+            shaped.measure_editable(known, available)
+        } else {
+            shaped.measure(known, available)
+        };
         let previous = tree.text_measured_size(node).unwrap_or(LogicalSize::ZERO);
         let fixed_layout = tree
             .get(node)
@@ -503,6 +508,7 @@ pub(crate) fn refresh_text(
             dpi_epoch,
             measured,
             size_changed,
+            editable,
         );
     }
     let fast = text.take_fast_path_stats();
@@ -564,14 +570,9 @@ pub(crate) fn layout_text(
             let Some(shaped) = tree.text_slot(node).map(|slot| Rc::clone(slot.shaped())) else {
                 continue;
             };
-            let width = {
-                let width = tree.text_content_width(node);
-                if width > LogicalPx::ZERO {
-                    width
-                } else {
-                    shaped.max_content_size().width
-                }
-            };
+            let width = tree
+                .text_layout_width(node)
+                .unwrap_or_else(|| shaped.max_content_size().width);
             let current = tree
                 .text_slot(node)
                 .map(|slot| (slot.laid_width_bits(), slot.laid_generation()));

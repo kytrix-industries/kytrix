@@ -137,6 +137,15 @@ pub enum EngineError {
     #[error("text shaping failed for {node:?}: {detail}")]
     TextShape { node: NodeId, detail: SmolStr },
 
+    #[error("node {node:?} is not an editable text node")]
+    TextEditNotAvailable { node: NodeId },
+
+    #[error("invalid editable text spec for {node:?}: {detail}")]
+    TextEditSpecInvalid { node: NodeId, detail: SmolStr },
+
+    #[error("editable text layout failed for {node:?}: {detail}")]
+    TextEditLayout { node: NodeId, detail: SmolStr },
+
     #[error("atlas {kind:?} is exhausted: no free tile fits after a clear and rebuild")]
     AtlasExhausted { kind: AtlasKind },
 
@@ -329,6 +338,17 @@ mod tests {
                 node: NodeId::for_test(5, 1),
                 detail: SmolStr::new_static("font stack is empty"),
             },
+            EngineError::TextEditNotAvailable {
+                node: NodeId::for_test(11, 1),
+            },
+            EngineError::TextEditSpecInvalid {
+                node: NodeId::for_test(12, 1),
+                detail: SmolStr::new_static("masked editable text cannot be multiline"),
+            },
+            EngineError::TextEditLayout {
+                node: NodeId::for_test(13, 1),
+                detail: SmolStr::new_static("text has not been shaped yet"),
+            },
             EngineError::AtlasExhausted {
                 kind: AtlasKind::Glyph,
             },
@@ -446,6 +466,35 @@ mod tests {
         assert!(text.contains("Y"), "{text}");
         assert!(text.contains("-1.5"), "{text}");
         assert!(text.contains("finite, non-negative"), "{text}");
+    }
+
+    #[test]
+    fn text_edit_errors_name_the_node_and_detail() {
+        let unavailable = EngineError::TextEditNotAvailable {
+            node: NodeId::for_test(12, 2),
+        }
+        .to_string();
+        assert!(
+            unavailable.contains("not an editable text node"),
+            "{unavailable}"
+        );
+        assert!(unavailable.contains("n12.2"), "{unavailable}");
+
+        let invalid = EngineError::TextEditSpecInvalid {
+            node: NodeId::for_test(13, 2),
+            detail: SmolStr::new_static("masked editable text cannot be multiline"),
+        }
+        .to_string();
+        assert!(invalid.contains("invalid editable text spec"), "{invalid}");
+        assert!(invalid.contains("masked"), "{invalid}");
+
+        let layout = EngineError::TextEditLayout {
+            node: NodeId::for_test(14, 2),
+            detail: SmolStr::new_static("text has not been shaped yet"),
+        }
+        .to_string();
+        assert!(layout.contains("editable text layout failed"), "{layout}");
+        assert!(layout.contains("shaped yet"), "{layout}");
     }
 
     #[test]

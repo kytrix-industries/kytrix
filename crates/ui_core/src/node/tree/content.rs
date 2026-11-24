@@ -19,6 +19,23 @@ pub(crate) fn text_content(tree: &NodeTree, node: NodeId) -> Option<&TextContent
     tree.arena.get(node).and_then(|target| target.kind.text())
 }
 
+pub(crate) fn editable(tree: &NodeTree, node: NodeId) -> Option<&crate::text_edit::EditableText> {
+    tree.get(node).ok()?;
+    tree.editable_slots
+        .get(node.index() as usize)
+        .and_then(|slot| slot.as_deref())
+}
+
+pub(crate) fn editable_mut(
+    tree: &mut NodeTree,
+    node: NodeId,
+) -> Option<&mut crate::text_edit::EditableText> {
+    tree.get(node).ok()?;
+    tree.editable_slots
+        .get_mut(node.index() as usize)
+        .and_then(|slot| slot.as_deref_mut())
+}
+
 pub(crate) fn set_canvas(
     tree: &mut NodeTree,
     node: NodeId,
@@ -86,6 +103,10 @@ pub(crate) fn take_text_dirty(tree: &mut NodeTree, out: &mut Vec<NodeId>) {
     tree.text_dirty.take_into(out);
 }
 
+pub(crate) fn text_dirty_pending(tree: &NodeTree, node: NodeId) -> bool {
+    tree.text_dirty.contains(node)
+}
+
 #[cfg(test)]
 pub(crate) fn text_dirty_len(tree: &NodeTree) -> usize {
     tree.text_dirty.len()
@@ -149,14 +170,17 @@ pub(crate) fn set_text_shaped(
     dpi_epoch: u32,
     measured: LogicalSize,
     size_changed: bool,
+    editable: bool,
 ) -> bool {
     let Some(target) = tree.arena.get_mut(node) else {
         return false;
     };
     let rc = Rc::clone(&shaped);
-    target.measure = Some(Box::new(move |known, available| {
-        rc.measure(known, available)
-    }));
+    target.measure = Some(if editable {
+        Box::new(move |known, available| rc.measure_editable(known, available))
+    } else {
+        Box::new(move |known, available| rc.measure(known, available))
+    });
     target.text_measured_size = measured;
 
     let index = node.index() as usize;
@@ -208,7 +232,7 @@ pub(crate) fn install_text_line_for_test(
         content.style.clone(),
     ));
     let key = crate::text::cache::ShapeKey::new(content, 1);
-    let _ = set_text_shaped(tree, node, shaped, key, 1, LogicalSize::ZERO, false);
+    let _ = set_text_shaped(tree, node, shaped, key, 1, LogicalSize::ZERO, false, false);
     set_text_line(tree, node, line, width, 0)
 }
 
@@ -352,13 +376,23 @@ pub(crate) fn text_caret_rect(
     Ok(rect)
 }
 
-fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> LogicalPx {
+pub(crate) fn expected_layout_width(
+    tree: &NodeTree,
+    shaped: &ShapedText,
+    node: NodeId,
+) -> LogicalPx {
     let width = tree.text_content_width(node);
     if width > LogicalPx::ZERO {
         width
     } else {
         shaped.max_content_size().width
     }
+}
+
+pub(crate) fn laid_width(tree: &NodeTree, node: NodeId) -> Option<LogicalPx> {
+    let slot = tree.text_slot(node)?;
+    let width = expected_layout_width(tree, slot.shaped(), node);
+    (slot.laid_width_bits() == width.value().to_bits()).then_some(width)
 }
 
 pub(crate) fn text_byte_index_at(
@@ -968,6 +1002,11 @@ impl TextDirtyQueue {
         if self.seen.insert(node) {
             self.nodes.push(node);
         }
+    }
+
+    #[must_use]
+    pub(crate) fn contains(&self, node: NodeId) -> bool {
+        self.seen.contains(&node)
     }
 
     pub(crate) fn take_into(&mut self, out: &mut Vec<NodeId>) {

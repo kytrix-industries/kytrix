@@ -9,6 +9,7 @@ pub mod node;
 pub mod paint;
 pub mod resources;
 pub mod text;
+pub mod text_edit;
 pub mod window;
 
 #[cfg(feature = "test-support")]
