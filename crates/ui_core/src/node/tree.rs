@@ -71,7 +71,6 @@ impl NodeKind {
     pub(crate) fn is_geometry(&self) -> bool {
         matches!(self, Self::Geometry(_))
     }
-
     #[must_use]
     pub(crate) fn text(&self) -> Option<&TextContent> {
         match self {
@@ -123,6 +122,7 @@ pub struct Node {
     parent: Option<NodeId>,
     children: Vec<NodeId>,
     kind: NodeKind,
+    canvas_generation: u32,
     style: Box<Style>,
     style_patch: Option<Box<StylePatch>>,
     bind_style: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> StylePatch>>,
@@ -185,6 +185,19 @@ impl Node {
     #[must_use]
     pub fn kind(&self) -> &NodeKind {
         &self.kind
+    }
+
+    #[must_use]
+    pub(crate) fn canvas(&self) -> Option<&Arc<Canvas>> {
+        match &self.kind {
+            NodeKind::Canvas(canvas) => Some(canvas),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn canvas_generation(&self) -> u32 {
+        self.canvas_generation
     }
 
     #[must_use]
@@ -321,6 +334,7 @@ pub struct NodeTree {
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
     images_need_refresh: bool,
     image_nodes: Vec<NodeId>,
+    canvas_nodes: Vec<NodeId>,
     dirty_bind: DirtySet,
     dirty_layout: DirtySet,
     dirty_paint: DirtySet,
@@ -800,6 +814,16 @@ impl NodeTree {
     pub(crate) fn text_content(&self, node: NodeId) -> Option<&TextContent> {
         content::text_content(self, node)
     }
+
+    #[must_use]
+    pub(crate) fn canvas(&self, node: NodeId) -> Option<&Arc<Canvas>> {
+        content::canvas(self, node)
+    }
+
+    #[must_use]
+    pub(crate) fn canvas_generation(&self, node: NodeId) -> Option<u32> {
+        self.arena.get(node).map(Node::canvas_generation)
+    }
     pub(crate) fn set_canvas(
         &mut self,
         node: NodeId,
@@ -813,6 +837,10 @@ impl NodeTree {
     }
     pub(crate) fn image_nodes(&self) -> &[NodeId] {
         &self.image_nodes
+    }
+
+    pub(crate) fn canvas_nodes(&self) -> &[NodeId] {
+        &self.canvas_nodes
     }
     pub(crate) fn refresh_image_intrinsics(
         &mut self,
@@ -891,11 +919,11 @@ impl NodeTree {
         node: NodeId,
         shaped: Rc<crate::text::shape::ShapedText>,
         key: crate::text::cache::ShapeKey,
-        scale_epoch: u32,
+        dpi_epoch: u32,
         measured: LogicalSize,
         size_changed: bool,
     ) -> bool {
-        content::set_text_shaped(self, node, shaped, key, scale_epoch, measured, size_changed)
+        content::set_text_shaped(self, node, shaped, key, dpi_epoch, measured, size_changed)
     }
     #[cfg(test)]
     pub(crate) fn install_text_line_for_test(

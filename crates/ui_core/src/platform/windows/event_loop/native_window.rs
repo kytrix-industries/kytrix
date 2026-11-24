@@ -262,7 +262,7 @@ pub(super) fn apply_event(
                 }
             }
             dispatcher.wake();
-            Event::DpiChanged { dpi, scale }
+            Event::DpiChanged { dpi }
         }
         PlatformEvent::Focus(focused) => {
             if !focused {
@@ -342,7 +342,11 @@ mod tests {
             "恢复后的第一帧必须是全量重绘，实际 {outcome:?}"
         );
         let window = app.window(id).expect("window");
-        assert_eq!(window.scale(), windows[0].scale(), "必须重新查询显示器 DPI");
+        assert_eq!(
+            window.device_pixel_ratio(),
+            windows[0].scale(),
+            "必须重新查询显示器 DPI"
+        );
         assert_eq!(
             window.size(),
             windows[0].logical_size(),

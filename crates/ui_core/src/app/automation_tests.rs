@@ -3,7 +3,7 @@ use std::{cell::Cell, rc::Rc};
 use super::App;
 use crate::{
     event::{Action, InputEvent, Modifiers, PointerButton},
-    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::builder::NodeBuilder,
     paint::{
         color::Color,
@@ -20,7 +20,6 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let window = app.create_window(WindowOptions {
         title: "automation".into(),
         size: LogicalSize::new(px(400.0), px(300.0)),
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (runtime, app, window)

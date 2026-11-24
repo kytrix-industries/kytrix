@@ -351,7 +351,7 @@ impl NativeWindow {
             owner: None,
             modal: false,
             modal_registry,
-            scale: options.scale,
+            scale: DevicePixelRatio::ONE,
             logical_size: options.size,
             seen_scale: 1.0,
             seen_frame_rate: 0.0,
@@ -552,7 +552,6 @@ impl NativeWindow {
             }
             events.push(Event::DpiChanged {
                 dpi: dpi::dpi_from_scale(scale),
-                scale,
             });
         }
         let size = self.view.frame().size;

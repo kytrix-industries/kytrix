@@ -1,6 +1,6 @@
 use market_participants_model::decimal::Tick;
 use time::UtcOffset;
-use ui_core::{math::px, paint::color::Color};
+use ui_core::{math::px, paint::color::Color, text::TextContent};
 use widget::test_support::WidgetTestApp;
 
 use super::text::{
@@ -121,29 +121,35 @@ fn a_labelled_value_should_name_the_series_before_the_number() {
 }
 
 #[test]
-fn an_empty_cache_should_hold_nothing_stale() {
-    let mut cache = ChartTextCache::default();
-
-    assert!(!cache.has_stale());
-}
-
-#[test]
-fn a_cache_should_report_a_stale_lease_once_and_then_drop_it() {
+fn a_cache_should_hand_back_the_recipe_it_holds() {
     let mut harness = WidgetTestApp::new();
     let style = label_style(px(10.0), px(14.0), Color::WHITE);
     let mut cache = ChartTextCache::default();
-    harness.with_cx(|cx| cache.line(cx.app_mut(), "12,345", &style));
-    assert!(
-        !cache.has_stale(),
-        "a line shaped for the current atlas is fresh"
-    );
+    let first = harness.with_cx(|cx| cache.content(cx.app_mut(), "12,345", &style));
+    let again = harness.with_cx(|cx| cache.content(cx.app_mut(), "12,345", &style));
+    assert_eq!(first, again, "the same line is one cache entry");
 
-    let stack = harness.app().font_stack().clone();
-    harness.app_mut().set_font_stack(stack);
+    let recoloured = harness.with_cx(|cx| {
+        cache.content(
+            cx.app_mut(),
+            "12,345",
+            &label_style(px(10.0), px(14.0), Color::BLACK),
+        )
+    });
+    assert_ne!(first, recoloured, "another colour is another entry");
+}
 
-    assert!(cache.has_stale(), "a lease the atlas dropped is reported");
-    assert!(
-        !cache.has_stale(),
-        "and the dropped line is not kept to say it again"
-    );
+#[test]
+fn a_cached_width_should_be_the_engine_measurement() {
+    let mut harness = WidgetTestApp::new();
+    let style = label_style(px(10.0), px(14.0), Color::WHITE);
+    let mut cache = ChartTextCache::default();
+    let cached = harness.with_cx(|cx| cache.width(cx.app_mut(), "12,345", &style));
+    let measured = harness.with_cx(|cx| {
+        cx.app_mut()
+            .measure_text(&TextContent::new("12,345", style.clone()), None)
+            .width
+    });
+
+    assert_eq!(cached, measured);
 }

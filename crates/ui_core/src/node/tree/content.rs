@@ -32,6 +32,7 @@ pub(crate) fn set_canvas(
     };
     let fresh = Arc::new(canvas);
     let previous = std::mem::replace(existing, Arc::clone(&fresh));
+    target.canvas_generation = target.canvas_generation.saturating_add(1);
     for geometry in canvas_geometry_ids(&previous) {
         unbind_geometry_node(tree, geometry, node);
     }
@@ -40,6 +41,10 @@ pub(crate) fn set_canvas(
     }
     tree.mark_subtree_paint(node);
     true
+}
+
+pub(crate) fn canvas(tree: &NodeTree, node: NodeId) -> Option<&Arc<crate::paint::canvas::Canvas>> {
+    tree.arena.get(node).and_then(|target| target.canvas())
 }
 
 pub(crate) fn canvas_geometry_ids(
@@ -100,16 +105,7 @@ pub(crate) fn text_layout_dirty_len(tree: &NodeTree) -> usize {
 }
 
 pub(crate) fn mark_canvas_nodes_paint(tree: &mut NodeTree) -> usize {
-    let mut nodes: Vec<NodeId> = Vec::new();
-    tree.for_each_dfs(|node| {
-        if tree
-            .arena
-            .get(node)
-            .is_some_and(|target| matches!(target.kind(), NodeKind::Canvas(_)))
-        {
-            nodes.push(node);
-        }
-    });
+    let nodes: Vec<NodeId> = tree.canvas_nodes().to_vec();
     let marked = nodes.len();
     for node in nodes {
         tree.mark_paint(node);
@@ -150,7 +146,7 @@ pub(crate) fn set_text_shaped(
     node: NodeId,
     shaped: Rc<crate::text::shape::ShapedText>,
     key: crate::text::cache::ShapeKey,
-    scale_epoch: u32,
+    dpi_epoch: u32,
     measured: LogicalSize,
     size_changed: bool,
 ) -> bool {
@@ -171,7 +167,7 @@ pub(crate) fn set_text_shaped(
         Some(slot) => {
             slot.shaped = shaped;
             slot.key = key;
-            slot.scale_epoch = scale_epoch;
+            slot.dpi_epoch = dpi_epoch;
             slot.line = None;
             slot.laid_width_bits = 0;
             slot.laid_generation = 0;
@@ -181,7 +177,7 @@ pub(crate) fn set_text_shaped(
                 *slot = Some(TextSlot {
                     shaped,
                     key,
-                    scale_epoch,
+                    dpi_epoch,
                     line: None,
                     laid_width_bits: 0,
                     laid_generation: 0,
@@ -995,7 +991,7 @@ impl Default for TextDirtyQueue {
 pub(crate) struct TextSlot {
     shaped: Rc<crate::text::shape::ShapedText>,
     key: crate::text::cache::ShapeKey,
-    scale_epoch: u32,
+    dpi_epoch: u32,
     line: Option<Rc<ShapedLine>>,
     laid_width_bits: u32,
     laid_generation: u32,
@@ -1010,8 +1006,8 @@ impl TextSlot {
         self.key
     }
 
-    pub(crate) fn scale_epoch(&self) -> u32 {
-        self.scale_epoch
+    pub(crate) fn dpi_epoch(&self) -> u32 {
+        self.dpi_epoch
     }
 
     pub(crate) fn line(&self) -> Option<&Rc<ShapedLine>> {

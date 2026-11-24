@@ -345,7 +345,7 @@ impl NativeWindow {
                             placed.y0.value(),
                             placed.width().value(),
                             placed.height().value(),
-                            SWP_NOZORDER | SWP_NOACTIVATE,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
                         )
                     }
                     .map_err(|error| window_error("SetWindowPos", error))?;
@@ -359,7 +359,7 @@ impl NativeWindow {
                             0,
                             width,
                             height,
-                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_FRAMECHANGED,
                         )
                     }
                     .map_err(|error| window_error("SetWindowPos", error))?;
@@ -625,17 +625,10 @@ fn another_modal_window_for(owner: HWND, excluded: HWND) -> bool {
 }
 
 fn provisional_window_rect(options: &WindowOptions, dpi: u32) -> (i32, i32, i32, i32) {
-    let client = physical_client(options.size, options.scale);
+    let scale = dpi::scale_from_dpi(dpi).unwrap_or(DevicePixelRatio::ONE);
+    let client = physical_client(options.size, scale);
     let (width, height) = dpi::window_size_for_client(client, dpi, options.decorations);
     let Some(position) = options.position else {
-        return (
-            DEFAULT_WINDOW_ORIGIN.0,
-            DEFAULT_WINDOW_ORIGIN.1,
-            width,
-            height,
-        );
-    };
-    let Some(scale) = dpi::scale_from_dpi(dpi) else {
         return (
             DEFAULT_WINDOW_ORIGIN.0,
             DEFAULT_WINDOW_ORIGIN.1,
@@ -751,7 +744,7 @@ mod tests {
         },
     };
 
-    use super::{NativeWindow, refresh_hz_from_display_frequency};
+    use super::{NativeWindow, provisional_window_rect, refresh_hz_from_display_frequency};
     use crate::{
         app::App,
         event::{Event, ImeEvent},
@@ -850,7 +843,7 @@ mod tests {
 
         let window = app.window(id).expect("window");
         assert_eq!(
-            window.scale(),
+            window.device_pixel_ratio(),
             native.scale(),
             "恢复必须重新查询显示器 DPI 并写回比例"
         );
@@ -1248,6 +1241,22 @@ mod tests {
         png
     }
 
+    #[test]
+    fn provisional_window_rect_uses_the_given_dpi() {
+        let options = WindowOptions {
+            decorations: Decorations::None,
+            size: LogicalSize::new(px(200.0), px(100.0)),
+            ..WindowOptions::default()
+        };
+        let (_, _, width_96, height_96) = provisional_window_rect(&options, 96);
+        let (_, _, width_192, height_192) = provisional_window_rect(&options, 192);
+        assert_eq!((width_96, height_96), (200, 100));
+        assert_eq!(
+            (width_192, height_192),
+            (400, 200),
+            "the provisional client area must follow the passed DPI"
+        );
+    }
     #[test]
     fn a_frameless_window_keeps_the_overlapped_window_style() {
         let options = WindowOptions {

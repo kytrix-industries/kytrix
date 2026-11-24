@@ -62,7 +62,6 @@ impl Fixture {
         let window = app.create_window(WindowOptions {
             title: SmolStr::new_static("image"),
             size: LogicalSize::new(px(400.0), px(300.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let mut fixture = Self { rt, app, window };
@@ -397,7 +396,6 @@ fn closing_a_window_invalidates_images_referencing_released_resources() {
     let owner = fixture.app.create_window(WindowOptions {
         title: SmolStr::new_static("owner"),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let bytes = png(16, 16);
@@ -490,7 +488,7 @@ fn scaled(fixture: &mut Fixture, factor: f32) -> DevicePixelRatio {
         .app
         .window_mut(fixture.window)
         .expect("window")
-        .set_scale(dpr);
+        .set_device_pixel_ratio(dpr);
     dpr
 }
 

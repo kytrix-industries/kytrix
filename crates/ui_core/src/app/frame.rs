@@ -101,6 +101,13 @@ pub(crate) fn frame(
         if let Some(target) = app.windows.get_mut(&window) {
             target.record_a11y_only_frame();
         }
+        if app
+            .windows
+            .get(&window)
+            .is_some_and(|target| target.canvas_text_pending_frames() > 0)
+        {
+            app.request_frame();
+        }
         return Some(Ok(FrameOutcome::Idle));
     }
     let text = match app.refresh_text(window) {
@@ -128,7 +135,7 @@ pub(crate) fn frame(
         }
     };
     app.prepare_image_variants(window);
-    let text_layout = match app.layout_text(window) {
+    let mut text_layout = match app.layout_text(window) {
         Some(Ok(report)) => report,
         Some(Err(error)) => {
             app.abort_frame(window, ticket);
@@ -142,6 +149,46 @@ pub(crate) fn frame(
     app.rewindow_virtuals(window);
     let clamped = app.clamp_scroll_offsets(window);
     if clamped {
+        app.request_frame();
+    }
+    let mut resolution = match app.resolve_canvas_text(window) {
+        Some(Ok(report)) => report,
+        Some(Err(error)) => {
+            app.abort_frame(window, ticket);
+            return Some(Err(error));
+        }
+        None => {
+            app.abort_frame(window, ticket);
+            return None;
+        }
+    };
+    let mut resolve_rounds = 0usize;
+    while resolution.evicted && resolve_rounds < super::text_pass::MAX_LAYOUT_TEXT_PASSES {
+        text_layout = match app.layout_text(window) {
+            Some(Ok(report)) => report,
+            Some(Err(error)) => {
+                app.abort_frame(window, ticket);
+                return Some(Err(error));
+            }
+            None => {
+                app.abort_frame(window, ticket);
+                return None;
+            }
+        };
+        resolution = match app.resolve_canvas_text(window) {
+            Some(Ok(report)) => report,
+            Some(Err(error)) => {
+                app.abort_frame(window, ticket);
+                return Some(Err(error));
+            }
+            None => {
+                app.abort_frame(window, ticket);
+                return None;
+            }
+        };
+        resolve_rounds += 1;
+    }
+    if resolution.evicted || resolution.pending {
         app.request_frame();
     }
     app.upload_atlas_pages();
@@ -213,7 +260,7 @@ pub(crate) fn frame(
         return None;
     };
     let stale_text = core::mem::take(&mut paint.stale_text);
-    let stale_canvas_runs = paint.stale_canvas_runs;
+    let unresolved_canvas_text = paint.unresolved_canvas_text;
     if !paint.skipped_inline_images.is_empty() {
         app.text.push_diagnostics(
             paint
@@ -239,19 +286,20 @@ pub(crate) fn frame(
         }
         app.request_frame();
     }
-    if stale_canvas_runs > 0 {
+    if unresolved_canvas_text > 0 {
         app.text
-            .push_diagnostics(vec![crate::text::TextDiagnostic::CanvasTextStale {
-                runs: stale_canvas_runs,
+            .push_diagnostics(vec![crate::text::TextDiagnostic::CanvasTextUnresolved {
+                recipes: unresolved_canvas_text,
             }]);
-        let generation = app.atlas.generation();
         let follow_up = app
             .windows
             .get_mut(&window)
-            .is_some_and(|target| target.note_stale_canvas_followup(generation));
+            .is_some_and(Window::note_canvas_text_skip);
         if follow_up {
             app.request_frame();
         }
+    } else if let Some(target) = app.windows.get_mut(&window) {
+        target.reset_canvas_text_skip();
     }
     let glyph_extent = app.atlas.page().0;
     let image_pages = app.resources.page_count();
@@ -320,7 +368,7 @@ mod tests {
 
     use crate::{
         app::App,
-        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+        math::{LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         paint::style::{PaintSpec, StylePatch},
         window::{FrameOutcome, WindowOptions},
@@ -338,7 +386,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("frame budget"),
             size: LogicalSize::new(px(400.0), px(300.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("窗口存在").tree().root();

@@ -20,7 +20,7 @@ use network::transport::error::TransportError;
 use smol_str::SmolStr;
 use ui_core::{
     event::{Action, Event, InputEvent, PointerButton, ScrollPhase, ScrollUnit},
-    math::{LogicalPoint, px},
+    math::{DevicePixelRatio, LogicalPoint, px},
     node::builder::NodeBuilder,
     paint::style_builder::StyleBuilder,
     test_support::record::PrimitiveKind,
@@ -982,7 +982,7 @@ fn switching_the_language_should_repaint_the_labels() {
 }
 
 #[test]
-fn a_lease_that_moved_should_repaint_the_labels() {
+fn a_font_stack_change_should_not_rewrite_the_map_canvas() {
     let mut harness = harness();
     let mut pane = pane(&mut harness);
     paint_one_vessel(&mut harness, &mut pane);
@@ -990,30 +990,19 @@ fn a_lease_that_moved_should_repaint_the_labels() {
 
     let stack = harness.app().font_stack().clone();
     harness.app_mut().set_font_stack(stack);
-    frame(&mut harness, &mut pane);
+    harness
+        .with_cx(|cx| cx.request_frame())
+        .expect("the font change asks the platform for a frame");
+    harness.drain();
 
     assert!(
-        !Arc::ptr_eq(&before, &canvas_handle(&harness, &pane)),
-        "a dead atlas lease is a rebuilt canvas, not a steady one"
+        Arc::ptr_eq(&before, &canvas_handle(&harness, &pane)),
+        "the engine re-shapes the recorded text; the map does not rebuild its canvas"
     );
-}
-
-#[test]
-fn a_moved_lease_should_settle_back_into_a_steady_frame() {
-    let mut harness = harness();
-    let mut pane = pane(&mut harness);
-    paint_one_vessel(&mut harness, &mut pane);
-    harness.switch_language(LanguageCode::ZhCn);
-    frame(&mut harness, &mut pane);
-    let at = hull_of(&pane, 1);
-    pointer_move(&mut harness, &mut pane, at);
-    frame(&mut harness, &mut pane);
-    pointer_leave(&mut harness, &mut pane, at);
-    frame(&mut harness, &mut pane);
-
-    let stack = harness.app().font_stack().clone();
-    harness.app_mut().set_font_stack(stack);
-    frame(&mut harness, &mut pane);
+    assert!(
+        glyph_count(&harness, &pane) > 0,
+        "the frame still draws the labels' glyph runs"
+    );
 
     let settled = canvas_handle(&harness, &pane);
     let requests = harness.frame_requests();
@@ -1022,12 +1011,37 @@ fn a_moved_lease_should_settle_back_into_a_steady_frame() {
 
     assert!(
         !harness.rendered(),
-        "the frame after the rebuild draws nothing"
+        "the frame after the re-shape draws nothing"
     );
     assert_eq!(harness.frame_requests(), requests, "and asks for nothing");
     assert!(
         Arc::ptr_eq(&settled, &canvas_handle(&harness, &pane)),
-        "the canvas of the rebuilt frame is the one kept"
+        "the canvas of the re-shaped frame is the one kept"
+    );
+}
+
+#[test]
+fn a_dpi_change_should_not_rewrite_the_map_canvas() {
+    let mut harness = harness();
+    let mut pane = pane(&mut harness);
+    paint_one_vessel(&mut harness, &mut pane);
+    let before = canvas_handle(&harness, &pane);
+
+    let window = harness.window();
+    harness
+        .app_mut()
+        .window_mut(window)
+        .expect("the window exists")
+        .set_device_pixel_ratio(DevicePixelRatio::new(2.0).expect("2x is valid"));
+    harness.drain();
+
+    assert!(
+        Arc::ptr_eq(&before, &canvas_handle(&harness, &pane)),
+        "the engine re-rasterizes the recorded text; the map does not rebuild its canvas"
+    );
+    assert!(
+        glyph_count(&harness, &pane) > 0,
+        "the frame at the new DPR still draws the labels' glyph runs"
     );
 }
 

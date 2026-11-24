@@ -20,7 +20,7 @@ mod tests {
     use crate::{
         app::App,
         event::Event,
-        math::{DevicePixelRatio, LogicalSize, px},
+        math::{LogicalSize, px},
         window::{WindowId, WindowOptions},
     };
 
@@ -32,7 +32,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: "close".into(),
             size: LogicalSize::new(px(320.0), px(240.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         (runtime, app, window)

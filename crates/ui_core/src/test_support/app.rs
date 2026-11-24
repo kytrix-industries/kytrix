@@ -10,7 +10,7 @@ use crate::{
     app::{App, AppHandle},
     error::EngineError,
     event::{Event, InputEvent, InputOutcome, Modifiers},
-    math::{LogicalPoint, dp},
+    math::{DevicePixelRatio, LogicalPoint, dp},
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
@@ -57,6 +57,19 @@ impl TestApp {
             a11y_shadow: ShadowTree::new(),
             a11y_contract_error: None,
             tasks_run: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn with_scale(dpr: DevicePixelRatio) -> Self {
+        let mut app = Self::with_options(WindowOptions::default());
+        app.set_dpr(dpr);
+        app
+    }
+
+    pub fn set_dpr(&mut self, dpr: DevicePixelRatio) {
+        if let Some(window) = self.app.window_mut(self.window) {
+            window.set_device_pixel_ratio(dpr);
         }
     }
 
@@ -412,7 +425,7 @@ impl TestApp {
             .app
             .window(self.window)
             .expect("TestApp's window must exist");
-        let scale = window.scale();
+        let scale = window.device_pixel_ratio();
         let size = window.size();
         let surface = scale.to_covering_device_rect(crate::math::LogicalRect::from_origin_size(
             LogicalPoint::ZERO,
@@ -500,9 +513,11 @@ mod tests {
     #[cfg(all(not(windows), not(target_os = "macos")))]
     use crate::test_support::snapshot::SnapshotError;
     use crate::{
-        math::{DevicePixelRatio, LogicalPoint, LogicalRect, px},
+        event::Event,
+        math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         paint::{
+            canvas::Canvas,
             color::{Color, ColorResolver, LinearPremulRgba},
             style::{PaintSpec, StylePatch},
             style_builder::StyleBuilder,
@@ -512,7 +527,7 @@ mod tests {
             record::{LaneOutcome, PrimitiveKind},
             snapshot::SnapshotCase,
         },
-        text::TextStyle,
+        text::{TextContent, TextStyle},
     };
 
     const RECT: LogicalRect = LogicalRect::from_origin_size(
@@ -716,7 +731,6 @@ mod tests {
         let mut app = TestApp::with_options(crate::window::WindowOptions {
             title: "text pixels".into(),
             size: crate::math::LogicalSize::new(px(200.0), px(60.0)),
-            scale: DevicePixelRatio::ONE,
             ..crate::window::WindowOptions::default()
         });
         let window = app.window_id();
@@ -791,6 +805,107 @@ mod tests {
             px(300.0),
         ));
         assert_eq!(record.damage, vec![expected]);
+    }
+
+    #[test]
+    fn with_scale_injects_the_device_pixel_ratio() {
+        let dpr = DevicePixelRatio::new(2.0).expect("2x is valid");
+        let mut app = TestApp::with_scale(dpr);
+        let window = app.window_id();
+        let _node = mount_painted(&mut app, "panel");
+        let _ = app.drain().expect("首帧");
+
+        let target = app.app().window(window).expect("窗口");
+        assert_eq!(target.device_pixel_ratio(), dpr);
+        assert_eq!(target.physical_surface(), (1600, 1200));
+        let dump = crate::test_support::diagnostics::frame_dump(&app);
+        assert_eq!(dump.scale, 2.0);
+        assert_eq!(
+            dump.viewport,
+            dpr.to_covering_device_rect(LogicalRect::from_origin_size(
+                LogicalPoint::ZERO,
+                LogicalSize::new(px(800.0), px(600.0)),
+            ))
+        );
+        assert!(
+            dump.instances
+                .iter()
+                .any(|instance| instance.bounds == [8.0, 12.0, 80.0, 32.0]),
+            "注入的 DPR 必须把逻辑图元落到物理像素：{:?}",
+            dump.instances
+                .iter()
+                .map(|instance| instance.bounds)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn with_scale_rasterizes_canvas_text_at_the_injected_ratio() {
+        let dpr = DevicePixelRatio::new(2.0).expect("2x is valid");
+        let mut app = TestApp::with_scale(dpr);
+        let window = app.window_id();
+        let bounds = LogicalRect::from_origin_size(
+            LogicalPoint::ZERO,
+            LogicalSize::new(px(120.0), px(40.0)),
+        );
+        let mut canvas = Canvas::new(bounds);
+        assert!(canvas.push_text(
+            TextContent::new("A", TextStyle::new(px(16.0))),
+            LogicalPoint::ZERO,
+        ));
+        let node = {
+            let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
+            let root = tree.root();
+            NodeBuilder::canvas(canvas)
+                .layout_override(bounds)
+                .build(tree, root)
+                .expect("canvas 挂载")
+        };
+        let _ = app.drain().expect("帧");
+        let resolved = app
+            .app()
+            .window(window)
+            .expect("窗口")
+            .canvas_text()
+            .get(&node)
+            .expect("canvas 文本必须已解析");
+        assert_eq!(
+            resolved.lines[0].scale, dpr,
+            "注入的 DPR 必须决定文本光栅变体"
+        );
+    }
+
+    #[test]
+    fn a_dpi_change_repaints_without_relayout_and_the_event_is_diagnostic_only() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let node = mount_painted(&mut app, "panel");
+        let _ = app.drain().expect("首帧");
+        let bounds = app.probe().bounds(node).expect("bounds");
+
+        app.dispatch_event(Event::DpiChanged { dpi: 192 });
+        let _ = app.drain().expect("事件帧");
+        assert_eq!(
+            app.app().window(window).expect("窗口").device_pixel_ratio(),
+            DevicePixelRatio::ONE,
+            "DpiChanged 只是诊断事件，不得改变窗口 DPR"
+        );
+        assert_eq!(app.probe().bounds(node).expect("bounds"), bounds);
+
+        let dpr = DevicePixelRatio::new(2.0).expect("2x is valid");
+        app.set_dpr(dpr);
+        let record = app.drain().expect("DPI 帧").clone();
+        assert!(record.rendered, "DPI 变化必须重绘");
+        assert!(record.damage_full, "DPI 变化必须退化为全帧");
+        assert_eq!(
+            app.app().window(window).expect("窗口").device_pixel_ratio(),
+            dpr
+        );
+        assert_eq!(
+            app.probe().bounds(node).expect("bounds"),
+            bounds,
+            "DPI 变化不得重排布局"
+        );
     }
 
     #[test]
@@ -1420,9 +1535,9 @@ mod p11_tests {
         let mut app = TestApp::with_options(WindowOptions {
             title: SmolStr::new_static("scale"),
             size: crate::math::LogicalSize::new(px(400.0), px(300.0)),
-            scale,
             ..WindowOptions::default()
         });
+        app.set_dpr(scale);
         app.enable_a11y_capture();
         let node = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
@@ -1578,7 +1693,7 @@ mod p11_tests {
         app.app_mut()
             .window_mut(window)
             .expect("window")
-            .set_scale(DevicePixelRatio::new(1.5).expect("scale"));
+            .set_device_pixel_ratio(DevicePixelRatio::new(1.5).expect("scale"));
         let _ = app.drain().expect("second");
         let snap = snapshot(&app);
         assert!(snap.full, "DPI 变化必须整棵重发（bounds 全是物理像素）");
@@ -2343,7 +2458,7 @@ mod p11_fix_tests {
             app.app()
                 .window(window)
                 .expect("window")
-                .scale()
+                .device_pixel_ratio()
                 .to_covering_device_rect(after),
             "a11y bounds 必须覆盖整个逻辑矩形（floor/ceil 外扩）"
         );
@@ -2734,7 +2849,12 @@ mod p11_fix_tests {
                 .text_caret_rect(run, caret_byte)
                 .expect("caret");
             let bounds = app.probe().bounds(run).expect("bounds");
-            let scale = app.app().window(window).expect("window").scale().factor();
+            let scale = app
+                .app()
+                .window(window)
+                .expect("window")
+                .device_pixel_ratio()
+                .factor();
             let expected = (caret.min().x - bounds.origin.x).value() * scale;
             let actual = record.character_positions[position_index];
             assert!(
@@ -2846,7 +2966,12 @@ mod p11_fix_tests {
                 .text_caret_rect(run, caret_byte)
                 .expect("caret");
             let bounds = app.probe().bounds(run).expect("bounds");
-            let scale = app.app().window(window).expect("window").scale().factor();
+            let scale = app
+                .app()
+                .window(window)
+                .expect("window")
+                .device_pixel_ratio()
+                .factor();
             let expected = (caret.min().x - bounds.origin.x).value() * scale;
             let actual = record.character_positions[position_index];
             assert!(
@@ -2904,7 +3029,12 @@ mod p11_fix_tests {
             .text_caret_rect(run, 3)
             .expect("caret");
         let bounds = app.probe().bounds(run).expect("bounds");
-        let scale = app.app().window(window).expect("window").scale().factor();
+        let scale = app
+            .app()
+            .window(window)
+            .expect("window")
+            .device_pixel_ratio()
+            .factor();
         let expected = (caret.min().x - bounds.origin.x).value() * scale;
         assert!(
             (record.character_positions[1] - expected).abs() <= 1.0,
@@ -3077,8 +3207,7 @@ mod p11_fix_tests {
         );
         assert!(
             record.character_positions.is_empty() && record.character_widths.is_empty(),
-            "等长但内容不同的 value 覆盖同样必须省略位置/宽度（旧守卫只比字节总长会漏掉）：\
-             {:?} / {:?}",
+            "等长但内容不同的 value 覆盖同样必须省略位置/宽度（旧守卫只比字节总长会漏掉）：{:?} / {:?}",
             record.character_positions,
             record.character_widths
         );
@@ -3226,7 +3355,7 @@ mod p11_fix_tests {
         app.app_mut()
             .window_mut(window)
             .expect("window")
-            .set_scale(scale);
+            .set_device_pixel_ratio(scale);
         let _ = app.drain_pump().expect("DPI 首笔");
         assert!(
             app.a11y_update().expect("DPI 首笔").tree.is_some(),

@@ -1,8 +1,4 @@
 use core::ops::Range;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
 
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -20,7 +16,6 @@ pub(crate) mod fast_path;
 pub(crate) mod inline_flow;
 pub(crate) mod raster;
 pub(crate) mod shape;
-pub(crate) mod standalone;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum TextAlign {
@@ -748,7 +743,7 @@ pub struct InlineBoxSpec {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ShapedLine {
+pub(crate) struct ShapedLine {
     pub text: SmolStr,
     pub lines: Vec<ShapedTextLine>,
     pub width: LogicalPx,
@@ -779,12 +774,13 @@ impl ShapedLine {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn size(&self) -> LogicalSize {
+    pub(crate) fn size(&self) -> LogicalSize {
         LogicalSize::new(self.width, self.height)
     }
 
-    pub fn glyph_runs(&self) -> impl Iterator<Item = &ShapedGlyphRun> + '_ {
+    pub(crate) fn glyph_runs(&self) -> impl Iterator<Item = &ShapedGlyphRun> + '_ {
         self.lines.iter().flat_map(|line| {
             line.items.iter().filter_map(|item| match item {
                 ShapedTextItem::GlyphRun(run) => Some(run),
@@ -795,7 +791,7 @@ impl ShapedLine {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ShapedTextLine {
+pub(crate) struct ShapedTextLine {
     pub text_range: Range<usize>,
     pub baseline: LogicalPx,
     pub line_height: LogicalPx,
@@ -805,88 +801,29 @@ pub struct ShapedTextLine {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ShapedDecoration {
+pub(crate) struct ShapedDecoration {
     pub rect: LogicalRect,
     pub color: Color,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum ShapedTextItem {
+pub(crate) enum ShapedTextItem {
     GlyphRun(ShapedGlyphRun),
     InlineBox(ShapedInlineBox),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ShapedGlyphRun {
+pub(crate) struct ShapedGlyphRun {
     pub color: Color,
     pub text_range: Range<usize>,
     pub glyphs: Vec<PositionedGlyph>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ShapedInlineBox {
+pub(crate) struct ShapedInlineBox {
     pub id: u64,
     pub rect: LogicalRect,
     pub baseline: Option<LogicalPx>,
-}
-
-#[must_use]
-pub(crate) const fn pack_atlas_lease(generation: u32, eviction_epoch: u32) -> u64 {
-    (generation as u64) << 32 | eviction_epoch as u64
-}
-
-#[derive(Debug)]
-pub struct ShapedTextHandle {
-    line: Arc<ShapedLine>,
-    inline_boxes: Box<[ShapedInlineBox]>,
-    generation: u32,
-    eviction_epoch: u32,
-    scale: DevicePixelRatio,
-    lease: Arc<AtomicU64>,
-}
-
-impl ShapedTextHandle {
-    pub(crate) fn new(
-        line: Arc<ShapedLine>,
-        inline_boxes: Box<[ShapedInlineBox]>,
-        generation: u32,
-        eviction_epoch: u32,
-        scale: DevicePixelRatio,
-        lease: Arc<AtomicU64>,
-    ) -> Self {
-        Self {
-            line,
-            inline_boxes,
-            generation,
-            eviction_epoch,
-            scale,
-            lease,
-        }
-    }
-
-    #[must_use]
-    pub fn line(&self) -> &ShapedLine {
-        &self.line
-    }
-
-    #[must_use]
-    pub fn is_stale(&self) -> bool {
-        self.lease.load(Ordering::Relaxed) != pack_atlas_lease(self.generation, self.eviction_epoch)
-    }
-
-    #[must_use]
-    pub fn size(&self) -> LogicalSize {
-        self.line.size()
-    }
-
-    #[must_use]
-    pub fn scale(&self) -> DevicePixelRatio {
-        self.scale
-    }
-
-    pub(crate) fn inline_boxes(&self) -> &[ShapedInlineBox] {
-        &self.inline_boxes
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -948,8 +885,11 @@ pub enum TextDiagnostic {
     AtlasFull {
         skipped: usize,
     },
-    CanvasTextStale {
-        runs: usize,
+    CanvasTextUnresolved {
+        recipes: usize,
+    },
+    InvalidMeasureWidth {
+        width: LogicalPx,
     },
     InvalidTextRun {
         runs: usize,

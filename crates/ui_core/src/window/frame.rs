@@ -251,7 +251,7 @@ pub(crate) fn submit_gpu(
     index: FrameIndex,
     plan: Plan,
 ) -> Option<crate::render::RenderStats> {
-    let surface = window.physical_surface();
+    let surface = window.surface;
     if let Plan::Partial(rects) = plan {
         for rect in rects.as_slice() {
             debug_assert!(
@@ -444,7 +444,7 @@ mod tests {
     use super::note_reset_epoch;
     use crate::{
         app::App,
-        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+        math::{LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         window::{WindowId, WindowOptions},
     };
@@ -459,7 +459,6 @@ mod tests {
         let window: WindowId = app.create_window(WindowOptions {
             title: SmolStr::new_static("frame-release"),
             size: LogicalSize::new(px(320.0), px(240.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();
@@ -489,7 +488,6 @@ mod tests {
         let window: WindowId = app.create_window(WindowOptions {
             title: SmolStr::new_static("resync"),
             size: LogicalSize::new(px(320.0), px(240.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();
@@ -583,7 +581,6 @@ mod tests {
         let window: WindowId = app.create_window(WindowOptions {
             title: SmolStr::new_static("render-stats"),
             size: LogicalSize::new(px(320.0), px(240.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let view = app.window_mut(window).expect("window");

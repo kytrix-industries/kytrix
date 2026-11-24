@@ -11,7 +11,7 @@ use std::{
 
 use ui_core::{
     app::{App, Application},
-    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+    math::{LogicalRect, LogicalSize, px},
     node::builder::NodeBuilder,
     paint::{
         color::Color,
@@ -224,7 +224,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window = app.create_window(WindowOptions {
         title: smol_str::SmolStr::new_static("kytrix A4 presented_at evidence"),
         size: WINDOW_SIZE,
-        scale: DevicePixelRatio::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
         ..WindowOptions::default()
     });

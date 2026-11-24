@@ -218,7 +218,7 @@ mod tests {
     use crate::{
         a11y::{A11yDiagnostic, A11yOverride, A11yPatch, A11yRole},
         app::App,
-        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+        math::{LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal},
         paint::{
             color::Color,
@@ -249,7 +249,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: SmolStr::new_static("a11y-only-cost"),
             size: LogicalSize::new(px(320.0), px(240.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();

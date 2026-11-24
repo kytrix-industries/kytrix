@@ -605,7 +605,6 @@ impl WaylandState {
             window,
             Event::DpiChanged {
                 dpi: (scale.factor() * 96.0).round() as u32,
-                scale,
             },
         ));
     }

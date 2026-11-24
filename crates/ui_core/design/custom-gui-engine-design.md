@@ -15,7 +15,7 @@
 > 的迁移期表述改为终态事实（旧模块已删、不再需要环境变量、旧依赖已去）。
 > ③ **新增 §14「迁移收口」**：依赖树零 gpui、分层与依赖方向、三端验收方式与结论、验收构建 feature 形状、质量数据、
 > 已知限制与 backlog、证据索引。
-> ④ **E24 落盘**（§4.5 形状缓存键前提 / §11.1 `shape_text` 换色语义）：`ShapeKey` 仍不含 color，但光栅期按**本次**
+> ④ **E24 落盘**（§4.5 形状缓存键前提 / §11.1 canvas 文本换色语义）：`ShapeKey` 仍不含 color，但光栅期按**本次**
 > `style.color` 重写未被 `TextRun` 覆盖的 run（`text/shape.rs::current_run_color`）；同文本换色命中布局缓存、不重复 shape。
 > ⑤ 清理文中「迁移期 / P5 后 / 过渡」等已过时措辞（共 26 处，逐条见 `.docs/gui-migration/design-changes.md` §23）。
 > 本版**不改任何生产代码**：只改本文与 `.docs/gui-migration/**`（文档批 P6-5）。
@@ -373,24 +373,24 @@ pub(crate) use windows as backend;
 
 | 类别 | 可依赖类型 / 入口（深路径省略 `ui_core::`） | 一句话用途 / 边界 |
 |---|---|---|
-| 错误 | `error::EngineError`（顶层 **36** 个变体，§2.9；含 E1–E6 新增的 `TextShapeStandalone` / `InvalidTextScale` / `VirtualListExtents` / `InvalidVirtualExtent` / `UnsupportedWindowCapability` / `WindowIcon`，以及 P3-1b 的 `FrameHookInstalled`） | 所有 `Result` 的错误类型；应用按变体分类处理（`StaleNode` 同时覆盖「不能作为文本命中目标」，§11.5），禁止字符串错误穿透 |
-| 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation, Decorations}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**三端可见**：E6 已移除 `cfg(target_os = "linux")`）、`window::ImeContentType`、`App::{on_frame, create_window, window, window_mut, frame, set_drag_regions, request_node_repaint, take_resource_results, handle, runtime_handle, close_window, set_title, request_window_control, set_traffic_light_position, traffic_light_inset, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override, unload_resource, modal_scope, set_a11y_patch, after, after_scoped, cancel_timer, on_animation_complete}`、`Window::{state, text_byte_index_at, text_caret_rect, set_drag_regions, set_canvas, scene, set_image_resource, scale_epoch}` | 启动、建窗、帧驱动、窗口 chrome（E6：装饰 / 标题 / 系统按钮 / 交通灯 / 状态回报）；**E7**：`unload_resource` / `set_image_resource` / `scale_epoch`（图片生命周期与 DPI 世代）；**E10**：`after` / `after_scoped` / `cancel_timer` / `on_animation_complete`（一次性定时器与动画完成）；**E12**：`modal_scope`（模态作用域根）；**E15**：`set_a11y_patch`（a11y 增量写）。`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
+| 错误 | `error::EngineError`（顶层强类型变体，§2.9；含 E1–E6 新增的 `VirtualListExtents` / `InvalidVirtualExtent` / `UnsupportedWindowCapability` / `WindowIcon`，以及 P3-1b 的 `FrameHookInstalled`；E 阶段删除 `TextShapeStandalone` / `InvalidTextScale`） | 所有 `Result` 的错误类型；应用按变体分类处理（`StaleNode` 同时覆盖「不能作为文本命中目标」，§11.5），禁止字符串错误穿透 |
+| 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation, Decorations}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**三端可见**：E6 已移除 `cfg(target_os = "linux")`）、`window::ImeContentType`、`App::{on_frame, create_window, window, window_mut, frame, set_drag_regions, request_node_repaint, take_resource_results, handle, runtime_handle, close_window, set_title, request_window_control, set_traffic_light_position, traffic_light_inset, measure_text, unload_resource, modal_scope, set_a11y_patch, after, after_scoped, cancel_timer, on_animation_complete}`、`Window::{state, text_byte_index_at, text_caret_rect, set_drag_regions, set_canvas, scene, set_image_resource}` | 启动、建窗、帧驱动、窗口 chrome（E6：装饰 / 标题 / 系统按钮 / 交通灯 / 状态回报）；**E7**：`unload_resource` / `set_image_resource`（图片生命周期；DPI 世代是引擎内部状态）；**E10**：`after` / `after_scoped` / `cancel_timer` / `on_animation_complete`（一次性定时器与动画完成）；**E12**：`modal_scope`（模态作用域根）；**E15**：`set_a11y_patch`（a11y 增量写）。`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
 | 节点 | `node::id::NodeId`、`node::builder::NodeBuilder`、`node::tree::{NodeTree, Node, NodeKind, LayoutBox}`、`node::image::{ImageFit, ImageSource, ImageContent}`、`node::dirty::DirtyFlags`、`NodeTree::{new, root, get, append_child, remove, set_style, set_layout_override, invalidate_measure, hit_test, text_selection_rects, text_caret_rect, len, is_empty, debug_id}`、`NodeBuilder::{image, image_pending, image_modulation}`、`Window::{tree, tree_mut}` | 建树与增删子节点（`NodeTree::{append_child, remove}`）；**E7 图片节点**：`NodeKind::Image(Box<ImageContent>)`（叶子）、`ImageFit::{Fill, Contain, Cover}`、`ImageSource::{Ready, Pending}`、`NodeBuilder::{image, image_pending, image_modulation}`（§11.9）。**没有 `NodeHandle` / `Children` / 声明式子节点 `Slot`**（`node::id::Slot<T>` 是私有 arena 槽，且 workspace lint 禁止半公开）。`NodeTree::{text_byte_index_at, text_line, set_image_resource}` 是 `pub(crate)`，公开入口只有 `Window::*`（§11.5 / §11.9） |
 | 状态 | `node::signal::{Signal, SignalId, Derived, Transient, SignalScope}`、`node::dependency::ReadCtx`、`App::{signal, signal_scope, signal_scoped, window_signal, release_scope, transient, transient_scoped, derived, batch, write, write_with, update, update_with, read, read_with, write_transient, read_transient}` | 状态写入与依赖追踪。`read` 返回 `SignalRef<T>` 读守卫（守卫存活期写同一信号 **panic**）。**E8**：`transient_scoped(scope: SignalScope, initial)` 把瞬态值绑定到作用域，`release_scope` 返回**值槽位数**（信号 + 瞬态值）并在同批取消引用该瞬态值的动画槽（§11.10）。**没有 `TaskHandle`**：异步回投是 `AppHandle::{send, spawn}`；资源解码结果经 `App::take_resource_results()` 取回 |
 | 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Shadows, MAX_SHADOWS, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{Rect, Size, Point, Transform, Scale, Edges, PhysicalRect}`、`NodeBuilder::{boxed, text, canvas, geometry, style, paint, bind_style, bind_text, bind_a11y, a11y, measure, hit_shape, layout_override, focus_ring, tab_stop, id, inline_boxes, runs, on_click, on_action, on_drag, build}` | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值）。`NodeBuilder::runs` 是多 run 覆盖样式的挂载入口（E2，§11.2）。**E13**：`StylePatch.opacity` 是**组不透明度**（自身 × 祖先链，§11.14）、`PaintSpec.shadows: Shadows`（`MAX_SHADOWS = 4`，数组序 = 绘制序）、`ShadowSpec{offset, blur, spread, color}`（§11.14） |
-| 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`（`GeometryDraw` 含 E4 的 `range: Range<u32>` 与 `GeometryDraw::full`）、`paint::canvas::Canvas`（含 E1 的 `push_shaped_text`）、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}`（`AtlasTile` 含 E1d 的 CPU 侧 `slot` / `slot_epoch`）、`Window::set_canvas` | 自绘（`Canvas` 只装引擎 8 类图元，§5.9；canvas 文本走 `App::shape_text` + `Canvas::push_shaped_text`，§11.1）、注册静态几何与子区间绘制（§5.5 / §11.4）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`**；`AtlasAllocator::is_alive` 是 `pub(crate)`，不进公开面 |
-| 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ShapedLine, ShapedTextHandle, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ShapedDecoration, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`；`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}` | 文本组件。**`ShapedLine` 类型公开但节点文本路径的应用拿不到实例**（`NodeTree::text_line` 是 `pub(crate)`）；无节点归属的 shaping 用 `App::shape_text` 拿 `ShapedTextHandle`（E1），富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
+| 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`（`GeometryDraw` 含 E4 的 `range: Range<u32>` 与 `GeometryDraw::full`）、`paint::canvas::{Canvas, CanvasText}`（E 阶段：canvas 文本配方）、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}`（`AtlasTile` 含 E1d 的 CPU 侧 `slot` / `slot_epoch`）、`Window::set_canvas` | 自绘（`Canvas` 只装引擎图元，§5.9；canvas 文本走 `Canvas::push_text(TextContent, origin)`，§11.1）、注册静态几何与子区间绘制（§5.5 / §11.4）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`** |
+| 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, measure_text}`；`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}` | 文本组件。**shaping 快照（`ShapedLine` 等）全部 `pub(crate)`**（`NodeTree::text_line` 是 `pub(crate)`；应用不持有租约）；无节点归属的文本走 `Canvas::push_text(TextContent, origin)`、尺寸用 `App::measure_text`（§11.1）；富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
 | 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, ImageResourceKind, ImageDiagnostic, DecodeState, DecodeCause, ResourceStats, PendingResource}`、`App::{resources, image_diagnostics, prepare_image_variant, take_resource_results, unload_resource, insert_bitmap_for_window, insert_svg_for_window, insert_bitmap_async_for_window, insert_svg_async_for_window}`、`Window::set_image_resource` | 图标 / 图片 / 远程头像。资源只描述“源 + 内在尺寸”：位图登记原生物理像素并自带 1/2、1/4 LOD，SVG 登记内在逻辑尺寸；栅格目标由引擎按绘制盒 × DPR 接管（`ResourceImage::variant_for(cache, target)`）。`ResourceCache` 的写入口（insert / unload / release_window）全部 `pub(crate)`，应用只能走 `App` 资源 API。`ResourceImage.tile` 已删除；Canvas / 行内图片用 `App::prepare_image_variant` 取目标变体。**E7 生命周期**：`insert_*_async` 产出 `PendingResource`，`poll()` 的结果交给 `App` 后，**挂载了 Pending 图片的节点自动转 Ready**（无需应用插手）；`App::unload_resource` 是唯一的公开卸载入口（遍历全部窗口置脏，R-19 已消除） |
 | 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, ItemAlign, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`、`app::{AnimationCompletion, AnimationEndKind, TimerId}`、`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, set_virtual_extents, scroll_to_item, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running, after, after_scoped, cancel_timer, on_animation_complete, modal_scope}` | 通用交互机制。`VirtualListConfig { extent, extents, overscan }`：`extents = None` 等高行、`Some(..)` 逐项高度（E3 已实现，§11.3；`VirtualListConfig` 因 `Box<[f32]>` **不再是 `Copy`**）。**E10**：`after` / `after_scoped` / `cancel_timer` / `on_animation_complete`（**单槽**，kit 层 `AnimationRouter` 是唯一注册者，§11.12）；**E12**：`OverlayOptions{.., trap_focus, a11y: A11yOverride}`（新增 `a11y` 字段 ⇒ `OverlayOptions` **不再是 `Copy`**）、`App::modal_scope`。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
 | 事件 | `event::{Event, InputEvent, InputOutcome, Action, ActionSource, KeyBinding, Key, KeyCode, Modifiers, PointerButton, ImeEvent}`、`layout::hit_test::HitResult`、`App::{drain_events, drain_events_where, on_action, off_action, bind_key, unbind_key, bind_key_scoped, unbind_key_scoped, unbind_scope_keys, has_action_handler, scoped_key_binding_count, dispatch_action, dispatch_action_focused}` | 事件处理与快捷键。`Action` 是 `{ FocusNext, FocusPrev, Dismiss, Custom(SmolStr) }`：**应用动作只能是字符串 key**（没有强类型变体表）；「怎么触发」在 `ActionSource`。**E8**：`bind_key_scoped(window, scope: NodeId, binding) -> Result<(), EngineError>`（破坏性变更：旧签名返回 `()`）、`unbind_key_scoped`、`unbind_scope_keys`；作用域键绑定按焦点祖先链**内→外**求值，无 handler 不吞键（§11.10）。`has_action_handler` / `scoped_key_binding_count` 是 `test-support` 只读观测面。**E21**：`App::drain_events_where(keep: impl FnMut(WindowId, &Event) -> bool) -> Vec<(WindowId, Event)>` 只取走 `keep` 认可的事件，其余**留在队列**（原顺序、丢弃计数不变）——给只拥有「自己窗口的文本 / 按键 / IME」的消费者（对话框输入框），其余事件由组合根的 `drain_events` 照常读到（§13.11、`spec-deltas/E21.md`） |
 | 无障碍 | `a11y::{A11yRole, A11yOrientation, A11yNode, A11yLabel, A11yAction, A11yOverride, A11yPatch, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yTreeSnapshot, A11yLive, A11ySort}`、`NodeBuilder::{a11y, bind_a11y}`、`App::{on_a11y_action, off_a11y_action, a11y_diagnostics, set_a11y_patch, modal_scope}` | 自定义组件声明语义。`a11y` 接受**整值** `A11yOverride`（不是 `(role, label 闭包)`）。**E15**：`A11yRole` 共 **43** 个变体（`A11yRole::ALL: [Self; 43]`，§11.15），`A11yOrientation::{Horizontal, Vertical}`；`App::set_a11y_patch(window, node, A11yPatch)` 是运行期 a11y 增量的公开写入口（内部 `request_frame`，§11.15） |
-| 测试（`test-support` feature） | `test_support::app::{TestApp, TestWindow}`、`test_support::probe::{Probe, Selector}`、`test_support::record::{FrameRecord, RenderedFrame, QuadRecord, PrimitiveRecord, PrimitiveKind, PaintLog, LanePaintEntry, LaneOutcome, DeltaRecord, FrameStats}`、`test_support::script::{FrameScript, ScriptFrame, FrameSample, ScriptReport, A11yCapture, A11yDelivery}`、`test_support::snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme, SnapshotImage, SnapshotDiff, SnapshotError, GoldenError, Tolerance, PixelBounds}`、`test_support::{a11y, acceptance, gui_smoke, pixels, diagnostics}`、**`test_support::diagnostics::{SignalSlotStats, signal_slot_stats}`（E21）** | 布局与图形测试（§6.2–§6.5）。**没有 `TestApp::mount`、没有 `TestApp::new(renderer: None)`、没有 `Probe::a11y()`，`Selector` 只有 `Id` / `Text` / `Path`（无 `Role`）**。E1–E6 新增观测面：`FrameRecord.stale_canvas_runs`、`Window::inline_box_image_diagnostics()`、`App::frame_requests()`（§6.3 / §6.8）。**E21**：`signal_slot_stats(app) -> SignalSlotStats { slots, live, free }` 是值槽位表的分配统计——槽位在作用域释放时归还空闲栈并被下次分配复用，因此「反复开关一个面板后 `slots` / `live` 不增长」可断言（泄漏面：根作用域信号永不回收，P3-0b F1）；只在 `feature = "test-support"` 下存在 |
+| 测试（`test-support` feature） | `test_support::app::{TestApp, TestWindow}`、`test_support::probe::{Probe, Selector}`、`test_support::record::{FrameRecord, RenderedFrame, QuadRecord, PrimitiveRecord, PrimitiveKind, PaintLog, LanePaintEntry, LaneOutcome, DeltaRecord, FrameStats}`、`test_support::script::{FrameScript, ScriptFrame, FrameSample, ScriptReport, A11yCapture, A11yDelivery}`、`test_support::snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme, SnapshotImage, SnapshotDiff, SnapshotError, GoldenError, Tolerance, PixelBounds}`、`test_support::{a11y, acceptance, gui_smoke, pixels, diagnostics}`、**`test_support::diagnostics::{SignalSlotStats, signal_slot_stats}`（E21）** | 布局与图形测试（§6.2–§6.5）。**没有 `TestApp::mount`、没有 `TestApp::new(renderer: None)`、没有 `Probe::a11y()`，`Selector` 只有 `Id` / `Text` / `Path`（无 `Role`）**。E1–E6 新增观测面：`Window::inline_box_image_diagnostics()`、`App::frame_requests()`（§6.3 / §6.8）。**E21**：`signal_slot_stats(app) -> SignalSlotStats { slots, live, free }` 是值槽位表的分配统计——槽位在作用域释放时归还空闲栈并被下次分配复用，因此「反复开关一个面板后 `slots` / `live` 不增长」可断言（泄漏面：根作用域信号永不回收，P3-0b F1）；只在 `feature = "test-support"` 下存在 |
 
 **E1–E6 已实现的公开面（P1 完成；均可依赖）**：
 
 | 扩展 | 新增公开面 | 章节 |
 |---|---|---|
-| E1 | `text::ShapedTextHandle`（无公开构造器；`ShapedInlineBox` 经 `App::shaped_inline_boxes` 读取）、`App::{shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`、`ShapedTextHandle::{line, is_stale, size, scale}`、`Canvas::push_shaped_text`、`AtlasTile::{slot, slot_epoch}`（CPU 侧数据字段） | §11.1 |
+| E1 | `paint::canvas::{Canvas, CanvasText}`、`Canvas::push_text`、`Primitive::Text`（CPU 侧中间图元）、`App::measure_text`、`AtlasTile::{slot, slot_epoch}`（CPU 侧数据字段） | §11.1 |
 | E2 | `text::{TextRun, TextDecoration, InlineBoxPaint}`、`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}`、`InlineBoxSpec.paint`、`NodeBuilder::runs`、`TextDiagnostic::{InvalidTextRun, TextRunClipped, InlineBoxImageMissing}` | §11.2 |
 | E3 | `VirtualListConfig.extents`、`ItemAlign`、`App::{set_virtual_extents, scroll_to_item}`、`EngineError::{VirtualListExtents, InvalidVirtualExtent}` | §11.3 |
 | E4 | `GeometryDraw.range`、`GeometryDraw::full` | §11.4 |
@@ -401,7 +401,7 @@ pub(crate) use windows as backend;
 
 | 扩展 | 新增 / 变更公开面 | 章节 |
 |---|---|---|
-| E7 | `node::image::{ImageFit, ImageSource, ImageContent}`、`NodeKind::Image`、`NodeBuilder::{image, image_pending, image_modulation}`、`Window::{set_image_resource, scale_epoch}`、`App::unload_resource`、`A11yRole::Image`、`A11yDiagnostic::MissingAltText{kind: Image}`、test-support `PrimitiveRecord::{image_modulation, image_uv}` | §11.9 |
+| E7 | `node::image::{ImageFit, ImageSource, ImageContent}`、`NodeKind::Image`、`NodeBuilder::{image, image_pending, image_modulation}`、`Window::set_image_resource`、`App::unload_resource`、`A11yRole::Image`、`A11yDiagnostic::MissingAltText{kind: Image}`、test-support `PrimitiveRecord::{image_modulation, image_uv}` | §11.9 |
 | E8 | `App::{bind_key_scoped, unbind_key_scoped, unbind_scope_keys, transient_scoped}`（`bind_key_scoped` 改为返回 `Result`）、test-support `App::{has_action_handler, scoped_key_binding_count}`、`InputOutcome::action` | §11.10 |
 | E9 / E9c | `A11yRole::{Tree, TreeItem}`（32→34）、`A11yNode::{children, parent}` 语义改为 a11y 逻辑父子、`A11yPatch::{row_index, row_count, column_index, column_count, pos_in_set, size_of_set}` 集合字段生效 | §11.11 |
 | E10 / E10c | `app::{AnimationCompletion, AnimationEndKind, TimerId}`、`App::{on_animation_complete, after, after_scoped, cancel_timer}`、`TimerId::window` | §11.12 |
@@ -409,7 +409,7 @@ pub(crate) use windows as backend;
 | E13 | `paint::style::{Shadows, MAX_SHADOWS, ShadowSpec.spread}`、`PaintSpec.shadows`（替换 `shadow`）、`StylePatch.opacity` 组语义、`Node.paint_opacity`（**不是**公开面，内部戳） | §11.14 |
 | E15 | `A11yRole::{ComboBox, ListBox, MenuItemCheckBox, MenuItemRadio, ColorWell}`（38→43）、`a11y::A11yOrientation`、`A11yPatch.orientation`、`App::set_a11y_patch` | §11.15 |
 
-**E2b 候选（未实现，仅登记，不得依赖）**：Canvas / standalone shaping 不绘制装饰与行内盒；节点文本路径的 InlineBox 命中只读访问面（`App::shaped_inline_boxes` 只覆盖 standalone handle）。详见 §11.2。
+**E2b 候选（未实现，仅登记，不得依赖）**：Canvas 配方只编码字形 run，不绘制装饰与行内盒（行内盒落点只对节点文本路径可读）。详见 §11.2。
 
 **明确留在应用层**：`ui_kit` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、**55** 个 Phosphor SVG + 7 品牌 PNG + 23
 预览图 + WAV、`IconKind → path` 映射、全部 widget 业务与几何、i18n、widget 注册表，以及 **D24 的薄 `StyleBuilder`**。
@@ -1240,7 +1240,7 @@ line_break / font_variations / decoration；**不含 color / alignment**）+ **�
 **不含 inline box 的 `paint`**（绘制方式在 paint 期从内容声明解析，不是 shaping 输入）。宽度变化**不重建 `Layout`**，只重跑
 `break_all_lines` + `align` —— 直接支撑 §3.4 的「文本变化但尺寸不变只 `PAINT`」。
 
-`App::shape_text` 的 standalone shaping 复用同一份 `ShapeKey` 与缓存；其**光栅 scale** 取 `App::text_scale()`（§11.1），scale 只进光栅
+Canvas 文本配方的 shaping 复用同一份 `ShapeKey` 与缓存；其**光栅 scale** 取窗口 DPR（§11.1），scale 只进光栅
 （`GlyphKey` 的量化 ppem），不进缓存键；节点文本的光栅 scale 取窗口 `Scale`。bidi / 字素簇边界由 parley 决定，引擎不假设单 run 或 LTR
 （文本命中语义见 §11.5）。
 
@@ -1668,36 +1668,40 @@ scroll hint，其余平台走全帧拷贝。
 
 ```rust
 // paint/canvas.rs —— 值语义：应用构造 → 交给节点（NodeBuilder::canvas / Window::set_canvas）
-pub struct Canvas { /* bounds: Rect（逻辑像素 AABB）+ 私有 Lane */ }
+pub struct Canvas { /* bounds: Rect<LogicalPx>（逻辑像素 AABB）+ 私有 Lane */ }
 impl Canvas {
-    pub fn new(bounds: Rect) -> Self;
+    pub fn new(bounds: Rect<LogicalPx>) -> Self;
     pub fn push_quad(&mut self, quad: Quad);
-    pub fn push_text(&mut self, run: GlyphRun);      // 应用**不应**自造 GlyphRun（AtlasTile 只能由图集分配器产出）
-    /// E1：应用画文本的唯一合法入口；`origin` 是文本盒左上角的绝对窗口逻辑像素。
-    /// 句柄失效（图集换代 / 逐 tile 淘汰）⇒ 返回 false 且**不产生任何图元**（不画旧 UV）。
-    pub fn push_shaped_text(&mut self, handle: &ShapedTextHandle, origin: Point) -> bool;
+    /// E1：应用画文本的唯一合法入口。只记录逻辑配方（TextContent + 文本盒左上角的绝对窗口逻辑像素 origin）；
+    /// 字形 shaping / 光栅化 / tile 生命周期全归引擎，应用不持有句柄、不需要在 DPI 变化后重建。
+    /// 空文本不产生配方并返回 false；其余情况返回 true。
+    pub fn push_text(&mut self, content: TextContent, origin: Point<LogicalPx>) -> bool;
     pub fn push_image(&mut self, image: Image);
     pub fn push_path(&mut self, path: Path);
     pub fn push_shadow(&mut self, shadow: Shadow);
     pub fn push_geometry(&mut self, draw: GeometryDraw);
     pub fn push_clip(&mut self, clip: ClipRect) -> bool;   // 圆角层预算制，超预算返回 false
     pub fn pop_clip(&mut self) -> bool;
-    pub fn bounds(&self) -> Rect;
+    pub fn bounds(&self) -> Rect<LogicalPx>;
     pub fn primitives(&self) -> &[Primitive];
     pub fn is_empty(&self) -> bool;
+}
+
+pub struct CanvasText {
+    pub content: TextContent,
+    pub origin: Point<LogicalPx>,
 }
 ```
 
 **能力边界（实现事实）**：
 
-- **只能装引擎 8 类图元**（`Quad` / `GlyphRun` / `Image` / `Path` / `Shadow` / `Clip` / `Geometry` + 嵌套 `Canvas` 由引擎从
+- **只能装引擎 9 类图元**（`Quad` / `GlyphRun` / `Text` / `Image` / `Path` / `Shadow` / `Clip` / `Geometry` + 嵌套 `Canvas` 由引擎从
   Canvas 节点生成，**没有 `push_canvas`**）。应用可构造 **6 类**：`Quad` / `Image` / `Path` / `Shadow` / `Clip` / `Geometry`；
-  `GlyphRun` 需要 `AtlasTile`（图集分配器的产物），应用**不构造**裸 `GlyphRun` —— canvas 内文本由 E1 的
-  `App::shape_text` + `Canvas::push_shaped_text` 提供（§11.1，已实现）：应用持有 `ShapedTextHandle`，在句柄失效
-  （`is_stale()`）后重新 shape 并重建 Canvas。
+  `GlyphRun` 需要 `AtlasTile`（图集分配器的产物）、`Text` 是引擎内部配方图元 —— 应用通过 `Canvas::push_text(TextContent, origin)`
+  记录配方，paint 期由引擎替换成 `Primitive::GlyphRun`，应用**看不到也拿不到**字形 tile。
 - **canvas 文本的坐标与 bounds 契约**：`origin` 是文本盒左上角的**绝对窗口逻辑像素**（与 Canvas 内其它图元同域）；
-  `origin + handle.size()` **必须落在 `Canvas::bounds` 内**（damage / 命中只看 `Canvas::bounds`，引擎**不会**自动 union —— 
-  F10 的 P3 建议）。多行文本的所有行一起偏移。
+  `origin + 逻辑测量尺寸` **必须落在 `Canvas::bounds` 内**（damage / 命中只看 `Canvas::bounds`，引擎**不会**自动 union ——
+  F10 的 P3 建议）。应用需要文本尺寸时用 `App::measure_text(&TextContent, max_width) -> Size<LogicalPx>`（逻辑像素、无 DPR）。
 - **坐标系**：`Canvas.bounds` 是逻辑像素 AABB 契约（**必须 ⊇ 内部图元 bounds 并集**，damage / 命中只用它）；内部图元的坐标是
   **绝对窗口逻辑像素**（不是节点相对）—— 应用自绘时必须自己把内容平移到节点在窗口中的位置（I11）。
 - **clip**：`push_clip` / `pop_clip` 是**圆角层预算制**（`MAX_CLIP_DEPTH = 8`，四角半径非全 0 才占一层；直角 clip 不占预算），
@@ -1705,19 +1709,19 @@ impl Canvas {
 - **挂载与更新**：`NodeBuilder::canvas(Canvas)` 在建树时吃一个**值**；每帧替换走
   `Window::set_canvas(&mut self, node: NodeId, canvas: Canvas) -> Result<bool, EngineError>`——官方路径是
   在 `App::on_frame` 钩子里「读上一帧 `Node::layout().bounds` → 重建 Canvas → `set_canvas`」（本帧稍后重建 lane，不额外请求帧）。
-- **编码期安全网（E1b + E1d）**：`push_shaped_text` 只在 push 时校验句柄租约；push 之后同帧发生的图集换代（扩容 / 清空 /
-  换字体栈）**或逐 tile LRU 淘汰**（不换代）会让已写入的 `AtlasTile` 变成旧 UV。paint 在编码 `Primitive::Canvas` 前调用
-  crate 私有的 `Canvas::without_stale_glyph_runs(&AtlasAllocator)`：逐 tile 用 `AtlasAllocator::is_alive`（代际 + 槽位分配身份
-  `(slot, slot_epoch)`，O(1)）判活，**任一 tile 失效的 run 整段丢弃**（少字优于花字，与节点文本 D-5 同口径），其余图元（含 clip
-  括号）顺序不变；丢弃数进 `PaintReport::stale_canvas_runs` → `FrameRecord::stale_canvas_runs` → `TextDiagnostic::CanvasTextStale
-  { runs }`。**能力边界（应用义务）**：Canvas 内容归应用所有，引擎无法重建 —— 止损后该 Canvas 会持续少字，直到应用在句柄
-  `is_stale()` 后重新 shape 并重建 Canvas；图集因容量压力逐 tile 淘汰时同样适用。
-- **有界补帧**：编码期丢弃失效 run 后，引擎按 `(window, atlas generation)` **至多补一帧**（`Window::note_stale_canvas_followup`），
-  给应用执行重建义务的窗口；应用忽略义务也不会造成 I3 空转（同代际不重复请求）。
-- **Canvas 的 damage 粒度**：`Canvas` 的 damage 取 `Canvas::bounds`；Canvas 内 `GeometryDraw.range` 变化时 damage = 旧画布 AABB ∪
+- **文本解析归引擎（E1，已实现）**：`Window::canvas_text` 按 canvas 节点缓存 `ResolvedCanvasText { key, lines, pending }`，
+  `key` 含 canvas generation / 窗口 DPR bits / atlas generation / 字形淘汰纪元。`App::frame` 在 `layout_text` 之后、
+  `upload_atlas_pages` 之前跑 `resolve_canvas_text(window)`：对每个 `Primitive::Text` 配方走 shaping 缓存（键不含 DPR）+ 按窗口
+  DPR 光栅化；DPI 变化只让 key 失配并重光栅，**`Arc<Canvas>` 不变、应用无失效判据**。paint 只做「配方 → `GlyphRun`」替换；
+  解析缺失（有界重试后仍无结果）时跳过该 canvas 并记 `PaintReport::unresolved_canvas_text` →
+`TextDiagnostic::CanvasTextUnresolved { recipes }`（诊断去重，不静默）：解析缺失 / tile 失活时只跳过该文本配方（其余 primitives 照发），按窗口有界补帧，绝不画 stale UV。
+- **无编码期安全网**：`Canvas::without_stale_glyph_runs` / `PaintReport::stale_canvas_runs` / `Window::note_stale_canvas_followup` /
+  `TextDiagnostic::CanvasTextStale` / `ShapedTextHandle` 租约全部删除 —— 应用不再持有 tile，引擎在同一帧内先解析、后上传、再 paint，
+  不存在「应用编码了旧 UV」的路径。
+- **`Canvas` 的 damage 粒度**：`Canvas` 的 damage 取 `Canvas::bounds`；Canvas 内 `GeometryDraw.range` 变化时 damage = 旧画布 AABB ∪
   新画布 AABB（画布粒度，§5.5 的 E4 例外）。
-- `StylePatch::opacity` **不作用于 Canvas 内容**（应用自己生成的颜色引擎不解析）；组不透明度需要离屏 layer，不在本设计范围；应用应改用逐图元 `opacity`。
-
+- `StylePatch::opacity` **不作用于 Canvas 内容**（应用自己生成的颜色引擎不解析；canvas 文本按自身 `TextStyle.color` 着色）；组不透明度
+  需要离屏 layer，不在本设计范围；应用应改用逐图元 `opacity`。
 **明确不做**（v2.1 起删除旧承诺，理由按强度排序）：
 
 | 不做 | 理由 |
@@ -1870,7 +1874,6 @@ pub struct FrameRecord {
     pub skipped_by_budget: u64,         // 被帧预算推迟的次数
     pub paint_log: PaintLog,            // 每条 lane 的 Rebuilt / Reused
     pub presented_latency: Option<Duration>,
-    pub stale_canvas_runs: usize,       // 本帧编码期丢弃的 Canvas 内失效字形 run 数（E1d；0 = 正常）
     pub a11y_only: bool,                 // 本帧是否是 a11y-only 帧（无像素工作）
     pub a11y: Option<A11yTreeSnapshot>,  // 本帧的一笔 a11y 交付（捕获未开 = None）
 }
@@ -1887,7 +1890,7 @@ pub struct RenderedFrame {
 **画了什么**（quad / path / clip 括号 / 文本 run / 几何）从 `RenderedFrame.canvases` 下钻：每个 `CanvasRecord` 的
 `canvas` 就是 paint 交给编码器的那个 `Arc<Canvas>`（逐 tile 编码期安全网过滤后的值），`canvas.primitives()` 是应用写入的
 图元序列，两帧 `Arc::ptr_eq` 为真 ⟺ 画布没被重写。这是 widget 测试的 canvas 读点（§13.2 的
-`WidgetTestApp::{canvas_primitives, canvas_handle}`），只存在于 `test-support`，不影响生产帧记录；`FrameRecord.stale_canvas_runs`
+`WidgetTestApp::{canvas_primitives, canvas_handle}`），只存在于 `test-support`，不影响生产帧记录；Canvas 内容经 `canvas_primitives` 展开断言
 仍是编码期安全网丢弃的失效 run 数（§11.1），无失效 run 时为 0。
 
 **断言示例**：
@@ -2009,10 +2012,7 @@ state、颜色空间标记与插值空间 —— **零容差**，可在 CPU 侧�
 | 无（新增） | `SnapshotCase` + `SnapshotScene` / `SnapshotTheme` + `Tolerance` + golden | L3 | 14 case × 3 设备 = 42 张 golden；**不含文字像素** |
 | 无（新增） | `criterion` bench：`perf` / `layout_postpass` | L4 | 非闸门 |
 
-**P1（E1–E6）新增的 L2 观测面**（用于断言；不改变上面的迁移量口径）：`FrameRecord.stale_canvas_runs`（Canvas 编码期丢弃的
-失效字形 run 数，0 = 正常；`test-support` 类型）、`Window::inline_box_image_diagnostics()`（`Window::frame` 路径跳过的行内图片，
-最近一帧快照、每帧重建不增长）、`App::frame_requests()`（有界补帧断言）、`App::text_diagnostics()`（`CanvasTextStale` /
-`InvalidTextRun` / `TextRunClipped` / `InlineBoxImageMissing` 等按诊断值去重）。这些面都是只读诊断，不改变帧语义。
+**P1（E1–E6）新增的 L2 观测面**（用于断言；不改变上面的迁移量口径）：`Window::inline_box_image_diagnostics()`（`Window::frame` 路径跳过的行内图片，最近一帧快照、每帧重建不增长）、`App::frame_requests()`（有界补帧断言）、`App::text_diagnostics()`（`CanvasTextUnresolved` / `InvalidTextRun` / `TextRunClipped` / `InlineBoxImageMissing` 等按诊断值去重）。这些面都是只读诊断，不改变帧语义。
 
 **`#[tokio::test]`（794 个，数字准确但口径要改）**：现有约 794 个 `#[tokio::test]` **不能整体判定为可保留**。正确做法是**先分桶**：
 按「`use gpui_kit`」把 794 分成 **641 个纯桶（文件不 `use gpui_kit`，可批量信任）** 与 **153 个需抽查**（A5 §3）—— 不是逐个抽查 794。
@@ -2498,10 +2498,8 @@ app.set_title(window, SmolStr::new_static("Kytrix — BTC/USDT"))?;
 
 #### 8.6.5 DPI、全屏与安全区
 
-- **DPI**：拖动区与自绘 header 的坐标全为**逻辑像素**；`WM_DPICHANGED` / `backingScaleFactor` / `wl_output.scale` 变化时引擎更新
-  `Window::scale()` 且**不重排布局**（逻辑布局与 DPI 无关，吸附只在 paint 边界完成，I11），应用不需要也不应该重排 header。
-  **canvas 文本**的句柄按窗口 DPI 光栅（`App::text_scale`，§11.1）：DPI 变化 / 跨屏移动 / 多窗口不同 DPI 后应用必须重新
-  `shape_text` 并重建 Canvas。
+- **DPI**：拖动区与自绘 header 的坐标全为**逻辑像素**；`WM_DPICHANGED` / `backingScaleFactor` / `wl_output.scale` 变化时引擎更新内部 DPR 且**不重排布局**（逻辑布局与 DPI 无关，吸附只在 paint 边界完成，I11），应用不需要也不应该重排 header。
+  **canvas 文本**的配方由引擎按窗口 DPR 解析与光栅（§11.1）：DPI 变化 / 跨屏移动 / 多窗口不同 DPI 只让解析 key 失配并重光栅，`Arc<Canvas>` 不变、应用无需重建。
 - **全屏**：Linux 全屏时 `WindowState.fullscreen == true` ⇒ 应用**不画**标题栏（此时没有窗口装饰语义）；macOS 原生全屏
   （`FullScreenPrimary`）下交通灯由 AppKit 隐藏/浮现，应用按 `WindowState` 或安全区变化重排。**Windows 不支持全屏控制**
   （§8.6.1：`ToggleFullscreen` → `UnsupportedWindowCapability { capability: "fullscreen window control" }`，
@@ -2819,7 +2817,7 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 
 | ID | 增量 | 量级 | 受影响不变量 | 阻塞 crate（08 口径） | 分级 | 状态 / 批次 |
 |---|---|---|---|---|---|---|
-| **E1** | 文本 shaping 公开面（`ShapedTextHandle` + `App::shape_text` + `Canvas::push_shaped_text` + InlineBox 读取） | **M** | I2（不加 `Primitive` 变体）、I4（tile 生命周期仍归图集/retire）、I12（非像素断言）、I17 | candlestick / order_book / heatmap / prediction_market / perp / chokepoint + 4 个图表类 | **硬阻塞** | ✅ 已实现（P1-E1） |
+| **E1** | Canvas 文本配方（`CanvasText` + `Canvas::push_text` + `App::measure_text`；删除 `ShapedTextHandle` / `push_shaped_text` / `text_scale`） | **M** | I2（`Primitive::Text` 是 CPU 侧中间图元，`GpuPrimitive` / shader 零变更）、I4（tile 生命周期仍归图集/retire）、I12（非像素断言）、I17 | candlestick / order_book / heatmap / prediction_market / perp / chokepoint + 4 个图表类 | **硬阻塞** | ✅ 已实现（P1-E1） |
 | **E2** | 富文本（多 `TextRun` + 文本装饰 + InlineBox 绘制与诊断） | **L** | I2、I17、I12、I8（装饰走普通 `Quad`、不进 shader ⇒ 不触发 golden） | ui_kit markdown 全组（empty / news / x） | **必做（D-03 扩展 E2）** | ✅ 已实现（P1-E2） |
 | **E3** | 变高虚拟列表（extents 前缀和 + 锚点 + `set_virtual_extents` / `scroll_to_item`） | **M** | I5（行高来自布局，回写必须走同一棵 taffy 树）、I3（锚点补偿不得额外出帧）、I11（全逻辑像素） | news / x / eth/sol 钱包（`DequeUnsizedList`）、6 张表的 wrap 行 | **硬阻塞** | ✅ 已实现（P1-E3） |
 | **E4** | `GeometryDraw.range`（索引元素子区间） | **M** | **I2（唯一契约变更点）**、I4（页级上传不变）、I8（同几何不同 range 的像素覆盖） | global_shipping_chokepoint（LOD 4 档 / 22,876 三角形） | **硬阻塞** | ✅ 已实现（P1-E4） |
@@ -2857,126 +2855,73 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 4. 每条落地带 L1/L2 断言；改变绘制输出的补 L3 golden 或（文本类）结构与度量断言（§4.5 / §6.10）。
 5. 不以「兼容层 / 预埋 API / 未使用字段」占位（AGENTS §1.1 / §2.1）。
 
-### 11.1 E1 · 文本 shaping 公开面（已实现，量级 M，P1-E1）
+### 11.1 E1 · Canvas 文本配方（已实现；E 阶段替换原 standalone shaping 公开面）
 
-**实现事实**：`ShapedLine` 仍是公开只读类型，但节点文本路径的应用拿不到实例（`NodeTree::text_line` 仍 `pub(crate)`）；E1 新增
-**无节点归属**的 shaping 公开面：`App::shape_text` 产出可长期持有的 `ShapedTextHandle`，canvas 用 `Canvas::push_shaped_text` 编码，
-行内盒落点经 `App::shaped_inline_boxes` 读取。`text/*` 子模块仍全部 `pub(crate)`（实现细节），公开契约只有 `text.rs` 的类型。
+**实现事实**：Canvas 文本不再由应用持有 `ShapedTextHandle`，也不再公开任何按 DPI 光栅化的句柄。应用只记录**逻辑文本配方**
+（`TextContent` + 逻辑原点），引擎在帧管线内解析、光栅化并替换为 `Primitive::GlyphRun`；DPI 变化、图集换代、逐 tile 淘汰都由
+引擎按 key 重光栅，不重建 `Arc<Canvas>`，也不需要应用改任何缓存键。`ShapedLine` / `ShapedTextLine` / `ShapedTextItem` /
+`ShapedGlyphRun` / `ShapedInlineBox` / `ShapedDecoration` 全部 `pub(crate)`，`ShapedTextHandle` 与 `text::pack_atlas_lease` 整体删除。
 
 ```rust
-// text.rs（已实现；字段私有，无公开构造器）
-pub struct ShapedTextHandle { /* Arc<ShapedLine> + Box<[ShapedInlineBox]> + (generation, eviction_epoch) 租约 + scale + Arc<AtomicU64> */ }
-impl ShapedTextHandle {
-    pub fn line(&self) -> &ShapedLine;      // 只读快照（glyph 位置、行、装饰、inline box）
-    pub fn is_stale(&self) -> bool;         // 图集换代或逐 tile 淘汰后为真
-    pub fn size(&self) -> Size;             // 内容尺寸（逻辑像素）
-    pub fn scale(&self) -> f32;             // 本次 shaping 的光栅 scale（App::text_scale 的值）
-}
-
-impl App {
-    /// 按样式、最大宽度与行内盒塑形；复用 `text/cache.rs` 的形状缓存。
-    pub fn shape_text(
-        &mut self, text: &str, style: &TextStyle, max_width: Option<f32>, inline_boxes: &[InlineBoxSpec],
-    ) -> Result<ShapedTextHandle, EngineError>;
-    /// 行内盒落点（文本盒局部逻辑像素；顺序 = 行内位置顺序，`id` 原样保留）。
-    pub fn shaped_inline_boxes<'a>(&self, handle: &'a ShapedTextHandle) -> &'a [ShapedInlineBox];
-    /// canvas 文本的 App 级默认光栅 scale（初始 1.0）。
-    pub fn text_scale(&self) -> f32;
-    /// 显式覆盖（离屏 / 测试 / 固定 DPI）；覆盖期间不跟随焦点窗口 DPI。
-    pub fn set_text_scale(&mut self, scale: f32) -> Result<(), EngineError>;
-    /// 取消覆盖，恢复跟随焦点窗口 DPI（无焦点窗口时保留当前值）。
-    pub fn clear_text_scale_override(&mut self);
-}
-
 // paint/canvas.rs（已实现）
+pub struct CanvasText { pub content: TextContent, pub origin: Point<LogicalPx> }
 impl Canvas {
-    /// 引擎负责：租约校验（等价 D-5）、origin 偏移、按 run 拆 `Primitive::GlyphRun`。
-    /// 返回 false = 句柄已失效（应用应丢弃并重新 `shape_text`），此时**不产生任何图元**。
-    pub fn push_shaped_text(&mut self, handle: &ShapedTextHandle, origin: Point) -> bool;
+    /// 记录逻辑文本配方；空文本不产生配方并返回 false，其余返回 true。
+    pub fn push_text(&mut self, content: TextContent, origin: Point<LogicalPx>) -> bool;
+}
+
+// app.rs（已实现；逻辑像素、无 DPR）
+impl App {
+    pub fn measure_text(&mut self, content: &TextContent, max_width: Option<LogicalPx>) -> LogicalSize;
 }
 ```
 
 **语义**：
 
-1. **应用永不构造裸 `GlyphRun` / `AtlasTile`**：`Canvas::push_text(GlyphRun)` 保持现状（文档已写「应用层不应自行构造」），应用画文本的
-   唯一合法入口是 `push_shaped_text`；`AtlasTile` 字段虽 `pub`，但应用没有图集分配器，生产路径只能来自句柄。
+1. **应用永不构造裸 `GlyphRun` / `AtlasTile`**：`Canvas::push_glyph_run` 降 `pub(crate)`（引擎 paint 期专用）；
+   `Primitive::Text(Arc<CanvasText>)` 是 CPU 侧中间图元，paint 前必被替换，`InstanceEncoder` / `SceneDelta` / 帧记录只会看到
+   `Primitive::GlyphRun`。
 2. **`origin`** 是文本盒左上角的**绝对窗口逻辑像素**（与 Canvas 内其它图元同一坐标系，§5.9）；多行文本的所有行一起偏移。
-   **应用义务**：`origin + handle.size()` 必须落在 `Canvas::bounds` 内 —— damage / 命中只看 `Canvas::bounds`，引擎**不会**自动 union
-   （P3 建议 F10；越界内容的自绘责任归应用）。
-3. **行内盒**：`inline_boxes` 与节点路径同源（`TextContent.inline_boxes`），传空切片 = 无行内盒。`shaped_inline_boxes` 的落点按
-   **parley 布局顺序**（行内位置顺序）返回，`id` 原样保留；输入 `index` 非单调时**不保证**与传入 `inline_boxes` 一一对应，应用用 `id`
-   映射（F7 的语义收紧，不是实现偏差）。E1 只保证落点可读；装饰与 `InlineBoxPaint` 的绘制归 E2（§11.2）。
-4. **`max_width`**：`None` = 不限宽（单行）；`Some(w)` 触发断行（等价 `break_all_lines(Some(w))`）；非有限值或负数 ⇒
-   `EngineError::TextShapeStandalone`。
-5. **图集租约 = `(generation, eviction_epoch)`**：`generation` 是整页换代（扩容 / 清空 / 字体栈切换 / DPI 世代），`eviction_epoch` 是
-   **累计淘汰纪元**（`GlyphAtlas` 每淘汰一个 tile +1，只增不减）。句柄构造时记录两者；任一前进 ⇒ `is_stale()` 为真、
-   `push_shaped_text` 返回 `false` 且**不产生任何图元**（不允许「画旧 UV」——正是 D-5 修掉的花字问题）。实现用单个打包的
-   `AtomicU64` 租约（高 32 位 `generation`、低 32 位 `eviction_epoch`，`text::pack_atlas_lease`）保证两者原子地一起前进。
-   句柄**不持有**形状缓存键；形状缓存复用发生在 `shape_text` 内部（`ShapeKey`，§4.5）。
-6. **编码期安全网（push 之后）**：`push_shaped_text` 只在 push 时校验租约；push 之后同帧的图集换代（`layout_text` 扩容 / 清空、换
-   字体栈）**或逐 tile LRU 淘汰**（不换代）会让已写入的 `AtlasTile` 指向旧 UV。paint 在编码 `Primitive::Canvas` 前逐 `GlyphRun`
-   用 `AtlasAllocator::is_alive`（代际 + 槽位分配身份 `(slot, slot_epoch)`，O(1)）判活：**失效 run 整段丢弃**（少字优于花字，与节点
-   文本的 D-5 编码期硬校验同口径），其余图元（含 clip 括号）与顺序不变；丢弃数进 `PaintReport::stale_canvas_runs` →
-   `FrameRecord::stale_canvas_runs` → `TextDiagnostic::CanvasTextStale { runs }`。**有界补帧**：同一 `(window, atlas generation)` 至多
-   补一帧（`Window::note_stale_canvas_followup`），给应用执行重建义务的窗口；应用忽略义务也不造成 I3 空转。
-7. **应用义务（canvas 文本）**：Canvas 内容归应用所有，引擎**不能**代替应用重建 —— 丢弃后该 Canvas 会持续少字，直到应用在
-   `is_stale()` 后重新 `shape_text` 并用新句柄重建 Canvas；图集因容量压力逐 tile 淘汰时同样适用（代际不变、句柄已失效）。
-8. **App 级默认光栅 scale**：`App` 维护 `default_text_scale`（初始 1.0）。当前焦点窗口获得焦点或焦点窗口 DPI 变化时采用该窗口的
-   `Window::scale()`；`Event::DpiChanged.scale` 是本次变化的**权威值**（Windows / macOS 先镜像再派发、Wayland 先派发再镜像 —— 顺序
-   不同但结果一致）；没有焦点窗口时保留上一次的值。`set_text_scale` 提供**显式覆盖**（覆盖期间不再跟随焦点窗口 DPI），值必须是
-   **有限正数**，否则返回 `EngineError::InvalidTextScale { scale }`（不静默钳制、错误路径不改变当前 scale）；
-   `clear_text_scale_override` 取消覆盖并立即恢复跟随（无焦点窗口时保留当前值）。`shape_text` 用该 scale 光栅（ppem = 字号 × scale，
-   经 `GlyphKey` 的量化 ppem 维进字形缓存键）；`ShapedTextHandle::scale()` 与 `ShapedLine::scale` 都是该值；paint 阶段仍按窗口
-   `Scale` 放大（几何落点是逻辑像素）。**应用义务**：句柄的 tile 位图按 shape 时刻的 scale 光栅；多窗口不同 DPI、焦点切换、窗口被
-   拖到另一块屏（DPI 变化）后，应用**必须**丢弃句柄并重新 `shape_text`；引擎不会自动重光栅已有句柄。
-9. **错误路径的收尾**：`shape_text` 接住 `Result` 后**无条件**执行淘汰失效（文本行 + Canvas 节点标 PAINT）与租约同步，错误路径
-   不 `?` 早退（失败 shaping 也可能已淘汰节点文本的 tile / 前进租约）。
-10. **`AtlasTile` 的淘汰可检测身份（E1d，CPU 侧契约扩展）**：`AtlasTile` 增加 `slot: u32`（所属分配器槽位表下标）与
-    `slot_epoch: u32`（槽位分配纪元，分配器每次放入槽位都前进，`clear` / `grow` 不回退）；`(slot, slot_epoch)` 唯一标识一次分配，
-    `AtlasAllocator::is_alive(&self, tile) -> bool`（`render/atlas.rs`，**`pub(crate)`**，不是公开 API）O(1) 判定「图集种类一致 +
-    代际一致 + 槽位仍被占用且纪元相同」。字段**不进** `GpuPrimitive` 128 B 布局、不进 uniform / 顶点布局 / 三端 shader；
-    `AtlasTile` 24 → 32 B（`PositionedGlyph` 40 → 48 B，单字形 +8 B）。`push` 期不逐 tile 扫描：句柄租约已等价且更早覆盖逐 tile
-    失效，`AtlasAllocator` 是 crate 私有、不能进公开签名。
-11. **颜色与缓存键（E24，P6 前修复）**：`ShapeKey` **仍不含 color**（R12-11 不变）⇒ 同一文本换色**命中 shaping 缓存、不重复 shape**；
-    但**光栅期**按**本次**请求的 `style.color` 现场重算每个 style run 的颜色（`text/shape.rs::current_run_color`）：被 `TextRun`
-    完全覆盖的 run 用 run 自己的颜色（E2 具体值）；与所有 run 不相交的区间用**本次基础色**（E24 修复点 —— 此前 `rasterize_parley`
-    取 layout brush，导致 Canvas 同一文本第二次以不同颜色塑形仍画首色，W6b F22「halo 环视觉上不存在」）；部分相交（parley 合并
-    同色 run）保留 shape 期画刷。首次光栅三条分支都等价于旧输出 ⇒ 节点文本快照**零 diff**。`ShapedText::rasterize` 的 `color`
-    参数语义 = **本次基础文本色**，不是「仅省略号 / 装饰色」。测试观测面：`App::shape_count_for_test()`（`#[cfg(test)]` 真实
-    parley 塑形计数，生产零符号；配 `repeated_shape_reuses_the_cached_snapshot`、`canvas_text_recolors_on_a_shaping_cache_hit`、
-    `base_color_recolor_keeps_explicit_run_colors`）。
-
-**错误**：
-
-| 变体 | 触发 |
-|---|---|
-| `EngineError::TextShapeStandalone { detail: SmolStr }` | 无节点归属的 shaping 失败（字体栈为空 / `max_width` 非有限或为负 / parley 构建失败） |
-| `EngineError::InvalidTextScale { scale: f32 }` | `App::set_text_scale` 的 scale 非有限或 `<= 0`（与平台 DPI 错误 `InvalidDpiScale` 分开） |
-| `EngineError::AtlasExhausted { kind: AtlasKind }` | 字形图集在扩容 + LRU 淘汰后仍放不下本次工作集 |
-
-**不变量影响**：I2 ✅（`Primitive` 不加变体；`Canvas` 仍只装 8 类图元；`AtlasTile` 的字段扩展是 CPU 侧、不改 GPU 布局与 `contract.md`）；
-I4 ✅（tile 生命周期仍归引擎的图集 / retire）；I12 ✅（非像素断言：`handle.line().glyphs` 数量、`size()`、`text_range`、
-`FrameRecord.stale_canvas_runs`）；I17 ✅（句柄是只读快照，文本内容变化仍走 `bind_text` 或重新 shape，不绕过 Signal）。
+   **应用义务**：`origin + measure_text(...)` 必须落在 `Canvas::bounds` 内 —— damage / 命中只看 `Canvas::bounds`，引擎**不会**自动
+   union（P3 建议 F10；越界内容的自绘责任归应用）。尺寸需要时调 `App::measure_text`。
+3. **Canvas 文本按 max-content 单行绘制**：配方不携带断行宽度；`measure_text(content, Some(w))` 只回答「若在 w 下断行会多高」（`w` 非有限 / 负数按 max-content 处理并记 `TextDiagnostic::InvalidMeasureWidth`），
+   不会改变 canvas 的绘制结果。行内盒（`TextContent.inline_boxes`）的落点来自 parley 布局，但 canvas 只编码字形 run ——
+   行内盒的绘制归节点文本路径（E2 / §11.2）。
+4. **解析归引擎**：`Window::canvas_text: HashMap<NodeId, ResolvedCanvasText>`，`key = (canvas_generation, dpr_bits,
+   atlas_generation, glyph_eviction_epoch, font_stack_version)；`Node::canvas_generation` 随 `Window::set_canvas` 前进。`App::frame` 在 `layout_text`
+   之后、`upload_atlas_pages` 之前跑 `App::resolve_canvas_text(window)`：按 paint 序（`NodeTree::canvas_nodes`，DFS 前序）对每个
+   配方走 `TextContext::shape_cached`（`ShapeKey` 不含 DPR）+ 按窗口 DPR 光栅化，key 命中即跳过。**同帧新 tile 在上传前就绪，
+   不需要补帧**。
+5. **失效与自愈**：DPI 变化 / 字体栈切换 / 图集扩容只让 key 失配并重光栅；解析自身造成的图集换代或逐 tile 淘汰会让已解析行
+   失效 —— 引擎作废节点文本行并重跑（有界 `MAX_LAYOUT_TEXT_PASSES`，随后按需重跑 `layout_text`）；图集满的软失败把条目置
+   `pending` 并请求下一帧重试，与节点文本的 `AtlasFull` 升级同口径（连续 3 帧升级 `EngineError::AtlasExhausted`）。
+6. **paint 只做替换**：`PaintPass` 的 `Content::Canvas` 分支按同一遍历顺序把 `Primitive::Text` 换成 `GlyphRun`（origin 偏移 +
+   run 颜色），不含任何 DPR / 图集逻辑。解析缺失时跳过该 canvas 并计 `PaintReport::unresolved_canvas_text` →
+   `TextDiagnostic::CanvasTextUnresolved { recipes }`（`TextContext::push_diagnostics` 去重，不静默）；paint 前逐条校验 `ShapedLine::atlas_generation` 与 tile 存活，失活就跳过该配方并补帧，绝不画 stale UV。解析表在每帧 resolve 开头 prune 已卸载的 canvas 节点；pending 逐节点独立、按窗口连续解析帧计数升级。
+7. **公开面删除**：`App::{shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override, note_window_dpi}`、
+   `Canvas::{push_shaped_text, without_stale_glyph_runs}`、`Window::note_stale_canvas_followup`、`PaintReport::stale_canvas_runs`、
+   `TextDiagnostic::CanvasTextStale`、`EngineError::{InvalidTextScale, TextShapeStandalone}`、`App::atlas_generation_lease`、
+   编码期 stale-run 安全网（`Canvas::without_stale_glyph_runs` / `PaintReport::stale_canvas_runs`）全部删除；`AtlasAllocator::is_alive`（与 `Slot::epoch`）保留，改由画布文本绘制期判活用。`AtlasTile::{slot, slot_epoch}` 字段保留（CPU 侧、供诊断/测试观测）。
+8. **错误**：本路径不再有「standalone shaping」专属错误；字形容量压力走既有 `EngineError::AtlasExhausted { kind: AtlasKind }`。
+9. **不变量影响**：I2 **触及但 GPU 零变更**（`Primitive` 增加 CPU 侧 `Text` 变体，`GpuPrimitive` 128 B / shader / `contract.md`
+   不变）；I4 ✅（tile 生命周期仍归图集 / retire，且不再有应用持有的租约）；I12 ✅（非像素断言：帧记录里的 `GlyphRun` 数 /
+   `CanvasPrimitive.glyphs`、`App::measure_text`、解析诊断）；I17 ✅（文本变化仍走 `bind_text` / `set_canvas`，不绕过 Signal）。
 
 **测试面**：
 
-- L0/L1：`shape_text` 的 `size()` / 行数 / 字形数；`max_width` 断行；CJK + emoji 混合塑形（度量单调、不 panic，彩色字形压平可退 tofu）；
-  传入 `inline_boxes` 后 `shaped_inline_boxes()` 的数量与 `id`；`is_stale()` 在整页换代与逐 tile 淘汰后为真、
-  `push_shaped_text` 在 stale 时返回 `false` 且 `Canvas::primitives()` 长度不变；失败 shaping 仍失效节点文本并同步租约；
-  DPI 事件用自带 `scale` 作权威值；形状缓存键区分 `inline_boxes`（变异 M3 守护）。
-- L2：`FrameRecord.stale_canvas_runs` 无失效 run 时为 0、换代 / 淘汰后等于被丢弃 run 数；`Primitive::Canvas` 作为不透明图元进帧记录时，
-  Canvas 内层 `GlyphRun` 计数与 bounds 在 `Window::scene()` 核对；节点文本路径的 `Primitive::GlyphRun` bounds ⊆ 节点盒且 lane 图元数 =
-  非空 run 数。守护用例：`stale_canvas_runs_request_exactly_one_bounded_follow_up_frame`、
-  `failed_shape_still_invalidates_text_lines_and_syncs_the_lease`、`tile_eviction_makes_long_lived_handles_stale_and_reshaping_recovers`、
-  `evicted_canvas_tiles_are_filtered_at_encode_time_without_a_generation_bump`、
-  `without_stale_glyph_runs_drops_evicted_tiles_and_keeps_live_ones`、
-  `is_alive_tracks_allocation_eviction_slot_reuse_and_page_growth`、`frame_record_glyph_runs_stay_inside_the_text_node_box`。
-- **不引入 L3**（文字像素不做 golden，§4.5 / I12）。
-
+- L0/L1：`app::canvas_text::tests::{canvas_text_does_not_rebuild_on_dpi_change, a_matching_recipe_key_does_not_shape_again,
+  nested_canvases_resolve_their_own_text_in_paint_order, changing_the_recipe_reresolves_the_canvas,
+  new_glyph_tiles_are_ready_before_the_atlas_upload, measure_text_*}`；`paint::pass::tests::{canvas_text_recipes_become_glyph_runs_during_paint,
+  an_unresolved_canvas_recipe_is_skipped_and_counted}`；`paint::canvas::tests::{push_text_records_only_the_logical_recipe,
+  push_text_refuses_empty_content}`。
+- L2（widget 层）：迁移后的图表测试断言「字体栈 / DPI 变化不重写 widget 的 `Arc<Canvas>`，但帧记录仍含 `PrimitiveKind::GlyphRun`」
+  （candlestick / hyperliquid_wallet / prediction_market / volume_heatmap / perpetual_statistics / chokepoint / gauge / ETF）。
+- **不引入 L3**（文字像素不做 golden，§4.5 / I12）；`FrameRecord` 不再有 `stale_canvas_runs`，Canvas 内容通过 `canvas_primitives`
+  展开断言。
 ### 11.2 E2 · 富文本：多 run + 装饰 + InlineBox（已实现，量级 L，P1-E2）
 
 **实现事实**：`TextContent` 支持 runs（逐区间覆盖样式）；`TextStyle` 支持装饰；`emit_text` 按 `InlineBoxPaint` 生成引擎既有图元；
-装饰是 shaping 期烘好的 `ShapedDecoration` 几何、paint 期编码为普通 `Quad`；公开只读面：`ShapedTextLine.decorations: Vec<ShapedDecoration>`、`ShapedDecoration { rect: Rect, color: Color }`（`text.rs:1174,1184`），应用可据此断言，渲染仍由引擎 `Quad` 承担。
+装饰是 shaping 期烘好的 `ShapedDecoration` 几何、paint 期编码为普通 `Quad`；这些 shaping 快照（`ShapedTextLine` / `ShapedDecoration`）全部 `pub(crate)`，应用侧只能通过帧记录（`canvas_primitives` / `PrimitiveRecord`）或节点文本路径的可访问面断言，渲染仍由引擎 `Quad` 承担。
 
 ```rust
 // text.rs（已实现；数据形状以源码为准）
@@ -3077,10 +3022,10 @@ inline box `paint = Some(Image)` 的 `Image` 图元 bounds == `shaped_inline_box
 
 **E2b 候选（未实现，仅登记，不得依赖）**：
 
-1. **Canvas / standalone shaping 不绘制装饰与行内盒**：`Canvas::push_shaped_text` 只编码 glyph run；`App::shape_text` 的 standalone
+1. **Canvas 配方不绘制装饰与行内盒**：`Canvas::push_text` 只记录配方，paint 期只编码 glyph run；
    路径同样不绘制 —— `InlineBoxPaint` / `TextDecoration` 的绘制只覆盖节点文本路径（`emit_text`）。
-2. **节点文本路径的 InlineBox 命中只读访问面**：`NodeTree::text_line` 仍 `pub(crate)`，且 `App::shape_text` 不接受 runs、无法复现节点
-   文本的行内盒落点；因此「InlineBox 命中」目前仅 standalone handle 路径可行。链接文本命中可先用 E5 的 `text_byte_index_at` + 应用
+2. **节点文本路径的 InlineBox 命中只读访问面**：`NodeTree::text_line` 仍 `pub(crate)`，且 Canvas 配方不支持 runs、无法复现节点
+   文本的行内盒落点；因此「InlineBox 命中」目前仅节点文本路径可行。链接文本命中可先用 E5 的 `text_byte_index_at` + 应用
    自持 run 区间判定。
 
 ### 11.3 E3 · 变高虚拟列表（已实现，量级 M，P1-E3）
@@ -3260,7 +3205,7 @@ request_window_control, set_traffic_light_position, traffic_light_inset}`、三�
 pub enum Decorations { Native, None }     // 数据枚举，不是扩展点（I14）
 
 pub struct WindowOptions {
-    // 既有字段：title / size / position / min_size / max_size / owner / modal / always_on_top / scale / background
+    // 既有字段：title / size / position / min_size / max_size / owner / modal / always_on_top / background
     pub decorations: Decorations,        // 默认 Native
     pub icon: Option<Bytes>,             // PNG 或 ICO 字节；仅 Windows 生效（mac/Linux 文档化降级）
 }
@@ -3419,15 +3364,13 @@ impl NodeBuilder {
 impl Window {
     /// 换图（同一节点换资源）；**不请求帧** —— 帧外调用须配 `App::request_repaint` / `request_node_repaint`。
     pub fn set_image_resource(&mut self, node: NodeId, resource: ResourceId) -> Result<bool, EngineError>;
-    /// DPI 世代（缩放变化时前进）；图片内在尺寸按它重解析。
-    pub fn scale_epoch(&self) -> u32;
 }
 impl App { pub fn unload_resource(&mut self, id: ResourceId) -> bool; }
 ```
 
 **语义**：
 
-1. **尺寸来源**：`Style` 显式尺寸**优先**；否则用内在尺寸 = tile 物理像素 ÷ 窗口 `scale`（逻辑像素）。资源未解析前
+1. **尺寸来源**：`Style` 显式尺寸**优先**；否则用内在尺寸 = tile 物理像素 ÷ 窗口 DPR（逻辑像素）。资源未解析前
    `measure = 0×0`（占位），解析完成后自动重排 + 重绘（**不需要**应用插手）。
 2. **异步生命周期**：`ResourceCache::insert_async*` → `PendingResource`；`poll()` 的结果交给 `App` 后，挂载了该
    `PendingResource` 的节点**自动转 Ready**（`resolve_pending` → 写 `source` / `intrinsic` / measure → 上冒 `LAYOUT` +
@@ -3438,7 +3381,7 @@ impl App { pub fn unload_resource(&mut self, id: ResourceId) -> bool; }
    收缩比只含两轴等比项，所以与 scale 无关。
 4. **资源卸载（唯一公开入口）**：`App::unload_resource(id)` 才会把**全部窗口**中引用该资源的节点置脏（只 `PAINT`、不动布局、
    保留 `intrinsic`）；`ResourceCache` 的写入口全部 `pub(crate)`，不存在绕过路径（**R-19**）。关窗路径按 `resources.image(id).is_none()` 判死清悬垂引用。
-5. **DPI**：窗口 `scale_epoch` 前进 ⇒ 位图的内在逻辑尺寸 = 原生物理像素 ÷ 新 DPR，`mark_layout` 重排；SVG 内在逻辑尺寸不变、不重排，
+5. **DPI**：窗口 DPR 变化（引擎内部 DPI 世代前进）⇒ 位图的内在逻辑尺寸 = 原生物理像素 ÷ 新 DPR，`mark_layout` 重排；SVG 内在逻辑尺寸不变、不重排，
    但变体按新 DPR 的目标重新选择/生成（变体准备在布局之后、图集上传之前完成）。应用不再换变体；`set_image_resource` 只用于显式替换资源。
 6. **a11y**：`NodeKind::Image` 的默认角色是 `A11yRole::Image`；**可访问名只来自 `A11yOverride::label`**，无 `value`；
    默认**非交互**（无 `Click` / `Focus` 动作）。无 label 的图片按 §7.4 标 `hidden` 并写 `A11yDiagnostic::MissingAltText{kind: Image}`；
@@ -4953,6 +4896,8 @@ pub struct TestApp { /* 默认无 renderer */ }
 impl TestApp {
     pub fn new() -> Self;                                            // 无参
     pub fn with_options(options: WindowOptions) -> Self;
+    pub fn with_scale(dpr: DevicePixelRatio) -> Self;
+    pub fn set_dpr(&mut self, dpr: DevicePixelRatio);
     pub fn inject(&mut self, e: InputEvent) -> InputOutcome;
     pub fn drain(&mut self) -> Result<&FrameRecord, EngineError>;     // 只为推进**一帧**
     pub fn advance(&mut self, by: Duration);
@@ -4961,6 +4906,14 @@ impl TestApp {
     pub fn window(&mut self) -> TestWindow<'_>;                      // VisualTestContext 的对位
     pub fn snapshot(&self, case: SnapshotCase) -> Result<SnapshotImage, SnapshotError>;
     pub fn assert_oracle(&mut self);
+}
+impl Window {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn device_pixel_ratio(&self) -> DevicePixelRatio;
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_device_pixel_ratio(&mut self, dpr: DevicePixelRatio);
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn physical_surface(&self) -> (u32, u32);
 }
 ```
 
@@ -4975,7 +4928,6 @@ impl NodeBuilder {
 }
 impl Window {
     pub fn set_image_resource(&mut self, node: NodeId, resource: ResourceId) -> Result<bool, EngineError>;
-    pub fn scale_epoch(&self) -> u32;
 }
 impl App {
     pub fn unload_resource(&mut self, id: ResourceId) -> bool;

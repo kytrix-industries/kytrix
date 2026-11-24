@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use ahash::AHashMap;
 use bytes::Bytes;
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -17,7 +15,7 @@ use ui_core::{
         primitive::{Border, ClipRect, GeometryDraw, Quad, QuadPaint},
         style_builder::StyleBuilder,
     },
-    text::{ShapedTextHandle, TextSlant, TextStyle},
+    text::{TextContent, TextSlant, TextStyle},
 };
 use ui_kit::kit::size::UnifiedSize;
 use widget::cx::WidgetCx;
@@ -132,7 +130,6 @@ struct PaintedKey {
     filter: ShipTypeFilter,
     colors: MapColors,
     language: LanguageCode,
-    text_scale: f32,
     zone: i32,
     present_types: usize,
 }
@@ -140,7 +137,7 @@ struct PaintedKey {
 struct CachedText {
     text: SmolStr,
     style: TextStyle,
-    handle: Arc<ShapedTextHandle>,
+    width: LogicalPx,
 }
 
 struct MapTextCache {
@@ -154,48 +151,46 @@ impl MapTextCache {
         }
     }
 
-    fn line(&mut self, app: &mut App, text: &str, style: &TextStyle) -> Arc<ShapedTextHandle> {
-        if let Some(index) = self
+    fn content(&mut self, app: &mut App, text: &str, style: &TextStyle) -> TextContent {
+        let entry = self.cached(app, text, style);
+        TextContent::new(entry.text.clone(), entry.style.clone())
+    }
+
+    fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
+        self.cached(app, text, style).width
+    }
+
+    fn height(&mut self, app: &mut App, style: &TextStyle) -> LogicalPx {
+        let content = self.content(app, "X", style);
+        app.measure_text(&content, None).height
+    }
+
+    fn cached(&mut self, app: &mut App, text: &str, style: &TextStyle) -> &CachedText {
+        let index = match self
             .entries
             .iter()
             .position(|entry| entry.text == text && entry.style == *style)
         {
-            let entry = self.entries.remove(index);
-            if !entry.handle.is_stale() {
-                let handle = Arc::clone(&entry.handle);
+            Some(index) => {
+                let entry = self.entries.remove(index);
                 self.entries.push(entry);
-                return handle;
+                self.entries.len() - 1
             }
-        }
-        let handle = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
-            app.shape_text("", style, None, &[])
-                .expect("an empty line always shapes")
-        }));
-        if self.entries.len() == TEXT_CACHE_CAPACITY {
-            self.entries.remove(0);
-        }
-        self.entries.push(CachedText {
-            text: SmolStr::new(text),
-            style: style.clone(),
-            handle: Arc::clone(&handle),
-        });
-        handle
-    }
-
-    fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
-        self.line(app, text, style).size().width
-    }
-
-    fn height(&mut self, app: &mut App, style: &TextStyle) -> LogicalPx {
-        self.line(app, "X", style).size().height
-    }
-
-    fn has_stale(&mut self) -> bool {
-        let stale = self.entries.iter().any(|entry| entry.handle.is_stale());
-        if stale {
-            self.entries.retain(|entry| !entry.handle.is_stale());
-        }
-        stale
+            None => {
+                let content = TextContent::new(text, style.clone());
+                let width = app.measure_text(&content, None).width;
+                if self.entries.len() == TEXT_CACHE_CAPACITY {
+                    self.entries.remove(0);
+                }
+                self.entries.push(CachedText {
+                    text: SmolStr::new(text),
+                    style: style.clone(),
+                    width,
+                });
+                self.entries.len() - 1
+            }
+        };
+        &self.entries[index]
     }
 }
 
@@ -337,17 +332,15 @@ impl MapCanvas {
             filter: picture.filter,
             colors,
             language,
-            text_scale: cx.app().text_scale(),
             zone: picture.zone,
             present_types: picture.present_types.len(),
         };
-        if self.painted == Some(key) && !self.text.has_stale() {
+        if self.painted == Some(key) {
             return Ok(false);
         }
 
-        let (canvas, changed, dynamic) =
-            self.paint(cx.app_mut(), picture, scene, translate, &key)?;
-        let changed = cx.set_canvas(node, canvas)? && changed;
+        let (canvas, dynamic) = self.paint(cx.app_mut(), picture, scene, translate, &key);
+        let changed = cx.set_canvas(node, canvas)?;
         if changed {
             for id in std::mem::take(&mut self.dynamic) {
                 cx.app_mut().geometry_mut().release(id);
@@ -369,7 +362,7 @@ impl MapCanvas {
         scene: Option<&'static Scene>,
         translate: &Translate,
         key: &PaintedKey,
-    ) -> Result<(Canvas, bool, Vec<GeometryId>), EngineError> {
+    ) -> (Canvas, Vec<GeometryId>) {
         let bounds = key.bounds;
         let viewport = [bounds.size.width.value(), bounds.size.height.value()];
         let projection = Projection::new(self.camera, viewport);
@@ -453,7 +446,7 @@ impl MapCanvas {
         }
 
         let _ = canvas.pop_clip();
-        Ok((canvas, true, dynamic))
+        (canvas, dynamic)
     }
 
     fn ensure_tier(&mut self, app: &mut App, scene: &'static Scene, tier: usize) {
@@ -1079,12 +1072,9 @@ fn push_line(
     text: &str,
     origin: LogicalPoint,
     style: &TextStyle,
-) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-    let line = cache.line(app, text, style);
-    canvas.push_shaped_text(&line, origin)
+) {
+    let content = cache.content(app, text, style);
+    let _ = canvas.push_text(content, origin);
 }
 
 fn hover_values(details: &VesselDetails, translate: &Translate) -> [SmolStr; 16] {
@@ -1120,7 +1110,7 @@ fn hover_values(details: &VesselDetails, translate: &Translate) -> [SmolStr; 16]
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::{rc::Rc, sync::Arc};
 
     use i18n::{language::codes::LanguageCode, translate::Translate};
     use ui_core::{

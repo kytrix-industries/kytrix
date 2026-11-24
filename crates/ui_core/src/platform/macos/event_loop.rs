@@ -582,7 +582,8 @@ fn recover_window_renderer(
         ));
     };
     let size = native.backing_size();
-    let scale = f64::from(native.scale().factor());
+    let native_dpr = native.scale();
+    let scale = f64::from(native_dpr.factor());
     let max_frame_rate = native.maximum_frames_per_second();
 
     let (old, background) = {
@@ -738,7 +739,7 @@ mod tests {
     fn recovery_forces_a_full_republish_of_the_next_frame() {
         use crate::{
             app::App,
-            math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+            math::{LogicalRect, LogicalSize, px},
             node::builder::NodeBuilder,
             paint::{color::Color, style::PaintSpec},
             window::FrameOutcome,
@@ -752,7 +753,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: SmolStr::new_static("device-recovery"),
             size: LogicalSize::new(px(320.0), px(240.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();

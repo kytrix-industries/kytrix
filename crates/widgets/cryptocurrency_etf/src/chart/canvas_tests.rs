@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use i18n::language::codes::LanguageCode;
 use ui_core::{
-    math::{LogicalPoint, px},
+    math::{DevicePixelRatio, LogicalPoint, px},
     node::{builder::NodeBuilder, id::NodeId},
-    paint::{primitive::Primitive, style_builder::StyleBuilder},
+    paint::style_builder::StyleBuilder,
+    test_support::record::PrimitiveKind,
     window::WindowId,
 };
 use widget::test_support::WidgetTestApp;
@@ -63,18 +66,6 @@ impl ChartHarness {
         let Self { app, chart, .. } = self;
         app.with_cx(|cx| chart.release(cx));
     }
-}
-
-fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
-    harness
-        .canvas()
-        .primitives()
-        .iter()
-        .find_map(|primitive| match primitive {
-            Primitive::GlyphRun(run) => run.glyphs.first(),
-            _ => None,
-        })
-        .map(|glyph| glyph.tile.generation)
 }
 
 fn harness_in(width: f32, height: f32, flows: &[f64]) -> ChartHarness {
@@ -306,32 +297,83 @@ fn a_language_change_should_rewrite_the_labels_a_chart_is_already_showing() {
 }
 
 #[test]
-fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
+fn a_font_stack_or_dpi_change_should_not_rewrite_a_charts_canvas() {
     let mut harness = harness();
     assert!(harness.sync(), "the first frame paints");
+    harness.app.drain();
+    let node = harness.chart.node().expect("the chart built a canvas node");
+    let drawn = harness
+        .app
+        .canvas_handle(node)
+        .expect("the node holds a canvas");
     let labels = harness.canvas().primitives().len();
-    let generation = glyph_generation(&harness).expect("a chart of three days labels its axes");
 
+    let window = harness.window;
     let stack = harness.app.app().font_stack().clone();
     harness.app.app_mut().set_font_stack(stack);
+    harness
+        .app
+        .app_mut()
+        .request_repaint(window)
+        .expect("the host repaints after a font stack change");
+    harness.app.drain();
 
     assert!(
-        harness.sync(),
-        "a label whose lease moved is a frame the chart owes, not an idle one"
+        !harness.sync(),
+        "the engine re-rasterizes canvas text; the chart owes no frame"
     );
-    assert_ne!(
-        glyph_generation(&harness),
-        Some(generation),
-        "every label was shaped for the atlas that exists now"
+    assert!(
+        Arc::ptr_eq(
+            &drawn,
+            &harness
+                .app
+                .canvas_handle(node)
+                .expect("the node holds a canvas")
+        ),
+        "the canvas value must survive a font stack change"
     );
     assert_eq!(
         harness.canvas().primitives().len(),
         labels,
-        "and none of them disappeared with the old lease"
+        "the labels are the recipe the chart already recorded"
     );
     assert!(
+        harness
+            .app
+            .canvas_primitives(node)
+            .iter()
+            .any(|primitive| primitive.kind == PrimitiveKind::GlyphRun),
+        "the rendered frame still draws the labels"
+    );
+
+    harness
+        .app
+        .app_mut()
+        .window_mut(window)
+        .expect("the host's window exists")
+        .set_device_pixel_ratio(DevicePixelRatio::new(2.0).expect("2x is a valid ratio"));
+    harness.app.drain();
+    assert!(
         !harness.sync(),
-        "with fresh leases the frame is steady again (I3)"
+        "the engine rasterizes canvas text per window DPR; the chart owes no frame"
+    );
+    assert!(
+        Arc::ptr_eq(
+            &drawn,
+            &harness
+                .app
+                .canvas_handle(node)
+                .expect("the node holds a canvas")
+        ),
+        "the canvas value must survive a DPI change"
+    );
+    assert!(
+        harness
+            .app
+            .canvas_primitives(node)
+            .iter()
+            .any(|primitive| primitive.kind == PrimitiveKind::GlyphRun),
+        "the rendered frame still draws the labels at the new DPR"
     );
 }
 

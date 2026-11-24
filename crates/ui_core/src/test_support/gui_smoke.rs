@@ -1268,7 +1268,6 @@ fn app() -> TestApp {
     TestApp::with_options(WindowOptions {
         title: SmolStr::new_static("kytrix gui smoke"),
         size: WINDOW,
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     })
 }

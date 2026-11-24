@@ -1,8 +1,8 @@
-use std::{rc::Rc, sync::Arc};
+use std::rc::Rc;
 
 use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use time::{Date, Month, UtcOffset};
-use ui_core::{math::px, paint::color::Color};
+use ui_core::{math::px, paint::color::Color, text::TextContent};
 use widget::test_support::WidgetTestApp;
 
 use super::{
@@ -267,15 +267,15 @@ fn the_axis_and_legend_round_to_whole_percent() {
 }
 
 #[test]
-fn the_text_cache_shapes_a_line_once() {
+fn the_text_cache_returns_the_line_it_measured() {
     let mut app = WidgetTestApp::new();
     let mut cache = ChartTextCache::default();
     let style = axis_style();
 
-    let first = cache.line(app.app_mut(), "8:00 AM", &style);
-    let same = cache.line(app.app_mut(), "8:00 AM", &style);
+    let first = cache.content(app.app_mut(), "8:00 AM", &style);
+    let same = cache.content(app.app_mut(), "8:00 AM", &style);
 
-    assert!(Arc::ptr_eq(&first, &same));
+    assert_eq!(first, same);
     assert_eq!(cache.cached_len(), 1);
 }
 
@@ -286,10 +286,10 @@ fn the_text_cache_keeps_a_line_per_style() {
     let style = axis_style();
     let coloured = label_style(px(12.0), px(14.0), Color::BLACK, REGULAR_WEIGHT);
 
-    let first = cache.line(app.app_mut(), "8:00 AM", &style);
-    let second = cache.line(app.app_mut(), "8:00 AM", &coloured);
+    let first = cache.content(app.app_mut(), "8:00 AM", &style);
+    let second = cache.content(app.app_mut(), "8:00 AM", &coloured);
 
-    assert!(!Arc::ptr_eq(&first, &second));
+    assert_ne!(first, second);
     assert_eq!(cache.cached_len(), 2);
 }
 
@@ -298,63 +298,43 @@ fn the_text_cache_keeps_a_bounded_lru_window() {
     let mut app = WidgetTestApp::new();
     let mut cache = ChartTextCache::default();
     let style = axis_style();
-    let mut second = None;
     for index in 0..TEXT_CACHE_CAPACITY {
-        let handle = cache.line(app.app_mut(), &format!("label-{index}"), &style);
-        if index == 2 {
-            second = Some(handle);
-        }
+        cache.content(app.app_mut(), &format!("label-{index}"), &style);
     }
-    let second = second.expect("the third label was shaped");
     assert_eq!(cache.cached_len(), TEXT_CACHE_CAPACITY);
 
-    cache.line(app.app_mut(), "label-0", &style);
-    let first = cache.line(app.app_mut(), "label-1", &style);
-    cache.line(app.app_mut(), "new-label", &style);
+    cache.content(app.app_mut(), "label-0", &style);
+    cache.content(app.app_mut(), "label-1", &style);
+    cache.content(app.app_mut(), "new-label", &style);
 
     assert_eq!(cache.cached_len(), TEXT_CACHE_CAPACITY);
-    let evicted = cache.line(app.app_mut(), "label-2", &style);
     assert!(
-        !Arc::ptr_eq(&evicted, &second),
-        "the least recently used label was the one dropped"
+        cache.cached("label-0"),
+        "a label that was read again was kept"
     );
-    let kept = cache.line(app.app_mut(), "label-1", &style);
     assert!(
-        Arc::ptr_eq(&kept, &first),
+        cache.cached("label-1"),
         "a label that was read again survived the eviction window"
     );
-}
-
-#[test]
-fn the_text_cache_reshapes_a_line_whose_atlas_lease_is_gone() {
-    let mut app = WidgetTestApp::new();
-    let mut cache = ChartTextCache::default();
-    let style = axis_style();
-    let before = cache.line(app.app_mut(), "8:00 AM", &style);
-
-    let stack = app.app().font_stack().clone();
-    app.app_mut().set_font_stack(stack);
-
-    let after = cache.line(app.app_mut(), "8:00 AM", &style);
-
-    assert!(before.is_stale(), "the font stack change moved the lease");
     assert!(
-        !Arc::ptr_eq(&before, &after),
-        "the stale handle was shaped again"
+        !cache.cached("label-2"),
+        "the least recently used label was the one dropped"
     );
-    assert!(!after.is_stale(), "and the fresh one is drawable");
-    assert_eq!(cache.cached_len(), 1);
+    assert!(cache.cached("new-label"));
 }
 
 #[test]
-fn the_text_cache_measures_the_line_it_shaped() {
+fn the_text_cache_measures_the_line_it_caches() {
     let mut app = WidgetTestApp::new();
     let mut cache = ChartTextCache::default();
     let style = axis_style();
 
     let width = cache.width(app.app_mut(), "100%", &style);
-    let line = cache.line(app.app_mut(), "100%", &style);
+    let measured = app
+        .app_mut()
+        .measure_text(&TextContent::new("100%", style), None)
+        .width;
 
-    assert_eq!(width, line.size().width);
+    assert_eq!(width, measured);
     assert!(width > px(0.0));
 }

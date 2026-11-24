@@ -362,18 +362,8 @@ pub struct LayoutBox {
 
 1. `TextStyle.size`、`letter_spacing`、`TextStyleExtras.word_spacing` 改为 `LogicalPx`；`line_height` 作为无量纲倍数保留 `f32`。
 2. `TextContent`、`InlineBoxSpec.size`、`TextDecoration.rect` 全部 `LogicalPx`。
-3. 删除公开的 `ShapedLine` / `ShapedTextLine` / `ShapedTextItem` / `ShapedTextHandle` / `App::shape_text` / `App::shaped_inline_boxes` / `App::text_scale` / `App::set_text_scale` / `App::clear_text_scale_override`；这些结构全部降 `pub(crate)`。
+3. 删除公开的 `ShapedLine` / `ShapedTextLine` / `ShapedTextItem` / `ShapedGlyphRun` / `ShapedInlineBox` / `ShapedDecoration` / `ShapedTextHandle` / `App::shape_text` / `App::shaped_inline_boxes` / `App::text_scale` / `App::set_text_scale` / `App::clear_text_scale_override`；shaping 快照全部降 `pub(crate)`，`ShapedTextHandle` 整体删除（应用不再持有租约）。
 4. `Canvas` 新增：
-
-```rust
-pub fn push_text(&mut self, content: TextContent, origin: Point<LogicalPx>) -> bool;
-```
-
-   Canvas 内只保存逻辑文本配方（`TextContent` + 逻辑原点），不保存按某个 DPI 光栅化的字形 tile。
-
-5. **Canvas 文本纳入既有 text pass，不给 `PaintPass` 加文本服务。** 理由：`TextContext` / `GlyphRasterizer` / `GlyphAtlas` / `AtlasAllocator` 全在 `App` 上；`InstanceEncoder` 跑在 compositor 线程；且 atlas 上传发生在 paint **之前**，任何“paint 期才光栅化”的方案都会让新 tile 晚一帧上传，必须额外补帧。
-
-   数据模型：
 
 ```rust
 pub struct CanvasText {
@@ -381,33 +371,69 @@ pub struct CanvasText {
     pub origin: Point<LogicalPx>,
 }
 
-enum Primitive {
+pub fn push_text(&mut self, content: TextContent, origin: Point<LogicalPx>) -> bool;
+```
+
+   Canvas 内只保存逻辑文本配方（`TextContent` + 逻辑原点），不保存按某个 DPI 光栅化的字形 tile；空文本不产生配方（返回 `false`）。
+   应用需要文本尺寸时用 `App::measure_text(&mut self, content: &TextContent, max_width: Option<LogicalPx>) -> LogicalSize`：走同一份
+   `TextContext::shape_cached`（键不含 DPR），只测逻辑尺寸、不碰字形图集。`max_width` 必须有限且 ≥ 0：非有限 / 负数不会被静默截断，而是按 `None`（max-content）测量并记一条强类型 `TextDiagnostic::InvalidMeasureWidth { width }`。
+
+5. **Canvas 文本纳入既有 text pass，不给 `PaintPass` 加文本服务。** 理由：`TextContext` / `GlyphRasterizer` / `GlyphAtlas` / `AtlasAllocator`
+   全在 `App` 上；`InstanceEncoder` 跑在 compositor 线程；且 atlas 上传发生在 paint **之前**，任何“paint 期才光栅化”的方案都会让新 tile
+   晚一帧上传，必须额外补帧。
+
+   数据模型：
+
+```rust
+pub enum Primitive {
     Text(Arc<CanvasText>),
 }
 
 pub(crate) struct ResolvedCanvasText {
     key: CanvasTextKey,
     lines: Vec<Rc<ShapedLine>>,
+    pending: bool,
 }
 
 pub(crate) struct CanvasTextKey {
     canvas_generation: u32,
+    font_stack_version: u32,
     dpr_bits: u32,
     atlas_generation: u32,
     glyph_eviction_epoch: u32,
 }
 ```
 
-   帧内流程（`App::frame`）：
+   `Window::canvas_text: HashMap<NodeId, ResolvedCanvasText>` 按 canvas 节点保存解析结果；`Node` 记录 `canvas_generation`，
+   `Window::set_canvas` 每次替换画布值都前进一格。
+
+   帧内流程（`App::frame`，已实现）：
 
    - `refresh_styles` → `refresh_text`（节点文本 shaping，缓存键不含 DPR）→ `refresh_images` → `layout` → `layout_text`（节点文本光栅）；
-   - **新增 `resolve_canvas_text(window)`**：按绘制顺序遍历该窗口的 canvas 节点（含嵌套 canvas），对每个 `Primitive::Text` 配方走 `TextContext::shape_cached`（键不含 DPR）+ 按窗口 DPR 光栅化，写入 `Window::canvas_text: HashMap<NodeId, ResolvedCanvasText>`；key 命中即跳过；
-   - `upload_atlas_pages`；
-   - `paint_frame`：`PaintPass` 的 `Content::Canvas` 分支按同一遍历顺序把 `Primitive::Text` 替换成 `Primitive::GlyphRun`（只做“配方 → 已解析结果”替换，不含任何 DPR 逻辑）。
-6. 文本缓存键：`(text hash, style, max_width, font_stack_version)`，**不包含 DPR**；字形图集键包含量化 ppem。DPI 变化只让 `CanvasTextKey.dpr_bits` 失配，重光栅文本，不重建 `Arc<Canvas>`，也不让应用改任何 cache key。
+   - **`App::resolve_canvas_text(window)`**：先 prune（`retain` 仍存在的 canvas 节点，卸载的节点不会留下解析表条目），再按绘制顺序遍历该窗口的
+     canvas 节点（`NodeTree::canvas_nodes`，DFS 前序 = paint 序，含嵌套 `Primitive::Canvas`），对每个 `Primitive::Text` 配方走
+     `TextContext::shape_cached`（键不含 DPR）+ 按窗口 DPR 光栅化，写入 `Window::canvas_text`；key 命中即跳过。key =
+     `(canvas_generation, font_stack_version, dpr_bits, atlas_generation, glyph_eviction_epoch)`，其中 `atlas_generation` 按配方光栅化后
+     的最新代际与淘汰纪元落账（一轮内换代不白跑一轮）。解析自身导致图集换代 / 逐 tile 淘汰时，作废节点文本行并重跑解析（有界，
+     `MAX_LAYOUT_TEXT_PASSES`）；随后按需重跑 `layout_text`。`pending` 逐节点独立：某节点最后一轮干净就不再算 pending，不会把别的 canvas 的
+     skipped 传播过去；只有最终仍有 pending 的节点才补帧 / 升级。
+   - 软失败（图集满）把条目标 `pending`；每窗口按“连续解析帧”计数（干净的解析帧清零），连续 3 帧才升级 `AtlasExhausted`，与节点文本同口径。
+     相邻帧已解析为 live 的旧结果会保留作回退：新一批结果若含失活 tile 且旧结果仍全活，就不覆盖旧结果，只把条目标 pending 等下一帧重解。
+     a11y-only 帧不会吞掉待重试请求：只要该窗口还有 pending，就继续请求补帧。
+   - `upload_atlas_pages`：同一帧内新分配的 tile 在 paint 前就绪，**不需要补帧**；
+   - `paint_frame`：`PaintPass` 的 `Content::Canvas` 分支按同一遍历顺序把 `Primitive::Text` 替换成 `Primitive::GlyphRun`（只做“配方 →
+     已解析结果”替换，不含任何 DPR 逻辑）。替换前逐条校验 `ShapedLine::atlas_generation` 与 tile 存活（`AtlasAllocator::is_alive`）：
+     解析缺失或 tile 已失活/被淘汰时**只跳过该文本配方**，同一 canvas 的 quad / image / clip / path / 嵌套 canvas 照常发射，并计入
+     `PaintReport::unresolved_canvas_text` → `TextDiagnostic::CanvasTextUnresolved { recipes }`（去重的一次性诊断），同时按窗口有界补帧
+     （连续跳过 3 帧后停止请求，避免无限补帧）。因此解析预算耗尽也绝不会画 stale UV。解析结果变化的节点会被标 paint 脏位：
+     DPI / 图集换代只重建该 lane 的已解析字形，`Arc<Canvas>` 与应用缓存值都不变。
+6. 文本缓存键：`(text hash, style, max_width, font_stack_version)`，**不包含 DPR**；字形图集键包含量化 ppem。DPI 变化只让 `CanvasTextKey.dpr_bits`
+   失配，重光栅文本，不重建 `Arc<Canvas>`，也不让应用改任何 cache key。
 7. 节点文本路径保持逻辑 shaping + 逻辑布局宽度；`TextPass` 只在光栅阶段使用窗口 DPR。`Window::set_scale` 标记所有文本 dirty，但不让布局失效。
-8. 删除的安全网（因为配方不再由应用持有）：`Canvas::without_stale_glyph_runs`、`PaintReport::stale_canvas_runs`、`Window::note_stale_canvas_followup`、`App` 中的 stale-canvas 补帧分支、`TextDiagnostic::CanvasTextStale`、`Canvas::push_shaped_text`、`App::shape_text`、`App::text_scale`、`App::set_text_scale`、`App::clear_text_scale_override`、`App::shaped_inline_boxes`、`EngineError::InvalidTextScale`。
-
+8. 删除的安全网（因为配方不再由应用持有）：`Canvas::without_stale_glyph_runs`、`PaintReport::stale_canvas_runs`、`Window::note_stale_canvas_followup`、
+   `App` 中的 stale-canvas 补帧分支、`TextDiagnostic::CanvasTextStale`、`Canvas::push_shaped_text`、`App::shape_text`、`App::text_scale`、
+   `App::set_text_scale`、`App::clear_text_scale_override`、`App::shaped_inline_boxes`、`EngineError::InvalidTextScale`、`EngineError::TextShapeStandalone`、
+   `App::note_window_dpi`、`text::pack_atlas_lease` 与租约判活路径（`AtlasAllocator::is_alive` 保留，改由画布文本绘制期判活用；槽位纪元仍写进 `AtlasTile` 供测试观测）。
 ### 4.6 资源 / 图片
 
 资源只描述“源 + 内在尺寸”，fit（Contain/Cover/Fill）是绘制属性，永远不进入资源层；栅格目标由引擎接管（参考 Flutter `ResizeImage` / `ImageProvider`、GPUI `ObjectFit`、Qt `QImage` DPR）。
@@ -504,7 +530,7 @@ impl App {
 ### 4.7 `window` / `app` / `platform` / `a11y`
 
 1. `Window::size()` / `set_size()` / `WindowOptions.size` 全部 `Size<LogicalPx>`；`WindowOptions.scale` 从生产 API 删除，测试用 `TestApp::with_scale` 注入。
-2. `Window::scale()` / `set_scale()` / `scale_epoch()` 从公开 API 删除；`set_scale` 保留 `pub(crate)` 给平台层，`device_pixel_ratio` 为引擎内部字段。
+2. `Window::scale()` / `set_scale()` / `dpi_epoch()` 从公开 API 删除；`set_scale` 保留 `pub(crate)` 给平台层，DPR 为引擎内部字段。test-support 侧的注入 / 观测面是 `TestApp::{with_scale, set_dpr}` 与 `Window::{device_pixel_ratio, set_device_pixel_ratio, physical_surface}`。
 3. `Event::DpiChanged` 只保留 `dpi: u32`（诊断信息）；删除 `scale` 字段。应用不需要也不应该接收 DPI 比例来做几何。
 4. `App::note_window_dpi`、`default_text_scale`、`text_scale_override` 删除；`TextScale` 若未来要支持无障碍字号，作为独立应用级字号倍率而不是 DPI。
 5. 平台层：
@@ -519,14 +545,17 @@ impl App {
 - 旧的非泛型 `math::{Point, Size, Rect}` 与 `math::Scale`（替换为 `Point<T>/Size<T>/Rect<T>` 和 `DevicePixelRatio`）
 - `Rect::{snap_to_device, to_physical_f32, to_physical, to_physical_rounded, to_physical_covering}`
 - `math::snap_stroke_width`（算法移入 `DevicePixelRatio::stroke_width`）
-- `Window::{scale, set_scale, scale_epoch}`（`set_scale` 降为 `pub(crate)`）
+- `Window::{scale, set_scale, dpi_epoch}`（`set_scale` 降为 `pub(crate)`）
 - `WindowOptions.scale`
 - `Event::DpiChanged.scale`
-- `App::{shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`
-- `text::{ShapedLine, ShapedTextLine, ShapedTextItem, ShapedTextHandle, ShapedGlyphRun, ShapedInlineBox, ShapedDecoration}`（全部降 `pub(crate)`）
-- `Canvas::{push_shaped_text, without_stale_glyph_runs}`
+- `App::{shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override, note_window_dpi}`
+- `text::{ShapedLine, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ShapedDecoration}`（全部降 `pub(crate)`）
+- `text::ShapedTextHandle` 与 `text::pack_atlas_lease`（整体删除：应用不再持有租约）
+- `App::atlas_generation_lease`（`ShapedTextHandle` 的唯一消费者）
+- `Canvas::{push_shaped_text, without_stale_glyph_runs}`；`Canvas::push_text(GlyphRun)` 改名 `push_glyph_run` 并降 `pub(crate)`
 - `Window::note_stale_canvas_followup`、`PaintReport::stale_canvas_runs`、`TextDiagnostic::CanvasTextStale`
-- `EngineError::InvalidTextScale`
+- 编码期 stale-run 安全网（`Canvas::without_stale_glyph_runs` / `PaintReport::stale_canvas_runs`）；`AtlasAllocator::is_alive` 与 `Slot::epoch` 保留，改由画布文本绘制期判活
+- `EngineError::{InvalidTextScale, TextShapeStandalone}`
 - `ResourceCache::{insert_for_display, insert_svg_for_display, insert_owned_svg_for_display, insert_owned_at_size, insert_at_size, insert_async_at_size}` 的公开面
 - `App::resources_mut`（应用只能走逻辑资源 API）
 - `PhysicalBounds`（合并到 `DeviceRect`）
@@ -720,25 +749,39 @@ DeviceRect = (x0, y0, x1, y1)
 - `profile_ui` Dicebear 走引擎 SVG 资源，删 `image` / `resvg` / `usvg`。
 - 所有 `window.scale()` 调用从 `ui_kit/src` 消失；grep 门禁见 §8。
 
-### 阶段 E：Canvas 文本
+### 阶段 E：Canvas 文本（已实现）
 
-**E1 引擎侧**
+**E1 引擎侧（已落地）**
 
-- `Canvas::push_text(TextContent, origin)` + `Primitive::Text(Arc<CanvasText>)`。
-- `Window::canvas_text` 解析表 + `App::resolve_canvas_text(window)`（在 `upload_atlas_pages` 之前）。
-- `PaintPass` 做配方 → `GlyphRun` 替换。
-- 删除 `App::shape_text` / `text_scale` / `set_text_scale` / `clear_text_scale_override` / `shaped_inline_boxes`、`ShapedTextHandle`、`Canvas::push_shaped_text`、`without_stale_glyph_runs`、`stale_canvas_runs`、`note_stale_canvas_followup`、`TextDiagnostic::CanvasTextStale`、`EngineError::InvalidTextScale`。
+- `Canvas::push_text(TextContent, origin)` + `Primitive::Text(Arc<CanvasText>)`；空文本不产生配方。
+- `Window::canvas_text: HashMap<NodeId, ResolvedCanvasText>` 解析表（key = canvas generation / 字体栈版本 / DPR bits / atlas generation / 字形淘汰纪元；
+  `Node::canvas_generation` 随 `set_canvas` 前进）+ `App::resolve_canvas_text(window)`（在 `upload_atlas_pages` 之前）。
+- `PaintPass` 的 `Content::Canvas` 分支做配方 → `GlyphRun` 替换；解析缺失时跳过并计入 `PaintReport::unresolved_canvas_text` →
+  `TextDiagnostic::CanvasTextUnresolved`。
+- `App::measure_text(&TextContent, max_width)`：逻辑像素测量入口，走同一 shaping 缓存、不含 DPR。
+- 删除 `App::shape_text` / `text_scale` / `set_text_scale` / `clear_text_scale_override` / `shaped_inline_boxes`、`ShapedTextHandle`、
+  `Canvas::push_shaped_text`、`without_stale_glyph_runs`、`stale_canvas_runs`、`note_stale_canvas_followup`、
+  `TextDiagnostic::CanvasTextStale`、`EngineError::{InvalidTextScale, TextShapeStandalone}`、`App::note_window_dpi`、
+  编码期 stale-run 安全网；`AtlasAllocator::is_alive` 保留用于画布文本绘制期判活。`ShapedLine` 等全部降 `pub(crate)`。
 
-**E2 widgets 迁移**
+**E2 widgets 迁移（已落地）**
 
-- 7 个图表 widget 与 `widget` crate 迁 `push_text`；删除 `ChartTextCache.scale` 等 DPI 失效判据。
+- 7 个图表 widget、`coin_market_cap_fear_and_greed_index`、`hyperliquid_wallet` 与 `widget` crate 迁 `push_text`；
+  文本缓存改为「逻辑输入 + `App::measure_text` 宽度」，删除 `ChartTextCache.scale`、`text_scale` 键、`has_stale` / `drop_stale`、
+  `painted_text` 句柄留存等 DPI / 租约失效判据。
 
-### 阶段 F：DPI 公开面收口
+**E1 新增测试**：`canvas_text_does_not_rebuild_on_dpi_change`、`a_matching_recipe_key_does_not_shape_again`、
+`nested_canvases_resolve_their_own_text_in_paint_order`、`changing_the_recipe_reresolves_the_canvas`、
+`new_glyph_tiles_are_ready_before_the_atlas_upload`、`measure_text_*`、`canvas_text_paints_the_recipe_color`、
+`canvas_text_reports_atlas_pressure_and_retries`、`canvas_text_recipes_become_glyph_runs_during_paint`、`an_unresolved_canvas_recipe_is_skipped_and_counted`。
 
-- 删除 `Window::{scale, set_scale, scale_epoch}` 公开面、`WindowOptions.scale`、`Event::DpiChanged.scale`、`App::{note_window_dpi, default_text_scale, text_scale_override}`。
-- 平台层内部化 DPR；新增 test-support 的 `TestApp::with_scale` / `TestApp::set_dpr` / `SnapshotCase.scale`。
-- `ui_core` examples 加 `required-features`，物理观测收敛到 test-support 面。
-- 全仓 grep 旧 API 为 0。
+### 阶段 F：DPI 公开面收口（已实现）
+
+- 删除 `Window::{scale, dpi_epoch}` 公开面与 `WindowOptions.scale`；`set_scale` 降为 `pub(crate)` 给平台层；`Event::DpiChanged` 只保留 `dpi: u32`（`App::{note_window_dpi, default_text_scale, text_scale_override}` 已随 E 阶段文本 scale 机制一并删除）。
+- test-support 侧的 DPR 注入 / 观测面：`TestApp::{with_scale, set_dpr}`、`Window::{device_pixel_ratio, set_device_pixel_ratio, physical_surface}`、`SnapshotCase.scale`；`FrameScript` 的 DPI 变化走 `TestApp::set_dpr`。
+- `ui_core` 的 `frameless_smoke` / `p1_win_placement_evidence` / `acceptance` 加 `required-features = ["test-support"]`，物理观测收敛到测试面；`demo` 的图标变体改走 `App::prepare_image_variant`，不读 DPR。
+- 全仓 grep 旧公开面为 0（`Window::scale` / `.scale().factor` / `WindowOptions` 的 `scale` 字段 / `Event::DpiChanged.scale`）；`dpi_epoch()` 是新的引擎内部名（`pub(crate)`），只出现在 crate 内与既有测试名 `quads_snap_to_device_pixels` 的白名单。
+- **F1 新增测试**：`dpi_changed_exposes_only_the_diagnostic_dpi`、`default_window_starts_at_unit_device_pixel_ratio`、`with_scale_injects_the_device_pixel_ratio`、`with_scale_rasterizes_canvas_text_at_the_injected_ratio`、`a_dpi_change_repaints_without_relayout_and_the_event_is_diagnostic_only`；`dpi_change_does_not_invalidate_layout` 保留。
 
 ### 阶段 G：验收
 
@@ -762,7 +805,12 @@ DeviceRect = (x0, y0, x1, y1)
 | `damage_covers_the_unsnapped_rect` | Damage 使用外扩规则，覆盖 Quad 未吸附/吸附后的所有边界 |
 | `dpi_change_does_not_invalidate_layout` | `set_scale` 后根没有 LAYOUT 脏位，layout bounds 不变 |
 | `dpi_change_rerasterizes_text_only` | 文本 tile 换代但文本布局宽度不变 |
-| `canvas_text_does_not_rebuild_on_dpi_change` | 同一 `Arc<Canvas>` 在 DPI 变化后仍可绘制，文本按新 DPR 重光栅（阶段 A4/E1 落地） |
+| `canvas_text_does_not_rebuild_on_dpi_change` | 同一 `Arc<Canvas>` 在 DPI 变化后仍可绘制，文本按新 DPR 重光栅（E1 已落地：`app::canvas_text::tests`） |
+| `a_matching_recipe_key_does_not_shape_again` | 配方 key 命中时不再调用 shaping（E1 已落地） |
+| `nested_canvases_resolve_their_own_text_in_paint_order` | 多个 canvas 节点按 paint 序各自解析、各自保留 origin（E1 已落地） |
+| `changing_the_recipe_reresolves_the_canvas` | 内容/样式变化 ⇒ `canvas_generation` 前进并重新解析（E1 已落地） |
+| `new_glyph_tiles_are_ready_before_the_atlas_upload` | 同帧新 tile 在 `upload_atlas_pages` 前就绪，无需补帧（E1 已落地） |
+| `measure_text_*` | 逻辑测量：空文本为零、限宽增高、与窗口 DPR 无关（E1 已落地） |
 | `ui_kit_has_no_device_scale_dependency` | grep 门禁（见 §8.3）（阶段 A4/E1 落地） |
 | `toggle_logical_geometry_is_stable_at_every_dpi` | Toggle 的 layout override 逻辑几何与 DPI 无关（阶段 A4/E1 落地） |
 
@@ -782,16 +830,19 @@ DeviceRect = (x0, y0, x1, y1)
 ```powershell
 Select-String -Path crates/ui_kit/src/**,crates/widgets/**,crates/profile_ui/src/** -Pattern 'Window::scale|\.scale\(\)\.factor|device_length|device_length_with_parity|text_scale|shape_text|push_shaped_text'
 Select-String -Path crates/ui_core/src/**,crates/ui_kit/src/** -Pattern 'snap_to_device|to_physical_f32|to_physical_rounded|to_physical_covering|snap_stroke_width'
+Get-ChildItem -Recurse -Filter *.rs crates | Select-String -Pattern 'Window::scale|\.scale\(\)\.factor|dpi_epoch()|WindowOptions \{ scale|DpiChanged \{ dpi, scale'
 ```
 
-两个门禁在阶段 F 后都必须是 0（测试代码里的纯逻辑 scale 常量除外，需明确白名单）。
+三个门禁在阶段 F 后都必须是 0（测试代码里的纯逻辑 scale 常量除外，需明确白名单）。
 
 ### 8.4 现有测试基线
 
-- `cargo test -p ui_core --lib --features hud,test-support`：2340 passed / 1 ignored；其中 `math` 单测 40 个（原 2344 中的 `to_physical_*` / `snap_stroke_width` 用例合并重写为逐档 DPR 表驱动用例）。
+- `cargo test --workspace`：8604 passed / 0 failed / 30 ignored（102 个测试目标）。
+- `cargo test -p ui_core --lib --features hud,test-support`：2348 passed / 1 ignored（E1 删除 standalone shaping API 后其 24 条句柄/租约用例退场，新增 18 条 canvas 文本 / measurement / pass 替换 / 字体栈 / 卸载 prune / 补帧预算用例 + 2 条节点文本 inline-box / ellipsis 等价覆盖；F1 新增 5 条 DPI 公开面用例；`math` 单测 40 个）。
 - `cargo test -p ui_kit --lib`：765 passed（kit 716 / theme 49；`style_builder` 测试已随模块迁入 `ui_core`）。
-- `cargo test -p ui_core --features test-support --test snapshot`：11 passed（WARP 14 张 golden，C1 期间逐图 `max=0 avg=0.000 mismatch=0`）。
-- `gui_smoke --ignored`：6 场景 PASS（WARP）。
+- `cargo test -p ui_core --features test-support --test snapshot`：11 passed（WARP 14 张 golden，C1 期间逐图 `max=0 avg=0.000 mismatch=0`；F 阶段重跑仍为 11 passed，无重基）。
+- `gui_smoke`：`--features test-support --test gui_smoke` 默认 1 ignored（需要真实窗口/显示）；`--ignored` 在 WARP 下 1 test（内部 6 场景）PASS。
+- `cargo check -p ui_core --all-targets`（**不带 feature**）：0 warning / 0 error。3 个 `required-features = ["test-support"]` 的 example（`snapshot_demo` / `frameless_smoke` / `acceptance` 等）与 `frame_record` / `snapshot` / `layout` / `hud` 集成测试在无 feature 时被 Cargo 跳过，属预期；带 feature 的完整门禁见上。
 - `acceptance -- cpu`：**既有缺陷**，文本帧 p99 ≈ 5.9–7.0 ms > 4 ms 阈值；与本轮重构无关。
 - Golden 数量与三端目标保持不变（42 张）。
 

@@ -26,7 +26,7 @@ fn new_window_has_root_and_empty_scene() {
     assert_eq!(window.tree().len(), 1, "初始只有 root");
     assert_eq!(window.scene().lane_count(), 0);
     assert!(window.scene().is_empty());
-    assert_eq!(window.scale(), DevicePixelRatio::ONE);
+    assert_eq!(window.device_pixel_ratio(), DevicePixelRatio::ONE);
 }
 
 #[test]
@@ -47,9 +47,9 @@ fn dpi_change_does_not_invalidate_layout() {
     let _ = window.compute_layout().expect("布局成功");
     window.tree_mut().clear_all_dirty_for_test();
     let bounds_before = window.tree().get(root).expect("root 存在").layout().bounds;
-    let epoch = window.scale_epoch();
+    let epoch = window.dpi_epoch();
 
-    window.set_scale(DevicePixelRatio::new(2.0).expect("合法比例"));
+    window.set_device_pixel_ratio(DevicePixelRatio::new(2.0).expect("合法比例"));
 
     let flags = window.tree().get(root).expect("root 存在").dirty();
     assert!(
@@ -66,7 +66,7 @@ fn dpi_change_does_not_invalidate_layout() {
         "DPI 变化不得改变 layout bounds"
     );
     assert!(window.full_damage_pending, "DPI 变化必须标整帧重绘");
-    assert_eq!(window.scale_epoch(), epoch + 1, "scale_epoch 精确递增 1");
+    assert_eq!(window.dpi_epoch(), epoch + 1, "dpi_epoch 精确递增 1");
 }
 
 #[test]
@@ -85,12 +85,24 @@ fn window_options_default_values() {
     assert_eq!(options.owner, None, "默认没有 owner（独立顶层窗口）");
     assert!(!options.modal, "默认不是模态窗口");
     assert!(!options.always_on_top, "默认不置顶");
-    assert_eq!(options.scale, DevicePixelRatio::ONE);
     assert_eq!(
         options.background,
         Color::BLACK,
         "默认背景必须是不透明黑（Color::default() 是透明）"
     );
+}
+
+#[test]
+fn default_window_starts_at_unit_device_pixel_ratio() {
+    let window = window();
+
+    assert_eq!(window.device_pixel_ratio(), DevicePixelRatio::ONE);
+    assert_eq!(
+        window.physical_surface(),
+        (800, 600),
+        "1:1 下物理 surface 必须与默认逻辑尺寸逐像素一致"
+    );
+    assert_eq!(window.dpi_epoch, 0, "新窗口的 DPI 世代从 0 开始");
 }
 
 #[test]
@@ -225,11 +237,11 @@ fn surface_starts_and_tracks_the_covering_size() {
         (1.5, (1200, 900)),
         (1.75, (1400, 1050)),
     ] {
-        window.set_scale(DevicePixelRatio::new(factor).expect("合法比例"));
+        window.set_device_pixel_ratio(DevicePixelRatio::new(factor).expect("合法比例"));
         assert_eq!(window.physical_surface(), expected, "scale {factor}");
         assert_eq!(
             window.physical_surface(),
-            covering_surface(window.size(), window.scale()),
+            covering_surface(window.size(), window.device_pixel_ratio()),
             "surface 必须与 covering 公式一致"
         );
     }
@@ -238,7 +250,7 @@ fn surface_starts_and_tracks_the_covering_size() {
     assert_eq!(window.physical_surface(), (450, 176));
     assert_eq!(
         window.physical_surface(),
-        covering_surface(window.size(), window.scale())
+        covering_surface(window.size(), window.device_pixel_ratio())
     );
     window.set_size(LogicalSize::new(px(0.0), px(0.0)));
     assert_eq!(window.physical_surface(), (1, 1));
@@ -251,7 +263,7 @@ fn set_surface_clamps_marks_full_damage_and_ignores_the_same_value() {
     assert_eq!(window.physical_surface(), (800, 600));
     assert!(!window.full_damage_pending);
     window.tree_mut().clear_all_dirty_for_test();
-    let epoch = window.scale_epoch();
+    let epoch = window.dpi_epoch();
 
     window.set_surface((0, 0));
     assert_eq!(window.physical_surface(), (1, 1), "零尺寸钳到 1 px");
@@ -266,7 +278,7 @@ fn set_surface_clamps_marks_full_damage_and_ignores_the_same_value() {
             .contains(DirtyFlags::LAYOUT),
         "set_surface 不标 layout（只是目标尺寸，不是布局变化）"
     );
-    assert_eq!(window.scale_epoch(), epoch, "set_surface 不动 scale_epoch");
+    assert_eq!(window.dpi_epoch(), epoch, "set_surface 不动 dpi_epoch");
 
     window.full_damage_pending = false;
     window.set_surface((1, 1));
@@ -300,7 +312,7 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
     window.tree_mut().clear_all_dirty_for_test();
     window.set_surface((999, 777));
     window.full_damage_pending = false;
-    let epoch = window.scale_epoch();
+    let epoch = window.dpi_epoch();
     let root = window.tree().root();
 
     window.set_size(LogicalSize::new(px(256.8), px(100.5)));
@@ -323,11 +335,11 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
             .contains(DirtyFlags::LAYOUT),
         "尺寸变化仍必须标根 LAYOUT"
     );
-    assert_eq!(window.scale_epoch(), epoch, "set_size 不动 scale_epoch");
+    assert_eq!(window.dpi_epoch(), epoch, "set_size 不动 dpi_epoch");
 
     window.tree_mut().clear_all_dirty_for_test();
     window.full_damage_pending = false;
-    window.set_scale(DevicePixelRatio::new(1.25).expect("合法比例"));
+    window.set_device_pixel_ratio(DevicePixelRatio::new(1.25).expect("合法比例"));
     assert_eq!(
         window.physical_surface(),
         (999, 777),
@@ -347,7 +359,7 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
             .contains(DirtyFlags::LAYOUT),
         "DPI 变化不得标根 LAYOUT"
     );
-    assert_eq!(window.scale_epoch(), epoch + 1, "scale_epoch 照常递增");
+    assert_eq!(window.dpi_epoch(), epoch + 1, "dpi_epoch 照常递增");
 
     window.set_surface((449, 176));
     assert_eq!(
@@ -360,7 +372,7 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
         LogicalSize::new(px(800.0), px(600.0)),
         DevicePixelRatio::ONE,
     ));
-    same_value.set_scale(DevicePixelRatio::new(1.25).expect("合法比例"));
+    same_value.set_device_pixel_ratio(DevicePixelRatio::new(1.25).expect("合法比例"));
     assert_eq!(
         same_value.physical_surface(),
         (800, 600),
@@ -428,7 +440,7 @@ fn dpi_change_does_not_move_logical_boxes() {
     );
 
     for factor in [1.5f32, 2.0] {
-        window.set_scale(DevicePixelRatio::new(factor).expect("合法比例"));
+        window.set_device_pixel_ratio(DevicePixelRatio::new(factor).expect("合法比例"));
         assert!(
             window.tree_mut().invalidate_layout(root),
             "前置：必须真的请求重排，否则缓存命中下测不到 DPI 相关 measure"
@@ -484,7 +496,7 @@ fn layout_is_identical_at_every_device_scale() {
     let reference = snapshot(&window);
 
     for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
-        window.set_scale(DevicePixelRatio::new(factor).expect("合法比例"));
+        window.set_device_pixel_ratio(DevicePixelRatio::new(factor).expect("合法比例"));
         let root = window.tree().root();
         assert!(
             window.tree_mut().invalidate_layout(root),
@@ -555,16 +567,16 @@ fn set_size_marks_root_layout_and_clears_cache() {
     assert_eq!(window.size(), LogicalSize::new(px(640.0), px(480.0)));
 }
 #[test]
-fn scale_epoch_bumps_on_dpi_change() {
+fn dpi_epoch_bumps_on_dpi_change() {
     let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
-    assert_eq!(window.scale_epoch(), 0);
+    assert_eq!(window.dpi_epoch(), 0);
 
-    window.set_scale(DevicePixelRatio::new(1.5).expect("finite scale"));
-    assert_eq!(window.scale_epoch(), 1);
+    window.set_device_pixel_ratio(DevicePixelRatio::new(1.5).expect("finite scale"));
+    assert_eq!(window.dpi_epoch(), 1);
 
-    window.set_scale(DevicePixelRatio::new(2.0).expect("finite scale"));
-    assert_eq!(window.scale_epoch(), 2);
-    assert_eq!(window.scale().factor(), 2.0);
+    window.set_device_pixel_ratio(DevicePixelRatio::new(2.0).expect("finite scale"));
+    assert_eq!(window.dpi_epoch(), 2);
+    assert_eq!(window.device_pixel_ratio().factor(), 2.0);
 }
 
 use crate::paint::style::{PaintSpec, StylePatch};

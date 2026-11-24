@@ -437,14 +437,14 @@ pub(crate) fn refresh_text(
         raster,
         text_dirty_scratch,
         windows,
-        scale_epochs,
+        dpi_epochs,
         pending_dirty,
         ..
     } = app;
     let window_id = window;
-    let scale_epoch = windows.get(&window_id)?.scale_epoch();
-    if scale_epochs.get(&window_id).copied().unwrap_or(0) != scale_epoch {
-        scale_epochs.insert(window_id, scale_epoch);
+    let dpi_epoch = windows.get(&window_id)?.dpi_epoch();
+    if dpi_epochs.get(&window_id).copied().unwrap_or(0) != dpi_epoch {
+        dpi_epochs.insert(window_id, dpi_epoch);
         if let Some(target) = windows.get_mut(&window_id) {
             target.tree_mut().invalidate_text_lines();
         }
@@ -481,7 +481,7 @@ pub(crate) fn refresh_text(
         let key = crate::text::cache::ShapeKey::new(&content, text.font_stack_version());
         if let Some(slot) = tree.text_slot(node)
             && slot.key() == key
-            && slot.scale_epoch() == scale_epoch
+            && slot.dpi_epoch() == dpi_epoch
             && Rc::ptr_eq(slot.shaped(), &shaped)
         {
             report.skipped += 1;
@@ -500,7 +500,7 @@ pub(crate) fn refresh_text(
             node,
             Rc::clone(&shaped),
             key,
-            scale_epoch,
+            dpi_epoch,
             measured,
             size_changed,
         );
@@ -753,7 +753,8 @@ mod tests {
         paint::{atlas::AtlasKind, primitive::Primitive},
         render::AtlasAllocator,
         text::{
-            TextContent, TextDiagnostic, TextRun, TextStyle, atlas::ATLAS_FULL_ESCALATION_FRAMES,
+            InlineAlign, InlineBoxSpec, TextContent, TextDiagnostic, TextOverflow, TextRun,
+            TextStyle, atlas::ATLAS_FULL_ESCALATION_FRAMES,
         },
         window::{WindowId, WindowOptions},
     };
@@ -1123,6 +1124,111 @@ mod tests {
         assert!(
             line.glyph_runs().any(|run| !run.glyphs.is_empty()),
             "重光栅后必须真的有字形（不是永久跳过）"
+        );
+    }
+
+    #[test]
+    fn a_node_text_inline_box_lands_in_the_shaped_line() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let spec = InlineBoxSpec {
+            id: 7,
+            index: 1,
+            size: crate::math::LogicalSize::new(px(12.0), px(12.0)),
+            baseline: None,
+            align: InlineAlign::Baseline,
+            paint: None,
+        };
+        let node = {
+            let w = app.window_mut(window).expect("窗口存在");
+            let root = w.tree().root();
+            NodeBuilder::text("a b", TextStyle::new(px(16.0)))
+                .inline_boxes([spec])
+                .style(text_style(Some(200.0)))
+                .build(w.tree_mut(), root)
+                .expect("挂载成功")
+        };
+        let report = frame_text(&mut app, window);
+        assert!(report.laid > 0, "the text node must be laid out");
+        let line = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .text_line(node)
+            .expect("laid line")
+            .clone();
+        let inline = line
+            .lines
+            .iter()
+            .flat_map(|shaped| shaped.items.iter())
+            .find_map(|item| match item {
+                crate::text::ShapedTextItem::InlineBox(inline) => Some(inline),
+                crate::text::ShapedTextItem::GlyphRun(_) => None,
+            })
+            .expect("the inline box lands in the shaped line");
+        assert_eq!(inline.id, 7);
+        assert_eq!(
+            inline.rect.size,
+            crate::math::LogicalSize::new(px(12.0), px(12.0)),
+            "the inline box keeps its requested size"
+        );
+    }
+
+    #[test]
+    fn a_node_text_ellipsis_truncates_to_the_max_lines() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let mut ellipsis_style = TextStyle::new(px(16.0));
+        ellipsis_style.overflow = TextOverflow::Ellipsis;
+        ellipsis_style.max_lines = 1;
+        let mut clip_style = TextStyle::new(px(16.0));
+        clip_style.overflow = TextOverflow::Clip;
+        let long = "the quick brown fox jumps over the lazy dog";
+        let node = {
+            let w = app.window_mut(window).expect("窗口存在");
+            let root = w.tree().root();
+            NodeBuilder::text(long, ellipsis_style)
+                .style(text_style(Some(120.0)))
+                .build(w.tree_mut(), root)
+                .expect("挂载成功")
+        };
+        let control = {
+            let w = app.window_mut(window).expect("窗口存在");
+            let root = w.tree().root();
+            NodeBuilder::text(long, clip_style)
+                .style(text_style(Some(120.0)))
+                .build(w.tree_mut(), root)
+                .expect("挂载成功")
+        };
+        frame_text(&mut app, window);
+        let ellipsis = {
+            let tree = app.window(window).expect("窗口存在").tree();
+            (
+                tree.text_line(node).expect("laid line").clone(),
+                tree.text_line(control).expect("control line").clone(),
+            )
+        };
+        assert!(
+            ellipsis.1.lines.len() > 1,
+            "the control text wraps past the max visible lines"
+        );
+        assert_eq!(
+            ellipsis.0.lines.len(),
+            1,
+            "ellipsis truncates the visible line count"
+        );
+        assert!(
+            ellipsis.0.width <= px(121.0),
+            "the ellipsized line stays inside the measure width"
+        );
+        assert!(
+            ellipsis.0.glyph_runs().any(|run| !run.glyphs.is_empty()),
+            "the truncated line still carries glyphs"
+        );
+        assert_eq!(
+            ellipsis.0.text.as_str(),
+            long,
+            "the shaped line keeps the logical text"
         );
     }
 }

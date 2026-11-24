@@ -1,4 +1,5 @@
 mod a11y;
+pub(crate) mod canvas_text;
 mod focus;
 mod frame;
 mod frame_budget;
@@ -20,6 +21,7 @@ use bytes::Bytes;
 use smol_str::SmolStr;
 
 use self::{
+    canvas_text::ResolvedCanvasText,
     frame::{FrameScheduler, FrameState},
     surface::covering_surface,
 };
@@ -143,7 +145,6 @@ pub struct WindowOptions {
     pub always_on_top: bool,
     pub decorations: Decorations,
     pub icon: Option<Bytes>,
-    pub scale: DevicePixelRatio,
     pub background: Color,
 }
 
@@ -160,7 +161,6 @@ impl Default for WindowOptions {
             always_on_top: false,
             decorations: Decorations::Native,
             icon: None,
-            scale: DevicePixelRatio::ONE,
             background: Color::BLACK,
         }
     }
@@ -245,7 +245,9 @@ pub struct Window {
     surface_from_platform: bool,
     #[cfg(target_os = "linux")]
     buffer_scale: i32,
-    scale_epoch: u32,
+    dpi_epoch: u32,
+    canvas_text_pending_frames: u8,
+    canvas_text_skip_frames: u8,
     frame_budget: frame_budget::FrameBudget,
     scheduler: FrameScheduler,
     composer: Option<WindowComposer>,
@@ -271,7 +273,7 @@ pub struct Window {
     glyph_atlas_rects: crate::render::DirtyRects,
     image_atlas_rects: [crate::render::DirtyRects; MAX_IMAGE_PAGES as usize],
     atlas_deferrals: u8,
-    stale_canvas_followup_generation: Option<u32>,
+    canvas_text: ahash::HashMap<NodeId, ResolvedCanvasText>,
     timings: FrameTimings,
     paint_order: Vec<crate::paint::scene::LaneId>,
     full_damage_pending: bool,
@@ -308,7 +310,7 @@ pub struct Window {
 
 impl Window {
     pub(crate) fn new(id: WindowId, options: WindowOptions) -> Self {
-        let scale = options.scale;
+        let scale = DevicePixelRatio::ONE;
         let surface = covering_surface(options.size, scale);
         let state = WindowState::for_decorations(options.decorations);
         let tree = NodeTree::new();
@@ -322,7 +324,7 @@ impl Window {
             surface_from_platform: false,
             #[cfg(target_os = "linux")]
             buffer_scale: 1,
-            scale_epoch: 0,
+            dpi_epoch: 0,
             frame_budget: frame_budget::FrameBudget::default(),
             scheduler: FrameScheduler::new(),
             composer: Some(WindowComposer::new()),
@@ -348,7 +350,9 @@ impl Window {
             glyph_atlas_rects: crate::render::DirtyRects::default(),
             image_atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
-            stale_canvas_followup_generation: None,
+            canvas_text: ahash::HashMap::default(),
+            canvas_text_pending_frames: 0,
+            canvas_text_skip_frames: 0,
             timings: FrameTimings::new(),
             paint_order: Vec::new(),
             full_damage_pending: false,
@@ -808,8 +812,31 @@ impl Window {
     pub(crate) fn reset_atlas_deferrals(&mut self) {
         surface::reset_atlas_deferrals(self)
     }
-    pub(crate) fn note_stale_canvas_followup(&mut self, generation: u32) -> bool {
-        surface::note_stale_canvas_followup(self, generation)
+    pub(crate) fn canvas_text(&self) -> &ahash::HashMap<NodeId, ResolvedCanvasText> {
+        &self.canvas_text
+    }
+    pub(crate) fn canvas_text_mut(&mut self) -> &mut ahash::HashMap<NodeId, ResolvedCanvasText> {
+        &mut self.canvas_text
+    }
+    pub(crate) fn canvas_text_pending_frames(&self) -> u8 {
+        self.canvas_text_pending_frames
+    }
+    pub(crate) fn note_canvas_text_pending(&mut self) -> bool {
+        self.canvas_text_pending_frames = self.canvas_text_pending_frames.saturating_add(1);
+        self.canvas_text_pending_frames >= crate::text::atlas::ATLAS_FULL_ESCALATION_FRAMES as u8
+    }
+    pub(crate) fn reset_canvas_text_pending(&mut self) {
+        self.canvas_text_pending_frames = 0;
+    }
+    pub(crate) fn note_canvas_text_skip(&mut self) -> bool {
+        if self.canvas_text_skip_frames >= crate::text::atlas::ATLAS_FULL_ESCALATION_FRAMES as u8 {
+            return false;
+        }
+        self.canvas_text_skip_frames += 1;
+        true
+    }
+    pub(crate) fn reset_canvas_text_skip(&mut self) {
+        self.canvas_text_skip_frames = 0;
     }
     pub(crate) fn queue_atlas_upload(
         &mut self,
@@ -849,8 +876,10 @@ impl Window {
     pub fn enable_offscreen_renderer(&mut self) -> Result<(), EngineError> {
         surface::enable_offscreen_renderer(self)
     }
-    fn physical_surface(&self) -> (u32, u32) {
-        surface::physical_surface(self)
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn physical_surface(&self) -> (u32, u32) {
+        self.surface
     }
     #[cfg(windows)]
     pub(crate) fn presented_surface(&self) -> (u32, u32) {
@@ -864,16 +893,25 @@ impl Window {
         surface::frame_rect(self)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
-    pub fn scale(&self) -> DevicePixelRatio {
+    pub fn device_pixel_ratio(&self) -> DevicePixelRatio {
+        self.scale
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_device_pixel_ratio(&mut self, dpr: DevicePixelRatio) {
+        scale::set_scale(self, dpr)
+    }
+    #[must_use]
+    pub(crate) fn scale(&self) -> DevicePixelRatio {
         scale::scale(self)
     }
-    pub fn set_scale(&mut self, scale: DevicePixelRatio) {
-        scale::set_scale(self, scale)
-    }
     #[must_use]
-    pub fn scale_epoch(&self) -> u32 {
-        scale::scale_epoch(self)
+    pub(crate) fn dpi_epoch(&self) -> u32 {
+        scale::dpi_epoch(self)
+    }
+    pub(crate) fn set_scale(&mut self, scale: DevicePixelRatio) {
+        scale::set_scale(self, scale)
     }
 
     #[must_use]

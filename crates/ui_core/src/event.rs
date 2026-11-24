@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use crate::{
     interaction::DragPhase,
     layout::hit_test::HitResult,
-    math::{DevicePixelRatio, LogicalPoint, LogicalSize, px},
+    math::{LogicalPoint, LogicalSize, px},
     node::id::NodeId,
 };
 
@@ -741,7 +741,6 @@ pub enum Event {
     Ime(ImeEvent),
     DpiChanged {
         dpi: u32,
-        scale: DevicePixelRatio,
     },
     AppearanceChanged {
         dark: bool,
@@ -820,11 +819,22 @@ mod tests {
     };
 
     use super::{
-        Action, ActionSource, InputEvent, InputOutcome, Key, KeyBinding, KeyCode, KeyState,
+        Action, ActionSource, Event, InputEvent, InputOutcome, Key, KeyBinding, KeyCode, KeyState,
         Modifiers, PointerButton, ScrollPhase, ScrollUnit, modifier_key_transitions,
         should_emit_text, timestamp_from_ticks, timestamp_from_ticks_32,
     };
     use crate::math::{LogicalPoint, px};
+
+    #[test]
+    fn dpi_changed_exposes_only_the_diagnostic_dpi() {
+        let event = Event::DpiChanged { dpi: 144 };
+
+        assert_eq!(event, Event::DpiChanged { dpi: 144 });
+        let Event::DpiChanged { dpi } = event else {
+            panic!("DPI 变化必须保持 DpiChanged 变体");
+        };
+        assert_eq!(dpi, 144);
+    }
 
     fn hash_of(action: &Action) -> u64 {
         let mut hasher = DefaultHasher::new();

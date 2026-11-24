@@ -4,7 +4,7 @@ use crate::{
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform},
     paint::{
         atlas::AtlasTile,
-        canvas::Canvas,
+        canvas::{Canvas, CanvasText},
         color::Color,
         geometry::{FULL_INDEX_RANGE, GeometryId},
     },
@@ -14,6 +14,7 @@ use crate::{
 pub enum Primitive {
     Quad(Quad),
     GlyphRun(GlyphRun),
+    Text(Arc<CanvasText>),
     Image(Image),
     Path(Path),
     Shadow(Shadow),
@@ -135,10 +136,11 @@ mod tests {
         math::{LogicalPoint, LogicalRect, LogicalSize, Transform, px},
         paint::{
             atlas::{AtlasKind, AtlasTile},
-            canvas::Canvas,
+            canvas::{Canvas, CanvasText},
             color::Color,
             geometry::GeometryId,
         },
+        text::{TextContent, TextStyle},
     };
 
     fn rect() -> LogicalRect {
@@ -191,6 +193,13 @@ mod tests {
                 }),
             ),
             (
+                "Text",
+                Primitive::Text(Arc::new(CanvasText {
+                    content: TextContent::new("hi", TextStyle::new(px(12.0))),
+                    origin: LogicalPoint::new(px(1.0), px(2.0)),
+                })),
+            ),
+            (
                 "Image",
                 Primitive::Image(Image {
                     bounds: rect(),
@@ -238,7 +247,7 @@ mod tests {
     #[test]
     fn all_variants_clone_eq_and_debug() {
         let samples = samples();
-        assert_eq!(samples.len(), 8);
+        assert_eq!(samples.len(), 9);
         for (name, sample) in &samples {
             let clone = sample.clone();
             assert_eq!(&clone, sample, "variant {name}");

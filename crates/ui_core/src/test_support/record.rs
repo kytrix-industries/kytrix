@@ -38,7 +38,6 @@ pub struct FrameRecord {
     pub skipped_by_budget: u64,
     pub paint_log: PaintLog,
     pub a11y: Option<crate::a11y::A11yTreeSnapshot>,
-    pub stale_canvas_runs: usize,
     pub presented_latency: Option<std::time::Duration>,
 }
 
@@ -87,6 +86,7 @@ pub enum PrimitiveKind {
     ClipPop,
     Geometry,
     Canvas,
+    Text,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -149,7 +149,6 @@ impl FrameRecord {
             skipped_by_budget: 0,
             paint_log: PaintLog::default(),
             a11y: None,
-            stale_canvas_runs: 0,
             presented_latency: None,
         }
     }
@@ -254,7 +253,6 @@ pub(crate) fn capture(
         skipped_by_budget: 0,
         paint_log: report.log,
         a11y: None,
-        stale_canvas_runs: report.stale_canvas_runs,
         presented_latency: None,
     }
 }
@@ -276,6 +274,7 @@ fn primitive_kind(primitive: &Primitive, node_bounds: LogicalRect) -> (Primitive
         Primitive::Clip(ClipOp::Pop) => (PrimitiveKind::ClipPop, node_bounds),
         Primitive::Geometry(_) => (PrimitiveKind::Geometry, node_bounds),
         Primitive::Canvas(canvas) => (PrimitiveKind::Canvas, canvas.bounds()),
+        Primitive::Text(_) => (PrimitiveKind::Text, node_bounds),
     }
 }
 
@@ -312,7 +311,7 @@ mod tests {
     use super::FrameRecord;
     use crate::{
         app::App,
-        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+        math::{LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         paint::{
             canvas::Canvas,
@@ -332,7 +331,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("scan"),
             size: LogicalSize::new(px(400.0), px(300.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("窗口存在").tree().root();
@@ -395,7 +393,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("encode"),
             size: LogicalSize::new(px(400.0), px(300.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("窗口存在").tree().root();
@@ -479,7 +476,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("canvas"),
             size: LogicalSize::new(px(400.0), px(300.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("窗口存在").tree().root();

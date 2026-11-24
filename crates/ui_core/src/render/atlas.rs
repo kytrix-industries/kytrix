@@ -275,7 +275,6 @@ impl AtlasAllocator {
             .iter()
             .any(|slot| matches!(slot, Some(existing) if existing.id == id))
     }
-
     pub(crate) fn is_alive(&self, tile: &AtlasTile) -> bool {
         tile.atlas == self.kind
             && tile.generation == self.generation
@@ -792,18 +791,15 @@ mod tests {
     }
 
     #[test]
-    fn is_alive_tracks_allocation_eviction_slot_reuse_and_page_growth() {
+    fn slot_allocation_epoch_tracks_slot_reuse() {
         let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64));
         let first = atlas.allocate((8, 8)).expect("fits");
-        assert!(atlas.is_alive(&first.tile), "刚分配的 tile 必须活着");
         assert_ne!(
             first.tile.slot_epoch, 0,
             "分配纪元从 1 起（0 = 从未分配的哨兵）"
         );
 
         atlas.deallocate(first.id);
-        assert!(!atlas.is_alive(&first.tile), "释放后的 tile 必须失效");
-
         let reused = atlas.allocate((8, 8)).expect("释放出的槽位可复用");
         assert_eq!(
             reused.tile.slot, first.tile.slot,
@@ -811,31 +807,52 @@ mod tests {
         );
         assert_ne!(
             reused.tile.slot_epoch, first.tile.slot_epoch,
-            "复用槽位必须换分配纪元（否则旧 tile 会假活）"
+            "复用槽位必须换分配纪元"
         );
+
+        let before = atlas.generation();
+        assert!(atlas.grow());
+        assert_ne!(atlas.generation(), before, "页扩容必须换代");
+    }
+
+    #[test]
+    fn is_alive_rejects_evicted_reused_moved_and_foreign_tiles() {
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64));
+        let first = atlas.allocate((8, 8)).expect("fits");
+        assert!(
+            atlas.is_alive(&first.tile),
+            "just allocated tile must be live"
+        );
+
+        atlas.deallocate(first.id);
+        assert!(!atlas.is_alive(&first.tile), "released tile must be dead");
+
+        let reused = atlas.allocate((8, 8)).expect("reuse the freed slot");
         assert!(atlas.is_alive(&reused.tile));
         assert!(
             !atlas.is_alive(&first.tile),
-            "槽位复用后旧身份必须失效（generation 不变时的逐 tile 淘汰）"
+            "slot reuse must invalidate the old identity without a generation bump"
         );
 
         assert!(atlas.grow());
-        assert!(!atlas.is_alive(&reused.tile), "页扩容后旧代际 tile 失效");
+        assert!(
+            !atlas.is_alive(&reused.tile),
+            "page growth invalidates old tiles"
+        );
 
         let mut fabricated = reused.tile;
-        fabricated.slot = u32::MAX;
         fabricated.generation = atlas.generation();
-        assert!(!atlas.is_alive(&fabricated), "越界槽位必须判死");
+        fabricated.slot = u32::MAX;
+        assert!(!atlas.is_alive(&fabricated), "out of range slot is dead");
 
         let mut images = AtlasAllocator::with_page(AtlasKind::Image, (64, 64));
         let image_tile = images.allocate((8, 8)).expect("fits").tile;
         assert!(
             !atlas.is_alive(&image_tile),
-            "字形分配器不得把图片 tile 判成活的"
+            "glyph atlas rejects image tiles"
         );
         assert!(images.is_alive(&image_tile));
     }
-
     #[test]
     fn zero_and_over_page_requests_are_rejected() {
         let mut atlas = allocator();

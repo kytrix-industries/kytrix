@@ -441,7 +441,7 @@ fn row_matches(tree: &NodeTree, row: NodeId, top: LogicalPx, height: LogicalPx) 
 mod tests {
     use super::*;
     use crate::{
-        math::{DevicePixelRatio, LogicalPx, LogicalRect},
+        math::{LogicalPx, LogicalRect},
         paint::style_builder::StyleBuilder,
         window::WindowOptions,
     };
@@ -460,7 +460,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: "e3".into(),
             size: LogicalSize::new(px(400.0), px(300.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let mut style = StyleBuilder::new()
@@ -981,7 +980,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: "e9c".into(),
             size: LogicalSize::new(px(400.0), px(300.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();

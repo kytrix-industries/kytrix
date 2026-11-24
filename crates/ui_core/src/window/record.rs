@@ -76,7 +76,7 @@ pub(crate) fn note_completed_frame(window: &mut Window, feedback: &FrameFeedback
 pub(crate) fn debug_hud_metrics(window: &Window) -> crate::debug_hud::DebugHudMetrics {
     use crate::render::timer::Section;
 
-    let (physical_width, physical_height) = window.physical_surface();
+    let (physical_width, physical_height) = window.surface;
     let upload_time = window
         .timings
         .sample(Section::Upload)

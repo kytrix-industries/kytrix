@@ -1,7 +1,7 @@
 use super::App;
 use crate::{
     error::EngineError,
-    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+    math::{LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
     paint::{
         color::Color,
@@ -19,7 +19,6 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let window = app.create_window(WindowOptions {
         title: "r01-16".into(),
         size: LogicalSize::new(px(400.0), px(300.0)),
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)
@@ -343,7 +342,6 @@ fn node_repaint_reports_stale_node_and_unknown_window() {
     let other = app.create_window(WindowOptions {
         title: "other".into(),
         size: LogicalSize::new(px(100.0), px(100.0)),
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let other_root = app.window(other).expect("window").tree().root();

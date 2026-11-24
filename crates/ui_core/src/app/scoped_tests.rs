@@ -5,7 +5,7 @@ use crate::{
     error::EngineError,
     event::{Action, InputEvent, KeyBinding, KeyCode, Modifiers},
     interaction::{AnimatedValue, AnimationSpec, Easing, ScrollAxis, ScrollConfig},
-    math::{DevicePixelRatio, LogicalSize, px},
+    math::{LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -23,7 +23,6 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let window = app.create_window(WindowOptions {
         title: "e8".into(),
         size: LogicalSize::new(px(400.0), px(300.0)),
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)

@@ -728,6 +728,16 @@ fn canvas_primitive(primitive: &Primitive) -> CanvasPrimitive {
             glyphs: 0,
             geometry: None,
         },
+        Primitive::Text(_) => CanvasPrimitive {
+            kind: PrimitiveKind::Text,
+            bounds: None,
+            corner_radius: None,
+            color: None,
+            border: None,
+            gradient: None,
+            glyphs: 0,
+            geometry: None,
+        },
     }
 }
 
@@ -839,7 +849,7 @@ mod tests {
             style::StylePatch,
         },
         test_support::record::PrimitiveKind,
-        text::TextStyle,
+        text::{TextContent, TextStyle},
     };
     use ui_kit::theme::{appearance::Appearance, role::Role};
 
@@ -1392,10 +1402,12 @@ mod tests {
             });
             let mut style = TextStyle::new(px(12.0));
             style.color = text_color;
-            let line = cx.app_mut().shape_text("42", &style, None, &[])?;
             assert!(
-                canvas.push_shaped_text(&line, LogicalPoint::new(px(4.0), px(4.0))),
-                "the fixture's shaped line is a live lease"
+                canvas.push_text(
+                    TextContent::new("42", style),
+                    LogicalPoint::new(px(4.0), px(4.0))
+                ),
+                "the fixture records its text recipe"
             );
             assert!(canvas.pop_clip(), "the fixture closes its clip");
             cx.set_canvas(node, canvas)?;

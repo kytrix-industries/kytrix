@@ -63,14 +63,14 @@ pub(crate) fn refresh_images(app: &mut App, window: WindowId) -> usize {
     let App {
         windows,
         resources,
-        image_scale_epochs,
+        image_dpi_epochs,
         ..
     } = app;
     let Some(target) = windows.get_mut(&window) else {
         return 0;
     };
-    let scale_epoch = target.scale_epoch();
-    let scale_changed = image_scale_epochs.get(&window).copied() != Some(scale_epoch);
+    let dpi_epoch = target.dpi_epoch();
+    let scale_changed = image_dpi_epochs.get(&window).copied() != Some(dpi_epoch);
     let marked = target.tree_mut().take_images_need_refresh();
     if !marked && !scale_changed {
         return 0;
@@ -80,7 +80,7 @@ pub(crate) fn refresh_images(app: &mut App, window: WindowId) -> usize {
     if scale_changed {
         target.tree_mut().mark_bitmap_images_paint(resources);
     }
-    image_scale_epochs.insert(window, scale_epoch);
+    image_dpi_epochs.insert(window, dpi_epoch);
     updated
 }
 
@@ -268,7 +268,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
             }
             app.note_window_focus(window, *focused);
         }
-        Event::DpiChanged { scale, .. } => app.note_window_dpi(window, *scale),
         _ => {}
     }
     app.events.push(window, event);

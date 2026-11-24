@@ -23,7 +23,6 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let window = app.create_window(WindowOptions {
         title: "resources".into(),
         size: LogicalSize::new(px(200.0), px(120.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)
@@ -78,7 +77,6 @@ fn resources_are_process_level() {
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     assert_ne!(second, window);
@@ -145,7 +143,6 @@ fn atlas_upload_marks_only_windows_with_a_renderer() {
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.upload_atlas_pages();
@@ -172,7 +169,6 @@ fn atlas_pages_are_broadcast_to_every_window() {
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -205,7 +201,6 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     for window in [first, second] {
@@ -746,7 +741,6 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -954,7 +948,6 @@ fn a_new_window_without_an_array_gets_zero_drawable_layers_while_growth_is_block
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -1079,7 +1072,6 @@ fn an_occluded_window_does_not_block_growth_and_resyncs_when_it_returns() {
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -1174,7 +1166,6 @@ fn growth_degrades_after_a_window_stops_consuming_uploads() {
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -1256,7 +1247,6 @@ fn a_new_window_receives_every_open_image_layer() {
     let second = app.create_window(WindowOptions {
         title: "second".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -1290,7 +1280,6 @@ fn closing_a_window_releases_its_owned_resources() {
     let right = app.create_window(WindowOptions {
         title: "right".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let bytes = png();
@@ -1341,7 +1330,6 @@ fn closing_a_window_is_idempotent_with_resources() {
     let right = app.create_window(WindowOptions {
         title: "right".into(),
         size: LogicalSize::new(px(64.0), px(64.0)),
-        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let left_bytes = png_rgba([1, 2, 3, 255]);

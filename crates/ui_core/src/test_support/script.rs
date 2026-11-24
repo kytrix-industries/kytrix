@@ -339,7 +339,7 @@ impl FrameScript {
                 }
                 FrameAction::Advance(by) => self.app.advance(by),
                 FrameAction::Resize(size) => self.set_window_size(size),
-                FrameAction::Scale(scale) => self.set_window_scale(scale),
+                FrameAction::Scale(scale) => self.app.set_dpr(scale),
                 FrameAction::InvalidateLanes => self.app.invalidate_all_lanes(),
             }
         }
@@ -384,13 +384,6 @@ impl FrameScript {
         let window = self.app.window_id();
         if let Some(target) = self.app.app_mut().window_mut(window) {
             target.set_size(size);
-        }
-    }
-
-    fn set_window_scale(&mut self, scale: DevicePixelRatio) {
-        let window = self.app.window_id();
-        if let Some(target) = self.app.app_mut().window_mut(window) {
-            target.set_scale(scale);
         }
     }
 }

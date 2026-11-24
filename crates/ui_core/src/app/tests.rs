@@ -363,7 +363,7 @@ fn dpi_change_relays_text_without_rebuilding_the_shared_atlas() {
 
     app.window_mut(window_a)
         .expect("窗口存在")
-        .set_scale(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
+        .set_device_pixel_ratio(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
     let _ = refresh(&mut app, window_a);
     let _ = layout(&mut app, window_a);
     let _ = text_layout(&mut app, window_a);
@@ -412,7 +412,7 @@ fn scale_change_relays_the_same_snapshot_at_the_new_ppem() {
 
     app.window_mut(window)
         .expect("窗口存在")
-        .set_scale(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
+        .set_device_pixel_ratio(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
     let _ = refresh(&mut app, window);
     let _ = layout(&mut app, window);
     let second = text_layout(&mut app, window);
@@ -450,7 +450,7 @@ fn dpi_change_rerasterizes_text_only() {
         let window_ref = app.window(window).expect("窗口存在");
         let tree = window_ref.tree();
         (
-            window_ref.scale_epoch(),
+            window_ref.dpi_epoch(),
             tree.text_content_width(node),
             tree.text_line(node).expect("快照").width,
             tree.text_measured_size(node).expect("测量尺寸"),
@@ -461,7 +461,7 @@ fn dpi_change_rerasterizes_text_only() {
 
     app.window_mut(window)
         .expect("窗口存在")
-        .set_scale(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
+        .set_device_pixel_ratio(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
     {
         let window_ref = app.window(window).expect("窗口存在");
         let root = window_ref.tree().root();
@@ -482,9 +482,9 @@ fn dpi_change_rerasterizes_text_only() {
     let window_ref = app.window(window).expect("窗口存在");
     let tree = window_ref.tree();
     assert_eq!(
-        window_ref.scale_epoch(),
+        window_ref.dpi_epoch(),
         epoch_before + 1,
-        "DPI 变化必须进步 scale_epoch"
+        "DPI 变化必须进步 dpi_epoch"
     );
     assert!(
         second.rasterized > 0,
@@ -1589,18 +1589,18 @@ fn text_caret_rect_includes_border_padding_and_node_origin() {
 }
 
 #[test]
-fn close_window_forgets_the_scale_epoch() {
+fn close_window_forgets_both_dpi_epochs() {
     let (_rt, mut app, window, _node) = text_app("x", None);
     let _ = refresh(&mut app, window);
     let _ = app.frame(window).expect("窗口存在").expect("帧成功");
     assert!(
-        app.image_scale_epochs.contains_key(&window),
+        app.image_dpi_epochs.contains_key(&window),
         "首帧必须登记图片 scale epoch（否则下面的清理断言是空断言）"
     );
     assert!(app.close_window(window));
     assert!(
-        !app.image_scale_epochs.contains_key(&window),
-        "关窗必须清 image_scale_epochs（create/close 循环下否则无界增长）"
+        !app.image_dpi_epochs.contains_key(&window),
+        "关窗必须清 image_dpi_epochs（create/close 循环下否则无界增长）"
     );
     assert!(!app.close_window(window), "second close is a no-op");
 }

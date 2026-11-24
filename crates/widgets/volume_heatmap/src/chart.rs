@@ -15,7 +15,7 @@ use ui_core::{
         style::StylePatch,
         style_builder::StyleBuilder,
     },
-    text::{ShapedTextHandle, TextAlign, TextStyle},
+    text::{TextAlign, TextContent, TextStyle},
 };
 use ui_kit::theme::{resolved::Theme, role::Role};
 use widget::cx::WidgetCx;
@@ -90,7 +90,7 @@ impl PreparedHeatMap {
 struct CachedText {
     text: SmolStr,
     style: TextStyle,
-    handle: Arc<ShapedTextHandle>,
+    width: LogicalPx,
 }
 
 struct ChartTextCache {
@@ -104,32 +104,34 @@ impl ChartTextCache {
         }
     }
 
-    fn line(&mut self, app: &mut App, text: &str, style: &TextStyle) -> Arc<ShapedTextHandle> {
+    fn content(&mut self, app: &mut App, text: &str, style: &TextStyle) -> TextContent {
+        self.width(app, text, style);
+        TextContent::new(text, style.clone())
+    }
+
+    fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
         if let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.text == text && entry.style == *style)
         {
             let entry = self.entries.remove(index);
-            if !entry.handle.is_stale() {
-                let handle = Arc::clone(&entry.handle);
-                self.entries.push(entry);
-                return handle;
-            }
+            let width = entry.width;
+            self.entries.push(entry);
+            return width;
         }
-        let handle = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
-            app.shape_text("", style, None, &[])
-                .expect("an empty line always shapes")
-        }));
+        let width = app
+            .measure_text(&TextContent::new(text, style.clone()), None)
+            .width;
         if self.entries.len() == TEXT_CACHE_CAPACITY {
             self.entries.remove(0);
         }
         self.entries.push(CachedText {
             text: SmolStr::new(text),
             style: style.clone(),
-            handle: Arc::clone(&handle),
+            width,
         });
-        handle
+        width
     }
 }
 
@@ -185,7 +187,6 @@ struct PaintedKey {
     revision: u64,
     hover: Option<usize>,
     colors: ChartColors,
-    text_scale: f32,
 }
 
 pub(crate) struct VolumeHeatMapChart {
@@ -194,7 +195,6 @@ pub(crate) struct VolumeHeatMapChart {
     revision: u64,
     layout: Option<Layout>,
     painted: Option<PaintedKey>,
-    painted_text: Vec<Arc<ShapedTextHandle>>,
     text: ChartTextCache,
     hover: Option<usize>,
 }
@@ -207,7 +207,6 @@ impl VolumeHeatMapChart {
             revision: 0,
             layout: None,
             painted: None,
-            painted_text: Vec::new(),
             text: ChartTextCache::new(),
             hover: None,
         }
@@ -291,15 +290,13 @@ impl VolumeHeatMapChart {
 
         let appearance = cx.theme().current(cx.app());
         let colors = ChartColors::resolve(cx.theme().theme_for(appearance));
-        let text_scale = cx.app().text_scale();
         let key = PaintedKey {
             bounds,
             revision: self.revision,
             hover: self.hover,
             colors,
-            text_scale,
         };
-        if self.painted == Some(key) && !self.painted_text.iter().any(|handle| handle.is_stale()) {
+        if self.painted == Some(key) {
             return Ok(false);
         }
 
@@ -313,12 +310,9 @@ impl VolumeHeatMapChart {
         let Some(layout) = layout.as_ref() else {
             return Ok(false);
         };
-        let (canvas, whole, painted_text) = paint(cx.app_mut(), data, layout, *hover, colors, text);
+        let canvas = paint(cx.app_mut(), data, layout, *hover, colors, text);
         let changed = cx.set_canvas(node, canvas)?;
-        if whole {
-            self.painted = Some(key);
-            self.painted_text = painted_text;
-        }
+        self.painted = Some(key);
         Ok(changed)
     }
 
@@ -376,7 +370,6 @@ impl VolumeHeatMapChart {
         }
         self.layout = None;
         self.painted = None;
-        self.painted_text.clear();
         self.hover = None;
     }
 
@@ -415,7 +408,7 @@ fn paint(
     hover: Option<usize>,
     colors: ChartColors,
     text: &mut ChartTextCache,
-) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
+) -> Canvas {
     let mut canvas = Canvas::new(layout.bounds);
     let _ = canvas.push_clip(ClipRect {
         rect: layout.bounds,
@@ -449,12 +442,6 @@ fn paint(
         }
     }
 
-    let mut context = TextContext {
-        app,
-        text,
-        used: Vec::with_capacity(data.tiles.len() * 2),
-        whole: true,
-    };
     for (tile, bounds) in data.tiles.iter().zip(layout.tiles.iter()) {
         let Some(block) = tile_block_bounds(*bounds) else {
             continue;
@@ -474,40 +461,17 @@ fn paint(
             block.origin.x + TILE_TEXT_INSET,
             block.origin.y + TILE_TEXT_INSET,
         );
-        context.label(&mut canvas, &tile.base_asset_label, origin, &style);
-        context.label(
-            &mut canvas,
-            &tile.notional_label,
+        let base_asset = text.content(app, &tile.base_asset_label, &style);
+        let _ = canvas.push_text(base_asset, origin);
+        let notional = text.content(app, &tile.notional_label, &style);
+        let _ = canvas.push_text(
+            notional,
             LogicalPoint::new(origin.x, origin.y + line_height),
-            &style,
         );
         let _ = canvas.pop_clip();
     }
-    let whole = context.whole;
-    let painted_text = context.used;
     let _ = canvas.pop_clip();
-    (canvas, whole, painted_text)
-}
-
-struct TextContext<'a> {
-    app: &'a mut App,
-    text: &'a mut ChartTextCache,
-    used: Vec<Arc<ShapedTextHandle>>,
-    whole: bool,
-}
-
-impl TextContext<'_> {
-    fn label(&mut self, canvas: &mut Canvas, text: &str, origin: LogicalPoint, style: &TextStyle) {
-        if text.is_empty() {
-            return;
-        }
-        let line = self.text.line(self.app, text, style);
-        if canvas.push_shaped_text(&line, origin) {
-            self.used.push(line);
-        } else {
-            self.whole = false;
-        }
-    }
+    canvas
 }
 
 fn tile_block_bounds(bounds: LogicalRect) -> Option<LogicalRect> {
@@ -691,10 +655,8 @@ fn contains_half_open(bounds: LogicalRect, position: LogicalPoint) -> bool {
 mod tests {
     use market_participants_model::decimal::Quantity;
     use ui_core::{
-        math::LogicalPoint,
-        node::{builder::NodeBuilder, tree::NodeKind},
-        paint::primitive::Primitive,
-        window::WindowId,
+        math::LogicalPoint, node::builder::NodeBuilder, paint::primitive::Primitive,
+        test_support::record::PrimitiveKind, window::WindowId,
     };
     use ui_kit::theme::appearance::Appearance;
     use widget::test_support::WidgetTestApp;
@@ -849,16 +811,19 @@ mod tests {
     }
 
     fn canvas_arc(harness: &ChartHarness) -> Arc<Canvas> {
-        match harness
+        harness
             .app
-            .tree()
-            .get(harness.chart.node().expect("the chart built"))
-            .expect("the canvas node exists")
-            .kind()
-        {
-            NodeKind::Canvas(canvas) => Arc::clone(canvas),
-            other => panic!("the chart node is a canvas, not {other:?}"),
-        }
+            .canvas_handle(harness.chart.node().expect("the chart built"))
+            .expect("the chart holds a canvas")
+    }
+
+    fn glyph_runs(harness: &ChartHarness) -> usize {
+        harness
+            .app
+            .canvas_primitives(harness.chart.node().expect("the chart built"))
+            .iter()
+            .filter(|primitive| primitive.kind == PrimitiveKind::GlyphRun)
+            .count()
     }
 
     fn quads(harness: &ChartHarness) -> Vec<&Quad> {
@@ -869,16 +834,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
-        primitives(harness)
-            .into_iter()
-            .find_map(|primitive| match primitive {
-                Primitive::GlyphRun(run) => run.glyphs.first(),
-                _ => None,
-            })
-            .map(|glyph| glyph.tile.generation)
     }
 
     fn middle_of(harness: &ChartHarness, index: usize) -> LogicalPoint {
@@ -1125,10 +1080,10 @@ mod tests {
         let mut cache = ChartTextCache::new();
         let style = label_style(px(12.0), px(15.0), Color::WHITE);
         for index in 0..TEXT_CACHE_CAPACITY {
-            cache.line(app.app_mut(), &format!("label-{index}"), &style);
+            cache.content(app.app_mut(), &format!("label-{index}"), &style);
         }
         assert_eq!(cache.entries.len(), TEXT_CACHE_CAPACITY);
-        cache.line(app.app_mut(), "new-label", &style);
+        cache.content(app.app_mut(), "new-label", &style);
 
         assert_eq!(cache.entries.len(), TEXT_CACHE_CAPACITY);
         assert!(
@@ -1147,22 +1102,38 @@ mod tests {
     }
 
     #[test]
-    fn text_cache_should_invalidate_for_style_color_and_font_size_changes() {
+    fn text_cache_should_keep_distinct_entries_for_style_colour_and_size_changes() {
         let mut app = WidgetTestApp::new();
         let mut cache = ChartTextCache::new();
         let style = label_style(px(12.0), px(15.0), Color::WHITE);
         let alternate_color = label_style(px(12.0), px(15.0), Color::BLACK);
         let alternate_size = label_style(px(13.0), px(16.25), Color::WHITE);
 
-        let first = cache.line(app.app_mut(), "BTC", &style);
-        let same = cache.line(app.app_mut(), "BTC", &style);
-        assert!(Arc::ptr_eq(&first, &same), "the same line is shaped once");
+        let first = cache.content(app.app_mut(), "BTC", &style);
+        let same = cache.content(app.app_mut(), "BTC", &style);
+        assert_eq!(first, same, "the same line is one cache entry");
+        assert_eq!(cache.entries.len(), 1);
 
-        let recoloured = cache.line(app.app_mut(), "BTC", &alternate_color);
-        assert!(!Arc::ptr_eq(&first, &recoloured));
-        let resized = cache.line(app.app_mut(), "BTC", &alternate_size);
-        assert!(!Arc::ptr_eq(&first, &resized));
+        let recoloured = cache.content(app.app_mut(), "BTC", &alternate_color);
+        assert_ne!(first, recoloured);
+        let resized = cache.content(app.app_mut(), "BTC", &alternate_size);
+        assert_ne!(first, resized);
         assert_eq!(cache.entries.len(), 3);
+    }
+
+    #[test]
+    fn text_cache_should_cache_the_width_the_engine_measures() {
+        let mut app = WidgetTestApp::new();
+        let mut cache = ChartTextCache::new();
+        let style = label_style(px(12.0), px(15.0), Color::WHITE);
+
+        let cached = cache.width(app.app_mut(), "1.25M", &style);
+        let measured = app
+            .app_mut()
+            .measure_text(&TextContent::new("1.25M", style.clone()), None)
+            .width;
+
+        assert_eq!(cached, measured);
     }
 
     #[test]
@@ -1356,88 +1327,57 @@ mod tests {
     }
 
     #[test]
-    fn a_hover_should_not_shape_any_label_again() {
+    fn a_hover_should_not_rebuild_the_label_cache() {
         let mut harness = harness_in(WIDTH, HEIGHT, entries(&["BTC"]));
+        harness.app.drain();
         let labels = harness.chart.text.entries.len();
         assert_eq!(labels, 2, "one tile has two labels");
-        let before = primitives(&harness)
-            .into_iter()
-            .filter_map(|primitive| match primitive {
-                Primitive::GlyphRun(run) => run.glyphs.first().copied(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let held = harness
-            .chart
-            .text
-            .entries
-            .iter()
-            .map(|entry| Arc::clone(&entry.handle))
-            .collect::<Vec<_>>();
+        let glyphs = glyph_runs(&harness);
+        assert_eq!(glyphs, 2, "both labels reach the frame");
 
         assert!(harness.chart.point_at(middle_of(&harness, 0)));
         assert!(harness.sync());
+        harness.app.drain();
 
         assert_eq!(harness.chart.text.entries.len(), labels);
-        let after = harness
-            .chart
-            .text
-            .entries
-            .iter()
-            .map(|entry| Arc::clone(&entry.handle))
-            .collect::<Vec<_>>();
-        assert!(
-            after
-                .iter()
-                .zip(&held)
-                .all(|(after, held)| Arc::ptr_eq(after, held)),
-            "a hover changes no text, so every line it draws is the one already shaped"
-        );
-        let glyphs = primitives(&harness)
-            .into_iter()
-            .filter_map(|primitive| match primitive {
-                Primitive::GlyphRun(run) => run.glyphs.first().copied(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            glyphs.len(),
-            before.len(),
+            glyph_runs(&harness),
+            glyphs,
             "the hover redraw kept both labels"
         );
     }
 
     #[test]
-    fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
-        let mut harness = harness_in(WIDTH, HEIGHT, entries(&["BTC"]));
-        let primitives_before = harness.canvas().primitives().len();
-        let generation = glyph_generation(&harness).expect("the map labels its tiles");
+    fn a_chart_should_keep_its_canvas_when_the_engine_text_atlas_changes() {
+        let mut harness = harness();
+        harness.app.drain();
+        let canvas = canvas_arc(&harness);
+        assert!(glyph_runs(&harness) > 0, "the map labels its tiles");
 
         let stack = harness.app.app().font_stack().clone();
         harness.app.app_mut().set_font_stack(stack);
 
         assert!(
-            harness.sync(),
-            "a label whose lease moved is a frame the chart owes, not an idle one"
+            !harness.sync(),
+            "engine text invalidation is not the widget's repaint trigger"
         );
-        assert_ne!(
-            glyph_generation(&harness),
-            Some(generation),
-            "every label was shaped for the atlas that exists now"
-        );
-        assert_eq!(
-            harness.canvas().primitives().len(),
-            primitives_before,
-            "and none of them disappeared with the old lease"
+        harness.app.with_cx(|cx| {
+            cx.request_frame().expect("the harness requests a frame");
+        });
+        harness.app.drain();
+
+        assert!(
+            Arc::ptr_eq(&canvas, &canvas_arc(&harness)),
+            "the logical canvas survives an atlas change unchanged"
         );
         assert!(
-            !harness.sync(),
-            "with fresh leases the frame is steady again (I3)"
+            glyph_runs(&harness) > 0,
+            "the engine re-resolved the labels into glyph runs"
         );
     }
 
     #[test]
-    fn a_map_that_left_its_labels_behind_should_still_be_steady() {
+    fn a_smaller_map_should_repaint_once_after_the_cache_filled() {
         let big_map: Arc<[HeatMapEntry]> = Arc::from(
             (0..TILE_LIMIT)
                 .map(|index| entry(&format!("ASSET{index}"), 1, &format!("{index}")))
@@ -1452,30 +1392,9 @@ mod tests {
 
         harness.chart.set_entries(entries(&["BTC"]));
         assert!(harness.sync(), "the smaller map is a frame");
-        assert_eq!(
-            harness.chart.painted_text.len(),
-            2,
-            "the canvas on screen is drawn from the two lines of the map that is there"
-        );
-
-        let stack = harness.app.app().font_stack().clone();
-        harness.app.app_mut().set_font_stack(stack);
-        assert!(harness.sync(), "the lines on the canvas are shaped again");
-        assert!(
-            harness
-                .chart
-                .text
-                .entries
-                .iter()
-                .any(|cached| cached.handle.is_stale()),
-            "the cache still holds lines the canvas does not draw"
-        );
 
         let kept = canvas_arc(&harness);
-        assert!(
-            !harness.sync(),
-            "a stale line the canvas does not draw is not a frame the chart owes"
-        );
+        assert!(!harness.sync(), "the smaller map settles at once");
         assert!(
             Arc::ptr_eq(&kept, &canvas_arc(&harness)),
             "so the steady frame keeps the canvas it is drawn from"

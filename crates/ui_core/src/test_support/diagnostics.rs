@@ -145,13 +145,10 @@ pub fn frame_dump(app: &TestApp) -> FrameDump {
     let record = window.record();
     FrameDump {
         frame_index: record.map_or(0, |record| record.frame_index.get()),
-        viewport: window
-            .scale()
-            .to_covering_device_rect(LogicalRect::from_origin_size(
-                LogicalPoint::ZERO,
-                window.size(),
-            )),
-        scale: window.scale().factor(),
+        viewport: window.device_pixel_ratio().to_covering_device_rect(
+            LogicalRect::from_origin_size(LogicalPoint::ZERO, window.size()),
+        ),
+        scale: window.device_pixel_ratio().factor(),
         damage: record.map_or_else(Vec::new, |record| record.damage.clone()),
         instances,
         ops: buffer.ops().iter().map(op_dump).collect(),
@@ -783,7 +780,6 @@ mod tests {
             skipped_by_budget: 0,
             paint_log: crate::test_support::record::PaintLog::default(),
             a11y: None,
-            stale_canvas_runs: 0,
             presented_latency: None,
         };
         let overlay = DamageOverlay::of(&record);

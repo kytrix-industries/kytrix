@@ -115,8 +115,8 @@ fn resizing_or_changing_dpi_does_not_remap_the_logical_position() {
     app.app_mut()
         .window_mut(window)
         .expect("窗口")
-        .set_scale(scale);
-    app.dispatch_event(Event::DpiChanged { dpi: 192, scale });
+        .set_device_pixel_ratio(scale);
+    app.dispatch_event(Event::DpiChanged { dpi: 192 });
     assert_eq!(app.pointer_position(), Some(P1), "DPI 变化不重算旧位置");
     let logical = LogicalPoint::new(px(120.0), px(90.0));
     app.move_pointer(logical);

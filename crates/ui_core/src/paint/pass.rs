@@ -43,6 +43,7 @@ pub(crate) struct PaintPass<'a> {
     pub focused: Option<NodeId>,
     pub atlas: Option<&'a AtlasAllocator>,
     pub resources: Option<&'a ResourceCache>,
+    pub canvas_text: &'a ahash::HashMap<NodeId, crate::window::canvas_text::ResolvedCanvasText>,
     pub scroll_slots: &'a mut Vec<(LogicalPoint, DeviceRect)>,
     pub scroll_slot_nodes: &'a mut Vec<NodeId>,
     #[cfg(feature = "test-support")]
@@ -65,7 +66,7 @@ pub(crate) struct PaintReport {
     pub rebuilt: usize,
     pub damage: DamageSummary,
     pub stale_text: SmallVec<[NodeId; 4]>,
-    pub stale_canvas_runs: usize,
+    pub unresolved_canvas_text: usize,
     pub skipped_inline_images: SmallVec<[u64; 4]>,
     #[cfg(feature = "test-support")]
     pub instances: usize,
@@ -130,8 +131,9 @@ impl PaintPass<'_> {
             focused: self.focused,
             atlas: self.atlas,
             resources: self.resources,
+            canvas_text: self.canvas_text,
             stale_text: SmallVec::new(),
-            stale_canvas_runs: 0,
+            unresolved_canvas_text: 0,
             skipped_inline_images: SmallVec::new(),
             #[cfg(feature = "test-support")]
             log,
@@ -172,7 +174,7 @@ impl PaintPass<'_> {
             rebuilt: context.rebuilt,
             damage,
             stale_text: context.stale_text,
-            stale_canvas_runs: context.stale_canvas_runs,
+            unresolved_canvas_text: context.unresolved_canvas_text,
             skipped_inline_images: context.skipped_inline_images,
             #[cfg(feature = "test-support")]
             instances: 0,
@@ -208,8 +210,9 @@ struct PaintContext<'a> {
     scroll_slot_nodes: &'a mut Vec<NodeId>,
     focused: Option<NodeId>,
     atlas: Option<&'a AtlasAllocator>,
+    canvas_text: &'a ahash::HashMap<NodeId, crate::window::canvas_text::ResolvedCanvasText>,
     stale_text: SmallVec<[NodeId; 4]>,
-    stale_canvas_runs: usize,
+    unresolved_canvas_text: usize,
     skipped_inline_images: SmallVec<[u64; 4]>,
     resources: Option<&'a ResourceCache>,
     #[cfg(feature = "test-support")]
@@ -297,6 +300,76 @@ fn content_needs_clip(content: &Content) -> bool {
         Content::Text(line) => line.is_some(),
         Content::Canvas(_) => true,
         Content::Image(_) => false,
+    }
+}
+
+fn canvas_has_text(canvas: &crate::paint::canvas::Canvas) -> bool {
+    canvas.primitives().iter().any(|primitive| match primitive {
+        Primitive::Text(_) => true,
+        Primitive::Canvas(inner) => canvas_has_text(inner),
+        _ => false,
+    })
+}
+
+fn resolved_canvas(
+    canvas: &crate::paint::canvas::Canvas,
+    lines: Option<&[Rc<ShapedLine>]>,
+    atlas: Option<&crate::render::AtlasAllocator>,
+    next: &mut usize,
+    skipped: &mut usize,
+) -> crate::paint::canvas::Canvas {
+    let mut resolved = crate::paint::canvas::Canvas::new(canvas.bounds());
+    for primitive in canvas.primitives() {
+        match primitive {
+            Primitive::Text(text) => {
+                let line = lines.and_then(|lines| lines.get(*next));
+                *next += 1;
+                let live = line.filter(|line| {
+                    atlas.is_none_or(|atlas| crate::window::canvas_text::line_is_live(line, atlas))
+                });
+                match live {
+                    Some(line) => push_text_glyph_runs(&mut resolved, text, line),
+                    None => *skipped += 1,
+                }
+            }
+            Primitive::Canvas(inner) => {
+                let inner = resolved_canvas(inner, lines, atlas, next, skipped);
+                resolved.push_primitive(Primitive::Canvas(Arc::new(inner)));
+            }
+            other => resolved.push_primitive(other.clone()),
+        }
+    }
+    resolved
+}
+fn push_text_glyph_runs(
+    canvas: &mut crate::paint::canvas::Canvas,
+    text: &crate::paint::canvas::CanvasText,
+    line: &ShapedLine,
+) {
+    for shaped_line in &line.lines {
+        for item in &shaped_line.items {
+            let ShapedTextItem::GlyphRun(run) = item else {
+                continue;
+            };
+            if run.glyphs.is_empty() {
+                continue;
+            }
+            let mut glyphs = Vec::with_capacity(run.glyphs.len());
+            for glyph in &run.glyphs {
+                glyphs.push(PositionedGlyph {
+                    tile: glyph.tile,
+                    position: LogicalPoint::new(
+                        text.origin.x + glyph.position.x,
+                        text.origin.y + glyph.position.y,
+                    ),
+                    size: glyph.size,
+                });
+            }
+            canvas.push_glyph_run(GlyphRun {
+                color: run.color,
+                glyphs,
+            });
+        }
     }
 }
 
@@ -1218,7 +1291,10 @@ fn painted_content(
                         None => (rect, pad),
                     });
                 }
-                Primitive::Path(_) | Primitive::Geometry(_) | Primitive::Clip(_) => {}
+                Primitive::Path(_)
+                | Primitive::Geometry(_)
+                | Primitive::Clip(_)
+                | Primitive::Text(_) => {}
             }
         }
     }
@@ -1460,15 +1536,19 @@ impl PrimitiveEmitter {
 
             Content::Canvas(canvas) => {
                 let canvas_bounds = canvas.bounds();
-                let (canvas, stale_runs) = match context.atlas {
-                    Some(atlas) => match canvas.without_stale_glyph_runs(atlas) {
-                        Some((filtered, dropped)) => (Arc::new(filtered), dropped),
-                        None => (Arc::clone(&canvas), 0),
-                    },
-                    None => (Arc::clone(&canvas), 0),
-                };
-                context.stale_canvas_runs += stale_runs;
-                self.push(context, Primitive::Canvas(canvas));
+                let mut skipped = 0usize;
+                if canvas_has_text(&canvas) {
+                    let lines = context
+                        .canvas_text
+                        .get(&self.node)
+                        .map(|entry| entry.lines.as_slice());
+                    let resolved =
+                        resolved_canvas(&canvas, lines, context.atlas, &mut 0usize, &mut skipped);
+                    self.push(context, Primitive::Canvas(Arc::new(resolved)));
+                } else {
+                    self.push(context, Primitive::Canvas(canvas));
+                }
+                context.unresolved_canvas_text += skipped;
                 context
                     .damage
                     .push_logical(canvas_bounds, physical_px(1.0), self.clip);
@@ -1760,6 +1840,8 @@ mod tests {
         geometry: crate::paint::geometry_store::GeometryStore,
         focused: Option<crate::node::id::NodeId>,
         scale: DevicePixelRatio,
+        canvas_text:
+            ahash::HashMap<crate::node::id::NodeId, crate::window::canvas_text::ResolvedCanvasText>,
     }
 
     impl Harness {
@@ -1781,6 +1863,7 @@ mod tests {
                 geometry: crate::paint::geometry_store::GeometryStore::new(),
                 focused: None,
                 scale,
+                canvas_text: ahash::HashMap::default(),
             }
         }
 
@@ -1799,6 +1882,7 @@ mod tests {
                 focused: self.focused,
                 atlas: self.atlas.as_ref(),
                 resources: self.resources.as_ref(),
+                canvas_text: &self.canvas_text,
                 scroll_slots: &mut self.scroll_slots,
                 scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
@@ -1829,6 +1913,7 @@ mod tests {
                 focused: self.focused,
                 atlas: self.atlas.as_ref(),
                 resources: self.resources.as_ref(),
+                canvas_text: &self.canvas_text,
                 scroll_slots: &mut self.scroll_slots,
                 scroll_slot_nodes: &mut self.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
@@ -2335,6 +2420,168 @@ mod tests {
             lane_primitives(&h, geometry).first(),
             Some(Primitive::Geometry(_))
         ));
+    }
+
+    fn canvas_with_text(content: TextContent, origin: LogicalPoint) -> Canvas {
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)));
+        assert!(canvas.push_text(content, origin), "the recipe is recorded");
+        canvas
+    }
+
+    fn mount_canvas(h: &mut Harness, canvas: Canvas) -> NodeId {
+        let root = h.tree.root();
+        NodeBuilder::canvas(canvas)
+            .style(fixed_style(40.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("挂载")
+    }
+
+    #[test]
+    fn canvas_text_recipes_become_glyph_runs_during_paint() {
+        let mut h = Harness::new();
+        let origin = LogicalPoint::new(px(3.0), px(4.0));
+        let node = mount_canvas(
+            &mut h,
+            canvas_with_text(TextContent::new("ab", TextStyle::new(px(12.0))), origin),
+        );
+        let line = shaped_line(
+            vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 1.0))],
+            Vec::new(),
+        );
+        let generation = h.tree.canvas_generation(node).expect("canvas node");
+        h.canvas_text.insert(
+            node,
+            crate::window::canvas_text::ResolvedCanvasText {
+                key: crate::window::canvas_text::CanvasTextKey {
+                    font_stack_version: 0,
+                    canvas_generation: generation,
+                    dpr_bits: 1.0_f32.to_bits(),
+                    atlas_generation: 0,
+                    glyph_eviction_epoch: 0,
+                },
+                lines: vec![Rc::new(line)],
+                pending: false,
+            },
+        );
+        layout_all(&mut h.tree);
+        let report = h.paint();
+        assert_eq!(report.unresolved_canvas_text, 0);
+        let primitives = lane_primitives(&h, node);
+        let Some(Primitive::Canvas(rendered)) = primitives.first() else {
+            panic!("the canvas is pushed as one primitive");
+        };
+        assert!(!rendered.primitives().is_empty());
+        let Some(Primitive::GlyphRun(run)) = rendered.primitives().first() else {
+            panic!("the recipe is replaced by a glyph run");
+        };
+        assert_eq!(
+            run.glyphs[0].position,
+            LogicalPoint::new(origin.x + px(1.0), origin.y + px(2.0))
+        );
+        assert_eq!(run.color, Color::BLACK);
+        assert!(
+            !rendered
+                .primitives()
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Text(_))),
+            "no unresolved recipe reaches the scene"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_canvas_recipe_skips_only_its_text() {
+        let mut h = Harness::new();
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)));
+        canvas.push_primitive(Primitive::Quad(crate::paint::primitive::Quad {
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
+            corner_radius: [LogicalPx::ZERO; 4],
+            paint: crate::paint::primitive::QuadPaint::Solid {
+                fill: Color::BLACK,
+                border: None,
+            },
+        }));
+        assert!(canvas.push_text(
+            TextContent::new("ab", TextStyle::new(px(12.0))),
+            LogicalPoint::ZERO
+        ));
+        let node = mount_canvas(&mut h, canvas);
+        layout_all(&mut h.tree);
+        let report = h.paint();
+        assert_eq!(report.unresolved_canvas_text, 1);
+        let primitives = lane_primitives(&h, node);
+        let Some(Primitive::Canvas(rendered)) = primitives.first() else {
+            panic!("the canvas itself keeps painting");
+        };
+        assert!(
+            rendered
+                .primitives()
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Quad(_))),
+            "non-text primitives are emitted even when the text recipe is unresolved"
+        );
+        assert!(
+            !rendered
+                .primitives()
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::GlyphRun(_) | Primitive::Text(_))),
+            "only the unresolved text recipe is skipped"
+        );
+    }
+
+    #[test]
+    fn a_stale_canvas_text_line_is_never_painted() {
+        let mut h = Harness::new();
+        let node = mount_canvas(
+            &mut h,
+            canvas_with_text(
+                TextContent::new("ab", TextStyle::new(px(12.0))),
+                LogicalPoint::ZERO,
+            ),
+        );
+        let mut atlas = crate::render::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (64, 64),
+        );
+        let allocation = atlas.allocate((8, 8)).expect("the tile fits");
+        let mut run = glyph_run(Color::BLACK, 0..2, 1.0);
+        run.glyphs[0].tile = allocation.tile;
+        let mut line = shaped_line(vec![ShapedTextItem::GlyphRun(run)], Vec::new());
+        line.atlas_generation = atlas.generation();
+        assert!(atlas.grow(), "page growth invalidates the cached tiles");
+        h.atlas = Some(atlas);
+        let generation = h.tree.canvas_generation(node).expect("canvas node");
+        let atlas_generation = h.atlas.as_ref().expect("atlas").generation();
+        h.canvas_text.insert(
+            node,
+            crate::window::canvas_text::ResolvedCanvasText {
+                key: crate::window::canvas_text::CanvasTextKey {
+                    font_stack_version: line.font_stack_version,
+                    canvas_generation: generation,
+                    dpr_bits: 1.0_f32.to_bits(),
+                    atlas_generation,
+                    glyph_eviction_epoch: 0,
+                },
+                lines: vec![Rc::new(line)],
+                pending: false,
+            },
+        );
+        layout_all(&mut h.tree);
+        let report = h.paint();
+        assert_eq!(
+            report.unresolved_canvas_text, 1,
+            "a stale line must be reported instead of painted"
+        );
+        let primitives = lane_primitives(&h, node);
+        let Some(Primitive::Canvas(rendered)) = primitives.first() else {
+            panic!("the canvas is still painted");
+        };
+        assert!(
+            !rendered
+                .primitives()
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::GlyphRun(_))),
+            "stale UVs must never reach the scene"
+        );
     }
 
     const ONE_PIXEL_PNG: &[u8] = &[

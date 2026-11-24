@@ -12,7 +12,7 @@ use crate::{
     interaction::{
         AnimatedValue, AnimationSpec, Easing, ScrollConfig, ScrollHandle, VirtualListConfig,
     },
-    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         dirty::DirtyFlags,
@@ -35,7 +35,6 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let window = app.create_window(WindowOptions {
         title: "e16".into(),
         size: LogicalSize::new(px(400.0), px(300.0)),
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)

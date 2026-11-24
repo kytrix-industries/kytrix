@@ -260,8 +260,7 @@ impl<D: ChartData> Chart<D> {
             meshes: self.cache.meshes,
             appearance,
         };
-        let painted_already = self.cache.painted == Some(painted);
-        if painted_already && !self.cache.text.has_stale() {
+        if self.cache.painted == Some(painted) {
             return Ok(false);
         }
 
@@ -279,7 +278,7 @@ impl<D: ChartData> Chart<D> {
             legend: self.data.legend(),
             legend_measurements: measurements.legend,
         };
-        let (canvas, whole) = paint(
+        let canvas = paint(
             cx.app_mut(),
             &theme,
             &mut self.cache.text,
@@ -289,24 +288,8 @@ impl<D: ChartData> Chart<D> {
             tooltip.as_ref(),
             &self.cache.meshes,
         );
-        let (canvas, whole) = if whole {
-            (canvas, whole)
-        } else {
-            paint(
-                cx.app_mut(),
-                &theme,
-                &mut self.cache.text,
-                &frame,
-                prepared,
-                self.hover,
-                tooltip.as_ref(),
-                &self.cache.meshes,
-            )
-        };
         let changed = cx.set_canvas(node, canvas)?;
-        if whole {
-            self.cache.painted = Some(painted);
-        }
+        self.cache.painted = Some(painted);
         Ok(changed)
     }
 

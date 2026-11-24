@@ -127,9 +127,8 @@ struct PaintedCanvas {
 }
 
 impl PaintedCanvas {
-    fn matches(&self, frame: &ChartFrame<'_>, key: PaintedKey, text_is_stale: bool) -> bool {
-        !text_is_stale
-            && self.key == key
+    fn matches(&self, frame: &ChartFrame<'_>, key: PaintedKey) -> bool {
+        self.key == key
             && self.snapshot.shares_chart_data_with(frame.snapshot)
             && self.indicators == *frame.indicators
             && self.countdown_label == *frame.countdown_label
@@ -147,7 +146,6 @@ struct PaintedKey {
     panel_open: bool,
     colors: ChartPalette,
     language: LanguageCode,
-    text_scale: f32,
     catalog_generation: u64,
 }
 
@@ -259,7 +257,6 @@ impl ChartCanvas {
         let appearance = cx.theme().current(cx.app());
         let colors = ChartPalette::resolve(cx.theme().theme_for(appearance));
         let language = *cx.read(&cx.language());
-        let text_scale = cx.app().text_scale();
         let translate = cx.translate().clone();
         let key = PaintedKey {
             bounds,
@@ -271,16 +268,14 @@ impl ChartCanvas {
             panel_open: frame.panel_open,
             colors,
             language,
-            text_scale,
             catalog_generation: display
                 .as_ref()
                 .map_or(0, |display| display.generation_id().get()),
         };
-        let text_is_stale = self.text.has_stale() || self.readout.has_stale();
         if self
             .painted
             .as_ref()
-            .is_some_and(|painted| painted.matches(frame, key, text_is_stale))
+            .is_some_and(|painted| painted.matches(frame, key))
         {
             return Ok(false);
         }
@@ -380,8 +375,6 @@ impl ChartCanvas {
         bounds: LogicalRect,
         colors: ChartPalette,
     ) -> Result<(Canvas, Vec<GeometryId>), EngineError> {
-        self.text.drop_stale();
-        self.readout.drop_stale();
         let series = self.series(frame.snapshot, frame.indicators);
         let sub_plot_ids = enabled_sub_plot_ids(frame.indicators);
         let layout = resolve_chart_layout(
@@ -1711,8 +1704,8 @@ impl ChartPainter<'_, '_> {
         if text.is_empty() {
             return true;
         }
-        let line = self.text.line(self.app, text, style);
-        self.canvas.push_shaped_text(&line, origin)
+        let (content, _) = self.text.line(self.app, text, style);
+        self.canvas.push_text(content, origin)
     }
 
     fn push_centered_text(
@@ -1725,9 +1718,9 @@ impl ChartPainter<'_, '_> {
         if text.is_empty() {
             return true;
         }
-        let line = self.text.line(self.app, text, style);
-        let origin = LogicalPoint::new(center_x - line.size().width / 2.0, top);
-        self.canvas.push_shaped_text(&line, origin)
+        let (content, width) = self.text.line(self.app, text, style);
+        let origin = LogicalPoint::new(center_x - width / 2.0, top);
+        self.canvas.push_text(content, origin)
     }
 
     fn push_dashed_horizontal(&mut self, y: LogicalPx, plot: LogicalRect, color: Color) {
@@ -1804,9 +1797,8 @@ impl ChartPainter<'_, '_> {
                 break;
             }
             let style = self.label_style(entry.color);
-            let line = self.text.line(self.app, &entry.text, &style);
-            let width = line.size().width;
-            let _ = self.canvas.push_shaped_text(&line, LogicalPoint::new(x, y));
+            let (content, width) = self.text.line(self.app, &entry.text, &style);
+            let _ = self.canvas.push_text(content, LogicalPoint::new(x, y));
             x += width + LEGEND_ENTRY_GAP;
         }
         let _ = self.canvas.pop_clip();
@@ -2202,8 +2194,8 @@ impl ChartPainter<'_, '_> {
             corner_radius: [px(0.0); 4],
         });
         for run in readout.runs.iter() {
-            let _ = self.canvas.push_shaped_text(
-                &run.handle,
+            let _ = self.canvas.push_text(
+                run.content.clone(),
                 LogicalPoint::new(bounds.origin.x + run.x, bounds.origin.y),
             );
         }
@@ -2635,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chart_whose_atlas_lease_died_should_repaint() {
+    fn a_chart_should_keep_its_canvas_when_the_engine_text_atlas_changes() {
         let mut harness = Harness::new();
         let snapshot = snapshot_with_spacing(HARNESS_CANDLES, 60);
         let config = CandlestickIndicatorConfig::default();
@@ -2651,104 +2643,26 @@ mod tests {
         let stack = harness.harness.app().font_stack().clone();
         harness.harness.app_mut().set_font_stack(stack);
         assert!(
-            harness.chart.text.has_stale(),
-            "the cleared atlas leaves the shaped labels on a dead lease"
+            !harness.sync(&frame),
+            "engine text invalidation is not the widget's repaint trigger"
         );
-
-        assert!(
-            harness.sync(&frame),
-            "a dead text lease is a frame that rebuilds"
-        );
+        harness.harness.with_cx(|cx| {
+            cx.request_frame().expect("the harness requests a frame");
+        });
         harness.harness.drain();
         let after = harness
             .harness
             .canvas_handle(node)
             .expect("the node still holds a canvas");
         assert!(
-            !Arc::ptr_eq(&before, &after),
-            "the canvas was rebuilt with re-shaped text"
+            Arc::ptr_eq(&before, &after),
+            "the logical canvas survives an atlas change unchanged"
         );
         assert!(
             kinds(&harness.primitives(), PrimitiveKind::GlyphRun) > 0,
-            "the labels are re-shaped rather than lost"
-        );
-        assert!(
-            !harness.chart.text.has_stale(),
-            "the rebuilt frame re-shaped every line it draws"
+            "the engine re-resolved the labels into glyph runs"
         );
     }
-
-    #[test]
-    fn changing_the_text_scale_should_reshape_the_text() {
-        let mut harness = Harness::new();
-        let snapshot = snapshot_with_spacing(HARNESS_CANDLES, 60);
-        let config = CandlestickIndicatorConfig::default();
-        let countdown = SmolStr::new_static("00:30");
-        let viewport = ChartViewport::default();
-        let frame = frame_of(&snapshot, viewport, &config, &countdown);
-        harness.paint(&frame);
-
-        let layout = harness.layout();
-        let plot = layout.price_plot;
-        let range = visible_range(snapshot.candles(), viewport, plot.size.width);
-        let geometry = CandleGeometry::new(plot, range.len(), viewport.candle_width);
-        let cursor = LogicalPoint::new(geometry.center_x(10), plot.origin.y + 20.0);
-        let hovered = frame_of(
-            &snapshot,
-            ChartViewport {
-                cursor: Some(cursor),
-                ..viewport
-            },
-            &config,
-            &countdown,
-        );
-        assert!(harness.sync(&hovered));
-        assert!(
-            !harness.chart.text.shaped_scales().is_empty(),
-            "the frame shapes its axis labels"
-        );
-        assert!(
-            !harness.chart.readout.shaped_scales().is_empty(),
-            "the hovered frame shapes a readout"
-        );
-        assert!(
-            harness
-                .chart
-                .text
-                .shaped_scales()
-                .iter()
-                .chain(harness.chart.readout.shaped_scales().iter())
-                .all(|scale| *scale == 1.0),
-            "the harness shapes at the default raster scale"
-        );
-
-        harness
-            .harness
-            .app_mut()
-            .set_text_scale(2.0)
-            .expect("2.0 is a valid raster scale");
-        assert!(
-            harness.sync(&hovered),
-            "a new raster scale is a different picture"
-        );
-        harness.harness.drain();
-
-        let labels = harness.chart.text.shaped_scales();
-        assert!(
-            !labels.is_empty() && labels.iter().all(|scale| *scale == 2.0),
-            "every label is re-shaped at the new ppem: {labels:?}"
-        );
-        let readout = harness.chart.readout.shaped_scales();
-        assert!(
-            !readout.is_empty() && readout.iter().all(|scale| *scale == 2.0),
-            "the readout is re-shaped at the new ppem: {readout:?}"
-        );
-        assert!(
-            kinds(&harness.primitives(), PrimitiveKind::GlyphRun) > 0,
-            "the text is re-shaped rather than lost"
-        );
-    }
-
     #[test]
     fn switching_the_appearance_should_repaint_the_chart_in_the_new_theme() {
         let mut harness = Harness::new();
@@ -3868,43 +3782,6 @@ mod tests {
     }
 
     #[test]
-    fn a_canvas_with_a_stale_text_lease_should_not_match() {
-        let snapshot = one_candle_snapshot();
-        let indicators = CandlestickIndicatorConfig::default();
-        let countdown = SmolStr::new_static("00:00");
-        let viewport = ChartViewport::default();
-        let frame = frame_of(&snapshot, viewport, &indicators, &countdown);
-        let key = PaintedKey {
-            bounds: LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
-            candle_width: viewport.candle_width,
-            right_timestamp: viewport.right_timestamp,
-            cursor: viewport.cursor,
-            interval: frame.interval,
-            zone: frame.data_time_zone,
-            panel_open: frame.panel_open,
-            colors: light_palette(),
-            language: LanguageCode::En,
-            text_scale: 1.0,
-            catalog_generation: 0,
-        };
-        let painted = PaintedCanvas {
-            key,
-            snapshot: snapshot.clone(),
-            indicators: indicators.clone(),
-            countdown_label: countdown.clone(),
-        };
-
-        assert!(
-            painted.matches(&frame, key, false),
-            "nothing moved: the canvas on screen is reused"
-        );
-        assert!(
-            !painted.matches(&frame, key, true),
-            "a dead atlas lease is not a match: the labels have to be shaped and drawn again"
-        );
-    }
-
-    #[test]
     fn a_painted_key_should_reject_every_changed_drawing_input() {
         let snapshot = one_candle_snapshot();
         let bounds = LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0));
@@ -3925,7 +3802,6 @@ mod tests {
             panel_open: false,
             colors,
             language: LanguageCode::En,
-            text_scale: 1.0,
             catalog_generation: 0,
         };
         let unchanged = PaintedKey { ..key };
@@ -3989,14 +3865,6 @@ mod tests {
         assert_ne!(
             key,
             PaintedKey {
-                text_scale: 2.0,
-                ..key
-            },
-            "another raster scale changes the shaped glyphs"
-        );
-        assert_ne!(
-            key,
-            PaintedKey {
                 panel_open: true,
                 ..key
             },
@@ -4028,29 +3896,25 @@ mod tests {
             indicators: config.clone(),
             countdown_label: label.clone(),
         };
-        assert!(painted.matches(&frame, key, false));
+        assert!(painted.matches(&frame, key));
         let other_snapshot = one_candle_snapshot();
         let other_frame = frame_of(&other_snapshot, viewport, &config, &label);
         assert!(
-            !painted.matches(&other_frame, key, false),
+            !painted.matches(&other_frame, key),
             "a new snapshot changes the candles"
         );
         let mut other_config = config.clone();
         other_config.entries[0].enabled = false;
         let other_config_frame = frame_of(&snapshot, viewport, &other_config, &label);
         assert!(
-            !painted.matches(&other_config_frame, key, false),
+            !painted.matches(&other_config_frame, key),
             "switching a main-chart indicator off changes the lines and the bounds"
         );
         let other_label = SmolStr::new_static("00:29");
         let countdown_frame = frame_of(&snapshot, viewport, &config, &other_label);
         assert!(
-            !painted.matches(&countdown_frame, key, false),
+            !painted.matches(&countdown_frame, key),
             "the latest-price tag draws the countdown text"
-        );
-        assert!(
-            !painted.matches(&frame, key, true),
-            "a dead text lease must rebuild the canvas"
         );
     }
 

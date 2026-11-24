@@ -2,7 +2,7 @@ use smol_str::SmolStr;
 use taffy::style::{FlexDirection, Position};
 use ui_core::{
     interaction::{ScrollAxis, ScrollConfig},
-    math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         style::{Clip, Style},
@@ -18,7 +18,6 @@ fn app() -> TestApp {
     TestApp::with_options(WindowOptions {
         title: SmolStr::new_static("layout"),
         size: WINDOW,
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     })
 }

@@ -35,7 +35,7 @@ pub(crate) struct TextContext {
     stack_resolutions: u32,
     diagnostics: SmallVec<[TextDiagnostic; 8]>,
     font_epoch: u32,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     shapes: u32,
 }
 
@@ -56,7 +56,7 @@ impl TextContext {
             stack_resolutions: 0,
             diagnostics: SmallVec::new(),
             font_epoch: 1,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "test-support"))]
             shapes: 0,
         }
     }
@@ -172,7 +172,7 @@ impl TextContext {
                 (run.range.clone(), run_family)
             })
             .collect();
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-support"))]
         {
             self.shapes += 1;
         }
@@ -188,9 +188,14 @@ impl TextContext {
         (shaped, false)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn shape_count(&self) -> u32 {
         self.shapes
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn clear_shape_cache(&mut self) {
+        self.cache.clear();
     }
 
     fn font_identity(&self, custom: Option<&SmolStr>) -> u64 {

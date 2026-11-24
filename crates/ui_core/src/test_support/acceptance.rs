@@ -445,7 +445,7 @@ mod tests {
     use super::{Load, Scale, chart_chunk_lanes};
     use crate::{
         app::App,
-        math::{DevicePixelRatio, LogicalSize, px},
+        math::{LogicalSize, px},
         test_support::record::FrameStats,
         window::{FrameOutcome, WindowOptions},
     };
@@ -459,7 +459,6 @@ mod tests {
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("acceptance-fixture"),
             size: LogicalSize::new(px(640.0), px(480.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let load = Load::build(&mut app, window, Scale::MINI).expect("缩比负载");

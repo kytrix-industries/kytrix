@@ -209,14 +209,6 @@ pub(crate) fn reset_atlas_deferrals(window: &mut Window) {
     window.atlas_deferrals = 0;
 }
 
-pub(crate) fn note_stale_canvas_followup(window: &mut Window, generation: u32) -> bool {
-    if window.stale_canvas_followup_generation == Some(generation) {
-        return false;
-    }
-    window.stale_canvas_followup_generation = Some(generation);
-    true
-}
-
 pub(crate) fn queue_atlas_upload(
     window: &mut Window,
     kind: AtlasKind,
@@ -318,7 +310,7 @@ pub(crate) fn enable_offscreen_renderer(window: &mut Window) -> Result<(), Engin
     if window.renderer.is_some() {
         return Ok(());
     }
-    let surface = window.physical_surface();
+    let surface = window.surface;
     window.renderer = Some(Renderer::new_offscreen(surface)?);
     reset_atlas_accounting(window);
     Ok(())
@@ -331,10 +323,6 @@ fn reset_atlas_accounting(window: &mut Window) {
     window.image_drawable_layers = 0;
     window.glyph_atlas_rects = crate::render::DirtyRects::default();
     window.image_atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
-}
-
-pub(crate) fn physical_surface(window: &Window) -> (u32, u32) {
-    window.surface
 }
 
 #[cfg(windows)]

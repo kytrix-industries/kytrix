@@ -11,7 +11,7 @@ use ui_core::{
     app::App,
     math::{LogicalPx, px},
     paint::color::Color,
-    text::{ShapedTextHandle, TextStyle},
+    text::{TextContent, TextStyle},
 };
 use ui_kit::theme::components::ChartColors;
 
@@ -34,25 +34,22 @@ pub(crate) fn style_of(size: LogicalPx, color: Color) -> TextStyle {
 struct CachedTextLine {
     text: SmolStr,
     style: TextStyle,
-    handle: Arc<ShapedTextHandle>,
+    width: LogicalPx,
 }
 
 pub(crate) struct ChartTextCache {
     entries: Vec<CachedTextLine>,
-    scale: Option<f32>,
 }
 
 impl ChartTextCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: Vec::with_capacity(TEXT_CACHE_CAPACITY),
-            scale: None,
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
-        self.scale = None;
     }
 
     pub(crate) fn line(
@@ -60,47 +57,34 @@ impl ChartTextCache {
         app: &mut App,
         text: &str,
         style: &TextStyle,
-    ) -> Arc<ShapedTextHandle> {
-        if self.scale != Some(app.text_scale()) {
-            self.clear();
-        }
+    ) -> (TextContent, LogicalPx) {
+        let width = self.width(app, text, style);
+        (TextContent::new(text, style.clone()), width)
+    }
+
+    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
         if let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.text == text && entry.style == *style)
         {
             let entry = self.entries.remove(index);
-            if !entry.handle.is_stale() {
-                let handle = Arc::clone(&entry.handle);
-                self.entries.push(entry);
-                return handle;
-            }
+            let width = entry.width;
+            self.entries.push(entry);
+            return width;
         }
-
-        let scale = app.text_scale();
-        let handle = Arc::new(shape_line(app, text, style));
+        let width = app
+            .measure_text(&TextContent::new(text, style.clone()), None)
+            .width;
         if self.entries.len() == TEXT_CACHE_CAPACITY {
             self.entries.remove(0);
         }
         self.entries.push(CachedTextLine {
             text: SmolStr::new(text),
             style: style.clone(),
-            handle: Arc::clone(&handle),
+            width,
         });
-        self.scale = Some(scale);
-        handle
-    }
-
-    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
-        self.line(app, text, style).size().width
-    }
-
-    pub(crate) fn has_stale(&self) -> bool {
-        self.entries.iter().any(|entry| entry.handle.is_stale())
-    }
-
-    pub(crate) fn drop_stale(&mut self) {
-        self.entries.retain(|entry| !entry.handle.is_stale());
+        width
     }
 
     #[cfg(test)]
@@ -110,22 +94,7 @@ impl ChartTextCache {
             .map(|entry| entry.text.clone())
             .collect()
     }
-
-    #[cfg(test)]
-    pub(crate) fn shaped_scales(&self) -> Vec<f32> {
-        self.entries
-            .iter()
-            .map(|entry| entry.handle.scale().factor())
-            .collect()
-    }
 }
-
-fn shape_line(app: &mut App, text: &str, style: &TextStyle) -> ShapedTextHandle {
-    app.shape_text(text, style, None, &[])
-        .or_else(|_| app.shape_text("", style, None, &[]))
-        .expect("an empty line always shapes")
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadoutTone {
     Muted,
@@ -166,7 +135,7 @@ impl ReadoutSpan {
 }
 
 pub(crate) struct ReadoutRun {
-    pub handle: Arc<ShapedTextHandle>,
+    pub content: TextContent,
     pub x: f32,
 }
 
@@ -195,7 +164,6 @@ struct ReadoutCacheEntry {
     volume_unit: SmolStr,
     muted_color: Color,
     candle_color: Color,
-    text_scale: f32,
     presentation: ReadoutPresentation,
 }
 
@@ -205,7 +173,6 @@ impl ReadoutCacheEntry {
         candle: &ListingCandlestick,
         previous_close: Option<Price>,
         spec: &ReadoutSpec<'_>,
-        text_scale: f32,
     ) -> bool {
         self.candle == *candle
             && self.previous_close == previous_close
@@ -215,7 +182,6 @@ impl ReadoutCacheEntry {
             && self.volume_unit == spec.volume_unit
             && self.muted_color == spec.muted_color
             && self.candle_color == spec.candle_color
-            && self.text_scale == text_scale
     }
 }
 
@@ -229,28 +195,12 @@ impl ReadoutCache {
         self.entry = None;
     }
 
-    pub(crate) fn has_stale(&self) -> bool {
-        self.entry.as_ref().is_some_and(|entry| {
-            entry
-                .presentation
-                .runs
-                .iter()
-                .any(|run| run.handle.is_stale())
-        })
-    }
-
-    pub(crate) fn drop_stale(&mut self) {
-        if self.has_stale() {
-            self.entry = None;
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn described_text(&self) -> Option<SmolStr> {
         let entry = self.entry.as_ref()?;
         let mut text = String::new();
         for run in entry.presentation.runs.iter() {
-            text.push_str(run.handle.line().text.as_str());
+            text.push_str(run.content.text.as_str());
         }
         Some(SmolStr::new(text))
     }
@@ -258,21 +208,6 @@ impl ReadoutCache {
     #[cfg(test)]
     pub(crate) fn described_time_label(&self) -> Option<SmolStr> {
         Some(self.entry.as_ref()?.presentation.time_label.clone())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shaped_scales(&self) -> Vec<f32> {
-        self.entry
-            .as_ref()
-            .map(|entry| {
-                entry
-                    .presentation
-                    .runs
-                    .iter()
-                    .map(|run| run.handle.scale().factor())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     pub(crate) fn presentation(
@@ -283,16 +218,10 @@ impl ReadoutCache {
         spec: &ReadoutSpec<'_>,
     ) -> ReadoutPresentation {
         let previous_close = previous.map(|candle| CandlePrices::of(candle).close());
-        let text_scale = app.text_scale();
         if let Some(entry) = self
             .entry
             .as_ref()
-            .filter(|entry| entry.matches(candle, previous_close, spec, text_scale))
-            && !entry
-                .presentation
-                .runs
-                .iter()
-                .any(|run| run.handle.is_stale())
+            .filter(|entry| entry.matches(candle, previous_close, spec))
         {
             return entry.presentation.clone();
         }
@@ -312,7 +241,6 @@ impl ReadoutCache {
             volume_unit: SmolStr::new(spec.volume_unit),
             muted_color: spec.muted_color,
             candle_color: spec.candle_color,
-            text_scale,
             presentation: presentation.clone(),
         });
         presentation
@@ -396,9 +324,9 @@ fn shape_readout(
             (ReadoutTone::Muted, false) => &muted,
             (ReadoutTone::Candle, _) => &candle_style,
         };
-        let handle = Arc::new(shape_line(app, &span.text, style));
-        let width = handle.size().width;
-        runs.push(ReadoutRun { handle, x });
+        let content = TextContent::new(span.text.clone(), style.clone());
+        let width = app.measure_text(&content, None).width;
+        runs.push(ReadoutRun { content, x });
         x += f32::from(width);
     }
     (runs.into(), x)
@@ -787,12 +715,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_empty_text_cache_has_no_stale_line() {
-        assert!(!ChartTextCache::new().has_stale());
-        assert!(!ReadoutCache::default().has_stale());
-    }
-
     fn readout_spec(volume_unit: &str) -> ReadoutSpec<'_> {
         ReadoutSpec {
             price_tick: tick("0.01"),
@@ -808,7 +730,7 @@ mod tests {
         presentation
             .runs
             .iter()
-            .map(|run| run.handle.line().text.as_str())
+            .map(|run| run.content.text.as_str())
             .collect()
     }
 

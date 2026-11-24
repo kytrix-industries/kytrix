@@ -217,7 +217,7 @@ impl CryptocurrencyEtfChart {
             line: self.cache.line,
             appearance,
         };
-        if self.cache.painted == Some(painted) && !self.cache.text.has_stale() {
+        if self.cache.painted == Some(painted) {
             return Ok(false);
         }
 
@@ -228,7 +228,7 @@ impl CryptocurrencyEtfChart {
             return Ok(false);
         };
         let line = self.cache.line.map(|id| (id, colors.role(Role::FgDefault)));
-        let (canvas, whole) = paint(
+        let canvas = paint(
             cx.app_mut(),
             &self.data,
             prepared,
@@ -238,24 +238,8 @@ impl CryptocurrencyEtfChart {
             &mut self.cache.text,
             line,
         );
-        let (canvas, whole) = if whole {
-            (canvas, whole)
-        } else {
-            paint(
-                cx.app_mut(),
-                &self.data,
-                prepared,
-                layout,
-                self.hover,
-                colors,
-                &mut self.cache.text,
-                line,
-            )
-        };
         let changed = cx.set_canvas(node, canvas)?;
-        if whole {
-            self.cache.painted = Some(painted);
-        }
+        self.cache.painted = Some(painted);
         Ok(changed)
     }
 

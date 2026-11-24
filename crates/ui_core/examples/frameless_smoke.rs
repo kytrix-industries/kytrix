@@ -109,12 +109,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if report.first_presented_at.is_none() && target.last_frame_presentation().is_some() {
                 report.first_presented_at = Some(Instant::now());
                 report.initial_size = Some(target.size());
-                report.expected_maximized = expected_maximized_size(target.scale().factor());
+                report.expected_maximized =
+                    expected_maximized_size(target.device_pixel_ratio().factor());
                 println!(
                     "smoke: first frame presented at {wall:.2}s ({frames} pump rounds, \
-                     client={:.0}x{:.0}, work-area={})",
+                     client={:.0}x{:.0}, physical={:?}, work-area={})",
                     target.size().width,
                     target.size().height,
+                    target.physical_surface(),
                     report.expected_maximized.map_or_else(
                         || "unknown (non-Windows)".to_owned(),
                         |size| format!("{:.0}x{:.0}", size.width, size.height),

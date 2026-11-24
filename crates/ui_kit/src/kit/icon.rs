@@ -772,7 +772,7 @@ mod tests {
         app.app_mut()
             .window_mut(window)
             .expect("test window")
-            .set_scale(DevicePixelRatio::new(scale).expect("测试 DPI 必须是有限正数"));
+            .set_device_pixel_ratio(DevicePixelRatio::new(scale).expect("测试 DPI 必须是有限正数"));
     }
 
     fn resource(

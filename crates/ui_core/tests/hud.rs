@@ -181,7 +181,7 @@ fn the_size_line_follows_the_window_on_the_next_application_frame() {
     test.app_mut()
         .window_mut(window)
         .expect("窗口")
-        .set_scale(DevicePixelRatio::new(1.25).expect("scale"));
+        .set_device_pixel_ratio(DevicePixelRatio::new(1.25).expect("scale"));
     assert!(test.drain().expect("DPI 变化帧").rendered);
     assert!(
         line(&test, 10).starts_with("1250x875 @ 1.25x "),

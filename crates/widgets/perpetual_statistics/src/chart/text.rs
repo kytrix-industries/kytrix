@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use market_participants_model::decimal::{Price, Quantity, Tick};
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
@@ -7,7 +5,7 @@ use ui_core::{
     app::App,
     math::LogicalPx,
     paint::color::Color,
-    text::{ShapedTextHandle, TextAlign, TextStyle},
+    text::{TextAlign, TextContent, TextStyle},
 };
 use ui_kit::kit::format::group_digits;
 
@@ -19,7 +17,7 @@ pub(crate) const NOT_A_READING: SmolStr = SmolStr::new_static("--");
 struct CachedText {
     text: SmolStr,
     style: TextStyle,
-    handle: Arc<ShapedTextHandle>,
+    width: LogicalPx,
 }
 
 pub(crate) struct ChartTextCache {
@@ -40,44 +38,38 @@ impl ChartTextCache {
         app: &mut App,
         text: &str,
         style: &TextStyle,
-    ) -> Arc<ShapedTextHandle> {
+    ) -> (TextContent, LogicalPx) {
+        let width = self.width(app, text, style);
+        (TextContent::new(text, style.clone()), width)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn content(&mut self, app: &mut App, text: &str, style: &TextStyle) -> TextContent {
+        self.line(app, text, style).0
+    }
+    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
         if let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.text == text && entry.style == *style)
         {
             let entry = self.entries.remove(index);
-            if !entry.handle.is_stale() {
-                let handle = Arc::clone(&entry.handle);
-                self.entries.push(entry);
-                return handle;
-            }
+            let width = entry.width;
+            self.entries.push(entry);
+            return width;
         }
-        let handle = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
-            app.shape_text("", style, None, &[])
-                .expect("an empty line always shapes")
-        }));
+        let width = app
+            .measure_text(&TextContent::new(text, style.clone()), None)
+            .width;
         if self.entries.len() == TEXT_CACHE_CAPACITY {
             self.entries.remove(0);
         }
         self.entries.push(CachedText {
             text: SmolStr::new(text),
             style: style.clone(),
-            handle: Arc::clone(&handle),
+            width,
         });
-        handle
-    }
-
-    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
-        self.line(app, text, style).size().width
-    }
-
-    pub(crate) fn has_stale(&mut self) -> bool {
-        let stale = self.entries.iter().any(|entry| entry.handle.is_stale());
-        if stale {
-            self.entries.retain(|entry| !entry.handle.is_stale());
-        }
-        stale
+        width
     }
 }
 

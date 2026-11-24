@@ -11,7 +11,7 @@ use crate::{
         AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, OverlayDismiss,
         OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig, VirtualListConfig,
     },
-    math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, LogicalSize, dp, px},
+    math::{DeviceRect, LogicalPoint, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
     paint::{
         color::Color,
@@ -30,7 +30,6 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let window = app.create_window(WindowOptions {
         title: "p10".into(),
         size: LogicalSize::new(px(400.0), px(300.0)),
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)
@@ -3702,7 +3701,6 @@ fn held_keys_are_per_window_and_cleared_on_close() {
     let other = app.create_window(WindowOptions {
         title: "other".into(),
         size: LogicalSize::new(px(200.0), px(200.0)),
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     frame(&mut app, window);

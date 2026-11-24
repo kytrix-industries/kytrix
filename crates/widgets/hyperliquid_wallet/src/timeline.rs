@@ -19,7 +19,7 @@ use ui_core::{
     a11y::{A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    math::{LogicalPoint, LogicalPx, LogicalRect, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         canvas::Canvas,
@@ -28,7 +28,7 @@ use ui_core::{
         style::StylePatch,
         style_builder::StyleBuilder,
     },
-    text::{ShapedTextHandle, TextStyle},
+    text::{TextContent, TextStyle},
 };
 use ui_kit::theme::{handle::ThemeHandle, resolved::Theme, role::Role};
 use widget::cx::WidgetCx;
@@ -593,15 +593,8 @@ impl TimelineData {
 }
 
 struct CachedTextLine {
-    text: SmolStr,
-    style: TextStyle,
-    line: Arc<ShapedTextHandle>,
-}
-
-impl CachedTextLine {
-    fn matches(&self, text: &str, style: &TextStyle) -> bool {
-        self.text == text && self.style == *style
-    }
+    content: TextContent,
+    size: LogicalSize,
 }
 
 struct GeometryCacheEntry {
@@ -648,33 +641,27 @@ impl PaintCache {
         geometry
     }
 
-    fn line(&mut self, app: &mut App, text: &str, style: &TextStyle) -> Arc<ShapedTextHandle> {
+    fn line(&mut self, app: &mut App, text: &str, style: &TextStyle) -> (TextContent, LogicalSize) {
         if let Some(index) = self
             .text_lines
             .iter()
-            .position(|entry| entry.matches(text, style))
+            .position(|entry| entry.content.text == text && entry.content.style == *style)
         {
             let entry = self.text_lines.remove(index);
-            if !entry.line.is_stale() {
-                let line = entry.line.clone();
-                self.text_lines.push(entry);
-                return line;
-            }
+            let result = (entry.content.clone(), entry.size);
+            self.text_lines.push(entry);
+            return result;
         }
-
-        let line = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
-            app.shape_text("", style, None, &[])
-                .expect("an empty line always shapes")
-        }));
+        let content = TextContent::new(text, style.clone());
+        let size = app.measure_text(&content, None);
         if self.text_lines.len() >= TEXT_CACHE_CAPACITY {
             self.text_lines.remove(0);
         }
         self.text_lines.push(CachedTextLine {
-            text: SmolStr::new(text),
-            style: style.clone(),
-            line: line.clone(),
+            content: content.clone(),
+            size,
         });
-        line
+        (content, size)
     }
 }
 
@@ -682,23 +669,13 @@ struct LabelMetrics {
     labels: (SmolStr, SmolStr),
     color: Color,
     font_size: LogicalPx,
-    text_scale: f32,
-    start: Arc<ShapedTextHandle>,
-    end: Arc<ShapedTextHandle>,
+    start: (TextContent, LogicalSize),
+    end: (TextContent, LogicalSize),
 }
 
 impl LabelMetrics {
-    fn matches(
-        &self,
-        labels: &(SmolStr, SmolStr),
-        color: Color,
-        font_size: LogicalPx,
-        text_scale: f32,
-    ) -> bool {
-        self.labels == *labels
-            && self.color == color
-            && self.font_size == font_size
-            && self.text_scale == text_scale
+    fn matches(&self, labels: &(SmolStr, SmolStr), color: Color, font_size: LogicalPx) -> bool {
+        self.labels == *labels && self.color == color && self.font_size == font_size
     }
 }
 
@@ -710,7 +687,6 @@ struct PreparedKey {
     hovered: Option<(Side, usize)>,
     colors: TimelineColors,
     language: LanguageCode,
-    text_scale: f32,
 }
 
 impl PreparedKey {
@@ -723,7 +699,6 @@ impl PreparedKey {
         hovered: Option<(Side, usize)>,
         colors: TimelineColors,
         language: LanguageCode,
-        text_scale: f32,
     ) -> bool {
         let same_snapshot = match (&self.snapshot, snapshot) {
             (Some(current), Some(next)) => Arc::ptr_eq(current, next),
@@ -737,7 +712,6 @@ impl PreparedKey {
             && self.hovered == hovered
             && self.colors == colors
             && self.language == language
-            && self.text_scale == text_scale
     }
 }
 
@@ -747,7 +721,6 @@ pub(super) struct TimelinePaint {
     cache: PaintCache,
     labels: Option<LabelMetrics>,
     prepared: Option<PreparedKey>,
-    painted_text: Vec<Arc<ShapedTextHandle>>,
     hovered: Option<(Side, usize)>,
     empty_bounds: Option<LogicalRect>,
     a11y_language: Option<LanguageCode>,
@@ -761,7 +734,6 @@ impl TimelinePaint {
             cache: PaintCache::default(),
             labels: None,
             prepared: None,
-            painted_text: Vec::new(),
             hovered: None,
             empty_bounds: None,
             a11y_language: None,
@@ -794,7 +766,6 @@ impl TimelinePaint {
             cx.set_canvas(node, Canvas::new(bounds))?;
             self.empty_bounds = Some(bounds);
             self.prepared = None;
-            self.painted_text.clear();
             self.hovered = None;
             self.data.replace_snapshot(None);
             return Ok(());
@@ -804,7 +775,6 @@ impl TimelinePaint {
         let appearance = cx.theme().current(cx.app());
         let colors = TimelineColors::resolve(cx.theme().theme_for(appearance));
         let tokens = *cx.theme().tokens();
-        let text_scale = cx.app().text_scale();
         let language_now = *cx.read(&language);
         let translate = cx.translate().clone();
 
@@ -817,7 +787,6 @@ impl TimelinePaint {
             axis_labels(&translate),
             tokens.small.font_size,
             colors.axis_label,
-            text_scale,
         );
         let (start_label_width, end_label_width) =
             if label_widths.0 + label_widths.1 + AXIS_LABEL_GAP * 2.0 < plot_width {
@@ -840,9 +809,8 @@ impl TimelinePaint {
                 hovered,
                 colors,
                 language_now,
-                text_scale,
             )
-        }) && !self.painted_text.iter().any(|handle| handle.is_stale());
+        });
         if prepared {
             return Ok(());
         }
@@ -883,24 +851,17 @@ impl TimelinePaint {
             },
             hovered,
         };
-        let (canvas, whole, painted_text) = frame.paint(&mut self.cache);
+        let canvas = frame.paint(&mut self.cache);
         cx.set_canvas(node, canvas)?;
-        if whole {
-            self.prepared = Some(PreparedKey {
-                snapshot: self.data.snapshot.clone(),
-                bounds,
-                axis_width,
-                start_label_width,
-                hovered,
-                colors,
-                language: language_now,
-                text_scale,
-            });
-            self.painted_text = painted_text;
-        } else {
-            self.prepared = None;
-            self.painted_text.clear();
-        }
+        self.prepared = Some(PreparedKey {
+            snapshot: self.data.snapshot.clone(),
+            bounds,
+            axis_width,
+            start_label_width,
+            hovered,
+            colors,
+            language: language_now,
+        });
         Ok(())
     }
 
@@ -910,7 +871,6 @@ impl TimelinePaint {
         self.cache = PaintCache::default();
         self.labels = None;
         self.prepared = None;
-        self.painted_text.clear();
         self.hovered = None;
         self.empty_bounds = None;
         self.a11y_language = None;
@@ -922,16 +882,17 @@ impl TimelinePaint {
         labels: (SmolStr, SmolStr),
         font_size: LogicalPx,
         color: Color,
-        text_scale: f32,
     ) -> (
-        (Option<Arc<ShapedTextHandle>>, Option<Arc<ShapedTextHandle>>),
+        (
+            Option<(TextContent, LogicalSize)>,
+            Option<(TextContent, LogicalSize)>,
+        ),
         (LogicalPx, LogicalPx),
     ) {
-        let current = self.labels.as_ref().is_some_and(|metrics| {
-            metrics.matches(&labels, color, font_size, text_scale)
-                && !metrics.start.is_stale()
-                && !metrics.end.is_stale()
-        });
+        let current = self
+            .labels
+            .as_ref()
+            .is_some_and(|metrics| metrics.matches(&labels, color, font_size));
         if !current {
             let style = text_style(font_size, color);
             let start = self.cache.line(app, labels.0.as_str(), &style);
@@ -940,13 +901,12 @@ impl TimelinePaint {
                 labels,
                 color,
                 font_size,
-                text_scale,
                 start,
                 end,
             });
         }
         let metrics = self.labels.as_ref().expect("the labels are ensured");
-        let widths = (metrics.start.size().width, metrics.end.size().width);
+        let widths = (metrics.start.1.width, metrics.end.1.width);
         (
             (Some(metrics.start.clone()), Some(metrics.end.clone())),
             widths,
@@ -1050,24 +1010,14 @@ fn tooltip_panel(
 struct TextPainter<'a> {
     app: &'a mut App,
     cache: &'a mut PaintCache,
-    used: Vec<Arc<ShapedTextHandle>>,
-    whole: bool,
 }
 
 impl TextPainter<'_> {
-    fn line(&mut self, text: &str, style: &TextStyle) -> Option<Arc<ShapedTextHandle>> {
+    fn line(&mut self, text: &str, style: &TextStyle) -> Option<(TextContent, LogicalSize)> {
         if text.is_empty() {
             return None;
         }
         Some(self.cache.line(self.app, text, style))
-    }
-
-    fn place(&mut self, canvas: &mut Canvas, line: &Arc<ShapedTextHandle>, origin: LogicalPoint) {
-        if canvas.push_shaped_text(line, origin) {
-            self.used.push(line.clone());
-        } else {
-            self.whole = false;
-        }
     }
 }
 
@@ -1084,12 +1034,15 @@ struct Frame<'a> {
     snapshot: &'a Arc<TimelineSnapshot>,
     buckets: &'a [TimelineBucket],
     geometry: &'a TimelineGeometry,
-    labels: (Option<Arc<ShapedTextHandle>>, Option<Arc<ShapedTextHandle>>),
+    labels: (
+        Option<(TextContent, LogicalSize)>,
+        Option<(TextContent, LogicalSize)>,
+    ),
     hovered: Option<(Side, usize)>,
 }
 
 impl Frame<'_> {
-    fn paint(self, cache: &mut PaintCache) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
+    fn paint(self, cache: &mut PaintCache) -> Canvas {
         let Self {
             app,
             bounds,
@@ -1112,12 +1065,7 @@ impl Frame<'_> {
             rect: bounds,
             corner_radius: [px(0.0); 4],
         });
-        let mut text = TextPainter {
-            app,
-            cache,
-            used: Vec::with_capacity(buckets.len() * 2 + TOOLTIP_VISIBLE_ROWS * 3),
-            whole: true,
-        };
+        let mut text = TextPainter { app, cache };
 
         for tick in [geometry.axis, geometry.start_tick, geometry.end_tick] {
             canvas.push_quad(solid_quad(tick.translate(origin), colors.axis));
@@ -1152,32 +1100,29 @@ impl Frame<'_> {
                 Side::Buy => "B",
                 Side::Sell => "S",
             };
-            let Some(line) = text.line(letter, &letter_style) else {
+            let Some((content, size)) = text.line(letter, &letter_style) else {
                 continue;
             };
-            let size = line.size();
             let center = LogicalPoint::new(
                 marker.bounds.origin.x + (marker.bounds.size.width - size.width) / 2.0,
                 marker.bounds.origin.y + (marker.bounds.size.height - size.height) / 2.0,
             );
-            text.place(&mut canvas, &line, center + origin);
+            let _ = canvas.push_text(content, center + origin);
         }
 
-        if let Some(start) = &labels.0 {
-            let size = start.size();
+        if let Some((content, size)) = &labels.0 {
             let position = LogicalPoint::new(
                 geometry.axis.origin.x - AXIS_LABEL_GAP - size.width,
                 geometry.axis.origin.y - size.height / 2.0,
             );
-            text.place(&mut canvas, start, position + origin);
+            let _ = canvas.push_text(content.clone(), position + origin);
         }
-        if let Some(end) = &labels.1 {
-            let size = end.size();
+        if let Some((content, size)) = &labels.1 {
             let position = LogicalPoint::new(
                 geometry.axis.max().x + AXIS_LABEL_GAP,
                 geometry.axis.origin.y - size.height / 2.0,
             );
-            text.place(&mut canvas, end, position + origin);
+            let _ = canvas.push_text(content.clone(), position + origin);
         }
 
         if let Some((side, index)) = hovered
@@ -1202,7 +1147,7 @@ impl Frame<'_> {
         }
 
         let _ = canvas.pop_clip();
-        (canvas, text.whole, text.used)
+        canvas
     }
 }
 
@@ -1269,29 +1214,25 @@ impl TooltipFrame<'_> {
             let label_style = text_style(self.font, self.colors.tone(tone));
             let age = age_text(self.now, row.timestamp, self.translate);
 
-            let Some(quantity_line) = text.line(&quantity, &quantity_style) else {
+            let Some((quantity_line, quantity_size)) = text.line(&quantity, &quantity_style) else {
                 continue;
             };
-            let line_top = top + (TOOLTIP_ROW_HEIGHT - quantity_line.size().height) / 2.0;
-            text.place(
-                canvas,
-                &quantity_line,
+            let line_top = top + (TOOLTIP_ROW_HEIGHT - quantity_size.height) / 2.0;
+            let _ = canvas.push_text(
+                quantity_line,
                 LogicalPoint::new(origin.x + panel.origin.x + TOOLTIP_PADDING, line_top),
             );
 
             let age_line = text.line(&age, &muted_style);
             let label_line = text.line(&label, &label_style);
-            let age_width = age_line.as_ref().map_or(px(0.0), |line| line.size().width);
-            let label_width = label_line
-                .as_ref()
-                .map_or(px(0.0), |line| line.size().width);
-            if let Some(line) = &age_line {
-                text.place(canvas, line, LogicalPoint::new(right - age_width, line_top));
+            let age_width = age_line.as_ref().map_or(px(0.0), |(_, size)| size.width);
+            let label_width = label_line.as_ref().map_or(px(0.0), |(_, size)| size.width);
+            if let Some((content, _)) = age_line {
+                let _ = canvas.push_text(content, LogicalPoint::new(right - age_width, line_top));
             }
-            if let Some(line) = &label_line {
-                text.place(
-                    canvas,
-                    line,
+            if let Some((content, _)) = label_line {
+                let _ = canvas.push_text(
+                    content,
                     LogicalPoint::new(right - age_width - AXIS_LABEL_GAP - label_width, line_top),
                 );
             }
@@ -1852,7 +1793,7 @@ mod tests {
     }
 
     #[test]
-    fn a_timeline_should_reshape_its_text_when_the_atlas_lease_is_gone() {
+    fn a_timeline_should_keep_its_canvas_when_the_engine_text_atlas_changes() {
         let mut harness = a_timeline();
         let before = harness.canvas().expect("the timeline drew a canvas");
 
@@ -1860,14 +1801,32 @@ mod tests {
         harness.app.app_mut().set_font_stack(stack);
 
         harness.sync(None);
-        harness.app.drain();
-
         assert!(
-            !Arc::ptr_eq(
+            Arc::ptr_eq(
                 &before,
                 &harness.canvas().expect("the timeline drew a canvas")
             ),
-            "a stale glyph lease is a canvas the timeline owed"
+            "engine text invalidation is not the widget's repaint trigger"
+        );
+
+        harness.app.with_cx(|cx| {
+            cx.request_frame().expect("the harness requests a frame");
+        });
+        harness.app.drain();
+
+        assert!(
+            Arc::ptr_eq(
+                &before,
+                &harness.canvas().expect("the timeline drew a canvas")
+            ),
+            "the logical canvas survives the atlas change unchanged"
+        );
+        assert!(
+            harness
+                .primitives()
+                .iter()
+                .any(|primitive| primitive.kind == PrimitiveKind::GlyphRun),
+            "the engine re-resolved the labels into glyph runs"
         );
     }
 
@@ -2057,7 +2016,7 @@ mod tests {
             "the timeline mints no value slots"
         );
         assert!(harness.paint.prepared.is_none());
-        assert!(harness.paint.painted_text.is_empty());
+        assert!(harness.paint.cache.text_lines.is_empty());
 
         harness.sync(None);
         harness.app.drain();

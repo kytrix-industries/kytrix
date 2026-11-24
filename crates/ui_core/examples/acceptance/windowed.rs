@@ -10,7 +10,6 @@ use std::{
 
 use ui_core::{
     app::{App, AppHandle, Application},
-    math::DevicePixelRatio,
     paint::color::Color,
     window::{FrameOutcome, WindowId, WindowOptions},
 };
@@ -282,7 +281,6 @@ pub fn run_window(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     let window = app.create_window(WindowOptions {
         title: smol_str::SmolStr::new_static("kytrix acceptance"),
         size: scene::WINDOW_SIZE,
-        scale: DevicePixelRatio::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
         ..WindowOptions::default()
     });
@@ -419,7 +417,6 @@ pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     let window = app.create_window(WindowOptions {
         title: smol_str::SmolStr::new_static("kytrix acceptance (idle)"),
         size: scene::WINDOW_SIZE,
-        scale: DevicePixelRatio::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
         ..WindowOptions::default()
     });
@@ -482,14 +479,18 @@ pub fn run_idle(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
 
 fn print_environment(app: &App, window: WindowId) {
     let size = app.window(window).map(|window| window.size());
-    let scale = app.window(window).map(|window| window.scale().factor());
+    let scale = app
+        .window(window)
+        .map(|window| window.device_pixel_ratio().factor());
+    let physical = app.window(window).map(|window| window.physical_surface());
     println!(
-        "环境：os={} arch={} logical_cpus={} window={:?} dpi={:?}",
+        "环境：os={} arch={} logical_cpus={} window={:?} dpi={:?} physical={:?}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         crate::report::cores(),
         size,
-        scale
+        scale,
+        physical
     );
 }
 

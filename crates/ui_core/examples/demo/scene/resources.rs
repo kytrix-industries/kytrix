@@ -3,8 +3,8 @@ use ui_core::{
     a11y::{A11yOverride, A11yRole},
     app::App,
     interaction::ScrollConfig,
-    math::{DeviceSize, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, dp, px},
-    node::{builder::NodeBuilder, id::NodeId},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
+    node::{builder::NodeBuilder, id::NodeId, image::ImageFit},
     paint::{
         canvas::Canvas,
         color::Color,
@@ -49,16 +49,11 @@ pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, origin: Logi
     let icon = app
         .insert_bitmap_for_window(window, &ICON_PNG)
         .expect("内嵌 16x16 PNG 必须可解码");
-    let dpr = app.window(window).expect("窗口存在").scale().factor();
     for (index, slot) in ICON_SLOTS.iter().enumerate() {
         let local = LogicalRect::new(slot.0, slot.1, slot.2, slot.2);
         let absolute = local.translate(origin);
-        let target = DeviceSize::new(
-            dp((slot.2.value() * dpr).ceil() as i32),
-            dp((slot.2.value() * dpr).ceil() as i32),
-        );
-        let tile = icon
-            .variant_for(app.resources(), target)
+        let tile = app
+            .prepare_image_variant(window, icon, local.size, ImageFit::Fill)
             .expect("位图的原生变体恒可用");
         let mut canvas = Canvas::new(absolute);
         canvas.push_image(Image {

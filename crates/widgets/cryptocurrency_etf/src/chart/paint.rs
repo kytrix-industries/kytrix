@@ -272,13 +272,8 @@ pub(crate) fn paint(
     theme: &Theme,
     text: &mut ChartTextCache,
     line: Option<(GeometryId, Color)>,
-) -> (Canvas, bool) {
-    let mut context = PaintContext {
-        app,
-        theme,
-        text,
-        whole: true,
-    };
+) -> Canvas {
+    let mut context = PaintContext { app, theme, text };
     let chart = theme.components().chart;
     let mut canvas = Canvas::new(layout.content);
     paint_plot_rules(&mut canvas, layout, chart.grid);
@@ -309,15 +304,13 @@ pub(crate) fn paint(
     if let Some(hover) = hover.filter(|hover| hover.index < data.points.len()) {
         paint_hover(&mut canvas, data, hover, layout, theme, &mut context);
     }
-    let whole = context.whole;
-    (canvas, whole)
+    canvas
 }
 
 struct PaintContext<'a> {
     app: &'a mut App,
     theme: &'a Theme,
     text: &'a mut ChartTextCache,
-    whole: bool,
 }
 
 impl PaintContext<'_> {
@@ -334,16 +327,13 @@ impl PaintContext<'_> {
         if width <= LogicalPx::ZERO {
             return;
         }
-        let line = self.text.line(self.app, text, style);
-        let line_width = line.size().width;
+        let (content, line_width) = self.text.line(self.app, text, style);
         let origin_x = match align {
             Align::Left => x,
             Align::Center => x + (width - line_width) / 2.0,
             Align::Right => x + width - line_width,
         };
-        if !canvas.push_shaped_text(&line, LogicalPoint::new(origin_x, y)) {
-            self.whole = false;
-        }
+        let _ = canvas.push_text(content, LogicalPoint::new(origin_x, y));
     }
 }
 

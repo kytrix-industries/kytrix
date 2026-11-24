@@ -137,12 +137,6 @@ pub enum EngineError {
     #[error("text shaping failed for {node:?}: {detail}")]
     TextShape { node: NodeId, detail: SmolStr },
 
-    #[error("standalone text shaping failed: {detail}")]
-    TextShapeStandalone { detail: SmolStr },
-
-    #[error("invalid text scale {scale}: must be finite and greater than zero")]
-    InvalidTextScale { scale: f32 },
-
     #[error("atlas {kind:?} is exhausted: no free tile fits after a clear and rebuild")]
     AtlasExhausted { kind: AtlasKind },
 
@@ -335,10 +329,6 @@ mod tests {
                 node: NodeId::for_test(5, 1),
                 detail: SmolStr::new_static("font stack is empty"),
             },
-            EngineError::TextShapeStandalone {
-                detail: SmolStr::new_static("font stack is empty"),
-            },
-            EngineError::InvalidTextScale { scale: 0.0 },
             EngineError::AtlasExhausted {
                 kind: AtlasKind::Glyph,
             },
@@ -428,21 +418,6 @@ mod tests {
         assert!(text.contains("text shaping failed"), "{text}");
         assert!(text.contains("n6.2"), "{text}");
         assert!(text.contains("char boundary"), "{text}");
-    }
-
-    #[test]
-    fn standalone_text_shape_display_has_no_node_handle() {
-        let text = EngineError::TextShapeStandalone {
-            detail: SmolStr::new_static("max_width 0 must be finite and non-negative"),
-        }
-        .to_string();
-
-        assert!(text.contains("standalone text shaping failed"), "{text}");
-        assert!(text.contains("max_width"), "{text}");
-        assert!(
-            !text.contains("node"),
-            "独立 shaping 错误不得暗示节点归属：{text}"
-        );
     }
 
     #[test]
@@ -640,18 +615,6 @@ mod tests {
 
         assert!(text.contains("live node"), "{text}");
         assert!(text.contains("releasing it would break"), "{text}");
-    }
-
-    #[test]
-    fn invalid_text_scale_display_is_distinct_from_the_platform_dpi_error() {
-        let text = EngineError::InvalidTextScale { scale: f32::NAN }.to_string();
-
-        assert!(text.contains("invalid text scale"), "{text}");
-        assert!(text.contains("finite and greater than zero"), "{text}");
-        assert!(
-            !text.contains("DPI"),
-            "应用侧 scale 错误不得与平台 DPI 错误混淆：{text}"
-        );
     }
 
     #[test]

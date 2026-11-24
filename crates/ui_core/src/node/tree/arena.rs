@@ -26,6 +26,7 @@ pub(crate) fn new() -> NodeTree {
         parent: None,
         children: Vec::new(),
         kind: NodeKind::Box,
+        canvas_generation: 0,
         style: Box::new(root_style),
         style_patch: None,
         bind_style: None,
@@ -71,6 +72,7 @@ pub(crate) fn new() -> NodeTree {
         a11y_slots: vec![None],
         images_need_refresh: false,
         image_nodes: Vec::new(),
+        canvas_nodes: Vec::new(),
         dirty_bind: DirtySet::new(),
         dirty_layout,
         dirty_paint,
@@ -190,6 +192,7 @@ pub(crate) fn insert_child(
         parent: None,
         children: Vec::new(),
         kind,
+        canvas_generation: 0,
         style: Box::new(style),
         style_patch: None,
         bind_style,
@@ -221,6 +224,13 @@ pub(crate) fn insert_child(
     {
         tree.images_need_refresh = true;
         tree.image_nodes.push(id);
+    }
+    if tree
+        .arena
+        .get(id)
+        .is_some_and(|target| matches!(target.kind, NodeKind::Canvas(_)))
+    {
+        tree.canvas_nodes.push(id);
     }
     tree.layout_cache.remove(&id);
     let index = id.index() as usize;
@@ -436,6 +446,9 @@ pub(crate) fn remove(
     }
     if !tree.image_nodes.is_empty() {
         tree.image_nodes.retain(|id| !removed.contains(id));
+    }
+    if !tree.canvas_nodes.is_empty() {
+        tree.canvas_nodes.retain(|id| !removed.contains(id));
     }
     tree.dirty_bind.shrink_stale();
     tree.dirty_layout.shrink_stale();

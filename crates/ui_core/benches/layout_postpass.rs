@@ -4,7 +4,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
-    math::{DevicePixelRatio, LogicalPoint, LogicalSize, px},
+    math::{LogicalPoint, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     window::{WindowId, WindowOptions},
@@ -26,7 +26,6 @@ fn fixture(handle: &tokio::runtime::Handle) -> (App, WindowId) {
     let window = app.create_window(WindowOptions {
         title: SmolStr::new_static("bench"),
         size: VIEWPORT,
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (app, window)

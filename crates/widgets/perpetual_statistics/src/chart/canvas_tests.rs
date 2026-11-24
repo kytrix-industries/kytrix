@@ -8,6 +8,7 @@ use ui_core::{
     math::{LogicalPoint, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{primitive::Primitive, style_builder::StyleBuilder},
+    test_support::record::PrimitiveKind,
     window::WindowId,
 };
 use ui_kit::theme::appearance::Appearance;
@@ -101,6 +102,24 @@ impl ChartHarness {
             .expect("the chart drew a canvas")
     }
 
+    fn node(&self) -> NodeId {
+        self.chart.node().expect("the chart built")
+    }
+
+    fn canvas_handle(&self) -> Arc<ui_core::paint::canvas::Canvas> {
+        self.app
+            .canvas_handle(self.node())
+            .expect("the node holds a canvas")
+    }
+
+    fn glyph_runs(&self) -> usize {
+        self.app
+            .canvas_primitives(self.node())
+            .iter()
+            .filter(|primitive| primitive.kind == PrimitiveKind::GlyphRun)
+            .count()
+    }
+
     fn layout(&self) -> super::axes::ChartLayout {
         self.chart
             .layout_for_test()
@@ -153,18 +172,6 @@ fn middle_of_plot(harness: &ChartHarness) -> LogicalPoint {
     )
 }
 
-fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
-    harness
-        .canvas()
-        .primitives()
-        .iter()
-        .find_map(|primitive| match primitive {
-            Primitive::GlyphRun(run) => run.glyphs.first(),
-            _ => None,
-        })
-        .map(|glyph| glyph.tile.generation)
-}
-
 fn kinds(canvas: &ui_core::paint::canvas::Canvas) -> Vec<&'static str> {
     canvas
         .primitives()
@@ -172,6 +179,7 @@ fn kinds(canvas: &ui_core::paint::canvas::Canvas) -> Vec<&'static str> {
         .map(|primitive| match primitive {
             Primitive::Quad(_) => "quad",
             Primitive::GlyphRun(_) => "text",
+            Primitive::Text(_) => "text",
             Primitive::Path(_) => "path",
             Primitive::Image(_) => "image",
             Primitive::Shadow(_) => "shadow",
@@ -368,33 +376,35 @@ fn a_language_switch_should_rewrite_the_labels() {
 }
 
 #[test]
-fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
+fn a_chart_should_keep_its_canvas_when_the_engine_text_atlas_changes() {
     let mut harness = ChartHarness::new(3);
     assert!(harness.sync(), "the first frame paints");
-    let labels = harness.canvas().primitives().len();
-    let generation =
-        glyph_generation(&harness).expect("a chart of three intervals labels its axes");
+    harness.app.drain();
+    let canvas = harness.canvas_handle();
+    assert!(
+        harness.glyph_runs() > 0,
+        "the axes are labelled with glyph runs"
+    );
 
     let stack = harness.app.app().font_stack().clone();
     harness.app.app_mut().set_font_stack(stack);
 
     assert!(
-        harness.sync(),
-        "a label whose lease moved is a frame the chart owes, not an idle one"
+        !harness.sync(),
+        "engine text invalidation is not the widget's repaint trigger"
     );
-    assert_ne!(
-        glyph_generation(&harness),
-        Some(generation),
-        "every label was shaped for the atlas that exists now"
-    );
-    assert_eq!(
-        harness.canvas().primitives().len(),
-        labels,
-        "and none of them disappeared with the old lease"
+    harness.app.with_cx(|cx| {
+        cx.request_frame().expect("the harness requests a frame");
+    });
+    harness.app.drain();
+
+    assert!(
+        Arc::ptr_eq(&canvas, &harness.canvas_handle()),
+        "the logical canvas survives an atlas change unchanged"
     );
     assert!(
-        !harness.sync(),
-        "with fresh leases the frame is steady again (I3)"
+        harness.glyph_runs() > 0,
+        "the engine re-resolved the labels into glyph runs"
     );
 }
 

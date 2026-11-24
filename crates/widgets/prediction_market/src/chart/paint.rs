@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use i18n::translate::Translate;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -11,7 +9,7 @@ use ui_core::{
         geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology},
         primitive::{Border, ClipRect, GeometryDraw, Quad, QuadPaint},
     },
-    text::{ShapedTextHandle, TextStyle},
+    text::TextStyle,
 };
 use ui_kit::theme::{resolved::Theme, role::Role};
 
@@ -127,21 +125,19 @@ pub(crate) fn paint(
     colors: &ChartColors,
     hovered: Option<HoveredSample>,
     pulse_phase: Option<f32>,
-) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
+) -> Canvas {
     let layout = prepared.layout;
     if prepared.domain.is_none()
         || layout.plot.size.width <= px(0.0)
         || layout.plot.size.height <= px(0.0)
     {
-        return (Canvas::new(layout.bounds), true, Vec::new());
+        return Canvas::new(layout.bounds);
     }
     let mut context = PaintContext {
         app,
         translate,
         text,
         colors,
-        used: Vec::new(),
-        whole: true,
     };
     let mut canvas = Canvas::new(layout.bounds);
     paint_grid(&mut canvas, prepared, colors);
@@ -151,8 +147,7 @@ pub(crate) fn paint(
         paint_hover(&mut canvas, prepared, hovered, &mut context);
     }
     paint_endpoints(&mut canvas, prepared, hovered, pulse_phase, &mut context);
-    let whole = context.whole;
-    (canvas, whole, context.used)
+    canvas
 }
 
 struct PaintContext<'a> {
@@ -160,8 +155,6 @@ struct PaintContext<'a> {
     translate: &'a Translate,
     text: &'a mut ChartTextCache,
     colors: &'a ChartColors,
-    used: Vec<Arc<ShapedTextHandle>>,
-    whole: bool,
 }
 
 impl PaintContext<'_> {
@@ -176,14 +169,12 @@ impl PaintContext<'_> {
         if text.is_empty() {
             return;
         }
-        let line = self.text.line(self.app, text, style);
-        if canvas.push_shaped_text(&line, LogicalPoint::new(x, y)) {
-            #[cfg(test)]
-            record_text(text, x, y, style.size, line.size().width);
-            self.used.push(line);
-        } else {
-            self.whole = false;
-        }
+        let (content, line_width) = self.text.line(self.app, text, style);
+        #[cfg(test)]
+        record_text(text, x, y, style.size, line_width);
+        #[cfg(not(test))]
+        let _ = line_width;
+        let _ = canvas.push_text(content, LogicalPoint::new(x, y));
     }
 
     fn width(&mut self, text: &str, style: &TextStyle) -> LogicalPx {

@@ -22,10 +22,7 @@ pub fn test_app() -> TestApp {
 #[must_use]
 pub fn test_app_with_scale(scale: f32) -> TestApp {
     let scale = DevicePixelRatio::new(scale).expect("测试 DPI 必须是有限正数");
-    TestApp::with_options(WindowOptions {
-        scale,
-        ..WindowOptions::default()
-    })
+    TestApp::with_scale(scale)
 }
 
 #[must_use]

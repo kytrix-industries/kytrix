@@ -104,7 +104,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let scale = app
                     .window(id)
-                    .map(|window| window.scale().factor())
+                    .map(|window| window.device_pixel_ratio().factor())
                     .unwrap_or(1.0);
                 let expected = (
                     (POSITION.x.value() * scale).round() as i32,
@@ -259,7 +259,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let expected = state.move_requested.map(|(x, y)| {
                     let scale = app
                         .window(id)
-                        .map(|window| window.scale().factor())
+                        .map(|window| window.device_pixel_ratio().factor())
                         .unwrap_or(1.0);
                     (x as f32 / scale, y as f32 / scale)
                 });

@@ -33,7 +33,6 @@ fn new_app(handle: &tokio::runtime::Handle) -> Fixture {
     let window = app.create_window(WindowOptions {
         title: SmolStr::new_static("bench"),
         size: VIEWPORT,
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     Fixture { app, window }

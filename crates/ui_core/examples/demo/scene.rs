@@ -231,7 +231,6 @@ impl Scene {
         let window = app.create_window(WindowOptions {
             title: TITLE.into(),
             size: window_size(),
-            scale: ui_core::math::DevicePixelRatio::ONE,
             background: color(BG_RGBA),
             ..WindowOptions::default()
         });

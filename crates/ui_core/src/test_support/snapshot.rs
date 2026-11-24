@@ -7,8 +7,8 @@ use std::{
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-    math::{DevicePixelRatio, DeviceSize, LogicalRect, LogicalSize, dp, px},
-    node::{builder::NodeBuilder, id::NodeId},
+    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+    node::{builder::NodeBuilder, id::NodeId, image::ImageFit},
     paint::{
         canvas::Canvas,
         color::Color,
@@ -461,9 +461,9 @@ pub fn capture(case: SnapshotCase) -> Result<SnapshotImage, GoldenError> {
     let mut app = TestApp::with_options(WindowOptions {
         title: SmolStr::new_static("kytrix golden"),
         size: case.size,
-        scale: case.scale,
         ..WindowOptions::default()
     });
+    app.set_dpr(case.scale);
     mount(&mut app, case.scene, case.theme);
     app.drain().map_err(|error| GoldenError::Frame {
         detail: SmolStr::new(error.to_string()),
@@ -876,7 +876,6 @@ fn build_image(app: &mut TestApp, root: NodeId, palette: &Palette) {
         .app_mut()
         .insert_bitmap_for_window(window, &snapshot_png())
         .expect("the synthetic 16x16 png must decode");
-    let dpr = app.app().window(window).expect("window").scale().factor();
     let slots = [
         LogicalRect::new(px(16.0), px(16.0), px(16.0), px(16.0)),
         LogicalRect::new(px(48.0), px(16.0), px(32.0), px(32.0)),
@@ -893,12 +892,9 @@ fn build_image(app: &mut TestApp, root: NodeId, palette: &Palette) {
         },
     ];
     for (index, (bounds, modulation)) in slots.into_iter().zip(modulations).enumerate() {
-        let target = DeviceSize::new(
-            dp((bounds.size.width.value() * dpr).ceil() as i32),
-            dp((bounds.size.height.value() * dpr).ceil() as i32),
-        );
-        let tile = icon
-            .variant_for(app.app().resources(), target)
+        let tile = app
+            .app_mut()
+            .prepare_image_variant(window, icon, bounds.size, ImageFit::Fill)
             .expect("the native bitmap variant is always available");
         let mut canvas = Canvas::new(bounds);
         canvas.push_image(Image {

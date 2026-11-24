@@ -7,7 +7,7 @@ pub(crate) fn scale(window: &Window) -> DevicePixelRatio {
 
 pub(crate) fn set_scale(window: &mut Window, scale: DevicePixelRatio) {
     window.scale = scale;
-    window.scale_epoch = window.scale_epoch.wrapping_add(1);
+    window.dpi_epoch = window.dpi_epoch.wrapping_add(1);
     window.full_damage_pending = true;
     window.tree.mark_all_text_dirty();
     window.a11y.note_bounds_changed();
@@ -16,6 +16,6 @@ pub(crate) fn set_scale(window: &mut Window, scale: DevicePixelRatio) {
     }
 }
 
-pub(crate) fn scale_epoch(window: &Window) -> u32 {
-    window.scale_epoch
+pub(crate) fn dpi_epoch(window: &Window) -> u32 {
+    window.dpi_epoch
 }

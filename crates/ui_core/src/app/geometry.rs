@@ -199,7 +199,12 @@ mod tests {
         let id = register(&mut app);
         let node = mount(&mut app, id);
         let window = app.window_id();
-        let scale = app.app().window(window).expect("窗口存在").scale().factor();
+        let scale = app
+            .app()
+            .window(window)
+            .expect("窗口存在")
+            .device_pixel_ratio()
+            .factor();
         assert_eq!(painted_transform(&app, window), Some(Transform::IDENTITY));
 
         let transform = Transform::translate(px(12.0), px(7.0));

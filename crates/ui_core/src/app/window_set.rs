@@ -291,8 +291,8 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     }
     app.close_handlers.remove(&id);
     app.a11y_delivered.remove(&id);
-    app.scale_epochs.remove(&id);
-    app.image_scale_epochs.remove(&id);
+    app.dpi_epochs.remove(&id);
+    app.image_dpi_epochs.remove(&id);
     app.scoped_bindings.retain(|scoped| scoped.window != id);
     if app.focused_window == Some(id) {
         app.focused_window = None;

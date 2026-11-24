@@ -287,10 +287,10 @@ fn quads(canvas: &Canvas) -> Vec<&ui_core::paint::primitive::Quad> {
         .collect()
 }
 
-fn glyph_run_count(canvas: &Canvas) -> usize {
+fn text_recipe_count(canvas: &Canvas) -> usize {
     primitives(canvas)
         .into_iter()
-        .filter(|primitive| matches!(primitive, Primitive::GlyphRun(_)))
+        .filter(|primitive| matches!(primitive, Primitive::Text(_)))
         .count()
 }
 
@@ -1145,9 +1145,10 @@ fn a_collected_reading_should_draw_the_gauge_frame() {
 
     assert_eq!(path_count(&canvas), 5, "one band per level of the scale");
     assert_eq!(quads(&canvas).len(), 12, "ten caps, the ring and the dot");
-    assert!(
-        glyph_run_count(&canvas) >= 2,
-        "the score and the level's name are shaped into the canvas"
+    assert_eq!(
+        text_recipe_count(&canvas),
+        2,
+        "the score and the level's name are recorded as canvas text"
     );
     assert_eq!(
         harness.app().geometry().len(),

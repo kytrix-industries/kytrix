@@ -27,7 +27,6 @@ fn capture(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut test = TestApp::with_options(WindowOptions {
         title: TITLE.into(),
         size,
-        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let window = test.window_id();

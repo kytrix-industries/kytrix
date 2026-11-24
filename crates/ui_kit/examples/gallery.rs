@@ -1764,11 +1764,7 @@ impl Gallery {
             let table = self.table.clone();
             let tree = self.tree.clone();
             let _ = app.after(window, Duration::from_millis(1_500), move |app| {
-                let scale = app
-                    .window(window)
-                    .map(|target| target.scale().factor())
-                    .unwrap_or(1.0);
-                println!("gallery: probe scale={scale} content_height={content_height}");
+                println!("gallery: probe content_height={content_height}");
                 print_probe_rects(app, window, &nodes, "");
                 print_probe_mounted(app, "top", &lists, &table, &tree);
                 if let Some(handle) = app.scroll_handle(window, viewport) {
@@ -1990,10 +1986,9 @@ impl Gallery {
         }
 
         if let Some(target) = app.window(self.window) {
-            let scale = target.scale().factor();
             let size = target.size();
             let text = format_smolstr!(
-                "DPI {scale:.2}× · 客户区 {:.0}×{:.0} · 窗口关闭按钮退出",
+                "客户区 {:.0}×{:.0} · 窗口关闭按钮退出",
                 size.width,
                 size.height
             );
@@ -2262,12 +2257,8 @@ impl Gallery {
                     format_smolstr!("window: resize {:.0}×{:.0}", size.width, size.height),
                 );
             }
-            Event::DpiChanged { dpi, scale } => {
-                log_line(
-                    app,
-                    &self.log,
-                    format_smolstr!("window: DPI {dpi} (scale {:.2})", scale.factor()),
-                );
+            Event::DpiChanged { dpi } => {
+                log_line(app, &self.log, format_smolstr!("window: DPI {dpi}"));
             }
             Event::AppearanceChanged { dark } => {
                 let next = if *dark {

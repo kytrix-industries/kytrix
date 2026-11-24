@@ -53,7 +53,7 @@ pub(crate) fn paint_frame(
             rebuilt: 0,
             damage: crate::render::damage::DamageSummary::default(),
             stale_text: smallvec::SmallVec::new(),
-            stale_canvas_runs: 0,
+            unresolved_canvas_text: 0,
             skipped_inline_images: smallvec::SmallVec::new(),
             #[cfg(feature = "test-support")]
             instances: 0,
@@ -93,7 +93,7 @@ pub(crate) fn paint_frame(
                 rebuilt: 0,
                 damage,
                 stale_text: smallvec::SmallVec::new(),
-                stale_canvas_runs: 0,
+                unresolved_canvas_text: 0,
                 skipped_inline_images: smallvec::SmallVec::new(),
                 #[cfg(feature = "test-support")]
                 instances: 0,
@@ -149,6 +149,7 @@ pub(crate) fn paint_frame(
             }
             window.tree.recycle(dirty);
             let focused = window.focus.focused();
+            let canvas_text = &window.canvas_text;
             let mut pass = PaintPass {
                 tree: &mut window.tree,
                 geometry,
@@ -160,6 +161,7 @@ pub(crate) fn paint_frame(
                 focused,
                 atlas,
                 resources,
+                canvas_text,
                 scroll_slots: &mut window.scroll_slots,
                 scroll_slot_nodes: &mut window.scroll_slot_nodes,
                 #[cfg(feature = "test-support")]
@@ -173,7 +175,7 @@ pub(crate) fn paint_frame(
         }
     };
     let mut report = report;
-    let surface = window.physical_surface();
+    let surface = window.surface;
     let mut delta = SceneDelta::empty(FrameHeader {
         window: window.id(),
         index: crate::window::FrameIndex::default(),
@@ -347,7 +349,7 @@ pub(crate) fn request_repaint(window: &mut Window) {
 mod tests {
     use crate::{
         app::App,
-        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+        math::{LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::{color::Color, style::PaintSpec},
         window::{FrameOutcome, WindowId, WindowOptions},
@@ -364,7 +366,6 @@ mod tests {
         app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("paint-prune"),
             size: LogicalSize::new(px(1280.0), px(800.0)),
-            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         })
     }

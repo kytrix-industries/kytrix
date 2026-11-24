@@ -9,7 +9,6 @@ use ui_core::{
     math::{LogicalPoint, LogicalPx, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch, style_builder::StyleBuilder},
-    text::ShapedTextHandle,
 };
 use widget::cx::WidgetCx;
 
@@ -192,7 +191,6 @@ struct PreparedKey {
     bounds: LogicalRect,
     time_zone: UtcOffset,
     language: LanguageCode,
-    text_scale: f32,
 }
 
 impl PreparedKey {
@@ -201,7 +199,6 @@ impl PreparedKey {
             && self.bounds == other.bounds
             && self.time_zone == other.time_zone
             && self.language == other.language
-            && self.text_scale == other.text_scale
     }
 }
 
@@ -211,7 +208,6 @@ struct PaintedKey {
     bounds: LogicalRect,
     time_zone: UtcOffset,
     language: LanguageCode,
-    text_scale: f32,
     colors: ChartColors,
     hovered: Option<HoveredSample>,
     pulse: Option<f32>,
@@ -224,7 +220,6 @@ impl PartialEq for PaintedKey {
             && self.bounds == other.bounds
             && self.time_zone == other.time_zone
             && self.language == other.language
-            && self.text_scale == other.text_scale
             && self.colors == other.colors
             && self.hovered == other.hovered
             && self.pulse == other.pulse
@@ -236,7 +231,6 @@ pub(crate) struct ChartCanvas {
     node: Option<NodeId>,
     prepared: Option<(PreparedKey, PreparedChart)>,
     painted: Option<PaintedKey>,
-    painted_text: Vec<Arc<ShapedTextHandle>>,
     text: ChartTextCache,
     meshes: [SeriesMeshes; MAX_LINES],
     #[cfg(test)]
@@ -251,7 +245,6 @@ impl ChartCanvas {
             node: None,
             prepared: None,
             painted: None,
-            painted_text: Vec::new(),
             text: ChartTextCache::default(),
             meshes: [SeriesMeshes::default(); MAX_LINES],
             #[cfg(test)]
@@ -309,7 +302,6 @@ impl ChartCanvas {
     pub(crate) fn clear(&mut self) {
         self.prepared = None;
         self.painted = None;
-        self.painted_text.clear();
     }
 
     pub(crate) fn sync(
@@ -332,13 +324,11 @@ impl ChartCanvas {
 
         let time_zone = cx.data_time_zone();
         let language = *cx.read(&cx.language());
-        let text_scale = cx.app().text_scale();
         let key = PreparedKey {
             snapshot: Arc::clone(snapshot),
             bounds,
             time_zone,
             language,
-            text_scale,
         };
         if !self
             .prepared
@@ -366,20 +356,17 @@ impl ChartCanvas {
             bounds,
             time_zone,
             language,
-            text_scale,
             colors,
             hovered,
             pulse: pulse_phase,
             meshes: self.meshes,
         };
-        if self.painted.as_ref() == Some(&painted)
-            && !self.painted_text.iter().any(|handle| handle.is_stale())
-        {
+        if self.painted.as_ref() == Some(&painted) {
             return Ok(false);
         }
 
         let translate = cx.translate().clone();
-        let (canvas, whole, used) = paint(
+        let canvas = paint(
             cx.app_mut(),
             &mut self.text,
             &translate,
@@ -389,29 +376,12 @@ impl ChartCanvas {
             hovered,
             pulse_phase,
         );
-        let (canvas, whole, used) = if whole {
-            (canvas, whole, used)
-        } else {
-            paint(
-                cx.app_mut(),
-                &mut self.text,
-                &translate,
-                prepared,
-                &self.meshes,
-                &colors,
-                hovered,
-                pulse_phase,
-            )
-        };
         let changed = cx.set_canvas(node, canvas)?;
         #[cfg(test)]
         {
             self.hovered = hovered;
         }
-        if whole {
-            self.painted = Some(painted);
-            self.painted_text = used;
-        }
+        self.painted = Some(painted);
         Ok(changed)
     }
 

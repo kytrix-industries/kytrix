@@ -437,6 +437,7 @@ impl ShapedText {
             ellipsis,
             line_offset,
         )?;
+        shaped.font_stack_version = self.font_stack_version;
         Ok((shaped, diagnostics, ctx.glyph_atlas.take_stats()))
     }
 

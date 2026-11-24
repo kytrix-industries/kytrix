@@ -607,11 +607,8 @@ fn a_dpi_change_applies_immediately_and_stamps_later_events() {
             .any(|event| matches!(event.event, PlatformEvent::Dpi { dpi: 192 })),
         "必须派发 Dpi{{192}}，实际 {events:?}"
     );
-    assert_eq!(
-        raw.scale().factor(),
-        2.0,
-        "WndProcState 必须立刻换到新 scale"
-    );
+    let dpr = raw.scale();
+    assert_eq!(dpr.factor(), 2.0, "WndProcState 必须立刻换到新 scale");
 
     let mut placed = RECT::default();
     unsafe {
@@ -1206,7 +1203,7 @@ fn a_size_move_resize_drives_a_real_frame() {
     assert_eq!(
         window.size(),
         window
-            .scale()
+            .device_pixel_ratio()
             .to_logical_size(DeviceSize::new(dp(800), dp(600))),
         "WM_SIZE 必须把客户区写进窗口（逻辑尺寸 = 物理客户区 / scale）"
     );

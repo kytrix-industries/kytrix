@@ -1523,18 +1523,14 @@ impl LaneEncoder<'_> {
         *self.state = ClipState::unbounded();
         self.saved.clear();
         for primitive in primitives {
-            self.encode_primitive(primitive, 0)?;
+            self.encode_primitive(primitive)?;
         }
         debug_assert_eq!(self.state.depth(), 0, "lane must be clip-balanced (C1)");
         self.flush_run();
         Ok(())
     }
 
-    fn encode_primitive(
-        &mut self,
-        primitive: &Primitive,
-        canvas_depth: u8,
-    ) -> Result<(), EngineError> {
+    fn encode_primitive(&mut self, primitive: &Primitive) -> Result<(), EngineError> {
         match primitive {
             Primitive::Clip(ClipOp::Push(rect)) => self.push_clip(*rect)?,
             Primitive::Clip(ClipOp::Pop) => self.pop_clip(),
@@ -1561,6 +1557,7 @@ impl LaneEncoder<'_> {
                     }
                 }
             }
+            Primitive::Text(_) => {}
             Primitive::Path(path) => {
                 self.flush_run();
                 let color = self.colors.resolve(&self.resolver, path.fill).to_array();
@@ -1578,10 +1575,9 @@ impl LaneEncoder<'_> {
                 self.push_geometry_op(draw.id, draw.transform, color, draw.range.clone(), None);
             }
             Primitive::Canvas(canvas) => {
-                debug_assert_eq!(canvas_depth, 0, "Canvas nesting depth must be <= 1");
                 let entry_depth = self.state.depth();
                 for inner in canvas.primitives() {
-                    self.encode_primitive(inner, canvas_depth + 1)?;
+                    self.encode_primitive(inner)?;
                 }
                 debug_assert_eq!(
                     self.state.depth(),

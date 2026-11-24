@@ -2,6 +2,7 @@ mod a11y;
 mod animation;
 #[cfg(feature = "automation")]
 mod automation;
+mod canvas_text;
 #[cfg(feature = "hud")]
 mod debug;
 mod event_queue;
@@ -21,10 +22,7 @@ mod virtual_list;
 mod window_set;
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -44,7 +42,7 @@ use crate::{
         ScrollConfig, ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
     },
     layout::hit_test::HitResult,
-    math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize},
     node::{
         builder::NodeBuilder,
         dependency::{DependencyGraph, EvalStack, ReadCtx},
@@ -58,9 +56,8 @@ use crate::{
         DecodeState, ImageDiagnostic, PendingResource, ResourceCache, ResourceId, ResourceImage,
     },
     text::{
-        FontStack, FontStackStatus, InlineBoxSpec, ShapedInlineBox, ShapedTextHandle,
-        TextDiagnostic, TextLayoutReport, TextPassReport, TextStyle, atlas::GlyphAtlas,
-        context::TextContext, raster::GlyphRasterizer,
+        FontStack, FontStackStatus, TextContent, TextDiagnostic, TextLayoutReport, TextPassReport,
+        atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
     },
     window::{FrameOutcome, FramePresentation, FrameTicket, Window, WindowId, WindowOptions},
 };
@@ -105,13 +102,10 @@ pub struct App {
     glyph_atlas: GlyphAtlas,
     text_dirty_scratch: Vec<crate::node::id::NodeId>,
     text_layout_scratch: Vec<crate::node::id::NodeId>,
-    scale_epochs: ahash::HashMap<WindowId, u32>,
-    image_scale_epochs: ahash::HashMap<WindowId, u32>,
+    dpi_epochs: ahash::HashMap<WindowId, u32>,
+    image_dpi_epochs: ahash::HashMap<WindowId, u32>,
     image_diagnostics: Vec<ImageDiagnostic>,
     atlas_generation_seen: u32,
-    atlas_generation_lease: Arc<AtomicU64>,
-    default_text_scale: f32,
-    text_scale_override: Option<f32>,
     focused_window: Option<WindowId>,
     pending_dirty: crate::render::DirtyRects,
     glyph_page_extent: Option<u32>,
@@ -345,10 +339,7 @@ impl App {
             crate::paint::atlas::AtlasKind::Glyph,
             (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
         );
-        let atlas_generation_lease = Arc::new(AtomicU64::new(crate::text::pack_atlas_lease(
-            atlas.generation(),
-            0,
-        )));
+
         Self {
             store: StateStore::with_capacity(64, 16),
             graph: DependencyGraph::new(),
@@ -366,13 +357,10 @@ impl App {
             glyph_atlas: GlyphAtlas::new(),
             text_dirty_scratch: Vec::new(),
             text_layout_scratch: Vec::new(),
-            scale_epochs: ahash::HashMap::default(),
-            image_scale_epochs: ahash::HashMap::default(),
+            dpi_epochs: ahash::HashMap::default(),
+            image_dpi_epochs: ahash::HashMap::default(),
             image_diagnostics: Vec::new(),
             atlas_generation_seen: 0,
-            atlas_generation_lease,
-            default_text_scale: 1.0,
-            text_scale_override: None,
             focused_window: None,
             pending_dirty: crate::render::DirtyRects::default(),
             glyph_page_extent: None,
@@ -1666,143 +1654,36 @@ impl App {
         &mut self,
         window: WindowId,
     ) -> Option<Result<TextLayoutReport, EngineError>> {
-        let result = text_pass::layout_text(self, window);
-        self.sync_atlas_generation_lease();
-        result
+        text_pass::layout_text(self, window)
     }
 
-    pub fn shape_text(
+    #[must_use]
+    pub fn measure_text(
         &mut self,
-        text: &str,
-        style: &TextStyle,
+        content: &TextContent,
         max_width: Option<LogicalPx>,
-        inline_boxes: &[InlineBoxSpec],
-    ) -> Result<ShapedTextHandle, EngineError> {
-        let App {
-            text: text_context,
-            raster,
-            atlas,
-            glyph_atlas,
-            pending_dirty,
-            atlas_generation_lease,
-            default_text_scale,
-            windows,
-            ..
-        } = self;
-        let scale = *default_text_scale;
-        let result = crate::text::standalone::shape(
-            text_context,
-            raster,
-            atlas,
-            glyph_atlas,
-            pending_dirty,
-            atlas_generation_lease,
-            text,
-            style,
-            max_width,
-            inline_boxes,
-            scale,
-        );
-        let evicted = glyph_atlas.take_evicted();
-        if evicted > 0 {
-            for window in windows.values_mut() {
-                window.tree_mut().invalidate_text_lines();
-                window.tree_mut().mark_canvas_nodes_paint();
-            }
-        }
-        self.sync_atlas_generation_lease();
-        result
+    ) -> LogicalSize {
+        canvas_text::measure_text(self, content, max_width)
     }
 
-    #[cfg(test)]
+    pub(crate) fn resolve_canvas_text(
+        &mut self,
+        window: WindowId,
+    ) -> Option<Result<canvas_text::CanvasTextReport, EngineError>> {
+        canvas_text::resolve_canvas_text(self, window)
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn shape_count_for_test(&self) -> u32 {
         self.text.shape_count()
-    }
-
-    #[must_use]
-    pub fn shaped_inline_boxes<'a>(&self, handle: &'a ShapedTextHandle) -> &'a [ShapedInlineBox] {
-        handle.inline_boxes()
-    }
-
-    fn sync_atlas_generation_lease(&self) {
-        self.atlas_generation_lease.store(
-            crate::text::pack_atlas_lease(
-                self.atlas.generation(),
-                self.glyph_atlas.eviction_epoch(),
-            ),
-            Ordering::Relaxed,
-        );
-    }
-
-    #[must_use]
-    pub fn text_scale(&self) -> f32 {
-        self.default_text_scale
-    }
-
-    pub fn set_text_scale(&mut self, scale: f32) -> Result<(), EngineError> {
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(EngineError::InvalidTextScale { scale });
-        }
-        self.text_scale_override = Some(scale);
-        self.default_text_scale = scale;
-        Ok(())
-    }
-
-    pub fn clear_text_scale_override(&mut self) {
-        self.text_scale_override = None;
-        self.follow_focused_window_scale();
     }
 
     pub(crate) fn note_window_focus(&mut self, window: WindowId, focused: bool) {
         if focused {
             self.focused_window = Some(window);
-            self.follow_focused_window_scale();
         } else if self.focused_window == Some(window) {
             self.focused_window = None;
         }
-    }
-
-    pub(crate) fn note_window_dpi(&mut self, window: WindowId, scale: DevicePixelRatio) {
-        if self.focused_window == Some(window) {
-            self.apply_text_scale(scale.factor());
-        }
-    }
-
-    fn apply_text_scale(&mut self, scale: f32) {
-        if self.text_scale_override.is_some() {
-            return;
-        }
-        self.default_text_scale = scale;
-    }
-
-    fn follow_focused_window_scale(&mut self) {
-        let Some(window) = self.focused_window else {
-            return;
-        };
-        let scale = self
-            .windows
-            .get(&window)
-            .map(|target| target.scale().factor());
-        if let Some(scale) = scale {
-            self.apply_text_scale(scale);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cap_glyph_atlas_page_for_test(&mut self, page: u32) {
-        self.atlas.cap_page_for_test(page);
-        self.glyph_atlas.clear();
-        self.sync_atlas_generation_lease();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn glyph_atlas_generation_for_test(&self) -> u32 {
-        self.atlas.generation()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn glyph_atlas_eviction_epoch_for_test(&self) -> u32 {
-        self.glyph_atlas.eviction_epoch()
     }
 
     #[must_use]
@@ -1825,15 +1706,11 @@ impl App {
     }
 
     pub fn set_font_stack(&mut self, stack: FontStack) -> u32 {
-        let version = text_pass::set_font_stack(self, stack);
-        self.sync_atlas_generation_lease();
-        version
+        text_pass::set_font_stack(self, stack)
     }
 
     pub fn reload_system_fonts(&mut self) -> u32 {
-        let version = text_pass::reload_system_fonts(self);
-        self.sync_atlas_generation_lease();
-        version
+        text_pass::reload_system_fonts(self)
     }
 
     pub fn set_digit_fast_path(&mut self, enabled: bool) {
@@ -1847,7 +1724,6 @@ impl App {
 
     fn repaint_text_if_atlas_changed(&mut self) {
         text_pass::repaint_text_if_atlas_changed(self);
-        self.sync_atlas_generation_lease();
     }
 
     fn invalidate_all_text(&mut self) {

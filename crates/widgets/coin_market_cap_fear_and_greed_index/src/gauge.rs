@@ -12,7 +12,7 @@ use ui_core::{
         primitive::{ClipRect, Path, Quad, QuadPaint},
         style::StylePatch,
     },
-    text::{ShapedTextHandle, TextStyle},
+    text::{TextContent, TextStyle},
 };
 use ui_kit::theme::{resolved::Theme, role::Role};
 use widget::cx::WidgetCx;
@@ -257,7 +257,6 @@ struct GaugeKey {
     score: u8,
     level: SmolStr,
     colors: GaugeColors,
-    text_scale: f32,
 }
 
 impl GaugeKey {
@@ -267,21 +266,17 @@ impl GaugeKey {
         score: u8,
         level: &SmolStr,
         colors: &GaugeColors,
-        text_scale: f32,
     ) -> bool {
         self.bounds == bounds
             && self.score == score
             && self.level == *level
             && self.colors == *colors
-            && self.text_scale == text_scale
     }
 }
 
 struct PreparedGauge {
     key: GaugeKey,
     bands: Vec<GeometryId>,
-    score_line: ShapedTextHandle,
-    level_line: ShapedTextHandle,
 }
 
 pub(crate) struct Gauge {
@@ -339,14 +334,10 @@ impl Gauge {
         }
 
         let colors = self.colors(cx);
-        let text_scale = cx.app().text_scale();
-        let current = self.prepared.as_ref().is_some_and(|prepared| {
-            prepared
-                .key
-                .matches(bounds, score, level, &colors, text_scale)
-                && !prepared.score_line.is_stale()
-                && !prepared.level_line.is_stale()
-        });
+        let current = self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.key.matches(bounds, score, level, &colors));
         if current {
             return Ok(());
         }
@@ -387,26 +378,15 @@ impl Gauge {
             score_size * LINE_HEIGHT_RATIO,
             level_size * LINE_HEIGHT_RATIO,
         );
-        let score_line = match cx.app_mut().shape_text(
-            format_smolstr!("{score}").as_str(),
-            &text_style(score_size, colors.text),
-            None,
-            &[],
-        ) {
-            Ok(line) => line,
-            Err(error) => return Err(abandon_frame(cx.app_mut(), bands, error)),
-        };
-        let level_line = match cx.app_mut().shape_text(
-            level.as_str(),
-            &text_style(level_size, colors.text),
-            None,
-            &[],
-        ) {
-            Ok(line) => line,
-            Err(error) => return Err(abandon_frame(cx.app_mut(), bands, error)),
-        };
-        let _ = canvas.push_shaped_text(&score_line, text_origin(score_box, score_line.size()));
-        let _ = canvas.push_shaped_text(&level_line, text_origin(level_box, level_line.size()));
+        let score_content = TextContent::new(
+            format_smolstr!("{score}"),
+            text_style(score_size, colors.text),
+        );
+        let level_content = TextContent::new(level.clone(), text_style(level_size, colors.text));
+        let score_measured = cx.app_mut().measure_text(&score_content, None);
+        let level_measured = cx.app_mut().measure_text(&level_content, None);
+        let _ = canvas.push_text(score_content, text_origin(score_box, score_measured));
+        let _ = canvas.push_text(level_content, text_origin(level_box, level_measured));
         let _ = canvas.pop_clip();
 
         if let Err(error) = cx.set_canvas(node, canvas) {
@@ -419,11 +399,8 @@ impl Gauge {
                 score,
                 level: level.clone(),
                 colors,
-                text_scale,
             },
             bands,
-            score_line,
-            level_line,
         });
 
         Ok(())
