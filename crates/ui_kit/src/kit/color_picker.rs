@@ -11,7 +11,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, ActionSource, Event},
     interaction::{ActionCtx, DragPhase},
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -70,10 +70,10 @@ const PALETTE_LIGHTNESS: [f32; PALETTE_COLS] = [
 
 const TRIGGER_RADIUS: f32 = 4.0;
 const TRIGGER_PADDING: f32 = 2.0;
-const TRIGGER_WELL_RADIUS: f32 = 4.0;
+const TRIGGER_WELL_RADIUS: LogicalPx = LogicalPx::new(4.0);
 const FOOTER_WELL_SIZE: f32 = 30.0;
-const FOOTER_WELL_RADIUS: f32 = 6.0;
-const PANEL_PADDING: f32 = 8.0;
+const FOOTER_WELL_RADIUS: LogicalPx = LogicalPx::new(6.0);
+const PANEL_PADDING: LogicalPx = LogicalPx::new(8.0);
 const CONTROL_RADIUS: f32 = 4.0;
 const RING_WIDTH: f32 = 2.0;
 const RING_INSET: f32 = 1.0;
@@ -243,20 +243,20 @@ static PALETTE: LazyLock<[Hsla; PALETTE_ROWS * PALETTE_COLS]> = LazyLock::new(||
     })
 });
 
-fn palette_cell_bounds(bounds: Rect, row: usize, col: usize) -> Rect {
+fn palette_cell_bounds(bounds: LogicalRect, row: usize, col: usize) -> LogicalRect {
     let scale_x = bounds.size.width / PALETTE_SIZE;
     let scale_y = bounds.size.height / PALETTE_SIZE;
-    Rect::new(
-        bounds.origin.x + PALETTE_STEP * col as f32 * scale_x,
-        bounds.origin.y + PALETTE_STEP * row as f32 * scale_y,
-        PALETTE_CELL * scale_x,
-        PALETTE_CELL * scale_y,
+    LogicalRect::new(
+        bounds.origin.x + scale_x * (PALETTE_STEP * col as f32),
+        bounds.origin.y + scale_y * (PALETTE_STEP * row as f32),
+        scale_x * PALETTE_CELL,
+        scale_y * PALETTE_CELL,
     )
 }
 
-fn palette_index_at(size: Size, position: Point) -> Option<usize> {
-    let (width, height) = (size.width, size.height);
-    let (x, y) = (position.x, position.y);
+fn palette_index_at(size: LogicalSize, position: LogicalPoint) -> Option<usize> {
+    let (width, height) = (size.width.value(), size.height.value());
+    let (x, y) = (position.x.value(), position.y.value());
 
     if !(0.0..width).contains(&x) || !(0.0..height).contains(&y) {
         return None;
@@ -285,15 +285,21 @@ fn palette_index_at(size: Size, position: Point) -> Option<usize> {
     Some(row * PALETTE_COLS + col)
 }
 
-fn well_canvas(bounds: Rect, color: Color, base: Color, checker: Color, radius: f32) -> Canvas {
+fn well_canvas(
+    bounds: LogicalRect,
+    color: Color,
+    base: Color,
+    checker: Color,
+    radius: LogicalPx,
+) -> Canvas {
     let mut canvas = Canvas::new(bounds);
     canvas.push_quad(solid_quad(bounds, radius, base));
 
     if rgba8(color)[3] < 255 {
         let right = bounds.origin.x + bounds.size.width;
         let bottom = bounds.origin.y + bounds.size.height;
-        let cols = (bounds.size.width / CHECKER_CELL).ceil() as usize;
-        let rows = (bounds.size.height / CHECKER_CELL).ceil() as usize;
+        let cols = (bounds.size.width.value() / CHECKER_CELL).ceil() as usize;
+        let rows = (bounds.size.height.value() / CHECKER_CELL).ceil() as usize;
         for row in 0..rows {
             for col in 0..cols {
                 if (row + col) % 2 == 0 {
@@ -301,10 +307,14 @@ fn well_canvas(bounds: Rect, color: Color, base: Color, checker: Color, radius: 
                 }
                 let x = bounds.origin.x + col as f32 * CHECKER_CELL;
                 let y = bounds.origin.y + row as f32 * CHECKER_CELL;
-                let width = CHECKER_CELL.min(right - x);
-                let height = CHECKER_CELL.min(bottom - y);
+                let width = CHECKER_CELL.min(f32::from(right - x));
+                let height = CHECKER_CELL.min(f32::from(bottom - y));
                 if width > 0.0 && height > 0.0 {
-                    canvas.push_quad(solid_quad(Rect::new(x, y, width, height), 0.0, checker));
+                    canvas.push_quad(solid_quad(
+                        LogicalRect::new(x, y, px(width), px(height)),
+                        px(0.0),
+                        checker,
+                    ));
                 }
             }
         }
@@ -315,13 +325,13 @@ fn well_canvas(bounds: Rect, color: Color, base: Color, checker: Color, radius: 
     canvas
 }
 
-fn palette_canvas(bounds: Rect, hovered: Option<usize>) -> Canvas {
+fn palette_canvas(bounds: LogicalRect, hovered: Option<usize>) -> Canvas {
     let mut canvas = Canvas::new(bounds);
     let scale = (bounds.size.width / PALETTE_SIZE).min(bounds.size.height / PALETTE_SIZE);
-    let cell_radius = 4.0 * scale;
-    let ring_inset = RING_INSET * scale;
-    let ring_width = RING_WIDTH * scale;
-    let ring_radius = 3.0 * scale;
+    let cell_radius = scale * 4.0;
+    let ring_inset = scale * RING_INSET;
+    let ring_width = scale * RING_WIDTH;
+    let ring_radius = scale * 3.0;
 
     for (index, swatch) in PALETTE.iter().enumerate() {
         let color = hsla_to_color(*swatch);
@@ -329,7 +339,7 @@ fn palette_canvas(bounds: Rect, hovered: Option<usize>) -> Canvas {
         canvas.push_quad(solid_quad(cell, cell_radius, color));
 
         if hovered == Some(index) {
-            let inner = Rect::new(
+            let inner = LogicalRect::new(
                 cell.origin.x + ring_inset,
                 cell.origin.y + ring_inset,
                 cell.size.width - ring_inset * 2.0,
@@ -353,7 +363,7 @@ fn palette_canvas(bounds: Rect, hovered: Option<usize>) -> Canvas {
 }
 
 fn track_canvas(
-    bounds: Rect,
+    bounds: LogicalRect,
     channel: HslaChannel,
     base: Hsla,
     value: f32,
@@ -366,7 +376,7 @@ fn track_canvas(
     let width = bounds.size.width;
     let height = bounds.size.height;
 
-    if width <= 0.0 || height <= 0.0 {
+    if width.value() <= 0.0 || height.value() <= 0.0 {
         return canvas;
     }
 
@@ -383,7 +393,7 @@ fn track_canvas(
         let x0 = left + width * t0;
         let x1 = left + width * t1;
         let center = (x0 + x1) / 2.0;
-        let distance = (center - left).min((left + width) - center);
+        let distance = (center - left).min((left + width) - center).value();
         let inset = if distance < TRACK_RADIUS {
             TRACK_RADIUS
                 - (TRACK_RADIUS * TRACK_RADIUS
@@ -394,13 +404,13 @@ fn track_canvas(
         };
         let slice_height = height - inset * 2.0;
 
-        if slice_height <= 0.0 {
+        if slice_height.value() <= 0.0 {
             continue;
         }
 
         canvas.push_quad(Quad {
-            bounds: Rect::new(x0, top + inset, x1 - x0, slice_height),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(x0, top + inset, x1 - x0, slice_height),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: color,
                 border: None,
@@ -408,20 +418,27 @@ fn track_canvas(
         });
     }
 
-    if width < THUMB_DIAMETER {
+    if width.value() < THUMB_DIAMETER {
         return canvas;
     }
 
     let half = THUMB_DIAMETER / 2.0;
-    let x = (left + width * value).clamp(left + half, left + width - half);
+    let x = (left + width * value)
+        .value()
+        .clamp((left + half).value(), (left + width - half).value());
     let y = top + height / 2.0;
     canvas.push_quad(Quad {
-        bounds: Rect::new(x - half, y - half, THUMB_DIAMETER, THUMB_DIAMETER),
-        corner_radius: [half; 4],
+        bounds: LogicalRect::new(
+            px(x - half),
+            y - half,
+            px(THUMB_DIAMETER),
+            px(THUMB_DIAMETER),
+        ),
+        corner_radius: [px(half); 4],
         paint: QuadPaint::Solid {
             fill: thumb_fill,
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: thumb_border,
             }),
         },
@@ -430,10 +447,10 @@ fn track_canvas(
     canvas
 }
 
-fn solid_quad(bounds: Rect, radius: f32, color: Color) -> Quad {
+fn solid_quad(bounds: LogicalRect, radius: LogicalPx, color: Color) -> Quad {
     Quad {
         bounds,
-        corner_radius: [radius.max(0.0); 4],
+        corner_radius: [radius.max(px(0.0)); 4],
         paint: QuadPaint::Solid {
             fill: color,
             border: None,
@@ -496,7 +513,7 @@ struct Panel {
     confirm: NodeId,
     well: NodeId,
     input: InputNode,
-    well_last: Option<(Rect, Color)>,
+    well_last: Option<(LogicalRect, Color)>,
 }
 
 enum BodyView {
@@ -508,7 +525,7 @@ struct PaletteView {
     root: NodeId,
     canvas: NodeId,
     cells: Vec<NodeId>,
-    last: Option<(Rect, Option<usize>)>,
+    last: Option<(LogicalRect, Option<usize>)>,
 }
 
 struct SliderView {
@@ -522,7 +539,7 @@ struct SliderView {
 struct TrackView {
     track: NodeId,
     canvas: NodeId,
-    last: Option<(Rect, Hsla, f32)>,
+    last: Option<(LogicalRect, Hsla, f32)>,
 }
 
 struct Actions {
@@ -629,7 +646,7 @@ struct Inner {
     last_hex_text: RefCell<SmolStr>,
     last_hex_focus: Cell<bool>,
     last_trigger_color: Cell<Option<Color>>,
-    last_trigger_bounds: Cell<Option<Rect>>,
+    last_trigger_bounds: Cell<Option<LogicalRect>>,
     last_color: Cell<Color>,
     appearance: Rc<Cell<Appearance>>,
     last_appearance: Cell<Appearance>,
@@ -678,8 +695,8 @@ impl ColorPicker {
             format_smolstr!("{key}:overlay"),
             OverlayOptions {
                 placement: Placement::new(Side::Bottom, Alignment::Start),
-                gap: 4.0,
-                margin: 4.0,
+                gap: px(4.0),
+                margin: px(4.0),
                 flip: true,
                 dismiss: DismissPolicy::OutsideClick,
                 modal: false,
@@ -859,12 +876,12 @@ impl ColorPicker {
             .items_center()
             .justify_center()
             .size(side, side)
-            .padding(TRIGGER_PADDING)
+            .padding(px(TRIGGER_PADDING))
             .border(inner.theme.tokens().border_width)
             .relative()
             .build();
         let mut paint = PaintBuilder::new().build();
-        paint.corner_radius = [TRIGGER_RADIUS; 4];
+        paint.corner_radius = [px(TRIGGER_RADIUS); 4];
 
         let theme = inner.theme.clone();
         let open = inner.overlay.open_state();
@@ -922,7 +939,7 @@ impl ColorPicker {
                 parent,
             )?;
         let well_side = side - TRIGGER_PADDING * 2.0 - inner.theme.tokens().border_width * 2.0;
-        let well = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let well = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(format_smolstr!("{}:trigger.well", inner.key))
             .style(StyleBuilder::new().size(well_side, well_side).build())
             .tab_stop(false)
@@ -1137,9 +1154,9 @@ impl ColorPicker {
                 .window(panel.window)
                 .and_then(|target| target.tree().get(track).ok())
                 .map(|node| node.layout().bounds.size.width)
-                .unwrap_or(0.0)
+                .unwrap_or(px(0.0))
         };
-        if width <= 0.0 {
+        if width.value() <= 0.0 {
             return;
         }
         self.set_channel(ctx.app_mut(), channel, hit.local_point.x / width);
@@ -1164,16 +1181,16 @@ impl ColorPicker {
                 .window(panel.window)
                 .and_then(|target| target.tree().get(track).ok())
                 .map(|node| node.layout().bounds.size.width)
-                .unwrap_or(0.0);
+                .unwrap_or(px(0.0));
             (track, width)
         };
 
         match phase {
             DragPhase::Start => {
                 let _ = ctx.app_mut().capture_pointer(window, track);
-                self.drag_to(ctx, channel, track, width);
+                self.drag_to(ctx, channel, track, f32::from(width));
             }
-            DragPhase::Move => self.drag_to(ctx, channel, track, width),
+            DragPhase::Move => self.drag_to(ctx, channel, track, f32::from(width)),
             DragPhase::End | DragPhase::Cancel => {
                 let _ = ctx.app_mut().release_pointer(window);
             }
@@ -1200,7 +1217,7 @@ impl ColorPicker {
             return;
         };
         let t = (info.current.x - origin) / width;
-        self.set_channel(app, channel, t);
+        self.set_channel(app, channel, f32::from(t));
     }
 
     fn set_preview_swatch(&self, app: &mut App, index: Option<usize>, input: Option<&InputNode>) {
@@ -1363,8 +1380,8 @@ impl ColorPicker {
             .style(
                 StyleBuilder::new()
                     .flex_col()
-                    .gap(8.0)
-                    .width(PANEL_CONTENT_WIDTH)
+                    .gap(px(8.0))
+                    .width(px(PANEL_CONTENT_WIDTH))
                     .build(),
             )
             .build(tree, panel_node)?;
@@ -1391,9 +1408,9 @@ impl ColorPicker {
             let labels_for_text = labels_signal;
             let mut paint = PaintBuilder::new().build();
             paint.corner_radius = if index == 0 {
-                [CONTROL_RADIUS, 0.0, 0.0, CONTROL_RADIUS]
+                [px(CONTROL_RADIUS), px(0.0), px(0.0), px(CONTROL_RADIUS)]
             } else {
-                [0.0, CONTROL_RADIUS, CONTROL_RADIUS, 0.0]
+                [px(0.0), px(CONTROL_RADIUS), px(CONTROL_RADIUS), px(0.0)]
             };
             let tab = NodeBuilder::boxed()
                 .id(format_smolstr!("{}:panel.tab.{}", inner.key, index))
@@ -1458,13 +1475,19 @@ impl ColorPicker {
 
         let body = NodeBuilder::boxed()
             .id(format_smolstr!("{}:panel.body", inner.key))
-            .style(StyleBuilder::new().flex_col().width_full().gap(8.0).build())
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .width_full()
+                    .gap(px(8.0))
+                    .build(),
+            )
             .build(tree, content)?;
 
         let owner = theme_handle.clone();
         let _separator = NodeBuilder::boxed()
             .id(format_smolstr!("{}:panel.separator", inner.key))
-            .style(StyleBuilder::new().width_full().height(1.0).build())
+            .style(StyleBuilder::new().width_full().height(px(1.0)).build())
             .bind_style(move |cx| StylePatch {
                 background: Some(owner.role(cx, Role::LineDivider)),
                 interactive: Some(false),
@@ -1483,17 +1506,17 @@ impl ColorPicker {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(8.0)
+                    .gap(px(8.0))
                     .width_full()
                     .build(),
             )
             .build(tree, content)?;
 
-        let well = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let well = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(format_smolstr!("{}:panel.well", inner.key))
             .style(
                 StyleBuilder::new()
-                    .size(FOOTER_WELL_SIZE, FOOTER_WELL_SIZE)
+                    .size(px(FOOTER_WELL_SIZE), px(FOOTER_WELL_SIZE))
                     .build(),
             )
             .tab_stop(false)
@@ -1553,7 +1576,7 @@ impl ColorPicker {
             )
             .paint({
                 let mut paint = PaintBuilder::new().build();
-                paint.corner_radius = [CONTROL_RADIUS; 4];
+                paint.corner_radius = [px(CONTROL_RADIUS); 4];
                 paint
             })
             .tab_stop(true)
@@ -1659,7 +1682,7 @@ impl ColorPicker {
             .style(
                 StyleBuilder::new()
                     .relative()
-                    .size(PALETTE_SIZE, PALETTE_SIZE)
+                    .size(px(PALETTE_SIZE), px(PALETTE_SIZE))
                     .build(),
             )
             .tab_stop(false)
@@ -1678,7 +1701,7 @@ impl ColorPicker {
             })
             .on_click(inner.actions.palette.clone())
             .build(tree, body)?;
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(format_smolstr!("{}:palette.canvas", inner.key))
             .style(StyleBuilder::new().absolute().size_full().build())
             .tab_stop(false)
@@ -1700,9 +1723,9 @@ impl ColorPicker {
                 .style(
                     StyleBuilder::new()
                         .absolute()
-                        .left(PALETTE_STEP * col as f32)
-                        .top(PALETTE_STEP * row as f32)
-                        .size(PALETTE_CELL, PALETTE_CELL)
+                        .left(px(PALETTE_STEP * col as f32))
+                        .top(px(PALETTE_STEP * row as f32))
+                        .size(px(PALETTE_CELL), px(PALETTE_CELL))
                         .build(),
                 )
                 .tab_stop(false)
@@ -1745,7 +1768,13 @@ impl ColorPicker {
             .tree_mut();
         let root = NodeBuilder::boxed()
             .id(format_smolstr!("{}:sliders", inner.key))
-            .style(StyleBuilder::new().flex_col().gap(8.0).width_full().build())
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .width_full()
+                    .build(),
+            )
             .build(tree, body)?;
         let mut tracks: Vec<TrackView> = Vec::with_capacity(4);
         for channel in HslaChannel::ALL {
@@ -1764,19 +1793,19 @@ impl ColorPicker {
                     StyleBuilder::new()
                         .flex_row()
                         .items_center()
-                        .gap(SLIDER_ROW_INNER_GAP)
-                        .height(SLIDER_ROW_HEIGHT)
+                        .gap(px(SLIDER_ROW_INNER_GAP))
+                        .height(px(SLIDER_ROW_HEIGHT))
                         .width_full()
                         .build(),
                 )
                 .build(tree, root)?;
-            NodeBuilder::text(channel.label(&labels), TextStyle::new(12.0))
+            NodeBuilder::text(channel.label(&labels), TextStyle::new(px(12.0)))
                 .id(format_smolstr!(
                     "{}:slider.{}.label",
                     inner.key,
                     channel.id()
                 ))
-                .style(StyleBuilder::new().width(SLIDER_LABEL_WIDTH).build())
+                .style(StyleBuilder::new().width(px(SLIDER_LABEL_WIDTH)).build())
                 .bind_text(move |cx| channel.label(&cx.read(&labels_for_row)))
                 .bind_style(move |cx| StylePatch {
                     foreground: Some(owner.role(cx, Role::FgMuted)),
@@ -1793,7 +1822,7 @@ impl ColorPicker {
                     StyleBuilder::new()
                         .relative()
                         .flex_1()
-                        .height(TRACK_HEIGHT)
+                        .height(px(TRACK_HEIGHT))
                         .build(),
                 )
                 .tab_stop(false)
@@ -1824,7 +1853,7 @@ impl ColorPicker {
                 .on_click(inner.actions.track[index].clone())
                 .on_drag(inner.actions.drag[index].clone())
                 .build(tree, row)?;
-            let canvas = NodeBuilder::canvas(Canvas::new(Rect::default()))
+            let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
                 .id(format_smolstr!(
                     "{}:slider.{}.canvas",
                     inner.key,
@@ -1843,14 +1872,14 @@ impl ColorPicker {
                 .build(tree, track)?;
             NodeBuilder::text(
                 channel.value_text(display),
-                TextStyle::new(12.0).with_alignment(TextAlign::End),
+                TextStyle::new(px(12.0)).with_alignment(TextAlign::End),
             )
             .id(format_smolstr!(
                 "{}:slider.{}.value",
                 inner.key,
                 channel.id()
             ))
-            .style(StyleBuilder::new().width(SLIDER_VALUE_WIDTH).build())
+            .style(StyleBuilder::new().width(px(SLIDER_VALUE_WIDTH)).build())
             .a11y(A11yOverride {
                 hidden: true,
                 ..A11yOverride::default()
@@ -2164,7 +2193,7 @@ fn recipe_for(
     }
 }
 
-fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
+fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<LogicalRect> {
     app.window(window)
         .and_then(|target| target.tree().get(node).ok())
         .map(|node| node.layout().bounds)
@@ -2216,7 +2245,7 @@ fn node_in_subtree(app: &App, window: WindowId, root: NodeId, candidate: Option<
 #[cfg(test)]
 mod tests {
     use ui_core::{
-        math::{Point, Rect, Size},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         paint::{
             canvas::Canvas,
             color::ColorResolver,
@@ -2308,29 +2337,29 @@ mod tests {
         assert_eq!(palette_hue(0), None);
     }
 
-    fn cell_center(row: usize, col: usize) -> Point {
-        Point::new(
-            PALETTE_STEP * col as f32 + 10.0,
-            PALETTE_STEP * row as f32 + 10.0,
+    fn cell_center(row: usize, col: usize) -> LogicalPoint {
+        LogicalPoint::new(
+            px(PALETTE_STEP * col as f32 + 10.0),
+            px(PALETTE_STEP * row as f32 + 10.0),
         )
     }
 
     #[test]
     fn palette_index_at_should_map_a_cell_center_to_its_index() {
-        let grid = Size::new(PALETTE_SIZE, PALETTE_SIZE);
+        let grid = LogicalSize::new(px(PALETTE_SIZE), px(PALETTE_SIZE));
         assert_eq!(palette_index_at(grid, cell_center(2, 4)), Some(28));
         assert_eq!(palette_index_at(grid, cell_center(0, 0)), Some(0));
     }
 
     #[test]
     fn palette_index_at_should_hit_the_last_cell_and_reject_its_trailing_edge() {
-        let grid = Size::new(PALETTE_SIZE, PALETTE_SIZE);
+        let grid = LogicalSize::new(px(PALETTE_SIZE), px(PALETTE_SIZE));
         assert_eq!(
             palette_index_at(grid, cell_center(PALETTE_ROWS - 1, PALETTE_COLS - 1)),
             Some(143)
         );
         assert_eq!(
-            palette_index_at(grid, Point::new(PALETTE_SIZE, PALETTE_SIZE)),
+            palette_index_at(grid, LogicalPoint::new(px(PALETTE_SIZE), px(PALETTE_SIZE))),
             None,
             "右下角在网格的半开边界之外"
         );
@@ -2338,19 +2367,25 @@ mod tests {
 
     #[test]
     fn palette_index_at_should_reject_the_gap_between_cells() {
-        let grid = Size::new(PALETTE_SIZE, PALETTE_SIZE);
-        assert_eq!(palette_index_at(grid, Point::new(22.0, 10.0)), None);
-        assert_eq!(palette_index_at(grid, Point::new(10.0, 22.0)), None);
+        let grid = LogicalSize::new(px(PALETTE_SIZE), px(PALETTE_SIZE));
+        assert_eq!(
+            palette_index_at(grid, LogicalPoint::new(px(22.0), px(10.0))),
+            None
+        );
+        assert_eq!(
+            palette_index_at(grid, LogicalPoint::new(px(10.0), px(22.0))),
+            None
+        );
     }
 
     #[test]
     fn palette_index_at_should_reject_positions_outside_the_grid() {
-        let grid = Size::new(PALETTE_SIZE, PALETTE_SIZE);
+        let grid = LogicalSize::new(px(PALETTE_SIZE), px(PALETTE_SIZE));
         for position in [
-            Point::new(PALETTE_SIZE, 10.0),
-            Point::new(10.0, PALETTE_SIZE),
-            Point::new(-1.0, 10.0),
-            Point::new(10.0, -1.0),
+            LogicalPoint::new(px(PALETTE_SIZE), px(10.0)),
+            LogicalPoint::new(px(10.0), px(PALETTE_SIZE)),
+            LogicalPoint::new(px(-1.0), px(10.0)),
+            LogicalPoint::new(px(10.0), px(-1.0)),
         ] {
             assert_eq!(palette_index_at(grid, position), None, "{position:?}");
         }
@@ -2363,8 +2398,8 @@ mod tests {
         let half_cell = 10.0 / 2.0;
         assert_eq!(
             palette_index_at(
-                Size::new(scaled, scaled),
-                Point::new(4.0 * pitch + half_cell, 2.0 * pitch + half_cell),
+                LogicalSize::new(px(scaled), px(scaled)),
+                LogicalPoint::new(px(4.0 * pitch + half_cell), px(2.0 * pitch + half_cell)),
             ),
             Some(28),
             "缩放后的同一色块映射回同一下标"
@@ -2373,25 +2408,43 @@ mod tests {
 
     #[test]
     fn palette_index_at_should_pin_the_24_pixel_pitch_to_the_right_edge() {
-        let grid = Size::new(PALETTE_SIZE, PALETTE_SIZE);
+        let grid = LogicalSize::new(px(PALETTE_SIZE), px(PALETTE_SIZE));
         let y = PALETTE_STEP * (PALETTE_ROWS - 1) as f32 + 10.0;
         assert_eq!(y, 274.0);
-        assert_eq!(palette_index_at(grid, Point::new(263.999, y)), None);
-        assert_eq!(palette_index_at(grid, Point::new(264.0, y)), Some(143));
-        assert_eq!(palette_index_at(grid, Point::new(283.999, y)), Some(143));
-        assert_eq!(palette_index_at(grid, Point::new(284.0, y)), None);
-        assert_eq!(palette_index_at(grid, Point::new(239.999, y)), None);
-        assert_eq!(palette_index_at(grid, Point::new(240.0, y)), Some(142));
+        assert_eq!(
+            palette_index_at(grid, LogicalPoint::new(px(263.999), px(y))),
+            None
+        );
+        assert_eq!(
+            palette_index_at(grid, LogicalPoint::new(px(264.0), px(y))),
+            Some(143)
+        );
+        assert_eq!(
+            palette_index_at(grid, LogicalPoint::new(px(283.999), px(y))),
+            Some(143)
+        );
+        assert_eq!(
+            palette_index_at(grid, LogicalPoint::new(px(284.0), px(y))),
+            None
+        );
+        assert_eq!(
+            palette_index_at(grid, LogicalPoint::new(px(239.999), px(y))),
+            None
+        );
+        assert_eq!(
+            palette_index_at(grid, LogicalPoint::new(px(240.0), px(y))),
+            Some(142)
+        );
     }
 
     #[test]
     fn drawn_cells_should_map_back_to_their_own_index_at_any_scale() {
         for edge in [PALETTE_SIZE, PALETTE_SIZE / 2.0] {
-            let bounds = Rect::new(100.0, 50.0, edge, edge);
-            let size = Size::new(edge, edge);
+            let bounds = LogicalRect::new(px(100.0), px(50.0), px(edge), px(edge));
+            let size = LogicalSize::new(px(edge), px(edge));
             for (index, _) in PALETTE.iter().enumerate() {
                 let cell = palette_cell_bounds(bounds, index / PALETTE_COLS, index % PALETTE_COLS);
-                let local = Point::new(
+                let local = LogicalPoint::new(
                     cell.origin.x + cell.size.width / 2.0 - bounds.origin.x,
                     cell.origin.y + cell.size.height / 2.0 - bounds.origin.y,
                 );
@@ -2724,13 +2777,19 @@ mod tests {
 
     #[test]
     fn a_translucent_well_draws_a_checkerboard_and_an_opaque_one_does_not() {
-        let bounds = Rect::new(10.0, 20.0, 24.0, 24.0);
+        let bounds = LogicalRect::new(px(10.0), px(20.0), px(24.0), px(24.0));
         let base = Color::srgb(0.1, 0.1, 0.1, 1.0);
         let checker = Color::srgb(0.8, 0.8, 0.8, 1.0);
-        let opaque = well_canvas(bounds, Color::WHITE, base, checker, 4.0);
+        let opaque = well_canvas(bounds, Color::WHITE, base, checker, px(4.0));
         assert_eq!(canvas_quads(&opaque).len(), 2, "底色 + 颜色");
 
-        let translucent = well_canvas(bounds, Color::srgb(1.0, 0.0, 0.0, 0.5), base, checker, 4.0);
+        let translucent = well_canvas(
+            bounds,
+            Color::srgb(1.0, 0.0, 0.0, 0.5),
+            base,
+            checker,
+            px(4.0),
+        );
         assert!(
             canvas_quads(&translucent).len() > 2,
             "半透明颜色必须露出棋盘格"
@@ -2740,7 +2799,7 @@ mod tests {
 
     #[test]
     fn a_palette_canvas_draws_every_cell_and_the_hover_ring() {
-        let bounds = Rect::new(0.0, 0.0, PALETTE_SIZE, PALETTE_SIZE);
+        let bounds = LogicalRect::new(px(0.0), px(0.0), px(PALETTE_SIZE), px(PALETTE_SIZE));
         let canvas = palette_canvas(bounds, None);
         assert_eq!(canvas_quads(&canvas).len(), PALETTE.len());
         let hovered = palette_canvas(bounds, Some(28));
@@ -2757,12 +2816,12 @@ mod tests {
                 )
             })
             .expect("悬停环图元使用带边框的绘制模式");
-        assert_eq!(ring.corner_radius, [3.0; 4]);
+        assert_eq!(ring.corner_radius, [px(3.0); 4]);
     }
 
     #[test]
     fn a_track_narrower_than_its_thumb_should_paint_without_panicking() {
-        let bounds = Rect::new(0.0, 0.0, 10.0, 14.0);
+        let bounds = LogicalRect::new(px(0.0), px(0.0), px(10.0), px(14.0));
         let canvas = track_canvas(
             bounds,
             HslaChannel::Hue,
@@ -2775,13 +2834,13 @@ mod tests {
         assert_eq!(quads.len(), TRACK_SLICES, "窄轨道只画切片，没有拇指");
         for quad in quads {
             assert!(quad.bounds.origin.x >= bounds.origin.x - EPS);
-            assert!(quad.bounds.origin.x + quad.bounds.size.width <= 10.0 + EPS);
+            assert!((quad.bounds.origin.x + quad.bounds.size.width).value() <= 10.0 + EPS);
         }
     }
 
     #[test]
     fn a_full_track_draws_the_thumb_at_the_value() {
-        let bounds = Rect::new(100.0, 5.0, 156.0, 14.0);
+        let bounds = LogicalRect::new(px(100.0), px(5.0), px(156.0), px(14.0));
         let canvas = track_canvas(
             bounds,
             HslaChannel::Saturation,
@@ -2793,9 +2852,9 @@ mod tests {
         let quads = canvas_quads(&canvas);
         assert_eq!(quads.len(), TRACK_SLICES + 1);
         let thumb = quads.last().expect("拇指");
-        assert!((thumb.bounds.size.width - THUMB_DIAMETER).abs() < EPS);
+        assert!((thumb.bounds.size.width.value() - THUMB_DIAMETER).abs() < EPS);
         let center = thumb.bounds.origin.x + thumb.bounds.size.width / 2.0;
-        assert!((center - (100.0 + 156.0 * 0.25)).abs() < EPS);
+        assert!((center.value() - (100.0 + 156.0 * 0.25)).abs() < EPS);
     }
 
     #[test]
@@ -2825,7 +2884,7 @@ mod ui_tests {
     use ui_core::{
         a11y::A11yRole,
         event::{Event, InputEvent, KeyCode, KeyState, Modifiers, PointerButton},
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::{
             id::NodeId,
             tree::{NodeKind, NodeTree},
@@ -2923,18 +2982,18 @@ mod ui_tests {
             false
         }
 
-        fn bounds(&self, node: ui_core::node::id::NodeId) -> Rect {
+        fn bounds(&self, node: ui_core::node::id::NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("节点已布局")
         }
 
-        fn center(rect: Rect) -> Point {
-            Point::new(
+        fn center(rect: LogicalRect) -> LogicalPoint {
+            LogicalPoint::new(
                 rect.origin.x + rect.size.width / 2.0,
                 rect.origin.y + rect.size.height / 2.0,
             )
         }
 
-        fn click_at(&mut self, point: Point) {
+        fn click_at(&mut self, point: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 point,
                 PointerButton::Primary,
@@ -2965,7 +3024,7 @@ mod ui_tests {
             self.picker.inner.panel.borrow().is_some()
         }
 
-        fn palette(&self) -> Option<(Rect, Vec<ui_core::node::id::NodeId>)> {
+        fn palette(&self) -> Option<(LogicalRect, Vec<ui_core::node::id::NodeId>)> {
             let panel = self.picker.inner.panel.borrow();
             let panel = panel.as_ref()?;
             let BodyView::Palette(view) = &panel.body_view else {
@@ -3066,21 +3125,21 @@ mod ui_tests {
 
         fn click_cell(&mut self, row: usize, col: usize) {
             let (grid, _) = self.palette().expect("色板已显示");
-            let point = Point::new(
+            let point = LogicalPoint::new(
                 grid.origin.x + super::PALETTE_STEP * col as f32 + 10.0,
                 grid.origin.y + super::PALETTE_STEP * row as f32 + 10.0,
             );
             self.click_at(point);
         }
 
-        fn hover_at(&mut self, point: Point) {
+        fn hover_at(&mut self, point: LogicalPoint) {
             let _ = self
                 .app
                 .inject(InputEvent::pointer_move(point, Modifiers::empty()));
             self.pump_times(2);
         }
 
-        fn drag_track(&mut self, channel: usize, start_fraction: f32, target: Point) {
+        fn drag_track(&mut self, channel: usize, start_fraction: f32, target: LogicalPoint) {
             let start = self.track_point(channel, start_fraction);
             let launch_fraction = if target.x >= start.x {
                 (start_fraction + 0.1).min(1.0)
@@ -3127,10 +3186,10 @@ mod ui_tests {
             }
         }
 
-        fn track_point(&self, channel: usize, fraction: f32) -> Point {
+        fn track_point(&self, channel: usize, fraction: f32) -> LogicalPoint {
             let track = self.tracks().expect("HSLA 页")[channel];
             let bounds = self.bounds(track);
-            Point::new(
+            LogicalPoint::new(
                 bounds.origin.x + bounds.size.width * fraction,
                 bounds.origin.y + bounds.size.height / 2.0,
             )
@@ -3190,7 +3249,7 @@ mod ui_tests {
                 .well
         }
 
-        fn panel_painter(&self, node: NodeId) -> Vec<Rect> {
+        fn panel_painter(&self, node: NodeId) -> Vec<LogicalRect> {
             let tree = self.app.app().window(self.window).expect("窗口").tree();
             match tree.get(node).expect("节点").kind() {
                 NodeKind::Canvas(canvas) => canvas
@@ -3227,17 +3286,18 @@ mod ui_tests {
         let harness = Harness::new();
         let surface = &harness.picker.overlay().options().surface;
         assert_eq!(surface.background, Role::SurfaceOverlay);
-        assert_eq!(surface.corner_radius, 4.0, "旧 rounded_sm");
+        assert_eq!(surface.corner_radius, px(4.0), "旧 rounded_sm");
         assert_eq!(surface.padding, super::PANEL_PADDING, "旧 p_2");
         let layers: Vec<_> = surface.shadows.iter().collect();
         assert_eq!(layers.len(), 2, "旧面板是双层菜单阴影");
-        assert_eq!(layers[0].offset, Point::new(0.0, 1.0));
-        assert_eq!(layers[0].blur, 2.0);
-        assert_eq!(layers[0].spread, 0.0);
-        assert_eq!(layers[1].offset, Point::new(0.0, 3.0));
-        assert_eq!(layers[1].blur, 6.0);
+        assert_eq!(layers[0].offset, LogicalPoint::new(px(0.0), px(1.0)));
+        assert_eq!(layers[0].blur, px(2.0));
+        assert_eq!(layers[0].spread, px(0.0));
+        assert_eq!(layers[1].offset, LogicalPoint::new(px(0.0), px(3.0)));
+        assert_eq!(layers[1].blur, px(6.0));
         assert_eq!(
-            layers[1].spread, -2.0,
+            layers[1].spread,
+            px(-2.0),
             "第二层负 spread 是旧菜单的紧凑接触阴影"
         );
         assert_eq!(layers[0].color, layers[1].color, "两层同色（菜单阴影色）");
@@ -3253,7 +3313,7 @@ mod ui_tests {
             let mut harness = Harness::with_size(size);
             let bounds = harness.bounds(harness.trigger());
             assert_eq!(bounds.size.width, bounds.size.height, "{size:?}");
-            assert_eq!(bounds.size.width, edge, "{size:?} 触发器边长");
+            assert_eq!(bounds.size.width, px(edge), "{size:?} 触发器边长");
             harness.open();
             assert!(harness.panel_open(), "{size:?} 方形触发器仍能打开面板");
         }
@@ -3324,7 +3384,7 @@ mod ui_tests {
         let mut harness = Harness::new();
         harness.open();
         assert!(harness.panel_open());
-        harness.click_at(Point::new(760.0, 560.0));
+        harness.click_at(LogicalPoint::new(px(760.0), px(560.0)));
         assert!(!harness.panel_open(), "面板外部按下关闭面板");
     }
 
@@ -3346,8 +3406,8 @@ mod ui_tests {
         harness.open();
         assert!(harness.palette().is_some());
         let (grid, _) = harness.palette().expect("色板");
-        assert_eq!(grid.size.width, super::PALETTE_SIZE);
-        assert_eq!(grid.size.height, super::PALETTE_SIZE);
+        assert_eq!(grid.size.width, px(super::PALETTE_SIZE));
+        assert_eq!(grid.size.height, px(super::PALETTE_SIZE));
 
         harness.switch_to_hsla();
         assert_eq!(
@@ -3359,9 +3419,9 @@ mod ui_tests {
         let _ = tabs;
         let tracks = harness.tracks().expect("HSLA 页画出四条轨道");
         let height = harness.bounds(tracks[0]).size.height;
-        assert_eq!(height, super::TRACK_HEIGHT);
+        assert_eq!(height, px(super::TRACK_HEIGHT));
         let width = harness.bounds(tracks[0]).size.width;
-        assert_eq!(width, 156.0, "72 + 8 + 156 + 8 + 40 = 284");
+        assert_eq!(width, px(156.0), "72 + 8 + 156 + 8 + 40 = 284");
 
         let tabs = harness.tabs();
         harness.click_node(tabs[0]);
@@ -3416,7 +3476,7 @@ mod ui_tests {
         let mut harness = Harness::new();
         harness.open();
         let (grid, _) = harness.palette().expect("色板");
-        let cell = Point::new(
+        let cell = LogicalPoint::new(
             grid.origin.x + super::PALETTE_STEP * 4.0 + 10.0,
             grid.origin.y + super::PALETTE_STEP * 2.0 + 10.0,
         );
@@ -3441,7 +3501,7 @@ mod ui_tests {
         assert!(harness.changes.borrow().is_empty());
         assert!(harness.panel_open());
 
-        let gap = Point::new(cell.x + 12.0, cell.y);
+        let gap = LogicalPoint::new(cell.x + 12.0, cell.y);
         harness.hover_at(gap);
         assert_eq!(
             harness.picker.hovered_swatch(harness.app.app()),
@@ -3450,12 +3510,12 @@ mod ui_tests {
         );
         assert_eq!(harness.picker.draft(harness.app.app()), None);
 
-        let next = Point::new(cell.x + super::PALETTE_STEP, cell.y);
+        let next = LogicalPoint::new(cell.x + super::PALETTE_STEP, cell.y);
         harness.hover_at(next);
         assert_eq!(harness.picker.hovered_swatch(harness.app.app()), Some(29));
         assert_eq!(harness.picker.draft(harness.app.app()), None);
 
-        harness.hover_at(Point::new(760.0, 560.0));
+        harness.hover_at(LogicalPoint::new(px(760.0), px(560.0)));
         assert_eq!(
             harness.picker.hovered_swatch(harness.app.app()),
             None,
@@ -3475,7 +3535,7 @@ mod ui_tests {
         let mut harness = Harness::new();
         harness.open();
         let (grid, _) = harness.palette().expect("色板");
-        let cell = Point::new(
+        let cell = LogicalPoint::new(
             grid.origin.x + super::PALETTE_STEP * 4.0 + 10.0,
             grid.origin.y + super::PALETTE_STEP * 2.0 + 10.0,
         );
@@ -3507,7 +3567,7 @@ mod ui_tests {
         let mut harness = Harness::new();
         harness.open();
         let (grid, _) = harness.palette().expect("色板");
-        let cell = Point::new(
+        let cell = LogicalPoint::new(
             grid.origin.x + super::PALETTE_STEP * 4.0 + 10.0,
             grid.origin.y + super::PALETTE_STEP * 2.0 + 10.0,
         );
@@ -3530,7 +3590,7 @@ mod ui_tests {
         harness.open();
         harness.click_cell(2, 4);
         assert!(harness.picker.draft(harness.app.app()).is_some());
-        harness.click_at(Point::new(760.0, 560.0));
+        harness.click_at(LogicalPoint::new(px(760.0), px(560.0)));
         harness.settle();
         assert!(!harness.panel_open(), "外部按压关闭面板");
         assert_eq!(
@@ -3961,7 +4021,7 @@ mod ui_tests {
         let launch = harness.track_point(1, 0.3);
         let track = harness.tracks().expect("HSLA 页")[1];
         let bounds = harness.bounds(track);
-        let outside = Point::new(bounds.origin.x + bounds.size.width + 50.0, launch.y);
+        let outside = LogicalPoint::new(bounds.origin.x + bounds.size.width + 50.0, launch.y);
         let _ = harness.app.inject(InputEvent::pointer_down(
             start,
             PointerButton::Primary,
@@ -4246,7 +4306,7 @@ mod ui_tests {
         assert_eq!(record.label_text(), Some(expected_label.as_str()));
 
         let bounds = app.probe().bounds(trigger).expect("触发器盒");
-        let point = Point::new(
+        let point = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -4270,7 +4330,7 @@ mod ui_tests {
             panel.as_ref().expect("面板").tabs
         };
         let tab_bounds = app.probe().bounds(tabs[1]).expect("HSLA 页签");
-        let tab_point = Point::new(
+        let tab_point = LogicalPoint::new(
             tab_bounds.origin.x + tab_bounds.size.width / 2.0,
             tab_bounds.origin.y + tab_bounds.size.height / 2.0,
         );
@@ -4378,9 +4438,9 @@ mod ui_tests {
         let mut harness = Harness::new();
         harness.open();
         let (grid, _) = harness.palette().expect("色板");
-        let local = Point::new(
-            super::PALETTE_STEP * 5.0 + 10.0,
-            super::PALETTE_STEP * 3.0 + 10.0,
+        let local = LogicalPoint::new(
+            px(super::PALETTE_STEP * 5.0 + 10.0),
+            px(super::PALETTE_STEP * 3.0 + 10.0),
         );
         assert_eq!(
             palette_index_at(grid.size, local),

@@ -1,4 +1,7 @@
-use ui_core::{math::Size, paint::color::Color};
+use ui_core::{
+    math::{LogicalSize, px},
+    paint::color::Color,
+};
 use ui_kit::theme::{
     appearance::Appearance, components::ComponentTokens, resolved::Theme, role::Role,
 };
@@ -38,9 +41,9 @@ fn a_tooltip_should_be_sized_from_its_own_padding_and_lines() {
     let style = tooltip_style(&ComponentTokens::standard());
 
     assert_eq!(
-        style.content_size(100.0, 3),
-        Size::new(
-            100.0 + style.padding * 2.0,
+        style.content_size(px(100.0), 3),
+        LogicalSize::new(
+            px(100.0) + style.padding * 2.0,
             style.line_height * 3.0 + style.padding * 2.0
         ),
         "every edge keeps the text away from it, top and bottom included"
@@ -61,7 +64,7 @@ fn a_chart_tooltip_should_be_the_size_the_frameworks_tooltip_draws_one_in() {
         tokens.small.font_size * 1.4,
         "and its line is the token's own line box"
     );
-    assert!(style.radius > 0.0 && style.padding > 0.0);
+    assert!(style.radius > px(0.0) && style.padding > px(0.0));
     let theme = theme();
     let tooltip = theme.components().tooltip;
     assert_ne!(

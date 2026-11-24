@@ -5,7 +5,7 @@ use market_participants_model::decimal::Quantity;
 use smol_str::SmolStr;
 use time::UtcOffset;
 use ui_core::{
-    math::Point,
+    math::{LogicalPoint, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{primitive::Primitive, style_builder::StyleBuilder},
     window::WindowId,
@@ -111,8 +111,8 @@ impl ChartHarness {
         let page = self.page;
         self.app.with_cx(|cx| {
             let style = StyleBuilder::new()
-                .width(width)
-                .height(height)
+                .width(px(width))
+                .height(px(height))
                 .flex_col()
                 .build();
             cx.tree_mut()
@@ -135,8 +135,8 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
             .id("TEST_PERPETUAL_STATISTICS_PAGE")
             .style(
                 StyleBuilder::new()
-                    .width(width)
-                    .height(height)
+                    .width(px(width))
+                    .height(px(height))
                     .flex_col()
                     .build(),
             )
@@ -145,9 +145,9 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
     })
 }
 
-fn middle_of_plot(harness: &ChartHarness) -> Point {
+fn middle_of_plot(harness: &ChartHarness) -> LogicalPoint {
     let plot = harness.layout().plot;
-    Point::new(
+    LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )
@@ -188,8 +188,8 @@ fn a_chart_should_fill_the_box_it_is_given() {
     assert!(harness.sync(), "the first frame paints");
 
     let layout = harness.layout();
-    assert_eq!(layout.content.size.width, WIDTH);
-    assert_eq!(layout.content.size.height, HEIGHT);
+    assert_eq!(layout.content.size.width, px(WIDTH));
+    assert_eq!(layout.content.size.height, px(HEIGHT));
     assert_eq!(harness.canvas().bounds(), layout.content);
     let kinds = kinds(harness.canvas());
     assert!(kinds.contains(&"geometry"), "the two lines are meshes");
@@ -224,7 +224,7 @@ fn a_resized_chart_should_redraw_itself_in_the_new_box() {
     harness.resize(WIDTH, 320.0);
     assert!(harness.sync(), "the new box is another drawing");
     let after = harness.layout();
-    assert_eq!(after.content.size.height, 320.0);
+    assert_eq!(after.content.size.height, px(320.0));
     assert!(after.plot.size.height < before.plot.size.height);
     assert_eq!(harness.canvas().bounds(), after.content);
     assert!(!harness.sync(), "and it settles again");
@@ -281,9 +281,9 @@ fn a_pointer_off_the_plot_should_not_hover_anything() {
     assert!(harness.sync());
     let layout = harness.layout();
 
-    assert!(!harness.chart.point_at(Point::new(1.0, 1.0)));
+    assert!(!harness.chart.point_at(LogicalPoint::new(px(1.0), px(1.0))));
     assert_eq!(harness.chart.hover_for_test(), None);
-    let below = Point::new(layout.plot.origin.x + 10.0, layout.time_axis.origin.y + 2.0);
+    let below = LogicalPoint::new(layout.plot.origin.x + 10.0, layout.time_axis.origin.y + 2.0);
     assert!(!harness.chart.point_at(below));
     assert_eq!(harness.chart.hover_for_test(), None);
 }
@@ -551,8 +551,8 @@ fn a_shrinking_window_should_drop_a_hover_it_no_longer_holds() {
     let mut harness = ChartHarness::new(4);
     assert!(harness.sync());
     let layout = harness.layout();
-    let near_end = Point::new(
-        layout.plot.right() - 14.0,
+    let near_end = LogicalPoint::new(
+        layout.plot.right() - px(14.0),
         layout.plot.origin.y + layout.plot.size.height / 2.0,
     );
     assert!(harness.chart.point_at(near_end));
@@ -579,7 +579,7 @@ fn the_chart_should_point_at_the_series_it_was_built_for() {
 
     assert!(!layout.plot.is_empty());
     assert!(
-        layout.left_axis.size.width > 0.0,
+        layout.left_axis.size.width > px(0.0),
         "open interest has a left axis"
     );
     assert_eq!(

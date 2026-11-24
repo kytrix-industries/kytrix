@@ -4,7 +4,7 @@ use i18n::translate::Translate;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
-    math::{Point, Rect, Size, Transform},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform, px},
     paint::{
         canvas::Canvas,
         color::Color,
@@ -28,50 +28,55 @@ use super::{
     },
 };
 
-pub(crate) const SERIES_STROKE_WIDTH: f32 = 1.75;
-pub(crate) const SERIES_HALO_WIDTH: f32 = 2.0;
+pub(crate) const SERIES_STROKE_WIDTH: LogicalPx = LogicalPx::new(1.75);
+pub(crate) const SERIES_HALO_WIDTH: LogicalPx = LogicalPx::new(2.0);
 const SERIES_FADE_ALPHA: f32 = 0.25;
 
-const GRID_DOT: f32 = 1.0;
-const GRID_PERIOD: f32 = 4.0;
+const GRID_DOT: LogicalPx = LogicalPx::new(1.0);
+const GRID_PERIOD: LogicalPx = LogicalPx::new(4.0);
 
-const CROSSHAIR_WIDTH: f32 = 1.5;
-const CROSSHAIR_OVERHANG_TOP: f32 = 17.0;
+const CROSSHAIR_WIDTH: LogicalPx = LogicalPx::new(1.5);
+const CROSSHAIR_OVERHANG_TOP: LogicalPx = LogicalPx::new(17.0);
 
-const Y_LABEL_GAP: f32 = 11.0;
-const X_LABEL_GAP: f32 = 7.0;
-const AXIS_LINE_HEIGHT: f32 = 14.0;
+const Y_LABEL_GAP: LogicalPx = LogicalPx::new(11.0);
+const X_LABEL_GAP: LogicalPx = LogicalPx::new(7.0);
+const AXIS_LINE_HEIGHT: LogicalPx = LogicalPx::new(14.0);
 
-const LABEL_PADDING_LEFT: f32 = 4.0;
-const LABEL_BAR_WIDTH: f32 = 4.0;
-const LABEL_BAR_HEIGHT: f32 = 12.0;
-const LABEL_BAR_GAP: f32 = 4.0;
-const LABEL_PADDING_RIGHT: f32 = 6.0;
-const LABEL_BAR_RADIUS: f32 = 2.0;
-const LABEL_TEXT_INSET: f32 = LABEL_PADDING_LEFT + LABEL_BAR_WIDTH + LABEL_BAR_GAP;
-const LABEL_BOX_CHROME: f32 =
-    LABEL_PADDING_LEFT + LABEL_BAR_WIDTH + LABEL_BAR_GAP + LABEL_PADDING_RIGHT;
-const LABEL_BOX_RADIUS: f32 = 4.0;
-const LABEL_BOX_BORDER: f32 = 1.0;
-const LABEL_LINE_HEIGHT: f32 = LABEL_HEIGHT;
+const LABEL_PADDING_LEFT: LogicalPx = LogicalPx::new(4.0);
+const LABEL_BAR_WIDTH: LogicalPx = LogicalPx::new(4.0);
+const LABEL_BAR_HEIGHT: LogicalPx = LogicalPx::new(12.0);
+const LABEL_BAR_GAP: LogicalPx = LogicalPx::new(4.0);
+const LABEL_PADDING_RIGHT: LogicalPx = LogicalPx::new(6.0);
+const LABEL_BAR_RADIUS: LogicalPx = LogicalPx::new(2.0);
+const LABEL_TEXT_INSET: LogicalPx =
+    LogicalPx::new(LABEL_PADDING_LEFT.value() + LABEL_BAR_WIDTH.value() + LABEL_BAR_GAP.value());
+const LABEL_BOX_CHROME: LogicalPx = LogicalPx::new(
+    LABEL_PADDING_LEFT.value()
+        + LABEL_BAR_WIDTH.value()
+        + LABEL_BAR_GAP.value()
+        + LABEL_PADDING_RIGHT.value(),
+);
+const LABEL_BOX_RADIUS: LogicalPx = LogicalPx::new(4.0);
+const LABEL_BOX_BORDER: LogicalPx = LogicalPx::new(1.0);
+const LABEL_LINE_HEIGHT: LogicalPx = LABEL_HEIGHT;
 
-const HOVER_DOT_INNER: f32 = 8.0;
-const HOVER_DOT_OUTER: f32 = 12.0;
+const HOVER_DOT_INNER: LogicalPx = LogicalPx::new(8.0);
+const HOVER_DOT_OUTER: LogicalPx = LogicalPx::new(12.0);
 const HOVER_DOT_OUTER_ALPHA: f32 = 0.1;
 
-const ENDPOINT_RADIUS: f32 = HOVER_DOT_INNER / 2.0;
-const PULSE_MIN_RADIUS: f32 = ENDPOINT_RADIUS + 2.0;
-const PULSE_MAX_RADIUS: f32 = 10.0;
+const ENDPOINT_RADIUS: LogicalPx = LogicalPx::new(HOVER_DOT_INNER.value() / 2.0);
+const PULSE_MIN_RADIUS: LogicalPx = LogicalPx::new(ENDPOINT_RADIUS.value() + 2.0);
+const PULSE_MAX_RADIUS: LogicalPx = LogicalPx::new(10.0);
 const PULSE_ALPHA: f32 = 0.4;
 const PULSE_DOT_SCALE: f32 = 0.08;
 
-const DOT_MASK_LEFT: f32 = HOVER_DOT_OUTER / 2.0;
-const DOT_MASK_RIGHT: f32 = PULSE_MAX_RADIUS;
-const DOT_MASK_VERTICAL: f32 = HOVER_DOT_OUTER / 2.0;
-const ENDPOINT_MASK_VERTICAL: f32 = PULSE_MAX_RADIUS;
+const DOT_MASK_LEFT: LogicalPx = LogicalPx::new(HOVER_DOT_OUTER.value() / 2.0);
+const DOT_MASK_RIGHT: LogicalPx = PULSE_MAX_RADIUS;
+const DOT_MASK_VERTICAL: LogicalPx = LogicalPx::new(HOVER_DOT_OUTER.value() / 2.0);
+const ENDPOINT_MASK_VERTICAL: LogicalPx = PULSE_MAX_RADIUS;
 
-const TIME_LABEL_TOP_INSET: f32 = 1.0;
-const TIME_LABEL_LINE_HEIGHT: f32 = 16.0;
+const TIME_LABEL_TOP_INSET: LogicalPx = LogicalPx::new(1.0);
+const TIME_LABEL_LINE_HEIGHT: LogicalPx = LogicalPx::new(16.0);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ChartColors {
@@ -124,7 +129,9 @@ pub(crate) fn paint(
     pulse_phase: Option<f32>,
 ) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
     let layout = prepared.layout;
-    if prepared.domain.is_none() || layout.plot.size.width <= 0.0 || layout.plot.size.height <= 0.0
+    if prepared.domain.is_none()
+        || layout.plot.size.width <= px(0.0)
+        || layout.plot.size.height <= px(0.0)
     {
         return (Canvas::new(layout.bounds), true, Vec::new());
     }
@@ -158,12 +165,19 @@ struct PaintContext<'a> {
 }
 
 impl PaintContext<'_> {
-    fn text(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle) {
+    fn text(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: LogicalPx,
+        y: LogicalPx,
+        style: &TextStyle,
+    ) {
         if text.is_empty() {
             return;
         }
         let line = self.text.line(self.app, text, style);
-        if canvas.push_shaped_text(&line, Point::new(x, y)) {
+        if canvas.push_shaped_text(&line, LogicalPoint::new(x, y)) {
             #[cfg(test)]
             record_text(text, x, y, style.size, line.size().width);
             self.used.push(line);
@@ -172,30 +186,36 @@ impl PaintContext<'_> {
         }
     }
 
-    fn width(&mut self, text: &str, style: &TextStyle) -> f32 {
+    fn width(&mut self, text: &str, style: &TextStyle) -> LogicalPx {
         self.text.width(self.app, text, style)
     }
 }
 
 fn paint_grid(canvas: &mut Canvas, prepared: &PreparedChart, colors: &ChartColors) {
     let layout = prepared.layout;
+    let plot_right = layout.plot.right();
     push_clip(canvas, layout.plot);
     for tick in &prepared.axis.ticks {
         let y = y_for_percent(*tick, &prepared.axis, layout.plot);
         let mut x = layout.plot.origin.x;
-        while x < layout.plot.right() {
-            let width = GRID_DOT.min(layout.plot.right() - x);
-            push_quad(canvas, Rect::new(x, y, width, GRID_DOT), colors.grid);
+        while x < plot_right {
+            let width = GRID_DOT.min(plot_right - x);
+            push_quad(canvas, LogicalRect::new(x, y, width, GRID_DOT), colors.grid);
             x += GRID_PERIOD;
         }
     }
     pop_clip(canvas);
+    let bounds_bottom = layout.bounds.bottom();
     push_clip(canvas, layout.bounds);
     for tick in prepared.time_ticks.iter() {
         let mut y = layout.plot.origin.y;
-        while y < layout.bounds.bottom() {
-            let height = GRID_DOT.min(layout.bounds.bottom() - y);
-            push_quad(canvas, Rect::new(tick.x, y, GRID_DOT, height), colors.grid);
+        while y < bounds_bottom {
+            let height = GRID_DOT.min(bounds_bottom - y);
+            push_quad(
+                canvas,
+                LogicalRect::new(tick.x, y, GRID_DOT, height),
+                colors.grid,
+            );
             y += GRID_PERIOD;
         }
     }
@@ -282,39 +302,41 @@ fn paint_series(
     pop_clip(canvas);
 }
 
-fn fade_masks(plot: Rect, crosshair_x: f32) -> (Rect, Rect) {
-    let x = crosshair_x.clamp(plot.origin.x, plot.right());
-    let left = Rect::from_origin_size(
+fn fade_masks(plot: LogicalRect, crosshair_x: LogicalPx) -> (LogicalRect, LogicalRect) {
+    let left_edge = plot.origin.x;
+    let right_edge = plot.right();
+    let x = crosshair_x.clamp(left_edge, right_edge);
+    let left = LogicalRect::from_origin_size(
         plot.origin,
-        Size::new((x - plot.origin.x).max(0.0), plot.size.height),
+        LogicalSize::new((x - left_edge).max(px(0.0)), plot.size.height),
     );
-    let right = Rect::from_origin_size(
-        Point::new(x, plot.origin.y),
-        Size::new((plot.right() - x).max(0.0), plot.size.height),
+    let right = LogicalRect::from_origin_size(
+        LogicalPoint::new(x, plot.origin.y),
+        LogicalSize::new((right_edge - x).max(px(0.0)), plot.size.height),
     );
     (left, right)
 }
 
-fn dot_mask(plot: Rect) -> Rect {
-    Rect::from_origin_size(
-        Point::new(
+fn dot_mask(plot: LogicalRect) -> LogicalRect {
+    LogicalRect::from_origin_size(
+        LogicalPoint::new(
             plot.origin.x - DOT_MASK_LEFT,
             plot.origin.y - DOT_MASK_VERTICAL,
         ),
-        Size::new(
+        LogicalSize::new(
             plot.size.width + (DOT_MASK_LEFT + DOT_MASK_RIGHT),
             plot.size.height + DOT_MASK_VERTICAL * 2.0,
         ),
     )
 }
 
-fn endpoint_mask(plot: Rect) -> Rect {
-    Rect::from_origin_size(
-        Point::new(
+fn endpoint_mask(plot: LogicalRect) -> LogicalRect {
+    LogicalRect::from_origin_size(
+        LogicalPoint::new(
             plot.origin.x - DOT_MASK_LEFT,
             plot.origin.y - ENDPOINT_MASK_VERTICAL,
         ),
-        Size::new(
+        LogicalSize::new(
             plot.size.width + (DOT_MASK_LEFT + DOT_MASK_RIGHT),
             plot.size.height + ENDPOINT_MASK_VERTICAL * 2.0,
         ),
@@ -351,7 +373,7 @@ fn paint_endpoints(
     pop_clip(canvas);
 }
 
-fn pulse_ring(phase: f32) -> Option<(f32, f32)> {
+fn pulse_ring(phase: f32) -> Option<(LogicalPx, f32)> {
     if !(0.0..1.0).contains(&phase) {
         return None;
     }
@@ -381,7 +403,7 @@ fn paint_hover(
     let height = layout.plot.size.height + CROSSHAIR_OVERHANG_TOP;
     push_quad(
         canvas,
-        Rect::new(x, top, CROSSHAIR_WIDTH, height),
+        LogicalRect::new(x, top, CROSSHAIR_WIDTH, height),
         context.colors.crosshair,
     );
     pop_clip(canvas);
@@ -421,7 +443,8 @@ fn paint_label_column(
         context.colors.foreground,
         STRONG_WEIGHT,
     );
-    let mut labels: Vec<(usize, SmolStr, f32, f32)> = Vec::with_capacity(prepared.series.len());
+    let mut labels: Vec<(usize, SmolStr, LogicalPx, LogicalPx)> =
+        Vec::with_capacity(prepared.series.len());
     for series in prepared.series.iter() {
         if !series.covers(hovered.timestamp) {
             continue;
@@ -440,13 +463,13 @@ fn paint_label_column(
     let widest = labels
         .iter()
         .map(|(_, _, width, _)| *width)
-        .fold(0.0, f32::max);
+        .fold(LogicalPx::ZERO, LogicalPx::max);
     let side = label_side(hovered.x, widest, layout.plot);
-    let anchors: Vec<f32> = labels.iter().map(|(_, _, _, anchor)| *anchor).collect();
+    let anchors: Vec<LogicalPx> = labels.iter().map(|(_, _, _, anchor)| *anchor).collect();
     let tops = label_tops(&anchors, LABEL_HEIGHT, LABEL_COLLISION_GAP, layout.plot);
     push_clip(canvas, layout.bounds);
     for ((color, text, width, _), top) in labels.iter().zip(tops.iter()) {
-        let bounds = Rect::new(
+        let bounds = LogicalRect::new(
             label_x(hovered.x, *width, side, layout.plot),
             *top,
             *width,
@@ -463,7 +486,7 @@ fn paint_label_column(
                 }),
             },
         });
-        let bar = Rect::new(
+        let bar = LogicalRect::new(
             bounds.origin.x + LABEL_PADDING_LEFT,
             bounds.origin.y + (LABEL_HEIGHT - LABEL_BAR_HEIGHT) / 2.0,
             LABEL_BAR_WIDTH,
@@ -515,17 +538,17 @@ fn paint_hover_time(
     context.text(canvas, text.as_str(), x, y, &font);
 }
 
-pub(crate) fn line_geometry(screen: &[ScreenPoint], width: f32) -> Option<GeometryDesc> {
-    let mut points: Vec<Point> = Vec::with_capacity(screen.len() * 2);
+pub(crate) fn line_geometry(screen: &[ScreenPoint], width: LogicalPx) -> Option<GeometryDesc> {
+    let mut points: Vec<ScreenPoint> = Vec::with_capacity(screen.len() * 2);
     let first = screen.first()?;
-    points.push(Point::new(first.x, first.y));
+    points.push(*first);
     for pair in screen.windows(2) {
         let (from, to) = (pair[0], pair[1]);
-        let horizontal = Point::new(to.x, from.y);
+        let horizontal = ScreenPoint { x: to.x, y: from.y };
         if points.last().is_none_or(|last| *last != horizontal) {
             points.push(horizontal);
         }
-        let next = Point::new(to.x, to.y);
+        let next = ScreenPoint { x: to.x, y: to.y };
         if points.last().is_none_or(|last| *last != next) {
             points.push(next);
         }
@@ -534,48 +557,90 @@ pub(crate) fn line_geometry(screen: &[ScreenPoint], width: f32) -> Option<Geomet
         return None;
     }
 
-    let half = (width / 2.0).max(0.5);
+    let half = (width / 2.0).max(px(0.5));
     let mut vertices = Vec::<[f32; 3]>::with_capacity(points.len() * 8);
     let mut indices = Vec::<u32>::with_capacity(points.len() * 12);
-    let mut min = Point::new(f32::INFINITY, f32::INFINITY);
-    let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
-    let mut push_quad = |corners: [Point; 4]| {
+    let mut min = ScreenPoint {
+        x: px(f32::INFINITY),
+        y: px(f32::INFINITY),
+    };
+    let mut max = ScreenPoint {
+        x: px(f32::NEG_INFINITY),
+        y: px(f32::NEG_INFINITY),
+    };
+    let mut push_quad = |corners: [ScreenPoint; 4]| {
         let base = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
         for corner in corners {
-            vertices.push([corner.x, corner.y, -1.0]);
-            min = Point::new(min.x.min(corner.x), min.y.min(corner.y));
-            max = Point::new(max.x.max(corner.x), max.y.max(corner.y));
+            vertices.push([corner.x.value(), corner.y.value(), -1.0]);
+            min = ScreenPoint {
+                x: min.x.min(corner.x),
+                y: min.y.min(corner.y),
+            };
+            max = ScreenPoint {
+                x: max.x.max(corner.x),
+                y: max.y.max(corner.y),
+            };
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     };
-    let square = |center: Point| {
+    let square = |center: ScreenPoint| {
         [
-            Point::new(center.x - half, center.y - half),
-            Point::new(center.x + half, center.y - half),
-            Point::new(center.x + half, center.y + half),
-            Point::new(center.x - half, center.y + half),
+            ScreenPoint {
+                x: center.x - half,
+                y: center.y - half,
+            },
+            ScreenPoint {
+                x: center.x + half,
+                y: center.y - half,
+            },
+            ScreenPoint {
+                x: center.x + half,
+                y: center.y + half,
+            },
+            ScreenPoint {
+                x: center.x - half,
+                y: center.y + half,
+            },
         ]
     };
 
     for window in points.windows(2) {
         let (from, to) = (window[0], window[1]);
-        let delta = Point::new(to.x - from.x, to.y - from.y);
-        let length = delta.x.hypot(delta.y);
+        let delta = ScreenPoint {
+            x: to.x - from.x,
+            y: to.y - from.y,
+        };
+        let length = delta.x.value().hypot(delta.y.value());
         if !length.is_finite() || length <= f32::EPSILON {
             continue;
         }
-        let normal = Point::new(-delta.y / length * half, delta.x / length * half);
+        let normal = ScreenPoint {
+            x: -delta.y / length * half.value(),
+            y: delta.x / length * half.value(),
+        };
         push_quad([
-            Point::new(from.x + normal.x, from.y + normal.y),
-            Point::new(to.x + normal.x, to.y + normal.y),
-            Point::new(to.x - normal.x, to.y - normal.y),
-            Point::new(from.x - normal.x, from.y - normal.y),
+            ScreenPoint {
+                x: from.x + normal.x,
+                y: from.y + normal.y,
+            },
+            ScreenPoint {
+                x: to.x + normal.x,
+                y: to.y + normal.y,
+            },
+            ScreenPoint {
+                x: to.x - normal.x,
+                y: to.y - normal.y,
+            },
+            ScreenPoint {
+                x: from.x - normal.x,
+                y: from.y - normal.y,
+            },
         ]);
     }
     for point in &points {
         push_quad(square(*point));
     }
-    let bounds = Rect::new(min.x, min.y, max.x - min.x, max.y - min.y).outset(half / 2.0);
+    let bounds = LogicalRect::new(min.x, min.y, max.x - min.x, max.y - min.y).outset(half / 2.0);
     if vertices.is_empty() || indices.is_empty() || !bounds.is_finite() {
         return None;
     }
@@ -599,8 +664,8 @@ pub(crate) fn line_geometry(screen: &[ScreenPoint], width: f32) -> Option<Geomet
     })
 }
 
-fn paint_circle(canvas: &mut Canvas, center: ScreenPoint, radius: f32, color: Color) {
-    if radius <= 0.0 {
+fn paint_circle(canvas: &mut Canvas, center: ScreenPoint, radius: LogicalPx, color: Color) {
+    if radius <= px(0.0) {
         return;
     }
     canvas.push_quad(Quad {
@@ -613,18 +678,18 @@ fn paint_circle(canvas: &mut Canvas, center: ScreenPoint, radius: f32, color: Co
     });
 }
 
-fn push_quad(canvas: &mut Canvas, bounds: Rect, fill: Color) {
+fn push_quad(canvas: &mut Canvas, bounds: LogicalRect, fill: Color) {
     canvas.push_quad(Quad {
         bounds,
-        corner_radius: [0.0; 4],
+        corner_radius: [px(0.0); 4],
         paint: QuadPaint::Solid { fill, border: None },
     });
 }
 
-fn push_clip(canvas: &mut Canvas, rect: Rect) {
+fn push_clip(canvas: &mut Canvas, rect: LogicalRect) {
     let _ = canvas.push_clip(ClipRect {
         rect,
-        corner_radius: [0.0; 4],
+        corner_radius: [px(0.0); 4],
     });
 }
 
@@ -636,9 +701,9 @@ fn pop_clip(canvas: &mut Canvas) {
 #[derive(Clone, Debug)]
 pub(crate) struct TextRecord {
     pub text: SmolStr,
-    pub origin: Point,
-    pub font_size: f32,
-    pub shaped_width: f32,
+    pub origin: LogicalPoint,
+    pub font_size: LogicalPx,
+    pub shaped_width: LogicalPx,
 }
 
 #[cfg(test)]
@@ -657,11 +722,17 @@ pub(crate) fn reset_text_log() {
 }
 
 #[cfg(test)]
-fn record_text(text: &str, x: f32, y: f32, font_size: f32, shaped_width: f32) {
+fn record_text(
+    text: &str,
+    x: LogicalPx,
+    y: LogicalPx,
+    font_size: LogicalPx,
+    shaped_width: LogicalPx,
+) {
     TEXT_LOG.with(|log| {
         log.borrow_mut().push(TextRecord {
             text: SmolStr::new(text),
-            origin: Point::new(x, y),
+            origin: LogicalPoint::new(x, y),
             font_size,
             shaped_width,
         });

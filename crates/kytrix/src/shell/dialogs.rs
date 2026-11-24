@@ -4,6 +4,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     event::Event,
+    math::px,
     node::signal::{Signal, SignalScope},
     window::WindowId,
 };
@@ -81,7 +82,7 @@ impl Dialogs {
                 window,
                 parent,
                 message.clone(),
-                12.0,
+                px(12.0),
                 400,
                 Role::FgDefault,
                 &theme,
@@ -113,7 +114,7 @@ impl Dialogs {
                 window,
                 parent,
                 message.clone(),
-                12.0,
+                px(12.0),
                 400,
                 Role::FgDefault,
                 &theme,

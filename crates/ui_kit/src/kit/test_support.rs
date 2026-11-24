@@ -3,7 +3,7 @@ use std::{thread, time::Duration};
 use ui_core::{
     a11y::{A11yNode, A11yNodeId, A11yTreeSnapshot},
     app::App,
-    math::{Rect, Scale},
+    math::{DevicePixelRatio, LogicalRect},
     node::id::NodeId,
     paint::primitive::{Image, Primitive},
     test_support::{
@@ -21,7 +21,7 @@ pub fn test_app() -> TestApp {
 
 #[must_use]
 pub fn test_app_with_scale(scale: f32) -> TestApp {
-    let scale = Scale::new(scale).expect("测试 DPI 必须是有限正数");
+    let scale = DevicePixelRatio::new(scale).expect("测试 DPI 必须是有限正数");
     TestApp::with_options(WindowOptions {
         scale,
         ..WindowOptions::default()
@@ -56,7 +56,7 @@ pub fn image_primitives(app: &TestApp) -> Vec<Image> {
 }
 
 #[must_use]
-pub fn bounds(app: &TestApp, node: NodeId) -> Option<Rect> {
+pub fn bounds(app: &TestApp, node: NodeId) -> Option<LogicalRect> {
     app.probe().bounds(node)
 }
 
@@ -255,7 +255,7 @@ pub fn assert_single_parent_per_node(snapshot: &A11yTreeSnapshot) {
 #[cfg(test)]
 mod tests {
     use ui_core::{
-        math::Rect,
+        math::{LogicalRect, px},
         node::builder::NodeBuilder,
         paint::{color::Color, style::PaintSpec},
         resources::DecodeState,
@@ -282,7 +282,7 @@ mod tests {
     fn the_probe_reads_layout_boxes() {
         let mut app = test_app();
         let window = app.window_id();
-        let rect = Rect::new(4.0, 6.0, 20.0, 12.0);
+        let rect = LogicalRect::new(px(4.0), px(6.0), px(20.0), px(12.0));
         let window_root = root(&app);
         let node = NodeBuilder::boxed()
             .layout_override(rect)
@@ -320,7 +320,7 @@ mod tests {
             let window = app.window_id();
             let window_root = root(&app);
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
                 .paint(PaintSpec {
                     background: Color::WHITE,
                     ..PaintSpec::default()
@@ -348,13 +348,14 @@ mod tests {
     #[test]
     fn the_decode_host_delivers_async_results() {
         let mut host = DecodeApp::new();
+        let window = host.window_id();
         let bytes = bytes::Bytes::copy_from_slice(
             crate::kit::icon::svg(crate::kit::icon::IconKind::User).as_bytes(),
         );
         let pending = host
             .app_mut()
-            .resources_mut()
-            .insert_svg_async_at_size(bytes, ui_core::math::Size::new(48.0, 48.0));
+            .insert_svg_async_for_window(window, bytes, crate::kit::icon::ICON_INTRINSIC_SIZE)
+            .expect("测试窗口存在");
         let delivered = host.poll_until(600, |app| {
             let results = app.take_resource_results();
             results
@@ -367,7 +368,10 @@ mod tests {
         };
         match state {
             DecodeState::Ready(image) => {
-                assert_eq!((image.width, image.height), (48, 48));
+                assert_eq!(
+                    image.intrinsic(ui_core::math::DevicePixelRatio::ONE),
+                    crate::kit::icon::ICON_INTRINSIC_SIZE
+                );
             }
             other => panic!("图标 SVG 应栅格成功，实际 {other:?}"),
         }

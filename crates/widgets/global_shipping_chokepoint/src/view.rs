@@ -339,7 +339,7 @@ impl WidgetView for GlobalShippingChokepointWidget {
                 if !self.map.contains(*position) {
                     return false;
                 }
-                if self.map.zoom_by_wheel(*position, delta.y) {
+                if self.map.zoom_by_wheel(*position, f32::from(delta.y)) {
                     self.map.track_pointer(*position, &self.painted);
                     let _ = cx.request_frame();
                 }

@@ -6,7 +6,7 @@ use time::UtcOffset;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch, style_builder::StyleBuilder},
 };
@@ -26,7 +26,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CacheKey {
-    pub bounds: Rect,
+    pub bounds: LogicalRect,
     pub revision: u64,
 }
 
@@ -83,7 +83,7 @@ impl<D: ChartData> Chart<D> {
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
         let label = t_smol!(translate, "widget.perpetual_statistics.chart");
-        let node = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let node = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id("TEST_PERPETUAL_STATISTICS_CHART")
             .style(
                 StyleBuilder::new()
@@ -147,7 +147,7 @@ impl<D: ChartData> Chart<D> {
         }
     }
 
-    pub(crate) fn hover_at(&self, cursor: Point) -> Option<Hover> {
+    pub(crate) fn hover_at(&self, cursor: LogicalPoint) -> Option<Hover> {
         let layout = self.cache.layout?;
         if !layout.plot.contains(cursor) {
             return None;
@@ -155,11 +155,11 @@ impl<D: ChartData> Chart<D> {
         let index = nearest_index(layout.plot, self.data.point_count(), cursor.x)?;
         self.data.hover_point(index).map(|index| Hover {
             index,
-            cursor_y: cursor.y.round(),
+            cursor_y: px(cursor.y.value().round()),
         })
     }
 
-    pub(crate) fn point_at(&mut self, cursor: Point) -> bool {
+    pub(crate) fn point_at(&mut self, cursor: LogicalPoint) -> bool {
         let next = self.hover_at(cursor);
         if self.hover == next {
             return false;
@@ -224,7 +224,7 @@ impl<D: ChartData> Chart<D> {
             return Ok(false);
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        if bounds.size.width.value() <= 0.0 || bounds.size.height.value() <= 0.0 {
             return Ok(false);
         }
 
@@ -314,7 +314,7 @@ impl<D: ChartData> Chart<D> {
         for previous in self.cache.meshes.iter_mut().filter_map(Option::take) {
             cx.app_mut().geometry_mut().release(previous);
         }
-        let lines: Vec<&[Option<Point>]> = match prepared {
+        let lines: Vec<&[Option<LogicalPoint>]> = match prepared {
             Prepared::Lines { series, .. } => series
                 .iter()
                 .filter_map(|geometry| geometry.points.as_deref())
@@ -504,7 +504,7 @@ impl ChartDispatch {
         }
     }
 
-    pub(crate) fn point_at(&mut self, cursor: Point) -> bool {
+    pub(crate) fn point_at(&mut self, cursor: LogicalPoint) -> bool {
         match self {
             Self::OpenInterest(chart) => chart.point_at(cursor),
             Self::TakerVolume(chart) => chart.point_at(cursor),

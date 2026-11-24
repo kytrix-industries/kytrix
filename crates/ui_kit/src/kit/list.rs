@@ -13,7 +13,7 @@ use ui_core::{
     interaction::{
         ActionCtx, ItemAlign, ScrollHandle, VirtualList, VirtualListConfig, VirtualListState,
     },
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -32,15 +32,15 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RowHeight {
-    Fixed(f32),
-    Variable { estimate: f32 },
+    Fixed(LogicalPx),
+    Variable { estimate: LogicalPx },
 }
 
 impl RowHeight {
     #[must_use]
-    pub fn extent(self) -> f32 {
+    pub fn extent(self) -> LogicalPx {
         match self {
-            Self::Fixed(extent) | Self::Variable { estimate: extent } => extent.max(1.0),
+            Self::Fixed(extent) | Self::Variable { estimate: extent } => extent.max(px(1.0)),
         }
     }
 
@@ -66,8 +66,8 @@ pub struct ListOptions {
     pub capacity: Option<usize>,
     pub reverse: bool,
     pub keep_on_newest: bool,
-    pub padding_x: f32,
-    pub padding_y: f32,
+    pub padding_x: LogicalPx,
+    pub padding_y: LogicalPx,
     pub row_stretch: bool,
     pub scrollbar: bool,
     pub separator: bool,
@@ -75,7 +75,7 @@ pub struct ListOptions {
 
 impl ListOptions {
     #[must_use]
-    pub fn fixed(extent: f32) -> Self {
+    pub fn fixed(extent: LogicalPx) -> Self {
         Self {
             row_height: RowHeight::Fixed(extent),
             overscan: 2,
@@ -83,8 +83,8 @@ impl ListOptions {
             capacity: None,
             reverse: false,
             keep_on_newest: false,
-            padding_x: 6.0,
-            padding_y: 2.0,
+            padding_x: px(6.0),
+            padding_y: px(2.0),
             row_stretch: false,
             scrollbar: true,
             separator: false,
@@ -92,7 +92,7 @@ impl ListOptions {
     }
 
     #[must_use]
-    pub fn variable(estimate: f32) -> Self {
+    pub fn variable(estimate: LogicalPx) -> Self {
         Self {
             row_height: RowHeight::Variable { estimate },
             ..Self::fixed(estimate)
@@ -118,21 +118,21 @@ impl ListOptions {
     }
 
     #[must_use]
-    pub fn padding(mut self, x: f32, y: f32) -> Self {
-        self.padding_x = x.max(0.0);
-        self.padding_y = y.max(0.0);
+    pub fn padding(mut self, x: LogicalPx, y: LogicalPx) -> Self {
+        self.padding_x = x.max(LogicalPx::ZERO);
+        self.padding_y = y.max(LogicalPx::ZERO);
         self
     }
 
     #[must_use]
-    pub fn padding_x(mut self, padding: f32) -> Self {
-        self.padding_x = padding.max(0.0);
+    pub fn padding_x(mut self, padding: LogicalPx) -> Self {
+        self.padding_x = padding.max(LogicalPx::ZERO);
         self
     }
 
     #[must_use]
-    pub fn padding_y(mut self, padding: f32) -> Self {
-        self.padding_y = padding.max(0.0);
+    pub fn padding_y(mut self, padding: LogicalPx) -> Self {
+        self.padding_y = padding.max(LogicalPx::ZERO);
         self
     }
 
@@ -273,14 +273,14 @@ pub(crate) fn apply_click(
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RowHeights {
-    heights: Vec<f32>,
-    prefix: Vec<f32>,
+    heights: Vec<LogicalPx>,
+    prefix: Vec<LogicalPx>,
 }
 
 impl RowHeights {
     #[must_use]
-    pub fn filled(count: usize, height: f32) -> Self {
-        let height = height.max(0.0);
+    pub fn filled(count: usize, height: LogicalPx) -> Self {
+        let height = height.max(LogicalPx::ZERO);
         let mut this = Self {
             heights: vec![height; count],
             prefix: Vec::with_capacity(count + 1),
@@ -291,8 +291,8 @@ impl RowHeights {
 
     fn rebuild_prefix(&mut self) {
         self.prefix.clear();
-        self.prefix.resize(self.heights.len() + 1, 0.0);
-        let mut total = 0.0_f32;
+        self.prefix.resize(self.heights.len() + 1, LogicalPx::ZERO);
+        let mut total = LogicalPx::ZERO;
         for (index, height) in self.heights.iter().copied().enumerate() {
             total += height;
             self.prefix[index + 1] = total;
@@ -311,18 +311,18 @@ impl RowHeights {
     }
 
     #[must_use]
-    pub fn as_slice(&self) -> &[f32] {
+    pub fn as_slice(&self) -> &[LogicalPx] {
         &self.heights
     }
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn get(&self, index: usize) -> Option<f32> {
+    pub(crate) fn get(&self, index: usize) -> Option<LogicalPx> {
         self.heights.get(index).copied()
     }
 
     #[must_use]
-    pub fn top(&self, index: usize) -> f32 {
+    pub fn top(&self, index: usize) -> LogicalPx {
         self.prefix
             .get(index)
             .copied()
@@ -330,29 +330,29 @@ impl RowHeights {
     }
 
     #[must_use]
-    pub fn total(&self) -> f32 {
-        self.prefix.last().copied().unwrap_or(0.0)
+    pub fn total(&self) -> LogicalPx {
+        self.prefix.last().copied().unwrap_or(LogicalPx::ZERO)
     }
 
     #[must_use]
-    pub fn index_at(&self, offset: f32) -> (usize, f32) {
-        if self.heights.is_empty() || self.total() <= 0.0 {
-            return (0, offset.max(0.0));
+    pub fn index_at(&self, offset: LogicalPx) -> (usize, LogicalPx) {
+        if self.heights.is_empty() || self.total() <= LogicalPx::ZERO {
+            return (0, offset.max(LogicalPx::ZERO));
         }
         let tops = &self.prefix[..self.heights.len()];
         let index = tops
             .partition_point(|top| *top <= offset)
             .saturating_sub(1)
             .min(self.heights.len() - 1);
-        (index, (offset - tops[index]).max(0.0))
+        (index, (offset - tops[index]).max(LogicalPx::ZERO))
     }
 
-    pub fn set(&mut self, index: usize, height: f32) -> bool {
-        let height = height.max(0.0);
+    pub fn set(&mut self, index: usize, height: LogicalPx) -> bool {
+        let height = height.max(LogicalPx::ZERO);
         let Some(slot) = self.heights.get_mut(index) else {
             return false;
         };
-        if (*slot - height).abs() <= f32::EPSILON {
+        if (*slot - height).abs() <= px(f32::EPSILON) {
             return false;
         }
         *slot = height;
@@ -360,17 +360,17 @@ impl RowHeights {
         true
     }
 
-    pub fn insert_front(&mut self, height: f32) {
-        self.heights.insert(0, height.max(0.0));
+    pub fn insert_front(&mut self, height: LogicalPx) {
+        self.heights.insert(0, height.max(LogicalPx::ZERO));
         self.rebuild_prefix();
     }
 
-    pub fn push_back(&mut self, height: f32) {
-        self.heights.push(height.max(0.0));
+    pub fn push_back(&mut self, height: LogicalPx) {
+        self.heights.push(height.max(LogicalPx::ZERO));
         self.rebuild_prefix();
     }
 
-    pub fn pop_front(&mut self) -> Option<f32> {
+    pub fn pop_front(&mut self) -> Option<LogicalPx> {
         if self.heights.is_empty() {
             return None;
         }
@@ -379,7 +379,7 @@ impl RowHeights {
         Some(removed)
     }
 
-    pub fn pop_back(&mut self) -> Option<f32> {
+    pub fn pop_back(&mut self) -> Option<LogicalPx> {
         let removed = self.heights.pop();
         if removed.is_some() {
             self.rebuild_prefix();
@@ -387,11 +387,11 @@ impl RowHeights {
         removed
     }
 
-    pub fn resize(&mut self, count: usize, fallback: f32) {
+    pub fn resize(&mut self, count: usize, fallback: LogicalPx) {
         if self.heights.len() == count {
             return;
         }
-        self.heights.resize(count, fallback.max(0.0));
+        self.heights.resize(count, fallback.max(LogicalPx::ZERO));
         self.rebuild_prefix();
     }
 }
@@ -399,7 +399,7 @@ impl RowHeights {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PushAnchor {
     pub index: usize,
-    pub inner: f32,
+    pub inner: LogicalPx,
     pub at_newest: bool,
 }
 
@@ -409,7 +409,7 @@ pub(crate) fn push_anchor_after(
     full: bool,
     reverse: bool,
     new_count: usize,
-) -> Option<(usize, f32)> {
+) -> Option<(usize, LogicalPx)> {
     if new_count == 0 {
         return None;
     }
@@ -714,7 +714,7 @@ impl List {
     }
 
     #[must_use]
-    pub fn offset(&self, app: &App) -> Option<f32> {
+    pub fn offset(&self, app: &App) -> Option<LogicalPx> {
         let handle = self.inner.geometry.borrow().handle?;
         app.scroll_state(&handle).map(|state| state.offset.y)
     }
@@ -766,14 +766,14 @@ impl List {
 
     pub fn set_items(&self, app: &mut App, count: usize) -> Result<(), EngineError> {
         self.inner.ensure_heights(count);
-        self.rebuild(app, count, Some(0.0))?;
+        self.rebuild(app, count, Some(LogicalPx::ZERO))?;
         app.write(&self.inner.selection, Selection::new());
         Ok(())
     }
 
     pub fn set_count(&self, app: &mut App, count: usize) -> Result<(), EngineError> {
         self.inner.ensure_heights(count);
-        let offset = self.offset(app).unwrap_or(0.0);
+        let offset = self.offset(app).unwrap_or(LogicalPx::ZERO);
         self.rebuild(app, count, Some(offset))?;
         app.update(&self.inner.selection, |selection| {
             selection.retain_below(count);
@@ -795,11 +795,11 @@ impl List {
         let viewport = state.viewport.height;
         let offset = state.offset.y;
         let (first, inner) = self.inner.index_at(offset, old_count);
-        let max = (self.inner.content_height(old_count) - viewport).max(0.0);
+        let max = (self.inner.content_height(old_count) - viewport).max(LogicalPx::ZERO);
         let at_newest = if self.inner.options.reverse {
-            offset <= 0.5
+            offset <= px(0.5)
         } else {
-            max <= 0.5 || offset >= max - 0.5
+            max <= px(0.5) || offset >= max - px(0.5)
         };
         let anchor = PushAnchor {
             index: first,
@@ -825,16 +825,16 @@ impl List {
         let follow = self.inner.options.keep_on_newest && at_newest;
         let target = if follow {
             if self.inner.options.reverse {
-                0.0
+                LogicalPx::ZERO
             } else {
-                (self.inner.content_height(new_count) - viewport).max(0.0)
+                (self.inner.content_height(new_count) - viewport).max(LogicalPx::ZERO)
             }
         } else if let Some((index, inner)) =
             push_anchor_after(anchor, full, self.inner.options.reverse, new_count)
         {
             self.inner.row_top(index, new_count) + inner
         } else {
-            0.0
+            LogicalPx::ZERO
         };
         self.rebuild(app, new_count, Some(target))
     }
@@ -851,11 +851,11 @@ impl List {
         app.scroll_to_item(&list, index, align)
     }
 
-    pub fn scroll_by(&self, app: &mut App, delta: f32) -> Result<(), EngineError> {
+    pub fn scroll_by(&self, app: &mut App, delta: LogicalPx) -> Result<(), EngineError> {
         let Some(handle) = self.inner.geometry.borrow().handle else {
             return Ok(());
         };
-        app.scroll_by(&handle, Point::new(0.0, delta))
+        app.scroll_by(&handle, LogicalPoint::new(LogicalPx::ZERO, delta))
     }
 
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
@@ -906,7 +906,7 @@ impl List {
                     let height = tree
                         .get(content)
                         .map(|node| node.layout().bounds.size.height)
-                        .unwrap_or(0.0)
+                        .unwrap_or(LogicalPx::ZERO)
                         + padding * 2.0;
                     if heights.set(index, height) {
                         measured = true;
@@ -914,7 +914,7 @@ impl List {
                 }
             }
             if measured {
-                let heights = self.inner.heights.borrow().as_slice().to_vec();
+                let heights: Vec<LogicalPx> = self.inner.heights.borrow().as_slice().to_vec();
                 if let Some(list) = self.inner.geometry.borrow().list {
                     app.set_virtual_extents(&list, &heights)?;
                 }
@@ -970,10 +970,10 @@ impl List {
                     .style(
                         StyleBuilder::new()
                             .absolute()
-                            .top(0.0)
-                            .left(0.0)
-                            .right(0.0)
-                            .height(1.0)
+                            .top(px(0.0))
+                            .left(px(0.0))
+                            .right(px(0.0))
+                            .height(px(1.0))
                             .build(),
                     )
                     .bind_style(move |cx| StylePatch {
@@ -1140,7 +1140,7 @@ impl List {
         &self,
         app: &mut App,
         count: usize,
-        target_offset: Option<f32>,
+        target_offset: Option<LogicalPx>,
     ) -> Result<(), EngineError> {
         let window = self.inner.geometry.borrow().window;
         let (Some(list), Some(handle)) = (
@@ -1150,7 +1150,7 @@ impl List {
             app.write(&self.inner.count, count);
             return Ok(());
         };
-        let heights = if self.inner.options.row_height.is_variable() {
+        let heights: Option<Vec<LogicalPx>> = if self.inner.options.row_height.is_variable() {
             Some(self.inner.heights.borrow().as_slice().to_vec())
         } else {
             None
@@ -1164,7 +1164,7 @@ impl List {
                 app.set_virtual_extents(&list, heights)?;
             }
             if let Some(offset) = target_offset {
-                app.scroll_to(&handle, Point::new(0.0, offset))?;
+                app.scroll_to(&handle, LogicalPoint::new(LogicalPx::ZERO, offset))?;
             }
             Ok(())
         })?;
@@ -1238,13 +1238,13 @@ impl ListInner {
         }
     }
 
-    fn row_top(&self, index: usize, count: usize) -> f32 {
+    fn row_top(&self, index: usize, count: usize) -> LogicalPx {
         match self.options.row_height {
-            RowHeight::Fixed(extent) => index.min(count) as f32 * extent,
+            RowHeight::Fixed(extent) => extent * index.min(count) as f32,
             RowHeight::Variable { estimate } => {
                 let heights = self.heights.borrow();
                 if heights.is_empty() {
-                    index as f32 * estimate
+                    estimate * index as f32
                 } else {
                     heights.top(index)
                 }
@@ -1252,13 +1252,13 @@ impl ListInner {
         }
     }
 
-    fn content_height(&self, count: usize) -> f32 {
+    fn content_height(&self, count: usize) -> LogicalPx {
         match self.options.row_height {
-            RowHeight::Fixed(extent) => count as f32 * extent,
+            RowHeight::Fixed(extent) => extent * count as f32,
             RowHeight::Variable { estimate } => {
                 let heights = self.heights.borrow();
                 if heights.is_empty() {
-                    count as f32 * estimate
+                    estimate * count as f32
                 } else {
                     heights.total()
                 }
@@ -1266,20 +1266,20 @@ impl ListInner {
         }
     }
 
-    fn index_at(&self, offset: f32, count: usize) -> (usize, f32) {
+    fn index_at(&self, offset: LogicalPx, count: usize) -> (usize, LogicalPx) {
         if count == 0 {
-            return (0, 0.0);
+            return (0, LogicalPx::ZERO);
         }
         match self.options.row_height {
             RowHeight::Fixed(extent) => {
                 let index = ((offset / extent).floor().max(0.0) as usize).min(count - 1);
-                (index, offset - index as f32 * extent)
+                (index, offset - extent * index as f32)
             }
             RowHeight::Variable { estimate } => {
                 let heights = self.heights.borrow();
                 if heights.is_empty() {
                     let index = ((offset / estimate).floor().max(0.0) as usize).min(count - 1);
-                    (index, offset - index as f32 * estimate)
+                    (index, offset - estimate * index as f32)
                 } else {
                     heights.index_at(offset)
                 }
@@ -1305,54 +1305,56 @@ mod tests {
 
     #[test]
     fn row_heights_prefix_and_index_at() {
-        let mut heights = RowHeights::filled(4, 25.0);
-        assert_eq!(heights.total(), 100.0);
-        assert_eq!(heights.top(0), 0.0);
-        assert_eq!(heights.top(2), 50.0);
-        assert_eq!(heights.index_at(0.0), (0, 0.0));
-        assert_eq!(heights.index_at(24.0), (0, 24.0));
-        assert_eq!(heights.index_at(25.0), (1, 0.0));
-        assert_eq!(heights.index_at(74.0), (2, 24.0));
+        let mut heights = RowHeights::filled(4, px(25.0));
+        assert_eq!(heights.total(), px(100.0));
+        assert_eq!(heights.top(0), px(0.0));
+        assert_eq!(heights.top(2), px(50.0));
+        assert_eq!(heights.index_at(px(0.0)), (0, px(0.0)));
+        assert_eq!(heights.index_at(px(24.0)), (0, px(24.0)));
+        assert_eq!(heights.index_at(px(25.0)), (1, px(0.0)));
+        assert_eq!(heights.index_at(px(74.0)), (2, px(24.0)));
         assert_eq!(
-            heights.index_at(200.0),
-            (3, 125.0),
+            heights.index_at(px(200.0)),
+            (3, px(125.0)),
             "越界偏移退到末项（行内偏移可超过行高）"
         );
 
-        assert!(heights.set(1, 50.0));
-        assert_eq!(heights.total(), 125.0);
-        assert_eq!(heights.top(2), 75.0);
-        assert_eq!(heights.index_at(75.0), (2, 0.0));
-        assert!(!heights.set(1, 50.0), "同值不重建前缀和");
+        assert!(heights.set(1, px(50.0)));
+        assert_eq!(heights.total(), px(125.0));
+        assert_eq!(heights.top(2), px(75.0));
+        assert_eq!(heights.index_at(px(75.0)), (2, px(0.0)));
+        assert!(!heights.set(1, px(50.0)), "同值不重建前缀和");
 
         let empty = RowHeights::default();
-        assert_eq!(empty.index_at(12.0), (0, 12.0), "空表无条目");
-        assert_eq!(empty.total(), 0.0);
+        assert_eq!(empty.index_at(px(12.0)), (0, px(12.0)), "空表无条目");
+        assert_eq!(empty.total(), px(0.0));
     }
 
     #[test]
     fn row_heights_mutations_keep_the_prefix_consistent() {
-        let mut heights = RowHeights::filled(3, 10.0);
-        heights.insert_front(5.0);
-        assert_eq!(heights.as_slice(), &[5.0, 10.0, 10.0, 10.0]);
-        assert_eq!(heights.top(1), 5.0);
-        assert_eq!(heights.total(), 35.0);
+        let mut heights = RowHeights::filled(3, px(10.0));
+        heights.insert_front(px(5.0));
+        assert_eq!(heights.as_slice(), &[px(5.0), px(10.0), px(10.0), px(10.0)]);
+        assert_eq!(heights.top(1), px(5.0));
+        assert_eq!(heights.total(), px(35.0));
 
         heights.pop_back();
-        assert_eq!(heights.total(), 25.0);
-        heights.push_back(20.0);
-        assert_eq!(heights.total(), 45.0);
+        assert_eq!(heights.total(), px(25.0));
+        heights.push_back(px(20.0));
+        assert_eq!(heights.total(), px(45.0));
         heights.pop_front();
-        assert_eq!(heights.top(0), 0.0);
-        assert_eq!(heights.total(), 40.0);
+        assert_eq!(heights.top(0), px(0.0));
+        assert_eq!(heights.total(), px(40.0));
 
-        heights.resize(5, 7.0);
-        assert_eq!(heights.as_slice(), &[10.0, 10.0, 20.0, 7.0, 7.0]);
-        assert_eq!(heights.total(), 54.0);
-        heights.resize(2, 7.0);
-        assert_eq!(heights.total(), 20.0);
+        heights.resize(5, px(7.0));
+        assert_eq!(
+            heights.as_slice(),
+            &[px(10.0), px(10.0), px(20.0), px(7.0), px(7.0)]
+        );
+        assert_eq!(heights.total(), px(54.0));
+        heights.resize(2, px(7.0));
+        assert_eq!(heights.total(), px(20.0));
     }
-
     #[test]
     fn selection_click_modes() {
         let mut selection = Selection::new();
@@ -1386,23 +1388,26 @@ mod tests {
     fn push_anchor_moves_with_the_dropped_or_inserted_item() {
         let anchor = PushAnchor {
             index: 3,
-            inner: 4.0,
+            inner: px(4.0),
             at_newest: false,
         };
-        assert_eq!(push_anchor_after(anchor, false, false, 5), Some((3, 4.0)));
+        assert_eq!(
+            push_anchor_after(anchor, false, false, 5),
+            Some((3, px(4.0)))
+        );
         assert_eq!(
             push_anchor_after(anchor, true, false, 5),
-            Some((2, 4.0)),
+            Some((2, px(4.0))),
             "非倒序满容量丢首项 ⇒ 读者下标 −1"
         );
         assert_eq!(
             push_anchor_after(anchor, true, true, 5),
-            Some((4, 4.0)),
+            Some((4, px(4.0))),
             "倒序满容量头插 ⇒ 读者下标 +1"
         );
         assert_eq!(
             push_anchor_after(anchor, false, false, 3),
-            Some((2, 4.0)),
+            Some((2, px(4.0))),
             "条目数缩小时 clamp 到末项"
         );
         assert_eq!(push_anchor_after(anchor, false, false, 0), None);
@@ -1426,6 +1431,7 @@ mod ui_tests {
         a11y::{A11yPatch, A11yRole},
         error::EngineError,
         event::{InputEvent, Modifiers, PointerButton},
+        math::{LogicalPoint, LogicalPx, px},
         node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
         paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
@@ -1448,7 +1454,7 @@ mod ui_tests {
     }
 
     fn text_row(tree: &mut NodeTree, parent: NodeId, index: usize) -> Result<(), EngineError> {
-        NodeBuilder::text(format_smolstr!("row{index}"), TextStyle::new(12.0))
+        NodeBuilder::text(format_smolstr!("row{index}"), TextStyle::new(px(12.0)))
             .build(tree, parent)?;
         Ok(())
     }
@@ -1473,8 +1479,8 @@ mod ui_tests {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(BOX_WIDTH)
-                        .height(BOX_HEIGHT)
+                        .width(px(BOX_WIDTH))
+                        .height(px(BOX_HEIGHT))
                         .build(),
                 )
                 .build(tree, root)
@@ -1487,7 +1493,7 @@ mod ui_tests {
     }
 
     fn harness(rows: usize) -> Harness {
-        harness_with(ListOptions::fixed(ROW_EXTENT), rows, text_row)
+        harness_with(ListOptions::fixed(px(ROW_EXTENT)), rows, text_row)
     }
 
     fn settle(harness: &mut Harness) {
@@ -1498,15 +1504,15 @@ mod ui_tests {
         let _ = harness.app.drain().expect("frame");
     }
 
-    fn center(app: &TestApp, node: NodeId) -> ui_core::math::Point {
+    fn center(app: &TestApp, node: NodeId) -> LogicalPoint {
         let bounds = app.probe().bounds(node).expect("bounds");
-        ui_core::math::Point::new(
+        LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         )
     }
 
-    fn click(app: &mut TestApp, point: ui_core::math::Point) {
+    fn click(app: &mut TestApp, point: LogicalPoint) {
         let _ = app.inject(InputEvent::pointer_down(
             point,
             PointerButton::Primary,
@@ -1519,10 +1525,7 @@ mod ui_tests {
         ));
     }
 
-    fn click_outcome(
-        app: &mut TestApp,
-        point: ui_core::math::Point,
-    ) -> ui_core::event::InputOutcome {
+    fn click_outcome(app: &mut TestApp, point: LogicalPoint) -> ui_core::event::InputOutcome {
         let _ = app.inject(InputEvent::pointer_down(
             point,
             PointerButton::Primary,
@@ -1586,7 +1589,7 @@ mod ui_tests {
             app.app_mut(),
             theme,
             "first-frame",
-            ListOptions::fixed(ROW_EXTENT),
+            ListOptions::fixed(px(ROW_EXTENT)),
             text_row,
         );
         list.set_initial_count(app.app_mut(), 20);
@@ -1597,8 +1600,8 @@ mod ui_tests {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(BOX_WIDTH)
-                        .height(BOX_HEIGHT)
+                        .width(px(BOX_WIDTH))
+                        .height(px(BOX_HEIGHT))
                         .build(),
                 )
                 .build(tree, root)
@@ -1644,7 +1647,7 @@ mod ui_tests {
             .expect("第 0 行必须有文本节点");
         let bounds = app.probe().bounds(text).expect("行文本 bounds");
         assert!(
-            bounds.size.width > 0.0 && bounds.size.height > 0.0,
+            bounds.size.width.value() > 0.0 && bounds.size.height.value() > 0.0,
             "首帧行文本必须已布局（bounds 非零）：{bounds:?}"
         );
     }
@@ -1768,7 +1771,7 @@ mod ui_tests {
             app.app_mut(),
             theme,
             "row-a11y",
-            ListOptions::fixed(ROW_EXTENT),
+            ListOptions::fixed(px(ROW_EXTENT)),
             text_row,
         );
         list.set_row_a11y(move |cx: &mut ReadCtx<'_>, index| A11yPatch {
@@ -1887,7 +1890,7 @@ mod ui_tests {
             app.app_mut(),
             theme,
             "released",
-            ListOptions::fixed(ROW_EXTENT),
+            ListOptions::fixed(px(ROW_EXTENT)),
             text_row,
         );
         let released = list.release(app.app_mut());
@@ -1908,7 +1911,10 @@ mod ui_tests {
         let first_bounds = harness.app.probe().bounds(first).expect("row 0 bounds");
         let second_bounds = harness.app.probe().bounds(second).expect("row 1 bounds");
         assert!(
-            (second_bounds.origin.y - first_bounds.origin.y - ROW_EXTENT).abs() < 0.5,
+            (second_bounds.origin.y - first_bounds.origin.y - ROW_EXTENT)
+                .abs()
+                .value()
+                < 0.5,
             "行按 extent 紧凑排列：{first_bounds:?} {second_bounds:?}"
         );
         assert_eq!(
@@ -1932,7 +1938,7 @@ mod ui_tests {
         let _ = harness.list.sync(harness.app.app_mut()).expect("sync");
         assert_eq!(
             harness.list.offset(harness.app.app()),
-            Some(300.0),
+            Some(px(300.0)),
             "第 10 行贴顶 = 10 * 30"
         );
         let mounted = harness.list.mounted_rows(harness.app.app());
@@ -1955,7 +1961,7 @@ mod ui_tests {
         let point = center(&harness.app, viewport);
         let _ = harness.app.inject(InputEvent::scroll_lines(
             point,
-            ui_core::math::Point::new(0.0, -2.0),
+            LogicalPoint::new(px(0.0), px(-2.0)),
             Modifiers::empty(),
         ));
         for _ in 0..8 {
@@ -1963,7 +1969,7 @@ mod ui_tests {
             let _ = harness.app.drain().expect("frame");
         }
         let offset = harness.list.offset(harness.app.app()).expect("offset");
-        assert!(offset > 300.0, "滚轮下滚后偏移增大：{offset}");
+        assert!(offset > px(300.0), "滚轮下滚后偏移增大：{offset}");
     }
 
     #[test]
@@ -1971,11 +1977,11 @@ mod ui_tests {
         let mut harness = harness(20);
         harness
             .list
-            .scroll_by(harness.app.app_mut(), 100.0)
+            .scroll_by(harness.app.app_mut(), px(100.0))
             .expect("像素下滚");
         let _ = harness.app.drain().expect("frame");
         let _ = harness.list.sync(harness.app.app_mut()).expect("sync");
-        assert_eq!(harness.list.offset(harness.app.app()), Some(100.0));
+        assert_eq!(harness.list.offset(harness.app.app()), Some(px(100.0)));
         let mounted = harness.list.mounted_rows(harness.app.app());
         assert!(
             !mounted.iter().any(|(index, _)| *index == 0),
@@ -1989,23 +1995,23 @@ mod ui_tests {
 
         harness
             .list
-            .scroll_by(harness.app.app_mut(), -1_000.0)
+            .scroll_by(harness.app.app_mut(), px(-1_000.0))
             .expect("向上越界");
         let _ = harness.app.drain().expect("frame");
         assert_eq!(
             harness.list.offset(harness.app.app()),
-            Some(0.0),
+            Some(px(0.0)),
             "负目标夹到 0，不产生负偏移"
         );
 
         harness
             .list
-            .scroll_by(harness.app.app_mut(), 10_000.0)
+            .scroll_by(harness.app.app_mut(), px(10_000.0))
             .expect("向下越界");
         let _ = harness.app.drain().expect("frame");
         assert_eq!(
             harness.list.offset(harness.app.app()),
-            Some(480.0),
+            Some(px(480.0)),
             "目标夹到 内容 600 − 视口 120"
         );
     }
@@ -2013,7 +2019,7 @@ mod ui_tests {
     #[test]
     fn scrolling_by_pixels_uses_the_measured_heights() {
         let mut harness = harness_with(
-            ListOptions::variable(ROW_EXTENT),
+            ListOptions::variable(px(ROW_EXTENT)),
             12,
             |tree, parent, index| {
                 let height = if index.is_multiple_of(2) { 40.0 } else { 20.0 };
@@ -2021,7 +2027,7 @@ mod ui_tests {
                     .style(
                         StyleBuilder::new()
                             .width_full()
-                            .height(height)
+                            .height(px(height))
                             .flex_none()
                             .build(),
                     )
@@ -2029,25 +2035,27 @@ mod ui_tests {
                 Ok(())
             },
         );
-        assert_eq!(harness.list.row_heights().get(0), Some(44.0));
+        assert_eq!(harness.list.row_heights().get(0), Some(px(44.0)));
         let heights = harness.list.row_heights();
-        let total: f32 = (0..12).map(|index| heights.get(index).unwrap_or(0.0)).sum();
-        assert_ne!(total, 12.0 * ROW_EXTENT, "至少一行脱离了估计值");
+        let total = (0..12).fold(LogicalPx::ZERO, |total, index| {
+            total + heights.get(index).unwrap_or(LogicalPx::ZERO)
+        });
+        assert_ne!(total, px(12.0 * ROW_EXTENT), "至少一行脱离了估计值");
         harness
             .list
-            .scroll_by(harness.app.app_mut(), 50.0)
+            .scroll_by(harness.app.app_mut(), px(50.0))
             .expect("像素下滚");
         let _ = harness.app.drain().expect("frame");
-        assert_eq!(harness.list.offset(harness.app.app()), Some(50.0));
+        assert_eq!(harness.list.offset(harness.app.app()), Some(px(50.0)));
 
         harness
             .list
-            .scroll_by(harness.app.app_mut(), 10_000.0)
+            .scroll_by(harness.app.app_mut(), px(10_000.0))
             .expect("向下越界");
         let _ = harness.app.drain().expect("frame");
         assert_eq!(
             harness.list.offset(harness.app.app()),
-            Some((total - BOX_HEIGHT).max(0.0)),
+            Some((total - px(BOX_HEIGHT)).max(LogicalPx::ZERO)),
             "夹紧到实测内容 {total} − 视口 {BOX_HEIGHT}"
         );
     }
@@ -2056,12 +2064,12 @@ mod ui_tests {
     fn scrolling_by_a_non_finite_delta_is_rejected() {
         let mut harness = harness(4);
         assert!(matches!(
-            harness.list.scroll_by(harness.app.app_mut(), f32::NAN),
+            harness.list.scroll_by(harness.app.app_mut(), px(f32::NAN)),
             Err(EngineError::NotScrollable { .. })
         ));
         assert_eq!(
             harness.list.offset(harness.app.app()),
-            Some(0.0),
+            Some(px(0.0)),
             "被拒后偏移不变"
         );
     }
@@ -2069,7 +2077,7 @@ mod ui_tests {
     #[test]
     fn variable_heights_are_measured_and_written_back() {
         let mut harness = harness_with(
-            ListOptions::variable(ROW_EXTENT),
+            ListOptions::variable(px(ROW_EXTENT)),
             20,
             |tree, parent, index| {
                 let height = if index.is_multiple_of(2) { 40.0 } else { 20.0 };
@@ -2077,7 +2085,7 @@ mod ui_tests {
                     .style(
                         StyleBuilder::new()
                             .width_full()
-                            .height(height)
+                            .height(px(height))
                             .flex_none()
                             .build(),
                     )
@@ -2087,18 +2095,21 @@ mod ui_tests {
         );
         settle(&mut harness);
         let heights = harness.list.row_heights();
-        assert_eq!(heights.get(0), Some(44.0), "40 + 上下 padding 2*2");
-        assert_eq!(heights.get(1), Some(24.0), "20 + padding");
+        assert_eq!(heights.get(0), Some(px(44.0)), "40 + 上下 padding 2*2");
+        assert_eq!(heights.get(1), Some(px(24.0)), "20 + padding");
         let first = harness.list.row_node(harness.app.app(), 0).expect("row 0");
         let second = harness.list.row_node(harness.app.app(), 1).expect("row 1");
         let first_bounds = harness.app.probe().bounds(first).expect("bounds");
         let second_bounds = harness.app.probe().bounds(second).expect("bounds");
         assert!(
-            (first_bounds.size.height - 44.0).abs() < 0.5,
+            (first_bounds.size.height - 44.0).abs().value() < 0.5,
             "{first_bounds:?}"
         );
         assert!(
-            (second_bounds.origin.y - first_bounds.origin.y - 44.0).abs() < 0.5,
+            (second_bounds.origin.y - first_bounds.origin.y - 44.0)
+                .abs()
+                .value()
+                < 0.5,
             "行位置跟前缀和走：{first_bounds:?} {second_bounds:?}"
         );
     }
@@ -2125,7 +2136,7 @@ mod ui_tests {
             .expect("replace");
         settle(&mut harness);
         assert_eq!(harness.list.count(harness.app.app()), 5);
-        assert_eq!(harness.list.offset(harness.app.app()), Some(0.0));
+        assert_eq!(harness.list.offset(harness.app.app()), Some(px(0.0)));
         assert!(harness.list.selection(harness.app.app()).is_empty());
     }
 
@@ -2168,10 +2179,10 @@ mod ui_tests {
             app.app_mut(),
             theme,
             "deque",
-            ListOptions::fixed(ROW_EXTENT).deque(8).keep_on_newest(),
+            ListOptions::fixed(px(ROW_EXTENT)).deque(8).keep_on_newest(),
             move |tree, parent, index| {
                 let value = data_rows.borrow().get(index).copied().unwrap_or(0);
-                NodeBuilder::text(format_smolstr!("row{value}"), TextStyle::new(12.0))
+                NodeBuilder::text(format_smolstr!("row{value}"), TextStyle::new(px(12.0)))
                     .build(tree, parent)?;
                 Ok(())
             },
@@ -2184,8 +2195,8 @@ mod ui_tests {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(BOX_WIDTH)
-                        .height(BOX_HEIGHT)
+                        .width(px(BOX_WIDTH))
+                        .height(px(BOX_HEIGHT))
                         .build(),
                 )
                 .build(tree, root)
@@ -2203,7 +2214,7 @@ mod ui_tests {
             )
             .expect("scroll");
         let _ = harness.app.drain().expect("frame");
-        assert_eq!(harness.list.offset(harness.app.app()), Some(60.0));
+        assert_eq!(harness.list.offset(harness.app.app()), Some(px(60.0)));
         {
             let mut data = data.borrow_mut();
             if data.len() == 8 {
@@ -2221,7 +2232,7 @@ mod ui_tests {
         assert_eq!(harness.list.count(harness.app.app()), 8);
         assert_eq!(
             harness.list.offset(harness.app.app()),
-            Some(30.0),
+            Some(px(30.0)),
             "读者读的条目下标 −1，偏移跟着前缀和回退"
         );
         assert_eq!(
@@ -2241,13 +2252,13 @@ mod ui_tests {
             app.app_mut(),
             theme,
             "deque-reverse",
-            ListOptions::fixed(ROW_EXTENT)
+            ListOptions::fixed(px(ROW_EXTENT))
                 .deque(8)
                 .reverse()
                 .keep_on_newest(),
             move |tree, parent, index| {
                 let value = data_rows.borrow().get(index).copied().unwrap_or(0);
-                NodeBuilder::text(format_smolstr!("row{value}"), TextStyle::new(12.0))
+                NodeBuilder::text(format_smolstr!("row{value}"), TextStyle::new(px(12.0)))
                     .build(tree, parent)?;
                 Ok(())
             },
@@ -2260,8 +2271,8 @@ mod ui_tests {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(BOX_WIDTH)
-                        .height(BOX_HEIGHT)
+                        .width(px(BOX_WIDTH))
+                        .height(px(BOX_HEIGHT))
                         .build(),
                 )
                 .build(tree, root)
@@ -2279,7 +2290,7 @@ mod ui_tests {
             )
             .expect("scroll");
         let _ = harness.app.drain().expect("frame");
-        assert_eq!(harness.list.offset(harness.app.app()), Some(60.0));
+        assert_eq!(harness.list.offset(harness.app.app()), Some(px(60.0)));
         {
             let mut data = data.borrow_mut();
             if data.len() == 8 {
@@ -2291,7 +2302,7 @@ mod ui_tests {
         settle(&mut harness);
         assert_eq!(
             harness.list.offset(harness.app.app()),
-            Some(90.0),
+            Some(px(90.0)),
             "倒序头插 ⇒ 读者下标 +1，偏移前移一行"
         );
         assert_eq!(
@@ -2306,7 +2317,7 @@ mod ui_tests {
             "push 不改选中"
         );
         let _ = SelectionMode::Single;
-        let _ = RowHeight::Fixed(1.0);
+        let _ = RowHeight::Fixed(px(1.0));
     }
 
     fn variable_list_without_frames_with(
@@ -2325,8 +2336,8 @@ mod ui_tests {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(BOX_WIDTH)
-                        .height(BOX_HEIGHT)
+                        .width(px(BOX_WIDTH))
+                        .height(px(BOX_HEIGHT))
                         .build(),
                 )
                 .build(tree, root)
@@ -2346,7 +2357,7 @@ mod ui_tests {
             .style(
                 StyleBuilder::new()
                     .width_full()
-                    .height(height)
+                    .height(px(height))
                     .flex_none()
                     .build(),
             )
@@ -2361,14 +2372,14 @@ mod ui_tests {
             if index.is_multiple_of(2) { 40.0 } else { 20.0 }
         }
         variable_list_without_frames_with(
-            ListOptions::variable(VARIABLE_EXTENT),
+            ListOptions::variable(px(VARIABLE_EXTENT)),
             ROWS,
             |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 NodeBuilder::boxed()
                     .style(
                         StyleBuilder::new()
                             .width_full()
-                            .height(row_height(index))
+                            .height(px(row_height(index)))
                             .flex_none()
                             .build(),
                     )
@@ -2391,14 +2402,14 @@ mod ui_tests {
         for &index in measured {
             assert_eq!(
                 heights.get(index),
-                Some(real_height(index)),
+                Some(px(real_height(index))),
                 "第 {index} 行高度（首轮必须读到实测真实高，而不是 0 / 估计值）"
             );
         }
         let state = list.state(app.app()).expect("虚拟列表状态");
         assert!(state.mounted > 0, "可见行必须挂载：{state:?}");
         assert!(
-            heights.total() > 0.0,
+            heights.total() > px(0.0),
             "内容高度（前缀和）必须 > 0：{}",
             heights.total()
         );
@@ -2433,21 +2444,24 @@ mod ui_tests {
 
     #[test]
     fn the_first_sync_after_set_count_measures_real_heights_and_keeps_the_offset() {
-        let (mut app, list) =
-            variable_list_without_frames_with(ListOptions::variable(26.0), 5, explicit_height_row);
+        let (mut app, list) = variable_list_without_frames_with(
+            ListOptions::variable(px(26.0)),
+            5,
+            explicit_height_row,
+        );
         assert!(
             list.sync(app.app_mut()).expect("首轮 sync"),
             "首轮实测必须回写真实行高"
         );
         let before = list.row_heights();
-        assert_eq!(before.get(0), Some(64.0), "显式行高 60 + padding 2*2");
-        assert_eq!(before.get(1), Some(34.0), "显式行高 30 + padding 2*2");
+        assert_eq!(before.get(0), Some(px(64.0)), "显式行高 60 + padding 2*2");
+        assert_eq!(before.get(1), Some(px(34.0)), "显式行高 30 + padding 2*2");
 
         list.scroll_to_item(app.app_mut(), 2, ui_core::interaction::ItemAlign::Start)
             .expect("scroll");
         let offset = list.offset(app.app()).expect("offset");
         assert!(
-            offset > 0.0,
+            offset > px(0.0),
             "先滚到非零偏移（set_count 保留它的前提）：{offset}"
         );
 
@@ -2466,7 +2480,7 @@ mod ui_tests {
             let expected = if index.is_multiple_of(2) { 64.0 } else { 34.0 };
             assert_eq!(
                 after.get(*index),
-                Some(expected),
+                Some(px(expected)),
                 "第 {index} 行：set_count 后首轮实测必须是真实行高（不是 padding-only 4.0）"
             );
         }
@@ -2483,7 +2497,7 @@ mod ui_tests {
             Rc::new(RefCell::new(VecDeque::from([60.0, 30.0, 60.0, 30.0, 60.0])));
         let rows = data.clone();
         let (mut app, list) = variable_list_without_frames_with(
-            ListOptions::variable(26.0).deque(5),
+            ListOptions::variable(px(26.0)).deque(5),
             5,
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 let height = rows.borrow().get(index).copied().unwrap_or(0.0);
@@ -2491,7 +2505,7 @@ mod ui_tests {
                     .style(
                         StyleBuilder::new()
                             .width_full()
-                            .height(height)
+                            .height(px(height))
                             .flex_none()
                             .build(),
                     )
@@ -2504,13 +2518,13 @@ mod ui_tests {
             "首轮实测必须回写真实行高"
         );
         let before = list.row_heights();
-        assert_eq!(before.get(0), Some(64.0), "数据行高 60 + padding 2*2");
-        assert_eq!(before.get(1), Some(34.0), "数据行高 30 + padding 2*2");
+        assert_eq!(before.get(0), Some(px(64.0)), "数据行高 60 + padding 2*2");
+        assert_eq!(before.get(1), Some(px(34.0)), "数据行高 30 + padding 2*2");
 
         list.scroll_to_item(app.app_mut(), 2, ui_core::interaction::ItemAlign::Start)
             .expect("scroll");
         assert!(
-            list.offset(app.app()).expect("offset") > 0.0,
+            list.offset(app.app()).expect("offset") > px(0.0),
             "先滚到非零偏移（锚点保持的前提）"
         );
 
@@ -2535,17 +2549,17 @@ mod ui_tests {
             let content = data.get(*index).copied().expect("新数据覆盖已挂载行");
             assert_eq!(
                 after.get(*index),
-                Some(content + 4.0),
+                Some(px(content + 4.0)),
                 "第 {index} 行：push 后首轮实测必须是真实行高（不是 padding-only 4.0）"
             );
         }
         let offset = list.offset(app.app()).expect("offset");
         assert!(
-            offset > 0.0,
+            offset > px(0.0),
             "读者锚点仍在列表中部（没有被 clamp 到 0）：{offset}"
         );
         assert!(
-            (offset - after.top(1)).abs() < 0.5,
+            (offset - after.top(1)).abs() < px(0.5),
             "读者贴顶的条目丢首项后是下标 1：offset={offset} top(1)={}",
             after.top(1)
         );
@@ -2554,10 +2568,10 @@ mod ui_tests {
     #[test]
     fn set_count_on_a_text_row_height_list_keeps_the_scroll_offset() {
         let (mut app, list) = variable_list_without_frames_with(
-            ListOptions::variable(26.0),
+            ListOptions::variable(px(26.0)),
             12,
             |tree: &mut NodeTree, parent: NodeId, index: usize| {
-                NodeBuilder::text(format_smolstr!("row{index}"), TextStyle::new(12.0))
+                NodeBuilder::text(format_smolstr!("row{index}"), TextStyle::new(px(12.0)))
                     .build(tree, parent)?;
                 Ok::<(), EngineError>(())
             },
@@ -2569,14 +2583,14 @@ mod ui_tests {
         let before = list.row_heights();
         let first = before.get(0).expect("第 0 行高度");
         assert!(
-            (5.0..40.0).contains(&first),
+            (px(5.0)..px(40.0)).contains(&first),
             "文本行应有真实实测高度（不是 estimate / padding-only）：{first}"
         );
 
         list.scroll_to_item(app.app_mut(), 4, ui_core::interaction::ItemAlign::Start)
             .expect("scroll");
         let offset = list.offset(app.app()).expect("offset");
-        assert!(offset > 0.0, "先滚到非零偏移：{offset}");
+        assert!(offset > px(0.0), "先滚到非零偏移：{offset}");
 
         list.set_count(app.app_mut(), 12).expect("set count");
         list.sync(app.app_mut())
@@ -2606,7 +2620,7 @@ mod ui_tests {
             .collect();
         let after = list.row_heights();
         let real = after.get(mounted[0]).expect("挂载行高度");
-        assert!(real > 4.0, "挂载行必须补上真实高度：{after:?}");
+        assert!(real > px(4.0), "挂载行必须补上真实高度：{after:?}");
         for index in &mounted {
             assert_eq!(
                 after.get(*index),
@@ -2618,29 +2632,39 @@ mod ui_tests {
 
     #[test]
     fn the_padding_builders_shape_the_row_boxes_and_measurements() {
-        let options = ListOptions::fixed(ROW_EXTENT).padding(3.0, 5.0);
+        let options = ListOptions::fixed(px(ROW_EXTENT)).padding(px(3.0), px(5.0));
         assert_eq!(
             (options.padding_x, options.padding_y),
-            (3.0, 5.0),
+            (px(3.0), px(5.0)),
             "padding(x, y) 同时写两侧"
         );
-        assert_eq!(ListOptions::fixed(ROW_EXTENT).padding_x(1.5).padding_x, 1.5);
-        assert_eq!(ListOptions::fixed(ROW_EXTENT).padding_y(2.5).padding_y, 2.5);
-        let clamped = ListOptions::fixed(ROW_EXTENT).padding(-4.0, -2.0);
+        assert_eq!(
+            ListOptions::fixed(px(ROW_EXTENT))
+                .padding_x(px(1.5))
+                .padding_x,
+            px(1.5)
+        );
+        assert_eq!(
+            ListOptions::fixed(px(ROW_EXTENT))
+                .padding_y(px(2.5))
+                .padding_y,
+            px(2.5)
+        );
+        let clamped = ListOptions::fixed(px(ROW_EXTENT)).padding(px(-4.0), px(-2.0));
         assert_eq!(
             (clamped.padding_x, clamped.padding_y),
-            (0.0, 0.0),
+            (px(0.0), px(0.0)),
             "负内边距夹到 0"
         );
         assert_eq!(
-            ListOptions::fixed(ROW_EXTENT).overscan(5).overscan,
+            ListOptions::fixed(px(ROW_EXTENT)).overscan(5).overscan,
             5,
             "overscan builder 是行数口径"
         );
 
         let harness = harness_with(
-            ListOptions::fixed(ROW_EXTENT)
-                .padding(3.0, 5.0)
+            ListOptions::fixed(px(ROW_EXTENT))
+                .padding(px(3.0), px(5.0))
                 .row_stretch(),
             4,
             text_row,
@@ -2653,27 +2677,36 @@ mod ui_tests {
         let row_bounds = harness.app.probe().bounds(row).expect("row bounds");
         let content_bounds = harness.app.probe().bounds(content).expect("content bounds");
         assert!(
-            (content_bounds.origin.x - (row_bounds.origin.x + 3.0)).abs() < 0.5,
+            (content_bounds.origin.x - (row_bounds.origin.x + 3.0))
+                .abs()
+                .value()
+                < 0.5,
             "内容左内边距 = padding_x（行 {row_bounds:?} / 内容 {content_bounds:?}）"
         );
         assert!(
-            (content_bounds.origin.y - (row_bounds.origin.y + 5.0)).abs() < 0.5,
+            (content_bounds.origin.y - (row_bounds.origin.y + 5.0))
+                .abs()
+                .value()
+                < 0.5,
             "内容上内边距 = padding_y（行 {row_bounds:?} / 内容 {content_bounds:?}）"
         );
         assert!(
-            (content_bounds.size.width - (row_bounds.size.width - 6.0)).abs() < 0.5,
+            (content_bounds.size.width - (row_bounds.size.width - 6.0))
+                .abs()
+                .value()
+                < 0.5,
             "内容可用宽 = 行宽 − 2×padding_x（行 {row_bounds:?} / 内容 {content_bounds:?}）"
         );
 
         let mut variable = harness_with(
-            ListOptions::variable(10.0).padding(3.0, 5.0),
+            ListOptions::variable(px(10.0)).padding(px(3.0), px(5.0)),
             3,
             |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 NodeBuilder::boxed()
                     .style(
                         StyleBuilder::new()
-                            .width(40.0)
-                            .height(20.0 + index as f32 * 10.0)
+                            .width(px(40.0))
+                            .height(px(20.0 + index as f32 * 10.0))
                             .build(),
                     )
                     .build(tree, parent)?;
@@ -2688,7 +2721,7 @@ mod ui_tests {
         for index in 0..3 {
             assert_eq!(
                 heights.get(index),
-                Some(20.0 + index as f32 * 10.0 + 10.0),
+                Some(px(20.0 + index as f32 * 10.0 + 10.0)),
                 "第 {index} 行 extent = 内容高 + 2 × padding_y"
             );
         }
@@ -2703,6 +2736,7 @@ mod deque_tests {
     use ui_core::{
         error::EngineError,
         interaction::ItemAlign,
+        math::px,
         node::{builder::NodeBuilder, tree::NodeTree},
         paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
@@ -2724,8 +2758,8 @@ mod deque_tests {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(BOX_WIDTH)
-                        .height(BOX_HEIGHT)
+                        .width(px(BOX_WIDTH))
+                        .height(px(BOX_HEIGHT))
                         .build(),
                 )
                 .build(tree, root)
@@ -2745,7 +2779,7 @@ mod deque_tests {
 
     fn fixed_deque(app: &mut TestApp, reverse: bool, data: Rc<RefCell<VecDeque<usize>>>) -> List {
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let mut options = ListOptions::fixed(ROW_EXTENT).deque(8).keep_on_newest();
+        let mut options = ListOptions::fixed(px(ROW_EXTENT)).deque(8).keep_on_newest();
         if reverse {
             options = options.reverse();
         }
@@ -2757,7 +2791,7 @@ mod deque_tests {
             options,
             move |tree, parent, index| {
                 let value = rows.borrow().get(index).copied().unwrap_or(0);
-                NodeBuilder::text(format_smolstr!("row{value}"), TextStyle::new(12.0))
+                NodeBuilder::text(format_smolstr!("row{value}"), TextStyle::new(px(12.0)))
                     .build(tree, parent)?;
                 Ok(())
             },
@@ -2792,7 +2826,7 @@ mod deque_tests {
         list.scroll_to_item(app.app_mut(), 2, ItemAlign::Start)
             .expect("scroll mid");
         let _ = app.drain().expect("frame");
-        assert_eq!(list.offset(app.app()), Some(60.0));
+        assert_eq!(list.offset(app.app()), Some(px(60.0)));
         {
             let mut data = data.borrow_mut();
             data.pop_front();
@@ -2802,7 +2836,7 @@ mod deque_tests {
         settle(&mut app, &list);
         assert_eq!(
             list.offset(app.app()),
-            Some(30.0),
+            Some(px(30.0)),
             "滚走的读者不被跟随拖走：原第 2 条移到下标 1"
         );
         assert_eq!(list.count(app.app()), 8);
@@ -2818,11 +2852,11 @@ mod deque_tests {
         list.scroll_to_item(app.app_mut(), 7, ItemAlign::End)
             .expect("scroll end");
         let _ = app.drain().expect("frame");
-        assert_eq!(list.offset(app.app()), Some(120.0));
-        list.scroll_by(app.app_mut(), -ROW_EXTENT)
+        assert_eq!(list.offset(app.app()), Some(px(120.0)));
+        list.scroll_by(app.app_mut(), px(-ROW_EXTENT))
             .expect("scroll up");
         let _ = app.drain().expect("frame");
-        assert_eq!(list.offset(app.app()), Some(90.0), "滚离尾部一行");
+        assert_eq!(list.offset(app.app()), Some(px(90.0)), "滚离尾部一行");
         {
             let mut data = data.borrow_mut();
             data.pop_front();
@@ -2832,14 +2866,14 @@ mod deque_tests {
         settle(&mut app, &list);
         assert_eq!(
             list.offset(app.app()),
-            Some(60.0),
+            Some(px(60.0)),
             "读者读的那一条（原下标 3）移到 2：push 保持读者"
         );
 
-        list.scroll_by(app.app_mut(), 10_000.0)
+        list.scroll_by(app.app_mut(), px(10_000.0))
             .expect("scroll to tail");
         let _ = app.drain().expect("frame");
-        assert_eq!(list.offset(app.app()), Some(120.0), "回到尾部");
+        assert_eq!(list.offset(app.app()), Some(px(120.0)), "回到尾部");
         {
             let mut data = data.borrow_mut();
             data.pop_front();
@@ -2849,7 +2883,7 @@ mod deque_tests {
         settle(&mut app, &list);
         assert_eq!(
             list.offset(app.app()),
-            Some(120.0),
+            Some(px(120.0)),
             "回到最新一条 ⇒ push 跟随尾部"
         );
     }
@@ -2861,7 +2895,7 @@ mod deque_tests {
         let data: Rc<RefCell<VecDeque<usize>>> = Rc::new(RefCell::new((0..8).collect()));
         let list = fixed_deque(&mut app, true, data.clone());
         mount_list(&mut app, &list, 8, window);
-        assert_eq!(list.offset(app.app()), Some(0.0));
+        assert_eq!(list.offset(app.app()), Some(px(0.0)));
         {
             let mut data = data.borrow_mut();
             data.pop_back();
@@ -2871,7 +2905,7 @@ mod deque_tests {
         settle(&mut app, &list);
         assert_eq!(
             list.offset(app.app()),
-            Some(0.0),
+            Some(px(0.0)),
             "倒序列表的读者在最新一条上 ⇒ 回到顶部（最新一条）"
         );
         let node = list.row_node(app.app(), 0).expect("row 0");
@@ -2906,14 +2940,16 @@ mod deque_tests {
             app.app_mut(),
             theme,
             "deque-variable",
-            ListOptions::variable(ROW_EXTENT).deque(8).keep_on_newest(),
+            ListOptions::variable(px(ROW_EXTENT))
+                .deque(8)
+                .keep_on_newest(),
             |tree: &mut NodeTree, parent: ui_core::node::id::NodeId, index: usize| {
                 let height = if index.is_multiple_of(2) { 40.0 } else { 20.0 };
                 NodeBuilder::boxed()
                     .style(
                         StyleBuilder::new()
                             .width_full()
-                            .height(height)
+                            .height(px(height))
                             .flex_none()
                             .build(),
                     )
@@ -2928,7 +2964,7 @@ mod deque_tests {
             .expect("scroll");
         let _ = app.drain().expect("frame");
         let expected = heights.top(2);
-        assert!((list.offset(app.app()).expect("offset") - expected).abs() < 0.5);
+        assert!((list.offset(app.app()).expect("offset") - expected).abs() < px(0.5));
         list.push(app.app_mut()).expect("push");
         settle(&mut app, &list);
         let expected = heights.get(1).expect("height 1");
@@ -2936,10 +2972,10 @@ mod deque_tests {
         let _ = expected;
         let measured = list.row_heights();
         assert!(
-            (offset - measured.top(1)).abs() < 0.5,
+            (offset - measured.top(1)).abs() < px(0.5),
             "变高双端列表按测量前缀和保持锚点（原第 2 条移到下标 1 并贴顶）"
         );
-        assert!(offset > 0.0);
+        assert!(offset > px(0.0));
     }
 
     fn separator_list(options: ListOptions, rows: usize) -> (TestApp, List) {
@@ -2951,7 +2987,7 @@ mod deque_tests {
             "list",
             options,
             |tree: &mut NodeTree, parent: ui_core::node::id::NodeId, index: usize| {
-                NodeBuilder::text(format_smolstr!("row{index}"), TextStyle::new(12.0))
+                NodeBuilder::text(format_smolstr!("row{index}"), TextStyle::new(px(12.0)))
                     .build(tree, parent)?;
                 Ok::<(), EngineError>(())
             },
@@ -2963,7 +2999,7 @@ mod deque_tests {
 
     #[test]
     fn the_builtin_separator_draws_one_divider_per_row_except_the_first() {
-        let (app, list) = separator_list(ListOptions::fixed(ROW_EXTENT).separator(), 4);
+        let (app, list) = separator_list(ListOptions::fixed(px(ROW_EXTENT)).separator(), 4);
         let theme = crate::theme::resolved::Theme::of(Appearance::Light);
         let window = app.window_id();
         let mounted = list.mounted_rows(app.app());
@@ -3017,15 +3053,25 @@ mod deque_tests {
             );
             let row_bounds = app.probe().bounds(row).expect("row bounds");
             let separator_bounds = app.probe().bounds(separator).expect("separator bounds");
-            assert_eq!(separator_bounds.size.height, 1.0, "分隔线几何高 1 px");
+            assert_eq!(
+                separator_bounds.size.height.value(),
+                1.0,
+                "分隔线几何高 1 px"
+            );
             assert!(
-                (separator_bounds.size.width - row_bounds.size.width).abs() < 0.5,
+                (separator_bounds.size.width - row_bounds.size.width)
+                    .abs()
+                    .value()
+                    < 0.5,
                 "分隔线横跨整行（行宽 {}，线宽 {}）",
                 row_bounds.size.width,
                 separator_bounds.size.width
             );
             assert!(
-                (separator_bounds.origin.y - row_bounds.origin.y).abs() < 0.5,
+                (separator_bounds.origin.y - row_bounds.origin.y)
+                    .abs()
+                    .value()
+                    < 0.5,
                 "分隔线落在行顶边（行 y {}，线 y {}）",
                 row_bounds.origin.y,
                 separator_bounds.origin.y
@@ -3038,7 +3084,7 @@ mod deque_tests {
             );
         }
 
-        let (plain, plain_list) = separator_list(ListOptions::fixed(ROW_EXTENT), 4);
+        let (plain, plain_list) = separator_list(ListOptions::fixed(px(ROW_EXTENT)), 4);
         let window = plain.window_id();
         for (_, row) in plain_list.mounted_rows(plain.app()) {
             let tree = plain.app().window(window).expect("window").tree();

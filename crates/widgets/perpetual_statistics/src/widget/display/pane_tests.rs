@@ -19,7 +19,10 @@ use market_participants_model::{
     routing::CapabilityId,
 };
 use smol_str::SmolStr;
-use ui_core::node::{builder::NodeBuilder, id::NodeId, tree::NodeKind};
+use ui_core::{
+    math::px,
+    node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
+};
 use widget::{
     config::WidgetConfigChange,
     protocol::RequestId,
@@ -292,8 +295,8 @@ impl Fixture {
                 .id("TEST_PERPETUAL_STATISTICS_BODY")
                 .style(
                     ui_core::paint::style_builder::StyleBuilder::new()
-                        .width(640.0)
-                        .height(360.0)
+                        .width(px(640.0))
+                        .height(px(360.0))
                         .flex_col()
                         .build(),
                 )
@@ -372,8 +375,8 @@ impl Fixture {
                 .id("TEST_PERPETUAL_STATISTICS_HEADER_HOST")
                 .style(
                     ui_core::paint::style_builder::StyleBuilder::new()
-                        .width(640.0)
-                        .height(32.0)
+                        .width(px(640.0))
+                        .height(px(32.0))
                         .flex_col()
                         .build(),
                 )
@@ -438,7 +441,7 @@ impl Fixture {
         chart.canvas_for_test(self.harness.app(), self.harness.window())
     }
 
-    fn plot(&self) -> ui_core::math::Rect {
+    fn plot(&self) -> ui_core::math::LogicalRect {
         self.chart()
             .and_then(ChartDispatch::layout_for_test)
             .expect("the chart was laid out")
@@ -1255,8 +1258,8 @@ fn two_panes_should_keep_their_own_header_handlers() {
             .id("TEST_TWO_PANES_HEADER")
             .style(
                 ui_core::paint::style_builder::StyleBuilder::new()
-                    .width(640.0)
-                    .height(64.0)
+                    .width(px(640.0))
+                    .height(px(64.0))
                     .flex_col()
                     .build(),
             )

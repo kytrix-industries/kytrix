@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use ui_core::{app::App, error::EngineError, node::id::NodeId, window::WindowId};
+use ui_core::{app::App, error::EngineError, math::px, node::id::NodeId, window::WindowId};
 use ui_kit::theme::role::Role;
 use widget::identity::WidgetId;
 use widget_gallery_ui::gallery::{WidgetGallery, WidgetGalleryEvent};
@@ -34,10 +34,10 @@ impl GalleryPage {
             WORKSPACE_PAGES,
             ui_core::paint::style_builder::StyleBuilder::new()
                 .absolute()
-                .top(0.0)
-                .left(0.0)
-                .right(0.0)
-                .bottom(0.0)
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
                 .flex_col()
                 .overflow_hidden()
                 .build(),
@@ -48,10 +48,10 @@ impl GalleryPage {
             root,
             ui_core::paint::style_builder::StyleBuilder::new()
                 .absolute()
-                .top(0.0)
-                .left(0.0)
-                .right(0.0)
-                .bottom(0.0)
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
                 .build(),
             Role::SurfaceCanvas,
             &composition.theme,

@@ -26,7 +26,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     event::{Event, InputEvent, PointerButton},
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     window::WindowId,
@@ -75,8 +75,8 @@ use super::{
 const MAXIMUM_CANDLES: usize = 1_500;
 const HISTORY_PAGE_SIZE: u16 = 300;
 const PREFETCH_MARGIN: usize = 120;
-const MIN_CANDLE_WIDTH: f32 = 5.0;
-const MAX_CANDLE_WIDTH: f32 = 25.0;
+const MIN_CANDLE_WIDTH: LogicalPx = px(5.0);
+const MAX_CANDLE_WIDTH: LogicalPx = px(25.0);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandlestickConfig {
@@ -300,8 +300,8 @@ pub struct CandlestickWidget {
     instrument: Option<HeaderInstrument>,
     controls: Option<HeaderControls>,
     dragging: bool,
-    drag_last_x: Option<f32>,
-    drag_remainder: f32,
+    drag_last_x: Option<LogicalPx>,
+    drag_remainder: LogicalPx,
     fetching_history: bool,
     fetching_newer: bool,
     history_requested_before: Option<i64>,
@@ -391,10 +391,10 @@ impl WidgetView for CandlestickWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .left(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
@@ -547,7 +547,7 @@ impl WidgetView for CandlestickWidget {
             InputEvent::Scroll {
                 position, delta, ..
             } => {
-                if self.zoom_at(*position, delta.y) {
+                if self.zoom_at(*position, f32::from(delta.y)) {
                     let _ = cx.request_frame();
                 }
                 true
@@ -677,7 +677,7 @@ impl CandlestickWidget {
             controls: None,
             dragging: false,
             drag_last_x: None,
-            drag_remainder: 0.0,
+            drag_remainder: LogicalPx::ZERO,
             fetching_history: false,
             fetching_newer: false,
             history_requested_before: None,
@@ -793,7 +793,7 @@ impl CandlestickWidget {
         self.viewport.cursor = None;
         self.dragging = false;
         self.drag_last_x = None;
-        self.drag_remainder = 0.0;
+        self.drag_remainder = LogicalPx::ZERO;
         self.fetching_history = false;
         self.fetching_newer = false;
         self.history_requested_before = None;
@@ -1081,7 +1081,7 @@ impl CandlestickWidget {
                     .style(
                         StyleBuilder::new()
                             .flex_none()
-                            .width(PANEL_WIDTH)
+                            .width(px(PANEL_WIDTH))
                             .height_full()
                             .min_height_0()
                             .build(),
@@ -1272,7 +1272,7 @@ impl CandlestickWidget {
         latest_price_indicator_is_visible(candles.len(), visible_end, true)
     }
 
-    fn chart_contains(&self, position: Point) -> bool {
+    fn chart_contains(&self, position: LogicalPoint) -> bool {
         self.chart
             .bounds()
             .is_some_and(|bounds| bounds.contains(position))
@@ -1348,7 +1348,7 @@ impl CandlestickWidget {
         else {
             return;
         };
-        if maximum_plot_width <= 0.0 {
+        if maximum_plot_width <= LogicalPx::ZERO {
             return;
         }
         let Some(snapshot) = self.snapshot.as_ref() else {
@@ -1550,7 +1550,7 @@ impl CandlestickWidget {
         }
     }
 
-    fn apply_pointer(&mut self, position: Point) -> bool {
+    fn apply_pointer(&mut self, position: LogicalPoint) -> bool {
         if self.dragging {
             let Some(last_x) = self.drag_last_x.replace(position.x) else {
                 return false;
@@ -1558,7 +1558,7 @@ impl CandlestickWidget {
             self.drag_remainder += position.x - last_x;
             let candle_delta = (self.drag_remainder / self.viewport.candle_width).trunc() as isize;
             if candle_delta != 0 {
-                self.drag_remainder -= candle_delta as f32 * self.viewport.candle_width;
+                self.drag_remainder -= self.viewport.candle_width * candle_delta as f32;
                 return self.pan_by(-candle_delta);
             }
             false
@@ -1570,20 +1570,20 @@ impl CandlestickWidget {
         }
     }
 
-    fn begin_drag(&mut self, x: f32) -> bool {
+    fn begin_drag(&mut self, x: LogicalPx) -> bool {
         let changed = !self.dragging || self.viewport.cursor.is_some();
         self.dragging = true;
         self.drag_last_x = Some(x);
-        self.drag_remainder = 0.0;
+        self.drag_remainder = LogicalPx::ZERO;
         self.viewport.cursor = None;
         changed
     }
 
-    fn end_drag(&mut self, position: Option<Point>) -> bool {
+    fn end_drag(&mut self, position: Option<LogicalPoint>) -> bool {
         let changed = self.dragging || self.viewport.cursor != position;
         self.dragging = false;
         self.drag_last_x = None;
-        self.drag_remainder = 0.0;
+        self.drag_remainder = LogicalPx::ZERO;
         self.viewport.cursor = position;
         changed
     }
@@ -1618,7 +1618,7 @@ impl CandlestickWidget {
         true
     }
 
-    fn zoom_at(&mut self, position: Point, delta_y: f32) -> bool {
+    fn zoom_at(&mut self, position: LogicalPoint, delta_y: f32) -> bool {
         if delta_y == 0.0 {
             return false;
         }
@@ -1632,10 +1632,10 @@ impl CandlestickWidget {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return false;
         };
-        let steps = if delta_y > 0.0 { 1.0 } else { -1.0 };
+        let steps = if delta_y > 0.0 { px(1.0) } else { px(-1.0) };
         let old_width = self.viewport.candle_width;
         let new_width = (old_width + steps).clamp(MIN_CANDLE_WIDTH, MAX_CANDLE_WIDTH);
-        if (new_width - old_width).abs() < f32::EPSILON {
+        if (new_width - old_width).abs() < px(f32::EPSILON) {
             return false;
         }
         let candles = snapshot.candles();
@@ -1710,7 +1710,7 @@ impl CandlestickWidget {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -1980,7 +1980,7 @@ fn venue_of(config: &CandlestickConfig) -> Option<&VenueId> {
         .map(|selection| &selection.listing.route.venue)
 }
 
-fn pointer_position(event: &InputEvent) -> Option<Point> {
+fn pointer_position(event: &InputEvent) -> Option<LogicalPoint> {
     match event {
         InputEvent::PointerEnter { position, .. }
         | InputEvent::PointerMove { position, .. }

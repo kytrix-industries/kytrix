@@ -7,6 +7,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event},
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::style::StylePatch,
     text::TextStyle,
@@ -23,7 +24,7 @@ use crate::{
     theme::{components::InteractiveVariant, role::Role},
 };
 
-const CORNER_RADIUS: f32 = 4.0;
+const CORNER_RADIUS: LogicalPx = LogicalPx::new(4.0);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ButtonVariant {
@@ -41,7 +42,7 @@ pub struct Button {
     variant: ButtonVariant,
     size: UnifiedSize,
     icon: Option<IconKind>,
-    icon_size: Option<f32>,
+    icon_size: Option<LogicalPx>,
     label: Option<SmolStr>,
     a11y_label: Option<SmolStr>,
     disabled: bool,
@@ -122,7 +123,7 @@ impl Button {
     }
 
     #[must_use]
-    pub fn icon_size(mut self, size: f32) -> Self {
+    pub fn icon_size(mut self, size: LogicalPx) -> Self {
         self.icon_size = Some(size);
         self
     }
@@ -248,7 +249,7 @@ impl Button {
             .loading(self.loading)
             .selected(self.selected);
         if let Some((index, count)) = self.joined {
-            let radii = joined_edges(CORNER_RADIUS, 1.0, index, count).corner_radius;
+            let radii = joined_edges(CORNER_RADIUS, px(1.0), index, count).corner_radius;
             interactive = interactive.corner_radii(radii);
         }
         if let Some(callback) = &self.callback {
@@ -372,7 +373,7 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{ActionSource, InputEvent, Modifiers, PointerButton},
-        math::Point,
+        math::{LogicalPoint, px},
         node::{id::NodeId, tree::NodeKind},
         paint::color::{Color, ColorResolver},
         test_support::app::TestApp,
@@ -492,7 +493,7 @@ mod tests {
     fn the_size_ladder_reaches_layout_text_and_icon() {
         let harness = harness(|button| button.icon(IconKind::Check).large());
         let bounds = harness.app.probe().bounds(harness.node).expect("bounds");
-        assert_eq!(bounds.size.height, 40.0, "大号按钮高 40");
+        assert_eq!(bounds.size.height, px(40.0), "大号按钮高 40");
         let window = harness.app.window_id();
         let tree = harness.app.app().window(window).expect("window").tree();
         let children = tree.get(harness.node).expect("node").children();
@@ -536,7 +537,7 @@ mod tests {
             icon_width(|button| button
                 .icon(IconKind::ArrowsClockwise)
                 .small()
-                .icon_size(12.0)),
+                .icon_size(px(12.0))),
             12.0,
             "显式覆盖恢复旧 size_3 的 12 px"
         );
@@ -582,7 +583,7 @@ mod tests {
             })
         });
         assert_eq!(patch(&harness).interactive, Some(false));
-        let point = Point::new(
+        let point = LogicalPoint::new(
             harness
                 .app
                 .probe()
@@ -681,7 +682,7 @@ mod tests {
         });
         let window = harness.app.window_id();
         let bounds = harness.app.probe().bounds(harness.node).expect("bounds");
-        let point = Point::new(
+        let point = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -724,7 +725,11 @@ mod tests {
         second.build(app.app_mut(), window, root).expect("second");
         let record = app.drain().expect("frame").clone();
         let frame = record.frame.as_ref().expect("rendered");
-        let radii: Vec<[f32; 4]> = frame.quads.iter().map(|quad| quad.corner_radius).collect();
+        let radii: Vec<[f32; 4]> = frame
+            .quads
+            .iter()
+            .map(|quad| quad.corner_radius.map(|radius| radius.value()))
+            .collect();
         assert!(
             radii.contains(&[4.0, 0.0, 0.0, 4.0]),
             "首按钮保留左外角：{radii:?}"

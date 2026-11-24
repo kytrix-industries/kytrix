@@ -278,7 +278,7 @@ mod ui_tests {
     use ui_core::{
         event::{Action, InputEvent, Modifiers, PointerButton},
         interaction::{OverlayDismiss, OverlayOptions, OverlayPlacement},
-        math::{Point, Size},
+        math::{LogicalPoint, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::style_builder::{PaintBuilder, StyleBuilder},
         test_support::app::TestApp,
@@ -287,7 +287,7 @@ mod ui_tests {
 
     use super::{Band, Layer};
 
-    const PANEL: Size = Size::new(120.0, 80.0);
+    const PANEL: LogicalSize = LogicalSize::new(px(120.0), px(80.0));
 
     fn harness() -> (TestApp, WindowId, NodeId) {
         let app = TestApp::new();
@@ -299,7 +299,7 @@ mod ui_tests {
     fn overlay_at(
         app: &mut TestApp,
         window: WindowId,
-        origin: Point,
+        origin: LogicalPoint,
         dismiss: OverlayDismiss,
         trap_focus: bool,
     ) -> ui_core::interaction::Overlay {
@@ -355,7 +355,7 @@ mod ui_tests {
             let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
             NodeBuilder::boxed()
                 .id(key.to_owned())
-                .style(StyleBuilder::new().width(40.0).height(20.0).build())
+                .style(StyleBuilder::new().width(px(40.0)).height(px(20.0)).build())
                 .paint(
                     PaintBuilder::new()
                         .background(ui_core::paint::color::Color::BLACK)
@@ -371,15 +371,15 @@ mod ui_tests {
         (node, clicks)
     }
 
-    fn center(app: &TestApp, node: NodeId) -> Point {
+    fn center(app: &TestApp, node: NodeId) -> LogicalPoint {
         let bounds = app.probe().bounds(node).expect("节点必须有布局盒");
-        Point::new(
+        LogicalPoint::new(
             bounds.origin.x + bounds.size.width * 0.5,
             bounds.origin.y + bounds.size.height * 0.5,
         )
     }
 
-    fn click(app: &mut TestApp, at: Point) {
+    fn click(app: &mut TestApp, at: LogicalPoint) {
         let _ = app.inject(InputEvent::pointer_down(
             at,
             PointerButton::Primary,
@@ -408,14 +408,14 @@ mod ui_tests {
         let alert = overlay_at(
             &mut app,
             window,
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             OverlayDismiss::Explicit,
             true,
         );
         let dialog = overlay_at(
             &mut app,
             window,
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             OverlayDismiss::Explicit,
             true,
         );
@@ -438,7 +438,7 @@ mod ui_tests {
         );
         let tree = app.app().window(window).expect("窗口").tree();
         let hit = tree
-            .hit_test(Point::new(40.0, 40.0))
+            .hit_test(LogicalPoint::new(px(40.0), px(40.0)))
             .map(|hit| hit.node)
             .expect("重叠处必有命中");
         let mut cursor = Some(hit);
@@ -463,14 +463,14 @@ mod ui_tests {
         let first = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             false,
         );
         let second = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             false,
         );
@@ -501,14 +501,14 @@ mod ui_tests {
         let lower = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             false,
         );
         let upper = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             false,
         );
@@ -537,35 +537,35 @@ mod ui_tests {
         let alert = overlay_at(
             &mut app,
             window,
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             OverlayDismiss::Explicit,
             true,
         );
         let popup = overlay_at(
             &mut app,
             window,
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             OverlayDismiss::OutsideClick,
             false,
         );
         let dialog = overlay_at(
             &mut app,
             window,
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             OverlayDismiss::Explicit,
             true,
         );
         let submenu = overlay_at(
             &mut app,
             window,
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             OverlayDismiss::OutsideClick,
             false,
         );
         let tooltip = overlay_at(
             &mut app,
             window,
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             OverlayDismiss::Explicit,
             false,
         );
@@ -603,14 +603,14 @@ mod ui_tests {
         let lower = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             false,
         );
         let upper = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             false,
         );
@@ -632,14 +632,14 @@ mod ui_tests {
         let lower = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             true,
         );
         let upper = overlay_at(
             &mut app,
             window,
-            Point::new(5.0, 5.0),
+            LogicalPoint::new(px(5.0), px(5.0)),
             OverlayDismiss::Explicit,
             true,
         );
@@ -673,21 +673,21 @@ mod ui_tests {
         let alert = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             true,
         );
         let dialog = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             true,
         );
         let menu = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::OutsideClick,
             false,
         );
@@ -721,7 +721,7 @@ mod ui_tests {
         let popup = overlay_at(
             &mut app,
             window,
-            Point::new(300.0, 300.0),
+            LogicalPoint::new(px(300.0), px(300.0)),
             OverlayDismiss::Explicit,
             false,
         );
@@ -747,7 +747,7 @@ mod ui_tests {
         let modal = overlay_at(
             &mut app,
             window,
-            Point::new(300.0, 300.0),
+            LogicalPoint::new(px(300.0), px(300.0)),
             OverlayDismiss::Explicit,
             true,
         );
@@ -773,14 +773,14 @@ mod ui_tests {
         let alert_a = overlay_at(
             &mut app,
             window_a,
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             OverlayDismiss::Explicit,
             true,
         );
         let dialog_b = overlay_at(
             &mut app,
             window_b,
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             OverlayDismiss::Explicit,
             true,
         );
@@ -823,14 +823,14 @@ mod ui_tests {
         let first = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             true,
         );
         let second = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             true,
         );
@@ -868,7 +868,7 @@ mod ui_tests {
         let menu = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::OutsideClick,
             false,
         );
@@ -876,7 +876,7 @@ mod ui_tests {
         let dialog = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             true,
         );
@@ -888,7 +888,7 @@ mod ui_tests {
         let menu = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::OutsideClick,
             false,
         );
@@ -896,7 +896,7 @@ mod ui_tests {
         let alert = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             true,
         );
@@ -915,7 +915,7 @@ mod ui_tests {
         let first_alert = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::Explicit,
             true,
         );
@@ -923,7 +923,7 @@ mod ui_tests {
         let second_alert = overlay_at(
             &mut app,
             window,
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             OverlayDismiss::Explicit,
             true,
         );
@@ -941,7 +941,7 @@ mod ui_tests {
         let first_menu = overlay_at(
             &mut app,
             window,
-            Point::ZERO,
+            LogicalPoint::ZERO,
             OverlayDismiss::OutsideClick,
             false,
         );
@@ -949,7 +949,7 @@ mod ui_tests {
         let second_menu = overlay_at(
             &mut app,
             window,
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             OverlayDismiss::OutsideClick,
             false,
         );

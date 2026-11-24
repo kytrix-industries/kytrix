@@ -193,7 +193,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use smol_str::SmolStr;
-    use ui_core::{error::EngineError, node::builder::NodeBuilder, text::TextStyle};
+    use ui_core::{error::EngineError, math::px, node::builder::NodeBuilder, text::TextStyle};
     use widget::{
         category::WidgetCategory,
         config::WidgetConfigChange,
@@ -534,7 +534,7 @@ mod tests {
             if group == HeaderGroup::Right {
                 return Ok(());
             }
-            NodeBuilder::text(SmolStr::new_static("sound"), TextStyle::new(13.0))
+            NodeBuilder::text(SmolStr::new_static("sound"), TextStyle::new(px(13.0)))
                 .id("TEST_HEADER_CONTROL")
                 .build(cx.tree_mut(), parent)?;
             Ok(())

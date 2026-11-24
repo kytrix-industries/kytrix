@@ -10,7 +10,7 @@ use ui_core::{
     event::{Action, ActionSource},
     interaction::{ActionCtx, AnimatedValue, AnimationSpec, DragPhase, ScrollHandle},
     layout::LayoutOverride,
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -33,24 +33,24 @@ pub enum ScrollbarAxis {
 }
 
 impl ScrollbarAxis {
-    fn length(self, size: Size) -> f32 {
+    fn length(self, size: LogicalSize) -> LogicalPx {
         match self {
             Self::Vertical => size.height,
             Self::Horizontal => size.width,
         }
     }
 
-    fn component(self, point: Point) -> f32 {
+    fn component(self, point: LogicalPoint) -> LogicalPx {
         match self {
             Self::Vertical => point.y,
             Self::Horizontal => point.x,
         }
     }
 
-    fn point(self, offset: f32) -> Point {
+    fn point(self, offset: LogicalPx) -> LogicalPoint {
         match self {
-            Self::Vertical => Point::new(0.0, offset),
-            Self::Horizontal => Point::new(offset, 0.0),
+            Self::Vertical => LogicalPoint::new(LogicalPx::ZERO, offset),
+            Self::Horizontal => LogicalPoint::new(offset, LogicalPx::ZERO),
         }
     }
 }
@@ -63,18 +63,18 @@ pub enum ScrollbarMode {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollbarOptions {
-    pub thickness: f32,
-    pub corner_radius: f32,
-    pub min_thumb: f32,
+    pub thickness: LogicalPx,
+    pub corner_radius: LogicalPx,
+    pub min_thumb: LogicalPx,
     pub mode: ScrollbarMode,
 }
 
 impl Default for ScrollbarOptions {
     fn default() -> Self {
         Self {
-            thickness: 4.0,
-            corner_radius: 1.0,
-            min_thumb: 20.0,
+            thickness: px(4.0),
+            corner_radius: px(1.0),
+            min_thumb: px(20.0),
             mode: ScrollbarMode::Always,
         }
     }
@@ -88,17 +88,17 @@ impl ScrollbarOptions {
     }
 
     #[must_use]
-    pub fn thickness(mut self, thickness: f32) -> Self {
-        self.thickness = thickness.max(1.0);
+    pub fn thickness(mut self, thickness: LogicalPx) -> Self {
+        self.thickness = thickness.max(px(1.0));
         self
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct DragStart {
-    start_offset: f32,
-    max: f32,
-    usable: f32,
+    start_offset: LogicalPx,
+    max: LogicalPx,
+    usable: LogicalPx,
 }
 
 struct ScrollBarInner {
@@ -171,11 +171,15 @@ impl ScrollBar {
         let thickness = inner.options.thickness;
         let mut track_style = StyleBuilder::new().absolute();
         track_style = match inner.axis {
-            ScrollbarAxis::Vertical => track_style.top(0.0).right(0.0).bottom(0.0).width(thickness),
+            ScrollbarAxis::Vertical => track_style
+                .top(LogicalPx::ZERO)
+                .right(LogicalPx::ZERO)
+                .bottom(LogicalPx::ZERO)
+                .width(thickness),
             ScrollbarAxis::Horizontal => track_style
-                .left(0.0)
-                .right(0.0)
-                .bottom(0.0)
+                .left(LogicalPx::ZERO)
+                .right(LogicalPx::ZERO)
+                .bottom(LogicalPx::ZERO)
                 .height(thickness),
         };
         let track = NodeBuilder::boxed()
@@ -184,8 +188,18 @@ impl ScrollBar {
             .on_click(inner.track_action.clone())
             .build(tree, parent)?;
         let initial = match inner.axis {
-            ScrollbarAxis::Vertical => Rect::new(0.0, 0.0, thickness, inner.options.min_thumb),
-            ScrollbarAxis::Horizontal => Rect::new(0.0, 0.0, inner.options.min_thumb, thickness),
+            ScrollbarAxis::Vertical => LogicalRect::new(
+                LogicalPx::ZERO,
+                LogicalPx::ZERO,
+                thickness,
+                inner.options.min_thumb,
+            ),
+            ScrollbarAxis::Horizontal => LogicalRect::new(
+                LogicalPx::ZERO,
+                LogicalPx::ZERO,
+                inner.options.min_thumb,
+                thickness,
+            ),
         };
         let theme = inner.theme.clone();
         let hovered = inner.hovered;
@@ -259,7 +273,7 @@ impl ScrollBar {
     }
 
     #[must_use]
-    pub fn thumb_rect(&self, app: &App) -> Option<Rect> {
+    pub fn thumb_rect(&self, app: &App) -> Option<LogicalRect> {
         let geometry = self.inner.geometry.borrow();
         let (window, thumb) = (geometry.window?, geometry.thumb?);
         drop(geometry);
@@ -313,8 +327,8 @@ impl ScrollBar {
         let viewport = self.inner.axis.length(state.viewport);
         let content = self.inner.axis.length(state.content);
         let offset = self.inner.axis.component(state.offset);
-        let max = (content - viewport).max(0.0);
-        let scrollable = max > 0.5;
+        let max = (content - viewport).max(LogicalPx::ZERO);
+        let scrollable = max > px(0.5);
         let rect = thumb_rect(
             self.inner.axis,
             track_len,
@@ -392,12 +406,12 @@ impl ScrollBar {
                 .get(track)
                 .ok()
                 .map(|node| self.inner.axis.length(node.layout().bounds.size))
-                .unwrap_or(0.0);
+                .unwrap_or(LogicalPx::ZERO);
             (state, track_len)
         };
         let viewport = self.inner.axis.length(state.viewport);
         let content = self.inner.axis.length(state.content);
-        let max = (content - viewport).max(0.0);
+        let max = (content - viewport).max(LogicalPx::ZERO);
         let thumb_len = thumb_length(track_len, viewport, content, self.inner.options);
         let click = self.inner.axis.component(hit.local_point);
         let target_offset = track_target_offset(track_len, thumb_len, max, click);
@@ -430,12 +444,12 @@ impl ScrollBar {
                     .window(window)
                     .and_then(|target| target.tree().get(track).ok())
                     .map(|node| self.inner.axis.length(node.layout().bounds.size))
-                    .unwrap_or(0.0);
+                    .unwrap_or(LogicalPx::ZERO);
                 let viewport = self.inner.axis.length(state.viewport);
                 let content = self.inner.axis.length(state.content);
-                let max = (content - viewport).max(0.0);
+                let max = (content - viewport).max(LogicalPx::ZERO);
                 let thumb_len = thumb_length(track_len, viewport, content, self.inner.options);
-                let usable = (track_len - thumb_len).max(0.0);
+                let usable = (track_len - thumb_len).max(LogicalPx::ZERO);
                 let start = DragStart {
                     start_offset: self.inner.axis.component(state.offset),
                     max,
@@ -463,9 +477,14 @@ impl ScrollBar {
     }
 }
 
-fn thumb_length(track_len: f32, viewport: f32, content: f32, options: ScrollbarOptions) -> f32 {
-    if track_len <= 0.0 || content <= 0.0 {
-        return 0.0;
+fn thumb_length(
+    track_len: LogicalPx,
+    viewport: LogicalPx,
+    content: LogicalPx,
+    options: ScrollbarOptions,
+) -> LogicalPx {
+    if track_len <= LogicalPx::ZERO || content <= LogicalPx::ZERO {
+        return LogicalPx::ZERO;
     }
     let ratio = (viewport / content).clamp(0.0, 1.0);
     (track_len * ratio)
@@ -473,47 +492,57 @@ fn thumb_length(track_len: f32, viewport: f32, content: f32, options: ScrollbarO
         .min(track_len)
 }
 
-fn thumb_offset(track_len: f32, thumb_len: f32, offset: f32, max: f32) -> f32 {
-    let usable = (track_len - thumb_len).max(0.0);
-    if max <= 0.0 || usable <= 0.0 {
-        return 0.0;
+fn thumb_offset(
+    track_len: LogicalPx,
+    thumb_len: LogicalPx,
+    offset: LogicalPx,
+    max: LogicalPx,
+) -> LogicalPx {
+    let usable = (track_len - thumb_len).max(LogicalPx::ZERO);
+    if max <= LogicalPx::ZERO || usable <= LogicalPx::ZERO {
+        return LogicalPx::ZERO;
     }
-    (offset.clamp(0.0, max) / max * usable).clamp(0.0, usable)
+    (usable * (offset.clamp(LogicalPx::ZERO, max) / max)).clamp(LogicalPx::ZERO, usable)
 }
 
 fn thumb_rect(
     axis: ScrollbarAxis,
-    track_len: f32,
+    track_len: LogicalPx,
     options: ScrollbarOptions,
-    viewport: f32,
-    content: f32,
-    offset: f32,
-) -> Rect {
-    let max = (content - viewport).max(0.0);
+    viewport: LogicalPx,
+    content: LogicalPx,
+    offset: LogicalPx,
+) -> LogicalRect {
+    let max = (content - viewport).max(LogicalPx::ZERO);
     let len = thumb_length(track_len, viewport, content, options);
     let pos = thumb_offset(track_len, len, offset, max);
     match axis {
-        ScrollbarAxis::Vertical => Rect::new(0.0, pos, options.thickness, len),
-        ScrollbarAxis::Horizontal => Rect::new(pos, 0.0, len, options.thickness),
+        ScrollbarAxis::Vertical => LogicalRect::new(LogicalPx::ZERO, pos, options.thickness, len),
+        ScrollbarAxis::Horizontal => LogicalRect::new(pos, LogicalPx::ZERO, len, options.thickness),
     }
 }
 
-fn track_target_offset(track_len: f32, thumb_len: f32, max: f32, click: f32) -> f32 {
-    let usable = (track_len - thumb_len).max(0.0);
-    if usable <= 0.0 || max <= 0.0 {
-        return 0.0;
+fn track_target_offset(
+    track_len: LogicalPx,
+    thumb_len: LogicalPx,
+    max: LogicalPx,
+    click: LogicalPx,
+) -> LogicalPx {
+    let usable = (track_len - thumb_len).max(LogicalPx::ZERO);
+    if usable <= LogicalPx::ZERO || max <= LogicalPx::ZERO {
+        return LogicalPx::ZERO;
     }
-    ((click - thumb_len / 2.0) / usable).clamp(0.0, 1.0) * max
+    max * ((click - thumb_len / 2.0) / usable).clamp(0.0, 1.0)
 }
 
-fn drag_offset(start: f32, delta: f32, usable: f32, max: f32) -> f32 {
-    if max <= 0.0 {
-        return start.max(0.0);
+fn drag_offset(start: LogicalPx, delta: LogicalPx, usable: LogicalPx, max: LogicalPx) -> LogicalPx {
+    if max <= LogicalPx::ZERO {
+        return start.max(LogicalPx::ZERO);
     }
-    if usable <= 0.0 {
-        return start.clamp(0.0, max);
+    if usable <= LogicalPx::ZERO {
+        return start.clamp(LogicalPx::ZERO, max);
     }
-    (start + delta / usable * max).clamp(0.0, max)
+    (start + max * (delta / usable)).clamp(LogicalPx::ZERO, max)
 }
 
 fn node_in_subtree(app: &App, window: WindowId, root: NodeId, candidate: Option<NodeId>) -> bool {
@@ -533,7 +562,7 @@ fn node_in_subtree(app: &App, window: WindowId, root: NodeId, candidate: Option<
 
 #[cfg(test)]
 mod tests {
-    use ui_core::math::Rect;
+    use ui_core::math::{LogicalPx, LogicalRect, px};
 
     use super::{
         ScrollBar, ScrollbarAxis, ScrollbarMode, ScrollbarOptions, drag_offset, thumb_length,
@@ -546,31 +575,50 @@ mod tests {
 
     #[test]
     fn thumb_length_follows_the_visible_fraction_and_clamps() {
-        assert_eq!(thumb_length(200.0, 100.0, 400.0, options()), 50.0);
         assert_eq!(
-            thumb_length(200.0, 10.0, 10_000.0, options()),
-            20.0,
+            thumb_length(px(200.0), px(100.0), px(400.0), options()),
+            px(50.0)
+        );
+        assert_eq!(
+            thumb_length(px(200.0), px(10.0), px(10_000.0), options()),
+            px(20.0),
             "极长内容夹到最小长度"
         );
         assert_eq!(
-            thumb_length(10.0, 100.0, 100.0, options()),
-            10.0,
+            thumb_length(px(10.0), px(100.0), px(100.0), options()),
+            px(10.0),
             "内容不足一屏 ⇒ 滑块占满轨道"
         );
-        assert_eq!(thumb_length(0.0, 100.0, 400.0, options()), 0.0);
+        assert_eq!(
+            thumb_length(LogicalPx::ZERO, px(100.0), px(400.0), options()),
+            LogicalPx::ZERO
+        );
     }
 
     #[test]
     fn thumb_offset_maps_the_scroll_range_onto_the_track() {
-        assert_eq!(thumb_offset(200.0, 50.0, 0.0, 300.0), 0.0);
-        assert_eq!(thumb_offset(200.0, 50.0, 150.0, 300.0), 75.0);
-        assert_eq!(thumb_offset(200.0, 50.0, 300.0, 300.0), 150.0);
         assert_eq!(
-            thumb_offset(200.0, 50.0, 10_000.0, 300.0),
-            150.0,
+            thumb_offset(px(200.0), px(50.0), LogicalPx::ZERO, px(300.0)),
+            LogicalPx::ZERO
+        );
+        assert_eq!(
+            thumb_offset(px(200.0), px(50.0), px(150.0), px(300.0)),
+            px(75.0)
+        );
+        assert_eq!(
+            thumb_offset(px(200.0), px(50.0), px(300.0), px(300.0)),
+            px(150.0)
+        );
+        assert_eq!(
+            thumb_offset(px(200.0), px(50.0), px(10_000.0), px(300.0)),
+            px(150.0),
             "越界 clamp"
         );
-        assert_eq!(thumb_offset(200.0, 200.0, 10.0, 0.0), 0.0, "不可滚动");
+        assert_eq!(
+            thumb_offset(px(200.0), px(200.0), px(10.0), LogicalPx::ZERO),
+            LogicalPx::ZERO,
+            "不可滚动"
+        );
     }
 
     #[test]
@@ -578,41 +626,66 @@ mod tests {
         assert_eq!(
             thumb_rect(
                 ScrollbarAxis::Vertical,
-                200.0,
+                px(200.0),
                 options(),
-                100.0,
-                400.0,
-                200.0
+                px(100.0),
+                px(400.0),
+                px(200.0)
             ),
-            Rect::new(0.0, 100.0, 4.0, 50.0)
+            LogicalRect::new(px(0.0), px(100.0), px(4.0), px(50.0))
         );
         assert_eq!(
             thumb_rect(
                 ScrollbarAxis::Horizontal,
-                200.0,
+                px(200.0),
                 options(),
-                100.0,
-                400.0,
-                0.0
+                px(100.0),
+                px(400.0),
+                LogicalPx::ZERO
             ),
-            Rect::new(0.0, 0.0, 50.0, 4.0)
+            LogicalRect::new(px(0.0), px(0.0), px(50.0), px(4.0))
         );
     }
 
     #[test]
     fn track_click_centers_the_thumb() {
-        assert_eq!(track_target_offset(200.0, 50.0, 300.0, 100.0), 150.0);
-        assert_eq!(track_target_offset(200.0, 50.0, 300.0, 0.0), 0.0);
-        assert_eq!(track_target_offset(200.0, 50.0, 300.0, 200.0), 300.0);
-        assert_eq!(track_target_offset(200.0, 200.0, 300.0, 100.0), 0.0);
+        assert_eq!(
+            track_target_offset(px(200.0), px(50.0), px(300.0), px(100.0)),
+            px(150.0)
+        );
+        assert_eq!(
+            track_target_offset(px(200.0), px(50.0), px(300.0), LogicalPx::ZERO),
+            LogicalPx::ZERO
+        );
+        assert_eq!(
+            track_target_offset(px(200.0), px(50.0), px(300.0), px(200.0)),
+            px(300.0)
+        );
+        assert_eq!(
+            track_target_offset(px(200.0), px(200.0), px(300.0), px(100.0)),
+            LogicalPx::ZERO
+        );
     }
 
     #[test]
     fn drag_moves_by_the_track_to_content_ratio() {
-        assert_eq!(drag_offset(0.0, 75.0, 150.0, 300.0), 150.0);
-        assert_eq!(drag_offset(100.0, -150.0, 150.0, 300.0), 0.0);
-        assert_eq!(drag_offset(100.0, 10_000.0, 150.0, 300.0), 300.0);
-        assert_eq!(drag_offset(42.0, 5.0, 0.0, 0.0), 42.0, "不可拖动时保持");
+        assert_eq!(
+            drag_offset(LogicalPx::ZERO, px(75.0), px(150.0), px(300.0)),
+            px(150.0)
+        );
+        assert_eq!(
+            drag_offset(px(100.0), px(-150.0), px(150.0), px(300.0)),
+            LogicalPx::ZERO
+        );
+        assert_eq!(
+            drag_offset(px(100.0), px(10_000.0), px(150.0), px(300.0)),
+            px(300.0)
+        );
+        assert_eq!(
+            drag_offset(px(42.0), px(5.0), LogicalPx::ZERO, LogicalPx::ZERO),
+            px(42.0),
+            "不可拖动时保持"
+        );
     }
 
     #[test]
@@ -673,7 +746,7 @@ mod ui_tests {
     use ui_core::{
         event::{InputEvent, Modifiers, PointerButton},
         interaction::{ScrollConfig, ScrollHandle},
-        math::Size,
+        math::{LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
@@ -705,8 +778,8 @@ mod ui_tests {
                 .style(
                     StyleBuilder::new()
                         .relative()
-                        .width(BOX_WIDTH)
-                        .height(BOX_HEIGHT)
+                        .width(px(BOX_WIDTH))
+                        .height(px(BOX_HEIGHT))
                         .overflow_hidden()
                         .build(),
                 )
@@ -718,7 +791,7 @@ mod ui_tests {
             .make_scroll(window, container, ScrollConfig::default())
             .expect("scrollable");
         app.app_mut()
-            .set_scroll_content(&handle, Size::new(BOX_WIDTH, CONTENT_HEIGHT))
+            .set_scroll_content(&handle, LogicalSize::new(px(BOX_WIDTH), px(CONTENT_HEIGHT)))
             .expect("content");
         let options = ScrollbarOptions {
             mode,
@@ -755,14 +828,14 @@ mod ui_tests {
         let _ = harness.app.drain().expect("frame");
     }
 
-    fn thumb_bounds(harness: &ScrollHarness) -> ui_core::math::Rect {
+    fn thumb_bounds(harness: &ScrollHarness) -> ui_core::math::LogicalRect {
         let track = harness.bar.nodes().0.expect("track node");
         let track_bounds = harness.app.probe().bounds(track).expect("track bounds");
         let rect = harness
             .bar
             .thumb_rect(harness.app.app())
             .expect("thumb rect");
-        ui_core::math::Rect::new(
+        ui_core::math::LogicalRect::new(
             track_bounds.origin.x + rect.origin.x,
             track_bounds.origin.y + rect.origin.y,
             rect.size.width,
@@ -774,7 +847,10 @@ mod ui_tests {
         harness
             .app
             .app_mut()
-            .scroll_to(&harness.handle, ui_core::math::Point::new(0.0, offset))
+            .scroll_to(
+                &harness.handle,
+                ui_core::math::LogicalPoint::new(px(0.0), px(offset)),
+            )
             .expect("scroll");
         let _ = harness.app.drain().expect("frame");
         let _ = harness.bar.sync(harness.app.app_mut()).expect("sync");
@@ -788,8 +864,8 @@ mod ui_tests {
             .bar
             .thumb_rect(harness.app.app())
             .expect("thumb rect");
-        assert!((rect.size.height - 25.0).abs() < 0.5, "{rect:?}");
-        assert_eq!(rect.origin.y, 0.0);
+        assert!((rect.size.height - 25.0).abs() < px(0.5), "{rect:?}");
+        assert_eq!(rect.origin.y, px(0.0));
         assert!(harness.bar.scrollable(harness.app.app()));
 
         scroll_to(&mut harness, 150.0);
@@ -797,7 +873,7 @@ mod ui_tests {
             .bar
             .thumb_rect(harness.app.app())
             .expect("thumb rect");
-        assert!((rect.origin.y - 37.5).abs() < 0.5, "{rect:?}");
+        assert!((rect.origin.y - 37.5).abs() < px(0.5), "{rect:?}");
     }
 
     #[test]
@@ -807,7 +883,7 @@ mod ui_tests {
         let (track, _) = harness.bar.nodes();
         let track = track.expect("track");
         let bounds = harness.app.probe().bounds(track).expect("track bounds");
-        let inside = ui_core::math::Point::new(
+        let inside = ui_core::math::LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -821,7 +897,7 @@ mod ui_tests {
             "悬停后滑块淡入到 1"
         );
 
-        let outside = ui_core::math::Point::new(bounds.origin.x - 60.0, bounds.origin.y);
+        let outside = ui_core::math::LogicalPoint::new(bounds.origin.x - 60.0, bounds.origin.y);
         let _ = harness
             .app
             .inject(InputEvent::pointer_move(outside, Modifiers::empty()));
@@ -839,7 +915,7 @@ mod ui_tests {
         let (track, _) = harness.bar.nodes();
         let track = track.expect("track");
         let bounds = harness.app.probe().bounds(track).expect("track bounds");
-        let inside = ui_core::math::Point::new(
+        let inside = ui_core::math::LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -867,7 +943,7 @@ mod ui_tests {
             "120 ms 规格内到达 1（128 ms 实际 {opacity}）"
         );
 
-        let outside = ui_core::math::Point::new(bounds.origin.x - 60.0, bounds.origin.y);
+        let outside = ui_core::math::LogicalPoint::new(bounds.origin.x - 60.0, bounds.origin.y);
         let _ = harness
             .app
             .inject(InputEvent::pointer_move(outside, Modifiers::empty()));
@@ -896,7 +972,7 @@ mod ui_tests {
         let (track, _) = harness.bar.nodes();
         let track = track.expect("track");
         let bounds = harness.app.probe().bounds(track).expect("track bounds");
-        let inside = ui_core::math::Point::new(
+        let inside = ui_core::math::LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -933,7 +1009,7 @@ mod ui_tests {
     fn dragging_the_thumb_scrolls_proportionally() {
         let mut harness = harness(ScrollbarMode::Always);
         let thumb = thumb_bounds(&harness);
-        let origin = ui_core::math::Point::new(
+        let origin = ui_core::math::LogicalPoint::new(
             thumb.origin.x + thumb.size.width / 2.0,
             thumb.origin.y + thumb.size.height / 2.0,
         );
@@ -942,11 +1018,11 @@ mod ui_tests {
             PointerButton::Primary,
             Modifiers::empty(),
         ));
-        let promoted = ui_core::math::Point::new(origin.x, origin.y + 10.0);
+        let promoted = ui_core::math::LogicalPoint::new(origin.x, origin.y + 10.0);
         let _ = harness
             .app
             .inject(InputEvent::pointer_move(promoted, Modifiers::empty()));
-        let moved = ui_core::math::Point::new(origin.x, origin.y + 30.0);
+        let moved = ui_core::math::LogicalPoint::new(origin.x, origin.y + 30.0);
         let _ = harness
             .app
             .inject(InputEvent::pointer_move(moved, Modifiers::empty()));
@@ -962,7 +1038,10 @@ mod ui_tests {
             .expect("state")
             .offset
             .y;
-        assert!((offset - 120.0).abs() < 0.5, "拖拽换算后的偏移：{offset}");
+        assert!(
+            (offset - 120.0).abs() < px(0.5),
+            "拖拽换算后的偏移：{offset}"
+        );
     }
 
     #[test]
@@ -971,7 +1050,7 @@ mod ui_tests {
         let (track, _) = harness.bar.nodes();
         let track = track.expect("track");
         let bounds = harness.app.probe().bounds(track).expect("track bounds");
-        let point = ui_core::math::Point::new(
+        let point = ui_core::math::LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height * 0.75,
         );
@@ -992,7 +1071,7 @@ mod ui_tests {
             .expect("state")
             .offset
             .y;
-        assert!(offset > 150.0, "点击轨道下部后偏移过半：{offset}");
+        assert!(offset > px(150.0), "点击轨道下部后偏移过半：{offset}");
     }
 
     #[test]
@@ -1013,7 +1092,7 @@ mod ui_tests {
         let (track, _) = harness.bar.nodes();
         let track = track.expect("track");
         let bounds = harness.app.probe().bounds(track).expect("track bounds");
-        let point = ui_core::math::Point::new(
+        let point = ui_core::math::LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height * 0.75,
         );

@@ -3,7 +3,7 @@ use market_participants_model::{
     listing::rules::ListingPrecision,
 };
 use smol_str::SmolStr;
-use ui_core::math::{Point, Rect};
+use ui_core::math::{LogicalPoint, LogicalRect, px};
 
 use super::{
     axes::{AxisScale, ChartLayout, bar_domain, line_domain, ratio_domain, share_scale},
@@ -19,7 +19,11 @@ use crate::model::{LongShortRatioPoint, OpenInterestPoint, TakerVolumePoint, rat
 const SHARE_TICKS: [(f64, &str); 2] = [(0.0, "0%"), (1.0, "100%")];
 
 fn layout() -> ChartLayout {
-    ChartLayout::new(Rect::new(0.0, 0.0, 640.0, 360.0), Some(60.0), 60.0)
+    ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(640.0), px(360.0)),
+        Some(px(60.0)),
+        px(60.0),
+    )
 }
 
 fn quantity(value: u64) -> Quantity {
@@ -162,7 +166,7 @@ fn a_taker_volume_frame_should_prepare_one_pair_of_bars_per_interval() {
     assert_eq!(bars.len(), 2);
     assert!(
         bars.iter()
-            .all(|(buy, sell)| buy.size.width > 0.0 && sell.size.width > 0.0)
+            .all(|(buy, sell)| buy.size.width > px(0.0) && sell.size.width > px(0.0))
     );
 }
 
@@ -218,7 +222,7 @@ fn a_hover_should_mark_every_series_at_its_own_reading() {
     ];
     let hover = Hover {
         index: 0,
-        cursor_y: 100.0,
+        cursor_y: px(100.0),
     };
     let markers = hover_markers(
         &frame(layout, (Some(&amount), &value), &legend),
@@ -252,7 +256,7 @@ fn a_hover_should_mark_no_point_of_a_paired_bar_chart() {
         &prepared,
         Hover {
             index: 0,
-            cursor_y: 100.0,
+            cursor_y: px(100.0),
         },
     );
 
@@ -272,7 +276,7 @@ fn a_hover_should_mark_the_ratio_reading_of_a_share_chart() {
         &prepared,
         Hover {
             index: 0,
-            cursor_y: 100.0,
+            cursor_y: px(100.0),
         },
     );
 
@@ -282,29 +286,32 @@ fn a_hover_should_mark_the_ratio_reading_of_a_share_chart() {
 
 #[test]
 fn the_line_mesh_should_refuse_an_empty_frame() {
-    assert!(line_geometry_mesh(&[], 2.0).is_none());
-    assert!(line_geometry_mesh(&[None, None], 2.0).is_none());
+    assert!(line_geometry_mesh(&[], px(2.0)).is_none());
+    assert!(line_geometry_mesh(&[None, None], px(2.0)).is_none());
 }
 
 #[test]
 fn the_line_mesh_should_cover_every_segment_and_joint() {
     let points = [
-        Point::new(10.0, 10.0),
-        Point::new(20.0, 30.0),
-        Point::new(30.0, 20.0),
+        LogicalPoint::new(px(10.0), px(10.0)),
+        LogicalPoint::new(px(20.0), px(30.0)),
+        LogicalPoint::new(px(30.0), px(20.0)),
     ];
-    let desc = line_geometry_mesh(&points.map(Some), 2.0).expect("three points make a mesh");
+    let desc = line_geometry_mesh(&points.map(Some), px(2.0)).expect("three points make a mesh");
 
     assert_eq!(desc.vertex_bytes.len(), 5 * 4 * 12);
     assert_eq!(desc.index_bytes.len(), 5 * 6 * 4);
-    assert!(desc.bounds.size.width > 20.0);
-    assert!(desc.bounds.size.height > 20.0);
+    assert!(desc.bounds.size.width > px(20.0));
+    assert!(desc.bounds.size.height > px(20.0));
 }
 
 #[test]
 fn the_line_mesh_should_skip_a_repeated_point() {
-    let points = [Point::new(10.0, 10.0), Point::new(10.0, 10.0)];
-    let desc = line_geometry_mesh(&points.map(Some), 2.0).expect("a dot still draws");
+    let points = [
+        LogicalPoint::new(px(10.0), px(10.0)),
+        LogicalPoint::new(px(10.0), px(10.0)),
+    ];
+    let desc = line_geometry_mesh(&points.map(Some), px(2.0)).expect("a dot still draws");
 
     assert_eq!(
         desc.vertex_bytes.len(),
@@ -343,24 +350,27 @@ fn a_tooltip_should_be_sized_from_the_component_ladder() {
 
     assert_eq!(style.font_size, theme.tokens().small.font_size);
     assert!(style.line_height > style.font_size);
-    assert!(style.padding > 0.0 && style.radius > 0.0);
+    assert!(style.padding > px(0.0) && style.radius > px(0.0));
     assert_eq!(
-        style.content_size(100.0, 1).width,
-        100.0 + style.padding * 2.0
+        style.content_size(px(100.0), 1).width,
+        px(100.0) + style.padding * 2.0
     );
 }
 
 #[test]
 fn a_tooltip_should_grow_with_its_lines() {
     let style = TooltipStyle {
-        font_size: 12.0,
-        line_height: 16.0,
-        padding: 4.0,
-        radius: 4.0,
+        font_size: px(12.0),
+        line_height: px(16.0),
+        padding: px(4.0),
+        radius: px(4.0),
     };
 
-    assert_eq!(style.content_size(100.0, 2).height, 2.0 * 16.0 + 8.0);
-    assert_eq!(style.content_size(100.0, 2).width, 108.0);
+    assert_eq!(
+        style.content_size(px(100.0), 2).height,
+        px(2.0 * 16.0 + 8.0)
+    );
+    assert_eq!(style.content_size(px(100.0), 2).width, px(108.0));
 }
 
 #[test]
@@ -400,8 +410,11 @@ fn a_prepared_frame_should_count_the_points_it_was_built_from() {
         Prepared::Shares {
             bars: Box::default(),
             line: None,
-            markers: vec![Rect::new(0.0, 0.0, 1.0, 1.0), Rect::new(0.0, 0.0, 1.0, 1.0)]
-                .into_boxed_slice(),
+            markers: vec![
+                LogicalRect::new(px(0.0), px(0.0), px(1.0), px(1.0)),
+                LogicalRect::new(px(0.0), px(0.0), px(1.0), px(1.0))
+            ]
+            .into_boxed_slice(),
             ticks: Box::default(),
         }
         .point_count(),

@@ -12,6 +12,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event, KeyBinding, KeyCode, Modifiers},
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -34,7 +35,7 @@ use crate::{
         interactive::{Interactive, mount_dynamic_icon},
         layer::{Band, Layer},
         menu::{
-            IconCache, ItemPanel, ItemPanelOptions, PanelContent, PanelMeasure, PanelRoles,
+            IconSnapshot, ItemPanel, ItemPanelOptions, PanelContent, PanelMeasure, PanelRoles,
             PanelRow, PanelWidth, build_icon_slot,
         },
         overlay::{Anchor, AnimationRouter, OverlayError, Placement},
@@ -43,9 +44,9 @@ use crate::{
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 
-const TAG_RADIUS: f32 = 4.0;
-const TAG_GAP: f32 = 4.0;
-const CHECK_COLUMN: f32 = 14.0;
+const TAG_RADIUS: LogicalPx = LogicalPx::new(4.0);
+const TAG_GAP: LogicalPx = LogicalPx::new(4.0);
+const CHECK_COLUMN: LogicalPx = LogicalPx::new(14.0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectItem {
@@ -83,10 +84,10 @@ impl SelectItem {
 pub struct SelectOptions {
     pub size: UnifiedSize,
     pub variant: InteractiveVariant,
-    pub width: Option<f32>,
-    pub max_height: f32,
+    pub width: Option<LogicalPx>,
+    pub max_height: LogicalPx,
     pub placement: Placement,
-    pub gap: f32,
+    pub gap: LogicalPx,
     pub label: Option<SmolStr>,
     pub placeholder: SmolStr,
     pub multiple: bool,
@@ -100,9 +101,9 @@ impl Default for SelectOptions {
             size: UnifiedSize::Medium,
             variant: InteractiveVariant::Outline,
             width: None,
-            max_height: 320.0,
+            max_height: px(320.0),
             placement: Placement::BOTTOM_START,
-            gap: 4.0,
+            gap: px(4.0),
             label: None,
             placeholder: SmolStr::new_static("Select…"),
             multiple: false,
@@ -126,13 +127,13 @@ impl SelectOptions {
     }
 
     #[must_use]
-    pub fn width(mut self, width: f32) -> Self {
+    pub fn width(mut self, width: LogicalPx) -> Self {
         self.width = Some(width);
         self
     }
 
     #[must_use]
-    pub fn max_height(mut self, max_height: f32) -> Self {
+    pub fn max_height(mut self, max_height: LogicalPx) -> Self {
         self.max_height = max_height;
         self
     }
@@ -183,7 +184,7 @@ pub struct Select {
 struct SelectState {
     window: Option<WindowId>,
     trigger: Option<NodeId>,
-    trigger_width: f32,
+    trigger_width: LogicalPx,
     tags_written: Vec<usize>,
     slots: Vec<Option<NodeId>>,
     overflow: Option<NodeId>,
@@ -205,7 +206,7 @@ struct SelectInner {
     scope: SignalScope,
     trigger: Interactive,
     panel: ItemPanel,
-    icons: IconCache,
+    icons: RefCell<IconSnapshot>,
     items: Rc<RefCell<Rc<Vec<SelectItem>>>>,
     revision: Signal<u64>,
     chosen: Signal<Vec<usize>>,
@@ -282,7 +283,7 @@ impl Select {
             scope,
             trigger,
             panel,
-            icons: IconCache::default(),
+            icons: RefCell::new(IconSnapshot::default()),
             items: Rc::new(RefCell::new(Rc::new(Vec::new()))),
             revision: app.signal_scoped(scope, 0u64),
             chosen: app.signal_scoped(scope, Vec::new()),
@@ -449,17 +450,15 @@ impl Select {
         let clear_action = self.inner.actions.clear.clone();
         let trigger_watch = trigger.clone();
         let current_icon = self.selected_icon(app);
-        self.inner.icons.resolve(
-            app,
-            window,
-            current_icon.unwrap_or(IconKind::X),
-            size.icon_size(),
-        )?;
+        self.inner
+            .icons
+            .borrow_mut()
+            .resolve(app, window, current_icon.unwrap_or(IconKind::X))?;
         let icon_resource = self
             .inner
             .icons
-            .snapshot()
-            .get(current_icon.unwrap_or(IconKind::X), size.icon_size())
+            .borrow()
+            .get(current_icon.unwrap_or(IconKind::X))
             .ok_or(EngineError::UnknownWindow { window })?;
         let icon_slot = Rc::new(Cell::new(None));
         let icon_slot_inner = icon_slot.clone();
@@ -467,7 +466,7 @@ impl Select {
             let side = if current_icon.is_some() {
                 size.icon_size()
             } else {
-                0.0
+                LogicalPx::ZERO
             };
             let theme_icon = theme.clone();
             let icon = NodeBuilder::image(icon_resource, ImageFit::Fill)
@@ -739,7 +738,7 @@ impl Select {
             .inner
             .options
             .width
-            .unwrap_or_else(|| self.inner.state.borrow().trigger_width.max(1.0));
+            .unwrap_or_else(|| self.inner.state.borrow().trigger_width.max(px(1.0)));
         self.inner
             .panel
             .set_content(app, self.panel_content(app))
@@ -776,7 +775,7 @@ impl Select {
         if self.is_open(app) {
             self.measure_trigger(app);
             if self.inner.options.width.is_none() {
-                let width = self.inner.state.borrow().trigger_width.max(1.0);
+                let width = self.inner.state.borrow().trigger_width.max(px(1.0));
                 self.inner.panel.resize(app, width)?;
             }
         }
@@ -815,7 +814,7 @@ impl Select {
         let size = self.inner.options.size;
         let chosen = self.inner.chosen;
         let labels: Vec<SmolStr> = items.iter().map(|item| item.label.clone()).collect();
-        let icons = Rc::new(self.inner.icons.snapshot());
+        let icons = Rc::new(self.inner.icons.borrow().clone());
         let items_build = items.clone();
         let has_icon = items.iter().any(|item| item.icon.is_some());
         let build: Rc<dyn Fn(&mut NodeTree, NodeId, usize) -> Result<(), EngineError>> = {
@@ -872,7 +871,12 @@ impl Select {
                     ..A11yPatch::default()
                 },
             });
-        let extra = CHECK_COLUMN + if has_icon { size.icon_size() } else { 0.0 };
+        let extra = CHECK_COLUMN
+            + if has_icon {
+                size.icon_size()
+            } else {
+                LogicalPx::ZERO
+            };
         let measure = Some(PanelMeasure { labels, extra });
         PanelContent {
             rows,
@@ -999,14 +1003,13 @@ impl Select {
     }
 
     fn resolve_icons(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
-        let size = self.inner.options.size.icon_size();
         let items = self.inner.items.borrow().clone();
         let mut kinds: Vec<IconKind> = items.iter().filter_map(|item| item.icon).collect();
         kinds.extend(self.selected_icon(app));
         kinds.sort_unstable();
         kinds.dedup();
         for kind in kinds {
-            self.inner.icons.resolve(app, window, kind, size)?;
+            self.inner.icons.borrow_mut().resolve(app, window, kind)?;
         }
         Ok(())
     }
@@ -1028,14 +1031,18 @@ impl Select {
         let size = self.inner.options.size.icon_size();
         let mut changed = false;
         if let Some(kind) = desired {
-            self.inner.icons.resolve(app, window, kind, size)?;
+            self.inner.icons.borrow_mut().resolve(app, window, kind)?;
             changed = true;
         }
-        let resource = desired.and_then(|kind| self.inner.icons.snapshot().get(kind, size));
+        let resource = desired.and_then(|kind| self.inner.icons.borrow().get(kind));
         if let Some(target) = app.window_mut(window) {
             if let Ok(current) = target.tree().get(node) {
                 let mut style = current.style().clone();
-                let side = if desired.is_some() { size } else { 0.0 };
+                let side = if desired.is_some() {
+                    size
+                } else {
+                    LogicalPx::ZERO
+                };
                 style.size_length(side, side);
                 let _ = target.tree_mut().set_style(node, style);
             }
@@ -1170,7 +1177,7 @@ fn build_tag_chip(
         items,
         key,
     } = chip;
-    let chip_height = (size.h() - 8.0).max(16.0);
+    let chip_height = (size.h() - 8.0).max(px(16.0));
     let theme_chip = theme.clone();
     let tree = app
         .window_mut(window)
@@ -1184,7 +1191,7 @@ fn build_tag_chip(
                 .items_center()
                 .height(chip_height)
                 .padding_x(size.px() / 2.0)
-                .border(1.0)
+                .border(px(1.0))
                 .build(),
         ))
         .paint(PaintBuilder::new().rounded(TAG_RADIUS).build())
@@ -1192,7 +1199,7 @@ fn build_tag_chip(
             background: Some(theme_chip.role(cx, Role::SurfaceControl)),
             foreground: Some(theme_chip.role(cx, Role::FgDefault)),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: theme_chip.role(cx, Role::LineBorder),
             }),
             ..StylePatch::default()
@@ -1247,14 +1254,13 @@ impl fmt::Debug for Select {
 
 #[cfg(test)]
 mod tests {
-
     use std::{cell::RefCell, rc::Rc, time::Duration};
 
     use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
         a11y::A11yRole,
         event::{Action, Event, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
         test_support::{app::TestApp, diagnostics::signal_slot_stats},
         window::WindowId,
@@ -1288,7 +1294,7 @@ mod tests {
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
             NodeBuilder::boxed()
                 .id("background")
-                .layout_override(Rect::new(620.0, 520.0, 80.0, 40.0))
+                .layout_override(LogicalRect::new(px(620.0), px(520.0), px(80.0), px(40.0)))
                 .on_click(Action::Custom(SmolStr::new_static("background.click")))
                 .build(
                     app.app_mut().window_mut(window).expect("窗口").tree_mut(),
@@ -1360,7 +1366,7 @@ mod tests {
             self.settle(select);
         }
 
-        fn click(&mut self, select: &Select, at: Point) {
+        fn click(&mut self, select: &Select, at: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 at,
                 PointerButton::Primary,
@@ -1374,13 +1380,13 @@ mod tests {
             self.settle(select);
         }
 
-        fn bounds(&self, node: NodeId) -> Rect {
+        fn bounds(&self, node: NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("布局盒")
         }
 
-        fn center(&self, node: NodeId) -> Point {
+        fn center(&self, node: NodeId) -> LogicalPoint {
             let bounds = self.bounds(node);
-            Point::new(
+            LogicalPoint::new(
                 bounds.origin.x + bounds.size.width / 2.0,
                 bounds.origin.y + bounds.size.height / 2.0,
             )
@@ -1428,7 +1434,7 @@ mod tests {
             count
         }
 
-        fn row_center(&self, index: usize) -> Point {
+        fn row_center(&self, index: usize) -> LogicalPoint {
             self.center(self.row(index))
         }
 
@@ -1645,7 +1651,7 @@ mod tests {
         );
 
         harness.click(&select, harness.center(trigger));
-        harness.click(&select, Point::new(10.0, 10.0));
+        harness.click(&select, LogicalPoint::new(px(10.0), px(10.0)));
         assert!(!select.is_open(harness.app.app()), "点击外部关闭");
     }
 
@@ -1828,7 +1834,7 @@ mod tests {
     #[test]
     fn an_explicit_width_stays_exact_for_long_items() {
         let mut harness = Harness::new();
-        let select = harness.select(SelectOptions::default().width(120.0));
+        let select = harness.select(SelectOptions::default().width(px(120.0)));
         harness.mount(
             &select,
             vec![
@@ -1843,13 +1849,13 @@ mod tests {
         harness.click(&select, harness.center(trigger));
         let panel = harness.bounds(select.panel_node().expect("面板"));
         assert!(
-            (panel.size.width - 120.0).abs() < 0.5,
+            (panel.size.width - 120.0).abs() < px(0.5),
             "显式宽度精确生效、不随长条目增长：{}",
             panel.size.width
         );
         let row = harness.bounds(harness.row(0));
         assert!(
-            row.size.width <= 120.0 - 8.0 + 0.5,
+            row.size.width <= px(120.0 - 8.0 + 0.5),
             "长条目被面板宽度约束（截断 / 换行）：行宽 {}",
             row.size.width
         );
@@ -1884,7 +1890,7 @@ mod tests {
             .width;
 
         assert!(
-            (one_line - two_lines).abs() < 0.5,
+            (one_line - two_lines).abs() < px(0.5),
             "换行 label 按最宽行量宽（与单行同宽）：单行 {one_line} / 换行 {two_lines}"
         );
     }

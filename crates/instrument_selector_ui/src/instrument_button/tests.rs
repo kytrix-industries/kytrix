@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use market_participants_connector::catalog::test_support;
 use market_participants_model::routing::CapabilityId;
-use ui_core::math::Point;
+use ui_core::math::LogicalPoint;
 
 use super::*;
 use crate::{
@@ -254,7 +254,7 @@ fn a_click_opens_the_selector_only_when_the_control_is_live() {
     };
     live.drain();
     let bounds = live.bounds(node).expect("the control is laid out");
-    let centre = Point::new(
+    let centre = LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     );
@@ -285,7 +285,7 @@ fn a_click_opens_the_selector_only_when_the_control_is_live() {
     };
     disabled.drain();
     let bounds = disabled.bounds(node).expect("the control is laid out");
-    let centre = Point::new(
+    let centre = LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     );

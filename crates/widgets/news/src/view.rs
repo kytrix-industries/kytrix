@@ -8,6 +8,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     a11y::A11yPatch,
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle},
@@ -50,7 +51,7 @@ use super::{
     sound::{NotificationSound, SilentSound, Throttle},
 };
 
-const ROW_ESTIMATE: f32 = 76.0;
+const ROW_ESTIMATE: LogicalPx = LogicalPx::new(76.0);
 
 const ROW_TEXT_SIZE: UnifiedSize = UnifiedSize::Medium;
 
@@ -642,10 +643,10 @@ impl NewsWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
@@ -836,10 +837,10 @@ fn build_row(
         .style(
             StyleBuilder::new()
                 .flex_col()
-                .gap(8.0)
+                .gap(px(8.0))
                 .width_full()
                 .min_width_0()
-                .padding(8.0)
+                .padding(px(8.0))
                 .build(),
         )
         .build(tree, row)?;
@@ -850,7 +851,7 @@ fn build_row(
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .gap(8.0)
+                .gap(px(8.0))
                 .width_full()
                 .min_width_0()
                 .build(),
@@ -861,7 +862,7 @@ fn build_row(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(8.0)
+                .gap(px(8.0))
                 .flex_1()
                 .min_width_0()
                 .build(),
@@ -2458,7 +2459,7 @@ mod tests {
             assert_eq!(list.count(harness.app()), 1);
             assert!(
                 list.offset(harness.app())
-                    .is_some_and(|offset| offset.abs() < 0.5),
+                    .is_some_and(|offset| offset.abs() < px(0.5)),
                 "the reader is on the newest report the pane opened with"
             );
         }
@@ -2481,7 +2482,7 @@ mod tests {
         );
         assert!(
             list.offset(harness.app())
-                .is_some_and(|offset| offset.abs() < 0.5),
+                .is_some_and(|offset| offset.abs() < px(0.5)),
             "a reader on the newest report keeps their place when one arrives"
         );
         let text = harness.text_of(body);

@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 use ui_core::{
     app::App,
     event::{InputEvent, Modifiers, PointerButton},
-    math::{Point, Size},
+    math::{LogicalPoint, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
@@ -231,7 +231,7 @@ impl Harness {
 
     pub(crate) fn with_venues(venues: Vec<VenueId>) -> Self {
         let mut app = TestApp::with_options(WindowOptions {
-            size: Size::new(1280.0, 900.0),
+            size: LogicalSize::new(px(1280.0), px(900.0)),
             ..WindowOptions::default()
         });
         let runtime = app.app().runtime_handle().clone();
@@ -331,7 +331,7 @@ impl Harness {
         }
     }
 
-    pub(crate) fn bounds(&self, node: NodeId) -> Option<ui_core::math::Rect> {
+    pub(crate) fn bounds(&self, node: NodeId) -> Option<ui_core::math::LogicalRect> {
         self.app.probe().bounds(node)
     }
 
@@ -360,7 +360,7 @@ impl Harness {
         self.click(node);
     }
 
-    pub(crate) fn click_point(&mut self, position: Point) {
+    pub(crate) fn click_point(&mut self, position: LogicalPoint) {
         self.app.inject(InputEvent::pointer_down(
             position,
             PointerButton::Primary,
@@ -509,8 +509,8 @@ impl Harness {
     }
 }
 
-fn centre_of(rect: ui_core::math::Rect) -> Point {
-    Point {
+fn centre_of(rect: ui_core::math::LogicalRect) -> LogicalPoint {
+    LogicalPoint {
         x: rect.origin.x + rect.size.width / 2.0,
         y: rect.origin.y + rect.size.height / 2.0,
     }

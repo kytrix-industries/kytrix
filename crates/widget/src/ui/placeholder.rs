@@ -6,6 +6,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::Event,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::style::StylePatch,
     text::TextStyle,
@@ -26,7 +27,7 @@ use crate::{
 };
 
 const PLACEHOLDER_TEXT_SIZE: f32 = 13.0;
-const SPINNER_SIZE: f32 = 18.0;
+const SPINNER_SIZE: LogicalPx = LogicalPx::new(18.0);
 
 struct EmbeddedAssets;
 
@@ -62,7 +63,7 @@ impl Placeholder {
 
         if let Some(label) = label {
             let theme = cx.theme().clone();
-            NodeBuilder::text(label, TextStyle::new(PLACEHOLDER_TEXT_SIZE))
+            NodeBuilder::text(label, TextStyle::new(px(PLACEHOLDER_TEXT_SIZE)))
                 .bind_style(move |read| StylePatch {
                     foreground: Some(theme.role(read, Role::FgMuted)),
                     ..StylePatch::default()
@@ -160,16 +161,19 @@ pub(crate) fn failure_text(
     let theme = cx.theme().clone();
     let failure = failure.clone();
 
-    NodeBuilder::text(SmolStr::default(), TextStyle::new(PLACEHOLDER_TEXT_SIZE))
-        .bind_text(move |read| {
-            let _language: ui_core::node::signal::SignalRef<LanguageCode> = read.read(&language);
-            failure.text(&translate)
-        })
-        .bind_style(move |read| StylePatch {
-            foreground: Some(theme.role(read, Role::StatusDangerBase)),
-            ..StylePatch::default()
-        })
-        .build(cx.tree_mut(), parent)
+    NodeBuilder::text(
+        SmolStr::default(),
+        TextStyle::new(px(PLACEHOLDER_TEXT_SIZE)),
+    )
+    .bind_text(move |read| {
+        let _language: ui_core::node::signal::SignalRef<LanguageCode> = read.read(&language);
+        failure.text(&translate)
+    })
+    .bind_style(move |read| StylePatch {
+        foreground: Some(theme.role(read, Role::StatusDangerBase)),
+        ..StylePatch::default()
+    })
+    .build(cx.tree_mut(), parent)
 }
 
 pub(crate) fn recovery_button(

@@ -1,6 +1,7 @@
 use smol_str::SmolStr;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
+    math::px,
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         color::Color,
@@ -155,17 +156,17 @@ impl Badge {
                     .gap(size.gap())
                     .padding_x(size.px())
                     .height(size.h())
-                    .border(1.0)
+                    .border(px(1.0))
                     .build(),
             )
-            .paint(PaintBuilder::new().rounded(4.0).build())
+            .paint(PaintBuilder::new().rounded(px(4.0)).build())
             .bind_style(move |cx| {
                 let (background, foreground, border) = badge_colors(cx, &theme, color, shape);
                 StylePatch {
                     background: Some(background),
                     foreground: Some(foreground),
                     border: Some(Border {
-                        width: 1.0,
+                        width: px(1.0),
                         color: border,
                     }),
                     ..StylePatch::default()
@@ -289,6 +290,7 @@ fn status_roles(color: BadgeColor) -> (Role, Role, Role) {
 mod tests {
     use ui_core::{
         a11y::A11yRole,
+        math::px,
         node::{id::NodeId, tree::NodeKind},
         paint::color::ColorResolver,
         test_support::app::TestApp,
@@ -440,9 +442,9 @@ mod tests {
     fn the_size_ladder_reaches_the_layout() {
         let harness = harness(|badge| badge.text("x").small());
         let bounds = harness.app.probe().bounds(harness.node).expect("bounds");
-        assert_eq!(bounds.size.height, 20.0);
+        assert_eq!(bounds.size.height, px(20.0));
         assert!(
-            (bounds.size.width - 4.0 - 4.0).abs() > -1.0,
+            (bounds.size.width - 4.0 - 4.0).abs() > px(-1.0),
             "宽度至少是内边距之和（实际 {}）",
             bounds.size.width
         );

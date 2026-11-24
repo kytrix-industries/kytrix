@@ -15,6 +15,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event, InputEvent},
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -33,7 +34,7 @@ use ui_kit::{
         badge::Badge,
         button::Button,
         dialog::{Dialog, DialogBuilder, DialogClose, DialogError},
-        icon::{IconKind, svg},
+        icon::{ICON_INTRINSIC_SIZE, IconKind, svg},
         input::{self, InputNode, InputSpec, InputState},
         list::{List, ListOptions, SelectionMode},
         overlay::OverlayError,
@@ -58,7 +59,7 @@ const MESSAGE_WIDTH: f32 = 420.0;
 
 const ROW_AVATAR_SIZE: f32 = 42.0;
 
-const ROW_HEIGHT: f32 = 72.0;
+const ROW_HEIGHT: LogicalPx = px(72.0);
 
 const VERIFIED_ICON_SIZE: f32 = 12.0;
 
@@ -478,17 +479,13 @@ impl DialogState {
 
     fn create_kit(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let verified = {
-            let (window, scale) = {
-                let window = cx.window_mut();
-                (window.id(), window.scale().factor())
-            };
-            let image = cx.app_mut().resources_mut().insert_owned_svg_for_display(
+            let window = cx.window();
+            let image = cx.app_mut().insert_svg_for_window(
                 window,
                 svg(IconKind::CheckCircle).as_bytes(),
-                ui_core::math::Size::new(12.0, 12.0),
-                scale,
+                ICON_INTRINSIC_SIZE,
             )?;
-            ImageSource::Ready(image.id)
+            ImageSource::Ready(image.id())
         };
         self.verified = Some(verified);
 
@@ -511,7 +508,7 @@ impl DialogState {
             self.keys.accounts.clone(),
             ListOptions::fixed(ROW_HEIGHT)
                 .selection(SelectionMode::None)
-                .padding(0.0, 0.0),
+                .padding(px(0.0), px(0.0)),
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 build_account_row(tree, parent, index, &accounts)
             },
@@ -537,7 +534,7 @@ impl DialogState {
             self.keys.results.clone(),
             ListOptions::fixed(ROW_HEIGHT)
                 .selection(SelectionMode::None)
-                .padding(0.0, 0.0),
+                .padding(px(0.0), px(0.0)),
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 build_result_row(tree, parent, index, &results)
             },
@@ -1396,9 +1393,9 @@ impl DialogState {
                 .style(
                     StyleBuilder::new()
                         .width_full()
-                        .height(CONTENT_HEIGHT)
+                        .height(px(CONTENT_HEIGHT))
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -1485,7 +1482,7 @@ impl DialogState {
                         .width_full()
                         .flex_row()
                         .items_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .build(),
                 )
@@ -1557,10 +1554,10 @@ impl DialogState {
                 .style(
                     StyleBuilder::new()
                         .absolute()
-                        .top(0.0)
-                        .right(0.0)
-                        .bottom(0.0)
-                        .left(0.0)
+                        .top(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .left(px(0.0))
                         .min_width_0()
                         .min_height_0()
                         .overflow_hidden()
@@ -1604,7 +1601,7 @@ impl DialogState {
         window: WindowId,
         area: NodeId,
         key: &str,
-        text_size: f32,
+        text_size: LogicalPx,
     ) -> Result<(), EngineError> {
         let theme = self.theme.clone();
         let translate = self.translate.clone();
@@ -1923,10 +1920,10 @@ impl DialogState {
                 .style(
                     StyleBuilder::new()
                         .absolute()
-                        .top(0.0)
-                        .right(0.0)
-                        .bottom(0.0)
-                        .left(0.0)
+                        .top(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .left(px(0.0))
                         .min_width_0()
                         .min_height_0()
                         .overflow_hidden()
@@ -1972,7 +1969,7 @@ impl DialogState {
         window: WindowId,
         area: NodeId,
         key: &str,
-        text_size: f32,
+        text_size: LogicalPx,
     ) -> Result<(), EngineError> {
         let theme = self.theme.clone();
         let translate = self.translate.clone();
@@ -2098,7 +2095,7 @@ impl DialogState {
         window: WindowId,
         parent: NodeId,
         key: &str,
-        title_size: f32,
+        title_size: LogicalPx,
     ) -> Result<NodeId, EngineError> {
         let count = self.count;
         let limit = self.limit;
@@ -2146,7 +2143,7 @@ impl DialogState {
                         .width_full()
                         .flex_none()
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, pages)
@@ -2205,12 +2202,12 @@ impl DialogState {
 fn page_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .absolute()
-        .top(0.0)
-        .right(0.0)
-        .bottom(0.0)
-        .left(0.0)
+        .top(px(0.0))
+        .right(px(0.0))
+        .bottom(px(0.0))
+        .left(px(0.0))
         .flex_col()
-        .gap(8.0)
+        .gap(px(8.0))
         .min_width_0()
         .min_height_0()
         .build()
@@ -2222,7 +2219,7 @@ fn header_style() -> ui_core::paint::style::Style {
         .flex_none()
         .flex_row()
         .items_center()
-        .gap(8.0)
+        .gap(px(8.0))
         .min_width_0()
         .build()
 }
@@ -2233,7 +2230,7 @@ fn toolbar_style() -> ui_core::paint::style::Style {
         .flex_none()
         .flex_row()
         .items_center()
-        .gap(8.0)
+        .gap(px(8.0))
         .min_width_0()
         .build()
 }
@@ -2484,7 +2481,7 @@ fn build_account_row(
                 .flex_1()
                 .min_width_0()
                 .flex_col()
-                .gap(4.0)
+                .gap(px(4.0))
                 .build(),
         )
         .build(tree, row)?;
@@ -2646,7 +2643,7 @@ fn build_result_row(
                 .flex_1()
                 .min_width_0()
                 .flex_col()
-                .gap(4.0)
+                .gap(px(4.0))
                 .build(),
         )
         .build(tree, row)?;
@@ -2745,11 +2742,11 @@ fn row_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .flex_row()
         .items_center()
-        .gap(12.0)
+        .gap(px(12.0))
         .width_full()
         .height_full()
         .min_width_0()
-        .padding_x(8.0)
+        .padding_x(px(8.0))
         .build()
 }
 
@@ -2773,7 +2770,7 @@ fn profile_line(
                 .width_full()
                 .flex_row()
                 .items_center()
-                .gap(4.0)
+                .gap(px(4.0))
                 .min_width_0()
                 .build(),
         )
@@ -2874,7 +2871,7 @@ fn build_row_slot(
     index: usize,
     key: &str,
     slots: &Rc<RefCell<BTreeMap<usize, NodeId>>>,
-    size: f32,
+    size: LogicalPx,
 ) -> Result<(), EngineError> {
     let slot = NodeBuilder::boxed()
         .id(format_smolstr!("{key}:row:{index}:actions"))
@@ -2902,8 +2899,8 @@ fn build_avatar(
     theme: &ThemeHandle,
 ) -> Result<(), EngineError> {
     let style = StyleBuilder::new()
-        .width(ROW_AVATAR_SIZE)
-        .height(ROW_AVATAR_SIZE)
+        .width(px(ROW_AVATAR_SIZE))
+        .height(px(ROW_AVATAR_SIZE))
         .flex_none()
         .build();
     let ready = !url.is_empty()
@@ -2960,8 +2957,8 @@ fn build_icon(
     };
     node.style(
         StyleBuilder::new()
-            .width(size)
-            .height(size)
+            .width(px(size))
+            .height(px(size))
             .flex_none()
             .build(),
     )
@@ -2987,15 +2984,15 @@ fn message_block(
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap(8.0)
-                    .padding(8.0)
+                    .gap(px(8.0))
+                    .padding(px(8.0))
                     .build(),
             )
             .bind_style(visible_if(visible))
@@ -3008,7 +3005,7 @@ fn sentence_node(
     window: WindowId,
     parent: NodeId,
     id: SmolStr,
-    text_size: f32,
+    text_size: LogicalPx,
     theme: ThemeHandle,
     role: Role,
     text: impl Fn(&mut ReadCtx<'_>) -> SmolStr + 'static,
@@ -3021,7 +3018,7 @@ fn sentence_node(
         .id(id)
         .style(
             StyleBuilder::new()
-                .max_width(MESSAGE_WIDTH)
+                .max_width(px(MESSAGE_WIDTH))
                 .min_width_0()
                 .build(),
         )

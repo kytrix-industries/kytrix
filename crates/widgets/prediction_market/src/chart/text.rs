@@ -5,6 +5,7 @@ use smol_str::{SmolStr, format_smolstr};
 use time::OffsetDateTime;
 use ui_core::{
     app::App,
+    math::LogicalPx,
     paint::color::Color,
     text::{ShapedTextHandle, TextAlign, TextStyle},
 };
@@ -13,9 +14,9 @@ use super::geometry::{TimeLabelKind, local_datetime};
 
 pub(crate) const TEXT_CACHE_CAPACITY: usize = 256;
 
-pub(crate) const AXIS_FONT_SIZE: f32 = 12.0;
-pub(crate) const LABEL_FONT_SIZE: f32 = 12.0;
-pub(crate) const TIME_LABEL_FONT_SIZE: f32 = 12.0;
+pub(crate) const AXIS_FONT_SIZE: LogicalPx = LogicalPx::new(12.0);
+pub(crate) const LABEL_FONT_SIZE: LogicalPx = LogicalPx::new(12.0);
+pub(crate) const TIME_LABEL_FONT_SIZE: LogicalPx = LogicalPx::new(12.0);
 
 pub(crate) const STRONG_WEIGHT: u16 = 600;
 pub(crate) const REGULAR_WEIGHT: u16 = 400;
@@ -87,7 +88,7 @@ impl ChartTextCache {
         handle
     }
 
-    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
+    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
         self.line(app, text, style).size().width
     }
 
@@ -98,15 +99,15 @@ impl ChartTextCache {
 }
 
 pub(crate) fn label_style(
-    font_size: f32,
-    line_height: f32,
+    font_size: LogicalPx,
+    line_height: LogicalPx,
     color: Color,
     weight: u16,
 ) -> TextStyle {
     let mut style = TextStyle::new(font_size);
     style.color = color;
     style.weight = weight;
-    style.line_height = Some(line_height / font_size);
+    style.line_height = Some(line_height.value() / font_size.value());
     style.alignment = TextAlign::Start;
     style
 }

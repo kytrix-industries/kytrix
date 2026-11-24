@@ -12,6 +12,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::{Event, InputEvent},
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -63,7 +64,7 @@ use super::{
 const DIALOG_WIDTH: f32 = 680.0;
 const DIALOG_HEIGHT: f32 = 460.0;
 const CATEGORY_COLUMN_WIDTH: f32 = 160.0;
-const ROW_HEIGHT: f32 = 28.0;
+const ROW_HEIGHT: LogicalPx = px(28.0);
 const CORNER_RADIUS: f32 = 4.0;
 const MESSAGE_WIDTH: f32 = 420.0;
 const CHECK_MARK: &str = "✓";
@@ -506,9 +507,9 @@ impl SelectorState {
                 .style(
                     StyleBuilder::new()
                         .width_full()
-                        .height(DIALOG_HEIGHT)
+                        .height(px(DIALOG_HEIGHT))
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -523,7 +524,7 @@ impl SelectorState {
                     StyleBuilder::new()
                         .flex_row()
                         .flex_1()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -536,14 +537,14 @@ impl SelectorState {
                 .id(format_smolstr!("{key}:categories"))
                 .style(
                     StyleBuilder::new()
-                        .width(CATEGORY_COLUMN_WIDTH)
+                        .width(px(CATEGORY_COLUMN_WIDTH))
                         .height_full()
                         .flex_none()
                         .min_height_0()
                         .overflow_hidden()
                         .build(),
                 )
-                .paint(PaintBuilder::new().rounded(CORNER_RADIUS).build())
+                .paint(PaintBuilder::new().rounded(px(CORNER_RADIUS)).build())
                 .bind_style(panel_style(theme.clone(), Role::SurfaceSunken))
                 .build(tree, top)
         })?;
@@ -560,7 +561,7 @@ impl SelectorState {
                     StyleBuilder::new()
                         .flex_col()
                         .flex_1()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -577,7 +578,7 @@ impl SelectorState {
                         .width_full()
                         .flex_row()
                         .items_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .build(),
                 )
@@ -629,7 +630,7 @@ impl SelectorState {
                 .style(
                     StyleBuilder::new()
                         .flex_none()
-                        .max_width(CATEGORY_COLUMN_WIDTH * 2.0)
+                        .max_width(px(CATEGORY_COLUMN_WIDTH * 2.0))
                         .min_width_0()
                         .build(),
                 )
@@ -668,7 +669,7 @@ impl SelectorState {
                         .overflow_hidden()
                         .build(),
                 )
-                .paint(PaintBuilder::new().rounded(CORNER_RADIUS).build())
+                .paint(PaintBuilder::new().rounded(px(CORNER_RADIUS)).build())
                 .bind_style(panel_style(theme.clone(), Role::SurfaceRaised))
                 .build(tree, right)
         })?;
@@ -696,7 +697,7 @@ impl SelectorState {
                         .flex_1()
                         .items_center()
                         .justify_center()
-                        .padding(8.0)
+                        .padding(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -714,7 +715,7 @@ impl SelectorState {
                         .flex_none()
                         .width_full()
                         .flex_col()
-                        .gap(2.0)
+                        .gap(px(2.0))
                         .min_width_0()
                         .build(),
                 )
@@ -1127,7 +1128,7 @@ impl SelectorState {
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -1288,7 +1289,7 @@ fn build_index_row(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(6.0)
+                .gap(px(6.0))
                 .width_full()
                 .min_width_0()
                 .build(),
@@ -1406,7 +1407,7 @@ fn static_text(
     parent: NodeId,
     id: SmolStr,
     text: SmolStr,
-    size: f32,
+    size: LogicalPx,
     role: Role,
     theme: &ThemeHandle,
 ) -> Result<NodeId, EngineError> {
@@ -1416,7 +1417,7 @@ fn static_text(
             .id(id)
             .style(
                 StyleBuilder::new()
-                    .max_width(MESSAGE_WIDTH)
+                    .max_width(px(MESSAGE_WIDTH))
                     .min_width_0()
                     .build(),
             )

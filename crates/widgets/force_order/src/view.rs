@@ -19,6 +19,7 @@ use time::UtcOffset;
 use ui_core::{
     a11y::A11yPatch,
     error::EngineError,
+    math::LogicalPx,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
@@ -165,7 +166,7 @@ fn build_cell(
     language: Signal<LanguageCode>,
     translate: &Translate,
     theme: &ThemeHandle,
-    font_size: f32,
+    font_size: LogicalPx,
 ) {
     let text = NodeBuilder::text(SmolStr::default(), TextStyle::new(font_size));
 
@@ -424,7 +425,7 @@ impl WidgetView for ForceOrderWidget {
     }
 }
 
-fn table_options(row_height: f32) -> TableOptions {
+fn table_options(row_height: LogicalPx) -> TableOptions {
     TableOptions::fixed(row_height).selection(SelectionMode::None)
 }
 
@@ -1399,14 +1400,14 @@ mod tests {
 
     #[test]
     fn the_table_should_not_offer_row_selection() {
-        let options = table_options(30.0);
+        let options = table_options(LogicalPx::new(30.0));
 
         assert_eq!(
             options.selection,
             SelectionMode::None,
             "the old dataset had no selection: rows are display-only"
         );
-        assert_eq!(options.row_height, RowHeight::Fixed(30.0));
+        assert_eq!(options.row_height, RowHeight::Fixed(LogicalPx::new(30.0)));
     }
 
     #[test]

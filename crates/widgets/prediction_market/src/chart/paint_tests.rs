@@ -6,7 +6,7 @@ use market_participants_model::{
     prediction::{PredictionPricePoint, PredictionRange, PredictionSeries},
 };
 use ui_core::{
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     paint::color::Color,
     test_support::record::PrimitiveKind,
 };
@@ -24,12 +24,12 @@ use crate::{
     test_support::{charted_market, event_ref, event_with},
 };
 
-const WINDOW_WIDTH: f32 = 760.0;
-const WINDOW_HEIGHT: f32 = 248.0;
+const WINDOW_WIDTH: LogicalPx = px(760.0);
+const WINDOW_HEIGHT: LogicalPx = px(248.0);
 
 const SAMPLE_COUNT: i64 = 60;
 const MINUTE: i64 = 60_000;
-const LABEL_GAP: f32 = 1.0;
+const LABEL_GAP: LogicalPx = px(1.0);
 
 fn translate(language: LanguageCode) -> Translate {
     Translate::new(
@@ -43,7 +43,7 @@ struct ChartHarness {
     chart: ChartCanvas,
     page: ui_core::node::id::NodeId,
     snapshot: Arc<PredictionMarketSnapshot>,
-    pointer: Option<Point>,
+    pointer: Option<LogicalPoint>,
     pulse: Option<f32>,
 }
 
@@ -52,7 +52,7 @@ impl ChartHarness {
         Self::sized(snapshot, WINDOW_WIDTH, WINDOW_HEIGHT)
     }
 
-    fn sized(snapshot: Arc<PredictionMarketSnapshot>, width: f32, height: f32) -> Self {
+    fn sized(snapshot: Arc<PredictionMarketSnapshot>, width: LogicalPx, height: LogicalPx) -> Self {
         let mut app = WidgetTestApp::with_translate(translate(LanguageCode::En));
         let page = page(&mut app, width, height);
         let chart = app.with_cx(|_| ChartCanvas::new());
@@ -107,7 +107,7 @@ impl ChartHarness {
         }
     }
 
-    fn set_pointer(&mut self, pointer: Option<Point>) {
+    fn set_pointer(&mut self, pointer: Option<LogicalPoint>) {
         self.pointer = pointer;
     }
 
@@ -115,7 +115,7 @@ impl ChartHarness {
         self.pulse = pulse;
     }
 
-    fn resize(&mut self, width: f32, height: f32) {
+    fn resize(&mut self, width: LogicalPx, height: LogicalPx) {
         let page = self.page;
         self.app.with_cx(|cx| {
             let style = ui_core::paint::style_builder::StyleBuilder::new()
@@ -131,7 +131,7 @@ impl ChartHarness {
     }
 }
 
-fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> ui_core::node::id::NodeId {
+fn page(app: &mut WidgetTestApp, width: LogicalPx, height: LogicalPx) -> ui_core::node::id::NodeId {
     app.with_cx(|cx| {
         let root = cx.tree().root();
         ui_core::node::builder::NodeBuilder::boxed()
@@ -149,13 +149,13 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> ui_core::node::id::
 }
 
 struct Frame {
-    bounds: Rect,
+    bounds: LogicalRect,
     primitives: Vec<CanvasPrimitive>,
     texts: Vec<TextRecord>,
 }
 
 impl Frame {
-    fn plot(&self) -> Rect {
+    fn plot(&self) -> LogicalRect {
         ChartLayout::new(self.bounds).plot
     }
 
@@ -181,8 +181,8 @@ impl Frame {
             .into_iter()
             .filter(|quad| {
                 let bounds = bounds_of(*quad);
-                (bounds.size.height - LABEL_HEIGHT).abs() <= 2.0
-                    && bounds.size.width > 20.0
+                (bounds.size.height - LABEL_HEIGHT).abs() <= px(2.0)
+                    && bounds.size.width > px(20.0)
                     && quad.border.is_some()
             })
             .collect()
@@ -192,15 +192,15 @@ impl Frame {
         let record = self
             .text(text)
             .unwrap_or_else(|| panic!("the frame should draw the label {text:?}"));
-        let left = record.origin.x - 12.0;
+        let left = record.origin.x - px(12.0);
         let top = record.origin.y;
         self.quads()
             .into_iter()
             .find(|quad| {
                 let bounds = bounds_of(*quad);
-                (bounds.origin.x - left).abs() <= 2.0
-                    && (bounds.origin.y - top).abs() <= 2.0
-                    && (bounds.size.height - LABEL_HEIGHT).abs() <= 2.0
+                (bounds.origin.x - left).abs() <= px(2.0)
+                    && (bounds.origin.y - top).abs() <= px(2.0)
+                    && (bounds.size.height - LABEL_HEIGHT).abs() <= px(2.0)
             })
             .expect("every drawn label has its box")
     }
@@ -231,7 +231,7 @@ impl Frame {
             .collect()
     }
 
-    fn enclosing_clip(&self, index: usize) -> Option<Rect> {
+    fn enclosing_clip(&self, index: usize) -> Option<LogicalRect> {
         self.primitives[..index]
             .iter()
             .rev()
@@ -240,7 +240,7 @@ impl Frame {
     }
 }
 
-fn bounds_of(primitive: CanvasPrimitive) -> Rect {
+fn bounds_of(primitive: CanvasPrimitive) -> LogicalRect {
     primitive.bounds.expect("a quad has bounds")
 }
 
@@ -270,9 +270,9 @@ fn role(role: Role) -> Color {
     Theme::of(Appearance::Light).role(role)
 }
 
-fn assert_close(actual: f32, expected: f32, tolerance: f32, what: &str) {
+fn assert_close(actual: LogicalPx, expected: LogicalPx, tolerance: f32, what: &str) {
     assert!(
-        (actual - expected).abs() <= tolerance,
+        (actual - expected).abs() <= px(tolerance),
         "{what}: expected {expected}, got {actual} (tolerance {tolerance})"
     );
 }
@@ -388,16 +388,18 @@ fn a_chart_without_a_hover_draws_no_hover_furniture() {
     let frame = harness.draw();
 
     assert!(
-        frame.quads().iter().all(
-            |quad| !(bounds_of(*quad).size.height > 100.0 && bounds_of(*quad).size.width < 3.0)
-        ),
+        frame
+            .quads()
+            .iter()
+            .all(|quad| !(bounds_of(*quad).size.height > px(100.0)
+                && bounds_of(*quad).size.width < px(3.0))),
         "no crosshair is drawn without a pointer"
     );
     assert!(
         frame
             .quads()
             .iter()
-            .all(|quad| !(11.0..=13.0).contains(&bounds_of(*quad).size.width)),
+            .all(|quad| !(px(11.0)..=px(13.0)).contains(&bounds_of(*quad).size.width)),
         "no hover wash is drawn without a pointer; the static endpoint dot is still drawn"
     );
     assert!(frame.label_boxes().is_empty(), "no label column either");
@@ -425,7 +427,7 @@ fn a_chart_without_a_hover_draws_no_hover_furniture() {
 fn a_language_change_relabels_the_axis_and_the_hover() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -457,8 +459,8 @@ fn a_language_change_relabels_the_axis_and_the_hover() {
 fn a_hover_at_either_end_keeps_its_labels_inside_the_plot() {
     let mut harness = ChartHarness::new(two_series(0.0, 100.0));
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
-        plot.right() - 1.0,
+    harness.set_pointer(Some(LogicalPoint::new(
+        plot.right() - px(1.0),
         plot.origin.y + plot.size.height / 2.0,
     )));
     let frame = harness.draw();
@@ -488,8 +490,8 @@ fn the_endpoint_dot_is_as_large_as_a_hovered_intersection() {
         .into_iter()
         .filter(|quad| {
             let bounds = bounds_of(*quad);
-            (bounds.size.width - 8.0).abs() < 0.01
-                && (bounds.origin.x + bounds.size.width / 2.0 - plot.right()).abs() < 1.0
+            (bounds.size.width - 8.0).abs() < px(0.01)
+                && (bounds.origin.x + bounds.size.width / 2.0 - plot.right()).abs() < px(1.0)
         })
         .collect();
 
@@ -500,7 +502,7 @@ fn the_endpoint_dot_is_as_large_as_a_hovered_intersection() {
 fn the_hover_crosshair_stops_at_the_zero_line() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -510,7 +512,7 @@ fn the_hover_crosshair_stops_at_the_zero_line() {
         .into_iter()
         .find(|quad| {
             let bounds = bounds_of(*quad);
-            (bounds.size.width - 1.5).abs() < 0.01 && bounds.size.height > plot.size.height
+            (bounds.size.width - 1.5).abs() < px(0.01) && bounds.size.height > plot.size.height
         })
         .expect("a hover draws the vertical indicator");
 
@@ -526,7 +528,7 @@ fn the_hover_crosshair_stops_at_the_zero_line() {
 fn a_mid_chart_hover_stacks_its_labels_on_the_right() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -543,7 +545,7 @@ fn a_mid_chart_hover_stacks_its_labels_on_the_right() {
     assert!(
         boxes
             .iter()
-            .all(|quad| (bounds_of(*quad).origin.x - (crosshair_x + 8.0)).abs() <= 2.0),
+            .all(|quad| (bounds_of(*quad).origin.x - (crosshair_x + 8.0)).abs() <= px(2.0)),
         "a label column that fits opens to the right, at the crosshair plus eight"
     );
 
@@ -552,7 +554,8 @@ fn a_mid_chart_hover_stacks_its_labels_on_the_right() {
         bounds_of(*left)
             .origin
             .y
-            .total_cmp(&bounds_of(*right).origin.y)
+            .value()
+            .total_cmp(&bounds_of(*right).origin.y.value())
     });
     let uppermost = bounds_of(sorted[0]);
     let lower_box = bounds_of(sorted[1]);
@@ -580,7 +583,7 @@ fn a_mid_chart_hover_stacks_its_labels_on_the_right() {
         .expect("the lower line's label names it");
     assert_close(
         bounds_of(frame.label_box("Yes 23.0%")).size.width,
-        lower_label.shaped_width + 18.0,
+        lower_label.shaped_width + px(18.0),
         2.0,
         "the box is its text plus its padding, bar and gap",
     );
@@ -592,21 +595,21 @@ fn a_mid_chart_hover_stacks_its_labels_on_the_right() {
 
 #[test]
 fn a_twelve_series_column_keeps_every_label_at_a_distinct_top() {
-    let mut harness = ChartHarness::sized(twelve_series(), WINDOW_WIDTH, WINDOW_HEIGHT + 100.0);
+    let mut harness = ChartHarness::sized(twelve_series(), WINDOW_WIDTH, WINDOW_HEIGHT + px(100.0));
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));
     let frame = harness.draw();
 
-    let mut tops: Vec<f32> = frame
+    let mut tops: Vec<LogicalPx> = frame
         .label_boxes()
         .iter()
         .map(|quad| bounds_of(*quad).origin.y)
         .collect();
     assert_eq!(tops.len(), 12, "one box per line");
-    tops.sort_by(f32::total_cmp);
+    tops.sort_by(|left, right| left.value().total_cmp(&right.value()));
     assert!(
         tops.windows(2).all(|pair| pair[1] > pair[0]),
         "twelve boxes keep twelve distinct tops: {tops:?}"
@@ -626,7 +629,7 @@ fn a_hover_near_the_right_edge_flips_the_label_column_left() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
     let last_sample_x = plot.origin.x + plot.size.width * 59.0 / 60.0;
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         last_sample_x,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -638,7 +641,7 @@ fn a_hover_near_the_right_edge_flips_the_label_column_left() {
         let bounds = bounds_of(quad);
         assert_close(
             bounds.right(),
-            last_sample_x - 8.0,
+            last_sample_x - px(8.0),
             2.0,
             "a flipped column keeps its right edge eight pixels left of the crosshair",
         );
@@ -653,7 +656,7 @@ fn a_hover_near_the_right_edge_flips_the_label_column_left() {
 fn hovering_fades_every_line_to_the_right_of_the_sample() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -689,11 +692,11 @@ fn hovering_fades_every_line_to_the_right_of_the_sample() {
             .enclosing_clip(full_index)
             .expect("the full stroke is clipped");
         assert!(
-            faded_clip.origin.x >= crosshair_x - 1.0,
+            faded_clip.origin.x >= crosshair_x - px(1.0),
             "the faded mesh is clipped to the right of the crosshair"
         );
         assert!(
-            full_clip.right() <= crosshair_x + 1.0,
+            full_clip.right() <= crosshair_x + px(1.0),
             "the full mesh is clipped to the left of the crosshair"
         );
     }
@@ -711,13 +714,13 @@ fn a_pulse_starts_outside_the_endpoint_dot() {
         .into_iter()
         .find(|quad| {
             quad.color == Some(palette()[0].with_opacity(ring_alpha(0.0)))
-                && (bounds_of(*quad).size.width - 12.0).abs() < 0.01
+                && (bounds_of(*quad).size.width - 12.0).abs() < px(0.01)
         })
         .expect("the pulse starts as a ring wider than the endpoint dot");
 
     assert_eq!(
         bounds_of(ring).size.width,
-        12.0,
+        px(12.0),
         "a six-pixel radius around a four-pixel dot"
     );
 }
@@ -733,7 +736,8 @@ fn a_pulse_phase_draws_the_expanding_ring() {
         .quads()
         .into_iter()
         .filter(|quad| {
-            (bounds_of(*quad).size.width - 14.0).abs() < 0.01 && is_faded(*quad, ring_alpha(0.25))
+            (bounds_of(*quad).size.width - 14.0).abs() < px(0.01)
+                && is_faded(*quad, ring_alpha(0.25))
         })
         .count();
     assert_eq!(early_ring, 2, "one ring around each line's endpoint");
@@ -745,9 +749,9 @@ fn a_pulse_phase_draws_the_expanding_ring() {
         .into_iter()
         .filter(|quad| is_faded(*quad, ring_alpha(0.75)))
         .map(|quad| bounds_of(quad).size.width)
-        .fold(0.0_f32, f32::max);
+        .fold(px(0.0), LogicalPx::max);
     assert!(
-        widest > 13.0,
+        widest > px(13.0),
         "the ring expands as the phase advances: {widest}"
     );
 }
@@ -770,7 +774,7 @@ fn no_pulse_phase_draws_no_ring() {
 fn the_hovered_time_sits_in_the_top_strip() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -782,7 +786,7 @@ fn the_hovered_time_sits_in_the_top_strip() {
         .expect("the hovered sample's time is drawn");
     assert_close(
         label.origin.x,
-        crosshair_x + 8.0,
+        crosshair_x + px(8.0),
         2.0,
         "the time is left-aligned eight pixels right of the crosshair",
     );
@@ -790,7 +794,7 @@ fn the_hovered_time_sits_in_the_top_strip() {
         label.origin.y < plot.origin.y,
         "the time is drawn above the plot"
     );
-    assert_eq!(label.font_size, 12.0);
+    assert_eq!(label.font_size, px(12.0));
 }
 
 #[test]
@@ -798,7 +802,7 @@ fn a_hover_near_the_right_edge_flips_the_time_label_left() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
     let last_sample_x = plot.origin.x + plot.size.width * 59.0 / 60.0;
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         last_sample_x,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -808,10 +812,10 @@ fn a_hover_near_the_right_edge_flips_the_time_label_left() {
         .text("Jan 1, 12:59 AM")
         .expect("the hovered sample's time is drawn");
     assert!(
-        label.origin.x + label.shaped_width <= last_sample_x - 8.0 + 2.0,
+        label.origin.x + label.shaped_width <= last_sample_x - px(8.0) + px(2.0),
         "the time flips to the left of the crosshair when it would overflow"
     );
-    assert!(label.origin.x >= 0.0, "and it stays inside the element");
+    assert!(label.origin.x >= px(0.0), "and it stays inside the element");
 }
 
 #[test]
@@ -821,7 +825,7 @@ fn a_pointer_only_frame_reuses_the_prepared_chart() {
     let prepared = harness.chart.prepared_builds();
     assert!(prepared >= 1, "a drawn chart has prepared a frame");
 
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -852,7 +856,9 @@ fn the_vertical_grid_starts_below_the_time_strip_and_reaches_the_bottom_band() {
         .into_iter()
         .filter(|quad| {
             let bounds = bounds_of(*quad);
-            quad.color == Some(grid) && bounds.size.width <= 1.5 && bounds.size.height <= 1.5
+            quad.color == Some(grid)
+                && bounds.size.width <= px(1.5)
+                && bounds.size.height <= px(1.5)
         })
         .collect();
     assert!(!dots.is_empty(), "the grid is drawn");
@@ -860,9 +866,9 @@ fn the_vertical_grid_starts_below_the_time_strip_and_reaches_the_bottom_band() {
     let top = dots
         .iter()
         .map(|dot| bounds_of(*dot).origin.y)
-        .fold(f32::INFINITY, f32::min);
+        .fold(px(f32::INFINITY), LogicalPx::min);
     assert!(
-        top >= plot.origin.y - 0.01,
+        top >= plot.origin.y - px(0.01),
         "the vertical grid stops at the plot's top instead of running through the time \
          strip: top {top} vs plot top {}",
         plot.origin.y
@@ -871,7 +877,7 @@ fn the_vertical_grid_starts_below_the_time_strip_and_reaches_the_bottom_band() {
     let bottom = dots
         .iter()
         .map(|dot| bounds_of(*dot).bottom())
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(px(f32::NEG_INFINITY), LogicalPx::max);
     assert!(
         bottom > plot.bottom(),
         "the vertical grid still runs through the x-label band: bottom {bottom}"
@@ -882,7 +888,7 @@ fn the_vertical_grid_starts_below_the_time_strip_and_reaches_the_bottom_band() {
 fn a_hover_dot_on_the_left_plot_edge_is_not_cut_by_the_plot_mask() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + 0.5,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -892,7 +898,7 @@ fn a_hover_dot_on_the_left_plot_edge_is_not_cut_by_the_plot_mask() {
         .quads_indexed()
         .into_iter()
         .find(|(_, quad)| {
-            (bounds_of(*quad).size.width - 12.0).abs() <= 0.01 && is_faded(*quad, 0.1)
+            (bounds_of(*quad).size.width - 12.0).abs() <= px(0.01) && is_faded(*quad, 0.1)
         })
         .expect("the hover dot's wash is drawn at the first sample");
     let left = bounds_of(dot).origin.x;
@@ -900,7 +906,7 @@ fn a_hover_dot_on_the_left_plot_edge_is_not_cut_by_the_plot_mask() {
 
     assert_close(
         left,
-        plot_left - 6.0,
+        plot_left - px(6.0),
         0.01,
         "the wash around a dot centred on the plot's left edge reaches six pixels past it",
     );
@@ -908,7 +914,7 @@ fn a_hover_dot_on_the_left_plot_edge_is_not_cut_by_the_plot_mask() {
         .enclosing_clip(index)
         .expect("the dot is drawn in a mask");
     assert!(
-        mask.origin.x <= left + 0.01,
+        mask.origin.x <= left + px(0.01),
         "the dot mask keeps the whole wash visible: mask left {} vs dot left {left}",
         mask.origin.x
     );
@@ -918,8 +924,8 @@ fn a_hover_dot_on_the_left_plot_edge_is_not_cut_by_the_plot_mask() {
 fn a_hover_dot_on_the_plot_edge_is_not_cut_by_the_plot_mask() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
-        plot.right() - 1.0,
+    harness.set_pointer(Some(LogicalPoint::new(
+        plot.right() - px(1.0),
         plot.origin.y + plot.size.height / 2.0,
     )));
     let frame = harness.draw();
@@ -928,7 +934,7 @@ fn a_hover_dot_on_the_plot_edge_is_not_cut_by_the_plot_mask() {
         .quads_indexed()
         .into_iter()
         .find(|(_, quad)| {
-            (bounds_of(*quad).size.width - 12.0).abs() <= 0.01 && is_faded(*quad, 0.1)
+            (bounds_of(*quad).size.width - 12.0).abs() <= px(0.01) && is_faded(*quad, 0.1)
         })
         .expect("the hover dot's wash is drawn at the last sample");
     let right = bounds_of(dot).right();
@@ -943,7 +949,7 @@ fn a_hover_dot_on_the_plot_edge_is_not_cut_by_the_plot_mask() {
         .enclosing_clip(index)
         .expect("the dot is drawn in a mask");
     assert!(
-        mask.right() >= right - 0.01,
+        mask.right() >= right - px(0.01),
         "the dot mask keeps the whole wash visible: mask right {} vs dot right {right}",
         mask.right()
     );
@@ -969,12 +975,13 @@ fn the_endpoint_pulse_reaches_past_the_plot_edge_without_touching_the_labels() {
             bounds_of(left.1)
                 .size
                 .width
-                .total_cmp(&bounds_of(right.1).size.width)
+                .value()
+                .total_cmp(&bounds_of(right.1).size.width.value())
         })
         .expect("the pulse ring is drawn");
     let ring = bounds_of(ring_quad);
     assert!(
-        ring.size.width > 16.0,
+        ring.size.width > px(16.0),
         "a late phase draws the widest ring: {}",
         ring.size.width
     );
@@ -990,7 +997,7 @@ fn the_endpoint_pulse_reaches_past_the_plot_edge_without_touching_the_labels() {
         .enclosing_clip(index)
         .expect("the pulse is drawn in a mask");
     assert!(
-        mask.right() >= ring.right() - 0.01,
+        mask.right() >= ring.right() - px(0.01),
         "the dot mask keeps the whole pulse visible: mask right {} vs ring right {}",
         mask.right(),
         ring.right()
@@ -1022,14 +1029,15 @@ fn an_endpoint_pulse_at_the_axis_top_is_not_cut_by_its_mask() {
             bounds_of(left.1)
                 .size
                 .width
-                .total_cmp(&bounds_of(right.1).size.width)
+                .value()
+                .total_cmp(&bounds_of(right.1).size.width.value())
         })
         .expect("the pulse ring at the axis top is drawn");
     let ring = bounds_of(ring_quad);
     let plot_top = plot.origin.y;
 
     assert!(
-        ring.origin.y < plot_top - 6.0,
+        ring.origin.y < plot_top - px(6.0),
         "the ring reaches past the hover dot's wash at the axis top: {} vs {plot_top}",
         ring.origin.y
     );
@@ -1037,7 +1045,7 @@ fn an_endpoint_pulse_at_the_axis_top_is_not_cut_by_its_mask() {
         .enclosing_clip(index)
         .expect("the pulse is drawn in a mask");
     assert!(
-        mask.origin.y <= ring.origin.y + 0.01,
+        mask.origin.y <= ring.origin.y + px(0.01),
         "the endpoint mask keeps the ring's top visible: mask top {} vs ring top {}",
         mask.origin.y,
         ring.origin.y
@@ -1055,12 +1063,12 @@ fn the_y_labels_fit_the_narrowed_gutter() {
         .expect("a chart at certainty labels its hundred-percent tick");
     let right = label.origin.x + label.shaped_width;
     assert!(
-        right <= frame.bounds.right() + 0.01,
+        right <= frame.bounds.right() + px(0.01),
         "the widest y label still fits the gutter: text right {right}, bounds right {}",
         frame.bounds.right()
     );
     assert!(
-        label.origin.x >= plot.right() + 9.0,
+        label.origin.x >= plot.right() + px(9.0),
         "the y labels start clear of the dot mask"
     );
 }
@@ -1069,8 +1077,8 @@ fn the_y_labels_fit_the_narrowed_gutter() {
 fn a_line_that_ended_before_the_hover_grows_no_dot_or_label() {
     let mut harness = ChartHarness::new(snapshot_with_an_ended_line());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
-        plot.right() - 1.0,
+    harness.set_pointer(Some(LogicalPoint::new(
+        plot.right() - px(1.0),
         plot.origin.y + plot.size.height / 2.0,
     )));
     let frame = harness.draw();
@@ -1095,7 +1103,9 @@ fn a_line_that_ended_before_the_hover_grows_no_dot_or_label() {
     let washes = frame
         .quads()
         .into_iter()
-        .filter(|quad| (bounds_of(*quad).size.width - 12.0).abs() <= 0.01 && is_faded(*quad, 0.1))
+        .filter(|quad| {
+            (bounds_of(*quad).size.width - 12.0).abs() <= px(0.01) && is_faded(*quad, 0.1)
+        })
         .count();
     assert_eq!(
         washes, 1,
@@ -1131,7 +1141,7 @@ fn the_frame_draws_one_mesh_per_line_and_a_halo_under_it() {
 fn every_clip_the_frame_opens_is_closed() {
     let mut harness = ChartHarness::new(snapshot());
     let plot = harness.draw().plot();
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));
@@ -1157,7 +1167,7 @@ fn a_resize_redraws_the_chart_in_the_new_box() {
     let mut harness = ChartHarness::new(snapshot());
     let before = harness.draw().bounds;
 
-    harness.resize(WINDOW_WIDTH, WINDOW_HEIGHT + 100.0);
+    harness.resize(WINDOW_WIDTH, WINDOW_HEIGHT + px(100.0));
     let frame = harness.draw();
 
     assert_eq!(
@@ -1178,7 +1188,7 @@ fn a_pointer_move_keeps_the_meshes_the_canvas_names() {
     let registered = harness.app.app().geometry().len();
     assert_eq!(registered, 4, "two lines and their halos");
 
-    harness.set_pointer(Some(Point::new(
+    harness.set_pointer(Some(LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )));

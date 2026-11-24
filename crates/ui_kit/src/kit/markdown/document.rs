@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use smol_str::SmolStr;
-use ui_core::math::Size;
+use ui_core::math::LogicalSize;
 
 use super::source::InlineImageFormat;
 
@@ -67,7 +67,7 @@ pub enum MarkdownPiece {
     InlineImage {
         path: SmolStr,
         format: InlineImageFormat,
-        size: Size,
+        size: LogicalSize,
         link: Option<LinkId>,
         kbd: Option<KbdId>,
     },
@@ -236,7 +236,7 @@ mod tests {
     use std::sync::Arc;
 
     use smol_str::SmolStr;
-    use ui_core::math::Size;
+    use ui_core::math::{LogicalSize, px};
 
     use super::{
         HeadingLevel, KbdId, LinkId, MarkdownBlock, MarkdownDocument, MarkdownListItem,
@@ -306,7 +306,7 @@ mod tests {
                     MarkdownPiece::InlineImage {
                         path: SmolStr::new_static("x.png"),
                         format: InlineImageFormat::Image,
-                        size: Size::new(8.0, 8.0),
+                        size: LogicalSize::new(px(8.0), px(8.0)),
                         link: None,
                         kbd: Some(KbdId(0)),
                     },

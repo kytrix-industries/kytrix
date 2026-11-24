@@ -8,6 +8,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event},
     interaction::ScrollHandle,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         style::{PaintSpec, StylePatch},
@@ -45,7 +46,7 @@ const SEARCH_WIDTH: f32 = 240.0;
 
 const SIDEBAR_WIDTH: f32 = 232.0;
 
-const SIDEBAR_ROW_HEIGHT: f32 = 30.0;
+const SIDEBAR_ROW_HEIGHT: LogicalPx = px(30.0);
 
 pub struct SettingsPage {
     host: SettingsHost,
@@ -118,8 +119,8 @@ impl SettingsPage {
                         .justify_between()
                         .flex_none()
                         .width_full()
-                        .gap(16.0)
-                        .padding_sides(16.0, 24.0, 12.0, 24.0)
+                        .gap(px(16.0))
+                        .padding_sides(px(16.0), px(24.0), px(12.0), px(24.0))
                         .build(),
                 )
                 .build(tree, parent)
@@ -131,7 +132,7 @@ impl SettingsPage {
                 .role(Role::FgDefault);
             NodeBuilder::text(
                 i18n::t_smol!(host.translate(), "settings_ui.title"),
-                TextStyle::new(20.0).with_weight(700).with_color(style),
+                TextStyle::new(px(20.0)).with_weight(700).with_color(style),
             )
             .id(SmolStr::new_static("SETTINGS_TITLE"))
             .bind_style(move |cx| StylePatch {
@@ -146,7 +147,7 @@ impl SettingsPage {
                 .style(
                     StyleBuilder::new()
                         .flex_none()
-                        .width(SEARCH_WIDTH)
+                        .width(px(SEARCH_WIDTH))
                         .min_width_0()
                         .build(),
                 )
@@ -195,8 +196,8 @@ impl SettingsPage {
                         .width_full()
                         .min_width_0()
                         .min_height_0()
-                        .gap(12.0)
-                        .padding_sides(0.0, 24.0, 16.0, 24.0)
+                        .gap(px(12.0))
+                        .padding_sides(px(0.0), px(24.0), px(16.0), px(24.0))
                         .build(),
                 )
                 .build(tree, parent)
@@ -207,7 +208,7 @@ impl SettingsPage {
                 .style(
                     StyleBuilder::new()
                         .flex_none()
-                        .width(SIDEBAR_WIDTH)
+                        .width(px(SIDEBAR_WIDTH))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -220,7 +221,7 @@ impl SettingsPage {
                 .style(
                     StyleBuilder::new()
                         .flex_none()
-                        .width(1.0)
+                        .width(px(1.0))
                         .height_full()
                         .build(),
                 )
@@ -374,7 +375,7 @@ impl SettingsPage {
             app,
             theme,
             format_smolstr!("{}.sidebar", self.key),
-            ListOptions::fixed(SIDEBAR_ROW_HEIGHT).padding(0.0, 4.0),
+            ListOptions::fixed(SIDEBAR_ROW_HEIGHT).padding(px(0.0), px(4.0)),
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 let entry = entries.borrow().get(index).cloned();
                 build_sidebar_row(tree, parent, entry, &row_theme, current, &row_key)
@@ -710,14 +711,14 @@ fn build_sidebar_row(
                         .flex_none()
                         .width_full()
                         .height(SIDEBAR_ROW_HEIGHT)
-                        .padding_sides(10.0, 6.0, 10.0, 6.0)
+                        .padding_sides(px(10.0), px(6.0), px(10.0), px(6.0))
                         .build(),
                 )
                 .bind_style({
                     let theme = theme.clone();
                     move |cx| StylePatch {
                         border: Some(ui_core::paint::primitive::Border {
-                            width: 1.0,
+                            width: px(1.0),
                             color: theme.role(cx, Role::LineDivider),
                         }),
                         ..StylePatch::default()
@@ -738,8 +739,8 @@ fn build_sidebar_row(
                         .width_full()
                         .height(SIDEBAR_ROW_HEIGHT)
                         .min_width_0()
-                        .gap(8.0)
-                        .padding_sides(0.0, 8.0, 0.0, 8.0)
+                        .gap(px(8.0))
+                        .padding_sides(px(0.0), px(8.0), px(0.0), px(8.0))
                         .build(),
                 )
                 .tab_stop(true)

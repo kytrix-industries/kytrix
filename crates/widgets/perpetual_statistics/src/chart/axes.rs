@@ -1,35 +1,41 @@
 use smol_str::SmolStr;
-use ui_core::math::{Point, Rect, Size};
+use ui_core::math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px};
 
 use super::{palette::AXIS_LINE_HEIGHT, rect::RectExt};
 
-pub(crate) const MINIMUM_PLOT_WIDTH: f32 = 48.0;
-pub(crate) const MINIMUM_AXIS_WIDTH: f32 = 42.0;
-pub(crate) const AXIS_LABEL_HORIZONTAL_PADDING: f32 = 12.0;
-pub(crate) const AXIS_TICK_TEXT_INSET: f32 = 8.0;
-pub(crate) const CHART_MIN_CONTENT_WIDTH: f32 = 520.0;
-pub(crate) const CHART_MIN_CONTENT_HEIGHT: f32 = 280.0;
-pub(crate) const DATA_EDGE_INSET: f32 = 12.0;
-pub(crate) const TIME_AXIS_HEIGHT: f32 = 28.0;
-pub(crate) const LEGEND_HEIGHT: f32 = 30.0;
-pub(crate) const TOP_INSET: f32 = 22.0;
+pub(crate) const MINIMUM_PLOT_WIDTH: LogicalPx = px(48.0);
+pub(crate) const MINIMUM_AXIS_WIDTH: LogicalPx = px(42.0);
+pub(crate) const AXIS_LABEL_HORIZONTAL_PADDING: LogicalPx = px(12.0);
+pub(crate) const AXIS_TICK_TEXT_INSET: LogicalPx = px(8.0);
+pub(crate) const CHART_MIN_CONTENT_WIDTH: LogicalPx = px(520.0);
+pub(crate) const CHART_MIN_CONTENT_HEIGHT: LogicalPx = px(280.0);
+pub(crate) const DATA_EDGE_INSET: LogicalPx = px(12.0);
+pub(crate) const TIME_AXIS_HEIGHT: LogicalPx = px(28.0);
+pub(crate) const LEGEND_HEIGHT: LogicalPx = px(30.0);
+pub(crate) const TOP_INSET: LogicalPx = px(22.0);
 pub(crate) const MAX_AXIS_TICKS: usize = 8;
 pub(crate) const MAX_TIME_TICKS: usize = 6;
-pub(crate) const TIME_TICK_WIDTH: f32 = 104.0;
+pub(crate) const TIME_TICK_WIDTH: LogicalPx = px(104.0);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ChartLayout {
-    pub content: Rect,
-    pub left_axis: Rect,
-    pub plot: Rect,
-    pub right_axis: Rect,
-    pub time_axis: Rect,
-    pub legend: Rect,
+    pub content: LogicalRect,
+    pub left_axis: LogicalRect,
+    pub plot: LogicalRect,
+    pub right_axis: LogicalRect,
+    pub time_axis: LogicalRect,
+    pub legend: LogicalRect,
 }
 
 impl ChartLayout {
-    pub(crate) fn new(bounds: Rect, left_label_width: Option<f32>, right_label_width: f32) -> Self {
-        let left_width = left_label_width.map_or(0.0, |width| axis_width(bounds.size.width, width));
+    pub(crate) fn new(
+        bounds: LogicalRect,
+        left_label_width: Option<LogicalPx>,
+        right_label_width: LogicalPx,
+    ) -> Self {
+        let left_width = left_label_width.map_or(LogicalPx::ZERO, |width| {
+            axis_width(bounds.size.width, width)
+        });
         let right_width = axis_width(bounds.size.width, right_label_width);
         let content_width = bounds
             .size
@@ -37,44 +43,47 @@ impl ChartLayout {
             .max(MINIMUM_PLOT_WIDTH + left_width + right_width)
             .max(CHART_MIN_CONTENT_WIDTH);
         let content_height = bounds.size.height.max(CHART_MIN_CONTENT_HEIGHT);
-        let content =
-            Rect::from_origin_size(bounds.origin, Size::new(content_width, content_height));
-        let time_height = TIME_AXIS_HEIGHT.min(content.size.height * 0.12);
-        let legend_height = LEGEND_HEIGHT.min(content.size.height * 0.14);
-        let top_inset =
-            TOP_INSET.min((content.size.height - time_height - legend_height - 1.0).max(0.0));
-        let plot_width = (content.size.width - left_width - right_width).max(1.0);
-        let plot_height = (content.size.height - top_inset - time_height - legend_height).max(1.0);
-        let plot = Rect::from_origin_size(
-            Point::new(content.origin.x + left_width, content.origin.y + top_inset),
-            Size::new(plot_width, plot_height),
+        let content = LogicalRect::from_origin_size(
+            bounds.origin,
+            LogicalSize::new(content_width, content_height),
+        );
+        let time_height = TIME_AXIS_HEIGHT.min(content_height * 0.12);
+        let legend_height = LEGEND_HEIGHT.min(content_height * 0.14);
+        let top_inset = TOP_INSET
+            .min((content_height - time_height - legend_height - px(1.0)).max(LogicalPx::ZERO));
+        let plot_width = (content_width - left_width - right_width).max(px(1.0));
+        let plot_height = (content_height - top_inset - time_height - legend_height).max(px(1.0));
+        let plot = LogicalRect::from_origin_size(
+            LogicalPoint::new(content.origin.x + left_width, content.origin.y + top_inset),
+            LogicalSize::new(plot_width, plot_height),
         );
         Self {
             content,
-            left_axis: Rect::from_origin_size(
-                Point::new(content.origin.x, plot.origin.y),
-                Size::new(left_width, plot_height),
+            left_axis: LogicalRect::from_origin_size(
+                LogicalPoint::new(content.origin.x, plot.origin.y),
+                LogicalSize::new(left_width, plot_height),
             ),
             plot,
-            right_axis: Rect::from_origin_size(
-                Point::new(plot.right(), plot.origin.y),
-                Size::new(right_width, plot_height),
+            right_axis: LogicalRect::from_origin_size(
+                LogicalPoint::new(plot.right(), plot.origin.y),
+                LogicalSize::new(right_width, plot_height),
             ),
-            time_axis: Rect::from_origin_size(
-                Point::new(plot.origin.x, plot.bottom()),
-                Size::new(plot_width, time_height),
+            time_axis: LogicalRect::from_origin_size(
+                LogicalPoint::new(plot.origin.x, plot.bottom()),
+                LogicalSize::new(plot_width, time_height),
             ),
-            legend: Rect::from_origin_size(
-                Point::new(content.origin.x, plot.bottom() + time_height),
-                Size::new(content.size.width, legend_height),
+            legend: LogicalRect::from_origin_size(
+                LogicalPoint::new(content.origin.x, plot.bottom() + time_height),
+                LogicalSize::new(content.size.width, legend_height),
             ),
         }
     }
 }
 
-pub(crate) fn axis_width(chart_width: f32, longest_label: f32) -> f32 {
-    let desired = (longest_label.ceil() + AXIS_LABEL_HORIZONTAL_PADDING).max(MINIMUM_AXIS_WIDTH);
-    let available = (chart_width - MINIMUM_PLOT_WIDTH).max(0.0);
+pub(crate) fn axis_width(chart_width: LogicalPx, longest_label: LogicalPx) -> LogicalPx {
+    let desired =
+        (px(longest_label.value().ceil()) + AXIS_LABEL_HORIZONTAL_PADDING).max(MINIMUM_AXIS_WIDTH);
+    let available = (chart_width - MINIMUM_PLOT_WIDTH).max(LogicalPx::ZERO);
     desired.min(available)
 }
 
@@ -199,8 +208,8 @@ pub(crate) fn share_scale(ticks: &'static [(f64, &'static str)]) -> AxisScale {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PositionedTimeTick {
     pub label: SmolStr,
-    pub origin_x: f32,
-    pub width: f32,
+    pub origin_x: LogicalPx,
+    pub width: LogicalPx,
 }
 
 pub(crate) fn nice_ticks(domain: ValueDomain) -> Vec<f64> {
@@ -251,7 +260,7 @@ pub(crate) fn nice_step(raw: f64) -> f64 {
     nice_fraction * magnitude
 }
 
-pub(crate) fn value_y(value: f64, domain: ValueDomain, plot: Rect) -> f32 {
+pub(crate) fn value_y(value: f64, domain: ValueDomain, plot: LogicalRect) -> LogicalPx {
     let ratio = if domain.range() > 0.0 && value.is_finite() {
         ((value - domain.minimum) / domain.range()).clamp(0.0, 1.0)
     } else {
@@ -260,12 +269,12 @@ pub(crate) fn value_y(value: f64, domain: ValueDomain, plot: Rect) -> f32 {
     plot.bottom() - plot.size.height * ratio as f32
 }
 
-pub(crate) fn data_x_range(plot: Rect) -> (f32, f32) {
+pub(crate) fn data_x_range(plot: LogicalRect) -> (LogicalPx, LogicalPx) {
     let inset = DATA_EDGE_INSET.min(plot.size.width / 2.0);
     (plot.origin.x + inset, plot.right() - inset)
 }
 
-pub(crate) fn point_x(plot: Rect, point_count: usize, index: usize) -> f32 {
+pub(crate) fn point_x(plot: LogicalRect, point_count: usize, index: usize) -> LogicalPx {
     if point_count <= 1 {
         return plot.origin.x + plot.size.width / 2.0;
     }
@@ -274,7 +283,7 @@ pub(crate) fn point_x(plot: Rect, point_count: usize, index: usize) -> f32 {
     left + (right - left) * fraction
 }
 
-pub(crate) fn axis_label_y(y: f32, axis: Rect) -> f32 {
+pub(crate) fn axis_label_y(y: LogicalPx, axis: LogicalRect) -> LogicalPx {
     (y - AXIS_LINE_HEIGHT / 2.0).clamp(
         axis.origin.y,
         (axis.bottom() - AXIS_LINE_HEIGHT).max(axis.origin.y),
@@ -298,8 +307,8 @@ pub(crate) fn valid_index(valid: &[usize], index: usize) -> Option<usize> {
     }
 }
 
-pub(crate) fn nearest_index(plot: Rect, point_count: usize, x: f32) -> Option<usize> {
-    if point_count == 0 || plot.size.width <= 0.0 {
+pub(crate) fn nearest_index(plot: LogicalRect, point_count: usize, x: LogicalPx) -> Option<usize> {
+    if point_count == 0 || plot.size.width <= LogicalPx::ZERO {
         return None;
     }
     if point_count == 1 {
@@ -307,7 +316,7 @@ pub(crate) fn nearest_index(plot: Rect, point_count: usize, x: f32) -> Option<us
     }
     let (left, right) = data_x_range(plot);
     let width = right - left;
-    if width <= 0.0 {
+    if width <= LogicalPx::ZERO {
         return Some(0);
     }
     let fraction = ((x - left) / width).clamp(0.0, 1.0);
@@ -315,71 +324,77 @@ pub(crate) fn nearest_index(plot: Rect, point_count: usize, x: f32) -> Option<us
 }
 
 pub(crate) fn paired_bar_bounds(
-    plot: Rect,
+    plot: LogicalRect,
     point_count: usize,
     index: usize,
     buy: f64,
     sell: f64,
     domain: ValueDomain,
-) -> (Rect, Rect) {
+) -> (LogicalRect, LogicalRect) {
     let (buy_left, sell_left, bar_width) = paired_bar_x_bounds(plot, point_count, index);
     let baseline = value_y(0.0, domain, plot);
     let buy_top = value_y(buy, domain, plot);
     let sell_top = value_y(sell, domain, plot);
     (
-        Rect::from_origin_size(
-            Point::new(buy_left, buy_top),
-            Size::new(bar_width, (baseline - buy_top).max(1.0)),
+        LogicalRect::from_origin_size(
+            LogicalPoint::new(buy_left, buy_top),
+            LogicalSize::new(bar_width, (baseline - buy_top).max(px(1.0))),
         ),
-        Rect::from_origin_size(
-            Point::new(sell_left, sell_top),
-            Size::new(bar_width, (baseline - sell_top).max(1.0)),
+        LogicalRect::from_origin_size(
+            LogicalPoint::new(sell_left, sell_top),
+            LogicalSize::new(bar_width, (baseline - sell_top).max(px(1.0))),
         ),
     )
 }
 
-pub(crate) fn paired_bar_x_bounds(plot: Rect, point_count: usize, index: usize) -> (f32, f32, f32) {
+pub(crate) fn paired_bar_x_bounds(
+    plot: LogicalRect,
+    point_count: usize,
+    index: usize,
+) -> (LogicalPx, LogicalPx, LogicalPx) {
+    let plot_width = plot.size.width;
     let slot_width = if point_count <= 1 {
-        plot.size.width.min(32.0)
+        plot_width.min(px(32.0))
     } else {
-        plot.size.width / point_count as f32
+        plot_width / point_count as f32
     };
-    let group_width = (slot_width * 0.72).clamp(4.0, 24.0);
+    let group_width = (slot_width * 0.72).clamp(px(4.0), px(24.0));
     let bar_width = group_width / 2.0;
     let center = point_x(plot, point_count, index);
     (center - bar_width, center, bar_width)
 }
 
-pub(crate) fn ratio_bar_width(plot: Rect, point_count: usize) -> f32 {
+pub(crate) fn ratio_bar_width(plot: LogicalRect, point_count: usize) -> LogicalPx {
     if point_count == 0 {
-        return 3.0;
+        return px(3.0);
     }
-    (plot.size.width / point_count as f32 * 0.62).clamp(3.0, 18.0)
+    (plot.size.width / point_count as f32 * 0.62).clamp(px(3.0), px(18.0))
 }
 
 pub(crate) fn stacked_bar_bounds(
-    center_x: f32,
-    width: f32,
+    center_x: LogicalPx,
+    width: LogicalPx,
     long_share: f64,
     short_share: f64,
-    plot: Rect,
-) -> (Rect, Rect) {
+    plot: LogicalRect,
+) -> (LogicalRect, LogicalRect) {
     let total = long_share + short_share;
     let normalized_long = if total > 0.0 {
         (long_share / total).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let long_height = plot.size.height * normalized_long as f32;
-    let short_height = plot.size.height - long_height;
+    let plot_height = plot.size.height;
+    let long_height = plot_height * normalized_long as f32;
+    let short_height = plot_height - long_height;
     (
-        Rect::from_origin_size(
-            Point::new(center_x - width / 2.0, plot.bottom() - long_height),
-            Size::new(width, long_height),
+        LogicalRect::from_origin_size(
+            LogicalPoint::new(center_x - width / 2.0, plot.bottom() - long_height),
+            LogicalSize::new(width, long_height),
         ),
-        Rect::from_origin_size(
-            Point::new(center_x - width / 2.0, plot.origin.y),
-            Size::new(width, short_height),
+        LogicalRect::from_origin_size(
+            LogicalPoint::new(center_x - width / 2.0, plot.origin.y),
+            LogicalSize::new(width, short_height),
         ),
     )
 }
@@ -403,7 +418,7 @@ pub(crate) fn label_indices(point_count: usize, maximum_labels: usize) -> Vec<us
         })
 }
 
-pub(crate) fn time_tick_indices(point_count: usize, plot_width: f32) -> Vec<usize> {
+pub(crate) fn time_tick_indices(point_count: usize, plot_width: LogicalPx) -> Vec<usize> {
     let fitting = (plot_width / TIME_TICK_WIDTH).floor() as usize;
     label_indices(
         point_count,
@@ -418,47 +433,57 @@ pub(crate) fn position_time_ticks(
 ) -> Box<[PositionedTimeTick]> {
     let width = TIME_TICK_WIDTH.min(layout.time_axis.size.width);
     let maximum_x = (layout.time_axis.right() - width).max(layout.time_axis.origin.x);
+    let origin_limit = layout.time_axis.origin.x;
     labels
         .into_iter()
         .map(|(index, label)| {
             let x = point_x(layout.plot, point_count, index);
             PositionedTimeTick {
                 label,
-                origin_x: (x - width / 2.0).clamp(layout.time_axis.origin.x, maximum_x),
+                origin_x: (x - width / 2.0).clamp(origin_limit, maximum_x),
                 width,
             }
         })
         .collect()
 }
 
-pub(crate) fn tooltip_bounds(anchor: Point, desired_size: Size, container: Rect, gap: f32) -> Rect {
-    let fitted = Size::new(
-        desired_size.width.min(container.size.width).max(0.0),
-        desired_size.height.min(container.size.height).max(0.0),
-    );
+pub(crate) fn tooltip_bounds(
+    anchor: LogicalPoint,
+    desired_size: LogicalSize,
+    container: LogicalRect,
+    gap: LogicalPx,
+) -> LogicalRect {
+    let fitted_width = desired_size
+        .width
+        .min(container.size.width)
+        .max(LogicalPx::ZERO);
+    let fitted_height = desired_size
+        .height
+        .min(container.size.height)
+        .max(LogicalPx::ZERO);
     let mut x = anchor.x + gap;
     let mut y = anchor.y + gap;
-    if x + fitted.width > container.right() {
-        x = anchor.x - gap - fitted.width;
+    if x + fitted_width > container.right() {
+        x = anchor.x - gap - fitted_width;
     }
-    if y + fitted.height > container.bottom() {
-        y = anchor.y - gap - fitted.height;
+    if y + fitted_height > container.bottom() {
+        y = anchor.y - gap - fitted_height;
     }
-    let maximum_x = (container.right() - fitted.width).max(container.origin.x);
-    let maximum_y = (container.bottom() - fitted.height).max(container.origin.y);
-    Rect::from_origin_size(
-        Point::new(
+    let maximum_x = (container.right() - fitted_width).max(container.origin.x);
+    let maximum_y = (container.bottom() - fitted_height).max(container.origin.y);
+    LogicalRect::from_origin_size(
+        LogicalPoint::new(
             x.clamp(container.origin.x, maximum_x),
             y.clamp(container.origin.y, maximum_y),
         ),
-        fitted,
+        LogicalSize::new(fitted_width, fitted_height),
     )
 }
 
-pub(crate) fn marker_bounds(center: Point, side: f32) -> Rect {
+pub(crate) fn marker_bounds(center: LogicalPoint, side: LogicalPx) -> LogicalRect {
     let radius = side / 2.0;
-    Rect::from_origin_size(
-        Point::new(center.x - radius, center.y - radius),
-        Size::new(radius * 2.0, radius * 2.0),
+    LogicalRect::from_origin_size(
+        LogicalPoint::new(center.x - radius, center.y - radius),
+        LogicalSize::new(radius * 2.0, radius * 2.0),
     )
 }

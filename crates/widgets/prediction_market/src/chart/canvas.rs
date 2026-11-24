@@ -6,7 +6,7 @@ use time::UtcOffset;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch, style_builder::StyleBuilder},
     text::ShapedTextHandle,
@@ -29,7 +29,7 @@ const CHART_SELECTOR: &str = "TEST_PREDICTION_MARKET_CHART";
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TimeTick {
     pub timestamp: i64,
-    pub x: f32,
+    pub x: LogicalPx,
     pub label: SmolStr,
 }
 
@@ -69,7 +69,7 @@ pub(crate) struct PreparedChart {
 impl PreparedChart {
     fn new(
         snapshot: &PredictionMarketSnapshot,
-        bounds: Rect,
+        bounds: LogicalRect,
         time_zone: UtcOffset,
         translate: &Translate,
     ) -> Self {
@@ -159,7 +159,7 @@ impl PreparedChart {
         }
     }
 
-    pub(crate) fn hover_at(&self, pointer: Point) -> Option<HoveredSample> {
+    pub(crate) fn hover_at(&self, pointer: LogicalPoint) -> Option<HoveredSample> {
         let domain = self.domain?;
         if !self.layout.plot.contains(pointer) {
             return None;
@@ -189,7 +189,7 @@ fn samples_of(series: &PredictionMarketSeries) -> Vec<Sample> {
 
 struct PreparedKey {
     snapshot: Arc<PredictionMarketSnapshot>,
-    bounds: Rect,
+    bounds: LogicalRect,
     time_zone: UtcOffset,
     language: LanguageCode,
     text_scale: f32,
@@ -208,7 +208,7 @@ impl PreparedKey {
 #[derive(Clone, Debug)]
 struct PaintedKey {
     snapshot: Arc<PredictionMarketSnapshot>,
-    bounds: Rect,
+    bounds: LogicalRect,
     time_zone: UtcOffset,
     language: LanguageCode,
     text_scale: f32,
@@ -270,7 +270,7 @@ impl ChartCanvas {
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
         let label = t_smol!(translate, "widget.names.prediction_market");
-        let node = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let node = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(CHART_SELECTOR)
             .style(
                 StyleBuilder::new()
@@ -316,7 +316,7 @@ impl ChartCanvas {
         &mut self,
         cx: &mut WidgetCx<'_>,
         snapshot: &Arc<PredictionMarketSnapshot>,
-        pointer: Option<Point>,
+        pointer: Option<LogicalPoint>,
         pulse_phase: Option<f32>,
     ) -> Result<bool, EngineError> {
         let Some(node) = self.node else {
@@ -326,7 +326,7 @@ impl ChartCanvas {
             return Ok(false);
         };
         let bounds = whole_pixel_bounds(target.layout().bounds);
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
             return Ok(false);
         }
 
@@ -476,7 +476,11 @@ impl ChartCanvas {
     }
 }
 
-fn register_line(cx: &mut WidgetCx<'_>, screen: &[ScreenPoint], width: f32) -> Option<GeometryId> {
+fn register_line(
+    cx: &mut WidgetCx<'_>,
+    screen: &[ScreenPoint],
+    width: LogicalPx,
+) -> Option<GeometryId> {
     let desc = line_geometry(screen, width)?;
     match cx.app_mut().geometry_mut().insert(desc) {
         Ok(id) => Some(id),
@@ -487,11 +491,11 @@ fn register_line(cx: &mut WidgetCx<'_>, screen: &[ScreenPoint], width: f32) -> O
     }
 }
 
-fn whole_pixel_bounds(bounds: Rect) -> Rect {
-    Rect::new(
-        bounds.origin.x.round(),
-        bounds.origin.y.round(),
-        bounds.size.width.round(),
-        bounds.size.height.round(),
+fn whole_pixel_bounds(bounds: LogicalRect) -> LogicalRect {
+    LogicalRect::new(
+        px(bounds.origin.x.value().round()),
+        px(bounds.origin.y.value().round()),
+        px(bounds.size.width.value().round()),
+        px(bounds.size.height.value().round()),
     )
 }

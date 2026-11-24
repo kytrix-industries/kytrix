@@ -4,7 +4,7 @@ use i18n::t_smol;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch, style_builder::StyleBuilder},
 };
@@ -107,18 +107,18 @@ impl CryptocurrencyEtfChart {
         self.hover.map(|hover| hover.index)
     }
 
-    pub(crate) fn hover_at(&self, cursor: Point) -> Option<Hover> {
+    pub(crate) fn hover_at(&self, cursor: LogicalPoint) -> Option<Hover> {
         let layout = self.cache.layout?;
         if !layout.plot.contains(cursor) {
             return None;
         }
         nearest_index(layout.plot, self.data.points.len(), cursor.x).map(|index| Hover {
             index,
-            cursor_y: cursor.y.round(),
+            cursor_y: px(cursor.y.value().round()),
         })
     }
 
-    pub(crate) fn point_at(&mut self, cursor: Point) -> bool {
+    pub(crate) fn point_at(&mut self, cursor: LogicalPoint) -> bool {
         let next = self.hover_at(cursor);
         if self.hover == next {
             return false;
@@ -144,7 +144,7 @@ impl CryptocurrencyEtfChart {
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
         let label = t_smol!(translate, "widget.cryptocurrency_etf.chart");
-        let node = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let node = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id("TEST_ETF_CHART")
             .style(
                 StyleBuilder::new()
@@ -187,7 +187,7 @@ impl CryptocurrencyEtfChart {
             return Ok(false);
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
             return Ok(false);
         }
 

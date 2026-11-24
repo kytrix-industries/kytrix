@@ -15,7 +15,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
     event::{Action, Event, InputEvent},
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         style::{Cursor, StylePatch},
@@ -57,14 +57,12 @@ use super::{
     watch::{self, WatchListError, deserialize_addresses},
 };
 
-const ACCOUNT_ROW_HEIGHT: f32 = 88.0;
-
-const WALLET_ROW_HEIGHT: f32 = ACCOUNT_ROW_HEIGHT + timeline::HEIGHT + 1.0;
-
+const ACCOUNT_ROW_HEIGHT: LogicalPx = px(88.0);
+const WALLET_ROW_HEIGHT: LogicalPx =
+    px(ACCOUNT_ROW_HEIGHT.value() + timeline::HEIGHT.value() + 1.0);
 const ROW_OVERSCAN: usize = 2;
 
-const ROW_CONTROL_SIZE: f32 = 24.0;
-
+const ROW_CONTROL_SIZE: LogicalPx = px(24.0);
 const ADDRESS_TEXT_SIZE: UnifiedSize = UnifiedSize::Medium;
 
 const META_TEXT_SIZE: UnifiedSize = UnifiedSize::Small;
@@ -282,7 +280,7 @@ pub struct HyperliquidWalletWidget {
     row_canvases: Rc<RefCell<AHashMap<usize, NodeId>>>,
     row_controls: AHashMap<usize, RowControls>,
     timeline_paints: AHashMap<usize, (NodeId, TimelinePaint)>,
-    hover: Option<(usize, Point)>,
+    hover: Option<(usize, LogicalPoint)>,
     hovered_row: Option<usize>,
     row_actions: Vec<Action>,
     detail_page: Option<NodeId>,
@@ -421,10 +419,10 @@ impl WidgetView for HyperliquidWalletWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .min_width_0()
                     .min_height_0()
@@ -468,10 +466,10 @@ impl WidgetView for HyperliquidWalletWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .min_width_0()
                     .min_height_0()
@@ -490,8 +488,8 @@ impl WidgetView for HyperliquidWalletWidget {
                     .flex_none()
                     .width_full()
                     .min_width_0()
-                    .padding_x(8.0)
-                    .padding_y(4.0)
+                    .padding_x(px(8.0))
+                    .padding_y(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), detail)?;
@@ -517,7 +515,7 @@ impl WidgetView for HyperliquidWalletWidget {
                     .width_full()
                     .min_width_0()
                     .items_center()
-                    .padding(4.0)
+                    .padding(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), detail)?;
@@ -599,7 +597,7 @@ impl WidgetView for HyperliquidWalletWidget {
                 self.track_hover(*position, cx)
             }
             Event::Input(InputEvent::PointerLeave { .. }) => {
-                self.track_hover(Point::new(-1.0, -1.0), cx)
+                self.track_hover(LogicalPoint::new(px(-1.0), px(-1.0)), cx)
             }
             _ => false,
         }
@@ -754,7 +752,7 @@ impl HyperliquidWalletWidget {
             key,
             ListOptions::fixed(WALLET_ROW_HEIGHT)
                 .overscan(ROW_OVERSCAN)
-                .padding(0.0, 0.0)
+                .padding(px(0.0), px(0.0))
                 .selection(SelectionMode::None),
             move |tree, parent, index| build_wallet_row(tree, parent, index, &context),
         );
@@ -826,7 +824,7 @@ impl HyperliquidWalletWidget {
                     .width_full()
                     .min_width_0()
                     .items_center()
-                    .padding(4.0)
+                    .padding(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), detail)?;
@@ -2007,7 +2005,7 @@ impl HyperliquidWalletWidget {
         header.refresh.release(cx.app_mut());
     }
 
-    fn track_hover(&mut self, position: Point, cx: &mut WidgetCx<'_>) -> bool {
+    fn track_hover(&mut self, position: LogicalPoint, cx: &mut WidgetCx<'_>) -> bool {
         let next = self.hover_target(position, cx);
         if next == self.hover {
             return false;
@@ -2026,7 +2024,11 @@ impl HyperliquidWalletWidget {
         true
     }
 
-    fn hover_target(&self, position: Point, cx: &WidgetCx<'_>) -> Option<(usize, Point)> {
+    fn hover_target(
+        &self,
+        position: LogicalPoint,
+        cx: &WidgetCx<'_>,
+    ) -> Option<(usize, LogicalPoint)> {
         let list = self.list.as_ref()?;
         for (index, row_node) in list.mounted_rows(cx.app()) {
             let Ok(row) = cx.tree().get(row_node) else {
@@ -2041,12 +2043,12 @@ impl HyperliquidWalletWidget {
                 continue;
             };
             let canvas_bounds = canvas_node.layout().bounds;
-            if canvas_bounds.size.width <= 0.0 || canvas_bounds.size.height <= 0.0 {
+            if canvas_bounds.size.width <= px(0.0) || canvas_bounds.size.height <= px(0.0) {
                 return None;
             }
             return Some((
                 index,
-                Point::new(
+                LogicalPoint::new(
                     position.x - canvas_bounds.origin.x,
                     position.y - canvas_bounds.origin.y,
                 ),
@@ -2206,7 +2208,7 @@ fn build_wallet_row(
             .style(
                 StyleBuilder::new()
                     .width_full()
-                    .height(1.0)
+                    .height(px(1.0))
                     .flex_none()
                     .build(),
             )
@@ -2229,8 +2231,8 @@ fn build_wallet_row(
                 .width_full()
                 .height(ACCOUNT_ROW_HEIGHT)
                 .min_width_0()
-                .padding_sides(4.0, 8.0, 4.0, 8.0)
-                .gap(2.0)
+                .padding_sides(px(4.0), px(8.0), px(4.0), px(8.0))
+                .gap(px(2.0))
                 .build(),
         )
         .build(tree, row)?;
@@ -2242,7 +2244,7 @@ fn build_wallet_row(
                 .items_center()
                 .width_full()
                 .min_width_0()
-                .gap(4.0)
+                .gap(px(4.0))
                 .build(),
         )
         .build(tree, account)?;
@@ -2330,7 +2332,7 @@ fn build_wallet_row(
                 .items_center()
                 .width_full()
                 .min_width_0()
-                .gap(4.0)
+                .gap(px(4.0))
                 .build(),
         )
         .build(tree, account)?;
@@ -2464,8 +2466,8 @@ fn build_wallet_row(
         .style(
             StyleBuilder::new()
                 .absolute()
-                .left(0.0)
-                .top(0.0)
+                .left(px(0.0))
+                .top(px(0.0))
                 .size_full()
                 .items_center()
                 .justify_center()
@@ -2517,8 +2519,8 @@ fn build_wallet_row(
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .right(8.0)
-                    .top(8.0)
+                    .right(px(8.0))
+                    .top(px(8.0))
                     .width(ROW_CONTROL_SIZE)
                     .height(ROW_CONTROL_SIZE)
                     .build(),
@@ -2548,7 +2550,7 @@ mod tests {
         account::error::AccountCatalogError, catalog::error::CatalogError,
     };
     use serde_json::json;
-    use ui_core::{event::ActionSource, math::Rect, node::signal::SignalScope};
+    use ui_core::{event::ActionSource, math::LogicalRect, node::signal::SignalScope};
     use widget::test_support::WidgetTestApp;
 
     use super::*;
@@ -2628,7 +2630,7 @@ mod tests {
     ) -> Pane {
         let scope = harness.app_mut().signal_scope();
         let status = WidgetStatus::new(harness.app_mut(), scope);
-        let parent = sized_parent(harness, 800.0, 600.0);
+        let parent = sized_parent(harness, px(800.0), px(600.0));
         let published = Rc::new(Cell::new(0));
         let counted = Rc::clone(&published);
         let config_change = WidgetConfigChange::new(move |_| {
@@ -4547,7 +4549,7 @@ mod tests {
         );
     }
 
-    fn sized_parent(harness: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
+    fn sized_parent(harness: &mut WidgetTestApp, width: LogicalPx, height: LogicalPx) -> NodeId {
         harness.with_cx(|cx| {
             let root = cx.tree().root();
             NodeBuilder::boxed()
@@ -4565,7 +4567,7 @@ mod tests {
         })
     }
 
-    fn bounds_of(harness: &WidgetTestApp, node: NodeId) -> Rect {
+    fn bounds_of(harness: &WidgetTestApp, node: NodeId) -> LogicalRect {
         harness
             .tree()
             .get(node)
@@ -4580,9 +4582,9 @@ mod tests {
             .unwrap_or_else(|| panic!("{prefix} is built under {parent:?}"))
     }
 
-    fn assert_close(actual: f32, expected: f32, what: &str) {
+    fn assert_close(actual: LogicalPx, expected: LogicalPx, what: &str) {
         assert!(
-            (actual - expected).abs() < 0.01,
+            (actual - expected).abs() < px(0.01),
             "{what}: {actual} != {expected}"
         );
     }
@@ -4593,7 +4595,7 @@ mod tests {
         let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
         load(&mut harness, &mut pane);
         report_overview(&mut harness, &mut pane, &a_wallet(), overview_of());
-        let parent = sized_parent(&mut harness, 600.0, 400.0);
+        let parent = sized_parent(&mut harness, px(600.0), px(400.0));
         pane.parent = parent;
         build_body(&mut harness, &mut pane);
         sync(&mut harness, &mut pane);
@@ -4603,12 +4605,12 @@ mod tests {
         let body_bounds = bounds_of(&harness, body);
         assert_close(
             body_bounds.size.width,
-            600.0,
+            px(600.0),
             "the body is as wide as its slot",
         );
         assert_close(
             body_bounds.size.height,
-            400.0,
+            px(400.0),
             "the body is as tall as its slot",
         );
 
@@ -4648,7 +4650,7 @@ mod tests {
         let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
         load(&mut harness, &mut pane);
         report_overview(&mut harness, &mut pane, &a_wallet(), overview_of());
-        let parent = sized_parent(&mut harness, 600.0, 400.0);
+        let parent = sized_parent(&mut harness, px(600.0), px(400.0));
         pane.parent = parent;
         build_body(&mut harness, &mut pane);
         open_wallet(&mut harness, &mut pane);
@@ -4692,7 +4694,7 @@ mod tests {
             "nothing is left under the tables",
         );
         assert!(
-            area_bounds.size.height > 300.0,
+            area_bounds.size.height > px(300.0),
             "the tables fill the page under the tabs: {}",
             area_bounds.size.height
         );
@@ -5089,12 +5091,12 @@ mod tests {
                 );
                 assert_close(
                     bounds_of(&harness, divider).size.height,
-                    1.0,
+                    px(1.0),
                     "the divider is one line",
                 );
                 assert_close(
                     account_bounds.origin.y - row_bounds.origin.y,
-                    1.0,
+                    px(1.0),
                     "the divider sits above the account line, inside the row",
                 );
                 assert_close(

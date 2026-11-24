@@ -13,11 +13,9 @@ dicebear-core = { workspace = true }
 dicebear-styles = { workspace = true, features = ["gaze"] }
 futures = { workspace = true }
 i18n = { workspace = true }
-image = { workspace = true }
 kytrix_service_provider = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
-resvg = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 smol_str = { workspace = true }
@@ -25,7 +23,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 ui_core = { workspace = true }
 url = { workspace = true }
-usvg = { workspace = true }
 widget = { workspace = true }
 zeroize = { workspace = true }
 

@@ -9,7 +9,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::Event,
-    math::Size,
+    math::{LogicalSize, px},
     window::{Decorations, WindowId, WindowOptions},
 };
 use ui_kit::theme::role::Role;
@@ -496,8 +496,8 @@ impl Shell {
 pub(crate) fn main_window_options(background: ui_core::paint::color::Color) -> WindowOptions {
     WindowOptions {
         title: SmolStr::new_static("Kytrix"),
-        size: Size::new(1280.0, 960.0),
-        min_size: Some(Size::new(800.0, 600.0)),
+        size: LogicalSize::new(px(1280.0), px(960.0)),
+        min_size: Some(LogicalSize::new(px(800.0), px(600.0))),
         decorations: if cfg!(target_os = "windows") {
             Decorations::None
         } else {

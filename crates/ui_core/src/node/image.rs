@@ -1,9 +1,8 @@
 use crate::{
-    math::{LogicalRect, LogicalSize},
+    math::{DevicePixelRatio, DeviceSize, LogicalRect, LogicalSize, dp},
     paint::{atlas::AtlasTile, color::Color},
     resources::{PendingResource, ResourceId},
 };
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ImageFit {
     #[default]
@@ -34,6 +33,7 @@ pub struct ImageContent {
     fit: ImageFit,
     modulation: Color,
     intrinsic: Option<LogicalSize>,
+    prepared_target: Option<DeviceSize>,
 }
 
 impl ImageContent {
@@ -43,6 +43,7 @@ impl ImageContent {
             fit,
             modulation: Color::WHITE,
             intrinsic: None,
+            prepared_target: None,
         }
     }
 
@@ -66,8 +67,14 @@ impl ImageContent {
         self.intrinsic
     }
 
+    #[must_use]
+    pub const fn prepared_target(&self) -> Option<DeviceSize> {
+        self.prepared_target
+    }
+
     pub(crate) fn set_source(&mut self, source: ImageSource) {
         self.source = source;
+        self.prepared_target = None;
     }
 
     pub(crate) fn set_modulation(&mut self, modulation: Color) {
@@ -76,6 +83,10 @@ impl ImageContent {
 
     pub(crate) fn set_intrinsic(&mut self, intrinsic: LogicalSize) {
         self.intrinsic = Some(intrinsic);
+    }
+
+    pub(crate) fn set_prepared_target(&mut self, target: DeviceSize) {
+        self.prepared_target = Some(target);
     }
 }
 
@@ -131,11 +142,45 @@ fn crop_axis(start: f32, end: f32, fraction: f32) -> (f32, f32) {
     (first, first + span)
 }
 
+pub(crate) fn variant_target(
+    bounds: LogicalRect,
+    fit: ImageFit,
+    intrinsic: LogicalSize,
+    dpr: DevicePixelRatio,
+) -> Option<DeviceSize> {
+    if bounds.size.is_empty() || intrinsic.is_empty() {
+        return None;
+    }
+    let drawn = match fit {
+        ImageFit::Fill => bounds.size,
+        ImageFit::Contain => {
+            let scale =
+                (bounds.size.width / intrinsic.width).min(bounds.size.height / intrinsic.height);
+            intrinsic * scale
+        }
+        ImageFit::Cover => {
+            let scale =
+                (bounds.size.width / intrinsic.width).max(bounds.size.height / intrinsic.height);
+            intrinsic * scale
+        }
+    };
+    let physical = dpr.to_physical_size(drawn);
+    let width = physical.width.value();
+    let height = physical.height.value();
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return None;
+    }
+    Some(DeviceSize::new(
+        dp(width.ceil() as i32),
+        dp(height.ceil() as i32),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ImageFit, ImageSource, cover_tile, fit_bounds};
+    use super::{ImageFit, ImageSource, cover_tile, fit_bounds, variant_target};
     use crate::{
-        math::{LogicalRect, LogicalSize, px},
+        math::{DevicePixelRatio, DeviceSize, LogicalRect, LogicalSize, dp, px},
         paint::atlas::{AtlasKind, AtlasTile},
         resources::{PendingResource, ResourceId},
     };
@@ -246,5 +291,76 @@ mod tests {
         assert_eq!(ready.resource(), Some(ResourceId::for_test(3, 1)));
         assert_eq!(pending.resource(), None);
         assert_ne!(ready, pending);
+    }
+
+    #[test]
+    fn variant_target_fills_the_box_at_the_window_dpr() {
+        let bounds = LogicalRect::new(px(10.0), px(20.0), px(100.0), px(50.0));
+        let intrinsic = LogicalSize::new(px(10.0), px(10.0));
+        assert_eq!(
+            variant_target(bounds, ImageFit::Fill, intrinsic, DevicePixelRatio::ONE),
+            Some(DeviceSize::new(dp(100), dp(50))),
+            "Fill 的栅格目标 = 节点盒"
+        );
+        assert_eq!(
+            variant_target(
+                bounds,
+                ImageFit::Fill,
+                intrinsic,
+                DevicePixelRatio::new(1.5).expect("scale")
+            ),
+            Some(DeviceSize::new(dp(150), dp(75))),
+            "目标物理尺寸 = 绘制盒 × DPR"
+        );
+        assert_eq!(
+            variant_target(
+                LogicalRect::new(px(0.0), px(0.0), px(10.2), px(10.2)),
+                ImageFit::Fill,
+                intrinsic,
+                DevicePixelRatio::ONE
+            ),
+            Some(DeviceSize::new(dp(11), dp(11))),
+            "小数绘制盒必须向上取整"
+        );
+    }
+
+    #[test]
+    fn variant_target_keeps_the_intrinsic_aspect_for_contain_and_cover() {
+        let bounds = LogicalRect::new(px(0.0), px(0.0), px(100.0), px(50.0));
+        let intrinsic = LogicalSize::new(px(10.0), px(10.0));
+        assert_eq!(
+            variant_target(bounds, ImageFit::Contain, intrinsic, DevicePixelRatio::ONE),
+            Some(DeviceSize::new(dp(50), dp(50))),
+            "Contain 的栅格目标 = 内嵌后的实际绘制尺寸"
+        );
+        assert_eq!(
+            variant_target(bounds, ImageFit::Cover, intrinsic, DevicePixelRatio::ONE),
+            Some(DeviceSize::new(dp(100), dp(100))),
+            "Cover 按覆盖盒的比例栅格化，UV 裁切发生在绘制期"
+        );
+    }
+
+    #[test]
+    fn variant_target_rejects_degenerate_geometry() {
+        let bounds = LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0));
+        let intrinsic = LogicalSize::new(px(10.0), px(10.0));
+        for empty in [
+            LogicalRect::new(px(0.0), px(0.0), px(0.0), px(10.0)),
+            LogicalRect::new(px(0.0), px(0.0), px(10.0), px(f32::NAN)),
+        ] {
+            assert_eq!(
+                variant_target(empty, ImageFit::Fill, intrinsic, DevicePixelRatio::ONE),
+                None
+            );
+        }
+        for image in [
+            LogicalSize::ZERO,
+            LogicalSize::new(px(f32::INFINITY), px(1.0)),
+        ] {
+            assert_eq!(
+                variant_target(bounds, ImageFit::Contain, image, DevicePixelRatio::ONE),
+                None
+            );
+        }
     }
 }

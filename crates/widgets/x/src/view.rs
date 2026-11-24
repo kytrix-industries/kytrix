@@ -25,6 +25,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch},
     error::EngineError,
     event::{Action, Event, InputEvent, PointerButton},
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -40,7 +41,7 @@ use ui_kit::{
     kit::{
         button::Button,
         empty_state::EmptyState,
-        icon::{IconKind, svg},
+        icon::{ICON_INTRINSIC_SIZE, IconKind, svg},
         list::{List, ListOptions, SelectionMode},
         size::{UnifiedSizable, UnifiedSize},
     },
@@ -72,7 +73,7 @@ use super::{
     },
 };
 
-const ROW_ESTIMATE: f32 = 240.0;
+const ROW_ESTIMATE: LogicalPx = px(240.0);
 
 const AVATAR_SIZE: f32 = 40.0;
 
@@ -848,6 +849,7 @@ impl XWidget {
     }
 
     fn register_media(&mut self, cx: &mut WidgetCx<'_>) {
+        let window = cx.window();
         let mut registered = false;
         for (url, state) in self.media.iter() {
             if !matches!(state, MediaState::Ready(_)) {
@@ -869,10 +871,16 @@ impl XWidget {
             if bytes.is_empty() {
                 continue;
             }
-            let pending = cx
+            let pending = match cx
                 .app_mut()
-                .resources_mut()
-                .insert_async(Bytes::from(bytes));
+                .insert_bitmap_async_for_window(window, Bytes::from(bytes))
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    log::warn!("the x pane could not register a cached picture: {error}");
+                    continue;
+                }
+            };
             self.images
                 .borrow_mut()
                 .insert(url.clone(), ImageSource::Pending(pending));
@@ -947,7 +955,7 @@ impl XWidget {
                 .keep_on_newest()
                 .separator()
                 .selection(SelectionMode::None)
-                .padding(0.0, 0.0),
+                .padding(px(0.0), px(0.0)),
             move |tree, row_parent, index| build_row(tree, row_parent, index, &context),
         );
         list.set_initial_count(cx.app_mut(), count);
@@ -985,10 +993,10 @@ impl XWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
@@ -1503,18 +1511,14 @@ impl XWidget {
 }
 
 fn register_row_icons(cx: &mut WidgetCx<'_>) -> Result<RowIcons, EngineError> {
-    let (window, scale) = {
-        let window = cx.window_mut();
-        (window.id(), window.scale().factor())
-    };
+    let window = cx.window();
     let mut register = |kind: IconKind| -> Result<ImageSource, EngineError> {
-        let image = cx.app_mut().resources_mut().insert_owned_svg_for_display(
+        let image = cx.app_mut().insert_svg_for_window(
             window,
             svg(kind).as_bytes(),
-            ui_core::math::Size::new(16.0, 16.0),
-            scale,
+            ICON_INTRINSIC_SIZE,
         )?;
-        Ok(ImageSource::Ready(image.id))
+        Ok(ImageSource::Ready(image.id()))
     };
     Ok(RowIcons {
         repost: register(IconKind::Repeat)?,
@@ -1673,8 +1677,8 @@ fn build_row(
         .style(
             StyleBuilder::new()
                 .flex_col()
-                .gap(6.0)
-                .padding_sides(12.0, 12.0, 12.0, 12.0)
+                .gap(px(6.0))
+                .padding_sides(px(12.0), px(12.0), px(12.0), px(12.0))
                 .width_full()
                 .min_width_0()
                 .build(),
@@ -1732,8 +1736,8 @@ fn build_repost_line(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(4.0)
-                .padding_sides(0.0, 0.0, 0.0, AVATAR_SIZE + 12.0)
+                .gap(px(4.0))
+                .padding_sides(px(0.0), px(0.0), px(0.0), px(AVATAR_SIZE + 12.0))
                 .min_width_0()
                 .build(),
         )
@@ -1786,7 +1790,7 @@ fn build_tweet(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(12.0)
+                .gap(px(12.0))
                 .min_width_0()
                 .width_full()
                 .build(),
@@ -1799,7 +1803,7 @@ fn build_tweet(
             StyleBuilder::new()
                 .flex_col()
                 .flex_1()
-                .gap(6.0)
+                .gap(px(6.0))
                 .min_width_0()
                 .build(),
         )
@@ -1830,8 +1834,8 @@ fn build_avatar(
         AVATAR_SIZE
     };
     let style = StyleBuilder::new()
-        .width(size)
-        .height(size)
+        .width(px(size))
+        .height(px(size))
         .flex_none()
         .build();
     let image = if plan.avatar_url.is_empty() {
@@ -1885,7 +1889,7 @@ fn build_tweet_header(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(4.0)
+                .gap(px(4.0))
                 .min_width_0()
                 .build(),
         )
@@ -2072,9 +2076,9 @@ fn build_gallery(
         .style(
             StyleBuilder::new()
                 .flex_col()
-                .gap(4.0)
-                .width(tile_width * columns as f32 + 4.0 * (columns - 1) as f32)
-                .max_width(GALLERY_WIDE_WIDTH)
+                .gap(px(4.0))
+                .width(px(tile_width * columns as f32 + 4.0 * (columns - 1) as f32))
+                .max_width(px(GALLERY_WIDE_WIDTH))
                 .build(),
         )
         .build(tree, parent)?;
@@ -2084,7 +2088,7 @@ fn build_gallery(
             .style(
                 StyleBuilder::new()
                     .flex_row()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .width_full()
                     .min_width_0()
                     .build(),
@@ -2114,8 +2118,8 @@ fn build_media_tile(
     let media = context.media();
     let state = media.get(&item.url);
     let style = StyleBuilder::new()
-        .width(width)
-        .height(height)
+        .width(px(width))
+        .height(px(height))
         .flex_none()
         .build();
     let mut tile = NodeBuilder::boxed()
@@ -2171,12 +2175,17 @@ fn build_media_tile(
                         NodeBuilder::image_pending(pending, ImageFit::Cover)
                     }
                 };
-                node.style(StyleBuilder::new().width(width).height(height).build())
-                    .a11y(A11yOverride {
-                        hidden: true,
-                        ..A11yOverride::default()
-                    })
-                    .build(tree, tile)?;
+                node.style(
+                    StyleBuilder::new()
+                        .width(px(width))
+                        .height(px(height))
+                        .build(),
+                )
+                .a11y(A11yOverride {
+                    hidden: true,
+                    ..A11yOverride::default()
+                })
+                .build(tree, tile)?;
             } else {
                 build_icon_centered(
                     tree,
@@ -2239,9 +2248,9 @@ fn build_quote(
         .style(
             StyleBuilder::new()
                 .flex_row()
-                .gap(8.0)
-                .padding(8.0)
-                .border(1.0)
+                .gap(px(8.0))
+                .padding(px(8.0))
+                .border(px(1.0))
                 .min_width_0()
                 .build(),
         )
@@ -2249,7 +2258,7 @@ fn build_quote(
             let theme = context.theme.clone();
             move |read| StylePatch {
                 border: Some(ui_core::paint::primitive::Border {
-                    width: 1.0,
+                    width: px(1.0),
                     color: theme.role(read, Role::LineDivider),
                 }),
                 ..StylePatch::default()
@@ -2267,7 +2276,7 @@ fn build_quote(
             StyleBuilder::new()
                 .flex_col()
                 .flex_1()
-                .gap(4.0)
+                .gap(px(4.0))
                 .min_width_0()
                 .build(),
         )
@@ -2297,8 +2306,8 @@ fn build_icon(
     };
     node.style(
         StyleBuilder::new()
-            .width(size)
-            .height(size)
+            .width(px(size))
+            .height(px(size))
             .flex_none()
             .build(),
     )
@@ -2324,7 +2333,7 @@ fn build_icon_centered(
         ImageSource::Ready(resource) => NodeBuilder::image(resource, ImageFit::Contain),
         ImageSource::Pending(pending) => NodeBuilder::image_pending(pending, ImageFit::Contain),
     };
-    node.style(StyleBuilder::new().width(size).height(size).build())
+    node.style(StyleBuilder::new().width(px(size)).height(px(size)).build())
         .bind_style(themed_foreground(theme, role))
         .a11y(A11yOverride {
             hidden: true,

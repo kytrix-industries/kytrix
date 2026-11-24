@@ -8,6 +8,7 @@ use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::engine::KytrixServiceError;
 use ui_core::{
     event::ActionSource,
+    math::{LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope, tree::NodeKind},
     paint::{
         canvas::Canvas,
@@ -87,7 +88,7 @@ fn body_parent(harness: &mut WidgetTestApp) -> NodeId {
         let root = cx.tree().root();
         NodeBuilder::boxed()
             .id("TEST_FGI_HOST")
-            .style(StyleBuilder::new().size(400.0, 480.0).build())
+            .style(StyleBuilder::new().size(px(400.0), px(480.0)).build())
             .build(cx.tree_mut(), root)
             .expect("the host's root is alive")
     })
@@ -293,7 +294,7 @@ fn glyph_run_count(canvas: &Canvas) -> usize {
         .count()
 }
 
-fn node_bounds(harness: &WidgetTestApp, node: NodeId) -> ui_core::math::Rect {
+fn node_bounds(harness: &WidgetTestApp, node: NodeId) -> LogicalRect {
     harness
         .tree()
         .get(node)
@@ -1138,7 +1139,7 @@ fn a_collected_reading_should_draw_the_gauge_frame() {
     let bounds = node_bounds(&harness, node);
     assert_eq!(canvas.bounds(), bounds, "the canvas covers the node's box");
     assert!(
-        bounds.size.width > 96.0 && bounds.size.height > 72.0,
+        bounds.size.width > px(96.0) && bounds.size.height > px(72.0),
         "the fixture box is large enough for a gauge: {bounds:?}"
     );
 
@@ -1208,7 +1209,7 @@ fn the_two_decorative_icons_should_keep_the_reference_size() {
         .children()[1];
     assert_eq!(
         node_bounds(&harness, info_icon).size.width,
-        12.0,
+        px(12.0),
         "the heading's info icon is drawn at the reference's 12 px"
     );
 
@@ -1225,7 +1226,7 @@ fn the_two_decorative_icons_should_keep_the_reference_size() {
         .children()[0];
     assert_eq!(
         node_bounds(&harness, refresh_icon).size.width,
-        12.0,
+        px(12.0),
         "the header's refresh icon is drawn at the reference's 12 px"
     );
 }

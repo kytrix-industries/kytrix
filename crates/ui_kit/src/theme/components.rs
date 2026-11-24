@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use ui_core::paint::color::Color;
+use ui_core::{
+    math::{LogicalPx, px},
+    paint::color::Color,
+};
 
 use super::{
     color::{black_with_alpha, over, with_alpha},
@@ -35,11 +38,11 @@ pub enum ControlSize {
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct SizeTokens {
-    pub height: f32,
-    pub gap: f32,
-    pub padding_x: f32,
-    pub font_size: f32,
-    pub icon_size: f32,
+    pub height: LogicalPx,
+    pub gap: LogicalPx,
+    pub padding_x: LogicalPx,
+    pub font_size: LogicalPx,
+    pub icon_size: LogicalPx,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -59,7 +62,7 @@ pub struct ComponentTokens {
     pub small: SizeTokens,
     pub medium: SizeTokens,
     pub large: SizeTokens,
-    pub border_width: f32,
+    pub border_width: LogicalPx,
     pub animation_tick: Duration,
     pub shadow: ShadowTokens,
     pub scrollbar: ScrollbarTokens,
@@ -68,18 +71,18 @@ pub struct ComponentTokens {
 impl ComponentTokens {
     pub fn standard() -> Self {
         let size = |height, gap, padding_x, font_size, icon_size| SizeTokens {
-            height,
-            gap,
-            padding_x,
-            font_size,
-            icon_size,
+            height: px(height),
+            gap: px(gap),
+            padding_x: px(padding_x),
+            font_size: px(font_size),
+            icon_size: px(icon_size),
         };
 
         Self {
             small: size(20.0, 4.0, 4.0, 12.0, 8.0),
             medium: size(30.0, 6.0, 6.0, 14.0, 12.0),
             large: size(40.0, 8.0, 10.0, 18.0, 16.0),
-            border_width: 1.0,
+            border_width: px(1.0),
             animation_tick: Duration::from_millis(150),
             shadow: ShadowTokens {
                 dialog_alpha: 0.25,
@@ -483,6 +486,8 @@ impl ChartColors {
 
 #[cfg(test)]
 mod tests {
+    use ui_core::math::px;
+
     use super::{ComponentTokens, ControlSize, InteractiveVariant};
     use crate::theme::{
         appearance::Appearance, color::contrast, palette::Palette, resolved::Theme, role::Role,
@@ -779,14 +784,18 @@ mod tests {
         let tokens = ComponentTokens::standard();
         for (size, height, gap, padding_x, font_size, icon_size) in FROZEN_SIZE_LADDER {
             let token = tokens.for_size(size);
-            assert_eq!(token.height, height, "高度");
-            assert_eq!(token.gap, gap, "间隙");
-            assert_eq!(token.padding_x, padding_x, "水平内边距");
-            assert_eq!(token.font_size, font_size, "字号（旧 rems × 16 px 根字号）");
-            assert_eq!(token.icon_size, icon_size, "图标边长");
+            assert_eq!(token.height, px(height), "高度");
+            assert_eq!(token.gap, px(gap), "间隙");
+            assert_eq!(token.padding_x, px(padding_x), "水平内边距");
+            assert_eq!(
+                token.font_size,
+                px(font_size),
+                "字号（旧 rems × 16 px 根字号）"
+            );
+            assert_eq!(token.icon_size, px(icon_size), "图标边长");
         }
 
-        assert_eq!(tokens.border_width, 1.0);
+        assert_eq!(tokens.border_width, px(1.0));
         assert_eq!(tokens.animation_tick, std::time::Duration::from_millis(150));
         assert_eq!(tokens.shadow.dialog_alpha, 0.25);
         assert_eq!(tokens.shadow.menu_alpha, 0.12);

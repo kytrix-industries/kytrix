@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 use ui_core::{
     app::App,
     event::{InputEvent, Modifiers, PointerButton},
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect, px},
     node::{
         id::NodeId,
         tree::{Node, NodeKind},
@@ -92,7 +92,7 @@ pub(crate) struct Harness {
 impl Harness {
     pub(crate) fn new() -> Self {
         let mut app = TestApp::with_options(ui_core::window::WindowOptions {
-            size: ui_core::math::Size::new(1280.0, 900.0),
+            size: ui_core::math::LogicalSize::new(px(1280.0), px(900.0)),
             ..ui_core::window::WindowOptions::default()
         });
         let runtime = app.app().runtime_handle().clone();
@@ -208,11 +208,11 @@ impl Harness {
         self.app.advance(by);
     }
 
-    pub(crate) fn bounds(&self, node: NodeId) -> Option<Rect> {
+    pub(crate) fn bounds(&self, node: NodeId) -> Option<LogicalRect> {
         self.app.probe().bounds(node)
     }
 
-    pub(crate) fn click(&mut self, position: Point) {
+    pub(crate) fn click(&mut self, position: LogicalPoint) {
         self.app.inject(InputEvent::pointer_down(
             position,
             PointerButton::Primary,
@@ -225,7 +225,7 @@ impl Harness {
         ));
     }
 
-    pub(crate) fn move_pointer(&mut self, position: Point) {
+    pub(crate) fn move_pointer(&mut self, position: LogicalPoint) {
         let _ = self.app.move_pointer(position);
     }
 

@@ -1,5 +1,5 @@
 use app_config::workspace::{WorkspaceLayout, WorkspaceOrientation, WorkspaceWidget};
-use ui_core::math::Rect;
+use ui_core::math::{LogicalPx, LogicalRect, px};
 
 use crate::shell::metrics::{PANE_COMPACT_WIDTH, PANE_MIN_WIDTH, SPLIT_BAR_SIZE};
 
@@ -76,7 +76,7 @@ impl PaneNode {
         }
     }
 
-    fn preferred_width(&self) -> f32 {
+    fn preferred_width(&self) -> LogicalPx {
         match self {
             Self::Leaf { .. } => PANE_MIN_WIDTH,
             Self::Split {
@@ -93,7 +93,7 @@ impl PaneNode {
         }
     }
 
-    fn compact_width(&self) -> f32 {
+    fn compact_width(&self) -> LogicalPx {
         match self {
             Self::Leaf { .. } => PANE_COMPACT_WIDTH,
             Self::Split {
@@ -130,8 +130,8 @@ pub(crate) struct PaneTree {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkspaceGeometry {
-    pub panes: Vec<(PaneId, Rect)>,
-    pub splits: Vec<(SplitId, Rect, f32)>,
+    pub panes: Vec<(PaneId, LogicalRect)>,
+    pub splits: Vec<(SplitId, LogicalRect, LogicalPx)>,
 }
 
 impl Default for PaneTree {
@@ -378,20 +378,20 @@ impl PaneTree {
         get(&self.root, split)
     }
 
-    pub(crate) fn layout(&mut self, viewport: Rect) -> WorkspaceGeometry {
+    pub(crate) fn layout(&mut self, viewport: LogicalRect) -> WorkspaceGeometry {
         let mut geometry = WorkspaceGeometry::default();
-        let viewport = Rect::new(
-            viewport.origin.x.max(0.0),
-            viewport.origin.y.max(0.0),
-            viewport.size.width.max(0.0),
-            viewport.size.height.max(0.0),
+        let viewport = LogicalRect::new(
+            viewport.origin.x.max(px(0.0)),
+            viewport.origin.y.max(px(0.0)),
+            viewport.size.width.max(px(0.0)),
+            viewport.size.height.max(px(0.0)),
         );
         walk(&mut self.root, viewport, &mut geometry);
         geometry
     }
 }
 
-fn walk(node: &mut PaneNode, rect: Rect, geometry: &mut WorkspaceGeometry) {
+fn walk(node: &mut PaneNode, rect: LogicalRect, geometry: &mut WorkspaceGeometry) {
     match node {
         PaneNode::Leaf { pane } => geometry.panes.push((*pane, rect)),
         PaneNode::Split {
@@ -412,12 +412,12 @@ fn walk(node: &mut PaneNode, rect: Rect, geometry: &mut WorkspaceGeometry) {
 }
 
 fn split_bounds(
-    rect: Rect,
+    rect: LogicalRect,
     orientation: PaneOrientation,
     fraction: f32,
     head: &PaneNode,
     tail: &PaneNode,
-) -> (Rect, Rect, Rect, f32, f32) {
+) -> (LogicalRect, LogicalRect, LogicalRect, LogicalPx, f32) {
     let fraction = if fraction.is_finite() {
         fraction.clamp(0.0, 1.0)
     } else {
@@ -425,8 +425,9 @@ fn split_bounds(
     };
     match orientation {
         PaneOrientation::Horizontal => {
-            let bar = SPLIT_BAR_SIZE.min(rect.size.width.max(0.0));
-            let content = (rect.size.width - bar).max(0.0);
+            let width = rect.size.width.max(LogicalPx::ZERO);
+            let bar = SPLIT_BAR_SIZE.min(width);
+            let content = (width - bar).max(LogicalPx::ZERO);
             let head_min = enforced_width(
                 content,
                 head.preferred_width(),
@@ -445,73 +446,76 @@ fn split_bounds(
                 head_min.min(content),
                 (content - tail_min).max(head_min).min(content),
             );
-            let produced = if content > 0.0 {
-                (head_width / content * 1000.0).round() / 1000.0
-            } else {
-                fraction
-            };
-            let head_rect = Rect::new(rect.origin.x, rect.origin.y, head_width, rect.size.height);
-            let bar_rect = Rect::new(
+            let produced = head_width / content;
+            let head_rect =
+                LogicalRect::new(rect.origin.x, rect.origin.y, head_width, rect.size.height);
+            let bar_rect = LogicalRect::new(
                 rect.origin.x + head_width,
                 rect.origin.y,
                 bar,
                 rect.size.height,
             );
-            let tail_rect = Rect::new(
+            let tail_rect = LogicalRect::new(
                 rect.origin.x + head_width + bar,
                 rect.origin.y,
-                (content - head_width).max(0.0),
+                (content - head_width).max(LogicalPx::ZERO),
                 rect.size.height,
             );
-            (head_rect, bar_rect, tail_rect, content, produced)
-        }
-        PaneOrientation::Vertical => {
-            let bar = SPLIT_BAR_SIZE.min(rect.size.height.max(0.0));
-            let content = (rect.size.height - bar).max(0.0);
-            let head_height = content * fraction;
-            let produced = if content > 0.0 {
-                (head_height / content * 1000.0).round() / 1000.0
+            let produced = if content > LogicalPx::ZERO {
+                (produced * 1000.0).round() / 1000.0
             } else {
                 fraction
             };
-            let head_rect = Rect::new(rect.origin.x, rect.origin.y, rect.size.width, head_height);
-            let bar_rect = Rect::new(
+            (head_rect, bar_rect, tail_rect, content, produced)
+        }
+        PaneOrientation::Vertical => {
+            let height = rect.size.height.max(LogicalPx::ZERO);
+            let bar = SPLIT_BAR_SIZE.min(height);
+            let content = (height - bar).max(LogicalPx::ZERO);
+            let head_height = content * fraction;
+            let head_rect =
+                LogicalRect::new(rect.origin.x, rect.origin.y, rect.size.width, head_height);
+            let bar_rect = LogicalRect::new(
                 rect.origin.x,
                 rect.origin.y + head_height,
                 rect.size.width,
                 bar,
             );
-            let tail_rect = Rect::new(
+            let tail_rect = LogicalRect::new(
                 rect.origin.x,
                 rect.origin.y + head_height + bar,
                 rect.size.width,
-                (content - head_height).max(0.0),
+                (content - head_height).max(LogicalPx::ZERO),
             );
+            let produced = if content > LogicalPx::ZERO {
+                ((head_height / content) * 1000.0).round() / 1000.0
+            } else {
+                fraction
+            };
             (head_rect, bar_rect, tail_rect, content, produced)
         }
     }
 }
 
 fn enforced_width(
-    available: f32,
-    preferred: f32,
-    other_preferred: f32,
-    compact: f32,
-    other_compact: f32,
-) -> f32 {
+    available: LogicalPx,
+    preferred: LogicalPx,
+    other_preferred: LogicalPx,
+    compact: LogicalPx,
+    other_compact: LogicalPx,
+) -> LogicalPx {
     if available >= preferred + other_preferred {
         preferred
     } else if available >= compact + other_compact {
         compact
     } else {
-        0.0
+        LogicalPx::ZERO
     }
 }
 
 #[cfg(test)]
 mod tests {
     use app_config::workspace::WorkspaceWidget;
-    use ui_core::math::Rect;
 
     use super::*;
 
@@ -542,8 +546,8 @@ mod tests {
         }
     }
 
-    fn viewport(width: f32, height: f32) -> Rect {
-        Rect::new(0.0, 0.0, width, height)
+    fn viewport(width: f32, height: f32) -> LogicalRect {
+        LogicalRect::new(px(0.0), px(0.0), px(width), px(height))
     }
 
     #[test]
@@ -567,12 +571,12 @@ mod tests {
         let (head, tail) = (geometry.panes[0].1, geometry.panes[1].1);
         let (_, bar, content) = geometry.splits[0];
         assert_eq!(bar.size.width, SPLIT_BAR_SIZE);
-        assert_eq!(content, 800.0);
-        assert_eq!(head.size.width, 400.0);
-        assert_eq!(tail.size.width, 400.0);
+        assert_eq!(content, px(800.0));
+        assert_eq!(head.size.width, px(400.0));
+        assert_eq!(tail.size.width, px(400.0));
         assert_eq!(head.origin.x + head.size.width, bar.origin.x);
         assert_eq!(bar.origin.x + bar.size.width, tail.origin.x);
-        assert_eq!(tail.origin.x + tail.size.width, 804.0);
+        assert_eq!(tail.origin.x + tail.size.width, px(804.0));
         assert_eq!(leaves.len(), 2);
     }
 
@@ -585,11 +589,11 @@ mod tests {
         let (head, tail) = (geometry.panes[0].1, geometry.panes[1].1);
         let (_, bar, content) = geometry.splits[0];
         assert_eq!(bar.size.height, SPLIT_BAR_SIZE);
-        assert_eq!(content, 200.0);
-        assert_eq!(head.size.height, 50.0);
-        assert_eq!(tail.size.height, 150.0);
-        assert_eq!(head.size.width, 300.0);
-        assert_eq!(tail.origin.y + tail.size.height, 204.0);
+        assert_eq!(content, px(200.0));
+        assert_eq!(head.size.height, px(50.0));
+        assert_eq!(tail.size.height, px(150.0));
+        assert_eq!(head.size.width, px(300.0));
+        assert_eq!(tail.origin.y + tail.size.height, px(204.0));
     }
 
     #[test]
@@ -600,7 +604,7 @@ mod tests {
 
         let head = geometry.panes[0].1;
         let tail = geometry.panes[1].1;
-        let content = 800.0 - SPLIT_BAR_SIZE;
+        let content = px(800.0) - SPLIT_BAR_SIZE;
         assert_eq!(head.size.width, content - PANE_MIN_WIDTH);
         assert_eq!(tail.size.width, PANE_MIN_WIDTH);
         let split = geometry.splits[0].0;
@@ -618,9 +622,9 @@ mod tests {
 
         let head = geometry.panes[0].1;
         let tail = geometry.panes[1].1;
-        assert_eq!(head.size.width, 60.0);
-        assert_eq!(tail.size.width, 60.0);
-        assert!(head.size.width > 0.0 && tail.size.width > 0.0);
+        assert_eq!(head.size.width, px(60.0));
+        assert_eq!(tail.size.width, px(60.0));
+        assert!(head.size.width > px(0.0) && tail.size.width > px(0.0));
     }
 
     #[test]
@@ -701,8 +705,8 @@ mod tests {
 
         assert!(tree.set_fraction(split, 0.25));
         let geometry = tree.layout(viewport(804.0, 400.0));
-        assert_eq!(geometry.panes[0].1.size.width, 200.0);
-        assert_eq!(geometry.panes[1].1.size.width, 600.0);
+        assert_eq!(geometry.panes[0].1.size.width, px(200.0));
+        assert_eq!(geometry.panes[1].1.size.width, px(600.0));
         assert_eq!(tree.fraction(split), Some(0.25));
     }
 
@@ -716,6 +720,6 @@ mod tests {
         );
         let (mut tree, _) = PaneTree::from_layout(&layout);
         let geometry = tree.layout(viewport(804.0, 400.0));
-        assert_eq!(geometry.panes[0].1.size.width, 400.0);
+        assert_eq!(geometry.panes[0].1.size.width, px(400.0));
     }
 }

@@ -1,11 +1,17 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use super::{App, AppHandle};
 use crate::{
     error::EngineError,
     event::Event,
+    math::{LogicalPx, LogicalRect, LogicalSize},
+    node::image::{ImageFit, variant_target},
     platform::dispatcher::Dispatcher,
-    resources::{DecodeState, PendingResource, ResourceCache, ResourceImage},
+    resources::{
+        DecodeState, ImageDiagnostic, PendingResource, ResourceCache, ResourceImage, VariantState,
+    },
     window::WindowId,
 };
 
@@ -47,7 +53,7 @@ pub(crate) fn apply_resource_results(
     let App { windows, .. } = app;
     let mut count = 0;
     for window in windows.values_mut() {
-        let scale = window.scale().factor();
+        let scale = window.scale();
         count += window.tree_mut().resolve_pending_images(&resolved, scale);
     }
     count
@@ -69,17 +75,77 @@ pub(crate) fn refresh_images(app: &mut App, window: WindowId) -> usize {
     if !marked && !scale_changed {
         return 0;
     }
-    let scale = target.scale().factor();
-    let mut reselected = 0;
+    let dpr = target.scale();
+    let updated = target.tree_mut().refresh_image_intrinsics(resources, dpr);
     if scale_changed {
-        let applied = target.tree_mut().refresh_images_for_scale(resources, scale);
-        for id in applied {
-            resources.record_owner(window, id);
-            reselected += 1;
-        }
-        image_scale_epochs.insert(window, scale_epoch);
+        target.tree_mut().mark_bitmap_images_paint(resources);
     }
-    reselected + target.tree_mut().refresh_image_intrinsics(resources, scale)
+    image_scale_epochs.insert(window, scale_epoch);
+    updated
+}
+
+pub(crate) fn prepare_image_variants(app: &mut App, window: WindowId) -> usize {
+    let report = {
+        let App {
+            windows, resources, ..
+        } = app;
+        let Some(target) = windows.get_mut(&window) else {
+            return 0;
+        };
+        let dpr = target.scale();
+        resources.begin_variant_frame();
+        target.tree_mut().prepare_image_variants(resources, dpr)
+    };
+    let created = report.created;
+    for (resource, intrinsic, cause) in report.failures {
+        app.record_image_diagnostic(ImageDiagnostic::VariantUnavailable {
+            resource,
+            width: intrinsic.width.value().max(0.0).round() as u32,
+            height: intrinsic.height.value().max(0.0).round() as u32,
+            cause,
+        });
+    }
+    for resource in report.recovered {
+        if !app.has_image_diagnostic(resource) {
+            continue;
+        }
+        app.clear_image_diagnostic(resource);
+        for candidate in app.windows.values_mut() {
+            candidate
+                .tree_mut()
+                .invalidate_images_with_resource(resource);
+        }
+    }
+    created
+}
+
+pub(crate) fn prepare_image_variant(
+    app: &mut App,
+    window: WindowId,
+    image: ResourceImage,
+    target: LogicalSize,
+    fit: ImageFit,
+) -> Option<crate::paint::atlas::AtlasTile> {
+    let dpr = app.windows.get(&window)?.scale();
+    let live = app.resources.image(image.id())?;
+    let intrinsic = live.intrinsic(dpr);
+    let bounds = LogicalRect::new(
+        LogicalPx::ZERO,
+        LogicalPx::ZERO,
+        target.width,
+        target.height,
+    );
+    let physical = variant_target(bounds, fit, intrinsic, dpr)?;
+    match app.resources.ensure_variant(live, physical) {
+        Some(VariantState::Ready { .. }) | Some(VariantState::Failed { .. }) => {
+            let tile = app.resources.variant_for(live, physical);
+            if tile.is_some() {
+                app.resources.protect_variant(live, physical);
+            }
+            tile
+        }
+        None => None,
+    }
 }
 
 pub(crate) fn unload_resource(app: &mut App, id: crate::resources::ResourceId) -> bool {
@@ -106,6 +172,54 @@ pub(crate) fn invalidate_dead_images(app: &mut App) -> usize {
         invalidated += window.tree_mut().invalidate_dead_images(resources);
     }
     invalidated
+}
+
+pub(crate) fn insert_bitmap_for_window(
+    app: &mut App,
+    window: WindowId,
+    bytes: &[u8],
+) -> Result<ResourceImage, EngineError> {
+    match app.windows.get(&window) {
+        Some(_) => app.resources.insert_owned(window, bytes),
+        None => Err(EngineError::UnknownWindow { window }),
+    }
+}
+
+pub(crate) fn insert_svg_for_window(
+    app: &mut App,
+    window: WindowId,
+    bytes: &[u8],
+    intrinsic: LogicalSize,
+) -> Result<ResourceImage, EngineError> {
+    match app.windows.get(&window) {
+        Some(_) => app.resources.insert_owned_svg(window, bytes, intrinsic),
+        None => Err(EngineError::UnknownWindow { window }),
+    }
+}
+
+pub(crate) fn insert_bitmap_async_for_window(
+    app: &mut App,
+    window: WindowId,
+    bytes: Bytes,
+) -> Result<PendingResource, EngineError> {
+    match app.windows.get(&window) {
+        Some(_) => Ok(app.resources.insert_owned_async(window, bytes)),
+        None => Err(EngineError::UnknownWindow { window }),
+    }
+}
+
+pub(crate) fn insert_svg_async_for_window(
+    app: &mut App,
+    window: WindowId,
+    bytes: Bytes,
+    intrinsic: LogicalSize,
+) -> Result<PendingResource, EngineError> {
+    match app.windows.get(&window) {
+        Some(_) => app
+            .resources
+            .insert_owned_svg_async(window, bytes, intrinsic),
+        None => Err(EngineError::UnknownWindow { window }),
+    }
 }
 
 pub(crate) fn take_resource_results(app: &mut App) -> Vec<(PendingResource, DecodeState)> {
@@ -171,10 +285,6 @@ pub(crate) fn clipboard_text(_app: &App) -> Result<smol_str::SmolStr, EngineErro
 #[must_use]
 pub(crate) fn resources(app: &App) -> &ResourceCache {
     &app.resources
-}
-
-pub(crate) fn resources_mut(app: &mut App) -> &mut ResourceCache {
-    &mut app.resources
 }
 
 #[must_use]

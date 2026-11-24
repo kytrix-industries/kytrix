@@ -1,6 +1,6 @@
 use smol_str::SmolStr;
 use ui_core::{
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect, px},
     paint::geometry::{GeometryPipeline, IndexType, Topology},
     test_support::app::TestApp,
 };
@@ -62,7 +62,7 @@ fn a_window_of_one_day_should_be_a_point_rather_than_a_line() {
     assert!(
         (marker.x - prepared.bars[0].bounds.origin.x - prepared.bars[0].bounds.size.width / 2.0)
             .abs()
-            < 0.5,
+            < px(0.5),
         "the marker sits on the day the bar stands for"
     );
 }
@@ -161,14 +161,14 @@ fn a_cache_key_should_name_the_box_and_the_window_it_was_prepared_from() {
 fn a_hover_should_be_the_same_hover_until_a_reading_or_a_whole_pixel_changes() {
     let hover = Hover {
         index: 2,
-        cursor_y: 40.0,
+        cursor_y: px(40.0),
     };
 
     assert_eq!(
         hover,
         Hover {
             index: 2,
-            cursor_y: 40.0
+            cursor_y: px(40.0)
         },
         "two positions on one day are one drawing"
     );
@@ -176,21 +176,21 @@ fn a_hover_should_be_the_same_hover_until_a_reading_or_a_whole_pixel_changes() {
         hover,
         Hover {
             index: 3,
-            cursor_y: 40.0
+            cursor_y: px(40.0)
         }
     );
     assert_ne!(
         hover,
         Hover {
             index: 2,
-            cursor_y: 41.0
+            cursor_y: px(41.0)
         }
     );
 }
 
 #[test]
 fn a_hover_marker_should_be_centered_on_the_reading_it_marks() {
-    let center = Point::new(120.0, 80.0);
+    let center = LogicalPoint::new(px(120.0), px(80.0));
     let marker = marker_bounds(center);
 
     assert_eq!(
@@ -227,9 +227,9 @@ fn a_tooltips_flow_should_colour_the_amount_and_not_the_caption() {
 #[test]
 fn the_line_mesh_should_cover_every_segment_and_joint() {
     let points = [
-        Some(Point::new(0.0, 0.0)),
-        Some(Point::new(10.0, 10.0)),
-        Some(Point::new(20.0, 0.0)),
+        Some(LogicalPoint::new(px(0.0), px(0.0))),
+        Some(LogicalPoint::new(px(10.0), px(10.0))),
+        Some(LogicalPoint::new(px(20.0), px(0.0))),
     ];
     let desc = line_geometry(&points, LINE_WIDTH).expect("a line of three points has a mesh");
     eprintln!(
@@ -244,16 +244,16 @@ fn the_line_mesh_should_cover_every_segment_and_joint() {
     assert_eq!(desc.topology, Topology::TriangleList);
     assert_eq!(desc.vertex_bytes.len(), 5 * 4 * 12);
     assert_eq!(desc.index_bytes.len(), 5 * 6 * 4);
-    assert!(desc.bounds.size.width >= 20.0, "{:?}", desc.bounds);
-    assert!(desc.bounds.size.height >= 10.0, "{:?}", desc.bounds);
+    assert!(desc.bounds.size.width >= px(20.0), "{:?}", desc.bounds);
+    assert!(desc.bounds.size.height >= px(10.0), "{:?}", desc.bounds);
 }
 
 #[test]
 fn the_line_mesh_should_break_where_a_day_is_not_a_reading() {
     let points = [
-        Some(Point::new(0.0, 0.0)),
+        Some(LogicalPoint::new(px(0.0), px(0.0))),
         None,
-        Some(Point::new(10.0, 10.0)),
+        Some(LogicalPoint::new(px(10.0), px(10.0))),
     ];
     let desc = line_geometry(&points, LINE_WIDTH).expect("two runs of one point each");
 
@@ -283,7 +283,7 @@ fn the_axes_should_be_measured_wide_enough_for_the_titles_they_draw() {
     assert!(
         measurements
             .right_axis_width
-            .is_some_and(|width| width > 0.0),
+            .is_some_and(|width| width > px(0.0)),
         "the whole complex draws a second axis"
     );
     assert_eq!(
@@ -294,7 +294,11 @@ fn the_axes_should_be_measured_wide_enough_for_the_titles_they_draw() {
 
 #[test]
 fn a_layout_should_place_the_marker_on_the_zero_line_of_its_own_axis() {
-    let layout = ChartLayout::new(Rect::new(0.0, 0.0, 640.0, 360.0), 40.0, Some(60.0));
+    let layout = ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(640.0), px(360.0)),
+        px(40.0),
+        Some(px(60.0)),
+    );
     let data = prepared_all(&english(), &[1_000.0, 2_000.0]);
     let scale = data.flow.domain;
 
@@ -302,5 +306,5 @@ fn a_layout_should_place_the_marker_on_the_zero_line_of_its_own_axis() {
         value_y(0.0, scale, layout.plot) <= layout.plot.origin.y + layout.plot.size.height,
         "a flow domain always contains zero, so the baseline is inside the plot"
     );
-    assert!(layout.plot.size.height > 0.0);
+    assert!(layout.plot.size.height > px(0.0));
 }

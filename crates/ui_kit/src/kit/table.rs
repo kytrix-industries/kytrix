@@ -11,6 +11,7 @@ use ui_core::{
     error::EngineError,
     event::Action,
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -142,8 +143,8 @@ fn span_cell_style(
     columns: &[Column],
     start: usize,
     span: usize,
-    padding_x: f32,
-    padding_y: f32,
+    padding_x: LogicalPx,
+    padding_y: LogicalPx,
 ) -> Style {
     let covered = &columns[start..start + span];
     let align = covered
@@ -180,7 +181,7 @@ fn span_cell_style(
             .min_width(taffy::style::LengthPercentageAuto::length(fixed));
         style
     } else {
-        builder.width(fixed).flex_none().build()
+        builder.width(px(fixed)).flex_none().build()
     }
 }
 
@@ -197,7 +198,7 @@ pub struct TableOptions {
 
 impl TableOptions {
     #[must_use]
-    pub fn fixed(row_height: f32) -> Self {
+    pub fn fixed(row_height: LogicalPx) -> Self {
         Self {
             row_height: RowHeight::Fixed(row_height),
             selection: SelectionMode::Multi,
@@ -206,7 +207,7 @@ impl TableOptions {
     }
 
     #[must_use]
-    pub fn variable(estimate: f32) -> Self {
+    pub fn variable(estimate: LogicalPx) -> Self {
         Self {
             row_height: RowHeight::Variable { estimate },
             ..Self::fixed(estimate)
@@ -233,8 +234,8 @@ struct TableInner {
     row_count: Rc<Cell<usize>>,
     sort_action: Action,
     geometry: RefCell<TableGeometry>,
-    header_height: f32,
-    padding_x: f32,
+    header_height: LogicalPx,
+    padding_x: LogicalPx,
 }
 
 #[derive(Default)]
@@ -292,8 +293,8 @@ impl Table {
                 capacity: None,
                 reverse: false,
                 keep_on_newest: false,
-                padding_x: 0.0,
-                padding_y: 0.0,
+                padding_x: LogicalPx::ZERO,
+                padding_y: LogicalPx::ZERO,
                 row_stretch: fixed_rows,
                 scrollbar: options.scrollbar,
                 separator: false,
@@ -326,8 +327,13 @@ impl Table {
                         callback.map_or(column.column_span, |callback| callback(row, column_index))
                     };
                     let span = clamp_span(requested, &list_columns, column_index);
-                    let style =
-                        span_cell_style(&list_columns, column_index, span, tokens.padding_x, 4.0);
+                    let style = span_cell_style(
+                        &list_columns,
+                        column_index,
+                        span,
+                        tokens.padding_x,
+                        px(4.0),
+                    );
                     let cell_theme = list_theme.clone();
                     let cell = NodeBuilder::boxed()
                         .id(format_smolstr!("{table_key}:cell:{row}:{column_index}"))
@@ -351,7 +357,7 @@ impl Table {
                         .style(
                             StyleBuilder::new()
                                 .width_full()
-                                .height(1.0)
+                                .height(px(1.0))
                                 .flex_none()
                                 .build(),
                         )
@@ -514,7 +520,13 @@ impl Table {
             let column = &inner.columns[index];
             let span = clamp_span(column.column_span, &inner.columns, index);
             let theme = inner.theme.clone();
-            let style = span_cell_style(&inner.columns, index, span, inner.padding_x, 0.0);
+            let style = span_cell_style(
+                &inner.columns,
+                index,
+                span,
+                inner.padding_x,
+                LogicalPx::ZERO,
+            );
             let header_theme = theme.clone();
             let sortable = column.sortable;
             let a11y_sort = sort;
@@ -601,7 +613,7 @@ impl Table {
             .style(
                 StyleBuilder::new()
                     .width_full()
-                    .height(1.0)
+                    .height(px(1.0))
                     .flex_none()
                     .build(),
             )
@@ -631,10 +643,10 @@ impl Table {
                 .style(
                     StyleBuilder::new()
                         .absolute()
-                        .left(0.0)
-                        .right(0.0)
-                        .top(0.0)
-                        .bottom(0.0)
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .bottom(px(0.0))
                         .flex_row()
                         .items_center()
                         .justify_center()
@@ -776,6 +788,7 @@ mod tests {
         a11y::{A11yAction, A11yRole, A11ySort},
         event::{InputEvent, Modifiers, PointerButton},
         interaction::ItemAlign,
+        math::px,
         node::{
             builder::NodeBuilder,
             id::NodeId,
@@ -833,13 +846,16 @@ mod tests {
 
     #[test]
     fn table_options_default_to_multi_select() {
-        let options = TableOptions::fixed(28.0);
+        let options = TableOptions::fixed(px(28.0));
         assert_eq!(options.selection, SelectionMode::Multi);
-        assert_eq!(options.row_height, RowHeight::Fixed(28.0));
+        assert_eq!(options.row_height, RowHeight::Fixed(px(28.0)));
         assert!(options.scrollbar);
 
-        let variable = TableOptions::variable(40.0);
-        assert_eq!(variable.row_height, RowHeight::Variable { estimate: 40.0 });
+        let variable = TableOptions::variable(px(40.0));
+        assert_eq!(
+            variable.row_height,
+            RowHeight::Variable { estimate: px(40.0) }
+        );
     }
 
     #[test]
@@ -852,7 +868,7 @@ mod tests {
                 Column::flex("value", 1.0),
                 Column::flex("", 1.0).header_binding(TextValue::bound(language)),
             ],
-            TableOptions::fixed(28.0),
+            TableOptions::fixed(px(28.0)),
             4,
             text_cell,
         );
@@ -897,7 +913,7 @@ mod tests {
         column: usize,
     ) {
         let label = smol_str::format_smolstr!("{row}:{column}");
-        NodeBuilder::text(label, TextStyle::new(12.0))
+        NodeBuilder::text(label, TextStyle::new(px(12.0)))
             .build(tree, parent)
             .expect("cell");
     }
@@ -909,7 +925,7 @@ mod tests {
                 Column::fixed("name", 120.0).sortable(),
                 Column::flex("value", 1.0),
             ],
-            TableOptions::fixed(28.0),
+            TableOptions::fixed(px(28.0)),
             rows,
             text_cell,
         )
@@ -942,7 +958,12 @@ mod tests {
         let parent = {
             let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
             NodeBuilder::boxed()
-                .style(StyleBuilder::new().width(width).height(height).build())
+                .style(
+                    StyleBuilder::new()
+                        .width(px(width))
+                        .height(px(height))
+                        .build(),
+                )
                 .build(tree, root)
                 .expect("parent")
         };
@@ -965,15 +986,15 @@ mod tests {
         let _ = app.drain().expect("frame");
     }
 
-    fn center(app: &TestApp, node: ui_core::node::id::NodeId) -> ui_core::math::Point {
+    fn center(app: &TestApp, node: ui_core::node::id::NodeId) -> ui_core::math::LogicalPoint {
         let bounds = app.probe().bounds(node).expect("bounds");
-        ui_core::math::Point::new(
+        ui_core::math::LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         )
     }
 
-    fn click(app: &mut TestApp, point: ui_core::math::Point) {
+    fn click(app: &mut TestApp, point: ui_core::math::LogicalPoint) {
         let _ = app.inject(InputEvent::pointer_down(
             point,
             PointerButton::Primary,
@@ -988,7 +1009,7 @@ mod tests {
 
     fn click_outcome(
         app: &mut TestApp,
-        point: ui_core::math::Point,
+        point: ui_core::math::LogicalPoint,
     ) -> ui_core::event::InputOutcome {
         let _ = app.inject(InputEvent::pointer_down(
             point,
@@ -1016,13 +1037,13 @@ mod tests {
         let cell = table.cell_node(app.app(), 0, 0).expect("first cell");
         let name = app.probe().bounds(cell).expect("cell bounds");
         assert!(
-            (name.size.width - 120.0).abs() < 0.5,
+            (name.size.width - 120.0).abs() < px(0.5),
             "固定列宽 120：{name:?}"
         );
         let value = table.cell_node(app.app(), 0, 1).expect("second cell");
         let value_bounds = app.probe().bounds(value).expect("cell bounds");
         assert!(
-            value_bounds.size.width > 120.0,
+            value_bounds.size.width > px(120.0),
             "弹性列占剩余宽度：{value_bounds:?}"
         );
         assert_eq!(
@@ -1160,7 +1181,7 @@ mod tests {
         let table = table_with(
             &mut app,
             vec![Column::fixed("name", 120.0), Column::flex("value", 1.0)],
-            TableOptions::variable(20.0),
+            TableOptions::variable(px(20.0)),
             8,
             |tree, parent, row, _column| {
                 let height = if row % 2 == 0 { 40.0 } else { 16.0 };
@@ -1168,7 +1189,7 @@ mod tests {
                     .style(
                         StyleBuilder::new()
                             .width_full()
-                            .height(height)
+                            .height(px(height))
                             .flex_none()
                             .build(),
                     )
@@ -1180,20 +1201,20 @@ mod tests {
         let heights = table.list().row_heights();
         assert_eq!(
             heights.get(0),
-            Some(49.0),
+            Some(px(49.0)),
             "内容 40 + 单元格上下 padding 4*2 + 行分隔线 1"
         );
-        assert_eq!(heights.get(1), Some(25.0), "内容 16 + padding + 分隔线");
+        assert_eq!(heights.get(1), Some(px(25.0)), "内容 16 + padding + 分隔线");
         let row0 = table.list().row_node(app.app(), 0).expect("row 0");
         let row1 = table.list().row_node(app.app(), 1).expect("row 1");
         let first = app.probe().bounds(row0).expect("row 0 bounds");
         let second = app.probe().bounds(row1).expect("row 1 bounds");
         assert!(
-            (first.size.height - 49.0).abs() < 0.5,
+            (first.size.height - 49.0).abs() < px(0.5),
             "行高按实测内容：{first:?}"
         );
         assert!(
-            (second.origin.y - first.origin.y - 49.0).abs() < 0.5,
+            (second.origin.y - first.origin.y - 49.0).abs() < px(0.5),
             "行位置跟前缀和走：{first:?} {second:?}"
         );
         table
@@ -1204,13 +1225,13 @@ mod tests {
         let _ = table.sync(app.app_mut()).expect("sync");
         assert_eq!(
             table.list().offset(app.app()),
-            Some(74.0),
+            Some(px(74.0)),
             "变高前缀和上的滚动锚点"
         );
         let cell = table.cell_node(app.app(), 2, 0).expect("row 2 cell");
         let bounds = app.probe().bounds(cell).expect("cell bounds");
         assert!(
-            (bounds.size.height - 48.0).abs() < 0.5,
+            (bounds.size.height - 48.0).abs() < px(0.5),
             "单元格高度 = 内容 40 + padding 8：{bounds:?}"
         );
     }
@@ -1226,7 +1247,7 @@ mod tests {
                 Column::fixed("size", 50.0),
                 Column::flex("change", 1.0),
             ],
-            TableOptions::fixed(28.0),
+            TableOptions::fixed(px(28.0)),
             4,
             text_cell,
         );
@@ -1234,7 +1255,7 @@ mod tests {
         let header0 = table.header_node(app.app(), 0).expect("header 0");
         let header0 = app.probe().bounds(header0).expect("header 0 bounds");
         assert!(
-            (header0.size.width - 219.0).abs() < 0.5,
+            (header0.size.width - 219.0).abs() < px(0.5),
             "跨列表头 = 固定列 100 + 弹性列份额 119：{header0:?}"
         );
         assert!(
@@ -1244,7 +1265,7 @@ mod tests {
         let cell0 = table.cell_node(app.app(), 0, 0).expect("cell 0/0");
         let cell0 = app.probe().bounds(cell0).expect("cell bounds");
         assert!(
-            (cell0.size.width - 219.0).abs() < 0.5,
+            (cell0.size.width - 219.0).abs() < px(0.5),
             "跨列单元格 = 被跨列宽度之和：{cell0:?}"
         );
         assert!(
@@ -1253,9 +1274,9 @@ mod tests {
         );
         let cell2 = table.cell_node(app.app(), 0, 2).expect("cell 0/2");
         let cell2 = app.probe().bounds(cell2).expect("cell bounds");
-        assert!((cell2.size.width - 50.0).abs() < 0.5, "{cell2:?}");
+        assert!((cell2.size.width - 50.0).abs() < px(0.5), "{cell2:?}");
         assert!(
-            (cell2.origin.x - cell0.origin.x - 219.0).abs() < 0.5,
+            (cell2.origin.x - cell0.origin.x - 219.0).abs() < px(0.5),
             "后续列紧接合并单元格排开：{cell0:?} {cell2:?}"
         );
         let header0_node = table.header_node(app.app(), 0).expect("header 0");
@@ -1284,7 +1305,7 @@ mod tests {
                 Column::fixed("c", 75.0),
                 Column::fixed("d", 25.0),
             ],
-            TableOptions::fixed(24.0),
+            TableOptions::fixed(px(24.0)),
             2,
             text_cell,
         );
@@ -1293,14 +1314,14 @@ mod tests {
         let cell = table.cell_node(app.app(), 0, 1).expect("row 0 span start");
         let bounds = app.probe().bounds(cell).expect("cell bounds");
         assert!(
-            (bounds.size.width - 150.0).abs() < 0.5,
+            (bounds.size.width - 150.0).abs() < px(0.5),
             "99 列夹到剩余 3 列 = 50 + 75 + 25：{bounds:?}"
         );
         assert!(table.cell_node(app.app(), 0, 2).is_none());
         assert!(table.cell_node(app.app(), 0, 3).is_none());
         let cell = table.cell_node(app.app(), 1, 1).expect("row 1 col 1");
         let bounds = app.probe().bounds(cell).expect("cell bounds");
-        assert!((bounds.size.width - 50.0).abs() < 0.5, "{bounds:?}");
+        assert!((bounds.size.width - 50.0).abs() < px(0.5), "{bounds:?}");
     }
 
     #[test]
@@ -1348,7 +1369,7 @@ mod tests {
             .expect("Table 必须接管行窗口的 scroll（E9 R2 后半）");
         assert!(scroll.vertical);
         assert!(
-            scroll.y_max > 0.0,
+            scroll.y_max > px(0.0),
             "滚动范围来自行窗口的内容高度：{scroll:?}"
         );
         for action in [
@@ -1437,7 +1458,7 @@ mod tests {
                 Column::fixed("size", 50.0),
                 Column::flex("change", 1.0),
             ],
-            TableOptions::fixed(28.0),
+            TableOptions::fixed(px(28.0)),
             4,
             text_cell,
         );

@@ -1,5 +1,6 @@
 use ui_core::{
     a11y::A11yOverride,
+    math::px,
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
 };
@@ -45,10 +46,10 @@ impl Separator {
     ) -> Result<NodeId, ui_core::error::EngineError> {
         let mut style = match self.orientation {
             SeparatorOrientation::Horizontal => {
-                StyleBuilder::new().width_full().height(1.0).build()
+                StyleBuilder::new().width_full().height(px(1.0)).build()
             }
             SeparatorOrientation::Vertical => {
-                let mut style = StyleBuilder::new().width(1.0).build();
+                let mut style = StyleBuilder::new().width(px(1.0)).build();
                 style.align_self(taffy::style::AlignSelf::STRETCH);
                 style
             }
@@ -72,6 +73,7 @@ impl Separator {
 #[cfg(test)]
 mod tests {
     use ui_core::{
+        math::px,
         node::{builder::NodeBuilder, id::NodeId},
         paint::{color::ColorResolver, style_builder::StyleBuilder},
         test_support::app::TestApp,
@@ -98,8 +100,8 @@ mod tests {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(parent_size.0)
-                        .height(parent_size.1)
+                        .width(px(parent_size.0))
+                        .height(px(parent_size.1))
                         .build(),
                 )
                 .build(tree, root)
@@ -119,13 +121,13 @@ mod tests {
     fn horizontal_and_vertical_separators_take_one_pixel_on_their_axis() {
         let (app, node, _) = build(SeparatorOrientation::Horizontal, (200.0, 100.0));
         let bounds = app.probe().bounds(node).expect("bounds");
-        assert_eq!(bounds.size.height, 1.0);
-        assert!((bounds.size.width - 200.0).abs() < 0.5);
+        assert_eq!(bounds.size.height, px(1.0));
+        assert!((bounds.size.width - 200.0).abs() < px(0.5));
         let (app, node, _) = build(SeparatorOrientation::Vertical, (200.0, 100.0));
         let bounds = app.probe().bounds(node).expect("bounds");
-        assert_eq!(bounds.size.width, 1.0);
+        assert_eq!(bounds.size.width, px(1.0));
         assert!(
-            (bounds.size.height - 100.0).abs() < 0.5,
+            (bounds.size.height - 100.0).abs() < px(0.5),
             "纵向分割线拉伸到父高"
         );
     }

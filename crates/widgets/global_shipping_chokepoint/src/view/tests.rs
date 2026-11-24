@@ -20,7 +20,7 @@ use network::transport::error::TransportError;
 use smol_str::SmolStr;
 use ui_core::{
     event::{Action, Event, InputEvent, PointerButton, ScrollPhase, ScrollUnit},
-    math::Point,
+    math::{LogicalPoint, px},
     node::builder::NodeBuilder,
     paint::style_builder::StyleBuilder,
     test_support::record::PrimitiveKind,
@@ -168,8 +168,8 @@ fn page(harness: &mut WidgetTestApp) -> NodeId {
             .id("TEST_CHOKEPOINT_PAGE")
             .style(
                 StyleBuilder::new()
-                    .width(PAGE.0)
-                    .height(PAGE.1)
+                    .width(px(PAGE.0))
+                    .height(px(PAGE.1))
                     .flex_col()
                     .build(),
             )
@@ -448,11 +448,11 @@ fn paint_one_vessel(harness: &mut WidgetTestApp, pane: &mut Pane) {
     frame(harness, pane);
 }
 
-fn hull_of(pane: &Pane, mmsi: u32) -> Point {
+fn hull_of(pane: &Pane, mmsi: u32) -> LogicalPoint {
     let bounds = pane.widget.map.bounds().expect("the map has a box");
     let projection = Projection::new(
         pane.widget.map.camera(),
-        [bounds.size.width, bounds.size.height],
+        [f32::from(bounds.size.width), f32::from(bounds.size.height)],
     );
     let vessel: &Vessel = pane
         .widget
@@ -461,10 +461,10 @@ fn hull_of(pane: &Pane, mmsi: u32) -> Point {
         .find(|vessel| vessel.mmsi == mmsi)
         .expect("the fixture painted this vessel");
     let at = projection.screen(vessel.position);
-    Point::new(bounds.origin.x + at[0], bounds.origin.y + at[1])
+    LogicalPoint::new(bounds.origin.x + at[0], bounds.origin.y + at[1])
 }
 
-fn pointer_move(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
+fn pointer_move(harness: &mut WidgetTestApp, pane: &mut Pane, position: LogicalPoint) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
             &Event::Input(InputEvent::PointerMove {
@@ -477,7 +477,7 @@ fn pointer_move(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -
     })
 }
 
-fn pointer_leave(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) {
+fn pointer_leave(harness: &mut WidgetTestApp, pane: &mut Pane, position: LogicalPoint) {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
             &Event::Input(InputEvent::PointerLeave {
@@ -490,7 +490,7 @@ fn pointer_leave(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) 
     });
 }
 
-fn pointer_down(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
+fn pointer_down(harness: &mut WidgetTestApp, pane: &mut Pane, position: LogicalPoint) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
             &Event::Input(InputEvent::PointerDown {
@@ -504,7 +504,7 @@ fn pointer_down(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -
     })
 }
 
-fn pointer_up(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
+fn pointer_up(harness: &mut WidgetTestApp, pane: &mut Pane, position: LogicalPoint) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
             &Event::Input(InputEvent::PointerUp {
@@ -529,12 +529,12 @@ fn pointer_cancel(harness: &mut WidgetTestApp, pane: &mut Pane) -> bool {
     })
 }
 
-fn wheel(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point, step: f32) -> bool {
+fn wheel(harness: &mut WidgetTestApp, pane: &mut Pane, position: LogicalPoint, step: f32) -> bool {
     harness.with_cx(|cx| {
         pane.widget.dispatch(
             &Event::Input(InputEvent::Scroll {
                 position,
-                delta: Point::new(0.0, step),
+                delta: LogicalPoint::new(px(0.0), px(step)),
                 unit: ScrollUnit::Line,
                 phase: ScrollPhase::Discrete,
                 modifiers: ui_core::event::Modifiers::default(),
@@ -1217,7 +1217,7 @@ fn the_credit_should_open_the_copyright_page() {
     frame(&mut harness, &mut pane);
 
     let bounds = pane.widget.map.bounds().expect("the map was laid out");
-    let credit = Point::new(
+    let credit = LogicalPoint::new(
         bounds.origin.x + 12.0,
         bounds.origin.y + bounds.size.height - 10.0,
     );
@@ -1261,7 +1261,7 @@ fn a_cancelled_pointer_should_not_pan_or_open_the_credit() {
     frame(&mut harness, &mut pane);
 
     let bounds = pane.widget.map.bounds().expect("the map was laid out");
-    let credit = Point::new(
+    let credit = LogicalPoint::new(
         bounds.origin.x + 12.0,
         bounds.origin.y + bounds.size.height - 10.0,
     );
@@ -1280,7 +1280,7 @@ fn a_cancelled_pointer_should_not_pan_or_open_the_credit() {
     pointer_move(
         &mut harness,
         &mut pane,
-        Point::new(credit.x + 40.0, credit.y - 40.0),
+        LogicalPoint::new(credit.x + 40.0, credit.y - 40.0),
     );
     assert_eq!(
         pane.widget.map.camera(),
@@ -1295,7 +1295,7 @@ fn a_pointer_outside_the_canvas_should_not_be_the_map_s() {
     let mut pane = pane(&mut harness);
     paint_one_vessel(&mut harness, &mut pane);
     let bounds = pane.widget.map.bounds().expect("the map was laid out");
-    let outside = Point::new(
+    let outside = LogicalPoint::new(
         bounds.origin.x - 40.0,
         bounds.origin.y + bounds.size.height / 2.0,
     );
@@ -1308,7 +1308,7 @@ fn a_pointer_outside_the_canvas_should_not_be_the_map_s() {
     pointer_move(
         &mut harness,
         &mut pane,
-        Point::new(outside.x + 30.0, outside.y),
+        LogicalPoint::new(outside.x + 30.0, outside.y),
     );
     assert_eq!(
         pane.widget.map.camera(),

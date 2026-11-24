@@ -7,6 +7,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, KeyBinding, KeyCode, Modifiers},
     interaction::{ActionCtx, ItemAlign},
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -290,8 +291,8 @@ pub enum KeyOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TreeOptions {
-    pub row_height: f32,
-    pub indent: f32,
+    pub row_height: LogicalPx,
+    pub indent: LogicalPx,
     pub selection: SelectionMode,
     pub scrollbar: bool,
 }
@@ -299,8 +300,8 @@ pub struct TreeOptions {
 impl Default for TreeOptions {
     fn default() -> Self {
         Self {
-            row_height: 30.0,
-            indent: 12.0,
+            row_height: px(30.0),
+            indent: px(12.0),
             selection: SelectionMode::Single,
             scrollbar: true,
         }
@@ -309,14 +310,14 @@ impl Default for TreeOptions {
 
 impl TreeOptions {
     #[must_use]
-    pub fn row_height(mut self, row_height: f32) -> Self {
-        self.row_height = row_height.max(1.0);
+    pub fn row_height(mut self, row_height: LogicalPx) -> Self {
+        self.row_height = row_height.max(px(1.0));
         self
     }
 
     #[must_use]
-    pub fn indent(mut self, indent: f32) -> Self {
-        self.indent = indent.max(0.0);
+    pub fn indent(mut self, indent: LogicalPx) -> Self {
+        self.indent = indent.max(LogicalPx::ZERO);
         self
     }
 }
@@ -377,8 +378,8 @@ impl Tree {
                 capacity: None,
                 reverse: false,
                 keep_on_newest: false,
-                padding_x: 6.0,
-                padding_y: 2.0,
+                padding_x: px(6.0),
+                padding_y: px(2.0),
                 row_stretch: false,
                 scrollbar: options.scrollbar,
                 separator: false,
@@ -704,7 +705,7 @@ fn build_row(
     state: Signal<TreeState>,
     options: TreeOptions,
 ) -> Result<(), EngineError> {
-    let line_height = (options.row_height - 4.0).max(1.0);
+    let line_height = (options.row_height - 4.0).max(px(1.0));
     for _ in 0..row.indent_depth() {
         let slot = NodeBuilder::boxed()
             .style(
@@ -721,7 +722,7 @@ fn build_row(
         NodeBuilder::boxed()
             .style(
                 StyleBuilder::new()
-                    .width(1.0)
+                    .width(px(1.0))
                     .height(line_height)
                     .flex_none()
                     .build(),
@@ -795,6 +796,8 @@ fn build_row(
 
 #[cfg(test)]
 mod tests {
+    use ui_core::math::px;
+
     use super::{FlatRow, KeyOutcome, TreeItem, TreeKey, TreeOptions, TreeState};
 
     fn folders() -> Vec<TreeItem> {
@@ -960,8 +963,8 @@ mod tests {
     #[test]
     fn options_default_to_a_compact_single_selection_tree() {
         let options = TreeOptions::default();
-        assert_eq!(options.row_height, 30.0);
-        assert_eq!(options.indent, 12.0);
+        assert_eq!(options.row_height, px(30.0));
+        assert_eq!(options.indent, px(12.0));
         assert!(options.scrollbar);
         assert_eq!(options.selection, crate::kit::list::SelectionMode::Single);
     }
@@ -974,7 +977,7 @@ mod ui_tests {
         a11y::A11yRole,
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         interaction::ScrollConfig,
-        math::Size,
+        math::{LogicalPx, LogicalSize, px},
         node::{builder::NodeBuilder, tree::NodeKind},
         paint::style_builder::StyleBuilder,
         test_support::{a11y::assert_incremental_within, app::TestApp},
@@ -1021,7 +1024,12 @@ mod ui_tests {
         let parent = {
             let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
             NodeBuilder::boxed()
-                .style(StyleBuilder::new().width(240.0).height(180.0).build())
+                .style(
+                    StyleBuilder::new()
+                        .width(px(240.0))
+                        .height(px(180.0))
+                        .build(),
+                )
                 .build(tree, root)
                 .expect("parent")
         };
@@ -1046,7 +1054,7 @@ mod ui_tests {
             .row_node(harness.app.app(), row)
             .expect("row");
         let bounds = harness.app.probe().bounds(node).expect("bounds");
-        let point = ui_core::math::Point::new(
+        let point = ui_core::math::LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -1250,7 +1258,12 @@ mod ui_tests {
             let parent = {
                 let tree_mut = app.app_mut().window_mut(window).expect("window").tree_mut();
                 NodeBuilder::boxed()
-                    .style(StyleBuilder::new().width(240.0).height(180.0).build())
+                    .style(
+                        StyleBuilder::new()
+                            .width(px(240.0))
+                            .height(px(180.0))
+                            .build(),
+                    )
                     .build(tree_mut, root)
                     .expect("parent")
             };
@@ -1262,8 +1275,8 @@ mod ui_tests {
                 .style(
                     StyleBuilder::new()
                         .relative()
-                        .width(100.0)
-                        .height(100.0)
+                        .width(px(100.0))
+                        .height(px(100.0))
                         .overflow_hidden()
                         .build(),
                 )
@@ -1276,7 +1289,7 @@ mod ui_tests {
             .make_scroll(window, external, ScrollConfig::default())
             .expect("scrollable");
         app.app_mut()
-            .set_scroll_content(&handle, Size::new(100.0, 400.0))
+            .set_scroll_content(&handle, LogicalSize::new(px(100.0), px(400.0)))
             .expect("content");
         for _ in 0..4 {
             let _ = app.drain().expect("frame");
@@ -1305,7 +1318,7 @@ mod ui_tests {
             .offset
             .y;
         assert!(
-            offset > 0.0,
+            offset > px(0.0),
             "树的实例级绑定不得吞掉其它控件的默认方向键滚动（offset={offset}）"
         );
         assert_eq!(first.selected_row(app.app()), Some(1));
@@ -1573,7 +1586,14 @@ mod ui_tests {
             )
             .expect("scroll");
         let _ = harness.app.drain().expect("frame");
-        assert!(harness.tree.list().offset(harness.app.app()).unwrap_or(0.0) > 0.0);
+        assert!(
+            harness
+                .tree
+                .list()
+                .offset(harness.app.app())
+                .unwrap_or(LogicalPx::ZERO)
+                > LogicalPx::ZERO
+        );
         harness
             .tree
             .set_roots(harness.app.app_mut(), vec![TreeItem::new("only", "only")])
@@ -1582,7 +1602,7 @@ mod ui_tests {
         assert_eq!(harness.tree.rows().len(), 1);
         assert_eq!(
             harness.tree.list().offset(harness.app.app()),
-            Some(0.0),
+            Some(px(0.0)),
             "换根数据回到顶部"
         );
         assert_eq!(harness.tree.selected_row(harness.app.app()), None);
@@ -1744,7 +1764,7 @@ mod ui_tests {
                 .expect("window")
                 .tree_mut();
             NodeBuilder::boxed()
-                .style(StyleBuilder::new().size(8.0, 8.0).build())
+                .style(StyleBuilder::new().size(px(8.0), px(8.0)).build())
                 .build(tree, parent)
                 .expect("静态兄弟")
         };

@@ -8,7 +8,10 @@ use download_provider::error::DownloadFailure;
 use i18n::{language::codes::LanguageCode, t_smol};
 use smol_str::SmolStr;
 use tempfile::TempDir;
-use ui_core::event::{Event, InputEvent, KeyCode};
+use ui_core::{
+    event::{Event, InputEvent, KeyCode},
+    math::px,
+};
 use ui_kit::kit::icon::IconKind;
 
 use crate::{
@@ -206,7 +209,7 @@ fn a_stored_directory_should_be_shown_in_its_field() {
         "the field stays inside the row: {bounds:?} in {control:?}"
     );
     assert!(
-        bounds.size.height < 40.0,
+        bounds.size.height < px(40.0),
         "the field stays on one line: {bounds:?}"
     );
 }
@@ -595,7 +598,7 @@ fn the_row_text_should_stay_on_one_line() {
         )
         .expect("the reason is laid out");
     assert!(
-        error.size.height < 25.0,
+        error.size.height < px(25.0),
         "the long failure reason should be cut to one line: {error:?}"
     );
     let size = harness
@@ -605,7 +608,7 @@ fn the_row_text_should_stay_on_one_line() {
                 .expect("the size is drawn"),
         )
         .expect("the size is laid out");
-    assert!(size.size.height < 25.0, "the size stays on one line");
+    assert!(size.size.height < px(25.0), "the size stays on one line");
 }
 
 #[test]

@@ -14,6 +14,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event, InputEvent},
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -41,9 +42,9 @@ use ui_kit::{
 };
 use widget::{cx::WidgetCx, error::TranslatedError};
 
-const DIALOG_WIDTH: f32 = 620.0;
+const DIALOG_WIDTH: LogicalPx = px(620.0);
 
-const CONTENT_HEIGHT: f32 = 400.0;
+const CONTENT_HEIGHT: LogicalPx = px(400.0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AddressDialogError {
@@ -325,7 +326,7 @@ impl DialogState {
             key.clone(),
             ListOptions::fixed(row_height)
                 .selection(SelectionMode::None)
-                .padding(0.0, 0.0),
+                .padding(px(0.0), px(0.0)),
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 build_address_row(tree, parent, index, &key, &addresses, &slots, &theme)
             },
@@ -371,7 +372,7 @@ impl DialogState {
         };
         let content_weak = Weak::clone(inner);
         DialogBuilder::new(title)
-            .width(DIALOG_WIDTH)
+            .width(DIALOG_WIDTH.value())
             .close_button(false)
             .content(move |app, window, body| {
                 let Some(state) = content_weak.upgrade() else {
@@ -701,7 +702,7 @@ impl DialogState {
                         .width_full()
                         .height(CONTENT_HEIGHT)
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -719,7 +720,7 @@ impl DialogState {
                         .flex_row()
                         .items_center()
                         .justify_between()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .build(),
                 )
@@ -736,7 +737,7 @@ impl DialogState {
                         .flex_none()
                         .flex_row()
                         .items_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .build(),
                 )
@@ -887,7 +888,7 @@ impl DialogState {
                         .width_full()
                         .flex_none()
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, panel)
@@ -919,7 +920,7 @@ impl DialogState {
         window: WindowId,
         parent: NodeId,
         key: &str,
-        text_size: f32,
+        text_size: LogicalPx,
     ) -> Result<(), EngineError> {
         let language = self.language;
         let translate = self.translate.clone();
@@ -1108,7 +1109,7 @@ fn build_address_row(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(8.0)
+                .gap(px(8.0))
                 .width_full()
                 .min_width_0()
                 .build(),
@@ -1164,15 +1165,15 @@ fn message_block(
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap(8.0)
-                    .padding(8.0)
+                    .gap(px(8.0))
+                    .padding(px(8.0))
                     .build(),
             )
             .bind_style(visible)

@@ -1,11 +1,11 @@
-use std::fmt;
+use std::{fmt, sync::OnceLock};
 
 use smol_str::SmolStr;
 use ui_core::{
     a11y::A11yOverride,
     app::App,
     error::EngineError,
-    math::Size,
+    math::{LogicalPx, LogicalSize},
     node::{builder::NodeBuilder, id::NodeId, image::ImageFit},
     paint::{color::Color, style::Style},
     resources::ResourceImage,
@@ -82,17 +82,27 @@ impl BrandKind {
     }
 
     #[must_use]
-    pub fn native_size(self) -> Size {
-        assets::find(self.asset_path())
-            .and_then(assets::Asset::native_size)
-            .expect("品牌 PNG 必须是可读文件头的位图（PNG）")
+    pub fn native_size(self) -> LogicalSize {
+        static NATIVE_SIZES: OnceLock<[LogicalSize; BrandKind::ALL.len()]> = OnceLock::new();
+        let sizes = NATIVE_SIZES.get_or_init(|| {
+            BrandKind::ALL.map(|kind| {
+                assets::find(kind.asset_path())
+                    .and_then(assets::Asset::native_size)
+                    .expect("品牌 PNG 必须是可读文件头的位图（PNG）")
+            })
+        });
+        let index = BrandKind::ALL
+            .iter()
+            .position(|kind| *kind == self)
+            .expect("BrandKind::ALL 覆盖全部变体");
+        sizes[index]
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Brand {
     pub kind: BrandKind,
-    pub size: Option<f32>,
+    pub size: Option<LogicalPx>,
     pub alt: Option<SmolStr>,
 }
 
@@ -107,7 +117,7 @@ impl Brand {
     }
 
     #[must_use]
-    pub const fn with_size(mut self, side: f32) -> Self {
+    pub const fn with_size(mut self, side: LogicalPx) -> Self {
         self.size = Some(side);
         self
     }
@@ -119,9 +129,9 @@ impl Brand {
     }
 
     #[must_use]
-    pub fn display_size(&self) -> Size {
+    pub fn display_size(&self) -> LogicalSize {
         match self.size {
-            Some(side) => Size::new(side, side),
+            Some(side) => LogicalSize::new(side, side),
             None => self.kind.native_size(),
         }
     }
@@ -133,21 +143,16 @@ impl Brand {
         parent: NodeId,
     ) -> Result<NodeId, BrandError> {
         if let Some(side) = self.size
-            && (!side.is_finite() || side <= 0.0)
+            && (!side.is_finite() || side <= LogicalPx::ZERO)
         {
             return Err(BrandError::InvalidSize { size: side });
         }
         let frame = self.display_size();
-        let scale = app
-            .window(window)
-            .ok_or(BrandError::UnknownWindow { window })?
-            .scale()
-            .factor();
-        let resource = self.resource_for(app, window, scale)?;
+        let resource = self.resource_for(app, window)?;
 
         let mut style = Style::default();
         style.size_length(frame.width, frame.height);
-        let mut builder = NodeBuilder::image(resource.id, ImageFit::Contain)
+        let mut builder = NodeBuilder::image(resource.id(), ImageFit::Contain)
             .image_modulation(Color::WHITE)
             .style(style);
         if let Some(alt) = self.alt {
@@ -166,54 +171,19 @@ impl Brand {
             .map_err(BrandError::Node)
     }
 
-    pub fn reselect(
-        self,
-        app: &mut App,
-        window: WindowId,
-        node: NodeId,
-    ) -> Result<ResourceImage, BrandError> {
-        if let Some(side) = self.size
-            && (!side.is_finite() || side <= 0.0)
-        {
-            return Err(BrandError::InvalidSize { size: side });
-        }
-        let scale = app
-            .window(window)
-            .ok_or(BrandError::UnknownWindow { window })?
-            .scale()
-            .factor();
-        let resource = self.resource_for(app, window, scale)?;
-        let accepted = app
-            .window_mut(window)
-            .ok_or(BrandError::UnknownWindow { window })?
-            .set_image_resource(node, resource.id)
-            .map_err(BrandError::Node)?;
-        if !accepted {
-            return Err(BrandError::NotImageNode { node });
-        }
-        app.request_repaint(window).map_err(BrandError::Node)?;
-        Ok(resource)
-    }
-
-    fn resource_for(
-        &self,
-        app: &mut App,
-        window: WindowId,
-        scale: f32,
-    ) -> Result<ResourceImage, BrandError> {
-        let frame = self.display_size();
-        let physical = Size::new(frame.width * scale, frame.height * scale);
-        app.resources_mut()
-            .insert_owned_at_size(window, self.kind.bytes(), physical)
-            .map_err(BrandError::Decode)
+    fn resource_for(&self, app: &mut App, window: WindowId) -> Result<ResourceImage, BrandError> {
+        app.insert_bitmap_for_window(window, self.kind.bytes())
+            .map_err(|error| match error {
+                EngineError::UnknownWindow { window } => BrandError::UnknownWindow { window },
+                other => BrandError::Decode(other),
+            })
     }
 }
 
 #[derive(Debug)]
 pub enum BrandError {
     UnknownWindow { window: WindowId },
-    InvalidSize { size: f32 },
-    NotImageNode { node: NodeId },
+    InvalidSize { size: LogicalPx },
     Decode(EngineError),
     Node(EngineError),
 }
@@ -227,12 +197,6 @@ impl fmt::Display for BrandError {
             BrandError::InvalidSize { size } => {
                 write!(formatter, "brand logo size {size} must be finite and > 0")
             }
-            BrandError::NotImageNode { node } => {
-                write!(
-                    formatter,
-                    "brand reselect target {node:?} is not an image node"
-                )
-            }
             BrandError::Decode(error) => write!(formatter, "brand logo decode failed: {error}"),
             BrandError::Node(error) => write!(formatter, "brand logo node mount failed: {error}"),
         }
@@ -243,9 +207,7 @@ impl std::error::Error for BrandError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             BrandError::Decode(error) | BrandError::Node(error) => Some(error),
-            BrandError::UnknownWindow { .. }
-            | BrandError::InvalidSize { .. }
-            | BrandError::NotImageNode { .. } => None,
+            BrandError::UnknownWindow { .. } | BrandError::InvalidSize { .. } => None,
         }
     }
 }
@@ -254,10 +216,12 @@ impl std::error::Error for BrandError {
 mod tests {
     use ui_core::{
         a11y::{A11yDiagnostic, A11yDrawKind, A11yRole},
-        math::{Rect, Scale, Size},
-        node::{builder::NodeBuilder, id::NodeId, image::ImageFit, tree::NodeKind},
+        math::{DevicePixelRatio, LogicalRect, px},
+        node::{id::NodeId, image::ImageFit, tree::NodeKind},
         paint::{color::Color, primitive::Image},
+        resources::{ImageResourceKind, ResourceImage},
         test_support::app::TestApp,
+        window::WindowId,
     };
 
     use super::{
@@ -265,9 +229,7 @@ mod tests {
         SOLANA,
     };
     use crate::{
-        kit::test_support::{
-            assert_single_image, bounds, image_primitives, test_app, test_app_with_scale,
-        },
+        kit::test_support::{assert_single_image, bounds, image_primitives, test_app},
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
@@ -315,36 +277,36 @@ mod tests {
     fn native_sizes_keep_the_aspect_ratio_and_explicit_sizes_are_square_boxes() {
         assert_eq!(
             BrandKind::Ethereum.native_size(),
-            ui_core::math::Size::new(44.0, 72.0)
+            ui_core::math::LogicalSize::new(px(44.0), px(72.0))
         );
         assert_eq!(
             BrandKind::Solana.native_size(),
-            ui_core::math::Size::new(81.0, 72.0)
+            ui_core::math::LogicalSize::new(px(81.0), px(72.0))
         );
         assert_eq!(
             Brand::new(BrandKind::Ethereum).display_size(),
-            ui_core::math::Size::new(44.0, 72.0)
+            ui_core::math::LogicalSize::new(px(44.0), px(72.0))
         );
         assert_eq!(
             Brand::new(BrandKind::Ethereum)
-                .with_size(24.0)
+                .with_size(px(24.0))
                 .display_size(),
-            ui_core::math::Size::new(24.0, 24.0)
+            ui_core::math::LogicalSize::new(px(24.0), px(24.0))
         );
     }
 
-    fn assert_rect_near(actual: Rect, expected: Rect) {
+    fn assert_rect_near(actual: LogicalRect, expected: LogicalRect) {
         let eps = 1e-2;
         assert!(
-            (actual.origin.x - expected.origin.x).abs() < eps
-                && (actual.origin.y - expected.origin.y).abs() < eps
-                && (actual.size.width - expected.size.width).abs() < eps
-                && (actual.size.height - expected.size.height).abs() < eps,
+            (actual.origin.x - expected.origin.x).abs() < px(eps)
+                && (actual.origin.y - expected.origin.y).abs() < px(eps)
+                && (actual.size.width - expected.size.width).abs() < px(eps)
+                && (actual.size.height - expected.size.height).abs() < px(eps),
             "期望 {expected:?}，实际 {actual:?}"
         );
     }
 
-    fn measured(brand: Brand) -> (Rect, Image) {
+    fn measured(brand: Brand) -> (LogicalRect, Image) {
         let mut app = test_app();
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
@@ -372,49 +334,103 @@ mod tests {
 
     #[test]
     fn non_square_brands_are_contained_in_the_requested_square() {
-        let (frame, image) = measured(Brand::new(BrandKind::Ethereum).with_size(36.0));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 36.0, 36.0));
-        assert_rect_near(image.bounds, Rect::new(7.0, 0.0, 22.0, 36.0));
+        let (frame, image) = measured(Brand::new(BrandKind::Ethereum).with_size(px(36.0)));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(36.0), px(36.0)),
+        );
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(7.0), px(0.0), px(22.0), px(36.0)),
+        );
         assert_eq!(image.modulation, Color::WHITE, "品牌图不染色");
 
-        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(36.0));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 36.0, 36.0));
-        assert_rect_near(image.bounds, Rect::new(0.0, 2.0, 36.0, 32.0));
+        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(px(36.0)));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(36.0), px(36.0)),
+        );
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(0.0), px(2.0), px(36.0), px(32.0)),
+        );
 
-        let (frame, image) = measured(Brand::new(BrandKind::Binance).with_size(36.0));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 36.0, 36.0));
-        assert_rect_near(image.bounds, Rect::new(0.0, 0.0, 36.0, 36.0));
+        let (frame, image) = measured(Brand::new(BrandKind::Binance).with_size(px(36.0)));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(36.0), px(36.0)),
+        );
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(0.0), px(0.0), px(36.0), px(36.0)),
+        );
 
         let (frame, image) = measured(Brand::new(BrandKind::Ethereum));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 44.0, 72.0));
-        assert_rect_near(image.bounds, Rect::new(0.0, 0.0, 44.0, 72.0));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(44.0), px(72.0)),
+        );
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(0.0), px(0.0), px(44.0), px(72.0)),
+        );
     }
 
     #[test]
-    fn production_sizes_14_and_16_letterbox_the_decoded_tile() {
-        let (frame, image) = measured(Brand::new(BrandKind::Ethereum).with_size(14.0));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 14.0, 14.0));
-        assert_rect_near(image.bounds, Rect::new(3.0, 0.0, 8.0, 14.0));
+    fn production_sizes_14_and_16_letterbox_the_native_aspect() {
+        let (frame, image) = measured(Brand::new(BrandKind::Ethereum).with_size(px(14.0)));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(14.0), px(14.0)),
+        );
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(2.722_222_3), px(0.0), px(8.555_555), px(14.0)),
+        );
 
-        let (frame, image) = measured(Brand::new(BrandKind::Ethereum).with_size(16.0));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 16.0, 16.0));
-        assert_rect_near(image.bounds, Rect::new(3.5, 0.0, 9.0, 16.0));
+        let (frame, image) = measured(Brand::new(BrandKind::Ethereum).with_size(px(16.0)));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)),
+        );
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(3.111_111_2), px(0.0), px(9.777_778), px(16.0)),
+        );
 
-        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(14.0));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 14.0, 14.0));
-        assert_rect_near(image.bounds, Rect::new(0.0, 1.0, 14.0, 12.0));
+        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(px(14.0)));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(14.0), px(14.0)),
+        );
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(0.0), px(0.777_777_8), px(14.0), px(12.444_445)),
+        );
 
-        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(16.0));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 16.0, 16.0));
-        assert_rect_near(image.bounds, Rect::new(0.0, 1.0, 16.0, 14.0));
+        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(px(16.0)));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)),
+        );
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(0.0), px(0.888_888_9), px(16.0), px(14.222_223)),
+        );
     }
 
     #[test]
     fn a_brand_mounts_an_unmodulated_image_node() {
-        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(32.0));
-        assert_rect_near(frame, Rect::new(0.0, 0.0, 32.0, 32.0));
+        let (frame, image) = measured(Brand::new(BrandKind::Solana).with_size(px(32.0)));
+        assert_rect_near(
+            frame,
+            LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
+        );
         assert_eq!(image.modulation, Color::WHITE, "品牌图不染色");
-        assert_rect_near(image.bounds, Rect::new(0.0, 2.0, 32.0, 28.0));
+        assert_rect_near(
+            image.bounds,
+            LogicalRect::new(px(0.0), px(1.777_777_7), px(32.0), px(28.444_445)),
+        );
     }
 
     #[test]
@@ -423,32 +439,16 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
         for size in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let side = px(size);
             let error = Brand::new(BrandKind::Binance)
-                .with_size(size)
+                .with_size(side)
                 .build(app.app_mut(), window, root)
                 .expect_err("非法尺寸必须失败");
             assert!(
-                matches!(&error, BrandError::InvalidSize { size: actual } if actual.to_bits() == size.to_bits()),
+                matches!(&error, BrandError::InvalidSize { size: actual } if actual.value().to_bits() == size.to_bits()),
                 "size={size} 的错误分类不对：{error:?}"
             );
         }
-
-        let container = NodeBuilder::boxed()
-            .build(
-                app.app_mut()
-                    .window_mut(window)
-                    .expect("test window")
-                    .tree_mut(),
-                root,
-            )
-            .expect("容器");
-        let error = Brand::new(BrandKind::Binance)
-            .reselect(app.app_mut(), window, container)
-            .expect_err("非图片节点必须失败");
-        assert!(
-            matches!(error, BrandError::NotImageNode { node } if node == container),
-            "非图片节点的错误分类不对：{error:?}"
-        );
 
         assert!(app.app_mut().close_window(window), "窗口必须存在");
         let error = Brand::new(BrandKind::Binance)
@@ -463,7 +463,7 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
         Brand::new(BrandKind::Ethereum)
-            .with_size(36.0)
+            .with_size(px(36.0))
             .build(app.app_mut(), window, root)
             .expect("品牌挂载");
         let _ = app.drain().expect("首帧");
@@ -477,12 +477,12 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
         let labelled = Brand::new(BrandKind::Binance)
-            .with_size(16.0)
+            .with_size(px(16.0))
             .with_alt("Binance")
             .build(app.app_mut(), window, root)
             .expect("有 alt 的品牌挂载");
         let decorative = Brand::new(BrandKind::Ethereum)
-            .with_size(16.0)
+            .with_size(px(16.0))
             .build(app.app_mut(), window, root)
             .expect("无 alt 的品牌挂载");
         let _ = app.drain().expect("首帧");
@@ -532,60 +532,46 @@ mod tests {
     }
 
     #[test]
-    fn reselecting_after_a_dpi_change_swaps_to_the_2x_variant() {
-        let mut app = test_app_with_scale(1.0);
+    fn a_brand_registers_its_bitmap_at_the_native_pixels() {
+        let mut app = test_app();
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
-        let brand = Brand::new(BrandKind::Solana).with_size(32.0);
-        let node = brand
-            .clone()
+        let node = Brand::new(BrandKind::Solana)
+            .with_size(px(32.0))
             .build(app.app_mut(), window, root)
             .expect("品牌挂载");
-        let _ = app.drain().expect("1× 首帧");
-        let before = assert_single_image(&app);
+        let _ = app.drain().expect("首帧");
 
-        set_window_scale(&mut app, 2.0);
-        let _ = app.drain().expect("2× 首帧（E7 只重解析内在尺寸）");
-        assert_rect_near(
-            bounds(&app, node).expect("品牌节点布局盒"),
-            Rect::new(0.0, 0.0, 32.0, 32.0),
-        );
-        assert_eq!(
-            assert_single_image(&app).bounds,
-            before.bounds,
-            "换变体前几何照旧"
-        );
-
-        let resource = brand
-            .reselect(app.app_mut(), window, node)
-            .expect("重选档位");
-        let expected = app
-            .app_mut()
-            .resources_mut()
-            .insert_for_display(BrandKind::Solana.bytes(), Size::new(32.0, 32.0), 2.0)
-            .expect("引擎的 E7 显示变体");
-        assert_eq!(
-            resource, expected,
-            "reselect 必须等价于 insert_for_display(节点盒, 2×)"
-        );
+        let image = resource_of(&app, window, node);
         assert!(
-            resource.width > 32 || resource.height > 32,
-            "2× 变体的物理像素必须比 1× 更大：{resource:?}"
+            matches!(image.kind(), ImageResourceKind::Bitmap { .. }),
+            "品牌是位图资源：{:?}",
+            image.kind()
         );
-
-        let _ = app.drain().expect("换变体后一帧");
-        let after = assert_single_image(&app);
-        assert_eq!(after.tile, resource.tile, "图元必须用 2× 变体的 tile");
-        assert_ne!(after.tile, before.tile, "换档必须换到另一张 tile");
-        assert_rect_near(after.bounds, Rect::new(0.0, 2.0, 32.0, 28.0));
+        assert_eq!(
+            image.intrinsic(DevicePixelRatio::ONE),
+            BrandKind::Solana.native_size(),
+            "位图按原生像素登记，内在逻辑尺寸 = 原生 / DPR"
+        );
+        let tree = app.app().window(window).expect("test window").tree();
+        let mounted = tree.get(node).expect("品牌节点");
+        let NodeKind::Image(content) = mounted.kind() else {
+            panic!("品牌必须是图片节点");
+        };
+        assert_eq!(
+            content.intrinsic(),
+            Some(BrandKind::Solana.native_size()),
+            "节点内在尺寸由资源导出，与 32 px 显示盒无关"
+        );
     }
 
-    fn set_window_scale(app: &mut TestApp, scale: f32) {
-        let window = app.window_id();
-        app.app_mut()
-            .window_mut(window)
-            .expect("test window")
-            .set_scale(Scale::new(scale).expect("测试 DPI 必须是有限正数"));
+    fn resource_of(app: &TestApp, window: WindowId, node: NodeId) -> ResourceImage {
+        let tree = app.app().window(window).expect("test window").tree();
+        let NodeKind::Image(content) = tree.get(node).expect("品牌节点").kind() else {
+            panic!("品牌必须是图片节点");
+        };
+        let id = content.source().resource().expect("品牌是就绪资源");
+        app.app().resources().image(id).expect("资源必须仍然存活")
     }
 
     #[test]
@@ -595,7 +581,7 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
         let node = Brand::new(BrandKind::Ethereum)
-            .with_size(26.0)
+            .with_size(px(26.0))
             .with_alt("Ethereum")
             .build(app.app_mut(), window, root)
             .expect("品牌挂载");

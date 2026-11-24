@@ -36,7 +36,7 @@ use market_participants_model::{
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     event::{Action, Event, InputEvent, Modifiers, PointerButton},
-    math::{Point, Size},
+    math::{LogicalPoint, LogicalPx, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope},
     paint::style_builder::StyleBuilder,
     test_support::record::PrimitiveKind,
@@ -263,7 +263,7 @@ fn resize_window(harness: &mut WidgetTestApp, size: (f32, f32)) {
         .app_mut()
         .window_mut(window)
         .expect("the host window exists")
-        .set_size(Size::new(size.0, size.1));
+        .set_size(LogicalSize::new(px(size.0), px(size.1)));
     harness.drain();
 }
 
@@ -274,8 +274,8 @@ fn page(harness: &mut WidgetTestApp, id: &'static str, size: (f32, f32)) -> Node
             .id(id)
             .style(
                 StyleBuilder::new()
-                    .width(size.0)
-                    .height(size.1)
+                    .width(px(size.0))
+                    .height(px(size.1))
                     .flex_col()
                     .build(),
             )
@@ -288,7 +288,7 @@ fn header_group(harness: &mut WidgetTestApp, parent: NodeId, id: &'static str) -
     harness.with_cx(|cx| {
         NodeBuilder::boxed()
             .id(id)
-            .style(StyleBuilder::new().flex_row().height(32.0).build())
+            .style(StyleBuilder::new().flex_row().height(px(32.0)).build())
             .build(cx.tree_mut(), parent)
             .expect("the header group builds")
     })
@@ -437,18 +437,18 @@ impl Pane {
             .expect("the chart is a canvas node")
     }
 
-    fn layout_width(&self) -> Option<f32> {
+    fn layout_width(&self) -> Option<LogicalPx> {
         self.widget.chart.layout_width()
     }
 
-    fn data_center(&self) -> Point {
+    fn data_center(&self) -> LogicalPoint {
         let bounds = self
             .widget
             .chart
             .layout()
             .expect("the chart has been laid out")
             .data_bounds();
-        Point::new(
+        LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         )
@@ -681,7 +681,7 @@ fn sync_surface(
     harness.drain();
 }
 
-fn pointer_move(position: Point) -> Event {
+fn pointer_move(position: LogicalPoint) -> Event {
     Event::Input(InputEvent::PointerMove {
         position,
         modifiers: Modifiers::default(),
@@ -689,7 +689,7 @@ fn pointer_move(position: Point) -> Event {
     })
 }
 
-fn pointer_down(position: Point) -> Event {
+fn pointer_down(position: LogicalPoint) -> Event {
     Event::Input(InputEvent::PointerDown {
         position,
         button: PointerButton::Primary,
@@ -698,7 +698,7 @@ fn pointer_down(position: Point) -> Event {
     })
 }
 
-fn pointer_up(position: Point) -> Event {
+fn pointer_up(position: LogicalPoint) -> Event {
     Event::Input(InputEvent::PointerUp {
         position,
         button: PointerButton::Primary,
@@ -707,7 +707,7 @@ fn pointer_up(position: Point) -> Event {
     })
 }
 
-fn scroll(position: Point, delta: Point) -> Event {
+fn scroll(position: LogicalPoint, delta: LogicalPoint) -> Event {
     Event::Input(InputEvent::Scroll {
         position,
         delta,
@@ -718,9 +718,9 @@ fn scroll(position: Point, delta: Point) -> Event {
     })
 }
 
-fn over_the_panel(pane: &Pane) -> Point {
+fn over_the_panel(pane: &Pane) -> LogicalPoint {
     let bounds = pane.widget.chart.bounds().expect("the chart has a box");
-    Point::new(
+    LogicalPoint::new(
         bounds.max().x + 8.0,
         bounds.origin.y + bounds.size.height / 2.0,
     )
@@ -1740,7 +1740,7 @@ fn dragging_should_pan_the_viewport_and_stop_at_the_live_edge() {
     );
     assert!(pane.widget.dragging);
 
-    let right = Point::new(center.x + 120.0, center.y);
+    let right = LogicalPoint::new(center.x + 120.0, center.y);
     assert!(pane.dispatch(&mut harness, pointer_move(right)));
     assert!(
         pane.widget.viewport.right_timestamp.is_some(),
@@ -1748,7 +1748,7 @@ fn dragging_should_pan_the_viewport_and_stop_at_the_live_edge() {
     );
 
     let bounds = pane.widget.chart.bounds().expect("the chart has a box");
-    let left = Point::new(bounds.origin.x + 1.0, center.y);
+    let left = LogicalPoint::new(bounds.origin.x + 1.0, center.y);
     assert!(pane.dispatch(&mut harness, pointer_move(left)));
     assert_eq!(
         pane.widget.viewport.right_timestamp, None,
@@ -1768,7 +1768,10 @@ fn scrolling_should_zoom_around_the_pointer() {
     let width = pane.widget.viewport.candle_width;
 
     assert!(
-        pane.dispatch(&mut harness, scroll(center, Point::new(0.0, 1.0))),
+        pane.dispatch(
+            &mut harness,
+            scroll(center, LogicalPoint::new(px(0.0), px(1.0)))
+        ),
         "the plot consumes the wheel rather than letting the page scroll"
     );
 
@@ -1793,7 +1796,10 @@ fn a_wheel_without_a_vertical_delta_should_not_zoom() {
     let width = pane.widget.viewport.candle_width;
 
     assert!(
-        pane.dispatch(&mut harness, scroll(center, Point::new(0.0, 0.0))),
+        pane.dispatch(
+            &mut harness,
+            scroll(center, LogicalPoint::new(px(0.0), px(0.0)))
+        ),
         "the chart still consumes the wheel over its plot"
     );
 
@@ -1816,7 +1822,10 @@ fn a_horizontal_wheel_should_not_zoom_the_chart() {
     let anchored = pane.widget.viewport.right_timestamp;
 
     assert!(
-        pane.dispatch(&mut harness, scroll(center, Point::new(24.0, 0.0))),
+        pane.dispatch(
+            &mut harness,
+            scroll(center, LogicalPoint::new(px(24.0), px(0.0)))
+        ),
         "the chart consumes both axes of a two-finger pan over its plot"
     );
 
@@ -1842,7 +1851,7 @@ fn a_release_outside_the_canvas_should_end_the_drag() {
     assert!(
         pane.dispatch(
             &mut harness,
-            pointer_move(Point::new(center.x + 120.0, center.y))
+            pointer_move(LogicalPoint::new(center.x + 120.0, center.y))
         ),
         "the drag pans"
     );
@@ -1877,7 +1886,7 @@ fn a_pointer_that_comes_back_to_the_plot_should_not_jump() {
     assert!(pane.dispatch(&mut harness, pointer_up(outside)));
     let anchored = pane.widget.viewport.right_timestamp;
 
-    let back = Point::new(center.x + 40.0, center.y);
+    let back = LogicalPoint::new(center.x + 40.0, center.y);
     assert!(
         pane.dispatch(&mut harness, pointer_move(back)),
         "the chart takes the pointer again"
@@ -1903,7 +1912,7 @@ fn events_outside_the_chart_should_not_be_consumed_and_leaving_should_clear_the_
     assert!(pane.dispatch(&mut harness, pointer_move(center)));
     assert_eq!(pane.widget.viewport.cursor, Some(center));
 
-    let outside = Point::new(9_000.0, 9_000.0);
+    let outside = LogicalPoint::new(px(9_000.0), px(9_000.0));
     assert!(
         !pane.dispatch(&mut harness, pointer_move(outside)),
         "the panel and the header are not the chart's to consume"
@@ -1975,8 +1984,8 @@ fn a_widened_chart_should_ask_for_the_history_it_now_needs() {
 
     let page_node = pane.chart_page;
     let wide = StyleBuilder::new()
-        .width(WIDE_PAGE.0)
-        .height(WIDE_PAGE.1)
+        .width(px(WIDE_PAGE.0))
+        .height(px(WIDE_PAGE.1))
         .flex_col()
         .build();
     harness.with_cx(|cx| {
@@ -1988,7 +1997,7 @@ fn a_widened_chart_should_ask_for_the_history_it_now_needs() {
     pane.frame(&mut harness);
 
     assert!(
-        pane.layout_width().expect("the chart was laid out again") > PAGE.0,
+        pane.layout_width().expect("the chart was laid out again") > px(PAGE.0),
         "the plot grew with the pane"
     );
     assert_eq!(

@@ -1,5 +1,6 @@
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
+    math::px,
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
@@ -48,7 +49,7 @@ impl EmptyState {
         let mut style = StyleBuilder::new()
             .flex_none()
             .min_width_0()
-            .padding_x(16.0)
+            .padding_x(px(16.0))
             .build();
         style.max_width(taffy::style::LengthPercentageAuto::percent(1.0));
         let root = NodeBuilder::boxed()
@@ -56,7 +57,7 @@ impl EmptyState {
             .style(style)
             .build(tree, parent)?;
         let theme = self.theme.clone();
-        let mut text = NodeBuilder::text(self.text.initial_text(), TextStyle::new(TEXT_SIZE));
+        let mut text = NodeBuilder::text(self.text.initial_text(), TextStyle::new(px(TEXT_SIZE)));
         if self.text.is_bound() {
             let label = self.text.clone();
             text = text.bind_text(move |cx| label.read(cx));
@@ -83,6 +84,7 @@ impl std::fmt::Debug for EmptyState {
 #[cfg(test)]
 mod tests {
     use ui_core::{
+        math::px,
         node::{id::NodeId, tree::NodeKind},
         paint::color::ColorResolver,
         test_support::app::TestApp,
@@ -117,7 +119,7 @@ mod tests {
         match tree.get(children[0]).expect("text").kind() {
             NodeKind::Text(content) => {
                 assert_eq!(content.text, "No trades yet");
-                assert_eq!(content.style.size, 14.0);
+                assert_eq!(content.style.size, px(14.0));
             }
             other => panic!("expected Text, got {other:?}"),
         }
@@ -149,8 +151,8 @@ mod tests {
             .clone();
         assert_eq!(patch, ui_core::paint::style::StylePatch::default());
         let bounds = app.probe().bounds(node).expect("bounds");
-        assert!(bounds.size.width > 0.0, "宽度由内容决定，不写死");
-        assert!(bounds.size.height > 0.0);
+        assert!(bounds.size.width > px(0.0), "宽度由内容决定，不写死");
+        assert!(bounds.size.height > px(0.0));
     }
 
     #[test]

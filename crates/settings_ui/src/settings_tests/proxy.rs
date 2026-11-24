@@ -7,7 +7,7 @@ use app_config::{
 use app_config_provider::store::ConfigPersistenceError;
 use i18n::language::codes::LanguageCode;
 use smol_str::SmolStr;
-use ui_core::{event::KeyCode, node::id::NodeId};
+use ui_core::{event::KeyCode, math::px, node::id::NodeId};
 
 use crate::{
     pages::proxy::editor::{
@@ -246,7 +246,7 @@ fn an_empty_catalog_should_draw_the_message_it_has_to_say() {
     assert!(
         (message.origin.x + message.size.width / 2.0 - (table.origin.x + table.size.width / 2.0))
             .abs()
-            < 1.0,
+            < px(1.0),
         "the message should be drawn across the whole table: {message:?} in {table:?}"
     );
 }
@@ -307,7 +307,7 @@ fn the_add_button_should_sit_above_a_table_that_fills_the_page() {
         "the button that adds an entry is a medium one: {add:?}"
     );
     assert!(
-        (add.origin.x + add.size.width - (page.origin.x + page.size.width)).abs() < 1.0,
+        (add.origin.x + add.size.width - (page.origin.x + page.size.width)).abs() < px(1.0),
         "the button belongs at the right end of the row above the table: {add:?} in {page:?}"
     );
     assert!(
@@ -315,15 +315,16 @@ fn the_add_button_should_sit_above_a_table_that_fills_the_page() {
         "the table belongs below the button rather than beside it: {table:?} under {add:?}"
     );
     assert!(
-        (page.origin.y + page.size.height - (content.origin.y + content.size.height)).abs() < 1.0,
+        (page.origin.y + page.size.height - (content.origin.y + content.size.height)).abs()
+            < px(1.0),
         "the page should be the whole of the body it is drawn in: {page:?} beside {content:?}"
     );
     assert!(
-        (table.origin.y + table.size.height - (page.origin.y + page.size.height)).abs() < 1.0,
+        (table.origin.y + table.size.height - (page.origin.y + page.size.height)).abs() < px(1.0),
         "the table should be the rest of the page: {table:?} in {page:?}"
     );
     assert!(
-        (table.size.width - page.size.width).abs() < 1.0,
+        (table.size.width - page.size.width).abs() < px(1.0),
         "the table should be as wide as the page it fills: {table:?} in {page:?}"
     );
 }
@@ -531,11 +532,11 @@ fn the_form_buttons_should_sit_under_a_line_at_the_foot_of_the_form() {
          {confirm:?}"
     );
     assert!(
-        (footer.origin.y + footer.size.height - (form.origin.y + form.size.height)).abs() < 1.0,
+        (footer.origin.y + footer.size.height - (form.origin.y + form.size.height)).abs() < px(1.0),
         "the row should be the foot of the form: {footer:?} in {form:?}"
     );
     assert!(
-        (confirm.origin.x + confirm.size.width - (form.origin.x + form.size.width)).abs() < 1.0,
+        (confirm.origin.x + confirm.size.width - (form.origin.x + form.size.width)).abs() < px(1.0),
         "the row should be laid out from the right edge of the form: {confirm:?} in {form:?}"
     );
     assert_eq!(

@@ -8,6 +8,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     event::Event,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
@@ -53,7 +54,7 @@ use crate::{
 
 pub(crate) const COUNTDOWN_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
-const METRICS_HEIGHT: f32 = 58.0;
+const METRICS_HEIGHT: LogicalPx = px(58.0);
 
 const REFRESH_KEY_SUFFIX: &str = "cryptocurrency_etf.refresh";
 const ASSET_KEY_SUFFIX: &str = "cryptocurrency_etf.asset";
@@ -307,8 +308,8 @@ impl WidgetView for CryptocurrencyEtfWidget {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .gap(12.0)
-                    .padding_x(12.0)
+                    .gap(px(12.0))
+                    .padding_x(px(12.0))
                     .build(),
             )
             .build(cx.tree_mut(), root)?;
@@ -931,7 +932,7 @@ impl CryptocurrencyEtfWidget {
                     .flex_1()
                     .min_width_0()
                     .flex_col()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -995,7 +996,7 @@ impl CryptocurrencyEtfWidget {
                     .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -1007,7 +1008,7 @@ impl CryptocurrencyEtfWidget {
                     .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), row)?;

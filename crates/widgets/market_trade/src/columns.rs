@@ -8,6 +8,7 @@ use market_participants_model::{
 use smol_str::SmolStr;
 use time::UtcOffset;
 use ui_core::{
+    math::LogicalPx,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::style::StylePatch,
     text::TextStyle,
@@ -108,7 +109,7 @@ pub(super) fn columns(headers: [SmolStr; COLUMN_COUNT]) -> Vec<Column> {
         .collect()
 }
 
-pub(super) fn table_options(row_height: f32) -> TableOptions {
+pub(super) fn table_options(row_height: LogicalPx) -> TableOptions {
     TableOptions::fixed(row_height).selection(SelectionMode::None)
 }
 
@@ -139,7 +140,7 @@ pub(super) fn build_cell(
     rows: Signal<MarketTradeSnapshot>,
     config: Signal<Config>,
     theme: ThemeHandle,
-    font_size: f32,
+    font_size: LogicalPx,
 ) {
     let text = NodeBuilder::text(SmolStr::default(), TextStyle::new(font_size));
 
@@ -387,7 +388,7 @@ mod tests {
             "the old dataset had no sorting"
         );
 
-        let options = table_options(24.0);
+        let options = table_options(LogicalPx::new(24.0));
         assert_eq!(options.selection, SelectionMode::None);
     }
 }

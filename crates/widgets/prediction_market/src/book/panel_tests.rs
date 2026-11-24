@@ -9,6 +9,7 @@ use market_participants_model::{
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     interaction::ItemAlign,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::style_builder::StyleBuilder,
     test_support::record::PrimitiveKind,
@@ -25,9 +26,9 @@ use super::{
 };
 use crate::test_support::{charted_market, event_ref, level, order_book};
 
-const PAGE: (f32, f32) = (400.0, 400.0);
+const PAGE: (LogicalPx, LogicalPx) = (px(400.0), px(400.0));
 
-const ROW_HEIGHT: f32 = 22.0;
+const ROW_HEIGHT: LogicalPx = px(22.0);
 
 const TICK: Duration = Duration::from_millis(16);
 
@@ -355,29 +356,29 @@ fn the_grouping_choice_should_follow_the_book_and_fall_back_to_its_tick() {
 
 #[test]
 fn split_ratio_should_follow_the_pointer_and_stay_inside_the_area() {
-    assert_eq!(split_ratio(0.5, 0.0, 500.0), 0.5);
-    let shrunk = split_ratio(0.5, 50.0, 500.0);
+    assert_eq!(split_ratio(0.5, px(0.0), px(500.0)), 0.5);
+    let shrunk = split_ratio(0.5, px(50.0), px(500.0));
     assert!(
         (shrunk - 0.4).abs() < 1e-6,
         "dragging down gives the book less: {shrunk}"
     );
-    let grown = split_ratio(0.5, -50.0, 500.0);
+    let grown = split_ratio(0.5, px(-50.0), px(500.0));
     assert!(
         (grown - 0.6).abs() < 1e-6,
         "dragging up gives it more: {grown}"
     );
     assert_eq!(
-        split_ratio(0.25, 1_000.0, 500.0),
+        split_ratio(0.25, px(1_000.0), px(500.0)),
         MIN_BOOK_RATIO,
         "a drag past the smallest share stops at it"
     );
     assert_eq!(
-        split_ratio(0.75, -1_000.0, 500.0),
+        split_ratio(0.75, px(-1_000.0), px(500.0)),
         MAX_BOOK_RATIO,
         "a drag past the largest share stops at it"
     );
     assert_eq!(
-        split_ratio(0.5, 50.0, 0.0),
+        split_ratio(0.5, px(50.0), px(0.0)),
         0.5,
         "an area that has not been laid out leaves the notch alone"
     );
@@ -537,9 +538,9 @@ fn the_first_book_should_anchor_the_spread_row_at_the_centre() {
         .panel
         .scroll_offset(fixture.harness.app())
         .expect("the list is attached");
-    let expected = asks as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0 - (PAGE.1 - 20.0) / 2.0;
+    let expected = ROW_HEIGHT * asks as f32 + ROW_HEIGHT / 2.0 - (PAGE.1 - px(20.0)) / 2.0;
     assert!(
-        (offset - expected).abs() < 1.0,
+        (offset - expected).abs() < px(1.0),
         "the spread row is centred in the ladder: {offset} vs {expected}"
     );
     let rows = fixture.panel.mounted_rows(fixture.harness.app());
@@ -641,7 +642,7 @@ fn the_depth_bars_should_be_one_quad_per_visible_row_in_the_side_colour() {
         .map(|quad| {
             let quad = quad.bounds.expect("a quad has bounds");
             assert!(
-                (quad.origin.x - bounds.origin.x).abs() < 0.01,
+                (quad.origin.x - bounds.origin.x).abs() < px(0.01),
                 "the bars hang off the left edge of their row"
             );
             quad.size.width / bounds.size.width
@@ -776,14 +777,14 @@ fn the_depth_bars_should_follow_the_lists_scroll_offset() {
         .panel
         .scroll_offset(fixture.harness.app())
         .expect("the list is attached");
-    assert!(offset > 0.0, "the deep ladder is anchored and scrolled");
+    assert!(offset > px(0.0), "the deep ladder is anchored and scrolled");
 
     let quads = fixture.quads();
     let first = (offset / ROW_HEIGHT).floor() as usize;
-    let expected_top = bounds.origin.y + first as f32 * ROW_HEIGHT - offset;
+    let expected_top = bounds.origin.y + ROW_HEIGHT * first as f32 - offset;
     let first_quad = quads[0].bounds.expect("a quad has bounds");
     assert!(
-        (first_quad.origin.y - expected_top).abs() < 0.01,
+        (first_quad.origin.y - expected_top).abs() < px(0.01),
         "the first bar is the first row of the scrolled window: {} vs {expected_top}",
         first_quad.origin.y
     );
@@ -803,7 +804,7 @@ fn the_depth_bars_should_follow_the_lists_scroll_offset() {
         .scroll_offset(fixture.harness.app())
         .expect("the list is attached");
     assert!(
-        (scrolled - offset).abs() > 1.0,
+        (scrolled - offset).abs() > px(1.0),
         "the programmatic jump moved the ladder: {scrolled} vs {offset}"
     );
     assert!(
@@ -811,10 +812,10 @@ fn the_depth_bars_should_follow_the_lists_scroll_offset() {
         "a scrolled ladder is a drawing for the bars, not a steady frame"
     );
     let first = (scrolled / ROW_HEIGHT).floor() as usize;
-    let expected_top = bounds.origin.y + first as f32 * ROW_HEIGHT - scrolled;
+    let expected_top = bounds.origin.y + ROW_HEIGHT * first as f32 - scrolled;
     let first_quad = fixture.quads()[0].bounds.expect("a quad has bounds");
     assert!(
-        (first_quad.origin.y - expected_top).abs() < 0.01,
+        (first_quad.origin.y - expected_top).abs() < px(0.01),
         "the bars follow the offset the list is scrolled to: {} vs {expected_top}",
         first_quad.origin.y
     );

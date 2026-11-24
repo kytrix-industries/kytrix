@@ -7,10 +7,7 @@ use image::{
 use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions, Xyzd};
 use smol_str::{SmolStr, format_smolstr};
 
-use crate::{
-    math::{PhysicalPx, PhysicalSize},
-    resources::DecodeCause,
-};
+use crate::resources::DecodeCause;
 
 pub(crate) const MAX_TILE_DIM: u32 = 2046;
 
@@ -54,10 +51,7 @@ pub(crate) struct DecodedImage {
     pub color: SourceColor,
 }
 
-pub(crate) fn decode(
-    bytes: &[u8],
-    target: Option<(u32, u32)>,
-) -> Result<DecodedImage, DecodeCause> {
+pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeCause> {
     let format = format_of(bytes)?;
     let tag = format_tag(format);
     let mut decoder = ImageReader::with_format(Cursor::new(bytes), format)
@@ -84,7 +78,7 @@ pub(crate) fn decode(
     let mut image: DynamicImage =
         DynamicImage::from_decoder(decoder).map_err(|error| classify(tag, error))?;
     image.apply_orientation(orientation);
-    image = resize_decoded(image, target);
+    image = limit_native_size(image);
     let rgba = image.to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     debug_assert_eq!(rgba.as_raw().len(), width as usize * height as usize * 4);
@@ -97,31 +91,46 @@ pub(crate) fn decode(
     })
 }
 
-pub(crate) fn resolve_target(target: PhysicalSize, source: (u32, u32)) -> (u32, u32) {
-    fn pixel(value: PhysicalPx) -> u32 {
-        let value = value.value();
-        if !value.is_finite() || value <= 0.0 {
-            1
-        } else {
-            (value.ceil() as u32).max(1)
-        }
-    }
-    let width = pixel(target.width).min(source.0).min(MAX_TILE_DIM);
-    let height = pixel(target.height).min(source.1).min(MAX_TILE_DIM);
-    (width, height)
-}
-
-fn resize_decoded(image: DynamicImage, target: Option<(u32, u32)>) -> DynamicImage {
+fn limit_native_size(image: DynamicImage) -> DynamicImage {
     let (width, height) = (image.width(), image.height());
-    let (limit, filter) = match target {
-        Some(target) => (target, FilterType::CatmullRom),
-        None => ((MAX_TILE_DIM, MAX_TILE_DIM), FilterType::Triangle),
-    };
-    let (final_width, final_height) = fit_into((width, height), limit);
+    let (final_width, final_height) = fit_into((width, height), (MAX_TILE_DIM, MAX_TILE_DIM));
     if (final_width, final_height) == (width, height) {
         return image;
     }
-    image.resize_exact(final_width, final_height, filter)
+    image.resize_exact(final_width, final_height, FilterType::Triangle)
+}
+
+pub(crate) fn downsample(decoded: &DecodedImage, width: u32, height: u32) -> DecodedImage {
+    debug_assert!(width > 0 && height > 0, "LOD 尺寸必须为正");
+    debug_assert!(width <= decoded.width && height <= decoded.height);
+    let rgba = bgra_to_rgba(&decoded.bgra);
+    let image = image::RgbaImage::from_raw(decoded.width, decoded.height, rgba)
+        .expect("BGRA 缓冲长度与解码尺寸一致");
+    let resized = image::imageops::resize(&image, width, height, FilterType::Triangle);
+    DecodedImage {
+        width,
+        height,
+        bgra: rgba_to_bgra(resized.as_raw()),
+        color: decoded.color,
+    }
+}
+
+fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(bgra.len() % 4, 0);
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for pixel in bgra.as_chunks::<4>().0 {
+        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    rgba
+}
+
+fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(rgba.len() % 4, 0);
+    let mut bgra = Vec::with_capacity(rgba.len());
+    for pixel in rgba.as_chunks::<4>().0 {
+        bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    bgra
 }
 
 fn convert_icc_to_srgb(
@@ -461,16 +470,13 @@ mod tests {
         DECODE_PEAK_MARGIN, ICC_PROFILE_LIMIT, MAX_DECODE_ALLOC, MAX_SOURCE_BYTES, MAX_SOURCE_DIM,
         MAX_SOURCE_PIXELS, MAX_TILE_DIM, SourceColor, SourceIcc, allocate_zeroed,
         check_source_bytes, check_source_size, classify, convert_icc_to_srgb, decode_limits,
-        estimate_peak, fit_into, is_srgb_profile, premultiply_channel, resolve_target, srgb_decode,
-        srgb_encode, test_png, transfer_lut,
+        estimate_peak, fit_into, is_srgb_profile, premultiply_channel, srgb_decode, srgb_encode,
+        test_png, transfer_lut,
     };
-    use crate::{
-        math::{PhysicalSize, physical_px},
-        resources::DecodeCause,
-    };
+    use crate::resources::DecodeCause;
 
     fn decode(bytes: &[u8]) -> Result<super::DecodedImage, DecodeCause> {
-        super::decode(bytes, None)
+        super::decode(bytes)
     }
 
     fn png_rgba8(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
@@ -810,79 +816,6 @@ mod tests {
         assert_eq!(fit_into((200, 100), (300, 40)), (80, 40));
         assert_eq!(fit_into((40, 20), (200, 200)), (40, 20));
         assert_eq!(fit_into((600, 300), (40, 40)), (40, 20));
-    }
-
-    #[test]
-    fn resolve_target_rounds_up_and_clamps_to_source_and_tile() {
-        assert_eq!(
-            resolve_target(
-                PhysicalSize::new(physical_px(40.2), physical_px(20.1)),
-                (200, 100)
-            ),
-            (41, 21)
-        );
-        assert_eq!(
-            resolve_target(
-                PhysicalSize::new(physical_px(40.0), physical_px(20.0)),
-                (200, 100)
-            ),
-            (40, 20)
-        );
-        assert_eq!(
-            resolve_target(
-                PhysicalSize::new(physical_px(200.0), physical_px(200.0)),
-                (40, 20)
-            ),
-            (40, 20)
-        );
-        assert_eq!(
-            resolve_target(
-                PhysicalSize::new(physical_px(500.0), physical_px(500.0)),
-                (40, 20)
-            ),
-            (40, 20)
-        );
-        assert_eq!(
-            resolve_target(
-                PhysicalSize::new(physical_px(4000.0), physical_px(4000.0)),
-                (5000, 5000)
-            ),
-            (MAX_TILE_DIM, MAX_TILE_DIM)
-        );
-        assert_eq!(
-            resolve_target(
-                PhysicalSize::new(physical_px(0.0), physical_px(-3.0)),
-                (200, 100)
-            ),
-            (1, 1)
-        );
-        assert_eq!(
-            resolve_target(
-                PhysicalSize::new(physical_px(f32::NAN), physical_px(f32::INFINITY)),
-                (200, 100)
-            ),
-            (1, 1)
-        );
-    }
-
-    #[test]
-    fn decode_at_size_keeps_aspect_and_never_upscales() {
-        let bytes = solid(200, 100, [10, 20, 30, 255]);
-        let sized = super::decode(&bytes, Some((40, 40))).expect("sized decode");
-        assert_eq!((sized.width, sized.height), (40, 20), "等比 fit，不是拉伸");
-
-        let small = solid(40, 20, [1, 2, 3, 255]);
-        let not_upscaled = super::decode(&small, Some((200, 200))).expect("no upscale");
-        assert_eq!(
-            (not_upscaled.width, not_upscaled.height),
-            (40, 20),
-            "目标大于源尺寸时不得放大"
-        );
-        assert_eq!(
-            not_upscaled.bgra,
-            decode(&small).expect("原尺寸").bgra,
-            "不放大时像素与原尺寸路径逐字节一致"
-        );
     }
 
     #[test]

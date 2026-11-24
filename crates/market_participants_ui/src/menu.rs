@@ -13,6 +13,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yRole},
     app::App,
     error::EngineError,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -57,7 +58,7 @@ const PANEL_CONTENT_WIDTH: f32 = PANEL_WIDTH - 2.0 * SURFACE_PADDING;
 
 const TRIGGER_ICON_SIZE: f32 = 16.0;
 
-const MARK_SIZE: f32 = 14.0;
+const MARK_SIZE: LogicalPx = px(14.0);
 
 const ACTION_WIDTH: f32 = 64.0;
 
@@ -242,7 +243,7 @@ impl MenuInner {
             });
         let trigger_node = trigger.build_bare(app, window, parent)?;
         IconSpec::new(IconKind::Bank)
-            .with_size(TRIGGER_ICON_SIZE)
+            .with_size(px(TRIGGER_ICON_SIZE))
             .build_themed(app, window, trigger_node, &theme, Role::FgDefault)?;
         self.trigger = Some(trigger);
         self.trigger_node = Some(trigger_node);
@@ -275,7 +276,7 @@ impl MenuInner {
             overlay_key,
             OverlayOptions {
                 placement: Placement::BOTTOM_START,
-                gap: 4.0,
+                gap: px(4.0),
                 dismiss: DismissPolicy::OutsideClick,
                 modal: true,
                 band: Band::Dialog,
@@ -427,7 +428,7 @@ impl MenuInner {
                 .style(
                     StyleBuilder::new()
                         .flex_col()
-                        .width(PANEL_CONTENT_WIDTH)
+                        .width(px(PANEL_CONTENT_WIDTH))
                         .min_width_0()
                         .build(),
                 )
@@ -657,16 +658,16 @@ fn build_row(
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(8.0)
+                    .gap(px(8.0))
                     .width_full()
-                    .padding_y(2.0)
+                    .padding_y(px(2.0))
                     .build(),
             )
             .build(tree, parent)?
     };
 
     Brand::new(brand_of(venue))
-        .with_size(16.0)
+        .with_size(px(16.0))
         .with_alt(market.clone())
         .build(app, window, row_node)?;
 
@@ -863,7 +864,7 @@ fn fix_width(app: &mut App, window: WindowId, node: NodeId, width: f32) -> Resul
         .tree_mut();
     let mut style = tree.get(node)?.style().clone();
     style
-        .width_length(width)
+        .width_length(px(width))
         .flex_grow(0.0)
         .flex_shrink(0.0)
         .justify_center();
@@ -882,7 +883,7 @@ mod tests {
         display::lexical::scope_display_code, identifier::VenueScopeId, listing::route::VenueRoute,
     };
     use smol_str::SmolStr;
-    use ui_core::{math::Point, node::builder::NodeBuilder};
+    use ui_core::{math::LogicalPoint, node::builder::NodeBuilder};
 
     use super::*;
     use crate::{
@@ -1452,9 +1453,9 @@ mod tests {
         let mut harness = Harness::new();
         open_panel(&mut harness);
 
-        harness.click_point(Point {
-            x: 1200.0,
-            y: 850.0,
+        harness.click_point(LogicalPoint {
+            x: px(1200.0),
+            y: px(850.0),
         });
         harness.settle_fade();
 

@@ -5,7 +5,7 @@ use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::SmolStr;
 use ui_core::{
     event::{Event, InputEvent},
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::style_builder::StyleBuilder,
 };
@@ -23,7 +23,7 @@ use crate::{
 
 const ACCOUNT: &str = "test-account";
 
-const PAGE: (f32, f32) = (640.0, 360.0);
+const PAGE: (LogicalPx, LogicalPx) = (px(640.0), px(360.0));
 
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
@@ -1006,7 +1006,7 @@ fn the_header_should_keep_its_controls_without_an_account() {
         let node = node(&harness, pane.header_group, prefix);
         let bounds = harness.tree().get(node).expect("laid out").layout().bounds;
         assert!(
-            bounds.size.width > 0.0,
+            bounds.size.width > px(0.0),
             "every control is still drawn: {prefix}"
         );
     }
@@ -1210,7 +1210,7 @@ fn a_pointer_move_should_redraw_the_row_and_the_chart() {
         .expect("the chart is laid out")
         .layout()
         .bounds;
-    let position = Point::new(
+    let position = LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     );

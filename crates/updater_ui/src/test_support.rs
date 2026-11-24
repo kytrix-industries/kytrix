@@ -12,7 +12,7 @@ use download_provider::{
 };
 use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use ui_core::{
-    math::Size,
+    math::{LogicalSize, px},
     node::{id::NodeId, tree::NodeTree},
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
@@ -73,7 +73,7 @@ pub(crate) struct Harness {
 impl Harness {
     pub(crate) fn new() -> Self {
         let mut app = TestApp::with_options(WindowOptions {
-            size: Size::new(1280.0, 900.0),
+            size: LogicalSize::new(px(1280.0), px(900.0)),
             ..WindowOptions::default()
         });
         let runtime = tokio::runtime::Builder::new_current_thread()

@@ -238,6 +238,12 @@ pub enum EngineError {
     #[error("image resource decode failed: {cause}")]
     ResourceDecode { cause: DecodeCause },
 
+    #[error(
+        "invalid image intrinsic size {width}x{height}: both sides must be finite and greater than \
+         zero"
+    )]
+    InvalidImageIntrinsic { width: f32, height: f32 },
+
     #[error("window {window:?} has no {capability} on this platform")]
     UnsupportedWindowCapability {
         window: WindowId,
@@ -360,6 +366,10 @@ mod tests {
                     page: (2048, 2048),
                     cause: crate::resources::CapacityCause::PageFull,
                 },
+            },
+            EngineError::InvalidImageIntrinsic {
+                width: f32::NAN,
+                height: -1.0,
             },
             EngineError::UnsupportedWindowCapability {
                 window: crate::window::WindowId::for_test(7),
@@ -642,6 +652,20 @@ mod tests {
             !text.contains("DPI"),
             "应用侧 scale 错误不得与平台 DPI 错误混淆：{text}"
         );
+    }
+
+    #[test]
+    fn invalid_image_intrinsic_display_names_both_sides() {
+        let text = EngineError::InvalidImageIntrinsic {
+            width: 0.0,
+            height: f32::NAN,
+        }
+        .to_string();
+
+        assert!(text.contains("invalid image intrinsic"), "{text}");
+        assert!(text.contains("0"), "{text}");
+        assert!(text.contains("NaN"), "{text}");
+        assert!(text.contains("greater than zero"), "{text}");
     }
 
     #[test]

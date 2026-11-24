@@ -22,6 +22,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::Event,
+    math::px,
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -628,7 +629,7 @@ impl CredentialsRow {
                         .flex_row()
                         .items_center()
                         .justify_end()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .width_full()
                         .build(),
                 )?;
@@ -929,7 +930,7 @@ impl CredentialsEditor {
                         .flex_col()
                         .width_full()
                         .min_width_0()
-                        .gap(12.0)
+                        .gap(px(12.0))
                         .build(),
                 )
                 .build(tree, parent)
@@ -944,7 +945,7 @@ impl CredentialsEditor {
                             .flex_col()
                             .width_full()
                             .min_width_0()
-                            .gap(4.0)
+                            .gap(px(4.0))
                             .build(),
                     )
                     .build(tree, parent)
@@ -989,7 +990,7 @@ impl CredentialsEditor {
             let error: Signal<Option<SmolStr>> = app.signal_scoped(scope, None);
             let error_theme = theme.clone();
             layout::build_node(app, window, column, move |tree, parent| {
-                NodeBuilder::text(SmolStr::default(), TextStyle::new(12.0))
+                NodeBuilder::text(SmolStr::default(), TextStyle::new(px(12.0)))
                     .id(kind.error_selector(field))
                     .bind_text(move |cx| cx.read(&error).clone().unwrap_or_default())
                     .bind_style(move |cx| {
@@ -1018,7 +1019,7 @@ impl CredentialsEditor {
                         .flex_col()
                         .flex_none()
                         .width_full()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, parent)
@@ -1031,7 +1032,7 @@ impl CredentialsEditor {
             StyleBuilder::new()
                 .flex_none()
                 .width_full()
-                .height(1.0)
+                .height(px(1.0))
                 .build(),
             PaintSpec::default(),
             &theme,
@@ -1047,7 +1048,7 @@ impl CredentialsEditor {
                 .items_center()
                 .justify_end()
                 .width_full()
-                .gap(8.0)
+                .gap(px(8.0))
                 .build(),
         )?;
         let weak = Rc::downgrade(self);

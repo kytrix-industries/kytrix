@@ -3,7 +3,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event},
     interaction::{ScrollConfig, ScrollHandle},
-    math::Size,
+    math::{LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -148,7 +148,7 @@ pub(crate) struct IndicatorPanel {
     expanded: Vec<(IndicatorId, bool)>,
     built_config: Option<CandlestickIndicatorConfig>,
     built_language: Option<LanguageCode>,
-    scroll_content: Option<Size>,
+    scroll_content: Option<LogicalSize>,
     hovered_card: Option<IndicatorId>,
 }
 
@@ -245,8 +245,8 @@ impl IndicatorPanel {
                 StyleBuilder::new()
                     .width_full()
                     .flex_col()
-                    .gap(CARD_GAP)
-                    .padding(PANEL_PADDING)
+                    .gap(px(CARD_GAP))
+                    .padding(px(PANEL_PADDING))
                     .flex_none()
                     .build(),
             )
@@ -499,10 +499,10 @@ impl IndicatorPanel {
             };
             (viewport, content_node.layout().bounds.size.height)
         };
-        if viewport.height <= 0.0 || !height.is_finite() {
+        if viewport.height <= px(0.0) || !height.is_finite() {
             return Ok(false);
         }
-        let size = Size::new(viewport.width, height.max(viewport.height));
+        let size = LogicalSize::new(viewport.width, height.max(viewport.height));
         if self.scroll_content == Some(size) {
             return Ok(false);
         }

@@ -1,7 +1,7 @@
 use std::{borrow::Cow, io::Cursor};
 
 use smol_str::SmolStr;
-use ui_core::math::Size;
+use ui_core::math::{LogicalSize, px};
 
 const SCHEME: &str = "file:";
 const SIZE_KEY: &str = "size";
@@ -28,7 +28,7 @@ pub enum InlineImageFormat {
 pub struct InlineImageSource {
     pub path: SmolStr,
     pub format: InlineImageFormat,
-    pub size: Option<Size>,
+    pub size: Option<LogicalSize>,
 }
 
 impl InlineImageSource {
@@ -83,7 +83,7 @@ impl InlineImageSource {
         })
     }
 
-    pub fn resolve(&self, assets: &dyn MarkdownAssets) -> Size {
+    pub fn resolve(&self, assets: &dyn MarkdownAssets) -> LogicalSize {
         if let Some(size) = self.size {
             return size;
         }
@@ -91,12 +91,15 @@ impl InlineImageSource {
         let intrinsic = bytes
             .as_deref()
             .and_then(intrinsic_size)
-            .filter(|size| *size != Size::ZERO)
-            .unwrap_or(Size::new(DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE));
+            .filter(|size| *size != LogicalSize::ZERO)
+            .unwrap_or(LogicalSize::new(
+                px(DEFAULT_IMAGE_SIZE),
+                px(DEFAULT_IMAGE_SIZE),
+            ));
 
-        Size::new(
-            intrinsic.width.max(MIN_INTRINSIC_SIZE),
-            intrinsic.height.max(MIN_INTRINSIC_SIZE),
+        LogicalSize::new(
+            intrinsic.width.max(px(MIN_INTRINSIC_SIZE)),
+            intrinsic.height.max(px(MIN_INTRINSIC_SIZE)),
         )
     }
 }
@@ -124,7 +127,7 @@ fn unquote(value: &str) -> Option<&str> {
     }
 }
 
-fn parse_size(value: &str) -> Option<Size> {
+fn parse_size(value: &str) -> Option<LogicalSize> {
     let (width, height) = match value.split_once(',') {
         Some((width, height)) => (width, height),
         None => (value, value),
@@ -136,9 +139,9 @@ fn parse_size(value: &str) -> Option<Size> {
         return None;
     };
 
-    Some(Size::new(
-        width.clamp(MIN_IMAGE_SIZE, MAX_IMAGE_SIZE),
-        height.clamp(MIN_IMAGE_SIZE, MAX_IMAGE_SIZE),
+    Some(LogicalSize::new(
+        px(width.clamp(MIN_IMAGE_SIZE, MAX_IMAGE_SIZE)),
+        px(height.clamp(MIN_IMAGE_SIZE, MAX_IMAGE_SIZE)),
     ))
 }
 
@@ -155,14 +158,14 @@ fn is_plain_number(value: &str) -> bool {
         })
 }
 
-fn intrinsic_size(bytes: &[u8]) -> Option<Size> {
+fn intrinsic_size(bytes: &[u8]) -> Option<LogicalSize> {
     let (width, height) = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?
         .into_dimensions()
         .ok()?;
 
-    Some(Size::new(width as f32, height as f32))
+    Some(LogicalSize::new(px(width as f32), px(height as f32)))
 }
 
 #[cfg(test)]
@@ -170,7 +173,7 @@ mod tests {
     use std::borrow::Cow;
 
     use smol_str::SmolStr;
-    use ui_core::math::Size;
+    use ui_core::math::{LogicalSize, px};
 
     use super::{InlineImageFormat, InlineImageSource, MarkdownAssets};
 
@@ -185,7 +188,7 @@ mod tests {
         }
     }
 
-    fn parsed(uri: &str) -> (SmolStr, InlineImageFormat, Option<Size>) {
+    fn parsed(uri: &str) -> (SmolStr, InlineImageFormat, Option<LogicalSize>) {
         let source = InlineImageSource::parse(uri)
             .unwrap_or_else(|| panic!("{uri} should be a usable image URI"));
         (source.path, source.format, source.size)
@@ -199,7 +202,7 @@ mod tests {
         );
     }
 
-    fn parsed_size(uri: &str, expected: Size) {
+    fn parsed_size(uri: &str, expected: LogicalSize) {
         let (_, _, size) = parsed(uri);
         assert_eq!(
             size,
@@ -281,7 +284,7 @@ mod tests {
         ] {
             let source = InlineImageSource::parse(uri)
                 .unwrap_or_else(|| panic!("{uri} should be a usable image URI"));
-            let default = Size::new(16., 16.);
+            let default = LogicalSize::new(px(16.), px(16.));
 
             assert_eq!(
                 EmbeddedAssets.load(&source.path),
@@ -355,39 +358,75 @@ mod tests {
 
     #[test]
     fn size_takes_one_number_for_both_edges_or_two_for_width_and_height() {
-        parsed_size("file://a/b.png?size=24", Size::new(24., 24.));
-        parsed_size("file://a/b.png?size=24,48", Size::new(24., 48.));
-        parsed_size("file://a/b.png?size=3.5", Size::new(3.5, 3.5));
-        parsed_size("file://a/b.png?size=24.5,48.25", Size::new(24.5, 48.25));
-        parsed_size("file://a/b.png?size=00024", Size::new(24., 24.));
+        parsed_size("file://a/b.png?size=24", LogicalSize::new(px(24.), px(24.)));
+        parsed_size(
+            "file://a/b.png?size=24,48",
+            LogicalSize::new(px(24.), px(48.)),
+        );
+        parsed_size(
+            "file://a/b.png?size=3.5",
+            LogicalSize::new(px(3.5), px(3.5)),
+        );
+        parsed_size(
+            "file://a/b.png?size=24.5,48.25",
+            LogicalSize::new(px(24.5), px(48.25)),
+        );
+        parsed_size(
+            "file://a/b.png?size=00024",
+            LogicalSize::new(px(24.), px(24.)),
+        );
     }
 
     #[test]
     fn size_may_be_quoted_and_lives_anywhere_in_the_query() {
-        parsed_size("file://a/b.png?size=\"24,48\"", Size::new(24., 48.));
-        parsed_size("file://a/b.png?size=24,48&type=img", Size::new(24., 48.));
-        parsed_size("file://a/b.png?type=img&size=24,48", Size::new(24., 48.));
+        parsed_size(
+            "file://a/b.png?size=\"24,48\"",
+            LogicalSize::new(px(24.), px(48.)),
+        );
+        parsed_size(
+            "file://a/b.png?size=24,48&type=img",
+            LogicalSize::new(px(24.), px(48.)),
+        );
+        parsed_size(
+            "file://a/b.png?type=img&size=24,48",
+            LogicalSize::new(px(24.), px(48.)),
+        );
     }
 
     #[test]
     fn an_explicit_size_is_clamped() {
-        parsed_size("file://a/b.png?size=0", Size::new(1., 1.));
-        parsed_size("file://a/b.png?size=0.5", Size::new(1., 1.));
-        parsed_size("file://a/b.png?size=.5", Size::new(1., 1.));
-        parsed_size("file://a/b.png?size=0,0", Size::new(1., 1.));
-        parsed_size("file://a/b.png?size=1", Size::new(1., 1.));
-        parsed_size("file://a/b.png?size=256", Size::new(256., 256.));
-        parsed_size("file://a/b.png?size=9999", Size::new(256., 256.));
-        parsed_size("file://a/b.png?size=256.5", Size::new(256., 256.));
-        parsed_size("file://a/b.png?size=0,9999", Size::new(1., 256.));
-        parsed_size("file://a/b.png?size=9999,0", Size::new(256., 1.));
+        parsed_size("file://a/b.png?size=0", LogicalSize::new(px(1.), px(1.)));
+        parsed_size("file://a/b.png?size=0.5", LogicalSize::new(px(1.), px(1.)));
+        parsed_size("file://a/b.png?size=.5", LogicalSize::new(px(1.), px(1.)));
+        parsed_size("file://a/b.png?size=0,0", LogicalSize::new(px(1.), px(1.)));
+        parsed_size("file://a/b.png?size=1", LogicalSize::new(px(1.), px(1.)));
+        parsed_size(
+            "file://a/b.png?size=256",
+            LogicalSize::new(px(256.), px(256.)),
+        );
+        parsed_size(
+            "file://a/b.png?size=9999",
+            LogicalSize::new(px(256.), px(256.)),
+        );
+        parsed_size(
+            "file://a/b.png?size=256.5",
+            LogicalSize::new(px(256.), px(256.)),
+        );
+        parsed_size(
+            "file://a/b.png?size=0,9999",
+            LogicalSize::new(px(1.), px(256.)),
+        );
+        parsed_size(
+            "file://a/b.png?size=9999,0",
+            LogicalSize::new(px(256.), px(1.)),
+        );
     }
 
     #[test]
     fn an_absurdly_long_number_is_clamped_instead_of_overflowing() {
         let uri = format!("file://a/b.png?size={}", "9".repeat(400));
 
-        parsed_size(&uri, Size::new(256., 256.));
+        parsed_size(&uri, LogicalSize::new(px(256.), px(256.)));
     }
 
     #[test]
@@ -418,8 +457,14 @@ mod tests {
             "a/b.png",
             InlineImageFormat::Image,
         );
-        parsed_size("file://a/b.png?color=red&size=24", Size::new(24., 24.));
-        parsed_size("file://a/b.png?&&size=24&&", Size::new(24., 24.));
+        parsed_size(
+            "file://a/b.png?color=red&size=24",
+            LogicalSize::new(px(24.), px(24.)),
+        );
+        parsed_size(
+            "file://a/b.png?&&size=24&&",
+            LogicalSize::new(px(24.), px(24.)),
+        );
         parsed_as("file://a/b.png?", "a/b.png", InlineImageFormat::Image);
     }
 
@@ -449,25 +494,31 @@ mod tests {
 
         assert_eq!(
             resolve("file://brands/Binance/binance.png"),
-            Size::new(128., 128.)
+            LogicalSize::new(px(128.), px(128.))
         );
         assert_eq!(
             resolve("file://brands/Ethereum/colored@72px.png"),
-            Size::new(44., 72.)
+            LogicalSize::new(px(44.), px(72.))
         );
         assert_eq!(
             resolve("file://brands/Solana/colored@72px.png"),
-            Size::new(81., 72.)
+            LogicalSize::new(px(81.), px(72.))
         );
         assert_eq!(
             resolve("file://brands/Hyperliquid/hyperliquid.png"),
-            Size::new(180., 180.)
+            LogicalSize::new(px(180.), px(180.))
         );
-        assert_eq!(resolve("file://brands/OKX/okx.png"), Size::new(200., 200.));
-        assert_eq!(resolve("file://nope/nothing.png"), Size::new(16., 16.));
+        assert_eq!(
+            resolve("file://brands/OKX/okx.png"),
+            LogicalSize::new(px(200.), px(200.))
+        );
+        assert_eq!(
+            resolve("file://nope/nothing.png"),
+            LogicalSize::new(px(16.), px(16.))
+        );
         assert_eq!(
             resolve("file://icons/phosphoricons/graph.svg"),
-            Size::new(16., 16.)
+            LogicalSize::new(px(16.), px(16.))
         );
     }
 
@@ -481,11 +532,11 @@ mod tests {
 
         assert_eq!(
             resolve("file://brands/Binance/binance.png?size=24,40"),
-            Size::new(24., 40.)
+            LogicalSize::new(px(24.), px(40.))
         );
         assert_eq!(
             resolve("file://nope/nothing.png?size=40"),
-            Size::new(40., 40.)
+            LogicalSize::new(px(40.), px(40.))
         );
     }
 
@@ -494,7 +545,7 @@ mod tests {
         let resolved = InlineImageSource::parse("file://icons/phosphoricons/graph.svg?type=img")
             .expect("the fixture URI should be usable")
             .resolve(&EmbeddedAssets);
-        let default = Size::new(16., 16.);
+        let default = LogicalSize::new(px(16.), px(16.));
 
         assert_eq!(resolved, default);
     }
@@ -512,7 +563,7 @@ mod tests {
 
         let source = InlineImageSource::parse("file://icons/phosphoricons/graph.svg")
             .expect("the fixture URI should be usable");
-        let default = Size::new(16., 16.);
+        let default = LogicalSize::new(px(16.), px(16.));
 
         assert_eq!(source.resolve(&SvgOnly), default);
         assert!(SvgOnly.load(&source.path).is_some(), "the asset exists");

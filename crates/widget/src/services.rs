@@ -192,7 +192,7 @@ mod tests {
     use ui_core::{
         app::App,
         error::EngineError,
-        math::Point,
+        math::{LogicalPoint, px},
         node::{
             builder::NodeBuilder,
             id::NodeId,
@@ -426,7 +426,7 @@ mod tests {
         harness
             .with_cx(|cx| {
                 let window = cx.window();
-                let origin = Anchor::point(Point::new(40.0, 40.0));
+                let origin = Anchor::point(LogicalPoint::new(px(40.0), px(40.0)));
                 overlay.open(cx.app_mut(), window, origin, |tree, panel| {
                     NodeBuilder::boxed().build(tree, panel).map(|_| ())
                 })
@@ -651,7 +651,7 @@ mod tests {
 
         fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
             let reloads = self.reloads;
-            NodeBuilder::text(SmolStr::default(), TextStyle::new(13.0))
+            NodeBuilder::text(SmolStr::default(), TextStyle::new(px(13.0)))
                 .bind_text(move |read| {
                     let reloads = *read.read(&reloads);
                     format_smolstr!("reloaded {reloads}")

@@ -320,6 +320,7 @@ pub struct NodeTree {
     subtree_bounds: Vec<LogicalRect>,
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
     images_need_refresh: bool,
+    image_nodes: Vec<NodeId>,
     dirty_bind: DirtySet,
     dirty_layout: DirtySet,
     dirty_paint: DirtySet,
@@ -810,19 +811,28 @@ impl NodeTree {
     pub(crate) fn take_images_need_refresh(&mut self) -> bool {
         std::mem::take(&mut self.images_need_refresh)
     }
+    pub(crate) fn image_nodes(&self) -> &[NodeId] {
+        &self.image_nodes
+    }
     pub(crate) fn refresh_image_intrinsics(
         &mut self,
         resources: &crate::resources::ResourceCache,
-        scale: f32,
+        dpr: crate::math::DevicePixelRatio,
     ) -> usize {
-        image::refresh_intrinsics(self, resources, scale)
+        image::refresh_intrinsics(self, resources, dpr)
     }
-    pub(crate) fn refresh_images_for_scale(
+    pub(crate) fn prepare_image_variants(
         &mut self,
         resources: &mut crate::resources::ResourceCache,
-        scale: f32,
-    ) -> Vec<ResourceId> {
-        image::refresh_for_scale(self, resources, scale)
+        dpr: crate::math::DevicePixelRatio,
+    ) -> image::PrepareImageVariants {
+        image::prepare_variants(self, resources, dpr)
+    }
+    pub(crate) fn mark_bitmap_images_paint(
+        &mut self,
+        resources: &crate::resources::ResourceCache,
+    ) -> usize {
+        image::mark_bitmap_paint(self, resources)
     }
     pub(crate) fn resolve_pending_images(
         &mut self,
@@ -830,9 +840,9 @@ impl NodeTree {
             crate::resources::PendingResource,
             crate::resources::ResourceImage,
         >,
-        scale: f32,
+        dpr: crate::math::DevicePixelRatio,
     ) -> usize {
-        image::resolve_pending(self, resolved, scale)
+        image::resolve_pending(self, resolved, dpr)
     }
     pub(crate) fn invalidate_images_with_resource(&mut self, resource: ResourceId) -> usize {
         image::invalidate_with_resource(self, resource)

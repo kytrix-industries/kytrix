@@ -15,7 +15,7 @@ use smol_str::SmolStr;
 use ui_core::{
     app::App,
     event::{Event, InputEvent, Modifiers, PointerButton},
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{id::NodeId, tree::NodeKind},
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
@@ -78,7 +78,7 @@ impl Harness {
 
     pub(crate) fn build(config: Config, translate: Translate) -> Self {
         let mut app = TestApp::with_options(WindowOptions {
-            size: Size::new(1280.0, 900.0),
+            size: LogicalSize::new(px(1280.0), px(900.0)),
             ..WindowOptions::default()
         });
         let window = app.window_id();
@@ -246,7 +246,7 @@ impl Harness {
         app.write(&language, code);
     }
 
-    pub(crate) fn bounds(&self, node: NodeId) -> Option<Rect> {
+    pub(crate) fn bounds(&self, node: NodeId) -> Option<LogicalRect> {
         self.app.probe().bounds(node)
     }
 
@@ -374,7 +374,7 @@ impl Harness {
         self.drain();
     }
 
-    pub(crate) fn click(&mut self, position: Point) {
+    pub(crate) fn click(&mut self, position: LogicalPoint) {
         self.app.inject(InputEvent::pointer_down(
             position,
             PointerButton::Primary,
@@ -395,7 +395,7 @@ impl Harness {
         let bounds = self
             .bounds(node)
             .unwrap_or_else(|| panic!("{prefix} has not been laid out"));
-        self.click(Point::new(
+        self.click(LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         ));

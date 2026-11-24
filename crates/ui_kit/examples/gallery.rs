@@ -11,7 +11,7 @@ use ui_core::{
     app::{App, Application},
     event::{Action, ActionSource, Event, InputEvent},
     interaction::ScrollConfig,
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -253,7 +253,9 @@ fn tree(app: &mut App, window: WindowId) -> &mut NodeTree {
 }
 
 fn text_style(size: f32, weight: u16, color: Color) -> TextStyle {
-    TextStyle::new(size).with_weight(weight).with_color(color)
+    TextStyle::new(px(size))
+        .with_weight(weight)
+        .with_color(color)
 }
 
 fn container(app: &mut App, window: WindowId, parent: NodeId, style: Style) -> NodeId {
@@ -271,7 +273,7 @@ fn row(app: &mut App, window: WindowId, parent: NodeId, gap: f32) -> NodeId {
         StyleBuilder::new()
             .flex_row()
             .items_center()
-            .gap(gap)
+            .gap(px(gap))
             .width_full()
             .build(),
     )
@@ -282,7 +284,10 @@ fn sized_box(app: &mut App, window: WindowId, parent: NodeId, width: f32, height
         app,
         window,
         parent,
-        StyleBuilder::new().width(width).height(height).build(),
+        StyleBuilder::new()
+            .width(px(width))
+            .height(px(height))
+            .build(),
     )
 }
 
@@ -347,23 +352,23 @@ fn section(
     let style = StyleBuilder::new()
         .flex_col()
         .flex_none()
-        .width(SECTION_W)
-        .height(height)
-        .padding_sides(14.0, 16.0, 14.0, 16.0)
-        .gap(8.0)
+        .width(px(SECTION_W))
+        .height(px(height))
+        .padding_sides(px(14.0), px(16.0), px(14.0), px(16.0))
+        .gap(px(8.0))
         .relative()
         .overflow_hidden()
         .build();
     let card = NodeBuilder::boxed()
         .id(format_smolstr!("gallery.section.{index}"))
         .style(style)
-        .paint(PaintBuilder::new().rounded(12.0).build())
+        .paint(PaintBuilder::new().rounded(px(12.0)).build())
         .bind_style({
             let theme = theme.clone();
             move |cx| StylePatch {
                 background: Some(theme.role(cx, Role::SurfaceRaised)),
                 border: Some(Border {
-                    width: 1.0,
+                    width: px(1.0),
                     color: theme.role(cx, Role::LineBorder),
                 }),
                 ..StylePatch::default()
@@ -381,7 +386,7 @@ fn section(
             .flex_1()
             .min_height_0()
             .width_full()
-            .gap(8.0)
+            .gap(px(8.0))
             .build(),
     )
 }
@@ -394,8 +399,8 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
         window,
         parent,
         StyleBuilder::new()
-            .width(360.0)
-            .height(176.0)
+            .width(px(360.0))
+            .height(px(176.0))
             .relative()
             .build(),
     );
@@ -404,8 +409,8 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
         window,
         outer,
         StyleBuilder::new()
-            .width(360.0)
-            .height(176.0)
+            .width(px(360.0))
+            .height(px(176.0))
             .relative()
             .overflow_hidden()
             .build(),
@@ -418,7 +423,12 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
             Role::SurfaceRaised
         };
         let _ = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, index as f32 * 26.0, 360.0, 25.0))
+            .layout_override(LogicalRect::new(
+                px(0.0),
+                px(index as f32 * 26.0),
+                px(360.0),
+                px(25.0),
+            ))
             .bind_style(move |cx| StylePatch {
                 background: Some(row_theme.role(cx, role)),
                 ..StylePatch::default()
@@ -430,7 +440,12 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
             format_smolstr!("滚动行 #{index} — 滚轮 / 拖条 / 轨道点击"),
             text_style(12.0, 400, fg),
         )
-        .layout_override(Rect::new(12.0, index as f32 * 26.0 + 4.0, 320.0, 18.0))
+        .layout_override(LogicalRect::new(
+            px(12.0),
+            px(index as f32 * 26.0 + 4.0),
+            px(320.0),
+            px(18.0),
+        ))
         .bind_style(move |cx| StylePatch {
             foreground: Some(label_theme.role(cx, Role::FgMuted)),
             ..StylePatch::default()
@@ -439,7 +454,7 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
         .expect("scroll label");
     }
     if let Ok(handle) = app.make_scroll(window, viewport, ScrollConfig::default()) {
-        let _ = app.set_scroll_content(&handle, Size::new(360.0, 20.0 * 26.0));
+        let _ = app.set_scroll_content(&handle, LogicalSize::new(px(360.0), px(20.0 * 26.0)));
     }
     let bar = ScrollBar::new(
         app,
@@ -509,7 +524,7 @@ impl Gallery {
 
         let window = app.create_window(WindowOptions {
             title: SmolStr::new_static("Kytrix · ui_kit kit gallery (P2-6b)"),
-            size: Size::new(WINDOW_W, WINDOW_H),
+            size: LogicalSize::new(px(WINDOW_W), px(WINDOW_H)),
             background: canvas,
             ..WindowOptions::default()
         });
@@ -532,10 +547,10 @@ impl Gallery {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .padding_sides(0.0, SIDE_MARGIN, 0.0, SIDE_MARGIN)
-                    .height(HEADER_H)
+                    .padding_sides(px(0.0), px(SIDE_MARGIN), px(0.0), px(SIDE_MARGIN))
+                    .height(px(HEADER_H))
                     .width_full()
-                    .gap(14.0)
+                    .gap(px(14.0))
                     .build(),
             )
             .build(tree(app, window), root)
@@ -636,9 +651,14 @@ impl Gallery {
                     .flex_col()
                     .flex_none()
                     .width_full()
-                    .height(total_height)
-                    .padding_sides(CONTENT_TOP, SIDE_MARGIN, CONTENT_BOTTOM, SIDE_MARGIN)
-                    .gap(SECTION_GAP)
+                    .height(px(total_height))
+                    .padding_sides(
+                        px(CONTENT_TOP),
+                        px(SIDE_MARGIN),
+                        px(CONTENT_BOTTOM),
+                        px(SIDE_MARGIN),
+                    )
+                    .gap(px(SECTION_GAP))
                     .build(),
             )
             .build(tree(app, window), viewport)
@@ -672,16 +692,20 @@ impl Gallery {
                 app,
                 window,
                 swatches,
-                StyleBuilder::new().flex_col().width(92.0).gap(4.0).build(),
+                StyleBuilder::new()
+                    .flex_col()
+                    .width(px(92.0))
+                    .gap(px(4.0))
+                    .build(),
             );
             let swatch_theme = theme.clone();
             NodeBuilder::boxed()
-                .style(StyleBuilder::new().width_full().height(34.0).build())
-                .paint(PaintBuilder::new().rounded(6.0).build())
+                .style(StyleBuilder::new().width_full().height(px(34.0)).build())
+                .paint(PaintBuilder::new().rounded(px(6.0)).build())
                 .bind_style(move |cx| StylePatch {
                     background: Some(swatch_theme.role(cx, role)),
                     border: Some(Border {
-                        width: 1.0,
+                        width: px(1.0),
                         color: swatch_theme.role(cx, Role::LineBorder),
                     }),
                     ..StylePatch::default()
@@ -694,7 +718,7 @@ impl Gallery {
             let icons_row = row(app, window, s1, 8.0);
             for kind in chunk {
                 let icon = IconSpec::new(*kind)
-                    .with_size(16.0)
+                    .with_size(px(16.0))
                     .build_themed(app, window, icons_row, &theme, Role::FgMuted)
                     .expect("gallery icon");
                 if theme_icons.len() < 3 {
@@ -707,21 +731,21 @@ impl Gallery {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(16.0)
-                    .padding_sides(6.0, 14.0, 6.0, 14.0)
-                    .height(46.0)
+                    .gap(px(16.0))
+                    .padding_sides(px(6.0), px(14.0), px(6.0), px(14.0))
+                    .height(px(46.0))
                     .build(),
             )
             .paint(PaintSpec {
                 background: Color::from_rgba8([0x14, 0x1A, 0x22, 0xFF]),
-                corner_radius: [6.0; 4],
+                corner_radius: [px(6.0); 4],
                 ..PaintSpec::default()
             })
             .build(tree(app, window), s1)
             .expect("brand plate");
         for kind in BrandKind::ALL {
             let _ = Brand::new(kind)
-                .with_size(26.0)
+                .with_size(px(26.0))
                 .with_alt(kind.name())
                 .build(app, window, brand_plate);
         }
@@ -874,7 +898,7 @@ impl Gallery {
             .label("进度 42%");
         let _ = progress.build(app, window, progress_box);
         let spinner = Spinner::new(app, theme.clone(), "gallery.spinner")
-            .with_size(18.0)
+            .with_size(px(18.0))
             .with_role(Role::BrandBase)
             .with_label("静态加载指示（动画默认关闭，保 I3）")
             .spinning(false);
@@ -975,7 +999,7 @@ impl Gallery {
             app,
             theme.clone(),
             "gallery.list.fixed",
-            ListOptions::fixed(26.0),
+            ListOptions::fixed(px(26.0)),
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 let theme = fixed_theme.clone();
                 NodeBuilder::text(format_smolstr!("等高行 #{index}"), fixed_style.clone())
@@ -994,7 +1018,7 @@ impl Gallery {
             app,
             theme.clone(),
             "gallery.list.variable",
-            ListOptions::variable(26.0),
+            ListOptions::variable(px(26.0)),
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 let lines = 1 + index % 3;
                 let mut text = format_smolstr!("变高行 #{index}：");
@@ -1020,7 +1044,7 @@ impl Gallery {
                 app,
                 theme.clone(),
                 "gallery.list.deque",
-                ListOptions::fixed(26.0).deque(32),
+                ListOptions::fixed(px(26.0)).deque(32),
                 move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                     let text = data
                         .borrow()
@@ -1094,7 +1118,7 @@ impl Gallery {
             theme.clone(),
             "gallery.table",
             columns,
-            TableOptions::variable(30.0).selection(SelectionMode::Multi),
+            TableOptions::variable(px(30.0)).selection(SelectionMode::Multi),
             move |tree: &mut NodeTree, parent: NodeId, row: usize, column: usize| {
                 let text = match column {
                     0 => format_smolstr!("资产 #{row}"),
@@ -1317,7 +1341,7 @@ impl Gallery {
                         "Overlay 面板（12 向 placement + flip/clamp + 淡入淡出）",
                         text_style(12.0, 400, Color::WHITE),
                     )
-                    .style(StyleBuilder::new().padding(8.0).build())
+                    .style(StyleBuilder::new().padding(px(8.0)).build())
                     .bind_style(move |cx| StylePatch {
                         foreground: Some(theme.role(cx, Role::FgDefault)),
                         ..StylePatch::default()
@@ -1483,12 +1507,12 @@ impl Gallery {
                     .and_then(|target| target.tree().get(node).ok())
                     .map(|node| {
                         let bounds = node.layout().bounds;
-                        Point::new(
+                        LogicalPoint::new(
                             bounds.origin.x + 24.0,
                             bounds.origin.y + bounds.size.height + 6.0,
                         )
                     })
-                    .unwrap_or(Point::new(420.0, 600.0));
+                    .unwrap_or(LogicalPoint::new(px(420.0), px(600.0)));
                 let opened = context_menu.open(app, window, point);
                 if opened.is_ok() {
                     log_line(app, &log, "context-menu: 打开（按钮演示右键语义）");
@@ -1648,7 +1672,8 @@ impl Gallery {
 
         match app.make_scroll(window, viewport, ScrollConfig::default()) {
             Ok(handle) => {
-                let _ = app.set_scroll_content(&handle, Size::new(WINDOW_W, total_height));
+                let _ = app
+                    .set_scroll_content(&handle, LogicalSize::new(px(WINDOW_W), px(total_height)));
             }
             Err(error) => println!("gallery: WARN viewport scroll registration failed: {error}"),
         }
@@ -1747,7 +1772,7 @@ impl Gallery {
                 print_probe_rects(app, window, &nodes, "");
                 print_probe_mounted(app, "top", &lists, &table, &tree);
                 if let Some(handle) = app.scroll_handle(window, viewport) {
-                    let _ = app.scroll_to(&handle, Point::new(0.0, 1.0e6));
+                    let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(1.0e6)));
                 }
                 let nodes = nodes.clone();
                 let lists = lists.clone();
@@ -1758,13 +1783,13 @@ impl Gallery {
                         let offset = app
                             .scroll_state(&handle)
                             .map(|state| state.offset.y)
-                            .unwrap_or(0.0);
+                            .unwrap_or(px(0.0));
                         println!("gallery: probe bottom scroll_offset={offset}");
                     }
                     print_probe_rects(app, window, &nodes, "bottom ");
                     print_probe_mounted(app, "bottom", &lists, &table, &tree);
                     if let Some(handle) = app.scroll_handle(window, viewport) {
-                        let _ = app.scroll_to(&handle, Point::new(0.0, 2_300.0));
+                        let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(2_300.0)));
                     }
                     if let Some((_, node)) = nodes.iter().find(|(name, _)| name == "input") {
                         let _ = app.set_focus(window, Some(*node));
@@ -1781,7 +1806,7 @@ impl Gallery {
             let report = self.overlay_check.clone();
             let _ = app.after(window, Duration::from_millis(600), move |app| {
                 if let Some(handle) = app.scroll_handle(window, viewport) {
-                    let _ = app.scroll_to(&handle, Point::new(0.0, 3_150.0));
+                    let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(3_150.0)));
                 }
                 print_probe_rects(app, window, &nodes, "overlay ");
                 app.handle().wake();
@@ -1866,7 +1891,7 @@ impl Gallery {
             let viewport = self.viewport;
             let _ = app.after(window, Duration::from_millis(8_000), move |app| {
                 if let Some(handle) = app.scroll_handle(window, viewport) {
-                    let _ = app.scroll_to(&handle, Point::new(0.0, offset));
+                    let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(offset)));
                     println!("gallery: scroll-to offset={offset}");
                 }
                 app.handle().wake();
@@ -2328,17 +2353,17 @@ fn demo_trigger(
                 .flex_row()
                 .items_center()
                 .justify_center()
-                .padding_sides(4.0, 12.0, 4.0, 12.0)
-                .height(30.0)
+                .padding_sides(px(4.0), px(12.0), px(4.0), px(12.0))
+                .height(px(30.0))
                 .build(),
         )
-        .paint(PaintBuilder::new().rounded(6.0).build())
+        .paint(PaintBuilder::new().rounded(px(6.0)).build())
         .tab_stop(true)
         .on_click(action)
         .bind_style(move |cx| StylePatch {
             background: Some(theme_style.role(cx, Role::SurfaceControl)),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: theme_style.role(cx, Role::LineBorder),
             }),
             ..StylePatch::default()
@@ -2506,7 +2531,7 @@ fn menu_metrics(app: &App, window: WindowId) -> Option<(usize, f32, f32)> {
         let tree = app.window(window)?.tree();
         tree.get(thumb).ok()?.layout().bounds.size.height
     };
-    Some((children, content, thumb_height))
+    Some((children, f32::from(content), f32::from(thumb_height)))
 }
 
 fn picker_metrics(app: &App, window: WindowId, picker: &ColorPicker) -> (bool, Option<usize>) {

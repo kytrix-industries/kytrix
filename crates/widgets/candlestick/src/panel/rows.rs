@@ -4,6 +4,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
     event::Action,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal},
     paint::{
         color::Color,
@@ -41,7 +42,7 @@ const NODE_GAP: f32 = 4.0;
 const ROW_GAP_X: f32 = 8.0;
 const LINE_GAP: f32 = 4.0;
 pub(super) const PERIOD_FIELD_WIDTH: f32 = 60.0;
-const ROW_ICON_SIZE: f32 = 12.0;
+const ROW_ICON_SIZE: LogicalPx = LogicalPx::new(12.0);
 const CARD_PADDING: f32 = 8.0;
 const CARD_RADIUS: f32 = 4.0;
 const HINT_INSET: f32 = 4.0;
@@ -126,7 +127,7 @@ impl Rows<'_, '_> {
             ))
             .style(
                 StyleBuilder::new()
-                    .height(NODE_ROW_HEIGHT)
+                    .height(px(NODE_ROW_HEIGHT))
                     .flex_row()
                     .items_center()
                     .build(),
@@ -168,13 +169,13 @@ impl Rows<'_, '_> {
                 StyleBuilder::new()
                     .width_full()
                     .flex_col()
-                    .padding(CARD_PADDING)
+                    .padding(px(CARD_PADDING))
                     .border(border)
                     .build(),
             )
             .paint(
                 PaintBuilder::new()
-                    .rounded(CARD_RADIUS)
+                    .rounded(px(CARD_RADIUS))
                     .border(border, Color::TRANSPARENT)
                     .build(),
             )
@@ -237,10 +238,10 @@ impl Rows<'_, '_> {
             .id(format_smolstr!("TEST_PANEL_NODE_{name}"))
             .style(
                 StyleBuilder::new()
-                    .height(NODE_ROW_HEIGHT)
+                    .height(px(NODE_ROW_HEIGHT))
                     .flex_row()
                     .items_center()
-                    .gap(NODE_GAP)
+                    .gap(px(NODE_GAP))
                     .build(),
             )
             .a11y(A11yOverride {
@@ -281,7 +282,7 @@ impl Rows<'_, '_> {
                 .style(
                     StyleBuilder::new()
                         .width(caret_width(&self.theme))
-                        .height(NODE_ROW_HEIGHT)
+                        .height(px(NODE_ROW_HEIGHT))
                         .flex_none()
                         .build(),
                 )
@@ -335,11 +336,11 @@ impl Rows<'_, '_> {
         let line = NodeBuilder::boxed()
             .style(
                 StyleBuilder::new()
-                    .height(SETTING_ROW_HEIGHT)
+                    .height(px(SETTING_ROW_HEIGHT))
                     .flex_row()
                     .items_center()
-                    .gap(ROW_GAP_X)
-                    .padding_sides(0.0, 0.0, 0.0, setting_inset(&self.theme))
+                    .gap(px(ROW_GAP_X))
+                    .padding_sides(px(0.0), px(0.0), px(0.0), setting_inset(&self.theme))
                     .relative()
                     .build(),
             )
@@ -361,7 +362,7 @@ impl Rows<'_, '_> {
             ))
             .style(
                 StyleBuilder::new()
-                    .width(PERIOD_FIELD_WIDTH)
+                    .width(px(PERIOD_FIELD_WIDTH))
                     .flex_none()
                     .build(),
             )
@@ -412,11 +413,11 @@ impl Rows<'_, '_> {
             ))
             .style(
                 StyleBuilder::new()
-                    .height(SETTING_ROW_HEIGHT)
+                    .height(px(SETTING_ROW_HEIGHT))
                     .flex_row()
                     .items_center()
-                    .gap(ROW_GAP_X)
-                    .padding_sides(0.0, 0.0, 0.0, checkbox_inset(&self.theme))
+                    .gap(px(ROW_GAP_X))
+                    .padding_sides(px(0.0), px(0.0), px(0.0), checkbox_inset(&self.theme))
                     .build(),
             )
             .build(self.cx.tree_mut(), parent)?;
@@ -503,7 +504,7 @@ impl Rows<'_, '_> {
                 StyleBuilder::new()
                     .width_full()
                     .flex_col()
-                    .gap(LINE_GAP)
+                    .gap(px(LINE_GAP))
                     .build(),
             )
             .build(self.cx.tree_mut(), parent)?;
@@ -554,11 +555,11 @@ impl Rows<'_, '_> {
         let line_node = NodeBuilder::boxed()
             .style(
                 StyleBuilder::new()
-                    .height(SETTING_ROW_HEIGHT)
+                    .height(px(SETTING_ROW_HEIGHT))
                     .flex_row()
                     .items_center()
-                    .gap(ROW_GAP_X)
-                    .padding_sides(0.0, 0.0, 0.0, setting_inset(&self.theme))
+                    .gap(px(ROW_GAP_X))
+                    .padding_sides(px(0.0), px(0.0), px(0.0), setting_inset(&self.theme))
                     .relative()
                     .build(),
             )
@@ -573,7 +574,7 @@ impl Rows<'_, '_> {
             .id(format_smolstr!("TEST_PANEL_LINE_FIELD_{name}_{index}"))
             .style(
                 StyleBuilder::new()
-                    .width(PERIOD_FIELD_WIDTH)
+                    .width(px(PERIOD_FIELD_WIDTH))
                     .flex_none()
                     .build(),
             )
@@ -662,7 +663,7 @@ impl Rows<'_, '_> {
                 StyleBuilder::new()
                     .width_full()
                     .flex_row()
-                    .padding_sides(0.0, 0.0, 0.0, setting_inset(&self.theme))
+                    .padding_sides(px(0.0), px(0.0), px(0.0), setting_inset(&self.theme))
                     .build(),
             )
             .build(self.cx.tree_mut(), parent)?;
@@ -721,7 +722,7 @@ impl Rows<'_, '_> {
         let language = self.cx.language();
         let theme = self.theme.clone();
         let invalid = self.wiring.invalid;
-        let inset = setting_inset(&self.theme) + HINT_INSET;
+        let inset = setting_inset(&self.theme) + px(HINT_INSET);
         NodeBuilder::text(
             SmolStr::default(),
             TextStyle::new(UnifiedSize::Small.text_size()),
@@ -729,7 +730,7 @@ impl Rows<'_, '_> {
         .id(id)
         .style(
             StyleBuilder::new()
-                .padding_sides(0.0, 0.0, 0.0, inset)
+                .padding_sides(px(0.0), px(0.0), px(0.0), inset)
                 .build(),
         )
         .bind_text(move |read| {
@@ -819,15 +820,15 @@ fn invalid_border(
     }
 }
 
-fn caret_width(theme: &ThemeHandle) -> f32 {
-    ROW_ICON_SIZE + 2.0 * UnifiedSize::Small.px() + 2.0 * theme.tokens().border_width
+fn caret_width(theme: &ThemeHandle) -> LogicalPx {
+    ROW_ICON_SIZE + UnifiedSize::Small.px() * 2.0 + theme.tokens().border_width * 2.0
 }
 
-fn setting_inset(theme: &ThemeHandle) -> f32 {
-    caret_width(theme) + NODE_GAP + UnifiedSize::Small.px()
+fn setting_inset(theme: &ThemeHandle) -> LogicalPx {
+    caret_width(theme) + px(NODE_GAP) + UnifiedSize::Small.px()
 }
 
-fn checkbox_inset(theme: &ThemeHandle) -> f32 {
+fn checkbox_inset(theme: &ThemeHandle) -> LogicalPx {
     setting_inset(theme) - UnifiedSize::Small.px()
 }
 

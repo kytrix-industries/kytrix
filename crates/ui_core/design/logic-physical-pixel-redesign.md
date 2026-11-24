@@ -42,7 +42,8 @@
 | `ShapedLine` 等 | 全部降 `pub(crate)` |
 | `Menu::IconCache` | 直接删除组件级缓存，依赖 `ResourceCache` 去重 |
 | Canvas 文本断言 | frame/quad 记录断言，不新增 golden |
-| `ResourceImage` | 字段私有，只暴露 `logical_size(): Size<LogicalPx>` |
+| `ResourceImage` | 字段私有，只暴露 `id()` / `kind()` / `intrinsic(dpr)` / `variant_for(cache, target)`；资源只描述“源 + 内在尺寸” |
+| 资源栅格目标 | `ImageFit` 是绘制属性；引擎在绘制期为每个 (资源, 目标物理尺寸) 选择/生成变体 |
 | `App::resources_mut` | 一并收口，应用只能走逻辑资源 API |
 | 异步资源 owner | 本轮一并修“异步插入不登记 owner 导致关窗不回收” |
 | Dicebear 头像 | 走引擎 SVG 资源，删除 `profile_ui` 的 `image`/`resvg`/`usvg` 依赖 |
@@ -259,7 +260,7 @@ impl DevicePixelRatio {
 | `ui_core::render::*` | `PhysicalPx` / `DevicePx` | 否 | GPU payload、swapchain、atlas、scissor 只接收物理值 |
 | `ui_core::platform::*` | `DevicePx`（原生）↔ `LogicalPx`（事件） | 是，平台边界 | 指针、窗口尺寸、IME caret 在这里换算 |
 | `ui_core::a11y` | `DevicePx` | 是，a11y 边界 | AccessKit 需要屏幕物理坐标 |
-| `ui_core::resources` | 逻辑资源句柄 + 内部物理变体 | 是，资源内部 | 应用只给逻辑尺寸；引擎按窗口 DPR 选择物理变体 |
+| `ui_core::resources` | 资源 = 源 + 内在尺寸；内部持有物理变体 | 是，资源内部 | 位图登记原生物理像素；SVG 登记内在逻辑尺寸；栅格目标由引擎按绘制盒 × DPR 决定 |
 
 ### 3.3 新增/改写的不变量
 
@@ -409,55 +410,96 @@ pub(crate) struct CanvasTextKey {
 
 ### 4.6 资源 / 图片
 
-1. `ResourceImage` 改为字段私有 + 只暴露逻辑尺寸：
+资源只描述“源 + 内在尺寸”，fit（Contain/Cover/Fill）是绘制属性，永远不进入资源层；栅格目标由引擎接管（参考 Flutter `ResizeImage` / `ImageProvider`、GPUI `ObjectFit`、Qt `QImage` DPR）。
+
+1. 资源种类与句柄：
 
 ```rust
+pub enum ImageResourceKind {
+    Bitmap { native: Size<DevicePx> },
+    Vector { intrinsic: Size<LogicalPx> },
+}
+
 pub struct ResourceImage {
     id: ResourceId,
-    tile: AtlasTile,
-    physical_size: Size<DevicePx>,
+    kind: ImageResourceKind,
 }
 
 impl ResourceImage {
     pub fn id(&self) -> ResourceId;
-    pub fn tile(&self) -> AtlasTile;
-    pub fn logical_size(&self, dpr: DevicePixelRatio) -> Size<LogicalPx>;
+    pub fn kind(&self) -> ImageResourceKind;
+    pub fn intrinsic(&self, dpr: DevicePixelRatio) -> Size<LogicalPx>;
+    pub fn variant_for(&self, cache: &ResourceCache, target: Size<DevicePx>) -> Option<AtlasTile>;
 }
 ```
 
-   `logical_size` 的 `dpr` 参数只供引擎内部与 test-support 使用；应用侧改用 `Window` 无关的 `App::resource_logical_size(window, image)`。
+   - 位图：登记**原生物理像素**；内在逻辑尺寸 = 原生 / 窗口 DPR。解码期同时生成固定 1/2、1/4（最小 1 边）**预缩 LOD 变体**（Triangle 滤波，不按 contain/cover 目标下采样）；绘制时取“≥ 目标的最小变体”，无则原生，再小由 GPU 采样。
+   - SVG：登记**内在逻辑尺寸**（仅用于布局内在尺寸，来自调用方给定的 intrinsic）；**栅格化以文档声明尺寸为准**：`scale_x = target_px / tree.size().width`，`scale_y` 同理。intrinsic 与文档纵横比不一致时文档被拉伸到目标盒（与 CSS `width`/`height` 作用于 `<img>` 一致），不报错。
+   - `variant_for` 是只读查询（带回退：精确目标缺失时选最近的可用变体）；生成入口是 `ResourceCache::ensure_variant`，由引擎在布局之后的变体准备阶段调用（写路径不暴露给应用）。
+   - SVG 变体生成失败时回退到最近的可用变体，并在 `App::image_diagnostics()` 里记录一次 `ImageDiagnostic::VariantUnavailable`（按资源去重；恢复后自动清除）；容量失败不得让图片静默消失。
 
-2. `ResourceCache` 的 scale 参数方法改为 `pub(crate)`，只允许 `App` / `Window` 内部使用；`App::resources_mut` 一并收口，应用只能走逻辑资源 API。
-3. 新增逻辑资源 API：
+2. `ResourceCache` 内部按资源保存变体列表：位图 3 条（原生 + 1/2 + 1/4）；SVG 按**量化后的物理尺寸**缓存栅格变体（长边向上取整到 4 物理像素的倍数，保持宽高比），DPI 或布局盒变化时按新目标取/生成变体。每资源变体数上限为 8，超出按 LRU 淘汰期间未被当前帧引用的变体，淘汰会归还图集 tile 与 byte budget；当前帧 `prepare` 触达的变体、以及经 `App::prepare_image_variant` 交给 Canvas/行内图片的变体（exposed）优先保留。SVG 变体的解码预算按 `width × height × 4 B + 小常量` 估算，不使用位图的解码峰值模型。`ResourceStats.{entries, tiles}` 分别统计资源数与变体数。
+
+3. `ResourceImage` 的公开面只有 `id()` / `kind()` / `intrinsic(dpr)` / `variant_for(cache, target)`；`logical_size()`、`tile()`、`reselect`、`insert_for_display`、`insert_at_size`、`insert_svg_at_size` 全部删除，`App::resources_mut` 一并收口；`ResourceCache` 的写入口（`insert*` / `unload` / `release_window`）全部 `pub(crate)`，外部只有只读 `&ResourceCache`。
+
+4. 资源 API 只接收“源 + 内在尺寸”，不再接收逻辑/物理目标：
 
 ```rust
 impl App {
-    pub fn insert_svg_for_window(
-        &mut self,
-        window: WindowId,
-        bytes: &[u8],
-        logical: Size<LogicalPx>,
-    ) -> Result<ResourceImage, EngineError>;
-
     pub fn insert_bitmap_for_window(
         &mut self,
         window: WindowId,
         bytes: &[u8],
-        logical: Size<LogicalPx>,
     ) -> Result<ResourceImage, EngineError>;
+
+    pub fn insert_svg_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: &[u8],
+        intrinsic: Size<LogicalPx>,
+    ) -> Result<ResourceImage, EngineError>;
+
+    pub fn insert_bitmap_async_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: Bytes,
+    ) -> Result<PendingResource, EngineError>;
 
     pub fn insert_svg_async_for_window(
         &mut self,
         window: WindowId,
         bytes: Bytes,
-        logical: Size<LogicalPx>,
-    ) -> PendingResource;
+        intrinsic: Size<LogicalPx>,
+    ) -> Result<PendingResource, EngineError>;
 }
 ```
 
-4. 物理目标尺寸为 `ceil(logical × dpr)`（与现有 `resolve_target` 的向上取整一致），保证不会因为向下取整而模糊。
-5. `ImageContent.intrinsic` 保持 `Size<LogicalPx>`；引擎在 DPI 变化时用 `physical_size / dpr` 重新计算内在逻辑尺寸。
-6. `ResourceCache::reselect` 内部按窗口 DPR 选择变体；应用不再持有 `scale`、不再维护 `scale_bits` 缓存键。
+   同步版登记 owner；异步版在交付时登记 owner，关窗会回收 owner 引用并丢弃该窗口仍在途的解码任务。同一 `(window, resource)` 只登记一次 owner 引用，重复插入不复用也不累加（owner 列表不随反复打开菜单增长）。
+
+5. 目标物理尺寸 = 绘制盒经 `ImageFit` 计算后的实际绘制尺寸 × DPR，向上取整到整数：Contain 取内嵌后的等比盒，Cover 按覆盖比例放大 intrinsic（UV 裁切发生在绘制期），Fill 取节点盒。计算入口是 `node::image::variant_target`，绘制与变体准备共用同一函数。
+
+6. 节点 `ImageContent.intrinsic` 由 `ResourceImage::intrinsic(dpr)` 得出。DPI 变化时：位图的内在逻辑尺寸变化并触发 `mark_layout`（本设计的**唯一允许例外**，因为位图形状由原生像素决定）；SVG 内在尺寸不变、只按新 DPR 重新选择/生成变体。引擎为每个图片节点记录上次准备的目标物理尺寸，目标变化即重绘该节点（DPI 换档时 SVG 也要换 tile）。
+
+7. 绘制（`paint::pass`）：按 `fit_bounds` 得图元逻辑 bounds，按 `variant_target` 得物理目标，再向资源取 `variant_for`（失败/缺失时回退到最近可用变体）；`Primitive::Image` 仍只带 `AtlasTile` + 逻辑 bounds，逻辑场景不存 DPR。Cover 在拿到变体后按 `cover_tile` 裁 UV。
+
+8. 变体准备在布局之后、图集上传之前完成：新生成的变体同帧可见，不需要额外一帧；准备阶段只为真正新增/换档的变体标记节点重绘。
+
+9. Canvas / 行内图片通过公开入口取变体：
+
+```rust
+impl App {
+    pub fn prepare_image_variant(
+        &mut self,
+        window: WindowId,
+        image: ResourceImage,
+        target: Size<LogicalPx>,
+        fit: ImageFit,
+    ) -> Option<AtlasTile>;
+    pub fn image_diagnostics(&self) -> &[ImageDiagnostic];
+}
+```
+
+   `prepare_image_variant` 按窗口 DPR 计算物理目标并生成/复用变体，返回的变体标记为 exposed（LRU 优先保留）。
 
 ### 4.7 `window` / `app` / `platform` / `a11y`
 
@@ -528,10 +570,15 @@ fn track_metrics(size: UnifiedSize) -> TrackMetrics {
 
 ### 5.2 资源类组件
 
-- `Brand::resource_for`：调用 `App::insert_bitmap_for_window(window, bytes, frame)`，`frame: Size<LogicalPx>`。
-- `IconSpec::resource_for` / `mount_dynamic_icon`：调用 `App::insert_svg_for_window(window, bytes, Size<LogicalPx>)`。
+- `Brand::resource_for`：调用 `App::insert_bitmap_for_window(window, bytes)`；位图不再接收逻辑目标，缓存键由内容字节去重，内在尺寸由引擎按窗口 DPR 维护。
+- `IconSpec::resource_for` / `mount_dynamic_icon`：调用 `App::insert_svg_for_window(window, bytes, intrinsic)`，`intrinsic: Size<LogicalPx>` 来自图标的设计尺寸；不再传“显示目标”。
+- SVG 的 `intrinsic` 只是**布局内在尺寸**，不是文档尺寸：栅格化按 SVG 自身声明尺寸（`tree.size()`）映射到目标物理像素。只有 viewBox 的资产（如 DiceBear）不会因为 `intrinsic` 较小而被裁掉。
+- Canvas / 行内图片：用 `App::prepare_image_variant(window, image, target, fit)` 取目标变体；`ResourceCache` 的写入口不可达。
+- `BrandKind::native_size()` 用 `OnceLock` 缓存 PNG 头解析结果，build 热路径不再重复解析。
 - `Menu::IconCache`：直接删除组件级缓存，依赖 `ResourceCache` 的 `ContentKey` 去重。
-- `AssetImages::request`：增加 `window: WindowId` 参数并调用逻辑资源 API。
+- `AssetImages::request`：增加 `window: WindowId` 参数并调用资源 API；位图异步插入不再传逻辑尺寸。
+- 组件只读 `ResourceImage::intrinsic(dpr)`（仅 test-support 断言需要）或直接使用节点 `ImageFit`；不再调用 `ResourceImage::tile()`、`logical_size()`，也不在组件内按 scale 选变体。
+- `ImageFit` 只出现在节点的绘制属性上（`NodeBuilder::image` / `ImageContent.fit`）；组件不得把 fit 传给资源 API。
 - 所有 `window.scale()` 调用从 `ui_kit/src` 消失；grep 门禁见 §8。
 
 ### 5.3 读取 layout bounds 的组件
@@ -645,20 +692,33 @@ DeviceRect = (x0, y0, x1, y1)
 
 - 按 crate 逐个迁移，每个 crate 收口自己的 `cargo test -p <crate>`。
 
-### 阶段 D：资源逻辑 API
+### 阶段 D：资源引擎接管栅格目标
 
-**D1 引擎侧**
+**D1 引擎侧资源模型**
 
-- `ResourceCache` scale 方法降 `pub(crate)`；`App::resources_mut` 收口。
-- 新增 `App::insert_{svg,bitmap,svg_async,bitmap_async}_for_window`。
-- `ResourceImage` 字段私有 + `logical_size()`。
-- 修异步资源 owner 登记。
+- `ResourceCache` 内部按资源保存变体列表；scale 方法降 `pub(crate)`；`App::resources_mut` 收口。
+- `ResourceImage` 字段私有，只暴露 `id()` / `kind()` / `intrinsic(dpr)` / `variant_for(cache, target)`。
 
-**D2 应用侧**
+**D2 引擎侧逻辑 API**
 
-- `Brand` / `Icon` / `Interactive` / `Menu` / `AssetImages` / `widgets/x` 迁逻辑 API。
+- 新增 `App::insert_{bitmap,svg,bitmap_async,svg_async}_for_window`。
+- 位图只登记原生像素，SVG 只登记内在逻辑尺寸；同步与异步版本都登记 owner，关窗回收并取消在途解码。
+
+**D3a 引擎接管栅格目标（本轮）**
+
+- `ImageResourceKind::{Bitmap { native }, Vector { intrinsic }}`；删除 `logical_size` / `tile` / `reselect` / `insert_for_display` / `insert_at_size` / `insert_svg_at_size`。
+- 变体准备阶段（布局之后、图集上传之前）按 `variant_target` 生成/复用 SVG 变体；位图只保留原生变体。
+- `paint::pass` 图片发射改为 `fit_bounds` + `variant_target` + `variant_for`；Cover 在变体 tile 上裁 UV。
+
+**D3b 应用侧资源调用迁移**
+
+- `Brand` / `Icon` / `Interactive` / `Menu` / `AssetImages` / `widgets/x` 迁新资源 API；组件删除 `tile()` / `logical_size()` / 组件级变体选择。
 - `Menu::IconCache` 删除。
+
+**D3c 应用侧栅格/依赖清理**
+
 - `profile_ui` Dicebear 走引擎 SVG 资源，删 `image` / `resvg` / `usvg`。
+- 所有 `window.scale()` 调用从 `ui_kit/src` 消失；grep 门禁见 §8。
 
 ### 阶段 E：Canvas 文本
 
@@ -754,3 +814,5 @@ Select-String -Path crates/ui_core/src/**,crates/ui_kit/src/** -Pattern 'snap_to
 - egui tessellator（pixels_per_point / feathering）: https://github.com/emilk/egui/blob/master/crates/epaint/src/tessellator.rs
 - Flutter ViewConfiguration（physical/logical constraints、devicePixelRatio、toMatrix）: https://api.flutter.dev/flutter/rendering/ViewConfiguration-class.html
 - Flutter RenderParagraph.devicePixelRatio（DPI 变化重生成文本位图）: https://api.flutter.dev/flutter/rendering/RenderParagraph/devicePixelRatio.html
+
+

@@ -5,6 +5,7 @@ use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 use ui_core::{
     app::App,
+    math::LogicalPx,
     paint::color::Color,
     text::{ShapedTextHandle, TextAlign, TextStyle},
 };
@@ -67,7 +68,7 @@ impl ChartTextCache {
         handle
     }
 
-    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
+    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
         self.line(app, text, style).size().width
     }
 
@@ -80,7 +81,7 @@ impl ChartTextCache {
     }
 }
 
-pub(crate) fn label_style(font_size: f32, line_height: f32, color: Color) -> TextStyle {
+pub(crate) fn label_style(font_size: LogicalPx, line_height: LogicalPx, color: Color) -> TextStyle {
     let mut style = TextStyle::new(font_size);
     style.color = color;
     style.line_height = Some(line_height / font_size);

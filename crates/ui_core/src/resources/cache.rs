@@ -2,10 +2,12 @@ use std::hash::Hasher;
 
 use ahash::AHasher;
 use bytes::Bytes;
+use smallvec::SmallVec;
 
 use crate::{
-    math::{DevicePx, DeviceRect, LogicalSize, dp},
-    resources::{DecodeCause, ResourceId, ResourceImage, image::SourceKind},
+    math::{DevicePx, DeviceRect, DeviceSize, LogicalSize, dp},
+    paint::atlas::AtlasTile,
+    resources::{DecodeCause, ImageResourceKind, ResourceId, image::SourceKind},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -15,38 +17,54 @@ pub(crate) struct ContentKey {
 }
 
 impl ContentKey {
-    pub(crate) fn new(bytes: &[u8], kind: SourceKind) -> Self {
+    pub(crate) fn new(bytes: &[u8], kind: SourceKind, intrinsic: Option<LogicalSize>) -> Self {
         let mut hasher = AHasher::default();
         hasher.write_u8(kind as u8);
+        match intrinsic {
+            Some(intrinsic) => {
+                hasher.write_u8(1);
+                hasher.write_u32(intrinsic.width.value().to_bits());
+                hasher.write_u32(intrinsic.height.value().to_bits());
+            }
+            None => hasher.write_u8(0),
+        }
         hasher.write(bytes);
         Self {
             len: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
             hash: hasher.finish(),
         }
     }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            len: 0,
+            hash: AHasher::default().finish(),
+        }
+    }
 }
 
 pub(crate) struct DedupeEntry {
     pub bytes: Bytes,
-    pub variants: Vec<VariantEntry>,
-}
-
-pub(crate) struct VariantEntry {
-    pub target: (u32, u32),
     pub id: ResourceId,
 }
 
-pub(crate) struct Entry {
-    pub image: ResourceImage,
+pub(crate) struct Variant {
+    pub target: DeviceSize,
+    pub pixels: u64,
+    pub tile: AtlasTile,
     pub alloc: etagere::AllocId,
     pub padded: DeviceRect,
+    pub last_used: u64,
+    pub pinned_frame: u64,
+    pub exposed: bool,
+}
+
+pub(crate) struct Entry {
+    pub kind: ImageResourceKind,
+    pub key: ContentKey,
+    pub variants: SmallVec<[Variant; 3]>,
     pub refcount: u32,
     pub last_used: u64,
-    pub key: ContentKey,
-    pub target: (u32, u32),
-    pub intrinsic: (u32, u32),
-    pub kind: SourceKind,
-    pub logical: Option<LogicalSize>,
 }
 
 pub(crate) struct Page {
@@ -132,7 +150,7 @@ impl Page {
 mod tests {
     use super::{ContentKey, Page};
     use crate::{
-        math::{DeviceRect, dp},
+        math::{DeviceRect, LogicalSize, dp, px},
         resources::{DecodeCause, image::SourceKind},
     };
 
@@ -234,20 +252,35 @@ mod tests {
 
     #[test]
     fn content_key_is_stable_for_equal_bytes_and_splits_different_lengths() {
-        let first = ContentKey::new(b"logo", SourceKind::Bitmap);
-        let second = ContentKey::new(b"logo", SourceKind::Bitmap);
-        let longer = ContentKey::new(b"logos", SourceKind::Bitmap);
+        let first = ContentKey::new(b"logo", SourceKind::Bitmap, None);
+        let second = ContentKey::new(b"logo", SourceKind::Bitmap, None);
+        let longer = ContentKey::new(b"logos", SourceKind::Bitmap, None);
 
         assert_eq!(first, second, "同一份字节的内容键必须相同");
         assert_ne!(first, longer, "长度进键：不同长度不该互相命中");
         assert_ne!(
-            ContentKey::new(b"logo", SourceKind::Bitmap),
-            ContentKey::new(b"logo", SourceKind::Svg),
-            "来源类型进键：同一份字节不能跨 PNG/SVG 复用变体"
+            ContentKey::new(b"logo", SourceKind::Bitmap, None),
+            ContentKey::new(b"logo", SourceKind::Svg, None),
+            "来源类型进键：同一份字节不能跨 PNG/SVG 复用"
         );
         assert_ne!(
-            ContentKey::new(b"logo", SourceKind::Bitmap),
-            ContentKey::new(b"olgo", SourceKind::Bitmap)
+            ContentKey::new(b"logo", SourceKind::Bitmap, None),
+            ContentKey::new(b"olgo", SourceKind::Bitmap, None)
+        );
+    }
+
+    #[test]
+    fn content_key_separates_svg_intrinsics() {
+        let square = LogicalSize::new(px(16.0), px(16.0));
+        let wide = LogicalSize::new(px(32.0), px(16.0));
+        assert_ne!(
+            ContentKey::new(b"<svg/>", SourceKind::Svg, Some(square)),
+            ContentKey::new(b"<svg/>", SourceKind::Svg, Some(wide)),
+            "同一份 SVG 字节在不同内在尺寸下是不同资源"
+        );
+        assert_eq!(
+            ContentKey::new(b"<svg/>", SourceKind::Svg, Some(square)),
+            ContentKey::new(b"<svg/>", SourceKind::Svg, Some(square))
         );
     }
 }

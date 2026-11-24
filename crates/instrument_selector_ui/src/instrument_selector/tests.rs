@@ -9,7 +9,7 @@ use market_participants_model::{
     routing::CapabilityId,
 };
 use smol_str::{SmolStr, format_smolstr};
-use ui_core::math::Point;
+use ui_core::math::{LogicalPoint, px};
 
 use super::*;
 use crate::test_support::{Harness, catalog_with, loaded, scope};
@@ -690,7 +690,7 @@ fn click_node(harness: &mut Harness, prefix: &str) {
 
 fn click_node_id(harness: &mut Harness, node: ui_core::node::id::NodeId) {
     let bounds = harness.bounds(node).expect("the node is laid out");
-    let centre = Point::new(
+    let centre = LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     );
@@ -1349,7 +1349,7 @@ fn the_filter_takes_its_own_text_and_leaves_every_other_event_queued() {
         },
     ));
     harness.pump(ui_core::event::Event::Resized {
-        size: ui_core::math::Size::new(1280.0, 900.0),
+        size: ui_core::math::LogicalSize::new(px(1280.0), px(900.0)),
     });
     harness.settle(2);
 

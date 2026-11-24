@@ -6,7 +6,7 @@ use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::SmolStr;
 use ui_core::{
     event::{InputEvent, Modifiers, PointerButton},
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::id::NodeId,
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
@@ -42,7 +42,7 @@ impl Harness {
     pub(crate) fn with_config(config: Config) -> Self {
         let mut app = TestApp::with_options(WindowOptions {
             title: SmolStr::new_static("Kytrix test"),
-            size: Size::new(1280.0, 960.0),
+            size: LogicalSize::new(px(1280.0), px(960.0)),
             ..WindowOptions::default()
         });
         let window = app.window_id();
@@ -109,12 +109,12 @@ impl Harness {
         self.node(debug_id).is_some()
     }
 
-    pub(crate) fn bounds(&self, debug_id: &str) -> Option<Rect> {
+    pub(crate) fn bounds(&self, debug_id: &str) -> Option<LogicalRect> {
         let node = self.node(debug_id)?;
         self.tree().get(node).ok().map(|node| node.layout().bounds)
     }
 
-    pub(crate) fn bounds_all(&self, debug_id: &str) -> Vec<Rect> {
+    pub(crate) fn bounds_all(&self, debug_id: &str) -> Vec<LogicalRect> {
         let tree = self.tree();
         self.nodes()
             .into_iter()
@@ -169,7 +169,7 @@ impl Harness {
             .get(target)
             .map(|node| node.layout().bounds)
             .unwrap_or_else(|_| panic!("{debug_id} should have a box"));
-        let center = Point::new(
+        let center = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -205,7 +205,7 @@ impl Harness {
         node
     }
 
-    pub(crate) fn drag(&mut self, debug_id: &str, delta: Point) {
+    pub(crate) fn drag(&mut self, debug_id: &str, delta: LogicalPoint) {
         let node = self
             .node(debug_id)
             .unwrap_or_else(|| panic!("the window should draw {debug_id}"));
@@ -215,14 +215,15 @@ impl Harness {
             .map(|node| node.layout().bounds)
             .unwrap_or_else(|_| panic!("{debug_id} should have a box"));
         assert!(
-            bounds.size.width > 0.0 && bounds.size.height > 0.0,
+            bounds.size.width > px(0.0) && bounds.size.height > px(0.0),
             "{debug_id} should have a hit area: {bounds:?}"
         );
-        let start = Point::new(
+        let start = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
-        let move_to = |offset: Point| Point::new(start.x + offset.x, start.y + offset.y);
+        let move_to =
+            |offset: LogicalPoint| LogicalPoint::new(start.x + offset.x, start.y + offset.y);
         let _ = self.app.inject(InputEvent::PointerDown {
             position: start,
             button: PointerButton::Primary,
@@ -231,10 +232,10 @@ impl Harness {
         });
         let _ = self
             .app
-            .move_pointer(move_to(Point::new(delta.x * 0.5, delta.y * 0.5)));
+            .move_pointer(move_to(LogicalPoint::new(delta.x * 0.5, delta.y * 0.5)));
         let _ = self
             .app
-            .move_pointer(move_to(Point::new(delta.x * 0.75, delta.y * 0.75)));
+            .move_pointer(move_to(LogicalPoint::new(delta.x * 0.75, delta.y * 0.75)));
         let _ = self.app.move_pointer(move_to(delta));
         let _ = self.app.inject(InputEvent::PointerUp {
             position: move_to(delta),
@@ -325,9 +326,9 @@ mod tests {
             "one drag strip between the two control clusters"
         );
         let region = regions[0];
-        assert!(region.size.width > 0.0 && region.size.height > 0.0);
+        assert!(region.size.width > px(0.0) && region.size.height > px(0.0));
         assert!(
-            region.origin.x > 0.0,
+            region.origin.x > px(0.0),
             "the region leaves the left control cluster out"
         );
         if cfg!(target_os = "windows") {
@@ -344,7 +345,7 @@ mod tests {
         );
         assert_eq!(
             harness.bounds("SIDEBAR").map(|bounds| bounds.size.width),
-            Some(220.0)
+            Some(px(220.0))
         );
 
         harness.click("TITLE_BAR_SIDEBAR_TOGGLE");
@@ -361,7 +362,7 @@ mod tests {
         );
         assert_eq!(
             harness.bounds("SIDEBAR").map(|bounds| bounds.size.width),
-            Some(40.0)
+            Some(px(40.0))
         );
         assert!(!harness.exists("SIDEBAR_NEW_WORKSPACE_LABEL"));
     }
@@ -720,7 +721,7 @@ mod tests {
         assert_eq!(bodies.len(), 2, "the split mounts a second pane");
         for body in &bodies {
             assert!(
-                body.size.width > 0.0 && body.size.height > 0.0,
+                body.size.width > px(0.0) && body.size.height > px(0.0),
                 "every pane has a real rectangle: {bodies:?}"
             );
         }
@@ -729,7 +730,7 @@ mod tests {
             "the panes fit inside the stage: stage {stage:?}, panes {bodies:?}"
         );
         assert!(
-            (bodies[0].size.width - bodies[1].size.width).abs() < 1.0,
+            (bodies[0].size.width - bodies[1].size.width).abs() < px(1.0),
             "an even split gives both panes the same width: {bodies:?}"
         );
     }
@@ -764,7 +765,7 @@ mod tests {
         let before = harness.bounds_all("PANE_BODY");
         let commits = harness.composition.hub.commits();
 
-        harness.drag(&bar, Point::new(80.0, 0.0));
+        harness.drag(&bar, LogicalPoint::new(px(80.0), px(0.0)));
 
         let after = harness.bounds_all("PANE_BODY");
         assert!(
@@ -772,7 +773,7 @@ mod tests {
             "the head pane follows the bar: before {before:?}, after {after:?}"
         );
         assert!(
-            after[1].size.width > 0.0,
+            after[1].size.width > px(0.0),
             "the tail pane keeps a real rectangle: {after:?}"
         );
         assert_eq!(

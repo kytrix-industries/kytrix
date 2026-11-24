@@ -12,7 +12,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, ActionSource, KeyBinding, KeyCode, Modifiers},
     interaction::ItemAlign,
-    math::Size,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder, dependency::ReadCtx, id::NodeId, image::ImageFit, signal::Signal,
         tree::NodeTree,
@@ -25,7 +25,7 @@ use ui_core::{
 
 use crate::{
     kit::{
-        icon::{IconKind, svg},
+        icon::{ICON_INTRINSIC_SIZE, IconKind, svg},
         layer::{Band, Layer, LayerSlot},
         list::{List, ListOptions, RowHeight, Selection, SelectionMode},
         overlay::{
@@ -37,78 +37,17 @@ use crate::{
     theme::{handle::ThemeHandle, role::Role},
 };
 
-const MENU_PADDING: f32 = 4.0;
+const MENU_PADDING: LogicalPx = LogicalPx::new(4.0);
 const GROUP_HEIGHT_RATIO: f32 = 0.75;
-const SEPARATOR_HEIGHT: f32 = 9.0;
-const SUBMENU_GAP: f32 = 0.0;
+const SEPARATOR_HEIGHT: LogicalPx = LogicalPx::new(9.0);
+const SUBMENU_GAP: LogicalPx = LogicalPx::ZERO;
 const SUBMENU_DELAY: Duration = Duration::from_millis(150);
-
-#[derive(Default)]
-pub(crate) struct IconCache {
-    entries: RefCell<Vec<CachedIcon>>,
-}
-
-struct CachedIcon {
-    kind: IconKind,
-    size: f32,
-    scale_bits: u32,
-    resource: ResourceId,
-}
-
-impl IconCache {
-    pub(crate) fn resolve(
-        &self,
-        app: &mut App,
-        window: WindowId,
-        kind: IconKind,
-        size: f32,
-    ) -> Result<(), EngineError> {
-        let scale = app
-            .window(window)
-            .ok_or(EngineError::UnknownWindow { window })?
-            .scale()
-            .factor();
-        let scale_bits = scale.to_bits();
-        if self
-            .entries
-            .borrow()
-            .iter()
-            .any(|entry| entry.kind == kind && entry.size == size && entry.scale_bits == scale_bits)
-        {
-            return Ok(());
-        }
-        let image = app.resources_mut().insert_owned_svg_for_display(
-            window,
-            svg(kind).as_bytes(),
-            Size::new(size, size),
-            scale,
-        )?;
-        self.entries.borrow_mut().push(CachedIcon {
-            kind,
-            size,
-            scale_bits,
-            resource: image.id,
-        });
-        Ok(())
-    }
-
-    pub(crate) fn snapshot(&self) -> IconSnapshot {
-        IconSnapshot {
-            entries: self
-                .entries
-                .borrow()
-                .iter()
-                .map(|entry| (entry.kind, entry.size, entry.resource))
-                .collect(),
-        }
-    }
-}
 
 fn build_icon(
     tree: &mut NodeTree,
     parent: NodeId,
     resource: ResourceId,
-    size: f32,
+    size: LogicalPx,
     bind_style: impl Fn(&mut ReadCtx<'_>) -> StylePatch + 'static,
 ) -> Result<(), EngineError> {
     NodeBuilder::image(resource, ImageFit::Fill)
@@ -124,7 +63,7 @@ fn build_icon(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PanelRow {
-    pub height: f32,
+    pub height: LogicalPx,
     pub disabled: bool,
 }
 
@@ -138,7 +77,7 @@ pub(crate) struct PanelContent {
 #[derive(Clone)]
 pub(crate) struct PanelMeasure {
     pub labels: Vec<SmolStr>,
-    pub extra: f32,
+    pub extra: LogicalPx,
 }
 
 impl Clone for PanelContent {
@@ -164,12 +103,12 @@ pub(crate) struct PanelRoles {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ItemPanelOptions {
     pub size: UnifiedSize,
-    pub max_height: f32,
-    pub row_height: f32,
+    pub max_height: LogicalPx,
+    pub row_height: LogicalPx,
     pub band: Band,
     pub modal: bool,
     pub placement: Placement,
-    pub gap: f32,
+    pub gap: LogicalPx,
     pub roles: PanelRoles,
     pub label: Option<SmolStr>,
     pub width: PanelWidth,
@@ -196,12 +135,12 @@ struct PanelActions {
 struct PanelState {
     window: Option<WindowId>,
     surface: Option<NodeId>,
-    width: f32,
-    min_width: f32,
-    content_width: f32,
+    width: LogicalPx,
+    min_width: LogicalPx,
+    content_width: LogicalPx,
     measured: bool,
     measure: Option<NodeId>,
-    height: f32,
+    height: LogicalPx,
     opened: bool,
 }
 
@@ -244,7 +183,7 @@ impl ItemPanel {
             reverse: false,
             keep_on_newest: false,
             padding_x: MENU_PADDING,
-            padding_y: 0.0,
+            padding_y: LogicalPx::ZERO,
             row_stretch: true,
             scrollbar: true,
             separator: false,
@@ -300,7 +239,7 @@ impl ItemPanel {
             OverlayOptions {
                 placement: options.placement,
                 gap: options.gap,
-                margin: 4.0,
+                margin: px(4.0),
                 flip: true,
                 dismiss: DismissPolicy::OutsideClick,
                 modal: options.modal,
@@ -336,12 +275,12 @@ impl ItemPanel {
             state: RefCell::new(PanelState {
                 window: None,
                 surface: None,
-                width: 0.0,
-                min_width: 0.0,
-                content_width: 0.0,
+                width: LogicalPx::ZERO,
+                min_width: LogicalPx::ZERO,
+                content_width: LogicalPx::ZERO,
                 measured: false,
                 measure: None,
-                height: 0.0,
+                height: LogicalPx::ZERO,
                 opened: false,
             }),
             open,
@@ -429,17 +368,20 @@ impl ItemPanel {
         app: &mut App,
         window: WindowId,
         anchor: Anchor,
-        width: f32,
+        width: LogicalPx,
     ) -> PanelResult<bool> {
         let content = self.inner.content.borrow().clone();
         let Some(content) = content else {
             return Ok(false);
         };
-        let width = (width.max(1.0) - MENU_PADDING * 2.0).max(1.0);
-        let total: f32 = content.rows.iter().map(|row| row.height).sum();
+        let width = (width.max(px(1.0)) - MENU_PADDING * 2.0).max(px(1.0));
+        let total = content
+            .rows
+            .iter()
+            .fold(LogicalPx::ZERO, |total, row| total + row.height);
         let height = total
-            .min((self.inner.options.max_height - MENU_PADDING * 2.0).max(1.0))
-            .max(0.0);
+            .min((self.inner.options.max_height - MENU_PADDING * 2.0).max(px(1.0)))
+            .max(LogicalPx::ZERO);
         let key = self.inner.key.clone();
         let list = self.inner.list.clone();
         let activate = self.inner.actions.activate.clone();
@@ -495,7 +437,7 @@ impl ItemPanel {
             state.window = Some(window);
             state.surface = surface_slot.get();
             state.min_width = width;
-            state.content_width = 0.0;
+            state.content_width = LogicalPx::ZERO;
             state.width = width;
             state.measure = measure_slot.get();
             state.measured = state.measure.is_none();
@@ -508,11 +450,11 @@ impl ItemPanel {
         Ok(true)
     }
 
-    pub(crate) fn resize(&self, app: &mut App, width: f32) -> Result<(), EngineError> {
-        let min_width = (width.max(1.0) - MENU_PADDING * 2.0).max(1.0);
+    pub(crate) fn resize(&self, app: &mut App, width: LogicalPx) -> Result<(), EngineError> {
+        let min_width = (width.max(px(1.0)) - MENU_PADDING * 2.0).max(px(1.0));
         {
             let mut state = self.inner.state.borrow_mut();
-            if state.surface.is_none() || (state.min_width - min_width).abs() < 0.5 {
+            if state.surface.is_none() || (state.min_width - min_width).abs() < px(0.5) {
                 return Ok(());
             }
             state.min_width = min_width;
@@ -533,7 +475,7 @@ impl ItemPanel {
         let (Some(window), Some(surface)) = (window, surface) else {
             return Ok(false);
         };
-        if previous > 0.0 && (previous - target).abs() < 0.5 {
+        if previous > LogicalPx::ZERO && (previous - target).abs() < px(0.5) {
             return Ok(false);
         }
         if let Some(tree) = app.window_mut(window).map(|target| target.tree_mut())
@@ -560,7 +502,7 @@ impl ItemPanel {
         let content = self.inner.content.borrow().clone();
         let text_size = self.inner.options.size.text_size();
         let mut state = self.inner.state.borrow_mut();
-        state.content_width = 0.0;
+        state.content_width = LogicalPx::ZERO;
         state.measured = false;
         let Some(tree) = app.window_mut(window).map(|target| target.tree_mut()) else {
             return Ok(());
@@ -581,7 +523,7 @@ impl ItemPanel {
         Ok(())
     }
 
-    fn measure_content(&self, app: &App) -> Option<f32> {
+    fn measure_content(&self, app: &App) -> Option<LogicalPx> {
         let (window, node) = {
             let state = self.inner.state.borrow();
             (state.window?, state.measure?)
@@ -590,7 +532,7 @@ impl ItemPanel {
         let content = self.inner.content.borrow();
         let measure = content.as_ref()?.measure.as_ref()?;
         let mut offset = 0usize;
-        let mut width = 0.0f32;
+        let mut width = LogicalPx::ZERO;
         for label in &measure.labels {
             let bytes = label.as_bytes();
             let mut segment_start = 0usize;
@@ -882,10 +824,13 @@ impl ItemPanel {
         let Some(content) = content else {
             return Ok(());
         };
-        let total: f32 = content.rows.iter().map(|row| row.height).sum();
+        let total = content
+            .rows
+            .iter()
+            .fold(LogicalPx::ZERO, |total, row| total + row.height);
         let height = total
-            .min((self.inner.options.max_height - MENU_PADDING * 2.0).max(1.0))
-            .max(0.0);
+            .min((self.inner.options.max_height - MENU_PADDING * 2.0).max(px(1.0)))
+            .max(LogicalPx::ZERO);
         {
             let mut state = self.inner.state.borrow_mut();
             state.height = height;
@@ -910,10 +855,10 @@ impl ItemPanel {
             state.window = None;
             state.measure = None;
             state.measured = false;
-            state.content_width = 0.0;
-            state.width = 0.0;
-            state.min_width = 0.0;
-            state.height = 0.0;
+            state.content_width = LogicalPx::ZERO;
+            state.width = LogicalPx::ZERO;
+            state.min_width = LogicalPx::ZERO;
+            state.height = LogicalPx::ZERO;
             opened
         };
         let _ = app.write(&self.inner.open, false);
@@ -1066,11 +1011,11 @@ impl MenuMode {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MenuOptions {
     pub size: UnifiedSize,
-    pub width: f32,
-    pub max_height: f32,
+    pub width: LogicalPx,
+    pub max_height: LogicalPx,
     pub mode: MenuMode,
     pub placement: Placement,
-    pub gap: f32,
+    pub gap: LogicalPx,
     pub band: Band,
     pub label: Option<SmolStr>,
     pub submenu_delay: Duration,
@@ -1080,11 +1025,11 @@ impl Default for MenuOptions {
     fn default() -> Self {
         Self {
             size: UnifiedSize::Medium,
-            width: 200.0,
-            max_height: 320.0,
+            width: px(200.0),
+            max_height: px(320.0),
             mode: MenuMode::Menu,
             placement: Placement::BOTTOM_START,
-            gap: 4.0,
+            gap: px(4.0),
             band: Band::Popup,
             label: None,
             submenu_delay: SUBMENU_DELAY,
@@ -1094,13 +1039,13 @@ impl Default for MenuOptions {
 
 impl MenuOptions {
     #[must_use]
-    pub fn width(mut self, width: f32) -> Self {
+    pub fn width(mut self, width: LogicalPx) -> Self {
         self.width = width;
         self
     }
 
     #[must_use]
-    pub fn max_height(mut self, max_height: f32) -> Self {
+    pub fn max_height(mut self, max_height: LogicalPx) -> Self {
         self.max_height = max_height;
         self
     }
@@ -1182,7 +1127,7 @@ struct MenuInner {
     layer: Layer,
     router: AnimationRouter,
     panel: ItemPanel,
-    icons: IconCache,
+    icons: RefCell<IconSnapshot>,
     rows: RefCell<Vec<RowKind>>,
     entries: RefCell<Rc<Vec<MenuEntry>>>,
     kind: MenuKind,
@@ -1271,7 +1216,7 @@ impl Menu {
             layer,
             router,
             panel,
-            icons: IconCache::default(),
+            icons: RefCell::new(IconSnapshot::default()),
             rows: RefCell::new(Vec::new()),
             entries: RefCell::new(Rc::new(entries.into_iter().collect())),
             kind,
@@ -1354,6 +1299,7 @@ impl Menu {
     ) -> Result<bool, OverlayError> {
         self.inner.window.set(Some(window));
         self.resolve_icons(app, window)?;
+        self.install_content(app);
         let width = self.inner.options.width;
         let opened = self.inner.panel.open(app, window, anchor, width)?;
         if opened {
@@ -1529,7 +1475,7 @@ impl Menu {
                             Role::FgDefault
                         };
                         build_label(tree, parent, &theme, &submenu.label, text_style, foreground)?;
-                        if let Some(resource) = icons.get(IconKind::CaretRight, size.icon_size()) {
+                        if let Some(resource) = icons.get(IconKind::CaretRight) {
                             let theme_icon = theme.clone();
                             build_icon(tree, parent, resource, size.icon_size(), move |cx| {
                                 StylePatch {
@@ -1546,7 +1492,7 @@ impl Menu {
                     MenuEntry::Separator => {
                         let theme_line = theme.clone();
                         NodeBuilder::boxed()
-                            .style(StyleBuilder::new().width_full().height(1.0).build())
+                            .style(StyleBuilder::new().width_full().height(px(1.0)).build())
                             .bind_style(move |cx| StylePatch {
                                 background: Some(theme_line.role(cx, Role::LineDivider)),
                                 ..StylePatch::default()
@@ -1853,12 +1799,12 @@ impl Menu {
     }
 
     fn icon_snapshot(&self) -> IconSnapshot {
-        self.inner.icons.snapshot()
+        self.inner.icons.borrow().clone()
     }
 
     fn resolve_icons(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let entries = self.inner.entries.borrow().clone();
-        let size = self.inner.options.size;
+        let mut icons = self.inner.icons.borrow_mut();
         for entry in entries.iter() {
             let icon = match entry {
                 MenuEntry::Action(action) => action.icon,
@@ -1866,9 +1812,7 @@ impl Menu {
                 MenuEntry::Group(_) | MenuEntry::Separator => None,
             };
             if let Some(kind) = icon {
-                self.inner
-                    .icons
-                    .resolve(app, window, kind, size.icon_size())?;
+                icons.resolve(app, window, kind)?;
             }
         }
         if self.inner.options.mode == MenuMode::Menu
@@ -1876,9 +1820,7 @@ impl Menu {
                 .iter()
                 .any(|entry| matches!(entry, MenuEntry::Submenu(_)))
         {
-            self.inner
-                .icons
-                .resolve(app, window, IconKind::CaretRight, size.icon_size())?;
+            icons.resolve(app, window, IconKind::CaretRight)?;
         }
         Ok(())
     }
@@ -1901,25 +1843,44 @@ impl Menu {
 
 #[derive(Clone, Default)]
 pub(crate) struct IconSnapshot {
-    entries: Vec<(IconKind, f32, ResourceId)>,
+    entries: Vec<(IconKind, ResourceId)>,
 }
 
 impl IconSnapshot {
-    pub(crate) fn get(&self, kind: IconKind, size: f32) -> Option<ResourceId> {
+    pub(crate) fn resolve(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        kind: IconKind,
+    ) -> Result<(), EngineError> {
+        let image = app.insert_svg_for_window(window, svg(kind).as_bytes(), ICON_INTRINSIC_SIZE)?;
+        let resource = image.id();
+        match self
+            .entries
+            .iter_mut()
+            .find(|(entry_kind, _)| *entry_kind == kind)
+        {
+            Some(entry) => entry.1 = resource,
+            None => self.entries.push((kind, resource)),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, kind: IconKind) -> Option<ResourceId> {
         self.entries
             .iter()
-            .find(|(entry_kind, entry_size, _)| *entry_kind == kind && *entry_size == size)
-            .map(|(_, _, resource)| *resource)
+            .find(|(entry_kind, _)| *entry_kind == kind)
+            .map(|(_, resource)| *resource)
     }
 }
 
-const MEASURE_WIDTH: f32 = 4096.0;
+const MEASURE_WIDTH: LogicalPx = LogicalPx::new(4096.0);
 
 fn build_measure_node(
     tree: &mut NodeTree,
     surface: NodeId,
     measure: &PanelMeasure,
-    text_size: f32,
+    text_size: LogicalPx,
 ) -> Result<NodeId, EngineError> {
     let mut text = String::with_capacity(measure.labels.iter().map(|label| label.len() + 1).sum());
     for (index, label) in measure.labels.iter().enumerate() {
@@ -1936,9 +1897,9 @@ fn build_measure_node(
         StyleBuilder::new()
             .absolute()
             .left(-MEASURE_WIDTH)
-            .top(0.0)
+            .top(px(0.0))
             .width(MEASURE_WIDTH)
-            .height(1.0)
+            .height(px(1.0))
             .build(),
     )
     .a11y(A11yOverride {
@@ -1958,7 +1919,7 @@ pub(crate) fn build_icon_slot(
     reserve: bool,
 ) -> Result<(), EngineError> {
     let side = size.icon_size();
-    match icons.get(icon.unwrap_or(IconKind::X), side) {
+    match icons.get(icon.unwrap_or(IconKind::X)) {
         Some(resource) if icon.is_some() => {
             let theme = theme.clone();
             build_icon(tree, parent, resource, side, move |cx| StylePatch {
@@ -2062,7 +2023,7 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{InputEvent, KeyCode, Modifiers, PointerButton},
-        math::Rect,
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         test_support::app::TestApp,
         window::WindowId,
@@ -2078,7 +2039,10 @@ mod tests {
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
-    const ANCHOR: Rect = Rect::new(300.0, 200.0, 120.0, 32.0);
+    const ANCHOR: LogicalRect = LogicalRect::from_origin_size(
+        LogicalPoint::new(px(300.0), px(200.0)),
+        LogicalSize::new(px(120.0), px(32.0)),
+    );
 
     struct Harness {
         app: TestApp,
@@ -2164,7 +2128,7 @@ mod tests {
             let _ = menu.sync(self.app.app_mut());
         }
 
-        fn click(&mut self, menu: &Menu, at: ui_core::math::Point) {
+        fn click(&mut self, menu: &Menu, at: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 at,
                 PointerButton::Primary,
@@ -2179,7 +2143,7 @@ mod tests {
             let _ = menu.sync(self.app.app_mut());
         }
 
-        fn hover(&mut self, menu: &Menu, at: ui_core::math::Point) {
+        fn hover(&mut self, menu: &Menu, at: LogicalPoint) {
             let _ = self
                 .app
                 .inject(InputEvent::pointer_move(at, Modifiers::empty()));
@@ -2193,7 +2157,7 @@ mod tests {
             let _ = menu.sync(self.app.app_mut());
         }
 
-        fn bounds(&self, node: NodeId) -> Rect {
+        fn bounds(&self, node: NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("布局盒")
         }
 
@@ -2216,9 +2180,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("第 {index} 行未挂载"))
         }
 
-        fn row_center(&self, index: usize) -> ui_core::math::Point {
+        fn row_center(&self, index: usize) -> LogicalPoint {
             let bounds = self.bounds(self.row(index));
-            ui_core::math::Point::new(
+            LogicalPoint::new(
                 bounds.origin.x + bounds.size.width / 2.0,
                 bounds.origin.y + bounds.size.height / 2.0,
             )
@@ -2280,7 +2244,11 @@ mod tests {
             "左对齐锚点（BOTTOM_START）"
         );
         assert!(panel.origin.y >= ANCHOR.max().y, "面板在锚点下方");
-        assert_eq!(panel.size.width, 200.0, "面板宽度 = MenuOptions.width");
+        assert_eq!(
+            panel.size.width.value(),
+            200.0,
+            "面板宽度 = MenuOptions.width"
+        );
     }
 
     #[test]
@@ -2295,7 +2263,7 @@ mod tests {
             .root();
         let bottom = NodeBuilder::boxed()
             .id("bottom-anchor")
-            .layout_override(Rect::new(300.0, 560.0, 120.0, 32.0))
+            .layout_override(LogicalRect::new(px(300.0), px(560.0), px(120.0), px(32.0)))
             .build(
                 harness
                     .app
@@ -2314,7 +2282,7 @@ mod tests {
         harness.settle(&menu);
         let panel = harness.bounds(menu.panel_node().expect("面板"));
         assert!(
-            panel.max().y <= 560.0 + 0.5,
+            panel.max().y.value() <= 560.0 + 0.5,
             "放不下时翻到锚点上方：{panel:?}"
         );
     }
@@ -2408,7 +2376,7 @@ mod tests {
         let mut harness = Harness::new();
         let menu = harness.menu(entries(), options());
         harness.open(&menu);
-        harness.click(&menu, ui_core::math::Point::new(10.0, 10.0));
+        harness.click(&menu, LogicalPoint::new(px(10.0), px(10.0)));
         assert!(!menu.is_open(harness.app.app()), "点击外部关闭");
         assert_eq!(harness.closes.get(), 1);
     }
@@ -2455,7 +2423,7 @@ mod tests {
             "子菜单在所属行右侧：行 {row_bounds:?} / 子 {submenu:?}"
         );
         assert!(
-            (submenu.origin.y - row_bounds.origin.y).abs() < 1.0,
+            (submenu.origin.y - row_bounds.origin.y).value().abs() < 1.0,
             "子菜单与所属行顶部对齐"
         );
     }
@@ -2502,7 +2470,7 @@ mod tests {
         let menu = harness.menu(
             entries,
             MenuOptions {
-                max_height: 200.0,
+                max_height: px(200.0),
                 ..options()
             },
         );
@@ -2510,7 +2478,7 @@ mod tests {
         assert_eq!(menu.row_count(), 80);
         let panel = harness.bounds(menu.panel_node().expect("面板"));
         assert!(
-            panel.size.height <= 200.0 + 0.5,
+            panel.size.height.value() <= 200.0 + 0.5,
             "面板高度被 max_height 截住：{panel:?}"
         );
         let mounted = count_rows(&harness);
@@ -2598,7 +2566,7 @@ mod tests {
             "菜单自带模态作用域"
         );
         harness.app.inject(InputEvent::pointer_move(
-            ui_core::math::Point::new(5.0, 5.0),
+            LogicalPoint::new(px(5.0), px(5.0)),
             Modifiers::empty(),
         ));
         let _ = harness.app.drain().expect("帧");

@@ -48,11 +48,18 @@ fn glyph_spec(page: u32) -> AtlasArraySpec {
     AtlasArraySpec { page, layers: 1 }
 }
 
+fn native_tile(app: &App, image: crate::resources::ResourceImage) -> AtlasTile {
+    image
+        .variant_for(app.resources(), crate::math::DeviceSize::new(dp(1), dp(1)))
+        .expect("位图的原生变体恒可用")
+}
+
 fn tile_pixel(app: &App, image: crate::resources::ResourceImage) -> [u8; 4] {
+    let tile = native_tile(app, image);
     let (page, pixels) = app.resources().page_pixels().expect("image page");
     let page_width = page.0 as usize;
-    let origin_x = (image.tile.u0 * page.0 as f32).round() as usize;
-    let origin_y = (image.tile.v0 * page.0 as f32).round() as usize;
+    let origin_x = (tile.u0 * page.0 as f32).round() as usize;
+    let origin_y = (tile.v0 * page.0 as f32).round() as usize;
     let offset = origin_y * page_width * 4 + origin_x * 4;
     pixels[offset..offset + 4].try_into().expect("4 字节像素")
 }
@@ -60,7 +67,7 @@ fn tile_pixel(app: &App, image: crate::resources::ResourceImage) -> [u8; 4] {
 #[test]
 fn resources_are_process_level() {
     let (_rt, mut app, window) = setup();
-    let image = app.resources_mut().insert(&png()).expect("insert");
+    let image = app.resources.insert(&png()).expect("insert");
 
     assert_eq!(app.resources().len(), 1);
     assert_eq!(
@@ -79,8 +86,9 @@ fn resources_are_process_level() {
 
     let (page, pixels) = app.resources().page_pixels().expect("page");
     let page_width = page.0 as usize;
-    let origin_x = (image.tile.u0 * page.0 as f32).round() as usize;
-    let origin_y = (image.tile.v0 * page.0 as f32).round() as usize;
+    let tile = native_tile(&app, image);
+    let origin_x = (tile.u0 * page.0 as f32).round() as usize;
+    let origin_y = (tile.v0 * page.0 as f32).round() as usize;
     let offset = origin_y * page_width * 4 + origin_x * 4;
     assert_eq!(&pixels[offset..offset + 4], &[30, 20, 10, 255]);
 }
@@ -106,7 +114,7 @@ fn insert_does_not_touch_node_dirty_flags() {
         .expect("node")
         .dirty();
 
-    let _ = app.resources_mut().insert(&png()).expect("insert");
+    let _ = app.resources.insert(&png()).expect("insert");
 
     let after = app
         .window(window)
@@ -121,7 +129,7 @@ fn insert_does_not_touch_node_dirty_flags() {
 #[test]
 fn atlas_upload_without_renderers_keeps_windows_unsynced() {
     let (_rt, mut app, window) = setup();
-    let _ = app.resources_mut().insert(&png()).expect("insert");
+    let _ = app.resources.insert(&png()).expect("insert");
 
     app.upload_atlas_pages();
     app.upload_atlas_pages();
@@ -172,7 +180,7 @@ fn atlas_pages_are_broadcast_to_every_window() {
         .enable_offscreen_renderer()
         .expect("offscreen renderer");
 
-    let _ = app.resources_mut().insert(&png()).expect("insert");
+    let _ = app.resources.insert(&png()).expect("insert");
     app.upload_atlas_pages();
 
     for window in [first, second] {
@@ -353,7 +361,7 @@ fn image_atlas_page_is_lazy_until_the_first_insert() {
         app.resources().page_pixels().is_none(),
         "没有插入图片时不得分配图片页（DEVIATIONS F-208）"
     );
-    let _ = app.resources_mut().insert(&png()).expect("insert");
+    let _ = app.resources.insert(&png()).expect("insert");
     let (page, pixels) = app.resources().page_pixels().expect("page");
     assert_eq!(
         page,
@@ -370,10 +378,10 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..3u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 1, 20, 30, 255]))
             .expect("insert");
     }
@@ -428,10 +436,14 @@ fn image_pages_upload_to_their_own_texture_array_layers() {
     );
 
     let inserted = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([200, 1, 2, 255]))
         .expect("insert");
-    assert_eq!(inserted.tile.page, 1, "页 0 已满，新图必须落在 layer 1");
+    assert_eq!(
+        native_tile(&app, inserted).page,
+        1,
+        "页 0 已满，新图必须落在 layer 1"
+    );
     app.upload_atlas_pages();
 
     {
@@ -472,10 +484,10 @@ fn growing_the_image_array_reuploads_every_open_layer() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..2u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 1, 20, 30, 255]))
             .expect("insert");
     }
@@ -505,7 +517,7 @@ fn growing_the_image_array_reuploads_every_open_layer() {
     let _ = app.frame(window).expect("frame").expect("ok");
 
     let _ = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([200, 1, 2, 255]))
         .expect("insert");
     assert_eq!(app.resources().page_count(), 2);
@@ -613,10 +625,10 @@ fn a_busy_upload_slot_defers_the_image_array_growth() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..2u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 1, 20, 30, 255]))
             .expect("insert");
     }
@@ -637,7 +649,7 @@ fn a_busy_upload_slot_defers_the_image_array_growth() {
     let _ = app.frame(window).expect("frame").expect("ok");
 
     let _ = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([200, 1, 2, 255]))
         .expect("insert");
     assert_eq!(app.resources().page_count(), 2);
@@ -710,10 +722,10 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..2u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 1, 20, 30, 255]))
             .expect("insert");
     }
@@ -761,7 +773,7 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
     }
 
     let _ = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([200, 1, 2, 255]))
         .expect("insert");
     assert_eq!(app.resources().page_count(), 2);
@@ -837,10 +849,10 @@ fn a_partial_layer_enqueue_does_not_advance_the_image_array() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..2u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 1, 20, 30, 255]))
             .expect("insert");
     }
@@ -860,7 +872,7 @@ fn a_partial_layer_enqueue_does_not_advance_the_image_array() {
     let _ = app.frame(first).expect("frame").expect("ok");
 
     let _ = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([200, 1, 2, 255]))
         .expect("insert");
     assert_eq!(app.resources().page_count(), 2);
@@ -917,10 +929,10 @@ fn a_new_window_without_an_array_gets_zero_drawable_layers_while_growth_is_block
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..2u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 1, 20, 30, 255]))
             .expect("insert");
     }
@@ -952,7 +964,7 @@ fn a_new_window_without_an_array_gets_zero_drawable_layers_while_growth_is_block
     assert_eq!(app.window(second).expect("second").image_array_spec(), None);
 
     let _ = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([200, 1, 2, 255]))
         .expect("insert");
     assert_eq!(app.resources().page_count(), 2);
@@ -1013,9 +1025,9 @@ fn initial_array_establishment_ignores_participation() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     let _ = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([7, 8, 9, 255]))
         .expect("insert");
     app.window_mut(window)
@@ -1052,10 +1064,10 @@ fn an_occluded_window_does_not_block_growth_and_resyncs_when_it_returns() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..2u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 1, 20, 30, 255]))
             .expect("insert");
     }
@@ -1081,7 +1093,7 @@ fn an_occluded_window_does_not_block_growth_and_resyncs_when_it_returns() {
     }
 
     let _ = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([200, 1, 2, 255]))
         .expect("insert");
     let page_bytes = 16usize * 16 * 4;
@@ -1147,10 +1159,10 @@ fn growth_degrades_after_a_window_stops_consuming_uploads() {
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..2u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 1, 20, 30, 255]))
             .expect("insert");
     }
@@ -1176,7 +1188,7 @@ fn growth_degrades_after_a_window_stops_consuming_uploads() {
     }
 
     let _ = app
-        .resources_mut()
+        .resources
         .insert(&png_rgba([200, 1, 2, 255]))
         .expect("insert");
     let page_bytes = 16usize * 16 * 4;
@@ -1227,10 +1239,10 @@ fn growth_degrades_after_a_window_stops_consuming_uploads() {
 fn a_new_window_receives_every_open_image_layer() {
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
-    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16));
+    app.resources = crate::resources::ResourceCache::with_page_for_test((16, 16)).without_lods();
     for index in 0..3u8 {
         let _ = app
-            .resources_mut()
+            .resources
             .insert(&png_rgba([index + 10, 40, 50, 255]))
             .expect("insert");
     }
@@ -1283,21 +1295,25 @@ fn closing_a_window_releases_its_owned_resources() {
     });
     let bytes = png();
     let left_image = app
-        .resources_mut()
+        .resources
         .insert_owned(left, &bytes)
         .expect("left insert");
     let right_image = app
-        .resources_mut()
+        .resources
         .insert_owned(right, &bytes)
         .expect("right insert");
     assert_eq!(left_image, right_image, "同一内容两个窗口共享同一 tile");
     assert_eq!(app.resources().len(), 1, "去重后只有一条条目");
-    assert_eq!(app.resources().stats().used_pixels, 16, "4×4 内容区");
+    assert_eq!(
+        app.resources().stats().used_pixels,
+        16 + 4 + 1,
+        "4×4 内容区 + 1/2 + 1/4 LOD"
+    );
 
     assert!(app.close_window(left), "左窗口存在");
     assert_eq!(app.resources().len(), 1, "右窗口仍持有引用，不得回收");
     let still_alive = app
-        .resources_mut()
+        .resources
         .insert(&bytes)
         .expect("共享内容必须仍可去重命中");
     assert_eq!(still_alive, right_image, "右窗口的 tile 不得失效");
@@ -1306,7 +1322,7 @@ fn closing_a_window_releases_its_owned_resources() {
         [30, 20, 10, 255],
         "右窗口 tile 的页内像素必须仍是原内容"
     );
-    assert!(app.resources_mut().unload(still_alive.id), "还掉临时引用");
+    assert!(app.resources.unload(still_alive.id()), "还掉临时引用");
 
     assert!(app.close_window(right), "右窗口存在");
     assert_eq!(app.resources().len(), 0, "两个窗口关完后条目必须归零");
@@ -1331,11 +1347,11 @@ fn closing_a_window_is_idempotent_with_resources() {
     let left_bytes = png_rgba([1, 2, 3, 255]);
     let right_bytes = png_rgba([4, 5, 6, 255]);
     let _left_image = app
-        .resources_mut()
+        .resources
         .insert_owned(left, &left_bytes)
         .expect("left insert");
     let right_image = app
-        .resources_mut()
+        .resources
         .insert_owned(right, &right_bytes)
         .expect("right insert");
     assert_eq!(app.resources().len(), 2, "两种内容两条条目");
@@ -1349,12 +1365,12 @@ fn closing_a_window_is_idempotent_with_resources() {
         "重复 close 不得释放其它窗口的引用"
     );
     let still_alive = app
-        .resources_mut()
+        .resources
         .insert(&right_bytes)
         .expect("right content still alive");
     assert_eq!(still_alive, right_image);
     assert_eq!(tile_pixel(&app, right_image), [6, 5, 4, 255]);
-    assert!(app.resources_mut().unload(still_alive.id));
+    assert!(app.resources.unload(still_alive.id()));
 
     assert!(app.close_window(right));
     assert_eq!(app.resources().len(), 0);
@@ -1384,7 +1400,7 @@ fn async_decode_is_delivered_by_the_frame_hook() {
     let mut app = App::new(rt.handle().clone());
     let _window = app.create_window(WindowOptions::default());
     let pending = app
-        .resources_mut()
+        .resources
         .insert_async(bytes::Bytes::from(png_rgba([10, 20, 30, 255])));
 
     let requests = app.frame_requests();
@@ -1404,7 +1420,12 @@ fn async_decode_is_delivered_by_the_frame_hook() {
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0].0, pending, "必须带原 PendingResource 句柄");
     assert!(
-        matches!(&delivered[0].1, DecodeState::Ready(image) if (image.width, image.height) == (4, 4)),
+        matches!(
+            &delivered[0].1,
+            DecodeState::Ready(image)
+                if image.intrinsic(crate::math::DevicePixelRatio::ONE)
+                    == LogicalSize::new(px(4.0), px(4.0))
+        ),
         "必须交付 Ready(ResourceImage)：{:?}",
         delivered[0].1
     );
@@ -1423,7 +1444,7 @@ fn async_decode_wakes_the_pump() {
     let _window = app.create_window(WindowOptions::default());
     let _ = app.dispatcher().take_frame_wake();
     let _pending = app
-        .resources_mut()
+        .resources
         .insert_async(bytes::Bytes::from(png_rgba([1, 2, 3, 255])));
 
     assert!(
@@ -1573,7 +1594,7 @@ fn async_ready_tile_can_be_applied_to_an_existing_node() {
     let _ = app.frame(window).expect("帧").expect("首帧不报错");
 
     let _pending = app
-        .resources_mut()
+        .resources
         .insert_async(bytes::Bytes::from(png_rgba([40, 50, 60, 255])));
     let mut image: Option<ResourceImage> = None;
     assert!(wait_until(400, || {
@@ -1586,12 +1607,16 @@ fn async_ready_tile_can_be_applied_to_an_existing_node() {
         image.is_some()
     }));
     let image = image.expect("必须交付 Ready");
-    assert_eq!((image.width, image.height), (4, 4));
+    let tile = native_tile(&app, image);
+    assert_eq!(
+        image.intrinsic(crate::math::DevicePixelRatio::ONE),
+        LogicalSize::new(px(4.0), px(4.0))
+    );
 
     let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)));
     canvas.push_image(Image {
         bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
-        tile: image.tile,
+        tile,
         modulation: Color::WHITE,
     });
     assert!(
@@ -1606,9 +1631,10 @@ fn async_ready_tile_can_be_applied_to_an_existing_node() {
     let primitives = target.scene().lane_primitives(lane).expect("prims");
     assert!(
         primitives.iter().any(|primitive| match primitive {
-            Primitive::Canvas(canvas) => canvas.primitives().iter().any(
-                |inner| matches!(inner, Primitive::Image(primed) if primed.tile == image.tile)
-            ),
+            Primitive::Canvas(canvas) => canvas
+                .primitives()
+                .iter()
+                .any(|inner| matches!(inner, Primitive::Image(primed) if primed.tile == tile)),
             _ => false,
         }),
         "Ready tile 必须被 set_canvas 应用到节点并上屏：{primitives:?}"

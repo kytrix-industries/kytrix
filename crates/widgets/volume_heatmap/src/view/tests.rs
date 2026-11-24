@@ -12,7 +12,7 @@ use market_participants_model::{
 use smol_str::SmolStr;
 use ui_core::{
     event::{Event, InputEvent},
-    math::Point,
+    math::{LogicalPoint, px},
     node::{builder::NodeBuilder, tree::NodeKind},
     paint::canvas::Canvas,
 };
@@ -226,8 +226,8 @@ fn page(harness: &mut WidgetTestApp) -> NodeId {
             .id("TEST_VOLUME_HEATMAP_PAGE")
             .style(
                 StyleBuilder::new()
-                    .width(PAGE.0)
-                    .height(PAGE.1)
+                    .width(px(PAGE.0))
+                    .height(px(PAGE.1))
                     .flex_col()
                     .build(),
             )
@@ -1653,7 +1653,7 @@ fn the_pointer_should_follow_the_tile_under_it() {
         .expect("the map is laid out")
         .layout()
         .bounds;
-    let middle = Point::new(
+    let middle = LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     );

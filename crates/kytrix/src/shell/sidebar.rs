@@ -5,6 +5,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::Event,
+    math::px,
     node::{id::NodeId, signal::Signal},
     paint::style_builder::StyleBuilder,
     window::WindowId,
@@ -124,10 +125,10 @@ impl Sidebar {
             node,
             StyleBuilder::new()
                 .absolute()
-                .top(0.0)
-                .left(0.0)
-                .right(0.0)
-                .bottom(0.0)
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
                 .build(),
             Role::SurfaceSunken,
             &self.theme,
@@ -139,10 +140,10 @@ impl Sidebar {
             SIDEBAR_DIVIDER,
             StyleBuilder::new()
                 .absolute()
-                .right(0.0)
-                .top(0.0)
-                .bottom(0.0)
-                .width(1.0)
+                .right(px(0.0))
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .width(px(1.0))
                 .build(),
         )?;
         ui::container(
@@ -242,7 +243,7 @@ impl Sidebar {
                 node,
                 SIDEBAR_NEW_WORKSPACE_LABEL,
                 label,
-                12.0,
+                px(12.0),
                 500,
                 Role::FgDefault,
                 &self.theme,
@@ -291,7 +292,7 @@ impl Sidebar {
                 node,
                 SIDEBAR_WORKSPACE_NAME,
                 name.clone(),
-                12.0,
+                px(12.0),
                 500,
                 Role::FgDefault,
                 &self.theme,
@@ -334,7 +335,7 @@ impl Sidebar {
             selector,
             StyleBuilder::new()
                 .absolute()
-                .right(metrics::SIDEBAR_PADDING + 26.0)
+                .right(metrics::SIDEBAR_PADDING + px(26.0))
                 .top(metrics::SIDEBAR_PADDING)
                 .build(),
         )?;
@@ -407,7 +408,7 @@ impl Sidebar {
                 node,
                 SIDEBAR_FOOTER_SETTINGS_LABEL,
                 label,
-                12.0,
+                px(12.0),
                 500,
                 Role::FgDefault,
                 &self.theme,

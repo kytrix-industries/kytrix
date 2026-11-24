@@ -15,7 +15,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         canvas::Canvas,
@@ -50,27 +50,28 @@ use crate::{
 
 const SELECTOR: &str = "CandlestickChart";
 
-const AXIS_TICK_TEXT_INSET: f32 = 10.0;
-const AXIS_TAG_TEXT_INSET: f32 = 8.0;
-const LATEST_PRICE_TAG_HEIGHT: f32 = 38.0;
-const LATEST_PRICE_TAG_PRICE_HEIGHT: f32 = 20.0;
+const AXIS_TICK_TEXT_INSET: LogicalPx = px(10.0);
+const AXIS_TAG_TEXT_INSET: LogicalPx = px(8.0);
+const LATEST_PRICE_TAG_HEIGHT: LogicalPx = px(38.0);
+const LATEST_PRICE_TAG_PRICE_HEIGHT: LogicalPx = px(20.0);
 const LATEST_PRICE_MAX_CANDLE_GAP: usize = 40;
-const PRICE_AXIS_TARGET_LABEL_SPACING: f32 = 44.0;
-const PRICE_AXIS_MIN_LABEL_SPACING: f32 = 28.0;
+const PRICE_AXIS_TARGET_LABEL_SPACING: LogicalPx = px(44.0);
+const PRICE_AXIS_MIN_LABEL_SPACING: LogicalPx = px(28.0);
 const MAX_PRICE_AXIS_TARGET_INTERVALS: f64 = 16.0;
 const MAX_PRICE_AXIS_TICKS: usize = 24;
-const TEXT_ROW_INSET: f32 = 4.0;
-const FIRST_TEXT_ROW_TOP: f32 = TEXT_ROW_INSET;
-const READOUT_LEGEND_GAP: f32 = 2.0;
-const MAIN_LEGEND_TOP: f32 = FIRST_TEXT_ROW_TOP + TEXT_ROW_HEIGHT + READOUT_LEGEND_GAP;
+const TEXT_ROW_INSET: LogicalPx = px(4.0);
+const FIRST_TEXT_ROW_TOP: LogicalPx = TEXT_ROW_INSET;
+const READOUT_LEGEND_GAP: LogicalPx = px(2.0);
+const MAIN_LEGEND_TOP: LogicalPx =
+    px(TEXT_ROW_INSET.value() + TEXT_ROW_HEIGHT.value() + READOUT_LEGEND_GAP.value());
 const VOLUME_HEADROOM: f64 = 1.08;
-const SUB_PLOT_COMPACT_HEIGHT: f32 = 5.0 * TEXT_ROW_HEIGHT;
-const CROSSHAIR_TAG_HEIGHT: f32 = 20.0;
-const CROSSHAIR_TIME_TAG_WIDTH: f32 = 132.0;
-const DASH_LENGTH: f32 = 5.0;
-const DASH_GAP: f32 = 9.0;
-const LINE_WIDTH: f32 = 1.0;
-const LEGEND_ENTRY_GAP: f32 = 10.0;
+const SUB_PLOT_COMPACT_HEIGHT: LogicalPx = px(5.0 * TEXT_ROW_HEIGHT.value());
+const CROSSHAIR_TAG_HEIGHT: LogicalPx = px(20.0);
+const CROSSHAIR_TIME_TAG_WIDTH: LogicalPx = px(132.0);
+const DASH_LENGTH: LogicalPx = px(5.0);
+const DASH_GAP: LogicalPx = px(9.0);
+const LINE_WIDTH: LogicalPx = px(1.0);
+const LEGEND_ENTRY_GAP: LogicalPx = px(10.0);
 
 pub(crate) struct ChartFrame<'a> {
     pub snapshot: &'a CandlestickSeriesSnapshot,
@@ -107,7 +108,7 @@ impl ChartPalette {
 
 pub(crate) struct ChartCanvas {
     node: Option<NodeId>,
-    bounds: Option<Rect>,
+    bounds: Option<LogicalRect>,
     layout: Option<ChartLayout>,
     painted: Option<PaintedCanvas>,
     text: ChartTextCache,
@@ -137,10 +138,10 @@ impl PaintedCanvas {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaintedKey {
-    bounds: Rect,
-    candle_width: f32,
+    bounds: LogicalRect,
+    candle_width: LogicalPx,
     right_timestamp: Option<i64>,
-    cursor: Option<Point>,
+    cursor: Option<LogicalPoint>,
     interval: TimeFrame,
     zone: UtcOffset,
     panel_open: bool,
@@ -177,7 +178,7 @@ impl ChartCanvas {
         self.node
     }
 
-    pub(crate) fn bounds(&self) -> Option<Rect> {
+    pub(crate) fn bounds(&self) -> Option<LogicalRect> {
         self.bounds
     }
 
@@ -186,7 +187,7 @@ impl ChartCanvas {
     }
 
     #[cfg(test)]
-    pub(crate) fn layout_width(&self) -> Option<f32> {
+    pub(crate) fn layout_width(&self) -> Option<LogicalPx> {
         self.layout
             .as_ref()
             .map(|layout| layout.price_plot.size.width)
@@ -206,7 +207,7 @@ impl ChartCanvas {
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
         let label = t_smol!(translate, "widget.candlestick.chart");
-        let node = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let node = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(SELECTOR)
             .style(
                 StyleBuilder::new()
@@ -376,7 +377,7 @@ impl ChartCanvas {
         translate: &Translate,
         display: Option<&DisplaySnapshot>,
         frame: &ChartFrame<'_>,
-        bounds: Rect,
+        bounds: LogicalRect,
         colors: ChartPalette,
     ) -> Result<(Canvas, Vec<GeometryId>), EngineError> {
         self.text.drop_stale();
@@ -425,20 +426,20 @@ struct PreparedAxisTick {
 }
 
 struct PreparedTimeTick {
-    x: f32,
+    x: LogicalPx,
     label: SmolStr,
 }
 
 struct PreparedLatestPrice {
-    y: f32,
+    y: LogicalPx,
     label: SmolStr,
     is_up: bool,
 }
 
 struct PreparedCandle {
-    wick: Rect,
-    body: Rect,
-    volume: Option<Rect>,
+    wick: LogicalRect,
+    body: LogicalRect,
+    volume: Option<LogicalRect>,
     is_up: bool,
 }
 
@@ -463,7 +464,7 @@ fn resolve_chart_layout(
     app: &mut App,
     text: &mut ChartTextCache,
     frame: &ChartFrame<'_>,
-    bounds: Rect,
+    bounds: LogicalRect,
     colors: ChartPalette,
     series: &[IndicatorSeries],
     sub_plot_ids: &[IndicatorId],
@@ -471,7 +472,7 @@ fn resolve_chart_layout(
     let provisional = ChartLayout::new(
         bounds,
         LayoutInputs {
-            longest_label_width: 0.0,
+            longest_label_width: LogicalPx::ZERO,
             sub_plot_count: sub_plot_ids.len(),
         },
     );
@@ -493,8 +494,8 @@ fn resolve_chart_layout(
     )
     .into_iter()
     .map(|label| text.width(app, &label, &style))
-    .fold(0.0_f32, f32::max);
-    let countdown_width = latest.map_or(0.0, |_| {
+    .fold(LogicalPx::ZERO, LogicalPx::max);
+    let countdown_width = latest.map_or(LogicalPx::ZERO, |_| {
         text.width(app, maximum_countdown_label(frame.interval), &style)
     });
     ChartLayout::new(
@@ -511,7 +512,7 @@ fn axis_label_candidates(
     range: std::ops::Range<usize>,
     latest_price: Option<Price>,
     price_tick: Tick,
-    price_plot_height: f32,
+    price_plot_height: LogicalPx,
     main_series: &[IndicatorSeries],
     sub_plot_ids: &[IndicatorId],
 ) -> Vec<SmolStr> {
@@ -594,12 +595,12 @@ fn axis_label_candidates(
     labels
 }
 
-fn axis_text_width(axis_width: f32, inset: f32) -> f32 {
-    (axis_width - inset).max(0.0)
+fn axis_text_width(axis_width: LogicalPx, inset: LogicalPx) -> LogicalPx {
+    (axis_width - inset).max(LogicalPx::ZERO)
 }
 
-fn axis_label_clip(axis: Rect) -> Rect {
-    Rect::new(
+fn axis_label_clip(axis: LogicalRect) -> LogicalRect {
+    LogicalRect::new(
         axis.origin.x,
         axis.origin.y,
         axis_text_width(axis.size.width, AXIS_TICK_TEXT_INSET),
@@ -689,7 +690,7 @@ fn prepare_visible_chart(
             label: format_price(value, price_tick),
         })
         .collect::<Vec<_>>();
-    let label_stride = ((70.0 / frame.viewport.candle_width).ceil() as usize).max(1);
+    let label_stride = ((px(70.0) / frame.viewport.candle_width).ceil() as usize).max(1);
     let first_tick = range.start.div_ceil(label_stride) * label_stride;
     let time_ticks = (first_tick..range.end)
         .step_by(label_stride)
@@ -851,7 +852,7 @@ fn sub_plot_legend(
 }
 
 fn readout_candle_index(
-    cursor: Option<Point>,
+    cursor: Option<LogicalPoint>,
     layout: &ChartLayout,
     visible: &VisibleChart,
 ) -> usize {
@@ -966,22 +967,29 @@ fn volume_upper_bound(candles: &[ListingCandlestick]) -> f64 {
     }
 }
 
-fn price_axis_values(lowest: f64, highest: f64, plot_height: f32, price_tick: Tick) -> Vec<f64> {
+fn price_axis_values(
+    lowest: f64,
+    highest: f64,
+    plot_height: LogicalPx,
+    price_tick: Tick,
+) -> Vec<f64> {
     let range = highest - lowest;
     if !range.is_finite() || range <= 0.0 {
         return vec![lowest];
     }
 
-    let plot_height = f64::from(plot_height.max(0.0));
-    if plot_height < f64::from(PRICE_AXIS_MIN_LABEL_SPACING) {
+    let plot_height = plot_height.max(LogicalPx::ZERO).value();
+    if plot_height < PRICE_AXIS_MIN_LABEL_SPACING.value() {
         return vec![(lowest + highest) / 2.0];
     }
 
-    let target_intervals = (plot_height / f64::from(PRICE_AXIS_TARGET_LABEL_SPACING))
+    let plot_height = f64::from(plot_height);
+    let target_intervals = (plot_height / f64::from(PRICE_AXIS_TARGET_LABEL_SPACING.value()))
         .round()
         .clamp(1.0, MAX_PRICE_AXIS_TARGET_INTERVALS);
     let preferred_step = nearest_nice_step(range / target_intervals);
-    let minimum_step = nice_step(range * f64::from(PRICE_AXIS_MIN_LABEL_SPACING) / plot_height);
+    let minimum_step =
+        nice_step(range * f64::from(PRICE_AXIS_MIN_LABEL_SPACING.value()) / plot_height);
     let step = align_step_to_price_tick(preferred_step.max(minimum_step), price_tick);
     let first = (lowest / step).ceil() * step;
     let mut values = Vec::with_capacity(MAX_PRICE_AXIS_TICKS);
@@ -1102,7 +1110,7 @@ fn sub_value_range(series: &IndicatorSeries, range: std::ops::Range<usize>) -> V
     }
 }
 
-fn sub_axis_values(id: IndicatorId, value_range: ValueRange, plot_height: f32) -> Vec<f64> {
+fn sub_axis_values(id: IndicatorId, value_range: ValueRange, plot_height: LogicalPx) -> Vec<f64> {
     let compact = plot_height < SUB_PLOT_COMPACT_HEIGHT;
     match id {
         IndicatorId::Vol => volume_axis_values(value_range.highest),
@@ -1141,7 +1149,7 @@ struct SubPlotAxis {
 fn sub_plot_axis(
     id: IndicatorId,
     value_range: ValueRange,
-    plot_height: f32,
+    plot_height: LogicalPx,
     guides: &[f64],
 ) -> SubPlotAxis {
     let labels = sub_axis_values(id, value_range, plot_height);
@@ -1213,14 +1221,14 @@ fn format_percentage_value(value: f64) -> SmolStr {
     }
 }
 
-fn y_for_sub_value(value: f64, value_range: ValueRange, plot: Rect) -> f32 {
+fn y_for_sub_value(value: f64, value_range: ValueRange, plot: LogicalRect) -> LogicalPx {
     let span = (value_range.highest - value_range.lowest).max(f64::MIN_POSITIVE);
     let ratio = ((value_range.highest - value) / span).clamp(0.0, 1.0);
     plot.origin.y + plot.size.height * ratio as f32
 }
 
-fn sub_value_from_y(y: f32, value_range: ValueRange, plot: Rect) -> f64 {
-    let ratio = if plot.size.height > 0.0 {
+fn sub_value_from_y(y: LogicalPx, value_range: ValueRange, plot: LogicalRect) -> f64 {
+    let ratio = if plot.size.height > px(0.0) {
         f64::from((y - plot.origin.y) / plot.size.height)
     } else {
         0.0
@@ -1230,14 +1238,14 @@ fn sub_value_from_y(y: f32, value_range: ValueRange, plot: Rect) -> f64 {
 
 fn candle_wick_bounds(
     prices: CandlePrices,
-    center_x: f32,
+    center_x: LogicalPx,
     lowest: f64,
     highest: f64,
-    plot: Rect,
-) -> Rect {
+    plot: LogicalRect,
+) -> LogicalRect {
     let high_y = y_for_price(prices.high().inner() as f64, lowest, highest, plot);
     let low_y = y_for_price(prices.low().inner() as f64, lowest, highest, plot);
-    Rect::new(
+    LogicalRect::new(
         center_x - LINE_WIDTH / 2.0,
         high_y,
         LINE_WIDTH,
@@ -1247,40 +1255,40 @@ fn candle_wick_bounds(
 
 fn candle_body_bounds(
     prices: CandlePrices,
-    center_x: f32,
-    body_width: f32,
+    center_x: LogicalPx,
+    body_width: LogicalPx,
     lowest: f64,
     highest: f64,
-    plot: Rect,
-) -> Rect {
+    plot: LogicalRect,
+) -> LogicalRect {
     let open_y = y_for_price(prices.open().inner() as f64, lowest, highest, plot);
     let close_y = y_for_price(prices.close().inner() as f64, lowest, highest, plot);
-    Rect::new(
+    LogicalRect::new(
         center_x - body_width / 2.0,
         open_y.min(close_y),
         body_width,
-        (close_y - open_y).abs().max(1.0),
+        (close_y - open_y).abs().max(px(1.0)),
     )
 }
 
 fn candle_volume_bounds(
     candle: &ListingCandlestick,
-    center_x: f32,
-    body_width: f32,
+    center_x: LogicalPx,
+    body_width: LogicalPx,
     upper: f64,
-    plot: Option<Rect>,
-) -> Option<Rect> {
+    plot: Option<LogicalRect>,
+) -> Option<LogicalRect> {
     let plot = plot?;
     let quantity = candle.traded_quantity.as_ref()?;
     if quantity.value.is_zero() {
         return None;
     }
     let top = y_for_volume(quantity.value.inner() as f64, upper, plot);
-    Some(Rect::new(
+    Some(LogicalRect::new(
         center_x - body_width / 2.0,
         top,
         body_width,
-        (plot.max().y - top).max(1.0),
+        (plot.max().y - top).max(px(1.0)),
     ))
 }
 
@@ -1324,55 +1332,65 @@ fn asset_label(
         )
 }
 
-fn for_each_horizontal_dash(y: f32, plot: Rect, mut f: impl FnMut(Rect)) {
+fn for_each_horizontal_dash(y: LogicalPx, plot: LogicalRect, mut f: impl FnMut(LogicalRect)) {
     let right = plot.max().x;
     let mut x = plot.origin.x;
     while x < right {
-        f(Rect::new(x, y, DASH_LENGTH.min(right - x), LINE_WIDTH));
+        f(LogicalRect::new(
+            x,
+            y,
+            DASH_LENGTH.min(right - x),
+            LINE_WIDTH,
+        ));
         x += DASH_GAP;
     }
 }
 
-fn for_each_vertical_dash(x: f32, plot: Rect, mut f: impl FnMut(Rect)) {
+fn for_each_vertical_dash(x: LogicalPx, plot: LogicalRect, mut f: impl FnMut(LogicalRect)) {
     let bottom = plot.max().y;
     let mut y = plot.origin.y;
     while y < bottom {
-        f(Rect::new(x, y, LINE_WIDTH, DASH_LENGTH.min(bottom - y)));
+        f(LogicalRect::new(
+            x,
+            y,
+            LINE_WIDTH,
+            DASH_LENGTH.min(bottom - y),
+        ));
         y += DASH_GAP;
     }
 }
 
-fn readout_bounds(price_plot: Rect) -> Rect {
+fn readout_bounds(price_plot: LogicalRect) -> LogicalRect {
     let top = FIRST_TEXT_ROW_TOP;
-    Rect::new(
+    LogicalRect::new(
         price_plot.origin.x + TEXT_ROW_INSET,
         price_plot.origin.y + top,
-        (price_plot.size.width - TEXT_ROW_INSET * 2.0).max(0.0),
-        (price_plot.size.height - top - TEXT_ROW_INSET).clamp(0.0, TEXT_ROW_HEIGHT),
+        (price_plot.size.width - TEXT_ROW_INSET * 2.0).max(px(0.0)),
+        (price_plot.size.height - top - TEXT_ROW_INSET).clamp(px(0.0), TEXT_ROW_HEIGHT),
     )
 }
 
-fn y_for_price(price: f64, lowest: f64, highest: f64, plot: Rect) -> f32 {
+fn y_for_price(price: f64, lowest: f64, highest: f64, plot: LogicalRect) -> LogicalPx {
     let ratio = ((highest - price) / (highest - lowest).max(1.0)).clamp(0.0, 1.0);
     plot.origin.y + plot.size.height * ratio as f32
 }
 
-fn price_for_y(y: f32, lowest: f64, highest: f64, plot: Rect) -> f64 {
+fn price_for_y(y: LogicalPx, lowest: f64, highest: f64, plot: LogicalRect) -> f64 {
     let ratio = f64::from((y - plot.origin.y) / plot.size.height);
     highest - (highest - lowest) * ratio.clamp(0.0, 1.0)
 }
 
-fn y_for_volume(volume: f64, upper: f64, plot: Rect) -> f32 {
+fn y_for_volume(volume: f64, upper: f64, plot: LogicalRect) -> LogicalPx {
     let ratio = (volume / upper.max(1.0)).clamp(0.0, 1.0);
     plot.max().y - plot.size.height * ratio as f32
 }
 
-fn volume_for_y(y: f32, upper: f64, plot: Rect) -> f64 {
+fn volume_for_y(y: LogicalPx, upper: f64, plot: LogicalRect) -> f64 {
     let ratio = f64::from((plot.max().y - y) / plot.size.height);
     upper * ratio.clamp(0.0, 1.0)
 }
 
-fn axis_label_y(y: f32, axis: Rect) -> f32 {
+fn axis_label_y(y: LogicalPx, axis: LogicalRect) -> LogicalPx {
     let label_height = TEXT_ROW_HEIGHT.min(axis.size.height);
     (y - label_height / 2.0)
         .max(axis.origin.y)
@@ -1422,7 +1440,7 @@ fn nearest_nice_step(raw_step: f64) -> f64 {
 struct LineMesh {
     vertex_bytes: Vec<u8>,
     index_bytes: Vec<u8>,
-    bounds: Rect,
+    bounds: LogicalRect,
 }
 
 impl LineMesh {
@@ -1430,7 +1448,7 @@ impl LineMesh {
         values: &[Option<f64>],
         range: std::ops::Range<usize>,
         geometry: CandleGeometry,
-        y_for: impl Fn(f64) -> f32,
+        y_for: impl Fn(f64) -> LogicalPx,
     ) -> Option<Self> {
         debug_assert!(range.start <= range.end);
         debug_assert!(
@@ -1440,7 +1458,7 @@ impl LineMesh {
         );
 
         let mut mesh = MeshBuilder::default();
-        let mut previous: Option<(Point, bool)> = None;
+        let mut previous: Option<(LogicalPoint, bool)> = None;
         let first = range.start.saturating_sub(1);
         for (index, value) in values.iter().enumerate().take(range.end).skip(first) {
             let Some(value) = value else {
@@ -1452,7 +1470,7 @@ impl LineMesh {
             } else {
                 geometry.center_x(index - range.start)
             };
-            let point = Point::new(x, y_for(*value));
+            let point = LogicalPoint::new(x, y_for(*value));
             match previous {
                 Some((from, joined)) => {
                     if joined {
@@ -1473,16 +1491,18 @@ struct MeshBuilder {
     vertex_bytes: Vec<u8>,
     index_bytes: Vec<u8>,
     vertex_count: u32,
-    min: Point,
-    max: Point,
+    min: LogicalPoint,
+    max: LogicalPoint,
     any: bool,
 }
 
 impl MeshBuilder {
-    fn push_vertex(&mut self, point: Point) {
-        let Point { x, y } = point;
-        self.vertex_bytes.extend_from_slice(&x.to_le_bytes());
-        self.vertex_bytes.extend_from_slice(&y.to_le_bytes());
+    fn push_vertex(&mut self, point: LogicalPoint) {
+        let LogicalPoint { x, y } = point;
+        self.vertex_bytes
+            .extend_from_slice(&f32::from(x).to_le_bytes());
+        self.vertex_bytes
+            .extend_from_slice(&f32::from(y).to_le_bytes());
         self.vertex_bytes
             .extend_from_slice(&(-1.0_f32).to_le_bytes());
         if self.any {
@@ -1504,32 +1524,32 @@ impl MeshBuilder {
         }
     }
 
-    fn push_segment(&mut self, from: Point, to: Point) {
-        let dx = to.x - from.x;
-        let dy = to.y - from.y;
+    fn push_segment(&mut self, from: LogicalPoint, to: LogicalPoint) {
+        let dx = f32::from(to.x - from.x);
+        let dy = f32::from(to.y - from.y);
         let length = (dx * dx + dy * dy).sqrt();
         if length <= f32::EPSILON {
             return;
         }
-        let half = LINE_WIDTH / 2.0;
+        let half = (LINE_WIDTH / 2.0).value();
         let nx = -dy / length * half;
         let ny = dx / length * half;
         let base = self.vertex_count;
-        self.push_vertex(Point::new(from.x + nx, from.y + ny));
-        self.push_vertex(Point::new(from.x - nx, from.y - ny));
-        self.push_vertex(Point::new(to.x + nx, to.y + ny));
-        self.push_vertex(Point::new(to.x - nx, to.y - ny));
+        self.push_vertex(LogicalPoint::new(from.x + nx, from.y + ny));
+        self.push_vertex(LogicalPoint::new(from.x - nx, from.y - ny));
+        self.push_vertex(LogicalPoint::new(to.x + nx, to.y + ny));
+        self.push_vertex(LogicalPoint::new(to.x - nx, to.y - ny));
         self.push_triangle([base, base + 1, base + 2]);
         self.push_triangle([base + 2, base + 1, base + 3]);
     }
 
-    fn push_join(&mut self, at: Point) {
+    fn push_join(&mut self, at: LogicalPoint) {
         let half = LINE_WIDTH / 2.0;
         let base = self.vertex_count;
-        self.push_vertex(Point::new(at.x - half, at.y - half));
-        self.push_vertex(Point::new(at.x + half, at.y - half));
-        self.push_vertex(Point::new(at.x - half, at.y + half));
-        self.push_vertex(Point::new(at.x + half, at.y + half));
+        self.push_vertex(LogicalPoint::new(at.x - half, at.y - half));
+        self.push_vertex(LogicalPoint::new(at.x + half, at.y - half));
+        self.push_vertex(LogicalPoint::new(at.x - half, at.y + half));
+        self.push_vertex(LogicalPoint::new(at.x + half, at.y + half));
         self.push_triangle([base, base + 1, base + 2]);
         self.push_triangle([base + 2, base + 1, base + 3]);
     }
@@ -1541,9 +1561,9 @@ impl MeshBuilder {
         Some(LineMesh {
             vertex_bytes: self.vertex_bytes,
             index_bytes: self.index_bytes,
-            bounds: Rect::from_origin_size(
+            bounds: LogicalRect::from_origin_size(
                 self.min,
-                Size::new(self.max.x - self.min.x, self.max.y - self.min.y),
+                LogicalSize::new(self.max.x - self.min.x, self.max.y - self.min.y),
             ),
         })
     }
@@ -1560,7 +1580,7 @@ struct ChartPainter<'a, 'frame> {
     visible: Option<&'a VisibleChart>,
     series: &'a [IndicatorSeries],
     colors: ChartPalette,
-    bounds: Rect,
+    bounds: LogicalRect,
     canvas: Canvas,
     geometry: Vec<GeometryId>,
     price_tick: Tick,
@@ -1573,10 +1593,10 @@ impl ChartPainter<'_, '_> {
         let data_bounds = layout.data_bounds();
         let _ = self.canvas.push_clip(ClipRect {
             rect: self.bounds,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         self.push_quad(
-            Rect::new(
+            LogicalRect::new(
                 layout.price_plot.max().x,
                 layout.price_plot.origin.y,
                 LINE_WIDTH,
@@ -1588,7 +1608,7 @@ impl ChartPainter<'_, '_> {
             self.push_quad(*separator, grid);
         }
         self.push_quad(
-            Rect::new(
+            LogicalRect::new(
                 data_bounds.origin.x,
                 data_bounds.max().y,
                 data_bounds.size.width,
@@ -1679,15 +1699,15 @@ impl ChartPainter<'_, '_> {
         style_of(AXIS_FONT_SIZE, color)
     }
 
-    fn push_quad(&mut self, bounds: Rect, fill: Color) {
+    fn push_quad(&mut self, bounds: LogicalRect, fill: Color) {
         self.canvas.push_quad(Quad {
             bounds,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid { fill, border: None },
         });
     }
 
-    fn push_text(&mut self, text: &str, style: &TextStyle, origin: Point) -> bool {
+    fn push_text(&mut self, text: &str, style: &TextStyle, origin: LogicalPoint) -> bool {
         if text.is_empty() {
             return true;
         }
@@ -1699,22 +1719,22 @@ impl ChartPainter<'_, '_> {
         &mut self,
         text: &str,
         style: &TextStyle,
-        center_x: f32,
-        top: f32,
+        center_x: LogicalPx,
+        top: LogicalPx,
     ) -> bool {
         if text.is_empty() {
             return true;
         }
         let line = self.text.line(self.app, text, style);
-        let origin = Point::new(center_x - line.size().width / 2.0, top);
+        let origin = LogicalPoint::new(center_x - line.size().width / 2.0, top);
         self.canvas.push_shaped_text(&line, origin)
     }
 
-    fn push_dashed_horizontal(&mut self, y: f32, plot: Rect, color: Color) {
+    fn push_dashed_horizontal(&mut self, y: LogicalPx, plot: LogicalRect, color: Color) {
         for_each_horizontal_dash(y, plot, |bounds| self.push_quad(bounds, color));
     }
 
-    fn push_dashed_vertical(&mut self, x: f32, plot: Rect, color: Color) {
+    fn push_dashed_vertical(&mut self, x: LogicalPx, plot: LogicalRect, color: Color) {
         for_each_vertical_dash(x, plot, |bounds| self.push_quad(bounds, color));
     }
 
@@ -1722,7 +1742,7 @@ impl ChartPainter<'_, '_> {
         &mut self,
         mesh: LineMesh,
         fill: Color,
-        clip: Rect,
+        clip: LogicalRect,
     ) -> Result<(), EngineError> {
         let id = self.app.geometry_mut().insert(GeometryDesc {
             vertex_bytes: mesh.vertex_bytes.into(),
@@ -1735,7 +1755,7 @@ impl ChartPainter<'_, '_> {
         })?;
         let _ = self.canvas.push_clip(ClipRect {
             rect: clip,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         self.canvas.push_path(Path {
             bounds: mesh.bounds,
@@ -1771,13 +1791,13 @@ impl ChartPainter<'_, '_> {
         Ok(())
     }
 
-    fn paint_legend(&mut self, entries: &[LegendEntry], plot: Rect, top: f32) {
+    fn paint_legend(&mut self, entries: &[LegendEntry], plot: LogicalRect, top: LogicalPx) {
         let mut x = plot.origin.x + TEXT_ROW_INSET;
         let y = plot.origin.y + top;
         let right = plot.max().x;
         let _ = self.canvas.push_clip(ClipRect {
             rect: plot,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         for entry in entries {
             if x >= right {
@@ -1786,13 +1806,13 @@ impl ChartPainter<'_, '_> {
             let style = self.label_style(entry.color);
             let line = self.text.line(self.app, &entry.text, &style);
             let width = line.size().width;
-            let _ = self.canvas.push_shaped_text(&line, Point::new(x, y));
+            let _ = self.canvas.push_shaped_text(&line, LogicalPoint::new(x, y));
             x += width + LEGEND_ENTRY_GAP;
         }
         let _ = self.canvas.pop_clip();
     }
 
-    fn paint_legend_rows(&mut self, rows: &[Vec<LegendEntry>], plot: Rect, top: f32) {
+    fn paint_legend_rows(&mut self, rows: &[Vec<LegendEntry>], plot: LogicalRect, top: LogicalPx) {
         let mut row_top = top;
         for entries in rows {
             if entries.is_empty() {
@@ -1814,7 +1834,7 @@ impl ChartPainter<'_, '_> {
                 layout.price_plot,
             );
             self.push_quad(
-                Rect::new(
+                LogicalRect::new(
                     layout.price_plot.origin.x,
                     y,
                     layout.price_plot.size.width,
@@ -1827,7 +1847,7 @@ impl ChartPainter<'_, '_> {
         let clip = axis_label_clip(layout.price_axis);
         let _ = self.canvas.push_clip(ClipRect {
             rect: clip,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         for tick in &visible.price_ticks {
             let y = y_for_price(
@@ -1836,8 +1856,8 @@ impl ChartPainter<'_, '_> {
                 visible.highest,
                 layout.price_plot,
             );
-            let origin = Point::new(
-                layout.price_axis.origin.x + 7.0,
+            let origin = LogicalPoint::new(
+                layout.price_axis.origin.x + px(7.0),
                 axis_label_y(y, layout.price_axis),
             );
             let _ = self.push_text(&tick.label, &style, origin);
@@ -1851,7 +1871,7 @@ impl ChartPainter<'_, '_> {
         let data_bounds = layout.data_bounds();
         for tick in &visible.time_ticks {
             self.push_quad(
-                Rect::new(
+                LogicalRect::new(
                     tick.x,
                     data_bounds.origin.y,
                     LINE_WIDTH,
@@ -1863,14 +1883,14 @@ impl ChartPainter<'_, '_> {
         let style = self.label_style(self.colors.chart.axis);
         let _ = self.canvas.push_clip(ClipRect {
             rect: layout.time_axis,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         for tick in &visible.time_ticks {
             let _ = self.push_centered_text(
                 &tick.label,
                 &style,
                 tick.x,
-                layout.time_axis.origin.y + 6.0,
+                layout.time_axis.origin.y + px(6.0),
             );
         }
         let _ = self.canvas.pop_clip();
@@ -1896,7 +1916,7 @@ impl ChartPainter<'_, '_> {
         for value in axis.grid {
             let y = y_for_sub_value(value, value_range, plot);
             self.push_quad(
-                Rect::new(plot.origin.x, y, plot.size.width, LINE_WIDTH),
+                LogicalRect::new(plot.origin.x, y, plot.size.width, LINE_WIDTH),
                 grid,
             );
         }
@@ -1904,7 +1924,7 @@ impl ChartPainter<'_, '_> {
         let clip = axis_label_clip(sub_plot.axis);
         let _ = self.canvas.push_clip(ClipRect {
             rect: clip,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         for value in axis.labels {
             let y = y_for_sub_value(value, value_range, plot);
@@ -1913,7 +1933,10 @@ impl ChartPainter<'_, '_> {
                 IndicatorId::Macd => format_signed_price(value, self.price_tick),
                 _ => format_percentage_tick(value),
             };
-            let origin = Point::new(sub_plot.axis.origin.x + 7.0, axis_label_y(y, sub_plot.axis));
+            let origin = LogicalPoint::new(
+                sub_plot.axis.origin.x + px(7.0),
+                axis_label_y(y, sub_plot.axis),
+            );
             let _ = self.push_text(&label, &style, origin);
         }
         let _ = self.canvas.pop_clip();
@@ -1925,7 +1948,7 @@ impl ChartPainter<'_, '_> {
             let y = y_for_sub_value(guide.value, value_range, plot);
             if guide.solid {
                 self.push_quad(
-                    Rect::new(plot.origin.x, y, plot.size.width, LINE_WIDTH),
+                    LogicalRect::new(plot.origin.x, y, plot.size.width, LINE_WIDTH),
                     grid,
                 );
             } else {
@@ -1938,7 +1961,7 @@ impl ChartPainter<'_, '_> {
         let zero_y = y_for_sub_value(0.0, value_range, plot);
         let _ = self.canvas.push_clip(ClipRect {
             rect: plot,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         for line in &series.lines {
             if line.shape != LineShape::Histogram {
@@ -1950,10 +1973,10 @@ impl ChartPainter<'_, '_> {
                 };
                 let value_y = y_for_sub_value(value, value_range, plot);
                 let top = value_y.min(zero_y);
-                let height = (value_y - zero_y).abs().max(1.0);
+                let height = (value_y - zero_y).abs().max(px(1.0));
                 let x = visible.geometry.center_x(slot) - body_width / 2.0;
                 let color = histogram_bar_color(value, hovered_slot == Some(slot), bars);
-                self.push_quad(Rect::new(x, top, body_width, height), color);
+                self.push_quad(LogicalRect::new(x, top, body_width, height), color);
             }
         }
         let _ = self.canvas.pop_clip();
@@ -1982,7 +2005,7 @@ impl ChartPainter<'_, '_> {
         let bars = BarColors::of(self.colors);
         let _ = self.canvas.push_clip(ClipRect {
             rect: layout.data_bounds(),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         for (index, candle) in visible.candles.iter().enumerate() {
             let color = if candle.is_up { bullish } else { bearish };
@@ -1995,7 +2018,7 @@ impl ChartPainter<'_, '_> {
         let _ = self.canvas.pop_clip();
         let _ = self.canvas.push_clip(ClipRect {
             rect: layout.price_plot,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         for candle in &visible.candles {
             let color = if candle.is_up { bullish } else { bearish };
@@ -2018,19 +2041,19 @@ impl ChartPainter<'_, '_> {
     fn paint_latest_price_axis_tag(&mut self, latest: &PreparedLatestPrice, background: Color) {
         let axis = self.layout.price_axis;
         let tag_height = LATEST_PRICE_TAG_HEIGHT.min(axis.size.height);
-        if tag_height <= 0.0 {
+        if tag_height <= LogicalPx::ZERO {
             return;
         }
         let tag_y = (latest.y - LATEST_PRICE_TAG_PRICE_HEIGHT / 2.0)
             .max(axis.origin.y)
             .min(axis.max().y - tag_height);
         self.push_quad(
-            Rect::new(axis.origin.x, tag_y, axis.size.width, tag_height),
+            LogicalRect::new(axis.origin.x, tag_y, axis.size.width, tag_height),
             background,
         );
 
         let style = self.label_style(self.colors.tag_foreground);
-        let clip = Rect::new(
+        let clip = LogicalRect::new(
             axis.origin.x,
             tag_y,
             axis_text_width(axis.size.width, AXIS_TAG_TEXT_INSET),
@@ -2038,15 +2061,15 @@ impl ChartPainter<'_, '_> {
         );
         let _ = self.canvas.push_clip(ClipRect {
             rect: clip,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
-        if tag_height < 34.0 {
+        if tag_height < px(34.0) {
             let _ = self.push_text(
                 &latest.label,
                 &style,
-                Point::new(
-                    axis.origin.x + 5.0,
-                    tag_y + (tag_height - TEXT_ROW_HEIGHT).max(0.0) / 2.0,
+                LogicalPoint::new(
+                    axis.origin.x + px(5.0),
+                    tag_y + (tag_height - TEXT_ROW_HEIGHT).max(LogicalPx::ZERO) / 2.0,
                 ),
             );
             let _ = self.canvas.pop_clip();
@@ -2055,17 +2078,20 @@ impl ChartPainter<'_, '_> {
         let _ = self.push_text(
             &latest.label,
             &style,
-            Point::new(axis.origin.x + 5.0, tag_y + 3.0),
+            LogicalPoint::new(axis.origin.x + px(5.0), tag_y + px(3.0)),
         );
         let _ = self.push_text(
             self.frame.countdown_label,
             &style,
-            Point::new(axis.origin.x + 5.0, tag_y + LATEST_PRICE_TAG_PRICE_HEIGHT),
+            LogicalPoint::new(
+                axis.origin.x + px(5.0),
+                tag_y + LATEST_PRICE_TAG_PRICE_HEIGHT,
+            ),
         );
         let _ = self.canvas.pop_clip();
     }
 
-    fn paint_crosshair(&mut self, cursor: Point, visible: &VisibleChart, time_label: &str) {
+    fn paint_crosshair(&mut self, cursor: LogicalPoint, visible: &VisibleChart, time_label: &str) {
         let layout = self.layout;
         let Some(slot) = visible.geometry.slot_at(cursor.x) else {
             return;
@@ -2117,38 +2143,38 @@ impl ChartPainter<'_, '_> {
             .max(time_axis.origin.x)
             .min(time_axis.max().x - tag_width);
         self.push_quad(
-            Rect::new(tag_x, time_axis.origin.y, tag_width, time_axis.size.height),
+            LogicalRect::new(tag_x, time_axis.origin.y, tag_width, time_axis.size.height),
             self.colors.tag_background,
         );
         let style = self.label_style(self.colors.tag_foreground);
-        let clip = Rect::new(tag_x, time_axis.origin.y, tag_width, time_axis.size.height);
+        let clip = LogicalRect::new(tag_x, time_axis.origin.y, tag_width, time_axis.size.height);
         let _ = self.canvas.push_clip(ClipRect {
             rect: clip,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         let _ = self.push_centered_text(
             time_label,
             &style,
             tag_x + tag_width / 2.0,
-            time_axis.origin.y + 6.0,
+            time_axis.origin.y + px(6.0),
         );
         let _ = self.canvas.pop_clip();
     }
 
-    fn paint_axis_tag(&mut self, y: f32, label: &str, axis: Rect) {
+    fn paint_axis_tag(&mut self, y: LogicalPx, label: &str, axis: LogicalRect) {
         let tag_height = CROSSHAIR_TAG_HEIGHT.min(axis.size.height);
-        if tag_height <= 0.0 {
+        if tag_height <= LogicalPx::ZERO {
             return;
         }
         let tag_y = (y - tag_height / 2.0)
             .max(axis.origin.y)
             .min(axis.max().y - tag_height);
         self.push_quad(
-            Rect::new(axis.origin.x, tag_y, axis.size.width, tag_height),
+            LogicalRect::new(axis.origin.x, tag_y, axis.size.width, tag_height),
             self.colors.tag_background,
         );
         let style = self.label_style(self.colors.tag_foreground);
-        let clip = Rect::new(
+        let clip = LogicalRect::new(
             axis.origin.x,
             tag_y,
             axis_text_width(axis.size.width, AXIS_TAG_TEXT_INSET),
@@ -2156,25 +2182,29 @@ impl ChartPainter<'_, '_> {
         );
         let _ = self.canvas.push_clip(ClipRect {
             rect: clip,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
-        let _ = self.push_text(label, &style, Point::new(axis.origin.x + 5.0, tag_y + 3.0));
+        let _ = self.push_text(
+            label,
+            &style,
+            LogicalPoint::new(axis.origin.x + px(5.0), tag_y + px(3.0)),
+        );
         let _ = self.canvas.pop_clip();
     }
 
-    fn paint_readout(&mut self, readout: &ReadoutPresentation, price_plot: Rect) {
+    fn paint_readout(&mut self, readout: &ReadoutPresentation, price_plot: LogicalRect) {
         let bounds = readout_bounds(price_plot);
         if bounds.size.is_empty() || readout.width <= 0.0 {
             return;
         }
         let _ = self.canvas.push_clip(ClipRect {
             rect: bounds,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         for run in readout.runs.iter() {
             let _ = self.canvas.push_shaped_text(
                 &run.handle,
-                Point::new(bounds.origin.x + run.x, bounds.origin.y),
+                LogicalPoint::new(bounds.origin.x + run.x, bounds.origin.y),
             );
         }
         let _ = self.canvas.pop_clip();
@@ -2204,7 +2234,7 @@ mod tests {
     use crate::indicator::IndicatorLine;
 
     const HARNESS_CANDLES: usize = 200;
-    const PAGE_SIZE: (f32, f32) = (640.0, 400.0);
+    const PAGE_SIZE: (LogicalPx, LogicalPx) = (px(640.0), px(400.0));
 
     fn market_price(value: Price) -> MarketPrice {
         MarketPrice {
@@ -2357,7 +2387,7 @@ mod tests {
             range,
             lowest: 0.0,
             highest: 100.0,
-            geometry: CandleGeometry::new(layout.price_plot, snapshot.candles().len(), 9.0),
+            geometry: CandleGeometry::new(layout.price_plot, snapshot.candles().len(), px(9.0)),
             candles: Vec::new(),
             price_ticks: Vec::new(),
             time_ticks: Vec::new(),
@@ -2381,7 +2411,7 @@ mod tests {
             Self::of_size(PAGE_SIZE)
         }
 
-        fn of_size((width, height): (f32, f32)) -> Self {
+        fn of_size((width, height): (LogicalPx, LogicalPx)) -> Self {
             let mut harness = WidgetTestApp::new();
             let page = harness.with_cx(|cx| {
                 let root = cx.tree().root();
@@ -2451,8 +2481,8 @@ mod tests {
     fn candle_bodies(
         primitives: &[CanvasPrimitive],
         colors: ChartPalette,
-        body_width: f32,
-    ) -> Vec<Rect> {
+        body_width: LogicalPx,
+    ) -> Vec<LogicalRect> {
         primitives
             .iter()
             .filter(|primitive| primitive.kind == PrimitiveKind::Quad)
@@ -2461,15 +2491,15 @@ mod tests {
                     || primitive.color == Some(colors.chart.bearish)
             })
             .filter_map(|primitive| primitive.bounds)
-            .filter(|bounds| (bounds.size.width - body_width).abs() < 0.01)
+            .filter(|bounds| (bounds.size.width - body_width).abs() < px(0.01))
             .collect()
     }
 
     fn full_strength_bars_in(
         primitives: &[CanvasPrimitive],
         colors: ChartPalette,
-        plot: Rect,
-    ) -> Vec<Rect> {
+        plot: LogicalRect,
+    ) -> Vec<LogicalRect> {
         primitives
             .iter()
             .filter(|primitive| primitive.kind == PrimitiveKind::Quad)
@@ -2662,7 +2692,7 @@ mod tests {
         let plot = layout.price_plot;
         let range = visible_range(snapshot.candles(), viewport, plot.size.width);
         let geometry = CandleGeometry::new(plot, range.len(), viewport.candle_width);
-        let cursor = Point::new(geometry.center_x(10), plot.origin.y + 20.0);
+        let cursor = LogicalPoint::new(geometry.center_x(10), plot.origin.y + 20.0);
         let hovered = frame_of(
             &snapshot,
             ChartViewport {
@@ -2774,9 +2804,9 @@ mod tests {
         let config = CandlestickIndicatorConfig::default();
         let sub_plot_ids = enabled_sub_plot_ids(&config);
         for (size, base_price) in [
-            ((640.0_f32, 400.0_f32), 100_u64),
-            ((640.0, 400.0), 1_234_567_u64),
-            ((420.0, 320.0), 123_456_u64),
+            ((px(640.0), px(400.0)), 100_u64),
+            ((px(640.0), px(400.0)), 1_234_567_u64),
+            ((px(420.0), px(320.0)), 123_456_u64),
         ] {
             let mut harness = Harness::of_size(size);
             let snapshot = snapshot_of((0..HARNESS_CANDLES).map(|index| {
@@ -2821,10 +2851,10 @@ mod tests {
                     .text
                     .width(harness.harness.app_mut(), &label, &style)
             })
-            .fold(0.0_f32, f32::max);
+            .fold(LogicalPx::ZERO, LogicalPx::max);
 
             assert!(
-                axis_width + 0.01 >= widest + AXIS_LABEL_HORIZONTAL_PADDING,
+                axis_width + px(0.01) >= widest + AXIS_LABEL_HORIZONTAL_PADDING,
                 "the {size:?} chart's axis is {axis_width} wide but the widest label it draws is {widest} wide"
             );
         }
@@ -2972,7 +3002,7 @@ mod tests {
         let range = visible_range(snapshot.candles(), viewport, plot.size.width);
         let body_width = CandleGeometry::new(plot, range.len(), viewport.candle_width).body_width();
         let bodies_before = candle_bodies(&harness.primitives(), colors, body_width);
-        let grid_before: Vec<f32> = harness
+        let grid_before: Vec<LogicalPx> = harness
             .primitives()
             .iter()
             .filter(|primitive| primitive.kind == PrimitiveKind::Quad)
@@ -2982,7 +3012,7 @@ mod tests {
             .map(|bounds| bounds.origin.x)
             .collect();
 
-        let stride = ((70.0_f32 / viewport.candle_width).ceil() as usize).max(1);
+        let stride = ((px(70.0) / viewport.candle_width).ceil() as usize).max(1);
         assert_eq!(
             HARNESS_CANDLES % stride,
             0,
@@ -3004,7 +3034,7 @@ mod tests {
         assert!(harness.harness.rendered());
 
         let bodies_after = candle_bodies(&harness.primitives(), colors, body_width);
-        let grid_after: Vec<f32> = harness
+        let grid_after: Vec<LogicalPx> = harness
             .primitives()
             .iter()
             .filter(|primitive| primitive.kind == PrimitiveKind::Quad)
@@ -3135,7 +3165,7 @@ mod tests {
         let geometry = CandleGeometry::new(plot, range.len(), viewport.candle_width);
         let slot = 10;
         let absolute = range.start + slot;
-        let cursor = Point::new(geometry.center_x(slot), plot.origin.y + 20.0);
+        let cursor = LogicalPoint::new(geometry.center_x(slot), plot.origin.y + 20.0);
 
         let hovered = frame_of(
             &snapshot,
@@ -3204,7 +3234,7 @@ mod tests {
         let geometry = CandleGeometry::new(plot, range.len(), viewport.candle_width);
         let slot = 6;
         let absolute = range.start + slot;
-        let cursor = Point::new(geometry.center_x(slot), plot.origin.y + 20.0);
+        let cursor = LogicalPoint::new(geometry.center_x(slot), plot.origin.y + 20.0);
 
         let hovered = frame_of(
             &snapshot,
@@ -3246,7 +3276,7 @@ mod tests {
         let range = visible_range(snapshot.candles(), viewport, plot.size.width);
         let geometry = CandleGeometry::new(plot, range.len(), viewport.candle_width);
         let slot = 12;
-        let cursor = Point::new(geometry.center_x(slot), plot.origin.y + 20.0);
+        let cursor = LogicalPoint::new(geometry.center_x(slot), plot.origin.y + 20.0);
         let hovered = frame_of(
             &snapshot,
             ChartViewport {
@@ -3291,7 +3321,7 @@ mod tests {
         let range = visible_range(snapshot.candles(), viewport, plot.size.width);
         let geometry = CandleGeometry::new(plot, range.len(), viewport.candle_width);
         let slot = 15;
-        let cursor = Point::new(geometry.center_x(slot), plot.origin.y + 20.0);
+        let cursor = LogicalPoint::new(geometry.center_x(slot), plot.origin.y + 20.0);
         let hovered = frame_of(
             &snapshot,
             ChartViewport {
@@ -3338,7 +3368,7 @@ mod tests {
         harness.paint(&frame);
 
         let axis = harness.layout().price_axis;
-        let cursor = Point::new(
+        let cursor = LogicalPoint::new(
             axis.origin.x + axis.size.width / 2.0,
             axis.origin.y + axis.size.height / 4.0,
         );
@@ -3386,7 +3416,7 @@ mod tests {
             "VOL, MACD and RSI each own a box"
         );
         assert_eq!(layout.separators.len(), layout.sub_plots.len());
-        let axis_clips: Vec<Rect> = layout
+        let axis_clips: Vec<LogicalRect> = layout
             .sub_plots
             .iter()
             .map(|sub_plot| axis_label_clip(sub_plot.axis))
@@ -3469,14 +3499,14 @@ mod tests {
         let (lowest, highest) = price_bounds(&candles, None);
         let volume_upper = volume_upper_bound(&candles);
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 240.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             LayoutInputs {
-                longest_label_width: 0.0,
+                longest_label_width: LogicalPx::ZERO,
                 sub_plot_count: 1,
             },
         );
         let volume_plot = layout.sub_plots[0].plot;
-        let geometry = CandleGeometry::new(layout.price_plot, candles.len(), 5.0);
+        let geometry = CandleGeometry::new(layout.price_plot, candles.len(), px(5.0));
         let body_width = geometry.body_width();
         let mut wick_and_volume_bounds = Vec::with_capacity(candles.len() * 2);
         let mut body_bounds = Vec::with_capacity(candles.len());
@@ -3547,26 +3577,26 @@ mod tests {
 
     #[test]
     fn dashed_segments_should_preserve_count_and_bounds() {
-        let plot = Rect::new(10.0, 20.0, 20.0, 20.0);
+        let plot = LogicalRect::new(px(10.0), px(20.0), px(20.0), px(20.0));
         let mut horizontal = Vec::with_capacity(3);
         let mut vertical = Vec::with_capacity(3);
-        for_each_horizontal_dash(25.0, plot, |bounds| horizontal.push(bounds));
-        for_each_vertical_dash(15.0, plot, |bounds| vertical.push(bounds));
+        for_each_horizontal_dash(px(25.0), plot, |bounds| horizontal.push(bounds));
+        for_each_vertical_dash(px(15.0), plot, |bounds| vertical.push(bounds));
 
         assert_eq!(
             horizontal,
             [
-                Rect::new(10.0, 25.0, 5.0, 1.0),
-                Rect::new(19.0, 25.0, 5.0, 1.0),
-                Rect::new(28.0, 25.0, 2.0, 1.0),
+                LogicalRect::new(px(10.0), px(25.0), px(5.0), px(1.0)),
+                LogicalRect::new(px(19.0), px(25.0), px(5.0), px(1.0)),
+                LogicalRect::new(px(28.0), px(25.0), px(2.0), px(1.0)),
             ]
         );
         assert_eq!(
             vertical,
             [
-                Rect::new(15.0, 20.0, 1.0, 5.0),
-                Rect::new(15.0, 29.0, 1.0, 5.0),
-                Rect::new(15.0, 38.0, 1.0, 2.0),
+                LogicalRect::new(px(15.0), px(20.0), px(1.0), px(5.0)),
+                LogicalRect::new(px(15.0), px(29.0), px(1.0), px(5.0)),
+                LogicalRect::new(px(15.0), px(38.0), px(1.0), px(2.0)),
             ]
         );
     }
@@ -3611,8 +3641,8 @@ mod tests {
     #[test]
     fn price_axis_values_should_add_labels_for_taller_plots() {
         let tick = Tick::from_inner(1).expect("price tick should be positive");
-        let short = price_axis_values(0.0, 1_000.0, 200.0, tick);
-        let tall = price_axis_values(0.0, 1_000.0, 480.0, tick);
+        let short = price_axis_values(0.0, 1_000.0, px(200.0), tick);
+        let tall = price_axis_values(0.0, 1_000.0, px(480.0), tick);
 
         assert!(tall.len() > short.len());
     }
@@ -3620,7 +3650,7 @@ mod tests {
     #[test]
     fn price_axis_values_should_use_compact_nice_steps_for_typical_height() {
         let tick = Tick::from_inner(1).expect("price tick should be positive");
-        let values = price_axis_values(0.0, 1_000.0, 360.0, tick);
+        let values = price_axis_values(0.0, 1_000.0, px(360.0), tick);
 
         assert_eq!(values[1] - values[0], 100.0);
     }
@@ -3628,12 +3658,12 @@ mod tests {
     #[test]
     fn price_axis_values_should_keep_minimum_label_spacing() {
         let tick = Tick::from_inner(1).expect("price tick should be positive");
-        let height = 360.0;
+        let height = px(360.0);
         let values = price_axis_values(0.0, 1_000.0, height, tick);
 
         assert!(values.windows(2).all(|pair| {
-            let spacing = (pair[1] - pair[0]) / 1_000.0 * f64::from(height);
-            spacing >= f64::from(PRICE_AXIS_MIN_LABEL_SPACING)
+            let spacing = (pair[1] - pair[0]) / 1_000.0 * f64::from(height.value());
+            spacing >= f64::from(PRICE_AXIS_MIN_LABEL_SPACING.value())
         }));
     }
 
@@ -3641,13 +3671,13 @@ mod tests {
     fn price_axis_values_should_use_one_label_when_plot_is_too_short() {
         let tick = Tick::from_inner(1).expect("price tick should be positive");
 
-        assert_eq!(price_axis_values(0.0, 1_000.0, 20.0, tick).len(), 1);
+        assert_eq!(price_axis_values(0.0, 1_000.0, px(20.0), tick).len(), 1);
     }
 
     #[test]
     fn price_axis_values_should_not_repeat_labels_for_coarse_price_ticks() {
         let tick = Tick::from_inner(250).expect("price tick should be positive");
-        let labels = price_axis_values(0.0, 1_000.0, 480.0, tick)
+        let labels = price_axis_values(0.0, 1_000.0, px(480.0), tick)
             .into_iter()
             .map(|value| format_price(value, tick))
             .collect::<Vec<_>>();
@@ -3657,15 +3687,18 @@ mod tests {
 
     #[test]
     fn readout_bounds_should_not_exceed_narrow_price_plot() {
-        let plot = Rect::new(10.0, 20.0, 6.0, 10.0);
+        let plot = LogicalRect::new(px(10.0), px(20.0), px(6.0), px(10.0));
         let readout = readout_bounds(plot);
 
-        assert_eq!((readout.size.width, readout.size.height), (0.0, 2.0));
+        assert_eq!(
+            (readout.size.width, readout.size.height),
+            (px(0.0), px(2.0))
+        );
     }
 
     #[test]
     fn the_readout_should_take_the_first_text_row() {
-        let plot = Rect::new(0.0, 120.0, 320.0, 240.0);
+        let plot = LogicalRect::new(px(0.0), px(120.0), px(320.0), px(240.0));
         let readout = readout_bounds(plot);
 
         assert_eq!(
@@ -3681,20 +3714,20 @@ mod tests {
 
     #[test]
     fn the_readout_should_have_no_room_in_a_plot_shorter_than_one_row() {
-        let plot = |height: f32| Rect::new(0.0, 0.0, 320.0, height);
+        let plot = |height: LogicalPx| LogicalRect::new(px(0.0), px(0.0), px(320.0), height);
 
         assert_eq!(
             readout_bounds(plot(TEXT_ROW_INSET)).size.height,
-            0.0,
+            px(0.0),
             "a plot exactly one inset tall has no row to give"
         );
         assert_eq!(
-            readout_bounds(plot(10.0)).size.height,
-            2.0,
+            readout_bounds(plot(px(10.0))).size.height,
+            px(2.0),
             "a plot 10px tall gives what is left after the inset, clipped to one row"
         );
         assert_eq!(
-            readout_bounds(plot(240.0)).size.height,
+            readout_bounds(plot(px(240.0))).size.height,
             TEXT_ROW_HEIGHT,
             "a plot with room gives exactly one whole row"
         );
@@ -3703,7 +3736,7 @@ mod tests {
     #[test]
     fn the_two_text_rows_should_fit_a_price_plot_at_the_reserved_height() {
         let floor = crate::chart::geometry::MIN_PLOT_HEIGHT;
-        let plot = Rect::new(0.0, 0.0, 320.0, floor);
+        let plot = LogicalRect::new(px(0.0), px(0.0), px(320.0), floor);
 
         let readout = readout_bounds(plot);
         let legend_top = plot.origin.y + MAIN_LEGEND_TOP;
@@ -3725,7 +3758,7 @@ mod tests {
 
     #[test]
     fn axis_text_width_should_not_be_negative_for_narrow_axes() {
-        assert_eq!(axis_text_width(4.0, AXIS_TICK_TEXT_INSET), 0.0);
+        assert_eq!(axis_text_width(px(4.0), AXIS_TICK_TEXT_INSET), px(0.0));
     }
 
     #[test]
@@ -3737,7 +3770,7 @@ mod tests {
             0..candles.len(),
             None,
             tick,
-            300.0,
+            px(300.0),
             &[],
             &[IndicatorId::Vol],
         );
@@ -3785,21 +3818,21 @@ mod tests {
 
     #[test]
     fn zero_volume_should_map_to_plot_bottom() {
-        let plot = Rect::new(10.0, 20.0, 400.0, 100.0);
+        let plot = LogicalRect::new(px(10.0), px(20.0), px(400.0), px(100.0));
 
         assert_eq!(y_for_volume(0.0, 100.0, plot), plot.max().y);
     }
 
     #[test]
     fn maximum_volume_should_map_to_plot_top() {
-        let plot = Rect::new(10.0, 20.0, 400.0, 100.0);
+        let plot = LogicalRect::new(px(10.0), px(20.0), px(400.0), px(100.0));
 
         assert_eq!(y_for_volume(100.0, 100.0, plot), plot.origin.y);
     }
 
     #[test]
     fn volume_hover_midpoint_should_map_to_half_the_upper_bound() {
-        let plot = Rect::new(10.0, 20.0, 400.0, 100.0);
+        let plot = LogicalRect::new(px(10.0), px(20.0), px(400.0), px(100.0));
         let midpoint = plot.origin.y + plot.size.height / 2.0;
 
         assert_eq!(volume_for_y(midpoint, 100.0, plot), 50.0);
@@ -3842,7 +3875,7 @@ mod tests {
         let viewport = ChartViewport::default();
         let frame = frame_of(&snapshot, viewport, &indicators, &countdown);
         let key = PaintedKey {
-            bounds: Rect::new(0.0, 0.0, 320.0, 240.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             candle_width: viewport.candle_width,
             right_timestamp: viewport.right_timestamp,
             cursor: viewport.cursor,
@@ -3874,9 +3907,9 @@ mod tests {
     #[test]
     fn a_painted_key_should_reject_every_changed_drawing_input() {
         let snapshot = one_candle_snapshot();
-        let bounds = Rect::new(0.0, 0.0, 320.0, 240.0);
+        let bounds = LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0));
         let viewport = ChartViewport {
-            candle_width: 9.0,
+            candle_width: px(9.0),
             right_timestamp: None,
             cursor: None,
         };
@@ -3900,7 +3933,7 @@ mod tests {
         assert_ne!(
             key,
             PaintedKey {
-                candle_width: 10.0,
+                candle_width: px(10.0),
                 ..key
             },
             "zooming changes the candle boxes"
@@ -3916,7 +3949,7 @@ mod tests {
         assert_ne!(
             key,
             PaintedKey {
-                bounds: Rect::new(0.0, 0.0, 640.0, 480.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(640.0), px(480.0)),
                 ..key
             },
             "resizing changes every box"
@@ -3972,7 +4005,7 @@ mod tests {
         assert_ne!(
             key,
             PaintedKey {
-                cursor: Some(Point::new(1.0, 2.0)),
+                cursor: Some(LogicalPoint::new(px(1.0), px(2.0))),
                 ..key
             },
             "the pointer decides the crosshair and the readout"
@@ -4023,9 +4056,9 @@ mod tests {
 
     #[test]
     fn an_indicator_line_mesh_should_break_at_a_none_and_take_one_candle_from_the_left() {
-        let plot = Rect::new(0.0, 0.0, 100.0, 100.0);
-        let geometry = CandleGeometry::new(plot, 2, 10.0);
-        let y_for = |value: f64| value as f32;
+        let plot = LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0));
+        let geometry = CandleGeometry::new(plot, 2, px(10.0));
+        let y_for = |value: f64| px(value as f32);
 
         assert!(
             LineMesh::polyline(&[Some(1.0), None, Some(3.0)], 0..3, geometry, y_for).is_none(),
@@ -4053,30 +4086,30 @@ mod tests {
     #[test]
     #[should_panic(expected = "the range indexes the whole snapshot")]
     fn an_indicator_line_mesh_should_reject_a_relative_slice() {
-        let plot = Rect::new(0.0, 0.0, 100.0, 100.0);
-        let geometry = CandleGeometry::new(plot, 2, 10.0);
+        let plot = LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0));
+        let geometry = CandleGeometry::new(plot, 2, px(10.0));
 
         let _ = LineMesh::polyline(&[Some(1.0), Some(2.0)], 1..3, geometry, |value| {
-            value as f32
+            px(value as f32)
         });
     }
 
     #[test]
     fn an_indicator_line_mesh_should_take_one_candle_width_left_of_the_first_slot() {
-        let plot = Rect::new(0.0, 0.0, 100.0, 100.0);
-        let geometry = CandleGeometry::new(plot, 2, 10.0);
+        let plot = LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0));
+        let geometry = CandleGeometry::new(plot, 2, px(10.0));
 
         assert_eq!(
             geometry.center_x_left_of_first(1),
             geometry.center_x(0) - 10.0
         );
-        assert_eq!(geometry.center_x_left_of_first(1), 75.0);
+        assert_eq!(geometry.center_x_left_of_first(1), px(75.0));
 
-        let empty = CandleGeometry::new(plot, 0, 10.0);
+        let empty = CandleGeometry::new(plot, 0, px(10.0));
         assert_eq!(empty.center_x_left_of_first(1), empty.center_x(0) - 10.0);
 
         let mesh = LineMesh::polyline(&[Some(1.0), Some(2.0)], 1..2, geometry, |value| {
-            value as f32
+            px(value as f32)
         })
         .expect("a two-point run is a line");
         assert!(
@@ -4102,13 +4135,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "range.start <= range.end")]
     fn an_indicator_line_mesh_should_reject_a_reversed_range() {
-        let plot = Rect::new(0.0, 0.0, 100.0, 100.0);
-        let geometry = CandleGeometry::new(plot, 2, 10.0);
+        let plot = LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0));
+        let geometry = CandleGeometry::new(plot, 2, px(10.0));
         let start = 2;
         let end = 1;
 
         let _ = LineMesh::polyline(&[Some(1.0), Some(2.0)], start..end, geometry, |value| {
-            value as f32
+            px(value as f32)
         });
     }
 
@@ -4205,8 +4238,9 @@ mod tests {
         }];
 
         let (_, highest) = price_bounds_with_indicators(&candles, 0..1, None, &series);
-        let with_indicator = axis_label_candidates(&candles, 0..1, None, tick, 300.0, &series, &[]);
-        let baseline = axis_label_candidates(&candles, 0..1, None, tick, 300.0, &[], &[]);
+        let with_indicator =
+            axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &series, &[]);
+        let baseline = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &[], &[]);
 
         assert!(
             with_indicator.contains(&format_price(highest, tick)),
@@ -4221,13 +4255,13 @@ mod tests {
     #[test]
     fn the_readout_should_describe_the_candle_under_the_cursor() {
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 240.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             LayoutInputs {
-                longest_label_width: 0.0,
+                longest_label_width: LogicalPx::ZERO,
                 sub_plot_count: 1,
             },
         );
-        let geometry = CandleGeometry::new(layout.price_plot, 10, 9.0);
+        let geometry = CandleGeometry::new(layout.price_plot, 10, px(9.0));
         let visible = VisibleChart {
             range: 10..20,
             lowest: 0.0,
@@ -4239,7 +4273,7 @@ mod tests {
             latest_price: None,
             sub_plots: Vec::new(),
         };
-        let cursor = Point::new(geometry.center_x(3), layout.price_plot.origin.y + 5.0);
+        let cursor = LogicalPoint::new(geometry.center_x(3), layout.price_plot.origin.y + 5.0);
 
         assert_eq!(
             readout_candle_index(Some(cursor), &layout, &visible),
@@ -4280,9 +4314,9 @@ mod tests {
     fn the_readout_should_describe_the_newest_visible_candle_without_a_cursor() {
         let snapshot = snapshot_with_candles(200);
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 240.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             LayoutInputs {
-                longest_label_width: 0.0,
+                longest_label_width: LogicalPx::ZERO,
                 sub_plot_count: 1,
             },
         );
@@ -4302,7 +4336,7 @@ mod tests {
             "a viewport of 150..175 ends at candle 174"
         );
 
-        let over_the_axis = Point::new(
+        let over_the_axis = LogicalPoint::new(
             layout.price_axis.origin.x + layout.price_axis.size.width / 2.0,
             layout.price_axis.origin.y + layout.price_axis.size.height / 2.0,
         );
@@ -4317,9 +4351,9 @@ mod tests {
     fn the_readout_fallback_should_follow_the_viewport_after_a_pan() {
         let snapshot = snapshot_with_candles(200);
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 240.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             LayoutInputs {
-                longest_label_width: 0.0,
+                longest_label_width: LogicalPx::ZERO,
                 sub_plot_count: 0,
             },
         );
@@ -4339,9 +4373,9 @@ mod tests {
     #[test]
     fn a_chart_without_enabled_sub_plots_should_have_no_sub_plot_boxes() {
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 240.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             LayoutInputs {
-                longest_label_width: 50.0,
+                longest_label_width: px(50.0),
                 sub_plot_count: 0,
             },
         );
@@ -4356,9 +4390,9 @@ mod tests {
     fn no_enabled_sub_plot_should_prepare_no_sub_plot_data_or_volume_bars() {
         let snapshot = snapshot_with_candles(10);
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 240.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             LayoutInputs {
-                longest_label_width: 50.0,
+                longest_label_width: px(50.0),
                 sub_plot_count: 0,
             },
         );
@@ -4380,9 +4414,9 @@ mod tests {
     fn a_pane_too_short_for_sub_plots_should_prepare_none() {
         let snapshot = snapshot_with_candles(10);
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 60.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(60.0)),
             LayoutInputs {
-                longest_label_width: 50.0,
+                longest_label_width: px(50.0),
                 sub_plot_count: 4,
             },
         );
@@ -4418,9 +4452,9 @@ mod tests {
     fn a_first_sub_plot_that_is_not_volume_should_not_prepare_volume_bars() {
         let snapshot = snapshot_with_candles(10);
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 240.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             LayoutInputs {
-                longest_label_width: 50.0,
+                longest_label_width: px(50.0),
                 sub_plot_count: 1,
             },
         );
@@ -4456,9 +4490,9 @@ mod tests {
     fn the_default_volume_sub_plot_should_prepare_its_bars() {
         let snapshot = snapshot_with_candles(10);
         let layout = ChartLayout::new(
-            Rect::new(0.0, 0.0, 320.0, 240.0),
+            LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0)),
             LayoutInputs {
-                longest_label_width: 50.0,
+                longest_label_width: px(50.0),
                 sub_plot_count: 1,
             },
         );
@@ -4677,7 +4711,7 @@ mod tests {
         };
 
         assert_eq!(
-            sub_axis_values(IndicatorId::Macd, value_range, 100.0),
+            sub_axis_values(IndicatorId::Macd, value_range, px(100.0)),
             [-5.0, 0.0, 5.0]
         );
     }
@@ -4698,7 +4732,7 @@ mod tests {
         let value_range = sub_value_range(&series, 0..2);
 
         assert_eq!(
-            sub_axis_values(IndicatorId::Macd, value_range, 100.0).len(),
+            sub_axis_values(IndicatorId::Macd, value_range, px(100.0)).len(),
             3
         );
     }
@@ -4710,19 +4744,19 @@ mod tests {
             highest: 100.0,
         };
         assert_eq!(
-            sub_axis_values(IndicatorId::Rsi, domain, 40.0),
+            sub_axis_values(IndicatorId::Rsi, domain, px(40.0)),
             [30.0, 50.0, 70.0]
         );
         assert_eq!(
-            sub_axis_values(IndicatorId::Rsi, domain, 120.0),
+            sub_axis_values(IndicatorId::Rsi, domain, px(120.0)),
             [0.0, 30.0, 50.0, 70.0, 100.0]
         );
         assert_eq!(
-            sub_axis_values(IndicatorId::Kdj, domain, 40.0),
+            sub_axis_values(IndicatorId::Kdj, domain, px(40.0)),
             [0.0, 50.0, 100.0]
         );
         assert_eq!(
-            sub_axis_values(IndicatorId::Kdj, domain, 120.0),
+            sub_axis_values(IndicatorId::Kdj, domain, px(120.0)),
             [0.0, 20.0, 80.0, 100.0]
         );
     }
@@ -4734,7 +4768,7 @@ mod tests {
             highest: 100.0,
         };
 
-        let tall_rsi = sub_plot_axis(IndicatorId::Rsi, domain, 120.0, &[30.0, 70.0]);
+        let tall_rsi = sub_plot_axis(IndicatorId::Rsi, domain, px(120.0), &[30.0, 70.0]);
         assert_eq!(tall_rsi.labels, [0.0, 30.0, 50.0, 70.0, 100.0]);
         assert_eq!(tall_rsi.grid, [0.0, 50.0, 100.0]);
         assert_eq!(
@@ -4751,11 +4785,11 @@ mod tests {
             ]
         );
 
-        let compact_rsi = sub_plot_axis(IndicatorId::Rsi, domain, 40.0, &[30.0, 70.0]);
+        let compact_rsi = sub_plot_axis(IndicatorId::Rsi, domain, px(40.0), &[30.0, 70.0]);
         assert_eq!(compact_rsi.labels, [30.0, 50.0, 70.0]);
         assert_eq!(compact_rsi.grid, [50.0]);
 
-        let tall_kdj = sub_plot_axis(IndicatorId::Kdj, domain, 120.0, &[20.0, 80.0]);
+        let tall_kdj = sub_plot_axis(IndicatorId::Kdj, domain, px(120.0), &[20.0, 80.0]);
         assert_eq!(tall_kdj.labels, [0.0, 20.0, 80.0, 100.0]);
         assert_eq!(tall_kdj.grid, [0.0, 100.0]);
 
@@ -4765,7 +4799,7 @@ mod tests {
                 lowest: -5.0,
                 highest: 5.0,
             },
-            120.0,
+            px(120.0),
             &[0.0],
         );
         assert_eq!(macd.labels, [-5.0, 0.0, 5.0]);
@@ -4792,12 +4826,12 @@ mod tests {
         };
 
         assert_eq!(
-            sub_axis_values(IndicatorId::Rsi, domain, 70.0).len(),
+            sub_axis_values(IndicatorId::Rsi, domain, px(70.0)).len(),
             5,
             "five 14px label rows fit exactly in 70px"
         );
         assert_eq!(
-            sub_axis_values(IndicatorId::Rsi, domain, 69.9).len(),
+            sub_axis_values(IndicatorId::Rsi, domain, px(69.9)).len(),
             3,
             "one pixel less cannot fit the five label rows"
         );
@@ -4810,7 +4844,7 @@ mod tests {
             highest: 124.0,
         };
 
-        let values = sub_axis_values(IndicatorId::Kdj, value_range, 120.0);
+        let values = sub_axis_values(IndicatorId::Kdj, value_range, px(120.0));
 
         assert!((3..=5).contains(&values.len()), "got {values:?}");
         assert_eq!(values, [-18.0, 20.0, 80.0, 100.0, 124.0]);
@@ -4835,7 +4869,7 @@ mod tests {
             "the range is padded beyond the domain: {value_range:?}"
         );
         assert_eq!(
-            sub_axis_values(IndicatorId::Kdj, value_range, 120.0),
+            sub_axis_values(IndicatorId::Kdj, value_range, px(120.0)),
             [0.0, 20.0, 80.0, 100.0]
         );
     }
@@ -4858,7 +4892,7 @@ mod tests {
             0..1,
             None,
             tick,
-            300.0,
+            px(300.0),
             &series,
             &[IndicatorId::Macd],
         );
@@ -4868,7 +4902,7 @@ mod tests {
             "negative MACD candidates were {labels:?}"
         );
         assert!(labels.contains(&format_signed_price(inner, tick)));
-        let baseline = axis_label_candidates(&candles, 0..1, None, tick, 300.0, &[], &[]);
+        let baseline = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &[], &[]);
         assert!(
             !baseline.contains(&format_signed_price(-inner, tick)),
             "without the MACD sub plot the signed tick is not a candidate"
@@ -4899,7 +4933,7 @@ mod tests {
             0..1,
             None,
             tick,
-            300.0,
+            px(300.0),
             &series,
             &[IndicatorId::Rsi, IndicatorId::Kdj],
         );
@@ -4910,7 +4944,7 @@ mod tests {
             );
         }
 
-        let baseline = axis_label_candidates(&candles, 0..1, None, tick, 300.0, &[], &[]);
+        let baseline = axis_label_candidates(&candles, 0..1, None, tick, px(300.0), &[], &[]);
         assert!(
             !baseline.contains(&format_percentage_tick(30.0)),
             "without an RSI sub plot the 30 guide is not a candidate"

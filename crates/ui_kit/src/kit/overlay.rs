@@ -13,7 +13,7 @@ use ui_core::{
         AnimatedValue, AnimationId, AnimationSpec, Easing, Overlay as EngineOverlay,
         OverlayDismiss, OverlayOptions as EngineOverlayOptions, OverlayPlacement,
     },
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -150,16 +150,16 @@ impl Placement {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacementConfig {
-    pub gap: f32,
-    pub margin: f32,
+    pub gap: LogicalPx,
+    pub margin: LogicalPx,
     pub flip: bool,
 }
 
 impl Default for PlacementConfig {
     fn default() -> Self {
         Self {
-            gap: 4.0,
-            margin: 4.0,
+            gap: px(4.0),
+            margin: px(4.0),
             flip: true,
         }
     }
@@ -180,7 +180,7 @@ impl PlacementConfig {
 
 #[derive(Debug)]
 pub enum OverlayError {
-    PlacementConfig { gap: f32, margin: f32 },
+    PlacementConfig { gap: LogicalPx, margin: LogicalPx },
     Engine(EngineError),
 }
 
@@ -213,12 +213,12 @@ impl std::error::Error for OverlayError {
 
 #[must_use]
 pub fn resolve_origin(
-    anchor: Rect,
-    panel: Size,
-    viewport: Size,
+    anchor: LogicalRect,
+    panel: LogicalSize,
+    viewport: LogicalSize,
     placement: Placement,
     config: PlacementConfig,
-) -> Point {
+) -> LogicalPoint {
     if !anchor.is_finite()
         || !panel.width.is_finite()
         || !panel.height.is_finite()
@@ -227,10 +227,10 @@ pub fn resolve_origin(
         || !config.gap.is_finite()
         || !config.margin.is_finite()
     {
-        return Point::ZERO;
+        return LogicalPoint::ZERO;
     }
-    let gap = config.gap.max(0.0);
-    let margin = config.margin.max(0.0);
+    let gap = config.gap.max(LogicalPx::ZERO);
+    let margin = config.margin.max(LogicalPx::ZERO);
     let mut side = placement.side;
     if config.flip && !main_axis_fits(anchor, panel, side, viewport, gap, margin) {
         let opposite = side.opposite();
@@ -242,7 +242,7 @@ pub fn resolve_origin(
         }
     }
     let placed = candidate(anchor, panel, Placement::new(side, placement.align), gap);
-    Point::new(
+    LogicalPoint::new(
         clamp_axis(
             placed.origin.x,
             margin,
@@ -256,7 +256,12 @@ pub fn resolve_origin(
     )
 }
 
-fn candidate(anchor: Rect, panel: Size, placement: Placement, gap: f32) -> Rect {
+fn candidate(
+    anchor: LogicalRect,
+    panel: LogicalSize,
+    placement: Placement,
+    gap: LogicalPx,
+) -> LogicalRect {
     let (x, y) = match placement.side {
         Side::Bottom => (
             aligned_start(
@@ -295,10 +300,15 @@ fn candidate(anchor: Rect, panel: Size, placement: Placement, gap: f32) -> Rect 
             ),
         ),
     };
-    Rect::new(x, y, panel.width, panel.height)
+    LogicalRect::new(x, y, panel.width, panel.height)
 }
 
-fn aligned_start(anchor_origin: f32, anchor_size: f32, panel_size: f32, align: Alignment) -> f32 {
+fn aligned_start(
+    anchor_origin: LogicalPx,
+    anchor_size: LogicalPx,
+    panel_size: LogicalPx,
+    align: Alignment,
+) -> LogicalPx {
     match align {
         Alignment::Start => anchor_origin,
         Alignment::Center => anchor_origin + (anchor_size - panel_size) * 0.5,
@@ -307,14 +317,14 @@ fn aligned_start(anchor_origin: f32, anchor_size: f32, panel_size: f32, align: A
 }
 
 fn main_axis_fits(
-    anchor: Rect,
-    panel: Size,
+    anchor: LogicalRect,
+    panel: LogicalSize,
     side: Side,
-    viewport: Size,
-    gap: f32,
-    margin: f32,
+    viewport: LogicalSize,
+    gap: LogicalPx,
+    margin: LogicalPx,
 ) -> bool {
-    const TOLERANCE: f32 = 0.5;
+    const TOLERANCE: LogicalPx = LogicalPx::new(0.5);
     match side {
         Side::Bottom => anchor.max().y + gap + panel.height <= viewport.height - margin + TOLERANCE,
         Side::Top => anchor.origin.y - gap - panel.height >= margin - TOLERANCE,
@@ -323,7 +333,13 @@ fn main_axis_fits(
     }
 }
 
-fn available(anchor: Rect, side: Side, viewport: Size, gap: f32, margin: f32) -> f32 {
+fn available(
+    anchor: LogicalRect,
+    side: Side,
+    viewport: LogicalSize,
+    gap: LogicalPx,
+    margin: LogicalPx,
+) -> LogicalPx {
     match side {
         Side::Bottom => viewport.height - margin - anchor.max().y - gap,
         Side::Top => anchor.origin.y - margin - gap,
@@ -332,7 +348,7 @@ fn available(anchor: Rect, side: Side, viewport: Size, gap: f32, margin: f32) ->
     }
 }
 
-fn clamp_axis(value: f32, min: f32, max: f32) -> f32 {
+fn clamp_axis(value: LogicalPx, min: LogicalPx, max: LogicalPx) -> LogicalPx {
     if max < min {
         min
     } else {
@@ -343,7 +359,7 @@ fn clamp_axis(value: f32, min: f32, max: f32) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Anchor {
     Node(NodeId),
-    Fixed(Rect),
+    Fixed(LogicalRect),
 }
 
 impl Anchor {
@@ -353,34 +369,35 @@ impl Anchor {
     }
 
     #[must_use]
-    pub const fn point(point: Point) -> Self {
-        Self::Fixed(Rect::new(point.x, point.y, 0.0, 0.0))
+    pub const fn point(point: LogicalPoint) -> Self {
+        Self::Fixed(LogicalRect::from_origin_size(point, LogicalSize::ZERO))
     }
 
     #[must_use]
-    pub const fn rect(rect: Rect) -> Self {
+    pub const fn rect(rect: LogicalRect) -> Self {
         Self::Fixed(rect)
     }
 }
 
 #[must_use]
-pub fn anchor_rect(app: &App, window: WindowId, anchor: Anchor) -> Option<Rect> {
+pub fn anchor_rect(app: &App, window: WindowId, anchor: Anchor) -> Option<LogicalRect> {
     match anchor {
         Anchor::Fixed(rect) => Some(rect),
         Anchor::Node(node) => {
             let tree = app.window(window)?.tree();
             let bounds = tree.get(node).ok()?.layout().bounds;
-            let mut offset = Point::ZERO;
+            let mut offset = LogicalPoint::ZERO;
             let mut cursor = tree.get(node).ok()?.parent();
             while let Some(current) = cursor {
                 if let Some(handle) = app.scroll_handle(window, current)
                     && let Some(state) = app.scroll_state(&handle)
                 {
-                    offset = Point::new(offset.x + state.offset.x, offset.y + state.offset.y);
+                    offset =
+                        LogicalPoint::new(offset.x + state.offset.x, offset.y + state.offset.y);
                 }
                 cursor = tree.get(current).ok()?.parent();
             }
-            Some(bounds.translate(Point::new(-offset.x, -offset.y)))
+            Some(bounds.translate(LogicalPoint::new(-offset.x, -offset.y)))
         }
     }
 }
@@ -403,8 +420,8 @@ impl DismissPolicy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OverlaySurface {
     pub background: Role,
-    pub corner_radius: f32,
-    pub padding: f32,
+    pub corner_radius: LogicalPx,
+    pub padding: LogicalPx,
     pub shadows: Shadows,
 }
 
@@ -415,19 +432,19 @@ impl OverlaySurface {
         let color = Color::BLACK.with_opacity(tokens.shadow.menu_alpha);
         Self {
             background: Role::SurfaceOverlay,
-            corner_radius: 4.0,
-            padding: 4.0,
+            corner_radius: px(4.0),
+            padding: px(4.0),
             shadows: Shadows::new([
                 ShadowSpec {
-                    offset: Point::new(0.0, 1.0),
-                    blur: 2.0,
-                    spread: 0.0,
+                    offset: LogicalPoint::new(px(0.0), px(1.0)),
+                    blur: px(2.0),
+                    spread: px(0.0),
                     color,
                 },
                 ShadowSpec {
-                    offset: Point::new(0.0, 3.0),
-                    blur: 6.0,
-                    spread: -2.0,
+                    offset: LogicalPoint::new(px(0.0), px(3.0)),
+                    blur: px(6.0),
+                    spread: px(-2.0),
                     color,
                 },
             ]),
@@ -439,12 +456,12 @@ impl OverlaySurface {
         let tokens = ComponentTokens::standard();
         Self {
             background: Role::SurfaceOverlay,
-            corner_radius: 4.0,
-            padding: 8.0,
+            corner_radius: px(4.0),
+            padding: px(8.0),
             shadows: Shadows::from(ShadowSpec {
-                offset: Point::new(0.0, 25.0),
-                blur: 50.0,
-                spread: -12.0,
+                offset: LogicalPoint::new(px(0.0), px(25.0)),
+                blur: px(50.0),
+                spread: px(-12.0),
                 color: Color::BLACK.with_opacity(tokens.shadow.dialog_alpha),
             }),
         }
@@ -454,8 +471,8 @@ impl OverlaySurface {
     pub fn tooltip() -> Self {
         Self {
             background: Role::SurfaceInverse,
-            corner_radius: 4.0,
-            padding: 4.0,
+            corner_radius: px(4.0),
+            padding: px(4.0),
             shadows: Shadows::default(),
         }
     }
@@ -522,8 +539,8 @@ impl OverlayA11y {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OverlayOptions {
     pub placement: Placement,
-    pub gap: f32,
-    pub margin: f32,
+    pub gap: LogicalPx,
+    pub margin: LogicalPx,
     pub flip: bool,
     pub dismiss: DismissPolicy,
     pub modal: bool,
@@ -540,8 +557,8 @@ impl Default for OverlayOptions {
     fn default() -> Self {
         Self {
             placement: Placement::BOTTOM_START,
-            gap: 4.0,
-            margin: 4.0,
+            gap: px(4.0),
+            margin: px(4.0),
             flip: true,
             dismiss: DismissPolicy::OutsideClick,
             modal: false,
@@ -575,9 +592,9 @@ struct OverlayState {
     panel: Option<NodeId>,
     scrim: Option<NodeId>,
     anchor: Option<Anchor>,
-    origin: Option<Point>,
+    origin: Option<LogicalPoint>,
     frame_at_open: Option<FrameIndex>,
-    scrim_geometry: Option<(Point, Size)>,
+    scrim_geometry: Option<(LogicalPoint, LogicalSize)>,
     closing: bool,
 }
 
@@ -710,13 +727,13 @@ impl Overlay {
         }
         let viewport = app
             .window(window)
-            .map_or(Size::ZERO, |target| target.size());
+            .map_or(LogicalSize::ZERO, |target| target.size());
         let Some(anchor_rect) = anchor_rect(app, window, anchor) else {
             return Ok(false);
         };
         let initial_origin = resolve_origin(
             anchor_rect,
-            Size::ZERO,
+            LogicalSize::ZERO,
             viewport,
             self.inner.options.placement,
             self.inner.options.placement_config(),
@@ -836,7 +853,8 @@ impl Overlay {
         }
         let previous = self.inner.state.borrow().origin;
         let moved = previous.is_none_or(|previous| {
-            (previous.x - origin.x).abs() >= 0.5 || (previous.y - origin.y).abs() >= 0.5
+            (previous.x - origin.x).abs().value() >= 0.5
+                || (previous.y - origin.y).abs().value() >= 0.5
         });
         if moved {
             changed |= app.place_overlay(&handle, OverlayPlacement::Point(origin));
@@ -962,8 +980,8 @@ impl Overlay {
         &self,
         tree: &mut NodeTree,
         parent: NodeId,
-        viewport: Size,
-        origin: Point,
+        viewport: LogicalSize,
+        origin: LogicalPoint,
         scrim: Scrim,
     ) -> Result<NodeId, EngineError> {
         let theme = self.inner.theme.clone();
@@ -1013,7 +1031,13 @@ impl Overlay {
             .build(tree, parent)
     }
 
-    fn sync_scrim(&self, app: &mut App, window: WindowId, origin: Point, viewport: Size) -> bool {
+    fn sync_scrim(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        origin: LogicalPoint,
+        viewport: LogicalSize,
+    ) -> bool {
         let scrim = self.inner.state.borrow().scrim;
         let Some(scrim) = scrim else {
             return false;
@@ -1080,7 +1104,7 @@ impl Overlay {
     }
 }
 
-fn scrim_style(origin: Point, viewport: Size) -> Style {
+fn scrim_style(origin: LogicalPoint, viewport: LogicalSize) -> Style {
     StyleBuilder::new()
         .absolute()
         .left(-origin.x)
@@ -1093,18 +1117,21 @@ fn scrim_style(origin: Point, viewport: Size) -> Style {
 #[cfg(test)]
 mod tests {
 
-    use ui_core::math::{Point, Rect, Size};
+    use ui_core::math::{LogicalPoint, LogicalRect, LogicalSize, px};
 
     use super::{Alignment, Placement, PlacementConfig, Side, resolve_origin};
 
-    const VIEWPORT: Size = Size::new(800.0, 600.0);
-    const PANEL: Size = Size::new(120.0, 80.0);
-    const ANCHOR: Rect = Rect::new(300.0, 200.0, 100.0, 40.0);
+    const VIEWPORT: LogicalSize = LogicalSize::new(px(800.0), px(600.0));
+    const PANEL: LogicalSize = LogicalSize::new(px(120.0), px(80.0));
+    const ANCHOR: LogicalRect = LogicalRect::from_origin_size(
+        LogicalPoint::new(px(300.0), px(200.0)),
+        LogicalSize::new(px(100.0), px(40.0)),
+    );
 
     fn config(flip: bool) -> PlacementConfig {
         PlacementConfig {
-            gap: 4.0,
-            margin: 4.0,
+            gap: px(4.0),
+            margin: px(4.0),
             flip,
         }
     }
@@ -1144,7 +1171,7 @@ mod tests {
         for (placement, (x, y)) in cases {
             assert_eq!(
                 resolve_origin(ANCHOR, PANEL, VIEWPORT, placement, cfg),
-                Point::new(x, y),
+                LogicalPoint::new(px(x), px(y)),
                 "{placement:?} 的落点漂移"
             );
         }
@@ -1153,36 +1180,36 @@ mod tests {
     #[test]
     fn flip_moves_to_the_opposite_side_when_the_preferred_side_does_not_fit() {
         let cfg = config(true);
-        let bottom = Rect::new(300.0, 500.0, 100.0, 40.0);
+        let bottom = LogicalRect::new(px(300.0), px(500.0), px(100.0), px(40.0));
         assert_eq!(
             resolve_origin(bottom, PANEL, VIEWPORT, Placement::BOTTOM_START, cfg),
-            Point::new(300.0, 416.0)
+            LogicalPoint::new(px(300.0), px(416.0))
         );
-        let right = Rect::new(700.0, 200.0, 100.0, 40.0);
+        let right = LogicalRect::new(px(700.0), px(200.0), px(100.0), px(40.0));
         assert_eq!(
             resolve_origin(right, PANEL, VIEWPORT, Placement::RIGHT_START, cfg),
-            Point::new(576.0, 200.0)
+            LogicalPoint::new(px(576.0), px(200.0))
         );
-        let tight = Rect::new(300.0, 120.0, 100.0, 40.0);
+        let tight = LogicalRect::new(px(300.0), px(120.0), px(100.0), px(40.0));
         assert_eq!(
             resolve_origin(
                 tight,
                 PANEL,
-                Size::new(800.0, 200.0),
+                LogicalSize::new(px(800.0), px(200.0)),
                 Placement::BOTTOM_START,
                 cfg
             ),
-            Point::new(300.0, 36.0)
+            LogicalPoint::new(px(300.0), px(36.0))
         );
     }
 
     #[test]
     fn flip_can_be_disabled() {
         let cfg = config(false);
-        let bottom = Rect::new(300.0, 500.0, 100.0, 40.0);
+        let bottom = LogicalRect::new(px(300.0), px(500.0), px(100.0), px(40.0));
         assert_eq!(
             resolve_origin(bottom, PANEL, VIEWPORT, Placement::BOTTOM_START, cfg),
-            Point::new(300.0, 516.0),
+            LogicalPoint::new(px(300.0), px(516.0)),
             "关掉 flip 后 Bottom 被 clamp 到视口底边"
         );
     }
@@ -1190,25 +1217,28 @@ mod tests {
     #[test]
     fn clamping_keeps_the_panel_inside_the_viewport() {
         let cfg = config(false);
-        let corner = Rect::new(790.0, 590.0, 10.0, 10.0);
+        let corner = LogicalRect::new(px(790.0), px(590.0), px(10.0), px(10.0));
         assert_eq!(
             resolve_origin(corner, PANEL, VIEWPORT, Placement::BOTTOM_END, cfg),
-            Point::new(800.0 - 4.0 - PANEL.width, 600.0 - 4.0 - PANEL.height)
+            LogicalPoint::new(
+                px(800.0 - 4.0) - PANEL.width,
+                px(600.0 - 4.0) - PANEL.height
+            )
         );
-        let top_left = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let top_left = LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0));
         assert_eq!(
             resolve_origin(top_left, PANEL, VIEWPORT, Placement::TOP_START, cfg),
-            Point::new(4.0, 4.0)
+            LogicalPoint::new(px(4.0), px(4.0))
         );
         assert_eq!(
             resolve_origin(
                 ANCHOR,
-                Size::new(900.0, 700.0),
+                LogicalSize::new(px(900.0), px(700.0)),
                 VIEWPORT,
                 Placement::BOTTOM_START,
                 cfg
             ),
-            Point::new(4.0, 4.0)
+            LogicalPoint::new(px(4.0), px(4.0))
         );
     }
 
@@ -1217,32 +1247,32 @@ mod tests {
         let cfg = PlacementConfig::default();
         assert_eq!(
             resolve_origin(
-                Rect::new(f32::NAN, 0.0, 10.0, 10.0),
+                LogicalRect::new(px(f32::NAN), px(0.0), px(10.0), px(10.0)),
                 PANEL,
                 VIEWPORT,
                 Placement::BOTTOM_START,
                 cfg
             ),
-            Point::ZERO
+            LogicalPoint::ZERO
         );
         assert_eq!(
             resolve_origin(
                 ANCHOR,
-                Size::new(f32::INFINITY, 10.0),
+                LogicalSize::new(px(f32::INFINITY), px(10.0)),
                 VIEWPORT,
                 Placement::BOTTOM_START,
                 cfg
             ),
-            Point::ZERO
+            LogicalPoint::ZERO
         );
         let negative = PlacementConfig {
-            gap: -5.0,
-            margin: -5.0,
+            gap: px(-5.0),
+            margin: px(-5.0),
             flip: true,
         };
         assert_eq!(
             resolve_origin(ANCHOR, PANEL, VIEWPORT, Placement::BOTTOM_START, negative),
-            Point::new(300.0, 240.0),
+            LogicalPoint::new(px(300.0), px(240.0)),
             "负间隙 / 负边距按 0 处理"
         );
     }
@@ -1251,19 +1281,19 @@ mod tests {
     fn non_finite_config_falls_back_to_the_origin() {
         for broken in [
             PlacementConfig {
-                gap: f32::INFINITY,
-                margin: 4.0,
+                gap: px(f32::INFINITY),
+                margin: px(4.0),
                 flip: true,
             },
             PlacementConfig {
-                gap: 4.0,
-                margin: f32::NAN,
+                gap: px(4.0),
+                margin: px(f32::NAN),
                 flip: true,
             },
         ] {
             assert_eq!(
                 resolve_origin(ANCHOR, PANEL, VIEWPORT, Placement::BOTTOM_START, broken),
-                Point::ZERO,
+                LogicalPoint::ZERO,
                 "非有限定位参数必须回退原点：{broken:?}"
             );
         }
@@ -1274,62 +1304,62 @@ mod tests {
         let cfg = config(true);
         let cases = [
             (
-                Rect::new(760.0, 200.0, 40.0, 20.0),
+                LogicalRect::new(px(760.0), px(200.0), px(40.0), px(20.0)),
                 Placement::BOTTOM_START,
                 (676.0, 224.0),
             ),
             (
-                Rect::new(760.0, 200.0, 40.0, 20.0),
+                LogicalRect::new(px(760.0), px(200.0), px(40.0), px(20.0)),
                 Placement::BOTTOM,
                 (676.0, 224.0),
             ),
             (
-                Rect::new(10.0, 200.0, 40.0, 20.0),
+                LogicalRect::new(px(10.0), px(200.0), px(40.0), px(20.0)),
                 Placement::BOTTOM_END,
                 (4.0, 224.0),
             ),
             (
-                Rect::new(760.0, 300.0, 40.0, 20.0),
+                LogicalRect::new(px(760.0), px(300.0), px(40.0), px(20.0)),
                 Placement::TOP_START,
                 (676.0, 216.0),
             ),
             (
-                Rect::new(760.0, 300.0, 40.0, 20.0),
+                LogicalRect::new(px(760.0), px(300.0), px(40.0), px(20.0)),
                 Placement::TOP,
                 (676.0, 216.0),
             ),
             (
-                Rect::new(10.0, 300.0, 40.0, 20.0),
+                LogicalRect::new(px(10.0), px(300.0), px(40.0), px(20.0)),
                 Placement::TOP_END,
                 (4.0, 216.0),
             ),
             (
-                Rect::new(200.0, 590.0, 40.0, 20.0),
+                LogicalRect::new(px(200.0), px(590.0), px(40.0), px(20.0)),
                 Placement::RIGHT_START,
                 (244.0, 516.0),
             ),
             (
-                Rect::new(200.0, 590.0, 40.0, 20.0),
+                LogicalRect::new(px(200.0), px(590.0), px(40.0), px(20.0)),
                 Placement::RIGHT,
                 (244.0, 516.0),
             ),
             (
-                Rect::new(200.0, 590.0, 40.0, 20.0),
+                LogicalRect::new(px(200.0), px(590.0), px(40.0), px(20.0)),
                 Placement::RIGHT_END,
                 (244.0, 516.0),
             ),
             (
-                Rect::new(300.0, 590.0, 40.0, 20.0),
+                LogicalRect::new(px(300.0), px(590.0), px(40.0), px(20.0)),
                 Placement::LEFT_START,
                 (176.0, 516.0),
             ),
             (
-                Rect::new(300.0, 590.0, 40.0, 20.0),
+                LogicalRect::new(px(300.0), px(590.0), px(40.0), px(20.0)),
                 Placement::LEFT,
                 (176.0, 516.0),
             ),
             (
-                Rect::new(300.0, 590.0, 40.0, 20.0),
+                LogicalRect::new(px(300.0), px(590.0), px(40.0), px(20.0)),
                 Placement::LEFT_END,
                 (176.0, 516.0),
             ),
@@ -1337,7 +1367,7 @@ mod tests {
         for (anchor, placement, (x, y)) in cases {
             assert_eq!(
                 resolve_origin(anchor, PANEL, VIEWPORT, placement, cfg),
-                Point::new(x, y),
+                LogicalPoint::new(px(x), px(y)),
                 "{placement:?} 横轴越界只 clamp、不翻转（anchor {anchor:?}）"
             );
         }
@@ -1346,10 +1376,10 @@ mod tests {
     #[test]
     fn main_axis_overflow_flips_for_all_twelve_placements() {
         let cfg = config(true);
-        let narrow = Rect::new(340.0, 590.0, 100.0, 20.0);
-        let low = Rect::new(340.0, 0.0, 100.0, 20.0);
-        let right = Rect::new(760.0, 260.0, 40.0, 40.0);
-        let left = Rect::new(0.0, 260.0, 40.0, 40.0);
+        let narrow = LogicalRect::new(px(340.0), px(590.0), px(100.0), px(20.0));
+        let low = LogicalRect::new(px(340.0), px(0.0), px(100.0), px(20.0));
+        let right = LogicalRect::new(px(760.0), px(260.0), px(40.0), px(40.0));
+        let left = LogicalRect::new(px(0.0), px(260.0), px(40.0), px(40.0));
         let cases = [
             (narrow, Placement::BOTTOM_START, (340.0, 506.0)),
             (narrow, Placement::BOTTOM, (330.0, 506.0)),
@@ -1367,7 +1397,7 @@ mod tests {
         for (anchor, placement, (x, y)) in cases {
             assert_eq!(
                 resolve_origin(anchor, PANEL, VIEWPORT, placement, cfg),
-                Point::new(x, y),
+                LogicalPoint::new(px(x), px(y)),
                 "{placement:?} 主轴放不下必须翻到对边（anchor {anchor:?}）"
             );
         }
@@ -1383,7 +1413,7 @@ mod ui_tests {
     use ui_core::{
         a11y::A11yRole,
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect, Size},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::{
             color::Color,
@@ -1402,9 +1432,12 @@ mod ui_tests {
         theme::{appearance::Appearance, components::ComponentTokens, handle::ThemeHandle},
     };
 
-    const VIEWPORT: Size = Size::new(800.0, 600.0);
-    const ANCHOR: Rect = Rect::new(300.0, 200.0, 100.0, 40.0);
-    const CONTENT: Size = Size::new(120.0, 80.0);
+    const VIEWPORT: LogicalSize = LogicalSize::new(px(800.0), px(600.0));
+    const ANCHOR: LogicalRect = LogicalRect::from_origin_size(
+        LogicalPoint::new(px(300.0), px(200.0)),
+        LogicalSize::new(px(100.0), px(40.0)),
+    );
+    const CONTENT: LogicalSize = LogicalSize::new(px(120.0), px(80.0));
 
     fn build_content(
         tree: &mut ui_core::node::tree::NodeTree,
@@ -1473,7 +1506,7 @@ mod ui_tests {
             self.node("anchor", ANCHOR, None)
         }
 
-        fn node(&mut self, id: &str, rect: Rect, action: Option<Action>) -> NodeId {
+        fn node(&mut self, id: &str, rect: LogicalRect, action: Option<Action>) -> NodeId {
             let mut builder = NodeBuilder::boxed().id(id.to_owned()).layout_override(rect);
             if let Some(action) = action {
                 builder = builder.on_click(action);
@@ -1506,11 +1539,11 @@ mod ui_tests {
             let _ = self.app.drain().expect("帧");
         }
 
-        fn bounds(&self, node: NodeId) -> Rect {
+        fn bounds(&self, node: NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("布局盒")
         }
 
-        fn click(&mut self, at: Point) {
+        fn click(&mut self, at: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 at,
                 PointerButton::Primary,
@@ -1542,11 +1575,11 @@ mod ui_tests {
         let panel = harness.bounds(overlay.overlay_node().expect("浮层节点"));
         assert_eq!(
             panel.origin,
-            Point::new(ANCHOR.origin.x, ANCHOR.max().y + 4.0)
+            LogicalPoint::new(ANCHOR.origin.x, ANCHOR.max().y + 4.0)
         );
         assert_eq!(
             panel.size,
-            Size::new(CONTENT.width + 8.0, CONTENT.height + 8.0),
+            LogicalSize::new(CONTENT.width + 8.0, CONTENT.height + 8.0),
             "面板尺寸 = 内容 + 两侧 4 px 内边距"
         );
         assert!(overlay.is_open(harness.app.app()));
@@ -1560,12 +1593,16 @@ mod ui_tests {
     #[test]
     fn a_panel_near_the_bottom_flips_above_the_anchor() {
         let mut harness = Harness::new();
-        let anchor = harness.node("anchor", Rect::new(300.0, 560.0, 100.0, 40.0), None);
+        let anchor = harness.node(
+            "anchor",
+            LogicalRect::new(px(300.0), px(560.0), px(100.0), px(40.0)),
+            None,
+        );
         let overlay = harness.overlay("menu", options());
         assert!(harness.open(&overlay, Anchor::node(anchor)));
         let panel = harness.bounds(overlay.overlay_node().expect("浮层节点"));
         assert!(
-            (panel.max().y - (560.0 - 4.0)).abs() < 0.5,
+            (panel.max().y - (560.0 - 4.0)).abs().value() < 0.5,
             "翻到上方后底边应贴锚点顶部 − gap：{panel:?}"
         );
     }
@@ -1578,7 +1615,7 @@ mod ui_tests {
         assert!(harness.open(&overlay, Anchor::node(anchor)));
         let node = overlay.overlay_node().expect("浮层节点");
 
-        harness.click(Point::new(10.0, 10.0));
+        harness.click(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = overlay.sync(harness.app.app_mut());
         assert!(!overlay.is_open(harness.app.app()), "外部点击必须关闭浮层");
         assert!(overlay.overlay_node().is_none());
@@ -1654,7 +1691,7 @@ mod ui_tests {
                 move |tree, panel| {
                     NodeBuilder::boxed()
                         .id("inner")
-                        .style(StyleBuilder::new().width(80.0).height(24.0).build())
+                        .style(StyleBuilder::new().width(px(80.0)).height(px(24.0)).build())
                         .on_click(inner)
                         .build(tree, panel)?;
                     Ok(())
@@ -1718,7 +1755,7 @@ mod ui_tests {
         harness.settle(&modal);
         let scrim = modal.scrim_node().expect("模态浮层有遮罩");
         let bounds = harness.bounds(scrim);
-        assert_eq!(bounds.origin, Point::ZERO, "遮罩铺满窗口");
+        assert_eq!(bounds.origin, LogicalPoint::ZERO, "遮罩铺满窗口");
         assert_eq!(bounds.size, VIEWPORT, "遮罩覆盖整个视口");
     }
 
@@ -1738,7 +1775,7 @@ mod ui_tests {
         );
         assert!(harness.open(&overlay, Anchor::node(anchor)));
         assert!(overlay.scrim_node().is_some());
-        harness.click(Point::new(20.0, 20.0));
+        harness.click(LogicalPoint::new(px(20.0), px(20.0)));
         let _ = overlay.sync(harness.app.app_mut());
         assert!(!overlay.is_open(harness.app.app()), "点遮罩 = 点外部");
     }
@@ -1976,10 +2013,10 @@ mod ui_tests {
                 .style(
                     StyleBuilder::new()
                         .absolute()
-                        .left(0.0)
-                        .top(0.0)
-                        .width(300.0)
-                        .height(200.0)
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .width(px(300.0))
+                        .height(px(200.0))
                         .overflow_hidden()
                         .build(),
                 )
@@ -1998,7 +2035,7 @@ mod ui_tests {
         harness
             .app
             .app_mut()
-            .set_scroll_content(&scroll_handle, Size::new(300.0, 1000.0))
+            .set_scroll_content(&scroll_handle, LogicalSize::new(px(300.0), px(1000.0)))
             .expect("内容尺寸");
         let anchor = {
             let tree = harness
@@ -2009,7 +2046,7 @@ mod ui_tests {
                 .tree_mut();
             NodeBuilder::boxed()
                 .id("anchor")
-                .layout_override(Rect::new(40.0, 400.0, 100.0, 40.0))
+                .layout_override(LogicalRect::new(px(40.0), px(400.0), px(100.0), px(40.0)))
                 .build(tree, viewport_node)
                 .expect("锚点")
         };
@@ -2026,17 +2063,20 @@ mod ui_tests {
         );
         harness.settle(&overlay);
         let before = harness.bounds(overlay.overlay_node().expect("浮层节点"));
-        assert!((before.origin.y - 444.0).abs() < 0.5, "未滚动：{before:?}");
+        assert!(
+            (before.origin.y - 444.0).abs().value() < 0.5,
+            "未滚动：{before:?}"
+        );
 
         harness
             .app
             .app_mut()
-            .scroll_to(&scroll_handle, Point::new(0.0, 300.0))
+            .scroll_to(&scroll_handle, LogicalPoint::new(px(0.0), px(300.0)))
             .expect("滚动");
         harness.settle(&overlay);
         let after = harness.bounds(overlay.overlay_node().expect("浮层节点"));
         assert!(
-            (after.origin.y - (before.origin.y - 300.0)).abs() < 0.5,
+            (after.origin.y - (before.origin.y - 300.0)).abs().value() < 0.5,
             "滚动 300 后浮层跟随锚点上移：before={before:?} after={after:?}"
         );
     }
@@ -2126,7 +2166,7 @@ mod ui_tests {
             let panel = harness.bounds(overlay.overlay_node().expect("浮层节点"));
             assert_eq!(
                 panel.size,
-                Size::new(
+                LogicalSize::new(
                     CONTENT.width + padding * 2.0,
                     CONTENT.height + padding * 2.0
                 ),
@@ -2150,15 +2190,15 @@ mod ui_tests {
             layers,
             vec![
                 (
-                    Point::new(0.0, 1.0),
-                    2.0,
-                    0.0,
+                    LogicalPoint::new(px(0.0), px(1.0)),
+                    px(2.0),
+                    px(0.0),
                     Color::BLACK.with_opacity(tokens.shadow.menu_alpha),
                 ),
                 (
-                    Point::new(0.0, 3.0),
-                    6.0,
-                    -2.0,
+                    LogicalPoint::new(px(0.0), px(3.0)),
+                    px(6.0),
+                    px(-2.0),
                     Color::BLACK.with_opacity(tokens.shadow.menu_alpha),
                 ),
             ],
@@ -2173,7 +2213,7 @@ mod ui_tests {
             .collect();
         assert_eq!(
             layers,
-            vec![(Point::new(0.0, 25.0), 50.0, -12.0)],
+            vec![(LogicalPoint::new(px(0.0), px(25.0)), px(50.0), px(-12.0))],
             "对话框必须是旧实现的大偏移单层阴影"
         );
         assert_eq!(
@@ -2274,10 +2314,10 @@ mod ui_tests {
 
         let panel = harness.bounds(overlay.overlay_node().expect("浮层节点"));
         let padding = overlay.options().surface.padding;
-        let padding_x = (panel.origin.x + panel.size.width * 0.5) as u32;
-        let padding_y = (panel.origin.y + padding * 0.5) as u32;
-        let content_x = (panel.origin.x + padding + CONTENT.width * 0.5) as u32;
-        let content_y = (panel.origin.y + padding + CONTENT.height * 0.5) as u32;
+        let padding_x = (panel.origin.x + panel.size.width * 0.5).value() as u32;
+        let padding_y = (panel.origin.y + padding * 0.5).value() as u32;
+        let content_x = (panel.origin.x + padding + CONTENT.width * 0.5).value() as u32;
+        let content_y = (panel.origin.y + padding + CONTENT.height * 0.5).value() as u32;
         let image = harness
             .app
             .read_pixels()
@@ -2317,7 +2357,7 @@ mod ui_tests {
         assert!(harness.open(&foreground, Anchor::node(anchor)));
         assert_eq!(harness.layer.len(harness.window), 2);
 
-        harness.click(Point::new(10.0, 10.0));
+        harness.click(LogicalPoint::new(px(10.0), px(10.0)));
         assert!(
             foreground.sync(harness.app.app_mut()),
             "sync 必须发现引擎侧关闭"
@@ -2497,7 +2537,7 @@ mod ui_tests {
         let panel = harness.bounds(overlay.overlay_node().expect("浮层节点"));
         assert_eq!(
             panel.origin,
-            Point::new(ANCHOR.origin.x, ANCHOR.max().y + 4.0),
+            LogicalPoint::new(ANCHOR.origin.x, ANCHOR.max().y + 4.0),
             "第二帧在实测后的正确位置"
         );
     }
@@ -2630,7 +2670,7 @@ mod ui_tests {
         let overlay = harness.overlay(
             "menu",
             OverlayOptions {
-                gap: f32::INFINITY,
+                gap: px(f32::INFINITY),
                 ..options()
             },
         );
@@ -2643,7 +2683,7 @@ mod ui_tests {
             )
             .expect_err("非有限 gap 必须报错");
         assert!(
-            matches!(error, OverlayError::PlacementConfig { gap, .. } if gap.is_infinite()),
+            matches!(error, OverlayError::PlacementConfig { gap, .. } if !gap.is_finite()),
             "必须是强类型 PlacementConfig 错误，实际 {error:?}"
         );
         assert!(overlay.overlay_node().is_none(), "配置错误不得建节点");

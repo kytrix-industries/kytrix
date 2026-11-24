@@ -16,7 +16,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     interaction::ItemAlign,
-    math::Rect,
+    math::{LogicalPx, LogicalRect, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -49,13 +49,13 @@ use super::model::{
     grouping_steps, settle_grouping,
 };
 
-const ROW_HEIGHT: f32 = 22.0;
+const ROW_HEIGHT: LogicalPx = LogicalPx::new(22.0);
 
-const HEADER_HEIGHT: f32 = 20.0;
+const HEADER_HEIGHT: LogicalPx = LogicalPx::new(20.0);
 
-const HEADER_TEXT_SIZE: f32 = 11.0;
+const HEADER_TEXT_SIZE: LogicalPx = LogicalPx::new(11.0);
 
-const PANEL_PADDING_X: f32 = 8.0;
+const PANEL_PADDING_X: LogicalPx = LogicalPx::new(8.0);
 
 const DEPTH_ANIMATION_TICK: Duration = Duration::from_millis(16);
 
@@ -182,8 +182,8 @@ pub(super) fn row_at(grouped: &GroupedBook, index: usize) -> Option<PanelRow<'_>
     }
 }
 
-pub(crate) fn split_ratio(start: f32, delta_y: f32, area_height: f32) -> f32 {
-    if area_height <= 0.0 {
+pub(crate) fn split_ratio(start: f32, delta_y: LogicalPx, area_height: LogicalPx) -> f32 {
+    if area_height <= px(0.0) {
         return clamp_ratio(start);
     }
     clamp_ratio(start - delta_y / area_height)
@@ -218,8 +218,8 @@ impl BookRows {
 struct DepthBarsKey {
     grouped: Option<Arc<GroupedBook>>,
     eased: f32,
-    bounds: Rect,
-    offset: f32,
+    bounds: LogicalRect,
+    offset: LogicalPx,
     ask_color: Color,
     bid_color: Color,
 }
@@ -229,8 +229,8 @@ impl DepthBarsKey {
         &self,
         grouped: Option<&Arc<GroupedBook>>,
         eased: f32,
-        bounds: Rect,
-        offset: f32,
+        bounds: LogicalRect,
+        offset: LogicalPx,
         ask_color: Color,
         bid_color: Color,
     ) -> bool {
@@ -325,10 +325,10 @@ impl BuiltPanel {
             return Ok(false);
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
             return Ok(false);
         }
-        let offset = self.list.offset(cx.app()).unwrap_or(0.0);
+        let offset = self.list.offset(cx.app()).unwrap_or(LogicalPx::ZERO);
         let appearance = self.theme.current(cx.app());
         let resolved = self.theme.theme_for(appearance);
         let ask_color = resolved.role(Role::MarketDownWeak);
@@ -473,13 +473,13 @@ impl PredictionBookPanel {
             .build(cx.tree_mut(), root)?;
 
         let canvas_theme = theme.clone();
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(DEPTH_SELECTOR)
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .left(0.0)
-                    .top(0.0)
+                    .left(px(0.0))
+                    .top(px(0.0))
                     .size_full()
                     .build(),
             )
@@ -498,7 +498,7 @@ impl PredictionBookPanel {
             theme.clone(),
             list_key,
             ListOptions::fixed(ROW_HEIGHT)
-                .padding(0.0, 0.0)
+                .padding(LogicalPx::ZERO, LogicalPx::ZERO)
                 .selection(SelectionMode::None),
             move |tree, parent, index| {
                 build_row(
@@ -529,8 +529,8 @@ impl PredictionBookPanel {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .left(0.0)
-                    .top(0.0)
+                    .left(px(0.0))
+                    .top(px(0.0))
                     .size_full()
                     .flex_row()
                     .items_center()
@@ -745,7 +745,7 @@ impl PredictionBookPanel {
     }
 
     #[cfg(test)]
-    pub(crate) fn scroll_offset(&self, app: &App) -> Option<f32> {
+    pub(crate) fn scroll_offset(&self, app: &App) -> Option<LogicalPx> {
         self.built.as_ref().and_then(|built| built.list.offset(app))
     }
 
@@ -781,7 +781,7 @@ fn depth_map(grouped: &GroupedBook) -> AHashMap<DepthKey, f32> {
     depths
 }
 
-fn aligned_text(size: f32) -> TextStyle {
+fn aligned_text(size: LogicalPx) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.alignment = TextAlign::Right;
     style
@@ -795,7 +795,7 @@ fn build_row(
     language: Signal<LanguageCode>,
     translate: Translate,
     theme: ThemeHandle,
-    font_size: f32,
+    font_size: LogicalPx,
 ) -> Result<(), EngineError> {
     let container = NodeBuilder::boxed()
         .id(ROW_SELECTOR)
@@ -893,8 +893,8 @@ fn cell_role(read: &mut ReadCtx<'_>, rows: Signal<BookRows>, index: usize, colum
 }
 
 fn depth_canvas(
-    bounds: Rect,
-    offset: f32,
+    bounds: LogicalRect,
+    offset: LogicalPx,
     grouped: Option<&GroupedBook>,
     snapshot: &DepthSnapshot,
     ask_color: Color,
@@ -903,7 +903,7 @@ fn depth_canvas(
     let mut canvas = Canvas::new(bounds);
     let _ = canvas.push_clip(ClipRect {
         rect: bounds,
-        corner_radius: [0.0; 4],
+        corner_radius: [px(0.0); 4],
     });
     if let Some(grouped) = grouped {
         let count = grouped.asks.len() + 1 + grouped.bids.len();
@@ -911,8 +911,8 @@ fn depth_canvas(
         let visible = ((bounds.size.height / ROW_HEIGHT).ceil().max(1.0) as usize) + 1;
         let last = (first + visible).min(count);
         for index in first..last {
-            let top = bounds.origin.y + index as f32 * ROW_HEIGHT - offset;
-            let row = Rect::new(bounds.origin.x, top, bounds.size.width, ROW_HEIGHT);
+            let top = bounds.origin.y + ROW_HEIGHT * index as f32 - offset;
+            let row = LogicalRect::new(bounds.origin.x, top, bounds.size.width, ROW_HEIGHT);
             if row.origin.y + row.size.height <= bounds.origin.y
                 || row.origin.y >= bounds.origin.y + bounds.size.height
             {
@@ -924,12 +924,12 @@ fn depth_canvas(
                 Some(PanelRow::Spread) | None => continue,
             };
             let width = row.size.width * ratio;
-            if width <= 0.0 {
+            if width <= px(0.0) {
                 continue;
             }
             canvas.push_quad(Quad {
-                bounds: Rect::new(row.origin.x, row.origin.y, width, row.size.height),
-                corner_radius: [0.0; 4],
+                bounds: LogicalRect::new(row.origin.x, row.origin.y, width, row.size.height),
+                corner_radius: [px(0.0); 4],
                 paint: QuadPaint::Solid {
                     fill: color,
                     border: None,

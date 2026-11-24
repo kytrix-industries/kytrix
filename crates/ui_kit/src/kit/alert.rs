@@ -12,6 +12,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     interaction::ActionCtx,
+    math::px,
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -188,8 +189,8 @@ impl AlertBuilder {
         let track_theme = theme.clone();
         let track = StyleBuilder::new()
             .flex_col()
-            .width(PANEL_WIDTH)
-            .gap(8.0)
+            .width(px(PANEL_WIDTH))
+            .gap(px(8.0))
             .overflow_hidden()
             .build();
         let builder = NodeBuilder::boxed()
@@ -211,7 +212,7 @@ impl AlertBuilder {
         )?;
         let title_theme = title_color;
         NodeBuilder::text(self.title.clone(), {
-            let mut style = TextStyle::new(20.0);
+            let mut style = TextStyle::new(px(20.0));
             style.weight = 700;
             style.alignment = TextAlign::Center;
             style
@@ -227,7 +228,7 @@ impl AlertBuilder {
             root,
         )?;
         let msg_theme = message_color;
-        NodeBuilder::text(self.message.clone(), TextStyle::new(16.0))
+        NodeBuilder::text(self.message.clone(), TextStyle::new(px(16.0)))
             .bind_style(move |cx| StylePatch {
                 foreground: Some(msg_theme.role(cx, Role::FgDefault)),
                 ..StylePatch::default()
@@ -241,7 +242,7 @@ impl AlertBuilder {
         let mut input_node = None;
         if let Some(factory) = &self.input {
             let input_column = NodeBuilder::boxed()
-                .style(StyleBuilder::new().flex_col().gap(4.0).build())
+                .style(StyleBuilder::new().flex_col().gap(px(4.0)).build())
                 .build(
                     app.window_mut(window)
                         .ok_or(EngineError::UnknownWindow { window })?
@@ -255,7 +256,7 @@ impl AlertBuilder {
                 input_column,
             );
             let error_theme = theme.clone();
-            NodeBuilder::text("", TextStyle::new(14.0))
+            NodeBuilder::text("", TextStyle::new(px(14.0)))
                 .bind_text(move |cx| cx.read(&error).clone().unwrap_or_else(SmolStr::default))
                 .bind_style(move |cx| {
                     let visible = cx.read(&error).is_some();
@@ -274,7 +275,13 @@ impl AlertBuilder {
             input_node = Some(input);
         }
         let row = NodeBuilder::boxed()
-            .style(StyleBuilder::new().flex_row().width_full().gap(0.0).build())
+            .style(
+                StyleBuilder::new()
+                    .flex_row()
+                    .width_full()
+                    .gap(px(0.0))
+                    .build(),
+            )
             .build(
                 app.window_mut(window)
                     .ok_or(EngineError::UnknownWindow { window })?
@@ -434,6 +441,7 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{InputEvent, Modifiers, PointerButton},
+        math::px,
         node::{id::NodeId, tree::NodeKind},
         paint::{color::ColorResolver, style::Clip},
         test_support::{app::TestApp, probe::Selector},
@@ -509,7 +517,7 @@ mod tests {
 
     fn click(app: &mut TestApp, node: NodeId) {
         let bounds = app.probe().bounds(node).expect("bounds");
-        let point = ui_core::math::Point::new(
+        let point = ui_core::math::LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -579,7 +587,7 @@ mod tests {
             .probe()
             .bounds(harness.alert.ok_button().node().expect("ok"))
             .expect("ok bounds");
-        assert_eq!(panel.size.width, 384.0, "面板宽度 w_96");
+        assert_eq!(panel.size.width, px(384.0), "面板宽度 w_96");
         assert_eq!(ok.size.width, panel.size.width, "单按钮铺满面板");
         assert_eq!(ok.origin.x, panel.origin.x, "按钮贴面板左缘");
         let window = harness.app.window_id();
@@ -599,7 +607,7 @@ mod tests {
             .expect("message");
         match tree.get(message).expect("message").kind() {
             NodeKind::Text(content) => {
-                assert_eq!(content.style.size, 16.0, "消息继承旧 16 px 字号")
+                assert_eq!(content.style.size, px(16.0), "消息继承旧 16 px 字号")
             }
             other => panic!("expected Text, got {other:?}"),
         }
@@ -620,13 +628,13 @@ mod tests {
         let ok = probe.bounds(ok_node).expect("ok bounds");
         let cancel = probe.bounds(cancel_node).expect("cancel bounds");
         assert!(
-            (ok.size.width - cancel.size.width).abs() < 0.5,
+            (ok.size.width - cancel.size.width).abs() < px(0.5),
             "两按钮等分（ok {} / cancel {}）",
             ok.size.width,
             cancel.size.width
         );
         assert!(
-            (ok.size.width + cancel.size.width - panel.size.width).abs() < 0.5,
+            (ok.size.width + cancel.size.width - panel.size.width).abs() < px(0.5),
             "两按钮合计铺满面板（{} + {} vs {}）",
             ok.size.width,
             cancel.size.width,
@@ -647,7 +655,7 @@ mod tests {
             let center = text_bounds.origin.x + text_bounds.size.width / 2.0;
             let button_center = bounds.origin.x + bounds.size.width / 2.0;
             assert!(
-                (center - button_center).abs() < 1.0,
+                (center - button_center).abs() < px(1.0),
                 "{label} 的文字必须居中（{center} vs {button_center}）"
             );
         }
@@ -863,7 +871,7 @@ mod tests {
             "错误出现后错误行可见"
         );
         match tree.get(error).expect("error").kind() {
-            NodeKind::Text(content) => assert_eq!(content.style.size, 14.0, "错误行字号 14 px"),
+            NodeKind::Text(content) => assert_eq!(content.style.size, px(14.0), "错误行字号 14 px"),
             other => panic!("expected Text, got {other:?}"),
         }
         let danger = Theme::of(Appearance::Light).role(Role::StatusDangerBase);

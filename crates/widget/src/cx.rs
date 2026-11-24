@@ -199,7 +199,7 @@ mod tests {
     use smol_str::format_smolstr;
     use ui_core::{
         event::Action,
-        math::Rect,
+        math::{LogicalRect, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
         paint::canvas::Canvas,
     };
@@ -271,15 +271,23 @@ mod tests {
         let mut harness = WidgetTestApp::new();
         let node = harness.with_cx(|cx| {
             let parent = cx.tree().root();
-            NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0)))
-                .build(cx.tree_mut(), parent)
-                .expect("the root is alive")
+            NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(8.0),
+                px(8.0),
+            )))
+            .build(cx.tree_mut(), parent)
+            .expect("the root is alive")
         });
 
         let changed = harness
             .with_cx(|cx| {
                 cx.window_mut();
-                cx.set_canvas(node, Canvas::new(Rect::new(0.0, 0.0, 16.0, 16.0)))
+                cx.set_canvas(
+                    node,
+                    Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0))),
+                )
             })
             .expect("the node is alive");
 

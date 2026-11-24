@@ -16,7 +16,7 @@ use kytrix_service_provider::service::{
 use network::transport::error::TransportError;
 use ui_core::{
     event::{ActionSource, Modifiers},
-    math::Point,
+    math::LogicalPoint,
     node::{signal::SignalScope, tree::NodeKind},
 };
 use ui_kit::kit::button::Button;
@@ -350,7 +350,7 @@ fn largest_image_node(harness: &WidgetTestApp, root: NodeId) -> Option<NodeId> {
     while let Some(node) = stack.pop() {
         let target = tree.get(node).expect("the node exists");
         if matches!(target.kind(), NodeKind::Image(_)) {
-            let width = target.layout().bounds.size.width;
+            let width = target.layout().bounds.size.width.value();
             if best.is_none_or(|(_, best)| width > best) {
                 best = Some((node, width));
             }
@@ -382,7 +382,7 @@ fn build_header(harness: &mut WidgetTestApp, pane: &mut Pane) {
     .expect("the header control builds");
 }
 
-fn click_at(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
+fn click_at(harness: &mut WidgetTestApp, pane: &mut Pane, position: LogicalPoint) -> bool {
     let event = Event::Input(InputEvent::PointerUp {
         position,
         button: PointerButton::Primary,
@@ -399,7 +399,7 @@ fn click_node(harness: &mut WidgetTestApp, pane: &mut Pane, node: NodeId) -> boo
         .expect("the node is alive")
         .layout()
         .bounds;
-    let centre = Point::new(
+    let centre = LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     );
@@ -1504,7 +1504,7 @@ fn a_picture_that_landed_should_be_drawn_as_an_image() {
         .layout()
         .bounds;
     assert!(
-        bounds.size.width > 100.0,
+        bounds.size.width.value() > 100.0,
         "the picture fills its tile rather than being the tile's placeholder mark"
     );
     assert_eq!(
@@ -1579,7 +1579,7 @@ fn a_frame_should_offer_a_failed_picture_again() {
         .expect("the window root")
         .layout()
         .bounds;
-    let point = Point::new(
+    let point = LogicalPoint::new(
         bounds.origin.x + 2.0,
         bounds.origin.y.max(window.origin.y) + 2.0,
     );
@@ -1786,7 +1786,7 @@ fn a_click_on_a_link_should_open_the_link_not_the_tweet() {
         .expect("the text node is alive")
         .layout()
         .bounds;
-    let point = Point::new(
+    let point = LogicalPoint::new(
         bounds.origin.x + 8.0,
         bounds.origin.y + bounds.size.height / 2.0,
     );

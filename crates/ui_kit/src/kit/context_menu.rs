@@ -1,7 +1,13 @@
 use std::{cell::RefCell, fmt, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
-use ui_core::{app::App, error::EngineError, math::Point, node::id::NodeId, window::WindowId};
+use ui_core::{
+    app::App,
+    error::EngineError,
+    math::{LogicalPoint, LogicalPx, px},
+    node::id::NodeId,
+    window::WindowId,
+};
 
 use crate::kit::{
     layer::{Band, Layer},
@@ -29,8 +35,8 @@ impl MenuAnchor {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContextMenuOptions {
     pub size: UnifiedSize,
-    pub width: f32,
-    pub max_height: f32,
+    pub width: LogicalPx,
+    pub max_height: LogicalPx,
     pub anchor: MenuAnchor,
     pub label: Option<SmolStr>,
 }
@@ -39,8 +45,8 @@ impl Default for ContextMenuOptions {
     fn default() -> Self {
         Self {
             size: UnifiedSize::Medium,
-            width: 200.0,
-            max_height: 320.0,
+            width: px(200.0),
+            max_height: px(320.0),
             anchor: MenuAnchor::TopLeft,
             label: None,
         }
@@ -49,13 +55,13 @@ impl Default for ContextMenuOptions {
 
 impl ContextMenuOptions {
     #[must_use]
-    pub fn width(mut self, width: f32) -> Self {
+    pub fn width(mut self, width: LogicalPx) -> Self {
         self.width = width;
         self
     }
 
     #[must_use]
-    pub fn max_height(mut self, max_height: f32) -> Self {
+    pub fn max_height(mut self, max_height: LogicalPx) -> Self {
         self.max_height = max_height;
         self
     }
@@ -155,7 +161,7 @@ impl ContextMenu {
         &self,
         app: &mut App,
         window: WindowId,
-        point: Point,
+        point: LogicalPoint,
     ) -> Result<bool, OverlayError> {
         self.close_peers(app, window);
         *self.inner.window.borrow_mut() = Some(window);
@@ -169,7 +175,7 @@ impl ContextMenu {
         &self,
         app: &mut App,
         window: WindowId,
-        point: Point,
+        point: LogicalPoint,
         highlighted: Option<&str>,
     ) -> Result<bool, OverlayError> {
         self.close_peers(app, window);
@@ -250,7 +256,7 @@ fn menu_options(options: &ContextMenuOptions) -> MenuOptions {
         max_height: options.max_height,
         mode: MenuMode::Menu,
         placement: options.anchor.placement(),
-        gap: 0.0,
+        gap: LogicalPx::ZERO,
         band: Band::ContextMenu,
         label: options.label.clone(),
         submenu_delay: std::time::Duration::from_millis(150),
@@ -268,7 +274,6 @@ impl fmt::Debug for ContextMenu {
 
 #[cfg(test)]
 mod tests {
-
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -280,7 +285,7 @@ mod tests {
         a11y::A11yRole,
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         interaction::ScrollConfig,
-        math::{Point, Rect, Size},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
@@ -319,7 +324,7 @@ mod tests {
             let sink = clicks.clone();
             NodeBuilder::boxed()
                 .id("background")
-                .layout_override(Rect::new(600.0, 500.0, 80.0, 40.0))
+                .layout_override(LogicalRect::new(px(600.0), px(500.0), px(80.0), px(40.0)))
                 .on_click(Action::Custom(SmolStr::new_static("background.click")))
                 .build(
                     app.app_mut().window_mut(window).expect("窗口").tree_mut(),
@@ -366,7 +371,7 @@ mod tests {
             .on_close(move |_| closes.set(closes.get() + 1))
         }
 
-        fn open(&mut self, menu: &ContextMenu, at: Point) -> bool {
+        fn open(&mut self, menu: &ContextMenu, at: LogicalPoint) -> bool {
             let opened = menu
                 .open(self.app.app_mut(), self.window, at)
                 .expect("打开");
@@ -386,7 +391,7 @@ mod tests {
             let _ = self.app.drain().expect("帧");
         }
 
-        fn click(&mut self, menu: &ContextMenu, at: Point) {
+        fn click(&mut self, menu: &ContextMenu, at: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 at,
                 PointerButton::Primary,
@@ -410,7 +415,7 @@ mod tests {
             self.settle(menu);
         }
 
-        fn bounds(&self, node: NodeId) -> Rect {
+        fn bounds(&self, node: NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("布局盒")
         }
 
@@ -428,18 +433,18 @@ mod tests {
             None
         }
 
-        fn row_center(&self, index: usize) -> Point {
+        fn row_center(&self, index: usize) -> LogicalPoint {
             let node = self
                 .find(&format!("context:menu:panel:list:row:{index}"))
                 .unwrap_or_else(|| panic!("第 {index} 行未挂载"));
             let bounds = self.bounds(node);
-            Point::new(
+            LogicalPoint::new(
                 bounds.origin.x + bounds.size.width / 2.0,
                 bounds.origin.y + bounds.size.height / 2.0,
             )
         }
 
-        fn hover(&mut self, menu: &ContextMenu, at: Point) {
+        fn hover(&mut self, menu: &ContextMenu, at: LogicalPoint) {
             let _ = self
                 .app
                 .inject(InputEvent::pointer_move(at, Modifiers::empty()));
@@ -461,7 +466,7 @@ mod tests {
 
     fn options() -> ContextMenuOptions {
         ContextMenuOptions {
-            width: 200.0,
+            width: px(200.0),
             ..ContextMenuOptions::default()
         }
     }
@@ -470,11 +475,11 @@ mod tests {
     fn the_menu_opens_with_its_top_left_corner_on_the_point() {
         let mut harness = Harness::new();
         let menu = harness.menu(options());
-        let point = Point::new(300.0, 200.0);
+        let point = LogicalPoint::new(px(300.0), px(200.0));
         assert!(harness.open(&menu, point));
         let panel = harness.bounds(menu.panel_node().expect("面板"));
         assert_eq!(panel.origin, point, "TopLeft 锚点：面板左上角在点上");
-        assert_eq!(panel.size.width, 200.0, "面板宽度 = 构造参数");
+        assert_eq!(panel.size.width.value(), 200.0, "面板宽度 = 构造参数");
     }
 
     #[test]
@@ -484,12 +489,12 @@ mod tests {
             anchor: MenuAnchor::BottomLeft,
             ..options()
         });
-        let point = Point::new(300.0, 300.0);
+        let point = LogicalPoint::new(px(300.0), px(300.0));
         assert!(harness.open(&menu, point));
         let panel = harness.bounds(menu.panel_node().expect("面板"));
         assert_eq!(panel.origin.x, point.x, "左下角锚点：左边缘在点上");
         assert!(
-            (panel.max().y - point.y).abs() < 0.5,
+            (panel.max().y - point.y).abs().value() < 0.5,
             "左下角锚点：底边在点上（实际 {panel:?} / 点 {point:?}）"
         );
     }
@@ -498,10 +503,11 @@ mod tests {
     fn the_menu_stays_inside_the_viewport_near_an_edge() {
         let mut harness = Harness::new();
         let menu = harness.menu(options());
-        assert!(harness.open(&menu, Point::new(790.0, 590.0)));
+        assert!(harness.open(&menu, LogicalPoint::new(px(790.0), px(590.0))));
         let panel = harness.bounds(menu.panel_node().expect("面板"));
         assert!(
-            panel.max().x <= 800.0 - 4.0 + 0.5 && panel.max().y <= 600.0 - 4.0 + 0.5,
+            panel.max().x.value() <= 800.0 - 4.0 + 0.5
+                && panel.max().y.value() <= 600.0 - 4.0 + 0.5,
             "贴边时被 clamp 进视口（留 4 px 边距）：{panel:?}"
         );
     }
@@ -510,7 +516,7 @@ mod tests {
     fn choosing_an_entry_closes_the_menu_before_reporting_it() {
         let mut harness = Harness::new();
         let menu = harness.menu(options());
-        harness.open(&menu, Point::new(300.0, 200.0));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
         let at = harness.row_center(1);
         harness.click(&menu, at);
 
@@ -527,8 +533,8 @@ mod tests {
     fn a_press_outside_closes_the_menu_and_does_not_reach_the_page() {
         let mut harness = Harness::new();
         let menu = harness.menu(options());
-        harness.open(&menu, Point::new(300.0, 200.0));
-        harness.click(&menu, Point::new(640.0, 520.0));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
+        harness.click(&menu, LogicalPoint::new(px(640.0), px(520.0)));
         assert!(!menu.is_open(harness.app.app()), "外部按下关闭菜单");
         assert_eq!(
             harness.background_clicks.get(),
@@ -541,12 +547,12 @@ mod tests {
     fn escape_closes_the_menu() {
         let mut harness = Harness::new();
         let menu = harness.menu(options());
-        harness.open(&menu, Point::new(300.0, 200.0));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
         harness.key(&menu, KeyCode::Escape);
         assert!(!menu.is_open(harness.app.app()));
         assert_eq!(harness.closes.get(), 1);
 
-        harness.open(&menu, Point::new(300.0, 200.0));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
         assert!(menu.close_now(harness.app.app_mut()));
         harness.settle(&menu);
         assert!(!menu.is_open(harness.app.app()));
@@ -558,9 +564,9 @@ mod tests {
         let mut harness = Harness::new();
         let first = harness.menu(options());
         let second = harness.menu(options());
-        harness.open(&first, Point::new(300.0, 200.0));
+        harness.open(&first, LogicalPoint::new(px(300.0), px(200.0)));
         assert!(first.is_open(harness.app.app()));
-        harness.open(&second, Point::new(400.0, 300.0));
+        harness.open(&second, LogicalPoint::new(px(400.0), px(300.0)));
         harness.settle(&first);
         assert!(
             !first.is_open(harness.app.app()),
@@ -573,7 +579,7 @@ mod tests {
     fn reopening_closes_the_previous_submenu() {
         let mut harness = Harness::new();
         let menu = harness.menu_with(entries_with_submenu(), options());
-        harness.open(&menu, Point::new(300.0, 200.0));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
         let root_panel = menu.panel_node().expect("根面板");
         let at = harness.row_center(1);
         harness.hover(&menu, at);
@@ -585,7 +591,7 @@ mod tests {
         );
         assert_eq!(harness.layer.len(harness.window), 2, "根菜单 + 子菜单两层");
 
-        harness.open(&menu, Point::new(200.0, 150.0));
+        harness.open(&menu, LogicalPoint::new(px(200.0), px(150.0)));
         assert!(
             harness
                 .find("context:menu:sub:1:panel:list:row:0")
@@ -628,7 +634,7 @@ mod tests {
             .open_at(
                 harness.app.app_mut(),
                 harness.window,
-                Point::new(300.0, 200.0),
+                LogicalPoint::new(px(300.0), px(200.0)),
                 Some("paste"),
             )
             .expect("打开");
@@ -645,7 +651,7 @@ mod tests {
             label: Some(SmolStr::new_static("编辑")),
             ..options()
         });
-        harness.open(&menu, Point::new(300.0, 200.0));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
         assert!(menu.is_open(harness.app.app()));
         let _ = harness.app.drain().expect("帧");
         harness.app.assert_a11y_contract();
@@ -695,8 +701,8 @@ mod tests {
                 .style(
                     StyleBuilder::new()
                         .relative()
-                        .width(800.0)
-                        .height(600.0)
+                        .width(px(800.0))
+                        .height(px(600.0))
                         .overflow_hidden()
                         .build(),
                 )
@@ -711,15 +717,15 @@ mod tests {
         harness
             .app
             .app_mut()
-            .set_scroll_content(&handle, Size::new(800.0, 2400.0))
+            .set_scroll_content(&handle, LogicalSize::new(px(800.0), px(2400.0)))
             .expect("内容");
         handle
     }
 
-    fn wheel(harness: &mut Harness, menu: &ContextMenu, at: Point) {
+    fn wheel(harness: &mut Harness, menu: &ContextMenu, at: LogicalPoint) {
         let _ = harness.app.inject(InputEvent::scroll_lines(
             at,
-            Point::new(0.0, -2.0),
+            LogicalPoint::new(px(0.0), px(-2.0)),
             Modifiers::empty(),
         ));
         harness.settle(menu);
@@ -730,20 +736,22 @@ mod tests {
     }
 
     fn page_offset(harness: &Harness, handle: &ui_core::interaction::ScrollHandle) -> f32 {
-        harness
-            .app
-            .app()
-            .scroll_state(handle)
-            .expect("滚动状态")
-            .offset
-            .y
+        f32::from(
+            harness
+                .app
+                .app()
+                .scroll_state(handle)
+                .expect("滚动状态")
+                .offset
+                .y,
+        )
     }
 
     #[test]
     fn a_submenu_keeps_the_context_menu_band_and_escape_closes_it_first() {
         let mut harness = Harness::new();
         let menu = harness.menu_with(entries_with_submenu(), options());
-        harness.open(&menu, Point::new(300.0, 200.0));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
         let root_panel = menu.panel_node().expect("根面板");
         let root_wrapper = overlay_wrapper(harness.app.app(), harness.window, root_panel);
         let before = harness.root_children();
@@ -821,16 +829,16 @@ mod tests {
         let mut harness = Harness::new();
         let page = scroll_page(&mut harness);
         let menu = harness.menu(options());
-        harness.open(&menu, Point::new(300.0, 200.0));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
 
-        wheel(&mut harness, &menu, Point::new(700.0, 500.0));
+        wheel(&mut harness, &menu, LogicalPoint::new(px(700.0), px(500.0)));
         assert_eq!(page_offset(&harness, &page), 0.0, "面板外滚轮不滚页面");
         let on_panel = harness.row_center(0);
         wheel(&mut harness, &menu, on_panel);
         assert_eq!(page_offset(&harness, &page), 0.0, "面板上滚轮不滚页面");
 
         harness.key(&menu, KeyCode::Escape);
-        wheel(&mut harness, &menu, Point::new(700.0, 500.0));
+        wheel(&mut harness, &menu, LogicalPoint::new(px(700.0), px(500.0)));
         assert!(
             page_offset(&harness, &page) > 50.0,
             "无浮层时页面可滚：{}",

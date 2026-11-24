@@ -30,6 +30,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -60,7 +61,7 @@ use crate::{host::SelectorHost, instrument_button::ConfirmHandler, ui::build_nod
 const DIALOG_WIDTH: f32 = 720.0;
 const DIALOG_HEIGHT: f32 = 520.0;
 const VENUE_COLUMN_WIDTH: f32 = 180.0;
-const ROW_HEIGHT: f32 = 26.0;
+const ROW_HEIGHT: LogicalPx = px(26.0);
 const KEY_BASE: &str = "instrument-selector";
 const PANEL_ID: &str = "INSTRUMENT_SELECTOR";
 
@@ -497,10 +498,10 @@ impl SelectorState {
                 .id(PANEL_ID)
                 .style(
                     StyleBuilder::new()
-                        .width(DIALOG_WIDTH)
-                        .height(DIALOG_HEIGHT)
+                        .width(px(DIALOG_WIDTH))
+                        .height(px(DIALOG_HEIGHT))
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_height_0()
                         .build(),
                 )
@@ -513,7 +514,7 @@ impl SelectorState {
                     StyleBuilder::new()
                         .flex_row()
                         .flex_1()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -525,7 +526,7 @@ impl SelectorState {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(VENUE_COLUMN_WIDTH)
+                        .width(px(VENUE_COLUMN_WIDTH))
                         .height_full()
                         .flex_none()
                         .min_height_0()
@@ -548,7 +549,7 @@ impl SelectorState {
                     StyleBuilder::new()
                         .flex_col()
                         .flex_1()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -631,7 +632,7 @@ impl SelectorState {
                         .flex_1()
                         .items_center()
                         .justify_center()
-                        .padding(8.0)
+                        .padding(px(8.0))
                         .build(),
                 )
                 .bind_style({
@@ -1046,7 +1047,7 @@ fn themed_panel(
     move |cx| StylePatch {
         background: Some(theme.role(cx, Role::SurfaceRaised)),
         border: Some(Border {
-            width: 1.0,
+            width: px(1.0),
             color: theme.role(cx, Role::LineBorder),
         }),
         ..StylePatch::default()
@@ -1075,7 +1076,7 @@ fn build_listing_row(
                 .flex_row()
                 .items_center()
                 .width_full()
-                .padding_x(8.0)
+                .padding_x(px(8.0))
                 .min_height_0()
                 .build(),
         )

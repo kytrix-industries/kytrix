@@ -17,6 +17,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     event::{Event, InputEvent},
+    math::px,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
@@ -373,10 +374,10 @@ where
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .left(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
@@ -995,7 +996,7 @@ where
                     .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -1042,7 +1043,7 @@ where
                     .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;

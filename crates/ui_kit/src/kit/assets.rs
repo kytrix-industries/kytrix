@@ -5,9 +5,10 @@ use bytes::Bytes;
 use smol_str::SmolStr;
 use ui_core::{
     app::App,
-    math::Size,
+    math::{LogicalSize, px},
     node::image::ImageSource,
     resources::{DecodeCause, DecodeState, PendingResource, ResourceImage},
+    window::WindowId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -25,13 +26,13 @@ pub struct Asset {
 
 impl Asset {
     #[must_use]
-    pub fn native_size(&self) -> Option<Size> {
+    pub fn native_size(&self) -> Option<LogicalSize> {
         let (width, height) = image::ImageReader::new(std::io::Cursor::new(self.bytes))
             .with_guessed_format()
             .ok()?
             .into_dimensions()
             .ok()?;
-        Some(Size::new(width as f32, height as f32))
+        Some(LogicalSize::new(px(width as f32), px(height as f32)))
     }
 }
 
@@ -111,7 +112,7 @@ impl AssetImageState {
     pub fn node_source(&self) -> Option<ImageSource> {
         match self {
             AssetImageState::Pending(pending) => Some(ImageSource::Pending(*pending)),
-            AssetImageState::Ready(image) => Some(ImageSource::Ready(image.id)),
+            AssetImageState::Ready(image) => Some(ImageSource::Ready(image.id())),
             AssetImageState::Failed(_) => None,
         }
     }
@@ -138,8 +139,8 @@ impl AssetImages {
     pub fn request(
         &mut self,
         app: &mut App,
+        window: WindowId,
         path: &str,
-        display: Size,
     ) -> Result<AssetImageState, AssetError> {
         let asset = find(path).ok_or_else(|| AssetError::UnknownAsset {
             path: SmolStr::new(path),
@@ -148,8 +149,8 @@ impl AssetImages {
             return Ok(state.clone());
         }
         let pending = app
-            .resources_mut()
-            .insert_async_at_size(Bytes::from_static(asset.bytes), display);
+            .insert_bitmap_async_for_window(window, Bytes::from_static(asset.bytes))
+            .map_err(|_| AssetError::UnknownWindow { window })?;
         let path = SmolStr::new(path);
         self.pending.insert(pending, path.clone());
         let state = AssetImageState::Pending(pending);
@@ -160,10 +161,10 @@ impl AssetImages {
     pub fn request_source(
         &mut self,
         app: &mut App,
+        window: WindowId,
         path: &str,
-        display: Size,
     ) -> Result<Option<ImageSource>, AssetError> {
-        let state = self.request(app, path, display)?;
+        let state = self.request(app, window, path)?;
         Ok(state.node_source())
     }
 
@@ -221,6 +222,7 @@ impl AssetImages {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AssetError {
     UnknownAsset { path: SmolStr },
+    UnknownWindow { window: WindowId },
 }
 
 impl fmt::Display for AssetError {
@@ -228,6 +230,9 @@ impl fmt::Display for AssetError {
         match self {
             AssetError::UnknownAsset { path } => {
                 write!(formatter, "unknown asset `{path}`")
+            }
+            AssetError::UnknownWindow { window } => {
+                write!(formatter, "asset target window {window:?} is closed")
             }
         }
     }
@@ -241,19 +246,19 @@ mod tests {
     use smol_str::SmolStr;
     use ui_core::{
         app::App,
-        math::{Rect, Size},
+        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
         node::{
             builder::NodeBuilder,
             image::{ImageFit, ImageSource},
             tree::NodeKind,
         },
         paint::{primitive::Primitive, style::Style},
-        resources::ResourceImage,
         window::WindowId,
     };
 
     use super::{
-        ASSETS, AssetError, AssetImageState, AssetImages, AssetKind, AssetLoaded, bytes, find, list,
+        ASSETS, Asset, AssetError, AssetImageState, AssetImages, AssetKind, AssetLoaded, bytes,
+        find, list,
     };
     use crate::kit::test_support::DecodeApp;
 
@@ -309,20 +314,30 @@ mod tests {
     #[test]
     fn native_sizes_come_from_the_file_header() {
         let ethereum = find("brands/Ethereum/colored@72px.png").expect("Ethereum");
-        assert_eq!(ethereum.native_size(), Some(Size::new(44.0, 72.0)));
+        assert_eq!(
+            ethereum.native_size(),
+            Some(LogicalSize::new(px(44.0), px(72.0)))
+        );
         let solana = find("brands/Solana/colored@72px.png").expect("Solana");
-        assert_eq!(solana.native_size(), Some(Size::new(81.0, 72.0)));
+        assert_eq!(
+            solana.native_size(),
+            Some(LogicalSize::new(px(81.0), px(72.0)))
+        );
         let binance = find("brands/Binance/binance.png").expect("Binance");
-        assert_eq!(binance.native_size(), Some(Size::new(128.0, 128.0)));
+        assert_eq!(
+            binance.native_size(),
+            Some(LogicalSize::new(px(128.0), px(128.0)))
+        );
     }
 
     #[test]
     fn async_asset_decoding_is_delivered_by_the_engine_poll() {
         let mut harness = DecodeApp::new();
+        let window = harness.window_id();
         let mut images = AssetImages::new();
         let path = "brands/Hyperliquid/hyperliquid.png";
         let state = images
-            .request(harness.app_mut(), path, Size::new(24.0, 24.0))
+            .request(harness.app_mut(), window, path)
             .expect("已登记的资产");
         let AssetImageState::Pending(pending) = state else {
             panic!("首次请求必须是 Pending，实际 {state:?}");
@@ -343,34 +358,32 @@ mod tests {
         let AssetImageState::Ready(image) = loaded[0].state else {
             panic!("Hyperliquid logo 应解码成功，实际是 {:?}", loaded[0].state);
         };
-        assert_eq!((image.width, image.height), (24, 24));
         assert_eq!(
-            images.image(path),
-            Some(ResourceImage {
-                id: image.id,
-                tile: image.tile,
-                width: 24,
-                height: 24,
-            })
+            image.intrinsic(DevicePixelRatio::ONE),
+            find(path)
+                .and_then(Asset::native_size)
+                .expect("Hyperliquid 必须是可读文件头的位图"),
+            "位图按原生像素登记，内在逻辑尺寸 = 原生 / DPR"
         );
+        assert_eq!(images.image(path), Some(image));
         assert_eq!(
             images.node_source(path),
-            Some(ImageSource::Ready(image.id)),
+            Some(ImageSource::Ready(image.id())),
             "Ready 状态必须给出 E7 图片节点的资源句柄"
         );
 
         assert!(images.poll(harness.app_mut()).is_empty());
         assert_eq!(
             images
-                .request(harness.app_mut(), path, Size::new(24.0, 24.0))
+                .request(harness.app_mut(), window, path)
                 .expect("已登记"),
             AssetImageState::Ready(image)
         );
         assert_eq!(
             images
-                .request_source(harness.app_mut(), path, Size::new(24.0, 24.0))
+                .request_source(harness.app_mut(), window, path)
                 .expect("已登记"),
-            Some(ImageSource::Ready(image.id)),
+            Some(ImageSource::Ready(image.id())),
             "去重命中时 request_source 必须直接给出 Ready 来源"
         );
     }
@@ -378,12 +391,13 @@ mod tests {
     #[test]
     fn a_failed_decode_has_no_image_source() {
         let mut harness = DecodeApp::new();
+        let window = harness.window_id();
         let mut images = AssetImages::new();
         let path = "widgets/news.png";
         let pending = harness
             .app_mut()
-            .resources_mut()
-            .insert_async_at_size(Bytes::from_static(b"not a png"), Size::new(8.0, 8.0));
+            .insert_bitmap_async_for_window(window, Bytes::from_static(b"not a png"))
+            .expect("测试窗口存在");
         images.pending.insert(pending, SmolStr::new_static(path));
         images
             .entries
@@ -409,7 +423,7 @@ mod tests {
         );
         assert_eq!(
             images
-                .request_source(harness.app_mut(), path, Size::new(8.0, 8.0))
+                .request_source(harness.app_mut(), window, path)
                 .expect("已登记的路径"),
             None,
             "Failed 后 request_source 不得重新投递或给出来源"
@@ -419,20 +433,20 @@ mod tests {
     #[test]
     fn a_pending_asset_node_repaints_when_the_decode_arrives() {
         let mut harness = DecodeApp::new();
+        let window = harness.window_id();
         let mut images = AssetImages::new();
         let path = "brands/Binance/binance.png";
         let source = images
-            .request_source(harness.app_mut(), path, Size::new(24.0, 24.0))
+            .request_source(harness.app_mut(), window, path)
             .expect("已登记的资产")
             .expect("首次请求必须是可挂来源（Pending）");
         let ImageSource::Pending(pending) = source else {
             panic!("首次请求必须是 Pending（异步宿主），实际 {source:?}");
         };
 
-        let window = harness.window_id();
         let root = harness.app().window(window).expect("窗口").tree().root();
         let mut style = Style::default();
-        style.size_length(24.0, 24.0);
+        style.size_length(px(24.0), px(24.0));
         let node = NodeBuilder::image_pending(pending, ImageFit::Contain)
             .style(style)
             .build(
@@ -476,7 +490,7 @@ mod tests {
         assert_eq!(painted.len(), 1, "资源到达后必须画出图片图元：{painted:?}");
         assert_eq!(
             painted[0].bounds,
-            Rect::new(0.0, 0.0, 24.0, 24.0),
+            LogicalRect::new(px(0.0), px(0.0), px(24.0), px(24.0)),
             "Binance 是正方形，Contain 填满正方形节点盒"
         );
     }
@@ -508,15 +522,16 @@ mod tests {
     #[test]
     fn two_caches_share_the_delivery_buffer_without_swallowing() {
         let mut harness = DecodeApp::new();
+        let window = harness.window_id();
         let mut first = AssetImages::new();
         let mut second = AssetImages::new();
         let first_path = "brands/Hyperliquid/hyperliquid.png";
         let second_path = "brands/Binance/binance.png";
         first
-            .request(harness.app_mut(), first_path, Size::new(24.0, 24.0))
+            .request(harness.app_mut(), window, first_path)
             .expect("已登记的资产");
         second
-            .request(harness.app_mut(), second_path, Size::new(16.0, 16.0))
+            .request(harness.app_mut(), window, second_path)
             .expect("已登记的资产");
 
         let mut first_loaded: Vec<AssetLoaded> = Vec::new();
@@ -557,9 +572,10 @@ mod tests {
     #[test]
     fn unknown_assets_are_typed_errors() {
         let mut harness = DecodeApp::new();
+        let window = harness.window_id();
         let mut images = AssetImages::new();
         let error = images
-            .request(harness.app_mut(), "widgets/nope.png", Size::new(8.0, 8.0))
+            .request(harness.app_mut(), window, "widgets/nope.png")
             .expect_err("未登记必须失败");
         assert_eq!(
             error,

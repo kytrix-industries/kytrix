@@ -6,6 +6,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
+    math::px,
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -90,10 +91,10 @@ impl Progress {
                 StyleBuilder::new()
                     .flex_row()
                     .width_full()
-                    .height(TRACK_HEIGHT)
+                    .height(px(TRACK_HEIGHT))
                     .build(),
             )
-            .paint(PaintBuilder::new().rounded(2.0).build())
+            .paint(PaintBuilder::new().rounded(px(2.0)).build())
             .bind_style(move |cx| StylePatch {
                 background: Some(theme_track.components(cx).progress.track),
                 ..StylePatch::default()
@@ -120,7 +121,7 @@ impl Progress {
         let indicator = NodeBuilder::boxed()
             .id(format_smolstr!("{}:indicator", self.inner.key))
             .style(indicator_style(initial))
-            .paint(PaintBuilder::new().rounded(2.0).build())
+            .paint(PaintBuilder::new().rounded(px(2.0)).build())
             .bind_style(move |cx| StylePatch {
                 background: Some(theme_indicator.components(cx).progress.progress),
                 ..StylePatch::default()
@@ -197,7 +198,7 @@ fn clamp_percent(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use ui_core::{
-        a11y::A11yRole, node::id::NodeId, paint::style_builder::StyleBuilder,
+        a11y::A11yRole, math::px, node::id::NodeId, paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
     };
 
@@ -220,7 +221,12 @@ mod tests {
         let parent = {
             let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
             ui_core::node::builder::NodeBuilder::boxed()
-                .style(StyleBuilder::new().width(200.0).height(20.0).build())
+                .style(
+                    StyleBuilder::new()
+                        .width(px(200.0))
+                        .height(px(20.0))
+                        .build(),
+                )
                 .build(tree, root)
                 .expect("parent")
         };
@@ -248,10 +254,10 @@ mod tests {
             .probe()
             .bounds(harness.indicator)
             .expect("indicator");
-        assert_eq!(track.size.height, 8.0);
-        assert!((track.size.width - 200.0).abs() < 0.5, "轨道撑满父盒");
+        assert_eq!(track.size.height, px(8.0));
+        assert!((track.size.width - 200.0).abs() < px(0.5), "轨道撑满父盒");
         assert!(
-            (indicator.size.width - 80.0).abs() < 0.5,
+            (indicator.size.width - 80.0).abs() < px(0.5),
             "40% 的 200 px 是 80 px（实际 {}）",
             indicator.size.width
         );
@@ -275,7 +281,7 @@ mod tests {
             .bounds(harness.indicator)
             .expect("indicator");
         assert!(
-            (indicator.size.width - 140.0).abs() < 0.5,
+            (indicator.size.width - 140.0).abs() < px(0.5),
             "70% 的 200 px 是 140 px（实际 {}）",
             indicator.size.width
         );

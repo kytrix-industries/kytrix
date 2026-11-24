@@ -9,6 +9,7 @@ use smol_str::{SmolStr, format_smolstr};
 use time::UtcOffset;
 use ui_core::{
     app::App,
+    math::{LogicalPx, px},
     paint::color::Color,
     text::{ShapedTextHandle, TextStyle},
 };
@@ -16,15 +17,15 @@ use ui_kit::theme::components::ChartColors;
 
 use crate::{model::CandlePrices, time::format_crosshair_time};
 
-pub(crate) const AXIS_FONT_SIZE: f32 = 10.0;
-pub(crate) const READOUT_FONT_SIZE: f32 = 11.0;
-pub(crate) const TEXT_ROW_HEIGHT: f32 = 14.0;
+pub(crate) const AXIS_FONT_SIZE: LogicalPx = px(10.0);
+pub(crate) const READOUT_FONT_SIZE: LogicalPx = px(11.0);
+pub(crate) const TEXT_ROW_HEIGHT: LogicalPx = px(14.0);
 const TEXT_CACHE_CAPACITY: usize = 256;
 const READOUT_KEY_WEIGHT: u16 = 700;
 
 const MISSING_VOLUME: &str = "—";
 
-pub(crate) fn style_of(size: f32, color: Color) -> TextStyle {
+pub(crate) fn style_of(size: LogicalPx, color: Color) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.color = color;
     style
@@ -90,7 +91,7 @@ impl ChartTextCache {
         handle
     }
 
-    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
+    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
         self.line(app, text, style).size().width
     }
 
@@ -114,7 +115,7 @@ impl ChartTextCache {
     pub(crate) fn shaped_scales(&self) -> Vec<f32> {
         self.entries
             .iter()
-            .map(|entry| entry.handle.scale())
+            .map(|entry| entry.handle.scale().factor())
             .collect()
     }
 }
@@ -268,7 +269,7 @@ impl ReadoutCache {
                     .presentation
                     .runs
                     .iter()
-                    .map(|run| run.handle.scale())
+                    .map(|run| run.handle.scale().factor())
                     .collect()
             })
             .unwrap_or_default()
@@ -398,7 +399,7 @@ fn shape_readout(
         let handle = Arc::new(shape_line(app, &span.text, style));
         let width = handle.size().width;
         runs.push(ReadoutRun { handle, x });
-        x += width;
+        x += f32::from(width);
     }
     (runs.into(), x)
 }

@@ -4,6 +4,7 @@ use i18n::language::codes::LanguageCode;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     event::{Action, ActionSource, Event, InputEvent},
+    math::px,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{color::Color, style_builder::StyleBuilder},
     test_support::diagnostics::SignalSlotStats,
@@ -39,7 +40,7 @@ fn harness() -> (
         NodeBuilder::boxed()
             .style(
                 StyleBuilder::new()
-                    .width(super::PANEL_WIDTH)
+                    .width(px(super::PANEL_WIDTH))
                     .height_full()
                     .flex_col()
                     .build(),
@@ -201,7 +202,7 @@ fn the_rows_line_up_on_the_checkbox_s_line() {
 
     let root_bounds = bounds(&harness, root);
     assert!(
-        (root_bounds.size.width - PANEL_WIDTH).abs() <= 1.0,
+        (root_bounds.size.width - PANEL_WIDTH).abs() <= px(1.0),
         "the panel fills the column the body gives it: {root_bounds:?}"
     );
     let card = harness
@@ -209,7 +210,7 @@ fn the_rows_line_up_on_the_checkbox_s_line() {
         .expect("MA's card was built");
     let card_bounds = bounds(&harness, card);
     assert!(
-        card_bounds.size.width > 200.0 && card_bounds.size.height > 20.0,
+        card_bounds.size.width > px(200.0) && card_bounds.size.height > px(20.0),
         "the card is laid out inside the panel: {card_bounds:?}"
     );
 
@@ -221,12 +222,12 @@ fn the_rows_line_up_on_the_checkbox_s_line() {
         .expect("MA's first field was built");
     let field_bounds = bounds(&harness, field);
     assert!(
-        (field_bounds.size.width - PERIOD_FIELD_WIDTH).abs() <= 1.0,
+        (field_bounds.size.width - PERIOD_FIELD_WIDTH).abs() <= px(1.0),
         "the field takes the width the row gives it: {field_bounds:?}"
     );
     let checkbox_line = toggle_bounds.origin.x + UnifiedSize::Small.px();
     assert!(
-        (field_bounds.origin.x - checkbox_line).abs() <= 1.0,
+        (field_bounds.origin.x - checkbox_line).abs() <= px(1.0),
         "the field starts on the checkbox's line: field={field_bounds:?} toggle={toggle_bounds:?}"
     );
 
@@ -234,7 +235,7 @@ fn the_rows_line_up_on_the_checkbox_s_line() {
         .find_by_debug_prefix(root, "TEST_PANEL_INVALID_MA_0")
         .expect("the hint was built");
     assert!(
-        bounds(&harness, hint).size.height < 1.0,
+        bounds(&harness, hint).size.height < px(1.0),
         "a valid field reserves no hint space: {:?}",
         bounds(&harness, hint)
     );
@@ -330,7 +331,7 @@ fn a_period_field_commits_only_a_period_it_may_take() {
             .bounds
             .size
             .height
-            > 1.0,
+            > px(1.0),
         "the hint is drawn while the text is not a period"
     );
     assert!(
@@ -355,7 +356,7 @@ fn a_period_field_commits_only_a_period_it_may_take() {
             .bounds
             .size
             .height
-            < 1.0,
+            < px(1.0),
         "the hint goes away once the stored value is put back"
     );
     harness.with_cx(|cx| panel.release(cx));

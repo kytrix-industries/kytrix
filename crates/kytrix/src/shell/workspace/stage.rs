@@ -8,7 +8,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event},
     interaction::DragPhase,
-    math::Rect,
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         style::StylePatch,
@@ -41,11 +41,11 @@ struct SplitBar {
     node: NodeId,
     orientation: PaneOrientation,
     action: Action,
-    drag_origin: Option<f32>,
-    extent: f32,
+    drag_fraction: Option<f32>,
+    extent: LogicalPx,
 }
 
-fn bar_style(orientation: PaneOrientation, rect: Rect) -> ui_core::paint::style::Style {
+fn bar_style(orientation: PaneOrientation, rect: LogicalRect) -> ui_core::paint::style::Style {
     let base = StyleBuilder::new()
         .absolute()
         .left(rect.origin.x)
@@ -81,7 +81,7 @@ pub(crate) struct Stage {
     panes: Vec<Pane>,
     bars: Vec<SplitBar>,
     gallery: Option<GalleryPage>,
-    viewport: ui_core::math::Size,
+    viewport: LogicalSize,
     geometry_dirty: Cell<bool>,
     dirty: Rc<Cell<bool>>,
 }
@@ -105,10 +105,10 @@ impl Stage {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .left(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
                     .flex_col()
                     .overflow_hidden()
                     .build(),
@@ -137,7 +137,7 @@ impl Stage {
             panes: Vec::with_capacity(leaves.len()),
             bars: Vec::new(),
             gallery: None,
-            viewport: ui_core::math::Size::default(),
+            viewport: LogicalSize::default(),
             geometry_dirty: Cell::new(true),
             dirty,
         };
@@ -261,7 +261,7 @@ impl Stage {
         }
         self.viewport = size;
         self.geometry_dirty.set(false);
-        let viewport = Rect::new(0.0, 0.0, size.width, size.height);
+        let viewport = LogicalRect::new(px(0.0), px(0.0), size.width, size.height);
         let geometry = self.tree.layout(viewport);
         for (pane, rect) in geometry.panes {
             if let Some(pane) = self.pane_mut(pane) {
@@ -487,12 +487,16 @@ impl Stage {
             ));
             let node = NodeBuilder::boxed()
                 .id(smol_str::format_smolstr!("{SPLIT_BAR}.{}", split.index()))
-                .style(bar_style(orientation, Rect::default()))
+                .style(bar_style(orientation, LogicalRect::default()))
                 .on_drag(action.clone())
                 .build(ui::tree(app, window)?, self.root)?;
             let bar_line = match orientation {
-                PaneOrientation::Horizontal => StyleBuilder::new().width(2.0).height_full().build(),
-                PaneOrientation::Vertical => StyleBuilder::new().height(2.0).width_full().build(),
+                PaneOrientation::Horizontal => {
+                    StyleBuilder::new().width(px(2.0)).height_full().build()
+                }
+                PaneOrientation::Vertical => {
+                    StyleBuilder::new().height(px(2.0)).width_full().build()
+                }
             };
             let mut bar_paint = PaintBuilder::new().build();
             bar_paint.background =
@@ -519,8 +523,8 @@ impl Stage {
                 node,
                 orientation,
                 action,
-                drag_origin: None,
-                extent: 0.0,
+                drag_fraction: None,
+                extent: LogicalPx::ZERO,
             });
         }
 
@@ -532,7 +536,7 @@ impl Stage {
         app: &mut App,
         split: SplitId,
         phase: DragPhase,
-        delta: ui_core::math::Point,
+        delta: LogicalPoint,
     ) -> Result<bool, EngineError> {
         let Some(bar) = self.bars.iter_mut().find(|bar| bar.split == split) else {
             return Ok(false);
@@ -543,14 +547,14 @@ impl Stage {
             .unwrap_or(PaneOrientation::Horizontal);
         match phase {
             DragPhase::Start => {
-                bar.drag_origin = self.tree.fraction(split);
+                bar.drag_fraction = self.tree.fraction(split);
                 Ok(false)
             }
             DragPhase::Move => {
-                let Some(origin) = bar.drag_origin else {
+                let Some(origin) = bar.drag_fraction else {
                     return Ok(false);
                 };
-                if bar.extent <= 0.0 {
+                if bar.extent <= LogicalPx::ZERO {
                     return Ok(false);
                 }
                 let extent = bar.extent;
@@ -565,7 +569,7 @@ impl Stage {
                 Ok(false)
             }
             DragPhase::End | DragPhase::Cancel => {
-                bar.drag_origin = None;
+                bar.drag_fraction = None;
 
                 Ok(phase == DragPhase::End)
             }

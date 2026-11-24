@@ -30,6 +30,7 @@ use ui_core::{
     app::{App, AppHandle},
     error::EngineError,
     event::Action,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -987,10 +988,10 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 .id(PANEL_ID)
                 .style(
                     StyleBuilder::new()
-                        .width(DIALOG_WIDTH)
-                        .height(DIALOG_HEIGHT)
+                        .width(px(DIALOG_WIDTH))
+                        .height(px(DIALOG_HEIGHT))
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_height_0()
                         .build(),
                 )
@@ -1003,7 +1004,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                     StyleBuilder::new()
                         .flex_row()
                         .items_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, root)
@@ -1087,7 +1088,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                     StyleBuilder::new()
                         .flex_row()
                         .items_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, root)
@@ -1164,7 +1165,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                         .min_width_0()
                         .min_height_0()
                         .overflow_hidden()
-                        .padding(8.0)
+                        .padding(px(8.0))
                         .build(),
                 )
                 .bind_style({
@@ -1172,7 +1173,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                     move |cx| StylePatch {
                         background: Some(theme.role(cx, Role::SurfaceSunken)),
                         border: Some(Border {
-                            width: 1.0,
+                            width: px(1.0),
                             color: theme.role(cx, Role::LineDivider),
                         }),
                         ..StylePatch::default()
@@ -1188,7 +1189,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                     StyleBuilder::new()
                         .flex_row()
                         .items_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, root)
@@ -1539,7 +1540,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                             .flex_1()
                             .items_center()
                             .justify_center()
-                            .gap(8.0)
+                            .gap(px(8.0))
                             .build(),
                     )
                     .build(tree, body)
@@ -1625,7 +1626,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                         StyleBuilder::new()
                             .flex_row()
                             .flex_1()
-                            .gap(8.0)
+                            .gap(px(8.0))
                             .min_height_0()
                             .build(),
                     )
@@ -1648,7 +1649,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         parent: NodeId,
         index: usize,
         card: &PredictionEventCard,
-        text_size: f32,
+        text_size: LogicalPx,
     ) {
         let theme = self.host.theme().clone();
         let translate = self.host.translate().clone();
@@ -1681,15 +1682,15 @@ impl<S: PredictionEventSource> SelectorState<S> {
                         .flex_1()
                         .min_width_0()
                         .min_height_0()
-                        .gap(6.0)
-                        .padding(10.0)
+                        .gap(px(6.0))
+                        .padding(px(10.0))
                         .overflow_hidden()
                         .build(),
                 )
                 .bind_style(move |cx| StylePatch {
                     background: Some(card_theme.role(cx, Role::SurfaceRaised)),
                     border: Some(Border {
-                        width: 1.0,
+                        width: px(1.0),
                         color: if selected {
                             card_theme.role(cx, Role::BrandBase)
                         } else {
@@ -1735,7 +1736,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                     StyleBuilder::new()
                         .flex_row()
                         .items_center()
-                        .gap(6.0)
+                        .gap(px(6.0))
                         .build(),
                 )
                 .build(tree, node)
@@ -1796,7 +1797,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
-    fn build_card_note(&self, app: &mut App, parent: NodeId, text: SmolStr, text_size: f32) {
+    fn build_card_note(&self, app: &mut App, parent: NodeId, text: SmolStr, text_size: LogicalPx) {
         let theme = self.host.theme().clone();
         let _ = build_node(app, self.window, parent, |tree, parent| {
             NodeBuilder::text(text, TextStyle::new(text_size - 1.0))
@@ -1814,7 +1815,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         parent: NodeId,
         option: &PredictionOptionCard,
         reduce_motion: bool,
-        text_size: f32,
+        text_size: LogicalPx,
     ) {
         let theme = self.host.theme().clone();
         let (text, pending) = self.display_text(&option.label);
@@ -1828,7 +1829,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                     StyleBuilder::new()
                         .flex_row()
                         .items_center()
-                        .gap(6.0)
+                        .gap(px(6.0))
                         .width_full()
                         .build(),
                 )
@@ -1859,8 +1860,8 @@ impl<S: PredictionEventSource> SelectorState<S> {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(BAR_WIDTH)
-                        .height(4.0)
+                        .width(px(BAR_WIDTH))
+                        .height(px(4.0))
                         .flex_none()
                         .build(),
                 )
@@ -1881,7 +1882,12 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let fill_theme = theme.clone();
         let _ = build_node(app, self.window, track, |tree, track| {
             NodeBuilder::boxed()
-                .style(StyleBuilder::new().width(fill_width).height_full().build())
+                .style(
+                    StyleBuilder::new()
+                        .width(px(fill_width))
+                        .height_full()
+                        .build(),
+                )
                 .bind_style(move |cx| StylePatch {
                     background: Some(fill_theme.role(cx, Role::ChartSeries0)),
                     ..StylePatch::default()
@@ -1892,7 +1898,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let percent = format_smolstr!("{percentage:.0}%");
         let _ = build_node(app, self.window, row, |tree, row| {
             NodeBuilder::text(percent, TextStyle::new(text_size - 1.0))
-                .style(StyleBuilder::new().width(34.0).flex_none().build())
+                .style(StyleBuilder::new().width(px(34.0)).flex_none().build())
                 .bind_style(move |cx| StylePatch {
                     foreground: Some(percent_theme.role(cx, Role::FgMuted)),
                     ..StylePatch::default()

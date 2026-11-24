@@ -3,7 +3,7 @@ use std::rc::Rc;
 use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use market_participants_model::prediction::PredictionRange;
 use time::{Date, Month, OffsetDateTime, UtcOffset};
-use ui_core::math::{Point, Rect, Size};
+use ui_core::math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px};
 
 use super::{
     geometry::{
@@ -21,12 +21,12 @@ fn translate(language: LanguageCode) -> Translate {
     )
 }
 
-fn plot() -> Rect {
-    Rect::new(8.0, 18.0, 880.0, 200.0)
+fn plot() -> LogicalRect {
+    LogicalRect::new(px(8.0), px(18.0), px(880.0), px(200.0))
 }
 
 fn layout() -> ChartLayout {
-    ChartLayout::new(Rect::new(0.0, 0.0, 928.0, 248.0))
+    ChartLayout::new(LogicalRect::new(px(0.0), px(0.0), px(928.0), px(248.0)))
 }
 
 fn sample(timestamp: i64, percent: f64) -> Sample {
@@ -70,20 +70,20 @@ fn assert_unique(labels: &[String]) {
 fn the_layout_leaves_the_measured_strips_around_the_plot() {
     let layout = layout();
 
-    assert_eq!(layout.plot.origin, Point::new(LEFT_INSET, TOP_STRIP));
-    assert_eq!(layout.plot.size, Size::new(880.0, 200.0));
-    assert_eq!(layout.plot.right(), 928.0 - RIGHT_GUTTER);
-    assert_eq!(layout.plot.bottom(), 248.0 - 30.0);
+    assert_eq!(layout.plot.origin, LogicalPoint::new(LEFT_INSET, TOP_STRIP));
+    assert_eq!(layout.plot.size, LogicalSize::new(px(880.0), px(200.0)));
+    assert_eq!(layout.plot.right(), px(928.0) - RIGHT_GUTTER);
+    assert_eq!(layout.plot.bottom(), px(248.0) - px(30.0));
     assert_eq!(layout.top_strip().size.height, TOP_STRIP);
-    assert_eq!(layout.bottom_band().size.height, 30.0);
+    assert_eq!(layout.bottom_band().size.height, px(30.0));
 }
 
 #[test]
 fn a_box_too_small_for_the_strips_has_an_empty_plot() {
-    let layout = ChartLayout::new(Rect::new(0.0, 0.0, 20.0, 20.0));
+    let layout = ChartLayout::new(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)));
 
-    assert_eq!(layout.plot.size.width, 0.0);
-    assert_eq!(layout.plot.size.height, 0.0);
+    assert_eq!(layout.plot.size.width, px(0.0));
+    assert_eq!(layout.plot.size.height, px(0.0));
 }
 
 #[test]
@@ -291,7 +291,7 @@ fn decimation_keeps_a_single_sample_as_one_point() {
 
 #[test]
 fn a_subpixel_probability_step_should_not_be_drawn_as_a_second_line() {
-    let plot = Rect::new(8.0, 18.0, 880.0, 900.0);
+    let plot = LogicalRect::new(px(8.0), px(18.0), px(880.0), px(900.0));
     let samples = [
         sample(0, 99.95),
         sample(1_000, 99.95),
@@ -303,7 +303,7 @@ fn a_subpixel_probability_step_should_not_be_drawn_as_a_second_line() {
         end: 3_000,
     };
     let folded = decimate(&samples, domain, &ValueAxis::new(100.0), plot);
-    let ys: Vec<f32> = folded.screen.iter().map(|point| point.y).collect();
+    let ys: Vec<LogicalPx> = folded.screen.iter().map(|point| point.y).collect();
 
     assert_eq!(ys.len(), 4, "the samples still keep their columns");
     assert!(
@@ -319,7 +319,7 @@ fn a_subpixel_probability_step_should_not_be_drawn_as_a_second_line() {
 
 #[test]
 fn a_line_at_either_axis_edge_stays_inside_the_plot() {
-    let plot = Rect::new(8.0, 18.0, 880.0, 900.0);
+    let plot = LogicalRect::new(px(8.0), px(18.0), px(880.0), px(900.0));
     let samples = [sample(0, 0.0), sample(1_000, 100.0)];
     let domain = TimeDomain {
         start: 0,
@@ -342,7 +342,7 @@ fn a_line_at_either_axis_edge_stays_inside_the_plot() {
 
 #[test]
 fn a_probability_step_of_a_pixel_or_more_is_still_drawn() {
-    let plot = Rect::new(8.0, 18.0, 880.0, 900.0);
+    let plot = LogicalRect::new(px(8.0), px(18.0), px(880.0), px(900.0));
     let samples = [sample(0, 99.95), sample(1_000, 99.80)];
     let domain = TimeDomain {
         start: 0,
@@ -362,7 +362,7 @@ fn a_short_window_picks_a_tick_step_that_fits() {
         start: 0,
         end: 3_600_000,
     };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Clock);
     assert_eq!(
@@ -388,7 +388,7 @@ fn a_day_picks_a_three_hour_step_and_blanks_its_repeated_endpoint() {
         start,
         end: start + 86_400_000,
     };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Clock);
     assert_eq!(
@@ -418,7 +418,7 @@ fn a_wide_plot_steps_away_from_hourly_labels_over_a_day() {
         start,
         end: start + 86_400_000,
     };
-    let ticks = time_ticks(domain, 1600.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(1600.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Clock);
     assert!(
@@ -444,7 +444,7 @@ fn a_twelve_hour_window_still_uses_hourly_labels() {
         start,
         end: start + 12 * 3_600_000,
     };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Clock);
     assert!(
@@ -464,7 +464,7 @@ fn a_four_hundred_pixel_week_still_gets_daily_labels() {
         start,
         end: start + 7 * 86_400_000,
     };
-    let ticks = time_ticks(domain, 400.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(400.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Day);
     assert_eq!(
@@ -498,7 +498,7 @@ fn a_days_ticks_are_aligned_to_the_local_clock() {
         start: 0,
         end: 86_400_000,
     };
-    let ticks = time_ticks(domain, 880.0, zone).timestamps;
+    let ticks = time_ticks(domain, px(880.0), zone).timestamps;
     assert!(!ticks.is_empty());
 
     for tick in ticks {
@@ -520,7 +520,7 @@ fn long_windows_are_labelled_at_month_starts() {
     let start = millis(2026, Month::January, 1);
     let end = start + 400 * 86_400_000;
     let domain = TimeDomain { start, end };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Month);
     assert!(
@@ -542,7 +542,7 @@ fn a_multi_year_window_picks_a_year_step() {
     let start = millis(2000, Month::January, 1);
     let end = millis(2026, Month::January, 1);
     let domain = TimeDomain { start, end };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::MonthYear);
     assert!(ticks.timestamps.len() >= 2);
@@ -563,7 +563,7 @@ fn a_multi_year_window_picks_a_year_step() {
 fn a_century_axis_strides_years_without_walking_the_finer_steps() {
     let start = millis(1900, Month::January, 1);
     let end = millis(2000, Month::January, 1);
-    let ticks = time_ticks(TimeDomain { start, end }, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(TimeDomain { start, end }, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::MonthYear);
     assert!(
@@ -588,7 +588,7 @@ fn a_week_is_labelled_by_distinct_days_at_the_reference_width() {
         start,
         end: start + 7 * 86_400_000,
     };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Day);
     assert_eq!(
@@ -610,7 +610,7 @@ fn a_month_is_labelled_by_unique_dates_rather_than_months() {
         start,
         end: start + 30 * 86_400_000,
     };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Day);
     assert!(
@@ -633,7 +633,7 @@ fn a_two_month_all_range_is_labelled_by_unique_weeks() {
         start,
         end: start + 60 * 86_400_000,
     };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Day);
     assert!(
@@ -651,7 +651,7 @@ fn a_two_day_all_range_is_labelled_by_unique_days() {
         start,
         end: start + 2 * 86_400_000,
     };
-    let ticks = time_ticks(domain, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(domain, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Day);
     assert_eq!(ticks.timestamps.len(), 2);
@@ -662,7 +662,7 @@ fn a_two_day_all_range_is_labelled_by_unique_days() {
 fn a_fifteen_month_window_uses_bare_month_labels_like_the_reference() {
     let start = millis(2024, Month::August, 1);
     let end = millis(2025, Month::November, 1);
-    let ticks = time_ticks(TimeDomain { start, end }, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(TimeDomain { start, end }, px(880.0), UtcOffset::UTC);
 
     assert_eq!(ticks.label, TimeLabelKind::Month);
     assert_eq!(
@@ -690,7 +690,7 @@ fn a_fifteen_month_window_uses_bare_month_labels_like_the_reference() {
 fn a_two_year_window_puts_the_year_in_its_month_labels() {
     let start = millis(2025, Month::January, 1);
     let end = millis(2027, Month::January, 1);
-    let ticks = time_ticks(TimeDomain { start, end }, 880.0, UtcOffset::UTC);
+    let ticks = time_ticks(TimeDomain { start, end }, px(880.0), UtcOffset::UTC);
 
     assert_eq!(
         ticks.label,

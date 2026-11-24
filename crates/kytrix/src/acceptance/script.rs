@@ -12,7 +12,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     event::{InputEvent, Modifiers, PointerButton},
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect, px},
     node::id::NodeId,
     paint::{
         color::Color,
@@ -257,7 +257,7 @@ impl Script {
         let size = window.size();
         let primitives = app.painted_primitives(self.window);
         let texts = app.texts(self.window);
-        if size.width <= 0.0 || size.height <= 0.0 {
+        if size.width <= px(0.0) || size.height <= px(0.0) {
             return StepOutcome::Fail(
                 "painted",
                 format_smolstr!("zero-sized window ({}x{})", size.width, size.height),
@@ -536,7 +536,11 @@ impl Script {
         };
         let outcome = app.inject_input(
             self.window,
-            InputEvent::scroll_lines(centre, Point::new(0.0, -1.0), Modifiers::empty()),
+            InputEvent::scroll_lines(
+                centre,
+                LogicalPoint::new(px(0.0), px(-1.0)),
+                Modifiers::empty(),
+            ),
         );
         if outcome.hit.is_none() {
             return StepOutcome::Fail(
@@ -580,10 +584,10 @@ impl Script {
     }
 }
 
-fn pane_centre(app: &App, window: WindowId, composition: &Composition) -> Option<Point> {
+fn pane_centre(app: &App, window: WindowId, composition: &Composition) -> Option<LogicalPoint> {
     let size = app.window(window)?.size();
     let sidebar = metrics::width(composition.hub.read(|config| config.ui.sidebar));
-    Some(Point::new(
+    Some(LogicalPoint::new(
         (sidebar + size.width) / 2.0,
         (metrics::TITLE_BAR_HEIGHT + size.height) / 2.0,
     ))
@@ -593,7 +597,7 @@ fn click_target_for_debug_id(
     app: &App,
     window: WindowId,
     debug_id: &str,
-) -> Option<(NodeId, Rect)> {
+) -> Option<(NodeId, LogicalRect)> {
     let tree = app.window(window)?.tree();
     let mut wrappers = Vec::new();
     let mut stack = vec![tree.root()];
@@ -605,16 +609,16 @@ fn click_target_for_debug_id(
             stack.extend(entry.children().iter().rev().copied());
         }
     }
-    let area = |bounds: &Rect| bounds.size.width * bounds.size.height;
+    let area = |bounds: &LogicalRect| bounds.size.width.value() * bounds.size.height.value();
     wrappers
         .into_iter()
         .filter_map(|wrapper| click_target(app, window, wrapper))
         .max_by(|(_, left), (_, right)| area(left).total_cmp(&area(right)))
 }
 
-fn click_target(app: &App, window: WindowId, wrapper: NodeId) -> Option<(NodeId, Rect)> {
+fn click_target(app: &App, window: WindowId, wrapper: NodeId) -> Option<(NodeId, LogicalRect)> {
     let tree = app.window(window)?.tree();
-    let mut best: Option<(NodeId, Rect)> = None;
+    let mut best: Option<(NodeId, LogicalRect)> = None;
     let mut stack = vec![wrapper];
     while let Some(node) = stack.pop() {
         let Ok(entry) = tree.get(node) else {
@@ -622,11 +626,13 @@ fn click_target(app: &App, window: WindowId, wrapper: NodeId) -> Option<(NodeId,
         };
         let bounds = entry.layout().bounds;
         if entry.style_patch().interactive == Some(true)
-            && bounds.size.width > 0.0
-            && bounds.size.height > 0.0
+            && bounds.size.width > px(0.0)
+            && bounds.size.height > px(0.0)
         {
-            let area = bounds.size.width * bounds.size.height;
-            if best.is_none_or(|(_, current)| area > current.size.width * current.size.height) {
+            let area = bounds.size.width.value() * bounds.size.height.value();
+            if best.is_none_or(|(_, current)| {
+                area > current.size.width.value() * current.size.height.value()
+            }) {
                 best = Some((node, bounds));
             }
         }
@@ -634,12 +640,13 @@ fn click_target(app: &App, window: WindowId, wrapper: NodeId) -> Option<(NodeId,
     }
     best.or_else(|| {
         node_bounds(app, window, wrapper).and_then(|bounds| {
-            (bounds.size.width > 0.0 && bounds.size.height > 0.0).then_some((wrapper, bounds))
+            (bounds.size.width > px(0.0) && bounds.size.height > px(0.0))
+                .then_some((wrapper, bounds))
         })
     })
 }
 
-fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
+fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<LogicalRect> {
     app.window(window)?
         .tree()
         .get(node)
@@ -647,8 +654,8 @@ fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
         .map(|entry| entry.layout().bounds)
 }
 
-fn centre_of(bounds: Rect) -> Point {
-    Point::new(
+fn centre_of(bounds: LogicalRect) -> LogicalPoint {
+    LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     )

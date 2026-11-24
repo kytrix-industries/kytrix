@@ -68,6 +68,7 @@ impl From<String> for TextValue {
 mod tests {
     use smol_str::SmolStr;
     use ui_core::{
+        math::px,
         node::{builder::NodeBuilder, tree::NodeKind},
         test_support::app::TestApp,
     };
@@ -103,7 +104,7 @@ mod tests {
         let root = app.app().window(window).expect("window").tree().root();
         let node = {
             let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
-            NodeBuilder::text("", ui_core::text::TextStyle::new(12.0))
+            NodeBuilder::text("", ui_core::text::TextStyle::new(px(12.0)))
                 .bind_text(move |cx| value.read(cx))
                 .build(tree, root)
                 .expect("text node")

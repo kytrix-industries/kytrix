@@ -38,7 +38,7 @@ use tokio::sync::{Mutex, mpsc};
 use ui_core::{
     event::{Action, ActionSource},
     interaction::ItemAlign,
-    math::Size,
+    math::{LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
 };
 use ui_kit::{kit::list::SelectionMode, theme::components::InteractiveState};
@@ -616,7 +616,7 @@ fn service_refused() -> WidgetRpcResult<WatchListProtocol> {
     Err(refused())
 }
 
-fn bounds(fixture: &Fixture, node: NodeId) -> ui_core::math::Rect {
+fn bounds(fixture: &Fixture, node: NodeId) -> LogicalRect {
     fixture
         .harness
         .tree()
@@ -945,7 +945,7 @@ fn a_row_waiting_for_its_market_should_be_one_cell_where_its_values_would_be() {
         &fixture,
         cells[ACTIONS_COLUMN].expect("the controls keep their own cell"),
     );
-    let spanned: f32 = (MISSING_MARKET_COLUMN..ACTIONS_COLUMN)
+    let spanned = (MISSING_MARKET_COLUMN..ACTIONS_COLUMN)
         .map(|column| {
             bounds(
                 &fixture,
@@ -956,19 +956,23 @@ fn a_row_waiting_for_its_market_should_be_one_cell_where_its_values_would_be() {
             )
             .size
             .width
+            .value()
         })
-        .sum();
+        .sum::<f32>();
     assert!(
         merged.size.width > route.size.width * 2.0,
         "the waiting cell is wider than any one column it replaces: {merged:?} vs {route:?}"
     );
     assert!(
-        (merged.size.width - spanned).abs() <= spanned * 0.05 + 1.0,
+        (merged.size.width.value() - spanned).abs() <= spanned * 0.05 + 1.0,
         "the waiting cell is as wide as the six columns it replaces: {} vs {spanned}",
         merged.size.width
     );
     assert!(
-        (actions.origin.x - (merged.origin.x + merged.size.width)).abs() <= 1.0,
+        (actions.origin.x - (merged.origin.x + merged.size.width))
+            .abs()
+            .value()
+            <= 1.0,
         "the controls sit in their own column right beside the waiting cell: \
          merged {merged:?}, controls {actions:?}"
     );
@@ -1072,7 +1076,7 @@ fn the_tables_should_draw_rows_to_read_rather_than_rows_to_pick() {
     fixture.frame();
 
     assert_eq!(
-        crate::table::table_options(28.0).selection,
+        crate::table::table_options(px(28.0)).selection,
         SelectionMode::None,
         "a watch list draws read-only rows"
     );
@@ -1821,7 +1825,7 @@ fn resizing_should_pair_the_row_controls_with_the_rows_the_table_mounts() {
         .app_mut()
         .window_mut(window)
         .expect("the host's window")
-        .set_size(Size::new(800.0, 220.0));
+        .set_size(LogicalSize::new(px(800.0), px(220.0)));
     pair_window(&mut fixture);
     let narrow = mounted_rows(&fixture, WatchListMarket::Continuous);
     assert!(
@@ -1839,7 +1843,7 @@ fn resizing_should_pair_the_row_controls_with_the_rows_the_table_mounts() {
         .app_mut()
         .window_mut(window)
         .expect("the host's window")
-        .set_size(Size::new(800.0, 600.0));
+        .set_size(LogicalSize::new(px(800.0), px(600.0)));
     pair_window(&mut fixture);
     let back = mounted_rows(&fixture, WatchListMarket::Continuous);
     assert_eq!(

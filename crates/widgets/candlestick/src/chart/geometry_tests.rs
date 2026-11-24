@@ -8,22 +8,22 @@ use market_participants_model::{
         units::{MarketQuantity, QuantityUnit},
     },
 };
-use ui_core::math::{Point, Rect};
+use ui_core::math::{LogicalPoint, LogicalRect, px};
 
 use super::geometry::*;
 
-const CHART: Rect = Rect::new(0.0, 0.0, 800.0, 500.0);
+const CHART: LogicalRect = LogicalRect::new(px(0.0), px(0.0), px(800.0), px(500.0));
 
-fn right(rect: Rect) -> f32 {
-    rect.max().x
+fn right(rect: LogicalRect) -> f32 {
+    f32::from(rect.max().x)
 }
 
-fn bottom(rect: Rect) -> f32 {
-    rect.max().y
+fn bottom(rect: LogicalRect) -> f32 {
+    f32::from(rect.max().y)
 }
 
-fn center(rect: Rect) -> Point {
-    Point::new(
+fn center(rect: LogicalRect) -> LogicalPoint {
+    LogicalPoint::new(
         rect.origin.x + rect.size.width / 2.0,
         rect.origin.y + rect.size.height / 2.0,
     )
@@ -33,7 +33,7 @@ fn chart_layout(longest_label_width: f32, sub_plot_count: usize) -> ChartLayout 
     ChartLayout::new(
         CHART,
         LayoutInputs {
-            longest_label_width,
+            longest_label_width: px(longest_label_width),
             sub_plot_count,
         },
     )
@@ -41,9 +41,9 @@ fn chart_layout(longest_label_width: f32, sub_plot_count: usize) -> ChartLayout 
 
 fn layout_with_height(total: f32, sub_plot_count: usize) -> ChartLayout {
     ChartLayout::new(
-        Rect::new(0.0, 0.0, 800.0, total),
+        LogicalRect::new(px(0.0), px(0.0), px(800.0), px(total)),
         LayoutInputs {
-            longest_label_width: 0.0,
+            longest_label_width: px(0.0),
             sub_plot_count,
         },
     )
@@ -84,7 +84,7 @@ fn layout_should_place_a_sub_plot_below_the_price_plot() {
 
     assert_eq!(
         layout.sub_plots[0].plot.origin.y,
-        bottom(layout.price_plot) + PLOT_SEPARATOR_HEIGHT
+        px(bottom(layout.price_plot)) + PLOT_SEPARATOR_HEIGHT
     );
 }
 
@@ -94,7 +94,7 @@ fn layout_should_place_time_axis_below_the_last_sub_plot() {
 
     assert_eq!(
         layout.time_axis.origin.y,
-        bottom(layout.sub_plots.last().expect("sub plots").plot)
+        px(bottom(layout.sub_plots.last().expect("sub plots").plot))
     );
 }
 
@@ -119,15 +119,15 @@ fn layout_should_use_minimum_axis_width_for_short_labels() {
 fn layout_should_expand_axis_for_long_labels() {
     let layout = chart_layout(80.0, 1);
 
-    assert_eq!(layout.price_axis.size.width, 92.0);
+    assert_eq!(layout.price_axis.size.width, px(92.0));
 }
 
 #[test]
 fn layout_should_preserve_minimum_plot_width_when_label_is_too_wide() {
     let layout = ChartLayout::new(
-        Rect::new(0.0, 0.0, 100.0, 80.0),
+        LogicalRect::new(px(0.0), px(0.0), px(100.0), px(80.0)),
         LayoutInputs {
-            longest_label_width: 200.0,
+            longest_label_width: px(200.0),
             sub_plot_count: 1,
         },
     );
@@ -138,14 +138,14 @@ fn layout_should_preserve_minimum_plot_width_when_label_is_too_wide() {
 #[test]
 fn layout_should_not_cap_fitting_labels_to_a_chart_ratio() {
     let layout = ChartLayout::new(
-        Rect::new(0.0, 0.0, 400.0, 300.0),
+        LogicalRect::new(px(0.0), px(0.0), px(400.0), px(300.0)),
         LayoutInputs {
-            longest_label_width: 160.0,
+            longest_label_width: px(160.0),
             sub_plot_count: 1,
         },
     );
 
-    assert_eq!(layout.price_axis.size.width, 172.0);
+    assert_eq!(layout.price_axis.size.width, px(172.0));
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn layout_should_share_width_between_every_y_axis() {
 fn maximum_plot_width_should_assume_the_minimum_axis_width() {
     let layout = chart_layout(80.0, 1);
 
-    assert_eq!(layout.maximum_plot_width(), 758.0);
+    assert_eq!(layout.maximum_plot_width(), px(758.0));
 }
 
 #[test]
@@ -197,10 +197,10 @@ fn hit_testing_should_reject_a_separator() {
 #[test]
 fn candle_geometry_should_share_centers_between_price_and_volume_plots() {
     let layout = chart_layout(0.0, SUB_PLOT_INLINE);
-    let price_geometry = CandleGeometry::new(layout.price_plot, 20, 10.0);
+    let price_geometry = CandleGeometry::new(layout.price_plot, 20, px(10.0));
 
     for sub_plot in &layout.sub_plots {
-        let sub_geometry = CandleGeometry::new(sub_plot.plot, 20, 10.0);
+        let sub_geometry = CandleGeometry::new(sub_plot.plot, 20, px(10.0));
         assert_eq!(price_geometry.center_x(7), sub_geometry.center_x(7));
     }
 }
@@ -208,28 +208,31 @@ fn candle_geometry_should_share_centers_between_price_and_volume_plots() {
 #[test]
 fn candle_geometry_should_share_body_width_between_price_and_volume_plots() {
     let layout = chart_layout(0.0, 1);
-    let price_geometry = CandleGeometry::new(layout.price_plot, 20, 10.0);
-    let sub_geometry = CandleGeometry::new(layout.sub_plots[0].plot, 20, 10.0);
+    let price_geometry = CandleGeometry::new(layout.price_plot, 20, px(10.0));
+    let sub_geometry = CandleGeometry::new(layout.sub_plots[0].plot, 20, px(10.0));
 
     assert_eq!(price_geometry.body_width(), sub_geometry.body_width());
 }
 
 #[test]
 fn candle_geometry_should_anchor_the_newest_candle_to_the_right_edge() {
-    let plot = Rect::new(0.0, 0.0, 100.0, 100.0);
-    let geometry = CandleGeometry::new(plot, 10, 10.0);
+    let plot = LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0));
+    let geometry = CandleGeometry::new(plot, 10, px(10.0));
 
-    assert_eq!(geometry.center_x(9), right(plot) - 5.0);
+    assert_eq!(geometry.center_x(9), px(right(plot) - 5.0));
 }
 
 #[test]
 fn candle_geometry_should_clamp_a_slot_outside_the_visible_range() {
-    let plot = Rect::new(0.0, 0.0, 100.0, 100.0);
-    let geometry = CandleGeometry::new(plot, 10, 10.0);
+    let plot = LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0));
+    let geometry = CandleGeometry::new(plot, 10, px(10.0));
 
-    assert_eq!(geometry.slot_at(-50.0), Some(0));
-    assert_eq!(geometry.slot_at(500.0), Some(9));
-    assert_eq!(CandleGeometry::new(plot, 0, 10.0).slot_at(1.0), None);
+    assert_eq!(geometry.slot_at(px(-50.0)), Some(0));
+    assert_eq!(geometry.slot_at(px(500.0)), Some(9));
+    assert_eq!(
+        CandleGeometry::new(plot, 0, px(10.0)).slot_at(px(1.0)),
+        None
+    );
 }
 
 const HEIGHT_TABLE: [(f32, usize, f32, f32, f32, f32, f32, f32); 18] = [
@@ -265,21 +268,25 @@ fn layout_should_match_the_height_table() {
         let actual_per_sub = layout
             .sub_plots
             .first()
-            .map_or(0.0, |sub_plot| sub_plot.plot.size.height);
+            .map_or(0.0, |sub_plot| f32::from(sub_plot.plot.size.height));
         let actual_sub_total = layout
             .sub_plots
             .iter()
-            .map(|sub_plot| sub_plot.plot.size.height)
+            .map(|sub_plot| f32::from(sub_plot.plot.size.height))
             .sum::<f32>()
             + layout
                 .separators
                 .iter()
-                .map(|separator| separator.size.height)
+                .map(|separator| f32::from(separator.size.height))
                 .sum::<f32>();
         let actual_content = actual_price + actual_sub_total;
 
-        assert_close(actual_time, time, &format!("{label}: time"));
-        assert_close(actual_content, content, &format!("{label}: content"));
+        assert_close(f32::from(actual_time), time, &format!("{label}: time"));
+        assert_close(
+            f32::from(actual_content),
+            content,
+            &format!("{label}: content"),
+        );
         assert_close(
             actual_per_sub * sub_count as f32,
             sub_budget,
@@ -287,7 +294,11 @@ fn layout_should_match_the_height_table() {
         );
         assert_close(actual_per_sub, per_sub, &format!("{label}: per sub"));
         assert_close(actual_sub_total, sub_total, &format!("{label}: sub total"));
-        assert_close(actual_price, price_height, &format!("{label}: price"));
+        assert_close(
+            f32::from(actual_price),
+            price_height,
+            &format!("{label}: price"),
+        );
     }
 }
 
@@ -296,16 +307,20 @@ fn layout_should_cap_a_sub_plot_at_the_ceiling() {
     let layout = layout_with_height(1200.0, 1);
 
     assert_close(
-        layout.sub_plots[0].plot.size.height,
-        SUB_PLOT_HEIGHT_CEILING,
+        f32::from(layout.sub_plots[0].plot.size.height),
+        f32::from(SUB_PLOT_HEIGHT_CEILING),
         "per sub",
     );
     assert_close(
-        layout.sub_plots[0].plot.size.height + layout.separators[0].size.height,
-        SUB_PLOT_HEIGHT_CEILING + PLOT_SEPARATOR_HEIGHT,
+        f32::from(layout.sub_plots[0].plot.size.height + layout.separators[0].size.height),
+        f32::from(SUB_PLOT_HEIGHT_CEILING + PLOT_SEPARATOR_HEIGHT),
         "sub total",
     );
-    assert_close(layout.price_plot.size.height, 973.0, "price height");
+    assert_close(
+        f32::from(layout.price_plot.size.height),
+        973.0,
+        "price height",
+    );
 }
 
 #[test]
@@ -317,35 +332,35 @@ fn layout_should_preserve_the_height_invariants() {
             let label = format!("{total}px with {sub_plot_count} sub plots");
             let layout = layout_with_height(total, sub_plot_count);
             let time_height = layout.time_axis.size.height;
-            let content = (total - time_height).max(0.0);
+            let content = (total - f32::from(time_height)).max(0.0);
             let price_height = layout.price_plot.size.height;
             let per_sub = layout
                 .sub_plots
                 .first()
-                .map_or(0.0, |sub_plot| sub_plot.plot.size.height);
+                .map_or(0.0, |sub_plot| f32::from(sub_plot.plot.size.height));
             let sub_total = layout
                 .sub_plots
                 .iter()
-                .map(|sub_plot| sub_plot.plot.size.height)
+                .map(|sub_plot| f32::from(sub_plot.plot.size.height))
                 .sum::<f32>()
                 + layout
                     .separators
                     .iter()
-                    .map(|separator| separator.size.height)
+                    .map(|separator| f32::from(separator.size.height))
                     .sum::<f32>();
 
             assert!(
-                price_height >= MIN_PLOT_HEIGHT.min(content) - 0.01,
+                price_height >= MIN_PLOT_HEIGHT.min(px(content)) - px(0.01),
                 "{label}: the price plot must keep its floor or take the whole content \
                  (price {price_height}, content {content})"
             );
             assert!(
-                (time_height + sub_total + price_height - total).abs() < 0.01,
+                (time_height + sub_total + price_height - total).abs() < px(0.01),
                 "{label}: the boxes must add up to the pane (time {time_height}, \
                  sub total {sub_total}, price {price_height}, total {total})"
             );
             assert!(
-                price_height >= 0.0 && per_sub >= 0.0 && sub_total >= 0.0,
+                price_height >= px(0.0) && per_sub >= 0.0 && sub_total >= 0.0,
                 "{label}: no box may be negative (price {price_height}, per sub {per_sub}, \
                  sub total {sub_total})"
             );
@@ -359,8 +374,12 @@ fn layout_should_draw_no_sub_plots_when_the_price_floor_takes_the_content() {
 
     assert!(layout.sub_plots.is_empty());
     assert!(layout.separators.is_empty());
-    assert_eq!(layout.time_axis.origin.y, bottom(layout.price_plot));
-    assert_close(layout.price_plot.size.height, 45.6, "price height");
+    assert_eq!(layout.time_axis.origin.y, px(bottom(layout.price_plot)));
+    assert_close(
+        f32::from(layout.price_plot.size.height),
+        45.6,
+        "price height",
+    );
 }
 
 #[test]
@@ -377,7 +396,7 @@ fn every_sub_plot_should_have_one_separator_above_it() {
                 "{total}px with {sub_plot_count} sub plots"
             );
             for (separator, sub_plot) in layout.separators.iter().zip(&layout.sub_plots) {
-                assert_eq!(bottom(*separator), sub_plot.plot.origin.y);
+                assert_eq!(sub_plot.plot.origin.y, px(bottom(*separator)));
             }
         }
     }
@@ -396,7 +415,8 @@ fn the_time_axis_should_always_sit_below_the_last_sub_plot() {
                 .map_or(bottom(layout.price_plot), |sub_plot| bottom(sub_plot.plot));
 
             assert_eq!(
-                layout.time_axis.origin.y, last_plot_bottom,
+                layout.time_axis.origin.y,
+                px(last_plot_bottom),
                 "{total}px with {sub_plot_count} sub plots"
             );
         }
@@ -426,29 +446,29 @@ fn data_bounds_should_cover_the_price_plot_and_every_sub_plot() {
 fn visible_range_should_follow_timestamp_anchor() {
     let candles = (1..=10).map(candle).collect::<Vec<_>>();
     let viewport = ChartViewport {
-        candle_width: 10.0,
+        candle_width: px(10.0),
         right_timestamp: Some(6),
         cursor: None,
     };
 
-    assert_eq!(visible_range(&candles, viewport, 30.0), 2..6);
+    assert_eq!(visible_range(&candles, viewport, px(30.0)), 2..6);
 }
 
 #[test]
 fn visible_range_should_show_the_newest_candles_when_following_the_live_edge() {
     let candles = (1..=10).map(candle).collect::<Vec<_>>();
     let viewport = ChartViewport {
-        candle_width: 10.0,
+        candle_width: px(10.0),
         right_timestamp: None,
         cursor: None,
     };
 
-    assert_eq!(visible_range(&candles, viewport, 30.0), 6..10);
+    assert_eq!(visible_range(&candles, viewport, px(30.0)), 6..10);
 }
 
 #[test]
 fn visible_range_should_be_empty_without_candles() {
     let viewport = ChartViewport::default();
 
-    assert_eq!(visible_range(&[], viewport, 300.0), 0..0);
+    assert_eq!(visible_range(&[], viewport, px(300.0)), 0..0);
 }

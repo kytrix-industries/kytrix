@@ -11,6 +11,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
@@ -107,8 +108,8 @@ struct CellSink {
     language: Signal<LanguageCode>,
     translate: Translate,
     theme: ThemeHandle,
-    font_size: f32,
-    small_font_size: f32,
+    font_size: LogicalPx,
+    small_font_size: LogicalPx,
     slots: ActionSlots,
 }
 
@@ -403,7 +404,7 @@ impl CellSink {
                     .flex_row()
                     .items_center()
                     .justify_end()
-                    .gap(2.0)
+                    .gap(px(2.0))
                     .build(),
             )
             .build(tree, parent)?;
@@ -604,7 +605,7 @@ pub(super) fn columns(market: WatchListMarket, translate: &Translate) -> Vec<Col
         .collect()
 }
 
-pub(super) fn table_options(row_height: f32) -> TableOptions {
+pub(super) fn table_options(row_height: LogicalPx) -> TableOptions {
     TableOptions::fixed(row_height).selection(SelectionMode::None)
 }
 

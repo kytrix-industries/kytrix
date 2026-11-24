@@ -10,7 +10,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::{Action, ActionSource, Event},
-    math::Rect,
+    math::{LogicalPx, LogicalRect},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -609,10 +609,10 @@ impl WidgetTestApp {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CanvasPrimitive {
     pub kind: PrimitiveKind,
-    pub bounds: Option<Rect>,
-    pub corner_radius: Option<[f32; 4]>,
+    pub bounds: Option<LogicalRect>,
+    pub corner_radius: Option<[LogicalPx; 4]>,
     pub color: Option<Color>,
-    pub border: Option<(f32, Color)>,
+    pub border: Option<(LogicalPx, Color)>,
     pub gradient: Option<(Color, GradientKind)>,
     pub glyphs: usize,
     pub geometry: Option<GeometryId>,
@@ -643,9 +643,9 @@ fn canvas_primitive(primitive: &Primitive) -> CanvasPrimitive {
             }
         }
         Primitive::GlyphRun(run) => {
-            let mut bounds = Rect::default();
+            let mut bounds = LogicalRect::default();
             for glyph in &run.glyphs {
-                bounds = bounds.union(Rect::from_origin_size(glyph.position, glyph.size));
+                bounds = bounds.union(LogicalRect::from_origin_size(glyph.position, glyph.size));
             }
             CanvasPrimitive {
                 kind: PrimitiveKind::GlyphRun,
@@ -829,7 +829,7 @@ mod tests {
     use ui_core::{
         app::App,
         error::EngineError,
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::{
             canvas::Canvas,
@@ -1249,8 +1249,8 @@ mod tests {
         let countdown = harness.app_mut().signal(0_u32);
         let label = harness.with_cx(|cx| {
             let root = cx.tree().root();
-            NodeBuilder::text(SmolStr::default(), TextStyle::new(12.0))
-                .layout_override(Rect::new(0.0, 0.0, 80.0, 20.0))
+            NodeBuilder::text(SmolStr::default(), TextStyle::new(px(12.0)))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(80.0), px(20.0)))
                 .bind_text(move |read| {
                     let value = *read.read(&countdown);
                     format_smolstr!("{value}")
@@ -1292,7 +1292,7 @@ mod tests {
 
     const CANVAS_TICKS: u8 = 3;
 
-    const CANVAS_BOX: Rect = Rect::new(0.0, 0.0, 120.0, 40.0);
+    const CANVAS_BOX: LogicalRect = LogicalRect::new(px(0.0), px(0.0), px(120.0), px(40.0));
 
     struct CanvasWidget {
         progress: u8,
@@ -1335,7 +1335,12 @@ mod tests {
             let theme = cx.theme().clone();
             NodeBuilder::boxed()
                 .id("TEST_PLATE")
-                .layout_override(Rect::new(0.0, 0.0, CANVAS_BOX.size.width, 10.0))
+                .layout_override(LogicalRect::new(
+                    px(0.0),
+                    px(0.0),
+                    CANVAS_BOX.size.width,
+                    px(10.0),
+                ))
                 .bind_style(move |read| StylePatch {
                     background: Some(theme.role(read, Role::MarketUp)),
                     ..StylePatch::default()
@@ -1366,25 +1371,30 @@ mod tests {
             assert!(
                 canvas.push_clip(ClipRect {
                     rect: CANVAS_BOX,
-                    corner_radius: [4.0; 4],
+                    corner_radius: [px(4.0); 4],
                 }),
                 "the fixture's clip is one rounded layer, under the depth limit"
             );
             canvas.push_quad(Quad {
-                bounds: Rect::new(0.0, 0.0, 10.0 * f32::from(self.progress + 1), 20.0),
-                corner_radius: [2.0; 4],
+                bounds: LogicalRect::new(
+                    px(0.0),
+                    px(0.0),
+                    px(10.0 * f32::from(self.progress + 1)),
+                    px(20.0),
+                ),
+                corner_radius: [px(2.0); 4],
                 paint: QuadPaint::Solid { fill, border: None },
             });
             canvas.push_path(Path {
-                bounds: Rect::new(0.0, 0.0, 40.0, 20.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)),
                 geometry: mesh,
                 fill,
             });
-            let mut style = TextStyle::new(12.0);
+            let mut style = TextStyle::new(px(12.0));
             style.color = text_color;
             let line = cx.app_mut().shape_text("42", &style, None, &[])?;
             assert!(
-                canvas.push_shaped_text(&line, Point::new(4.0, 4.0)),
+                canvas.push_shaped_text(&line, LogicalPoint::new(px(4.0), px(4.0))),
                 "the fixture's shaped line is a live lease"
             );
             assert!(canvas.pop_clip(), "the fixture closes its clip");
@@ -1420,7 +1430,7 @@ mod tests {
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 40.0, 20.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)),
             pipeline: GeometryPipeline::Ui,
         })
     }
@@ -1470,14 +1480,14 @@ mod tests {
         );
         let clip = &primitives[0];
         assert_eq!(clip.bounds, Some(CANVAS_BOX));
-        assert_eq!(clip.corner_radius, Some([4.0; 4]));
+        assert_eq!(clip.corner_radius, Some([px(4.0); 4]));
         let quad = &primitives[1];
         assert_eq!(
             quad.bounds,
-            Some(Rect::new(0.0, 0.0, 10.0, 20.0)),
+            Some(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(20.0))),
             "the first paint is progress 0"
         );
-        assert_eq!(quad.corner_radius, Some([2.0; 4]));
+        assert_eq!(quad.corner_radius, Some([px(2.0); 4]));
         assert_eq!(
             quad.color,
             Some(role_color(&harness, Appearance::Light, Role::MarketUp)),
@@ -1502,7 +1512,7 @@ mod tests {
         let grown = harness.canvas_primitives(node);
         assert_eq!(
             grown[1].bounds,
-            Some(Rect::new(0.0, 0.0, 20.0, 20.0)),
+            Some(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0))),
             "the next frame repainted the quad at the next progress"
         );
     }
@@ -1522,7 +1532,7 @@ mod tests {
         let painted = harness.canvas_primitives(node);
         assert_eq!(
             painted[1].bounds,
-            Some(Rect::new(0.0, 0.0, 40.0, 20.0)),
+            Some(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0))),
             "the animation reached its last progress"
         );
 
@@ -1609,11 +1619,16 @@ mod tests {
         let mut harness = WidgetTestApp::new();
         let node = harness.with_cx(|cx| {
             let root = cx.tree().root();
-            NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 16.0, 16.0)))
-                .layout_override(Rect::new(0.0, 0.0, 16.0, 16.0))
-                .id("TEST_EMPTY_CANVAS")
-                .build(cx.tree_mut(), root)
-                .expect("the root is alive")
+            NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(16.0),
+                px(16.0),
+            )))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)))
+            .id("TEST_EMPTY_CANVAS")
+            .build(cx.tree_mut(), root)
+            .expect("the root is alive")
         });
         harness.drain();
         assert!(harness.rendered(), "the node itself paints");

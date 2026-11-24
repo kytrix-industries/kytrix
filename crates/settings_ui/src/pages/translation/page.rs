@@ -12,6 +12,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::{Action, Event},
+    math::px,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{style::PaintSpec, style_builder::StyleBuilder},
     window::WindowId,
@@ -231,8 +232,8 @@ impl PageView for TranslationPage {
                 .size_full()
                 .min_width_0()
                 .min_height_0()
-                .gap(16.0)
-                .padding_y(4.0)
+                .gap(px(16.0))
+                .padding_y(px(4.0))
                 .build(),
             PaintSpec::default(),
             &theme,
@@ -425,7 +426,7 @@ impl PageView for TranslationPage {
                             .width_full()
                             .min_width_0()
                             .min_height_0()
-                            .gap(6.0)
+                            .gap(px(6.0))
                             .build(),
                     )
                     .build(tree, parent)

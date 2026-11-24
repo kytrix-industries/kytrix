@@ -6,7 +6,7 @@ use market_participants_model::{
     prediction::{PredictionPricePoint, PredictionRange, PredictionSeries},
 };
 use ui_core::{
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::canvas::Canvas,
     test_support::record::PrimitiveKind,
@@ -21,8 +21,8 @@ use crate::{
     test_support::{charted_market, event_ref, event_with},
 };
 
-const WIDTH: f32 = 760.0;
-const HEIGHT: f32 = 248.0;
+const WIDTH: LogicalPx = px(760.0);
+const HEIGHT: LogicalPx = px(248.0);
 
 fn translate(language: LanguageCode) -> Translate {
     Translate::new(
@@ -118,7 +118,7 @@ impl ChartHarness {
             .expect("the chart syncs")
     }
 
-    fn sync_at(&mut self, pointer: Point) -> bool {
+    fn sync_at(&mut self, pointer: LogicalPoint) -> bool {
         let Self {
             app,
             chart,
@@ -141,14 +141,14 @@ impl ChartHarness {
             .expect("the chart drew a canvas")
     }
 
-    fn box_of(&self) -> Rect {
+    fn box_of(&self) -> LogicalRect {
         self.app
             .canvas_handle(self.node)
             .expect("the node holds a canvas")
             .bounds()
     }
 
-    fn resize(&mut self, width: f32, height: f32) {
+    fn resize(&mut self, width: LogicalPx, height: LogicalPx) {
         let page = self.page;
         self.app.with_cx(|cx| {
             let style = ui_core::paint::style_builder::StyleBuilder::new()
@@ -177,7 +177,7 @@ impl ChartHarness {
     }
 }
 
-fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
+fn page(app: &mut WidgetTestApp, width: LogicalPx, height: LogicalPx) -> NodeId {
     app.with_cx(|cx| {
         let root = cx.tree().root();
         NodeBuilder::boxed()
@@ -217,7 +217,7 @@ fn a_chart_should_fill_the_box_it_is_given() {
 
     assert_eq!(
         harness.box_of(),
-        Rect::new(0.0, 0.0, WIDTH, HEIGHT),
+        LogicalRect::new(px(0.0), px(0.0), WIDTH, HEIGHT),
         "the canvas covers the box the node was given"
     );
     assert!(
@@ -435,7 +435,7 @@ fn a_pointer_should_resolve_to_a_sample_without_preparing_again() {
     assert!(harness.sync());
     let builds = harness.chart.prepared_builds();
     let plot = ChartLayout::new(harness.box_of()).plot;
-    let pointer = Point::new(
+    let pointer = LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     );
@@ -510,7 +510,7 @@ fn a_stale_label_off_the_canvas_should_not_keep_the_chart_repainting() {
     assert!(harness.sync(), "the first frame paints");
     let plot = ChartLayout::new(harness.box_of()).plot;
     let sample = |fraction: f32| {
-        Point::new(
+        LogicalPoint::new(
             plot.origin.x + plot.size.width * fraction,
             plot.origin.y + plot.size.height / 2.0,
         )
@@ -611,7 +611,7 @@ fn a_resize_should_prepare_the_new_box() {
     let builds = harness.chart.prepared_builds();
     let before = ChartLayout::new(harness.box_of()).plot;
 
-    harness.resize(WIDTH, HEIGHT + 100.0);
+    harness.resize(WIDTH, HEIGHT + px(100.0));
     assert!(harness.sync(), "the new box is another drawing");
     let after = ChartLayout::new(harness.box_of()).plot;
 
@@ -632,7 +632,7 @@ fn a_fractional_resize_should_not_prepare_again() {
     let builds = harness.chart.prepared_builds();
     let box_before = harness.box_of();
 
-    harness.resize(WIDTH + 0.3, HEIGHT + 0.3);
+    harness.resize(WIDTH + px(0.3), HEIGHT + px(0.3));
 
     assert_eq!(
         harness.box_of(),

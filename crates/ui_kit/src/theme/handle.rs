@@ -87,7 +87,7 @@ impl ThemeHandle {
 #[cfg(test)]
 mod tests {
     use ui_core::{
-        math::Rect,
+        math::{LogicalRect, px},
         node::builder::NodeBuilder,
         paint::{
             color::{Color, ColorResolver},
@@ -137,7 +137,7 @@ mod tests {
         let theme_reader = {
             let theme = handle.clone();
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
                 .paint(PaintSpec {
                     background: Color::WHITE,
                     ..PaintSpec::default()
@@ -154,7 +154,7 @@ mod tests {
         };
         let appearance_reader = {
             let theme = handle.clone();
-            NodeBuilder::text("light", ui_core::text::TextStyle::new(13.0))
+            NodeBuilder::text("light", ui_core::text::TextStyle::new(px(13.0)))
                 .bind_text(move |cx| match theme.appearance(cx) {
                     Appearance::Light => smol_str::SmolStr::new_static("light"),
                     Appearance::Dark => smol_str::SmolStr::new_static("night"),
@@ -166,7 +166,7 @@ mod tests {
                 .expect("外观读者")
         };
         let static_node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 30.0, 20.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(30.0), px(20.0), px(10.0)))
             .paint(PaintSpec {
                 background: Color::WHITE,
                 ..PaintSpec::default()
@@ -178,7 +178,7 @@ mod tests {
             .expect("静态节点");
         let other_reader = {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 50.0, 20.0, 10.0))
+                .layout_override(LogicalRect::new(px(0.0), px(50.0), px(20.0), px(10.0)))
                 .paint(PaintSpec {
                     background: Color::WHITE,
                     ..PaintSpec::default()
@@ -267,7 +267,7 @@ mod tests {
         let reader = {
             let theme = handle.clone();
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
                 .paint(PaintSpec {
                     background: constant,
                     ..PaintSpec::default()
@@ -323,7 +323,7 @@ mod tests {
             let theme = handle.clone();
             nodes.push(
                 NodeBuilder::boxed()
-                    .layout_override(Rect::new(0.0, index, 10.0, 10.0))
+                    .layout_override(LogicalRect::new(px(0.0), px(index), px(10.0), px(10.0)))
                     .paint(PaintSpec {
                         background: Color::WHITE,
                         ..PaintSpec::default()

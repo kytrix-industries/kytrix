@@ -11,6 +11,7 @@ use ui_core::{
     error::EngineError,
     event::Event,
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -36,7 +37,7 @@ use ui_kit::{
 
 use crate::{host::SettingsHost, layout, session::SettingsChange};
 
-const FORM_WIDTH: f32 = 480.0;
+const FORM_WIDTH: LogicalPx = px(480.0);
 
 const LABEL_SIZE: f32 = 13.0;
 
@@ -500,7 +501,7 @@ impl ProxyEditor {
 
         let dialog = DialogBuilder::new(title)
             .content(content)
-            .width(FORM_WIDTH)
+            .width(FORM_WIDTH.value())
             .fade(false)
             .close_label(close_label)
             .build(
@@ -634,7 +635,7 @@ impl FormBuild<'_> {
                 .flex_col()
                 .width_full()
                 .min_width_0()
-                .gap(12.0)
+                .gap(px(12.0))
                 .build(),
         )?;
 
@@ -677,7 +678,7 @@ impl FormBuild<'_> {
                 .flex_col()
                 .width_full()
                 .min_width_0()
-                .gap(4.0)
+                .gap(px(4.0))
                 .build(),
             visible,
         )?;
@@ -721,9 +722,9 @@ impl FormBuild<'_> {
         layout::build_node(app, self.window, wrapper, move |tree, parent| {
             NodeBuilder::text(
                 SmolStr::default(),
-                TextStyle::new(ERROR_SIZE).with_wrap(TextWrap::Wrap),
+                TextStyle::new(px(ERROR_SIZE)).with_wrap(TextWrap::Wrap),
             )
-            .style(StyleBuilder::new().height(ERROR_LINE_HEIGHT).build())
+            .style(StyleBuilder::new().height(px(ERROR_LINE_HEIGHT)).build())
             .bind_text(move |cx| cx.read(&error).clone())
             .bind_style(move |cx| {
                 let visible = { !cx.read(&error).is_empty() };
@@ -841,7 +842,7 @@ impl FormBuild<'_> {
                 .flex_col()
                 .width_full()
                 .min_width_0()
-                .gap(4.0)
+                .gap(px(4.0))
                 .build(),
         )?;
         layout::themed_text(
@@ -869,7 +870,7 @@ impl FormBuild<'_> {
                 .flex_col()
                 .width_full()
                 .flex_none()
-                .gap(8.0)
+                .gap(px(8.0))
                 .build(),
         )?;
         let divider_theme = self.theme.clone();
@@ -888,7 +889,7 @@ impl FormBuild<'_> {
                 .justify_end()
                 .width_full()
                 .flex_none()
-                .gap(8.0)
+                .gap(px(8.0))
                 .build(),
         )?;
 

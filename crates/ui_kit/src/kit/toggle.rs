@@ -11,7 +11,7 @@ use ui_core::{
     event::Event,
     interaction::ActionCtx,
     layout::LayoutOverride,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -74,7 +74,7 @@ struct Geometry {
     knob: Option<NodeId>,
     ring: Option<NodeId>,
     mark: Option<NodeId>,
-    mark_paint: Cell<Option<(Rect, Color)>>,
+    mark_paint: Cell<Option<(LogicalRect, Color)>>,
 }
 
 impl Toggle {
@@ -337,16 +337,17 @@ impl Toggle {
         let inset = track_metrics(self.size).inset;
         let knob_size = (bounds.size.height - inset * 2.0)
             .min(bounds.size.width - inset * 2.0)
-            .max(1.0);
-        let travel = (bounds.size.width - knob_size - inset * 2.0).max(0.0);
-        let offset =
-            (inset + self.mix(app) * travel).clamp(0.0, (bounds.size.width - knob_size).max(0.0));
-        let top = inset.min((bounds.size.height - knob_size).max(0.0));
+            .max(px(1.0));
+        let travel = (bounds.size.width - knob_size - inset * 2.0).max(px(0.0));
+        let offset = (inset + travel * self.mix(app))
+            .value()
+            .clamp(0.0, (bounds.size.width - knob_size).max(px(0.0)).value());
+        let top = inset.min((bounds.size.height - knob_size).max(px(0.0)));
         set_override(
             app,
             window,
             knob,
-            Rect::new(offset, top, knob_size, knob_size),
+            LogicalRect::new(px(offset), top, knob_size, knob_size),
         )
     }
 
@@ -361,10 +362,10 @@ impl Toggle {
         let Some(bounds) = layout_bounds(app, window, control) else {
             return Ok(false);
         };
-        let mark_size = (bounds.size.width * CHECK_ICON_RATIO).max(1.0);
-        let rect = Rect::new(
-            ((bounds.size.width - mark_size) / 2.0).max(0.0),
-            ((bounds.size.height - mark_size) / 2.0).max(0.0),
+        let mark_size = (bounds.size.width * CHECK_ICON_RATIO).max(px(1.0));
+        let rect = LogicalRect::new(
+            ((bounds.size.width - mark_size) / 2.0).max(px(0.0)),
+            ((bounds.size.height - mark_size) / 2.0).max(px(0.0)),
             mark_size,
             mark_size,
         );
@@ -376,7 +377,7 @@ impl Toggle {
             .theme_for(appearance)
             .role(Role::FgOnBrand)
             .with_opacity(self.mix(app));
-        let paint_bounds = Rect::new(
+        let paint_bounds = LogicalRect::new(
             bounds.origin.x + rect.origin.x,
             bounds.origin.y + rect.origin.y,
             mark_size,
@@ -395,7 +396,7 @@ impl Toggle {
     }
 }
 
-fn layout_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
+fn layout_bounds(app: &App, window: WindowId, node: NodeId) -> Option<LogicalRect> {
     app.window(window)?
         .tree()
         .get(node)
@@ -404,25 +405,26 @@ fn layout_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
         .filter(|bounds| !bounds.is_empty())
 }
 
-fn check_canvas(bounds: Rect, color: Color) -> Canvas {
+fn check_canvas(bounds: LogicalRect, color: Color) -> Canvas {
     let mut canvas = Canvas::new(bounds);
     let size = bounds.size.width.min(bounds.size.height);
     let radius = size * CHECK_STROKE_RATIO;
     let points = [
-        Point::new(bounds.origin.x + size * 0.20, bounds.origin.y + size * 0.55),
-        Point::new(bounds.origin.x + size * 0.43, bounds.origin.y + size * 0.78),
-        Point::new(bounds.origin.x + size * 0.82, bounds.origin.y + size * 0.22),
+        LogicalPoint::new(bounds.origin.x + size * 0.20, bounds.origin.y + size * 0.55),
+        LogicalPoint::new(bounds.origin.x + size * 0.43, bounds.origin.y + size * 0.78),
+        LogicalPoint::new(bounds.origin.x + size * 0.82, bounds.origin.y + size * 0.22),
     ];
     for pair in points.windows(2) {
         let from = pair[0];
         let to = pair[1];
-        let length = (to.x - from.x).hypot(to.y - from.y);
-        let steps = (length / (radius * 0.6)).ceil().max(1.0) as usize;
+        let length = (to.x - from.x).value().hypot((to.y - from.y).value());
+        let steps = (length / (radius.value() * 0.6)).ceil().max(1.0) as usize;
         for step in 0..=steps {
             let t = step as f32 / steps as f32;
-            let center = Point::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+            let center =
+                LogicalPoint::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
             canvas.push_quad(Quad {
-                bounds: Rect::new(
+                bounds: LogicalRect::new(
                     center.x - radius,
                     center.y - radius,
                     radius * 2.0,
@@ -443,7 +445,7 @@ fn set_override(
     app: &mut App,
     window: WindowId,
     node: NodeId,
-    rect: Rect,
+    rect: LogicalRect,
 ) -> Result<bool, EngineError> {
     let current = app
         .window(window)
@@ -483,14 +485,14 @@ struct Control {
     knob: Option<NodeId>,
     ring: Option<NodeId>,
     mark: Option<NodeId>,
-    mark_paint: Option<(Rect, Color)>,
+    mark_paint: Option<(LogicalRect, Color)>,
 }
 
 struct TrackMetrics {
-    width: f32,
-    height: f32,
-    radius: f32,
-    inset: f32,
+    width: LogicalPx,
+    height: LogicalPx,
+    radius: LogicalPx,
+    inset: LogicalPx,
 }
 
 fn track_metrics(size: UnifiedSize) -> TrackMetrics {
@@ -499,7 +501,7 @@ fn track_metrics(size: UnifiedSize) -> TrackMetrics {
         width: height * 1.9,
         height,
         radius: height / 2.0,
-        inset: 2.0,
+        inset: LogicalPx::new(2.0),
     }
 }
 
@@ -528,7 +530,7 @@ fn build_control(
                         .justify_center()
                         .build(),
                 )
-                .paint(PaintBuilder::new().rounded(3.0).build())
+                .paint(PaintBuilder::new().rounded(px(3.0)).build())
                 .bind_style(move |cx| {
                     if is_radio {
                         return StylePatch::default();
@@ -542,7 +544,7 @@ fn build_control(
                     StylePatch {
                         background: Some(background),
                         border: Some(Border {
-                            width: 1.0,
+                            width: px(1.0),
                             color: if enabled { border } else { palette.unchecked },
                         }),
                         ..StylePatch::default()
@@ -560,7 +562,12 @@ fn build_control(
                 Some(
                     NodeBuilder::boxed()
                         .style(StyleBuilder::new().size(side, side).build())
-                        .layout_override(Rect::new(0.0, 0.0, side, side))
+                        .layout_override(LogicalRect::new(
+                            LogicalPx::ZERO,
+                            LogicalPx::ZERO,
+                            side,
+                            side,
+                        ))
                         .paint(PaintBuilder::new().rounded(side).build())
                         .bind_style(move |cx| {
                             let (palette, enabled) = toggle_colors(cx, &ring_theme, &disabled);
@@ -573,7 +580,7 @@ fn build_control(
                             StylePatch {
                                 background: Some(background),
                                 border: Some(Border {
-                                    width: 1.0,
+                                    width: px(1.0),
                                     color: if enabled { border } else { palette.unchecked },
                                 }),
                                 ..StylePatch::default()
@@ -594,10 +601,10 @@ fn build_control(
                 ToggleKind::Checkbox => {
                     let mark_size = side * CHECK_ICON_RATIO;
                     let inset = (side - mark_size) / 2.0;
-                    let canvas = Canvas::new(Rect::default());
+                    let canvas = Canvas::new(LogicalRect::default());
                     let mark = NodeBuilder::canvas(canvas)
                         .style(StyleBuilder::new().size(mark_size, mark_size).build())
-                        .layout_override(Rect::new(inset, inset, mark_size, mark_size))
+                        .layout_override(LogicalRect::new(inset, inset, mark_size, mark_size))
                         .bind_style(move |cx| {
                             let _ = theme.appearance(cx);
                             StylePatch::default()
@@ -620,7 +627,7 @@ fn build_control(
                     let theme_dot = theme;
                     let mark = NodeBuilder::boxed()
                         .style(StyleBuilder::new().size(dot, dot).build())
-                        .layout_override(Rect::new(inset, inset, dot, dot))
+                        .layout_override(LogicalRect::new(inset, inset, dot, dot))
                         .paint(PaintBuilder::new().rounded(dot / 2.0).build())
                         .bind_style(move |cx| {
                             let progress = *cx.read_transient(&mark_mix);
@@ -669,7 +676,7 @@ fn build_control(
                     StylePatch {
                         background: Some(background),
                         border: Some(Border {
-                            width: 1.0,
+                            width: px(1.0),
                             color: background,
                         }),
                         ..StylePatch::default()
@@ -682,7 +689,7 @@ fn build_control(
                     parent,
                 )?;
             let knob_size = metrics.height - metrics.inset * 2.0;
-            let initial = Rect::new(metrics.inset, metrics.inset, knob_size, knob_size);
+            let initial = LogicalRect::new(metrics.inset, metrics.inset, knob_size, knob_size);
             let theme_knob = theme;
             let knob = NodeBuilder::boxed()
                 .layout_override(initial)
@@ -730,7 +737,7 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect, Size},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::{
             color::{Color, ColorResolver},
@@ -796,8 +803,8 @@ mod tests {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .width(width)
-                        .height(30.0)
+                        .width(px(width))
+                        .height(px(30.0))
                         .flex_col()
                         .build(),
                 )
@@ -835,9 +842,9 @@ mod tests {
         let _ = harness.app.drain().expect("frame");
     }
 
-    fn center(app: &TestApp, node: NodeId) -> Point {
+    fn center(app: &TestApp, node: NodeId) -> LogicalPoint {
         let bounds = app.probe().bounds(node).expect("bounds");
-        Point::new(
+        LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         )
@@ -896,7 +903,7 @@ mod tests {
             .expect("单选外圈节点")
     }
 
-    fn override_rect(harness: &Harness, node: NodeId) -> Rect {
+    fn override_rect(harness: &Harness, node: NodeId) -> LogicalRect {
         let window = harness.app.window_id();
         harness
             .app
@@ -911,7 +918,7 @@ mod tests {
             .rect
     }
 
-    fn override_geometry(harness: &Harness) -> Vec<Rect> {
+    fn override_geometry(harness: &Harness) -> Vec<LogicalRect> {
         let geometry = harness.toggle.inner.geometry.borrow();
         [geometry.knob, geometry.ring, geometry.mark]
             .into_iter()
@@ -1088,7 +1095,7 @@ mod tests {
                 .style();
             assert_eq!(
                 style.inner().padding.left,
-                taffy::style::LengthPercentage::length(size.px()),
+                taffy::style::LengthPercentage::length(size.px().value()),
                 "{size:?} 的左内边距"
             );
         }
@@ -1264,12 +1271,12 @@ mod tests {
     #[test]
     fn the_medium_toggle_geometry_is_frozen_in_logical_pixels() {
         let metrics = super::track_metrics(crate::kit::size::UnifiedSize::Medium);
-        assert_eq!(metrics.width, 28.5);
-        assert_eq!(metrics.height, 15.0);
-        assert_eq!(metrics.radius, 7.5);
-        assert_eq!(metrics.inset, 2.0);
+        assert_eq!(metrics.width, px(28.5));
+        assert_eq!(metrics.height, px(15.0));
+        assert_eq!(metrics.radius, px(7.5));
+        assert_eq!(metrics.inset, px(2.0));
         let travel = metrics.width - (metrics.height - metrics.inset * 2.0) - metrics.inset * 2.0;
-        assert_eq!(travel, 13.5);
+        assert_eq!(travel, px(13.5));
 
         let unchecked = harness(ToggleKind::Switch, false);
         let track = unchecked
@@ -1277,11 +1284,15 @@ mod tests {
             .probe()
             .bounds(unchecked.toggle.control_node().expect("track"))
             .expect("track bounds");
-        assert_eq!(track.size, Size::new(28.5, 15.0), "switch 轨道逻辑尺寸");
+        assert_eq!(
+            track.size,
+            LogicalSize::new(px(28.5), px(15.0)),
+            "switch 轨道逻辑尺寸"
+        );
         let knob = unchecked.toggle.knob_node().expect("knob");
         assert_eq!(
             override_rect(&unchecked, knob),
-            Rect::new(2.0, 2.0, 11.0, 11.0),
+            LogicalRect::new(px(2.0), px(2.0), px(11.0), px(11.0)),
             "未选中滑块几何"
         );
 
@@ -1294,10 +1305,14 @@ mod tests {
             .iter()
             .find(|quad| quad.node == checked.toggle.control_node().expect("track"))
             .expect("轨道四边图元");
-        assert_eq!(track_quad.corner_radius, [7.5; 4], "switch 轨道圆角半径");
+        assert_eq!(
+            track_quad.corner_radius,
+            [px(7.5); 4],
+            "switch 轨道圆角半径"
+        );
         assert_eq!(
             override_rect(&checked, checked.toggle.knob_node().expect("knob")),
-            Rect::new(15.5, 2.0, 11.0, 11.0),
+            LogicalRect::new(px(15.5), px(2.0), px(11.0), px(11.0)),
             "选中滑块几何：inset 2 + travel 13.5"
         );
 
@@ -1307,30 +1322,40 @@ mod tests {
             .probe()
             .bounds(checkbox.toggle.control_node().expect("control"))
             .expect("control bounds");
-        assert_eq!(control.size, Size::new(18.0, 18.0), "checkbox 方框逻辑尺寸");
+        assert_eq!(
+            control.size,
+            LogicalSize::new(px(18.0), px(18.0)),
+            "checkbox 方框逻辑尺寸"
+        );
         let mark = override_rect(&checkbox, mark_node(&checkbox));
-        assert!((mark.origin.x - 0.9).abs() < 1e-4, "checkbox mark 内缩");
-        assert!((mark.size.width - 16.2).abs() < 1e-4, "checkbox mark 尺寸");
         assert!(
-            (mark.origin.x * 2.0 + mark.size.width - 18.0).abs() < 1e-4,
+            (mark.origin.x.value() - 0.9).abs() < 1e-4,
+            "checkbox mark 内缩"
+        );
+        assert!(
+            (mark.size.width.value() - 16.2).abs() < 1e-4,
+            "checkbox mark 尺寸"
+        );
+        assert!(
+            (mark.origin.x.value() * 2.0 + mark.size.width.value() - 18.0).abs() < 1e-4,
             "checkbox mark 水平居中"
         );
 
         let radio = harness(ToggleKind::Radio, true);
         assert_eq!(
             override_rect(&radio, ring_node(&radio)),
-            Rect::new(0.0, 0.0, 18.0, 18.0),
+            LogicalRect::new(px(0.0), px(0.0), px(18.0), px(18.0)),
             "单选外圈几何"
         );
         let dot = override_rect(&radio, mark_node(&radio));
-        assert!((dot.origin.x - 5.22).abs() < 1e-4, "单选内点内缩");
-        assert!((dot.size.width - 7.56).abs() < 1e-4, "单选内点尺寸");
+        assert!((dot.origin.x.value() - 5.22).abs() < 1e-4, "单选内点内缩");
+        assert!((dot.size.width.value() - 7.56).abs() < 1e-4, "单选内点尺寸");
         assert!(
-            (dot.origin.x * 2.0 + dot.size.width - 18.0).abs() < 1e-4,
+            (dot.origin.x.value() * 2.0 + dot.size.width.value() - 18.0).abs() < 1e-4,
             "单选内点水平居中"
         );
         assert!(
-            (dot.origin.y * 2.0 + dot.size.height - 18.0).abs() < 1e-4,
+            (dot.origin.y.value() * 2.0 + dot.size.height.value() - 18.0).abs() < 1e-4,
             "单选内点垂直居中"
         );
     }
@@ -1352,11 +1377,11 @@ mod tests {
                 .expect("track bounds");
             let knob = override_rect(&harness, harness.toggle.knob_node().expect("knob"));
             assert!(
-                track.size.width < 28.5,
+                track.size.width.value() < 28.5,
                 "宽度 {width}: track 必须确实被压窄（实际 {}）",
                 track.size.width
             );
-            assert!(knob.origin.x >= 0.0, "宽度 {width}: 滑块左缘越界");
+            assert!(knob.origin.x.value() >= 0.0, "宽度 {width}: 滑块左缘越界");
             assert!(
                 knob.origin.x + knob.size.width <= track.size.width + 1e-4,
                 "宽度 {width}: 滑块右缘 {} 超出轨道宽 {}",
@@ -1393,13 +1418,13 @@ mod tests {
                 (
                     "track",
                     harness.toggle.control_node().expect("track"),
-                    Rect::new(6.0, 7.5, 28.5, 15.0),
+                    LogicalRect::new(px(6.0), px(7.5), px(28.5), px(15.0)),
                     track_px,
                 ),
                 (
                     "knob",
                     harness.toggle.knob_node().expect("knob"),
-                    Rect::new(21.5, 9.5, 11.0, 11.0),
+                    LogicalRect::new(px(21.5), px(9.5), px(11.0), px(11.0)),
                     knob_px,
                 ),
             ];

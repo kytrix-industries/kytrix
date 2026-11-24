@@ -12,7 +12,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::{Event, InputEvent, PointerButton},
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         style::StylePatch,
@@ -70,9 +70,9 @@ const FRAME_TICK_MS: u32 = 16;
 
 const FRAME_TICK: std::time::Duration = std::time::Duration::from_millis(16);
 
-const BOOK_SPLITTER_HEIGHT: f32 = 7.0;
+const BOOK_SPLITTER_HEIGHT: LogicalPx = LogicalPx::new(7.0);
 
-const MIN_BOOK_HEIGHT: f32 = 56.0;
+const MIN_BOOK_HEIGHT: LogicalPx = LogicalPx::new(56.0);
 
 const EVENT_KEY_SUFFIX: &str = "prediction_market.header.event";
 const GROUP_KEY_SUFFIX: &str = "prediction_market.header.market_group";
@@ -176,7 +176,7 @@ impl Pulse {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SplitDragStart {
     start_ratio: f32,
-    start_y: f32,
+    start_y: LogicalPx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,7 +301,7 @@ pub struct PredictionMarketWidget {
     pulse_seen_ticks: u64,
     pulse: Option<Pulse>,
     pulse_timer: Option<ui_core::app::TimerId>,
-    pointer: Option<Point>,
+    pointer: Option<LogicalPoint>,
     chart: ChartCanvas,
     book_panel: PredictionBookPanel,
     book_snapshot: Option<Arc<PredictionOrderBook>>,
@@ -507,9 +507,9 @@ impl WidgetView for PredictionMarketWidget {
                     .width_full()
                     .flex_row()
                     .items_center()
-                    .gap(8.0)
-                    .padding_x(8.0)
-                    .padding_y(4.0)
+                    .gap(px(8.0))
+                    .padding_x(px(8.0))
+                    .padding_y(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), root)?;
@@ -521,7 +521,7 @@ impl WidgetView for PredictionMarketWidget {
                         .flex_none()
                         .flex_row()
                         .items_center()
-                        .gap(6.0)
+                        .gap(px(6.0))
                         .build(),
                 )
                 .bind_style(move |read| {
@@ -538,8 +538,13 @@ impl WidgetView for PredictionMarketWidget {
                 .build(cx.tree_mut(), legend)?;
             let dot_theme = self.theme.clone();
             NodeBuilder::boxed()
-                .style(StyleBuilder::new().flex_none().size(8.0, 8.0).build())
-                .paint(PaintBuilder::new().rounded(4.0).build())
+                .style(
+                    StyleBuilder::new()
+                        .flex_none()
+                        .size(px(8.0), px(8.0))
+                        .build(),
+                )
+                .paint(PaintBuilder::new().rounded(px(4.0)).build())
                 .bind_style(move |read| {
                     let snapshot = read.read(&snapshots);
                     let snapshot = &*snapshot;
@@ -641,8 +646,8 @@ impl WidgetView for PredictionMarketWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .left(px(0.0))
                     .size_full()
                     .flex_row()
                     .items_center()
@@ -1464,7 +1469,7 @@ impl PredictionMarketWidget {
                 StyleBuilder::new()
                     .flex_none()
                     .width_full()
-                    .height(1.0)
+                    .height(px(1.0))
                     .build(),
             )
             .bind_style(move |read| StylePatch {
@@ -1493,7 +1498,7 @@ impl PredictionMarketWidget {
         let strip_text_theme = theme.clone();
         let strip_text_language = language_signal;
         let strip_text_translate = translate.clone();
-        NodeBuilder::text(SmolStr::default(), TextStyle::new(11.0))
+        NodeBuilder::text(SmolStr::default(), TextStyle::new(px(11.0)))
             .bind_text(move |read| {
                 let _language = read.read(&strip_text_language);
                 let region = read.read(&region_signal);
@@ -1538,8 +1543,8 @@ impl PredictionMarketWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .left(px(0.0))
                     .size_full()
                     .flex_row()
                     .items_center()
@@ -1558,7 +1563,7 @@ impl PredictionMarketWidget {
                 }
             })
             .build(cx.tree_mut(), status)?;
-        NodeBuilder::text(SmolStr::default(), TextStyle::new(12.0))
+        NodeBuilder::text(SmolStr::default(), TextStyle::new(px(12.0)))
             .bind_text(move |read| {
                 let _language = read.read(&status_text_language);
                 let region = read.read(&region_signal);
@@ -1573,13 +1578,13 @@ impl PredictionMarketWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .left(px(0.0))
                     .size_full()
                     .flex_col()
                     .items_center()
                     .justify_end()
-                    .padding_y(4.0)
+                    .padding_y(px(4.0))
                     .build(),
             )
             .bind_style(move |read| {
@@ -2289,7 +2294,7 @@ impl PredictionMarketWidget {
         self.chart.clear();
     }
 
-    fn begin_book_split(&mut self, position: Point) {
+    fn begin_book_split(&mut self, position: LogicalPoint) {
         self.split_drag = Some(SplitDragStart {
             start_ratio: clamp_ratio(self.config.order_book_ratio),
             start_y: position.y,
@@ -2297,7 +2302,7 @@ impl PredictionMarketWidget {
         self.split_dragging = false;
     }
 
-    fn drag_book_splitter(&mut self, position: Point, cx: &mut WidgetCx<'_>) {
+    fn drag_book_splitter(&mut self, position: LogicalPoint, cx: &mut WidgetCx<'_>) {
         let Some(start) = self.split_drag else {
             return;
         };
@@ -2309,7 +2314,7 @@ impl PredictionMarketWidget {
         };
         let height = node.layout().bounds.size.height;
         let ratio = crate::book::split_ratio(start.start_ratio, position.y - start.start_y, height);
-        let ratio = if height > 0.0 {
+        let ratio = if height > px(0.0) {
             ratio
                 .max(MIN_BOOK_RATIO.max(MIN_BOOK_HEIGHT / height))
                 .min(MAX_BOOK_RATIO)
@@ -2336,7 +2341,7 @@ impl PredictionMarketWidget {
     }
 }
 
-fn pointer_over(cx: &WidgetCx<'_>, node: NodeId, position: Point) -> bool {
+fn pointer_over(cx: &WidgetCx<'_>, node: NodeId, position: LogicalPoint) -> bool {
     cx.tree()
         .get(node)
         .is_ok_and(|node| node.layout().bounds.contains(position))
@@ -2349,9 +2354,9 @@ fn book_strip_style() -> ui_core::paint::style::Style {
         .flex_row()
         .items_center()
         .justify_between()
-        .gap(4.0)
-        .padding_x(8.0)
-        .padding_y(2.0)
+        .gap(px(4.0))
+        .padding_x(px(8.0))
+        .padding_y(px(2.0))
         .build()
 }
 
@@ -2375,7 +2380,7 @@ fn collapsed_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .flex_none()
         .width_full()
-        .height(0.0)
+        .height(px(0.0))
         .overflow_hidden()
         .build()
 }
@@ -2383,8 +2388,8 @@ fn collapsed_style() -> ui_core::paint::style::Style {
 fn overlay_center_style() -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .absolute()
-        .top(0.0)
-        .left(0.0)
+        .top(px(0.0))
+        .left(px(0.0))
         .size_full()
         .flex_row()
         .items_center()

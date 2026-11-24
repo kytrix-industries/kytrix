@@ -6,7 +6,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     interaction::{AnimatedValue, AnimationSpec, Easing},
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -41,7 +41,7 @@ pub enum SpinnerColor {
 #[derive(Clone)]
 pub struct Spinner {
     inner: Rc<SpinnerInner>,
-    size: f32,
+    size: LogicalPx,
     label: Option<SmolStr>,
     spinning: bool,
 }
@@ -54,7 +54,7 @@ struct SpinnerInner {
     color: std::cell::Cell<SpinnerColor>,
     angle: Transient<f32>,
     target: Cell<f32>,
-    last_paint: Cell<Option<(Rect, f32, Color)>>,
+    last_paint: Cell<Option<(LogicalRect, f32, Color)>>,
     geometry: std::cell::RefCell<Geometry>,
 }
 
@@ -87,7 +87,7 @@ impl Spinner {
     }
 
     #[must_use]
-    pub fn with_size(mut self, size: f32) -> Self {
+    pub fn with_size(mut self, size: LogicalPx) -> Self {
         self.size = size;
         self
     }
@@ -123,7 +123,7 @@ impl Spinner {
         parent: NodeId,
     ) -> Result<NodeId, EngineError> {
         let style = StyleBuilder::new().size(self.size, self.size).build();
-        let builder = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let builder = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(format_smolstr!("{}:spinner", self.inner.key))
             .style(style)
             .tab_stop(false)
@@ -276,23 +276,23 @@ impl Spinner {
     }
 }
 
-fn spinner_canvas(bounds: Rect, angle: f32, color: Color) -> Canvas {
+fn spinner_canvas(bounds: LogicalRect, angle: f32, color: Color) -> Canvas {
     let mut canvas = Canvas::new(bounds);
-    let center = Point::new(
+    let center = LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     );
-    let dot = (bounds.size.width.min(bounds.size.height) / 6.0).max(MIN_DOT);
-    let radius = (bounds.size.width.min(bounds.size.height) / 2.0 - dot / 2.0).max(0.0);
+    let dot = (bounds.size.width.min(bounds.size.height) / 6.0).max(px(MIN_DOT));
+    let radius = (bounds.size.width.min(bounds.size.height) / 2.0 - dot / 2.0).max(px(0.0));
     for index in 0..DOTS {
         let phase = angle + index as f32 * TAU / DOTS as f32;
         let alpha = 0.15 + 0.85 * (index as f32 / (DOTS - 1) as f32);
-        let position = Point::new(
-            center.x + phase.cos() * radius,
-            center.y + phase.sin() * radius,
+        let position = LogicalPoint::new(
+            center.x + radius * phase.cos(),
+            center.y + radius * phase.sin(),
         );
         canvas.push_quad(Quad {
-            bounds: Rect::new(position.x - dot / 2.0, position.y - dot / 2.0, dot, dot),
+            bounds: LogicalRect::new(position.x - dot / 2.0, position.y - dot / 2.0, dot, dot),
             corner_radius: [dot / 2.0; 4],
             paint: QuadPaint::Solid {
                 fill: color.with_opacity(alpha),
@@ -309,7 +309,7 @@ mod tests {
 
     use ui_core::{
         a11y::A11yRole,
-        math::Rect,
+        math::{LogicalRect, px},
         node::{id::NodeId, tree::NodeKind},
         test_support::app::TestApp,
     };
@@ -327,7 +327,7 @@ mod tests {
         let mut app = TestApp::new();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
         let spinner = Spinner::new(app.app_mut(), theme, "spin")
-            .with_size(24.0)
+            .with_size(px(24.0))
             .with_color(ui_core::paint::color::Color::WHITE)
             .spinning(spinning);
         let window = app.window_id();
@@ -339,7 +339,7 @@ mod tests {
         Harness { app, spinner, node }
     }
 
-    fn canvas_quads(harness: &Harness) -> Vec<Rect> {
+    fn canvas_quads(harness: &Harness) -> Vec<LogicalRect> {
         let window = harness.app.window_id();
         let tree = harness.app.app().window(window).expect("window").tree();
         match tree.get(harness.node).expect("node").kind() {
@@ -378,8 +378,8 @@ mod tests {
     fn a_spinner_draws_a_ring_of_dots_inside_its_layout_box() {
         let harness = harness(true);
         let bounds = harness.app.probe().bounds(harness.node).expect("bounds");
-        assert!((bounds.size.width - 24.0).abs() < 0.5);
-        assert!((bounds.size.height - 24.0).abs() < 0.5);
+        assert!((bounds.size.width.value() - 24.0).abs() < 0.5);
+        assert!((bounds.size.height.value() - 24.0).abs() < 0.5);
         let quads = canvas_quads(&harness);
         assert_eq!(quads.len(), 8, "8 个点");
         for quad in quads {
@@ -418,7 +418,7 @@ mod tests {
         let mut app = TestApp::new();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
         let spinner = Spinner::new(app.app_mut(), theme.clone(), "themed")
-            .with_size(24.0)
+            .with_size(px(24.0))
             .with_role(Role::BrandBase)
             .spinning(false);
         let window = app.window_id();

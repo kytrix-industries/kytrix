@@ -1,6 +1,7 @@
 use std::{rc::Rc, sync::Arc};
 
 use app_config::settings::AccountConfig;
+use bytes::Bytes;
 use i18n::{t_smol, translate::Translate};
 use kytrix_service_provider::auth::{constants::ACCOUNT_ORIGIN, model::PlanCode};
 use smol_str::{SmolStr, format_smolstr};
@@ -12,6 +13,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::Event,
+    math::{LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -35,7 +37,7 @@ use widget::error::TranslatedError;
 
 use crate::{
     account::SignedInAccount,
-    avatar::{AvatarError, Face},
+    avatar::AvatarError,
     dialogs::{self, AlertAction, AlertContent},
     host::ProfileHost,
     menu::{MenuContent, MenuRequest, MenuShape, MenuSignals, plan_label},
@@ -59,7 +61,7 @@ pub(crate) enum MenuEvent {
     Face {
         wallet: SmolStr,
         generated: bool,
-        result: Result<(SmolStr, Face), AvatarError>,
+        result: Result<(SmolStr, SmolStr), AvatarError>,
     },
     Plan {
         generation: u64,
@@ -455,16 +457,11 @@ impl ProfileMenu {
         }
         state.face_job = Some(job);
         let runtime = self.host.runtime().clone();
-        let scale = app
-            .window(state.window)
-            .map_or(1.0, |window| window.scale().factor());
-        let side = (crate::menu::ACCOUNT_AVATAR_SIZE * scale).round().max(1.0) as u32;
         let (events, handle, window) = (state.events_tx.clone(), app.handle(), state.window);
         let generated = stored.is_none();
         let job_wallet = wallet;
         self.host.runtime().spawn(async move {
-            let result =
-                crate::avatar::render_face(job_wallet.clone(), stored, side, runtime).await;
+            let result = crate::avatar::render_face(job_wallet.clone(), stored, runtime).await;
             let _ = events.send(MenuEvent::Face {
                 wallet: job_wallet,
                 generated,
@@ -482,7 +479,7 @@ impl ProfileMenu {
         state: &mut State,
         wallet: SmolStr,
         generated: bool,
-        result: Result<(SmolStr, Face), AvatarError>,
+        result: Result<(SmolStr, SmolStr), AvatarError>,
     ) {
         let current = state
             .snapshot
@@ -494,7 +491,7 @@ impl ProfileMenu {
 
             return;
         }
-        let (wallet, face) = match result {
+        let (wallet, svg) = match result {
             Ok(face) => face,
             Err(error) => {
                 log::warn!("failed to produce the wallet avatar: {error}");
@@ -505,15 +502,28 @@ impl ProfileMenu {
         state.face_job = None;
         if generated {
             let settings = Rc::clone(self.host.settings());
-            if !settings.store_avatar_if_current(app, wallet.as_str(), face.svg.clone()) {
+            if !settings.store_avatar_if_current(app, wallet.as_str(), svg.to_string()) {
                 log::warn!("a generated avatar no longer belonged to the signed-in account");
 
                 return;
             }
         }
         state.face_generation = state.face_generation.wrapping_add(1);
-        let svg = face.svg_smol();
-        let pending = app.resources_mut().insert_async(face.png);
+        let pending = match app.insert_svg_async_for_window(
+            state.window,
+            Bytes::copy_from_slice(svg.as_bytes()),
+            LogicalSize::new(
+                px(crate::menu::ACCOUNT_AVATAR_SIZE),
+                px(crate::menu::ACCOUNT_AVATAR_SIZE),
+            ),
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::warn!("failed to register the wallet avatar: {error}");
+
+                return;
+            }
+        };
         state.face = Some(FaceTexture {
             pending,
             svg,
@@ -1213,7 +1223,7 @@ impl TriggerBuild<'_> {
             .id(TRIGGER_AVATAR_ID)
             .style(
                 ui_core::paint::style_builder::StyleBuilder::new()
-                    .size(face_size, face_size)
+                    .size(px(face_size), px(face_size))
                     .items_center()
                     .justify_center()
                     .build(),
@@ -1231,7 +1241,7 @@ impl TriggerBuild<'_> {
                 NodeBuilder::image_pending(texture.pending, ui_core::node::image::ImageFit::Cover)
                     .style(
                         ui_core::paint::style_builder::StyleBuilder::new()
-                            .size(face_size, face_size)
+                            .size(px(face_size), px(face_size))
                             .build(),
                     )
                     .build(
@@ -1245,7 +1255,7 @@ impl TriggerBuild<'_> {
             }
             None => {
                 ui_kit::kit::icon::IconSpec::new(ui_kit::kit::icon::IconKind::User)
-                    .with_size(face_size)
+                    .with_size(px(face_size))
                     .build_themed(
                         app,
                         self.window,
@@ -1340,7 +1350,11 @@ mod tests {
         model::{PlanCode, SessionAvailability},
     };
     use smol_str::SmolStr;
-    use ui_core::{math::Size, node::tree::NodeKind};
+    use ui_core::{
+        math::{DevicePixelRatio, LogicalSize, px},
+        node::{image::ImageSource, tree::NodeKind},
+        resources::ImageResourceKind,
+    };
     use ui_kit::kit::{layer::Band, size::UnifiedSize};
     use widget::error::TranslatedError;
 
@@ -1382,7 +1396,7 @@ mod tests {
         harness.text_of(node)
     }
 
-    fn bounds(harness: &Harness, prefix: &str) -> ui_core::math::Rect {
+    fn bounds(harness: &Harness, prefix: &str) -> ui_core::math::LogicalRect {
         let node = harness
             .find(prefix)
             .unwrap_or_else(|| panic!("nothing draws {prefix}; ids: {:?}", harness.debug_ids()));
@@ -1391,8 +1405,8 @@ mod tests {
             .unwrap_or_else(|| panic!("{prefix} is not laid out"))
     }
 
-    fn centre(rect: ui_core::math::Rect) -> ui_core::math::Point {
-        ui_core::math::Point::new(
+    fn centre(rect: ui_core::math::LogicalRect) -> ui_core::math::LogicalPoint {
+        ui_core::math::LogicalPoint::new(
             rect.origin.x + rect.size.width / 2.0,
             rect.origin.y + rect.size.height / 2.0,
         )
@@ -1446,7 +1460,7 @@ mod tests {
         );
         assert_eq!(
             bounds(&harness, "TEST_PROFILE_TRIGGER_AVATAR").size,
-            Size::new(16.0, 16.0),
+            LogicalSize::new(px(16.0), px(16.0)),
             "the placeholder face is the size the title bar's other marks take"
         );
     }
@@ -1557,7 +1571,7 @@ mod tests {
                 .expect("the panel is laid out")
                 .size
                 .width,
-            MENU_WIDTH,
+            px(MENU_WIDTH),
             "the menu is the one width the account block is centred on"
         );
         assert_eq!(
@@ -1628,7 +1642,7 @@ mod tests {
 
         assert_eq!(
             face.size,
-            Size::new(ACCOUNT_AVATAR_SIZE, ACCOUNT_AVATAR_SIZE),
+            LogicalSize::new(px(ACCOUNT_AVATAR_SIZE), px(ACCOUNT_AVATAR_SIZE)),
             "the face of the account block is the largest thing in it"
         );
         assert!(
@@ -1641,7 +1655,7 @@ mod tests {
         );
         assert_eq!(
             badge.size,
-            Size::new(20.0, 20.0),
+            LogicalSize::new(px(20.0), px(20.0)),
             "the wallet family is a corner mark, not a line of its own"
         );
         assert!(
@@ -1786,7 +1800,7 @@ mod tests {
         let mut harness = Harness::signed_in();
         show_menu(&mut harness);
 
-        harness.click_at(ui_core::math::Point::new(4.0, 4.0));
+        harness.click_at(ui_core::math::LogicalPoint::new(px(4.0), px(4.0)));
         harness.settle(3);
 
         assert!(
@@ -2237,13 +2251,13 @@ mod tests {
 
         assert!(
             harness.settle_until(200, |harness| harness.menu().face().is_some()),
-            "the stored avatar is rasterized"
+            "the stored avatar is turned into a resource request"
         );
         harness.settle(3);
 
         assert_eq!(
             bounds(&harness, "TEST_PROFILE_TRIGGER_AVATAR").size,
-            Size::new(24.0, 24.0),
+            LogicalSize::new(px(24.0), px(24.0)),
             "the account's own picture is drawn larger than the placeholder"
         );
         let face = harness
@@ -2261,12 +2275,32 @@ mod tests {
             .first()
             .copied()
             .expect("the face box holds the picture");
+        let source = match tree.get(child).expect("the picture exists").kind() {
+            NodeKind::Image(content) => content.source(),
+            other => panic!("the face is not an engine image node: {other:?}"),
+        };
+        let ImageSource::Ready(id) = source else {
+            panic!("the engine settles an SVG request in its registering frame: {source:?}");
+        };
+        let image = harness
+            .app()
+            .resources()
+            .image(id)
+            .expect("the face resource is alive");
         assert!(
-            matches!(
-                tree.get(child).expect("the picture exists").kind(),
-                NodeKind::Image(_)
-            ),
-            "the face is an engine image node"
+            matches!(image.kind(), ImageResourceKind::Vector { .. }),
+            "the face is an engine-rasterized SVG: {:?}",
+            image.kind()
+        );
+        assert_eq!(
+            image.intrinsic(DevicePixelRatio::ONE),
+            LogicalSize::new(px(56.0), px(56.0)),
+            "the avatar registers its intrinsic size, not the 24 px trigger box"
+        );
+        assert_eq!(
+            harness.menu().face().map(|(svg, _)| svg.as_str()),
+            Some(AVATAR_SVG),
+            "what the control keeps is the stored SVG, not a rasterized copy"
         );
     }
 
@@ -2317,7 +2351,7 @@ mod tests {
                 .menu()
                 .face()
                 .is_some_and(|(svg, _)| svg.as_str() == other_svg)),
-            "the new avatar is rasterized"
+            "the new avatar is turned into a new resource request"
         );
         let second = harness
             .menu()

@@ -1,11 +1,11 @@
 use market_participants_model::{decimal::Fraction, prediction::PredictionRange};
 use time::{Date, Month, OffsetDateTime, UtcOffset};
-use ui_core::math::{Point, Rect, Size};
+use ui_core::math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px};
 
-pub(crate) const LEFT_INSET: f32 = 8.0;
-pub(crate) const TOP_STRIP: f32 = 18.0;
-pub(crate) const RIGHT_GUTTER: f32 = 40.0;
-pub(crate) const BOTTOM_BAND: f32 = 30.0;
+pub(crate) const LEFT_INSET: LogicalPx = LogicalPx::new(8.0);
+pub(crate) const TOP_STRIP: LogicalPx = LogicalPx::new(18.0);
+pub(crate) const RIGHT_GUTTER: LogicalPx = LogicalPx::new(40.0);
+pub(crate) const BOTTOM_BAND: LogicalPx = LogicalPx::new(30.0);
 
 pub(crate) const Y_TICK_STEP: f64 = 10.0;
 pub(crate) const Y_ROUNDING_STEP: f64 = 5.0;
@@ -13,10 +13,10 @@ pub(crate) const Y_MINIMUM_MAX: f64 = 10.0;
 
 pub(crate) const SINGLE_SAMPLE_PADDING_MILLIS: i64 = 30 * 60 * 1_000;
 
-pub(crate) const CLOCK_TICK_SPACING: f32 = 54.0;
-const DAY_TICK_SPACING: f32 = 56.0;
-const MONTH_TICK_SPACING: f32 = 40.0;
-const MONTH_YEAR_TICK_SPACING: f32 = 72.0;
+pub(crate) const CLOCK_TICK_SPACING: LogicalPx = LogicalPx::new(54.0);
+const DAY_TICK_SPACING: LogicalPx = LogicalPx::new(56.0);
+const MONTH_TICK_SPACING: LogicalPx = LogicalPx::new(40.0);
+const MONTH_YEAR_TICK_SPACING: LogicalPx = LogicalPx::new(72.0);
 pub(crate) const MINIMUM_TICK_COUNT: usize = 2;
 
 const CLOCK_LABEL_CAP: usize = 12;
@@ -28,52 +28,52 @@ const DAY_MILLIS: i64 = 86_400_000;
 
 const PERCENT_SCALE: f64 = 1e16;
 
-const SERIES_EDGE_INSET: f32 = 2.0;
+const SERIES_EDGE_INSET: LogicalPx = LogicalPx::new(2.0);
 
 pub(crate) trait RectExt {
-    fn right(self) -> f32;
-    fn bottom(self) -> f32;
+    fn right(self) -> LogicalPx;
+    fn bottom(self) -> LogicalPx;
 }
 
-impl RectExt for Rect {
-    fn right(self) -> f32 {
+impl RectExt for LogicalRect {
+    fn right(self) -> LogicalPx {
         self.origin.x + self.size.width
     }
 
-    fn bottom(self) -> f32 {
+    fn bottom(self) -> LogicalPx {
         self.origin.y + self.size.height
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ChartLayout {
-    pub bounds: Rect,
-    pub plot: Rect,
+    pub bounds: LogicalRect,
+    pub plot: LogicalRect,
 }
 
 impl ChartLayout {
-    pub(crate) fn new(bounds: Rect) -> Self {
-        let plot = Rect::from_origin_size(
-            Point::new(bounds.origin.x + LEFT_INSET, bounds.origin.y + TOP_STRIP),
-            Size::new(
-                (bounds.size.width - (LEFT_INSET + RIGHT_GUTTER)).max(0.0),
-                (bounds.size.height - (TOP_STRIP + BOTTOM_BAND)).max(0.0),
+    pub(crate) fn new(bounds: LogicalRect) -> Self {
+        let plot = LogicalRect::from_origin_size(
+            LogicalPoint::new(bounds.origin.x + LEFT_INSET, bounds.origin.y + TOP_STRIP),
+            LogicalSize::new(
+                (bounds.size.width - (LEFT_INSET + RIGHT_GUTTER)).max(px(0.0)),
+                (bounds.size.height - (TOP_STRIP + BOTTOM_BAND)).max(px(0.0)),
             ),
         );
         Self { bounds, plot }
     }
 
-    pub(crate) fn top_strip(self) -> Rect {
-        Rect::from_origin_size(
+    pub(crate) fn top_strip(self) -> LogicalRect {
+        LogicalRect::from_origin_size(
             self.bounds.origin,
-            Size::new(self.bounds.size.width, TOP_STRIP),
+            LogicalSize::new(self.bounds.size.width, TOP_STRIP),
         )
     }
 
-    pub(crate) fn bottom_band(self) -> Rect {
-        Rect::from_origin_size(
-            Point::new(self.bounds.origin.x, self.plot.bottom()),
-            Size::new(self.plot.size.width, BOTTOM_BAND),
+    pub(crate) fn bottom_band(self) -> LogicalRect {
+        LogicalRect::from_origin_size(
+            LogicalPoint::new(self.bounds.origin.x, self.plot.bottom()),
+            LogicalSize::new(self.plot.size.width, BOTTOM_BAND),
         )
     }
 }
@@ -117,7 +117,7 @@ pub(crate) fn time_domain(minimum: i64, maximum: i64, range: PredictionRange) ->
     }
 }
 
-pub(crate) fn x_for_time(domain: TimeDomain, plot: Rect, timestamp: i64) -> f32 {
+pub(crate) fn x_for_time(domain: TimeDomain, plot: LogicalRect, timestamp: i64) -> LogicalPx {
     let span = domain.span();
     if span <= 0 {
         return plot.origin.x + plot.size.width / 2.0;
@@ -152,7 +152,7 @@ impl ValueAxis {
     }
 }
 
-pub(crate) fn y_for_percent(percent: f64, axis: &ValueAxis, plot: Rect) -> f32 {
+pub(crate) fn y_for_percent(percent: f64, axis: &ValueAxis, plot: LogicalRect) -> LogicalPx {
     let ratio = if axis.maximum > 0.0 && percent.is_finite() {
         (percent / axis.maximum).clamp(0.0, 1.0)
     } else {
@@ -161,7 +161,7 @@ pub(crate) fn y_for_percent(percent: f64, axis: &ValueAxis, plot: Rect) -> f32 {
     plot.bottom() - plot.size.height * ratio as f32
 }
 
-pub(crate) fn y_for_series(percent: f64, axis: &ValueAxis, plot: Rect) -> f32 {
+pub(crate) fn y_for_series(percent: f64, axis: &ValueAxis, plot: LogicalRect) -> LogicalPx {
     let y = y_for_percent(percent, axis, plot);
     if plot.size.height <= SERIES_EDGE_INSET * 2.0 {
         return y;
@@ -180,8 +180,8 @@ pub(crate) struct Sample {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScreenPoint {
-    pub x: f32,
-    pub y: f32,
+    pub x: LogicalPx,
+    pub y: LogicalPx,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -215,9 +215,9 @@ pub(crate) fn decimate(
     samples: &[Sample],
     domain: TimeDomain,
     axis: &ValueAxis,
-    plot: Rect,
+    plot: LogicalRect,
 ) -> Decimated {
-    if samples.is_empty() || plot.size.width <= 0.0 || plot.size.height <= 0.0 {
+    if samples.is_empty() || plot.size.width <= px(0.0) || plot.size.height <= px(0.0) {
         return Decimated::default();
     }
     let lead = lead_index(samples, domain.start);
@@ -233,7 +233,7 @@ pub(crate) fn decimate(
             continue;
         }
         let x = x_for_time(domain, plot, sample.timestamp);
-        let column = (x - plot.origin.x).floor() as i32;
+        let column = (x - plot.origin.x).value().floor() as i32;
         match columns.last_mut() {
             Some((last_column, last_index)) if *last_column == column => *last_index = index,
             _ => columns.push((column, index)),
@@ -253,12 +253,12 @@ pub(crate) fn decimate(
     chosen.extend(columns.iter().map(|&(_, index)| index));
     chosen.dedup();
     let mut screen: Vec<ScreenPoint> = Vec::with_capacity(chosen.len());
-    let mut drawn_y: Option<f32> = None;
+    let mut drawn_y: Option<LogicalPx> = None;
     for index in chosen {
         let sample = samples[index];
         let y = y_for_series(sample.percent, axis, plot);
         let y = match drawn_y {
-            Some(previous) if (y - previous).abs() < 1.0 => previous,
+            Some(previous) if (y - previous).abs() < px(1.0) => previous,
             _ => y,
         };
         drawn_y = Some(y);
@@ -280,7 +280,7 @@ pub(crate) enum TimeLabelKind {
 }
 
 impl TimeLabelKind {
-    const fn spacing(self) -> f32 {
+    const fn spacing(self) -> LogicalPx {
         match self {
             Self::Clock => CLOCK_TICK_SPACING,
             Self::Day => DAY_TICK_SPACING,
@@ -411,7 +411,7 @@ pub(crate) struct TimeTicks {
     pub timestamps: Vec<i64>,
 }
 
-pub(crate) fn time_ticks(domain: TimeDomain, plot_width: f32, zone: UtcOffset) -> TimeTicks {
+pub(crate) fn time_ticks(domain: TimeDomain, plot_width: LogicalPx, zone: UtcOffset) -> TimeTicks {
     let span = domain.span();
     if span <= 0 {
         return TimeTicks {
@@ -455,7 +455,7 @@ pub(crate) fn time_ticks(domain: TimeDomain, plot_width: f32, zone: UtcOffset) -
     }
 }
 
-fn maximum_tick_count(plot_width: f32, label: TimeLabelKind, span: i64) -> usize {
+fn maximum_tick_count(plot_width: LogicalPx, label: TimeLabelKind, span: i64) -> usize {
     let count = ((plot_width / label.spacing()).floor() as usize + 1).max(MINIMUM_TICK_COUNT);
     if label == TimeLabelKind::Clock && span > CLOCK_CAP_SPAN_MILLIS {
         count.min(CLOCK_LABEL_CAP)

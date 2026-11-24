@@ -10,7 +10,7 @@ use i18n::language::codes::LanguageCode;
 use market_participants_model::identifier::VenueId;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect},
     node::id::NodeId,
 };
 
@@ -124,7 +124,7 @@ pub(crate) fn click_alert(harness: &mut Harness, button: &str) {
     let bounds = harness
         .bounds(node)
         .unwrap_or_else(|| panic!("the alert's {button} button has not been laid out"));
-    harness.click(Point::new(
+    harness.click(LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     ));
@@ -135,7 +135,7 @@ pub(crate) fn alert_is_open(harness: &Harness) -> bool {
     find_ending(harness, ".ok:interactive").is_some()
 }
 
-pub(crate) fn bounds(harness: &Harness, prefix: &str) -> Rect {
+pub(crate) fn bounds(harness: &Harness, prefix: &str) -> LogicalRect {
     let node = harness
         .find(prefix)
         .unwrap_or_else(|| panic!("no node whose id starts with {prefix}"));
@@ -144,19 +144,19 @@ pub(crate) fn bounds(harness: &Harness, prefix: &str) -> Rect {
         .unwrap_or_else(|| panic!("{prefix} has not been laid out"))
 }
 
-pub(crate) fn center(bounds: Rect) -> Point {
-    Point::new(
+pub(crate) fn center(bounds: LogicalRect) -> LogicalPoint {
+    LogicalPoint::new(
         bounds.origin.x + bounds.size.width / 2.0,
         bounds.origin.y + bounds.size.height / 2.0,
     )
 }
 
-pub(crate) fn edges(bounds: Rect) -> (f32, f32, f32, f32) {
+pub(crate) fn edges(bounds: LogicalRect) -> (f32, f32, f32, f32) {
     (
-        bounds.origin.y,
-        bounds.origin.x + bounds.size.width,
-        bounds.origin.y + bounds.size.height,
-        bounds.origin.x,
+        f32::from(bounds.origin.y),
+        f32::from(bounds.origin.x + bounds.size.width),
+        f32::from(bounds.origin.y + bounds.size.height),
+        f32::from(bounds.origin.x),
     )
 }
 

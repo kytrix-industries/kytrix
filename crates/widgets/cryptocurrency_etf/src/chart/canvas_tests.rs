@@ -1,6 +1,6 @@
 use i18n::language::codes::LanguageCode;
 use ui_core::{
-    math::Point,
+    math::{LogicalPoint, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{primitive::Primitive, style_builder::StyleBuilder},
     window::WindowId,
@@ -106,8 +106,8 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
             .id("TEST_ETF_PAGE")
             .style(
                 StyleBuilder::new()
-                    .width(width)
-                    .height(height)
+                    .width(px(width))
+                    .height(px(height))
                     .flex_col()
                     .build(),
             )
@@ -116,9 +116,9 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
     })
 }
 
-fn middle_of_plot(harness: &ChartHarness) -> Point {
+fn middle_of_plot(harness: &ChartHarness) -> LogicalPoint {
     let plot = harness.layout().plot;
-    Point::new(
+    LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )
@@ -131,10 +131,11 @@ fn a_chart_should_fill_the_box_it_is_given() {
 
     let layout = harness.layout();
     assert_eq!(
-        layout.content.size.width, WIDTH,
+        layout.content.size.width,
+        px(WIDTH),
         "the content box is the pane's, when the labels fit it"
     );
-    assert_eq!(layout.content.size.height, HEIGHT);
+    assert_eq!(layout.content.size.height, px(HEIGHT));
     assert_eq!(
         harness.canvas().bounds(),
         layout.content,
@@ -157,10 +158,11 @@ fn a_chart_in_a_roomy_box_should_fill_it_rather_than_stay_at_its_floor() {
 
     let layout = harness.layout();
     assert_eq!(
-        layout.content.size.width, 760.0,
+        layout.content.size.width,
+        px(760.0),
         "the content follows the box it is given"
     );
-    assert_eq!(layout.content.size.height, 560.0);
+    assert_eq!(layout.content.size.height, px(560.0));
     assert_eq!(
         harness.canvas().bounds(),
         layout.content,
@@ -177,12 +179,12 @@ fn a_pane_narrower_than_the_chart_should_clip_it_rather_than_squeeze_the_plot() 
 
     assert_eq!(
         small.layout().content.size.width,
-        WIDTH,
+        px(WIDTH),
         "the content keeps its own floor, so the labels are never crushed"
     );
     assert_eq!(
         small.layout().content.size.height,
-        HEIGHT,
+        px(HEIGHT),
         "and so does its height"
     );
     assert_eq!(
@@ -221,9 +223,9 @@ fn a_pointer_off_the_plot_should_not_hover_anything() {
     assert!(harness.sync());
     let layout = harness.layout();
 
-    assert!(!harness.chart.point_at(Point::new(1.0, 1.0)));
+    assert!(!harness.chart.point_at(LogicalPoint::new(px(1.0), px(1.0))));
     assert_eq!(harness.chart.hover_for_test(), None);
-    let below = Point::new(layout.plot.origin.x + 10.0, layout.time_axis.origin.y + 2.0);
+    let below = LogicalPoint::new(layout.plot.origin.x + 10.0, layout.time_axis.origin.y + 2.0);
     assert!(
         !harness.chart.point_at(below),
         "the time axis is not the plot"
@@ -268,14 +270,14 @@ fn a_pointers_height_should_be_kept_at_whole_pixels() {
     assert!(
         harness
             .chart
-            .point_at(Point::new(plot.origin.x + plot.size.width / 2.0, y))
+            .point_at(LogicalPoint::new(plot.origin.x + plot.size.width / 2.0, y))
     );
     let hover = harness.chart.hover_for_test().expect("the day is hovered");
     assert_eq!(
         hover,
         Hover {
             index: hover.index,
-            cursor_y: y.round(),
+            cursor_y: px(y.value().round()),
         },
         "a pointer that moved less than a pixel is not a change worth a frame"
     );
@@ -410,7 +412,7 @@ fn the_plot_should_be_a_rectangle_inside_the_content() {
     assert!(harness.sync());
     let layout = harness.layout();
 
-    assert!(layout.plot.size.width > 0.0 && layout.plot.size.height > 0.0);
+    assert!(layout.plot.size.width > px(0.0) && layout.plot.size.height > px(0.0));
     assert!(
         layout.plot.origin.x >= layout.content.origin.x
             && layout.plot.origin.x + layout.plot.size.width

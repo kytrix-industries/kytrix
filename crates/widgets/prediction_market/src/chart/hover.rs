@@ -1,11 +1,11 @@
-use ui_core::math::{Point, Rect, Size};
+use ui_core::math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize};
 
 use super::geometry::{Sample, ScreenPoint, ValueAxis, y_for_series};
 
-pub(crate) const LABEL_GAP: f32 = 8.0;
-pub(crate) const LABEL_RIGHT_MARGIN: f32 = 4.0;
-pub(crate) const LABEL_HEIGHT: f32 = 20.0;
-pub(crate) const LABEL_COLLISION_GAP: f32 = 1.0;
+pub(crate) const LABEL_GAP: LogicalPx = LogicalPx::new(8.0);
+pub(crate) const LABEL_RIGHT_MARGIN: LogicalPx = LogicalPx::new(4.0);
+pub(crate) const LABEL_HEIGHT: LogicalPx = LogicalPx::new(20.0);
+pub(crate) const LABEL_COLLISION_GAP: LogicalPx = LogicalPx::new(1.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LabelSide {
@@ -36,7 +36,7 @@ pub(crate) fn nearest_timestamp(timestamps: &[i64], time: i64) -> Option<i64> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct HoveredSample {
     pub timestamp: i64,
-    pub x: f32,
+    pub x: LogicalPx,
 }
 
 pub(crate) fn value_at(samples: &[Sample], timestamp: i64) -> Option<f64> {
@@ -51,7 +51,7 @@ pub(crate) fn value_at(samples: &[Sample], timestamp: i64) -> Option<f64> {
 pub(crate) fn hover_point(
     samples: &[Sample],
     axis: &ValueAxis,
-    plot: Rect,
+    plot: LogicalRect,
     hovered: HoveredSample,
 ) -> Option<ScreenPoint> {
     let percent = value_at(samples, hovered.timestamp)?;
@@ -61,38 +61,54 @@ pub(crate) fn hover_point(
     })
 }
 
-pub(crate) fn label_side(crosshair_x: f32, widest_label: f32, plot: Rect) -> LabelSide {
-    if crosshair_x + LABEL_GAP + widest_label
-        <= plot.origin.x + plot.size.width - LABEL_RIGHT_MARGIN
-    {
+pub(crate) fn label_side(
+    crosshair_x: LogicalPx,
+    widest_label: LogicalPx,
+    plot: LogicalRect,
+) -> LabelSide {
+    let right = plot.origin.x + plot.size.width;
+    if crosshair_x + LABEL_GAP + widest_label <= right - LABEL_RIGHT_MARGIN {
         LabelSide::Right
     } else {
         LabelSide::Left
     }
 }
 
-pub(crate) fn label_x(crosshair_x: f32, width: f32, side: LabelSide, plot: Rect) -> f32 {
+pub(crate) fn label_x(
+    crosshair_x: LogicalPx,
+    width: LogicalPx,
+    side: LabelSide,
+    plot: LogicalRect,
+) -> LogicalPx {
     let natural = match side {
         LabelSide::Right => crosshair_x + LABEL_GAP,
         LabelSide::Left => crosshair_x - LABEL_GAP - width,
     };
-    let right = plot.origin.x + plot.size.width;
-    natural.clamp(plot.origin.x, (right - width).max(plot.origin.x))
+    let left = plot.origin.x;
+    let right = left + plot.size.width;
+    natural.clamp(left, (right - width).max(left))
 }
 
-pub(crate) fn label_tops(anchors: &[f32], height: f32, gap: f32, plot: Rect) -> Vec<f32> {
-    let mut tops = vec![plot.origin.y; anchors.len()];
+pub(crate) fn label_tops(
+    anchors: &[LogicalPx],
+    height: LogicalPx,
+    gap: LogicalPx,
+    plot: LogicalRect,
+) -> Vec<LogicalPx> {
+    let plot_top = plot.origin.y;
+    let plot_bottom = plot_top + plot.size.height;
+    let mut tops = vec![plot_top; anchors.len()];
     let mut order: Vec<usize> = (0..anchors.len()).collect();
-    order.sort_by(|left, right| anchors[*right].total_cmp(&anchors[*left]));
-    let mut top_below: Option<f32> = None;
+    order.sort_by(|left, right| anchors[*right].value().total_cmp(&anchors[*left].value()));
+    let mut top_below: Option<LogicalPx> = None;
     for index in order {
-        let mut bottom = anchors[index].min(plot.origin.y + plot.size.height);
+        let mut bottom = anchors[index].min(plot_bottom);
         if let Some(top_below) = top_below {
             bottom = bottom.min(top_below - gap);
         }
         let mut top = bottom - height;
-        if top < plot.origin.y {
-            let inside_top = plot.origin.y;
+        if top < plot_top {
+            let inside_top = plot_top;
             let inside_bottom = inside_top + height;
             if top_below.is_none_or(|below| inside_bottom + gap <= below) {
                 top = inside_top;
@@ -104,10 +120,10 @@ pub(crate) fn label_tops(anchors: &[f32], height: f32, gap: f32, plot: Rect) -> 
     tops
 }
 
-pub(crate) fn dot_bounds(center: ScreenPoint, diameter: f32) -> Rect {
+pub(crate) fn dot_bounds(center: ScreenPoint, diameter: LogicalPx) -> LogicalRect {
     let radius = diameter / 2.0;
-    Rect::from_origin_size(
-        Point::new(center.x - radius, center.y - radius),
-        Size::new(diameter, diameter),
+    LogicalRect::from_origin_size(
+        LogicalPoint::new(center.x - radius, center.y - radius),
+        LogicalSize::new(diameter, diameter),
     )
 }

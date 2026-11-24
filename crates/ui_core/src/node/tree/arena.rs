@@ -70,6 +70,7 @@ pub(crate) fn new() -> NodeTree {
         subtree_bounds: vec![LogicalRect::default()],
         a11y_slots: vec![None],
         images_need_refresh: false,
+        image_nodes: Vec::new(),
         dirty_bind: DirtySet::new(),
         dirty_layout,
         dirty_paint,
@@ -219,6 +220,7 @@ pub(crate) fn insert_child(
         .is_some_and(|target| target.kind.image().is_some())
     {
         tree.images_need_refresh = true;
+        tree.image_nodes.push(id);
     }
     tree.layout_cache.remove(&id);
     let index = id.index() as usize;
@@ -431,6 +433,9 @@ pub(crate) fn remove(
     }
     if !tree.overlay_containers.is_empty() {
         tree.overlay_containers.retain(|id| !removed.contains(id));
+    }
+    if !tree.image_nodes.is_empty() {
+        tree.image_nodes.retain(|id| !removed.contains(id));
     }
     tree.dirty_bind.shrink_stale();
     tree.dirty_layout.shrink_stale();

@@ -8,7 +8,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    math::{Point, Rect, Transform},
+    math::{LogicalPoint, LogicalPx, LogicalRect, Transform, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         canvas::Canvas,
@@ -37,34 +37,34 @@ pub(super) const MAP_SELECTOR: &str = "TEST_CHOKEPOINT_MAP";
 
 const WHEEL_ZOOM_STEP: f32 = 1.15;
 
-const COUNTRY_LABEL_TEXT_SIZE: f32 = 21.0;
+const COUNTRY_LABEL_TEXT_SIZE: LogicalPx = px(21.0);
 
-const CITY_LABEL_TEXT_SIZE: f32 = 13.0;
+const CITY_LABEL_TEXT_SIZE: LogicalPx = px(13.0);
 
-fn water_label_text_size() -> f32 {
+fn water_label_text_size() -> LogicalPx {
     UnifiedSize::Small.text_size()
 }
 
-const LABEL_HALO_OFFSETS: [[f32; 2]; 8] = [
-    [-1.0, -1.0],
-    [0.0, -1.0],
-    [1.0, -1.0],
-    [-1.0, 0.0],
-    [1.0, 0.0],
-    [-1.0, 1.0],
-    [0.0, 1.0],
-    [1.0, 1.0],
+const LABEL_HALO_OFFSETS: [[LogicalPx; 2]; 8] = [
+    [px(-1.0), px(-1.0)],
+    [px(0.0), px(-1.0)],
+    [px(1.0), px(-1.0)],
+    [px(-1.0), px(0.0)],
+    [px(1.0), px(0.0)],
+    [px(-1.0), px(1.0)],
+    [px(0.0), px(1.0)],
+    [px(1.0), px(1.0)],
 ];
 
-const CARD_WIDTH: f32 = 228.0;
+const CARD_WIDTH: LogicalPx = px(228.0);
 
-const CARD_MARGIN: f32 = 12.0;
+const CARD_MARGIN: LogicalPx = px(12.0);
 
-const ATTRIBUTION_INSET: f32 = 8.0;
+const ATTRIBUTION_INSET: LogicalPx = px(8.0);
 
 const CARD_LINE_RHYTHM: f32 = 1.618;
 
-const CORNER_GAP: f32 = 4.0;
+const CORNER_GAP: LogicalPx = px(4.0);
 
 const ATTRIBUTION_KEY: &str = "widget.global_shipping_chokepoint.attribution";
 
@@ -125,7 +125,7 @@ pub(super) struct MapPicture<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaintedKey {
-    bounds: Rect,
+    bounds: LogicalRect,
     camera: Camera,
     revision: u64,
     hovered: Option<u32>,
@@ -182,11 +182,11 @@ impl MapTextCache {
         handle
     }
 
-    fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
+    fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> LogicalPx {
         self.line(app, text, style).size().width
     }
 
-    fn height(&mut self, app: &mut App, style: &TextStyle) -> f32 {
+    fn height(&mut self, app: &mut App, style: &TextStyle) -> LogicalPx {
         self.line(app, "X", style).size().height
     }
 
@@ -206,15 +206,15 @@ struct TierGeometry {
 
 pub(super) struct MapCanvas {
     node: Option<NodeId>,
-    bounds: Option<Rect>,
+    bounds: Option<LogicalRect>,
     camera: Camera,
     tiers: [Option<TierGeometry>; model::LAND_TIERS],
     dynamic: Vec<GeometryId>,
     painted: Option<PaintedKey>,
     text: MapTextCache,
     hovered: Option<u32>,
-    attribution: Option<Rect>,
-    pointer: Option<Point>,
+    attribution: Option<LogicalRect>,
+    pointer: Option<LogicalPoint>,
     dragging: bool,
 }
 
@@ -241,7 +241,7 @@ impl MapCanvas {
     }
 
     #[cfg(test)]
-    pub(super) fn bounds(&self) -> Option<Rect> {
+    pub(super) fn bounds(&self) -> Option<LogicalRect> {
         self.bounds
     }
 
@@ -263,7 +263,7 @@ impl MapCanvas {
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
         let label = t_smol!(translate, "widget.names.global_shipping_chokepoint");
-        let node = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let node = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(MAP_SELECTOR)
             .style(
                 StyleBuilder::new()
@@ -311,11 +311,13 @@ impl MapCanvas {
             return Ok(false);
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
             return Ok(false);
         }
         self.bounds = Some(bounds);
-        self.camera = self.camera.clamped([bounds.size.width, bounds.size.height]);
+        self.camera = self
+            .camera
+            .clamped([bounds.size.width.value(), bounds.size.height.value()]);
 
         if self
             .hovered
@@ -369,16 +371,16 @@ impl MapCanvas {
         key: &PaintedKey,
     ) -> Result<(Canvas, bool, Vec<GeometryId>), EngineError> {
         let bounds = key.bounds;
-        let viewport = [bounds.size.width, bounds.size.height];
+        let viewport = [bounds.size.width.value(), bounds.size.height.value()];
         let projection = Projection::new(self.camera, viewport);
-        let origin = [bounds.origin.x, bounds.origin.y];
+        let origin = [bounds.origin.x.value(), bounds.origin.y.value()];
         let colors = key.colors;
         let mut dynamic = Vec::with_capacity(4 + SHIP_TYPES.len() + 1);
         let mut canvas = Canvas::new(bounds);
 
         canvas.push_quad(Quad {
             bounds,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: colors.ocean,
                 border: None,
@@ -386,7 +388,7 @@ impl MapCanvas {
         });
         let _ = canvas.push_clip(ClipRect {
             rect: bounds,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
 
         if projection.drawable()
@@ -502,7 +504,10 @@ impl MapCanvas {
             let text = label_text(translate, label.key, label.kind);
             let style = label_style(label.kind, colors);
             let width = self.text.width(app, &text, &style);
-            let origin = Point::new(label.at[0] - width / 2.0, label.at[1] - style.size / 2.0);
+            let origin = LogicalPoint::new(
+                px(label.at[0]) - width / 2.0,
+                px(label.at[1]) - style.size / 2.0,
+            );
             if matches!(label.kind, LabelKind::Country | LabelKind::City) {
                 let halo = halo_style(label.kind, colors);
                 for [dx, dy] in LABEL_HALO_OFFSETS {
@@ -511,7 +516,7 @@ impl MapCanvas {
                         &mut self.text,
                         canvas,
                         &text,
-                        Point::new(origin.x + dx, origin.y + dy),
+                        LogicalPoint::new(origin.x + dx, origin.y + dy),
                         &halo,
                     );
                 }
@@ -524,7 +529,7 @@ impl MapCanvas {
         &mut self,
         app: &mut App,
         canvas: &mut Canvas,
-        bounds: Rect,
+        bounds: LogicalRect,
         picture: &MapPicture<'_>,
         colors: MapColors,
         translate: &Translate,
@@ -532,9 +537,9 @@ impl MapCanvas {
         let size = UnifiedSize::Small;
         let pad = size.px();
         let gap = size.gap();
-        let dot = 8.0;
-        let dot_gap = 6.0;
-        let column_gap = 12.0;
+        let dot = px(8.0);
+        let dot_gap = px(6.0);
+        let column_gap = px(12.0);
         let ink = small_style(colors.text);
         let muted = small_style(colors.muted);
         let line = self.text.height(app, &ink);
@@ -554,18 +559,18 @@ impl MapCanvas {
             })
             .collect::<Vec<_>>();
         let columns = 2usize;
-        let mut column_width: f32 = 0.0;
+        let mut column_width = LogicalPx::ZERO;
         for (name, _, _) in &entries {
             column_width = column_width.max(dot + dot_gap + self.text.width(app, name, &ink));
         }
         let rows = entries.len().div_ceil(columns);
         let title_width = self.text.width(app, &title, &muted);
-        let grid_width = columns as f32 * column_width + (columns as f32 - 1.0) * column_gap;
+        let grid_width = column_width * columns as f32 + column_gap * (columns as f32 - 1.0);
         let card_width = pad * 2.0 + title_width.max(grid_width);
-        let card_height = pad * 2.0 + line + gap + rows as f32 * (line + gap);
-        let legend = Rect::new(
+        let card_height = pad * 2.0 + line + gap + (line + gap) * rows as f32;
+        let legend = LogicalRect::new(
             bounds.origin.x + bounds.size.width - ATTRIBUTION_INSET - card_width,
-            bounds.origin.y + bounds.size.height - 32.0 - card_height,
+            bounds.origin.y + bounds.size.height - px(32.0) - card_height,
             card_width,
             card_height,
         );
@@ -575,17 +580,17 @@ impl MapCanvas {
             &mut self.text,
             canvas,
             &title,
-            Point::new(legend.origin.x + pad, legend.origin.y + pad),
+            LogicalPoint::new(legend.origin.x + pad, legend.origin.y + pad),
             &muted,
         );
         for (index, (name, dot_ink, name_ink)) in entries.iter().enumerate() {
             let column = index % columns;
             let row = index / columns;
-            let x = legend.origin.x + pad + column as f32 * (column_width + column_gap);
-            let y = legend.origin.y + pad + line + gap + row as f32 * (line + gap);
+            let x = legend.origin.x + pad + (column_width + column_gap) * column as f32;
+            let y = legend.origin.y + pad + line + gap + (line + gap) * row as f32;
             canvas.push_quad(Quad {
-                bounds: Rect::new(x, y + (line - dot) / 2.0, dot, dot),
-                corner_radius: [2.0; 4],
+                bounds: LogicalRect::new(x, y + (line - dot) / 2.0, dot, dot),
+                corner_radius: [px(2.0); 4],
                 paint: QuadPaint::Solid {
                     fill: *dot_ink,
                     border: None,
@@ -597,13 +602,13 @@ impl MapCanvas {
                 &mut self.text,
                 canvas,
                 name,
-                Point::new(x + dot + dot_gap, y),
+                LogicalPoint::new(x + dot + dot_gap, y),
                 &style,
             );
         }
 
         let count_height = pad * 2.0 + line;
-        let count = Rect::new(
+        let count = LogicalRect::new(
             legend.origin.x,
             legend.origin.y - CORNER_GAP - count_height,
             card_width,
@@ -619,7 +624,7 @@ impl MapCanvas {
             &mut self.text,
             canvas,
             &label,
-            Point::new(count.origin.x + pad, count.origin.y + pad),
+            LogicalPoint::new(count.origin.x + pad, count.origin.y + pad),
             &muted,
         );
         let number = format_smolstr!("{}", picture.vessels.len());
@@ -629,7 +634,7 @@ impl MapCanvas {
             &mut self.text,
             canvas,
             &number,
-            Point::new(
+            LogicalPoint::new(
                 count.origin.x + count.size.width - pad - number_width,
                 count.origin.y + pad,
             ),
@@ -639,9 +644,9 @@ impl MapCanvas {
         let credit = t_smol!(translate, ATTRIBUTION_KEY);
         let credit_width = self.text.width(app, &credit, &ink);
         let credit_height = self.text.height(app, &ink);
-        let credit_rect = Rect::new(
+        let credit_rect = LogicalRect::new(
             bounds.origin.x + ATTRIBUTION_INSET,
-            bounds.origin.y + bounds.size.height - 6.0 - credit_height,
+            bounds.origin.y + bounds.size.height - px(6.0) - credit_height,
             credit_width,
             credit_height,
         );
@@ -661,7 +666,7 @@ impl MapCanvas {
         app: &mut App,
         canvas: &mut Canvas,
         projection: Projection,
-        bounds: Rect,
+        bounds: LogicalRect,
         picture: &MapPicture<'_>,
         colors: MapColors,
         translate: &Translate,
@@ -681,17 +686,18 @@ impl MapCanvas {
         let ink = small_style(colors.text);
         let muted = small_style(colors.muted);
         let line = self.text.height(app, &ink);
-        let viewport = [bounds.size.width, bounds.size.height];
         let hull = projection.screen(vessel.position);
-        let height = pad * 2.0 + 18.0 * line + 15.0 * gap;
-        let left = if hull[0] + CARD_MARGIN + CARD_WIDTH <= viewport[0] {
-            hull[0] + CARD_MARGIN
+        let height = pad * 2.0 + line * 18.0 + gap * 15.0;
+        let left = if px(hull[0]) + CARD_MARGIN + CARD_WIDTH <= bounds.size.width {
+            px(hull[0]) + CARD_MARGIN
         } else {
-            (hull[0] - CARD_MARGIN - CARD_WIDTH).max(0.0)
+            (px(hull[0]) - CARD_MARGIN - CARD_WIDTH).max(LogicalPx::ZERO)
         };
-        let top =
-            (hull[1] - height / 2.0).clamp(0.0, (viewport[1] - height - CARD_MARGIN).max(0.0));
-        let card = Rect::new(
+        let top = (px(hull[1]) - height / 2.0).clamp(
+            LogicalPx::ZERO,
+            (bounds.size.height - height - CARD_MARGIN).max(LogicalPx::ZERO),
+        );
+        let card = LogicalRect::new(
             bounds.origin.x + left,
             bounds.origin.y + top,
             CARD_WIDTH,
@@ -709,7 +715,7 @@ impl MapCanvas {
                 &mut self.text,
                 canvas,
                 &label,
-                Point::new(card.origin.x + pad, y),
+                LogicalPoint::new(card.origin.x + pad, y),
                 &muted,
             );
             let value_style = small_style(colors.text);
@@ -719,7 +725,7 @@ impl MapCanvas {
                     &mut self.text,
                     canvas,
                     value,
-                    Point::new(card.origin.x + pad, y + line),
+                    LogicalPoint::new(card.origin.x + pad, y + line),
                     &value_style,
                 );
                 y += line * 2.0 + gap;
@@ -728,15 +734,15 @@ impl MapCanvas {
                 let x = (value_right - width)
                     .max(value_left + width_of(&label, &muted, app, &mut self.text) + gap);
                 let _ = canvas.push_clip(ClipRect {
-                    rect: Rect::new(x, y, value_right - x, line),
-                    corner_radius: [0.0; 4],
+                    rect: LogicalRect::new(x, y, value_right - x, line),
+                    corner_radius: [px(0.0); 4],
                 });
                 push_line(
                     app,
                     &mut self.text,
                     canvas,
                     value,
-                    Point::new(x, y),
+                    LogicalPoint::new(x, y),
                     &value_style,
                 );
                 let _ = canvas.pop_clip();
@@ -747,17 +753,23 @@ impl MapCanvas {
 
     pub(super) fn projection(&self) -> Option<Projection> {
         let bounds = self.bounds?;
-        let projection = Projection::new(self.camera, [bounds.size.width, bounds.size.height]);
+        let projection = Projection::new(
+            self.camera,
+            [bounds.size.width.value(), bounds.size.height.value()],
+        );
         projection.drawable().then_some(projection)
     }
 
-    pub(super) fn vessel_at(&mut self, position: Point, vessels: &[Vessel]) -> Option<u32> {
+    pub(super) fn vessel_at(&mut self, position: LogicalPoint, vessels: &[Vessel]) -> Option<u32> {
         let bounds = self.bounds?;
         if !bounds.contains(position) {
             return None;
         }
         let projection = self.projection()?;
-        let canvas_point = [position.x - bounds.origin.x, position.y - bounds.origin.y];
+        let canvas_point = [
+            position.x.value() - bounds.origin.x.value(),
+            position.y.value() - bounds.origin.y.value(),
+        ];
         let points = vessels
             .iter()
             .map(|vessel| (vessel.mmsi, projection.screen(vessel.position)))
@@ -765,7 +777,7 @@ impl MapCanvas {
         model::hit_test(&points, canvas_point)
     }
 
-    pub(super) fn track_pointer(&mut self, position: Point, vessels: &[Vessel]) -> bool {
+    pub(super) fn track_pointer(&mut self, position: LogicalPoint, vessels: &[Vessel]) -> bool {
         let hit = self.vessel_at(position, vessels);
         if hit == self.hovered {
             return false;
@@ -778,7 +790,7 @@ impl MapCanvas {
         self.hovered.take().is_some()
     }
 
-    pub(super) fn pointer_down(&mut self, position: Point) {
+    pub(super) fn pointer_down(&mut self, position: LogicalPoint) {
         self.pointer = Some(position);
         self.dragging = true;
     }
@@ -787,37 +799,40 @@ impl MapCanvas {
         self.dragging = false;
     }
 
-    pub(super) fn pointer_move(&mut self, position: Point, vessels: &[Vessel]) -> bool {
+    pub(super) fn pointer_move(&mut self, position: LogicalPoint, vessels: &[Vessel]) -> bool {
         let previous = self.pointer.replace(position);
         if self.dragging {
             self.hovered = None;
             let Some(previous) = previous else {
                 return true;
             };
-            return self.pan(Point::new(position.x - previous.x, position.y - previous.y));
+            return self.pan(LogicalPoint::new(
+                position.x - previous.x,
+                position.y - previous.y,
+            ));
         }
         self.track_pointer(position, vessels)
     }
 
-    pub(super) fn pan(&mut self, delta: Point) -> bool {
+    pub(super) fn pan(&mut self, delta: LogicalPoint) -> bool {
         let Some(bounds) = self.bounds else {
             return false;
         };
-        let viewport = [bounds.size.width, bounds.size.height];
+        let viewport = [bounds.size.width.value(), bounds.size.height.value()];
         let scale = model::fit_px_per_merc(viewport) * self.camera.zoom;
         if !scale.is_finite() || scale <= 0.0 {
             return false;
         }
         self.set_camera(Camera {
             center: [
-                self.camera.center[0] - delta.x / scale,
-                self.camera.center[1] + delta.y / scale,
+                self.camera.center[0] - delta.x.value() / scale,
+                self.camera.center[1] + delta.y.value() / scale,
             ],
             zoom: self.camera.zoom,
         })
     }
 
-    pub(super) fn zoom_by_wheel(&mut self, position: Point, step: f32) -> bool {
+    pub(super) fn zoom_by_wheel(&mut self, position: LogicalPoint, step: f32) -> bool {
         if !step.is_finite() || step == 0.0 {
             return false;
         }
@@ -829,14 +844,14 @@ impl MapCanvas {
         self.zoom_at(position, factor)
     }
 
-    pub(super) fn zoom_by_pinch(&mut self, position: Point, delta: f32) -> bool {
+    pub(super) fn zoom_by_pinch(&mut self, position: LogicalPoint, delta: f32) -> bool {
         if !delta.is_finite() || delta == 0.0 {
             return false;
         }
         self.zoom_at(position, 1.0 + delta)
     }
 
-    pub(super) fn zoom_at(&mut self, position: Point, factor: f32) -> bool {
+    pub(super) fn zoom_at(&mut self, position: LogicalPoint, factor: f32) -> bool {
         let Some(bounds) = self.bounds else {
             return false;
         };
@@ -846,7 +861,10 @@ impl MapCanvas {
         let Some(projection) = self.projection() else {
             return false;
         };
-        let canvas_point = [position.x - bounds.origin.x, position.y - bounds.origin.y];
+        let canvas_point = [
+            position.x.value() - bounds.origin.x.value(),
+            position.y.value() - bounds.origin.y.value(),
+        ];
         let anchor = projection.mercator(canvas_point);
         let zoom = (self.camera.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         if zoom == self.camera.zoom {
@@ -866,7 +884,7 @@ impl MapCanvas {
         let Some(bounds) = self.bounds else {
             return false;
         };
-        let clamped = camera.clamped([bounds.size.width, bounds.size.height]);
+        let clamped = camera.clamped([bounds.size.width.value(), bounds.size.height.value()]);
         if clamped == self.camera {
             return false;
         }
@@ -874,11 +892,11 @@ impl MapCanvas {
         true
     }
 
-    pub(super) fn attribution_contains(&self, position: Point) -> bool {
+    pub(super) fn attribution_contains(&self, position: LogicalPoint) -> bool {
         self.attribution.is_some_and(|rect| rect.contains(position))
     }
 
-    pub(super) fn contains(&self, position: Point) -> bool {
+    pub(super) fn contains(&self, position: LogicalPoint) -> bool {
         self.bounds.is_some_and(|bounds| bounds.contains(position))
     }
 
@@ -896,7 +914,7 @@ fn tier_metres_per_pixel(tier: usize) -> f32 {
     }
 }
 
-fn land_transform(projection: Projection, bounds: Rect) -> Transform {
+fn land_transform(projection: Projection, bounds: LogicalRect) -> Transform {
     let zero = projection.screen([0.0, 0.0]);
     let scale_x = projection.screen([1.0, 0.0])[0] - zero[0];
     let scale_y = projection.screen([0.0, 1.0])[1] - zero[1];
@@ -997,8 +1015,8 @@ fn placed_labels(
             sizes.insert(
                 (label.key, label_kind_index(kind)),
                 LabelSize {
-                    width,
-                    height: style.size,
+                    width: width.value(),
+                    height: style.size.value(),
                 },
             );
         }
@@ -1022,11 +1040,11 @@ fn label_kind_index(kind: LabelKind) -> u8 {
     }
 }
 
-fn credit_origin(rect: Rect) -> Point {
-    Point::new(rect.origin.x, rect.origin.y)
+fn credit_origin(rect: LogicalRect) -> LogicalPoint {
+    LogicalPoint::new(rect.origin.x, rect.origin.y)
 }
 
-fn width_of(text: &str, style: &TextStyle, app: &mut App, cache: &mut MapTextCache) -> f32 {
+fn width_of(text: &str, style: &TextStyle, app: &mut App, cache: &mut MapTextCache) -> LogicalPx {
     cache.width(app, text, style)
 }
 
@@ -1037,8 +1055,8 @@ fn small_style(color: Color) -> TextStyle {
     style
 }
 
-fn push_panel(canvas: &mut Canvas, bounds: Rect, colors: MapColors) {
-    let radius = 4.0f32
+fn push_panel(canvas: &mut Canvas, bounds: LogicalRect, colors: MapColors) {
+    let radius = px(4.0)
         .min(bounds.size.width / 2.0)
         .min(bounds.size.height / 2.0);
     canvas.push_quad(Quad {
@@ -1047,7 +1065,7 @@ fn push_panel(canvas: &mut Canvas, bounds: Rect, colors: MapColors) {
         paint: QuadPaint::Solid {
             fill: colors.overlay,
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: colors.border,
             }),
         },
@@ -1059,7 +1077,7 @@ fn push_line(
     cache: &mut MapTextCache,
     canvas: &mut Canvas,
     text: &str,
-    origin: Point,
+    origin: LogicalPoint,
     style: &TextStyle,
 ) -> bool {
     if text.is_empty() {
@@ -1106,7 +1124,7 @@ mod tests {
 
     use i18n::{language::codes::LanguageCode, translate::Translate};
     use ui_core::{
-        node::builder::NodeBuilder, paint::primitive::Primitive,
+        math::LogicalSize, node::builder::NodeBuilder, paint::primitive::Primitive,
         test_support::record::PrimitiveKind,
     };
     use ui_kit::theme::appearance::Appearance;
@@ -1155,7 +1173,7 @@ mod tests {
                 .expect("the node is a canvas")
         }
 
-        fn bounds(&self) -> Rect {
+        fn bounds(&self) -> LogicalRect {
             self.map.bounds().expect("the map was laid out")
         }
     }
@@ -1167,8 +1185,8 @@ mod tests {
                 .id("TEST_CHOKEPOINT_MAP_PAGE")
                 .style(
                     StyleBuilder::new()
-                        .width(PAGE.0)
-                        .height(PAGE.1)
+                        .width(px(PAGE.0))
+                        .height(px(PAGE.1))
                         .flex_col()
                         .build(),
                 )
@@ -1230,7 +1248,7 @@ mod tests {
 
         assert_eq!(
             harness.bounds().size,
-            ui_core::math::Size::new(PAGE.0, PAGE.1),
+            LogicalSize::new(px(PAGE.0), px(PAGE.1)),
             "the canvas is laid out in the page it was built into"
         );
         assert!(
@@ -1316,10 +1334,10 @@ mod tests {
         let bounds = harness.bounds();
         let projection = Projection::new(
             harness.map.camera(),
-            [bounds.size.width, bounds.size.height],
+            [bounds.size.width.value(), bounds.size.height.value()],
         );
         let at = projection.screen(vessels[0].position);
-        let window = Point::new(bounds.origin.x + at[0], bounds.origin.y + at[1]);
+        let window = LogicalPoint::new(bounds.origin.x + at[0], bounds.origin.y + at[1]);
 
         assert_eq!(
             harness.map.vessel_at(window, &vessels),
@@ -1327,9 +1345,10 @@ mod tests {
             "the pointer is resolved against the frame's camera"
         );
         assert_eq!(
-            harness
-                .map
-                .vessel_at(Point::new(window.x + 100.0, window.y + 100.0), &vessels),
+            harness.map.vessel_at(
+                LogicalPoint::new(window.x + 100.0, window.y + 100.0),
+                &vessels
+            ),
             None
         );
     }
@@ -1345,10 +1364,10 @@ mod tests {
         let bounds = harness.bounds();
         let projection = Projection::new(
             harness.map.camera(),
-            [bounds.size.width, bounds.size.height],
+            [bounds.size.width.value(), bounds.size.height.value()],
         );
         let at = projection.screen(vessels[0].position);
-        let window = Point::new(bounds.origin.x + at[0], bounds.origin.y + at[1]);
+        let window = LogicalPoint::new(bounds.origin.x + at[0], bounds.origin.y + at[1]);
         assert!(harness.map.track_pointer(window, &vessels));
         harness.sync(&vessels, &[ShipType::Tanker]);
         harness.app.drain();
@@ -1366,12 +1385,15 @@ mod tests {
         harness.sync(&[], &[]);
         harness.app.drain();
         let bounds = harness.bounds();
-        let at = Point::new(
+        let at = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
         let projection = harness.map.projection().expect("the map has a projection");
-        let canvas_point = [at.x - bounds.origin.x, at.y - bounds.origin.y];
+        let canvas_point = [
+            at.x.value() - bounds.origin.x.value(),
+            at.y.value() - bounds.origin.y.value(),
+        ];
         let before = projection.mercator(canvas_point);
 
         assert!(harness.map.zoom_at(at, 1.5));
@@ -1417,7 +1439,10 @@ mod tests {
         harness.app.drain();
         let before = harness.canvas_handle();
 
-        assert!(harness.map.pan(Point::new(12.0, -8.0)), "the camera moved");
+        assert!(
+            harness.map.pan(LogicalPoint::new(px(12.0), px(-8.0))),
+            "the camera moved"
+        );
         harness.sync(&[], &[]);
         harness.app.drain();
 
@@ -1439,7 +1464,10 @@ mod tests {
             "the first painted frame registers the coastline"
         );
 
-        assert!(harness.map.pan(Point::new(12.0, -8.0)), "the camera moved");
+        assert!(
+            harness.map.pan(LogicalPoint::new(px(12.0), px(-8.0))),
+            "the camera moved"
+        );
         harness.sync(&[], &[]);
         harness.app.drain();
 
@@ -1494,21 +1522,21 @@ mod tests {
             .expect("the registered tier is drawn");
 
         let zero = projection.screen([0.0, 0.0]);
-        let at = transform.apply(Point::new(0.0, 0.0));
+        let at = transform.apply(LogicalPoint::new(px(0.0), px(0.0)));
         assert!(
-            (at.x - (bounds.origin.x + zero[0])).abs() < 1e-3
-                && (at.y - (bounds.origin.y + zero[1])).abs() < 1e-3,
+            (at.x - (bounds.origin.x + zero[0])).abs() < px(1e-3)
+                && (at.y - (bounds.origin.y + zero[1])).abs() < px(1e-3),
             "the land's Mercator origin lands where the projection says: {at:?}"
         );
         let unit = projection.screen([1.0, 1.0]);
-        let east = transform.apply(Point::new(1.0, 0.0));
-        let north = transform.apply(Point::new(0.0, 1.0));
+        let east = transform.apply(LogicalPoint::new(px(1.0), px(0.0)));
+        let north = transform.apply(LogicalPoint::new(px(0.0), px(1.0)));
         assert!(
-            (east.x - at.x - (unit[0] - zero[0])).abs() < 1e-3,
+            (east.x - at.x - (unit[0] - zero[0])).abs() < px(1e-3),
             "one degree east is one projected pixel step to the right"
         );
         assert!(
-            (north.y - at.y - (unit[1] - zero[1])).abs() < 1e-3,
+            (north.y - at.y - (unit[1] - zero[1])).abs() < px(1e-3),
             "one degree north is one projected pixel step up the canvas"
         );
         assert!(

@@ -5,6 +5,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::Event,
+    math::px,
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         style::StylePatch,
@@ -69,7 +70,7 @@ impl WidgetSurface {
             .style(
                 StyleBuilder::new()
                     .flex_col()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .size_full()
                     .min_width_0()
                     .min_height_0()
@@ -311,11 +312,11 @@ fn build_shell(
                 .overflow_hidden()
                 .build(),
         )
-        .paint(PaintBuilder::new().rounded(SURFACE_RADIUS).build())
+        .paint(PaintBuilder::new().rounded(px(SURFACE_RADIUS)).build())
         .bind_style(move |read| StylePatch {
             background: Some(slot_theme.role(read, Role::SurfaceSunken)),
             border: Some(ui_core::paint::primitive::Border {
-                width: 1.0,
+                width: px(1.0),
                 color: slot_theme.role(read, Role::LineDivider),
             }),
             ..StylePatch::default()
@@ -353,18 +354,18 @@ fn build_shell(
         .style(
             StyleBuilder::new()
                 .absolute()
-                .top(0.0)
-                .right(0.0)
-                .bottom(0.0)
-                .left(0.0)
+                .top(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .left(px(0.0))
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(8.0)
-                .padding(16.0)
+                .gap(px(8.0))
+                .padding(px(16.0))
                 .build(),
         )
-        .paint(PaintBuilder::new().rounded(SURFACE_RADIUS).build())
+        .paint(PaintBuilder::new().rounded(px(SURFACE_RADIUS)).build())
         .bind_style(move |read| {
             let presentation = *read.read(&slot_placeholder);
             StylePatch {
@@ -396,19 +397,19 @@ fn build_banner(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(8.0)
-                .padding(4.0)
+                .gap(px(8.0))
+                .padding(px(4.0))
                 .width_full()
                 .flex_none()
                 .min_width_0()
                 .build(),
         )
-        .paint(PaintBuilder::new().rounded(SURFACE_RADIUS).build())
+        .paint(PaintBuilder::new().rounded(px(SURFACE_RADIUS)).build())
         .bind_style(move |read| StylePatch {
             background: Some(theme.role(read, Role::StatusDangerSurface)),
             foreground: Some(theme.role(read, Role::StatusDangerBase)),
             border: Some(ui_core::paint::primitive::Border {
-                width: 1.0,
+                width: px(1.0),
                 color: theme.role(read, Role::StatusDangerBorder),
             }),
             ..StylePatch::default()
@@ -419,7 +420,7 @@ fn build_banner(
         })
         .build(cx.tree_mut(), root)?;
 
-    NodeBuilder::text(SmolStr::default(), TextStyle::new(BANNER_TEXT_SIZE))
+    NodeBuilder::text(SmolStr::default(), TextStyle::new(px(BANNER_TEXT_SIZE)))
         .bind_text({
             let failure = failure.clone();
             let translate = cx.translate().clone();

@@ -17,6 +17,7 @@ use ui_core::{
     a11y::A11yPatch,
     app::{App, TimerId},
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         style::{PaintSpec, StylePatch},
@@ -972,7 +973,7 @@ impl FinancialCalendarWidget {
                     .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -1148,7 +1149,7 @@ fn columns(translate: &Translate) -> impl Iterator<Item = Column> + '_ {
     .map(|(header, weight)| Column::flex(header, weight).align(ColumnAlign::Start))
 }
 
-fn table_options(row_height: f32) -> TableOptions {
+fn table_options(row_height: LogicalPx) -> TableOptions {
     TableOptions::fixed(row_height).selection(SelectionMode::None)
 }
 
@@ -1159,8 +1160,8 @@ struct CellSink {
     language: Signal<LanguageCode>,
     translate: Translate,
     theme: ThemeHandle,
-    font_size: f32,
-    small_font_size: f32,
+    font_size: LogicalPx,
+    small_font_size: LogicalPx,
 }
 
 impl CellSink {
@@ -1242,7 +1243,7 @@ impl CellSink {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(tree, parent)?;
@@ -1251,12 +1252,12 @@ impl CellSink {
             NodeBuilder::boxed()
                 .style(
                     StyleBuilder::new()
-                        .size(MARK_SIZE, MARK_SIZE)
+                        .size(px(MARK_SIZE), px(MARK_SIZE))
                         .flex_none()
                         .build(),
                 )
                 .paint(PaintSpec {
-                    corner_radius: [MARK_SIZE / 2.0; 4],
+                    corner_radius: [px(MARK_SIZE / 2.0); 4],
                     ..PaintSpec::default()
                 })
                 .bind_style(move |read| {
@@ -1344,7 +1345,7 @@ impl CellSink {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .min_width_0()
                     .build(),
             )
@@ -2633,7 +2634,7 @@ mod tests {
 
     #[test]
     fn the_table_should_not_offer_row_selection() {
-        let options = table_options(30.0);
+        let options = table_options(px(30.0));
 
         assert_eq!(
             options.selection,
@@ -2642,7 +2643,7 @@ mod tests {
         );
         assert_eq!(
             options.row_height,
-            ui_kit::kit::list::RowHeight::Fixed(30.0)
+            ui_kit::kit::list::RowHeight::Fixed(px(30.0))
         );
     }
 

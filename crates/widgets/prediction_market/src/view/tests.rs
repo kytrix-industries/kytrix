@@ -18,7 +18,7 @@ use market_participants_model::{
 };
 use ui_core::{
     event::{ActionSource, Event, InputEvent, Modifiers, PointerButton},
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope},
 };
 use widget::{
@@ -40,7 +40,7 @@ use crate::{
     test_support::{charted_market, event_ref, event_with, order_book},
 };
 
-const PAGE: (f32, f32) = (900.0, 520.0);
+const PAGE: (LogicalPx, LogicalPx) = (px(900.0), px(520.0));
 
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
@@ -1398,7 +1398,7 @@ fn a_splitter_drag_should_follow_the_pointer_and_report_once() {
         .expect("the splitter")
         .layout()
         .bounds;
-    let start = Point::new(bounds.origin.x + 10.0, bounds.origin.y + 2.0);
+    let start = LogicalPoint::new(bounds.origin.x + px(10.0), bounds.origin.y + px(2.0));
     let publishes = pane.publishes.get();
 
     let down = Event::Input(InputEvent::PointerDown {
@@ -1411,7 +1411,7 @@ fn a_splitter_drag_should_follow_the_pointer_and_report_once() {
     assert!(pane.widget.split_drag.is_some());
 
     let moved = Event::Input(InputEvent::PointerMove {
-        position: Point::new(start.x, start.y - 40.0),
+        position: LogicalPoint::new(start.x, start.y - px(40.0)),
         modifiers: Modifiers::empty(),
         timestamp: Instant::now(),
     });
@@ -1428,7 +1428,7 @@ fn a_splitter_drag_should_follow_the_pointer_and_report_once() {
     );
 
     let up = Event::Input(InputEvent::PointerUp {
-        position: Point::new(start.x, start.y - 40.0),
+        position: LogicalPoint::new(start.x, start.y - px(40.0)),
         button: PointerButton::Primary,
         modifiers: Modifiers::empty(),
         timestamp: Instant::now(),
@@ -1455,7 +1455,7 @@ fn a_splitter_drag_past_its_bounds_should_stop_at_the_clamp() {
         .expect("the splitter")
         .layout()
         .bounds;
-    let start = Point::new(bounds.origin.x + 10.0, bounds.origin.y + 2.0);
+    let start = LogicalPoint::new(bounds.origin.x + px(10.0), bounds.origin.y + px(2.0));
 
     let down = Event::Input(InputEvent::PointerDown {
         position: start,
@@ -1465,7 +1465,7 @@ fn a_splitter_drag_past_its_bounds_should_stop_at_the_clamp() {
     });
     harness.with_cx(|cx| pane.widget.dispatch(&down, cx));
     let moved = Event::Input(InputEvent::PointerMove {
-        position: Point::new(start.x, start.y - 10_000.0),
+        position: LogicalPoint::new(start.x, start.y - px(10_000.0)),
         modifiers: Modifiers::empty(),
         timestamp: Instant::now(),
     });
@@ -1481,7 +1481,7 @@ fn a_click_outside_the_splitter_should_not_report_the_ratio() {
     let mut pane = ready_pane(&mut harness, &directory);
 
     let down = Event::Input(InputEvent::PointerDown {
-        position: Point::new(1.0, 1.0),
+        position: LogicalPoint::new(px(1.0), px(1.0)),
         button: PointerButton::Primary,
         modifiers: Modifiers::empty(),
         timestamp: Instant::now(),
@@ -1503,7 +1503,7 @@ fn a_splitter_gesture_interrupted_by_hiding_should_not_report_its_notch() {
         .expect("the splitter")
         .layout()
         .bounds;
-    let start = Point::new(bounds.origin.x + 10.0, bounds.origin.y + 2.0);
+    let start = LogicalPoint::new(bounds.origin.x + px(10.0), bounds.origin.y + px(2.0));
     let down = Event::Input(InputEvent::PointerDown {
         position: start,
         button: PointerButton::Primary,
@@ -1512,7 +1512,7 @@ fn a_splitter_gesture_interrupted_by_hiding_should_not_report_its_notch() {
     });
     harness.with_cx(|cx| pane.widget.dispatch(&down, cx));
     let moved = Event::Input(InputEvent::PointerMove {
-        position: Point::new(start.x, start.y - 30.0),
+        position: LogicalPoint::new(start.x, start.y - px(30.0)),
         modifiers: Modifiers::empty(),
         timestamp: Instant::now(),
     });
@@ -1521,7 +1521,7 @@ fn a_splitter_gesture_interrupted_by_hiding_should_not_report_its_notch() {
     request(&mut harness, &mut pane, HeaderRequest::ToggleBook);
     let publishes = pane.publishes.get();
     let up = Event::Input(InputEvent::PointerUp {
-        position: Point::new(start.x, start.y - 30.0),
+        position: LogicalPoint::new(start.x, start.y - px(30.0)),
         button: PointerButton::Primary,
         modifiers: Modifiers::empty(),
         timestamp: Instant::now(),
@@ -1548,7 +1548,7 @@ fn a_splitter_drag_back_to_its_start_should_not_report() {
         .expect("the splitter")
         .layout()
         .bounds;
-    let start = Point::new(bounds.origin.x + 10.0, bounds.origin.y + 2.0);
+    let start = LogicalPoint::new(bounds.origin.x + px(10.0), bounds.origin.y + px(2.0));
     let publishes = pane.publishes.get();
     let down = Event::Input(InputEvent::PointerDown {
         position: start,
@@ -1559,7 +1559,7 @@ fn a_splitter_drag_back_to_its_start_should_not_report() {
     harness.with_cx(|cx| pane.widget.dispatch(&down, cx));
 
     let away = Event::Input(InputEvent::PointerMove {
-        position: Point::new(start.x, start.y - 40.0),
+        position: LogicalPoint::new(start.x, start.y - px(40.0)),
         modifiers: Modifiers::empty(),
         timestamp: Instant::now(),
     });
@@ -1611,9 +1611,9 @@ fn a_short_pane_should_not_store_a_notch_below_the_drawn_minimum() {
         .widget
         .split_area
         .and_then(|area| harness.tree().get(area).ok())
-        .map_or(0.0, |area| area.layout().bounds.size.height);
-    assert!(area_height > 0.0);
-    let start = Point::new(bounds.origin.x + 10.0, bounds.origin.y + 2.0);
+        .map_or(px(0.0), |area| area.layout().bounds.size.height);
+    assert!(area_height > px(0.0));
+    let start = LogicalPoint::new(bounds.origin.x + px(10.0), bounds.origin.y + px(2.0));
     let down = Event::Input(InputEvent::PointerDown {
         position: start,
         button: PointerButton::Primary,
@@ -1622,7 +1622,7 @@ fn a_short_pane_should_not_store_a_notch_below_the_drawn_minimum() {
     });
     harness.with_cx(|cx| pane.widget.dispatch(&down, cx));
     let moved = Event::Input(InputEvent::PointerMove {
-        position: Point::new(start.x, start.y + 10_000.0),
+        position: LogicalPoint::new(start.x, start.y + px(10_000.0)),
         modifiers: Modifiers::empty(),
         timestamp: Instant::now(),
     });
@@ -1697,11 +1697,11 @@ fn a_book_error_with_a_reading_should_draw_a_strip_above_the_panel() {
         .get(chrome.strip)
         .expect("the strip is still built");
     assert!(
-        strip.layout().bounds.size.height > 0.0,
+        strip.layout().bounds.size.height > px(0.0),
         "a failure after a reading keeps the ladder and puts a strip above it"
     );
     let ladder = harness.tree().get(chrome.ladder).expect("the ladder");
-    assert!(ladder.layout().bounds.size.height > 0.0);
+    assert!(ladder.layout().bounds.size.height > px(0.0));
 }
 
 #[test]

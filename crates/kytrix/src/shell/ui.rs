@@ -5,6 +5,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
     paint::{
         color::Color,
@@ -67,7 +68,7 @@ pub(crate) fn label_named(
     parent: NodeId,
     id: &'static str,
     text: impl Into<SmolStr>,
-    size: f32,
+    size: LogicalPx,
     weight: u16,
     role: Role,
     theme: &ThemeHandle,
@@ -107,7 +108,7 @@ pub(crate) fn label(
     window: WindowId,
     parent: NodeId,
     text: impl Into<SmolStr>,
-    size: f32,
+    size: LogicalPx,
     weight: u16,
     role: Role,
     theme: &ThemeHandle,
@@ -129,7 +130,7 @@ pub(crate) fn themed_label(
     tree: &mut NodeTree,
     parent: NodeId,
     text: impl Into<SmolStr>,
-    size: f32,
+    size: LogicalPx,
     weight: u16,
     initial: Color,
     role: Role,
@@ -178,10 +179,10 @@ pub(crate) fn window_backdrop(
         .style(
             StyleBuilder::new()
                 .absolute()
-                .top(0.0)
-                .left(0.0)
-                .right(0.0)
-                .bottom(0.0)
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
                 .build(),
         )
         .paint(PaintBuilder::new().background(initial).build())

@@ -7,6 +7,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event, KeyBinding, KeyCode, Modifiers},
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle, TextWrap},
@@ -19,7 +20,7 @@ use crate::{
         interactive::{Interactive, mount_dynamic_icon},
         layer::{Band, Layer},
         menu::{
-            IconCache, ItemPanel, ItemPanelOptions, PanelContent, PanelMeasure, PanelRoles,
+            IconSnapshot, ItemPanel, ItemPanelOptions, PanelContent, PanelMeasure, PanelRoles,
             PanelRow, PanelWidth, build_icon_slot,
         },
         overlay::{Anchor, AnimationRouter, OverlayError, Placement},
@@ -64,10 +65,10 @@ impl DropdownItem {
 pub struct DropdownOptions {
     pub size: UnifiedSize,
     pub variant: InteractiveVariant,
-    pub width: Option<f32>,
-    pub max_height: f32,
+    pub width: Option<LogicalPx>,
+    pub max_height: LogicalPx,
     pub placement: Placement,
-    pub gap: f32,
+    pub gap: LogicalPx,
     pub label: Option<SmolStr>,
     pub placeholder: SmolStr,
 }
@@ -78,9 +79,9 @@ impl Default for DropdownOptions {
             size: UnifiedSize::Medium,
             variant: InteractiveVariant::Ghost,
             width: None,
-            max_height: 320.0,
+            max_height: px(320.0),
             placement: Placement::BOTTOM_START,
-            gap: 4.0,
+            gap: px(4.0),
             label: None,
             placeholder: SmolStr::new_static("Select…"),
         }
@@ -101,13 +102,13 @@ impl DropdownOptions {
     }
 
     #[must_use]
-    pub fn width(mut self, width: f32) -> Self {
+    pub fn width(mut self, width: LogicalPx) -> Self {
         self.width = Some(width);
         self
     }
 
     #[must_use]
-    pub fn max_height(mut self, max_height: f32) -> Self {
+    pub fn max_height(mut self, max_height: LogicalPx) -> Self {
         self.max_height = max_height;
         self
     }
@@ -140,7 +141,7 @@ pub struct Dropdown {
 struct DropdownState {
     window: Option<WindowId>,
     trigger: Option<NodeId>,
-    trigger_width: f32,
+    trigger_width: LogicalPx,
     trigger_icon: Option<NodeId>,
     icon_shown: Option<IconKind>,
 }
@@ -157,7 +158,7 @@ struct DropdownInner {
     options: DropdownOptions,
     trigger: Interactive,
     panel: ItemPanel,
-    icons: IconCache,
+    icons: RefCell<IconSnapshot>,
     items: RefCell<Rc<Vec<DropdownItem>>>,
     selected: Signal<Option<usize>>,
     display: Signal<SmolStr>,
@@ -231,7 +232,7 @@ impl Dropdown {
             options,
             trigger,
             panel,
-            icons: IconCache::default(),
+            icons: RefCell::new(IconSnapshot::default()),
             items: RefCell::new(Rc::new(Vec::new())),
             selected: app.signal_scoped(scope, None),
             display: app.signal_scoped(scope, SmolStr::new_static("")),
@@ -335,17 +336,15 @@ impl Dropdown {
         let trigger_text_move = trigger_text.clone();
         let trigger_caret = trigger.clone();
         let current_icon = self.selected_icon(app);
-        self.inner.icons.resolve(
-            app,
-            window,
-            current_icon.unwrap_or(IconKind::X),
-            size.icon_size(),
-        )?;
+        self.inner
+            .icons
+            .borrow_mut()
+            .resolve(app, window, current_icon.unwrap_or(IconKind::X))?;
         let icon_resource = self
             .inner
             .icons
-            .snapshot()
-            .get(current_icon.unwrap_or(IconKind::X), size.icon_size())
+            .borrow()
+            .get(current_icon.unwrap_or(IconKind::X))
             .ok_or(EngineError::UnknownWindow { window })?;
         let icon_slot = Rc::new(std::cell::Cell::new(None));
         let icon_slot_inner = icon_slot.clone();
@@ -354,7 +353,7 @@ impl Dropdown {
             let side = if current_icon.is_some() {
                 size.icon_size()
             } else {
-                0.0
+                LogicalPx::ZERO
             };
             let icon = NodeBuilder::image(icon_resource, ui_core::node::image::ImageFit::Fill)
                 .style(StyleBuilder::new().size(side, side).build())
@@ -477,7 +476,7 @@ impl Dropdown {
             .inner
             .options
             .width
-            .unwrap_or_else(|| self.inner.state.borrow().trigger_width.max(1.0));
+            .unwrap_or_else(|| self.inner.state.borrow().trigger_width.max(px(1.0)));
         self.inner
             .panel
             .set_content(app, self.panel_content())
@@ -511,7 +510,7 @@ impl Dropdown {
         if self.is_open(app) {
             self.measure_trigger(app);
             if self.inner.options.width.is_none() {
-                let width = self.inner.state.borrow().trigger_width.max(1.0);
+                let width = self.inner.state.borrow().trigger_width.max(px(1.0));
                 self.inner.panel.resize(app, width)?;
             }
         }
@@ -546,7 +545,7 @@ impl Dropdown {
         let theme = self.inner.theme.clone();
         let size = self.inner.options.size;
         let labels: Vec<SmolStr> = items.iter().map(|item| item.label.clone()).collect();
-        let icons = Rc::new(self.inner.icons.snapshot());
+        let icons = Rc::new(self.inner.icons.borrow().clone());
         let has_icon = items.iter().any(|item| item.icon.is_some());
         let build: Rc<dyn Fn(&mut NodeTree, NodeId, usize) -> Result<(), EngineError>> = {
             let items = items.clone();
@@ -587,7 +586,11 @@ impl Dropdown {
         });
         let measure = Some(PanelMeasure {
             labels: measure_labels,
-            extra: if has_icon { size.icon_size() } else { 0.0 },
+            extra: if has_icon {
+                size.icon_size()
+            } else {
+                LogicalPx::ZERO
+            },
         });
         PanelContent {
             rows,
@@ -706,14 +709,13 @@ impl Dropdown {
     }
 
     fn resolve_icons(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
-        let size = self.inner.options.size.icon_size();
         let items = self.inner.items.borrow().clone();
         let mut kinds: Vec<IconKind> = items.iter().filter_map(|item| item.icon).collect();
         kinds.extend(self.selected_icon(app));
         kinds.sort_unstable();
         kinds.dedup();
         for kind in kinds {
-            self.inner.icons.resolve(app, window, kind, size)?;
+            self.inner.icons.borrow_mut().resolve(app, window, kind)?;
         }
         Ok(())
     }
@@ -735,14 +737,18 @@ impl Dropdown {
         let size = self.inner.options.size.icon_size();
         let mut changed = false;
         if let Some(kind) = desired {
-            self.inner.icons.resolve(app, window, kind, size)?;
+            self.inner.icons.borrow_mut().resolve(app, window, kind)?;
             changed = true;
         }
-        let resource = desired.and_then(|kind| self.inner.icons.snapshot().get(kind, size));
+        let resource = desired.and_then(|kind| self.inner.icons.borrow().get(kind));
         if let Some(target) = app.window_mut(window) {
             if let Ok(current) = target.tree().get(node) {
                 let mut style = current.style().clone();
-                let side = if desired.is_some() { size } else { 0.0 };
+                let side = if desired.is_some() {
+                    size
+                } else {
+                    LogicalPx::ZERO
+                };
                 style.size_length(side, side);
                 let _ = target.tree_mut().set_style(node, style);
             }
@@ -799,7 +805,6 @@ impl fmt::Debug for Dropdown {
 
 #[cfg(test)]
 mod tests {
-
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -810,7 +815,7 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
         paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
@@ -848,7 +853,7 @@ mod tests {
             let sink = clicks.clone();
             NodeBuilder::boxed()
                 .id("background")
-                .layout_override(Rect::new(600.0, 500.0, 80.0, 40.0))
+                .layout_override(LogicalRect::new(px(600.0), px(500.0), px(80.0), px(40.0)))
                 .on_click(Action::Custom(SmolStr::new_static("background.click")))
                 .build(
                     app.app_mut().window_mut(window).expect("窗口").tree_mut(),
@@ -926,7 +931,7 @@ mod tests {
             let _ = dropdown.sync(self.app.app_mut());
         }
 
-        fn click(&mut self, dropdown: &Dropdown, at: Point) {
+        fn click(&mut self, dropdown: &Dropdown, at: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 at,
                 PointerButton::Primary,
@@ -940,13 +945,13 @@ mod tests {
             self.settle(dropdown);
         }
 
-        fn bounds(&self, node: NodeId) -> Rect {
+        fn bounds(&self, node: NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("布局盒")
         }
 
-        fn center(&self, node: NodeId) -> Point {
+        fn center(&self, node: NodeId) -> LogicalPoint {
             let bounds = self.bounds(node);
-            Point::new(
+            LogicalPoint::new(
                 bounds.origin.x + bounds.size.width / 2.0,
                 bounds.origin.y + bounds.size.height / 2.0,
             )
@@ -971,9 +976,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("第 {index} 行未挂载"))
         }
 
-        fn row_center(&self, index: usize) -> Point {
+        fn row_center(&self, index: usize) -> LogicalPoint {
             let bounds = self.bounds(self.row(index));
-            Point::new(
+            LogicalPoint::new(
                 bounds.origin.x + bounds.size.width / 2.0,
                 bounds.origin.y + bounds.size.height / 2.0,
             )
@@ -1154,7 +1159,7 @@ mod tests {
         let trigger_width = harness.bounds(trigger).size.width;
         let panel = harness.bounds(dropdown.panel_node().expect("面板"));
         assert!(
-            (panel.size.width - trigger_width).abs() < 0.5,
+            (panel.size.width - trigger_width).abs() < px(0.5),
             "面板宽度对齐触发器：面板 {} / 触发器 {trigger_width}",
             panel.size.width
         );
@@ -1164,7 +1169,7 @@ mod tests {
     fn a_long_item_list_is_virtualized_and_scrolls_to_the_end() {
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions {
-            max_height: 200.0,
+            max_height: px(200.0),
             ..DropdownOptions::default()
         });
         let many: Vec<DropdownItem> = (0..200)
@@ -1179,7 +1184,7 @@ mod tests {
 
         let panel = harness.bounds(dropdown.panel_node().expect("面板"));
         assert!(
-            panel.size.height <= 200.0 + 0.5,
+            panel.size.height <= px(200.0 + 0.5),
             "面板高度被 max_height 截住"
         );
         assert!(
@@ -1201,7 +1206,7 @@ mod tests {
         harness.click(&dropdown, harness.center(trigger));
         assert!(dropdown.is_open(harness.app.app()));
 
-        harness.click(&dropdown, Point::new(640.0, 520.0));
+        harness.click(&dropdown, LogicalPoint::new(px(640.0), px(520.0)));
         assert!(!dropdown.is_open(harness.app.app()), "点击外部关闭");
         assert_eq!(
             harness.background_clicks.get(),
@@ -1231,7 +1236,7 @@ mod tests {
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions::default());
         harness.mount(&dropdown, items());
-        harness.click(&dropdown, Point::new(640.0, 520.0));
+        harness.click(&dropdown, LogicalPoint::new(px(640.0), px(520.0)));
         assert_eq!(harness.background_clicks.get(), 1, "关闭态不遮背景点击");
     }
 
@@ -1317,7 +1322,7 @@ mod tests {
     #[test]
     fn an_explicit_width_stays_exact_for_long_items() {
         let mut harness = Harness::new();
-        let dropdown = harness.dropdown(DropdownOptions::default().width(120.0));
+        let dropdown = harness.dropdown(DropdownOptions::default().width(px(120.0)));
         harness.mount(
             &dropdown,
             vec![
@@ -1332,13 +1337,13 @@ mod tests {
         harness.click(&dropdown, harness.center(trigger));
         let panel = harness.bounds(dropdown.panel_node().expect("面板"));
         assert!(
-            (panel.size.width - 120.0).abs() < 0.5,
+            (panel.size.width - 120.0).abs() < px(0.5),
             "显式宽度精确生效、不随长条目增长：{}",
             panel.size.width
         );
         let row = harness.bounds(harness.row(0));
         assert!(
-            row.size.width <= 120.0 - 8.0 + 0.5,
+            row.size.width <= px(120.0 - 8.0 + 0.5),
             "长条目被面板宽度约束（截断 / 换行）：行宽 {}",
             row.size.width
         );
@@ -1430,8 +1435,8 @@ mod tests {
                 .style(
                     StyleBuilder::new()
                         .relative()
-                        .width(800.0)
-                        .height(600.0)
+                        .width(px(800.0))
+                        .height(px(600.0))
                         .overflow_hidden()
                         .build(),
                 )
@@ -1450,7 +1455,10 @@ mod tests {
         harness
             .app
             .app_mut()
-            .set_scroll_content(&handle, ui_core::math::Size::new(800.0, 2400.0))
+            .set_scroll_content(
+                &handle,
+                ui_core::math::LogicalSize::new(px(800.0), px(2400.0)),
+            )
             .expect("内容");
 
         let dropdown = harness.dropdown(DropdownOptions::default());
@@ -1461,8 +1469,8 @@ mod tests {
 
         let wheel = |harness: &mut Harness, dropdown: &Dropdown| {
             let _ = harness.app.inject(InputEvent::scroll_lines(
-                Point::new(700.0, 500.0),
-                Point::new(0.0, -2.0),
+                LogicalPoint::new(px(700.0), px(500.0)),
+                LogicalPoint::new(px(0.0), px(-2.0)),
                 Modifiers::empty(),
             ));
             harness.settle(dropdown);
@@ -1480,7 +1488,7 @@ mod tests {
                 .expect("滚动状态")
                 .offset
                 .y,
-            0.0,
+            px(0.0),
             "面板打开时背景滚轮被消费"
         );
 
@@ -1494,7 +1502,7 @@ mod tests {
                 .expect("滚动状态")
                 .offset
                 .y
-                > 50.0,
+                > px(50.0),
             "无浮层时背景可滚"
         );
     }

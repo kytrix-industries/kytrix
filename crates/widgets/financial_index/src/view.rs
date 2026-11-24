@@ -18,6 +18,7 @@ use ui_core::{
     a11y::A11yPatch,
     app::{App, TimerId},
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{primitive::Border, style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextOverflow, TextStyle, TextWrap},
@@ -66,7 +67,7 @@ const FLASH_PEAK: Duration = Duration::from_millis(100);
 const FLASH_TICK: Duration = Duration::from_millis(16);
 const GRID_FLASH_HEIGHT: f32 = 6.0;
 const GRID_CELL_WIDTH: f32 = 160.0;
-const GRID_CELL_HEIGHT: f32 = 88.0;
+const GRID_CELL_HEIGHT: LogicalPx = px(88.0);
 const COLUMN_COUNT: usize = 4;
 const COLUMN_WEIGHTS: [f32; COLUMN_COUNT] = [0.4, 0.2, 0.2, 0.2];
 
@@ -174,7 +175,7 @@ struct FlashVisual {
 pub(crate) struct GridLayout {
     pub columns: usize,
     pub lines: usize,
-    pub cell_height: f32,
+    pub cell_height: LogicalPx,
 }
 
 pub(crate) fn grid_layout(viewport_width: f32, item_count: usize) -> GridLayout {
@@ -912,7 +913,7 @@ impl FinancialIndexWidget {
     fn viewport_width(&self, cx: &WidgetCx<'_>) -> f32 {
         self.content_slot
             .and_then(|slot| cx.tree().get(slot).ok())
-            .map_or(0.0, |node| node.layout().bounds.size.width)
+            .map_or(0.0, |node| f32::from(node.layout().bounds.size.width))
     }
 
     fn settle_flashes(&mut self, cx: &mut WidgetCx<'_>) {
@@ -1098,8 +1099,8 @@ impl FinancialIndexWidget {
         let large_font_size = self.theme.tokens().large.font_size;
         let key = cx.unique_key("financial_index.grid");
         let options = ListOptions {
-            padding_x: 0.0,
-            padding_y: 0.0,
+            padding_x: px(0.0),
+            padding_y: px(0.0),
             ..ListOptions::fixed(GRID_CELL_HEIGHT).selection(SelectionMode::None)
         };
         let list = List::new(
@@ -1477,8 +1478,8 @@ struct TableCellSink {
     language: Signal<LanguageCode>,
     translate: Translate,
     theme: ThemeHandle,
-    font_size: f32,
-    small_font_size: f32,
+    font_size: LogicalPx,
+    small_font_size: LogicalPx,
 }
 
 impl TableCellSink {
@@ -1667,8 +1668,8 @@ struct GridSink {
     language: Signal<LanguageCode>,
     translate: Translate,
     theme: ThemeHandle,
-    font_size: f32,
-    large_font_size: f32,
+    font_size: LogicalPx,
+    large_font_size: LogicalPx,
 }
 
 impl GridSink {
@@ -1695,7 +1696,7 @@ impl GridSink {
                 NodeBuilder::boxed()
                     .style(
                         StyleBuilder::new()
-                            .width(GRID_CELL_WIDTH)
+                            .width(px(GRID_CELL_WIDTH))
                             .height(GRID_CELL_HEIGHT)
                             .flex_none()
                             .min_width_0()
@@ -1732,16 +1733,16 @@ impl GridSink {
             .id("TEST_INDICES_GRID_CELL")
             .style(
                 StyleBuilder::new()
-                    .width(GRID_CELL_WIDTH)
+                    .width(px(GRID_CELL_WIDTH))
                     .height(GRID_CELL_HEIGHT)
                     .flex_none()
                     .relative()
                     .overflow_hidden()
                     .min_width_0()
                     .flex_col()
-                    .gap(4.0)
-                    .padding(8.0)
-                    .border(1.0)
+                    .gap(px(4.0))
+                    .padding(px(8.0))
+                    .border(px(1.0))
                     .build(),
             )
             .bind_style(move |read| {
@@ -1753,7 +1754,7 @@ impl GridSink {
                 StylePatch {
                     background: Some(theme.role(read, direction_surface(direction))),
                     border: Some(Border {
-                        width: 1.0,
+                        width: px(1.0),
                         color: theme.role(read, Role::LineDivider),
                     }),
                     ..StylePatch::default()
@@ -1844,7 +1845,7 @@ impl GridSink {
                     .items_center()
                     .width_full()
                     .min_width_0()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(tree, parent)?;
@@ -1939,10 +1940,10 @@ impl GridSink {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(-1.0)
-                    .left(-1.0)
-                    .right(-1.0)
-                    .height(GRID_FLASH_HEIGHT)
+                    .top(px(-1.0))
+                    .left(px(-1.0))
+                    .right(px(-1.0))
+                    .height(px(GRID_FLASH_HEIGHT))
                     .build(),
             )
             .bind_style(move |read| {
@@ -2119,8 +2120,8 @@ mod tests {
                 .id("TEST_INDICES_BODY")
                 .style(
                     StyleBuilder::new()
-                        .width(BODY_WIDTH)
-                        .height(BODY_HEIGHT)
+                        .width(px(BODY_WIDTH))
+                        .height(px(BODY_HEIGHT))
                         .flex_col()
                         .build(),
                 )
@@ -2351,10 +2352,10 @@ mod tests {
             .layout()
             .bounds;
         (
-            bounds.origin.x,
-            bounds.origin.y,
-            bounds.size.width,
-            bounds.size.height,
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
         )
     }
 
@@ -3065,7 +3066,7 @@ mod tests {
         let (cell_x, cell_y, cell_width, cell_height) = place(&harness, cell);
         let (bar_x, bar_y, bar_width, bar_height) = place(&harness, bar);
         assert_eq!(cell_width, GRID_CELL_WIDTH);
-        assert_eq!(cell_height, GRID_CELL_HEIGHT);
+        assert_eq!(cell_height, GRID_CELL_HEIGHT.value());
         assert_eq!(bar_height, GRID_FLASH_HEIGHT);
         assert!(
             (bar_y - cell_y).abs() <= 1.5,
@@ -3376,7 +3377,7 @@ mod tests {
         let (second_x, _, second_width, _) = place(&harness, cells[1]);
         assert_eq!(
             (first_width, first_height),
-            (GRID_CELL_WIDTH, GRID_CELL_HEIGHT),
+            (GRID_CELL_WIDTH, GRID_CELL_HEIGHT.value()),
             "a cell keeps the old 160x88 size"
         );
         assert_eq!(second_width, GRID_CELL_WIDTH);

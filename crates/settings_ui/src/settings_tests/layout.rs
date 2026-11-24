@@ -1,10 +1,10 @@
 use market_participants_connector::venue::definition::supported_venues;
 use smol_str::SmolStr;
-use ui_core::math::{Point, Rect};
+use ui_core::math::{LogicalPoint, LogicalRect};
 
 use crate::{pages::registry, settings_tests::test_support::Harness};
 
-fn bounds(harness: &Harness, selector: &str) -> Rect {
+fn bounds(harness: &Harness, selector: &str) -> LogicalRect {
     let node = harness
         .find(selector)
         .unwrap_or_else(|| panic!("no node whose id starts with {selector}"));
@@ -13,26 +13,26 @@ fn bounds(harness: &Harness, selector: &str) -> Rect {
         .unwrap_or_else(|| panic!("{selector} has not been laid out"))
 }
 
-fn left(rect: Rect) -> f32 {
-    rect.origin.x
+fn left(rect: LogicalRect) -> f32 {
+    f32::from(rect.origin.x)
 }
 
-fn right(rect: Rect) -> f32 {
-    rect.origin.x + rect.size.width
+fn right(rect: LogicalRect) -> f32 {
+    f32::from(rect.origin.x + rect.size.width)
 }
 
-fn top(rect: Rect) -> f32 {
-    rect.origin.y
+fn top(rect: LogicalRect) -> f32 {
+    f32::from(rect.origin.y)
 }
 
-fn bottom(rect: Rect) -> f32 {
-    rect.origin.y + rect.size.height
+fn bottom(rect: LogicalRect) -> f32 {
+    f32::from(rect.origin.y + rect.size.height)
 }
 
-fn centre(rect: Rect) -> Point {
-    Point::new(
-        left(rect) + rect.size.width / 2.0,
-        top(rect) + rect.size.height / 2.0,
+fn centre(rect: LogicalRect) -> LogicalPoint {
+    LogicalPoint::new(
+        rect.origin.x + rect.size.width / 2.0,
+        rect.origin.y + rect.size.height / 2.0,
     )
 }
 
@@ -74,7 +74,7 @@ fn the_header_should_hold_the_search_above_the_columns() {
     let content = bounds(&harness, "SETTINGS_CONTENT");
 
     assert!(
-        aligned(search.size.width, 240.0),
+        aligned(f32::from(search.size.width), 240.0),
         "the search field is the gallery header's 240 px: {search:?}"
     );
     assert!(
@@ -358,7 +358,11 @@ fn the_page_content_should_scroll_inside_the_settings_page() {
          outer {outer:?}, viewport {viewport:?}, content {content:?}"
     );
     assert!(
-        aligned(left(content), left(viewport)) && aligned(content.size.width, viewport.size.width),
+        aligned(left(content), left(viewport))
+            && aligned(
+                f32::from(content.size.width),
+                f32::from(viewport.size.width)
+            ),
         "the content column fills the viewport: content {content:?}, viewport {viewport:?}"
     );
     assert!(

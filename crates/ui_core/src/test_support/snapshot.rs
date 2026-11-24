@@ -7,7 +7,7 @@ use std::{
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+    math::{DevicePixelRatio, DeviceSize, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         canvas::Canvas,
@@ -871,11 +871,12 @@ fn build_image(app: &mut TestApp, root: NodeId, palette: &Palette) {
             ..PaintSpec::default()
         },
     );
+    let window = app.window_id();
     let icon = app
         .app_mut()
-        .resources_mut()
-        .insert(&snapshot_png())
+        .insert_bitmap_for_window(window, &snapshot_png())
         .expect("the synthetic 16x16 png must decode");
+    let dpr = app.app().window(window).expect("window").scale().factor();
     let slots = [
         LogicalRect::new(px(16.0), px(16.0), px(16.0), px(16.0)),
         LogicalRect::new(px(48.0), px(16.0), px(32.0), px(32.0)),
@@ -892,13 +893,19 @@ fn build_image(app: &mut TestApp, root: NodeId, palette: &Palette) {
         },
     ];
     for (index, (bounds, modulation)) in slots.into_iter().zip(modulations).enumerate() {
+        let target = DeviceSize::new(
+            dp((bounds.size.width.value() * dpr).ceil() as i32),
+            dp((bounds.size.height.value() * dpr).ceil() as i32),
+        );
+        let tile = icon
+            .variant_for(app.app().resources(), target)
+            .expect("the native bitmap variant is always available");
         let mut canvas = Canvas::new(bounds);
         canvas.push_image(Image {
             bounds,
-            tile: icon.tile,
+            tile,
             modulation,
         });
-        let window = app.window_id();
         let _ = NodeBuilder::canvas(canvas)
             .layout_override(bounds)
             .id(match index {

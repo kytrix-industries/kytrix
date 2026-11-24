@@ -10,6 +10,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     interaction::ScrollHandle,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -351,8 +352,8 @@ struct Plan {
     notes: Option<SmolStr>,
     install_supported: bool,
     language: LanguageCode,
-    body_size: f32,
-    secondary_size: f32,
+    body_size: LogicalPx,
+    secondary_size: LogicalPx,
 }
 
 fn build_content(
@@ -375,7 +376,7 @@ fn build_content(
                 StyleBuilder::new()
                     .flex_col()
                     .width_full()
-                    .gap(CONTENT_GAP)
+                    .gap(px(CONTENT_GAP))
                     .build(),
             )
             .build(tree, body)
@@ -422,7 +423,7 @@ fn build_content(
                     .items_center()
                     .justify_end()
                     .width_full()
-                    .gap(CONTENT_GAP)
+                    .gap(px(CONTENT_GAP))
                     .build(),
             )
             .build(tree, root)
@@ -474,8 +475,8 @@ fn build_notes(
                     .flex_col()
                     .flex_1()
                     .min_width_0()
-                    .max_height(NOTES_MAX_HEIGHT)
-                    .padding_sides(0.0, SCROLLBAR_WIDTH, 0.0, 0.0)
+                    .max_height(px(NOTES_MAX_HEIGHT))
+                    .padding_sides(px(0.0), px(SCROLLBAR_WIDTH), px(0.0), px(0.0))
                     .overflow_hidden()
                     .build(),
             )
@@ -494,10 +495,10 @@ fn build_notes(
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .width(SCROLLBAR_WIDTH)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .width(px(SCROLLBAR_WIDTH))
                     .build(),
             )
             .build(tree, band)
@@ -656,7 +657,7 @@ fn build_failure(
     let text_theme = theme.clone();
     let text_translate = translate.clone();
     build_node(app, window, parent, |tree, parent| {
-        NodeBuilder::text(SmolStr::default(), TextStyle::new(BODY_SIZE))
+        NodeBuilder::text(SmolStr::default(), TextStyle::new(px(BODY_SIZE)))
             .id(format_smolstr!("{key}:failure"))
             .style(StyleBuilder::new().width_full().build())
             .bind_text(move |cx| {
@@ -679,7 +680,7 @@ fn build_text(
     app: &mut App,
     window: WindowId,
     parent: NodeId,
-    size: f32,
+    size: LogicalPx,
     bind: impl Fn(&mut ReadCtx<'_>) -> SmolStr + 'static,
 ) -> Result<NodeId, EngineError> {
     build_node(app, window, parent, |tree, parent| {
@@ -1315,12 +1316,12 @@ mod tests {
             .expect("the status panel is laid out");
 
         assert!(
-            notes.size.width > 900.0,
+            notes.size.width.value() > 900.0,
             "the notes fill the wide panel ({:?})",
             notes.size
         );
         assert!(
-            (status.size.width - STATUS_WIDTH).abs() < 0.5,
+            (status.size.width - STATUS_WIDTH).abs().value() < 0.5,
             "the status content fills the narrower panel ({:?})",
             status.size
         );
@@ -1354,7 +1355,7 @@ mod tests {
             .bounds(scrollbar)
             .expect("the scrollbar is laid out");
         assert!(
-            bounds.size.height > 100.0,
+            bounds.size.height.value() > 100.0,
             "the scrollbar runs the height of the notes it scrolls ({bounds:?})"
         );
     }

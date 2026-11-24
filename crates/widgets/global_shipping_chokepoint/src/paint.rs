@@ -1,6 +1,9 @@
 use std::ops::Range;
 
-use ui_core::{math::Rect, paint::color::Color};
+use ui_core::{
+    math::{LogicalRect, px},
+    paint::color::Color,
+};
 
 use crate::{
     colors::MapColors,
@@ -43,7 +46,7 @@ const MARKER_LENGTH_FAR: f32 = 12.0;
 pub(super) struct Mesh {
     pub vertices: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
-    pub bounds: Rect,
+    pub bounds: LogicalRect,
 }
 
 impl Mesh {
@@ -97,13 +100,13 @@ impl MeshBuilder {
 
     fn finish(self) -> Mesh {
         let bounds = if self.vertices.is_empty() {
-            Rect::default()
+            LogicalRect::default()
         } else {
-            Rect::new(
-                self.min[0],
-                self.min[1],
-                self.max[0] - self.min[0],
-                self.max[1] - self.min[1],
+            LogicalRect::new(
+                px(self.min[0]),
+                px(self.min[1]),
+                px(self.max[0] - self.min[0]),
+                px(self.max[1] - self.min[1]),
             )
         };
         Mesh {
@@ -112,7 +115,7 @@ impl MeshBuilder {
             bounds: if bounds.is_finite() {
                 bounds
             } else {
-                Rect::default()
+                LogicalRect::default()
             },
         }
     }
@@ -592,10 +595,10 @@ mod tests {
         let [west, south, east, north] = model::mercator_bounds();
         let bounds = land.mesh.bounds;
         assert!(
-            bounds.origin.x >= west - 1e-5
-                && bounds.origin.y >= south - 1e-5
-                && bounds.max().x <= east + 1e-5
-                && bounds.max().y <= north + 1e-5,
+            bounds.origin.x >= px(west - 1e-5)
+                && bounds.origin.y >= px(south - 1e-5)
+                && bounds.max().x <= px(east + 1e-5)
+                && bounds.max().y <= px(north + 1e-5),
             "the land mesh's box is in Mercator radians, not window pixels: {bounds:?}",
         );
 
@@ -610,13 +613,13 @@ mod tests {
                 assert_close(shifted[1], base[1] + origin[1], what);
             }
             assert_close(
-                moved.bounds.origin.x,
-                plain.bounds.origin.x + origin[0],
+                f32::from(moved.bounds.origin.x),
+                f32::from(plain.bounds.origin.x + origin[0]),
                 what,
             );
             assert_close(
-                moved.bounds.origin.y,
-                plain.bounds.origin.y + origin[1],
+                f32::from(moved.bounds.origin.y),
+                f32::from(plain.bounds.origin.y + origin[1]),
                 what,
             );
         };
@@ -932,7 +935,11 @@ mod tests {
         let empty = Mesh::default();
         assert!(empty.is_empty());
         assert_eq!(empty.triangle_count(), 0);
-        assert_eq!(empty.bounds, Rect::default(), "an empty mesh has no box");
+        assert_eq!(
+            empty.bounds,
+            LogicalRect::default(),
+            "an empty mesh has no box"
+        );
     }
 
     #[test]
@@ -987,12 +994,12 @@ mod tests {
         assert_eq!(triangles(dot), ROUND_SEGMENTS, "the dot is a fan of six");
         let dot_bounds = dot.bounds;
         assert_close(
-            dot_bounds.size.width,
+            f32::from(dot_bounds.size.width),
             UNKNOWN_VESSEL_RADIUS * 2.0,
             "the dot is drawn at its radius",
         );
         assert_close(
-            dot_bounds.origin.y + dot_bounds.size.height / 2.0,
+            f32::from(dot_bounds.origin.y + dot_bounds.size.height / 2.0),
             origin[1] + centre[1],
             "the dot is centred on the hull",
         );
@@ -1038,7 +1045,7 @@ mod tests {
             );
         }
         assert_close(
-            ring.bounds.size.width,
+            f32::from(ring.bounds.size.width),
             HOVER_RING_OUTER * 2.0,
             "the ring is as wide as its outer diameter",
         );
@@ -1153,22 +1160,22 @@ mod tests {
 
             let bounds = land.mesh.bounds;
             assert_close(
-                bounds.origin.x,
+                f32::from(bounds.origin.x),
                 west,
                 &format!("tier {tier}: the land starts at the map's west edge"),
             );
             assert_close(
-                bounds.origin.y,
+                f32::from(bounds.origin.y),
                 south,
                 &format!("tier {tier}: and at its south edge"),
             );
             assert_close(
-                bounds.max().x,
+                f32::from(bounds.max().x),
                 east,
                 &format!("tier {tier}: and ends at its east edge"),
             );
             assert_close(
-                bounds.max().y,
+                f32::from(bounds.max().y),
                 north,
                 &format!("tier {tier}: and at its north edge"),
             );

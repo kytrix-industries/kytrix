@@ -13,7 +13,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event, InputEvent, KeyBinding, KeyCode, Modifiers},
     interaction::{ScrollConfig, ScrollHandle},
-    math::{Point, Size},
+    math::{LogicalPoint, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -221,9 +221,9 @@ impl GalleryCore {
             StyleBuilder::new()
                 .flex_none()
                 .flex_col()
-                .width(SIDEBAR_WIDTH)
-                .gap(ROW_GAP)
-                .padding_sides(16.0, 8.0, 16.0, 0.0)
+                .width(px(SIDEBAR_WIDTH))
+                .gap(px(ROW_GAP))
+                .padding_sides(px(16.0), px(8.0), px(16.0), px(0.0))
                 .build(),
         )?;
         let body = build_container(
@@ -258,8 +258,8 @@ impl GalleryCore {
                     .flex_col()
                     .flex_none()
                     .width_full()
-                    .padding(CONTENT_PADDING)
-                    .gap(CATEGORY_GAP)
+                    .padding(px(CONTENT_PADDING))
+                    .gap(px(CATEGORY_GAP))
                     .build(),
             )
             .build(tree(app, window), viewport)?;
@@ -446,7 +446,12 @@ impl GalleryCore {
         let window = self.window;
         let search_box = NodeBuilder::boxed()
             .id(self.keys.control("search"))
-            .style(StyleBuilder::new().flex_none().width(SEARCH_WIDTH).build())
+            .style(
+                StyleBuilder::new()
+                    .flex_none()
+                    .width(px(SEARCH_WIDTH))
+                    .build(),
+            )
             .build(tree(app, window), header)?;
         let spec = std::sync::Arc::new(InputSpec {
             name: self.keys.control("search_input"),
@@ -513,8 +518,8 @@ impl GalleryCore {
                     .items_center()
                     .justify_end()
                     .width_full()
-                    .gap(8.0)
-                    .padding_sides(12.0, 20.0, 16.0, 20.0)
+                    .gap(px(8.0))
+                    .padding_sides(px(12.0), px(20.0), px(16.0), px(20.0))
                     .build(),
             )
             .build(tree(app, window), footer)?;
@@ -627,7 +632,7 @@ impl GalleryCore {
                     StyleBuilder::new()
                         .flex_col()
                         .width_full()
-                        .gap(HEADING_GAP)
+                        .gap(px(HEADING_GAP))
                         .build(),
                 )?;
                 let heading = NodeBuilder::boxed()
@@ -637,7 +642,7 @@ impl GalleryCore {
                             .flex_row()
                             .items_center()
                             .width_full()
-                            .height(HEADING_HEIGHT)
+                            .height(px(HEADING_HEIGHT))
                             .build(),
                     )
                     .build(tree(app, self.window), group)?;
@@ -647,7 +652,7 @@ impl GalleryCore {
                     &self.theme,
                     heading,
                     t_smol!(&self.translate, category.label()),
-                    TextStyle::new(12.0).with_weight(600),
+                    TextStyle::new(px(12.0)).with_weight(600),
                     Role::FgMuted,
                 )?;
                 let rows = build_container(
@@ -657,7 +662,7 @@ impl GalleryCore {
                     StyleBuilder::new()
                         .flex_col()
                         .width_full()
-                        .gap(ROW_GAP)
+                        .gap(px(ROW_GAP))
                         .build(),
                 )?;
                 for widget in widgets {
@@ -692,7 +697,8 @@ impl GalleryCore {
 
     fn update_scroll_content(&mut self, app: &mut App, height: f32) {
         if let Some(handle) = self.scroll
-            && let Err(error) = app.set_scroll_content(&handle, Size::new(1.0, height))
+            && let Err(error) =
+                app.set_scroll_content(&handle, LogicalSize::new(px(1.0), px(height)))
         {
             log::warn!("the gallery could not size its catalogue: {error}");
         }
@@ -700,7 +706,7 @@ impl GalleryCore {
 
     fn reset_scroll(&mut self, app: &mut App) {
         if let Some(handle) = self.scroll
-            && let Err(error) = app.scroll_to(&handle, Point::new(0.0, 0.0))
+            && let Err(error) = app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(0.0)))
         {
             log::warn!("the gallery could not scroll its catalogue: {error}");
         }
@@ -1044,8 +1050,8 @@ fn build_header(
                 .flex_row()
                 .items_center()
                 .width_full()
-                .gap(16.0)
-                .padding_sides(20.0, 20.0, 12.0, 20.0)
+                .gap(px(16.0))
+                .padding_sides(px(20.0), px(20.0), px(12.0), px(20.0))
                 .build(),
         )
         .build(tree(app, window), parent)?;
@@ -1057,7 +1063,7 @@ fn build_header(
             .flex_1()
             .min_width_0()
             .flex_col()
-            .gap(2.0)
+            .gap(px(2.0))
             .build(),
     )?;
     bound_label(
@@ -1066,7 +1072,7 @@ fn build_header(
         theme,
         titles,
         "widget_gallery.title",
-        TextStyle::new(18.0).with_weight(700),
+        TextStyle::new(px(18.0)).with_weight(700),
         Role::FgDefault,
         translate,
         *language,
@@ -1077,7 +1083,7 @@ fn build_header(
         theme,
         titles,
         "widget_gallery.subtitle",
-        TextStyle::new(12.0),
+        TextStyle::new(px(12.0)),
         Role::FgMuted,
         translate,
         *language,
@@ -1122,10 +1128,10 @@ fn build_preview(
             StyleBuilder::new()
                 .flex_none()
                 .flex_col()
-                .width(PREVIEW_WIDTH)
+                .width(px(PREVIEW_WIDTH))
                 .min_height_0()
-                .gap(8.0)
-                .padding(16.0)
+                .gap(px(8.0))
+                .padding(px(16.0))
                 .build(),
         )
         .bind_style(move |cx| StylePatch {
@@ -1142,7 +1148,7 @@ fn build_preview(
     let selection_text = *selection;
     let language_text = *language;
     let preview_theme = theme.clone();
-    NodeBuilder::text("", TextStyle::new(13.0).with_weight(600))
+    NodeBuilder::text("", TextStyle::new(px(13.0)).with_weight(600))
         .id(keys.control("preview_title"))
         .bind_text(move |cx| {
             let _language = cx.read(&language_text);
@@ -1171,7 +1177,7 @@ fn build_preview(
     let hint_language = *language;
     NodeBuilder::text(
         t_smol!(translate, "widget_gallery.subtitle"),
-        TextStyle::new(12.0),
+        TextStyle::new(px(12.0)),
     )
     .id(keys.control("preview_hint"))
     .bind_text(move |cx| {
@@ -1231,12 +1237,12 @@ fn build_row(
                 .flex_row()
                 .items_center()
                 .width_full()
-                .height(ROW_HEIGHT)
-                .padding_x(12.0)
-                .gap(12.0)
+                .height(px(ROW_HEIGHT))
+                .padding_x(px(12.0))
+                .gap(px(12.0))
                 .build(),
         )
-        .paint(PaintBuilder::new().rounded(8.0).build())
+        .paint(PaintBuilder::new().rounded(px(8.0)).build())
         .on_click(row_action.clone())
         .a11y(A11yOverride {
             role: Some(A11yRole::Button),
@@ -1257,7 +1263,7 @@ fn build_row(
                     Color::TRANSPARENT
                 }),
                 border: Some(Border {
-                    width: 1.0,
+                    width: px(1.0),
                     color: line,
                 }),
                 ..StylePatch::default()
@@ -1265,7 +1271,7 @@ fn build_row(
         })
         .build(tree(app, window), parent)?;
 
-    let icon = IconSpec::new(icon).with_size(ICON_SIZE).build_themed(
+    let icon = IconSpec::new(icon).with_size(px(ICON_SIZE)).build_themed(
         app,
         window,
         row,
@@ -1284,7 +1290,7 @@ fn build_row(
             .flex_1()
             .min_width_0()
             .flex_col()
-            .gap(2.0)
+            .gap(px(2.0))
             .build(),
     )?;
     static_label(
@@ -1293,7 +1299,7 @@ fn build_row(
         theme,
         text_column,
         name,
-        TextStyle::new(13.0).with_weight(500),
+        TextStyle::new(px(13.0)).with_weight(500),
         Role::FgDefault,
     )?;
     if let Some(description) = description {
@@ -1303,7 +1309,7 @@ fn build_row(
             theme,
             text_column,
             description,
-            TextStyle::new(11.0),
+            TextStyle::new(px(11.0)),
             Role::FgMuted,
         )?;
     }
@@ -1316,11 +1322,11 @@ fn build_row(
         .style(
             StyleBuilder::new()
                 .flex_none()
-                .width(MARK_SIZE)
-                .height(MARK_SIZE)
+                .width(px(MARK_SIZE))
+                .height(px(MARK_SIZE))
                 .build(),
         )
-        .paint(PaintBuilder::new().rounded(MARK_SIZE / 2.0).build())
+        .paint(PaintBuilder::new().rounded(px(MARK_SIZE / 2.0)).build())
         .bind_style(move |cx| {
             let selected = { (*cx.read(&mark_selected)).clone().as_ref() == Some(&mark_row) };
             let color = if selected {
@@ -1334,7 +1340,10 @@ fn build_row(
                 } else {
                     Color::TRANSPARENT
                 }),
-                border: Some(Border { width: 1.0, color }),
+                border: Some(Border {
+                    width: px(1.0),
+                    color,
+                }),
                 ..StylePatch::default()
             }
         })
@@ -1437,7 +1446,7 @@ mod tests {
     use ui_core::{
         error::EngineError,
         event::{Event, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::{
             builder::NodeBuilder,
             id::NodeId,
@@ -1498,7 +1507,7 @@ mod tests {
                     parent: NodeId,
                     cx: &mut WidgetCx<'_>,
                 ) -> Result<(), EngineError> {
-                    NodeBuilder::text($marker, TextStyle::new(12.0))
+                    NodeBuilder::text($marker, TextStyle::new(px(12.0)))
                         .id($marker)
                         .build(cx.tree_mut(), parent)?;
                     Ok(())
@@ -1573,7 +1582,7 @@ mod tests {
         }
 
         fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-            NodeBuilder::text("TEST_PREVIEW_HIDDEN", TextStyle::new(12.0))
+            NodeBuilder::text("TEST_PREVIEW_HIDDEN", TextStyle::new(px(12.0)))
                 .id("TEST_PREVIEW_HIDDEN")
                 .build(cx.tree_mut(), parent)?;
             Ok(())
@@ -1706,7 +1715,7 @@ mod tests {
         None
     }
 
-    fn bounds_of(app: &WidgetTestApp, node: NodeId) -> Rect {
+    fn bounds_of(app: &WidgetTestApp, node: NodeId) -> LogicalRect {
         app.app()
             .window(app.window())
             .expect("the host window")
@@ -1719,7 +1728,7 @@ mod tests {
 
     fn click_node(app: &mut WidgetTestApp, node: NodeId) {
         let bounds = bounds_of(app, node);
-        let point = Point::new(
+        let point = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -2448,7 +2457,7 @@ mod tests {
         }
         let left = NodeBuilder::boxed()
             .id("TEST_PANE_LEFT")
-            .style(StyleBuilder::new().width(380.0).height_full().build())
+            .style(StyleBuilder::new().width(px(380.0)).height_full().build())
             .build(
                 app.app_mut().window_mut(window).expect("window").tree_mut(),
                 root,

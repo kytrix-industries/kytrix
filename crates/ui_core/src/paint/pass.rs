@@ -7,12 +7,12 @@ use crate::test_support::record::{LaneOutcome, LanePaintEntry, PaintLog};
 use crate::{
     error::EngineError,
     math::{
-        DevicePixelRatio, DeviceRect, LogicalPoint, LogicalPx, LogicalRect, LogicalSize,
-        PhysicalPx, dp, physical_px, px,
+        DevicePixelRatio, DeviceRect, LogicalPoint, LogicalPx, LogicalRect, PhysicalPx, dp,
+        physical_px, px,
     },
     node::{
         id::NodeId,
-        image::{ImageContent, ImageFit, cover_tile, fit_bounds},
+        image::{ImageContent, ImageFit, cover_tile, fit_bounds, variant_target},
         tree::{BakedGeometryChunk, NodeKind, NodeTree, PaintNodeState},
     },
     paint::{
@@ -1588,27 +1588,35 @@ impl PrimitiveEmitter {
     }
 
     fn emit_image(&mut self, context: &mut PaintContext<'_>, content: &ImageContent, opacity: f32) {
-        let Some(image) = context.resources.and_then(|resources| {
-            content
-                .source()
-                .resource()
-                .and_then(|resource| resources.image(resource))
-        }) else {
+        let Some(resources) = context.resources else {
             return;
         };
-        let image_size = LogicalSize::new(px(image.width as f32), px(image.height as f32));
+        let Some(image) = content
+            .source()
+            .resource()
+            .and_then(|resource| resources.image(resource))
+        else {
+            return;
+        };
+        let intrinsic = image.intrinsic(context.scale);
         let bounds = self.bounds;
-        let Some(rect) = fit_bounds(bounds, content.fit(), image_size) else {
+        let Some(rect) = fit_bounds(bounds, content.fit(), intrinsic) else {
+            return;
+        };
+        let Some(target) = variant_target(bounds, content.fit(), intrinsic, context.scale) else {
+            return;
+        };
+        let Some(tile) = image.variant_for(resources, target) else {
             return;
         };
         let tile = match content.fit() {
             ImageFit::Cover => {
-                let Some(tile) = cover_tile(bounds, image_size, image.tile) else {
+                let Some(tile) = cover_tile(bounds, intrinsic, tile) else {
                     return;
                 };
                 tile
             }
-            ImageFit::Contain | ImageFit::Fill => image.tile,
+            ImageFit::Contain | ImageFit::Fill => tile,
         };
         let modulation = self
             .patch
@@ -1669,10 +1677,24 @@ impl PrimitiveEmitter {
                 resource,
                 modulation,
             }) => {
-                let image = context
-                    .resources
-                    .and_then(|resources| resources.image(resource));
-                let Some(image) = image else {
+                let Some(resources) = context.resources else {
+                    if !context.skipped_inline_images.contains(&id) {
+                        context.skipped_inline_images.push(id);
+                    }
+                    return;
+                };
+                let Some(image) = resources.image(resource) else {
+                    if !context.skipped_inline_images.contains(&id) {
+                        context.skipped_inline_images.push(id);
+                    }
+                    return;
+                };
+                let intrinsic = image.intrinsic(self.scale);
+                let Some(target) = variant_target(bounds, ImageFit::Fill, intrinsic, self.scale)
+                else {
+                    return;
+                };
+                let Some(tile) = image.variant_for(resources, target) else {
                     if !context.skipped_inline_images.contains(&id) {
                         context.skipped_inline_images.push(id);
                     }
@@ -1686,7 +1708,7 @@ impl PrimitiveEmitter {
                     context,
                     Primitive::Image(Image {
                         bounds,
-                        tile: image.tile,
+                        tile,
                         modulation,
                     }),
                 );
@@ -2695,7 +2717,7 @@ mod tests {
             spec(
                 5,
                 InlineBoxPaint::Image {
-                    resource: image.id,
+                    resource: image.id(),
                     modulation: Color::WHITE,
                 },
             ),
@@ -2720,6 +2742,9 @@ mod tests {
             },
         ];
         let mut h = Harness::new();
+        let expected = image
+            .variant_for(&resources, crate::math::DeviceSize::new(dp(8), dp(8)))
+            .expect("位图的原生变体恒可用");
         h.resources = Some(resources);
         let node = spawn_text(
             &mut h,
@@ -2743,13 +2768,13 @@ mod tests {
         let Primitive::Image(primed) = &images[0] else {
             unreachable!()
         };
-        assert_eq!(primed.tile, image.tile, "tile 必须来自 ResourceImage");
+        assert_eq!(primed.tile, expected, "tile 必须来自 ResourceImage");
         assert_eq!(primed.bounds, boxes[0].rect.translate(origin));
         assert_eq!(primed.modulation, Color::WHITE);
         assert_eq!(report.skipped_inline_images.as_slice(), &[6]);
 
         let mut cache = h.resources.take().expect("resources");
-        assert!(cache.unload(image.id));
+        assert!(cache.unload(image.id()));
         h.resources = Some(cache);
         h.mark_paint(node);
         let report = h.paint();
@@ -3877,7 +3902,7 @@ mod tests {
             ),
             "文本行注入"
         );
-        let image_node = NodeBuilder::image(image.id, crate::node::image::ImageFit::Fill)
+        let image_node = NodeBuilder::image(image.id(), crate::node::image::ImageFit::Fill)
             .style(fixed_style(40.0, 40.0))
             .build(&mut h.tree, group)
             .expect("image");

@@ -127,6 +127,7 @@ pub(crate) fn frame(
             return None;
         }
     };
+    app.prepare_image_variants(window);
     let text_layout = match app.layout_text(window) {
         Some(Ok(report)) => report,
         Some(Err(error)) => {

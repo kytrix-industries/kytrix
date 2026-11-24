@@ -19,7 +19,7 @@ use ui_core::{
     a11y::{A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         canvas::Canvas,
@@ -35,29 +35,29 @@ use widget::cx::WidgetCx;
 
 use super::model::{AgeBucket, DisplayPrecision, TimelineSnapshot, age_bucket, now_millis};
 
-pub(super) const HEIGHT: f32 = 136.0;
+pub(super) const HEIGHT: LogicalPx = px(136.0);
 
 pub(super) const WINDOW_MILLIS: i64 = 6 * 60 * 60 * 1_000;
 
-const BUCKET_WIDTH: f32 = 24.0;
-const AXIS_LABEL_GAP: f32 = 8.0;
-const AXIS_Y: f32 = HEIGHT / 2.0;
-const AXIS_LINE_HEIGHT: f32 = 1.0;
-const AXIS_TICK_HEIGHT: f32 = 8.0;
-const MARKER_MIN_SIZE: f32 = 18.0;
-const MARKER_MAX_SIZE: f32 = 24.0;
-const MARKER_GAP: f32 = 6.0;
-const MARKER_AXIS_GAP: f32 = 4.0;
+const BUCKET_WIDTH: LogicalPx = px(24.0);
+const AXIS_LABEL_GAP: LogicalPx = px(8.0);
+const AXIS_Y: LogicalPx = px(HEIGHT.value() / 2.0);
+const AXIS_LINE_HEIGHT: LogicalPx = px(1.0);
+const AXIS_TICK_HEIGHT: LogicalPx = px(8.0);
+const MARKER_MIN_SIZE: LogicalPx = px(18.0);
+const MARKER_MAX_SIZE: LogicalPx = px(24.0);
+const MARKER_GAP: LogicalPx = px(6.0);
+const MARKER_AXIS_GAP: LogicalPx = px(4.0);
 const MARKER_RADIUS_RATIO: f32 = 0.22;
 const MARKER_FONT_RATIO: f32 = 0.68;
-const MARKER_MIN_FONT_SIZE: f32 = 10.0;
-const CONNECTOR_WIDTH: f32 = 1.0;
-const TOOLTIP_WIDTH: f32 = 320.0;
-const TOOLTIP_ROW_HEIGHT: f32 = 18.0;
+const MARKER_MIN_FONT_SIZE: LogicalPx = px(10.0);
+const CONNECTOR_WIDTH: LogicalPx = px(1.0);
+const TOOLTIP_WIDTH: LogicalPx = px(320.0);
+const TOOLTIP_ROW_HEIGHT: LogicalPx = px(18.0);
 const TOOLTIP_VISIBLE_ROWS: usize = 6;
-const TOOLTIP_PADDING: f32 = 4.0;
-const TOOLTIP_GAP: f32 = 4.0;
-const TOOLTIP_CORNER_RADIUS: f32 = 4.0;
+const TOOLTIP_PADDING: LogicalPx = px(4.0);
+const TOOLTIP_GAP: LogicalPx = px(4.0);
+const TOOLTIP_CORNER_RADIUS: LogicalPx = px(4.0);
 const TEXT_CACHE_CAPACITY: usize = 64;
 
 const TIMELINE_SELECTOR: &str = "TEST_HYPERLIQUID_WALLET_TIMELINE";
@@ -116,34 +116,38 @@ impl TooltipRow {
 struct MarkerGeometry {
     side: Side,
     bucket_index: usize,
-    bounds: Rect,
-    connector: Rect,
+    bounds: LogicalRect,
+    connector: LogicalRect,
 }
 
 #[derive(Debug, PartialEq)]
 struct TimelineGeometry {
-    axis: Rect,
-    start_tick: Rect,
-    end_tick: Rect,
+    axis: LogicalRect,
+    start_tick: LogicalRect,
+    end_tick: LogicalRect,
     markers: Arc<[MarkerGeometry]>,
-    marker_size: f32,
+    marker_size: LogicalPx,
 }
 
 impl TimelineGeometry {
-    fn new(buckets: &[TimelineBucket], plot_width: f32, start_label_width: f32) -> Self {
+    fn new(
+        buckets: &[TimelineBucket],
+        plot_width: LogicalPx,
+        start_label_width: LogicalPx,
+    ) -> Self {
         let plot_width = finite_width(plot_width);
         let bucket_count = bucket_count(plot_width);
         let slot_width = plot_width / bucket_count as f32;
         let marker_size = marker_size(slot_width);
-        let axis_left = start_label_width.max(0.0) + AXIS_LABEL_GAP;
-        let axis = Rect::new(axis_left, AXIS_Y, plot_width, AXIS_LINE_HEIGHT);
-        let start_tick = Rect::new(
+        let axis_left = start_label_width.max(px(0.0)) + AXIS_LABEL_GAP;
+        let axis = LogicalRect::new(axis_left, AXIS_Y, plot_width, AXIS_LINE_HEIGHT);
+        let start_tick = LogicalRect::new(
             axis_left,
             AXIS_Y - AXIS_TICK_HEIGHT / 2.0,
             AXIS_LINE_HEIGHT,
             AXIS_TICK_HEIGHT,
         );
-        let end_tick = Rect::new(
+        let end_tick = LogicalRect::new(
             axis_left + plot_width - AXIS_LINE_HEIGHT,
             AXIS_Y - AXIS_TICK_HEIGHT / 2.0,
             AXIS_LINE_HEIGHT,
@@ -155,7 +159,7 @@ impl TimelineGeometry {
             if bucket.index >= bucket_count {
                 continue;
             }
-            let center_x = axis_left + (bucket.index as f32 + 0.5) * slot_width;
+            let center_x = axis_left + slot_width * (bucket.index as f32 + 0.5);
             let left = (center_x - marker_size / 2.0)
                 .max(axis_left)
                 .min((axis_left + plot_width - marker_size).max(axis_left));
@@ -177,8 +181,8 @@ impl TimelineGeometry {
                     )
                 }
             };
-            let bounds = Rect::new(left, top, marker_size, marker_size);
-            let connector = Rect::new(
+            let bounds = LogicalRect::new(left, top, marker_size, marker_size);
+            let connector = LogicalRect::new(
                 center_x - CONNECTOR_WIDTH / 2.0,
                 connector_top.min(top + marker_size),
                 CONNECTOR_WIDTH,
@@ -207,7 +211,7 @@ impl TimelineGeometry {
             .find(|marker| marker.side == side && marker.bucket_index == bucket_index)
     }
 
-    fn marker_at(&self, point: Point) -> Option<&MarkerGeometry> {
+    fn marker_at(&self, point: LogicalPoint) -> Option<&MarkerGeometry> {
         self.markers
             .iter()
             .rev()
@@ -215,49 +219,54 @@ impl TimelineGeometry {
     }
 }
 
-fn marker_size(slot_width: f32) -> f32 {
-    if !slot_width.is_finite() || slot_width <= 0.0 {
-        return 1.0;
+fn marker_size(slot_width: LogicalPx) -> LogicalPx {
+    if !slot_width.is_finite() || slot_width <= px(0.0) {
+        return px(1.0);
     }
-    let available = (slot_width - MARKER_GAP).max(1.0);
+    let available = (slot_width - MARKER_GAP).max(px(1.0));
     available
         .min(MARKER_MAX_SIZE)
         .max(MARKER_MIN_SIZE.min(available))
 }
 
-fn finite_width(width: f32) -> f32 {
-    if width.is_finite() && width > 0.0 {
+fn finite_width(width: LogicalPx) -> LogicalPx {
+    if width.is_finite() && width > px(0.0) {
         width
     } else {
-        1.0
+        px(1.0)
     }
 }
 
-pub(super) fn plot_width(width: f32) -> f32 {
+pub(super) fn plot_width(width: LogicalPx) -> LogicalPx {
     finite_width(width)
 }
 
-fn axis_line_width(total_width: f32, start_label_width: f32, end_label_width: f32) -> f32 {
-    if !total_width.is_finite() || total_width <= 0.0 {
-        return 1.0;
+fn axis_line_width(
+    total_width: LogicalPx,
+    start_label_width: LogicalPx,
+    end_label_width: LogicalPx,
+) -> LogicalPx {
+    if !total_width.is_finite() || total_width <= px(0.0) {
+        return px(1.0);
     }
-    let occupied = start_label_width.max(0.0) + end_label_width.max(0.0) + AXIS_LABEL_GAP * 2.0;
-    (total_width - occupied).max(1.0)
+    let occupied =
+        start_label_width.max(px(0.0)) + end_label_width.max(px(0.0)) + AXIS_LABEL_GAP * 2.0;
+    (total_width - occupied).max(px(1.0))
 }
 
-fn bucket_count(width: f32) -> usize {
-    if !width.is_finite() || width <= 0.0 {
+fn bucket_count(width: LogicalPx) -> usize {
+    if !width.is_finite() || width <= px(0.0) {
         return 1;
     }
     (width / BUCKET_WIDTH).floor().max(1.0) as usize
 }
 
-fn bucket_width_millis(width: f32) -> i64 {
+fn bucket_width_millis(width: LogicalPx) -> i64 {
     let count = bucket_count(width).min(WINDOW_MILLIS as usize) as i64;
     (WINDOW_MILLIS + count - 1) / count
 }
 
-fn build_buckets(snapshot: &TimelineSnapshot, width: f32) -> Vec<TimelineBucket> {
+fn build_buckets(snapshot: &TimelineSnapshot, width: LogicalPx) -> Vec<TimelineBucket> {
     let count = bucket_count(width);
     let bucket_width = bucket_width_millis(width);
     let window = snapshot.window_end.saturating_sub(snapshot.window_start);
@@ -510,16 +519,16 @@ impl TimelineColors {
     }
 }
 
-fn text_style(font_size: f32, color: Color) -> TextStyle {
+fn text_style(font_size: LogicalPx, color: Color) -> TextStyle {
     let mut style = TextStyle::new(font_size);
     style.color = color;
     style
 }
 
-fn solid_quad(bounds: Rect, fill: Color) -> Quad {
+fn solid_quad(bounds: LogicalRect, fill: Color) -> Quad {
     Quad {
         bounds,
-        corner_radius: [0.0; 4],
+        corner_radius: [px(0.0); 4],
         paint: QuadPaint::Solid { fill, border: None },
     }
 }
@@ -527,7 +536,7 @@ fn solid_quad(bounds: Rect, fill: Color) -> Quad {
 struct TimelineData {
     snapshot: Option<Arc<TimelineSnapshot>>,
     buckets: Arc<[TimelineBucket]>,
-    plot_width: f32,
+    plot_width: LogicalPx,
 }
 
 impl Default for TimelineData {
@@ -535,7 +544,7 @@ impl Default for TimelineData {
         Self {
             snapshot: None,
             buckets: Arc::from([]),
-            plot_width: 1.0,
+            plot_width: px(1.0),
         }
     }
 }
@@ -552,16 +561,16 @@ impl TimelineData {
         }
         self.snapshot = snapshot.cloned();
         self.buckets = match &self.snapshot {
-            Some(snapshot) => build_buckets(snapshot, self.plot_width.max(1.0)).into(),
+            Some(snapshot) => build_buckets(snapshot, self.plot_width.max(px(1.0))).into(),
             None => Arc::from([]),
         };
         true
     }
 
-    fn set_plot_width(&mut self, plot_width: f32) -> bool {
+    fn set_plot_width(&mut self, plot_width: LogicalPx) -> bool {
         let plot_width = finite_width(plot_width);
         let rebucket = bucket_count(self.plot_width) != bucket_count(plot_width);
-        if !rebucket && (self.plot_width - plot_width).abs() <= 0.5 {
+        if !rebucket && (self.plot_width - plot_width).abs() <= px(0.5) {
             return false;
         }
         self.plot_width = plot_width;
@@ -597,8 +606,8 @@ impl CachedTextLine {
 
 struct GeometryCacheEntry {
     buckets: Arc<[TimelineBucket]>,
-    plot_width: f32,
-    start_label_width: f32,
+    plot_width: LogicalPx,
+    start_label_width: LogicalPx,
     geometry: Arc<TimelineGeometry>,
 }
 
@@ -612,14 +621,14 @@ impl PaintCache {
     fn geometry(
         &mut self,
         buckets: &Arc<[TimelineBucket]>,
-        plot_width: f32,
-        start_label_width: f32,
+        plot_width: LogicalPx,
+        start_label_width: LogicalPx,
     ) -> Arc<TimelineGeometry> {
         let plot_width = finite_width(plot_width);
         let matches = self.geometry.as_ref().is_some_and(|entry| {
             Arc::ptr_eq(&entry.buckets, buckets)
-                && entry.plot_width.to_bits() == plot_width.to_bits()
-                && entry.start_label_width.to_bits() == start_label_width.to_bits()
+                && entry.plot_width == plot_width
+                && entry.start_label_width == start_label_width
         });
         if matches && let Some(entry) = self.geometry.as_ref() {
             return entry.geometry.clone();
@@ -672,7 +681,7 @@ impl PaintCache {
 struct LabelMetrics {
     labels: (SmolStr, SmolStr),
     color: Color,
-    font_size: f32,
+    font_size: LogicalPx,
     text_scale: f32,
     start: Arc<ShapedTextHandle>,
     end: Arc<ShapedTextHandle>,
@@ -683,7 +692,7 @@ impl LabelMetrics {
         &self,
         labels: &(SmolStr, SmolStr),
         color: Color,
-        font_size: f32,
+        font_size: LogicalPx,
         text_scale: f32,
     ) -> bool {
         self.labels == *labels
@@ -695,9 +704,9 @@ impl LabelMetrics {
 
 struct PreparedKey {
     snapshot: Option<Arc<TimelineSnapshot>>,
-    bounds: Rect,
-    axis_width: f32,
-    start_label_width: f32,
+    bounds: LogicalRect,
+    axis_width: LogicalPx,
+    start_label_width: LogicalPx,
     hovered: Option<(Side, usize)>,
     colors: TimelineColors,
     language: LanguageCode,
@@ -708,9 +717,9 @@ impl PreparedKey {
     fn matches(
         &self,
         snapshot: &Option<Arc<TimelineSnapshot>>,
-        bounds: Rect,
-        axis_width: f32,
-        start_label_width: f32,
+        bounds: LogicalRect,
+        axis_width: LogicalPx,
+        start_label_width: LogicalPx,
         hovered: Option<(Side, usize)>,
         colors: TimelineColors,
         language: LanguageCode,
@@ -740,7 +749,7 @@ pub(super) struct TimelinePaint {
     prepared: Option<PreparedKey>,
     painted_text: Vec<Arc<ShapedTextHandle>>,
     hovered: Option<(Side, usize)>,
-    empty_bounds: Option<Rect>,
+    empty_bounds: Option<LogicalRect>,
     a11y_language: Option<LanguageCode>,
 }
 
@@ -765,7 +774,7 @@ impl TimelinePaint {
         snapshot: Option<&Arc<TimelineSnapshot>>,
         precision: &DisplayPrecision,
         language: Signal<LanguageCode>,
-        hover: Option<Point>,
+        hover: Option<LogicalPoint>,
     ) -> Result<(), EngineError> {
         let Some(node) = self.node else {
             return Ok(());
@@ -774,7 +783,7 @@ impl TimelinePaint {
             return Ok(());
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 || !bounds.is_finite() {
+        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) || !bounds.is_finite() {
             return Ok(());
         }
 
@@ -814,7 +823,7 @@ impl TimelinePaint {
             if label_widths.0 + label_widths.1 + AXIS_LABEL_GAP * 2.0 < plot_width {
                 label_widths
             } else {
-                (0.0, 0.0)
+                (px(0.0), px(0.0))
             };
         let axis_width = axis_line_width(plot_width, start_label_width, end_label_width);
         let geometry = self
@@ -867,7 +876,7 @@ impl TimelinePaint {
             snapshot,
             buckets: &self.data.buckets,
             geometry: &geometry,
-            labels: if start_label_width > 0.0 {
+            labels: if start_label_width > px(0.0) {
                 labels
             } else {
                 (None, None)
@@ -911,12 +920,12 @@ impl TimelinePaint {
         &mut self,
         app: &mut App,
         labels: (SmolStr, SmolStr),
-        font_size: f32,
+        font_size: LogicalPx,
         color: Color,
         text_scale: f32,
     ) -> (
         (Option<Arc<ShapedTextHandle>>, Option<Arc<ShapedTextHandle>>),
-        (f32, f32),
+        (LogicalPx, LogicalPx),
     ) {
         let current = self.labels.as_ref().is_some_and(|metrics| {
             metrics.matches(&labels, color, font_size, text_scale)
@@ -946,9 +955,9 @@ impl TimelinePaint {
 
     fn resolve_hover(
         &mut self,
-        hover: Option<Point>,
+        hover: Option<LogicalPoint>,
         geometry: &TimelineGeometry,
-        bounds: Rect,
+        bounds: LogicalRect,
     ) -> Option<(Side, usize)> {
         let Some(point) = hover.filter(|point| point.x.is_finite() && point.y.is_finite()) else {
             self.hovered = None;
@@ -987,7 +996,7 @@ pub(super) fn build_canvas(
     parent: NodeId,
     theme: ThemeHandle,
 ) -> Result<NodeId, EngineError> {
-    NodeBuilder::canvas(Canvas::new(Rect::default()))
+    NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
         .id(TIMELINE_SELECTOR)
         .style(
             StyleBuilder::new()
@@ -1004,8 +1013,8 @@ pub(super) fn build_canvas(
         .build(tree, parent)
 }
 
-fn tooltip_row_limit(height: f32) -> usize {
-    if !height.is_finite() || height <= 0.0 {
+fn tooltip_row_limit(height: LogicalPx) -> usize {
+    if !height.is_finite() || height <= px(0.0) {
         return 0;
     }
     let available = height - TOOLTIP_GAP * 2.0 - TOOLTIP_PADDING * 2.0;
@@ -1013,10 +1022,15 @@ fn tooltip_row_limit(height: f32) -> usize {
     rows.min(TOOLTIP_VISIBLE_ROWS)
 }
 
-fn tooltip_panel(marker: &MarkerGeometry, width: f32, height: f32, rows: usize) -> Rect {
-    let panel_width = TOOLTIP_WIDTH.min((width - TOOLTIP_GAP * 2.0).max(1.0));
-    let panel_height = (rows as f32 * TOOLTIP_ROW_HEIGHT + TOOLTIP_PADDING * 2.0)
-        .min((height - TOOLTIP_GAP * 2.0).max(1.0));
+fn tooltip_panel(
+    marker: &MarkerGeometry,
+    width: LogicalPx,
+    height: LogicalPx,
+    rows: usize,
+) -> LogicalRect {
+    let panel_width = TOOLTIP_WIDTH.min((width - TOOLTIP_GAP * 2.0).max(px(1.0)));
+    let panel_height = (TOOLTIP_ROW_HEIGHT * rows as f32 + TOOLTIP_PADDING * 2.0)
+        .min((height - TOOLTIP_GAP * 2.0).max(px(1.0)));
     let center = marker.bounds.origin.x + marker.bounds.size.width / 2.0;
     let left = (center - panel_width / 2.0).clamp(
         TOOLTIP_GAP,
@@ -1030,7 +1044,7 @@ fn tooltip_panel(marker: &MarkerGeometry, width: f32, height: f32, rows: usize) 
         TOOLTIP_GAP,
         (height - panel_height - TOOLTIP_GAP).max(TOOLTIP_GAP),
     );
-    Rect::new(left, top, panel_width, panel_height)
+    LogicalRect::new(left, top, panel_width, panel_height)
 }
 
 struct TextPainter<'a> {
@@ -1048,7 +1062,7 @@ impl TextPainter<'_> {
         Some(self.cache.line(self.app, text, style))
     }
 
-    fn place(&mut self, canvas: &mut Canvas, line: &Arc<ShapedTextHandle>, origin: Point) {
+    fn place(&mut self, canvas: &mut Canvas, line: &Arc<ShapedTextHandle>, origin: LogicalPoint) {
         if canvas.push_shaped_text(line, origin) {
             self.used.push(line.clone());
         } else {
@@ -1059,11 +1073,11 @@ impl TextPainter<'_> {
 
 struct Frame<'a> {
     app: &'a mut App,
-    bounds: Rect,
+    bounds: LogicalRect,
     colors: TimelineColors,
-    axis_font: f32,
-    marker_font: f32,
-    border_width: f32,
+    axis_font: LogicalPx,
+    marker_font: LogicalPx,
+    border_width: LogicalPx,
     translate: &'a Translate,
     precision: &'a DisplayPrecision,
     now: i64,
@@ -1096,7 +1110,7 @@ impl Frame<'_> {
         let mut canvas = Canvas::new(bounds);
         let _ = canvas.push_clip(ClipRect {
             rect: bounds,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         let mut text = TextPainter {
             app,
@@ -1142,7 +1156,7 @@ impl Frame<'_> {
                 continue;
             };
             let size = line.size();
-            let center = Point::new(
+            let center = LogicalPoint::new(
                 marker.bounds.origin.x + (marker.bounds.size.width - size.width) / 2.0,
                 marker.bounds.origin.y + (marker.bounds.size.height - size.height) / 2.0,
             );
@@ -1151,7 +1165,7 @@ impl Frame<'_> {
 
         if let Some(start) = &labels.0 {
             let size = start.size();
-            let position = Point::new(
+            let position = LogicalPoint::new(
                 geometry.axis.origin.x - AXIS_LABEL_GAP - size.width,
                 geometry.axis.origin.y - size.height / 2.0,
             );
@@ -1159,7 +1173,7 @@ impl Frame<'_> {
         }
         if let Some(end) = &labels.1 {
             let size = end.size();
-            let position = Point::new(
+            let position = LogicalPoint::new(
                 geometry.axis.max().x + AXIS_LABEL_GAP,
                 geometry.axis.origin.y - size.height / 2.0,
             );
@@ -1193,10 +1207,10 @@ impl Frame<'_> {
 }
 
 struct TooltipFrame<'a> {
-    bounds: Rect,
+    bounds: LogicalRect,
     colors: TimelineColors,
-    border_width: f32,
-    font: f32,
+    border_width: LogicalPx,
+    font: LogicalPx,
     geometry: &'a TimelineGeometry,
     snapshot: &'a TimelineSnapshot,
     precision: &'a DisplayPrecision,
@@ -1237,7 +1251,7 @@ impl TooltipFrame<'_> {
         });
         let _ = canvas.push_clip(ClipRect {
             rect: panel.translate(origin),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
 
         let quantity_style = text_style(self.font, self.colors.neutral);
@@ -1245,7 +1259,7 @@ impl TooltipFrame<'_> {
         let right = origin.x + panel.max().x - TOOLTIP_PADDING;
         for (offset, row) in rows.iter().take(shown).enumerate() {
             let top =
-                origin.y + panel.origin.y + TOOLTIP_PADDING + offset as f32 * TOOLTIP_ROW_HEIGHT;
+                origin.y + panel.origin.y + TOOLTIP_PADDING + TOOLTIP_ROW_HEIGHT * offset as f32;
             let quantity = format_smolstr!(
                 "{} @ {}",
                 row.quantity_text(self.precision, self.translate),
@@ -1258,26 +1272,27 @@ impl TooltipFrame<'_> {
             let Some(quantity_line) = text.line(&quantity, &quantity_style) else {
                 continue;
             };
-            let line_height = quantity_line.size().height;
-            let line_top = top + (TOOLTIP_ROW_HEIGHT - line_height) / 2.0;
+            let line_top = top + (TOOLTIP_ROW_HEIGHT - quantity_line.size().height) / 2.0;
             text.place(
                 canvas,
                 &quantity_line,
-                Point::new(origin.x + panel.origin.x + TOOLTIP_PADDING, line_top),
+                LogicalPoint::new(origin.x + panel.origin.x + TOOLTIP_PADDING, line_top),
             );
 
             let age_line = text.line(&age, &muted_style);
             let label_line = text.line(&label, &label_style);
-            let age_width = age_line.as_ref().map_or(0.0, |line| line.size().width);
-            let label_width = label_line.as_ref().map_or(0.0, |line| line.size().width);
+            let age_width = age_line.as_ref().map_or(px(0.0), |line| line.size().width);
+            let label_width = label_line
+                .as_ref()
+                .map_or(px(0.0), |line| line.size().width);
             if let Some(line) = &age_line {
-                text.place(canvas, line, Point::new(right - age_width, line_top));
+                text.place(canvas, line, LogicalPoint::new(right - age_width, line_top));
             }
             if let Some(line) = &label_line {
                 text.place(
                     canvas,
                     line,
-                    Point::new(right - age_width - AXIS_LABEL_GAP - label_width, line_top),
+                    LogicalPoint::new(right - age_width - AXIS_LABEL_GAP - label_width, line_top),
                 );
             }
         }
@@ -1327,7 +1342,7 @@ mod tests {
             ),
         ]);
 
-        let assigned = build_buckets(&snapshot, 560.0)
+        let assigned = build_buckets(&snapshot, px(560.0))
             .iter()
             .map(|bucket| bucket.fill_indices.len())
             .sum::<usize>();
@@ -1347,7 +1362,7 @@ mod tests {
             .into(),
         };
 
-        assert!(build_buckets(&snapshot, 560.0).is_empty());
+        assert!(build_buckets(&snapshot, px(560.0)).is_empty());
     }
 
     #[test]
@@ -1356,7 +1371,7 @@ mod tests {
             fill(&address("1"), &listing(), Side::Buy, "1", "1", 1, 1),
             fill(&address("1"), &listing(), Side::Buy, "1", "1", 2, 2),
         ]);
-        let bucket = build_buckets(&snapshot, 560.0)
+        let bucket = build_buckets(&snapshot, px(560.0))
             .into_iter()
             .find(|bucket| bucket.side == Side::Buy)
             .expect("a buy bucket should exist");
@@ -1368,18 +1383,18 @@ mod tests {
 
     #[test]
     fn bucket_count_and_width_follow_plot_width() {
-        assert_eq!(bucket_count(23.0), 1);
-        assert_eq!(bucket_count(560.0), 23);
-        assert_eq!(bucket_count(576.0), 24);
-        assert_eq!(bucket_width_millis(560.0), (WINDOW_MILLIS + 22) / 23);
-        assert_eq!(bucket_width_millis(f32::MAX), 1);
+        assert_eq!(bucket_count(px(23.0)), 1);
+        assert_eq!(bucket_count(px(560.0)), 23);
+        assert_eq!(bucket_count(px(576.0)), 24);
+        assert_eq!(bucket_width_millis(px(560.0)), (WINDOW_MILLIS + 22) / 23);
+        assert_eq!(bucket_width_millis(px(f32::MAX)), 1);
     }
 
     #[test]
     fn axis_line_width_reserves_both_endpoint_labels() {
-        let line_width = axis_line_width(560.0, 48.0, 24.0);
+        let line_width = axis_line_width(px(560.0), px(48.0), px(24.0));
 
-        assert_eq!(line_width, 472.0);
+        assert_eq!(line_width, px(472.0));
         assert_eq!(bucket_count(line_width), 19);
     }
 
@@ -1429,7 +1444,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
-        let bucket = build_buckets(&snapshot, 560.0)
+        let bucket = build_buckets(&snapshot, px(560.0))
             .into_iter()
             .find(|bucket| bucket.side == Side::Buy)
             .expect("a buy bucket should exist");
@@ -1457,7 +1472,7 @@ mod tests {
                 fill_indices: vec![2],
             },
         ];
-        let geometry = TimelineGeometry::new(&buckets, 472.0, 48.0);
+        let geometry = TimelineGeometry::new(&buckets, px(472.0), px(48.0));
         assert!(
             geometry
                 .markers
@@ -1475,13 +1490,20 @@ mod tests {
                 .markers
                 .iter()
                 .filter(|marker| marker.side == Side::Buy)
-                .all(|marker| marker.connector.size.height > 0.0)
+                .all(|marker| marker.connector.size.height > px(0.0))
         );
     }
 
     #[test]
     fn marker_gap_is_preserved_across_supported_plot_widths() {
-        for plot_width in [472.0, 560.0, 768.0, 1_024.0, 1_536.0, 2_048.0] {
+        for plot_width in [
+            px(472.0),
+            px(560.0),
+            px(768.0),
+            px(1_024.0),
+            px(1_536.0),
+            px(2_048.0),
+        ] {
             let count = bucket_count(plot_width);
             let buckets = (0..count)
                 .map(|index| TimelineBucket {
@@ -1490,7 +1512,7 @@ mod tests {
                     fill_indices: vec![index],
                 })
                 .collect::<Vec<_>>();
-            let geometry = TimelineGeometry::new(&buckets, plot_width, 48.0);
+            let geometry = TimelineGeometry::new(&buckets, plot_width, px(48.0));
             for pair in geometry.markers.windows(2) {
                 assert!(
                     pair[1].bounds.origin.x - pair[0].bounds.max().x >= MARKER_GAP - 0.01,
@@ -1509,7 +1531,7 @@ mod tests {
         }];
 
         assert!(
-            TimelineGeometry::new(&buckets, 560.0, 48.0)
+            TimelineGeometry::new(&buckets, px(560.0), px(48.0))
                 .markers
                 .is_empty()
         );
@@ -1529,7 +1551,7 @@ mod tests {
                 fill_indices: vec![1],
             },
         ];
-        let geometry = TimelineGeometry::new(&buckets, 560.0, 48.0);
+        let geometry = TimelineGeometry::new(&buckets, px(560.0), px(48.0));
         let [buy, sell] = geometry.markers.as_ref() else {
             panic!("expected one buy and one sell marker");
         };
@@ -1540,10 +1562,10 @@ mod tests {
 
     #[test]
     fn narrow_slots_use_available_space_to_keep_markers_separate() {
-        let size = marker_size(20.0);
+        let size = marker_size(px(20.0));
 
-        assert_eq!(size, 14.0);
-        assert!(20.0 - size >= MARKER_GAP);
+        assert_eq!(size, px(14.0));
+        assert!(px(20.0) - size >= MARKER_GAP);
     }
 
     #[test]
@@ -1557,11 +1579,11 @@ mod tests {
             1,
             1,
         )]);
-        let buckets: Arc<[TimelineBucket]> = build_buckets(&snapshot, 472.0).into();
+        let buckets: Arc<[TimelineBucket]> = build_buckets(&snapshot, px(472.0)).into();
         let mut cache = PaintCache::default();
 
-        let first = cache.geometry(&buckets, 472.0, 48.0);
-        let second = cache.geometry(&buckets, 472.0, 48.0);
+        let first = cache.geometry(&buckets, px(472.0), px(48.0));
+        let second = cache.geometry(&buckets, px(472.0), px(48.0));
 
         assert!(Arc::ptr_eq(&first, &second));
     }
@@ -1577,11 +1599,11 @@ mod tests {
             1,
             1,
         )]);
-        let buckets: Arc<[TimelineBucket]> = build_buckets(&snapshot, 472.0).into();
+        let buckets: Arc<[TimelineBucket]> = build_buckets(&snapshot, px(472.0)).into();
         let mut cache = PaintCache::default();
 
-        let first = cache.geometry(&buckets, 472.0, 48.0);
-        let second = cache.geometry(&buckets, 576.0, 48.0);
+        let first = cache.geometry(&buckets, px(472.0), px(48.0));
+        let second = cache.geometry(&buckets, px(576.0), px(48.0));
 
         assert!(!Arc::ptr_eq(&first, &second));
     }
@@ -1621,13 +1643,13 @@ mod tests {
         data.replace_snapshot(Some(&snapshot));
         let before = data.buckets.clone();
 
-        assert!(data.set_plot_width(320.0));
+        assert!(data.set_plot_width(px(320.0)));
         assert!(
             !Arc::ptr_eq(&before, &data.buckets),
             "the fills are assigned to the slots of the new plot width"
         );
         assert!(
-            !data.set_plot_width(320.0),
+            !data.set_plot_width(px(320.0)),
             "the same width is not a change"
         );
         assert_eq!(data.buckets.len(), 1);
@@ -1647,19 +1669,19 @@ mod tests {
         let mut data = TimelineData::default();
         data.replace_snapshot(Some(&snapshot));
 
-        assert!(data.set_plot_width(575.9));
+        assert!(data.set_plot_width(px(575.9)));
         assert_eq!(bucket_count(data.plot_width), 23);
-        assert!(data.set_plot_width(576.1));
+        assert!(data.set_plot_width(px(576.1)));
         assert_eq!(bucket_count(data.plot_width), 24);
     }
 
     #[test]
     fn a_non_finite_dimension_should_not_poison_the_plot_width() {
         let mut data = TimelineData::default();
-        assert!(data.set_plot_width(560.0));
+        assert!(data.set_plot_width(px(560.0)));
 
-        assert!(data.set_plot_width(f32::NAN));
-        assert_eq!(data.plot_width, 1.0);
+        assert!(data.set_plot_width(px(f32::NAN)));
+        assert_eq!(data.plot_width, px(1.0));
         assert_eq!(bucket_count(data.plot_width), 1);
     }
 
@@ -1679,7 +1701,7 @@ mod tests {
     }
 
     impl TimelineHarness {
-        fn sync(&mut self, hover: Option<Point>) {
+        fn sync(&mut self, hover: Option<LogicalPoint>) {
             let Self {
                 app,
                 paint,
@@ -1709,7 +1731,7 @@ mod tests {
         }
     }
 
-    fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
+    fn page(app: &mut WidgetTestApp, width: LogicalPx, height: LogicalPx) -> NodeId {
         app.with_cx(|cx| {
             let root = cx.tree().root();
             NodeBuilder::boxed()
@@ -1728,7 +1750,7 @@ mod tests {
 
     fn harness(snapshot: Option<Arc<TimelineSnapshot>>) -> TimelineHarness {
         let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
-        let window_page = page(&mut app, 720.0, HEIGHT);
+        let window_page = page(&mut app, px(720.0), HEIGHT);
         let node = app
             .with_cx(|cx| {
                 let theme = cx.theme().clone();
@@ -1756,7 +1778,7 @@ mod tests {
         ]))))
     }
 
-    fn quads(harness: &TimelineHarness) -> Vec<Rect> {
+    fn quads(harness: &TimelineHarness) -> Vec<LogicalRect> {
         harness
             .primitives()
             .into_iter()
@@ -1790,7 +1812,7 @@ mod tests {
     #[test]
     fn a_canvas_that_was_never_written_paints_no_primitives() {
         let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
-        let page = page(&mut app, 720.0, HEIGHT);
+        let page = page(&mut app, px(720.0), HEIGHT);
         let node = app
             .with_cx(|cx| {
                 let theme = cx.theme().clone();
@@ -1918,7 +1940,7 @@ mod tests {
             .marker(Side::Buy, 0)
             .copied()
             .expect("the buy bucket has a marker");
-        let point = Point::new(
+        let point = LogicalPoint::new(
             marker.bounds.origin.x + marker.bounds.size.width / 2.0,
             marker.bounds.origin.y + marker.bounds.size.height / 2.0,
         );
@@ -1951,7 +1973,7 @@ mod tests {
             "the two labels, the marker's letter, and three lines for each of the newest six fills"
         );
 
-        harness.sync(Some(Point::new(1.0, 1.0)));
+        harness.sync(Some(LogicalPoint::new(px(1.0), px(1.0))));
         harness.app.drain();
         assert_eq!(
             glyph_runs(&harness),
@@ -1985,7 +2007,7 @@ mod tests {
     #[test]
     fn a_canvas_that_the_layout_has_not_measured_is_left_alone() {
         let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
-        let page = page(&mut app, 720.0, HEIGHT);
+        let page = page(&mut app, px(720.0), HEIGHT);
         let node = app
             .with_cx(|cx| {
                 let theme = cx.theme().clone();

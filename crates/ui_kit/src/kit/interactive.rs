@@ -7,6 +7,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event, InputEvent, PointerButton},
     interaction::{ActionCtx, AnimatedValue, AnimationSpec, Easing},
+    math::LogicalPx,
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -34,7 +35,7 @@ use crate::{
     },
 };
 
-const CORNER_RADIUS: f32 = 4.0;
+const CORNER_RADIUS: LogicalPx = LogicalPx::new(4.0);
 
 const CLICK_ACTION_SUFFIX: &str = ".click";
 
@@ -72,7 +73,7 @@ pub struct Interactive {
     tooltip: Option<SmolStr>,
     action: Option<Action>,
     callback: Option<Rc<dyn Fn(&mut ActionCtx<'_>)>>,
-    corner_radii: [f32; 4],
+    corner_radii: [LogicalPx; 4],
     tab_stop: bool,
     chrome: bool,
 }
@@ -243,13 +244,13 @@ impl Interactive {
     }
 
     #[must_use]
-    pub fn corner_radius(mut self, radius: f32) -> Self {
+    pub fn corner_radius(mut self, radius: LogicalPx) -> Self {
         self.corner_radii = [radius; 4];
         self
     }
 
     #[must_use]
-    pub fn corner_radii(mut self, radii: [f32; 4]) -> Self {
+    pub fn corner_radii(mut self, radii: [LogicalPx; 4]) -> Self {
         self.corner_radii = radii;
         self
     }
@@ -739,27 +740,21 @@ pub(crate) fn mount_dynamic_icon(
     window: WindowId,
     parent: NodeId,
     kind: crate::kit::icon::IconKind,
-    size: f32,
+    size: LogicalPx,
     bind_style: impl Fn(&mut ReadCtx<'_>) -> StylePatch + 'static,
 ) -> Result<NodeId, EngineError> {
     debug_assert!(
-        size.is_finite() && size > 0.0,
+        size.is_finite() && size > LogicalPx::ZERO,
         "icon size must be a positive logical length"
     );
-    let scale = app
-        .window(window)
-        .ok_or(EngineError::UnknownWindow { window })?
-        .scale()
-        .factor();
-    let resource = app.resources_mut().insert_owned_svg_for_display(
+    let resource = app.insert_svg_for_window(
         window,
         crate::kit::icon::svg(kind).as_bytes(),
-        ui_core::math::Size::new(size, size),
-        scale,
+        crate::kit::icon::ICON_INTRINSIC_SIZE,
     )?;
     let mut style = ui_core::paint::style::Style::default();
     style.size_length(size, size);
-    NodeBuilder::image(resource.id, ui_core::node::image::ImageFit::Fill)
+    NodeBuilder::image(resource.id(), ui_core::node::image::ImageFit::Fill)
         .style(style)
         .bind_style(bind_style)
         .a11y(A11yOverride {
@@ -782,7 +777,7 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{ActionSource, Event, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::Point,
+        math::{LogicalPoint, px},
         node::{dirty::DirtyFlags, id::NodeId},
         paint::{
             color::{Color, ColorResolver},
@@ -836,9 +831,9 @@ mod tests {
         let _ = harness.app.drain().expect("frame");
     }
 
-    fn center(app: &TestApp, node: NodeId) -> Point {
+    fn center(app: &TestApp, node: NodeId) -> LogicalPoint {
         let bounds = app.probe().bounds(node).expect("bounds");
-        Point::new(
+        LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         )
@@ -897,7 +892,7 @@ mod tests {
         assert_color(patch(&harness).background, recipe.background, "背景配方");
         assert_color(patch(&harness).foreground, recipe.foreground, "前景配方");
 
-        let point = Point::new(400.0, 300.0);
+        let point = LogicalPoint::new(px(400.0), px(300.0));
         let _ = harness
             .app
             .inject(InputEvent::pointer_move(point, Modifiers::empty()));
@@ -1002,7 +997,7 @@ mod tests {
         settle(&mut harness);
         assert!(harness.interactive.focused(harness.app.app()));
         let border = patch(&harness).border.expect("焦点边框");
-        assert_eq!(border.width, 2.0, "焦点环是 2 px");
+        assert_eq!(border.width, px(2.0), "焦点环是 2 px");
         assert_eq!(
             resolved(border.color),
             resolved(light_theme().role(crate::theme::role::Role::LineFocus))
@@ -1011,7 +1006,7 @@ mod tests {
         let _ = harness.interactive.sync(harness.app.app_mut());
         settle(&mut harness);
         assert!(!harness.interactive.focused(harness.app.app()));
-        assert_eq!(patch(&harness).border.expect("普通边框").width, 1.0);
+        assert_eq!(patch(&harness).border.expect("普通边框").width, px(1.0));
     }
 
     #[test]
@@ -1323,13 +1318,13 @@ mod tests {
         let layout = tree.get(node).expect("node").style();
         assert_eq!(
             layout.inner().size.height,
-            Dimension::length(UnifiedSize::Large.h())
+            Dimension::length(UnifiedSize::Large.h().value())
         );
         assert_eq!(
             layout.inner().padding.left,
             taffy::style::LengthPercentage::length(10.0)
         );
         let bounds = app.probe().bounds(node).expect("bounds");
-        assert!(bounds.size.height >= UnifiedSize::Large.h() - 0.5);
+        assert!(bounds.size.height.value() >= UnifiedSize::Large.h().value() - 0.5);
     }
 }

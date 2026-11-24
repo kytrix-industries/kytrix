@@ -11,7 +11,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     interaction::ActionCtx,
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -312,8 +312,8 @@ impl DialogBuilder {
             key,
             OverlayOptions {
                 placement: Placement::TOP_START,
-                gap: 0.0,
-                margin: 0.0,
+                gap: LogicalPx::ZERO,
+                margin: LogicalPx::ZERO,
                 flip: false,
                 dismiss: self.config.dismiss,
                 modal: true,
@@ -372,7 +372,10 @@ impl Dialog {
         self.inner
             .overlay
             .set_a11y(self.inner.config.a11y(title.as_str()));
-        let anchor = Anchor::point(Point::new(viewport.width * 0.5, viewport.height * 0.5));
+        let anchor = Anchor::point(LogicalPoint::new(
+            viewport.width * 0.5,
+            viewport.height * 0.5,
+        ));
         let opened = self.inner.overlay.open(
             app,
             window,
@@ -549,8 +552,8 @@ impl Dialog {
                 StyleBuilder::new()
                     .flex_col()
                     .relative()
-                    .width(self.inner.config.width)
-                    .gap(CONTENT_GAP)
+                    .width(px(self.inner.config.width))
+                    .gap(px(CONTENT_GAP))
                     .build(),
             )
             .build(tree_mut(app, window)?, panel)?;
@@ -558,7 +561,7 @@ impl Dialog {
             let title_theme = self.inner.theme.clone();
             let title = self.inner.title;
             NodeBuilder::text(self.inner.config.title.clone(), {
-                let mut style = TextStyle::new(TITLE_SIZE);
+                let mut style = TextStyle::new(px(TITLE_SIZE));
                 style.weight = 700;
                 style.alignment = TextAlign::Center;
                 style
@@ -578,7 +581,7 @@ impl Dialog {
                 StyleBuilder::new()
                     .flex_col()
                     .width_full()
-                    .gap(CONTENT_GAP)
+                    .gap(px(CONTENT_GAP))
                     .build(),
             )
             .build(tree_mut(app, window)?, root)?;
@@ -704,14 +707,16 @@ impl Dialog {
         else {
             return false;
         };
-        let desired = Point::new(
-            ((viewport.width - bounds.size.width) * 0.5).max(0.0),
-            ((viewport.height - bounds.size.height) * 0.5).max(0.0),
+        let desired = LogicalPoint::new(
+            ((viewport.width - bounds.size.width) * 0.5).max(px(0.0)),
+            ((viewport.height - bounds.size.height) * 0.5).max(px(0.0)),
         );
-        if (bounds.origin.x - desired.x).abs() < 0.5 && (bounds.origin.y - desired.y).abs() < 0.5 {
+        if (bounds.origin.x - desired.x).abs().value() < 0.5
+            && (bounds.origin.y - desired.y).abs().value() < 0.5
+        {
             return false;
         }
-        let anchor = Anchor::point(Point::new(desired.x, desired.y + bounds.size.height));
+        let anchor = Anchor::point(LogicalPoint::new(desired.x, desired.y + bounds.size.height));
         self.inner
             .overlay
             .open(
@@ -788,14 +793,13 @@ fn position_close_button(app: &mut App, window: WindowId, node: NodeId) -> Resul
     let mut style = tree.get(node)?.style().clone();
     style
         .position(Position::Absolute)
-        .inset_top(0.0)
-        .inset_right(0.0);
+        .inset_top(px(0.0))
+        .inset_right(px(0.0));
     tree.set_style(node, style)
 }
 
 #[cfg(test)]
 mod tests {
-
     use std::{cell::Cell, rc::Rc, time::Duration};
 
     use smol_str::{SmolStr, format_smolstr};
@@ -803,7 +807,7 @@ mod tests {
         a11y::A11yRole,
         app::App,
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect, Size},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal},
         paint::{
             color::Color,
@@ -825,7 +829,7 @@ mod tests {
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
-    const VIEWPORT: Size = Size::new(800.0, 600.0);
+    const VIEWPORT: LogicalSize = LogicalSize::new(px(800.0), px(600.0));
 
     struct Harness {
         app: TestApp,
@@ -883,13 +887,13 @@ mod tests {
             let _ = dialog.sync(self.app.app_mut()).expect("同步");
         }
 
-        fn bounds(&self, node: NodeId) -> Rect {
+        fn bounds(&self, node: NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("布局盒")
         }
 
-        fn center(&self, node: NodeId) -> Point {
+        fn center(&self, node: NodeId) -> LogicalPoint {
             let bounds = self.bounds(node);
-            Point::new(
+            LogicalPoint::new(
                 bounds.origin.x + bounds.size.width * 0.5,
                 bounds.origin.y + bounds.size.height * 0.5,
             )
@@ -900,7 +904,7 @@ mod tests {
             self.click_at(point);
         }
 
-        fn click_at(&mut self, point: Point) {
+        fn click_at(&mut self, point: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 point,
                 PointerButton::Primary,
@@ -965,7 +969,12 @@ mod tests {
                     .tree_mut();
                 NodeBuilder::boxed()
                     .id("background")
-                    .layout_override(Rect::new(0.0, 0.0, VIEWPORT.width, VIEWPORT.height))
+                    .layout_override(LogicalRect::new(
+                        px(0.0),
+                        px(0.0),
+                        VIEWPORT.width,
+                        VIEWPORT.height,
+                    ))
                     .paint(PaintBuilder::new().background(Color::WHITE).build())
                     .on_click(action.clone())
                     .build(tree, self.root)
@@ -1011,7 +1020,12 @@ mod tests {
                 .tree_mut();
             let node = NodeBuilder::boxed()
                 .id("body-box")
-                .style(StyleBuilder::new().width(width).height(height).build())
+                .style(
+                    StyleBuilder::new()
+                        .width(px(width))
+                        .height(px(height))
+                        .build(),
+                )
                 .paint(PaintBuilder::new().background(Color::WHITE).build())
                 .build(tree, parent)?;
             *tracked.borrow_mut() = Some(node);
@@ -1029,7 +1043,7 @@ mod tests {
         }
     }
 
-    fn quad_alpha(app: &App, window: WindowId, bounds: Rect) -> Option<f32> {
+    fn quad_alpha(app: &App, window: WindowId, bounds: LogicalRect) -> Option<f32> {
         app.window(window)?
             .scene()
             .iter()
@@ -1083,16 +1097,16 @@ mod tests {
         let panel = dialog.panel_node().expect("面板");
         let bounds = harness.bounds(panel);
         assert!(
-            (bounds.origin.x - (VIEWPORT.width - bounds.size.width) * 0.5).abs() < 0.5,
+            (bounds.origin.x - (VIEWPORT.width - bounds.size.width) * 0.5).abs() < px(0.5),
             "面板水平居中：{bounds:?}"
         );
         assert!(
-            (bounds.origin.y - (VIEWPORT.height - bounds.size.height) * 0.5).abs() < 0.5,
+            (bounds.origin.y - (VIEWPORT.height - bounds.size.height) * 0.5).abs() < px(0.5),
             "面板垂直居中：{bounds:?}"
         );
         assert_eq!(
             bounds.size.width,
-            384.0 + 16.0,
+            px(384.0 + 16.0),
             "面板宽度 = 内容宽度 384 + 两侧各 8 px 内边距"
         );
     }
@@ -1139,18 +1153,20 @@ mod tests {
             );
         }
         assert!(
-            ok.size.width > 0.0 && cancel.size.width > 0.0 && ok.origin.y == cancel.origin.y,
+            ok.size.width > px(0.0)
+                && cancel.size.width > px(0.0)
+                && ok.origin.y == cancel.origin.y,
             "按钮行上的两个按钮等分同一行"
         );
         assert!(
-            (ok.size.width - cancel.size.width).abs() < 0.5,
+            (ok.size.width - cancel.size.width).abs() < px(0.5),
             "确认 / 取消必须等分按钮行：{ok:?} / {cancel:?}"
         );
         assert!(
             close.origin.x > panel.origin.x + panel.size.width * 0.5,
             "关闭按钮在内容列右上角：{close:?}"
         );
-        assert_eq!(body.size.height, 30.0, "内容列高度 = 自定义内容高度");
+        assert_eq!(body.size.height, px(30.0), "内容列高度 = 自定义内容高度");
     }
 
     #[test]
@@ -1271,7 +1287,7 @@ mod tests {
                 .on_close(record_close(reason.clone())),
             "explicit",
         );
-        harness.click_at(Point::new(10.0, 10.0));
+        harness.click_at(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = dialog.sync(harness.app.app_mut()).expect("同步");
         assert!(
             dialog.is_open(harness.app.app()),
@@ -1296,7 +1312,7 @@ mod tests {
                 .on_close(record_close(reason.clone())),
             "outside",
         );
-        harness.click_at(Point::new(10.0, 10.0));
+        harness.click_at(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = dialog.sync(harness.app.app_mut()).expect("同步");
         assert!(
             !dialog.is_open(harness.app.app()),
@@ -1318,7 +1334,7 @@ mod tests {
                 .tree_mut();
             NodeBuilder::boxed()
                 .id("trigger")
-                .layout_override(Rect::new(10.0, 10.0, 100.0, 40.0))
+                .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(40.0)))
                 .on_click(trigger_action)
                 .build(tree, harness.root)
                 .expect("触发器")
@@ -1359,7 +1375,7 @@ mod tests {
             dialog.overlay_node(),
             "最上层模态作用域 = 对话框浮层包装节点"
         );
-        harness.click_at(Point::new(20.0, 20.0));
+        harness.click_at(LogicalPoint::new(px(20.0), px(20.0)));
         assert_eq!(*harness.app.app().read(&clicks), 0, "模态期间背景不可交互");
     }
 
@@ -1842,7 +1858,7 @@ mod tests {
             menu.open(
                 harness.app.app_mut(),
                 harness.window,
-                Anchor::point(Point::new(40.0, 40.0)),
+                Anchor::point(LogicalPoint::new(px(40.0), px(40.0))),
                 |_, _| Ok(())
             )
             .expect("打开菜单")

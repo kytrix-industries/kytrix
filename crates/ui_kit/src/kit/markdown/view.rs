@@ -4,15 +4,14 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    math::{Point, Size},
+    math::{LogicalPoint, LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
     paint::{
         color::Color,
         style::StylePatch,
         style_builder::{PaintBuilder, StyleBuilder},
     },
-    resources::ResourceCache,
-    text::{InlineBoxPaint, TextAlign, TextStyle, TextWrap},
+    text::{TextAlign, TextStyle, TextWrap},
     window::{Window, WindowId},
 };
 
@@ -20,24 +19,23 @@ use crate::{
     kit::markdown::{
         document::{LinkId, MarkdownBlock, MarkdownDocument, MarkdownPiece, ParagraphAlign},
         inline_flow::{FlowStyle, ImagePaintSource, LinkSpan, flow},
-        source::{InlineImageFormat, MarkdownAssets},
     },
     theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
 };
 
 const LINE_HEIGHT: f32 = 1.4;
-const BLOCK_GAP: f32 = 8.0;
-const HEADING_SPACE_ABOVE: f32 = 8.0;
-const CODE_PADDING: f32 = 8.0;
-const CODE_RADIUS: f32 = 4.0;
-const QUOTE_BORDER_WIDTH: f32 = 3.0;
-const QUOTE_PADDING: f32 = 8.0;
-const LIST_MARKER_WIDTH: f32 = 20.0;
-const CELL_PADDING: f32 = 4.0;
+const BLOCK_GAP: LogicalPx = LogicalPx::new(8.0);
+const HEADING_SPACE_ABOVE: LogicalPx = LogicalPx::new(8.0);
+const CODE_PADDING: LogicalPx = LogicalPx::new(8.0);
+const CODE_RADIUS: LogicalPx = LogicalPx::new(4.0);
+const QUOTE_BORDER_WIDTH: LogicalPx = LogicalPx::new(3.0);
+const QUOTE_PADDING: LogicalPx = LogicalPx::new(8.0);
+const LIST_MARKER_WIDTH: LogicalPx = LogicalPx::new(20.0);
+const CELL_PADDING: LogicalPx = LogicalPx::new(4.0);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownStyle {
-    pub body_size: f32,
+    pub body_size: LogicalPx,
     pub line_height: f32,
     pub foreground: Color,
     pub muted: Color,
@@ -68,11 +66,11 @@ impl MarkdownStyle {
         }
     }
 
-    pub fn line_height(&self) -> f32 {
+    pub fn line_height(&self) -> LogicalPx {
         self.body_size * self.line_height
     }
 
-    fn text_style(&self, size: f32, bold: bool, align: ParagraphAlign) -> TextStyle {
+    fn text_style(&self, size: LogicalPx, bold: bool, align: ParagraphAlign) -> TextStyle {
         TextStyle::new(size)
             .with_color(self.foreground)
             .with_weight(if bold { 700 } else { 400 })
@@ -81,7 +79,7 @@ impl MarkdownStyle {
             .with_wrap(TextWrap::Wrap)
     }
 
-    fn flow_style(&self, size: f32, bold: bool) -> FlowStyle {
+    fn flow_style(&self, size: LogicalPx, bold: bool) -> FlowStyle {
         FlowStyle {
             font_size: size,
             color: self.foreground,
@@ -97,30 +95,6 @@ fn text_align(align: ParagraphAlign) -> TextAlign {
         ParagraphAlign::Left => TextAlign::Left,
         ParagraphAlign::Right => TextAlign::Right,
         ParagraphAlign::Center => TextAlign::Center,
-    }
-}
-
-pub struct ResourceImages<'a> {
-    pub cache: &'a mut ResourceCache,
-    pub assets: &'a dyn MarkdownAssets,
-}
-
-impl ImagePaintSource for ResourceImages<'_> {
-    fn paint_for(
-        &mut self,
-        path: &str,
-        format: InlineImageFormat,
-        _size: Size,
-    ) -> Option<InlineBoxPaint> {
-        if format == InlineImageFormat::Svg {
-            return None;
-        }
-        let bytes = self.assets.load(path)?;
-        let image = self.cache.insert(bytes.as_ref()).ok()?;
-        Some(InlineBoxPaint::Image {
-            resource: image.id,
-            modulation: Color::WHITE,
-        })
     }
 }
 
@@ -169,7 +143,7 @@ pub struct MarkdownHandles {
 }
 
 impl MarkdownHandles {
-    pub fn link_at(&self, window: &Window, point: Point) -> Option<LinkId> {
+    pub fn link_at(&self, window: &Window, point: LogicalPoint) -> Option<LinkId> {
         for block in &self.text_blocks {
             if block.links.is_empty() {
                 continue;
@@ -181,7 +155,7 @@ impl MarkdownHandles {
             if !bounds.contains(point) {
                 continue;
             }
-            let local = Point::new(point.x - bounds.origin.x, point.y - bounds.origin.y);
+            let local = LogicalPoint::new(point.x - bounds.origin.x, point.y - bounds.origin.y);
             let Ok(byte) = window.text_byte_index_at(block.node, local) else {
                 continue;
             };
@@ -407,14 +381,14 @@ impl BuildCtx<'_> {
         let mut block_index = 0usize;
         for (index, block) in blocks.iter().enumerate() {
             if matches!(block, MarkdownBlock::BlankLine) {
-                self.build_block(tree, parent, block, 0.0, index);
+                self.build_block(tree, parent, block, LogicalPx::ZERO, index);
                 previous_blank = true;
                 continue;
             }
             let mut gap = if block_index > 0 && !previous_blank {
                 BLOCK_GAP
             } else {
-                0.0
+                LogicalPx::ZERO
             };
             if block_index > 0 && matches!(block, MarkdownBlock::Heading { .. }) {
                 gap += HEADING_SPACE_ABOVE;
@@ -430,14 +404,14 @@ impl BuildCtx<'_> {
         tree: &mut NodeTree,
         parent: NodeId,
         block: &MarkdownBlock,
-        gap: f32,
+        gap: LogicalPx,
         index: usize,
     ) {
         let style = StyleBuilder::new()
             .flex_col()
             .width_full()
             .min_width_0()
-            .margin_sides(gap, 0.0, 0.0, 0.0)
+            .margin_sides(gap, px(0.0), px(0.0), px(0.0))
             .build();
         let id = match block {
             MarkdownBlock::BlankLine => format_smolstr!("MARKDOWN_BLANK_{index}"),
@@ -473,7 +447,7 @@ impl BuildCtx<'_> {
             MarkdownBlock::ThematicBreak => {
                 let paint = PaintBuilder::new().background(self.style().divider).build();
                 let _ = NodeBuilder::boxed()
-                    .style(StyleBuilder::new().width_full().height(1.0).build())
+                    .style(StyleBuilder::new().width_full().height(px(1.0)).build())
                     .paint(paint)
                     .id("MARKDOWN_RULE")
                     .build(tree, wrapper);
@@ -487,7 +461,7 @@ impl BuildCtx<'_> {
         tree: &mut NodeTree,
         parent: NodeId,
         pieces: &[MarkdownPiece],
-        size: f32,
+        size: LogicalPx,
         bold: bool,
         align: ParagraphAlign,
     ) {
@@ -569,7 +543,7 @@ impl BuildCtx<'_> {
                     .flex_col()
                     .flex_1()
                     .min_width_0()
-                    .padding_sides(0.0, 0.0, 0.0, QUOTE_PADDING)
+                    .padding_sides(px(0.0), px(0.0), px(0.0), QUOTE_PADDING)
                     .build(),
             )
             .id("MARKDOWN_QUOTE_BODY")
@@ -697,7 +671,7 @@ impl BuildCtx<'_> {
             }
             let paint = PaintBuilder::new().background(self.style().divider).build();
             let _ = NodeBuilder::boxed()
-                .style(StyleBuilder::new().width_full().height(1.0).build())
+                .style(StyleBuilder::new().width_full().height(px(1.0)).build())
                 .paint(paint)
                 .id("MARKDOWN_TABLE_RULE")
                 .build(tree, column);
@@ -712,7 +686,7 @@ mod tests {
     use smol_str::SmolStr;
     use ui_core::{
         interaction::ScrollConfig,
-        math::{Point, Size},
+        math::{LogicalPoint, LogicalSize, px},
         node::{builder::NodeBuilder, tree::NodeKind},
         paint::style_builder::StyleBuilder,
         test_support::{app::TestApp, probe::Selector},
@@ -768,7 +742,7 @@ mod tests {
         MarkdownPiece::InlineImage {
             path: SmolStr::new_static("brands/Binance/binance.png"),
             format: InlineImageFormat::Image,
-            size: Size::new(side, side),
+            size: LogicalSize::new(px(side), px(side)),
             link: None,
             kbd: None,
         }
@@ -818,8 +792,8 @@ mod tests {
         assert_eq!(handles.text_blocks.len(), 1);
         let node = handles.text_blocks[0].node;
         let bounds = app.probe().bounds(node).expect("文本节点有布局盒");
-        assert!(bounds.size.width > 0.0, "{bounds:?}");
-        assert!(bounds.size.height > 0.0, "{bounds:?}");
+        assert!(bounds.size.width > px(0.0), "{bounds:?}");
+        assert!(bounds.size.height > px(0.0), "{bounds:?}");
         let record = app.frame_record();
         let frame = record.frame.as_ref().expect("首帧必须渲染");
         assert!(
@@ -829,7 +803,7 @@ mod tests {
                         primitive.kind,
                         ui_core::test_support::record::PrimitiveKind::GlyphRun
                     )
-                    && primitive.bounds.size.width > 0.0
+                    && primitive.bounds.size.width > px(0.0)
             }),
             "文本节点必须产生字形图元"
         );
@@ -883,19 +857,19 @@ mod tests {
         let frame = record.frame.as_ref().expect("首帧");
         assert!(
             frame.quads.iter().any(|quad| quad.node == node
-                && quad.bounds.size.width > 0.0
-                && quad.bounds.size.height <= 2.0),
+                && quad.bounds.size.width > px(0.0)
+                && quad.bounds.size.height <= px(2.0)),
             "链接下划线必须作为 Quad 画出来（{:#?}）",
             frame.quads
         );
 
         let window = app.app().window(app.window_id()).expect("窗口");
-        let point = Point::new(
+        let point = LogicalPoint::new(
             bounds.origin.x + 20.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
         assert_eq!(handles.link_at(window, point), Some(LinkId(0)));
-        let outside = Point::new(bounds.origin.x + bounds.size.width + 40.0, point.y);
+        let outside = LogicalPoint::new(bounds.origin.x + bounds.size.width + 40.0, point.y);
         assert_eq!(handles.link_at(window, outside), None);
     }
 
@@ -921,7 +895,7 @@ mod tests {
         let bounds = app.probe().bounds(blank).expect("布局盒");
         let expected = view.style().line_height();
         assert!(
-            (bounds.size.height - expected).abs() < 0.5,
+            (bounds.size.height - expected).abs() < px(0.5),
             "空行高度 {} 必须等于一行行高 {expected}",
             bounds.size.height
         );
@@ -941,8 +915,8 @@ mod tests {
         let frame = record.frame.as_ref().expect("首帧");
         assert!(
             frame.quads.iter().any(|quad| quad.node == node
-                && (quad.bounds.size.width - 24.0).abs() < 0.5
-                && (quad.bounds.size.height - 24.0).abs() < 0.5),
+                && (quad.bounds.size.width - 24.0).abs() < px(0.5)
+                && (quad.bounds.size.height - 24.0).abs() < px(0.5)),
             "行内图片必须按解析期尺寸画成 24×24 的 Quad（{:#?}）",
             frame.quads
         );
@@ -1045,12 +1019,12 @@ mod tests {
         let root = app.app().window(window).expect("窗口").tree().root();
         let theme = Theme::of(Appearance::Light);
         let flow_style = FlowStyle::new(
-            16.0,
+            px(16.0),
             theme.role(crate::theme::role::Role::FgDefault),
             theme.role(crate::theme::role::Role::BrandBase),
             theme.role(crate::theme::role::Role::FgDefault),
         );
-        let base = TextStyle::new(16.0);
+        let base = TextStyle::new(px(16.0));
         let mut images = InvisibleImages;
         let rich: RichText = rich_text(
             app.app_mut().window_mut(window).expect("窗口").tree_mut(),
@@ -1076,7 +1050,7 @@ mod tests {
             &mut images,
             "x.png",
             InlineImageFormat::Image,
-            Size::new(8.0, 8.0),
+            LogicalSize::new(px(8.0), px(8.0)),
         );
         assert!(matches!(
             paint,
@@ -1131,7 +1105,7 @@ mod tests {
         assert_eq!(
             handles.link_at(
                 window,
-                Point::new(bounds.origin.x + 1.0, bounds.origin.y + 1.0)
+                LogicalPoint::new(bounds.origin.x + 1.0, bounds.origin.y + 1.0)
             ),
             None
         );
@@ -1176,7 +1150,7 @@ mod tests {
         );
         let heading_gap = second.origin.y - (blank_bounds.origin.y + blank_bounds.size.height);
         assert!(
-            (heading_gap - super::HEADING_SPACE_ABOVE).abs() < 0.01,
+            (heading_gap - super::HEADING_SPACE_ABOVE).abs() < px(0.01),
             "空行后标题的上间距 = {heading_gap}，期望 {}（空行抑制 BLOCK_GAP，只留标题额外间距）",
             super::HEADING_SPACE_ABOVE
         );
@@ -1203,7 +1177,7 @@ mod tests {
         let body_gap =
             body.origin.y - (paragraph_blank_bounds.origin.y + paragraph_blank_bounds.size.height);
         assert!(
-            body_gap.abs() < 0.01,
+            body_gap.abs() < px(0.01),
             "空行后普通段落的上间距 = {body_gap}，期望 0（空行自己就是间距）"
         );
         assert!(
@@ -1225,7 +1199,7 @@ mod tests {
         let gap_after_heading =
             body_bounds.origin.y - (heading_bounds.origin.y + heading_bounds.size.height);
         assert!(
-            (gap_after_heading - super::BLOCK_GAP).abs() < 0.01,
+            (gap_after_heading - super::BLOCK_GAP).abs() < px(0.01),
             "无空行时段落上间距 = {gap_after_heading}，期望 {}",
             super::BLOCK_GAP
         );
@@ -1244,7 +1218,8 @@ mod tests {
         let gap_after_paragraph =
             heading_bounds.origin.y - (intro_bounds.origin.y + intro_bounds.size.height);
         assert!(
-            (gap_after_paragraph - (super::BLOCK_GAP + super::HEADING_SPACE_ABOVE)).abs() < 0.01,
+            (gap_after_paragraph - (super::BLOCK_GAP + super::HEADING_SPACE_ABOVE)).abs()
+                < px(0.01),
             "无空行时标题上间距 = {gap_after_paragraph}，期望 {}",
             super::BLOCK_GAP + super::HEADING_SPACE_ABOVE
         );
@@ -1381,8 +1356,8 @@ mod tests {
                 .style(
                     StyleBuilder::new()
                         .relative()
-                        .width(800.0)
-                        .height(600.0)
+                        .width(px(800.0))
+                        .height(px(600.0))
                         .overflow_hidden()
                         .build(),
                 )
@@ -1394,7 +1369,7 @@ mod tests {
             .make_scroll(window, page, ScrollConfig::default())
             .expect("滚动容器");
         app.app_mut()
-            .set_scroll_content(&handle, Size::new(800.0, 1800.0))
+            .set_scroll_content(&handle, LogicalSize::new(px(800.0), px(1800.0)))
             .expect("滚动内容");
         let blocks = (0..12)
             .map(|index| paragraph(vec![text(&format!("段落 {index}"))]))
@@ -1404,11 +1379,11 @@ mod tests {
                 .expect("the markdown mounts");
         let _ = app.drain().expect("首帧");
         app.app_mut()
-            .scroll_to(&handle, Point::new(0.0, 240.0))
+            .scroll_to(&handle, LogicalPoint::new(px(0.0), px(240.0)))
             .expect("滚动");
         let _ = app.drain().expect("滚动帧");
         let offset = app.app().scroll_state(&handle).expect("滚动状态").offset.y;
-        assert!((offset - 240.0).abs() < 0.5, "页面滚到 240：{offset}");
+        assert!((offset - 240.0).abs() < px(0.5), "页面滚到 240：{offset}");
 
         let root_before = node.root();
         let first_child_before = app
@@ -1443,7 +1418,7 @@ mod tests {
         assert_eq!(rebuilt.parent(), Some(page), "根节点的父节点不变");
         let offset_after = app.app().scroll_state(&handle).expect("滚动状态").offset.y;
         assert!(
-            (offset_after - offset).abs() < 0.5,
+            (offset_after - offset).abs() < px(0.5),
             "重建不移动页面滚动：{offset_after}"
         );
     }

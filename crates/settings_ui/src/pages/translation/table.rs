@@ -7,6 +7,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
+    math::px,
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         style::{PaintSpec, StylePatch},
@@ -90,7 +91,7 @@ impl TranslationTable {
                 .min_height_0()
                 .overflow_hidden()
                 .build(),
-            PaintBuilder::new().rounded(8.0).build(),
+            PaintBuilder::new().rounded(px(8.0)).build(),
             theme,
             Some(Role::SurfaceSunken),
             Some(Role::LineDivider),
@@ -191,9 +192,9 @@ impl TranslationTable {
                         .items_center()
                         .flex_none()
                         .width_full()
-                        .height(HEADER_HEIGHT)
-                        .padding_x(12.0)
-                        .gap(8.0)
+                        .height(px(HEADER_HEIGHT))
+                        .padding_x(px(12.0))
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, parent)
@@ -214,7 +215,7 @@ impl TranslationTable {
             let style = match width {
                 Some(width) => StyleBuilder::new()
                     .flex_none()
-                    .width(width)
+                    .width(px(width))
                     .min_width_0()
                     .build(),
                 None => StyleBuilder::new().flex_1().min_width_0().build(),
@@ -257,10 +258,10 @@ impl TranslationTable {
                 .items_center()
                 .flex_none()
                 .width_full()
-                .height(ROW_HEIGHT)
+                .height(px(ROW_HEIGHT))
                 .min_width_0()
-                .padding_x(12.0)
-                .gap(8.0)
+                .padding_x(px(12.0))
+                .gap(px(8.0))
                 .build(),
             PaintSpec::default(),
             theme,
@@ -289,7 +290,7 @@ impl TranslationTable {
             container,
             StyleBuilder::new()
                 .flex_none()
-                .width(SIZE_COLUMN_WIDTH)
+                .width(px(SIZE_COLUMN_WIDTH))
                 .min_width_0()
                 .build(),
         )?;
@@ -311,9 +312,9 @@ impl TranslationTable {
                         .flex_row()
                         .items_center()
                         .flex_none()
-                        .width(STATUS_COLUMN_WIDTH)
+                        .width(px(STATUS_COLUMN_WIDTH))
                         .min_width_0()
-                        .gap(4.0)
+                        .gap(px(4.0))
                         .build(),
                 )
                 .build(tree, parent)
@@ -564,7 +565,7 @@ fn single_line_text(
         parent,
         StyleBuilder::new().flex_1().min_width_0().build(),
     )?;
-    let style = TextStyle::new(TEXT_SIZE)
+    let style = TextStyle::new(px(TEXT_SIZE))
         .with_weight(weight)
         .with_color(theme.theme_for(SEED_APPEARANCE).role(role))
         .with_wrap(TextWrap::NoWrap)

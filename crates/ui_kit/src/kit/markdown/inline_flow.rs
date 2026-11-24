@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use smol_str::SmolStr;
 use ui_core::{
-    math::Size,
+    math::{LogicalPx, LogicalSize, px},
     paint::color::Color,
     text::{
         InlineAlign, InlineBoxPaint, InlineBoxSpec, TextDecoration, TextRun, TextSlant, TextStyle,
@@ -55,7 +55,7 @@ pub struct LinkSpan {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlowStyle {
-    pub font_size: f32,
+    pub font_size: LogicalPx,
     pub color: Color,
     pub link: Color,
     pub code: Color,
@@ -63,7 +63,7 @@ pub struct FlowStyle {
 }
 
 impl FlowStyle {
-    pub fn new(font_size: f32, color: Color, link: Color, code: Color) -> Self {
+    pub fn new(font_size: LogicalPx, color: Color, link: Color, code: Color) -> Self {
         Self {
             font_size,
             color,
@@ -84,7 +84,7 @@ pub trait ImagePaintSource {
         &mut self,
         path: &str,
         format: InlineImageFormat,
-        size: Size,
+        size: LogicalSize,
     ) -> Option<InlineBoxPaint>;
 }
 
@@ -98,11 +98,11 @@ impl ImagePaintSource for PlaceholderImagePaint {
         &mut self,
         _path: &str,
         _format: InlineImageFormat,
-        _size: Size,
+        _size: LogicalSize,
     ) -> Option<InlineBoxPaint> {
         Some(InlineBoxPaint::Quad {
             color: self.color,
-            corner_radius: [2.0; 4],
+            corner_radius: [px(2.0); 4],
         })
     }
 }
@@ -111,7 +111,12 @@ impl ImagePaintSource for PlaceholderImagePaint {
 pub struct InvisibleImages;
 
 impl ImagePaintSource for InvisibleImages {
-    fn paint_for(&mut self, _: &str, _: InlineImageFormat, _: Size) -> Option<InlineBoxPaint> {
+    fn paint_for(
+        &mut self,
+        _: &str,
+        _: InlineImageFormat,
+        _: LogicalSize,
+    ) -> Option<InlineBoxPaint> {
         None
     }
 }
@@ -234,7 +239,7 @@ impl<'a> FlowBuilder<'a> {
         &mut self,
         path: &str,
         format: InlineImageFormat,
-        size: Size,
+        size: LogicalSize,
         link: Option<LinkId>,
         kbd: Option<KbdId>,
         images: &mut dyn ImagePaintSource,
@@ -295,15 +300,16 @@ impl<'a> FlowBuilder<'a> {
         });
         if mark.link.is_some() {
             style = style.with_decoration(
-                TextDecoration::underline(DECORATION_THICKNESS).with_color(Some(base.link)),
+                TextDecoration::underline(px(DECORATION_THICKNESS)).with_color(Some(base.link)),
             );
         } else if mark.strike {
             style = style.with_decoration(
-                TextDecoration::strikethrough(DECORATION_THICKNESS).with_color(Some(base.color)),
+                TextDecoration::strikethrough(px(DECORATION_THICKNESS))
+                    .with_color(Some(base.color)),
             );
         } else if mark.kbd.is_some() {
             style = style.with_decoration(
-                TextDecoration::underline(DECORATION_THICKNESS).with_color(Some(base.code)),
+                TextDecoration::underline(px(DECORATION_THICKNESS)).with_color(Some(base.code)),
             );
         }
         style
@@ -314,7 +320,7 @@ impl<'a> FlowBuilder<'a> {
 mod tests {
     use smol_str::SmolStr;
     use ui_core::{
-        math::Size,
+        math::{LogicalSize, px},
         paint::color::Color,
         text::{InlineAlign, InlineBoxPaint, TextDecoration, TextSlant},
     };
@@ -338,7 +344,7 @@ mod tests {
     }
 
     fn style() -> FlowStyle {
-        FlowStyle::new(16.0, color(1.0), color(0.5), color(0.25))
+        FlowStyle::new(px(16.0), color(1.0), color(0.5), color(0.25))
     }
 
     fn text(value: &str) -> MarkdownPiece {
@@ -377,7 +383,7 @@ mod tests {
         MarkdownPiece::InlineImage {
             path: SmolStr::new(path),
             format,
-            size: Size::new(side, side),
+            size: LogicalSize::new(px(side), px(side)),
             link: None,
             kbd: None,
         }
@@ -405,7 +411,7 @@ mod tests {
         assert_eq!(flow.runs[0].range, 0..5);
         assert_eq!(flow.runs[1].range, 5..6);
         assert_eq!(flow.runs[2].range, 6..11);
-        assert_eq!(flow.runs[2].style.size, 16.0);
+        assert_eq!(flow.runs[2].style.size, px(16.0));
         assert_eq!(flow.runs[2].style.weight, 400);
         assert_eq!(flow.runs[2].style.slant, TextSlant::Normal);
         assert!(flow.runs[2].style.decoration().is_none());
@@ -536,7 +542,10 @@ mod tests {
         assert_eq!(flow.inline_boxes.len(), 2);
         assert_eq!(flow.inline_boxes[0].index, 1, "第一张图在 a、b 之间");
         assert_eq!(flow.inline_boxes[1].index, 2);
-        assert_eq!(flow.inline_boxes[0].size, Size::new(24.0, 24.0));
+        assert_eq!(
+            flow.inline_boxes[0].size,
+            LogicalSize::new(px(24.0), px(24.0))
+        );
         assert_eq!(flow.inline_boxes[0].align, InlineAlign::Middle);
         assert_eq!(flow.inline_boxes[0].id, 0);
         assert_eq!(flow.inline_boxes[1].id, 1);
@@ -602,7 +611,7 @@ mod tests {
             MarkdownPiece::InlineImage {
                 path: SmolStr::new_static("x.png"),
                 format: InlineImageFormat::Image,
-                size: Size::new(8.0, 8.0),
+                size: LogicalSize::new(px(8.0), px(8.0)),
                 link: Some(LinkId(0)),
                 kbd: None,
             },
@@ -628,11 +637,11 @@ mod tests {
                 &mut self,
                 _path: &str,
                 _format: InlineImageFormat,
-                size: Size,
+                size: LogicalSize,
             ) -> Option<InlineBoxPaint> {
                 Some(InlineBoxPaint::Quad {
-                    color: color(size.width / 100.0),
-                    corner_radius: [0.0; 4],
+                    color: color(f32::from(size.width / 100.0)),
+                    corner_radius: [px(0.0); 4],
                 })
             }
         }

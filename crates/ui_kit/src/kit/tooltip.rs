@@ -8,6 +8,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::{App, TimerId},
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
@@ -58,20 +59,20 @@ impl TooltipContent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TooltipOptions {
     pub placement: Placement,
-    pub gap: f32,
+    pub gap: LogicalPx,
     pub delay: Duration,
     pub fade: bool,
-    pub max_width: f32,
+    pub max_width: LogicalPx,
 }
 
 impl Default for TooltipOptions {
     fn default() -> Self {
         Self {
             placement: Placement::BOTTOM,
-            gap: 4.0,
+            gap: px(4.0),
             delay: Duration::from_millis(500),
             fade: true,
-            max_width: 320.0,
+            max_width: px(320.0),
         }
     }
 }
@@ -90,7 +91,7 @@ impl TooltipOptions {
     }
 
     #[must_use]
-    pub fn max_width(mut self, max_width: f32) -> Self {
+    pub fn max_width(mut self, max_width: LogicalPx) -> Self {
         self.max_width = max_width;
         self
     }
@@ -145,7 +146,7 @@ impl Tooltip {
             OverlayOptions {
                 placement: options.placement,
                 gap: options.gap,
-                margin: 4.0,
+                margin: px(4.0),
                 flip: true,
                 dismiss: DismissPolicy::Explicit,
                 modal: false,
@@ -400,13 +401,13 @@ fn build_content(
     key: &str,
     content: &TooltipContent,
     theme: &ThemeHandle,
-    max_width: f32,
+    max_width: LogicalPx,
 ) -> Result<(), EngineError> {
-    let limited = max_width.is_finite() && max_width > 0.0;
+    let limited = max_width.is_finite() && max_width > LogicalPx::ZERO;
     let mut row_style = StyleBuilder::new()
         .flex_row()
         .items_center()
-        .gap(6.0)
+        .gap(px(6.0))
         .min_width_0();
     if limited {
         row_style = row_style.max_width(max_width);
@@ -465,7 +466,7 @@ mod tests {
         a11y::A11yRole,
         error::EngineError,
         event::{Action, InputEvent, KeyCode, Modifiers},
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
@@ -484,7 +485,10 @@ mod tests {
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
-    const TRIGGER: Rect = Rect::new(300.0, 200.0, 100.0, 40.0);
+    const TRIGGER: LogicalRect = LogicalRect::from_origin_size(
+        LogicalPoint::new(px(300.0), px(200.0)),
+        LogicalSize::new(px(100.0), px(40.0)),
+    );
 
     struct Harness {
         app: TestApp,
@@ -546,7 +550,7 @@ mod tests {
             }
         }
 
-        fn hover(&mut self, at: Point) {
+        fn hover(&mut self, at: LogicalPoint) {
             let _ = self
                 .app
                 .inject(InputEvent::pointer_move(at, Modifiers::empty()));
@@ -600,7 +604,7 @@ mod tests {
                     .open(
                         self.app.app_mut(),
                         self.window,
-                        Anchor::point(Point::new(50.0, 50.0)),
+                        Anchor::point(LogicalPoint::new(px(50.0), px(50.0))),
                         content
                     )
                     .expect("打开模态对话框")
@@ -611,9 +615,9 @@ mod tests {
             dialog
         }
 
-        fn trigger_center(&self) -> Point {
+        fn trigger_center(&self) -> LogicalPoint {
             let bounds = self.app.probe().bounds(self.trigger).expect("触发器布局");
-            Point::new(
+            LogicalPoint::new(
                 bounds.origin.x + bounds.size.width * 0.5,
                 bounds.origin.y + bounds.size.height * 0.5,
             )
@@ -685,7 +689,7 @@ mod tests {
             "淡入完成"
         );
 
-        harness.hover(Point::new(10.0, 10.0));
+        harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
@@ -749,12 +753,13 @@ mod tests {
             .bounds(harness.tip.overlay().overlay_node().expect("浮层节点"))
             .expect("面板布局");
         assert!(
-            (panel.max().y - (TRIGGER.origin.y - 4.0)).abs() < 0.5,
+            (panel.max().y - (TRIGGER.origin.y - 4.0)).value().abs() < 0.5,
             "Top 定位：面板底边 = 触发器顶边 − gap，实际 {panel:?}"
         );
         assert!(
             (panel.origin.x + panel.size.width * 0.5
                 - (TRIGGER.origin.x + TRIGGER.size.width * 0.5))
+                .value()
                 .abs()
                 < 0.5,
             "Top 居中：面板中心应贴触发器中心，实际 {panel:?}"
@@ -798,12 +803,12 @@ mod tests {
             harness.settle();
             let panel = harness.tip.overlay().panel_node().expect("面板");
             let bounds = harness.app.probe().bounds(panel).expect("面板布局");
-            (bounds.size.width, bounds.size.height)
+            (f32::from(bounds.size.width), f32::from(bounds.size.height))
         }
 
         assert_eq!(
             TooltipOptions::default().max_width,
-            320.0,
+            px(320.0),
             "默认恢复旧实现的 320 px 内容上限（W3a F6）"
         );
         let (default_width, default_height) = panel_size(TooltipOptions::default());
@@ -812,7 +817,8 @@ mod tests {
             "默认上限 320：面板总宽 = 320 + 2 × 面板内边距，实际 {default_width}"
         );
 
-        let (narrow_width, narrow_height) = panel_size(TooltipOptions::default().max_width(120.0));
+        let (narrow_width, narrow_height) =
+            panel_size(TooltipOptions::default().max_width(px(120.0)));
         assert!(
             (narrow_width - (120.0 + 8.0)).abs() <= 1.0,
             "显式上限 120 生效，实际面板宽 {narrow_width}"
@@ -823,7 +829,7 @@ mod tests {
         );
 
         let (wide_width, wide_height) =
-            panel_size(TooltipOptions::default().max_width(f32::INFINITY));
+            panel_size(TooltipOptions::default().max_width(px(f32::INFINITY)));
         assert!(
             wide_width > default_width + 100.0,
             "f32::INFINITY = 不限制：长句单行撑开，实际 {wide_width}"
@@ -897,7 +903,7 @@ mod tests {
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()));
 
-        harness.hover(Point::new(10.0, 10.0));
+        harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()));
         assert!(
@@ -1125,7 +1131,7 @@ mod tests {
             "前置：仍在淡出窗口内"
         );
 
-        harness.hover(Point::new(10.0, 10.0));
+        harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = harness.sync();
         assert!(
             harness.tip.overlay().overlay_node().is_some(),
@@ -1169,7 +1175,7 @@ mod tests {
         });
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
-        harness.hover(Point::new(10.0, 10.0));
+        harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()));
 
@@ -1208,7 +1214,12 @@ mod tests {
         let _dialog = harness.open_modal(|tree, panel| {
             NodeBuilder::boxed()
                 .id("dialog-box")
-                .style(StyleBuilder::new().width(120.0).height(40.0).build())
+                .style(
+                    StyleBuilder::new()
+                        .width(px(120.0))
+                        .height(px(40.0))
+                        .build(),
+                )
                 .build(tree, panel)?;
             Ok(())
         });
@@ -1245,7 +1256,7 @@ mod tests {
         let dialog = harness.open_modal(move |tree, panel| {
             let node = NodeBuilder::boxed()
                 .id("inner-trigger")
-                .layout_override(Rect::new(10.0, 10.0, 100.0, 40.0))
+                .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(40.0)))
                 .build(tree, panel)?;
             slot.set(Some(node));
             Ok(())
@@ -1255,7 +1266,7 @@ mod tests {
             .tip
             .attach(harness.app.app_mut(), harness.window, inner);
         let bounds = harness.app.probe().bounds(inner).expect("触发器布局");
-        let center = Point::new(
+        let center = LogicalPoint::new(
             bounds.origin.x + bounds.size.width * 0.5,
             bounds.origin.y + bounds.size.height * 0.5,
         );
@@ -1338,7 +1349,7 @@ mod tests {
             menu.open(
                 harness.app.app_mut(),
                 harness.window,
-                Anchor::point(Point::new(20.0, 20.0)),
+                Anchor::point(LogicalPoint::new(px(20.0), px(20.0))),
                 |_, _| Ok(())
             )
             .expect("打开菜单")

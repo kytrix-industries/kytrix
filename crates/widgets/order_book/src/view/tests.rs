@@ -36,6 +36,7 @@ use market_participants_model::{
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     event::{Action, ActionSource},
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
     paint::{
         canvas::Canvas,
@@ -56,7 +57,7 @@ use widget::{
 use super::*;
 use crate::service::{OrderBookEventSubscription, OrderBookSource};
 
-const PAGE: (f32, f32) = (640.0, 360.0);
+const PAGE: (LogicalPx, LogicalPx) = (px(640.0), px(360.0));
 
 const FIXTURE_DEPTH: u16 = 5_000;
 
@@ -336,8 +337,16 @@ impl Fixture {
         let scope = harness.scope();
         let status = WidgetStatus::new(harness.app_mut(), scope);
         let page = leaf(&mut harness, "TEST_ORDER_BOOK_PAGE", PAGE);
-        let left = leaf(&mut harness, "TEST_ORDER_BOOK_HEADER_LEFT", (320.0, 32.0));
-        let right = leaf(&mut harness, "TEST_ORDER_BOOK_HEADER_RIGHT", (320.0, 32.0));
+        let left = leaf(
+            &mut harness,
+            "TEST_ORDER_BOOK_HEADER_LEFT",
+            (px(320.0), px(32.0)),
+        );
+        let right = leaf(
+            &mut harness,
+            "TEST_ORDER_BOOK_HEADER_RIGHT",
+            (px(320.0), px(32.0)),
+        );
         let publishes: Rc<Cell<usize>> = Rc::new(Cell::new(0));
         let counted = Rc::clone(&publishes);
         let change = WidgetConfigChange::new(move |_| {
@@ -518,7 +527,7 @@ fn pane(loaded: bool) -> Fixture {
     Fixture::new(config(Some("BTC")), vec![default_entry()], loaded)
 }
 
-fn leaf(harness: &mut WidgetTestApp, id: &'static str, size: (f32, f32)) -> NodeId {
+fn leaf(harness: &mut WidgetTestApp, id: &'static str, size: (LogicalPx, LogicalPx)) -> NodeId {
     harness.with_cx(|cx| {
         let root = cx.tree().root();
         NodeBuilder::boxed()
@@ -594,7 +603,7 @@ fn canvas_quads(canvas: &Canvas) -> Vec<Quad> {
         .collect()
 }
 
-fn canvas_bar_widths(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> Vec<f32> {
+fn canvas_bar_widths(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> Vec<LogicalPx> {
     canvas_quads(canvas_of(harness, canvas_node(harness, parent, selector)))
         .into_iter()
         .map(|quad| quad.bounds.size.width)
@@ -1497,7 +1506,7 @@ fn the_depth_animation_should_ease_the_bars_on_the_canvas_tick_by_tick() {
     fixture.drain();
     let moved = canvas_bar_widths(&fixture.harness, fixture.page, ASK_BARS_SELECTOR);
     assert!(
-        moved[0] > settled[0] && moved[0] < 0.75 * row_width,
+        moved[0] > settled[0] && moved[0] < row_width * 0.75,
         "the canvas follows the eased progress: {moved:?}"
     );
 
@@ -1661,9 +1670,9 @@ fn the_depth_bars_should_be_drawn_on_the_canvases_it_owns() {
             },
             "ask bar {index} is painted in the ask depth colour"
         );
-        assert_eq!(quad.corner_radius, [0.0; 4]);
+        assert_eq!(quad.corner_radius, [px(0.0); 4]);
         assert!(
-            (quad.bounds.origin.x + quad.bounds.size.width - ask_right).abs() < 0.01,
+            (quad.bounds.origin.x + quad.bounds.size.width - ask_right).abs() < px(0.01),
             "ask bar {index} hangs off the row's right edge"
         );
     }
@@ -1720,7 +1729,7 @@ fn the_depth_bars_should_be_drawn_on_the_canvases_it_owns() {
         (imbalance_quads[0].bounds.size.width + imbalance_quads[1].bounds.size.width
             - imbalance_width)
             .abs()
-            < 0.01,
+            < px(0.01),
         "the two shares fill the bar"
     );
 }
@@ -2059,7 +2068,7 @@ fn two_panes_should_not_share_a_single_component_key() {
     let peer_right = leaf(
         &mut fixture.harness,
         "TEST_ORDER_BOOK_PEER_HEADER_RIGHT",
-        (320.0, 32.0),
+        (px(320.0), px(32.0)),
     );
     let first_keys = fixture.harness.with_cx(|cx| {
         [

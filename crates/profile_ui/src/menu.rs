@@ -5,6 +5,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
+    math::px,
     node::{builder::NodeBuilder, id::NodeId, image::ImageFit, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextStyle, TextWrap},
@@ -194,9 +195,9 @@ impl ContentBuild<'_> {
             .style(
                 StyleBuilder::new()
                     .flex_col()
-                    .width(MENU_CONTENT_WIDTH)
+                    .width(px(MENU_CONTENT_WIDTH))
                     .min_width_0()
-                    .gap(2.0)
+                    .gap(px(2.0))
                     .build(),
             )
             .build(tree_mut(app, self.window)?, panel)
@@ -215,8 +216,8 @@ impl ContentBuild<'_> {
                     .width_full()
                     .min_width_0()
                     .items_center()
-                    .gap(ACCOUNT_BLOCK_GAP)
-                    .padding(ACCOUNT_BLOCK_PADDING)
+                    .gap(px(ACCOUNT_BLOCK_GAP))
+                    .padding(px(ACCOUNT_BLOCK_PADDING))
                     .build(),
             )
             .build(tree_mut(app, self.window)?, parent)?;
@@ -234,7 +235,7 @@ impl ContentBuild<'_> {
             .style(
                 StyleBuilder::new()
                     .relative()
-                    .size(ACCOUNT_AVATAR_SIZE, ACCOUNT_AVATAR_SIZE)
+                    .size(px(ACCOUNT_AVATAR_SIZE), px(ACCOUNT_AVATAR_SIZE))
                     .build(),
             )
             .build(tree_mut(app, self.window)?, parent)?;
@@ -242,7 +243,7 @@ impl ContentBuild<'_> {
             .id(ACCOUNT_FACE_ID)
             .style(
                 StyleBuilder::new()
-                    .size(ACCOUNT_AVATAR_SIZE, ACCOUNT_AVATAR_SIZE)
+                    .size(px(ACCOUNT_AVATAR_SIZE), px(ACCOUNT_AVATAR_SIZE))
                     .items_center()
                     .justify_center()
                     .build(),
@@ -257,7 +258,7 @@ impl ContentBuild<'_> {
                 NodeBuilder::image_pending(texture.pending, ImageFit::Cover)
                     .style(
                         StyleBuilder::new()
-                            .size(ACCOUNT_AVATAR_SIZE, ACCOUNT_AVATAR_SIZE)
+                            .size(px(ACCOUNT_AVATAR_SIZE), px(ACCOUNT_AVATAR_SIZE))
                             .build(),
                     )
                     .build(tree_mut(app, self.window)?, face)?;
@@ -282,9 +283,9 @@ impl ContentBuild<'_> {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .right(offset)
-                    .bottom(offset)
-                    .size(ACCOUNT_BADGE_SIZE, ACCOUNT_BADGE_SIZE)
+                    .right(px(offset))
+                    .bottom(px(offset))
+                    .size(px(ACCOUNT_BADGE_SIZE), px(ACCOUNT_BADGE_SIZE))
                     .items_center()
                     .justify_center()
                     .build(),
@@ -299,7 +300,7 @@ impl ContentBuild<'_> {
             AccountWalletKind::Solana => BrandKind::Solana,
         };
         Brand::new(brand)
-            .with_size(ACCOUNT_BADGE_LOGO_SIZE)
+            .with_size(px(ACCOUNT_BADGE_LOGO_SIZE))
             .with_alt(wallet_kind_label(self.account.wallet_kind()))
             .build(app, self.window, badge)
             .map_err(|error| brand_error(self.window, error))?;
@@ -338,7 +339,7 @@ impl ContentBuild<'_> {
                     .width_full()
                     .min_width_0()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(tree_mut(app, self.window)?, parent)?;
@@ -353,7 +354,7 @@ impl ContentBuild<'_> {
             .style(
                 StyleBuilder::new()
                     .min_width_0()
-                    .max_width(MENU_CONTENT_WIDTH * 0.5)
+                    .max_width(px(MENU_CONTENT_WIDTH * 0.5))
                     .build(),
             )
             .bind_style(move |cx| StylePatch {
@@ -426,7 +427,7 @@ impl ContentBuild<'_> {
     fn separator(&self, app: &mut App, parent: NodeId) -> Result<NodeId, EngineError> {
         let line = self.theme.clone();
         NodeBuilder::boxed()
-            .style(StyleBuilder::new().width_full().height(1.0).build())
+            .style(StyleBuilder::new().width_full().height(px(1.0)).build())
             .bind_style(move |cx| StylePatch {
                 background: Some(line.role(cx, Role::LineDivider)),
                 ..StylePatch::default()

@@ -23,6 +23,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::TimerId,
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
@@ -47,7 +48,7 @@ use super::{
 
 const AGE_TICK: Duration = Duration::from_secs(1);
 
-fn row_height(theme: &ThemeHandle) -> f32 {
+fn row_height(theme: &ThemeHandle) -> LogicalPx {
     theme.tokens().medium.height
 }
 
@@ -874,7 +875,7 @@ struct CellContext {
     language: Signal<LanguageCode>,
     theme: ThemeHandle,
     translate: Translate,
-    font_size: f32,
+    font_size: LogicalPx,
 }
 
 fn build_cell(
@@ -1017,14 +1018,14 @@ impl DetailTables {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap(6.0)
+                    .gap(px(6.0))
                     .build(),
             )
             .a11y(A11yOverride {
@@ -1244,10 +1245,10 @@ impl DetailTables {
                 .style(
                     StyleBuilder::new()
                         .absolute()
-                        .top(0.0)
-                        .right(0.0)
-                        .bottom(0.0)
-                        .left(0.0)
+                        .top(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .left(px(0.0))
                         .flex_col()
                         .min_width_0()
                         .min_height_0()
@@ -1285,7 +1286,7 @@ impl DetailTables {
         cx: &mut WidgetCx<'_>,
         tab: DetailTab,
         rows: usize,
-        font_size: f32,
+        font_size: LogicalPx,
         options: TableOptions,
     ) -> Table {
         let context = CellContext {

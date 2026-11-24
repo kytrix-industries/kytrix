@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use smol_str::SmolStr;
-use ui_core::{interaction::DragPhase, math::Point, window::WindowControl};
+use ui_core::{interaction::DragPhase, math::LogicalPoint, window::WindowControl};
 
 use super::workspace::tree::{PaneId, PaneOrientation, SplitId};
 
@@ -38,7 +38,7 @@ pub(crate) enum Intent {
     SplitDrag {
         split: SplitId,
         phase: DragPhase,
-        delta: Point,
+        delta: LogicalPoint,
     },
 }
 

@@ -30,6 +30,7 @@ use ui_core::{
     a11y::A11yPatch,
     app::{App, TimerId},
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextStyle},
@@ -561,7 +562,7 @@ impl WidgetView for OrderBookWidget {
                 .map(|target| target.layout().bounds)
         });
         if let Some(bounds) = ladder_bounds
-            && bounds.size.height > 0.0
+            && bounds.size.height > px(0.0)
         {
             let drawable = drawable_rows(bounds, self.theme.tokens().small.font_size);
             if drawable != self.drawable_rows {
@@ -720,8 +721,8 @@ impl OrderBookWidget {
         &self,
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
-        font_size: f32,
-        height: f32,
+        font_size: LogicalPx,
+        height: LogicalPx,
     ) -> Result<(), EngineError> {
         let row = NodeBuilder::boxed()
             .id("TEST_ORDER_BOOK_COLUMNS")
@@ -731,7 +732,7 @@ impl OrderBookWidget {
                     .items_center()
                     .flex_none()
                     .height(height)
-                    .padding_x(8.0)
+                    .padding_x(px(8.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -788,8 +789,8 @@ impl OrderBookWidget {
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
         side: RowSide,
-        font_size: f32,
-        stride: f32,
+        font_size: LogicalPx,
+        stride: LogicalPx,
     ) -> Result<NodeId, EngineError> {
         let area = NodeBuilder::boxed()
             .id(match side {
@@ -849,7 +850,7 @@ impl OrderBookWidget {
         &self,
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
-        height: f32,
+        height: LogicalPx,
     ) -> Result<(), EngineError> {
         let tokens = self.theme.tokens();
         let font_size = tokens.large.font_size;
@@ -863,8 +864,8 @@ impl OrderBookWidget {
                     .justify_center()
                     .flex_none()
                     .height(height)
-                    .gap(8.0)
-                    .padding_x(8.0)
+                    .gap(px(8.0))
+                    .padding_x(px(8.0))
                     .min_width_0()
                     .build(),
             )
@@ -948,8 +949,8 @@ impl OrderBookWidget {
         &mut self,
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
-        height: f32,
-        font_size: f32,
+        height: LogicalPx,
+        font_size: LogicalPx,
     ) -> Result<(), EngineError> {
         let row = NodeBuilder::boxed()
             .id("TEST_ORDER_BOOK_IMBALANCE_ROW")
@@ -972,7 +973,7 @@ impl OrderBookWidget {
                     .items_center()
                     .justify_between()
                     .size_full()
-                    .padding_x(8.0)
+                    .padding_x(px(8.0))
                     .build(),
             )
             .build(cx.tree_mut(), row)?;
@@ -1018,8 +1019,8 @@ impl OrderBookWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .left(0.0)
-                    .top(0.0)
+                    .left(px(0.0))
+                    .top(px(0.0))
                     .size_full()
                     .flex_row()
                     .items_center()
@@ -1105,7 +1106,7 @@ impl OrderBookWidget {
             .ask_list
             .as_ref()
             .and_then(|list| list.offset(cx.app()))
-            .unwrap_or(0.0);
+            .unwrap_or(LogicalPx::ZERO);
         self.ask_bars.sync(
             cx,
             &ask_levels,
@@ -1120,7 +1121,7 @@ impl OrderBookWidget {
             .bid_list
             .as_ref()
             .and_then(|list| list.offset(cx.app()))
-            .unwrap_or(0.0);
+            .unwrap_or(LogicalPx::ZERO);
         self.bid_bars.sync(
             cx,
             &bid_levels,
@@ -1638,7 +1639,7 @@ impl OrderBookWidget {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -1902,13 +1903,13 @@ fn hand_over_header_request(
     let _ = app.request_repaint(window);
 }
 
-fn aligned_text(size: f32) -> TextStyle {
+fn aligned_text(size: LogicalPx) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.alignment = TextAlign::Right;
     style
 }
 
-fn bold_text(size: f32) -> TextStyle {
+fn bold_text(size: LogicalPx) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.weight = 700;
     style
@@ -1921,7 +1922,7 @@ fn build_row(
     side: RowSide,
     book: Signal<PublishedBook>,
     theme: ThemeHandle,
-    font_size: f32,
+    font_size: LogicalPx,
 ) -> Result<(), EngineError> {
     let container = NodeBuilder::boxed()
         .style(

@@ -12,7 +12,10 @@ use app_config_provider::store::ConfigPersistenceError;
 use i18n::language::codes::LanguageCode;
 use market_participants_model::identifier::VenueId;
 use smol_str::{SmolStr, format_smolstr};
-use ui_core::event::{Action, KeyCode};
+use ui_core::{
+    event::{Action, KeyCode},
+    math::px,
+};
 use ui_kit::kit::size::UnifiedSize;
 
 use crate::{
@@ -744,7 +747,7 @@ fn the_credentials_dialog_should_be_drawn_the_way_the_application_draws_its_dial
     let cancel = bounds(&harness, CANCEL_SELECTOR);
 
     assert!(
-        (content.size.width - 480.0).abs() < 1.0,
+        (content.size.width - 480.0).abs() < px(1.0),
         "the credentials dialog is 480 px wide: it is {content:?}"
     );
     let fields = kind
@@ -833,7 +836,7 @@ fn a_credential_rows_buttons_should_be_medium_sized() {
         for selector in [kind.edit_selector(), kind.clear_selector()] {
             let button = bounds(&harness, selector.as_ref());
             assert!(
-                (button.size.height - UnifiedSize::Medium.h()).abs() < 1.0,
+                (button.size.height - UnifiedSize::Medium.h()).abs() < px(1.0),
                 "{kind:?}'s button should be drawn at the medium size: {selector} is {button:?}"
             );
         }

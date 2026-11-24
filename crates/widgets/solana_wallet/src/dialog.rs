@@ -15,6 +15,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event, InputEvent},
     interaction::ActionCtx,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -383,7 +384,7 @@ impl DialogState {
             key.clone(),
             ListOptions::fixed(row_height)
                 .selection(SelectionMode::None)
-                .padding(0.0, 0.0),
+                .padding(LogicalPx::ZERO, LogicalPx::ZERO),
             move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                 build_address_row(tree, parent, index, &key, &addresses, &slots, &theme)
             },
@@ -908,9 +909,9 @@ impl DialogState {
                 .style(
                     StyleBuilder::new()
                         .width_full()
-                        .height(CONTENT_HEIGHT)
+                        .height(px(CONTENT_HEIGHT))
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .min_height_0()
                         .build(),
@@ -927,7 +928,7 @@ impl DialogState {
                         .flex_none()
                         .flex_row()
                         .items_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .build(),
                 )
@@ -952,7 +953,7 @@ impl DialogState {
                         .flex_none()
                         .flex_row()
                         .items_center()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .min_width_0()
                         .build(),
                 )
@@ -1119,7 +1120,7 @@ impl DialogState {
                         .width_full()
                         .flex_none()
                         .flex_col()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, panel)
@@ -1151,7 +1152,7 @@ impl DialogState {
         window: WindowId,
         parent: NodeId,
         key: &str,
-        text_size: f32,
+        text_size: LogicalPx,
     ) -> Result<NodeId, EngineError> {
         let addresses = self.addresses;
         let limit = self.limit;
@@ -1194,7 +1195,7 @@ impl DialogState {
         window: WindowId,
         area: NodeId,
         key: &str,
-        text_size: f32,
+        text_size: LogicalPx,
     ) -> Result<(), EngineError> {
         let signed_in = self.signed_in;
         let ready = self.ready;
@@ -1341,7 +1342,7 @@ impl DialogState {
         app: &mut App,
         window: WindowId,
         parent: NodeId,
-        text_size: f32,
+        text_size: LogicalPx,
         key: &'static str,
     ) -> Result<NodeId, EngineError> {
         let language = self.language;
@@ -1354,7 +1355,7 @@ impl DialogState {
             )
             .style(
                 StyleBuilder::new()
-                    .max_width(MESSAGE_WIDTH)
+                    .max_width(px(MESSAGE_WIDTH))
                     .min_width_0()
                     .build(),
             )
@@ -1454,7 +1455,7 @@ fn build_address_row(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(8.0)
+                .gap(px(8.0))
                 .width_full()
                 .min_width_0()
                 .build(),
@@ -1510,15 +1511,15 @@ fn message_block(
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap(8.0)
-                    .padding(8.0)
+                    .gap(px(8.0))
+                    .padding(px(8.0))
                     .build(),
             )
             .bind_style(visible)

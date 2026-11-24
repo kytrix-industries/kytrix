@@ -2,7 +2,7 @@ use std::{rc::Rc, sync::Arc};
 
 use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use time::{Date, Month, UtcOffset};
-use ui_core::paint::color::Color;
+use ui_core::{math::px, paint::color::Color};
 use widget::test_support::WidgetTestApp;
 
 use super::{
@@ -57,7 +57,7 @@ fn midnight() -> i64 {
 }
 
 fn axis_style() -> ui_core::text::TextStyle {
-    label_style(12.0, 14.0, Color::WHITE, REGULAR_WEIGHT)
+    label_style(px(12.0), px(14.0), Color::WHITE, REGULAR_WEIGHT)
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn the_text_cache_keeps_a_line_per_style() {
     let mut app = WidgetTestApp::new();
     let mut cache = ChartTextCache::default();
     let style = axis_style();
-    let coloured = label_style(12.0, 14.0, Color::BLACK, REGULAR_WEIGHT);
+    let coloured = label_style(px(12.0), px(14.0), Color::BLACK, REGULAR_WEIGHT);
 
     let first = cache.line(app.app_mut(), "8:00 AM", &style);
     let second = cache.line(app.app_mut(), "8:00 AM", &coloured);
@@ -356,5 +356,5 @@ fn the_text_cache_measures_the_line_it_shaped() {
     let line = cache.line(app.app_mut(), "100%", &style);
 
     assert_eq!(width, line.size().width);
-    assert!(width > 0.0);
+    assert!(width > px(0.0));
 }

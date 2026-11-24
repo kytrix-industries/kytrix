@@ -15,7 +15,7 @@ use ui_core::{
     },
     interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
     layout::hit_test::HitResult,
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -109,7 +109,7 @@ pub struct InputState {
     undo: Vec<EditSnapshot>,
     redo: Vec<EditSnapshot>,
     dragging: bool,
-    drag_origin: Option<Point>,
+    drag_origin: Option<LogicalPoint>,
 }
 
 impl InputState {
@@ -509,7 +509,7 @@ impl InputState {
         self.dragging
     }
 
-    pub fn begin_drag(&mut self, origin_caret: usize, origin: Point) -> bool {
+    pub fn begin_drag(&mut self, origin_caret: usize, origin: LogicalPoint) -> bool {
         self.cancel_composition();
         let origin_caret = snap_char_boundary(&self.text, origin_caret);
         self.dragging = true;
@@ -538,7 +538,7 @@ impl InputState {
         &mut self,
         window: &Window,
         text_node: NodeId,
-        local_point: Point,
+        local_point: LogicalPoint,
         extend: bool,
     ) -> bool {
         let Ok(display_byte) = window.text_byte_index_at(text_node, local_point) else {
@@ -995,7 +995,11 @@ pub fn build(
     let multiline = spec.multiline;
     let name = spec.name.clone();
     let padding_x = size.padding_x;
-    let padding_y = if multiline { size.padding_x } else { 0.0 };
+    let padding_y = if multiline {
+        size.padding_x
+    } else {
+        LogicalPx::ZERO
+    };
 
     let mut root_style = StyleBuilder::new()
         .flex_row()
@@ -1009,14 +1013,14 @@ pub fn build(
         .build();
     if multiline {
         root_style
-            .min_height(LengthPercentageAuto::length(size.height))
+            .min_height(LengthPercentageAuto::length(size.height.value()))
             .align_self(taffy::style::AlignSelf::START);
     } else {
         root_style.height_length(size.height);
     }
     let root_paint = PaintBuilder::new()
         .border(border_width, Color::TRANSPARENT)
-        .rounded(CORNER_RADIUS)
+        .rounded(px(CORNER_RADIUS))
         .build();
 
     let style_state = *state;
@@ -1196,7 +1200,7 @@ pub fn build(
         .expect("input: placeholder node mounts under the fresh root");
 
     let caret_theme = theme.clone();
-    let caret = NodeBuilder::canvas(Canvas::new(Rect::default()))
+    let caret = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
         .style(
             StyleBuilder::new()
                 .absolute()
@@ -1249,7 +1253,7 @@ impl InputNode {
                 viewport,
                 ScrollConfig {
                     axis: ScrollAxis::Horizontal,
-                    line_height: 1.0,
+                    line_height: px(1.0),
                 },
             )
         {
@@ -1311,7 +1315,7 @@ impl InputNode {
             let app = ctx.app_mut();
             let scroll = scroll_handle
                 .and_then(|handle| app.scroll_state(&handle))
-                .map_or(0.0, |state| state.offset.x);
+                .map_or(0.0, |state| f32::from(state.offset.x));
             let text_origin = {
                 let Some(window_ref) = app.window(window) else {
                     return;
@@ -1321,8 +1325,8 @@ impl InputNode {
                 };
                 node.layout().bounds.origin
             };
-            let to_text_local = |point: Point| {
-                Point::new(point.x - text_origin.x + scroll, point.y - text_origin.y)
+            let to_text_local = |point: LogicalPoint| {
+                LogicalPoint::new(point.x - text_origin.x + scroll, point.y - text_origin.y)
             };
             let before = app.read(&state).clone();
             let mut next = before.clone();
@@ -1385,7 +1389,7 @@ impl InputNode {
                     })
                     .or_else(|| {
                         next.drag_origin
-                            .map(|origin| Point::new(origin.x + delta.x, origin.y + delta.y))
+                            .map(|origin| LogicalPoint::new(origin.x + delta.x, origin.y + delta.y))
                     });
                 if let Some(current) = current
                     && let Some(window_ref) = app.window(window)
@@ -1605,19 +1609,22 @@ impl InputNode {
             )
         };
         let (content_width, text_origin_x, viewport_width, viewport_height, caret) = geometry;
-        if viewport_width <= 0.0 || !content_width.is_finite() {
+        if viewport_width.value() <= 0.0 || !content_width.is_finite() {
             return false;
         }
         let _ = app.set_scroll_content(
             &handle,
-            Size::new(content_width.max(viewport_width), viewport_height.max(1.0)),
+            LogicalSize::new(
+                content_width.max(viewport_width),
+                viewport_height.max(px(1.0)),
+            ),
         );
         let Some(current) = app.scroll_state(&handle) else {
             return false;
         };
-        let max_offset = (content_width - viewport_width).max(0.0);
+        let max_offset = (content_width - viewport_width).max(px(0.0));
         let caret_left = caret.origin.x - text_origin_x;
-        let caret_right = caret_left + caret.size.width.max(1.0);
+        let caret_right = caret_left + caret.size.width.max(px(1.0));
         let mut next = current.offset.x;
         if caret_left < next {
             next = caret_left;
@@ -1625,11 +1632,12 @@ impl InputNode {
         if caret_right > next + viewport_width {
             next = caret_right - viewport_width;
         }
-        let next = next.clamp(0.0, max_offset);
-        if (next - current.offset.x).abs() <= f32::EPSILON {
+        let next = next.value().clamp(0.0, max_offset.value());
+        if (next - current.offset.x.value()).abs() <= f32::EPSILON {
             return false;
         }
-        app.scroll_to(&handle, Point::new(next, 0.0)).is_ok()
+        app.scroll_to(&handle, LogicalPoint::new(px(next), px(0.0)))
+            .is_ok()
     }
 
     pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
@@ -1682,14 +1690,14 @@ impl InputNode {
         selection_color: Color,
     ) -> Option<Canvas> {
         if !window.focus().is_focused(self.root) {
-            return Some(Canvas::new(Rect::default()));
+            return Some(Canvas::new(LogicalRect::default()));
         }
         let masked = self.spec.masked;
         let caret_byte = state.display_caret_byte(masked);
         let caret_rect = window.text_caret_rect(self.text, caret_byte).ok()?;
         let local_zero = window.tree().text_caret_rect(self.text, 0).ok()?;
         let absolute_zero = window.text_caret_rect(self.text, 0).ok()?;
-        let origin = Point::new(
+        let origin = LogicalPoint::new(
             absolute_zero.origin.x - local_zero.origin.x,
             absolute_zero.origin.y - local_zero.origin.y,
         );
@@ -1703,7 +1711,7 @@ impl InputNode {
             for rect in rects {
                 quads.push(Quad {
                     bounds: rect.translate(origin),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                     paint: QuadPaint::Solid {
                         fill: selection_color,
                         border: None,
@@ -1713,15 +1721,15 @@ impl InputNode {
         }
         quads.push(Quad {
             bounds: caret_rect,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: caret_color,
                 border: None,
             },
         });
-        let bounds = quads
-            .iter()
-            .fold(Rect::default(), |bounds, quad| bounds.union(quad.bounds));
+        let bounds = quads.iter().fold(LogicalRect::default(), |bounds, quad| {
+            bounds.union(quad.bounds)
+        });
         let mut canvas = Canvas::new(bounds);
         for quad in quads {
             canvas.push_quad(quad);
@@ -1759,12 +1767,12 @@ fn drag_action(spec: &InputSpec) -> Action {
     Action::Custom(format_smolstr!("ui_kit.input.{}.drag", spec.name))
 }
 
-fn text_local_point(tree: &NodeTree, hit: HitResult, text: NodeId) -> Option<Point> {
+fn text_local_point(tree: &NodeTree, hit: HitResult, text: NodeId) -> Option<LogicalPoint> {
     let hit_node = tree.get(hit.node).ok()?;
     let text_node = tree.get(text).ok()?;
     let hit_bounds = hit_node.layout().bounds;
     let text_bounds = text_node.layout().bounds;
-    Some(Point::new(
+    Some(LogicalPoint::new(
         hit.local_point.x + hit_bounds.origin.x - text_bounds.origin.x,
         hit.local_point.y + hit_bounds.origin.y - text_bounds.origin.y,
     ))
@@ -1891,7 +1899,7 @@ mod tests {
             PointerButton,
         },
         interaction::ScrollHandle,
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeKind},
         paint::{
             color::{Color, ColorResolver},
@@ -2071,7 +2079,7 @@ mod tests {
                 .count()
         }
 
-        fn caret_quads(&self) -> Vec<Rect> {
+        fn caret_quads(&self) -> Vec<LogicalRect> {
             let window = self.window();
             let tree = self.app.app().window(window).expect("窗口存在").tree();
             let NodeKind::Canvas(canvas) = tree.get(self.node.caret).expect("节点存在").kind()
@@ -2146,7 +2154,7 @@ mod tests {
 
         fn click_node(&mut self, node: NodeId) {
             let bounds = self.app.probe().bounds(node).expect("节点已布局");
-            let point = Point::new(
+            let point = LogicalPoint::new(
                 bounds.origin.x + bounds.size.width * 0.5,
                 bounds.origin.y + bounds.size.height * 0.5,
             );
@@ -2580,11 +2588,16 @@ mod tests {
             .expect("文本已 shape");
         let caret_quad = harness.caret_quads().last().copied().expect("caret quad");
         assert!(
-            (caret_quad.origin.x - caret_rect.origin.x).abs() <= 0.5
-                && (caret_quad.origin.y - caret_rect.origin.y).abs() <= 0.5,
+            (caret_quad.origin.x - caret_rect.origin.x).value().abs() <= 0.5
+                && (caret_quad.origin.y - caret_rect.origin.y).value().abs() <= 0.5,
             "caret 画布必须与引擎 caret 矩形同源：{caret_quad:?} vs {caret_rect:?}"
         );
-        assert!((caret_quad.size.width - caret_rect.size.width).abs() <= 0.5);
+        assert!(
+            (caret_quad.size.width - caret_rect.size.width)
+                .value()
+                .abs()
+                <= 0.5
+        );
     }
 
     #[test]
@@ -2603,15 +2616,15 @@ mod tests {
             .text_caret_rect(harness.node.text, bullet_caret)
             .expect("脱敏文本已 shape");
         let caret_quad = harness.caret_quads().last().copied().expect("caret quad");
-        assert!((caret_quad.origin.x - caret_rect.origin.x).abs() <= 0.5);
-        assert!((caret_quad.origin.y - caret_rect.origin.y).abs() <= 0.5);
+        assert!((caret_quad.origin.x - caret_rect.origin.x).value().abs() <= 0.5);
+        assert!((caret_quad.origin.y - caret_rect.origin.y).value().abs() <= 0.5);
         let area = harness
             .app
             .app()
             .ime_cursor_area(harness.window())
             .expect("窗口存在")
             .expect("聚焦时必须登记 IME caret 区域");
-        assert!((area.origin.x - caret_rect.origin.x).abs() <= 0.5);
+        assert!((area.origin.x - caret_rect.origin.x).value().abs() <= 0.5);
     }
 
     #[test]
@@ -2647,8 +2660,8 @@ mod tests {
             .window_ref()
             .text_caret_rect(harness.node.text, 2)
             .expect("文本已 shape");
-        assert!((area.origin.x - caret_rect.origin.x).abs() <= 0.5);
-        assert!((area.origin.y - caret_rect.origin.y).abs() <= 0.5);
+        assert!((area.origin.x - caret_rect.origin.x).value().abs() <= 0.5);
+        assert!((area.origin.y - caret_rect.origin.y).value().abs() <= 0.5);
         harness.app.app_mut().set_focus(window, None);
         assert!(harness.node.sync(harness.app.app_mut()));
         assert!(!harness.state().is_focused());
@@ -2676,19 +2689,24 @@ mod tests {
         assert!(state.set_caret_from_point(
             window_ref,
             harness.node.text,
-            Point::new(1.0, bounds.size.height / 2.0),
+            LogicalPoint::new(px(1.0), bounds.size.height / 2.0),
             false
         ));
         assert_eq!(state.caret(), 0, "点在最左：字节 0");
         assert!(state.set_caret_from_point(
             window_ref,
             harness.node.text,
-            Point::new(bounds.size.width - 0.5, bounds.size.height / 2.0),
+            LogicalPoint::new(bounds.size.width - 0.5, bounds.size.height / 2.0),
             false
         ));
         assert_eq!(state.caret(), 2, "点在末尾：文本长度");
         assert!(state.text().is_char_boundary(state.caret()));
-        assert!(!state.set_caret_from_point(window_ref, harness.node.root, Point::ZERO, false));
+        assert!(!state.set_caret_from_point(
+            window_ref,
+            harness.node.root,
+            LogicalPoint::ZERO,
+            false
+        ));
         let _ = window;
     }
 
@@ -2700,7 +2718,7 @@ mod tests {
             .probe()
             .bounds(harness.node.text)
             .expect("已布局");
-        let position = Point::new(
+        let position = LogicalPoint::new(
             bounds.origin.x + 1.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -2868,7 +2886,7 @@ mod tests {
             .probe()
             .bounds(harness.node.root)
             .expect("已布局");
-        let position = Point::new(bounds.origin.x + 2.0, bounds.origin.y + 2.0);
+        let position = LogicalPoint::new(bounds.origin.x + 2.0, bounds.origin.y + 2.0);
         harness.app.inject(InputEvent::pointer_down(
             position,
             PointerButton::Primary,
@@ -3272,7 +3290,7 @@ mod tests {
             .scroll_state(&handle)
             .expect("滚动容器状态");
         assert!(
-            scroll.offset.x > 0.0,
+            scroll.offset.x.value() > 0.0,
             "200 字符的 caret 在末尾，必须横向滚动才能看见：{:?}",
             scroll.offset
         );
@@ -3300,8 +3318,8 @@ mod tests {
             .copied()
             .expect("caret 画布至少有一个 quad");
         assert!(
-            (caret_quad.origin.x - caret.origin.x).abs() <= 0.5
-                && (caret_quad.origin.y - caret.origin.y).abs() <= 0.5,
+            (caret_quad.origin.x - caret.origin.x).value().abs() <= 0.5
+                && (caret_quad.origin.y - caret.origin.y).value().abs() <= 0.5,
             "滚动后 caret 画布必须等于引擎屏幕坐标：quad={caret_quad:?}，caret={caret:?}，offset={:?}",
             scroll.offset
         );
@@ -3328,7 +3346,7 @@ mod tests {
             .scroll_state(&handle)
             .expect("滚动容器状态");
         assert!(
-            scroll.offset.x > 0.0,
+            scroll.offset.x.value() > 0.0,
             "选区末端在视口外，必须横向滚动才看得见：{:?}",
             scroll.offset
         );
@@ -3353,7 +3371,7 @@ mod tests {
         let absolute_zero = window_ref
             .text_caret_rect(harness.node.text, 0)
             .expect("屏幕原点");
-        let origin = Point::new(
+        let origin = LogicalPoint::new(
             absolute_zero.origin.x - local_zero.origin.x,
             absolute_zero.origin.y - local_zero.origin.y,
         );
@@ -3374,8 +3392,8 @@ mod tests {
         );
         let caret_quad = *quads.last().expect("caret quad");
         assert!(
-            (caret_quad.origin.x - caret.origin.x).abs() <= 0.5
-                && (caret_quad.origin.y - caret.origin.y).abs() <= 0.5,
+            (caret_quad.origin.x - caret.origin.x).value().abs() <= 0.5
+                && (caret_quad.origin.y - caret.origin.y).value().abs() <= 0.5,
             "caret quad 必须是屏幕坐标：quad={caret_quad:?}，caret={caret:?}，offset={:?}",
             scroll.offset
         );
@@ -3385,10 +3403,10 @@ mod tests {
         {
             let expected = rect.translate(origin);
             assert!(
-                (quad.origin.x - expected.origin.x).abs() <= 0.5
-                    && (quad.origin.y - expected.origin.y).abs() <= 0.5
-                    && (quad.size.width - expected.size.width).abs() <= 0.5
-                    && (quad.size.height - expected.size.height).abs() <= 0.5,
+                (quad.origin.x - expected.origin.x).value().abs() <= 0.5
+                    && (quad.origin.y - expected.origin.y).value().abs() <= 0.5
+                    && (quad.size.width - expected.size.width).value().abs() <= 0.5
+                    && (quad.size.height - expected.size.height).value().abs() <= 0.5,
                 "选区 quad 必须是局部矩形 + 屏幕原点：quad={quad:?}，expected={expected:?}"
             );
             assert!(
@@ -3409,7 +3427,7 @@ mod tests {
         }
         let handle = harness.scroll_handle().expect("横向滚动容器");
         let scroll = harness.app.app().scroll_state(&handle).expect("滚动状态");
-        assert!(scroll.offset.x > 0.0);
+        assert!(scroll.offset.x.value() > 0.0);
         let viewport = harness.node.viewport.expect("视口");
         let viewport_bounds = harness.app.probe().bounds(viewport).expect("视口布局");
         let text_bounds = harness
@@ -3417,7 +3435,7 @@ mod tests {
             .probe()
             .bounds(harness.node.text)
             .expect("文本布局");
-        let position = Point::new(
+        let position = LogicalPoint::new(
             viewport_bounds.origin.x + viewport_bounds.size.width - 2.0,
             text_bounds.origin.y + text_bounds.size.height / 2.0,
         );
@@ -3440,7 +3458,7 @@ mod tests {
         );
     }
 
-    fn caret_position(harness: &Harness, byte: usize) -> Point {
+    fn caret_position(harness: &Harness, byte: usize) -> LogicalPoint {
         let bounds = harness
             .app
             .probe()
@@ -3450,13 +3468,13 @@ mod tests {
             .window_ref()
             .text_caret_rect(harness.node.text, byte)
             .expect("caret 几何");
-        Point::new(
+        LogicalPoint::new(
             caret.origin.x + 0.5,
             bounds.origin.y + bounds.size.height / 2.0,
         )
     }
 
-    fn drag(harness: &mut Harness, from: Point, to: Point) {
+    fn drag(harness: &mut Harness, from: LogicalPoint, to: LogicalPoint) {
         harness.app.inject(InputEvent::pointer_down(
             from,
             PointerButton::Primary,
@@ -3502,7 +3520,7 @@ mod tests {
         let mut harness = harness(spec(), state("hello world"));
         harness.focus();
         let start = caret_position(&harness, 5);
-        let far_right = Point::new(2_000.0, start.y);
+        let far_right = LogicalPoint::new(px(2_000.0), start.y);
         drag(&mut harness, start, far_right);
         assert_eq!(
             harness.state().selection(),
@@ -3535,7 +3553,7 @@ mod tests {
         assert_eq!(harness.state().caret(), 8);
     }
 
-    fn click(harness: &mut Harness, position: Point) {
+    fn click(harness: &mut Harness, position: LogicalPoint) {
         harness.app.inject(InputEvent::pointer_down(
             position,
             PointerButton::Primary,
@@ -3746,7 +3764,7 @@ mod tests {
                 .expect("窗口存在")
                 .tree_mut();
             NodeBuilder::boxed()
-                .style(StyleBuilder::new().size(10.0, 10.0).build())
+                .style(StyleBuilder::new().size(px(10.0), px(10.0)).build())
                 .paint(PaintSpec {
                     background: Color::WHITE,
                     ..PaintSpec::default()

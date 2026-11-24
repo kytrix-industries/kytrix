@@ -12,7 +12,7 @@ use ui_core::{
     event::{Action, Event, KeyBinding, KeyCode, Modifiers},
     interaction::{ActionCtx, AnimatedValue, AnimationSpec, Easing},
     layout::LayoutOverride,
-    math::Rect,
+    math::{LogicalPx, LogicalRect, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -196,7 +196,7 @@ impl TabBar {
     }
 
     #[must_use]
-    pub fn indicator_rect(&self, app: &App) -> Option<Rect> {
+    pub fn indicator_rect(&self, app: &App) -> Option<LogicalRect> {
         let geometry = self.inner.geometry.borrow();
         let window = geometry.window?;
         let indicator = geometry.indicator?;
@@ -233,11 +233,11 @@ impl TabBar {
                     .flex_row()
                     .items_center()
                     .width_full()
-                    .padding(TRACK_PADDING)
-                    .gap(TAB_GAP)
+                    .padding(px(TRACK_PADDING))
+                    .gap(px(TAB_GAP))
                     .build(),
             )
-            .paint(PaintBuilder::new().rounded(TRACK_RADIUS).build())
+            .paint(PaintBuilder::new().rounded(px(TRACK_RADIUS)).build())
             .bind_style(move |cx| StylePatch {
                 background: Some(track_theme.role(cx, Role::SurfaceSunken)),
                 ..StylePatch::default()
@@ -264,7 +264,7 @@ impl TabBar {
                     .items_center()
                     .relative()
                     .width_full()
-                    .gap(TAB_GAP)
+                    .gap(px(TAB_GAP))
                     .build(),
             )
             .build(
@@ -278,8 +278,8 @@ impl TabBar {
             Some(
                 NodeBuilder::boxed()
                     .id(format_smolstr!("{}:indicator", inner.key))
-                    .layout_override(Rect::default())
-                    .paint(PaintBuilder::new().rounded(TRACK_RADIUS).build())
+                    .layout_override(LogicalRect::default())
+                    .paint(PaintBuilder::new().rounded(px(TRACK_RADIUS)).build())
                     .bind_style(move |cx| StylePatch {
                         background: Some(theme.role(cx, Role::SurfaceOverlay)),
                         ..StylePatch::default()
@@ -568,11 +568,11 @@ impl TabBar {
         ) else {
             return Ok(false);
         };
-        let rect = Rect::new(
-            *app.read_transient(&self.inner.indicator_left),
-            0.0,
-            *app.read_transient(&self.inner.indicator_width),
-            *app.read_transient(&self.inner.indicator_height),
+        let rect = LogicalRect::new(
+            px(*app.read_transient(&self.inner.indicator_left)),
+            px(0.0),
+            px(*app.read_transient(&self.inner.indicator_width)),
+            px(*app.read_transient(&self.inner.indicator_height)),
         );
         let current = app
             .window(window)
@@ -602,9 +602,9 @@ impl TabBar {
         let row_bounds = tree.get(row).ok()?.layout().bounds;
         let tab_bounds = tree.get(tab).ok()?.layout().bounds;
         Some((
-            tab_bounds.origin.x - row_bounds.origin.x,
-            tab_bounds.size.width,
-            tab_bounds.size.height,
+            f32::from(tab_bounds.origin.x - row_bounds.origin.x),
+            f32::from(tab_bounds.size.width),
+            f32::from(tab_bounds.size.height),
         ))
     }
 
@@ -678,11 +678,11 @@ fn close_palette() -> RolePalette {
     }
 }
 
-fn close_side(size: UnifiedSize) -> f32 {
+fn close_side(size: UnifiedSize) -> LogicalPx {
     match size {
-        UnifiedSize::Small => 12.0,
-        UnifiedSize::Medium => 16.0,
-        UnifiedSize::Large => 20.0,
+        UnifiedSize::Small => px(12.0),
+        UnifiedSize::Medium => px(16.0),
+        UnifiedSize::Large => px(20.0),
     }
 }
 
@@ -700,7 +700,7 @@ fn set_square_close_style(
     app: &mut App,
     window: WindowId,
     node: NodeId,
-    side: f32,
+    side: LogicalPx,
 ) -> Result<(), EngineError> {
     let style = StyleBuilder::new()
         .flex_row()
@@ -720,7 +720,7 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::{id::NodeId, tree::NodeKind},
         paint::color::{Color, ColorResolver},
         test_support::app::TestApp,
@@ -788,7 +788,7 @@ mod tests {
 
     fn click(app: &mut TestApp, node: NodeId) {
         let bounds = app.probe().bounds(node).expect("bounds");
-        let point = Point::new(
+        let point = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -919,15 +919,15 @@ mod tests {
             .expect("row");
         let row_bounds = harness.app.probe().bounds(row_node).expect("row");
         let first_bounds = harness.app.probe().bounds(first).expect("tab");
-        let expected_first = Rect::new(
+        let expected_first = LogicalRect::new(
             first_bounds.origin.x - row_bounds.origin.x,
-            0.0,
+            px(0.0),
             first_bounds.size.width,
             first_bounds.size.height,
         );
         assert!(
-            (row.origin.x - expected_first.origin.x).abs() < 0.5
-                && (row.size.width - expected_first.size.width).abs() < 0.5,
+            (row.origin.x - expected_first.origin.x).abs() < px(0.5)
+                && (row.size.width - expected_first.size.width).abs() < px(0.5),
             "初始指示条应覆盖第一个标签（实际 {row:?} / 期望 {expected_first:?}）"
         );
 
@@ -939,20 +939,20 @@ mod tests {
             .expect("indicator");
         let last = harness.bar.tab_nodes()[2];
         let last_bounds = harness.app.probe().bounds(last).expect("tab");
-        let expected_last = Rect::new(
+        let expected_last = LogicalRect::new(
             last_bounds.origin.x - row_bounds.origin.x,
-            0.0,
+            px(0.0),
             last_bounds.size.width,
             last_bounds.size.height,
         );
         assert!(
-            (rect.origin.x - expected_last.origin.x).abs() < 0.5,
+            (rect.origin.x - expected_last.origin.x).abs() < px(0.5),
             "指示条必须移动到最后一个标签（实际 {} / 期望 {}）",
             rect.origin.x,
             expected_last.origin.x
         );
         assert!(
-            (rect.size.width - expected_last.size.width).abs() < 0.5,
+            (rect.size.width - expected_last.size.width).abs() < px(0.5),
             "指示条宽度跟随标签"
         );
     }
@@ -1089,7 +1089,7 @@ mod tests {
         let tab = bar.tab_nodes()[0];
         let bounds = app.probe().bounds(tab).expect("tab");
         assert!(
-            bounds.size.width <= super::TAB_MAX_WIDTH + 0.5,
+            bounds.size.width <= px(super::TAB_MAX_WIDTH + 0.5),
             "标签宽度上限 160 px（实际 {}）",
             bounds.size.width
         );
@@ -1134,8 +1134,8 @@ mod tests {
             )
         };
         let bounds = harness.app.probe().bounds(close).expect("close bounds");
-        assert_eq!(bounds.size.width, 16.0, "Medium 关闭按钮 16 px");
-        assert_eq!(bounds.size.height, 16.0);
+        assert_eq!(bounds.size.width, px(16.0), "Medium 关闭按钮 16 px");
+        assert_eq!(bounds.size.height, px(16.0));
         assert_eq!(icon_size, taffy::style::Dimension::length(16.0), "X 满尺寸");
         let theme = Theme::of(Appearance::Light);
         assert_color(
@@ -1143,7 +1143,7 @@ mod tests {
             theme.role(Role::FgMuted),
             "常态前景 fg.muted",
         );
-        let point = Point::new(
+        let point = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );

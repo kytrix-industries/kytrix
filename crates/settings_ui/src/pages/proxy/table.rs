@@ -12,6 +12,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event},
     interaction::ActionCtx,
+    math::px,
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -293,7 +294,7 @@ impl PageView for ProxyTablePage {
                         .size_full()
                         .min_width_0()
                         .min_height_0()
-                        .gap(8.0)
+                        .gap(px(8.0))
                         .build(),
                 )
                 .build(tree, parent)
@@ -345,7 +346,7 @@ impl PageView for ProxyTablePage {
                 .overflow_hidden()
                 .relative()
                 .build(),
-            PaintBuilder::new().rounded(6.0).build(),
+            PaintBuilder::new().rounded(px(6.0)).build(),
             &theme,
             Some(Role::SurfaceSunken),
             Some(Role::LineDivider),
@@ -385,10 +386,10 @@ impl PageView for ProxyTablePage {
                 .style(
                     StyleBuilder::new()
                         .absolute()
-                        .left(0.0)
-                        .right(0.0)
-                        .top(0.0)
-                        .bottom(0.0)
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .bottom(px(0.0))
                         .flex_row()
                         .items_center()
                         .justify_center()
@@ -655,7 +656,7 @@ fn row_controls(
                 .items_center()
                 .justify_center()
                 .width_full()
-                .gap(ROW_GAP)
+                .gap(px(ROW_GAP))
                 .build(),
         )
         .build(tree, parent)?;
@@ -664,7 +665,7 @@ fn row_controls(
         let action = Action::Custom(format_smolstr!("{}.{row}.{suffix}", cell.action_prefix));
         let button = NodeBuilder::boxed()
             .id(format_smolstr!("SETTINGS_PROXY_ROW_{row}_{suffix}"))
-            .style(StyleBuilder::new().flex_none().padding(4.0).build())
+            .style(StyleBuilder::new().flex_none().padding(px(4.0)).build())
             .tab_stop(true)
             .on_click(action)
             .a11y(A11yOverride {

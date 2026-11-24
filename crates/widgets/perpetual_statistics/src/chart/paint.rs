@@ -2,7 +2,7 @@ use bytes::Bytes;
 use smol_str::SmolStr;
 use ui_core::{
     app::App,
-    math::{Point, Rect, Transform},
+    math::{LogicalPoint, LogicalPx, LogicalRect, Transform, px},
     paint::{
         canvas::Canvas,
         color::Color,
@@ -39,7 +39,7 @@ const LINE_SERIES: [Series; 2] = [Series::Amount, Series::Value];
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Hover {
     pub index: usize,
-    pub cursor_y: f32,
+    pub cursor_y: LogicalPx,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,8 +56,8 @@ pub(crate) struct Tooltip {
 
 #[derive(Default, Debug, PartialEq)]
 pub(crate) struct LineGeometry {
-    pub points: Option<Box<[Option<Point>]>>,
-    pub markers: Box<[Rect]>,
+    pub points: Option<Box<[Option<LogicalPoint>]>>,
+    pub markers: Box<[LogicalRect]>,
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -69,13 +69,13 @@ pub(crate) enum Prepared {
         ticks: Box<[PositionedTimeTick]>,
     },
     Bars {
-        bars: Box<[(Rect, Rect)]>,
+        bars: Box<[(LogicalRect, LogicalRect)]>,
         ticks: Box<[PositionedTimeTick]>,
     },
     Shares {
-        bars: Box<[(Rect, Rect)]>,
-        line: Option<Box<[Option<Point>]>>,
-        markers: Box<[Rect]>,
+        bars: Box<[(LogicalRect, LogicalRect)]>,
+        line: Option<Box<[Option<LogicalPoint>]>>,
+        markers: Box<[LogicalRect]>,
         ticks: Box<[PositionedTimeTick]>,
     },
 }
@@ -93,15 +93,15 @@ impl Prepared {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LegendMeasurements {
-    label_widths: [f32; MAX_SERIES],
-    entry_widths: [f32; MAX_SERIES],
-    pub content_width: f32,
+    label_widths: [LogicalPx; MAX_SERIES],
+    entry_widths: [LogicalPx; MAX_SERIES],
+    pub content_width: LogicalPx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub(crate) struct Measurements {
-    pub left_axis_width: Option<f32>,
-    pub right_axis_width: f32,
+    pub left_axis_width: Option<LogicalPx>,
+    pub right_axis_width: LogicalPx,
     pub legend: LegendMeasurements,
 }
 
@@ -144,14 +144,14 @@ fn widest_label_width(
     scale: &AxisScale,
     title: Option<&str>,
     style: &TextStyle,
-) -> f32 {
+) -> LogicalPx {
     scale
         .ticks
         .iter()
         .map(|tick| tick.label.as_str())
         .chain(title)
         .map(|label| text.width(app, label, style))
-        .fold(0.0, f32::max)
+        .fold(LogicalPx::ZERO, LogicalPx::max)
 }
 
 fn measure_legend(
@@ -168,7 +168,9 @@ fn measure_legend(
         measurements.label_widths[index] = label_width;
         measurements.entry_widths[index] = label_width + LEGEND_SWATCH_GAP;
     }
-    measurements.content_width = measurements.entry_widths[..count].iter().sum::<f32>()
+    measurements.content_width = measurements.entry_widths[..count]
+        .iter()
+        .fold(LogicalPx::ZERO, |total, width| total + *width)
         + LEGEND_ENTRY_GAP * count.saturating_sub(1) as f32;
     measurements
 }
@@ -255,7 +257,7 @@ pub(crate) fn prepare_ratio(
             short_share,
             layout.plot,
         ));
-        let center = Point::new(
+        let center = LogicalPoint::new(
             center_x,
             value_y(ratio_as_f64(bar.ratio), ratio.domain, layout.plot),
         );
@@ -281,7 +283,7 @@ fn line_geometry(
     values: impl Iterator<Item = f64>,
     point_count: usize,
     domain: super::axes::ValueDomain,
-    plot: Rect,
+    plot: LogicalRect,
 ) -> LineGeometry {
     let mut markers = Vec::with_capacity(point_count);
     let mut points = Vec::with_capacity(point_count);
@@ -290,7 +292,7 @@ fn line_geometry(
             points.push(None);
             continue;
         }
-        let position = Point::new(
+        let position = LogicalPoint::new(
             point_x(plot, point_count, index),
             value_y(value, domain, plot),
         );
@@ -317,31 +319,34 @@ fn time_ticks(
     )
 }
 
-pub(crate) fn line_geometry_mesh(points: &[Option<Point>], width: f32) -> Option<GeometryDesc> {
-    let half = (width / 2.0).max(0.5);
+pub(crate) fn line_geometry_mesh(
+    points: &[Option<LogicalPoint>],
+    width: LogicalPx,
+) -> Option<GeometryDesc> {
+    let half = (width / 2.0).max(px(0.5));
     let mut vertices = Vec::<[f32; 3]>::with_capacity(points.len() * 8);
     let mut indices = Vec::<u32>::with_capacity(points.len() * 12);
-    let mut min = Point::new(f32::INFINITY, f32::INFINITY);
-    let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
-    let mut push_quad = |corners: [Point; 4]| {
+    let mut min = LogicalPoint::new(px(f32::INFINITY), px(f32::INFINITY));
+    let mut max = LogicalPoint::new(px(f32::NEG_INFINITY), px(f32::NEG_INFINITY));
+    let mut push_quad = |corners: [LogicalPoint; 4]| {
         let base = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
         for corner in corners {
-            vertices.push([corner.x, corner.y, -1.0]);
-            min = Point::new(min.x.min(corner.x), min.y.min(corner.y));
-            max = Point::new(max.x.max(corner.x), max.y.max(corner.y));
+            vertices.push([f32::from(corner.x), f32::from(corner.y), -1.0]);
+            min = LogicalPoint::new(min.x.min(corner.x), min.y.min(corner.y));
+            max = LogicalPoint::new(max.x.max(corner.x), max.y.max(corner.y));
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     };
-    let square = |center: Point| {
+    let square = |center: LogicalPoint| {
         [
-            Point::new(center.x - half, center.y - half),
-            Point::new(center.x + half, center.y - half),
-            Point::new(center.x + half, center.y + half),
-            Point::new(center.x - half, center.y + half),
+            LogicalPoint::new(center.x - half, center.y - half),
+            LogicalPoint::new(center.x + half, center.y - half),
+            LogicalPoint::new(center.x + half, center.y + half),
+            LogicalPoint::new(center.x - half, center.y + half),
         ]
     };
 
-    let mut run: Vec<Point> = Vec::with_capacity(points.len());
+    let mut run: Vec<LogicalPoint> = Vec::with_capacity(points.len());
     for slot in points.iter().chain(std::iter::once(&None)) {
         let Some(point) = *slot else {
             if run.len() == 1 {
@@ -349,17 +354,20 @@ pub(crate) fn line_geometry_mesh(points: &[Option<Point>], width: f32) -> Option
             } else {
                 for window in run.windows(2) {
                     let (from, to) = (window[0], window[1]);
-                    let delta = Point::new(to.x - from.x, to.y - from.y);
-                    let length = delta.x.hypot(delta.y);
+                    let delta = LogicalPoint::new(to.x - from.x, to.y - from.y);
+                    let length = delta.x.value().hypot(delta.y.value());
                     if !length.is_finite() || length <= f32::EPSILON {
                         continue;
                     }
-                    let normal = Point::new(-delta.y / length * half, delta.x / length * half);
+                    let normal = LogicalPoint::new(
+                        -delta.y / length * half.value(),
+                        delta.x / length * half.value(),
+                    );
                     push_quad([
-                        Point::new(from.x + normal.x, from.y + normal.y),
-                        Point::new(to.x + normal.x, to.y + normal.y),
-                        Point::new(to.x - normal.x, to.y - normal.y),
-                        Point::new(from.x - normal.x, from.y - normal.y),
+                        LogicalPoint::new(from.x + normal.x, from.y + normal.y),
+                        LogicalPoint::new(to.x + normal.x, to.y + normal.y),
+                        LogicalPoint::new(to.x - normal.x, to.y - normal.y),
+                        LogicalPoint::new(from.x - normal.x, from.y - normal.y),
                     ]);
                 }
                 for point in &run {
@@ -371,7 +379,7 @@ pub(crate) fn line_geometry_mesh(points: &[Option<Point>], width: f32) -> Option
         };
         run.push(point);
     }
-    let bounds = Rect::new(min.x, min.y, max.x - min.x, max.y - min.y).outset(half / 2.0);
+    let bounds = LogicalRect::new(min.x, min.y, max.x - min.x, max.y - min.y).outset(half / 2.0);
     if vertices.is_empty() || indices.is_empty() || !bounds.is_finite() {
         return None;
     }
@@ -439,7 +447,7 @@ pub(crate) fn paint(
     paint_legend(&mut canvas, frame, &mut context);
     let _ = canvas.push_clip(ClipRect {
         rect: frame.layout.plot,
-        corner_radius: [0.0; 4],
+        corner_radius: [px(0.0); 4],
     });
     paint_series(&mut canvas, prepared, meshes, theme);
     if let Some(hover) = hover {
@@ -471,13 +479,13 @@ impl PaintContext<'_> {
         &mut self,
         canvas: &mut Canvas,
         text: &str,
-        x: f32,
-        width: f32,
-        y: f32,
+        x: LogicalPx,
+        width: LogicalPx,
+        y: LogicalPx,
         align: Align,
         style: &TextStyle,
     ) {
-        if width <= 0.0 {
+        if width <= LogicalPx::ZERO {
             return;
         }
         let line = self.text.line(self.app, text, style);
@@ -487,12 +495,12 @@ impl PaintContext<'_> {
             Align::Center => x + (width - line_width) / 2.0,
             Align::Right => x + width - line_width,
         };
-        if !canvas.push_shaped_text(&line, Point::new(origin_x, y)) {
+        if !canvas.push_shaped_text(&line, LogicalPoint::new(origin_x, y)) {
             self.whole = false;
         }
     }
 
-    fn width(&mut self, text: &str, style: &TextStyle) -> f32 {
+    fn width(&mut self, text: &str, style: &TextStyle) -> LogicalPx {
         self.text.width(self.app, text, style)
     }
 }
@@ -500,21 +508,21 @@ impl PaintContext<'_> {
 fn paint_plot_rules(canvas: &mut Canvas, layout: ChartLayout, color: Color) {
     push_quad(
         canvas,
-        Rect::new(
+        LogicalRect::new(
             layout.plot.origin.x,
             layout.plot.origin.y,
             layout.plot.size.width,
-            1.0,
+            px(1.0),
         ),
         color,
     );
     push_quad(
         canvas,
-        Rect::new(
+        LogicalRect::new(
             layout.plot.origin.x,
-            layout.plot.bottom() - 1.0,
+            layout.plot.bottom() - px(1.0),
             layout.plot.size.width,
-            1.0,
+            px(1.0),
         ),
         color,
     );
@@ -526,11 +534,11 @@ fn paint_value_grid(canvas: &mut Canvas, frame: &Frame<'_>, color: Color) {
         let y = value_y(tick.value, scale.domain, frame.layout.plot);
         push_quad(
             canvas,
-            Rect::new(
+            LogicalRect::new(
                 frame.layout.plot.origin.x,
                 y,
                 frame.layout.plot.size.width,
-                1.0,
+                px(1.0),
             ),
             color,
         );
@@ -541,14 +549,13 @@ fn paint_axes(canvas: &mut Canvas, frame: &Frame<'_>, context: &mut PaintContext
     let color = context.theme.role(Role::ChartAxis);
     let style = label_style(AXIS_FONT_SIZE, AXIS_LINE_HEIGHT, color);
     let layout = frame.layout;
-    let title_y = layout.content.origin.y + 2.0;
-    let inset = AXIS_TICK_TEXT_INSET;
+    let title_y = layout.content.origin.y + px(2.0);
     let (left_title, right_title) = frame.axis_titles;
     context.text(
         canvas,
         left_title,
         layout.left_axis.origin.x,
-        (layout.left_axis.size.width - inset).max(0.0),
+        (layout.left_axis.size.width - AXIS_TICK_TEXT_INSET).max(px(0.0)),
         title_y,
         Align::Right,
         &style,
@@ -559,8 +566,8 @@ fn paint_axes(canvas: &mut Canvas, frame: &Frame<'_>, context: &mut PaintContext
     context.text(
         canvas,
         right_title,
-        layout.right_axis.origin.x + inset,
-        (layout.right_axis.size.width - inset).max(0.0),
+        layout.right_axis.origin.x + AXIS_TICK_TEXT_INSET,
+        (layout.right_axis.size.width - AXIS_TICK_TEXT_INSET).max(px(0.0)),
         title_y,
         Align::Left,
         &style,
@@ -598,7 +605,7 @@ fn paint_value_axis(
         AxisSide::Left => (Align::Right, axis.origin.x),
         AxisSide::Right => (Align::Left, axis.origin.x + AXIS_TICK_TEXT_INSET),
     };
-    let width = (axis.size.width - AXIS_TICK_TEXT_INSET).max(0.0);
+    let width = (axis.size.width - AXIS_TICK_TEXT_INSET).max(px(0.0));
     for tick in &scale.ticks {
         let y = axis_label_y(value_y(tick.value, scale.domain, layout.plot), axis);
         context.text(
@@ -630,7 +637,7 @@ fn paint_time_axis(
             tick.label.as_str(),
             tick.origin_x,
             tick.width,
-            layout.time_axis.origin.y + 4.0,
+            layout.time_axis.origin.y + px(4.0),
             Align::Center,
             &style,
         );
@@ -643,9 +650,9 @@ fn paint_legend(canvas: &mut Canvas, frame: &Frame<'_>, context: &mut PaintConte
     let text_color = context.theme.role(Role::FgMuted);
     let style = label_style(AXIS_FONT_SIZE, AXIS_LINE_HEIGHT, text_color);
     let mut x = centered_legend_origin(layout, measurements.content_width);
-    let y = layout.legend.origin.y + 8.0;
+    let y = layout.legend.origin.y + px(8.0);
     for (index, entry) in frame.legend.iter().enumerate().take(MAX_SERIES) {
-        let swatch = Rect::new(x + 3.0, y + 2.0, 8.0, 8.0);
+        let swatch = LogicalRect::new(x + px(3.0), y + px(2.0), px(8.0), px(8.0));
         push_quad(canvas, swatch, entry.series.color(context.theme));
         context.text(
             canvas,
@@ -660,7 +667,7 @@ fn paint_legend(canvas: &mut Canvas, frame: &Frame<'_>, context: &mut PaintConte
     }
 }
 
-fn centered_legend_origin(layout: ChartLayout, content_width: f32) -> f32 {
+fn centered_legend_origin(layout: ChartLayout, content_width: LogicalPx) -> LogicalPx {
     let legend = layout.legend;
     if content_width <= legend.size.width {
         legend.origin.x + (legend.size.width - content_width) / 2.0
@@ -721,11 +728,12 @@ fn paint_series(
     }
 }
 
-fn paint_dashed_vertical(canvas: &mut Canvas, x: f32, plot: Rect, color: Color) {
+fn paint_dashed_vertical(canvas: &mut Canvas, x: LogicalPx, plot: LogicalRect, color: Color) {
+    let bottom = plot.bottom();
     let mut y = plot.origin.y;
-    while y < plot.bottom() {
-        let height = CROSSHAIR_DASH.min(plot.bottom() - y);
-        push_quad(canvas, Rect::new(x, y, 1.0, height), color);
+    while y < bottom {
+        let height = CROSSHAIR_DASH.min(bottom - y);
+        push_quad(canvas, LogicalRect::new(x, y, px(1.0), height), color);
         y += CROSSHAIR_PERIOD;
     }
 }
@@ -749,9 +757,9 @@ fn paint_tooltip(
     let content_width = std::iter::once(tooltip.title.as_str())
         .chain(tooltip.entries.iter().map(|entry| entry.text.as_str()))
         .map(|line| context.width(line, &line_style))
-        .fold(0.0f32, f32::max);
+        .fold(LogicalPx::ZERO, LogicalPx::max);
     let bounds = tooltip_bounds(
-        Point::new(
+        LogicalPoint::new(
             point_x(layout.plot, prepared.point_count(), hover.index),
             hover.cursor_y,
         ),
@@ -760,7 +768,7 @@ fn paint_tooltip(
         TOOLTIP_GAP,
     );
     paint_tooltip_surface(canvas, bounds, style, surface);
-    let text_width = (bounds.size.width - style.padding * 2.0).max(0.0);
+    let text_width = (bounds.size.width - style.padding * 2.0).max(px(0.0));
     context.text(
         canvas,
         tooltip.title.as_str(),
@@ -791,10 +799,10 @@ pub(crate) fn hover_markers(
     frame: &Frame<'_>,
     prepared: &Prepared,
     hover: Hover,
-) -> Vec<(Series, Rect)> {
+) -> Vec<(Series, LogicalRect)> {
     let count = prepared.point_count();
     let x = point_x(frame.layout.plot, count, hover.index);
-    let centers: Vec<(Series, f32)> = match prepared {
+    let centers: Vec<(Series, LogicalPx)> = match prepared {
         Prepared::Nothing | Prepared::Bars { .. } => Vec::new(),
         Prepared::Lines { series, .. } => series
             .iter()
@@ -813,19 +821,24 @@ pub(crate) fn hover_markers(
     };
     centers
         .into_iter()
-        .map(|(series, y)| (series, marker_bounds(Point::new(x, y), HOVER_MARKER_SIZE)))
+        .map(|(series, y)| {
+            (
+                series,
+                marker_bounds(LogicalPoint::new(x, y), HOVER_MARKER_SIZE),
+            )
+        })
         .collect()
 }
 
 fn paint_tooltip_surface(
     canvas: &mut Canvas,
-    bounds: Rect,
+    bounds: LogicalRect,
     style: TooltipStyle,
     background: Color,
 ) {
     let radius = style
         .radius
-        .max(0.0)
+        .max(px(0.0))
         .min(bounds.size.width / 2.0)
         .min(bounds.size.height / 2.0);
     canvas.push_quad(Quad {
@@ -838,10 +851,10 @@ fn paint_tooltip_surface(
     });
 }
 
-fn push_quad(canvas: &mut Canvas, bounds: Rect, fill: Color) {
+fn push_quad(canvas: &mut Canvas, bounds: LogicalRect, fill: Color) {
     canvas.push_quad(Quad {
         bounds,
-        corner_radius: [0.0; 4],
+        corner_radius: [px(0.0); 4],
         paint: QuadPaint::Solid { fill, border: None },
     });
 }

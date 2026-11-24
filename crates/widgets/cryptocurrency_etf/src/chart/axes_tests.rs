@@ -1,10 +1,10 @@
 use smol_str::{SmolStr, format_smolstr};
-use ui_core::math::{Point, Rect, Size};
+use ui_core::math::{LogicalPoint, LogicalRect, LogicalSize, px};
 
 use super::{axes::*, units::RectExt};
 
-fn plot() -> Rect {
-    Rect::new(10.0, 20.0, 300.0, 200.0)
+fn plot() -> LogicalRect {
+    LogicalRect::new(px(10.0), px(20.0), px(300.0), px(200.0))
 }
 
 fn labels(count: usize) -> Vec<SmolStr> {
@@ -83,7 +83,8 @@ fn the_axis_should_keep_zero_inside_a_crossing_domain() {
     assert_eq!(value(&values), vec![0.0, 5_000.0, 10_000.0, 15_000.0]);
     let zero_y = value_y(0.0, domain, plot());
     assert!(zero_y > plot().origin.y && zero_y < plot().bottom());
-    let zero_fraction = f64::from(plot().bottom() - zero_y) / f64::from(plot().size.height);
+    let zero_fraction =
+        f64::from((plot().bottom() - zero_y).value()) / f64::from(plot().size.height.value());
     let expected_fraction = -domain.minimum / domain.range();
     assert!((zero_fraction - expected_fraction).abs() < 1e-6);
 }
@@ -208,9 +209,9 @@ fn an_axis_should_not_drop_an_in_domain_zero_baseline() {
 
 #[test]
 fn nearest_index_should_clamp_to_the_plot_edges() {
-    assert_eq!(nearest_index(plot(), 5, -50.0), Some(0));
-    assert_eq!(nearest_index(plot(), 5, 500.0), Some(4));
-    assert_eq!(nearest_index(plot(), 0, 20.0), None);
+    assert_eq!(nearest_index(plot(), 5, px(-50.0)), Some(0));
+    assert_eq!(nearest_index(plot(), 5, px(500.0)), Some(4));
+    assert_eq!(nearest_index(plot(), 0, px(20.0)), None);
 }
 
 #[test]
@@ -233,7 +234,7 @@ fn a_single_point_should_be_centered_in_the_plot() {
 fn value_y_should_map_zero_between_inflows_and_outflows() {
     let domain = ValueDomain::new(-10.0, 10.0);
 
-    assert_eq!(value_y(0.0, domain, plot()), 120.0);
+    assert_eq!(value_y(0.0, domain, plot()), px(120.0));
 }
 
 #[test]
@@ -241,8 +242,8 @@ fn axis_labels_should_be_centered_and_clamped_inside_the_axis() {
     let axis = plot();
 
     assert_eq!(
-        axis_label_y(120.0, axis),
-        120.0 - super::palette::AXIS_LINE_HEIGHT / 2.0
+        axis_label_y(px(120.0), axis),
+        px(120.0) - super::palette::AXIS_LINE_HEIGHT / 2.0
     );
     assert_eq!(axis_label_y(axis.origin.y, axis), axis.origin.y);
     assert_eq!(
@@ -269,19 +270,19 @@ fn a_bar_should_grow_from_the_zero_line_whichever_way_it_points() {
     assert_eq!(outflow.origin.y, baseline, "an outflow hangs from it");
     assert_eq!(outflow.bottom(), plot.bottom());
     assert_eq!(inflow.origin.x, outflow.origin.x, "one bar per day");
-    assert!(inflow.size.width >= 1.0);
+    assert!(inflow.size.width >= px(1.0));
 }
 
 #[test]
 fn a_layout_should_measure_both_axes_and_drop_an_absent_one() {
-    let bounds = Rect::new(0.0, 0.0, 640.0, 360.0);
-    let dual = ChartLayout::new(bounds, 80.0, Some(100.0));
-    let single = ChartLayout::new(bounds, 80.0, None);
+    let bounds = LogicalRect::new(px(0.0), px(0.0), px(640.0), px(360.0));
+    let dual = ChartLayout::new(bounds, px(80.0), Some(px(100.0)));
+    let single = ChartLayout::new(bounds, px(80.0), None);
 
-    assert_eq!(dual.left_axis.size.width, 92.0);
-    assert_eq!(dual.right_axis.size.width, 112.0);
-    assert_eq!(single.left_axis.size.width, 92.0);
-    assert_eq!(single.right_axis.size.width, 0.0);
+    assert_eq!(dual.left_axis.size.width, px(92.0));
+    assert_eq!(dual.right_axis.size.width, px(112.0));
+    assert_eq!(single.left_axis.size.width, px(92.0));
+    assert_eq!(single.right_axis.size.width, px(0.0));
     assert_eq!(dual.plot.origin.y - bounds.origin.y, TOP_INSET);
     assert_eq!(dual.time_axis.origin.y, dual.plot.bottom());
     assert_eq!(dual.content.origin, bounds.origin);
@@ -289,41 +290,41 @@ fn a_layout_should_measure_both_axes_and_drop_an_absent_one() {
 
 #[test]
 fn a_layout_should_grow_its_content_rather_than_squeeze_a_label() {
-    let bounds = Rect::new(0.0, 0.0, 240.0, 360.0);
-    let layout = ChartLayout::new(bounds, 500.0, Some(500.0));
+    let bounds = LogicalRect::new(px(0.0), px(0.0), px(240.0), px(360.0));
+    let layout = ChartLayout::new(bounds, px(500.0), Some(px(500.0)));
 
-    assert_eq!(layout.left_axis.size.width, 512.0);
-    assert_eq!(layout.right_axis.size.width, 512.0);
+    assert_eq!(layout.left_axis.size.width, px(512.0));
+    assert_eq!(layout.right_axis.size.width, px(512.0));
     assert_eq!(layout.plot.size.width, MINIMUM_PLOT_WIDTH);
-    assert_eq!(layout.content.size.width, 1_072.0);
+    assert_eq!(layout.content.size.width, px(1_072.0));
 }
 
 #[test]
 fn a_layout_should_never_be_smaller_than_the_chart_it_draws() {
-    let bounds = Rect::new(0.0, 0.0, 120.0, 90.0);
-    let layout = ChartLayout::new(bounds, 20.0, Some(20.0));
+    let bounds = LogicalRect::new(px(0.0), px(0.0), px(120.0), px(90.0));
+    let layout = ChartLayout::new(bounds, px(20.0), Some(px(20.0)));
 
     assert_eq!(layout.content.size.width, CHART_MIN_CONTENT_WIDTH);
     assert_eq!(layout.content.size.height, CHART_MIN_CONTENT_HEIGHT);
-    assert!(layout.plot.size.width > 0.0);
-    assert!(layout.plot.size.height > 0.0);
+    assert!(layout.plot.size.width > px(0.0));
+    assert!(layout.plot.size.height > px(0.0));
 }
 
 #[test]
 fn the_content_minimum_should_account_for_both_axes() {
     assert_eq!(
-        content_min_size(80.0, Some(100.0)),
-        Size::new(640.0, 360.0),
+        content_min_size(px(80.0), Some(px(100.0))),
+        LogicalSize::new(px(640.0), px(360.0)),
         "labels that fit the chart's floor report the floor"
     );
     assert_eq!(
-        content_min_size(500.0, Some(500.0)),
-        Size::new(1_072.0, 360.0),
+        content_min_size(px(500.0), Some(px(500.0))),
+        LogicalSize::new(px(1_072.0), px(360.0)),
         "labels wider than the floor grow the content to them"
     );
     assert_eq!(
-        content_min_size(700.0, None),
-        Size::new(760.0, 360.0),
+        content_min_size(px(700.0), None),
+        LogicalSize::new(px(760.0), px(360.0)),
         "a chart with one axis needs that axis' width and the plot beside it"
     );
 }
@@ -331,8 +332,16 @@ fn the_content_minimum_should_account_for_both_axes() {
 #[test]
 fn the_time_axis_should_label_both_ends_and_never_overlap() {
     let labels = labels(30);
-    let wide = ChartLayout::new(Rect::new(0.0, 0.0, 640.0, 360.0), 80.0, Some(100.0));
-    let narrow = ChartLayout::new(Rect::new(0.0, 0.0, 240.0, 360.0), 500.0, Some(500.0));
+    let wide = ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(640.0), px(360.0)),
+        px(80.0),
+        Some(px(100.0)),
+    );
+    let narrow = ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(240.0), px(360.0)),
+        px(500.0),
+        Some(px(500.0)),
+    );
 
     let wide_ticks = position_time_ticks(&labels, wide);
     assert!(wide_ticks.len() > 1, "a wide plot labels more than one day");
@@ -365,15 +374,24 @@ fn the_time_axis_should_label_both_ends_and_never_overlap() {
 
 #[test]
 fn an_empty_window_should_label_no_days() {
-    let layout = ChartLayout::new(Rect::new(0.0, 0.0, 640.0, 360.0), 80.0, Some(100.0));
+    let layout = ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(640.0), px(360.0)),
+        px(80.0),
+        Some(px(100.0)),
+    );
 
     assert!(position_time_ticks(&[], layout).is_empty());
 }
 
 #[test]
 fn a_tooltip_should_fit_inside_a_narrow_plot() {
-    let narrow = Rect::new(0.0, 0.0, 24.0, 40.0);
-    let bounds = tooltip_bounds(Point::new(12.0, 20.0), Size::new(230.0, 82.0), narrow, 10.0);
+    let narrow = LogicalRect::new(px(0.0), px(0.0), px(24.0), px(40.0));
+    let bounds = tooltip_bounds(
+        LogicalPoint::new(px(12.0), px(20.0)),
+        LogicalSize::new(px(230.0), px(82.0)),
+        narrow,
+        px(10.0),
+    );
 
     assert!(bounds.size.width <= narrow.size.width);
     assert!(bounds.size.height <= narrow.size.height);
@@ -385,26 +403,26 @@ fn a_tooltip_should_fit_inside_a_narrow_plot() {
 fn a_tooltip_should_flip_side_rather_than_leave_the_plot() {
     let plot = plot();
     let at_right = tooltip_bounds(
-        Point::new(plot.right() - 2.0, plot.origin.y),
-        Size::new(60.0, 40.0),
+        LogicalPoint::new(plot.right() - px(2.0), plot.origin.y),
+        LogicalSize::new(px(60.0), px(40.0)),
         plot,
-        10.0,
+        px(10.0),
     );
     let at_left = tooltip_bounds(
-        Point::new(plot.origin.x + 2.0, plot.origin.y),
-        Size::new(60.0, 40.0),
+        LogicalPoint::new(plot.origin.x + 2.0, plot.origin.y),
+        LogicalSize::new(px(60.0), px(40.0)),
         plot,
-        10.0,
+        px(10.0),
     );
 
     assert!(at_right.right() <= plot.right());
     assert!(
-        at_right.origin.x < plot.right() - 2.0,
+        at_right.origin.x < plot.right() - px(2.0),
         "it moves left of the pointer"
     );
     assert!(at_left.origin.x >= plot.origin.x);
     assert!(
-        at_left.origin.x > plot.origin.x + 2.0,
+        at_left.origin.x > plot.origin.x + px(2.0),
         "it moves right of the pointer"
     );
 }

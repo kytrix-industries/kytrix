@@ -3,7 +3,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         canvas::Canvas,
@@ -35,9 +35,9 @@ const BAND_RATIO: f32 = 0.09;
 
 const GAP_RATIO: f32 = 0.65;
 
-const MIN_CANVAS_WIDTH: f32 = 96.0;
+const MIN_CANVAS_WIDTH: LogicalPx = px(96.0);
 
-const MIN_CANVAS_HEIGHT: f32 = 72.0;
+const MIN_CANVAS_HEIGHT: LogicalPx = px(72.0);
 
 const SCORE_TEXT_RADIUS_RATIO: f32 = 0.35;
 
@@ -55,11 +55,11 @@ const INDICATOR_RATIO: f32 = 1.33;
 
 const INDICATOR_HALO_RATIO: f32 = 0.2;
 
-const MIN_INDICATOR_HALO: f32 = 2.0;
+const MIN_INDICATOR_HALO: LogicalPx = px(2.0);
 
-const MAX_INDICATOR_HALO: f32 = 16.0;
+const MAX_INDICATOR_HALO: LogicalPx = px(16.0);
 
-const MESH_STEP_LENGTH: f32 = 2.0;
+const MESH_STEP_LENGTH: LogicalPx = px(2.0);
 
 const MESH_MIN_STEPS: f32 = 4.0;
 
@@ -71,18 +71,18 @@ const EDGE_COVERAGE: f32 = 0.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GaugeGeometry {
-    center: Point,
-    cap_radius: f32,
-    band_radius: f32,
-    outer_radius: f32,
-    inner_radius: f32,
-    indicator_radius: f32,
-    indicator_halo: f32,
+    center: LogicalPoint,
+    cap_radius: LogicalPx,
+    band_radius: LogicalPx,
+    outer_radius: LogicalPx,
+    inner_radius: LogicalPx,
+    indicator_radius: LogicalPx,
+    indicator_halo: LogicalPx,
     gap_half: f32,
 }
 
 impl GaugeGeometry {
-    fn compute(bounds: Rect) -> Option<Self> {
+    fn compute(bounds: LogicalRect) -> Option<Self> {
         let width = bounds.size.width;
         let height = bounds.size.height;
         if !width.is_finite() || !height.is_finite() {
@@ -98,15 +98,17 @@ impl GaugeGeometry {
         let indicator_halo =
             (band * INDICATOR_HALO_RATIO).clamp(MIN_INDICATOR_HALO, MAX_INDICATOR_HALO);
         let indicator_reach = indicator_radius + indicator_halo;
-        let band_radius = (width / 2.0 - indicator_reach).min(height - 2.0 * indicator_reach);
-        if band_radius <= 0.0 {
+        let band_radius = (width / 2.0 - indicator_reach).min(height - indicator_reach * 2.0);
+        if band_radius <= LogicalPx::ZERO {
             return None;
         }
         let gap_half = ((band * GAP_RATIO) / band_radius).to_degrees();
-        let center_y = bounds.origin.y + (height + band_radius) / 2.0;
 
         Some(Self {
-            center: Point::new(bounds.origin.x + width / 2.0, center_y),
+            center: LogicalPoint::new(
+                bounds.origin.x + width / 2.0,
+                bounds.origin.y + (height + band_radius) / 2.0,
+            ),
             cap_radius,
             band_radius,
             outer_radius: band_radius + cap_radius,
@@ -129,16 +131,16 @@ impl GaugeGeometry {
         (start + self.gap_half, end - self.gap_half)
     }
 
-    fn point_at(&self, angle: f32, radius: f32) -> Point {
+    fn point_at(&self, angle: f32, radius: LogicalPx) -> LogicalPoint {
         let radians = angle.to_radians();
 
-        Point::new(
+        LogicalPoint::new(
             self.center.x + radius * radians.cos(),
             self.center.y + radius * radians.sin(),
         )
     }
 
-    fn cap_centers(&self) -> [(Point, usize); CAP_COUNT] {
+    fn cap_centers(&self) -> [(LogicalPoint, usize); CAP_COUNT] {
         std::array::from_fn(|index| {
             let segment = index / 2;
             let (start, end) = self.arc_span(segment);
@@ -148,7 +150,7 @@ impl GaugeGeometry {
         })
     }
 
-    fn indicator_center(&self, score: u8) -> Point {
+    fn indicator_center(&self, score: u8) -> LogicalPoint {
         let angle = START_ANGLE + SWEEP * f32::from(score) / 100.0;
 
         self.point_at(angle, self.band_radius)
@@ -171,26 +173,26 @@ impl GaugeGeometry {
 
     fn band_mesh(&self, index: usize) -> BandMesh {
         let (start, end) = self.arc_span(index);
-        let arc_length = (end - start).to_radians() * self.band_radius;
+        let arc_length = self.band_radius * (end - start).to_radians();
         let steps = (arc_length / MESH_STEP_LENGTH)
             .ceil()
             .clamp(MESH_MIN_STEPS, MESH_MAX_STEPS) as usize;
         let rings = [
             (self.outer_radius, EDGE_COVERAGE),
-            (self.band_radius, -self.cap_radius),
+            (self.band_radius, -self.cap_radius.value()),
             (self.inner_radius, EDGE_COVERAGE),
         ];
 
         let mut vertices = Vec::with_capacity((steps + 1) * rings.len() * 3);
-        let mut min = Point::new(f32::INFINITY, f32::INFINITY);
-        let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        let mut min = LogicalPoint::new(px(f32::INFINITY), px(f32::INFINITY));
+        let mut max = LogicalPoint::new(px(f32::NEG_INFINITY), px(f32::NEG_INFINITY));
         for step in 0..=steps {
             let angle = start + (end - start) * step as f32 / steps as f32;
             for (radius, coverage) in rings {
                 let point = self.point_at(angle, radius);
-                min = Point::new(min.x.min(point.x), min.y.min(point.y));
-                max = Point::new(max.x.max(point.x), max.y.max(point.y));
-                vertices.extend_from_slice(&[point.x, point.y, coverage]);
+                min = LogicalPoint::new(min.x.min(point.x), min.y.min(point.y));
+                max = LogicalPoint::new(max.x.max(point.x), max.y.max(point.y));
+                vertices.extend_from_slice(&[point.x.value(), point.y.value(), coverage]);
             }
         }
 
@@ -205,7 +207,7 @@ impl GaugeGeometry {
         BandMesh {
             vertices,
             indices,
-            bounds: Rect::new(min.x, min.y, max.x - min.x, max.y - min.y),
+            bounds: LogicalRect::new(min.x, min.y, max.x - min.x, max.y - min.y),
         }
     }
 }
@@ -213,7 +215,7 @@ impl GaugeGeometry {
 struct BandMesh {
     vertices: Vec<f32>,
     indices: Vec<u32>,
-    bounds: Rect,
+    bounds: LogicalRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -251,7 +253,7 @@ pub(crate) fn level_color(theme: &Theme, level: Level) -> Color {
 
 #[derive(Clone, Debug, PartialEq)]
 struct GaugeKey {
-    bounds: Rect,
+    bounds: LogicalRect,
     score: u8,
     level: SmolStr,
     colors: GaugeColors,
@@ -261,7 +263,7 @@ struct GaugeKey {
 impl GaugeKey {
     fn matches(
         &self,
-        bounds: Rect,
+        bounds: LogicalRect,
         score: u8,
         level: &SmolStr,
         colors: &GaugeColors,
@@ -306,7 +308,7 @@ impl Gauge {
             .min_width_0()
             .min_height_0()
             .build();
-        let node = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let node = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(GAUGE_SELECTOR)
             .style(style)
             .bind_style(move |read| {
@@ -353,7 +355,7 @@ impl Gauge {
         let mut canvas = Canvas::new(bounds);
         let _ = canvas.push_clip(ClipRect {
             rect: bounds,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
         let mut bands = Vec::with_capacity(SEGMENT_COUNT);
         if let Some(geometry) = &geometry {
@@ -481,21 +483,21 @@ fn register_band(app: &mut App, mesh: &BandMesh) -> Result<GeometryId, EngineErr
     })
 }
 
-fn text_style(size: f32, color: Color) -> TextStyle {
+fn text_style(size: LogicalPx, color: Color) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.color = color;
 
     style
 }
 
-fn text_origin(box_: Rect, line: ui_core::math::Size) -> Point {
-    Point::new(
+fn text_origin(box_: LogicalRect, line: LogicalSize) -> LogicalPoint {
+    LogicalPoint::new(
         box_.origin.x + (box_.size.width - line.width) / 2.0,
         box_.origin.y,
     )
 }
 
-fn text_sizes(bounds: Rect, geometry: Option<GaugeGeometry>) -> (f32, f32) {
+fn text_sizes(bounds: LogicalRect, geometry: Option<GaugeGeometry>) -> (LogicalPx, LogicalPx) {
     let score_size = match geometry {
         Some(geometry) => geometry.band_radius * SCORE_TEXT_RADIUS_RATIO,
         None => bounds.size.width.min(bounds.size.height) * SCORE_TEXT_FALLBACK_RATIO,
@@ -505,11 +507,11 @@ fn text_sizes(bounds: Rect, geometry: Option<GaugeGeometry>) -> (f32, f32) {
 }
 
 fn text_boxes(
-    bounds: Rect,
+    bounds: LogicalRect,
     geometry: Option<GaugeGeometry>,
-    score_height: f32,
-    level_height: f32,
-) -> (Rect, Rect) {
+    score_height: LogicalPx,
+    level_height: LogicalPx,
+) -> (LogicalRect, LogicalRect) {
     let gap = level_height * TEXT_LINE_GAP_RATIO;
     let stacked = score_height + gap + level_height;
     let top = match geometry {
@@ -518,8 +520,8 @@ fn text_boxes(
     };
 
     (
-        Rect::new(bounds.origin.x, top, bounds.size.width, score_height),
-        Rect::new(
+        LogicalRect::new(bounds.origin.x, top, bounds.size.width, score_height),
+        LogicalRect::new(
             bounds.origin.x,
             top + score_height + gap,
             bounds.size.width,
@@ -528,8 +530,8 @@ fn text_boxes(
     )
 }
 
-fn circle_bounds(center: Point, radius: f32) -> Rect {
-    Rect::new(
+fn circle_bounds(center: LogicalPoint, radius: LogicalPx) -> LogicalRect {
+    LogicalRect::new(
         center.x - radius,
         center.y - radius,
         radius * 2.0,
@@ -537,7 +539,7 @@ fn circle_bounds(center: Point, radius: f32) -> Rect {
     )
 }
 
-fn circle_quad(center: Point, radius: f32, color: Color) -> Quad {
+fn circle_quad(center: LogicalPoint, radius: LogicalPx, color: Color) -> Quad {
     Quad {
         bounds: circle_bounds(center, radius),
         corner_radius: [radius; 4],
@@ -555,26 +557,26 @@ mod tests {
     use super::*;
     use crate::model::Level;
 
-    fn canvas() -> Rect {
-        Rect::new(0.0, 0.0, 400.0, 240.0)
+    fn canvas() -> LogicalRect {
+        LogicalRect::new(px(0.0), px(0.0), px(400.0), px(240.0))
     }
 
     fn geometry() -> GaugeGeometry {
         GaugeGeometry::compute(canvas()).expect("a normal canvas should hold a gauge")
     }
 
-    fn distance(from: Point, to: Point) -> f32 {
-        let dx = from.x - to.x;
-        let dy = from.y - to.y;
+    fn distance(from: LogicalPoint, to: LogicalPoint) -> f32 {
+        let dx = from.x.value() - to.x.value();
+        let dy = from.y.value() - to.y.value();
 
         (dx * dx + dy * dy).sqrt()
     }
 
-    fn farthest_corner(bounds: Rect, center: Point) -> f32 {
+    fn farthest_corner(bounds: LogicalRect, center: LogicalPoint) -> f32 {
         [
             bounds.origin,
-            Point::new(bounds.max().x, bounds.origin.y),
-            Point::new(bounds.origin.x, bounds.max().y),
+            LogicalPoint::new(bounds.max().x, bounds.origin.y),
+            LogicalPoint::new(bounds.origin.x, bounds.max().y),
             bounds.max(),
         ]
         .into_iter()
@@ -647,7 +649,7 @@ mod tests {
         for index in 0..SEGMENT_COUNT - 1 {
             let left = caps[index * 2 + 1].0;
             let right = caps[(index + 1) * 2].0;
-            let separation = distance(left, right);
+            let separation = px(distance(left, right));
 
             assert!(
                 separation > cap_diameter,
@@ -671,7 +673,7 @@ mod tests {
             let radius = distance(center, geometry.center);
 
             assert!(
-                (radius - geometry.band_radius).abs() < 0.01,
+                (px(radius) - geometry.band_radius).abs() < px(0.01),
                 "an end cap off the centre line would not round its band"
             );
         }
@@ -688,7 +690,7 @@ mod tests {
         let right = geometry.center.x + reach;
 
         assert!(
-            (geometry.outer_radius - (geometry.band_radius + geometry.cap_radius)).abs() < 0.01,
+            (geometry.outer_radius - (geometry.band_radius + geometry.cap_radius)).abs() < px(0.01),
             "the band's outermost point is the band plus one cap"
         );
         assert!(
@@ -713,11 +715,11 @@ mod tests {
         let left_margin = left - canvas.origin.x;
         let right_margin = canvas.max().x - right;
         assert!(
-            (top_margin - bottom_margin).abs() < 0.01,
+            (top_margin - bottom_margin).abs() < px(0.01),
             "the gauge block is centred vertically in the canvas"
         );
         assert!(
-            (left_margin - right_margin).abs() < 0.01,
+            (left_margin - right_margin).abs() < px(0.01),
             "the gauge block is centred horizontally in the canvas"
         );
 
@@ -737,18 +739,18 @@ mod tests {
         let right = geometry.indicator_center(100);
 
         assert!(
-            (left.x - geometry.center.x + band).abs() < 0.01
-                && (left.y - geometry.center.y).abs() < 0.01,
+            (left.x - geometry.center.x + band).abs() < px(0.01)
+                && (left.y - geometry.center.y).abs() < px(0.01),
             "zero is the left end of the half circle"
         );
         assert!(
-            (top.x - geometry.center.x).abs() < 0.01
-                && (top.y - geometry.center.y + band).abs() < 0.01,
+            (top.x - geometry.center.x).abs() < px(0.01)
+                && (top.y - geometry.center.y + band).abs() < px(0.01),
             "fifty is the top of the half circle"
         );
         assert!(
-            (right.x - geometry.center.x - band).abs() < 0.01
-                && (right.y - geometry.center.y).abs() < 0.01,
+            (right.x - geometry.center.x - band).abs() < px(0.01)
+                && (right.y - geometry.center.y).abs() < px(0.01),
             "one hundred is the right end of the half circle"
         );
 
@@ -765,16 +767,23 @@ mod tests {
 
     #[test]
     fn a_canvas_below_the_threshold_should_have_no_gauge() {
-        let too_short = Rect::new(0.0, 0.0, MIN_CANVAS_WIDTH, MIN_CANVAS_HEIGHT - 1.0);
-        let too_narrow = Rect::new(0.0, 0.0, MIN_CANVAS_WIDTH - 1.0, MIN_CANVAS_HEIGHT);
-        let empty = Rect::new(0.0, 0.0, 0.0, 0.0);
+        let too_short =
+            LogicalRect::new(px(0.0), px(0.0), MIN_CANVAS_WIDTH, MIN_CANVAS_HEIGHT - 1.0);
+        let too_narrow =
+            LogicalRect::new(px(0.0), px(0.0), MIN_CANVAS_WIDTH - 1.0, MIN_CANVAS_HEIGHT);
+        let empty = LogicalRect::new(px(0.0), px(0.0), px(0.0), px(0.0));
 
         assert!(GaugeGeometry::compute(too_short).is_none());
         assert!(GaugeGeometry::compute(too_narrow).is_none());
         assert!(GaugeGeometry::compute(empty).is_none());
         assert!(
-            GaugeGeometry::compute(Rect::new(0.0, 0.0, MIN_CANVAS_WIDTH, MIN_CANVAS_HEIGHT))
-                .is_some(),
+            GaugeGeometry::compute(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                MIN_CANVAS_WIDTH,
+                MIN_CANVAS_HEIGHT
+            ))
+            .is_some(),
             "the threshold itself still draws"
         );
     }
@@ -842,7 +851,7 @@ mod tests {
             "the marker's diameter is wider than the band"
         );
         assert!(
-            (geometry.indicator_radius - geometry.cap_radius * INDICATOR_RATIO).abs() < 0.01,
+            (geometry.indicator_radius - geometry.cap_radius * INDICATOR_RATIO).abs() < px(0.01),
             "the marker's radius is the band end's radius times the reference's ratio"
         );
 
@@ -871,7 +880,7 @@ mod tests {
     #[test]
     fn the_indicator_ring_should_follow_the_band_with_a_floor_and_a_ceiling() {
         let geometry_of = |width: f32, height: f32| {
-            GaugeGeometry::compute(Rect::new(0.0, 0.0, width, height))
+            GaugeGeometry::compute(LogicalRect::new(px(0.0), px(0.0), px(width), px(height)))
                 .expect("the fixture canvas holds a gauge")
         };
 
@@ -885,11 +894,11 @@ mod tests {
             "a tiny gauge keeps the ring at its floor"
         );
         assert!(
-            (medium.indicator_halo - 4.32).abs() < 0.01,
+            (medium.indicator_halo - px(4.32)).abs() < px(0.01),
             "a middle-sized gauge gets twenty percent of its band"
         );
         assert!(
-            (large.indicator_halo - 14.4).abs() < 0.01,
+            (large.indicator_halo - px(14.4)).abs() < px(0.01),
             "a large gauge still gets twenty percent of its band"
         );
         assert_eq!(
@@ -916,7 +925,7 @@ mod tests {
                 "every corner of a cap is rounded by the cap's radius"
             );
             assert!(
-                farthest_corner(quad.bounds, geometry.center) > geometry.outer_radius,
+                px(farthest_corner(quad.bounds, geometry.center)) > geometry.outer_radius,
                 "a square cap's corner lies outside the band's outer edge, which is \
                  why that corner is not what the quad paints"
             );
@@ -979,7 +988,8 @@ mod tests {
                 deepest = deepest.min(coverage);
             }
             assert_eq!(
-                deepest, -geometry.cap_radius,
+                deepest,
+                -geometry.cap_radius.value(),
                 "the centre ring is the saturated inside of the band"
             );
             assert!(
@@ -993,7 +1003,7 @@ mod tests {
     #[test]
     fn the_score_and_the_level_name_should_not_overlap_above_the_centre() {
         let gauge_canvas = canvas();
-        let words_only = Rect::new(0.0, 0.0, 400.0, 60.0);
+        let words_only = LogicalRect::new(px(0.0), px(0.0), px(400.0), px(60.0));
         let gauge = GaugeGeometry::compute(gauge_canvas);
         let no_gauge = GaugeGeometry::compute(words_only);
         assert!(gauge.is_some(), "the fixture canvas holds a gauge");
@@ -1031,11 +1041,11 @@ mod tests {
             );
             let center = bounds.origin.x + bounds.size.width / 2.0;
             assert!(
-                (score_box.origin.x + score_box.size.width / 2.0 - center).abs() < 0.01,
+                (score_box.origin.x + score_box.size.width / 2.0 - center).abs() < px(0.01),
                 "the score is centred on the arc's centre line"
             );
             assert!(
-                (level_box.origin.x + level_box.size.width / 2.0 - center).abs() < 0.01,
+                (level_box.origin.x + level_box.size.width / 2.0 - center).abs() < px(0.01),
                 "and so is the level's name"
             );
         }
@@ -1043,8 +1053,8 @@ mod tests {
 
     #[test]
     fn a_narrow_canvas_should_shrink_the_reading_with_the_band() {
-        let wide = Rect::new(0.0, 0.0, 800.0, 800.0);
-        let narrow = Rect::new(0.0, 0.0, 200.0, 800.0);
+        let wide = LogicalRect::new(px(0.0), px(0.0), px(800.0), px(800.0));
+        let narrow = LogicalRect::new(px(0.0), px(0.0), px(200.0), px(800.0));
         let wide_geometry = GaugeGeometry::compute(wide).expect("the wide canvas holds a gauge");
         let narrow_geometry =
             GaugeGeometry::compute(narrow).expect("the narrow canvas holds a gauge");

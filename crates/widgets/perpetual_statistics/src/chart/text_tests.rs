@@ -1,6 +1,6 @@
 use market_participants_model::decimal::Tick;
 use time::UtcOffset;
-use ui_core::paint::color::Color;
+use ui_core::{math::px, paint::color::Color};
 use widget::test_support::WidgetTestApp;
 
 use super::text::{
@@ -130,7 +130,7 @@ fn an_empty_cache_should_hold_nothing_stale() {
 #[test]
 fn a_cache_should_report_a_stale_lease_once_and_then_drop_it() {
     let mut harness = WidgetTestApp::new();
-    let style = label_style(10.0, 14.0, Color::WHITE);
+    let style = label_style(px(10.0), px(14.0), Color::WHITE);
     let mut cache = ChartTextCache::default();
     harness.with_cx(|cx| cache.line(cx.app_mut(), "12,345", &style));
     assert!(

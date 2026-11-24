@@ -1,4 +1,4 @@
-use ui_core::paint::style_builder::StyleBuilder;
+use ui_core::{math::LogicalPx, paint::style_builder::StyleBuilder};
 
 use crate::theme::components::{ComponentTokens, ControlSize, SizeTokens};
 
@@ -10,27 +10,27 @@ impl ControlSize {
     }
 
     #[must_use]
-    pub fn h(self) -> f32 {
+    pub fn h(self) -> LogicalPx {
         self.tokens().height
     }
 
     #[must_use]
-    pub fn gap(self) -> f32 {
+    pub fn gap(self) -> LogicalPx {
         self.tokens().gap
     }
 
     #[must_use]
-    pub fn px(self) -> f32 {
+    pub fn px(self) -> LogicalPx {
         self.tokens().padding_x
     }
 
     #[must_use]
-    pub fn text_size(self) -> f32 {
+    pub fn text_size(self) -> LogicalPx {
         self.tokens().font_size
     }
 
     #[must_use]
-    pub fn icon_size(self) -> f32 {
+    pub fn icon_size(self) -> LogicalPx {
         self.tokens().icon_size
     }
 }
@@ -64,7 +64,7 @@ impl UnifiedSizeStyle for StyleBuilder {
 #[cfg(test)]
 mod tests {
     use taffy::style::{Dimension, LengthPercentage};
-    use ui_core::paint::style_builder::StyleBuilder;
+    use ui_core::{math::px, paint::style_builder::StyleBuilder};
 
     use super::{UnifiedSizable, UnifiedSize, UnifiedSizeStyle};
 
@@ -77,11 +77,11 @@ mod tests {
     #[test]
     fn every_size_ladder_value_matches_the_frozen_legacy_ladder() {
         for (size, height, gap, padding_x, font_size, icon_size) in FROZEN_LADDER {
-            assert_eq!(size.h(), height, "{size:?} 的高度漂移");
-            assert_eq!(size.gap(), gap, "{size:?} 的间隙漂移");
-            assert_eq!(size.px(), padding_x, "{size:?} 的水平内边距漂移");
-            assert_eq!(size.icon_size(), icon_size, "{size:?} 的图标尺寸漂移");
-            assert_eq!(size.text_size(), font_size, "{size:?} 的字号漂移");
+            assert_eq!(size.h(), px(height), "{size:?} 的高度漂移");
+            assert_eq!(size.gap(), px(gap), "{size:?} 的间隙漂移");
+            assert_eq!(size.px(), px(padding_x), "{size:?} 的水平内边距漂移");
+            assert_eq!(size.icon_size(), px(icon_size), "{size:?} 的图标尺寸漂移");
+            assert_eq!(size.text_size(), px(font_size), "{size:?} 的字号漂移");
         }
     }
 

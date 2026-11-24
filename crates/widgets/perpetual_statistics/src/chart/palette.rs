@@ -1,5 +1,8 @@
 use smol_str::SmolStr;
-use ui_core::{math::Size, paint::color::Color};
+use ui_core::{
+    math::{LogicalPx, LogicalSize, px},
+    paint::color::Color,
+};
 use ui_kit::theme::{components::ComponentTokens, resolved::Theme, role::Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,19 +36,19 @@ pub(crate) struct SeriesLabel {
     pub label: SmolStr,
 }
 
-pub(crate) const AXIS_FONT_SIZE: f32 = 10.0;
-pub(crate) const AXIS_LINE_HEIGHT: f32 = 14.0;
-pub(crate) const LINE_WIDTH: f32 = 2.0;
-pub(crate) const LINE_MARKER_SIZE: f32 = 4.0;
-pub(crate) const HOVER_MARKER_SIZE: f32 = 9.0;
-pub(crate) const TOOLTIP_GAP: f32 = 10.0;
-pub(crate) const CROSSHAIR_DASH: f32 = 4.0;
-pub(crate) const CROSSHAIR_PERIOD: f32 = 7.0;
-pub(crate) const LEGEND_SWATCH_GAP: f32 = 20.0;
-pub(crate) const LEGEND_ENTRY_GAP: f32 = 18.0;
-pub(crate) const LEGEND_OVERFLOW_INSET: f32 = 4.0;
-const TOOLTIP_RADIUS: f32 = 4.0;
-const TOOLTIP_PADDING: f32 = 4.0;
+pub(crate) const AXIS_FONT_SIZE: LogicalPx = px(10.0);
+pub(crate) const AXIS_LINE_HEIGHT: LogicalPx = px(14.0);
+pub(crate) const LINE_WIDTH: LogicalPx = px(2.0);
+pub(crate) const LINE_MARKER_SIZE: LogicalPx = px(4.0);
+pub(crate) const HOVER_MARKER_SIZE: LogicalPx = px(9.0);
+pub(crate) const TOOLTIP_GAP: LogicalPx = px(10.0);
+pub(crate) const CROSSHAIR_DASH: LogicalPx = px(4.0);
+pub(crate) const CROSSHAIR_PERIOD: LogicalPx = px(7.0);
+pub(crate) const LEGEND_SWATCH_GAP: LogicalPx = px(20.0);
+pub(crate) const LEGEND_ENTRY_GAP: LogicalPx = px(18.0);
+pub(crate) const LEGEND_OVERFLOW_INSET: LogicalPx = px(4.0);
+const TOOLTIP_RADIUS: LogicalPx = px(4.0);
+const TOOLTIP_PADDING: LogicalPx = px(4.0);
 const TOOLTIP_LINE_HEIGHT_RATIO: f32 = 1.4;
 
 pub(crate) fn tooltip_style(tokens: &ComponentTokens) -> TooltipStyle {
@@ -60,15 +63,15 @@ pub(crate) fn tooltip_style(tokens: &ComponentTokens) -> TooltipStyle {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TooltipStyle {
-    pub font_size: f32,
-    pub line_height: f32,
-    pub padding: f32,
-    pub radius: f32,
+    pub font_size: LogicalPx,
+    pub line_height: LogicalPx,
+    pub padding: LogicalPx,
+    pub radius: LogicalPx,
 }
 
 impl TooltipStyle {
-    pub(crate) fn content_size(self, content_width: f32, line_count: usize) -> Size {
-        Size::new(
+    pub(crate) fn content_size(self, content_width: LogicalPx, line_count: usize) -> LogicalSize {
+        LogicalSize::new(
             content_width + self.padding * 2.0,
             self.line_height * line_count as f32 + self.padding * 2.0,
         )

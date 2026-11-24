@@ -19,7 +19,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::{InputEvent, Modifiers, PointerButton},
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
     test_support::{app::TestApp, diagnostics::SignalSlotStats},
     window::{WindowId, WindowOptions},
@@ -355,7 +355,7 @@ impl Harness {
 
     pub(crate) fn with(snapshot: AccountSnapshot, accounts: FakeAccountService) -> Self {
         let mut app = TestApp::with_options(WindowOptions {
-            size: Size::new(1280.0, 900.0),
+            size: LogicalSize::new(px(1280.0), px(900.0)),
             ..WindowOptions::default()
         });
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -403,7 +403,7 @@ impl Harness {
                 ui_core::paint::style_builder::StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .padding(8.0)
+                    .padding(px(8.0))
                     .build(),
             )
             .build(
@@ -548,11 +548,11 @@ impl Harness {
         self.drain();
     }
 
-    pub(crate) fn bounds(&self, node: NodeId) -> Option<Rect> {
+    pub(crate) fn bounds(&self, node: NodeId) -> Option<LogicalRect> {
         self.app.probe().bounds(node)
     }
 
-    pub(crate) fn move_pointer(&mut self, position: Point) {
+    pub(crate) fn move_pointer(&mut self, position: LogicalPoint) {
         let _ = self.app.move_pointer(position);
     }
 
@@ -560,7 +560,7 @@ impl Harness {
         let bounds = self
             .bounds(node)
             .unwrap_or_else(|| panic!("the node is not laid out; ids: {:?}", self.debug_ids()));
-        let centre = Point::new(
+        let centre = LogicalPoint::new(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
         );
@@ -568,7 +568,7 @@ impl Harness {
         self.click_at(centre);
     }
 
-    pub(crate) fn click_at(&mut self, position: Point) {
+    pub(crate) fn click_at(&mut self, position: LogicalPoint) {
         self.app.inject(InputEvent::pointer_down(
             position,
             PointerButton::Primary,
@@ -696,7 +696,7 @@ impl Harness {
             .trigger_node()
             .expect("the control built its trigger");
         if let Some(bounds) = self.bounds(node) {
-            self.move_pointer(Point::new(
+            self.move_pointer(LogicalPoint::new(
                 bounds.origin.x + bounds.size.width / 2.0,
                 bounds.origin.y + bounds.size.height / 2.0,
             ));

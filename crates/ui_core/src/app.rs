@@ -28,6 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
+
 #[cfg(feature = "hud")]
 use crate::debug_hud::DebugHudState;
 use crate::{
@@ -52,7 +54,9 @@ use crate::{
     paint::{color::Color, style::Cursor, style_builder::StyleBuilder},
     platform::dispatcher::{Dispatcher, UserTask},
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
-    resources::{DecodeState, PendingResource, ResourceCache},
+    resources::{
+        DecodeState, ImageDiagnostic, PendingResource, ResourceCache, ResourceId, ResourceImage,
+    },
     text::{
         FontStack, FontStackStatus, InlineBoxSpec, ShapedInlineBox, ShapedTextHandle,
         TextDiagnostic, TextLayoutReport, TextPassReport, TextStyle, atlas::GlyphAtlas,
@@ -103,6 +107,7 @@ pub struct App {
     text_layout_scratch: Vec<crate::node::id::NodeId>,
     scale_epochs: ahash::HashMap<WindowId, u32>,
     image_scale_epochs: ahash::HashMap<WindowId, u32>,
+    image_diagnostics: Vec<ImageDiagnostic>,
     atlas_generation_seen: u32,
     atlas_generation_lease: Arc<AtomicU64>,
     default_text_scale: f32,
@@ -363,6 +368,7 @@ impl App {
             text_layout_scratch: Vec::new(),
             scale_epochs: ahash::HashMap::default(),
             image_scale_epochs: ahash::HashMap::default(),
+            image_diagnostics: Vec::new(),
             atlas_generation_seen: 0,
             atlas_generation_lease,
             default_text_scale: 1.0,
@@ -441,6 +447,10 @@ impl App {
         resources::refresh_images(self, window)
     }
 
+    pub(crate) fn prepare_image_variants(&mut self, window: WindowId) -> usize {
+        resources::prepare_image_variants(self, window)
+    }
+
     #[must_use]
     pub fn handle(&self) -> AppHandle {
         resources::handle(self)
@@ -507,8 +517,77 @@ impl App {
         resources::resources(self)
     }
 
-    pub fn resources_mut(&mut self) -> &mut ResourceCache {
-        resources::resources_mut(self)
+    #[must_use]
+    pub fn image_diagnostics(&self) -> &[ImageDiagnostic] {
+        &self.image_diagnostics
+    }
+
+    pub fn prepare_image_variant(
+        &mut self,
+        window: WindowId,
+        image: ResourceImage,
+        target: LogicalSize,
+        fit: crate::node::image::ImageFit,
+    ) -> Option<crate::paint::atlas::AtlasTile> {
+        resources::prepare_image_variant(self, window, image, target, fit)
+    }
+
+    pub(crate) fn record_image_diagnostic(&mut self, diagnostic: ImageDiagnostic) {
+        let resource = diagnostic.resource();
+        if let Some(existing) = self
+            .image_diagnostics
+            .iter_mut()
+            .find(|existing| existing.resource() == resource)
+        {
+            *existing = diagnostic;
+            return;
+        }
+        self.image_diagnostics.push(diagnostic);
+    }
+
+    pub(crate) fn clear_image_diagnostic(&mut self, resource: ResourceId) {
+        self.image_diagnostics
+            .retain(|diagnostic| diagnostic.resource() != resource);
+    }
+
+    pub(crate) fn has_image_diagnostic(&self, resource: ResourceId) -> bool {
+        self.image_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.resource() == resource)
+    }
+
+    pub fn insert_bitmap_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: &[u8],
+    ) -> Result<ResourceImage, EngineError> {
+        resources::insert_bitmap_for_window(self, window, bytes)
+    }
+
+    pub fn insert_svg_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: &[u8],
+        intrinsic: LogicalSize,
+    ) -> Result<ResourceImage, EngineError> {
+        resources::insert_svg_for_window(self, window, bytes, intrinsic)
+    }
+
+    pub fn insert_bitmap_async_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: Bytes,
+    ) -> Result<PendingResource, EngineError> {
+        resources::insert_bitmap_async_for_window(self, window, bytes)
+    }
+
+    pub fn insert_svg_async_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: Bytes,
+        intrinsic: LogicalSize,
+    ) -> Result<PendingResource, EngineError> {
+        resources::insert_svg_async_for_window(self, window, bytes, intrinsic)
     }
 
     #[must_use]

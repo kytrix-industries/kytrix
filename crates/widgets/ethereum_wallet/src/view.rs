@@ -14,6 +14,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle},
@@ -52,7 +53,7 @@ use super::{
     },
 };
 
-const ROW_ESTIMATE: f32 = 68.0;
+const ROW_ESTIMATE: LogicalPx = LogicalPx::new(68.0);
 
 const ROW_OVERSCAN: usize = 2;
 
@@ -663,7 +664,7 @@ impl EthereumWalletWidget {
                 .overscan(ROW_OVERSCAN)
                 .separator()
                 .selection(SelectionMode::None)
-                .padding(0.0, 0.0),
+                .padding(LogicalPx::ZERO, LogicalPx::ZERO),
             move |tree, row_parent, index| {
                 build_transfer_row(tree, row_parent, index, &row_context)
             },
@@ -700,10 +701,10 @@ impl EthereumWalletWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
@@ -1130,10 +1131,10 @@ fn build_transfer_row(
         .style(
             StyleBuilder::new()
                 .flex_col()
-                .gap(4.0)
+                .gap(px(4.0))
                 .width_full()
                 .min_width_0()
-                .padding(8.0)
+                .padding(px(8.0))
                 .build(),
         )
         .bind_a11y(move |cx| {
@@ -1163,7 +1164,7 @@ fn build_transfer_row(
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .gap(8.0)
+                .gap(px(8.0))
                 .width_full()
                 .min_width_0()
                 .build(),
@@ -1263,7 +1264,7 @@ fn build_address_line(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(8.0)
+                .gap(px(8.0))
                 .min_width_0()
                 .build(),
         )
@@ -1281,7 +1282,7 @@ fn build_address_line(
     ))
     .style(
         StyleBuilder::new()
-            .width(ADDRESS_LABEL_WIDTH)
+            .width(px(ADDRESS_LABEL_WIDTH))
             .flex_none()
             .build(),
     )

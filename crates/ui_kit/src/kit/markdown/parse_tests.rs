@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use smol_str::SmolStr;
-use ui_core::math::Size;
+use ui_core::math::{LogicalSize, px};
 
 use super::parse;
 use crate::kit::markdown::{
@@ -138,10 +138,10 @@ fn kbd_text(value: &str, id: usize) -> MarkdownPiece {
 }
 
 fn image(path: &str, format: InlineImageFormat, side: f32) -> MarkdownPiece {
-    sized_image(path, format, Size::new(side, side))
+    sized_image(path, format, LogicalSize::new(px(side), px(side)))
 }
 
-fn sized_image(path: &str, format: InlineImageFormat, size: Size) -> MarkdownPiece {
+fn sized_image(path: &str, format: InlineImageFormat, size: LogicalSize) -> MarkdownPiece {
     MarkdownPiece::InlineImage {
         path: SmolStr::new(path),
         format,
@@ -495,7 +495,7 @@ fn kbd_marks_the_inline_styles_inside_it() {
         paragraph(vec![MarkdownPiece::InlineImage {
             path: SmolStr::new_static("icons/phosphoricons/arrow-up.svg"),
             format: InlineImageFormat::Svg,
-            size: Size::new(16., 16.),
+            size: LogicalSize::new(px(16.), px(16.)),
             link: None,
             kbd: Some(KbdId(0)),
         }])
@@ -595,7 +595,7 @@ fn an_image_without_a_size_takes_the_asset_size() {
         paragraph(vec![sized_image(
             INTRINSIC_ASSET,
             InlineImageFormat::Image,
-            Size::new(40., 30.)
+            LogicalSize::new(px(40.), px(30.))
         )])
     );
 }
@@ -607,7 +607,7 @@ fn a_type_overrides_the_extension() {
         paragraph(vec![sized_image(
             INTRINSIC_ASSET,
             InlineImageFormat::Svg,
-            Size::new(INTRINSIC_WIDTH as f32, INTRINSIC_HEIGHT as f32)
+            LogicalSize::new(px(INTRINSIC_WIDTH as f32), px(INTRINSIC_HEIGHT as f32))
         )])
     );
     assert_eq!(
@@ -635,7 +635,7 @@ fn a_size_may_carry_one_number_or_two() {
         paragraph(vec![sized_image(
             INTRINSIC_ASSET,
             InlineImageFormat::Image,
-            Size::new(24., 48.)
+            LogicalSize::new(px(24.), px(48.))
         )])
     );
 }
@@ -663,7 +663,7 @@ fn a_quoted_size_survives_the_markdown_parser() {
         paragraph(vec![sized_image(
             INTRINSIC_ASSET,
             InlineImageFormat::Image,
-            Size::new(24., 48.)
+            LogicalSize::new(px(24.), px(48.))
         )])
     );
 }
@@ -691,7 +691,7 @@ fn an_image_inside_a_link_carries_the_link() {
             vec![MarkdownPiece::InlineImage {
                 path: SmolStr::new_static(INTRINSIC_ASSET),
                 format: InlineImageFormat::Image,
-                size: Size::new(24., 24.),
+                size: LogicalSize::new(px(24.), px(24.)),
                 link: Some(LinkId(0)),
                 kbd: None,
             }],
@@ -710,7 +710,7 @@ fn an_unusable_size_falls_back_to_the_asset_size() {
             paragraph(vec![sized_image(
                 INTRINSIC_ASSET,
                 InlineImageFormat::Image,
-                Size::new(INTRINSIC_WIDTH as f32, INTRINSIC_HEIGHT as f32)
+                LogicalSize::new(px(INTRINSIC_WIDTH as f32), px(INTRINSIC_HEIGHT as f32))
             )]),
             "{source} should fall back to the asset size"
         );
@@ -1557,7 +1557,7 @@ fn with_link_stamps_text_and_image_and_leaves_a_line_break_alone() {
         MarkdownPiece::InlineImage {
             path: SmolStr::new_static("a/b.png"),
             format: InlineImageFormat::Image,
-            size: Size::new(24., 24.),
+            size: LogicalSize::new(px(24.), px(24.)),
             link: Some(LinkId(2)),
             kbd: None,
         }

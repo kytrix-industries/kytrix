@@ -8,6 +8,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
+    math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         style::StylePatch,
@@ -54,9 +55,9 @@ use crate::{
 
 const MISSING: &str = "—";
 
-const LEVEL_MARKER_SIZE: f32 = 8.0;
+const LEVEL_MARKER_SIZE: LogicalPx = px(8.0);
 
-const VALUE_COLUMN_WIDTH: f32 = 28.0;
+const VALUE_COLUMN_WIDTH: LogicalPx = px(28.0);
 
 const SEMIBOLD: u16 = 600;
 
@@ -668,8 +669,8 @@ impl CoinMarketCapFearAndGreedIndexWidget {
                     .size_full()
                     .min_width_0()
                     .min_height_0()
-                    .gap(8.0)
-                    .padding(12.0)
+                    .gap(px(8.0))
+                    .padding(px(12.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -700,7 +701,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -747,7 +748,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             .style(
                 StyleBuilder::new()
                     .flex_col()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .width_full()
                     .min_width_0()
                     .build(),
@@ -788,7 +789,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .gap(8.0)
+                    .gap(px(8.0))
                     .width_full()
                     .min_width_0()
                     .build(),
@@ -820,7 +821,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(8.0)
+                    .gap(px(8.0))
                     .flex_none()
                     .build(),
             )
@@ -877,7 +878,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
                 StyleBuilder::new()
                     .flex_row()
                     .items_center()
-                    .gap(4.0)
+                    .gap(px(4.0))
                     .flex_none()
                     .build(),
             )
@@ -1015,10 +1016,10 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             .style(
                 StyleBuilder::new()
                     .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
                     .flex_col()
                     .items_center()
                     .justify_center()
@@ -1159,7 +1160,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
     }
 }
 
-fn text_style(size: f32, weight: u16, alignment: Option<TextAlign>) -> TextStyle {
+fn text_style(size: LogicalPx, weight: u16, alignment: Option<TextAlign>) -> TextStyle {
     let mut style = TextStyle::new(size);
     style.weight = weight;
     if let Some(alignment) = alignment {

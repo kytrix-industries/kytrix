@@ -6,7 +6,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         canvas::Canvas,
@@ -22,13 +22,13 @@ use widget::cx::WidgetCx;
 
 use crate::model::{HeatMapEntry, PriceDirection, TILE_LIMIT};
 
-const TILE_TEXT_INSET: f32 = 4.0;
-const TILE_MIN_FONT_SIZE: f32 = 10.0;
-const TILE_MAX_FONT_SIZE: f32 = 30.0;
-const TILE_LINE_HEIGHT_EXTRA: f32 = 3.0;
-const TILE_BORDER_WIDTH: f32 = 1.0;
-const TILE_CORNER_RADIUS: f32 = 4.0;
-const TILE_GUTTER: f32 = 1.0;
+const TILE_TEXT_INSET: LogicalPx = px(4.0);
+const TILE_MIN_FONT_SIZE: LogicalPx = px(10.0);
+const TILE_MAX_FONT_SIZE: LogicalPx = px(30.0);
+const TILE_LINE_HEIGHT_EXTRA: LogicalPx = px(3.0);
+const TILE_BORDER_WIDTH: LogicalPx = px(1.0);
+const TILE_CORNER_RADIUS: LogicalPx = px(4.0);
+const TILE_GUTTER: LogicalPx = px(1.0);
 const TEXT_CACHE_CAPACITY: usize = TILE_LIMIT * 2;
 
 pub(crate) const HEATMAP_SELECTOR: &str = "TEST_VOLUME_HEATMAP_CANVAS";
@@ -134,9 +134,9 @@ impl ChartTextCache {
 }
 
 struct Layout {
-    bounds: Rect,
+    bounds: LogicalRect,
     revision: u64,
-    tiles: Box<[Rect]>,
+    tiles: Box<[LogicalRect]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -181,7 +181,7 @@ impl ChartColors {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaintedKey {
-    bounds: Rect,
+    bounds: LogicalRect,
     revision: u64,
     hover: Option<usize>,
     colors: ChartColors,
@@ -242,7 +242,7 @@ impl VolumeHeatMapChart {
         let language = cx.language();
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
-        let node = NodeBuilder::canvas(Canvas::new(Rect::default()))
+        let node = NodeBuilder::canvas(Canvas::new(LogicalRect::default()))
             .id(HEATMAP_SELECTOR)
             .style(
                 StyleBuilder::new()
@@ -281,7 +281,7 @@ impl VolumeHeatMapChart {
             return Ok(false);
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
             return Ok(false);
         }
 
@@ -322,7 +322,7 @@ impl VolumeHeatMapChart {
         Ok(changed)
     }
 
-    fn ensure_layout(&mut self, bounds: Rect) -> bool {
+    fn ensure_layout(&mut self, bounds: LogicalRect) -> bool {
         if self
             .layout
             .as_ref()
@@ -343,7 +343,7 @@ impl VolumeHeatMapChart {
         true
     }
 
-    fn hit_test(&self, position: Point) -> Option<usize> {
+    fn hit_test(&self, position: LogicalPoint) -> Option<usize> {
         let layout = self.layout.as_ref()?;
         if !position.x.is_finite() || !position.y.is_finite() {
             return None;
@@ -354,7 +354,7 @@ impl VolumeHeatMapChart {
             .position(|bounds| contains_half_open(*bounds, position))
     }
 
-    pub(crate) fn point_at(&mut self, position: Point) -> bool {
+    pub(crate) fn point_at(&mut self, position: LogicalPoint) -> bool {
         let next = self.hit_test(position);
         if self.hover == next {
             return false;
@@ -386,7 +386,7 @@ impl VolumeHeatMapChart {
     }
 
     #[cfg(test)]
-    pub(crate) fn tile_bounds(&self) -> Vec<Rect> {
+    pub(crate) fn tile_bounds(&self) -> Vec<LogicalRect> {
         self.layout
             .as_ref()
             .map(|layout| layout.tiles.to_vec())
@@ -419,7 +419,7 @@ fn paint(
     let mut canvas = Canvas::new(layout.bounds);
     let _ = canvas.push_clip(ClipRect {
         rect: layout.bounds,
-        corner_radius: [0.0; 4],
+        corner_radius: [px(0.0); 4],
     });
     for (index, (tile, bounds)) in data.tiles.iter().zip(layout.tiles.iter()).enumerate() {
         let Some(block) = tile_block_bounds(*bounds) else {
@@ -461,16 +461,16 @@ fn paint(
         };
         let font_size = tile_font_size(block, layout.bounds);
         let line_height = tile_line_height(font_size);
-        let available_width = (block.size.width - TILE_TEXT_INSET * 2.0).max(0.0);
-        if available_width <= 0.0 || block.size.height <= 0.0 {
+        let available_width = (block.size.width - TILE_TEXT_INSET * 2.0).max(px(0.0));
+        if available_width <= px(0.0) || block.size.height <= px(0.0) {
             continue;
         }
         let style = label_style(font_size, line_height, colors.label(tile.direction));
         let _ = canvas.push_clip(ClipRect {
             rect: block,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         });
-        let origin = Point::new(
+        let origin = LogicalPoint::new(
             block.origin.x + TILE_TEXT_INSET,
             block.origin.y + TILE_TEXT_INSET,
         );
@@ -478,7 +478,7 @@ fn paint(
         context.label(
             &mut canvas,
             &tile.notional_label,
-            Point::new(origin.x, origin.y + line_height),
+            LogicalPoint::new(origin.x, origin.y + line_height),
             &style,
         );
         let _ = canvas.pop_clip();
@@ -497,7 +497,7 @@ struct TextContext<'a> {
 }
 
 impl TextContext<'_> {
-    fn label(&mut self, canvas: &mut Canvas, text: &str, origin: Point, style: &TextStyle) {
+    fn label(&mut self, canvas: &mut Canvas, text: &str, origin: LogicalPoint, style: &TextStyle) {
         if text.is_empty() {
             return;
         }
@@ -510,22 +510,22 @@ impl TextContext<'_> {
     }
 }
 
-fn tile_block_bounds(bounds: Rect) -> Option<Rect> {
-    let block = Rect::new(
+fn tile_block_bounds(bounds: LogicalRect) -> Option<LogicalRect> {
+    let block = LogicalRect::new(
         bounds.origin.x + TILE_GUTTER,
         bounds.origin.y + TILE_GUTTER,
-        (bounds.size.width - TILE_GUTTER * 2.0).max(0.0),
-        (bounds.size.height - TILE_GUTTER * 2.0).max(0.0),
+        (bounds.size.width - TILE_GUTTER * 2.0).max(px(0.0)),
+        (bounds.size.height - TILE_GUTTER * 2.0).max(px(0.0)),
     );
     has_positive_area(block).then_some(block)
 }
 
-fn tile_corner_radii(block: Rect) -> [f32; 4] {
+fn tile_corner_radii(block: LogicalRect) -> [LogicalPx; 4] {
     let limit = block.size.width.min(block.size.height) / 2.0;
     [TILE_CORNER_RADIUS.min(limit); 4]
 }
 
-fn tile_font_size(block: Rect, chart_bounds: Rect) -> f32 {
+fn tile_font_size(block: LogicalRect, chart_bounds: LogicalRect) -> LogicalPx {
     let chart_area = bounds_area(chart_bounds);
     let area_ratio = if chart_area > 0.0 {
         bounds_area(block) / chart_area
@@ -535,7 +535,7 @@ fn tile_font_size(block: Rect, chart_bounds: Rect) -> f32 {
     font_size_for_area_ratio(area_ratio)
 }
 
-fn font_size_for_area_ratio(area_ratio: f32) -> f32 {
+fn font_size_for_area_ratio(area_ratio: f32) -> LogicalPx {
     let ratio = if area_ratio.is_finite() {
         area_ratio.clamp(0.0, 1.0).sqrt()
     } else {
@@ -544,11 +544,11 @@ fn font_size_for_area_ratio(area_ratio: f32) -> f32 {
     TILE_MIN_FONT_SIZE + (TILE_MAX_FONT_SIZE - TILE_MIN_FONT_SIZE) * ratio
 }
 
-fn tile_line_height(font_size: f32) -> f32 {
+fn tile_line_height(font_size: LogicalPx) -> LogicalPx {
     font_size + TILE_LINE_HEIGHT_EXTRA
 }
 
-fn label_style(font_size: f32, line_height: f32, color: Color) -> TextStyle {
+fn label_style(font_size: LogicalPx, line_height: LogicalPx, color: Color) -> TextStyle {
     let mut style = TextStyle::new(font_size);
     style.color = color;
     style.line_height = Some(line_height / font_size);
@@ -556,8 +556,12 @@ fn label_style(font_size: f32, line_height: f32, color: Color) -> TextStyle {
     style
 }
 
-fn layout_tiles(items: &[LayoutItem], tile_count: usize, canvas_size: Size) -> Vec<Rect> {
-    let empty = Rect::new(0.0, 0.0, 0.0, 0.0);
+fn layout_tiles(
+    items: &[LayoutItem],
+    tile_count: usize,
+    canvas_size: LogicalSize,
+) -> Vec<LogicalRect> {
+    let empty = LogicalRect::new(px(0.0), px(0.0), px(0.0), px(0.0));
     let mut result = vec![empty; tile_count];
     if items.is_empty() || !valid_size(canvas_size) {
         return result;
@@ -570,13 +574,18 @@ fn layout_tiles(items: &[LayoutItem], tile_count: usize, canvas_size: Size) -> V
     layout_binary(
         items,
         total,
-        Rect::new(0.0, 0.0, canvas_size.width, canvas_size.height),
+        LogicalRect::new(px(0.0), px(0.0), canvas_size.width, canvas_size.height),
         &mut result,
     );
     result
 }
 
-fn layout_binary(items: &[LayoutItem], total: f64, bounds: Rect, result: &mut [Rect]) {
+fn layout_binary(
+    items: &[LayoutItem],
+    total: f64,
+    bounds: LogicalRect,
+    result: &mut [LogicalRect],
+) {
     let Some(first) = items.first() else {
         return;
     };
@@ -598,13 +607,13 @@ fn layout_binary(items: &[LayoutItem], total: f64, bounds: Rect, result: &mut [R
     let (first_bounds, second_bounds) = if bounds.size.width >= bounds.size.height {
         let first_width = bounds.size.width * ratio;
         (
-            Rect::new(
+            LogicalRect::new(
                 bounds.origin.x,
                 bounds.origin.y,
                 first_width,
                 bounds.size.height,
             ),
-            Rect::new(
+            LogicalRect::new(
                 bounds.origin.x + first_width,
                 bounds.origin.y,
                 bounds.size.width - first_width,
@@ -614,13 +623,13 @@ fn layout_binary(items: &[LayoutItem], total: f64, bounds: Rect, result: &mut [R
     } else {
         let first_height = bounds.size.height * ratio;
         (
-            Rect::new(
+            LogicalRect::new(
                 bounds.origin.x,
                 bounds.origin.y,
                 bounds.size.width,
                 first_height,
             ),
-            Rect::new(
+            LogicalRect::new(
                 bounds.origin.x,
                 bounds.origin.y + first_height,
                 bounds.size.width,
@@ -652,22 +661,25 @@ fn balanced_split(items: &[LayoutItem], total: f64) -> (usize, f64) {
     (best_split, best_total)
 }
 
-fn valid_size(value: Size) -> bool {
-    value.width.is_finite() && value.height.is_finite() && value.width > 0.0 && value.height > 0.0
+fn valid_size(value: LogicalSize) -> bool {
+    value.width.is_finite()
+        && value.height.is_finite()
+        && value.width > px(0.0)
+        && value.height > px(0.0)
 }
 
-fn has_positive_area(bounds: Rect) -> bool {
+fn has_positive_area(bounds: LogicalRect) -> bool {
     bounds.is_finite() && valid_size(bounds.size)
 }
 
-fn bounds_area(bounds: Rect) -> f32 {
+fn bounds_area(bounds: LogicalRect) -> f32 {
     if !has_positive_area(bounds) {
         return 0.0;
     }
-    bounds.size.width * bounds.size.height
+    bounds.size.area()
 }
 
-fn contains_half_open(bounds: Rect, position: Point) -> bool {
+fn contains_half_open(bounds: LogicalRect, position: LogicalPoint) -> bool {
     has_positive_area(bounds)
         && position.x >= bounds.origin.x
         && position.x < bounds.origin.x + bounds.size.width
@@ -679,7 +691,7 @@ fn contains_half_open(bounds: Rect, position: Point) -> bool {
 mod tests {
     use market_participants_model::decimal::Quantity;
     use ui_core::{
-        math::Point,
+        math::LogicalPoint,
         node::{builder::NodeBuilder, tree::NodeKind},
         paint::primitive::Primitive,
         window::WindowId,
@@ -720,26 +732,26 @@ mod tests {
         PreparedHeatMap::new(entries)
     }
 
-    fn area(bounds: Rect) -> f32 {
-        bounds.size.width * bounds.size.height
+    fn area(bounds: LogicalRect) -> f32 {
+        bounds.size.width.value() * bounds.size.height.value()
     }
 
-    fn overlap_area(left: Rect, right: Rect) -> f32 {
+    fn overlap_area(left: LogicalRect, right: LogicalRect) -> f32 {
         let width = (left.origin.x + left.size.width).min(right.origin.x + right.size.width)
             - left.origin.x.max(right.origin.x);
         let height = (left.origin.y + left.size.height).min(right.origin.y + right.size.height)
             - left.origin.y.max(right.origin.y);
-        width.max(0.0) * height.max(0.0)
+        width.max(px(0.0)).value() * height.max(px(0.0)).value()
     }
 
-    fn assert_geometry_is_safe(rectangles: &[Rect], canvas: ui_core::math::Size) {
+    fn assert_geometry_is_safe(rectangles: &[LogicalRect], canvas: ui_core::math::LogicalSize) {
         for rectangle in rectangles.iter().copied() {
             assert!(rectangle.origin.x.is_finite());
             assert!(rectangle.origin.y.is_finite());
             assert!(rectangle.size.width.is_finite());
             assert!(rectangle.size.height.is_finite());
-            assert!(rectangle.origin.x >= 0.0);
-            assert!(rectangle.origin.y >= 0.0);
+            assert!(rectangle.origin.x >= px(0.0));
+            assert!(rectangle.origin.y >= px(0.0));
             assert!(rectangle.origin.x + rectangle.size.width <= canvas.width);
             assert!(rectangle.origin.y + rectangle.size.height <= canvas.height);
         }
@@ -782,8 +794,8 @@ mod tests {
         fn resize(&mut self, width: f32, height: f32) {
             let Self { app, page, .. } = self;
             let style = StyleBuilder::new()
-                .width(width)
-                .height(height)
+                .width(px(width))
+                .height(px(height))
                 .flex_col()
                 .build();
             app.with_cx(|cx| cx.tree_mut().set_style(*page, style))
@@ -822,8 +834,8 @@ mod tests {
                 .id("TEST_VOLUME_HEATMAP_PAGE")
                 .style(
                     StyleBuilder::new()
-                        .width(width)
-                        .height(height)
+                        .width(px(width))
+                        .height(px(height))
                         .flex_col()
                         .build(),
                 )
@@ -869,9 +881,9 @@ mod tests {
             .map(|glyph| glyph.tile.generation)
     }
 
-    fn middle_of(harness: &ChartHarness, index: usize) -> Point {
+    fn middle_of(harness: &ChartHarness, index: usize) -> LogicalPoint {
         let tile = harness.chart.tile_bounds()[index];
-        Point::new(
+        LogicalPoint::new(
             tile.origin.x + tile.size.width / 2.0,
             tile.origin.y + tile.size.height / 2.0,
         )
@@ -900,13 +912,23 @@ mod tests {
             entry("SOL", 1, "1"),
         ]);
         let data = prepared(entries);
-        let canvas = ui_core::math::Size::new(300.0, 200.0);
+        let canvas = ui_core::math::LogicalSize::new(px(300.0), px(200.0));
 
         let rectangles = layout_tiles(&data.layout_items, data.tiles.len(), canvas);
 
         assert_geometry_is_safe(&rectangles, canvas);
         let total_area = rectangles.iter().copied().map(area).sum::<f32>();
-        assert!((total_area - area(Rect::new(0.0, 0.0, canvas.width, canvas.height))).abs() < 0.1);
+        assert!(
+            (total_area
+                - area(LogicalRect::new(
+                    px(0.0),
+                    px(0.0),
+                    canvas.width,
+                    canvas.height
+                )))
+            .abs()
+                < 0.1
+        );
         assert!((area(rectangles[0]) / total_area - 0.6).abs() < 0.001);
         assert!((area(rectangles[1]) / total_area - 0.3).abs() < 0.001);
         assert!((area(rectangles[2]) / total_area - 0.1).abs() < 0.001);
@@ -920,7 +942,7 @@ mod tests {
                 weight: (TILE_LIMIT - index) as f64,
             })
             .collect::<Vec<_>>();
-        let canvas = ui_core::math::Size::new(853.0, 479.0);
+        let canvas = ui_core::math::LogicalSize::new(px(853.0), px(479.0));
 
         let rectangles = layout_tiles(&items, items.len(), canvas);
 
@@ -929,14 +951,17 @@ mod tests {
 
     #[test]
     fn a_tile_should_be_drawn_inset_by_the_gutter_on_every_side() {
-        let tile = Rect::new(10.0, 20.0, 100.0, 60.0);
+        let tile = LogicalRect::new(px(10.0), px(20.0), px(100.0), px(60.0));
 
         let block = tile_block_bounds(tile).expect("a tile this size keeps a block");
 
-        assert_eq!(block, Rect::new(11.0, 21.0, 98.0, 58.0));
+        assert_eq!(
+            block,
+            LogicalRect::new(px(11.0), px(21.0), px(98.0), px(58.0))
+        );
         assert_eq!(
             block.origin,
-            Point::new(tile.origin.x + TILE_GUTTER, tile.origin.y + TILE_GUTTER),
+            LogicalPoint::new(tile.origin.x + TILE_GUTTER, tile.origin.y + TILE_GUTTER),
             "the block is what the labels and the outline are laid out in"
         );
     }
@@ -945,7 +970,7 @@ mod tests {
     fn two_neighbours_should_part_by_two_gutters() {
         let entries: Arc<[HeatMapEntry]> = Arc::from([entry("BTC", 1, "1"), entry("ETH", 1, "1")]);
         let data = prepared(entries);
-        let canvas = ui_core::math::Size::new(200.0, 100.0);
+        let canvas = ui_core::math::LogicalSize::new(px(200.0), px(100.0));
 
         let rectangles = layout_tiles(&data.layout_items, data.tiles.len(), canvas);
         let left = tile_block_bounds(rectangles[0]).expect("the fixture lays both tiles out");
@@ -959,8 +984,8 @@ mod tests {
 
     #[test]
     fn a_tile_the_gutter_would_eat_should_not_be_drawn() {
-        let laid_out = Rect::new(4.0, 4.0, 40.0, 2.0);
-        let not_laid_out = Rect::new(0.0, 0.0, 0.0, 0.0);
+        let laid_out = LogicalRect::new(px(4.0), px(4.0), px(40.0), px(2.0));
+        let not_laid_out = LogicalRect::new(px(0.0), px(0.0), px(0.0), px(0.0));
 
         assert!(tile_block_bounds(laid_out).is_none());
         assert!(tile_block_bounds(not_laid_out).is_none());
@@ -969,18 +994,19 @@ mod tests {
     #[test]
     fn a_tile_corner_should_be_rounded_to_rounded_sm_and_never_past_half_the_tile() {
         assert_eq!(
-            TILE_CORNER_RADIUS, 4.0,
+            TILE_CORNER_RADIUS,
+            px(4.0),
             "the framework's rounded_sm is a quarter of the sixteen pixel rem"
         );
-        assert_eq!(TILE_GUTTER, 1.0);
+        assert_eq!(TILE_GUTTER, px(1.0));
 
         assert_eq!(
-            tile_corner_radii(Rect::new(0.0, 0.0, 120.0, 60.0)),
+            tile_corner_radii(LogicalRect::new(px(0.0), px(0.0), px(120.0), px(60.0))),
             [TILE_CORNER_RADIUS; 4]
         );
         assert_eq!(
-            tile_corner_radii(Rect::new(0.0, 0.0, 6.0, 240.0)),
-            [3.0; 4],
+            tile_corner_radii(LogicalRect::new(px(0.0), px(0.0), px(6.0), px(240.0))),
+            [px(3.0); 4],
             "a block narrower than its radius is a pill rather than a shape with broken corners"
         );
     }
@@ -988,11 +1014,14 @@ mod tests {
     #[test]
     fn binary_layout_should_fill_the_canvas_for_one_positive_entry() {
         let data = prepared(entries(&["BTC"]));
-        let canvas = ui_core::math::Size::new(123.0, 57.0);
+        let canvas = ui_core::math::LogicalSize::new(px(123.0), px(57.0));
 
         let rectangles = layout_tiles(&data.layout_items, data.tiles.len(), canvas);
 
-        assert_eq!(rectangles[0], Rect::new(0.0, 0.0, 123.0, 57.0));
+        assert_eq!(
+            rectangles[0],
+            LogicalRect::new(px(0.0), px(0.0), px(123.0), px(57.0))
+        );
     }
 
     #[test]
@@ -1000,11 +1029,14 @@ mod tests {
         let entries: Arc<[HeatMapEntry]> =
             Arc::from([entry("BTC", 10, "10"), entry("ZERO", 0, "0")]);
         let data = prepared(entries);
-        let canvas = ui_core::math::Size::new(100.0, 80.0);
+        let canvas = ui_core::math::LogicalSize::new(px(100.0), px(80.0));
 
         let rectangles = layout_tiles(&data.layout_items, data.tiles.len(), canvas);
 
-        assert_eq!(rectangles[0], Rect::new(0.0, 0.0, 100.0, 80.0));
+        assert_eq!(
+            rectangles[0],
+            LogicalRect::new(px(0.0), px(0.0), px(100.0), px(80.0))
+        );
         assert!(!has_positive_area(rectangles[1]));
     }
 
@@ -1016,7 +1048,7 @@ mod tests {
         let zero = layout_tiles(
             &data.layout_items,
             data.tiles.len(),
-            ui_core::math::Size::new(100.0, 80.0),
+            ui_core::math::LogicalSize::new(px(100.0), px(80.0)),
         );
         let invalid = layout_tiles(
             &[LayoutItem {
@@ -1024,7 +1056,7 @@ mod tests {
                 weight: 1.0,
             }],
             1,
-            ui_core::math::Size::new(f32::NAN, f32::INFINITY),
+            ui_core::math::LogicalSize::new(px(f32::NAN), px(f32::INFINITY)),
         );
 
         assert!(zero.iter().all(|bounds| !has_positive_area(*bounds)));
@@ -1039,8 +1071,8 @@ mod tests {
             entry("ZERO", 0, "0"),
         ]);
         let data = prepared(entries);
-        let bounds = Rect::new(10.0, 20.0, 100.0, 50.0);
-        let canvas = ui_core::math::Size::new(100.0, 50.0);
+        let bounds = LogicalRect::new(px(10.0), px(20.0), px(100.0), px(50.0));
+        let canvas = ui_core::math::LogicalSize::new(px(100.0), px(50.0));
         let tiles = layout_tiles(&data.layout_items, data.tiles.len(), canvas)
             .into_iter()
             .map(|tile| tile.translate(bounds.origin))
@@ -1055,22 +1087,22 @@ mod tests {
         assert_eq!(
             layout.tiles.iter().position(|tile| contains_half_open(
                 *tile,
-                Point::new(first.origin.x + 1.0, first.origin.y + 1.0)
+                LogicalPoint::new(first.origin.x + 1.0, first.origin.y + 1.0)
             )),
             Some(0)
         );
         assert!(
             !contains_half_open(
                 first,
-                Point::new(first.origin.x + first.size.width, first.origin.y + 1.0)
+                LogicalPoint::new(first.origin.x + first.size.width, first.origin.y + 1.0)
             ),
             "the right edge belongs to the tile after it"
         );
         assert_eq!(
-            layout
-                .tiles
-                .iter()
-                .position(|tile| contains_half_open(*tile, Point::new(f32::NAN, 20.0))),
+            layout.tiles.iter().position(|tile| contains_half_open(
+                *tile,
+                LogicalPoint::new(px(f32::NAN), px(20.0))
+            )),
             None
         );
         assert!(!has_positive_area(layout.tiles[2]));
@@ -1091,7 +1123,7 @@ mod tests {
     fn text_cache_should_keep_a_bounded_lru_window() {
         let mut app = WidgetTestApp::new();
         let mut cache = ChartTextCache::new();
-        let style = label_style(12.0, 15.0, Color::WHITE);
+        let style = label_style(px(12.0), px(15.0), Color::WHITE);
         for index in 0..TEXT_CACHE_CAPACITY {
             cache.line(app.app_mut(), &format!("label-{index}"), &style);
         }
@@ -1118,9 +1150,9 @@ mod tests {
     fn text_cache_should_invalidate_for_style_color_and_font_size_changes() {
         let mut app = WidgetTestApp::new();
         let mut cache = ChartTextCache::new();
-        let style = label_style(12.0, 15.0, Color::WHITE);
-        let alternate_color = label_style(12.0, 15.0, Color::BLACK);
-        let alternate_size = label_style(13.0, 16.25, Color::WHITE);
+        let style = label_style(px(12.0), px(15.0), Color::WHITE);
+        let alternate_color = label_style(px(12.0), px(15.0), Color::BLACK);
+        let alternate_size = label_style(px(13.0), px(16.25), Color::WHITE);
 
         let first = cache.line(app.app_mut(), "BTC", &style);
         let same = cache.line(app.app_mut(), "BTC", &style);
@@ -1188,8 +1220,8 @@ mod tests {
     fn a_pointer_move_inside_one_tile_should_not_be_a_change() {
         let mut harness = harness();
         let tile = harness.chart.tile_bounds()[0];
-        let left = Point::new(tile.origin.x + 2.0, tile.origin.y + 2.0);
-        let right = Point::new(tile.origin.x + 3.0, tile.origin.y + 3.0);
+        let left = LogicalPoint::new(tile.origin.x + 2.0, tile.origin.y + 2.0);
+        let right = LogicalPoint::new(tile.origin.x + 3.0, tile.origin.y + 3.0);
 
         assert!(harness.chart.point_at(left));
         assert!(!harness.chart.point_at(right), "one tile is one drawing");
@@ -1209,7 +1241,9 @@ mod tests {
         );
 
         assert!(
-            harness.chart.point_at(Point::new(-4.0, -4.0)),
+            harness
+                .chart
+                .point_at(LogicalPoint::new(px(-4.0), px(-4.0))),
             "leaving the map is a change of the tile under the pointer"
         );
         assert_eq!(harness.chart.hovered(), None);

@@ -1,5 +1,5 @@
 use smol_str::SmolStr;
-use ui_core::math::{Point, Rect, Size};
+use ui_core::math::{LogicalPoint, LogicalRect, LogicalSize, px};
 
 use super::{
     axes::{
@@ -13,12 +13,12 @@ use super::{
     rect::RectExt,
 };
 
-fn bounds() -> Rect {
-    Rect::new(0.0, 0.0, 640.0, 360.0)
+fn bounds() -> LogicalRect {
+    LogicalRect::new(px(0.0), px(0.0), px(640.0), px(360.0))
 }
 
-fn center(plot: Rect) -> Point {
-    Point::new(
+fn center(plot: LogicalRect) -> LogicalPoint {
+    LogicalPoint::new(
         plot.origin.x + plot.size.width / 2.0,
         plot.origin.y + plot.size.height / 2.0,
     )
@@ -26,7 +26,7 @@ fn center(plot: Rect) -> Point {
 
 #[test]
 fn the_time_axis_should_sit_under_the_plot_and_the_legend_under_that() {
-    let layout = ChartLayout::new(bounds(), Some(60.0), 60.0);
+    let layout = ChartLayout::new(bounds(), Some(px(60.0)), px(60.0));
 
     assert_eq!(layout.time_axis.origin.y, layout.plot.bottom());
     assert_eq!(layout.time_axis.size.height, TIME_AXIS_HEIGHT);
@@ -37,7 +37,7 @@ fn the_time_axis_should_sit_under_the_plot_and_the_legend_under_that() {
 
 #[test]
 fn each_axis_should_share_the_plot_height_and_sit_at_its_own_edge() {
-    let layout = ChartLayout::new(bounds(), Some(60.0), 50.0);
+    let layout = ChartLayout::new(bounds(), Some(px(60.0)), px(50.0));
 
     assert_eq!(layout.left_axis.origin.y, layout.plot.origin.y);
     assert_eq!(layout.left_axis.size.height, layout.plot.size.height);
@@ -48,18 +48,18 @@ fn each_axis_should_share_the_plot_height_and_sit_at_its_own_edge() {
 
 #[test]
 fn a_short_label_should_leave_its_axis_at_the_minimum_width() {
-    assert_eq!(axis_width(640.0, 12.0), MINIMUM_AXIS_WIDTH);
+    assert_eq!(axis_width(px(640.0), px(12.0)), MINIMUM_AXIS_WIDTH);
 }
 
 #[test]
 fn a_long_label_should_widen_only_its_own_axis() {
-    let narrow = ChartLayout::new(bounds(), None, 20.0);
-    let wide = ChartLayout::new(bounds(), None, 80.0);
+    let narrow = ChartLayout::new(bounds(), None, px(20.0));
+    let wide = ChartLayout::new(bounds(), None, px(80.0));
 
-    assert_eq!(narrow.left_axis.size.width, 0.0);
+    assert_eq!(narrow.left_axis.size.width, px(0.0));
     assert_eq!(
         wide.right_axis.size.width,
-        (80.0_f32 + 12.0).min(640.0 - MINIMUM_PLOT_WIDTH)
+        px(80.0_f32 + 12.0).min(px(640.0) - MINIMUM_PLOT_WIDTH)
     );
     assert_eq!(
         narrow.plot.size.width - wide.plot.size.width,
@@ -69,9 +69,9 @@ fn a_long_label_should_widen_only_its_own_axis() {
 
 #[test]
 fn a_chart_without_a_left_axis_should_give_that_width_to_the_plot() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
 
-    assert_eq!(layout.left_axis.size.width, 0.0);
+    assert_eq!(layout.left_axis.size.width, px(0.0));
     assert_eq!(
         layout.plot.size.width,
         layout.content.size.width - layout.right_axis.size.width
@@ -80,7 +80,11 @@ fn a_chart_without_a_left_axis_should_give_that_width_to_the_plot() {
 
 #[test]
 fn a_narrow_pane_should_grow_the_content_instead_of_squeezing_the_plot() {
-    let layout = ChartLayout::new(Rect::new(0.0, 0.0, 200.0, 120.0), Some(60.0), 60.0);
+    let layout = ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(200.0), px(120.0)),
+        Some(px(60.0)),
+        px(60.0),
+    );
 
     assert_eq!(layout.content.size.width, CHART_MIN_CONTENT_WIDTH);
     assert_eq!(layout.content.size.height, CHART_MIN_CONTENT_HEIGHT);
@@ -92,20 +96,28 @@ fn a_narrow_pane_should_grow_the_content_instead_of_squeezing_the_plot() {
 
 #[test]
 fn a_pane_too_narrow_for_its_axes_should_still_keep_a_usable_plot() {
-    let layout = ChartLayout::new(Rect::new(0.0, 0.0, 20.0, 20.0), Some(200.0), 200.0);
+    let layout = ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)),
+        Some(px(200.0)),
+        px(200.0),
+    );
 
     assert!(
-        layout.plot.size.width >= 1.0,
+        layout.plot.size.width >= px(1.0),
         "a chart of no width still resolves a plot"
     );
-    assert!(layout.plot.size.height >= 1.0);
+    assert!(layout.plot.size.height >= px(1.0));
 }
 
 #[test]
 fn a_short_pane_should_keep_the_time_axis_and_the_legend_inside_the_content() {
-    let layout = ChartLayout::new(Rect::new(0.0, 0.0, 640.0, 60.0), None, 60.0);
+    let layout = ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(640.0), px(60.0)),
+        None,
+        px(60.0),
+    );
 
-    assert!(layout.plot.size.height >= 1.0);
+    assert!(layout.plot.size.height >= px(1.0));
     assert!(
         layout.legend.bottom() <= layout.content.bottom(),
         "the legend stays inside the content box"
@@ -184,7 +196,7 @@ fn a_step_should_round_up_to_one_two_or_five() {
 
 #[test]
 fn a_single_point_should_be_centred_in_the_plot() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
 
     assert_eq!(
         point_x(layout.plot, 1, 0),
@@ -195,7 +207,7 @@ fn a_single_point_should_be_centred_in_the_plot() {
 
 #[test]
 fn the_first_and_last_points_should_keep_their_inset() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
 
     assert_eq!(
         point_x(layout.plot, 10, 0),
@@ -209,16 +221,16 @@ fn the_first_and_last_points_should_keep_their_inset() {
 
 #[test]
 fn the_nearest_point_should_clamp_to_the_ends() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
 
-    assert_eq!(nearest_index(layout.plot, 10, f32::MIN), Some(0));
-    assert_eq!(nearest_index(layout.plot, 10, f32::MAX), Some(9));
-    assert_eq!(nearest_index(layout.plot, 0, 10.0), None);
+    assert_eq!(nearest_index(layout.plot, 10, px(f32::MIN)), Some(0));
+    assert_eq!(nearest_index(layout.plot, 10, px(f32::MAX)), Some(9));
+    assert_eq!(nearest_index(layout.plot, 0, px(10.0)), None);
 }
 
 #[test]
 fn the_value_axis_should_put_its_maximum_at_the_top() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
     let domain = ValueDomain::new(0.0, 100.0);
 
     assert_eq!(value_y(100.0, domain, layout.plot), layout.plot.origin.y);
@@ -231,7 +243,7 @@ fn the_value_axis_should_put_its_maximum_at_the_top() {
 
 #[test]
 fn the_buy_half_of_a_bar_should_touch_the_sell_half() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
     let (buy_left, sell_left, width) = paired_bar_x_bounds(layout.plot, 6, 2);
 
     assert_eq!(buy_left + width, sell_left, "the halves meet at the point");
@@ -239,18 +251,18 @@ fn the_buy_half_of_a_bar_should_touch_the_sell_half() {
 
 #[test]
 fn bars_should_get_thinner_as_more_of_them_share_the_plot() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
     let (_, _, few) = paired_bar_x_bounds(layout.plot, 4, 0);
     let (_, _, many) = paired_bar_x_bounds(layout.plot, 30, 0);
 
     assert!(many <= few);
-    assert!(many >= 2.0, "a bar stays visible");
+    assert!(many >= px(2.0), "a bar stays visible");
 }
 
 #[test]
 fn a_stacked_bar_should_always_fill_its_plot_height() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
-    let (long, short) = stacked_bar_bounds(center(layout.plot).x, 10.0, 0.3, 0.7, layout.plot);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
+    let (long, short) = stacked_bar_bounds(center(layout.plot).x, px(10.0), 0.3, 0.7, layout.plot);
 
     assert_eq!(
         long.size.height + short.size.height,
@@ -262,16 +274,16 @@ fn a_stacked_bar_should_always_fill_its_plot_height() {
 
 #[test]
 fn a_stacked_bar_of_no_reading_should_still_be_a_whole_bar() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
-    let (long, short) = stacked_bar_bounds(center(layout.plot).x, 10.0, 0.0, 0.0, layout.plot);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
+    let (long, short) = stacked_bar_bounds(center(layout.plot).x, px(10.0), 0.0, 0.0, layout.plot);
 
-    assert_eq!(long.size.height, 0.0);
+    assert_eq!(long.size.height, px(0.0));
     assert_eq!(short.size.height, layout.plot.size.height);
 }
 
 #[test]
 fn the_time_axis_should_always_label_both_ends() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
     let labels = position_time_ticks(
         label_indices(30, 5)
             .into_iter()
@@ -299,8 +311,8 @@ fn a_short_window_should_label_every_point_it_has() {
 
 #[test]
 fn a_narrow_plot_should_label_fewer_intervals() {
-    let wide = time_tick_indices(30, 1000.0);
-    let narrow = time_tick_indices(30, 160.0);
+    let wide = time_tick_indices(30, px(1000.0));
+    let narrow = time_tick_indices(30, px(160.0));
 
     assert!(narrow.len() <= wide.len());
     assert!(narrow.len() >= 2, "both ends are still labelled");
@@ -308,7 +320,7 @@ fn a_narrow_plot_should_label_fewer_intervals() {
 
 #[test]
 fn every_time_label_should_stay_inside_the_axis() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
     let ticks = position_time_ticks(
         label_indices(30, 6)
             .into_iter()
@@ -319,17 +331,17 @@ fn every_time_label_should_stay_inside_the_axis() {
 
     for tick in ticks {
         assert!(tick.origin_x >= layout.time_axis.origin.x);
-        assert!(tick.origin_x + tick.width <= layout.time_axis.right() + f32::EPSILON);
+        assert!(tick.origin_x + tick.width <= layout.time_axis.right() + px(f32::EPSILON));
     }
-    assert_eq!(super::axes::TIME_TICK_WIDTH, 104.0);
+    assert_eq!(super::axes::TIME_TICK_WIDTH, px(104.0));
 }
 
 #[test]
 fn a_tooltip_should_flip_instead_of_leaving_the_plot() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
-    let desired = Size::new(120.0, 80.0);
-    let near_right = Point::new(layout.plot.right() - 2.0, layout.plot.origin.y + 10.0);
-    let bounds = tooltip_bounds(near_right, desired, layout.plot, 10.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
+    let desired = LogicalSize::new(px(120.0), px(80.0));
+    let near_right = LogicalPoint::new(layout.plot.right() - px(2.0), layout.plot.origin.y + 10.0);
+    let bounds = tooltip_bounds(near_right, desired, layout.plot, px(10.0));
 
     assert!(bounds.right() <= layout.plot.right());
     assert!(bounds.origin.x < near_right.x, "the tooltip flipped left");
@@ -338,12 +350,12 @@ fn a_tooltip_should_flip_instead_of_leaving_the_plot() {
 
 #[test]
 fn a_tooltip_bigger_than_its_plot_should_still_be_placed_inside_it() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
     let bounds = tooltip_bounds(
         center(layout.plot),
-        Size::new(10_000.0, 10_000.0),
+        LogicalSize::new(px(10_000.0), px(10_000.0)),
         layout.plot,
-        10.0,
+        px(10.0),
     );
 
     assert_eq!(bounds.size.width, layout.plot.size.width);
@@ -353,7 +365,7 @@ fn a_tooltip_bigger_than_its_plot_should_still_be_placed_inside_it() {
 
 #[test]
 fn a_y_axis_label_should_be_centred_on_the_line_it_names() {
-    let layout = ChartLayout::new(bounds(), Some(60.0), 60.0);
+    let layout = ChartLayout::new(bounds(), Some(px(60.0)), px(60.0));
     let y = layout.plot.origin.y + 100.0;
 
     assert_eq!(
@@ -364,7 +376,7 @@ fn a_y_axis_label_should_be_centred_on_the_line_it_names() {
 
 #[test]
 fn a_y_axis_label_at_the_edges_should_stay_inside_its_axis() {
-    let layout = ChartLayout::new(bounds(), Some(60.0), 60.0);
+    let layout = ChartLayout::new(bounds(), Some(px(60.0)), px(60.0));
 
     assert_eq!(
         axis_label_y(layout.left_axis.origin.y, layout.left_axis),
@@ -378,15 +390,15 @@ fn a_y_axis_label_at_the_edges_should_stay_inside_its_axis() {
 
 #[test]
 fn a_ratio_bar_should_stay_between_its_floor_and_its_ceiling() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
     let width = ratio_bar_width(layout.plot, 30);
 
-    assert!((3.0..=18.0).contains(&width));
+    assert!((px(3.0)..=px(18.0)).contains(&width));
 }
 
 #[test]
 fn the_buy_half_of_a_bar_should_start_at_its_point() {
-    let layout = ChartLayout::new(bounds(), None, 60.0);
+    let layout = ChartLayout::new(bounds(), None, px(60.0));
     let (buy, sell) = paired_bar_bounds(layout.plot, 4, 1, 2.0, 1.0, ValueDomain::new(0.0, 4.0));
 
     assert!(

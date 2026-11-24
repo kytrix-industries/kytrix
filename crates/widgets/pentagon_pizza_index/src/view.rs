@@ -14,6 +14,7 @@ use time::{OffsetDateTime, UtcOffset};
 use ui_core::{
     app::{App, TimerId},
     error::EngineError,
+    math::px,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         style::{PaintSpec, StylePatch},
@@ -231,8 +232,8 @@ impl WidgetView for PentagonPizzaIndexWidget {
                     .min_height_0()
                     .items_center()
                     .justify_center()
-                    .gap(BODY_GAP)
-                    .padding(BODY_PADDING)
+                    .gap(px(BODY_GAP))
+                    .padding(px(BODY_PADDING))
                     .build(),
             )
             .build(cx.tree_mut(), parent)?;
@@ -244,7 +245,7 @@ impl WidgetView for PentagonPizzaIndexWidget {
                 StyleBuilder::new()
                     .flex_col()
                     .items_center()
-                    .gap(LEVEL_COLUMN_GAP)
+                    .gap(px(LEVEL_COLUMN_GAP))
                     .build(),
             )
             .build(cx.tree_mut(), root)?;
@@ -626,7 +627,7 @@ impl PentagonPizzaIndexWidget {
         let language = cx.language();
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
-        let mut style = TextStyle::new(LEVEL_NAME_SIZE);
+        let mut style = TextStyle::new(px(LEVEL_NAME_SIZE));
         style.weight = LEVEL_NAME_WEIGHT;
         NodeBuilder::text(SmolStr::default(), style)
             .id("TEST_PENTAGON_PIZZA_INDEX_NAME")
@@ -655,12 +656,12 @@ impl PentagonPizzaIndexWidget {
             .style(
                 StyleBuilder::new()
                     .width_full()
-                    .max_width(LEVEL_BAR_MAX_WIDTH)
-                    .height(LEVEL_BAR_HEIGHT)
+                    .max_width(px(LEVEL_BAR_MAX_WIDTH))
+                    .height(px(LEVEL_BAR_HEIGHT))
                     .build(),
             )
             .paint(PaintSpec {
-                corner_radius: [LEVEL_BAR_RADIUS; 4],
+                corner_radius: [px(LEVEL_BAR_RADIUS); 4],
                 ..PaintSpec::default()
             })
             .bind_style(move |read| {
@@ -1663,12 +1664,13 @@ mod tests {
             .layout()
             .bounds;
         assert!(
-            (bounds.size.height - LEVEL_BAR_HEIGHT).abs() < f32::EPSILON,
+            (bounds.size.height.value() - LEVEL_BAR_HEIGHT).abs() < f32::EPSILON,
             "the bar is one thin rule under the reading: {}",
             bounds.size.height
         );
         assert!(
-            bounds.size.width > 0.0 && bounds.size.width <= LEVEL_BAR_MAX_WIDTH + f32::EPSILON,
+            bounds.size.width.value() > 0.0
+                && bounds.size.width.value() <= LEVEL_BAR_MAX_WIDTH + f32::EPSILON,
             "the bar is written across the pane up to its cap: {}",
             bounds.size.width
         );

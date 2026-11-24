@@ -3,7 +3,7 @@ use std::{rc::Rc, sync::Arc};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::SmolStr;
 use time::{Date, Month};
-use ui_core::math::Rect;
+use ui_core::math::{LogicalRect, px};
 
 use super::{axes::ChartLayout, data::PreparedData};
 use crate::model::{
@@ -74,9 +74,13 @@ pub(crate) fn prepared_all(translate: &Translate, flows: &[f64]) -> PreparedData
 }
 
 pub(crate) fn layout(width: f32, height: f32) -> ChartLayout {
-    ChartLayout::new(Rect::new(0.0, 0.0, width, height), 40.0, Some(60.0))
+    ChartLayout::new(
+        LogicalRect::new(px(0.0), px(0.0), px(width), px(height)),
+        px(40.0),
+        Some(px(60.0)),
+    )
 }
 
-pub(crate) fn bounds(width: f32, height: f32) -> Rect {
-    Rect::new(0.0, 0.0, width, height)
+pub(crate) fn bounds(width: f32, height: f32) -> LogicalRect {
+    LogicalRect::new(px(0.0), px(0.0), px(width), px(height))
 }

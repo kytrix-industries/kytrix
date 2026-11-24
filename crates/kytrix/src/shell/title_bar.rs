@@ -6,7 +6,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::Event,
-    math::Rect,
+    math::{LogicalRect, px},
     node::id::NodeId,
     paint::style_builder::StyleBuilder,
     window::{WindowId, WindowState},
@@ -56,7 +56,7 @@ pub(crate) struct TitleBar {
     updater: Option<Updater>,
     indicator: Option<UpdateIndicator>,
     maximized: bool,
-    drag_regions: Vec<Rect>,
+    drag_regions: Vec<LogicalRect>,
 }
 
 impl TitleBar {
@@ -74,9 +74,9 @@ impl TitleBar {
             TITLE_BAR,
             StyleBuilder::new()
                 .absolute()
-                .top(0.0)
-                .left(0.0)
-                .right(0.0)
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
                 .height(metrics::TITLE_BAR_HEIGHT)
                 .flex_row()
                 .items_center()
@@ -399,8 +399,13 @@ impl TitleBar {
         let gap = metrics::CONTROL_GAP;
         let start = left.origin.x + left.size.width + gap;
         let end = right.origin.x - gap;
-        let regions = if end > start && bar.size.height > 0.0 {
-            vec![Rect::new(start, bar.origin.y, end - start, bar.size.height)]
+        let regions = if end > start && bar.size.height > px(0.0) {
+            vec![LogicalRect::new(
+                start,
+                bar.origin.y,
+                end - start,
+                bar.size.height,
+            )]
         } else {
             Vec::new()
         };
@@ -413,7 +418,7 @@ impl TitleBar {
     }
 
     #[cfg(test)]
-    pub(crate) fn drag_regions(&self) -> &[Rect] {
+    pub(crate) fn drag_regions(&self) -> &[LogicalRect] {
         &self.drag_regions
     }
 

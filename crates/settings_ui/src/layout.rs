@@ -4,7 +4,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     interaction::{ScrollConfig, ScrollHandle},
-    math::Size,
+    math::{LogicalPx, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
     paint::{
         primitive::Border,
@@ -24,7 +24,7 @@ use ui_kit::{
 
 use crate::host::SettingsHost;
 
-pub(crate) const CONTROL_WIDTH: f32 = 240.0;
+pub(crate) const CONTROL_WIDTH: LogicalPx = px(240.0);
 
 const SEED_APPEARANCE: Appearance = Appearance::Dark;
 
@@ -58,7 +58,7 @@ pub(crate) fn container(
 }
 
 fn text_style(theme: &ThemeHandle, size: f32, weight: u16, role: Role) -> TextStyle {
-    TextStyle::new(size)
+    TextStyle::new(px(size))
         .with_weight(weight)
         .with_color(theme.theme_for(SEED_APPEARANCE).role(role))
         .with_wrap(TextWrap::Wrap)
@@ -85,7 +85,7 @@ pub(crate) fn themed_box(
             .bind_style(move |cx| StylePatch {
                 background: background.map(|role| background_theme.role(cx, role)),
                 border: border.map(|role| Border {
-                    width: 1.0,
+                    width: px(1.0),
                     color: border_theme.role(cx, role),
                 }),
                 ..StylePatch::default()
@@ -159,8 +159,8 @@ pub(crate) fn row(
                         .items_center()
                         .width_full()
                         .min_width_0()
-                        .gap(24.0)
-                        .padding_sides(12.0, 20.0, 12.0, 20.0)
+                        .gap(px(24.0))
+                        .padding_sides(px(12.0), px(20.0), px(12.0), px(20.0))
                         .build(),
                 )
                 .build(tree, parent)
@@ -173,7 +173,7 @@ pub(crate) fn row(
                 .flex_1()
                 .min_width_0()
                 .flex_col()
-                .gap(3.0)
+                .gap(px(3.0))
                 .build(),
         )?;
         themed_text(
@@ -238,7 +238,7 @@ pub(crate) fn section(
             .flex_none()
             .width_full()
             .min_width_0()
-            .gap(6.0)
+            .gap(px(6.0))
             .build(),
     )?;
     if let Some(title) = title {
@@ -247,7 +247,7 @@ pub(crate) fn section(
             let style = title_theme.theme_for(SEED_APPEARANCE).role(Role::FgDefault);
             NodeBuilder::text(
                 title,
-                TextStyle::new(LABEL_SIZE)
+                TextStyle::new(px(LABEL_SIZE))
                     .with_weight(600)
                     .with_color(style),
             )
@@ -276,7 +276,7 @@ pub(crate) fn section(
             .min_width_0()
             .overflow_hidden()
             .build(),
-        PaintBuilder::new().rounded(8.0).build(),
+        PaintBuilder::new().rounded(px(8.0)).build(),
         theme,
         Some(Role::SurfaceSunken),
         None,
@@ -291,7 +291,7 @@ pub(crate) fn section(
                 StyleBuilder::new()
                     .flex_none()
                     .width_full()
-                    .padding_x(20.0)
+                    .padding_x(px(20.0))
                     .build(),
             )?;
             themed_box(
@@ -302,7 +302,7 @@ pub(crate) fn section(
                 StyleBuilder::new()
                     .flex_none()
                     .width_full()
-                    .height(1.0)
+                    .height(px(1.0))
                     .build(),
                 PaintSpec::default(),
                 theme,
@@ -394,8 +394,8 @@ pub(crate) fn scroll_region(
                     .flex_none()
                     .width_full()
                     .min_width_0()
-                    .padding_sides(4.0, 0.0, 12.0, 0.0)
-                    .gap(16.0)
+                    .padding_sides(px(4.0), px(0.0), px(12.0), px(0.0))
+                    .gap(px(16.0))
                     .build(),
             )
             .build(tree, parent)
@@ -429,10 +429,10 @@ pub(crate) fn sync_scroll_content(
         return;
     };
     let size = entry.layout().bounds.size;
-    if size.width <= 0.0 || size.height <= 0.0 {
+    if size.width <= px(0.0) || size.height <= px(0.0) {
         return;
     }
-    let _ = app.set_scroll_content(handle, Size::new(size.width, size.height));
+    let _ = app.set_scroll_content(handle, LogicalSize::new(size.width, size.height));
 }
 
 pub(crate) fn page_content_id() -> SmolStr {

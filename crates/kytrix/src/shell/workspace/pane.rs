@@ -5,7 +5,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::Event,
-    math::Rect,
+    math::{LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         primitive::Border,
@@ -208,7 +208,7 @@ impl Pane {
         Ok(())
     }
 
-    pub(crate) fn set_rect(&mut self, app: &mut App, rect: Rect) -> Result<(), EngineError> {
+    pub(crate) fn set_rect(&mut self, app: &mut App, rect: LogicalRect) -> Result<(), EngineError> {
         let tree = ui::tree(app, self.window)?;
         tree.set_style(self.container, frame_style(rect))
     }
@@ -327,7 +327,7 @@ impl Pane {
     }
 }
 
-fn frame_style(rect: Rect) -> ui_core::paint::style::Style {
+fn frame_style(rect: LogicalRect) -> ui_core::paint::style::Style {
     StyleBuilder::new()
         .absolute()
         .left(rect.origin.x)
@@ -335,8 +335,8 @@ fn frame_style(rect: Rect) -> ui_core::paint::style::Style {
         .width(rect.size.width)
         .height(rect.size.height)
         .flex_col()
-        .gap(4.0)
-        .padding(4.0)
+        .gap(px(4.0))
+        .padding(px(4.0))
         .overflow_hidden()
         .min_width_0()
         .min_height_0()
@@ -353,17 +353,17 @@ fn build_frame(
     let themed = theme.clone();
     NodeBuilder::boxed()
         .id(SmolStr::new_static("PANE_FRAME"))
-        .style(frame_style(Rect::default()))
+        .style(frame_style(LogicalRect::default()))
         .paint(
             PaintBuilder::new()
                 .background(background)
-                .rounded(4.0)
+                .rounded(px(4.0))
                 .build(),
         )
         .bind_style(move |cx| StylePatch {
             background: Some(themed.role(cx, Role::SurfaceCanvas)),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: themed.role(cx, Role::LineDivider),
             }),
             ..StylePatch::default()
@@ -385,10 +385,10 @@ fn build_header_row(
             StyleBuilder::new()
                 .flex_row()
                 .items_center()
-                .gap(4.0)
-                .padding(4.0)
+                .gap(px(4.0))
+                .padding(px(4.0))
                 .width_full()
-                .height(34.0)
+                .height(px(34.0))
                 .flex_none()
                 .overflow_hidden()
                 .build(),
@@ -396,13 +396,13 @@ fn build_header_row(
         .paint(
             PaintBuilder::new()
                 .background(background)
-                .rounded(4.0)
+                .rounded(px(4.0))
                 .build(),
         )
         .bind_style(move |cx| StylePatch {
             background: Some(themed.role(cx, Role::SurfaceRaised)),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: themed.role(cx, Role::LineDivider),
             }),
             ..StylePatch::default()

@@ -5,7 +5,7 @@ use ui_core::{
     a11y::A11yOverride,
     app::App,
     error::EngineError,
-    math::Size,
+    math::{LogicalPx, LogicalSize},
     node::{builder::NodeBuilder, id::NodeId, image::ImageFit},
     paint::{
         color::Color,
@@ -17,7 +17,9 @@ use ui_core::{
 
 use crate::theme::{handle::ThemeHandle, role::Role};
 
-pub const DEFAULT_ICON_SIZE: f32 = 16.0;
+pub const DEFAULT_ICON_SIZE: LogicalPx = LogicalPx::new(16.0);
+
+pub const ICON_INTRINSIC_SIZE: LogicalSize = LogicalSize::new(DEFAULT_ICON_SIZE, DEFAULT_ICON_SIZE);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum IconKind {
@@ -287,7 +289,7 @@ svg_table! {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IconSpec {
     pub kind: IconKind,
-    pub size: f32,
+    pub size: LogicalPx,
     pub color: Color,
 }
 
@@ -304,7 +306,7 @@ impl IconSpec {
     }
 
     #[must_use]
-    pub const fn with_size(mut self, size: f32) -> Self {
+    pub const fn with_size(mut self, size: LogicalPx) -> Self {
         self.size = size;
         self
     }
@@ -321,18 +323,13 @@ impl IconSpec {
         window: WindowId,
         parent: NodeId,
     ) -> Result<NodeId, IconError> {
-        if !self.size.is_finite() || self.size <= 0.0 {
+        if !self.size.is_finite() || self.size <= LogicalPx::ZERO {
             return Err(IconError::InvalidSize { size: self.size });
         }
-        let scale = app
-            .window(window)
-            .ok_or(IconError::UnknownWindow { window })?
-            .scale()
-            .factor();
-        let resource = self.resource_for(app, window, scale)?;
+        let resource = self.resource_for(app, window)?;
         let mut style = Style::default();
         style.size_length(self.size, self.size);
-        NodeBuilder::image(resource.id, ImageFit::Fill)
+        NodeBuilder::image(resource.id(), ImageFit::Fill)
             .image_modulation(self.color)
             .style(style)
             .a11y(A11yOverride {
@@ -356,20 +353,15 @@ impl IconSpec {
         theme: &ThemeHandle,
         role: Role,
     ) -> Result<NodeId, IconError> {
-        if !self.size.is_finite() || self.size <= 0.0 {
+        if !self.size.is_finite() || self.size <= LogicalPx::ZERO {
             return Err(IconError::InvalidSize { size: self.size });
         }
-        let scale = app
-            .window(window)
-            .ok_or(IconError::UnknownWindow { window })?
-            .scale()
-            .factor();
-        let resource = self.resource_for(app, window, scale)?;
+        let resource = self.resource_for(app, window)?;
         let initial = theme.theme_for(theme.current(app)).role(role);
         let mut style = Style::default();
         style.size_length(self.size, self.size);
         let style_theme = theme.clone();
-        NodeBuilder::image(resource.id, ImageFit::Fill)
+        NodeBuilder::image(resource.id(), ImageFit::Fill)
             .image_modulation(initial)
             .style(style)
             .a11y(A11yOverride {
@@ -389,27 +381,19 @@ impl IconSpec {
             .map_err(IconError::Node)
     }
 
-    fn resource_for(
-        self,
-        app: &mut App,
-        window: WindowId,
-        scale: f32,
-    ) -> Result<ResourceImage, IconError> {
-        app.resources_mut()
-            .insert_owned_svg_for_display(
-                window,
-                svg(self.kind).as_bytes(),
-                Size::new(self.size, self.size),
-                scale,
-            )
-            .map_err(IconError::Decode)
+    fn resource_for(self, app: &mut App, window: WindowId) -> Result<ResourceImage, IconError> {
+        app.insert_svg_for_window(window, svg(self.kind).as_bytes(), ICON_INTRINSIC_SIZE)
+            .map_err(|error| match error {
+                EngineError::UnknownWindow { window } => IconError::UnknownWindow { window },
+                other => IconError::Decode(other),
+            })
     }
 }
 
 #[derive(Debug)]
 pub enum IconError {
     UnknownWindow { window: WindowId },
-    InvalidSize { size: f32 },
+    InvalidSize { size: LogicalPx },
     UnknownKind { name: SmolStr },
     Decode(EngineError),
     Node(EngineError),
@@ -451,17 +435,18 @@ impl std::error::Error for IconError {
 mod tests {
     use ui_core::{
         a11y::{A11yDiagnostic, A11yDrawKind, A11yRole},
-        math::{Rect, Scale, Size},
+        math::{DevicePixelRatio, DeviceSize, LogicalRect, LogicalSize, dp, px},
         node::{
             id::NodeId,
             image::{ImageFit, ImageSource},
             tree::NodeKind,
         },
         paint::color::Color,
+        resources::ResourceImage,
         test_support::app::TestApp,
     };
 
-    use super::{DEFAULT_ICON_SIZE, IconError, IconKind, IconSpec, svg};
+    use super::{DEFAULT_ICON_SIZE, ICON_INTRINSIC_SIZE, IconError, IconKind, IconSpec, svg};
     use crate::{
         kit::test_support::{bounds, image_primitives, test_app, test_app_with_scale},
         theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
@@ -528,24 +513,47 @@ mod tests {
     }
 
     #[test]
-    fn the_raster_is_produced_at_the_physical_pixel_size() {
-        for scale in [1.0f32, 1.5, 2.0] {
-            let mut app = test_app_with_scale(scale);
-            let window = app.window_id();
-            let root = app.app().window(window).expect("test window").tree().root();
-            let node = IconSpec::new(IconKind::GearSix)
-                .with_size(16.0)
-                .build(app.app_mut(), window, root)
-                .expect("图标挂载");
-            let _ = app.drain().expect("首帧");
-            let image = resource(&app, window, node);
-            let expected = (16.0 * scale).round() as u32;
+    fn an_icon_registers_one_vector_resource_at_the_design_size() {
+        let mut app = test_app_with_scale(1.0);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("test window").tree().root();
+        let sizes = [8.0f32, 12.0, 16.0, 32.0];
+        let nodes: Vec<NodeId> = sizes
+            .into_iter()
+            .map(|side| {
+                IconSpec::new(IconKind::GearSix)
+                    .with_size(px(side))
+                    .build(app.app_mut(), window, root)
+                    .expect("图标挂载")
+            })
+            .collect();
+        let _ = app.drain().expect("首帧");
+
+        let resources: Vec<ResourceImage> = nodes
+            .iter()
+            .map(|node| resource(&app, window, *node))
+            .collect();
+        assert!(
+            resources.iter().all(|image| *image == resources[0]),
+            "同一图标的显示尺寸不进资源身份：{resources:?}"
+        );
+        assert_eq!(
+            resources[0].intrinsic(DevicePixelRatio::ONE),
+            ICON_INTRINSIC_SIZE,
+            "SVG 登记的是图标内在逻辑尺寸，不是显示目标"
+        );
+        for (node, side) in nodes.iter().zip(sizes) {
             assert_eq!(
-                (image.width, image.height),
-                (expected, expected),
-                "scale {scale}: 图标必须按物理像素栅格（16 × {scale} = {expected}）"
+                bounds(&app, *node).map(|rect| rect.size),
+                Some(LogicalSize::new(px(side), px(side))),
+                "{side} px 图标的布局盒必须等于显式尺寸"
             );
         }
+        assert_eq!(
+            image_primitives(&app).len(),
+            nodes.len(),
+            "每个图标仍然各画一个图元"
+        );
     }
 
     #[test]
@@ -556,7 +564,7 @@ mod tests {
         let color = Color::from_rgba8([0x33, 0x99, 0xFF, 0xFF]);
 
         let node = IconSpec::new(IconKind::CheckCircle)
-            .with_size(16.0)
+            .with_size(px(16.0))
             .with_color(color)
             .build(app.app_mut(), window, root)
             .expect("图标挂载");
@@ -564,7 +572,7 @@ mod tests {
 
         assert_eq!(
             bounds(&app, node),
-            Some(Rect::new(0.0, 0.0, 16.0, 16.0)),
+            Some(LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0))),
             "图片节点的布局盒必须正好是显式 Style 尺寸"
         );
         {
@@ -593,36 +601,51 @@ mod tests {
         assert_eq!(images[0].modulation, color, "调制色必须是 IconSpec.color");
         assert_eq!(
             images[0].bounds,
-            Rect::new(0.0, 0.0, 16.0, 16.0),
+            LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)),
             "Fill 图元必须落在节点盒里"
         );
     }
 
     #[test]
-    fn a_dpi_change_reselects_the_physical_svg_raster() {
+    fn a_dpi_change_keeps_the_intrinsic_and_the_engine_keeps_every_raster() {
         let mut app = test_app_with_scale(1.0);
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
         let node = IconSpec::new(IconKind::GearSix)
-            .with_size(16.0)
+            .with_size(px(16.0))
             .build(app.app_mut(), window, root)
             .expect("图标挂载");
         let _ = app.drain().expect("1× 首帧");
-        assert_eq!(resource(&app, window, node).width, 16, "1× 是 16 物理像素");
+        let image = resource(&app, window, node);
+        assert_eq!(
+            image.intrinsic(DevicePixelRatio::ONE),
+            ICON_INTRINSIC_SIZE,
+            "1× 的内在逻辑尺寸是图标设计尺寸"
+        );
+        let at_1x = app
+            .app()
+            .resources()
+            .variant_for(image, DeviceSize::new(dp(16), dp(16)))
+            .expect("1× 帧必须栅格出 16 物理像素变体");
 
         set_window_scale(&mut app, 2.0);
         let _ = app.drain().expect("2× 首帧");
-        let image = resource(&app, window, node);
         assert_eq!(
-            (image.width, image.height),
-            (32, 32),
-            "DPI 变化后引擎必须自动把节点切到新物理尺寸的栅格"
+            image.intrinsic(DevicePixelRatio::new(2.0).expect("2×")),
+            ICON_INTRINSIC_SIZE,
+            "矢量资源的内在逻辑尺寸不随 DPR 变化"
         );
         assert_eq!(
             bounds(&app, node),
-            Some(Rect::new(0.0, 0.0, 16.0, 16.0)),
+            Some(LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0))),
             "显式 Style 尺寸：DPI 变化不得让图标布局跳动"
         );
+        let at_2x = app
+            .app()
+            .resources()
+            .variant_for(image, DeviceSize::new(dp(32), dp(32)))
+            .expect("DPI 变化后引擎必须自动栅格出 32 物理像素变体");
+        assert_ne!(at_1x, at_2x, "两个物理尺寸必须是两张不同的图集变体");
         assert_eq!(image_primitives(&app).len(), 1, "换变体不得复制图元");
     }
 
@@ -637,16 +660,17 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
         for size in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let side = px(size);
             let error = IconSpec::new(IconKind::X)
-                .with_size(size)
+                .with_size(side)
                 .build(app.app_mut(), window, root)
                 .expect_err("非法尺寸必须失败");
             assert!(
-                matches!(&error, IconError::InvalidSize { size: actual } if actual.to_bits() == size.to_bits()),
+                matches!(&error, IconError::InvalidSize { size: actual } if actual.value().to_bits() == size.to_bits()),
                 "size={size} 的错误分类不对：{error:?}"
             );
         }
-        assert_eq!(DEFAULT_ICON_SIZE, 16.0, "默认尺寸是旧用法里的常见值");
+        assert_eq!(DEFAULT_ICON_SIZE, px(16.0), "默认尺寸是旧用法里的常见值");
     }
 
     #[test]
@@ -668,7 +692,7 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("test window").tree().root();
         let node = IconSpec::new(IconKind::CheckCircle)
-            .with_size(16.0)
+            .with_size(px(16.0))
             .build(app.app_mut(), window, root)
             .expect("图标挂载");
         let _ = app.drain().expect("首帧");
@@ -707,7 +731,7 @@ mod tests {
             .iter()
             .map(|size| {
                 IconSpec::new(IconKind::CaretDown)
-                    .with_size(*size)
+                    .with_size(px(*size))
                     .build(app.app_mut(), window, root)
                     .expect("图标挂载")
             })
@@ -720,7 +744,7 @@ mod tests {
             let node_bounds = bounds(&app, *node).expect("图标布局盒");
             assert_eq!(
                 node_bounds.size,
-                Size::new(size, size),
+                LogicalSize::new(px(size), px(size)),
                 "{size} px 图标的布局盒必须等于显式尺寸"
             );
             let image = primitives
@@ -748,7 +772,7 @@ mod tests {
         app.app_mut()
             .window_mut(window)
             .expect("test window")
-            .set_scale(Scale::new(scale).expect("测试 DPI 必须是有限正数"));
+            .set_scale(DevicePixelRatio::new(scale).expect("测试 DPI 必须是有限正数"));
     }
 
     fn resource(
@@ -778,11 +802,11 @@ mod tests {
         let root = app.app().window(window).expect("test window").tree().root();
 
         let themed = IconSpec::new(IconKind::CheckCircle)
-            .with_size(16.0)
+            .with_size(px(16.0))
             .build_themed(app.app_mut(), window, root, &theme, Role::FgMuted)
             .expect("主题图标");
         let static_icon = IconSpec::new(IconKind::GearSix)
-            .with_size(16.0)
+            .with_size(px(16.0))
             .with_color(Color::from_rgba8([0xFF, 0x00, 0x00, 0xFF]))
             .build(app.app_mut(), window, root)
             .expect("静态图标");
@@ -794,7 +818,7 @@ mod tests {
         assert_eq!(
             images
                 .iter()
-                .find(|image| image.bounds.origin.x == 0.0)
+                .find(|image| image.bounds.origin.x == px(0.0))
                 .map(|image| resolved(image.modulation)),
             Some(light_muted),
             "首帧：主题图标的调制色 = 浅色 FgMuted"
@@ -817,7 +841,7 @@ mod tests {
         let images = image_primitives(&app);
         let themed_modulation = images
             .iter()
-            .find(|image| image.bounds.origin.x == 0.0)
+            .find(|image| image.bounds.origin.x == px(0.0))
             .map(|image| resolved(image.modulation));
         assert_eq!(themed_modulation, Some(dark_muted), "深色主题图标的调制色");
         assert_ne!(
@@ -826,7 +850,7 @@ mod tests {
         );
         let static_modulation = images
             .iter()
-            .find(|image| image.bounds.origin.x > 0.0)
+            .find(|image| image.bounds.origin.x > px(0.0))
             .map(|image| resolved(image.modulation));
         assert_eq!(
             static_modulation,
