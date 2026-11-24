@@ -583,19 +583,23 @@ struct TrackMetrics {
 }
 
 fn track_metrics(size: UnifiedSize) -> TrackMetrics {
-    let height = size.icon_size() * 1.25;
+    let height = size.icon_size() + px(8.0);
     TrackMetrics {
-        width: height * 1.9,
+        width: height * 2.0 - px(4.0),
         height,
         radius: height / 2.0,
-        inset: LogicalPx::new(2.0),
+        inset: px(4.0),
     }
 }
 ```
 
-`sync_knob` 直接在逻辑空间计算 `offset = inset + mix * travel`，写回 `Rect<LogicalPx>`；`sync_ring` / `sync_mark` 使用静态逻辑矩形。物理像素对齐由 `InstanceEncoder` 的 `Quad` 吸附完成。
+`sync_knob` 直接在逻辑空间计算 `offset = inset + mix * travel`，写回 `Rect<LogicalPx>`；ring / mark 在 build 时使用静态逻辑矩形。物理像素对齐由 `InstanceEncoder` 的 `Quad` / `Image` 吸附完成。
 
-结果：Toggle 中约 200 行 DPI 专用计算与辅助函数被删除，组件回到普通逻辑布局规模；不再有 DPI 专用测试。小数 DPI 下允许最多 1 物理像素的居中偏差（WebKit/CSS 的常规行为）。若产品要求严格对称，设计系统使用 4 的倍数的逻辑尺寸（1.25/1.5/1.75/2/2.5/3 下均为整数物理像素），而不是把 DPI 带回组件。
+结果：Toggle 中约 200 行 DPI 专用计算与辅助函数被删除，组件回到普通逻辑布局规模；不再有 DPI 专用测试。
+
+Toggle 的全部尺寸与偏移改为 **4 逻辑像素的倍数**：`control_side = max(icon_size + 4, 16)`（复选与单选共用）、`mark_side = control_side - 8`、`switch_height = icon_size + 8`、`switch_width = switch_height × 2 - 4`、`inset = 4`。因为 4×{1.25, 1.5, 1.75, 2, 3} 都是整数，`pixelSnappedIntRect` 对这些矩形在任意相位下都给出精确的物理尺寸与间距：开关上下边距相等，单选外圈为正圆且内点严格居中，复选方框保持正方形。Medium 为开关 36×20、滑块 12、复选/单选 16、勾/内点 8；开关相对原方案变大，复选/单选略小，这是换取严格对称的直接代价。
+
+复选勾改为内联 SVG 模板（`toggle.rs` 的 `CHECK_SVG`），用 Image 节点按 `mark_side` 填充；引擎按窗口 DPR 栅格化，避免 Canvas 圆点在逐边吸附下混排 3/4 物理像素。`InstanceEncoder` 的吸附策略保持不变。
 
 ### 5.2 资源类组件
 
@@ -813,6 +817,7 @@ DeviceRect = (x0, y0, x1, y1)
 | `measure_text_*` | 逻辑测量：空文本为零、限宽增高、与窗口 DPR 无关（E1 已落地） |
 | `ui_kit_has_no_device_scale_dependency` | grep 门禁（见 §8.3）（阶段 A4/E1 落地） |
 | `toggle_logical_geometry_is_stable_at_every_dpi` | Toggle 的 layout override 逻辑几何与 DPI 无关（阶段 A4/E1 落地） |
+| `the_toggle_shapes_stay_square_and_centered_in_device_pixels` | 1/1.25/1.5/1.75/2/3 下开关上下边距相等，单选/复选外框与标记均为正方形且严格居中 |
 
 `SnapshotCase.scale` / `TestApp::with_scale` / `TestApp::set_dpr` 只作为 test-support 的 DPR 注入入口保留，不进入生产公开 API。
 
@@ -853,7 +858,7 @@ Get-ChildItem -Recurse -Filter *.rs crates | Select-String -Pattern 'Window::sca
 3. **文本改造风险最高**：`Canvas::push_text` 改的是帧内阶段顺序（新增 `resolve_canvas_text` 在 `upload_atlas_pages` 之前），影响文本缓存、图集淘汰、IME/caret 路径；必须单独一批实现和回归。
 4. **`Style.inner` 私有化的迁移成本**：实测 `style.inner` 写入点 274 处（ui_core 166 / ui_kit 100 / widgets 4 / market_participants_ui 4），其中约 30 处是非长度字段（`display` / `align_self` / 百分比尺寸），必须在阶段 B1 一并补齐 typed setter。
 5. **性能**：单位类型全部 `#[repr(transparent)]`，零运行时开销；`Canvas::push_text` 每帧按 key 命中跳过，目标不高于当前 `shape_text` 稳态成本。
-6. **小数 DPI 的对称性**：不保证 Toggle 等装饰形状绝对对称；这是 WebKit/CSS 的既定取舍。若产品验收要求严格对称，应使用 4 的倍数逻辑尺寸或另立“设备对齐组”设计，不应回到组件内 DPI 计算。
+6. **小数 DPI 的对称性**：其他装饰形状仍按 WebKit/CSS 的既定取舍最多偏差 1 物理像素；Toggle 已通过 4 的倍数逻辑尺寸收口（Medium 为开关 36×20 / 滑块 12、复选 16 / 勾 8、单选 16 / 内点 8），不再依赖组件内 DPI 计算。若其他组件验收要求严格对称，同样使用 4 的倍数逻辑尺寸，而不是回到组件内 DPI 计算。
 7. **examples 依赖 DPI 做证据**：`frameless_smoke` / `p1_win_placement_evidence` / `acceptance/windowed` 需要 `Window::scale`，删除公开面后改为 `required-features = ["test-support"]` + test-support 物理观测面。
 
 ## 10. 参考资料
@@ -869,5 +874,6 @@ Get-ChildItem -Recurse -Filter *.rs crates | Select-String -Pattern 'Window::sca
 ## 11. 交付记录
 
 - 2026-11-24：阶段 A–F 全部落地，提交 25eb02b4（设计稿）/ df4a16fe（布局去吸附 + paint 吸附）/ 34786c05（Toggle 去 DPI）/ 78cd3405（StyleBuilder 入引擎）/ ae176bfc（单位类型）/ db7f1683（下游迁移 + 图片资源模型）/ 4e2f2b99（Canvas 文本 + DPI 收口）。
+- 2026-11-24：Toggle 改为 4 逻辑像素倍数（Medium 开关 36×20 / 滑块 12、复选/单选 16 / 勾、内点 8），复选勾改用内联 SVG 模板的 Image 节点；修复小数 DPI 下滑块偏心、单选外圈椭圆与复选勾锯齿。
 - 勘误：78cd3405 的提交正文写「删除 ui_kit 的 taffy 生产依赖」，实际 ui_kit 仍保留 taffy 生产依赖（9 个生产文件把 taffy 枚举作为 typed setter 入参）；prediction_market 的 taffy 为 dev-dependency，market_participants_ui 已无 taffy。
 - 验收环境：Windows 下 `cargo clippy --all-features` 会打开 `llama_sys/metal`，构建脚本按设计拒绝非 macOS，属既有平台约束；门禁使用不带 `--all-features` 的 workspace clippy。
