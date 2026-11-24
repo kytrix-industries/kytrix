@@ -16,6 +16,7 @@ impl MemoryNeed {
         device_local: true,
     };
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const READBACK: Self = Self {
         host_visible: true,
         host_coherent: true,

@@ -47,7 +47,7 @@ impl A11yConsumerEpoch {
         self.0.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(windows, feature = "test-support")))]
     #[must_use]
     pub(crate) fn same_handle(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)

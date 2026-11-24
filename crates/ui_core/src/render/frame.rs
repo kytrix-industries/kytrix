@@ -583,6 +583,8 @@ mod tests {
         FrameFeedback, FramePayload, FrameRequest, FrameSlot, InFlightRing, InstanceChunk,
         InstanceMirror, LatestFrame, MAX_FRAMES_IN_FLIGHT, ResyncGate, pool_lock,
     };
+    #[cfg(target_os = "linux")]
+    use crate::math::px;
     use crate::{
         math::{DeviceRect, dp},
         paint::instance::InstanceEncoder,

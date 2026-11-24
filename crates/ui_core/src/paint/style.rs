@@ -860,6 +860,15 @@ mod tests {
         assert_eq!(collected, shadows);
     }
 
+    #[cfg(target_os = "linux")]
+    const SHADOWS_SIZE_BASELINE: usize = 80;
+    #[cfg(not(target_os = "linux"))]
+    const SHADOWS_SIZE_BASELINE: usize = 88;
+    #[cfg(target_os = "linux")]
+    const PAINT_SPEC_SIZE_BASELINE: usize = 184;
+    #[cfg(not(target_os = "linux"))]
+    const PAINT_SPEC_SIZE_BASELINE: usize = 192;
+
     #[test]
     fn shadows_size_budget() {
         let single = size_of::<ShadowSpec>();
@@ -870,12 +879,14 @@ mod tests {
         println!("size_of::<PaintSpec>() = {paint}");
         assert_eq!(single, 36, "ShadowSpec 尺寸基线（E13 §2.4）");
         assert_eq!(
-            shadows, 88,
-            "Shadows 尺寸基线（内联 2 层 = ShadowSpec 36×2 + SmallVec 头 16）"
+            shadows, SHADOWS_SIZE_BASELINE,
+            "Shadows 尺寸基线（内联 2 层 = ShadowSpec 36×2 + SmallVec 头 16；Linux 的 wayland-backend \
+             启用 smallvec/union ⇒ 少 8 B 为 80）"
         );
         assert_eq!(
-            paint, 192,
-            "PaintSpec 尺寸基线（E13 §2.4；装在 `Option<Box<...>>` 里，不影响 `Node` 336 B）"
+            paint, PAINT_SPEC_SIZE_BASELINE,
+            "PaintSpec 尺寸基线（E13 §2.4；Windows/mac 192 B，Linux 的 wayland-backend 启用 \
+             smallvec/union ⇒ 少 8 B 为 184 B；装在 `Option<Box<...>>` 里，不影响 `Node` 尺寸）"
         );
     }
 }

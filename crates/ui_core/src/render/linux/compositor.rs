@@ -2030,7 +2030,7 @@ mod tests {
         plan_swapchain_copy,
     };
     use crate::{
-        math::{DeviceRect, LogicalSize},
+        math::{DeviceRect, LogicalSize, dp, px},
         paint::atlas::AtlasKind,
         render::{
             DirtyRects,

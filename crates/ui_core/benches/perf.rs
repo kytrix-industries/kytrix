@@ -5,10 +5,12 @@ use std::{
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use smol_str::{SmolStr, format_smolstr};
+#[cfg(windows)]
+use ui_core::math::DevicePixelRatio;
 use ui_core::{
     a11y::A11yPatch,
     app::App,
-    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+    math::{LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         color::{Color, ColorResolver},

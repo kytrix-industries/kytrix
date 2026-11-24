@@ -565,7 +565,7 @@ impl ResourceCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn without_lods(mut self) -> Self {
         self.lod_levels = 0;
         self

@@ -16,6 +16,11 @@ use crate::{
     text_edit::EditableSpec,
 };
 
+#[cfg(target_os = "linux")]
+const NODE_SIZE_BASELINE: usize = 328;
+#[cfg(not(target_os = "linux"))]
+const NODE_SIZE_BASELINE: usize = 336;
+
 fn boxed(tree: &mut NodeTree, parent: NodeId) -> NodeId {
     NodeBuilder::boxed().build(tree, parent).expect("挂载成功")
 }
@@ -192,15 +197,16 @@ fn node_and_handle_sizes() {
         size_of::<Option<Box<crate::a11y::tree::NodeA11y>>>()
     );
     assert_eq!(
-        node_size, 336,
+        node_size, NODE_SIZE_BASELINE,
         "Node 尺寸基线: {node_size} B（上限 336 B：冷字段必须装箱，见 R03-3；X5 起多 lane 集合占 24 B；\
-         E13 的组不透明度戳 `paint_opacity` +4 B ⇒ 补齐到 336 B，**已无余量**，后续加字段须先装箱搬走冷字段）"
+         E13 的组不透明度戳 `paint_opacity` +4 B ⇒ 补齐到 336 B，**已无余量**，后续加字段须先装箱搬走冷字段；\
+         Linux 的 wayland-backend 启用 smallvec/union ⇒ 少 8 B 为 328 B）"
     );
     assert_eq!(
         size_of::<crate::text::TextContent>(),
         112,
         "TextContent 的尺寸基线（v2.1 E2 的 `runs: Option<Box<ThinSlice>>` +8；E2b 的归一化诊断 \
-         计数 +8。`NodeKind::Text` 装箱持有 TextContent ⇒ Node 336 B，上限 336 B）"
+         计数 +8。`NodeKind::Text` 装箱持有 TextContent ⇒ Node 336 B（Linux 328 B），上限 336 B）"
     );
     assert_eq!(
         size_of::<Option<NodeId>>(),
@@ -886,7 +892,7 @@ fn node_size_after_p06() {
     let size = size_of::<Node>();
     println!("size_of::<Node>() = {size}");
     assert_eq!(
-        size, 336,
+        size, NODE_SIZE_BASELINE,
         "Node 尺寸基线：{size} B（备选瘦身：删掉未被读取的 `Node.id` 字段）"
     );
 }

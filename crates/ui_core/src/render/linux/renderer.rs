@@ -835,7 +835,7 @@ mod tests {
     };
     use crate::{
         error::EngineError,
-        math::dp,
+        math::{dp, px},
         paint::atlas::AtlasKind,
         render::{DirtyRects, RenderStats, compositor::Plan, frame::LatestFrame},
         window::FrameIndex,

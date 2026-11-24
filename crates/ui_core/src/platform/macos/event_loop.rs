@@ -696,8 +696,12 @@ mod tests {
 
     use smol_str::SmolStr;
 
-    use super::{RecoveryDisposition, recovery_disposition, request_full_republish_after_recovery};
-    use crate::{error::EngineError, window::WindowOptions};
+    #[cfg(feature = "test-support")]
+    use super::request_full_republish_after_recovery;
+    use super::{RecoveryDisposition, recovery_disposition};
+    use crate::error::EngineError;
+    #[cfg(feature = "test-support")]
+    use crate::window::WindowOptions;
 
     #[test]
     fn only_device_lost_triggers_a_renderer_rebuild() {
