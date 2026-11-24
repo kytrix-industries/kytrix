@@ -180,7 +180,15 @@ pub(crate) fn translate(
             if state.ime.consume_char(wparam as u16, context.ticks_ms) {
                 return None;
             }
-            decode_char(wparam as u16, state).map(PlatformEvent::Text)
+            let text = decode_char(wparam as u16, state)?;
+            let modifiers = state.modifiers;
+            let alt_gr = modifiers.contains(Modifiers::CONTROL | Modifiers::ALT);
+            let command_modifier = modifiers.contains(Modifiers::META)
+                || (!alt_gr && modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT));
+            if state.ime.is_composing() || command_modifier || text.chars().any(char::is_control) {
+                return None;
+            }
+            Some(PlatformEvent::Text(text))
         }
         windows::Win32::UI::Controls::WM_MOUSELEAVE => Some(PlatformEvent::PointerLeave),
         WM_SETFOCUS => Some(PlatformEvent::Focus(true)),
@@ -512,24 +520,40 @@ fn f_key(n: u8) -> Option<KeyCode> {
 #[cfg(test)]
 mod tests {
     use smol_str::SmolStr;
-    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
 
     use super::{
         MessageContext, PlatformEvent, PointerKind, TranslateState, key_code_from_native,
         lines_per_tick, translate,
     };
     use crate::{
-        event::{KeyCode, KeyState, Modifiers, PointerButton},
+        event::{ImeEvent, KeyCode, KeyState, Modifiers, PointerButton},
         math::DevicePixelRatio,
     };
 
     fn key_lparam(scancode: u16, extended: bool, previous_down: bool) -> isize {
-        let mut raw = u32::from(scancode) << 16;
+        key_lparam_full(scancode, extended, previous_down, false, false)
+    }
+
+    fn key_lparam_full(
+        scancode: u16,
+        extended: bool,
+        previous_down: bool,
+        released: bool,
+        alt_context: bool,
+    ) -> isize {
+        let mut raw = 1u32 | (u32::from(scancode) << 16);
         if extended {
             raw |= 1 << 24;
         }
+        if alt_context {
+            raw |= 1 << 29;
+        }
         if previous_down {
             raw |= 1 << 30;
+        }
+        if released {
+            raw |= 1 << 31;
         }
         raw as isize
     }
@@ -549,6 +573,66 @@ mod tests {
     fn translate_raw(msg: u32, wparam: usize, lparam: isize) -> Option<PlatformEvent> {
         let mut state = TranslateState::default();
         translate(msg, wparam, lparam, context(), &mut state).map(|stamped| stamped.event)
+    }
+
+    fn char_event(state: &mut TranslateState, unit: u16) -> Option<PlatformEvent> {
+        char_message(state, unit, 0)
+    }
+
+    fn char_message(state: &mut TranslateState, unit: u16, lparam: isize) -> Option<PlatformEvent> {
+        translate(WM_CHAR, usize::from(unit), lparam, context(), state).map(|stamped| stamped.event)
+    }
+
+    fn key_message(
+        state: &mut TranslateState,
+        msg: u32,
+        vk: u16,
+        lparam: isize,
+    ) -> Option<PlatformEvent> {
+        translate(msg, usize::from(vk), lparam, context(), state).map(|stamped| stamped.event)
+    }
+
+    fn key_down(state: &mut TranslateState, vk: u16, scancode: u16, extended: bool) {
+        let _ = key_message(state, WM_KEYDOWN, vk, key_lparam(scancode, extended, false));
+    }
+
+    fn key_up(state: &mut TranslateState, vk: u16, scancode: u16, extended: bool) {
+        let _ = key_message(
+            state,
+            WM_KEYUP,
+            vk,
+            key_lparam_full(scancode, extended, true, true, false),
+        );
+    }
+
+    fn sys_key(state: &mut TranslateState, vk: u16, scancode: u16, down: bool) {
+        let _ = key_message(
+            state,
+            if down { WM_SYSKEYDOWN } else { WM_SYSKEYUP },
+            vk,
+            key_lparam_full(scancode, false, !down, !down, true),
+        );
+    }
+
+    const ALTGR_CTRL_DOWN: isize = 0x001D_0001;
+    const ALTGR_ALT_DOWN: isize = 0x2138_0001;
+    const ALTGR_LETTER_DOWN: isize = 0x2010_0001;
+    const ALTGR_CHAR: isize = 0x2010_0001;
+    const ALTGR_LETTER_UP: isize = 0xE010_0001;
+    const ALTGR_CTRL_UP: isize = 0xE01D_0001;
+    const ALTGR_ALT_UP: isize = 0xE038_0001;
+
+    fn altgr_char_event(state: &mut TranslateState, unit: u16) -> Option<PlatformEvent> {
+        let _ = key_message(state, WM_KEYDOWN, 0x11, ALTGR_CTRL_DOWN);
+        let _ = key_message(state, WM_KEYDOWN, 0x12, ALTGR_ALT_DOWN);
+        let _ = key_message(state, WM_KEYDOWN, 0x51, ALTGR_LETTER_DOWN);
+        char_message(state, unit, ALTGR_CHAR)
+    }
+
+    fn altgr_release(state: &mut TranslateState) {
+        let _ = key_message(state, WM_KEYUP, 0x51, ALTGR_LETTER_UP);
+        let _ = key_message(state, WM_SYSKEYUP, 0x11, ALTGR_CTRL_UP);
+        let _ = key_message(state, WM_KEYUP, 0x12, ALTGR_ALT_UP);
     }
 
     #[test]
@@ -718,6 +802,202 @@ mod tests {
         assert_eq!(
             plain.map(|stamped| stamped.event),
             Some(PlatformEvent::Text("a".into()))
+        );
+    }
+
+    #[test]
+    fn control_char_messages_never_become_text() {
+        let mut state = TranslateState::default();
+        for unit in [0x08_u16, 0x09, 0x0D, 0x1B, 0x7F, 0x85, 0x9F] {
+            assert_eq!(
+                char_event(&mut state, unit),
+                None,
+                "WM_CHAR {unit:#04x} 是控制字符，不得变成 Text"
+            );
+        }
+        assert_eq!(
+            char_event(&mut state, u16::from(b'a')),
+            Some(PlatformEvent::Text("a".into())),
+            "控制字符过滤不得吞掉普通键入"
+        );
+    }
+
+    #[test]
+    fn command_modifier_messages_never_become_text() {
+        let mut state = TranslateState::default();
+        assert_eq!(
+            char_event(&mut state, u16::from(b'x')),
+            Some(PlatformEvent::Text("x".into()))
+        );
+
+        key_down(&mut state, 0x11, 0x1D, false);
+        assert_eq!(state.modifiers(), Modifiers::CONTROL);
+        for unit in [0x01_u16, 0x03, 0x16, 0x18, 0x1A, 0x19] {
+            assert_eq!(
+                char_event(&mut state, unit),
+                None,
+                "Ctrl 组合的 WM_CHAR {unit:#04x} 不得变成 Text"
+            );
+        }
+        assert_eq!(
+            char_event(&mut state, 0x20),
+            None,
+            "Ctrl+Space 是真实可达的非控制字符 Ctrl 组合，必须拦截"
+        );
+        key_up(&mut state, 0x11, 0x1D, false);
+
+        sys_key(&mut state, 0x12, 0x38, true);
+        assert_eq!(state.modifiers(), Modifiers::ALT);
+        assert_eq!(
+            char_event(&mut state, u16::from(b'x')),
+            None,
+            "单独 ALT 仍拦截（物理左 Alt+字母走 WM_SYSCHAR，本断言是防御）"
+        );
+        sys_key(&mut state, 0x12, 0x38, false);
+        assert_eq!(
+            char_event(&mut state, u16::from(b'x')),
+            Some(PlatformEvent::Text("x".into())),
+            "修饰键全部抬起后必须恢复文本"
+        );
+
+        key_down(&mut state, 0x5B, 0x5B, true);
+        assert_eq!(state.modifiers(), Modifiers::META);
+        assert_eq!(
+            char_event(&mut state, u16::from(b'x')),
+            None,
+            "META 不得产生 Text"
+        );
+        key_up(&mut state, 0x5B, 0x5B, true);
+        assert_eq!(
+            char_event(&mut state, u16::from(b'x')),
+            Some(PlatformEvent::Text("x".into()))
+        );
+    }
+
+    #[test]
+    fn altgr_char_messages_become_text() {
+        let mut state = TranslateState::default();
+        for (unit, expected) in [(0x40_u16, "@"), (0x20AC, "€"), (0x0105, "ą")] {
+            assert_eq!(
+                altgr_char_event(&mut state, unit),
+                Some(PlatformEvent::Text(expected.into())),
+                "AltGr 字符 {expected} 必须放行"
+            );
+            assert_eq!(
+                state.modifiers(),
+                Modifiers::CONTROL | Modifiers::ALT,
+                "AltGr 投递 WM_CHAR 时是合成的 Ctrl+Alt"
+            );
+            assert_eq!(char_event(&mut state, 0x08), None, "AltGr 下控制字符仍拦截");
+            assert_eq!(char_event(&mut state, 0x0D), None);
+            altgr_release(&mut state);
+            assert_eq!(state.modifiers(), Modifiers::empty());
+        }
+
+        key_down(&mut state, 0x10, 0x2A, false);
+        assert_eq!(
+            altgr_char_event(&mut state, 0x20AC),
+            Some(PlatformEvent::Text("€".into())),
+            "AltGr+Shift 仍放行"
+        );
+        key_down(&mut state, 0x5B, 0x5B, true);
+        assert_eq!(
+            char_event(&mut state, 0x40),
+            None,
+            "META 与 AltGr 同按时 META 优先拦截"
+        );
+    }
+
+    #[test]
+    fn alt_numpad_char_after_alt_release_becomes_text() {
+        let mut state = TranslateState::default();
+        sys_key(&mut state, 0x12, 0x38, true);
+        assert_eq!(state.modifiers(), Modifiers::ALT);
+        sys_key(&mut state, 0x61, 0x4F, true);
+        sys_key(&mut state, 0x61, 0x4F, false);
+        sys_key(&mut state, 0x12, 0x38, false);
+        assert_eq!(state.modifiers(), Modifiers::empty());
+        assert_eq!(
+            char_event(&mut state, 0xE9),
+            Some(PlatformEvent::Text("é".into())),
+            "Alt+numpad 的 WM_CHAR 在 Alt 抬起后到达，不得被 Alt 规则误杀"
+        );
+    }
+
+    #[test]
+    fn shift_never_blocks_text() {
+        let mut state = TranslateState::default();
+        key_down(&mut state, 0x10, 0x2A, false);
+        assert_eq!(state.modifiers(), Modifiers::SHIFT);
+        assert_eq!(
+            char_event(&mut state, u16::from(b'A')),
+            Some(PlatformEvent::Text("A".into()))
+        );
+    }
+
+    #[test]
+    fn emoji_surrogate_pairs_survive_the_char_filter() {
+        let mut state = TranslateState::default();
+        key_down(&mut state, 0x10, 0x2A, false);
+        assert_eq!(char_event(&mut state, 0xD83C), None, "高代理单独不产生文本");
+        assert_eq!(
+            char_event(&mut state, 0xDF0D),
+            Some(PlatformEvent::Text("🌍".into())),
+            "Shift 组合下的代理对必须保留"
+        );
+        assert_eq!(char_event(&mut state, 0xDF0D), None, "孤立低代理不产生文本");
+        assert_eq!(
+            char_event(&mut state, u16::from(b'a')),
+            Some(PlatformEvent::Text("a".into())),
+            "孤立低代理不得污染后续键入"
+        );
+    }
+
+    #[test]
+    fn ime_replay_suppression_survives_modifier_changes() {
+        let mut state = TranslateState::default();
+        key_down(&mut state, 0x11, 0x1D, false);
+        state.ime_mut().queue_commit("🌍ab", context().ticks_ms);
+        assert_eq!(char_event(&mut state, 0xD83C), None);
+        assert_eq!(char_event(&mut state, 0xDF0D), None);
+        assert_eq!(char_event(&mut state, u16::from(b'a')), None);
+        key_up(&mut state, 0x11, 0x1D, false);
+        assert_eq!(
+            char_event(&mut state, u16::from(b'b')),
+            None,
+            "Ctrl 抬起后队列里剩余的补发字符仍必须被抑制（抑制先于过滤器）"
+        );
+        assert_eq!(
+            char_event(&mut state, u16::from(b'c')),
+            Some(PlatformEvent::Text("c".into())),
+            "队列耗尽后真实键入必须放行"
+        );
+    }
+
+    #[test]
+    fn composition_char_messages_never_become_text() {
+        let mut state = TranslateState::default();
+        let start = state
+            .ime_mut()
+            .handle(HWND::default(), WM_IME_STARTCOMPOSITION, 0, 0);
+        assert!(matches!(start.events.as_slice(), [ImeEvent::Start]));
+        assert!(state.ime().is_composing());
+        assert_eq!(
+            char_event(&mut state, u16::from(b'a')),
+            None,
+            "组合期普通字符只信 IME 事件"
+        );
+        assert_eq!(char_event(&mut state, 0x08), None);
+
+        let end = state
+            .ime_mut()
+            .handle(HWND::default(), WM_IME_ENDCOMPOSITION, 0, 0);
+        assert!(matches!(end.events.as_slice(), [ImeEvent::End]));
+        assert!(!state.ime().is_composing());
+        assert_eq!(
+            char_event(&mut state, u16::from(b'a')),
+            Some(PlatformEvent::Text("a".into())),
+            "组合结束后必须恢复文本"
         );
     }
 
