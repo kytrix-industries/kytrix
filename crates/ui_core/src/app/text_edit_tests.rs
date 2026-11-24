@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::App;
 use crate::{
     a11y::A11yRole,
@@ -6,7 +8,7 @@ use crate::{
     node::{builder::NodeBuilder, id::NodeId},
     paint::{color::Color, style::Style},
     text::{TextPassReport, TextStyle},
-    text_edit::EditableSpec,
+    text_edit::{EditableSpec, TextAffinity},
     window::{WindowId, WindowOptions},
 };
 
@@ -65,6 +67,31 @@ fn mount_with_style(app: &mut App, window: WindowId, spec: EditableSpec, style: 
         .style(style)
         .build(w.tree_mut(), root)
         .expect("挂载可编辑文本")
+}
+
+fn masked_spec(style: TextStyle, max_length: Option<usize>) -> EditableSpec {
+    EditableSpec {
+        masked: true,
+        max_length,
+        ..spec(style, false)
+    }
+}
+
+fn max_length_spec(style: TextStyle, max_length: Option<usize>) -> EditableSpec {
+    EditableSpec {
+        max_length,
+        ..spec(style, false)
+    }
+}
+
+fn display_mirror(app: &App, window: WindowId, node: NodeId) -> smol_str::SmolStr {
+    app.window(window)
+        .expect("窗口存在")
+        .tree()
+        .text_content(node)
+        .expect("文本镜像")
+        .text
+        .clone()
 }
 
 fn capped_style(max_width: f32) -> Style {
@@ -409,6 +436,10 @@ fn stale_node_id_is_rejected_and_cannot_alias_a_recycled_slot() {
         app.text_edit_metrics(window, first),
         Err(EngineError::StaleNode { node }) if node == first
     ));
+    assert!(matches!(
+        app.text_edit_snapshot(window, first),
+        Err(EngineError::StaleNode { node }) if node == first
+    ));
     assert_eq!(
         app.text_edit_value(window, second).expect("新节点可读"),
         "",
@@ -656,6 +687,10 @@ fn text_edit_apis_report_strongly_typed_errors() {
         app.text_edit_set_value(window, text, "x"),
         Err(EngineError::TextEditNotAvailable { node }) if node == text
     ));
+    assert!(matches!(
+        app.text_edit_snapshot(window, text),
+        Err(EngineError::TextEditNotAvailable { node }) if node == text
+    ));
 
     let editable = mount(
         &mut app,
@@ -667,9 +702,19 @@ fn text_edit_apis_report_strongly_typed_errors() {
         app.text_edit_value(window, editable).expect("初始值可读"),
         ""
     );
+    assert_eq!(
+        app.text_edit_snapshot(window, editable)
+            .expect("初始快照可读")
+            .generation,
+        0
+    );
     let unknown = WindowId::from_raw(999);
     assert!(matches!(
         app.text_edit_value(unknown, editable),
+        Err(EngineError::UnknownWindow { window }) if window == unknown
+    ));
+    assert!(matches!(
+        app.text_edit_snapshot(unknown, editable),
         Err(EngineError::UnknownWindow { window }) if window == unknown
     ));
     assert!(matches!(
@@ -697,6 +742,367 @@ fn text_edit_apis_report_strongly_typed_errors() {
         before,
         "失败的挂载不得留下孤儿节点"
     );
+}
+
+#[test]
+fn masked_display_mirrors_one_bullet_per_grapheme_and_keeps_real_text_apart() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+    );
+    for (raw, expected) in [
+        ("abc", "•••"),
+        ("e\u{301}", "•"),
+        ("👨‍👩‍👧", "•"),
+        ("🇨🇳", "•"),
+        ("👍🏽", "•"),
+        ("a👍🏽🇨🇳e\u{301}", "••••"),
+    ] {
+        assert!(
+            app.text_edit_set_value(window, node, raw)
+                .expect("写入成功")
+        );
+        assert_eq!(
+            app.text_edit_value(window, node).expect("真实文本"),
+            raw,
+            "value 必须返回真实文本"
+        );
+        assert_eq!(
+            display_mirror(&app, window, node),
+            expected,
+            "TextContent 镜像必须是显示文本"
+        );
+        assert_eq!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .editable(node)
+                .expect("可编辑槽位")
+                .display_text(),
+            expected
+        );
+        let snapshot = app.text_edit_snapshot(window, node).expect("快照");
+        assert_eq!(snapshot.text.as_ref(), raw);
+        assert_eq!(snapshot.selection.range(), expected.len()..expected.len());
+        assert!(snapshot.selection.is_collapsed());
+    }
+}
+
+#[test]
+fn masked_display_mapping_rebuilds_only_when_the_text_changes() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+    );
+    let builds = |app: &App| {
+        app.window(window)
+            .expect("窗口存在")
+            .tree()
+            .editable(node)
+            .expect("可编辑槽位")
+            .display_builds()
+    };
+    assert_eq!(builds(&app), 0, "挂载只建空 identity display");
+    assert!(
+        app.text_edit_set_value(window, node, "abc")
+            .expect("写入成功")
+    );
+    assert_eq!(builds(&app), 1, "内容变化重建一次映射");
+    for _ in 0..8 {
+        let first = app.text_edit_snapshot(window, node).expect("快照");
+        let second = app.text_edit_snapshot(window, node).expect("快照");
+        assert_eq!(first.generation, second.generation);
+        assert!(Arc::ptr_eq(&first.text, &second.text));
+    }
+    assert_eq!(builds(&app), 1, "读取快照不得重建映射");
+    assert!(
+        !app.text_edit_set_value(window, node, "abc")
+            .expect("等值写入")
+    );
+    assert_eq!(builds(&app), 1, "等值写入不得重建映射");
+    assert!(
+        app.text_edit_set_value(window, node, "abcdef")
+            .expect("写入成功")
+    );
+    assert_eq!(builds(&app), 2, "每次内容变化只重建一次");
+}
+
+#[test]
+fn masked_empty_text_keeps_the_line_box_and_an_empty_display() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+    );
+    refresh(&mut app, window);
+    layout(&mut app, window);
+    text_layout(&mut app, window);
+
+    assert_eq!(app.text_edit_value(window, node).expect("真实文本"), "");
+    assert_eq!(display_mirror(&app, window, node), "");
+    let metrics = app
+        .text_edit_metrics(window, node)
+        .expect("空掩码文本可度量");
+    assert_eq!(metrics.line_count, 1);
+    assert!(metrics.line_height > LogicalPx::ZERO);
+    let snapshot = app.text_edit_snapshot(window, node).expect("快照");
+    assert_eq!(snapshot.selection.range(), 0..0);
+    assert_eq!(
+        snapshot.selection.focus().affinity,
+        TextAffinity::Downstream
+    );
+    assert!(!app.text_edit_set_value(window, node, "").expect("空值写入"));
+}
+
+#[test]
+fn masked_max_length_counts_the_real_graphemes() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), Some(2)),
+        None,
+    );
+    assert!(
+        app.text_edit_set_value(window, node, "👨‍👩‍👧a")
+            .expect("写入成功")
+    );
+    assert_eq!(app.text_edit_value(window, node).expect("真实文本"), "👨‍👩‍👧a");
+    assert_eq!(display_mirror(&app, window, node), "••");
+    assert!(
+        app.text_edit_set_value(window, node, "🇨🇳🇨🇳🇨🇳")
+            .expect("写入成功")
+    );
+    assert_eq!(app.text_edit_value(window, node).expect("真实文本"), "🇨🇳🇨🇳");
+    assert_eq!(display_mirror(&app, window, node), "••");
+    let snapshot = app.text_edit_snapshot(window, node).expect("快照");
+    assert_eq!(
+        snapshot.selection.range(),
+        6..6,
+        "display 坐标是两个 • 的 6 字节"
+    );
+
+    let zero = mount(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), Some(0)),
+        None,
+    );
+    assert!(
+        !app.text_edit_set_value(window, zero, "abc")
+            .expect("max_length=0 静默截断")
+    );
+    assert_eq!(app.text_edit_value(window, zero).expect("真实文本"), "");
+    assert_eq!(display_mirror(&app, window, zero), "");
+}
+
+#[test]
+fn max_length_truncates_on_real_grapheme_boundaries() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        max_length_spec(TextStyle::new(px(16.0)), Some(2)),
+        None,
+    );
+    assert!(
+        app.text_edit_set_value(window, node, "a👍🏽b")
+            .expect("写入成功")
+    );
+    assert_eq!(
+        app.text_edit_value(window, node).expect("真实文本"),
+        "a👍🏽",
+        "截断不得拆开 emoji 字素簇"
+    );
+    assert_eq!(display_mirror(&app, window, node), "a👍🏽");
+    assert!(
+        !app.text_edit_set_value(window, node, "a👍🏽")
+            .expect("等值写入不报告 changed")
+    );
+
+    let unlimited = mount(
+        &mut app,
+        window,
+        max_length_spec(TextStyle::new(px(16.0)), None),
+        None,
+    );
+    assert!(
+        app.text_edit_set_value(window, unlimited, "a👍🏽b")
+            .expect("写入成功")
+    );
+    assert_eq!(
+        app.text_edit_value(window, unlimited).expect("真实文本"),
+        "a👍🏽b"
+    );
+}
+
+#[test]
+fn set_value_collapses_the_selection_to_the_display_end() {
+    let (_rt, mut app, window) = new_app();
+    let plain = mount(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+    );
+    let initial = app.text_edit_snapshot(window, plain).expect("初始快照");
+    assert_eq!(initial.selection.range(), 0..0);
+    assert!(
+        app.text_edit_set_value(window, plain, "abc")
+            .expect("写入成功")
+    );
+    let collapsed = app.text_edit_snapshot(window, plain).expect("快照");
+    assert!(collapsed.selection.is_collapsed());
+    assert_eq!(collapsed.selection.range(), 3..3);
+    assert_eq!(collapsed.selection.focus().byte, 3);
+    assert_eq!(collapsed.selection.focus().affinity, TextAffinity::Upstream);
+    assert!(
+        app.text_edit_set_value(window, plain, "")
+            .expect("写入成功")
+    );
+    let empty = app.text_edit_snapshot(window, plain).expect("快照");
+    assert_eq!(empty.selection.range(), 0..0);
+    assert_eq!(empty.selection.focus().affinity, TextAffinity::Downstream);
+
+    let masked = mount(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+    );
+    assert!(
+        app.text_edit_set_value(window, masked, "abc")
+            .expect("写入成功")
+    );
+    let snapshot = app.text_edit_snapshot(window, masked).expect("快照");
+    assert_eq!(snapshot.selection.range(), 9..9, "••• 的 display 末尾是 9");
+    assert_eq!(snapshot.selection.focus().byte, 9);
+    let tree = app.window(window).expect("窗口存在").tree();
+    let editable = tree.editable(masked).expect("可编辑槽位");
+    assert_eq!(editable.display_text(), "•••");
+    assert_eq!(editable.display_byte_for_raw(3), 9);
+    assert_eq!(editable.raw_byte_for_display(9), 3);
+    assert_eq!(editable.raw_byte_for_display(5), 1);
+    assert_eq!(editable.display_byte_for_raw(2), 6);
+    assert_eq!(editable.display_byte_for_raw(usize::MAX), 9);
+    assert_eq!(editable.raw_byte_for_display(usize::MAX), 3);
+}
+
+#[test]
+fn snapshot_generation_tracks_changes_and_reuses_the_text_allocation() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+    );
+    let first = app.text_edit_snapshot(window, node).expect("快照");
+    let base = first.generation;
+    assert!(!app.text_edit_set_value(window, node, "").expect("等值写入"));
+    let unchanged = app.text_edit_snapshot(window, node).expect("快照");
+    assert_eq!(unchanged.generation, base, "同值写入不得 +1");
+    assert!(
+        Arc::ptr_eq(&first.text, &unchanged.text),
+        "同 generation 的快照必须复用同一次 Arc<str>"
+    );
+
+    assert!(
+        app.text_edit_set_value(window, node, "abc")
+            .expect("写入成功")
+    );
+    let changed = app.text_edit_snapshot(window, node).expect("快照");
+    assert_eq!(changed.generation, base + 1);
+    assert!(!Arc::ptr_eq(&first.text, &changed.text));
+    let repeated = app.text_edit_snapshot(window, node).expect("快照");
+    assert_eq!(repeated.generation, changed.generation);
+    assert!(Arc::ptr_eq(&changed.text, &repeated.text));
+
+    let masked = mount(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+    );
+    let before = app.text_edit_snapshot(window, masked).expect("快照");
+    assert!(
+        app.text_edit_set_value(window, masked, "abc")
+            .expect("写入成功")
+    );
+    let after = app.text_edit_snapshot(window, masked).expect("快照");
+    assert_eq!(after.generation, before.generation + 1);
+    assert!(!Arc::ptr_eq(&before.text, &after.text));
+    assert!(
+        app.text_edit_set_value(window, masked, "xyz")
+            .expect("写入成功")
+    );
+    let replaced = app.text_edit_snapshot(window, masked).expect("快照");
+    assert_eq!(
+        replaced.generation,
+        after.generation + 1,
+        "真实文本变化必须 +1（即使掩码 display 不变）"
+    );
+    assert!(!Arc::ptr_eq(&after.text, &replaced.text));
+    assert_eq!(replaced.text.as_ref(), "xyz");
+    assert_eq!(display_mirror(&app, window, masked), "•••");
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn masked_display_renders_bullet_glyphs_through_test_app() {
+    use crate::test_support::{app::TestApp, record::PrimitiveKind};
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let (masked, reference) = {
+        let w = app.app_mut().window_mut(window).expect("窗口");
+        let root = w.tree().root();
+        let masked = NodeBuilder::editable_text(masked_spec(TextStyle::new(px(16.0)), None))
+            .style(node_style(None))
+            .build(w.tree_mut(), root)
+            .expect("挂载掩码输入");
+        let reference = NodeBuilder::text("•••", TextStyle::new(px(16.0)))
+            .style(node_style(None))
+            .build(w.tree_mut(), root)
+            .expect("挂载参考文本");
+        (masked, reference)
+    };
+    app.app_mut()
+        .text_edit_set_value(window, masked, "abc")
+        .expect("写入成功");
+    assert_eq!(
+        app.app()
+            .window(window)
+            .expect("窗口")
+            .tree()
+            .text_content(masked)
+            .expect("文本镜像")
+            .text,
+        "•••"
+    );
+    let _ = app.drain().expect("帧");
+
+    let rendered = app.rendered().expect("已提交");
+    let glyph_bounds = |node: NodeId| {
+        rendered
+            .primitives
+            .iter()
+            .find(|primitive| primitive.node == node && primitive.kind == PrimitiveKind::GlyphRun)
+            .map(|primitive| primitive.bounds)
+            .expect("掩码文本必须渲染出字形")
+    };
+    let masked_bounds = glyph_bounds(masked);
+    let reference_bounds = glyph_bounds(reference);
+    assert_near(masked_bounds.size.width, reference_bounds.size.width);
+    assert!(masked_bounds.size.width > LogicalPx::ZERO);
 }
 
 #[cfg(feature = "test-support")]

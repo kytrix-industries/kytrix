@@ -1674,6 +1674,14 @@ impl App {
         crate::text_edit::set_value(self, window, node, text)
     }
 
+    pub fn text_edit_snapshot(
+        &self,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<crate::text_edit::TextEditSnapshot, EngineError> {
+        crate::text_edit::snapshot(self, window, node)
+    }
+
     pub fn text_edit_metrics(
         &self,
         window: WindowId,
