@@ -1,6 +1,6 @@
 # ui_core 逻辑像素 / 物理像素边界重构设计
 
-状态：设计稿（本轮不修改代码）
+状态：已实现（阶段 A–F 收口；提交 25eb02b4 / df4a16fe / 34786c05 / 78cd3405 / ae176bfc / db7f1683 / 4e2f2b99，最终验证 2026-11-24）
 范围：`ui_core`、`ui_kit` 以及依赖这两个 crate 的应用层 API
 决策记录：2026-11-23
 
@@ -269,7 +269,7 @@ impl DevicePixelRatio {
 - **I11-1（应用层无 DPI）**：`ui_kit`、widgets、`profile_ui` 等应用代码不得读取 `DevicePixelRatio`，不得在像素几何计算中乘除 DPI。
 - **I11-2（布局纯逻辑）**：`LayoutBox`、`LayoutOverride`、`HitShape`、`Canvas.bounds`、`Primitive` 的几何字段只允许 `LogicalPx`；同一棵树在不同 DPR 下布局结果逐位相同。
 - **I11-3（单一换算边界）**：`LogicalPx → PhysicalPx/DevicePx` 只发生在 `InstanceEncoder`（绘制）与平台/资源/a11y 边界；`paint` 之内不得出现组件级 scale 参数。
-- **I11-4（物理类型封闭）**：`PhysicalPx`/`DevicePx` 只出现在 `render`、`platform`、`a11y`、`resources` 变体和 test-support 的物理观测面；不进入 `Style`、`PaintSpec`、`TextStyle`、`Canvas`、`Primitive`。
+- **I11-4（物理类型封闭）**：`PhysicalPx`/`DevicePx` 只出现在 `render`、`platform`、`a11y`、`resources` 变体和 test-support 的物理观测面；不进入 `Style`、`PaintSpec`、`TextStyle`、`Canvas`、`Primitive`。例外：`NodeTree` 的 clip 缓存键（`Option<DeviceRect>`）是 paint 内部缓存，不是布局/场景几何，允许保留。
 - **I11-5（无兼容别名）**：删除旧的非泛型 `Point/Size/Rect`（改为 `Point<T>/Size<T>/Rect<T>`）、`Scale`、`snap_to_device`、`to_physical_*`、`Window::scale` 等名字，不保留过渡 API。
 
 ## 4. ui_core 具体改造
@@ -786,7 +786,7 @@ DeviceRect = (x0, y0, x1, y1)
 ### 阶段 G：验收
 
 - `cargo +nightly fmt --all -- --check`
-- `cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo +nightly clippy --workspace --all-targets -- -D warnings`（`--all-features` 会开启 `llama_sys` 的 metal feature，Windows 下构建脚本按设计直接报错，属既有平台约束，不进本仓库门禁）
 - `cargo test --workspace`
 - `cargo test -p ui_core --features test-support --test snapshot`（按新基线）
 - `cargo test -p ui_core --features test-support --test gui_smoke -- --ignored`
@@ -828,17 +828,17 @@ DeviceRect = (x0, y0, x1, y1)
 ### 8.3 静态门禁
 
 ```powershell
-Select-String -Path crates/ui_kit/src/**,crates/widgets/**,crates/profile_ui/src/** -Pattern 'Window::scale|\.scale\(\)\.factor|device_length|device_length_with_parity|text_scale|shape_text|push_shaped_text'
-Select-String -Path crates/ui_core/src/**,crates/ui_kit/src/** -Pattern 'snap_to_device|to_physical_f32|to_physical_rounded|to_physical_covering|snap_stroke_width'
-Get-ChildItem -Recurse -Filter *.rs crates | Select-String -Pattern 'Window::scale|\.scale\(\)\.factor|dpi_epoch()|WindowOptions \{ scale|DpiChanged \{ dpi, scale'
+Get-ChildItem -Recurse -Filter *.rs crates/ui_kit/src,crates/widgets,crates/profile_ui/src | Select-String -Pattern 'Window::scale|\.scale\(\)\.factor|device_length|device_length_with_parity|text_scale|shape_text|push_shaped_text'
+Get-ChildItem -Recurse -Filter *.rs crates/ui_core/src,crates/ui_kit/src | Select-String -Pattern 'snap_to_device|to_physical_f32|to_physical_rounded|to_physical_covering|snap_stroke_width'
+Get-ChildItem -Recurse -Filter *.rs crates | Select-String -Pattern 'Window::scale|\.scale\(\)\.factor|dpi_epoch\(\)|WindowOptions \{ scale|DpiChanged \{ dpi, scale'
 ```
 
-三个门禁在阶段 F 后都必须是 0（测试代码里的纯逻辑 scale 常量除外，需明确白名单）。
+门禁 1 必须为 0；门禁 2 只允许测试名 `quads_snap_to_device_pixels`（1 条）；门禁 3 只允许保留的 `pub(crate)` 内部名 `dpi_epoch()`（15 条）。
 
 ### 8.4 现有测试基线
 
-- `cargo test --workspace`：8604 passed / 0 failed / 30 ignored（102 个测试目标）。
-- `cargo test -p ui_core --lib --features hud,test-support`：2348 passed / 1 ignored（E1 删除 standalone shaping API 后其 24 条句柄/租约用例退场，新增 18 条 canvas 文本 / measurement / pass 替换 / 字体栈 / 卸载 prune / 补帧预算用例 + 2 条节点文本 inline-box / ellipsis 等价覆盖；F1 新增 5 条 DPI 公开面用例；`math` 单测 40 个）。
+- `cargo test --workspace`：8606 passed / 0 failed / 30 ignored（102 个测试目标）。
+- `cargo test -p ui_core --lib --features hud,test-support`：2349 passed / 1 ignored（E1 删除 standalone shaping API 后其 24 条句柄/租约用例退场，新增 18 条 canvas 文本 / measurement / pass 替换 / 字体栈 / 卸载 prune / 补帧预算用例 + 2 条节点文本 inline-box / ellipsis 等价覆盖；F1 新增 5 条 DPI 公开面用例；`math` 单测 41 个）。
 - `cargo test -p ui_kit --lib`：765 passed（kit 716 / theme 49；`style_builder` 测试已随模块迁入 `ui_core`）。
 - `cargo test -p ui_core --features test-support --test snapshot`：11 passed（WARP 14 张 golden，C1 期间逐图 `max=0 avg=0.000 mismatch=0`；F 阶段重跑仍为 11 passed，无重基）。
 - `gui_smoke`：`--features test-support --test gui_smoke` 默认 1 ignored（需要真实窗口/显示）；`--ignored` 在 WARP 下 1 test（内部 6 场景）PASS。
@@ -866,4 +866,8 @@ Get-ChildItem -Recurse -Filter *.rs crates | Select-String -Pattern 'Window::sca
 - Flutter ViewConfiguration（physical/logical constraints、devicePixelRatio、toMatrix）: https://api.flutter.dev/flutter/rendering/ViewConfiguration-class.html
 - Flutter RenderParagraph.devicePixelRatio（DPI 变化重生成文本位图）: https://api.flutter.dev/flutter/rendering/RenderParagraph/devicePixelRatio.html
 
+## 11. 交付记录
 
+- 2026-11-24：阶段 A–F 全部落地，提交 25eb02b4（设计稿）/ df4a16fe（布局去吸附 + paint 吸附）/ 34786c05（Toggle 去 DPI）/ 78cd3405（StyleBuilder 入引擎）/ ae176bfc（单位类型）/ db7f1683（下游迁移 + 图片资源模型）/ 4e2f2b99（Canvas 文本 + DPI 收口）。
+- 勘误：78cd3405 的提交正文写「删除 ui_kit 的 taffy 生产依赖」，实际 ui_kit 仍保留 taffy 生产依赖（9 个生产文件把 taffy 枚举作为 typed setter 入参）；prediction_market 的 taffy 为 dev-dependency，market_participants_ui 已无 taffy。
+- 验收环境：Windows 下 `cargo clippy --all-features` 会打开 `llama_sys/metal`，构建脚本按设计拒绝非 macOS，属既有平台约束；门禁使用不带 `--all-features` 的 workspace clippy。

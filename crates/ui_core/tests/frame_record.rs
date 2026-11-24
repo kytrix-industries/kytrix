@@ -54,6 +54,49 @@ fn text_frame_records_glyph_run_instances() {
 }
 
 #[test]
+fn glyph_runs_stay_inside_the_text_node_box() {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let root = app.app().window(window).expect("窗口存在").tree().root();
+    let node = NodeBuilder::text("Frame L2 text", TextStyle::new(px(16.0)))
+        .layout_override(LogicalRect::new(px(10.0), px(20.0), px(220.0), px(40.0)))
+        .id("text.l2")
+        .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
+        .expect("文本节点");
+
+    let _ = app.drain().expect("帧成功");
+    let node_bounds = app
+        .app()
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .get(node)
+        .expect("节点")
+        .layout()
+        .bounds;
+    let rendered = app.rendered().expect("已提交");
+    let runs: Vec<LogicalRect> = rendered
+        .primitives
+        .iter()
+        .filter(|primitive| primitive.node == node && primitive.kind == PrimitiveKind::GlyphRun)
+        .map(|primitive| primitive.bounds)
+        .collect();
+
+    assert!(!runs.is_empty(), "文本节点必须产生 GlyphRun");
+    for bounds in runs {
+        assert!(
+            bounds.origin.x >= node_bounds.origin.x - 0.5
+                && bounds.origin.y >= node_bounds.origin.y - 0.5
+                && bounds.origin.x + bounds.size.width
+                    <= node_bounds.origin.x + node_bounds.size.width + 0.5
+                && bounds.origin.y + bounds.size.height
+                    <= node_bounds.origin.y + node_bounds.size.height + 0.5,
+            "GlyphRun bounds {bounds:?} 必须 ⊆ 节点盒 {node_bounds:?}"
+        );
+    }
+}
+
+#[test]
 fn canvas_frame_flattens_primitives() {
     let mut app = TestApp::new();
     let window = app.window_id();

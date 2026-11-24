@@ -941,6 +941,9 @@ impl DevicePixelRatio {
         let y0 = rect.origin.y.value() * factor;
         let x1 = (rect.origin.x.value() + rect.size.width.value()) * factor;
         let y1 = (rect.origin.y.value() + rect.size.height.value()) * factor;
+        if ![x0, y0, x1, y1].iter().all(|value| value.is_finite()) {
+            return DeviceRect::default();
+        }
         DeviceRect::from_edges(
             round_device(x0),
             round_device(y0),
@@ -959,6 +962,9 @@ impl DevicePixelRatio {
         let y0 = rect.origin.y.value() * factor;
         let x1 = (rect.origin.x.value() + rect.size.width.value()) * factor;
         let y1 = (rect.origin.y.value() + rect.size.height.value()) * factor;
+        if ![x0, y0, x1, y1].iter().all(|value| value.is_finite()) {
+            return DeviceRect::default();
+        }
         DeviceRect::from_edges(
             floor_device(x0),
             floor_device(y0),
@@ -1590,6 +1596,16 @@ mod tests {
         assert_eq!(
             dpr(1.0).to_covering_device_rect(overflow),
             device(i32::MIN, 0, i32::MAX, 10)
+        );
+    }
+
+    #[test]
+    fn overflowing_edge_sum_is_an_empty_device_rect() {
+        let overflow = rect(3.0e38, 0.0, 1.0e38, 10.0);
+        assert_eq!(dpr(1.0).to_device_rect(overflow), DeviceRect::default());
+        assert_eq!(
+            dpr(1.0).to_covering_device_rect(overflow),
+            DeviceRect::default()
         );
     }
 
