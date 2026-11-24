@@ -101,10 +101,20 @@ pub(crate) fn dispatch_action_with_hit(
     }
 }
 
+#[cfg(any(test, feature = "test-support", feature = "automation"))]
 pub(crate) fn dispatch_input(app: &mut App, window: WindowId, event: InputEvent) -> InputOutcome {
+    dispatch_input_tracked(app, window, event).0
+}
+
+pub(crate) fn dispatch_input_tracked(
+    app: &mut App,
+    window: WindowId,
+    event: InputEvent,
+) -> (InputOutcome, bool) {
     let mut outcome = InputOutcome::default();
+    let mut consumed = false;
     if !app.windows.contains_key(&window) {
-        return outcome;
+        return (outcome, consumed);
     }
     let position = match &event {
         InputEvent::PointerEnter { position, .. }
@@ -168,13 +178,17 @@ pub(crate) fn dispatch_input(app: &mut App, window: WindowId, event: InputEvent)
             repeat,
             modifiers,
             ..
-        } => app.on_key(window, code, state, repeat, modifiers, &mut outcome),
+        } => {
+            consumed = app.on_key(window, code, state, repeat, modifiers, &mut outcome);
+        }
+        InputEvent::Text { text, .. } => {
+            consumed = crate::text_edit::handle_text(app, window, &text);
+        }
         InputEvent::Magnify { .. }
         | InputEvent::Rotate { .. }
         | InputEvent::SmartMagnify { .. } => {}
-        InputEvent::Text { .. } => {}
     }
-    outcome
+    (outcome, consumed)
 }
 
 pub(crate) fn hit_at(app: &App, window: WindowId, position: LogicalPoint) -> Option<HitResult> {
@@ -565,7 +579,7 @@ pub(crate) fn on_key(
     repeat: bool,
     modifiers: Modifiers,
     outcome: &mut InputOutcome,
-) {
+) -> bool {
     match state {
         KeyState::Down => {
             app.held_keys.entry(window).or_default().insert(code);
@@ -574,8 +588,23 @@ pub(crate) fn on_key(
             if let Some(held) = app.held_keys.get_mut(&window) {
                 held.remove(&code);
             }
-            return;
+            return app
+                .consumed_keys
+                .get_mut(&window)
+                .is_some_and(|consumed| consumed.remove(&code));
         }
+    }
+    let consumed = crate::text_edit::handle_key(app, window, code, repeat, modifiers);
+    {
+        let consumed_keys = app.consumed_keys.entry(window).or_default();
+        if consumed {
+            consumed_keys.insert(code);
+        } else {
+            consumed_keys.remove(&code);
+        }
+    }
+    if consumed {
+        return true;
     }
     if !repeat {
         if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
@@ -602,7 +631,7 @@ pub(crate) fn on_key(
                     outcome.action = Some(action);
                     outcome.target = Some(node);
                 }
-                return;
+                return false;
             }
         }
         let focused = app.focused(window);
@@ -640,7 +669,7 @@ pub(crate) fn on_key(
                 ) {
                     outcome.action = Some(action);
                     outcome.target = Some(node);
-                    return;
+                    return false;
                 }
             }
         }
@@ -653,7 +682,7 @@ pub(crate) fn on_key(
             let node =
                 focused.or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
             let Some(node) = node else {
-                return;
+                return false;
             };
             if app.dispatch_action_with_hit(
                 window,
@@ -666,12 +695,13 @@ pub(crate) fn on_key(
                 outcome.action = Some(action);
                 outcome.target = Some(node);
             }
-            return;
+            return false;
         }
     }
     if modifiers.is_empty() {
         default_key_scroll(app, window, code);
     }
+    false
 }
 
 fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
@@ -760,6 +790,7 @@ pub(crate) fn click_count(
 
 pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
     app.held_keys.remove(&window);
+    app.consumed_keys.remove(&window);
     if app
         .windows
         .get_mut(&window)

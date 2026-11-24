@@ -381,6 +381,11 @@ impl ShapedText {
     }
 
     #[cfg(test)]
+    pub(crate) fn is_simple(&self) -> bool {
+        matches!(self.kind, ShapedKind::Simple(_))
+    }
+
+    #[cfg(test)]
     pub(crate) fn layout_breaks(&self) -> u32 {
         match &self.kind {
             ShapedKind::Parley(snapshot) => snapshot.borrow().breaks.get(),
@@ -514,7 +519,7 @@ impl ShapedText {
         Ok((shaped, diagnostics, ctx.glyph_atlas.take_stats()))
     }
 
-    fn with_broken_layout<R>(
+    pub(crate) fn with_broken_layout<R>(
         &self,
         width: LogicalPx,
         alignment: TextAlign,

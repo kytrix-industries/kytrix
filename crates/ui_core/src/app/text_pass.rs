@@ -472,13 +472,22 @@ pub(crate) fn refresh_text(
         let Some(content) = tree.text_content(node).cloned() else {
             continue;
         };
-        let (shaped, hit) = text.shape_cached(&content);
+        let editable = tree.editable(node).is_some();
+        let (shaped, hit) = if editable {
+            text.shape_cached_editable(&content)
+        } else {
+            text.shape_cached(&content)
+        };
         if hit {
             report.reused += 1;
         } else {
             report.shaped += 1;
         }
-        let key = crate::text::cache::ShapeKey::new(&content, text.font_stack_version());
+        let key = if editable {
+            crate::text::cache::ShapeKey::parley_only(&content, text.font_stack_version())
+        } else {
+            crate::text::cache::ShapeKey::new(&content, text.font_stack_version())
+        };
         if let Some(slot) = tree.text_slot(node)
             && slot.key() == key
             && slot.dpi_epoch() == dpi_epoch
@@ -488,7 +497,6 @@ pub(crate) fn refresh_text(
             continue;
         }
 
-        let editable = tree.editable(node).is_some();
         let measured = if editable {
             shaped.measure_editable(known, available)
         } else {

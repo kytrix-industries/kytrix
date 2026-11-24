@@ -116,6 +116,7 @@ pub struct App {
     dispatcher: Arc<Dispatcher>,
     events: event_queue::EventQueue,
     held_keys: ahash::HashMap<WindowId, ahash::HashSet<KeyCode>>,
+    consumed_keys: ahash::HashMap<WindowId, ahash::HashSet<KeyCode>>,
     frame_hook: Option<Box<dyn FnMut(&mut App)>>,
     handlers: ahash::HashMap<Action, ActionHandler>,
     close_handlers: ahash::HashMap<WindowId, CloseHandler>,
@@ -371,6 +372,7 @@ impl App {
             dispatcher,
             events: event_queue::EventQueue::new(),
             held_keys: ahash::HashMap::default(),
+            consumed_keys: ahash::HashMap::default(),
             frame_hook: None,
             handlers: ahash::HashMap::default(),
             close_handlers: ahash::HashMap::default(),
@@ -905,8 +907,17 @@ impl App {
         input::dispatch_action_with_hit(self, window, node, action, source, hit, modifiers)
     }
 
+    #[cfg(any(test, feature = "test-support", feature = "automation"))]
     pub(crate) fn dispatch_input(&mut self, window: WindowId, event: InputEvent) -> InputOutcome {
         input::dispatch_input(self, window, event)
+    }
+
+    pub(crate) fn dispatch_input_tracked(
+        &mut self,
+        window: WindowId,
+        event: InputEvent,
+    ) -> (InputOutcome, bool) {
+        input::dispatch_input_tracked(self, window, event)
     }
 
     fn hit_at(&self, window: WindowId, position: LogicalPoint) -> Option<HitResult> {
@@ -982,7 +993,7 @@ impl App {
         repeat: bool,
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
-    ) {
+    ) -> bool {
         input::on_key(self, window, code, state, repeat, modifiers, outcome)
     }
 
@@ -1680,6 +1691,14 @@ impl App {
         node: NodeId,
     ) -> Result<crate::text_edit::TextEditSnapshot, EngineError> {
         crate::text_edit::snapshot(self, window, node)
+    }
+
+    pub fn text_edit_undo(&mut self, window: WindowId, node: NodeId) -> Result<bool, EngineError> {
+        crate::text_edit::undo(self, window, node)
+    }
+
+    pub fn text_edit_redo(&mut self, window: WindowId, node: NodeId) -> Result<bool, EngineError> {
+        crate::text_edit::redo(self, window, node)
     }
 
     pub fn text_edit_metrics(

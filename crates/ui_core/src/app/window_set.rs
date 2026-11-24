@@ -302,6 +302,7 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     super::timer::cancel_window(app, id);
     super::animation::drop_completions_for_window(app, id);
     app.held_keys.remove(&id);
+    app.consumed_keys.remove(&id);
     if app.cursor_pending.is_some_and(|(window, _)| window == id) {
         app.cursor_pending = None;
     }

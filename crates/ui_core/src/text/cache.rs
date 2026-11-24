@@ -16,10 +16,19 @@ pub(crate) struct ShapeKey {
     text_len: u32,
     style_hash: u64,
     font_stack_version: u32,
+    parley_only: bool,
 }
 
 impl ShapeKey {
     pub(crate) fn new(content: &TextContent, font_stack_version: u32) -> Self {
+        Self::with_parley_only(content, font_stack_version, false)
+    }
+
+    pub(crate) fn parley_only(content: &TextContent, font_stack_version: u32) -> Self {
+        Self::with_parley_only(content, font_stack_version, true)
+    }
+
+    fn with_parley_only(content: &TextContent, font_stack_version: u32, parley_only: bool) -> Self {
         let mut text_hasher = AHasher::default();
         text_hasher.write(content.text.as_bytes());
         let mut style_hasher = AHasher::default();
@@ -48,6 +57,7 @@ impl ShapeKey {
             text_len: content.text.len() as u32,
             style_hash: style_hasher.finish(),
             font_stack_version,
+            parley_only,
         }
     }
 }

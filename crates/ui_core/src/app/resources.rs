@@ -260,7 +260,10 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
     match &event {
         Event::Input(input) => {
             app.sync_clock();
-            app.dispatch_input(window, input.clone());
+            let (_, consumed) = app.dispatch_input_tracked(window, input.clone());
+            if consumed {
+                return;
+            }
         }
         Event::FocusChanged { focused } => {
             if !focused {
@@ -273,12 +276,42 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
     app.events.push(window, event);
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CLIPBOARD: std::cell::RefCell<Option<smol_str::SmolStr>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn set_clipboard_text(_app: &App, text: &str) -> Result<(), EngineError> {
-    crate::platform::native::clipboard::set_text(text)
+    #[cfg(test)]
+    {
+        let _ = crate::platform::native::clipboard::set_text as fn(&str) -> Result<(), EngineError>;
+        TEST_CLIPBOARD.with(|cell| {
+            *cell.borrow_mut() = Some(smol_str::SmolStr::new(text));
+        });
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        crate::platform::native::clipboard::set_text(text)
+    }
 }
 
 pub(crate) fn clipboard_text(_app: &App) -> Result<smol_str::SmolStr, EngineError> {
-    crate::platform::native::clipboard::get_text()
+    #[cfg(test)]
+    {
+        let _ = crate::platform::native::clipboard::get_text
+            as fn() -> Result<smol_str::SmolStr, EngineError>;
+        Ok(TEST_CLIPBOARD.with(|cell| {
+            cell.borrow()
+                .clone()
+                .unwrap_or_else(smol_str::SmolStr::default)
+        }))
+    }
+    #[cfg(not(test))]
+    {
+        crate::platform::native::clipboard::get_text()
+    }
 }
 
 #[must_use]

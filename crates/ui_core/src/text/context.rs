@@ -134,7 +134,26 @@ impl TextContext {
     }
 
     pub(crate) fn shape_cached(&mut self, content: &TextContent) -> (Rc<ShapedText>, bool) {
-        let key = ShapeKey::new(content, self.font_stack_version);
+        self.shape_cached_impl(content, true)
+    }
+
+    pub(crate) fn shape_cached_editable(
+        &mut self,
+        content: &TextContent,
+    ) -> (Rc<ShapedText>, bool) {
+        self.shape_cached_impl(content, false)
+    }
+
+    fn shape_cached_impl(
+        &mut self,
+        content: &TextContent,
+        allow_fast_path: bool,
+    ) -> (Rc<ShapedText>, bool) {
+        let key = if allow_fast_path {
+            ShapeKey::new(content, self.font_stack_version)
+        } else {
+            ShapeKey::parley_only(content, self.font_stack_version)
+        };
         if let Some(hit) = self.cache.get(&key)
             && hit.text() == content.text
             && hit.same_shaping_inputs(&content.style, content.runs())
@@ -146,7 +165,8 @@ impl TextContext {
         self.ensure_stack_status();
         let family = self.family_for(content.style.family());
         let font_identity = self.font_identity(content.style.family());
-        if content.inline_boxes.is_empty()
+        if allow_fast_path
+            && content.inline_boxes.is_empty()
             && content.runs().is_empty()
             && content.normalized_runs() == 0
             && content.style.decoration().is_none()

@@ -486,6 +486,8 @@ fn editable_spec(label: &'static str) -> EditableSpec {
         placeholder: SmolStr::new_static(""),
         multiline: false,
         masked: false,
+        readonly: false,
+        disabled: false,
         max_length: None,
         submit: None,
         text_style: TextStyle::new(px(16.0)),
