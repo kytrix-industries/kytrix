@@ -1749,6 +1749,11 @@ impl App {
         crate::text_edit::placeholder_color(self, window, node)
     }
 
+    #[must_use]
+    pub fn focused_editable(&self, window: WindowId) -> Option<NodeId> {
+        crate::text_edit::focused_node(self, window)
+    }
+
     pub fn text_edit_set_a11y_invalid(
         &mut self,
         window: WindowId,

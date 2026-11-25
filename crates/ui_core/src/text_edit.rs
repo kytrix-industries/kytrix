@@ -3551,6 +3551,13 @@ struct KeyContext {
     submit: Option<Action>,
 }
 
+pub(crate) fn focused_node(app: &App, window: WindowId) -> Option<NodeId> {
+    let node = app.focused(window)?;
+    let tree = app.window(window)?.tree();
+    let editable = tree.editable(node)?;
+    (!editable.spec().disabled).then_some(node)
+}
+
 fn focused_editable(app: &App, window: WindowId) -> Option<KeyContext> {
     let node = app.focused(window)?;
     let tree = app.window(window)?.tree();
