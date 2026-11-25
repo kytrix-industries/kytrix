@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf};
+use std::{io, path::PathBuf, time::Instant};
 
 use app_config::{
     network::{ProxyAuthorizationConfig, ProxyConfig, ProxyRoute, ServiceTarget},
@@ -7,7 +7,11 @@ use app_config::{
 use app_config_provider::store::ConfigPersistenceError;
 use i18n::language::codes::LanguageCode;
 use smol_str::SmolStr;
-use ui_core::{event::KeyCode, math::px, node::id::NodeId};
+use ui_core::{
+    event::{Event, InputEvent, KeyCode},
+    math::px,
+    node::id::NodeId,
+};
 
 use crate::{
     pages::proxy::editor::{
@@ -82,6 +86,36 @@ fn type_text(harness: &mut Harness, text: &str) {
 fn type_into(harness: &mut Harness, field: &str, text: &str) {
     click_field(harness, field);
     type_text(harness, text);
+}
+
+#[test]
+fn confirming_in_the_same_batch_as_the_last_key_should_keep_it() {
+    let mut harness = Harness::with_config(configured());
+    open_add_form(&mut harness);
+    click_field(&mut harness, "name");
+    harness.dispatch_without_frame(Event::Input(InputEvent::Text {
+        text: SmolStr::new_static("osaka"),
+        timestamp: Instant::now(),
+    }));
+    click_field(&mut harness, "addr");
+    harness.dispatch_without_frame(Event::Input(InputEvent::Text {
+        text: SmolStr::new_static("127.0.0.1"),
+        timestamp: Instant::now(),
+    }));
+    click_field(&mut harness, "port");
+    harness.dispatch_without_frame(Event::Input(InputEvent::Text {
+        text: SmolStr::new_static("1080"),
+        timestamp: Instant::now(),
+    }));
+    harness.click_node(CONFIRM_SELECTOR);
+    harness.settle(2);
+
+    let stored = harness.config();
+    assert_eq!(
+        stored.proxies.get("osaka").map(|proxy| proxy.port),
+        Some(1080),
+        "confirming must read the key that arrived in the same batch"
+    );
 }
 
 fn click_alert(harness: &mut Harness, suffix: &str) {

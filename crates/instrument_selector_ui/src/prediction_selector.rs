@@ -1056,12 +1056,14 @@ impl<S: PredictionEventSource> SelectorState<S> {
 
         let spec = Arc::new(InputSpec {
             name: format_smolstr!("{}:search", self.key),
+            label: None,
             placeholder: SmolStr::default(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Small,
             submit: None,
         });
@@ -1325,8 +1327,11 @@ impl<S: PredictionEventSource> SelectorState<S> {
             return;
         }
 
-        self.dispatch_events(app);
         self.follow_language(app);
+        let mut changed = false;
+        if let Some(search) = self.search_node.as_ref() {
+            changed |= search.sync(app);
+        }
         self.follow_search(app);
         self.drain_loads(app);
         self.drain_translations(app);
@@ -1334,7 +1339,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         self.rebuild_body(app);
         self.write_page_text(app);
 
-        let mut changed = false;
         if let Some(select) = self.select.as_ref() {
             changed |= select.sync(app).unwrap_or(false);
         }
@@ -1343,9 +1347,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
         if let Some(spinner) = self.spinner.as_ref() {
             changed |= spinner.sync(app).unwrap_or(false);
-        }
-        if let Some(search) = self.search_node.as_ref() {
-            changed |= search.sync(app);
         }
         if let Some(tooltip) = self.translate_tooltip.as_ref() {
             changed |= tooltip.sync(app);
@@ -1361,31 +1362,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         if self.closed.get() {
             self.finish(app);
         }
-    }
-
-    fn dispatch_events(&mut self, app: &mut App) {
-        let Some(search) = self.search_node.as_ref() else {
-            return;
-        };
-        if !self.owns_modal(app) {
-            return;
-        }
-        let window = self.window;
-        for (_, event) in app
-            .drain_events_where(|target, event| target == window && crate::ui::is_text_input(event))
-        {
-            let _ = search.dispatch(app, &event);
-        }
-    }
-
-    fn owns_modal(&self, app: &App) -> bool {
-        let Some(dialog) = self.dialog.as_ref() else {
-            return false;
-        };
-        matches!(
-            (app.modal_scope(self.window), dialog.overlay_node()),
-            (Some(top), Some(own)) if top == own
-        )
     }
 
     fn follow_language(&mut self, app: &mut App) {

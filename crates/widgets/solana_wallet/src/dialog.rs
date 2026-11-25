@@ -13,7 +13,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    event::{Action, Event, InputEvent},
+    event::Action,
     interaction::ActionCtx,
     math::{LogicalPx, px},
     node::{
@@ -548,7 +548,7 @@ impl DialogState {
             }
             DialogButtonKind::Add => {
                 let label = t_smol!(translate, "widget.solana_wallet.add_address");
-                let input_state = self.input_state;
+                let add_input = self.input.clone();
                 let addresses = self.addresses;
                 let limit = self.limit;
                 let ready = self.ready;
@@ -562,9 +562,12 @@ impl DialogState {
                     .a11y_label(label.clone())
                     .tooltip_text(label)
                     .on_click(move |ctx| {
+                        let Some(input) = add_input.as_ref() else {
+                            return;
+                        };
                         offer_typed_address(
                             ctx,
-                            &input_state,
+                            input,
                             &addresses,
                             &limit,
                             &ready,
@@ -666,10 +669,12 @@ impl DialogState {
         if self.released || self.closed.get() {
             return Ok(());
         }
+        if let Some(input) = &self.input {
+            let _ = input.sync(cx.app_mut());
+        }
         self.rebuild_static_copy(cx)?;
         self.publish(cx, view);
         self.sync_recover_button(cx)?;
-        self.dispatch_text_events(cx);
         self.show_addresses(cx)?;
         self.sync_components(cx)?;
         if !self
@@ -692,32 +697,6 @@ impl DialogState {
             return Ok(());
         };
         self.rebuild_button(cx, parent, DialogButtonKind::Recover)
-    }
-
-    fn dispatch_text_events(&mut self, cx: &mut WidgetCx<'_>) {
-        let Some(input) = self.input.as_ref() else {
-            return;
-        };
-        if !self.owns_modal(cx.app()) {
-            return;
-        }
-        let window = self.window;
-        let events = cx
-            .app_mut()
-            .drain_events_where(|target, event| target == window && is_text_input(event));
-        for (_, event) in events {
-            let _ = input.dispatch(cx.app_mut(), &event);
-        }
-    }
-
-    fn owns_modal(&self, app: &App) -> bool {
-        let Some(dialog) = self.dialog.as_ref() else {
-            return false;
-        };
-        matches!(
-            (app.modal_scope(self.window), dialog.overlay_node()),
-            (Some(top), Some(own)) if top == own
-        )
     }
 
     fn sync_components(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
@@ -966,36 +945,19 @@ impl DialogState {
                 .build(tree, toolbar)
         })?;
         let submit = Action::Custom(format_smolstr!("{}.submit", self.keys.input));
-        let submit_input_state = self.input_state;
-        let submit_addresses = self.addresses;
-        let submit_limit = self.limit;
-        let submit_ready = self.ready;
-        let submit_known = self.known;
-        let submit_operation = self.operation;
-        let submit_add_request = self.add_request;
-        app.on_action(submit.clone(), move |ctx| {
-            offer_typed_address(
-                ctx,
-                &submit_input_state,
-                &submit_addresses,
-                &submit_limit,
-                &submit_ready,
-                &submit_known,
-                &submit_operation,
-                &submit_add_request,
-            );
-        });
         self.input_submit = Some(submit.clone());
         let spec = Arc::new(InputSpec {
             name: self.keys.input.clone(),
+            label: None,
             placeholder: SmolStr::default(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
-            submit: Some(submit),
+            submit: Some(submit.clone()),
         });
         let input = {
             let tree = app
@@ -1012,6 +974,25 @@ impl DialogState {
             )
         };
         input.install(app);
+        let submit_input = input.clone();
+        let submit_addresses = self.addresses;
+        let submit_limit = self.limit;
+        let submit_ready = self.ready;
+        let submit_known = self.known;
+        let submit_operation = self.operation;
+        let submit_add_request = self.add_request;
+        app.on_action(submit, move |ctx| {
+            offer_typed_address(
+                ctx,
+                &submit_input,
+                &submit_addresses,
+                &submit_limit,
+                &submit_ready,
+                &submit_known,
+                &submit_operation,
+                &submit_add_request,
+            );
+        });
         self.input = Some(input);
 
         let add_holder = build_node(app, window, toolbar, |tree, toolbar| {
@@ -1399,15 +1380,14 @@ fn canonical_address(typed: &SmolStr) -> Option<SmolStr> {
 
 fn addable_from(
     ctx: &ActionCtx<'_>,
-    input_state: &Signal<InputState>,
+    typed_text: &str,
     addresses: &Signal<Arc<[SolanaWalletSelection]>>,
     limit: &Signal<Option<usize>>,
     ready: &Signal<bool>,
     known: &Signal<bool>,
     operation: &Signal<Option<SelectionOperation>>,
 ) -> Option<SmolStr> {
-    let text = SmolStr::new(ctx.read(input_state).text().trim());
-    let typed = canonical_address(&text)?;
+    let typed = canonical_address(&SmolStr::new(typed_text.trim()))?;
     solana_wallet_address(&typed)?;
     if !(*ctx.read(ready) && *ctx.read(known) && ctx.read(operation).is_none()) {
         return None;
@@ -1422,7 +1402,7 @@ fn addable_from(
 
 fn offer_typed_address(
     ctx: &mut ActionCtx<'_>,
-    input_state: &Signal<InputState>,
+    input: &InputNode,
     addresses: &Signal<Arc<[SolanaWalletSelection]>>,
     limit: &Signal<Option<usize>>,
     ready: &Signal<bool>,
@@ -1430,8 +1410,16 @@ fn offer_typed_address(
     operation: &Signal<Option<SelectionOperation>>,
     add_request: &Signal<Option<SmolStr>>,
 ) {
-    let Some(address) = addable_from(ctx, input_state, addresses, limit, ready, known, operation)
-    else {
+    let text = input.value(ctx.app_mut());
+    let Some(address) = addable_from(
+        ctx,
+        text.as_str(),
+        addresses,
+        limit,
+        ready,
+        known,
+        operation,
+    ) else {
         return;
     };
     ctx.write(add_request, Some(address));
@@ -1612,13 +1600,6 @@ impl MarkdownAssets for EmbeddedAssets {
     }
 }
 
-fn is_text_input(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Input(InputEvent::Text { .. } | InputEvent::Key { .. }) | Event::Ime(_)
-    )
-}
-
 fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
     match error {
         DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
@@ -1649,7 +1630,7 @@ mod tests {
     use kytrix_service_provider::service::solana_wallet::{
         SolanaWalletSelection, SolanaWalletSelectionsResponse,
     };
-    use ui_core::event::{ActionSource, KeyCode, KeyState, Modifiers};
+    use ui_core::event::{ActionSource, Event, InputEvent, KeyCode, KeyState, Modifiers};
     use widget::{protocol::RequestId, rpc::RpcCallError, test_support::WidgetTestApp};
 
     use super::*;
@@ -1782,39 +1763,29 @@ mod tests {
     fn type_address(harness: &mut WidgetTestApp, dialog: &SolanaWalletDialog, text: &str) {
         let input = dialog.test_input().expect("the address field is built");
         let window = harness.window();
-        let _ = harness.app_mut().set_focus(window, Some(input.root));
-        let event = Event::Input(InputEvent::Text {
+        let _ = harness.app_mut().set_focus(window, Some(input.editable));
+        harness.dispatch_event(Event::Input(InputEvent::Text {
             text: SmolStr::new(text),
             timestamp: Instant::now(),
-        });
-        assert!(
-            input.dispatch(harness.app_mut(), &event),
-            "the focused field takes the text"
-        );
+        }));
     }
 
     fn set_address(harness: &mut WidgetTestApp, dialog: &SolanaWalletDialog, text: &str) {
-        let state = dialog.inner.borrow().input_state;
-        harness.with_cx(|cx| {
-            cx.write(&state, InputState::new(text));
-        });
+        let input = dialog.test_input().expect("the address field is built");
+        input.update_value(harness.app_mut(), text);
     }
 
     fn press_enter(harness: &mut WidgetTestApp, dialog: &SolanaWalletDialog) {
         let input = dialog.test_input().expect("the address field is built");
         let window = harness.window();
-        let _ = harness.app_mut().set_focus(window, Some(input.root));
-        let event = Event::Input(InputEvent::Key {
+        let _ = harness.app_mut().set_focus(window, Some(input.editable));
+        harness.dispatch_event(Event::Input(InputEvent::Key {
             code: KeyCode::Enter,
             state: KeyState::Down,
             repeat: false,
             modifiers: Modifiers::empty(),
             timestamp: Instant::now(),
-        });
-        assert!(
-            input.dispatch(harness.app_mut(), &event),
-            "the focused field takes the Enter key"
-        );
+        }));
     }
 
     #[test]

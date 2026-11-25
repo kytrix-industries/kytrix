@@ -1,7 +1,6 @@
 use i18n::{t_smol, translate::Translate};
 use ui_core::{
     error::EngineError,
-    event::Event,
     node::{id::NodeId, signal::Signal},
     paint::color::Color,
     window::WindowId,
@@ -152,10 +151,6 @@ impl FieldPicker {
     pub(super) fn sync(&self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         self.picker.sync(cx.app_mut())?;
         Ok(())
-    }
-
-    pub(super) fn dispatch(&self, cx: &mut WidgetCx<'_>, event: &Event) -> bool {
-        self.picker.dispatch(cx.app_mut(), event)
     }
 
     pub(super) fn release(self, cx: &mut WidgetCx<'_>) {

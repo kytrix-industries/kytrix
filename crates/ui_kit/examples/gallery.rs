@@ -211,6 +211,14 @@ fn node_patch(app: &App, window: WindowId, node: NodeId) -> Option<StylePatch> {
         .map(|node| node.style_patch().clone())
 }
 
+fn text_style_color(app: &App, window: WindowId, node: NodeId) -> Option<Color> {
+    let target = app.window(window)?;
+    match target.tree().get(node).ok()?.kind() {
+        NodeKind::Text(content) => Some(content.style.color),
+        _ => None,
+    }
+}
+
 fn text_colors(app: &App, window: WindowId, root: NodeId) -> Vec<(Color, Option<Color>)> {
     let Some(target) = app.window(window) else {
         return Vec::new();
@@ -1217,7 +1225,7 @@ impl Gallery {
             &theme,
         );
         let input_row = row(app, window, s10, 12.0);
-        let single_box = sized_box(app, window, input_row, 300.0, 40.0);
+        let single_box = sized_box(app, window, input_row, 300.0, 30.0);
         let single = make_input(
             app,
             window,
@@ -1228,9 +1236,11 @@ impl Gallery {
             false,
             false,
             false,
+            None,
             ControlSize::Medium,
         );
-        let masked_box = sized_box(app, window, input_row, 240.0, 40.0);
+        single.update_value(app, "Kytrix 单行输入 · IME 演示");
+        let masked_box = sized_box(app, window, input_row, 240.0, 30.0);
         let masked = make_input(
             app,
             window,
@@ -1241,9 +1251,11 @@ impl Gallery {
             true,
             false,
             false,
+            None,
             ControlSize::Medium,
         );
-        let disabled_box = sized_box(app, window, input_row, 240.0, 40.0);
+        masked.update_value(app, "s3cret-密码");
+        let disabled_box = sized_box(app, window, input_row, 240.0, 30.0);
         let disabled = make_input(
             app,
             window,
@@ -1254,11 +1266,12 @@ impl Gallery {
             false,
             true,
             false,
+            None,
             ControlSize::Medium,
         );
         inputs.extend([single, masked, disabled]);
         let multiline_row = row(app, window, s10, 12.0);
-        let multiline_box = sized_box(app, window, multiline_row, 620.0, 96.0);
+        let multiline_box = sized_box(app, window, multiline_row, 620.0, 58.0);
         let multiline = make_input(
             app,
             window,
@@ -1269,7 +1282,12 @@ impl Gallery {
             false,
             false,
             true,
+            Some(3),
             ControlSize::Small,
+        );
+        multiline.update_value(
+            app,
+            "第一行\n第二行\n第三行\n第四行（可视 3 行，溢出滚动由 P3 的 ensure-visible 完成）",
         );
         inputs.push(multiline);
         themed_label(
@@ -1701,8 +1719,8 @@ impl Gallery {
         if let Some(node) = dialog.confirm_button().and_then(|button| button.node()) {
             probe_nodes.push((SmolStr::new_static("dialog_confirm"), node));
         }
-        for input in &inputs {
-            probe_nodes.push((SmolStr::new_static("input"), input.root));
+        for (index, input) in inputs.iter().enumerate() {
+            probe_nodes.push((format_smolstr!("input{index}"), input.editable));
         }
         log_line(app, &log, "gallery: 建树完成（15 个分区）");
 
@@ -1763,10 +1781,12 @@ impl Gallery {
             let lists = self.lists.clone();
             let table = self.table.clone();
             let tree = self.tree.clone();
+            let inputs = self.inputs.clone();
             let _ = app.after(window, Duration::from_millis(1_500), move |app| {
                 println!("gallery: probe content_height={content_height}");
                 print_probe_rects(app, window, &nodes, "");
                 print_probe_mounted(app, "top", &lists, &table, &tree);
+                print_input_probe(app, window, &inputs, "top");
                 if let Some(handle) = app.scroll_handle(window, viewport) {
                     let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(1.0e6)));
                 }
@@ -1774,6 +1794,7 @@ impl Gallery {
                 let lists = lists.clone();
                 let table = table.clone();
                 let tree = tree.clone();
+                let inputs = inputs.clone();
                 let _ = app.after(window, Duration::from_millis(600), move |app| {
                     if let Some(handle) = app.scroll_handle(window, viewport) {
                         let offset = app
@@ -1784,12 +1805,14 @@ impl Gallery {
                     }
                     print_probe_rects(app, window, &nodes, "bottom ");
                     print_probe_mounted(app, "bottom", &lists, &table, &tree);
+                    print_input_probe(app, window, &inputs, "bottom ");
                     if let Some(handle) = app.scroll_handle(window, viewport) {
                         let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(2_300.0)));
                     }
-                    if let Some((_, node)) = nodes.iter().find(|(name, _)| name == "input") {
+                    if let Some((_, node)) = nodes.iter().find(|(name, _)| name == "input0") {
                         let _ = app.set_focus(window, Some(*node));
                         println!("gallery: probe focused first input node={node:?}");
+                        print_input_probe(app, window, &inputs, "focused ");
                     }
                 });
             });
@@ -2138,15 +2161,19 @@ impl Gallery {
             check_color(
                 &mut failures,
                 appearance,
-                "input.text.foreground",
-                node_patch(app, window, built.text).and_then(|patch| patch.foreground),
-                input.foreground.enabled,
+                "input.text.color",
+                text_style_color(app, window, built.editable),
+                if built.spec.disabled {
+                    input.foreground.disabled
+                } else {
+                    input.foreground.enabled
+                },
             );
             check_color(
                 &mut failures,
                 appearance,
-                "input.placeholder.foreground",
-                node_patch(app, window, built.placeholder).and_then(|patch| patch.foreground),
+                "input.placeholder.color",
+                app.text_edit_placeholder_color(window, built.editable).ok(),
                 input.placeholder,
             );
         }
@@ -2282,12 +2309,8 @@ impl Gallery {
             toggle.dispatch(app, event);
         }
         self.tab_bar.dispatch(app, event);
-        for input in &self.inputs {
-            input.dispatch(app, event);
-        }
         self.dropdown.dispatch(app, event);
         self.select.dispatch(app, event);
-        self.color_picker.dispatch(app, event);
     }
 }
 
@@ -2390,16 +2413,19 @@ fn make_input(
     masked: bool,
     disabled: bool,
     multiline: bool,
+    visible_lines: Option<u16>,
     size: ControlSize,
 ) -> InputNode {
     let spec = Arc::new(InputSpec {
         name: SmolStr::new_static(name),
+        label: None,
         placeholder: SmolStr::new_static(placeholder),
         masked,
         multiline,
         readonly: false,
         disabled,
         max_length: None,
+        visible_lines,
         size,
         submit: None,
     });
@@ -2445,6 +2471,34 @@ fn print_probe_rects(app: &mut App, window: WindowId, nodes: &[(SmolStr, NodeId)
             ),
             None => println!("gallery: probe {prefix}{name} node={node:?} missing"),
         }
+    }
+}
+
+fn print_input_probe(app: &App, window: WindowId, inputs: &[InputNode], prefix: &str) {
+    let Some(target) = app.window(window) else {
+        return;
+    };
+    let tree = target.tree();
+    for (index, input) in inputs.iter().enumerate() {
+        let root = tree.get(input.root).ok().map(|node| node.layout().bounds);
+        let editable = tree
+            .get(input.editable)
+            .ok()
+            .map(|node| node.layout().bounds);
+        let metrics = app.text_edit_metrics(window, input.editable).ok();
+        let snapshot = app.text_edit_snapshot(window, input.editable).ok();
+        let caret = snapshot.as_ref().and_then(|snapshot| {
+            target
+                .text_caret_rect(input.editable, snapshot.selection.focus().byte)
+                .ok()
+        });
+        let value = app.text_edit_value(window, input.editable).ok();
+        println!(
+            "gallery: probe {prefix}input{index} root={root:?} editable={editable:?} metrics={metrics:?} caret={caret:?} selection={:?} composing={:?} focused={:?} value={value:?}",
+            snapshot.as_ref().map(|snapshot| snapshot.selection.range()),
+            snapshot.as_ref().map(|snapshot| snapshot.composing),
+            snapshot.as_ref().map(|snapshot| snapshot.focused),
+        );
     }
 }
 

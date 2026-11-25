@@ -554,6 +554,16 @@ impl WidgetTestApp {
     }
 
     #[must_use]
+    pub fn a11y_label(&mut self, node: NodeId) -> Option<String> {
+        let _ = self.app.a11y_oracle_diff();
+        self.app.assert_a11y_contract();
+        self.app
+            .a11y()?
+            .node_for(node)
+            .and_then(|entry| entry.label.as_ref().map(|label| label.text().to_owned()))
+    }
+
+    #[must_use]
     pub fn a11y_hidden(&self, node: NodeId) -> bool {
         let snapshot = self
             .app

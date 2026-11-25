@@ -67,6 +67,61 @@ fn press_key(harness: &mut Harness, code: KeyCode, modifiers: ui_core::event::Mo
     );
 }
 
+fn directory_engine_text(harness: &Harness) -> String {
+    let ids = harness.debug_ids();
+    let index = ids
+        .iter()
+        .position(|id| id.ends_with(".directory.text"))
+        .expect("the directory field is drawn");
+    let node = harness
+        .find_all("")
+        .into_iter()
+        .nth(index)
+        .expect("the directory field node is alive");
+    harness
+        .app()
+        .text_edit_value(harness.window(), node)
+        .expect("the directory field is editable")
+        .to_string()
+}
+
+#[test]
+fn blurring_the_directory_field_should_commit_what_was_typed() {
+    let stored = TempDir::new().expect("the stored directory builds");
+    let chosen = TempDir::new().expect("the chosen directory builds");
+    let (mut harness, _downloads, _fake) = page_with(&stored);
+    harness.settle(1);
+    harness.click_node("SETTINGS_AI_DIRECTORY_INPUT");
+    press_key(
+        &mut harness,
+        KeyCode::KeyA,
+        ui_core::event::Modifiers::CONTROL,
+    );
+    send_event(
+        &mut harness,
+        Event::Input(InputEvent::Text {
+            text: SmolStr::new(chosen.path().to_string_lossy()),
+            timestamp: Instant::now(),
+        }),
+    );
+    harness.settle(1);
+    let window = harness.window();
+    harness.app_mut().set_focus(window, None);
+    let typed = chosen.path().to_string_lossy().to_string();
+    for frame in 0..4 {
+        harness.settle(1);
+        assert_eq!(
+            directory_engine_text(&harness),
+            typed,
+            "the field must show the committed directory from frame {frame} on"
+        );
+    }
+    assert_eq!(
+        harness.config().translation.model_directory,
+        Some(chosen.path().to_path_buf()),
+        "blurring the directory field must commit what was typed"
+    );
+}
 fn replace_directory(harness: &mut Harness, text: &str) {
     harness.click_node("SETTINGS_AI_DIRECTORY_INPUT");
     press_key(harness, KeyCode::KeyA, ui_core::event::Modifiers::CONTROL);

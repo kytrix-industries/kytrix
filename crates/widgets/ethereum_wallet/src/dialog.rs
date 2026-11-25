@@ -13,7 +13,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    event::{Action, Event, InputEvent},
+    event::Action,
     interaction::ActionCtx,
     math::{LogicalPx, px},
     node::{
@@ -228,6 +228,7 @@ struct DialogState {
     dialog: Option<Dialog>,
     list: Option<List>,
     input: Option<InputNode>,
+    input_slot: Rc<RefCell<Option<InputNode>>>,
     spinner: Option<Spinner>,
     spinner_parent: Option<NodeId>,
     refresh: Option<Button>,
@@ -344,6 +345,7 @@ impl DialogState {
             dialog: None,
             list: None,
             input: None,
+            input_slot: Rc::new(RefCell::new(None)),
             spinner: None,
             spinner_parent: None,
             refresh: None,
@@ -405,17 +407,21 @@ impl DialogState {
         self.shown_addresses = Some(count);
         self.list = Some(list);
 
-        let input_state = self.input_state;
         let addresses = self.addresses;
         let limit = self.limit;
         let ready = self.ready;
         let known = self.known;
         let operation = self.operation;
         let add_request = self.add_request;
+        let input_slot = Rc::clone(&self.input_slot);
         cx.app_mut().on_action(self.submit.clone(), move |ctx| {
+            let Some(input) = input_slot.borrow().clone() else {
+                return;
+            };
+            let text = input.value(ctx.app_mut());
             let address = addable_from(
                 ctx,
-                &input_state,
+                text.as_str(),
                 &addresses,
                 &limit,
                 &ready,
@@ -580,7 +586,7 @@ impl DialogState {
             }
             DialogButtonKind::Add => {
                 let label = t_smol!(translate, "widget.ethereum_wallet.add_address");
-                let input_state = self.input_state;
+                let input = self.input.clone();
                 let addresses = self.addresses;
                 let limit = self.limit;
                 let ready = self.ready;
@@ -594,9 +600,13 @@ impl DialogState {
                     .a11y_label(label.clone())
                     .tooltip_text(label)
                     .on_click(move |ctx| {
+                        let Some(input) = input.clone() else {
+                            return;
+                        };
+                        let text = input.value(ctx.app_mut());
                         let address = addable_from(
                             ctx,
-                            &input_state,
+                            text.as_str(),
                             &addresses,
                             &limit,
                             &ready,
@@ -702,10 +712,12 @@ impl DialogState {
         if self.released || self.closed.get() {
             return Ok(());
         }
+        if let Some(input) = &self.input {
+            let _ = input.sync(cx.app_mut());
+        }
         self.rebuild_static_copy(cx)?;
         self.publish(cx, view);
         self.sync_recover_button(cx)?;
-        self.dispatch_text_events(cx);
         self.show_addresses(cx)?;
         self.sync_components(cx)?;
         if !self
@@ -728,32 +740,6 @@ impl DialogState {
             return Ok(());
         };
         self.rebuild_button(cx, parent, DialogButtonKind::Recover)
-    }
-
-    fn dispatch_text_events(&mut self, cx: &mut WidgetCx<'_>) {
-        let Some(input) = self.input.as_ref() else {
-            return;
-        };
-        if !self.owns_modal(cx.app()) {
-            return;
-        }
-        let window = self.window;
-        let events = cx
-            .app_mut()
-            .drain_events_where(|target, event| target == window && is_text_input(event));
-        for (_, event) in events {
-            let _ = input.dispatch(cx.app_mut(), &event);
-        }
-    }
-
-    fn owns_modal(&self, app: &App) -> bool {
-        let Some(dialog) = self.dialog.as_ref() else {
-            return false;
-        };
-        matches!(
-            (app.modal_scope(self.window), dialog.overlay_node()),
-            (Some(top), Some(own)) if top == own
-        )
     }
 
     fn sync_components(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
@@ -1003,12 +989,14 @@ impl DialogState {
         })?;
         let spec = Arc::new(InputSpec {
             name: self.keys.input.clone(),
+            label: None,
             placeholder: SmolStr::default(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: Some(self.submit.clone()),
         });
@@ -1027,7 +1015,8 @@ impl DialogState {
             )
         };
         input.install(app);
-        self.input = Some(input);
+        self.input = Some(input.clone());
+        *self.input_slot.borrow_mut() = Some(input);
 
         let add_holder = build_node(app, window, toolbar, |tree, toolbar| {
             NodeBuilder::boxed()
@@ -1387,6 +1376,7 @@ impl DialogState {
     }
 
     fn take_components(&mut self) -> DialogComponents {
+        *self.input_slot.borrow_mut() = None;
         let delete_buttons = std::mem::take(&mut self.delete_buttons)
             .into_values()
             .map(|entry| entry.button)
@@ -1420,15 +1410,14 @@ fn canonical_address(typed: &SmolStr) -> Option<SmolStr> {
 
 fn addable_from(
     ctx: &ActionCtx<'_>,
-    input_state: &Signal<InputState>,
+    typed_text: &str,
     addresses: &Signal<Arc<[EthereumWalletSelection]>>,
     limit: &Signal<Option<usize>>,
     ready: &Signal<bool>,
     known: &Signal<bool>,
     operation: &Signal<Option<SelectionOperation>>,
 ) -> Option<SmolStr> {
-    let text = SmolStr::new(ctx.read(input_state).text().trim());
-    let typed = canonical_address(&text)?;
+    let typed = canonical_address(&SmolStr::new(typed_text.trim()))?;
     ethereum_wallet_address(&typed)?;
     if !(*ctx.read(ready) && *ctx.read(known) && ctx.read(operation).is_none()) {
         return None;
@@ -1614,13 +1603,6 @@ impl MarkdownAssets for EmbeddedAssets {
     }
 }
 
-fn is_text_input(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Input(InputEvent::Text { .. } | InputEvent::Key { .. }) | Event::Ime(_)
-    )
-}
-
 fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
     match error {
         DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
@@ -1651,7 +1633,7 @@ mod tests {
     use kytrix_service_provider::service::ethereum_wallet::{
         EthereumWalletSelection, EthereumWalletSelectionsResponse,
     };
-    use ui_core::event::{ActionSource, KeyCode, Modifiers};
+    use ui_core::event::{ActionSource, Event, InputEvent, KeyCode, Modifiers};
     use widget::{protocol::RequestId, rpc::RpcCallError, test_support::WidgetTestApp};
 
     use super::*;
@@ -1791,26 +1773,21 @@ mod tests {
     fn type_address(harness: &mut WidgetTestApp, dialog: &EthereumWalletDialog, text: &str) {
         let input = dialog.test_input().expect("the address field is built");
         let window = harness.window();
-        let _ = harness.app_mut().set_focus(window, Some(input.root));
-        let event = Event::Input(InputEvent::Text {
+        let _ = harness.app_mut().set_focus(window, Some(input.editable));
+        harness.dispatch_event(Event::Input(InputEvent::Text {
             text: SmolStr::new(text),
             timestamp: Instant::now(),
-        });
-        assert!(
-            input.dispatch(harness.app_mut(), &event),
-            "the focused field takes the text"
-        );
+        }));
     }
 
     fn press_enter(harness: &mut WidgetTestApp, dialog: &EthereumWalletDialog) {
         let input = dialog.test_input().expect("the address field is built");
         let window = harness.window();
-        let _ = harness.app_mut().set_focus(window, Some(input.root));
-        let event = Event::Input(InputEvent::key_down(KeyCode::Enter, Modifiers::empty()));
-        assert!(
-            input.dispatch(harness.app_mut(), &event),
-            "the focused field takes Enter"
-        );
+        let _ = harness.app_mut().set_focus(window, Some(input.editable));
+        harness.dispatch_event(Event::Input(InputEvent::key_down(
+            KeyCode::Enter,
+            Modifiers::empty(),
+        )));
     }
 
     #[test]

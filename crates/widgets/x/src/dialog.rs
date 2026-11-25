@@ -10,10 +10,10 @@ use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::x::{XApiError, XProfile, XSelection, XSelectionStatus};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    a11y::{A11yOverride, A11yPatch},
+    a11y::A11yOverride,
     app::App,
     error::EngineError,
-    event::{Action, Event, InputEvent},
+    event::Action,
     interaction::ActionCtx,
     math::{LogicalPx, px},
     node::{
@@ -583,10 +583,15 @@ impl DialogState {
         if self.released || self.closed.get() {
             return Ok(());
         }
+        if let Some(input) = &self.filter {
+            let _ = input.sync(cx.app_mut());
+        }
+        if let Some(input) = &self.query {
+            let _ = input.sync(cx.app_mut());
+        }
         self.rebuild_static_copy(cx)?;
         self.sync_recover(cx)?;
         self.publish(cx, view);
-        self.dispatch_text_events(cx);
         self.follow_typed_query(cx);
         self.sync_lists(cx)?;
         self.sync_components(cx)?;
@@ -669,36 +674,6 @@ impl DialogState {
         self.last_view = Some(view.clone());
     }
 
-    fn dispatch_text_events(&mut self, cx: &mut WidgetCx<'_>) {
-        if !self.owns_modal(cx.app()) {
-            return;
-        }
-        let window = self.window;
-        let events = cx
-            .app_mut()
-            .drain_events_where(|target, event| target == window && is_text_input(event));
-        for (_, event) in events {
-            if let Some(input) = self.query.as_ref()
-                && input.dispatch(cx.app_mut(), &event)
-            {
-                continue;
-            }
-            if let Some(input) = self.filter.as_ref() {
-                let _ = input.dispatch(cx.app_mut(), &event);
-            }
-        }
-    }
-
-    fn owns_modal(&self, app: &App) -> bool {
-        let Some(dialog) = self.dialog.as_ref() else {
-            return false;
-        };
-        matches!(
-            (app.modal_scope(self.window), dialog.overlay_node()),
-            (Some(top), Some(own)) if top == own
-        )
-    }
-
     fn follow_typed_query(&mut self, cx: &mut WidgetCx<'_>) {
         if self.answered_query == self.typed_query(cx) {
             return;
@@ -761,30 +736,15 @@ impl DialogState {
         if self.built_language == Some(language) {
             return Ok(());
         }
-        let window = self.window;
         let filter_placeholder = t_smol!(self.translate, "widget.x.filter_placeholder");
         let query_placeholder = t_smol!(self.translate, "widget.x.search_placeholder");
         if let Some(input) = self.filter.as_ref() {
-            input.update_placeholder(cx.app_mut(), filter_placeholder.clone());
-            let _ = cx.app_mut().set_a11y_patch(
-                window,
-                input.root,
-                A11yPatch {
-                    label: Some(filter_placeholder),
-                    ..A11yPatch::default()
-                },
-            );
+            input.update_label(cx.app_mut(), filter_placeholder.clone());
+            input.update_placeholder(cx.app_mut(), filter_placeholder);
         }
         if let Some(input) = self.query.as_ref() {
-            input.update_placeholder(cx.app_mut(), query_placeholder.clone());
-            let _ = cx.app_mut().set_a11y_patch(
-                window,
-                input.root,
-                A11yPatch {
-                    label: Some(query_placeholder),
-                    ..A11yPatch::default()
-                },
-            );
+            input.update_label(cx.app_mut(), query_placeholder.clone());
+            input.update_placeholder(cx.app_mut(), query_placeholder);
         }
         if let Some(spinner) = self.spinner.take() {
             spinner.release(cx.app_mut());
@@ -913,7 +873,7 @@ impl DialogState {
             }
             StaticButton::Search => {
                 let label = t_smol!(translate, "widget.x.search_users");
-                let query_state = self.query_state;
+                let search_input = self.query.clone();
                 let ready = self.ready;
                 let operation = self.operation;
                 let searching = self.searching;
@@ -925,9 +885,13 @@ impl DialogState {
                     .a11y_label(label.clone())
                     .tooltip_text(label)
                     .on_click(move |ctx| {
+                        let Some(input) = search_input.as_ref() else {
+                            return;
+                        };
+                        let text = input.value(ctx.app_mut());
                         offer_search(
                             ctx,
-                            &query_state,
+                            text.as_str(),
                             &ready,
                             &operation,
                             &searching,
@@ -1500,12 +1464,14 @@ impl DialogState {
         })?;
         let spec = Arc::new(InputSpec {
             name: self.keys.filter.clone(),
+            label: Some(t_smol!(translate, "widget.x.filter_placeholder")),
             placeholder: t_smol!(translate, "widget.x.filter_placeholder"),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: None,
         });
@@ -1524,14 +1490,6 @@ impl DialogState {
             )
         };
         filter.install(app);
-        let _ = app.set_a11y_patch(
-            window,
-            filter.root,
-            A11yPatch {
-                label: Some(t_smol!(translate, "widget.x.filter_placeholder")),
-                ..A11yPatch::default()
-            },
-        );
         self.filter = Some(filter);
 
         let area = build_node(app, window, root, |tree, root| {
@@ -1839,30 +1797,39 @@ impl DialogState {
                 .build(tree, toolbar)
         })?;
         let submit = Action::Custom(format_smolstr!("{}.submit", self.keys.query));
-        let submit_query_state = self.query_state;
         let submit_ready = self.ready;
         let submit_operation = self.operation;
         let submit_searching = self.searching;
         let submit_search_request = self.search_request;
-        app.on_action(submit.clone(), move |ctx| {
-            offer_search(
-                ctx,
-                &submit_query_state,
-                &submit_ready,
-                &submit_operation,
-                &submit_searching,
-                &submit_search_request,
-            );
-        });
+        let submit_slot = Rc::new(RefCell::new(None::<InputNode>));
+        {
+            let slot = Rc::clone(&submit_slot);
+            app.on_action(submit.clone(), move |ctx| {
+                let Some(input) = slot.borrow().clone() else {
+                    return;
+                };
+                let text = input.value(ctx.app_mut());
+                offer_search(
+                    ctx,
+                    text.as_str(),
+                    &submit_ready,
+                    &submit_operation,
+                    &submit_searching,
+                    &submit_search_request,
+                );
+            });
+        }
         self.query_submit = Some(submit.clone());
         let spec = Arc::new(InputSpec {
             name: self.keys.query.clone(),
+            label: Some(t_smol!(translate, "widget.x.search_placeholder")),
             placeholder: t_smol!(translate, "widget.x.search_placeholder"),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: Some(submit),
         });
@@ -1881,14 +1848,7 @@ impl DialogState {
             )
         };
         query.install(app);
-        let _ = app.set_a11y_patch(
-            window,
-            query.root,
-            A11yPatch {
-                label: Some(t_smol!(translate, "widget.x.search_placeholder")),
-                ..A11yPatch::default()
-            },
-        );
+        *submit_slot.borrow_mut() = Some(query.clone());
         self.query = Some(query);
         let search_holder = build_node(app, window, toolbar, |tree, toolbar| {
             NodeBuilder::boxed()
@@ -2243,13 +2203,12 @@ fn typed_text(signal: &Signal<InputState>, cx: &WidgetCx<'_>) -> Option<SmolStr>
 
 fn searchable_now(
     ctx: &ActionCtx<'_>,
-    query_state: &Signal<InputState>,
+    typed_text: &str,
     ready: &Signal<bool>,
     operation: &Signal<Option<SelectionOperation>>,
     searching: &Signal<bool>,
 ) -> Option<SmolStr> {
-    let state = ctx.read(query_state);
-    let typed = state.text().trim();
+    let typed = typed_text.trim();
     if !valid_search_query(typed) {
         return None;
     }
@@ -2261,13 +2220,13 @@ fn searchable_now(
 
 fn offer_search(
     ctx: &mut ActionCtx<'_>,
-    query_state: &Signal<InputState>,
+    typed_text: &str,
     ready: &Signal<bool>,
     operation: &Signal<Option<SelectionOperation>>,
     searching: &Signal<bool>,
     search_request: &Signal<Option<SmolStr>>,
 ) {
-    let Some(query) = searchable_now(ctx, query_state, ready, operation, searching) else {
+    let Some(query) = searchable_now(ctx, typed_text, ready, operation, searching) else {
         return;
     };
     ctx.write(search_request, Some(query));
@@ -3114,13 +3073,6 @@ fn release_components(app: &mut App, components: DialogComponents) {
     }
 }
 
-fn is_text_input(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Input(InputEvent::Text { .. } | InputEvent::Key { .. }) | Event::Ime(_)
-    )
-}
-
 fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
     match error {
         DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
@@ -3151,7 +3103,7 @@ mod tests {
     use kytrix_service_provider::service::x::{
         XApiError, XProfile, XSelection, XSelectionStatus, XSelectionsResponse,
     };
-    use ui_core::event::{ActionSource, ImeEvent};
+    use ui_core::event::{ActionSource, Event, ImeEvent, InputEvent};
     use widget::test_support::WidgetTestApp;
 
     use super::*;
@@ -3208,9 +3160,11 @@ mod tests {
     }
 
     fn set_query(harness: &mut WidgetTestApp, dialog: &TweetDialog, text: &str) {
-        let state = dialog.inner.borrow().query_state;
+        let input = dialog.inner.borrow().query.clone();
         harness.with_cx(|cx| {
-            cx.write(&state, InputState::new(text));
+            if let Some(input) = input.as_ref() {
+                input.update_value(cx.app_mut(), text);
+            }
         });
     }
 
@@ -3749,6 +3703,7 @@ mod tests {
     #[test]
     fn the_dialog_s_static_copy_should_follow_the_language() {
         let mut harness = harness();
+        harness.enable_a11y_capture();
         let mut dialog = open(&mut harness);
         let view = view(
             true,
@@ -3772,15 +3727,20 @@ mod tests {
             .inner
             .borrow()
             .filter
-            .as_ref()
-            .map(|input| input.root)
+            .clone()
             .expect("the managed page draws its filter");
         assert!(
             harness
-                .text_of(filter)
+                .app()
+                .read(&filter.placeholder_state)
                 .contains(t_smol!(english, "widget.x.filter_placeholder").as_str()),
             "the field is placeheld in the language it was built in: {}",
-            harness.text_of(filter)
+            harness.app().read(&filter.placeholder_state)
+        );
+        assert_eq!(
+            harness.a11y_label(filter.editable),
+            Some(t_smol!(english, "widget.x.filter_placeholder").to_string()),
+            "the field is named in the language it was built in"
         );
 
         harness.switch_language(LanguageCode::ZhCn);
@@ -3800,10 +3760,16 @@ mod tests {
         );
         assert!(
             harness
-                .text_of(filter)
+                .app()
+                .read(&filter.placeholder_state)
                 .contains(t_smol!(chinese, "widget.x.filter_placeholder").as_str()),
             "the field's placeholder follows the language: {}",
-            harness.text_of(filter)
+            harness.app().read(&filter.placeholder_state)
+        );
+        assert_eq!(
+            harness.a11y_label(filter.editable),
+            Some(t_smol!(chinese, "widget.x.filter_placeholder").to_string()),
+            "the field's name follows the language"
         );
     }
 
@@ -3822,7 +3788,7 @@ mod tests {
             .borrow()
             .filter
             .as_ref()
-            .map(|input| input.root)
+            .map(|input| input.editable)
             .expect("the managed page draws its filter");
         let window = harness.window();
         assert!(

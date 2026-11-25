@@ -69,8 +69,6 @@ pub struct SettingsPage {
     page_scroll: Option<(ScrollHandle, NodeId, ScrollBar)>,
     search_input: Option<InputNode>,
     search_state: Option<Signal<InputState>>,
-    #[cfg(test)]
-    search_spec: std::sync::Arc<InputSpec>,
     alerts: Vec<Dialog>,
     alert_count: u64,
     system_dark: bool,
@@ -160,12 +158,14 @@ impl SettingsPage {
         ));
         let spec = std::sync::Arc::new(InputSpec {
             name: SmolStr::new_static("SETTINGS_SEARCH"),
+            label: None,
             placeholder: app.read(&search_placeholder).clone(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: None,
         });
@@ -265,8 +265,6 @@ impl SettingsPage {
             page_scroll: None,
             search_input: Some(search_input),
             search_state: Some(search_state),
-            #[cfg(test)]
-            search_spec: std::sync::Arc::clone(&spec),
             alerts: Vec::new(),
             alert_count: 0,
             system_dark,
@@ -291,13 +289,10 @@ impl SettingsPage {
 
     #[cfg(test)]
     pub(crate) fn set_query(&mut self, app: &mut App, query: &str) {
-        let Some(state) = self.search_state else {
+        let Some(input) = &self.search_input else {
             return;
         };
-        let spec = std::sync::Arc::clone(&self.search_spec);
-        app.update(&state, |state| {
-            state.set_text(&spec, query);
-        });
+        input.update_value(app, query);
     }
 
     pub fn take_write_failure(&mut self) -> Option<SmolStr> {
@@ -575,6 +570,9 @@ impl SettingsPage {
         self.report_write_failure(app);
         self.sync_alerts(app);
         self.project(app);
+        if let Some(input) = &self.search_input {
+            input.sync(app);
+        }
 
         let selection = app.read(&self.selection).clone();
         if let Some(selection) = selection {
@@ -599,9 +597,6 @@ impl SettingsPage {
         if let Some((_, _, bar)) = &self.page_scroll {
             bar.sync(app)?;
         }
-        if let Some(input) = &self.search_input {
-            input.sync(app);
-        }
 
         Ok(())
     }
@@ -611,9 +606,6 @@ impl SettingsPage {
             self.system_dark = *dark;
         }
         let mut consumed = false;
-        if let Some(input) = &self.search_input {
-            consumed |= input.dispatch(app, event);
-        }
         if let Some(page) = self.page.as_mut() {
             consumed |= page.dispatch(app, event);
         }

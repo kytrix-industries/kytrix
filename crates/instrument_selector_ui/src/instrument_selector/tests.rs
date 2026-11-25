@@ -1338,7 +1338,7 @@ fn the_filter_takes_its_own_text_and_leaves_every_other_event_queued() {
     harness.settle(2);
     assert_eq!(
         harness.app().focused(harness.window()),
-        harness.find(&format_smolstr!("{key}:filter.root")),
+        harness.find(&format_smolstr!("{key}:filter.text")),
         "the click focuses the filter input"
     );
 

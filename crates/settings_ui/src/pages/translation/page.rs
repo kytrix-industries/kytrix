@@ -252,34 +252,38 @@ impl PageView for TranslationPage {
         let commit = Action::Custom(format_smolstr!("{}.{PAGE}.directory.commit", self.key));
         let spec = Arc::new(InputSpec {
             name: format_smolstr!("{}.{PAGE}.directory", self.key),
+            label: None,
             placeholder: t_smol!(translate, "settings_ui.ai.model_directory"),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: Some(commit.clone()),
         });
+        let directory_slot = Rc::new(RefCell::new(None::<InputNode>));
         {
             let rejected = Rc::clone(&self.directory_rejected);
             let host = self.host.clone();
             let downloads = self.downloads.clone();
-            let state = directory_state;
+            let slot = Rc::clone(&directory_slot);
             app.on_action(commit.clone(), move |ctx| {
-                let text = {
-                    let state = ctx.read(&state);
-                    state.text().to_owned()
+                let Some(input) = slot.borrow().clone() else {
+                    return;
                 };
+                let text = input.value(ctx.app_mut());
                 if text.is_empty() {
                     return;
                 }
+                let window = ctx.window();
                 let accepted = choose_directory(
                     ctx.app_mut(),
                     &host,
                     window,
                     downloads.as_deref(),
-                    PathBuf::from(text),
+                    PathBuf::from(text.as_str()),
                 );
                 rejected.set(!accepted);
             });
@@ -290,7 +294,6 @@ impl PageView for TranslationPage {
         let directory_theme = theme.clone();
         let directory_row_theme = theme.clone();
         let directory_translate = translate.clone();
-        let directory_slot = Rc::new(RefCell::new(None::<InputNode>));
         let directory_sink = Rc::clone(&directory_slot);
         let directory_spec = Arc::clone(&spec);
         rows.push(layout::row(
@@ -413,7 +416,7 @@ impl PageView for TranslationPage {
         self.model_parent = model_parent.get();
 
         layout::section(app, window, root, &theme, "ai.translation", None, rows)?;
-        self.directory = directory_slot.borrow_mut().take();
+        self.directory = directory_slot.borrow().clone();
 
         if cx.filter.admits_field(PAGE, "models") {
             let models = layout::build_node(app, window, root, |tree, parent| {
@@ -481,11 +484,14 @@ impl PageView for TranslationPage {
             )
         });
 
-        let stored = directory
-            .as_ref()
-            .map(|path| SmolStr::new(path.to_string_lossy()))
-            .unwrap_or_default();
         if let Some(input) = &self.directory {
+            changed |= input.sync(app);
+            let stored = self
+                .host
+                .config(app, |config| config.translation.model_directory.clone())
+                .as_ref()
+                .map(|path| SmolStr::new(path.to_string_lossy()))
+                .unwrap_or_default();
             let rejected = self.directory_rejected.replace(false);
             let state = match self.directory_state {
                 Some(state) => {
@@ -497,7 +503,6 @@ impl PageView for TranslationPage {
             if rejected || (state.0 != stored && !state.1) {
                 changed |= input.update_value(app, stored.as_str());
             }
-            changed |= input.sync(app);
         }
 
         if let Some(select) = &self.site {
@@ -568,9 +573,6 @@ impl PageView for TranslationPage {
 
     fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
         let mut consumed = false;
-        if let Some(input) = &self.directory {
-            consumed |= input.dispatch(app, event);
-        }
         if let Some(select) = &self.site {
             consumed |= select.dispatch(app, event);
         }

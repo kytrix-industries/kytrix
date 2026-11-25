@@ -255,6 +255,7 @@ impl AlertBuilder {
                     .tree_mut(),
                 input_column,
             );
+            input.install(app);
             let error_theme = theme.clone();
             NodeBuilder::text("", TextStyle::new(px(14.0)))
                 .bind_text(move |cx| cx.read(&error).clone().unwrap_or_else(SmolStr::default))
@@ -303,7 +304,7 @@ impl AlertBuilder {
                 }
                 let value = input_for_ok
                     .as_ref()
-                    .map(|input| SmolStr::new(ctx.app_mut().read(&input.state).text()));
+                    .map(|input| input.value(ctx.app_mut()));
                 if let Some(validate) = &validate {
                     let checked = value.clone().unwrap_or_default();
                     if let Err(message) = validate(&checked) {
@@ -417,6 +418,9 @@ impl Alert {
         if let Some(cancel) = &self.cancel_button {
             changed |= cancel.sync(app)?;
         }
+        if let Some(input) = &self.input {
+            changed |= input.sync(app);
+        }
         Ok(changed)
     }
 
@@ -426,7 +430,8 @@ impl Alert {
                 .cancel_button
                 .as_ref()
                 .map_or(0, |cancel| cancel.release(app));
-        buttons + app.release_scope(self.scope)
+        let input = self.input.as_ref().map_or(0, |input| input.release(app));
+        buttons + input + app.release_scope(self.scope)
     }
 }
 
@@ -471,12 +476,14 @@ mod tests {
     ) -> (InputFactory, ui_core::node::signal::Signal<InputState>) {
         let spec = Arc::new(InputSpec {
             name: smol_str::SmolStr::new_static("alert-input"),
+            label: None,
             placeholder: smol_str::SmolStr::default(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: None,
         });

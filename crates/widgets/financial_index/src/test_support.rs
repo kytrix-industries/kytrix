@@ -94,6 +94,25 @@ pub(crate) fn manifest() -> proto_types::FinancialIndices {
     }
 }
 
+pub(crate) fn two_indices_in_one_category() -> proto_types::FinancialIndices {
+    proto_types::FinancialIndices {
+        categories: vec![
+            category("asia", "Asia", "亚洲"),
+            category("america", "America", "美洲"),
+        ],
+        indices: vec![
+            index("HSI", "asia", "Hang Seng Index", "恒生指数"),
+            index(
+                "HSCEI",
+                "asia",
+                "Hang Seng China Enterprises",
+                "恒生中国企业",
+            ),
+            index("SPX", "america", "S&P 500", "标普 500"),
+        ],
+    }
+}
+
 fn category(code: &str, en: &str, zh: &str) -> proto_types::FinancialIndexCategory {
     proto_types::FinancialIndexCategory {
         code: code.to_owned(),

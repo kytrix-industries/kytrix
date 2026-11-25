@@ -141,12 +141,14 @@ impl Dialogs {
         let placeholder: Signal<SmolStr> = app.signal_scoped(scope, alert.placeholder.clone());
         let spec = std::sync::Arc::new(InputSpec {
             name: SmolStr::new_static("shell.name-alert"),
+            label: None,
             placeholder: alert.placeholder.clone(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: None,
         });

@@ -161,7 +161,6 @@ impl PageView for VenuePage {
         for select in &self.selects {
             consumed |= select.dispatch(app, event);
         }
-        consumed |= self.credentials.dispatch(app, event);
 
         consumed
     }

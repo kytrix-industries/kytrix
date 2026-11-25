@@ -9,7 +9,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    event::{Action, ActionSource, Event},
+    event::{Action, ActionSource},
     interaction::{ActionCtx, DragPhase},
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
@@ -999,21 +999,15 @@ impl ColorPicker {
         Ok(changed)
     }
 
-    pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
-        let panel = self.inner.panel.borrow();
-        let Some(panel) = panel.as_ref() else {
-            return false;
-        };
-        panel.input.dispatch(app, event)
-    }
-
     pub fn release(&self, app: &mut App) -> usize {
         let inner = &self.inner;
         for action in self.action_list() {
             app.off_action(&action);
         }
         inner.overlay.release(app);
-        inner.panel.borrow_mut().take();
+        if let Some(panel) = inner.panel.borrow_mut().take() {
+            panel.input.release(app);
+        }
         *inner.trigger.borrow_mut() = None;
         app.release_scope(inner.scope)
     }
@@ -1281,7 +1275,10 @@ impl ColorPicker {
     }
 
     fn commit_hex_text(&self, app: &mut App, input: Option<&InputNode>) {
-        let text = SmolStr::new(app.read(&self.inner.hex_state).text());
+        let text = match input {
+            Some(input) => input.value(app),
+            None => SmolStr::new(app.read(&self.inner.hex_state).text()),
+        };
         if let Some(color) = parse_hex(text.as_str()) {
             self.set_user_color(app, color, false, input);
         }
@@ -1301,12 +1298,7 @@ impl ColorPicker {
         let hex = hex_string(color);
         let changed = match input {
             Some(input) => input.update_value(app, hex.as_str()),
-            None => {
-                let focused = app.read(&self.inner.hex_state).is_focused();
-                let mut state = InputState::new(hex.as_str());
-                state.set_focused(focused);
-                app.write(&self.inner.hex_state, state)
-            }
+            None => app.write(&self.inner.hex_state, InputState::new(hex.as_str())),
         };
         *self.inner.last_hex_text.borrow_mut() = hex;
 
@@ -1546,12 +1538,14 @@ impl ColorPicker {
             input_slot,
             Arc::new(InputSpec {
                 name: format_smolstr!("{}.hex", inner.key),
+                label: None,
                 placeholder: SmolStr::new_static("#RRGGBB"),
                 masked: false,
                 multiline: false,
                 readonly: false,
                 disabled: false,
                 max_length: None,
+                visible_lines: None,
                 size: ControlSize::Medium,
                 submit: Some(hex_submit),
             }),
@@ -2153,7 +2147,9 @@ impl ColorPicker {
 
     fn reset_after_close(&self, app: &mut App) {
         let inner = &self.inner;
-        inner.panel.borrow_mut().take();
+        if let Some(panel) = inner.panel.borrow_mut().take() {
+            panel.input.release(app);
+        }
         let hovered = *app.read(&inner.hovered);
         let draft = *app.read(&inner.draft);
         app.write(&inner.hovered, None);
@@ -3072,7 +3068,7 @@ mod ui_tests {
 
         fn input_root(&self) -> ui_core::node::id::NodeId {
             let panel = self.picker.inner.panel.borrow();
-            panel.as_ref().expect("面板已打开").input.root
+            panel.as_ref().expect("面板已打开").input.editable
         }
 
         fn hex_focus(&mut self) {
@@ -3099,10 +3095,6 @@ mod ui_tests {
 
         fn pump_event(&mut self, event: Event) {
             self.app.dispatch_event(event);
-            let events = self.app.app_mut().drain_events();
-            for (_window, event) in events {
-                self.picker.dispatch(self.app.app_mut(), &event);
-            }
             self.pump_times(2);
         }
 
@@ -4387,7 +4379,7 @@ mod ui_tests {
         assert_eq!(record.label_text(), Some("OK"));
         let input = {
             let panel = picker.inner.panel.borrow();
-            panel.as_ref().expect("面板").input.root
+            panel.as_ref().expect("面板").input.editable
         };
         let record = snapshot.node_for(input).expect("HEX 输入框 a11y");
         assert_eq!(record.role, A11yRole::TextInput);

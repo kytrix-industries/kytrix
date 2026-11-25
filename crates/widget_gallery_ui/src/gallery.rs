@@ -11,7 +11,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yRole},
     app::App,
     error::EngineError,
-    event::{Action, Event, InputEvent, KeyBinding, KeyCode, Modifiers},
+    event::{Action, KeyBinding, KeyCode, Modifiers},
     interaction::{ScrollConfig, ScrollHandle},
     math::{LogicalPoint, LogicalSize, px},
     node::{
@@ -126,7 +126,7 @@ struct GalleryCore {
     translate: Translate,
     scope: SignalScope,
     panel: NodeId,
-    header: NodeId,
+    header_chrome: NodeId,
     sidebar: NodeId,
     footer: NodeId,
     content: NodeId,
@@ -202,6 +202,17 @@ impl GalleryCore {
             &theme,
             &translate,
             &services.language,
+        )?;
+        let header_chrome = build_container(
+            app,
+            window,
+            header,
+            StyleBuilder::new()
+                .flex_none()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .build(),
         )?;
         let main = build_container(
             app,
@@ -297,7 +308,7 @@ impl GalleryCore {
             translate,
             scope,
             panel,
-            header,
+            header_chrome,
             sidebar,
             footer,
             content,
@@ -332,7 +343,7 @@ impl GalleryCore {
             let entries = core.entries.clone();
             core.rebuild_rows(app, &entries)?;
             core.route = Some(register_route(&weak, &core.services));
-            let input = core.chrome.as_ref().map(|chrome| chrome.input.root);
+            let input = core.chrome.as_ref().map(|chrome| chrome.input.editable);
             if let Some(input) = input {
                 app.set_focus(window, Some(input));
             }
@@ -350,8 +361,24 @@ impl GalleryCore {
         let confirm = self.keys.action("confirm");
         let focus_search = self.keys.action("focus-search");
         let row = self.keys.action("row");
+        let search_submit = self.keys.action("search-submit");
 
         {
+            let handler = Weak::clone(weak);
+            app.on_action(search_submit.clone(), move |ctx| {
+                let Some(core) = handler.upgrade() else {
+                    return;
+                };
+                let selected = {
+                    let core = core.borrow();
+                    ctx.read(&core.selection).clone()
+                };
+                let Some(widget) = selected else {
+                    return;
+                };
+                let mut core = core.borrow_mut();
+                core.emit(WidgetGalleryEvent::Confirm(widget));
+            });
             let handler = Weak::clone(weak);
             app.on_action(cancel.clone(), move |_ctx| {
                 let Some(core) = handler.upgrade() else {
@@ -382,7 +409,8 @@ impl GalleryCore {
                 };
                 let (window, input) = {
                     let core = core.borrow();
-                    let Some(input) = core.chrome.as_ref().map(|chrome| chrome.input.root) else {
+                    let Some(input) = core.chrome.as_ref().map(|chrome| chrome.input.editable)
+                    else {
                         return;
                     };
                     (core.window, input)
@@ -398,7 +426,7 @@ impl GalleryCore {
                 let (widget, window, input) = {
                     let core = core.borrow();
                     let widget = core.rows_by_node.get(&node).cloned();
-                    let input = core.chrome.as_ref().map(|chrome| chrome.input.root);
+                    let input = core.chrome.as_ref().map(|chrome| chrome.input.editable);
                     (widget, core.window, input)
                 };
                 let Some(widget) = widget else {
@@ -431,7 +459,7 @@ impl GalleryCore {
             )?;
         }
 
-        Ok(vec![cancel, confirm, focus_search, row])
+        Ok(vec![cancel, confirm, focus_search, row, search_submit])
     }
 
     fn build_chrome(
@@ -442,7 +470,7 @@ impl GalleryCore {
         let theme = self.theme.clone();
         let translate = self.translate.clone();
 
-        let header = self.header;
+        let header = self.header_chrome;
         let window = self.window;
         let search_box = NodeBuilder::boxed()
             .id(self.keys.control("search"))
@@ -455,14 +483,16 @@ impl GalleryCore {
             .build(tree(app, window), header)?;
         let spec = std::sync::Arc::new(InputSpec {
             name: self.keys.control("search_input"),
+            label: None,
             placeholder: t_smol!(&translate, "widget_gallery.search_placeholder"),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ui_kit::theme::components::ControlSize::Medium,
-            submit: None,
+            submit: Some(self.keys.action("search-submit")),
         });
         let state = self.input_state;
         let placeholder = self.placeholder;
@@ -496,7 +526,7 @@ impl GalleryCore {
                         let input = {
                             let mut core = core.borrow_mut();
                             core.toggle_filter(category);
-                            core.chrome.as_ref().map(|chrome| chrome.input.root)
+                            core.chrome.as_ref().map(|chrome| chrome.input.editable)
                         };
                         let _ = ctx.app_mut().request_repaint(window);
                         if let Some(input) = input {
@@ -579,9 +609,9 @@ impl GalleryCore {
         let had_search_focus = self
             .chrome
             .as_ref()
-            .is_some_and(|chrome| focused == Some(chrome.input.root));
+            .is_some_and(|chrome| focused == Some(chrome.input.editable));
         if let Some(chrome) = self.chrome.take() {
-            clear_children(app, self.window, self.header);
+            clear_children(app, self.window, self.header_chrome);
             clear_children(app, self.window, self.sidebar);
             clear_children(app, self.window, self.footer);
             chrome.input.release(app);
@@ -593,7 +623,7 @@ impl GalleryCore {
         }
         self.build_chrome(app, weak)?;
         if had_search_focus
-            && let Some(input) = self.chrome.as_ref().map(|chrome| chrome.input.root)
+            && let Some(input) = self.chrome.as_ref().map(|chrome| chrome.input.editable)
         {
             app.set_focus(self.window, Some(input));
         }
@@ -742,7 +772,9 @@ impl GalleryCore {
             return Ok(());
         }
 
-        self.drain_input_events(app);
+        if let Some(chrome) = self.chrome.as_mut() {
+            let _ = chrome.input.sync(app);
+        }
 
         let language = *app.read(&self.services.language);
         if language != self.language {
@@ -772,76 +804,11 @@ impl GalleryCore {
         Ok(())
     }
 
-    fn drain_input_events(&mut self, app: &mut App) {
-        if !self.has_focus(app) {
-            return;
-        }
-        let window = self.window;
-        let events = app.drain_events_where(|event_window, event| {
-            event_window == window
-                && matches!(
-                    event,
-                    Event::Input(InputEvent::Text { .. } | InputEvent::Key { .. }) | Event::Ime(_)
-                )
-        });
-        if events.is_empty() {
-            return;
-        }
-        let search = self.chrome.as_ref().map(|chrome| chrome.input.root);
-        let mut forward = Vec::with_capacity(events.len());
-        for (_, event) in events {
-            if let Event::Input(InputEvent::Key {
-                code: KeyCode::Enter | KeyCode::NumpadEnter,
-                state: ui_core::event::KeyState::Down,
-                repeat: false,
-                modifiers,
-                ..
-            }) = &event
-                && modifiers.is_empty()
-                && app.focused(self.window) == search
-            {
-                let selected = { (*app.read(&self.selection)).clone() };
-                if let Some(widget) = selected {
-                    self.emit(WidgetGalleryEvent::Confirm(widget));
-                }
-                continue;
-            }
-            forward.push(event);
-        }
-        if forward.is_empty() {
-            return;
-        }
-        if let Some(chrome) = self.chrome.as_ref() {
-            for event in &forward {
-                let _ = chrome.input.dispatch(app, event);
-            }
-        }
-    }
-
-    fn has_focus(&self, app: &App) -> bool {
-        let Some(focused) = app.focused(self.window) else {
-            return false;
-        };
-        let Some(window) = app.window(self.window) else {
-            return false;
-        };
-        let tree = window.tree();
-        let mut cursor = Some(focused);
-        while let Some(node) = cursor {
-            if node == self.panel {
-                return true;
-            }
-            cursor = tree.get(node).ok().and_then(|node| node.parent());
-        }
-        false
-    }
-
     fn sync_chrome(&mut self, app: &mut App) {
         let no_selection = app.read(&self.selection).is_none();
         let filter = self.filter;
         let scrollbar = self.scrollbar.clone();
         if let Some(chrome) = self.chrome.as_mut() {
-            let _ = chrome.input.sync(app);
             let _ = chrome.confirm.set_disabled(app, no_selection);
             for (category, button) in &chrome.categories {
                 let _ = button.set_selected(app, filter == Some(*category));
@@ -1865,7 +1832,7 @@ mod tests {
                 .as_ref()
                 .expect("chrome")
                 .input
-                .root
+                .editable
         }
 
         fn focus_search(&mut self) {

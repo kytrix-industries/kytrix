@@ -254,21 +254,15 @@ fn a_period_field_commits_only_a_period_it_may_take() {
     let field = harness
         .find_by_debug_prefix(
             root,
-            &format_smolstr!("panel.line.MA.0.period@{index}.root"),
+            &format_smolstr!("panel.line.MA.0.period@{index}.text"),
         )
         .expect("MA's first period field was built");
 
     assert!(harness.with_cx(|cx| cx.app_mut().set_focus(window, Some(field))));
-    harness.with_cx(|cx| {
-        let event = Event::Input(InputEvent::Text {
-            text: SmolStr::new_static("0"),
-            timestamp: Instant::now(),
-        });
-        assert!(
-            panel.dispatch(cx, &event),
-            "the focused field takes the text"
-        );
-    });
+    harness.dispatch_event(Event::Input(InputEvent::Text {
+        text: SmolStr::new_static("0"),
+        timestamp: Instant::now(),
+    }));
     harness.drain();
     harness.with_cx(|cx| panel.sync(cx, &config).expect("typing sync"));
     harness.drain();
@@ -300,17 +294,14 @@ fn a_period_field_commits_only_a_period_it_may_take() {
     let field = harness
         .find_by_debug_prefix(
             root,
-            &format_smolstr!("panel.line.MA.0.period@{index}.root"),
+            &format_smolstr!("panel.line.MA.0.period@{index}.text"),
         )
         .expect("the rebuilt field was built");
     assert!(harness.with_cx(|cx| cx.app_mut().set_focus(window, Some(field))));
-    harness.with_cx(|cx| {
-        let event = Event::Input(InputEvent::Text {
-            text: SmolStr::new_static("x"),
-            timestamp: Instant::now(),
-        });
-        assert!(panel.dispatch(cx, &event));
-    });
+    harness.dispatch_event(Event::Input(InputEvent::Text {
+        text: SmolStr::new_static("x"),
+        timestamp: Instant::now(),
+    }));
     harness.drain();
     harness.with_cx(|cx| panel.sync(cx, &config).expect("invalid sync"));
     harness.drain();

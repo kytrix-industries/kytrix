@@ -12,7 +12,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    event::{Action, Event, InputEvent},
+    event::Action,
     interaction::ActionCtx,
     math::{LogicalPx, px},
     node::{
@@ -200,6 +200,7 @@ struct DialogState {
     dialog: Option<Dialog>,
     list: Option<List>,
     input: Option<InputNode>,
+    input_slot: Rc<RefCell<Option<InputNode>>>,
     add: Option<Button>,
     close: Option<Button>,
     delete_buttons: BTreeMap<usize, DeleteButton>,
@@ -292,6 +293,7 @@ impl DialogState {
             dialog: None,
             list: None,
             input: None,
+            input_slot: Rc::new(RefCell::new(None)),
             add: None,
             close: None,
             delete_buttons: BTreeMap::new(),
@@ -335,15 +337,19 @@ impl DialogState {
         self.shown_addresses = Some(0);
         self.list = Some(list);
 
-        let input_state = self.input_state;
         let addresses = self.addresses;
         let limit = self.limit;
         let add_request = self.add_request;
         let refusal = self.refusal;
+        let input_slot = Rc::clone(&self.input_slot);
         cx.app_mut().on_action(self.submit.clone(), move |ctx| {
+            let Some(input) = input_slot.borrow().clone() else {
+                return;
+            };
+            let text = input.value(ctx.app_mut());
             offer_typed_address(
                 ctx,
-                &input_state,
+                text.as_str(),
                 &addresses,
                 &limit,
                 &add_request,
@@ -453,7 +459,7 @@ impl DialogState {
         match kind {
             DialogButtonKind::Add => {
                 let label = t_smol!(translate, "widget.hyperliquid_wallet.add");
-                let input_state = self.input_state;
+                let input = self.input.clone();
                 let addresses = self.addresses;
                 let limit = self.limit;
                 let add_request = self.add_request;
@@ -465,9 +471,13 @@ impl DialogState {
                     .a11y_label(label.clone())
                     .tooltip_text(label)
                     .on_click(move |ctx| {
+                        let Some(input) = input.clone() else {
+                            return;
+                        };
+                        let text = input.value(ctx.app_mut());
                         offer_typed_address(
                             ctx,
-                            &input_state,
+                            text.as_str(),
                             &addresses,
                             &limit,
                             &add_request,
@@ -520,10 +530,12 @@ impl DialogState {
         if self.released || self.closed.get() {
             return Ok(());
         }
+        if let Some(input) = &self.input {
+            let _ = input.sync(cx.app_mut());
+        }
         self.rebuild_static_copy(cx)?;
         self.publish(cx, view);
         self.clear_stale_refusal(cx);
-        self.dispatch_text_events(cx);
         self.show_addresses(cx)?;
         self.sync_components(cx)?;
         if !self
@@ -545,32 +557,6 @@ impl DialogState {
         if cx.read(&self.refusal).is_some() {
             let _ = cx.write(&self.refusal, None);
         }
-    }
-
-    fn dispatch_text_events(&mut self, cx: &mut WidgetCx<'_>) {
-        let Some(input) = self.input.as_ref() else {
-            return;
-        };
-        if !self.owns_modal(cx.app()) {
-            return;
-        }
-        let window = self.window;
-        let events = cx
-            .app_mut()
-            .drain_events_where(|target, event| target == window && is_text_input(event));
-        for (_, event) in events {
-            let _ = input.dispatch(cx.app_mut(), &event);
-        }
-    }
-
-    fn owns_modal(&self, app: &App) -> bool {
-        let Some(dialog) = self.dialog.as_ref() else {
-            return false;
-        };
-        matches!(
-            (app.modal_scope(self.window), dialog.overlay_node()),
-            (Some(top), Some(own)) if top == own
-        )
     }
 
     fn sync_components(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
@@ -751,12 +737,14 @@ impl DialogState {
         })?;
         let spec = Arc::new(InputSpec {
             name: self.keys.input.clone(),
+            label: None,
             placeholder: SmolStr::default(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: Some(self.submit.clone()),
         });
@@ -775,7 +763,8 @@ impl DialogState {
             )
         };
         input.install(app);
-        self.input = Some(input);
+        self.input = Some(input.clone());
+        *self.input_slot.borrow_mut() = Some(input);
 
         let add_holder = build_node(app, window, toolbar, |tree, toolbar| {
             NodeBuilder::boxed()
@@ -1004,6 +993,7 @@ impl DialogState {
     }
 
     fn take_components(&mut self) -> DialogComponents {
+        *self.input_slot.borrow_mut() = None;
         let delete_buttons = std::mem::take(&mut self.delete_buttons)
             .into_values()
             .map(|entry| entry.button)
@@ -1068,13 +1058,13 @@ fn judge_typed_address(typed: &str, limit: usize, addresses: &[WalletAddress]) -
 
 fn offer_typed_address(
     ctx: &mut ActionCtx<'_>,
-    input_state: &Signal<InputState>,
+    typed_text: &str,
     addresses: &Signal<Arc<[WalletAddress]>>,
     limit: &Signal<usize>,
     add_request: &Signal<Option<WalletAddress>>,
     refusal: &Signal<Option<AddressDialogError>>,
 ) {
-    let text = SmolStr::new(ctx.read(input_state).text().trim());
+    let text = SmolStr::new(typed_text.trim());
     let addresses = ctx.read(addresses);
     let judged = judge_typed_address(&text, *ctx.read(limit), &addresses[..]);
     match judged {
@@ -1215,13 +1205,6 @@ fn release_components(app: &mut App, components: DialogComponents) {
     }
 }
 
-fn is_text_input(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Input(InputEvent::Text { .. } | InputEvent::Key { .. }) | Event::Ime(_)
-    )
-}
-
 fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
     match error {
         DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
@@ -1249,7 +1232,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use i18n::{language::codes::LanguageCode, t_smol};
-    use ui_core::event::{ActionSource, KeyCode, Modifiers};
+    use ui_core::event::{ActionSource, Event, InputEvent, KeyCode, Modifiers};
     use widget::test_support::WidgetTestApp;
 
     use super::*;
@@ -1381,33 +1364,26 @@ mod tests {
     fn type_address(harness: &mut WidgetTestApp, dialog: &WalletAddressDialog, text: &str) {
         let input = dialog.test_input().expect("the address field is built");
         let window = harness.window();
-        let _ = harness.app_mut().set_focus(window, Some(input.root));
-        let event = Event::Input(InputEvent::Text {
+        let _ = harness.app_mut().set_focus(window, Some(input.editable));
+        harness.dispatch_event(Event::Input(InputEvent::Text {
             text: SmolStr::new(text),
             timestamp: Instant::now(),
-        });
-        assert!(
-            input.dispatch(harness.app_mut(), &event),
-            "the focused field takes the text"
-        );
+        }));
     }
 
     fn set_address(harness: &mut WidgetTestApp, dialog: &WalletAddressDialog, text: &str) {
-        let state = dialog.inner.borrow().input_state;
-        harness.with_cx(|cx| {
-            cx.write(&state, InputState::new(text));
-        });
+        let input = dialog.test_input().expect("the address field is built");
+        input.update_value(harness.app_mut(), text);
     }
 
     fn press_enter(harness: &mut WidgetTestApp, dialog: &WalletAddressDialog) {
         let input = dialog.test_input().expect("the address field is built");
         let window = harness.window();
-        let _ = harness.app_mut().set_focus(window, Some(input.root));
-        let event = Event::Input(InputEvent::key_down(KeyCode::Enter, Modifiers::empty()));
-        assert!(
-            input.dispatch(harness.app_mut(), &event),
-            "the focused field takes Enter"
-        );
+        let _ = harness.app_mut().set_focus(window, Some(input.editable));
+        harness.dispatch_event(Event::Input(InputEvent::key_down(
+            KeyCode::Enter,
+            Modifiers::empty(),
+        )));
     }
 
     #[test]

@@ -112,8 +112,7 @@ impl Control {
         match self {
             Self::Button(button) => button.dispatch(cx.app_mut(), event),
             Self::Toggle(toggle) => toggle.dispatch(cx.app_mut(), event),
-            Self::Input(input) => input.dispatch(cx, event),
-            Self::Picker(picker) => picker.dispatch(cx, event),
+            _ => false,
         }
     }
 

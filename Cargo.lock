@@ -6943,6 +6943,7 @@ dependencies = [
  "taffy",
  "tokio",
  "ui_core",
+ "unicode-segmentation",
 ]
 
 [[package]]

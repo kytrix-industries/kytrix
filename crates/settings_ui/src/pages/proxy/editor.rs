@@ -531,11 +531,14 @@ impl ProxyEditor {
             return Ok(());
         }
 
+        {
+            let controls = self.controls.borrow();
+            for input in &controls.inputs {
+                input.sync(app);
+            }
+        }
         self.follow_fields(app);
         let controls = self.controls.borrow();
-        for input in &controls.inputs {
-            input.sync(app);
-        }
         if let Some(select) = &controls.authorization {
             select.sync(app)?;
         }
@@ -574,9 +577,6 @@ impl ProxyEditor {
     pub(crate) fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
         let controls = self.controls.borrow();
         let mut consumed = false;
-        for input in &controls.inputs {
-            consumed |= input.dispatch(app, event);
-        }
         if let Some(select) = &controls.authorization {
             consumed |= select.dispatch(app, event);
         }
@@ -698,12 +698,14 @@ impl FormBuild<'_> {
         let placeholder = app.signal_scoped(self.scope, SmolStr::default());
         let spec = std::sync::Arc::new(InputSpec {
             name: format_smolstr!("{}.field.{}", self.key, field.id()),
+            label: None,
             placeholder: SmolStr::default(),
             masked: field == Field::Password,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Medium,
             submit: None,
         });
@@ -973,7 +975,7 @@ fn confirm(
             let Some(input) = controls.borrow().inputs.get(field.index()).cloned() else {
                 continue;
             };
-            let value = app.read_with(&input.state, |state| SmolStr::new(state.text()));
+            let value = input.value(app);
             draft.set_text(field, value);
         }
     }

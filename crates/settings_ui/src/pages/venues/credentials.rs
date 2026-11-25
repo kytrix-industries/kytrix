@@ -21,7 +21,6 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    event::Event,
     math::px,
     node::{
         builder::NodeBuilder,
@@ -519,15 +518,6 @@ impl CredentialsArea {
         Ok(())
     }
 
-    pub(crate) fn dispatch(&self, app: &mut App, event: &Event) -> bool {
-        let mut consumed = false;
-        for row in &self.rows {
-            consumed |= row.dispatch(app, event);
-        }
-
-        consumed
-    }
-
     pub(crate) fn release(&mut self, app: &mut App) {
         for row in self.rows.drain(..) {
             row.release(app);
@@ -784,10 +774,6 @@ impl CredentialsRow {
         Ok(())
     }
 
-    fn dispatch(&self, app: &mut App, event: &Event) -> bool {
-        self.editor.dispatch(app, event)
-    }
-
     fn release(self, app: &mut App) {
         self.edit.release(app);
         if let Some((node, clear)) = self.state.borrow_mut().clear.take() {
@@ -970,12 +956,14 @@ impl CredentialsEditor {
             let placeholder = app.signal_scoped(scope, placeholder_text.clone());
             let spec = Arc::new(InputSpec {
                 name: kind.field_id(field),
+                label: None,
                 placeholder: placeholder_text,
                 masked: field.password,
                 multiline: false,
                 readonly: false,
                 disabled: false,
                 max_length: None,
+                visible_lines: None,
                 size: ControlSize::Medium,
                 submit: None,
             });
@@ -1110,14 +1098,14 @@ impl CredentialsEditor {
             };
             form.fields
                 .iter()
-                .map(|field| (field.field, field.input.state, field.error))
+                .map(|field| (field.field, field.input.clone(), field.error))
                 .collect::<Vec<_>>()
         };
 
         let mut draft = CredentialsDraft::empty(kind);
         let mut rejected = false;
-        for (field, state, error) in pending {
-            let value = SmolStr::new(app.read(&state).text());
+        for (field, input, error) in pending {
+            let value = input.value(app);
             match field.error_key {
                 Some(key) if value.trim().is_empty() => {
                     app.write(&error, Some(i18n::t_smol!(translate, key)));
@@ -1180,19 +1168,6 @@ impl CredentialsEditor {
         }
 
         Ok(())
-    }
-
-    fn dispatch(&self, app: &mut App, event: &Event) -> bool {
-        let inner = self.inner.borrow();
-        let Some(form) = inner.form.as_ref() else {
-            return false;
-        };
-        let mut consumed = false;
-        for field in &form.fields {
-            consumed |= field.input.dispatch(app, event);
-        }
-
-        consumed
     }
 
     fn release_form(&self, app: &mut App) {

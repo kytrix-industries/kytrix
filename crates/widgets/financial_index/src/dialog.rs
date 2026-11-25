@@ -11,7 +11,6 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    event::{Event, InputEvent},
     math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
@@ -594,12 +593,14 @@ impl SelectorState {
         })?;
         let spec = Arc::new(InputSpec {
             name: self.keys.filter.clone(),
+            label: None,
             placeholder: SmolStr::default(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Small,
             submit: None,
         });
@@ -757,7 +758,9 @@ impl SelectorState {
         if self.retry_requested.take() {
             self.reload(cx)?;
         }
-        self.dispatch_text_events(cx);
+        if let Some(input) = self.input.as_ref() {
+            input.sync(cx.app_mut());
+        }
         self.follow_tree(cx)?;
         self.follow_filter(cx)?;
         self.follow_list_click(cx)?;
@@ -768,9 +771,6 @@ impl SelectorState {
         }
         if let Some(list) = self.list.as_ref() {
             list.sync(cx.app_mut())?;
-        }
-        if let Some(input) = self.input.as_ref() {
-            input.sync(cx.app_mut());
         }
         if let Some(spinner) = self.spinner.as_ref() {
             spinner.sync(cx.app_mut())?;
@@ -881,32 +881,6 @@ impl SelectorState {
         }
         let _ = cx.request_frame();
         Ok(())
-    }
-
-    fn dispatch_text_events(&mut self, cx: &mut WidgetCx<'_>) {
-        let Some(filter) = self.input.as_ref() else {
-            return;
-        };
-        if !self.owns_modal(cx.app()) {
-            return;
-        }
-        let window = self.window;
-        let events = cx
-            .app_mut()
-            .drain_events_where(|target, event| target == window && is_text_input(event));
-        for (_, event) in events {
-            let _ = filter.dispatch(cx.app_mut(), &event);
-        }
-    }
-
-    fn owns_modal(&self, app: &App) -> bool {
-        let Some(dialog) = self.dialog.as_ref() else {
-            return false;
-        };
-        matches!(
-            (app.modal_scope(self.window), dialog.overlay_node()),
-            (Some(top), Some(own)) if top == own
-        )
     }
 
     fn follow_tree(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
@@ -1442,13 +1416,6 @@ fn build_node(
     build(tree, parent)
 }
 
-fn is_text_input(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Input(InputEvent::Text { .. } | InputEvent::Key { .. }) | Event::Ime(_)
-    )
-}
-
 fn selection_count(selected: &HashSet<FinancialIndexTopic>) -> u32 {
     u32::try_from(selected.len()).unwrap_or(u32::MAX)
 }
@@ -1699,20 +1666,16 @@ mod tests {
     fn type_into_filter(harness: &mut WidgetTestApp, selector: &mut IndexSelector, typed: &str) {
         let filter = input(selector);
         let window = harness.window();
-        let _ = harness.app_mut().set_focus(window, Some(filter.root));
+        let _ = harness.app_mut().set_focus(window, Some(filter.editable));
         assert_eq!(
             harness.app().focused(window),
-            Some(filter.root),
+            Some(filter.editable),
             "the field takes the focus"
         );
-        let event = Event::Input(InputEvent::Text {
+        harness.dispatch_event(Event::Input(InputEvent::Text {
             text: SmolStr::new(typed),
             timestamp: Instant::now(),
-        });
-        assert!(
-            filter.dispatch(harness.app_mut(), &event),
-            "the focused field takes the text"
-        );
+        }));
         sync(harness, selector);
         harness.drain();
     }
@@ -1855,6 +1818,28 @@ mod tests {
         assert!(
             !harness.has_text(row_content(&harness, &selector, 0), CHECK_MARK),
             "a row that is no longer chosen does not draw the mark"
+        );
+    }
+
+    #[test]
+    fn the_last_typed_key_should_filter_in_the_same_frame() {
+        let mut harness = harness();
+        let source = FakeSource::default();
+        source.set_manifest(test_support::two_indices_in_one_category());
+        let (mut selector, _) = selector(&mut harness, source, &[]);
+        wait_for_manifest(&mut harness, &mut selector);
+        settle_frames(&mut harness, &mut selector);
+        assert_eq!(
+            visible_codes(&selector),
+            ["HSI", "HSCEI"],
+            "the asia category starts with both indices on show"
+        );
+
+        type_into_filter(&mut harness, &mut selector, "hsi");
+        assert_eq!(
+            visible_codes(&selector),
+            ["HSI"],
+            "the frame that mirrors the field is the frame that filters by the last key"
         );
     }
 
@@ -2578,26 +2563,36 @@ mod tests {
         let (mut selector, _) = selector(&mut harness, source, &[]);
         sync(&mut harness, &mut selector);
         let filter = input(&selector);
-        let click = Action::Custom(format_smolstr!("ui_kit.input.{}.click", filter.spec.name));
-        let drag = Action::Custom(format_smolstr!("ui_kit.input.{}.drag", filter.spec.name));
+        let track = Action::Custom(format_smolstr!("{}.scrollbar.track", filter.spec.name));
+        let drag = Action::Custom(format_smolstr!("{}.scrollbar.drag", filter.spec.name));
         assert!(
-            harness.app().has_action_handler(&click),
-            "the filter registers its click"
+            !harness.app().has_action_handler(&track),
+            "a single line filter draws no scrollbar track"
         );
         assert!(
-            harness.app().has_action_handler(&drag),
-            "the filter registers its drag"
+            !harness.app().has_action_handler(&drag),
+            "a single line filter draws no scrollbar drag"
+        );
+        let root = harness.root();
+        assert!(
+            harness
+                .find_by_debug_prefix(root, &format_smolstr!("{}.text", filter.spec.name))
+                .is_some(),
+            "the filter is drawn"
         );
 
         harness.with_cx(|cx| selector.release(cx));
 
         assert!(
-            !harness.app().has_action_handler(&click),
-            "the released selector left its filter's click handler behind"
+            harness
+                .find_by_debug_prefix(root, &format_smolstr!("{}.text", filter.spec.name))
+                .is_none(),
+            "the released selector takes its filter node away"
         );
-        assert!(
-            !harness.app().has_action_handler(&drag),
-            "the released selector left its filter's drag handler behind"
+        assert_eq!(
+            filter.release(harness.app_mut()),
+            0,
+            "a single line filter has nothing to detach"
         );
     }
 

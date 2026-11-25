@@ -374,6 +374,10 @@ impl Harness {
         self.drain();
     }
 
+    pub(crate) fn dispatch_without_frame(&mut self, event: Event) {
+        self.app.dispatch_event(event);
+    }
+
     pub(crate) fn click(&mut self, position: LogicalPoint) {
         self.app.inject(InputEvent::pointer_down(
             position,

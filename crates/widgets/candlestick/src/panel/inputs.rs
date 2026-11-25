@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
 use smol_str::{SmolStr, format_smolstr};
-use ui_core::{
-    event::Event,
-    node::signal::{Signal, SignalScope},
-};
+use ui_core::node::signal::{Signal, SignalScope};
 use ui_kit::{
     kit::{
         input::{self as kit_input, InputNode, InputSpec, InputState},
@@ -120,12 +117,14 @@ impl FieldInput {
         let placeholder = cx.app_mut().signal_scoped(scope, SmolStr::new_static(""));
         let spec = Arc::new(InputSpec {
             name,
+            label: None,
             placeholder: SmolStr::new_static(""),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: UnifiedSize::Small,
             submit: None,
         });
@@ -181,10 +180,6 @@ impl FieldInput {
         }
         self.last_focused = focused;
         edit
-    }
-
-    pub(super) fn dispatch(&self, cx: &mut WidgetCx<'_>, event: &Event) -> bool {
-        self.node.dispatch(cx.app_mut(), event)
     }
 
     pub(super) fn release(self, cx: &mut WidgetCx<'_>) {

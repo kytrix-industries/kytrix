@@ -564,12 +564,14 @@ impl SelectorState {
         })?;
         let spec = Arc::new(InputSpec {
             name: format_smolstr!("{}:filter", self.key),
+            label: None,
             placeholder: SmolStr::default(),
             masked: false,
             multiline: false,
             readonly: false,
             disabled: false,
             max_length: None,
+            visible_lines: None,
             size: ControlSize::Small,
             submit: None,
         });
@@ -686,8 +688,10 @@ impl SelectorState {
             return;
         }
 
-        self.dispatch_events(app);
         self.adopt_language(app);
+        if let Some(input) = self.input.as_ref() {
+            input.sync(app);
+        }
         self.follow_tree(app);
         self.follow_input(app);
         let ranked = self.advance_matching();
@@ -702,9 +706,6 @@ impl SelectorState {
         let mut changed = false;
         changed |= self.tree.sync(app).unwrap_or(false);
         changed |= self.list.sync(app).unwrap_or(false);
-        if let Some(input) = self.input.as_ref() {
-            changed |= input.sync(app);
-        }
         changed |= self.update_confirm_button(app);
         changed |= self
             .dialog
@@ -717,31 +718,6 @@ impl SelectorState {
         if self.closed.get() {
             self.finish(app);
         }
-    }
-
-    fn dispatch_events(&self, app: &mut App) {
-        let Some(input) = self.input.as_ref() else {
-            return;
-        };
-        if !self.owns_modal(app) {
-            return;
-        }
-        let window = self.window;
-        for (_, event) in app
-            .drain_events_where(|target, event| target == window && crate::ui::is_text_input(event))
-        {
-            let _ = input.dispatch(app, &event);
-        }
-    }
-
-    fn owns_modal(&self, app: &App) -> bool {
-        let Some(dialog) = self.dialog.as_ref() else {
-            return false;
-        };
-        matches!(
-            (app.modal_scope(self.window), dialog.overlay_node()),
-            (Some(top), Some(own)) if top == own
-        )
     }
 
     fn adopt_language(&mut self, app: &mut App) {
