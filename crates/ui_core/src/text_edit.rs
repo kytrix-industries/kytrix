@@ -3327,8 +3327,7 @@ pub(crate) fn handle_key(
     match code {
         KeyCode::Tab => false,
         KeyCode::Escape if modifiers.is_empty() => {
-            let _ = collapse_selection(app, window, node);
-            true
+            collapse_selection(app, window, node).is_ok_and(|changed| changed)
         }
         KeyCode::ArrowLeft => {
             if word {

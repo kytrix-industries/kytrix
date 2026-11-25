@@ -1418,6 +1418,10 @@ fn shift_motions_extend_the_selection_and_escape_collapses_to_its_start() {
         0..0,
         "Escape 折叠到选区起点"
     );
+    assert!(
+        !press(&mut app, window, KeyCode::Escape, Modifiers::empty()),
+        "选区已折叠时 Escape 必须留给宿主（对话框关闭等绑定）"
+    );
 }
 
 #[test]
@@ -2709,7 +2713,6 @@ fn mapped_edit_keys_are_consumed_without_losing_focus() {
         (KeyCode::End, command_modifiers()),
         (KeyCode::Backspace, Modifiers::empty()),
         (KeyCode::Delete, Modifiers::empty()),
-        (KeyCode::Escape, Modifiers::empty()),
         (KeyCode::KeyA, command_modifiers()),
         (KeyCode::KeyC, command_modifiers()),
         (KeyCode::KeyX, command_modifiers()),
