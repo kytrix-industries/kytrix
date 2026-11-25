@@ -80,6 +80,40 @@ pub(crate) fn caret_rect(layout: &parley::Layout<ColorBrush>, byte_index: usize)
     to_rect(cursor.geometry(layout, 1.0))
 }
 
+const UNDERLINE_BASELINE_EM: f32 = 0.10;
+
+pub(crate) fn composition_underline_rects(
+    layout: &parley::Layout<ColorBrush>,
+    anchor: usize,
+    focus: usize,
+    font_size: f32,
+    thickness: f32,
+) -> Vec<LogicalRect> {
+    let anchor_cursor = Cursor::from_byte_index(layout, anchor, Affinity::Downstream);
+    let focus_cursor = Cursor::from_byte_index(layout, focus, Affinity::Upstream);
+    let selection = Selection::new(anchor_cursor, focus_cursor);
+    if selection.is_collapsed() {
+        return Vec::new();
+    }
+    let mut rects = Vec::new();
+    for (bounds, line_index) in selection.geometry(layout) {
+        let Some(line) = layout.lines().nth(line_index) else {
+            continue;
+        };
+        let top = line.metrics().baseline + font_size * UNDERLINE_BASELINE_EM;
+        let rect = LogicalRect::new(
+            px(bounds.x0 as f32),
+            px(top),
+            px((bounds.x1 - bounds.x0) as f32),
+            px(thickness),
+        );
+        if rect.size.width > LogicalPx::ZERO && rect.size.height > LogicalPx::ZERO {
+            rects.push(rect);
+        }
+    }
+    rects
+}
+
 pub(crate) fn byte_index_at(
     layout: &parley::Layout<ColorBrush>,
     text: &str,
@@ -109,7 +143,8 @@ fn to_rect(bounds: BoundingBox) -> LogicalRect {
 #[cfg(test)]
 mod tests {
     use super::{
-        byte_index_at, caret_rect, floor_boundary, selection_rects, to_inline_box, vertical_align,
+        byte_index_at, caret_rect, composition_underline_rects, floor_boundary, selection_rects,
+        to_inline_box, vertical_align,
     };
     use crate::{
         math::{LogicalPoint, LogicalSize, px},
@@ -541,6 +576,31 @@ mod tests {
                 .any(|(index, &hit)| index + 1 < right_hits.len() && hit < text.len()),
             "右侧越界不得全部收敛到整段 len：{right_hits:?}"
         );
+    }
+
+    #[test]
+    fn composition_underlines_follow_each_wrapped_line() {
+        let layout = layout_of_width("alpha beta gamma delta", 60.0);
+        let line_count = layout.lines().count();
+        assert!(line_count >= 3, "fixture 必须折成多行");
+        let rects =
+            composition_underline_rects(&layout, 0, "alpha beta gamma delta".len(), 16.0, 1.0);
+
+        assert_eq!(rects.len(), line_count, "每行一条下划线：{rects:?}");
+        for (index, rect) in rects.iter().enumerate() {
+            let baseline = layout
+                .lines()
+                .nth(index)
+                .expect("行存在")
+                .metrics()
+                .baseline;
+            assert!(
+                (rect.origin.y.value() - (baseline + 1.6)).abs() < 0.01,
+                "第 {index} 行下划线 y = baseline + 0.10×font_size：{rect:?}"
+            );
+            assert!((rect.size.height.value() - 1.0).abs() < 0.01);
+            assert!(rect.size.width.value() > 0.0);
+        }
     }
 
     fn layout_of_direction(

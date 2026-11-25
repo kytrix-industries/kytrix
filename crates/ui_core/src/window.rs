@@ -941,6 +941,9 @@ impl Window {
     pub(crate) fn clear_ime_cursor_request(&mut self) -> bool {
         focus::clear_ime_cursor_request(self)
     }
+    pub(crate) fn ime_cursor_node(&self) -> Option<NodeId> {
+        focus::ime_cursor_node(self)
+    }
     pub(crate) fn ime_cursor_area(&self) -> Result<Option<LogicalRect>, EngineError> {
         focus::ime_cursor_area(self)
     }

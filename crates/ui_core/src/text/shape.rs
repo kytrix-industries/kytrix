@@ -581,6 +581,26 @@ impl ShapedText {
         .unwrap_or_default()
     }
 
+    pub(crate) fn composition_underline_rects(
+        &self,
+        width: LogicalPx,
+        alignment: TextAlign,
+        range: core::ops::Range<usize>,
+        font_size: LogicalPx,
+        thickness: LogicalPx,
+    ) -> Vec<LogicalRect> {
+        self.with_broken_layout(width, alignment, |layout| {
+            inline_flow::composition_underline_rects(
+                layout,
+                range.start,
+                range.end,
+                font_size.value(),
+                thickness.value(),
+            )
+        })
+        .unwrap_or_default()
+    }
+
     pub(crate) fn byte_index_at(
         &self,
         width: LogicalPx,

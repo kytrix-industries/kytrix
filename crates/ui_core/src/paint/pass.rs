@@ -1239,6 +1239,68 @@ struct PrimitiveEmitter {
     opacity: f32,
 }
 
+struct TextDecorations {
+    selection: Vec<LogicalRect>,
+    underlines: Vec<LogicalRect>,
+    caret: Option<LogicalRect>,
+    placeholder: Option<Rc<ShapedLine>>,
+    selection_color: Color,
+    composition_color: Color,
+    caret_color: Color,
+    placeholder_color: Color,
+}
+
+fn text_decorations(tree: &NodeTree, node: NodeId) -> Option<TextDecorations> {
+    let editable = tree.editable(node)?;
+    let content = tree.text_content(node)?;
+    let shaped = tree.text_slot(node)?.shaped();
+    if shaped.text() != editable.display_text() {
+        return None;
+    }
+    let width = tree.text_layout_width(node)?;
+    let alignment = content.style.alignment;
+    let selection = editable.selection();
+    let selection_rects = if selection.is_collapsed() {
+        Vec::new()
+    } else {
+        shaped.selection_rects(
+            width,
+            alignment,
+            selection.range().start,
+            selection.range().end,
+        )
+    };
+    let caret = editable
+        .focused()
+        .then(|| tree.text_caret_rect(node, selection.focus().byte).ok())
+        .flatten();
+    let mut underlines = Vec::new();
+    if let Some(ranges) = editable.composition_ranges() {
+        let font_size = editable.spec().text_style.size;
+        for (index, range) in ranges.iter().enumerate() {
+            let thickness = if index % 2 == 0 { px(1.0) } else { px(1.5) };
+            underlines.extend(shaped.composition_underline_rects(
+                width,
+                alignment,
+                range.clone(),
+                font_size,
+                thickness,
+            ));
+        }
+    }
+    let placeholder = editable.visible_placeholder_line().cloned();
+    Some(TextDecorations {
+        selection: selection_rects,
+        underlines,
+        caret,
+        placeholder,
+        selection_color: editable.spec().selection_color,
+        composition_color: editable.spec().composition_color,
+        caret_color: editable.spec().caret_color,
+        placeholder_color: editable.spec().placeholder_color,
+    })
+}
+
 fn negate(offset: LogicalPoint) -> LogicalPoint {
     LogicalPoint::new(-offset.x, -offset.y)
 }
@@ -1578,6 +1640,17 @@ impl PrimitiveEmitter {
             self.bounds.origin.x + self.content_offset.x,
             self.bounds.origin.y + self.content_offset.y,
         );
+        let decorations = text_decorations(context.tree, self.node);
+        if let Some(decorations) = &decorations {
+            for rect in &decorations.selection {
+                self.emit_solid_quad(
+                    context,
+                    rect.translate(origin),
+                    decorations.selection_color,
+                    opacity,
+                );
+            }
+        }
         let inline_paints: SmallVec<[(u64, Option<InlineBoxPaint>); 4]> = context
             .tree
             .text_content(self.node)
@@ -1662,6 +1735,104 @@ impl PrimitiveEmitter {
                         },
                     }),
                 );
+                self.push_damage(context, bounds, physical_px(0.0));
+            }
+        }
+        if let Some(decorations) = decorations {
+            for rect in &decorations.underlines {
+                self.emit_solid_quad(
+                    context,
+                    rect.translate(origin),
+                    decorations.composition_color,
+                    opacity,
+                );
+            }
+            if let Some(placeholder) = &decorations.placeholder {
+                let live = context.atlas.is_none_or(|atlas| {
+                    crate::window::canvas_text::line_is_live(placeholder, atlas)
+                });
+                if live {
+                    let color = self
+                        .patch
+                        .foreground
+                        .unwrap_or(decorations.placeholder_color);
+                    self.emit_placeholder(context, placeholder, color, origin, opacity);
+                } else if !context.stale_text.contains(&self.node) {
+                    context.stale_text.push(self.node);
+                }
+            }
+            if let Some(caret) = decorations.caret {
+                self.emit_solid_quad(
+                    context,
+                    caret.translate(origin),
+                    decorations.caret_color,
+                    opacity,
+                );
+            }
+        }
+    }
+
+    fn emit_solid_quad(
+        &mut self,
+        context: &mut PaintContext<'_>,
+        bounds: LogicalRect,
+        color: Color,
+        opacity: f32,
+    ) {
+        let color = color.with_opacity(opacity);
+        if color.is_transparent()
+            || bounds.size.width <= LogicalPx::ZERO
+            || bounds.size.height <= LogicalPx::ZERO
+        {
+            return;
+        }
+        self.push(
+            context,
+            Primitive::Quad(Quad {
+                bounds,
+                corner_radius: [LogicalPx::ZERO; 4],
+                paint: QuadPaint::Solid {
+                    fill: color,
+                    border: None,
+                },
+            }),
+        );
+        self.push_damage(context, bounds, physical_px(0.0));
+    }
+
+    fn emit_placeholder(
+        &mut self,
+        context: &mut PaintContext<'_>,
+        line: &ShapedLine,
+        color: Color,
+        origin: LogicalPoint,
+        opacity: f32,
+    ) {
+        let color = color.with_opacity(opacity);
+        if color.is_transparent() {
+            return;
+        }
+        for shaped_line in &line.lines {
+            for item in &shaped_line.items {
+                let ShapedTextItem::GlyphRun(run) = item else {
+                    continue;
+                };
+                if run.glyphs.is_empty() {
+                    continue;
+                }
+                let mut glyphs = Vec::with_capacity(run.glyphs.len());
+                let mut bounds = LogicalRect::default();
+                for glyph in &run.glyphs {
+                    let position =
+                        LogicalPoint::new(origin.x + glyph.position.x, origin.y + glyph.position.y);
+                    bounds = bounds.union(LogicalRect::from_origin_size(position, glyph.size));
+                    glyphs.push(PositionedGlyph {
+                        tile: glyph.tile,
+                        position,
+                        size: glyph.size,
+                    });
+                }
+                self.push(context, Primitive::GlyphRun(GlyphRun { color, glyphs }));
                 self.push_damage(context, bounds, physical_px(0.0));
             }
         }

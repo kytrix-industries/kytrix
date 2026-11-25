@@ -57,7 +57,7 @@ use crate::{
     },
     text::{
         FontStack, FontStackStatus, TextContent, TextDiagnostic, TextLayoutReport, TextPassReport,
-        atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
+        TextStyle, atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
     },
     window::{FrameOutcome, FramePresentation, FrameTicket, Window, WindowId, WindowOptions},
 };
@@ -1078,7 +1078,12 @@ impl App {
     }
 
     pub fn set_ime_enabled(&mut self, window: WindowId, enabled: bool) {
-        focus::set_ime_enabled(self, window, enabled)
+        let changed = focus::set_ime_enabled(self, window, enabled);
+        if !enabled {
+            crate::text_edit::clear_managed_ime_cursor_area(self, window);
+        } else if changed {
+            self.request_frame();
+        }
     }
 
     pub fn ime_cursor_area(&self, window: WindowId) -> Result<Option<LogicalRect>, EngineError> {
@@ -1715,6 +1720,84 @@ impl App {
         node: NodeId,
     ) -> Result<crate::text_edit::TextEditMetrics, EngineError> {
         crate::text_edit::metrics(self, window, node)
+    }
+
+    pub fn text_edit_set_placeholder(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        placeholder: &str,
+    ) -> Result<bool, EngineError> {
+        crate::text_edit::set_placeholder(self, window, node, placeholder)
+    }
+
+    pub fn text_edit_set_placeholder_color(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        color: Color,
+    ) -> Result<bool, EngineError> {
+        crate::text_edit::set_color(
+            self,
+            window,
+            node,
+            crate::text_edit::EditableColorSlot::Placeholder,
+            color,
+        )
+    }
+
+    pub fn text_edit_set_caret_color(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        color: Color,
+    ) -> Result<bool, EngineError> {
+        crate::text_edit::set_color(
+            self,
+            window,
+            node,
+            crate::text_edit::EditableColorSlot::Caret,
+            color,
+        )
+    }
+
+    pub fn text_edit_set_selection_color(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        color: Color,
+    ) -> Result<bool, EngineError> {
+        crate::text_edit::set_color(
+            self,
+            window,
+            node,
+            crate::text_edit::EditableColorSlot::Selection,
+            color,
+        )
+    }
+
+    pub fn text_edit_set_composition_color(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        color: Color,
+    ) -> Result<bool, EngineError> {
+        crate::text_edit::set_color(
+            self,
+            window,
+            node,
+            crate::text_edit::EditableColorSlot::Composition,
+            color,
+        )
+    }
+
+    pub fn text_edit_set_text_style(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        style: TextStyle,
+    ) -> Result<bool, EngineError> {
+        crate::text_edit::set_text_style(self, window, node, style)
     }
 
     #[must_use]

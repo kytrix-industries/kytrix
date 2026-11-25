@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use super::App;
 use crate::{
     error::EngineError,
-    math::LogicalSize,
+    math::{LogicalPx, LogicalSize},
     text::{FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport},
     window::WindowId,
 };
@@ -483,6 +483,17 @@ pub(crate) fn refresh_text(
         } else {
             report.shaped += 1;
         }
+        if let Some(placeholder) = tree
+            .editable(node)
+            .and_then(|editable| editable.placeholder_content())
+        {
+            let (placeholder_shaped, _hit) = text.shape_cached_editable(&placeholder);
+            if tree.editable_mut(node).is_some_and(|editable| {
+                editable.ensure_placeholder(placeholder, placeholder_shaped)
+            }) {
+                tree.mark_text_layout_dirty(node);
+            }
+        }
         let key = if editable {
             crate::text::cache::ShapeKey::parley_only(&content, text.font_stack_version())
         } else {
@@ -588,47 +599,97 @@ pub(crate) fn layout_text(
                 && tree.text_line(node).is_some()
             {
                 reused += 1;
-                continue;
-            }
-            let Some(content) = tree.text_content(node) else {
-                continue;
-            };
-            let color = content.style.color;
-            let alignment = content.style.alignment;
-            let ellipsis = text.ellipsis_for(&content.style);
-            let mut ctx = crate::text::shape::RasterCtx {
-                raster,
-                glyph_atlas,
-                atlas,
-                generation,
-                scale,
-            };
-            let (line, mut diagnostics, stats) =
-                match shaped.rasterize(width, alignment, color, &mut ctx, ellipsis.as_deref()) {
+            } else {
+                let Some(content) = tree.text_content(node) else {
+                    continue;
+                };
+                let color = content.style.color;
+                let alignment = content.style.alignment;
+                let ellipsis = text.ellipsis_for(&content.style);
+                let mut ctx = crate::text::shape::RasterCtx {
+                    raster,
+                    glyph_atlas,
+                    atlas,
+                    generation,
+                    scale,
+                };
+                let (line, mut diagnostics, stats) = match shaped.rasterize(
+                    width,
+                    alignment,
+                    color,
+                    &mut ctx,
+                    ellipsis.as_deref(),
+                ) {
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
-            report.rasterized += stats.rasters;
-            report.tiles_reused += stats.hits;
-            report.atlas_rebuilds += stats.rebuilds;
-            report.atlas_evictions += stats.evictions;
-            report.skipped_glyphs += stats.skipped;
-            pending_dirty.merge(&mut atlas.take_dirty_rects());
-            let soft_fail = stats.skipped > 0;
-            if soft_fail {
-                diagnostics.push(TextDiagnostic::AtlasFull {
-                    skipped: stats.skipped,
-                });
-                tree.mark_text_layout_dirty(node);
+                report.rasterized += stats.rasters;
+                report.tiles_reused += stats.hits;
+                report.atlas_rebuilds += stats.rebuilds;
+                report.atlas_evictions += stats.evictions;
+                report.skipped_glyphs += stats.skipped;
+                pending_dirty.merge(&mut atlas.take_dirty_rects());
+                let soft_fail = stats.skipped > 0;
+                if soft_fail {
+                    diagnostics.push(TextDiagnostic::AtlasFull {
+                        skipped: stats.skipped,
+                    });
+                    tree.mark_text_layout_dirty(node);
+                }
+                text.push_diagnostics(diagnostics);
+                let laid_generation = if soft_fail {
+                    PENDING_ATLAS_RETRY_GENERATION
+                } else {
+                    generation
+                };
+                tree.set_text_line(node, Rc::new(line), width, laid_generation);
+                laid += 1;
             }
-            text.push_diagnostics(diagnostics);
-            let laid_generation = if soft_fail {
-                PENDING_ATLAS_RETRY_GENERATION
-            } else {
-                generation
-            };
-            tree.set_text_line(node, Rc::new(line), width, laid_generation);
-            laid += 1;
+            let placeholder = tree.editable(node).and_then(|editable| {
+                let (content, shaped) = editable.placeholder_layout()?;
+                let placeholder_width = if width > LogicalPx::ZERO {
+                    width
+                } else {
+                    shaped.max_content_size().width
+                };
+                (!editable.placeholder_line_fresh(generation, placeholder_width)).then_some((
+                    content,
+                    shaped,
+                    placeholder_width,
+                ))
+            });
+            if let Some((content, shaped, placeholder_width)) = placeholder {
+                let ellipsis = text.ellipsis_for(&content.style);
+                let mut ctx = crate::text::shape::RasterCtx {
+                    raster,
+                    glyph_atlas,
+                    atlas,
+                    generation,
+                    scale,
+                };
+                let (line, diagnostics, stats) = match shaped.rasterize(
+                    placeholder_width,
+                    content.style.alignment,
+                    content.style.color,
+                    &mut ctx,
+                    ellipsis.as_deref(),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                report.rasterized += stats.rasters;
+                report.tiles_reused += stats.hits;
+                report.atlas_rebuilds += stats.rebuilds;
+                report.atlas_evictions += stats.evictions;
+                report.skipped_glyphs += stats.skipped;
+                pending_dirty.merge(&mut atlas.take_dirty_rects());
+                text.push_diagnostics(diagnostics);
+                if stats.skipped > 0 {
+                    tree.mark_text_layout_dirty(node);
+                } else if let Some(editable) = tree.editable_mut(node) {
+                    editable.set_placeholder_line(Rc::new(line), placeholder_width);
+                }
+            }
         }
         let evicted = glyph_atlas.take_evicted();
         let generation_changed = atlas.generation() != generation;

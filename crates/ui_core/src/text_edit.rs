@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, rc::Rc, sync::Arc};
 
 use parley::{
     Affinity as ParleyAffinity, BreakReason as ParleyBreakReason, Cursor as ParleyCursor, Layout,
@@ -17,8 +17,8 @@ use crate::{
     math::LogicalPx,
     node::{id::NodeId, tree::NodeTree},
     paint::color::{Color, ColorBrush},
-    text::{TextContent, TextStyle},
-    window::WindowId,
+    text::{ShapedLine, TextContent, TextStyle, shape::ShapedText},
+    window::{Window, WindowId},
 };
 
 const MASK_GLYPH: char = '\u{2022}';
@@ -581,6 +581,13 @@ struct Composition {
     selection_before: TextSelection,
 }
 
+struct PlaceholderText {
+    content: TextContent,
+    shaped: Rc<ShapedText>,
+    line: Option<Rc<ShapedLine>>,
+    laid_width_bits: u32,
+}
+
 impl Composition {
     fn new(raw: Range<usize>, selection_before: TextSelection) -> Self {
         Self {
@@ -653,6 +660,14 @@ fn splice_preedit(
     text.push_str(fragment);
     text.push_str(&current[end_byte..]);
     (text.finish(), caret)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditableColorSlot {
+    Caret,
+    Selection,
+    Composition,
+    Placeholder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -791,6 +806,7 @@ pub(crate) struct EditableText {
     spec: EditableSpec,
     selection: TextSelection,
     composition: Option<Composition>,
+    placeholder: Option<PlaceholderText>,
     focused: bool,
     a11y_value: SmolStr,
     generation: u64,
@@ -820,6 +836,7 @@ impl EditableText {
             spec,
             selection,
             composition: None,
+            placeholder: None,
             focused: false,
             a11y_value: SmolStr::default(),
             generation: 0,
@@ -1192,6 +1209,140 @@ impl EditableText {
         })
     }
 
+    pub(crate) fn focused(&self) -> bool {
+        self.focused
+    }
+
+    pub(crate) fn composition_ranges(&self) -> Option<&[Range<usize>]> {
+        match &self.display {
+            DisplayText::Composed(composed) => Some(composed.clauses_display.as_slice()),
+            DisplayText::Identity | DisplayText::Masked(_) => None,
+        }
+    }
+
+    pub(crate) fn composition_caret(&self) -> Option<usize> {
+        match &self.display {
+            DisplayText::Composed(composed) => Some(composed.caret_display),
+            DisplayText::Identity | DisplayText::Masked(_) => None,
+        }
+    }
+
+    pub(crate) fn placeholder_content(&self) -> Option<TextContent> {
+        if !self.committed.is_empty()
+            || self.composition.is_some()
+            || self.spec.placeholder.is_empty()
+        {
+            return None;
+        }
+        let mut style = self.spec.text_style.clone();
+        style.color = self.spec.placeholder_color;
+        Some(TextContent::new(self.spec.placeholder.clone(), style))
+    }
+
+    pub(crate) fn ensure_placeholder(
+        &mut self,
+        content: TextContent,
+        shaped: Rc<ShapedText>,
+    ) -> bool {
+        let changed = match &self.placeholder {
+            Some(placeholder) => {
+                !Rc::ptr_eq(&placeholder.shaped, &shaped)
+                    || placeholder.content.text != content.text
+                    || placeholder.content.style.color != content.style.color
+            }
+            None => true,
+        };
+        if changed {
+            self.placeholder = Some(PlaceholderText {
+                content,
+                shaped,
+                line: None,
+                laid_width_bits: 0,
+            });
+        }
+        changed
+    }
+
+    pub(crate) fn placeholder_layout(&self) -> Option<(TextContent, Rc<ShapedText>)> {
+        if !self.committed.is_empty()
+            || self.composition.is_some()
+            || self.spec.placeholder.is_empty()
+        {
+            return None;
+        }
+        self.placeholder
+            .as_ref()
+            .map(|placeholder| (placeholder.content.clone(), Rc::clone(&placeholder.shaped)))
+    }
+
+    pub(crate) fn placeholder_line_fresh(&self, generation: u32, width: LogicalPx) -> bool {
+        self.placeholder.as_ref().is_some_and(|placeholder| {
+            placeholder.laid_width_bits == width.value().to_bits()
+                && placeholder
+                    .line
+                    .as_ref()
+                    .is_some_and(|line| line.atlas_generation == generation)
+        })
+    }
+
+    pub(crate) fn set_placeholder_line(&mut self, line: Rc<ShapedLine>, width: LogicalPx) {
+        if let Some(placeholder) = &mut self.placeholder {
+            placeholder.line = Some(line);
+            placeholder.laid_width_bits = width.value().to_bits();
+        }
+    }
+
+    pub(crate) fn clear_placeholder_line(&mut self) {
+        if let Some(placeholder) = &mut self.placeholder {
+            placeholder.line = None;
+            placeholder.laid_width_bits = 0;
+        }
+    }
+
+    fn set_placeholder_text(&mut self, placeholder: SmolStr) -> bool {
+        if self.spec.placeholder == placeholder {
+            return false;
+        }
+        self.spec.placeholder = placeholder;
+        self.placeholder = None;
+        true
+    }
+
+    fn set_color(&mut self, slot: EditableColorSlot, color: Color) -> bool {
+        let target = match slot {
+            EditableColorSlot::Caret => &mut self.spec.caret_color,
+            EditableColorSlot::Selection => &mut self.spec.selection_color,
+            EditableColorSlot::Composition => &mut self.spec.composition_color,
+            EditableColorSlot::Placeholder => &mut self.spec.placeholder_color,
+        };
+        if *target == color {
+            return false;
+        }
+        *target = color;
+        true
+    }
+
+    fn set_text_style(&mut self, style: TextStyle) -> bool {
+        if self.spec.text_style == style {
+            return false;
+        }
+        self.spec.text_style = style;
+        self.placeholder = None;
+        true
+    }
+
+    pub(crate) fn visible_placeholder_line(&self) -> Option<&Rc<ShapedLine>> {
+        if !self.committed.is_empty()
+            || self.composition.is_some()
+            || self.spec.placeholder.is_empty()
+        {
+            return None;
+        }
+        self.placeholder
+            .as_ref()
+            .and_then(|placeholder| placeholder.line.as_ref())
+    }
+
     fn apply_edit(
         &mut self,
         range: Range<usize>,
@@ -1445,6 +1596,123 @@ pub(crate) fn set_value(
         }
     }
     if touched {
+        app.request_frame();
+    }
+    Ok(changed)
+}
+
+pub(crate) fn set_placeholder(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    placeholder: &str,
+) -> Result<bool, EngineError> {
+    let changed = {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        validate_node(tree, window, node)?;
+        let Some(editable) = tree.editable_mut(node) else {
+            return Err(EngineError::TextEditNotAvailable { node });
+        };
+        editable.set_placeholder_text(SmolStr::new(placeholder))
+    };
+    if changed {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        refresh_display_text(tree, node)?;
+        tree.mark_paint(node);
+        tree.mark_a11y(node);
+        sync_a11y_patch(tree, node);
+        app.request_frame();
+    }
+    Ok(changed)
+}
+
+pub(crate) fn set_color(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    slot: EditableColorSlot,
+    color: Color,
+) -> Result<bool, EngineError> {
+    let changed = {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        validate_node(tree, window, node)?;
+        let Some(editable) = tree.editable_mut(node) else {
+            return Err(EngineError::TextEditNotAvailable { node });
+        };
+        editable.set_color(slot, color)
+    };
+    if changed {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        if slot == EditableColorSlot::Placeholder {
+            refresh_display_text(tree, node)?;
+        }
+        tree.mark_paint(node);
+        app.request_frame();
+    }
+    Ok(changed)
+}
+
+fn refresh_display_text(tree: &mut NodeTree, node: NodeId) -> Result<(), EngineError> {
+    let (display, style) = {
+        let editable = tree
+            .editable(node)
+            .ok_or(EngineError::TextEditNotAvailable { node })?;
+        (
+            SmolStr::new(editable.display_text()),
+            editable.spec().text_style.clone(),
+        )
+    };
+    tree.set_text_content(node, TextContent::new(display, style));
+    Ok(())
+}
+
+pub(crate) fn set_text_style(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    style: TextStyle,
+) -> Result<bool, EngineError> {
+    let changed = {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        validate_node(tree, window, node)?;
+        let Some(editable) = tree.editable_mut(node) else {
+            return Err(EngineError::TextEditNotAvailable { node });
+        };
+        let mut candidate = editable.spec().clone();
+        candidate.text_style = style.clone();
+        if let Err(detail) = candidate.validate() {
+            return Err(EngineError::TextEditSpecInvalid { node, detail });
+        }
+        editable.set_text_style(style.clone())
+    };
+    if changed {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        let display = tree
+            .editable(node)
+            .ok_or(EngineError::TextEditNotAvailable { node })?
+            .display_text()
+            .to_owned();
+        tree.set_text_content(node, TextContent::new(SmolStr::new(display), style));
+        tree.invalidate_text_layout(node);
+        tree.mark_paint(node);
         app.request_frame();
     }
     Ok(changed)
@@ -2433,6 +2701,67 @@ pub(crate) fn apply_focus(tree: &mut NodeTree, node: NodeId, focused: bool) -> b
     tree.mark_a11y(node);
     sync_a11y_patch(tree, node);
     true
+}
+
+pub(crate) fn sync_ime_cursor_area(app: &mut App, window: WindowId) {
+    if !app.ime_enabled(window) {
+        clear_managed_ime_cursor_area(app, window);
+        return;
+    }
+    let focused = app.focused(window);
+    let editable_focused = focused.and_then(|node| {
+        let tree = app.window(window)?.tree();
+        (tree.editable(node).is_some() && tree.is_effectively_visible(node)).then_some(node)
+    });
+    let request = editable_focused.and_then(|node| ime_cursor_request(app, window, node));
+    let Some(target) = app.window_mut(window) else {
+        return;
+    };
+    if let Some((node, byte_index)) = request {
+        target.set_ime_cursor_request(node, byte_index);
+        return;
+    }
+    if let Some(node) = editable_focused {
+        if target.ime_cursor_node() != Some(node) {
+            target.clear_ime_cursor_request();
+        }
+        return;
+    }
+    if managed_ime_request(target) {
+        target.clear_ime_cursor_request();
+    }
+}
+
+pub(crate) fn clear_managed_ime_cursor_area(app: &mut App, window: WindowId) {
+    let Some(target) = app.window_mut(window) else {
+        return;
+    };
+    if managed_ime_request(target) {
+        target.clear_ime_cursor_request();
+    }
+}
+
+fn managed_ime_request(window: &Window) -> bool {
+    window.ime_cursor_node().is_some_and(|node| {
+        window.tree().get(node).is_err() || window.tree().editable(node).is_some()
+    })
+}
+
+fn ime_cursor_request(app: &App, window: WindowId, node: NodeId) -> Option<(NodeId, usize)> {
+    let tree = app.window(window)?.tree();
+    let editable = tree.editable(node)?;
+    if editable.spec().readonly || editable.spec().disabled {
+        return None;
+    }
+    let byte_index = editable
+        .composition_caret()
+        .unwrap_or_else(|| editable.selection().focus().byte);
+    let display = editable.display_text();
+    if byte_index > display.len() || !display.is_char_boundary(byte_index) {
+        return None;
+    }
+    tree.text_caret_rect(node, byte_index).ok()?;
+    Some((node, byte_index))
 }
 
 pub(crate) fn cancel_composition_on_focus_loss(app: &mut App, window: WindowId) {

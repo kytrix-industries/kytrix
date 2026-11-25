@@ -164,9 +164,9 @@ pub(crate) fn clear_ime_cursor_area(app: &mut App, window: WindowId) {
     }
 }
 
-pub(crate) fn set_ime_enabled(app: &mut App, window: WindowId, enabled: bool) {
+pub(crate) fn set_ime_enabled(app: &mut App, window: WindowId, enabled: bool) -> bool {
     if !app.windows.contains_key(&window) {
-        return;
+        return false;
     }
     let changed = if enabled {
         app.ime_disabled.remove(&window)
@@ -176,6 +176,7 @@ pub(crate) fn set_ime_enabled(app: &mut App, window: WindowId, enabled: bool) {
     if changed {
         app.dispatcher.wake();
     }
+    changed
 }
 
 pub(crate) fn ime_cursor_area(

@@ -156,6 +156,9 @@ pub(crate) fn invalidate_text_lines(tree: &mut NodeTree) -> usize {
         }
         slot.laid_width_bits = 0;
         slot.laid_generation = 0;
+        if let Some(editable) = tree.editable_slots.get_mut(index).and_then(Option::as_mut) {
+            editable.clear_placeholder_line();
+        }
         tree.mark_text_layout_dirty(node);
         tree.mark_paint(node);
     }
@@ -435,6 +438,9 @@ pub(crate) fn invalidate_text_line(tree: &mut NodeTree, node: NodeId) {
     slot.line = None;
     slot.laid_width_bits = 0;
     slot.laid_generation = 0;
+    if let Some(editable) = tree.editable_slots.get_mut(index).and_then(Option::as_mut) {
+        editable.clear_placeholder_line();
+    }
     tree.mark_text_layout_dirty(node);
     tree.mark_paint(node);
 }

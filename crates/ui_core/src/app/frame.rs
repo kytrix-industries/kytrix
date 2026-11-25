@@ -96,6 +96,7 @@ pub(crate) fn frame(
         .get(&window)
         .is_some_and(Window::a11y_only_frame)
     {
+        crate::text_edit::sync_ime_cursor_area(app, window);
         app.abort_frame(window, ticket);
         #[cfg(feature = "test-support")]
         if let Some(target) = app.windows.get_mut(&window) {
@@ -191,6 +192,7 @@ pub(crate) fn frame(
     if resolution.evicted || resolution.pending {
         app.request_frame();
     }
+    crate::text_edit::sync_ime_cursor_area(app, window);
     app.upload_atlas_pages();
     let painted = {
         let App {

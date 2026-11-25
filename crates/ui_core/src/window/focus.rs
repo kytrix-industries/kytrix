@@ -61,6 +61,10 @@ pub(crate) fn clear_ime_cursor_request(window: &mut Window) -> bool {
     window.ime_cursor.take().is_some()
 }
 
+pub(crate) fn ime_cursor_node(window: &Window) -> Option<NodeId> {
+    window.ime_cursor.map(|request| request.node)
+}
+
 pub(crate) fn ime_cursor_area(window: &Window) -> Result<Option<LogicalRect>, EngineError> {
     let Some(request) = window.ime_cursor else {
         return Ok(None);

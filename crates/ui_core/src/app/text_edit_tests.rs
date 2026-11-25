@@ -6,7 +6,7 @@ use crate::{
     error::EngineError,
     event::{Action, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers},
     interaction::{ScrollAxis, ScrollConfig},
-    math::{LogicalPx, LogicalRect, LogicalSize, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         color::Color,
@@ -4166,4 +4166,1902 @@ fn identity_emoji_composition_caret_and_end_after_commit_are_idempotent() {
     let snapshot = snapshot_of(&app, window, node);
     assert_eq!(snapshot.generation, generation, "提交后补 End 必须幂等");
     assert_eq!(text_of(&app, window, node), "ab🌍");
+}
+
+fn placeholder_spec(style: TextStyle, multiline: bool) -> EditableSpec {
+    EditableSpec {
+        placeholder: smol_str::SmolStr::new_static("Type here"),
+        ..spec(style, multiline)
+    }
+}
+
+fn node_origin(app: &App, window: WindowId, node: NodeId) -> LogicalPoint {
+    let tree = app.window(window).expect("窗口存在").tree();
+    let bounds = tree.get(node).expect("节点存在").layout().bounds;
+    let content_offset = tree.content_offset(node);
+    LogicalPoint::new(
+        bounds.origin.x + content_offset.x,
+        bounds.origin.y + content_offset.y,
+    )
+}
+
+#[test]
+fn empty_editable_caret_rect_covers_the_first_line_box() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(120.0),
+        "",
+    );
+    let metrics = app.text_edit_metrics(window, node).expect("度量");
+    let caret = app
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .text_caret_rect(node, 0)
+        .expect("空文本 caret 几何");
+    assert!(
+        (caret.size.height - metrics.line_height).abs() <= px(0.5),
+        "空文本 caret 高度必须等于行盒：{caret:?} vs {metrics:?}"
+    );
+    assert!(
+        caret.origin.y.abs() <= px(0.5),
+        "空文本 caret 必须落在首行行盒顶部：{caret:?}"
+    );
+    assert!(caret.size.width >= px(1.0), "caret 宽度至少 1：{caret:?}");
+}
+
+#[test]
+fn placeholder_line_baseline_matches_the_first_text_baseline() {
+    let (_rt, mut app, window) = new_app();
+    for (size, multiline, width) in [
+        (12.0, false, 160.0),
+        (16.0, false, 160.0),
+        (30.0, false, 200.0),
+        (16.0, true, 60.0),
+    ] {
+        let node = mount(
+            &mut app,
+            window,
+            placeholder_spec(TextStyle::new(px(size)), multiline),
+            Some(width),
+        );
+        refresh(&mut app, window);
+        layout(&mut app, window);
+        text_layout(&mut app, window);
+
+        let metrics = app.text_edit_metrics(window, node).expect("度量");
+        let baseline = metrics.first_baseline.expect("首行基线");
+        let placeholder_baseline = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .editable(node)
+            .expect("可编辑槽位")
+            .visible_placeholder_line()
+            .expect("空文本必须缓存 placeholder 行")
+            .first_baseline
+            .expect("placeholder 行必须有基线");
+        assert!(
+            (placeholder_baseline - baseline).abs() <= px(0.5),
+            "size {size} multiline {multiline}: placeholder 基线 {placeholder_baseline} 必须等于首行基线 {baseline}"
+        );
+
+        if multiline {
+            app.text_edit_set_value(window, node, "a\nb\nc")
+                .expect("写入三行");
+            refresh(&mut app, window);
+            layout(&mut app, window);
+            text_layout(&mut app, window);
+            assert!(
+                app.window(window)
+                    .expect("窗口存在")
+                    .tree()
+                    .editable(node)
+                    .expect("可编辑槽位")
+                    .visible_placeholder_line()
+                    .is_none(),
+                "有提交文本时不得显示 placeholder"
+            );
+
+            app.text_edit_set_value(window, node, "").expect("清空");
+            refresh(&mut app, window);
+            layout(&mut app, window);
+            text_layout(&mut app, window);
+            let metrics = app.text_edit_metrics(window, node).expect("度量");
+            let baseline = metrics.first_baseline.expect("首行基线");
+            let placeholder_baseline = app
+                .window(window)
+                .expect("窗口存在")
+                .tree()
+                .editable(node)
+                .expect("可编辑槽位")
+                .visible_placeholder_line()
+                .expect("清空后 placeholder 必须恢复")
+                .first_baseline
+                .expect("placeholder 行必须有基线");
+            assert!(
+                (placeholder_baseline - baseline).abs() <= px(0.5),
+                "清空后 placeholder 基线 {placeholder_baseline} 必须等于首行基线 {baseline}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cross_line_selection_rects_cover_each_wrapped_line() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), true),
+        Some(40.0),
+    );
+    app.text_edit_set_value(window, node, "alpha beta gamma delta")
+        .expect("写入");
+    refresh(&mut app, window);
+    layout(&mut app, window);
+    text_layout(&mut app, window);
+
+    let metrics = app.text_edit_metrics(window, node).expect("度量");
+    assert!(metrics.line_count >= 3, "fixture 必须折成多行：{metrics:?}");
+    assert!(crate::text_edit::select_all(&mut app, window, node).expect("全选"));
+    let display_len = app
+        .text_edit_snapshot(window, node)
+        .expect("快照")
+        .selection
+        .range()
+        .end;
+    let rects = app
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .text_selection_rects(node, 0, display_len)
+        .expect("选区几何");
+    assert_eq!(
+        rects.len(),
+        metrics.line_count,
+        "跨行选区每行一个矩形：{rects:?}"
+    );
+    let mut previous_y = px(-1.0);
+    for rect in &rects {
+        assert!(
+            rect.size.width > LogicalPx::ZERO,
+            "每行矩形必须有宽度：{rect:?}"
+        );
+        assert!(
+            rect.origin.y > previous_y,
+            "选区矩形 y 必须逐行递增：{rects:?}"
+        );
+        previous_y = rect.origin.y;
+    }
+}
+
+#[test]
+fn composition_underline_rects_sit_below_the_baseline_with_clause_thickness() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(160.0),
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(2),
+        smallvec::smallvec![0..1, 1..2],
+        None,
+    ));
+    refresh(&mut app, window);
+    layout(&mut app, window);
+    text_layout(&mut app, window);
+
+    let metrics = app.text_edit_metrics(window, node).expect("度量");
+    let baseline = metrics.first_baseline.expect("首行基线");
+    let tree = app.window(window).expect("窗口存在").tree();
+    let shaped = tree.text_slot(node).expect("文本槽位").shaped();
+    let width = tree.text_layout_width(node).expect("布局宽度");
+    let ranges = tree
+        .editable(node)
+        .expect("可编辑槽位")
+        .composition_ranges()
+        .expect("组合 clauses")
+        .to_vec();
+    assert_eq!(ranges.len(), 2, "两个 clause");
+    for (index, range) in ranges.iter().enumerate() {
+        let thickness = if index % 2 == 0 { px(1.0) } else { px(1.5) };
+        let rects = shaped.composition_underline_rects(
+            width,
+            crate::text::TextAlign::Start,
+            range.clone(),
+            px(16.0),
+            thickness,
+        );
+        assert_eq!(rects.len(), 1, "单行 clause 一个下划线：{rects:?}");
+        let rect = rects[0];
+        assert!(
+            (rect.origin.y - (baseline + px(1.6))).abs() <= px(0.5),
+            "下划线 y 必须 = baseline + 0.10*font_size：{rect:?} vs {baseline}"
+        );
+        assert!(
+            (rect.size.height - thickness).abs() <= px(1e-3),
+            "clause {index} 厚度 {thickness}：{rect:?}"
+        );
+    }
+}
+
+#[test]
+fn ime_cursor_area_follows_the_editable_caret_composition_and_blur() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(160.0),
+    );
+    app.text_edit_set_value(window, node, "abcd").expect("写入");
+    frame(&mut app, window);
+    assert_eq!(
+        app.ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "未聚焦可编辑节点时不得写 IME cursor area"
+    );
+
+    assert!(app.set_focus(window, Some(node)));
+    frame(&mut app, window);
+    let area = app
+        .ime_cursor_area(window)
+        .expect("窗口存在")
+        .expect("聚焦后必须有 IME cursor area");
+    let expected = caret_screen(&app, window, node, 4);
+    assert_caret_area(area, expected);
+
+    crate::text_edit::set_selection(&mut app, window, node, 1, 1).expect("光标");
+    frame(&mut app, window);
+    let area = app
+        .ime_cursor_area(window)
+        .expect("窗口存在")
+        .expect("光标移动后仍有 IME area");
+    assert_caret_area(area, caret_screen(&app, window, node, 1));
+
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(1),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    frame(&mut app, window);
+    let composition = app
+        .text_edit_composition(window, node)
+        .expect("组合")
+        .expect("组合中");
+    let area = app
+        .ime_cursor_area(window)
+        .expect("窗口存在")
+        .expect("组合期必须有 IME area");
+    assert_caret_area(area, caret_screen(&app, window, node, composition.caret));
+
+    assert!(app.set_focus(window, None));
+    frame(&mut app, window);
+    assert_eq!(
+        app.ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "失焦必须清除 IME cursor area"
+    );
+}
+
+fn caret_screen(app: &App, window: WindowId, node: NodeId, byte_index: usize) -> LogicalRect {
+    let tree = app.window(window).expect("窗口存在").tree();
+    tree.text_caret_rect(node, byte_index)
+        .expect("caret 几何")
+        .translate(node_origin(app, window, node))
+}
+
+fn assert_caret_area(area: LogicalRect, expected: LogicalRect) {
+    assert!(
+        (area.origin.x - expected.origin.x).abs() <= px(0.5)
+            && (area.origin.y - expected.origin.y).abs() <= px(0.5),
+        "IME area 必须等于 caret 屏幕矩形：{area:?} vs {expected:?}"
+    );
+    assert!(
+        (area.size.height - expected.size.height).abs() <= px(0.5),
+        "IME area 高度必须等于 caret 高度：{area:?} vs {expected:?}"
+    );
+}
+#[cfg(feature = "test-support")]
+fn test_editable_node(
+    app: &mut crate::test_support::app::TestApp,
+    editable: EditableSpec,
+    width: f32,
+    value: &str,
+) -> NodeId {
+    let window = app.window_id();
+    let node = {
+        let w = app.app_mut().window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        NodeBuilder::editable_text(editable)
+            .style(node_style(Some(width)))
+            .build(w.tree_mut(), root)
+            .expect("挂载可编辑文本")
+    };
+    app.app_mut()
+        .text_edit_set_value(window, node, value)
+        .expect("写入");
+    node
+}
+
+#[cfg(feature = "test-support")]
+fn lane_kinds(
+    app: &crate::test_support::app::TestApp,
+    node: NodeId,
+) -> Vec<crate::test_support::record::PrimitiveKind> {
+    use crate::test_support::record::PrimitiveKind;
+
+    app.rendered()
+        .expect("已提交")
+        .primitives
+        .iter()
+        .filter(|primitive| {
+            primitive.node == node
+                && matches!(
+                    primitive.kind,
+                    PrimitiveKind::Quad | PrimitiveKind::GlyphRun
+                )
+        })
+        .map(|primitive| primitive.kind)
+        .collect()
+}
+
+#[cfg(feature = "test-support")]
+fn node_quads(
+    app: &crate::test_support::app::TestApp,
+    node: NodeId,
+) -> Vec<crate::test_support::record::QuadRecord> {
+    app.rendered()
+        .expect("已提交")
+        .quads
+        .iter()
+        .filter(|quad| quad.node == node)
+        .copied()
+        .collect()
+}
+
+#[cfg(feature = "test-support")]
+fn solid_color(red: f32, green: f32, blue: f32, alpha: f32) -> Color {
+    Color::Srgb {
+        r: red,
+        g: green,
+        b: blue,
+        alpha,
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn selection_quad_paints_below_glyphs_and_caret_above_them() {
+    use crate::{
+        paint::color::ColorResolver,
+        test_support::{app::TestApp, record::PrimitiveKind},
+    };
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let selection_color = solid_color(0.2, 0.4, 0.8, 0.5);
+    let caret_color = solid_color(1.0, 0.0, 0.0, 1.0);
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.selection_color = selection_color;
+    editable.caret_color = caret_color;
+    let node = test_editable_node(&mut app, editable, 200.0, "abcd");
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("聚焦帧");
+    assert!(crate::text_edit::select_all(app.app_mut(), window, node).expect("全选"));
+    app.drain().expect("选区帧");
+
+    assert_eq!(
+        lane_kinds(&app, node),
+        vec![
+            PrimitiveKind::Quad,
+            PrimitiveKind::GlyphRun,
+            PrimitiveKind::Quad
+        ],
+        "lane 顺序必须是 选区 Quad → 字形 → caret"
+    );
+    let quads = node_quads(&app, node);
+    assert_eq!(quads.len(), 2, "选区 + caret：{quads:?}");
+    assert_eq!(
+        quads[0].fill,
+        ColorResolver.resolve(selection_color),
+        "第一个 Quad 必须是选区"
+    );
+    assert_eq!(
+        quads[1].fill,
+        ColorResolver.resolve(caret_color),
+        "最后一个 Quad 必须是 caret"
+    );
+    let metrics = app.app().text_edit_metrics(window, node).expect("度量");
+    assert!(
+        (quads[1].bounds.size.height - metrics.line_height).abs() <= px(0.5),
+        "caret 高度必须等于行盒：{:?} vs {metrics:?}",
+        quads[1].bounds
+    );
+    assert!(
+        (quads[1].bounds.origin.x - (quads[0].bounds.origin.x + quads[0].bounds.size.width)).abs()
+            <= px(1.0),
+        "caret 必须画在选区末尾（focus 端）：{quads:?}"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn empty_editable_paints_the_caret_in_the_line_box() {
+    use crate::test_support::{app::TestApp, record::PrimitiveKind};
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node =
+        test_editable_offset_child(&mut app, spec(TextStyle::new(px(16.0)), false), 120.0, "");
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("帧");
+
+    assert_eq!(
+        lane_kinds(&app, node),
+        vec![PrimitiveKind::Quad],
+        "空文本只画 caret"
+    );
+    let quads = node_quads(&app, node);
+    let caret = quads[0].bounds;
+    let metrics = app.app().text_edit_metrics(window, node).expect("度量");
+    let tree = app.app().window(window).expect("窗口存在").tree();
+    let bounds = tree.get(node).expect("节点").layout().bounds;
+    let content_offset = tree.content_offset(node);
+    let origin = LogicalPoint::new(
+        bounds.origin.x + content_offset.x,
+        bounds.origin.y + content_offset.y,
+    );
+    assert!(
+        (caret.size.height - metrics.line_height).abs() <= px(0.5),
+        "空文本 caret 高度必须等于行盒：{caret:?} vs {metrics:?}"
+    );
+    assert!(
+        (caret.origin.x - origin.x).abs() <= px(0.5)
+            && (caret.origin.y - origin.y).abs() <= px(0.5),
+        "空文本 caret 必须位于 content-box 首行行盒起点：{caret:?} vs {origin:?}"
+    );
+    assert!(
+        content_offset.x > LogicalPx::ZERO && content_offset.y > LogicalPx::ZERO,
+        "fixture 必须带 border+padding：{content_offset:?}"
+    );
+    assert!(caret.size.width >= px(1.0), "caret 宽度至少 1：{caret:?}");
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn composition_underlines_paint_after_glyphs_and_before_the_caret() {
+    use crate::{
+        paint::color::ColorResolver,
+        test_support::{app::TestApp, record::PrimitiveKind},
+    };
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let composition_color = solid_color(0.0, 0.8, 0.0, 1.0);
+    let caret_color = solid_color(1.0, 0.0, 0.0, 1.0);
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.composition_color = composition_color;
+    editable.caret_color = caret_color;
+    let node = test_editable_offset_child(&mut app, editable, 200.0, "abcd");
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("聚焦帧");
+    crate::text_edit::set_selection(app.app_mut(), window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        app.app_mut(),
+        window,
+        "ni",
+        Some(2),
+        smallvec::smallvec![0..1, 1..2],
+        None,
+    ));
+    app.drain().expect("组合帧");
+
+    let kinds = lane_kinds(&app, node);
+    assert_eq!(
+        kinds,
+        vec![
+            PrimitiveKind::GlyphRun,
+            PrimitiveKind::Quad,
+            PrimitiveKind::Quad,
+            PrimitiveKind::Quad
+        ],
+        "组合期顺序必须是 字形 → 两条下划线 → caret"
+    );
+    let quads = node_quads(&app, node);
+    assert_eq!(quads.len(), 3, "{quads:?}");
+    assert_eq!(quads[0].fill, ColorResolver.resolve(composition_color));
+    assert_eq!(quads[1].fill, ColorResolver.resolve(composition_color));
+    assert_eq!(quads[2].fill, ColorResolver.resolve(caret_color));
+    let metrics = app.app().text_edit_metrics(window, node).expect("度量");
+    let baseline = metrics.first_baseline.expect("首行基线");
+    let origin = node_origin(app.app(), window, node);
+    let tree = app.app().window(window).expect("窗口存在").tree();
+    let ranges = tree
+        .editable(node)
+        .expect("可编辑槽位")
+        .composition_ranges()
+        .expect("clauses")
+        .to_vec();
+    for (index, quad) in quads[..2].iter().enumerate() {
+        let thickness = if index % 2 == 0 { px(1.0) } else { px(1.5) };
+        assert!(
+            (quad.bounds.origin.y - (origin.y + baseline + px(1.6))).abs() <= px(0.5),
+            "clause {index} 下划线 y = origin + baseline + 0.10*font_size：{:?} vs {origin:?}+{baseline}",
+            quad.bounds
+        );
+        assert!(
+            (quad.bounds.size.height - thickness).abs() <= px(1e-3),
+            "clause {index} 厚度 {thickness}：{:?}",
+            quad.bounds
+        );
+        let clause_start = tree
+            .text_caret_rect(node, ranges[index].start)
+            .expect("clause 起点几何")
+            .origin
+            .x;
+        assert!(
+            (quad.bounds.origin.x - (origin.x + clause_start)).abs() <= px(1.0),
+            "clause {index} 下划线 x 必须 = origin + caret(clause 起点)：{:?} vs {origin:?}+{clause_start}",
+            quad.bounds
+        );
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn placeholder_glyphs_paint_before_the_caret_only_for_empty_text() {
+    use crate::test_support::{app::TestApp, record::PrimitiveKind};
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        placeholder_spec(TextStyle::new(px(16.0)), false),
+        200.0,
+        "",
+    );
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("帧");
+    assert!(
+        app.app()
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .editable(node)
+            .expect("可编辑槽位")
+            .visible_placeholder_line()
+            .is_some(),
+        "热身帧后 placeholder 行必须已缓存"
+    );
+    assert_eq!(
+        lane_kinds(&app, node),
+        vec![PrimitiveKind::GlyphRun, PrimitiveKind::Quad],
+        "空文本：placeholder 字形 → caret"
+    );
+    let quads = node_quads(&app, node);
+    assert_eq!(quads.len(), 1, "只有 caret：{quads:?}");
+
+    app.app_mut()
+        .text_edit_set_value(window, node, "abcd")
+        .expect("写入");
+    app.drain().expect("有字帧");
+    let tree = app.app().window(window).expect("窗口存在").tree();
+    assert!(
+        tree.editable(node)
+            .expect("可编辑槽位")
+            .visible_placeholder_line()
+            .is_none(),
+        "有提交文本时必须隐藏 placeholder"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn cross_line_selection_paints_one_quad_per_line_before_glyphs() {
+    use crate::{paint::color::ColorResolver, test_support::record::PrimitiveKind};
+
+    let mut app = crate::test_support::app::TestApp::new();
+    let window = app.window_id();
+    let selection_color = solid_color(0.2, 0.4, 0.8, 0.5);
+    let mut editable = spec(TextStyle::new(px(16.0)), true);
+    editable.selection_color = selection_color;
+    let node = test_editable_node(&mut app, editable, 40.0, "alpha beta gamma delta");
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    assert!(crate::text_edit::select_all(app.app_mut(), window, node).expect("全选"));
+    app.drain().expect("选区帧");
+
+    let metrics = app.app().text_edit_metrics(window, node).expect("度量");
+    let line_count = metrics.line_count;
+    assert!(line_count >= 3, "fixture 必须折成多行：{metrics:?}");
+    let kinds = lane_kinds(&app, node);
+    assert_eq!(
+        &kinds[..line_count],
+        vec![PrimitiveKind::Quad; line_count],
+        "跨行选区必须先画每行的选区 Quad：{kinds:?}"
+    );
+    assert_eq!(
+        kinds[line_count],
+        PrimitiveKind::GlyphRun,
+        "选区之后才是字形：{kinds:?}"
+    );
+    assert_eq!(
+        kinds.last(),
+        Some(&PrimitiveKind::Quad),
+        "最后是 caret：{kinds:?}"
+    );
+    let quads = node_quads(&app, node);
+    assert_eq!(quads.len(), line_count + 1, "每行选区 + caret：{quads:?}");
+    for quad in &quads[..line_count] {
+        assert_eq!(quad.fill, ColorResolver.resolve(selection_color));
+        assert!(quad.bounds.size.width > LogicalPx::ZERO);
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn caret_and_selection_changes_repaint_only_the_editable_lane_without_shaping() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = {
+        let w = app.app_mut().window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        let node = NodeBuilder::editable_text(spec(TextStyle::new(px(16.0)), false))
+            .style(node_style(Some(200.0)))
+            .build(w.tree_mut(), root)
+            .expect("挂载可编辑文本");
+        let _sibling = NodeBuilder::boxed()
+            .layout_override(LogicalRect::new(px(210.0), px(0.0), px(10.0), px(10.0)))
+            .paint(crate::paint::style::PaintSpec {
+                background: Color::WHITE,
+                ..crate::paint::style::PaintSpec::default()
+            })
+            .build(w.tree_mut(), root)
+            .expect("静态兄弟节点");
+        node
+    };
+    app.app_mut()
+        .text_edit_set_value(window, node, "abcd")
+        .expect("写入");
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("预热帧");
+    let base = app.app().shape_count_for_test();
+
+    assert!(press(
+        app.app_mut(),
+        window,
+        KeyCode::ArrowLeft,
+        Modifiers::empty()
+    ));
+    assert!(press(
+        app.app_mut(),
+        window,
+        KeyCode::ArrowLeft,
+        Modifiers::empty()
+    ));
+    app.drain().expect("caret 帧");
+    assert_eq!(
+        app.app().shape_count_for_test(),
+        base,
+        "caret 移动不得重新 shape"
+    );
+    assert_eq!(
+        app.frame_record().dirty_nodes,
+        vec![node],
+        "只重绘可编辑节点的 lane"
+    );
+    assert_eq!(
+        app.frame_record().stats.text.expect("文本报告").shaped,
+        0,
+        "选区/caret 变化不得触发文本 pass 整形"
+    );
+
+    assert!(crate::text_edit::select_all(app.app_mut(), window, node).expect("全选"));
+    app.drain().expect("选区帧");
+    assert_eq!(
+        app.app().shape_count_for_test(),
+        base,
+        "选区变化不得重新 shape"
+    );
+    assert_eq!(app.frame_record().dirty_nodes, vec![node]);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn masked_caret_and_selection_use_display_coordinates() {
+    use crate::test_support::{app::TestApp, record::PrimitiveKind};
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        200.0,
+        "abcd",
+    );
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    assert!(crate::text_edit::select_all(app.app_mut(), window, node).expect("全选"));
+    app.drain().expect("选区帧");
+
+    let snapshot = app.app().text_edit_snapshot(window, node).expect("快照");
+    assert_eq!(
+        snapshot.selection.range(),
+        0..12,
+        "掩码 display 每字素一个 3 字节项目符号"
+    );
+    assert_eq!(
+        lane_kinds(&app, node),
+        vec![
+            PrimitiveKind::Quad,
+            PrimitiveKind::GlyphRun,
+            PrimitiveKind::Quad
+        ]
+    );
+    let quads = node_quads(&app, node);
+    let selection = quads[0].bounds;
+    let caret = quads[1].bounds;
+    let glyph = app
+        .rendered()
+        .expect("已提交")
+        .primitives
+        .iter()
+        .find(|primitive| primitive.node == node && primitive.kind == PrimitiveKind::GlyphRun)
+        .expect("掩码字形")
+        .bounds;
+    assert!(
+        (selection.origin.x - glyph.origin.x).abs() <= px(1.5)
+            && (selection.origin.x + selection.size.width - (glyph.origin.x + glyph.size.width))
+                .abs()
+                <= px(2.0),
+        "选区必须覆盖掩码 display 字形：{selection:?} vs {glyph:?}"
+    );
+    assert!(
+        (caret.origin.x - (selection.origin.x + selection.size.width)).abs() <= px(0.5),
+        "caret 必须位于掩码 display 末尾：{caret:?} vs {selection:?}"
+    );
+    let metrics = app.app().text_edit_metrics(window, node).expect("度量");
+    assert!((caret.size.height - metrics.line_height).abs() <= px(0.5));
+}
+#[cfg(feature = "test-support")]
+#[test]
+fn focus_changes_toggle_the_caret_and_repaint_the_editable_lane() {
+    use crate::test_support::{app::TestApp, record::PrimitiveKind};
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        spec(TextStyle::new(px(16.0)), false),
+        200.0,
+        "abcd",
+    );
+    app.drain().expect("未聚焦帧");
+    assert_eq!(
+        lane_kinds(&app, node),
+        vec![PrimitiveKind::GlyphRun],
+        "未聚焦不画 caret"
+    );
+
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("聚焦帧");
+    assert_eq!(
+        lane_kinds(&app, node),
+        vec![PrimitiveKind::GlyphRun, PrimitiveKind::Quad],
+        "聚焦后绘制 caret"
+    );
+    assert_eq!(app.frame_record().dirty_nodes, vec![node]);
+
+    assert!(app.app_mut().set_focus(window, None));
+    app.drain().expect("失焦帧");
+    assert_eq!(
+        lane_kinds(&app, node),
+        vec![PrimitiveKind::GlyphRun],
+        "失焦后隐藏 caret"
+    );
+    assert_eq!(
+        app.frame_record().dirty_nodes,
+        vec![node],
+        "失焦必须重绘该节点"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn masked_empty_text_still_shows_the_placeholder() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let mut editable = masked_spec(TextStyle::new(px(16.0)), None);
+    editable.placeholder = smol_str::SmolStr::new_static("Password");
+    let node = test_editable_node(&mut app, editable, 200.0, "");
+    app.drain().expect("帧");
+    assert!(
+        app.app()
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .editable(node)
+            .expect("可编辑槽位")
+            .visible_placeholder_line()
+            .is_some(),
+        "掩码空文本同样显示 placeholder"
+    );
+}
+
+#[cfg(feature = "test-support")]
+fn offset_node_style(width: f32) -> Style {
+    let mut style = Style::default();
+    style.align_self(taffy::style::AlignSelf::START);
+    style.width(taffy::style::Dimension::length(width));
+    style.padding(px(6.0));
+    style.border(px(2.0));
+    style
+}
+
+#[cfg(feature = "test-support")]
+fn test_editable_offset_child(
+    app: &mut crate::test_support::app::TestApp,
+    editable: EditableSpec,
+    width: f32,
+    value: &str,
+) -> NodeId {
+    let window = app.window_id();
+    let node = {
+        let w = app.app_mut().window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        let mut parent_style = Style::default();
+        parent_style.align_self(taffy::style::AlignSelf::START);
+        parent_style.padding(px(20.0));
+        let parent = NodeBuilder::boxed()
+            .style(parent_style)
+            .build(w.tree_mut(), root)
+            .expect("父容器");
+        NodeBuilder::editable_text(editable)
+            .style(offset_node_style(width))
+            .build(w.tree_mut(), parent)
+            .expect("可编辑子节点")
+    };
+    app.app_mut()
+        .text_edit_set_value(window, node, value)
+        .expect("写入");
+    node
+}
+
+#[cfg(feature = "test-support")]
+fn placeholder_spec_text(style: TextStyle, multiline: bool, placeholder: &str) -> EditableSpec {
+    EditableSpec {
+        placeholder: smol_str::SmolStr::new(placeholder),
+        ..spec(style, multiline)
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn glyph_bounds(app: &crate::test_support::app::TestApp, node: NodeId) -> LogicalRect {
+    use crate::test_support::record::PrimitiveKind;
+
+    app.rendered()
+        .expect("已提交")
+        .primitives
+        .iter()
+        .filter(|primitive| primitive.node == node && primitive.kind == PrimitiveKind::GlyphRun)
+        .fold(LogicalRect::default(), |bounds, primitive| {
+            bounds.union(primitive.bounds)
+        })
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn decorations_include_node_origin_and_content_offset() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_offset_child(
+        &mut app,
+        spec(TextStyle::new(px(16.0)), false),
+        180.0,
+        "abcd",
+    );
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("聚焦帧");
+    assert!(crate::text_edit::select_all(app.app_mut(), window, node).expect("全选"));
+    app.drain().expect("选区帧");
+
+    let tree = app.app().window(window).expect("窗口存在").tree();
+    let bounds = tree.get(node).expect("节点").layout().bounds;
+    let content_offset = tree.content_offset(node);
+    assert!(
+        bounds.origin.x > LogicalPx::ZERO && bounds.origin.y > LogicalPx::ZERO,
+        "fixture 节点必须非原点：{bounds:?}"
+    );
+    assert!(
+        content_offset.x > LogicalPx::ZERO && content_offset.y > LogicalPx::ZERO,
+        "fixture 节点必须带 border+padding：{content_offset:?}"
+    );
+    let origin = LogicalPoint::new(
+        bounds.origin.x + content_offset.x,
+        bounds.origin.y + content_offset.y,
+    );
+    let expected_caret = tree
+        .text_caret_rect(node, 4)
+        .expect("caret 几何")
+        .translate(origin);
+    let glyph = glyph_bounds(&app, node);
+    let quads = node_quads(&app, node);
+    assert_eq!(quads.len(), 2, "选区 + caret：{quads:?}");
+    let selection = quads[0].bounds;
+    let caret = quads[1].bounds;
+    assert!(
+        (caret.origin.x - expected_caret.origin.x).abs() <= px(0.5)
+            && (caret.origin.y - expected_caret.origin.y).abs() <= px(0.5),
+        "caret 必须含节点原点与 content_offset：{caret:?} vs {expected_caret:?}"
+    );
+    assert!(
+        (caret.size.height - expected_caret.size.height).abs() <= px(0.5),
+        "caret 高度必须与 tree 几何一致：{caret:?} vs {expected_caret:?}"
+    );
+    assert!(
+        selection.origin.x <= glyph.origin.x + px(1.5)
+            && selection.origin.x + selection.size.width
+                >= glyph.origin.x + glyph.size.width - px(1.5),
+        "选区必须与同节点字形水平对齐：{selection:?} vs {glyph:?}"
+    );
+    assert!(
+        selection.origin.y <= glyph.origin.y + px(1.5)
+            && selection.origin.y + selection.size.height
+                >= glyph.origin.y + glyph.size.height - px(1.5),
+        "选区必须与同节点字形垂直对齐：{selection:?} vs {glyph:?}"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn placeholder_paints_at_the_text_paint_position() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let style = TextStyle::new(px(16.0));
+    let node = test_editable_offset_child(
+        &mut app,
+        placeholder_spec_text(style, false, "abcd"),
+        180.0,
+        "",
+    );
+    app.drain().expect("placeholder 帧");
+    let placeholder = glyph_bounds(&app, node);
+    assert!(
+        placeholder.size.width > LogicalPx::ZERO,
+        "placeholder 必须画出字形：{placeholder:?}"
+    );
+    app.app_mut()
+        .text_edit_set_value(window, node, "abcd")
+        .expect("写入");
+    app.drain().expect("文本帧");
+    let text = glyph_bounds(&app, node);
+    assert!(
+        (placeholder.origin.x - text.origin.x).abs() <= px(0.5)
+            && (placeholder.origin.y - text.origin.y).abs() <= px(0.5)
+            && (placeholder.size.width - text.size.width).abs() <= px(0.5)
+            && (placeholder.size.height - text.size.height).abs() <= px(0.5),
+        "paint 层 placeholder 必须与同串文本字形位置一致：{placeholder:?} vs {text:?}"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn placeholder_respects_alignment_and_wraps_to_the_content_width() {
+    use crate::{test_support::app::TestApp, text::TextAlign};
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let mut offsets = Vec::new();
+    for alignment in [TextAlign::Start, TextAlign::Center, TextAlign::End] {
+        let mut style = TextStyle::new(px(16.0));
+        style.alignment = alignment;
+        let editable = placeholder_spec_text(style.clone(), false, "Hello");
+        let reference = {
+            let w = app.app_mut().window_mut(window).expect("窗口存在");
+            let root = w.tree().root();
+            NodeBuilder::text("Hello", style)
+                .style(node_style(Some(200.0)))
+                .build(w.tree_mut(), root)
+                .expect("参考文本")
+        };
+        let node = {
+            let w = app.app_mut().window_mut(window).expect("窗口存在");
+            let root = w.tree().root();
+            NodeBuilder::editable_text(editable)
+                .style(node_style(Some(200.0)))
+                .build(w.tree_mut(), root)
+                .expect("placeholder 节点")
+        };
+        app.drain().expect("帧");
+        let tree = app.app().window(window).expect("窗口存在").tree();
+        let node_origin = {
+            let bounds = tree.get(node).expect("节点").layout().bounds;
+            let content_offset = tree.content_offset(node);
+            bounds.origin.x + content_offset.x
+        };
+        let reference_origin = tree.get(reference).expect("节点").layout().bounds.origin.x;
+        let placeholder_x = glyph_bounds(&app, node).origin.x - node_origin;
+        let reference_x = glyph_bounds(&app, reference).origin.x - reference_origin;
+        assert!(
+            (placeholder_x - reference_x).abs() <= px(0.5),
+            "{alignment:?}: placeholder x {placeholder_x} 必须等于同 style 文本 x {reference_x}"
+        );
+        offsets.push(placeholder_x);
+    }
+    assert!(
+        offsets[0] < offsets[1] && offsets[1] < offsets[2],
+        "Start/Center/End 必须产生递增偏移：{offsets:?}"
+    );
+
+    let mut multiline = placeholder_spec_text(
+        TextStyle::new(px(16.0)),
+        true,
+        "alpha beta gamma delta epsilon zeta",
+    );
+    multiline.multiline = true;
+    let node = test_editable_node(&mut app, multiline, 60.0, "");
+    app.drain().expect("多行 placeholder 帧");
+    let lines = app
+        .app()
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .editable(node)
+        .expect("可编辑槽位")
+        .visible_placeholder_line()
+        .expect("placeholder 行")
+        .lines
+        .len();
+    assert!(lines >= 2, "placeholder 必须按内容宽断行：{lines}");
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn ime_cursor_area_uses_the_focus_end_of_a_reversed_selection() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        spec(TextStyle::new(px(16.0)), false),
+        200.0,
+        "abcd",
+    );
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("聚焦帧");
+    crate::text_edit::set_selection(app.app_mut(), window, node, 4, 1).expect("反向选区");
+    app.drain().expect("选区帧");
+
+    let area = app
+        .app()
+        .ime_cursor_area(window)
+        .expect("窗口存在")
+        .expect("反向选区仍须写 IME area");
+    assert_caret_area(area, caret_screen(app.app(), window, node, 1));
+    let anchor_caret = caret_screen(app.app(), window, node, 4);
+    assert!(
+        (area.origin.x - anchor_caret.origin.x).abs() > px(1.0),
+        "IME area 必须用 focus 端而不是 anchor 端：{area:?} vs {anchor_caret:?}"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn removing_a_focused_editable_clears_the_ime_cursor_area() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        spec(TextStyle::new(px(16.0)), false),
+        200.0,
+        "abcd",
+    );
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("聚焦帧");
+    assert!(
+        app.app()
+            .ime_cursor_area(window)
+            .expect("窗口存在")
+            .is_some(),
+        "前置：聚焦后必须有 IME area"
+    );
+
+    app.app_mut().remove_node(window, node).expect("删除节点");
+    app.drain().expect("删除帧");
+    assert_eq!(
+        app.app().ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "删除聚焦可编辑节点后 IME area 必须清除"
+    );
+    assert_eq!(
+        app.app()
+            .window(window)
+            .expect("窗口存在")
+            .ime_cursor_node(),
+        None,
+        "删除后托管 request 不得残留"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn text_edit_set_placeholder_invalidates_the_cached_placeholder_line() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        placeholder_spec_text(TextStyle::new(px(16.0)), false, "old"),
+        200.0,
+        "",
+    );
+    app.drain().expect("初始 placeholder 帧");
+    let line_text = |app: &TestApp| {
+        app.app()
+            .window(app.window_id())
+            .expect("窗口存在")
+            .tree()
+            .editable(node)
+            .expect("可编辑槽位")
+            .visible_placeholder_line()
+            .map(|line| line.text.clone())
+    };
+    assert_eq!(line_text(&app).as_deref(), Some("old"));
+    let before = glyph_bounds(&app, node);
+
+    assert!(
+        app.app_mut()
+            .text_edit_set_placeholder(window, node, "new hint")
+            .expect("setter"),
+        "placeholder 变化必须报告 changed"
+    );
+    app.drain().expect("placeholder 更新帧");
+    assert_eq!(
+        line_text(&app).as_deref(),
+        Some("new hint"),
+        "缓存行必须失效重建"
+    );
+    let after = glyph_bounds(&app, node);
+    assert!(
+        (after.size.width - before.size.width).abs() > px(1.0),
+        "绘制宽度必须跟随新 placeholder：{before:?} -> {after:?}"
+    );
+
+    assert!(
+        app.app_mut()
+            .text_edit_set_placeholder(window, node, "")
+            .expect("setter"),
+        "置空必须报告 changed"
+    );
+    app.drain().expect("置空帧");
+    assert_eq!(line_text(&app), None, "置空后不得再绘制旧缓存行");
+    assert!(
+        lane_kinds(&app, node).is_empty(),
+        "空 placeholder + 未聚焦不得有图元：{:?}",
+        lane_kinds(&app, node)
+    );
+    assert!(
+        !app.app_mut()
+            .text_edit_set_placeholder(window, node, "")
+            .expect("幂等"),
+        "重复置空不得报告 changed"
+    );
+    assert!(
+        app.app_mut()
+            .text_edit_set_placeholder(window, node, "again")
+            .expect("setter")
+    );
+    app.drain().expect("再次设置帧");
+    assert_eq!(line_text(&app).as_deref(), Some("again"));
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn text_edit_set_placeholder_while_text_exists_shows_after_clearing() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(&mut app, spec(TextStyle::new(px(16.0)), false), 200.0, "x");
+    app.drain().expect("有字帧");
+    assert!(
+        app.app_mut()
+            .text_edit_set_placeholder(window, node, "hint")
+            .expect("setter")
+    );
+    app.drain().expect("设置帧");
+    assert!(
+        app.app()
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .editable(node)
+            .expect("可编辑槽位")
+            .visible_placeholder_line()
+            .is_none(),
+        "有文本时不得显示 placeholder"
+    );
+    app.app_mut()
+        .text_edit_set_value(window, node, "")
+        .expect("清空");
+    app.drain().expect("清空帧");
+    let line = app
+        .app()
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .editable(node)
+        .expect("可编辑槽位")
+        .visible_placeholder_line()
+        .cloned()
+        .expect("清空后 placeholder 必须出现");
+    assert_eq!(line.text.as_str(), "hint");
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn text_edit_color_setters_repaint_without_reshaping() {
+    use crate::{paint::color::ColorResolver, test_support::app::TestApp};
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        spec(TextStyle::new(px(16.0)), false),
+        200.0,
+        "abcd",
+    );
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    assert!(crate::text_edit::select_all(app.app_mut(), window, node).expect("全选"));
+    app.drain().expect("预热帧");
+    let base = app.app().shape_count_for_test();
+
+    let caret_color = solid_color(0.0, 1.0, 0.0, 1.0);
+    assert!(
+        app.app_mut()
+            .text_edit_set_caret_color(window, node, caret_color)
+            .expect("caret color")
+    );
+    app.drain().expect("caret 颜色帧");
+    let quads = node_quads(&app, node);
+    assert_eq!(
+        quads.last().expect("caret").fill,
+        ColorResolver.resolve(caret_color)
+    );
+
+    let selection_color = solid_color(0.0, 0.0, 1.0, 0.5);
+    assert!(
+        app.app_mut()
+            .text_edit_set_selection_color(window, node, selection_color)
+            .expect("selection color")
+    );
+    app.drain().expect("选区颜色帧");
+    let quads = node_quads(&app, node);
+    assert_eq!(
+        quads.first().expect("选区").fill,
+        ColorResolver.resolve(selection_color)
+    );
+
+    crate::text_edit::set_selection(app.app_mut(), window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        app.app_mut(),
+        window,
+        "ni",
+        Some(2),
+        smallvec::smallvec![0..1, 1..2],
+        None,
+    ));
+    app.drain().expect("组合帧");
+    let base_after_composition = app.app().shape_count_for_test();
+    let composition_color = solid_color(1.0, 1.0, 0.0, 1.0);
+    assert!(
+        app.app_mut()
+            .text_edit_set_composition_color(window, node, composition_color)
+            .expect("composition color")
+    );
+    app.drain().expect("组合颜色帧");
+    let quads = node_quads(&app, node);
+    let composition_quads: Vec<_> = quads
+        .iter()
+        .filter(|quad| quad.fill == ColorResolver.resolve(composition_color))
+        .collect();
+    assert_eq!(
+        composition_quads.len(),
+        2,
+        "两条 clause 下划线必须换色：{quads:?}"
+    );
+    assert_eq!(
+        app.app().shape_count_for_test(),
+        base_after_composition,
+        "颜色 setter 不得重新 shape"
+    );
+    assert!(
+        app.app().shape_count_for_test() > base,
+        "组合本身允许一次 shape（前置断言）"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn text_edit_set_placeholder_color_rebuilds_without_reshaping() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        placeholder_spec_text(TextStyle::new(px(16.0)), false, "hint"),
+        200.0,
+        "",
+    );
+    app.drain().expect("预热帧");
+    let base = app.app().shape_count_for_test();
+    let color = solid_color(0.0, 1.0, 0.0, 1.0);
+    assert!(
+        app.app_mut()
+            .text_edit_set_placeholder_color(window, node, color)
+            .expect("placeholder color")
+    );
+    app.drain().expect("颜色帧");
+    assert_eq!(
+        app.app().shape_count_for_test(),
+        base,
+        "placeholder 颜色变化必须命中原 shape cache"
+    );
+    let tree = app.app().window(window).expect("窗口存在").tree();
+    let editable = tree.editable(node).expect("可编辑槽位");
+    assert_eq!(editable.spec().placeholder_color, color);
+    assert!(
+        editable.visible_placeholder_line().is_some(),
+        "颜色变化后 placeholder 行必须重建并可见"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn text_edit_set_text_style_reshapes_and_rebuilds_the_placeholder_line() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let small = TextStyle::new(px(12.0));
+    let node = test_editable_node(
+        &mut app,
+        placeholder_spec_text(small, false, "abcd"),
+        180.0,
+        "",
+    );
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("预热帧");
+    let base = app.app().shape_count_for_test();
+    let before = app.app().text_edit_metrics(window, node).expect("度量");
+
+    let large = TextStyle::new(px(24.0));
+    assert!(
+        app.app_mut()
+            .text_edit_set_text_style(window, node, large.clone())
+            .expect("text style")
+    );
+    app.drain().expect("样式帧");
+    let after = app.app().text_edit_metrics(window, node).expect("度量");
+    assert!(
+        after.line_height > before.line_height,
+        "字号变大后行盒必须变大：{before:?} -> {after:?}"
+    );
+    assert!(
+        app.app().shape_count_for_test() > base,
+        "样式变化必须重新 shape"
+    );
+    let tree = app.app().window(window).expect("窗口存在").tree();
+    assert_eq!(tree.text_content(node).expect("文本内容").style, large);
+    let editable = tree.editable(node).expect("可编辑槽位");
+    let placeholder_baseline = editable
+        .visible_placeholder_line()
+        .expect("placeholder 行必须重建")
+        .first_baseline
+        .expect("基线");
+    assert!(
+        (placeholder_baseline - after.first_baseline.expect("首行基线")).abs() <= px(0.5),
+        "样式变化后 placeholder 基线必须跟随新首行基线"
+    );
+    let quads = node_quads(&app, node);
+    let caret = quads.last().expect("caret");
+    assert!(
+        (caret.bounds.size.height - after.line_height).abs() <= px(0.5),
+        "caret 高度必须跟随新行盒：{:?} vs {after:?}",
+        caret.bounds
+    );
+}
+
+#[cfg(feature = "test-support")]
+fn test_editable_styled(
+    app: &mut crate::test_support::app::TestApp,
+    editable: EditableSpec,
+    style: Style,
+    value: &str,
+) -> NodeId {
+    let window = app.window_id();
+    let node = {
+        let w = app.app_mut().window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        NodeBuilder::editable_text(editable)
+            .style(style)
+            .build(w.tree_mut(), root)
+            .expect("可编辑文本")
+    };
+    app.app_mut()
+        .text_edit_set_value(window, node, value)
+        .expect("写入");
+    node
+}
+
+#[cfg(feature = "test-support")]
+fn reference_text_node(
+    app: &mut crate::test_support::app::TestApp,
+    text: &str,
+    style: TextStyle,
+    node_style: Style,
+) -> NodeId {
+    let window = app.window_id();
+    let w = app.app_mut().window_mut(window).expect("窗口存在");
+    let root = w.tree().root();
+    NodeBuilder::text(text, style)
+        .style(node_style)
+        .build(w.tree_mut(), root)
+        .expect("参考文本")
+}
+
+#[cfg(feature = "test-support")]
+fn placeholder_alignment_metrics(
+    app: &crate::test_support::app::TestApp,
+    window: WindowId,
+    node: NodeId,
+    reference: NodeId,
+) -> (usize, usize, LogicalPx, LogicalPx) {
+    let tree = app.app().window(window).expect("窗口存在").tree();
+    let placeholder_lines = tree
+        .editable(node)
+        .expect("可编辑槽位")
+        .visible_placeholder_line()
+        .expect("placeholder 行")
+        .lines
+        .len();
+    let reference_lines = tree.text_line(reference).expect("参考行").lines.len();
+    let placeholder_x = glyph_bounds(app, node).origin.x - node_origin(app.app(), window, node).x;
+    let reference_bounds = tree.get(reference).expect("参考节点").layout().bounds;
+    let reference_x = glyph_bounds(app, reference).origin.x
+        - reference_bounds.origin.x
+        - tree.content_offset(reference).x;
+    (
+        placeholder_lines,
+        reference_lines,
+        placeholder_x,
+        reference_x,
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn lane_has_glyphs(app: &crate::test_support::app::TestApp, node: NodeId) -> bool {
+    use crate::test_support::record::PrimitiveKind;
+
+    app.rendered().is_some_and(|rendered| {
+        rendered
+            .primitives
+            .iter()
+            .any(|primitive| primitive.node == node && primitive.kind == PrimitiveKind::GlyphRun)
+    })
+}
+
+#[cfg(feature = "test-support")]
+fn glyph_run_color(
+    app: &crate::test_support::app::TestApp,
+    window: WindowId,
+    node: NodeId,
+) -> Option<Color> {
+    use crate::paint::primitive::Primitive;
+
+    let target = app.app().window(window)?;
+    let lane = target.tree().lane_of(node)?;
+    target
+        .scene()
+        .lane_primitives(lane)?
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => Some(run.color),
+            _ => None,
+        })
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn placeholder_rebuilds_when_the_node_content_width_changes() {
+    use crate::{test_support::app::TestApp, text::TextAlign};
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let placeholder = "alpha beta gamma delta epsilon zeta";
+    let mut style = TextStyle::new(px(16.0));
+    style.alignment = TextAlign::Center;
+    let mut editable = placeholder_spec_text(style.clone(), true, placeholder);
+    editable.multiline = true;
+    let wide = node_style(Some(200.0));
+    let node = test_editable_styled(&mut app, editable, wide.clone(), "");
+    let reference = reference_text_node(&mut app, placeholder, style, wide);
+    app.drain().expect("初始帧");
+    let initial = placeholder_alignment_metrics(&app, window, node, reference);
+    assert!(initial.0 >= 2, "fixture 在 200px 必须折行：{initial:?}");
+    assert_eq!(initial.0, initial.1, "初始行数必须与参考一致");
+    assert!(
+        (initial.2 - initial.3).abs() <= px(0.5),
+        "初始 Center 偏移必须与参考一致：{initial:?}"
+    );
+
+    let narrow = node_style(Some(60.0));
+    {
+        let w = app.app_mut().window_mut(window).expect("窗口存在");
+        w.tree_mut()
+            .set_style(node, narrow.clone())
+            .expect("收窄可编辑");
+        w.tree_mut().set_style(reference, narrow).expect("收窄参考");
+    }
+    app.app_mut().request_frame();
+    app.drain().expect("收窄帧");
+    let after = placeholder_alignment_metrics(&app, window, node, reference);
+    assert!(
+        after.0 > initial.0,
+        "内容宽 200→60 后 placeholder 必须重排：{initial:?} -> {after:?}"
+    );
+    assert_eq!(after.0, after.1, "收窄后行数必须与参考一致：{after:?}");
+    assert!(
+        (after.2 - after.3).abs() <= px(0.5),
+        "收窄后 Center 偏移必须与参考一致：{after:?}"
+    );
+
+    app.app_mut()
+        .text_edit_set_value(window, node, "x")
+        .expect("写入");
+    app.drain().expect("打字帧");
+    app.app_mut()
+        .text_edit_set_value(window, node, "")
+        .expect("清空");
+    app.drain().expect("清空帧");
+    let healed = placeholder_alignment_metrics(&app, window, node, reference);
+    assert_eq!(healed.0, healed.1, "打字清空后必须自愈：{healed:?}");
+    assert!(
+        (healed.2 - healed.3).abs() <= px(0.5),
+        "打字清空后偏移必须与参考一致：{healed:?}"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn placeholder_follows_a_real_window_resize() {
+    use crate::{test_support::app::TestApp, text::TextAlign};
+
+    let mut app = TestApp::with_options(WindowOptions {
+        title: smol_str::SmolStr::new_static("resize"),
+        size: LogicalSize::new(px(800.0), px(600.0)),
+        ..WindowOptions::default()
+    });
+    let window = app.window_id();
+    let placeholder = "alpha beta gamma delta epsilon zeta";
+    let mut style = TextStyle::new(px(16.0));
+    style.alignment = TextAlign::Center;
+    let mut editable = placeholder_spec_text(style.clone(), true, placeholder);
+    editable.multiline = true;
+    let mut full_width = Style::default();
+    full_width.align_self(taffy::style::AlignSelf::START);
+    full_width.width(taffy::style::Dimension::percent(1.0));
+    let node = test_editable_styled(&mut app, editable, full_width.clone(), "");
+    let reference = reference_text_node(&mut app, placeholder, style, full_width);
+    app.drain().expect("800px 帧");
+    let wide = placeholder_alignment_metrics(&app, window, node, reference);
+    assert_eq!(wide.0, wide.1, "800px 行数必须与参考一致：{wide:?}");
+
+    app.app_mut()
+        .window_mut(window)
+        .expect("窗口存在")
+        .set_size(LogicalSize::new(px(300.0), px(600.0)));
+    app.app_mut().request_frame();
+    app.drain().expect("300px 帧");
+    let narrow = placeholder_alignment_metrics(&app, window, node, reference);
+    assert_eq!(narrow.0, narrow.1, "300px 行数必须与参考一致：{narrow:?}");
+    assert!(
+        (narrow.2 - narrow.3).abs() <= px(0.5),
+        "300px Center 偏移必须与参考一致：{narrow:?}"
+    );
+    assert!(
+        narrow.0 != wide.0 || (narrow.2 - wide.2).abs() > px(0.5),
+        "窗口收窄后 placeholder 必须改变：{wide:?} -> {narrow:?}"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn stale_placeholder_line_is_repainted_after_a_redraw_request() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        placeholder_spec_text(TextStyle::new(px(16.0)), false, "abcd"),
+        200.0,
+        "",
+    );
+    app.drain().expect("预热帧");
+    {
+        let w = app.app_mut().window_mut(window).expect("窗口存在");
+        let tree = w.tree_mut();
+        let width = tree.text_layout_width(node).expect("布局宽度");
+        let existing = tree
+            .editable(node)
+            .expect("可编辑槽位")
+            .visible_placeholder_line()
+            .expect("placeholder 行")
+            .clone();
+        let mut stale = (*existing).clone();
+        stale.atlas_generation = stale.atlas_generation.wrapping_add(1);
+        tree.editable_mut(node)
+            .expect("可编辑槽位")
+            .set_placeholder_line(std::rc::Rc::new(stale), width);
+        tree.mark_paint(node);
+    }
+    app.app_mut().request_frame();
+    app.drain().expect("stale 帧");
+    assert!(
+        !lane_has_glyphs(&app, node),
+        "atlas generation 失效的 placeholder 旧 tile 不得绘制"
+    );
+
+    app.drain().expect("自愈帧");
+    assert!(
+        lane_has_glyphs(&app, node),
+        "失效守卫必须请求重绘并在下一帧重建 placeholder"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn placeholder_paint_uses_the_foreground_style_patch_when_present() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let placeholder_color = solid_color(0.0, 1.0, 0.0, 1.0);
+    let patch_color = solid_color(0.0, 0.0, 1.0, 1.0);
+    let mut editable = placeholder_spec_text(TextStyle::new(px(16.0)), false, "abcd");
+    editable.placeholder_color = placeholder_color;
+    let plain = test_editable_node(&mut app, editable, 200.0, "");
+    let patched = {
+        let w = app.app_mut().window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        NodeBuilder::editable_text(placeholder_spec_text(
+            TextStyle::new(px(16.0)),
+            false,
+            "abcd",
+        ))
+        .style(node_style(Some(200.0)))
+        .bind_style(move |_| crate::paint::style::StylePatch {
+            foreground: Some(patch_color),
+            ..crate::paint::style::StylePatch::default()
+        })
+        .build(w.tree_mut(), root)
+        .expect("带前景 patch 的可编辑文本")
+    };
+    app.drain().expect("帧");
+    assert_eq!(
+        glyph_run_color(&app, window, plain),
+        Some(placeholder_color),
+        "无 patch 时 placeholder 必须用 placeholder_color"
+    );
+    assert_eq!(
+        glyph_run_color(&app, window, patched),
+        Some(patch_color),
+        "有 foreground patch 时 placeholder 必须用 patch 颜色"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn text_edit_set_text_style_rejects_invalid_styles() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        spec(TextStyle::new(px(16.0)), false),
+        200.0,
+        "abcd",
+    );
+    app.drain().expect("预热帧");
+
+    let mut zero_size = TextStyle::new(px(0.0));
+    zero_size.color = Color::BLACK;
+    assert!(
+        matches!(
+            app.app_mut().text_edit_set_text_style(window, node, zero_size),
+            Err(EngineError::TextEditSpecInvalid { node: reported, .. }) if reported == node
+        ),
+        "size=0 必须报 TextEditSpecInvalid"
+    );
+    let mut truncating = TextStyle::new(px(16.0));
+    truncating.max_lines = 1;
+    assert!(matches!(
+        app.app_mut()
+            .text_edit_set_text_style(window, node, truncating),
+        Err(EngineError::TextEditSpecInvalid { .. })
+    ));
+    let mut zero_line_height = TextStyle::new(px(16.0));
+    zero_line_height.line_height = Some(0.0);
+    assert!(matches!(
+        app.app_mut()
+            .text_edit_set_text_style(window, node, zero_line_height),
+        Err(EngineError::TextEditSpecInvalid { .. })
+    ));
+
+    let valid = TextStyle::new(px(20.0));
+    assert!(
+        app.app_mut()
+            .text_edit_set_text_style(window, node, valid.clone())
+            .expect("合法样式")
+    );
+    assert_eq!(
+        app.app()
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .editable(node)
+            .expect("可编辑槽位")
+            .spec()
+            .text_style,
+        valid
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn disabling_ime_clears_the_managed_request_without_a_frame() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let node = test_editable_node(
+        &mut app,
+        spec(TextStyle::new(px(16.0)), false),
+        200.0,
+        "abcd",
+    );
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("聚焦帧");
+    assert!(
+        app.app()
+            .ime_cursor_area(window)
+            .expect("窗口存在")
+            .is_some()
+    );
+
+    app.app_mut().set_ime_enabled(window, false);
+    assert_eq!(
+        app.app().ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "IME 禁用必须立即清托管 request（不依赖帧/文本 pass）"
+    );
+    assert_eq!(
+        app.app()
+            .window(window)
+            .expect("窗口存在")
+            .ime_cursor_node(),
+        None
+    );
+    app.drain().expect("禁用帧");
+    assert_eq!(app.app().ime_cursor_area(window).expect("窗口存在"), None);
+
+    app.app_mut().set_ime_enabled(window, true);
+    app.drain().expect("重启帧");
+    assert!(
+        app.app()
+            .ime_cursor_area(window)
+            .expect("窗口存在")
+            .is_some(),
+        "重新启用后 IME area 必须恢复"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn hiding_a_focused_editable_clears_the_ime_cursor_area() {
+    use crate::test_support::app::TestApp;
+
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let (parent, node) = {
+        let w = app.app_mut().window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        let parent = NodeBuilder::boxed()
+            .style(node_style(None))
+            .build(w.tree_mut(), root)
+            .expect("父容器");
+        let node = NodeBuilder::editable_text(spec(TextStyle::new(px(16.0)), false))
+            .style(node_style(Some(200.0)))
+            .build(w.tree_mut(), parent)
+            .expect("可编辑文本");
+        (parent, node)
+    };
+    app.app_mut()
+        .text_edit_set_value(window, node, "abcd")
+        .expect("写入");
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.drain().expect("聚焦帧");
+    assert!(
+        app.app()
+            .ime_cursor_area(window)
+            .expect("窗口存在")
+            .is_some()
+    );
+
+    let mut hidden = Style::default();
+    hidden.display(taffy::style::Display::None);
+    app.app_mut()
+        .window_mut(window)
+        .expect("窗口存在")
+        .tree_mut()
+        .set_style(parent, hidden)
+        .expect("隐藏父容器");
+    app.app_mut().request_frame();
+    app.drain().expect("隐藏帧");
+    assert_eq!(
+        app.app().ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "聚焦但不可见的可编辑节点不得写 IME area"
+    );
+    assert_eq!(
+        app.app()
+            .window(window)
+            .expect("窗口存在")
+            .ime_cursor_node(),
+        None
+    );
+
+    app.app_mut()
+        .window_mut(window)
+        .expect("窗口存在")
+        .tree_mut()
+        .set_style(parent, node_style(None))
+        .expect("恢复显示");
+    app.app_mut().request_frame();
+    app.drain().expect("恢复帧");
+    assert!(
+        app.app()
+            .ime_cursor_area(window)
+            .expect("窗口存在")
+            .is_some(),
+        "恢复可见后 IME area 必须重新写入"
+    );
 }
