@@ -729,7 +729,7 @@ pub struct InputSpec {
 | ㉔ | 像素 golden 依赖**宿主 emoji 字体版本**：Windows 基线来自 Segoe UI Emoji（`crates/ui_core/tests/golden/warp/color_emoji_1_light.png`）。Segoe UI Emoji 无国旗字形（`🇨🇳` 渲染成两个字母/单色），Linux 全局字体栈不含 emoji 家族时部分 emoji 走单色轮廓（实测见 §11.7） | `eee0f04e` |
 | ㉕ | COLRv1 只有**单色回退**（swash 0.2.10 只读 COLR v0 记录）：Segoe UI Emoji 幸运地保留 3487 条 v0 base glyph，故 Windows 彩色可用；仅 v1 的字体退回单色并记 `ColorGlyphMonochrome` 诊断 | `eee0f04e` |
 | ㉖ | **caret 矩形按行盒归一**：parley 的 `Cursor::geometry` 返回 `min/max(block, content)` 的并集（Linux 字体下可高于行盒：20 行盒 vs 22 caret），引擎在 `inline_flow::caret_rect` 里把 caret 吸附到**所在行盒**（top = 行顶、height = `LineMetrics.line_height`），保证「行盒 / caret / 占位符 / 滚动步长 / IME 候选框」同一口径（§3.1 约束），并让 ensure-visible 的「留 1 行」在任意字体度量下可达 | P5 收尾（本篇 §11.9） |
-| ㉗ | 输入控件**整盒可点**：引擎新增 press 宿主代理（后续 ㊳ 收敛为 `NodeTree::set_press_focus_target`；press 落在该节点或其后代上时，若没有更近的焦点目标，则聚焦它承载的 editable；该节点不进入 Tab 序、不改变「点控件外失焦」语义）；`input.rs` 的 root 用它代理 padding/border，`kit::ScrollBar` 新增 `ScrollbarOptions::tab_stop(bool)`（输入框的 track/thumb 置 false，动作与拖拽不变）。恢复旧组件「整盒可点」行为，同时每个输入仍只有 editable 一个 Tab 停靠点。**P4-10 起该 API 改为显式目标 `press_focuses_editable(target)`，见 ㊳** | 终审 round 1 修复（P3-1） |
+| ㉗ | 输入控件**整盒可点**：引擎新增 press 宿主代理（后续 ㊳ 收敛为 `NodeTree::set_press_focus_target`；press 落在该节点或其后代上时，若没有更近的焦点目标，则聚焦它承载的 editable；该节点不进入 Tab 序、不改变「点控件外失焦」语义）；`input.rs` 的 root 用它代理 padding/border，`kit::ScrollBar` 新增 `ScrollbarOptions::tab_stop(bool)`（输入框的 track/thumb 置 false，动作与拖拽不变）。恢复旧组件「整盒可点」行为，同时每个输入仍只有 editable 一个 Tab 停靠点。**P4-10 起该能力改为显式目标 `NodeTree::set_press_focus_target(host, target)`（建树后回填），见 ㊳** | 终审 round 1 修复（P3-1） |
 | ㉘ | `InputState::validate` **删除**：字段错误只有单一来源——`InputNode` 镜像按引擎文本（清洗后字素簇）+ `InputSpec.max_length` 派生 `TooLong`，业务错误仍由应用层 `InputState::set_error` 注入；`validate` 在生产代码 0 消费者（§5.3 应用层校验未落地），删除避免「按镜像文本 / 按请求文本」双源语义 | 终审 round 1 修复（P4-16） |
 | ㉙ | 彩色字形图集 tile 在上传时**复制 1 纹素边缘色**（padding 语义）：straight-alpha 纹素与 `FILTER = LINEAR` 在分数设备位置/缩放下不再出现「双线性 × straight alpha」导致的边缘偏暗；`render/shaders/contract.md` 增补彩色图集的 padding/纹素语义条目，Windows WARP 的 `golden/color_emoji_1_light.png` 随实现重出 | P4-01（§11.11.3 裁决 1） |
 | ㉚ | 像素用例**缺 emoji 字体 / 无呈现后端默认硬失败**：`color_emoji_glyphs_render_in_color` 与 `golden_color_emoji` 不再「打印 skip 后 return」；只有显式置 `KYTRIX_TEST_SKIP_GPU_PIXELS=1` 才允许跳过，且必须打印可读 reason（用途、限制与更新流程见 `crates/ui_core/tests/golden/README.md`） | P4-02（裁决 2） |
@@ -783,7 +783,7 @@ App::text_edit_set_text_style(window, node, TextStyle) -> Result<bool, EngineErr
 App::set_scroll_line_height(handle, LogicalPx) -> Result<(), EngineError>
 // 错误
 EngineError::{TextEditNotAvailable{node}, TextEditSpecInvalid{node,detail}, TextEditLayout{node,detail},
-              NodeSpecInvalid{node,detail}, AtlasExhausted{kind}}
+              NodeSpecInvalid{parent,detail}, AtlasExhausted{kind}}
 // 渲染
 paint::atlas::AtlasKind::{Glyph=0, Image=1, ColorGlyph=2}、KIND_COLOR_GLYPH = 8
 ```
@@ -802,7 +802,7 @@ setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`。
 | `cargo test --workspace` | **8876 passed / 0 failed / 30 ignored**（60 测试二进制 + 41 doc-test = 101 个二进制） |
 | `cargo test -p ui_core --lib` | 2280（2279 passed + 1 ignored） |
 | `cargo test -p ui_core --lib --features test-support` | 2610（2609 passed + 1 ignored） |
-| `cargo test -p ui_core --features test-support --tests` | frame_record **8** / layout **4** / snapshot **13** / gui_smoke 1 ignored / `demo` example 39 |
+| `cargo test -p ui_core --features test-support --tests` | frame_record **8** / layout **4** / snapshot **14** / gui_smoke 1 ignored / `demo` example 39 |
 | `cargo test -p ui_kit --lib` | **748 passed** |
 | `cargo +nightly clippy --workspace --all-targets -- -D warnings` | **PASS**（0 warning / 0 error） |
 | `cargo +nightly fmt --check` | **PASS**（exit 0，无输出） |
@@ -893,7 +893,10 @@ head `cb965b56` + P5 工作区改动（含 §11.9 的四类修复）。日志：
 
 | 门禁 | 结果 |
 |---|---|
-| `cargo test --workspace` | **8923 passed / 0 failed / 30 ignored**（102 个二进制） |
+| `cargo test --workspace` | **8924 passed / 0 failed / 30 ignored**（102 个二进制） |
+| `cargo test -p ui_core --lib` / `--features test-support` | **2315 passed + 1 ignored** / **2656 passed + 1 ignored** |
+| `cargo test -p ui_core --features test-support --tests` | frame_record **8** / layout **4** / snapshot **14** / demo **39**（gui_smoke 1 ignored） |
+| `cargo test -p ui_kit --lib` / `cargo test -p settings_ui --lib` | **758 passed / 0 failed**、**236 passed / 0 failed** |
 | `cargo +nightly clippy --workspace --all-targets -- -D warnings` | **exit 0** |
 | `cargo +nightly fmt --check` | **exit 0** |
 | gallery `--idle-check` / `--theme-check` | PASS（**0 帧/3 s**；Dark→Light→Dark 0 failure） |
@@ -903,9 +906,9 @@ head `cb965b56` + P5 工作区改动（含 §11.9 的四类修复）。日志：
 | 项 | 结果 |
 |---|---|
 | `cargo +nightly fmt --check` | **PASS**（exit 0） |
-| `cargo test -p ui_core --lib` | **2097 passed / 0 failed** |
-| `cargo test -p ui_core --lib --features test-support` | **2431 passed / 0 failed** |
-| `cargo test -p ui_core --features test-support --tests` | lib 2431 / snapshot **13** 全 0 failed（frame_record/layout/demo 本机同套用例已绿，远端未单独复跑） |
+| `cargo test -p ui_core --lib` | **2098 passed / 0 failed** |
+| `cargo test -p ui_core --lib --features test-support` | **2432 passed / 0 failed** |
+| `cargo test -p ui_core --features test-support --tests` | lib 2432 / snapshot **14** 全 0 failed（frame_record/layout/demo 本机同套用例已绿，远端未单独复跑） |
 | `cargo test -p ui_kit --lib` / `cargo test -p ui_kit` | **758 passed / 0 failed**（两者一致） |
 | `cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings`（默认 + `--features test-support`） | **exit 0 / exit 0** |
 | gallery 构建 + `--idle-check` / `--theme-check` | 构建 PASS；idle **PASS（2 帧/3 s，门槛 ≤2）**；theme **PASS（0 failure）** |
@@ -916,9 +919,9 @@ head `cb965b56` + P5 工作区改动（含 §11.9 的四类修复）。日志：
 | 项 | 结果 |
 |---|---|
 | `cargo +nightly fmt --check` | **PASS** |
-| `cargo test -p ui_core --lib` | **2061 passed / 0 failed** |
-| `cargo test -p ui_core --lib --features test-support` | **2396 passed / 0 failed** |
-| `cargo test -p ui_core --features test-support --tests` | lib 2396 / snapshot **13** 全 0 failed（frame_record/layout/demo 本机同套用例已绿，远端未单独复跑） |
+| `cargo test -p ui_core --lib` | **2062 passed / 0 failed** |
+| `cargo test -p ui_core --lib --features test-support` | **2397 passed / 0 failed** |
+| `cargo test -p ui_core --features test-support --tests` | lib 2397 / snapshot **14** 全 0 failed（frame_record/layout/demo 本机同套用例已绿，远端未单独复跑） |
 | `cargo test -p ui_kit --lib` / `cargo test -p ui_kit` | **758 passed / 0 failed** |
 | `cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings`（默认 + `--features test-support`） | **exit 0 / exit 0** |
 | gallery 构建 + `--idle-check` / `--theme-check` | 构建 PASS；idle **PASS（1 帧/3 s，门槛 ≤2）**；theme **PASS（0 failure）** |
@@ -973,9 +976,9 @@ ensure-visible 的「已达」判定改为「clamp 后目标」。二者都不�
 | 项 | 结果 |
 |---|---|
 | 变异 11 项重跑（`.review/text-input/p5-mutations-r3.log`） | M1/M2/M1b/M3/M4/M5/M6/M7/M8/**M9**/M10 全部 **RED**（M9 = 新用例变红），每项 `restore identical=True`；M3 在新几何下仍 2/2 红 |
-| Windows | 见 §11.7（8923 passed / clippy 0 / fmt 0 / gallery 0 帧 + 0 failure） |
-| Ubuntu | 见 §11.7（ui_core 2097 & 2431 全绿、ui_kit 758、clippy 0、gallery idle 1 帧 + theme 0 failure） |
-| macOS | 见 §11.7（ui_core 2061 & 2396 全绿、ui_kit 758、clippy 0、gallery idle 0 帧 + theme 0 failure） |
+| Windows | 见 §11.7（8924 passed / clippy 0 / fmt 0 / gallery 0 帧 + 0 failure） |
+| Ubuntu | 见 §11.7（ui_core 2098 & 2432 全绿、ui_kit 758、clippy 0、gallery idle 1 帧 + theme 0 failure） |
+| macOS | 见 §11.7（ui_core 2062 & 2397 全绿、ui_kit 758、clippy 0、gallery idle 0 帧 + theme 0 failure） |
 
 ### 11.10 终审 round 1 修复记录（P3×3 + 廉价 P4）
 
@@ -1051,7 +1054,7 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 | a11y（§2.4） | P4-56…P4-64 | `node_for` 回落 focus 字段；`focus_ancestors` 补真实 consumer 用例；角色判定去重；`editable_action` 优先级例外成文（59，见 ㊼）；Replace 的 `?` 传播判别测试；密码扫描覆盖 custom action；删 `apply_caret` 冗余守卫与不可达 run 分支；组合期 cancel 排序判别 | `a11y.rs`、`a11y/adapter.rs`、`a11y/action.rs`、`a11y/mapping.rs`、`a11y/tree.rs`、`a11y/contract_tests.rs`、`app/text_edit_tests.rs` |
 | ui_kit（§2.5） | P4-65…P4-70 | 非法 style 不改状态；IME 回归区分 `focused_editable` 与 `focused`；`visible_lines_height` 的 `padding_y` 形参修正；placeholder 颜色断言走引擎；`update_value` 的 error 变化也 `request_repaint` | `ui_kit/src/kit/input.rs`、`app/text_edit_tests.rs` |
 | settings_ui（§2.6） | P4-71 | 失焦提交帧的下拉/表格消费点改用**新目录**（不再用提交前快照） | `settings_ui/src/pages/translation/page.rs` |
-| 文档 / 设计基线（§2.7） | P4-72、73、74、75 | 三端计数按实测回填（72：Windows 8923/0/30、Ubuntu 2097+2431、macOS 2061+2396）；`drain_events_where` 残留注记（73，见引擎设计 §1.3）；Linux 尺寸基线机理（75）与 `render/linux.rs` cfg 口径（74）写入 `CONTRIBUTING.md` | 本文 §11.7 / §11.9、`crates/ui_core/design/custom-gui-engine-design.md` §1.3、`CONTRIBUTING.md` §2/§3 |
+| 文档 / 设计基线（§2.7） | P4-72、73、74、75 | 三端计数按实测回填（72：Windows 8924/0/30、Ubuntu 2098+2432、macOS 2062+2397）；`drain_events_where` 残留注记（73，见引擎设计 §1.3）；Linux 尺寸基线机理（75）与 `render/linux.rs` cfg 口径（74）写入 `CONTRIBUTING.md` | 本文 §11.7 / §11.9、`crates/ui_core/design/custom-gui-engine-design.md` §1.3、`CONTRIBUTING.md` §2/§3 |
 
 > 批次划分（清单 §6）：1A 文档与登记 / 1B `ui_core` 测试 / 1C `ui_kit` 测试 / 2A 引擎微调 / 2B kit+settings_ui /
 > 3 渲染与彩色字形（含 golden 重建）/ 4 a11y 读面。**说明**：机械项以清单分组归纳，逐条内容不在此复制。
@@ -1114,7 +1117,7 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 
 | 项 | 状态 |
 |---|---|
-| §11.7 / §11.9 三端测试计数（P4-72） | 已按实测回填（Windows workspace 8923/0/30、lib 2314、TS 2655；Ubuntu lib 2097、TS 2431；macOS lib 2061、TS 2396） |
+| §11.7 / §11.9 三端测试计数（P4-72） | 已按实测回填（Windows workspace 8924/0/30、lib 2315、TS 2656；Ubuntu lib 2098、TS 2432；macOS lib 2062、TS 2397） |
 | `NodeTree::set_press_focus_target` 的精确落点（builder 形参 vs build 后回填） | 语义已定（宿主显式唯一目标 + 按点落 caret）；**最终形态为 build 后回填**（`node/tree.rs`），builder 带参版本未采用形态，按源码校正引擎设计 §1.3 与偏差 ㊳ |
 | 旧计数 `2062/2386/748`、`2027/2351/748` | 已在 §11.7 注明**过期**（round 2 为 `2067/2392/752`、`2032/2357/752`），不得引用 |
 

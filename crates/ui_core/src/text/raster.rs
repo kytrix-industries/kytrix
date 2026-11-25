@@ -552,7 +552,12 @@ fn collect_font_files(dir: &std::path::Path, depth: usize, out: &mut Vec<std::pa
 
 #[cfg(test)]
 pub(crate) fn gpu_pixels_exempt() -> bool {
-    std::env::var("KYTRIX_TEST_SKIP_GPU_PIXELS").is_ok_and(|value| value == "1")
+    gpu_pixels_exempt_value(std::env::var("KYTRIX_TEST_SKIP_GPU_PIXELS").ok().as_deref())
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_pixels_exempt_value(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 #[cfg(test)]
@@ -631,8 +636,8 @@ fn append_colr_v1_paint(data: &[u8], glyph: u16) -> Vec<u8> {
 mod tests {
     use super::{
         ColorGlyphCoverage, ColrCoverage, GlyphRasterizer, GlyphVariation, color_pixels,
-        probe_emoji_font, probe_font, probe_variable_font, require_color_glyph_monochrome_fixture,
-        split_subpixel_x,
+        gpu_pixels_exempt_value, probe_emoji_font, probe_font, probe_variable_font,
+        require_color_glyph_monochrome_fixture, split_subpixel_x,
     };
 
     #[test]
@@ -1281,6 +1286,16 @@ mod tests {
             "numBaseGlyphPaintRecords = u32::MAX 且表长只容纳 0 条记录时不得解析任何 base glyph（否则会迭代 43 亿次）"
         );
         assert!(!coverage.has_paint(42));
+    }
+
+    #[test]
+    fn the_pixel_exemption_requires_the_literal_one() {
+        assert!(!gpu_pixels_exempt_value(None));
+        assert!(!gpu_pixels_exempt_value(Some("")));
+        assert!(!gpu_pixels_exempt_value(Some("0")));
+        assert!(!gpu_pixels_exempt_value(Some("true")));
+        assert!(!gpu_pixels_exempt_value(Some("2")));
+        assert!(gpu_pixels_exempt_value(Some("1")));
     }
 
     #[test]

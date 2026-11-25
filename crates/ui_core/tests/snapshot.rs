@@ -90,7 +90,21 @@ fn golden_color_emoji() {
 }
 
 fn gpu_pixel_exempt() -> bool {
-    std::env::var("KYTRIX_TEST_SKIP_GPU_PIXELS").is_ok_and(|value| value == "1")
+    gpu_pixel_exempt_value(std::env::var("KYTRIX_TEST_SKIP_GPU_PIXELS").ok().as_deref())
+}
+
+fn gpu_pixel_exempt_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[test]
+fn the_pixel_exemption_requires_the_literal_one() {
+    assert!(!gpu_pixel_exempt_value(None));
+    assert!(!gpu_pixel_exempt_value(Some("")));
+    assert!(!gpu_pixel_exempt_value(Some("0")));
+    assert!(!gpu_pixel_exempt_value(Some("true")));
+    assert!(!gpu_pixel_exempt_value(Some("2")));
+    assert!(gpu_pixel_exempt_value(Some("1")));
 }
 
 fn skip_gpu_pixel_assertions(reason: &str) {

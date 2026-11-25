@@ -97,7 +97,7 @@ Linux 上也会编译 `render/linux/readback.rs`；该模块的 `ReadbackImage` 
 `dead_code`。
 
 **门禁矩阵（三端一致）**：
-- `cargo test -p ui_core`（默认 features）：必须 0 failed，且 Linux 默认 clippy 必须通过；
+- `cargo test -p ui_core`（默认 features）：必须 0 failed，且 Linux 默认 clippy 必须通过（Linux 的 GPU 并发用例需要可用 Vulkan 设备；无 ICD 时该用例硬失败，属环境缺失，按 `tests/golden/README.md` 的豁免开关显式声明）；
 - `cargo test -p ui_core --features test-support`：必须 0 failed；
 - `cargo +nightly clippy -p ui_core --all-targets -- -D warnings`：默认与 `--features test-support` 都要过。
 

@@ -61,7 +61,8 @@ golden 是 `SnapshotImage.rgba8` 的**原样**落盘：**预乘 sRGB 编码的 R
 | `metal-real/` | **按设计不建**（不比对，也不因此失败） | 是（按 metal-real 期望：Apple Color Emoji 红色旗面） |
 
 「本设备按设计没有该基线」与「本设备应有基线但文件缺失 / 本机没有 emoji 字体」是两件事：**后者默认硬失败**
-（见下一节），不得混同。Windows 的 Segoe UI Emoji **不含国旗字形**，`🇨🇳` 实际渲染成两个单色区域指示符字母 `CN`
+（见下一节），不得混同。唯一例外是 `golden_color_emoji`：它只在 `warp/` 建基线，其它设备目录没有该文件时按
+「本设备按设计不建」跳过（不置豁免也跳过），其余 14 份 golden 在所属平台目录缺文件一律硬失败。Windows 的 Segoe UI Emoji **不含国旗字形**，`🇨🇳` 实际渲染成两个单色区域指示符字母 `CN`
 ——这是系统字体能力而非引擎缺陷；`🇨🇳` 在具备国旗字形的字体（如 Noto Color Emoji）上走 `KIND_COLOR_GLYPH`。
 其余文字仍由 `rendered_text_produces_visible_glyph_pixels`（覆盖率 sanity）与 L2 的 `GlyphRun` 断言覆盖，不进 golden。
 
@@ -104,7 +105,7 @@ COLRv1-only 夹具在找不到任何单面字体文件时读本开关。只有�
 |---|---|
 | 开关 | 环境变量 `KYTRIX_TEST_SKIP_GPU_PIXELS=1`（**仅值为 `1` 时生效**，其它值（含空串）视为未设置） |
 | 用途 | 最小化容器 / CI 镜像**无 emoji 字体**、**无可用 GPU 后端**（`SnapshotError::Gpu`）等宿主能力缺失 |
-| 行为 | 打印可读 `reason`（点名缺失的字体 / 设备）后跳过断言；输出为 `skip <用例名>: <reason> (explicitly exempted by KYTRIX_TEST_SKIP_GPU_PIXELS=1)`，报告里必须能看到 |
+| 行为 | 打印可读原因后跳过断言，三种固定输出：`skip golden <case>: no render backend (explicitly exempted by KYTRIX_TEST_SKIP_GPU_PIXELS=1)`、`skip color emoji pixel assertions: <reason> (...)`、`skip COLRv1-only fixture: <reason> (...)`；报告里必须能看到 |
 | 限制 ① | **不得**在常规 CI / 开发机上默认置位 |
 | 限制 ② | **不得**用于让「基线差异 / 真回归」变绿——差异只走重基纪律逐张确认 |
 | 限制 ③ | 豁免不改变「本设备有基线就必须通过」的判定（有基线时任何豁免都无效） |
@@ -226,7 +227,7 @@ bless 掉了」—— AR2b P1-N1 的越界列（lavapipe 旧基线 `x=148,y=18..
 | Linux | 跑（Vulkan 离屏渲染器，`Renderer::with_headless`，F-150）；必须提供 lavapipe（`llvmpipe`）。**无可用 Vulkan 设备 = 硬失败**，只有 `KYTRIX_TEST_SKIP_GPU_PIXELS=1` 可显式豁免（14 份，不建 `color_emoji`） |
 | macOS | 跑（Metal 离屏渲染器，`metal-real/` 实机基线）；ssh 无呈现会话同样**默认硬失败**，同上豁免（14 份，不建 `color_emoji`） |
 
-- Windows 上的 `SnapshotError::Gpu` 是**测试失败**（设备/渲染/读回真故障），不是跳过（I10）。
+- Windows 上的 `SnapshotError::Gpu` 是**测试失败**（设备/渲染/读回真故障），不是跳过（I10）；仅在显式置位 `KYTRIX_TEST_SKIP_GPU_PIXELS=1` 时才按豁免跳过（`assert_golden` 的 `Snapshot(NoRenderer|Gpu)` 分支）。
 - Linux 上「宿主没有 Vulkan 设备」是**环境缺失而不是产品缺陷**：`snapshot_result_is_typed_per_platform`
   按平台断言错误类型（Linux 允许 `Err(Gpu)`），但**像素用例**默认硬失败，需 `KYTRIX_TEST_SKIP_GPU_PIXELS=1`
   才跳过；Linux 运行环境仍需准备 lavapipe，该路径必须真跑。
