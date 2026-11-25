@@ -539,6 +539,9 @@ nightly 的 2 条 clippy）见 §11.7/§11.8。
 
 ### 10.6 三端最终结果（P5 收尾第二轮，head cb965b56 + P5 工作区改动）
 
+> **后续计数不再回写本表**：P4 遗留清零轮（基线 `ead8cdcb`）之后三端测试计数会再次变化，最新数字与占位口径
+> 以 `.docs/text-input-redesign-design.md` §11.7 / §11.9 为准（本轮以 `TBD-数字` 占位，合并后统一回填；P4-72）。
+
 | 平台 | ui_core lib | ui_core test-support | ui_kit lib | clippy | fmt | gallery idle/theme |
 |---|---|---|---|---|---|---|
 | Windows | 2280（2279+1 ignored） | 2610（2609+1 ignored） | 748 | 0 | 0 | 0 帧 / 0 failure |

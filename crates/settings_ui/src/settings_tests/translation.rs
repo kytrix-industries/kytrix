@@ -122,6 +122,51 @@ fn blurring_the_directory_field_should_commit_what_was_typed() {
         "blurring the directory field must commit what was typed"
     );
 }
+#[test]
+fn the_frame_that_commits_a_directory_should_rebuild_the_model_state_from_it() {
+    let stored = TempDir::new().expect("the stored directory builds");
+    let chosen = TempDir::new().expect("the chosen directory builds");
+    let (mut harness, downloads, _fake) = page(config_in(stored.path()));
+    downloads
+        .force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, chosen.path().to_path_buf());
+    downloads.force_downloaded_for_test(
+        TranslationModel::HyMt218B125Bit,
+        chosen.path().to_path_buf(),
+    );
+    harness.settle(1);
+    let delete_rows = |harness: &Harness| {
+        (0..8)
+            .filter(|index| action_drawn(harness, "DELETE", *index))
+            .count()
+    };
+    assert_eq!(delete_rows(&harness), 0, "前置：存储目录里没有已下载模型");
+
+    harness.click_node("SETTINGS_AI_DIRECTORY_INPUT");
+    press_key(
+        &mut harness,
+        KeyCode::KeyA,
+        ui_core::event::Modifiers::CONTROL,
+    );
+    send_event(
+        &mut harness,
+        Event::Input(InputEvent::Text {
+            text: SmolStr::new(chosen.path().to_string_lossy()),
+            timestamp: Instant::now(),
+        }),
+    );
+    harness.settle(1);
+    let window = harness.window();
+    harness.app_mut().set_focus(window, None);
+    for frame in 0..4 {
+        harness.settle(1);
+        assert_eq!(
+            delete_rows(&harness),
+            2,
+            "失焦提交后的第 {frame} 帧，模型表必须已经按新目录渲染"
+        );
+    }
+}
+
 fn replace_directory(harness: &mut Harness, text: &str) {
     harness.click_node("SETTINGS_AI_DIRECTORY_INPUT");
     press_key(harness, KeyCode::KeyA, ui_core::event::Modifiers::CONTROL);

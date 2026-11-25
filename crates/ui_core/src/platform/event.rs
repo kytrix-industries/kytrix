@@ -576,7 +576,7 @@ mod tests {
     }
 
     fn char_event(state: &mut TranslateState, unit: u16) -> Option<PlatformEvent> {
-        char_message(state, unit, 0)
+        char_message(state, unit, 1)
     }
 
     fn char_message(state: &mut TranslateState, unit: u16, lparam: isize) -> Option<PlatformEvent> {
@@ -618,9 +618,9 @@ mod tests {
     const ALTGR_ALT_DOWN: isize = 0x2138_0001;
     const ALTGR_LETTER_DOWN: isize = 0x2010_0001;
     const ALTGR_CHAR: isize = 0x2010_0001;
-    const ALTGR_LETTER_UP: isize = 0xE010_0001;
-    const ALTGR_CTRL_UP: isize = 0xE01D_0001;
-    const ALTGR_ALT_UP: isize = 0xE038_0001;
+    const ALTGR_LETTER_UP: isize = 0xC010_0001;
+    const ALTGR_CTRL_UP: isize = 0xC01D_0001;
+    const ALTGR_ALT_UP: isize = 0xC138_0001;
 
     fn altgr_char_event(state: &mut TranslateState, unit: u16) -> Option<PlatformEvent> {
         let _ = key_message(state, WM_KEYDOWN, 0x11, ALTGR_CTRL_DOWN);
@@ -631,7 +631,7 @@ mod tests {
 
     fn altgr_release(state: &mut TranslateState) {
         let _ = key_message(state, WM_KEYUP, 0x51, ALTGR_LETTER_UP);
-        let _ = key_message(state, WM_SYSKEYUP, 0x11, ALTGR_CTRL_UP);
+        let _ = key_message(state, WM_KEYUP, 0x11, ALTGR_CTRL_UP);
         let _ = key_message(state, WM_KEYUP, 0x12, ALTGR_ALT_UP);
     }
 
@@ -790,9 +790,9 @@ mod tests {
     #[test]
     fn char_messages_merge_surrogate_pairs() {
         let mut state = TranslateState::default();
-        let high = translate(WM_CHAR, 0xD83C, 0, context(), &mut state);
-        let low = translate(WM_CHAR, 0xDF0D, 0, context(), &mut state);
-        let plain = translate(WM_CHAR, 'a' as usize, 0, context(), &mut state);
+        let high = translate(WM_CHAR, 0xD83C, 1, context(), &mut state);
+        let low = translate(WM_CHAR, 0xDF0D, 1, context(), &mut state);
+        let plain = translate(WM_CHAR, 'a' as usize, 1, context(), &mut state);
 
         assert_eq!(high, None, "高代理单独不产生文本");
         assert_eq!(
@@ -1355,7 +1355,7 @@ mod tests {
         state.ime_mut().queue_commit("🌍a", context().ticks_ms);
         for unit in "🌍a".encode_utf16() {
             assert_eq!(
-                translate(WM_CHAR, usize::from(unit), 0, context(), &mut state),
+                translate(WM_CHAR, usize::from(unit), 1, context(), &mut state),
                 None,
                 "提交后补发的 WM_CHAR 必须被抑制"
             );

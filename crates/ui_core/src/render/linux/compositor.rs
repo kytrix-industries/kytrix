@@ -8,7 +8,7 @@ use ash::vk;
 use wayland_client::protocol::wl_surface;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use super::readback::{Readback, ReadbackImage};
 use super::{
     atlas::{AtlasUploads, SharedAtlas},
@@ -222,9 +222,9 @@ pub(crate) struct GpuRenderer {
     suboptimal_rebuilds: u32,
     last_rebuild_sequence: u64,
     rebuild_abandoned: bool,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     snapshot_index: u32,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     readback: Readback,
     shared: Arc<SharedGpu>,
 }
@@ -317,9 +317,9 @@ impl GpuRenderer {
             suboptimal_rebuilds: 0,
             last_rebuild_sequence: 0,
             rebuild_abandoned: false,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             snapshot_index: 0,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             readback: Readback::new(),
             shared,
         };
@@ -583,7 +583,7 @@ impl GpuRenderer {
         self.atlas_uploads.pending(kind)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn readback(&mut self) -> Result<ReadbackImage, EngineError> {
         let command = self.commands[0];
         let image = self.persist.image;
@@ -640,7 +640,7 @@ impl GpuRenderer {
         self.readback.fetch(size)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn render_snapshot(
         &mut self,
         buffer: &crate::paint::instance::InstanceBuffer,
@@ -2591,7 +2591,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "test-support")]
     #[test]
     fn two_renderers_render_concurrently_on_one_shared_gpu() {
         use crate::{
@@ -2622,8 +2621,9 @@ mod tests {
             scene
         }
 
-        fn pixel(image: &super::ReadbackImage, width: u32, x: u32, y: u32) -> [u8; 4] {
-            let index = ((y * width + x) * 4) as usize;
+        fn pixel(image: &super::ReadbackImage, x: u32, y: u32) -> [u8; 4] {
+            assert!(x < image.width && y < image.height, "pixel ({x}, {y}) outside {}x{}", image.width, image.height);
+            let index = ((y * image.width + x) * 4) as usize;
             [
                 image.rgba8[index],
                 image.rgba8[index + 1],
@@ -2664,8 +2664,8 @@ mod tests {
                 let image = renderer
                     .render_snapshot(buffer)
                     .expect("concurrent snapshot");
-                assert_eq!(pixel(&image, 8, 3, 3), [255, 0, 0, 255]);
-                assert_eq!(pixel(&image, 8, 0, 0), [0, 0, 0, 0]);
+                assert_eq!(pixel(&image, 3, 3), [255, 0, 0, 255]);
+                assert_eq!(pixel(&image, 0, 0), [0, 0, 0, 0]);
             }));
         }
         for thread in threads {

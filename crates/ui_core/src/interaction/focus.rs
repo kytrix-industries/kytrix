@@ -77,20 +77,6 @@ pub(crate) fn editable_focusable(tree: &NodeTree, node: NodeId) -> bool {
     })
 }
 
-fn hosted_editable(tree: &NodeTree, host: NodeId) -> Option<NodeId> {
-    let mut stack = vec![host];
-    while let Some(node) = stack.pop() {
-        if editable_focusable(tree, node) {
-            return Some(node);
-        }
-        let Ok(target) = tree.get(node) else {
-            continue;
-        };
-        stack.extend(target.children().iter().rev().copied());
-    }
-    None
-}
-
 #[must_use]
 pub(crate) fn nearest_focusable(tree: &NodeTree, from: NodeId) -> Option<NodeId> {
     let mut cursor = Some(from);
@@ -98,12 +84,13 @@ pub(crate) fn nearest_focusable(tree: &NodeTree, from: NodeId) -> Option<NodeId>
         if focusable(tree, node) {
             return Some(node);
         }
-        if tree
+        if let Some(target) = tree
             .get(node)
-            .is_ok_and(|target| target.press_focuses_editable())
-            && let Some(editable) = hosted_editable(tree, node)
+            .ok()
+            .and_then(|target| target.press_focus_target())
+            && editable_focusable(tree, target)
         {
-            return Some(editable);
+            return Some(target);
         }
         cursor = tree.get(node).ok().and_then(|target| target.parent());
     }
@@ -359,7 +346,7 @@ mod tests {
 
     fn editable(tree: &mut NodeTree, parent: NodeId, disabled: bool) -> NodeId {
         use crate::{a11y::A11yRole, math::px, paint::color::Color, text::TextStyle};
-        NodeBuilder::editable_text(crate::text_edit::EditableSpec {
+        let editable = NodeBuilder::editable_text(crate::text_edit::EditableSpec {
             role: A11yRole::TextInput,
             label: smol_str::SmolStr::new_static(""),
             placeholder: smol_str::SmolStr::new_static(""),
@@ -376,26 +363,28 @@ mod tests {
             composition_color: Color::BLACK,
         })
         .build(tree, parent)
-        .expect("mount editable")
+        .expect("mount editable");
+        tree.set_style_patch_for_test(
+            editable,
+            StylePatch {
+                interactive: Some(!disabled),
+                ..StylePatch::default()
+            },
+        );
+        editable
     }
 
     #[test]
-    fn a_press_host_focuses_its_editable_without_joining_the_tab_order() {
+    fn a_press_host_focuses_its_explicit_target_without_joining_the_tab_order() {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let shell = NodeBuilder::boxed()
             .tab_stop(false)
-            .press_focuses_editable()
             .build(&mut tree, root)
             .expect("mount shell");
         let editable = editable(&mut tree, shell, false);
-        tree.set_style_patch_for_test(
-            editable,
-            StylePatch {
-                interactive: Some(true),
-                ..StylePatch::default()
-            },
-        );
+        tree.set_press_focus_target(shell, editable)
+            .expect("press host");
         let outside = NodeBuilder::boxed()
             .on_click(Action::custom("outside"))
             .build(&mut tree, root)
@@ -404,7 +393,7 @@ mod tests {
         assert_eq!(
             nearest_focusable(&tree, shell),
             Some(editable),
-            "按在控件外壳上必须把焦点交给它承载的 editable"
+            "按在控件外壳上必须把焦点交给它显式指定的 editable"
         );
         assert!(
             !focusable(&tree, shell),
@@ -427,7 +416,28 @@ mod tests {
     }
 
     #[test]
-    fn a_press_host_without_a_focusable_editable_falls_through_to_its_ancestors() {
+    fn a_press_host_focuses_only_the_explicit_target_among_many_editables() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let shell = NodeBuilder::boxed()
+            .tab_stop(false)
+            .build(&mut tree, root)
+            .expect("mount shell");
+        let first = editable(&mut tree, shell, false);
+        let second = editable(&mut tree, shell, false);
+        tree.set_press_focus_target(shell, second)
+            .expect("press host");
+
+        assert!(!focusable(&tree, shell), "外壳仍不是焦点节点");
+        assert_eq!(
+            nearest_focusable(&tree, shell),
+            Some(second),
+            "多个可编辑节点时必须命中显式目标，而不是 DFS 第一个（{first:?}）"
+        );
+    }
+
+    #[test]
+    fn a_press_host_without_a_focusable_target_falls_through_to_its_ancestors() {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let button = NodeBuilder::boxed()
@@ -436,15 +446,69 @@ mod tests {
             .expect("mount button");
         let shell = NodeBuilder::boxed()
             .tab_stop(false)
-            .press_focuses_editable()
             .build(&mut tree, button)
             .expect("mount shell");
-        let _disabled = editable(&mut tree, shell, true);
+        let disabled = editable(&mut tree, shell, true);
+        tree.set_press_focus_target(shell, disabled)
+            .expect("press host");
 
         assert_eq!(
             nearest_focusable(&tree, shell),
             Some(button),
-            "禁用的 editable 不能被代理聚焦，回落到祖先焦点目标"
+            "禁用的显式目标不能被代理聚焦，回落到祖先焦点目标"
+        );
+    }
+
+    #[test]
+    fn a_hidden_press_target_falls_through_to_its_ancestors() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let button = NodeBuilder::boxed()
+            .on_click(Action::custom("outer"))
+            .build(&mut tree, root)
+            .expect("mount button");
+        let shell = NodeBuilder::boxed()
+            .tab_stop(false)
+            .build(&mut tree, button)
+            .expect("mount shell");
+        let hidden_parent = NodeBuilder::boxed().build(&mut tree, shell).expect("mount");
+        let hidden = editable(&mut tree, hidden_parent, false);
+        tree.set_style_patch_for_test(
+            hidden_parent,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        tree.set_press_focus_target(shell, hidden)
+            .expect("press host");
+
+        assert_eq!(
+            nearest_focusable(&tree, shell),
+            Some(button),
+            "不可见的显式目标不能被代理聚焦，回落到祖先焦点目标"
+        );
+    }
+
+    #[test]
+    fn unknown_press_targets_are_rejected() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let shell = NodeBuilder::boxed()
+            .tab_stop(false)
+            .build(&mut tree, root)
+            .expect("mount shell");
+        let target = plain(&mut tree, shell);
+        tree.remove(target).expect("remove");
+
+        assert!(
+            tree.set_press_focus_target(shell, target).is_err(),
+            "目标节点失效必须拒绝登记"
+        );
+        assert_eq!(
+            nearest_focusable(&tree, shell),
+            None,
+            "失败登记后外壳仍不是焦点节点"
         );
     }
 

@@ -280,7 +280,7 @@ pub fn build(
                     f32::from(lines.max(1)),
                     fallback_line,
                     border_width,
-                    padding_y,
+                    padding_x,
                 ));
             }
             None => {
@@ -302,7 +302,6 @@ pub fn build(
         .paint(root_paint)
         .id(format_smolstr!("{name}.root"))
         .tab_stop(false)
-        .press_focuses_editable()
         .bind_style(move |cx| {
             let state = cx.read(&style_state);
             let colors = style_theme.components(cx).input;
@@ -419,6 +418,8 @@ pub fn build(
         })
         .build(tree, viewport)
         .expect("input: editable text mounts under the fresh viewport");
+    tree.set_press_focus_target(root, editable)
+        .expect("input: the press host targets the editable it just built");
 
     InputNode {
         root,
@@ -492,9 +493,11 @@ impl InputNode {
         let Ok(changed) = app.text_edit_set_value(window, self.editable, value) else {
             return false;
         };
-        self.refresh_mirror(app, window, self.too_long_error(value));
+        let mirrored = self.refresh_mirror(app, window, self.too_long_error(value));
         if changed {
             self.reset_horizontal_scroll(app);
+        }
+        if changed || mirrored {
             let _ = app.request_repaint(window);
         }
         changed
@@ -624,11 +627,11 @@ impl InputNode {
         changed
     }
 
-    fn refresh_mirror(&self, app: &mut App, window: WindowId, error: Option<InputError>) {
+    fn refresh_mirror(&self, app: &mut App, window: WindowId, error: Option<InputError>) -> bool {
         let Ok(snapshot) = app.text_edit_snapshot(window, self.editable) else {
-            return;
+            return false;
         };
-        app.write(&self.state, InputState::mirrored(&snapshot, error));
+        app.write(&self.state, InputState::mirrored(&snapshot, error))
     }
 
     fn too_long_error(&self, text: &str) -> Option<InputError> {
@@ -920,9 +923,9 @@ fn visible_lines_height(
     lines: f32,
     line_height: LogicalPx,
     border: LogicalPx,
-    padding: LogicalPx,
+    padding_x: LogicalPx,
 ) -> LogicalPx {
-    px(lines * line_height.value() + 2.0 * (border.value() + padding.value()))
+    px(lines * line_height.value() + 2.0 * (border.value() + padding_x.value()))
 }
 
 fn editable_role(spec: &InputSpec) -> A11yRole {
@@ -1513,6 +1516,7 @@ mod tests {
         assert!(harness.app.app().ime_enabled(harness.window()));
         let ime_area = harness.ime_cursor_area();
         assert!(ime_area.is_some(), "聚焦后可编辑节点必须交付 IME 光标矩形");
+        let caret = harness.state().caret();
         let settled = harness.frame_index();
 
         harness.click_point(border);
@@ -1532,9 +1536,20 @@ mod tests {
             "边框点击不得重开/清空 IME 光标矩形"
         );
         assert_eq!(
-            harness.frame_index(),
-            settled,
-            "无状态变化的控件点击不得产生额外帧"
+            harness.state().caret(),
+            caret,
+            "边框点击按点落 caret：与上一落点相同则不改变光标位置"
+        );
+        assert_eq!(
+            harness.frame_index().get(),
+            settled.get() + 1,
+            "边框点击只允许一次落点重绘（blur→focus 的中间态会多排帧）"
+        );
+        harness.app.drain().expect("稳定帧");
+        assert_eq!(
+            harness.frame_index().get(),
+            settled.get() + 1,
+            "边框点击后必须回到静止，不得持续出帧"
         );
 
         let editable = harness.editable_bounds();
@@ -1555,6 +1570,30 @@ mod tests {
         ));
         assert_eq!(harness.focused(), None, "点击控件外必须照旧失焦");
         assert_eq!(hits.get(), 1, "真正的失焦只提交一次");
+    }
+
+    #[test]
+    fn pressing_the_control_chrome_lands_the_caret_at_the_pressed_point() {
+        let mut harness = harness(spec(), "abcdef");
+        harness.drain();
+        harness.focus();
+        assert_eq!(harness.state().caret(), 6, "前置：caret 在文本末尾");
+        let root = harness.root_bounds();
+        let point = LogicalPoint::new(
+            root.origin.x + px(3.0),
+            root.origin.y + root.size.height * 0.5,
+        );
+        harness.click_point(point);
+        assert_eq!(
+            harness.focused(),
+            Some(harness.node.editable),
+            "点击内边距必须让 editable 获得焦点"
+        );
+        assert_eq!(
+            harness.state().caret(),
+            0,
+            "按点落 caret：左侧内边距落在文本起点"
+        );
     }
 
     #[test]
@@ -2394,15 +2433,36 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholder_signal_is_exposed_for_dynamic_copy() {
-        let harness = harness(spec(), "");
+    fn the_placeholder_signal_the_caller_holds_reaches_the_engine() {
+        let mut harness = harness(spec(), "");
+        harness.drain();
         assert_eq!(
-            harness.app.app().read(&harness.placeholder).as_str(),
+            harness.a11y_node().placeholder.as_deref(),
+            Some("请输入"),
+            "前置：初始占位已经到达引擎"
+        );
+        let external = SmolStr::new_static("宿主写入的占位");
+        assert!(
+            harness
+                .app
+                .app_mut()
+                .write(&harness.placeholder, external.clone()),
+            "宿主持有的是同一个 placeholder 信号"
+        );
+        harness.drain();
+        assert_eq!(
+            harness.a11y_node().placeholder.as_deref(),
+            Some(external.as_str()),
+            "宿主直接写 placeholder 信号后，下一帧必须到达引擎"
+        );
+        assert_eq!(
             harness
                 .app
                 .app()
                 .read(&harness.node.placeholder_state)
-                .as_str()
+                .as_str(),
+            external.as_str(),
+            "kit 镜像的正是宿主写入的那个信号"
         );
     }
 
@@ -2526,6 +2586,49 @@ mod tests {
             over.state().error(),
             Some(&InputError::TooLong { max: 2 }),
             "a cleaned line over the limit reports TooLong"
+        );
+    }
+
+    #[test]
+    fn an_error_only_update_value_requests_a_frame() {
+        let mut harness = harness(max_spec(3), "");
+        harness.drain();
+        harness.drain();
+        assert!(harness.node.update_value(harness.app.app_mut(), "abc"));
+        harness.drain();
+        harness.drain();
+        assert_eq!(harness.state().error(), None, "前置：三个字符正好在上限内");
+        let idle = harness.frame_index();
+
+        assert!(
+            !harness.node.update_value(harness.app.app_mut(), "abcd"),
+            "引擎文本已被截成上限，不算改变"
+        );
+        assert_eq!(
+            harness.state().error(),
+            Some(&InputError::TooLong { max: 3 }),
+            "只有错误态变化"
+        );
+        let mut frames = 0;
+        for _ in 0..3 {
+            harness.app.drain().expect("帧");
+            frames = harness.frame_index().get() - idle.get();
+            if frames > 0 {
+                break;
+            }
+        }
+        assert_eq!(frames, 1, "只改错误态也必须恰排一帧");
+        let rejected = {
+            let light = harness.theme.theme_for(Appearance::Light);
+            resolved(light.role(Role::StatusDangerBorder))
+        };
+        assert_eq!(
+            harness
+                .style_patch(harness.node.root)
+                .border
+                .map(|border| resolved(border.color)),
+            Some(rejected),
+            "错误边框必须在同一帧到达控件"
         );
     }
 
@@ -2702,6 +2805,60 @@ mod tests {
     }
 
     #[test]
+    fn moving_the_focus_to_a_focusable_non_editable_node_turns_the_ime_off() {
+        let mut harness = harness(spec(), "abc");
+        harness.focus();
+        let window = harness.window();
+        assert!(
+            harness.app.app().ime_enabled(window),
+            "前置：可编辑节点上的焦点打开了 IME"
+        );
+        assert!(harness.ime_cursor_area().is_some());
+        let root = harness
+            .app
+            .app()
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .root();
+        let button = NodeBuilder::boxed()
+            .on_click(Action::custom("test.ime.non-editable"))
+            .build(
+                harness
+                    .app
+                    .app_mut()
+                    .window_mut(window)
+                    .expect("窗口存在")
+                    .tree_mut(),
+                root,
+            )
+            .expect("可聚焦按钮");
+        assert!(
+            harness.app.app_mut().set_focus(window, Some(button)),
+            "非可编辑但可聚焦的节点可以拿走焦点"
+        );
+        harness.drain();
+        assert_eq!(harness.focused(), Some(button), "焦点落在非可编辑节点上");
+        assert!(
+            !harness.app.app().ime_enabled(window),
+            "焦点移到可聚焦但非可编辑节点必须关闭窗口 IME"
+        );
+        assert_eq!(harness.ime_cursor_area(), None, "失焦必须清掉 IME 光标矩形");
+
+        assert!(
+            harness
+                .app
+                .app_mut()
+                .set_focus(window, Some(harness.node.editable))
+        );
+        harness.drain();
+        assert!(
+            harness.app.app().ime_enabled(window),
+            "焦点回到可编辑节点必须重新打开 IME"
+        );
+    }
+
+    #[test]
     fn releasing_a_disabled_input_reports_nothing_to_release() {
         let mut harness = harness(
             InputSpec {
@@ -2849,6 +3006,77 @@ mod tests {
             bar.opacity(harness.app.app()) >= 0.99,
             "hover 时淡入到 1.0，实际 {}",
             bar.opacity(harness.app.app())
+        );
+    }
+
+    #[test]
+    fn a_one_line_field_keeps_its_overlay_thumb_draggable() {
+        let content = (0..40)
+            .map(|line| format!("line{line}\n"))
+            .collect::<String>();
+        let mut harness = harness(multiline_spec(Some(1)), content.as_str());
+        harness.drain();
+        harness.drain();
+        let bar = harness
+            .node
+            .scrollbar
+            .borrow()
+            .clone()
+            .expect("多行溢出时存在滚动条");
+        assert!(bar.scrollable(harness.app.app()), "前置：内容远超一行");
+        let (track_node, _) = bar.nodes();
+        let track = node_bounds(&harness, track_node.expect("轨道"));
+        assert!(
+            track.size.height.value() < 24.0,
+            "前置：visible_lines=1 的极短轨道，实际 {}",
+            track.size.height.value()
+        );
+        let thumb = bar.thumb_rect(harness.app.app()).expect("thumb");
+        assert!(
+            thumb.size.height >= px(2.0),
+            "极短轨道的最小滑块不得塌成零高度：{}",
+            thumb.size.height.value()
+        );
+        assert!(
+            track.size.height - thumb.size.height >= px(2.0),
+            "极短轨道必须留下拖拽行程：track {} thumb {}",
+            track.size.height.value(),
+            thumb.size.height.value()
+        );
+
+        let handle = vertical_handle(&harness);
+        let origin = LogicalPoint::new(
+            track.origin.x + track.size.width * 0.5,
+            track.origin.y + thumb.origin.y + thumb.size.height * 0.5,
+        );
+        let _ = harness.app.inject(InputEvent::pointer_down(
+            origin,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let promoted = LogicalPoint::new(origin.x, origin.y + 10.0);
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(promoted, Modifiers::empty()));
+        let moved = LogicalPoint::new(origin.x, origin.y + 20.0);
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(moved, Modifiers::empty()));
+        let _ = harness.app.inject(InputEvent::pointer_up(
+            moved,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let offset = harness
+            .app
+            .app()
+            .scroll_state(&handle)
+            .expect("滚动状态")
+            .offset
+            .y;
+        assert!(
+            offset > px(0.0),
+            "拖拽 visible_lines=1 的滑块必须改变滚动偏移：{offset}"
         );
     }
 

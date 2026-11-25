@@ -677,3 +677,18 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 > 口径说明：`--idle-check` **不聚焦**任何输入框；有焦点时的闪烁节奏（每 530 ms 一帧）由引擎测试
 > `a_focused_caret_renders_one_frame_per_half_period` 与 gallery `--probe` 的 `next_wake` 承担，
 > 不计入 idle 帧数。
+
+### 12.5 输入框手动验收清单（真实桌面会话；P4-17 的载体）
+
+`--probe` / `--idle-check` / `--theme-check` 只覆盖几何、帧数与配色；以下**平台输入语义**必须在真实窗口里
+人工过一遍（每项一行，回归时逐条打勾）。这是 P4-17「P0 手动验收清单缺 AltGr / Alt+numpad」的落点。
+
+| # | 操作 | 期望 |
+|---|---|---|
+| 1 | 键盘布局切到 AltGr 布局（波兰语 / 德语），`AltGr` + 字母 | 字符进入输入框（AltGr 例外放行，§11.2 ⑤） |
+| 2 | `Alt` + 小键盘数字 | **不输入**正文（单按 Alt 仍按命令修饰键拒绝；已登记为事件层采样口径，P4-76） |
+| 3 | 单行 readonly 输入框：Enter / Ctrl+Enter | **不派发 submit**、文本不变（P4-04 / §11.2 ㉜） |
+| 4 | 多行 readonly 输入框：Enter | 不插入换行（同上） |
+| 5 | Backspace / Ctrl+V / Ctrl+A / Esc | 只删 1 个字素、粘贴后无方块、无 `0x01`/`0x1B` 混入（四个实机 BUG 的第 ④ 条） |
+| 6 | 点击输入框 padding / border / 滚动条 gutter | 焦点不丢（整盒可点，§11.2 ㉗）；caret 落在**点击处**（P4-10 / ㊳） |
+| 7 | IME 候选窗（中文输入） | 候选窗贴在 caret 行盒位置；输入框不可见（`opacity=0`/零尺寸/被裁剪）时不定位（㉟） |

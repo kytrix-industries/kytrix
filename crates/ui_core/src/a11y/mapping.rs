@@ -247,14 +247,14 @@ fn is_text_run_in_input(tree: &NodeTree, node: NodeId) -> bool {
         return false;
     };
     let slot = tree.a11y_of(parent);
-    let role = slot
-        .and_then(|slot| slot.patch.role)
-        .or_else(|| slot.and_then(|slot| slot.over.as_ref().and_then(|over| over.role)))
-        .unwrap_or_else(|| role_by_kind(tree, parent, parent_node));
-    matches!(
-        role,
-        A11yRole::TextInput | A11yRole::MultilineTextInput | A11yRole::PasswordInput
-    )
+    let role = effective_role(
+        tree,
+        parent,
+        parent_node,
+        slot.and_then(|slot| slot.over.as_ref()),
+        slot.map(|slot| &slot.patch),
+    );
+    is_text_input_role(role)
 }
 
 pub(crate) fn effective_role(
@@ -430,7 +430,7 @@ pub(crate) fn effective_role_of(tree: &NodeTree, node: NodeId) -> A11yRole {
     )
 }
 
-fn is_text_input_role(role: A11yRole) -> bool {
+pub(crate) fn is_text_input_role(role: A11yRole) -> bool {
     matches!(
         role,
         A11yRole::TextInput | A11yRole::MultilineTextInput | A11yRole::PasswordInput

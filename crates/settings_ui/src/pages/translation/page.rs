@@ -476,13 +476,6 @@ impl PageView for TranslationPage {
 
         let theme = self.host.theme_handle();
         let translate = self.host.translate().clone();
-        let (directory, site, selected) = self.host.config(app, |config| {
-            (
-                config.translation.model_directory.clone(),
-                config.translation.download_site,
-                config.translation.selected_model,
-            )
-        });
 
         if let Some(input) = &self.directory {
             changed |= input.sync(app);
@@ -504,6 +497,14 @@ impl PageView for TranslationPage {
                 changed |= input.update_value(app, stored.as_str());
             }
         }
+
+        let (directory, site, selected) = self.host.config(app, |config| {
+            (
+                config.translation.model_directory.clone(),
+                config.translation.download_site,
+                config.translation.selected_model,
+            )
+        });
 
         if let Some(select) = &self.site {
             let chosen = select.chosen(app);

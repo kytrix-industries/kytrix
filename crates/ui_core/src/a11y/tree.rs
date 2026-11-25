@@ -8,6 +8,7 @@ use crate::{
         mapping::{
             a11y_disabled, a11y_read_only, bounds_of, effective_actions, effective_description,
             effective_label, effective_role, effective_value, is_decorative_image, is_hidden,
+            is_text_input_role,
         },
         textrun,
     },
@@ -136,28 +137,27 @@ pub(crate) fn node_a11y_records_with_cache(
         diagnostics.push(A11yDiagnostic::MissingAltText { node, kind });
     }
     if label.is_none()
-        && value.is_none()
-        && matches!(
-            role,
-            A11yRole::Button
-                | A11yRole::TextInput
-                | A11yRole::MultilineTextInput
-                | A11yRole::CheckBox
-                | A11yRole::Switch
-                | A11yRole::RadioButton
-                | A11yRole::Slider
-                | A11yRole::MenuItem
-                | A11yRole::MenuItemCheckBox
-                | A11yRole::MenuItemRadio
-                | A11yRole::ListBoxOption
-                | A11yRole::ScrollBar
-                | A11yRole::Menu
-                | A11yRole::MenuBar
-                | A11yRole::ComboBox
-                | A11yRole::ListBox
-                | A11yRole::ColorWell
-                | A11yRole::Tooltip
-        )
+        && (is_text_input_role(role)
+            || (value.is_none()
+                && matches!(
+                    role,
+                    A11yRole::Button
+                        | A11yRole::CheckBox
+                        | A11yRole::Switch
+                        | A11yRole::RadioButton
+                        | A11yRole::Slider
+                        | A11yRole::MenuItem
+                        | A11yRole::MenuItemCheckBox
+                        | A11yRole::MenuItemRadio
+                        | A11yRole::ListBoxOption
+                        | A11yRole::ScrollBar
+                        | A11yRole::Menu
+                        | A11yRole::MenuBar
+                        | A11yRole::ComboBox
+                        | A11yRole::ListBox
+                        | A11yRole::ColorWell
+                        | A11yRole::Tooltip
+                )))
     {
         diagnostics.push(A11yDiagnostic::MissingLabel { node });
     }
@@ -176,10 +176,7 @@ pub(crate) fn node_a11y_records_with_cache(
         }
     }
 
-    let editable = matches!(
-        role,
-        A11yRole::TextInput | A11yRole::MultilineTextInput | A11yRole::PasswordInput
-    ) && tree.editable(node).is_some();
+    let editable = is_text_input_role(role) && tree.editable(node).is_some();
     let text_metrics = match role {
         A11yRole::Label | A11yRole::TextRun => value.as_deref().and_then(textrun::text_metrics),
         _ => None,

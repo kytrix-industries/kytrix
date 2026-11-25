@@ -1140,7 +1140,7 @@ impl App {
         &mut self,
         handle: &ScrollHandle,
         line_height: LogicalPx,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<(), EngineError> {
         scroll::set_scroll_line_height(self, handle, line_height)
     }
 
@@ -1908,6 +1908,11 @@ impl App {
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn shape_count_for_test(&self) -> u32 {
         self.text.shape_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consumed_key_window_count_for_test(&self) -> usize {
+        self.consumed_keys.len()
     }
 
     #[must_use]

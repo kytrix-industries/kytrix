@@ -382,9 +382,6 @@ impl A11yBridge {
                 self.queued.remove(ancestor);
                 apply_caret(&mut record.node, caret);
                 focus_ancestors.push(record.node);
-                if let Some(run) = record.text_run {
-                    nodes.push(run);
-                }
             }
         }
 
@@ -503,7 +500,6 @@ fn apply_caret(record: &mut A11yNode, caret: Option<(NodeId, usize)>) {
         || record.text_selection.is_some()
         || record.character_lengths.is_empty()
         || record.role != A11yRole::TextRun
-        || record.text_run.is_some()
     {
         return;
     }
@@ -1094,8 +1090,21 @@ mod tests {
         );
         let snapshot = take(&mut bridge, &mut tree, Some(never_delivered)).expect("焦点笔");
         assert!(
-            snapshot.node_for(never_delivered).is_none(),
+            snapshot
+                .nodes
+                .iter()
+                .all(|record| record.engine != never_delivered),
             "本批仍在推进首树前缀，焦点节点不在 nodes 里"
+        );
+        assert_eq!(
+            snapshot.node_for(never_delivered).map(|record| record.id),
+            Some(snapshot.focus_node.id),
+            "焦点回退交付的引擎节点必须能通过 node_for 查到（与 id_for_engine 同口径）"
+        );
+        assert_eq!(
+            snapshot.id_for_engine(never_delivered),
+            Some(snapshot.focus_node.id),
+            "焦点回退的 id_for_engine 必须与 node_for 一致"
         );
 
         let update = to_tree_update(&snapshot);
@@ -1142,7 +1151,7 @@ mod tests {
 
         let snapshot = take(&mut bridge, &mut tree, Some(focus)).expect("焦点笔");
         assert!(
-            snapshot.node_for(focus).is_none(),
+            snapshot.nodes.iter().all(|record| record.engine != focus),
             "前置条件：焦点节点不在本批 nodes 里"
         );
         assert!(
@@ -1235,7 +1244,7 @@ mod tests {
 
         let snapshot = take(&mut bridge, &mut tree, Some(focus)).expect("焦点笔");
         assert!(
-            snapshot.node_for(focus).is_none(),
+            snapshot.nodes.iter().all(|record| record.engine != focus),
             "前置条件：焦点节点不在本批 nodes 里"
         );
         assert_eq!(
@@ -2206,8 +2215,13 @@ mod tests {
 
         let second = take(&mut bridge, &mut tree, Some(input)).expect("焦点笔");
         assert!(
-            second.node_for(input).is_none(),
+            second.nodes.iter().all(|record| record.engine != input),
             "焦点笔仍在推进首笔前缀，输入只走 focus 回退"
+        );
+        assert_eq!(
+            second.node_for(input).map(|record| record.id),
+            Some(second.focus_node.id),
+            "focus 回退交付的输入必须能通过 node_for 查到"
         );
         let record = &second.focus_node;
         assert_eq!(record.engine, input, "焦点回退必须交付可编辑输入");
@@ -2233,6 +2247,69 @@ mod tests {
         assert_eq!(
             consumer(state, run.id).data().character_lengths(),
             &[3, 4, 1, 1]
+        );
+    }
+
+    #[test]
+    fn a_focus_target_with_a_deep_parent_chain_is_delivered_to_the_real_consumer() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut rows = Vec::with_capacity(6000);
+        for _ in 0..6000 {
+            rows.push(NodeBuilder::boxed().build(&mut tree, root).expect("row"));
+        }
+        let grandparent = rows[5999];
+        let parent = NodeBuilder::boxed()
+            .build(&mut tree, grandparent)
+            .expect("parent");
+        let focus = NodeBuilder::boxed()
+            .build(&mut tree, parent)
+            .expect("focus");
+
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        let mut consumer_tree = accesskit_consumer::Tree::new(to_tree_update(&first), true);
+
+        let snapshot = take(&mut bridge, &mut tree, Some(focus)).expect("焦点笔");
+        assert!(
+            snapshot.nodes.iter().all(|record| record.engine != focus),
+            "前置条件：焦点节点不在本批 nodes 里"
+        );
+        assert!(
+            !snapshot.focus_ancestors.is_empty(),
+            "前置条件：焦点父链不在本批，必须走 focus_ancestors 分支"
+        );
+        let update = to_tree_update(&snapshot);
+        for ancestor in &snapshot.focus_ancestors {
+            assert!(
+                update
+                    .nodes
+                    .iter()
+                    .any(|(id, _)| *id == AkNodeId(ancestor.id.get())),
+                "focus_ancestors 的祖先必须与焦点同笔交付：{ancestor:?}"
+            );
+        }
+        consumer_tree.update_and_process_changes(update, &mut NoopChangeHandler);
+        let state = consumer_tree.state();
+        let focus_node = consumer(state, snapshot.focus);
+        assert_eq!(
+            state.focus().expect("焦点必须可解析").id(),
+            focus_node.id(),
+            "焦点必须解析到本笔交付的焦点记录"
+        );
+        let parent_id = focus_node.parent().expect("焦点节点必须有父").id();
+        assert!(
+            snapshot
+                .focus_ancestors
+                .iter()
+                .any(|record| consumer(state, record.id).id() == parent_id),
+            "焦点的父必须是 focus_ancestors 之一：{:?}",
+            snapshot.focus_ancestors
+        );
+        assert_eq!(
+            focus_node.role(),
+            accesskit::Role::GenericContainer,
+            "焦点记录必须是引擎节点的推导角色"
         );
     }
 

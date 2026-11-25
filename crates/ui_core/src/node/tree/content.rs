@@ -198,6 +198,7 @@ pub(crate) fn set_text_shaped(
             slot.line = None;
             slot.laid_width_bits = 0;
             slot.laid_generation = 0;
+            slot.stale_request = None;
         }
         None => {
             if let Some(slot) = tree.text_slots.get_mut(index) {
@@ -208,6 +209,7 @@ pub(crate) fn set_text_shaped(
                     line: None,
                     laid_width_bits: 0,
                     laid_generation: 0,
+                    stale_request: None,
                 });
             }
         }
@@ -443,6 +445,22 @@ pub(crate) fn invalidate_text_line(tree: &mut NodeTree, node: NodeId) {
     }
     tree.mark_text_layout_dirty(node);
     tree.mark_paint(node);
+}
+
+pub(crate) fn request_text_line_relayout(
+    tree: &mut NodeTree,
+    node: NodeId,
+    atlas_generations: (u32, u32),
+) -> bool {
+    let index = node.index() as usize;
+    let Some(slot) = tree.text_slots.get_mut(index).and_then(Option::as_mut) else {
+        return false;
+    };
+    if slot.stale_request == Some(atlas_generations) {
+        return false;
+    }
+    slot.stale_request = Some(atlas_generations);
+    true
 }
 
 pub(crate) fn invalidate_text_layout(tree: &mut NodeTree, node: NodeId) -> bool {
@@ -1040,6 +1058,7 @@ pub(crate) struct TextSlot {
     line: Option<Rc<ShapedLine>>,
     laid_width_bits: u32,
     laid_generation: u32,
+    stale_request: Option<(u32, u32)>,
 }
 
 impl TextSlot {

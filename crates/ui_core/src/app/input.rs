@@ -290,10 +290,40 @@ pub(crate) fn on_pointer_down(
         return true;
     }
     if button.is_primary() {
-        let focus_target = app.windows.get(&window).and_then(|target| {
-            hit.and_then(|result| focus::nearest_focusable(target.tree(), result.node))
+        let press_target = app.windows.get(&window).and_then(|target| {
+            let result = hit?;
+            let tree = target.tree();
+            let focus_target = focus::nearest_focusable(tree, result.node)?;
+            let text_target = (tree.editable(focus_target).is_some()
+                && tree.is_ancestor(result.node, focus_target))
+            .then_some(focus_target);
+            Some((focus_target, text_target))
         });
-        app.set_focus(window, focus_target);
+        app.set_focus(window, press_target.map(|(focus_target, _)| focus_target));
+        if let Some(text_target) = press_target.and_then(|(_, text_target)| text_target) {
+            let count = if modifiers.is_empty() {
+                app.click_count(window, text_target, position, button, timestamp)
+            } else {
+                1
+            };
+            outcome.click_count = count;
+            let local_point = app.windows.get(&window).and_then(|target| {
+                crate::text_edit::text_node_local_point(target.tree(), text_target, position)
+            });
+            if let Some(local_point) = local_point
+                && crate::text_edit::pointer_press(
+                    app,
+                    window,
+                    text_target,
+                    position,
+                    local_point,
+                    count,
+                    modifiers,
+                )
+            {
+                let _ = app.capture_pointer(window, text_target);
+            }
+        }
     }
     if button.is_primary() {
         let drag = app.windows.get(&window).and_then(|target| {

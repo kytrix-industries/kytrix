@@ -6,7 +6,7 @@ pub(crate) mod instance;
 pub(crate) mod memory;
 pub(crate) mod pipeline;
 pub(crate) mod plan;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod readback;
 pub(crate) mod renderer;
 pub(crate) mod swapchain;

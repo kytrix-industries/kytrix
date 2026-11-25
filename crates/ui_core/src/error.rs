@@ -134,6 +134,9 @@ pub enum EngineError {
         value: LogicalPx,
     },
 
+    #[error("invalid node spec for a child of {parent:?}: {detail}")]
+    NodeSpecInvalid { parent: NodeId, detail: SmolStr },
+
     #[error("text shaping failed for {node:?}: {detail}")]
     TextShape { node: NodeId, detail: SmolStr },
 

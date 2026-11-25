@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use super::App;
 use crate::{
     error::EngineError,
-    math::{LogicalPx, LogicalSize},
+    math::LogicalSize,
     text::{FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport},
     window::WindowId,
 };
@@ -725,12 +725,11 @@ pub(crate) fn layout_text(
         while index < text_layout_scratch.len() {
             let node = text_layout_scratch[index];
             index += 1;
-            let Some(shaped) = tree.text_slot(node).map(|slot| Rc::clone(slot.shaped())) else {
+            let Some(slot) = tree.text_slot(node) else {
                 continue;
             };
-            let width = tree
-                .text_layout_width(node)
-                .unwrap_or_else(|| shaped.max_content_size().width);
+            let shaped = Rc::clone(slot.shaped());
+            let width = tree.text_layout_width(node).expect("文本槽已确认存在");
             let current = tree
                 .text_slot(node)
                 .map(|slot| (slot.laid_width_bits(), slot.laid_generation()));
@@ -788,18 +787,9 @@ pub(crate) fn layout_text(
             }
             let placeholder = tree.editable(node).and_then(|editable| {
                 let (content, shaped) = editable.placeholder_layout()?;
-                let placeholder_width = if width > LogicalPx::ZERO {
-                    width
-                } else {
-                    shaped.max_content_size().width
-                };
-                (!editable.placeholder_line_fresh(generation, placeholder_width)).then_some((
-                    content,
-                    shaped,
-                    placeholder_width,
-                ))
+                (!editable.placeholder_line_fresh(generation, width)).then_some((content, shaped))
             });
-            if let Some((content, shaped, placeholder_width)) = placeholder {
+            if let Some((content, shaped)) = placeholder {
                 let ellipsis = text.ellipsis_for(&content.style);
                 let mut ctx = crate::text::shape::RasterCtx {
                     raster,
@@ -809,7 +799,7 @@ pub(crate) fn layout_text(
                     scale,
                 };
                 let (line, diagnostics, stats) = match shaped.rasterize(
-                    placeholder_width,
+                    width,
                     content.style.alignment,
                     content.style.color,
                     &mut ctx,
@@ -830,7 +820,7 @@ pub(crate) fn layout_text(
                 if stats.skipped > 0 || stats.skipped_color > 0 {
                     tree.mark_text_layout_dirty(node);
                 } else if let Some(editable) = tree.editable_mut(node) {
-                    editable.set_placeholder_line(Rc::new(line), placeholder_width);
+                    editable.set_placeholder_line(Rc::new(line), width);
                 }
             }
         }
@@ -1157,6 +1147,80 @@ mod tests {
         );
         assert_eq!(app.glyph_atlas.color_page(), (512, 512));
         assert!(!app.glyph_atlas.has_color_records());
+    }
+
+    #[test]
+    fn the_color_glyph_page_replicates_tile_edges_into_the_padding() {
+        if crate::text::raster::probe_emoji_font().is_none() {
+            eprintln!("skip: no color emoji font available on this device");
+            return;
+        }
+        let (_rt, mut app, window, node) = text_app("\u{1F30D}", Some(200.0));
+        frame_text(&mut app, window);
+        app.upload_atlas_pages();
+        let (page, pixels) = app.color_glyph_page_pixels().expect("彩色字形页已建立");
+        let glyph = {
+            let tree = app.window(window).expect("窗口存在").tree();
+            tree.text_line(node)
+                .expect("line")
+                .glyph_runs()
+                .flat_map(|run| run.glyphs.iter().copied())
+                .find(|glyph| glyph.tile.atlas == AtlasKind::ColorGlyph)
+                .expect("emoji 必须走彩色图集")
+        };
+        let page_size = page.0 as usize;
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * page_size + x) * 4;
+            pixels[offset..offset + 4].try_into().expect("4 bytes")
+        };
+        let origin_x = (glyph.tile.u0 * page.0 as f32).round() as usize;
+        let origin_y = (glyph.tile.v0 * page.0 as f32).round() as usize;
+        let width = ((glyph.tile.u1 - glyph.tile.u0) * page.0 as f32).round() as usize;
+        let height = ((glyph.tile.v1 - glyph.tile.v0) * page.0 as f32).round() as usize;
+        assert!(origin_x > 0 && origin_y > 0);
+        assert!(origin_x + width < page_size && origin_y + height < page_size);
+        let mut opaque_edge = 0usize;
+        for row in 0..height {
+            let left = pixel(origin_x, origin_y + row);
+            assert_eq!(
+                pixel(origin_x - 1, origin_y + row),
+                left,
+                "左 padding 必须复制第 {row} 行的边缘纹素"
+            );
+            let right = pixel(origin_x + width - 1, origin_y + row);
+            assert_eq!(
+                pixel(origin_x + width, origin_y + row),
+                right,
+                "右 padding 必须复制第 {row} 行的边缘纹素"
+            );
+            opaque_edge += usize::from(left[3] != 0) + usize::from(right[3] != 0);
+        }
+        for column in 0..width {
+            assert_eq!(
+                pixel(origin_x + column, origin_y - 1),
+                pixel(origin_x + column, origin_y),
+                "上 padding 必须复制第 {column} 列的边缘纹素"
+            );
+            assert_eq!(
+                pixel(origin_x + column, origin_y + height),
+                pixel(origin_x + column, origin_y + height - 1),
+                "下 padding 必须复制第 {column} 列的边缘纹素"
+            );
+        }
+        assert_eq!(
+            pixel(origin_x - 1, origin_y - 1),
+            pixel(origin_x, origin_y),
+            "左上角 padding 必须复制角纹素"
+        );
+        assert_eq!(
+            pixel(origin_x + width, origin_y + height),
+            pixel(origin_x + width - 1, origin_y + height - 1),
+            "右下角 padding 必须复制角纹素"
+        );
+        assert!(
+            opaque_edge > 0,
+            "彩色 tile 至少有一条边缘存在非透明纹素，否则 padding 复制无法被判别"
+        );
     }
 
     #[test]

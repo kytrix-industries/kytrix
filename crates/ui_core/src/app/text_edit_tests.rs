@@ -10,7 +10,7 @@ use crate::{
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         color::Color,
-        style::{Clip, Style},
+        style::{Clip, Style, StylePatch},
         style_builder::StyleBuilder,
     },
     text::{TextPassReport, TextStyle},
@@ -490,6 +490,14 @@ fn cross_window_node_ids_are_rejected() {
         app.text_edit_metrics(window_b, node_a),
         Err(EngineError::StaleNode { node }) if node == node_a
     ));
+    assert!(matches!(
+        app.text_edit_snapshot(window_b, node_a),
+        Err(EngineError::StaleNode { node }) if node == node_a
+    ));
+    assert!(matches!(
+        app.text_edit_snapshot(window_a, node_b),
+        Err(EngineError::StaleNode { node }) if node == node_b
+    ));
     assert_eq!(
         app.text_edit_value(window_b, node_b).expect("本窗句柄可读"),
         "",
@@ -619,6 +627,20 @@ fn zero_height_editable_node_still_reports_metrics() {
         .expect("零高节点仍可度量");
     assert!(metrics.line_height > LogicalPx::ZERO);
     assert_eq!(metrics.line_count, 1);
+    assert_eq!(
+        metrics.content_height, metrics.line_height,
+        "零高节点也必须与行盒/raster 高度一致：{metrics:?}"
+    );
+    let measured = app
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .text_measured_size(node)
+        .expect("文本测量尺寸");
+    assert_eq!(
+        measured.height, metrics.line_height,
+        "measure_editable 与 metrics 必须给出同一行高"
+    );
 }
 
 #[test]
@@ -2409,7 +2431,7 @@ fn shift_word_and_page_extensions_and_paste_undo_restore_the_selection() {
 }
 
 #[test]
-fn readonly_single_line_enter_still_dispatches_submit_once() {
+fn readonly_single_line_enter_neither_submits_nor_consumes() {
     use std::{cell::Cell, rc::Rc};
 
     let (_rt, mut app, window) = new_app();
@@ -2422,16 +2444,22 @@ fn readonly_single_line_enter_still_dispatches_submit_once() {
     editable.readonly = true;
     editable.submit = Some(Action::custom("submit"));
     let node = mount_editable(&mut app, window, editable, None, "hello");
-    assert!(press(&mut app, window, KeyCode::Enter, Modifiers::empty()));
-    assert_eq!(submitted.get(), 1, "readonly 不改文本但不阻止提交");
+    assert!(
+        !press(&mut app, window, KeyCode::Enter, Modifiers::empty()),
+        "readonly 单行 Enter 不消费：交还宿主"
+    );
+    assert_eq!(submitted.get(), 0, "readonly 单行 Enter 不提交");
     assert_eq!(text_of(&app, window, node), "hello");
-    assert!(press_repeat(
-        &mut app,
-        window,
-        KeyCode::Enter,
-        Modifiers::empty()
-    ));
-    assert_eq!(submitted.get(), 1, "auto-repeat 不重复提交");
+    assert!(
+        !press(&mut app, window, KeyCode::Enter, command_modifiers()),
+        "readonly 单行 Ctrl+Enter 同样不消费"
+    );
+    assert_eq!(submitted.get(), 0, "readonly 单行 Ctrl+Enter 也不提交");
+    assert!(
+        !press_repeat(&mut app, window, KeyCode::Enter, Modifiers::empty()),
+        "readonly 单行 auto-repeat 同样交还宿主"
+    );
+    assert_eq!(submitted.get(), 0);
     frame(&mut app, window);
 }
 
@@ -2844,6 +2872,26 @@ fn unmapped_keys_are_left_to_the_host_with_focus_intact() {
             "{code:?} + {modifiers:?} 不得改变焦点"
         );
     }
+
+    let _ = app.drain_events();
+    app.dispatch(
+        window,
+        Event::Input(InputEvent::key_down(KeyCode::F1, Modifiers::empty())),
+    );
+    let queued = app.drain_events();
+    assert_eq!(
+        queued.len(),
+        1,
+        "交给宿主的键必须真的进入 drain_events 队列"
+    );
+    assert!(matches!(
+        queued[0].1,
+        Event::Input(InputEvent::Key {
+            code: KeyCode::F1,
+            state: KeyState::Down,
+            ..
+        })
+    ));
     frame(&mut app, window);
 }
 
@@ -2898,12 +2946,34 @@ fn alt_gr_never_triggers_edit_commands_and_still_lets_text_arrive() {
     assert_eq!(text_of(&app, window, node), before);
     assert_eq!(snapshot_of(&app, window, node).selection.range(), 11..11);
 
+    assert!(type_text(&mut app, window, "abc"));
+    let typed = text_of(&app, window, node);
+    assert_eq!(typed, "hello worldabc");
+    assert_eq!(
+        undo_stats_of(&app, window, node).0,
+        1,
+        "前置：必须已有撤销历史"
+    );
     assert!(
         press(&mut app, window, KeyCode::KeyZ, alt_gr),
         "AltGr+可打印键由编辑内核消费，宿主不得触发快捷键"
     );
-    assert_eq!(text_of(&app, window, node), before, "AltGr+Z 不得触发撤销");
-    assert_eq!(snapshot_of(&app, window, node).selection.range(), 11..11);
+    assert_eq!(
+        text_of(&app, window, node),
+        typed,
+        "有撤销历史时 AltGr+Z 仍不得触发撤销"
+    );
+    assert_eq!(
+        undo_stats_of(&app, window, node).0,
+        1,
+        "AltGr+Z 不得消耗撤销历史"
+    );
+    assert!(press(&mut app, window, KeyCode::KeyZ, command_modifiers()));
+    assert_eq!(
+        text_of(&app, window, node),
+        before,
+        "Ctrl+Z 必须仍能撤销刚才键入的内容（历史未被 AltGr+Z 破坏）"
+    );
     assert!(type_text(&mut app, window, "é"));
     assert_eq!(
         text_of(&app, window, node),
@@ -6050,13 +6120,23 @@ fn text_edit_set_text_style_rejects_invalid_styles() {
 
     let mut app = TestApp::new();
     let window = app.window_id();
-    let node = test_editable_node(
-        &mut app,
-        spec(TextStyle::new(px(16.0)), false),
-        200.0,
-        "abcd",
-    );
+    let original = TextStyle::new(px(16.0));
+    let node = test_editable_node(&mut app, spec(original.clone(), false), 200.0, "abcd");
     app.drain().expect("预热帧");
+    let applied = |app: &TestApp| {
+        let tree = app.app().window(window).expect("窗口存在").tree();
+        (
+            tree.editable(node)
+                .expect("可编辑槽位")
+                .spec()
+                .text_style
+                .clone(),
+            tree.text_content(node).expect("文本内容").style.clone(),
+        )
+    };
+    let pristine = applied(&app);
+    assert_eq!(pristine.0, original, "前置：初始样式");
+    let idle = app.app().window(window).expect("窗口存在").frame_index();
 
     let mut zero_size = TextStyle::new(px(0.0));
     zero_size.color = Color::BLACK;
@@ -6081,6 +6161,17 @@ fn text_edit_set_text_style_rejects_invalid_styles() {
             .text_edit_set_text_style(window, node, zero_line_height),
         Err(EngineError::TextEditSpecInvalid { .. })
     ));
+    assert_eq!(
+        applied(&app),
+        pristine,
+        "非法样式不得改动可编辑槽位或显示镜像"
+    );
+    app.drain().expect("非法样式不排帧");
+    assert_eq!(
+        app.app().window(window).expect("窗口存在").frame_index(),
+        idle,
+        "非法样式不得排帧"
+    );
 
     let valid = TextStyle::new(px(20.0));
     assert!(
@@ -6566,6 +6657,101 @@ fn a11y_replace_selected_text_cancels_the_composition_first() {
     assert_eq!(text_of(&app, window, node), "abcd");
 }
 
+#[test]
+fn a11y_replace_selected_text_propagates_a_failed_cancel_composition() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 1, 3).expect("选中 bc");
+    let (input, _) = a11y_ids(&mut app, window, node);
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(snapshot_of(&app, window, node).composing);
+    crate::text_edit::fail_next_cancel_composition();
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::ReplaceSelectedText,
+        Some(accesskit::ActionData::Value("Z".into())),
+    );
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(
+        snapshot.composing,
+        "取消组合失败必须传播：不得继续替换（继续会在 apply_raw_edit 里隐式取消组合并写入）"
+    );
+    assert_eq!(
+        text_of(&app, window, node),
+        "abcd",
+        "取消组合失败时不得发生任何编辑"
+    );
+    assert!(
+        app.a11y_diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            crate::a11y::A11yDiagnostic::InvalidActionData {
+                node: reported,
+                action: A11yAction::ReplaceSelectedText,
+            } if *reported == node
+        )),
+        "取消组合的错误必须到达动作分发层：{:?}",
+        app.a11y_diagnostics()
+    );
+}
+
+#[test]
+fn a11y_set_text_selection_maps_character_indices_after_cancelling_the_composition() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    let (input, run) = a11y_ids(&mut app, window, node);
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("caret");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(2),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert_eq!(
+        display_mirror(&app, window, node),
+        "abnicd",
+        "前置条件：preedit 占据 display 2..4，字符索引 3 落在组合文本里"
+    );
+    assert!(snapshot_of(&app, window, node).composing);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::SetTextSelection,
+        Some(text_selection_data(run, 3, 3)),
+    );
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing);
+    assert_eq!(
+        snapshot.selection.range(),
+        3..3,
+        "必须先把组合取消、再按已提交文本换算字符索引；在组合显示坐标里换算会得到 2..2"
+    );
+    assert_eq!(text_of(&app, window, node), "abcd");
+}
+
 fn pointer_point_at(
     app: &App,
     window: WindowId,
@@ -6645,5 +6831,476 @@ fn a11y_text_selection_cancels_pointer_drag_and_clears_granularity() {
         snapshot_of(&app, window, node).selection.range(),
         2..6,
         "a11y 同范围选择必须把粒度刷回 Cluster（Word 残留会得到 2..11）"
+    );
+}
+
+#[test]
+fn typing_ten_thousand_keys_keeps_the_undo_merge_linear() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "",
+    );
+    let keys = 1_000usize;
+    for _ in 0..keys {
+        assert!(type_text(&mut app, window, "a"));
+    }
+    let (undo_len, redo_len, bytes) = undo_stats_of(&app, window, node);
+    assert_eq!(undo_len, 1, "连续键入必须合并成一个撤销步");
+    assert_eq!(redo_len, 0);
+    assert_eq!(bytes, keys, "撤销记录只保留插入的 {keys} 字节");
+    let copied = app
+        .window(window)
+        .expect("窗口")
+        .tree()
+        .editable(node)
+        .expect("可编辑槽位")
+        .undo_copy_bytes();
+    assert!(
+        copied <= 4 * keys * std::mem::size_of::<Arc<str>>(),
+        "合并路径必须是线性拷贝，实测 {copied} B（每键重建合并串会达到约 {} B）",
+        keys * keys / 2
+    );
+    assert!(press(&mut app, window, KeyCode::KeyZ, command_modifiers()));
+    assert_eq!(text_of(&app, window, node), "", "整组撤销必须回到空文本");
+    assert_eq!(undo_stats_of(&app, window, node).1, 1, "撤销步进入 redo");
+    frame(&mut app, window);
+}
+
+#[test]
+fn metrics_stay_unavailable_until_the_text_dirty_queue_is_consumed() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(160.0),
+        "hello",
+    );
+    frame(&mut app, window);
+    let before = app.text_edit_metrics(window, node).expect("完整帧后可用");
+    assert!(before.line_height > LogicalPx::ZERO);
+
+    app.reload_system_fonts();
+    let error = app
+        .text_edit_metrics(window, node)
+        .expect_err("文本脏队列未消费时必须拒绝 metrics，不得返回上一帧旧值");
+    let rendered = format!("{error:?}");
+    assert!(
+        matches!(
+            error,
+            EngineError::TextEditLayout { node: reported, detail }
+                if reported == node && detail == "not laid out yet"
+        ),
+        "{rendered}"
+    );
+    frame(&mut app, window);
+    let after = app.text_edit_metrics(window, node).expect("重排后恢复");
+    assert_eq!(after.line_count, before.line_count);
+    assert_eq!(after.line_height, before.line_height);
+}
+
+#[test]
+fn display_none_editable_still_reports_metrics() {
+    let (_rt, mut app, window) = new_app();
+    let mut style = node_style(Some(160.0));
+    style.display(taffy::style::Display::None);
+    let node = mount_with_style(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        style,
+    );
+    app.text_edit_set_value(window, node, "hidden")
+        .expect("写入");
+    frame(&mut app, window);
+
+    assert_eq!(bounds(&app, window, node).size.height, LogicalPx::ZERO);
+    let metrics = app
+        .text_edit_metrics(window, node)
+        .expect("display:none 的可编辑节点仍必须可度量");
+    assert_eq!(metrics.line_count, 1);
+    assert!(metrics.line_height > LogicalPx::ZERO);
+}
+
+#[test]
+fn identity_caret_mapping_snaps_forward_on_the_real_insert_path() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(200.0),
+        "\u{301}x",
+    );
+    frame(&mut app, window);
+    crate::text_edit::set_selection(&mut app, window, node, 0, 0).expect("光标");
+    assert!(type_text(&mut app, window, "q"));
+    assert_eq!(text_of(&app, window, node), "q\u{301}x");
+    assert_eq!(
+        caret_of(&app, window, node),
+        3,
+        "插入的 q 与后续组合符合并成新字素，caret 必须吸附到簇尾而不是停在簇内 1"
+    );
+    frame(&mut app, window);
+}
+
+#[test]
+fn ime_cursor_area_is_cleared_for_transparent_or_zero_size_editable() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(160.0),
+        "abc",
+    );
+    frame(&mut app, window);
+    frame(&mut app, window);
+    assert!(
+        app.ime_cursor_area(window).expect("窗口存在").is_some(),
+        "可见且聚焦时必须写 IME cursor area"
+    );
+
+    let set_opacity = |app: &mut App, value: f32| {
+        let tree = app.window_mut(window).expect("窗口存在").tree_mut();
+        tree.set_style_patch(
+            node,
+            StylePatch {
+                opacity: Some(value),
+                ..StylePatch::default()
+            },
+        );
+        tree.mark_paint(node);
+    };
+    set_opacity(&mut app, 0.0);
+    frame(&mut app, window);
+    assert_eq!(
+        app.ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "opacity=0 的聚焦 editable 必须清空 IME cursor area"
+    );
+
+    set_opacity(&mut app, 1.0);
+    frame(&mut app, window);
+    assert!(
+        app.ime_cursor_area(window).expect("窗口存在").is_some(),
+        "恢复不透明后必须重新写 IME cursor area"
+    );
+
+    let mut zero = node_style(Some(160.0));
+    zero.height_length(px(0.0));
+    app.window_mut(window)
+        .expect("窗口存在")
+        .tree_mut()
+        .set_style(node, zero)
+        .expect("设置零高");
+    frame(&mut app, window);
+    assert_eq!(
+        app.ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "零尺寸的聚焦 editable 必须清空 IME cursor area"
+    );
+}
+
+#[test]
+fn ime_cursor_area_is_cleared_when_the_editable_is_fully_clipped() {
+    let (_rt, mut app, window) = new_app();
+    let (hidden, visible) = {
+        let tree = app.window_mut(window).expect("窗口存在").tree_mut();
+        let root = tree.root();
+        let container = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(120.0), px(20.0))
+                    .overflow_hidden()
+                    .build(),
+            )
+            .build(tree, root)
+            .expect("裁剪容器");
+        let absolute = |top: LogicalPx| {
+            StyleBuilder::new()
+                .absolute()
+                .top(top)
+                .width(px(120.0))
+                .build()
+        };
+        let hidden = NodeBuilder::editable_text(spec(TextStyle::new(px(16.0)), false))
+            .style(absolute(px(40.0)))
+            .build(tree, container)
+            .expect("被裁掉的可编辑");
+        let visible = NodeBuilder::editable_text(spec(TextStyle::new(px(16.0)), false))
+            .style(absolute(px(0.0)))
+            .build(tree, container)
+            .expect("可见可编辑");
+        (hidden, visible)
+    };
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(hidden)));
+    frame(&mut app, window);
+    assert_eq!(
+        app.ime_cursor_area(window).expect("窗口存在"),
+        None,
+        "被 scroll/clip 完全裁掉的聚焦 editable 必须清空 IME cursor area"
+    );
+    assert_eq!(
+        app.focused(window),
+        Some(hidden),
+        "只清 IME request：焦点仍留在节点上"
+    );
+
+    assert!(app.set_focus(window, Some(visible)));
+    frame(&mut app, window);
+    assert!(
+        app.ime_cursor_area(window).expect("窗口存在").is_some(),
+        "可见的聚焦 editable 必须有 IME cursor area"
+    );
+}
+
+#[test]
+fn masked_input_ignores_control_characters_and_limits_typed_graphemes() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+        "",
+    );
+    assert!(type_text(&mut app, window, "a\tb\nc\r"));
+    assert_eq!(
+        text_of(&app, window, node),
+        "abc",
+        "掩码单行输入必须先清洗全部控制字符"
+    );
+    assert_eq!(display_mirror(&app, window, node), "•••");
+
+    let limited = mount_editable(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), Some(1)),
+        None,
+        "",
+    );
+    assert!(type_text(&mut app, window, "abc"));
+    assert_eq!(
+        text_of(&app, window, limited),
+        "a",
+        "max_length=1 只允许一个真实字素"
+    );
+    assert_eq!(display_mirror(&app, window, limited), "•");
+    frame(&mut app, window);
+}
+
+#[test]
+fn editable_with_bind_text_is_rejected_at_build() {
+    let (_rt, mut app, window) = new_app();
+    let root = app.window(window).expect("窗口存在").tree().root();
+    let tree = app.window_mut(window).expect("窗口存在").tree_mut();
+    let error = NodeBuilder::editable_text(spec(TextStyle::new(px(16.0)), false))
+        .bind_text(|_| smol_str::SmolStr::new_static("bound"))
+        .build(tree, root)
+        .expect_err("editable + bind_text 必须在 build 阶段被拒绝（release 构建也一样）");
+    assert!(
+        matches!(error, EngineError::NodeSpecInvalid { parent, .. } if parent == root),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn consumed_keys_are_cleared_by_focus_loss_and_window_close() {
+    let (_rt, mut app, window) = new_app();
+    let other_window = app.create_window(WindowOptions::default());
+    let _node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abc",
+    );
+    let _other = mount_editable(
+        &mut app,
+        other_window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "xyz",
+    );
+
+    assert!(press(
+        &mut app,
+        window,
+        KeyCode::ArrowLeft,
+        Modifiers::empty()
+    ));
+    assert_eq!(app.consumed_key_window_count_for_test(), 1);
+    app.dispatch(other_window, Event::FocusChanged { focused: false });
+    let _ = app.drain_events();
+    assert_eq!(
+        app.consumed_key_window_count_for_test(),
+        1,
+        "别的窗口失焦不得清掉本窗口的 consumed 键"
+    );
+    app.dispatch(
+        window,
+        Event::Input(InputEvent::key_up(KeyCode::ArrowLeft, Modifiers::empty())),
+    );
+    assert!(
+        app.drain_events().is_empty(),
+        "失焦前已消费的键必须随 KeyUp 一起消费"
+    );
+
+    app.dispatch(window, Event::FocusChanged { focused: false });
+    let _ = app.drain_events();
+    assert_eq!(
+        app.consumed_key_window_count_for_test(),
+        0,
+        "窗口失焦必须清掉该窗口的 consumed 键表"
+    );
+    app.dispatch(
+        window,
+        Event::Input(InputEvent::key_up(KeyCode::ArrowLeft, Modifiers::empty())),
+    );
+    assert_eq!(
+        app.drain_events().len(),
+        1,
+        "清表之后同一按键的 KeyUp 必须入队交还宿主"
+    );
+
+    assert!(press(
+        &mut app,
+        window,
+        KeyCode::ArrowLeft,
+        Modifiers::empty()
+    ));
+    assert!(press(
+        &mut app,
+        other_window,
+        KeyCode::ArrowLeft,
+        Modifiers::empty()
+    ));
+    assert_eq!(app.consumed_key_window_count_for_test(), 2);
+    assert!(app.close_window(other_window));
+    assert_eq!(
+        app.consumed_key_window_count_for_test(),
+        1,
+        "关窗必须清掉该窗口的 consumed 键表"
+    );
+}
+
+#[test]
+fn stale_text_relayout_is_debounced_per_atlas_generation() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(160.0),
+        "abc",
+    );
+    frame(&mut app, window);
+    let generations = (app.atlas.generation(), app.glyph_atlas.color_generation());
+    let tree = app.window_mut(window).expect("窗口存在").tree_mut();
+    assert!(
+        tree.request_text_line_relayout(node, generations),
+        "同一图集代际下的首次失效必须请求重排"
+    );
+    assert!(
+        !tree.request_text_line_relayout(node, generations),
+        "同一代际内重复失效（逐 tile LRU 抖动）不得反复请求"
+    );
+    assert!(
+        tree.request_text_line_relayout(node, (generations.0.wrapping_add(1), generations.1)),
+        "图集代际变化后必须重新允许请求"
+    );
+}
+
+#[test]
+fn keyboard_edits_keep_the_caret_visible_through_the_app_pipeline() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(200.0),
+        "abc",
+    );
+    frame(&mut app, window);
+    assert_eq!(app.text_edit_caret_visible(window), Some(true));
+    assert!(press(
+        &mut app,
+        window,
+        KeyCode::ArrowLeft,
+        Modifiers::empty()
+    ));
+    assert_eq!(
+        app.text_edit_caret_visible(window),
+        Some(true),
+        "键盘编辑事件必须把 caret 重置为可见"
+    );
+    assert_eq!(app.focused(window), Some(node));
+}
+
+#[test]
+fn set_scroll_line_height_validates_its_input_and_reports_typed_errors() {
+    let (_rt, mut app, window) = new_app();
+    let (container, plain) = {
+        let tree = app.window_mut(window).expect("窗口存在").tree_mut();
+        let root = tree.root();
+        let mut style = StyleBuilder::new().size(px(100.0), px(100.0)).build();
+        style.clip = Clip::Bounds;
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .build(tree, root)
+            .expect("滚动容器");
+        let plain = NodeBuilder::boxed().build(tree, root).expect("普通盒子");
+        (container, plain)
+    };
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: px(20.0),
+            },
+        )
+        .expect("可滚动");
+    for bad in [f32::NAN, f32::INFINITY, 0.0, -4.0] {
+        assert!(
+            matches!(
+                app.set_scroll_line_height(&handle, px(bad)),
+                Err(EngineError::NotScrollable { node }) if node == container
+            ),
+            "非法行高 {bad} 必须报 NotScrollable"
+        );
+    }
+    assert!(
+        app.set_scroll_line_height(&handle, px(20.0)).is_ok(),
+        "同值写入是成功的空操作"
+    );
+    assert!(app.set_scroll_line_height(&handle, px(24.0)).is_ok());
+    assert_eq!(
+        app.window(window)
+            .expect("窗口存在")
+            .tree()
+            .scroll_slot(container)
+            .expect("滚动槽")
+            .line_height,
+        px(24.0)
+    );
+
+    let plain_handle = crate::interaction::ScrollHandle::new(window, plain);
+    assert!(matches!(
+        app.set_scroll_line_height(&plain_handle, px(20.0)),
+        Err(EngineError::NotScrollable { node }) if node == plain
+    ));
+
+    assert!(app.close_window(window));
+    assert!(
+        app.set_scroll_line_height(&handle, px(20.0)).is_ok(),
+        "窗口已关闭时是空操作而不是错误"
     );
 }

@@ -2645,6 +2645,10 @@ mod tests {
             Vec::new(),
         );
         let generation = h.tree.canvas_generation(node).expect("canvas node");
+        let atlas_generation = h
+            .atlas
+            .as_ref()
+            .map_or(INITIAL_ATLAS_GENERATION, |atlas| atlas.generation());
         h.canvas_text.insert(
             node,
             crate::window::canvas_text::ResolvedCanvasText {
@@ -2652,7 +2656,7 @@ mod tests {
                     font_stack_version: 0,
                     canvas_generation: generation,
                     dpr_bits: 1.0_f32.to_bits(),
-                    atlas_generation: 0,
+                    atlas_generation,
                     color_atlas_generation: INITIAL_ATLAS_GENERATION,
                     glyph_eviction_epoch: 0,
                 },
@@ -2739,17 +2743,21 @@ mod tests {
             crate::paint::atlas::AtlasKind::Glyph,
             (64, 64),
         );
+        assert!(atlas.grow(), "page growth invalidates the cached tiles");
         let allocation = atlas.allocate((8, 8)).expect("the tile fits");
         let mut run = glyph_run(Color::BLACK, 0..2, 1.0);
         run.glyphs[0].tile = allocation.tile;
         let mut line = shaped_line(vec![ShapedTextItem::GlyphRun(run)], Vec::new());
-        line.atlas_generation = atlas.generation();
+        line.atlas_generation = atlas.generation().wrapping_add(1);
+        assert!(
+            !allocation.tile.is_stale(atlas.generation()),
+            "本用例只让单色代际失效：tile 本身必须活着，否则测不出代际比较"
+        );
         assert_eq!(
             line.color_atlas_generation,
             h.color_atlas.generation(),
             "本用例只让单色代际失效，彩色代际必须保持一致"
         );
-        assert!(atlas.grow(), "page growth invalidates the cached tiles");
         h.atlas = Some(atlas);
         let generation = h.tree.canvas_generation(node).expect("canvas node");
         let atlas_generation = h.atlas.as_ref().expect("atlas").generation();

@@ -593,6 +593,7 @@ impl<'a> ActionCtx<'a> {
 pub(crate) struct NodeInteraction {
     pub action: Option<Action>,
     pub drag: Option<Action>,
+    pub press_focus_target: Option<NodeId>,
     pub scroll: Option<ScrollSlot>,
     pub virtual_list: Option<VirtualSlot>,
     pub overlay: Option<OverlaySlot>,
@@ -604,6 +605,7 @@ impl NodeInteraction {
         Self {
             action: None,
             drag: None,
+            press_focus_target: None,
             scroll: None,
             virtual_list: None,
             overlay: None,
@@ -617,6 +619,7 @@ impl std::fmt::Debug for NodeInteraction {
         f.debug_struct("NodeInteraction")
             .field("action", &self.action)
             .field("drag", &self.drag)
+            .field("press_focus_target", &self.press_focus_target)
             .field("scroll", &self.scroll)
             .field("virtual_list", &self.virtual_list)
             .field("overlay", &self.overlay)

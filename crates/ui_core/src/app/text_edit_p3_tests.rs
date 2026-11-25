@@ -1288,3 +1288,305 @@ fn ensure_visible_reveals_the_selection_anchor_when_the_focus_stays_visible() {
         "reveal anchor 不得把 focus 端挤出视口：{screen_focus:?} vs {viewport:?}"
     );
 }
+
+#[test]
+fn pointer_activity_resets_the_caret_to_visible_and_restarts_the_period() {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let root = root_of(&app, window);
+    let node = mount_editable(&mut app, root, spec(false), editable_style(Some(200.0)));
+    app.app_mut()
+        .text_edit_set_value(window, node, "abcdef")
+        .expect("写入文本");
+    drain(&mut app);
+    focus(&mut app, node);
+    drain(&mut app);
+    app.advance(Duration::from_millis(530));
+    drain(&mut app);
+    assert_eq!(visible(&app, window), Some(false), "前置：已熄灭");
+
+    app.advance(Duration::from_millis(100));
+    let point = caret_screen(&app, node, 6);
+    app.inject(InputEvent::pointer_down(
+        point,
+        PointerButton::Primary,
+        Modifiers::empty(),
+    ));
+    drain(&mut app);
+    assert_eq!(visible(&app, window), Some(true), "指针活动必须重置为亮");
+    assert_eq!(caret_quads(&app, node).len(), 1);
+
+    app.advance(Duration::from_millis(529));
+    drain(&mut app);
+    assert_eq!(visible(&app, window), Some(true), "指针活动后 529ms 仍亮");
+    app.advance(Duration::from_millis(1));
+    drain(&mut app);
+    assert_eq!(visible(&app, window), Some(false), "指针活动后 530ms 熄灭");
+    app.inject(InputEvent::pointer_up(
+        point,
+        PointerButton::Primary,
+        Modifiers::empty(),
+    ));
+    let _ = drain(&mut app);
+}
+
+#[test]
+fn programmatic_set_value_resets_the_caret_to_visible() {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let root = root_of(&app, window);
+    let node = mount_editable(&mut app, root, spec(false), editable_style(Some(200.0)));
+    app.app_mut()
+        .text_edit_set_value(window, node, "abc")
+        .expect("写入文本");
+    drain(&mut app);
+    focus(&mut app, node);
+    drain(&mut app);
+    app.advance(Duration::from_millis(530));
+    drain(&mut app);
+    assert_eq!(visible(&app, window), Some(false), "前置：已熄灭");
+
+    app.app_mut()
+        .text_edit_set_value(window, node, "abcdef")
+        .expect("程序化写入");
+    drain(&mut app);
+    assert_eq!(
+        visible(&app, window),
+        Some(true),
+        "程序化写值必须重置 caret 为可见"
+    );
+    assert_eq!(caret_quads(&app, node).len(), 1);
+}
+
+#[test]
+fn ime_commit_resets_the_caret_to_visible() {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let root = root_of(&app, window);
+    let node = mount_editable(&mut app, root, spec(false), editable_style(Some(200.0)));
+    app.app_mut()
+        .text_edit_set_value(window, node, "abc")
+        .expect("写入文本");
+    drain(&mut app);
+    focus(&mut app, node);
+    drain(&mut app);
+    app.advance(Duration::from_millis(530));
+    drain(&mut app);
+    assert_eq!(visible(&app, window), Some(false), "前置：已熄灭");
+
+    app.dispatch_event(Event::Ime(ImeEvent::Commit {
+        text: SmolStr::new_static("x"),
+        replace: None,
+    }));
+    drain(&mut app);
+    assert_eq!(visible(&app, window), Some(true), "IME 提交必须重置为亮");
+    assert!(
+        app.app()
+            .text_edit_value(window, node)
+            .is_ok_and(|value| value.as_str() == "abcx")
+    );
+}
+
+#[test]
+fn dragging_past_the_right_edge_auto_scrolls_horizontally() {
+    let text: String = (0..40).map(|index| format!("w{index} ")).collect();
+    let mut bed = horizontal_bed(text.as_str());
+    let window = bed.window;
+    let node = bed.node;
+    focus(&mut bed.app, node);
+    crate::text_edit::set_selection(bed.app.app_mut(), window, node, 0, 0).expect("caret 到文首");
+    let _ = drain(&mut bed.app);
+
+    let viewport = bounds(&bed.app, bed.viewport);
+    let start = caret_screen(&bed.app, node, 0);
+    bed.app.inject(InputEvent::pointer_down(
+        start,
+        PointerButton::Primary,
+        Modifiers::empty(),
+    ));
+    let outside = LogicalPoint::new(viewport.max().x + px(30.0), start.y);
+    bed.app
+        .inject(InputEvent::pointer_move(outside, Modifiers::empty()));
+    let offset = bed.offset().x;
+    assert!(
+        offset > px(0.0),
+        "拖到视口右侧外必须触发水平 auto-scroll：{offset:?}"
+    );
+    let snapshot = bed
+        .app
+        .app()
+        .text_edit_snapshot(window, node)
+        .expect("快照");
+    assert_eq!(
+        snapshot.selection.anchor().byte,
+        0,
+        "水平 auto-scroll 保持 anchor 在文首"
+    );
+    assert!(
+        snapshot.selection.focus().byte > 0,
+        "水平拖选必须推进 focus"
+    );
+    bed.app.inject(InputEvent::pointer_up(
+        outside,
+        PointerButton::Primary,
+        Modifiers::empty(),
+    ));
+    let _ = drain(&mut bed.app);
+}
+
+#[test]
+fn ensure_visible_rejects_an_anchor_reveal_that_would_push_the_focus_out() {
+    let text: String = (0..30)
+        .map(|index| ((b'a' + (index % 26) as u8) as char).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut bed = vertical_bed(text.as_str(), 4, None);
+    focus(&mut bed.app, bed.node);
+    bed.set_caret(page_line(1));
+    drain(&mut bed.app);
+    let before = bed.offset().y;
+    assert_eq!(before, px(0.0), "前置：focus 行已在视口内");
+
+    crate::text_edit::set_selection(
+        bed.app.app_mut(),
+        bed.window,
+        bed.node,
+        page_line(20),
+        page_line(1),
+    )
+    .expect("远距离反选");
+    drain(&mut bed.app);
+    drain(&mut bed.app);
+    assert_eq!(
+        bed.offset().y,
+        px(0.0),
+        "anchor reveal 会把 focus 端挤出视口时必须在拒绝分支里放弃滚动"
+    );
+    let snapshot = bed
+        .app
+        .app()
+        .text_edit_snapshot(bed.window, bed.node)
+        .expect("快照");
+    assert_eq!(snapshot.selection.anchor().byte, page_line(20));
+}
+
+#[test]
+fn ensure_visible_scrolls_horizontally_to_reveal_a_selection_anchor() {
+    let text = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut bed = horizontal_bed(text);
+    let window = bed.window;
+    let node = bed.node;
+    focus(&mut bed.app, node);
+    crate::text_edit::set_selection(bed.app.app_mut(), window, node, 2, 2).expect("caret");
+    let _ = drain(&mut bed.app);
+    assert_eq!(bed.offset().x, px(0.0), "前置：caret 在视口内");
+
+    let viewport = bounds(&bed.app, bed.viewport);
+    let anchor = (0..text.len())
+        .find(|byte| caret_content(&bed.app, node, *byte).max().x > viewport.size.width)
+        .expect("文本必须宽于视口");
+    crate::text_edit::set_selection(bed.app.app_mut(), window, node, anchor, 2).expect("水平反选");
+    let _ = drain(&mut bed.app);
+    let _ = drain(&mut bed.app);
+
+    let offset = bed.offset().x;
+    assert!(
+        offset > px(0.0),
+        "水平滚动轴上的选区 anchor 必须被 reveal：offset={offset:?}"
+    );
+    let anchor_rect = caret_content(&bed.app, node, anchor);
+    let focus_rect = caret_content(&bed.app, node, 2);
+    let screen_anchor = anchor_rect.translate(LogicalPoint::new(-offset, px(0.0)));
+    let screen_focus = focus_rect.translate(LogicalPoint::new(-offset, px(0.0)));
+    assert!(
+        screen_anchor.max().x <= viewport.size.width,
+        "anchor 端必须露出：{screen_anchor:?} vs {viewport:?}"
+    );
+    assert!(
+        screen_focus.origin.x >= px(0.0) && screen_focus.max().x <= viewport.size.width,
+        "reveal anchor 不得把 focus 端挤出视口：{screen_focus:?} vs {viewport:?}"
+    );
+}
+
+#[test]
+fn a_non_owner_window_focus_loss_keeps_the_owner_blink_timer() {
+    let mut app = TestApp::new();
+    let window_a = app.window_id();
+    let window_b = app
+        .app_mut()
+        .create_window(crate::window::WindowOptions::default());
+    let node_a = mount_in_window(&mut app, window_a, "abcdef");
+    let _node_b = mount_in_window(&mut app, window_b, "uvwxyz");
+    drain(&mut app);
+    frame_window(&mut app, window_b);
+    drain(&mut app);
+
+    focus(&mut app, node_a);
+    drain(&mut app);
+    assert!(
+        app.app().next_wake_deadline().is_some(),
+        "前置：owner 窗口应有闪烁唤醒"
+    );
+
+    app.app_mut().dispatch(
+        window_b,
+        crate::event::Event::FocusChanged { focused: false },
+    );
+    assert!(
+        app.app().next_wake_deadline().is_some(),
+        "非 owner 窗口失焦不得取消 owner 的闪烁 timer"
+    );
+    app.advance(Duration::from_millis(530));
+    let record = app.drain().expect("A 翻转帧").clone();
+    assert!(record.rendered, "530ms 后 owner 窗口仍必须提交翻转帧");
+    assert_eq!(
+        visible(&app, window_a),
+        Some(false),
+        "非 owner 失焦后 owner 的闪烁节奏不受影响"
+    );
+}
+
+#[test]
+fn a_cross_window_takeover_hides_the_previous_owner_caret() {
+    let mut app = TestApp::new();
+    let window_a = app.window_id();
+    let window_b = app
+        .app_mut()
+        .create_window(crate::window::WindowOptions::default());
+    let node_a = mount_in_window(&mut app, window_a, "abcdef");
+    let node_b = mount_in_window(&mut app, window_b, "uvwxyz");
+    drain(&mut app);
+    frame_window(&mut app, window_b);
+    drain(&mut app);
+
+    focus(&mut app, node_a);
+    drain(&mut app);
+    assert_eq!(
+        app.app().text_edit_caret_visible(window_a),
+        Some(true),
+        "前置：A 是闪烁 owner 且 caret 可见"
+    );
+
+    app.app_mut().set_focus(window_b, Some(node_b));
+    let _ = frame_window(&mut app, window_b);
+    assert_eq!(
+        app.app().text_edit_caret_visible(window_a),
+        Some(false),
+        "夺权后 A 的聚焦 caret 必须被隐藏"
+    );
+    assert_eq!(
+        app.app().text_edit_caret_visible(window_b),
+        Some(true),
+        "B 成为新 owner 且 caret 可见"
+    );
+    assert!(
+        !app.app()
+            .window(window_a)
+            .expect("窗口")
+            .tree()
+            .editable(node_a)
+            .expect("可编辑节点")
+            .caret_visible(),
+        "跨窗夺权必须把旧 owner 的 caret 隐藏并标脏"
+    );
+}

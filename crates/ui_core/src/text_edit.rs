@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ops::Range,
     rc::Rc,
     sync::Arc,
@@ -21,7 +22,10 @@ use crate::{
     interaction::{ScrollAxis, drag as drag_util, scroll},
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{id::NodeId, tree::NodeTree},
-    paint::color::{Color, ColorBrush},
+    paint::{
+        color::{Color, ColorBrush},
+        style::Clip,
+    },
     text::{ShapedLine, TextContent, TextStyle, shape::ShapedText},
     window::{Window, WindowId},
 };
@@ -532,8 +536,8 @@ impl MaskedDisplay {
     }
 
     #[cfg(test)]
-    fn display_byte_for_raw(&self, raw: &str, raw_byte: usize) -> usize {
-        if raw_byte >= raw.len() {
+    fn display_byte_for_raw(&self, raw_len: usize, raw_byte: usize) -> usize {
+        if raw_byte >= raw_len {
             return self.text.len();
         }
         let cluster = self
@@ -543,8 +547,8 @@ impl MaskedDisplay {
         self.display_starts[cluster] as usize
     }
 
-    fn display_byte_after_raw(&self, raw: &str, raw_byte: usize) -> usize {
-        if raw_byte >= raw.len() {
+    fn display_byte_after_raw(&self, raw_len: usize, raw_byte: usize) -> usize {
+        if raw_byte >= raw_len {
             return self.text.len();
         }
         let cluster = self
@@ -559,9 +563,9 @@ impl MaskedDisplay {
             .map_or(self.text.len(), |start| *start as usize)
     }
 
-    fn raw_byte_for_display(&self, raw: &str, display_byte: usize) -> usize {
+    fn raw_byte_for_display(&self, raw_len: usize, display_byte: usize) -> usize {
         if display_byte >= self.text.len() {
-            return raw.len();
+            return raw_len;
         }
         let cluster = self
             .display_starts
@@ -898,10 +902,70 @@ impl EditKind {
 struct UndoStep {
     kind: EditKind,
     range: Range<usize>,
-    removed: Arc<str>,
-    inserted: Arc<str>,
+    removed: EditText,
+    inserted: EditText,
     selection_before: TextSelection,
     selection_after: TextSelection,
+}
+
+#[derive(Default)]
+struct EditText {
+    chunks: VecDeque<Arc<str>>,
+    len: usize,
+    #[cfg(test)]
+    copy_bytes: usize,
+}
+
+impl EditText {
+    fn new(text: &str) -> Self {
+        Self {
+            chunks: VecDeque::from([Arc::from(text)]),
+            len: text.len(),
+            #[cfg(test)]
+            copy_bytes: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn append(&mut self, other: &Self) {
+        self.chunks.extend(other.chunks.iter().cloned());
+        self.len += other.len;
+        #[cfg(test)]
+        {
+            self.copy_bytes += other.chunks.len() * std::mem::size_of::<Arc<str>>();
+        }
+    }
+
+    fn prepend(&mut self, other: &Self) {
+        for chunk in other.chunks.iter().rev() {
+            self.chunks.push_front(Arc::clone(chunk));
+        }
+        self.len += other.len;
+        #[cfg(test)]
+        {
+            self.copy_bytes += other.chunks.len() * std::mem::size_of::<Arc<str>>();
+        }
+    }
+
+    fn materialize(&self) -> String {
+        let mut text = String::with_capacity(self.len);
+        for chunk in &self.chunks {
+            text.push_str(chunk);
+        }
+        text
+    }
+
+    #[cfg(test)]
+    fn copy_bytes(&self) -> usize {
+        self.copy_bytes
+    }
 }
 
 #[derive(Default)]
@@ -967,7 +1031,7 @@ fn merge_step(last: &mut UndoStep, step: &UndoStep) -> bool {
             {
                 return false;
             }
-            last.inserted = concat_text(&last.inserted, &step.inserted);
+            last.inserted.append(&step.inserted);
             last.selection_after = step.selection_after;
             true
         }
@@ -978,7 +1042,7 @@ fn merge_step(last: &mut UndoStep, step: &UndoStep) -> bool {
             {
                 return false;
             }
-            last.removed = concat_text(&step.removed, &last.removed);
+            last.removed.prepend(&step.removed);
             last.range.start = step.range.start;
             last.selection_after = step.selection_after;
             true
@@ -990,20 +1054,13 @@ fn merge_step(last: &mut UndoStep, step: &UndoStep) -> bool {
             {
                 return false;
             }
-            last.removed = concat_text(&last.removed, &step.removed);
+            last.removed.append(&step.removed);
             last.range.end = last.range.start + last.removed.len();
             last.selection_after = step.selection_after;
             true
         }
         EditKind::Replace | EditKind::Paste | EditKind::CompositionCommit => false,
     }
-}
-
-fn concat_text(left: &Arc<str>, right: &Arc<str>) -> Arc<str> {
-    let mut text = String::with_capacity(left.len() + right.len());
-    text.push_str(left);
-    text.push_str(right);
-    Arc::from(text)
 }
 
 pub(crate) struct EditableText {
@@ -1097,7 +1154,7 @@ impl EditableText {
         match &self.display {
             DisplayText::Identity => display_byte.min(self.committed.len()),
             DisplayText::Masked(masked) => {
-                masked.raw_byte_for_display(&self.committed, display_byte)
+                masked.raw_byte_for_display(self.committed.len(), display_byte)
             }
             DisplayText::Composed(composed) => composed.raw_byte_for_display(display_byte),
         }
@@ -1114,7 +1171,9 @@ impl EditableText {
     pub(crate) fn display_byte_for_raw(&self, raw_byte: usize) -> usize {
         match &self.display {
             DisplayText::Identity => raw_byte.min(self.committed.len()),
-            DisplayText::Masked(masked) => masked.display_byte_for_raw(&self.committed, raw_byte),
+            DisplayText::Masked(masked) => {
+                masked.display_byte_for_raw(self.committed.len(), raw_byte)
+            }
             DisplayText::Composed(composed) => composed.display_byte_for_raw(raw_byte),
         }
     }
@@ -1123,7 +1182,9 @@ impl EditableText {
         let raw_byte = raw_byte.min(self.committed.len());
         match &self.display {
             DisplayText::Identity => snap_caret_forward(&self.committed, raw_byte),
-            DisplayText::Masked(masked) => masked.display_byte_after_raw(&self.committed, raw_byte),
+            DisplayText::Masked(masked) => {
+                masked.display_byte_after_raw(self.committed.len(), raw_byte)
+            }
             DisplayText::Composed(composed) => composed.caret_display_byte_for_raw(raw_byte),
         }
     }
@@ -1308,11 +1369,10 @@ impl EditableText {
             self.bump_generation();
             return Some(display_changed);
         }
-        let removed: Arc<str> = Arc::from(&self.committed[composition.raw.clone()]);
-        let inserted_arc: Arc<str> = Arc::from(inserted);
+        let removed = EditText::new(&self.committed[composition.raw.clone()]);
         let selection_before = composition.selection_before;
         let Some(display_changed) =
-            self.write_committed(composition.raw.start, composition.raw.end, &inserted_arc)
+            self.write_committed(composition.raw.start, composition.raw.end, inserted)
         else {
             let display_changed = self.refresh_composition_display();
             let display_len = self.display_len();
@@ -1322,14 +1382,14 @@ impl EditableText {
             return Some(display_changed);
         };
         let display_len = self.display_len();
-        let caret_raw = composition.raw.start + inserted_arc.len();
+        let caret_raw = composition.raw.start + inserted.len();
         let caret_display = self.caret_display_byte_for_raw(caret_raw);
         self.selection = TextSelection::collapsed(TextCursor::at(caret_display, display_len));
         let step = UndoStep {
             kind: EditKind::CompositionCommit,
             range: composition.raw,
             removed,
-            inserted: inserted_arc,
+            inserted: EditText::new(inserted),
             selection_before,
             selection_after: self.selection,
         };
@@ -1624,10 +1684,9 @@ impl EditableText {
         if start != end && self.committed[start..end] == *inserted {
             return None;
         }
-        let removed: Arc<str> = Arc::from(&self.committed[start..end]);
-        let inserted: Arc<str> = Arc::from(inserted);
+        let removed = EditText::new(&self.committed[start..end]);
         let selection_before = self.selection;
-        let display_changed = self.write_committed(start, end, &inserted)?;
+        let display_changed = self.write_committed(start, end, inserted)?;
         let display_len = self.display_len();
         self.selection = match after {
             AfterEdit::CollapsedAtRaw(raw_byte) => {
@@ -1639,7 +1698,7 @@ impl EditableText {
             kind,
             range: start..end,
             removed,
-            inserted,
+            inserted: EditText::new(inserted),
             selection_before,
             selection_after: self.selection,
         };
@@ -1652,7 +1711,8 @@ impl EditableText {
         let step = self.undo.undo.pop()?;
         let start = step.range.start;
         let end = start + step.inserted.len();
-        match self.write_committed(start, end, &step.removed) {
+        let removed = step.removed.materialize();
+        match self.write_committed(start, end, &removed) {
             Some(display_changed) => {
                 self.selection = step.selection_before.normalized(self.display_len());
                 self.undo.push_redo(step);
@@ -1671,7 +1731,8 @@ impl EditableText {
         let step = self.undo.redo.pop()?;
         let start = step.range.start;
         let end = start + step.removed.len();
-        match self.write_committed(start, end, &step.inserted) {
+        let inserted = step.inserted.materialize();
+        match self.write_committed(start, end, &inserted) {
             Some(display_changed) => {
                 self.selection = step.selection_after.normalized(self.display_len());
                 self.undo.push_undo(step);
@@ -1721,6 +1782,16 @@ impl EditableText {
             .map(|step| step.removed.len() + step.inserted.len())
             .sum();
         (self.undo.undo_len(), self.undo.redo_len(), bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn undo_copy_bytes(&self) -> usize {
+        self.undo
+            .undo
+            .iter()
+            .chain(self.undo.redo.iter())
+            .map(|step| step.removed.copy_bytes() + step.inserted.copy_bytes())
+            .sum()
     }
 }
 
@@ -2079,13 +2150,7 @@ pub(crate) fn metrics(
     let Some(content) = tree.text_content(node) else {
         return Err(EngineError::StaleNode { node });
     };
-    let metrics = slot
-        .shaped()
-        .line_metrics(width, content.style.alignment)
-        .ok_or_else(|| EngineError::TextEditLayout {
-            node,
-            detail: SmolStr::new_static("text layout has no lines"),
-        })?;
+    let metrics = slot.shaped().line_metrics(width, content.style.alignment);
     Ok(TextEditMetrics {
         line_height: metrics.line_height,
         first_baseline: metrics.first_baseline,
@@ -2094,11 +2159,26 @@ pub(crate) fn metrics(
     })
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_CANCEL_COMPOSITION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_cancel_composition() {
+    FAIL_CANCEL_COMPOSITION.with(|fail| fail.set(true));
+}
+
 pub(crate) fn cancel_composition(
     app: &mut App,
     window: WindowId,
     node: NodeId,
 ) -> Result<bool, EngineError> {
+    #[cfg(test)]
+    if FAIL_CANCEL_COMPOSITION.with(std::cell::Cell::take) {
+        return Err(EngineError::StaleNode { node });
+    }
     let result = {
         let target = app
             .window_mut(window)
@@ -3140,7 +3220,7 @@ pub(crate) fn sync_ime_cursor_area(app: &mut App, window: WindowId) {
     let focused = app.focused(window);
     let editable_focused = focused.and_then(|node| {
         let tree = app.window(window)?.tree();
-        (tree.editable(node).is_some() && tree.is_effectively_visible(node)).then_some(node)
+        (tree.editable(node).is_some() && ime_cursor_area_visible(tree, node)).then_some(node)
     });
     let request = editable_focused.and_then(|node| ime_cursor_request(app, window, node));
     let Some(target) = app.window_mut(window) else {
@@ -3168,6 +3248,54 @@ pub(crate) fn clear_managed_ime_cursor_area(app: &mut App, window: WindowId) {
     if managed_ime_request(target) {
         target.clear_ime_cursor_request();
     }
+}
+
+fn ime_cursor_area_visible(tree: &NodeTree, node: NodeId) -> bool {
+    if !tree.is_effectively_visible(node) {
+        return false;
+    }
+    let mut cursor = Some(node);
+    let mut opacity = 1.0f32;
+    while let Some(current) = cursor {
+        let Ok(target) = tree.get(current) else {
+            return false;
+        };
+        opacity *= match target.style_patch().opacity {
+            Some(value) if value.is_nan() => 0.0,
+            Some(value) => value.clamp(0.0, 1.0),
+            None => 1.0,
+        };
+        cursor = target.parent();
+    }
+    if opacity <= 0.0 {
+        return false;
+    }
+    let Ok(target) = tree.get(node) else {
+        return false;
+    };
+    let bounds = target.layout().bounds;
+    if bounds.size.width <= LogicalPx::ZERO || bounds.size.height <= LogicalPx::ZERO {
+        return false;
+    }
+    let screen = scroll::to_screen(tree, node, bounds);
+    let mut cursor = target.parent();
+    while let Some(current) = cursor {
+        let Ok(ancestor) = tree.get(current) else {
+            return false;
+        };
+        if ancestor.clip() == Clip::Bounds {
+            let clip = scroll::to_screen(
+                tree,
+                current,
+                ancestor.layout().bounds.inset(ancestor.layout().border),
+            );
+            if !clip.intersects(screen) {
+                return false;
+            }
+        }
+        cursor = ancestor.parent();
+    }
+    true
 }
 
 fn managed_ime_request(window: &Window) -> bool {
@@ -3366,6 +3494,24 @@ fn extend_pointer_selection(app: &mut App, window: WindowId, node: NodeId, posit
     }
 }
 
+pub(crate) fn text_node_local_point(
+    tree: &NodeTree,
+    node: NodeId,
+    position: LogicalPoint,
+) -> Option<LogicalPoint> {
+    match tree.hit_test(position) {
+        Some(hit) if hit.node == node => Some(hit.local_point),
+        _ => {
+            let bounds = tree.get(node).ok()?.layout().bounds;
+            let offset = scroll::ancestor_offset(tree, node);
+            Some(LogicalPoint::new(
+                position.x + offset.x - bounds.origin.x,
+                position.y + offset.y - bounds.origin.y,
+            ))
+        }
+    }
+}
+
 fn text_layout_point(
     app: &App,
     window: WindowId,
@@ -3374,17 +3520,7 @@ fn text_layout_point(
 ) -> Option<LogicalPoint> {
     let tree = app.window(window)?.tree();
     let content = tree.content_offset(node);
-    let local = match tree.hit_test(position) {
-        Some(hit) if hit.node == node => hit.local_point,
-        _ => {
-            let bounds = tree.get(node).ok()?.layout().bounds;
-            let offset = scroll::ancestor_offset(tree, node);
-            LogicalPoint::new(
-                position.x + offset.x - bounds.origin.x,
-                position.y + offset.y - bounds.origin.y,
-            )
-        }
-    };
+    let local = text_node_local_point(tree, node, position)?;
     Some(LogicalPoint::new(local.x - content.x, local.y - content.y))
 }
 
@@ -3640,6 +3776,9 @@ fn handle_enter(app: &mut App, window: WindowId, context: &KeyContext, repeat: b
         }
         return true;
     }
+    if context.readonly {
+        return false;
+    }
     if repeat {
         return true;
     }
@@ -3790,7 +3929,7 @@ fn apply_blink(app: &mut App, window: WindowId, trigger: BlinkTrigger) {
         if let Some(previous) = previous
             && let Some(previous_window) = previous.window()
         {
-            sync_caret_visible(app, previous_window, previous, false, false);
+            sync_caret_visible(app, previous_window, previous, false, true);
         }
     }
     let Some(node) = focused else {
@@ -4558,19 +4697,23 @@ mod tests {
         };
         let raw = "e\u{301}x";
         assert_eq!(
-            masked.display_byte_after_raw(raw, 0),
+            masked.display_byte_after_raw(raw.len(), 0),
             0,
             "簇起点保持 display 簇起点"
         );
         assert_eq!(
-            masked.display_byte_after_raw(raw, 1),
+            masked.display_byte_after_raw(raw.len(), 1),
             3,
             "簇内 byte 吸附到簇尾"
         );
-        assert_eq!(masked.display_byte_after_raw(raw, 2), 3);
-        assert_eq!(masked.display_byte_after_raw(raw, 3), 3, "下一簇起点保持");
-        assert_eq!(masked.display_byte_after_raw(raw, 4), 6);
-        assert_eq!(masked.display_byte_after_raw(raw, usize::MAX), 6);
+        assert_eq!(masked.display_byte_after_raw(raw.len(), 2), 3);
+        assert_eq!(
+            masked.display_byte_after_raw(raw.len(), 3),
+            3,
+            "下一簇起点保持"
+        );
+        assert_eq!(masked.display_byte_after_raw(raw.len(), 4), 6);
+        assert_eq!(masked.display_byte_after_raw(raw.len(), usize::MAX), 6);
         assert_eq!(editable.caret_display_byte_for_raw(1), 3);
         assert_eq!(editable.caret_display_byte_for_raw(4), 6);
     }

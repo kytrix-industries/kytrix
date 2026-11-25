@@ -378,6 +378,7 @@ impl A11yTreeSnapshot {
         self.nodes
             .iter()
             .find(|node| node.engine == engine && !self.is_virtual_text_run(node))
+            .or_else(|| (self.focus_node.engine == engine).then_some(&self.focus_node))
     }
 
     #[must_use]
@@ -404,10 +405,6 @@ impl A11yTreeSnapshot {
             .iter()
             .any(|node| node.text_run == Some(record.id))
             || self.focus_node.text_run == Some(record.id)
-            || self
-                .focus_ancestors
-                .iter()
-                .any(|node| node.text_run == Some(record.id))
     }
 
     pub fn nodes_with_role(&self, role: A11yRole) -> impl Iterator<Item = &A11yNode> {

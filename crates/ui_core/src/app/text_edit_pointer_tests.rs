@@ -14,7 +14,7 @@ use crate::{
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         color::Color,
-        style::{Clip, Cursor, Style},
+        style::{Clip, Cursor, Style, StylePatch},
         style_builder::StyleBuilder,
     },
     test_support::app::TestApp,
@@ -887,8 +887,8 @@ fn pointer_drag_moves_stay_within_the_interaction_budget() {
         "拖拽期间不得重新 shape"
     );
     assert!(
-        per_move_us < 4_000.0,
-        "pointer move 平均 {per_move_us:.1}µs 超出预算"
+        per_move_us < 250.0,
+        "pointer move 平均 {per_move_us:.1}µs 超出预算（实测约 8µs，回归到 1ms 必须失败）"
     );
     println!(
         "pointer_move_budget: {moves} moves in {:.2}ms ({per_move_us:.1}µs/move)",
@@ -1120,4 +1120,145 @@ fn padding_and_border_offsets_map_the_pointer_to_text() {
         "padding/border 的 content_offset 不得参与拖选映射错误"
     );
     let _ = up(&mut app, end, at);
+}
+
+fn mount_editable_in_host(app: &mut TestApp, host: NodeId, width: f32) -> NodeId {
+    let id = app.window_id();
+    let target = app.app_mut().window_mut(id).expect("窗口存在");
+    let editable = NodeBuilder::editable_text(spec(false))
+        .style(node_style(Some(width)))
+        .build(target.tree_mut(), host)
+        .expect("挂载可编辑文本");
+    target.tree_mut().set_style_patch_for_test(
+        editable,
+        StylePatch {
+            interactive: Some(true),
+            ..StylePatch::default()
+        },
+    );
+    editable
+}
+
+fn mount_press_host(app: &mut TestApp) -> (NodeId, NodeId) {
+    let id = app.window_id();
+    let host = {
+        let target = app.app_mut().window_mut(id).expect("窗口存在");
+        let root = target.tree().root();
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .width(px(220.0))
+                    .height(px(44.0))
+                    .padding_x(px(12.0))
+                    .padding_y(px(8.0))
+                    .build(),
+            )
+            .tab_stop(false)
+            .build(target.tree_mut(), root)
+            .expect("挂载按压宿主")
+    };
+    let editable = mount_editable_in_host(app, host, 180.0);
+    app.app_mut()
+        .window_mut(id)
+        .expect("窗口存在")
+        .tree_mut()
+        .set_press_focus_target(host, editable)
+        .expect("登记按压宿主");
+    (host, editable)
+}
+
+fn chrome_point(app: &TestApp, host: NodeId, from_right: f32) -> LogicalPoint {
+    let bounds = bounds(app, host);
+    LogicalPoint::new(
+        bounds.origin.x + bounds.size.width - px(from_right),
+        bounds.origin.y + bounds.size.height * 0.5,
+    )
+}
+
+#[test]
+fn a_press_on_the_host_chrome_places_the_caret_at_the_nearest_text_position() {
+    let mut app = TestApp::new();
+    let id = app.window_id();
+    let (host, editable) = mount_press_host(&mut app);
+    app.app_mut()
+        .text_edit_set_value(id, editable, "abcdef")
+        .expect("写入文本");
+    frame(&mut app);
+    assert_eq!(
+        selection_of(&app, editable).range(),
+        6..6,
+        "初始 caret 在末尾"
+    );
+
+    let at = Instant::now();
+    let left = chrome_point(&app, host, 217.0);
+    let _ = down(&mut app, left, Modifiers::empty(), at);
+    assert_eq!(
+        focused(&app),
+        Some(editable),
+        "按压控件外壳的 padding 必须直接聚焦 editable，不得停留在中间宿主"
+    );
+    assert_eq!(
+        selection_of(&app, editable).range(),
+        0..0,
+        "左侧 padding 必须把 caret clamp 到最近文本位置（行首）"
+    );
+    assert!(
+        press_active(&app),
+        "按压宿主必须进入文本按压态（可继续拖选）"
+    );
+    let _ = up(&mut app, left, at);
+
+    let right = chrome_point(&app, host, 3.0);
+    let _ = down(&mut app, right, Modifiers::empty(), at);
+    assert_eq!(
+        selection_of(&app, editable).range(),
+        6..6,
+        "右侧 padding 必须把 caret clamp 到行长（行尾）"
+    );
+    let _ = up(&mut app, right, at);
+    frame(&mut app);
+}
+
+#[test]
+fn a_press_host_places_the_caret_only_in_the_explicitly_targeted_editable() {
+    let mut app = TestApp::new();
+    let id = app.window_id();
+    let (host, first) = mount_press_host(&mut app);
+    let target = mount_editable_in_host(&mut app, host, 80.0);
+    app.app_mut()
+        .window_mut(id)
+        .expect("窗口存在")
+        .tree_mut()
+        .set_press_focus_target(host, target)
+        .expect("登记按压宿主");
+    app.app_mut()
+        .text_edit_set_value(id, first, "aaa")
+        .expect("写入文本");
+    app.app_mut()
+        .text_edit_set_value(id, target, "bbb")
+        .expect("写入文本");
+    frame(&mut app);
+    assert_eq!(selection_of(&app, first).range(), 3..3);
+    assert_eq!(selection_of(&app, target).range(), 3..3);
+
+    let at = Instant::now();
+    let left = chrome_point(&app, host, 217.0);
+    let _ = down(&mut app, left, Modifiers::empty(), at);
+    assert_eq!(
+        focused(&app),
+        Some(target),
+        "宿主必须把焦点交给显式目标，而不是 DFS 里的第一个 editable"
+    );
+    assert_eq!(
+        selection_of(&app, target).range(),
+        0..0,
+        "显式目标必须按点落 caret"
+    );
+    assert_eq!(
+        selection_of(&app, first).range(),
+        3..3,
+        "未被指定的 editable 不得被动 caret"
+    );
+    let _ = up(&mut app, left, at);
 }

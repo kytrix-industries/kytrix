@@ -106,7 +106,6 @@ pub(crate) struct NodeSpec {
     a11y: Option<crate::a11y::A11yOverride>,
     bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
     tab_stop: bool,
-    press_focuses_editable: bool,
 }
 
 static EMPTY_STYLE_PATCH: StylePatch = StylePatch {
@@ -133,7 +132,6 @@ pub struct Node {
     hit_shape: Option<Box<HitShape>>,
     layout_override: Option<LayoutOverride>,
     tab_stop: bool,
-    press_focuses_editable: bool,
     paint: Option<Box<PaintSpec>>,
     content_offset: LogicalPoint,
     text_bind: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
@@ -215,8 +213,10 @@ impl Node {
     }
 
     #[must_use]
-    pub(crate) fn press_focuses_editable(&self) -> bool {
-        self.press_focuses_editable
+    pub(crate) fn press_focus_target(&self) -> Option<NodeId> {
+        self.interaction
+            .as_deref()
+            .and_then(|slot| slot.press_focus_target)
     }
 
     #[must_use]
@@ -423,6 +423,13 @@ impl NodeTree {
         spec: NodeSpec,
     ) -> Result<NodeId, EngineError> {
         arena::insert_child(self, parent, spec)
+    }
+    pub fn set_press_focus_target(
+        &mut self,
+        host: NodeId,
+        target: NodeId,
+    ) -> Result<(), EngineError> {
+        arena::set_press_focus_target(self, host, target)
     }
     pub fn remove(
         &mut self,
@@ -1025,6 +1032,14 @@ impl NodeTree {
     }
     pub(crate) fn invalidate_text_line(&mut self, node: NodeId) {
         content::invalidate_text_line(self, node)
+    }
+
+    pub(crate) fn request_text_line_relayout(
+        &mut self,
+        node: NodeId,
+        atlas_generations: (u32, u32),
+    ) -> bool {
+        content::request_text_line_relayout(self, node, atlas_generations)
     }
 
     pub(crate) fn invalidate_text_layout(&mut self, node: NodeId) -> bool {

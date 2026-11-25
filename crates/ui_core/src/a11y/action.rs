@@ -4,7 +4,7 @@ use crate::{
     a11y::{
         A11yAction, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yNodeId, A11yRole,
         A11yTextPosition,
-        mapping::{action_from_accesskit, effective_role_of},
+        mapping::{action_from_accesskit, effective_role_of, is_text_input_role},
         textrun,
     },
     app::App,
@@ -359,10 +359,7 @@ fn normalized_selection_target(tree: &NodeTree, target: NodeId) -> NodeId {
 }
 
 fn is_text_input(tree: &NodeTree, node: NodeId) -> bool {
-    matches!(
-        effective_role_of(tree, node),
-        A11yRole::TextInput | A11yRole::MultilineTextInput
-    )
+    is_text_input_role(effective_role_of(tree, node))
 }
 
 fn is_text_run(tree: &NodeTree, node: NodeId) -> bool {

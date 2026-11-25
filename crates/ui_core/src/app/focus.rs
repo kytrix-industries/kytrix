@@ -71,7 +71,7 @@ pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
 
 pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -> bool {
     let scope = focus_scope(app, window);
-    let focus_changed = {
+    {
         let Some(target) = app.windows.get_mut(&window) else {
             return false;
         };
@@ -103,11 +103,8 @@ pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -
                 target.tree_mut().mark_paint(changed);
             }
         }
-        old != node
-    };
-    if focus_changed {
-        crate::text_edit::cancel_pointer_press(app, window);
     }
+    crate::text_edit::cancel_pointer_press(app, window);
     crate::text_edit::note_focus_change(app, window);
     app.request_frame();
     true

@@ -38,7 +38,6 @@ pub struct NodeBuilder {
     a11y: Option<crate::a11y::A11yOverride>,
     bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
     tab_stop: bool,
-    press_focuses_editable: bool,
 }
 
 impl Default for NodeBuilder {
@@ -67,14 +66,7 @@ impl NodeBuilder {
             a11y: None,
             bind_a11y: None,
             tab_stop: true,
-            press_focuses_editable: false,
         }
-    }
-
-    #[must_use]
-    pub fn press_focuses_editable(mut self) -> Self {
-        self.press_focuses_editable = true;
-        self
     }
 
     #[must_use]
@@ -277,10 +269,14 @@ impl NodeBuilder {
             "leaf nodes cannot have children: canvas/geometry/override nodes do not lay out \
              children, so the subtree would never produce layout boxes or pixels"
         );
-        debug_assert!(
-            self.editable.is_none() || self.bind_text.is_none(),
-            "editable text nodes own their display mirror; bind_text would overwrite it"
-        );
+        if self.editable.is_some() && self.bind_text.is_some() {
+            return Err(EngineError::NodeSpecInvalid {
+                parent,
+                detail: SmolStr::new_static(
+                    "editable text nodes own their display mirror; bind_text would overwrite it",
+                ),
+            });
+        }
         let mut spec = NodeSpec::new(self.kind, self.style, self.bind_style);
         if let Some(measure) = self.measure {
             spec = spec.with_measure(measure);
@@ -320,9 +316,6 @@ impl NodeBuilder {
         }
         if !self.tab_stop {
             spec = spec.with_tab_stop(false);
-        }
-        if self.press_focuses_editable {
-            spec = spec.with_press_focuses_editable();
         }
         tree.insert_child(parent, spec)
     }

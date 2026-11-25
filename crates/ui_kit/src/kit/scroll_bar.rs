@@ -26,6 +26,10 @@ use ui_core::{
 
 use crate::theme::handle::ThemeHandle;
 
+const MIN_THUMB_TRACK_SHARE: f32 = 0.5;
+
+const MIN_THUMB_LENGTH: LogicalPx = px(2.0);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollbarAxis {
     Vertical,
@@ -525,9 +529,11 @@ fn thumb_length(
         return LogicalPx::ZERO;
     }
     let ratio = (viewport / content).clamp(0.0, 1.0);
-    (track_len * ratio)
-        .max(options.min_thumb.min(track_len))
-        .min(track_len)
+    let min_thumb = (track_len * MIN_THUMB_TRACK_SHARE)
+        .max(MIN_THUMB_LENGTH)
+        .min(options.min_thumb)
+        .min(track_len);
+    (track_len * ratio).max(min_thumb).min(track_len)
 }
 
 fn thumb_offset(
@@ -630,6 +636,27 @@ mod tests {
         assert_eq!(
             thumb_length(LogicalPx::ZERO, px(100.0), px(400.0), options()),
             LogicalPx::ZERO
+        );
+    }
+
+    #[test]
+    fn a_short_track_scales_the_minimum_thumb_down() {
+        let short = thumb_length(px(16.0), px(16.0), px(10_000.0), options());
+        assert_eq!(short, px(8.0), "16px 轨道上的最小滑块按轨道比例收缩");
+        assert_eq!(
+            thumb_offset(px(16.0), short, px(9_984.0), px(9_984.0)),
+            px(8.0),
+            "极短轨道仍留下可拖拽行程"
+        );
+        assert_eq!(
+            thumb_length(px(4.0), px(1.0), px(10_000.0), options()),
+            px(2.0),
+            "极端轨道仍保留 2px 最小滑块"
+        );
+        assert_eq!(
+            thumb_length(px(200.0), px(10.0), px(10_000.0), options()),
+            px(20.0),
+            "正常轨道仍使用配置下限"
         );
     }
 
@@ -805,6 +832,10 @@ mod ui_tests {
     }
 
     fn harness(mode: ScrollbarMode) -> ScrollHarness {
+        harness_with(mode, BOX_HEIGHT, CONTENT_HEIGHT)
+    }
+
+    fn harness_with(mode: ScrollbarMode, box_height: f32, content_height: f32) -> ScrollHarness {
         let mut app = TestApp::new();
         let window = app.window_id();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
@@ -817,7 +848,7 @@ mod ui_tests {
                     StyleBuilder::new()
                         .relative()
                         .width(px(BOX_WIDTH))
-                        .height(px(BOX_HEIGHT))
+                        .height(px(box_height))
                         .overflow_hidden()
                         .build(),
                 )
@@ -829,7 +860,7 @@ mod ui_tests {
             .make_scroll(window, container, ScrollConfig::default())
             .expect("scrollable");
         app.app_mut()
-            .set_scroll_content(&handle, LogicalSize::new(px(BOX_WIDTH), px(CONTENT_HEIGHT)))
+            .set_scroll_content(&handle, LogicalSize::new(px(BOX_WIDTH), px(content_height)))
             .expect("content");
         let options = ScrollbarOptions {
             mode,
@@ -1079,6 +1110,64 @@ mod ui_tests {
         assert!(
             (offset - 120.0).abs() < px(0.5),
             "拖拽换算后的偏移：{offset}"
+        );
+    }
+
+    #[test]
+    fn a_very_short_track_keeps_a_draggable_thumb() {
+        let mut harness = harness_with(ScrollbarMode::Always, 16.0, 40_000.0);
+        let track = harness.bar.nodes().0.expect("track node");
+        let track_bounds = harness.app.probe().bounds(track).expect("track bounds");
+        assert!(
+            (track_bounds.size.height.value() - 16.0).abs() < 0.5,
+            "前置：16px 极短轨道，实际 {}",
+            track_bounds.size.height.value()
+        );
+        let thumb = thumb_bounds(&harness);
+        assert!(
+            thumb.size.height >= px(2.0),
+            "极短轨道的最小滑块不得塌成零高度：{}",
+            thumb.size.height.value()
+        );
+        assert!(
+            track_bounds.size.height - thumb.size.height >= px(2.0),
+            "极短轨道必须留下拖拽行程：track {} thumb {}",
+            track_bounds.size.height.value(),
+            thumb.size.height.value()
+        );
+
+        let origin = ui_core::math::LogicalPoint::new(
+            thumb.origin.x + thumb.size.width / 2.0,
+            thumb.origin.y + thumb.size.height / 2.0,
+        );
+        let _ = harness.app.inject(InputEvent::pointer_down(
+            origin,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let promoted = ui_core::math::LogicalPoint::new(origin.x, origin.y + 10.0);
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(promoted, Modifiers::empty()));
+        let moved = ui_core::math::LogicalPoint::new(origin.x, origin.y + 20.0);
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(moved, Modifiers::empty()));
+        let _ = harness.app.inject(InputEvent::pointer_up(
+            moved,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let offset = harness
+            .app
+            .app()
+            .scroll_state(&harness.handle)
+            .expect("state")
+            .offset
+            .y;
+        assert!(
+            offset > px(0.0),
+            "拖拽极短轨道的滑块必须改变滚动偏移：{offset}"
         );
     }
 

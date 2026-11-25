@@ -290,13 +290,22 @@ pub(crate) fn frame(
         debug_hud::finish_frame(state);
     }
     if !stale_text.is_empty() {
-        if let Some(target) = app.windows.get_mut(&window) {
+        let atlas_generations = (app.atlas.generation(), app.glyph_atlas.color_generation());
+        let requested = {
+            let target = app.windows.get_mut(&window)?;
             let tree = target.tree_mut();
+            let mut requested = false;
             for node in stale_text {
-                tree.invalidate_text_line(node);
+                if tree.request_text_line_relayout(node, atlas_generations) {
+                    tree.invalidate_text_line(node);
+                    requested = true;
+                }
             }
+            requested
+        };
+        if requested {
+            app.request_frame();
         }
-        app.request_frame();
     }
     if unresolved_canvas_text > 0 {
         app.text

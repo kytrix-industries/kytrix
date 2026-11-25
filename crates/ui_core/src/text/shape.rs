@@ -333,12 +333,7 @@ impl ShapedText {
             ShapedKind::Simple(simple) => simple.metrics().line_height,
             ShapedKind::Parley(snapshot) => {
                 let snapshot = snapshot.borrow();
-                let line = snapshot.layout.lines().next();
-                debug_assert!(
-                    line.is_some(),
-                    "an empty parley layout always carries a strut line"
-                );
-                line.map_or_else(
+                snapshot.layout.lines().next().map_or_else(
                     || self.style.size * self.style.line_height.unwrap_or(1.0),
                     |line| px(line.metrics().line_height),
                 )
@@ -347,35 +342,30 @@ impl ShapedText {
         LogicalSize::new(LogicalPx::ZERO, line_height)
     }
 
-    pub(crate) fn line_metrics(
-        &self,
-        width: LogicalPx,
-        alignment: TextAlign,
-    ) -> Option<TextLineMetrics> {
+    pub(crate) fn line_metrics(&self, width: LogicalPx, alignment: TextAlign) -> TextLineMetrics {
         match &self.kind {
             ShapedKind::Parley(snapshot) => {
                 let mut snapshot = snapshot.borrow_mut();
                 snapshot.break_and_align(Some(width.max(LogicalPx::ZERO)), align_of(alignment));
-                let line_height = snapshot
-                    .layout
-                    .lines()
-                    .next()
-                    .map(|line| px(line.metrics().line_height))?;
-                Some(TextLineMetrics {
+                let line_height = snapshot.layout.lines().next().map_or_else(
+                    || self.style.size * self.style.line_height.unwrap_or(1.0),
+                    |line| px(line.metrics().line_height),
+                );
+                TextLineMetrics {
                     line_height,
                     first_baseline: snapshot.layout.first_baseline().map(px),
                     line_count: snapshot.layout.lines().count(),
                     content_height: px(snapshot.layout.height()),
-                })
+                }
             }
             ShapedKind::Simple(simple) => {
                 let metrics = simple.metrics();
-                Some(TextLineMetrics {
+                TextLineMetrics {
                     line_height: metrics.line_height,
                     first_baseline: Some(metrics.baseline),
                     line_count: 1,
                     content_height: metrics.line_height,
-                })
+                }
             }
         }
     }
@@ -1155,11 +1145,11 @@ fn rasterize_parley(
                             continue;
                         };
                         if color_monochrome {
-                            diagnostics.push(color_glyph_monochrome_diagnostic(
-                                &font,
-                                glyph.id,
-                                item_range.clone(),
-                            ));
+                            diagnostics.push(TextDiagnostic::ColorGlyphMonochrome {
+                                font: font_label(&font),
+                                glyph: glyph.id,
+                                text_range: item_range.clone(),
+                            });
                         }
                         glyphs.push(positioned);
                     }
@@ -1210,18 +1200,6 @@ fn rasterize_parley(
         scale: ctx.scale,
     };
     Ok((shaped, diagnostics))
-}
-
-fn color_glyph_monochrome_diagnostic(
-    font: &parley::FontData,
-    glyph: u32,
-    text_range: core::ops::Range<usize>,
-) -> TextDiagnostic {
-    TextDiagnostic::ColorGlyphMonochrome {
-        font: font_label(font),
-        glyph,
-        text_range,
-    }
 }
 
 fn emit_glyph(
@@ -4186,58 +4164,67 @@ mod tests {
 
     #[test]
     fn a_colr_v1_only_font_emits_the_color_glyph_monochrome_diagnostic() {
-        let Some((font, glyph)) = crate::text::raster::colr_v1_only_font() else {
-            eprintln!("skip: no rebuildable single-font available for the COLRv1 fixture");
+        const FAMILY: &str = "Kytrix COLRv1 Fixture";
+        let Some((font, glyph)) = crate::text::raster::require_color_glyph_monochrome_fixture()
+        else {
             return;
         };
+        let mut font_cx = parley::FontContext::new();
+        let registered = font_cx.collection.register_fonts(
+            font.data,
+            Some(parley::fontique::FontInfoOverride {
+                family_name: Some(FAMILY),
+                ..Default::default()
+            }),
+        );
+        assert!(!registered.is_empty(), "注入字体必须注册成功");
+        let mut layout_cx: parley::LayoutContext<crate::paint::color::ColorBrush> =
+            parley::LayoutContext::new();
+        let family = parley::FontFamily::Single(parley::FontFamilyName::Named(
+            std::borrow::Cow::Borrowed(FAMILY),
+        ));
+        let content = TextContent::new("A", TextStyle::new(px(32.0)).with_wrap(TextWrap::NoWrap));
+        let shaped =
+            super::ShapedText::shape(&mut font_cx, &mut layout_cx, &family, &content, 1, &[]);
         let mut raster = crate::text::raster::GlyphRasterizer::new();
         let mut glyph_atlas = crate::text::atlas::GlyphAtlas::new();
         let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
             crate::paint::atlas::AtlasKind::Glyph,
             (256, 256),
         );
-        let generation = atlas.generation();
-        let mut ctx = super::RasterCtx {
-            raster: &mut raster,
-            glyph_atlas: &mut glyph_atlas,
-            atlas: &mut atlas,
-            generation,
-            scale: DevicePixelRatio::ONE,
-        };
-        let (positioned, color_monochrome) = super::emit_glyph(
-            &mut ctx,
-            &font,
-            glyph,
-            32.0,
-            &crate::text::raster::GlyphVariation::default(),
-            px(0.0),
-            px(0.0),
-        )
-        .expect("fabricated font must rasterize")
-        .expect("outline fallback must produce coverage");
-        assert!(
-            color_monochrome,
-            "COLRv1-only 字形必须把 color_monochrome 冒泡到 shape 层"
+        let (line, diagnostics, _) = rasterize_line(
+            &shaped,
+            px(256.0),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyph_atlas,
+            &mut atlas,
         );
         assert_eq!(
-            positioned.tile.atlas,
-            crate::paint::atlas::AtlasKind::Glyph,
-            "单色回退必须落在 R8 图集"
+            diagnostics.len(),
+            1,
+            "COLRv1-only 字形必须恰好产生一条单色回退诊断：{diagnostics:?}"
         );
-        assert!(!glyph_atlas.has_color_records());
-        let diagnostic = super::color_glyph_monochrome_diagnostic(&font, glyph, 0..1);
-        match diagnostic {
+        match &diagnostics[0] {
             TextDiagnostic::ColorGlyphMonochrome {
+                font: label,
                 glyph: diagnostic_glyph,
                 text_range,
-                font: label,
             } => {
-                assert_eq!(diagnostic_glyph, glyph);
-                assert_eq!(text_range, 0..1);
+                assert_eq!(*diagnostic_glyph, glyph);
+                assert_eq!(text_range, &(0..1), "诊断必须覆盖被回退的字形文本区间");
                 assert!(!label.is_empty(), "诊断必须带上字体标签");
             }
             other => panic!("期望 ColorGlyphMonochrome，得到 {other:?}"),
         }
+        let glyphs = all_glyphs(&line);
+        assert_eq!(glyphs.len(), 1, "fixture 文本只有一个字形");
+        assert_eq!(
+            glyphs[0].tile.atlas,
+            crate::paint::atlas::AtlasKind::Glyph,
+            "单色回退必须落在 R8 图集"
+        );
+        assert!(!glyph_atlas.has_color_records(), "单色回退不得写入彩色图集");
     }
 
     #[test]

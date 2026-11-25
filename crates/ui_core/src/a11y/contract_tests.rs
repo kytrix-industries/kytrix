@@ -4,7 +4,7 @@ use smol_str::SmolStr;
 
 use crate::{
     a11y::{
-        A11yNodeId, A11yRole, A11yTreeSnapshot,
+        A11yCustomAction, A11yDiagnostic, A11yNodeId, A11yOverride, A11yRole, A11yTreeSnapshot,
         adapter::{to_accesskit, to_tree_update},
     },
     app::App,
@@ -306,6 +306,13 @@ fn assert_no_plaintext(snapshot: &A11yTreeSnapshot, secret: &str) {
         {
             assert!(!text.contains(secret), "a11y 记录泄漏密码明文：{text}");
         }
+        for custom in &record.custom_actions {
+            assert!(
+                !custom.label.contains(secret),
+                "a11y 记录的自定义动作标签泄漏密码明文：{}",
+                custom.label
+            );
+        }
     }
     let update = to_tree_update(snapshot);
     for (id, node) in &update.nodes {
@@ -321,6 +328,13 @@ fn assert_no_plaintext(snapshot: &A11yTreeSnapshot, secret: &str) {
             assert!(
                 !text.contains(secret),
                 "TreeUpdate 节点 {id:?} 泄漏密码明文：{text}"
+            );
+        }
+        for custom in node.custom_actions() {
+            assert!(
+                !custom.description.contains(secret),
+                "TreeUpdate 节点 {id:?} 的自定义动作描述泄漏密码明文：{}",
+                custom.description
             );
         }
     }
@@ -662,4 +676,110 @@ fn composition_never_changes_the_accessible_name() {
         Some("输入"),
         "有 label 时 name 在组合期保持恒定"
     );
+}
+
+fn has_missing_label(app: &App, node: NodeId) -> bool {
+    app.a11y_diagnostics().iter().any(|diagnostic| {
+        matches!(diagnostic, A11yDiagnostic::MissingLabel { node: reported } if *reported == node)
+    })
+}
+
+#[test]
+fn an_unlabelled_editable_input_is_diagnosed_as_missing_a_label() {
+    let (_runtime, mut app, window) = new_app();
+    let input = mount(
+        &mut app,
+        window,
+        unlabelled_editable_spec(A11yRole::TextInput, false, false),
+        "secret-value",
+    );
+    let (snapshot, tree) = full_tree(&mut app, window);
+    let (input_id, _run_id) = text_runs(&snapshot, input);
+    assert!(
+        has_missing_label(&app, input),
+        "无 label 的可编辑输入必须记 MissingLabel（即使有 value）：{:?}",
+        app.a11y_diagnostics()
+    );
+    let input_node = node_ref(tree.state(), input_id);
+    assert_eq!(
+        input_node.label(),
+        None,
+        "诊断不得把内容文本变成 Name（name 仍只来自 label）"
+    );
+    assert_eq!(input_node.value().as_deref(), Some("secret-value"));
+}
+
+#[test]
+fn a_labelled_editable_input_is_not_diagnosed_as_missing_a_label() {
+    let (_runtime, mut app, window) = new_app();
+    let input = mount(
+        &mut app,
+        window,
+        editable_spec(A11yRole::TextInput, false, false),
+        "value",
+    );
+    let (snapshot, _tree) = full_tree(&mut app, window);
+    let _ = text_runs(&snapshot, input);
+    assert!(
+        !has_missing_label(&app, input),
+        "有显式 label 的输入不得记 MissingLabel：{:?}",
+        app.a11y_diagnostics()
+    );
+}
+
+#[test]
+fn an_unlabelled_password_input_is_diagnosed_without_leaking_plaintext() {
+    let (_runtime, mut app, window) = new_app();
+    let input = mount(
+        &mut app,
+        window,
+        unlabelled_editable_spec(A11yRole::PasswordInput, false, true),
+        "s3cret",
+    );
+    let (snapshot, tree) = full_tree(&mut app, window);
+    let (input_id, _run_id) = text_runs(&snapshot, input);
+    assert!(
+        has_missing_label(&app, input),
+        "无 label 的密码输入同样必须记 MissingLabel：{:?}",
+        app.a11y_diagnostics()
+    );
+    let diagnostics = format!("{:?}", app.a11y_diagnostics());
+    assert!(
+        !diagnostics.contains("s3cret"),
+        "MissingLabel 诊断不得携带密码明文：{diagnostics}"
+    );
+    assert_no_plaintext(&snapshot, "s3cret");
+    assert_eq!(
+        node_ref(tree.state(), input_id).label(),
+        None,
+        "诊断不得改变密码输入的 Name 语义"
+    );
+}
+
+#[test]
+#[should_panic(expected = "自定义动作")]
+fn the_plaintext_scan_covers_custom_action_labels() {
+    let (_runtime, mut app, window) = new_app();
+    let _input = mount(
+        &mut app,
+        window,
+        editable_spec(A11yRole::PasswordInput, false, true),
+        "s3cret",
+    );
+    {
+        let target = app.window_mut(window).expect("window");
+        let root = target.tree().root();
+        NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                custom_actions: vec![A11yCustomAction {
+                    id: 1,
+                    label: SmolStr::new_static("s3cret"),
+                }],
+                ..A11yOverride::default()
+            })
+            .build(target.tree_mut(), root)
+            .expect("custom action node");
+    }
+    let (snapshot, _tree) = full_tree(&mut app, window);
+    assert_no_plaintext(&snapshot, "s3cret");
 }
