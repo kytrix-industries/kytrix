@@ -81,23 +81,28 @@ git check-attr text eol -- crates/ui_core/src/app.rs     # 预期：text: set / 
 
 ---
 
-## 3. `render/linux.rs` 的 `cfg` 口径（P4-74）
+## 3. 三端 `readback` 的 `cfg` 口径（P4-74，已统一）
 
-三端 `readback` 模块的编译条件**不一致**，这是已登记口径，不是笔误：
+三端 `readback` 模块的编译条件**已统一为** `#[cfg(any(test, feature = "test-support"))]`：
 
 | 文件 | `readback` 的 cfg |
 |---|---|
 | `crates/ui_core/src/render/windows.rs` | `#[cfg(any(test, feature = "test-support"))]` |
 | `crates/ui_core/src/render/macos.rs` | `#[cfg(any(test, feature = "test-support"))]` |
-| `crates/ui_core/src/render/linux.rs` | `#[cfg(feature = "test-support")]`（**无 `test`**） |
+| `crates/ui_core/src/render/linux.rs` | `#[cfg(any(test, feature = "test-support"))]` |
 
-**后果**：Linux 上只跑 `cargo test`（`cfg(test)`、无 `test-support`）时 `readback` 不编译，因此
-**任何读回 / 像素路径在 Linux 只能在 `--features test-support` 下验证**；另两端在纯 `cfg(test)` 下也可用。
-三端门禁命令之所以要分开写，就是这条口径导致的。
+统一后 Linux 的纯 `cfg(test)` 也能编译读回路径，于是 `cargo test -p ui_core`（默认 features）在
+Linux 上也会编译 `render/linux/readback.rs`；该模块的 `ReadbackImage` 尺寸字段因此必须在锁内测试里被
+读取（`compositor.rs` 的 `pixel()` 用 `image.width/height` 做边界断言），否则 Linux 默认 clippy 会报
+`dead_code`。
 
-**纪律**：不要「顺手统一」这行 cfg（属 P4-74 的文档口径，改动需独立批次）。若确实要统一，必须同时复核
-`cargo check -p ui_core --tests`、`cargo check -p ui_core --features test-support --tests` 在**三端**的编译矩阵，
-并同步 `crates/ui_core/tests/golden/README.md` 的「平台」节。
+**门禁矩阵（三端一致）**：
+- `cargo test -p ui_core`（默认 features）：必须 0 failed，且 Linux 默认 clippy 必须通过；
+- `cargo test -p ui_core --features test-support`：必须 0 failed；
+- `cargo +nightly clippy -p ui_core --all-targets -- -D warnings`：默认与 `--features test-support` 都要过。
+
+**纪律**：再改这行 cfg 必须同时复核上述矩阵在**三端**的编译结果，并同步
+`crates/ui_core/tests/golden/README.md` 的「平台」节。
 
 ---
 
@@ -121,6 +126,6 @@ git check-attr text eol -- crates/ui_core/src/app.rs     # 预期：text: set / 
 | 设计与实现的偏差（编号连续） | `.docs/text-input-redesign-design.md` §11.2 |
 | WONTFIX（明确不修） | 同文件 §11.11.2（含理由分类：环境限制 / 模型固有 / 测试读面 / 微优化；工件类单列） |
 | 引擎公开面增量 | `crates/ui_core/design/custom-gui-engine-design.md` §1.3（白名单表 + 增量子表） |
-| 待填数字 | 统一用 `TBD-数字` 占位，合并后由维护者一次回填（禁止写旧值） |
+| 数字口径 | 文档中的门禁数字必须写实测值（禁止写旧值或占位；换工具链后重跑并同步 §11.7 表格） |
 
 **不要**在代码里留注释解释历史原因（`AGENTS.md` §1.6）；背景进提交说明或上述文档。

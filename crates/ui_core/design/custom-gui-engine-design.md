@@ -378,12 +378,12 @@ pub(crate) use windows as backend;
    | 面 | 形状 / 语义 | 备注 |
    |---|---|---|
    | `NodeBuilder::editable_text(EditableSpec)` | 建 `NodeKind::Text` + 注册可编辑 side table（`NodeTree::editable*`）：引擎级可编辑文本节点，**不**新增 `NodeKind` 变体 | 公开类型见本表末行 |
-   | `NodeBuilder::press_focuses_editable(target)` | **press 宿主显式指定唯一目标 editable**：按下落在宿主或其非焦点后代时聚焦 `target` 并按**落点**置 caret；宿主自身不进 Tab 序、不改变「点控件外失焦」 | **P4-10 新签名**（旧形状无参、按 DFS 取子树第一个 editable，已删除）；契约「一个 press 宿主显式指定一个目标」 |
+   | `NodeTree::set_press_focus_target(host, target)` | **press 宿主显式指定唯一目标 editable**：按下落在宿主或其非焦点后代时聚焦 `target` 并按**落点**置 caret；宿主自身不进 Tab 序、不改变「点控件外失焦」 | **P4-10 新签名**（旧形状无参、按 DFS 取子树第一个 editable，已删除）；契约「一个 press 宿主显式指定一个目标」 |
    | `App::text_edit_{value, snapshot, composition, metrics}` | 只读面，统一 `Result<_, EngineError>`；`metrics` 在**布局脏但未 `compute_layout`** 时返回上一完整帧的自洽旧值（P4-05 契约收窄） | `TextEditMetrics{line_height, first_baseline, line_count, content_height}` |
    | `App::text_edit_{set_value, set_placeholder, set_label, set_a11y_invalid, undo, redo}` | 程序化写面；`set_value` 绕过 `readonly`/`disabled` 并清 undo（对齐旧 `set_value` 契约） | 组合 setter 已按单一职责拆分（P4-35） |
    | `App::text_edit_set_{placeholder, caret, selection, composition}_color`、`App::text_edit_placeholder_color`（getter）、`App::text_edit_set_text_style` | 逐颜色 / 样式 setter + placeholder 颜色只读 getter；**没有** `EditableColors` 打包类型 | P4-35 |
    | `App::{focused_editable, text_edit_caret_visible, next_wake_deadline, ime_enabled}` | 当前聚焦可编辑节点 / 闪烁相位 / 下一唤醒时刻 / 窗口 IME 开关（只读观测面） | 宿主调度与测试读面 |
-   | `App::set_scroll_line_height` | 滚动步长按引擎行高校正；`nan` / `inf` / `<= 0` 拒绝、同值返回 `Ok(false)` | `Result<bool, EngineError>` |
+   | `App::set_scroll_line_height` | 滚动步长按引擎行高校正；`nan` / `inf` / `<= 0` 拒绝，成功返回 `Ok(())` | `Result<(), EngineError>` |
    | `text_edit::{TextCursor, TextAffinity, TextSelection, TextEditSnapshot, TextEditComposition, TextEditMetrics, EditableSpec, sanitize_text}` | 公开类型与文本清洗入口（不暴露 parley 类型） | 深路径 `ui_core::text_edit::…` |
    | `test-support`: `App::signal_write_calls()` | 信号写入口计数探针：**每次进入 `App::write` 即 +1**（先自增再写存储 ⇒ 等值写、失效写、最终返回 `false` 的写都计入；`write_with` / `update` 不计），只在 `feature = "test-support"` 下存在 | 镜像短路判别（`ui_kit::the_mirror_short_circuits_when_the_generation_does_not_change`） |
 

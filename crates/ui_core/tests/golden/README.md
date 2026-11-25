@@ -95,14 +95,16 @@ mismatched_pixels <= floor(compared_pixels × max_mismatch_ppm / 1_000_000)
 
 ## 跳过与硬失败：`KYTRIX_TEST_SKIP_GPU_PIXELS=1`（P4-02）
 
-像素类用例（golden 比对 + `color_emoji_glyphs_render_in_color` 的彩色像素断言）**默认硬失败**：
-「本机没有 emoji 字体」「本机没有呈现后端」不再是「打印一行 skip 后通过」。只有环境确实缺失且已显式声明时才豁免。
+像素类用例（全部 golden 比对 + `color_emoji_glyphs_render_in_color` 的彩色像素断言 + COLRv1-only 夹具）**默认硬失败**：
+「本机没有 emoji 字体」「本机没有呈现后端」不再是「打印一行 skip 后通过」。覆盖范围：`assert_golden` 在
+`GoldenError::Snapshot(NoRenderer | Gpu)` 时读本开关；彩色像素用例在离屏读回失败或缺少彩色字体时读本开关；
+COLRv1-only 夹具在找不到任何单面字体文件时读本开关。只有环境确实缺失且已显式声明时才豁免。
 
 | 项 | 约定 |
 |---|---|
-| 开关 | 环境变量 `KYTRIX_TEST_SKIP_GPU_PIXELS=1`（**仅值为 `1` 时生效**，其它值视为未设置） |
+| 开关 | 环境变量 `KYTRIX_TEST_SKIP_GPU_PIXELS=1`（**仅值为 `1` 时生效**，其它值（含空串）视为未设置） |
 | 用途 | 最小化容器 / CI 镜像**无 emoji 字体**、**无可用 GPU 后端**（`SnapshotError::Gpu`）等宿主能力缺失 |
-| 行为 | 打印可读 `reason`（点名缺失的字体 / 设备）后跳过断言；输出必须以 `SKIP` 前缀带原因，报告里必须能看到 |
+| 行为 | 打印可读 `reason`（点名缺失的字体 / 设备）后跳过断言；输出为 `skip <用例名>: <reason> (explicitly exempted by KYTRIX_TEST_SKIP_GPU_PIXELS=1)`，报告里必须能看到 |
 | 限制 ① | **不得**在常规 CI / 开发机上默认置位 |
 | 限制 ② | **不得**用于让「基线差异 / 真回归」变绿——差异只走重基纪律逐张确认 |
 | 限制 ③ | 豁免不改变「本设备有基线就必须通过」的判定（有基线时任何豁免都无效） |

@@ -1,8 +1,8 @@
 use ui_core::{
     math::DevicePixelRatio,
     test_support::snapshot::{
-        GoldenError, SnapshotCase, SnapshotImage, SnapshotScene, SnapshotTheme, Tolerance,
-        assert_golden, capture, compare, gpu_guard,
+        GoldenError, SnapshotCase, SnapshotError, SnapshotImage, SnapshotScene, SnapshotTheme,
+        Tolerance, assert_golden, capture, compare, gpu_guard,
     },
 };
 
@@ -18,6 +18,14 @@ fn case(scene: SnapshotScene, theme: SnapshotTheme, scale: f32) -> SnapshotCase 
 fn run_with(case: SnapshotCase, tolerance: Tolerance) {
     let _guard = gpu_guard();
     match assert_golden(case, tolerance) {
+        Err(GoldenError::Snapshot(SnapshotError::NoRenderer | SnapshotError::Gpu { .. }))
+            if gpu_pixel_exempt() =>
+        {
+            eprintln!(
+                "skip golden {}: no render backend (explicitly exempted by KYTRIX_TEST_SKIP_GPU_PIXELS=1)",
+                case.golden_name()
+            );
+        }
         Ok(diff) => eprintln!(
             "{} max={} avg={:.3} mismatch={}/{} (allowed {})",
             case.golden_name(),
@@ -82,7 +90,7 @@ fn golden_color_emoji() {
 }
 
 fn gpu_pixel_exempt() -> bool {
-    std::env::var_os("KYTRIX_TEST_SKIP_GPU_PIXELS").is_some()
+    std::env::var("KYTRIX_TEST_SKIP_GPU_PIXELS").is_ok_and(|value| value == "1")
 }
 
 fn skip_gpu_pixel_assertions(reason: &str) {

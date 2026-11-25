@@ -2622,7 +2622,12 @@ mod tests {
         }
 
         fn pixel(image: &super::ReadbackImage, x: u32, y: u32) -> [u8; 4] {
-            assert!(x < image.width && y < image.height, "pixel ({x}, {y}) outside {}x{}", image.width, image.height);
+            assert!(
+                x < image.width && y < image.height,
+                "pixel ({x}, {y}) outside {}x{}",
+                image.width,
+                image.height
+            );
             let index = ((y * image.width + x) * 4) as usize;
             [
                 image.rgba8[index],

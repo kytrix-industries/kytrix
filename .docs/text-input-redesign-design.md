@@ -729,7 +729,7 @@ pub struct InputSpec {
 | ㉔ | 像素 golden 依赖**宿主 emoji 字体版本**：Windows 基线来自 Segoe UI Emoji（`crates/ui_core/tests/golden/warp/color_emoji_1_light.png`）。Segoe UI Emoji 无国旗字形（`🇨🇳` 渲染成两个字母/单色），Linux 全局字体栈不含 emoji 家族时部分 emoji 走单色轮廓（实测见 §11.7） | `eee0f04e` |
 | ㉕ | COLRv1 只有**单色回退**（swash 0.2.10 只读 COLR v0 记录）：Segoe UI Emoji 幸运地保留 3487 条 v0 base glyph，故 Windows 彩色可用；仅 v1 的字体退回单色并记 `ColorGlyphMonochrome` 诊断 | `eee0f04e` |
 | ㉖ | **caret 矩形按行盒归一**：parley 的 `Cursor::geometry` 返回 `min/max(block, content)` 的并集（Linux 字体下可高于行盒：20 行盒 vs 22 caret），引擎在 `inline_flow::caret_rect` 里把 caret 吸附到**所在行盒**（top = 行顶、height = `LineMetrics.line_height`），保证「行盒 / caret / 占位符 / 滚动步长 / IME 候选框」同一口径（§3.1 约束），并让 ensure-visible 的「留 1 行」在任意字体度量下可达 | P5 收尾（本篇 §11.9） |
-| ㉗ | 输入控件**整盒可点**：引擎新增 `NodeBuilder::press_focuses_editable`（press 落在该节点或其后代上时，若没有更近的焦点目标，则聚焦它承载的 editable；该节点不进入 Tab 序、不改变「点控件外失焦」语义）；`input.rs` 的 root 用它代理 padding/border，`kit::ScrollBar` 新增 `ScrollbarOptions::tab_stop(bool)`（输入框的 track/thumb 置 false，动作与拖拽不变）。恢复旧组件「整盒可点」行为，同时每个输入仍只有 editable 一个 Tab 停靠点。**P4-10 起该 API 改为显式目标 `press_focuses_editable(target)`，见 ㊳** | 终审 round 1 修复（P3-1） |
+| ㉗ | 输入控件**整盒可点**：引擎新增 press 宿主代理（后续 ㊳ 收敛为 `NodeTree::set_press_focus_target`；press 落在该节点或其后代上时，若没有更近的焦点目标，则聚焦它承载的 editable；该节点不进入 Tab 序、不改变「点控件外失焦」语义）；`input.rs` 的 root 用它代理 padding/border，`kit::ScrollBar` 新增 `ScrollbarOptions::tab_stop(bool)`（输入框的 track/thumb 置 false，动作与拖拽不变）。恢复旧组件「整盒可点」行为，同时每个输入仍只有 editable 一个 Tab 停靠点。**P4-10 起该 API 改为显式目标 `press_focuses_editable(target)`，见 ㊳** | 终审 round 1 修复（P3-1） |
 | ㉘ | `InputState::validate` **删除**：字段错误只有单一来源——`InputNode` 镜像按引擎文本（清洗后字素簇）+ `InputSpec.max_length` 派生 `TooLong`，业务错误仍由应用层 `InputState::set_error` 注入；`validate` 在生产代码 0 消费者（§5.3 应用层校验未落地），删除避免「按镜像文本 / 按请求文本」双源语义 | 终审 round 1 修复（P4-16） |
 | ㉙ | 彩色字形图集 tile 在上传时**复制 1 纹素边缘色**（padding 语义）：straight-alpha 纹素与 `FILTER = LINEAR` 在分数设备位置/缩放下不再出现「双线性 × straight alpha」导致的边缘偏暗；`render/shaders/contract.md` 增补彩色图集的 padding/纹素语义条目，Windows WARP 的 `golden/color_emoji_1_light.png` 随实现重出 | P4-01（§11.11.3 裁决 1） |
 | ㉚ | 像素用例**缺 emoji 字体 / 无呈现后端默认硬失败**：`color_emoji_glyphs_render_in_color` 与 `golden_color_emoji` 不再「打印 skip 后 return」；只有显式置 `KYTRIX_TEST_SKIP_GPU_PIXELS=1` 才允许跳过，且必须打印可读 reason（用途、限制与更新流程见 `crates/ui_core/tests/golden/README.md`） | P4-02（裁决 2） |
@@ -740,7 +740,7 @@ pub struct InputSpec {
 | ㉟ | IME 光标区写入的**可见性口径统一**：聚焦 editable 必须同时满足 `opacity > 0`、非零尺寸、未被祖先 scroll/clip 完全裁剪，才写 `set_ime_cursor_area`；否则不写（候选窗不再定位到不可见位置）。该口径**只用于 IME 定位**，paint / hit-test / a11y 的既有可见性判定不变（那部分另立任务） | P4-07（裁决 7） |
 | ㊱ | `stale_text` / `line_is_live` 修复路径加**去抖记账**：同一节点在同一帧内只记一次「需修复」，避免逐 tile LRU 淘汰导致每帧 `invalidate_text_line + request_frame` 的理论活锁 | P4-08（裁决 8） |
 | ㊲ | `MissingLabel` 诊断**纳入「有 value 无 label」**：条件不再是 `label.is_none() && value.is_none()`（该条件因 `EditableText::a11y_patch` 恒填 value 而永不触发）；未加 label 的输入框现在会报该诊断 | P4-09（裁决 9） |
-| ㊳ | press 宿主**显式目标 + 按点落 caret**：`NodeBuilder::press_focuses_editable(target)` 由宿主显式指定**唯一**目标 editable（旧的「DFS 取子树第一个 editable」隐式解析删除），按下时聚焦 `target` 并按落点置 caret；契约约束「一个 press 宿主显式指定一个目标」，多个候选不再由遍历顺序决定（含 P4-11） | P4-10 / P4-11（裁决 10） |
+| ㊳ | press 宿主**显式目标 + 按点落 caret**：`NodeTree::set_press_focus_target(host, target)` 由宿主显式指定**唯一**目标 editable（builder 带参版本因 root 先于 editable 构建会成死 API，最终改为 build 后回填）（旧的「DFS 取子树第一个 editable」隐式解析删除），按下时聚焦 `target` 并按落点置 caret；契约约束「一个 press 宿主显式指定一个目标」，多个候选不再由遍历顺序决定（含 P4-11） | P4-10 / P4-11（裁决 10） |
 | ㊴ | `.gitattributes` **不入库**：`.gitignore` 的 `.*` 规则继续生效，且**不**新增 `!.gitattributes` 豁免；EOL 规则改为「本机配置」写进 `CONTRIBUTING.md`（附可直接复制的文件内容与校验命令），worktree/远端不依赖该文件 | P4-12（裁决 11） |
 | ㊵ | COLRv1 `numBaseGlyphPaintRecords` 读取后**按表长 clamp**（`min(count, 表中可用记录数)`）再迭代：损坏/恶意字体不再可能迭代 43 亿次，正常字体行为不变 | P4-13（裁决 12） |
 | ㊶ | ScrollBar 极短 track（`visible_lines = 1` 的 16 px）时**最小 thumb 按 track 比例收缩**：`min_thumb` 不再被 `min(track_len)` 截断成 `usable = 0`，拖拽与轨道点击保持可动（滚轮路径不受影响） | P4-14（裁决 13） |
@@ -759,7 +759,7 @@ pub struct InputSpec {
 ```rust
 // 构建
 NodeBuilder::editable_text(spec: EditableSpec) -> Self
-NodeBuilder::press_focuses_editable() -> Self  // 输入控件整盒可点（§11.2 ㉗）
+NodeTree::set_press_focus_target(host, target) -> Result<(), EngineError>  // press 宿主显式目标（§11.2 ㉗/㊳）
 // 类型（不暴露 parley）
 text_edit::{TextAffinity, TextCursor, TextSelection, TextEditSnapshot, TextEditMetrics,
             TextEditComposition, EditableSpec, sanitize_text}
@@ -780,10 +780,10 @@ App::text_edit_set_label(window, node, impl Into<SmolStr>) -> Result<bool, Engin
 App::text_edit_set_a11y_invalid(window, node, bool) -> Result<bool, EngineError>
 App::text_edit_set_{placeholder,caret,selection,composition}_color(window, node, Color) -> Result<bool, EngineError>
 App::text_edit_set_text_style(window, node, TextStyle) -> Result<bool, EngineError>
-App::set_scroll_line_height(...)
+App::set_scroll_line_height(handle, LogicalPx) -> Result<(), EngineError>
 // 错误
 EngineError::{TextEditNotAvailable{node}, TextEditSpecInvalid{node,detail}, TextEditLayout{node,detail},
-              AtlasExhausted{kind}}
+              NodeSpecInvalid{node,detail}, AtlasExhausted{kind}}
 // 渲染
 paint::atlas::AtlasKind::{Glyph=0, Image=1, ColorGlyph=2}、KIND_COLOR_GLYPH = 8
 ```
@@ -984,7 +984,7 @@ ensure-visible 的「已达」判定改为「clamp 后目标」。二者都不�
 
 | # | 问题 | 修复 | 证据（测试） |
 |---|---|---|---|
-| P3-1 | 点击输入框 padding/border/滚动条 gutter 会清焦点（旧组件整盒可点；对 `submit_on_blur` 字段等同误触提交） | 引擎新增 `NodeBuilder::press_focuses_editable()`（press 落在该节点或其非焦点后代上时，解析它承载的 editable；该节点不进入 Tab 序，点控件外仍失焦）→ kit root 声明代理；`kit::ScrollBar` 新增 `ScrollbarOptions::tab_stop(bool)`，输入框 track/thumb 置 `false`（动作/拖拽保留）→ 每个输入仍只有 editable 一个 Tab 停靠点 | `ui_kit::clicking_the_control_chrome_focuses_the_editable_without_blurring_it`（焦点/`submit_on_blur` 不触发/IME 不关不重开/无额外帧）、`clicking_the_multiline_padding_and_gutter_focuses_the_editable`、`the_input_contributes_exactly_one_tab_stop`（单行+多行 4 步 Tab 环）、`ui_core::interaction::focus::tests::a_press_host_*`（2 条）；变异 P3-1a/P3-1b 均 RED |
+| P3-1 | 点击输入框 padding/border/滚动条 gutter 会清焦点（旧组件整盒可点；对 `submit_on_blur` 字段等同误触提交） | 引擎新增 press 宿主显式目标 `NodeTree::set_press_focus_target`（press 落在该节点或其非焦点后代上时，解析它承载的 editable；该节点不进入 Tab 序，点控件外仍失焦）→ kit root 声明代理；`kit::ScrollBar` 新增 `ScrollbarOptions::tab_stop(bool)`，输入框 track/thumb 置 `false`（动作/拖拽保留）→ 每个输入仍只有 editable 一个 Tab 停靠点 | `ui_kit::clicking_the_control_chrome_focuses_the_editable_without_blurring_it`（焦点/`submit_on_blur` 不触发/IME 不关不重开/无额外帧）、`clicking_the_multiline_padding_and_gutter_focuses_the_editable`、`the_input_contributes_exactly_one_tab_stop`（单行+多行 4 步 Tab 环）、`ui_core::interaction::focus::tests::a_press_host_*`（2 条）；变异 P3-1a/P3-1b 均 RED |
 | P3-2 | 失焦不打断 undo 合并组（D7 明文要求） | `EditableText::set_focused` 在焦点变化时 `break_undo_group()` | `ui_core::blurring_breaks_the_undo_group_between_typing_sessions`、`blurred_masked_and_multiline_fields_start_a_new_undo_group`；既有 Enter/导航/粘贴打断与同聚焦会话合并用例不变；变异 RED |
 | P3-3 | 空 label 的可编辑节点把内容文本当 a11y Name（组合期 Name 随 preedit 变化，违反 §4.12） | `effective_label` 只信显式 label：可编辑节点/文本输入角色不再回退到内容文本 | `ui_core::a11y::contract_tests::{an_unlabelled_editable_input_exposes_no_accessible_name, composition_never_changes_the_accessible_name}`（consumer `label()==None`、组合前后 name 恒定）；既有 TextRun/密码掩码/组合期不暴露 preedit 契约全绿；变异 RED |
 | P4-1 | 本表 ⑨ 与实现相反 | 重写 ⑨（见上） | — |
@@ -1036,7 +1036,7 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 | P4-07 | IME 光标区可见性口径统一：`opacity > 0` + 非零尺寸 + 未被裁剪 | `text_edit.rs`（`sync_ime_cursor_area`）；㉟ |
 | P4-08 | `stale_text` / `line_is_live` 修复路径加去抖记账（一节点一帧一次） | `paint/pass.rs`、`app/frame.rs`；㊱ |
 | P4-09 | `MissingLabel` 诊断纳入「有 value 无 label」的可编辑节点 | `a11y/tree.rs`；㊲ |
-| P4-10 / P4-11 | `press_focuses_editable(target)`：宿主**显式指定唯一目标** + 按点落 caret；「一个 press 宿主一个目标」成文 | `node/builder.rs`、`interaction/focus.rs`、`ui_kit/src/kit/input.rs`、引擎设计 §1.3；㊳ |
+| P4-10 / P4-11 | `NodeTree::set_press_focus_target(host, target)`：宿主**显式指定唯一目标** + 按点落 caret；「一个 press 宿主一个目标」成文 | `node/tree.rs`、`interaction/focus.rs`、`app/input.rs`、`ui_kit/src/kit/input.rs`、引擎设计 §1.3；㊳ |
 | P4-12 | `.gitattributes` **不跟踪**（不加 `!.gitattributes`），规则改写入 `CONTRIBUTING.md` | `CONTRIBUTING.md` §1；㊴ |
 | P4-13 | COLRv1 `numBaseGlyphPaintRecords` **按表长 clamp** 后再迭代 | `text/raster.rs`；㊵ |
 | P4-14 | ScrollBar 极短 track 的**最小 thumb 按 track 比例收缩** | `ui_kit/src/kit/scroll_bar.rs`；㊶ |
@@ -1110,12 +1110,12 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 | 13 | P4-14 ScrollBar 极短 track | **最小 thumb 按 track 比例收缩** | ㊶ |
 | 14 | P4-76…P4-96（21 条） | **全部登记不修** | §11.11.2、㊷ |
 
-#### 11.11.4 本轮占位与待确认
+#### 11.11.4 本轮占位与遗留确认（全部已回填/已定案）
 
 | 项 | 状态 |
 |---|---|
 | §11.7 / §11.9 三端测试计数（P4-72） | 已按实测回填（Windows workspace 8923/0/30、lib 2314、TS 2655；Ubuntu lib 2097、TS 2431；macOS lib 2061、TS 2396） |
-| `press_focuses_editable(target)` 的精确形参落点（builder 形参 vs build 后回填） | 语义已定（宿主显式唯一目标 + 按点落 caret）；**签名以批 2A 源码为准**，若最终为「build 后回填」形态，按源码校正引擎设计 §1.3 与偏差 ㊳ |
+| `NodeTree::set_press_focus_target` 的精确落点（builder 形参 vs build 后回填） | 语义已定（宿主显式唯一目标 + 按点落 caret）；**最终形态为 build 后回填**（`node/tree.rs`），builder 带参版本未采用形态，按源码校正引擎设计 §1.3 与偏差 ㊳ |
 | 旧计数 `2062/2386/748`、`2027/2351/748` | 已在 §11.7 注明**过期**（round 2 为 `2067/2392/752`、`2032/2357/752`），不得引用 |
 
 ## 附录 A：关键证据索引

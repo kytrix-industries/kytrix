@@ -552,7 +552,7 @@ fn collect_font_files(dir: &std::path::Path, depth: usize, out: &mut Vec<std::pa
 
 #[cfg(test)]
 pub(crate) fn gpu_pixels_exempt() -> bool {
-    std::env::var_os("KYTRIX_TEST_SKIP_GPU_PIXELS").is_some()
+    std::env::var("KYTRIX_TEST_SKIP_GPU_PIXELS").is_ok_and(|value| value == "1")
 }
 
 #[cfg(test)]
