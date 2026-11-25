@@ -244,6 +244,48 @@ fn a_password_input_only_exposes_the_masked_text_run() {
     assert_no_plaintext(&snapshot, "s3cret");
 }
 
+#[test]
+fn a_composing_password_input_keeps_the_a11y_value_masked() {
+    let (_runtime, mut app, window) = new_app();
+    let input = mount(
+        &mut app,
+        window,
+        editable_spec(A11yRole::PasswordInput, false, true),
+        "s3cret",
+    );
+    let (snapshot, mut tree) = full_tree(&mut app, window);
+    let _ = text_runs(&snapshot, input);
+
+    assert!(app.set_focus(window, Some(input)));
+    app.dispatch(
+        window,
+        Event::Ime(ImeEvent::Preedit {
+            text: SmolStr::new_static("mima"),
+            caret: Some(4),
+            clauses: smallvec::SmallVec::new(),
+            replace: None,
+        }),
+    );
+    let composition = app
+        .text_edit_composition(window, input)
+        .expect("组合状态")
+        .expect("组合中");
+    assert!(!composition.preedit.is_empty(), "前置：已进入组合");
+
+    let snapshot = incremental(&mut app, window, &mut tree);
+    let (input_id, _run_id) = text_runs(&snapshot, input);
+    let state = tree.state();
+    let input_node = node_ref(state, input_id);
+
+    assert_eq!(
+        input_node.data().value(),
+        Some("••••••"),
+        "组合期的 a11y value 仍是已提交文本的掩码串"
+    );
+    assert_no_plaintext(&snapshot, "s3cret");
+    assert_no_plaintext(&snapshot, "mima");
+}
+
 fn assert_no_plaintext(snapshot: &A11yTreeSnapshot, secret: &str) {
     let mut records = Vec::with_capacity(snapshot.nodes().len() + 2);
     records.extend(snapshot.nodes().iter());

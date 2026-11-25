@@ -334,7 +334,7 @@ impl TabBar {
                 });
             let label = item.label.clone();
             let close_for_content = close.clone();
-            let close_watch = close.clone();
+            let close_watch = close;
             let tab_for_label = tab.clone();
             let label_bind = tab.clone();
             let size = inner.options.size;

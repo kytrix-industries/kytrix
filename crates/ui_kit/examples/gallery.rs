@@ -1287,7 +1287,7 @@ impl Gallery {
         );
         multiline.update_value(
             app,
-            "第一行\n第二行\n第三行\n第四行\n第五行\n第六行（可视 3 行：滚轮滚动、caret 移动自动露出、右侧 hover 出现滚动条）",
+            "第一行 🌍 彩色字形\n第二行 👨‍👩‍👧 emoji 走 RGBA 图集，整簇可删可移\n第三行\n第四行\n第五行\n第六行（可视 3 行：滚轮滚动、caret 移动自动露出、右侧 hover 出现滚动条）",
         );
         inputs.push(multiline);
         themed_label(

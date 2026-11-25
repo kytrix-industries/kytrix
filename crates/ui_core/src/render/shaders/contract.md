@@ -56,6 +56,12 @@
 | 保留          | 5     | —                                      | Geometry 实例化表达（v1 走 geometry 通道） |
 | 保留          | 6–7   | —                                      | 应用自定义（v1 不做，F-29）                |
 | `KIND_COLOR_GLYPH` | **8** | `Primitive::GlyphRun`（tile 来自彩色字形图集，每字形 1 实例） | `color = texel.rgb × texel.a`（linear 预乘，**不**乘 `color0`） |
+| 未分配        | ≥9    | —                                      | 保留（`params1.z` 超出上表即非法；shader 无 default 分支语义） |
+
+`AtlasKind` 的 CPU 索引与上表 `kind` 是两套编号，不要混用：`Glyph = 0` / `Image = 1` /
+`ColorGlyph = 2`（`paint::atlas::AtlasKind`），它是 descriptor 里的图集顺序；实例上真正决定
+FS 采样分支的是 `params1.z` 的 `kind`（`KIND_GLYPH = 1` / `KIND_IMAGE = 2` /
+`KIND_COLOR_GLYPH = 8`，`KIND_QUAD = 0` / `KIND_SHADOW = 3`）。
 
 `atlas_page`（`params1.y`）：**采样哪张图集由 `params1.z`（`kind`）决定，`.y` 只是该图集
 texture array 的层号（图集页索引）**。单色字形图集与彩色字形图集都恒 1 层、页索引恒 `0`；图片图集的层数是**运行时
@@ -64,6 +70,10 @@ texture array 的层号（图集页索引）**。单色字形图集与彩色字�
 数组按当前页数懒创建、**只增不减**（页数增长时按新层数重建数组 + App 全量重传每个已打开层；
 没有图片时是 1 层的 1×1 占位数组，不占 16 MiB）。`MAX_IMAGE_PAGES` 只是页号 / 待上传槽的上限，
 shader 不读任何上限（层号直接来自 `params1.y`）；对非图集 kind 写 `0` 并忽略。
+彩色字形图集的**页内尺寸**与单色字形 / 图片图集共用同一增长策略：边长 512 → 1024 → 2048
+（`ATLAS_PAGE_STEPS`，上限 `MAX_ATLAS_PAGE = 2048`），恒 1 层；满页上限下的内存是
+2048²×4 B = 16 MiB（RGBA8），单色字形图集是 2048²×1 B = 4 MiB（R8）。彩色页驱逐/重建与单色
+共用同一套 LRU 与 pass 计数，图集满的软失败走 `AtlasExhausted { kind }`。
 `gradient_kind`：`NONE = 0`、`HORIZONTAL = 1`、`VERTICAL = 2`、`RADIAL = 3`。
 `clip_depth`（`params1.w`）：链长，见 §1 硬约束 4。
 

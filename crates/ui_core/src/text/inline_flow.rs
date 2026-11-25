@@ -77,7 +77,22 @@ pub(crate) fn selection_rects(
 
 pub(crate) fn caret_rect(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> LogicalRect {
     let cursor = Cursor::from_byte_index(layout, byte_index, Affinity::Downstream);
-    to_rect(cursor.geometry(layout, 1.0))
+    let rect = to_rect(cursor.geometry(layout, 1.0));
+    let center = px(rect.origin.y.value() + rect.size.height.value() * 0.5);
+    let mut top = LogicalPx::ZERO;
+    let mut last = None;
+    for line in layout.lines() {
+        let height = px(line.metrics().line_height);
+        if center < top + height {
+            return LogicalRect::new(rect.origin.x, top, rect.size.width, height);
+        }
+        top += height;
+        last = Some((top, height));
+    }
+    match last {
+        Some((top, height)) => LogicalRect::new(rect.origin.x, top, rect.size.width, height),
+        None => rect,
+    }
 }
 
 const UNDERLINE_BASELINE_EM: f32 = 0.10;

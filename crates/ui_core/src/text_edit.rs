@@ -78,6 +78,7 @@ struct RevealKey {
     ancestor: Option<NodeId>,
     caret: LogicalRect,
     viewport: LogicalSize,
+    limit: LogicalPoint,
 }
 
 struct RevealGeometry {
@@ -1164,13 +1165,17 @@ impl EditableText {
         }
     }
 
+    fn a11y_value_for(&self, display: &DisplayText) -> SmolStr {
+        match display {
+            DisplayText::Masked(masked) => masked.text.clone(),
+            DisplayText::Composed(_) | DisplayText::Identity => self.build_a11y_value(),
+        }
+    }
+
     fn install_committed(&mut self, next: String, text_changed: bool) -> bool {
         self.committed = Arc::from(next);
         let display = self.build_display();
-        let a11y_value = match &display {
-            DisplayText::Masked(masked) => masked.text.clone(),
-            DisplayText::Composed(_) | DisplayText::Identity => self.build_a11y_value(),
-        };
+        let a11y_value = self.a11y_value_for(&display);
         self.a11y_value = a11y_value;
         let display_changed = match (&self.display, &display) {
             (DisplayText::Identity, DisplayText::Identity) => text_changed,
@@ -1372,7 +1377,9 @@ impl EditableText {
             DisplayText::Composed(composed) => composed.caret_display,
             _ => 0,
         };
+        let a11y_value = self.a11y_value_for(&display);
         self.display = display;
+        self.a11y_value = a11y_value;
         if self.composition.is_some() {
             self.selection = TextSelection::collapsed(TextCursor::at(caret, display_len));
         }
@@ -3890,7 +3897,7 @@ pub(crate) fn ensure_visible(app: &mut App, window: WindowId) {
     };
     let line_height = metrics(app, window, node).map_or_else(
         |_| geometry.focus.size.height.max(px(1.0)),
-        |metrics| metrics.line_height,
+        |metrics| metrics.line_height.max(geometry.focus.size.height),
     );
     let focus_wanted = reveal_offset(
         &slot,
@@ -3917,17 +3924,18 @@ pub(crate) fn ensure_visible(app: &mut App, window: WindowId) {
         set_reveal(app, window, node, Some(geometry.key));
         return;
     };
-    if wanted == slot.offset {
+    let target = clamp_reveal_target(&slot, geometry.viewport, wanted);
+    if target == slot.offset {
         set_reveal(app, window, node, Some(geometry.key));
         return;
     }
     let handle = crate::interaction::ScrollHandle::new(window, ancestor);
-    if app.scroll_to(&handle, wanted).is_err() {
+    if app.scroll_to(&handle, target).is_err() {
         return;
     }
     let reached = app
         .scroll_state(&handle)
-        .is_some_and(|state| state.offset == wanted || state.offset == slot.offset);
+        .is_some_and(|state| state.offset == target || state.offset == slot.offset);
     if reached {
         set_reveal(app, window, node, Some(geometry.key));
     }
@@ -3989,11 +3997,15 @@ fn reveal_geometry(app: &App, window: WindowId, node: NodeId) -> Option<RevealGe
     let viewport = ancestor.map_or_else(LogicalRect::default, |(container, _)| {
         scroll::viewport(tree, container)
     });
+    let limit = ancestor.map_or_else(LogicalPoint::default, |(_, slot)| {
+        scroll::max_offset(&slot, viewport.size)
+    });
     Some(RevealGeometry {
         key: RevealKey {
             ancestor: ancestor.map(|(container, _)| container),
             caret,
             viewport: viewport.size,
+            limit,
         },
         ancestor,
         focus,
