@@ -292,7 +292,7 @@ impl WindowRenderer {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -418,7 +418,7 @@ impl Drop for PanicGuard {
 struct Shared {
     state: Mutex<State>,
     work: Condvar,
-    atlas_pending: [AtomicU32; 2],
+    atlas_pending: [AtomicU32; 3],
 }
 
 struct State {
@@ -452,6 +452,7 @@ impl State {
 struct AtlasSlots {
     glyph: Option<AtlasUpload>,
     image: [Option<AtlasUpload>; MAX_IMAGE_PAGES as usize],
+    color_glyph: Option<AtlasUpload>,
 }
 
 struct AtlasUpload {
@@ -467,6 +468,7 @@ impl AtlasSlots {
         Self {
             glyph: None,
             image: [const { None }; MAX_IMAGE_PAGES as usize],
+            color_glyph: None,
         }
     }
 
@@ -485,6 +487,7 @@ impl AtlasSlots {
         let slot = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image[usize::from(layer)],
+            AtlasKind::ColorGlyph => &mut self.color_glyph,
         };
         assert!(
             slot.is_none(),
@@ -500,8 +503,9 @@ impl AtlasSlots {
     }
 
     fn take(&mut self) -> Vec<AtlasUpload> {
-        let mut uploads = Vec::with_capacity(1 + usize::from(MAX_IMAGE_PAGES));
+        let mut uploads = Vec::with_capacity(2 + usize::from(MAX_IMAGE_PAGES));
         uploads.extend(self.glyph.take());
+        uploads.extend(self.color_glyph.take());
         uploads.extend(self.image.iter_mut().filter_map(Option::take));
         uploads
     }
@@ -686,7 +690,7 @@ fn run_gpu_loop(
 ) -> Result<(), EngineError> {
     let mut pending: Option<FrameRequest> = None;
     let mut feedback_requested: Option<FrameIndex> = None;
-    let mut atlas_awaiting = [false; 2];
+    let mut atlas_awaiting = [false; 3];
     loop {
         if let Some(next) = shared.take_frame() {
             pending = Some(match pending.take() {
@@ -745,11 +749,7 @@ fn run_gpu_loop(
             } => {
                 for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
                     if std::mem::take(awaiting) {
-                        shared.atlas_uploaded(if index == 0 {
-                            AtlasKind::Glyph
-                        } else {
-                            AtlasKind::Image
-                        });
+                        shared.atlas_uploaded(crate::paint::atlas::ATLAS_KINDS[index]);
                     }
                 }
                 submitted.push_back(SubmittedFrame {
@@ -860,7 +860,7 @@ mod tests {
         Arc::new(Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         })
     }
 
@@ -993,7 +993,7 @@ mod tests {
         let shared = Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         };
         assert!(!shared.lock().has_work(), "空槽不是 GPU 线程的工作");
 
@@ -1013,7 +1013,7 @@ mod tests {
         let shared = Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         };
         shared.request_shutdown();
         shared.set_background([1.0, 0.0, 0.0, 1.0]);
@@ -1026,7 +1026,7 @@ mod tests {
         let terminated = Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         };
         terminated.mark_terminated();
         terminated.set_background([0.0, 1.0, 0.0, 1.0]);
@@ -1108,7 +1108,7 @@ mod tests {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         });
         let worker = Arc::clone(&shared);
         let hook = std::panic::take_hook();
@@ -1138,7 +1138,7 @@ mod tests {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         });
         shared.publish_error(EngineError::Swapchain {
             detail: SmolStr::new_static("recreate_swapchain_khr failed"),
@@ -1157,7 +1157,7 @@ mod tests {
         let shared = Shared {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         };
         shared.publish_error(EngineError::DeviceLost {
             reason: SmolStr::new_static("VK_ERROR_DEVICE_LOST"),

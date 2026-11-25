@@ -152,9 +152,11 @@ pub(super) fn submit_recorded(
         }
         let rebuild = {
             let atlas = shared.atlas();
-            renderer
-                .atlas_uploads
-                .reconcile_pages([atlas.spec(AtlasKind::Glyph), atlas.spec(AtlasKind::Image)])?
+            renderer.atlas_uploads.reconcile_pages([
+                atlas.spec(AtlasKind::Glyph),
+                atlas.spec(AtlasKind::Image),
+                atlas.spec(AtlasKind::ColorGlyph),
+            ])?
         };
         if !rebuild.is_empty() {
             let mut atlas = shared.atlas_write();

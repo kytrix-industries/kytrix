@@ -637,7 +637,8 @@ fn window_frame_reports_skipped_inline_box_images() {
         width: px(20.0),
         height: px(16.0),
         first_baseline: Some(px(12.0)),
-        atlas_generation: 0,
+        atlas_generation: 1,
+        color_atlas_generation: 1,
         font_stack_version: 1,
         scale: DevicePixelRatio::ONE,
     };

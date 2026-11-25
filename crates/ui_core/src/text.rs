@@ -750,6 +750,7 @@ pub(crate) struct ShapedLine {
     pub height: LogicalPx,
     pub first_baseline: Option<LogicalPx>,
     pub atlas_generation: u32,
+    pub color_atlas_generation: u32,
     pub font_stack_version: u32,
     pub scale: DevicePixelRatio,
 }
@@ -759,6 +760,7 @@ impl ShapedLine {
     pub(crate) fn empty(
         text: SmolStr,
         generation: u32,
+        color_generation: u32,
         font_stack_version: u32,
         scale: DevicePixelRatio,
     ) -> Self {
@@ -769,6 +771,7 @@ impl ShapedLine {
             height: LogicalPx::ZERO,
             first_baseline: None,
             atlas_generation: generation,
+            color_atlas_generation: color_generation,
             font_stack_version,
             scale,
         }
@@ -855,6 +858,7 @@ pub struct TextLayoutReport {
     pub atlas_rebuilds: usize,
     pub atlas_evictions: usize,
     pub skipped_glyphs: usize,
+    pub skipped_color_glyphs: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1073,6 +1077,7 @@ mod tests {
         let line = ShapedLine::empty(
             smol_str::SmolStr::new_static(""),
             3,
+            2,
             1,
             DevicePixelRatio::ONE,
         );

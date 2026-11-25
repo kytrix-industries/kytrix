@@ -20,6 +20,9 @@ void main() {
     if (kind == KYTRIX_KIND_GLYPH) {
         float coverage = texture(glyph_atlas, vec3(v_uv, 0.0)).r;
         color = p.color0 * coverage;
+    } else if (kind == KYTRIX_KIND_COLOR_GLYPH) {
+        vec4 texel = texture(color_glyph_atlas, vec3(v_uv, 0.0));
+        color = vec4(texel.rgb * texel.a, texel.a);
     } else if (kind == KYTRIX_KIND_IMAGE) {
         color = texture(image_atlas, vec3(v_uv, float(uint(p.params1.y)))) * p.color0;
     } else if (kind == KYTRIX_KIND_SHADOW) {

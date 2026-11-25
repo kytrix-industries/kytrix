@@ -5,6 +5,7 @@ using namespace metal;
 #define KYTRIX_KIND_GLYPH 1u
 #define KYTRIX_KIND_IMAGE 2u
 #define KYTRIX_KIND_SHADOW 3u
+#define KYTRIX_KIND_COLOR_GLYPH 8u
 
 #define KYTRIX_GRADIENT_NONE 0u
 #define KYTRIX_GRADIENT_HORIZONTAL 1u

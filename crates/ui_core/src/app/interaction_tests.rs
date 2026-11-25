@@ -915,6 +915,7 @@ fn an_idle_frame_does_not_advance_the_inline_composer() {
             &crate::paint::geometry_store::GeometryStore::new(),
             None,
             None,
+            None,
         )
         .expect("idle paint");
     assert_eq!(
@@ -941,6 +942,7 @@ fn an_idle_frame_does_not_advance_the_inline_composer() {
         .expect("window")
         .paint_frame(
             &crate::paint::geometry_store::GeometryStore::new(),
+            None,
             None,
             None,
         )
@@ -1006,6 +1008,7 @@ fn consecutive_idle_frames_accumulate_their_scene_deltas() {
                 &crate::paint::geometry_store::GeometryStore::new(),
                 None,
                 None,
+                None,
             )
             .expect("idle paint");
         assert_eq!(
@@ -1050,6 +1053,7 @@ fn consecutive_idle_frames_accumulate_their_scene_deltas() {
         .expect("window")
         .paint_frame(
             &crate::paint::geometry_store::GeometryStore::new(),
+            None,
             None,
             None,
         )
@@ -1111,6 +1115,7 @@ fn a_removed_lane_survives_an_idle_frame_and_reaches_the_next_commit() {
             &crate::paint::geometry_store::GeometryStore::new(),
             None,
             None,
+            None,
         )
         .expect("idle paint");
     assert_eq!((idle.damage.rects, idle.damage.full), (0, false));
@@ -1141,6 +1146,7 @@ fn a_removed_lane_survives_an_idle_frame_and_reaches_the_next_commit() {
         .expect("window")
         .paint_frame(
             &crate::paint::geometry_store::GeometryStore::new(),
+            None,
             None,
             None,
         )
@@ -1219,6 +1225,7 @@ fn an_a11y_only_frame_still_runs_after_a_retained_delta() {
         .expect("window")
         .paint_frame(
             &crate::paint::geometry_store::GeometryStore::new(),
+            None,
             None,
             None,
         )
@@ -1323,6 +1330,7 @@ fn an_idle_frame_keeps_its_scene_delta_for_the_next_scroll_frame() {
         .expect("window")
         .paint_frame(
             &crate::paint::geometry_store::GeometryStore::new(),
+            None,
             None,
             None,
         )

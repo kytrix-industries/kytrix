@@ -24,7 +24,7 @@ fn next_page(page: u32, max_page: u32) -> Option<u32> {
 pub(crate) fn texel_bytes(kind: AtlasKind) -> u32 {
     match kind {
         AtlasKind::Glyph => 1,
-        AtlasKind::Image => 4,
+        AtlasKind::Image | AtlasKind::ColorGlyph => 4,
     }
 }
 
@@ -32,6 +32,7 @@ pub(crate) fn texel_bytes(kind: AtlasKind) -> u32 {
 pub(crate) struct AtlasRebuilt {
     pub glyph: bool,
     pub image: bool,
+    pub color_glyph: bool,
 }
 
 impl AtlasRebuilt {
@@ -39,6 +40,7 @@ impl AtlasRebuilt {
         match kind {
             AtlasKind::Glyph => self.glyph = true,
             AtlasKind::Image => self.image = true,
+            AtlasKind::ColorGlyph => self.color_glyph = true,
         }
     }
 }

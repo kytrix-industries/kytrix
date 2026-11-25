@@ -12,6 +12,7 @@ use crate::{
 
 pub(crate) fn upload_atlas_pages(app: &mut App) {
     app.upload_glyph_page();
+    app.upload_color_glyph_page();
     app.upload_image_page();
 }
 
@@ -125,6 +126,132 @@ pub(crate) fn upload_glyph_page(app: &mut App) {
         let rects = window.atlas_rects(AtlasKind::Glyph, 0).clone();
         if window.queue_atlas_upload(AtlasKind::Glyph, 0, spec, &packed, rects) {
             window.clear_atlas_rects(AtlasKind::Glyph, 0);
+        }
+        app.packed = packed;
+    }
+}
+
+pub(crate) fn upload_color_glyph_page(app: &mut App) {
+    use crate::{paint::atlas::AtlasKind, render::AtlasArraySpec};
+
+    let page = app.glyph_atlas.color_page();
+    debug_assert_eq!(page.0, page.1, "color glyph atlas page must stay square");
+    let extent = page.0;
+    let len = extent as usize * extent as usize * 4;
+    let spec = AtlasArraySpec {
+        page: extent,
+        layers: 1,
+    };
+
+    let cleared = app.glyph_atlas.color_take_cleared();
+    let has_records = app.glyph_atlas.has_color_records();
+    if !has_records {
+        app.pending_color_dirty.clear();
+        if app.color_glyph_page_extent.take().is_some() {
+            app.color_glyph_page = Vec::new();
+            for window in app.windows.values_mut() {
+                window.clear_atlas_rects(AtlasKind::ColorGlyph, 0);
+                window.mark_atlas_page_stale(AtlasKind::ColorGlyph);
+            }
+        }
+        return;
+    }
+    if cleared {
+        app.pending_color_dirty.clear();
+        app.color_glyph_page_extent = None;
+        for window in app.windows.values_mut() {
+            window.clear_atlas_rects(AtlasKind::ColorGlyph, 0);
+            window.mark_atlas_page_stale(AtlasKind::ColorGlyph);
+        }
+    }
+    let page_changed = app.color_glyph_page_extent != Some(extent);
+    if page_changed {
+        app.pending_color_dirty.clear();
+        app.color_glyph_page.clear();
+        app.color_glyph_page.resize(len, 0);
+        app.color_glyph_page_extent = Some(extent);
+    }
+    let refresh = cleared || page_changed;
+
+    let dirty = std::mem::take(&mut app.pending_color_dirty);
+    let has_rects = !dirty.is_empty();
+    let any_missing = app.windows.values().any(|window| {
+        window.has_renderer() && !window.atlas_page_matches(AtlasKind::ColorGlyph, spec)
+    });
+    let any_stale_idle = app.windows.values().any(|window| {
+        window.has_renderer()
+            && !window.atlas_page_matches(AtlasKind::ColorGlyph, spec)
+            && window.atlas_idle(AtlasKind::ColorGlyph)
+    });
+    let any_queued = app.windows.values().any(|window| {
+        window.has_renderer() && !window.atlas_rects(AtlasKind::ColorGlyph, 0).is_empty()
+    });
+    if !has_rects && !any_missing && !any_queued {
+        return;
+    }
+    if refresh || any_stale_idle {
+        app.glyph_atlas
+            .write_color_page(&mut app.color_glyph_page, extent);
+    } else if has_rects {
+        app.glyph_atlas
+            .write_color_rows(&mut app.color_glyph_page, extent, &dirty);
+    }
+    let full_rects = crate::render::DirtyRects::full();
+
+    for window in app.windows.values_mut() {
+        if !window.has_renderer() {
+            continue;
+        }
+        if !window.atlas_page_matches(AtlasKind::ColorGlyph, spec) {
+            if !window.atlas_idle(AtlasKind::ColorGlyph) {
+                continue;
+            }
+            let uploaded = window.queue_atlas_upload(
+                AtlasKind::ColorGlyph,
+                0,
+                spec,
+                &app.color_glyph_page,
+                full_rects.clone(),
+            );
+            if uploaded {
+                window.mark_atlas_page_received(AtlasKind::ColorGlyph, spec);
+                window.clear_atlas_rects(AtlasKind::ColorGlyph, 0);
+            }
+            continue;
+        }
+        if has_rects {
+            window
+                .atlas_rects_mut(AtlasKind::ColorGlyph, 0)
+                .merge_from(&dirty);
+        }
+        if window.atlas_rects(AtlasKind::ColorGlyph, 0).is_empty()
+            || !window.atlas_idle(AtlasKind::ColorGlyph)
+        {
+            continue;
+        }
+        if window.atlas_rects(AtlasKind::ColorGlyph, 0).is_full() {
+            if window.queue_atlas_upload(
+                AtlasKind::ColorGlyph,
+                0,
+                spec,
+                &app.color_glyph_page,
+                full_rects.clone(),
+            ) {
+                window.clear_atlas_rects(AtlasKind::ColorGlyph, 0);
+            }
+            continue;
+        }
+        let mut packed = std::mem::take(&mut app.packed);
+        crate::render::atlas::pack_rects(
+            &app.color_glyph_page,
+            extent,
+            4,
+            window.atlas_rects(AtlasKind::ColorGlyph, 0),
+            &mut packed,
+        );
+        let rects = window.atlas_rects(AtlasKind::ColorGlyph, 0).clone();
+        if window.queue_atlas_upload(AtlasKind::ColorGlyph, 0, spec, &packed, rects) {
+            window.clear_atlas_rects(AtlasKind::ColorGlyph, 0);
         }
         app.packed = packed;
     }
@@ -421,6 +548,15 @@ pub(crate) fn glyph_page_pixels(app: &App) -> ((u32, u32), Vec<u8>) {
     (page, pixels)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn color_glyph_page_pixels(app: &App) -> Option<((u32, u32), Vec<u8>)> {
+    app.color_glyph_page_extent?;
+    let page = app.glyph_atlas.color_page();
+    let mut pixels = vec![0u8; (page.0 as usize) * (page.1 as usize) * 4];
+    app.glyph_atlas.write_color_page(&mut pixels, page.0);
+    Some((page, pixels))
+}
+
 #[cfg(feature = "test-support")]
 pub(crate) fn resource_page_pixels_all(app: &App) -> Vec<((u32, u32), &[u8])> {
     (0..app.resources.page_count() as u16)
@@ -549,6 +685,7 @@ pub(crate) fn layout_text(
         glyph_atlas,
         windows,
         pending_dirty,
+        pending_color_dirty,
         text_layout_scratch,
         ..
     } = app;
@@ -565,7 +702,7 @@ pub(crate) fn layout_text(
             .take_text_layout_dirty(text_layout_scratch);
     }
     if text_layout_scratch.is_empty() {
-        let _ = glyph_atlas.note_soft_fail(0);
+        let _ = glyph_atlas.note_soft_fail(0, 0);
         return Some(Ok(report));
     }
 
@@ -576,7 +713,9 @@ pub(crate) fn layout_text(
         report.atlas_rebuilds = 0;
         report.atlas_evictions = 0;
         report.skipped_glyphs = 0;
+        report.skipped_color_glyphs = 0;
         let generation = atlas.generation();
+        let color_generation = glyph_atlas.color_generation();
         let mut laid = 0usize;
         let mut reused = 0usize;
         let _previous_evictions = glyph_atlas.take_evicted();
@@ -628,11 +767,13 @@ pub(crate) fn layout_text(
                 report.atlas_rebuilds += stats.rebuilds;
                 report.atlas_evictions += stats.evictions;
                 report.skipped_glyphs += stats.skipped;
+                report.skipped_color_glyphs += stats.skipped_color;
                 pending_dirty.merge(&mut atlas.take_dirty_rects());
-                let soft_fail = stats.skipped > 0;
+                pending_color_dirty.merge(&mut glyph_atlas.color_take_dirty_rects());
+                let soft_fail = stats.skipped > 0 || stats.skipped_color > 0;
                 if soft_fail {
                     diagnostics.push(TextDiagnostic::AtlasFull {
-                        skipped: stats.skipped,
+                        skipped: stats.skipped + stats.skipped_color,
                     });
                     tree.mark_text_layout_dirty(node);
                 }
@@ -682,9 +823,11 @@ pub(crate) fn layout_text(
                 report.atlas_rebuilds += stats.rebuilds;
                 report.atlas_evictions += stats.evictions;
                 report.skipped_glyphs += stats.skipped;
+                report.skipped_color_glyphs += stats.skipped_color;
                 pending_dirty.merge(&mut atlas.take_dirty_rects());
+                pending_color_dirty.merge(&mut glyph_atlas.color_take_dirty_rects());
                 text.push_diagnostics(diagnostics);
-                if stats.skipped > 0 {
+                if stats.skipped > 0 || stats.skipped_color > 0 {
                     tree.mark_text_layout_dirty(node);
                 } else if let Some(editable) = tree.editable_mut(node) {
                     editable.set_placeholder_line(Rc::new(line), placeholder_width);
@@ -692,7 +835,8 @@ pub(crate) fn layout_text(
             }
         }
         let evicted = glyph_atlas.take_evicted();
-        let generation_changed = atlas.generation() != generation;
+        let generation_changed =
+            atlas.generation() != generation || glyph_atlas.color_generation() != color_generation;
         report.laid = laid;
         report.reused = reused;
         report.reruns = round;
@@ -721,7 +865,9 @@ pub(crate) fn layout_text(
             other.tree_mut().mark_canvas_nodes_paint();
         }
     }
-    if let Err(error) = glyph_atlas.note_soft_fail(report.skipped_glyphs) {
+    if let Err(error) =
+        glyph_atlas.note_soft_fail(report.skipped_glyphs, report.skipped_color_glyphs)
+    {
         return Some(Err(error));
     }
     Some(Ok(report))
@@ -779,10 +925,14 @@ pub(crate) fn reload_system_fonts(app: &mut App) -> u32 {
 
 pub(crate) fn repaint_text_if_atlas_changed(app: &mut App) {
     let generation = app.atlas.generation();
-    if generation == app.atlas_generation_seen {
+    let color_generation = app.glyph_atlas.color_generation();
+    if generation == app.atlas_generation_seen
+        && color_generation == app.color_atlas_generation_seen
+    {
         return;
     }
     app.atlas_generation_seen = generation;
+    app.color_atlas_generation_seen = color_generation;
     for window in app.windows.values_mut() {
         let tree = window.tree_mut();
         tree.invalidate_text_lines();
@@ -956,6 +1106,134 @@ mod tests {
             fourth.skipped_glyphs > 0,
             "容量仍未恢复（report: {fourth:?}）"
         );
+    }
+
+    #[test]
+    fn mono_only_text_never_establishes_the_color_glyph_page() {
+        let (_rt, mut app, window, _node) = text_app("hello", Some(200.0));
+        frame_text(&mut app, window);
+        let _ = app.frame(window).expect("窗口存在").expect("帧");
+        assert!(
+            app.color_glyph_page_pixels().is_none(),
+            "单色文本不得分配/上传彩色字形页（零额外 CPU/GPU 常驻）"
+        );
+        assert_eq!(app.glyph_atlas.color_page(), (512, 512));
+        assert!(!app.glyph_atlas.has_color_records());
+    }
+
+    #[test]
+    fn color_glyph_skips_are_counted_in_the_atlas_full_diagnostic() {
+        if crate::text::raster::probe_emoji_font().is_none() {
+            eprintln!("skip: no color emoji font available on this device");
+            return;
+        }
+        let (_rt, mut app, window, _node) = text_app("\u{1F30D}", Some(200.0));
+        let mut color = AtlasAllocator::with_page(AtlasKind::ColorGlyph, (512, 512));
+        color.cap_page_for_test(512);
+        assert!(color.allocate((500, 500)).is_some(), "占满彩色页");
+        app.glyph_atlas.set_color_allocator_for_test(color);
+        let report = frame_text(&mut app, window);
+        assert!(
+            report.skipped_color_glyphs > 0,
+            "彩色页占满后必须统计彩色跳过（实测 {}）",
+            report.skipped_color_glyphs
+        );
+        let diagnostics = super::text_diagnostics(&app);
+        let skipped = diagnostics
+            .iter()
+            .find_map(|diagnostic| match diagnostic {
+                TextDiagnostic::AtlasFull { skipped } => Some(*skipped),
+                _ => None,
+            })
+            .expect("彩色跳过必须产生 AtlasFull 诊断");
+        assert!(
+            skipped >= report.skipped_color_glyphs,
+            "诊断计数必须包含彩色跳过（诊断 {skipped}，彩色跳过 {}）",
+            report.skipped_color_glyphs
+        );
+    }
+
+    #[test]
+    fn mono_text_after_font_reload_keeps_the_color_page_unestablished() {
+        let (_rt, mut app, window, _node) = text_app("hello", Some(200.0));
+        frame_text(&mut app, window);
+        let _ = app.frame(window).expect("窗口存在").expect("首帧");
+        assert!(
+            app.color_glyph_page_pixels().is_none(),
+            "首帧：单色文本不得建立彩色页"
+        );
+        app.reload_system_fonts();
+        let _ = app
+            .frame(window)
+            .expect("窗口存在")
+            .expect("字体刷新后的帧");
+        assert!(
+            app.color_glyph_page_pixels().is_none(),
+            "reload_system_fonts 的 clear() 不得让单色文本建立彩色页"
+        );
+    }
+
+    #[test]
+    fn color_emoji_glyphs_use_the_color_atlas_and_mono_glyphs_stay_in_r8() {
+        let Some(_emoji_font) = crate::text::raster::probe_emoji_font() else {
+            eprintln!("skip: no color emoji font available on this device");
+            return;
+        };
+        let (_rt, mut app, window, node) = text_app("A\u{1F30D}B", Some(400.0));
+        frame_text(&mut app, window);
+        let atlases = {
+            let tree = app.window(window).expect("窗口存在").tree();
+            tree.text_line(node)
+                .expect("line")
+                .glyph_runs()
+                .flat_map(|run| run.glyphs.iter())
+                .map(|glyph| glyph.tile.atlas)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            atlases,
+            vec![
+                crate::paint::atlas::AtlasKind::Glyph,
+                crate::paint::atlas::AtlasKind::ColorGlyph,
+                crate::paint::atlas::AtlasKind::Glyph,
+            ],
+            "只有 emoji 进彩色图集，拉丁字形仍走 R8 图集"
+        );
+        let generation = app.atlas.generation();
+        let color_generation = app.glyph_atlas.color_generation();
+        let _ = app.frame(window).expect("窗口存在").expect("帧");
+        assert_eq!(
+            app.atlas.generation(),
+            generation,
+            "单色图集不得因 emoji 换代"
+        );
+        assert_eq!(
+            app.glyph_atlas.color_generation(),
+            color_generation,
+            "彩色图集未增长/清空时代际不变"
+        );
+        assert!(
+            app.color_glyph_page_pixels().is_some(),
+            "出现彩色字形后必须建立彩色字形页"
+        );
+        #[cfg(feature = "test-support")]
+        {
+            let kinds = app
+                .window(window)
+                .expect("窗口存在")
+                .instance_buffer()
+                .expect("inline window 必须有实例缓冲")
+                .instance_kinds()
+                .to_vec();
+            assert!(
+                kinds.contains(&crate::paint::instance::KIND_COLOR_GLYPH),
+                "彩色字形必须编码为 KIND_COLOR_GLYPH：{kinds:?}"
+            );
+            assert!(
+                kinds.contains(&crate::paint::instance::KIND_GLYPH),
+                "单色字形必须仍编码为 KIND_GLYPH：{kinds:?}"
+            );
+        }
     }
 
     #[test]

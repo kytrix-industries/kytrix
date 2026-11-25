@@ -37,6 +37,18 @@ pub fn render_offscreen(
         glyph_pixels,
         DirtyRects::full(),
     );
+    if let Some((color_page, color_pixels)) = app.color_glyph_page_pixels() {
+        renderer.queue_atlas_upload(
+            AtlasKind::ColorGlyph,
+            0,
+            crate::render::AtlasArraySpec {
+                page: color_page.0,
+                layers: 1,
+            },
+            color_pixels,
+            DirtyRects::full(),
+        );
+    }
     let image_pages = app.resource_page_pixels_all();
     let image_layers = u32::try_from(image_pages.len()).expect("image page count fits u32");
     for (layer, (image_page, image_pixels)) in image_pages.into_iter().enumerate() {

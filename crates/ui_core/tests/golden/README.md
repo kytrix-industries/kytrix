@@ -4,7 +4,7 @@
 
 | 目录          | 设备                              | 状态                              |
 |---------------|-----------------------------------|-----------------------------------|
-| `warp/`       | Windows WARP（D3D12 软件设备）    | 既有                              |
+| `warp/`       | Windows WARP（D3D12 软件设备）    | 既有；P4 起多一份 `color_emoji`（Windows 专属，见下） |
 | `lavapipe/`   | Linux Mesa llvmpipe（软件 Vulkan）| 2026-11-13 新增（见下）           |
 | `metal-real/` | macOS 实机 GPU（Intel Iris Plus 655 / Metal 3） | 2026-11-13 新增（13 份；`clip_subpixel` 待真机重基） |
 
@@ -31,9 +31,15 @@ golden 是 `SnapshotImage.rgba8` 的**原样**落盘：**预乘 sRGB 编码的 R
 | `image`    | 图片图集：1:1 / 2× / 半透明调制（16×16 四象限 alpha = 255/170/85/0） | 160×120      | 1、2       | light       |
 | `clip`     | 嵌套 clip + 溢出子矩形（整数边界；**0 容差**，见下）                 | 240×160      | 1          | light       |
 | `clip_subpixel` | 分数坐标边界（容器物理边界 24.25 / 20.5 / 156.5 / 96.75）加四边溢出的子矩形（**0 容差**） | 240×160 | 1 | light |
+| `color_emoji` | 彩色字形图集：`🌍` / `👨‍👩‍👧` / `🇨🇳`（48 px；`KIND_COLOR_GLYPH` = RGBA8 sRGB 图集） | 240×160 | 1 | light |
 
-**没有文字 case**：字形像素依赖宿主字体文件与版本，跨机必然分叉。
-字形由 `rendered_text_produces_visible_glyph_pixels`（覆盖率 sanity）与 L2 的 `GlyphRun` 断言覆盖。
+**唯一的文字 case 是 `color_emoji`，且只在 Windows 建基线**：彩色字形像素依赖宿主 emoji 字体
+（Windows 是 Segoe UI Emoji）与字体版本，跨设备必然分叉，因此 `lavapipe/` / `metal-real/` 不建该 case：
+`tests/snapshot.rs::golden_color_emoji` 在 golden 缺失且未 bless 时打印 `skip` 并返回（理由写入报告）。
+Windows 的 Segoe UI Emoji **不含国旗字形**，`🇨🇳` 实际渲染成两个单色区域指示符字母 `CN`——这是系统
+字体能力而非引擎缺陷；`🇨🇳` 在具备国旗字形的字体（如 Noto Color Emoji）上走 `KIND_COLOR_GLYPH`。
+其余文字仍由 `rendered_text_produces_visible_glyph_pixels`（覆盖率 sanity）与 L2 的 `GlyphRun`
+断言覆盖，不进 golden。
 
 ## 容差（D19：机制冻结，数值可校准）
 

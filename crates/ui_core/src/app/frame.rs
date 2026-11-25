@@ -199,12 +199,19 @@ pub(crate) fn frame(
             windows,
             geometry,
             atlas,
+            glyph_atlas,
             resources,
             ..
         } = app;
-        windows
-            .get_mut(&window)
-            .map(|target| target.paint_frame(geometry, Some(&*atlas), Some(&*resources)))
+        let color_atlas = glyph_atlas.color_allocator();
+        windows.get_mut(&window).map(|target| {
+            target.paint_frame(
+                geometry,
+                Some(&*atlas),
+                Some(color_atlas),
+                Some(&*resources),
+            )
+        })
     };
     let mut paint = match painted {
         Some(Ok(report)) => report,
@@ -304,6 +311,12 @@ pub(crate) fn frame(
         target.reset_canvas_text_skip();
     }
     let glyph_extent = app.atlas.page().0;
+    let color_glyph_spec =
+        app.color_glyph_page_extent
+            .map(|extent| crate::render::AtlasArraySpec {
+                page: extent,
+                layers: 1,
+            });
     let image_pages = app.resources.page_count();
     let image_spec = (image_pages > 0).then(|| crate::render::AtlasArraySpec {
         page: app.resources.page_extent(),
@@ -318,6 +331,8 @@ pub(crate) fn frame(
         target.has_renderer()
             && (target.atlas_rects_pending()
                 || !target.atlas_page_matches(AtlasKind::Glyph, glyph_spec)
+                || color_glyph_spec
+                    .is_some_and(|spec| !target.atlas_page_matches(AtlasKind::ColorGlyph, spec))
                 || image_spec.is_some_and(|spec| {
                     !target.atlas_page_matches(AtlasKind::Image, spec)
                         || (0..spec.layers as u16).any(|layer| !target.image_layer_received(layer))

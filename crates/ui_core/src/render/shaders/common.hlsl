@@ -2,6 +2,7 @@
 #define KYTRIX_KIND_GLYPH 1
 #define KYTRIX_KIND_IMAGE 2
 #define KYTRIX_KIND_SHADOW 3
+#define KYTRIX_KIND_COLOR_GLYPH 8
 
 #define KYTRIX_GRADIENT_NONE 0
 #define KYTRIX_GRADIENT_HORIZONTAL 1
@@ -54,6 +55,7 @@ StructuredBuffer<ClipEntry> clips : register(t1);
 
 Texture2DArray<float>  glyph_atlas : register(t2);
 Texture2DArray<float4> image_atlas : register(t3);
+Texture2DArray<float4> color_glyph_atlas : register(t4);
 SamplerState           atlas_sampler : register(s0);
 
 

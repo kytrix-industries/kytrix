@@ -9,8 +9,8 @@ use windows::{
         Direct3D12::*,
         Dxgi::Common::{
             DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM,
-            DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT,
-            DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
         },
     },
     core::PCSTR,
@@ -30,7 +30,7 @@ use crate::{
 const SLOT_SRVS: u32 = 2;
 const SLOT_COUNT: u32 = MAX_FRAMES_IN_FLIGHT as u32;
 const WINDOW_SRVS: u32 = SLOT_SRVS * SLOT_COUNT;
-const ATLAS_SRVS: u32 = 2;
+const ATLAS_SRVS: u32 = 3;
 pub(crate) const ATLAS_GENERATIONS: u8 = 2;
 const ATLAS_DESCRIPTORS: u32 = ATLAS_SRVS * ATLAS_GENERATIONS as u32;
 const SRV_HEAP_CAPACITY: u32 = 2048;
@@ -156,7 +156,7 @@ impl Pipeline {
         match pipeline {
             GeometryPipeline::Ui => &self.geometry_ui,
             GeometryPipeline::Textured { atlas } => match atlas {
-                AtlasKind::Glyph => &self.geometry_glyph,
+                AtlasKind::Glyph | AtlasKind::ColorGlyph => &self.geometry_glyph,
                 AtlasKind::Image => &self.geometry_image,
             },
         }
@@ -317,6 +317,7 @@ fn texture_srv(kind: AtlasKind, layers: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC 
         Format: match kind {
             AtlasKind::Glyph => DXGI_FORMAT_R8_UNORM,
             AtlasKind::Image => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            AtlasKind::ColorGlyph => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         },
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,

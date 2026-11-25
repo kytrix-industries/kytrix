@@ -30,6 +30,7 @@ pub(crate) fn resolve_canvas_text(
         glyph_atlas,
         windows,
         pending_dirty,
+        pending_color_dirty,
         ..
     } = app;
     let target = windows.get_mut(&window)?;
@@ -46,6 +47,7 @@ pub(crate) fn resolve_canvas_text(
     let mut rounds = 0usize;
     loop {
         let generation = atlas.generation();
+        let color_generation = glyph_atlas.color_generation();
         let eviction_epoch = glyph_atlas.eviction_epoch();
         for node in &nodes {
             let Some(canvas) = target.tree().canvas(*node).cloned() else {
@@ -59,6 +61,7 @@ pub(crate) fn resolve_canvas_text(
                 font_stack_version,
                 dpr_bits,
                 atlas_generation: generation,
+                color_atlas_generation: color_generation,
                 glyph_eviction_epoch: eviction_epoch,
             };
             if target
@@ -94,9 +97,10 @@ pub(crate) fn resolve_canvas_text(
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
-                skipped += stats.skipped;
+                skipped += stats.skipped + stats.skipped_color;
                 text.push_diagnostics(diagnostics);
                 pending_dirty.merge(&mut atlas.take_dirty_rects());
+                pending_color_dirty.merge(&mut glyph_atlas.color_take_dirty_rects());
                 lines.push(Rc::new(line));
             }
             if skipped > 0 {
@@ -104,14 +108,19 @@ pub(crate) fn resolve_canvas_text(
             }
             let key = CanvasTextKey {
                 atlas_generation: atlas.generation(),
+                color_atlas_generation: glyph_atlas.color_generation(),
                 glyph_eviction_epoch: glyph_atlas.eviction_epoch(),
                 ..key
             };
-            let live = lines_are_live(&lines, atlas);
+            let atlases = crate::window::canvas_text::GlyphAtlases {
+                glyph: atlas,
+                color: glyph_atlas.color_allocator(),
+            };
+            let live = lines_are_live(&lines, atlases);
             let previous_live = target
                 .canvas_text()
                 .get(node)
-                .is_some_and(|existing| lines_are_live(&existing.lines, atlas));
+                .is_some_and(|existing| lines_are_live(&existing.lines, atlases));
             let pending = skipped > 0 || !live;
             if live || !previous_live {
                 target.canvas_text_mut().insert(
@@ -128,7 +137,8 @@ pub(crate) fn resolve_canvas_text(
             let _ = target.tree_mut().mark_paint(*node);
         }
         let evicted = glyph_atlas.take_evicted() > 0;
-        let generation_changed = atlas.generation() != generation;
+        let generation_changed =
+            atlas.generation() != generation || glyph_atlas.color_generation() != color_generation;
         if !evicted && !generation_changed {
             break;
         }
@@ -510,7 +520,11 @@ mod tests {
             "the frame draws the freshly resolved glyph tiles"
         );
         assert!(
-            crate::window::canvas_text::line_is_live(&after_lines[0], &app.app().atlas),
+            crate::window::canvas_text::GlyphAtlases {
+                glyph: &app.app().atlas,
+                color: app.app().glyph_atlas.color_allocator(),
+            }
+            .line_is_live(&after_lines[0]),
             "the painted line is backed by live atlas tiles"
         );
     }
@@ -890,9 +904,13 @@ mod tests {
         let drawn: usize = lines.iter().map(|line| glyph_count(line)).sum();
         assert!(drawn >= 8, "capacity recovery draws every glyph: {drawn}");
         assert!(
-            lines
-                .iter()
-                .all(|line| crate::window::canvas_text::line_is_live(line, &app.app().atlas)),
+            lines.iter().all(|line| {
+                crate::window::canvas_text::GlyphAtlases {
+                    glyph: &app.app().atlas,
+                    color: app.app().glyph_atlas.color_allocator(),
+                }
+                .line_is_live(line)
+            }),
             "the recovered frame resolves to live tiles"
         );
     }

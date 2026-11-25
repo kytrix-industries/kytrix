@@ -2,7 +2,7 @@ use ash::vk;
 
 use crate::{
     error::EngineError,
-    paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
+    paint::atlas::{ATLAS_KINDS, AtlasKind, MAX_IMAGE_PAGES},
     render::{
         AtlasArraySpec, AtlasPageRequest,
         atlas::{DirtyRects, MAX_RESIDENT_STAGING_BYTES, RectChunk, texel_bytes},
@@ -136,6 +136,7 @@ pub(crate) struct SharedAtlas {
     device: ash::Device,
     glyph: SharedPage,
     image: SharedPage,
+    color_glyph: SharedPage,
     sampler: vk::Sampler,
 }
 
@@ -150,6 +151,14 @@ impl SharedAtlas {
             Ok(page) => page,
             Err(error) => {
                 glyph.destroy(device.raw());
+                return Err(error);
+            }
+        };
+        let color_glyph = match SharedPage::new(device, AtlasKind::ColorGlyph, placeholder) {
+            Ok(page) => page,
+            Err(error) => {
+                glyph.destroy(device.raw());
+                image.destroy(device.raw());
                 return Err(error);
             }
         };
@@ -171,6 +180,7 @@ impl SharedAtlas {
             Err(error) => {
                 glyph.destroy(device.raw());
                 image.destroy(device.raw());
+                color_glyph.destroy(device.raw());
                 return Err(init_error("create_sampler(atlas)", format!("{error:?}")));
             }
         };
@@ -178,6 +188,7 @@ impl SharedAtlas {
             device: device.raw().clone(),
             glyph,
             image,
+            color_glyph,
             sampler,
         })
     }
@@ -188,6 +199,10 @@ impl SharedAtlas {
 
     pub(crate) fn image_view(&self) -> vk::ImageView {
         self.image.view
+    }
+
+    pub(crate) fn color_glyph_view(&self) -> vk::ImageView {
+        self.color_glyph.view
     }
 
     pub(crate) fn sampler(&self) -> vk::Sampler {
@@ -218,6 +233,7 @@ impl SharedAtlas {
         match kind {
             AtlasKind::Glyph => &self.glyph,
             AtlasKind::Image => &self.image,
+            AtlasKind::ColorGlyph => &self.color_glyph,
         }
     }
 
@@ -225,6 +241,7 @@ impl SharedAtlas {
         match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
+            AtlasKind::ColorGlyph => &mut self.color_glyph,
         }
     }
 
@@ -286,6 +303,7 @@ impl Drop for SharedAtlas {
         }
         self.glyph.destroy(&self.device);
         self.image.destroy(&self.device);
+        self.color_glyph.destroy(&self.device);
     }
 }
 
@@ -304,8 +322,8 @@ impl PendingUpload {
 }
 
 pub(crate) struct AtlasUploads {
-    pending: [[Option<PendingUpload>; MAX_IMAGE_PAGES as usize]; 2],
-    staging: [StagingSet; 2],
+    pending: [[Option<PendingUpload>; MAX_IMAGE_PAGES as usize]; 3],
+    staging: [StagingSet; 3],
 }
 
 impl AtlasUploads {
@@ -315,6 +333,7 @@ impl AtlasUploads {
             staging: [
                 StagingSet::new(AtlasKind::Glyph),
                 StagingSet::new(AtlasKind::Image),
+                StagingSet::new(AtlasKind::ColorGlyph),
             ],
         }
     }
@@ -362,10 +381,10 @@ impl AtlasUploads {
 
     pub(crate) fn reconcile_pages(
         &mut self,
-        current: [crate::render::AtlasArraySpec; 2],
+        current: [crate::render::AtlasArraySpec; 3],
     ) -> Result<Vec<AtlasPageRequest>, EngineError> {
-        let mut rebuild: Vec<AtlasPageRequest> = Vec::with_capacity(2);
-        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+        let mut rebuild: Vec<AtlasPageRequest> = Vec::with_capacity(3);
+        for kind in ATLAS_KINDS {
             let index = kind.index() as usize;
             let current = current[index];
             let pending_spec = self.pending[index]
@@ -433,7 +452,7 @@ impl AtlasUploads {
         command: vk::CommandBuffer,
     ) -> Result<Vec<GpuResourceHandle>, EngineError> {
         let mut retired = Vec::new();
-        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+        for kind in ATLAS_KINDS {
             let kind_index = kind.index() as usize;
             let pendings: Vec<PendingUpload> = self.pending[kind_index]
                 .iter_mut()
@@ -758,6 +777,7 @@ fn texture_format(kind: AtlasKind) -> vk::Format {
     match kind {
         AtlasKind::Glyph => vk::Format::R8_UNORM,
         AtlasKind::Image => vk::Format::B8G8R8A8_SRGB,
+        AtlasKind::ColorGlyph => vk::Format::R8G8B8A8_SRGB,
     }
 }
 
@@ -1009,7 +1029,7 @@ mod tests {
         );
         assert_eq!(
             uploads
-                .reconcile_pages([spec(1, 1), spec(1, 1)])
+                .reconcile_pages([spec(1, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages"),
             vec![request(AtlasKind::Glyph, 64, 1)]
         );
@@ -1026,7 +1046,7 @@ mod tests {
         );
         assert!(
             uploads
-                .reconcile_pages([spec(128, 1), spec(1, 1)])
+                .reconcile_pages([spec(128, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages")
                 .is_empty()
         );
@@ -1043,7 +1063,7 @@ mod tests {
         );
         assert!(
             uploads
-                .reconcile_pages([spec(128, 1), spec(1, 1)])
+                .reconcile_pages([spec(128, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages")
                 .is_empty()
         );
@@ -1060,7 +1080,7 @@ mod tests {
         );
         assert!(
             uploads
-                .reconcile_pages([spec(64, 1), spec(1, 1)])
+                .reconcile_pages([spec(64, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages")
                 .is_empty()
         );
@@ -1082,7 +1102,7 @@ mod tests {
         }
         assert_eq!(
             uploads
-                .reconcile_pages([spec(1, 1), spec(1, 1)])
+                .reconcile_pages([spec(1, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages"),
             vec![request(AtlasKind::Image, TEST_PAGE, 4)],
             "按 extent 去重：数组只有一次重建，且层数取最大值"
@@ -1127,6 +1147,7 @@ mod tests {
             .reconcile_pages([
                 gpu.atlas().spec(AtlasKind::Glyph),
                 gpu.atlas().spec(AtlasKind::Image),
+                gpu.atlas().spec(AtlasKind::ColorGlyph),
             ])
             .expect("reconcile pages");
         assert_eq!(rebuild, vec![request(AtlasKind::Image, TEST_PAGE, 1)]);
@@ -1222,6 +1243,7 @@ mod tests {
             .reconcile_pages([
                 gpu.atlas().spec(AtlasKind::Glyph),
                 gpu.atlas().spec(AtlasKind::Image),
+                gpu.atlas().spec(AtlasKind::ColorGlyph),
             ])
             .expect("reconcile pages");
         gpu.rebuild_atlas_pages(&rebuild)
@@ -1322,6 +1344,7 @@ mod tests {
             .reconcile_pages([
                 gpu.atlas().spec(AtlasKind::Glyph),
                 gpu.atlas().spec(AtlasKind::Image),
+                gpu.atlas().spec(AtlasKind::ColorGlyph),
             ])
             .expect("reconcile pages");
         assert_eq!(
@@ -1390,6 +1413,7 @@ mod tests {
             .reconcile_pages([
                 gpu.atlas().spec(AtlasKind::Glyph),
                 gpu.atlas().spec(AtlasKind::Image),
+                gpu.atlas().spec(AtlasKind::ColorGlyph),
             ])
             .expect("reconcile pages");
         assert_eq!(rebuild, vec![request(AtlasKind::Image, TEST_PAGE, 1)]);
@@ -1423,6 +1447,7 @@ mod tests {
             .reconcile_pages([
                 gpu.atlas().spec(AtlasKind::Glyph),
                 gpu.atlas().spec(AtlasKind::Image),
+                gpu.atlas().spec(AtlasKind::ColorGlyph),
             ])
             .expect("reconcile pages");
         assert_eq!(
@@ -1491,6 +1516,7 @@ mod tests {
             .reconcile_pages([
                 gpu.atlas().spec(AtlasKind::Glyph),
                 gpu.atlas().spec(AtlasKind::Image),
+                gpu.atlas().spec(AtlasKind::ColorGlyph),
             ])
             .expect("reconcile pages");
         gpu.rebuild_atlas_pages(&rebuild)

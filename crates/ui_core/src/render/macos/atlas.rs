@@ -6,7 +6,7 @@ use objc2_metal::{
 
 use crate::{
     error::EngineError,
-    paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
+    paint::atlas::{ATLAS_KINDS, AtlasKind, MAX_IMAGE_PAGES},
     render::{
         atlas::{AtlasRebuilt, DirtyRects, MAX_RESIDENT_STAGING_BYTES, RectChunk, texel_bytes},
         frame::MAX_FRAMES_IN_FLIGHT,
@@ -58,7 +58,8 @@ struct PendingUpload {
 pub(crate) struct AtlasTextures {
     glyph: AtlasTexture,
     image: AtlasTexture,
-    force_full: [[bool; MAX_IMAGE_PAGES as usize]; 2],
+    color_glyph: AtlasTexture,
+    force_full: [[bool; MAX_IMAGE_PAGES as usize]; 3],
 }
 
 impl AtlasTextures {
@@ -66,7 +67,8 @@ impl AtlasTextures {
         Ok(Self {
             glyph: AtlasTexture::new(device, AtlasKind::Glyph)?,
             image: AtlasTexture::new(device, AtlasKind::Image)?,
-            force_full: [[false; MAX_IMAGE_PAGES as usize]; 2],
+            color_glyph: AtlasTexture::new(device, AtlasKind::ColorGlyph)?,
+            force_full: [[false; MAX_IMAGE_PAGES as usize]; 3],
         })
     }
 
@@ -74,6 +76,7 @@ impl AtlasTextures {
         match kind {
             AtlasKind::Glyph => &self.glyph.texture,
             AtlasKind::Image => &self.image.texture,
+            AtlasKind::ColorGlyph => &self.color_glyph.texture,
         }
     }
 
@@ -100,18 +103,20 @@ impl AtlasTextures {
         let texture = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
+            AtlasKind::ColorGlyph => &mut self.color_glyph,
         };
         texture.queue_upload(layer, spec, pixels, rects);
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        self.glyph.first_pending().is_some() || self.image.first_pending().is_some()
+        ATLAS_KINDS.iter().any(|kind| self.pending(*kind))
     }
 
     pub(crate) fn pending(&self, kind: AtlasKind) -> bool {
         match kind {
             AtlasKind::Glyph => self.glyph.first_pending().is_some(),
             AtlasKind::Image => self.image.first_pending().is_some(),
+            AtlasKind::ColorGlyph => self.color_glyph.first_pending().is_some(),
         }
     }
 
@@ -122,11 +127,12 @@ impl AtlasTextures {
         sequence: u64,
     ) -> Result<AtlasRebuilt, EngineError> {
         let mut rebuilt = AtlasRebuilt::default();
-        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+        for kind in ATLAS_KINDS {
             let index = kind.index() as usize;
             let texture = match kind {
                 AtlasKind::Glyph => &mut self.glyph,
                 AtlasKind::Image => &mut self.image,
+                AtlasKind::ColorGlyph => &mut self.color_glyph,
             };
             let Some(spec) = texture.pending_spec() else {
                 continue;
@@ -184,7 +190,7 @@ impl AtlasTextures {
         slot: usize,
         encoder: &ProtocolObject<dyn MTLBlitCommandEncoder>,
     ) -> Result<(), EngineError> {
-        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+        for kind in ATLAS_KINDS {
             let index = kind.index() as usize;
             let force_full = std::mem::replace(
                 &mut self.force_full[index],
@@ -193,6 +199,7 @@ impl AtlasTextures {
             let texture = match kind {
                 AtlasKind::Glyph => &mut self.glyph,
                 AtlasKind::Image => &mut self.image,
+                AtlasKind::ColorGlyph => &mut self.color_glyph,
             };
             texture.record_uploads(device, queue, sequence, slot, encoder, &force_full)?;
         }
@@ -472,6 +479,7 @@ fn texture_format(kind: AtlasKind) -> MTLPixelFormat {
     match kind {
         AtlasKind::Glyph => MTLPixelFormat::R8Unorm,
         AtlasKind::Image => MTLPixelFormat::BGRA8Unorm_sRGB,
+        AtlasKind::ColorGlyph => MTLPixelFormat::RGBA8Unorm_sRGB,
     }
 }
 
