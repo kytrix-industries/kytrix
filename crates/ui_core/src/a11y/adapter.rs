@@ -16,8 +16,8 @@ use crate::{
         },
         textrun,
         tree::{
-            CollectionSemanticsCache, collect_subtree, node_a11y_with_cache, push_ancestors,
-            resolve_focus,
+            CollectionSemanticsCache, collect_subtree, node_a11y_records_with_cache,
+            push_ancestors, resolve_focus,
         },
     },
     app::App,
@@ -315,10 +315,10 @@ impl A11yBridge {
             focus_chain.reverse();
         }
         let focus_related = |engine: NodeId| engine == focus_id || focus_chain.contains(&engine);
-        let mut nodes = Vec::with_capacity(batch.len());
+        let mut nodes = Vec::with_capacity(batch.len() + 1);
         let mut re_refresh: SmallVec<[NodeId; 8]> = SmallVec::new();
         for node in &batch {
-            if let Some(mut record) = node_a11y_with_cache(
+            if let Some(mut record) = node_a11y_records_with_cache(
                 tree,
                 *node,
                 scale,
@@ -327,18 +327,24 @@ impl A11yBridge {
                 &mut self.tables,
                 diagnostics,
             ) {
-                let before = record.children.len();
-                record.children.retain(|child| {
-                    self.ids.engine_of(*child).is_some_and(|engine| {
-                        self.delivered.contains(&engine)
-                            || batch_set.contains(&engine)
-                            || focus_related(engine)
-                    })
+                let before = record.node.children.len();
+                let text_run = record.text_run.as_ref().map(|run| run.id);
+                record.node.children.retain(|child| {
+                    Some(*child) == text_run
+                        || self.ids.engine_of(*child).is_some_and(|engine| {
+                            self.delivered.contains(&engine)
+                                || batch_set.contains(&engine)
+                                || focus_related(engine)
+                        })
                 });
-                if record.children.len() != before {
+                if record.node.children.len() != before {
                     re_refresh.push(*node);
                 }
-                nodes.push(record);
+                apply_caret(&mut record.node, caret);
+                nodes.push(record.node);
+                if let Some(run) = record.text_run {
+                    nodes.push(run);
+                }
             }
         }
         for node in &batch {
@@ -348,9 +354,9 @@ impl A11yBridge {
         self.refresh = deferred;
         self.refresh.extend(re_refresh);
 
-        let mut focus_ancestors = Vec::with_capacity(focus_chain.len());
+        let mut focus_ancestors = Vec::with_capacity(focus_chain.len() + 1);
         for ancestor in &focus_chain {
-            if let Some(mut record) = node_a11y_with_cache(
+            if let Some(mut record) = node_a11y_records_with_cache(
                 tree,
                 *ancestor,
                 scale,
@@ -359,20 +365,26 @@ impl A11yBridge {
                 &mut self.tables,
                 diagnostics,
             ) {
-                let before = record.children.len();
-                record.children.retain(|child| {
-                    self.ids.engine_of(*child).is_some_and(|engine| {
-                        self.delivered.contains(&engine)
-                            || batch_set.contains(&engine)
-                            || focus_related(engine)
-                    })
+                let before = record.node.children.len();
+                let text_run = record.text_run.as_ref().map(|run| run.id);
+                record.node.children.retain(|child| {
+                    Some(*child) == text_run
+                        || self.ids.engine_of(*child).is_some_and(|engine| {
+                            self.delivered.contains(&engine)
+                                || batch_set.contains(&engine)
+                                || focus_related(engine)
+                        })
                 });
-                if record.children.len() != before {
+                if record.node.children.len() != before {
                     self.refresh.push(*ancestor);
                 }
                 self.delivered.insert(*ancestor);
                 self.queued.remove(ancestor);
-                focus_ancestors.push(record);
+                apply_caret(&mut record.node, caret);
+                focus_ancestors.push(record.node);
+                if let Some(run) = record.text_run {
+                    nodes.push(run);
+                }
             }
         }
 
@@ -387,11 +399,12 @@ impl A11yBridge {
         }
         let emit_tree_info = std::mem::take(&mut self.tree_info_pending);
 
+        let mut focus_text_run = None;
         let mut focus_node =
             if let Some(record) = nodes.iter().find(|record| record.engine == focus_id) {
                 record.clone()
             } else {
-                let mut record = node_a11y_with_cache(
+                let mut record = node_a11y_records_with_cache(
                     tree,
                     focus_id,
                     scale,
@@ -401,24 +414,21 @@ impl A11yBridge {
                     diagnostics,
                 )
                 .expect("resolve_focus 已保证焦点节点存活");
-                let before = record.children.len();
-                record.children.retain(|child| {
-                    self.ids.engine_of(*child).is_some_and(|engine| {
-                        self.delivered.contains(&engine) || batch_set.contains(&engine)
-                    })
+                let before = record.node.children.len();
+                let text_run = record.text_run.as_ref().map(|run| run.id);
+                record.node.children.retain(|child| {
+                    Some(*child) == text_run
+                        || self.ids.engine_of(*child).is_some_and(|engine| {
+                            self.delivered.contains(&engine) || batch_set.contains(&engine)
+                        })
                 });
-                if record.children.len() != before {
+                if record.node.children.len() != before {
                     self.refresh.push(focus_id);
                 }
-                record
+                focus_text_run = record.text_run;
+                record.node
             };
         apply_caret(&mut focus_node, caret);
-        for record in &mut nodes {
-            apply_caret(record, caret);
-        }
-        for record in &mut focus_ancestors {
-            apply_caret(record, caret);
-        }
         self.delivered.insert(focus_id);
         self.queued.remove(&focus_id);
         self.last_focus = Some(focus_id);
@@ -435,6 +445,7 @@ impl A11yBridge {
                 .stable_of(focus_id)
                 .expect("焦点节点刚被 node_a11y 分配 id"),
             focus_node,
+            focus_text_run,
             focus_ancestors,
             diagnostics: diagnostics.len(),
         })
@@ -492,6 +503,7 @@ fn apply_caret(record: &mut A11yNode, caret: Option<(NodeId, usize)>) {
         || record.text_selection.is_some()
         || record.character_lengths.is_empty()
         || record.role != A11yRole::TextRun
+        || record.text_run.is_some()
     {
         return;
     }
@@ -548,6 +560,9 @@ pub(crate) fn to_tree_update(snapshot: &A11yTreeSnapshot) -> TreeUpdate {
             AkNodeId(snapshot.focus_node.id.get()),
             to_accesskit(&snapshot.focus_node),
         ));
+        if let Some(run) = &snapshot.focus_text_run {
+            nodes.push((AkNodeId(run.id.get()), to_accesskit(run)));
+        }
     }
     TreeUpdate {
         nodes,
@@ -673,13 +688,14 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
         node.set_text_direction(accesskit::TextDirection::LeftToRight);
     }
     if let Some(selection) = record.text_selection {
+        let selection_node = AkNodeId(record.text_run.unwrap_or(record.id).get());
         node.set_text_selection(accesskit::TextSelection {
             anchor: accesskit::TextPosition {
-                node: AkNodeId(record.id.get()),
+                node: selection_node,
                 character_index: selection.anchor,
             },
             focus: accesskit::TextPosition {
-                node: AkNodeId(record.id.get()),
+                node: selection_node,
                 character_index: selection.focus,
             },
         });
@@ -1976,5 +1992,290 @@ mod tests {
             Some(accesskit::Orientation::Vertical),
             "滚动容器无显式方向 ⇒ 按 vertical 轴推导"
         );
+    }
+
+    fn editable_spec() -> crate::text_edit::EditableSpec {
+        crate::text_edit::EditableSpec {
+            role: A11yRole::TextInput,
+            label: SmolStr::new_static("搜索"),
+            placeholder: SmolStr::new_static(""),
+            multiline: false,
+            masked: false,
+            readonly: false,
+            disabled: false,
+            max_length: None,
+            submit: None,
+            text_style: TextStyle::new(px(12.0)),
+            caret_color: crate::paint::color::Color::BLACK,
+            selection_color: crate::paint::color::Color::BLACK,
+            placeholder_color: crate::paint::color::Color::BLACK,
+            composition_color: crate::paint::color::Color::BLACK,
+        }
+    }
+
+    fn write_editable_patch(
+        tree: &mut NodeTree,
+        node: NodeId,
+        value: &str,
+        selection: A11yTextSelection,
+    ) {
+        crate::a11y::tree::write_a11y_patch(
+            tree,
+            node,
+            A11yPatch {
+                role: Some(A11yRole::TextInput),
+                value: Some(SmolStr::new(value)),
+                selection: Some(selection),
+                ..A11yPatch::default()
+            },
+        );
+    }
+
+    #[test]
+    fn an_editable_input_delivers_its_text_run_directly_after_it() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let input = NodeBuilder::editable_text(editable_spec())
+            .build(&mut tree, root)
+            .expect("editable input");
+        write_editable_patch(
+            &mut tree,
+            input,
+            "价🌍ab",
+            A11yTextSelection {
+                anchor: 3,
+                focus: 8,
+            },
+        );
+        let mut bridge = A11yBridge::new();
+        let snapshot = take(&mut bridge, &mut tree, None).expect("首笔");
+        let index = snapshot
+            .nodes
+            .iter()
+            .position(|record| record.engine == input && record.text_run.is_some())
+            .expect("输入节点");
+        let input_record = &snapshot.nodes[index];
+        let run_record = &snapshot.nodes[index + 1];
+        assert_eq!(
+            input_record.text_run,
+            Some(run_record.id),
+            "输入节点后必须紧跟它的 TextRun 子节点"
+        );
+        assert_eq!(run_record.engine, input);
+        assert_eq!(run_record.parent, Some(input_record.id));
+        assert_eq!(run_record.role, A11yRole::TextRun);
+        assert_eq!(run_record.value.as_deref(), Some("价🌍ab"));
+        assert_eq!(run_record.character_lengths, vec![3, 4, 1, 1]);
+        assert_eq!(input_record.children.first().copied(), Some(run_record.id));
+        assert_eq!(
+            input_record.text_selection,
+            Some(A11yTextSelection {
+                anchor: 1,
+                focus: 3
+            }),
+            "字节 3..8 → grapheme 1..3"
+        );
+        let update = to_tree_update(&snapshot);
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(id, _)| *id == AkNodeId(input_record.id.get()))
+                && update
+                    .nodes
+                    .iter()
+                    .any(|(id, _)| *id == AkNodeId(run_record.id.get())),
+            "输入与 TextRun 必须同笔交付"
+        );
+        assert_eq!(
+            snapshot.node_for(input).map(|record| record.id),
+            Some(input_record.id)
+        );
+        assert_eq!(snapshot.id_for_engine(input), Some(input_record.id));
+    }
+
+    #[test]
+    fn incremental_editable_updates_resend_the_text_run_with_new_content() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let input = NodeBuilder::editable_text(editable_spec())
+            .build(&mut tree, root)
+            .expect("editable input");
+        write_editable_patch(
+            &mut tree,
+            input,
+            "ab",
+            A11yTextSelection {
+                anchor: 0,
+                focus: 0,
+            },
+        );
+        let mut bridge = A11yBridge::new();
+        let _ = take(&mut bridge, &mut tree, None).expect("首笔");
+
+        write_editable_patch(
+            &mut tree,
+            input,
+            "abc",
+            A11yTextSelection {
+                anchor: 3,
+                focus: 3,
+            },
+        );
+        let snapshot = take(&mut bridge, &mut tree, None).expect("增量");
+        assert!(!snapshot.full);
+        let records: Vec<&crate::a11y::A11yNode> = snapshot
+            .nodes
+            .iter()
+            .filter(|record| record.engine == input || record.text_run.is_some())
+            .collect();
+        let run = snapshot
+            .nodes
+            .iter()
+            .find(|record| record.role == A11yRole::TextRun)
+            .expect("TextRun 必须随增量重发");
+        assert_eq!(run.value.as_deref(), Some("abc"));
+        assert_eq!(run.character_lengths, vec![1, 1, 1]);
+        assert!(records.iter().any(|record| {
+            record.text_run == Some(run.id)
+                && record.text_selection
+                    == Some(A11yTextSelection {
+                        anchor: 3,
+                        focus: 3,
+                    })
+        }));
+    }
+
+    struct NoopChangeHandler;
+
+    impl accesskit_consumer::TreeChangeHandler for NoopChangeHandler {
+        fn node_added(&mut self, _node: &accesskit_consumer::NodeRef) {}
+
+        fn node_updated(
+            &mut self,
+            _old_node: &accesskit_consumer::NodeRef,
+            _new_node: &accesskit_consumer::NodeRef,
+        ) {
+        }
+
+        fn focus_moved(
+            &mut self,
+            _old_node: Option<&accesskit_consumer::NodeRef>,
+            _new_node: Option<&accesskit_consumer::NodeRef>,
+        ) {
+        }
+
+        fn node_removed(&mut self, _node: &accesskit_consumer::NodeRef) {}
+    }
+
+    fn consumer(
+        state: &accesskit_consumer::TreeState,
+        id: crate::a11y::A11yNodeId,
+    ) -> accesskit_consumer::NodeRef<'_> {
+        state
+            .node_by_tree_local_id(AkNodeId(id.get()), accesskit::TreeId::ROOT)
+            .expect("a11y node must exist in the consumer tree")
+    }
+
+    #[test]
+    fn a_focus_target_beyond_the_batch_keeps_its_text_run_attached() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        for _ in 0..6000 {
+            NodeBuilder::boxed().build(&mut tree, root).expect("box");
+        }
+        let input = NodeBuilder::editable_text(editable_spec())
+            .build(&mut tree, root)
+            .expect("editable input");
+        write_editable_patch(
+            &mut tree,
+            input,
+            "价🌍ab",
+            A11yTextSelection {
+                anchor: 3,
+                focus: 8,
+            },
+        );
+        let mut bridge = A11yBridge::new();
+        let first = take(&mut bridge, &mut tree, None).expect("首笔");
+        let mut consumer_tree = accesskit_consumer::Tree::new(to_tree_update(&first), true);
+        assert!(
+            first.node_for(input).is_none(),
+            "前置条件：可编辑输入在首笔预算之外"
+        );
+
+        let second = take(&mut bridge, &mut tree, Some(input)).expect("焦点笔");
+        assert!(
+            second.node_for(input).is_none(),
+            "焦点笔仍在推进首笔前缀，输入只走 focus 回退"
+        );
+        let record = &second.focus_node;
+        assert_eq!(record.engine, input, "焦点回退必须交付可编辑输入");
+        let run = second
+            .focus_text_run
+            .as_ref()
+            .expect("焦点回退必须附带虚拟 TextRun");
+        assert_eq!(record.text_run, Some(run.id));
+        assert!(
+            record.children.contains(&run.id),
+            "焦点回退的 children 必须保留本节点自己的 TextRun：{:?}",
+            record.children
+        );
+
+        consumer_tree.update_and_process_changes(to_tree_update(&second), &mut NoopChangeHandler);
+        let state = consumer_tree.state();
+        let input_node = consumer(state, record.id);
+        let run_node = consumer(state, run.id);
+        assert!(input_node.supports_text_ranges());
+        assert_eq!(run_node.parent().expect("run parent").id(), input_node.id());
+        let selection = input_node.text_selection().expect("selection resolves");
+        assert_eq!(selection.text(), "🌍a");
+        assert_eq!(
+            consumer(state, run.id).data().character_lengths(),
+            &[3, 4, 1, 1]
+        );
+    }
+
+    #[test]
+    fn the_ime_caret_hint_never_fills_a_virtual_text_run() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let input = NodeBuilder::editable_text(editable_spec())
+            .build(&mut tree, root)
+            .expect("editable input");
+        crate::a11y::tree::write_a11y_patch(
+            &mut tree,
+            input,
+            A11yPatch {
+                role: Some(A11yRole::TextInput),
+                value: Some(SmolStr::new_static("abcd")),
+                selection: None,
+                ..A11yPatch::default()
+            },
+        );
+        let mut bridge = A11yBridge::new();
+        let mut diagnostics = Vec::new();
+        let snapshot = bridge
+            .take(
+                &mut tree,
+                Some(input),
+                scale(),
+                "Kytrix",
+                Some((input, 2)),
+                &mut diagnostics,
+            )
+            .expect("首笔");
+        let record = snapshot.node_for(input).expect("input record");
+        assert_eq!(
+            record.text_selection, None,
+            "caret hint 只服务 real TextRun；可编辑节点由 patch 提供选区"
+        );
+        let run = record.text_run.expect("virtual run");
+        let run_record = snapshot.node(run).expect("run record");
+        assert_eq!(
+            run_record.text_selection, None,
+            "虚拟 TextRun 不得被 caret hint 写 self-referencing 选区"
+        );
+        assert!(to_accesskit(record).text_selection().is_none());
     }
 }

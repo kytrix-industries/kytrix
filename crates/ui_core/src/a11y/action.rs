@@ -59,7 +59,6 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
     }
     let action = match (request.action, data.as_ref()) {
         (Action::CustomAction, Some(ActionData::CustomAction(id))) => A11yAction::Custom(*id),
-        (Action::ReplaceSelectedText, _) => A11yAction::SetValue,
         (action, _) => match action_from_accesskit(action) {
             Some(action) => action,
             None => {
@@ -109,6 +108,16 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
 
+    if let Some(handled) = editable_action(app, window, engine, action, data.as_ref()) {
+        if !handled {
+            app.a11y_note(A11yDiagnostic::InvalidActionData {
+                node: engine,
+                action,
+            });
+        }
+        return;
+    }
+
     let mut handler_node = engine;
     let payload = match action {
         A11yAction::Increment | A11yAction::Decrement => {
@@ -152,6 +161,7 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         | A11yAction::Increment
         | A11yAction::Decrement
         | A11yAction::SetTextSelection
+        | A11yAction::ReplaceSelectedText
         | A11yAction::Expand
         | A11yAction::Collapse
         | A11yAction::ShowContextMenu
@@ -174,9 +184,59 @@ const fn is_state_changing(action: A11yAction) -> bool {
             | A11yAction::Increment
             | A11yAction::Decrement
             | A11yAction::SetTextSelection
+            | A11yAction::ReplaceSelectedText
             | A11yAction::Expand
             | A11yAction::Collapse
     )
+}
+
+fn editable_action(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    action: A11yAction,
+    data: Option<&ActionData>,
+) -> Option<bool> {
+    let editable = app
+        .window(window)
+        .is_some_and(|target| target.tree().editable(node).is_some());
+    if !editable {
+        return None;
+    }
+    match action {
+        A11yAction::SetTextSelection => {
+            let Some(ActionData::SetTextSelection(selection)) = data else {
+                return Some(false);
+            };
+            let same_engine = |node_id: accesskit::NodeId| {
+                app.window(window)
+                    .and_then(|target| target.a11y_engine_of(A11yNodeId::from_stable(node_id.0)))
+                    .is_some_and(|engine| engine == node)
+            };
+            if !same_engine(selection.anchor.node) || !same_engine(selection.focus.node) {
+                return Some(false);
+            }
+            crate::text_edit::cancel_pointer_press(app, window);
+            Some(
+                crate::text_edit::set_selection_from_character_indices(
+                    app,
+                    window,
+                    node,
+                    selection.anchor.character_index,
+                    selection.focus.character_index,
+                )
+                .is_ok(),
+            )
+        }
+        A11yAction::ReplaceSelectedText => {
+            let Some(ActionData::Value(text)) = data else {
+                return Some(false);
+            };
+            crate::text_edit::cancel_pointer_press(app, window);
+            Some(crate::text_edit::replace_selected_text(app, window, node, text).is_ok())
+        }
+        _ => None,
+    }
 }
 
 fn increment_payload(
@@ -837,19 +897,20 @@ mod tests {
     }
 
     #[test]
-    fn replace_selected_text_is_normalised_to_set_value() {
+    fn replace_selected_text_keeps_its_own_action_and_payload() {
         let (_runtime, mut app, window) = setup();
         let root = app.window(window).expect("window").tree().root();
         let node = NodeBuilder::boxed()
             .a11y(A11yOverride {
                 role: Some(crate::a11y::A11yRole::TextInput),
+                actions: Some(vec![A11yAction::ReplaceSelectedText]),
                 ..A11yOverride::default()
             })
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
         let seen = Rc::new(Cell::new(String::new()));
         let sink = Rc::clone(&seen);
-        app.on_a11y_action(A11yAction::SetValue, move |ctx| {
+        app.on_a11y_action(A11yAction::ReplaceSelectedText, move |ctx| {
             if let A11yActionData::Value(text) = ctx.data() {
                 sink.set(String::from(text));
             }

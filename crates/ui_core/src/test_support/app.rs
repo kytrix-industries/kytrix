@@ -1287,6 +1287,7 @@ mod p11_tests {
             style_builder::StyleBuilder,
         },
         text::TextStyle,
+        text_edit::EditableSpec,
         window::WindowOptions,
     };
 
@@ -2381,6 +2382,86 @@ mod p11_tests {
         );
         assert_eq!(snap.node_for(rows[1]).expect("row 1").checked, Some(true));
         app.assert_a11y_oracle();
+    }
+
+    fn editable_a11y_spec() -> EditableSpec {
+        EditableSpec {
+            role: A11yRole::TextInput,
+            label: smol_str::SmolStr::new_static("搜索"),
+            placeholder: smol_str::SmolStr::new_static(""),
+            multiline: false,
+            masked: false,
+            readonly: false,
+            disabled: false,
+            max_length: None,
+            submit: None,
+            text_style: TextStyle::new(px(16.0)),
+            caret_color: Color::BLACK,
+            selection_color: Color::BLACK,
+            placeholder_color: Color::BLACK,
+            composition_color: Color::BLACK,
+        }
+    }
+
+    #[test]
+    fn a11y_force_full_keeps_a_focused_editable_text_run_attached() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        for _ in 0..2100 {
+            NodeBuilder::boxed()
+                .build(
+                    app.app_mut().window_mut(window).expect("window").tree_mut(),
+                    root,
+                )
+                .expect("box");
+        }
+        let editable = NodeBuilder::editable_text(editable_a11y_spec())
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                root,
+            )
+            .expect("editable input");
+        assert!(
+            app.app_mut().set_focus(window, Some(editable)),
+            "可编辑输入必须可聚焦"
+        );
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .a11y_force_full();
+        let _ = app.drain().expect("frame");
+        assert!(
+            app.a11y_contract_error().is_none(),
+            "强制全量交付必须合法：{:?}",
+            app.a11y_contract_error()
+        );
+        let snapshot = snapshot(&app);
+        assert!(snapshot.full, "强制全量后的首笔必须是全树");
+        let record = &snapshot.focus_node;
+        assert_eq!(
+            record.engine, editable,
+            "2100 个兄弟后的焦点输入必须走 focus 回退"
+        );
+        let run = snapshot
+            .focus_text_run
+            .as_ref()
+            .expect("焦点回退必须附带虚拟 TextRun");
+        assert_eq!(record.text_run, Some(run.id));
+        assert!(
+            record.children.contains(&run.id),
+            "焦点回退的 children 必须保留本节点自己的 TextRun：{:?}",
+            record.children
+        );
+        let tree_update = app.a11y_update().expect("TreeUpdate 必须被捕获");
+        assert!(
+            tree_update
+                .nodes
+                .iter()
+                .any(|(id, _)| *id == accesskit::NodeId(run.id.get())),
+            "TextRun 必须与输入同笔交付"
+        );
     }
 }
 

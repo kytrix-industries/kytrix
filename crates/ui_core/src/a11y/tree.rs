@@ -2,8 +2,8 @@ use smallvec::SmallVec;
 
 use crate::{
     a11y::{
-        A11yDiagnostic, A11yLabel, A11yLabelSource, A11yNode, A11yOverride, A11yPatch, A11yRole,
-        A11yScroll,
+        A11yAction, A11yDiagnostic, A11yLabel, A11yLabelSource, A11yNode, A11yNodeId, A11yOverride,
+        A11yPatch, A11yRole, A11yScroll,
         identity::{A11yIds, A11yKey},
         mapping::{
             a11y_disabled, a11y_read_only, bounds_of, effective_actions, effective_description,
@@ -20,6 +20,11 @@ use crate::{
     },
     paint::style::Clip,
 };
+
+pub(crate) struct A11yRecord {
+    pub node: A11yNode,
+    pub text_run: Option<A11yNode>,
+}
 
 pub(crate) struct NodeA11y {
     pub over: Option<A11yOverride>,
@@ -63,6 +68,7 @@ pub(crate) fn node_a11y(
     node_a11y_with_cache(tree, node, scale, title, ids, &mut tables, diagnostics)
 }
 
+#[cfg(test)]
 pub(crate) fn node_a11y_with_cache(
     tree: &NodeTree,
     node: NodeId,
@@ -72,6 +78,19 @@ pub(crate) fn node_a11y_with_cache(
     tables: &mut CollectionSemanticsCache,
     diagnostics: &mut Vec<A11yDiagnostic>,
 ) -> Option<A11yNode> {
+    node_a11y_records_with_cache(tree, node, scale, title, ids, tables, diagnostics)
+        .map(|record| record.node)
+}
+
+pub(crate) fn node_a11y_records_with_cache(
+    tree: &NodeTree,
+    node: NodeId,
+    scale: DevicePixelRatio,
+    title: &str,
+    ids: &mut A11yIds,
+    tables: &mut CollectionSemanticsCache,
+    diagnostics: &mut Vec<A11yDiagnostic>,
+) -> Option<A11yRecord> {
     let target = tree.get(node).ok()?;
     let slot = tree.a11y_of(node);
     let over = slot.and_then(|slot| slot.over.as_ref());
@@ -157,11 +176,23 @@ pub(crate) fn node_a11y_with_cache(
         }
     }
 
+    let editable = matches!(
+        role,
+        A11yRole::TextInput | A11yRole::MultilineTextInput | A11yRole::PasswordInput
+    ) && tree.editable(node).is_some();
     let text_metrics = match role {
         A11yRole::Label | A11yRole::TextRun => value.as_deref().and_then(textrun::text_metrics),
         _ => None,
     };
     let (character_lengths, word_starts) = text_metrics.unwrap_or_default();
+    let (editable_lengths, editable_word_starts) = if editable {
+        value
+            .as_deref()
+            .and_then(textrun::text_metrics)
+            .unwrap_or_default()
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let (character_positions, character_widths) = match (role, value.as_deref()) {
         (A11yRole::TextRun, Some(value)) => {
             textrun::character_metrics(tree, node, value, &character_lengths, scale)
@@ -174,6 +205,10 @@ pub(crate) fn node_a11y_with_cache(
             .and_then(|patch| patch.selection)
             .or_else(|| over.and_then(|over| over.selection))
             .map(|selection| textrun::selection(&character_lengths, selection)),
+        _ if editable => patch
+            .and_then(|patch| patch.selection)
+            .or_else(|| over.and_then(|over| over.selection))
+            .map(|selection| textrun::selection(&editable_lengths, selection)),
         _ => None,
     };
 
@@ -230,7 +265,7 @@ pub(crate) fn node_a11y_with_cache(
         identity_key(tree, node, over, patch),
         diagnostics,
     );
-    let children = a11y_children(tree, node, role, tables)
+    let mut children: Vec<A11yNodeId> = a11y_children(tree, node, role, tables)
         .into_iter()
         .map(|child| {
             let key = identity_key(
@@ -242,7 +277,40 @@ pub(crate) fn node_a11y_with_cache(
             ids.id_for(tree, child, key, diagnostics)
         })
         .collect();
-    Some(A11yNode {
+    let text_run = editable.then(|| {
+        let run_id = ids.id_for_text_run(node);
+        let run = text_run_record(
+            tree,
+            node,
+            id,
+            run_id,
+            TextRunText {
+                value: value.clone().unwrap_or_default(),
+                character_lengths: editable_lengths,
+                word_starts: editable_word_starts,
+            },
+            scale,
+            disabled,
+        );
+        (run_id, run)
+    });
+    let (text_run_id, text_run) = match text_run {
+        Some((run_id, run)) => (Some(run_id), Some(run)),
+        None => (None, None),
+    };
+    if let Some(run_id) = text_run_id {
+        children.insert(0, run_id);
+    }
+    let parent = parent.map(|parent| {
+        let key = identity_key(
+            tree,
+            parent,
+            over_child(tree, parent),
+            patch_child(tree, parent),
+        );
+        ids.id_for(tree, parent, key, diagnostics)
+    });
+    let node = A11yNode {
         id,
         engine: node,
         role,
@@ -293,6 +361,7 @@ pub(crate) fn node_a11y_with_cache(
         character_positions,
         character_widths,
         text_selection,
+        text_run: text_run_id,
         read_only,
         modal,
         busy,
@@ -302,16 +371,9 @@ pub(crate) fn node_a11y_with_cache(
         level,
         orientation,
         children,
-        parent: parent.map(|parent| {
-            let key = identity_key(
-                tree,
-                parent,
-                over_child(tree, parent),
-                patch_child(tree, parent),
-            );
-            ids.id_for(tree, parent, key, diagnostics)
-        }),
-    })
+        parent,
+    };
+    Some(A11yRecord { node, text_run })
 }
 
 fn over_child(tree: &NodeTree, node: NodeId) -> Option<&A11yOverride> {
@@ -320,6 +382,77 @@ fn over_child(tree: &NodeTree, node: NodeId) -> Option<&A11yOverride> {
 
 fn patch_child(tree: &NodeTree, node: NodeId) -> Option<&A11yPatch> {
     tree.a11y_of(node).map(|slot| &slot.patch)
+}
+
+struct TextRunText {
+    value: smol_str::SmolStr,
+    character_lengths: Vec<u8>,
+    word_starts: Vec<u8>,
+}
+
+fn text_run_record(
+    tree: &NodeTree,
+    engine: NodeId,
+    input: A11yNodeId,
+    id: A11yNodeId,
+    text: TextRunText,
+    scale: DevicePixelRatio,
+    disabled: bool,
+) -> A11yNode {
+    let (character_positions, character_widths) =
+        textrun::character_metrics(tree, engine, &text.value, &text.character_lengths, scale)
+            .unwrap_or_default();
+    A11yNode {
+        id,
+        engine,
+        role: A11yRole::TextRun,
+        label: None,
+        value: Some(text.value),
+        description: None,
+        bounds: bounds_of(tree, engine, scale),
+        actions: if disabled {
+            Vec::new()
+        } else {
+            vec![A11yAction::SetTextSelection]
+        },
+        hidden: false,
+        disabled: false,
+        checked: None,
+        selected: None,
+        expanded: None,
+        row_index: None,
+        column_index: None,
+        row_count: None,
+        column_count: None,
+        live: None,
+        pos_in_set: None,
+        size_of_set: None,
+        numeric_value: None,
+        min_numeric_value: None,
+        max_numeric_value: None,
+        numeric_value_step: None,
+        numeric_value_jump: None,
+        sort: None,
+        scroll: None,
+        clips_children: false,
+        custom_actions: Vec::new(),
+        character_lengths: text.character_lengths,
+        word_starts: text.word_starts,
+        character_positions,
+        character_widths,
+        text_selection: None,
+        text_run: None,
+        read_only: false,
+        modal: false,
+        busy: false,
+        invalid: false,
+        error_message: None,
+        placeholder: None,
+        level: None,
+        orientation: None,
+        children: Vec::new(),
+        parent: Some(input),
+    }
 }
 
 fn identity_key(
@@ -1682,10 +1815,10 @@ mod tests {
         );
         assert!(input_snapshot.actions.contains(&A11yAction::SetValue));
         assert!(
-            !input_snapshot
+            input_snapshot
                 .actions
                 .contains(&A11yAction::SetTextSelection),
-            "输入框默认只宣告 SetValue，选区能力挂在 TextRun 上"
+            "含 TextRun 子节点的输入框必须宣告 SetTextSelection（consumer supports_text_ranges 同款判据）"
         );
 
         let run_snapshot = super::node_a11y(

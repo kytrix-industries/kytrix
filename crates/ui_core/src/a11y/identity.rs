@@ -11,6 +11,7 @@ pub(crate) const A11Y_ID_KEY_CAPACITY: usize = 65_536;
 pub(crate) enum A11yKey {
     App(u64),
     VirtualRow { list: NodeId, index: usize },
+    TextRun { input: NodeId },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -25,6 +26,7 @@ pub(crate) struct A11yIds {
     by_engine: ahash::HashMap<NodeId, u64>,
     by_key: ahash::HashMap<A11yKey, KeyBinding>,
     by_id: ahash::HashMap<u64, NodeId>,
+    virtual_ids: ahash::HashMap<u64, NodeId>,
 }
 
 impl A11yIds {
@@ -35,6 +37,7 @@ impl A11yIds {
             by_engine: ahash::HashMap::default(),
             by_key: ahash::HashMap::default(),
             by_id: ahash::HashMap::default(),
+            virtual_ids: ahash::HashMap::default(),
         }
     }
 
@@ -79,6 +82,20 @@ impl A11yIds {
         A11yNodeId::from_stable(id)
     }
 
+    pub(crate) fn id_for_text_run(&mut self, input: NodeId) -> A11yNodeId {
+        let key = A11yKey::TextRun { input };
+        if let Some(binding) = self.by_key.get(&key).copied() {
+            self.observe_key(key, binding.id);
+            self.bind_virtual(binding.id, input);
+            return A11yNodeId::from_stable(binding.id);
+        }
+        let id = self.next;
+        self.next += 1;
+        self.observe_key(key, id);
+        self.bind_virtual(id, input);
+        A11yNodeId::from_stable(id)
+    }
+
     pub(crate) fn engine_of(&self, id: A11yNodeId) -> Option<NodeId> {
         self.by_id.get(&id.get()).copied()
     }
@@ -97,16 +114,29 @@ impl A11yIds {
 
     pub(crate) fn prune(&mut self, tree: &NodeTree) {
         self.by_engine.retain(|node, _| tree.get(*node).is_ok());
+        self.virtual_ids.retain(|_, owner| tree.get(*owner).is_ok());
         self.by_id.clear();
-        self.by_id.reserve(self.by_engine.len());
+        self.by_id
+            .reserve(self.by_engine.len() + self.virtual_ids.len());
         for (node, id) in &self.by_engine {
             self.by_id.insert(*id, *node);
         }
-        self.by_key
-            .retain(|_, binding| self.epoch.wrapping_sub(binding.seen) < A11Y_ID_KEY_TTL);
+        for (id, owner) in &self.virtual_ids {
+            self.by_id.insert(*id, *owner);
+        }
+        self.by_key.retain(|key, binding| {
+            self.epoch.wrapping_sub(binding.seen) < A11Y_ID_KEY_TTL
+                || matches!(key, A11yKey::TextRun { input } if tree.get(*input).is_ok())
+        });
         if self.by_key.len() > A11Y_ID_KEY_CAPACITY {
-            let mut seen: Vec<(u32, A11yKey)> =
-                self.by_key.iter().map(|(key, b)| (b.seen, *key)).collect();
+            let mut seen: Vec<(u32, A11yKey)> = self
+                .by_key
+                .iter()
+                .filter(|(key, _)| {
+                    !matches!(key, A11yKey::TextRun { input } if tree.get(*input).is_ok())
+                })
+                .map(|(key, b)| (b.seen, *key))
+                .collect();
             seen.sort_unstable_by_key(|(seen, _)| *seen);
             let drop_count = seen.len() / 2;
             for (_, key) in seen.into_iter().take(drop_count) {
@@ -122,6 +152,11 @@ impl A11yIds {
             self.by_engine.remove(&previous);
         }
         self.by_engine.insert(node, id);
+    }
+
+    fn bind_virtual(&mut self, id: u64, owner: NodeId) {
+        self.by_id.insert(id, owner);
+        self.virtual_ids.insert(id, owner);
     }
 
     fn observe_key(&mut self, key: A11yKey, id: u64) {
@@ -143,7 +178,7 @@ impl Default for A11yIds {
 
 #[cfg(test)]
 mod tests {
-    use super::{A11Y_ID_KEY_CAPACITY, A11yIds, A11yKey};
+    use super::{A11Y_ID_KEY_CAPACITY, A11Y_ID_KEY_TTL, A11yIds, A11yKey};
     use crate::{
         a11y::A11yDiagnostic,
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
@@ -156,6 +191,39 @@ mod tests {
     fn id_of(ids: &mut A11yIds, tree: &NodeTree, node: NodeId) -> u64 {
         let mut diagnostics = Vec::new();
         ids.id_for(tree, node, None, &mut diagnostics).get()
+    }
+
+    #[test]
+    fn a_virtual_text_run_keeps_its_id_and_resolves_actions_to_its_input() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let input = mount(&mut tree, root);
+        let mut ids = A11yIds::new();
+        let mut diagnostics = Vec::new();
+        let input_id = ids.id_for(&tree, input, None, &mut diagnostics);
+        let run = ids.id_for_text_run(input);
+        assert_ne!(run, input_id, "虚拟子节点必须有自己的稳定 id");
+        assert_eq!(
+            ids.engine_of(run),
+            Some(input),
+            "虚拟 id 的动作/状态必须解析回输入节点"
+        );
+        for _ in 0..5 {
+            ids.begin_delivery();
+            ids.prune(&tree);
+            assert_eq!(ids.id_for_text_run(input), run, "虚拟 id 跨帧必须稳定");
+        }
+
+        tree.remove(input).expect("unmount input");
+        ids.begin_delivery();
+        ids.prune(&tree);
+        assert_eq!(ids.engine_of(run), None, "输入卸载后虚拟 id 必须失效");
+        let rebuilt = mount(&mut tree, root);
+        assert_ne!(
+            ids.id_for_text_run(rebuilt),
+            run,
+            "旧虚拟 id 不得复用给新输入"
+        );
     }
 
     #[test]
@@ -324,6 +392,34 @@ mod tests {
         assert!(
             keys <= A11Y_ID_KEY_CAPACITY,
             "逻辑键旁表必须有硬上限：{keys}"
+        );
+    }
+
+    #[test]
+    fn a_mounted_text_run_key_survives_more_than_the_id_key_ttl() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let input = mount(&mut tree, root);
+        let other = mount(&mut tree, root);
+        let mut ids = A11yIds::new();
+        let mut diagnostics = Vec::new();
+        let run = ids.id_for_text_run(input);
+        let _ = ids.id_for(&tree, other, None, &mut diagnostics);
+        for _ in 0..(A11Y_ID_KEY_TTL + 137) {
+            ids.begin_delivery();
+            ids.prune(&tree);
+            let _ = ids.id_for(&tree, other, None, &mut diagnostics);
+        }
+        assert_eq!(
+            ids.id_for_text_run(input),
+            run,
+            "挂载中的 TextRun 键不得被 TTL 淘汰（否则 AT 会周期性看到节点重建）"
+        );
+        assert_eq!(ids.engine_of(run), Some(input));
+        let (_, keys, _) = ids.sizes();
+        assert!(
+            keys <= 2,
+            "旁表不得随交付轮数累积：{keys} > A11Y_ID_KEY_TTL={A11Y_ID_KEY_TTL}"
         );
     }
 }

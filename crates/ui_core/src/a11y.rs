@@ -179,6 +179,7 @@ pub enum A11yAction {
     Increment,
     Decrement,
     SetTextSelection,
+    ReplaceSelectedText,
     ScrollUp,
     ScrollDown,
     ScrollLeft,
@@ -329,6 +330,7 @@ pub struct A11yNode {
     pub character_positions: Vec<f32>,
     pub character_widths: Vec<f32>,
     pub text_selection: Option<A11yTextSelection>,
+    pub text_run: Option<A11yNodeId>,
     pub read_only: bool,
     pub modal: bool,
     pub busy: bool,
@@ -355,6 +357,7 @@ pub struct A11yTreeSnapshot {
     pub nodes: Vec<A11yNode>,
     pub focus: A11yNodeId,
     pub focus_node: A11yNode,
+    pub focus_text_run: Option<A11yNode>,
     pub focus_ancestors: Vec<A11yNode>,
     pub diagnostics: usize,
 }
@@ -372,7 +375,9 @@ impl A11yTreeSnapshot {
 
     #[must_use]
     pub fn node_for(&self, engine: NodeId) -> Option<&A11yNode> {
-        self.nodes.iter().find(|node| node.engine == engine)
+        self.nodes
+            .iter()
+            .find(|node| node.engine == engine && !self.is_virtual_text_run(node))
     }
 
     #[must_use]
@@ -389,9 +394,20 @@ impl A11yTreeSnapshot {
     pub fn id_for_engine(&self, engine: NodeId) -> Option<A11yNodeId> {
         self.nodes
             .iter()
-            .find(|node| node.engine == engine)
+            .find(|node| node.engine == engine && !self.is_virtual_text_run(node))
             .map(|node| node.id)
             .or_else(|| (self.focus_node.engine == engine).then_some(self.focus_node.id))
+    }
+
+    fn is_virtual_text_run(&self, record: &A11yNode) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| node.text_run == Some(record.id))
+            || self.focus_node.text_run == Some(record.id)
+            || self
+                .focus_ancestors
+                .iter()
+                .any(|node| node.text_run == Some(record.id))
     }
 
     pub fn nodes_with_role(&self, role: A11yRole) -> impl Iterator<Item = &A11yNode> {
@@ -625,6 +641,8 @@ mod tests {
 
 pub(crate) mod action;
 pub(crate) mod adapter;
+#[cfg(test)]
+mod contract_tests;
 pub(crate) mod identity;
 pub(crate) mod mapping;
 pub(crate) mod textrun;

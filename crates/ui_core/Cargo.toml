@@ -89,6 +89,8 @@ harness = false
 [dev-dependencies]
 # P13：只测 CPU 侧 pass。workspace 已关掉 criterion 的默认 features（无 plotters/rayon，S-130）。
 criterion = { workspace = true }
+# P1b-3：AccessKit 消费端契约测试（与锁内 accesskit_windows/macos/unix 的传递版本一致 0.39.2）。
+accesskit_consumer = { workspace = true }
 # P14：`tests/layout.rs` 构造 taffy 样式（`Style.inner` 的公开类型；已在依赖图内，不加包）。
 taffy = { workspace = true }
 

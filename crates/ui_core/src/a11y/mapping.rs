@@ -74,6 +74,7 @@ pub(crate) const fn action_to_accesskit(action: A11yAction) -> accesskit::Action
         A::Increment => Action::Increment,
         A::Decrement => Action::Decrement,
         A::SetTextSelection => Action::SetTextSelection,
+        A::ReplaceSelectedText => Action::ReplaceSelectedText,
         A::ScrollUp => Action::ScrollUp,
         A::ScrollDown => Action::ScrollDown,
         A::ScrollLeft => Action::ScrollLeft,
@@ -96,6 +97,7 @@ pub(crate) const fn action_from_accesskit(action: accesskit::Action) -> Option<A
         Action::Focus => Some(A::Focus),
         Action::SetValue => Some(A::SetValue),
         Action::SetTextSelection => Some(A::SetTextSelection),
+        Action::ReplaceSelectedText => Some(A::ReplaceSelectedText),
         Action::Increment => Some(A::Increment),
         Action::Decrement => Some(A::Decrement),
         Action::ScrollUp => Some(A::ScrollUp),
@@ -109,7 +111,6 @@ pub(crate) const fn action_from_accesskit(action: accesskit::Action) -> Option<A
         Action::ShowContextMenu => Some(A::ShowContextMenu),
         Action::CustomAction
         | Action::Blur
-        | Action::ReplaceSelectedText
         | Action::HideTooltip
         | Action::ShowTooltip
         | Action::ScrollToPoint
@@ -250,7 +251,10 @@ fn is_text_run_in_input(tree: &NodeTree, node: NodeId) -> bool {
         .and_then(|slot| slot.patch.role)
         .or_else(|| slot.and_then(|slot| slot.over.as_ref().and_then(|over| over.role)))
         .unwrap_or_else(|| role_by_kind(tree, parent, parent_node));
-    matches!(role, A11yRole::TextInput | A11yRole::MultilineTextInput)
+    matches!(
+        role,
+        A11yRole::TextInput | A11yRole::MultilineTextInput | A11yRole::PasswordInput
+    )
 }
 
 pub(crate) fn effective_role(
@@ -295,6 +299,17 @@ pub(crate) fn effective_actions(
     {
         actions.push(A11yAction::ScrollIntoView);
     }
+    if is_text_input_role(role) {
+        if subtree_has_text_run(tree, node) && !actions.contains(&A11yAction::SetTextSelection) {
+            actions.push(A11yAction::SetTextSelection);
+        }
+        if tree.editable(node).is_some() && !actions.contains(&A11yAction::ReplaceSelectedText) {
+            actions.push(A11yAction::ReplaceSelectedText);
+        }
+    }
+    if tree.editable(node).is_some() {
+        actions.retain(|action| *action != A11yAction::SetValue);
+    }
     if crate::interaction::focus::action_target(tree, node).is_some()
         && !actions.contains(&A11yAction::Click)
     {
@@ -317,6 +332,7 @@ pub(crate) fn effective_actions(
                     | A11yAction::Increment
                     | A11yAction::Decrement
                     | A11yAction::SetTextSelection
+                    | A11yAction::ReplaceSelectedText
                     | A11yAction::Expand
                     | A11yAction::Collapse
             )
@@ -331,7 +347,10 @@ pub(crate) fn effective_actions(
 pub(crate) const fn is_value_mutation(action: A11yAction) -> bool {
     matches!(
         action,
-        A11yAction::SetValue | A11yAction::Increment | A11yAction::Decrement
+        A11yAction::SetValue
+            | A11yAction::Increment
+            | A11yAction::Decrement
+            | A11yAction::ReplaceSelectedText
     )
 }
 
@@ -365,6 +384,13 @@ pub(crate) fn action_allowed(tree: &NodeTree, node: NodeId, action: A11yAction) 
             let role = effective_role_of(tree, node);
             matches!(role, A11yRole::TextRun)
                 || (is_text_input_role(role) && subtree_has_text_run(tree, node))
+        }
+        A11yAction::ReplaceSelectedText => {
+            let role = effective_role_of(tree, node);
+            is_text_input_role(role)
+                && tree.editable(node).is_some()
+                && !a11y_read_only(tree, node)
+                && !a11y_disabled(tree, node)
         }
         A11yAction::Custom(id) => custom_action_registered(tree, node, id),
         _ => false,
@@ -405,10 +431,16 @@ pub(crate) fn effective_role_of(tree: &NodeTree, node: NodeId) -> A11yRole {
 }
 
 fn is_text_input_role(role: A11yRole) -> bool {
-    matches!(role, A11yRole::TextInput | A11yRole::MultilineTextInput)
+    matches!(
+        role,
+        A11yRole::TextInput | A11yRole::MultilineTextInput | A11yRole::PasswordInput
+    )
 }
 
 fn subtree_has_text_run(tree: &NodeTree, node: NodeId) -> bool {
+    if tree.editable(node).is_some() {
+        return true;
+    }
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
         if effective_role_of(tree, current) == A11yRole::TextRun {
@@ -566,7 +598,27 @@ mod tests {
             style::{Clip, Style, StylePatch},
         },
         text::{TextContent, TextStyle},
+        text_edit::EditableSpec,
     };
+
+    fn editable_spec() -> EditableSpec {
+        EditableSpec {
+            role: A11yRole::TextInput,
+            label: smol_str::SmolStr::new_static("搜索"),
+            placeholder: smol_str::SmolStr::new_static(""),
+            multiline: false,
+            masked: false,
+            readonly: false,
+            disabled: false,
+            max_length: None,
+            submit: None,
+            text_style: TextStyle::new(px(12.0)),
+            caret_color: crate::paint::color::Color::BLACK,
+            selection_color: crate::paint::color::Color::BLACK,
+            placeholder_color: crate::paint::color::Color::BLACK,
+            composition_color: crate::paint::color::Color::BLACK,
+        }
+    }
 
     #[test]
     fn every_role_is_included_exactly_once_in_all() {
@@ -776,6 +828,7 @@ mod tests {
             A11yAction::Focus,
             A11yAction::SetValue,
             A11yAction::SetTextSelection,
+            A11yAction::ReplaceSelectedText,
             A11yAction::ScrollUp,
             A11yAction::ScrollDown,
             A11yAction::ScrollLeft,
@@ -1301,6 +1354,7 @@ mod tests {
         assert!(is_value_mutation(A11yAction::SetValue));
         assert!(is_value_mutation(A11yAction::Increment));
         assert!(is_value_mutation(A11yAction::Decrement));
+        assert!(is_value_mutation(A11yAction::ReplaceSelectedText));
         for action in [
             A11yAction::Click,
             A11yAction::Focus,
@@ -1349,6 +1403,25 @@ mod tests {
         assert!(
             action_allowed(&tree, run, A11yAction::SetTextSelection),
             "TextRun 自身必须允许 SetTextSelection"
+        );
+        assert!(
+            !action_allowed(&tree, input, A11yAction::ReplaceSelectedText),
+            "ReplaceSelectedText 只属于引擎可编辑节点（普通 TextRun 子节点只能选择）"
+        );
+        assert!(
+            !action_allowed(&tree, run, A11yAction::ReplaceSelectedText),
+            "ReplaceSelectedText 只属于输入框（替换整段选区），不宣告在 TextRun 上"
+        );
+        let editable = NodeBuilder::editable_text(editable_spec())
+            .build(&mut tree, root)
+            .expect("editable input");
+        assert!(
+            action_allowed(&tree, editable, A11yAction::SetTextSelection),
+            "可编辑节点合成 TextRun ⇒ 必须允许 SetTextSelection"
+        );
+        assert!(
+            action_allowed(&tree, editable, A11yAction::ReplaceSelectedText),
+            "可编辑节点必须允许 ReplaceSelectedText"
         );
         assert!(
             !action_allowed(&tree, input, A11yAction::Increment),

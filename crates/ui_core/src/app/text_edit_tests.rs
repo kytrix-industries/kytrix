@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Instant};
 
 use super::App;
 use crate::{
-    a11y::A11yRole,
+    a11y::{A11yAction, A11yNodeId, A11yRole, A11yTextSelection},
     error::EngineError,
     event::{Action, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers},
     interaction::{ScrollAxis, ScrollConfig},
@@ -3641,16 +3641,17 @@ fn composition_updates_rebuild_the_display_once_per_event_and_never_per_frame() 
     assert_eq!(snapshot_of(&app, window, node).generation, generation);
 }
 
-fn a11y_node(app: &mut App, window: WindowId, node: NodeId) -> crate::a11y::A11yNode {
+fn a11y_snapshot(app: &mut App, window: WindowId) -> crate::a11y::A11yTreeSnapshot {
     frame(app, window);
-    let snapshot = app.a11y_take(window).expect("a11y 交付");
-    snapshot
+    app.a11y_take(window)
+        .or_else(|| app.a11y_take(window))
+        .expect("a11y 交付")
+}
+
+fn a11y_node(app: &mut App, window: WindowId, node: NodeId) -> crate::a11y::A11yNode {
+    a11y_snapshot(app, window)
         .node_for(node)
         .cloned()
-        .or_else(|| {
-            let snapshot = app.a11y_take(window).expect("再次 a11y 交付");
-            snapshot.node_for(node).cloned()
-        })
         .expect("可编辑节点必须进入 a11y 树")
 }
 
@@ -3662,24 +3663,54 @@ fn editable_a11y_patch_exposes_role_value_placeholder_and_flags() {
     editable.placeholder = smol_str::SmolStr::new_static("输入关键词");
     editable.readonly = true;
     let node = mount_editable(&mut app, window, editable, None, "hello");
-    let record = a11y_node(&mut app, window, node);
+    let snapshot = a11y_snapshot(&mut app, window);
+    let record = snapshot.node_for(node).expect("输入节点").clone();
     assert_eq!(record.role, A11yRole::TextInput);
     assert_eq!(record.label_text(), Some("搜索"));
     assert_eq!(record.value.as_deref(), Some("hello"));
     assert!(record.read_only);
     assert_eq!(record.placeholder.as_deref(), Some("输入关键词"));
     assert_eq!(
-        record.text_selection, None,
-        "P1b-2 降级：可编辑节点不暴露文本选区（task-14 TextRun 子节点模型）"
+        record.text_selection,
+        Some(A11yTextSelection {
+            anchor: 5,
+            focus: 5
+        }),
+        "选区挂在输入节点上（TextPosition.node 指向 TextRun 子节点）"
     );
     assert!(
         record.character_lengths.is_empty(),
-        "P1b-2 降级：可编辑节点不写 character_lengths"
+        "字符语义由 TextRun 子节点承担，输入节点不写 character_lengths"
     );
+    let run_id = record
+        .text_run
+        .expect("可编辑节点必须有虚拟 TextRun 子节点");
+    assert_eq!(
+        record.children.first(),
+        Some(&run_id),
+        "输入节点的 children 首位必须是它的 TextRun 子节点"
+    );
+    let run = snapshot.node(run_id).expect("TextRun 子节点");
+    assert_eq!(run.role, A11yRole::TextRun);
+    assert_eq!(run.value.as_deref(), Some("hello"));
+    assert_eq!(run.character_lengths, vec![1, 1, 1, 1, 1]);
+    assert_eq!(run.parent, Some(record.id));
+    assert_eq!(run.engine, node, "虚拟子节点回指同一个引擎节点");
+    assert!(run.actions.contains(&A11yAction::SetTextSelection));
     let ak = crate::a11y::adapter::to_accesskit(&record);
     assert_eq!(ak.role(), accesskit::Role::TextInput);
     assert_eq!(ak.value(), Some("hello"));
-    assert!(ak.text_selection().is_none());
+    let selection = ak.text_selection().expect("text_selection");
+    assert_eq!(selection.focus.character_index, 5);
+    assert_eq!(
+        selection.focus.node,
+        accesskit::NodeId(run_id.get()),
+        "TextPosition.node 必须是 TextRun 子节点"
+    );
+    let ak_run = crate::a11y::adapter::to_accesskit(run);
+    assert_eq!(ak_run.role(), accesskit::Role::TextRun);
+    assert_eq!(ak_run.character_lengths(), &[1, 1, 1, 1, 1]);
+    assert_eq!(ak_run.value(), Some("hello"));
 }
 
 #[test]
@@ -3688,7 +3719,8 @@ fn password_a11y_patch_masks_the_value_and_never_leaks_plaintext() {
     let mut editable = masked_spec(TextStyle::new(px(16.0)), None);
     editable.label = smol_str::SmolStr::new_static("密码");
     let node = mount_editable(&mut app, window, editable, None, "s3cret");
-    let record = a11y_node(&mut app, window, node);
+    let snapshot = a11y_snapshot(&mut app, window);
+    let record = snapshot.node_for(node).expect("密码输入").clone();
     assert_eq!(record.role, A11yRole::PasswordInput);
     assert_eq!(record.value.as_deref(), Some("••••••"));
     assert!(
@@ -3697,10 +3729,32 @@ fn password_a11y_patch_masks_the_value_and_never_leaks_plaintext() {
             .as_deref()
             .is_some_and(|value| !value.contains("s3cret"))
     );
-    assert_eq!(record.text_selection, None);
+    assert_eq!(
+        record.text_selection,
+        Some(A11yTextSelection {
+            anchor: 6,
+            focus: 6
+        })
+    );
+    let run_id = record.text_run.expect("密码输入的 TextRun 子节点");
+    let run = snapshot.node(run_id).expect("TextRun 子节点");
+    assert_eq!(run.value.as_deref(), Some("••••••"), "TextRun 只给掩码串");
+    assert!(
+        run.value
+            .as_deref()
+            .is_some_and(|value| !value.contains("s3cret")),
+        "TextRun 不得泄漏明文"
+    );
+    assert_eq!(run.character_lengths, vec![3, 3, 3, 3, 3, 3]);
     let ak = crate::a11y::adapter::to_accesskit(&record);
     assert_eq!(ak.role(), accesskit::Role::PasswordInput);
     assert_eq!(ak.value(), Some("••••••"));
+    let selection = ak.text_selection().expect("text_selection");
+    assert_eq!(selection.focus.character_index, 6);
+    assert_eq!(selection.focus.node, accesskit::NodeId(run_id.get()));
+    let ak_run = crate::a11y::adapter::to_accesskit(run);
+    assert_eq!(ak_run.value(), Some("••••••"));
+    assert_eq!(ak_run.character_lengths(), &[3, 3, 3, 3, 3, 3]);
 }
 
 #[test]
@@ -3718,7 +3772,16 @@ fn empty_editable_mounts_with_engine_a11y_patch_before_focus() {
     );
     assert_eq!(record.label_text(), Some("搜索"));
     assert_eq!(record.value.as_deref(), Some(""), "空文本也交付 value");
-    assert_eq!(record.text_selection, None);
+    assert_eq!(
+        record.text_selection,
+        Some(A11yTextSelection {
+            anchor: 0,
+            focus: 0
+        }),
+        "空文本的 caret 也必须交付（consumer 空输入同样解析选区）"
+    );
+    let run_id = record.text_run.expect("空文本也必须有 TextRun 子节点");
+    assert!(record.children.contains(&run_id));
 }
 
 #[test]
@@ -3857,7 +3920,14 @@ fn a11y_patch_tracks_edited_values() {
     assert!(type_text(&mut app, window, "c"));
     let record = a11y_node(&mut app, window, node);
     assert_eq!(record.value.as_deref(), Some("abc"));
-    assert_eq!(record.text_selection, None, "降级后不暴露选区");
+    assert_eq!(
+        record.text_selection,
+        Some(A11yTextSelection {
+            anchor: 3,
+            focus: 3
+        }),
+        "输入后 caret 跟在文本末尾"
+    );
     assert!(press(
         &mut app,
         window,
@@ -3866,6 +3936,13 @@ fn a11y_patch_tracks_edited_values() {
     ));
     let record = a11y_node(&mut app, window, node);
     assert_eq!(record.value.as_deref(), Some("ab"));
+    assert_eq!(
+        record.text_selection,
+        Some(A11yTextSelection {
+            anchor: 2,
+            focus: 2
+        })
+    );
 }
 
 #[test]
@@ -6063,5 +6140,431 @@ fn hiding_a_focused_editable_clears_the_ime_cursor_area() {
             .expect("窗口存在")
             .is_some(),
         "恢复可见后 IME area 必须重新写入"
+    );
+}
+
+fn a11y_ids(app: &mut App, window: WindowId, node: NodeId) -> (A11yNodeId, A11yNodeId) {
+    let snapshot = a11y_snapshot(app, window);
+    let record = snapshot.node_for(node).expect("可编辑节点");
+    (
+        record.id,
+        record.text_run.expect("可编辑节点的 TextRun 子节点"),
+    )
+}
+
+fn dispatch_a11y(
+    app: &mut App,
+    window: WindowId,
+    target: A11yNodeId,
+    action: accesskit::Action,
+    data: Option<accesskit::ActionData>,
+) {
+    crate::a11y::action::dispatch(
+        app,
+        window,
+        accesskit::ActionRequest {
+            action,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: accesskit::NodeId(target.get()),
+            data,
+        },
+    );
+}
+
+fn text_selection_data(run: A11yNodeId, anchor: usize, focus: usize) -> accesskit::ActionData {
+    accesskit::ActionData::SetTextSelection(accesskit::TextSelection {
+        anchor: accesskit::TextPosition {
+            node: accesskit::NodeId(run.get()),
+            character_index: anchor,
+        },
+        focus: accesskit::TextPosition {
+            node: accesskit::NodeId(run.get()),
+            character_index: focus,
+        },
+    })
+}
+
+#[test]
+fn a11y_set_text_selection_selects_by_grapheme_index_on_the_text_run() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "价🌍ab",
+    );
+    let (input, run) = a11y_ids(&mut app, window, node);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::SetTextSelection,
+        Some(text_selection_data(run, 1, 3)),
+    );
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        3..8,
+        "grapheme 1..3（🌍a）→ display 字节 3..8"
+    );
+
+    dispatch_a11y(
+        &mut app,
+        window,
+        run,
+        accesskit::Action::SetTextSelection,
+        Some(text_selection_data(run, 0, 1)),
+    );
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        0..3,
+        "动作目标也可以是 TextRun 子节点（解析回同一引擎节点）"
+    );
+
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::SetTextSelection,
+        Some(text_selection_data(run, 3, 1)),
+    );
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        3..8,
+        "反向选区按引擎语义保留 anchor/focus（range 归一化）"
+    );
+}
+
+#[test]
+fn a11y_replace_selected_text_replaces_the_selection_in_one_undo_step() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "hello",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 1, 4).expect("选中 ell");
+    let (input, _) = a11y_ids(&mut app, window, node);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::ReplaceSelectedText,
+        Some(accesskit::ActionData::Value("i".into())),
+    );
+    assert_eq!(text_of(&app, window, node), "hio");
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        2..2,
+        "替换后 caret 在插入文本之后"
+    );
+    assert!(app.text_edit_undo(window, node).expect("undo"));
+    assert_eq!(text_of(&app, window, node), "hello");
+    assert_eq!(snapshot_of(&app, window, node).selection.range(), 1..4);
+    assert!(!app.text_edit_undo(window, node).expect("undo 耗尽"));
+}
+
+#[test]
+fn a11y_replace_selected_text_rejects_readonly_and_disabled_inputs() {
+    let (_rt, mut app, window) = new_app();
+    let mut locked = spec(TextStyle::new(px(16.0)), false);
+    locked.readonly = true;
+    let readonly = mount_editable(&mut app, window, locked, None, "abc");
+    crate::text_edit::set_selection(&mut app, window, readonly, 0, 1).expect("选中 a");
+    let (input, _) = a11y_ids(&mut app, window, readonly);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::ReplaceSelectedText,
+        Some(accesskit::ActionData::Value("z".into())),
+    );
+    assert_eq!(text_of(&app, window, readonly), "abc", "只读输入不得被替换");
+    assert!(
+        app.a11y_diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            crate::a11y::A11yDiagnostic::ReadOnlyAction {
+                node,
+                action: A11yAction::ReplaceSelectedText,
+            } if *node == readonly
+        )),
+        "{:?}",
+        app.a11y_diagnostics()
+    );
+
+    let mut disabled = spec(TextStyle::new(px(16.0)), false);
+    disabled.disabled = true;
+    let disabled_input = mount(&mut app, window, disabled, None);
+    app.text_edit_set_value(window, disabled_input, "abc")
+        .expect("写入成功");
+    crate::text_edit::set_selection(&mut app, window, disabled_input, 0, 1).expect("选中 a");
+    let (input, _) = a11y_ids(&mut app, window, disabled_input);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::ReplaceSelectedText,
+        Some(accesskit::ActionData::Value("z".into())),
+    );
+    assert_eq!(text_of(&app, window, disabled_input), "abc");
+    assert!(
+        app.a11y_diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            crate::a11y::A11yDiagnostic::DisabledAction {
+                node,
+                action: A11yAction::ReplaceSelectedText,
+            } if *node == disabled_input
+        )),
+        "{:?}",
+        app.a11y_diagnostics()
+    );
+}
+
+#[test]
+fn a11y_replace_selected_text_on_a_password_keeps_the_a11y_text_masked() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+        "abc",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 0, 6).expect("选中两个掩码字符");
+    let (input, run) = a11y_ids(&mut app, window, node);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::ReplaceSelectedText,
+        Some(accesskit::ActionData::Value("xy".into())),
+    );
+    assert_eq!(text_of(&app, window, node), "xyc");
+    let snapshot = a11y_snapshot(&mut app, window);
+    let record = snapshot.node_for(node).expect("密码输入");
+    assert_eq!(record.value.as_deref(), Some("•••"));
+    let run = snapshot.node(run).expect("TextRun 子节点");
+    assert_eq!(run.value.as_deref(), Some("•••"));
+    assert!(
+        !run.value
+            .as_deref()
+            .is_some_and(|value| value.contains("xyc"))
+    );
+    assert_eq!(run.character_lengths, vec![3, 3, 3]);
+    assert!(app.text_edit_undo(window, node).expect("undo"));
+    assert_eq!(text_of(&app, window, node), "abc");
+}
+
+#[test]
+fn a11y_set_text_selection_cancels_the_composition_first() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    let (input, run) = a11y_ids(&mut app, window, node);
+    assert_eq!(app.focused(window), Some(node), "mount_editable 已聚焦");
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("caret");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(2),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(snapshot_of(&app, window, node).composing);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::SetTextSelection,
+        Some(text_selection_data(run, 0, 1)),
+    );
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing, "SetTextSelection 必须先取消组合");
+    assert_eq!(snapshot.selection.range(), 0..1);
+    assert_eq!(display_mirror(&app, window, node), "abcd");
+}
+
+#[test]
+fn a11y_replace_selected_text_sanitizes_and_respects_max_length() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        max_length_spec(TextStyle::new(px(16.0)), Some(3)),
+        None,
+        "ab",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 0, 2).expect("全选");
+    let (input, _) = a11y_ids(&mut app, window, node);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::ReplaceSelectedText,
+        Some(accesskit::ActionData::Value("x\ty\nzw".into())),
+    );
+    assert_eq!(
+        text_of(&app, window, node),
+        "xyz",
+        "单行输入剔除控制符后按字素截断到 max_length=3"
+    );
+    assert_eq!(snapshot_of(&app, window, node).selection.range(), 3..3);
+    assert!(app.text_edit_undo(window, node).expect("undo"));
+    assert_eq!(text_of(&app, window, node), "ab", "替换是一步 undo");
+    assert!(!app.text_edit_undo(window, node).expect("undo 耗尽"));
+}
+
+#[test]
+fn a11y_replace_selected_text_normalises_crlf_for_multiline() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), true),
+        None,
+        "aXd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 1, 2).expect("选中 X");
+    let (input, _) = a11y_ids(&mut app, window, node);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::ReplaceSelectedText,
+        Some(accesskit::ActionData::Value("X\r\nY".into())),
+    );
+    assert_eq!(
+        text_of(&app, window, node),
+        "aX\nYd",
+        "多行保留换行且 CRLF→LF"
+    );
+    assert!(app.text_edit_undo(window, node).expect("undo"));
+    assert_eq!(text_of(&app, window, node), "aXd");
+    assert!(!app.text_edit_undo(window, node).expect("undo 耗尽"));
+}
+
+#[test]
+fn a11y_replace_selected_text_cancels_the_composition_first() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 1, 3).expect("选中 bc");
+    let (input, _) = a11y_ids(&mut app, window, node);
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(snapshot_of(&app, window, node).composing);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::ReplaceSelectedText,
+        Some(accesskit::ActionData::Value("Z".into())),
+    );
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing, "ReplaceSelectedText 必须先取消组合");
+    assert_eq!(text_of(&app, window, node), "aZbcd");
+    assert_eq!(snapshot.selection.range(), 2..2);
+    assert!(app.text_edit_undo(window, node).expect("undo"));
+    assert_eq!(text_of(&app, window, node), "abcd");
+}
+
+fn pointer_point_at(
+    app: &App,
+    window: WindowId,
+    node: NodeId,
+    byte: usize,
+) -> (LogicalPoint, LogicalPoint) {
+    let caret = app
+        .window(window)
+        .expect("窗口存在")
+        .text_caret_rect(node, byte)
+        .expect("caret 几何");
+    let origin = bounds(app, window, node).origin;
+    let window_point = LogicalPoint::new(
+        caret.origin.x + px(0.5),
+        caret.origin.y + caret.size.height * 0.5,
+    );
+    let local = LogicalPoint::new(window_point.x - origin.x, window_point.y - origin.y);
+    (window_point, local)
+}
+
+#[test]
+fn a11y_text_selection_cancels_pointer_drag_and_clears_granularity() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        Some(300.0),
+        "hello world",
+    );
+    frame(&mut app, window);
+    let (pointer, local) = pointer_point_at(&app, window, node, 8);
+    assert!(crate::text_edit::pointer_press(
+        &mut app,
+        window,
+        node,
+        pointer,
+        local,
+        2,
+        Modifiers::empty()
+    ));
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        6..11,
+        "双击选中 world（Word 粒度）"
+    );
+    assert!(
+        crate::text_edit::text_pointer_press(&app, window).is_some(),
+        "双击后必须存在拖拽会话"
+    );
+
+    let (input, run) = a11y_ids(&mut app, window, node);
+    dispatch_a11y(
+        &mut app,
+        window,
+        input,
+        accesskit::Action::SetTextSelection,
+        Some(text_selection_data(run, 6, 11)),
+    );
+    assert_eq!(snapshot_of(&app, window, node).selection.range(), 6..11);
+    assert!(
+        crate::text_edit::text_pointer_press(&app, window).is_none(),
+        "a11y 动作改变选区后不得残留拖拽态"
+    );
+
+    let (pointer, local) = pointer_point_at(&app, window, node, 2);
+    assert!(crate::text_edit::pointer_press(
+        &mut app,
+        window,
+        node,
+        pointer,
+        local,
+        1,
+        Modifiers::SHIFT
+    ));
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        2..6,
+        "a11y 同范围选择必须把粒度刷回 Cluster（Word 残留会得到 2..11）"
     );
 }

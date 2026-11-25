@@ -9,7 +9,7 @@ use smol_str::{SmolStr, SmolStrBuilder};
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 use crate::{
-    a11y::{A11yPatch, A11yRole},
+    a11y::{A11yPatch, A11yRole, textrun},
     app::App,
     error::EngineError,
     event::{Action, ActionSource, ImeEvent, KeyCode, Modifiers},
@@ -1338,11 +1338,19 @@ impl EditableText {
     }
 
     fn a11y_patch(&self) -> A11yPatch {
+        let selection = self
+            .composition
+            .is_none()
+            .then_some(crate::a11y::A11yTextSelection {
+                anchor: self.selection.anchor.byte,
+                focus: self.selection.focus.byte,
+            });
         A11yPatch {
             role: Some(self.spec.role),
             label: (!self.spec.label.is_empty()).then(|| self.spec.label.clone()),
             placeholder: (!self.spec.placeholder.is_empty()).then(|| self.spec.placeholder.clone()),
             value: Some(self.a11y_value.clone()),
+            selection,
             read_only: Some(self.spec.readonly),
             disabled: Some(self.spec.disabled),
             invalid: Some(self.invalid),
@@ -2251,6 +2259,35 @@ fn converged_byte(layout: &Layout<ColorBrush>, display_len: usize, byte: usize) 
     }
 }
 
+pub(crate) fn set_selection_from_character_indices(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    anchor_character: usize,
+    focus_character: usize,
+) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node)?;
+    let lengths = {
+        let tree = app
+            .window(window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .tree();
+        validate_node(tree, window, node)?;
+        let editable = tree
+            .editable(node)
+            .ok_or(EngineError::TextEditNotAvailable { node })?;
+        textrun::text_metrics(editable.display_text())
+            .map(|(lengths, _)| lengths)
+            .ok_or(EngineError::TextEditLayout {
+                node,
+                detail: SmolStr::new_static("a11y character lengths overflow u8"),
+            })?
+    };
+    let anchor = textrun::byte_index(&lengths, anchor_character.min(lengths.len()));
+    let focus = textrun::byte_index(&lengths, focus_character.min(lengths.len()));
+    set_selection(app, window, node, anchor, focus)
+}
+
 pub(crate) fn select_all(
     app: &mut App,
     window: WindowId,
@@ -2333,6 +2370,57 @@ pub(crate) fn insert_text(
         range,
         &inserted,
         kind,
+        AfterEdit::CollapsedAtRaw(caret),
+    )
+}
+
+pub(crate) fn replace_selected_text(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    text: &str,
+) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node)?;
+    let prepared = {
+        let tree = app
+            .window(window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .tree();
+        validate_node(tree, window, node)?;
+        let editable = tree
+            .editable(node)
+            .ok_or(EngineError::TextEditNotAvailable { node })?;
+        if editable.spec().readonly || editable.spec().disabled {
+            None
+        } else {
+            let sanitized = sanitize(text, editable.spec().multiline);
+            let display = editable.selection().range();
+            let range = editable.raw_byte_for_display(display.start)
+                ..editable.raw_byte_for_display(display.end);
+            let removed = grapheme_count(&editable.committed()[range.clone()]);
+            let room = match editable.spec().max_length {
+                Some(max) => max.saturating_sub(editable.graphemes().saturating_sub(removed)),
+                None => usize::MAX,
+            };
+            let inserted = truncate_graphemes(&sanitized, Some(room));
+            if range.is_empty() && inserted.is_empty() {
+                None
+            } else {
+                Some((range, SmolStr::new(inserted)))
+            }
+        }
+    };
+    let Some((range, inserted)) = prepared else {
+        return Ok(false);
+    };
+    let caret = range.start + inserted.len();
+    apply_raw_edit(
+        app,
+        window,
+        node,
+        range,
+        &inserted,
+        EditKind::Replace,
         AfterEdit::CollapsedAtRaw(caret),
     )
 }
@@ -3520,9 +3608,9 @@ mod tests {
     use unicode_segmentation::UnicodeSegmentation;
 
     use super::{
-        DisplayText, EditableSpec, EditableText, MASK_GLYPH, TextAffinity, TextCursor,
-        TextSelection, byte_offset_for_utf16, sanitize, snap_caret_forward, splice_preedit,
-        truncate_graphemes,
+        DisplayText, EditableSpec, EditableText, MASK_GLYPH, SelectionBase, TextAffinity,
+        TextCursor, TextSelection, byte_offset_for_utf16, sanitize, snap_caret_forward,
+        splice_preedit, truncate_graphemes,
     };
     use crate::{a11y::A11yRole, event::Action, math::px, paint::color::Color, text::TextStyle};
 
@@ -3993,7 +4081,10 @@ mod tests {
             Some("••"),
             "a11y value 不含 preedit"
         );
-        assert!(patch.selection.is_none(), "降级后 a11y patch 不写选区");
+        assert!(
+            patch.selection.is_none(),
+            "组合期不暴露 preedit：选区一并不暴露"
+        );
         assert_eq!(editable.raw_byte_for_display(6), 2);
         assert_eq!(editable.raw_byte_for_display(9), 2);
         assert_eq!(editable.raw_byte_for_display(12), 2);
@@ -4110,5 +4201,27 @@ mod tests {
         assert_eq!(byte_offset_for_utf16("🌍a", 1), 0, "代理对中间落到字符起点");
         assert_eq!(byte_offset_for_utf16("🌍a", 2), 4);
         assert_eq!(byte_offset_for_utf16("🌍a", 3), 5);
+    }
+
+    #[test]
+    fn equal_range_with_cluster_base_refreshes_a_word_selection_base() {
+        let mut editable = editable_with("hello world");
+        let start = TextCursor::at(6, 11);
+        let end = TextCursor::at(11, 11);
+        editable.selection = TextSelection {
+            anchor: start,
+            focus: end,
+            h_pos: None,
+            base: SelectionBase::Word { start, end },
+        };
+        assert!(
+            editable.set_selection(TextSelection::ranged(start, end)),
+            "同范围但 base 不同必须视为选择变化（否则拖拽粒度残留）"
+        );
+        assert_eq!(editable.selection.base, SelectionBase::Cluster);
+        assert!(
+            !editable.set_selection(TextSelection::ranged(start, end)),
+            "范围与 base 都相同才是 no-op"
+        );
     }
 }
