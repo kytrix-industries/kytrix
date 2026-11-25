@@ -1408,7 +1408,8 @@ impl App {
         self.clock
     }
 
-    pub(crate) fn ime_enabled(&self, window: WindowId) -> bool {
+    #[must_use]
+    pub fn ime_enabled(&self, window: WindowId) -> bool {
         focus::ime_enabled(self, window)
     }
 
