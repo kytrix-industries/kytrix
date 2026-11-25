@@ -157,18 +157,6 @@ impl InputState {
         self.can_redo
     }
 
-    pub fn validate(&mut self, spec: &InputSpec) -> Option<InputError> {
-        let error = if self.text.is_empty() {
-            Some(InputError::Empty)
-        } else {
-            spec.max_length
-                .filter(|max| grapheme_count(&self.text) > *max)
-                .map(|max| InputError::TooLong { max })
-        };
-        self.error = error.clone();
-        error
-    }
-
     pub fn set_error(&mut self, error: Option<InputError>) {
         self.error = error;
     }
@@ -314,6 +302,7 @@ pub fn build(
         .paint(root_paint)
         .id(format_smolstr!("{name}.root"))
         .tab_stop(false)
+        .press_focuses_editable()
         .bind_style(move |cx| {
             let state = cx.read(&style_state);
             let colors = style_theme.components(cx).input;
@@ -505,7 +494,6 @@ impl InputNode {
         };
         self.refresh_mirror(app, window, self.too_long_error(value));
         if changed {
-            *self.last_placeholder.borrow_mut() = app.read(&self.placeholder_state).clone();
             self.reset_horizontal_scroll(app);
             let _ = app.request_repaint(window);
         }
@@ -543,7 +531,7 @@ impl InputNode {
         self.update_value(app, "")
     }
 
-    pub fn set_clearable(&mut self, app: &mut App, clearable: bool) -> bool {
+    pub fn set_clearable(&self, app: &mut App, clearable: bool) -> bool {
         if self.clear.borrow().is_some() == clearable {
             return false;
         }
@@ -681,7 +669,8 @@ impl InputNode {
             ScrollbarOptions::default()
                 .hover()
                 .inset(size.padding_x)
-                .focus_opacity(SCROLLBAR_FOCUS_OPACITY),
+                .focus_opacity(SCROLLBAR_FOCUS_OPACITY)
+                .tab_stop(false),
         );
         let built = app
             .window_mut(window)
@@ -1258,6 +1247,39 @@ mod tests {
             ));
         }
 
+        fn click_point(&mut self, point: LogicalPoint) {
+            let _ = self.app.inject(InputEvent::pointer_down(
+                point,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            let _ = self.app.inject(InputEvent::pointer_up(
+                point,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            self.drain();
+        }
+
+        fn focused(&self) -> Option<NodeId> {
+            self.app.app().focused(self.window())
+        }
+
+        fn frame_index(&self) -> ui_core::window::FrameIndex {
+            self.app
+                .app()
+                .window(self.window())
+                .expect("窗口存在")
+                .frame_index()
+        }
+
+        fn ime_cursor_area(&self) -> Option<ui_core::math::LogicalRect> {
+            self.app
+                .app()
+                .ime_cursor_area(self.window())
+                .expect("窗口存在")
+        }
+
         fn style_patch(&self, node: NodeId) -> ui_core::paint::style::StylePatch {
             let window = self.window();
             self.app
@@ -1456,6 +1478,182 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_control_chrome_focuses_the_editable_without_blurring_it() {
+        let hits = Rc::new(Cell::new(0));
+        let submit = Action::Custom(SmolStr::new_static("test.chrome.submit"));
+        let counter = Rc::clone(&hits);
+        let mut harness = harness(
+            InputSpec {
+                submit: Some(submit.clone()),
+                ..spec()
+            },
+            "",
+        );
+        harness
+            .app
+            .app_mut()
+            .on_action(submit, move |_ctx| counter.set(counter.get() + 1));
+        assert!(harness.node.set_submit_on_blur(true));
+        harness.drain();
+        assert_eq!(harness.focused(), None, "前置：控件未聚焦");
+
+        let root = harness.root_bounds();
+        let center_y = root.origin.y + root.size.height * 0.5;
+        let border = LogicalPoint::new(root.origin.x + px(0.5), center_y);
+        let padding = LogicalPoint::new(root.origin.x + px(3.0), center_y);
+
+        harness.click_point(padding);
+        assert_eq!(
+            harness.focused(),
+            Some(harness.node.editable),
+            "点击内边距必须让 editable 获得焦点"
+        );
+        assert_eq!(hits.get(), 0, "聚焦不得触发 submit_on_blur");
+        assert!(harness.state().is_focused(), "镜像同步到聚焦态");
+        assert!(harness.app.app().ime_enabled(harness.window()));
+        let ime_area = harness.ime_cursor_area();
+        assert!(ime_area.is_some(), "聚焦后可编辑节点必须交付 IME 光标矩形");
+        let settled = harness.frame_index();
+
+        harness.click_point(border);
+        assert_eq!(
+            harness.focused(),
+            Some(harness.node.editable),
+            "点击边框必须保持 editable 焦点"
+        );
+        assert_eq!(hits.get(), 0, "边框点击不得触发 submit_on_blur");
+        assert!(
+            harness.app.app().ime_enabled(harness.window()),
+            "边框点击不得关闭 IME"
+        );
+        assert_eq!(
+            harness.ime_cursor_area(),
+            ime_area,
+            "边框点击不得重开/清空 IME 光标矩形"
+        );
+        assert_eq!(
+            harness.frame_index(),
+            settled,
+            "无状态变化的控件点击不得产生额外帧"
+        );
+
+        let editable = harness.editable_bounds();
+        harness.click_point(LogicalPoint::new(
+            editable.origin.x + editable.size.width * 0.5,
+            editable.origin.y + editable.size.height * 0.5,
+        ));
+        assert_eq!(
+            harness.focused(),
+            Some(harness.node.editable),
+            "点击文本区仍聚焦 editable"
+        );
+        assert_eq!(hits.get(), 0);
+
+        harness.click_point(LogicalPoint::new(
+            root.origin.x + root.size.width * 0.5,
+            root.max().y + px(20.0),
+        ));
+        assert_eq!(harness.focused(), None, "点击控件外必须照旧失焦");
+        assert_eq!(hits.get(), 1, "真正的失焦只提交一次");
+    }
+
+    #[test]
+    fn clicking_the_multiline_padding_and_gutter_focuses_the_editable() {
+        let mut harness = harness(multiline_spec(Some(3)), "one\ntwo\nthree\nfour");
+        harness.drain();
+        let root = harness.root_bounds();
+        let editable = harness.editable_bounds();
+        assert!(
+            editable.max().x + px(3.0) < root.max().x,
+            "前置：文本右侧必须有滚动条 gutter"
+        );
+        let gutter = LogicalPoint::new(
+            editable.max().x + px(3.0),
+            editable.origin.y + editable.size.height * 0.5,
+        );
+        harness.click_point(gutter);
+        assert_eq!(
+            harness.focused(),
+            Some(harness.node.editable),
+            "点击滚动条 gutter 必须聚焦 editable"
+        );
+        let top_padding = LogicalPoint::new(
+            root.origin.x + root.size.width * 0.5,
+            root.origin.y + px(3.0),
+        );
+        harness.click_point(top_padding);
+        assert_eq!(
+            harness.focused(),
+            Some(harness.node.editable),
+            "点击多行顶部内边距必须保持 editable 焦点"
+        );
+    }
+
+    fn tab_cycle_around_input(harness: &mut Harness) -> Vec<NodeId> {
+        let window = harness.window();
+        let tree_root = harness
+            .app
+            .app()
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .root();
+        let before = NodeBuilder::boxed()
+            .on_click(Action::custom("test.tab.before"))
+            .build(
+                harness
+                    .app
+                    .app_mut()
+                    .window_mut(window)
+                    .expect("窗口存在")
+                    .tree_mut(),
+                tree_root,
+            )
+            .expect("前置按钮");
+        let after = NodeBuilder::boxed()
+            .on_click(Action::custom("test.tab.after"))
+            .build(
+                harness
+                    .app
+                    .app_mut()
+                    .window_mut(window)
+                    .expect("窗口存在")
+                    .tree_mut(),
+                tree_root,
+            )
+            .expect("后置按钮");
+        harness.drain();
+        assert_eq!(harness.focused(), None, "前置：没有焦点");
+        let sequence: Vec<NodeId> = (0..4)
+            .map(|_| {
+                harness
+                    .app
+                    .app_mut()
+                    .focus_next(window)
+                    .expect("Tab 必须落在候选节点上")
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec![harness.node.editable, before, after, harness.node.editable],
+            "输入控件只有 editable 一个 Tab 停靠点（root/viewport/滚动条不进入序列）"
+        );
+        sequence
+    }
+
+    #[test]
+    fn the_input_contributes_exactly_one_tab_stop() {
+        let mut single = harness(spec(), "");
+        tab_cycle_around_input(&mut single);
+        let mut multiline = harness(multiline_spec(Some(3)), "");
+        tab_cycle_around_input(&mut multiline);
+        assert!(
+            multiline.node.scrollbar.borrow().is_some(),
+            "前置：多行输入带 overlay 滚动条（其节点也不得进入 Tab 序）"
+        );
+    }
+
+    #[test]
     fn submit_on_blur_is_only_for_single_line_inputs() {
         let hits = Rc::new(Cell::new(0));
         let submit = Action::Custom(SmolStr::new_static("test.multi.submit"));
@@ -1532,33 +1730,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_reports_empty_and_too_long_with_stable_i18n_keys() {
+    fn error_states_expose_stable_i18n_keys() {
         let mut state = InputState::new("");
-        assert_eq!(state.validate(&spec()), Some(InputError::Empty));
+        state.set_error(Some(InputError::Empty));
         assert_eq!(
             state.error().map(InputError::i18n_key),
             Some("input.error.empty")
         );
-        let mut too_long = InputState::new("abcd");
-        let limited = InputSpec {
-            max_length: Some(3),
-            ..spec()
-        };
+        state.set_error(Some(InputError::TooLong { max: 3 }));
         assert_eq!(
-            too_long.validate(&limited),
-            Some(InputError::TooLong { max: 3 })
-        );
-        assert_eq!(
-            too_long.error().map(InputError::i18n_key),
+            state.error().map(InputError::i18n_key),
             Some("input.error.tooLong")
         );
-        too_long.set_error(Some(InputError::Invalid {
+        state.set_error(Some(InputError::Invalid {
             i18n_key: SmolStr::new_static("input.error.duplicate"),
         }));
         assert_eq!(
-            too_long.error().map(InputError::i18n_key),
+            state.error().map(InputError::i18n_key),
             Some("input.error.duplicate")
         );
+        state.set_error(None);
+        assert!(state.error().is_none());
     }
 
     #[test]
@@ -1598,6 +1790,26 @@ mod tests {
                 .node
                 .update_placeholder(harness.app.app_mut(), "新的占位"),
             "同值不写"
+        );
+    }
+
+    #[test]
+    fn an_external_placeholder_write_survives_an_update_value_in_the_same_frame() {
+        let mut harness = harness(spec(), "");
+        harness.drain();
+        let external = SmolStr::new_static("外部写入的占位");
+        assert!(
+            harness
+                .app
+                .app_mut()
+                .write(&harness.placeholder, external.clone())
+        );
+        assert!(harness.node.update_value(harness.app.app_mut(), "abc"));
+        harness.drain();
+        assert_eq!(
+            harness.a11y_node().placeholder.as_deref(),
+            Some(external.as_str()),
+            "宿主直接写 placeholder 信号后，同帧 update_value 不得吞掉同步"
         );
     }
 
@@ -1969,11 +2181,23 @@ mod tests {
     fn the_mirror_short_circuits_when_the_generation_does_not_change() {
         let mut harness = harness(spec(), "");
         harness.focus();
+        let steady = harness.app.app().signal_write_calls();
         assert!(!harness.sync(), "稳态 sync 不写信号");
         assert!(!harness.sync());
+        assert_eq!(
+            harness.app.app().signal_write_calls(),
+            steady,
+            "generation 不变时 sync 不得调用 App::write"
+        );
         harness.type_text("a");
         assert_eq!(harness.state().generation, harness.snapshot().generation);
+        let steady = harness.app.app().signal_write_calls();
         assert!(!harness.sync(), "同一世代不重复写镜像");
+        assert_eq!(
+            harness.app.app().signal_write_calls(),
+            steady,
+            "同一世代不得调用 App::write"
+        );
     }
 
     #[test]
@@ -2306,7 +2530,7 @@ mod tests {
     }
 
     #[test]
-    fn max_length_counts_grapheme_clusters_and_validation_agrees() {
+    fn max_length_counts_grapheme_clusters_for_typed_and_programmatic_text() {
         let mut harness = harness(max_spec(2), "");
         assert!(harness.node.update_value(harness.app.app_mut(), "👨‍👩‍👧‍👦a"));
         assert_eq!(
@@ -2315,7 +2539,6 @@ mod tests {
             "one family emoji is one grapheme, so both clusters fit"
         );
         assert_eq!(harness.state().error(), None);
-        assert_eq!(harness.state().validate(&max_spec(2)), None);
 
         assert!(harness.node.update_value(harness.app.app_mut(), "abc"));
         assert_eq!(harness.engine_value(), "ab");
@@ -2323,11 +2546,6 @@ mod tests {
             harness.state().error(),
             Some(&InputError::TooLong { max: 2 }),
             "the request that had to be clipped is reported"
-        );
-        assert_eq!(
-            harness.state().validate(&max_spec(2)),
-            None,
-            "the mirrored text the engine keeps is within the limit"
         );
     }
 

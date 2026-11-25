@@ -38,6 +38,7 @@ pub struct NodeBuilder {
     a11y: Option<crate::a11y::A11yOverride>,
     bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
     tab_stop: bool,
+    press_focuses_editable: bool,
 }
 
 impl Default for NodeBuilder {
@@ -66,7 +67,14 @@ impl NodeBuilder {
             a11y: None,
             bind_a11y: None,
             tab_stop: true,
+            press_focuses_editable: false,
         }
+    }
+
+    #[must_use]
+    pub fn press_focuses_editable(mut self) -> Self {
+        self.press_focuses_editable = true;
+        self
     }
 
     #[must_use]
@@ -312,6 +320,9 @@ impl NodeBuilder {
         }
         if !self.tab_stop {
             spec = spec.with_tab_stop(false);
+        }
+        if self.press_focuses_editable {
+            spec = spec.with_press_focuses_editable();
         }
         tree.insert_child(parent, spec)
     }

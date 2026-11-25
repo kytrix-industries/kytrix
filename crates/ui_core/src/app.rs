@@ -155,6 +155,8 @@ pub struct App {
     batch_depth: u32,
     batch_wake: bool,
     frame_requests: u64,
+    #[cfg(feature = "test-support")]
+    signal_write_calls: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -413,6 +415,8 @@ impl App {
             batch_depth: 0,
             batch_wake: false,
             frame_requests: 0,
+            #[cfg(feature = "test-support")]
+            signal_write_calls: 0,
         }
     }
 
@@ -463,14 +467,6 @@ impl App {
     #[must_use]
     pub fn drain_events(&mut self) -> Vec<(WindowId, Event)> {
         resources::drain_events(self)
-    }
-
-    #[must_use]
-    pub fn drain_events_where(
-        &mut self,
-        keep: impl FnMut(WindowId, &Event) -> bool,
-    ) -> Vec<(WindowId, Event)> {
-        resources::drain_events_where(self, keep)
     }
 
     #[must_use]
@@ -777,6 +773,12 @@ impl App {
     #[must_use]
     pub fn frame_requests(&self) -> u64 {
         self.frame_requests
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn signal_write_calls(&self) -> u64 {
+        self.signal_write_calls
     }
 
     pub(crate) fn take_wake_request(&mut self) -> bool {

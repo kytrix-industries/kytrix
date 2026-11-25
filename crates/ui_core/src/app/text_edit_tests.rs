@@ -1620,6 +1620,82 @@ fn consecutive_typing_undoes_in_one_step_and_navigation_breaks_the_group() {
     frame(&mut app, window);
 }
 
+fn undo_stats_of(app: &App, window: WindowId, node: NodeId) -> (usize, usize, usize) {
+    app.window(window)
+        .expect("窗口")
+        .tree()
+        .editable(node)
+        .expect("可编辑槽位")
+        .undo_stats()
+}
+
+#[test]
+fn blurring_breaks_the_undo_group_between_typing_sessions() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "",
+    );
+    assert!(type_text(&mut app, window, "ab"));
+    assert_eq!(
+        undo_stats_of(&app, window, node),
+        (1, 0, 2),
+        "同一聚焦会话内的连续键入合并为一步"
+    );
+    assert!(app.set_focus(window, None));
+    assert!(app.set_focus(window, Some(node)));
+    assert!(type_text(&mut app, window, "c"));
+    assert_eq!(text_of(&app, window, node), "abc");
+    assert_eq!(
+        undo_stats_of(&app, window, node),
+        (2, 0, 3),
+        "失焦必须打断合并组（D7）"
+    );
+    assert!(app.text_edit_undo(window, node).expect("undo"));
+    assert_eq!(text_of(&app, window, node), "ab", "只撤销失焦之后的键入");
+    assert!(app.text_edit_undo(window, node).expect("undo"));
+    assert_eq!(text_of(&app, window, node), "");
+    frame(&mut app, window);
+}
+
+#[test]
+fn blurred_masked_and_multiline_fields_start_a_new_undo_group() {
+    let (_rt, mut app, window) = new_app();
+    let masked = mount_editable(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+        "",
+    );
+    let multiline = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), true),
+        None,
+        "",
+    );
+    for node in [masked, multiline] {
+        assert!(app.set_focus(window, Some(node)));
+        assert!(type_text(&mut app, window, "ab"));
+        assert!(app.set_focus(window, None));
+        assert!(app.set_focus(window, Some(node)));
+        assert!(type_text(&mut app, window, "c"));
+        assert_eq!(text_of(&app, window, node), "abc");
+        assert_eq!(
+            undo_stats_of(&app, window, node),
+            (2, 0, 3),
+            "失焦打断对掩码与多行同样生效"
+        );
+        assert!(app.text_edit_undo(window, node).expect("undo"));
+        assert_eq!(text_of(&app, window, node), "ab");
+    }
+    frame(&mut app, window);
+}
+
 #[test]
 fn new_edits_clear_the_redo_stack() {
     let (_rt, mut app, window) = new_app();

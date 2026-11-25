@@ -74,6 +74,10 @@ pub(crate) fn write<T: Clone + PartialEq + 'static>(
     signal: &Signal<T>,
     value: T,
 ) -> bool {
+    #[cfg(feature = "test-support")]
+    {
+        app.signal_write_calls += 1;
+    }
     let id = signal.id();
     match app.store.write_owned(id, value) {
         None => false,

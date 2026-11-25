@@ -35,6 +35,7 @@ pub(crate) fn new() -> NodeTree {
         hit_shape: None,
         layout_override: None,
         tab_stop: true,
+        press_focuses_editable: false,
         paint: None,
         content_offset: LogicalPoint::ZERO,
         text_bind: None,
@@ -181,6 +182,7 @@ pub(crate) fn insert_child(
         a11y,
         bind_a11y,
         tab_stop,
+        press_focuses_editable,
     } = spec;
     let bound = bind_style.is_some() || bind_text.is_some() || bind_a11y.is_some();
     let interaction = (action.is_some() || drag.is_some() || focus_ring.is_some()).then(|| {
@@ -203,6 +205,7 @@ pub(crate) fn insert_child(
         hit_shape: hit_shape.map(Box::new),
         layout_override,
         tab_stop,
+        press_focuses_editable,
         paint,
         content_offset: LogicalPoint::ZERO,
         text_bind: bind_text,
@@ -510,6 +513,7 @@ impl NodeSpec {
             a11y: None,
             bind_a11y: None,
             tab_stop: true,
+            press_focuses_editable: false,
         }
     }
 
@@ -528,6 +532,11 @@ impl NodeSpec {
 
     pub(crate) fn with_tab_stop(mut self, tab_stop: bool) -> Self {
         self.tab_stop = tab_stop;
+        self
+    }
+
+    pub(crate) fn with_press_focuses_editable(mut self) -> Self {
+        self.press_focuses_editable = true;
         self
     }
 

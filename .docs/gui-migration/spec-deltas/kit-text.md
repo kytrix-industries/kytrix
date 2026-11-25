@@ -515,7 +515,7 @@ impl InputNode { install / release / sync / value / update_value / update_label 
 
 | 门禁 | 结果 |
 |---|---|
-| `cargo test --workspace` | **8866 passed / 0 failed / 30 ignored**（60 测试二进制 + 41 doc-test 二进制 = 101） |
+| `cargo test --workspace` | **8876 passed / 0 failed / 30 ignored**（60 测试二进制 + 41 doc-test 二进制 = 101） |
 | `cargo test -p ui_core --lib` | 2280（2279 passed + 1 ignored） |
 | `cargo test -p ui_core --lib --features test-support` | 2610（2609 passed + 1 ignored） |
 | `cargo test -p ui_core --features test-support`（lib + integration） | frame_record 8 / layout 4 / snapshot 13 / gui_smoke 1 ignored / demo example 39 |

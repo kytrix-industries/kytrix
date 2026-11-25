@@ -551,3 +551,115 @@ fn text_run_identity_and_selection_survive_many_full_deliveries() {
     let selection = input_node.text_selection().expect("200 笔后选区仍可解析");
     assert_eq!(selection.text(), "🌍a");
 }
+
+fn unlabelled_editable_spec(role: A11yRole, multiline: bool, masked: bool) -> EditableSpec {
+    EditableSpec {
+        label: SmolStr::default(),
+        ..editable_spec(role, multiline, masked)
+    }
+}
+
+#[test]
+fn an_unlabelled_editable_input_exposes_no_accessible_name() {
+    let (_runtime, mut app, window) = new_app();
+    let input = mount(
+        &mut app,
+        window,
+        unlabelled_editable_spec(A11yRole::TextInput, false, false),
+        "secret-value",
+    );
+    let (snapshot, tree) = full_tree(&mut app, window);
+    let (input_id, _run_id) = text_runs(&snapshot, input);
+    let input_node = node_ref(tree.state(), input_id);
+
+    assert_eq!(
+        input_node.label(),
+        None,
+        "空 label 的可编辑节点不得把内容文本当 Name"
+    );
+    assert_eq!(
+        input_node.value().as_deref(),
+        Some("secret-value"),
+        "内容仍必须通过 value 暴露"
+    );
+    assert_eq!(
+        snapshot.node_for(input).expect("input record").label_text(),
+        None,
+        "A11yNode 读面同样不得回退到内容文本"
+    );
+}
+
+fn accessible_names(
+    snapshot: &A11yTreeSnapshot,
+    tree: &Tree,
+    input: NodeId,
+) -> (Option<String>, Option<String>) {
+    let record = snapshot.node_for(input).expect("input record");
+    (
+        record.label_text().map(str::to_owned),
+        node_ref(tree.state(), record.id).label(),
+    )
+}
+
+#[test]
+fn composition_never_changes_the_accessible_name() {
+    let (_runtime, mut app, window) = new_app();
+    let unlabelled = mount(
+        &mut app,
+        window,
+        unlabelled_editable_spec(A11yRole::TextInput, false, false),
+        "ab",
+    );
+    let labelled = mount(
+        &mut app,
+        window,
+        editable_spec(A11yRole::TextInput, false, false),
+        "ab",
+    );
+    let (snapshot, mut tree) = full_tree(&mut app, window);
+    let (unlabelled_record_name, unlabelled_consumer_name) =
+        accessible_names(&snapshot, &tree, unlabelled);
+    let (labelled_record_name, labelled_consumer_name) =
+        accessible_names(&snapshot, &tree, labelled);
+    assert_eq!(unlabelled_record_name, None);
+    assert_eq!(
+        unlabelled_consumer_name, None,
+        "组合前：无 label 的输入没有 Name"
+    );
+    assert_eq!(labelled_record_name.as_deref(), Some("输入"));
+    assert_eq!(labelled_consumer_name.as_deref(), Some("输入"));
+
+    assert!(app.set_focus(window, Some(unlabelled)));
+    app.dispatch(
+        window,
+        Event::Ime(ImeEvent::Preedit {
+            text: SmolStr::new_static("ni"),
+            caret: Some(2),
+            clauses: smallvec::SmallVec::new(),
+            replace: None,
+        }),
+    );
+    assert!(
+        app.text_edit_composition(window, unlabelled)
+            .expect("composition")
+            .is_some(),
+        "前置：组合已开始"
+    );
+    let snapshot = incremental(&mut app, window, &mut tree);
+    let record = snapshot.node_for(unlabelled).expect("input record");
+    assert_eq!(record.label_text(), None, "组合期 name 不得随 preedit 变化");
+    assert_eq!(
+        node_ref(tree.state(), record.id).label(),
+        None,
+        "consumer 读面同样保持无 Name"
+    );
+    let labelled_record = snapshot.node_for(labelled).expect("labelled record");
+    assert_eq!(labelled_record.label_text(), Some("输入"));
+    assert_eq!(
+        node_ref(tree.state(), labelled_record.id)
+            .label()
+            .as_deref(),
+        Some("输入"),
+        "有 label 时 name 在组合期保持恒定"
+    );
+}

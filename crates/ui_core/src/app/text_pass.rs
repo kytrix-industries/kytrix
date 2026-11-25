@@ -1108,6 +1108,44 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn the_color_glyph_page_uploads_to_every_window_with_a_renderer() {
+        use crate::render::AtlasArraySpec;
+
+        let _guard = crate::render::windows::device::gpu_test_lock();
+        if crate::text::raster::probe_emoji_font().is_none() {
+            eprintln!("skip: no color emoji font available on this device");
+            return;
+        }
+        let (_rt, mut app, first, _node) = text_app("\u{1F30D}", Some(200.0));
+        let second = app.create_window(WindowOptions::default());
+        for target in [first, second] {
+            app.window_mut(target)
+                .expect("窗口存在")
+                .enable_offscreen_renderer()
+                .expect("offscreen renderer");
+        }
+        frame_text(&mut app, first);
+        app.upload_atlas_pages();
+        let spec = AtlasArraySpec {
+            page: app.glyph_atlas.color_page().0,
+            layers: 1,
+        };
+        assert!(
+            app.color_glyph_page_extent.is_some(),
+            "前置：彩色字形页已建立"
+        );
+        for target in [first, second] {
+            assert!(
+                app.window(target)
+                    .expect("窗口存在")
+                    .atlas_page_matches(AtlasKind::ColorGlyph, spec),
+                "彩色字形页必须逐窗口入队（不能只记第一个窗口）"
+            );
+        }
+    }
+
     #[test]
     fn mono_only_text_never_establishes_the_color_glyph_page() {
         let (_rt, mut app, window, _node) = text_app("hello", Some(200.0));

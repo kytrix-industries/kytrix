@@ -69,6 +69,7 @@ pub struct ScrollbarOptions {
     pub mode: ScrollbarMode,
     pub inset: LogicalPx,
     pub focus_opacity: f32,
+    pub tab_stop: bool,
 }
 
 impl Default for ScrollbarOptions {
@@ -80,6 +81,7 @@ impl Default for ScrollbarOptions {
             mode: ScrollbarMode::Always,
             inset: LogicalPx::ZERO,
             focus_opacity: 0.0,
+            tab_stop: true,
         }
     }
 }
@@ -106,6 +108,12 @@ impl ScrollbarOptions {
     #[must_use]
     pub fn focus_opacity(mut self, opacity: f32) -> Self {
         self.focus_opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    #[must_use]
+    pub fn tab_stop(mut self, tab_stop: bool) -> Self {
+        self.tab_stop = tab_stop;
         self
     }
 }
@@ -204,6 +212,7 @@ impl ScrollBar {
         let track = NodeBuilder::boxed()
             .id(format_smolstr!("{}:track", inner.key))
             .style(track_style.build())
+            .tab_stop(inner.options.tab_stop)
             .on_click(inner.track_action.clone())
             .build(tree, parent)?;
         let initial = match inner.axis {
@@ -227,6 +236,7 @@ impl ScrollBar {
         let thumb = NodeBuilder::boxed()
             .id(format_smolstr!("{}:thumb", inner.key))
             .layout_override(initial)
+            .tab_stop(inner.options.tab_stop)
             .paint(
                 PaintBuilder::new()
                     .rounded(inner.options.corner_radius)

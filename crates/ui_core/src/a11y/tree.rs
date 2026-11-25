@@ -106,7 +106,7 @@ pub(crate) fn node_a11y_records_with_cache(
         None
     };
     let parent = logical_a11y_parent(tree, node);
-    let mut label = effective_label(target, role, over, patch);
+    let mut label = effective_label(tree, node, target, role, over, patch);
     if node == tree.root() && label.is_none() && !title.is_empty() {
         label = Some(A11yLabel::new(
             smol_str::SmolStr::new(title),

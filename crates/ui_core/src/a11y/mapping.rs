@@ -481,6 +481,8 @@ pub(crate) fn a11y_disabled(tree: &NodeTree, node: NodeId) -> bool {
 }
 
 pub(crate) fn effective_label(
+    tree: &NodeTree,
+    node: NodeId,
     target: &Node,
     role: A11yRole,
     over: Option<&A11yOverride>,
@@ -491,6 +493,9 @@ pub(crate) fn effective_label(
         .or_else(|| over.and_then(|over| over.label.clone()));
     if let Some(text) = explicit {
         return Some(crate::a11y::A11yLabel::new(text, A11yLabelSource::Override));
+    }
+    if tree.editable(node).is_some() || is_text_input_role(role) {
+        return None;
     }
     match target.kind() {
         NodeKind::Text(content) if role == A11yRole::Label && !content.text.is_empty() => Some(

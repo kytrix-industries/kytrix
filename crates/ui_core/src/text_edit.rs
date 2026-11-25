@@ -1399,6 +1399,7 @@ impl EditableText {
         } else {
             false
         };
+        self.break_undo_group();
         self.focused = focused;
         self.caret_visible = true;
         self.reveal = None;

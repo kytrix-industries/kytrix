@@ -106,6 +106,7 @@ pub(crate) struct NodeSpec {
     a11y: Option<crate::a11y::A11yOverride>,
     bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
     tab_stop: bool,
+    press_focuses_editable: bool,
 }
 
 static EMPTY_STYLE_PATCH: StylePatch = StylePatch {
@@ -132,6 +133,7 @@ pub struct Node {
     hit_shape: Option<Box<HitShape>>,
     layout_override: Option<LayoutOverride>,
     tab_stop: bool,
+    press_focuses_editable: bool,
     paint: Option<Box<PaintSpec>>,
     content_offset: LogicalPoint,
     text_bind: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
@@ -210,6 +212,11 @@ impl Node {
     #[must_use]
     pub(crate) fn tab_stop(&self) -> bool {
         self.tab_stop
+    }
+
+    #[must_use]
+    pub(crate) fn press_focuses_editable(&self) -> bool {
+        self.press_focuses_editable
     }
 
     #[must_use]

@@ -3,7 +3,7 @@ use crate::{
     error::EngineError,
     interaction::{focus, overlay as overlay_util, scroll},
     math::LogicalRect,
-    node::{id::NodeId, tree::NodeTree},
+    node::id::NodeId,
     window::{Window, WindowId},
 };
 
@@ -77,7 +77,7 @@ pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -
         };
         if let Some(node) = node
             && !focus::focusable_in_scope(target.tree(), node, scope)
-            && !(editable_focusable(target.tree(), node)
+            && !(focus::editable_focusable(target.tree(), node)
                 && focus::in_scope(target.tree(), node, scope))
         {
             return false;
@@ -111,14 +111,6 @@ pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -
     crate::text_edit::note_focus_change(app, window);
     app.request_frame();
     true
-}
-
-fn editable_focusable(tree: &NodeTree, node: NodeId) -> bool {
-    tree.editable(node).is_some_and(|editable| {
-        !editable.spec().disabled
-            && tree.is_effectively_visible(node)
-            && tree.is_effectively_interactive(node)
-    })
 }
 
 pub(crate) fn restore_focus(app: &mut App, window: WindowId, opener: Option<NodeId>) -> bool {

@@ -496,7 +496,7 @@ impl GalleryCore {
         });
         let state = self.input_state;
         let placeholder = self.placeholder;
-        let mut input = input::build(
+        let input = input::build(
             tree(app, window),
             search_box,
             spec,

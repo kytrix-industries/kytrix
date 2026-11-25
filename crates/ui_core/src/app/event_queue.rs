@@ -30,22 +30,6 @@ impl EventQueue {
         self.items.drain(..).collect()
     }
 
-    pub(crate) fn drain_where(
-        &mut self,
-        mut keep: impl FnMut(WindowId, &Event) -> bool,
-    ) -> Vec<(WindowId, Event)> {
-        let mut taken = Vec::new();
-        self.items.retain(|(window, event)| {
-            if keep(*window, event) {
-                taken.push((*window, event.clone()));
-                false
-            } else {
-                true
-            }
-        });
-        taken
-    }
-
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.items.len()
@@ -121,33 +105,5 @@ mod tests {
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.dropped(), 0);
-    }
-
-    #[test]
-    fn a_filtered_drain_leaves_the_rest_queued_in_order() {
-        let mut queue = EventQueue::new();
-        let other = WindowId::for_test(2);
-        queue.push(window(), Event::FocusChanged { focused: true });
-        queue.push(other, Event::CloseRequested);
-        queue.push(
-            window(),
-            Event::Resized {
-                size: crate::math::LogicalSize::new(px(8.0), px(8.0)),
-            },
-        );
-
-        let taken = queue.drain_where(|target, _| target == window());
-
-        assert_eq!(
-            taken.len(),
-            2,
-            "only the events addressed to the asked-for window are taken"
-        );
-        assert_eq!(
-            queue.drain(),
-            vec![(other, Event::CloseRequested)],
-            "the rest stays queued, so the application still observes it"
-        );
-        assert_eq!(queue.dropped(), 0, "filtering is not dropping");
     }
 }

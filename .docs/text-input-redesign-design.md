@@ -464,7 +464,7 @@ pub struct InputSpec {
 
 - 引擎新增 `EngineError` 变体：`TextEditNotAvailable { node }`、`TextEditSpecInvalid { node, detail }`（掩码多行、行高非正等）、`TextEditLayout { node, detail }`（shape/break 失败）、`ColorGlyphAtlasExhausted`（复用 `AtlasExhausted { kind }`）。
 - 编辑命令在节点不可用/规格非法时返回 `Result`/`false`，不 panic；平台事件过滤失败只产生诊断，不阻断帧。
-- 组件层业务错误仍是 `InputError::{Empty,TooLong,Invalid}`，i18n key 保持稳定；校验由应用层调用 `InputState::validate`。
+- 组件层业务错误仍是 `InputError::{Empty,TooLong,Invalid}`，i18n key 保持稳定；`TooLong` 由 `InputNode` 按引擎文本（清洗后字素簇）与 `InputSpec.max_length` 派生，业务校验（必填/格式/重复）由应用层读镜像自行判定。
 
 ---
 
@@ -508,7 +508,7 @@ pub struct InputSpec {
 | `InputState.error`、submit-on-blur 开关、clearable 按钮 | `ui_kit::input` | 应用层 `read(&state)` |
 | border/背景/focus/error 边框、placeholder 文本/颜色、caret/selection 颜色、`visible_lines` 高度、ScrollBar | `ui_kit::input`（通过引擎 setter） | 组件 `sync` |
 | a11y value/selection/placeholder/readonly/disabled | 引擎自动；kit 只写业务字段 | AccessKit 快照 |
-| 业务校验（必填/格式/重复） | 应用层（读镜像） | `InputState::validate` |
+| 业务校验（必填/格式/重复） | 应用层（读镜像） | 应用层自判 + `App::set_a11y_invalid` 回写 |
 
 ---
 
@@ -690,7 +690,7 @@ pub struct InputSpec {
 | P3 | `589a462a` | caret 闪烁时钟/唤醒、ensure-visible、多行 viewport + overlay ScrollBar |
 | P4 | `eee0f04e` + merge `cb965b56` | 彩色字形 RGBA 图集、`KIND_COLOR_GLYPH`、三端 pipeline/shader/contract、彩色 emoji golden |
 
-### 11.2 已登记的设计偏差（①–㉖）
+### 11.2 已登记的设计偏差（①–㉘）
 
 | # | 偏差（相对本文 §3–§5） | 落地 |
 |---|---|---|
@@ -702,7 +702,7 @@ pub struct InputSpec {
 | ⑥ | 组合下划线**粗细按 clause 索引奇偶**交替（`ImeEvent` 只给 UTF-16 区间，没有 clause 类型，无法按主/子句区分） | `bb732834` |
 | ⑦ | `auto` 宽度节点的 placeholder 宽度回退到**空文本的 max-content**（`TextStyle` 无可用宽度时无第二布局源） | `bb732834` |
 | ⑧ | 窗口失焦后若仍出帧，可能重写一次 IME cursor area（没有 window-focus 门控；桌面 IME 不消费该矩形，无可观测影响） | `bb732834` |
-| ⑨ | a11y 的**选区与文本动作**由 P1b-3 的虚拟 `TextRun` 子节点承担（AccessKit 的 `TextSelection` 与 `SetTextSelection`/`ReplaceSelectedText` 落在 TextRun 上，输入节点本身只带 role/value/flags） | `2b70fef2` |
+| ⑨ | a11y 的**选区与文本动作**分工：`TextSelection` 属性挂在**输入节点**上，其 `TextPosition.node` 指向虚拟 `TextRun` 子节点（不是输入节点自引用）；`TextRun` 子节点承担文本内容/字符度量并宣告自己的 `SetTextSelection`；输入节点另外宣告 `SetTextSelection`（有 TextRun 子树时）与 `ReplaceSelectedText`（可编辑、非只读/非禁用），且可编辑节点**不**宣告 `SetValue` | `2b70fef2` |
 | ⑩ | `readonly` 输入框**消费** IME 事件但不显示 preedit（不进入组合，避免出现可编辑假象） | `8df38db9` |
 | ⑪ | `masked ⇔ A11yRole::PasswordInput` 是**单源硬约束**：`EditableSpec::validate` 拒绝 masked 非密码角色、密码角色非 masked、masked+multiline；不提供运行期切换 | `8df38db9` |
 | ⑫ | preedit 更新的复杂度是 **O(committed + preedit)**（重建 display 串与映射表），但**不随帧重建**：只在 text/selection/composition/样式变化时重建 | `8df38db9` |
@@ -720,6 +720,8 @@ pub struct InputSpec {
 | ㉔ | 像素 golden 依赖**宿主 emoji 字体版本**：Windows 基线来自 Segoe UI Emoji（`crates/ui_core/tests/golden/warp/color_emoji_1_light.png`）。Segoe UI Emoji 无国旗字形（`🇨🇳` 渲染成两个字母/单色），Linux 全局字体栈不含 emoji 家族时部分 emoji 走单色轮廓（实测见 §11.7） | `eee0f04e` |
 | ㉕ | COLRv1 只有**单色回退**（swash 0.2.10 只读 COLR v0 记录）：Segoe UI Emoji 幸运地保留 3487 条 v0 base glyph，故 Windows 彩色可用；仅 v1 的字体退回单色并记 `ColorGlyphMonochrome` 诊断 | `eee0f04e` |
 | ㉖ | **caret 矩形按行盒归一**：parley 的 `Cursor::geometry` 返回 `min/max(block, content)` 的并集（Linux 字体下可高于行盒：20 行盒 vs 22 caret），引擎在 `inline_flow::caret_rect` 里把 caret 吸附到**所在行盒**（top = 行顶、height = `LineMetrics.line_height`），保证「行盒 / caret / 占位符 / 滚动步长 / IME 候选框」同一口径（§3.1 约束），并让 ensure-visible 的「留 1 行」在任意字体度量下可达 | P5 收尾（本篇 §11.9） |
+| ㉗ | 输入控件**整盒可点**：引擎新增 `NodeBuilder::press_focuses_editable()`（press 落在该节点或其后代上时，若没有更近的焦点目标，则聚焦它承载的 editable；该节点不进入 Tab 序、不改变「点控件外失焦」语义）；`input.rs` 的 root 用它代理 padding/border，`kit::ScrollBar` 新增 `ScrollbarOptions::tab_stop(bool)`（输入框的 track/thumb 置 false，动作与拖拽不变）。恢复旧组件「整盒可点」行为，同时每个输入仍只有 editable 一个 Tab 停靠点 | 终审 round 1 修复（P3-1） |
+| ㉘ | `InputState::validate` **删除**：字段错误只有单一来源——`InputNode` 镜像按引擎文本（清洗后字素簇）+ `InputSpec.max_length` 派生 `TooLong`，业务错误仍由应用层 `InputState::set_error` 注入；`validate` 在生产代码 0 消费者（§5.3 应用层校验未落地），删除避免「按镜像文本 / 按请求文本」双源语义 | 终审 round 1 修复（P4-16） |
 
 ### 11.3 最终公开 API 清单
 
@@ -728,6 +730,7 @@ pub struct InputSpec {
 ```rust
 // 构建
 NodeBuilder::editable_text(spec: EditableSpec) -> Self
+NodeBuilder::press_focuses_editable() -> Self  // 输入控件整盒可点（§11.2 ㉗）
 // 类型（不暴露 parley）
 text_edit::{TextAffinity, TextCursor, TextSelection, TextEditSnapshot, TextEditMetrics,
             TextEditComposition, EditableSpec, sanitize_text}
@@ -757,16 +760,17 @@ paint::atlas::AtlasKind::{Glyph=0, Image=1, ColorGlyph=2}、KIND_COLOR_GLYPH = 8
 ```
 
 **`ui_kit`（薄壳）**：`InputSpec{name,label,placeholder,masked,multiline,readonly,disabled,max_length,
-visible_lines,size,submit}`、`InputState`（镜像 + `error`，只读面 + `validate`/`set_error`，无编辑方法）、
+visible_lines,size,submit}`、`InputState`（镜像 + `error`，只读面 + `set_error`，无 `validate`、无编辑方法）、
 `InputError{Empty,TooLong,Invalid}`、`InputNode{root,viewport,editable,scrollbar,placeholder_state,
 state,spec}`、`input::build`、`InputNode::{install,release,sync,value,update_value,update_label,
-update_placeholder,clear,set_clearable,set_submit_on_blur}`。
+update_placeholder,clear,set_clearable,set_submit_on_blur}`（`set_clearable(&self, …)`，与其它运行期
+setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`。
 
 ### 11.4 测试与门禁基线（Windows，HEAD `cb965b56` + P5 工作区改动）
 
 | 门禁 | 结果 |
 |---|---|
-| `cargo test --workspace` | **8866 passed / 0 failed / 30 ignored**（60 测试二进制 + 41 doc-test = 101 个二进制） |
+| `cargo test --workspace` | **8876 passed / 0 failed / 30 ignored**（60 测试二进制 + 41 doc-test = 101 个二进制） |
 | `cargo test -p ui_core --lib` | 2280（2279 passed + 1 ignored） |
 | `cargo test -p ui_core --lib --features test-support` | 2610（2609 passed + 1 ignored） |
 | `cargo test -p ui_core --features test-support --tests` | frame_record **8** / layout **4** / snapshot **13** / gui_smoke 1 ignored / `demo` example 39 |
@@ -856,7 +860,7 @@ head `cb965b56` + P5 工作区改动（含 §11.9 的四类修复）。日志：
 
 | 门禁 | 结果 |
 |---|---|
-| `cargo test --workspace` | **8866 passed / 0 failed / 30 ignored**（101 个二进制） |
+| `cargo test --workspace` | **8876 passed / 0 failed / 30 ignored**（101 个二进制） |
 | `cargo +nightly clippy --workspace --all-targets -- -D warnings` | **exit 0** |
 | `cargo +nightly fmt --check` | **exit 0** |
 | gallery `--idle-check` / `--theme-check` | PASS（**0 帧/3 s**；Dark→Light→Dark 0 failure） |
@@ -871,7 +875,7 @@ head `cb965b56` + P5 工作区改动（含 §11.9 的四类修复）。日志：
 | `cargo test -p ui_core --features test-support --tests` | lib 2386 / frame_record **8** / gui_smoke 1 ignored / layout **4** / snapshot **13** / demo example **39**，全 0 failed |
 | `cargo test -p ui_kit --lib` / `cargo test -p ui_kit` | **748 passed / 0 failed**（两者一致） |
 | `cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings`（默认 + `--features test-support`） | **exit 0 / exit 0** |
-| gallery 构建 + `--idle-check` / `--theme-check` | 构建 PASS；idle **PASS（1 帧/3 s，门槛 ≤2）**；theme **PASS（0 failure）** |
+| gallery 构建 + `--idle-check` / `--theme-check` | 构建 PASS；idle **PASS（2 帧/3 s，门槛 ≤2）**；theme **PASS（0 failure）** |
 | 测后 `git checkout -- .` | 干净（`STATUS_AFTER=0`） |
 
 **macOS（`my_macos`，ssh 无 GUI 会话 / 无 Metal 呈现）**
@@ -884,12 +888,17 @@ head `cb965b56` + P5 工作区改动（含 §11.9 的四类修复）。日志：
 | `cargo test -p ui_core --features test-support --tests` | lib 2351 / frame_record **8** / gui_smoke 1 ignored / layout **4** / snapshot **13** / demo **39**，全 0 failed |
 | `cargo test -p ui_kit --lib` / `cargo test -p ui_kit` | **748 passed / 0 failed** |
 | `cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings`（默认 + `--features test-support`） | **exit 0 / exit 0** |
-| gallery 构建 + `--idle-check` / `--theme-check` | 构建 PASS；idle **PASS（0 帧/3 s）**；theme **PASS（0 failure）** |
+| gallery 构建 + `--idle-check` / `--theme-check` | 构建 PASS；idle **PASS（1 帧/3 s，门槛 ≤2）**；theme **PASS（0 failure）** |
 
 > 环境差异（已登记，不影响结论）：三台的 nightly 版本不同（Windows `1.99.0-nightly`、Ubuntu
 > `1.102.0-nightly`、macOS `1.101.0-nightly`），P5 收尾已把两台远端新 nightly 报出的 2 条 clippy
 > 修掉；Ubuntu 的 gallery 需要显式 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`；macOS 无 `timeout(1)`，
 > 但 gallery 的 `--idle-check`/`--theme-check` 自带定时退出，可直接跑（实测均 PASS）。
+>
+> **idle 帧数口径**：`--idle-check` 先跑到稳定 baseline，再统计随后 3 s 内提交的帧数（门槛 ≤2）。
+> 该数值包含 baseline 之后仍可能有的一次残留唤醒，run-to-run 在 **0–2 帧**之间波动，不是硬基线；
+> 可复现的判据是「≤2 帧」。round 1 实测：Windows **0 帧/3 s**、Ubuntu **2 帧/3 s**、macOS **1 帧/3 s**
+> （日志 `.review/text-input/final-gallery-idle.log` 与两台远端 `/tmp/fg-*.log`）。
 
 ### 11.8 P5 收尾发现与处置
 
@@ -931,9 +940,47 @@ ensure-visible 的「已达」判定改为「clamp 后目标」。二者都不�
 | 项 | 结果 |
 |---|---|
 | 变异 11 项重跑（`.review/text-input/p5-mutations-r3.log`） | M1/M2/M1b/M3/M4/M5/M6/M7/M8/**M9**/M10 全部 **RED**（M9 = 新用例变红），每项 `restore identical=True`；M3 在新几何下仍 2/2 红 |
-| Windows | 见 §11.7（8866 passed / clippy 0 / fmt 0 / gallery 0 帧 + 0 failure） |
+| Windows | 见 §11.7（8876 passed / clippy 0 / fmt 0 / gallery 0 帧 + 0 failure） |
 | Ubuntu | 见 §11.7（ui_core 2062 & 2386 全绿、ui_kit 748、clippy 0、gallery idle 1 帧 + theme 0 failure） |
 | macOS | 见 §11.7（ui_core 2027 & 2351 全绿、ui_kit 748、clippy 0、gallery idle 0 帧 + theme 0 failure） |
+
+### 11.10 终审 round 1 修复记录（P3×3 + 廉价 P4）
+
+- 基线：`b1e01c79`（P5）+ 本工作区改动；门禁在 Windows 实跑（stable `rustc 1.97.1` / nightly
+  `1.99.0-nightly`），日志 `.review/text-input/fix-*.log`。
+
+| # | 问题 | 修复 | 证据（测试） |
+|---|---|---|---|
+| P3-1 | 点击输入框 padding/border/滚动条 gutter 会清焦点（旧组件整盒可点；对 `submit_on_blur` 字段等同误触提交） | 引擎新增 `NodeBuilder::press_focuses_editable()`（press 落在该节点或其非焦点后代上时，解析它承载的 editable；该节点不进入 Tab 序，点控件外仍失焦）→ kit root 声明代理；`kit::ScrollBar` 新增 `ScrollbarOptions::tab_stop(bool)`，输入框 track/thumb 置 `false`（动作/拖拽保留）→ 每个输入仍只有 editable 一个 Tab 停靠点 | `ui_kit::clicking_the_control_chrome_focuses_the_editable_without_blurring_it`（焦点/`submit_on_blur` 不触发/IME 不关不重开/无额外帧）、`clicking_the_multiline_padding_and_gutter_focuses_the_editable`、`the_input_contributes_exactly_one_tab_stop`（单行+多行 4 步 Tab 环）、`ui_core::interaction::focus::tests::a_press_host_*`（2 条）；变异 P3-1a/P3-1b 均 RED |
+| P3-2 | 失焦不打断 undo 合并组（D7 明文要求） | `EditableText::set_focused` 在焦点变化时 `break_undo_group()` | `ui_core::blurring_breaks_the_undo_group_between_typing_sessions`、`blurred_masked_and_multiline_fields_start_a_new_undo_group`；既有 Enter/导航/粘贴打断与同聚焦会话合并用例不变；变异 RED |
+| P3-3 | 空 label 的可编辑节点把内容文本当 a11y Name（组合期 Name 随 preedit 变化，违反 §4.12） | `effective_label` 只信显式 label：可编辑节点/文本输入角色不再回退到内容文本 | `ui_core::a11y::contract_tests::{an_unlabelled_editable_input_exposes_no_accessible_name, composition_never_changes_the_accessible_name}`（consumer `label()==None`、组合前后 name 恒定）；既有 TextRun/密码掩码/组合期不暴露 preedit 契约全绿；变异 RED |
+| P4-1 | 本表 ⑨ 与实现相反 | 重写 ⑨（见上） | — |
+| P4-2 | canvas 彩色图集耗尽时 `AtlasExhausted.kind` 恒为 `Glyph` | 按一次 pass 的 `skipped`/`skipped_color` 选择 kind | `ui_core::canvas_text_reports_color_atlas_exhaustion_with_the_real_kind`；变异 RED |
+| P4-3 | `upload_color_glyph_page` 的 per-window 路径零覆盖 | 双窗口 + offscreen renderer（无需可见窗口）断言彩色页逐窗口入队 | `ui_core::the_color_glyph_page_uploads_to_every_window_with_a_renderer`（`cfg(windows)`） |
+| P4-4 | ui_kit 死 API / 双源 / 签名不一致 | 删除 `App::drain_events_where`（含 `EventQueue::drain_where`，生产 0 消费者）；删除 `update_value` 里的 `last_placeholder` 潜伏写（宿主同帧直写 placeholder 信号不再被吞）；删除 `InputState::validate`（单一错误源，见 ㉘）；`InputNode::set_clearable(&self, …)` | `the_mirror_short_circuits_when_the_generation_does_not_change`（写计数探针）、`an_external_placeholder_write_survives_an_update_value_in_the_same_frame`、`error_states_expose_stable_i18n_keys`、`max_length_counts_grapheme_clusters_for_typed_and_programmatic_text` |
+| P4-5 | §11.7 的 idle 帧数不可复现 | 改为「实测 0–2 帧/3 s（门槛 ≤2）」并注明测量口径（见 §11.7 注） | — |
+| P4-6 | 镜像短路测试无判别力（审查变异 M09 存活） | `App::signal_write_calls()`（test-support 计数探针）+ 测试断言稳态 `sync` 不调用 `App::write` | `ui_kit::the_mirror_short_circuits_when_the_generation_does_not_change`；变异「恒 `mirror_dirty=true`」RED |
+
+**复位验门禁（Windows，修复后）**
+
+| 门禁 | 结果 |
+|---|---|
+| `cargo test --workspace` | **8876 passed / 0 failed / 30 ignored**（101 个二进制） |
+| `cargo test -p ui_core --lib` | **2285 passed / 1 ignored** |
+| `cargo test -p ui_core --lib --features test-support` | **2616 passed / 1 ignored** |
+| `cargo test -p ui_kit --lib` | **752 passed** |
+| `cargo +nightly clippy --workspace --all-targets -- -D warnings` | **exit 0** |
+| `cargo +nightly fmt --check` | **exit 0** |
+| `cargo build -p ui_kit --example gallery` | **exit 0** |
+| gallery `--idle-check` | **PASS：baseline frame_index=2 → 2，0 帧/3 s（门槛 ≤2）** |
+| gallery `--theme-check` | **PASS：Dark/Light/Dark 0 failure** |
+| gallery `--probe --auto-close=18` | **exit 0**（输入几何与 P5 一致：input0 root 300×30 / editable 286×28；input3 滚动条 track 4 px） |
+
+**变异自检（8/8 RED，先改后还原并 SHA256 逐字节校验）**：P3-1a（去 root press 代理）、P3-1b（滚动条
+`tab_stop` 恢复）、P3-2（去 `break_undo_group`）、P3-3（恢复内容文本回退）、P4-2（kind 恒 Glyph）、
+P4-3（彩色页逐窗口入队改成跳过有渲染器的窗口）、P4-4a（恢复 `last_placeholder` 潜伏写）、
+P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored_identical=True`。脚本/日志
+`.review/text-input/fix-mutate.ps1`、`fix-mutations.log`。
 
 ## 附录 A：关键证据索引
 

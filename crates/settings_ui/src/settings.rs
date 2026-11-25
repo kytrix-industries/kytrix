@@ -169,7 +169,7 @@ impl SettingsPage {
             size: ControlSize::Medium,
             submit: None,
         });
-        let mut search_input = {
+        let search_input = {
             let tree = app
                 .window_mut(window)
                 .ok_or(EngineError::UnknownWindow { window })?

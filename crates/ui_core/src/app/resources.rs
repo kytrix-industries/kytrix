@@ -243,14 +243,6 @@ pub(crate) fn drain_events(app: &mut App) -> Vec<(WindowId, Event)> {
     app.events.drain()
 }
 
-#[must_use]
-pub(crate) fn drain_events_where(
-    app: &mut App,
-    keep: impl FnMut(WindowId, &Event) -> bool,
-) -> Vec<(WindowId, Event)> {
-    app.events.drain_where(keep)
-}
-
 pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
     if matches!(event, Event::Input(_) | Event::Ime(_))
         && super::window_set::is_input_blocked_by_modal(app, window)

@@ -45,6 +45,8 @@ pub(crate) fn resolve_canvas_text(
 
     let mut report = CanvasTextReport::default();
     let mut rounds = 0usize;
+    let mut pass_skipped = 0usize;
+    let mut pass_skipped_color = 0usize;
     loop {
         let generation = atlas.generation();
         let color_generation = glyph_atlas.color_generation();
@@ -75,6 +77,7 @@ pub(crate) fn resolve_canvas_text(
             collect_recipes(&canvas, &mut recipes);
             let mut lines: Vec<Rc<crate::text::ShapedLine>> = Vec::with_capacity(recipes.len());
             let mut skipped = 0usize;
+            let mut skipped_color = 0usize;
             for recipe in recipes {
                 let (shaped, _hit) = text.shape_cached(&recipe);
                 let width = shaped.max_content_size().width;
@@ -97,12 +100,16 @@ pub(crate) fn resolve_canvas_text(
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
-                skipped += stats.skipped + stats.skipped_color;
+                skipped += stats.skipped;
+                skipped_color += stats.skipped_color;
                 text.push_diagnostics(diagnostics);
                 pending_dirty.merge(&mut atlas.take_dirty_rects());
                 pending_color_dirty.merge(&mut glyph_atlas.color_take_dirty_rects());
                 lines.push(Rc::new(line));
             }
+            pass_skipped += skipped;
+            pass_skipped_color += skipped_color;
+            let skipped = skipped + skipped_color;
             if skipped > 0 {
                 text.push_diagnostics(vec![TextDiagnostic::AtlasFull { skipped }]);
             }
@@ -177,9 +184,12 @@ pub(crate) fn resolve_canvas_text(
         }
     }
     if escalated {
-        return Some(Err(EngineError::AtlasExhausted {
-            kind: AtlasKind::Glyph,
-        }));
+        let kind = if pass_skipped_color > pass_skipped {
+            AtlasKind::ColorGlyph
+        } else {
+            AtlasKind::Glyph
+        };
+        return Some(Err(EngineError::AtlasExhausted { kind }));
     }
     Some(Ok(report))
 }
@@ -370,6 +380,16 @@ mod tests {
         app_mut.atlas = crate::render::AtlasAllocator::with_page(AtlasKind::Glyph, (512, 512));
         app_mut.glyph_atlas.clear();
         app_mut.request_frame();
+    }
+
+    fn constrain_color_atlas(app: &mut TestApp) {
+        let mut color = crate::render::AtlasAllocator::with_page(AtlasKind::ColorGlyph, (512, 512));
+        color.cap_page_for_test(512);
+        assert!(color.allocate((500, 500)).is_some(), "占满彩色页");
+        app.app_mut()
+            .glyph_atlas
+            .set_color_allocator_for_test(color);
+        app.app_mut().request_frame();
     }
 
     fn has_system_fonts(app: &mut TestApp) -> bool {
@@ -912,6 +932,58 @@ mod tests {
                 .line_is_live(line)
             }),
             "the recovered frame resolves to live tiles"
+        );
+    }
+
+    #[test]
+    fn canvas_text_reports_color_atlas_exhaustion_with_the_real_kind() {
+        let mut app = TestApp::new();
+        if !has_system_fonts(&mut app) {
+            return;
+        }
+        if crate::text::raster::probe_emoji_font().is_none() {
+            eprintln!("skip: no color emoji font available on this device");
+            return;
+        }
+        let window = app.window_id();
+        let mut canvas = Canvas::new(bounds());
+        assert!(canvas.push_text(
+            TextContent::new("\u{1F30D}", styled_at(32.0)),
+            LogicalPoint::ZERO,
+        ));
+        mount(&mut app, canvas);
+        constrain_color_atlas(&mut app);
+        let _ = app.app_mut().a11y_take(window);
+        app.window()
+            .drain()
+            .expect("the first pressured frame commits");
+        assert!(
+            app.app()
+                .text_diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(
+                    diagnostic,
+                    TextDiagnostic::AtlasFull { skipped } if *skipped > 0
+                )),
+            "彩色图集压力必须被诊断：{:?}",
+            app.app().text_diagnostics()
+        );
+
+        let mut escalated = None;
+        for _ in 0..3 {
+            match drain_main(&mut app, window) {
+                Ok(_) => {}
+                Err(EngineError::AtlasExhausted { kind }) => {
+                    escalated = Some(kind);
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(
+            escalated,
+            Some(AtlasKind::ColorGlyph),
+            "彩色图集耗尽必须按实际图集类型上报（不是恒为 Glyph）"
         );
     }
 
