@@ -802,7 +802,7 @@ setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`。
 | `cargo test --workspace` | **8876 passed / 0 failed / 30 ignored**（60 测试二进制 + 41 doc-test = 101 个二进制） |
 | `cargo test -p ui_core --lib` | 2280（2279 passed + 1 ignored） |
 | `cargo test -p ui_core --lib --features test-support` | 2610（2609 passed + 1 ignored） |
-| `cargo test -p ui_core --features test-support --tests` | frame_record **8** / layout **4** / snapshot **14** / gui_smoke 1 ignored / `demo` example 39 |
+| `cargo test -p ui_core --features test-support --tests` | frame_record **8** / layout **4** / snapshot **13** / gui_smoke 1 ignored / `demo` example 39 |
 | `cargo test -p ui_kit --lib` | **748 passed** |
 | `cargo +nightly clippy --workspace --all-targets -- -D warnings` | **PASS**（0 warning / 0 error） |
 | `cargo +nightly fmt --check` | **PASS**（exit 0，无输出） |
@@ -880,9 +880,9 @@ setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`。
   ui_core 整改批次），criterion 打印的 `change:` 百分比对照的是那份陈旧基线，**不作为本轮
   A/B 证据**（例如 `idle_frame` 会显示 +71.8%，而绝对耗时只有 432 ns）。
 
-### 11.7 三端最终验收（用户口径：只要求受影响 crate）—— 判据全部 PASS，计数已按实测回填
+head `92b573cb`（P4 遗留清零轮实测 head；其后 `7f586728` 及之后仅文档改动）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
 head `92b573cb`（P4 遗留清零轮最终提交）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
-
+> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`，其后的文档修正不改变计数）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，已在 `CONTRIBUTING.md` 记录。
 > **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，已在 `CONTRIBUTING.md` 记录。
 
 **Windows（全工作区）**
@@ -1114,7 +1114,7 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 | 项 | 状态 |
 |---|---|
 | §11.7 / §11.9 三端测试计数（P4-72） | 已按实测回填（Windows workspace 8924/0/30、lib 2315、TS 2656；Ubuntu lib 2098、TS 2432；macOS lib 2062、TS 2397） |
-| `NodeTree::set_press_focus_target` 的精确落点（builder 形参 vs build 后回填） | 语义已定（宿主显式唯一目标 + 按点落 caret）；**最终形态为 build 后回填**（`node/tree.rs`），builder 带参版本未采用形态，按源码校正引擎设计 §1.3 与偏差 ㊳ |
+| 旧计数口径 | 各轮历史记录保留原值供追溯；当前口径只认 §11.7 的实测值，不得引用更早的 `2062/2386/748`、`2027/2351/748`、`2067/2392/752`、`2032/2357/752` |
 | 旧计数 `2062/2386/748`、`2027/2351/748` | 已在 §11.7 注明**过期**（round 2 为 `2067/2392/752`、`2032/2357/752`），不得引用 |
 
 ## 附录 A：关键证据索引

@@ -364,7 +364,7 @@ pub(crate) use windows as backend;
    `test_support` 由 `feature = "test-support"` 门控（不进发布物，I7）。
 3. **白名单语义**：下表是「应用层允许依赖的类型与入口」，深路径省略 `ui_core::` 前缀；`error::EngineError` 是所有可失败
    API 的返回错误（缺它无法写应用代码）。**E1–E15 的公开面已全部实现**（P1 完成 E1–E6，§11.1–§11.6；P2 完成 E7–E15，
-   §11.9–§11.15），应用现在即可依赖。**P2 未新增 `EngineError` 变体**；P3-1b 为 `FrameRouter` 单槽可观测性新增
+   `FrameHookInstalled`（该批为 **36** 个；当前源码已 **40** 个，以 §2.9 冻结表为准，Lead 批准保留）。
    `FrameHookInstalled`（现 **36** 个，§2.9，Lead 批准保留）。
    **P3 期的引擎增量**（逐条在 `ledger.md` 登记、Lead 已批准越界改 `ui_core`）：`App::remove_node_with_scope`
    （E16 的「先删子树、后释放 scope」唯一入口）、`App::pointer_position`（E17）、`App::frame_hook_installed`（P3-1b）、
@@ -748,10 +748,10 @@ pub enum EngineError {
 > `GeometryTruncateGrows` / `AppInit` / `WindowCreate` / `Clipboard` / `NotScrollable` / `NotVirtualList` /
 > `VirtualListExtents` / `InvalidVirtualExtent` / `UnknownWindow` / `A11yInit` / `ResourceDecode` /
 > `InvalidImageIntrinsic` / `UnsupportedWindowCapability` / `WindowIcon`。
-> 计数分解：E 阶段基线 36（含 E1 的 `TextShapeStandalone` / E1b 的 `InvalidTextScale`，二者已随「单段文本整形
-> 面」重构删除）+ `ScopeOwnershipMismatch` + `InvalidImageIntrinsic` = 38；文本输入重构新增
-> `NodeSpecInvalid` / `TextEditNotAvailable` / `TextEditSpecInvalid` / `TextEditLayout` = **40**（前两者之外
-> 两个为 P1a 期既有，已在下面说明）。`StaleNode` 语义沿用「句柄不可用或不能作为文本命中目标」，未新增变体。
+> 计数分解：历史基线 36（含 `TextShapeStandalone` / `InvalidTextScale`）− 删除的 2 个（随「单段文本整形面」重构移除）
+> = 34；+ `ScopeOwnershipMismatch` + `InvalidImageIntrinsic` = 36；+ 文本输入重构的 `NodeSpecInvalid` /
+> `TextEditNotAvailable` / `TextEditSpecInvalid` / `TextEditLayout` = **40**。`StaleNode` 语义沿用「句柄不可用
+> 或不能作为文本命中目标」，未新增变体。各变体引入/删除提交以 `git log -S` 为准，不在本节复述。
 > （`FrameRouter` 单槽占用报错，Lead 已批准保留并登记 `ledger.md`）。`StaleNode` 的语义在 E5 扩展为
 > 「句柄不可用（从未存在 / 已卸载 / root）**或不能作为文本命中目标**」（§11.5），Display 文案同步、**不新增变体**。
 > `Composition` 是 2026-11-15 追加的 Windows DirectComposition **运行时**错误（几何 / `Commit` /
