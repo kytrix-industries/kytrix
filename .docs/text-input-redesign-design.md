@@ -880,14 +880,10 @@ setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`。
   ui_core 整改批次），criterion 打印的 `change:` 百分比对照的是那份陈旧基线，**不作为本轮
   A/B 证据**（例如 `idle_frame` 会显示 +71.8%，而绝对耗时只有 432 ns）。
 
-### 11.7 三端最终验收（用户口径：只要求受影响 crate）—— 判据全部 PASS（计数待 P4-72 回填）
+### 11.7 三端最终验收（用户口径：只要求受影响 crate）—— 判据全部 PASS，计数已按实测回填
+head `92b573cb`（P4 遗留清零轮最终提交）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
 
-head `cb965b56` + P5 工作区改动（含 §11.9 的四类修复）。日志：`.review/text-input/p5-remote-gates-r2.sh`、
-远端 `/tmp/r3b-gates.out`（Ubuntu）、`/tmp/r3c-gates.out`（macOS）。
-
-> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」已按 P4 遗留清零轮（§11.11）重跑并回填实测值；三端 nightly 版本不同导致 clippy 命中项差异，已在 `CONTRIBUTING.md` 记录。
-> 后回填，占位期间不得引用旧值（旧值 `Ubuntu 2062/2386/748`、`macOS 2027/2351/748` 已过期，round 2 实测为
-> `2067/2392/752`、`2032/2357/752`，本轮改动后仍会变化）。判据（0 failed、clippy/fmt exit 0、gallery 门槛）不变。
+> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，已在 `CONTRIBUTING.md` 记录。
 
 **Windows（全工作区）**
 

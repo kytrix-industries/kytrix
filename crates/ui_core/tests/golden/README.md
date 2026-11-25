@@ -108,7 +108,7 @@ COLRv1-only 夹具在找不到任何单面字体文件时读本开关。只有�
 | 行为 | 打印可读原因后跳过断言，三种固定输出：`skip golden <case>: no render backend (explicitly exempted by KYTRIX_TEST_SKIP_GPU_PIXELS=1)`、`skip color emoji pixel assertions: <reason> (...)`、`skip COLRv1-only fixture: <reason> (...)`；报告里必须能看到 |
 | 限制 ① | **不得**在常规 CI / 开发机上默认置位 |
 | 限制 ② | **不得**用于让「基线差异 / 真回归」变绿——差异只走重基纪律逐张确认 |
-| 限制 ③ | 豁免不改变「本设备有基线就必须通过」的判定（有基线时任何豁免都无效） |
+| 限制 ③ | 豁免**只覆盖环境层面的失败**（`SnapshotError::NoRenderer` / `Gpu`，以及缺彩色字体、缺单面字体文件）；**像素差异（`GoldenError::Diff`）永不免除**。后端可用时，本设备有基线就必须通过 |
 | 限制 ④ | 置位期间**不允许** bless（缺字体的环境会写出错误基线） |
 | 反例 | 字体/后端明明可用（如 Windows 有 Segoe UI Emoji）却靠它让红变绿 ⇒ 门禁违规，终审必须复查 |
 
