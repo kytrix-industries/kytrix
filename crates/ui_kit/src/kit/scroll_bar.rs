@@ -67,6 +67,8 @@ pub struct ScrollbarOptions {
     pub corner_radius: LogicalPx,
     pub min_thumb: LogicalPx,
     pub mode: ScrollbarMode,
+    pub inset: LogicalPx,
+    pub focus_opacity: f32,
 }
 
 impl Default for ScrollbarOptions {
@@ -76,6 +78,8 @@ impl Default for ScrollbarOptions {
             corner_radius: px(1.0),
             min_thumb: px(20.0),
             mode: ScrollbarMode::Always,
+            inset: LogicalPx::ZERO,
+            focus_opacity: 0.0,
         }
     }
 }
@@ -90,6 +94,18 @@ impl ScrollbarOptions {
     #[must_use]
     pub fn thickness(mut self, thickness: LogicalPx) -> Self {
         self.thickness = thickness.max(px(1.0));
+        self
+    }
+
+    #[must_use]
+    pub fn inset(mut self, inset: LogicalPx) -> Self {
+        self.inset = inset.max(LogicalPx::ZERO);
+        self
+    }
+
+    #[must_use]
+    pub fn focus_opacity(mut self, opacity: f32) -> Self {
+        self.focus_opacity = opacity.clamp(0.0, 1.0);
         self
     }
 }
@@ -109,6 +125,7 @@ struct ScrollBarInner {
     scope: SignalScope,
     hovered: Signal<bool>,
     scrollable: Signal<bool>,
+    focused: Signal<bool>,
     fade: Transient<f32>,
     fade_target: Cell<Option<f32>>,
     drag: Transient<Option<DragStart>>,
@@ -151,6 +168,7 @@ impl ScrollBar {
                 scope,
                 hovered: app.signal_scoped(scope, false),
                 scrollable: app.signal_scoped(scope, false),
+                focused: app.signal_scoped(scope, false),
                 fade: app.transient_scoped(scope, initial_fade),
                 fade_target: Cell::new(None),
                 drag: app.transient_scoped(scope, None),
@@ -169,17 +187,18 @@ impl ScrollBar {
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
         let inner = &self.inner;
         let thickness = inner.options.thickness;
+        let inset = inner.options.inset;
         let mut track_style = StyleBuilder::new().absolute();
         track_style = match inner.axis {
             ScrollbarAxis::Vertical => track_style
-                .top(LogicalPx::ZERO)
-                .right(LogicalPx::ZERO)
-                .bottom(LogicalPx::ZERO)
+                .top(inset)
+                .right(inset)
+                .bottom(inset)
                 .width(thickness),
             ScrollbarAxis::Horizontal => track_style
-                .left(LogicalPx::ZERO)
-                .right(LogicalPx::ZERO)
-                .bottom(LogicalPx::ZERO)
+                .left(inset)
+                .right(inset)
+                .bottom(inset)
                 .height(thickness),
         };
         let track = NodeBuilder::boxed()
@@ -300,6 +319,10 @@ impl ScrollBar {
         app.read_with(&self.inner.scrollable, |scrollable| *scrollable)
     }
 
+    pub fn set_focused(&self, app: &mut App, focused: bool) -> bool {
+        app.write(&self.inner.focused, focused)
+    }
+
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let (Some(window), Some(track), Some(thumb), Some(handle)) = (
             self.inner.geometry.borrow().window,
@@ -354,11 +377,16 @@ impl ScrollBar {
             changed = true;
         }
         let dragging = (*app.read_transient(&self.inner.drag)).is_some();
+        let focused = app.read_with(&self.inner.focused, |focused| *focused);
         let target_opacity = match self.inner.options.mode {
             ScrollbarMode::Always => f32::from(scrollable),
             ScrollbarMode::Hover => {
-                if scrollable && (hovered || dragging) {
+                if !scrollable {
+                    0.0
+                } else if hovered || dragging {
                     1.0
+                } else if focused {
+                    self.inner.options.focus_opacity
                 } else {
                     0.0
                 }

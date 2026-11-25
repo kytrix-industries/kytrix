@@ -1270,8 +1270,7 @@ fn text_decorations(tree: &NodeTree, node: NodeId) -> Option<TextDecorations> {
             selection.range().end,
         )
     };
-    let caret = editable
-        .focused()
+    let caret = (editable.focused() && editable.caret_visible())
         .then(|| tree.text_caret_rect(node, selection.focus().byte).ok())
         .flatten();
     let mut underlines = Vec::new();

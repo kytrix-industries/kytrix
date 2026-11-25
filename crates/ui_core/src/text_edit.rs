@@ -1,4 +1,9 @@
-use std::{ops::Range, rc::Rc, sync::Arc};
+use std::{
+    ops::Range,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parley::{
     Affinity as ParleyAffinity, BreakReason as ParleyBreakReason, Cursor as ParleyCursor, Layout,
@@ -10,11 +15,11 @@ use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 use crate::{
     a11y::{A11yPatch, A11yRole, textrun},
-    app::App,
+    app::{App, TimerId},
     error::EngineError,
     event::{Action, ActionSource, ImeEvent, KeyCode, Modifiers},
-    interaction::{drag as drag_util, scroll},
-    math::{LogicalPoint, LogicalPx, px},
+    interaction::{ScrollAxis, drag as drag_util, scroll},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{id::NodeId, tree::NodeTree},
     paint::color::{Color, ColorBrush},
     text::{ShapedLine, TextContent, TextStyle, shape::ShapedText},
@@ -22,6 +27,10 @@ use crate::{
 };
 
 const MASK_GLYPH: char = '\u{2022}';
+
+const CARET_BLINK_HALF: Duration = Duration::from_millis(530);
+
+const CARET_REVEAL_MARGIN_X: f32 = 4.0;
 
 fn masked_text(raw: &str) -> SmolStr {
     let mut text = SmolStrBuilder::with_capacity(raw.len());
@@ -32,6 +41,53 @@ fn masked_text(raw: &str) -> SmolStr {
 }
 
 const UNDO_LIMIT: usize = 100;
+
+pub(crate) struct CaretBlink {
+    last_activity: Instant,
+    visible: bool,
+    timer: Option<TimerId>,
+    focused: Option<NodeId>,
+    os_focused: bool,
+}
+
+impl CaretBlink {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            last_activity: now,
+            visible: true,
+            timer: None,
+            focused: None,
+            os_focused: true,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn owner(&self) -> Option<NodeId> {
+        self.focused
+    }
+
+    pub(crate) fn release_owner(&mut self) {
+        self.focused = None;
+        self.visible = true;
+        self.timer = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RevealKey {
+    ancestor: Option<NodeId>,
+    caret: LogicalRect,
+    viewport: LogicalSize,
+}
+
+struct RevealGeometry {
+    key: RevealKey,
+    ancestor: Option<(NodeId, crate::interaction::ScrollSlot)>,
+    focus: LogicalRect,
+    anchor: Option<LogicalRect>,
+    viewport: LogicalRect,
+    multiline: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextAffinity {
@@ -958,6 +1014,8 @@ pub(crate) struct EditableText {
     placeholder: Option<PlaceholderText>,
     focused: bool,
     invalid: bool,
+    caret_visible: bool,
+    reveal: Option<RevealKey>,
     a11y_value: SmolStr,
     generation: u64,
     snapshot: TextEditSnapshot,
@@ -989,6 +1047,8 @@ impl EditableText {
             placeholder: None,
             focused: false,
             invalid: false,
+            caret_visible: true,
+            reveal: None,
             a11y_value: SmolStr::default(),
             generation: 0,
             graphemes: 0,
@@ -1333,6 +1393,8 @@ impl EditableText {
             false
         };
         self.focused = focused;
+        self.caret_visible = true;
+        self.reveal = None;
         self.bump_generation();
         Some(display_changed)
     }
@@ -1371,6 +1433,26 @@ impl EditableText {
 
     pub(crate) fn focused(&self) -> bool {
         self.focused
+    }
+
+    pub(crate) fn caret_visible(&self) -> bool {
+        self.caret_visible
+    }
+
+    fn set_caret_visible(&mut self, visible: bool) -> bool {
+        if self.caret_visible == visible {
+            return false;
+        }
+        self.caret_visible = visible;
+        true
+    }
+
+    fn reveal(&self) -> Option<RevealKey> {
+        self.reveal
+    }
+
+    fn set_reveal(&mut self, reveal: Option<RevealKey>) {
+        self.reveal = reveal;
     }
 
     pub(crate) fn composition_ranges(&self) -> Option<&[Range<usize>]> {
@@ -1789,6 +1871,7 @@ pub(crate) fn set_value(
     }
     if touched {
         app.request_frame();
+        note_activity(app, window);
     }
     Ok(changed)
 }
@@ -2131,6 +2214,7 @@ fn commit_result(
     };
     write_commit_effects(target.tree_mut(), node, result);
     app.request_frame();
+    note_activity(app, window);
     Ok(true)
 }
 
@@ -2713,6 +2797,7 @@ fn store_selection(
     };
     if changed {
         app.request_frame();
+        note_activity(app, window);
     }
     Ok(changed)
 }
@@ -2791,7 +2876,7 @@ fn page_viewport_height(app: &App, window: WindowId, node: NodeId) -> LogicalPx 
         return LogicalPx::ZERO;
     };
     let tree = target.tree();
-    let Some((ancestor, _)) = scroll::scroll_ancestor(tree, node) else {
+    let Some((ancestor, _)) = scroll::scroll_ancestor_on(tree, node, ScrollAxis::Vertical) else {
         return LogicalPx::ZERO;
     };
     scroll::viewport(tree, ancestor).size.height
@@ -2973,6 +3058,7 @@ pub(crate) fn handle_ime(app: &mut App, window: WindowId, event: &ImeEvent) -> b
     }
     if ime_edit(app, window, context.node, event) {
         app.request_frame();
+        note_activity(app, window);
     }
     true
 }
@@ -3175,6 +3261,8 @@ pub(crate) fn pointer_press(
     if store_selection(app, window, node, selection).is_err() {
         return false;
     }
+    note_activity(app, window);
+    mark_revealed(app, window, node);
     let Some(target) = app.window_mut(window) else {
         return false;
     };
@@ -3213,6 +3301,7 @@ pub(crate) fn pointer_move(
     }
     auto_scroll_text(app, window, node, position);
     extend_pointer_selection(app, window, node, position);
+    note_activity(app, window);
     true
 }
 
@@ -3228,6 +3317,8 @@ pub(crate) fn pointer_release(app: &mut App, window: WindowId, position: Logical
         extend_pointer_selection(app, window, press.node, position);
     }
     cancel_pointer_press(app, window);
+    note_activity(app, window);
+    mark_revealed(app, window, press.node);
     true
 }
 
@@ -3304,55 +3395,62 @@ fn auto_scroll_goal(
 ) -> Option<(crate::interaction::ScrollHandle, LogicalPoint)> {
     let target = app.window(window)?;
     let tree = target.tree();
-    let (ancestor, slot) = scroll::scroll_ancestor(tree, node)?;
     let bounds = tree.get(node).ok()?.layout().bounds;
     let node_screen = scroll::to_screen(tree, node, bounds);
-    let viewport_screen = scroll::to_screen(tree, ancestor, scroll::viewport(tree, ancestor));
-    let visible = node_screen.intersect(viewport_screen);
-    let visible = if visible.size.width > LogicalPx::ZERO && visible.size.height > LogicalPx::ZERO {
-        visible
-    } else {
-        viewport_screen
-    };
-    let (distance, direction) = match slot.axis {
-        crate::interaction::ScrollAxis::Vertical => {
-            if position.y < visible.origin.y {
-                (visible.origin.y - position.y, -1.0_f32)
-            } else if position.y > visible.max().y {
-                (position.y - visible.max().y, 1.0_f32)
+    for (ancestor, slot) in scroll::scroll_ancestors(tree, node) {
+        let viewport_screen = scroll::to_screen(tree, ancestor, scroll::viewport(tree, ancestor));
+        let visible = node_screen.intersect(viewport_screen);
+        let visible =
+            if visible.size.width > LogicalPx::ZERO && visible.size.height > LogicalPx::ZERO {
+                visible
             } else {
-                (LogicalPx::ZERO, 0.0_f32)
+                viewport_screen
+            };
+        let (distance, direction) = match slot.axis {
+            ScrollAxis::Vertical => {
+                if position.y < visible.origin.y {
+                    (visible.origin.y - position.y, -1.0_f32)
+                } else if position.y > visible.max().y {
+                    (position.y - visible.max().y, 1.0_f32)
+                } else {
+                    (LogicalPx::ZERO, 0.0_f32)
+                }
             }
-        }
-        crate::interaction::ScrollAxis::Horizontal => {
-            if position.x < visible.origin.x {
-                (visible.origin.x - position.x, -1.0_f32)
-            } else if position.x > visible.max().x {
-                (position.x - visible.max().x, 1.0_f32)
-            } else {
-                (LogicalPx::ZERO, 0.0_f32)
+            ScrollAxis::Horizontal => {
+                if position.x < visible.origin.x {
+                    (visible.origin.x - position.x, -1.0_f32)
+                } else if position.x > visible.max().x {
+                    (position.x - visible.max().x, 1.0_f32)
+                } else {
+                    (LogicalPx::ZERO, 0.0_f32)
+                }
             }
+        };
+        if direction == 0.0 {
+            continue;
         }
-    };
-    if direction == 0.0 {
-        return None;
+        let max = scroll::max_offset(&slot, scroll::viewport(tree, ancestor).size);
+        let max = match slot.axis {
+            ScrollAxis::Vertical => max.y,
+            ScrollAxis::Horizontal => max.x,
+        };
+        if max <= LogicalPx::ZERO {
+            continue;
+        }
+        let step = px(distance
+            .value()
+            .clamp(1.0, (slot.line_height.value() * 2.0).max(1.0))
+            * direction);
+        let goal = match slot.axis {
+            ScrollAxis::Vertical => LogicalPoint::new(slot.offset.x, slot.offset.y + step),
+            ScrollAxis::Horizontal => LogicalPoint::new(slot.offset.x + step, slot.offset.y),
+        };
+        return Some((
+            crate::interaction::ScrollHandle::new(window, ancestor),
+            goal,
+        ));
     }
-    let step = px(distance
-        .value()
-        .clamp(1.0, (slot.line_height.value() * 2.0).max(1.0))
-        * direction);
-    let goal = match slot.axis {
-        crate::interaction::ScrollAxis::Vertical => {
-            LogicalPoint::new(slot.offset.x, slot.offset.y + step)
-        }
-        crate::interaction::ScrollAxis::Horizontal => {
-            LogicalPoint::new(slot.offset.x + step, slot.offset.y)
-        }
-    };
-    Some((
-        crate::interaction::ScrollHandle::new(window, ancestor),
-        goal,
-    ))
+    None
 }
 
 pub(crate) fn handle_key(
@@ -3556,6 +3654,434 @@ pub(crate) fn focused_node(app: &App, window: WindowId) -> Option<NodeId> {
     let tree = app.window(window)?.tree();
     let editable = tree.editable(node)?;
     (!editable.spec().disabled).then_some(node)
+}
+
+#[must_use]
+pub(crate) fn caret_visible(app: &App, window: WindowId) -> Option<bool> {
+    let node = focused_node(app, window)?;
+    app.window(window)?
+        .tree()
+        .editable(node)
+        .map(EditableText::caret_visible)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlinkTrigger {
+    Frame,
+    Timer,
+    Activity,
+    Focus,
+}
+
+pub(crate) fn sync_blink(app: &mut App, window: WindowId) {
+    apply_blink(app, window, BlinkTrigger::Frame);
+}
+
+pub(crate) fn sync_window_focus(app: &mut App, window: WindowId, focused: bool) {
+    app.caret_blink_mut().os_focused = focused;
+    if focused {
+        apply_blink(app, window, BlinkTrigger::Focus);
+        return;
+    }
+    let owner = app.caret_blink().focused.and_then(NodeId::window);
+    if owner == Some(window) {
+        {
+            let blink = app.caret_blink_mut();
+            blink.focused = None;
+            blink.visible = true;
+        }
+        cancel_blink_timer(app);
+    }
+    if let Some(node) = focused_node(app, window) {
+        sync_caret_visible(app, window, node, false, true);
+    }
+}
+
+pub(crate) fn resume_after_owner_release(app: &mut App) {
+    let windows: Vec<WindowId> = app.windows().map(|(window, _)| window).collect();
+    let mut marked = false;
+    for window in windows {
+        let Some(focused) = app.focused(window) else {
+            continue;
+        };
+        if let Some(target) = app.window_mut(window) {
+            target.tree_mut().mark_paint(focused);
+            marked = true;
+        }
+    }
+    if marked {
+        app.request_frame();
+    }
+}
+
+pub(crate) fn note_activity(app: &mut App, window: WindowId) {
+    apply_blink(app, window, BlinkTrigger::Activity);
+}
+
+pub(crate) fn note_focus_change(app: &mut App, window: WindowId) {
+    apply_blink(app, window, BlinkTrigger::Focus);
+}
+
+fn blink_tick(app: &mut App, window: WindowId) {
+    app.caret_blink_mut().timer = None;
+    if app.caret_blink().focused.and_then(NodeId::window) != Some(window) {
+        return;
+    }
+    apply_blink(app, window, BlinkTrigger::Timer);
+}
+
+fn take_blink_ownership(app: &mut App, focused: Option<NodeId>, now: Instant) {
+    let previous = app.caret_blink().focused;
+    {
+        let blink = app.caret_blink_mut();
+        blink.focused = focused;
+        blink.last_activity = now;
+        blink.visible = true;
+    }
+    cancel_blink_timer(app);
+    if let Some(previous) = previous
+        && let Some(previous_window) = previous.window()
+    {
+        sync_caret_visible(app, previous_window, previous, false, true);
+    }
+}
+
+fn apply_blink(app: &mut App, window: WindowId, trigger: BlinkTrigger) {
+    let now = app.now();
+    let focused = focused_node(app, window);
+    let owner = app.caret_blink().focused.and_then(NodeId::window);
+    if owner != Some(window) {
+        let can_take = focused.is_some()
+            && (trigger == BlinkTrigger::Focus
+                || (owner.is_none()
+                    && app.caret_blink().os_focused
+                    && app
+                        .focused_window()
+                        .is_none_or(|focused_window| focused_window == window)));
+        if can_take {
+            take_blink_ownership(app, focused, now);
+        } else {
+            if let Some(node) = focused {
+                sync_caret_visible(app, window, node, false, true);
+            }
+            return;
+        }
+    }
+    if trigger == BlinkTrigger::Activity {
+        app.caret_blink_mut().last_activity = now;
+    }
+    let previous = app.caret_blink().focused;
+    if previous != focused {
+        {
+            let blink = app.caret_blink_mut();
+            blink.focused = focused;
+            blink.last_activity = now;
+            blink.visible = true;
+        }
+        cancel_blink_timer(app);
+        if let Some(previous) = previous
+            && let Some(previous_window) = previous.window()
+        {
+            sync_caret_visible(app, previous_window, previous, false, false);
+        }
+    }
+    let Some(node) = focused else {
+        cancel_blink_timer(app);
+        app.caret_blink_mut().visible = true;
+        return;
+    };
+    let composing = app
+        .window(window)
+        .and_then(|target| target.tree().editable(node))
+        .is_some_and(EditableText::composing);
+    if composing {
+        app.caret_blink_mut().visible = true;
+        cancel_blink_timer(app);
+        sync_caret_visible(app, window, node, true, trigger == BlinkTrigger::Activity);
+        return;
+    }
+    if trigger == BlinkTrigger::Activity {
+        app.caret_blink_mut().visible = true;
+        sync_caret_visible(app, window, node, true, true);
+        ensure_blink_timer(app, window, node);
+        return;
+    }
+    let deadline = app.caret_blink().last_activity + CARET_BLINK_HALF;
+    if now >= deadline {
+        let next = !app.caret_blink().visible;
+        {
+            let blink = app.caret_blink_mut();
+            blink.visible = next;
+            blink.last_activity = now;
+        }
+        sync_caret_visible(app, window, node, next, trigger == BlinkTrigger::Timer);
+    } else {
+        let visible = app.caret_blink().visible;
+        sync_caret_visible(app, window, node, visible, false);
+    }
+    ensure_blink_timer(app, window, node);
+}
+
+fn sync_caret_visible(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    visible: bool,
+    request_frame: bool,
+) -> bool {
+    let Some(target) = app.window_mut(window) else {
+        return false;
+    };
+    let tree = target.tree_mut();
+    let changed = tree
+        .editable_mut(node)
+        .is_some_and(|editable| editable.set_caret_visible(visible));
+    if changed {
+        tree.mark_paint(node);
+    }
+    if changed && request_frame {
+        app.request_frame();
+    }
+    changed
+}
+
+fn ensure_blink_timer(app: &mut App, window: WindowId, node: NodeId) {
+    let timer = app.caret_blink().timer;
+    if let Some(id) = timer {
+        if app.timer_live(&id) {
+            return;
+        }
+        app.caret_blink_mut().timer = None;
+    }
+    let deadline = app.caret_blink().last_activity + CARET_BLINK_HALF;
+    let delay = deadline
+        .saturating_duration_since(app.now())
+        .max(Duration::from_millis(1));
+    app.caret_blink_mut().timer = app
+        .after_scoped(window, node, delay, move |app| blink_tick(app, window))
+        .ok();
+}
+
+fn cancel_blink_timer(app: &mut App) {
+    if let Some(id) = app.caret_blink_mut().timer.take() {
+        let _ = app.cancel_timer(&id);
+    }
+}
+pub(crate) fn ensure_visible(app: &mut App, window: WindowId) {
+    let Some(node) = focused_node(app, window) else {
+        return;
+    };
+    if text_pointer_press(app, window).is_some() {
+        return;
+    }
+    let Some(geometry) = reveal_geometry(app, window, node) else {
+        return;
+    };
+    let current = app
+        .window(window)
+        .and_then(|target| target.tree().editable(node))
+        .and_then(EditableText::reveal);
+    if current == Some(geometry.key) {
+        return;
+    }
+    let Some((ancestor, slot)) = geometry.ancestor else {
+        set_reveal(app, window, node, Some(geometry.key));
+        return;
+    };
+    let line_height = metrics(app, window, node).map_or_else(
+        |_| geometry.focus.size.height.max(px(1.0)),
+        |metrics| metrics.line_height,
+    );
+    let focus_wanted = reveal_offset(
+        &slot,
+        geometry.viewport,
+        geometry.focus,
+        geometry.multiline,
+        line_height,
+    );
+    let wanted = focus_wanted.or_else(|| {
+        geometry.anchor.and_then(|anchor| {
+            let candidate = reveal_offset(
+                &slot,
+                geometry.viewport,
+                anchor,
+                geometry.multiline,
+                line_height,
+            )?;
+            let target = clamp_reveal_target(&slot, geometry.viewport, candidate);
+            reveal_keeps_focus_visible(&slot, geometry.viewport, geometry.focus, target)
+                .then_some(target)
+        })
+    });
+    let Some(wanted) = wanted else {
+        set_reveal(app, window, node, Some(geometry.key));
+        return;
+    };
+    if wanted == slot.offset {
+        set_reveal(app, window, node, Some(geometry.key));
+        return;
+    }
+    let handle = crate::interaction::ScrollHandle::new(window, ancestor);
+    if app.scroll_to(&handle, wanted).is_err() {
+        return;
+    }
+    let reached = app
+        .scroll_state(&handle)
+        .is_some_and(|state| state.offset == wanted || state.offset == slot.offset);
+    if reached {
+        set_reveal(app, window, node, Some(geometry.key));
+    }
+}
+
+#[must_use]
+pub(crate) fn reveal_pending(app: &App, window: WindowId) -> bool {
+    let Some(node) = focused_node(app, window) else {
+        return false;
+    };
+    if text_pointer_press(app, window).is_some() {
+        return false;
+    }
+    let Some(geometry) = reveal_geometry(app, window, node) else {
+        return false;
+    };
+    let current = app
+        .window(window)
+        .and_then(|target| target.tree().editable(node))
+        .and_then(EditableText::reveal);
+    current != Some(geometry.key)
+}
+
+fn set_reveal(app: &mut App, window: WindowId, node: NodeId, reveal: Option<RevealKey>) {
+    if let Some(target) = app.window_mut(window)
+        && let Some(editable) = target.tree_mut().editable_mut(node)
+    {
+        editable.set_reveal(reveal);
+    }
+}
+
+fn mark_revealed(app: &mut App, window: WindowId, node: NodeId) {
+    if let Some(geometry) = reveal_geometry(app, window, node) {
+        set_reveal(app, window, node, Some(geometry.key));
+    }
+}
+
+fn caret_content_rect(tree: &NodeTree, node: NodeId, byte_index: usize) -> Option<LogicalRect> {
+    let local = tree.text_caret_rect(node, byte_index).ok()?;
+    let bounds = tree.get(node).ok()?.layout().bounds;
+    let content_offset = tree.content_offset(node);
+    Some(local.translate(LogicalPoint::new(
+        bounds.origin.x + content_offset.x,
+        bounds.origin.y + content_offset.y,
+    )))
+}
+
+fn reveal_geometry(app: &App, window: WindowId, node: NodeId) -> Option<RevealGeometry> {
+    let tree = app.window(window)?.tree();
+    let editable = tree.editable(node)?;
+    let multiline = editable.spec().multiline;
+    let selection = editable.selection();
+    let focus = caret_content_rect(tree, node, selection.focus().byte)?;
+    let anchor = (!selection.is_collapsed())
+        .then(|| caret_content_rect(tree, node, selection.anchor().byte))
+        .flatten();
+    let caret = anchor.map_or(focus, |anchor| focus.union(anchor));
+    let ancestor = scroll::scroll_ancestor(tree, node);
+    let viewport = ancestor.map_or_else(LogicalRect::default, |(container, _)| {
+        scroll::viewport(tree, container)
+    });
+    Some(RevealGeometry {
+        key: RevealKey {
+            ancestor: ancestor.map(|(container, _)| container),
+            caret,
+            viewport: viewport.size,
+        },
+        ancestor,
+        focus,
+        anchor,
+        viewport,
+        multiline,
+    })
+}
+
+fn reveal_offset(
+    slot: &crate::interaction::ScrollSlot,
+    viewport: LogicalRect,
+    caret: LogicalRect,
+    multiline: bool,
+    line_height: LogicalPx,
+) -> Option<LogicalPoint> {
+    match slot.axis {
+        ScrollAxis::Vertical => {
+            let available = viewport.size.height;
+            let margin = line_height.max(px(1.0));
+            let margin = margin.min(((available - margin) * 0.5).max(LogicalPx::ZERO));
+            let top = slot.offset.y + viewport.origin.y + margin;
+            let bottom = slot.offset.y + viewport.origin.y + available - margin;
+            if caret.origin.y < top {
+                Some(LogicalPoint::new(
+                    slot.offset.x,
+                    slot.offset.y + (caret.origin.y - top),
+                ))
+            } else if caret.max().y > bottom {
+                Some(LogicalPoint::new(
+                    slot.offset.x,
+                    slot.offset.y + (caret.max().y - bottom),
+                ))
+            } else {
+                None
+            }
+        }
+        ScrollAxis::Horizontal if !multiline => {
+            let available = viewport.size.width;
+            let margin = px(CARET_REVEAL_MARGIN_X).min(available * 0.25);
+            let left = slot.offset.x + viewport.origin.x + margin;
+            let right = slot.offset.x + viewport.origin.x + available - margin;
+            if caret.origin.x < left {
+                Some(LogicalPoint::new(
+                    slot.offset.x + (caret.origin.x - left),
+                    slot.offset.y,
+                ))
+            } else if caret.max().x > right {
+                Some(LogicalPoint::new(
+                    slot.offset.x + (caret.max().x - right),
+                    slot.offset.y,
+                ))
+            } else {
+                None
+            }
+        }
+        ScrollAxis::Horizontal => None,
+    }
+}
+
+fn clamp_reveal_target(
+    slot: &crate::interaction::ScrollSlot,
+    viewport: LogicalRect,
+    target: LogicalPoint,
+) -> LogicalPoint {
+    let mut probe = *slot;
+    probe.offset = target;
+    scroll::clamp_offset(&probe, viewport.size)
+}
+
+fn reveal_keeps_focus_visible(
+    slot: &crate::interaction::ScrollSlot,
+    viewport: LogicalRect,
+    focus: LogicalRect,
+    target: LogicalPoint,
+) -> bool {
+    match slot.axis {
+        ScrollAxis::Vertical => {
+            let start = target.y + viewport.origin.y;
+            let end = start + viewport.size.height;
+            focus.origin.y >= start && focus.max().y <= end
+        }
+        ScrollAxis::Horizontal => {
+            let start = target.x + viewport.origin.x;
+            let end = start + viewport.size.width;
+            focus.origin.x >= start && focus.max().x <= end
+        }
+    }
 }
 
 fn focused_editable(app: &App, window: WindowId) -> Option<KeyContext> {

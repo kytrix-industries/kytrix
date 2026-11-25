@@ -158,6 +158,14 @@ pub(crate) fn cleanup_removed_subtree(
         before - app.scoped_bindings.len()
     };
     let timers = super::timer::retain_live_scopes(app, window);
+    if app
+        .caret_blink()
+        .owner()
+        .is_some_and(|owner| removed.contains(&owner))
+    {
+        app.caret_blink_mut().release_owner();
+        crate::text_edit::resume_after_owner_release(app);
+    }
     let animations = super::animation::cancel_node_animations(app, window, removed);
     (scoped_key_bindings, timers, animations)
 }
@@ -330,6 +338,10 @@ pub(crate) fn close_window(app: &mut App, id: WindowId) -> bool {
     }
     if let Some(scope) = app.window_scopes.remove(&id) {
         super::signal_api::release_scope(app, scope);
+    }
+    if app.caret_blink().owner().and_then(NodeId::window) == Some(id) {
+        app.caret_blink_mut().release_owner();
+        crate::text_edit::resume_after_owner_release(app);
     }
     true
 }

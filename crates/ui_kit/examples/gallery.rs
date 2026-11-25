@@ -1287,7 +1287,7 @@ impl Gallery {
         );
         multiline.update_value(
             app,
-            "第一行\n第二行\n第三行\n第四行（可视 3 行，溢出滚动由 P3 的 ensure-visible 完成）",
+            "第一行\n第二行\n第三行\n第四行\n第五行\n第六行（可视 3 行：滚轮滚动、caret 移动自动露出、右侧 hover 出现滚动条）",
         );
         inputs.push(multiline);
         themed_label(
@@ -1813,6 +1813,17 @@ impl Gallery {
                         let _ = app.set_focus(window, Some(*node));
                         println!("gallery: probe focused first input node={node:?}");
                         print_input_probe(app, window, &inputs, "focused ");
+                        if let Some(multiline) = inputs.get(3) {
+                            let _ = app.set_focus(window, Some(multiline.editable));
+                            println!(
+                                "gallery: probe focused multiline node={:?}",
+                                multiline.editable
+                            );
+                            print_input_probe(app, window, &inputs, "multiline ");
+                        }
+                        let _ = app.after(window, Duration::from_millis(600), move |app| {
+                            print_input_probe(app, window, &inputs, "blink ");
+                        });
                     }
                 });
             });
@@ -2479,6 +2490,11 @@ fn print_input_probe(app: &App, window: WindowId, inputs: &[InputNode], prefix: 
         return;
     };
     let tree = target.tree();
+    println!(
+        "gallery: probe {prefix}caret_visible={:?} next_wake={:?}",
+        app.text_edit_caret_visible(window),
+        app.next_wake_deadline()
+    );
     for (index, input) in inputs.iter().enumerate() {
         let root = tree.get(input.root).ok().map(|node| node.layout().bounds);
         let editable = tree
@@ -2493,8 +2509,17 @@ fn print_input_probe(app: &App, window: WindowId, inputs: &[InputNode], prefix: 
                 .ok()
         });
         let value = app.text_edit_value(window, input.editable).ok();
+        let scrollbar = input
+            .scrollbar
+            .borrow()
+            .as_ref()
+            .map(|bar| (bar.scrollable(app), bar.thumb_rect(app), bar.opacity(app)));
+        let scroll = app
+            .scroll_handle(window, input.viewport)
+            .and_then(|handle| app.scroll_state(&handle))
+            .map(|state| (state.axis, state.offset, state.viewport, state.content));
         println!(
-            "gallery: probe {prefix}input{index} root={root:?} editable={editable:?} metrics={metrics:?} caret={caret:?} selection={:?} composing={:?} focused={:?} value={value:?}",
+            "gallery: probe {prefix}input{index} root={root:?} editable={editable:?} metrics={metrics:?} caret={caret:?} selection={:?} composing={:?} focused={:?} scroll={scroll:?} scrollbar={scrollbar:?} value={value:?}",
             snapshot.as_ref().map(|snapshot| snapshot.selection.range()),
             snapshot.as_ref().map(|snapshot| snapshot.composing),
             snapshot.as_ref().map(|snapshot| snapshot.focused),

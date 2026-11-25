@@ -125,6 +125,7 @@ pub struct App {
     thresholds: InputThresholds,
     clock: Instant,
     clock_live: bool,
+    caret_blink: crate::text_edit::CaretBlink,
     a11y_delivered: ahash::HashMap<WindowId, Instant>,
     a11y_delivered_round: bool,
     last_click: Option<ClickRecord>,
@@ -381,6 +382,7 @@ impl App {
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
             clock_live: true,
+            caret_blink: crate::text_edit::CaretBlink::new(Instant::now()),
             a11y_delivered: ahash::HashMap::default(),
             a11y_delivered_round: false,
             last_click: None,
@@ -1115,6 +1117,14 @@ impl App {
         scroll::set_scroll_content(self, handle, content)
     }
 
+    pub fn set_scroll_line_height(
+        &mut self,
+        handle: &ScrollHandle,
+        line_height: LogicalPx,
+    ) -> Result<bool, EngineError> {
+        scroll::set_scroll_line_height(self, handle, line_height)
+    }
+
     pub fn scroll_to(
         &mut self,
         handle: &ScrollHandle,
@@ -1309,7 +1319,30 @@ impl App {
         timer::cancel(self, id)
     }
 
-    pub(crate) fn next_wake_deadline(&self) -> Option<Instant> {
+    pub(crate) fn timer_live(&self, id: &TimerId) -> bool {
+        timer::is_live(self, id)
+    }
+
+    #[must_use]
+    pub(crate) fn caret_blink(&self) -> &crate::text_edit::CaretBlink {
+        &self.caret_blink
+    }
+
+    pub(crate) fn caret_blink_mut(&mut self) -> &mut crate::text_edit::CaretBlink {
+        &mut self.caret_blink
+    }
+
+    #[must_use]
+    pub(crate) fn now(&self) -> Instant {
+        if self.clock_live {
+            Instant::now()
+        } else {
+            self.clock
+        }
+    }
+
+    #[must_use]
+    pub fn next_wake_deadline(&self) -> Option<Instant> {
         #[cfg(target_os = "linux")]
         {
             let frames = self
@@ -1754,6 +1787,11 @@ impl App {
         crate::text_edit::focused_node(self, window)
     }
 
+    #[must_use]
+    pub fn text_edit_caret_visible(&self, window: WindowId) -> Option<bool> {
+        crate::text_edit::caret_visible(self, window)
+    }
+
     pub fn text_edit_set_a11y_invalid(
         &mut self,
         window: WindowId,
@@ -1853,12 +1891,18 @@ impl App {
         self.text.shape_count()
     }
 
+    #[must_use]
+    pub(crate) fn focused_window(&self) -> Option<WindowId> {
+        self.focused_window
+    }
+
     pub(crate) fn note_window_focus(&mut self, window: WindowId, focused: bool) {
         if focused {
             self.focused_window = Some(window);
         } else if self.focused_window == Some(window) {
             self.focused_window = None;
         }
+        crate::text_edit::sync_window_focus(self, window, focused);
     }
 
     #[must_use]
@@ -1950,6 +1994,9 @@ mod text_edit_tests;
 
 #[cfg(all(test, feature = "test-support"))]
 mod text_edit_pointer_tests;
+
+#[cfg(all(test, feature = "test-support"))]
+mod text_edit_p3_tests;
 
 #[cfg(test)]
 mod interaction_tests;

@@ -39,16 +39,34 @@ pub(crate) fn viewport(tree: &NodeTree, node: NodeId) -> LogicalRect {
     )
 }
 
+pub(crate) fn scroll_ancestors(
+    tree: &NodeTree,
+    from: NodeId,
+) -> impl Iterator<Item = (NodeId, ScrollSlot)> + '_ {
+    let mut cursor = Some(from);
+    std::iter::from_fn(move || {
+        while let Some(node) = cursor {
+            cursor = tree.get(node).ok().and_then(|target| target.parent());
+            if let Some(slot) = tree.scroll_slot(node) {
+                return Some((node, slot));
+            }
+        }
+        None
+    })
+}
+
 #[must_use]
 pub(crate) fn scroll_ancestor(tree: &NodeTree, from: NodeId) -> Option<(NodeId, ScrollSlot)> {
-    let mut cursor = Some(from);
-    while let Some(node) = cursor {
-        if let Some(slot) = tree.scroll_slot(node) {
-            return Some((node, slot));
-        }
-        cursor = tree.get(node).ok().and_then(|target| target.parent());
-    }
-    None
+    scroll_ancestors(tree, from).next()
+}
+
+#[must_use]
+pub(crate) fn scroll_ancestor_on(
+    tree: &NodeTree,
+    from: NodeId,
+    axis: ScrollAxis,
+) -> Option<(NodeId, ScrollSlot)> {
+    scroll_ancestors(tree, from).find(|(_, slot)| slot.axis == axis)
 }
 
 #[must_use]

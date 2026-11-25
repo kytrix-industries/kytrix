@@ -71,6 +71,31 @@ pub(crate) fn set_scroll_content(
     Ok(())
 }
 
+pub(crate) fn set_scroll_line_height(
+    app: &mut App,
+    handle: &ScrollHandle,
+    line_height: LogicalPx,
+) -> Result<bool, EngineError> {
+    let node = handle.node();
+    if !line_height.is_finite() || line_height <= LogicalPx::ZERO {
+        return Err(EngineError::NotScrollable { node });
+    }
+    let window = handle.window();
+    let Some(target) = app.windows.get_mut(&window) else {
+        return Ok(false);
+    };
+    let Some(slot) = target.tree().scroll_slot(node) else {
+        return Err(EngineError::NotScrollable { node });
+    };
+    if slot.line_height == line_height {
+        return Ok(false);
+    }
+    if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
+        slot.line_height = line_height;
+    }
+    Ok(true)
+}
+
 pub(crate) fn scroll_to(
     app: &mut App,
     handle: &ScrollHandle,

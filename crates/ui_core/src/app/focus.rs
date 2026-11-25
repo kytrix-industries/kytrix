@@ -108,6 +108,7 @@ pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -
     if focus_changed {
         crate::text_edit::cancel_pointer_press(app, window);
     }
+    crate::text_edit::note_focus_change(app, window);
     app.request_frame();
     true
 }

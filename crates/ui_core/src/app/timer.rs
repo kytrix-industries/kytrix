@@ -51,6 +51,13 @@ pub(crate) fn cancel(app: &mut App, id: &TimerId) -> bool {
     app.timers.len() != before
 }
 
+#[must_use]
+pub(crate) fn is_live(app: &App, id: &TimerId) -> bool {
+    app.timers
+        .iter()
+        .any(|timer| timer.window == id.window() && timer.id == id.generation())
+}
+
 pub(crate) fn next_deadline(app: &App) -> Option<Instant> {
     app.timers.iter().map(|timer| timer.deadline).min()
 }

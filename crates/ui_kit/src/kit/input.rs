@@ -11,7 +11,7 @@ use ui_core::{
     app::App,
     event::Action,
     interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
-    math::{LogicalPx, LogicalSize, px},
+    math::{LogicalPoint, LogicalPx, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         color::Color,
@@ -35,6 +35,12 @@ use crate::{
 };
 
 const CORNER_RADIUS: f32 = 4.0;
+
+const SCROLLBAR_GUTTER: f32 = 6.0;
+
+const SCROLLBAR_FOCUS_OPACITY: f32 = 0.5;
+
+const SINGLE_LINE_TRAILING_INSET: f32 = 5.0;
 
 #[derive(Clone, Debug)]
 pub struct InputSpec {
@@ -370,9 +376,15 @@ pub fn build(
         .expect("input: viewport mounts under the fresh root");
 
     let mut editable_style = match axis {
-        FieldAxis::SingleLine => StyleBuilder::new().flex_none().height_full().build(),
+        FieldAxis::SingleLine => StyleBuilder::new()
+            .flex_none()
+            .height_full()
+            .padding_sides(px(0.0), px(SINGLE_LINE_TRAILING_INSET), px(0.0), px(0.0))
+            .build(),
         FieldAxis::Multiline => {
-            let mut style = StyleBuilder::new().width_full().build();
+            let mut style = StyleBuilder::new()
+                .margin_sides(px(0.0), px(SCROLLBAR_GUTTER), px(0.0), px(0.0))
+                .build();
             style.flex(0.0, 0.0, Dimension::auto());
             style
         }
@@ -494,6 +506,7 @@ impl InputNode {
         self.refresh_mirror(app, window, self.too_long_error(value));
         if changed {
             *self.last_placeholder.borrow_mut() = app.read(&self.placeholder_state).clone();
+            self.reset_horizontal_scroll(app);
             let _ = app.request_repaint(window);
         }
         changed
@@ -610,7 +623,7 @@ impl InputNode {
         changed |= self.sync_placeholder(app, window);
         changed |= self.sync_layout(app, window);
         changed |= self.sync_invalid(app, window);
-        changed |= self.sync_scroll(app, window);
+        changed |= self.sync_scroll(app, window, snapshot.focused);
         changed |= self.sync_clear_button(app);
         if blur_submit && let Some(submit) = &self.spec.submit {
             changed |= app.dispatch_action(
@@ -637,26 +650,38 @@ impl InputNode {
     }
 
     fn install_scroll(&self, app: &mut App, window: WindowId) {
-        if FieldAxis::of(&self.spec) == FieldAxis::SingleLine {
-            return;
-        }
-        let config = ScrollConfig {
-            axis: ScrollAxis::Vertical,
-            line_height: self.metrics.get().map_or_else(
-                || self.theme.tokens().for_size(self.spec.size).font_size,
-                |metrics| metrics.line_height,
-            ),
+        let tokens = self.theme.tokens();
+        let size = tokens.for_size(self.spec.size);
+        let axis = FieldAxis::of(&self.spec);
+        let config = match axis {
+            FieldAxis::SingleLine => ScrollConfig {
+                axis: ScrollAxis::Horizontal,
+                line_height: size.font_size,
+            },
+            FieldAxis::Multiline => ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: self
+                    .metrics
+                    .get()
+                    .map_or_else(|| size.font_size, |metrics| metrics.line_height),
+            },
         };
         let Ok(handle) = app.make_scroll(window, self.viewport, config) else {
             return;
         };
         self.scroll_handle.set(Some(handle));
+        if axis == FieldAxis::SingleLine {
+            return;
+        }
         let scrollbar = ScrollBar::new(
             app,
             self.theme.clone(),
             format_smolstr!("{}.scrollbar", self.spec.name),
             scrollbar_axis(ScrollAxis::Vertical),
-            ScrollbarOptions::default().hover(),
+            ScrollbarOptions::default()
+                .hover()
+                .inset(size.padding_x)
+                .focus_opacity(SCROLLBAR_FOCUS_OPACITY),
         );
         let built = app
             .window_mut(window)
@@ -785,11 +810,14 @@ impl InputNode {
             .unwrap_or(false)
     }
 
-    fn sync_scroll(&self, app: &mut App, window: WindowId) -> bool {
+    fn sync_scroll(&self, app: &mut App, window: WindowId, focused: bool) -> bool {
         let Some(handle) = self.scroll_handle.get() else {
             return false;
         };
         let mut changed = false;
+        if let Some(metrics) = self.metrics.get() {
+            let _ = app.set_scroll_line_height(&handle, metrics.line_height);
+        }
         let content = {
             let Some(target) = app.window(window) else {
                 return false;
@@ -820,9 +848,23 @@ impl InputNode {
             changed = true;
         }
         if let Some(scrollbar) = self.scrollbar.borrow().as_ref() {
+            changed |= scrollbar.set_focused(app, focused);
             changed |= scrollbar.sync(app).unwrap_or(false);
         }
         changed
+    }
+
+    fn reset_horizontal_scroll(&self, app: &mut App) {
+        let Some(handle) = self.scroll_handle.get() else {
+            return;
+        };
+        let Some(state) = app.scroll_state(&handle) else {
+            return;
+        };
+        if state.axis != ScrollAxis::Horizontal || state.offset.x == LogicalPx::ZERO {
+            return;
+        }
+        let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), state.offset.y));
     }
 
     fn sync_clear_button(&self, app: &mut App) -> bool {
@@ -936,8 +978,8 @@ mod tests {
         a11y::{A11yRole, A11yTextSelection},
         app::App,
         event::{Action, ImeEvent, InputEvent, KeyCode, Modifiers, PointerButton},
-        interaction::{ScrollConfig, ScrollHandle},
-        math::{LogicalPoint, LogicalSize, px},
+        interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
+        math::{LogicalPoint, LogicalPx, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeKind},
         paint::{
             color::{Color, ColorResolver},
@@ -2451,5 +2493,271 @@ mod tests {
         assert!(!state.can_redo());
         assert_eq!(state.error(), None);
         assert_eq!(state.generation, 0);
+    }
+
+    fn settle(harness: &mut Harness) {
+        for _ in 0..10 {
+            harness.app.advance(std::time::Duration::from_millis(20));
+            harness.drain();
+        }
+    }
+
+    fn node_bounds(harness: &Harness, node: NodeId) -> ui_core::math::LogicalRect {
+        harness.app.probe().bounds(node).expect("节点已布局")
+    }
+
+    fn vertical_handle(harness: &Harness) -> ScrollHandle {
+        let window = harness.window();
+        harness
+            .app
+            .app()
+            .scroll_handle(window, harness.node.viewport)
+            .expect("多行 viewport 有滚动槽")
+    }
+
+    #[test]
+    fn visible_lines_sizes_the_field_and_the_overlay_scrollbar_together() {
+        let mut harness = harness(multiline_spec(Some(3)), "one\ntwo\nthree\nfour\nfive\nsix");
+        harness.drain();
+        harness.drain();
+        let metrics = harness.metrics();
+        let tokens = harness.theme.tokens();
+        let size = tokens.for_size(ControlSize::Small);
+        let expected_height = 3.0 * metrics.line_height.value()
+            + 2.0 * (tokens.border_width.value() + size.padding_x.value());
+        assert!(
+            (harness.root_bounds().size.height.value() - expected_height).abs() < 0.5,
+            "3 行高度={expected_height}，实际 {}",
+            harness.root_bounds().size.height.value()
+        );
+
+        let viewport = node_bounds(&harness, harness.node.viewport);
+        let editable = harness.editable_bounds();
+        assert!(
+            (editable.size.width.value() - (viewport.size.width.value() - 6.0)).abs() < 0.5,
+            "文本节点宽度 = viewport - 6px gutter：{} vs {}",
+            editable.size.width.value(),
+            viewport.size.width.value()
+        );
+
+        let bar = harness
+            .node
+            .scrollbar
+            .borrow()
+            .clone()
+            .expect("多行溢出时存在滚动条");
+        assert!(bar.scrollable(harness.app.app()), "内容 6 行 > 可视 3 行");
+        let (track, _) = bar.nodes();
+        let track = node_bounds(&harness, track.expect("轨道"));
+        assert!((track.size.width.value() - 4.0).abs() < 0.01, "4px overlay");
+        assert!(
+            (track.size.height.value() - viewport.size.height.value()).abs() < 0.5,
+            "轨道高度 = viewport：{} vs {}",
+            track.size.height.value(),
+            viewport.size.height.value()
+        );
+        assert!(
+            (track.origin.y - viewport.origin.y).value().abs() < 0.5
+                && (track.max().x - viewport.max().x).value().abs() < 0.5,
+            "轨道贴 viewport 右侧内边缘：{track:?} vs {viewport:?}"
+        );
+
+        let state = harness
+            .app
+            .app()
+            .scroll_state(&vertical_handle(&harness))
+            .expect("滚动状态");
+        let thumb = bar.thumb_rect(harness.app.app()).expect("thumb");
+        let expected_thumb =
+            track.size.height * (state.viewport.height.value() / state.content.height.value());
+        assert!(
+            (thumb.size.height - expected_thumb).value().abs() < 0.5,
+            "thumb 高度 = viewport/content × track：{:?} vs {expected_thumb:?}",
+            thumb.size.height
+        );
+        assert!(state.content.height > state.viewport.height);
+    }
+
+    #[test]
+    fn focusing_an_overflowing_multiline_keeps_the_scrollbar_semi_visible() {
+        let mut harness = harness(multiline_spec(Some(3)), "one\ntwo\nthree\nfour\nfive\nsix");
+        harness.drain();
+        settle(&mut harness);
+        let bar = harness.node.scrollbar.borrow().clone().expect("滚动条");
+        assert_eq!(bar.opacity(harness.app.app()), 0.0, "未聚焦未悬停时隐藏");
+
+        harness.focus();
+        settle(&mut harness);
+        let focused = bar.opacity(harness.app.app());
+        assert!(
+            (focused - 0.5).abs() < 0.01,
+            "聚焦时常驻低不透明度（0.5），实际 {focused}"
+        );
+
+        harness.blur();
+        settle(&mut harness);
+        assert_eq!(bar.opacity(harness.app.app()), 0.0, "失焦后淡出");
+
+        let (track, _) = bar.nodes();
+        let track = node_bounds(&harness, track.expect("轨道"));
+        let hover = LogicalPoint::new(
+            track.origin.x + track.size.width * 0.5,
+            track.origin.y + track.size.height * 0.5,
+        );
+        let _ = harness.app.inject(ui_core::event::InputEvent::pointer_move(
+            hover,
+            ui_core::event::Modifiers::empty(),
+        ));
+        settle(&mut harness);
+        assert!(
+            bar.opacity(harness.app.app()) >= 0.99,
+            "hover 时淡入到 1.0，实际 {}",
+            bar.opacity(harness.app.app())
+        );
+    }
+
+    #[test]
+    fn the_overlay_scrollbar_never_covers_the_glyphs() {
+        let mut harness = harness(multiline_spec(Some(3)), &"word ".repeat(40));
+        harness.app.invalidate_all_lanes();
+        harness.drain();
+        let editable = harness.editable_bounds();
+        let bar = harness.node.scrollbar.borrow().clone().expect("滚动条");
+        let (track, _) = bar.nodes();
+        let track = node_bounds(&harness, track.expect("轨道"));
+        let glyph_right = harness
+            .app
+            .rendered()
+            .expect("已提交")
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                primitive.node == harness.node.editable && primitive.kind == PrimitiveKind::GlyphRun
+            })
+            .map(|primitive| primitive.bounds.max().x)
+            .fold(px(0.0), LogicalPx::max);
+        assert!(
+            editable.max().x <= track.origin.x + 0.5,
+            "文本节点（含 gutter）不得伸入滚动条：{editable:?} vs {track:?}"
+        );
+        assert!(
+            glyph_right <= track.origin.x + 0.5,
+            "字形不得被滚动条覆盖：{glyph_right:?} vs {track:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_line_field_scrolls_horizontally_without_a_scrollbar() {
+        let mut harness = harness(spec(), "");
+        harness
+            .node
+            .update_value(harness.app.app_mut(), "0123456789".repeat(40).as_str());
+        harness.drain();
+        assert!(
+            harness.node.scrollbar.borrow().is_none(),
+            "单行不建 ScrollBar（结构不变）"
+        );
+        let window = harness.window();
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(window, harness.node.viewport)
+            .expect("单行 viewport 有水平滚动槽");
+        let state = harness.app.app().scroll_state(&handle).expect("滚动状态");
+        assert_eq!(state.axis, ScrollAxis::Horizontal);
+        let tree = harness.app.app().window(window).expect("窗口").tree();
+        assert_eq!(
+            tree.get(harness.node.root).expect("root").children().len(),
+            1,
+            "单行 root 只有 viewport，不新增 overlay 结构"
+        );
+    }
+
+    #[test]
+    fn update_value_resets_the_single_line_horizontal_offset() {
+        let mut harness = harness(spec(), "");
+        let long = "0123456789".repeat(60);
+        harness.node.update_value(harness.app.app_mut(), &long);
+        harness.drain();
+        harness.focus();
+        harness.drain();
+        let window = harness.window();
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(window, harness.node.viewport)
+            .expect("水平滚动槽");
+        let revealed = harness
+            .app
+            .app()
+            .scroll_state(&handle)
+            .expect("滚动状态")
+            .offset
+            .x;
+        assert!(
+            revealed > px(0.0),
+            "末尾 caret 必须横向 reveal：{revealed:?}"
+        );
+
+        harness.node.update_value(harness.app.app_mut(), "");
+        harness.drain();
+        assert_eq!(
+            harness
+                .app
+                .app()
+                .scroll_state(&handle)
+                .expect("滚动状态")
+                .offset
+                .x,
+            px(0.0),
+            "清空值后水平偏移归零"
+        );
+        assert_eq!(harness.engine_value(), "");
+        assert_eq!(harness.text(), "");
+    }
+
+    #[test]
+    fn dragging_a_multiline_scrolls_by_the_engine_line_height() {
+        let mut harness = harness(multiline_spec(Some(3)), "one\ntwo\nthree\nfour\nfive\nsix");
+        harness.drain();
+        harness.drain();
+        let metrics = harness.metrics();
+        let tokens = harness.theme.tokens();
+        let font_size = tokens.for_size(ControlSize::Small).font_size;
+        assert!(
+            metrics.line_height > font_size,
+            "前置：真实行高必须大于字号（否则回退不可判别）：{} vs {font_size:?}",
+            metrics.line_height
+        );
+        let window = harness.window();
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(window, harness.node.viewport)
+            .expect("多行滚动槽");
+        let viewport = node_bounds(&harness, harness.node.viewport);
+        let start = LogicalPoint::new(viewport.origin.x + px(10.0), viewport.origin.y + px(5.0));
+        let _ = harness.app.inject(InputEvent::pointer_down(
+            start,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let far = LogicalPoint::new(start.x, viewport.max().y + px(40.0));
+        let _ = harness
+            .app
+            .inject(InputEvent::pointer_move(far, Modifiers::empty()));
+        let offset = harness
+            .app
+            .app()
+            .scroll_state(&handle)
+            .expect("滚动状态")
+            .offset
+            .y;
+        assert!(
+            (offset - metrics.line_height * 2.0).value().abs() <= 0.5,
+            "拖拽自动滚动步长上限必须是 2×引擎行高（{}），实际 {offset:?}（字号回退会是 {:?}）",
+            metrics.line_height * 2.0,
+            font_size * 2.0
+        );
     }
 }

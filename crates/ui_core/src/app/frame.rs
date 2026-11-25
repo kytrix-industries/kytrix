@@ -95,6 +95,7 @@ pub(crate) fn frame(
         .windows
         .get(&window)
         .is_some_and(Window::a11y_only_frame)
+        && !crate::text_edit::reveal_pending(app, window)
     {
         crate::text_edit::sync_ime_cursor_area(app, window);
         app.abort_frame(window, ticket);
@@ -192,6 +193,8 @@ pub(crate) fn frame(
     if resolution.evicted || resolution.pending {
         app.request_frame();
     }
+    crate::text_edit::ensure_visible(app, window);
+    crate::text_edit::sync_blink(app, window);
     crate::text_edit::sync_ime_cursor_area(app, window);
     app.upload_atlas_pages();
     let painted = {
