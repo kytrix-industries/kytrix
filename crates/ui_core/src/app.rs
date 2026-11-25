@@ -1740,6 +1740,14 @@ impl App {
         crate::text_edit::set_label(self, window, node, label.into())
     }
 
+    pub fn text_edit_placeholder_color(
+        &self,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<Color, EngineError> {
+        crate::text_edit::placeholder_color(self, window, node)
+    }
+
     pub fn text_edit_set_a11y_invalid(
         &mut self,
         window: WindowId,

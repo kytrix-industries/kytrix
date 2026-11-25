@@ -1682,6 +1682,22 @@ pub(crate) fn value(app: &App, window: WindowId, node: NodeId) -> Result<SmolStr
     Ok(SmolStr::new(editable.committed()))
 }
 
+pub(crate) fn placeholder_color(
+    app: &App,
+    window: WindowId,
+    node: NodeId,
+) -> Result<Color, EngineError> {
+    let tree = app
+        .window(window)
+        .ok_or(EngineError::UnknownWindow { window })?
+        .tree();
+    validate_node(tree, window, node)?;
+    let editable = tree
+        .editable(node)
+        .ok_or(EngineError::TextEditNotAvailable { node })?;
+    Ok(editable.spec().placeholder_color)
+}
+
 pub(crate) fn snapshot(
     app: &App,
     window: WindowId,
@@ -2915,6 +2931,11 @@ fn ready_layout_width(tree: &NodeTree, node: NodeId) -> Result<LogicalPx, Engine
     tree.text_laid_width(node).ok_or_else(|| layout_error(node))
 }
 
+#[must_use]
+pub fn sanitize_text(text: &str, multiline: bool) -> SmolStr {
+    sanitize(text, multiline)
+}
+
 fn sanitize(text: &str, multiline: bool) -> SmolStr {
     let mut builder = SmolStrBuilder::new();
     for ch in text.chars() {
@@ -3645,8 +3666,8 @@ mod tests {
 
     use super::{
         DisplayText, EditableSpec, EditableText, MASK_GLYPH, SelectionBase, TextAffinity,
-        TextCursor, TextSelection, byte_offset_for_utf16, sanitize, snap_caret_forward,
-        splice_preedit, truncate_graphemes,
+        TextCursor, TextSelection, byte_offset_for_utf16, sanitize, sanitize_text,
+        snap_caret_forward, splice_preedit, truncate_graphemes,
     };
     use crate::{a11y::A11yRole, event::Action, math::px, paint::color::Color, text::TextStyle};
 
@@ -3692,6 +3713,14 @@ mod tests {
         assert_eq!(selection.focus().byte, 7);
         assert_eq!(selection.anchor().affinity, TextAffinity::Downstream);
         assert_eq!(selection.range(), 7..7);
+    }
+
+    #[test]
+    fn sanitize_text_exposes_the_input_cleaning_rule() {
+        assert_eq!(sanitize_text("a\u{8}b\u{1b}c", false), "abc");
+        assert_eq!(sanitize_text("a\tb\nc\r\nd", false), "abcd");
+        assert_eq!(sanitize_text("a\tb\nc\r\nd", true), "ab\nc\nd");
+        assert_eq!(sanitize_text("e\u{301}👍🏽", true), "e\u{301}👍🏽");
     }
 
     #[test]
