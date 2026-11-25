@@ -1468,6 +1468,14 @@ impl EditableText {
         true
     }
 
+    fn set_label(&mut self, label: SmolStr) -> bool {
+        if self.spec.label == label {
+            return false;
+        }
+        self.spec.label = label;
+        true
+    }
+
     fn set_color(&mut self, slot: EditableColorSlot, color: Color) -> bool {
         let target = match slot {
             EditableColorSlot::Caret => &mut self.spec.caret_color,
@@ -1764,6 +1772,35 @@ pub(crate) fn set_value(
         }
     }
     if touched {
+        app.request_frame();
+    }
+    Ok(changed)
+}
+
+pub(crate) fn set_label(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    label: SmolStr,
+) -> Result<bool, EngineError> {
+    let changed = {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        validate_node(tree, window, node)?;
+        let Some(editable) = tree.editable_mut(node) else {
+            return Err(EngineError::TextEditNotAvailable { node });
+        };
+        editable.set_label(label)
+    };
+    if changed {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        tree.mark_a11y(node);
+        sync_a11y_patch(tree, node);
         app.request_frame();
     }
     Ok(changed)
@@ -3655,6 +3692,21 @@ mod tests {
         assert_eq!(selection.focus().byte, 7);
         assert_eq!(selection.anchor().affinity, TextAffinity::Downstream);
         assert_eq!(selection.range(), 7..7);
+    }
+
+    #[test]
+    fn label_setter_updates_the_spec_and_patch() {
+        let mut editable = EditableText::new(spec());
+        assert_eq!(editable.a11y_patch().label, None);
+        assert!(editable.set_label(SmolStr::new_static("Search")));
+        assert_eq!(editable.spec().label, "Search");
+        assert_eq!(
+            editable.a11y_patch().label,
+            Some(SmolStr::new_static("Search"))
+        );
+        assert!(!editable.set_label(SmolStr::new_static("Search")));
+        assert!(editable.set_label(SmolStr::new_static("")));
+        assert_eq!(editable.a11y_patch().label, None);
     }
 
     #[test]

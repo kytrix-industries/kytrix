@@ -1731,6 +1731,15 @@ impl App {
         crate::text_edit::set_placeholder(self, window, node, placeholder)
     }
 
+    pub fn text_edit_set_label(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        label: impl Into<smol_str::SmolStr>,
+    ) -> Result<bool, EngineError> {
+        crate::text_edit::set_label(self, window, node, label.into())
+    }
+
     pub fn text_edit_set_a11y_invalid(
         &mut self,
         window: WindowId,
