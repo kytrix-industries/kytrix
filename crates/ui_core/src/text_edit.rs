@@ -290,6 +290,14 @@ impl TextSelection {
         self.anchor == other.anchor && self.focus == other.focus && self.base == other.base
     }
 
+    #[must_use]
+    pub fn collapsed_at(byte: usize) -> Self {
+        Self::collapsed(TextCursor {
+            byte,
+            affinity: TextAffinity::Downstream,
+        })
+    }
+
     pub fn anchor(&self) -> TextCursor {
         self.anchor
     }
@@ -949,6 +957,7 @@ pub(crate) struct EditableText {
     composition: Option<Composition>,
     placeholder: Option<PlaceholderText>,
     focused: bool,
+    invalid: bool,
     a11y_value: SmolStr,
     generation: u64,
     snapshot: TextEditSnapshot,
@@ -979,6 +988,7 @@ impl EditableText {
             composition: None,
             placeholder: None,
             focused: false,
+            invalid: false,
             a11y_value: SmolStr::default(),
             generation: 0,
             graphemes: 0,
@@ -1335,6 +1345,7 @@ impl EditableText {
             value: Some(self.a11y_value.clone()),
             read_only: Some(self.spec.readonly),
             disabled: Some(self.spec.disabled),
+            invalid: Some(self.invalid),
             ..A11yPatch::default()
         }
     }
@@ -1469,6 +1480,14 @@ impl EditableText {
         }
         self.spec.text_style = style;
         self.placeholder = None;
+        true
+    }
+
+    fn set_invalid(&mut self, invalid: bool) -> bool {
+        if self.invalid == invalid {
+            return false;
+        }
+        self.invalid = invalid;
         true
     }
 
@@ -1766,6 +1785,35 @@ pub(crate) fn set_placeholder(
         let tree = target.tree_mut();
         refresh_display_text(tree, node)?;
         tree.mark_paint(node);
+        tree.mark_a11y(node);
+        sync_a11y_patch(tree, node);
+        app.request_frame();
+    }
+    Ok(changed)
+}
+
+pub(crate) fn set_a11y_invalid(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    invalid: bool,
+) -> Result<bool, EngineError> {
+    let changed = {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        validate_node(tree, window, node)?;
+        let Some(editable) = tree.editable_mut(node) else {
+            return Err(EngineError::TextEditNotAvailable { node });
+        };
+        editable.set_invalid(invalid)
+    };
+    if changed {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
         tree.mark_a11y(node);
         sync_a11y_patch(tree, node);
         app.request_frame();
@@ -3510,6 +3558,27 @@ mod tests {
         let mut editable = EditableText::new(masked_spec(None));
         editable.assign_committed(text);
         editable
+    }
+
+    #[test]
+    fn collapsed_at_builds_a_downstream_caret_selection() {
+        let selection = TextSelection::collapsed_at(7);
+        assert!(selection.is_collapsed());
+        assert_eq!(selection.anchor().byte, 7);
+        assert_eq!(selection.focus().byte, 7);
+        assert_eq!(selection.anchor().affinity, TextAffinity::Downstream);
+        assert_eq!(selection.range(), 7..7);
+    }
+
+    #[test]
+    fn invalid_flag_reaches_the_a11y_patch() {
+        let mut editable = EditableText::new(spec());
+        assert_eq!(editable.a11y_patch().invalid, Some(false));
+        assert!(editable.set_invalid(true));
+        assert_eq!(editable.a11y_patch().invalid, Some(true));
+        assert!(!editable.set_invalid(true));
+        assert!(editable.set_invalid(false));
+        assert_eq!(editable.a11y_patch().invalid, Some(false));
     }
 
     #[test]
