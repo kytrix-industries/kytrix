@@ -99,6 +99,7 @@ pub(crate) fn atlas_page_matches(
 ) -> bool {
     match kind {
         AtlasKind::Glyph => window.glyph_page_received == Some(spec.page),
+        AtlasKind::ColorGlyph => window.color_glyph_page_received == Some(spec.page),
         AtlasKind::Image => window.image_page_received == Some(spec),
     }
 }
@@ -110,6 +111,7 @@ pub(crate) fn mark_atlas_page_received(
 ) {
     match kind {
         AtlasKind::Glyph => window.glyph_page_received = Some(spec.page),
+        AtlasKind::ColorGlyph => window.color_glyph_page_received = Some(spec.page),
         AtlasKind::Image => window.image_page_received = Some(spec),
     }
 }
@@ -125,6 +127,10 @@ pub(crate) fn mark_atlas_page_stale(window: &mut Window, kind: AtlasKind) {
         AtlasKind::Glyph => {
             window.glyph_page_received = None;
             window.glyph_atlas_rects.clear();
+        }
+        AtlasKind::ColorGlyph => {
+            window.color_glyph_page_received = None;
+            window.color_glyph_atlas_rects.clear();
         }
         AtlasKind::Image => {
             window.image_page_received = None;
@@ -148,13 +154,14 @@ pub(crate) fn atlas_rects(
     );
     match kind {
         AtlasKind::Glyph => &window.glyph_atlas_rects,
+        AtlasKind::ColorGlyph => &window.color_glyph_atlas_rects,
         AtlasKind::Image => &window.image_atlas_rects[usize::from(layer)],
     }
 }
 
 fn per_window_layer_slots(kind: AtlasKind) -> u32 {
     match kind {
-        AtlasKind::Glyph => 1,
+        AtlasKind::Glyph | AtlasKind::ColorGlyph => 1,
         AtlasKind::Image => u32::from(crate::paint::atlas::MAX_IMAGE_PAGES),
     }
 }
@@ -170,6 +177,7 @@ pub(crate) fn atlas_rects_mut(
     );
     match kind {
         AtlasKind::Glyph => &mut window.glyph_atlas_rects,
+        AtlasKind::ColorGlyph => &mut window.color_glyph_atlas_rects,
         AtlasKind::Image => &mut window.image_atlas_rects[usize::from(layer)],
     }
 }
@@ -181,6 +189,7 @@ pub(crate) fn clear_atlas_rects(window: &mut Window, kind: AtlasKind, layer: u16
 pub(crate) fn clear_all_atlas_rects(window: &mut Window, kind: AtlasKind) {
     match kind {
         AtlasKind::Glyph => window.glyph_atlas_rects.clear(),
+        AtlasKind::ColorGlyph => window.color_glyph_atlas_rects.clear(),
         AtlasKind::Image => {
             for rects in &mut window.image_atlas_rects {
                 rects.clear();
@@ -191,6 +200,7 @@ pub(crate) fn clear_all_atlas_rects(window: &mut Window, kind: AtlasKind) {
 
 pub(crate) fn atlas_rects_pending(window: &Window) -> bool {
     !window.glyph_atlas_rects.is_empty()
+        || !window.color_glyph_atlas_rects.is_empty()
         || window
             .image_atlas_rects
             .iter()
@@ -318,10 +328,12 @@ pub(crate) fn enable_offscreen_renderer(window: &mut Window) -> Result<(), Engin
 
 fn reset_atlas_accounting(window: &mut Window) {
     window.glyph_page_received = None;
+    window.color_glyph_page_received = None;
     window.image_page_received = None;
     window.image_layers_received = [false; crate::paint::atlas::MAX_IMAGE_PAGES as usize];
     window.image_drawable_layers = 0;
     window.glyph_atlas_rects = crate::render::DirtyRects::default();
+    window.color_glyph_atlas_rects = crate::render::DirtyRects::default();
     window.image_atlas_rects = std::array::from_fn(|_| crate::render::DirtyRects::default());
 }
 

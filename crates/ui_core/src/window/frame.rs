@@ -387,7 +387,7 @@ pub(crate) fn frame(window: &mut Window) -> Result<FrameOutcome, EngineError> {
     static NO_GEOMETRY: std::sync::OnceLock<crate::paint::geometry_store::GeometryStore> =
         std::sync::OnceLock::new();
     let geometry = NO_GEOMETRY.get_or_init(crate::paint::geometry_store::GeometryStore::new);
-    let report = match window.paint_frame(geometry, None, None) {
+    let report = match window.paint_frame(geometry, None, None, None) {
         Ok(report) => report,
         Err(error) => {
             window.abort_frame(ticket);

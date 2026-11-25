@@ -704,7 +704,7 @@ unsafe impl Send for SendLayer {}
 struct Shared {
     state: Mutex<State>,
     work: Condvar,
-    atlas_pending: [AtomicU32; 2],
+    atlas_pending: [AtomicU32; 3],
     pacing_paused: AtomicBool,
     in_flight: Arc<InFlight>,
 }
@@ -775,6 +775,7 @@ struct Completion {
 struct AtlasSlots {
     glyph: Option<AtlasUpload>,
     image: [Option<AtlasUpload>; MAX_IMAGE_PAGES as usize],
+    color_glyph: Option<AtlasUpload>,
 }
 
 struct AtlasUpload {
@@ -790,6 +791,7 @@ impl AtlasSlots {
         Self {
             glyph: None,
             image: [const { None }; MAX_IMAGE_PAGES as usize],
+            color_glyph: None,
         }
     }
 
@@ -808,6 +810,7 @@ impl AtlasSlots {
         let slot = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image[usize::from(layer)],
+            AtlasKind::ColorGlyph => &mut self.color_glyph,
         };
         assert!(
             slot.is_none(),
@@ -823,8 +826,9 @@ impl AtlasSlots {
     }
 
     fn take(&mut self) -> Vec<AtlasUpload> {
-        let mut uploads = Vec::with_capacity(1 + usize::from(MAX_IMAGE_PAGES));
+        let mut uploads = Vec::with_capacity(2 + usize::from(MAX_IMAGE_PAGES));
         uploads.extend(self.glyph.take());
+        uploads.extend(self.color_glyph.take());
         uploads.extend(self.image.iter_mut().filter_map(Option::take));
         uploads
     }
@@ -881,7 +885,7 @@ impl Shared {
         Self {
             state: Mutex::new(State::new()),
             work: Condvar::new(),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
             pacing_paused: AtomicBool::new(true),
             in_flight,
         }
@@ -1205,7 +1209,7 @@ fn gpu_loop(mut renderer: GpuRenderer, shared: Arc<Shared>, _keep_alive: SendLay
     let mut feedback = FeedbackQueue::new();
     let mut surface = SurfaceMismatch::new();
     let mut frontier: Option<FrameIndex> = None;
-    let mut atlas_awaiting = [false; 2];
+    let mut atlas_awaiting = [false; 3];
     loop {
         if let Some(linear) = shared.take_background() {
             renderer.set_background_color(linear);
@@ -1242,7 +1246,7 @@ fn frame_tick(
     feedback: &mut FeedbackQueue,
     frontier: &mut Option<FrameIndex>,
     surface: &mut SurfaceMismatch,
-    atlas_awaiting: &mut [bool; 2],
+    atlas_awaiting: &mut [bool; 3],
 ) -> ControlFlow<()> {
     #[cfg(any(test, feature = "test-support"))]
     if shared.has_pending_frame()
@@ -1332,11 +1336,7 @@ fn frame_tick(
         Ok((stats, samples)) => {
             for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
                 if std::mem::take(awaiting) {
-                    shared.atlas_uploaded(if index == 0 {
-                        AtlasKind::Glyph
-                    } else {
-                        AtlasKind::Image
-                    });
+                    shared.atlas_uploaded(crate::paint::atlas::ATLAS_KINDS[index]);
                 }
             }
             feedback.push(

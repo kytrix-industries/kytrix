@@ -66,7 +66,7 @@ impl Canvas {
         debug_assert!(
             run.glyphs
                 .iter()
-                .all(|glyph| glyph.tile.atlas == AtlasKind::Glyph && glyph.tile.page == 0),
+                .all(|glyph| glyph.tile.atlas.is_glyph() && glyph.tile.page == 0),
             "glyph run contains a tile from a non-glyph atlas or non-zero layer"
         );
         self.lane.push(Primitive::GlyphRun(run));

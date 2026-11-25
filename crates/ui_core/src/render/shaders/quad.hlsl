@@ -51,6 +51,9 @@ float4 ps_main(VsOut input) : SV_Target {
     if (kind == KYTRIX_KIND_GLYPH) {
         float coverage = glyph_atlas.Sample(atlas_sampler, float3(input.uv, 0.0)).r;
         color = p.color0 * coverage;
+    } else if (kind == KYTRIX_KIND_COLOR_GLYPH) {
+        float4 texel = color_glyph_atlas.Sample(atlas_sampler, float3(input.uv, 0.0));
+        color = float4(texel.rgb * texel.a, texel.a);
     } else if (kind == KYTRIX_KIND_IMAGE) {
         color = image_atlas.Sample(atlas_sampler, float3(input.uv, (float)(uint)p.params1.y))
                 * p.color0;

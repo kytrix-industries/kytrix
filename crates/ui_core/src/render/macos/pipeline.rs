@@ -88,12 +88,7 @@ impl PipelineLayout {
     pub(crate) fn for_geometry(pipeline: GeometryPipeline) -> Self {
         match pipeline {
             GeometryPipeline::Ui => Self::GeometryUi,
-            GeometryPipeline::Textured {
-                atlas: AtlasKind::Image,
-            } => Self::GeometryTextured(AtlasKind::Image),
-            GeometryPipeline::Textured {
-                atlas: AtlasKind::Glyph,
-            } => Self::GeometryTextured(AtlasKind::Glyph),
+            GeometryPipeline::Textured { atlas } => Self::GeometryTextured(atlas),
         }
     }
 
@@ -120,7 +115,7 @@ impl PipelineLayout {
             Self::GeometryTextured(AtlasKind::Image) => {
                 (GEOMETRY_METALLIB, "vs_textured", "ps_textured_image")
             }
-            Self::GeometryTextured(AtlasKind::Glyph) => {
+            Self::GeometryTextured(AtlasKind::Glyph | AtlasKind::ColorGlyph) => {
                 (GEOMETRY_METALLIB, "vs_textured", "ps_textured_glyph")
             }
         }
@@ -201,7 +196,7 @@ impl PipelineSet {
                 atlas: AtlasKind::Image,
             } => &self.geometry_image,
             GeometryPipeline::Textured {
-                atlas: AtlasKind::Glyph,
+                atlas: AtlasKind::Glyph | AtlasKind::ColorGlyph,
             } => &self.geometry_glyph,
         }
     }

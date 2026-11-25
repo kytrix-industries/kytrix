@@ -453,6 +453,7 @@ impl ShapedText {
                 ShapedLine::empty(
                     self.text.clone(),
                     ctx.generation,
+                    ctx.glyph_atlas.color_generation(),
                     self.font_stack_version,
                     ctx.scale,
                 ),
@@ -516,6 +517,7 @@ impl ShapedText {
             line_offset,
         )?;
         shaped.font_stack_version = self.font_stack_version;
+        shaped.color_atlas_generation = ctx.glyph_atlas.color_generation();
         Ok((shaped, diagnostics, ctx.glyph_atlas.take_stats()))
     }
 
@@ -1140,7 +1142,7 @@ fn rasterize_parley(
                                 text_range: item_range.clone(),
                             });
                         }
-                        let Some((positioned, color_glyph)) = emit_glyph(
+                        let Some((positioned, color_monochrome)) = emit_glyph(
                             ctx,
                             &font,
                             glyph.id,
@@ -1152,12 +1154,12 @@ fn rasterize_parley(
                         else {
                             continue;
                         };
-                        if color_glyph {
-                            diagnostics.push(TextDiagnostic::ColorGlyphMonochrome {
-                                font: font_label(&font),
-                                glyph: glyph.id,
-                                text_range: item_range.clone(),
-                            });
+                        if color_monochrome {
+                            diagnostics.push(color_glyph_monochrome_diagnostic(
+                                &font,
+                                glyph.id,
+                                item_range.clone(),
+                            ));
                         }
                         glyphs.push(positioned);
                     }
@@ -1203,10 +1205,23 @@ fn rasterize_parley(
         height: px(layout.height()),
         first_baseline: layout.first_baseline().map(px),
         atlas_generation: ctx.generation,
+        color_atlas_generation: ctx.glyph_atlas.color_generation(),
         font_stack_version: 0,
         scale: ctx.scale,
     };
     Ok((shaped, diagnostics))
+}
+
+fn color_glyph_monochrome_diagnostic(
+    font: &parley::FontData,
+    glyph: u32,
+    text_range: core::ops::Range<usize>,
+) -> TextDiagnostic {
+    TextDiagnostic::ColorGlyphMonochrome {
+        font: font_label(font),
+        glyph,
+        text_range,
+    }
 }
 
 fn emit_glyph(
@@ -1245,7 +1260,7 @@ fn emit_glyph(
                 ctx.scale.to_logical(physical_px(tile.height as f32)),
             ),
         },
-        tile.color,
+        tile.color_monochrome,
     )))
 }
 
@@ -4166,6 +4181,62 @@ mod tests {
                 expected,
                 "{text:?} direction={direction:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_colr_v1_only_font_emits_the_color_glyph_monochrome_diagnostic() {
+        let Some((font, glyph)) = crate::text::raster::colr_v1_only_font() else {
+            eprintln!("skip: no rebuildable single-font available for the COLRv1 fixture");
+            return;
+        };
+        let mut raster = crate::text::raster::GlyphRasterizer::new();
+        let mut glyph_atlas = crate::text::atlas::GlyphAtlas::new();
+        let mut atlas = crate::render::atlas::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (256, 256),
+        );
+        let generation = atlas.generation();
+        let mut ctx = super::RasterCtx {
+            raster: &mut raster,
+            glyph_atlas: &mut glyph_atlas,
+            atlas: &mut atlas,
+            generation,
+            scale: DevicePixelRatio::ONE,
+        };
+        let (positioned, color_monochrome) = super::emit_glyph(
+            &mut ctx,
+            &font,
+            glyph,
+            32.0,
+            &crate::text::raster::GlyphVariation::default(),
+            px(0.0),
+            px(0.0),
+        )
+        .expect("fabricated font must rasterize")
+        .expect("outline fallback must produce coverage");
+        assert!(
+            color_monochrome,
+            "COLRv1-only 字形必须把 color_monochrome 冒泡到 shape 层"
+        );
+        assert_eq!(
+            positioned.tile.atlas,
+            crate::paint::atlas::AtlasKind::Glyph,
+            "单色回退必须落在 R8 图集"
+        );
+        assert!(!glyph_atlas.has_color_records());
+        let diagnostic = super::color_glyph_monochrome_diagnostic(&font, glyph, 0..1);
+        match diagnostic {
+            TextDiagnostic::ColorGlyphMonochrome {
+                glyph: diagnostic_glyph,
+                text_range,
+                font: label,
+            } => {
+                assert_eq!(diagnostic_glyph, glyph);
+                assert_eq!(text_range, 0..1);
+                assert!(!label.is_empty(), "诊断必须带上字体标签");
+            }
+            other => panic!("期望 ColorGlyphMonochrome，得到 {other:?}"),
         }
     }
 

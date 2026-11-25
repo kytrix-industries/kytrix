@@ -377,7 +377,7 @@ impl WindowRenderer {
             reset_epoch: AtomicU64::new(0),
             composition_pending: AtomicBool::new(false),
             composition_rebuild: AtomicBool::new(false),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
             atlas_participating: AtomicBool::new(true),
         });
         let worker = Arc::clone(&shared);
@@ -523,7 +523,7 @@ struct Shared {
     reset_epoch: AtomicU64,
     composition_pending: AtomicBool,
     composition_rebuild: AtomicBool,
-    atlas_pending: [AtomicU32; 2],
+    atlas_pending: [AtomicU32; 3],
     atlas_participating: AtomicBool,
 }
 
@@ -566,6 +566,7 @@ impl State {
 struct AtlasSlots {
     glyph: Option<AtlasUpload>,
     image: [Option<AtlasUpload>; MAX_IMAGE_PAGES as usize],
+    color_glyph: Option<AtlasUpload>,
 }
 
 struct AtlasUpload {
@@ -581,6 +582,7 @@ impl AtlasSlots {
         Self {
             glyph: None,
             image: [const { None }; MAX_IMAGE_PAGES as usize],
+            color_glyph: None,
         }
     }
 
@@ -599,6 +601,7 @@ impl AtlasSlots {
         let slot = match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image[usize::from(layer)],
+            AtlasKind::ColorGlyph => &mut self.color_glyph,
         };
         assert!(
             slot.is_none(),
@@ -614,8 +617,9 @@ impl AtlasSlots {
     }
 
     fn take(&mut self) -> Vec<AtlasUpload> {
-        let mut uploads = Vec::with_capacity(1 + usize::from(MAX_IMAGE_PAGES));
+        let mut uploads = Vec::with_capacity(2 + usize::from(MAX_IMAGE_PAGES));
         uploads.extend(self.glyph.take());
+        uploads.extend(self.color_glyph.take());
         uploads.extend(self.image.iter_mut().filter_map(Option::take));
         uploads
     }
@@ -1108,7 +1112,7 @@ fn run_gpu_loop(
     submitted: &mut VecDeque<SubmittedFrame>,
     composition_recovery: &mut CompositionRecovery,
 ) -> Result<(), EngineError> {
-    let mut atlas_awaiting = [false; 2];
+    let mut atlas_awaiting = [false; 3];
     let mut display_recovery = DisplayRecovery::new();
     let mut force_present = false;
     let mut statistics = FrameStatisticsClock::new();
@@ -1201,11 +1205,7 @@ fn run_gpu_loop(
                 Ok((stats, samples)) => {
                     for (index, awaiting) in atlas_awaiting.iter_mut().enumerate() {
                         if std::mem::take(awaiting) {
-                            shared.atlas_uploaded(if index == 0 {
-                                AtlasKind::Glyph
-                            } else {
-                                AtlasKind::Image
-                            });
+                            shared.atlas_uploaded(crate::paint::atlas::ATLAS_KINDS[index]);
                         }
                     }
                     let presented = statistics.observe(renderer.frame_statistics());
@@ -1675,7 +1675,7 @@ mod tests {
             reset_epoch: AtomicU64::new(0),
             composition_pending: AtomicBool::new(false),
             composition_rebuild: AtomicBool::new(false),
-            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0)],
+            atlas_pending: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
             atlas_participating: AtomicBool::new(true),
         })
     }

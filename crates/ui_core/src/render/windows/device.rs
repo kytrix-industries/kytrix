@@ -365,7 +365,7 @@ pub(crate) struct SharedGpu {
     srv_heap: SrvHeap,
     srv_arena: Mutex<DescriptorArena>,
     atlas: RwLock<SharedAtlas>,
-    atlas_pages: [AtomicU32; 2],
+    atlas_pages: [AtomicU32; 3],
     watermarks: Mutex<Vec<Weak<StreamWatermark>>>,
     atlas_generation: AtomicU8,
     atlas_switch: Mutex<AtlasSwitch>,
@@ -463,10 +463,11 @@ impl SharedGpu {
         let atlas_pages = [
             AtomicU32::new(atlas.page(AtlasKind::Glyph)),
             AtomicU32::new(atlas.page(AtlasKind::Image)),
+            AtomicU32::new(atlas.page(AtlasKind::ColorGlyph)),
         ];
         let srv_heap = SrvHeap::new(device.raw())?;
         for generation in 0..ATLAS_GENERATIONS {
-            for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+            for kind in crate::paint::atlas::ATLAS_KINDS {
                 srv_heap.write_atlas(
                     device.raw(),
                     generation,
@@ -668,19 +669,21 @@ impl SharedGpu {
         for request in pending {
             let old = atlas.recreate(self.raw(), request.kind, request.spec)?;
             switch.retired_textures[active as usize].push(old);
-            self.srv_heap.write_atlas(
-                self.raw(),
-                target,
-                request.kind,
-                atlas.texture(request.kind),
-                atlas.layers(request.kind),
-            );
             self.atlas_pages[request.kind.index() as usize]
                 .store(request.spec.page, Ordering::Release);
             rebuilt.mark(request.kind);
         }
+        for kind in crate::paint::atlas::ATLAS_KINDS {
+            self.srv_heap.write_atlas(
+                self.raw(),
+                target,
+                kind,
+                atlas.texture(kind),
+                atlas.layers(kind),
+            );
+        }
         debug_assert!(
-            rebuilt.glyph || rebuilt.image,
+            rebuilt.glyph || rebuilt.image || rebuilt.color_glyph,
             "a non-empty rebuild must recreate at least one atlas page"
         );
         self.capture_generation_watermark(active);
@@ -690,10 +693,10 @@ impl SharedGpu {
 
     fn restore_atlas(
         &self,
-        snapshot: &[Option<crate::render::windows::atlas::ShadowAtlasSnapshot>; 2],
+        snapshot: &[Option<crate::render::windows::atlas::ShadowAtlasSnapshot>; 3],
     ) -> Result<(), EngineError> {
         let mut atlas = self.atlas.write().unwrap_or_else(PoisonError::into_inner);
-        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+        for kind in crate::paint::atlas::ATLAS_KINDS {
             let index = kind.index() as usize;
             let Some(snapshot) = snapshot[index].as_ref() else {
                 continue;

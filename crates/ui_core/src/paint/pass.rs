@@ -24,10 +24,7 @@ use crate::{
         scene::{LaneId, Scene},
         style::{Clip, PaintSpec, StylePatch},
     },
-    render::{
-        AtlasAllocator,
-        damage::{DamageAccumulator, DamageSummary},
-    },
+    render::damage::{DamageAccumulator, DamageSummary},
     resources::ResourceCache,
     text::{InlineBoxPaint, ShapedLine, ShapedTextItem},
 };
@@ -41,7 +38,7 @@ pub(crate) struct PaintPass<'a> {
     pub frame: DeviceRect,
     pub order: &'a mut Vec<LaneId>,
     pub focused: Option<NodeId>,
-    pub atlas: Option<&'a AtlasAllocator>,
+    pub atlases: Option<crate::window::canvas_text::GlyphAtlases<'a>>,
     pub resources: Option<&'a ResourceCache>,
     pub canvas_text: &'a ahash::HashMap<NodeId, crate::window::canvas_text::ResolvedCanvasText>,
     pub scroll_slots: &'a mut Vec<(LogicalPoint, DeviceRect)>,
@@ -129,7 +126,7 @@ impl PaintPass<'_> {
             scroll_slots,
             scroll_slot_nodes,
             focused: self.focused,
-            atlas: self.atlas,
+            atlases: self.atlases,
             resources: self.resources,
             canvas_text: self.canvas_text,
             stale_text: SmallVec::new(),
@@ -209,7 +206,7 @@ struct PaintContext<'a> {
     scroll_slots: &'a mut Vec<(LogicalPoint, DeviceRect)>,
     scroll_slot_nodes: &'a mut Vec<NodeId>,
     focused: Option<NodeId>,
-    atlas: Option<&'a AtlasAllocator>,
+    atlases: Option<crate::window::canvas_text::GlyphAtlases<'a>>,
     canvas_text: &'a ahash::HashMap<NodeId, crate::window::canvas_text::ResolvedCanvasText>,
     stale_text: SmallVec<[NodeId; 4]>,
     unresolved_canvas_text: usize,
@@ -314,7 +311,7 @@ fn canvas_has_text(canvas: &crate::paint::canvas::Canvas) -> bool {
 fn resolved_canvas(
     canvas: &crate::paint::canvas::Canvas,
     lines: Option<&[Rc<ShapedLine>]>,
-    atlas: Option<&crate::render::AtlasAllocator>,
+    atlases: Option<crate::window::canvas_text::GlyphAtlases<'_>>,
     next: &mut usize,
     skipped: &mut usize,
 ) -> crate::paint::canvas::Canvas {
@@ -324,16 +321,15 @@ fn resolved_canvas(
             Primitive::Text(text) => {
                 let line = lines.and_then(|lines| lines.get(*next));
                 *next += 1;
-                let live = line.filter(|line| {
-                    atlas.is_none_or(|atlas| crate::window::canvas_text::line_is_live(line, atlas))
-                });
+                let live =
+                    line.filter(|line| atlases.is_none_or(|atlases| atlases.line_is_live(line)));
                 match live {
                     Some(line) => push_text_glyph_runs(&mut resolved, text, line),
                     None => *skipped += 1,
                 }
             }
             Primitive::Canvas(inner) => {
-                let inner = resolved_canvas(inner, lines, atlas, next, skipped);
+                let inner = resolved_canvas(inner, lines, atlases, next, skipped);
                 resolved.push_primitive(Primitive::Canvas(Arc::new(inner)));
             }
             other => resolved.push_primitive(other.clone()),
@@ -1604,7 +1600,7 @@ impl PrimitiveEmitter {
                         .get(&self.node)
                         .map(|entry| entry.lines.as_slice());
                     let resolved =
-                        resolved_canvas(&canvas, lines, context.atlas, &mut 0usize, &mut skipped);
+                        resolved_canvas(&canvas, lines, context.atlases, &mut 0usize, &mut skipped);
                     self.push(context, Primitive::Canvas(Arc::new(resolved)));
                 } else {
                     self.push(context, Primitive::Canvas(canvas));
@@ -1627,8 +1623,9 @@ impl PrimitiveEmitter {
     }
 
     fn emit_text(&mut self, context: &mut PaintContext<'_>, line: &ShapedLine, opacity: f32) {
-        if let Some(atlas) = context.atlas
-            && line.atlas_generation != atlas.generation()
+        if let Some(atlases) = context.atlases
+            && (line.atlas_generation != atlases.glyph.generation()
+                || line.color_atlas_generation != atlases.color.generation())
         {
             if !context.stale_text.contains(&self.node) {
                 context.stale_text.push(self.node);
@@ -1747,9 +1744,9 @@ impl PrimitiveEmitter {
                 );
             }
             if let Some(placeholder) = &decorations.placeholder {
-                let live = context.atlas.is_none_or(|atlas| {
-                    crate::window::canvas_text::line_is_live(placeholder, atlas)
-                });
+                let live = context
+                    .atlases
+                    .is_none_or(|atlases| atlases.line_is_live(placeholder));
                 if live {
                     let color = self
                         .patch
@@ -2006,6 +2003,7 @@ mod tests {
         scroll_slots: Vec<(LogicalPoint, DeviceRect)>,
         scroll_slot_nodes: Vec<crate::node::id::NodeId>,
         atlas: Option<crate::render::AtlasAllocator>,
+        color_atlas: crate::render::AtlasAllocator,
         resources: Option<crate::resources::ResourceCache>,
         geometry: crate::paint::geometry_store::GeometryStore,
         focused: Option<crate::node::id::NodeId>,
@@ -2029,6 +2027,10 @@ mod tests {
                 scroll_slots: Vec::new(),
                 scroll_slot_nodes: Vec::new(),
                 atlas: None,
+                color_atlas: crate::render::AtlasAllocator::with_page(
+                    crate::paint::atlas::AtlasKind::ColorGlyph,
+                    (512, 512),
+                ),
                 resources: None,
                 geometry: crate::paint::geometry_store::GeometryStore::new(),
                 focused: None,
@@ -2050,7 +2052,12 @@ mod tests {
                 frame: frame(),
                 order: &mut self.order,
                 focused: self.focused,
-                atlas: self.atlas.as_ref(),
+                atlases: self.atlas.as_ref().map(|glyph| {
+                    crate::window::canvas_text::GlyphAtlases {
+                        glyph,
+                        color: &self.color_atlas,
+                    }
+                }),
                 resources: self.resources.as_ref(),
                 canvas_text: &self.canvas_text,
                 scroll_slots: &mut self.scroll_slots,
@@ -2081,7 +2088,12 @@ mod tests {
                 frame: frame(),
                 order: &mut self.order,
                 focused: self.focused,
-                atlas: self.atlas.as_ref(),
+                atlases: self.atlas.as_ref().map(|glyph| {
+                    crate::window::canvas_text::GlyphAtlases {
+                        glyph,
+                        color: &self.color_atlas,
+                    }
+                }),
                 resources: self.resources.as_ref(),
                 canvas_text: &self.canvas_text,
                 scroll_slots: &mut self.scroll_slots,
@@ -2129,6 +2141,18 @@ mod tests {
             };
             let _ = tree.set_layout_for_test(*id, layout);
         }
+    }
+
+    fn lane_has_glyph_runs(harness: &Harness, node: crate::node::id::NodeId) -> bool {
+        harness
+            .tree
+            .lane_of(node)
+            .and_then(|lane| harness.scene.lane_primitives(lane))
+            .is_some_and(|primitives| {
+                primitives
+                    .iter()
+                    .any(|primitive| matches!(primitive, Primitive::GlyphRun(_)))
+            })
     }
 
     fn lane_primitives(harness: &Harness, node: crate::node::id::NodeId) -> Vec<Primitive> {
@@ -2592,6 +2616,8 @@ mod tests {
         ));
     }
 
+    const INITIAL_ATLAS_GENERATION: u32 = 1;
+
     fn canvas_with_text(content: TextContent, origin: LogicalPoint) -> Canvas {
         let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)));
         assert!(canvas.push_text(content, origin), "the recipe is recorded");
@@ -2627,6 +2653,7 @@ mod tests {
                     canvas_generation: generation,
                     dpr_bits: 1.0_f32.to_bits(),
                     atlas_generation: 0,
+                    color_atlas_generation: INITIAL_ATLAS_GENERATION,
                     glyph_eviction_epoch: 0,
                 },
                 lines: vec![Rc::new(line)],
@@ -2717,6 +2744,11 @@ mod tests {
         run.glyphs[0].tile = allocation.tile;
         let mut line = shaped_line(vec![ShapedTextItem::GlyphRun(run)], Vec::new());
         line.atlas_generation = atlas.generation();
+        assert_eq!(
+            line.color_atlas_generation,
+            h.color_atlas.generation(),
+            "本用例只让单色代际失效，彩色代际必须保持一致"
+        );
         assert!(atlas.grow(), "page growth invalidates the cached tiles");
         h.atlas = Some(atlas);
         let generation = h.tree.canvas_generation(node).expect("canvas node");
@@ -2729,6 +2761,7 @@ mod tests {
                     canvas_generation: generation,
                     dpr_bits: 1.0_f32.to_bits(),
                     atlas_generation,
+                    color_atlas_generation: INITIAL_ATLAS_GENERATION,
                     glyph_eviction_epoch: 0,
                 },
                 lines: vec![Rc::new(line)],
@@ -2752,6 +2785,92 @@ mod tests {
                 .any(|primitive| matches!(primitive, Primitive::GlyphRun(_))),
             "stale UVs must never reach the scene"
         );
+    }
+
+    fn mount_text_line(h: &mut Harness, text: &'static str, mut line: ShapedLine) -> NodeId {
+        line.text = smol_str::SmolStr::new_static(text);
+        let root = h.tree.root();
+        let node = NodeBuilder::text(text, TextStyle::new(px(16.0)))
+            .style(fixed_style(50.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("text node");
+        let content = TextContent::new(text, TextStyle::new(px(16.0)));
+        assert!(h.tree.set_text_content(node, content.clone()));
+        assert!(
+            h.tree
+                .install_text_line_for_test(node, &content, Rc::new(line), px(20.0)),
+            "文本行注入"
+        );
+        node
+    }
+
+    fn text_line_with_generations(h: &Harness) -> (ShapedLine, u32, u32) {
+        let glyph_generation = h.atlas.as_ref().expect("glyph atlas").generation();
+        let color_generation = h.color_atlas.generation();
+        let mut line = shaped_line(
+            vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 0.0))],
+            Vec::new(),
+        );
+        line.atlas_generation = glyph_generation;
+        line.color_atlas_generation = color_generation;
+        (line, glyph_generation, color_generation)
+    }
+
+    #[test]
+    fn a_color_atlas_generation_change_alone_marks_text_stale() {
+        let mut h = Harness::new();
+        h.atlas = Some(crate::render::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (64, 64),
+        ));
+        let (line, _, _) = text_line_with_generations(&h);
+        let node = mount_text_line(&mut h, "ab", line);
+        layout_all(&mut h.tree);
+        let painted = h.paint();
+        assert!(painted.stale_text.is_empty(), "代际一致时文本可直接重绘");
+        assert!(
+            lane_primitives(&h, node)
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::GlyphRun(_))),
+            "代际一致时必须画出字形"
+        );
+
+        assert!(h.color_atlas.grow(), "彩色页扩容换代");
+        h.mark_paint(node);
+        let stale = h.paint();
+        assert_eq!(
+            stale.stale_text.as_slice(),
+            &[node],
+            "仅彩色代际变化也必须把文本行标 stale（否则会画旧 UV）"
+        );
+        assert!(!lane_has_glyph_runs(&h, node), "stale 行不得进入 scene");
+    }
+
+    #[test]
+    fn a_glyph_atlas_generation_change_alone_marks_text_stale() {
+        let mut h = Harness::new();
+        h.atlas = Some(crate::render::AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (64, 64),
+        ));
+        let (line, _, _) = text_line_with_generations(&h);
+        let node = mount_text_line(&mut h, "ab", line);
+        layout_all(&mut h.tree);
+        let painted = h.paint();
+        assert!(painted.stale_text.is_empty());
+
+        assert!(
+            h.atlas.as_mut().expect("glyph atlas").grow(),
+            "单色页扩容换代"
+        );
+        h.mark_paint(node);
+        let stale = h.paint();
+        assert_eq!(
+            stale.stale_text.as_slice(),
+            &[node],
+            "仅单色代际变化也必须把文本行标 stale"
+        );
+        assert!(!lane_has_glyph_runs(&h, node));
     }
 
     const ONE_PIXEL_PNG: &[u8] = &[
@@ -2802,7 +2921,8 @@ mod tests {
             width: px(20.0),
             height: px(16.0),
             first_baseline: Some(px(12.0)),
-            atlas_generation: 0,
+            atlas_generation: INITIAL_ATLAS_GENERATION,
+            color_atlas_generation: INITIAL_ATLAS_GENERATION,
             font_stack_version: 1,
             scale: DevicePixelRatio::ONE,
         }

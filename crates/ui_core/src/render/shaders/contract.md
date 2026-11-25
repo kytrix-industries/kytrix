@@ -55,9 +55,10 @@
 | 保留          | 4     | —                                      | Path 两阶段 coverage（v1 不用，F-26）      |
 | 保留          | 5     | —                                      | Geometry 实例化表达（v1 走 geometry 通道） |
 | 保留          | 6–7   | —                                      | 应用自定义（v1 不做，F-29）                |
+| `KIND_COLOR_GLYPH` | **8** | `Primitive::GlyphRun`（tile 来自彩色字形图集，每字形 1 实例） | `color = texel.rgb × texel.a`（linear 预乘，**不**乘 `color0`） |
 
 `atlas_page`（`params1.y`）：**采样哪张图集由 `params1.z`（`kind`）决定，`.y` 只是该图集
-texture array 的层号（图集页索引）**。字形图集恒 1 层、页索引恒 `0`；图片图集的层数是**运行时
+texture array 的层号（图集页索引）**。单色字形图集与彩色字形图集都恒 1 层、页索引恒 `0`；图片图集的层数是**运行时
 值**：等于 App 当前打开的资源图集页数（`render::atlas::ImageAtlasPager::page_count`，上限
 `MAX_IMAGE_PAGES = 4`），页索引 `0..page_count` 由资源层的多页分配器给出（D-9 多页图集 + LRU）。
 数组按当前页数懒创建、**只增不减**（页数增长时按新层数重建数组 + App 全量重传每个已打开层；
@@ -245,7 +246,15 @@ API 的硬件实例基址语义**互不相同**：
 | `root`（112 B）           | root constants `b0`（28 DWORD）       | `[[buffer(2)]]`                            | push constants `[0, 112)`                 |
 | glyph 图集（R8，1 层 array） | SRV `t2`（`ViewDimension=TEXTURE2D_ARRAY`） | `[[texture(0)]]`（`texture2d_array<float>`） | binding 4（combined `sampler2DArray`） |
 | image 图集（BGRA8 sRGB，`page_count` 层 array） | SRV `t3`（`ViewDimension=TEXTURE2D_ARRAY`） | `[[texture(1)]]`（`texture2d_array<float>`） | binding 5（combined `sampler2DArray`） |
+| color glyph 图集（RGBA8 sRGB，1 层 array） | SRV `t4`（`ViewDimension=TEXTURE2D_ARRAY`） | `[[texture(2)]]`（`texture2d_array<float>`） | binding 6（combined `sampler2DArray`） |
 | sampler                   | static `s0`                           | `[[sampler(0)]]`                           | 同上                                      |
+
+三个图集 SRV 在 descriptor 表中**连续排布**且顺序固定为「单色字形（t2）→ 图片（t3）→ 彩色字形（t4）」，
+shader 侧的标识符依次为 `glyph_atlas` / `image_atlas` / `color_glyph_atlas`：
+D3D12 的 atlas descriptor table 覆盖 `t2..=t4`（3 个 SRV，`BaseShaderRegister = 2`），Vulkan/Metal
+按 binding/texture 索引一一对应。`AtlasKind` 的 CPU 索引（0/1/2）直接等于该顺序，三端无需额外映射表。
+彩色字形图集的纹理视图**必须**声明为 sRGB（`R8G8B8A8_UNORM_SRGB` / `.rgba8Unorm_srgb` / `R8G8B8A8_SRGB`），
+三个图集共享同一个 sampler 与 `params1.y = 0`（恒第 0 层）。
 
 图集是 **texture array**（D-9）：字形固定 1 层（恒采样 layer 0）；图片的层数 = App 当前打开的
 图集页数（`1..=MAX_IMAGE_PAGES`；没有图片时是 1 层的 1×1 占位数组），layer = 图集页索引。
@@ -325,6 +334,7 @@ resolve 附件）。`Textured` 没有覆盖率属性，其顶点写 `KYTRIX_AA_I
 | UV         | `AtlasTile::uv()` 的**边**约定；**不加**半纹素偏移；三平台纹理原点都是左上、v 向下，**不做 v 翻转**；UV 的归一化基准是**该 tile 所在页**的尺寸 |
 | 采样       | 图集是 texture array：glyph 恒 `layer = 0`；image 的 `layer = params1.y`（= `AtlasTile.page`）。应用注册的静态纹理几何（`geometry.textured_*`）没有页概念，固定 `layer = 0` |
 | glyph 图集 | `R8_UNORM`（线性覆盖度，**非** sRGB）；`out = color0 × texel.r`（4 分量同乘）                                                                  |
+| color glyph 图集 | `RGBA8` **sRGB**；纹素是 **straight alpha 的 sRGB 编码颜色**（上传方：COLR v0 输出为 sRGB 空间预乘 → CPU 反预乘；sbix/CBDT PNG 输出本就是 straight）；shader 采样后格式解码为 linear，再 `out = vec4(texel.rgb × texel.a, texel.a)` 得到 linear premultiplied。**不乘 `color0`**（彩色 emoji 保留自身颜色，与单色字形路径的 `color0` 乘算不同） |
 | image 图集 | `BGRA8` **sRGB**；纹素是 **linear-premultiplied 后 sRGB 编码**；`out = texel × color0`                                                         |
 | 纹理视图   | image 图集的 SRV / 纹理视图**必须**声明为 sRGB 格式（`*_UNORM_SRGB` / `.bgra8Unorm_srgb` / `*_SRGB`）；glyph 图集必须保持非 sRGB 的 `R8_UNORM` |
 | 上传方职责 | P15 必须「linear 空间预乘 → sRGB 编码」后写图集；改成直通 alpha 时 shader 与本文件必须同时改（`texel.rgb *= texel.a`）                         |

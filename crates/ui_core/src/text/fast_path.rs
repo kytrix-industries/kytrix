@@ -196,6 +196,7 @@ impl SimpleShaped {
             height: self.metrics.line_height,
             first_baseline: Some(baseline),
             atlas_generation: ctx.generation,
+            color_atlas_generation: ctx.glyph_atlas.color_generation(),
             font_stack_version: 0,
             scale: ctx.scale,
         })

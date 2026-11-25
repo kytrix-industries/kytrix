@@ -3,14 +3,6 @@ use swash::{
     zeno::{Format, Placement, Vector},
 };
 
-fn bgra_to_coverage(data: &[u8]) -> Vec<u8> {
-    let (pixels, remainder) = data.as_chunks::<4>();
-    if !remainder.is_empty() {
-        return data.to_vec();
-    }
-    pixels.iter().map(|pixel| pixel[3]).collect()
-}
-
 pub(crate) const SUBPIXEL_PHASES: u8 = 4;
 
 pub(crate) const HINTING: bool = false;
@@ -43,6 +35,7 @@ struct SwashFont {
 struct FontEntry {
     font: parley::FontData,
     swash: Option<SwashFont>,
+    color_glyphs: ColorGlyphCoverage,
 }
 
 impl FontEntry {
@@ -60,6 +53,142 @@ pub(crate) struct RasterGlyph {
     pub placement: Placement,
     pub data: Vec<u8>,
     pub color: bool,
+    pub color_monochrome: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ColorGlyphCoverage {
+    colr: Option<ColrCoverage>,
+}
+
+impl ColorGlyphCoverage {
+    fn of(data: &[u8], font_offset: u32) -> Self {
+        Self {
+            colr: ColrCoverage::of(data, font_offset),
+        }
+    }
+
+    fn declares_color(&self, glyph: u32) -> bool {
+        self.colr.as_ref().is_some_and(|colr| colr.has_paint(glyph))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ColrCoverage {
+    v0: Box<[u32]>,
+    v1: Box<[u32]>,
+}
+
+impl ColrCoverage {
+    fn of(data: &[u8], font_offset: u32) -> Option<Self> {
+        let base = usize::try_from(font_offset).ok()?;
+        let table = sfnt_table(data, base, *b"COLR")?;
+        let header = slice(data, table, 0, 18)?;
+        let version = u16::from_be_bytes([header[0], header[1]]);
+        let v0_count = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        let v0_offset = usize::try_from(u32::from_be_bytes([
+            header[4], header[5], header[6], header[7],
+        ]))
+        .ok()?;
+        let v0 = (0..v0_count)
+            .filter_map(|index| {
+                let record = table.checked_add(v0_offset)?.checked_add(index * 6)?;
+                let bytes = data.get(record..record.checked_add(2)?)?;
+                Some(u32::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+            })
+            .collect::<Vec<_>>();
+        if version < 1 {
+            return Some(Self {
+                v0: v0.into_boxed_slice(),
+                v1: Box::default(),
+            });
+        }
+        let v1_offset = usize::try_from(u32::from_be_bytes([
+            header[14], header[15], header[16], header[17],
+        ]))
+        .ok()?;
+        let v1 = if v1_offset == 0 {
+            Vec::new()
+        } else {
+            let count = read_u32(data, table.checked_add(v1_offset)?).unwrap_or(0);
+            (0..count)
+                .filter_map(|index| {
+                    let record = table
+                        .checked_add(v1_offset)?
+                        .checked_add(4)?
+                        .checked_add(usize::try_from(index).ok()?.checked_mul(6)?)?;
+                    Some(u32::from(read_u16(data, record)?))
+                })
+                .collect::<Vec<_>>()
+        };
+        Some(Self {
+            v0: v0.into_boxed_slice(),
+            v1: v1.into_boxed_slice(),
+        })
+    }
+
+    fn has_paint(&self, glyph: u32) -> bool {
+        self.v0.binary_search(&glyph).is_ok() || self.v1.binary_search(&glyph).is_ok()
+    }
+}
+
+fn slice(data: &[u8], base: usize, relative: usize, len: usize) -> Option<&[u8]> {
+    let start = base.checked_add(relative)?;
+    let end = start.checked_add(len)?;
+    data.get(start..end)
+}
+
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes = data.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn sfnt_table(data: &[u8], font_offset: usize, tag: [u8; 4]) -> Option<usize> {
+    let directory = slice(data, font_offset, 0, 12)?;
+    let num_tables = usize::from(u16::from_be_bytes([directory[4], directory[5]]));
+    for index in 0..num_tables.min(256) {
+        let record = slice(data, font_offset, 12 + index * 16, 16)?;
+        if record[0..4] != tag {
+            continue;
+        }
+        let offset = u32::from_be_bytes([record[8], record[9], record[10], record[11]]);
+        return usize::try_from(offset).ok();
+    }
+    None
+}
+
+fn color_pixels(data: &[u8], premultiplied: bool) -> Vec<u8> {
+    let (pixels, remainder) = data.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return data.to_vec();
+    }
+    if !premultiplied {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len());
+    for pixel in pixels {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        let unpremultiply = |channel: u8| -> u8 {
+            let value = u32::from(channel) * 255;
+            u8::try_from((value + alpha / 2) / alpha).unwrap_or(u8::MAX)
+        };
+        out.extend_from_slice(&[
+            unpremultiply(pixel[0]),
+            unpremultiply(pixel[1]),
+            unpremultiply(pixel[2]),
+            pixel[3],
+        ]);
+    }
+    out
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -150,14 +279,22 @@ impl GlyphRasterizer {
         }
         let key = FontKey::of(font, self.font_epoch);
         let Self { ctx, fonts, .. } = self;
-        let entry = fonts.entry(key).or_insert_with(|| FontEntry {
-            font: font.clone(),
-            swash: swash::FontRef::from_index(font.data.data(), font.index as usize).map(|font| {
-                SwashFont {
-                    offset: font.offset,
-                    key: font.key,
-                }
-            }),
+        let entry = fonts.entry(key).or_insert_with(|| {
+            let swash =
+                swash::FontRef::from_index(font.data.data(), font.index as usize).map(|font| {
+                    SwashFont {
+                        offset: font.offset,
+                        key: font.key,
+                    }
+                });
+            let color_glyphs = swash.map_or_else(ColorGlyphCoverage::default, |swash| {
+                ColorGlyphCoverage::of(font.data.data(), swash.offset)
+            });
+            FontEntry {
+                font: font.clone(),
+                swash,
+                color_glyphs,
+            }
         });
         let swash_font = entry.swash_font()?;
         let builder = ctx
@@ -183,8 +320,10 @@ impl GlyphRasterizer {
         }
         let image = render.render(&mut scaler, glyph as u16)?;
         let color = image.content == Content::Color;
+        let color_monochrome = !color && entry.color_glyphs.declares_color(glyph);
         let data = if color {
-            bgra_to_coverage(&image.data)
+            let premultiplied = matches!(image.source, Source::ColorOutline(_));
+            color_pixels(&image.data, premultiplied)
         } else {
             image.data
         };
@@ -192,6 +331,7 @@ impl GlyphRasterizer {
             placement: image.placement,
             data,
             color,
+            color_monochrome,
         })
     }
 
@@ -270,9 +410,107 @@ pub(crate) fn probe_variable_font() -> Option<parley::FontData> {
 }
 
 #[cfg(test)]
+pub(crate) fn probe_emoji_font() -> Option<parley::FontData> {
+    use crate::paint::color::ColorBrush;
+
+    let mut font_cx = parley::FontContext::new();
+    let mut layout_cx: parley::LayoutContext<ColorBrush> = parley::LayoutContext::new();
+    let mut builder = layout_cx.ranged_builder(&mut font_cx, "\u{1F30D}", 1.0, true);
+    builder.push_default(parley::StyleProperty::FontSize(32.0));
+    let mut layout = builder.build("\u{1F30D}");
+    layout.break_all_lines(None);
+    let font = layout.lines().next()?.items().find_map(|item| match item {
+        parley::PositionedLayoutItem::GlyphRun(run) => Some(run.run().font().clone()),
+        parley::PositionedLayoutItem::InlineBox(_) => None,
+    })?;
+    let mut raster = GlyphRasterizer::new();
+    let glyph = u32::from(
+        swash::FontRef::from_index(font.data.data(), font.index as usize)?
+            .charmap()
+            .map('\u{1F30D}'),
+    );
+    let image = raster.rasterize(&font, glyph, 32.0, 0, &GlyphVariation::default())?;
+    image.color.then_some(font)
+}
+
+#[cfg(test)]
+pub(crate) fn colr_v1_only_font() -> Option<(parley::FontData, u32)> {
+    let base = probe_font()?;
+    let font_ref = swash::FontRef::from_index(base.data.data(), base.index as usize)?;
+    if font_ref.offset != 0 {
+        return None;
+    }
+    let glyph = u32::from(font_ref.charmap().map('A'));
+    if glyph == 0 || glyph > u32::from(u16::MAX) {
+        return None;
+    }
+    let fabricated = append_colr_v1_paint(base.data.data(), glyph as u16);
+    let font = parley::FontData::new(parley::fontique::Blob::from(fabricated), 0);
+    let mut raster = GlyphRasterizer::new();
+    let image = raster.rasterize(&font, glyph, 32.0, 0, &GlyphVariation::default())?;
+    (image.color_monochrome && !image.color).then_some((font, glyph))
+}
+
+#[cfg(test)]
+fn append_colr_v1_paint(data: &[u8], glyph: u16) -> Vec<u8> {
+    let num_tables = usize::from(u16::from_be_bytes([data[4], data[5]]));
+    let directory_end = 12 + num_tables * 16;
+    let mut records: Vec<[u8; 16]> = (0..num_tables)
+        .map(|index| {
+            let mut record = [0u8; 16];
+            record.copy_from_slice(&data[12 + index * 16..12 + index * 16 + 16]);
+            let offset = u32::from_be_bytes([record[8], record[9], record[10], record[11]]) + 16;
+            record[8..12].copy_from_slice(&offset.to_be_bytes());
+            record
+        })
+        .collect();
+    let mut colr = Vec::new();
+    colr.extend_from_slice(&1u16.to_be_bytes());
+    colr.extend_from_slice(&0u16.to_be_bytes());
+    colr.extend_from_slice(&0u32.to_be_bytes());
+    colr.extend_from_slice(&0u32.to_be_bytes());
+    colr.extend_from_slice(&0u16.to_be_bytes());
+    colr.extend_from_slice(&34u32.to_be_bytes());
+    for _ in 0..4 {
+        colr.extend_from_slice(&0u32.to_be_bytes());
+    }
+    colr.extend_from_slice(&1u32.to_be_bytes());
+    colr.extend_from_slice(&glyph.to_be_bytes());
+    colr.extend_from_slice(&0u32.to_be_bytes());
+    let shifted_end = data.len() + 16;
+    let colr_offset = (shifted_end + 3) & !3;
+    let mut record = [0u8; 16];
+    record[0..4].copy_from_slice(b"COLR");
+    record[8..12].copy_from_slice(&(colr_offset as u32).to_be_bytes());
+    record[12..16].copy_from_slice(&(colr.len() as u32).to_be_bytes());
+    records.push(record);
+    records.sort_by_key(|record| [record[0], record[1], record[2], record[3]]);
+
+    let mut font = Vec::with_capacity(colr_offset + colr.len());
+    font.extend_from_slice(&data[0..12]);
+    for record in &records {
+        font.extend_from_slice(record);
+    }
+    font.extend_from_slice(&data[directory_end..]);
+    font.resize(colr_offset, 0);
+    font.extend_from_slice(&colr);
+    let new_count = (num_tables + 1) as u16;
+    font[4..6].copy_from_slice(&new_count.to_be_bytes());
+    let power = (new_count as usize).next_power_of_two() >> 1;
+    let search_range = (power * 16) as u16;
+    let entry_selector = power.trailing_zeros() as u16;
+    let range_shift = (new_count * 16).saturating_sub(search_range);
+    font[6..8].copy_from_slice(&search_range.to_be_bytes());
+    font[8..10].copy_from_slice(&entry_selector.to_be_bytes());
+    font[10..12].copy_from_slice(&range_shift.to_be_bytes());
+    font
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        GlyphRasterizer, GlyphVariation, probe_font, probe_variable_font, split_subpixel_x,
+        ColorGlyphCoverage, ColrCoverage, GlyphRasterizer, GlyphVariation, color_pixels,
+        colr_v1_only_font, probe_emoji_font, probe_font, probe_variable_font, split_subpixel_x,
     };
 
     #[test]
@@ -716,6 +954,237 @@ mod tests {
         assert_ne!(
             before, after,
             "字体换代后必须使用新的 swash CacheKey，避免跨字体复用 ScalerProxy"
+        );
+    }
+
+    #[test]
+    fn color_pixels_unpremultiply_the_colr_output_to_straight_rgba() {
+        let premultiplied = [0u8, 171, 132, 250, 88, 59, 11, 93, 0, 0, 0, 0];
+        let straight = color_pixels(&premultiplied, true);
+        assert_eq!(straight.len(), premultiplied.len());
+        assert_eq!(
+            &straight[0..4],
+            &[0, 174, 135, 250],
+            "COLR 输出是 sRGB 空间预乘，必须反预乘成 straight"
+        );
+        assert_eq!(&straight[4..8], &[241, 162, 30, 93]);
+        assert_eq!(&straight[8..12], &[0, 0, 0, 0], "alpha=0 的像素不得除零");
+        for pixel in straight.as_chunks::<4>().0 {
+            assert!(pixel[3] == 0 || pixel[..3].iter().any(|channel| *channel != 0));
+        }
+    }
+
+    #[test]
+    fn color_pixels_pass_through_the_straight_bitmap_path() {
+        let straight = [12u8, 34, 56, 200, 0, 0, 0, 255];
+        assert_eq!(
+            color_pixels(&straight, false),
+            straight.to_vec(),
+            "sbix/CBDT PNG 解码已是 straight RGBA，不得再次反预乘"
+        );
+        assert_eq!(
+            color_pixels(&straight[..7], false).len(),
+            7,
+            "非 4 字节对齐的载荷原样返回，不构造半像素"
+        );
+    }
+
+    #[test]
+    fn colr_coverage_reads_v0_and_v1_base_glyph_lists() {
+        let mut font = vec![0u8; 28];
+        font[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        font[4..6].copy_from_slice(&1u16.to_be_bytes());
+        font[12..16].copy_from_slice(b"COLR");
+        font[20..24].copy_from_slice(&28u32.to_be_bytes());
+        let colr_len = 34 + 2 * 6 + 4 + 2 * 6;
+        font[24..28].copy_from_slice(&(colr_len as u32).to_be_bytes());
+        let colr = font.len();
+        font.extend_from_slice(&1u16.to_be_bytes());
+        font.extend_from_slice(&2u16.to_be_bytes());
+        font.extend_from_slice(&34u32.to_be_bytes());
+        font.extend_from_slice(&0u32.to_be_bytes());
+        font.extend_from_slice(&0u16.to_be_bytes());
+        font.extend_from_slice(&46u32.to_be_bytes());
+        font.extend_from_slice(&0u32.to_be_bytes());
+        font.extend_from_slice(&0u32.to_be_bytes());
+        font.extend_from_slice(&0u32.to_be_bytes());
+        font.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(font.len() - colr, 34, "COLR v0 头正好 34 字节");
+        for glyph in [10u16, 20] {
+            font.extend_from_slice(&glyph.to_be_bytes());
+            font.extend_from_slice(&0u16.to_be_bytes());
+            font.extend_from_slice(&0u16.to_be_bytes());
+        }
+        assert_eq!(font.len() - colr, 46);
+        font.extend_from_slice(&2u32.to_be_bytes());
+        for glyph in [30u16, 41] {
+            font.extend_from_slice(&glyph.to_be_bytes());
+            font.extend_from_slice(&0u32.to_be_bytes());
+        }
+        assert_eq!(
+            font.len() - colr,
+            colr_len,
+            "COLRv1 BaseGlyphPaintRecord 是 uint16 glyphID + Offset32 = 6 B/条"
+        );
+
+        let coverage = ColrCoverage::of(&font, 0).expect("COLR 表必须可解析");
+        for glyph in [10, 20, 30, 41] {
+            assert!(
+                coverage.has_paint(glyph),
+                "glyph {glyph} 必须声明 COLR 绘制"
+            );
+        }
+        for glyph in [0, 11, 21, 31, 42, 0x002A_0000, 0x001E_0000, u32::MAX] {
+            assert!(
+                !coverage.has_paint(glyph),
+                "glyph {glyph} 不得声明 COLR 绘制"
+            );
+        }
+        assert!(
+            ColrCoverage::of(&font[..20], 0).is_none(),
+            "截断的字体不得产生半解析结果"
+        );
+    }
+
+    #[test]
+    fn colr_v1_records_are_six_bytes_not_eight() {
+        let record = |glyph: u16| {
+            let mut bytes = Vec::with_capacity(6);
+            bytes.extend_from_slice(&glyph.to_be_bytes());
+            bytes.extend_from_slice(&7u32.to_be_bytes());
+            bytes
+        };
+        let mut colr = Vec::new();
+        colr.extend_from_slice(&1u16.to_be_bytes());
+        colr.extend_from_slice(&0u16.to_be_bytes());
+        colr.extend_from_slice(&0u32.to_be_bytes());
+        colr.extend_from_slice(&0u32.to_be_bytes());
+        colr.extend_from_slice(&0u16.to_be_bytes());
+        colr.extend_from_slice(&34u32.to_be_bytes());
+        for _ in 0..4 {
+            colr.extend_from_slice(&0u32.to_be_bytes());
+        }
+        colr.extend_from_slice(&2u32.to_be_bytes());
+        colr.extend_from_slice(&record(42));
+        colr.extend_from_slice(&record(300));
+
+        let mut font = vec![0u8; 28];
+        font[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        font[4..6].copy_from_slice(&1u16.to_be_bytes());
+        font[12..16].copy_from_slice(b"COLR");
+        font[20..24].copy_from_slice(&28u32.to_be_bytes());
+        font[24..28].copy_from_slice(&(colr.len() as u32).to_be_bytes());
+        font.extend_from_slice(&colr);
+
+        let coverage = ColrCoverage::of(&font, 0).expect("COLR 表必须可解析");
+        assert!(coverage.has_paint(42), "42 必须在 v1 base glyph list 中");
+        assert!(coverage.has_paint(300), "300 必须在 v1 base glyph list 中");
+        assert!(
+            !coverage.has_paint(42 << 16),
+            "按 8 B 步长误读会得到 glyphID|paintOffset 拼接的伪 ID {}, 规范布局必须读 uint16",
+            42 << 16
+        );
+        assert!(!coverage.has_paint(300 << 16), "300 的伪拼接 ID 也不得命中");
+    }
+
+    #[test]
+    fn a_colr_v1_only_glyph_falls_back_to_monochrome_with_the_flag() {
+        let Some((font, glyph)) = colr_v1_only_font() else {
+            eprintln!("skip: no rebuildable single-font available for the COLRv1 fixture");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let image = raster
+            .rasterize(&font, glyph, 32.0, 0, &GlyphVariation::default())
+            .expect("fabricated COLRv1-only font must rasterize the outline fallback");
+        assert!(
+            !image.color,
+            "COLRv1-only 字形必须回退单色（swash 0.2.10 无 v1 paint graph）"
+        );
+        assert!(
+            image.color_monochrome,
+            "COLRv1-only 字形必须标记为彩色字形单色回退（驱动 ColorGlyphMonochrome 诊断）"
+        );
+        let coverage = ColorGlyphCoverage::of(font.data.data(), 0);
+        assert!(
+            coverage.declares_color(glyph),
+            "注入的 COLRv1 BaseGlyphPaintRecord 必须被声明为彩色字形"
+        );
+    }
+
+    #[test]
+    fn color_emoji_raster_keeps_straight_alpha_above_premultiplied_alpha() {
+        let Some(font) = probe_emoji_font() else {
+            eprintln!("skip: no color emoji font available on this device");
+            return;
+        };
+        let font_ref = swash::FontRef::from_index(font.data.data(), font.index as usize)
+            .expect("emoji font must be a valid swash font");
+        let glyph = u32::from(font_ref.charmap().map('\u{1F30D}'));
+        let mut raster = GlyphRasterizer::new();
+        let image = raster
+            .rasterize(&font, glyph, 32.0, 0, &GlyphVariation::default())
+            .expect("emoji glyph must rasterize");
+        let mut straight_channels = 0usize;
+        for pixel in image.data.as_chunks::<4>().0 {
+            let alpha = u32::from(pixel[3]);
+            if (10..250).contains(&alpha) {
+                let max = u32::from(pixel[..3].iter().copied().max().unwrap_or(0));
+                if max > alpha {
+                    straight_channels += 1;
+                }
+            }
+        }
+        assert!(
+            straight_channels > 0,
+            "彩色覆盖度必须是 straight alpha：半透明像素里必须出现 rgb > alpha（实测 {straight_channels}）"
+        );
+    }
+
+    #[test]
+    fn colr_coverage_ignores_fonts_without_a_colr_table() {
+        let mut font = vec![0u8; 12];
+        font[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        assert!(ColrCoverage::of(&font, 0).is_none());
+        assert!(ColrCoverage::of(&[], 0).is_none());
+    }
+
+    #[test]
+    fn a_color_emoji_rasterizes_to_straight_rgba_with_visible_color() {
+        let Some(font) = probe_emoji_font() else {
+            eprintln!("skip: no color emoji font available on this device");
+            return;
+        };
+        let font_ref = swash::FontRef::from_index(font.data.data(), font.index as usize)
+            .expect("emoji font must be a valid swash font");
+        let glyph = u32::from(font_ref.charmap().map('\u{1F30D}'));
+        assert_ne!(glyph, 0, "emoji font must map U+1F30D");
+        let mut raster = GlyphRasterizer::new();
+        let image = raster
+            .rasterize(&font, glyph, 32.0, 0, &GlyphVariation::default())
+            .expect("emoji glyph must rasterize");
+        assert!(image.color, "系统 emoji 字体必须走彩色字形路径");
+        assert_eq!(
+            image.data.len() as u32,
+            image.placement.width * image.placement.height * 4,
+            "彩色字形载荷 = w × h × 4（RGBA8）"
+        );
+        let mut colored = 0usize;
+        let mut transparent_only = true;
+        for pixel in image.data.as_chunks::<4>().0 {
+            if pixel[3] != 0 {
+                transparent_only = false;
+            }
+            let max = pixel[..3].iter().copied().max().unwrap_or(0);
+            let min = pixel[..3].iter().copied().min().unwrap_or(0);
+            if pixel[3] > 200 && max - min > 60 {
+                colored += 1;
+            }
+        }
+        assert!(!transparent_only, "emoji 位图不得全透明");
+        assert!(
+            colored > 20,
+            "彩色 emoji 必须产生足够的饱和像素（实测 {colored}）"
         );
     }
 

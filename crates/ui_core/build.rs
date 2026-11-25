@@ -38,11 +38,12 @@ const CLIP_FIELDS: [&str; 3] = ["rect", "corner_radius", "meta"];
 const FRAME_FIELDS: [&str; 2] = ["viewport", "params"];
 const DRAW_FIELDS: [&str; 5] = ["basis", "translation", "color0", "clip_rect", "clip"];
 
-const CONSTANTS: [&str; 13] = [
+const CONSTANTS: [&str; 14] = [
     "KIND_QUAD",
     "KIND_GLYPH",
     "KIND_IMAGE",
     "KIND_SHADOW",
+    "KIND_COLOR_GLYPH",
     "GRADIENT_NONE",
     "GRADIENT_HORIZONTAL",
     "GRADIENT_VERTICAL",
@@ -65,7 +66,7 @@ const FORBIDDEN: [&str; 6] = [
     "bitcast",
 ];
 
-const CONTRACT_ANCHORS: [&str; 7] = [
+const CONTRACT_ANCHORS: [&str; 9] = [
     "TriangleStrip",
     "cull = NONE",
     "ONE_MINUS_SRC_ALPHA",
@@ -73,6 +74,8 @@ const CONTRACT_ANCHORS: [&str; 7] = [
     "aa_padding",
     "size_of == 128",
     "instance_base",
+    "KIND_COLOR_GLYPH",
+    "color_glyph_atlas",
 ];
 
 const INSTANCE_BASE_ANCHORS: [(&str, &str); 3] = [
@@ -376,9 +379,79 @@ fn validate(manifest: &Path, shader_dir: &Path) {
         }
     }
 
+    validate_color_glyph_branch(shader_dir);
+
     validate_math_equivalence(shader_dir);
 
     validate_render_state(manifest);
+}
+
+fn validate_color_glyph_branch(shader_dir: &Path) {
+    let hlsl_common = read(&shader_dir.join("common.hlsl"));
+    let hlsl_quad = read(&shader_dir.join("quad.hlsl"));
+    let glsl_common = read(&shader_dir.join("common.glsl"));
+    let glsl_quad = read(&shader_dir.join("quad.frag.glsl"));
+    let metal_quad = read(&shader_dir.join("quad.metal"));
+    for (file, src, anchor, expected) in [
+        (
+            "common.hlsl",
+            &hlsl_common,
+            "color_glyph_atlas : register(t4)",
+            "彩色字形图集 SRV 注册到 t4",
+        ),
+        (
+            "quad.hlsl",
+            &hlsl_quad,
+            "color_glyph_atlas.Sample",
+            "kind=8 分支采样 color_glyph_atlas",
+        ),
+        (
+            "quad.hlsl",
+            &hlsl_quad,
+            "float4(texel.rgb * texel.a, texel.a)",
+            "彩色输出的单次预乘向量",
+        ),
+        (
+            "common.glsl",
+            &glsl_common,
+            "binding = 6) uniform sampler2DArray color_glyph_atlas",
+            "彩色字形图集绑定到 binding 6",
+        ),
+        (
+            "quad.frag.glsl",
+            &glsl_quad,
+            "texture(color_glyph_atlas",
+            "kind=8 分支采样 color_glyph_atlas",
+        ),
+        (
+            "quad.frag.glsl",
+            &glsl_quad,
+            "vec4(texel.rgb * texel.a, texel.a)",
+            "彩色输出的单次预乘向量",
+        ),
+        (
+            "quad.metal",
+            &metal_quad,
+            "color_glyph_atlas [[texture(2)]]",
+            "彩色字形图集绑定到 texture(2)",
+        ),
+        (
+            "quad.metal",
+            &metal_quad,
+            "color_glyph_atlas.sample",
+            "kind=8 分支采样 color_glyph_atlas",
+        ),
+        (
+            "quad.metal",
+            &metal_quad,
+            "float4(texel.rgb * texel.a, texel.a)",
+            "彩色输出的单次预乘向量",
+        ),
+    ] {
+        if !src.contains(anchor) {
+            fail(file, "彩色字形分支", expected, &format!("缺少 `{anchor}`"));
+        }
+    }
 }
 
 fn validate_math_equivalence(shader_dir: &Path) {

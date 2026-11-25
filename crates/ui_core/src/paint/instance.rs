@@ -83,6 +83,7 @@ pub(crate) const KIND_QUAD: f32 = 0.0;
 pub(crate) const KIND_GLYPH: f32 = 1.0;
 pub(crate) const KIND_IMAGE: f32 = 2.0;
 pub(crate) const KIND_SHADOW: f32 = 3.0;
+pub(crate) const KIND_COLOR_GLYPH: f32 = 8.0;
 
 pub(crate) const GRADIENT_NONE: f32 = 0.0;
 pub(crate) const GRADIENT_HORIZONTAL: f32 = 1.0;
@@ -497,6 +498,14 @@ impl InstanceBuffer {
         self.ops.clear();
         self.segments.clear();
         self.changed.clear();
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn instance_kinds(&self) -> Vec<f32> {
+        self.instances
+            .iter()
+            .map(|instance| instance.params1[2])
+            .collect()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1960,6 +1969,10 @@ impl LaneEncoder<'_> {
             glyph.tile.page, 0,
             "glyph atlas tile must live in texture array layer 0"
         );
+        debug_assert!(
+            glyph.tile.atlas.is_glyph(),
+            "glyph run tile must come from a glyph atlas"
+        );
         if glyph.size.is_empty() {
             return;
         }
@@ -1967,13 +1980,18 @@ impl LaneEncoder<'_> {
             self.scale
                 .to_device_rect(LogicalRect::from_origin_size(glyph.position, glyph.size)),
         );
+        let kind = if glyph.tile.atlas == crate::paint::atlas::AtlasKind::ColorGlyph {
+            KIND_COLOR_GLYPH
+        } else {
+            KIND_GLYPH
+        };
         let instance = GpuPrimitive {
             bounds,
             corner_radius: [0.0; 4],
             color0: color0.to_array(),
             color1: [0.0; 4],
             params0: [0.0; 4],
-            params1: [self.clip_index(), 0.0, KIND_GLYPH, self.clip_depth()],
+            params1: [self.clip_index(), 0.0, kind, self.clip_depth()],
             uv: glyph.tile.uv(),
             clip_rect: self.clip_rect(),
         };
@@ -2011,8 +2029,8 @@ mod tests {
     use super::{
         CLIP_KIND_RECT, CLIP_KIND_ROUNDED, ClipChain, ClipChainId, ClipKind, ClipState,
         DrawIndexedArgs, GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive,
-        InstanceEncoder, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN,
-        SHADOW_SIGMA_SCALE, draw_indexed_params,
+        InstanceEncoder, KIND_COLOR_GLYPH, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS,
+        SHADOW_SIGMA_MIN, SHADOW_SIGMA_SCALE, draw_indexed_params,
     };
     use crate::{
         error::EngineError,
@@ -3416,6 +3434,42 @@ mod tests {
             assert_eq!(instance.params0[0], 0.0);
             assert_eq!(instance.color1, resolver().resolve(Color::BLACK).to_array());
         }
+    }
+
+    #[test]
+    fn glyph_run_kind_follows_the_tile_atlas() {
+        let tile = |atlas: AtlasKind| AtlasTile {
+            atlas,
+            page: 0,
+            u0: 0.0,
+            v0: 0.0,
+            u1: 0.5,
+            v1: 0.5,
+            generation: 0,
+            slot: 0,
+            slot_epoch: 0,
+        };
+        let scene = scene_with(|scene, lane| {
+            for atlas in [AtlasKind::Glyph, AtlasKind::ColorGlyph] {
+                assert!(scene.push(
+                    lane,
+                    Primitive::GlyphRun(GlyphRun {
+                        color: Color::WHITE,
+                        glyphs: vec![PositionedGlyph {
+                            tile: tile(atlas),
+                            position: LogicalPoint::new(px(1.0), px(2.0)),
+                            size: LogicalSize::new(px(8.0), px(8.0)),
+                        }],
+                    }),
+                ));
+            }
+        });
+        let buffer = encode(&scene);
+        assert_eq!(buffer.instances.len(), 2);
+        assert_eq!(buffer.instances[0].params1[2], KIND_GLYPH);
+        assert_eq!(buffer.instances[1].params1[2], KIND_COLOR_GLYPH);
+        assert_eq!(buffer.instances[1].params1[1], 0.0, "彩色字形图集恒第 0 层");
+        assert_eq!(buffer.instances[0].params1[1], 0.0);
     }
 
     #[test]

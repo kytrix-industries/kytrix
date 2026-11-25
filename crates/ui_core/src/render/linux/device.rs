@@ -460,7 +460,7 @@ pub(crate) struct SharedGpu {
     descriptors: Mutex<DescriptorPool>,
     pipeline: Pipeline,
     atlas: RwLock<SharedAtlas>,
-    atlas_pages: [AtomicU32; 2],
+    atlas_pages: [AtomicU32; 3],
     queue_lock: Mutex<()>,
     idle_timeline: vk::Semaphore,
     idle_sequence: AtomicU64,
@@ -534,6 +534,7 @@ impl SharedGpu {
             descriptors.all_sets(),
             atlas.glyph_view(),
             atlas.image_view(),
+            atlas.color_glyph_view(),
             atlas.sampler(),
         );
         let idle_timeline = {
@@ -551,6 +552,7 @@ impl SharedGpu {
         let atlas_pages = [
             AtomicU32::new(atlas.page(AtlasKind::Glyph)),
             AtomicU32::new(atlas.page(AtlasKind::Image)),
+            AtomicU32::new(atlas.page(AtlasKind::ColorGlyph)),
         ];
         let gpu = Self {
             descriptors: Mutex::new(descriptors),
@@ -568,7 +570,7 @@ impl SharedGpu {
         };
         {
             let atlas = gpu.atlas();
-            gpu.transition_atlas_layout(&atlas, &[AtlasKind::Glyph, AtlasKind::Image])?;
+            gpu.transition_atlas_layout(&atlas, &crate::paint::atlas::ATLAS_KINDS)?;
         }
         Ok(gpu)
     }
@@ -782,7 +784,7 @@ impl SharedGpu {
             rebuilt.mark(request.kind);
         }
         debug_assert!(
-            rebuilt.glyph || rebuilt.image,
+            rebuilt.glyph || rebuilt.image || rebuilt.color_glyph,
             "a non-empty rebuild must recreate at least one atlas page"
         );
         let kinds: Vec<AtlasKind> = pending.iter().map(|request| request.kind).collect();
@@ -796,6 +798,7 @@ impl SharedGpu {
                 descriptors.all_sets(),
                 atlas.glyph_view(),
                 atlas.image_view(),
+                atlas.color_glyph_view(),
                 atlas.sampler(),
             );
         }

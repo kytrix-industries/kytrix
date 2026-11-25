@@ -24,8 +24,12 @@ pub(crate) fn paint_frame(
     window: &mut Window,
     geometry: &crate::paint::geometry_store::GeometryStore,
     atlas: Option<&crate::render::AtlasAllocator>,
+    color_atlas: Option<&crate::render::AtlasAllocator>,
     resources: Option<&crate::resources::ResourceCache>,
 ) -> Result<PaintReport, EngineError> {
+    let atlases = atlas
+        .zip(color_atlas)
+        .map(|(glyph, color)| crate::window::canvas_text::GlyphAtlases { glyph, color });
     window.tree.reset_paint_visited();
     let mut removed: Vec<crate::paint::scene::LaneId> = Vec::new();
     for lane in window.tree.drain_removed_lanes() {
@@ -159,7 +163,7 @@ pub(crate) fn paint_frame(
                 frame,
                 order: &mut window.paint_order,
                 focused,
-                atlas,
+                atlases,
                 resources,
                 canvas_text,
                 scroll_slots: &mut window.scroll_slots,

@@ -17,6 +17,7 @@ use crate::{
         style_builder::StyleBuilder,
     },
     test_support::app::TestApp,
+    text::TextStyle,
     window::WindowOptions,
 };
 
@@ -84,10 +85,11 @@ pub enum SnapshotScene {
     Image,
     Clip,
     ClipSubpixel,
+    ColorEmoji,
 }
 
 impl SnapshotScene {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Shapes,
         Self::Shadow,
         Self::Gradient,
@@ -95,6 +97,7 @@ impl SnapshotScene {
         Self::Image,
         Self::Clip,
         Self::ClipSubpixel,
+        Self::ColorEmoji,
     ];
 
     #[must_use]
@@ -107,6 +110,7 @@ impl SnapshotScene {
             Self::Image => "image",
             Self::Clip => "clip",
             Self::ClipSubpixel => "clip_subpixel",
+            Self::ColorEmoji => "color_emoji",
         }
     }
 
@@ -117,6 +121,7 @@ impl SnapshotScene {
                 LogicalSize::new(px(240.0), px(160.0))
             }
             Self::Colors | Self::Image => LogicalSize::new(px(160.0), px(120.0)),
+            Self::ColorEmoji => LogicalSize::new(px(240.0), px(160.0)),
         }
     }
 
@@ -131,6 +136,7 @@ impl SnapshotScene {
             Self::Image => build_image(app, root, &palette),
             Self::Clip => build_clip(app, root, &palette),
             Self::ClipSubpixel => build_clip_subpixel(app, root, &palette),
+            Self::ColorEmoji => build_color_emoji(app, root, &palette),
         }
     }
 }
@@ -674,6 +680,34 @@ fn build_shapes(app: &mut TestApp, root: NodeId, palette: &Palette) {
             ..PaintSpec::default()
         },
     );
+}
+
+fn build_color_emoji(app: &mut TestApp, root: NodeId, palette: &Palette) {
+    build_backdrop(app, root, palette);
+    let window = app.window_id();
+    for (index, (id, text)) in [
+        ("emoji.globe", "\u{1F30D}"),
+        (
+            "emoji.family",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+        ),
+        ("emoji.flag", "\u{1F1E8}\u{1F1F3}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut style = TextStyle::new(px(48.0));
+        style.color = palette.ink;
+        let rect = LogicalRect::new(px(8.0), px(4.0 + index as f32 * 50.0), px(224.0), px(48.0));
+        let _ = NodeBuilder::text(text, style)
+            .layout_override(rect)
+            .id(id)
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                root,
+            )
+            .expect("emoji text node");
+    }
 }
 
 fn build_shadow(app: &mut TestApp, root: NodeId, palette: &Palette) {

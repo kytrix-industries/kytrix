@@ -263,6 +263,7 @@ pub struct Window {
     renderer: Option<Renderer>,
     presentation: VecDeque<FramePresentation>,
     glyph_page_received: Option<u32>,
+    color_glyph_page_received: Option<u32>,
     image_page_received: Option<crate::render::AtlasArraySpec>,
     image_layers_received: [bool; MAX_IMAGE_PAGES as usize],
     image_drawable_layers: u32,
@@ -271,6 +272,7 @@ pub struct Window {
     #[cfg(all(test, windows))]
     atlas_upload_failure_from: Option<u16>,
     glyph_atlas_rects: crate::render::DirtyRects,
+    color_glyph_atlas_rects: crate::render::DirtyRects,
     image_atlas_rects: [crate::render::DirtyRects; MAX_IMAGE_PAGES as usize],
     atlas_deferrals: u8,
     canvas_text: ahash::HashMap<NodeId, ResolvedCanvasText>,
@@ -340,6 +342,7 @@ impl Window {
             renderer: None,
             presentation: VecDeque::with_capacity(FRAME_PRESENTATION_HISTORY),
             glyph_page_received: None,
+            color_glyph_page_received: None,
             image_page_received: None,
             image_layers_received: [false; MAX_IMAGE_PAGES as usize],
             image_drawable_layers: u32::MAX,
@@ -348,6 +351,7 @@ impl Window {
             #[cfg(all(test, windows))]
             atlas_upload_failure_from: None,
             glyph_atlas_rects: crate::render::DirtyRects::default(),
+            color_glyph_atlas_rects: crate::render::DirtyRects::default(),
             image_atlas_rects: std::array::from_fn(|_| crate::render::DirtyRects::default()),
             atlas_deferrals: 0,
             canvas_text: ahash::HashMap::default(),
@@ -647,9 +651,10 @@ impl Window {
         &mut self,
         geometry: &crate::paint::geometry_store::GeometryStore,
         atlas: Option<&crate::render::AtlasAllocator>,
+        color_atlas: Option<&crate::render::AtlasAllocator>,
         resources: Option<&crate::resources::ResourceCache>,
     ) -> Result<PaintReport, EngineError> {
-        paint::paint_frame(self, geometry, atlas, resources)
+        paint::paint_frame(self, geometry, atlas, color_atlas, resources)
     }
     fn needs_node_repaint(&self) -> bool {
         paint::needs_node_repaint(self)

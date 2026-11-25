@@ -547,6 +547,7 @@ impl GpuRenderer {
             encoder.setFragmentBuffer_offset_atIndex(Some(clips), 0, 1);
             encoder.setFragmentTexture_atIndex(Some(self.atlas.texture(AtlasKind::Glyph)), 0);
             encoder.setFragmentTexture_atIndex(Some(self.atlas.texture(AtlasKind::Image)), 1);
+            encoder.setFragmentTexture_atIndex(Some(self.atlas.texture(AtlasKind::ColorGlyph)), 2);
             encoder.setFragmentSamplerState_atIndex(Some(self.core.sampler()), 0);
             encoder.setViewport(MTLViewport {
                 originX: 0.0,

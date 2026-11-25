@@ -24,6 +24,7 @@ const BINDING_INSTANCES: u32 = 0;
 const BINDING_CLIPS: u32 = 1;
 const BINDING_GLYPH_ATLAS: u32 = 4;
 const BINDING_IMAGE_ATLAS: u32 = 5;
+const BINDING_COLOR_GLYPH_ATLAS: u32 = 6;
 
 const QUAD_VS: &str = concat!(env!("OUT_DIR"), "/shaders/quad.vs.spv");
 const QUAD_PS: &str = concat!(env!("OUT_DIR"), "/shaders/quad.ps.spv");
@@ -45,7 +46,7 @@ impl GeometryPipelineSet {
                 atlas: AtlasKind::Image,
             } => self.image,
             GeometryPipeline::Textured {
-                atlas: AtlasKind::Glyph,
+                atlas: AtlasKind::Glyph | AtlasKind::ColorGlyph,
             } => self.glyph,
         }
     }
@@ -97,6 +98,11 @@ impl Pipeline {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_IMAGE_ATLAS)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_COLOR_GLYPH_ATLAS)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -242,6 +248,7 @@ impl Pipeline {
         sets: impl Iterator<Item = vk::DescriptorSet>,
         glyph: vk::ImageView,
         image: vk::ImageView,
+        color_glyph: vk::ImageView,
         sampler: vk::Sampler,
     ) {
         let glyph_info = [vk::DescriptorImageInfo::default()
@@ -252,7 +259,11 @@ impl Pipeline {
             .image_view(image)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .sampler(sampler)];
-        let mut writes = Vec::with_capacity(2 * MAX_WINDOWS as usize * MAX_FRAMES_IN_FLIGHT);
+        let color_glyph_info = [vk::DescriptorImageInfo::default()
+            .image_view(color_glyph)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .sampler(sampler)];
+        let mut writes = Vec::with_capacity(3 * MAX_WINDOWS as usize * MAX_FRAMES_IN_FLIGHT);
         for set in sets {
             writes.push(
                 vk::WriteDescriptorSet::default()
@@ -267,6 +278,13 @@ impl Pipeline {
                     .dst_binding(BINDING_IMAGE_ATLAS)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&image_info),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(BINDING_COLOR_GLYPH_ATLAS)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&color_glyph_info),
             );
         }
         if writes.is_empty() {

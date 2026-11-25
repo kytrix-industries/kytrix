@@ -106,12 +106,16 @@ pub struct App {
     image_dpi_epochs: ahash::HashMap<WindowId, u32>,
     image_diagnostics: Vec<ImageDiagnostic>,
     atlas_generation_seen: u32,
+    color_atlas_generation_seen: u32,
     focused_window: Option<WindowId>,
     pending_dirty: crate::render::DirtyRects,
+    pending_color_dirty: crate::render::DirtyRects,
     glyph_page_extent: Option<u32>,
+    color_glyph_page_extent: Option<u32>,
     image_array_established: Option<crate::render::AtlasArraySpec>,
     image_growth_deferrals: u32,
     glyph_page: Vec<u8>,
+    color_glyph_page: Vec<u8>,
     packed: Vec<u8>,
     dispatcher: Arc<Dispatcher>,
     events: event_queue::EventQueue,
@@ -363,12 +367,16 @@ impl App {
             image_dpi_epochs: ahash::HashMap::default(),
             image_diagnostics: Vec::new(),
             atlas_generation_seen: 0,
+            color_atlas_generation_seen: 0,
             focused_window: None,
             pending_dirty: crate::render::DirtyRects::default(),
+            pending_color_dirty: crate::render::DirtyRects::default(),
             glyph_page_extent: None,
+            color_glyph_page_extent: None,
             image_array_established: None,
             image_growth_deferrals: 0,
             glyph_page: Vec::new(),
+            color_glyph_page: Vec::new(),
             packed: Vec::new(),
             dispatcher,
             events: event_queue::EventQueue::new(),
@@ -490,6 +498,10 @@ impl App {
         text_pass::upload_glyph_page(self)
     }
 
+    fn upload_color_glyph_page(&mut self) {
+        text_pass::upload_color_glyph_page(self)
+    }
+
     fn upload_image_page(&mut self) {
         text_pass::upload_image_page(self)
     }
@@ -497,6 +509,11 @@ impl App {
     #[cfg(feature = "test-support")]
     pub(crate) fn glyph_page_pixels(&self) -> ((u32, u32), Vec<u8>) {
         text_pass::glyph_page_pixels(self)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn color_glyph_page_pixels(&self) -> Option<((u32, u32), Vec<u8>)> {
+        text_pass::color_glyph_page_pixels(self)
     }
 
     #[cfg(feature = "test-support")]

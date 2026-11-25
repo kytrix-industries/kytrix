@@ -5,12 +5,20 @@ pub const MAX_IMAGE_PAGES: u16 = 4;
 pub enum AtlasKind {
     Glyph = 0,
     Image = 1,
+    ColorGlyph = 2,
 }
+
+pub const ATLAS_KINDS: [AtlasKind; 3] = [AtlasKind::Glyph, AtlasKind::Image, AtlasKind::ColorGlyph];
 
 impl AtlasKind {
     #[must_use]
     pub const fn index(self) -> u32 {
         self as u32
+    }
+
+    #[must_use]
+    pub const fn is_glyph(self) -> bool {
+        matches!(self, Self::Glyph | Self::ColorGlyph)
     }
 }
 
@@ -48,7 +56,7 @@ impl AtlasTile {
 mod tests {
     use std::mem::size_of;
 
-    use super::{AtlasKind, AtlasTile, MAX_IMAGE_PAGES};
+    use super::{ATLAS_KINDS, AtlasKind, AtlasTile, MAX_IMAGE_PAGES};
 
     fn tile(
         atlas: AtlasKind,
@@ -76,6 +84,15 @@ mod tests {
     fn atlas_kind_index_matches_the_backend_slots() {
         assert_eq!(AtlasKind::Glyph.index(), 0);
         assert_eq!(AtlasKind::Image.index(), 1);
+        assert_eq!(AtlasKind::ColorGlyph.index(), 2);
+        assert_eq!(
+            ATLAS_KINDS.map(AtlasKind::index),
+            [0, 1, 2],
+            "三端 descriptor/纹理槽位按 index 连续排布"
+        );
+        assert!(AtlasKind::Glyph.is_glyph());
+        assert!(AtlasKind::ColorGlyph.is_glyph());
+        assert!(!AtlasKind::Image.is_glyph());
     }
 
     #[test]

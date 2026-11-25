@@ -69,6 +69,113 @@ fn golden_image() {
 }
 
 #[test]
+fn golden_color_emoji() {
+    let case = case(SnapshotScene::ColorEmoji, SnapshotTheme::Light, 1.0);
+    if std::env::var_os("UI_CORE_BLESS").is_none() && !case.golden_path().exists() {
+        eprintln!(
+            "skip golden {}: no golden for this device (reason: emoji font/GPU not provisioned)",
+            case.golden_name()
+        );
+        return;
+    }
+    run(case);
+}
+
+#[test]
+fn color_emoji_glyphs_render_in_color() {
+    let _guard = gpu_guard();
+    let case = case(SnapshotScene::ColorEmoji, SnapshotTheme::Light, 1.0);
+    let image = capture(case).expect("WARP/lavapipe/metal must read back the emoji scene");
+    let mut colored = 0usize;
+    let mut globe_ocean = 0usize;
+    let mut globe_land = 0usize;
+    let mut flag_red = 0usize;
+    let mut flag_band_saturated = 0usize;
+    let mut flag_band_ink = 0usize;
+    let width = image.width as usize;
+    for (index, pixel) in image.rgba8.as_chunks::<4>().0.iter().enumerate() {
+        let [r, g, b, a] = *pixel;
+        if a == 0 {
+            continue;
+        }
+        let span = r.max(g).max(b) - r.min(g).min(b);
+        if span >= 60 {
+            colored += 1;
+        }
+        if b > 120 && b > r.saturating_add(40) {
+            globe_ocean += 1;
+        }
+        if g > 120 && g > r.saturating_add(40) {
+            globe_land += 1;
+        }
+        if r > 150 && g < 100 && b < 110 {
+            flag_red += 1;
+        }
+        let y = index / width;
+        if FLAG_BAND.contains(&y) {
+            if span >= 60 {
+                flag_band_saturated += 1;
+            }
+            if r < 100 && g < 100 && b < 100 {
+                flag_band_ink += 1;
+            }
+        }
+    }
+    eprintln!(
+        "color emoji pixels: colored={colored} globe_ocean={globe_ocean} globe_land={globe_land} flag_red={flag_red} flag_band_saturated={flag_band_saturated} flag_band_ink={flag_band_ink}"
+    );
+    if colored == 0 {
+        eprintln!(
+            "skip color emoji: no colored pixels (reason: no color emoji font on this device)"
+        );
+        return;
+    }
+    assert!(
+        colored > 300,
+        "彩色字形必须产生足够的饱和像素（实测 {colored}，说明走的是单色 R8 路径）"
+    );
+    match ui_core::test_support::snapshot::device_dir() {
+        "warp" => {
+            assert!(
+                globe_ocean > 20 && globe_land > 20,
+                "🌍 必须同时有海洋蓝与陆地绿（ocean={globe_ocean}, land={globe_land}）"
+            );
+            assert_eq!(
+                flag_band_saturated, 0,
+                "Segoe UI Emoji 没有国旗字形：🇨🇳 行必须由单色字母渲染（实测 {flag_band_saturated} 个饱和像素）"
+            );
+            assert!(
+                flag_band_ink > 20,
+                "🇨🇳 行必须画出深色字母 CN（实测 {flag_band_ink} 个暗像素）"
+            );
+        }
+        "metal-real" => {
+            assert!(
+                globe_ocean > 20 && globe_land > 20,
+                "🌍 必须同时有海洋蓝与陆地绿（ocean={globe_ocean}, land={globe_land}）"
+            );
+            assert!(
+                flag_red > 20,
+                "Apple Color Emoji 必须为 🇨🇳 提供红色旗面（实测 {flag_red} 个像素）"
+            );
+        }
+        "lavapipe" => {
+            eprintln!(
+                "note: 🌍 在 Linux 上由 DejaVu Sans 的单色轮廓字形接管（font stack 未列 emoji 家族），\
+                 彩色证据来自 Noto Color Emoji 的国旗/家庭 ZWJ 字形"
+            );
+            assert!(
+                flag_red > 20,
+                "Noto Color Emoji 必须为 🇨🇳 提供红色旗面（实测 {flag_red} 个像素）"
+            );
+        }
+        other => panic!("color emoji 用例缺少设备目录 {other} 的期望"),
+    }
+}
+
+const FLAG_BAND: core::ops::Range<usize> = 112..160;
+
+#[test]
 fn golden_clip() {
     run_with(
         case(SnapshotScene::Clip, SnapshotTheme::Light, 1.0),

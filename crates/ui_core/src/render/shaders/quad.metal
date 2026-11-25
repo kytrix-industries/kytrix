@@ -48,6 +48,7 @@ fragment float4 ps_main(QuadVsOut in [[stage_in]],
                         device const ClipEntry* clips [[buffer(1)]],
                         texture2d_array<float> glyph_atlas [[texture(0)]],
                         texture2d_array<float> image_atlas [[texture(1)]],
+                        texture2d_array<float> color_glyph_atlas [[texture(2)]],
                         sampler atlas_sampler [[sampler(0)]]) {
     GpuPrimitive p = instances[in.instance];
     uint kind = uint(p.params1.z);
@@ -59,6 +60,9 @@ fragment float4 ps_main(QuadVsOut in [[stage_in]],
     if (kind == KYTRIX_KIND_GLYPH) {
         float coverage = glyph_atlas.sample(atlas_sampler, in.uv, 0u).r;
         color = p.color0 * coverage;
+    } else if (kind == KYTRIX_KIND_COLOR_GLYPH) {
+        float4 texel = color_glyph_atlas.sample(atlas_sampler, in.uv, 0u);
+        color = float4(texel.rgb * texel.a, texel.a);
     } else if (kind == KYTRIX_KIND_IMAGE) {
         color = image_atlas.sample(atlas_sampler, in.uv, uint(p.params1.y)) * p.color0;
     } else if (kind == KYTRIX_KIND_SHADOW) {

@@ -3,14 +3,14 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use windows::Win32::Graphics::{
     Direct3D12::*,
     Dxgi::Common::{
-        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_UNKNOWN,
-        DXGI_SAMPLE_DESC,
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
     },
 };
 
 use crate::{
     error::EngineError,
-    paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
+    paint::atlas::{ATLAS_KINDS, AtlasKind, MAX_IMAGE_PAGES},
     render::{
         AtlasArraySpec, AtlasPageRequest,
         atlas::{DirtyRects, MAX_RESIDENT_STAGING_BYTES, RectChunk, texel_bytes},
@@ -56,7 +56,8 @@ impl SharedPage {
 pub(crate) struct SharedAtlas {
     glyph: SharedPage,
     image: SharedPage,
-    shadow: [Mutex<Option<ShadowAtlas>>; 2],
+    color_glyph: SharedPage,
+    shadow: [Mutex<Option<ShadowAtlas>>; 3],
 }
 
 struct ShadowAtlas {
@@ -88,7 +89,8 @@ impl SharedAtlas {
         Ok(Self {
             glyph: SharedPage::new(device, AtlasKind::Glyph, placeholder)?,
             image: SharedPage::new(device, AtlasKind::Image, placeholder)?,
-            shadow: [Mutex::new(None), Mutex::new(None)],
+            color_glyph: SharedPage::new(device, AtlasKind::ColorGlyph, placeholder)?,
+            shadow: [Mutex::new(None), Mutex::new(None), Mutex::new(None)],
         })
     }
 
@@ -188,7 +190,7 @@ impl SharedAtlas {
         }
     }
 
-    pub(crate) fn shadow_snapshot(&self) -> [Option<ShadowAtlasSnapshot>; 2] {
+    pub(crate) fn shadow_snapshot(&self) -> [Option<ShadowAtlasSnapshot>; 3] {
         std::array::from_fn(|index| {
             shadow_lock(&self.shadow[index])
                 .as_ref()
@@ -203,6 +205,7 @@ impl SharedAtlas {
         match kind {
             AtlasKind::Glyph => &self.glyph,
             AtlasKind::Image => &self.image,
+            AtlasKind::ColorGlyph => &self.color_glyph,
         }
     }
 
@@ -210,6 +213,7 @@ impl SharedAtlas {
         match kind {
             AtlasKind::Glyph => &mut self.glyph,
             AtlasKind::Image => &mut self.image,
+            AtlasKind::ColorGlyph => &mut self.color_glyph,
         }
     }
 }
@@ -442,15 +446,15 @@ impl PendingUpload {
 }
 
 pub(crate) struct AtlasUploads {
-    pending: [[Option<PendingUpload>; MAX_IMAGE_PAGES as usize]; 2],
-    staging: [Option<AtlasStaging>; 2],
+    pending: [[Option<PendingUpload>; MAX_IMAGE_PAGES as usize]; 3],
+    staging: [Option<AtlasStaging>; 3],
 }
 
 impl AtlasUploads {
     pub(crate) fn new() -> Self {
         Self {
             pending: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            staging: [None, None],
+            staging: [None, None, None],
         }
     }
 
@@ -514,10 +518,10 @@ impl AtlasUploads {
 
     pub(crate) fn reconcile_pages(
         &mut self,
-        current: [AtlasArraySpec; 2],
+        current: [AtlasArraySpec; 3],
     ) -> Result<Vec<AtlasPageRequest>, EngineError> {
-        let mut rebuild: Vec<AtlasPageRequest> = Vec::with_capacity(2);
-        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+        let mut rebuild: Vec<AtlasPageRequest> = Vec::with_capacity(3);
+        for kind in ATLAS_KINDS {
             let index = kind.index() as usize;
             let current = current[index];
             let pending_spec = self.pending[index]
@@ -592,7 +596,7 @@ impl AtlasUploads {
         atlas: &SharedAtlas,
         retired: &mut Vec<GpuResourceHandle>,
     ) -> Result<(), EngineError> {
-        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+        for kind in ATLAS_KINDS {
             let index = kind.index() as usize;
             let Some(page) = self.pending[index]
                 .iter()
@@ -632,7 +636,7 @@ impl AtlasUploads {
         slot: usize,
     ) -> Result<Vec<GpuResourceHandle>, EngineError> {
         let mut retired = Vec::new();
-        for kind in [AtlasKind::Glyph, AtlasKind::Image] {
+        for kind in ATLAS_KINDS {
             let index = kind.index() as usize;
             let pendings: Vec<PendingUpload> = self.pending[index]
                 .iter_mut()
@@ -703,6 +707,7 @@ fn texture_format(kind: AtlasKind) -> windows::Win32::Graphics::Dxgi::Common::DX
     match kind {
         AtlasKind::Glyph => DXGI_FORMAT_R8_UNORM,
         AtlasKind::Image => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        AtlasKind::ColorGlyph => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
     }
 }
 
@@ -837,7 +842,9 @@ fn create_resource(
 mod tests {
     use windows::Win32::Graphics::{
         Direct3D12::D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM},
+        Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        },
     };
 
     use super::{AtlasUploads, STAGING_ROWS, SharedAtlas, align_up, resident_bytes};
@@ -930,6 +937,7 @@ mod tests {
                 .reconcile_pages([
                     self.atlas.spec(AtlasKind::Glyph),
                     self.atlas.spec(AtlasKind::Image),
+                    self.atlas.spec(AtlasKind::ColorGlyph),
                 ])
                 .expect("reconcile pages");
             for request in rebuild.drain(..) {
@@ -970,6 +978,7 @@ mod tests {
             let format = match kind {
                 AtlasKind::Glyph => DXGI_FORMAT_R8_UNORM,
                 AtlasKind::Image => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+                AtlasKind::ColorGlyph => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
             };
             let mut readback = Readback::new();
             readback
@@ -1021,7 +1030,7 @@ mod tests {
         );
         assert!(
             uploads
-                .reconcile_pages([spec(TEST_PAGE * 8, 1), spec(1, 1)])
+                .reconcile_pages([spec(TEST_PAGE * 8, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages")
                 .is_empty(),
             "非整页的旧页增量不应触发重建"
@@ -1041,14 +1050,14 @@ mod tests {
         );
         assert_eq!(
             uploads
-                .reconcile_pages([spec(TEST_PAGE * 8, 1), spec(1, 1)])
+                .reconcile_pages([spec(TEST_PAGE * 8, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages"),
             vec![request(AtlasKind::Glyph, TEST_PAGE, 1)],
             "整页上传必须要求把共享 array 重建到它自己的页尺寸"
         );
         assert!(
             uploads
-                .reconcile_pages([spec(TEST_PAGE, 1), spec(1, 1)])
+                .reconcile_pages([spec(TEST_PAGE, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages")
                 .is_empty(),
             "页已对齐时不再要求重建"
@@ -1071,7 +1080,7 @@ mod tests {
         }
         assert_eq!(
             uploads
-                .reconcile_pages([spec(1, 1), spec(1, 1)])
+                .reconcile_pages([spec(1, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages"),
             vec![request(AtlasKind::Image, TEST_PAGE, 4)],
             "按 extent 去重：数组只有一次重建，且层数取最大值"
@@ -1099,7 +1108,7 @@ mod tests {
         );
         assert!(
             uploads
-                .reconcile_pages([spec(1024, 1), spec(1, 1)])
+                .reconcile_pages([spec(1024, 1), spec(1, 1), spec(1, 1)])
                 .expect("reconcile pages")
                 .is_empty(),
             "旧页整页上传不得触发重建"
@@ -1656,7 +1665,7 @@ mod tests {
             );
         }
         let error = uploads
-            .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1)])
+            .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1), spec(1, 1)])
             .expect_err("缺层的扩层请求必须被拒绝");
         assert!(
             matches!(
@@ -1684,7 +1693,7 @@ mod tests {
             );
         }
         let error = uploads
-            .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1)])
+            .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1), spec(1, 1)])
             .expect_err("非整页的扩层请求必须被拒绝");
         assert!(
             matches!(
@@ -1714,7 +1723,7 @@ mod tests {
         }
         assert_eq!(
             uploads
-                .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1)])
+                .reconcile_pages([spec(TEST_PAGE, 3), spec(1, 1), spec(1, 1)])
                 .expect("全层整页的扩层请求必须被接受"),
             vec![request(AtlasKind::Image, TEST_PAGE, 3)],
             "一次重建、层数取最大值"
