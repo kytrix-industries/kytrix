@@ -9,10 +9,10 @@ use smol_str::{SmolStr, SmolStrBuilder};
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 use crate::{
-    a11y::A11yRole,
+    a11y::{A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    event::{Action, ActionSource, KeyCode, Modifiers},
+    event::{Action, ActionSource, ImeEvent, KeyCode, Modifiers},
     interaction::scroll,
     math::LogicalPx,
     node::{id::NodeId, tree::NodeTree},
@@ -22,6 +22,14 @@ use crate::{
 };
 
 const MASK_GLYPH: char = '\u{2022}';
+
+fn masked_text(raw: &str) -> SmolStr {
+    let mut text = SmolStrBuilder::with_capacity(raw.len());
+    for _ in raw.graphemes(true) {
+        text.push(MASK_GLYPH);
+    }
+    text.finish()
+}
 
 const UNDO_LIMIT: usize = 100;
 
@@ -203,6 +211,13 @@ pub struct TextEditMetrics {
     pub content_height: LogicalPx,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextEditComposition {
+    pub preedit: Range<usize>,
+    pub caret: usize,
+    pub clauses: Vec<Range<usize>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditableSpec {
     pub role: A11yRole,
@@ -230,15 +245,20 @@ impl EditableSpec {
         }
         if !matches!(
             self.role,
-            A11yRole::TextInput | A11yRole::MultilineTextInput
+            A11yRole::TextInput | A11yRole::MultilineTextInput | A11yRole::PasswordInput
         ) {
             return Err(SmolStr::new_static(
-                "editable role must be TextInput or MultilineTextInput",
+                "editable role must be TextInput, MultilineTextInput or PasswordInput",
             ));
         }
         if self.multiline != (self.role == A11yRole::MultilineTextInput) {
             return Err(SmolStr::new_static(
                 "editable role does not match its multiline flag",
+            ));
+        }
+        if self.masked != (self.role == A11yRole::PasswordInput) {
+            return Err(SmolStr::new_static(
+                "masked editable text must use the password role",
             ));
         }
         if !self.text_style.size.is_finite() || self.text_style.size <= LogicalPx::ZERO {
@@ -267,6 +287,17 @@ impl EditableSpec {
 pub(crate) enum DisplayText {
     Identity,
     Masked(MaskedDisplay),
+    Composed(ComposedDisplay),
+}
+
+impl DisplayText {
+    fn text<'a>(&'a self, committed: &'a str) -> &'a str {
+        match self {
+            Self::Identity => committed,
+            Self::Masked(masked) => &masked.text,
+            Self::Composed(composed) => &composed.text,
+        }
+    }
 }
 
 pub(crate) struct MaskedDisplay {
@@ -334,6 +365,296 @@ impl MaskedDisplay {
     }
 }
 
+pub(crate) struct ComposedDisplay {
+    text: SmolStr,
+    raw: Range<usize>,
+    preedit_display: Range<usize>,
+    caret_display: usize,
+    clauses_display: SmallVec<[Range<usize>; 4]>,
+    raw_starts: SmallVec<[u32; 8]>,
+    display_starts: SmallVec<[u32; 8]>,
+    display_lens: SmallVec<[u32; 8]>,
+    committed_len: usize,
+}
+
+impl ComposedDisplay {
+    fn new(committed: &str, masked: bool, composition: &Composition) -> Self {
+        let preedit = composition.text.as_str();
+        let raw = composition.raw.clone();
+        let prefix = &committed[..raw.start];
+        let suffix = &committed[raw.end..];
+        let bullet = MASK_GLYPH.len_utf8();
+        let prefix_clusters = prefix.graphemes(true).count();
+        let preedit_clusters = preedit.graphemes(true).count();
+        let suffix_clusters = suffix.graphemes(true).count();
+        let prefix_display_len = if masked {
+            prefix_clusters * bullet
+        } else {
+            prefix.len()
+        };
+        let preedit_display_len = if masked {
+            preedit_clusters * bullet
+        } else {
+            preedit.len()
+        };
+        let suffix_display_len = if masked {
+            suffix_clusters * bullet
+        } else {
+            suffix.len()
+        };
+        let preedit_display = prefix_display_len..prefix_display_len + preedit_display_len;
+        let caret_byte = composition.caret_utf16.map_or(preedit.len(), |units| {
+            byte_offset_for_utf16(preedit, units as usize)
+        });
+        let caret_in_preedit = if masked {
+            preedit[..caret_byte].graphemes(true).count() * bullet
+        } else {
+            caret_byte.min(preedit.len())
+        };
+        let caret_display = prefix_display_len + caret_in_preedit;
+        let mut clauses_display: SmallVec<[Range<usize>; 4]> = SmallVec::new();
+        for clause in &composition.clauses_utf16 {
+            let range = utf16_range_to_byte(preedit, clause);
+            let start = prefix_display_len + display_len_of(preedit, masked, 0, range.start);
+            let end = start + display_len_of(preedit, masked, range.start, range.end);
+            if end > start {
+                clauses_display.push(start..end);
+            }
+        }
+        let mut text = SmolStrBuilder::with_capacity(
+            prefix_display_len + preedit_display_len + suffix_display_len,
+        );
+        for segment in [prefix, preedit, suffix] {
+            if masked {
+                for _ in segment.graphemes(true) {
+                    text.push(MASK_GLYPH);
+                }
+            } else {
+                text.push_str(segment);
+            }
+        }
+        let text = text.finish();
+        let mut raw_starts: SmallVec<[u32; 8]> = SmallVec::new();
+        let mut display_starts: SmallVec<[u32; 8]> = SmallVec::new();
+        let mut display_lens: SmallVec<[u32; 8]> = SmallVec::new();
+        let mut prefix_index = 0usize;
+        let mut suffix_index = 0usize;
+        for (raw_byte, grapheme) in committed.grapheme_indices(true) {
+            if raw_byte >= raw.start && raw_byte < raw.end {
+                continue;
+            }
+            let display_start = if raw_byte < raw.start {
+                let start = if masked {
+                    prefix_index * bullet
+                } else {
+                    raw_byte
+                };
+                prefix_index += 1;
+                start
+            } else {
+                let start = prefix_display_len
+                    + preedit_display_len
+                    + if masked {
+                        suffix_index * bullet
+                    } else {
+                        raw_byte - raw.end
+                    };
+                suffix_index += 1;
+                start
+            };
+            let display_len = if masked {
+                MASK_GLYPH.len_utf8()
+            } else {
+                grapheme.len()
+            };
+            raw_starts.push(u32::try_from(raw_byte).unwrap_or(u32::MAX));
+            display_starts.push(u32::try_from(display_start).unwrap_or(u32::MAX));
+            display_lens.push(u32::try_from(display_len).unwrap_or(u32::MAX));
+        }
+        Self {
+            text,
+            raw,
+            preedit_display,
+            caret_display,
+            clauses_display,
+            raw_starts,
+            display_starts,
+            display_lens,
+            committed_len: committed.len(),
+        }
+    }
+
+    fn cluster_display_end(&self, cluster: usize) -> usize {
+        self.display_starts[cluster] as usize + self.display_lens[cluster] as usize
+    }
+
+    fn cluster_at_raw(&self, raw_byte: usize) -> Option<usize> {
+        if self.raw_starts.is_empty() {
+            return None;
+        }
+        Some(
+            self.raw_starts
+                .partition_point(|&start| start as usize <= raw_byte)
+                .saturating_sub(1),
+        )
+    }
+
+    fn cluster_at_display(&self, display_byte: usize) -> Option<usize> {
+        if self.display_starts.is_empty() {
+            return None;
+        }
+        Some(
+            self.display_starts
+                .partition_point(|&start| start as usize <= display_byte)
+                .saturating_sub(1),
+        )
+    }
+
+    fn raw_byte_for_display(&self, display_byte: usize) -> usize {
+        if display_byte >= self.text.len() {
+            return self.committed_len;
+        }
+        if display_byte >= self.preedit_display.start && display_byte < self.preedit_display.end {
+            return self.raw.start;
+        }
+        match self.cluster_at_display(display_byte) {
+            Some(cluster) => self.raw_starts[cluster] as usize,
+            None => self.raw.start,
+        }
+    }
+
+    #[cfg(test)]
+    fn display_byte_for_raw(&self, raw_byte: usize) -> usize {
+        if raw_byte == self.raw.start || (raw_byte > self.raw.start && raw_byte < self.raw.end) {
+            return self.preedit_display.start;
+        }
+        if raw_byte >= self.committed_len {
+            return self.text.len();
+        }
+        let Some(cluster) = self.cluster_at_raw(raw_byte) else {
+            return if raw_byte > self.raw.start {
+                self.text.len()
+            } else {
+                0
+            };
+        };
+        self.display_starts[cluster] as usize
+    }
+
+    fn caret_display_byte_for_raw(&self, raw_byte: usize) -> usize {
+        if raw_byte == self.raw.start {
+            return self.preedit_display.start;
+        }
+        if raw_byte >= self.committed_len {
+            return self.text.len();
+        }
+        if raw_byte < self.raw.start {
+            let Some(cluster) = self.cluster_at_raw(raw_byte) else {
+                return 0;
+            };
+            return if raw_byte == self.raw_starts[cluster] as usize {
+                self.display_starts[cluster] as usize
+            } else {
+                self.cluster_display_end(cluster)
+            };
+        }
+        if raw_byte < self.raw.end {
+            return self.preedit_display.end;
+        }
+        let Some(cluster) = self.cluster_at_raw(raw_byte) else {
+            return self.text.len();
+        };
+        if raw_byte == self.raw_starts[cluster] as usize {
+            self.display_starts[cluster] as usize
+        } else {
+            self.cluster_display_end(cluster)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Composition {
+    raw: Range<usize>,
+    text: SmolStr,
+    caret_utf16: Option<u32>,
+    clauses_utf16: SmallVec<[Range<usize>; 4]>,
+    selection_before: TextSelection,
+}
+
+impl Composition {
+    fn new(raw: Range<usize>, selection_before: TextSelection) -> Self {
+        Self {
+            raw,
+            text: SmolStr::default(),
+            caret_utf16: None,
+            clauses_utf16: SmallVec::new(),
+            selection_before,
+        }
+    }
+}
+
+fn display_len_of(text: &str, masked: bool, start: usize, end: usize) -> usize {
+    if masked {
+        text[start..end].graphemes(true).count() * MASK_GLYPH.len_utf8()
+    } else {
+        end.saturating_sub(start)
+    }
+}
+
+fn byte_offset_for_utf16(text: &str, units: usize) -> usize {
+    let mut remaining = units;
+    for (byte, ch) in text.char_indices() {
+        let width = ch.len_utf16();
+        if remaining < width {
+            return byte;
+        }
+        remaining -= width;
+        if remaining == 0 {
+            return byte + ch.len_utf8();
+        }
+    }
+    text.len()
+}
+
+fn utf16_range_to_byte(text: &str, range: &Range<usize>) -> Range<usize> {
+    let start = byte_offset_for_utf16(text, range.start);
+    let end = byte_offset_for_utf16(text, range.end).max(start);
+    start..end
+}
+
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+fn splice_preedit(
+    current: &str,
+    fragment: &str,
+    caret: Option<u32>,
+    replace: Option<&Range<usize>>,
+) -> (SmolStr, Option<u32>) {
+    let total = utf16_len(current);
+    let (mut start_units, mut end_units) = match replace {
+        Some(range) => (range.start.min(total), range.end.min(total)),
+        None => (0, total),
+    };
+    if start_units > end_units {
+        std::mem::swap(&mut start_units, &mut end_units);
+    }
+    let start_byte = byte_offset_for_utf16(current, start_units);
+    let end_byte = byte_offset_for_utf16(current, end_units).max(start_byte);
+    let caret = caret.map(|caret| {
+        let fragment_units = utf16_len(fragment);
+        u32::try_from(utf16_len(&current[..start_byte]) + (caret as usize).min(fragment_units))
+            .unwrap_or(u32::MAX)
+    });
+    let mut text =
+        SmolStrBuilder::with_capacity(current.len() - (end_byte - start_byte) + fragment.len());
+    text.push_str(&current[..start_byte]);
+    text.push_str(fragment);
+    text.push_str(&current[end_byte..]);
+    (text.finish(), caret)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EditKind {
     Insert,
@@ -341,6 +662,7 @@ pub(crate) enum EditKind {
     DeleteForward,
     Replace,
     Paste,
+    CompositionCommit,
 }
 
 impl EditKind {
@@ -452,7 +774,7 @@ fn merge_step(last: &mut UndoStep, step: &UndoStep) -> bool {
             last.selection_after = step.selection_after;
             true
         }
-        EditKind::Replace | EditKind::Paste => false,
+        EditKind::Replace | EditKind::Paste | EditKind::CompositionCommit => false,
     }
 }
 
@@ -468,6 +790,9 @@ pub(crate) struct EditableText {
     display: DisplayText,
     spec: EditableSpec,
     selection: TextSelection,
+    composition: Option<Composition>,
+    focused: bool,
+    a11y_value: SmolStr,
     generation: u64,
     snapshot: TextEditSnapshot,
     graphemes: usize,
@@ -494,6 +819,9 @@ impl EditableText {
             display: DisplayText::Identity,
             spec,
             selection,
+            composition: None,
+            focused: false,
+            a11y_value: SmolStr::default(),
             generation: 0,
             graphemes: 0,
             undo: UndoStack::default(),
@@ -524,11 +852,12 @@ impl EditableText {
         self.graphemes
     }
 
+    pub(crate) fn composing(&self) -> bool {
+        self.composition.is_some()
+    }
+
     pub(crate) fn display_text(&self) -> &str {
-        match &self.display {
-            DisplayText::Identity => &self.committed,
-            DisplayText::Masked(masked) => &masked.text,
-        }
+        self.display.text(&self.committed)
     }
 
     pub(crate) fn display_len(&self) -> usize {
@@ -541,7 +870,15 @@ impl EditableText {
             DisplayText::Masked(masked) => {
                 masked.raw_byte_for_display(&self.committed, display_byte)
             }
+            DisplayText::Composed(composed) => composed.raw_byte_for_display(display_byte),
         }
+    }
+
+    fn raw_range_for_display(&self, display: Range<usize>) -> Range<usize> {
+        let start = floor_char_boundary(&self.committed, self.raw_byte_for_display(display.start));
+        let end =
+            ceil_char_boundary(&self.committed, self.raw_byte_for_display(display.end)).max(start);
+        start..end
     }
 
     #[cfg(test)]
@@ -549,6 +886,7 @@ impl EditableText {
         match &self.display {
             DisplayText::Identity => raw_byte.min(self.committed.len()),
             DisplayText::Masked(masked) => masked.display_byte_for_raw(&self.committed, raw_byte),
+            DisplayText::Composed(composed) => composed.display_byte_for_raw(raw_byte),
         }
     }
 
@@ -557,6 +895,7 @@ impl EditableText {
         match &self.display {
             DisplayText::Identity => snap_caret_forward(&self.committed, raw_byte),
             DisplayText::Masked(masked) => masked.display_byte_after_raw(&self.committed, raw_byte),
+            DisplayText::Composed(composed) => composed.caret_display_byte_for_raw(raw_byte),
         }
     }
 
@@ -565,8 +904,8 @@ impl EditableText {
             generation: self.generation,
             text: Arc::clone(&self.committed),
             selection: self.selection,
-            composing: false,
-            focused: false,
+            composing: self.composition.is_some(),
+            focused: self.focused,
             can_undo: self.undo.undo_len() > 0,
             can_redo: self.undo.redo_len() > 0,
         }
@@ -577,20 +916,43 @@ impl EditableText {
         self.snapshot = self.build_snapshot();
     }
 
+    fn build_display(&self) -> DisplayText {
+        match &self.composition {
+            Some(composition) => DisplayText::Composed(ComposedDisplay::new(
+                &self.committed,
+                self.spec.masked,
+                composition,
+            )),
+            None if self.spec.masked => DisplayText::Masked(MaskedDisplay::new(&self.committed)),
+            None => DisplayText::Identity,
+        }
+    }
+
+    fn build_a11y_value(&self) -> SmolStr {
+        if self.spec.masked {
+            masked_text(&self.committed)
+        } else {
+            SmolStr::from(Arc::clone(&self.committed))
+        }
+    }
+
     fn install_committed(&mut self, next: String, text_changed: bool) -> bool {
         self.committed = Arc::from(next);
-        let display = if self.spec.masked {
-            DisplayText::Masked(MaskedDisplay::new(&self.committed))
-        } else {
-            DisplayText::Identity
+        let display = self.build_display();
+        let a11y_value = match &display {
+            DisplayText::Masked(masked) => masked.text.clone(),
+            DisplayText::Composed(_) | DisplayText::Identity => self.build_a11y_value(),
         };
+        self.a11y_value = a11y_value;
         let display_changed = match (&self.display, &display) {
             (DisplayText::Identity, DisplayText::Identity) => text_changed,
             (DisplayText::Masked(previous), DisplayText::Masked(next_display)) => {
                 previous.text.len() != next_display.text.len()
             }
             (DisplayText::Identity, DisplayText::Masked(_))
-            | (DisplayText::Masked(_), DisplayText::Identity) => true,
+            | (DisplayText::Masked(_), DisplayText::Identity)
+            | (DisplayText::Composed(_), _)
+            | (_, DisplayText::Composed(_)) => true,
         };
         self.display = display;
         #[cfg(test)]
@@ -635,6 +997,199 @@ impl EditableText {
 
     fn clear_history(&mut self) -> bool {
         self.undo.clear()
+    }
+
+    fn composition_start(&mut self) -> Option<bool> {
+        if self.composition.is_some() || self.spec.readonly || self.spec.disabled {
+            return None;
+        }
+        let selection_before = self.selection;
+        let raw = self.raw_range_for_display(selection_before.range());
+        self.composition = Some(Composition::new(raw, selection_before));
+        let display_changed = self.refresh_composition_display();
+        self.bump_generation();
+        Some(display_changed)
+    }
+
+    fn composition_update(
+        &mut self,
+        fragment: &str,
+        caret: Option<u32>,
+        clauses: &[Range<usize>],
+        replace: Option<&Range<usize>>,
+    ) -> Option<bool> {
+        if self.spec.readonly || self.spec.disabled {
+            return None;
+        }
+        let started = if self.composition.is_none() {
+            let selection_before = self.selection;
+            let raw = self.raw_range_for_display(selection_before.range());
+            self.composition = Some(Composition::new(raw, selection_before));
+            true
+        } else {
+            false
+        };
+        let sanitized = sanitize(fragment, self.spec.multiline);
+        let composition = self.composition.as_mut()?;
+        let previous_text = composition.text.clone();
+        let previous_caret = composition.caret_utf16;
+        let previous_clauses = composition.clauses_utf16.clone();
+        let (text, caret_utf16) = splice_preedit(&composition.text, &sanitized, caret, replace);
+        let changed = started
+            || previous_text != text
+            || previous_caret != caret_utf16
+            || previous_clauses.as_slice() != clauses;
+        if !changed {
+            return None;
+        }
+        composition.text = text;
+        composition.caret_utf16 = caret_utf16;
+        composition.clauses_utf16.clear();
+        composition.clauses_utf16.extend(clauses.iter().cloned());
+        let display_changed = self.refresh_composition_display();
+        self.bump_generation();
+        Some(display_changed)
+    }
+
+    fn composition_commit(
+        &mut self,
+        fragment: &str,
+        replace: Option<&Range<usize>>,
+    ) -> Option<bool> {
+        let composition = self.composition.take()?;
+        let sanitized = sanitize(fragment, self.spec.multiline);
+        let (text, _) = splice_preedit(&composition.text, &sanitized, None, replace);
+        let removed_graphemes = self.committed[composition.raw.clone()]
+            .graphemes(true)
+            .count();
+        let room = match self.spec.max_length {
+            Some(max) => max.saturating_sub(self.graphemes.saturating_sub(removed_graphemes)),
+            None => usize::MAX,
+        };
+        let inserted = truncate_graphemes(&text, Some(room));
+        if inserted.is_empty() && composition.raw.is_empty() {
+            let display_changed = self.refresh_composition_display();
+            let display_len = self.display_len();
+            let caret = self.caret_display_byte_for_raw(composition.raw.start);
+            self.selection = TextSelection::collapsed(TextCursor::at(caret, display_len));
+            self.bump_generation();
+            return Some(display_changed);
+        }
+        let removed: Arc<str> = Arc::from(&self.committed[composition.raw.clone()]);
+        let inserted_arc: Arc<str> = Arc::from(inserted);
+        let selection_before = composition.selection_before;
+        let Some(display_changed) =
+            self.write_committed(composition.raw.start, composition.raw.end, &inserted_arc)
+        else {
+            let display_changed = self.refresh_composition_display();
+            let display_len = self.display_len();
+            let caret = self.caret_display_byte_for_raw(composition.raw.start);
+            self.selection = TextSelection::collapsed(TextCursor::at(caret, display_len));
+            self.bump_generation();
+            return Some(display_changed);
+        };
+        let display_len = self.display_len();
+        let caret_raw = composition.raw.start + inserted_arc.len();
+        let caret_display = self.caret_display_byte_for_raw(caret_raw);
+        self.selection = TextSelection::collapsed(TextCursor::at(caret_display, display_len));
+        let step = UndoStep {
+            kind: EditKind::CompositionCommit,
+            range: composition.raw,
+            removed,
+            inserted: inserted_arc,
+            selection_before,
+            selection_after: self.selection,
+        };
+        self.undo.record(step);
+        self.bump_generation();
+        Some(display_changed)
+    }
+
+    fn insert_committed(&mut self, text: &str, kind: EditKind) -> Option<bool> {
+        let sanitized = sanitize(text, self.spec.multiline);
+        let range = self.raw_range_for_display(self.selection.range());
+        let removed = grapheme_count(&self.committed[range.clone()]);
+        let room = match self.spec.max_length {
+            Some(max) => max.saturating_sub(self.graphemes.saturating_sub(removed)),
+            None => usize::MAX,
+        };
+        let inserted = truncate_graphemes(&sanitized, Some(room));
+        if inserted.is_empty() {
+            return None;
+        }
+        let caret = range.start + inserted.len();
+        self.apply_edit(range, inserted, kind, AfterEdit::CollapsedAtRaw(caret))
+    }
+
+    fn cancel_composition(&mut self) -> Option<bool> {
+        let display_changed = self.drop_composition()?;
+        self.bump_generation();
+        Some(display_changed)
+    }
+
+    fn drop_composition(&mut self) -> Option<bool> {
+        let composition = self.composition.take()?;
+        let display_changed = self.refresh_composition_display();
+        let display_len = self.display_len();
+        let caret = self.caret_display_byte_for_raw(composition.raw.start);
+        self.selection = TextSelection::collapsed(TextCursor::at(caret, display_len));
+        Some(display_changed)
+    }
+
+    fn refresh_composition_display(&mut self) -> bool {
+        let display = self.build_display();
+        let display_changed = self.display.text(&self.committed) != display.text(&self.committed);
+        let display_len = display.text(&self.committed).len();
+        let caret = match &display {
+            DisplayText::Composed(composed) => composed.caret_display,
+            _ => 0,
+        };
+        self.display = display;
+        if self.composition.is_some() {
+            self.selection = TextSelection::collapsed(TextCursor::at(caret, display_len));
+        }
+        #[cfg(test)]
+        {
+            self.display_builds += 1;
+        }
+        display_changed
+    }
+
+    fn set_focused(&mut self, focused: bool) -> Option<bool> {
+        if self.focused == focused {
+            return None;
+        }
+        let display_changed = if !focused {
+            self.drop_composition().unwrap_or(false)
+        } else {
+            false
+        };
+        self.focused = focused;
+        self.bump_generation();
+        Some(display_changed)
+    }
+
+    fn a11y_patch(&self) -> A11yPatch {
+        A11yPatch {
+            role: Some(self.spec.role),
+            label: (!self.spec.label.is_empty()).then(|| self.spec.label.clone()),
+            placeholder: (!self.spec.placeholder.is_empty()).then(|| self.spec.placeholder.clone()),
+            value: Some(self.a11y_value.clone()),
+            read_only: Some(self.spec.readonly),
+            disabled: Some(self.spec.disabled),
+            ..A11yPatch::default()
+        }
+    }
+
+    fn composition_info(&self) -> Option<TextEditComposition> {
+        let DisplayText::Composed(composed) = &self.display else {
+            return None;
+        };
+        Some(TextEditComposition {
+            preedit: composed.preedit_display.clone(),
+            caret: composed.caret_display,
+            clauses: composed.clauses_display.iter().cloned().collect(),
+        })
     }
 
     fn apply_edit(
@@ -816,6 +1371,22 @@ pub(crate) fn snapshot(
     Ok(editable.snapshot().clone())
 }
 
+pub(crate) fn composition(
+    app: &App,
+    window: WindowId,
+    node: NodeId,
+) -> Result<Option<TextEditComposition>, EngineError> {
+    let tree = app
+        .window(window)
+        .ok_or(EngineError::UnknownWindow { window })?
+        .tree();
+    validate_node(tree, window, node)?;
+    let editable = tree
+        .editable(node)
+        .ok_or(EngineError::TextEditNotAvailable { node })?;
+    Ok(editable.composition_info())
+}
+
 pub(crate) fn set_value(
     app: &mut App,
     window: WindowId,
@@ -848,9 +1419,15 @@ pub(crate) fn set_value(
         let Some(editable) = tree.editable_mut(node) else {
             return Err(EngineError::TextEditNotAvailable { node });
         };
+        let cancelled = editable.cancel_composition();
         let generation = editable.generation;
         let (changed, display) = editable.assign_committed(truncated);
-        let touched = changed || editable.generation != generation;
+        let display = match (display, cancelled) {
+            (Some(display), _) => Some(display),
+            (None, Some(true)) => Some(SmolStr::new(editable.display_text())),
+            _ => None,
+        };
+        let touched = changed || cancelled.is_some() || editable.generation != generation;
         (changed, display, touched)
     };
     {
@@ -864,6 +1441,7 @@ pub(crate) fn set_value(
         }
         if touched {
             tree.mark_a11y(node);
+            sync_a11y_patch(tree, node);
         }
     }
     if touched {
@@ -907,7 +1485,33 @@ pub(crate) fn metrics(
     })
 }
 
+pub(crate) fn cancel_composition(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+) -> Result<bool, EngineError> {
+    let result = {
+        let target = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?;
+        let tree = target.tree_mut();
+        validate_node(tree, window, node)?;
+        let Some(editable) = tree.editable_mut(node) else {
+            return Err(EngineError::TextEditNotAvailable { node });
+        };
+        match editable.cancel_composition() {
+            Some(display_changed) => CommitResult::changed(
+                display_changed.then(|| SmolStr::new(editable.display_text())),
+                editable.spec().text_style.clone(),
+            ),
+            None => CommitResult::none(),
+        }
+    };
+    commit_result(app, window, node, result)
+}
+
 pub(crate) fn undo(app: &mut App, window: WindowId, node: NodeId) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node);
     let result = {
         let target = app
             .window_mut(window)
@@ -933,6 +1537,7 @@ pub(crate) fn undo(app: &mut App, window: WindowId, node: NodeId) -> Result<bool
 }
 
 pub(crate) fn redo(app: &mut App, window: WindowId, node: NodeId) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node);
     let result = {
         let target = app
             .window_mut(window)
@@ -981,6 +1586,19 @@ impl CommitResult {
     }
 }
 
+fn write_commit_effects(tree: &mut NodeTree, node: NodeId, result: CommitResult) -> bool {
+    if !result.changed {
+        return false;
+    }
+    if let (Some(display), Some(style)) = (result.display, result.style) {
+        tree.set_text_content(node, TextContent::new(display, style));
+    }
+    tree.mark_paint(node);
+    tree.mark_a11y(node);
+    sync_a11y_patch(tree, node);
+    true
+}
+
 fn commit_result(
     app: &mut App,
     window: WindowId,
@@ -990,19 +1608,19 @@ fn commit_result(
     if !result.changed {
         return Ok(false);
     }
-    {
-        let target = app
-            .window_mut(window)
-            .ok_or(EngineError::UnknownWindow { window })?;
-        let tree = target.tree_mut();
-        if let (Some(display), Some(style)) = (result.display, result.style) {
-            tree.set_text_content(node, TextContent::new(display, style));
-        }
-        tree.mark_paint(node);
-        tree.mark_a11y(node);
-    }
+    let Some(target) = app.window_mut(window) else {
+        return Err(EngineError::UnknownWindow { window });
+    };
+    write_commit_effects(target.tree_mut(), node, result);
     app.request_frame();
     Ok(true)
+}
+
+pub(crate) fn sync_a11y_patch(tree: &mut NodeTree, node: NodeId) {
+    let Some(patch) = tree.editable(node).map(EditableText::a11y_patch) else {
+        return;
+    };
+    crate::a11y::tree::write_a11y_patch(tree, node, patch);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1027,6 +1645,7 @@ pub(crate) fn apply_motion(
     motion: TextMotion,
     extend: bool,
 ) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node);
     let page_height = if matches!(motion, TextMotion::PageUp | TextMotion::PageDown) {
         page_viewport_height(app, window, node)
     } else {
@@ -1092,7 +1711,7 @@ pub(crate) fn set_selection(
     anchor_byte: usize,
     focus_byte: usize,
 ) -> Result<bool, EngineError> {
-    let display_len = {
+    let (display_len, composing) = {
         let tree = app
             .window(window)
             .ok_or(EngineError::UnknownWindow { window })?
@@ -1101,7 +1720,7 @@ pub(crate) fn set_selection(
         let editable = tree
             .editable(node)
             .ok_or(EngineError::TextEditNotAvailable { node })?;
-        editable.display_len()
+        (editable.display_len(), editable.composing())
     };
     let anchor = anchor_byte.min(display_len);
     let focus = focus_byte.min(display_len);
@@ -1116,6 +1735,47 @@ pub(crate) fn set_selection(
             )
         })?
     };
+    if composing {
+        let (raw_anchor, raw_focus) = {
+            let tree = app
+                .window(window)
+                .ok_or(EngineError::UnknownWindow { window })?
+                .tree();
+            validate_node(tree, window, node)?;
+            let editable = tree
+                .editable(node)
+                .ok_or(EngineError::TextEditNotAvailable { node })?;
+            (
+                editable.raw_byte_for_display(anchor),
+                editable.raw_byte_for_display(focus),
+            )
+        };
+        let _ = cancel_composition(app, window, node)?;
+        let (display_len, display_anchor, display_focus) = {
+            let tree = app
+                .window(window)
+                .ok_or(EngineError::UnknownWindow { window })?
+                .tree();
+            validate_node(tree, window, node)?;
+            let editable = tree
+                .editable(node)
+                .ok_or(EngineError::TextEditNotAvailable { node })?;
+            (
+                editable.display_len(),
+                editable.caret_display_byte_for_raw(raw_anchor),
+                editable.caret_display_byte_for_raw(raw_focus),
+            )
+        };
+        return store_selection(
+            app,
+            window,
+            node,
+            TextSelection::ranged(
+                TextCursor::at(display_anchor, display_len),
+                TextCursor::at(display_focus, display_len),
+            ),
+        );
+    }
     store_selection(
         app,
         window,
@@ -1179,6 +1839,7 @@ pub(crate) fn insert_text(
     text: &str,
     kind: EditKind,
 ) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node);
     let prepared = with_editable_layout(app, window, node, |editable, _layout| {
         if editable.spec().readonly || editable.spec().disabled {
             return None;
@@ -1270,6 +1931,7 @@ pub(crate) fn cut_selection(
     window: WindowId,
     node: NodeId,
 ) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node);
     let prepared = {
         let tree = app
             .window(window)
@@ -1325,6 +1987,7 @@ fn delete_side(
     forward: bool,
     word: bool,
 ) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node);
     let prepared = with_editable_layout(app, window, node, |editable, layout| {
         if editable.spec().readonly || editable.spec().disabled {
             return None;
@@ -1393,6 +2056,7 @@ fn apply_raw_edit(
     kind: EditKind,
     after: AfterEdit,
 ) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node);
     let result = {
         let target = app
             .window_mut(window)
@@ -1431,6 +2095,7 @@ fn store_selection(
     node: NodeId,
     selection: TextSelection,
 ) -> Result<bool, EngineError> {
+    let _ = cancel_composition(app, window, node);
     let changed = {
         let target = app
             .window_mut(window)
@@ -1444,6 +2109,7 @@ fn store_selection(
         if changed {
             tree.mark_paint(node);
             tree.mark_a11y(node);
+            sync_a11y_patch(tree, node);
         }
         changed
     };
@@ -1695,11 +2361,92 @@ fn grapheme_count(text: &str) -> usize {
     text.graphemes(true).count()
 }
 
-pub(crate) fn handle_text(app: &mut App, window: WindowId, text: &str) -> bool {
+pub(crate) fn handle_ime(app: &mut App, window: WindowId, event: &ImeEvent) -> bool {
     let Some(context) = focused_editable(app, window) else {
         return false;
     };
     if context.readonly {
+        return true;
+    }
+    if ime_edit(app, window, context.node, event) {
+        app.request_frame();
+    }
+    true
+}
+
+fn ime_edit(app: &mut App, window: WindowId, node: NodeId, event: &ImeEvent) -> bool {
+    let Some(target) = app.window_mut(window) else {
+        return false;
+    };
+    let tree = target.tree_mut();
+    let Some(editable) = tree.editable_mut(node) else {
+        return false;
+    };
+    let edit = match event {
+        ImeEvent::Start => editable.composition_start(),
+        ImeEvent::Preedit {
+            text,
+            caret,
+            clauses,
+            replace,
+        } => editable.composition_update(text, *caret, clauses, replace.as_ref()),
+        ImeEvent::End => editable.cancel_composition(),
+        ImeEvent::Commit { text, replace } => {
+            if editable.composing() {
+                editable.composition_commit(text, replace.as_ref())
+            } else {
+                editable.insert_committed(text, EditKind::CompositionCommit)
+            }
+        }
+    };
+    let result = match edit {
+        Some(display_changed) => CommitResult::changed(
+            display_changed.then(|| SmolStr::new(editable.display_text())),
+            editable.spec().text_style.clone(),
+        ),
+        None => CommitResult::none(),
+    };
+    write_commit_effects(tree, node, result)
+}
+
+pub(crate) fn apply_focus(tree: &mut NodeTree, node: NodeId, focused: bool) -> bool {
+    let display_changed = {
+        let Some(editable) = tree.editable_mut(node) else {
+            return false;
+        };
+        editable.set_focused(focused)
+    };
+    let Some(display_changed) = display_changed else {
+        return false;
+    };
+    if display_changed {
+        let (text, style) = {
+            let editable = tree.editable(node).expect("刚检查过");
+            (
+                SmolStr::new(editable.display_text()),
+                editable.spec().text_style.clone(),
+            )
+        };
+        tree.set_text_content(node, TextContent::new(text, style));
+    }
+    tree.mark_paint(node);
+    tree.mark_a11y(node);
+    sync_a11y_patch(tree, node);
+    true
+}
+
+pub(crate) fn cancel_composition_on_focus_loss(app: &mut App, window: WindowId) {
+    let Some(node) = app.focused(window) else {
+        return;
+    };
+    let _ = cancel_composition(app, window, node);
+}
+
+pub(crate) fn handle_text(app: &mut App, window: WindowId, text: &str) -> bool {
+    let Some(context) = focused_editable(app, window) else {
+        return false;
+    };
+    if context.composing || context.readonly {
         return true;
     }
     let _ = insert_text(app, window, context.node, text, EditKind::Insert);
@@ -1717,6 +2464,16 @@ pub(crate) fn handle_key(
         return false;
     };
     let node = context.node;
+    if context.composing {
+        return match code {
+            KeyCode::Escape if modifiers.is_empty() => {
+                let _ = cancel_composition(app, window, node);
+                true
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => true,
+            _ => false,
+        };
+    }
     let shift = modifiers.contains(Modifiers::SHIFT);
     let alt_gr = modifiers.contains(Modifiers::CONTROL) && modifiers.contains(Modifiers::ALT);
     let rest = modifiers.difference(Modifiers::SHIFT);
@@ -1889,6 +2646,7 @@ struct KeyContext {
     node: NodeId,
     multiline: bool,
     readonly: bool,
+    composing: bool,
     submit: Option<Action>,
 }
 
@@ -1903,6 +2661,7 @@ fn focused_editable(app: &App, window: WindowId) -> Option<KeyContext> {
         node,
         multiline: editable.spec().multiline,
         readonly: editable.spec().readonly,
+        composing: editable.composing(),
         submit: editable.spec().submit.clone(),
     })
 }
@@ -2006,7 +2765,8 @@ mod tests {
 
     use super::{
         DisplayText, EditableSpec, EditableText, MASK_GLYPH, TextAffinity, TextCursor,
-        TextSelection, sanitize, snap_caret_forward, truncate_graphemes,
+        TextSelection, byte_offset_for_utf16, sanitize, snap_caret_forward, splice_preedit,
+        truncate_graphemes,
     };
     use crate::{a11y::A11yRole, event::Action, math::px, paint::color::Color, text::TextStyle};
 
@@ -2031,6 +2791,7 @@ mod tests {
 
     fn masked_spec(max_length: Option<usize>) -> EditableSpec {
         EditableSpec {
+            role: A11yRole::PasswordInput,
             masked: true,
             max_length,
             ..spec()
@@ -2058,6 +2819,7 @@ mod tests {
         multiline.role = A11yRole::MultilineTextInput;
         multiline.multiline = true;
         assert!(multiline.validate().is_ok());
+        assert!(masked_spec(None).validate().is_ok());
     }
 
     #[test]
@@ -2075,7 +2837,7 @@ mod tests {
         wrong_role.role = A11yRole::Button;
         assert_eq!(
             wrong_role.validate().unwrap_err(),
-            "editable role must be TextInput or MultilineTextInput"
+            "editable role must be TextInput, MultilineTextInput or PasswordInput"
         );
 
         let mut role_mismatch = spec();
@@ -2083,6 +2845,29 @@ mod tests {
         assert_eq!(
             role_mismatch.validate().unwrap_err(),
             "editable role does not match its multiline flag"
+        );
+
+        let mut masked_text_input = spec();
+        masked_text_input.masked = true;
+        assert_eq!(
+            masked_text_input.validate().unwrap_err(),
+            "masked editable text must use the password role"
+        );
+
+        let mut plain_password = spec();
+        plain_password.role = A11yRole::PasswordInput;
+        assert_eq!(
+            plain_password.validate().unwrap_err(),
+            "masked editable text must use the password role"
+        );
+
+        let mut multiline_password = spec();
+        multiline_password.role = A11yRole::PasswordInput;
+        multiline_password.masked = true;
+        multiline_password.multiline = true;
+        assert_eq!(
+            multiline_password.validate().unwrap_err(),
+            "masked editable text cannot be multiline"
         );
 
         let mut bad_size = spec();
@@ -2309,5 +3094,244 @@ mod tests {
         assert_eq!(snap_caret_forward("👨‍👩‍👧", 4), "👨‍👩‍👧".len());
         assert_eq!(snap_caret_forward("", 0), 0);
         assert_eq!(snap_caret_forward("abc", 99), 3);
+    }
+
+    fn editable_with(text: &str) -> EditableText {
+        let mut editable = EditableText::new(spec());
+        editable.assign_committed(text);
+        editable
+    }
+
+    fn select_at(editable: &mut EditableText, start: usize, end: usize) {
+        let display_len = editable.display_len();
+        editable.selection = TextSelection::ranged(
+            TextCursor::at(start, display_len),
+            TextCursor::at(end, display_len),
+        );
+    }
+
+    fn start_composition(editable: &mut EditableText) {
+        assert!(editable.composition_start().is_some(), "组合必须启动");
+    }
+
+    #[test]
+    fn composed_identity_display_maps_display_and_raw_around_the_preedit() {
+        let mut editable = editable_with("abcd");
+        select_at(&mut editable, 2, 2);
+        start_composition(&mut editable);
+        assert!(
+            editable
+                .composition_update("ni", Some(2), &[], None)
+                .is_some()
+        );
+        assert_eq!(editable.display_text(), "abnicd");
+        assert_eq!(editable.committed(), "abcd");
+        let info = editable.composition_info().expect("组合信息");
+        assert_eq!(info.preedit, 2..4);
+        assert_eq!(info.caret, 4);
+        assert!(info.clauses.is_empty());
+
+        for (display, raw) in [(0, 0), (1, 1), (2, 2), (3, 2), (4, 2), (5, 3), (6, 4)] {
+            assert_eq!(
+                editable.raw_byte_for_display(display),
+                raw,
+                "display {display} → raw"
+            );
+        }
+        assert_eq!(editable.display_byte_for_raw(0), 0);
+        assert_eq!(editable.display_byte_for_raw(1), 1);
+        assert_eq!(editable.display_byte_for_raw(2), 2);
+        assert_eq!(
+            editable.display_byte_for_raw(3),
+            5,
+            "suffix 之后的 raw 起点映射到 shift 后的 display"
+        );
+        assert_eq!(editable.display_byte_for_raw(4), 6);
+        assert_eq!(
+            editable.caret_display_byte_for_raw(2),
+            2,
+            "组合起点 caret 在 preedit 前"
+        );
+        assert_eq!(editable.caret_display_byte_for_raw(3), 5);
+        assert_eq!(editable.caret_display_byte_for_raw(4), 6);
+    }
+
+    #[test]
+    fn composed_display_handles_a_replaced_selection() {
+        let mut editable = editable_with("abcd");
+        select_at(&mut editable, 1, 3);
+        start_composition(&mut editable);
+        assert!(
+            editable
+                .composition_update("xy", Some(1), &[], None)
+                .is_some()
+        );
+        assert_eq!(editable.display_text(), "axyd");
+        assert_eq!(editable.committed(), "abcd");
+        let info = editable.composition_info().expect("组合信息");
+        assert_eq!(info.preedit, 1..3);
+        assert_eq!(info.caret, 2);
+        assert_eq!(editable.raw_byte_for_display(0), 0);
+        assert_eq!(editable.raw_byte_for_display(1), 1);
+        assert_eq!(
+            editable.raw_byte_for_display(2),
+            1,
+            "preedit 内映射到组合起点"
+        );
+        assert_eq!(editable.raw_byte_for_display(3), 3);
+        assert_eq!(editable.raw_byte_for_display(4), 4);
+        assert_eq!(editable.caret_display_byte_for_raw(1), 1);
+        assert_eq!(
+            editable.caret_display_byte_for_raw(2),
+            3,
+            "组合终点 caret 在 preedit 后"
+        );
+        assert_eq!(editable.caret_display_byte_for_raw(3), 3);
+        assert_eq!(editable.caret_display_byte_for_raw(4), 4);
+
+        assert!(editable.cancel_composition().is_some());
+        assert_eq!(editable.display_text(), "abcd");
+        assert_eq!(editable.caret_display_byte_for_raw(2), 2);
+    }
+
+    #[test]
+    fn composed_masked_display_uses_one_bullet_per_preedit_grapheme() {
+        let mut editable = EditableText::new(masked_spec(None));
+        editable.assign_committed("ab");
+        editable.selection = TextSelection::collapsed(TextCursor::at(6, 6));
+        start_composition(&mut editable);
+        assert!(
+            editable
+                .composition_update("👨‍👩‍👧x", None, &[], None)
+                .is_some()
+        );
+        assert_eq!(editable.display_text(), "••••");
+        assert_eq!(editable.committed(), "ab");
+        let info = editable.composition_info().expect("组合信息");
+        assert_eq!(info.preedit, 6..12);
+        assert_eq!(info.caret, 12, "caret=None 落在 preedit 末尾");
+        let patch = editable.a11y_patch();
+        assert_eq!(
+            patch.value.as_deref(),
+            Some("••"),
+            "a11y value 不含 preedit"
+        );
+        assert!(patch.selection.is_none(), "降级后 a11y patch 不写选区");
+        assert_eq!(editable.raw_byte_for_display(6), 2);
+        assert_eq!(editable.raw_byte_for_display(9), 2);
+        assert_eq!(editable.raw_byte_for_display(12), 2);
+        assert_eq!(editable.raw_byte_for_display(11), 2);
+        assert_eq!(editable.display_byte_for_raw(1), 3);
+        assert_eq!(editable.display_byte_for_raw(2), 6);
+        assert_eq!(editable.caret_display_byte_for_raw(2), 6);
+
+        assert!(editable.composition_update("👨‍👩‍👧", None, &[], None).is_some());
+        assert_eq!(editable.display_text(), "•••");
+        assert_eq!(
+            editable.raw_byte_for_display(7),
+            2,
+            "preedit 内映射到组合起点"
+        );
+        assert_eq!(
+            editable.caret_display_byte_for_raw(2),
+            6,
+            "组合起点 caret 在 preedit 前"
+        );
+
+        assert!(
+            editable
+                .composition_update("e\u{301}", None, &[], None)
+                .is_some()
+        );
+        assert_eq!(
+            editable.display_text(),
+            "•••",
+            "组合字符簇在掩码 display 里仍是一个 •"
+        );
+        let info = editable.composition_info().expect("组合信息");
+        assert_eq!(info.preedit, 6..9);
+        assert_eq!(info.caret, 9);
+    }
+
+    #[test]
+    fn composition_commit_replaces_the_raw_range_and_records_one_undo_step() {
+        let mut editable = editable_with("abcd");
+        select_at(&mut editable, 1, 3);
+        start_composition(&mut editable);
+        assert!(
+            editable
+                .composition_update("ni", Some(2), &[], None)
+                .is_some()
+        );
+        assert!(editable.composition_commit("你", None).is_some());
+        assert_eq!(editable.committed(), "a你d");
+        assert_eq!(editable.display_text(), "a你d");
+        assert!(!editable.composing());
+        assert_eq!(editable.undo_stats().0, 1, "一次组合提交 = 一步 undo");
+        assert!(editable.undo().is_some());
+        assert_eq!(editable.committed(), "abcd");
+        assert_eq!(editable.selection().range(), 1..3, "撤销恢复组合前选区");
+        assert!(editable.redo().is_some());
+        assert_eq!(editable.committed(), "a你d");
+    }
+
+    #[test]
+    fn composition_commit_clips_to_grapheme_max_length() {
+        let mut editable = EditableText::new(masked_spec(Some(2)));
+        editable.assign_committed("a");
+        editable.selection = TextSelection::collapsed(TextCursor::at(3, 3));
+        start_composition(&mut editable);
+        assert!(editable.composition_update("👨‍👩‍👧", None, &[], None).is_some());
+        assert!(editable.composition_commit("🇨🇳x", None).is_some());
+        assert_eq!(editable.committed(), "a🇨🇳");
+        assert_eq!(editable.display_text(), "••");
+    }
+
+    #[test]
+    fn composition_end_is_idempotent_and_restores_the_caret() {
+        let mut editable = editable_with("abcd");
+        select_at(&mut editable, 2, 2);
+        start_composition(&mut editable);
+        assert!(editable.composition_update("ni", None, &[], None).is_some());
+        assert!(editable.cancel_composition().is_some());
+        assert_eq!(editable.display_text(), "abcd");
+        assert!(!editable.composing());
+        assert_eq!(editable.selection().range(), 2..2);
+        assert!(editable.cancel_composition().is_none(), "重复取消幂等");
+    }
+
+    #[test]
+    fn splice_preedit_applies_utf16_replace_ranges_and_caret_offsets() {
+        let (text, caret) = splice_preedit("ni", "hao", Some(3), Some(&(0..1)));
+        assert_eq!(text, "haoi");
+        assert_eq!(caret, Some(3));
+
+        let (text, caret) = splice_preedit("你好", "a", Some(0), Some(&(1..2)));
+        assert_eq!(text, "你a");
+        assert_eq!(
+            caret,
+            Some(1),
+            "替换起点前的 UTF-16 单位数 + fragment caret"
+        );
+
+        let (text, caret) = splice_preedit("ni", "你", Some(1), None);
+        assert_eq!(text, "你");
+        assert_eq!(caret, Some(1));
+
+        let (text, caret) = splice_preedit("", "🌍a", Some(1), None);
+        assert_eq!(text, "🌍a");
+        assert_eq!(caret, Some(1), "fragment caret 按 UTF-16 单位");
+    }
+
+    #[test]
+    fn byte_offset_for_utf16_lands_on_char_boundaries() {
+        assert_eq!(byte_offset_for_utf16("ni你好", 0), 0);
+        assert_eq!(byte_offset_for_utf16("ni你好", 2), 2);
+        assert_eq!(byte_offset_for_utf16("ni你好", 3), 5);
+        assert_eq!(byte_offset_for_utf16("ni你好", 4), 8);
+        assert_eq!(byte_offset_for_utf16("ni你好", 99), 8);
+        assert_eq!(byte_offset_for_utf16("🌍a", 1), 0, "代理对中间落到字符起点");
+        assert_eq!(byte_offset_for_utf16("🌍a", 2), 4);
+        assert_eq!(byte_offset_for_utf16("🌍a", 3), 5);
     }
 }

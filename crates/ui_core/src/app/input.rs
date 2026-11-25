@@ -791,6 +791,7 @@ pub(crate) fn click_count(
 pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
     app.held_keys.remove(&window);
     app.consumed_keys.remove(&window);
+    crate::text_edit::cancel_composition_on_focus_loss(app, window);
     if app
         .windows
         .get_mut(&window)

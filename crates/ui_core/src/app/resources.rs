@@ -265,6 +265,12 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, event: Event) {
                 return;
             }
         }
+        Event::Ime(ime) => {
+            app.sync_clock();
+            if crate::text_edit::handle_ime(app, window, ime) {
+                return;
+            }
+        }
         Event::FocusChanged { focused } => {
             if !focused {
                 app.on_window_focus_lost(window);

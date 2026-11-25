@@ -94,6 +94,7 @@ pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -
         target.request_damage(screen);
     }
     for changed in [old, node].into_iter().flatten() {
+        crate::text_edit::apply_focus(target.tree_mut(), changed, Some(changed) == node);
         let has_ring = target.tree().focus_ring(changed).is_some();
         target.tree_mut().mark_a11y(changed);
         if has_ring {

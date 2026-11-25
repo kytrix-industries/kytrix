@@ -4,7 +4,7 @@ use super::App;
 use crate::{
     a11y::A11yRole,
     error::EngineError,
-    event::{Action, Event, InputEvent, KeyCode, KeyState, Modifiers},
+    event::{Action, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers},
     interaction::{ScrollAxis, ScrollConfig},
     math::{LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
@@ -79,6 +79,7 @@ fn mount_with_style(app: &mut App, window: WindowId, spec: EditableSpec, style: 
 
 fn masked_spec(style: TextStyle, max_length: Option<usize>) -> EditableSpec {
     EditableSpec {
+        role: A11yRole::PasswordInput,
         masked: true,
         max_length,
         ..spec(style, false)
@@ -2909,4 +2910,1260 @@ fn each_keystroke_shapes_at_most_once() {
     assert_eq!(app.shape_count_for_test(), base + 2, "每个键最多一次 shape");
     frame(&mut app, window);
     assert_eq!(app.shape_count_for_test(), base + 2, "空闲帧不 shape");
+}
+
+fn dispatch_ime(app: &mut App, window: WindowId, event: ImeEvent) -> bool {
+    app.dispatch(window, Event::Ime(event));
+    !app.drain_events()
+        .iter()
+        .any(|(_, queued)| matches!(queued, Event::Ime(_)))
+}
+
+fn preedit(
+    app: &mut App,
+    window: WindowId,
+    text: &str,
+    caret: Option<u32>,
+    clauses: smallvec::SmallVec<[std::ops::Range<usize>; 4]>,
+    replace: Option<std::ops::Range<usize>>,
+) -> bool {
+    dispatch_ime(
+        app,
+        window,
+        ImeEvent::Preedit {
+            text: smol_str::SmolStr::new(text),
+            caret,
+            clauses,
+            replace,
+        },
+    )
+}
+
+fn commit_ime(
+    app: &mut App,
+    window: WindowId,
+    text: &str,
+    replace: Option<std::ops::Range<usize>>,
+) -> bool {
+    dispatch_ime(
+        app,
+        window,
+        ImeEvent::Commit {
+            text: smol_str::SmolStr::new(text),
+            replace,
+        },
+    )
+}
+
+fn composition_of(
+    app: &App,
+    window: WindowId,
+    node: NodeId,
+) -> Option<crate::text_edit::TextEditComposition> {
+    app.text_edit_composition(window, node).expect("组合快照")
+}
+
+fn display_builds(app: &App, window: WindowId, node: NodeId) -> u32 {
+    app.window(window)
+        .expect("窗口存在")
+        .tree()
+        .editable(node)
+        .expect("可编辑槽位")
+        .display_builds()
+}
+
+#[test]
+fn ime_preedit_composes_identity_display_around_the_caret() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(2),
+        smallvec::smallvec![0..2],
+        None,
+    ));
+    assert_eq!(display_mirror(&app, window, node), "abnicd");
+    assert_eq!(text_of(&app, window, node), "abcd", "组合不写 committed");
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(snapshot.composing);
+    assert!(snapshot.focused);
+    assert_eq!(
+        snapshot.selection.range(),
+        4..4,
+        "选区折叠到组合内 caret（ab + ni）"
+    );
+    let composition = composition_of(&app, window, node).expect("组合期必须有 display 信息");
+    assert_eq!(composition.preedit, 2..4);
+    assert_eq!(composition.caret, 4);
+    assert_eq!(composition.clauses, vec![2..4]);
+}
+
+#[test]
+fn ime_preedit_masks_each_preedit_grapheme_and_maps_committed_text() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+        "ab",
+    );
+    assert_eq!(caret_of(&app, window, node), 6, "•• 末尾");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert_eq!(display_mirror(&app, window, node), "••••");
+    assert_eq!(text_of(&app, window, node), "ab");
+    let snapshot = snapshot_of(&app, window, node);
+    assert_eq!(
+        snapshot.selection.range(),
+        12..12,
+        "组合 caret 在两字 preedit 末尾"
+    );
+    let composition = composition_of(&app, window, node).expect("组合 display");
+    assert_eq!(composition.preedit, 6..12);
+    assert_eq!(composition.caret, 12);
+
+    assert!(preedit(
+        &mut app,
+        window,
+        "👨‍👩‍👧",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert_eq!(
+        display_mirror(&app, window, node),
+        "•••",
+        "组合串按字素一个 •"
+    );
+    assert_eq!(
+        composition_of(&app, window, node).expect("组合").preedit,
+        6..9
+    );
+    frame(&mut app, window);
+    assert_eq!(
+        display_mirror(&app, window, node),
+        "•••",
+        "组合期掩码 display 必须能被文本 pass 整形"
+    );
+}
+
+#[test]
+fn ime_clauses_are_converted_to_display_bytes() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "ab",
+    );
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni你好",
+        Some(2),
+        smallvec::smallvec![2..3],
+        None,
+    ));
+    assert_eq!(display_mirror(&app, window, node), "abni你好");
+    let composition = composition_of(&app, window, node).expect("组合");
+    assert_eq!(composition.preedit, 2..10);
+    assert_eq!(composition.caret, 4);
+    assert_eq!(
+        composition.clauses,
+        vec![4..7],
+        "UTF-16 2..3 = '你' 的 3 个 display 字节"
+    );
+
+    let masked = mount_editable(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+        "ab",
+    );
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni你好",
+        Some(2),
+        smallvec::smallvec![2..3],
+        None,
+    ));
+    assert_eq!(display_mirror(&app, window, masked), "••••••");
+    let composition = composition_of(&app, window, masked).expect("掩码组合");
+    assert_eq!(composition.preedit, 6..18);
+    assert_eq!(
+        composition.caret, 12,
+        "前缀两个 • + 组合内两个 • 的 display caret"
+    );
+    assert_eq!(
+        composition.clauses,
+        vec![12..15],
+        "前缀两个 • + preedit 两个 • 之后的第三个 • 是 '你' 的高亮 clause"
+    );
+}
+
+#[test]
+fn ime_preedit_replace_splices_into_the_current_preedit() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(2),
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert!(preedit(
+        &mut app,
+        window,
+        "hao",
+        Some(3),
+        smallvec::SmallVec::new(),
+        Some(0..1),
+    ));
+    assert_eq!(display_mirror(&app, window, node), "abhaoicd");
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        5..5,
+        "caret = 替换段前 0 + 'hao' 的 3 字节"
+    );
+    let composition = composition_of(&app, window, node).expect("组合");
+    assert_eq!(composition.preedit, 2..6);
+    assert_eq!(composition.caret, 5);
+}
+
+#[test]
+fn ime_end_cancels_the_preedit_and_restores_the_committed_view() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 1, 3).expect("选区");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert_eq!(display_mirror(&app, window, node), "anid");
+    assert_eq!(text_of(&app, window, node), "abcd");
+    let before_end = snapshot_of(&app, window, node).generation;
+    assert!(dispatch_ime(&mut app, window, ImeEvent::End));
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing);
+    assert!(snapshot.generation > before_end);
+    assert_eq!(snapshot.selection.range(), 1..1, "caret 回组合起点");
+    assert_eq!(display_mirror(&app, window, node), "abcd");
+    assert_eq!(text_of(&app, window, node), "abcd");
+    assert!(composition_of(&app, window, node).is_none());
+    let after_end = snapshot.generation;
+    assert!(
+        dispatch_ime(&mut app, window, ImeEvent::End),
+        "End 必须消费"
+    );
+    assert_eq!(
+        snapshot_of(&app, window, node).generation,
+        after_end,
+        "重复 End 幂等"
+    );
+}
+
+#[test]
+fn ime_commit_replaces_the_composition_and_undoes_in_one_step() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 1, 3).expect("选区");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(2),
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert!(commit_ime(&mut app, window, "你", None));
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing);
+    assert_eq!(
+        text_of(&app, window, node),
+        "a你d",
+        "组合区间被提交文本替换"
+    );
+    assert_eq!(display_mirror(&app, window, node), "a你d");
+    assert_eq!(
+        snapshot.selection.range(),
+        4..4,
+        "display caret 在提交文本之后"
+    );
+    assert!(snapshot.can_undo);
+    assert!(app.text_edit_undo(window, node).expect("撤销"));
+    assert_eq!(text_of(&app, window, node), "abcd", "一次提交 = 一步 undo");
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        1..3,
+        "撤销恢复组合前选区"
+    );
+    assert!(!app.text_edit_undo(window, node).expect("没有更多步骤"));
+    frame(&mut app, window);
+}
+
+#[test]
+fn ime_commit_with_replace_commits_the_spliced_preedit() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "haoi",
+        Some(2),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(commit_ime(&mut app, window, "你", Some(1..3)));
+    assert_eq!(
+        text_of(&app, window, node),
+        "abh你icd",
+        "replace 相对 marked text 的子区间在提交前 splice"
+    );
+    assert!(!snapshot_of(&app, window, node).composing);
+    frame(&mut app, window);
+}
+
+#[test]
+fn ime_commit_without_a_composition_inserts_text_directly() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "ab",
+    );
+    assert!(commit_ime(&mut app, window, "你", None));
+    assert_eq!(text_of(&app, window, node), "ab你");
+    assert_eq!(display_mirror(&app, window, node), "ab你");
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing);
+    assert_eq!(snapshot.selection.range(), 5..5);
+
+    assert!(commit_ime(&mut app, window, "x\u{8}y", None));
+    assert_eq!(
+        text_of(&app, window, node),
+        "ab你xy",
+        "无组合的 IME 提交同样清洗控制字符"
+    );
+}
+
+#[test]
+fn ime_commit_clips_to_grapheme_max_length() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        max_length_spec(TextStyle::new(px(16.0)), Some(2)),
+        None,
+        "a",
+    );
+    const FAMILY: &str = "👨‍👩‍👧";
+    assert!(preedit(
+        &mut app,
+        window,
+        FAMILY,
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(commit_ime(&mut app, window, "🇨🇳x", None));
+    assert_eq!(
+        text_of(&app, window, node),
+        "a🇨🇳",
+        "max_length 按真实字素裁剪且不拆 emoji 簇"
+    );
+    frame(&mut app, window);
+}
+
+#[test]
+fn ime_text_events_are_suppressed_during_composition() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "ab",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert!(
+        type_text(&mut app, window, "x"),
+        "组合期普通 Text 必须被编辑内核消费而不是插入"
+    );
+    assert_eq!(text_of(&app, window, node), "ab");
+    assert_eq!(display_mirror(&app, window, node), "abni");
+    assert_eq!(
+        composition_of(&app, window, node)
+            .expect("组合仍存在")
+            .preedit,
+        2..4
+    );
+}
+
+#[test]
+fn ime_events_are_consumed_only_by_a_focused_editable() {
+    let (_rt, mut app, window) = new_app();
+    let _node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "",
+    );
+    assert!(
+        dispatch_ime(&mut app, window, ImeEvent::Start),
+        "焦点在可编辑节点时必须消费 IME"
+    );
+    assert_eq!(app.drain_events(), vec![], "被消费的 IME 不入事件队列");
+    app.set_focus(window, None);
+    assert!(
+        !dispatch_ime(&mut app, window, ImeEvent::Start),
+        "无焦点时 IME 交还宿主事件队列"
+    );
+}
+
+#[test]
+fn disabled_editable_is_not_focusable_and_leaves_ime_to_the_host() {
+    let (_rt, mut app, window) = new_app();
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.disabled = true;
+    let node = mount(&mut app, window, editable, None);
+    app.text_edit_set_value(window, node, "locked")
+        .expect("程序化写入");
+    frame(&mut app, window);
+    assert!(!app.set_focus(window, Some(node)), "disabled 不可聚焦");
+    assert_eq!(app.focused(window), None, "disabled 节点无法进入编辑路径");
+    assert!(!dispatch_ime(
+        &mut app,
+        window,
+        ImeEvent::Commit {
+            text: smol_str::SmolStr::new_static("x"),
+            replace: None,
+        }
+    ));
+    assert_eq!(text_of(&app, window, node), "locked");
+}
+
+#[test]
+fn readonly_editable_text_consumes_ime_without_composing() {
+    let (_rt, mut app, window) = new_app();
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.readonly = true;
+    let node = mount_editable(&mut app, window, editable, None, "hello");
+    assert!(dispatch_ime(&mut app, window, ImeEvent::Start));
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert!(!snapshot_of(&app, window, node).composing);
+    assert_eq!(text_of(&app, window, node), "hello");
+    assert_eq!(display_mirror(&app, window, node), "hello");
+}
+
+#[test]
+fn losing_focus_cancels_the_composition() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert!(snapshot_of(&app, window, node).focused);
+    assert!(app.set_focus(window, None));
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing, "失焦必须取消组合");
+    assert!(!snapshot.focused);
+    assert_eq!(display_mirror(&app, window, node), "abcd");
+    assert_eq!(snapshot.selection.range(), 2..2, "caret 回组合起点");
+
+    assert!(app.set_focus(window, Some(node)));
+    assert!(snapshot_of(&app, window, node).focused);
+}
+
+#[test]
+fn switching_focus_between_editables_cancels_the_first_composition() {
+    let (_rt, mut app, window) = new_app();
+    let first = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    let second = mount(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+    );
+    app.text_edit_set_value(window, second, "wxyz")
+        .expect("写入");
+    frame(&mut app, window);
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(app.set_focus(window, Some(second)));
+    let first_snapshot = snapshot_of(&app, window, first);
+    assert!(!first_snapshot.composing);
+    assert!(!first_snapshot.focused);
+    assert_eq!(display_mirror(&app, window, first), "abcd");
+    assert!(snapshot_of(&app, window, second).focused);
+}
+
+#[test]
+fn window_focus_loss_cancels_the_composition() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    app.dispatch(window, Event::FocusChanged { focused: false });
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing);
+    assert_eq!(display_mirror(&app, window, node), "abcd");
+    assert_eq!(snapshot.selection.range(), 4..4, "组合起点在文本末尾");
+}
+
+#[test]
+fn enter_during_composition_neither_submits_nor_inserts_a_newline() {
+    use std::{cell::Cell, rc::Rc};
+
+    let (_rt, mut app, window) = new_app();
+    let submitted = Rc::new(Cell::new(0_u32));
+    let seen = Rc::clone(&submitted);
+    app.on_action(Action::custom("submit"), move |_ctx| {
+        seen.set(seen.get() + 1);
+    });
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.submit = Some(Action::custom("submit"));
+    let node = mount_editable(&mut app, window, editable, None, "ab");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert!(
+        press(&mut app, window, KeyCode::Enter, Modifiers::empty()),
+        "组合期 Enter 必须被消费"
+    );
+    assert_eq!(submitted.get(), 0, "组合期 Enter 不得 submit");
+    assert_eq!(text_of(&app, window, node), "ab");
+    assert!(press_repeat(
+        &mut app,
+        window,
+        KeyCode::NumpadEnter,
+        Modifiers::empty()
+    ));
+    assert_eq!(submitted.get(), 0, "组合期 auto-repeat 也不提交");
+    assert!(snapshot_of(&app, window, node).composing);
+}
+
+#[test]
+fn escape_cancels_the_composition_before_collapsing_a_selection() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcdef",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 1, 3).expect("选区");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert!(dispatch_ime(&mut app, window, ImeEvent::Start));
+    assert!(
+        press(&mut app, window, KeyCode::Escape, Modifiers::empty()),
+        "组合期 Escape 被编辑内核消费"
+    );
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing, "Escape 优先取消组合");
+    assert_eq!(snapshot.selection.range(), 1..1, "取消后折叠到组合起点");
+
+    crate::text_edit::set_selection(&mut app, window, node, 0, 4).expect("选区");
+    assert!(press(&mut app, window, KeyCode::Escape, Modifiers::empty()));
+    assert_eq!(
+        snapshot_of(&app, window, node).selection.range(),
+        0..0,
+        "无组合时 Escape 折叠选区"
+    );
+}
+
+#[test]
+fn composition_updates_rebuild_the_display_once_per_event_and_never_per_frame() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcdef",
+    );
+    let base = display_builds(&app, window, node);
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert_eq!(display_builds(&app, window, node), base + 1);
+    assert!(preedit(
+        &mut app,
+        window,
+        "nih",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert_eq!(display_builds(&app, window, node), base + 2);
+    assert!(preedit(
+        &mut app,
+        window,
+        "nih",
+        None,
+        smallvec::SmallVec::new(),
+        None
+    ));
+    assert_eq!(
+        display_builds(&app, window, node),
+        base + 2,
+        "相同 preedit 不重建 display"
+    );
+    let generation = snapshot_of(&app, window, node).generation;
+    frame(&mut app, window);
+    assert_eq!(
+        display_builds(&app, window, node),
+        base + 2,
+        "帧不重建 display"
+    );
+    assert_eq!(snapshot_of(&app, window, node).generation, generation);
+}
+
+fn a11y_node(app: &mut App, window: WindowId, node: NodeId) -> crate::a11y::A11yNode {
+    frame(app, window);
+    let snapshot = app.a11y_take(window).expect("a11y 交付");
+    snapshot
+        .node_for(node)
+        .cloned()
+        .or_else(|| {
+            let snapshot = app.a11y_take(window).expect("再次 a11y 交付");
+            snapshot.node_for(node).cloned()
+        })
+        .expect("可编辑节点必须进入 a11y 树")
+}
+
+#[test]
+fn editable_a11y_patch_exposes_role_value_placeholder_and_flags() {
+    let (_rt, mut app, window) = new_app();
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.label = smol_str::SmolStr::new_static("搜索");
+    editable.placeholder = smol_str::SmolStr::new_static("输入关键词");
+    editable.readonly = true;
+    let node = mount_editable(&mut app, window, editable, None, "hello");
+    let record = a11y_node(&mut app, window, node);
+    assert_eq!(record.role, A11yRole::TextInput);
+    assert_eq!(record.label_text(), Some("搜索"));
+    assert_eq!(record.value.as_deref(), Some("hello"));
+    assert!(record.read_only);
+    assert_eq!(record.placeholder.as_deref(), Some("输入关键词"));
+    assert_eq!(
+        record.text_selection, None,
+        "P1b-2 降级：可编辑节点不暴露文本选区（task-14 TextRun 子节点模型）"
+    );
+    assert!(
+        record.character_lengths.is_empty(),
+        "P1b-2 降级：可编辑节点不写 character_lengths"
+    );
+    let ak = crate::a11y::adapter::to_accesskit(&record);
+    assert_eq!(ak.role(), accesskit::Role::TextInput);
+    assert_eq!(ak.value(), Some("hello"));
+    assert!(ak.text_selection().is_none());
+}
+
+#[test]
+fn password_a11y_patch_masks_the_value_and_never_leaks_plaintext() {
+    let (_rt, mut app, window) = new_app();
+    let mut editable = masked_spec(TextStyle::new(px(16.0)), None);
+    editable.label = smol_str::SmolStr::new_static("密码");
+    let node = mount_editable(&mut app, window, editable, None, "s3cret");
+    let record = a11y_node(&mut app, window, node);
+    assert_eq!(record.role, A11yRole::PasswordInput);
+    assert_eq!(record.value.as_deref(), Some("••••••"));
+    assert!(
+        record
+            .value
+            .as_deref()
+            .is_some_and(|value| !value.contains("s3cret"))
+    );
+    assert_eq!(record.text_selection, None);
+    let ak = crate::a11y::adapter::to_accesskit(&record);
+    assert_eq!(ak.role(), accesskit::Role::PasswordInput);
+    assert_eq!(ak.value(), Some("••••••"));
+}
+
+#[test]
+fn empty_editable_mounts_with_engine_a11y_patch_before_focus() {
+    let (_rt, mut app, window) = new_app();
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.label = smol_str::SmolStr::new_static("搜索");
+    let node = mount(&mut app, window, editable, None);
+    assert_eq!(app.focused(window), None, "前置：未聚焦");
+    let record = a11y_node(&mut app, window, node);
+    assert_eq!(
+        record.role,
+        A11yRole::TextInput,
+        "挂载写 patch 必须发生在 a11y_slots 初始化之后"
+    );
+    assert_eq!(record.label_text(), Some("搜索"));
+    assert_eq!(record.value.as_deref(), Some(""), "空文本也交付 value");
+    assert_eq!(record.text_selection, None);
+}
+
+#[test]
+fn disabled_empty_editable_keeps_its_a11y_patch() {
+    let (_rt, mut app, window) = new_app();
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.disabled = true;
+    editable.label = smol_str::SmolStr::new_static("锁定输入");
+    editable.placeholder = smol_str::SmolStr::new_static("不可编辑");
+    let node = mount(&mut app, window, editable, None);
+    assert!(!app.set_focus(window, Some(node)), "disabled 不可聚焦");
+    assert_eq!(app.focused(window), None);
+    let record = a11y_node(&mut app, window, node);
+    assert_eq!(record.role, A11yRole::TextInput);
+    assert_eq!(record.label_text(), Some("锁定输入"));
+    assert_eq!(record.value.as_deref(), Some(""));
+    assert_eq!(record.placeholder.as_deref(), Some("不可编辑"));
+    assert!(record.disabled, "disabled 空输入必须交付 disabled 状态");
+}
+
+#[test]
+fn composing_preedit_is_not_exposed_to_a11y() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(2),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    let record = a11y_node(&mut app, window, node);
+    assert_eq!(
+        record.value.as_deref(),
+        Some("abcd"),
+        "a11y value 不含 preedit"
+    );
+    assert_eq!(record.text_selection, None, "组合期也不暴露 preedit/选区");
+}
+
+#[test]
+fn focus_changes_update_the_snapshot_flags_and_generation() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+    );
+    let unfocused = snapshot_of(&app, window, node);
+    assert!(!unfocused.focused);
+    assert_eq!(unfocused.generation, 0);
+    assert!(app.set_focus(window, Some(node)));
+    let focused = snapshot_of(&app, window, node);
+    assert!(focused.focused);
+    assert_eq!(focused.generation, unfocused.generation + 1);
+    assert!(app.set_focus(window, None));
+    let blurred = snapshot_of(&app, window, node);
+    assert!(!blurred.focused);
+    assert_eq!(blurred.generation, focused.generation + 1);
+    assert!(!app.set_focus(window, None), "重复失焦不改变快照");
+    assert_eq!(
+        snapshot_of(&app, window, node).generation,
+        blurred.generation
+    );
+}
+
+#[test]
+fn programmatic_set_value_cancels_the_composition() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(
+        app.text_edit_set_value(window, node, "xyz")
+            .expect("程序化写入"),
+        "写入必须报告内容变化"
+    );
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing, "程序化写入必须取消组合");
+    assert_eq!(text_of(&app, window, node), "xyz");
+    assert_eq!(display_mirror(&app, window, node), "xyz");
+    assert_eq!(snapshot.selection.range(), 3..3);
+}
+
+#[test]
+fn multiline_composition_commit_keeps_newlines() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), true),
+        None,
+        "ab",
+    );
+    assert!(preedit(
+        &mut app,
+        window,
+        "c\nd",
+        Some(3),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert_eq!(display_mirror(&app, window, node), "abc\nd");
+    assert!(commit_ime(&mut app, window, "c\nd", None));
+    assert_eq!(text_of(&app, window, node), "abc\nd");
+    frame(&mut app, window);
+}
+
+#[test]
+fn a11y_patch_tracks_edited_values() {
+    let (_rt, mut app, window) = new_app();
+    let mut editable = spec(TextStyle::new(px(16.0)), false);
+    editable.label = smol_str::SmolStr::new_static("搜索");
+    let node = mount_editable(&mut app, window, editable, None, "ab");
+    assert!(type_text(&mut app, window, "c"));
+    let record = a11y_node(&mut app, window, node);
+    assert_eq!(record.value.as_deref(), Some("abc"));
+    assert_eq!(record.text_selection, None, "降级后不暴露选区");
+    assert!(press(
+        &mut app,
+        window,
+        KeyCode::Backspace,
+        Modifiers::empty()
+    ));
+    let record = a11y_node(&mut app, window, node);
+    assert_eq!(record.value.as_deref(), Some("ab"));
+}
+
+#[test]
+fn set_selection_during_composition_uses_committed_coordinates() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(2),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert_eq!(display_mirror(&app, window, node), "abnicd");
+    assert!(crate::text_edit::set_selection(&mut app, window, node, 0, 3).expect("组合期选区"));
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing, "设置选区必须先取消组合");
+    assert_eq!(
+        snapshot.selection.range(),
+        0..2,
+        "组合 display 0..3 的选区取消组合后落在 committed 的 0..2"
+    );
+    assert_eq!(display_mirror(&app, window, node), "abcd");
+    assert_eq!(text_of(&app, window, node), "abcd");
+}
+
+#[test]
+fn set_selection_during_masked_composition_maps_to_real_text() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), None),
+        None,
+        "abc",
+    );
+    assert!(crate::text_edit::set_selection(&mut app, window, node, 3, 6).expect("选中 b"));
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert_eq!(display_mirror(&app, window, node), "••••");
+    let _ = crate::text_edit::set_selection(&mut app, window, node, 3, 6).expect("组合期选区");
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing);
+    assert_eq!(
+        snapshot.selection.range(),
+        3..3,
+        "组合替换区间内的 display 3..6 取消后映射到组合起点 raw1（display 3..3）；旧顺序会得到 3..6"
+    );
+    assert_eq!(display_mirror(&app, window, node), "•••");
+    assert_eq!(text_of(&app, window, node), "abc");
+}
+
+#[test]
+fn undo_and_redo_cancel_the_composition() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "",
+    );
+    assert!(type_text(&mut app, window, "a"));
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(app.text_edit_undo(window, node).expect("撤销"));
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing, "undo 必须先取消组合");
+    assert_eq!(text_of(&app, window, node), "");
+    assert_eq!(display_mirror(&app, window, node), "");
+
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert!(app.text_edit_redo(window, node).expect("重做"));
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(!snapshot.composing, "redo 必须先取消组合");
+    assert_eq!(text_of(&app, window, node), "a");
+    assert_eq!(display_mirror(&app, window, node), "a");
+}
+
+#[test]
+fn ime_preedit_clamps_out_of_range_replace_and_caret() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(preedit(
+        &mut app,
+        window,
+        "ni",
+        Some(9999),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    let composition = composition_of(&app, window, node).expect("组合");
+    assert_eq!(composition.preedit, 2..4);
+    assert_eq!(composition.caret, 4, "越界 caret 收敛到 preedit 末尾");
+    assert!(preedit(
+        &mut app,
+        window,
+        "hao",
+        Some(1),
+        smallvec::SmallVec::new(),
+        Some(99..100),
+    ));
+    assert_eq!(
+        display_mirror(&app, window, node),
+        "abnihaocd",
+        "越界 replace 收敛到 preedit 末尾后做 suffix splice"
+    );
+    let composition = composition_of(&app, window, node).expect("组合");
+    assert_eq!(composition.preedit, 2..7);
+    assert_eq!(composition.caret, 5, "caret 相对 fragment 起点");
+    let (reverse_start, reverse_end) = (5usize, 2usize);
+    assert!(preedit(
+        &mut app,
+        window,
+        "x",
+        Some(0),
+        smallvec::SmallVec::new(),
+        Some(reverse_start..reverse_end),
+    ));
+    assert_eq!(
+        display_mirror(&app, window, node),
+        "abnixcd",
+        "反向 replace 区间按规范化后的 2..5 处理"
+    );
+    let composition = composition_of(&app, window, node).expect("组合");
+    assert_eq!(composition.preedit, 2..5);
+    assert_eq!(composition.caret, 4);
+    frame(&mut app, window);
+}
+
+#[test]
+fn empty_preedit_keeps_the_composition_until_end() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "abcd",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 2, 2).expect("光标");
+    assert!(dispatch_ime(&mut app, window, ImeEvent::Start));
+    assert!(preedit(
+        &mut app,
+        window,
+        "",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    let snapshot = snapshot_of(&app, window, node);
+    assert!(snapshot.composing, "空 preedit 仍是组合态");
+    assert_eq!(display_mirror(&app, window, node), "abcd");
+    let composition = composition_of(&app, window, node).expect("组合信息");
+    assert_eq!(composition.preedit, 2..2, "空 preedit 的 display 区间为空");
+    assert_eq!(composition.caret, 2);
+    assert!(dispatch_ime(&mut app, window, ImeEvent::End));
+    assert!(!snapshot_of(&app, window, node).composing);
+    assert_eq!(snapshot_of(&app, window, node).selection.range(), 2..2);
+}
+
+#[test]
+fn masked_composition_commit_is_truncated_and_undoes_cleanly() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        masked_spec(TextStyle::new(px(16.0)), Some(3)),
+        None,
+        "a",
+    );
+    assert!(preedit(
+        &mut app,
+        window,
+        "🇨🇳",
+        None,
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    assert_eq!(display_mirror(&app, window, node), "••");
+    assert!(commit_ime(&mut app, window, "🇨🇳xyz", None));
+    assert_eq!(
+        text_of(&app, window, node),
+        "a🇨🇳x",
+        "masked 组合提交按真实字素截断到 max_length"
+    );
+    assert_eq!(display_mirror(&app, window, node), "•••");
+    assert!(app.text_edit_undo(window, node).expect("撤销组合提交"));
+    assert_eq!(text_of(&app, window, node), "a");
+    assert_eq!(display_mirror(&app, window, node), "•");
+    assert_eq!(snapshot_of(&app, window, node).selection.range(), 3..3);
+}
+
+#[test]
+fn no_composition_ime_commit_is_truncated_and_undoes_in_one_step() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        max_length_spec(TextStyle::new(px(16.0)), Some(3)),
+        None,
+        "a",
+    );
+    assert!(commit_ime(&mut app, window, "🇨🇳xy", None));
+    assert_eq!(
+        text_of(&app, window, node),
+        "a🇨🇳x",
+        "无组合提交同样按真实字素 max_length 截断"
+    );
+    assert!(app.text_edit_undo(window, node).expect("撤销"));
+    assert_eq!(text_of(&app, window, node), "a");
+    assert!(!app.text_edit_undo(window, node).expect("提交为一步 undo"));
+}
+
+#[test]
+fn empty_no_composition_ime_commit_is_a_no_op_over_selection() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "a你",
+    );
+    crate::text_edit::set_selection(&mut app, window, node, 1, 4).expect("选区");
+    assert!(commit_ime(&mut app, window, "", None));
+    assert_eq!(
+        text_of(&app, window, node),
+        "a你",
+        "空的无组合提交不得删除选区（与 r1 insert_text 语义一致）"
+    );
+    assert_eq!(snapshot_of(&app, window, node).selection.range(), 1..4);
+    assert!(!snapshot_of(&app, window, node).can_undo, "no-op 不记 undo");
+}
+
+#[test]
+fn identity_emoji_composition_caret_and_end_after_commit_are_idempotent() {
+    let (_rt, mut app, window) = new_app();
+    let node = mount_editable(
+        &mut app,
+        window,
+        spec(TextStyle::new(px(16.0)), false),
+        None,
+        "ab",
+    );
+    assert!(preedit(
+        &mut app,
+        window,
+        "🌍a",
+        Some(2),
+        smallvec::SmallVec::new(),
+        None,
+    ));
+    let composition = composition_of(&app, window, node).expect("组合信息");
+    assert_eq!(composition.preedit, 2..7);
+    assert_eq!(
+        composition.caret, 6,
+        "UTF-16 caret 2（🌍 两个码元）落在 display 第 4 个字节"
+    );
+    assert!(commit_ime(&mut app, window, "🌍", None));
+    assert_eq!(text_of(&app, window, node), "ab🌍");
+    let generation = snapshot_of(&app, window, node).generation;
+    assert!(dispatch_ime(&mut app, window, ImeEvent::End));
+    let snapshot = snapshot_of(&app, window, node);
+    assert_eq!(snapshot.generation, generation, "提交后补 End 必须幂等");
+    assert_eq!(text_of(&app, window, node), "ab🌍");
 }

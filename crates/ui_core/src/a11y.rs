@@ -18,6 +18,7 @@ pub enum A11yRole {
     Button,
     TextInput,
     MultilineTextInput,
+    PasswordInput,
     CheckBox,
     Switch,
     RadioButton,
@@ -54,7 +55,7 @@ pub enum A11yRole {
 }
 
 impl A11yRole {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::Window,
         Self::Application,
         Self::GenericContainer,
@@ -65,6 +66,7 @@ impl A11yRole {
         Self::Button,
         Self::TextInput,
         Self::MultilineTextInput,
+        Self::PasswordInput,
         Self::CheckBox,
         Self::Switch,
         Self::RadioButton,

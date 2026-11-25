@@ -26,6 +26,7 @@ pub(crate) const fn role_to_accesskit(role: A11yRole) -> accesskit::Role {
         R::Button => Role::Button,
         R::TextInput => Role::TextInput,
         R::MultilineTextInput => Role::MultilineTextInput,
+        R::PasswordInput => Role::PasswordInput,
         R::CheckBox => Role::CheckBox,
         R::Switch => Role::Switch,
         R::RadioButton => Role::RadioButton,
@@ -171,7 +172,7 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         | R::MenuItemRadio
         | R::ListBoxOption => Vec::new(),
         R::Slider => vec![A::SetValue, A::Increment, A::Decrement, A::Focus],
-        R::TextInput | R::MultilineTextInput => vec![A::SetValue],
+        R::TextInput | R::MultilineTextInput | R::PasswordInput => vec![A::SetValue],
         R::TextRun => vec![A::SetTextSelection],
         R::Dialog | R::AlertDialog | R::Menu => Vec::new(),
         R::ScrollView => vec![
@@ -581,6 +582,7 @@ mod tests {
                 | A11yRole::Button
                 | A11yRole::TextInput
                 | A11yRole::MultilineTextInput
+                | A11yRole::PasswordInput
                 | A11yRole::CheckBox
                 | A11yRole::Switch
                 | A11yRole::RadioButton
@@ -651,6 +653,15 @@ mod tests {
         assert_eq!(
             role_to_accesskit(A11yRole::TextRun),
             accesskit::Role::TextRun
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::PasswordInput),
+            accesskit::Role::PasswordInput,
+            "密码输入使用 AccessKit 的 PasswordInput 角色"
+        );
+        assert!(
+            A11yRole::ALL.contains(&A11yRole::PasswordInput),
+            "A11yRole::ALL 必须包含 PasswordInput"
         );
         assert_eq!(role_to_accesskit(A11yRole::Tree), accesskit::Role::Tree);
         assert_eq!(
@@ -795,6 +806,7 @@ mod tests {
     fn default_actions_follow_the_role_table() {
         assert_eq!(default_actions(A11yRole::Button), vec![A11yAction::Click]);
         assert!(default_actions(A11yRole::TextInput).contains(&A11yAction::SetValue));
+        assert!(default_actions(A11yRole::PasswordInput).contains(&A11yAction::SetValue));
         assert!(default_actions(A11yRole::ScrollView).contains(&A11yAction::ScrollIntoView));
         for role in [
             A11yRole::Dialog,

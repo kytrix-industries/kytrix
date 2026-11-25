@@ -1693,6 +1693,14 @@ impl App {
         crate::text_edit::snapshot(self, window, node)
     }
 
+    pub fn text_edit_composition(
+        &self,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<Option<crate::text_edit::TextEditComposition>, EngineError> {
+        crate::text_edit::composition(self, window, node)
+    }
+
     pub fn text_edit_undo(&mut self, window: WindowId, node: NodeId) -> Result<bool, EngineError> {
         crate::text_edit::undo(self, window, node)
     }

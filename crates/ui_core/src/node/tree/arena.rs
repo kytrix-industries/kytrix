@@ -288,6 +288,9 @@ pub(crate) fn insert_child(
     }
     tree.a11y_slots[index] = (a11y.is_some() || bind_a11y.is_some())
         .then(|| Box::new(crate::a11y::tree::NodeA11y::new(a11y, bind_a11y)));
+    if tree.editable(id).is_some() {
+        crate::text_edit::sync_a11y_patch(tree, id);
+    }
     tree.dirty_layout.insert(id);
     tree.dirty_paint.insert(id);
     tree.dirty_a11y.insert(id);
