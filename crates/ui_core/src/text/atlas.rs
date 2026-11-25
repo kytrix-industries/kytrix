@@ -118,11 +118,12 @@ impl GlyphAtlas {
     }
 
     pub(crate) fn write_color_page(&self, page: &mut [u8], page_width: u32) {
-        for record in self.records.values() {
-            if record.tile.atlas != AtlasKind::ColorGlyph {
-                continue;
-            }
-            write_record_rows(page, page_width, record, 0, record.height, 4);
+        for record in self
+            .records
+            .values()
+            .filter(|record| record.tile.atlas == AtlasKind::ColorGlyph)
+        {
+            write_color_record_rows(page, page_width, record, -1, record.height as i32 + 1);
         }
     }
 
@@ -132,15 +133,34 @@ impl GlyphAtlas {
         page_width: u32,
         rects: &crate::render::DirtyRects,
     ) {
-        write_records_rows(
-            page,
-            page_width,
-            rects,
-            self.records
-                .values()
-                .filter(|record| record.tile.atlas == AtlasKind::ColorGlyph),
-            4,
-        );
+        for record in self
+            .records
+            .values()
+            .filter(|record| record.tile.atlas == AtlasKind::ColorGlyph)
+        {
+            let origin_y = record.origin.1 as i32;
+            for rect in rects.rects() {
+                let start = rect
+                    .y0
+                    .value()
+                    .max(origin_y - 1)
+                    .min(origin_y + record.height as i32 + 1);
+                let end = rect
+                    .y1
+                    .value()
+                    .max(origin_y - 1)
+                    .min(origin_y + record.height as i32 + 1);
+                if start < end {
+                    write_color_record_rows(
+                        page,
+                        page_width,
+                        record,
+                        start - origin_y,
+                        end - origin_y,
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn begin_pass(&mut self) {
@@ -267,6 +287,9 @@ impl GlyphAtlas {
         debug_assert_eq!(allocation.content.width().value() as u32, width);
         debug_assert_eq!(allocation.content.height().value() as u32, height);
         debug_assert!(allocation.padded.width() >= allocation.content.width());
+        if allocation.tile.atlas == AtlasKind::ColorGlyph {
+            self.color.mark_written(allocation.padded);
+        }
         let record = GlyphRecord {
             tile: allocation.tile,
             left: image.placement.left,
@@ -553,14 +576,264 @@ fn write_record_rows(
     }
 }
 
+fn write_color_record_rows(
+    page: &mut [u8],
+    page_width: u32,
+    record: &GlyphRecord,
+    row0: i32,
+    row1: i32,
+) {
+    let (x0, y0) = record.origin;
+    let start = row0.max(-1);
+    let end = row1.min(record.height as i32 + 1);
+    if start >= end || record.width == 0 || record.height == 0 {
+        return;
+    }
+    let source_pitch = record.width as usize * 4;
+    let pitch = page_width as usize * 4;
+    let strip_len = (record.width as usize + 2) * 4;
+    let mut strip = vec![0u8; strip_len];
+    for row in start..end {
+        let source_row = row.clamp(0, record.height as i32 - 1) as usize;
+        let source_start = source_row * source_pitch;
+        let Some(source) = record.data.get(source_start..source_start + source_pitch) else {
+            continue;
+        };
+        strip[0..4].copy_from_slice(&source[0..4]);
+        strip[4..4 + source_pitch].copy_from_slice(source);
+        strip[4 + source_pitch..strip_len].copy_from_slice(&source[source_pitch - 4..]);
+        let destination_row = y0 as i32 + row;
+        let destination_column = x0 as i32 - 1;
+        if destination_row < 0 || destination_column < 0 {
+            continue;
+        }
+        let destination = destination_row as usize * pitch + destination_column as usize * 4;
+        if destination + strip_len > page.len() {
+            continue;
+        }
+        page[destination..destination + strip_len].copy_from_slice(&strip);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ATLAS_FULL_ESCALATION_FRAMES, GlyphAtlas, GlyphAtlasStats, GlyphKey, ppem_key};
+    use super::{
+        ATLAS_FULL_ESCALATION_FRAMES, GlyphAtlas, GlyphAtlasStats, GlyphKey, GlyphRecord, ppem_key,
+        write_color_record_rows, write_record_rows,
+    };
     use crate::{
         paint::atlas::AtlasKind,
-        render::AtlasAllocator,
+        render::{AtlasAllocator, DirtyRects},
         text::raster::{FontKey, GlyphRasterizer, probe_emoji_font, probe_font},
     };
+
+    fn fabricated_color_record(allocator: &mut AtlasAllocator, data: &[u8]) -> GlyphRecord {
+        let allocation = allocator.allocate((2, 2)).expect("2x2 tile fits");
+        GlyphRecord {
+            tile: allocation.tile,
+            left: 0,
+            top: 0,
+            width: 2,
+            height: 2,
+            origin: (
+                allocation.content.x0.value() as u32,
+                allocation.content.y0.value() as u32,
+            ),
+            data: data.to_vec().into_boxed_slice(),
+            alloc: allocation.id,
+            color_monochrome: false,
+            last_used_pass: 0,
+        }
+    }
+
+    fn page_pixel(page: &[u8], page_width: u32, x: u32, y: u32) -> [u8; 4] {
+        let offset = (y as usize * page_width as usize + x as usize) * 4;
+        page[offset..offset + 4].try_into().expect("4 bytes")
+    }
+
+    fn sample_bilinear(page: &[u8], page_width: u32, x: f64, y: f64) -> [f64; 4] {
+        let x = x - 0.5;
+        let y = y - 0.5;
+        let x0 = x.floor() as i64;
+        let y0 = y.floor() as i64;
+        let fx = x - x0 as f64;
+        let fy = y - y0 as f64;
+        let fetch = |ix: i64, iy: i64| -> [f64; 4] {
+            let ix = ix.clamp(0, i64::from(page_width) - 1) as u32;
+            let iy = iy.clamp(0, i64::from(page_width) - 1) as u32;
+            page_pixel(page, page_width, ix, iy).map(|channel| f64::from(channel) / 255.0)
+        };
+        let top = [fetch(x0, y0), fetch(x0 + 1, y0)];
+        let bottom = [fetch(x0, y0 + 1), fetch(x0 + 1, y0 + 1)];
+        core::array::from_fn(|channel| {
+            let top = top[0][channel] * (1.0 - fx) + top[1][channel] * fx;
+            let bottom = bottom[0][channel] * (1.0 - fx) + bottom[1][channel] * fx;
+            top * (1.0 - fy) + bottom * fy
+        })
+    }
+
+    fn full_page(page_width: u32) -> Vec<u8> {
+        vec![0u8; (page_width * page_width * 4) as usize]
+    }
+
+    #[test]
+    fn color_glyph_page_writes_replicate_the_tile_edges_into_the_padding() {
+        let mut allocator = AtlasAllocator::with_page(AtlasKind::ColorGlyph, (32, 32));
+        let data = [
+            10u8, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let record = fabricated_color_record(&mut allocator, &data);
+        let (x0, y0) = record.origin;
+        let width = 32;
+        let mut page = full_page(width);
+        write_color_record_rows(&mut page, width, &record, -1, 3);
+
+        assert_eq!(page_pixel(&page, width, x0, y0), [10, 20, 30, 255]);
+        assert_eq!(
+            page_pixel(&page, width, x0 + 1, y0 + 1),
+            [100, 110, 120, 255]
+        );
+        assert_eq!(page_pixel(&page, width, x0 - 1, y0), [10, 20, 30, 255]);
+        assert_eq!(page_pixel(&page, width, x0 + 2, y0), [40, 50, 60, 255]);
+        assert_eq!(page_pixel(&page, width, x0 - 1, y0 + 1), [70, 80, 90, 255]);
+        assert_eq!(
+            page_pixel(&page, width, x0 + 2, y0 + 1),
+            [100, 110, 120, 255]
+        );
+        assert_eq!(page_pixel(&page, width, x0, y0 - 1), [10, 20, 30, 255]);
+        assert_eq!(page_pixel(&page, width, x0 + 1, y0 - 1), [40, 50, 60, 255]);
+        assert_eq!(page_pixel(&page, width, x0, y0 + 2), [70, 80, 90, 255]);
+        assert_eq!(
+            page_pixel(&page, width, x0 + 1, y0 + 2),
+            [100, 110, 120, 255]
+        );
+        assert_eq!(page_pixel(&page, width, x0 - 1, y0 - 1), [10, 20, 30, 255]);
+        assert_eq!(
+            page_pixel(&page, width, x0 + 2, y0 + 2),
+            [100, 110, 120, 255]
+        );
+    }
+
+    #[test]
+    fn color_glyph_partial_row_writes_also_cover_the_padding_rows() {
+        let mut allocator = AtlasAllocator::with_page(AtlasKind::ColorGlyph, (32, 32));
+        let data = [
+            10u8, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let record = fabricated_color_record(&mut allocator, &data);
+        let (x0, y0) = record.origin;
+        let width = 32;
+        let mut glyphs = GlyphAtlas::new();
+        glyphs.records.insert(
+            GlyphKey {
+                font: FontKey::of(
+                    &parley::FontData::new(parley::fontique::Blob::from(Vec::new()), 0),
+                    1,
+                ),
+                glyph: 0,
+                ppem_q: 0,
+                subpixel_x: 0,
+                variation: 0,
+            },
+            GlyphRecord {
+                tile: record.tile,
+                left: record.left,
+                top: record.top,
+                width: record.width,
+                height: record.height,
+                origin: record.origin,
+                data: record.data.clone(),
+                alloc: record.alloc,
+                color_monochrome: record.color_monochrome,
+                last_used_pass: record.last_used_pass,
+            },
+        );
+        let mut page = full_page(width);
+        glyphs.write_color_rows(&mut page, width, &DirtyRects::full());
+
+        assert_eq!(page_pixel(&page, width, x0 - 1, y0 - 1), [10, 20, 30, 255]);
+        assert_eq!(page_pixel(&page, width, x0 + 2, y0 - 1), [40, 50, 60, 255]);
+        assert_eq!(page_pixel(&page, width, x0 - 1, y0 + 2), [70, 80, 90, 255]);
+        assert_eq!(
+            page_pixel(&page, width, x0 + 2, y0 + 2),
+            [100, 110, 120, 255]
+        );
+    }
+
+    #[test]
+    fn color_glyph_padding_stops_linear_filtering_from_darkening_the_edges() {
+        let mut allocator = AtlasAllocator::with_page(AtlasKind::ColorGlyph, (32, 32));
+        let opaque = [200u8, 80, 40, 255];
+        let data: Vec<u8> = opaque.iter().copied().cycle().take(16).collect();
+        let record = fabricated_color_record(&mut allocator, &data);
+        let (x0, y0) = record.origin;
+        let width = 32;
+        let mut padded = full_page(width);
+        write_color_record_rows(&mut padded, width, &record, -1, 3);
+        let mut unpadded = full_page(width);
+        write_record_rows(&mut unpadded, width, &record, 0, 2, 4);
+
+        let sample = |page: &[u8]| sample_bilinear(page, width, f64::from(x0), f64::from(y0) + 0.5);
+        let premultiply = |sample: [f64; 4]| {
+            [
+                sample[0] * sample[3],
+                sample[1] * sample[3],
+                sample[2] * sample[3],
+            ]
+        };
+        let padded_out = premultiply(sample(&padded));
+        let unpadded_out = premultiply(sample(&unpadded));
+        assert!(
+            padded_out[0] > 0.7,
+            "padding 复制边缘色后，tile 边界（u0/v 边）的 50/50 LINEAR 采样必须保留整块颜色，实际 premult r={}",
+            padded_out[0]
+        );
+        assert!(
+            unpadded_out[0] < 0.35,
+            "padding 全 0 时边界采样与透明黑混合，premult r 只剩约一半，实际 {}",
+            unpadded_out[0]
+        );
+        assert!(
+            padded_out[0] > unpadded_out[0] * 2.0,
+            "padding 复制必须消除边缘偏暗：padded={:?} unpadded={:?}",
+            padded_out,
+            unpadded_out
+        );
+    }
+
+    #[test]
+    fn color_glyph_allocation_marks_the_tile_padding_dirty() {
+        let Some(emoji) = probe_emoji_font() else {
+            eprintln!("skip: no color emoji font available on this device");
+            return;
+        };
+        let emoji_id = u32::from(
+            swash::FontRef::from_index(emoji.data.data(), emoji.index as usize)
+                .expect("emoji font")
+                .charmap()
+                .map('\u{1F30D}'),
+        );
+        assert_ne!(emoji_id, 0);
+        let mut raster = GlyphRasterizer::new();
+        let mut glyphs = GlyphAtlas::new();
+        let mut atlas = tiny_glyph_atlas();
+        let tile = glyphs
+            .ensure(&mut raster, &mut atlas, &emoji, emoji_id, 32.0, 0, None)
+            .expect("ok")
+            .expect("emoji coverage");
+        assert_eq!(tile.tile.atlas, AtlasKind::ColorGlyph);
+        let rects = glyphs.color_take_dirty_rects();
+        assert!(
+            rects.rects().iter().any(|rect| {
+                rect.width().value() as u32 >= tile.width + 2
+                    && rect.height().value() as u32 >= tile.height + 2
+            }),
+            "彩色 tile 分配必须把 1px padding 一起标脏（上传必须覆盖 padding）：tile={}x{} rects={:?}",
+            tile.width,
+            tile.height,
+            rects.rects()
+        );
+    }
 
     fn space_glyph(font: &parley::FontData) -> Option<u32> {
         let font_ref = swash::FontRef::from_index(font.data.data(), font.index as usize)?;
@@ -1149,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn color_atlas_lru_eviction_never_touches_the_mono_tiles() {
+    fn color_atlas_lru_eviction_reclaims_color_records_and_deallocates_their_tiles() {
         let Some(emoji) = probe_emoji_font() else {
             eprintln!("skip: no color emoji font available on this device");
             return;
@@ -1171,7 +1444,7 @@ mod tests {
         .map(|ch| u32::from(emoji_ref.charmap().map(ch)))
         .filter(|id| *id != 0)
         .collect();
-        if emojis.len() < 4 {
+        if emojis.len() < 2 {
             eprintln!("skip: emoji font does not map enough emoji glyphs");
             return;
         }
@@ -1181,6 +1454,28 @@ mod tests {
                 .charmap()
                 .map('A'),
         );
+        let mut probe = GlyphRasterizer::new();
+        let variations = crate::text::raster::GlyphVariation::default();
+        let first = probe
+            .rasterize(&emoji, emojis[0], 16.0, 0, &variations)
+            .expect("first emoji must rasterize");
+        let second = probe
+            .rasterize(&emoji, emojis[1], 16.0, 0, &variations)
+            .expect("second emoji must rasterize");
+        let page = [
+            first.placement.width + 2,
+            first.placement.height + 2,
+            second.placement.width + 2,
+            second.placement.height + 2,
+        ]
+        .into_iter()
+        .max()
+        .expect("tile size");
+        assert!(
+            page < u32::from(u16::MAX),
+            "注入的彩色页必须可表达为 u32 页尺寸"
+        );
+
         let mut raster = GlyphRasterizer::new();
         let mut glyphs = GlyphAtlas::new();
         let mut atlas = tiny_glyph_atlas();
@@ -1189,32 +1484,65 @@ mod tests {
             .expect("ok")
             .expect("mono coverage");
         glyphs.begin_pass();
-        glyphs.set_color_page_for_test(16);
-        let mut live = 0usize;
-        for glyph in &emojis {
-            if glyphs
-                .ensure(&mut raster, &mut atlas, &emoji, *glyph, 32.0, 0, None)
-                .expect("ok")
-                .is_some()
-            {
-                live += 1;
-            }
-        }
+        glyphs.set_color_page_for_test(page);
+        assert!(glyphs.color_take_cleared());
+        let first_tile = glyphs
+            .ensure(&mut raster, &mut atlas, &emoji, emojis[0], 16.0, 0, None)
+            .expect("ok")
+            .expect("first emoji must fit the capped color page");
+        assert_eq!(first_tile.tile.atlas, AtlasKind::ColorGlyph);
+        assert_eq!(glyphs.color_len(), 1);
+        assert!(glyphs.has_color_records());
+        let _ = glyphs.take_stats();
+
+        glyphs.begin_pass();
+        let second_tile = glyphs
+            .ensure(&mut raster, &mut atlas, &emoji, emojis[1], 16.0, 0, None)
+            .expect("ok")
+            .expect("the LRU color tile must be evicted to make room");
+        assert_eq!(second_tile.tile.atlas, AtlasKind::ColorGlyph);
+        assert_ne!(
+            second_tile.tile, first_tile.tile,
+            "第二块彩色 tile 必须复用被驱逐的槽位（换代身份不同）"
+        );
         let stats = glyphs.take_stats();
-        assert!(
-            live <= 1,
-            "16² 的彩色页最多放下 1-2 个字形（实际放下 {live} 个）"
+        assert_eq!(
+            stats.evictions, 1,
+            "彩色页只放得下一个 tile：第二块必须真正驱逐第一块（stats: {stats:?}）"
         );
-        assert!(
-            stats.evictions > 0 || stats.skipped_color > 0,
-            "彩色图集容量压力必须走淘汰或软失败（stats: {stats:?}）"
+        assert_eq!(
+            stats.skipped_color, 0,
+            "驱逐后必须成功分配，不能退化成软失败（stats: {stats:?}）"
         );
+        assert_eq!(glyphs.color_len(), 1);
+        assert!(glyphs.has_color_records());
         let mono_hit = glyphs
             .ensure(&mut raster, &mut atlas, &mono, mono_id, 32.0, 0, None)
             .expect("ok")
             .expect("mono tile must survive color eviction");
         assert_eq!(mono_hit.tile, mono_tile.tile, "彩色淘汰不得波及 R8 图集");
         assert_eq!(mono_hit.tile.atlas, AtlasKind::Glyph);
+        let _ = glyphs.take_stats();
+
+        glyphs.begin_pass();
+        let oversized = glyphs
+            .ensure(&mut raster, &mut atlas, &emoji, emojis[0], 64.0, 0, None)
+            .expect("ok");
+        assert!(
+            oversized.is_none(),
+            "64 ppem 的彩色 tile 大于注入页：必须软失败"
+        );
+        let stats = glyphs.take_stats();
+        assert_eq!(
+            stats.skipped_color, 1,
+            "超大彩色 tile 必须计一次彩色软失败（stats: {stats:?}）"
+        );
+        assert_eq!(stats.evictions, 1, "驱逐最后一条彩色记录后不得再驱逐");
+        assert!(
+            !glyphs.has_color_records(),
+            "驱逐最后一条彩色记录必须把 color_records 递减到 0（否则彩色页会被永久认为有记录）"
+        );
+        assert_eq!(glyphs.color_len(), 0);
     }
 
     #[test]

@@ -158,6 +158,7 @@ fn emit_rerun(manifest: &Path, shader_dir: &Path) {
     let mut watched: Vec<&str> = vec!["build.rs", "src/paint/instance.rs", "src/paint/scene.rs"];
     watched.extend(RENDER_STATE_ANCHORS.iter().map(|(file, _, _)| *file));
     watched.extend(RENDER_STATE_FORBIDDEN.iter().map(|(file, _, _)| *file));
+    watched.extend(ATLAS_BINDING_ANCHORS.iter().map(|(file, _, _)| *file));
     watched.sort_unstable();
     watched.dedup();
     for source in watched {
@@ -384,6 +385,8 @@ fn validate(manifest: &Path, shader_dir: &Path) {
     validate_math_equivalence(shader_dir);
 
     validate_render_state(manifest);
+
+    validate_atlas_bindings(manifest);
 }
 
 fn validate_color_glyph_branch(shader_dir: &Path) {
@@ -732,6 +735,243 @@ const RENDER_STATE_FORBIDDEN: &[(&str, &str, &str)] = &[
         "vk::CullModeFlags::BACK",
     ),
 ];
+
+const ATLAS_BINDING_ANCHORS: &[(&str, &str, &str)] = &[
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 图集 SRV 数量",
+        "const ATLAS_SRVS: u32 = 3;",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 图集代数",
+        "pub(crate) const ATLAS_GENERATIONS: u8 = 2;",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 槽位 SRV 数量（atlas 表起点 t2）",
+        "const SLOT_SRVS: u32 = 2;",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 atlas 描述表覆盖 t2..t4",
+        "NumDescriptors: ATLAS_SRVS,",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 atlas 表寄存器起点 = t2",
+        "BaseShaderRegister: SLOT_SRVS,",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 采样器过滤 LINEAR",
+        "Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 采样器 U 轴 CLAMP",
+        "AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 采样器 V 轴 CLAMP",
+        "AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 采样器 W 轴 CLAMP",
+        "AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 采样器 LOD 0",
+        "MaxLOD: 0.0,",
+    ),
+    (
+        "src/render/windows/pipeline.rs",
+        "D3D12 采样器无比较",
+        "ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "Vulkan glyph 图集 binding 4",
+        "const BINDING_GLYPH_ATLAS: u32 = 4;",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "Vulkan image 图集 binding 5",
+        "const BINDING_IMAGE_ATLAS: u32 = 5;",
+    ),
+    (
+        "src/render/linux/pipeline.rs",
+        "Vulkan color glyph 图集 binding 6",
+        "const BINDING_COLOR_GLYPH_ATLAS: u32 = 6;",
+    ),
+    (
+        "src/render/linux/atlas.rs",
+        "Vulkan 采样器 mag LINEAR",
+        ".mag_filter(vk::Filter::LINEAR)",
+    ),
+    (
+        "src/render/linux/atlas.rs",
+        "Vulkan 采样器 min LINEAR",
+        ".min_filter(vk::Filter::LINEAR)",
+    ),
+    (
+        "src/render/linux/atlas.rs",
+        "Vulkan 采样器 U 轴 CLAMP_TO_EDGE",
+        ".address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)",
+    ),
+    (
+        "src/render/linux/atlas.rs",
+        "Vulkan 采样器 V 轴 CLAMP_TO_EDGE",
+        ".address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)",
+    ),
+    (
+        "src/render/linux/atlas.rs",
+        "Vulkan 采样器 W 轴 CLAMP_TO_EDGE",
+        ".address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)",
+    ),
+    (
+        "src/render/linux/atlas.rs",
+        "Vulkan 采样器无 mip（NEAREST）",
+        ".mipmap_mode(vk::SamplerMipmapMode::NEAREST)",
+    ),
+    (
+        "src/render/linux/atlas.rs",
+        "Vulkan 采样器 LOD 0",
+        ".max_lod(0.0)",
+    ),
+    (
+        "src/render/macos/core.rs",
+        "Metal 采样器 min LINEAR",
+        "descriptor.setMinFilter(MTLSamplerMinMagFilter::Linear);",
+    ),
+    (
+        "src/render/macos/core.rs",
+        "Metal 采样器 mag LINEAR",
+        "descriptor.setMagFilter(MTLSamplerMinMagFilter::Linear);",
+    ),
+    (
+        "src/render/macos/core.rs",
+        "Metal 采样器 S 轴 CLAMP_TO_EDGE",
+        "descriptor.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);",
+    ),
+    (
+        "src/render/macos/core.rs",
+        "Metal 采样器 T 轴 CLAMP_TO_EDGE",
+        "descriptor.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);",
+    ),
+    (
+        "src/render/macos/core.rs",
+        "Metal 采样器 R 轴 CLAMP_TO_EDGE",
+        "descriptor.setRAddressMode(MTLSamplerAddressMode::ClampToEdge);",
+    ),
+    (
+        "src/render/macos/core.rs",
+        "Metal 采样器无 mip",
+        "descriptor.setMipFilter(MTLSamplerMipFilter::NotMipmapped);",
+    ),
+    (
+        "src/render/macos/core.rs",
+        "Metal 采样器 LOD 0",
+        "descriptor.setLodMaxClamp(0.0);",
+    ),
+    (
+        "src/render/shaders/common.hlsl",
+        "D3D12 glyph 图集 SRV t2",
+        "glyph_atlas : register(t2)",
+    ),
+    (
+        "src/render/shaders/common.hlsl",
+        "D3D12 image 图集 SRV t3",
+        "image_atlas : register(t3)",
+    ),
+    (
+        "src/render/shaders/common.hlsl",
+        "D3D12 采样器寄存器 s0",
+        "atlas_sampler : register(s0)",
+    ),
+    (
+        "src/render/shaders/common.glsl",
+        "Vulkan glyph 图集 binding 4",
+        "binding = 4) uniform sampler2DArray glyph_atlas",
+    ),
+    (
+        "src/render/shaders/common.glsl",
+        "Vulkan image 图集 binding 5",
+        "binding = 5) uniform sampler2DArray image_atlas",
+    ),
+    (
+        "src/render/shaders/quad.metal",
+        "Metal glyph 图集 texture(0)",
+        "glyph_atlas [[texture(0)]]",
+    ),
+    (
+        "src/render/shaders/quad.metal",
+        "Metal image 图集 texture(1)",
+        "image_atlas [[texture(1)]]",
+    ),
+    (
+        "src/render/shaders/quad.metal",
+        "Metal 采样器槽位 sampler(0)",
+        "atlas_sampler [[sampler(0)]]",
+    ),
+];
+
+fn validate_atlas_bindings(manifest: &Path) {
+    for (file, what, expected) in ATLAS_BINDING_ANCHORS {
+        let contents = read(&manifest.join(file));
+        if let Err(detail) = check_anchors(file, &contents, &[(what, expected)]) {
+            panic!(
+                "\nui_core: 图集描述符/采样器漂移\n  {detail}\n  \
+                 修复: 三端图集 descriptor/采样器必须与 contract.md §7/§8 一致；改一端必须三端同步\n"
+            );
+        }
+    }
+    let d3d12_path = "src/render/windows/pipeline.rs";
+    let d3d12 = rust_consts(&read(&manifest.join(d3d12_path)));
+    let atlas_srvs = const_value(&d3d12, "ATLAS_SRVS", d3d12_path);
+    let generations = const_value(&d3d12, "ATLAS_GENERATIONS", d3d12_path);
+    let slot_srvs = const_value(&d3d12, "SLOT_SRVS", d3d12_path);
+    if atlas_srvs != 3.0 {
+        fail(
+            d3d12_path,
+            "ATLAS_SRVS",
+            "3（AtlasKind 数量：Glyph/Image/ColorGlyph）",
+            &atlas_srvs.to_string(),
+        );
+    }
+    if generations != 2.0 {
+        fail(
+            d3d12_path,
+            "ATLAS_GENERATIONS",
+            "2（单色 + 彩色双代 SRV）",
+            &generations.to_string(),
+        );
+    }
+    if slot_srvs != 2.0 {
+        fail(
+            d3d12_path,
+            "SLOT_SRVS",
+            "2（instances t0 + clips t1，图集表起点 t2）",
+            &slot_srvs.to_string(),
+        );
+    }
+    let vulkan_path = "src/render/linux/pipeline.rs";
+    let vulkan = rust_consts(&read(&manifest.join(vulkan_path)));
+    let glyph = const_value(&vulkan, "BINDING_GLYPH_ATLAS", vulkan_path);
+    let image = const_value(&vulkan, "BINDING_IMAGE_ATLAS", vulkan_path);
+    let color = const_value(&vulkan, "BINDING_COLOR_GLYPH_ATLAS", vulkan_path);
+    if glyph != 4.0 || image != glyph + 1.0 || color != glyph + atlas_srvs - 1.0 {
+        fail(
+            vulkan_path,
+            "BINDING_GLYPH_ATLAS / BINDING_IMAGE_ATLAS / BINDING_COLOR_GLYPH_ATLAS",
+            &format!("{glyph}→{image}→{color}（连续，末尾 = 图集数量 {atlas_srvs}）"),
+            &format!("{glyph}→{image}→{color}"),
+        );
+    }
+}
 
 fn validate_render_state(manifest: &Path) {
     for (file, what, expected) in RENDER_STATE_ANCHORS {

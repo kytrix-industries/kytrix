@@ -82,7 +82,7 @@ struct ColrCoverage {
 impl ColrCoverage {
     fn of(data: &[u8], font_offset: u32) -> Option<Self> {
         let base = usize::try_from(font_offset).ok()?;
-        let table = sfnt_table(data, base, *b"COLR")?;
+        let (table, table_len) = sfnt_table(data, base, *b"COLR")?;
         let header = slice(data, table, 0, 18)?;
         let version = u16::from_be_bytes([header[0], header[1]]);
         let v0_count = usize::from(u16::from_be_bytes([header[2], header[3]]));
@@ -110,13 +110,19 @@ impl ColrCoverage {
         let v1 = if v1_offset == 0 {
             Vec::new()
         } else {
-            let count = read_u32(data, table.checked_add(v1_offset)?).unwrap_or(0);
+            let records = v1_offset.checked_add(4)?;
+            let declared = read_u32(data, table.checked_add(v1_offset)?).unwrap_or(0);
+            let tabular = table_len.saturating_sub(records) / 6;
+            let in_data = data.len().saturating_sub(table.checked_add(records)?) / 6;
+            let count = usize::try_from(declared)
+                .unwrap_or(usize::MAX)
+                .min(tabular)
+                .min(in_data);
             (0..count)
                 .filter_map(|index| {
                     let record = table
-                        .checked_add(v1_offset)?
-                        .checked_add(4)?
-                        .checked_add(usize::try_from(index).ok()?.checked_mul(6)?)?;
+                        .checked_add(records)?
+                        .checked_add(index.checked_mul(6)?)?;
                     Some(u32::from(read_u16(data, record)?))
                 })
                 .collect::<Vec<_>>()
@@ -148,7 +154,7 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn sfnt_table(data: &[u8], font_offset: usize, tag: [u8; 4]) -> Option<usize> {
+fn sfnt_table(data: &[u8], font_offset: usize, tag: [u8; 4]) -> Option<(usize, usize)> {
     let directory = slice(data, font_offset, 0, 12)?;
     let num_tables = usize::from(u16::from_be_bytes([directory[4], directory[5]]));
     for index in 0..num_tables.min(256) {
@@ -157,7 +163,8 @@ fn sfnt_table(data: &[u8], font_offset: usize, tag: [u8; 4]) -> Option<usize> {
             continue;
         }
         let offset = u32::from_be_bytes([record[8], record[9], record[10], record[11]]);
-        return usize::try_from(offset).ok();
+        let length = u32::from_be_bytes([record[12], record[13], record[14], record[15]]);
+        return Some((usize::try_from(offset).ok()?, usize::try_from(length).ok()?));
     }
     None
 }
@@ -434,21 +441,135 @@ pub(crate) fn probe_emoji_font() -> Option<parley::FontData> {
 }
 
 #[cfg(test)]
-pub(crate) fn colr_v1_only_font() -> Option<(parley::FontData, u32)> {
-    let base = probe_font()?;
-    let font_ref = swash::FontRef::from_index(base.data.data(), base.index as usize)?;
-    if font_ref.offset != 0 {
-        return None;
+pub(crate) fn color_glyph_monochrome_fixture() -> Result<(parley::FontData, u32), String> {
+    let (base, glyph) = single_face_font_base()?;
+    let fabricated = append_colr_v1_paint(&base, glyph);
+    Ok((
+        parley::FontData::new(parley::fontique::Blob::from(fabricated), 0),
+        u32::from(glyph),
+    ))
+}
+
+#[cfg(test)]
+fn single_face_font_base() -> Result<(Vec<u8>, u16), String> {
+    let mut attempted = Vec::new();
+    for path in single_face_font_candidates() {
+        attempted.push(path.display().to_string());
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(font) = swash::FontRef::from_index(&data, 0) else {
+            continue;
+        };
+        if font.offset != 0 || sfnt_table(&data, 0, *b"COLR").is_some() {
+            continue;
+        }
+        let glyph = font.charmap().map('A');
+        if glyph != 0 {
+            return Ok((data, glyph));
+        }
     }
-    let glyph = u32::from(font_ref.charmap().map('A'));
-    if glyph == 0 || glyph > u32::from(u16::MAX) {
-        return None;
+    Err(format!(
+        "no single-face TTF/OTF font without a COLR table is available on this host; tried: [{}]",
+        attempted.join(", ")
+    ))
+}
+
+#[cfg(test)]
+fn single_face_font_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+
+    const SCAN_DEPTH: usize = 3;
+    let mut candidates = Vec::new();
+    if cfg!(windows) {
+        candidates.extend(
+            [
+                "segoeui.ttf",
+                "arial.ttf",
+                "calibri.ttf",
+                "tahoma.ttf",
+                "verdana.ttf",
+            ]
+            .map(|name| Path::new(r"C:\Windows\Fonts").join(name)),
+        );
+    } else if cfg!(target_os = "macos") {
+        candidates.extend(
+            [
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/Supplemental/Verdana.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/System/Library/Fonts/SFNSMono.ttf",
+            ]
+            .map(PathBuf::from),
+        );
+        collect_font_files(Path::new("/Library/Fonts"), 0, &mut candidates);
+        collect_font_files(
+            Path::new("/System/Library/Fonts"),
+            SCAN_DEPTH,
+            &mut candidates,
+        );
+    } else {
+        candidates.extend(
+            [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            ]
+            .map(PathBuf::from),
+        );
+        collect_font_files(Path::new("/usr/share/fonts"), SCAN_DEPTH, &mut candidates);
     }
-    let fabricated = append_colr_v1_paint(base.data.data(), glyph as u16);
-    let font = parley::FontData::new(parley::fontique::Blob::from(fabricated), 0);
-    let mut raster = GlyphRasterizer::new();
-    let image = raster.rasterize(&font, glyph, 32.0, 0, &GlyphVariation::default())?;
-    (image.color_monochrome && !image.color).then_some((font, glyph))
+    candidates
+}
+
+#[cfg(test)]
+fn collect_font_files(dir: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files = Vec::new();
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth > 0 {
+                subdirs.push(path);
+            }
+        } else if matches!(
+            path.extension().and_then(std::ffi::OsStr::to_str),
+            Some("ttf" | "otf")
+        ) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    subdirs.sort();
+    out.extend(files);
+    for subdir in &subdirs {
+        collect_font_files(subdir, depth - 1, out);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gpu_pixels_exempt() -> bool {
+    std::env::var_os("KYTRIX_TEST_SKIP_GPU_PIXELS").is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn require_color_glyph_monochrome_fixture() -> Option<(parley::FontData, u32)> {
+    match color_glyph_monochrome_fixture() {
+        Ok(fixture) => Some(fixture),
+        Err(reason) => {
+            assert!(
+                gpu_pixels_exempt(),
+                "无法构造 COLRv1-only 测试字体：{reason}；设置 KYTRIX_TEST_SKIP_GPU_PIXELS=1 可显式豁免"
+            );
+            eprintln!(
+                "skip COLRv1-only fixture: {reason} (explicitly exempted by KYTRIX_TEST_SKIP_GPU_PIXELS=1)"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -510,7 +631,8 @@ fn append_colr_v1_paint(data: &[u8], glyph: u16) -> Vec<u8> {
 mod tests {
     use super::{
         ColorGlyphCoverage, ColrCoverage, GlyphRasterizer, GlyphVariation, color_pixels,
-        colr_v1_only_font, probe_emoji_font, probe_font, probe_variable_font, split_subpixel_x,
+        probe_emoji_font, probe_font, probe_variable_font, require_color_glyph_monochrome_fixture,
+        split_subpixel_x,
     };
 
     #[test]
@@ -1088,9 +1210,82 @@ mod tests {
     }
 
     #[test]
+    fn colr_v1_base_glyph_records_are_clamped_to_the_table_length() {
+        let mut colr = Vec::new();
+        colr.extend_from_slice(&1u16.to_be_bytes());
+        colr.extend_from_slice(&0u16.to_be_bytes());
+        colr.extend_from_slice(&0u32.to_be_bytes());
+        colr.extend_from_slice(&0u32.to_be_bytes());
+        colr.extend_from_slice(&0u16.to_be_bytes());
+        colr.extend_from_slice(&34u32.to_be_bytes());
+        for _ in 0..4 {
+            colr.extend_from_slice(&0u32.to_be_bytes());
+        }
+        colr.extend_from_slice(&65535u32.to_be_bytes());
+        for glyph in [42u16, 300] {
+            colr.extend_from_slice(&glyph.to_be_bytes());
+            colr.extend_from_slice(&7u32.to_be_bytes());
+        }
+        let table_len = colr.len();
+        let mut font = vec![0u8; 28];
+        font[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        font[4..6].copy_from_slice(&1u16.to_be_bytes());
+        font[12..16].copy_from_slice(b"COLR");
+        font[20..24].copy_from_slice(&28u32.to_be_bytes());
+        font[24..28].copy_from_slice(&(table_len as u32).to_be_bytes());
+        font.extend_from_slice(&colr);
+        for glyph in [777u16, 888] {
+            font.extend_from_slice(&glyph.to_be_bytes());
+            font.extend_from_slice(&9u32.to_be_bytes());
+        }
+
+        let coverage = ColrCoverage::of(&font, 0).expect("COLR 表必须可解析");
+        assert!(coverage.has_paint(42), "表内记录 42 必须命中");
+        assert!(coverage.has_paint(300), "表内记录 300 必须命中");
+        assert!(
+            !coverage.has_paint(777) && !coverage.has_paint(888),
+            "声明计数 65535 超出表长可容纳的 2 条记录：表外数据不得被当成 BaseGlyphPaintRecord 解析"
+        );
+        assert_eq!(
+            coverage.v1.len(),
+            2,
+            "BaseGlyphList 必须按 COLR 表目录声明的长度截断（表长 {table_len} B，记录区仅 2 条）"
+        );
+    }
+
+    #[test]
+    fn colr_v1_huge_base_glyph_count_is_bounded_by_the_table() {
+        let mut colr = Vec::new();
+        colr.extend_from_slice(&1u16.to_be_bytes());
+        colr.extend_from_slice(&0u16.to_be_bytes());
+        colr.extend_from_slice(&0u32.to_be_bytes());
+        colr.extend_from_slice(&0u32.to_be_bytes());
+        colr.extend_from_slice(&0u16.to_be_bytes());
+        colr.extend_from_slice(&34u32.to_be_bytes());
+        for _ in 0..4 {
+            colr.extend_from_slice(&0u32.to_be_bytes());
+        }
+        colr.extend_from_slice(&u32::MAX.to_be_bytes());
+        colr.push(0);
+        let mut font = vec![0u8; 28];
+        font[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        font[4..6].copy_from_slice(&1u16.to_be_bytes());
+        font[12..16].copy_from_slice(b"COLR");
+        font[20..24].copy_from_slice(&28u32.to_be_bytes());
+        font[24..28].copy_from_slice(&(colr.len() as u32).to_be_bytes());
+        font.extend_from_slice(&colr);
+
+        let coverage = ColrCoverage::of(&font, 0).expect("COLR 表必须可解析");
+        assert!(
+            coverage.v1.is_empty(),
+            "numBaseGlyphPaintRecords = u32::MAX 且表长只容纳 0 条记录时不得解析任何 base glyph（否则会迭代 43 亿次）"
+        );
+        assert!(!coverage.has_paint(42));
+    }
+
+    #[test]
     fn a_colr_v1_only_glyph_falls_back_to_monochrome_with_the_flag() {
-        let Some((font, glyph)) = colr_v1_only_font() else {
-            eprintln!("skip: no rebuildable single-font available for the COLRv1 fixture");
+        let Some((font, glyph)) = require_color_glyph_monochrome_fixture() else {
             return;
         };
         let mut raster = GlyphRasterizer::new();

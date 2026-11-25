@@ -81,15 +81,35 @@ fn golden_color_emoji() {
     run(case);
 }
 
+fn gpu_pixel_exempt() -> bool {
+    std::env::var_os("KYTRIX_TEST_SKIP_GPU_PIXELS").is_some()
+}
+
+fn skip_gpu_pixel_assertions(reason: &str) {
+    assert!(
+        gpu_pixel_exempt(),
+        "彩色 emoji 像素断言无法执行：{reason}；如需在无彩色 emoji 字体/无呈现后端的环境显式豁免，设置 KYTRIX_TEST_SKIP_GPU_PIXELS=1"
+    );
+    eprintln!(
+        "skip color emoji pixel assertions: {reason} (explicitly exempted by KYTRIX_TEST_SKIP_GPU_PIXELS=1)"
+    );
+}
+
 #[test]
 fn color_emoji_glyphs_render_in_color() {
     let _guard = gpu_guard();
     let case = case(SnapshotScene::ColorEmoji, SnapshotTheme::Light, 1.0);
-    let image = capture(case).expect("WARP/lavapipe/metal must read back the emoji scene");
+    let image = match capture(case) {
+        Ok(image) => image,
+        Err(error) => {
+            skip_gpu_pixel_assertions(&format!("离屏读回失败：{error:?}"));
+            return;
+        }
+    };
     let mut colored = 0usize;
     let mut globe_ocean = 0usize;
     let mut globe_land = 0usize;
-    let mut flag_red = 0usize;
+    let mut flag_band_red = 0usize;
     let mut flag_band_saturated = 0usize;
     let mut flag_band_ink = 0usize;
     let width = image.width as usize;
@@ -108,11 +128,11 @@ fn color_emoji_glyphs_render_in_color() {
         if g > 120 && g > r.saturating_add(40) {
             globe_land += 1;
         }
-        if r > 150 && g < 100 && b < 110 {
-            flag_red += 1;
-        }
         let y = index / width;
         if FLAG_BAND.contains(&y) {
+            if r > 150 && g < 100 && b < 110 {
+                flag_band_red += 1;
+            }
             if span >= 60 {
                 flag_band_saturated += 1;
             }
@@ -122,12 +142,10 @@ fn color_emoji_glyphs_render_in_color() {
         }
     }
     eprintln!(
-        "color emoji pixels: colored={colored} globe_ocean={globe_ocean} globe_land={globe_land} flag_red={flag_red} flag_band_saturated={flag_band_saturated} flag_band_ink={flag_band_ink}"
+        "color emoji pixels: colored={colored} globe_ocean={globe_ocean} globe_land={globe_land} flag_band_red={flag_band_red} flag_band_saturated={flag_band_saturated} flag_band_ink={flag_band_ink}"
     );
     if colored == 0 {
-        eprintln!(
-            "skip color emoji: no colored pixels (reason: no color emoji font on this device)"
-        );
+        skip_gpu_pixel_assertions("宿主没有彩色 emoji 字体（colored=0）");
         return;
     }
     assert!(
@@ -155,8 +173,8 @@ fn color_emoji_glyphs_render_in_color() {
                 "🌍 必须同时有海洋蓝与陆地绿（ocean={globe_ocean}, land={globe_land}）"
             );
             assert!(
-                flag_red > 20,
-                "Apple Color Emoji 必须为 🇨🇳 提供红色旗面（实测 {flag_red} 个像素）"
+                flag_band_red > 20,
+                "Apple Color Emoji 必须为 🇨🇳 在旗帜行带内提供红色旗面（实测 {flag_band_red} 个像素）"
             );
         }
         "lavapipe" => {
@@ -165,8 +183,8 @@ fn color_emoji_glyphs_render_in_color() {
                  彩色证据来自 Noto Color Emoji 的国旗/家庭 ZWJ 字形"
             );
             assert!(
-                flag_red > 20,
-                "Noto Color Emoji 必须为 🇨🇳 提供红色旗面（实测 {flag_red} 个像素）"
+                flag_band_red > 20,
+                "Noto Color Emoji 必须为 🇨🇳 在旗帜行带内提供红色旗面（实测 {flag_band_red} 个像素）"
             );
         }
         other => panic!("color emoji 用例缺少设备目录 {other} 的期望"),

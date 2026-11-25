@@ -346,6 +346,7 @@ resolve 附件）。`Textured` 没有覆盖率属性，其顶点写 `KYTRIX_AA_I
 | glyph 图集 | `R8_UNORM`（线性覆盖度，**非** sRGB）；`out = color0 × texel.r`（4 分量同乘）                                                                  |
 | color glyph 图集 | `RGBA8` **sRGB**；纹素是 **straight alpha 的 sRGB 编码颜色**（上传方：COLR v0 输出为 sRGB 空间预乘 → CPU 反预乘；sbix/CBDT PNG 输出本就是 straight）；shader 采样后格式解码为 linear，再 `out = vec4(texel.rgb × texel.a, texel.a)` 得到 linear premultiplied。**不乘 `color0`**（彩色 emoji 保留自身颜色，与单色字形路径的 `color0` 乘算不同） |
 | image 图集 | `BGRA8` **sRGB**；纹素是 **linear-premultiplied 后 sRGB 编码**；`out = texel × color0`                                                         |
+| color glyph tile padding | 每个彩色 tile 的 content 四周必须有 **1 物理像素 padding**，内容是相邻行/列边缘纹素的**复制**（straight alpha 的边缘色）；上传脏矩形必须覆盖 padding。LINEAR 在分数设备位置采样 tile 边界（`AtlasTile::uv()` 的边约定）时按 50/50 读取 padding 与边缘纹素：padding 填 0 会把 straight-alpha 颜色与 `(0,0,0,0)` 混合、使 emoji 边缘偏暗。glyph（R8 覆盖度）与 image 图集**不**复制边缘——覆盖度的 0 边界就是正确的 alpha 语义 |
 | 纹理视图   | image 图集的 SRV / 纹理视图**必须**声明为 sRGB 格式（`*_UNORM_SRGB` / `.bgra8Unorm_srgb` / `*_SRGB`）；glyph 图集必须保持非 sRGB 的 `R8_UNORM` |
 | 上传方职责 | P15 必须「linear 空间预乘 → sRGB 编码」后写图集；改成直通 alpha 时 shader 与本文件必须同时改（`texel.rgb *= texel.a`）                         |
 
