@@ -71,35 +71,42 @@ pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
 
 pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -> bool {
     let scope = focus_scope(app, window);
-    let Some(target) = app.windows.get_mut(&window) else {
-        return false;
-    };
-    if let Some(node) = node
-        && !focus::focusable_in_scope(target.tree(), node, scope)
-        && !(editable_focusable(target.tree(), node) && focus::in_scope(target.tree(), node, scope))
-    {
-        return false;
-    }
-    let old = target.focus().focused();
-    if !target.focus_mut().set(node) {
-        return false;
-    }
-    if let Some(previous) = old
-        && let Some(ring) = target.tree().focus_ring(previous)
-        && let Ok(slot) = target.tree().get(previous)
-    {
-        let bounds = slot.layout().bounds;
-        let screen =
-            scroll::to_screen(target.tree(), previous, bounds).outset(ring.offset + ring.width);
-        target.request_damage(screen);
-    }
-    for changed in [old, node].into_iter().flatten() {
-        crate::text_edit::apply_focus(target.tree_mut(), changed, Some(changed) == node);
-        let has_ring = target.tree().focus_ring(changed).is_some();
-        target.tree_mut().mark_a11y(changed);
-        if has_ring {
-            target.tree_mut().mark_paint(changed);
+    let focus_changed = {
+        let Some(target) = app.windows.get_mut(&window) else {
+            return false;
+        };
+        if let Some(node) = node
+            && !focus::focusable_in_scope(target.tree(), node, scope)
+            && !(editable_focusable(target.tree(), node)
+                && focus::in_scope(target.tree(), node, scope))
+        {
+            return false;
         }
+        let old = target.focus().focused();
+        if !target.focus_mut().set(node) {
+            return false;
+        }
+        if let Some(previous) = old
+            && let Some(ring) = target.tree().focus_ring(previous)
+            && let Ok(slot) = target.tree().get(previous)
+        {
+            let bounds = slot.layout().bounds;
+            let screen =
+                scroll::to_screen(target.tree(), previous, bounds).outset(ring.offset + ring.width);
+            target.request_damage(screen);
+        }
+        for changed in [old, node].into_iter().flatten() {
+            crate::text_edit::apply_focus(target.tree_mut(), changed, Some(changed) == node);
+            let has_ring = target.tree().focus_ring(changed).is_some();
+            target.tree_mut().mark_a11y(changed);
+            if has_ring {
+                target.tree_mut().mark_paint(changed);
+            }
+        }
+        old != node
+    };
+    if focus_changed {
+        crate::text_edit::cancel_pointer_press(app, window);
     }
     app.request_frame();
     true

@@ -932,7 +932,7 @@ impl App {
         modifiers: Modifiers,
         timestamp: Instant,
         outcome: &mut InputOutcome,
-    ) {
+    ) -> bool {
         input::on_pointer_down(
             self, window, position, button, modifiers, timestamp, outcome,
         )
@@ -944,7 +944,7 @@ impl App {
         position: LogicalPoint,
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
-    ) {
+    ) -> bool {
         input::on_pointer_move(self, window, position, modifiers, outcome)
     }
 
@@ -956,7 +956,7 @@ impl App {
         modifiers: Modifiers,
         timestamp: Instant,
         outcome: &mut InputOutcome,
-    ) {
+    ) -> bool {
         input::on_pointer_up(
             self, window, position, button, modifiers, timestamp, outcome,
         )
@@ -1915,6 +1915,9 @@ mod tests;
 
 #[cfg(test)]
 mod text_edit_tests;
+
+#[cfg(all(test, feature = "test-support"))]
+mod text_edit_pointer_tests;
 
 #[cfg(test)]
 mod interaction_tests;

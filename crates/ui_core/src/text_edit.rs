@@ -13,8 +13,8 @@ use crate::{
     app::App,
     error::EngineError,
     event::{Action, ActionSource, ImeEvent, KeyCode, Modifiers},
-    interaction::scroll,
-    math::LogicalPx,
+    interaction::{drag as drag_util, scroll},
+    math::{LogicalPoint, LogicalPx, px},
     node::{id::NodeId, tree::NodeTree},
     paint::color::{Color, ColorBrush},
     text::{ShapedLine, TextContent, TextStyle, shape::ShapedText},
@@ -115,11 +115,29 @@ impl TextCursor {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionBase {
+    Cluster,
+    Word { start: TextCursor, end: TextCursor },
+    Line { start: TextCursor, end: TextCursor },
+}
+
+#[derive(Clone, Copy)]
 pub struct TextSelection {
     anchor: TextCursor,
     focus: TextCursor,
     h_pos: Option<f32>,
+    base: SelectionBase,
+}
+
+impl std::fmt::Debug for TextSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextSelection")
+            .field("anchor", &self.anchor)
+            .field("focus", &self.focus)
+            .field("h_pos", &self.h_pos)
+            .finish()
+    }
 }
 
 impl PartialEq for TextSelection {
@@ -136,6 +154,7 @@ impl TextSelection {
             anchor: cursor,
             focus: cursor,
             h_pos: None,
+            base: SelectionBase::Cluster,
         }
     }
 
@@ -144,6 +163,7 @@ impl TextSelection {
             anchor,
             focus,
             h_pos: None,
+            base: SelectionBase::Cluster,
         }
     }
 
@@ -152,6 +172,7 @@ impl TextSelection {
             anchor,
             focus,
             h_pos,
+            base: SelectionBase::Cluster,
         }
     }
 
@@ -160,6 +181,42 @@ impl TextSelection {
             anchor: TextCursor::from_parley(selection.anchor(), display_len),
             focus: TextCursor::from_parley(selection.focus(), display_len),
             h_pos: None,
+            base: SelectionBase::Cluster,
+        }
+    }
+
+    fn word_from_point(layout: &Layout<ColorBrush>, x: f32, y: f32, display_len: usize) -> Self {
+        let selection = ParleySelection::word_from_point(layout, x, y);
+        let anchor = TextCursor::from_parley(selection.anchor(), display_len);
+        let focus = TextCursor::from_parley(selection.focus(), display_len);
+        Self {
+            anchor,
+            focus,
+            h_pos: None,
+            base: SelectionBase::Word {
+                start: anchor,
+                end: focus,
+            },
+        }
+    }
+
+    fn hard_line_from_point(
+        layout: &Layout<ColorBrush>,
+        x: f32,
+        y: f32,
+        display_len: usize,
+    ) -> Self {
+        let selection = ParleySelection::hard_line_from_point(layout, x, y);
+        let anchor = TextCursor::from_parley(selection.anchor(), display_len);
+        let focus = TextCursor::from_parley(selection.focus(), display_len);
+        Self {
+            anchor,
+            focus,
+            h_pos: None,
+            base: SelectionBase::Line {
+                start: anchor,
+                end: focus,
+            },
         }
     }
 
@@ -167,12 +224,70 @@ impl TextSelection {
         ParleySelection::new(self.anchor.to_parley(layout), self.focus.to_parley(layout))
     }
 
+    fn extend_to_point(self, layout: &Layout<ColorBrush>, x: f32, y: f32) -> Self {
+        let display_len = layout.text_len();
+        let target = match self.base {
+            SelectionBase::Cluster => {
+                return Self {
+                    anchor: self.anchor,
+                    focus: TextCursor::from_parley(
+                        ParleyCursor::from_point(layout, x, y),
+                        display_len,
+                    ),
+                    h_pos: None,
+                    base: self.base,
+                };
+            }
+            SelectionBase::Word { start, end } => {
+                (ParleySelection::word_from_point(layout, x, y), start, end)
+            }
+            SelectionBase::Line { start, end } => (
+                ParleySelection::hard_line_from_point(layout, x, y),
+                start,
+                end,
+            ),
+        };
+        let (anchor, focus) = extend_selection(target.0, target.1, target.2, layout);
+        Self {
+            anchor: TextCursor::from_parley(anchor, display_len),
+            focus: TextCursor::from_parley(focus, display_len),
+            h_pos: None,
+            base: self.base,
+        }
+    }
+
+    fn shift_click_extension(self, layout: &Layout<ColorBrush>, x: f32, y: f32) -> Self {
+        let display_len = layout.text_len();
+        let target = ParleyCursor::from_point(layout, x, y);
+        let anchor = match self.base {
+            SelectionBase::Cluster => self.anchor,
+            SelectionBase::Word { start, end } | SelectionBase::Line { start, end } => {
+                if target.index() < start.byte {
+                    end
+                } else {
+                    start
+                }
+            }
+        };
+        Self {
+            anchor,
+            focus: TextCursor::from_parley(target, display_len),
+            h_pos: None,
+            base: self.base,
+        }
+    }
+
     fn normalized(self, display_len: usize) -> Self {
         Self {
             anchor: self.anchor.normalized(display_len),
             focus: self.focus.normalized(display_len),
             h_pos: self.h_pos,
+            base: self.base,
         }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.anchor == other.anchor && self.focus == other.focus && self.base == other.base
     }
 
     pub fn anchor(&self) -> TextCursor {
@@ -189,6 +304,32 @@ impl TextSelection {
 
     pub fn range(&self) -> Range<usize> {
         self.anchor.byte.min(self.focus.byte)..self.anchor.byte.max(self.focus.byte)
+    }
+}
+
+fn extend_selection(
+    target: ParleySelection,
+    start: TextCursor,
+    end: TextCursor,
+    layout: &Layout<ColorBrush>,
+) -> (ParleyCursor, ParleyCursor) {
+    let start_cursor = start.to_parley(layout);
+    let end_cursor = end.to_parley(layout);
+    let extending_right = target.anchor().index() >= start_cursor.index();
+    let mut min = target.anchor();
+    let mut max = target.anchor();
+    for cursor in [target.focus(), start_cursor, end_cursor] {
+        if cursor.index() < min.index() {
+            min = cursor;
+        }
+        if cursor.index() > max.index() {
+            max = cursor;
+        }
+    }
+    if extending_right {
+        (min, max)
+    } else {
+        (max, min)
     }
 }
 
@@ -999,7 +1140,7 @@ impl EditableText {
 
     fn set_selection(&mut self, selection: TextSelection) -> bool {
         let selection = selection.normalized(self.display_len());
-        if self.selection == selection {
+        if self.selection.matches(&selection) {
             return false;
         }
         self.selection = selection;
@@ -2780,6 +2921,244 @@ pub(crate) fn handle_text(app: &mut App, window: WindowId, text: &str) -> bool {
     }
     let _ = insert_text(app, window, context.node, text, EditKind::Insert);
     true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextPointerPress {
+    pub node: NodeId,
+    pub origin: LogicalPoint,
+    pub dragging: bool,
+}
+
+#[must_use]
+pub(crate) fn text_pointer_press(app: &App, window: WindowId) -> Option<TextPointerPress> {
+    app.window(window)?.pointer().text_edit
+}
+
+pub(crate) fn pointer_press(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    position: LogicalPoint,
+    local_point: LogicalPoint,
+    click_count: u8,
+    modifiers: Modifiers,
+) -> bool {
+    let content_offset = {
+        let Some(target) = app.window(window) else {
+            return false;
+        };
+        let tree = target.tree();
+        let Some(editable) = tree.editable(node) else {
+            return false;
+        };
+        if editable.spec().disabled {
+            return false;
+        }
+        tree.content_offset(node)
+    };
+    let point = LogicalPoint::new(
+        local_point.x - content_offset.x,
+        local_point.y - content_offset.y,
+    );
+    let _ = cancel_composition(app, window, node);
+    let selection = with_editable_layout(app, window, node, |editable, layout| {
+        let x = point.x.value();
+        let y = point.y.value();
+        let display_len = layout.text_len();
+        match click_count {
+            _ if modifiers.contains(Modifiers::SHIFT) => {
+                editable.selection().shift_click_extension(layout, x, y)
+            }
+            2 => TextSelection::word_from_point(layout, x, y, display_len),
+            count if count >= 3 => TextSelection::hard_line_from_point(layout, x, y, display_len),
+            _ => TextSelection::from_parley(ParleySelection::from_point(layout, x, y), display_len),
+        }
+    });
+    let Ok(selection) = selection else {
+        return false;
+    };
+    if store_selection(app, window, node, selection).is_err() {
+        return false;
+    }
+    let Some(target) = app.window_mut(window) else {
+        return false;
+    };
+    target.pointer_mut().text_edit = Some(TextPointerPress {
+        node,
+        origin: position,
+        dragging: false,
+    });
+    true
+}
+
+pub(crate) fn pointer_move(
+    app: &mut App,
+    window: WindowId,
+    position: LogicalPoint,
+    drag_distance: f32,
+) -> bool {
+    let Some(press) = text_pointer_press(app, window) else {
+        return false;
+    };
+    let node = press.node;
+    if app.focused(window) != Some(node) || !editable_accepts_pointer(app, window, node) {
+        cancel_pointer_press(app, window);
+        return false;
+    }
+    if !press.dragging {
+        let delta = LogicalPoint::new(position.x - press.origin.x, position.y - press.origin.y);
+        if !drag_util::crosses_threshold(delta, drag_distance) {
+            return true;
+        }
+        if let Some(target) = app.window_mut(window)
+            && let Some(press) = target.pointer_mut().text_edit.as_mut()
+        {
+            press.dragging = true;
+        }
+    }
+    auto_scroll_text(app, window, node, position);
+    extend_pointer_selection(app, window, node, position);
+    true
+}
+
+pub(crate) fn pointer_release(app: &mut App, window: WindowId, position: LogicalPoint) -> bool {
+    let Some(press) = text_pointer_press(app, window) else {
+        return false;
+    };
+    if app.focused(window) != Some(press.node) {
+        cancel_pointer_press(app, window);
+        return false;
+    }
+    if press.dragging && editable_accepts_pointer(app, window, press.node) {
+        extend_pointer_selection(app, window, press.node, position);
+    }
+    cancel_pointer_press(app, window);
+    true
+}
+
+pub(crate) fn cancel_pointer_press(app: &mut App, window: WindowId) -> bool {
+    let had = app
+        .window_mut(window)
+        .is_some_and(|target| target.pointer_mut().text_edit.take().is_some());
+    if had {
+        let _ = app.release_pointer(window);
+    }
+    had
+}
+
+fn editable_accepts_pointer(app: &App, window: WindowId, node: NodeId) -> bool {
+    app.window(window)
+        .and_then(|target| target.tree().editable(node))
+        .is_some_and(|editable| !editable.spec().disabled)
+}
+
+fn extend_pointer_selection(app: &mut App, window: WindowId, node: NodeId, position: LogicalPoint) {
+    let Some(point) = text_layout_point(app, window, node, position) else {
+        return;
+    };
+    let selection = with_editable_layout(app, window, node, |editable, layout| {
+        let height = layout.height();
+        let (x, y) = if point.y.value() < 0.0 {
+            (-1.0, -1.0)
+        } else if point.y.value() > height {
+            (layout.width() + 1.0, (height - 1.0).max(0.0))
+        } else {
+            (point.x.value(), point.y.value())
+        };
+        editable.selection().extend_to_point(layout, x, y)
+    });
+    if let Ok(selection) = selection {
+        let _ = store_selection(app, window, node, selection);
+    }
+}
+
+fn text_layout_point(
+    app: &App,
+    window: WindowId,
+    node: NodeId,
+    position: LogicalPoint,
+) -> Option<LogicalPoint> {
+    let tree = app.window(window)?.tree();
+    let content = tree.content_offset(node);
+    let local = match tree.hit_test(position) {
+        Some(hit) if hit.node == node => hit.local_point,
+        _ => {
+            let bounds = tree.get(node).ok()?.layout().bounds;
+            let offset = scroll::ancestor_offset(tree, node);
+            LogicalPoint::new(
+                position.x + offset.x - bounds.origin.x,
+                position.y + offset.y - bounds.origin.y,
+            )
+        }
+    };
+    Some(LogicalPoint::new(local.x - content.x, local.y - content.y))
+}
+
+fn auto_scroll_text(app: &mut App, window: WindowId, node: NodeId, position: LogicalPoint) {
+    let Some((handle, goal)) = auto_scroll_goal(app, window, node, position) else {
+        return;
+    };
+    let _ = app.scroll_to(&handle, goal);
+}
+
+fn auto_scroll_goal(
+    app: &App,
+    window: WindowId,
+    node: NodeId,
+    position: LogicalPoint,
+) -> Option<(crate::interaction::ScrollHandle, LogicalPoint)> {
+    let target = app.window(window)?;
+    let tree = target.tree();
+    let (ancestor, slot) = scroll::scroll_ancestor(tree, node)?;
+    let bounds = tree.get(node).ok()?.layout().bounds;
+    let node_screen = scroll::to_screen(tree, node, bounds);
+    let viewport_screen = scroll::to_screen(tree, ancestor, scroll::viewport(tree, ancestor));
+    let visible = node_screen.intersect(viewport_screen);
+    let visible = if visible.size.width > LogicalPx::ZERO && visible.size.height > LogicalPx::ZERO {
+        visible
+    } else {
+        viewport_screen
+    };
+    let (distance, direction) = match slot.axis {
+        crate::interaction::ScrollAxis::Vertical => {
+            if position.y < visible.origin.y {
+                (visible.origin.y - position.y, -1.0_f32)
+            } else if position.y > visible.max().y {
+                (position.y - visible.max().y, 1.0_f32)
+            } else {
+                (LogicalPx::ZERO, 0.0_f32)
+            }
+        }
+        crate::interaction::ScrollAxis::Horizontal => {
+            if position.x < visible.origin.x {
+                (visible.origin.x - position.x, -1.0_f32)
+            } else if position.x > visible.max().x {
+                (position.x - visible.max().x, 1.0_f32)
+            } else {
+                (LogicalPx::ZERO, 0.0_f32)
+            }
+        }
+    };
+    if direction == 0.0 {
+        return None;
+    }
+    let step = px(distance
+        .value()
+        .clamp(1.0, (slot.line_height.value() * 2.0).max(1.0))
+        * direction);
+    let goal = match slot.axis {
+        crate::interaction::ScrollAxis::Vertical => {
+            LogicalPoint::new(slot.offset.x, slot.offset.y + step)
+        }
+        crate::interaction::ScrollAxis::Horizontal => {
+            LogicalPoint::new(slot.offset.x + step, slot.offset.y)
+        }
+    };
+    Some((
+        crate::interaction::ScrollHandle::new(window, ancestor),
+        goal,
+    ))
 }
 
 pub(crate) fn handle_key(

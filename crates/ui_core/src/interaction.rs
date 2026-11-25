@@ -125,6 +125,7 @@ pub(crate) struct PointerState {
     pub capture: Option<NodeId>,
     pub last_hit: Option<HitResult>,
     pub modifiers: Modifiers,
+    pub text_edit: Option<crate::text_edit::TextPointerPress>,
 }
 
 impl PointerState {
@@ -138,6 +139,7 @@ impl PointerState {
             capture: None,
             last_hit: None,
             modifiers: Modifiers::empty(),
+            text_edit: None,
         }
     }
 

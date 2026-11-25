@@ -141,19 +141,27 @@ pub(crate) fn dispatch_input_tracked(
             position,
             modifiers,
             ..
-        } => app.on_pointer_move(window, position, modifiers, &mut outcome),
+        } => {
+            consumed = app.on_pointer_move(window, position, modifiers, &mut outcome);
+        }
         InputEvent::PointerDown {
             position,
             button,
             modifiers,
             timestamp,
-        } => app.on_pointer_down(window, position, button, modifiers, timestamp, &mut outcome),
+        } => {
+            consumed =
+                app.on_pointer_down(window, position, button, modifiers, timestamp, &mut outcome);
+        }
         InputEvent::PointerUp {
             position,
             button,
             modifiers,
             timestamp,
-        } => app.on_pointer_up(window, position, button, modifiers, timestamp, &mut outcome),
+        } => {
+            consumed =
+                app.on_pointer_up(window, position, button, modifiers, timestamp, &mut outcome);
+        }
         InputEvent::PointerLeave { modifiers, .. } => app.on_pointer_leave(window, modifiers),
         InputEvent::PointerCancel { .. } => app.cancel_pointer_session(window),
         InputEvent::Scroll {
@@ -205,14 +213,15 @@ pub(crate) fn on_pointer_down(
     modifiers: Modifiers,
     timestamp: Instant,
     outcome: &mut InputOutcome,
-) {
+) -> bool {
     if app
         .windows
         .get(&window)
         .is_some_and(|target| target.pointer().drag.is_some())
     {
-        return;
+        return false;
     }
+    crate::text_edit::cancel_pointer_press(app, window);
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
     let outside = app.windows.get(&window).and_then(|target| {
@@ -225,7 +234,7 @@ pub(crate) fn on_pointer_down(
             target.pointer_mut().pending_drag = None;
         }
         let _ = app.remove_node(window, node);
-        return;
+        return false;
     }
     if let Some(scope) = app.modal_scope(window) {
         let inside = app.windows.get(&window).is_some_and(|target| {
@@ -234,7 +243,7 @@ pub(crate) fn on_pointer_down(
             })
         });
         if !inside {
-            return;
+            return false;
         }
     }
     if let Some(target) = app.windows.get_mut(&window) {
@@ -249,6 +258,37 @@ pub(crate) fn on_pointer_down(
         });
     }
     update_hover(app, window, hit.map(|result| result.node));
+    if button.is_primary()
+        && let Some(result) = hit
+        && let Some(enabled) = app.windows.get(&window).and_then(|target| {
+            target
+                .tree()
+                .editable(result.node)
+                .map(|editable| !editable.spec().disabled)
+        })
+    {
+        if enabled {
+            let count = if modifiers.is_empty() {
+                app.click_count(window, result.node, position, button, timestamp)
+            } else {
+                1
+            };
+            outcome.click_count = count;
+            let _ = app.set_focus(window, Some(result.node));
+            if crate::text_edit::pointer_press(
+                app,
+                window,
+                result.node,
+                position,
+                result.local_point,
+                count,
+                modifiers,
+            ) {
+                let _ = app.capture_pointer(window, result.node);
+            }
+        }
+        return true;
+    }
     if button.is_primary() {
         let focus_target = app.windows.get(&window).and_then(|target| {
             hit.and_then(|result| focus::nearest_focusable(target.tree(), result.node))
@@ -269,6 +309,7 @@ pub(crate) fn on_pointer_down(
             });
         }
     }
+    false
 }
 
 pub(crate) fn on_pointer_move(
@@ -277,16 +318,25 @@ pub(crate) fn on_pointer_move(
     position: LogicalPoint,
     modifiers: Modifiers,
     outcome: &mut InputOutcome,
-) {
+) -> bool {
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
+    if let Some(target) = app.windows.get_mut(&window) {
+        let pointer = target.pointer_mut();
+        pointer.modifiers = modifiers;
+        pointer.last_hit = hit;
+    }
+    if crate::text_edit::text_pointer_press(app, window).is_some() {
+        update_hover(app, window, hit.map(|result| result.node));
+        update_cursor(app, window, hit);
+        let drag_distance = app.thresholds.drag_distance;
+        return crate::text_edit::pointer_move(app, window, position, drag_distance);
+    }
     let thresholds = app.thresholds;
     let mut promote: Option<(NodeId, Action, LogicalPoint)> = None;
     let mut moved: Option<(NodeId, Action, LogicalPoint)> = None;
     if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
-        pointer.modifiers = modifiers;
-        pointer.last_hit = hit;
         if let Some(session) = pointer.drag.as_mut() {
             session.current = position;
             session.phase = DragPhase::Move;
@@ -326,7 +376,7 @@ pub(crate) fn on_pointer_move(
             outcome.action = Some(action);
             outcome.target = Some(node);
         }
-        return;
+        return false;
     }
     if let Some((node, action, delta)) = moved
         && app.dispatch_action_with_hit(
@@ -344,6 +394,7 @@ pub(crate) fn on_pointer_move(
         outcome.action = Some(action);
         outcome.target = Some(node);
     }
+    false
 }
 
 pub(crate) fn on_pointer_up(
@@ -354,13 +405,31 @@ pub(crate) fn on_pointer_up(
     modifiers: Modifiers,
     timestamp: Instant,
     outcome: &mut InputOutcome,
-) {
+) -> bool {
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
-    let session = app.windows.get_mut(&window).and_then(|target| {
+    if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
         pointer.modifiers = modifiers;
         pointer.last_hit = hit;
+    }
+    let text_press = crate::text_edit::text_pointer_press(app, window).is_some();
+    if button.is_primary() {
+        if crate::text_edit::pointer_release(app, window, position) {
+            if let Some(target) = app.windows.get_mut(&window) {
+                target.pointer_mut().press = None;
+            }
+            return true;
+        }
+        if text_press {
+            if let Some(target) = app.windows.get_mut(&window) {
+                target.pointer_mut().press = None;
+            }
+            return false;
+        }
+    }
+    let session = app.windows.get_mut(&window).and_then(|target| {
+        let pointer = target.pointer_mut();
         if !button.is_primary() {
             return None;
         }
@@ -388,7 +457,7 @@ pub(crate) fn on_pointer_up(
             outcome.action = Some(action);
             outcome.target = Some(session.node);
         }
-        return;
+        return false;
     }
     let press = app.windows.get_mut(&window).and_then(|target| {
         let pointer = target.pointer_mut();
@@ -399,20 +468,27 @@ pub(crate) fn on_pointer_up(
         }
     });
     let Some(press) = press else {
-        return;
+        return false;
     };
     if !button.is_primary() {
-        return;
+        return false;
     }
     let Some(press_node) = press.node else {
-        return;
+        return false;
     };
+    if let Some(editable) = app
+        .windows
+        .get(&window)
+        .and_then(|target| target.tree().editable(press_node))
+    {
+        return editable.spec().disabled;
+    }
     let moved = LogicalPoint::new(position.x - press.position.x, position.y - press.position.y);
     if drag_util::crosses_threshold(moved, app.thresholds.drag_distance) {
-        return;
+        return false;
     }
     if hit.map(|result| result.node) != Some(press_node) {
-        return;
+        return false;
     }
     let count = app.click_count(window, press_node, position, button, timestamp);
     outcome.click_count = count;
@@ -437,14 +513,16 @@ pub(crate) fn on_pointer_up(
             outcome.target = Some(node);
         }
     }
+    false
 }
 
 pub(crate) fn on_pointer_leave(app: &mut App, window: WindowId, modifiers: Modifiers) {
     let mut changed = false;
+    let mut capture = false;
     if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
         pointer.modifiers = modifiers;
-        let capture = pointer.capture.is_some();
+        capture = pointer.capture.is_some();
         if !capture {
             pointer.press = None;
             pointer.pending_drag = None;
@@ -453,6 +531,9 @@ pub(crate) fn on_pointer_leave(app: &mut App, window: WindowId, modifiers: Modif
             pointer.cursor = Cursor::Default;
             changed = true;
         }
+    }
+    if !capture {
+        crate::text_edit::cancel_pointer_press(app, window);
     }
     update_hover(app, window, None);
     if changed {
@@ -803,6 +884,7 @@ pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
 }
 
 pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
+    let had_text_press = crate::text_edit::cancel_pointer_press(app, window);
     let had_capture = app
         .windows
         .get(&window)
@@ -811,7 +893,7 @@ pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
         .windows
         .get_mut(&window)
         .and_then(|target| target.pointer_mut().end_drag());
-    if cancelled.is_some() || had_capture {
+    if cancelled.is_some() || had_capture || had_text_press {
         app.capture_requests.insert(window, false);
     }
     if let Some(session) = cancelled {
@@ -929,6 +1011,11 @@ pub(crate) fn cleanup_removed_pointer_state(
     removed: &ahash::HashSet<NodeId>,
     removed_hover_chain: Option<SmallVec<[NodeId; 8]>>,
 ) {
+    if crate::text_edit::text_pointer_press(app, window)
+        .is_some_and(|press| removed.contains(&press.node))
+    {
+        crate::text_edit::cancel_pointer_press(app, window);
+    }
     let Some(target) = app.windows.get_mut(&window) else {
         return;
     };
@@ -990,7 +1077,15 @@ fn update_cursor(app: &mut App, window: WindowId, hit: Option<HitResult>) {
         let tree = target.tree();
         let scope = overlay_util::focus_scope_root(tree, tree.root());
         let hit = hit.filter(|result| overlay_util::in_modal_scope(tree, result.node, scope));
-        focus::resolve_cursor(tree, hit.map(|result| result.node))
+        let editable = hit.is_some_and(|result| {
+            tree.editable(result.node)
+                .is_some_and(|editable| !editable.spec().disabled)
+        });
+        if editable {
+            Cursor::Text
+        } else {
+            focus::resolve_cursor(tree, hit.map(|result| result.node))
+        }
     });
     let mut changed = false;
     if let Some(target) = app.windows.get_mut(&window) {

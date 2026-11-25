@@ -36,6 +36,10 @@ path = "examples/frameless_smoke.rs"
 required-features = ["test-support"]
 
 [[example]]
+name = "editable"
+path = "examples/editable.rs"
+
+[[example]]
 name = "p1_win_placement_evidence"
 path = "examples/p1_win_placement_evidence/main.rs"
 required-features = ["test-support"]
