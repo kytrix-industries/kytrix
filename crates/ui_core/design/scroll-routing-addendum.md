@@ -496,7 +496,7 @@ pub struct Column {
 | `table.rs` 宽度断言（`:1027-1054`、`:1178-1237`、`:1239-1295`、`:1297-1325`） | 依赖“flex 可缩到 0/具体像素” | 公式变化后期望值变 | 改为“列对齐 + 相对宽 + 内容宽公式”断言；像素按新公式重算 |
 | `table.rs:1327-1448`（a11y） | `scroll.vertical == true` | P1 后 `A11yScroll` 改形状；Table 双轴 | P1 迁移 + K20 新增双轴/无额外滚动容器断言 |
 | `Table` 滚动条归属 | 内层 List 自带垂直条 | 改为 Table 自建两条 bar + rail；ListOptions.scrollbar=false | §3.6；`releasing…signal_slots` 期望值重算 |
-| `ListOptions` 字面量 | Table 一处 + List 自身 + 测试/示例 | 新增 `content_width: Option<LogicalPx>` | 全部补 `content_width: None`；Table 处 `Some` |
+| `ListOptions` 字面量 | Table 一处 + List 自身 + 测试/示例 | 新增 `content_width: Option<LogicalPx>` | 全部补 `content_width: None`；**Table 处按 `content_width` 条件 Some/None：`> 0` → `Some(content_width)` + List `axes=Both`；`== 0` → `None` + List `axes=Vertical`** |
 | `VirtualListConfig` 字面量 | `List::attach` 一处 | 新增 `content_width: Option<LogicalPx>` | 同上 |
 | `ScrollBar::attach` 调用点（List/Table/gallery/应用层） | 返回 `()` | 改 `Result`（P3-1） | 主计划书 §4.7 处理 |
 
