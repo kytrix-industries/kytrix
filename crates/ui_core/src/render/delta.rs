@@ -338,7 +338,7 @@ impl DeltaBuilder {
 
     pub(crate) fn note_removed(&mut self, lane: LaneId, delta: &mut SceneDelta) {
         let slot = lane.slot() as usize;
-        if slot < self.versions.len() {
+        if slot < self.versions.len() && self.versions[slot].0 == lane.generation() {
             self.versions[slot] = (0, 0);
         }
         delta.removed.push(lane);
@@ -393,13 +393,18 @@ impl LaneStore {
         }
         for removed in &delta.removed {
             let slot = removed.slot() as usize;
-            if let Some(stored) = self.lanes.get_mut(slot).and_then(Option::take)
-                && stored.generation == removed.generation()
-            {
-                changed = true;
-                self.fast = false;
-                self.order.retain(|lane| *lane != *removed);
+            let matches = self
+                .lanes
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|stored| stored.generation == removed.generation());
+            if !matches {
+                continue;
             }
+            self.lanes[slot] = None;
+            changed = true;
+            self.fast = false;
+            self.order.retain(|lane| *lane != *removed);
         }
         for lane in &delta.lanes {
             let slot = lane.lane.slot() as usize;
@@ -621,7 +626,7 @@ mod tests {
         paint::{
             color::Color,
             instance::{GeometryLookup, LaneSource},
-            primitive::{Primitive, Quad, QuadPaint},
+            primitive::{CanvasDraw, Primitive, Quad, QuadPaint},
             scene::Scene,
         },
         render::compositor::{DamageRects, Plan},
@@ -1303,7 +1308,7 @@ mod tests {
             fill: Color::WHITE,
         });
         let lane = scene.new_lane();
-        assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
+        assert!(scene.push(lane, Primitive::Canvas(CanvasDraw::new(Arc::new(canvas)))));
         scene.set_order(&[lane]);
 
         let mut builder = DeltaBuilder::new();
@@ -1374,7 +1379,7 @@ mod tests {
             Color::WHITE,
         ));
         let lane = scene.new_lane();
-        assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
+        assert!(scene.push(lane, Primitive::Canvas(CanvasDraw::new(Arc::new(canvas)))));
         scene.set_order(&[lane]);
         let mut builder = DeltaBuilder::new();
         let mut first_delta = SceneDelta::empty(header(1, Plan::Full));
@@ -1384,12 +1389,12 @@ mod tests {
         assert!(scene.clear_lane(lane));
         assert!(scene.push(
             lane,
-            Primitive::Canvas(Arc::new(Canvas::new(LogicalRect::new(
+            Primitive::Canvas(CanvasDraw::new(Arc::new(Canvas::new(LogicalRect::new(
                 px(0.0),
                 px(0.0),
                 px(8.0),
                 px(8.0)
-            ))))
+            )))))
         ));
         let mut changed = SceneDelta::empty(header(2, Plan::Partial(DamageRects::new())));
         builder.collect(&mut scene, &geometry, &[], false, &mut changed);

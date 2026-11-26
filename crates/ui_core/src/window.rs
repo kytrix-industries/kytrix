@@ -688,7 +688,7 @@ impl Window {
     pub(crate) fn encoded_geometry(&self) -> &[crate::paint::instance::GeometryDrawGpu] {
         paint::encoded_geometry(self)
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(crate) fn scroll_slots(&self) -> &[(crate::math::LogicalPoint, DeviceRect)] {
         &self.scroll_slots

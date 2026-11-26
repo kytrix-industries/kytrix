@@ -6,8 +6,8 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    math::{LogicalPoint, LogicalPx, LogicalRect, Transform, px},
-    node::{builder::NodeBuilder, id::NodeId},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform, px},
+    node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
     paint::{
         canvas::Canvas,
         color::Color,
@@ -123,7 +123,7 @@ pub(super) struct MapPicture<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaintedKey {
-    bounds: LogicalRect,
+    size: LogicalSize,
     camera: Camera,
     revision: u64,
     hovered: Option<u32>,
@@ -202,6 +202,7 @@ struct TierGeometry {
 pub(super) struct MapCanvas {
     node: Option<NodeId>,
     bounds: Option<LogicalRect>,
+    screen_origin: LogicalPoint,
     camera: Camera,
     tiers: [Option<TierGeometry>; model::LAND_TIERS],
     dynamic: Vec<GeometryId>,
@@ -218,6 +219,7 @@ impl MapCanvas {
         Self {
             node: None,
             bounds: None,
+            screen_origin: LogicalPoint::ZERO,
             camera: Camera::default(),
             tiers: std::array::from_fn(|_| None),
             dynamic: Vec::new(),
@@ -310,6 +312,7 @@ impl MapCanvas {
             return Ok(false);
         }
         self.bounds = Some(bounds);
+        self.screen_origin = bounds.origin;
         self.camera = self
             .camera
             .clamped([bounds.size.width.value(), bounds.size.height.value()]);
@@ -325,7 +328,7 @@ impl MapCanvas {
         let colors = MapColors::resolve(cx.theme().theme_for(appearance));
         let language = *cx.read(&cx.language());
         let key = PaintedKey {
-            bounds,
+            size: bounds.size,
             camera: self.camera,
             revision: picture.revision,
             hovered: self.hovered,
@@ -363,7 +366,7 @@ impl MapCanvas {
         translate: &Translate,
         key: &PaintedKey,
     ) -> (Canvas, Vec<GeometryId>) {
-        let bounds = key.bounds;
+        let bounds = LogicalRect::from_origin_size(LogicalPoint::ZERO, key.size);
         let viewport = [bounds.size.width.value(), bounds.size.height.value()];
         let projection = Projection::new(self.camera, viewport);
         let origin = [bounds.origin.x.value(), bounds.origin.y.value()];
@@ -400,7 +403,7 @@ impl MapCanvas {
                 ) {
                     canvas.push_geometry(GeometryDraw {
                         id: land.id,
-                        transform: land_transform(projection, bounds),
+                        transform: land_transform(projection),
                         color: colors.land,
                         range,
                     });
@@ -753,16 +756,41 @@ impl MapCanvas {
         projection.drawable().then_some(projection)
     }
 
+    pub(super) fn note_pointer(&mut self, tree: &NodeTree, position: LogicalPoint) {
+        let Some(node) = self.node else {
+            return;
+        };
+        let Some(hit) = tree.hit_test(position) else {
+            return;
+        };
+        if hit.node == node {
+            self.screen_origin = LogicalPoint::new(
+                position.x - hit.local_point.x,
+                position.y - hit.local_point.y,
+            );
+        }
+    }
+
+    fn local(&self, position: LogicalPoint) -> LogicalPoint {
+        LogicalPoint::new(
+            position.x - self.screen_origin.x,
+            position.y - self.screen_origin.y,
+        )
+    }
+
+    fn viewport(&self) -> Option<LogicalRect> {
+        self.bounds
+            .map(|bounds| LogicalRect::from_origin_size(LogicalPoint::ZERO, bounds.size))
+    }
+
     pub(super) fn vessel_at(&mut self, position: LogicalPoint, vessels: &[Vessel]) -> Option<u32> {
-        let bounds = self.bounds?;
-        if !bounds.contains(position) {
+        let viewport = self.viewport()?;
+        let local = self.local(position);
+        if !viewport.contains(local) {
             return None;
         }
         let projection = self.projection()?;
-        let canvas_point = [
-            position.x.value() - bounds.origin.x.value(),
-            position.y.value() - bounds.origin.y.value(),
-        ];
+        let canvas_point = [local.x.value(), local.y.value()];
         let points = vessels
             .iter()
             .map(|vessel| (vessel.mmsi, projection.screen(vessel.position)))
@@ -845,19 +873,17 @@ impl MapCanvas {
     }
 
     pub(super) fn zoom_at(&mut self, position: LogicalPoint, factor: f32) -> bool {
-        let Some(bounds) = self.bounds else {
+        let Some(viewport) = self.viewport() else {
             return false;
         };
-        if !bounds.contains(position) || !factor.is_finite() || factor <= 0.0 {
+        let local = self.local(position);
+        if !viewport.contains(local) || !factor.is_finite() || factor <= 0.0 {
             return false;
         }
         let Some(projection) = self.projection() else {
             return false;
         };
-        let canvas_point = [
-            position.x.value() - bounds.origin.x.value(),
-            position.y.value() - bounds.origin.y.value(),
-        ];
+        let canvas_point = [local.x.value(), local.y.value()];
         let anchor = projection.mercator(canvas_point);
         let zoom = (self.camera.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         if zoom == self.camera.zoom {
@@ -886,11 +912,15 @@ impl MapCanvas {
     }
 
     pub(super) fn attribution_contains(&self, position: LogicalPoint) -> bool {
-        self.attribution.is_some_and(|rect| rect.contains(position))
+        let Some(rect) = self.attribution else {
+            return false;
+        };
+        rect.contains(self.local(position))
     }
 
     pub(super) fn contains(&self, position: LogicalPoint) -> bool {
-        self.bounds.is_some_and(|bounds| bounds.contains(position))
+        self.viewport()
+            .is_some_and(|viewport| viewport.contains(self.local(position)))
     }
 
     pub(super) fn is_dragging(&self) -> bool {
@@ -907,14 +937,11 @@ fn tier_metres_per_pixel(tier: usize) -> f32 {
     }
 }
 
-fn land_transform(projection: Projection, bounds: LogicalRect) -> Transform {
+fn land_transform(projection: Projection) -> Transform {
     let zero = projection.screen([0.0, 0.0]);
     let scale_x = projection.screen([1.0, 0.0])[0] - zero[0];
     let scale_y = projection.screen([0.0, 1.0])[1] - zero[1];
-    Transform::scale(scale_x, scale_y).then(Transform::translate(
-        bounds.origin.x + zero[0],
-        bounds.origin.y + zero[1],
-    ))
+    Transform::scale(scale_x, scale_y).then(Transform::translate(px(zero[0]), px(zero[1])))
 }
 
 fn register_mesh(app: &mut App, mesh: &Mesh) -> Option<GeometryId> {
@@ -1114,8 +1141,8 @@ mod tests {
 
     use i18n::{language::codes::LanguageCode, translate::Translate};
     use ui_core::{
-        math::LogicalSize, node::builder::NodeBuilder, paint::primitive::Primitive,
-        test_support::record::PrimitiveKind,
+        interaction::ScrollConfig, math::LogicalSize, node::builder::NodeBuilder,
+        paint::primitive::Primitive, test_support::record::PrimitiveKind,
     };
     use ui_kit::theme::appearance::Appearance;
     use widget::test_support::{CanvasPrimitive, WidgetTestApp};
@@ -1566,5 +1593,97 @@ mod tests {
                 halo.text
             );
         }
+    }
+
+    fn scroll_page(
+        harness: &mut CanvasHarness,
+        viewport: (f32, f32),
+        content: (f32, f32),
+        offset: f32,
+    ) {
+        let window = harness.app.window();
+        let page = harness.page;
+        let container = harness.app.with_cx(|cx| {
+            let root = cx.tree().root();
+            let container = NodeBuilder::boxed()
+                .id("TEST_CHOKEPOINT_MAP_SCROLL")
+                .style(
+                    StyleBuilder::new()
+                        .width(px(viewport.0))
+                        .height(px(viewport.1))
+                        .flex_col()
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(cx.tree_mut(), root)
+                .expect("the scroll container builds");
+            cx.tree_mut()
+                .append_child(container, page)
+                .expect("the page moves under the scroll container");
+            cx.tree_mut()
+                .set_style(
+                    page,
+                    StyleBuilder::new()
+                        .width(px(content.0))
+                        .height(px(content.1))
+                        .flex_none()
+                        .flex_col()
+                        .build(),
+                )
+                .expect("the page takes the taller content box");
+            container
+        });
+        harness.app.drain();
+        let handle = harness
+            .app
+            .app_mut()
+            .make_scroll(window, container, ScrollConfig::default())
+            .expect("the container scrolls");
+        harness
+            .app
+            .app_mut()
+            .set_scroll_content(&handle, LogicalSize::new(px(content.0), px(content.1)))
+            .expect("the content size is valid");
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&handle, LogicalPoint::new(px(0.0), px(offset)))
+            .expect("the offset is valid");
+        harness.app.drain();
+    }
+
+    #[test]
+    fn a_pointer_in_a_scrolled_ancestor_should_still_hit_the_vessel_under_it() {
+        let mut harness = harness();
+        let vessels = [vessel(1)];
+        harness.sync(&vessels, &[ShipType::Tanker]);
+        harness.app.drain();
+        let offset = 120.0;
+        scroll_page(&mut harness, PAGE, (640.0, 900.0), offset);
+        harness.sync(&vessels, &[ShipType::Tanker]);
+        harness.app.drain();
+
+        let bounds = harness.bounds();
+        let projection = Projection::new(
+            harness.map.camera(),
+            [bounds.size.width.value(), bounds.size.height.value()],
+        );
+        let at = projection.screen(vessels[0].position);
+        let window = LogicalPoint::new(
+            bounds.origin.x + at[0],
+            bounds.origin.y + at[1] - px(offset),
+        );
+        assert_ne!(
+            window,
+            LogicalPoint::new(bounds.origin.x + at[0], bounds.origin.y + at[1]),
+            "滚动祖先必须让窗口坐标与画布局部坐标不同"
+        );
+        let tree = harness.app.tree();
+        harness.map.note_pointer(tree, window);
+        assert_eq!(
+            harness.map.vessel_at(window, &vessels),
+            Some(1),
+            "指针必须换算到画布局部坐标（不再整体偏移 scroll offset）"
+        );
     }
 }

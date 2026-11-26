@@ -187,7 +187,8 @@ impl CryptocurrencyEtfChart {
             return Ok(false);
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+        let size = bounds.size;
+        if size.width <= px(0.0) || size.height <= px(0.0) {
             return Ok(false);
         }
 
@@ -195,13 +196,13 @@ impl CryptocurrencyEtfChart {
         let theme = cx.theme().clone();
         let colors = theme.theme_for(appearance);
         let key = CacheKey {
-            bounds,
+            size,
             revision: self.revision,
         };
         if self.cache.prepared.as_ref().map(|(cached, _)| *cached) != Some(key) {
             let measurements = measure(cx.app_mut(), &self.data, &mut self.cache.text, colors);
             let layout = ChartLayout::new(
-                bounds,
+                LogicalRect::from_origin_size(LogicalPoint::ZERO, size),
                 measurements.left_axis_width,
                 measurements.right_axis_width,
             );

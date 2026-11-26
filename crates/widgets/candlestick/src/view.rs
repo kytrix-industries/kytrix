@@ -27,7 +27,7 @@ use ui_core::{
     error::EngineError,
     event::{Event, InputEvent, PointerButton},
     math::{LogicalPoint, LogicalPx, px},
-    node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     window::WindowId,
 };
@@ -510,44 +510,43 @@ impl WidgetView for CandlestickWidget {
         if self.dragging
             && let InputEvent::PointerUp { .. } = input
         {
-            let inside = pointer_position(input).filter(|position| self.chart_contains(*position));
+            let inside =
+                pointer_position(input).and_then(|position| self.chart_local(cx.tree(), position));
             if self.end_drag(inside) {
                 let _ = cx.request_frame();
             }
             return true;
         }
-        let position = pointer_position(input);
-        if !position.is_some_and(|position| self.chart_contains(position)) {
+        let Some(position) = pointer_position(input) else {
             return false;
-        }
+        };
+        let Some(local) = self.chart_local(cx.tree(), position) else {
+            return false;
+        };
         match input {
-            InputEvent::PointerDown {
-                position, button, ..
-            } => {
+            InputEvent::PointerDown { button, .. } => {
                 if *button != PointerButton::Primary {
                     return false;
                 }
-                if self.begin_drag(position.x) {
+                if self.begin_drag(local.x) {
                     let _ = cx.request_frame();
                 }
                 true
             }
-            InputEvent::PointerUp { position, .. } => {
-                if self.end_drag(Some(*position)) {
+            InputEvent::PointerUp { .. } => {
+                if self.end_drag(Some(local)) {
                     let _ = cx.request_frame();
                 }
                 true
             }
-            InputEvent::PointerMove { position, .. } => {
-                if self.apply_pointer(*position) {
+            InputEvent::PointerMove { .. } => {
+                if self.apply_pointer(local) {
                     let _ = cx.request_frame();
                 }
                 true
             }
-            InputEvent::Scroll {
-                position, delta, ..
-            } => {
-                if self.zoom_at(*position, f32::from(delta.y)) {
+            InputEvent::Scroll { delta, .. } => {
+                if self.zoom_at(local, f32::from(delta.y)) {
                     let _ = cx.request_frame();
                 }
                 true
@@ -1272,10 +1271,10 @@ impl CandlestickWidget {
         latest_price_indicator_is_visible(candles.len(), visible_end, true)
     }
 
-    fn chart_contains(&self, position: LogicalPoint) -> bool {
-        self.chart
-            .bounds()
-            .is_some_and(|bounds| bounds.contains(position))
+    fn chart_local(&self, tree: &NodeTree, position: LogicalPoint) -> Option<LogicalPoint> {
+        let node = self.chart.node()?;
+        let hit = tree.hit_test(position)?;
+        (hit.node == node).then_some(hit.local_point)
     }
 
     fn sync_chart(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {

@@ -25,7 +25,7 @@ use ui_core::{
         style::{ShadowSpec, Shadows, Style, StylePatch},
         style_builder::{PaintBuilder, StyleBuilder},
     },
-    window::{FrameIndex, WindowId},
+    window::WindowId,
 };
 
 use crate::{
@@ -593,7 +593,6 @@ struct OverlayState {
     scrim: Option<NodeId>,
     anchor: Option<Anchor>,
     origin: Option<LogicalPoint>,
-    frame_at_open: Option<FrameIndex>,
     scrim_geometry: Option<(LogicalPoint, LogicalSize)>,
     closing: bool,
 }
@@ -778,7 +777,6 @@ impl Overlay {
                 return Err(error.into());
             }
         };
-        let frame_at_open = app.window(window).map(|target| target.frame_index());
         {
             let mut state = self.inner.state.borrow_mut();
             state.window = Some(window);
@@ -789,7 +787,6 @@ impl Overlay {
             state.scrim = scrim;
             state.anchor = Some(anchor);
             state.origin = Some(initial_origin);
-            state.frame_at_open = frame_at_open;
             state.scrim_geometry = scrim.map(|_| (initial_origin, viewport));
             state.closing = false;
         }
@@ -801,21 +798,62 @@ impl Overlay {
             self.inner.options.slot,
         );
         let _ = app.write(&self.inner.open, true);
-        self.start_fade(app, window, group, 1.0);
-        let _ = self.sync_scrim(app, window, initial_origin, viewport);
         let _ = self.inner.layer.enforce(app, window);
+        if let Err(error) = self.measure(app) {
+            self.close_now(app);
+            return Err(error.into());
+        }
+        self.reveal(app);
+        self.start_fade(app, window, group, 1.0);
         Ok(true)
     }
 
+    pub(crate) fn measure(&self, app: &mut App) -> Result<bool, EngineError> {
+        let Some(window) = self.inner.state.borrow().window else {
+            return Ok(false);
+        };
+        if app.window(window).is_none() {
+            return Ok(false);
+        }
+        if let Some(result) = app.refresh_text(window) {
+            result?;
+        }
+        let Some(target) = app.window_mut(window) else {
+            return Ok(false);
+        };
+        target.compute_layout()?;
+        Ok(self.place_panel(app))
+    }
+
+    fn reveal(&self, app: &mut App) -> bool {
+        if *app.read(&self.inner.revealed) {
+            return false;
+        }
+        let _ = app.write(&self.inner.revealed, true);
+        if !self.inner.options.fade {
+            app.write_transient(&self.inner.fade, 1.0);
+        }
+        true
+    }
+
+    #[must_use]
+    pub fn revealed(&self, app: &App) -> bool {
+        *app.read(&self.inner.revealed)
+    }
+
     pub fn place(&self, app: &mut App) -> bool {
-        let (window, handle, node, anchor) = {
+        self.place_panel(app)
+    }
+
+    fn place_panel(&self, app: &mut App) -> bool {
+        let (window, handle, anchor) = {
             let state = self.inner.state.borrow();
-            let (Some(window), Some(handle), Some(node), Some(anchor)) =
-                (state.window, state.handle, state.node, state.anchor)
+            let (Some(window), Some(handle), Some(anchor)) =
+                (state.window, state.handle, state.anchor)
             else {
                 return false;
             };
-            (window, handle, node, anchor)
+            (window, handle, anchor)
         };
         let Some(anchor_rect) = anchor_rect(app, window, anchor) else {
             self.close_now(app);
@@ -826,7 +864,7 @@ impl Overlay {
         };
         let Some(panel_size) = app
             .window(window)
-            .and_then(|target| target.tree().get(node).ok())
+            .and_then(|target| target.tree().get(handle.node()).ok())
             .map(|target| target.layout().bounds.size)
         else {
             return false;
@@ -838,24 +876,12 @@ impl Overlay {
             self.inner.options.placement,
             self.inner.options.placement_config(),
         );
-        let mut changed = false;
-        let frame_at_open = self.inner.state.borrow().frame_at_open;
-        let measured = frame_at_open.is_none_or(|opened| {
-            app.window(window)
-                .is_some_and(|target| target.frame_index() != opened)
-        });
-        if !*app.read(&self.inner.revealed) && measured {
-            let _ = app.write(&self.inner.revealed, true);
-            if !self.inner.options.fade {
-                app.write_transient(&self.inner.fade, 1.0);
-            }
-            changed = true;
-        }
         let previous = self.inner.state.borrow().origin;
         let moved = previous.is_none_or(|previous| {
             (previous.x - origin.x).abs().value() >= 0.5
                 || (previous.y - origin.y).abs().value() >= 0.5
         });
+        let mut changed = false;
         if moved {
             changed |= app.place_overlay(&handle, OverlayPlacement::Point(origin));
             self.inner.state.borrow_mut().origin = Some(origin);
@@ -939,7 +965,6 @@ impl Overlay {
             state.scrim = None;
             state.anchor = None;
             state.origin = None;
-            state.frame_at_open = None;
             state.scrim_geometry = None;
             state.closing = false;
         }
@@ -1409,7 +1434,7 @@ mod ui_tests {
 
     use std::time::Duration;
 
-    use smol_str::format_smolstr;
+    use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
         a11y::A11yRole,
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
@@ -1417,15 +1442,17 @@ mod ui_tests {
         node::{builder::NodeBuilder, id::NodeId},
         paint::{
             color::Color,
+            primitive::Primitive,
             style_builder::{PaintBuilder, StyleBuilder},
         },
         test_support::app::TestApp,
+        text::TextStyle,
         window::{FrameOutcome, WindowId},
     };
 
     use super::{
         Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayError, OverlayOptions,
-        OverlaySurface, Scrim,
+        OverlaySurface, Placement, Scrim,
     };
     use crate::{
         kit::layer::Layer,
@@ -1565,6 +1592,16 @@ mod ui_tests {
         }
     }
 
+    fn panel_painted(app: &TestApp, window: WindowId, panel: NodeId) -> bool {
+        let bounds = app.probe().bounds(panel).expect("面板盒");
+        app.app()
+            .window(window)
+            .expect("窗口")
+            .scene()
+            .iter()
+            .any(|primitive| matches!(primitive, Primitive::Quad(quad) if quad.bounds == bounds))
+    }
+
     #[test]
     fn the_panel_opens_below_its_anchor_after_layout_settles() {
         let mut harness = Harness::new();
@@ -1587,6 +1624,157 @@ mod ui_tests {
             overlay.progress(harness.app.app()),
             1.0,
             "关掉淡出后立即不透明"
+        );
+    }
+
+    #[test]
+    fn the_first_visible_frame_already_has_the_settled_rect() {
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let overlay = harness.overlay("early", options());
+        assert!(
+            overlay
+                .open(
+                    harness.app.app_mut(),
+                    harness.window,
+                    Anchor::node(anchor),
+                    build_content,
+                )
+                .expect("打开浮层")
+        );
+        assert!(
+            overlay.revealed(harness.app.app()),
+            "open 必须在同一帧内完成 place + reveal"
+        );
+        let _ = harness.app.drain().expect("打开帧");
+        let first = harness.bounds(overlay.overlay_node().expect("浮层节点"));
+        for _ in 0..3 {
+            harness.round(Duration::from_millis(16), &overlay);
+        }
+        let settled = harness.bounds(overlay.overlay_node().expect("浮层节点"));
+        assert_eq!(first, settled, "首个可见帧 rect 必须等于稳定帧 rect");
+    }
+
+    #[test]
+    fn open_reveals_and_paints_the_panel_without_a_host_sync() {
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let overlay = harness.overlay("no-sync", options());
+        assert!(
+            overlay
+                .open(
+                    harness.app.app_mut(),
+                    harness.window,
+                    Anchor::node(anchor),
+                    build_content,
+                )
+                .expect("打开浮层")
+        );
+        assert!(
+            overlay.revealed(harness.app.app()),
+            "缺省 sync 的宿主也必须在 open 内 reveal"
+        );
+        let _ = harness.app.drain().expect("不调用 sync 的打开帧");
+        let panel = overlay.panel_node().expect("面板节点");
+        let bounds = harness.bounds(panel);
+        assert!(
+            panel_painted(&harness.app, harness.window, panel),
+            "open 后第一帧必须真的画出面板背景（宿主没有 sync）"
+        );
+        for _ in 0..3 {
+            harness.round(Duration::from_millis(16), &overlay);
+        }
+        assert_eq!(
+            harness.bounds(panel),
+            bounds,
+            "无 sync 宿主的首帧 rect 必须等于稳定帧 rect"
+        );
+    }
+
+    #[test]
+    fn open_with_a_same_frame_or_next_frame_sync_still_paints_on_the_first_frame() {
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let overlay = harness.overlay("synced", options());
+        assert!(
+            overlay
+                .open(
+                    harness.app.app_mut(),
+                    harness.window,
+                    Anchor::node(anchor),
+                    build_content,
+                )
+                .expect("打开浮层")
+        );
+        let _ = overlay.sync(harness.app.app_mut());
+        let _ = harness.app.drain().expect("同帧 sync 的打开帧");
+        let panel = overlay.panel_node().expect("面板节点");
+        let first = harness.bounds(panel);
+        assert!(overlay.revealed(harness.app.app()), "同帧 sync 后必须可见");
+        assert!(
+            panel_painted(&harness.app, harness.window, panel),
+            "同帧 sync 的首帧必须画出面板"
+        );
+
+        let _ = harness.app.drain().expect("同一帧内不再 sync 的第二帧");
+        let _ = overlay.sync(harness.app.app_mut());
+        let _ = harness.app.drain().expect("下一帧 sync 的帧");
+        assert!(
+            overlay.revealed(harness.app.app()),
+            "下一帧 sync 后仍必须可见"
+        );
+        assert_eq!(
+            harness.bounds(panel),
+            first,
+            "同帧 / 下一帧 sync 都不得改变首可见帧 rect"
+        );
+    }
+
+    #[test]
+    fn text_dominated_content_measures_before_the_first_visible_frame() {
+        let mut harness = Harness::new();
+        let anchor = harness.anchor();
+        let overlay = harness.overlay(
+            "text",
+            OverlayOptions {
+                placement: Placement::TOP_START,
+                ..options()
+            },
+        );
+        let text = SmolStr::new_static(
+            "The quick brown fox jumps over the lazy dog, and the panel height \
+             follows the wrapped text instead of a fixed content box.",
+        );
+        assert!(
+            overlay
+                .open(
+                    harness.app.app_mut(),
+                    harness.window,
+                    Anchor::node(anchor),
+                    move |tree, panel| {
+                        NodeBuilder::text(text, TextStyle::new(px(13.0)))
+                            .id("text")
+                            .style(StyleBuilder::new().width(px(120.0)).build())
+                            .build(tree, panel)?;
+                        Ok(())
+                    },
+                )
+                .expect("打开浮层")
+        );
+        let _ = harness.app.drain().expect("打开帧");
+        let panel = overlay.panel_node().expect("面板节点");
+        let first = harness.bounds(panel);
+        assert!(
+            first.size.height > px(8.0),
+            "文本必须真的撑高面板（否则本用例无法区分首帧/稳定帧）：{first:?}"
+        );
+        for _ in 0..3 {
+            harness.round(Duration::from_millis(16), &overlay);
+        }
+        let settled = harness.bounds(panel);
+        assert_eq!(
+            first, settled,
+            "文本主导高度的面板首可见帧 rect 必须等于稳定帧 rect"
         );
     }
 
@@ -2501,7 +2689,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn a_fade_less_panel_is_hidden_on_its_first_frame() {
+    fn a_fade_less_panel_is_visible_and_opaque_right_after_open() {
         let mut harness = Harness::new();
         let anchor = harness.anchor();
         let overlay = harness.overlay("menu", options());
@@ -2517,28 +2705,19 @@ mod ui_tests {
         );
         assert_eq!(
             overlay.progress(harness.app.app()),
-            0.0,
-            "首帧不显示（等待实测）"
+            1.0,
+            "fade=false 打开即不透明"
+        );
+        assert!(
+            overlay.revealed(harness.app.app()),
+            "open 必须在同一帧内完成 reveal"
         );
         let _ = harness.app.drain().expect("首帧");
-        assert_eq!(
-            overlay.progress(harness.app.app()),
-            0.0,
-            "首次 sync 之前仍不显示"
-        );
-
-        assert!(overlay.sync(harness.app.app_mut()), "首次实测后揭开面板");
-        assert_eq!(
-            overlay.progress(harness.app.app()),
-            1.0,
-            "fade=false 揭开即不透明"
-        );
-        let _ = harness.app.drain().expect("第二帧");
         let panel = harness.bounds(overlay.overlay_node().expect("浮层节点"));
         assert_eq!(
             panel.origin,
             LogicalPoint::new(ANCHOR.origin.x, ANCHOR.max().y + 4.0),
-            "第二帧在实测后的正确位置"
+            "首帧就在实测后的正确位置"
         );
     }
 

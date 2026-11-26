@@ -36,7 +36,8 @@ use market_participants_model::{
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     event::{Action, Event, InputEvent, Modifiers, PointerButton},
-    math::{LogicalPoint, LogicalPx, LogicalSize, px},
+    interaction::ScrollConfig,
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope},
     paint::style_builder::StyleBuilder,
     test_support::record::PrimitiveKind,
@@ -454,6 +455,11 @@ impl Pane {
         )
     }
 
+    fn window_point(&self, harness: &WidgetTestApp, local: LogicalPoint) -> LogicalPoint {
+        let origin = chart_origin(self, harness);
+        LogicalPoint::new(local.x + origin.x, local.y + origin.y)
+    }
+
     fn dispatch(&mut self, harness: &mut WidgetTestApp, event: Event) -> bool {
         self.with(harness, |widget, cx| widget.dispatch(&event, cx))
     }
@@ -469,9 +475,18 @@ fn pane_with_source(
     source: FixtureSource,
     size: (f32, f32),
 ) -> Pane {
+    let chart_page = page(harness, "TEST_CANDLESTICK_PAGE", size);
+    pane_in_page(harness, chart_page, config, source)
+}
+
+fn pane_in_page(
+    harness: &mut WidgetTestApp,
+    chart_page: NodeId,
+    config: CandlestickConfig,
+    source: FixtureSource,
+) -> Pane {
     let scope = harness.app_mut().signal_scope();
     let status = WidgetStatus::new(harness.app_mut(), scope);
-    let chart_page = page(harness, "TEST_CANDLESTICK_PAGE", size);
     let left = header_group(harness, chart_page, "TEST_CANDLESTICK_HEADER_LEFT");
     let right = header_group(harness, chart_page, "TEST_CANDLESTICK_HEADER_RIGHT");
     let publishes = Rc::new(Cell::new(0));
@@ -489,6 +504,59 @@ fn pane_with_source(
         right,
         publishes,
     }
+}
+
+fn scrolled_page(
+    harness: &mut WidgetTestApp,
+    viewport: (f32, f32),
+    page_height: f32,
+    offset: f32,
+) -> NodeId {
+    let window = harness.window();
+    let container = harness.with_cx(|cx| {
+        let root = cx.tree().root();
+        NodeBuilder::boxed()
+            .id("TEST_CANDLESTICK_SCROLL")
+            .style(
+                StyleBuilder::new()
+                    .width(px(viewport.0))
+                    .height(px(viewport.1))
+                    .flex_col()
+                    .overflow_hidden()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)
+            .expect("the scroll container builds")
+    });
+    harness.drain();
+    let handle = harness
+        .app_mut()
+        .make_scroll(window, container, ScrollConfig::default())
+        .expect("the container scrolls");
+    harness
+        .app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(viewport.0), px(page_height)))
+        .expect("the content size is valid");
+    let page = harness.with_cx(|cx| {
+        NodeBuilder::boxed()
+            .id("TEST_CANDLESTICK_SCROLLED_PAGE")
+            .style(
+                StyleBuilder::new()
+                    .width(px(viewport.0))
+                    .height(px(page_height))
+                    .flex_none()
+                    .flex_col()
+                    .build(),
+            )
+            .build(cx.tree_mut(), container)
+            .expect("the scrolled page builds")
+    });
+    harness
+        .app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(offset)))
+        .expect("the offset is valid");
+    harness.drain();
+    page
 }
 
 fn default_pane(harness: &mut WidgetTestApp) -> Pane {
@@ -718,12 +786,30 @@ fn scroll(position: LogicalPoint, delta: LogicalPoint) -> Event {
     })
 }
 
-fn over_the_panel(pane: &Pane) -> LogicalPoint {
-    let bounds = pane.widget.chart.bounds().expect("the chart has a box");
+fn over_the_panel(pane: &Pane, harness: &WidgetTestApp) -> LogicalPoint {
+    let bounds = chart_bounds(pane, harness);
     LogicalPoint::new(
         bounds.max().x + 8.0,
         bounds.origin.y + bounds.size.height / 2.0,
     )
+}
+
+fn chart_bounds(pane: &Pane, harness: &WidgetTestApp) -> LogicalRect {
+    let node = pane
+        .widget
+        .chart
+        .node()
+        .expect("the chart built its canvas");
+    harness
+        .tree()
+        .get(node)
+        .expect("the chart node is mounted")
+        .layout()
+        .bounds
+}
+
+fn chart_origin(pane: &Pane, harness: &WidgetTestApp) -> LogicalPoint {
+    chart_bounds(pane, harness).origin
 }
 
 #[test]
@@ -1734,28 +1820,29 @@ fn dragging_should_pan_the_viewport_and_stop_at_the_live_edge() {
     let mut pane = drawn_pane(&mut harness, live_edge_snapshot(120, 120));
     let center = pane.data_center();
 
+    let press = pane.window_point(&harness, center);
     assert!(
-        pane.dispatch(&mut harness, pointer_down(center)),
+        pane.dispatch(&mut harness, pointer_down(press)),
         "the press lands on the chart"
     );
     assert!(pane.widget.dragging);
 
-    let right = LogicalPoint::new(center.x + 120.0, center.y);
+    let right = pane.window_point(&harness, LogicalPoint::new(center.x + 120.0, center.y));
     assert!(pane.dispatch(&mut harness, pointer_move(right)));
     assert!(
         pane.widget.viewport.right_timestamp.is_some(),
         "a drag away from the edge anchors the viewport"
     );
 
-    let bounds = pane.widget.chart.bounds().expect("the chart has a box");
-    let left = LogicalPoint::new(bounds.origin.x + 1.0, center.y);
+    let left = pane.window_point(&harness, LogicalPoint::new(px(1.0), center.y));
     assert!(pane.dispatch(&mut harness, pointer_move(left)));
     assert_eq!(
         pane.widget.viewport.right_timestamp, None,
         "the live edge is the furthest the viewport goes"
     );
 
-    assert!(pane.dispatch(&mut harness, pointer_up(center)));
+    let release = pane.window_point(&harness, center);
+    assert!(pane.dispatch(&mut harness, pointer_up(release)));
     assert!(!pane.widget.dragging);
     assert_eq!(pane.widget.viewport.cursor, Some(center));
 }
@@ -1767,10 +1854,11 @@ fn scrolling_should_zoom_around_the_pointer() {
     let center = pane.data_center();
     let width = pane.widget.viewport.candle_width;
 
+    let at = pane.window_point(&harness, center);
     assert!(
         pane.dispatch(
             &mut harness,
-            scroll(center, LogicalPoint::new(px(0.0), px(1.0)))
+            scroll(at, LogicalPoint::new(px(0.0), px(1.0)))
         ),
         "the plot consumes the wheel rather than letting the page scroll"
     );
@@ -1795,10 +1883,11 @@ fn a_wheel_without_a_vertical_delta_should_not_zoom() {
     let center = pane.data_center();
     let width = pane.widget.viewport.candle_width;
 
+    let at = pane.window_point(&harness, center);
     assert!(
         pane.dispatch(
             &mut harness,
-            scroll(center, LogicalPoint::new(px(0.0), px(0.0)))
+            scroll(at, LogicalPoint::new(px(0.0), px(0.0)))
         ),
         "the chart still consumes the wheel over its plot"
     );
@@ -1821,10 +1910,11 @@ fn a_horizontal_wheel_should_not_zoom_the_chart() {
     let width = pane.widget.viewport.candle_width;
     let anchored = pane.widget.viewport.right_timestamp;
 
+    let at = pane.window_point(&harness, center);
     assert!(
         pane.dispatch(
             &mut harness,
-            scroll(center, LogicalPoint::new(px(24.0), px(0.0)))
+            scroll(at, LogicalPoint::new(px(24.0), px(0.0)))
         ),
         "the chart consumes both axes of a two-finger pan over its plot"
     );
@@ -1846,17 +1936,16 @@ fn a_release_outside_the_canvas_should_end_the_drag() {
     let mut pane = drawn_pane(&mut harness, live_edge_snapshot(120, 120));
     let center = pane.data_center();
 
-    assert!(pane.dispatch(&mut harness, pointer_down(center)));
+    let press = pane.window_point(&harness, center);
+    assert!(pane.dispatch(&mut harness, pointer_down(press)));
     assert!(pane.widget.dragging, "the press started a drag");
+    let drag = pane.window_point(&harness, LogicalPoint::new(center.x + 120.0, center.y));
     assert!(
-        pane.dispatch(
-            &mut harness,
-            pointer_move(LogicalPoint::new(center.x + 120.0, center.y))
-        ),
+        pane.dispatch(&mut harness, pointer_move(drag)),
         "the drag pans"
     );
 
-    let outside = over_the_panel(&pane);
+    let outside = over_the_panel(&pane, &harness);
     assert!(
         pane.dispatch(&mut harness, pointer_up(outside)),
         "the release belongs to the widget whose press started the drag"
@@ -1877,8 +1966,9 @@ fn a_pointer_that_comes_back_to_the_plot_should_not_jump() {
     let mut pane = drawn_pane(&mut harness, live_edge_snapshot(120, 120));
     let center = pane.data_center();
 
-    assert!(pane.dispatch(&mut harness, pointer_down(center)));
-    let outside = over_the_panel(&pane);
+    let press = pane.window_point(&harness, center);
+    assert!(pane.dispatch(&mut harness, pointer_down(press)));
+    let outside = over_the_panel(&pane, &harness);
     assert!(
         !pane.dispatch(&mut harness, pointer_move(outside)),
         "a move over the panel is not the chart's to consume"
@@ -1887,8 +1977,9 @@ fn a_pointer_that_comes_back_to_the_plot_should_not_jump() {
     let anchored = pane.widget.viewport.right_timestamp;
 
     let back = LogicalPoint::new(center.x + 40.0, center.y);
+    let back_window = pane.window_point(&harness, back);
     assert!(
-        pane.dispatch(&mut harness, pointer_move(back)),
+        pane.dispatch(&mut harness, pointer_move(back_window)),
         "the chart takes the pointer again"
     );
     assert_eq!(
@@ -1909,7 +2000,8 @@ fn events_outside_the_chart_should_not_be_consumed_and_leaving_should_clear_the_
     let mut pane = drawn_pane(&mut harness, live_edge_snapshot(60, 60));
     let center = pane.data_center();
 
-    assert!(pane.dispatch(&mut harness, pointer_move(center)));
+    let hover = pane.window_point(&harness, center);
+    assert!(pane.dispatch(&mut harness, pointer_move(hover)));
     assert_eq!(pane.widget.viewport.cursor, Some(center));
 
     let outside = LogicalPoint::new(px(9_000.0), px(9_000.0));
@@ -1933,6 +2025,40 @@ fn events_outside_the_chart_should_not_be_consumed_and_leaving_should_clear_the_
         "the leave ends the drag"
     );
     assert_eq!(pane.widget.viewport.cursor, None);
+}
+
+#[test]
+fn a_pointer_in_a_scrolled_ancestor_should_still_hit_the_candle_under_it() {
+    let mut harness = harness();
+    let offset = 160.0;
+    let chart_page = scrolled_page(&mut harness, PAGE, 900.0, offset);
+    let mut pane = pane_in_page(
+        &mut harness,
+        chart_page,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+    );
+    pane.start_reading(&mut harness);
+    pane.accept(&mut harness, live_edge_snapshot(120, 120));
+    pane.draw(&mut harness);
+
+    let center = pane.data_center();
+    let origin = chart_origin(&pane, &harness);
+    let window = LogicalPoint::new(origin.x + center.x, origin.y + center.y - px(offset));
+    assert_ne!(
+        window,
+        pane.window_point(&harness, center),
+        "滚动祖先必须让窗口坐标与图表局部坐标不同"
+    );
+    assert!(
+        pane.dispatch(&mut harness, pointer_move(window)),
+        "滚动容器内的指针仍属于图表"
+    );
+    assert_eq!(
+        pane.widget.viewport.cursor,
+        Some(center),
+        "指针必须换算到图表局部坐标（不再整体偏移 scroll offset）"
+    );
 }
 
 #[test]

@@ -128,21 +128,21 @@ fn a_wider_box_should_spread_the_same_days_further_apart() {
 #[test]
 fn a_cache_key_should_name_the_box_and_the_window_it_was_prepared_from() {
     let key = CacheKey {
-        bounds: bounds(640.0, 360.0),
+        size: bounds(640.0, 360.0).size,
         revision: 3,
     };
 
     assert_eq!(
         key,
         CacheKey {
-            bounds: bounds(640.0, 360.0),
+            size: bounds(640.0, 360.0).size,
             revision: 3
         }
     );
     assert_ne!(
         key,
         CacheKey {
-            bounds: bounds(640.0, 361.0),
+            size: bounds(640.0, 361.0).size,
             revision: 3
         },
         "a resize prepares the frame again"
@@ -150,7 +150,7 @@ fn a_cache_key_should_name_the_box_and_the_window_it_was_prepared_from() {
     assert_ne!(
         key,
         CacheKey {
-            bounds: bounds(640.0, 360.0),
+            size: bounds(640.0, 360.0).size,
             revision: 4
         },
         "so does another answer"

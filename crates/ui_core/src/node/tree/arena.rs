@@ -70,6 +70,8 @@ pub(crate) fn new() -> NodeTree {
         editable_slots: vec![None],
         debug_ids: vec![None],
         clip_keys: vec![None],
+        baked_screen_bounds: vec![None],
+        painted_extents: vec![None],
         subtree_bounds: vec![LogicalRect::default()],
         a11y_slots: vec![None],
         images_need_refresh: false,
@@ -270,6 +272,14 @@ pub(crate) fn insert_child(
         tree.clip_keys.resize_with(index + 1, || None);
     }
     tree.clip_keys[index] = None;
+    if tree.baked_screen_bounds.len() <= index {
+        tree.baked_screen_bounds.resize_with(index + 1, || None);
+    }
+    tree.baked_screen_bounds[index] = None;
+    if tree.painted_extents.len() <= index {
+        tree.painted_extents.resize_with(index + 1, || None);
+    }
+    tree.painted_extents[index] = None;
     if tree.paint_marks.len() <= index {
         tree.paint_marks.resize(index + 1, 0);
     }
@@ -344,6 +354,14 @@ pub(crate) fn append_child(
     if let Some(node) = tree.arena.get_mut(parent) {
         node.children.push(child);
     }
+    if !tree.scroll_containers.is_empty()
+        && tree
+            .scroll_containers
+            .iter()
+            .any(|container| *container == child || tree.is_ancestor(child, *container))
+    {
+        tree.scroll_reg_epoch = tree.scroll_reg_epoch.wrapping_add(1);
+    }
     tree.mark_structure(parent);
     Ok(())
 }
@@ -362,8 +380,28 @@ pub(crate) fn remove(
     if let Some(p) = tree.arena.get_mut(parent) {
         p.children.retain(|existing| *existing != node);
     }
+    let parent_own = tree
+        .scroll_slot(parent)
+        .map_or(LogicalPoint::ZERO, |slot| slot.offset);
     let mut block: Vec<NodeId> = Vec::with_capacity(16);
-    tree.for_each_subtree(node, |id| block.push(id));
+    let mut scroll_extras: Vec<LogicalPoint> = Vec::with_capacity(16);
+    let mut stack: SmallVec<[(NodeId, LogicalPoint); 16]> = SmallVec::new();
+    stack.push((node, parent_own));
+    while let Some((current, extra)) = stack.pop() {
+        block.push(current);
+        scroll_extras.push(extra);
+        #[cfg(feature = "test-support")]
+        tree.note_scanned(current);
+        if let Some(target) = tree.arena.get(current) {
+            let child_extra = extra
+                + tree
+                    .scroll_slot(current)
+                    .map_or(LogicalPoint::ZERO, |slot| slot.offset);
+            for child in target.children.iter().rev() {
+                stack.push((*child, child_extra));
+            }
+        }
+    }
     let removed: ahash::HashSet<NodeId> = block.iter().copied().collect();
     if block.iter().any(|id| {
         tree.arena
@@ -372,12 +410,22 @@ pub(crate) fn remove(
     }) {
         tree.geometry_damage_escalation = true;
     }
+    if removed.iter().any(|id| {
+        tree.scroll_containers
+            .iter()
+            .any(|container| container == id)
+    }) {
+        tree.scroll_reg_epoch = tree.scroll_reg_epoch.wrapping_add(1);
+    }
     let mut subtree_damage = LogicalRect::default();
-    for id in &block {
+    for (id, extra) in block.iter().zip(&scroll_extras) {
         if let Some(target) = tree.arena.get(*id) {
-            subtree_damage = subtree_damage
-                .union(target.damage)
-                .union(target.layout.bounds);
+            let painted = tree
+                .painted_extent(*id)
+                .map_or_else(LogicalRect::default, |extent| extent.layout_bounds());
+            let paint = target.damage.union(target.layout.bounds).union(painted);
+            subtree_damage =
+                subtree_damage.union(paint.translate(LogicalPoint::new(-extra.x, -extra.y)));
             if !target.lanes.is_empty() {
                 tree.removed_lanes.extend(target.lanes.iter().copied());
             }
@@ -400,6 +448,12 @@ pub(crate) fn remove(
             *slot = None;
         }
         if let Some(slot) = tree.clip_keys.get_mut(index) {
+            *slot = None;
+        }
+        if let Some(slot) = tree.baked_screen_bounds.get_mut(index) {
+            *slot = None;
+        }
+        if let Some(slot) = tree.painted_extents.get_mut(index) {
             *slot = None;
         }
         if let Some(slot) = tree.paint_marks.get_mut(index) {

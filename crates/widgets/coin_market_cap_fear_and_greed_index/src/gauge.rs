@@ -253,24 +253,15 @@ pub(crate) fn level_color(theme: &Theme, level: Level) -> Color {
 
 #[derive(Clone, Debug, PartialEq)]
 struct GaugeKey {
-    bounds: LogicalRect,
+    size: LogicalSize,
     score: u8,
     level: SmolStr,
     colors: GaugeColors,
 }
 
 impl GaugeKey {
-    fn matches(
-        &self,
-        bounds: LogicalRect,
-        score: u8,
-        level: &SmolStr,
-        colors: &GaugeColors,
-    ) -> bool {
-        self.bounds == bounds
-            && self.score == score
-            && self.level == *level
-            && self.colors == *colors
+    fn matches(&self, size: LogicalSize, score: u8, level: &SmolStr, colors: &GaugeColors) -> bool {
+        self.size == size && self.score == score && self.level == *level && self.colors == *colors
     }
 }
 
@@ -329,7 +320,8 @@ impl Gauge {
             return Ok(());
         };
         let bounds = target.layout().bounds;
-        if bounds.is_empty() {
+        let size = bounds.size;
+        if size.is_empty() {
             return Ok(());
         }
 
@@ -337,11 +329,12 @@ impl Gauge {
         let current = self
             .prepared
             .as_ref()
-            .is_some_and(|prepared| prepared.key.matches(bounds, score, level, &colors));
+            .is_some_and(|prepared| prepared.key.matches(size, score, level, &colors));
         if current {
             return Ok(());
         }
 
+        let bounds = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
         let geometry = GaugeGeometry::compute(bounds);
         let mut canvas = Canvas::new(bounds);
         let _ = canvas.push_clip(ClipRect {
@@ -395,7 +388,7 @@ impl Gauge {
         self.release_bands(cx.app_mut());
         self.prepared = Some(PreparedGauge {
             key: GaugeKey {
-                bounds,
+                size,
                 score,
                 level: level.clone(),
                 colors,

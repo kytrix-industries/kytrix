@@ -4,6 +4,7 @@ pub mod color;
 pub mod geometry;
 pub mod geometry_store;
 
+pub(crate) mod extent;
 pub(crate) mod instance;
 pub(crate) mod pass;
 

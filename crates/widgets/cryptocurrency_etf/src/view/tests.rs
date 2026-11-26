@@ -5,7 +5,8 @@ use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::SmolStr;
 use ui_core::{
     event::{Event, InputEvent},
-    math::{LogicalPoint, LogicalPx, px},
+    interaction::ScrollConfig,
+    math::{LogicalPoint, LogicalPx, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::style_builder::StyleBuilder,
 };
@@ -1292,5 +1293,132 @@ fn a_fresh_pane_should_open_on_the_deepest_complex_its_recent_month_and_every_fu
         pane.widget.config(),
         None,
         "this pane persists no options at all"
+    );
+}
+
+fn scroll_page(
+    harness: &mut WidgetTestApp,
+    page: NodeId,
+    viewport: LogicalSize,
+    content: LogicalSize,
+    offset: LogicalPoint,
+) {
+    let window = harness.window();
+    let container = harness.with_cx(|cx| {
+        let root = cx.tree().root();
+        let container = NodeBuilder::boxed()
+            .id("TEST_ETF_SCROLL")
+            .style(
+                StyleBuilder::new()
+                    .width(viewport.width)
+                    .height(viewport.height)
+                    .flex_col()
+                    .overflow_hidden()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)
+            .expect("the scroll container builds");
+        cx.tree_mut()
+            .append_child(container, page)
+            .expect("the page moves under the scroll container");
+        cx.tree_mut()
+            .set_style(
+                page,
+                StyleBuilder::new()
+                    .width(content.width)
+                    .height(content.height)
+                    .flex_none()
+                    .flex_col()
+                    .build(),
+            )
+            .expect("the page takes the taller content box");
+        container
+    });
+    harness.drain();
+    let handle = harness
+        .app_mut()
+        .make_scroll(window, container, ScrollConfig::default())
+        .expect("the container scrolls");
+    harness
+        .app_mut()
+        .set_scroll_content(&handle, content)
+        .expect("the content size is valid");
+    harness
+        .app_mut()
+        .scroll_to(&handle, offset)
+        .expect("the offset is valid");
+    harness.drain();
+}
+
+#[test]
+fn a_pointer_in_a_scrolled_ancestor_should_still_hover_the_same_day() {
+    let mut harness = harness();
+    let mut pane = pane(&mut harness);
+    load(&mut harness, &mut pane);
+    report_snapshot(&mut harness, &mut pane, 1, snapshot_with(DEFAULT_FUNDS));
+    report_status(&mut harness, &mut pane, ready(1, i64::MAX));
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+
+    let offset = 90.0;
+    scroll_page(
+        &mut harness,
+        pane.page,
+        LogicalSize::new(px(640.0), px(600.0)),
+        LogicalSize::new(px(640.0), px(900.0)),
+        LogicalPoint::new(px(0.0), px(offset)),
+    );
+    frame(&mut harness, &mut pane);
+
+    let chart = node(&harness, pane.page, "TEST_ETF_CHART");
+    let bounds = harness
+        .tree()
+        .get(chart)
+        .expect("the chart is laid out")
+        .layout()
+        .bounds;
+    let layout = pane
+        .widget
+        .chart
+        .as_ref()
+        .expect("the snapshot built the chart")
+        .layout_for_test()
+        .expect("the chart laid out");
+    let local = LogicalPoint::new(
+        layout.plot.origin.x + layout.plot.size.width / 2.0,
+        layout.plot.origin.y + layout.plot.size.height / 2.0,
+    );
+    let window = LogicalPoint::new(
+        bounds.origin.x + local.x,
+        bounds.origin.y + local.y - px(offset),
+    );
+    assert_ne!(
+        window,
+        LogicalPoint::new(bounds.origin.x + local.x, bounds.origin.y + local.y),
+        "滚动祖先必须让窗口坐标与图表局部坐标不同"
+    );
+
+    let consumed = harness.with_cx(|cx| {
+        pane.widget.dispatch(
+            &Event::Input(InputEvent::PointerMove {
+                position: window,
+                modifiers: ui_core::event::Modifiers::default(),
+                timestamp: std::time::Instant::now(),
+            }),
+            cx,
+        )
+    });
+    assert!(consumed, "滚动容器内的指针属于图表");
+    let hover = pane
+        .widget
+        .chart
+        .as_ref()
+        .expect("the chart exists")
+        .hover_for_test()
+        .expect("指针必须在绘图区内");
+    assert_eq!(
+        hover.cursor_y,
+        px(local.y.value().round()),
+        "指针必须换算到图表局部坐标（不再整体偏移 scroll offset）"
     );
 }

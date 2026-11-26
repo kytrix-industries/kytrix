@@ -35,6 +35,7 @@ use crate::{
     },
     paint::{
         canvas::Canvas,
+        extent::PaintedExtent,
         geometry::GeometryId,
         scene::LaneId,
         style::{Clip, PaintSpec, Style, StylePatch},
@@ -312,7 +313,7 @@ pub(crate) struct PaintNodeState {
     pub children: usize,
     pub clip_bounds: Option<LogicalRect>,
     pub scroll: Option<LogicalPoint>,
-    pub screen_baked: bool,
+    pub needs_screen_bake: bool,
     pub opacity: f32,
 }
 
@@ -340,6 +341,8 @@ pub struct NodeTree {
     editable_slots: Vec<Option<Box<EditableText>>>,
     debug_ids: Vec<Option<SmolStr>>,
     clip_keys: Vec<Option<(u8, Option<DeviceRect>)>>,
+    baked_screen_bounds: Vec<Option<LogicalRect>>,
+    painted_extents: Vec<Option<PaintedExtent>>,
     subtree_bounds: Vec<LogicalRect>,
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
     images_need_refresh: bool,
@@ -630,6 +633,9 @@ impl NodeTree {
     pub(crate) fn mark_paint(&mut self, node: NodeId) -> bool {
         dirty::mark_paint(self, node)
     }
+    pub(crate) fn mark_paint_without_damage(&mut self, node: NodeId) -> bool {
+        dirty::mark_paint_without_damage(self, node)
+    }
     pub(crate) fn mark_layout(&mut self, node: NodeId) -> bool {
         dirty::mark_layout(self, node)
     }
@@ -686,18 +692,25 @@ impl NodeTree {
         }
     }
 
-    pub(crate) fn paint_epoch_changed(&mut self) -> bool {
-        let forced = std::mem::take(&mut self.force_full_paint);
-        forced
-            || self.structure_epoch != self.painted_structure_epoch
-            || self.scroll_reg_epoch != self.painted_scroll_reg_epoch
+    pub(crate) fn take_force_full_paint(&mut self) -> bool {
+        std::mem::take(&mut self.force_full_paint)
+    }
+
+    #[must_use]
+    pub(crate) fn structure_changed(&self) -> bool {
+        self.structure_epoch != self.painted_structure_epoch
+    }
+
+    #[must_use]
+    pub(crate) fn scroll_registry_changed(&self) -> bool {
+        self.scroll_reg_epoch != self.painted_scroll_reg_epoch
     }
 
     pub(crate) fn note_paint_frame(&mut self, full_path: bool, visited: usize) {
         self.paint_visited = visited;
+        self.painted_structure_epoch = self.structure_epoch;
         if full_path {
             self.paint_full_frames = self.paint_full_frames.saturating_add(1);
-            self.painted_structure_epoch = self.structure_epoch;
             self.painted_scroll_reg_epoch = self.scroll_reg_epoch;
         } else {
             self.paint_incremental_frames = self.paint_incremental_frames.saturating_add(1);
@@ -1130,6 +1143,16 @@ impl NodeTree {
     }
     pub(crate) fn set_lane_offset(&mut self, node: NodeId, offset: LogicalPoint) {
         content::set_lane_offset(self, node, offset)
+    }
+    pub(crate) fn set_baked_screen_bounds(&mut self, node: NodeId, bounds: LogicalRect) {
+        content::set_baked_screen_bounds(self, node, bounds)
+    }
+    #[must_use]
+    pub(crate) fn painted_extent(&self, node: NodeId) -> Option<PaintedExtent> {
+        content::painted_extent(self, node)
+    }
+    pub(crate) fn set_painted_extent(&mut self, node: NodeId, extent: Option<PaintedExtent>) {
+        content::set_painted_extent(self, node, extent)
     }
     pub(crate) fn clip_key(&self, node: NodeId) -> Option<(u8, Option<DeviceRect>)> {
         content::clip_key(self, node)

@@ -11,7 +11,7 @@ use crate::{
     interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
     math::{DeviceRect, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform, px},
     node::{dependency::ReadCtx, dirty::DirtyFlags, id::NodeId, signal::SignalId},
-    paint::{geometry::GeometryId, scene::LaneId, style::StylePatch},
+    paint::{extent::PaintedExtent, geometry::GeometryId, scene::LaneId, style::StylePatch},
     text::{ShapedLine, TextContent, shape::ShapedText},
 };
 
@@ -674,6 +674,29 @@ pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: Logical
     }
 }
 
+pub(crate) fn set_baked_screen_bounds(tree: &mut NodeTree, node: NodeId, bounds: LogicalRect) {
+    let index = node.index() as usize;
+    if tree.baked_screen_bounds.len() <= index {
+        tree.baked_screen_bounds.resize_with(index + 1, || None);
+    }
+    tree.baked_screen_bounds[index] = Some(bounds);
+}
+
+pub(crate) fn painted_extent(tree: &NodeTree, node: NodeId) -> Option<PaintedExtent> {
+    tree.painted_extents
+        .get(node.index() as usize)
+        .copied()
+        .flatten()
+}
+
+pub(crate) fn set_painted_extent(tree: &mut NodeTree, node: NodeId, extent: Option<PaintedExtent>) {
+    let index = node.index() as usize;
+    if tree.painted_extents.len() <= index {
+        tree.painted_extents.resize_with(index + 1, || None);
+    }
+    tree.painted_extents[index] = extent;
+}
+
 pub(crate) fn paint_state(
     tree: &NodeTree,
     node: NodeId,
@@ -685,15 +708,26 @@ pub(crate) fn paint_state(
     let target = tree.arena.get(node)?;
     let hidden = matches!(target.style.inner().display, taffy::style::Display::None)
         || target.style_patch().visible == Some(false);
-    let screen_baked = matches!(
+    let needs_screen_bake = matches!(
         target.kind(),
         super::NodeKind::Geometry(_) | super::NodeKind::Canvas(_)
     );
-    let effective_bake = if screen_baked {
+    let effective_bake = if needs_screen_bake {
         screen_offset
     } else {
         bake_offset
     };
+    let current_screen_bounds = needs_screen_bake.then(|| {
+        target
+            .layout
+            .bounds
+            .translate(LogicalPoint::new(-screen_offset.x, -screen_offset.y))
+    });
+    let stored_screen_bounds = tree
+        .baked_screen_bounds
+        .get(node.index() as usize)
+        .copied()
+        .flatten();
     let opacity = inherited_opacity
         * match target.style_patch().opacity {
             Some(value) if value.is_nan() => 0.0,
@@ -703,7 +737,8 @@ pub(crate) fn paint_state(
     let reusable = target.dirty.contains(DirtyFlags::REUSABLE)
         && tree.clip_key(node) == Some(clip_key)
         && target.lane_offset == effective_bake
-        && target.paint_opacity == opacity;
+        && target.paint_opacity == opacity
+        && stored_screen_bounds == current_screen_bounds;
     let clip_bounds = (target.style.clip == crate::paint::style::Clip::Bounds).then(|| {
         target
             .layout
@@ -728,7 +763,7 @@ pub(crate) fn paint_state(
         children: target.children.len(),
         clip_bounds,
         scroll,
-        screen_baked,
+        needs_screen_bake,
         opacity,
     })
 }

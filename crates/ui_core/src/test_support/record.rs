@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    math::{DeviceRect, LogicalPx, LogicalRect},
+    math::{DeviceRect, LogicalPoint, LogicalPx, LogicalRect},
     node::{id::NodeId, tree::NodeTree},
     paint::{
         canvas::Canvas,
@@ -199,29 +199,23 @@ pub(crate) fn capture(
         let node_bounds = tree
             .get(node)
             .map_or(LogicalRect::default(), |target| target.layout().bounds);
-        for primitive in scene.lane_primitives(*lane).unwrap_or(&[]) {
-            let (kind, bounds) = primitive_kind(primitive, node_bounds);
-            let (image_modulation, image_uv) = match primitive {
-                Primitive::Image(image) => (
-                    Some(resolver.resolve(image.modulation)),
-                    Some(image.tile.uv()),
-                ),
-                _ => (None, None),
-            };
-            primitives.push(PrimitiveRecord {
-                node,
-                kind,
-                bounds,
-                image_modulation,
-                image_uv,
-            });
+        let lane_primitives = scene.lane_primitives(*lane).unwrap_or(&[]);
+        record_primitives(
+            lane_primitives,
+            node,
+            node_bounds,
+            LogicalPoint::ZERO,
+            resolver,
+            &mut primitives,
+        );
+        for primitive in lane_primitives {
             if let Primitive::Quad(quad) = primitive {
                 quads.push(quad_record(node, quad, resolver));
             }
-            if let Primitive::Canvas(canvas) = primitive {
+            if let Primitive::Canvas(draw) = primitive {
                 canvases.push(CanvasRecord {
                     node,
-                    canvas: Arc::clone(canvas),
+                    canvas: Arc::clone(&draw.canvas),
                 });
             }
         }
@@ -257,23 +251,69 @@ pub(crate) fn capture(
     }
 }
 
-fn primitive_kind(primitive: &Primitive, node_bounds: LogicalRect) -> (PrimitiveKind, LogicalRect) {
+fn record_primitives(
+    primitives: &[Primitive],
+    node: NodeId,
+    node_bounds: LogicalRect,
+    offset: LogicalPoint,
+    resolver: &ColorResolver,
+    out: &mut Vec<PrimitiveRecord>,
+) {
+    for primitive in primitives {
+        let (kind, bounds) = primitive_kind(primitive, node_bounds, offset);
+        let (image_modulation, image_uv) = match primitive {
+            Primitive::Image(image) => (
+                Some(resolver.resolve(image.modulation)),
+                Some(image.tile.uv()),
+            ),
+            _ => (None, None),
+        };
+        out.push(PrimitiveRecord {
+            node,
+            kind,
+            bounds,
+            image_modulation,
+            image_uv,
+        });
+        if let Primitive::Canvas(draw) = primitive {
+            record_primitives(
+                draw.primitives(),
+                node,
+                node_bounds,
+                offset + draw.offset,
+                resolver,
+                out,
+            );
+        }
+    }
+}
+
+fn primitive_kind(
+    primitive: &Primitive,
+    node_bounds: LogicalRect,
+    offset: LogicalPoint,
+) -> (PrimitiveKind, LogicalRect) {
     match primitive {
-        Primitive::Quad(quad) => (PrimitiveKind::Quad, quad.bounds),
+        Primitive::Quad(quad) => (PrimitiveKind::Quad, quad.bounds.translate(offset)),
         Primitive::GlyphRun(run) => {
             let mut bounds = LogicalRect::default();
             for glyph in &run.glyphs {
                 bounds = bounds.union(LogicalRect::from_origin_size(glyph.position, glyph.size));
             }
-            (PrimitiveKind::GlyphRun, bounds)
+            (PrimitiveKind::GlyphRun, bounds.translate(offset))
         }
-        Primitive::Image(image) => (PrimitiveKind::Image, image.bounds),
-        Primitive::Path(path) => (PrimitiveKind::Path, path.bounds),
-        Primitive::Shadow(shadow) => (PrimitiveKind::Shadow, shadow.rect),
-        Primitive::Clip(ClipOp::Push(clip)) => (PrimitiveKind::ClipPush, clip.rect),
+        Primitive::Image(image) => (PrimitiveKind::Image, image.bounds.translate(offset)),
+        Primitive::Path(path) => (PrimitiveKind::Path, path.bounds.translate(offset)),
+        Primitive::Shadow(shadow) => (PrimitiveKind::Shadow, shadow.rect.translate(offset)),
+        Primitive::Clip(ClipOp::Push(clip)) => {
+            (PrimitiveKind::ClipPush, clip.rect.translate(offset))
+        }
         Primitive::Clip(ClipOp::Pop) => (PrimitiveKind::ClipPop, node_bounds),
         Primitive::Geometry(_) => (PrimitiveKind::Geometry, node_bounds),
-        Primitive::Canvas(canvas) => (PrimitiveKind::Canvas, canvas.bounds()),
+        Primitive::Canvas(draw) => (
+            PrimitiveKind::Canvas,
+            draw.bounds().translate(draw.offset).translate(offset),
+        ),
         Primitive::Text(_) => (PrimitiveKind::Text, node_bounds),
     }
 }
@@ -308,7 +348,7 @@ fn quad_record(
 mod tests {
     use std::sync::Arc;
 
-    use super::FrameRecord;
+    use super::{FrameRecord, PrimitiveKind};
     use crate::{
         app::App,
         math::{LogicalRect, LogicalSize, px},
@@ -316,8 +356,9 @@ mod tests {
         paint::{
             canvas::Canvas,
             color::Color,
-            primitive::{Quad, QuadPaint},
-            style::StylePatch,
+            geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology},
+            primitive::{Path, Quad, QuadPaint},
+            style::{PaintSpec, StylePatch},
         },
         window::{FrameOutcome, WindowOptions},
     };
@@ -540,5 +581,100 @@ mod tests {
             .record()
             .expect("空闲帧也有记录");
         assert!(idle.frame.is_none(), "空闲帧没有绘制快照");
+    }
+
+    #[test]
+    fn canvas_inner_primitives_are_recorded_in_lane_space() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions {
+            title: smol_str::SmolStr::new_static("canvas-space"),
+            size: LogicalSize::new(px(400.0), px(300.0)),
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("窗口存在").tree().root();
+        let points = [[0.0f32, 0.0, -1.0], [10.0, 0.0, -1.0], [0.0, 8.0, -1.0]];
+        let vertex_bytes: Vec<u8> = points
+            .iter()
+            .flat_map(|point| point.iter().flat_map(|value| value.to_ne_bytes()))
+            .collect();
+        let geometry = app
+            .geometry_mut()
+            .insert(GeometryDesc {
+                vertex_bytes: bytes::Bytes::from(vertex_bytes),
+                index_bytes: bytes::Bytes::from_static(&[0u8, 0, 1, 0, 2, 0]),
+                vertex_stride: 12,
+                index_type: IndexType::U16,
+                topology: Topology::TriangleList,
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(10.0), px(8.0)),
+                pipeline: GeometryPipeline::Ui,
+            })
+            .expect("注册几何");
+        let path_bounds = LogicalRect::new(px(5.0), px(6.0), px(10.0), px(8.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)));
+        canvas.push_path(Path {
+            bounds: path_bounds,
+            geometry,
+            fill: Color::WHITE,
+        });
+        let node = NodeBuilder::canvas(canvas)
+            .layout_override(LogicalRect::new(px(100.0), px(50.0), px(40.0), px(20.0)))
+            .paint(PaintSpec {
+                background: Color::WHITE,
+                ..PaintSpec::default()
+            })
+            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+            .expect("canvas 节点");
+        assert!(matches!(
+            app.frame(window).expect("窗口存在").expect("首帧"),
+            FrameOutcome::Committed(_)
+        ));
+        let record: FrameRecord = app
+            .window(window)
+            .expect("窗口存在")
+            .record()
+            .expect("提交帧必须有记录")
+            .clone();
+        let rendered = record.frame.as_ref().expect("提交帧必须有绘制快照");
+        let node_lane = LogicalRect::new(px(100.0), px(50.0), px(40.0), px(20.0));
+        let own: Vec<_> = rendered
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.node == node)
+            .collect();
+        assert!(
+            own.iter().all(|primitive| primitive.bounds.is_finite()),
+            "所有记录的图元 bounds 必须是有限 lane 空间矩形：{own:?}"
+        );
+        let canvas_entry = own
+            .iter()
+            .find(|primitive| primitive.kind == PrimitiveKind::Canvas)
+            .expect("节点自有绘制必须记录不透明的 Canvas 条目");
+        assert_eq!(canvas_entry.bounds, node_lane);
+        let quad_entry = own
+            .iter()
+            .find(|primitive| primitive.kind == PrimitiveKind::Quad)
+            .expect("背景 quad 必须被记录");
+        assert_eq!(quad_entry.bounds, node_lane);
+        let path_entry = own
+            .iter()
+            .find(|primitive| primitive.kind == PrimitiveKind::Path)
+            .expect("Canvas 内的 Path 必须进入 FrameRecord.primitives");
+        assert_ne!(
+            path_entry.bounds, path_bounds,
+            "Path bounds 不得记录成画布局部坐标"
+        );
+        assert_eq!(
+            path_entry.bounds,
+            LogicalRect::new(px(105.0), px(56.0), px(10.0), px(8.0)),
+            "Path bounds 必须与 quad/Canvas 一样在 lane 空间：节点原点 + 画布局部坐标"
+        );
+        assert_eq!(
+            rendered.quads.len(),
+            1,
+            "QuadRecord 仍只记录节点自有（顶层）quad，Canvas 内容保持不透明"
+        );
     }
 }

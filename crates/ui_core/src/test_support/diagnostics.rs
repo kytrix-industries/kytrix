@@ -405,9 +405,16 @@ impl DamageOverlay {
                 None => bounds,
             });
         }
-        let mut canvas = Canvas::new(union.unwrap_or_default());
+        let union = union.unwrap_or_default();
+        let origin = union.origin;
+        let mut canvas = Canvas::new(LogicalRect::from_origin_size(
+            LogicalPoint::ZERO,
+            union.size,
+        ));
         for rect in &self.rects {
-            let bounds = scale.to_logical_rect(*rect);
+            let bounds = scale
+                .to_logical_rect(*rect)
+                .translate(LogicalPoint::new(-origin.x, -origin.y));
             canvas.push_quad(Quad {
                 bounds,
                 corner_radius: [px(0.0); 4],
@@ -585,17 +592,17 @@ mod tests {
             )
             .expect("content");
         let mut canvas = Canvas::new(crate::math::LogicalRect::new(
-            px(8.0),
-            px(4.0),
+            px(0.0),
+            px(0.0),
             px(40.0),
             px(20.0),
         ));
         assert!(canvas.push_clip(ClipRect {
-            rect: crate::math::LogicalRect::new(px(8.0), px(4.0), px(40.0), px(20.0)),
+            rect: crate::math::LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)),
             corner_radius: [px(3.0); 4],
         }));
         canvas.push_quad(Quad {
-            bounds: crate::math::LogicalRect::new(px(9.0), px(5.0), px(10.0), px(10.0)),
+            bounds: crate::math::LogicalRect::new(px(1.0), px(1.0), px(10.0), px(10.0)),
             corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
@@ -789,6 +796,20 @@ mod tests {
         let canvas = overlay.canvas(scale);
         assert_eq!(canvas.primitives().len(), overlay.rects.len() * 5);
         assert!(canvas.bounds().size.width > px(15.0));
+        assert_eq!(
+            canvas.bounds().origin,
+            crate::math::LogicalPoint::ZERO,
+            "DamageOverlay 的 Canvas 内部坐标必须是节点局部坐标（引擎负责加节点偏移）"
+        );
+        let Some(crate::paint::primitive::Primitive::Quad(first)) = canvas.primitives().first()
+        else {
+            panic!("第一个图元必须是 range 覆盖 quad");
+        };
+        assert_eq!(
+            (first.bounds.origin.x, first.bounds.origin.y),
+            (px(5.5), px(10.5)),
+            "窗口坐标 (10,20)@2x 必须归一化为局部坐标（减去 union 原点）"
+        );
     }
 
     #[test]

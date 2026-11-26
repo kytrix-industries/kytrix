@@ -335,7 +335,7 @@ impl Scene {
             "⑥ 图片与滚动",
             "demo.card.resources",
         );
-        resources::build(app, window, resources_card, RES_CARD.origin);
+        resources::build(app, window, resources_card);
 
         #[cfg(target_os = "linux")]
         let chrome = chrome::build(app, window, root);

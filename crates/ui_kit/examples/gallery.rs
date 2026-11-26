@@ -11,7 +11,7 @@ use ui_core::{
     app::{App, Application},
     event::{Action, ActionSource, Event, InputEvent},
     interaction::ScrollConfig,
-    math::{LogicalPoint, LogicalRect, LogicalSize, px},
+    math::{DeviceRect, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -23,6 +23,14 @@ use ui_core::{
         primitive::Border,
         style::{PaintSpec, Style, StylePatch},
         style_builder::{PaintBuilder, StyleBuilder},
+    },
+    test_support::{
+        app::TestApp,
+        pixels::{
+            PersistentPixels, PixelFrame, changed_pixels, channel_span, compare_pixels, pixel,
+        },
+        record::FrameRecord,
+        snapshot::SnapshotImage,
     },
     text::{TextStyle, TextWrap},
     window::{WindowId, WindowOptions},
@@ -125,6 +133,7 @@ struct Flags {
     auto_close: Option<u64>,
     probe: bool,
     dump_overlay: bool,
+    pixel_check: bool,
     scroll_to: Option<f32>,
 }
 
@@ -145,6 +154,8 @@ fn parse_flags() -> Flags {
             flags.probe = true;
         } else if arg == "--dump-overlay" {
             flags.dump_overlay = true;
+        } else if arg == "--pixel-check" {
+            flags.pixel_check = true;
         } else if let Some(value) = arg.strip_prefix("--scroll-to=") {
             flags.scroll_to = value.parse::<f32>().ok();
         } else {
@@ -1875,7 +1886,15 @@ impl Gallery {
                                     dump_overlay_nodes(app, window, &["gallery.menu:panel"]);
                                     if round == 1 {
                                         let closed = menu.close(app);
-                                        let opened = color_picker.open(app, window);
+                                        let opened = match color_picker.open(app, window) {
+                                            Ok(opened) => opened,
+                                            Err(error) => {
+                                                println!(
+                                                    "gallery: overlay-check color-picker.open FAIL {error}"
+                                                );
+                                                false
+                                            }
+                                        };
                                         println!(
                                             "gallery: overlay-check menu.close -> {closed}; color-picker.open -> {opened}"
                                         );
@@ -2757,8 +2776,715 @@ impl MarkdownAssets for NoAssets {
     }
 }
 
+const PIXEL_CHECK_POPUP_MARGIN: f32 = 16.0;
+const PIXEL_CHECK_TOLERANCE: u8 = 2;
+const PIXEL_CHECK_SETTLE_LIMIT: usize = 40;
+const PIXEL_CHECK_IDLE_FRAMES: usize = 20;
+const PIXEL_CHECK_IDLE_STEP_MS: u64 = 137;
+const PIXEL_CHECK_FRAME_STEP_MS: u64 = 16;
+const PIXEL_CHECK_MIN_COMPARED_PERMILLE: u64 = 30;
+
+#[derive(Default)]
+struct PixelCheckReport {
+    checks: u32,
+    failures: u32,
+    seen: Vec<(&'static str, u32)>,
+    damage_full_frames: u32,
+    sampled_frames: u32,
+    first_visible: Option<LogicalRect>,
+    stable: Option<LogicalRect>,
+    moved: Option<LogicalRect>,
+}
+
+impl PixelCheckReport {
+    fn record(&mut self, ok: bool, key: &'static str, message: SmolStr) {
+        self.checks += 1;
+        if ok {
+            return;
+        }
+        self.failures += 1;
+        if let Some(entry) = self.seen.iter_mut().find(|(seen, _)| *seen == key) {
+            entry.1 += 1;
+            return;
+        }
+        self.seen.push((key, 1));
+        println!("gallery: pixel-check FAIL {message}");
+    }
+}
+
+struct PixelCheckRun {
+    report: PixelCheckReport,
+    before: SnapshotImage,
+    previous: SnapshotImage,
+}
+
+impl PixelCheckRun {
+    fn observe(
+        &mut self,
+        app: &TestApp,
+        picker: &ColorPicker,
+        pixels: &mut PersistentPixels,
+        record: &FrameRecord,
+        stage: &'static str,
+        compare_background: bool,
+    ) {
+        let popup = pixel_check_popup(app, picker);
+        if self.report.first_visible.is_none()
+            && picker.overlay().revealed(app.app())
+            && popup.is_some_and(|rect| !rect.is_empty())
+        {
+            self.report.first_visible = popup;
+        }
+        let frame = match pixels.present(app.app(), app.window_id()) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.report.record(
+                    false,
+                    "replay-error",
+                    format_smolstr!("{stage}: 持久增量重放失败 {error}"),
+                );
+                return;
+            }
+        };
+        let current = match &frame {
+            PixelFrame::Idle => return,
+            PixelFrame::Full(image) => {
+                self.report.record(
+                    self.report.sampled_frames == 0,
+                    "full-replay",
+                    format_smolstr!(
+                        "{stage}: 出现整帧重放（damage_full={}）",
+                        record.damage_full
+                    ),
+                );
+                image
+            }
+            PixelFrame::Incremental {
+                pixels: image,
+                damage,
+            } => {
+                let outside = changed_pixels(&self.previous, image, damage, 1);
+                self.report.record(
+                    outside == 0,
+                    "changed-outside-damage",
+                    format_smolstr!(
+                        "{stage}: {outside} 个变化像素落在 damage 之外（damage={damage:?}）"
+                    ),
+                );
+                image
+            }
+        };
+        if record.rendered && record.damage_full {
+            self.report.damage_full_frames += 1;
+            self.report.record(
+                false,
+                "damage-full",
+                format_smolstr!("{stage}: damage_full=true（damage={:?}）", record.damage),
+            );
+        }
+        if compare_background {
+            let mut excluded: Vec<DeviceRect> = Vec::with_capacity(2);
+            if let Some(rect) = popup {
+                excluded.push(pixel_check_exclusion(app, rect));
+            }
+            if let Some(rect) = picker
+                .trigger_node()
+                .and_then(|node| app.probe().bounds(node))
+            {
+                excluded.push(pixel_check_exclusion(app, rect));
+            }
+            let diff = compare_pixels(&self.before, current, &excluded);
+            self.report.record(
+                diff.span <= PIXEL_CHECK_TOLERANCE,
+                "background-residue",
+                format_smolstr!(
+                    "{stage}: popup 外背景残留 span={} at {:?} expected={:?} actual={:?}（排除 {} 个矩形）",
+                    diff.span,
+                    diff.at,
+                    pixel(&self.before, diff.at.0, diff.at.1),
+                    pixel(current, diff.at.0, diff.at.1),
+                    excluded.len()
+                ),
+            );
+        }
+        self.report.sampled_frames += 1;
+        self.previous = current.clone();
+    }
+
+    fn assert_restored(&mut self, stage: &'static str) {
+        let diff = compare_pixels(&self.before, &self.previous, &[]);
+        self.report.record(
+            diff.span <= PIXEL_CHECK_TOLERANCE,
+            "restored",
+            format_smolstr!(
+                "{stage}: 必须回到打开前像素，残留 span={} at {:?} expected={:?} actual={:?}",
+                diff.span,
+                diff.at,
+                pixel(&self.before, diff.at.0, diff.at.1),
+                pixel(&self.previous, diff.at.0, diff.at.1)
+            ),
+        );
+    }
+
+    fn assert_old_popup_restored(
+        &mut self,
+        app: &TestApp,
+        picker: &ColorPicker,
+        stage: &'static str,
+        old_popup: LogicalRect,
+        old_trigger: Option<LogicalRect>,
+    ) {
+        let mut excluded: Vec<DeviceRect> = Vec::with_capacity(3);
+        if let Some(rect) = pixel_check_popup(app, picker) {
+            excluded.push(pixel_check_exclusion(app, rect));
+        }
+        if let Some(rect) = picker
+            .trigger_node()
+            .and_then(|node| app.probe().bounds(node))
+        {
+            excluded.push(pixel_check_exclusion(app, rect));
+        }
+        if let Some(rect) = old_trigger {
+            excluded.push(pixel_check_exclusion(app, rect));
+        }
+        let region = pixel_check_exclusion(app, old_popup);
+        let diff = compare_region(
+            &self.before,
+            &self.previous,
+            region,
+            &excluded,
+            PIXEL_CHECK_TOLERANCE,
+        );
+        let fixture_pixels = u64::from(self.before.width) * u64::from(self.before.height);
+        let required = fixture_pixels * PIXEL_CHECK_MIN_COMPARED_PERMILLE / 1_000;
+        self.report.record(
+            diff.mismatched == 0,
+            "old-region",
+            format_smolstr!(
+                "{stage}: 旧浮层区域 {region:?} 必须逐像素回到打开前基线（比较 {} 像素，不一致 {}，最大 span={} at {:?}）",
+                diff.compared,
+                diff.mismatched,
+                diff.span,
+                diff.at
+            ),
+        );
+        self.report.record(
+            u64::from(diff.compared) >= required,
+            "old-region-coverage",
+            format_smolstr!(
+                "{stage}: 旧浮层区域必须真的被比较到（比较 {} 像素，下限 {required} = fixture {fixture_pixels} 设备像素的 {PIXEL_CHECK_MIN_COMPARED_PERMILLE}‰；防止排除区膨胀吞掉检查）",
+                diff.compared
+            ),
+        );
+        let detected = residue_detector_self_check(&self.before, region, &excluded);
+        self.report.record(
+            detected,
+            "residue-detector",
+            format_smolstr!(
+                "{stage}: 在旧浮层区域注入 ≥2 个分散旧色板像素后残影检测必须 FAIL（负向自检）"
+            ),
+        );
+    }
+}
+
+fn pixel_check_popup(app: &TestApp, picker: &ColorPicker) -> Option<LogicalRect> {
+    let node = picker.overlay().panel_node()?;
+    app.probe().bounds(node)
+}
+
+fn pixel_check_exclusion(app: &TestApp, popup: LogicalRect) -> DeviceRect {
+    let window = app.app().window(app.window_id()).expect("窗口");
+    window
+        .device_pixel_ratio()
+        .to_covering_device_rect(popup.outset(px(PIXEL_CHECK_POPUP_MARGIN)))
+}
+
+struct RegionDiff {
+    compared: u32,
+    mismatched: u32,
+    span: u8,
+    at: (u32, u32),
+    first: Option<(u32, u32)>,
+    last: Option<(u32, u32)>,
+}
+
+fn device_bounds(rect: &DeviceRect) -> (u32, u32, u32, u32) {
+    (
+        rect.x0.value().max(0) as u32,
+        rect.y0.value().max(0) as u32,
+        rect.x1.value().max(0) as u32,
+        rect.y1.value().max(0) as u32,
+    )
+}
+
+fn compare_region(
+    reference: &SnapshotImage,
+    actual: &SnapshotImage,
+    region: DeviceRect,
+    excluded: &[DeviceRect],
+    tolerance: u8,
+) -> RegionDiff {
+    assert_eq!(
+        (reference.width, reference.height),
+        (actual.width, actual.height),
+        "区域像素对比需要相同的 readback 尺寸"
+    );
+    let mut diff = RegionDiff {
+        compared: 0,
+        mismatched: 0,
+        span: 0,
+        at: (0, 0),
+        first: None,
+        last: None,
+    };
+    let (x0, y0, x1, y1) = device_bounds(&region);
+    let excluded: Vec<(u32, u32, u32, u32)> = excluded.iter().map(device_bounds).collect();
+    for y in y0.min(actual.height)..y1.min(actual.height) {
+        for x in x0.min(actual.width)..x1.min(actual.width) {
+            if excluded
+                .iter()
+                .any(|(x0, y0, x1, y1)| x >= *x0 && x < *x1 && y >= *y0 && y < *y1)
+            {
+                continue;
+            }
+            diff.first.get_or_insert((x, y));
+            diff.last = Some((x, y));
+            diff.compared += 1;
+            let span = channel_span(pixel(reference, x, y), pixel(actual, x, y));
+            if span > tolerance {
+                diff.mismatched += 1;
+                if span > diff.span {
+                    diff.span = span;
+                    diff.at = (x, y);
+                }
+            }
+        }
+    }
+    diff
+}
+
+fn residue_detector_self_check(
+    baseline: &SnapshotImage,
+    region: DeviceRect,
+    excluded: &[DeviceRect],
+) -> bool {
+    let untouched = compare_region(baseline, baseline, region, excluded, 0);
+    let (Some(first), Some(last)) = (untouched.first, untouched.last) else {
+        return false;
+    };
+    if first == last {
+        return false;
+    }
+    let mut corrupted = baseline.clone();
+    for (x, y) in [first, last] {
+        let offset = ((y as usize) * (baseline.width as usize) + x as usize) * 4;
+        corrupted.rgba8[offset..offset + 4].copy_from_slice(&[0xFF, 0x00, 0xFF, 0xFF]);
+    }
+    let detected = compare_region(
+        baseline,
+        &corrupted,
+        region,
+        excluded,
+        PIXEL_CHECK_TOLERANCE,
+    );
+    detected.mismatched >= 2
+}
+
+fn pixel_check_tick(
+    app: &mut TestApp,
+    picker: &ColorPicker,
+    pixels: &mut PersistentPixels,
+    run: &mut PixelCheckRun,
+    stage: &'static str,
+    compare_background: bool,
+) -> bool {
+    app.advance(Duration::from_millis(PIXEL_CHECK_FRAME_STEP_MS));
+    let record = app.drain().expect("帧").clone();
+    let idle = !record.rendered;
+    run.observe(app, picker, pixels, &record, stage, compare_background);
+    let _ = picker.sync(app.app_mut());
+    idle
+}
+
+fn pixel_check_settle(
+    app: &mut TestApp,
+    picker: &ColorPicker,
+    pixels: &mut PersistentPixels,
+    run: &mut PixelCheckRun,
+    stage: &'static str,
+    compare_background: bool,
+) -> bool {
+    let mut idle_streak = 0usize;
+    for _ in 0..PIXEL_CHECK_SETTLE_LIMIT {
+        idle_streak = if pixel_check_tick(app, picker, pixels, run, stage, compare_background) {
+            idle_streak + 1
+        } else {
+            0
+        };
+        if idle_streak >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+fn pixel_check_close(
+    app: &mut TestApp,
+    picker: &ColorPicker,
+    pixels: &mut PersistentPixels,
+    run: &mut PixelCheckRun,
+    stage: &'static str,
+) {
+    let mut closed = false;
+    for _ in 0..PIXEL_CHECK_SETTLE_LIMIT {
+        pixel_check_tick(app, picker, pixels, run, stage, false);
+        if picker.overlay().overlay_node().is_none() {
+            closed = true;
+            break;
+        }
+    }
+    run.report.record(
+        closed,
+        "close-frames",
+        format_smolstr!("{stage}: 关闭必须在 {PIXEL_CHECK_SETTLE_LIMIT} 帧内完成"),
+    );
+    for _ in 0..4 {
+        pixel_check_tick(app, picker, pixels, run, stage, false);
+    }
+}
+
+fn pixel_check_scene(app: &mut TestApp) -> ColorPicker {
+    let window = app.window_id();
+    let theme = ThemeHandle::new(app.app_mut(), Appearance::Dark);
+    let root = app.app().window(window).expect("窗口").tree().root();
+    let size = app.app().window(window).expect("窗口").size();
+    let backdrop = Color::from_rgba8([0x10, 0x14, 0x1A, 0xFF]);
+    {
+        let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
+        NodeBuilder::boxed()
+            .id("gallery.pixel-check:backdrop")
+            .layout_override(LogicalRect::from_origin_size(
+                LogicalPoint::new(px(-2.0), px(-2.0)),
+                LogicalSize::new(size.width + px(4.0), size.height + px(4.0)),
+            ))
+            .paint(PaintSpec {
+                background: backdrop,
+                ..PaintSpec::default()
+            })
+            .build(tree, root)
+            .expect("背景");
+    }
+    let cards = [
+        [0x32, 0x3A, 0x46, 0xFF],
+        [0x3C, 0x2E, 0x44, 0xFF],
+        [0x2C, 0x3E, 0x38, 0xFF],
+        [0x44, 0x3A, 0x28, 0xFF],
+        [0x28, 0x34, 0x48, 0xFF],
+        [0x3E, 0x2A, 0x2A, 0xFF],
+    ];
+    for (index, color) in cards.into_iter().enumerate() {
+        let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
+        NodeBuilder::boxed()
+            .id(format_smolstr!("gallery.pixel-check:card{index}"))
+            .layout_override(LogicalRect::new(
+                px(40.0 + (index % 3) as f32 * 240.0),
+                px(60.0 + (index / 3) as f32 * 90.0),
+                px(220.0),
+                px(70.0),
+            ))
+            .paint(PaintSpec {
+                background: Color::from_rgba8(color),
+                ..PaintSpec::default()
+            })
+            .build(tree, root)
+            .expect("内容卡");
+    }
+    let layer = Layer::new();
+    let router = AnimationRouter::new();
+    let picker = ColorPicker::new(
+        app.app_mut(),
+        theme,
+        layer,
+        router,
+        "gallery.pixel-check",
+        Color::WHITE,
+        UnifiedSize::Medium,
+    );
+    picker.build(app.app_mut(), window, root).expect("触发器");
+    pixel_check_move_trigger(app, &picker, PIXEL_CHECK_TRIGGER_A);
+    picker
+}
+
+const PIXEL_CHECK_TRIGGER_A: LogicalRect =
+    LogicalRect::new(px(620.0), px(470.0), px(30.0), px(30.0));
+const PIXEL_CHECK_TRIGGER_B: LogicalRect =
+    LogicalRect::new(px(120.0), px(360.0), px(30.0), px(30.0));
+const PIXEL_CHECK_TRIGGER_C: LogicalRect =
+    LogicalRect::new(px(620.0), px(300.0), px(30.0), px(30.0));
+
+#[must_use]
+fn pixel_check_rect_near(a: LogicalRect, b: LogicalRect) -> bool {
+    (a.origin.x - b.origin.x).abs().value() < 0.5
+        && (a.origin.y - b.origin.y).abs().value() < 0.5
+        && (a.size.width - b.size.width).abs().value() < 0.5
+        && (a.size.height - b.size.height).abs().value() < 0.5
+}
+
+fn pixel_check_move_trigger(app: &mut TestApp, picker: &ColorPicker, target: LogicalRect) {
+    let window = app.window_id();
+    let trigger = picker.trigger_node().expect("触发器已挂载");
+    app.app_mut()
+        .window_mut(window)
+        .expect("窗口")
+        .tree_mut()
+        .set_layout_override(trigger, Some(ui_core::layout::LayoutOverride::new(target)))
+        .expect("移动触发器");
+}
+
+fn pixel_check_first(
+    app: &TestApp,
+    window: WindowId,
+    pixels: &mut PersistentPixels,
+    record: &FrameRecord,
+) -> Option<SnapshotImage> {
+    match pixels.present_record(app.app(), window, record) {
+        Ok(PixelFrame::Full(image)) => Some(image),
+        Ok(other) => {
+            println!("gallery: pixel-check FAIL 首帧必须是整帧：{other:?}");
+            None
+        }
+        Err(error) => {
+            println!("gallery: pixel-check FAIL 首帧重放失败：{error}");
+            None
+        }
+    }
+}
+
+fn run_pixel_check() -> bool {
+    println!(
+        "gallery: pixel-check semantics: headless persistent-incremental pixel gate \
+         (exit 0 = PASS, exit 3 = FAIL); residue judgement = old-popup region pixel-by-pixel \
+         against the pre-open baseline with a coverage floor (compared >= {PIXEL_CHECK_MIN_COMPARED_PERMILLE} permille of the \
+         fixture device pixels) and a negative self-check that corrupts >= 2 scattered detected pixels; \
+         real-window pixel readback/screenshot is P3 (--dump-overlay only asserts rects)"
+    );
+    println!(
+        "gallery: pixel-check migration note: this gate binds kit::overlay/ColorPicker APIs that \
+         P1-11 deletes; P1-12 must port it (registered in design §8 §11)"
+    );
+    let _guard = ui_core::test_support::snapshot::gpu_guard();
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let picker = pixel_check_scene(&mut app);
+    let mut pixels = PersistentPixels::new(app.app(), window).expect("持久像素目标");
+    let first_record = app.drain().expect("首帧").clone();
+    let Some(before) = pixel_check_first(&app, window, &mut pixels, &first_record) else {
+        return false;
+    };
+    let _ = picker.sync(app.app_mut());
+    let rgba = before.rgba8.as_chunks::<4>().0;
+    let translucent = rgba.iter().filter(|pixel| pixel[3] < 255).count();
+    let min_alpha = rgba.iter().map(|pixel| pixel[3]).min().unwrap_or(255);
+    let mut run = PixelCheckRun {
+        report: PixelCheckReport::default(),
+        before: before.clone(),
+        previous: before,
+    };
+    run.report.record(
+        translucent == 0,
+        "baseline-opaque",
+        format_smolstr!(
+            "打开前基线必须完全不透明（半透明像素 {translucent} 个，min_alpha={min_alpha}）：否则增量重绘会在覆盖边缘累积 alpha"
+        ),
+    );
+
+    pixel_check_move_trigger(&mut app, &picker, PIXEL_CHECK_TRIGGER_B);
+    let moved_closed = pixel_check_settle(
+        &mut app,
+        &picker,
+        &mut pixels,
+        &mut run,
+        "move-closed",
+        false,
+    );
+    run.report.record(
+        moved_closed,
+        "move-closed-settle",
+        SmolStr::new_static("move-closed: 关闭态移动触发器后必须稳定"),
+    );
+    pixel_check_move_trigger(&mut app, &picker, PIXEL_CHECK_TRIGGER_A);
+    let returned = pixel_check_settle(
+        &mut app,
+        &picker,
+        &mut pixels,
+        &mut run,
+        "move-closed-return",
+        false,
+    );
+    run.report.record(
+        returned,
+        "move-closed-return-settle",
+        SmolStr::new_static("move-closed-return: 触发器回到原位后必须稳定"),
+    );
+    run.assert_restored("move-closed");
+
+    let opened = match picker.open(app.app_mut(), window) {
+        Ok(opened) => opened,
+        Err(error) => {
+            println!("gallery: pixel-check FAIL open: {error}");
+            return false;
+        }
+    };
+    run.report
+        .record(opened, "open", SmolStr::new_static("open: 面板必须打开"));
+    let settled = pixel_check_settle(&mut app, &picker, &mut pixels, &mut run, "open", true);
+    run.report.record(
+        settled,
+        "open-settle",
+        SmolStr::new_static("open: 面板必须在限帧内稳定"),
+    );
+    run.report.stable = pixel_check_popup(&app, &picker);
+    match (run.report.first_visible, run.report.stable) {
+        (Some(first), Some(stable)) => run.report.record(
+            pixel_check_rect_near(first, stable),
+            "first-visible-rect",
+            format_smolstr!("open: 首个可见帧 rect={first:?} != 稳定帧 rect={stable:?}"),
+        ),
+        (first, stable) => run.report.record(
+            false,
+            "first-visible-missing",
+            format_smolstr!("open: 首个可见帧/稳定帧 rect 缺失 first={first:?} stable={stable:?}"),
+        ),
+    }
+
+    run.report.record(
+        !app.app().animations_running(window),
+        "idle-no-animation",
+        SmolStr::new_static("idle: 采样窗口内不得有动画源（否则 idle 断言变成动画检查）"),
+    );
+    for _ in 0..PIXEL_CHECK_IDLE_FRAMES {
+        app.advance(Duration::from_millis(PIXEL_CHECK_IDLE_STEP_MS));
+        let idle = pixel_check_tick(&mut app, &picker, &mut pixels, &mut run, "idle", true);
+        run.report.record(
+            idle,
+            "idle-frames",
+            SmolStr::new_static("idle: 打开后稳定窗口内不得继续出帧"),
+        );
+    }
+
+    let old_popup = run.report.stable;
+    let old_trigger = picker
+        .trigger_node()
+        .and_then(|node| app.probe().bounds(node));
+    pixel_check_move_trigger(&mut app, &picker, PIXEL_CHECK_TRIGGER_C);
+    let moved_open = pixel_check_settle(&mut app, &picker, &mut pixels, &mut run, "move", false);
+    run.report.record(
+        moved_open,
+        "move-settle",
+        SmolStr::new_static("move: 锚点移动后必须稳定"),
+    );
+    run.report.moved = pixel_check_popup(&app, &picker);
+    if let Some(old) = old_popup {
+        run.assert_old_popup_restored(&app, &picker, "move", old, old_trigger);
+    }
+    if let (Some(stable), Some(moved)) = (run.report.stable, run.report.moved) {
+        run.report.record(
+            !pixel_check_rect_near(stable, moved),
+            "move-panel",
+            format_smolstr!("move: 面板必须离开旧位置（旧={stable:?} 新={moved:?}）"),
+        );
+    }
+
+    let closed = picker.close(app.app_mut());
+    run.report
+        .record(closed, "close", SmolStr::new_static("close: 面板必须关闭"));
+    pixel_check_close(&mut app, &picker, &mut pixels, &mut run, "close");
+    pixel_check_move_trigger(&mut app, &picker, PIXEL_CHECK_TRIGGER_A);
+    let restored = pixel_check_settle(
+        &mut app,
+        &picker,
+        &mut pixels,
+        &mut run,
+        "close-restore",
+        false,
+    );
+    run.report.record(
+        restored,
+        "close-restore-settle",
+        SmolStr::new_static("close-restore: 关闭并把触发器放回原位后必须稳定"),
+    );
+    run.assert_restored("close");
+
+    let reopened = match picker.open(app.app_mut(), window) {
+        Ok(reopened) => reopened,
+        Err(error) => {
+            println!("gallery: pixel-check FAIL reopen: {error}");
+            return false;
+        }
+    };
+    run.report.record(
+        reopened,
+        "reopen",
+        SmolStr::new_static("reopen: 面板必须重开"),
+    );
+    let reopened_settled =
+        pixel_check_settle(&mut app, &picker, &mut pixels, &mut run, "reopen", true);
+    run.report.record(
+        reopened_settled,
+        "reopen-settle",
+        SmolStr::new_static("reopen: 重开后必须稳定"),
+    );
+    if let (Some(stable), Some(after)) = (run.report.stable, pixel_check_popup(&app, &picker)) {
+        run.report.record(
+            pixel_check_rect_near(stable, after),
+            "reopen-rect",
+            format_smolstr!("reopen: 重开面板 rect={after:?} 必须与首次稳定 rect={stable:?} 一致"),
+        );
+    }
+    let closed_again = picker.close(app.app_mut());
+    run.report.record(
+        closed_again,
+        "reopen-close",
+        SmolStr::new_static("reopen-close: 面板必须关闭"),
+    );
+    pixel_check_close(&mut app, &picker, &mut pixels, &mut run, "reopen-close");
+    run.assert_restored("reopen-close");
+
+    let report = run.report;
+    let passed = report.failures == 0;
+    println!(
+        "gallery: pixel-check checks={} sampled_frames={} damage_full_frames={} first_visible={:?} stable={:?} moved={:?}",
+        report.checks,
+        report.sampled_frames,
+        report.damage_full_frames,
+        report.first_visible,
+        report.stable,
+        report.moved
+    );
+    if passed {
+        println!(
+            "gallery: pixel-check PASS ({} checks; residue = old-region baseline scan with coverage floor + 2-point injected-fault self-check; exit 0)",
+            report.checks
+        );
+    } else {
+        for (key, count) in &report.seen {
+            println!("gallery: pixel-check failures {key}={count}");
+        }
+        println!(
+            "gallery: pixel-check FAIL ({} failure(s) in {} checks; exit 3)",
+            report.failures, report.checks
+        );
+    }
+    passed
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flags = parse_flags();
+    if flags.pixel_check {
+        if !run_pixel_check() {
+            std::process::exit(3);
+        }
+        return Ok(());
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

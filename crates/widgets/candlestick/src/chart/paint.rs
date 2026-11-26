@@ -108,7 +108,6 @@ impl ChartPalette {
 
 pub(crate) struct ChartCanvas {
     node: Option<NodeId>,
-    bounds: Option<LogicalRect>,
     layout: Option<ChartLayout>,
     painted: Option<PaintedCanvas>,
     text: ChartTextCache,
@@ -137,7 +136,7 @@ impl PaintedCanvas {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaintedKey {
-    bounds: LogicalRect,
+    size: LogicalSize,
     candle_width: LogicalPx,
     right_timestamp: Option<i64>,
     cursor: Option<LogicalPoint>,
@@ -159,7 +158,6 @@ impl ChartCanvas {
     pub(crate) fn new() -> Self {
         Self {
             node: None,
-            bounds: None,
             layout: None,
             painted: None,
             text: ChartTextCache::new(),
@@ -171,13 +169,8 @@ impl ChartCanvas {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn node(&self) -> Option<NodeId> {
         self.node
-    }
-
-    pub(crate) fn bounds(&self) -> Option<LogicalRect> {
-        self.bounds
     }
 
     pub(crate) fn layout(&self) -> Option<&ChartLayout> {
@@ -249,17 +242,17 @@ impl ChartCanvas {
             return Ok(false);
         };
         let bounds = target.layout().bounds;
-        if bounds.size.is_empty() {
+        let size = bounds.size;
+        if size.is_empty() {
             return Ok(false);
         }
-        self.bounds = Some(bounds);
 
         let appearance = cx.theme().current(cx.app());
         let colors = ChartPalette::resolve(cx.theme().theme_for(appearance));
         let language = *cx.read(&cx.language());
         let translate = cx.translate().clone();
         let key = PaintedKey {
-            bounds,
+            size,
             candle_width: frame.viewport.candle_width,
             right_timestamp: frame.viewport.right_timestamp,
             cursor: frame.viewport.cursor,
@@ -280,8 +273,14 @@ impl ChartCanvas {
             return Ok(false);
         }
 
-        let (canvas, geometry) =
-            self.paint(cx.app_mut(), &translate, display, frame, bounds, colors)?;
+        let (canvas, geometry) = self.paint(
+            cx.app_mut(),
+            &translate,
+            display,
+            frame,
+            LogicalRect::from_origin_size(LogicalPoint::ZERO, size),
+            colors,
+        )?;
         let changed = cx.set_canvas(node, canvas)?;
         if changed {
             for id in std::mem::take(&mut self.geometry) {
@@ -321,7 +320,6 @@ impl ChartCanvas {
             let _ = cx.app_mut().remove_node(window, node);
         }
         self.clear();
-        self.bounds = None;
     }
 
     fn series(
@@ -2532,7 +2530,6 @@ mod tests {
         let canvas = ChartCanvas::new();
 
         assert_eq!(canvas.node(), None);
-        assert_eq!(canvas.bounds(), None);
         assert!(canvas.layout().is_none());
         assert_eq!(canvas.layout_width(), None);
     }
@@ -3784,7 +3781,7 @@ mod tests {
     #[test]
     fn a_painted_key_should_reject_every_changed_drawing_input() {
         let snapshot = one_candle_snapshot();
-        let bounds = LogicalRect::new(px(0.0), px(0.0), px(320.0), px(240.0));
+        let size = LogicalSize::new(px(320.0), px(240.0));
         let viewport = ChartViewport {
             candle_width: px(9.0),
             right_timestamp: None,
@@ -3793,7 +3790,7 @@ mod tests {
         let colors = light_palette();
         let other_colors = ChartPalette::resolve(&Theme::of(Appearance::Dark));
         let key = PaintedKey {
-            bounds,
+            size,
             candle_width: viewport.candle_width,
             right_timestamp: viewport.right_timestamp,
             cursor: None,
@@ -3825,7 +3822,7 @@ mod tests {
         assert_ne!(
             key,
             PaintedKey {
-                bounds: LogicalRect::new(px(0.0), px(0.0), px(640.0), px(480.0)),
+                size: LogicalSize::new(px(640.0), px(480.0)),
                 ..key
             },
             "resizing changes every box"

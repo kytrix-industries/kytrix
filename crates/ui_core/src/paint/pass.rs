@@ -17,9 +17,10 @@ use crate::{
     },
     paint::{
         color::Color,
+        extent::PaintedExtent,
         primitive::{
-            ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, Image, PositionedGlyph, Primitive,
-            Quad, QuadPaint, Shadow,
+            CanvasDraw, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, Image, PositionedGlyph,
+            Primitive, Quad, QuadPaint, Shadow,
         },
         scene::{LaneId, Scene},
         style::{Clip, PaintSpec, StylePatch},
@@ -62,6 +63,7 @@ impl PaintMode {
 pub(crate) struct PaintReport {
     pub rebuilt: usize,
     pub damage: DamageSummary,
+    pub order_rebuilt: bool,
     pub stale_text: SmallVec<[NodeId; 4]>,
     pub unresolved_canvas_text: usize,
     pub skipped_inline_images: SmallVec<[u64; 4]>,
@@ -154,15 +156,19 @@ impl PaintPass<'_> {
             1.0,
             mode.is_full(),
         )?;
-        match context.mode {
-            PaintMode::Full => context.scene.set_order(context.order),
+        let order_rebuilt = match context.mode {
+            PaintMode::Full => {
+                context.scene.set_order(context.order);
+                false
+            }
             PaintMode::Incremental if context.order_changed => {
                 rebuild_order_only(context.tree, context.order);
                 context.scene.set_order(context.order);
                 context.tree.note_order_rebuild();
+                true
             }
-            PaintMode::Incremental => {}
-        }
+            PaintMode::Incremental => false,
+        };
         let damage = context.damage.finish(frame);
         context
             .tree
@@ -170,6 +176,7 @@ impl PaintPass<'_> {
         Ok(PaintReport {
             rebuilt: context.rebuilt,
             damage,
+            order_rebuilt,
             stale_text: context.stale_text,
             unresolved_canvas_text: context.unresolved_canvas_text,
             skipped_inline_images: context.skipped_inline_images,
@@ -328,9 +335,12 @@ fn resolved_canvas(
                     None => *skipped += 1,
                 }
             }
-            Primitive::Canvas(inner) => {
-                let inner = resolved_canvas(inner, lines, atlases, next, skipped);
-                resolved.push_primitive(Primitive::Canvas(Arc::new(inner)));
+            Primitive::Canvas(draw) => {
+                let inner = resolved_canvas(&draw.canvas, lines, atlases, next, skipped);
+                resolved.push_primitive(Primitive::Canvas(CanvasDraw {
+                    canvas: Arc::new(inner),
+                    offset: draw.offset,
+                }));
             }
             other => resolved.push_primitive(other.clone()),
         }
@@ -399,7 +409,7 @@ fn paint_node(
         hide_subtree(context, node, clip, total);
         return Ok(());
     }
-    let (node_slot, node_slot_offset) = if state.screen_baked {
+    let (node_slot, node_slot_offset) = if state.needs_screen_bake {
         (0, LogicalPoint::ZERO)
     } else {
         (slot, slot_offset)
@@ -523,7 +533,7 @@ fn scroll_slot_for(
     cached
 }
 
-fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
+pub(crate) fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
     order.clear();
     let mut stack: SmallVec<[(NodeId, bool); 32]> = SmallVec::new();
     stack.push((tree.root(), false));
@@ -552,7 +562,8 @@ fn hide_subtree(
     total: LogicalPoint,
 ) {
     let previous_content = painted_content(context.tree, context.scene, node, context.scale);
-    let (children, damage_rect, child_offset) = {
+    let previous_extent = context.tree.painted_extent(node);
+    let (children, damage_rect, child_offset, screen_bounds) = {
         let Ok(target) = context.tree.get(node) else {
             return;
         };
@@ -566,13 +577,15 @@ fn hide_subtree(
         {
             damage_rect = damage_rect.union(snapshot.bounds());
         }
+        let screen_bounds = matches!(target.kind(), NodeKind::Canvas(_) | NodeKind::Geometry(_))
+            .then(|| target.layout().bounds.translate(negate(total)));
         let damage_rect = damage_rect.translate(negate(total));
         let child_offset = total
             + context
                 .tree
                 .scroll_slot(node)
                 .map_or(LogicalPoint::ZERO, |slot| slot.offset);
-        (children, damage_rect, child_offset)
+        (children, damage_rect, child_offset, screen_bounds)
     };
     for index in 0..context.tree.lane_count(node) {
         let Some(lane) = context.tree.lane_at(node, index) else {
@@ -600,6 +613,13 @@ fn hide_subtree(
     context.tree.clear_clip_key(node);
     context.tree.set_reusable(node);
     context.tree.clear_paint(node);
+    context.tree.set_painted_extent(node, None);
+    if let Some(bounds) = screen_bounds {
+        context.tree.set_baked_screen_bounds(node, bounds);
+    }
+    if let Some(extent) = previous_extent {
+        extent.push_damage(context.damage, negate(total), clip.covering);
+    }
     context
         .damage
         .push_logical(damage_rect, physical_px(1.0), clip.covering);
@@ -634,6 +654,10 @@ fn rebuild_lane(
         }
     };
     let previous_content = painted_content(context.tree, context.scene, node, context.scale);
+    let previous_extent = context.tree.painted_extent(node);
+    if let Some(extent) = previous_extent {
+        extent.push_damage(context.damage, negate(total), clip.covering);
+    }
     let had_primitives = context
         .scene
         .lane_primitives(lane)
@@ -652,6 +676,7 @@ fn rebuild_lane(
         ring,
         content_clip,
         geometry_transform,
+        needs_screen_bake,
     ) = {
         let Ok(target) = context.tree.get(node) else {
             return Ok(());
@@ -674,6 +699,7 @@ fn rebuild_lane(
             .then(|| context.tree.focus_ring(node))
             .flatten();
         let geometry_transform = crate::math::Transform::IDENTITY;
+        let needs_screen_bake = matches!(target.kind(), NodeKind::Canvas(_));
         (
             bounds,
             content_offset,
@@ -684,6 +710,7 @@ fn rebuild_lane(
             ring,
             content_clip,
             geometry_transform,
+            needs_screen_bake,
         )
     };
 
@@ -718,8 +745,11 @@ fn rebuild_lane(
         content_clip,
         geometry_transform,
         opacity,
+        painted: LogicalRect::default(),
+        layout_extent_shift: total + negate(slot_offset),
     };
     emitter.emit(context);
+    let painted_extent = emitter.painted_extent();
     push_painted_shadow(context, &previous_content, total, clip.covering);
 
     if !previous_content.screen.is_empty() {
@@ -741,6 +771,10 @@ fn rebuild_lane(
     context.tree.set_lane_offset(node, bake);
     context.tree.set_paint_opacity(node, opacity);
     context.tree.clear_paint(node);
+    context.tree.set_painted_extent(node, painted_extent);
+    if needs_screen_bake {
+        context.tree.set_baked_screen_bounds(node, bounds);
+    }
 
     if primitives == 0 {
         context.scene.release_lane(lane);
@@ -863,6 +897,10 @@ fn clear_geometry_lanes(
     geometry_transform: crate::math::Transform,
     bake: LogicalPoint,
 ) {
+    if let Some(extent) = context.tree.painted_extent(node) {
+        extent.push_damage(context.damage, negate(total), clip.covering);
+    }
+    context.tree.set_painted_extent(node, None);
     for chunk in 0..old_lanes {
         let Some(previous) = context.baked_scratch.get(chunk).copied() else {
             continue;
@@ -950,6 +988,7 @@ fn paint_geometry_node(
     };
     let visible = patch.visible.unwrap_or(true);
     let old_lanes = context.tree.lane_count(node);
+    let previous_extent = context.tree.painted_extent(node);
     context.baked_scratch.clear();
     if let Some(baked) = context.tree.baked_geometry_chunks(node) {
         context.baked_scratch.extend(baked.iter().copied());
@@ -966,6 +1005,7 @@ fn paint_geometry_node(
             bake,
         );
         context.tree.set_paint_opacity(node, opacity);
+        context.tree.set_baked_screen_bounds(node, bounds);
         return Ok(());
     }
     context.rebuild_scratch.clear();
@@ -985,6 +1025,7 @@ fn paint_geometry_node(
     }
     context.tree.resize_baked_geometry_chunks(node, desired);
     let mut created_any = false;
+    let mut painted = LogicalRect::default();
     let inner_clips = &clip.rects[..];
     for chunk in 0..desired {
         let lane = match context.tree.lane_at(node, chunk) {
@@ -1054,6 +1095,8 @@ fn paint_geometry_node(
             geometry_transform,
             content_clip,
             opacity,
+            painted: LogicalRect::default(),
+            layout_extent_shift: total,
         };
         if chunk == 0 {
             emitter.emit_decorations(context, opacity);
@@ -1067,6 +1110,7 @@ fn paint_geometry_node(
         if chunk == 0 {
             emitter.emit_focus_ring(context, opacity);
             emitter.emit_node_damage(context);
+            painted = emitter.painted;
         }
         for _ in inner_clips.iter().rev() {
             let _ = context.scene.push(lane, Primitive::Clip(ClipOp::Pop));
@@ -1153,11 +1197,29 @@ fn paint_geometry_node(
     }
     context.tree.truncate_lanes(node, desired);
     context.tree.resize_baked_geometry_chunks(node, desired);
+    let chunk_zero_rebuilt = context.rebuild_scratch.first().copied().unwrap_or(false);
+    if context.rebuild_scratch.iter().any(|rebuilt| *rebuilt) || desired != old_lanes {
+        let mut extent = bounds.translate(total).union(painted);
+        for chunk in 0..desired {
+            extent = extent.union(geometry_chunk_damage(
+                geometry_transform,
+                geometry_chunk_local_bounds(snapshot.as_ref(), chunk).unwrap_or_default(),
+                LogicalPoint::ZERO,
+            ));
+        }
+        if !chunk_zero_rebuilt && let Some(previous) = previous_extent {
+            extent = extent.union(previous.layout_bounds());
+        }
+        context
+            .tree
+            .set_painted_extent(node, PaintedExtent::new(extent));
+    }
     context.tree.set_reusable(node);
     context.tree.set_clip_key(node, clip.key());
     context.tree.set_lane_offset(node, bake);
     context.tree.set_paint_opacity(node, opacity);
     context.tree.clear_paint(node);
+    context.tree.set_baked_screen_bounds(node, bounds);
     if !context.mode.is_full() && created_any {
         context.order_changed = true;
     }
@@ -1233,6 +1295,8 @@ struct PrimitiveEmitter {
     geometry_transform: crate::math::Transform,
     content_clip: Option<LogicalRect>,
     opacity: f32,
+    painted: LogicalRect,
+    layout_extent_shift: LogicalPoint,
 }
 
 struct TextDecorations {
@@ -1331,7 +1395,9 @@ fn painted_content(
                             .union(LogicalRect::from_origin_size(glyph.position, glyph.size));
                     }
                 }
-                Primitive::Canvas(canvas) => screen = screen.union(canvas.bounds()),
+                Primitive::Canvas(draw) => {
+                    screen = screen.union(draw.bounds().translate(draw.offset));
+                }
                 Primitive::Image(image) => content = content.union(image.bounds),
                 Primitive::Quad(quad) => content = content.union(quad.bounds),
                 Primitive::Shadow(shadow) => {
@@ -1375,21 +1441,171 @@ fn push_painted_shadow(
     }
 }
 
+fn canvas_content_extent(
+    canvas: &crate::paint::canvas::Canvas,
+    scale: DevicePixelRatio,
+    geometry: &crate::paint::geometry_store::GeometryStore,
+) -> LogicalRect {
+    let mut extent = LogicalRect::default();
+    let mut clip: Option<LogicalRect> = None;
+    let mut saved: SmallVec<[Option<LogicalRect>; 8]> = SmallVec::new();
+    for primitive in canvas.primitives() {
+        match primitive {
+            Primitive::Clip(ClipOp::Push(rect)) => {
+                saved.push(clip);
+                clip = Some(match clip {
+                    Some(current) => current.intersect(rect.rect),
+                    None => rect.rect,
+                });
+            }
+            Primitive::Clip(ClipOp::Pop) => {
+                clip = saved.pop().flatten();
+            }
+            Primitive::Canvas(inner) => {
+                let inner_extent =
+                    canvas_content_extent(&inner.canvas, scale, geometry).translate(inner.offset);
+                extent = extent.union(clipped_extent(inner_extent, clip));
+            }
+            _ => {
+                let bounds = primitive_extent(primitive, scale, geometry);
+                extent = extent.union(clipped_extent(bounds, clip));
+            }
+        }
+    }
+    extent
+}
+
+fn clipped_extent(bounds: LogicalRect, clip: Option<LogicalRect>) -> LogicalRect {
+    match clip {
+        Some(clip) => bounds.intersect(clip),
+        None => bounds,
+    }
+}
+
+fn primitive_extent(
+    primitive: &Primitive,
+    scale: DevicePixelRatio,
+    geometry: &crate::paint::geometry_store::GeometryStore,
+) -> LogicalRect {
+    match primitive {
+        Primitive::Quad(quad) => quad.bounds,
+        Primitive::Shadow(shadow) => {
+            let blur = scale.to_physical(shadow.blur.max(LogicalPx::ZERO));
+            let sigma = (blur.value() * crate::paint::instance::SHADOW_SIGMA_SCALE)
+                .max(crate::paint::instance::SHADOW_SIGMA_MIN);
+            let pad = PhysicalPx::new(crate::paint::instance::SHADOW_PAD_SIGMAS * sigma + 1.0);
+            shadow
+                .rect
+                .translate(shadow.offset)
+                .outset(scale.to_logical(pad))
+        }
+        Primitive::Image(image) => image.bounds,
+        Primitive::GlyphRun(run) => {
+            let mut bounds = LogicalRect::default();
+            for glyph in &run.glyphs {
+                bounds = bounds.union(LogicalRect::from_origin_size(glyph.position, glyph.size));
+            }
+            bounds
+        }
+        Primitive::Path(path) => path.bounds,
+        Primitive::Geometry(draw) => geometry_draw_extent(draw, geometry),
+        Primitive::Canvas(_) | Primitive::Clip(_) | Primitive::Text(_) => LogicalRect::default(),
+    }
+}
+
+fn geometry_draw_extent(
+    draw: &GeometryDraw,
+    geometry: &crate::paint::geometry_store::GeometryStore,
+) -> LogicalRect {
+    let Some(snapshot) = geometry.snapshot_arc(draw.id) else {
+        return LogicalRect::default();
+    };
+    let local = geometry_drawn_bounds(&snapshot, &draw.range);
+    if local.is_empty() {
+        return LogicalRect::default();
+    }
+    let aabb = transformed_chunk_aabb(draw.transform, local);
+    if aabb[2] < aabb[0] || aabb[3] < aabb[1] {
+        return LogicalRect::default();
+    }
+    LogicalRect::new(
+        px(aabb[0]),
+        px(aabb[1]),
+        px(aabb[2] - aabb[0]),
+        px(aabb[3] - aabb[1]),
+    )
+}
+
+fn geometry_drawn_bounds(
+    snapshot: &crate::paint::geometry::GeometrySnapshot,
+    range: &std::ops::Range<u32>,
+) -> LogicalRect {
+    let mut bounds = LogicalRect::default();
+    for meta in snapshot.chunks() {
+        if crate::paint::geometry::chunk_draw_range(
+            snapshot.topology(),
+            snapshot.index_count(),
+            meta,
+            range.clone(),
+        )
+        .is_none()
+        {
+            continue;
+        }
+        let local = if meta.bounds.is_empty() {
+            snapshot.bounds()
+        } else {
+            meta.bounds
+        };
+        bounds = bounds.union(local);
+    }
+    bounds
+}
+
 impl PrimitiveEmitter {
     fn push(&mut self, context: &mut PaintContext<'_>, primitive: Primitive) {
         let _ = context.scene.push(self.lane, primitive);
         self.emitted += 1;
     }
 
+    fn note_painted(&mut self, lane_bounds: LogicalRect) {
+        if !lane_bounds.is_empty() {
+            self.painted = self
+                .painted
+                .union(lane_bounds.translate(self.layout_extent_shift));
+        }
+    }
+
+    fn note_shadow(&mut self, lane_bounds: LogicalRect, pad: PhysicalPx) {
+        self.note_painted(lane_bounds.outset(self.scale.to_logical(pad)));
+    }
+
+    fn painted_extent(&self) -> Option<PaintedExtent> {
+        PaintedExtent::new(self.painted)
+    }
+
     fn push_damage(
-        &self,
+        &mut self,
         context: &mut PaintContext<'_>,
         bounds: LogicalRect,
         aa_padding: PhysicalPx,
     ) {
+        self.note_painted(bounds);
         context
             .damage
             .push_logical(bounds.translate(self.damage_shift), aa_padding, self.clip);
+    }
+
+    fn push_shadow_damage(
+        &mut self,
+        context: &mut PaintContext<'_>,
+        bounds: LogicalRect,
+        pad: PhysicalPx,
+    ) {
+        self.note_shadow(bounds, pad);
+        context
+            .damage
+            .push_logical(bounds.translate(self.damage_shift), pad, self.clip);
     }
 
     fn emit(&mut self, context: &mut PaintContext<'_>) {
@@ -1426,7 +1642,7 @@ impl PrimitiveEmitter {
             let sigma = (blur.value() * crate::paint::instance::SHADOW_SIGMA_SCALE)
                 .max(crate::paint::instance::SHADOW_SIGMA_MIN);
             let pad = crate::paint::instance::SHADOW_PAD_SIGMAS * sigma + 1.0;
-            self.push_damage(
+            self.push_shadow_damage(
                 context,
                 primitive.rect.translate(primitive.offset),
                 PhysicalPx::new(pad),
@@ -1592,23 +1808,37 @@ impl PrimitiveEmitter {
             Content::Box => {}
 
             Content::Canvas(canvas) => {
-                let canvas_bounds = canvas.bounds();
+                let origin = LogicalPoint::new(
+                    self.bounds.origin.x + self.content_offset.x,
+                    self.bounds.origin.y + self.content_offset.y,
+                );
                 let mut skipped = 0usize;
-                if canvas_has_text(&canvas) {
+                let canvas = if canvas_has_text(&canvas) {
                     let lines = context
                         .canvas_text
                         .get(&self.node)
                         .map(|entry| entry.lines.as_slice());
                     let resolved =
                         resolved_canvas(&canvas, lines, context.atlases, &mut 0usize, &mut skipped);
-                    self.push(context, Primitive::Canvas(Arc::new(resolved)));
+                    Arc::new(resolved)
                 } else {
-                    self.push(context, Primitive::Canvas(canvas));
-                }
+                    canvas
+                };
+                let extent = canvas_content_extent(&canvas, self.scale, context.geometry)
+                    .translate(origin)
+                    .union(self.bounds);
+                self.note_painted(extent);
+                self.push(
+                    context,
+                    Primitive::Canvas(CanvasDraw {
+                        canvas,
+                        offset: origin,
+                    }),
+                );
                 context.unresolved_canvas_text += skipped;
                 context
                     .damage
-                    .push_logical(canvas_bounds, physical_px(1.0), self.clip);
+                    .push_logical(extent, physical_px(1.0), self.clip);
             }
             Content::Text(line) => {
                 if let Some(line) = line {
@@ -1967,19 +2197,25 @@ impl PrimitiveEmitter {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::{rc::Rc, sync::Arc};
 
     use super::PaintPass;
     use crate::{
         math::{
-            DevicePixelRatio, DeviceRect, LogicalPoint, LogicalPx, LogicalRect, dp, physical_px, px,
+            DevicePixelRatio, DeviceRect, LogicalPoint, LogicalPx, LogicalRect, Transform, dp,
+            physical_px, px,
         },
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::{
             canvas::Canvas,
-            color::Color,
-            geometry::GeometryId,
-            primitive::{Border, ClipOp, Gradient, GradientKind, Primitive, QuadPaint},
+            color::{Color, ColorResolver},
+            geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
+            geometry_store::GeometryStore,
+            instance::InstanceEncoder,
+            primitive::{
+                Border, CanvasDraw, ClipOp, ClipRect, GeometryDraw, Gradient, GradientKind, Path,
+                Primitive, Quad, QuadPaint,
+            },
             scene::{LaneId, Scene},
             style::{Clip, FocusRing, PaintSpec, ShadowSpec, Shadows, Style, StylePatch},
             style_builder::StyleBuilder,
@@ -2616,6 +2852,975 @@ mod tests {
         ));
     }
 
+    fn canvas_with_local_quad(bounds: LogicalRect, quad: LogicalRect) -> Canvas {
+        let mut canvas = Canvas::new(bounds);
+        canvas.push_quad(Quad {
+            bounds: quad,
+            corner_radius: [px(0.0); 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        });
+        canvas
+    }
+
+    fn canvas_draw(harness: &Harness, node: NodeId) -> CanvasDraw {
+        lane_primitives(harness, node)
+            .into_iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Canvas(draw) => Some(draw),
+                _ => None,
+            })
+            .expect("lane 里有 Canvas 图元")
+    }
+
+    fn encoded_instance_rects(harness: &Harness) -> Vec<[f32; 4]> {
+        let mut encoder = InstanceEncoder::new();
+        let buffer = encoder
+            .encode(
+                &harness.scene,
+                harness.scale,
+                ColorResolver,
+                &GeometryStore::new(),
+            )
+            .expect("编码");
+        buffer.instance_rects().collect()
+    }
+
+    fn only_instance_rect(harness: &Harness) -> [f32; 4] {
+        let rects = encoded_instance_rects(harness);
+        assert_eq!(rects.len(), 1, "只应有一个内容图元：{rects:?}");
+        rects[0]
+    }
+
+    fn quad_bounds(primitives: &[Primitive]) -> LogicalRect {
+        primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Quad(quad) => Some(quad.bounds),
+                _ => None,
+            })
+            .expect("图元里有 Quad")
+    }
+
+    #[test]
+    fn canvas_content_is_node_local_and_the_engine_adds_the_node_offset() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let local = LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0));
+        let node = NodeBuilder::canvas(canvas_with_local_quad(local, local))
+            .style(fixed_style(10.0, 10.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(40.0), px(24.0), px(10.0), px(10.0)),
+        );
+
+        let _ = h.paint();
+        let draw = canvas_draw(&h, node);
+        assert_eq!(
+            draw.offset,
+            LogicalPoint::new(px(40.0), px(24.0)),
+            "Canvas 内容的偏移 = 节点内容原点（屏幕坐标）"
+        );
+        assert_eq!(draw.bounds(), local, "Canvas 自身 bounds 保持节点局部坐标");
+        assert_eq!(
+            quad_bounds(draw.primitives()),
+            local,
+            "内部图元不得被引擎改写"
+        );
+        assert_eq!(
+            only_instance_rect(&h),
+            [40.0, 24.0, 10.0, 10.0],
+            "编码结果 = 节点局部坐标 + 节点屏幕偏移"
+        );
+
+        let stable = h.paint();
+        assert_eq!(stable.rebuilt, 0, "稳定帧不得重建 Canvas 的 lane");
+    }
+
+    #[test]
+    fn a_moved_canvas_node_follows_the_new_position_and_damages_old_and_new_extents() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let local = LogicalRect::new(px(0.0), px(0.0), px(60.0), px(40.0));
+        let node = NodeBuilder::canvas(canvas_with_local_quad(local, local))
+            .style(fixed_style(60.0, 40.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(20.0), px(10.0), px(60.0), px(40.0)),
+        );
+        let _ = h.paint();
+        assert_eq!(only_instance_rect(&h), [20.0, 10.0, 60.0, 40.0]);
+
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(200.0), px(150.0), px(60.0), px(40.0)),
+        );
+        h.mark_paint(node);
+        let report = h.paint();
+        assert!(report.rebuilt >= 1, "移动必须重建 Canvas 的 lane");
+        assert_eq!(
+            canvas_draw(&h, node).offset,
+            LogicalPoint::new(px(200.0), px(150.0))
+        );
+        assert_eq!(only_instance_rect(&h), [200.0, 150.0, 60.0, 40.0]);
+
+        let damage = h.damage.rects().to_vec();
+        for corner in [
+            DeviceRect::new(dp(20), dp(10), dp(21), dp(11)),
+            DeviceRect::new(dp(79), dp(49), dp(80), dp(50)),
+            DeviceRect::new(dp(200), dp(150), dp(201), dp(151)),
+            DeviceRect::new(dp(259), dp(189), dp(260), dp(190)),
+        ] {
+            assert!(
+                damage_covers(&damage, corner),
+                "damage 必须覆盖旧位置 ∪ 新位置：{damage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_layout_change_invalidates_a_cached_canvas_lane_on_the_first_frame() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let local = LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0));
+        let node = NodeBuilder::canvas(canvas_with_local_quad(local, local))
+            .style(fixed_style(10.0, 10.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(10.0), px(10.0), px(10.0), px(10.0)),
+        );
+        let _ = h.paint();
+        assert_eq!(only_instance_rect(&h), [10.0, 10.0, 10.0, 10.0]);
+
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(90.0), px(70.0), px(10.0), px(10.0)),
+        );
+        h.mark_paint(node);
+        let report = h.paint();
+        assert!(
+            report.rebuilt >= 1,
+            "布局位置变化必须让 Canvas 的复用失效（否则沿用旧坐标）"
+        );
+        assert_eq!(
+            canvas_draw(&h, node).offset,
+            LogicalPoint::new(px(90.0), px(70.0)),
+            "布局变化后的首帧必须用新位置"
+        );
+        assert_eq!(only_instance_rect(&h), [90.0, 70.0, 10.0, 10.0]);
+    }
+
+    #[test]
+    fn an_ancestor_scroll_bakes_the_canvas_content_exactly_once() {
+        use crate::{
+            interaction::{ScrollAxis, ScrollSlot},
+            math::LogicalSize,
+        };
+
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let mut style = fixed_style(100.0, 100.0);
+        style.clip = Clip::Bounds;
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .build(&mut h.tree, root)
+            .expect("container");
+        let local = LogicalRect::new(px(0.0), px(0.0), px(20.0), px(10.0));
+        let node = NodeBuilder::canvas(canvas_with_local_quad(local, local))
+            .layout_override(LogicalRect::new(px(0.0), px(30.0), px(20.0), px(10.0)))
+            .build(&mut h.tree, container)
+            .expect("canvas");
+        h.tree
+            .ensure_interaction(container)
+            .expect("interaction")
+            .scroll = Some(ScrollSlot {
+            offset: LogicalPoint::new(px(0.0), px(30.0)),
+            content: LogicalSize::new(px(100.0), px(400.0)),
+            axis: ScrollAxis::Vertical,
+            line_height: px(48.0),
+        });
+        h.tree.note_scroll_container(container);
+        layout_all(&mut h.tree);
+        set_layout(
+            &mut h.tree,
+            container,
+            LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)),
+        );
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(0.0), px(30.0), px(20.0), px(10.0)),
+        );
+
+        let _ = h.paint();
+        assert_eq!(
+            canvas_draw(&h, node).offset,
+            LogicalPoint::ZERO,
+            "滚动 30 后内容原点 = 布局 - 滚动（只烘焙一次）"
+        );
+        assert_eq!(only_instance_rect(&h), [0.0, 0.0, 20.0, 10.0]);
+
+        h.tree.scroll_slot_mut(container).expect("slot").offset =
+            LogicalPoint::new(px(0.0), px(10.0));
+        let _ = h.paint();
+        assert_eq!(
+            canvas_draw(&h, node).offset,
+            LogicalPoint::new(px(0.0), px(20.0)),
+            "滚动变化只改变烘焙偏移，不得双偏移"
+        );
+        assert_eq!(only_instance_rect(&h), [0.0, 20.0, 20.0, 10.0]);
+    }
+
+    #[test]
+    fn nested_canvases_accumulate_their_offsets() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let inner = canvas_with_local_quad(
+            LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)),
+            LogicalRect::new(px(1.0), px(2.0), px(4.0), px(4.0)),
+        );
+        let mut outer = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)));
+        outer.push_primitive(Primitive::Canvas(CanvasDraw {
+            canvas: Arc::new(inner),
+            offset: LogicalPoint::new(px(5.0), px(7.0)),
+        }));
+        let node = NodeBuilder::canvas(outer)
+            .style(fixed_style(40.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(100.0), px(50.0), px(40.0), px(20.0)),
+        );
+
+        let _ = h.paint();
+        assert_eq!(
+            only_instance_rect(&h),
+            [106.0, 59.0, 4.0, 4.0],
+            "节点偏移 + 嵌套画布局部偏移必须叠加"
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_canvas_damages_the_previous_content_extent() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let large = LogicalRect::new(px(0.0), px(0.0), px(90.0), px(60.0));
+        let node = NodeBuilder::canvas(canvas_with_local_quad(large, large))
+            .style(fixed_style(20.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(50.0), px(40.0), px(20.0), px(20.0)),
+        );
+        let _ = h.paint();
+        assert_eq!(only_instance_rect(&h), [50.0, 40.0, 90.0, 60.0]);
+
+        let small = LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0));
+        assert!(
+            h.tree
+                .set_canvas(node, canvas_with_local_quad(small, small)),
+            "Canvas 内容必须替换成功"
+        );
+        h.mark_paint(node);
+        let _ = h.paint();
+        assert_eq!(only_instance_rect(&h), [50.0, 40.0, 20.0, 20.0]);
+
+        let damage = h.damage.rects().to_vec();
+        assert!(
+            damage_covers(&damage, DeviceRect::new(dp(139), dp(99), dp(140), dp(100))),
+            "收缩后的 damage 必须覆盖旧内容的右下角：{damage:?}"
+        );
+    }
+
+    #[test]
+    fn a_canvas_with_content_outside_its_declared_bounds_damages_the_actual_content() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let declared = LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0));
+        let overflowing = LogicalRect::new(px(40.0), px(0.0), px(30.0), px(20.0));
+        let node = NodeBuilder::canvas(canvas_with_local_quad(declared, overflowing))
+            .style(fixed_style(20.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(50.0), px(40.0), px(20.0), px(20.0)),
+        );
+        let _ = h.paint();
+        let old_extent = painted_bounds(&h, node);
+        assert!(
+            old_extent.max().x >= px(120.0),
+            "Canvas 的 extent 必须并集内部图元的实际外延（声明 bounds 只有 20 宽）：{old_extent:?}"
+        );
+
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(200.0), px(40.0), px(20.0), px(20.0)),
+        );
+        h.mark_paint(node);
+        let report = h.paint();
+        assert!(!report.damage.full);
+        let new_extent = painted_bounds(&h, node);
+        let damage = h.damage.rects().to_vec();
+        assert_damage_covers_extent(&damage, old_extent, "越界内容旧位置");
+        assert_damage_covers_extent(&damage, new_extent, "越界内容新位置");
+    }
+
+    fn register_span_geometry(store: &mut GeometryStore, bounds: LogicalRect) -> GeometryId {
+        let points = [
+            [0.0f32, 0.0, -1.0],
+            [bounds.size.width.value(), 0.0, -1.0],
+            [0.0, bounds.size.height.value(), -1.0],
+        ];
+        let vertex_bytes: Vec<u8> = points
+            .iter()
+            .flat_map(|point| point.iter().flat_map(|value| value.to_ne_bytes()))
+            .collect();
+        store
+            .insert(GeometryDesc {
+                vertex_bytes: bytes::Bytes::from(vertex_bytes),
+                index_bytes: bytes::Bytes::from_static(&[0u8, 0, 1, 0, 2, 0]),
+                vertex_stride: 12,
+                index_type: IndexType::U16,
+                topology: Topology::TriangleList,
+                bounds,
+                pipeline: GeometryPipeline::Ui,
+            })
+            .expect("注册几何")
+    }
+
+    #[test]
+    fn a_canvas_clip_tightens_a_huge_geometry_extent_to_the_canvas_box() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let id = register_span_geometry(
+            &mut h.geometry,
+            LogicalRect::new(px(0.0), px(0.0), px(10_000.0), px(5_000.0)),
+        );
+        let canvas_rect = LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0));
+        let mut canvas = Canvas::new(canvas_rect);
+        assert!(canvas.push_clip(ClipRect {
+            rect: canvas_rect,
+            corner_radius: [px(0.0); 4],
+        }));
+        canvas.push_geometry(GeometryDraw {
+            id,
+            transform: Transform::IDENTITY,
+            color: Color::WHITE,
+            range: crate::paint::geometry::FULL_INDEX_RANGE,
+        });
+        assert!(canvas.pop_clip());
+        let node = NodeBuilder::canvas(canvas)
+            .style(fixed_style(200.0, 100.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        let node_box = LogicalRect::new(px(40.0), px(30.0), px(200.0), px(100.0));
+        set_layout(&mut h.tree, node, node_box);
+        let report = h.paint();
+        assert!(
+            !report.damage.full,
+            "裁剪后的巨大 Geometry extent 不得把帧升级为 Full：{:?}",
+            h.damage.rects()
+        );
+        assert_eq!(
+            painted_bounds(&h, node),
+            node_box,
+            "Canvas 内 clip 必须把巨大 Geometry 的 extent 收紧到画布盒"
+        );
+    }
+
+    #[test]
+    fn a_zoomed_map_style_canvas_redraw_stays_local() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let id = register_span_geometry(
+            &mut h.geometry,
+            LogicalRect::new(px(0.0), px(0.0), px(20_000.0), px(10_000.0)),
+        );
+        let canvas_rect = LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0));
+        let mut canvas = Canvas::new(canvas_rect);
+        canvas.push_quad(Quad {
+            bounds: canvas_rect,
+            corner_radius: [px(0.0); 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        });
+        assert!(canvas.push_clip(ClipRect {
+            rect: canvas_rect,
+            corner_radius: [px(0.0); 4],
+        }));
+        canvas.push_geometry(GeometryDraw {
+            id,
+            transform: Transform::scale(2.0, 2.0),
+            color: Color::WHITE,
+            range: crate::paint::geometry::FULL_INDEX_RANGE,
+        });
+        assert!(canvas.pop_clip());
+        let node = NodeBuilder::canvas(canvas)
+            .style(fixed_style(200.0, 100.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        let node_box = LogicalRect::new(px(40.0), px(30.0), px(200.0), px(100.0));
+        set_layout(&mut h.tree, node, node_box);
+
+        let report = h.paint();
+        assert!(
+            !report.damage.full,
+            "地图风格画布（大 AABB + clip + zoom）首绘不得整帧：{:?}",
+            h.damage.rects()
+        );
+        assert_damage_covers_extent(h.damage.rects(), node_box, "地图画布节点盒");
+
+        h.mark_paint(node);
+        let report = h.paint_incremental(&[node]);
+        assert!(
+            !report.damage.full,
+            "地图 hover/pan/zoom/tick 重建 lane 的增量帧不得整帧：{:?}",
+            h.damage.rects()
+        );
+    }
+
+    #[test]
+    fn a_geometry_draw_range_narrows_the_canvas_content_extent() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let id = h
+            .geometry
+            .insert(long_geometry(4096 + 10))
+            .expect("注册几何");
+        let snapshot = h.geometry.snapshot_arc(id).expect("几何快照");
+        assert!(snapshot.chunks().len() >= 2, "前置：几何必须切成多块");
+        let chunk0 = snapshot.chunk(0).expect("块 0").bounds;
+        let all = snapshot
+            .chunks()
+            .iter()
+            .fold(LogicalRect::default(), |bounds, meta| {
+                bounds.union(meta.bounds)
+            });
+        assert!(
+            chunk0.max().y < all.max().y,
+            "前置：块 0 的 AABB 必须小于整体：{chunk0:?} vs {all:?}"
+        );
+
+        let canvas_rect = LogicalRect::new(px(0.0), px(0.0), px(200.0), px(200.0));
+        let canvas_with = |range: std::ops::Range<u32>| {
+            let mut canvas = Canvas::new(canvas_rect);
+            canvas.push_geometry(GeometryDraw {
+                id,
+                transform: Transform::IDENTITY,
+                color: Color::WHITE,
+                range,
+            });
+            canvas
+        };
+        let full = NodeBuilder::canvas(canvas_with(crate::paint::geometry::FULL_INDEX_RANGE))
+            .style(fixed_style(8.0, 8.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        let ranged = NodeBuilder::canvas(canvas_with(0..4096))
+            .style(fixed_style(8.0, 8.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        let node_box = LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0));
+        set_layout(&mut h.tree, full, node_box);
+        set_layout(&mut h.tree, ranged, node_box);
+
+        let _ = h.paint();
+        assert_eq!(
+            painted_bounds(&h, ranged),
+            chunk0,
+            "range 未命中的块不得计入 Canvas extent"
+        );
+        assert_eq!(
+            painted_bounds(&h, full),
+            all,
+            "全 range 的 extent 必须并集所有绘制块"
+        );
+    }
+
+    #[test]
+    fn a_layout_only_geometry_move_damages_the_old_extent_and_the_new_box() {
+        let mut h = Harness::new();
+        let id = h.geometry.insert(long_geometry(3)).expect("注册几何");
+        let root = h.tree.root();
+        let node = NodeBuilder::geometry(id)
+            .style(fixed_style(100.0, 100.0))
+            .paint(with_white())
+            .build(&mut h.tree, root)
+            .expect("挂载几何节点");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(40.0), px(40.0), px(100.0), px(100.0)),
+        );
+        let _ = h.paint();
+        let old_extent = painted_bounds(&h, node);
+
+        let new_bounds = LogicalRect::new(px(200.0), px(120.0), px(100.0), px(100.0));
+        set_layout(&mut h.tree, node, new_bounds);
+        h.mark_paint(node);
+        let report = h.paint();
+        assert!(!report.damage.full, "几何节点只动布局不得整帧");
+        let new_extent = painted_bounds(&h, node);
+        assert_eq!(
+            new_extent.intersect(new_bounds),
+            new_bounds,
+            "新 extent 必须包含新布局位置的节点盒：{new_extent:?}"
+        );
+        let old_box = LogicalRect::new(px(40.0), px(40.0), px(100.0), px(100.0));
+        let chunk_bounds = h
+            .geometry
+            .snapshot_arc(id)
+            .expect("几何快照")
+            .chunk(0)
+            .expect("块 0")
+            .bounds;
+        let damage = h.damage.rects().to_vec();
+        assert_damage_covers_extent(&damage, old_box, "几何节点旧布局位置的装饰盒");
+        assert_damage_covers_extent(&damage, new_bounds, "几何节点新布局位置的装饰盒");
+        assert_damage_covers_extent(&damage, chunk_bounds, "几何块内容");
+        assert!(
+            old_extent.intersect(old_box) == old_box,
+            "旧 extent 必须包含旧布局位置的节点盒：{old_extent:?}"
+        );
+    }
+
+    #[test]
+    fn canvas_content_snaps_to_physical_pixels_at_125_percent() {
+        let mut h = Harness::with_scale(1.25);
+        let root = h.tree.root();
+        let local = LogicalRect::new(px(0.0), px(0.0), px(20.0), px(12.0));
+        let node = NodeBuilder::canvas(canvas_with_local_quad(
+            local,
+            LogicalRect::new(px(0.5), px(0.5), px(10.0), px(6.0)),
+        ))
+        .style(fixed_style(20.0, 12.0))
+        .build(&mut h.tree, root)
+        .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(10.0), px(4.0), px(20.0), px(12.0)),
+        );
+
+        let _ = h.paint();
+        let rect = only_instance_rect(&h);
+        assert_eq!(
+            rect,
+            [13.0, 6.0, 13.0, 7.0],
+            "1.25 DPR 下物理边必须取整：{rect:?}"
+        );
+        assert!(rect.iter().all(|value| value.fract() == 0.0));
+    }
+
+    fn register_triangle_geometry(store: &mut GeometryStore, bounds: LogicalRect) -> GeometryId {
+        let points = [[0.0f32, 0.0, -1.0], [20.0, 0.0, -1.0], [0.0, 12.0, -1.0]];
+        let vertex_bytes: Vec<u8> = points
+            .iter()
+            .flat_map(|point| point.iter().flat_map(|value| value.to_ne_bytes()))
+            .collect();
+        store
+            .insert(GeometryDesc {
+                vertex_bytes: bytes::Bytes::from(vertex_bytes),
+                index_bytes: bytes::Bytes::from_static(&[0u8, 0, 1, 0, 2, 0]),
+                vertex_stride: 12,
+                index_type: IndexType::U16,
+                topology: Topology::TriangleList,
+                bounds,
+                pipeline: GeometryPipeline::Ui,
+            })
+            .expect("注册三角形几何")
+    }
+
+    fn encoded_geometry_op_bounds(harness: &Harness) -> Vec<(GeometryId, DeviceRect)> {
+        let mut encoder = InstanceEncoder::new();
+        let buffer = encoder
+            .encode(
+                &harness.scene,
+                harness.scale,
+                ColorResolver,
+                &harness.geometry,
+            )
+            .expect("编码");
+        buffer
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                crate::paint::instance::FrameOp::Geometry { index, bounds, .. } => buffer
+                    .geometry()
+                    .get(*index as usize)
+                    .map(|draw| (draw.id, *bounds)),
+                crate::paint::instance::FrameOp::Instances { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_path_inside_a_canvas_keeps_local_op_bounds_at_125_percent() {
+        let mut h = Harness::with_scale(1.25);
+        let root = h.tree.root();
+        let local = LogicalRect::new(px(0.0), px(0.0), px(20.0), px(12.0));
+        let unclipped_id = register_triangle_geometry(&mut h.geometry, local);
+        let mut unclipped = Canvas::new(local);
+        unclipped.push_path(Path {
+            bounds: local,
+            geometry: unclipped_id,
+            fill: Color::WHITE,
+        });
+        let unclipped_node = NodeBuilder::canvas(unclipped)
+            .style(fixed_style(20.0, 12.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            unclipped_node,
+            LogicalRect::new(px(10.0), px(4.0), px(20.0), px(12.0)),
+        );
+
+        let clipped_id = register_triangle_geometry(&mut h.geometry, local);
+        let mut clipped = Canvas::new(local);
+        assert!(clipped.push_clip(ClipRect {
+            rect: local,
+            corner_radius: [px(0.0); 4],
+        }));
+        clipped.push_path(Path {
+            bounds: local,
+            geometry: clipped_id,
+            fill: Color::WHITE,
+        });
+        assert!(clipped.pop_clip());
+        let clipped_node = NodeBuilder::canvas(clipped)
+            .style(fixed_style(20.0, 12.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            clipped_node,
+            LogicalRect::new(px(300.0), px(200.0), px(20.0), px(12.0)),
+        );
+
+        let _ = h.paint();
+        let bounds: ahash::HashMap<GeometryId, DeviceRect> =
+            encoded_geometry_op_bounds(&h).into_iter().collect();
+        let check = |id: GeometryId, expected: (i32, i32, i32, i32), label: &str| {
+            let rect = bounds
+                .get(&id)
+                .copied()
+                .expect("每条 Path 必须有一个几何 op");
+            assert_eq!(
+                (
+                    rect.x0.value(),
+                    rect.y0.value(),
+                    rect.x1.value(),
+                    rect.y1.value()
+                ),
+                expected,
+                "{label}：op 可见范围必须由局部 AABB 加一次节点偏移得到（不是两次）"
+            );
+        };
+        check(unclipped_id, (11, 4, 39, 21), "无裁剪画布");
+        check(clipped_id, (374, 249, 401, 266), "带裁剪画布");
+    }
+
+    fn painted_bounds(harness: &Harness, node: NodeId) -> LogicalRect {
+        harness
+            .tree
+            .painted_extent(node)
+            .expect("已绘制节点必须记录 painted_extent")
+            .layout_bounds()
+    }
+
+    fn extent_probe_points(extent: LogicalRect) -> [LogicalPoint; 5] {
+        let max = extent.max();
+        let center = LogicalPoint::new(
+            extent.origin.x + extent.size.width / 2.0,
+            extent.origin.y + extent.size.height / 2.0,
+        );
+        [
+            LogicalPoint::new(extent.origin.x + px(0.5), extent.origin.y + px(0.5)),
+            LogicalPoint::new(max.x - px(0.5), extent.origin.y + px(0.5)),
+            LogicalPoint::new(extent.origin.x + px(0.5), max.y - px(0.5)),
+            LogicalPoint::new(max.x - px(0.5), max.y - px(0.5)),
+            center,
+        ]
+    }
+
+    fn damage_has_logical_point(damage: &[DeviceRect], point: LogicalPoint) -> bool {
+        let x = point.x.value().floor() as i32;
+        let y = point.y.value().floor() as i32;
+        damage.iter().any(|rect| {
+            rect.x0.value() <= x
+                && x < rect.x1.value()
+                && rect.y0.value() <= y
+                && y < rect.y1.value()
+        })
+    }
+
+    fn assert_damage_covers_extent(damage: &[DeviceRect], extent: LogicalRect, label: &str) {
+        for point in extent_probe_points(extent) {
+            assert!(
+                damage_has_logical_point(damage, point),
+                "{label} extent {extent:?} 的角点 {point:?} 必须被 damage 覆盖：{damage:?}"
+            );
+        }
+    }
+
+    fn shadowed() -> PaintSpec {
+        PaintSpec {
+            background: Color::WHITE,
+            shadows: Shadows::from(ShadowSpec {
+                offset: LogicalPoint::new(px(0.0), px(8.0)),
+                blur: px(10.0),
+                spread: px(0.0),
+                color: Color::BLACK,
+            }),
+            ..PaintSpec::default()
+        }
+    }
+
+    #[test]
+    fn moving_a_shadowed_focused_node_damages_old_and_new_painted_extents() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let node = NodeBuilder::boxed()
+            .style(fixed_style(40.0, 20.0))
+            .paint(shadowed())
+            .focus_ring(FocusRing::new(px(2.0), px(3.0), Color::BLACK))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        h.focused = Some(node);
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(20.0), px(10.0), px(40.0), px(20.0)),
+        );
+        let _ = h.paint();
+        let old_extent = painted_bounds(&h, node);
+        assert!(
+            old_extent.origin.x <= px(17.0) && old_extent.origin.y <= px(7.0),
+            "extent 必须包含焦点环 outset：{old_extent:?}"
+        );
+        assert!(
+            old_extent.max().y >= px(54.0),
+            "extent 必须包含阴影 blur 外溢（盒底 30 + offset 8 + pad 16）：{old_extent:?}"
+        );
+
+        let moved = LogicalRect::new(px(220.0), px(140.0), px(40.0), px(20.0));
+        set_layout(&mut h.tree, node, moved);
+        h.mark_paint(node);
+        let report = h.paint();
+        assert!(report.rebuilt >= 1, "移动必须重建 lane");
+        assert!(!report.damage.full, "局部移动不得退化为整帧");
+        let new_extent = painted_bounds(&h, node);
+        assert!(
+            new_extent.origin.y >= px(130.0),
+            "移动后 extent 必须跟着新位置更新：{new_extent:?}"
+        );
+
+        let damage = h.damage.rects().to_vec();
+        assert_damage_covers_extent(&damage, old_extent, "旧");
+        assert_damage_covers_extent(&damage, new_extent, "新");
+    }
+
+    #[test]
+    fn moving_a_canvas_node_damages_the_previous_content_extent() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let content = LogicalRect::new(px(0.0), px(0.0), px(90.0), px(60.0));
+        let node = NodeBuilder::canvas(canvas_with_local_quad(content, content))
+            .style(fixed_style(20.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(50.0), px(40.0), px(20.0), px(20.0)),
+        );
+        let _ = h.paint();
+        let old_extent = painted_bounds(&h, node);
+        assert!(
+            old_extent.size.width >= px(90.0) && old_extent.size.height >= px(60.0),
+            "Canvas 的 extent 必须是画布内容外延，不是节点盒：{old_extent:?}"
+        );
+
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(240.0), px(180.0), px(20.0), px(20.0)),
+        );
+        h.mark_paint(node);
+        let report = h.paint();
+        assert!(!report.damage.full, "Canvas 移动不得退化为整帧");
+        let new_extent = painted_bounds(&h, node);
+        let damage = h.damage.rects().to_vec();
+        assert_damage_covers_extent(&damage, old_extent, "旧 Canvas");
+        assert_damage_covers_extent(&damage, new_extent, "新 Canvas");
+    }
+
+    #[test]
+    fn moving_a_geometry_transform_damages_old_and_new_chunk_extents() {
+        let mut h = Harness::new();
+        let id = h
+            .geometry
+            .insert(long_geometry(4096 + 10))
+            .expect("注册几何");
+        let node = mount_geometry(&mut h, id, Clip::None);
+        let snapshot = h.geometry.snapshot_arc(id).expect("快照");
+        let mut chunks = LogicalRect::default();
+        for chunk in 0..snapshot.chunks().len() {
+            chunks = chunks.union(snapshot.chunk(chunk as u32).expect("块").bounds);
+        }
+        assert!(!chunks.is_empty(), "前置：块 AABB 非空");
+        let bounds = h.tree.get(node).expect("节点").layout().bounds;
+        let _ = h.paint();
+        let old_extent = painted_bounds(&h, node);
+        assert_eq!(
+            old_extent,
+            bounds.union(chunks),
+            "几何 extent = 节点盒 ∪ 每块 AABB"
+        );
+
+        let shift = LogicalPoint::new(px(120.0), px(80.0));
+        let extra = old_extent.union(old_extent.translate(shift));
+        h.tree
+            .set_geometry_transform(
+                node,
+                crate::math::Transform::translate(shift.x, shift.y),
+                extra,
+            )
+            .expect("设置几何变换");
+        let report = h.paint();
+        assert!(!report.damage.full, "几何内容移动不得退化为整帧");
+        let new_extent = painted_bounds(&h, node);
+        assert_eq!(
+            new_extent,
+            bounds.union(chunks.translate(shift)),
+            "变换后的 extent 必须跟随新块 AABB"
+        );
+        let damage = h.damage.rects().to_vec();
+        assert_damage_covers_extent(&damage, old_extent, "旧几何块");
+        assert_damage_covers_extent(&damage, new_extent, "新几何块");
+    }
+
+    #[test]
+    fn lane_reuse_keeps_the_painted_extent_and_hiding_clears_it() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let node = NodeBuilder::boxed()
+            .style(fixed_style(30.0, 20.0))
+            .paint(PaintSpec {
+                background: Color::WHITE,
+                shadows: Shadows::from(ShadowSpec {
+                    offset: LogicalPoint::new(px(0.0), px(4.0)),
+                    blur: px(8.0),
+                    spread: px(0.0),
+                    color: Color::BLACK,
+                }),
+                ..PaintSpec::default()
+            })
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        set_layout(
+            &mut h.tree,
+            node,
+            LogicalRect::new(px(40.0), px(30.0), px(30.0), px(20.0)),
+        );
+        let _ = h.paint();
+        let extent = painted_bounds(&h, node);
+
+        let stable = h.paint();
+        assert_eq!(stable.rebuilt, 0, "稳定帧必须复用 lane");
+        assert_eq!(
+            painted_bounds(&h, node),
+            extent,
+            "lane 复用时 extent 必须保留"
+        );
+
+        let _ = h.tree.set_style_patch_for_test(
+            node,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        h.mark_paint(node);
+        let _ = h.paint();
+        assert!(
+            h.tree.painted_extent(node).is_none(),
+            "hide_subtree 必须清空 extent"
+        );
+        let damage = h.damage.rects().to_vec();
+        assert_damage_covers_extent(&damage, extent, "隐藏前的");
+    }
+
+    #[test]
+    fn hiding_a_geometry_node_clears_its_chunk_extent_and_damages_it() {
+        let mut h = Harness::new();
+        let id = h.geometry.insert(long_geometry(3)).expect("注册几何");
+        let node = mount_geometry(&mut h, id, Clip::None);
+        let _ = h.paint();
+        let extent = painted_bounds(&h, node);
+
+        let _ = h.tree.set_style_patch_for_test(
+            node,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        h.mark_paint(node);
+        let report = h.paint();
+        assert!(!report.damage.full, "隐藏几何节点不得退化为整帧");
+        assert!(
+            h.tree.painted_extent(node).is_none(),
+            "隐藏几何节点必须清空 extent"
+        );
+        let damage = h.damage.rects().to_vec();
+        assert_damage_covers_extent(&damage, extent, "隐藏的几何块");
+    }
+
+    #[test]
+    fn removing_a_never_painted_node_falls_back_to_the_layout_bounds() {
+        let mut h = Harness::new();
+        let root = h.tree.root();
+        let node = NodeBuilder::boxed()
+            .style(fixed_style(30.0, 20.0))
+            .build(&mut h.tree, root)
+            .expect("挂载");
+        let bounds = LogicalRect::new(px(60.0), px(40.0), px(30.0), px(20.0));
+        set_layout(&mut h.tree, node, bounds);
+        assert!(
+            h.tree.painted_extent(node).is_none(),
+            "从未绘制过 ⇒ 没有 extent"
+        );
+
+        h.tree.remove(node).expect("移除");
+        let _ = h.paint();
+        let damage = h.damage.rects().to_vec();
+        assert_damage_covers_extent(&damage, bounds, "回退的 layout.bounds");
+    }
+
     const INITIAL_ATLAS_GENERATION: u32 = 1;
 
     fn canvas_with_text(content: TextContent, origin: LogicalPoint) -> Canvas {
@@ -2671,6 +3876,11 @@ mod tests {
         let Some(Primitive::Canvas(rendered)) = primitives.first() else {
             panic!("the canvas is pushed as one primitive");
         };
+        assert_eq!(
+            rendered.offset,
+            h.tree.get(node).expect("节点存在").layout().bounds.origin,
+            "文本画布按节点屏幕原点平移，字形位置保持局部坐标"
+        );
         assert!(!rendered.primitives().is_empty());
         let Some(Primitive::GlyphRun(run)) = rendered.primitives().first() else {
             panic!("the recipe is replaced by a glyph run");

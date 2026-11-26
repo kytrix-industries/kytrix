@@ -261,6 +261,36 @@ pub enum EngineError {
         window: WindowId,
         cause: WindowIconCause,
     },
+
+    #[error("pixel harness precondition failed: {cause}")]
+    PixelHarness { cause: PixelHarnessCause },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelHarnessCause {
+    NoCommittedFrame,
+    SurfaceResized,
+    NotInlineWindow,
+    UnrepresentableSurface,
+}
+
+impl std::fmt::Display for PixelHarnessCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCommittedFrame => {
+                formatter.write_str("no committed frame is available to replay")
+            }
+            Self::SurfaceResized => {
+                formatter.write_str("the target surface was resized after the persistent target")
+            }
+            Self::NotInlineWindow => {
+                formatter.write_str("the window has no inline instance buffer (headless only)")
+            }
+            Self::UnrepresentableSurface => {
+                formatter.write_str("the window surface does not fit a readback target")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,6 +421,9 @@ mod tests {
             EngineError::WindowIcon {
                 window: crate::window::WindowId::for_test(8),
                 cause: WindowIconCause::DecodeFailed,
+            },
+            EngineError::PixelHarness {
+                cause: PixelHarnessCause::SurfaceResized,
             },
         ]
     }
@@ -735,6 +768,21 @@ mod tests {
         .to_string();
         assert!(too_large.contains("2048x4096"), "{too_large}");
         assert!(too_large.contains("1024"), "{too_large}");
+    }
+
+    #[test]
+    fn pixel_harness_display_names_the_precondition() {
+        let cases = [
+            (PixelHarnessCause::NoCommittedFrame, "committed frame"),
+            (PixelHarnessCause::SurfaceResized, "resized"),
+            (PixelHarnessCause::NotInlineWindow, "headless"),
+            (PixelHarnessCause::UnrepresentableSurface, "readback target"),
+        ];
+        for (cause, fragment) in cases {
+            let text = EngineError::PixelHarness { cause }.to_string();
+            assert!(text.contains("pixel harness"), "{text}");
+            assert!(text.contains(fragment), "{cause:?}: {text}");
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ use crate::{
         input::{self as kit_input, InputNode, InputSpec, InputState},
         layer::{Band, Layer},
         overlay::{
-            Alignment, Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y,
+            Alignment, Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayError,
             OverlayOptions, OverlaySurface, Placement, Side,
         },
         size::UnifiedSize,
@@ -802,12 +802,11 @@ impl ColorPicker {
         self.inner.overlay.open_state()
     }
 
-    pub fn open(&self, app: &mut App, window: WindowId) -> bool {
+    pub fn open(&self, app: &mut App, window: WindowId) -> Result<bool, OverlayError> {
         if self.inner.overlay.is_open(app) {
-            return false;
+            return Ok(false);
         }
-        self.open_panel(app, window);
-        self.inner.overlay.is_open(app)
+        self.open_panel(app, window)
     }
 
     pub fn close(&self, app: &mut App) -> bool {
@@ -1095,7 +1094,9 @@ impl ColorPicker {
             return;
         }
 
-        self.open_panel(app, window);
+        if self.open_panel(app, window).is_err() {
+            self.inner.overlay.close_now(app);
+        }
     }
 
     fn on_palette(&self, ctx: &mut ActionCtx<'_>) {
@@ -1310,35 +1311,39 @@ impl ColorPicker {
         body(panel.as_ref().map(|panel| &panel.input))
     }
 
-    fn open_panel(&self, app: &mut App, window: WindowId) {
+    fn open_panel(&self, app: &mut App, window: WindowId) -> Result<bool, OverlayError> {
         let inner = &self.inner;
         if inner.overlay.is_open(app) {
-            return;
+            return Ok(false);
         }
         let Some(trigger) = inner.trigger.borrow().map(|view| view.node) else {
-            return;
+            return Ok(false);
         };
         let panel_label = app.read(&inner.labels).panel.clone();
         inner.overlay.set_a11y(OverlayA11y::dialog(panel_label));
         let opened = inner
             .overlay
-            .open(app, window, Anchor::node(trigger), |_, _| Ok(()))
-            .unwrap_or(false);
+            .open(app, window, Anchor::node(trigger), |_, _| Ok(()))?;
         if !opened {
-            return;
+            return Ok(false);
         }
         let Some(panel) = inner.overlay.panel_node() else {
-            return;
-        };
-        let built = self.build_panel(app, window, panel).is_ok();
-        if !built {
             inner.overlay.close_now(app);
-            return;
+            return Ok(false);
+        };
+        if let Err(error) = self.build_panel(app, window, panel) {
+            inner.overlay.close_now(app);
+            return Err(error.into());
+        }
+        if let Err(error) = inner.overlay.measure(app) {
+            inner.overlay.close_now(app);
+            return Err(error.into());
         }
         let callback = inner.open_callback.borrow().clone();
         if let Some(callback) = callback {
             callback(app);
         }
+        Ok(true)
     }
 
     fn build_panel(
@@ -1374,6 +1379,7 @@ impl ColorPicker {
                     .flex_col()
                     .gap(px(8.0))
                     .width(px(PANEL_CONTENT_WIDTH))
+                    .overflow_hidden()
                     .build(),
             )
             .build(tree, panel_node)?;
@@ -1677,6 +1683,7 @@ impl ColorPicker {
                 StyleBuilder::new()
                     .relative()
                     .size(px(PALETTE_SIZE), px(PALETTE_SIZE))
+                    .overflow_hidden()
                     .build(),
             )
             .tab_stop(false)
@@ -1944,7 +1951,7 @@ impl ColorPicker {
         }
 
         let color = *app.read(&inner.color);
-        let Some(bounds) = node_bounds(app, window, view.well) else {
+        let Some(bounds) = node_canvas_bounds(app, window, view.well) else {
             return Ok(changed);
         };
         if inner.last_trigger_color.get() == Some(color)
@@ -2080,7 +2087,7 @@ impl ColorPicker {
         match &mut panel.body_view {
             BodyView::Palette(view) => {
                 let hovered = *app.read(&self.inner.hovered);
-                let Some(bounds) = node_bounds(app, window, view.canvas) else {
+                let Some(bounds) = node_canvas_bounds(app, window, view.canvas) else {
                     return Ok(changed);
                 };
                 if view.last == Some((bounds, hovered)) {
@@ -2095,7 +2102,7 @@ impl ColorPicker {
                 for channel in HslaChannel::ALL {
                     let track = &mut view.tracks[channel.index()];
                     let value = channel.value(base);
-                    let Some(bounds) = node_bounds(app, window, track.canvas) else {
+                    let Some(bounds) = node_canvas_bounds(app, window, track.canvas) else {
                         continue;
                     };
                     if track.last == Some((bounds, base, value)) {
@@ -2125,7 +2132,7 @@ impl ColorPicker {
         let color = preview.unwrap_or_else(|| self.display_color(app));
         let window = panel.window;
         let appearance = panel.appearance;
-        let Some(bounds) = node_bounds(app, window, panel.well) else {
+        let Some(bounds) = node_canvas_bounds(app, window, panel.well) else {
             return Ok(false);
         };
         if panel.well_last == Some((bounds, color)) {
@@ -2189,10 +2196,10 @@ fn recipe_for(
     }
 }
 
-fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<LogicalRect> {
+fn node_canvas_bounds(app: &App, window: WindowId, node: NodeId) -> Option<LogicalRect> {
     app.window(window)
         .and_then(|target| target.tree().get(node).ok())
-        .map(|node| node.layout().bounds)
+        .map(|node| LogicalRect::from_origin_size(LogicalPoint::ZERO, node.layout().bounds.size))
 }
 
 fn apply_canvas(
@@ -2885,7 +2892,7 @@ mod ui_tests {
             id::NodeId,
             tree::{NodeKind, NodeTree},
         },
-        paint::canvas::Canvas,
+        paint::{canvas::Canvas, style::Clip},
         test_support::app::TestApp,
     };
 
@@ -3296,6 +3303,33 @@ mod ui_tests {
     }
 
     #[test]
+    fn the_first_visible_panel_frame_matches_the_settled_rect() {
+        let mut harness = Harness::new();
+        assert!(
+            harness
+                .picker
+                .open(harness.app.app_mut(), harness.window)
+                .expect("打开取色器")
+        );
+        let _ = harness.app.drain().expect("打开帧");
+        let _ = harness.picker.sync(harness.app.app_mut()).expect("sync");
+        let _ = harness.app.drain().expect("首个可见帧");
+        assert!(
+            harness.picker.overlay().revealed(harness.app.app()),
+            "首个可见帧必须已经 reveal"
+        );
+        let panel = harness
+            .picker
+            .overlay()
+            .panel_node()
+            .expect("面板节点已挂载");
+        let first = harness.bounds(panel);
+        harness.settle();
+        let settled = harness.bounds(panel);
+        assert_eq!(first, settled, "首个可见帧面板 rect 必须等于稳定帧 rect");
+    }
+
+    #[test]
     fn the_trigger_should_be_square_at_every_unified_size() {
         for (size, edge) in [
             (UnifiedSize::Small, 20.0),
@@ -3324,6 +3358,45 @@ mod ui_tests {
             .overlay_node()
             .map(|node| harness.app.probe().bounds(node));
         let _ = visual;
+    }
+
+    fn clip_of(harness: &Harness, suffix: &str) -> Clip {
+        let tree = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .tree();
+        let mut stack = vec![tree.root()];
+        while let Some(node) = stack.pop() {
+            if tree.debug_id(node).is_some_and(|id| id.ends_with(suffix)) {
+                return tree.get(node).expect("节点").style().clip;
+            }
+            if let Ok(entry) = tree.get(node) {
+                stack.extend(entry.children().iter().copied());
+            }
+        }
+        panic!("找不到节点 {suffix}");
+    }
+
+    #[test]
+    fn the_panel_content_and_palette_clip_their_children() {
+        let mut harness = Harness::new();
+        harness.open();
+        assert_eq!(
+            clip_of(&harness, ":panel.content"),
+            Clip::Bounds,
+            "内容根必须裁剪子树（Canvas 契约修好后仍是防御）"
+        );
+        assert_eq!(
+            clip_of(&harness, ":palette"),
+            Clip::Bounds,
+            "色板根必须裁剪画布与绝对命中格"
+        );
+        assert!(
+            harness.palette().expect("色板页").0.size.width > px(0.0),
+            "裁剪不得把色板布局打成零尺寸"
+        );
     }
 
     #[test]
@@ -3357,14 +3430,20 @@ mod ui_tests {
         assert_eq!(opened.get(), 1, "关闭不触发 on_open");
 
         assert!(
-            harness.picker.open(harness.app.app_mut(), harness.window),
+            harness
+                .picker
+                .open(harness.app.app_mut(), harness.window)
+                .expect("程序化打开"),
             "程序化打开返回 true"
         );
         harness.pump_times(1);
         assert!(harness.picker.is_open(harness.app.app()));
         assert_eq!(opened.get(), 2, "程序化打开同样触发 on_open");
         assert!(
-            !harness.picker.open(harness.app.app_mut(), harness.window),
+            !harness
+                .picker
+                .open(harness.app.app_mut(), harness.window)
+                .expect("已打开时程序化 open 不报错"),
             "已打开时程序化 open 是 no-op"
         );
         harness.pump_times(1);

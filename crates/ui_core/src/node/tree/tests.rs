@@ -106,6 +106,51 @@ fn remove_unmounts_subtree() {
 }
 
 #[test]
+fn remove_clears_the_extent_and_baked_screen_bounds_side_tables() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let node = boxed(&mut tree, root);
+    let index = node.index() as usize;
+    let rect = LogicalRect::new(px(4.0), px(6.0), px(20.0), px(10.0));
+    tree.set_painted_extent(node, crate::paint::extent::PaintedExtent::new(rect));
+    tree.set_baked_screen_bounds(node, rect);
+    assert!(tree.painted_extents.get(index).copied().flatten().is_some());
+    assert!(
+        tree.baked_screen_bounds
+            .get(index)
+            .copied()
+            .flatten()
+            .is_some()
+    );
+
+    tree.remove(node).expect("卸载成功");
+
+    assert!(
+        tree.painted_extents.get(index).copied().flatten().is_none(),
+        "remove 必须清空 painted_extents"
+    );
+    assert!(
+        tree.baked_screen_bounds
+            .get(index)
+            .copied()
+            .flatten()
+            .is_none(),
+        "remove 必须清空 baked_screen_bounds（与 painted_extents 对称）"
+    );
+
+    let reused = boxed(&mut tree, root);
+    assert_eq!(reused.index(), node.index(), "节点索引必须被复用");
+    assert!(tree.painted_extents.get(index).copied().flatten().is_none());
+    assert!(
+        tree.baked_screen_bounds
+            .get(index)
+            .copied()
+            .flatten()
+            .is_none()
+    );
+}
+
+#[test]
 fn remove_root_is_error() {
     let mut tree = NodeTree::new();
     let root = tree.root();
@@ -1006,30 +1051,32 @@ fn paint_closure_is_epoch_scoped() {
 }
 
 #[test]
-fn structure_and_scroll_epochs_force_the_next_full_frame() {
+fn structure_changes_keep_incremental_painting_and_scroll_registry_changes_force_full() {
     let mut tree = NodeTree::new();
     assert!(
-        !tree.paint_epoch_changed(),
-        "新树没有结构变化 ⇒ 代际判据不强制全量（首帧由 delta 的 full 与脏节点状态承担）"
+        !tree.structure_changed(),
+        "新树没有结构变化 ⇒ 不强制全量（首帧由 delta 的 full 与脏节点状态承担）"
     );
     tree.note_paint_frame(true, 1);
-    assert!(!tree.paint_epoch_changed(), "没有变化 ⇒ 允许增量");
+    assert!(!tree.structure_changed(), "没有变化 ⇒ 允许增量");
 
     let root = tree.root();
     let child = boxed(&mut tree, root);
-    assert!(tree.paint_epoch_changed(), "结构变化必须全量");
-    tree.note_paint_frame(true, 1);
-    assert!(!tree.paint_epoch_changed());
+    assert!(tree.structure_changed(), "结构变化必须被记录");
+    tree.note_paint_frame(false, 1);
+    assert!(
+        !tree.structure_changed(),
+        "结构变化允许增量绘制：结算后不得继续强制全量"
+    );
 
     tree.note_scroll_container(child);
-    assert!(tree.paint_epoch_changed(), "滚动容器登记必须全量");
+    assert!(tree.scroll_registry_changed(), "滚动容器登记必须降级为全量");
     tree.note_paint_frame(true, 2);
-    assert!(!tree.paint_epoch_changed());
+    assert!(!tree.scroll_registry_changed());
 
     tree.force_full_paint = true;
-    assert!(tree.paint_epoch_changed(), "强制全量标志必须被消费");
-    tree.note_paint_frame(true, 2);
-    assert!(!tree.paint_epoch_changed(), "强制标志只消费一次");
+    assert!(tree.take_force_full_paint(), "强制全量标志必须被消费");
+    assert!(!tree.take_force_full_paint(), "强制标志只消费一次");
 }
 
 #[test]

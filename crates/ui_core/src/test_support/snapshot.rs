@@ -7,7 +7,7 @@ use std::{
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, image::ImageFit},
     paint::{
         canvas::Canvas,
@@ -184,11 +184,28 @@ struct Palette {
     muted: Color,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotImage {
     pub width: u32,
     pub height: u32,
     pub rgba8: Vec<u8>,
+}
+
+impl fmt::Debug for SnapshotImage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in &self.rgba8 {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        formatter
+            .debug_struct("SnapshotImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("bytes", &self.rgba8.len())
+            .field("fnv1a", &hash)
+            .finish()
+    }
 }
 
 impl SnapshotImage {
@@ -930,9 +947,10 @@ fn build_image(app: &mut TestApp, root: NodeId, palette: &Palette) {
             .app_mut()
             .prepare_image_variant(window, icon, bounds.size, ImageFit::Fill)
             .expect("the native bitmap variant is always available");
-        let mut canvas = Canvas::new(bounds);
+        let local = LogicalRect::from_origin_size(LogicalPoint::ZERO, bounds.size);
+        let mut canvas = Canvas::new(local);
         canvas.push_image(Image {
-            bounds,
+            bounds: local,
             tile,
             modulation,
         });
@@ -1083,6 +1101,21 @@ mod tests {
             size: LogicalSize::new(px(10.0), px(10.0)),
             scale: DevicePixelRatio::new(scale).expect("scale"),
         }
+    }
+
+    #[test]
+    fn snapshot_image_debug_is_a_summary() {
+        let image = image(8, 8, [0xAB, 0xCD, 0xEF, 0xFF]);
+        let debug = format!("{image:?}");
+        assert!(debug.contains("SnapshotImage"), "{debug}");
+        assert!(debug.contains("fnv1a"), "{debug}");
+        assert!(debug.contains("bytes"), "{debug}");
+        assert!(
+            debug.len() < 200,
+            "Debug 必须是摘要，不得打印整幅像素缓冲：{} bytes",
+            debug.len()
+        );
+        assert!(!debug.contains("rgba8: ["), "{debug}");
     }
 
     #[test]

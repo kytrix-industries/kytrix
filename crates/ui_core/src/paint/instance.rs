@@ -542,6 +542,11 @@ impl InstanceBuffer {
         &self.ops
     }
 
+    #[cfg(test)]
+    pub(crate) fn instance_rects(&self) -> impl Iterator<Item = [f32; 4]> + '_ {
+        self.instances.iter().map(|instance| instance.bounds)
+    }
+
     pub(crate) fn geometry(&self) -> &[GeometryDrawGpu] {
         &self.geometry
     }
@@ -1532,37 +1537,41 @@ impl LaneEncoder<'_> {
         *self.state = ClipState::unbounded();
         self.saved.clear();
         for primitive in primitives {
-            self.encode_primitive(primitive)?;
+            self.encode_primitive(primitive, LogicalPoint::ZERO)?;
         }
         debug_assert_eq!(self.state.depth(), 0, "lane must be clip-balanced (C1)");
         self.flush_run();
         Ok(())
     }
 
-    fn encode_primitive(&mut self, primitive: &Primitive) -> Result<(), EngineError> {
+    fn encode_primitive(
+        &mut self,
+        primitive: &Primitive,
+        offset: LogicalPoint,
+    ) -> Result<(), EngineError> {
         match primitive {
-            Primitive::Clip(ClipOp::Push(rect)) => self.push_clip(*rect)?,
+            Primitive::Clip(ClipOp::Push(rect)) => self.push_clip(*rect, offset)?,
             Primitive::Clip(ClipOp::Pop) => self.pop_clip(),
             Primitive::Quad(quad) => {
                 if quad_visible(quad) {
-                    self.emit_quad(quad);
+                    self.emit_quad(quad, offset);
                 }
             }
             Primitive::Shadow(shadow) => {
                 if !shadow.color.is_transparent() {
-                    self.emit_shadow(shadow);
+                    self.emit_shadow(shadow, offset);
                 }
             }
             Primitive::Image(image) => {
                 if !image.modulation.is_transparent() && !image.bounds.is_empty() {
-                    self.emit_image(image);
+                    self.emit_image(image, offset);
                 }
             }
             Primitive::GlyphRun(run) => {
                 if !run.color.is_transparent() {
                     let color0 = self.colors.resolve(&self.resolver, run.color);
                     for glyph in &run.glyphs {
-                        self.emit_glyph(color0, glyph);
+                        self.emit_glyph(color0, glyph, offset);
                     }
                 }
             }
@@ -1572,7 +1581,7 @@ impl LaneEncoder<'_> {
                 let color = self.colors.resolve(&self.resolver, path.fill).to_array();
                 self.push_geometry_op(
                     path.geometry,
-                    Transform::IDENTITY,
+                    Transform::translate(offset.x, offset.y),
                     color,
                     crate::paint::geometry::FULL_INDEX_RANGE,
                     Some(path.bounds),
@@ -1581,12 +1590,21 @@ impl LaneEncoder<'_> {
             Primitive::Geometry(draw) => {
                 self.flush_run();
                 let color = self.colors.resolve(&self.resolver, draw.color).to_array();
-                self.push_geometry_op(draw.id, draw.transform, color, draw.range.clone(), None);
+                self.push_geometry_op(
+                    draw.id,
+                    draw.transform
+                        .then(Transform::translate(offset.x, offset.y)),
+                    color,
+                    draw.range.clone(),
+                    None,
+                );
             }
-            Primitive::Canvas(canvas) => {
+            Primitive::Canvas(draw) => {
                 let entry_depth = self.state.depth();
-                for inner in canvas.primitives() {
-                    self.encode_primitive(inner)?;
+                let canvas_offset =
+                    LogicalPoint::new(offset.x + draw.offset.x, offset.y + draw.offset.y);
+                for inner in draw.primitives() {
+                    self.encode_primitive(inner, canvas_offset)?;
                 }
                 debug_assert_eq!(
                     self.state.depth(),
@@ -1598,10 +1616,14 @@ impl LaneEncoder<'_> {
         Ok(())
     }
 
-    fn push_clip(&mut self, clip: crate::paint::primitive::ClipRect) -> Result<(), EngineError> {
+    fn push_clip(
+        &mut self,
+        clip: crate::paint::primitive::ClipRect,
+        offset: LogicalPoint,
+    ) -> Result<(), EngineError> {
         self.saved.push(self.state.clone());
         let factor = self.scale.factor();
-        let logical = clip.rect;
+        let logical = clip.rect.translate(offset);
         let rect = if logical.is_finite()
             && logical.size.width > LogicalPx::ZERO
             && logical.size.height > LogicalPx::ZERO
@@ -1848,8 +1870,8 @@ impl LaneEncoder<'_> {
         self.emitted_geometry_chunks += emitted;
     }
 
-    fn emit_quad(&mut self, quad: &crate::paint::primitive::Quad) {
-        let bounds = device_bounds(self.scale.to_device_rect(quad.bounds));
+    fn emit_quad(&mut self, quad: &crate::paint::primitive::Quad, offset: LogicalPoint) {
+        let bounds = device_bounds(self.scale.to_device_rect(quad.bounds.translate(offset)));
         if bounds[2] <= 0.0 || bounds[3] <= 0.0 {
             return;
         }
@@ -1898,10 +1920,10 @@ impl LaneEncoder<'_> {
         self.instances.push(instance);
     }
 
-    fn emit_shadow(&mut self, shadow: &crate::paint::primitive::Shadow) {
+    fn emit_shadow(&mut self, shadow: &crate::paint::primitive::Shadow, offset: LogicalPoint) {
         let bounds = self
             .scale
-            .to_physical_rect(shadow.rect.translate(shadow.offset))
+            .to_physical_rect(shadow.rect.translate(shadow.offset).translate(offset))
             .to_aabb();
         let blur = self.scale.to_physical(shadow.blur.max(LogicalPx::ZERO));
         let radii = crate::math::normalize_physical_corner_radius(
@@ -1927,7 +1949,7 @@ impl LaneEncoder<'_> {
         self.instances.push(instance);
     }
 
-    fn emit_image(&mut self, image: &crate::paint::primitive::Image) {
+    fn emit_image(&mut self, image: &crate::paint::primitive::Image, offset: LogicalPoint) {
         if image.bounds.is_empty() {
             return;
         }
@@ -1940,7 +1962,7 @@ impl LaneEncoder<'_> {
             return;
         }
         let page = image.tile.page.min(MAX_IMAGE_PAGES - 1);
-        let bounds = device_bounds(self.scale.to_device_rect(image.bounds));
+        let bounds = device_bounds(self.scale.to_device_rect(image.bounds.translate(offset)));
         let color0 = self.colors.resolve(&self.resolver, image.modulation);
         let instance = GpuPrimitive {
             bounds,
@@ -1964,6 +1986,7 @@ impl LaneEncoder<'_> {
         &mut self,
         color0: LinearPremulRgba,
         glyph: &crate::paint::primitive::PositionedGlyph,
+        offset: LogicalPoint,
     ) {
         debug_assert_eq!(
             glyph.tile.page, 0,
@@ -1976,9 +1999,10 @@ impl LaneEncoder<'_> {
         if glyph.size.is_empty() {
             return;
         }
+        let position = LogicalPoint::new(glyph.position.x + offset.x, glyph.position.y + offset.y);
         let bounds = device_bounds(
             self.scale
-                .to_device_rect(LogicalRect::from_origin_size(glyph.position, glyph.size)),
+                .to_device_rect(LogicalRect::from_origin_size(position, glyph.size)),
         );
         let kind = if glyph.tile.atlas == crate::paint::atlas::AtlasKind::ColorGlyph {
             KIND_COLOR_GLYPH
@@ -2043,8 +2067,8 @@ mod tests {
             color::{Color, ColorResolver},
             geometry::GeometryId,
             primitive::{
-                Border, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, GradientKind, Image,
-                PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
+                Border, CanvasDraw, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient,
+                GradientKind, Image, Path, PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
             },
             scene::{MAX_CLIP_DEPTH, Scene},
         },
@@ -2340,7 +2364,7 @@ mod tests {
         });
         assert!(canvas.pop_clip());
         let scene = scene_with(|scene, lane| {
-            assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
+            assert!(scene.push(lane, Primitive::Canvas(CanvasDraw::new(Arc::new(canvas)))));
         });
         let buffer = encode(&scene);
         let primitive = buffer
@@ -2385,7 +2409,7 @@ mod tests {
         });
         assert!(canvas.pop_clip());
         let scene = scene_with(|scene, lane| {
-            assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
+            assert!(scene.push(lane, Primitive::Canvas(CanvasDraw::new(Arc::new(canvas)))));
         });
         let buffer = encode(&scene);
         let instance = buffer.instances[0];
@@ -3041,7 +3065,7 @@ mod tests {
                     corner_radius: [px(0.0); 4],
                 },
             );
-            assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
+            assert!(scene.push(lane, Primitive::Canvas(CanvasDraw::new(Arc::new(canvas)))));
             assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
         });
         let buffer = encode(&scene);
@@ -3970,6 +3994,78 @@ mod tests {
         });
         let encoded = encode_geometry(&scene, &store);
         assert_eq!(encoded.ranges, vec![0..12288, 12288..12297]);
+    }
+
+    #[test]
+    fn path_op_bounds_stay_in_canvas_local_coordinates() {
+        let (store, id) = register_triangles(3);
+        let path = Path {
+            bounds: rect(0.0, 0.0, 64.0, 100.0),
+            geometry: id,
+            fill: Color::WHITE,
+        };
+        let encoded = |clip: bool| {
+            let mut canvas = Canvas::new(rect(0.0, 0.0, 64.0, 100.0));
+            if clip {
+                assert!(canvas.push_clip(ClipRect {
+                    rect: rect(0.0, 0.0, 64.0, 100.0),
+                    corner_radius: [px(0.0); 4],
+                }));
+            }
+            canvas.push_path(path);
+            if clip {
+                assert!(canvas.pop_clip());
+            }
+            let scene = scene_with(|scene, lane| {
+                assert!(scene.push(
+                    lane,
+                    Primitive::Canvas(CanvasDraw {
+                        canvas: Arc::new(canvas),
+                        offset: LogicalPoint::new(px(100.0), px(50.0)),
+                    }),
+                ));
+            });
+            let mut encoder = InstanceEncoder::new();
+            let buffer = encoder
+                .encode(&scene, scale(), resolver(), &store)
+                .expect("encode");
+            let transform = buffer
+                .geometry
+                .first()
+                .expect("画布内 Path 必须编码成几何绘制")
+                .transform;
+            let bounds = buffer
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    super::FrameOp::Geometry { bounds, .. } => Some(*bounds),
+                    _ => None,
+                })
+                .expect("必须有几何 op");
+            (transform, bounds)
+        };
+
+        let expected = (
+            Transform::translate(px(100.0), px(50.0)),
+            (199, 99, 329, 301),
+        );
+        for clip in [false, true] {
+            let (transform, bounds) = encoded(clip);
+            assert_eq!(
+                transform, expected.0,
+                "顶点变换只加一次画布偏移（clip={clip}）"
+            );
+            assert_eq!(
+                (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
+                (
+                    dp(expected.1.0),
+                    dp(expected.1.1),
+                    dp(expected.1.2),
+                    dp(expected.1.3)
+                ),
+                "几何 op 的可见范围必须是变换前局部 AABB 经一次画布偏移（clip={clip}）"
+            );
+        }
     }
 
     #[test]

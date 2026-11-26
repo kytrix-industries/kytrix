@@ -96,13 +96,21 @@ impl DamageAccumulator {
         }
         self.merge_to_fixpoint();
         let threshold = (frame.area() as f64) * f64::from(FULL_FRAME_AREA_RATIO);
-        let mut total: i64 = self.rects.iter().map(|rect| rect.area()).sum();
+        let mut total: i64 = self
+            .rects
+            .iter()
+            .map(|rect| rect.intersect(frame).area())
+            .sum();
         if total as f64 > threshold {
             return self.become_full();
         }
         if self.rects.len() > MAX_DAMAGE_RECTS {
             self.aggregate_to_budget();
-            total = self.rects.iter().map(|rect| rect.area()).sum();
+            total = self
+                .rects
+                .iter()
+                .map(|rect| rect.intersect(frame).area())
+                .sum();
             if total as f64 > threshold {
                 return self.become_full();
             }
@@ -732,6 +740,37 @@ mod tests {
 
         let (full, _) = run(1400, 140);
         assert!(full, "> 50% 帧面积必须 Full");
+    }
+
+    #[test]
+    fn the_area_threshold_counts_only_the_visible_part_of_a_rect() {
+        let screen = DeviceRect::new(dp(0), dp(0), dp(100), dp(100));
+        let mut half = DamageAccumulator::new(scale(1.0));
+        half.push_logical(rect(-50.0, 0.0, 100.0, 100.0), physical_px(0.0), None);
+        let summary = half.finish(screen);
+        assert!(
+            !summary.full,
+            "帧内可见面积恰好 50% 必须保持 Partial（阈值是严格大于）"
+        );
+        assert_eq!(summary.rects, 1);
+
+        let mut over = DamageAccumulator::new(scale(1.0));
+        over.push_logical(rect(-50.0, 0.0, 101.0, 100.0), physical_px(0.0), None);
+        assert!(
+            over.finish(screen).full,
+            "帧内可见面积 50% + 1px 必须升级为 Full"
+        );
+
+        let mut outside = DamageAccumulator::new(scale(1.0));
+        outside.push_logical(rect(-100.0, 0.0, 50.0, 50.0), physical_px(0.0), None);
+        let summary = outside.finish(screen);
+        assert!(!summary.full, "完全在帧外的矩形不得单独把帧升级为 Full");
+        assert_eq!(summary.rects, 1);
+        assert_eq!(
+            crate::render::compositor::plan(summary, outside.rects(), screen),
+            crate::render::compositor::Plan::Idle,
+            "完全在帧外的 damage 经 plan 裁剪后必须退化为 Idle"
+        );
     }
 
     #[test]

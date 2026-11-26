@@ -45,19 +45,19 @@ const ROW_COUNT: usize = 20;
 
 const ROW_HEIGHT: LogicalPx = px(24.0);
 
-pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, origin: LogicalPoint) {
+pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId) {
     let icon = app
         .insert_bitmap_for_window(window, &ICON_PNG)
         .expect("内嵌 16x16 PNG 必须可解码");
     for (index, slot) in ICON_SLOTS.iter().enumerate() {
         let local = LogicalRect::new(slot.0, slot.1, slot.2, slot.2);
-        let absolute = local.translate(origin);
+        let canvas_bounds = LogicalRect::from_origin_size(LogicalPoint::ZERO, local.size);
         let tile = app
             .prepare_image_variant(window, icon, local.size, ImageFit::Fill)
             .expect("位图的原生变体恒可用");
-        let mut canvas = Canvas::new(absolute);
+        let mut canvas = Canvas::new(canvas_bounds);
         canvas.push_image(Image {
-            bounds: absolute,
+            bounds: canvas_bounds,
             tile,
             modulation: Color::WHITE,
         });

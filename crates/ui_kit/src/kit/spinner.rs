@@ -6,7 +6,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     interaction::{AnimatedValue, AnimationSpec, Easing},
-    math::{LogicalPoint, LogicalPx, LogicalRect, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -54,7 +54,7 @@ struct SpinnerInner {
     color: std::cell::Cell<SpinnerColor>,
     angle: Transient<f32>,
     target: Cell<f32>,
-    last_paint: Cell<Option<(LogicalRect, f32, Color)>>,
+    last_paint: Cell<Option<(LogicalSize, f32, Color)>>,
     geometry: std::cell::RefCell<Geometry>,
 }
 
@@ -214,13 +214,13 @@ impl Spinner {
         let (Some(window), Some(node)) = (window, node) else {
             return Ok(false);
         };
-        let Some(bounds) = app
+        let Some(size) = app
             .window(window)
             .ok_or(EngineError::UnknownWindow { window })?
             .tree()
             .get(node)
             .ok()
-            .map(|target| target.layout().bounds)
+            .map(|target| target.layout().bounds.size)
         else {
             return Ok(false);
         };
@@ -233,16 +233,16 @@ impl Spinner {
         }
         let angle = app.read_transient(&self.inner.angle).rem_euclid(TAU);
         let color = self.color(app);
-        if self.inner.last_paint.get() == Some((bounds, angle, color)) {
+        if self.inner.last_paint.get() == Some((size, angle, color)) {
             return Ok(false);
         }
-        let canvas = spinner_canvas(bounds, angle, color);
+        let canvas = spinner_canvas(size, angle, color);
         let changed = app
             .window_mut(window)
             .ok_or(EngineError::UnknownWindow { window })?
             .set_canvas(node, canvas)?;
         if changed {
-            self.inner.last_paint.set(Some((bounds, angle, color)));
+            self.inner.last_paint.set(Some((size, angle, color)));
         }
         Ok(changed)
     }
@@ -276,14 +276,12 @@ impl Spinner {
     }
 }
 
-fn spinner_canvas(bounds: LogicalRect, angle: f32, color: Color) -> Canvas {
+fn spinner_canvas(size: LogicalSize, angle: f32, color: Color) -> Canvas {
+    let bounds = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
     let mut canvas = Canvas::new(bounds);
-    let center = LogicalPoint::new(
-        bounds.origin.x + bounds.size.width / 2.0,
-        bounds.origin.y + bounds.size.height / 2.0,
-    );
-    let dot = (bounds.size.width.min(bounds.size.height) / 6.0).max(px(MIN_DOT));
-    let radius = (bounds.size.width.min(bounds.size.height) / 2.0 - dot / 2.0).max(px(0.0));
+    let center = LogicalPoint::new(size.width / 2.0, size.height / 2.0);
+    let dot = (size.width.min(size.height) / 6.0).max(px(MIN_DOT));
+    let radius = (size.width.min(size.height) / 2.0 - dot / 2.0).max(px(0.0));
     for index in 0..DOTS {
         let phase = angle + index as f32 * TAU / DOTS as f32;
         let alpha = 0.15 + 0.85 * (index as f32 / (DOTS - 1) as f32);
@@ -377,16 +375,23 @@ mod tests {
     #[test]
     fn a_spinner_draws_a_ring_of_dots_inside_its_layout_box() {
         let harness = harness(true);
-        let bounds = harness.app.probe().bounds(harness.node).expect("bounds");
-        assert!((bounds.size.width.value() - 24.0).abs() < 0.5);
-        assert!((bounds.size.height.value() - 24.0).abs() < 0.5);
+        let size = harness
+            .app
+            .probe()
+            .bounds(harness.node)
+            .expect("bounds")
+            .size;
+        assert!((size.width.value() - 24.0).abs() < 0.5);
+        assert!((size.height.value() - 24.0).abs() < 0.5);
         let quads = canvas_quads(&harness);
         assert_eq!(quads.len(), 8, "8 个点");
         for quad in quads {
             assert!(
-                quad.origin.x >= bounds.origin.x - 1.0
-                    && quad.origin.x <= bounds.origin.x + bounds.size.width,
-                "点必须落在节点的画布范围内"
+                quad.origin.x >= px(-1.0)
+                    && quad.origin.x <= size.width
+                    && quad.origin.y >= px(-1.0)
+                    && quad.origin.y <= size.height,
+                "点必须落在节点的局部画布范围内"
             );
         }
     }

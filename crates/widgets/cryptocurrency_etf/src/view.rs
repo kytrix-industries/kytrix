@@ -393,7 +393,16 @@ impl WidgetView for CryptocurrencyEtfWidget {
         let moved = match input {
             ui_core::event::InputEvent::PointerMove { position, .. }
             | ui_core::event::InputEvent::PointerEnter { position, .. } => {
-                chart.point_at(*position)
+                let node = chart.node();
+                let local = cx
+                    .tree()
+                    .hit_test(*position)
+                    .filter(|hit| Some(hit.node) == node)
+                    .map(|hit| hit.local_point);
+                match local {
+                    Some(local) => chart.point_at(local),
+                    None => chart.clear_hover(),
+                }
             }
             ui_core::event::InputEvent::PointerLeave { .. } => chart.clear_hover(),
             _ => return false,

@@ -728,9 +728,9 @@ fn canvas_primitive(primitive: &Primitive) -> CanvasPrimitive {
             glyphs: 0,
             geometry: Some(draw.id),
         },
-        Primitive::Canvas(canvas) => CanvasPrimitive {
+        Primitive::Canvas(draw) => CanvasPrimitive {
             kind: PrimitiveKind::Canvas,
-            bounds: Some(canvas.bounds()),
+            bounds: Some(draw.bounds().translate(draw.offset)),
             corner_radius: None,
             color: None,
             border: None,

@@ -800,8 +800,8 @@ mod tests {
         );
         assert_eq!(
             tree.get(canvas).expect("存在").damage(),
-            LogicalRect::new(px(0.0), px(0.0), px(50.0), px(50.0)),
-            "damage = 旧位置 ∪ 新位置"
+            LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)),
+            "damage = 旧位置（新位置的绘制由 lane 重建时的图元 damage 覆盖）"
         );
     }
 

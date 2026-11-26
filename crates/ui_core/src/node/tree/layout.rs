@@ -281,8 +281,11 @@ pub(crate) fn place_subtree(
         ) {
             tree.geometry_damage_escalation = true;
         }
+        let painted = tree
+            .painted_extent(node)
+            .map_or_else(LogicalRect::default, |extent| extent.layout_bounds());
         if let Some(target) = tree.arena.get_mut(node) {
-            target.damage = target.damage.union(old.bounds).union(abs);
+            target.damage = target.damage.union(old.bounds).union(painted);
             target.layout = LayoutBox {
                 bounds: abs,
                 border: target.local_border,
@@ -291,7 +294,7 @@ pub(crate) fn place_subtree(
         }
         tree.moved_nodes.insert(node);
         tree.dirty_settle.insert(node);
-        let _ = tree.mark_paint(node);
+        let _ = tree.mark_paint_without_damage(node);
     } else if fresh && let Some(target) = tree.arena.get_mut(node) {
         target.layout.border = target.local_border;
     }

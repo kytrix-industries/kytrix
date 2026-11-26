@@ -183,7 +183,7 @@ impl ChartColors {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaintedKey {
-    bounds: LogicalRect,
+    size: LogicalSize,
     revision: u64,
     hover: Option<usize>,
     colors: ChartColors,
@@ -228,7 +228,6 @@ impl VolumeHeatMapChart {
         self.data.entries.is_empty()
     }
 
-    #[cfg(test)]
     pub(crate) fn node(&self) -> Option<NodeId> {
         self.node
     }
@@ -279,19 +278,19 @@ impl VolumeHeatMapChart {
         let Ok(target) = cx.tree().get(node) else {
             return Ok(false);
         };
-        let bounds = target.layout().bounds;
-        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+        let size = target.layout().bounds.size;
+        if size.width <= px(0.0) || size.height <= px(0.0) {
             return Ok(false);
         }
 
-        if self.ensure_layout(bounds) {
+        if self.ensure_layout(size) {
             self.hover = None;
         }
 
         let appearance = cx.theme().current(cx.app());
         let colors = ChartColors::resolve(cx.theme().theme_for(appearance));
         let key = PaintedKey {
-            bounds,
+            size,
             revision: self.revision,
             hover: self.hover,
             colors,
@@ -316,21 +315,17 @@ impl VolumeHeatMapChart {
         Ok(changed)
     }
 
-    fn ensure_layout(&mut self, bounds: LogicalRect) -> bool {
-        if self
-            .layout
-            .as_ref()
-            .is_some_and(|layout| layout.bounds == bounds && layout.revision == self.revision)
+    fn ensure_layout(&mut self, size: LogicalSize) -> bool {
+        if let Some(layout) = self.layout.as_mut()
+            && layout.bounds.size == size
+            && layout.revision == self.revision
         {
             return false;
         }
-        let tiles = layout_tiles(&self.data.layout_items, self.data.tiles.len(), bounds.size)
-            .into_iter()
-            .map(|tile| tile.translate(bounds.origin))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let tiles =
+            layout_tiles(&self.data.layout_items, self.data.tiles.len(), size).into_boxed_slice();
         self.layout = Some(Layout {
-            bounds,
+            bounds: LogicalRect::from_origin_size(LogicalPoint::ZERO, size),
             revision: self.revision,
             tiles,
         });
@@ -1026,12 +1021,9 @@ mod tests {
             entry("ZERO", 0, "0"),
         ]);
         let data = prepared(entries);
-        let bounds = LogicalRect::new(px(10.0), px(20.0), px(100.0), px(50.0));
+        let bounds = LogicalRect::new(px(0.0), px(0.0), px(100.0), px(50.0));
         let canvas = ui_core::math::LogicalSize::new(px(100.0), px(50.0));
-        let tiles = layout_tiles(&data.layout_items, data.tiles.len(), canvas)
-            .into_iter()
-            .map(|tile| tile.translate(bounds.origin))
-            .collect::<Vec<_>>();
+        let tiles = layout_tiles(&data.layout_items, data.tiles.len(), canvas);
         let layout = Layout {
             bounds,
             revision: 0,

@@ -1137,7 +1137,11 @@ fn a_collected_reading_should_draw_the_gauge_frame() {
     let canvas = gauge_canvas(&harness, &pane);
     let node = found(&harness, &pane, GAUGE_SELECTOR).expect("the gauge node");
     let bounds = node_bounds(&harness, node);
-    assert_eq!(canvas.bounds(), bounds, "the canvas covers the node's box");
+    assert_eq!(
+        canvas.bounds().size,
+        bounds.size,
+        "the canvas covers the node's box"
+    );
     assert!(
         bounds.size.width > px(96.0) && bounds.size.height > px(72.0),
         "the fixture box is large enough for a gauge: {bounds:?}"
@@ -1156,6 +1160,7 @@ fn a_collected_reading_should_draw_the_gauge_frame() {
         "the five band meshes are registered in the geometry store"
     );
 
+    let local = canvas.bounds();
     for primitive in primitives(&canvas) {
         let drawn = match primitive {
             Primitive::Path(path) => path.bounds,
@@ -1163,11 +1168,11 @@ fn a_collected_reading_should_draw_the_gauge_frame() {
             _ => continue,
         };
         assert!(
-            drawn.origin.x >= bounds.origin.x - 1.0
-                && drawn.origin.y >= bounds.origin.y - 1.0
-                && drawn.max().x <= bounds.max().x + 1.0
-                && drawn.max().y <= bounds.max().y + 1.0,
-            "every painted piece stays inside the canvas: {drawn:?} of {bounds:?}"
+            drawn.origin.x >= local.origin.x - 1.0
+                && drawn.origin.y >= local.origin.y - 1.0
+                && drawn.max().x <= local.max().x + 1.0
+                && drawn.max().y <= local.max().y + 1.0,
+            "every painted piece stays inside the canvas: {drawn:?} of {local:?}"
         );
     }
 

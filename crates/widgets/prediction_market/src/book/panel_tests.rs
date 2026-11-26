@@ -642,7 +642,7 @@ fn the_depth_bars_should_be_one_quad_per_visible_row_in_the_side_colour() {
         .map(|quad| {
             let quad = quad.bounds.expect("a quad has bounds");
             assert!(
-                (quad.origin.x - bounds.origin.x).abs() < px(0.01),
+                quad.origin.x < px(0.01),
                 "the bars hang off the left edge of their row"
             );
             quad.size.width / bounds.size.width
@@ -781,7 +781,7 @@ fn the_depth_bars_should_follow_the_lists_scroll_offset() {
 
     let quads = fixture.quads();
     let first = (offset / ROW_HEIGHT).floor() as usize;
-    let expected_top = bounds.origin.y + ROW_HEIGHT * first as f32 - offset;
+    let expected_top = ROW_HEIGHT * first as f32 - offset;
     let first_quad = quads[0].bounds.expect("a quad has bounds");
     assert!(
         (first_quad.origin.y - expected_top).abs() < px(0.01),
@@ -812,7 +812,7 @@ fn the_depth_bars_should_follow_the_lists_scroll_offset() {
         "a scrolled ladder is a drawing for the bars, not a steady frame"
     );
     let first = (scrolled / ROW_HEIGHT).floor() as usize;
-    let expected_top = bounds.origin.y + ROW_HEIGHT * first as f32 - scrolled;
+    let expected_top = ROW_HEIGHT * first as f32 - scrolled;
     let first_quad = fixture.quads()[0].bounds.expect("a quad has bounds");
     assert!(
         (first_quad.origin.y - expected_top).abs() < px(0.01),

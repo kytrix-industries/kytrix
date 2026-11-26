@@ -16,7 +16,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     interaction::ItemAlign,
-    math::{LogicalPx, LogicalRect, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -218,7 +218,7 @@ impl BookRows {
 struct DepthBarsKey {
     grouped: Option<Arc<GroupedBook>>,
     eased: f32,
-    bounds: LogicalRect,
+    size: LogicalSize,
     offset: LogicalPx,
     ask_color: Color,
     bid_color: Color,
@@ -229,13 +229,13 @@ impl DepthBarsKey {
         &self,
         grouped: Option<&Arc<GroupedBook>>,
         eased: f32,
-        bounds: LogicalRect,
+        size: LogicalSize,
         offset: LogicalPx,
         ask_color: Color,
         bid_color: Color,
     ) -> bool {
         self.eased == eased
-            && self.bounds == bounds
+            && self.size == size
             && self.offset == offset
             && self.ask_color == ask_color
             && self.bid_color == bid_color
@@ -325,7 +325,8 @@ impl BuiltPanel {
             return Ok(false);
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+        let size = bounds.size;
+        if size.width <= px(0.0) || size.height <= px(0.0) {
             return Ok(false);
         }
         let offset = self.list.offset(cx.app()).unwrap_or(LogicalPx::ZERO);
@@ -334,19 +335,12 @@ impl BuiltPanel {
         let ask_color = resolved.role(Role::MarketDownWeak);
         let bid_color = resolved.role(Role::MarketUpWeak);
         if self.prepared.as_ref().is_some_and(|prepared| {
-            prepared.matches(
-                grouped,
-                snapshot.eased,
-                bounds,
-                offset,
-                ask_color,
-                bid_color,
-            )
+            prepared.matches(grouped, snapshot.eased, size, offset, ask_color, bid_color)
         }) {
             return Ok(false);
         }
         let canvas = depth_canvas(
-            bounds,
+            size,
             offset,
             grouped.map(|grouped| grouped.as_ref()),
             snapshot,
@@ -359,7 +353,7 @@ impl BuiltPanel {
         self.prepared = Some(DepthBarsKey {
             grouped: grouped.cloned(),
             eased: snapshot.eased,
-            bounds,
+            size,
             offset,
             ask_color,
             bid_color,
@@ -893,13 +887,14 @@ fn cell_role(read: &mut ReadCtx<'_>, rows: Signal<BookRows>, index: usize, colum
 }
 
 fn depth_canvas(
-    bounds: LogicalRect,
+    size: LogicalSize,
     offset: LogicalPx,
     grouped: Option<&GroupedBook>,
     snapshot: &DepthSnapshot,
     ask_color: Color,
     bid_color: Color,
 ) -> Canvas {
+    let bounds = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
     let mut canvas = Canvas::new(bounds);
     let _ = canvas.push_clip(ClipRect {
         rect: bounds,

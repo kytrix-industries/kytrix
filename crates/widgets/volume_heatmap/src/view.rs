@@ -531,7 +531,18 @@ impl WidgetView for VolumeHeatMapWidget {
         };
         let moved = match input {
             InputEvent::PointerMove { position, .. }
-            | InputEvent::PointerEnter { position, .. } => self.chart.point_at(*position),
+            | InputEvent::PointerEnter { position, .. } => {
+                let node = self.chart.node();
+                let local = cx
+                    .tree()
+                    .hit_test(*position)
+                    .filter(|hit| Some(hit.node) == node)
+                    .map(|hit| hit.local_point);
+                match local {
+                    Some(local) => self.chart.point_at(local),
+                    None => self.chart.clear_hover(),
+                }
+            }
             InputEvent::PointerLeave { .. } => self.chart.clear_hover(),
             _ => return false,
         };

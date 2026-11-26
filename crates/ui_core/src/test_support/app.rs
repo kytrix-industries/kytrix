@@ -1379,7 +1379,7 @@ mod p11_tests {
         let canvas = mount(&mut app, |tree, root| {
             NodeBuilder::canvas(Canvas::new(LogicalRect::new(
                 px(0.0),
-                px(52.0),
+                px(0.0),
                 px(60.0),
                 px(30.0),
             )))

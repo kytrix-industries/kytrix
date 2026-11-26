@@ -6,7 +6,7 @@ use time::UtcOffset;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
-    math::{LogicalPoint, LogicalRect, px},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch, style_builder::StyleBuilder},
 };
@@ -26,7 +26,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CacheKey {
-    pub bounds: LogicalRect,
+    pub size: LogicalSize,
     pub revision: u64,
 }
 
@@ -223,15 +223,15 @@ impl<D: ChartData> Chart<D> {
         let Ok(target) = cx.tree().get(node) else {
             return Ok(false);
         };
-        let bounds = target.layout().bounds;
-        if bounds.size.width.value() <= 0.0 || bounds.size.height.value() <= 0.0 {
+        let size = target.layout().bounds.size;
+        if size.width.value() <= 0.0 || size.height.value() <= 0.0 {
             return Ok(false);
         }
 
         let appearance = cx.theme().current(cx.app());
         let theme = cx.theme().theme_for(appearance).clone();
         let key = CacheKey {
-            bounds,
+            size,
             revision: self.revision,
         };
         if self.cache.prepared.as_ref().map(|(cached, ..)| *cached) != Some(key) {
@@ -244,7 +244,7 @@ impl<D: ChartData> Chart<D> {
                 self.data.scales(),
             );
             let layout = ChartLayout::new(
-                bounds,
+                LogicalRect::from_origin_size(LogicalPoint::ZERO, size),
                 measurements.left_axis_width,
                 measurements.right_axis_width,
             );
@@ -492,6 +492,15 @@ impl ChartDispatch {
             Self::OpenInterest(chart) => chart.point_at(cursor),
             Self::TakerVolume(chart) => chart.point_at(cursor),
             Self::Ratio(chart) => chart.point_at(cursor),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hover_for_test(&self) -> Option<Hover> {
+        match self {
+            Self::OpenInterest(chart) => chart.hover_for_test(),
+            Self::TakerVolume(chart) => chart.hover_for_test(),
+            Self::Ratio(chart) => chart.hover_for_test(),
         }
     }
 

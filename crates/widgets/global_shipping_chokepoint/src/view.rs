@@ -293,6 +293,7 @@ impl WidgetView for GlobalShippingChokepointWidget {
             InputEvent::PointerDown {
                 position, button, ..
             } => {
+                self.map.note_pointer(cx.tree(), *position);
                 if *button != PointerButton::Primary || !self.map.contains(*position) {
                     return false;
                 }
@@ -301,6 +302,7 @@ impl WidgetView for GlobalShippingChokepointWidget {
                 true
             }
             InputEvent::PointerUp { position, .. } => {
+                self.map.note_pointer(cx.tree(), *position);
                 if !self.map.is_dragging() && !self.credit_pressed && !self.map.contains(*position)
                 {
                     return false;
@@ -313,6 +315,7 @@ impl WidgetView for GlobalShippingChokepointWidget {
                 true
             }
             InputEvent::PointerMove { position, .. } => {
+                self.map.note_pointer(cx.tree(), *position);
                 let moved = self.map.pointer_move(*position, &self.painted);
                 if moved {
                     let _ = cx.request_frame();
@@ -336,6 +339,7 @@ impl WidgetView for GlobalShippingChokepointWidget {
             InputEvent::Scroll {
                 position, delta, ..
             } => {
+                self.map.note_pointer(cx.tree(), *position);
                 if !self.map.contains(*position) {
                     return false;
                 }
@@ -346,6 +350,7 @@ impl WidgetView for GlobalShippingChokepointWidget {
                 true
             }
             InputEvent::Magnify { factor, center, .. } => {
+                self.map.note_pointer(cx.tree(), *center);
                 if !self.map.contains(*center) {
                     return false;
                 }

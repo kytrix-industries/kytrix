@@ -681,7 +681,7 @@ impl LabelMetrics {
 
 struct PreparedKey {
     snapshot: Option<Arc<TimelineSnapshot>>,
-    bounds: LogicalRect,
+    size: LogicalSize,
     axis_width: LogicalPx,
     start_label_width: LogicalPx,
     hovered: Option<(Side, usize)>,
@@ -693,7 +693,7 @@ impl PreparedKey {
     fn matches(
         &self,
         snapshot: &Option<Arc<TimelineSnapshot>>,
-        bounds: LogicalRect,
+        size: LogicalSize,
         axis_width: LogicalPx,
         start_label_width: LogicalPx,
         hovered: Option<(Side, usize)>,
@@ -706,7 +706,7 @@ impl PreparedKey {
             _ => false,
         };
         same_snapshot
-            && self.bounds == bounds
+            && self.size == size
             && self.axis_width == axis_width
             && self.start_label_width == start_label_width
             && self.hovered == hovered
@@ -722,7 +722,7 @@ pub(super) struct TimelinePaint {
     labels: Option<LabelMetrics>,
     prepared: Option<PreparedKey>,
     hovered: Option<(Side, usize)>,
-    empty_bounds: Option<LogicalRect>,
+    empty_size: Option<LogicalSize>,
     a11y_language: Option<LanguageCode>,
 }
 
@@ -735,7 +735,7 @@ impl TimelinePaint {
             labels: None,
             prepared: None,
             hovered: None,
-            empty_bounds: None,
+            empty_size: None,
             a11y_language: None,
         }
     }
@@ -755,22 +755,24 @@ impl TimelinePaint {
             return Ok(());
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) || !bounds.is_finite() {
+        let size = bounds.size;
+        if size.width <= px(0.0) || size.height <= px(0.0) || !bounds.is_finite() {
             return Ok(());
         }
+        let bounds = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
 
         let Some(snapshot) = snapshot else {
-            if self.empty_bounds == Some(bounds) {
+            if self.empty_size == Some(size) {
                 return Ok(());
             }
             cx.set_canvas(node, Canvas::new(bounds))?;
-            self.empty_bounds = Some(bounds);
+            self.empty_size = Some(size);
             self.prepared = None;
             self.hovered = None;
             self.data.replace_snapshot(None);
             return Ok(());
         };
-        self.empty_bounds = None;
+        self.empty_size = None;
 
         let appearance = cx.theme().current(cx.app());
         let colors = TimelineColors::resolve(cx.theme().theme_for(appearance));
@@ -778,7 +780,7 @@ impl TimelinePaint {
         let language_now = *cx.read(&language);
         let translate = cx.translate().clone();
 
-        let plot_width = plot_width(bounds.size.width);
+        let plot_width = plot_width(size.width);
         self.data.replace_snapshot(Some(snapshot));
         self.data.set_plot_width(plot_width);
 
@@ -803,7 +805,7 @@ impl TimelinePaint {
         let prepared = self.prepared.as_ref().is_some_and(|prepared| {
             prepared.matches(
                 &self.data.snapshot,
-                bounds,
+                size,
                 axis_width,
                 start_label_width,
                 hovered,
@@ -855,7 +857,7 @@ impl TimelinePaint {
         cx.set_canvas(node, canvas)?;
         self.prepared = Some(PreparedKey {
             snapshot: self.data.snapshot.clone(),
-            bounds,
+            size,
             axis_width,
             start_label_width,
             hovered,
@@ -872,7 +874,7 @@ impl TimelinePaint {
         self.labels = None;
         self.prepared = None;
         self.hovered = None;
-        self.empty_bounds = None;
+        self.empty_size = None;
         self.a11y_language = None;
     }
 
@@ -1059,7 +1061,6 @@ impl Frame<'_> {
             labels,
             hovered,
         } = self;
-        let origin = bounds.origin;
         let mut canvas = Canvas::new(bounds);
         let _ = canvas.push_clip(ClipRect {
             rect: bounds,
@@ -1068,10 +1069,10 @@ impl Frame<'_> {
         let mut text = TextPainter { app, cache };
 
         for tick in [geometry.axis, geometry.start_tick, geometry.end_tick] {
-            canvas.push_quad(solid_quad(tick.translate(origin), colors.axis));
+            canvas.push_quad(solid_quad(tick, colors.axis));
         }
         for marker in geometry.markers.iter() {
-            canvas.push_quad(solid_quad(marker.connector.translate(origin), colors.axis));
+            canvas.push_quad(solid_quad(marker.connector, colors.axis));
         }
 
         for marker in geometry.markers.iter() {
@@ -1082,7 +1083,7 @@ impl Frame<'_> {
             let radius = (marker.bounds.size.width * MARKER_RADIUS_RATIO)
                 .min(marker.bounds.size.width / 2.0);
             canvas.push_quad(Quad {
-                bounds: marker.bounds.translate(origin),
+                bounds: marker.bounds,
                 corner_radius: [radius; 4],
                 paint: QuadPaint::Solid {
                     fill,
@@ -1107,7 +1108,7 @@ impl Frame<'_> {
                 marker.bounds.origin.x + (marker.bounds.size.width - size.width) / 2.0,
                 marker.bounds.origin.y + (marker.bounds.size.height - size.height) / 2.0,
             );
-            let _ = canvas.push_text(content, center + origin);
+            let _ = canvas.push_text(content, center);
         }
 
         if let Some((content, size)) = &labels.0 {
@@ -1115,14 +1116,14 @@ impl Frame<'_> {
                 geometry.axis.origin.x - AXIS_LABEL_GAP - size.width,
                 geometry.axis.origin.y - size.height / 2.0,
             );
-            let _ = canvas.push_text(content.clone(), position + origin);
+            let _ = canvas.push_text(content.clone(), position);
         }
         if let Some((content, size)) = &labels.1 {
             let position = LogicalPoint::new(
                 geometry.axis.max().x + AXIS_LABEL_GAP,
                 geometry.axis.origin.y - size.height / 2.0,
             );
-            let _ = canvas.push_text(content.clone(), position + origin);
+            let _ = canvas.push_text(content.clone(), position);
         }
 
         if let Some((side, index)) = hovered
@@ -1182,9 +1183,8 @@ impl TooltipFrame<'_> {
             self.bounds.size.height,
             shown,
         );
-        let origin = self.bounds.origin;
         canvas.push_quad(Quad {
-            bounds: panel.translate(origin),
+            bounds: panel,
             corner_radius: [TOOLTIP_CORNER_RADIUS; 4],
             paint: QuadPaint::Solid {
                 fill: self.colors.panel,
@@ -1195,16 +1195,15 @@ impl TooltipFrame<'_> {
             },
         });
         let _ = canvas.push_clip(ClipRect {
-            rect: panel.translate(origin),
+            rect: panel,
             corner_radius: [px(0.0); 4],
         });
 
         let quantity_style = text_style(self.font, self.colors.neutral);
         let muted_style = text_style(self.font, self.colors.muted);
-        let right = origin.x + panel.max().x - TOOLTIP_PADDING;
+        let right = panel.max().x - TOOLTIP_PADDING;
         for (offset, row) in rows.iter().take(shown).enumerate() {
-            let top =
-                origin.y + panel.origin.y + TOOLTIP_PADDING + TOOLTIP_ROW_HEIGHT * offset as f32;
+            let top = panel.origin.y + TOOLTIP_PADDING + TOOLTIP_ROW_HEIGHT * offset as f32;
             let quantity = format_smolstr!(
                 "{} @ {}",
                 row.quantity_text(self.precision, self.translate),
@@ -1220,7 +1219,7 @@ impl TooltipFrame<'_> {
             let line_top = top + (TOOLTIP_ROW_HEIGHT - quantity_size.height) / 2.0;
             let _ = canvas.push_text(
                 quantity_line,
-                LogicalPoint::new(origin.x + panel.origin.x + TOOLTIP_PADDING, line_top),
+                LogicalPoint::new(panel.origin.x + TOOLTIP_PADDING, line_top),
             );
 
             let age_line = text.line(&age, &muted_style);

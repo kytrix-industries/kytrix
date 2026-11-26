@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ui_core::{
     error::EngineError,
-    math::{LogicalPx, LogicalRect, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         canvas::Canvas,
@@ -76,7 +76,7 @@ pub(super) fn bar_bounds(row: LogicalRect, ratio: f32) -> LogicalRect {
 }
 
 pub(super) fn bars_canvas(
-    bounds: LogicalRect,
+    size: LogicalSize,
     levels: &[GroupedLevel],
     progress: f32,
     font_size: LogicalPx,
@@ -84,6 +84,7 @@ pub(super) fn bars_canvas(
     color: Color,
     asks: bool,
 ) -> Canvas {
+    let bounds = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
     let mut canvas = Canvas::new(bounds);
     let _ = canvas.push_clip(ClipRect {
         rect: bounds,
@@ -110,11 +111,12 @@ pub(super) fn bars_canvas(
 }
 
 pub(super) fn imbalance_canvas(
-    bounds: LogicalRect,
+    size: LogicalSize,
     ask_ratio: f32,
     ask_color: Color,
     bid_color: Color,
 ) -> Canvas {
+    let bounds = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
     let mut canvas = Canvas::new(bounds);
     let _ = canvas.push_clip(ClipRect {
         rect: bounds,
@@ -162,7 +164,7 @@ pub(super) fn imbalance_canvas(
 
 struct BarsKey {
     levels: Arc<[GroupedLevel]>,
-    bounds: LogicalRect,
+    size: LogicalSize,
     progress: f32,
     font_size: LogicalPx,
     offset: LogicalPx,
@@ -174,7 +176,7 @@ impl BarsKey {
     fn matches(
         &self,
         levels: &Arc<[GroupedLevel]>,
-        bounds: LogicalRect,
+        size: LogicalSize,
         progress: f32,
         font_size: LogicalPx,
         offset: LogicalPx,
@@ -182,7 +184,7 @@ impl BarsKey {
         asks: bool,
     ) -> bool {
         Arc::ptr_eq(&self.levels, levels)
-            && self.bounds == bounds
+            && self.size == size
             && self.progress == progress
             && self.font_size == font_size
             && self.offset == offset
@@ -246,19 +248,20 @@ impl SideCanvas {
             return Ok(());
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+        let size = bounds.size;
+        if size.width <= px(0.0) || size.height <= px(0.0) {
             return Ok(());
         }
         if self.prepared.as_ref().is_some_and(|prepared| {
-            prepared.matches(levels, bounds, progress, font_size, offset, color, asks)
+            prepared.matches(levels, size, progress, font_size, offset, color, asks)
         }) {
             return Ok(());
         }
-        let canvas = bars_canvas(bounds, levels, progress, font_size, offset, color, asks);
+        let canvas = bars_canvas(size, levels, progress, font_size, offset, color, asks);
         cx.set_canvas(node, canvas)?;
         self.prepared = Some(BarsKey {
             levels: levels.clone(),
-            bounds,
+            size,
             progress,
             font_size,
             offset,
@@ -270,7 +273,7 @@ impl SideCanvas {
 }
 
 struct ImbalanceKey {
-    bounds: LogicalRect,
+    size: LogicalSize,
     ask_ratio: f32,
     ask_color: Color,
     bid_color: Color,
@@ -279,12 +282,12 @@ struct ImbalanceKey {
 impl ImbalanceKey {
     fn matches(
         &self,
-        bounds: LogicalRect,
+        size: LogicalSize,
         ask_ratio: f32,
         ask_color: Color,
         bid_color: Color,
     ) -> bool {
-        self.bounds == bounds
+        self.size == size
             && self.ask_ratio == ask_ratio
             && self.ask_color == ask_color
             && self.bid_color == bid_color
@@ -342,7 +345,8 @@ impl Imbalance {
             return Ok(());
         };
         let bounds = target.layout().bounds;
-        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+        let size = bounds.size;
+        if size.width <= px(0.0) || size.height <= px(0.0) {
             return Ok(());
         }
         let ask_ratio = if ask_ratio.is_finite() {
@@ -353,14 +357,14 @@ impl Imbalance {
         if self
             .prepared
             .as_ref()
-            .is_some_and(|prepared| prepared.matches(bounds, ask_ratio, ask_color, bid_color))
+            .is_some_and(|prepared| prepared.matches(size, ask_ratio, ask_color, bid_color))
         {
             return Ok(());
         }
-        let canvas = imbalance_canvas(bounds, ask_ratio, ask_color, bid_color);
+        let canvas = imbalance_canvas(size, ask_ratio, ask_color, bid_color);
         cx.set_canvas(node, canvas)?;
         self.prepared = Some(ImbalanceKey {
-            bounds,
+            size,
             ask_ratio,
             ask_color,
             bid_color,
@@ -521,7 +525,7 @@ mod tests {
         let levels: Arc<[GroupedLevel]> = Arc::from([level(0.2), level(0.5), level(1.0)]);
         let side = bounds(0.0, 0.0, 300.0, 100.0);
 
-        let canvas = bars_canvas(side, &levels, 1.0, FONT_SIZE, px(0.0), color(), true);
+        let canvas = bars_canvas(side.size, &levels, 1.0, FONT_SIZE, px(0.0), color(), true);
 
         assert_eq!(quads(&canvas).len(), levels.len());
     }
@@ -533,7 +537,7 @@ mod tests {
         let levels: Arc<[GroupedLevel]> = Arc::from([easing]);
         let side = bounds(0.0, 0.0, 300.0, 100.0);
 
-        let canvas = bars_canvas(side, &levels, 0.5, FONT_SIZE, px(0.0), color(), true);
+        let canvas = bars_canvas(side.size, &levels, 0.5, FONT_SIZE, px(0.0), color(), true);
 
         let bar = quads(&canvas).remove(0);
         assert!((bar.bounds.size.width - side.size.width / 2.0).abs() < px(0.01));
@@ -550,12 +554,12 @@ mod tests {
     fn the_imbalance_bar_should_split_the_box_between_the_two_sides() {
         let side = bounds(10.0, 20.0, 300.0, 20.0);
 
-        let canvas = imbalance_canvas(side, 0.25, color(), color());
+        let canvas = imbalance_canvas(side.size, 0.25, color(), color());
 
         let quads = quads(&canvas);
         assert_eq!(quads.len(), 2);
         assert!((quads[0].bounds.size.width - 75.0).abs() < px(0.01));
-        assert!((quads[1].bounds.origin.x - 85.0).abs() < px(0.01));
+        assert!((quads[1].bounds.origin.x - 75.0).abs() < px(0.01));
         assert!((quads[1].bounds.size.width - 225.0).abs() < px(0.01));
     }
 
@@ -565,7 +569,7 @@ mod tests {
         let side = bounds(0.0, 0.0, 300.0, 100.0);
         let key = BarsKey {
             levels: levels.clone(),
-            bounds: side,
+            size: side.size,
             progress: 1.0,
             font_size: FONT_SIZE,
             offset: px(0.0),
@@ -573,17 +577,17 @@ mod tests {
             asks: true,
         };
 
-        assert!(key.matches(&levels, side, 1.0, FONT_SIZE, px(0.0), color(), true));
-        assert!(!key.matches(&levels, side, 0.5, FONT_SIZE, px(0.0), color(), true));
+        assert!(key.matches(&levels, side.size, 1.0, FONT_SIZE, px(0.0), color(), true));
+        assert!(!key.matches(&levels, side.size, 0.5, FONT_SIZE, px(0.0), color(), true));
         assert!(!key.matches(
             &Arc::from([level(0.5)]),
-            side,
+            side.size,
             1.0,
             FONT_SIZE,
             px(0.0),
             color(),
             true
         ));
-        assert!(!key.matches(&levels, side, 1.0, FONT_SIZE, px(8.0), color(), true));
+        assert!(!key.matches(&levels, side.size, 1.0, FONT_SIZE, px(8.0), color(), true));
     }
 }

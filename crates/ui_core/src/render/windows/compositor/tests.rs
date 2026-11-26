@@ -14,7 +14,9 @@ use crate::{
         color::{Color, ColorResolver},
         geometry::{GeometryId, GeometryPipeline, IndexType, Topology},
         instance::{FrameOp, GeometryDrawGpu, InstanceEncoder},
-        primitive::{GeometryDraw, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint},
+        primitive::{
+            CanvasDraw, GeometryDraw, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint,
+        },
         scene::Scene,
     },
     render::{
@@ -1122,7 +1124,9 @@ fn submit_image_layers(renderer: &mut super::GpuRenderer, layers: u16) {
                 modulation: Color::WHITE,
             });
         }
-        let scene = one_lane_scene(Primitive::Canvas(std::sync::Arc::new(canvas)));
+        let scene = one_lane_scene(Primitive::Canvas(CanvasDraw::new(std::sync::Arc::new(
+            canvas,
+        ))));
         encoder
             .encode(
                 &scene,

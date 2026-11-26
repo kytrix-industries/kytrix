@@ -254,7 +254,7 @@ mod tests {
             atlas::{AtlasKind, AtlasTile},
             canvas::Canvas,
             color::Color,
-            primitive::Primitive,
+            primitive::{CanvasDraw, Primitive},
         },
         test_support::app::TestApp,
         text::{ShapedLine, ShapedTextItem, TextContent, TextDiagnostic, TextStyle},
@@ -599,7 +599,7 @@ mod tests {
             TextContent::new("Outer", styled(Color::WHITE)),
             LogicalPoint::new(px(2.0), px(3.0)),
         ));
-        outer.push_primitive(Primitive::Canvas(Arc::new(inner)));
+        outer.push_primitive(Primitive::Canvas(CanvasDraw::new(Arc::new(inner))));
         let node = mount(&mut app, outer);
         app.drain().expect("frame commits");
 

@@ -8,6 +8,10 @@ pub(crate) fn mark_paint(tree: &mut NodeTree, node: NodeId) -> bool {
     tree.touch(node, DirtyFlags::PAINT)
 }
 
+pub(crate) fn mark_paint_without_damage(tree: &mut NodeTree, node: NodeId) -> bool {
+    touch_without_damage(tree, node, DirtyFlags::PAINT)
+}
+
 pub(crate) fn mark_layout(tree: &mut NodeTree, node: NodeId) -> bool {
     if !tree.touch(
         node,
@@ -25,7 +29,8 @@ pub(crate) fn mark_a11y(tree: &mut NodeTree, node: NodeId) -> bool {
 }
 
 pub(crate) fn mark_structure(tree: &mut NodeTree, node: NodeId) -> bool {
-    if !tree.touch(
+    if !touch_without_damage(
+        tree,
         node,
         DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
     ) {
@@ -34,6 +39,39 @@ pub(crate) fn mark_structure(tree: &mut NodeTree, node: NodeId) -> bool {
     tree.structure_epoch = tree.structure_epoch.wrapping_add(1);
     tree.bubble_layout(node);
     tree.invalidate_caches_upwards(node);
+    true
+}
+
+fn touch_without_damage(tree: &mut NodeTree, node: NodeId, flags: DirtyFlags) -> bool {
+    let NodeTree {
+        arena,
+        dirty_bind,
+        dirty_layout,
+        dirty_paint,
+        dirty_a11y,
+        dirty_settle,
+        ..
+    } = tree;
+    let Some(target) = arena.get_mut(node) else {
+        return false;
+    };
+    target.dirty.insert(flags);
+    if flags.intersects(DirtyFlags::LAYOUT | DirtyFlags::PAINT) {
+        target.dirty.remove(DirtyFlags::REUSABLE);
+        dirty_settle.insert(node);
+    }
+    if flags.contains(DirtyFlags::BIND) {
+        dirty_bind.insert(node);
+    }
+    if flags.contains(DirtyFlags::LAYOUT) {
+        dirty_layout.insert(node);
+    }
+    if flags.contains(DirtyFlags::PAINT) {
+        dirty_paint.insert(node);
+    }
+    if flags.contains(DirtyFlags::A11Y) {
+        dirty_a11y.insert(node);
+    }
     true
 }
 

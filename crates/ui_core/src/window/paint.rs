@@ -11,7 +11,6 @@ use crate::{
     node::id::NodeId,
     paint::{
         pass::{PaintPass, PaintReport},
-        primitive::Primitive,
         scene::Scene,
     },
     render::{
@@ -56,6 +55,7 @@ pub(crate) fn paint_frame(
         return Ok(PaintReport {
             rebuilt: 0,
             damage: crate::render::damage::DamageSummary::default(),
+            order_rebuilt: false,
             stale_text: smallvec::SmallVec::new(),
             unresolved_canvas_text: 0,
             skipped_inline_images: smallvec::SmallVec::new(),
@@ -79,10 +79,15 @@ pub(crate) fn paint_frame(
             delta: DeltaRecord::default(),
         });
     }
-    let epoch_changed = window.tree.paint_epoch_changed();
+    let force_full = window.tree.take_force_full_paint();
+    let structure_changed = window.tree.structure_changed();
+    let registry_changed = window.tree.scroll_registry_changed();
+    let first_paint = window.tree.paint_counters().full_frames == 0;
+    let epoch_full = force_full || registry_changed || first_paint;
     let report = if !full_damage
         && removed.is_empty()
-        && !epoch_changed
+        && !epoch_full
+        && !structure_changed
         && !window.needs_node_repaint()
         && window.scroll_slots.len() > 1
     {
@@ -90,12 +95,14 @@ pub(crate) fn paint_frame(
     } else {
         None
     };
+    let mut full_paint = full_damage || epoch_full;
     let report = match report {
         Some(damage) => {
             window.tree.note_paint_frame(false, 0);
             PaintReport {
                 rebuilt: 0,
                 damage,
+                order_rebuilt: false,
                 stale_text: smallvec::SmallVec::new(),
                 unresolved_canvas_text: 0,
                 skipped_inline_images: smallvec::SmallVec::new(),
@@ -121,30 +128,7 @@ pub(crate) fn paint_frame(
         }
         None => {
             let dirty = window.tree.take_paint_work();
-            let mut full = full_damage || !removed.is_empty() || epoch_changed;
-            if !full {
-                for &node in &dirty {
-                    if window.tree.get(node).is_err() {
-                        continue;
-                    }
-                    let Some(lane) = window.tree.lane_of(node) else {
-                        full = true;
-                        break;
-                    };
-                    if window
-                        .scene
-                        .lane_primitives(lane)
-                        .is_none_or(<[Primitive]>::is_empty)
-                    {
-                        full = true;
-                        break;
-                    }
-                    if window.tree.clip_key(node).is_none() {
-                        full = true;
-                        break;
-                    }
-                }
-            }
+            let mut full = full_paint;
             if !full && scroll_damage_pending && !sync_scroll_offsets(window) {
                 full = true;
             }
@@ -171,14 +155,27 @@ pub(crate) fn paint_frame(
                 #[cfg(feature = "test-support")]
                 log: PaintLog::default(),
             };
-            if full {
+            let paint_report = if full {
                 pass.run()?
             } else {
                 pass.run_incremental()?
-            }
+            };
+            full_paint = full;
+            paint_report
         }
     };
     let mut report = report;
+    if !full_paint && !report.order_rebuilt && (structure_changed || !removed.is_empty()) {
+        let Window {
+            tree,
+            scene,
+            paint_order,
+            ..
+        } = window;
+        crate::paint::pass::rebuild_order_only(tree, paint_order);
+        scene.set_order(paint_order);
+        tree.note_order_rebuild();
+    }
     let surface = window.surface;
     let mut delta = SceneDelta::empty(FrameHeader {
         window: window.id(),
@@ -456,6 +453,61 @@ mod tests {
             counters.incremental_frames,
             counters_before.incremental_frames + 1,
             "本帧必须走增量路径"
+        );
+    }
+
+    #[test]
+    fn a_structural_frame_rebuilds_the_order_once() {
+        let runtime = runtime();
+        let mut app = App::new(runtime.handle().clone());
+        let window = headless_window(&mut app);
+        let root = app.window(window).expect("窗口存在").tree().root();
+        let tile = |tree: &mut crate::node::tree::NodeTree, y: f32| {
+            NodeBuilder::boxed()
+                .layout_override(LogicalRect::new(px(0.0), px(y), px(24.0), px(6.0)))
+                .paint(PaintSpec {
+                    background: Color::WHITE,
+                    ..PaintSpec::default()
+                })
+                .build(tree, root)
+                .expect("节点")
+        };
+        {
+            let tree = app.window_mut(window).expect("窗口存在").tree_mut();
+            for index in 0..4 {
+                tile(tree, index as f32 * 8.0);
+            }
+        }
+        frame_once(&mut app, window);
+        assert_eq!(
+            counters(&app, window).order_rebuilds,
+            0,
+            "全量帧不得走 order 增量重建"
+        );
+
+        let added = {
+            let tree = app.window_mut(window).expect("窗口存在").tree_mut();
+            tile(tree, 40.0)
+        };
+        let before = counters(&app, window).order_rebuilds;
+        frame_once(&mut app, window);
+        assert_eq!(
+            counters(&app, window).order_rebuilds,
+            before + 1,
+            "新增节点的结构帧只能重建一次 order"
+        );
+
+        let before = counters(&app, window).order_rebuilds;
+        app.window_mut(window)
+            .expect("窗口存在")
+            .tree_mut()
+            .remove(added)
+            .expect("移除节点");
+        frame_once(&mut app, window);
+        assert_eq!(
+            counters(&app, window).order_rebuilds,
+            before + 1,
+            "删除节点的结构帧只能重建一次 order"
         );
     }
 

@@ -6,7 +6,7 @@ use time::UtcOffset;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
-    math::{LogicalPoint, LogicalPx, LogicalRect, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch, style_builder::StyleBuilder},
 };
@@ -188,7 +188,7 @@ fn samples_of(series: &PredictionMarketSeries) -> Vec<Sample> {
 
 struct PreparedKey {
     snapshot: Arc<PredictionMarketSnapshot>,
-    bounds: LogicalRect,
+    size: LogicalSize,
     time_zone: UtcOffset,
     language: LanguageCode,
 }
@@ -196,7 +196,7 @@ struct PreparedKey {
 impl PreparedKey {
     fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.snapshot, &other.snapshot)
-            && self.bounds == other.bounds
+            && self.size == other.size
             && self.time_zone == other.time_zone
             && self.language == other.language
     }
@@ -205,7 +205,7 @@ impl PreparedKey {
 #[derive(Clone, Debug)]
 struct PaintedKey {
     snapshot: Arc<PredictionMarketSnapshot>,
-    bounds: LogicalRect,
+    size: LogicalSize,
     time_zone: UtcOffset,
     language: LanguageCode,
     colors: ChartColors,
@@ -217,7 +217,7 @@ struct PaintedKey {
 impl PartialEq for PaintedKey {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.snapshot, &other.snapshot)
-            && self.bounds == other.bounds
+            && self.size == other.size
             && self.time_zone == other.time_zone
             && self.language == other.language
             && self.colors == other.colors
@@ -317,8 +317,8 @@ impl ChartCanvas {
         let Ok(target) = cx.tree().get(node) else {
             return Ok(false);
         };
-        let bounds = whole_pixel_bounds(target.layout().bounds);
-        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+        let size = whole_pixel_size(target.layout().bounds.size);
+        if size.width <= px(0.0) || size.height <= px(0.0) {
             return Ok(false);
         }
 
@@ -326,7 +326,7 @@ impl ChartCanvas {
         let language = *cx.read(&cx.language());
         let key = PreparedKey {
             snapshot: Arc::clone(snapshot),
-            bounds,
+            size,
             time_zone,
             language,
         };
@@ -336,7 +336,8 @@ impl ChartCanvas {
             .is_some_and(|(cached, _)| cached.matches(&key))
         {
             let translate = cx.translate().clone();
-            let prepared = PreparedChart::new(snapshot, bounds, time_zone, &translate);
+            let local = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
+            let prepared = PreparedChart::new(snapshot, local, time_zone, &translate);
             self.replace_meshes(cx, &prepared);
             #[cfg(test)]
             {
@@ -348,12 +349,16 @@ impl ChartCanvas {
             return Ok(false);
         };
 
+        let pointer = pointer.and_then(|pointer| {
+            let hit = cx.tree().hit_test(pointer)?;
+            (hit.node == node).then_some(hit.local_point)
+        });
         let appearance = cx.theme().current(cx.app());
         let colors = ChartColors::resolve(cx.theme().theme_for(appearance));
         let hovered = pointer.and_then(|pointer| prepared.hover_at(pointer));
         let painted = PaintedKey {
             snapshot: Arc::clone(snapshot),
-            bounds,
+            size,
             time_zone,
             language,
             colors,
@@ -461,11 +466,9 @@ fn register_line(
     }
 }
 
-fn whole_pixel_bounds(bounds: LogicalRect) -> LogicalRect {
-    LogicalRect::new(
-        px(bounds.origin.x.value().round()),
-        px(bounds.origin.y.value().round()),
-        px(bounds.size.width.value().round()),
-        px(bounds.size.height.value().round()),
+fn whole_pixel_size(size: LogicalSize) -> LogicalSize {
+    LogicalSize::new(
+        px(size.width.value().round()),
+        px(size.height.value().round()),
     )
 }

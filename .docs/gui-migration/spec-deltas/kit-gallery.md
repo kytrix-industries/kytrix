@@ -692,3 +692,31 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 | 5 | Backspace / Ctrl+V / Ctrl+A / Esc | 只删 1 个字素、粘贴后无方块、无 `0x01`/`0x1B` 混入（四个实机 BUG 的第 ④ 条） |
 | 6 | 点击输入框 padding / border / 滚动条 gutter | 焦点不丢（整盒可点，§11.2 ㉗）；caret 落在**点击处**（P4-10 / ㊳） |
 | 7 | IME 候选窗（中文输入） | 候选窗贴在 caret 行盒位置；输入框不可见（`opacity=0`/零尺寸/被裁剪）时不定位（㉟） |
+
+## 13. P0 浮层重构（popup-overlay-redesign）对 gallery 的影响（2026-11-26 回写）
+
+> 依据：`.docs/popup-overlay-redesign-design.md` §6 P0、§7.4/§7.5、§8、§11（P0 实施回写）；实现位于 `crates/ui_kit/examples/gallery.rs`（P2-5 的 `crates/base_ui/...` 路径已随批次迁移，语义不变）。
+
+### 13.1 新增 `--pixel-check`（headless 持久增量像素门禁）
+
+- 命令：`cargo run -p ui_kit --example gallery -- --pixel-check`（PowerShell 先设 `$env:CARGO_TARGET_DIR='E:\kytrix\target'`）。
+- 退出码：**0 = PASS，3 = FAIL**；PASS/FAIL 行同时打印 `checks`、`sampled_frames`、`damage_full_frames`、`first_visible/stable/moved` rect。
+- 实现：headless 镜像 `TestApp` + 离屏 `GpuRenderer` + `PersistentPixels`（同一 persist 纹理跨帧、按 `FrameRecord.damage/damage_full` 走增量 + damage scissor、readback 后逐像素比较）；不依赖真实窗口 readback。
+- 断言（`checks` = `record()` 调用数，无手工增量）：**108 条 = 45 条逐帧采样断言（44 changed-outside-damage + 1 full-replay 首帧）（采样帧逐帧）+ 20 idle-frames + 20 background-residue + 3 restored + 2 close-frames + 18 条具名不变量**；具名不变量含 `baseline-opaque`、`open/open-settle`、`first-visible-rect`、`idle-no-animation`、`move-closed(-return)-settle`、`move-settle`、`old-region`、`old-region-coverage`、`residue-detector`、`move-panel`、`close`、`close-restore-settle`、`reopen(-settle/-rect/-close)`。
+- 残影判定口径：移动后对“旧浮层区域 − 新浮层 − 新旧 trigger（各外扩 16 px）”全区域对打开前基线逐像素扫描；**覆盖量下限** `compared ≥ fixture 设备像素 × 30‰`（本机实测 26104/480000 ≈ 5.44%，防排除区膨胀假绿）；**负向自检**在比较集首/尾注入 2 个分散旧色板像素，要求检测到 `mismatched ≥ 2`；idle 采样 137 ms × 20 且先断言“无动画源”；容差通道 span ≤ 2。
+- 迁移登记：该门禁绑定旧 `kit::overlay`（`Overlay::revealed/panel_node/open`）与 `ColorPicker`，P1-11 会删除这些 API → **P1-12 必须重写为 popup 栈 + `debug_stack` + 像素断言，并保留命令名与退出码**（设计 §8 已登记）。
+
+### 13.2 P0-8：旧 kit `Overlay` 首帧最小修复
+
+- `Overlay::open` 现在在 open 内完成 **measure（`App::refresh_text` + `Window::compute_layout`）→ place → reveal**，首可见帧 rect == 稳定帧；宿主不逐帧 `sync()` 也会显示，`place()` 不再承担首次 reveal（R-05）。
+- `ColorPicker::open`/`open_panel` 返回 `Result<bool, OverlayError>`：内容构建或 measure 失败会关闭回滚并返回强类型错误（Q-04）。
+- gallery 的 `overlay-check`/首帧断言依赖这两条语义；P0-8 是 **P1-11 会整体删除的过渡 API 的一部分**，迁移要求同 13.1。
+
+### 13.3 `--dump-overlay` 语义
+
+- 真实窗口 `--dump-overlay` 仍只断言 rect/children（不读像素）；真实窗口像素 readback/截图门禁登记为 **P3-6**（方案待定：readback vs 截图），届时与 headless `--pixel-check` 合并为同一退出码。`--idle-check`/`--theme-check` 语义不受 P0 影响。
+
+### 13.4 与本文档前批次记录的关系
+
+- 本文档 §9–§12 的 P2-5/P2-6b/P2-6c 记录保持不变；P0 的新增门禁与 P0-8 行为是**浮层重构阶段**的增量，不改变 gallery 的 ①–⑳ 场景结构与 `--theme-check`/`--idle-check` 口径。
+- 旧 `overlay::Overlay`/`Layer`/`Band` 的删除与 popup 栈切换在 P1-11 进行；在那之前 gallery 仍用旧 kit Overlay，`--pixel-check` 的迁移必须与 P1-11 同批完成（P1-12）。

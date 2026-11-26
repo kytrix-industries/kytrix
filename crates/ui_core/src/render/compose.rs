@@ -617,6 +617,171 @@ mod tests {
     }
 
     #[test]
+    fn releasing_a_lane_rebuilds_the_ops_without_the_freed_range() {
+        let mut fixture = Fixture::new(3);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let first = fixture.compose(&delta);
+        assert_eq!(first.stats.drawn_instances, 3);
+
+        let removed = fixture.scene.order()[1];
+        let remaining: Vec<_> = fixture
+            .scene
+            .order()
+            .iter()
+            .copied()
+            .filter(|lane| *lane != removed)
+            .collect();
+        fixture.scene.release_lane(removed);
+        fixture.scene.set_order(&remaining);
+        let mut delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        fixture.builder.note_removed(removed, &mut delta);
+        let composed = fixture.compose(&delta);
+
+        assert_eq!(
+            composed.stats.drawn_instances, 2,
+            "被释放 lane 的实例必须从 ops 里消失"
+        );
+        assert_eq!(
+            fixture.composer.encoder.fast_encodes(),
+            0,
+            "释放 lane 必须走全量 ops 重建，而不是增量快路径"
+        );
+        let ops: Vec<[u32; 2]> = fixture
+            .composer
+            .buffer()
+            .ops()
+            .iter()
+            .map(|op| match *op {
+                crate::paint::instance::FrameOp::Instances { start, len, .. } => [start, len],
+                crate::paint::instance::FrameOp::Geometry { .. } => panic!("没有几何 op"),
+            })
+            .collect();
+        let total: u32 = ops.iter().map(|entry| entry[1]).sum();
+        assert_eq!(total, 2, "ops 只能覆盖存活 lane 的实例区间：{ops:?}");
+    }
+
+    #[test]
+    fn a_removal_note_with_a_stale_generation_keeps_the_live_lane() {
+        let mut fixture = Fixture::new(1);
+        let delta = fixture.frame(Plan::Full, true, &[]);
+        let _ = fixture.compose(&delta);
+        let live = fixture.scene.order()[0];
+        assert_eq!(fixture.composer.lanes.len(), 1);
+
+        let stale = crate::paint::scene::LaneId::for_test(live.slot(), live.generation() + 1);
+        let mut delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        fixture.builder.note_removed(stale, &mut delta);
+        let _ = fixture.compose(&delta);
+        assert_eq!(
+            fixture.composer.lanes.len(),
+            1,
+            "generation 不匹配的移除通知不得把存活 lane 从 LaneStore 摘掉"
+        );
+
+        let added = fixture.scene.new_lane();
+        assert!(fixture.scene.push(added, quad()));
+        let order: Vec<_> = fixture
+            .scene
+            .order()
+            .iter()
+            .copied()
+            .chain([added])
+            .collect();
+        fixture.scene.set_order(&order);
+        let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
+        assert!(delta.order.is_some(), "新增 lane 必须重发绘制序");
+        let composed = fixture.compose(&delta);
+        assert_eq!(
+            composed.stats.encoded_lanes, 1,
+            "order 变化必须全量扫描：只有新增 lane 需要重编码"
+        );
+        assert_eq!(
+            composed.stats.reused_segments, 1,
+            "存活 lane 的实例段必须被复用"
+        );
+        let total: u32 = fixture
+            .composer
+            .buffer()
+            .ops()
+            .iter()
+            .map(|op| match *op {
+                crate::paint::instance::FrameOp::Instances { len, .. } => len,
+                crate::paint::instance::FrameOp::Geometry { .. } => panic!("没有几何 op"),
+            })
+            .sum();
+        assert_eq!(
+            total, 2,
+            "存活 lane 与新增 lane 的实例区间都必须出现在 ops 中（静默丢段会只剩 1）"
+        );
+    }
+
+    #[test]
+    fn reordering_lanes_without_removal_rebuilds_the_ops() {
+        let mut scene = Scene::empty();
+        let mut order = Vec::with_capacity(3);
+        for index in 0..3u32 {
+            let lane = scene.new_lane();
+            assert!(scene.push(
+                lane,
+                Primitive::Quad(Quad {
+                    bounds: LogicalRect::new(px(index as f32 * 10.0), px(0.0), px(4.0), px(4.0)),
+                    corner_radius: [px(0.0); 4],
+                    paint: QuadPaint::Solid {
+                        fill: Color::WHITE,
+                        border: None,
+                    },
+                })
+            ));
+            order.push(lane);
+        }
+        scene.set_order(&order);
+        let store = crate::paint::geometry_store::GeometryStore::new();
+        let mut builder = DeltaBuilder::new();
+        let mut composer = WindowComposer::new();
+        let mut delta = SceneDelta::empty(header(1, Plan::Full, DevicePixelRatio::ONE));
+        builder.collect(&mut scene, &store, &[], true, &mut delta);
+        let _ = composer.compose(&delta, ColorResolver).expect("首帧");
+
+        scene.set_order(&[order[2], order[0], order[1]]);
+        let mut delta = SceneDelta::empty(header(
+            2,
+            Plan::Partial(DamageRects::new()),
+            DevicePixelRatio::ONE,
+        ));
+        builder.collect(&mut scene, &store, &[], false, &mut delta);
+        assert!(delta.order.is_some(), "仅顺序变化必须发布新的绘制序");
+        assert!(delta.lanes.is_empty(), "仅顺序变化不得带 lane 内容");
+        assert!(delta.removed.is_empty(), "仅顺序变化不得带移除通知");
+        let composed = composer.compose(&delta, ColorResolver).expect("重排帧");
+        assert_eq!(
+            composer.encoder.fast_encodes(),
+            0,
+            "仅顺序变化必须走全量 ops 重建，而不是增量快路径"
+        );
+        assert_eq!(composed.stats.drawn_instances, 3);
+        assert_eq!(
+            composed.stats.reused_segments, 3,
+            "仅顺序变化只重排 ops：三条 lane 的实例段都应复用"
+        );
+        let orders: Vec<(i32, i32)> = composer
+            .buffer()
+            .ops()
+            .iter()
+            .map(|op| match *op {
+                crate::paint::instance::FrameOp::Instances { bounds, .. } => {
+                    (bounds.x0.value(), bounds.x1.value())
+                }
+                crate::paint::instance::FrameOp::Geometry { .. } => panic!("没有几何 op"),
+            })
+            .collect();
+        assert_eq!(
+            orders,
+            vec![(18, 26), (-2, 16)],
+            "ops 必须按新的绘制序分组：lane2 独占一组，lane0+lane1 连续成第二组（旧序只会是一组）：{orders:?}"
+        );
+    }
+
+    #[test]
     fn a_shrinking_relayout_survives_two_full_frames_being_coalesced() {
         const LANES: usize = 4;
         let mut fixture = Fixture::new(LANES);

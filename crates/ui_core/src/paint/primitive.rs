@@ -20,7 +20,31 @@ pub enum Primitive {
     Shadow(Shadow),
     Clip(ClipOp),
     Geometry(GeometryDraw),
-    Canvas(Arc<Canvas>),
+    Canvas(CanvasDraw),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasDraw {
+    pub canvas: Arc<Canvas>,
+    pub offset: LogicalPoint,
+}
+
+impl CanvasDraw {
+    #[must_use]
+    pub fn new(canvas: Arc<Canvas>) -> Self {
+        Self {
+            canvas,
+            offset: LogicalPoint::ZERO,
+        }
+    }
+}
+
+impl std::ops::Deref for CanvasDraw {
+    type Target = Canvas;
+
+    fn deref(&self) -> &Self::Target {
+        &self.canvas
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,8 +153,8 @@ mod tests {
     use std::{mem::size_of, sync::Arc};
 
     use super::{
-        Border, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, GradientKind, Image, Path,
-        PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
+        Border, CanvasDraw, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, GradientKind,
+        Image, Path, PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
     };
     use crate::{
         math::{LogicalPoint, LogicalRect, LogicalSize, Transform, px},
@@ -240,7 +264,10 @@ mod tests {
                     Color::WHITE,
                 )),
             ),
-            ("Canvas", Primitive::Canvas(Arc::new(Canvas::new(rect())))),
+            (
+                "Canvas",
+                Primitive::Canvas(CanvasDraw::new(Arc::new(Canvas::new(rect())))),
+            ),
         ]
     }
 

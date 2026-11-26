@@ -153,7 +153,8 @@ mod tests {
             atlas::{AtlasKind, AtlasTile},
             color::Color,
             primitive::{
-                ClipRect, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
+                CanvasDraw, ClipRect, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint,
+                Shadow,
             },
             scene::MAX_CLIP_DEPTH,
         },
@@ -358,7 +359,7 @@ mod tests {
         let mut inner = Canvas::new(bounds());
         inner.push_quad(quad());
         let mut canvas = Canvas::new(bounds());
-        canvas.push_primitive(Primitive::Canvas(Arc::new(inner)));
+        canvas.push_primitive(Primitive::Canvas(CanvasDraw::new(Arc::new(inner))));
         assert!(matches!(
             canvas.primitives()[0],
             Primitive::Canvas(ref nested) if nested.primitives().len() == 1

@@ -12,7 +12,7 @@ use crate::{
     interaction::{
         AnimatedValue, AnimationSpec, Easing, ScrollConfig, ScrollHandle, VirtualListConfig,
     },
-    math::{LogicalPoint, LogicalRect, LogicalSize, px},
+    math::{DeviceRect, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         dirty::DirtyFlags,
@@ -20,7 +20,10 @@ use crate::{
         signal::{Signal, Transient},
     },
     paint::{
-        style::{Clip, Style, StylePatch},
+        canvas::Canvas,
+        color::Color,
+        primitive::{Quad, QuadPaint},
+        style::{Clip, PaintSpec, ShadowSpec, Shadows, Style, StylePatch},
         style_builder::StyleBuilder,
     },
     window::{FrameOutcome, WindowId, WindowOptions},
@@ -1081,4 +1084,878 @@ fn remove_node_with_scope_rejects_provable_scope_mismatch() {
         Err(EngineError::StaleNode { node }) if node == stale
     ));
     assert_eq!(*app.read(&signal_live), 3, "StaleNode 路径不得释放 scope");
+}
+
+fn frame_once(app: &mut App, window: WindowId) {
+    let _ = app.frame(window).expect("window").expect("frame");
+}
+
+fn painted_extent(app: &App, window: WindowId, node: NodeId) -> LogicalRect {
+    app.window(window)
+        .expect("window")
+        .tree()
+        .painted_extent(node)
+        .expect("已绘制节点必须记录 painted_extent")
+        .layout_bounds()
+}
+
+fn latest_record(app: &App, window: WindowId) -> crate::test_support::record::FrameRecord {
+    app.window(window)
+        .expect("window")
+        .record()
+        .expect("提交帧必须留下 FrameRecord")
+        .clone()
+}
+
+fn assert_damage_covers_extent(
+    app: &App,
+    window: WindowId,
+    damage: &[DeviceRect],
+    extent: LogicalRect,
+    label: &str,
+) {
+    let dpr = app
+        .window(window)
+        .expect("window")
+        .device_pixel_ratio()
+        .factor();
+    let max = extent.max();
+    let center = LogicalPoint::new(
+        extent.origin.x + extent.size.width / 2.0,
+        extent.origin.y + extent.size.height / 2.0,
+    );
+    for point in [
+        LogicalPoint::new(extent.origin.x + px(0.5), extent.origin.y + px(0.5)),
+        LogicalPoint::new(max.x - px(0.5), extent.origin.y + px(0.5)),
+        LogicalPoint::new(extent.origin.x + px(0.5), max.y - px(0.5)),
+        LogicalPoint::new(max.x - px(0.5), max.y - px(0.5)),
+        center,
+    ] {
+        let x = (point.x.value() * dpr).floor() as i32;
+        let y = (point.y.value() * dpr).floor() as i32;
+        assert!(
+            damage.iter().any(|rect| {
+                rect.x0.value() <= x
+                    && x < rect.x1.value()
+                    && rect.y0.value() <= y
+                    && y < rect.y1.value()
+            }),
+            "{label} extent {extent:?} 的角点 {point:?} 必须被 damage 覆盖：{damage:?}"
+        );
+    }
+}
+
+fn shadowed_paint() -> PaintSpec {
+    PaintSpec {
+        background: Color::WHITE,
+        shadows: Shadows::from(ShadowSpec {
+            offset: LogicalPoint::new(px(0.0), px(6.0)),
+            blur: px(12.0),
+            spread: px(0.0),
+            color: Color::BLACK,
+        }),
+        ..PaintSpec::default()
+    }
+}
+
+fn positioned(rect: LogicalRect) -> Style {
+    let mut style = StyleBuilder::new()
+        .absolute()
+        .size(rect.size.width, rect.size.height)
+        .build();
+    style.inset(
+        taffy::style::LengthPercentageAuto::length(rect.origin.y.value()),
+        taffy::style::LengthPercentageAuto::length(0.0),
+        taffy::style::LengthPercentageAuto::length(0.0),
+        taffy::style::LengthPercentageAuto::length(rect.origin.x.value()),
+    );
+    style
+}
+
+#[test]
+fn removing_a_painted_subtree_damages_every_extent_without_a_full_frame() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let container = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(100.0),
+            px(80.0),
+        )))
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("container");
+    let panel = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(90.0),
+            px(70.0),
+            px(80.0),
+            px(60.0),
+        )))
+        .paint(shadowed_paint())
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            container,
+        )
+        .expect("panel");
+    let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(30.0)));
+    canvas.push_quad(Quad {
+        bounds: canvas.bounds(),
+        corner_radius: [px(0.0); 4],
+        paint: QuadPaint::Solid {
+            fill: Color::WHITE,
+            border: None,
+        },
+    });
+    let chart = NodeBuilder::canvas(canvas)
+        .style(positioned(LogicalRect::new(
+            px(10.0),
+            px(10.0),
+            px(20.0),
+            px(10.0),
+        )))
+        .build(app.window_mut(window).expect("window").tree_mut(), panel)
+        .expect("chart");
+    frame_once(&mut app, window);
+
+    let panel_extent = painted_extent(&app, window, panel);
+    let chart_extent = painted_extent(&app, window, chart);
+    assert!(
+        panel_extent.max().y >= px(155.0),
+        "面板 extent 必须含阴影 blur 外溢（盒底 130 + offset 6 + pad 19）：{panel_extent:?}"
+    );
+    assert!(
+        chart_extent.size.width >= px(40.0) && chart_extent.size.height >= px(30.0),
+        "Canvas extent 必须是画布内容外延：{chart_extent:?}"
+    );
+    assert!(
+        panel_extent.max().x > px(100.0) && panel_extent.max().y > px(80.0),
+        "前置条件：面板绘制外延必须溢出父容器盒，才能区分 extent 与 layout.bounds：{panel_extent:?}"
+    );
+
+    let outcome = app.remove_node(window, panel).expect("remove panel");
+    assert_eq!(outcome.removed_nodes, 2, "面板 + 画布");
+    frame_once(&mut app, window);
+
+    let record = latest_record(&app, window);
+    assert!(!record.damage_full, "删除子树不得退化为整帧");
+    assert_damage_covers_extent(&app, window, &record.damage, panel_extent, "面板旧");
+    assert_damage_covers_extent(&app, window, &record.damage, chart_extent, "画布旧");
+}
+
+#[test]
+fn moving_a_shadowed_panel_damages_the_old_and_new_extents_without_a_full_frame() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let panel = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(20.0),
+            px(20.0),
+            px(120.0),
+            px(80.0),
+        )))
+        .paint(shadowed_paint())
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("panel");
+    frame_once(&mut app, window);
+    let old_extent = painted_extent(&app, window, panel);
+    assert!(
+        old_extent.max().y >= px(125.0),
+        "旧 extent 必须含阴影外溢：{old_extent:?}"
+    );
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_absolute_inset(panel, LogicalPoint::new(px(60.0), px(50.0)));
+    frame_once(&mut app, window);
+
+    let record = latest_record(&app, window);
+    assert!(!record.damage_full, "移动面板不得退化为整帧");
+    let new_extent = painted_extent(&app, window, panel);
+    assert!(
+        new_extent.origin.x >= px(40.0) && new_extent.origin.y >= px(35.0),
+        "新 extent 必须跟随新位置（含阴影外溢）：{new_extent:?}"
+    );
+    assert_damage_covers_extent(&app, window, &record.damage, old_extent, "旧面板");
+    assert_damage_covers_extent(&app, window, &record.damage, new_extent, "新面板");
+}
+
+#[test]
+fn inserting_a_shadowed_subtree_paints_incrementally() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    frame_once(&mut app, window);
+    let panel = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(120.0),
+            px(90.0),
+            px(160.0),
+            px(100.0),
+        )))
+        .paint(shadowed_paint())
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("panel");
+    frame_once(&mut app, window);
+
+    let record = latest_record(&app, window);
+    assert!(!record.damage_full, "插入子树不得整帧");
+    assert_eq!(record.delta.removed, 0, "插入帧不得报告移除");
+    assert!(
+        record.dirty_nodes.contains(&panel),
+        "新子树必须重建 lane：{:?}",
+        record.dirty_nodes
+    );
+    let extent = painted_extent(&app, window, panel);
+    assert!(
+        extent.max().y >= px(215.0),
+        "新子树 extent 必须含阴影 blur 外溢（盒底 190 + offset 6 + pad 19）：{extent:?}"
+    );
+    assert_damage_covers_extent(&app, window, &record.damage, extent, "新插入");
+
+    settle(&mut app, window);
+}
+
+#[test]
+fn removing_a_painted_subtree_stays_incremental_and_reports_delta_removed() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let panel = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(120.0),
+            px(90.0),
+            px(160.0),
+            px(100.0),
+        )))
+        .paint(shadowed_paint())
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("panel");
+    let survivor = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(20.0),
+            px(20.0),
+            px(60.0),
+            px(40.0),
+        )))
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("survivor");
+    let bystander = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(20.0),
+            px(240.0),
+            px(60.0),
+            px(40.0),
+        )))
+        .paint(PaintSpec {
+            background: Color::BLACK,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("bystander");
+    frame_once(&mut app, window);
+    let extent = painted_extent(&app, window, panel);
+
+    app.remove_node(window, panel).expect("remove panel");
+    frame_once(&mut app, window);
+    let record = latest_record(&app, window);
+    assert!(!record.damage_full, "删除子树不得整帧");
+    assert_eq!(record.delta.removed, 1, "删除帧必须报告一条 lane 释放");
+    assert!(!record.delta.full, "删除帧的 delta 不得退化为 full");
+    assert_damage_covers_extent(&app, window, &record.damage, extent, "被删面板旧");
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_absolute_inset(survivor, LogicalPoint::new(px(30.0), px(30.0)));
+    let _ = bystander;
+    frame_once(&mut app, window);
+    let reuse = latest_record(&app, window);
+    assert!(!reuse.damage_full, "删除后的局部改动不得整帧");
+    assert!(
+        reuse.stats.reused_segments > 0,
+        "删除之后未变化 lane 的实例段必须继续复用：{:?}",
+        reuse.stats
+    );
+}
+
+#[test]
+fn reordering_a_subtree_stays_incremental_and_damages_its_extent() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let bottom = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(100.0),
+            px(100.0),
+            px(120.0),
+            px(80.0),
+        )))
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("bottom");
+    let top = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(140.0),
+            px(120.0),
+            px(120.0),
+            px(80.0),
+        )))
+        .paint(PaintSpec {
+            background: Color::BLACK,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("top");
+    frame_once(&mut app, window);
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .get(root)
+            .expect("root")
+            .children()[1],
+        top,
+        "前置条件：top 在绘制序末尾"
+    );
+    let extents: Vec<LogicalRect> = [bottom, top]
+        .iter()
+        .map(|node| painted_extent(&app, window, *node))
+        .collect();
+    assert!(
+        !extents[0].intersect(extents[1]).is_empty(),
+        "前置条件：两个节点必须空间重叠"
+    );
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .append_child(root, bottom)
+        .expect("reorder bottom to front");
+    frame_once(&mut app, window);
+
+    let record = latest_record(&app, window);
+    assert!(!record.damage_full, "重排子树不得整帧");
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .get(root)
+            .expect("root")
+            .children()[1],
+        bottom,
+        "重排后 bottom 必须在绘制序末尾"
+    );
+    assert_damage_covers_extent(
+        &app,
+        window,
+        &record.damage,
+        extents[0],
+        "重排后被提到最上层的节点",
+    );
+}
+
+#[test]
+fn registering_a_scroll_container_is_the_only_structural_full_downgrade() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    frame_once(&mut app, window);
+
+    let viewport = NodeBuilder::boxed()
+        .style({
+            let mut style = positioned(LogicalRect::new(px(40.0), px(40.0), px(200.0), px(160.0)));
+            style.clip = Clip::Bounds;
+            style
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("viewport");
+    let handle = app
+        .make_scroll(window, viewport, ScrollConfig::default())
+        .expect("scroll container");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(800.0)))
+        .expect("content size");
+    let full_frames_before = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .paint_counters()
+        .full_frames;
+    frame_once(&mut app, window);
+    let downgraded = latest_record(&app, window);
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .paint_counters()
+            .full_frames,
+        full_frames_before + 1,
+        "滚动容器注册变化必须安全降级为全量绘制遍历"
+    );
+    assert!(
+        !downgraded.damage_full,
+        "降级只重建槽位表与受影响 lane，damage 仍必须局部：{:?}",
+        downgraded.damage
+    );
+
+    let plain = NodeBuilder::boxed()
+        .style(positioned(LogicalRect::new(
+            px(10.0),
+            px(10.0),
+            px(40.0),
+            px(30.0),
+        )))
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("plain popup");
+    frame_once(&mut app, window);
+    let incremental = latest_record(&app, window);
+    assert!(
+        !incremental.damage_full,
+        "普通（无滚动）结构变化必须回到增量：{:?}",
+        incremental.damage
+    );
+    let extent = painted_extent(&app, window, plain);
+    assert_damage_covers_extent(&app, window, &incremental.damage, extent, "普通弹层");
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .paint_counters()
+            .full_frames,
+        full_frames_before + 1,
+        "普通结构变化不得再触发全量遍历"
+    );
+
+    app.remove_node(window, viewport).expect("remove viewport");
+    frame_once(&mut app, window);
+    let removed = latest_record(&app, window);
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .paint_counters()
+            .full_frames,
+        full_frames_before + 2,
+        "移除滚动容器（槽位表变化）同样必须降级为全量绘制"
+    );
+    assert!(
+        !removed.damage_full,
+        "移除滚动容器的 damage 仍必须局部：{:?}",
+        removed.damage
+    );
+}
+#[test]
+fn adding_and_removing_scrolled_content_stays_incremental() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let viewport = NodeBuilder::boxed()
+        .style({
+            let mut style = positioned(LogicalRect::new(px(40.0), px(40.0), px(200.0), px(160.0)));
+            style.clip = Clip::Bounds;
+            style
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("viewport");
+    let handle = app
+        .make_scroll(window, viewport, ScrollConfig::default())
+        .expect("scroll container");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(800.0)))
+        .expect("content size");
+    frame_once(&mut app, window);
+    let full_frames = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .paint_counters()
+        .full_frames;
+
+    let row = NodeBuilder::boxed()
+        .layout_override(LogicalRect::new(px(10.0), px(120.0), px(120.0), px(40.0)))
+        .paint(shadowed_paint())
+        .build(app.window_mut(window).expect("window").tree_mut(), viewport)
+        .expect("row");
+    frame_once(&mut app, window);
+    let inserted = latest_record(&app, window);
+    assert!(!inserted.damage_full, "滚动容器内新增子树不得整帧");
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .paint_counters()
+            .full_frames,
+        full_frames,
+        "滚动容器内新增不得触发全量遍历（槽位表不变）"
+    );
+    let extent = painted_extent(&app, window, row);
+    let visible = extent.intersect(LogicalRect::new(px(40.0), px(40.0), px(200.0), px(160.0)));
+    assert!(
+        !visible.is_empty(),
+        "前置条件：新行必须在视口内可见：{extent:?}"
+    );
+    assert_damage_covers_extent(
+        &app,
+        window,
+        &inserted.damage,
+        visible,
+        "滚动容器内新行的可见部分",
+    );
+
+    app.remove_node(window, row).expect("remove row");
+    frame_once(&mut app, window);
+    let removed = latest_record(&app, window);
+    assert!(!removed.damage_full, "滚动容器内删除子树不得整帧");
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .paint_counters()
+            .full_frames,
+        full_frames,
+        "滚动容器内删除不得触发全量遍历"
+    );
+    assert_eq!(removed.delta.removed, 1, "删除行必须报告 lane 释放");
+    assert_damage_covers_extent(&app, window, &removed.damage, extent, "滚动容器内旧行");
+}
+
+#[test]
+fn removing_a_scrolled_container_child_damages_its_screen_position() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let viewport = NodeBuilder::boxed()
+        .style({
+            let mut style = positioned(LogicalRect::new(px(40.0), px(40.0), px(200.0), px(160.0)));
+            style.clip = Clip::Bounds;
+            style
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("viewport");
+    let handle = app
+        .make_scroll(window, viewport, ScrollConfig::default())
+        .expect("scroll container");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(900.0)))
+        .expect("content size");
+    let row = NodeBuilder::boxed()
+        .layout_override(LogicalRect::new(px(10.0), px(360.0), px(120.0), px(40.0)))
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), viewport)
+        .expect("row");
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(300.0)))
+        .expect("scroll");
+    frame_once(&mut app, window);
+    let row_bounds = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(row)
+        .expect("row")
+        .layout()
+        .bounds;
+    let screen_extent = row_bounds.translate(LogicalPoint::new(px(0.0), px(-300.0)));
+    assert!(
+        !screen_extent
+            .intersect(LogicalRect::new(px(40.0), px(40.0), px(200.0), px(160.0)))
+            .is_empty(),
+        "前置条件：行必须出现在视口内：{screen_extent:?}"
+    );
+
+    app.remove_node(window, row).expect("remove row");
+    frame_once(&mut app, window);
+    let removed = latest_record(&app, window);
+    assert!(!removed.damage_full, "删除滚动容器直接子节点不得整帧");
+    assert_eq!(removed.delta.removed, 1, "删除行必须报告 lane 释放");
+    assert_damage_covers_extent(
+        &app,
+        window,
+        &removed.damage,
+        screen_extent,
+        "滚动容器直接子节点的屏幕位置",
+    );
+}
+
+fn assert_scroll_table(
+    app: &App,
+    window: WindowId,
+    container: NodeId,
+    expected_offset: LogicalPoint,
+) {
+    let target = app.window(window).expect("window");
+    let slots = target.scroll_slots();
+    assert_eq!(
+        slots.len(),
+        2,
+        "槽位表必须是「哨兵 + 唯一的虚拟列表容器」，不得留下 stale 槽：{slots:?}"
+    );
+    assert_eq!(slots[0].0, LogicalPoint::ZERO, "哨兵偏移必须为 0");
+    assert_eq!(
+        slots[1].0, expected_offset,
+        "槽位偏移必须等于容器当前的 scroll offset"
+    );
+    let bounds = target
+        .tree()
+        .get(container)
+        .expect("container")
+        .layout()
+        .bounds;
+    let expected_viewport = target.device_pixel_ratio().to_covering_device_rect(bounds);
+    assert_eq!(
+        slots[1].1, expected_viewport,
+        "槽位视口必须与容器的屏幕裁剪区一致"
+    );
+}
+
+#[test]
+fn a_virtual_list_keeps_its_scroll_table_consistent_across_item_churn_and_popups() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let container = {
+        let mut style = boxed_style(200.0, 120.0);
+        style.clip = Clip::Bounds;
+        style.position(taffy::style::Position::Relative);
+        NodeBuilder::boxed()
+            .style(style)
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("virtual container")
+    };
+    let list = app
+        .make_virtual_list(
+            window,
+            container,
+            VirtualListConfig {
+                extent: px(20.0),
+                extents: None,
+                overscan: 1,
+            },
+        )
+        .expect("virtual list");
+    let build_rows = |_index: usize| {
+        NodeBuilder::boxed().layout_override(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(180.0),
+            px(20.0),
+        ))
+    };
+    app.set_virtual_items(&list, 100, build_rows)
+        .expect("items");
+    frame_once(&mut app, window);
+    assert_scroll_table(&app, window, container, LogicalPoint::ZERO);
+
+    app.scroll_to(
+        &ScrollHandle::new(window, container),
+        LogicalPoint::new(px(0.0), px(600.0)),
+    )
+    .expect("scroll");
+    frame_once(&mut app, window);
+    let scrolled = latest_record(&app, window);
+    assert!(!scrolled.damage_full, "虚拟列表滚动不得整帧");
+    assert_eq!(scrolled.delta.scroll, 1, "滚动帧必须携带槽位增量");
+    assert_scroll_table(
+        &app,
+        window,
+        container,
+        LogicalPoint::new(px(0.0), px(600.0)),
+    );
+
+    app.set_virtual_items(&list, 140, build_rows)
+        .expect("grow items");
+    frame_once(&mut app, window);
+    let grown = latest_record(&app, window);
+    assert!(!grown.damage_full, "虚拟列表增行不得整帧");
+    assert_eq!(
+        grown.delta.scroll, 0,
+        "增行不得发布滚动表增量（否则说明槽位被错误重映射）"
+    );
+    assert_scroll_table(
+        &app,
+        window,
+        container,
+        LogicalPoint::new(px(0.0), px(600.0)),
+    );
+
+    app.set_virtual_items(&list, 80, build_rows)
+        .expect("shrink items");
+    frame_once(&mut app, window);
+    let shrunk = latest_record(&app, window);
+    assert!(!shrunk.damage_full, "虚拟列表减行不得整帧");
+    assert_eq!(shrunk.delta.scroll, 0, "减行不得发布滚动表增量");
+    assert_scroll_table(
+        &app,
+        window,
+        container,
+        LogicalPoint::new(px(0.0), px(600.0)),
+    );
+
+    let popup = NodeBuilder::boxed()
+        .layout_override(LogicalRect::new(px(10.0), px(160.0), px(120.0), px(80.0)))
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("popup");
+    frame_once(&mut app, window);
+    let opened = latest_record(&app, window);
+    assert!(!opened.damage_full, "虚拟列表存在时打开 popup 不得整帧");
+    assert_eq!(opened.delta.scroll, 0, "popup 开启不得改变滚动槽位表");
+    assert_scroll_table(
+        &app,
+        window,
+        container,
+        LogicalPoint::new(px(0.0), px(600.0)),
+    );
+
+    app.remove_node(window, popup).expect("close popup");
+    frame_once(&mut app, window);
+    let closed = latest_record(&app, window);
+    assert!(!closed.damage_full, "虚拟列表存在时关闭 popup 不得整帧");
+    assert_eq!(closed.delta.scroll, 0, "popup 关闭不得改变滚动槽位表");
+    assert_scroll_table(
+        &app,
+        window,
+        container,
+        LogicalPoint::new(px(0.0), px(600.0)),
+    );
+}
+
+#[test]
+fn removing_a_child_of_a_nested_scroll_container_damages_its_screen_position() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    let outer = NodeBuilder::boxed()
+        .style({
+            let mut style = positioned(LogicalRect::new(px(40.0), px(40.0), px(200.0), px(160.0)));
+            style.clip = Clip::Bounds;
+            style
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("outer viewport");
+    let outer_scroll = app
+        .make_scroll(window, outer, ScrollConfig::default())
+        .expect("outer scroll");
+    app.set_scroll_content(&outer_scroll, LogicalSize::new(px(200.0), px(900.0)))
+        .expect("outer content");
+    let inner = NodeBuilder::boxed()
+        .style({
+            let mut style = positioned(LogicalRect::new(px(0.0), px(300.0), px(200.0), px(160.0)));
+            style.clip = Clip::Bounds;
+            style
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("inner viewport");
+    let inner_scroll = app
+        .make_scroll(window, inner, ScrollConfig::default())
+        .expect("inner scroll");
+    app.set_scroll_content(&inner_scroll, LogicalSize::new(px(200.0), px(800.0)))
+        .expect("inner content");
+    let row = NodeBuilder::boxed()
+        .layout_override(LogicalRect::new(px(10.0), px(150.0), px(120.0), px(40.0)))
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    app.scroll_to(&outer_scroll, LogicalPoint::new(px(0.0), px(300.0)))
+        .expect("outer scroll");
+    app.scroll_to(&inner_scroll, LogicalPoint::new(px(0.0), px(50.0)))
+        .expect("inner scroll");
+    frame_once(&mut app, window);
+
+    let extent = painted_extent(&app, window, row);
+    let screen_extent = extent.translate(LogicalPoint::new(px(0.0), px(-350.0)));
+    assert_eq!(
+        screen_extent,
+        LogicalRect::new(px(50.0), px(140.0), px(120.0), px(40.0)),
+        "前置条件：行必须落在两层滚动后的屏幕位置"
+    );
+
+    app.remove_node(window, row).expect("remove row");
+    frame_once(&mut app, window);
+    let removed = latest_record(&app, window);
+    assert!(!removed.damage_full, "删除嵌套滚动容器的直接子节点不得整帧");
+    assert_damage_covers_extent(
+        &app,
+        window,
+        &removed.damage,
+        screen_extent,
+        "嵌套滚动容器的直接子节点屏幕位置（差的是内层容器自身的 scroll offset）",
+    );
+}
+
+fn register_triangle_geometry(app: &mut App) -> crate::paint::geometry::GeometryId {
+    use crate::paint::geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology};
+    let points = [[0.0f32, 0.0, -1.0], [20.0, 0.0, -1.0], [0.0, 10.0, -1.0]];
+    let vertex_bytes: Vec<u8> = points
+        .iter()
+        .flat_map(|point| point.iter().flat_map(|value| value.to_ne_bytes()))
+        .collect();
+    app.geometry_mut()
+        .insert(GeometryDesc {
+            vertex_bytes: bytes::Bytes::from(vertex_bytes),
+            index_bytes: bytes::Bytes::from_static(&[0u8, 0, 1, 0, 2, 0]),
+            vertex_stride: 12,
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(20.0), px(10.0)),
+            pipeline: GeometryPipeline::Ui,
+        })
+        .expect("注册三角几何")
+}
+
+#[test]
+fn standalone_geometry_structural_changes_escalate_to_full_damage() {
+    let (_rt, mut app, window) = setup();
+    let root = root(&app, window);
+    frame_once(&mut app, window);
+    let geometry = register_triangle_geometry(&mut app);
+    let node = NodeBuilder::geometry(geometry)
+        .layout_override(LogicalRect::new(px(20.0), px(20.0), px(80.0), px(60.0)))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("几何节点");
+    frame_once(&mut app, window);
+    assert!(
+        latest_record(&app, window).damage_full,
+        "I6 边界：新增独立 Geometry 节点（首帧布局变化）升级为整帧 damage"
+    );
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_layout_override(
+            node,
+            Some(crate::layout::LayoutOverride::new(LogicalRect::new(
+                px(200.0),
+                px(120.0),
+                px(80.0),
+                px(60.0),
+            ))),
+        )
+        .expect("移动几何节点");
+    frame_once(&mut app, window);
+    assert!(
+        latest_record(&app, window).damage_full,
+        "I6 边界：独立 Geometry 节点按布局移动仍升级为整帧 damage"
+    );
+
+    app.remove_node(window, node).expect("remove geometry node");
+    frame_once(&mut app, window);
+    assert!(
+        latest_record(&app, window).damage_full,
+        "I6 边界：删除独立 Geometry 节点仍升级为整帧 damage"
+    );
 }

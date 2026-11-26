@@ -12,7 +12,8 @@ use market_participants_model::{
 use smol_str::SmolStr;
 use ui_core::{
     event::{Event, InputEvent},
-    math::{LogicalPoint, px},
+    interaction::ScrollConfig,
+    math::{LogicalPoint, LogicalSize, px},
     node::{builder::NodeBuilder, tree::NodeKind},
     paint::canvas::Canvas,
 };
@@ -298,6 +299,32 @@ fn entries() -> Arc<[HeatMapEntry]> {
         notional_label: SmolStr::new_static("120"),
         direction: PriceDirection::Up,
     }])
+}
+
+fn four_entries() -> Arc<[HeatMapEntry]> {
+    let fixtures = [
+        ("BTC", "120", 120_u64),
+        ("ETH", "90", 90_u64),
+        ("SOL", "60", 60_u64),
+        ("XRP", "30", 30_u64),
+    ];
+    Arc::from(
+        fixtures
+            .into_iter()
+            .map(|(label, label_text, notional)| HeatMapEntry {
+                instrument: market_participants_connector::catalog::test_support::spot_token(
+                    "fixture", label, "USDT",
+                ),
+                base_asset_label: SmolStr::new(label),
+                notional_asset: market_participants_connector::catalog::test_support::token(
+                    "fixture", "USDT",
+                ),
+                notional: Quantity::from(notional),
+                notional_label: SmolStr::new(label_text),
+                direction: PriceDirection::Up,
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn ready(revision: u64) -> VolumeHeatMapStatus {
@@ -1907,4 +1934,123 @@ fn every_message_this_pane_shows_should_resolve_to_text() {
         );
     }
     let _ = &mut harness;
+}
+
+fn scroll_page(
+    harness: &mut WidgetTestApp,
+    page: NodeId,
+    viewport: LogicalSize,
+    content: LogicalSize,
+    offset: LogicalPoint,
+) {
+    let window = harness.window();
+    let container = harness.with_cx(|cx| {
+        let root = cx.tree().root();
+        let container = NodeBuilder::boxed()
+            .id("TEST_VOLUME_HEATMAP_SCROLL")
+            .style(
+                StyleBuilder::new()
+                    .width(viewport.width)
+                    .height(viewport.height)
+                    .flex_col()
+                    .overflow_hidden()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)
+            .expect("the scroll container builds");
+        cx.tree_mut()
+            .append_child(container, page)
+            .expect("the page moves under the scroll container");
+        cx.tree_mut()
+            .set_style(
+                page,
+                StyleBuilder::new()
+                    .width(content.width)
+                    .height(content.height)
+                    .flex_none()
+                    .flex_col()
+                    .build(),
+            )
+            .expect("the page takes the taller content box");
+        container
+    });
+    harness.drain();
+    let handle = harness
+        .app_mut()
+        .make_scroll(window, container, ScrollConfig::default())
+        .expect("the container scrolls");
+    harness
+        .app_mut()
+        .set_scroll_content(&handle, content)
+        .expect("the content size is valid");
+    harness
+        .app_mut()
+        .scroll_to(&handle, offset)
+        .expect("the offset is valid");
+    harness.drain();
+}
+
+#[test]
+fn a_pointer_in_a_scrolled_ancestor_should_still_hover_the_tile_under_it() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::new(&[binance()]);
+    let mut pane = pane(&mut harness, &directory);
+    load(&mut harness, &mut pane);
+    report_map(&mut harness, &mut pane, binance(), 1, four_entries());
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+
+    let offset = 300.0;
+    scroll_page(
+        &mut harness,
+        pane.page,
+        LogicalSize::new(px(640.0), px(600.0)),
+        LogicalSize::new(px(640.0), px(900.0)),
+        LogicalPoint::new(px(0.0), px(offset)),
+    );
+    frame(&mut harness, &mut pane);
+
+    let node = harness
+        .find_by_debug_prefix(pane.page, "TEST_VOLUME_HEATMAP_CANVAS")
+        .expect("the map is drawn");
+    let bounds = harness
+        .tree()
+        .get(node)
+        .expect("the map is laid out")
+        .layout()
+        .bounds;
+    let tiles = pane.widget.chart.tile_bounds();
+    assert_eq!(tiles.len(), 4, "四个条目必须排出四块热图");
+    let index = tiles.len() - 1;
+    let tile = tiles[index];
+    let local = LogicalPoint::new(
+        tile.origin.x + tile.size.width / 2.0,
+        tile.origin.y + tile.size.height / 2.0,
+    );
+    let window = LogicalPoint::new(
+        bounds.origin.x + local.x,
+        bounds.origin.y + local.y - px(offset),
+    );
+    assert_ne!(
+        window,
+        LogicalPoint::new(bounds.origin.x + local.x, bounds.origin.y + local.y),
+        "滚动祖先必须让窗口坐标与图表局部坐标不同"
+    );
+
+    let consumed = harness.with_cx(|cx| {
+        pane.widget.dispatch(
+            &Event::Input(InputEvent::PointerMove {
+                position: window,
+                modifiers: ui_core::event::Modifiers::default(),
+                timestamp: std::time::Instant::now(),
+            }),
+            cx,
+        )
+    });
+    assert!(consumed, "滚动容器内的指针属于热图");
+    assert_eq!(
+        pane.widget.chart.hovered(),
+        Some(index),
+        "指针必须换算到图表局部坐标（不再整体偏移 scroll offset）"
+    );
 }

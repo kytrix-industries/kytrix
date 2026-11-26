@@ -6,9 +6,10 @@ use market_participants_model::{
     prediction::{PredictionPricePoint, PredictionRange, PredictionSeries},
 };
 use ui_core::{
-    math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, px},
+    interaction::{ScrollAxis, ScrollConfig},
+    math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
-    paint::canvas::Canvas,
+    paint::{canvas::Canvas, style_builder::StyleBuilder},
     test_support::record::PrimitiveKind,
     window::WindowId,
 };
@@ -659,5 +660,103 @@ fn a_fractional_resize_should_not_prepare_again() {
         harness.chart.prepared_builds(),
         builds,
         "and it prepared nothing"
+    );
+}
+
+fn scroll_horizontally(harness: &mut ChartHarness, extra_width: LogicalPx, offset: LogicalPx) {
+    let window = harness.window;
+    let page = harness.page;
+    let container = harness.app.with_cx(|cx| {
+        let root = cx.tree().root();
+        let container = NodeBuilder::boxed()
+            .id("TEST_PREDICTION_MARKET_SCROLL")
+            .style(
+                StyleBuilder::new()
+                    .width(WIDTH)
+                    .height(HEIGHT)
+                    .flex_col()
+                    .overflow_hidden()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)
+            .expect("the scroll container builds");
+        cx.tree_mut()
+            .append_child(container, page)
+            .expect("the page moves under the scroll container");
+        cx.tree_mut()
+            .set_style(
+                page,
+                StyleBuilder::new()
+                    .width(WIDTH + extra_width)
+                    .height(HEIGHT)
+                    .flex_none()
+                    .flex_col()
+                    .build(),
+            )
+            .expect("the page takes the wider content box");
+        container
+    });
+    harness.app.drain();
+    let handle = harness
+        .app
+        .app_mut()
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axis: ScrollAxis::Horizontal,
+                line_height: px(48.0),
+            },
+        )
+        .expect("the container scrolls");
+    harness
+        .app
+        .app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(WIDTH + extra_width, HEIGHT))
+        .expect("the content size is valid");
+    harness
+        .app
+        .app_mut()
+        .scroll_to(&handle, LogicalPoint::new(offset, px(0.0)))
+        .expect("the offset is valid");
+    harness.app.drain();
+}
+
+#[test]
+fn a_pointer_in_a_scrolled_ancestor_should_still_resolve_to_the_same_sample() {
+    let mut harness = ChartHarness::new(snapshot());
+    assert!(harness.sync());
+    let offset = px(120.0);
+    scroll_horizontally(&mut harness, offset, offset);
+    assert!(harness.sync(), "the widened chart paints again");
+    let plot = ChartLayout::new(harness.box_of()).plot;
+    let local = LogicalPoint::new(
+        plot.origin.x + plot.size.width / 2.0,
+        plot.origin.y + plot.size.height / 2.0,
+    );
+    let bounds = harness.box_of();
+    let window = LogicalPoint::new(local.x - offset, local.y);
+    assert_ne!(
+        window,
+        LogicalPoint::new(local.x + bounds.origin.x, local.y + bounds.origin.y),
+        "滚动祖先必须让窗口坐标与图表局部坐标不同"
+    );
+
+    assert!(
+        harness
+            .app
+            .with_cx(|cx| harness
+                .chart
+                .sync(cx, &harness.snapshot, Some(window), None))
+            .expect("the chart syncs"),
+        "hovering after the scroll is a new drawing"
+    );
+    let hovered = harness
+        .chart
+        .hovered_sample()
+        .expect("the pointer is over the plot");
+    assert_eq!(
+        hovered.timestamp, 1_800_000,
+        "指针必须换算到图表局部坐标（不再整体偏移 scroll offset）"
     );
 }

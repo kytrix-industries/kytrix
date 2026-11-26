@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use ui_core::{
     app::App,
-    math::{LogicalPoint, LogicalPx, LogicalRect, Transform, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform, px},
     paint::{
         canvas::Canvas,
         color::Color,
@@ -40,7 +40,7 @@ pub(crate) struct Measurements {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CacheKey {
-    pub bounds: LogicalRect,
+    pub size: LogicalSize,
     pub revision: u64,
 }
 

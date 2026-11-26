@@ -462,7 +462,18 @@ where
         };
         let moved = match input {
             InputEvent::PointerMove { position, .. }
-            | InputEvent::PointerEnter { position, .. } => chart.point_at(*position),
+            | InputEvent::PointerEnter { position, .. } => {
+                let node = chart.node();
+                let local = cx
+                    .tree()
+                    .hit_test(*position)
+                    .filter(|hit| Some(hit.node) == node)
+                    .map(|hit| hit.local_point);
+                match local {
+                    Some(local) => chart.point_at(local),
+                    None => chart.clear_hover(),
+                }
+            }
             InputEvent::PointerLeave { .. } => chart.clear_hover(),
             _ => return false,
         };

@@ -20,7 +20,9 @@ use market_participants_model::{
 };
 use smol_str::SmolStr;
 use ui_core::{
-    math::px,
+    event::{Event, InputEvent},
+    interaction::ScrollConfig,
+    math::{LogicalPoint, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
 };
 use widget::{
@@ -1562,4 +1564,119 @@ fn texts(fixture: &Fixture, parent: NodeId) -> String {
         stack.extend(target.children().iter().copied());
     }
     text
+}
+
+fn scroll_page(fixture: &mut Fixture, viewport: (f32, f32), content: (f32, f32), offset: f32) {
+    let window = fixture.harness.window();
+    let page = fixture.page;
+    let container = fixture.harness.with_cx(|cx| {
+        let root = cx.tree().root();
+        let container = NodeBuilder::boxed()
+            .id("TEST_PERPETUAL_STATISTICS_SCROLL")
+            .style(
+                ui_core::paint::style_builder::StyleBuilder::new()
+                    .width(px(viewport.0))
+                    .height(px(viewport.1))
+                    .flex_col()
+                    .overflow_hidden()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)
+            .expect("the scroll container builds");
+        cx.tree_mut()
+            .append_child(container, page)
+            .expect("the page moves under the scroll container");
+        cx.tree_mut()
+            .set_style(
+                page,
+                ui_core::paint::style_builder::StyleBuilder::new()
+                    .width(px(content.0))
+                    .height(px(content.1))
+                    .flex_none()
+                    .flex_col()
+                    .build(),
+            )
+            .expect("the page takes the taller content box");
+        container
+    });
+    fixture.harness.drain();
+    let handle = fixture
+        .harness
+        .app_mut()
+        .make_scroll(window, container, ScrollConfig::default())
+        .expect("the container scrolls");
+    fixture
+        .harness
+        .app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(content.0), px(content.1)))
+        .expect("the content size is valid");
+    fixture
+        .harness
+        .app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(offset)))
+        .expect("the offset is valid");
+    fixture.harness.drain();
+}
+
+#[test]
+fn a_pointer_in_a_scrolled_ancestor_should_still_hover_the_chart_point() {
+    let mut fixture = Fixture::new(config(), true, supported(), [FetchPlan::Success(1)]);
+    fixture.load();
+    fixture.settle();
+    fixture.report_status(ready(1, 1_060_000));
+    fixture.report_snapshot(snapshot(1));
+    fixture.sync();
+    fixture.paint();
+
+    let offset = 90.0;
+    scroll_page(&mut fixture, (640.0, 600.0), (640.0, 900.0), offset);
+    fixture.sync();
+    fixture.paint();
+
+    let node = fixture
+        .chart()
+        .and_then(ChartDispatch::node)
+        .expect("the chart built its canvas");
+    let bounds = fixture
+        .harness
+        .tree()
+        .get(node)
+        .expect("the chart is laid out")
+        .layout()
+        .bounds;
+    let plot = fixture.plot();
+    let local = LogicalPoint::new(
+        plot.origin.x + plot.size.width / 2.0,
+        plot.origin.y + plot.size.height / 2.0,
+    );
+    let window = LogicalPoint::new(
+        bounds.origin.x + local.x,
+        bounds.origin.y + local.y - px(offset),
+    );
+    assert_ne!(
+        window,
+        LogicalPoint::new(bounds.origin.x + local.x, bounds.origin.y + local.y),
+        "滚动祖先必须让窗口坐标与图表局部坐标不同"
+    );
+
+    let consumed = fixture.harness.with_cx(|cx| {
+        fixture.widget.dispatch(
+            &Event::Input(InputEvent::PointerMove {
+                position: window,
+                modifiers: ui_core::event::Modifiers::default(),
+                timestamp: std::time::Instant::now(),
+            }),
+            cx,
+        )
+    });
+    assert!(consumed, "滚动容器内的指针属于图表");
+    let hover = fixture
+        .chart()
+        .and_then(ChartDispatch::hover_for_test)
+        .expect("指针必须在绘图区内");
+    assert_eq!(
+        hover.cursor_y,
+        px(local.y.value().round()),
+        "指针必须换算到图表局部坐标（不再整体偏移 scroll offset）"
+    );
 }
