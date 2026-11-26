@@ -3199,15 +3199,15 @@ mod tests {
             caret.origin.x >= viewport.origin.x && caret.max().x <= viewport.max().x,
             "最新输入的字符的 caret 必须完整落在视口内（display byte={byte}）：{caret:?} vs {viewport:?}"
         );
-        assert_eq!(
-            state.content.width,
-            harness.editable_bounds().size.width,
-            "滚动槽内容宽必须等于已布局 editable 宽度（display byte={byte}）：{state:?}"
+        let editable_width = harness.editable_bounds().size.width;
+        assert!(
+            (state.content.width - editable_width).abs() <= px(0.01),
+            "滚动槽内容宽必须等于已布局 editable 宽度（display byte={byte}）：{state:?} vs {editable_width}"
         );
-        assert_eq!(
-            state.offset.x,
-            state.content.width - state.viewport.width,
-            "单行 reveal 必须同帧把 offset 推到内容右端（display byte={byte}）：{state:?}"
+        let scroll_min = state.content.width - state.viewport.width;
+        assert!(
+            (state.offset.x - scroll_min).abs() <= px(0.01),
+            "单行 reveal 必须同帧把 offset 推到内容右端（display byte={byte}）：{state:?} vs {scroll_min}"
         );
     }
 

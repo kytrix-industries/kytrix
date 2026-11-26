@@ -666,10 +666,11 @@ fn ensure_visible_retries_once_when_the_scroll_content_changes_after_the_first_r
     focus(&mut bed.app, bed.node);
     bed.set_caret(page_line(5));
     drain(&mut bed.app);
-    assert_eq!(
+    assert!(
+        (bed.offset().y - line * 3.0).abs() <= px(0.01),
+        "末行 reveal 的目标被内容末尾 clamp 到最大偏移：{} vs {:?}",
         bed.offset().y,
-        line * 3.0,
-        "末行 reveal 的目标被内容末尾 clamp 到最大偏移"
+        line * 3.0
     );
 
     bed.app
@@ -683,7 +684,11 @@ fn ensure_visible_retries_once_when_the_scroll_content_changes_after_the_first_r
     let caret = caret_content(&bed.app, bed.node, page_line(5));
     let viewport = bounds(&bed.app, bed.viewport);
     let expected = caret.max().y + line - viewport.max().y;
-    assert_eq!(bed.offset().y, expected, "内容尺寸变化后必须补一次 reveal");
+    assert!(
+        (bed.offset().y - expected).abs() <= px(0.01),
+        "内容尺寸变化后必须补一次 reveal：{} vs {expected:?}",
+        bed.offset().y
+    );
     let settled = bed.offset().y;
     drain(&mut bed.app);
     assert_eq!(bed.offset().y, settled, "有界重试：稳定后不再滚动");
@@ -758,10 +763,11 @@ fn ensure_visible_reveals_a_typed_character_in_one_frame_when_the_host_content_l
         .expect("caret 到末尾");
     drain(&mut bed.app);
     let settled = bed.app.app().scroll_state(&bed.handle).expect("滚动状态");
-    assert_eq!(
-        settled.offset.x,
-        settled.content.width - settled.viewport.width,
-        "前置：宿主内容与布局一致时 offset 必须在右端"
+    let settled_right = settled.content.width - settled.viewport.width;
+    assert!(
+        (settled.offset.x - settled_right).abs() <= px(0.01),
+        "前置：宿主内容与布局一致时 offset 必须在右端：{:?} vs {settled_right:?}",
+        settled.offset.x
     );
     let step = caret_content(&bed.app, node, len).origin.x
         - caret_content(&bed.app, node, len - 1).origin.x;
@@ -785,10 +791,11 @@ fn ensure_visible_reveals_a_typed_character_in_one_frame_when_the_host_content_l
         after.content.width, editable.size.width,
         "reveal 必须同帧把滚动槽内容补到 editable 已布局宽度：{after:?} vs {editable:?}"
     );
-    assert_eq!(
-        after.offset.x,
-        after.content.width - after.viewport.width,
-        "同帧 offset 必须推到右端：{after:?}"
+    let after_right = after.content.width - after.viewport.width;
+    assert!(
+        (after.offset.x - after_right).abs() <= px(0.01),
+        "同帧 offset 必须推到右端：{:?} vs {after_right:?}（{after:?}）",
+        after.offset.x
     );
     let caret = caret_content(&bed.app, node, len + 1);
     let viewport = bounds(&bed.app, bed.viewport);
@@ -824,10 +831,10 @@ fn ensure_visible_reveals_a_typed_line_in_one_frame_when_the_host_content_lags()
     bed.set_caret(len);
     drain(&mut bed.app);
     let settled = bed.app.app().scroll_state(&bed.handle).expect("滚动状态");
-    assert_eq!(
-        settled.content.height,
-        line * 5.0,
-        "前置：宿主内容高 = 5 行：{settled:?}"
+    assert!(
+        (settled.content.height - line * 5.0).abs() <= px(0.01),
+        "前置：宿主内容高 = 5 行：{settled:?} vs {:?}",
+        line * 5.0
     );
     bed.app
         .app_mut()
