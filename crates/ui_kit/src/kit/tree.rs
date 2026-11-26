@@ -383,6 +383,7 @@ impl Tree {
                 row_stretch: false,
                 scrollbar: options.scrollbar,
                 separator: false,
+                content_width: None,
             },
             move |tree, parent, index| {
                 let Some(row) = flat_rows.borrow().get(index).cloned() else {

@@ -1744,6 +1744,7 @@ mod p11_tests {
                     extent: px(20.0),
                     extents: None,
                     overscan: 1,
+                    content_width: None,
                 },
             )
             .expect("virtual list");
@@ -2254,6 +2255,7 @@ mod p11_tests {
                     extent: px(20.0),
                     extents: None,
                     overscan: 0,
+                    content_width: None,
                 },
             )
             .expect("virtual list");
@@ -2343,6 +2345,7 @@ mod p11_tests {
                     extent: px(20.0),
                     extents: None,
                     overscan: 0,
+                    content_width: None,
                 },
             )
             .expect("virtual list");

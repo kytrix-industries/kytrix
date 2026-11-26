@@ -151,21 +151,34 @@ impl PointerState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScrollAxis {
+pub enum ScrollAxes {
     Vertical,
     Horizontal,
+    Both,
+}
+
+impl ScrollAxes {
+    #[must_use]
+    pub const fn vertical(self) -> bool {
+        matches!(self, Self::Vertical | Self::Both)
+    }
+
+    #[must_use]
+    pub const fn horizontal(self) -> bool {
+        matches!(self, Self::Horizontal | Self::Both)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollConfig {
-    pub axis: ScrollAxis,
+    pub axes: ScrollAxes,
     pub line_height: LogicalPx,
 }
 
 impl Default for ScrollConfig {
     fn default() -> Self {
         Self {
-            axis: ScrollAxis::Vertical,
+            axes: ScrollAxes::Vertical,
             line_height: px(48.0),
         }
     }
@@ -198,14 +211,14 @@ pub struct ScrollState {
     pub offset: LogicalPoint,
     pub content: LogicalSize,
     pub viewport: LogicalSize,
-    pub axis: ScrollAxis,
+    pub axes: ScrollAxes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScrollSlot {
     pub offset: LogicalPoint,
     pub content: LogicalSize,
-    pub axis: ScrollAxis,
+    pub axes: ScrollAxes,
     pub line_height: LogicalPx,
 }
 
@@ -236,6 +249,7 @@ pub struct VirtualListConfig {
     pub extent: LogicalPx,
     pub extents: Option<Box<[LogicalPx]>>,
     pub overscan: usize,
+    pub content_width: Option<LogicalPx>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -262,6 +276,7 @@ pub(crate) struct VirtualSlot {
     prefix: Vec<LogicalPx>,
     pub overscan: usize,
     pub count: usize,
+    pub content_width: Option<LogicalPx>,
     pub builder: Option<Box<dyn FnMut(usize) -> NodeBuilder>>,
     pub mounted: Vec<(usize, NodeId)>,
 }
@@ -274,6 +289,7 @@ impl VirtualSlot {
             prefix: Vec::new(),
             overscan,
             count: 0,
+            content_width: None,
             builder: None,
             mounted: Vec::new(),
         }
@@ -315,6 +331,7 @@ impl std::fmt::Debug for VirtualSlot {
             .field("prefix", &self.prefix.len())
             .field("overscan", &self.overscan)
             .field("count", &self.count)
+            .field("content_width", &self.content_width)
             .field("builder", &self.builder.as_ref().map(|_| "<closure>"))
             .field("mounted", &self.mounted)
             .finish()
@@ -656,7 +673,7 @@ pub(crate) fn resolve_placement(
 
 #[cfg(test)]
 mod tests {
-    use super::{Easing, FocusScope, InputThresholds, ScrollAxis, ScrollConfig, ScrollSlot};
+    use super::{Easing, FocusScope, InputThresholds, ScrollAxes, ScrollConfig, ScrollSlot};
     use crate::{
         math::{LogicalPoint, px},
         node::id::NodeId,
@@ -710,12 +727,22 @@ mod tests {
         let slot = ScrollSlot {
             offset: LogicalPoint::ZERO,
             content: crate::math::LogicalSize::new(px(100.0), px(200.0)),
-            axis: config.axis,
+            axes: config.axes,
             line_height: config.line_height,
         };
 
-        assert_eq!(config.axis, ScrollAxis::Vertical);
+        assert_eq!(config.axes, ScrollAxes::Vertical);
         assert_eq!(config.line_height, px(48.0));
         assert_eq!(slot.offset, LogicalPoint::ZERO);
+    }
+
+    #[test]
+    fn scroll_axes_report_their_enabled_directions() {
+        assert!(ScrollAxes::Vertical.vertical());
+        assert!(!ScrollAxes::Vertical.horizontal());
+        assert!(!ScrollAxes::Horizontal.vertical());
+        assert!(ScrollAxes::Horizontal.horizontal());
+        assert!(ScrollAxes::Both.vertical());
+        assert!(ScrollAxes::Both.horizontal());
     }
 }

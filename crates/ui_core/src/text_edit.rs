@@ -19,7 +19,7 @@ use crate::{
     app::{App, TimerId},
     error::EngineError,
     event::{Action, ActionSource, ImeEvent, KeyCode, Modifiers},
-    interaction::{ScrollAxis, drag as drag_util, scroll},
+    interaction::{ScrollAxes, drag as drag_util, scroll},
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{id::NodeId, tree::NodeTree},
     paint::{
@@ -2964,7 +2964,9 @@ fn page_viewport_height(app: &App, window: WindowId, node: NodeId) -> LogicalPx 
         return LogicalPx::ZERO;
     };
     let tree = target.tree();
-    let Some((ancestor, _)) = scroll::scroll_ancestor_on(tree, node, ScrollAxis::Vertical) else {
+    let Some((ancestor, _)) =
+        scroll::scroll_ancestors(tree, node).find(|(_, slot)| slot.axes.vertical())
+    else {
         return LogicalPx::ZERO;
     };
     scroll::viewport(tree, ancestor).size.height
@@ -3541,6 +3543,9 @@ fn auto_scroll_goal(
     let tree = target.tree();
     let bounds = tree.get(node).ok()?.layout().bounds;
     let node_screen = scroll::to_screen(tree, node, bounds);
+    let multiline = tree
+        .editable(node)
+        .is_some_and(|editable| editable.spec().multiline);
     for (ancestor, slot) in scroll::scroll_ancestors(tree, node) {
         let viewport_screen = scroll::to_screen(tree, ancestor, scroll::viewport(tree, ancestor));
         let visible = node_screen.intersect(viewport_screen);
@@ -3550,33 +3555,49 @@ fn auto_scroll_goal(
             } else {
                 viewport_screen
             };
-        let (distance, direction) = match slot.axis {
-            ScrollAxis::Vertical => {
-                if position.y < visible.origin.y {
-                    (visible.origin.y - position.y, -1.0_f32)
-                } else if position.y > visible.max().y {
-                    (position.y - visible.max().y, 1.0_f32)
-                } else {
-                    (LogicalPx::ZERO, 0.0_f32)
-                }
+        let vertical = if slot.axes.vertical() {
+            if position.y < visible.origin.y {
+                Some((visible.origin.y - position.y, -1.0_f32))
+            } else if position.y > visible.max().y {
+                Some((position.y - visible.max().y, 1.0_f32))
+            } else {
+                None
             }
-            ScrollAxis::Horizontal => {
-                if position.x < visible.origin.x {
-                    (visible.origin.x - position.x, -1.0_f32)
-                } else if position.x > visible.max().x {
-                    (position.x - visible.max().x, 1.0_f32)
-                } else {
-                    (LogicalPx::ZERO, 0.0_f32)
-                }
-            }
+        } else {
+            None
         };
-        if direction == 0.0 {
+        let horizontal = if slot.axes.horizontal() {
+            if position.x < visible.origin.x {
+                Some((visible.origin.x - position.x, -1.0_f32))
+            } else if position.x > visible.max().x {
+                Some((position.x - visible.max().x, 1.0_f32))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let preferred = if multiline {
+            [
+                (ScrollAxes::Vertical, vertical),
+                (ScrollAxes::Horizontal, horizontal),
+            ]
+        } else {
+            [
+                (ScrollAxes::Horizontal, horizontal),
+                (ScrollAxes::Vertical, vertical),
+            ]
+        };
+        let Some((axis, (distance, direction))) = preferred
+            .into_iter()
+            .find_map(|(axis, step)| step.map(|step| (axis, step)))
+        else {
             continue;
-        }
+        };
         let max = scroll::max_offset(&slot, scroll::viewport(tree, ancestor).size);
-        let max = match slot.axis {
-            ScrollAxis::Vertical => max.y,
-            ScrollAxis::Horizontal => max.x,
+        let max = match axis {
+            ScrollAxes::Horizontal => max.x,
+            ScrollAxes::Vertical | ScrollAxes::Both => max.y,
         };
         if max <= LogicalPx::ZERO {
             continue;
@@ -3585,9 +3606,11 @@ fn auto_scroll_goal(
             .value()
             .clamp(1.0, (slot.line_height.value() * 2.0).max(1.0))
             * direction);
-        let goal = match slot.axis {
-            ScrollAxis::Vertical => LogicalPoint::new(slot.offset.x, slot.offset.y + step),
-            ScrollAxis::Horizontal => LogicalPoint::new(slot.offset.x + step, slot.offset.y),
+        let goal = match axis {
+            ScrollAxes::Horizontal => LogicalPoint::new(slot.offset.x + step, slot.offset.y),
+            ScrollAxes::Vertical | ScrollAxes::Both => {
+                LogicalPoint::new(slot.offset.x, slot.offset.y + step)
+            }
         };
         return Some((
             crate::interaction::ScrollHandle::new(window, ancestor),
@@ -4184,48 +4207,44 @@ fn reveal_offset(
     multiline: bool,
     line_height: LogicalPx,
 ) -> Option<LogicalPoint> {
-    match slot.axis {
-        ScrollAxis::Vertical => {
-            let available = viewport.size.height;
-            let margin = line_height.max(px(1.0));
-            let margin = margin.min(((available - margin) * 0.5).max(LogicalPx::ZERO));
-            let top = slot.offset.y + viewport.origin.y + margin;
-            let bottom = slot.offset.y + viewport.origin.y + available - margin;
-            if caret.origin.y < top {
-                Some(LogicalPoint::new(
-                    slot.offset.x,
-                    slot.offset.y + (caret.origin.y - top),
-                ))
-            } else if caret.max().y > bottom {
-                Some(LogicalPoint::new(
-                    slot.offset.x,
-                    slot.offset.y + (caret.max().y - bottom),
-                ))
-            } else {
-                None
-            }
+    let horizontal = if slot.axes.horizontal() && (!multiline || slot.axes.vertical()) {
+        let available = viewport.size.width;
+        let margin = px(CARET_REVEAL_MARGIN_X).min(available * 0.25);
+        let left = slot.offset.x + viewport.origin.x + margin;
+        let right = slot.offset.x + viewport.origin.x + available - margin;
+        if caret.origin.x < left {
+            Some(slot.offset.x + (caret.origin.x - left))
+        } else if caret.max().x > right {
+            Some(slot.offset.x + (caret.max().x - right))
+        } else {
+            None
         }
-        ScrollAxis::Horizontal if !multiline => {
-            let available = viewport.size.width;
-            let margin = px(CARET_REVEAL_MARGIN_X).min(available * 0.25);
-            let left = slot.offset.x + viewport.origin.x + margin;
-            let right = slot.offset.x + viewport.origin.x + available - margin;
-            if caret.origin.x < left {
-                Some(LogicalPoint::new(
-                    slot.offset.x + (caret.origin.x - left),
-                    slot.offset.y,
-                ))
-            } else if caret.max().x > right {
-                Some(LogicalPoint::new(
-                    slot.offset.x + (caret.max().x - right),
-                    slot.offset.y,
-                ))
-            } else {
-                None
-            }
+    } else {
+        None
+    };
+    let vertical = if slot.axes.vertical() {
+        let available = viewport.size.height;
+        let margin = line_height.max(px(1.0));
+        let margin = margin.min(((available - margin) * 0.5).max(LogicalPx::ZERO));
+        let top = slot.offset.y + viewport.origin.y + margin;
+        let bottom = slot.offset.y + viewport.origin.y + available - margin;
+        if caret.origin.y < top {
+            Some(slot.offset.y + (caret.origin.y - top))
+        } else if caret.max().y > bottom {
+            Some(slot.offset.y + (caret.max().y - bottom))
+        } else {
+            None
         }
-        ScrollAxis::Horizontal => None,
-    }
+    } else {
+        None
+    };
+    let x = horizontal.unwrap_or(slot.offset.x);
+    let y = if multiline || horizontal.is_none() {
+        vertical.unwrap_or(slot.offset.y)
+    } else {
+        slot.offset.y
+    };
+    (horizontal.is_some() || vertical.is_some()).then_some(LogicalPoint::new(x, y))
 }
 
 fn clamp_reveal_target(
@@ -4244,18 +4263,15 @@ fn reveal_keeps_focus_visible(
     focus: LogicalRect,
     target: LogicalPoint,
 ) -> bool {
-    match slot.axis {
-        ScrollAxis::Vertical => {
-            let start = target.y + viewport.origin.y;
-            let end = start + viewport.size.height;
-            focus.origin.y >= start && focus.max().y <= end
-        }
-        ScrollAxis::Horizontal => {
-            let start = target.x + viewport.origin.x;
-            let end = start + viewport.size.width;
-            focus.origin.x >= start && focus.max().x <= end
-        }
-    }
+    let horizontal = !(slot.axes.horizontal() && target.x != slot.offset.x) || {
+        let start = target.x + viewport.origin.x;
+        focus.origin.x >= start && focus.max().x <= start + viewport.size.width
+    };
+    let vertical = !(slot.axes.vertical() && target.y != slot.offset.y) || {
+        let start = target.y + viewport.origin.y;
+        focus.origin.y >= start && focus.max().y <= start + viewport.size.height
+    };
+    horizontal && vertical
 }
 
 fn focused_editable(app: &App, window: WindowId) -> Option<KeyContext> {

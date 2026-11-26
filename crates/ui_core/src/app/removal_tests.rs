@@ -333,6 +333,7 @@ fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -962,6 +963,7 @@ fn removing_a_mounted_virtual_row_is_rejected_without_side_effects() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");

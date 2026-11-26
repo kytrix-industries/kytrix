@@ -40,7 +40,7 @@ pub(crate) fn make_scroll(
         slot.scroll = Some(ScrollSlot {
             offset: LogicalPoint::ZERO,
             content: viewport,
-            axis: config.axis,
+            axes: config.axes,
             line_height: config.line_height,
         });
     }
@@ -200,7 +200,7 @@ pub(crate) fn scroll_state(app: &App, handle: &ScrollHandle) -> Option<ScrollSta
         offset: slot.offset,
         content: slot.content,
         viewport: scroll::viewport(target.tree(), node).size,
-        axis: slot.axis,
+        axes: slot.axes,
     })
 }
 

@@ -2,7 +2,7 @@ use super::App;
 use crate::{
     error::EngineError,
     interaction::{
-        ItemAlign, ScrollAxis, ScrollConfig, ScrollHandle, ScrollSlot, VirtualList,
+        ItemAlign, ScrollAxes, ScrollConfig, ScrollHandle, ScrollSlot, VirtualList,
         VirtualListConfig, VirtualListState, VirtualSlot, scroll, virtual_list,
     },
     math::{LogicalPoint, LogicalPx, LogicalSize, px},
@@ -29,17 +29,28 @@ pub(crate) fn make_virtual_list(
     if let Some(extents) = config.extents.as_deref() {
         validate_extents(extents)?;
     }
+    if let Some(width) = config.content_width
+        && (!width.is_finite() || width < LogicalPx::ZERO)
+    {
+        return Err(EngineError::InvalidContentWidth { node: container });
+    }
     let viewport = scroll::viewport(target.tree(), container).size;
+    let content_width = config.content_width.unwrap_or(viewport.width);
     let Some(slot) = target.tree_mut().ensure_interaction(container) else {
         return Err(EngineError::StaleNode { node: container });
     };
     slot.scroll = Some(ScrollSlot {
         offset: LogicalPoint::ZERO,
-        content: viewport,
-        axis: ScrollAxis::Vertical,
+        content: LogicalSize::new(content_width, viewport.height),
+        axes: if config.content_width.is_some() {
+            ScrollAxes::Both
+        } else {
+            ScrollAxes::Vertical
+        },
         line_height: ScrollConfig::default().line_height,
     });
     let mut virtual_slot = VirtualSlot::new(config.extent.max(px(1.0)), config.overscan);
+    virtual_slot.content_width = config.content_width;
     if let Some(extents) = config.extents {
         virtual_slot.set_extents(extents);
     }
@@ -69,6 +80,7 @@ pub(crate) fn set_virtual_items(
     };
     let offset = scroll_slot.offset.y;
     let viewport_width = scroll::viewport(target.tree(), node).size.width;
+    let content_width = slot.content_width.unwrap_or(viewport_width);
     let anchor = virtual_list::offset_anchor(slot, offset);
     let (anchored, extents_dropped) = {
         let Some(target) = app.windows.get_mut(&window) else {
@@ -105,7 +117,7 @@ pub(crate) fn set_virtual_items(
         if anchored.is_some()
             && let Some(scroll) = target.tree_mut().scroll_slot_mut(node)
         {
-            scroll.content = LogicalSize::new(viewport_width, content);
+            scroll.content = LogicalSize::new(content_width, content);
         }
         (anchored, extents_dropped)
     };
@@ -115,7 +127,7 @@ pub(crate) fn set_virtual_items(
         {
             app.scroll_to(
                 &ScrollHandle::new(window, node),
-                LogicalPoint::new(px(0.0), target_offset),
+                LogicalPoint::new(scroll_slot.offset.x, target_offset),
             )?;
         }
         app.rewindow_virtual(window, node);
@@ -167,13 +179,13 @@ pub(crate) fn rewindow_virtual(app: &mut App, window: WindowId, node: NodeId) {
     let Some(target) = app.windows.get_mut(&window) else {
         return;
     };
-    let Some((range, content, viewport)) = target.tree().virtual_slot(node).and_then(|slot| {
+    let Some((range, content, content_width)) = target.tree().virtual_slot(node).and_then(|slot| {
         let scroll = target.tree().scroll_slot(node)?;
         let viewport = scroll::viewport(target.tree(), node).size;
         Some((
             virtual_list::visible_window(slot, scroll.offset.y, viewport.height),
             virtual_list::content_height(slot),
-            viewport,
+            slot.content_width.unwrap_or(viewport.width),
         ))
     }) else {
         return;
@@ -245,7 +257,7 @@ pub(crate) fn rewindow_virtual(app: &mut App, window: WindowId, node: NodeId) {
         changed = true;
     }
     if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
-        slot.content = LogicalSize::new(viewport.width, content);
+        slot.content = LogicalSize::new(content_width, content);
     }
     if changed {
         target.tree_mut().mark_structure(node);
@@ -288,15 +300,19 @@ fn apply_virtual_extents(
     node: NodeId,
     extents: &[LogicalPx],
 ) -> Result<(), EngineError> {
-    let Some((anchor, current_offset, viewport)) = app.windows.get(&window).and_then(|target| {
-        let slot = target.tree().virtual_slot(node)?;
-        let scroll = target.tree().scroll_slot(node)?;
-        Some((
-            virtual_list::offset_anchor(slot, scroll.offset.y),
-            scroll.offset.y,
-            scroll::viewport(target.tree(), node).size,
-        ))
-    }) else {
+    let Some((anchor, current_offset, viewport, content_width)) =
+        app.windows.get(&window).and_then(|target| {
+            let slot = target.tree().virtual_slot(node)?;
+            let scroll = target.tree().scroll_slot(node)?;
+            let viewport = scroll::viewport(target.tree(), node).size;
+            Some((
+                virtual_list::offset_anchor(slot, scroll.offset.y),
+                scroll.offset,
+                viewport,
+                slot.content_width.unwrap_or(viewport.width),
+            ))
+        })
+    else {
         return Err(EngineError::NotVirtualList { node });
     };
     let (target_offset, offset_changed) = {
@@ -314,14 +330,14 @@ fn apply_virtual_extents(
             max,
         );
         if let Some(scroll) = target.tree_mut().scroll_slot_mut(node) {
-            scroll.content = LogicalSize::new(viewport.width, content);
+            scroll.content = LogicalSize::new(content_width, content);
         }
-        (target_offset, target_offset != current_offset)
+        (target_offset, target_offset != current_offset.y)
     };
     if offset_changed {
         app.scroll_to(
             &ScrollHandle::new(window, node),
-            LogicalPoint::new(px(0.0), target_offset),
+            LogicalPoint::new(current_offset.x, target_offset),
         )?;
     }
     app.rewindow_virtual(window, node);
@@ -409,7 +425,7 @@ pub(crate) fn scroll_to_item(
     app.batch(|app| {
         app.scroll_to(
             &ScrollHandle::new(window, node),
-            LogicalPoint::new(px(0.0), target_offset),
+            LogicalPoint::new(scroll.offset.x, target_offset),
         )
     })
 }
@@ -478,6 +494,15 @@ mod tests {
     }
 
     fn fixture(extent: LogicalPx, overscan: usize, extents: Option<Vec<LogicalPx>>) -> Fixture {
+        fixture_with_width(extent, overscan, extents, None)
+    }
+
+    fn fixture_with_width(
+        extent: LogicalPx,
+        overscan: usize,
+        extents: Option<Vec<LogicalPx>>,
+        content_width: Option<LogicalPx>,
+    ) -> Fixture {
         let (runtime, mut app, window, container) = app_with_container();
         let list = app
             .make_virtual_list(
@@ -487,6 +512,7 @@ mod tests {
                     extent,
                     extents: extents.map(Vec::into_boxed_slice),
                     overscan,
+                    content_width,
                 },
             )
             .expect("virtual list");
@@ -505,6 +531,136 @@ mod tests {
             .expect("scroll state")
             .offset
             .y
+    }
+
+    #[test]
+    fn content_width_none_keeps_the_vertical_single_axis() {
+        let (_rt, mut app, window, container, list) = fixture(px(25.0), 0, None);
+        set_items(&mut app, &list, 10);
+        frame(&mut app, window);
+
+        let state = app
+            .scroll_state(&app.scroll_handle(window, container).expect("handle"))
+            .expect("state");
+        assert_eq!(state.axes, ScrollAxes::Vertical);
+        assert_eq!(state.viewport.width, px(200.0));
+        assert_eq!(
+            state.content.width, state.viewport.width,
+            "None：横向内容宽仍是视口宽（与 HEAD 一致）"
+        );
+    }
+
+    #[test]
+    fn content_width_some_enables_both_axes_and_survives_rewindow_and_extents() {
+        let (_rt, mut app, window, container, list) =
+            fixture_with_width(px(25.0), 0, None, Some(px(300.0)));
+        set_items(&mut app, &list, 10);
+        frame(&mut app, window);
+        let handle = app.scroll_handle(window, container).expect("handle");
+        let state = app.scroll_state(&handle).expect("state");
+        assert_eq!(state.axes, ScrollAxes::Both);
+        assert_eq!(state.content.width, px(300.0), "Some：横向内容宽 = 传入值");
+
+        app.scroll_to(&handle, LogicalPoint::new(px(50.0), px(100.0)))
+            .expect("scroll");
+        frame(&mut app, window);
+        assert_eq!(
+            app.scroll_state(&handle).expect("state").offset,
+            LogicalPoint::new(px(50.0), px(100.0))
+        );
+
+        app.set_virtual_extents(&list, &[px(30.0); 10])
+            .expect("extents");
+        frame(&mut app, window);
+        let state = app.scroll_state(&handle).expect("state");
+        assert_eq!(
+            state.content.width,
+            px(300.0),
+            "extents 重写 content 后不得清零横向内容宽"
+        );
+        assert_eq!(state.axes, ScrollAxes::Both);
+        assert_eq!(state.offset.x, px(50.0), "锚点滚动不得重置横向偏移");
+
+        set_items(&mut app, &list, 12);
+        frame(&mut app, window);
+        let state = app.scroll_state(&handle).expect("state");
+        assert_eq!(state.content.width, px(300.0), "rewindow 后横向内容宽保持");
+        assert_eq!(state.offset.x, px(50.0), "rewindow 后横向偏移保持");
+    }
+
+    #[test]
+    fn invalid_content_width_is_rejected_before_writing_any_slot() {
+        let (_runtime, mut app, window, container) = app_with_container();
+        for width in [px(f32::NAN), px(-1.0), px(f32::INFINITY)] {
+            match app.make_virtual_list(
+                window,
+                container,
+                VirtualListConfig {
+                    extent: px(25.0),
+                    extents: None,
+                    overscan: 0,
+                    content_width: Some(width),
+                },
+            ) {
+                Err(EngineError::InvalidContentWidth { node }) => assert_eq!(node, container),
+                other => {
+                    panic!("非法 content_width {width:?} 必须是 InvalidContentWidth：{other:?}")
+                }
+            }
+            let tree = app.window(window).expect("window").tree();
+            assert!(
+                tree.scroll_slot(container).is_none(),
+                "失败入口不得写滚动槽"
+            );
+            assert!(
+                tree.virtual_slot(container).is_none(),
+                "失败入口不得写虚拟槽"
+            );
+        }
+
+        app.make_virtual_list(
+            window,
+            container,
+            VirtualListConfig {
+                extent: px(25.0),
+                extents: None,
+                overscan: 0,
+                content_width: Some(px(0.0)),
+            },
+        )
+        .expect("0 是合法内容宽");
+        let handle = app.scroll_handle(window, container).expect("handle");
+        let state = app.scroll_state(&handle).expect("state");
+        assert_eq!(state.axes, ScrollAxes::Both);
+        assert_eq!(state.content.width, px(0.0), "合法 0 原样写入内容宽");
+    }
+
+    #[test]
+    fn scroll_to_item_keeps_the_horizontal_offset() {
+        let (_rt, mut app, window, container, list) =
+            fixture_with_width(px(20.0), 0, None, Some(px(300.0)));
+        set_items(&mut app, &list, 100);
+        frame(&mut app, window);
+        let handle = app.scroll_handle(window, container).expect("handle");
+        app.scroll_to(&handle, LogicalPoint::new(px(50.0), px(0.0)))
+            .expect("横向滚动");
+        frame(&mut app, window);
+
+        app.scroll_to_item(&list, 10, ItemAlign::Start)
+            .expect("scroll to item");
+        let state = app.scroll_state(&handle).expect("state");
+        assert_eq!(
+            state.offset,
+            LogicalPoint::new(px(50.0), px(200.0)),
+            "纵向锚点不得重置横向偏移"
+        );
+
+        frame(&mut app, window);
+        assert_eq!(
+            app.scroll_state(&handle).expect("state").offset.x,
+            px(50.0),
+            "帧后横向偏移保持"
+        );
     }
 
     fn content_height(app: &App, window: WindowId, container: NodeId) -> LogicalPx {
@@ -844,6 +1000,7 @@ mod tests {
                 extent: px(25.0),
                 extents: Some(vec![px(3e38), px(3e38)].into_boxed_slice()),
                 overscan: 0,
+                content_width: None,
             },
         ) {
             Err(EngineError::InvalidVirtualExtent { index: 1, .. }) => {}
@@ -939,6 +1096,7 @@ mod tests {
                 extent: px(25.0),
                 extents: Some(vec![px(25.0), px(f32::NAN)].into_boxed_slice()),
                 overscan: 0,
+                content_width: None,
             },
         ) {
             Err(EngineError::InvalidVirtualExtent { index: 1, .. }) => {}
@@ -1040,6 +1198,7 @@ mod tests {
                 VirtualListConfig {
                     extent: px(20.0),
                     overscan: 0,
+                    content_width: None,
                     extents: None,
                 },
             )

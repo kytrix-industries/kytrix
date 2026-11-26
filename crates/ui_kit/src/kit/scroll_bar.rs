@@ -51,10 +51,10 @@ impl ScrollbarAxis {
         }
     }
 
-    fn point(self, offset: LogicalPx) -> LogicalPoint {
+    fn point(self, current: LogicalPoint, offset: LogicalPx) -> LogicalPoint {
         match self {
-            Self::Vertical => LogicalPoint::new(LogicalPx::ZERO, offset),
-            Self::Horizontal => LogicalPoint::new(offset, LogicalPx::ZERO),
+            Self::Vertical => LogicalPoint::new(current.x, offset),
+            Self::Horizontal => LogicalPoint::new(offset, current.y),
         }
     }
 }
@@ -459,7 +459,7 @@ impl ScrollBar {
         let target_offset = track_target_offset(track_len, thumb_len, max, click);
         let _ = ctx
             .app_mut()
-            .scroll_to(&handle, self.inner.axis.point(target_offset));
+            .scroll_to(&handle, self.inner.axis.point(state.offset, target_offset));
     }
 
     fn on_thumb_drag(&self, ctx: &mut ActionCtx<'_>) {
@@ -507,9 +507,13 @@ impl ScrollBar {
                 };
                 let moved = self.inner.axis.component(delta);
                 let target = drag_offset(start.start_offset, moved, start.usable, start.max);
+                let current = ctx
+                    .app_mut()
+                    .scroll_state(&handle)
+                    .map_or(LogicalPoint::ZERO, |state| state.offset);
                 let _ = ctx
                     .app_mut()
-                    .scroll_to(&handle, self.inner.axis.point(target));
+                    .scroll_to(&handle, self.inner.axis.point(current, target));
             }
             DragPhase::End | DragPhase::Cancel => {
                 ctx.app_mut().write_transient(&self.inner.drag, None);
@@ -606,7 +610,7 @@ fn node_in_subtree(app: &App, window: WindowId, root: NodeId, candidate: Option<
 
 #[cfg(test)]
 mod tests {
-    use ui_core::math::{LogicalPx, LogicalRect, px};
+    use ui_core::math::{LogicalPoint, LogicalPx, LogicalRect, px};
 
     use super::{
         ScrollBar, ScrollbarAxis, ScrollbarMode, ScrollbarOptions, drag_offset, thumb_length,
@@ -713,6 +717,21 @@ mod tests {
     }
 
     #[test]
+    fn point_preserves_the_other_axis() {
+        let current = LogicalPoint::new(px(30.0), px(40.0));
+        assert_eq!(
+            ScrollbarAxis::Vertical.point(current, px(90.0)),
+            LogicalPoint::new(px(30.0), px(90.0)),
+            "垂直条只改 y，保留双轴容器的 x"
+        );
+        assert_eq!(
+            ScrollbarAxis::Horizontal.point(current, px(90.0)),
+            LogicalPoint::new(px(90.0), px(40.0)),
+            "水平条只改 x，保留双轴容器的 y"
+        );
+    }
+
+    #[test]
     fn track_click_centers_the_thumb() {
         assert_eq!(
             track_target_offset(px(200.0), px(50.0), px(300.0), px(100.0)),
@@ -809,9 +828,9 @@ mod ui_tests {
     use std::time::Duration;
 
     use ui_core::{
-        event::{InputEvent, Modifiers, PointerButton},
-        interaction::{ScrollConfig, ScrollHandle},
-        math::{LogicalSize, px},
+        event::{Action, InputEvent, Modifiers, PointerButton},
+        interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
@@ -1275,5 +1294,275 @@ mod ui_tests {
         }
         assert!(idle, "静止滚动条不得持续出帧（I3）");
         let _ = harness.container;
+    }
+
+    struct BothAxesHarness {
+        app: TestApp,
+        vertical: ScrollBar,
+        horizontal: ScrollBar,
+        handle: ScrollHandle,
+    }
+
+    fn both_axes_harness() -> BothAxesHarness {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let root = app.app().window(window).expect("window").tree().root();
+        let outer = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .id("both-axes-outer")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .size(px(BOX_WIDTH), px(BOX_HEIGHT))
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("outer")
+        };
+        let container = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .id("both-axes-viewport")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .size_full()
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, outer)
+                .expect("container")
+        };
+        let handle = app
+            .app_mut()
+            .make_scroll(
+                window,
+                container,
+                ScrollConfig {
+                    axes: ScrollAxes::Both,
+                    line_height: px(48.0),
+                },
+            )
+            .expect("双轴滚动容器");
+        app.app_mut()
+            .set_scroll_content(&handle, LogicalSize::new(px(400.0), px(400.0)))
+            .expect("内容尺寸");
+        let options = ScrollbarOptions::default();
+        let vertical = ScrollBar::new(
+            app.app_mut(),
+            theme.clone(),
+            "vertical-scrollbar",
+            ScrollbarAxis::Vertical,
+            options,
+        );
+        let horizontal = ScrollBar::new(
+            app.app_mut(),
+            theme,
+            "horizontal-scrollbar",
+            ScrollbarAxis::Horizontal,
+            options,
+        );
+        {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            vertical.build(tree, outer).expect("垂直滚动条");
+            horizontal.build(tree, outer).expect("水平滚动条");
+        }
+        vertical.attach(app.app_mut(), window, container);
+        horizontal.attach(app.app_mut(), window, container);
+        let mut harness = BothAxesHarness {
+            app,
+            vertical,
+            horizontal,
+            handle,
+        };
+        for _ in 0..4 {
+            harness.app.advance(Duration::from_millis(100));
+            let _ = harness.app.drain().expect("frame");
+            let _ = harness.vertical.sync(harness.app.app_mut()).expect("sync");
+            let _ = harness
+                .horizontal
+                .sync(harness.app.app_mut())
+                .expect("sync");
+        }
+        let _ = harness.app.drain().expect("frame");
+        harness
+    }
+
+    impl BothAxesHarness {
+        fn offset(&self) -> LogicalPoint {
+            self.app
+                .app()
+                .scroll_state(&self.handle)
+                .expect("滚动状态")
+                .offset
+        }
+
+        fn track_bounds(&self, bar: &ScrollBar) -> LogicalRect {
+            let (Some(track), _) = bar.nodes() else {
+                panic!("滚动条必须已构建");
+            };
+            self.app.probe().bounds(track).expect("轨道 bounds")
+        }
+
+        fn click(&mut self, point: LogicalPoint) -> Option<Action> {
+            let _ = self.app.inject(InputEvent::pointer_down(
+                point,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            self.app
+                .inject(InputEvent::pointer_up(
+                    point,
+                    PointerButton::Primary,
+                    Modifiers::empty(),
+                ))
+                .action
+        }
+
+        fn sync_bars(&mut self) {
+            for _ in 0..2 {
+                let _ = self.vertical.sync(self.app.app_mut()).expect("sync");
+                let _ = self.horizontal.sync(self.app.app_mut()).expect("sync");
+                let _ = self.app.drain().expect("frame");
+            }
+        }
+
+        fn thumb_center(&self, bar: &ScrollBar) -> LogicalPoint {
+            let track = self.track_bounds(bar);
+            let thumb = bar.thumb_rect(self.app.app()).expect("滑块 rect");
+            LogicalPoint::new(
+                track.origin.x + thumb.origin.x + thumb.size.width / 2.0,
+                track.origin.y + thumb.origin.y + thumb.size.height / 2.0,
+            )
+        }
+
+        fn drag_thumb(&mut self, origin: LogicalPoint, delta: LogicalPoint) -> Option<Action> {
+            let _ = self.app.inject(InputEvent::pointer_down(
+                origin,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            let promoted = LogicalPoint::new(origin.x + delta.x / 2.0, origin.y + delta.y / 2.0);
+            let started = self
+                .app
+                .inject(InputEvent::pointer_move(promoted, Modifiers::empty()))
+                .action;
+            let moved = LogicalPoint::new(origin.x + delta.x, origin.y + delta.y);
+            let _ = self
+                .app
+                .inject(InputEvent::pointer_move(moved, Modifiers::empty()));
+            let _ = self.app.inject(InputEvent::pointer_up(
+                moved,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            started
+        }
+    }
+
+    #[test]
+    fn dual_axis_scrollbar_preserves_other_axis() {
+        let mut harness = both_axes_harness();
+        let baseline = LogicalPoint::new(px(50.0), px(60.0));
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&harness.handle, baseline)
+            .expect("基线滚动");
+        let _ = harness.app.drain().expect("frame");
+        assert_eq!(harness.offset(), baseline, "前置：双轴基线偏移");
+
+        let vertical_track = harness.track_bounds(&harness.vertical);
+        let vertical_point = LogicalPoint::new(
+            vertical_track.origin.x + vertical_track.size.width / 2.0,
+            vertical_track.origin.y + vertical_track.size.height * 0.75,
+        );
+        let vertical_action = harness.vertical.inner.track_action.clone();
+        assert_eq!(
+            harness.click(vertical_point),
+            Some(vertical_action),
+            "点击点必须命中垂直条轨道"
+        );
+        let after_vertical = harness.offset();
+        assert!(
+            after_vertical.y > baseline.y,
+            "垂直条轨道点击必须改变 y：{after_vertical:?}"
+        );
+        assert_eq!(
+            after_vertical.x, baseline.x,
+            "垂直条不得清掉横向偏移：{after_vertical:?}"
+        );
+
+        let horizontal_track = harness.track_bounds(&harness.horizontal);
+        let horizontal_point = LogicalPoint::new(
+            horizontal_track.origin.x + horizontal_track.size.width * 0.75,
+            horizontal_track.origin.y + horizontal_track.size.height / 2.0,
+        );
+        let horizontal_action = harness.horizontal.inner.track_action.clone();
+        assert_eq!(
+            harness.click(horizontal_point),
+            Some(horizontal_action),
+            "点击点必须命中水平条轨道"
+        );
+        let after_horizontal = harness.offset();
+        assert!(
+            after_horizontal.x > after_vertical.x,
+            "水平条轨道点击必须改变 x：{after_horizontal:?}"
+        );
+        assert_eq!(
+            after_horizontal.y, after_vertical.y,
+            "水平条不得清掉纵向偏移：{after_horizontal:?}"
+        );
+    }
+
+    #[test]
+    fn dual_axis_scrollbar_thumb_drag_preserves_other_axis() {
+        let mut harness = both_axes_harness();
+        let baseline = LogicalPoint::new(px(50.0), px(60.0));
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&harness.handle, baseline)
+            .expect("基线滚动");
+        harness.sync_bars();
+        assert_eq!(harness.offset(), baseline, "前置：双轴基线偏移");
+
+        let vertical_thumb = harness.thumb_center(&harness.vertical);
+        let vertical_drag = harness.vertical.inner.drag_action.clone();
+        assert_eq!(
+            harness.drag_thumb(vertical_thumb, LogicalPoint::new(px(0.0), px(20.0))),
+            Some(vertical_drag),
+            "垂直滑块向下拖动必须由垂直条 drag handler 消费"
+        );
+        let after_vertical = harness.offset();
+        assert!(
+            after_vertical.y > baseline.y,
+            "垂直滑块向下拖动必须增加 y：{after_vertical:?}"
+        );
+        assert_eq!(
+            after_vertical.x, baseline.x,
+            "垂直滑块拖动不得清掉横向偏移：{after_vertical:?}"
+        );
+
+        harness.sync_bars();
+        let horizontal_thumb = harness.thumb_center(&harness.horizontal);
+        let horizontal_drag = harness.horizontal.inner.drag_action.clone();
+        assert_eq!(
+            harness.drag_thumb(horizontal_thumb, LogicalPoint::new(px(20.0), px(0.0))),
+            Some(horizontal_drag),
+            "水平滑块向右拖动必须由水平条 drag handler 消费"
+        );
+        let after_horizontal = harness.offset();
+        assert!(
+            after_horizontal.x > after_vertical.x,
+            "水平滑块向右拖动必须增加 x：{after_horizontal:?}"
+        );
+        assert_eq!(
+            after_horizontal.y, after_vertical.y,
+            "水平滑块拖动不得清掉纵向偏移：{after_horizontal:?}"
+        );
     }
 }

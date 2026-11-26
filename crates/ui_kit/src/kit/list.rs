@@ -71,6 +71,7 @@ pub struct ListOptions {
     pub row_stretch: bool,
     pub scrollbar: bool,
     pub separator: bool,
+    pub content_width: Option<LogicalPx>,
 }
 
 impl ListOptions {
@@ -88,6 +89,7 @@ impl ListOptions {
             row_stretch: false,
             scrollbar: true,
             separator: false,
+            content_width: None,
         }
     }
 
@@ -568,6 +570,11 @@ impl List {
     }
 
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
+        if let Some(width) = self.inner.options.content_width
+            && (!width.is_finite() || width < LogicalPx::ZERO)
+        {
+            return Err(EngineError::InvalidContentWidth { node: parent });
+        }
         let key = &self.inner.key;
         let outer_style = StyleBuilder::new()
             .relative()
@@ -622,6 +629,7 @@ impl List {
                 extent: options.row_height.extent(),
                 extents: None,
                 overscan: options.overscan,
+                content_width: options.content_width,
             },
         )?;
         let count = self.count(app);
@@ -1099,6 +1107,12 @@ impl List {
             } else {
                 row_style.items_center().build()
             };
+            let mut row_style = row_style;
+            if let Some(content_width) = options.content_width {
+                row_style.min_width(taffy::style::LengthPercentageAuto::length(
+                    content_width.value(),
+                ));
+            }
             let row_theme = theme.clone();
             let a11y_inner = inner.clone();
             NodeBuilder::boxed()
@@ -1431,7 +1445,7 @@ mod ui_tests {
         a11y::{A11yPatch, A11yRole},
         error::EngineError,
         event::{InputEvent, Modifiers, PointerButton},
-        interaction::{ScrollConfig, ScrollHandle},
+        interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
         math::{LogicalPoint, LogicalPx, LogicalSize, px},
         node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
         paint::style_builder::StyleBuilder,
@@ -1922,6 +1936,88 @@ mod ui_tests {
             row_texts(harness.app.app(), harness.app.window_id(), &harness.list, 2),
             vec![SmolStr::new_static("row2")]
         );
+    }
+
+    #[test]
+    fn content_width_makes_the_list_dual_axis_with_wide_rows() {
+        let mut options = ListOptions::fixed(px(ROW_EXTENT));
+        options.content_width = Some(px(300.0));
+        let harness = harness_with(options, 20, text_row);
+        let viewport = harness.list.viewport_node().expect("viewport");
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(harness.app.window_id(), viewport)
+            .expect("handle");
+        let state = harness.app.app().scroll_state(&handle).expect("state");
+        assert_eq!(state.axes, ScrollAxes::Both, "内容宽 > 视口 ⇒ 双轴");
+        assert_eq!(state.viewport.width, px(BOX_WIDTH));
+        assert_eq!(
+            state.content.width,
+            px(300.0),
+            "横向内容宽 = ListOptions.content_width"
+        );
+
+        let row = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        let bounds = harness.app.probe().bounds(row).expect("row bounds");
+        assert_eq!(
+            bounds.size.width,
+            px(300.0),
+            "挂载行必须撑到内容宽而不是视口宽：{bounds:?}"
+        );
+    }
+
+    #[test]
+    fn content_width_none_keeps_vertical_rows_at_the_viewport_width() {
+        let harness = harness(20);
+        let viewport = harness.list.viewport_node().expect("viewport");
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(harness.app.window_id(), viewport)
+            .expect("handle");
+        let state = harness.app.app().scroll_state(&handle).expect("state");
+        assert_eq!(state.axes, ScrollAxes::Vertical, "None 保持纵向单轴");
+        assert_eq!(
+            state.content.width, state.viewport.width,
+            "None：横向内容宽仍是视口宽"
+        );
+
+        let row = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        let bounds = harness.app.probe().bounds(row).expect("row bounds");
+        assert_eq!(
+            bounds.size.width,
+            px(BOX_WIDTH),
+            "None：行宽 = 视口宽（旧行为）"
+        );
+    }
+
+    #[test]
+    fn invalid_content_width_is_rejected_by_the_list_build() {
+        for width in [px(f32::NAN), px(-1.0)] {
+            let mut app = TestApp::new();
+            let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+            let mut options = ListOptions::fixed(px(ROW_EXTENT));
+            options.content_width = Some(width);
+            let list = List::new(app.app_mut(), theme, "invalid", options, text_row);
+            list.set_initial_count(app.app_mut(), 4);
+            let window = app.window_id();
+            let root = app.app().window(window).expect("window").tree().root();
+            let parent = {
+                let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+                NodeBuilder::boxed().build(tree, root).expect("parent")
+            };
+            let built = {
+                let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+                list.build(tree, parent)
+            };
+            match built {
+                Err(EngineError::InvalidContentWidth { .. }) => {}
+                other => {
+                    panic!("非法 content_width {width:?} 必须是 InvalidContentWidth：{other:?}")
+                }
+            }
+        }
     }
 
     #[test]

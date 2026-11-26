@@ -6,7 +6,7 @@ use crate::{
     a11y::{A11yOverride, A11yRole, A11yTreeSnapshot},
     event::{Action, ActionSource, Event, ImeEvent, InputEvent, KeyCode, Modifiers, PointerButton},
     interaction::{
-        DragPhase, OverlayDismiss, OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig,
+        DragPhase, OverlayDismiss, OverlayOptions, OverlayPlacement, ScrollAxes, ScrollConfig,
     },
     math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
@@ -470,7 +470,7 @@ fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
             window,
             viewport,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(40.0),
             },
         )

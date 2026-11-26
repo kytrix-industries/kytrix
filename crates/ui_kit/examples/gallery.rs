@@ -2659,7 +2659,7 @@ fn print_input_probe(app: &App, window: WindowId, inputs: &[InputNode], prefix: 
         let scroll = app
             .scroll_handle(window, input.viewport)
             .and_then(|handle| app.scroll_state(&handle))
-            .map(|state| (state.axis, state.offset, state.viewport, state.content));
+            .map(|state| (state.axes, state.offset, state.viewport, state.content));
         println!(
             "gallery: probe {prefix}input{index} root={root:?} editable={editable:?} metrics={metrics:?} caret={caret:?} selection={:?} composing={:?} focused={:?} scroll={scroll:?} scrollbar={scrollbar:?} value={value:?}",
             snapshot.as_ref().map(|snapshot| snapshot.selection.range()),

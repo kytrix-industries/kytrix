@@ -4,7 +4,7 @@ use super::App;
 use crate::{
     error::EngineError,
     event::{Action, InputEvent, KeyBinding, KeyCode, Modifiers},
-    interaction::{AnimatedValue, AnimationSpec, Easing, ScrollAxis, ScrollConfig},
+    interaction::{AnimatedValue, AnimationSpec, Easing, ScrollAxes, ScrollConfig},
     math::{LogicalSize, px},
     node::{
         builder::NodeBuilder,
@@ -166,7 +166,7 @@ fn a_scoped_binding_without_a_handler_falls_back_to_default_key_scroll() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )

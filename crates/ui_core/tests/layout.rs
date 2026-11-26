@@ -1,7 +1,7 @@
 use smol_str::SmolStr;
 use taffy::style::{FlexDirection, Position};
 use ui_core::{
-    interaction::{ScrollAxis, ScrollConfig},
+    interaction::{ScrollAxes, ScrollConfig},
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
@@ -243,7 +243,7 @@ fn scroll_offset_moves_what_hit_test_sees() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(24.0),
             },
         )

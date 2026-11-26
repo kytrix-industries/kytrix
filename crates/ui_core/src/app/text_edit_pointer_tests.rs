@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 use crate::{
     a11y::A11yRole,
     event::{Action, Event, InputEvent, InputOutcome, Modifiers, PointerButton},
-    interaction::{ScrollAxis, ScrollConfig},
+    interaction::{ScrollAxes, ScrollConfig},
     math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
@@ -502,7 +502,7 @@ fn dragging_out_of_the_view_scrolls_the_nearest_ancestor_and_settles() {
             id,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(20.0),
             },
         )
@@ -587,7 +587,7 @@ fn ancestor_scroll_drag_keeps_the_anchor_and_focus_bytes() {
             id,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(20.0),
             },
         )

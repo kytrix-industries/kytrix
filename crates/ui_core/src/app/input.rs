@@ -628,11 +628,17 @@ pub(crate) fn on_scroll(
     let mut dx = delta_x;
     let mut dy = delta_y;
     for (node, slot, size) in chain {
-        let drives = match slot.axis {
-            crate::interaction::ScrollAxis::Vertical => dy,
-            crate::interaction::ScrollAxis::Horizontal => dx,
+        let drives_y = if slot.axes.vertical() {
+            dy
+        } else {
+            LogicalPx::ZERO
         };
-        if drives == LogicalPx::ZERO {
+        let drives_x = if slot.axes.horizontal() {
+            dx
+        } else {
+            LogicalPx::ZERO
+        };
+        if drives_x == LogicalPx::ZERO && drives_y == LogicalPx::ZERO {
             continue;
         }
         let max = scroll::max_offset(&slot, size);
@@ -644,37 +650,38 @@ pub(crate) fn on_scroll(
             app.scroll_animation_target(node, window)
                 .unwrap_or(slot.offset)
         };
-        let (before, limit) = match slot.axis {
-            crate::interaction::ScrollAxis::Vertical => (pending.y, max.y),
-            crate::interaction::ScrollAxis::Horizontal => (pending.x, max.x),
-        };
-        let before = px(before.value().clamp(0.0, limit.value()));
         let step = if unit == ScrollUnit::Line {
             slot.line_height
         } else {
             px(1.0)
         };
-        let after = px((before - step * drives.value())
+        let before_y = px(pending.y.value().clamp(0.0, max.y.value()));
+        let after_y = px((before_y - step * drives_y.value())
             .value()
-            .clamp(0.0, limit.value()));
-        let consumed = px((before - after) / step);
-        if consumed == LogicalPx::ZERO {
+            .clamp(0.0, max.y.value()));
+        let consumed_y = px((before_y - after_y) / step);
+        let before_x = px(pending.x.value().clamp(0.0, max.x.value()));
+        let after_x = px((before_x - step * drives_x.value())
+            .value()
+            .clamp(0.0, max.x.value()));
+        let consumed_x = px((before_x - after_x) / step);
+        let mut goal = pending;
+        if consumed_y != LogicalPx::ZERO {
+            goal.y = after_y;
+            dy -= consumed_y;
+        }
+        if consumed_x != LogicalPx::ZERO {
+            goal.x = after_x;
+            dx -= consumed_x;
+        }
+        if goal == pending {
             continue;
         }
         let handle = ScrollHandle::new(window, node);
-        let mut goal = LogicalPoint::new(px(0.0), px(0.0));
-        match slot.axis {
-            crate::interaction::ScrollAxis::Vertical => goal.y = after,
-            crate::interaction::ScrollAxis::Horizontal => goal.x = after,
-        }
         if direct {
             let _ = app.scroll_to(&handle, goal);
         } else {
             let _ = app.scroll_to_animated(&handle, goal);
-        }
-        match slot.axis {
-            crate::interaction::ScrollAxis::Vertical => dy -= consumed,
-            crate::interaction::ScrollAxis::Horizontal => dx -= consumed,
         }
         if dx == LogicalPx::ZERO && dy == LogicalPx::ZERO {
             break;
@@ -816,7 +823,7 @@ pub(crate) fn on_key(
 }
 
 fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
-    use crate::{event::Key, interaction::ScrollAxis};
+    use crate::{event::Key, interaction::ScrollAxes};
     let Some(key) = Key::from_code(code) else {
         return false;
     };
@@ -829,22 +836,35 @@ fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
     let Some((node, slot)) = scroll::scroll_ancestor(target.tree(), focused) else {
         return false;
     };
+    let axes = slot.axes;
+    let axis = match key {
+        Key::ArrowLeft | Key::ArrowRight if axes.horizontal() => ScrollAxes::Horizontal,
+        Key::ArrowUp | Key::ArrowDown if axes.vertical() => ScrollAxes::Vertical,
+        Key::PageUp | Key::PageDown | Key::Home | Key::End => {
+            if axes.vertical() {
+                ScrollAxes::Vertical
+            } else {
+                ScrollAxes::Horizontal
+            }
+        }
+        _ => return false,
+    };
     let viewport = scroll::viewport(target.tree(), node).size;
     let max = scroll::max_offset(&slot, viewport);
-    let limit = match slot.axis {
-        ScrollAxis::Vertical => max.y,
-        ScrollAxis::Horizontal => max.x,
+    let limit = match axis {
+        ScrollAxes::Horizontal => max.x,
+        ScrollAxes::Vertical | ScrollAxes::Both => max.y,
     };
     let line = slot.line_height;
-    let page = match slot.axis {
-        ScrollAxis::Vertical => viewport.height,
-        ScrollAxis::Horizontal => viewport.width,
+    let page = match axis {
+        ScrollAxes::Horizontal => viewport.width,
+        ScrollAxes::Vertical | ScrollAxes::Both => viewport.height,
     };
-    let goal = match (slot.axis, key) {
-        (ScrollAxis::Vertical, Key::ArrowUp) => Some(-line),
-        (ScrollAxis::Vertical, Key::ArrowDown) => Some(line),
-        (ScrollAxis::Horizontal, Key::ArrowLeft) => Some(-line),
-        (ScrollAxis::Horizontal, Key::ArrowRight) => Some(line),
+    let goal = match (axis, key) {
+        (ScrollAxes::Vertical, Key::ArrowUp) => Some(-line),
+        (ScrollAxes::Vertical, Key::ArrowDown) => Some(line),
+        (ScrollAxes::Horizontal, Key::ArrowLeft) => Some(-line),
+        (ScrollAxes::Horizontal, Key::ArrowRight) => Some(line),
         (_, Key::PageUp) => Some(-page),
         (_, Key::PageDown) => Some(page),
         (_, Key::Home) => Some(-limit),
@@ -855,11 +875,10 @@ fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
         return false;
     };
     let handle = ScrollHandle::new(window, node);
-    let mut movement = LogicalPoint::new(px(0.0), px(0.0));
-    match slot.axis {
-        ScrollAxis::Vertical => movement.y = delta,
-        ScrollAxis::Horizontal => movement.x = delta,
-    }
+    let movement = match axis {
+        ScrollAxes::Horizontal => LogicalPoint::new(delta, LogicalPx::ZERO),
+        ScrollAxes::Vertical | ScrollAxes::Both => LogicalPoint::new(LogicalPx::ZERO, delta),
+    };
     app.scroll_by(&handle, movement).is_ok()
 }
 

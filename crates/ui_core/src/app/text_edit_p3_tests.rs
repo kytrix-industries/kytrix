@@ -5,7 +5,7 @@ use smol_str::SmolStr;
 use crate::{
     a11y::A11yRole,
     event::{Event, ImeEvent, InputEvent, KeyCode, Modifiers, PointerButton},
-    interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
+    interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
@@ -219,7 +219,7 @@ fn vertical_bed(
             window,
             viewport,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height,
             },
         )
@@ -294,7 +294,7 @@ fn horizontal_bed(text: &str) -> HorizontalBed {
             window,
             viewport,
             ScrollConfig {
-                axis: ScrollAxis::Horizontal,
+                axes: ScrollAxes::Horizontal,
                 line_height: px(LINE_HEIGHT),
             },
         )
@@ -936,7 +936,7 @@ fn ensure_visible_never_grows_an_outer_scroll_content() {
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Horizontal,
+                axes: ScrollAxes::Horizontal,
                 line_height: px(LINE_HEIGHT),
             },
         )
@@ -947,7 +947,7 @@ fn ensure_visible_never_grows_an_outer_scroll_content() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(LINE_HEIGHT),
             },
         )
@@ -1440,7 +1440,7 @@ fn page_down_uses_the_nearest_vertical_ancestor() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(LINE_HEIGHT),
             },
         )
@@ -1451,7 +1451,7 @@ fn page_down_uses_the_nearest_vertical_ancestor() {
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Horizontal,
+                axes: ScrollAxes::Horizontal,
                 line_height: px(LINE_HEIGHT),
             },
         )
@@ -1827,5 +1827,180 @@ fn a_cross_window_takeover_hides_the_previous_owner_caret() {
             .expect("可编辑节点")
             .caret_visible(),
         "跨窗夺权必须把旧 owner 的 caret 隐藏并标脏"
+    );
+}
+
+struct BothAxisBed {
+    app: TestApp,
+    window: WindowId,
+    node: NodeId,
+    viewport: NodeId,
+    handle: ScrollHandle,
+}
+
+fn both_axis_bed(
+    text: &str,
+    multiline: bool,
+    viewport: LogicalSize,
+    content: Option<LogicalSize>,
+) -> BothAxisBed {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let root = root_of(&app, window);
+    let mut style = StyleBuilder::new()
+        .flex_col()
+        .width(viewport.width)
+        .height(viewport.height)
+        .build();
+    style.clip = Clip::Bounds;
+    let viewport_node = box_node(&mut app, root, style);
+    let mut editable = editable_style(None);
+    editable.padding_sides(px(0.0), px(5.0), px(0.0), px(0.0));
+    let mut editable_spec = spec(multiline);
+    if multiline {
+        editable_spec.text_style = editable_spec.text_style.with_wrap(TextWrap::NoWrap);
+    }
+    let node = mount_editable(&mut app, viewport_node, editable_spec, editable);
+    app.app_mut()
+        .text_edit_set_value(window, node, text)
+        .expect("写入文本");
+    drain(&mut app);
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            viewport_node,
+            ScrollConfig {
+                axes: ScrollAxes::Both,
+                line_height: px(LINE_HEIGHT),
+            },
+        )
+        .expect("双轴容器");
+    drain(&mut app);
+    let node_bounds = bounds(&app, node);
+    let content = content.unwrap_or(node_bounds.size);
+    app.app_mut()
+        .set_scroll_content(&handle, content)
+        .expect("内容尺寸");
+    BothAxisBed {
+        app,
+        window,
+        node,
+        viewport: viewport_node,
+        handle,
+    }
+}
+
+impl BothAxisBed {
+    fn offset(&self) -> LogicalPoint {
+        self.app
+            .app()
+            .scroll_state(&self.handle)
+            .expect("滚动状态")
+            .offset
+    }
+}
+
+#[test]
+fn a_dual_axis_single_line_editable_reveals_horizontally() {
+    let text: String = (0..40).map(|index| format!("w{index} ")).collect();
+    let mut bed = both_axis_bed(
+        text.as_str(),
+        false,
+        LogicalSize::new(px(100.0), px(30.0)),
+        Some(LogicalSize::new(px(2000.0), px(200.0))),
+    );
+    focus(&mut bed.app, bed.node);
+    let end = app_text_len(&bed.app, bed.window, bed.node);
+    crate::text_edit::set_selection(bed.app.app_mut(), bed.window, bed.node, end, end)
+        .expect("caret 到末尾");
+    drain(&mut bed.app);
+
+    let caret = caret_content(&bed.app, bed.node, end);
+    let viewport = bounds(&bed.app, bed.viewport);
+    let offset = bed.offset();
+    assert!(
+        offset.x > px(0.0),
+        "单行 + Both：必须横向 reveal，offset={offset:?}"
+    );
+    assert_eq!(offset.y, px(0.0), "单行 + Both：纵向不得移动：{offset:?}");
+    let screen = caret.translate(LogicalPoint::new(-offset.x, px(0.0)));
+    assert!(
+        screen.max().x <= viewport.max().x,
+        "caret 必须完整落在视口内：{screen:?} vs {viewport:?}"
+    );
+}
+
+#[test]
+fn a_dual_axis_multiline_editable_still_prefers_vertical_reveal() {
+    let text: String = (0..8).map(|_| "abcdefghij").collect::<Vec<_>>().join("\n");
+    let mut bed = both_axis_bed(
+        text.as_str(),
+        true,
+        LogicalSize::new(px(200.0), px(60.0)),
+        None,
+    );
+    focus(&mut bed.app, bed.node);
+    let end = app_text_len(&bed.app, bed.window, bed.node);
+    crate::text_edit::set_selection(bed.app.app_mut(), bed.window, bed.node, end, end)
+        .expect("caret 到末尾");
+    drain(&mut bed.app);
+
+    let caret = caret_content(&bed.app, bed.node, end);
+    let viewport = bounds(&bed.app, bed.viewport);
+    let offset = bed.offset();
+    assert!(
+        offset.y > px(0.0),
+        "多行 + Both：纵向优先 reveal，offset={offset:?}"
+    );
+    assert_eq!(
+        offset.x,
+        px(0.0),
+        "多行 + Both：无横向 overflow 时不得移动横向：{offset:?}"
+    );
+    let screen = caret.translate(LogicalPoint::new(px(0.0), -offset.y));
+    assert!(
+        screen.max().y <= viewport.max().y,
+        "caret 必须完整落在视口内：{screen:?} vs {viewport:?}"
+    );
+}
+
+#[test]
+fn a_dual_axis_multiline_editable_reveals_both_axes() {
+    let text: String = (0..8)
+        .map(|_| "abcdefghijklmnopqrstuvwxyz0123456789")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut bed = both_axis_bed(
+        text.as_str(),
+        true,
+        LogicalSize::new(px(200.0), px(60.0)),
+        Some(LogicalSize::new(px(1200.0), px(400.0))),
+    );
+    focus(&mut bed.app, bed.node);
+    let end = app_text_len(&bed.app, bed.window, bed.node);
+    crate::text_edit::set_selection(bed.app.app_mut(), bed.window, bed.node, end, end)
+        .expect("caret 到末尾");
+    drain(&mut bed.app);
+
+    let caret = caret_content(&bed.app, bed.node, end);
+    let viewport = bounds(&bed.app, bed.viewport);
+    let offset = bed.offset();
+    assert!(
+        offset.x > px(0.0),
+        "多行 + Both + 横向 overflow：必须横向 reveal，offset={offset:?}"
+    );
+    assert!(
+        offset.y > px(0.0),
+        "多行 + Both + 纵向 overflow：必须纵向 reveal，offset={offset:?}"
+    );
+    let screen = caret.translate(LogicalPoint::new(-offset.x, -offset.y));
+    assert!(
+        screen.origin.x >= viewport.origin.x && screen.max().x <= viewport.max().x,
+        "caret 横向必须完整落在视口内：{screen:?} vs {viewport:?}"
+    );
+    assert!(
+        screen.origin.y >= viewport.origin.y && screen.max().y <= viewport.max().y,
+        "caret 纵向必须完整落在视口内：{screen:?} vs {viewport:?}"
     );
 }

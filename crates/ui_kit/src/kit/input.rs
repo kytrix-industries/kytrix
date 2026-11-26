@@ -10,7 +10,7 @@ use ui_core::{
     a11y::A11yRole,
     app::App,
     event::Action,
-    interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
+    interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
     math::{LogicalPoint, LogicalPx, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
@@ -646,11 +646,11 @@ impl InputNode {
         let axis = FieldAxis::of(&self.spec);
         let config = match axis {
             FieldAxis::SingleLine => ScrollConfig {
-                axis: ScrollAxis::Horizontal,
+                axes: ScrollAxes::Horizontal,
                 line_height: size.font_size,
             },
             FieldAxis::Multiline => ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: self
                     .metrics
                     .get()
@@ -668,7 +668,7 @@ impl InputNode {
             app,
             self.theme.clone(),
             format_smolstr!("{}.scrollbar", self.spec.name),
-            scrollbar_axis(ScrollAxis::Vertical),
+            ScrollbarAxis::Vertical,
             ScrollbarOptions::default()
                 .hover()
                 .inset(size.padding_x)
@@ -853,7 +853,7 @@ impl InputNode {
         let Some(state) = app.scroll_state(&handle) else {
             return;
         };
-        if state.axis != ScrollAxis::Horizontal || state.offset.x == LogicalPx::ZERO {
+        if state.axes != ScrollAxes::Horizontal || state.offset.x == LogicalPx::ZERO {
             return;
         }
         let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), state.offset.y));
@@ -950,13 +950,6 @@ fn text_style(spec: &InputSpec, size: &crate::theme::components::SizeTokens) -> 
         .with_overflow(TextOverflow::Clip, 0)
 }
 
-fn scrollbar_axis(axis: ScrollAxis) -> ScrollbarAxis {
-    match axis {
-        ScrollAxis::Horizontal => ScrollbarAxis::Horizontal,
-        ScrollAxis::Vertical => ScrollbarAxis::Vertical,
-    }
-}
-
 fn grapheme_count(text: &str) -> usize {
     text.graphemes(true).count()
 }
@@ -970,7 +963,7 @@ mod tests {
         a11y::{A11yRole, A11yTextSelection},
         app::App,
         event::{Action, ImeEvent, InputEvent, KeyCode, Modifiers, PointerButton},
-        interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
+        interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
         math::{LogicalPoint, LogicalPx, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeKind},
         paint::{
@@ -2047,7 +2040,7 @@ mod tests {
                 window,
                 wrapper,
                 ScrollConfig {
-                    axis: ui_core::interaction::ScrollAxis::Vertical,
+                    axes: ui_core::interaction::ScrollAxes::Vertical,
                     line_height: px(20.0),
                 },
             )
@@ -3128,7 +3121,7 @@ mod tests {
             .scroll_handle(window, harness.node.viewport)
             .expect("单行 viewport 有水平滚动槽");
         let state = harness.app.app().scroll_state(&handle).expect("滚动状态");
-        assert_eq!(state.axis, ScrollAxis::Horizontal);
+        assert_eq!(state.axes, ScrollAxes::Horizontal);
         let tree = harness.app.app().window(window).expect("窗口").tree();
         assert_eq!(
             tree.get(harness.node.root).expect("root").children().len(),

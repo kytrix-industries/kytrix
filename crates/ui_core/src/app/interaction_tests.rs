@@ -9,7 +9,7 @@ use crate::{
     },
     interaction::{
         AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, OverlayDismiss,
-        OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig, VirtualListConfig,
+        OverlayOptions, OverlayPlacement, ScrollAxes, ScrollConfig, VirtualListConfig,
     },
     math::{DeviceRect, LogicalPoint, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
@@ -114,7 +114,7 @@ fn wheel_events_in_one_frame_accumulate() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -153,7 +153,7 @@ fn non_finite_scroll_inputs_are_rejected() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -192,7 +192,7 @@ fn non_positive_line_height_is_rejected() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height,
             },
         );
@@ -511,7 +511,7 @@ fn scrollable_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) 
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -570,7 +570,7 @@ fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -733,7 +733,7 @@ fn a_nested_scroll_container_follows_the_outer_container_scroll() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -745,7 +745,7 @@ fn a_nested_scroll_container_follows_the_outer_container_scroll() {
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -810,6 +810,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -824,7 +825,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
             window,
             page,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -1430,7 +1431,7 @@ fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -1442,7 +1443,7 @@ fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -1605,6 +1606,7 @@ fn virtual_rows_carry_their_position_in_the_set() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -1653,6 +1655,7 @@ fn virtual_list_mounts_the_visible_window_and_recycles() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -2177,6 +2180,7 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -2239,6 +2243,7 @@ fn virtual_rows_are_laid_out_with_the_configured_extent() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -2959,7 +2964,7 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -3129,7 +3134,7 @@ fn pixel_scroll_follows_immediately_while_line_scroll_is_animated() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -3663,7 +3668,7 @@ fn programmatic_scroll_cancels_a_pending_wheel_animation() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -3834,7 +3839,7 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -3846,7 +3851,7 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Horizontal,
+                axes: ScrollAxes::Horizontal,
                 line_height: px(48.0),
             },
         )
@@ -4232,7 +4237,7 @@ fn nested_wheel_app(
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -4247,7 +4252,7 @@ fn nested_wheel_app(
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -4331,7 +4336,7 @@ fn line_wheel_applies_immediately_and_accumulates_in_one_frame() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -4371,7 +4376,7 @@ fn pixel_wheel_applies_immediately() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -4580,5 +4585,85 @@ fn new_sequence_after_idle_retargets_to_hovered_container() {
         wheel_offset(&app, window, outer),
         Some(LogicalPoint::new(px(0.0), px(48.0))),
         "新序列按指针位置重定位到外层"
+    );
+}
+
+#[test]
+fn scroll_to_clamps_both_axes_and_keeps_the_other_axis_untouched() {
+    let (_rt, mut app, window) = setup();
+    let container = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axes: ScrollAxes::Both,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(600.0), px(600.0)))
+        .expect("content");
+    frame(&mut app, window);
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").axes,
+        ScrollAxes::Both
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(120.0), px(80.0)))
+        .expect("both axes");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(120.0), px(80.0)),
+        "双轴目标一次写入两轴"
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(200.0), px(80.0)))
+        .expect("x only");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(200.0), px(80.0)),
+        "只滚 x 时 y 保持"
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(200.0), px(140.0)))
+        .expect("y only");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(200.0), px(140.0)),
+        "只滚 y 时 x 保持"
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(10_000.0), px(10_000.0)))
+        .expect("clamp");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(400.0), px(450.0)),
+        "两轴按各自滚动范围独立夹紧"
+    );
+}
+
+#[test]
+fn default_scroll_config_stays_on_the_vertical_single_axis() {
+    let (_rt, mut app, window) = setup();
+    let container = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(window, container, ScrollConfig::default())
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(600.0), px(600.0)))
+        .expect("content");
+    frame(&mut app, window);
+
+    let state = app.scroll_state(&handle).expect("state");
+    assert_eq!(state.axes, ScrollAxes::Vertical);
+    assert_eq!(state.content, LogicalSize::new(px(600.0), px(600.0)));
+    app.scroll_to(&handle, LogicalPoint::new(px(120.0), px(80.0)))
+        .expect("scroll");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(0.0), px(80.0)),
+        "默认纵向容器的横向偏移恒 0（旧行为不变）"
     );
 }

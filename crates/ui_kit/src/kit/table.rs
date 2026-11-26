@@ -298,6 +298,7 @@ impl Table {
                 row_stretch: fixed_rows,
                 scrollbar: options.scrollbar,
                 separator: false,
+                content_width: None,
             },
             move |tree, parent, row| {
                 let count = count_for_rows.get();
@@ -1367,7 +1368,11 @@ mod tests {
         let scroll = table_a11y
             .scroll
             .expect("Table 必须接管行窗口的 scroll（E9 R2 后半）");
-        assert!(scroll.vertical);
+        assert_eq!(
+            scroll.orientation,
+            Some(ui_core::a11y::A11yOrientation::Vertical),
+            "表体窗口是纵向滚动容器：orientation 必须由 axes 推导"
+        );
         assert!(
             scroll.y_max > px(0.0),
             "滚动范围来自行窗口的内容高度：{scroll:?}"

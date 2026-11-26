@@ -2,8 +2,8 @@ use smallvec::SmallVec;
 
 use crate::{
     a11y::{
-        A11yAction, A11yDiagnostic, A11yLabel, A11yLabelSource, A11yNode, A11yNodeId, A11yOverride,
-        A11yPatch, A11yRole, A11yScroll,
+        A11yAction, A11yDiagnostic, A11yLabel, A11yLabelSource, A11yNode, A11yNodeId,
+        A11yOrientation, A11yOverride, A11yPatch, A11yRole, A11yScroll,
         identity::{A11yIds, A11yKey},
         mapping::{
             a11y_disabled, a11y_read_only, bounds_of, effective_actions, effective_description,
@@ -12,7 +12,7 @@ use crate::{
         },
         textrun,
     },
-    interaction::ScrollAxis,
+    interaction::ScrollAxes,
     math::DevicePixelRatio,
     node::{
         dependency::ReadCtx,
@@ -512,7 +512,11 @@ fn scroll_state(tree: &NodeTree, node: NodeId) -> Option<A11yScroll> {
         y: slot.offset.y,
         x_max: max.x,
         y_max: max.y,
-        vertical: matches!(slot.axis, ScrollAxis::Vertical),
+        orientation: match slot.axes {
+            ScrollAxes::Vertical => Some(A11yOrientation::Vertical),
+            ScrollAxes::Horizontal => Some(A11yOrientation::Horizontal),
+            ScrollAxes::Both => None,
+        },
     })
 }
 
@@ -1125,7 +1129,7 @@ mod tests {
 
     use super::{collect_subtree, push_ancestors, resolve_focus};
     use crate::{
-        a11y::{A11yAction, A11yOverride, A11yRole, A11ySort, identity::A11yIds},
+        a11y::{A11yAction, A11yOrientation, A11yOverride, A11yRole, A11ySort, identity::A11yIds},
         math::{DevicePixelRatio, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         text::TextStyle,
@@ -2111,7 +2115,7 @@ mod tests {
             .scroll = Some(crate::interaction::ScrollSlot {
             offset: crate::math::LogicalPoint::new(px(0.0), px(40.0)),
             content: crate::math::LogicalSize::new(px(0.0), px(2000.0)),
-            axis: crate::interaction::ScrollAxis::Vertical,
+            axes: crate::interaction::ScrollAxes::Vertical,
             line_height: px(20.0),
         });
 
@@ -2130,7 +2134,7 @@ mod tests {
             .expect("集合根必须接管窗口的 scroll（E9 R2 后半）");
         assert_eq!(scroll.y, px(40.0));
         assert_eq!(scroll.y_max, px(2000.0));
-        assert!(scroll.vertical);
+        assert_eq!(scroll.orientation, Some(A11yOrientation::Vertical));
         assert!(
             table_record.clips_children,
             "滚动容器的裁剪感知必须随语义上提"
@@ -2163,6 +2167,45 @@ mod tests {
         assert_eq!(ak.scroll_y_max(), Some(2000.0));
         assert!(ak.clips_children());
         assert!(ak.supports_action(accesskit::Action::ScrollDown));
+    }
+
+    #[test]
+    fn both_axis_scrollers_report_both_ranges_without_an_orientation() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let scroller = NodeBuilder::boxed()
+            .build(&mut tree, root)
+            .expect("scroller");
+        tree.set_layout_for_test(
+            scroller,
+            crate::node::tree::LayoutBox {
+                bounds: crate::math::LogicalRect::new(px(0.0), px(0.0), px(120.0), px(80.0)),
+                border: crate::math::LogicalEdges::uniform(px(0.0)),
+            },
+        );
+        tree.ensure_interaction(scroller)
+            .expect("interaction")
+            .scroll = Some(crate::interaction::ScrollSlot {
+            offset: crate::math::LogicalPoint::new(px(30.0), px(40.0)),
+            content: crate::math::LogicalSize::new(px(1000.0), px(2000.0)),
+            axes: crate::interaction::ScrollAxes::Both,
+            line_height: px(20.0),
+        });
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let record = snapshot_with(&tree, scroller, &mut ids, &mut tables);
+        let scroll = record.scroll.expect("scroll");
+        assert_eq!(scroll.x, px(30.0));
+        assert_eq!(scroll.y, px(40.0));
+        assert_eq!(scroll.x_max, px(880.0));
+        assert_eq!(scroll.y_max, px(1920.0));
+        assert_eq!(
+            scroll.orientation, None,
+            "Both 不得自动推导 orientation（O9/A-H3）"
+        );
+        let ak = crate::a11y::adapter::to_accesskit(&record);
+        assert_eq!(ak.orientation(), None, "Both 只在显式声明时才设置方向");
     }
 
     #[test]

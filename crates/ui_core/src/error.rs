@@ -227,6 +227,8 @@ pub enum EngineError {
     NotScrollable { node: NodeId },
     #[error("node {node:?} is not a virtual list (Clip::Bounds + position: relative required)")]
     NotVirtualList { node: NodeId },
+    #[error("invalid content width while building under {node:?}: must be finite and non-negative")]
+    InvalidContentWidth { node: NodeId },
 
     #[error("virtual list item count mismatch: expected {expected}, got {actual}")]
     VirtualListExtents { expected: usize, actual: usize },

@@ -547,7 +547,7 @@ impl App {
 | `ScrollState` | `{ offset, content, viewport, axis }` | `{ offset, content, viewport, axes }` |
 | `ScrollSlot` | `{ offset, content, axis, line_height }` | `{ offset, content, axes, line_height }`（`pub(crate)`） |
 | `max_offset` / `clamp_offset` | 单轴；非本轴恒 0 | 双轴；未启用轴恒 0；启用轴各自夹紧 |
-| `scroll::scroll_ancestor_on` | 按单轴过滤 | 删除；由 `scroll_candidates` + 轴过滤替代 |
+| `scroll::scroll_ancestor_on` | 按单轴过滤 | **已删除（P1）**；由 `scroll::scroll_ancestors` + 轴过滤 / `scroll_candidates` 替代 |
 | `app/animation::scroll_animation_target` | 行滚轮动画累加 | 删除（无调用方） |
 | `on_scroll` | 内联父链 + 逐祖先消费 | 委托 `interaction/scroll.rs` 的 `route_wheel`；保留入口的 modal scope 过滤与 SHIFT 换轴 |
 | `default_key_scroll` | `scroll_ancestor` 单轴 | 共享 `scroll_candidates`；步进语义不变 |
@@ -562,7 +562,7 @@ impl App {
 - `interaction::ScrollAxis`（单轴枚举）与所有 `axis` 字段/匹配。
 - `on_scroll` 内联 `chain` 构建与逐祖先消费（`app/input.rs:609-682`）。
 - `direct`（`unit == Pixel || phase.is_continuous()`）分支与行滚轮动画分支；连带删除 `ScrollPhase::is_continuous`（`event.rs:315-320`，删 `direct` 后无生产调用方）。
-- `scroll::scroll_ancestor_on`（`interaction/scroll.rs:63-70`）及其在 `text_edit.rs:2967` 的调用。
+- **已删除（P1）**：`scroll::scroll_ancestor_on`（原 `interaction/scroll.rs:63-70`）及其在 `text_edit.rs` 的调用；P4 不再处理该项。
 - `scroll_animation_target`：`app/animation.rs:15-29` **与** `App::scroll_animation_target` 包装（`app.rs:1005-1007`）。
 - 旧断言测试（§2.4 明确列出）与相关测试辅助。
 - **保留**：`scroll::scroll_ancestor` / `scroll_ancestors` 作为 text_edit/a11y 的结构性（非代理）助手保留——它们仍被 `text_edit.rs:3544/4132/4158` 与 `a11y/mapping.rs:297` 使用；本批只把滚轮/键盘/a11y 的“找滚动目标”迁移到 `scroll_candidates`，不强行删除底层遍历器。若 P4 后发现可统一再删。
@@ -580,13 +580,13 @@ impl App {
 | crate / 文件 | 迁移内容 |
 |---|---|
 | `ui_core::interaction.rs` | `ScrollAxis` 定义删除；`ScrollConfig`/`ScrollState`/`ScrollSlot` 字段换 `axes` |
-| `ui_core::interaction/scroll.rs` | `max_offset`/`clamp_offset` 双轴；`scroll_ancestor_on` 删除；测试槽构造换 `axes` |
+| `ui_core::interaction/scroll.rs` | `max_offset`/`clamp_offset` 双轴；`scroll_ancestor_on` **已删除（P1）**；测试槽构造换 `axes` |
 | `ui_core::app/input.rs` | **P1 就要改**（否则删 `ScrollAxis` 后不编译）：`on_scroll`/`default_key_scroll` 的单轴 match 机械改为 `axes`（旧链式保留）；P2 再整体重写 `on_scroll`，并把 `InputEvent::Scroll.timestamp` 透传到 `App::on_scroll`（当前 `input.rs:167-182` 用 `..` 丢弃） |
 | `ui_core::app.rs` | `App::on_scroll` 签名加 `timestamp`；删除 `App::scroll_animation_target` 包装（`app.rs:1005-1007`） |
 | `ui_core::app/scroll.rs` | `make_scroll` 校验/写入 `axes`；`scroll_to` 双轴夹紧；`ScrollState.axes` |
-| `ui_core::app/virtual_list.rs` | `ScrollSlot { axes: Vertical }` |
+| `ui_core::app/virtual_list.rs` | `VirtualListConfig.content_width`；`ScrollSlot { axes: Vertical | Both }`（`content_width=Some` 时 Both）；三处 `scroll.content` 写入保留横向内容宽（`content_width.unwrap_or(viewport.width)`） |
 | `ui_core::app/animation.rs` | 删除 `scroll_animation_target`；`AnimationTarget::Scroll` 保留 |
-| `ui_core::text_edit.rs` | `scroll_ancestor_on` → 候选解析 + 轴过滤；`match slot.axis`（`3544/4132/4158` 等）改 `axes`；`Both` 不用于文本编辑器（单行 Horizontal / 多行 Vertical），若意外出现按“垂直优先 + 登记偏差”处理 |
+| `ui_core::text_edit.rs` | **P1 已收口**：`scroll_ancestor_on` 已删除（P1），reveal/ensure-visible 改走 `scroll::scroll_ancestors` + 轴过滤；**单行 `Both` 横向优先、多行 `Both` 纵向优先**（`text_edit.rs:3580-3598` 的 preferred 顺序、`:4216`/`:4234` 的 reveal 分支）；多行 `Both` 若横向 overflow 也 reveal 横向（P1 收口）；**生产 `Input` 仍只建单轴槽**（单行 `Horizontal` / 多行 `Vertical`），`Both` 仅出现在测试/未来双轴输入；`match slot.axis` 已改 `axes` |
 | `ui_core::a11y.rs`、`a11y/{tree,adapter}.rs` | `A11yScroll.vertical` → `orientation: Option<A11yOrientation>`；`scroll_state` 按 `axes` 计算；adapter 仅 `Some` 时设置；测试槽构造 |
 | `ui_core::a11y/action.rs` | 横向动作步长改用 `viewport.width`（`455-458` 现为 height，既有缺陷）；`a11y_scroll_target` 按动作轴过滤 |
 | `ui_core::a11y/mapping.rs:297` | 保留 `scroll_ancestor` 的结构性用法；不强制迁移（见 §5.3 保留项） |
@@ -595,7 +595,7 @@ impl App {
 | `ui_kit::kit/input.rs` | **保留 `FieldAxis`**（`SingleLine/Multiline` 是布局判别器，`input.rs:180-194/246-384`，不能替换）；只改 2 个 `ScrollConfig` 字面量（`648-658`）、`state.axis` 判断（`856`）改 `axes`、删除 `scrollbar_axis` 辅助（`953-958`）改用 `ScrollbarAxis::Vertical`；clear 代理见 §4.7 |
 | `ui_kit::kit/{list,table,tree,menu,dropdown}.rs` | 纵向配置改 `axes: Vertical`；Table header 代理（Geometry 增加 header） |
 | `ui_kit::kit/scroll_bar.rs` | `attach -> Result` + track 代理接线/清理；`ScrollbarAxis::point(current, offset)` 保留另一轴（`54-59/460-462/510-512`） |
-| `ui_kit/examples/gallery.rs` | `state.axis` 的 probe（`:2625`）改 `state.axes`；⑦ 改双轴 + 两条 bar；外层页面可见 bar；`--wheel-check` |
+| `ui_kit/examples/gallery.rs` | `state.axis` 的 probe（`:2625`）改 `state.axes`（**P1 已迁移**）；⑦ 改双轴 + 两条 bar、外层页面可见 bar、`--wheel-check`（P3-3/P3-4） |
 | `settings_ui/src/layout.rs`、`updater_ui/src/dialog.rs`、`widgets/candlestick/...`、`widget_gallery_ui/src/gallery.rs` | **P1 不需要改**（它们只用 `ScrollConfig::default()`/`Default::default()`，无 `axis` 字面量）；P3 只做各自 bar 的代理接线 |
 | `ui_core/benches/perf.rs`、`examples/acceptance/*` | 若使用 `ScrollConfig` 字面量则同步 |
 
@@ -623,10 +623,10 @@ impl App {
 | P1-2 全部调用点迁移 | §5.5 清单编译通过；**必须包含 `app/input.rs` 的机械 `axes` 迁移**（旧链式保留）；旧单轴测试改 `axes` | `cargo test -p ui_core` / `-p ui_kit` 绿（滚轮行为不变） |
 | P1-3 文本框/虚拟列表/kit 适配 | `ensure_visible` 仍按轴工作；虚拟列表纵向；`ScrollBar` 双轴 `point` 保留另一轴 | 既有 text-edit/list/scroll_bar 用例全绿 |
 | P1-4 a11y 双轴 | `A11yScroll.orientation` 按 axes；Both 不自动；横向步长改 width | a11y 用例 + Both/横向 step 用例 |
-| P1-5 双轴 List 承载（addendum §3.5，增量） | `VirtualListConfig.content_width`、`VirtualSlot.content_width`、`app/virtual_list.rs` 三处 content 写入保留宽度、`ListOptions.content_width`、行 `width_full + min_width`；默认 `None` 行为与 HEAD 一致 | 既有 list/virtual 用例全绿；`None` 时 `axes=Vertical`、行宽行为不变 |
+| P1-5 双轴 List 承载（addendum §3.5，增量） | `VirtualListConfig.content_width`、`VirtualSlot.content_width`、`app/virtual_list.rs` 三处 content 写入保留宽度、`ListOptions.content_width`、行 `width_full + min_width(content_width)`；`Some` 时 `ScrollSlot.axes = Both`，`None` 时 `axes = Vertical` 且行宽行为与 HEAD 一致 | 既有 list/virtual 用例全绿；`content_width=None` 时 `axes=Vertical`、行宽行为不变 |
 | P1-6 滚动槽语义标记（addendum §3.5，按 AD3 **取消**） | AD3 sticky + AD2 自管两 bar 后 `ScrollSlot.a11y` 无使用点 ⇒ **不新增引擎字段**（`ScrollSlot`/`ScrollConfig` 保持 P1-1 的形状） | 无新增 API；复核 `ScrollSlot` 字段清单与 AD3 前一致 |
 
-**文件作用域**：`crates/ui_core/src/{interaction.rs,interaction/scroll.rs,app/input.rs,app/scroll.rs,app/virtual_list.rs,text_edit.rs,a11y.rs,a11y/*}`、`crates/ui_kit/src/kit/{input,list,table,tree,menu,dropdown,scroll_bar}.rs`（类型迁移 + `content_width` 通道 + `scroll_bar` 的 point 改动）、`ui_core/examples`/`benches`；测试文件同步。**不包含** `settings_ui`/`updater_ui`/`candlestick`/`widget_gallery_ui`（无 `axis` 字面量；其 `Column::flex` 迁移在 P3-10）。
+**文件作用域**：`crates/ui_core/src/{interaction.rs,interaction/scroll.rs,app/input.rs,app/scroll.rs,app/virtual_list.rs,text_edit.rs,error.rs,a11y.rs,a11y/*}`（`error.rs` 新增 `InvalidContentWidth`）、`crates/ui_kit/src/kit/{input,list,table,tree,menu,dropdown,scroll_bar}.rs`（类型迁移 + `content_width` 通道 + `scroll_bar` 的 point 改动）、`crates/ui_kit/examples/gallery.rs`（`state.axes` probe 迁移）、`ui_core/examples`/`benches`；测试文件同步。**不包含** `settings_ui`/`updater_ui`/`candlestick`/`widget_gallery_ui`（无 `axis` 字面量；其 `Column::flex` 迁移在 P3-10）。
 
 **依赖**：P0。**门禁**：`cargo test -p ui_core -p ui_kit`、`clippy -D warnings`、`fmt`；**本阶段不得改变滚轮行为**（旧链式仍在），只做模型迁移。
 
@@ -674,7 +674,7 @@ impl App {
 | 任务 | 产出 | 验收 |
 |---|---|---|
 | P4-1 键盘/a11y 统一 | 共享 `scroll_candidates`（按动作轴过滤）；键盘语义不变；`a11y/action.rs` 横向步长改 width | E17/E18/E32/E32b/E33 绿；既有键盘/树/a11y 用例全绿 |
-| P4-2 删除遗留 | 单轴枚举、`scroll_ancestor_on`、`scroll_animation_target` + `App` 包装、`is_continuous`、旧链式、过时测试 | 限定 `rg 'interaction::ScrollAxis'` 无残留（排除 Wayland 同名枚举）；编译零 warning |
+| P4-2 删除遗留 | 单轴枚举、`scroll_animation_target` + `App` 包装、`is_continuous`、旧链式、过时测试（`scroll_ancestor_on` **已在 P1 删除，P4 不再检查**） | 限定 `rg 'interaction::ScrollAxis'` 无残留（排除 Wayland 同名枚举）；`rg 'scroll_ancestor_on'` 仅允许出现在历史文档；编译零 warning |
 | P4-3 文档回写 | 本文件状态/偏差；`custom-gui-engine-design.md` §1.3 API + §8.4 滚动段 + E22 状态（`:140/:4780/:5013`）；`.docs/.../kit-gallery.md` | 文档引用源码行号核对；E22.md 缺失引用修复或创建 |
 | P4-4 三端验证 | Windows 125%（必须）；macOS/Linux（可用则跑） | §10 清单；证据归档 |
 | P4-5 变异自检 | 恢复关键旧代码 → 对应用例红；还原 → 绿（含代理环、End→Momentum、ScrollbarAxis::point） | 变异日志 |
@@ -744,7 +744,7 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 | K5 | `input_clear_button_wheel_scrolls_input` | 在 `set_clearable(true)` 后创建按钮的场景下，input 动、page 0 | **红** |
 | K6 | `menu_panel_wheel_over_bar_scrolls_panel_list` | 面板列表动 | **红** |
 | K7 | `dual_axis_demo_bars_scroll_both_axes` | 两条 bar 各自轴生效 | **红** |
-| K7b | `dual_axis_scrollbar_preserves_other_axis` | 拖垂直条 x 不变；拖水平条 y 不变 | **红** |
+| K7b | `dual_axis_scrollbar_preserves_other_axis` | 拖垂直条 x 不变；拖水平条 y 不变 | 绿（P1 已加 ScrollBar 组件级 track click + thumb drag 测试；P3 仍补 Table/代理完整 K7b） |
 | K8 | `scrollbar_release_clears_proxy_and_is_safe` | 重复 release 幂等；卸载后不 panic | **红** |
 | K9 | `scrollbar_geometry_unchanged_by_proxy` | thumb/track 几何与旧断言一致 | 绿（守卫） |
 | K10 | `proxy_target_disabled_or_hidden_is_skipped` | track 可见、target 禁用/隐藏时不滚目标，继续向外层 | **红** |
@@ -754,6 +754,8 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 | G4 | `--wheel-check`：hover | 滚动后 hover 更新 | **红** |
 | G5 | `--wheel-check`：双轴 | ⑦ 两轴都可滚 | **红** |
 | G6 | `--wheel-check` 后独立运行 `--idle-check` | 无额外帧 | 守卫（分进程） |
+
+> K7b 分两段：P1 已覆盖 ScrollBar 组件级 track click / thumb drag 的“保留另一轴”行为（`ScrollbarAxis::point(current, offset)`），状态转绿；P3 仍补 Table 双轴 + 代理链路的完整 K7b（拖垂直条 x 不变、拖水平条 y 不变，含 header 镜像偏移与双 bar 归属）。
 
 ### 7.3 手工验收矩阵（真实窗口）
 
@@ -798,8 +800,8 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 
 ### 8.1 删除
 
-- `interaction::ScrollAxis` 枚举及 `ScrollSlot.axis`/`ScrollConfig.axis`/`ScrollState.axis`。
-- `interaction/scroll.rs::scroll_ancestor_on`、`scroll_ancestors`（若统一后无调用方）。
+- `interaction::ScrollAxis` 枚举及 `ScrollSlot.axis`/`ScrollConfig.axis`/`ScrollState.axis`（P1 已删除）。
+- `interaction/scroll.rs::scroll_ancestor_on` **已删除（P1）**；`scroll_ancestors` 保留为结构性助手（text_edit/a11y 仍用，见 §5.3）。
 - `app/animation.rs::scroll_animation_target`。
 - `app/input.rs::on_scroll` 内联 `chain`/`direct`/动画分支（`609-682`、`605`、`639-646`）。
 - 旧测试：`a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain`（替代为 E12）、`pixel_scroll_follows_immediately_while_line_scroll_is_animated`（替代为 E2/E3）、`programmatic_scroll_cancels_a_pending_wheel_animation`（改写为程序化动画取消）。

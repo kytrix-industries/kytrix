@@ -187,6 +187,7 @@ impl ItemPanel {
             row_stretch: true,
             scrollbar: true,
             separator: false,
+            content_width: None,
         };
         let row_action = Action::Custom(format_smolstr!("{key}.row"));
         let list = {
