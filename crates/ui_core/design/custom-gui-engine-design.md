@@ -3083,6 +3083,7 @@ impl App {
    理由：全零行高是「尚未测量 / 全部折叠」的过渡态，首次回填真实高度不得跳到底部。
 6. **`content` 写入**：引擎内部**直接写 `ScrollSlot.content`**（不重入 `App::set_scroll_content`，避免 `tree_mut` 借用重入）；写入前必须保证
    `content` 有限：`extents` 逐项有限非负且累计和有限。违反时返回 `InvalidVirtualExtent`，**不写任何状态**（原子性）。
+   另一个引擎侧 `content` 写入方是可编辑文本的 ensure-visible（`ui_core::text_edit::grow_reveal_content`，只放大、输入为 editable 已布局外接尺寸，天然有限，不再单独校验；见 `.docs/text-input-redesign-design.md` §11.12）。
 7. **`ItemAlign` 落点**：`Start` / `Center` / `End` 分别按顶边 / 中心 / 底边对齐；`Nearest` = 条目**完全位于视口内**时不滚（`target == current`
    ⇒ 不请求帧），完全在视口上方 ⇒ 顶边贴视口顶边，完全在视口下方 ⇒ 底边贴视口底边。四种对齐的落点都先按「内容高度 − 视口高度」夹紧
    （`>= 0`），再走 `App::scroll_to` 的唯一偏移写点。

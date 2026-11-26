@@ -4021,6 +4021,7 @@ pub(crate) fn ensure_visible(app: &mut App, window: WindowId) {
     if text_pointer_press(app, window).is_some() {
         return;
     }
+    grow_reveal_content(app, window, node);
     let Some(geometry) = reveal_geometry(app, window, node) else {
         return;
     };
@@ -4121,6 +4122,27 @@ fn caret_content_rect(tree: &NodeTree, node: NodeId, byte_index: usize) -> Optio
         bounds.origin.x + content_offset.x,
         bounds.origin.y + content_offset.y,
     )))
+}
+
+fn grow_reveal_content(app: &mut App, window: WindowId, node: NodeId) {
+    let Some(target) = app.window_mut(window) else {
+        return;
+    };
+    let tree = target.tree_mut();
+    let Some((ancestor, _)) = scroll::scroll_ancestor(tree, node) else {
+        return;
+    };
+    let Ok(laid_out) = tree.get(node) else {
+        return;
+    };
+    let bounds = laid_out.layout().bounds.size;
+    let Some(slot) = tree.scroll_slot_mut(ancestor) else {
+        return;
+    };
+    slot.content = LogicalSize::new(
+        slot.content.width.max(bounds.width),
+        slot.content.height.max(bounds.height),
+    );
 }
 
 fn reveal_geometry(app: &App, window: WindowId, node: NodeId) -> Option<RevealGeometry> {

@@ -3180,6 +3180,132 @@ mod tests {
         assert_eq!(harness.text(), "");
     }
 
+    fn viewport_handle(harness: &Harness) -> ScrollHandle {
+        let window = harness.window();
+        harness
+            .app
+            .app()
+            .scroll_handle(window, harness.node.viewport)
+            .expect("viewport 有滚动槽")
+    }
+
+    fn assert_newest_character_revealed(harness: &Harness) {
+        let handle = viewport_handle(harness);
+        let state = harness.app.app().scroll_state(&handle).expect("滚动状态");
+        let byte = harness.engine_display().len();
+        let caret = harness.caret_rect(byte);
+        let viewport = node_bounds(harness, harness.node.viewport);
+        assert!(
+            caret.origin.x >= viewport.origin.x && caret.max().x <= viewport.max().x,
+            "最新输入的字符的 caret 必须完整落在视口内（display byte={byte}）：{caret:?} vs {viewport:?}"
+        );
+        assert_eq!(
+            state.content.width,
+            harness.editable_bounds().size.width,
+            "滚动槽内容宽必须等于已布局 editable 宽度（display byte={byte}）：{state:?}"
+        );
+        assert_eq!(
+            state.offset.x,
+            state.content.width - state.viewport.width,
+            "单行 reveal 必须同帧把 offset 推到内容右端（display byte={byte}）：{state:?}"
+        );
+    }
+
+    #[test]
+    fn typing_into_an_overflowing_single_line_field_reveals_the_newest_character_in_one_frame() {
+        let initial = "0".repeat(40);
+        let mut harness = harness_at_width(120.0, spec(), initial.as_str());
+        harness.focus();
+        let settled = harness
+            .app
+            .app()
+            .scroll_state(&viewport_handle(&harness))
+            .expect("滚动状态");
+        assert!(
+            settled.offset.x > px(0.0),
+            "前置：聚焦后单行内容必须已溢出并 reveal（offset={:?}）",
+            settled.offset.x
+        );
+        for step in 0..20 {
+            harness.type_text("1");
+            assert_eq!(
+                harness.engine_value().len(),
+                initial.len() + 1 + step,
+                "键入必须落到引擎文本"
+            );
+            assert_newest_character_revealed(&harness);
+        }
+    }
+
+    #[test]
+    fn typing_wide_cjk_characters_reveals_the_newest_character_in_one_frame() {
+        let initial = "0".repeat(40);
+        let mut harness = harness_at_width(120.0, spec(), initial.as_str());
+        harness.focus();
+        for step in 0..20 {
+            harness.type_text("。");
+            assert_eq!(
+                harness.engine_value().len(),
+                initial.len() + 3 * (step + 1),
+                "CJK 键入必须落到引擎文本"
+            );
+            assert_newest_character_revealed(&harness);
+        }
+    }
+
+    #[test]
+    fn typing_into_an_overflowing_masked_field_reveals_the_newest_character_in_one_frame() {
+        let initial = "0".repeat(40);
+        let mut harness = harness_at_width(120.0, masked_spec(), initial.as_str());
+        harness.focus();
+        for step in 0..20 {
+            harness.type_text("a");
+            assert_eq!(
+                harness.engine_value().len(),
+                initial.len() + 1 + step,
+                "掩码键入必须落到引擎真实文本"
+            );
+            assert_newest_character_revealed(&harness);
+        }
+    }
+
+    #[test]
+    fn typing_at_the_bottom_of_a_visible_lines_field_keeps_the_caret_visible_in_one_frame() {
+        let mut harness = harness_at_width(160.0, multiline_spec(Some(3)), "one\ntwo\nthree");
+        harness.focus();
+        let start = harness
+            .app
+            .app()
+            .scroll_state(&viewport_handle(&harness))
+            .expect("滚动状态");
+        assert!(
+            (start.content.height - start.viewport.height).abs() <= px(0.5),
+            "前置：初始文本恰好填满 3 行视口（{start:?}）"
+        );
+        for _ in 0..40 {
+            harness.type_text("。");
+            let byte = harness.engine_display().len();
+            let caret = harness.caret_rect(byte);
+            let viewport = node_bounds(&harness, harness.node.viewport);
+            assert!(
+                caret.origin.x >= viewport.origin.x
+                    && caret.max().x <= viewport.max().x
+                    && caret.origin.y >= viewport.origin.y
+                    && caret.max().y <= viewport.max().y,
+                "底部继续输入必须同帧把 caret 留在视口内（display byte={byte}）：{caret:?} vs {viewport:?}"
+            );
+        }
+        let state = harness
+            .app
+            .app()
+            .scroll_state(&viewport_handle(&harness))
+            .expect("滚动状态");
+        assert!(
+            state.content.height > start.content.height && state.offset.y > px(0.0),
+            "结论：连续输入必须让多行内容变高并触发纵向 reveal（{state:?} vs {start:?}）"
+        );
+    }
+
     #[test]
     fn dragging_a_multiline_scrolls_by_the_engine_line_height() {
         let mut harness = harness(multiline_spec(Some(3)), "one\ntwo\nthree\nfour\nfive\nsix");

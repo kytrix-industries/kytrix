@@ -425,7 +425,7 @@ pub struct InputSpec {
 - 高度：`visible_lines = Some(n)` → root 高度 = `n × line_height + 2×(border + padding_y)`；文本节点不截断，完整内容高；`n` 行以外的内容通过 viewport 滚动查看。`None` → root `height_full + min_height(line_height)` 由宿主决定；溢出时同样滚动。
 - 单行高度仍由 `ControlSize` 决定（Small/Medium/Large = 20/30/40）；宿主包装盒应与控件高度一致或让控件在包装盒内居中（gallery 当前 40px 包装盒 + Medium 30px 输入框顶部对齐的问题在 gallery 侧修正，不为此增加 `InputSpec.height` 字段）。
 - 滚动条：仅 `content_height > viewport_height` 时可见；overlay 在右侧内边缘（4px，hover 淡入），文本节点右侧留 6px gutter（不参与换行，滚动条绘制在 gutter 内，不遮挡字形）。
-- ensure-visible：引擎在 layout pass 后对聚焦节点的 caret/选区做 reveal（上下各留 1 个行高 padding；单行横向留 4px）；拖拽自动滚动由引擎 pointer 逻辑负责。
+- ensure-visible：引擎在 layout pass 后对聚焦节点的 caret/选区做 reveal（上下各留 1 个行高 padding；单行横向留 4px）；拖拽自动滚动由引擎 pointer 逻辑负责。reveal 的 clamp 上界取 `max(滚动槽 content, 聚焦 editable 已布局外接尺寸)` 的**并集**：引擎在算 reveal 几何之前把该并集写回**最近滚动祖先**的 `ScrollSlot.content`（只放大不缩小），因此宿主帧前 hook 写入的「上一帧内容尺寸」不会把本次输入的 caret 裁掉，最新字符**同帧**即完整露出（见 §11.12）。
 - `TextStyle.max_lines` 继续只用于「不可滚动文本截断」（markdown 等），**不用于输入框限行**（避免 §2.6 P6 的测量截断/截断后仍全量光栅化问题）。
 
 ### 4.10 彩色 emoji（E1）
@@ -884,8 +884,8 @@ setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`；输
   ui_core 整改批次），criterion 打印的 `change:` 百分比对照的是那份陈旧基线，**不作为本轮
   A/B 证据**（例如 `idle_frame` 会显示 +71.8%，而绝对耗时只有 432 ns）。
 
-head `92b573cb`（P4 遗留清零轮实测 head；其后 `7f586728` 及之后仅文档改动）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
-> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`，其后的文档修正不改变计数）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，属环境差异。
+head `92b573cb`（P4 遗留清零轮实测 head；该 head 之后未再复核计数，§11.12 修复新增 8 条用例后的 Windows 计数见 §11.12）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
+> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`，其后的文档修正不改变计数）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，属环境差异。**本节计数已非当前口径**：§11.12 的 reveal 修复新增 4 条 `ui_core`(test-support) + 4 条 `ui_kit` 用例，Windows 实测 2673 / 763（workspace 按 +8 推算 8932），当前口径见 §11.12。
 
 **Windows（全工作区）**
 
@@ -1116,7 +1116,32 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 | 项 | 状态 |
 |---|---|
 | §11.7 / §11.9 三端测试计数（P4-72） | 已按实测回填（Windows workspace 8924/0/30、lib 2328、TS 2669；Ubuntu lib 2111；macOS lib 207562、TS 2397） |
-| 旧计数口径 | 各轮历史记录保留原值供追溯；当前口径只认 §11.7 的实测值，不得引用更早的 `2062/2386/748`、`2027/2351/748`、`2067/2392/752`、`2032/2357/752` |
+| 旧计数口径 | 各轮历史记录保留原值供追溯；当前口径以 §11.12 的本提交实测（Windows 2328/2673/763/236；workspace 按 +8 推算 8932）为准，§11.7 / §11.9 为 P4 遗留清零轮历史 head `92b573cb` 口径；不得引用更早的 `2062/2386/748`、`2027/2351/748`、`2067/2392/752`、`2032/2357/752` |
+
+### 11.12 输入 reveal 同帧性修复（溢出时最新输入的字符不再等下一次 caret 闪烁）
+
+**缺陷**：单行输入框溢出后继续键入，最新字符的 caret 当帧被视口裁掉，要等下一次定时器帧（caret 闪烁，530 ms）才左移补齐；多行在末行继续输入/折行时同一缺陷（纵向）。
+
+**根因**：`InputNode::sync()` 在**帧前 hook** 里用上一帧的 `editable.layout().bounds` 调 `App::set_scroll_content`，宿主写入的 `ScrollSlot.content` 比本帧文本宽度**滞后一帧**；引擎 ensure-visible 在帧内 layout 之后执行（caret 几何最新），但 `clamp_reveal_target` / `App::scroll_to` 的 clamp 上界 `content − viewport` 用的正是这份滞后值，于是 reveal 目标被裁到恰好等于当前 offset，走「目标 == 当前」分支直接返回：既不滚动也不请求新帧。
+
+**修法**（`ui_core::text_edit::grow_reveal_content`）：在 `ensure_visible` 算 reveal 几何**之前**，把聚焦 editable 的**最近滚动祖先**滚动槽 `content` 与该 editable 已布局外接尺寸按轴取 `max` 写回（引擎内部直接写 `ScrollSlot.content`，不重入 `App::set_scroll_content`，与虚拟列表同一先例——`crates/ui_core/design/custom-gui-engine-design.md` §11.3 第 6 条 `:3084`）；**只放大不缩小**，不新增公开 API、不新增整形/布局工作、不新增提交帧（`scroll_to` 既有的 `request_frame` 唤醒仍由下一帧 a11y-only 分支吸收）。kit 侧 `set_scroll_content` 写入保留：修复后两侧数值一致、无振荡；删字收缩仍沿用「下一帧由宿主缩小」的既有节奏。
+
+**语义**：reveal 的 clamp 上界 = `max(滚动槽 content, 聚焦 editable 已布局外接尺寸)` 的并集，因此「宿主内容滞后」不再延迟 reveal——键入/删除/caret 移动/粘贴/IME 提交当帧即可把最新字符完整落入视口。偏差登记：待 §11.2 新增 **㊿**（clamp 上界取并集 + 引擎内部写最近滚动祖先 `content`；偏差行由 Lead 在提交后统一补行）。
+
+**测试**（修复前 RED = 引擎 3 条新用例 + 改写后的 retries 用例 + kit 4 条；修复后 GREEN。`ensure_visible_keeps_a_larger_host_content_when_it_reveals` 是**负向守卫**：修复前后皆 GREEN，其判别力来自「缩小语义」变异 M2）：
+
+- 引擎（`ui_core::app::text_edit_p3_tests`）：`ensure_visible_reveals_a_typed_character_in_one_frame_when_the_host_content_lags`（单行水平单帧）、`ensure_visible_reveals_a_typed_line_in_one_frame_when_the_host_content_lags`（多行垂直单帧）、`ensure_visible_never_grows_an_outer_scroll_content`（嵌套滚动只动最近祖先、外层 `content` 不变）；`ensure_visible_keeps_a_larger_host_content_when_it_reveals` 为「只放大不缩小」的负向守卫（修复前即 GREEN，缩小语义变异 M2 可令其 RED）；原 `ensure_visible_retries_once_when_the_scroll_content_was_stale` 的首帧预期正是本条缺陷，改写为 `ensure_visible_retries_once_when_the_scroll_content_changes_after_the_first_reveal`（覆盖「内容尺寸后续变化时补一次 reveal、稳定后不再滚」，变异 M8 可令其 RED）。
+- kit（`ui_kit::kit::input::tests`）：`typing_into_an_overflowing_single_line_field_reveals_the_newest_character_in_one_frame`、`typing_wide_cjk_characters_reveals_the_newest_character_in_one_frame`、`typing_into_an_overflowing_masked_field_reveals_the_newest_character_in_one_frame`（ASCII / CJK 宽字符 / 掩码各连续键入 20 字符，每次 `type_text` 后**单帧**断言 caret 屏幕矩形完整落在 viewport 内、滚动槽 `content.width` 等于已布局 editable 宽度且 `offset.x == content.width − viewport.width`）、`typing_at_the_bottom_of_a_visible_lines_field_keeps_the_caret_visible_in_one_frame`（多行末行继续输入 40 字符，纵向单帧）。
+
+**已知边界/前提**：
+
+- 引擎内部写 `content` 的**有限性前提**与虚拟列表同口径（`crates/ui_core/design/custom-gui-engine-design.md` §11.3 第 6 条）：本写入方只放大，输入是 editable 已布局外接尺寸（天然有限），因此不重复做显式有限性校验；该写入入口已在引擎设计 §11.3 第 6 条登记。
+- grow 取的是 editable 的**尺寸**而非「相对滚动视口 content 原点的外沿」：kit 的 editable 是 viewport 直接子节点、两者原点对齐，故其值精确；通用宿主若把 editable 放在滚动内容的偏移位置，仍可能欠补（当前生产代码只有 kit `input` 使用 `editable_text`）。
+- 指针拖拽期间 `text_pointer_press` 早退、grow 不执行，因此拖拽自动滚动仍使用宿主 `content`（沿用现状，本轮未覆盖）。
+
+**性能**（Windows 本机 debug 构建，单行溢出输入连续键入 200 次、每次 1 帧；同机先后 3 次取中位数）：修复前 **591.12 ms**、修复后 **592.61 ms**（+0.25%，噪声量级）；每键入帧的提交帧数修复前后均 **1**（`scroll_to` 的既有 `request_frame` 唤醒被下一帧的 a11y-only 分支吸收，不增加提交帧），键入停止后连续 `drain` 到 `Drained::Idle`（0 额外提交帧）。修复后末态 `offset.x = 1367.91`（= 当帧内容宽 − 视口宽），修复前为 `1362.60`（滞后一个字符宽）。
+
+**本提交验收（Windows，`fix/typing-reveal`）**：`ui_core --lib` **2328 passed + 1 ignored**；`ui_core --features test-support --lib` **2673 passed + 1 ignored**；`ui_kit --lib` **763 passed**；`settings_ui` **236 passed**；`cargo test --workspace` 本轮未实跑，按新增 8 条用例推算 **8932**。Ubuntu / macOS 数字由 Lead 合并后补。§11.7 / §11.9 的 2328/2669/759/8924 是 P4 遗留清零轮历史 head `92b573cb` 口径，保留供追溯，不再作为当前口径。
 
 ## 附录 A：关键证据索引
 

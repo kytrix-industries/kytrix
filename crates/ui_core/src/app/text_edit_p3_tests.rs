@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
 
@@ -660,31 +660,30 @@ fn ensure_visible_does_not_steal_a_manual_scroll_back() {
 }
 
 #[test]
-fn ensure_visible_retries_once_when_the_scroll_content_was_stale() {
+fn ensure_visible_retries_once_when_the_scroll_content_changes_after_the_first_reveal() {
     let mut bed = vertical_bed("0\n1\n2\n3\n4\n5", 3, Some(4));
     let line = bed.line_height;
     focus(&mut bed.app, bed.node);
-    bed.set_caret(page_line(4));
+    bed.set_caret(page_line(5));
     drain(&mut bed.app);
-    let stale_max = line;
     assert_eq!(
         bed.offset().y,
-        stale_max,
-        "第一帧被旧内容尺寸 clamp（只到 4 行的内容）"
+        line * 3.0,
+        "末行 reveal 的目标被内容末尾 clamp 到最大偏移"
     );
 
     bed.app
         .app_mut()
         .set_scroll_content(
             &bed.handle,
-            LogicalSize::new(px(200.0), px(line.value() * 6.0)),
+            LogicalSize::new(px(200.0), px(line.value() * 8.0)),
         )
         .expect("内容尺寸更新");
     drain(&mut bed.app);
-    let caret = caret_content(&bed.app, bed.node, page_line(4));
+    let caret = caret_content(&bed.app, bed.node, page_line(5));
     let viewport = bounds(&bed.app, bed.viewport);
-    let expected = caret.max().y + line - (viewport.origin.y + viewport.size.height);
-    assert_eq!(bed.offset().y, expected, "内容尺寸同步后第二帧补上 reveal");
+    let expected = caret.max().y + line - viewport.max().y;
+    assert_eq!(bed.offset().y, expected, "内容尺寸变化后必须补一次 reveal");
     let settled = bed.offset().y;
     drain(&mut bed.app);
     assert_eq!(bed.offset().y, settled, "有界重试：稳定后不再滚动");
@@ -746,6 +745,239 @@ fn app_text_len(app: &TestApp, window: WindowId, node: NodeId) -> usize {
         .text_edit_value(window, node)
         .expect("真实文本")
         .len()
+}
+
+#[test]
+fn ensure_visible_reveals_a_typed_character_in_one_frame_when_the_host_content_lags() {
+    let mut bed = horizontal_bed("abcdefghijklmnopqrstuvwxyz0123456789");
+    let window = bed.window;
+    let node = bed.node;
+    focus(&mut bed.app, node);
+    let len = app_text_len(&bed.app, window, node);
+    crate::text_edit::set_selection(bed.app.app_mut(), window, node, len, len)
+        .expect("caret 到末尾");
+    drain(&mut bed.app);
+    let settled = bed.app.app().scroll_state(&bed.handle).expect("滚动状态");
+    assert_eq!(
+        settled.offset.x,
+        settled.content.width - settled.viewport.width,
+        "前置：宿主内容与布局一致时 offset 必须在右端"
+    );
+    let step = caret_content(&bed.app, node, len).origin.x
+        - caret_content(&bed.app, node, len - 1).origin.x;
+    bed.app
+        .app_mut()
+        .set_scroll_content(
+            &bed.handle,
+            LogicalSize::new(settled.content.width - step, settled.content.height),
+        )
+        .expect("滞后一帧的宿主内容尺寸");
+
+    bed.app.inject(InputEvent::Text {
+        text: SmolStr::new_static("W"),
+        timestamp: Instant::now(),
+    });
+    assert_eq!(drain(&mut bed.app), Drained::Committed, "键入帧必须提交");
+
+    let after = bed.app.app().scroll_state(&bed.handle).expect("滚动状态");
+    let editable = bounds(&bed.app, node);
+    assert_eq!(
+        after.content.width, editable.size.width,
+        "reveal 必须同帧把滚动槽内容补到 editable 已布局宽度：{after:?} vs {editable:?}"
+    );
+    assert_eq!(
+        after.offset.x,
+        after.content.width - after.viewport.width,
+        "同帧 offset 必须推到右端：{after:?}"
+    );
+    let caret = caret_content(&bed.app, node, len + 1);
+    let viewport = bounds(&bed.app, bed.viewport);
+    let screen = caret.translate(LogicalPoint::new(-after.offset.x, px(0.0)));
+    assert!(
+        screen.origin.x >= viewport.origin.x && screen.max().x <= viewport.max().x,
+        "最新输入的字符的 caret 必须完整落在视口内：{screen:?} vs {viewport:?}"
+    );
+    assert_eq!(
+        drain(&mut bed.app),
+        Drained::Idle,
+        "键入帧之后不得再有额外提交帧"
+    );
+    assert_eq!(
+        bed.app
+            .app()
+            .scroll_state(&bed.handle)
+            .expect("滚动状态")
+            .offset
+            .x,
+        after.offset.x,
+        "后续帧不得再次移动 offset"
+    );
+    assert_eq!(drain(&mut bed.app), Drained::Idle, "稳定后不得有额外帧");
+}
+
+#[test]
+fn ensure_visible_reveals_a_typed_line_in_one_frame_when_the_host_content_lags() {
+    let mut bed = vertical_bed("0\n1\n2\n3\n4", 3, None);
+    let line = bed.line_height;
+    focus(&mut bed.app, bed.node);
+    let len = app_text_len(&bed.app, bed.window, bed.node);
+    bed.set_caret(len);
+    drain(&mut bed.app);
+    let settled = bed.app.app().scroll_state(&bed.handle).expect("滚动状态");
+    assert_eq!(
+        settled.content.height,
+        line * 5.0,
+        "前置：宿主内容高 = 5 行：{settled:?}"
+    );
+    bed.app
+        .app_mut()
+        .set_scroll_content(
+            &bed.handle,
+            LogicalSize::new(settled.content.width, line * 4.0),
+        )
+        .expect("滞后一帧的宿主内容高度");
+
+    bed.app.inject(InputEvent::Text {
+        text: SmolStr::new_static("\n"),
+        timestamp: Instant::now(),
+    });
+    assert_eq!(drain(&mut bed.app), Drained::Committed, "键入帧必须提交");
+
+    let after = bed.app.app().scroll_state(&bed.handle).expect("滚动状态");
+    let editable = bounds(&bed.app, bed.node);
+    assert_eq!(
+        after.content.height, editable.size.height,
+        "reveal 必须同帧把滚动槽内容补到 editable 已布局高度：{after:?} vs {editable:?}"
+    );
+    let caret = caret_content(&bed.app, bed.node, len + 1);
+    let viewport = bounds(&bed.app, bed.viewport);
+    let screen = caret.translate(LogicalPoint::new(px(0.0), -after.offset.y));
+    assert!(
+        screen.origin.y >= viewport.origin.y && screen.max().y <= viewport.max().y,
+        "新输入的行的 caret 必须完整落在视口内：{screen:?} vs {viewport:?}"
+    );
+}
+
+#[test]
+fn ensure_visible_keeps_a_larger_host_content_when_it_reveals() {
+    let mut bed = horizontal_bed("abcdefghijklmnopqrstuvwxyz0123456789");
+    let window = bed.window;
+    let node = bed.node;
+    focus(&mut bed.app, node);
+    let len = app_text_len(&bed.app, window, node);
+    crate::text_edit::set_selection(bed.app.app_mut(), window, node, len, len)
+        .expect("caret 到末尾");
+    drain(&mut bed.app);
+    let settled = bed.app.app().scroll_state(&bed.handle).expect("滚动状态");
+    let host = LogicalSize::new(
+        settled.content.width + px(300.0),
+        settled.content.height + px(200.0),
+    );
+    bed.app
+        .app_mut()
+        .set_scroll_content(&bed.handle, host)
+        .expect("宿主更大的内容尺寸");
+
+    bed.app.inject(InputEvent::Text {
+        text: SmolStr::new_static("W"),
+        timestamp: Instant::now(),
+    });
+    assert_eq!(drain(&mut bed.app), Drained::Committed, "键入帧必须提交");
+
+    let after = bed.app.app().scroll_state(&bed.handle).expect("滚动状态");
+    assert_eq!(
+        after.content, host,
+        "reveal 只做并集，不得缩小宿主更大的内容：{after:?}"
+    );
+    let caret = caret_content(&bed.app, node, len + 1);
+    let viewport = bounds(&bed.app, bed.viewport);
+    let screen = caret.translate(LogicalPoint::new(-after.offset.x, px(0.0)));
+    assert!(
+        screen.origin.x >= viewport.origin.x && screen.max().x <= viewport.max().x,
+        "宿主内容更大时 caret 仍必须可见：{screen:?} vs {viewport:?}"
+    );
+}
+
+#[test]
+fn ensure_visible_never_grows_an_outer_scroll_content() {
+    let mut app = TestApp::new();
+    let window = app.window_id();
+    let root = root_of(&app, window);
+    let mut outer_style = StyleBuilder::new()
+        .width(px(300.0))
+        .height(px(120.0))
+        .build();
+    outer_style.clip = Clip::Bounds;
+    let outer = box_node(&mut app, root, outer_style);
+    let mut inner_style = StyleBuilder::new()
+        .flex_row()
+        .width(px(100.0))
+        .height(px(30.0))
+        .build();
+    inner_style.clip = Clip::Bounds;
+    let inner = box_node(&mut app, outer, inner_style);
+    let mut editable_style = editable_style(None);
+    editable_style.padding_sides(px(0.0), px(5.0), px(0.0), px(0.0));
+    let node = mount_editable(&mut app, inner, spec(false), editable_style);
+    app.app_mut()
+        .text_edit_set_value(window, node, "abcdefghijklmnopqrstuvwxyz0123456789")
+        .expect("写入文本");
+    drain(&mut app);
+    let inner_handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            inner,
+            ScrollConfig {
+                axis: ScrollAxis::Horizontal,
+                line_height: px(LINE_HEIGHT),
+            },
+        )
+        .expect("内层水平滚动槽");
+    let outer_handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: px(LINE_HEIGHT),
+            },
+        )
+        .expect("外层垂直滚动槽");
+    let outer_content = LogicalSize::new(px(300.0), px(400.0));
+    app.app_mut()
+        .set_scroll_content(&outer_handle, outer_content)
+        .expect("外层内容尺寸");
+    app.app_mut()
+        .set_scroll_content(&inner_handle, LogicalSize::new(px(10.0), px(30.0)))
+        .expect("内层滞后的内容尺寸");
+    focus(&mut app, node);
+    let len = app_text_len(&app, window, node);
+    crate::text_edit::set_selection(app.app_mut(), window, node, len, len).expect("caret 到末尾");
+    assert_eq!(drain(&mut app), Drained::Committed, "reveal 帧必须提交");
+
+    let inner_after = app.app().scroll_state(&inner_handle).expect("内层滚动状态");
+    let editable = bounds(&app, node);
+    assert_eq!(
+        inner_after.content.width, editable.size.width,
+        "内层滚动内容必须补到 editable 已布局宽度：{inner_after:?} vs {editable:?}"
+    );
+    assert_eq!(
+        app.app()
+            .scroll_state(&outer_handle)
+            .expect("外层滚动状态")
+            .content,
+        outer_content,
+        "外层滚动容器的 content 不得被 reveal 修改"
+    );
+    let caret = caret_content(&app, node, len);
+    let viewport = bounds(&app, inner);
+    let screen = caret.translate(LogicalPoint::new(-inner_after.offset.x, px(0.0)));
+    assert!(
+        screen.origin.x >= viewport.origin.x && screen.max().x <= viewport.max().x,
+        "caret 必须完整落在内层视口内：{screen:?} vs {viewport:?}"
+    );
 }
 
 #[test]
