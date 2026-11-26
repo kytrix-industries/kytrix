@@ -4208,3 +4208,377 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
     );
     assert_eq!(clicks.get(), 1, "模态关闭后背景点击必须恢复");
 }
+
+fn mount_wheel_pane(app: &mut App, window: WindowId, outer: NodeId, height: f32) -> NodeId {
+    let mut style = Style::default();
+    style.clip = Clip::Bounds;
+    NodeBuilder::boxed()
+        .style(style)
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(height)))
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("mount inner pane")
+}
+
+fn nested_wheel_app(
+    inner_content: f32,
+    outer_content: f32,
+) -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) {
+    let (rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 150.0);
+    let inner = mount_wheel_pane(&mut app, window, outer, 100.0);
+    frame(&mut app, window);
+    let outer_handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("outer scrollable");
+    app.set_scroll_content(
+        &outer_handle,
+        LogicalSize::new(px(200.0), px(outer_content)),
+    )
+    .expect("outer content");
+    let inner_handle = app
+        .make_scroll(
+            window,
+            inner,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("inner scrollable");
+    app.set_scroll_content(
+        &inner_handle,
+        LogicalSize::new(px(200.0), px(inner_content)),
+    )
+    .expect("inner content");
+    frame(&mut app, window);
+    (rt, app, window, outer, inner)
+}
+
+fn dispatch_wheel(
+    app: &mut App,
+    window: WindowId,
+    position: LogicalPoint,
+    lines: f32,
+    timestamp: std::time::Instant,
+) {
+    app.dispatch_input(
+        window,
+        InputEvent::Scroll {
+            position,
+            delta: LogicalPoint::new(px(0.0), px(lines)),
+            unit: ScrollUnit::Line,
+            phase: ScrollPhase::Discrete,
+            modifiers: Modifiers::empty(),
+            timestamp,
+        },
+    );
+}
+
+fn settle_frames(app: &mut App, window: WindowId) {
+    app.advance_clock(std::time::Duration::from_millis(400));
+    frame(app, window);
+}
+
+fn wheel_offset(app: &App, window: WindowId, node: NodeId) -> Option<LogicalPoint> {
+    app.window(window)
+        .expect("window")
+        .tree()
+        .scroll_slot(node)
+        .map(|slot| slot.offset)
+}
+
+#[test]
+fn wheel_over_inner_content_scrolls_only_inner() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = std::time::Instant::now();
+    for step in 0..3 {
+        dispatch_wheel(
+            &mut app,
+            window,
+            LogicalPoint::new(px(50.0), px(50.0)),
+            -1.0,
+            base + std::time::Duration::from_millis(50 * step),
+        );
+    }
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(144.0))),
+        "内层内容上的 3 行滚轮只滚内层"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::ZERO),
+        "同一序列外层必须保持不动"
+    );
+}
+
+#[test]
+#[ignore = "P0 red until P2"]
+fn line_wheel_applies_immediately_and_accumulates_in_one_frame() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
+        .expect("content");
+    frame(&mut app, window);
+
+    let base = std::time::Instant::now();
+    for step in 0..2 {
+        dispatch_wheel(
+            &mut app,
+            window,
+            LogicalPoint::new(px(50.0), px(50.0)),
+            -1.0,
+            base + std::time::Duration::from_millis(50 * step),
+        );
+    }
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::new(px(0.0), px(96.0))),
+        "行滚轮必须立即到位，同一帧内两次刻度累加为 96 px，不得有待等待动画"
+    );
+    assert!(
+        !app.has_animations(),
+        "行滚轮必须立即到位，不得创建 AnimationTarget::Scroll"
+    );
+}
+
+#[test]
+fn pixel_wheel_applies_immediately() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
+        .expect("content");
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        InputEvent::Scroll {
+            position: LogicalPoint::new(px(50.0), px(50.0)),
+            delta: LogicalPoint::new(px(0.0), px(-30.0)),
+            unit: ScrollUnit::Pixel,
+            phase: ScrollPhase::Discrete,
+            modifiers: Modifiers::empty(),
+            timestamp: std::time::Instant::now(),
+        },
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::new(px(0.0), px(30.0))),
+        "单轴 Pixel 滚轮必须同帧立即到位"
+    );
+    assert!(
+        !app.has_animations(),
+        "Pixel 滚轮不得创建 AnimationTarget::Scroll"
+    );
+}
+
+#[test]
+#[ignore = "P0 red until P2"]
+fn inner_at_end_does_not_move_outer_in_same_sequence() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(148.0, 400.0);
+    let base = std::time::Instant::now();
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base,
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "前置条件：内层已到边界"
+    );
+
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(50),
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "内层停在边界"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::ZERO),
+        "同一序列的余量必须丢弃：外层不得移动"
+    );
+}
+
+#[test]
+#[ignore = "P0 red until P2"]
+fn new_sequence_after_idle_moves_outer_when_inner_at_end() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(148.0, 400.0);
+    let base = std::time::Instant::now();
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base,
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "前置条件：内层已到边界"
+    );
+
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(50),
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "同一序列内层停在边界"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::ZERO),
+        "同一序列的余量必须丢弃：旧链式会结转并让外层离开 0"
+    );
+
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(500),
+    );
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "新序列不从内层边界继续"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "间隔超过序列空闲阈值后重新仲裁：外层整包消费 48 px 并立即到位（旧动画实现此处仍是 0）"
+    );
+}
+
+#[test]
+#[ignore = "P0 red until P2"]
+fn wheel_sequence_latches_target_when_pointer_moves() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = std::time::Instant::now();
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base,
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "前置条件：内层已滚 1 行"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(120.0)), Modifiers::empty()),
+    );
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(120.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(50),
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(96.0))),
+        "指针移到页面后同一序列仍锁定内层"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::ZERO),
+        "序列内不得因指针移动改滚外层"
+    );
+}
+
+#[test]
+fn new_sequence_after_idle_retargets_to_hovered_container() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = std::time::Instant::now();
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base,
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "前置条件：内层已滚 1 行"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(120.0)), Modifiers::empty()),
+    );
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(120.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(500),
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "新序列必须重新命中：内层不再接收"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "新序列按指针位置重定位到外层"
+    );
+}

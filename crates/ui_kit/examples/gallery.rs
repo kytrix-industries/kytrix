@@ -125,6 +125,7 @@ struct Flags {
     auto_close: Option<u64>,
     probe: bool,
     dump_overlay: bool,
+    wheel_check: bool,
     scroll_to: Option<f32>,
 }
 
@@ -145,6 +146,8 @@ fn parse_flags() -> Flags {
             flags.probe = true;
         } else if arg == "--dump-overlay" {
             flags.dump_overlay = true;
+        } else if arg == "--wheel-check" {
+            flags.wheel_check = true;
         } else if let Some(value) = arg.strip_prefix("--scroll-to=") {
             flags.scroll_to = value.parse::<f32>().ok();
         } else {
@@ -1970,6 +1973,40 @@ impl Gallery {
                 app.handle().wake();
             });
         }
+        if self.flags.wheel_check {
+            let viewport = self.viewport;
+            let lists = self.lists.clone();
+            let table = self.table.clone();
+            let _ = app.after(window, Duration::from_millis(500), move |app| {
+                let scroll = app
+                    .scroll_handle(window, viewport)
+                    .and_then(|handle| app.scroll_state(&handle));
+                let hit = app
+                    .window(window)
+                    .and_then(|target| {
+                        target
+                            .tree()
+                            .hit_test(LogicalPoint::new(px(WINDOW_W / 2.0), px(WINDOW_H / 2.0)))
+                    })
+                    .map(|hit| hit.node);
+                let table_offset = table.list().offset(app).map(|offset| offset.value());
+                let list_offset = lists
+                    .first()
+                    .and_then(|list| list.offset(app))
+                    .map(|offset| offset.value());
+                match scroll {
+                    Some(scroll) => println!(
+                        "gallery: wheel-check SKELETON page_offset={:.1} content_height={:.1} hit={hit:?} table_offset={table_offset:?} list_offset={list_offset:?}",
+                        scroll.offset.y, scroll.content.height
+                    ),
+                    None => println!(
+                        "gallery: wheel-check SKELETON page_offset=<missing> content_height=<missing> hit={hit:?} table_offset={table_offset:?} list_offset={list_offset:?}"
+                    ),
+                }
+                app.close_window(window);
+                app.handle().wake();
+            });
+        }
         if self.flags.idle_check {
             let idle = self.idle.clone();
             let _ = app.after(window, Duration::from_millis(1_000), move |app| {
@@ -2819,6 +2856,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("gallery: overlay-check FAIL ({report:?})");
             failed = true;
         }
+    }
+    if gallery.flags.wheel_check {
+        println!("gallery: wheel-check FAIL (skeleton: assertions land in P3)");
+        failed = true;
     }
     if failed {
         std::process::exit(3);
