@@ -51,6 +51,7 @@ const LIST_ID: &str = "MARKDOWN_LIST";
 const LIST_ITEM_ID: &str = "MARKDOWN_LIST_ITEM";
 const LIST_MARKER_ID: &str = "MARKDOWN_LIST_MARKER";
 const LIST_CONTENT_ID: &str = "MARKDOWN_LIST_CONTENT";
+const LIST_CONTENT_TIGHT_ID: &str = "MARKDOWN_LIST_CONTENT_TIGHT";
 const TABLE_ID: &str = "MARKDOWN_TABLE";
 const TABLE_ROW_ID: &str = "MARKDOWN_TABLE_ROW";
 const TABLE_CELL_ID: &str = "MARKDOWN_TABLE_CELL";
@@ -211,6 +212,8 @@ impl<'a> Builder<'a> {
     }
 
     fn parse(&mut self, source: &str) -> Result<(), EngineError> {
+        #[cfg(test)]
+        PARSE_COUNT.with(|count| count.set(count.get() + 1));
         let options =
             Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
         for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
@@ -1542,6 +1545,11 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
         let row = item.row;
+        let id = if self.current_item_is_loose() {
+            LIST_CONTENT_ID
+        } else {
+            LIST_CONTENT_TIGHT_ID
+        };
         self.ensure_marker()?;
         let column = self.build_node(
             NodeBuilder::boxed()
@@ -1552,7 +1560,7 @@ impl<'a> Builder<'a> {
                         .min_width_0()
                         .build(),
                 )
-                .id(LIST_CONTENT_ID),
+                .id(id),
             row,
         )?;
         if let Some(frame) = self.containers.last_mut()
@@ -1562,6 +1570,19 @@ impl<'a> Builder<'a> {
             frame.node = column;
         }
         Ok(())
+    }
+
+    fn current_item_is_loose(&self) -> bool {
+        let count = self.containers.len();
+        let Some(FrameKind::Item(item)) = self.containers.last().map(|frame| &frame.kind) else {
+            return false;
+        };
+        item.loose
+            || (count >= 2
+                && matches!(
+                    &self.containers[count - 2].kind,
+                    FrameKind::List { loose: true, .. }
+                ))
     }
 
     fn item_needs_content_column(&self) -> bool {
@@ -1688,12 +1709,9 @@ impl<'a> Builder<'a> {
         let height = self.style.line_height();
         let parent = self.parent();
         for _ in 0..count {
-            self.build_node(
-                NodeBuilder::boxed()
-                    .style(StyleBuilder::new().width_full().height(height).build())
-                    .id(SPACER_ID),
-                parent,
-            )?;
+            let mut style = StyleBuilder::new().width_full().height(height).build();
+            style.flex_shrink(0.0);
+            self.build_node(NodeBuilder::boxed().style(style).id(SPACER_ID), parent)?;
             if let Some(frame) = self.containers.last_mut() {
                 frame.previous_blank = true;
             }
@@ -1745,4 +1763,19 @@ fn digits_of(number: u64) -> u32 {
         value /= 10;
     }
     digits
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn parse_count() -> usize {
+    PARSE_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn reset_parse_count() {
+    PARSE_COUNT.with(|count| count.set(0));
 }

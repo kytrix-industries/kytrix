@@ -42,6 +42,8 @@ struct Collector<'a> {
 
 impl Collector<'_> {
     fn collect(&mut self, source: &str) {
+        #[cfg(test)]
+        PLAIN_PARSE_COUNT.with(|count| count.set(count.get() + 1));
         let options =
             Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
         for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
@@ -295,4 +297,19 @@ fn collect_text(payload: &str, range: Range<usize>, outside: &mut Vec<Range<usiz
     {
         outside.push(range);
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PLAIN_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn plain_parse_count() -> usize {
+    PLAIN_PARSE_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn reset_plain_parse_count() {
+    PLAIN_PARSE_COUNT.with(|count| count.set(0));
 }

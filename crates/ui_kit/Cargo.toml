@@ -16,7 +16,12 @@ ui_core = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 
+[[bench]]
+name = "markdown"
+harness = false
+
 [dev-dependencies]
+criterion = { workspace = true }
 tokio = { workspace = true }
 ui_core = { workspace = true, features = ["test-support"] }
 
