@@ -180,6 +180,7 @@ impl SimpleShaped {
         let line = ShapedTextLine {
             text_range: 0..text.len(),
             baseline,
+            line_top: LogicalPx::ZERO,
             line_height: self.metrics.line_height,
             advance: self.width,
             items: vec![ShapedTextItem::GlyphRun(ShapedGlyphRun {
@@ -188,6 +189,7 @@ impl SimpleShaped {
                 glyphs,
             })],
             decorations: Vec::new(),
+            backgrounds: Vec::new(),
         };
         Ok(ShapedLine {
             text,

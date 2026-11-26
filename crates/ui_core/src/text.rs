@@ -37,72 +37,86 @@ pub enum TextSlant {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TextDecoration {
-    Underline {
-        color: Option<Color>,
-        thickness: LogicalPx,
-    },
-    Strikethrough {
-        color: Option<Color>,
-        thickness: LogicalPx,
-    },
+pub struct TextDecoration {
+    pub color: Option<Color>,
+    pub thickness: LogicalPx,
 }
 
 impl TextDecoration {
     #[must_use]
-    pub const fn underline(thickness: LogicalPx) -> Self {
-        Self::Underline {
-            color: None,
-            thickness,
-        }
-    }
-
-    #[must_use]
-    pub const fn strikethrough(thickness: LogicalPx) -> Self {
-        Self::Strikethrough {
-            color: None,
-            thickness,
-        }
-    }
-
-    #[must_use]
-    pub const fn with_color(self, color: Option<Color>) -> Self {
-        match self {
-            Self::Underline { thickness, .. } => Self::Underline { color, thickness },
-            Self::Strikethrough { thickness, .. } => Self::Strikethrough { color, thickness },
-        }
-    }
-
-    #[must_use]
-    pub const fn color(self) -> Option<Color> {
-        match self {
-            Self::Underline { color, .. } | Self::Strikethrough { color, .. } => color,
-        }
-    }
-
-    #[must_use]
-    pub const fn thickness(self) -> LogicalPx {
-        match self {
-            Self::Underline { thickness, .. } | Self::Strikethrough { thickness, .. } => thickness,
-        }
-    }
-
-    #[must_use]
     pub fn is_visible(self) -> bool {
-        let thickness = self.thickness().value();
+        let thickness = self.thickness.value();
         thickness.is_finite() && thickness > 0.0
     }
 
-    pub(crate) fn hash_into(self, hasher: &mut ahash::AHasher) {
+    fn hash_into(self, hasher: &mut ahash::AHasher) {
         use core::hash::Hash;
 
-        let (tag, color, thickness) = match self {
-            Self::Underline { color, thickness } => (0u8, color, thickness),
-            Self::Strikethrough { color, thickness } => (1u8, color, thickness),
-        };
-        tag.hash(hasher);
-        color.map(color_bits).hash(hasher);
-        thickness.value().to_bits().hash(hasher);
+        self.color.map(color_bits).hash(hasher);
+        self.thickness.value().to_bits().hash(hasher);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TextDecorationKind {
+    Underline,
+    Strikethrough,
+}
+
+impl TextDecorationKind {
+    pub(crate) const ALL: [Self; 2] = [Self::Underline, Self::Strikethrough];
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextDecorations {
+    pub underline: Option<TextDecoration>,
+    pub strikethrough: Option<TextDecoration>,
+}
+
+impl TextDecorations {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.underline.is_none() && self.strikethrough.is_none()
+    }
+
+    pub(crate) const fn get(&self, kind: TextDecorationKind) -> Option<TextDecoration> {
+        match kind {
+            TextDecorationKind::Underline => self.underline,
+            TextDecorationKind::Strikethrough => self.strikethrough,
+        }
+    }
+
+    fn hash_into(self, hasher: &mut ahash::AHasher) {
+        use core::hash::Hash;
+
+        for kind in TextDecorationKind::ALL {
+            (kind as u8).hash(hasher);
+            match self.get(kind) {
+                Some(decoration) => {
+                    true.hash(hasher);
+                    decoration.hash_into(hasher);
+                }
+                None => false.hash(hasher),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextBackground {
+    pub color: Color,
+    pub corner_radius: LogicalPx,
+    pub padding_x: LogicalPx,
+}
+
+impl TextBackground {
+    #[must_use]
+    pub fn is_visible(self) -> bool {
+        !self.color.is_transparent()
+            && self.padding_x.is_finite()
+            && self.padding_x >= LogicalPx::ZERO
+            && self.corner_radius.is_finite()
+            && self.corner_radius >= LogicalPx::ZERO
     }
 }
 
@@ -195,7 +209,8 @@ pub struct TextStyleExtras {
     pub stretch: Option<u16>,
     pub word_spacing: Option<LogicalPx>,
     pub line_break: Option<TextLineBreak>,
-    pub decoration: Option<TextDecoration>,
+    pub decorations: TextDecorations,
+    pub background: Option<TextBackground>,
 }
 
 pub type FeatureSet = ThinSlice<TextFeature>;
@@ -317,8 +332,15 @@ impl TextStyle {
     }
 
     #[must_use]
-    pub fn decoration(&self) -> Option<TextDecoration> {
-        self.extras.as_ref().and_then(|extras| extras.decoration)
+    pub fn decorations(&self) -> TextDecorations {
+        self.extras
+            .as_ref()
+            .map_or_else(TextDecorations::default, |extras| extras.decorations)
+    }
+
+    #[must_use]
+    pub fn background(&self) -> Option<TextBackground> {
+        self.extras.as_ref().and_then(|extras| extras.background)
     }
 
     #[must_use]
@@ -460,8 +482,33 @@ impl TextStyle {
     }
 
     #[must_use]
-    pub fn with_decoration(mut self, decoration: TextDecoration) -> Self {
-        self.extras_mut().decoration = Some(decoration);
+    pub fn with_underline(mut self, thickness: LogicalPx, color: Option<Color>) -> Self {
+        self.extras_mut().decorations.underline = Some(TextDecoration { color, thickness });
+        self
+    }
+
+    #[must_use]
+    pub fn with_strikethrough(mut self, thickness: LogicalPx, color: Option<Color>) -> Self {
+        self.extras_mut().decorations.strikethrough = Some(TextDecoration { color, thickness });
+        self
+    }
+
+    #[must_use]
+    pub fn with_background(mut self, background: TextBackground) -> Self {
+        if background.is_visible() {
+            self.extras_mut().background = Some(background);
+            return self;
+        }
+        let empty = match self.extras.as_deref_mut() {
+            Some(extras) => {
+                extras.background = None;
+                *extras == TextStyleExtras::default()
+            }
+            None => true,
+        };
+        if empty {
+            self.extras = None;
+        }
         self
     }
 
@@ -492,13 +539,16 @@ impl TextStyle {
                     .collect::<Vec<_>>()
             })
             .hash(hasher);
-        match self.decoration() {
-            Some(decoration) => {
+        match self.background() {
+            Some(background) => {
                 true.hash(hasher);
-                decoration.hash_into(hasher);
+                color_bits(background.color).hash(hasher);
+                background.corner_radius.value().to_bits().hash(hasher);
+                background.padding_x.value().to_bits().hash(hasher);
             }
             None => false.hash(hasher),
         }
+        self.decorations().hash_into(hasher);
     }
 }
 
@@ -806,16 +856,28 @@ pub(crate) struct TextLineMetrics {
 pub(crate) struct ShapedTextLine {
     pub text_range: Range<usize>,
     pub baseline: LogicalPx,
+    pub line_top: LogicalPx,
     pub line_height: LogicalPx,
     pub advance: LogicalPx,
     pub items: Vec<ShapedTextItem>,
-    pub decorations: Vec<ShapedDecoration>,
+    pub decorations: Vec<ShapedQuad>,
+    pub backgrounds: Vec<ShapedQuad>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ShapedDecoration {
+pub(crate) struct ShapedQuad {
     pub rect: LogicalRect,
     pub color: Color,
+    pub corner_radius: LogicalPx,
+}
+
+impl ShapedQuad {
+    pub(crate) fn is_visible(self) -> bool {
+        !self.color.is_transparent()
+            && self.corner_radius.is_finite()
+            && self.corner_radius >= LogicalPx::ZERO
+            && !self.rect.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -920,8 +982,8 @@ mod tests {
     use std::mem::size_of;
 
     use super::{
-        FontStack, InlineAlign, InlineBoxSpec, ShapedLine, TextContent, TextDiagnostic, TextStyle,
-        TextWrap,
+        FontStack, InlineAlign, InlineBoxSpec, ShapedLine, ShapedTextLine, TextContent,
+        TextDiagnostic, TextStyle, TextStyleExtras, TextWrap,
     };
     use crate::{
         math::{DevicePixelRatio, LogicalSize, px},
@@ -1038,31 +1100,144 @@ mod tests {
 
     #[test]
     fn text_decoration_helpers_resolve_color_and_visibility() {
-        let underline = super::TextDecoration::underline(px(1.5));
-        assert!(matches!(underline, super::TextDecoration::Underline { .. }));
-        assert_eq!(underline.thickness(), px(1.5));
-        assert!(underline.color().is_none());
+        let underline = super::TextDecoration {
+            color: None,
+            thickness: px(1.5),
+        };
+        assert_eq!(underline.thickness, px(1.5));
+        assert!(underline.color.is_none());
         assert!(underline.is_visible());
-        let colored = underline.with_color(Some(Color::WHITE));
-        assert_eq!(colored.color(), Some(Color::WHITE));
-        let strike = super::TextDecoration::strikethrough(px(2.0));
-        assert!(matches!(
-            strike,
-            super::TextDecoration::Strikethrough { .. }
-        ));
-        assert!(!super::TextDecoration::underline(px(0.0)).is_visible());
-        assert!(!super::TextDecoration::underline(px(f32::NAN)).is_visible());
+        let colored = super::TextDecoration {
+            color: Some(Color::WHITE),
+            thickness: px(1.5),
+        };
+        assert_eq!(colored.color, Some(Color::WHITE));
+        assert!(
+            !super::TextDecoration {
+                color: None,
+                thickness: px(0.0),
+            }
+            .is_visible()
+        );
+        assert!(
+            !super::TextDecoration {
+                color: None,
+                thickness: px(f32::NAN),
+            }
+            .is_visible()
+        );
+    }
+
+    #[test]
+    fn text_decorations_carry_underline_and_strikethrough_together() {
+        let style = TextStyle::new(px(16.0))
+            .with_underline(px(1.0), None)
+            .with_strikethrough(px(2.0), Some(Color::WHITE));
+        let decorations = style.decorations();
+
+        assert!(!decorations.is_empty());
+        let underline = decorations.underline.expect("下划线必须存在");
+        let strikethrough = decorations.strikethrough.expect("删除线必须存在");
+        assert_eq!(underline.thickness, px(1.0));
+        assert_eq!(underline.color, None);
+        assert_eq!(strikethrough.thickness, px(2.0));
+        assert_eq!(strikethrough.color, Some(Color::WHITE));
+        assert!(TextStyle::new(px(16.0)).decorations().is_empty());
     }
 
     #[test]
     fn text_decoration_lives_in_extras() {
         let plain = TextStyle::new(px(16.0));
-        assert_eq!(plain.decoration(), None);
-        let decorated = plain
-            .clone()
-            .with_decoration(super::TextDecoration::underline(px(1.0)));
-        assert!(decorated.decoration().is_some());
+        assert_eq!(plain.decorations(), super::TextDecorations::default());
+        assert_eq!(plain.background(), None);
+        let decorated = plain.clone().with_underline(px(1.0), None);
+        assert!(decorated.decorations().underline.is_some());
         assert_ne!(plain, decorated);
+    }
+
+    #[test]
+    fn text_background_lives_in_extras() {
+        let plain = TextStyle::new(px(16.0));
+        let background = super::TextBackground {
+            color: Color::WHITE,
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let highlighted = plain.clone().with_background(background);
+
+        assert_eq!(highlighted.background(), Some(background));
+        assert_eq!(plain.background(), None);
+        assert_ne!(plain, highlighted);
+    }
+
+    #[test]
+    fn text_background_visibility_rejects_transparent_and_bad_geometry() {
+        let visible = super::TextBackground {
+            color: Color::WHITE,
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        assert!(visible.is_visible());
+        for (label, background) in [
+            (
+                "透明色",
+                super::TextBackground {
+                    color: Color::TRANSPARENT,
+                    ..visible
+                },
+            ),
+            (
+                "NaN 内边距",
+                super::TextBackground {
+                    padding_x: px(f32::NAN),
+                    ..visible
+                },
+            ),
+            (
+                "负内边距",
+                super::TextBackground {
+                    padding_x: px(-1.0),
+                    ..visible
+                },
+            ),
+            (
+                "NaN 圆角",
+                super::TextBackground {
+                    corner_radius: px(f32::NAN),
+                    ..visible
+                },
+            ),
+            (
+                "负圆角",
+                super::TextBackground {
+                    corner_radius: px(-1.0),
+                    ..visible
+                },
+            ),
+        ] {
+            assert!(!background.is_visible(), "{label}必须判为不可见");
+        }
+        let plain = TextStyle::new(px(16.0));
+        assert_eq!(
+            plain.clone().with_background(super::TextBackground {
+                color: Color::TRANSPARENT,
+                ..visible
+            }),
+            plain,
+            "不可见背景必须归一化为 None（不得额外开 extras 或改变判据）"
+        );
+        assert_eq!(
+            plain
+                .clone()
+                .with_background(visible)
+                .with_background(super::TextBackground {
+                    color: Color::TRANSPARENT,
+                    ..visible
+                }),
+            plain,
+            "后设置的不可见背景必须清空已有背景并回收空的 extras"
+        );
+        assert_eq!(plain.with_background(visible).background(), Some(visible));
     }
 
     #[test]
@@ -1071,6 +1246,8 @@ mod tests {
         assert_eq!(size_of::<TextContent>(), 112);
         assert_eq!(size_of::<InlineBoxSpec>(), 72);
         assert_eq!(size_of::<ShapedLine>(), 80);
+        assert_eq!(size_of::<ShapedTextLine>(), 104);
+        assert_eq!(size_of::<TextStyleExtras>(), 160);
     }
 
     #[test]
@@ -1109,18 +1286,70 @@ mod tests {
     fn text_style_hash_matches_for_equal_styles_and_differs_otherwise() {
         use std::hash::Hasher;
 
+        let hash = |style: &TextStyle| {
+            let mut hasher = ahash::AHasher::default();
+            style.hash_into(&mut hasher);
+            hasher.finish()
+        };
         let a = TextStyle::new(px(16.0)).with_weight(700);
         let b = TextStyle::new(px(16.0)).with_weight(700);
         let c = TextStyle::new(px(16.0)).with_weight(400);
 
-        let mut ha = ahash::AHasher::default();
-        a.hash_into(&mut ha);
-        let mut hb = ahash::AHasher::default();
-        b.hash_into(&mut hb);
-        let mut hc = ahash::AHasher::default();
-        c.hash_into(&mut hc);
+        assert_eq!(hash(&a), hash(&b));
+        assert_ne!(hash(&a), hash(&c));
 
-        assert_eq!(ha.finish(), hb.finish());
-        assert_ne!(ha.finish(), hc.finish());
+        let plain = TextStyle::new(px(16.0));
+        let underline = plain.clone().with_underline(px(1.0), None);
+        let strike = plain.clone().with_strikethrough(px(1.0), None);
+        let both = plain
+            .clone()
+            .with_underline(px(1.0), None)
+            .with_strikethrough(px(1.0), None);
+        let colored_line = plain.clone().with_underline(px(1.0), Some(Color::WHITE));
+        let thicker_line = plain.clone().with_underline(px(2.0), None);
+        let highlighted = plain.clone().with_background(super::TextBackground {
+            color: Color::WHITE,
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        });
+        let other_radius = plain.clone().with_background(super::TextBackground {
+            color: Color::WHITE,
+            corner_radius: px(4.0),
+            padding_x: px(2.0),
+        });
+        let other_padding = plain.clone().with_background(super::TextBackground {
+            color: Color::WHITE,
+            corner_radius: px(2.0),
+            padding_x: px(4.0),
+        });
+        let other_fill = plain.clone().with_background(super::TextBackground {
+            color: Color::BLACK,
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        });
+        let same_highlight = plain.clone().with_background(super::TextBackground {
+            color: Color::WHITE,
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        });
+        let plain_hash = hash(&plain);
+        let underline_hash = hash(&underline);
+        let highlighted_hash = hash(&highlighted);
+        for (name, baseline, style) in [
+            ("underline", plain_hash, &underline),
+            ("strike", plain_hash, &strike),
+            ("both", plain_hash, &both),
+            ("line color", underline_hash, &colored_line),
+            ("line thickness", underline_hash, &thicker_line),
+            ("background", plain_hash, &highlighted),
+            ("corner radius", highlighted_hash, &other_radius),
+            ("padding", highlighted_hash, &other_padding),
+            ("background fill", highlighted_hash, &other_fill),
+        ] {
+            assert_ne!(baseline, hash(style), "{name} 必须参与样式哈希");
+        }
+        assert_ne!(hash(&underline), hash(&both), "加一条线必须换哈希");
+        assert_ne!(hash(&underline), hash(&strike), "线的种类必须换哈希");
+        assert_eq!(hash(&highlighted), hash(&same_highlight));
     }
 }

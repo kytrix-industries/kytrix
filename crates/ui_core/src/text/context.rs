@@ -169,7 +169,8 @@ impl TextContext {
             && content.inline_boxes.is_empty()
             && content.runs().is_empty()
             && content.normalized_runs() == 0
-            && content.style.decoration().is_none()
+            && content.style.decorations().is_empty()
+            && content.style.background().is_none()
             && let Some(simple) = self.fast.try_shape(
                 &mut self.font_cx,
                 &mut self.layout_cx,
@@ -516,6 +517,74 @@ mod tests {
             shaped.is_simple(),
             "NoWrap 数字文本仍走单行快速路径（既有行为不变）"
         );
+    }
+
+    #[test]
+    fn decorated_or_highlighted_numbers_bypass_the_fast_path() {
+        use crate::{paint::color::Color, text::TextBackground};
+
+        let mut context = TextContext::new();
+        if context.family_count() == 0 {
+            eprintln!("skip: no system fonts");
+            return;
+        }
+        let highlight = TextBackground {
+            color: Color::WHITE,
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let base = TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap);
+        let plain = TextContent::new("1234567890", base.clone());
+        let highlighted = TextContent::new("1234567890", base.clone().with_background(highlight));
+        let underlined = TextContent::new("1234567890", base.clone().with_underline(px(1.0), None));
+
+        let (plain_shaped, plain_hit) = context.shape_cached(&plain);
+        assert!(!plain_hit);
+        assert!(plain_shaped.is_simple(), "无装饰的数字文本仍走单行快速路径");
+
+        let invisible = TextContent::new(
+            "1234567890",
+            base.with_background(TextBackground {
+                color: Color::TRANSPARENT,
+                ..highlight
+            }),
+        );
+        let (invisible_shaped, invisible_hit) = context.shape_cached(&invisible);
+        assert!(
+            invisible_hit,
+            "不可见背景必须归一化为 None（与无背景共享键与判据）"
+        );
+        assert!(
+            invisible_shaped.is_simple(),
+            "不可见背景不得禁用数字单行快速路径"
+        );
+
+        let (highlighted_shaped, highlighted_hit) = context.shape_cached(&highlighted);
+        assert!(!highlighted_hit, "背景必须进入形状缓存键");
+        assert!(
+            !highlighted_shaped.is_simple(),
+            "带背景的文本必须走完整 shaping（快速路径不产背景几何）"
+        );
+        let (highlighted_again, highlighted_again_hit) = context.shape_cached(&highlighted);
+        assert!(
+            highlighted_again_hit,
+            "同一带背景样式第二次必须命中形状缓存（键与判据必须同构）"
+        );
+        assert!(std::rc::Rc::ptr_eq(&highlighted_shaped, &highlighted_again));
+
+        let (underlined_shaped, underlined_hit) = context.shape_cached(&underlined);
+        assert!(!underlined_hit, "装饰必须进入形状缓存键");
+        assert!(
+            !underlined_shaped.is_simple(),
+            "带装饰的文本必须走完整 shaping（快速路径不产装饰几何）"
+        );
+        let (underlined_again, underlined_again_hit) = context.shape_cached(&underlined);
+        assert!(
+            underlined_again_hit,
+            "同一装饰集合第二次必须命中形状缓存（键与判据必须同构）"
+        );
+        assert!(std::rc::Rc::ptr_eq(&underlined_shaped, &underlined_again));
+        assert_eq!(context.cached_shapes(), 3);
     }
 
     #[test]

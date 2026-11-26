@@ -343,6 +343,20 @@ fn push_text_glyph_runs(
     line: &ShapedLine,
 ) {
     for shaped_line in &line.lines {
+        for background in shaped_line
+            .backgrounds
+            .iter()
+            .filter(|background| background.is_visible())
+        {
+            canvas.push_primitive(Primitive::Quad(Quad {
+                bounds: background.rect.translate(text.origin),
+                corner_radius: [background.corner_radius; 4],
+                paint: QuadPaint::Solid {
+                    fill: background.color,
+                    border: None,
+                },
+            }));
+        }
         for item in &shaped_line.items {
             let ShapedTextItem::GlyphRun(run) = item else {
                 continue;
@@ -1235,7 +1249,7 @@ struct PrimitiveEmitter {
     opacity: f32,
 }
 
-struct TextDecorations {
+struct EditDecorations {
     selection: Vec<LogicalRect>,
     underlines: Vec<LogicalRect>,
     caret: Option<LogicalRect>,
@@ -1246,7 +1260,7 @@ struct TextDecorations {
     placeholder_color: Color,
 }
 
-fn text_decorations(tree: &NodeTree, node: NodeId) -> Option<TextDecorations> {
+fn text_decorations(tree: &NodeTree, node: NodeId) -> Option<EditDecorations> {
     let editable = tree.editable(node)?;
     let content = tree.text_content(node)?;
     let shaped = tree.text_slot(node)?.shaped();
@@ -1284,7 +1298,7 @@ fn text_decorations(tree: &NodeTree, node: NodeId) -> Option<TextDecorations> {
         }
     }
     let placeholder = editable.visible_placeholder_line().cloned();
-    Some(TextDecorations {
+    Some(EditDecorations {
         selection: selection_rects,
         underlines,
         caret,
@@ -1636,12 +1650,28 @@ impl PrimitiveEmitter {
             self.bounds.origin.x + self.content_offset.x,
             self.bounds.origin.y + self.content_offset.y,
         );
+        for shaped_line in &line.lines {
+            for background in shaped_line
+                .backgrounds
+                .iter()
+                .filter(|background| background.is_visible())
+            {
+                self.emit_solid_quad(
+                    context,
+                    background.rect.translate(origin),
+                    background.corner_radius,
+                    background.color,
+                    opacity,
+                );
+            }
+        }
         let decorations = text_decorations(context.tree, self.node);
         if let Some(decorations) = &decorations {
             for rect in &decorations.selection {
                 self.emit_solid_quad(
                     context,
                     rect.translate(origin),
+                    LogicalPx::ZERO,
                     decorations.selection_color,
                     opacity,
                 );
@@ -1708,30 +1738,14 @@ impl PrimitiveEmitter {
                 }
             }
             for decoration in &shaped_line.decorations {
-                let color = self
-                    .patch
-                    .foreground
-                    .unwrap_or(decoration.color)
-                    .with_opacity(opacity);
-                if color.is_transparent()
-                    || decoration.rect.size.width <= LogicalPx::ZERO
-                    || decoration.rect.size.height <= LogicalPx::ZERO
-                {
-                    continue;
-                }
-                let bounds = decoration.rect.translate(origin);
-                self.push(
+                let color = self.patch.foreground.unwrap_or(decoration.color);
+                self.emit_solid_quad(
                     context,
-                    Primitive::Quad(Quad {
-                        bounds,
-                        corner_radius: [LogicalPx::ZERO; 4],
-                        paint: QuadPaint::Solid {
-                            fill: color,
-                            border: None,
-                        },
-                    }),
+                    decoration.rect.translate(origin),
+                    decoration.corner_radius,
+                    color,
+                    opacity,
                 );
-                self.push_damage(context, bounds, physical_px(0.0));
             }
         }
         if let Some(decorations) = decorations {
@@ -1739,6 +1753,7 @@ impl PrimitiveEmitter {
                 self.emit_solid_quad(
                     context,
                     rect.translate(origin),
+                    LogicalPx::ZERO,
                     decorations.composition_color,
                     opacity,
                 );
@@ -1761,6 +1776,7 @@ impl PrimitiveEmitter {
                 self.emit_solid_quad(
                     context,
                     caret.translate(origin),
+                    LogicalPx::ZERO,
                     decorations.caret_color,
                     opacity,
                 );
@@ -1772,21 +1788,19 @@ impl PrimitiveEmitter {
         &mut self,
         context: &mut PaintContext<'_>,
         bounds: LogicalRect,
+        corner_radius: LogicalPx,
         color: Color,
         opacity: f32,
     ) {
         let color = color.with_opacity(opacity);
-        if color.is_transparent()
-            || bounds.size.width <= LogicalPx::ZERO
-            || bounds.size.height <= LogicalPx::ZERO
-        {
+        if color.is_transparent() || bounds.is_empty() {
             return;
         }
         self.push(
             context,
             Primitive::Quad(Quad {
                 bounds,
-                corner_radius: [LogicalPx::ZERO; 4],
+                corner_radius: [corner_radius; 4],
                 paint: QuadPaint::Solid {
                     fill: color,
                     border: None,
@@ -1804,6 +1818,21 @@ impl PrimitiveEmitter {
         origin: LogicalPoint,
         opacity: f32,
     ) {
+        for shaped_line in &line.lines {
+            for background in shaped_line
+                .backgrounds
+                .iter()
+                .filter(|background| background.is_visible())
+            {
+                self.emit_solid_quad(
+                    context,
+                    background.rect.translate(origin),
+                    background.corner_radius,
+                    background.color,
+                    opacity,
+                );
+            }
+        }
         let color = color.with_opacity(opacity);
         if color.is_transparent() {
             return;
@@ -1986,8 +2015,8 @@ mod tests {
         },
         render::damage::DamageAccumulator,
         text::{
-            InlineAlign, InlineBoxPaint, InlineBoxSpec, ShapedDecoration, ShapedGlyphRun,
-            ShapedInlineBox, ShapedLine, ShapedTextItem, ShapedTextLine, TextContent, TextStyle,
+            InlineAlign, InlineBoxPaint, InlineBoxSpec, ShapedGlyphRun, ShapedInlineBox,
+            ShapedLine, ShapedQuad, ShapedTextItem, ShapedTextLine, TextContent, TextStyle,
         },
     };
 
@@ -2690,6 +2719,88 @@ mod tests {
     }
 
     #[test]
+    fn canvas_text_recipe_draws_run_backgrounds_before_glyph_runs() {
+        let mut h = Harness::new();
+        let origin = LogicalPoint::new(px(3.0), px(4.0));
+        let node = mount_canvas(
+            &mut h,
+            canvas_with_text(TextContent::new("ab", TextStyle::new(px(12.0))), origin),
+        );
+        let background = ShapedQuad {
+            rect: LogicalRect::new(px(-2.0), px(0.0), px(24.0), px(16.0)),
+            color: Color::WHITE,
+            corner_radius: px(2.0),
+        };
+        let mut line = shaped_line(
+            vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 1.0))],
+            Vec::new(),
+        );
+        line.lines[0].backgrounds = vec![
+            background,
+            ShapedQuad {
+                rect: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
+                color: Color::TRANSPARENT,
+                corner_radius: px(2.0),
+            },
+        ];
+        let generation = h.tree.canvas_generation(node).expect("canvas node");
+        let atlas_generation = h
+            .atlas
+            .as_ref()
+            .map_or(INITIAL_ATLAS_GENERATION, |atlas| atlas.generation());
+        h.canvas_text.insert(
+            node,
+            crate::window::canvas_text::ResolvedCanvasText {
+                key: crate::window::canvas_text::CanvasTextKey {
+                    font_stack_version: 0,
+                    canvas_generation: generation,
+                    dpr_bits: 1.0_f32.to_bits(),
+                    atlas_generation,
+                    color_atlas_generation: INITIAL_ATLAS_GENERATION,
+                    glyph_eviction_epoch: 0,
+                },
+                lines: vec![Rc::new(line)],
+                pending: false,
+            },
+        );
+        layout_all(&mut h.tree);
+        let report = h.paint();
+        assert_eq!(report.unresolved_canvas_text, 0);
+        let primitives = lane_primitives(&h, node);
+        let Some(Primitive::Canvas(rendered)) = primitives.first() else {
+            panic!("the canvas is pushed as one primitive");
+        };
+        let rendered_primitives = rendered.primitives();
+        assert_eq!(
+            rendered_primitives.len(),
+            2,
+            "背景 Quad + 字形 run 两条图元：{rendered_primitives:?}"
+        );
+        let Some(Primitive::Quad(quad)) = rendered_primitives.first() else {
+            panic!("run 背景必须排在字形之前：{rendered_primitives:?}");
+        };
+        assert_eq!(
+            quad.bounds,
+            background.rect.translate(origin),
+            "背景矩形必须偏移到 canvas 文本原点"
+        );
+        assert_eq!(
+            quad.corner_radius,
+            [px(2.0); 4],
+            "圆角必须来自 TextBackground"
+        );
+        let QuadPaint::Solid { fill, border } = &quad.paint else {
+            panic!("背景必须是实色 Quad");
+        };
+        assert_eq!(*fill, Color::WHITE);
+        assert!(border.is_none());
+        assert!(
+            matches!(rendered_primitives.get(1), Some(Primitive::GlyphRun(_))),
+            "非加速 canvas 文本路径也必须画背景，且背景在字形之前：{rendered_primitives:?}"
+        );
+    }
+
+    #[test]
     fn an_unresolved_canvas_recipe_skips_only_its_text() {
         let mut h = Harness::new();
         let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)));
@@ -2915,16 +3026,18 @@ mod tests {
         }
     }
 
-    fn shaped_line(items: Vec<ShapedTextItem>, decorations: Vec<ShapedDecoration>) -> ShapedLine {
+    fn shaped_line(items: Vec<ShapedTextItem>, decorations: Vec<ShapedQuad>) -> ShapedLine {
         ShapedLine {
             text: smol_str::SmolStr::new_static("ab"),
             lines: vec![ShapedTextLine {
                 text_range: 0..2,
                 baseline: px(12.0),
+                line_top: px(0.0),
                 line_height: px(16.0),
                 advance: px(20.0),
                 items,
                 decorations,
+                backgrounds: Vec::new(),
             }],
             width: px(20.0),
             height: px(16.0),
@@ -2934,6 +3047,15 @@ mod tests {
             font_stack_version: 1,
             scale: DevicePixelRatio::ONE,
         }
+    }
+
+    fn shaped_line_with_backgrounds(backgrounds: Vec<ShapedQuad>) -> ShapedLine {
+        let mut line = shaped_line(
+            vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 0.0))],
+            Vec::new(),
+        );
+        line.lines[0].backgrounds = backgrounds;
+        line
     }
 
     fn spawn_text(h: &mut Harness, content: TextContent, line: ShapedLine) -> NodeId {
@@ -3044,13 +3166,15 @@ mod tests {
             shaped_line(
                 vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 0.0))],
                 vec![
-                    ShapedDecoration {
+                    ShapedQuad {
                         rect: under,
                         color: underline_color,
+                        corner_radius: LogicalPx::ZERO,
                     },
-                    ShapedDecoration {
+                    ShapedQuad {
                         rect: strike,
                         color: strike_color,
+                        corner_radius: LogicalPx::ZERO,
                     },
                 ],
             ),
@@ -3109,13 +3233,15 @@ mod tests {
             shaped_line(
                 vec![ShapedTextItem::GlyphRun(glyph_run(text_color, 0..2, 0.0))],
                 vec![
-                    ShapedDecoration {
+                    ShapedQuad {
                         rect: LogicalRect::new(px(0.0), px(14.5), px(10.0), px(1.0)),
                         color: text_color,
+                        corner_radius: LogicalPx::ZERO,
                     },
-                    ShapedDecoration {
+                    ShapedQuad {
                         rect: LogicalRect::new(px(10.0), px(8.0), px(10.0), px(1.0)),
                         color: explicit_line,
+                        corner_radius: LogicalPx::ZERO,
                     },
                 ],
             ),
@@ -3158,7 +3284,7 @@ mod tests {
         assert_eq!(
             decoration_fills(&h),
             vec![foreground, foreground],
-            "foreground 必须覆盖装饰线色（含显式 TextDecoration::color）"
+            "foreground 必须覆盖装饰线色（含显式线色）"
         );
         assert_eq!(
             glyph_colors(&h),
@@ -3177,6 +3303,244 @@ mod tests {
         let _ = h.paint();
         assert_eq!(decoration_fills(&h), vec![text_color, text_color]);
         assert_eq!(glyph_colors(&h), vec![text_color]);
+    }
+
+    #[test]
+    fn run_backgrounds_are_drawn_before_glyphs_and_ignore_foreground() {
+        let background_fill = Color::Srgb {
+            r: 0.8,
+            g: 0.9,
+            b: 1.0,
+            alpha: 0.5,
+        };
+        let foreground = Color::Srgb {
+            r: 0.0,
+            g: 0.7,
+            b: 0.2,
+            alpha: 1.0,
+        };
+        let radius = px(2.0);
+        let bounds = LogicalRect::new(px(-2.0), px(0.0), px(24.0), px(16.0));
+        let mut h = Harness::new();
+        let node = spawn_text(
+            &mut h,
+            TextContent::new("ab", TextStyle::new(px(16.0))),
+            shaped_line_with_backgrounds(vec![
+                ShapedQuad {
+                    rect: bounds,
+                    color: background_fill,
+                    corner_radius: radius,
+                },
+                ShapedQuad {
+                    rect: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
+                    color: Color::TRANSPARENT,
+                    corner_radius: radius,
+                },
+            ]),
+        );
+        let origin = text_origin(&h, node);
+        let _ = h.paint();
+        let find_background = |primitives: &[Primitive]| {
+            primitives
+                .iter()
+                .position(|primitive| {
+                    matches!(primitive, Primitive::Quad(quad) if quad.corner_radius == [radius; 4])
+                })
+                .expect("背景 Quad 必须存在")
+        };
+        let primitives = lane_primitives(&h, node);
+        assert_eq!(
+            primitives
+                .iter()
+                .filter(|primitive| matches!(primitive, Primitive::Quad(_)))
+                .count(),
+            1,
+            "不可见背景（透明色）必须在 paint 前被过滤：{primitives:?}"
+        );
+        let background_index = find_background(&primitives);
+        let glyph_index = primitives
+            .iter()
+            .position(|primitive| matches!(primitive, Primitive::GlyphRun(_)))
+            .expect("字形必须在 lane 里");
+        assert!(
+            background_index < glyph_index,
+            "背景必须先于字形 push：{primitives:?}"
+        );
+        let Primitive::Quad(background) = &primitives[background_index] else {
+            unreachable!()
+        };
+        assert_eq!(background.bounds, bounds.translate(origin));
+        let QuadPaint::Solid { fill, border } = &background.paint else {
+            panic!("背景必须是实色 Quad");
+        };
+        assert_eq!(*fill, background_fill);
+        assert!(border.is_none(), "背景没有边框");
+
+        assert!(h.tree.set_style_patch(
+            node,
+            StylePatch {
+                foreground: Some(foreground),
+                ..StylePatch::default()
+            }
+        ));
+        h.mark_paint(node);
+        let _ = h.paint();
+        let primitives = lane_primitives(&h, node);
+        let background_index = find_background(&primitives);
+        let Primitive::Quad(background) = &primitives[background_index] else {
+            unreachable!()
+        };
+        let QuadPaint::Solid { fill, .. } = &background.paint else {
+            panic!("背景必须是实色 Quad");
+        };
+        assert_eq!(
+            *fill, background_fill,
+            "StylePatch.foreground 不得覆盖 run 背景色（背景不是前景装饰）"
+        );
+        let glyph_colors: Vec<Color> = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::GlyphRun(run) => Some(run.color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            glyph_colors,
+            vec![foreground],
+            "字形颜色仍被 foreground 覆盖"
+        );
+
+        assert!(h.tree.set_style_patch(
+            node,
+            StylePatch {
+                foreground: Some(foreground),
+                opacity: Some(0.5),
+                ..StylePatch::default()
+            }
+        ));
+        h.mark_paint(node);
+        let _ = h.paint();
+        let primitives = lane_primitives(&h, node);
+        let background_index = find_background(&primitives);
+        let Primitive::Quad(background) = &primitives[background_index] else {
+            unreachable!()
+        };
+        let QuadPaint::Solid { fill, .. } = &background.paint else {
+            panic!("背景必须是实色 Quad");
+        };
+        assert_eq!(
+            *fill,
+            background_fill.with_opacity(0.5),
+            "组 opacity 必须照乘到 run 背景色（背景不被 foreground 覆盖，但 opacity 是组级属性）"
+        );
+        let glyph_colors: Vec<Color> = primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::GlyphRun(run) => Some(run.color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            glyph_colors,
+            vec![foreground.with_opacity(0.5)],
+            "组 opacity 同时照乘到字形色"
+        );
+    }
+
+    #[test]
+    fn placeholder_line_draws_run_backgrounds() {
+        for (placeholder_color, expect_glyphs) in
+            [(Color::BLACK, true), (Color::TRANSPARENT, false)]
+        {
+            let mut h = Harness::new();
+            let root = h.tree.root();
+            let text_style = TextStyle::new(px(16.0));
+            let spec = crate::text_edit::EditableSpec {
+                role: crate::a11y::A11yRole::TextInput,
+                label: smol_str::SmolStr::new_static(""),
+                placeholder: smol_str::SmolStr::new_static("hint"),
+                multiline: false,
+                masked: false,
+                readonly: false,
+                disabled: false,
+                max_length: None,
+                submit: None,
+                text_style: text_style.clone(),
+                caret_color: Color::BLACK,
+                selection_color: Color::BLACK,
+                placeholder_color,
+                composition_color: Color::BLACK,
+            };
+            let node = NodeBuilder::editable_text(spec)
+                .style(fixed_style(40.0, 20.0))
+                .build(&mut h.tree, root)
+                .expect("可编辑文本节点");
+            let content = TextContent::new("", text_style.clone());
+            assert!(h.tree.set_text_content(node, content.clone()));
+            let main_line = crate::text::ShapedLine::empty(
+                smol_str::SmolStr::new_static(""),
+                INITIAL_ATLAS_GENERATION,
+                INITIAL_ATLAS_GENERATION,
+                1,
+                DevicePixelRatio::ONE,
+            );
+            assert!(h.tree.install_text_line_for_test(
+                node,
+                &content,
+                Rc::new(main_line),
+                px(40.0)
+            ));
+            let placeholder_content = TextContent::new("hint", text_style);
+            let placeholder_shaped = Rc::new(crate::text::shape::ShapedText::blank_for_text_test(
+                placeholder_content.text.clone(),
+                placeholder_content.style.clone(),
+            ));
+            let placeholder_line = shaped_line_with_backgrounds(vec![ShapedQuad {
+                rect: LogicalRect::new(px(-2.0), px(0.0), px(24.0), px(16.0)),
+                color: Color::WHITE,
+                corner_radius: px(2.0),
+            }]);
+            {
+                let editable = h.tree.editable_mut(node).expect("可编辑槽位");
+                assert!(
+                    editable.ensure_placeholder(placeholder_content, placeholder_shaped),
+                    "占位符行必须被接受"
+                );
+                editable.set_placeholder_line(Rc::new(placeholder_line), px(40.0));
+            }
+            layout_all(&mut h.tree);
+            let report = h.paint();
+            assert!(report.rebuilt > 0);
+            let primitives = lane_primitives(&h, node);
+            let background_index = primitives
+                .iter()
+                .position(|primitive| {
+                    matches!(primitive, Primitive::Quad(quad) if quad.corner_radius == [px(2.0); 4])
+                })
+                .unwrap_or_else(|| {
+                    panic!("占位符行的 run 背景必须画出（placeholder_color={placeholder_color:?}）：{primitives:?}")
+                });
+            let glyph_index = primitives
+                .iter()
+                .position(|primitive| matches!(primitive, Primitive::GlyphRun(_)));
+            if expect_glyphs {
+                let glyph_index = glyph_index.expect("占位符字形必须画出");
+                assert!(
+                    background_index < glyph_index,
+                    "占位符背景必须先于占位符字形：{primitives:?}"
+                );
+            } else {
+                assert!(
+                    glyph_index.is_none(),
+                    "占位符文字色全透明时不得产字形：{primitives:?}"
+                );
+                assert_eq!(
+                    background_index + 1,
+                    primitives.len(),
+                    "占位符文字色全透明时背景仍必须画（背景不得被字形颜色短路跳过）：{primitives:?}"
+                );
+            }
+        }
     }
 
     #[test]

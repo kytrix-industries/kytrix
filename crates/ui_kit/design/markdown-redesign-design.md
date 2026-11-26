@@ -825,7 +825,7 @@ pub struct TextStyleExtras {
 pub(crate) struct ShapedTextLine {
     pub text_range: Range<usize>,
     pub baseline: LogicalPx,
-    pub line_top: LogicalPx,              // 新增 = px(line.metrics().block_min_coord)
+    pub line_top: LogicalPx,              // 新增：首行 = px(block_min_coord)，其后按 line_height 累加
     pub line_height: LogicalPx,
     pub advance: LogicalPx,
     pub items: Vec<ShapedTextItem>,
@@ -856,12 +856,12 @@ pub(crate) struct ShapedQuad {            // 原 ShapedDecoration 更名并加�
 | `TextStyle::{decoration,with_decoration}`（R1 前 `:320-322,463-466`） | 单值与单 setter | 换成 `decorations/background` + 三个 setter |
 | `decoration_segments`（`shape.rs`，R1 前 `:939-1001`） | 每 run 只 `filter_map` 出一条装饰；base 兜底单 kind；变体 match 决定 offset | 「每 kind 各收集一条」（R1 抽出通用 `covered_segments`），base 兜底按 kind 外层循环，kind → offset 表（`UNDERLINE_OFFSET_EM`/`STRIKETHROUGH_OFFSET_EM` 保留） |
 | `background_segments`（新增，`shape.rs`） | — | run 的 `background()` + base 背景兜底；x 复用 `decoration_span`；rect = `(left - padding_x, line_top, width + 2×padding_x, line_height)`；相邻同色相接**先合并区间再扩边** |
-| `rasterize_parley`（`shape.rs`，R1 前 `:1050-1209`） | 组装 `ShapedTextLine` | 取 `line_top = px(metrics.block_min_coord)`，调用 `background_segments`，补 `backgrounds` |
+| `rasterize_parley`（`shape.rs`，R1 前 `:1050-1209`） | 组装 `ShapedTextLine` | 首行取 `line_top = px(metrics.block_min_coord)`、其后逐行累加 `line_height`（与 `line_height` 同源、严格相接），调用 `background_segments`，补 `backgrounds` |
 | `clamp_line_decorations`（`shape.rs`，R1 前 `:1302-1317`） | 只 clamp `decorations` | 泛化为 `clamp_line_rects`，同时作用于 `backgrounds` |
 | 数字快路径资格（`context.rs:168-173`） | `decoration().is_none()` | 「`decorations().is_empty()` **且** `background().is_none()`」 |
 | `ShapedTextLine` 字面量 | `fast_path.rs:180`、`shape.rs:1188`、`window/canvas_text.rs:77`、`window/tests.rs:625`、`pass.rs:2921`（测试助手） | 补 `line_top`、`backgrounds` |
 | `window/canvas_text.rs`（**非加速 canvas text 绘制路径**） | 只画字形与装饰线，不画 run 背景 | **R1 必须同步画背景**：与 `paint/pass.rs` 用同一份 `ShapedTextLine.backgrounds`、同一 z 序（字形之前）、同一 `corner_radius`/颜色；两条路径行为必须一致（否则软件路径与 GPU 路径观感不同） |
-| `emit_text` + `emit_solid_quad`（`paint/pass.rs`，R1 前 `:1625-1769`/`:1769-1797`） | `emit_solid_quad` 原为 4 参（`context,bounds,color,opacity`）且硬编码 `corner_radius: [ZERO;4]`，**HEAD 调用点 3 处（`:1642`/`:1739`/`:1761`）** | **扩为 5 参**（新增 `corner_radius: LogicalPx`），全部调用点同步（R1 前 3 处、R1 后 5 处 = 原 3 + 背景 2）；`emit_text` 在选区 Quad 之后、`items` 循环之前插入背景 Quad 循环（传入 `background.corner_radius`）；背景**不**走 `StylePatch.foreground` |
+| `emit_text` + `emit_solid_quad`（`paint/pass.rs`，R1 前 `:1625-1769`/`:1769-1797`） | `emit_solid_quad` 原为 4 参（`context,bounds,color,opacity`）且硬编码 `corner_radius: [ZERO;4]`，**HEAD 调用点 3 处（`:1642`/`:1739`/`:1761`）** | **扩为 5 参**（新增 `corner_radius: LogicalPx`），全部调用点同步（R1 前 3 处、R1 后 5 处 = 原 3 + 背景 2）；`emit_text` 在**选区 Quad 之前**、`items` 字形循环之前插入背景 Quad 循环（传入 `background.corner_radius`；选区半透明色覆盖在背景之上是期望行为）；背景**不**走 `StylePatch.foreground` |
 | `paint/pass.rs` 的私有 `struct TextDecorations`（R1 前 `:1238`，可编辑文本的选区/下划线/caret 聚合） | 与新增的公开 `text::TextDecorations` **同名但不同模块**（无编译冲突，但同名会让后续实现者混淆） | **R1 必须改名为 `EditDecorations`**（纯改名、无行为变化）；`text_decorations()` 函数名保留（它不是类型） |
 | `ui_kit/.../inline_flow.rs:301-314` | `if link … else if strike … else if kbd` 三选一 | 三个独立 `if` + `if mark.code { with_background(...) }`（R1 只做类型适配，语义切换在 R2） |
 | 既有测试 | `text.rs`（装饰 helper）、`cache.rs`（键区分）、`shape.rs`（装饰几何 7 组）、`pass.rs`（Quad 编码/foreground） | 按集合/背景改写断言（§5.11.4）；`shape.rs` 的 RTL 用例扩展到背景 |
@@ -869,9 +869,9 @@ pub(crate) struct ShapedQuad {            // 原 ShapedDecoration 更名并加�
 #### 5.11.3 run 背景的几何与绘制顺序（D19）
 
 - **x 区间**：复用 `decoration_span`（已处理 visual order / RTL / 双向）。
-- **y 范围**：`line_top .. line_top + line_height`（行盒，含 leading），`line_top = px(metrics.block_min_coord)`，**不能用 baseline 近似**。
+- **y 范围**：`line_top .. line_top + line_height`（行盒，含 leading），首行 `line_top = px(metrics.block_min_coord)`、其后按 `line_height` 累加，**不能用 baseline 近似**。
 - **水平内边距 2px + 圆角 2px**：矩形 = `(left - padding_x, line_top, width + 2 × padding_x, line_height)`，`corner_radius = 2px`；**不改变推进宽度**（不参与断行、不改 `advance`）。
-- **`line_top` 与 `line_height` 必须同源（硬约束）**：相邻行的背景矩形必须**严格相接**——`line_top_{i+1} == line_top_i + line_height_i`。实现口径二选一：① 按行累加（`line_top_0 = px(metrics.block_min_coord)`，之后 `line_top_{i+1} = line_top_i + line_height_i`）；② 两者取同一取整基准（同一 `to_physical` 舍入）。**禁止**一个来自 parley 的浮点坐标、另一个来自累加/取整后的值（否则逐行背景重叠 1 设备像素或留缝）。R1/R3 必须用**分数行高**（默认主题 `body_size 14 × 1.4 = 19.6px`）的多行用例钉死「无重叠、无缝隙」。
+- **`line_top` 与 `line_height` 必须同源（硬约束）**：相邻行的背景矩形必须**严格相接**——`line_top_{i+1} == line_top_i + line_height_i`。**定稿口径 = 按行累加**：`line_top_0 = px(metrics.block_min_coord)`，之后 `line_top_{i+1} = line_top_i + line_height_i`（备选「两者取同一取整基准」不采用）。**禁止**一个来自 parley 的浮点坐标、另一个来自累加/取整后的值（否则逐行背景重叠 1 设备像素或留缝）。R1/R3 必须用**分数行高**（默认主题 `body_size 14 × 1.4 = 19.6px`）的多行用例钉死「无重叠、无缝隙」。
 - **分组与 padding 只加在组两端（硬约束）**：先按「**同色 + 同圆角 + 同 `padding_x`**」分组 → **组内**合并区间 → `padding_x` **只加在该组最左端与最右端**。不同颜色/圆角/内边距的相邻 run **不合并、也不各自外扩**（若各自外扩，组间会出现 2×padding 的双绘区，半透明底色在该处偏深）。
 - **两条绘制路径一致**：GPU 路径（`paint/pass.rs` 的 `emit_text`）与非加速 canvas text 路径（`window/canvas_text.rs`）都必须画 run 背景，z 序相同（GlyphRun 之前）、几何数据同源。
 - **z 序**：背景必须在 GlyphRun / InlineBox 之前 push（lane 保序，`paint/scene.rs:183-193`）。
@@ -882,20 +882,24 @@ pub(crate) struct ShapedQuad {            // 原 ShapedDecoration 更名并加�
 
 | 文件 | 测试 | 断言 |
 |---|---|---|
-| `text/cache.rs` | `shape_key_distinguishes_decoration_set` | underline / strike / both 三者两两不同键 |
-| `text/cache.rs` | `shape_key_distinguishes_background` | 仅背景（颜色/圆角/内边距）不同 ⇒ 键不同 |
-| `text/context.rs` | `backgrounded_numbers_do_not_take_the_simple_path` | 带背景的数字 NoWrap 文本 `!is_simple()`；仅装饰集合不同 ⇒ 首次 `!hit`、再次 `hit` |
-| `text/shape.rs` | `one_run_may_carry_underline_and_strikethrough` | 同一 run 两条线、y 分布正确、厚度各自生效 |
-| `text/shape.rs` | `background_covers_the_line_box_per_line` | 跨软/硬换行每行一个矩形，`y == line_top`、`height == line_height`、水平各外扩 `padding_x`、圆角 `corner_radius` |
-| `text/shape.rs` | `adjacent_runs_merge_their_backgrounds` | 同色相邻 run 只出一个矩形 |
-| `text/shape.rs` | `rtl_background_covers_the_visual_span` | RTL/双向段落覆盖视觉跨度 |
-| `text/shape.rs` | `background_is_clamped_with_the_ellipsis` | 省略号裁剪后背景被 clamp |
-| `paint/pass.rs` | `background_quads_precede_glyphs` | 背景 Quad 在 GlyphRun 之前 push；圆角来自 `TextBackground`；组 opacity 乘到背景色 |
-| `paint/pass.rs` | `foreground_does_not_override_background` | `StylePatch.foreground` 覆盖字形与装饰线色，但**不**改背景色 |
-| `text/shape.rs` | `background_lines_touch_without_overlap_or_gap` | 分数行高（19.6px）多行文本：`line_top_{i+1} == line_top_i + line_height_i`（严格相接，无 1 设备像素重叠/缝隙） |
-| `text/shape.rs` | `background_padding_only_at_group_edges` | 相邻异色/异圆角/异 padding 的两组：组间无 2×padding 双绘；组内相邻同属性 run 只出一个矩形且左右各外扩一次 |
-| `window/canvas_text.rs` | `canvas_path_draws_run_backgrounds` | 非加速路径同样产出背景 Quad（数量/几何与 GPU 路径一致） |
-| `text/shape.rs` | `invisible_background_is_skipped` | `is_visible() == false`（透明色 / NaN padding / 负 padding）时不产背景矩形，且不影响 `is_simple()` 判据 |
+| `text/cache.rs` | `shape_key_distinguishes_decoration_sets_and_backgrounds` | 装饰集合（underline / strike / both）两两不同键；背景按**单字段**变化（颜色 / 圆角 / 内边距各一条）都必须换键（漏哈希任一字段即变红） |
+| `text/cache.rs` | `shape_key_distinguishes_base_style_decorations` | 仅基础样式 decoration 不同 ⇒ 换键 + 判据失配 |
+| `text/context.rs` | `decorated_or_highlighted_numbers_bypass_the_fast_path` | 带装饰或背景的数字 NoWrap 文本 `!is_simple()`；仅装饰集合不同 ⇒ 首次 `!hit`、再次 `hit`（`Rc::ptr_eq`）；透明背景归一化为 `None` ⇒ 仍命中且 `is_simple()` |
+| `text/shape.rs` | `one_run_draws_underline_and_strikethrough_together` | 同一 run 两条线、y 分布正确、厚度各自生效 |
+| `text/shape.rs` | `run_background_covers_the_line_box_with_padding_on_every_line` | 跨软换行每行一个矩形，`y == line_top`、`height == line_height`、水平各外扩 `padding_x`、圆角 `corner_radius` |
+| `text/shape.rs` | `background_survives_hard_line_breaks` | `\n` / `\r\n` / 空行三种硬换行各自每行一个矩形、末行宽 = advance + 2×padding |
+| `text/shape.rs` | `empty_and_whitespace_background_runs_stay_bounded` | 空 run 无矩形、纯空白 run 有界、纯空白行无矩形 |
+| `text/shape.rs` | `base_and_run_backgrounds_keep_their_own_spans` | base 与 run 背景各占其 span（外侧与**内侧**边界都钉死）、兜底不覆盖 run、组间接缝严格相接 |
+| `text/shape.rs` | `fractional_line_height_keeps_background_boxes_touching` | 分数行高（19.6px）多行：`line_top_{i+1} == line_top_i + line_height_i` |
+| `text/shape.rs` | `adjacent_different_backgrounds_do_not_double_pad_the_seam` | 相邻异色/异圆角/异 padding 两组：组间无 2×padding 双绘 |
+| `text/shape.rs` | `narrow_gap_between_backgrounds_is_split_between_them` | 窄缝（`0 < gap < 2×padding_x`）时每侧取 `min(padding_x, gap/2)`，两矩形严格相接不重叠 |
+| `text/shape.rs` | `rtl_background_covers_the_visual_span` | 两个不同底色 RTL run：视觉左/右归属与各自颜色、相邻严格相接；3-run 红/蓝/红 不合并被隔开的同色 |
+| `text/shape.rs` | `ellipsis_clamps_background_into_the_kept_line` | 只截右端到 `line_offset + advance`，左端保留 `padding_x`（−2px） |
+| `text/shape.rs` | `invisible_backgrounds_produce_no_geometry` | 不可见背景（透明色 / NaN / 负 padding）不产矩形 |
+| `text.rs` | `text_decorations_carry_underline_and_strikethrough_together`、`text_decoration_lives_in_extras`、`text_background_lives_in_extras`、`text_background_visibility_rejects_transparent_and_bad_geometry` | 数据形状与可见性判据；`with_background` 对不可见背景归一化为 `None`（不写字段、清旧值、回收空 extras） |
+| `paint/pass.rs` | `run_backgrounds_are_drawn_before_glyphs_and_ignore_foreground` | 背景 Quad 在选区与字形之前 push；`StylePatch.foreground` 只改字形与装饰线；组 opacity 照乘到背景色；透明 Quad 不产实例 |
+| `paint/pass.rs` | `canvas_text_recipe_draws_run_backgrounds_before_glyph_runs` | 非加速 canvas 路径：背景 Quad 先于 GlyphRun，几何与 GPU 路径一致，透明 Quad 不产实例 |
+| `paint/pass.rs` | `placeholder_line_draws_run_backgrounds` | 占位/回退路径也画背景（背景循环在占位文字色短路之前） |
 > **`ui_kit/.../inline_flow.rs` 的三条语义改写**（链接 + 删除线并存、行内代码底色、kbd 下划线 + 底色）**归 R2**（R1 只做类型适配、保持旧 else-if 语义，见 §5.11.2 末行与 §7-R1）；对应 3 条测试随 R2 交付。
 
 #### 5.11.5 风险与性能影响
