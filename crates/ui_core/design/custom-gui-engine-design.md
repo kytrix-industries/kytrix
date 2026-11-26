@@ -395,7 +395,7 @@ pub(crate) use windows as backend;
 | 状态 | `node::signal::{Signal, SignalId, Derived, Transient, SignalScope}`、`node::dependency::ReadCtx`、`App::{signal, signal_scope, signal_scoped, window_signal, release_scope, transient, transient_scoped, derived, batch, write, write_with, update, update_with, read, read_with, write_transient, read_transient}` | 状态写入与依赖追踪。`read` 返回 `SignalRef<T>` 读守卫（守卫存活期写同一信号 **panic**）。**E8**：`transient_scoped(scope: SignalScope, initial)` 把瞬态值绑定到作用域，`release_scope` 返回**值槽位数**（信号 + 瞬态值）并在同批取消引用该瞬态值的动画槽（§11.10）。**没有 `TaskHandle`**：异步回投是 `AppHandle::{send, spawn}`；资源解码结果经 `App::take_resource_results()` 取回 |
 | 样式 / 布局 | `paint::style::{Style, PaintSpec, StylePatch, FocusRing, ShadowSpec, Shadows, MAX_SHADOWS, Clip, Cursor}`、`layout::{MeasureFn, LayoutOverride}`、`layout::hit_test::HitShape`、`math::{LogicalPx, PhysicalPx, DevicePx, DevicePixelRatio, Point<T>, Size<T>, Rect<T>, Edges<T>, DeviceRect, Transform}`、`NodeBuilder::{boxed, text, canvas, geometry, style, paint, bind_style, bind_text, bind_a11y, a11y, measure, hit_shape, layout_override, focus_ring, tab_stop, id, inline_boxes, runs, on_click, on_action, on_drag, build}`（press 宿主目标改为建树后回填 `NodeTree::set_press_focus_target`） | 挂载期静态样式 / 动态补丁。`bind_*` **恰好三个**（`bind_text` / `bind_style` / `bind_a11y`），且**只在 `App::frame` 求值**（`Window::frame()` 不求值）。`NodeBuilder::runs` 是多 run 覆盖样式的挂载入口（E2，§11.2）。**E13**：`StylePatch.opacity` 是**组不透明度**（自身 × 祖先链，§11.14）、`PaintSpec.shadows: Shadows`（`MAX_SHADOWS = 4`，数组序 = 绘制序）、`ShadowSpec{offset, blur, spread, color}`（§11.14） |
 | 绘制 | `paint::scene::Scene`（**只能经 `Window::scene()` 取 `&Scene`**，写方法属引擎内部）、`paint::primitive::{Primitive, Quad, QuadPaint, Border, Gradient, GradientKind, GlyphRun, PositionedGlyph, Image, Path, Shadow, ClipOp, ClipRect, GeometryDraw}`（`GeometryDraw` 含 E4 的 `range: Range<u32>` 与 `GeometryDraw::full`）、`paint::canvas::{Canvas, CanvasText}`（E 阶段：canvas 文本配方）、`paint::geometry::{GeometryId, GeometryDesc, GeometryPipeline, GeometryUpdate, IndexType, Topology}`、`paint::geometry_store::GeometryStore`（经 `App::geometry_mut()`）、`paint::color::{Color, ColorResolver}`、`paint::atlas::{AtlasKind, AtlasTile}`（`AtlasTile` 含 E1d 的 CPU 侧 `slot` / `slot_epoch`）、`Window::set_canvas` | 自绘（`Canvas` 只装引擎图元，§5.9；canvas 文本走 `Canvas::push_text(TextContent, origin)`，§11.1）、注册静态几何与子区间绘制（§5.5 / §11.4）、颜色解析。**没有裸类型 `Geometry`、没有 `Brush`** |
-| 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextAlign, TextSlant, TextWrap（Wrap / NoWrap / BreakWord / Anywhere；BreakWord = text-wrap: wrap + overflow-wrap: break-word，只在整词放不下时词内应急断行、不改变 min/max-content，见 .docs/text-input-redesign-design.md §11.2 ㊾）, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, measure_text}`；`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}` | 文本组件。**shaping 快照（`ShapedLine` 等）全部 `pub(crate)`**（`NodeTree::text_line` 是 `pub(crate)`；应用不持有租约）；无节点归属的文本走 `Canvas::push_text(TextContent, origin)`、尺寸用 `App::measure_text`（§11.1）；富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
+| 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextDecorations, TextBackground, TextAlign, TextSlant, TextWrap（Wrap / NoWrap / BreakWord / Anywhere；BreakWord = text-wrap: wrap + overflow-wrap: break-word，只在整词放不下时词内应急断行、不改变 min/max-content，见 .docs/text-input-redesign-design.md §11.2 ㊾）, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, measure_text}`；`TextContent::{runs, with_runs}`、`TextStyle::{decorations, background, with_underline, with_strikethrough, with_background}` | 文本组件。**shaping 快照（`ShapedLine` 等）全部 `pub(crate)`**（`NodeTree::text_line` 是 `pub(crate)`；应用不持有租约）；无节点归属的文本走 `Canvas::push_text(TextContent, origin)`、尺寸用 `App::measure_text`（§11.1）；富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
 | 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, ImageResourceKind, ImageDiagnostic, DecodeState, DecodeCause, ResourceStats, PendingResource}`、`App::{resources, image_diagnostics, prepare_image_variant, take_resource_results, unload_resource, insert_bitmap_for_window, insert_svg_for_window, insert_bitmap_async_for_window, insert_svg_async_for_window}`、`Window::set_image_resource` | 图标 / 图片 / 远程头像。资源只描述“源 + 内在尺寸”：位图登记原生物理像素并自带 1/2、1/4 LOD，SVG 登记内在逻辑尺寸；栅格目标由引擎按绘制盒 × DPR 接管（`ResourceImage::variant_for(cache, target)`）。`ResourceCache` 的写入口（insert / unload / release_window）全部 `pub(crate)`，应用只能走 `App` 资源 API。`ResourceImage.tile` 已删除；Canvas / 行内图片用 `App::prepare_image_variant` 取目标变体。**E7 生命周期**：`insert_*_async` 产出 `PendingResource`，`poll()` 的结果交给 `App` 后，**挂载了 Pending 图片的节点自动转 Ready**（无需应用插手）；`App::unload_resource` 是唯一的公开卸载入口（遍历全部窗口置脏，R-19 已消除） |
 | 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, ItemAlign, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`、`app::{AnimationCompletion, AnimationEndKind, TimerId}`、`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, set_virtual_extents, scroll_to_item, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running, after, after_scoped, cancel_timer, on_animation_complete, modal_scope}` | 通用交互机制。`VirtualListConfig { extent, extents, overscan }`：`extents = None` 等高行、`Some(..)` 逐项高度（E3 已实现，§11.3；`VirtualListConfig` 因 `Box<[f32]>` **不再是 `Copy`**）。**E10**：`after` / `after_scoped` / `cancel_timer` / `on_animation_complete`（**单槽**，kit 层 `AnimationRouter` 是唯一注册者，§11.12）；**E12**：`OverlayOptions{.., trap_focus, a11y: A11yOverride}`（新增 `a11y` 字段 ⇒ `OverlayOptions` **不再是 `Copy`**）、`App::modal_scope`。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
 | 事件 | `event::{Event, InputEvent, InputOutcome, Action, ActionSource, KeyBinding, Key, KeyCode, Modifiers, PointerButton, ImeEvent}`、`layout::hit_test::HitResult`、`App::{drain_events, on_action, off_action, bind_key, unbind_key, bind_key_scoped, unbind_key_scoped, unbind_scope_keys, has_action_handler, scoped_key_binding_count, dispatch_action, dispatch_action_focused}` | 事件处理与快捷键。`Action` 是 `{ FocusNext, FocusPrev, Dismiss, Custom(SmolStr) }`：**应用动作只能是字符串 key**（没有强类型变体表）；「怎么触发」在 `ActionSource`。**E8**：`bind_key_scoped(window, scope: NodeId, binding) -> Result<(), EngineError>`（破坏性变更：旧签名返回 `()`）、`unbind_key_scoped`、`unbind_scope_keys`；作用域键绑定按焦点祖先链**内→外**求值，无 handler 不吞键（§11.10）。`has_action_handler` / `scoped_key_binding_count` 是 `test-support` 只读观测面。**E21**（已删除）：`App::drain_events_where` 于文本输入重构中移除——输入框不再转发宿主事件，宿主无需按窗口过滤事件队列（记录见 `.docs/text-input-redesign-design.md` §11.1、本题 `dfbf4f9c`） |
@@ -407,7 +407,7 @@ pub(crate) use windows as backend;
 | 扩展 | 新增公开面 | 章节 |
 |---|---|---|
 | E1 | `paint::canvas::{Canvas, CanvasText}`、`Canvas::push_text`、`Primitive::Text`（CPU 侧中间图元）、`App::measure_text`、`AtlasTile::{slot, slot_epoch}`（CPU 侧数据字段） | §11.1 |
-| E2 | `text::{TextRun, TextDecoration, InlineBoxPaint}`、`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}`、`InlineBoxSpec.paint`、`NodeBuilder::runs`、`TextDiagnostic::{InvalidTextRun, TextRunClipped, InlineBoxImageMissing}` | §11.2 |
+| E2 | `text::{TextRun, TextDecoration, TextDecorations, TextBackground, InlineBoxPaint}`、`TextContent::{runs, with_runs}`、`TextStyle::{decorations, background, with_underline, with_strikethrough, with_background}`、`InlineBoxSpec.paint`、`NodeBuilder::runs`、`TextDiagnostic::{InvalidTextRun, TextRunClipped, InlineBoxImageMissing}`；三个新类型：**`TextDecoration` = 单线条参数** `{ color: Option<Color>, thickness: LogicalPx }`（不是枚举）、**`TextDecorations` = 下划线 + 删除线两条线** `{ underline, strikethrough }`（同一 run 可两条线共存）、**`TextBackground` = run 底色** `{ color, corner_radius, padding_x }`（数据形状 / 落位 / 渲染见 §4.5.1） | §11.2 |
 | E3 | `VirtualListConfig.extents`、`ItemAlign`、`App::{set_virtual_extents, scroll_to_item}`、`EngineError::{VirtualListExtents, InvalidVirtualExtent}` | §11.3 |
 | E4 | `GeometryDraw.range`、`GeometryDraw::full` | §11.4 |
 | E5 | `Window::text_byte_index_at` | §11.5 |
@@ -425,7 +425,7 @@ pub(crate) use windows as backend;
 | E13 | `paint::style::{Shadows, MAX_SHADOWS, ShadowSpec.spread}`、`PaintSpec.shadows`（替换 `shadow`）、`StylePatch.opacity` 组语义、`Node.paint_opacity`（**不是**公开面，内部戳） | §11.14 |
 | E15 | `A11yRole::{ComboBox, ListBox, MenuItemCheckBox, MenuItemRadio, ColorWell}`（38→43）、`a11y::A11yOrientation`、`A11yPatch.orientation`、`App::set_a11y_patch` | §11.15 |
 
-**E2b 候选（未实现，仅登记，不得依赖）**：Canvas 配方只编码字形 run，不绘制装饰与行内盒（行内盒落点只对节点文本路径可读）。详见 §11.2。
+**E2b 候选（未实现，仅登记，不得依赖）**：Canvas 配方编码字形 run 与 run 背景，不绘制装饰线与行内盒（行内盒落点只对节点文本路径可读）。详见 §11.2。
 
 **明确留在应用层**：`ui_kit` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、**55** 个 Phosphor SVG + 7 品牌 PNG + 23
 预览图 + WAV、`IconKind → path` 映射、全部 widget 业务与几何、i18n、widget 注册表，以及 **D24 的薄 `StyleBuilder`**。
@@ -1252,7 +1252,7 @@ for line in layout.lines() {
 
 **缓存键**（`text/cache.rs::ShapeKey`）：文本哈希 + 文本长度 + **shaping 输入的样式哈希**（`TextStyle::hash_into`：family / size / weight /
 slant / line_height / letter_spacing / wrap / direction / overflow / max_lines / font_features / locale / stretch / word_spacing /
-line_break / font_variations / decoration；**不含 color / alignment**）+ **富文本 runs**（每个 run 的 `range` + shaping 输入哈希 + 颜色；E2 起必须入键，
+line_break / font_variations / decorations / background；**不含 color / alignment**）+ **富文本 runs**（每个 run 的 `range` + shaping 输入哈希 + 颜色；E2 起必须入键，
 否则不同 run 会误命中）+ **`normalized_runs`**（非法 runs 归一化计数的诊断随快照复用，不能让「有诊断的内容」命中「没诊断的快照」）
 + `inline_boxes` 的 id/index/size/baseline/align + `font_stack_version`。**不含 `scale`**（R12-4：逻辑坐标 shaping，DPI 变化不清缓存）、
 **不含 `atlas_generation`**（图集换代只影响 tile，不影响 glyph id / advance / 基线 / 行数；`ShapedLine` 快照另带代际，换代后重建）、
@@ -1268,6 +1268,44 @@ Canvas 文本配方的 shaping 复用同一份 `ShapeKey` 与缓存；其**光�
 部分相交保留 shape 期画刷）。这是「Canvas 多色文本」成立的前提（同一字符串以不同颜色塑形、多句柄并存），节点文本首次光栅输出
 不变。精确语义与测试见 §11.1 第 11 项。
 
+#### 4.5.1 文本装饰与 run 背景（已实现；E2 增补，R1 `9a4d3e8d`）
+
+**结论**：装饰从「单线枚举」升级为「单线参数 + 集合」，并新增 per-run 底色。二者都是 shaping 期烘好的几何、paint 期编码为普通
+`Quad`：不参与布局、不进 shader（不触发 I8），带装饰或背景的文本自动退出数字快路径。
+
+| 数据形状（`crates/ui_core/src/text.rs`） | 语义 | 证据 |
+|---|---|---|
+| `TextDecoration` | 单线条参数结构 `{ color: Option<Color>, thickness: LogicalPx }`；`is_visible()` = 厚度有限且 > 0 | `text.rs:39-58` |
+| `TextDecorations` | `{ underline: Option<TextDecoration>, strikethrough: Option<TextDecoration> }`；同一 run 可同时有两条线；`is_empty()` 判空 | `text.rs:70-103` |
+| `TextBackground` | `{ color, corner_radius, padding_x }`；`is_visible()` = 颜色非全透明 + 圆角/内边距有限且 ≥ 0；`with_background` 对不可见值归一化为 `None`（不写字段、回收空 extras） | `text.rs:105-121`、`text.rs:496-513` |
+| 落位 | `TextStyleExtras { decorations, background, .. }`（已装箱），`TextStyle` 仍 56 B；访问面 `TextStyle::{decorations, background}` + 三个 setter | `text.rs:203-214`、`text.rs:335-344`、`text.rs:484-497` |
+| shaping 产物 | `ShapedTextLine.{line_top, line_height, decorations: Vec<ShapedQuad>, backgrounds: Vec<ShapedQuad>}`；`ShapedQuad { rect, color, corner_radius }`（`is_visible()` 过滤透明 / 空矩形 / 非法圆角） | `text.rs:847-881`、`text.rs:855-865` |
+
+**几何**（`crates/ui_core/src/text/shape.rs`）：
+
+| 项 | 规格 | 证据 |
+|---|---|---|
+| 装饰线 | 下划线中心 = `baseline + 0.10 em`、删除线中心 = `baseline − 0.30 em`（`em` = 该 run 字号）；线宽 = `thickness`；逐行一条，RTL/bidi 跨度取行内视觉并集 | `shape.rs:928-929`、`shape.rs:941-992` |
+| 背景块 | y = 行盒 `line_top .. line_top + line_height`（含 leading）；首行 `line_top = 0`（文本局部坐标，paint 期再加 origin），随后逐行 `+= line_height`，相邻行严格相接 | `shape.rs:1163`、`shape.rs:1288-1302` |
+| 背景水平范围 | x 复用装饰的视觉跨度；`padding_x` 只加在「同色 + 同圆角 + 同 padding」合并组的**两端**；组间窄缝每侧取 `min(padding_x, gap/2)`，不双绘 | `shape.rs:1024-1067`、测试 `shape.rs:3480`、`shape.rs:3793` |
+| 不改变推进 | 背景/内边距不进断行：`advance` / `width` 与无背景时一致（内边距只扩矩形、不扩行宽） | `shape.rs:1056-1065`、测试 `shape.rs:3210` |
+| 两条线 + 底色共存 | 每个 kind 各收集一条装饰、背景另算 ⇒ 同一 run 可同时有下划线、删除线与底色（markdown 的「链接 + 删除线」「行内代码/键帽底色」即此形态） | `shape.rs:952-990`、测试 `shape.rs:3145`、`crates/ui_kit/src/kit/markdown/inline.rs:224-257` |
+| 裁剪 | `max_lines` 截断整行丢弃；省略号截断后**背景只截右端**（左端保留 `padding_x`，x 可为负），装饰线两端夹到 `[line_offset, line_offset + advance]`，夹成零宽即丢弃 | `shape.rs:1370-1396`、`shape.rs:1410-1437`、测试 `shape.rs:3870` |
+
+**绘制**（`crates/ui_core/src/paint/pass.rs`）：
+
+| 项 | 规格 | 证据 |
+|---|---|---|
+| 顺序 | 背景 `Quad` → 选区 `Quad` → 字形 `GlyphRun` / 行内盒 → 装饰线 `Quad`（可编辑文本再接 IME 组合线 / placeholder / caret）；**背景先于选区**是当前实现的事实 | `pass.rs:1653-1679`、`pass.rs:1691-1749` |
+| `foreground` | 只覆盖字形色与装饰线色（含显式 `TextDecoration::color`），**不改**背景色 | `pass.rs:1713-1717`、`pass.rs:1741`、测试 `pass.rs:3210`、`pass.rs:3309` |
+| 组不透明度 | 背景 / 装饰与字形一样乘组 `opacity`（`emit_solid_quad` 内 `with_opacity`） | `pass.rs:1787-1811`、测试 `pass.rs:3309` |
+| 四条路径（缺一即不一致） | ① GPU 节点文本 `emit_text`：背景 + 装饰都有；② Canvas 配方 `push_text_glyph_runs`：只画背景（无装饰，E2b 候选）；③ 可编辑占位行 `emit_placeholder`：只画背景（在占位文字色短路之前）；④ 装饰线/背景共用的 Quad 编码 `emit_solid_quad`（透明色 / 空矩形不产图元） | `pass.rs:340-384`、`pass.rs:1639-1811`、`pass.rs:1813-1835`、测试 `pass.rs:2722`、`pass.rs:3451` |
+| 缓存键 | 装饰集合（逐 kind「present + color + thickness bits」）与背景（present + color + 圆角 + 内边距）都必须进 `TextStyle::hash_into`；漏任一字段 ⇒ `ShapeKey` 碰撞 ⇒ 每帧重复 shaping（缓存抖动，输出仍正确） | `text.rs:515-552`、`text/cache.rs:35-40`、测试 `cache.rs:329`、`cache.rs:409` |
+| 快路径 | 数字快路径资格额外要求 `decorations().is_empty() && background().is_none()` ⇒ 有装饰或有背景一律走 parley 全路径 | `text/context.rs:168-173`、测试 `context.rs:523` |
+
+**不变量**：I2 ✅（复用 `Primitive::Quad`）；I17 ✅（`TextStyle` 是静态载荷，动态色仍 `StylePatch.foreground`）；I8 ✅（装饰/背景不进 shader、不做 golden）；`TextStyle` 尺寸 56 B 不变（新字段都在装箱的 `TextStyleExtras`）。
+**仍不改**：装饰 offset 是固定 EM 比例（0.10 / 0.30），不随字体度量变化（与 P1-E2 一致）。
+
 ### 4.6 字体策略（D17）
 
 | 项           | 设计                                                                                                                                                                           |
@@ -1280,19 +1318,32 @@ Canvas 文本配方的 shaping 复用同一份 `ShapeKey` 与缓存；其**光�
 
 ### 4.7 行内流
 
-`ui_kit/src/markdown/inline_flow.rs` 的自研行内流（链接下划线、`kbd` 盒、行内图片、折行）是必须保留的业务资产。设计上把它从「GPUI
-`Element` 实现」改造成**纯数据管线**：
+旧的「`Flow` / `FlowStyle` / `LinkSpan` / `flow()` / `rich_text` / `link_at`」公开面已删除（D9），`ui_kit/src/markdown/inline_flow.rs`
+整文件随 R2 删除；行内流现在是**纯数据两级映射**，引擎不解释 markdown 语义：
 
 ```text
-Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
-  → Parley InlineBox 描述（宽/高/baseline/vertical_align）
-  → Layout<B> 断行 → PositionedLayoutItem
-  → Scene：文本片段进 GlyphRun，装饰盒进 Quad，图片进 Image
+pulldown-cmark 行内事件（Text / Code / Strong / Emphasis / Strikethrough / Link / Image / InlineHtml）
+  → ui_kit InlineBuf：String 文本 + (Range, Marks) 样式段 + Vec<行内盒>（inline.rs:107-179）
+  → InlineBuf::finish(base, MarkdownStyle) → InlineContent { text, runs: Vec<TextRun>, boxes: Vec<InlineBoxSpec> }（inline.rs:180-221）
+  → TextContent::{with_runs, with_inline_boxes}（text.rs:606-633）
+  → parley RangedBuilder：逐 run push_run_style、逐盒 push_inline_box（text/shape.rs:165-178）
+  → 断行 → ShapedTextLine.items（GlyphRun | InlineBox）+ decorations + backgrounds → Scene
 ```
 
-**必须补齐的已知限制**：文本可选中 / 复制、a11y 角色、行内图片基线对齐、`kbd` 参与折行、右对齐行尾空白。选区由
-`text::inline_flow` 维护 `(anchor, focus)` 字节偏移并映射到 `PositionedLayoutItem`，同时通过
-`A11yAction::SetTextSelection` 暴露（§7.6）。
+**run 的样式叠加**（不是三选一）：marks 独立叠加——strong → `weight 700`、emphasis → italic、code/kbd → mono family、
+link → 链接色 + 下划线、kbd → 下划线、strike → 删除线、code/kbd → run 背景（§4.5.1）；因此「链接 + 删除线」「键帽下划线 +
+底色」在同一 run 上共存。相邻同样式段合并，与 base 样式相同的段不产 run（`runs` 为空 = 全段用 `TextContent.style`）。
+
+| 环节 | 事实 | 证据 |
+|---|---|---|
+| run 契约 | `TextContent.runs` 私有，只能经 `with_runs` / `NodeBuilder::runs` 构造；逐属性覆盖（`Option` 字段 `Some` 覆盖、`None` 继承 base；字号/字重/倾斜/行高/字距/颜色/wrap 取 run 自己的值）；构造期把区间夹到字符边界并丢弃重叠 / 空区间，被改动的 run 数记入 `normalized_runs`，shape 期压一条 `InvalidTextRun` | `crates/ui_core/src/text.rs:573-634`、§11.2 |
+| 行内盒 | `InlineBoxSpec { id, index, size, baseline: None, align: InlineAlign::Baseline, paint }`；引擎 `text/inline_flow` 映射为 parley `InlineBox`（`InFlow` + 垂直对齐），落点进 `ShapedTextLine.items` | `text/inline_flow.rs:12-58`、`text/shape.rs:1270-1284` |
+| 图片 / 盒绘制 | `paint` 决定绘制方式：markdown 图片统一 `InlineBoxPaint::Quad` 占位（§13.9 R-4）；`InlineBoxPaint::Image` 需 App 资源通路，组件本轮不用 | `crates/ui_kit/src/kit/markdown/inline.rs:204-219`、§11.2 第 7 条 |
+| 选区 | 只有可编辑文本节点有选区：`text_edit` 的 `EditableText`（选区 = `TextSelection { anchor, focus: TextCursor, h_pos, base }`，字节 + affinity）→ `EditDecorations`（选区 / 组合下划线 / placeholder / caret）；a11y 走 `A11yAction::SetTextSelection`。markdown 静态文本无此通路 | `text_edit.rs:187-377`、`text_edit.rs:1133`、`paint/pass.rs:1263-1311`、§7.6 |
+| 命中 | 字符命中走 `Window::text_byte_index_at`（§11.5）；行内盒命中没有引擎 API（节点文本路径的 `ShapedInlineBox.rect` 无公开只读面，§11.2 第 8 条）；markdown 链接本轮不做点击（D9：不保留 URL） | §11.2、§11.5 |
+
+**已知限制**（未收口）：行内图片是占位 `Quad`（不接 `ResourceCache`，§13.9 R-4）；静态文本不可选中 / 复制；`kbd`
+按普通 inline box 参与折行，基线取 `InlineAlign::Baseline`。
 
 ### 4.8 布局与文本的错误路径
 
@@ -2879,7 +2930,7 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 **实现事实**：Canvas 文本不再由应用持有 `ShapedTextHandle`，也不再公开任何按 DPI 光栅化的句柄。应用只记录**逻辑文本配方**
 （`TextContent` + 逻辑原点），引擎在帧管线内解析、光栅化并替换为 `Primitive::GlyphRun`；DPI 变化、图集换代、逐 tile 淘汰都由
 引擎按 key 重光栅，不重建 `Arc<Canvas>`，也不需要应用改任何缓存键。`ShapedLine` / `ShapedTextLine` / `ShapedTextItem` /
-`ShapedGlyphRun` / `ShapedInlineBox` / `ShapedDecoration` 全部 `pub(crate)`，`ShapedTextHandle` 与 `text::pack_atlas_lease` 整体删除。
+`ShapedGlyphRun` / `ShapedInlineBox` / `ShapedQuad` 全部 `pub(crate)`，`ShapedTextHandle` 与 `text::pack_atlas_lease` 整体删除。
 
 ```rust
 // paint/canvas.rs（已实现）
@@ -2904,8 +2955,8 @@ impl App {
    **应用义务**：`origin + measure_text(...)` 必须落在 `Canvas::bounds` 内 —— damage / 命中只看 `Canvas::bounds`，引擎**不会**自动
    union（P3 建议 F10；越界内容的自绘责任归应用）。尺寸需要时调 `App::measure_text`。
 3. **Canvas 文本按 max-content 单行绘制**：配方不携带断行宽度；`measure_text(content, Some(w))` 只回答「若在 w 下断行会多高」（`w` 非有限 / 负数按 max-content 处理并记 `TextDiagnostic::InvalidMeasureWidth`），
-   不会改变 canvas 的绘制结果。行内盒（`TextContent.inline_boxes`）的落点来自 parley 布局，但 canvas 只编码字形 run ——
-   行内盒的绘制归节点文本路径（E2 / §11.2）。
+   不会改变 canvas 的绘制结果。行内盒（`TextContent.inline_boxes`）的落点来自 parley 布局，但 canvas 只编码字形 run 与 run 背景 ——
+   行内盒与装饰线的绘制归节点文本路径（E2 / §11.2）。
 4. **解析归引擎**：`Window::canvas_text: HashMap<NodeId, ResolvedCanvasText>`，`key = (canvas_generation, dpr_bits,
    atlas_generation, glyph_eviction_epoch, font_stack_version)；`Node::canvas_generation` 随 `Window::set_canvas` 前进。`App::frame` 在 `layout_text`
    之后、`upload_atlas_pages` 之前跑 `App::resolve_canvas_text(window)`：按 paint 序（`NodeTree::canvas_nodes`，DFS 前序）对每个
@@ -2939,36 +2990,42 @@ impl App {
   展开断言。
 ### 11.2 E2 · 富文本：多 run + 装饰 + InlineBox（已实现，量级 L，P1-E2）
 
-**实现事实**：`TextContent` 支持 runs（逐区间覆盖样式）；`TextStyle` 支持装饰；`emit_text` 按 `InlineBoxPaint` 生成引擎既有图元；
-装饰是 shaping 期烘好的 `ShapedDecoration` 几何、paint 期编码为普通 `Quad`；这些 shaping 快照（`ShapedTextLine` / `ShapedDecoration`）全部 `pub(crate)`，应用侧只能通过帧记录（`canvas_primitives` / `PrimitiveRecord`）或节点文本路径的可访问面断言，渲染仍由引擎 `Quad` 承担。
+**实现事实**：`TextContent` 支持 runs（逐区间覆盖样式）；`TextStyle` 支持「装饰集合 + run 背景」（`TextDecorations` / `TextBackground`，
+数据形状与落位见 §4.5.1）；`emit_text` 按 `InlineBoxPaint` 生成引擎既有图元；装饰与背景都是 shaping 期烘好的 `ShapedQuad` 几何、
+paint 期编码为普通 `Quad`；这些 shaping 快照（`ShapedTextLine` / `ShapedQuad`）全部 `pub(crate)`，应用侧只能通过帧记录
+（`canvas_primitives` / `PrimitiveRecord`）或节点文本路径的可访问面断言，渲染仍由引擎 `Quad` 承担。
 
 ```rust
 // text.rs（已实现；数据形状以源码为准）
 pub struct TextRun { pub range: Range<usize>, pub style: TextStyle }
 impl TextRun { pub fn new(range: Range<usize>, style: TextStyle) -> Self; }
 
-pub enum TextDecoration {
-    Underline { color: Option<Color>, thickness: f32 },
-    Strikethrough { color: Option<Color>, thickness: f32 },
+// 装饰 =「单线参数 + 集合」（不是单线枚举）：每条线各自带颜色与线宽，同一 run 可同时有两条线（§4.5.1）。
+pub struct TextDecoration { pub color: Option<Color>, pub thickness: LogicalPx }
+impl TextDecoration { pub fn is_visible(self) -> bool; }   // thickness 有限且 > 0 才绘制
+
+pub struct TextDecorations {                 // 每个 run 一份；与兜底样式的合并规则见下方语义第 1 条
+    pub underline: Option<TextDecoration>,
+    pub strikethrough: Option<TextDecoration>,
 }
-impl TextDecoration {
-    pub const fn underline(thickness: f32) -> Self;
-    pub const fn strikethrough(thickness: f32) -> Self;
-    pub const fn with_color(self, color: Option<Color>) -> Self;
-    pub const fn color(self) -> Option<Color>;
-    pub const fn thickness(self) -> f32;
-    pub fn is_visible(self) -> bool;   // thickness 有限且 > 0 才绘制
-}
-// TextStyle：decoration 收进低频 `TextStyleExtras`（`extras: Option<Box<TextStyleExtras>>`），公开访问面是访问器 + 构造器；
-// `TextStyle` 仍 56 B。装饰不参与布局。
+impl TextDecorations { pub const fn is_empty(&self) -> bool; }
+
+pub struct TextBackground { pub color: Color, pub corner_radius: LogicalPx, pub padding_x: LogicalPx }
+impl TextBackground { pub fn is_visible(self) -> bool; }   // 颜色非全透明 + 圆角 / 内边距有限且 >= 0
+
+// TextStyle：装饰集合与背景收进低频 `TextStyleExtras`（`extras: Option<Box<TextStyleExtras>>`），公开面是访问器 + 三个 setter；
+// `TextStyle` 仍 56 B。装饰与背景都不参与布局。
 impl TextStyle {
-    pub fn decoration(&self) -> Option<TextDecoration>;
-    pub fn with_decoration(self, decoration: TextDecoration) -> Self;
+    pub fn decorations(&self) -> TextDecorations;                          // 无 extras 时 = 默认值（两条线都没有）
+    pub fn background(&self) -> Option<TextBackground>;
+    pub fn with_underline(self, thickness: LogicalPx, color: Option<Color>) -> Self;
+    pub fn with_strikethrough(self, thickness: LogicalPx, color: Option<Color>) -> Self;
+    pub fn with_background(self, background: TextBackground) -> Self;      // 不可见值归一化为 None（不写字段、回收空 extras）
 }
 
 pub enum InlineBoxPaint {                 // 引擎负责画，应用只声明
     Image { resource: ResourceId, modulation: Color },
-    Quad { color: Color, corner_radius: [f32; 4] },
+    Quad { color: Color, corner_radius: [LogicalPx; 4] },
 }
 pub struct InlineBoxSpec { /* 现有 5 字段 + */ pub paint: Option<InlineBoxPaint> }   // 72 B
 
@@ -2982,6 +3039,7 @@ pub struct TextContent {
 impl TextContent {
     pub fn runs(&self) -> &[TextRun];                  // 空切片 = 全段用 style
     pub fn with_runs(self, runs: impl IntoIterator<Item = TextRun>) -> Self;
+    pub fn with_inline_boxes(self, boxes: impl IntoIterator<Item = InlineBoxSpec>) -> Self;
 }
 impl NodeBuilder { pub fn runs(self, runs: impl IntoIterator<Item = TextRun>) -> Self; }
 ```
@@ -2994,7 +3052,8 @@ E2 未改变 `Node` 尺寸；E13 的 `paint_opacity: f32` **+4 B（对齐后 +8 
 **语义**：
 
 1. **run 覆盖 = 逐属性继承 + 可选覆盖**（不是「整段换一套样式」）：`Option` 字段（`family` / `font_features` / `stretch` /
-   `word_spacing` / `locale` / `font_variations` / `line_break` / `decoration`）`Some` 覆盖该属性、`None` **继承** `TextContent.style`
+   `word_spacing` / `locale` / `font_variations` / `line_break` / `background`，以及 `decorations` 里逐 kind 的 `Option<TextDecoration>`）
+   `Some` 覆盖该属性、`None` **继承** `TextContent.style`
    的同名属性（因此 `None` 不能把兜底样式的非默认值清回默认）；其余字段（字号 / 字重 / 倾斜 / 行高 / 字距 / 颜色 / `wrap`）总是取 run
    自己的值。**`wrap` 的实际归属是整段兜底样式**：`push_run_style` 只在 run 为 `NoWrap` / `Anywhere` 时向该区间下发收紧属性，
    `Wrap` 是空操作 ⇒ run **无法**把 base 的 `NoWrap` / `Anywhere` 复位成可换行；应用要「局部可换行」必须让 `TextContent.style.wrap`
@@ -3007,7 +3066,7 @@ E2 未改变 `Node` 尺寸；E13 的 `paint_opacity: f32` **+4 B（对齐后 +8 
 3. **装饰几何**：下划线中心 = `baseline + 0.10 em`；删除线中心 = `baseline − 0.30 em`（`em` = 装饰所属样式的字号）；线宽 = `thickness`
    （非有限 / `<= 0` 不画）。软换行时每行一条；**硬换行行尾按「行内容区间」裁剪**（去掉行尾 `\n` / `\r`，可见字符才画线；修复前
    `"ab\ncd"` 除末行外整行丢装饰，现为每行都有）；省略号截断后末行装饰夹到 `[line_offset, line_offset + advance]`，夹成零宽后丢弃。
-   兜底样式的装饰只覆盖「未被**带装饰的 run** 占用的区间」（不叠双线）；run 的 `decoration = None` = 继承兜底。
+   兜底样式的装饰只覆盖「未被**带该种装饰的 run** 占用的区间」（不叠双线）；run 的 `decorations` 里该 kind 为 `None` = 继承兜底。
 4. **装饰的 RTL / bidi 跨度**：装饰 x 跨度 = 区间内**所有** cluster 的视觉并集
    `[min(visual_offset), max(visual_offset + advance)]`（按行内视觉顺序取首/末相交 cluster，再取 min/max 归一）；**不能**只取逻辑首 /
    末字符所属 cluster 的端点（RTL 片段里逻辑首字符在视觉右端，端点法只覆盖中间一段）。LTR+RTL 混排与跨 run RTL 同规则。
@@ -3020,9 +3079,10 @@ E2 未改变 `Node` 尺寸；E13 的 `paint_opacity: f32` **+4 B（对齐后 +8 
    `TextDiagnostic::InlineBoxImageMissing { id }`（同帧按 id 去重；跨帧由 `TextContext` 按值去重）。`Some(Quad)` 生成 `Primitive::Quad`；
    `None` 只算落点、不绘制。无 `App` 通道的 `Window::frame` 没有 `ResourceCache`：行内图片一律跳过并记
    `Window::inline_box_image_diagnostics()`（最近一帧快照，每帧重建、不增长），需要行内图片请走 `App::frame`。
-8. **命中边界**：文本内字符命中走 E5 的 `Window::text_byte_index_at`；InlineBox 命中由应用用 `ShapedInlineBox.rect` +
-   `HitResult.local_point` 比对（**不新增**引擎命中 API）。节点文本路径的 `ShapedInlineBox.rect` 只读访问面**不存在** ——
-   `App::shaped_inline_boxes` 只覆盖 standalone handle，节点路径的只读访问面见下方 E2b 候选。
+8. **命中边界**：文本内字符命中走 E5 的 `Window::text_byte_index_at`；**InlineBox 命中没有引擎 API（本轮也不新增）**——
+   `ShapedInlineBox` 与 `NodeTree::text_line` 都是 `pub(crate)`，应用侧没有读取行内盒落点的公开面（曾用于 standalone handle 的
+   `App::shaped_inline_boxes` 已随 P4 公开面收敛删除），只能按自持的 run 区间 + `text_byte_index_at` 近似；节点文本路径的
+   只读访问面见下方 E2b 候选第 2 条。
 
 **错误 / 诊断**：不新增 `EngineError`；非法 runs 归一化 + `InvalidTextRun` / `TextRunClipped` 诊断；`bind_text` 的
 `TextDiagnostic::TextRunClipped { runs }` 语义不变。
@@ -3032,7 +3092,8 @@ I12 ✅（装饰矩形 / run 边界 / inline box rect 都是非像素断言对�
 
 **测试面**：L1 —— run 边界（`ShapedGlyphRun.text_range` 与 run 区间一致）；换行后 run 跨行正确；装饰矩形数量 = 每个有装饰的
 (run, 行) 段数；硬换行 / 纯 RTL / LTR 内 RTL run / 跨 run RTL 的装饰跨度；`foreground` 同时覆盖字形与装饰色；非法 runs 只产一条诊断；
-inline box `paint = Some(Image)` 的 `Image` 图元 bounds == `shaped_inline_boxes()[i].rect + 文本盒原点`。L2 —— `RenderedFrame.primitives`
+inline box `paint = Some(Image)` 的 `Image` 图元 bounds == shaping 期行内盒落点（守护用例 `pass.rs::inline_box_quad_paint_uses_the_landing_rect` /
+`pass.rs::inline_box_image_paint_resolves_tiles_and_skips_missing_resources`）。L2 —— `RenderedFrame.primitives`
 的 `PrimitiveKind::Quad` 装饰 item 数与 line / baseline 一致；`app_frame_reports_missing_inline_box_images_once`；
 `window_frame_reports_skipped_inline_box_images`。L3 —— **不新增**（文字像素不做 golden）。守护用例：
 `decoration_survives_hard_line_breaks`、`run_decoration_clipped_at_hard_line_break`、`decoration_range_excludes_the_hard_break_tail`、
@@ -3041,11 +3102,12 @@ inline box `paint = Some(Image)` 的 `Image` 图元 bounds == `shaped_inline_box
 
 **E2b 候选（未实现，仅登记，不得依赖）**：
 
-1. **Canvas 配方不绘制装饰与行内盒**：`Canvas::push_text` 只记录配方，paint 期只编码 glyph run；
-   路径同样不绘制 —— `InlineBoxPaint` / `TextDecoration` 的绘制只覆盖节点文本路径（`emit_text`）。
-2. **节点文本路径的 InlineBox 命中只读访问面**：`NodeTree::text_line` 仍 `pub(crate)`，且 Canvas 配方不支持 runs、无法复现节点
-   文本的行内盒落点；因此「InlineBox 命中」目前仅节点文本路径可行。链接文本命中可先用 E5 的 `text_byte_index_at` + 应用
-   自持 run 区间判定。
+1. **Canvas 配方不绘制装饰线与行内盒**：`Canvas::push_text` 只记录配方，paint 期编码 glyph run **与 run 背景**（
+   `pass.rs::push_text_glyph_runs` 在字形前画 `backgrounds`，守护用例 `canvas_text_recipe_draws_run_backgrounds_before_glyph_runs`）；
+   装饰线（`TextDecorations`）与 `InlineBoxPaint` 的绘制只覆盖节点文本路径（`emit_text`）。
+2. **节点文本路径的 InlineBox 命中只读访问面**：`NodeTree::text_line` 与 `ShapedInlineBox` 都是 `pub(crate)`，且 Canvas 配方不支持 runs、
+   无法复现节点文本的行内盒落点；因此应用侧**取不到**行内盒落点，「InlineBox 命中」无法由公开面实现——只能按应用自持的 run
+   区间 + E5 的 `text_byte_index_at` 近似。
 
 ### 11.3 E3 · 变高虚拟列表（已实现，量级 M，P1-E3）
 
@@ -3339,7 +3401,7 @@ macOS 纯函数 `traffic_light_position_applies_once_and_never_rolls_back` / 安
 | R-13 | 真机 DPI 覆盖仅 125% | E6 只在 125% 真机做过带回读的冒烟；100% / 150% / 200% 与混合 DPI 跨屏由纯函数（96/120/144/192）覆盖。**P6 三端验收已在 macOS / Linux 真机启动验收构建并跑 7 步自检**（§14.4），但都是默认 DPI、且不读回仪表；交通灯 AppKit 行为与 Wayland 标题生效时点仍只有平台无关纯函数单测。 | 接受；后续补真机 DPI 矩阵 |
 | R-14 | Win11 Snap Layouts `HTMAXBUTTON` 未实现 | 自绘最大化按钮无法触发系统 Snap Layouts 悬停浮层；`WM_NCHITTEST` 只返回八向 `HT*` / `HTCAPTION` / `HTCLIENT`。Aero Snap（拖边）/ 双击最大化 / `Alt+Space` / 右键系统菜单仍由系统提供。 | 接受；后续增强批次 |
 | R-15 | Windows 全屏不支持 | `ToggleFullscreen` ⇒ `UnsupportedWindowCapability { capability: "fullscreen window control" }`；`WindowState.can_fullscreen == false` 初值。理由：kytrix 现有 UI 只有最小化/最大化/关闭（A4 证据）；`WS_POPUP` 独占全屏会改 Snap / DWM / 任务栏 / Alt+Tab 语义，需重新整轮真机验收。 | 用户裁决接受（Lead task-11）；后续如需独占全屏单独立批 |
-| R-16 | E2b 候选两项 | ① Canvas / standalone shaping 不绘制装饰与行内盒；② 节点文本路径的 InlineBox 命中只读访问面不存在（仅 standalone handle 路径可读落点）。 | 未实现，登记于 §11.2 |
+| R-16 | E2b 候选两项 | ① Canvas / standalone shaping 不绘制装饰线与行内盒（run 背景已画）；② 节点文本路径的 InlineBox 命中只读访问面不存在（`NodeTree::text_line` / `ShapedInlineBox` 均 `pub(crate)`）。 | 未实现，登记于 §11.2 |
 | R-17 | 合并提交不可单独构建（bisect 例外） | P1 各批以 merge 提交合入 `gui-engine-migration`，部分 merge 提交单独 checkout 不保证可构建（跨分支 crate / 特性依赖）。`git bisect` / 回溯以 batch 的**功能提交**为单位，不以 merge 提交为构建判据。 | 接受（流程例外） |
 | R-18 | `WM_NCCALCSIZE` `wParam == FALSE` 无测试 | 该变体交 `DefWindowProcW`（与成熟实现同构）；本仓无 `SWP_FRAMECHANGED` 运行期样式变更路径，风险低。若未来引入运行期样式变更需回归。 | 接受；登记 |
 | R-19 | 裸 `ResourceCache::unload` 已不可达 | `ResourceCache` 的写入口（`insert*` / `unload` / `release_window`）已收为 `pub(crate)`，应用无法绕过 `App` 直接卸载；`App::unload_resource` 遍历全部窗口 `invalidate_images_with_resource` 后再释放。 | 已消除（D3a）；保留编号占位 |
@@ -3682,11 +3744,44 @@ impl App {
 
 | 项 | 事实 |
 |---|---|
-| 新模块 | `crates/ui_kit/src/theme/`（8 个模块 + `mod.rs`：`appearance` / `color` / `components` / `handle` / `palette` / `resolved` / `role` / `roles`）、`crates/ui_kit/src/kit/`（33 个组件模块 + `mod.rs` + `test_support`（`#[cfg(test)]`）；`kit/markdown/` 6 个模块 + `parse_tests`） |
+| 新模块 | `crates/ui_kit/src/theme/`（8 个模块 + `mod.rs`：`appearance` / `color` / `components` / `handle` / `palette` / `resolved` / `role` / `roles`）、`crates/ui_kit/src/kit/`（33 个组件模块 + `mod.rs` + `test_support`（`#[cfg(test)]`）；`kit/markdown.rs`（公开面）+ `kit/markdown/` 7 个子模块 + 自命名测试根 `kit/markdown/tests.rs` + `kit/markdown/tests/`（布局、职责与行数见 §12.1.1）） |
 | 旧模块（已删除） | 旧 `src/style/`（5 个模块 + `mod.rs`）、`src/` 顶层组件文件、旧 `src/markdown/`（9 文件）共 **37 个模块/目录、25,471 行**，已由 **P5-2**（`6239b84`）删除；`src/` 只剩 `kit/`、`theme/`、`lib.rs`（`style_builder.rs` 已由 B1b 迁入 `ui_core`，§12.7） |
 | 迁移形态裁决 | **模块级增量**：新模块用新路径与新 API，旧模块不改造、不桥接、不 re-export；**不是**公开 API 兼容层（AGENTS §1.1） |
 | 依赖 | `crates/ui_kit/Cargo.toml` 运行时只依赖 `ui_core`（构建期 `resvg`/`usvg`/`image`）；`gpui-kit` 已随 P5-2 删除，`grep -r gpui crates/ui_kit` = **0**（`cargo tree -p ui_kit \| grep gpui` 亦 0） |
-| 测试事实标准 | `cargo test -p ui_kit --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **765 passed**（B1b 后实测；P2 时点 1,139） |
+| 测试事实标准 | `cargo test -p ui_kit --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **779 passed**（其中 `kit::markdown` 189 条；本迁移 B1b 时点 765、P2 时点 1,139，markdown 重构后重新实测） |
+
+#### 12.1.1 `kit/markdown` 的实际布局（R2 单提交 `9447be99` 落地，R3 `0973bda5` 补齐测试 / 门禁 / 夹具）
+
+**结论**：旧的「持久 IR + view 映射」管线已整体删除——`MarkdownDocument` / `MarkdownBlock` / `MarkdownPiece` / `MarkdownView` /
+`MarkdownHandles` / `rich_text` / `parse_document` 这些类型与函数在 `crates/` 内已无定义（残留的只是 `widget` 侧 `is_rich_text`
+谓词与测试名）；现在是 **pulldown-cmark 单遍事件 → 节点树**：
+`Builder::build` 用 `Parser::new_ext(..).into_offset_iter()` 一次遍历直接建节点（`build.rs` 的 `Builder::build`），表格延迟到 `End(Table)` 建
+（`table.rs`），HTML 块是唯一允许递归的嵌套解析入口（`html.rs`，受深度 / 字节预算约束）；解析次数由门禁 4 的三个测试钉死
+（`tests/gates.rs` 的 `gate_four_the_nested_parse_count_follows_the_html_container_units`、
+`gate_four_every_production_rich_text_parses_exactly_once_or_once_nested`、`gate_four_plain_text_counts_the_nested_html_parse`；
+生产富文本 = 1 次主解析，或 1 次主解析 + 有限次嵌套解析）。
+
+文件行数按 2026-11-26 工作树实测（R3 之后重新核对；为避免再次漂移，下表**只标函数 / 符号名与文件头常量段，不再写 `file:line`**）：
+
+| 文件（实测算行） | 职责 |
+|---|---|
+| `markdown.rs`（186） | 自命名模块根 = 公开面：`MarkdownAssets` / `MarkdownStyle` / `MarkdownNode` / `plain_text` + 子模块声明（`mod assets;` … `#[cfg(test)] mod tests;`）+ 4 个主题常量（行高 1.4 / 装饰线宽 1 px / 背景内边距与圆角 2 px，集中在文件头的 `const` 段） |
+| `assets.rs`（582） | `file:` 行内图片源解析：显式 `?size`（1..256 clamp）> 图片内禀尺寸 > 16×16 回退；`InlineImageSource` 收为 `pub(super)`（类型声明与 `resolve()` 都在该文件） |
+| `build.rs`（1781） | 事件 → 节点树单遍构建：容器栈 / 行内缓冲刷新 / 空行 spacer 重建（`emit_blank_spacers`）/ 对齐窗口 / 嵌套上限 / 布局常量表（文件头常量段） |
+| `html.rs`（686） | HTML 块切片 + tokenizer（`classify` / `units` / 开闭标签 / 块类推断）+ 白名单映射 + 唯一嵌套解析入口（`HtmlBudget`）；`MAX_HTML_NESTED_PARSES` / `MAX_HTML_INNER_BYTES` / `MAX_HTML_BLOCK_BYTES` 在文件头常量段 |
+| `inline.rs`（258） | `InlineBuf` → `InlineContent`（`TextRun` + `InlineBoxSpec`）+ marks → `TextStyle` 映射（多装饰叠加 / run 背景 / 行内代码 mono）；入口 `InlineBuf::finish`、样式映射 `run_style` |
+| `lines.rs`（105） | `SourceLines`（行首表）+ 字节入参的空行计数（`blank_lines_between`） |
+| `plain.rs`（315） | `plain_text` 事件旁路（复用 `html` tokenizer 取标签内文字；表格 / 列表 / 代码块 / 图片跳过口径） |
+| `table.rs`（213） | 延迟建表 `TableBuf` / `CellBuf` + `End(Table)` 逐单元格 `measure_text(content, None)` 定列宽 + 行 / 列 / 溢出 / 测量字符上限（文件头常量段） |
+| `tests.rs`（1943） | 测试 harness（`mount` / `style` / `texts` / `tree_of` / `children` / `node_count` / `bounds` / `cell_widths` / `measured_width` 等）+ 子模块声明（测试根文件用自命名 `tests.rs` 而不是 `tests/mod.rs`，理由见 markdown 设计文档 §6.1） |
+| `tests/`（3,158） | `corpus` 1,008 / `gates` 406 / `ledger` 528 / `outline` 355 / `plain` 125 / `fixtures` 2 + 冻结夹具 `i18n_markdown` 387 / `legacy_plain_text` 347 |
+
+**spacer 的 flex 收缩（R3 已修复，不再是已知问题）**：spacer 节点（`MARKDOWN_SPACER`，每源码空行 1 个，`build.rs` 的
+`emit_blank_spacers`）除 `width_full + height(正文字行高)` 外**显式写 `flex_shrink = 0`**（`style.flex_shrink(0.0)`），
+`flex_grow` 保持 taffy 默认 0——R2 时它走默认 `shrink = 1`，父容器高度受限时会被压缩，R3 已修。证据：
+`tests/gates.rs::the_blank_line_spacer_is_flex_fixed_at_one_line_height` 与门禁 3
+（`gate_three_the_release_notes_stay_inside_the_node_budget`）都断言 `declared.flex_shrink == 0.0 && declared.flex_grow == 0.0`、
+高度 == `body_size × 1.4`；默认 800×600 根下 release notes 的 34 个 spacer 各 19.6px、节点总数 70。
 
 ### 12.2 主题基座（`theme/`）
 
@@ -3727,7 +3822,7 @@ impl App {
 | `interactive` / `button` / `toggle` / `badge` / `progress` / `spinner` / `separator` / `empty_state` / `alert` / `tab_bar` | 状态（hover/pressed/focus/disabled/loading/selected）→ `StylePatch` + `A11yPatch`；150 ms hover 用 `Transient` + `App::animate`（不进依赖图） |
 | `list` / `table` / `tree` / `deque_*` / `scroll_bar` | 虚拟化行窗口 + E3 变高；行/单元格/树项**声明**集合角色（E9/E15 语义，§11.11/§11.15） |
 | `overlay` / `layer` / `tooltip` / `dialog` / `alert` / `menu` / `dropdown` / `select` / `context_menu` / `color_picker` | `Overlay` 栈 + 固定 z 层带（`View < Dialog < Alert < Popup < ContextMenu < Tooltip`）+ `Layer` 按窗口分区；`OverlaySurface::{dialog,menu}` 统一表面（双层阴影按旧值回填，E13 真实接入）；模态走 `trap_focus` + `restore_focus`（E12） |
-| `markdown` / `input` | markdown 5 文件（`document`/`source`/`parse`/`inline_flow`/`view`），块容器递归上限 `MAX_BLOCK_NESTING = 64`（旧 comrak 1000 层引用会栈溢出 abort）；`input` 是应用层编辑状态机（IME / 水平滚动 / undo·redo / 拖选 / 双击选词），**不是**引擎能力 |
+| `markdown` / `input` | markdown = `kit/markdown.rs`（公开面）+ 7 个子模块 + 自命名测试根 `tests.rs` + `tests/`（布局 / 职责 / 行数见 §12.1.1），pulldown-cmark 单遍事件→节点树（无持久 IR）。上限：块容器 `MAX_BLOCK_NESTING = 64`、行内 marks `MAX_INLINE_NESTING = 64`、表格 `MAX_TABLE_ROWS = 200` / `MAX_TABLE_COLUMNS = 20` / 溢出段 `MAX_TABLE_OVERFLOW_ROWS = 100` / 列宽测量只取单元格前 1024 字符、HTML 嵌套解析 `MAX_HTML_NESTED_PARSES = 16` / 内层字节 `MAX_HTML_INNER_BYTES = 64 KB`、HTML 配对三上限（单块标签 4096 / 单块 payload 256 KB / 每文档参与配对的标签总数 16384）。超限一律**保留文字**降级：块容器进抑制模式（不建节点、文本压进最深允许容器内的扁平 text 节点）、表格超出部分转纯文本段落、HTML 预算超限退化为纯文本段落 / 去标签保文字；只有 type 1–5 HTML 块与行内深嵌套是**有意的丢弃契约**（细则见 `crates/ui_kit/design/markdown-redesign-design.md` §5.8 / §5.9 / §10.1）。`input` 是应用层编辑状态机（IME / 水平滚动 / undo·redo / 拖选 / 双击选词），**不是**引擎能力 |
 
 **`AnimationRouter`（唯一动画完成注册者，硬契约）**：引擎 `App::on_animation_complete` 是**单槽**（后注册覆盖）；kit 的
 `kit/overlay.rs` 里的 `AnimationRouter`（`Rc<RefCell<…>>`，`Clone + Default`）是**应用层唯一**注册者——`install(app)` 幂等装一次，
@@ -4424,7 +4519,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 `common.market_not_loaded` 的 `<p align>` / `<kbd>` / 行内 logo，以及 `widget.news.logged_out` 这类 widget 自己的
 `<p align="center">` 文案都算）经 `kit::markdown` 的 `MarkdownNode` 画成节点树，不得把 markdown/HTML 源码当纯文本画；
 纯文本 notice 仍由 `kit::empty_state` 画一句。行内图片（市场 logo / `bank` 图标）在资产批接入前由
-`PlaceholderImagePaint` 画成**占位色块**（R-4，不影响文字 / `<kbd>` / 粗体）。
+`InlineBoxPaint::Quad` 画成**占位色块**（R-4，不影响文字 / `<kbd>` / 粗体）。
 
 ### 13.7 FrameRouter 与 I3
 
@@ -4542,7 +4637,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-1 | `WidgetServices::{market_participants, kytrix_service}` 为 `Option` | 两者都是 application-shell 对象，契约层测试无法在零工具包上下文构造（P3 时点两个 crate 仍依赖 `gpui-kit`）。**P4-5 已补 gpui-free 缝**：`KytrixServiceConnector::spawn(runtime, network, transport)`（+ `test-support` 的 `spawn_signed_out`）、`MarketParticipantsConnectorInput::new(transport, ConfigNotification<…>).with_runtime(Runtime::from_handle(handle))`，P5-1 后统一收 `tokio::runtime::Handle`；组合根恒给 `Some`。**`Option` 形状保留**（headless 需要「没有这个协作者」的缺席语义，P6-1 验收构建亦用 signed-out 构造器）；读市场的 widget 在 `None` 时映射为业务 notice/failure，读服务的 widget 映射为业务 failure。**已关闭**（原「需裁决」项由 P4-5 落地） |
 | R-2 | `WidgetServices` 形状相对 P3-0 变更 | `config: ConfigManager` → `Signal<Config>`（P3-0 R4 已预告）；新增 `theme`（P3-1）、`kytrix_service`/`open_url`/`sound`/`reduce_motion`（P3-1b）与 `catalog_generation`（P3-1c）；见 design-changes。P3-0 的 5 字段不复存在 |
 | R-3 | 正文一次建树 | 引擎无 `.cached()`；widget 若按帧重建 body 会破坏节点身份/依赖边。20 crate 迁移时以此为准。`WidgetView::sync` 里才「有内容」的 body 晚一帧出现（framework 在 sync 前采样 `has_content`），widget 自行 `request_frame` |
-| R-4 | notice 的 markdown 文案 | **P3-1b/P3-1d 已收口**：`Notice::is_markdown(&Translate)` 对**解析后的目录值**判定（HTML 标签 / markdown 链接、图片 / 强调 / 行内代码），任意文案来源（`MarketNotLoaded` 与 `Message` 皆可）命中即由 `kit::markdown` 的 `MarkdownNode` 画成节点树（段落对齐 / `<kbd>` / 行内 logo 是 inline box），纯文本 notice 仍由 `kit::empty_state` 画一句。**残余（P3-1c 裁决，P6 后仍在）**：行内图片的绘制是占位色块（`PlaceholderImagePaint`）——富文本图片的 `ResourceCache` 通路未接，归 **P6 后资产批 backlog（§14.6）**，不影响文字与 kbd 的正确呈现；**W1 与 P6 真窗口验收均不据此判缺陷** |
+| R-4 | notice 的 markdown 文案 | **P3-1b/P3-1d 判定口径不变**：`Notice::is_markdown(&Translate)` 对**解析后的目录值**判定（HTML 标签 / markdown 链接、图片 / 强调 / 行内代码），任意文案来源（`MarketNotLoaded` 与 `Message` 皆可）命中即由 `kit::markdown` 的 `MarkdownNode` 画成节点树（段落对齐 / `<kbd>` / 行内 logo 是 inline box），纯文本 notice 仍由 `kit::empty_state` 画一句。**行内图片（R2 后的真实通路）**：markdown 把 `file:` 图片统一成 `InlineBoxSpec { size, baseline: None, align: InlineAlign::Baseline, paint: Some(InlineBoxPaint::Quad { color: image_placeholder, corner_radius: [px(2.0); 4] }) }`，尺寸取 `assets.rs::InlineImageSource`（显式 `?size` > 内禀尺寸 > 16×16 回退，1..256 clamp）——引擎仍只画**占位色块**；非 `file:` / 无尺寸来源回退 **alt 文本**（无 alt 不产节点）。**残余（P3-1c 裁决，P6 后仍在）**：`InlineBoxPaint::Image` 的 `ResourceCache` 通路组件未接（引擎能力见 §11.2 第 7 条），归 **P6 后资产批 backlog（§14.6）**，不影响文字与 kbd 的正确呈现；**W1 与 P6 真窗口验收均不据此判缺陷**。旧类型 `ImagePaintSource` / `PlaceholderImagePaint` / `InvisibleImages` 已随 R2 删除（全仓 0 命中），不得再引用 |
 | R-5 | `AnyWidget` 内部唯一 downcast | 类型擦除在 vtable 单态化函数内部完成，公开面无 downcast/trait object；安全由 mount 时同一 `W` 填充保证 |
 | R-6 | a11y 角色 | 引擎 `A11yRole` 无 `Alert`；banner 用 `GenericContainer` + `A11yLive::Assertive` 表达告警语义 |
 | R-7 | P3-1b 对 P3-1 冻结面的增量 | 相对 `2e4d3d6` 的必须变更（W1 开工前收口）：`WidgetCx::config` → `config_ref`（不克隆；`Arc<Config>` 出口删除）、新增 `account`/`window_mut`/`set_canvas`；`WidgetServices` 6 → 10 字段；`Notice::is_markdown`；`FrameRouter::new/install` → `Result`；引擎新增 `App::frame_hook_installed` 与 `EngineError::FrameHookInstalled`；`WidgetTestApp` 新增 `with_translate`/`try_mount`/`tree`/`a11y_hidden` 等并删除假 `recovery_action`。P3-1b 之前没有下游代码（W 批未开工），故不构成迁移负担，登记于 design-changes §13 |
@@ -4779,7 +4874,7 @@ kytrix（外壳）         widget_gallery_ui        market_participants_ui / pro
    走 `GeometryPipeline::Ui`（coverage = −1，硬边），无 AA feather；需引擎侧 coverage/AA 通道（新引擎扩展，未编号）。
 3. **E22 双向滚动容器**：`grid` 横向滚动 + 内容居中未实现，当前是单轴降级（窄面板换行、无横滚）；规格草稿
    `.docs/gui-migration/spec-deltas/E22.md`（**已登记、未实现**）。
-4. **富文本行内图片**：`PlaceholderImagePaint` 占位色块，`ResourceCache` 通路未接（§13.9 R-4 残余，归资产批）。
+4. **富文本行内图片**：`InlineBoxPaint::Quad` 占位色块（markdown 侧尺寸取 `assets.rs` 内禀尺寸 / 16×16 回退），引擎的 `InlineBoxPaint::Image` / `ResourceCache` 通路未接（§13.9 R-4 残余，归资产批）。
 5. **`P3-1i` 残余**：`RequestId` + `Pending` 归因是冻结写法，20 widget 已按此实现；但 `call_with_timeout` 入口在 widget 侧无消费方、
    跨 crate 的归因对账未做（**未验证**，见 §13.12 与 `ledger.md`）。
 6. **§11.8 已接受残余**：R-11 wrap、R-12 图片 tile 判活、R-13 DPI 矩阵、R-14 Win11 Snap Layouts `HTMAXBUTTON`、R-15 Windows 全屏、
