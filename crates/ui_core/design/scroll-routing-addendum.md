@@ -621,9 +621,22 @@ vec![
 
 | 任务 | 产出 | 验收 |
 |---|---|---|
-| P4-6 a11y 轴过滤 | `a11y_scroll_target` 按动作轴过滤（表头单元格经代理落到 List viewport）；Table 双轴断言 | K20、E32/E32b 扩用例 |
-| P4-7 变异自检 | 移除 45° 分支；`<45` 改 `<=45`；`project(delta, applied)` 参数反转；**`request_px` 去掉取负/改成 `Goal = offset - requested`**；候选换算改成全局常量；sticky 写去掉/取反；行 `min_width` 去掉；rail 尾隙去掉；bar 代理移除 | E34a/E34m/E35/E36/K12/K13/K15/K16/K21 红 |
-| P4-8 文档 | 主计划书附录 E + 冲突标注；本文件回写 `custom-gui-engine-design.md` E22/§8.4 | 引用行号复核 |
+| P4-6 a11y 轴过滤 | `a11y_scroll_target(tree, node, axis: Option<ScrollAxes>)`：集合根提升优先，随后 `scroll_candidates` 第一个包含 axis 的容器；`None`=任意轴（IntoView/SetOffset/action_allowed）；**self/lifted 分支也按 axis 匹配；候选需 `is_effectively_visible && is_effectively_interactive`；动作能力表按 `ScrollAxes` + 该轴 `max_offset > 0` 过滤（单轴容器只宣告本轴动作；宽视口 Table/Both `x_max == 0` 不宣告 Left/Right）**；Table 双轴/代理断言 | **完成**：E18/E32/E32b 绿；K20（Table 双轴 a11y）不回归；E32 改名并扩横向 `Item` 步长 |
+| P4-7 变异自检 | 45° 严格边界、投影参数、代理优先、键盘轴过滤、a11y 轴过滤、a11y 动作能力过滤、target 轴/可见性 | **完成**：M1–M7 逐项 RED→SHA256 还原→GREEN（见下）；P3-7 其余变异项（sticky 写/min_width/rail 尾隙/bar 代理）已在 P3 门禁完成，P4 未重复 |
+| P4-8 文档 | 主计划书附录 E + 冲突标注；本文件回写 `custom-gui-engine-design.md` E22/§8.4；`kit-gallery.md` | **完成**：主设计 §4.8/§7.1/§6 P4/附录 D；E22 状态/API/§8.4；kit-gallery 16 分区 + G1–G9；新增 `E22.md`；行号已按 P4 源码更新 |
+
+> **P4 收口实测（2026-11-26，最终）**：`ui_core` lib **2757 passed / 1 ignored**（P3 2744/1 ⇒ **+13**；本复审轮新增 9 条：a11y 动作轴/溢出过滤、lifted/self 轴匹配、键盘边界/hidden）、`ui_kit` lib **797 passed / 0 ignored**；`--ignored` 仅既有 dark-mode + `gui_smoke`；`gallery --wheel-check` PASS（G1–G9 **37 断言**）、`--idle-check` 0 帧、`--probe` exit 0；`cargo test/clippy --workspace/fmt/check` 全 PASS。证据：`E:\kytrix-scratch\scroll-impl\P4\README.txt`。
+>
+> **P4-7 七条变异结果**（脚本 `P4/mutate.ps1`；每项记录 HEAD/CMD/SHA256 BEFORE→RESTORED/MATCH/RED→GREEN）：
+> | # | 变异 | 红证据 | 还原 |
+> |---|---|---|---|
+> | M1 | `angle < 45.0` → `angle <= 45.0` | E34d 精确 45° 用例红（走投影而非整段吞掉） | SHA256 MATCH，GREEN |
+> | M2 | `project_vector(requested, applied)` → `(applied, requested)` | E34i >45° 投影断言红 | SHA256 MATCH，GREEN |
+> | M3 | `scroll_candidates` 代理优先移除 | 11 条红（候选链/代理回落/键盘+滚轮代理） | SHA256 MATCH，GREEN |
+> | M4 | `default_key_scroll` 回退旧“最近滚动祖先” | E17/E17b/E33 三条键盘用例红 | SHA256 MATCH，GREEN |
+> | M5 | `a11y_scroll_target` 轴过滤短路 | E32b 红 | SHA256 MATCH，GREEN |
+> | M6 | a11y 动作能力过滤移除（不按 `ScrollAxes`/`max_offset` 过滤） | E18 组红（单轴/宽视口宣告错误） | SHA256 MATCH，GREEN |
+> | M7 | target 轴/可见性过滤移除（self/lifted 不判 axis，候选不判 visible/interactive） | E18/E32b 组红（隐藏/无轴目标被选中） | SHA256 MATCH，GREEN |
 
 ---
 

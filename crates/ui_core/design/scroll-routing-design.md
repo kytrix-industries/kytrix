@@ -102,7 +102,7 @@
 | D | 连续滚动中指针跨容器 | 目标不变 | 代码：每事件重新 `hit_at` + 重建 chain（`input.rs:584-627`） | **缺陷**：无序列锁定 |
 | E | 滚动后指针下内容变化 | hover/tooltip/滚动条状态更新 | `revalidate_hover` 只在模态浮层创建（`app/overlay.rs:60`）与置顶（`:153`）调用；它只按已有 hover 节点重过滤模态作用域，`scroll_to`/关闭都不按指针重新命中 | **缺陷**（D5 纳入） |
 | F | 行滚轮手感 | 立即 3 行 | 120 ms 动画（`input.rs:605`、`639-646`） | **按 D3/裁决 C 需改**：行滚轮立即；滚动动画能力删除 |
-| G | 双轴容器（宽表格/大图） | 横竖都能滚 | `ScrollSlot` 单轴，非本轴恒 0（`interaction/scroll.rs:15-32`）；设计文档登记 E22 未实现（`design/custom-gui-engine-design.md:4780-4781`） | **按 D4 本批实现** |
+| G | 双轴容器（宽表格/大图） | 横竖都能滚 | `ScrollSlot` 单轴，非本轴恒 0（`interaction/scroll.rs:15-32`）；**E22 已实现（P4 回填）**：双轴 + Table 横向 + gallery ⑦/⑩，见 `custom-gui-engine-design.md` §8.4 与 `spec-deltas/E22.md` | **按 D4 本批实现** |
 
 **缺陷 B 的结构性根因**（`codebase-survey.md` §6）：
 
@@ -333,8 +333,8 @@ scroll_candidates(from):
 | 来源 | 起点 | 选择规则 |
 |---|---|---|
 | 滚轮 | 命中节点（`hit_at(position)`） | 候选链 → 第一个“能消费”的容器 → 闩锁 |
-| 键盘 | 焦点节点 | 候选链 → 第一个“对应轴可移动”的容器；不链式、不到边界回退（保持现状语义） |
-| a11y | 目标节点 | 候选链 → 第一个容器；保留 `a11y_scroll_target` 的集合根提升钩子 |
+| 键盘 | 焦点节点 | 候选链 → 过滤 visible/interactive → 按 key 取第一个包含对应轴的容器（Page/Home/End 两段轴偏好）；选中后不链式、不到边界回退（P4-1） |
+| a11y | 目标节点 | 候选链 → 第一个包含 `axis: Option<ScrollAxes>` 的容器（集合根提升最优先；`None`=任意轴，P4-6） |
 | 显式 | `ScrollHandle` | 直接使用（滚动条拖拽、程序化） |
 
 **“能消费”判定**（`can_consume`）
@@ -459,7 +459,7 @@ apply_to_target(target, raw, unit):
   - `adapter.rs:660-668` 改为：显式 `record.orientation` 优先，否则仅当 `scroll.orientation` 为 `Some` 时设置；Both 不自动设置。
 - `a11y/tree.rs:515` 的 `vertical` 推导删除，改由上述 `orientation` 表达。
 - a11y 滚动动作的步长：`a11y/action.rs:455-458` 目前**所有动作**都用 `viewport.size.height`（横向动作也用 height，是既有缺陷）；本批修正为：`ScrollUp/ScrollDown/PageUp/PageDown` → `viewport.height`，`ScrollLeft/ScrollRight` → `viewport.width`，`ScrollByItem` → `line_height`。补 E32 断言。
-- a11y 目标解析按动作轴过滤：`a11y_scroll_target(tree, node, axis)` 返回候选链中第一个 `axes` 包含该轴的容器；`ScrollDown` 在“横向内层 + 纵向页面”中落到外层（与滚轮 E13 一致）。补 E32b。
+- a11y 目标解析按动作轴过滤：`a11y_scroll_target(tree, node, axis: Option<ScrollAxes>)` 返回候选链中第一个 `axes` 包含该轴的容器（`None`=任意轴）；**self/lifted 分支也必须轴匹配；候选需 `is_effectively_visible`/`is_effectively_interactive`**。`ScrollDown` 在“横向内层 + 纵向页面”中落到外层（与滚轮 E13 一致）。补 E32b。
 
 ### 4.7 滚动代理（D2）
 
@@ -494,11 +494,18 @@ impl App {
 | 来源 | 现有实现 | 目标实现 |
 |---|---|---|
 | 滚轮 | `on_scroll` 内联父链 | `interaction/scroll.rs` 的 `scroll_candidates` + `ScrollSession` + 序列闩锁 |
-| 键盘 | `default_key_scroll` 的 `scroll_ancestor` | 同一 `scroll_candidates(focused)`，取第一个对应轴可移动的容器；步进规则不变（方向键 1 行、Page 1 页、Home/End 两端） |
-| a11y | `a11y_scroll_target`（含集合根提升） | 保留集合根提升钩子；底层“找容器”改为 `scroll_candidates` 的第一个 |
+| 键盘 | `default_key_scroll` 的 `scroll_ancestor` | 同一 `scroll_candidates(focused)`（含代理链/visible/interactive 过滤）；按 key 选轴：`Left/Right → Horizontal`、`Up/Down → Vertical`、`PageUp/PageDown/Home/End` 为**两段轴偏好**（先第一个含 Vertical 的容器，链上无纵向容器才退第一个含 Horizontal 的容器）；步进规则不变（方向键 1 行、Page 1 页、Home/End 两端）；命中后只夹紧、不链式/不回退（P4-1） |
+| a11y | `a11y_scroll_target`（含集合根提升） | 保留集合根提升钩子（最优先）；签名改为 `a11y_scroll_target(tree, node, axis: Option<ScrollAxes>)`：`Some(Vertical/Horizontal)` 按动作轴过滤 `scroll_candidates`，`None` = 任意轴（`ScrollIntoView`/`SetScrollOffset` 沿用最近滚动祖先语义）；**self 与 lifted 分支也必须通过 `axis` 匹配**；候选需 **`is_effectively_visible && is_effectively_interactive`**；动作→轴映射：ScrollUp/Down→Vertical、ScrollLeft/Right→Horizontal，**动作能力表按 `ScrollAxes` + 该轴 `max_offset > 0` 过滤**（宽视口 Table/Both `x_max == 0` 不宣告 Left/Right），`scroll_container` 与 `mapping::action_allowed` 共用同一解析（P4-6/D-P4-6/D-P4-7） |
 | 滚动条拖拽 | 显式 `ScrollHandle` | 不变（显式来源，不经仲裁） |
 
 **键盘语义保持不变**：焦点容器到边界不链式、不回退；`bind_key` 仍优先于默认滚动（`input.rs:780-815`）。仅把“找容器”换成代理感知的共享解析器。
+
+**P4 实现落点（已收口）**：
+- 键盘 `default_key_scroll`（`app/input.rs:750`）：`scroll_candidates(focused)` → `is_effectively_visible && is_effectively_interactive` 过滤 → 两段轴偏好；焦点在 bar track/thumb 上时经 `NodeInteraction.scroll_proxy` 落到所属容器（thumb → track → 容器）。
+- a11y `a11y_scroll_target`（`a11y/tree.rs:808`）：集合根提升优先，随后候选链第一个“包含 axis”的容器；**`node` 自身是滚动容器（self）或命中 lifted 集合根时，同样要求 `slot.axes` 包含 `axis`**（`None` 不限制）；候选在进入 `axis` 判断前先过 `is_effectively_visible && is_effectively_interactive`。`axis=None` 供 `ScrollIntoView/SetScrollOffset` 与 `action_allowed` 使用。
+- a11y 动作能力表（`mapping::action_allowed` / `a11y/action.rs`）：**按容器的 `ScrollAxes` + 该轴 `max_offset > 0` 过滤滚动动作**——单轴容器只宣告/处理本轴动作（Vertical 容器不宣告 ScrollLeft/Right，Horizontal 容器不宣告 ScrollUp/Down），`Both` 两轴都宣告；**轴被启用但当前无滚动范围（如宽视口 Table `x_max == 0`）也不宣告该轴动作**；能力门禁与 `scroll_container` 用同一 `axis: Option<ScrollAxes>`，避免“能宣告但不能执行”。
+- `a11y/action.rs:429` 的 `scroll_container(app, window, node, axis)`：Left/Right→Horizontal，Up/Down（含 `ScrollByItem` data）→Vertical，IntoView/SetOffset→None；步长保持 P1 修正（Up/Down/Page 用 height、Left/Right 用 width、Item 用 line_height）。
+- 与旧实现的差异见附录 D-P4-1…D-P4-7；`scroll_ancestor`/`scroll_ancestors` 不再被键盘/a11y 目标解析使用，仅剩 `a11y/mapping.rs:297` 与 `text_edit.rs` 的结构性调用（§5.3）。
 
 ### 4.9 与滚动动画（已删除）、虚拟列表、绘制、hover 的关系
 
@@ -553,8 +560,9 @@ impl App {
 | `on_scroll` | 内联父链 + 逐祖先消费 | 委托 `interaction/scroll.rs` 的 `route_wheel`；保留入口的 modal scope 过滤与 SHIFT 换轴 |
 | `default_key_scroll` | `scroll_ancestor` 单轴 | 共享 `scroll_candidates`；步进语义不变 |
 | `a11y::A11yScroll` | `{ x, y, x_max, y_max, vertical: bool }` | `{ x, y, x_max, y_max, orientation: Option<A11yOrientation> }`；Both → `None`；`adapter.rs` 仅在 `Some` 时设置 |
-| `a11y_scroll_target` | 自身→集合根→最近祖先 | 保留集合根提升；容器查找复用 `scroll_candidates`，并按动作轴过滤 |
+| `a11y_scroll_target` | `fn(tree, node) -> Option<NodeId>`（自身→集合根→最近祖先） | `fn(tree, node, axis: Option<ScrollAxes>) -> Option<NodeId>`：集合根提升优先；**self/lifted 目标也须 `axes` 包含 `axis`**；随后 `scroll_candidates` 中第一个包含 `axis` 且 `is_effectively_visible && is_effectively_interactive` 的容器；`None`=任意轴（IntoView/SetOffset/action_allowed） |
 | `a11y/action.rs` 步长 | 所有动作 `viewport.height` | `ScrollUp/Down/Page*` 用 height；`ScrollLeft/Right` 用 width；`ScrollByItem` 用 line_height |
+| a11y 滚动动作能力表 | 单轴容器也宣告两轴滚动动作 | **按 `ScrollAxes` + 该轴 `max_offset > 0` 过滤**：单轴容器只宣告本轴动作、`Both` 宣告两轴；轴已启用但无滚动范围（宽视口 Table `x_max == 0`）不宣告该轴；`mapping::action_allowed` 与 `scroll_container` 共用 `axis: Option<ScrollAxes>`（D-P4-6） |
 | `ScrollBar` | `attach` 只记 `ScrollHandle`；`ScrollbarAxis::point` 清零另一轴 | `attach -> Result` 并设 track 代理；`release` 清理；`point(current, offset)` 只改本轴；`Table`/`Input` 见 §4.7 |
 | `Table` | `Geometry` 只存 outer/body/header_row | 增加 `header: Option<NodeId>`；attach 后设 header 代理 |
 | `App::scroll_to_animated` | 计划保留公共/`pub(crate)` 包装 | **删除（裁决 C：滚动动画能力移除）**；程序化滚动统一 `scroll_to`（立即），无替代动画 API |
@@ -569,7 +577,7 @@ impl App {
 - **已删除（P1）**：`scroll::scroll_ancestor_on`（原 `interaction/scroll.rs:63-70`）及其在 `text_edit.rs` 的调用；P4 不再处理该项。
 - **裁决 C 删除（滚动动画能力）**：`scroll_to_animated`（`app/scroll.rs:207-238`）、`AnimationTarget::Scroll`、`scroll_animation_target`（`app/animation.rs:15-29`）与 `App::scroll_animation_target` 包装（`app.rs:1005-1007`）全部删除；程序化滚动统一立即 `scroll_to`。
 - 旧断言测试（§2.4 明确列出）与相关测试辅助。
-- **保留**：`scroll::scroll_ancestor` / `scroll_ancestors` 作为 text_edit/a11y 的结构性（非代理）助手保留——它们仍被 `text_edit.rs:3544/4132/4158` 与 `a11y/mapping.rs:297` 使用；本批只把滚轮/键盘/a11y 的“找滚动目标”迁移到 `scroll_candidates`，不强行删除底层遍历器。若 P4 后发现可统一再删。
+- **保留**：`scroll::scroll_ancestor` / `scroll_ancestors` 作为 text_edit/a11y 的结构性（非代理）助手保留——`text_edit.rs` 与 `a11y/mapping.rs:297` 仍使用；**P4 起键盘/a11y 目标解析已不再使用**（`app/input.rs`、`a11y/tree.rs`、`a11y/action.rs` 0 引用），仅保留结构性调用。若 P4 后发现可统一再删。
 
 ### 5.4 依赖与错误
 
@@ -684,11 +692,13 @@ impl App {
 
 | 任务 | 产出 | 验收 |
 |---|---|---|
-| P4-1 键盘/a11y 统一 | 共享 `scroll_candidates`（按动作轴过滤）；键盘语义不变；`a11y/action.rs` 横向步长改 width | E17/E18/E32/E32b/E33 绿；既有键盘/树/a11y 用例全绿 |
-| P4-2 删除遗留 | 单轴枚举、`scroll_animation_target` + `App` 包装、**`AnimationTarget::Scroll`、`scroll_to_animated`（裁决 C）**、`is_continuous`、旧链式、过时测试（`scroll_ancestor_on` **已在 P1 删除，P4 不再检查**） | 限定 `rg 'interaction::ScrollAxis'` 无残留（排除 Wayland 同名枚举）；`rg 'scroll_ancestor_on|scroll_to_animated|AnimationTarget::Scroll'` 仅允许历史文档；编译零 warning |
-| P4-3 文档回写 | 本文件状态/偏差；`custom-gui-engine-design.md` §1.3 API + §8.4 滚动段 + E22 状态（`:140/:4780/:5013`）；`.docs/.../kit-gallery.md` | 文档引用源码行号核对；E22.md 缺失引用修复或创建 |
-| P4-4 三端验证 | Windows 125%（必须）；macOS/Linux（可用则跑） | §10 清单；证据归档 |
-| P4-5 变异自检 | 恢复关键旧代码 → 对应用例红；还原 → 绿（含代理环、End→Momentum、ScrollbarAxis::point） | 变异日志 |
+| P4-1 键盘/a11y 统一 | 共享 `scroll_candidates`（代理链 + visible/interactive + 按动作轴过滤）；键盘两段轴偏好；`a11y/action.rs` 横向步长 width（P1 已修，P4 扩 Item 断言） | **完成**：E17/E17b/E18/E32/E32b/E33 绿（实测测试名见 §7.1）；既有键盘/树/a11y 用例全绿 |
+| P4-2 删除遗留 | 单轴枚举、`scroll_animation_target` + `App` 包装、**`AnimationTarget::Scroll`、`scroll_to_animated`（裁决 C）**、`is_continuous`、旧链式、过时测试（`scroll_ancestor_on` **已在 P1 删除，P4 不再检查**） | **完成**：`git grep` 等价 `rg` 残留全 0（`interaction::ScrollAxis` / `scroll_ancestor_on` / `scroll_to_animated` / `AnimationTarget::Scroll` / `scroll_animation_target` / `is_continuous` / `cancel_scroll_animation` / `lerp_point`；Wayland 私有同名枚举排除）；编译零 warning |
+| P4-3 文档回写 | 本文件状态/偏差；`custom-gui-engine-design.md` §1.3 API + §8.4 滚动段 + E22 状态（`:140/:4780/:5013`）；`.docs/.../kit-gallery.md`；E22 spec-delta | **完成**：本文件 §4.8/§7.1/§6 P4/附录 D + addendum §5；`custom-gui-engine-design.md` E22/§1.3/§8.4；`kit-gallery.md` 16 分区；新增 `spec-deltas/E22.md` |
+| P4-4 三端验证 | Windows 125%（必须）；macOS/Linux（可用则跑） | **Windows 125% 已跑**（cargo/gallery 全部门禁实跑）；**macOS/Wayland 未跑**（环境不可用，非代码门禁，**不构成三端闭环**）；**人工 M1–M6 未执行**——由 gallery 真实窗口自动断言（G1–G9/37 断言）替代，但**不计为已验收**，保留发布前人工清单（§7.3） |
+| P4-5 变异自检 | 恢复关键旧代码 → 对应用例红；还原 → 绿（含代理环、End→Momentum、ScrollbarAxis::point） | **完成**：M1 45° 严格边界、M2 投影参数反转、M3 代理优先移除、M4 键盘轴过滤移除、M5 a11y 轴过滤移除、**M6 a11y 动作能力过滤移除、M7 target 轴/可见性过滤移除**；逐项 RED→RESTORE SHA256 MATCH→GREEN（`P4/mutation-M*.log` / `P4/README.txt`） |
+
+> **P4 收口实测（2026-11-26，最终；HEAD `bbe29007` + 本轮工作区）**：`ui_core` lib **2757 passed / 1 ignored**（P3 2744/1 ⇒ **+13**；本复审轮新增 9 条：a11y 动作轴/溢出过滤、lifted/self 轴匹配、键盘边界/hidden）、`ui_kit` lib **797 passed / 0 ignored**；`--ignored` 仅既有 dark-mode + `gui_smoke` 2 条；gallery `--wheel-check` PASS（G1–G9 **37 断言**）、`--idle-check` 0 帧、`--probe` exit 0；`cargo test/clippy --workspace/fmt/check` 全 PASS。证据：`E:\kytrix-scratch\scroll-impl\P4\`（`README.txt`/`test.log`/`gates.txt`/`wheel.log`/`residuals.log`/`mutation-*`）。
 
 **依赖**：P2/P3。**门禁**：`cargo test --workspace`、`clippy -D warnings`、`fmt`、gallery 三模式（`--wheel-check`/`--idle-check`/`--probe`）。
 
@@ -725,8 +735,9 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 | E14 | `dual_axis_container_consumes_both_axes` | dx、dy 都变 | **红**（新能力） |
 | E15 | `dual_axis_clamps_each_axis_independently` | 一轴到边界不影响另一轴；**从非零 x/y 只滚一轴时另一轴保持** | **红** |
 | E16 | `disabled_axis_stays_zero` | content 再大也不动 | **红** |
-| E17 | `keyboard_scrolls_focused_container_through_proxy` | 焦点在 bar 上 → 滚容器（P4） | **红** |
-| E18 | `a11y_scroll_actions_follow_axes_and_proxy` | 双轴/代理目标正确（P4） | **红** |
+| E17 | `keyboard_scrolls_focused_container_through_proxy` | 焦点在 bar 上 → 滚容器（P4-1） | 绿（P4；track/thumb 两种焦点） |
+| E17b | `keyboard_page_falls_through_horizontal_inner_to_vertical_page` | 横向内层 + 纵向页面：PageDown 落页面；ArrowRight 仍由内层消费（P4-1 守卫） | 绿（P4） |
+| E18 | `a11y_scroll_actions_follow_axes_and_proxy` | 双轴/代理目标正确；**单轴容器只宣告本轴动作；轴已启用但 `max_offset == 0`（宽视口 Table/Both）不宣告 Left/Right；self/lifted 目标轴匹配；候选有效可见/可交互**（P4-6/D-P4-6/D-P4-7） | 绿（P4；Both 容器 + 代理节点） |
 | E19 | `wheel_scroll_refreshes_hover_under_pointer` | hover 节点随滚动更新 | **红** |
 | E20 | `wheel_without_movement_requests_no_frame` | 不唤醒/不出帧 | 绿（守卫，新代码不得破坏） |
 | E21 | `wheel_outside_modal_scope_is_dropped` | 模态外不滚 | 绿（守卫） |
@@ -738,9 +749,9 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 | E29 | `wheel_hover_refresh_skipped_during_pointer_capture` | 捕获期间不打断 hover；释放后恢复 | **红** |
 | E30 | `scroll_sequences_are_isolated_per_window` | 两个窗口各自闩锁互不影响 | **红** |
 | E31 | ~~`scroll_animation_is_cancelled_by_new_wheel_sequence`~~ | **已删除（裁决 C：滚动动画能力删除）**；P2 同步删除程序化动画取消用例，不再验收 | 删除 |
-| E32 | `a11y_horizontal_steps_use_viewport_width` | ScrollLeft/Right 用 width；Both 不自动 orientation | **红** |
-| E32b | `a11y_scroll_down_falls_through_horizontal_inner` | 横向内层 + 纵向页面：ScrollDown 落到外层（与 E13 一致） | **红** |
-| E33 | `keyboard_both_axis_mapping_and_bar_focus_proxy` | Both 容器 Page/Home 轴映射；bar 焦点代理 | **红** |
+| E32 | `a11y_horizontal_steps_use_viewport_width`（旧名 `horizontal_scroll_actions_step_by_the_viewport_width`） | ScrollLeft/Right 用 width；Both 不自动 orientation；横向 `ScrollUnit::Item` = line_height（P4-6 扩断言） | 绿（P4） |
+| E32b | `a11y_scroll_down_falls_through_horizontal_inner` | 横向内层 + 纵向页面：ScrollDown 落到外层（与 E13 一致）；ScrollRight 落内层；**lifted/self 目标也按动作轴匹配、候选有效可见/可交互**（P4-6/D-P4-7） | 绿（P4） |
+| E33 | `keyboard_both_axis_mapping_and_bar_focus_proxy` | Both 容器 Page/Home 轴映射；bar 焦点代理（P4-1） | 绿（P4） |
 
 > P0 实测口径（2026-11-26，证据见附录 A 的 P0 基线路径）：默认 `cargo test` 门禁绿；红测先行并以 `#[ignore]` 隔离，`--ignored` 复现红，P2 转绿。E2/E4/E5/E6 为已 `#[ignore]` 的红测；E7 旧实现已满足（守卫）；E12 旧断言当前绿、P2 改写为单赢家后转红；E5 覆盖 D1+D3 组合（第一段同序列外层 0，第二段 >IDLE 外层立即 48）。
 
@@ -795,6 +806,8 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 | M7 | macOS / Wayland（可用则跑） | 触控板双指滚动、相位 Begin/Update/End | 序列锁定、到边界不中途换目标；像素滚动立即 |
 | M8 | 全部 | `--idle-check` | PASS（滚动条静止不出帧） |
 
+> **P4 收口口径**：M1–M6/M8 的**进程内**等价检查由 gallery `--wheel-check`（G1–G9 **37 断言**）与 `--idle-check`（0 帧）覆盖并 PASS；但**人工 M1–M6 未执行**，自动断言替代**不计为已验收**，保留发布前人工清单。**Windows 125% 已跑**；**macOS/Wayland 未跑**（环境不可用，非代码门禁），因此**不构成三端闭环**；§7.3 的 M7（触控板相位）待有环境补跑。
+
 ### 7.4 变异自检（必须）
 
 | 变异 | 预期红 |
@@ -810,6 +823,8 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 | 移除滚动后 hover 刷新 | E19/G4 |
 | 移除 target 有效性检查 | E9/E9b |
 | 代理目标不做可见/禁用过滤 | K10 |
+
+> **P4-5 实跑结果（7 条，`P4/mutation-M*.log` + `P4/README.txt`）**：M1 `<45`→`<=45` ⇒ E34d 红；M2 `project_vector` 参数反转 ⇒ E34i 红；M3 代理优先移除 ⇒ 11 条红（候选链/代理回落/键盘/滚轮）；M4 键盘回退旧 `scroll_ancestor` ⇒ E17/E17b/E33 红；M5 a11y 轴过滤短路 ⇒ E32b 红；**M6 a11y 动作能力过滤移除 ⇒ E18 组红；M7 target 轴/可见性过滤移除 ⇒ E18/E32b 组红**。每项均 RED → SHA256 还原 MATCH → GREEN。P3-7 的 sticky/min_width/rail/bar 代理变异已在 P3 门禁完成，P4 未重复。
 
 记录方式：变异 → `cargo test` 红 → 还原 → 绿；日志与 SHA256/命令归档到 `.review/`（本机 gitignored）或本次证据目录。
 
@@ -1013,11 +1028,17 @@ cargo run -p ui_kit --example gallery -- --probe
 - 证据审查：READY-WITH-FIXES → H1–H4/M1–M6/L1–L5 已按报告逐条更正（外部对比表、引用行号、A/C 证据分离、`AnimationTarget::Scroll` 措辞），无剩余 BLOCKER/HIGH。
 - 剩余开放问题见 §9.2（O1–O10），需用户终审裁决；未裁决前不进入实施。复审原始报告追加在 `E:\kytrix-scratch\research\review-{architecture,repo,evidence}.md`。
 
-## 附录 D：实施偏差登记（模板）
+## 附录 D：实施偏差登记
 
 | 编号 | 阶段 | 计划 | 实际 | 原因 | 影响 | 证据 |
 |---|---|---|---|---|---|---|
-|  |  |  |  |  |  |  |
+| D-P4-1 | P4 | 键盘 `PageUp/PageDown/Home/End` “取第一个对应轴容器” | 实现为**两段轴偏好**：先第一个含 Vertical 的容器（Both 走纵轴），链上无纵向容器才退第一个含 Horizontal 的容器 | 支持“横向内层 + 纵向页面”的 Page 回落，同时保留纯 Horizontal 用 Horizontal | Page/Home/End 在混合链上落点更符合预期；箭头键仍单轴 | P4/README.txt P4-1；E33/E17b |
+| D-P4-2 | P4 | `a11y_scroll_target` 轴过滤签名未定 | 实际签名为 `a11y_scroll_target(tree, node, axis: Option<ScrollAxes>)`；`None`=任意轴 | `ScrollIntoView`/`SetScrollOffset` 保持“最近滚动祖先”语义，`Some` 才按动作轴过滤 | a11y 动作映射与能力门禁共用同一解析；行为不变 | P4/README.txt P4-6；E18/E32b |
+| D-P4-3 | P4 | E32 名 `horizontal_scroll_actions_step_by_the_viewport_width` | 改名 `a11y_horizontal_steps_use_viewport_width`，并新增横向 `ScrollUnit::Item` = `line_height` 断言 | 与 a11y 命名一致并覆盖横向行步长 | 计数不变（既有用例扩断言） | P4/README.txt A1/P4-6 |
+| D-P4-4 | P4 | 键盘候选过滤未明确 | 候选新增 `is_effectively_visible && is_effectively_interactive` 过滤 | 比旧 `scroll_ancestor` 更严格（隐藏祖先/禁用节点不参与） | 键盘目标选择与滚轮/a11y 一致 | P4/README.txt D-P4-4；E17/E33 |
+| D-P4-5 | P4 | 箭头键“最近滚动容器不含该轴”时的行为未定义 | 继续沿候选链向外找第一个包含该轴的容器（与“候选链第一个对应轴容器”一致）；**选中后到边界只夹紧、不链式/不回退** | 旧实现直接返回 `false`/不滚，横向内层场景方向键失效 | 横向内层 + 纵向页面方向键仍能在页面消费；边界语义不变 | P4/README.txt D-P4-5；E17b/E33 |
+| D-P4-6 | P4 | a11y 动作能力表未按容器轴/滚动范围区分 | **按 `ScrollAxes` + 该轴 `max_offset > 0` 过滤**：单轴容器只宣告/处理本轴滚动动作（Vertical 不宣告 ScrollLeft/Right，Horizontal 不宣告 ScrollUp/Down），`Both` 两轴都宣告；**轴已启用但无滚动范围（宽视口 Table/Both `x_max == 0`）不宣告 Left/Right**；`mapping::action_allowed` 与 `a11y/action.rs::scroll_container` 共用同一 `axis: Option<ScrollAxes>` | 旧实现单轴容器也宣告两轴动作，且 x_max=0 时仍宣告横向动作，出现“能宣告但不能执行” | 单轴/宽视口 Table 的 a11y 动作集与实际滚动能力一致 | P4 复审 B4；E18 |
+| D-P4-7 | P4 | `a11y_scroll_target` 只对候选链做轴过滤 | **self 与 lifted 分支也必须 `axes` 包含 `axis`**；候选统一先过 `is_effectively_visible && is_effectively_interactive` | 旧实现 self/lifted 直接返回，可能返回无该轴能力的节点或隐藏节点 | a11y 目标与滚轮/键盘同源过滤；E18/E32b 覆盖 | P4 复审；E18/E32b |
 
 ## 附录 E：实施补充入口
 

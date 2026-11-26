@@ -758,32 +758,41 @@ fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
     let Some(target) = app.windows.get(&window) else {
         return false;
     };
-    let Some((node, slot)) = scroll::scroll_ancestor(target.tree(), focused) else {
-        return false;
-    };
-    let axes = slot.axes;
-    let axis = match key {
-        Key::ArrowLeft | Key::ArrowRight if axes.horizontal() => ScrollAxes::Horizontal,
-        Key::ArrowUp | Key::ArrowDown if axes.vertical() => ScrollAxes::Vertical,
+    let tree = target.tree();
+    let requested: &[ScrollAxes] = match key {
+        Key::ArrowLeft | Key::ArrowRight => &[ScrollAxes::Horizontal],
+        Key::ArrowUp | Key::ArrowDown => &[ScrollAxes::Vertical],
         Key::PageUp | Key::PageDown | Key::Home | Key::End => {
-            if axes.vertical() {
-                ScrollAxes::Vertical
-            } else {
-                ScrollAxes::Horizontal
-            }
+            &[ScrollAxes::Vertical, ScrollAxes::Horizontal]
         }
         _ => return false,
     };
-    let viewport = scroll::viewport(target.tree(), node).size;
-    let max = scroll::max_offset(&slot, viewport);
-    let limit = match axis {
-        ScrollAxes::Horizontal => max.x,
-        ScrollAxes::Vertical | ScrollAxes::Both => max.y,
+    let candidates = scroll::scroll_candidates(tree, focused);
+    let mut selected = None;
+    for axis in requested {
+        let found = candidates.iter().copied().find_map(|candidate| {
+            let slot = tree.scroll_slot(candidate)?;
+            if !tree.is_effectively_visible(candidate)
+                || !tree.is_effectively_interactive(candidate)
+            {
+                return None;
+            }
+            slot.axes.supports(*axis).then_some((candidate, slot))
+        });
+        if let Some((node, slot)) = found {
+            selected = Some((node, slot, *axis));
+            break;
+        }
+    }
+    let Some((node, slot, axis)) = selected else {
+        return false;
     };
+    let viewport = scroll::viewport(tree, node).size;
+    let max = scroll::max_offset(&slot, viewport);
     let line = slot.line_height;
-    let page = match axis {
-        ScrollAxes::Horizontal => viewport.width,
-        ScrollAxes::Vertical | ScrollAxes::Both => viewport.height,
+    let (limit, page) = match axis {
+        ScrollAxes::Horizontal => (max.x, viewport.width),
+        _ => (max.y, viewport.height),
     };
     let goal = match (axis, key) {
         (ScrollAxes::Vertical, Key::ArrowUp) => Some(-line),
@@ -800,9 +809,10 @@ fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
         return false;
     };
     let handle = ScrollHandle::new(window, node);
-    let movement = match axis {
-        ScrollAxes::Horizontal => LogicalPoint::new(delta, LogicalPx::ZERO),
-        ScrollAxes::Vertical | ScrollAxes::Both => LogicalPoint::new(LogicalPx::ZERO, delta),
+    let movement = if axis == ScrollAxes::Horizontal {
+        LogicalPoint::new(delta, LogicalPx::ZERO)
+    } else {
+        LogicalPoint::new(LogicalPx::ZERO, delta)
     };
     app.scroll_by(&handle, movement).is_ok()
 }

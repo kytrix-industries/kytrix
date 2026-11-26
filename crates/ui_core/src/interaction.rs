@@ -169,6 +169,15 @@ impl ScrollAxes {
     pub const fn horizontal(self) -> bool {
         matches!(self, Self::Horizontal | Self::Both)
     }
+
+    #[must_use]
+    pub(crate) const fn supports(self, axis: Self) -> bool {
+        match axis {
+            Self::Vertical => self.vertical(),
+            Self::Horizontal => self.horizontal(),
+            Self::Both => matches!(self, Self::Both),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

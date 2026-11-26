@@ -1609,13 +1609,19 @@ mod tests {
         for action in [
             A11yAction::ScrollUp,
             A11yAction::ScrollDown,
-            A11yAction::ScrollLeft,
-            A11yAction::ScrollRight,
             A11yAction::ScrollIntoView,
+            A11yAction::SetScrollOffset,
         ] {
             assert!(
                 table_a11y.actions.contains(&action),
                 "Table 必须宣告 {action:?}（上提的滚动动作）"
+            );
+        }
+        for action in [A11yAction::ScrollLeft, A11yAction::ScrollRight] {
+            assert!(
+                !table_a11y.actions.contains(&action),
+                "x_max == 0 的宽表不得宣告 {action:?}：{:?}",
+                table_a11y.actions
             );
         }
         let header = a11y_of(&snapshot, header_row);
@@ -2523,6 +2529,46 @@ mod tests {
             vec![A11yRole::Table, A11yRole::GenericContainer],
             "滚动语义只上提到 Table 与行窗口，表头/单元格不得再出现滚动容器"
         );
+    }
+
+    #[test]
+    fn wide_table_does_not_advertise_horizontal_scroll_actions() {
+        let mut app = TestApp::new();
+        let table = table_with(
+            &mut app,
+            demo_columns(),
+            TableOptions::fixed(px(28.0)),
+            20,
+            text_cell,
+        );
+        mount_in(&mut app, &table, 1100.0, 240.0);
+        app.enable_a11y_capture();
+        let _ = app.drain().expect("frame");
+        let snapshot = app.a11y().expect("a11y snapshot").clone();
+        let table_node = table.outer_node().expect("table node");
+        let table_a11y = a11y_of(&snapshot, table_node);
+        let scroll = table_a11y.scroll.expect("Table 双轴滚动语义");
+        assert_eq!(scroll.x_max, px(0.0), "宽视口没有横向范围：{scroll:?}");
+        assert!(scroll.y_max > px(0.0), "表体仍有纵向范围：{scroll:?}");
+        for action in [
+            A11yAction::ScrollUp,
+            A11yAction::ScrollDown,
+            A11yAction::ScrollIntoView,
+            A11yAction::SetScrollOffset,
+        ] {
+            assert!(
+                table_a11y.actions.contains(&action),
+                "宽表仍必须宣告 {action:?}：{:?}",
+                table_a11y.actions
+            );
+        }
+        for action in [A11yAction::ScrollLeft, A11yAction::ScrollRight] {
+            assert!(
+                !table_a11y.actions.contains(&action),
+                "x_max == 0 的宽表不得宣告 {action:?}：{:?}",
+                table_a11y.actions
+            );
+        }
     }
 
     #[test]

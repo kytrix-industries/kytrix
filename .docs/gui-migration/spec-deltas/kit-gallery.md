@@ -9,7 +9,7 @@
 
 ## 1. 示例结构
 
-单文件、只依赖 `ui_core` + `base_ui::{kit, theme, style_builder}`；窗口 1200×800、系统标题栏、引擎 scroll 容器承载 15 个分区卡片（`flow flex_col`，内容总高 3854 逻辑像素）：
+单文件、只依赖 `ui_core` + `base_ui::{kit, theme, style_builder}`；窗口 1200×800、系统标题栏、引擎 scroll 容器承载 **16 个分区**卡片（`flow flex_col`；P2-5 时为 15 个，P3 在 ⑨ 后插入 ⑩ 宽表，旧 ⑩–⑮ 顺延为 ⑪–⑯）：
 
 | # | 分区 | 覆盖组件 / 能力 |
 |---|---|---|
@@ -19,21 +19,26 @@
 | ④ | 反馈 | `badge` 6 色、`progress`、`spinner`（静态，见 G6）、`separator`、`empty_state` |
 | ⑤ | 标签栏 | `tab_bar::TabBar`（Slide 指示条 / 关闭按钮 / 方向键） |
 | ⑥ | 列表 | `list::List` 等高 / 变高（`RowHeight::Variable` 实测回写）/ 双端 deque（push 按钮） |
-| ⑦ | 滚动条 | 独立 `scroll_bar::ScrollBar` + 引擎 `App::make_scroll`（20 行，拖拽 / 轨道点击） |
-| ⑧ | 表格 | `table::{Table, Column}`：固定/弹性列、跨列（`span(2)`）、可排序表头、`SelectionMode::Multi`、变高行 |
+| ⑦ | **双轴滚动演示** | `scroll_bar::ScrollBar` 垂直 + 水平两条 bar 代理同一 `App::make_scroll` 容器（20 行 × 宽内容；两轴可滚、拖拽 / track 滚轮 / 轨道点击）；**外层页面还有 hover 淡入的 overlay 滚动条**（页面可滚时出现） |
+| ⑧ | 表格 | `table::{Table, Column}`：固定/弹性列（`Column::flex(header, weight, min_width)` 三参数）、跨列（`span(2)`）、可排序表头、`SelectionMode::Multi`、变高行 |
 | ⑨ | 树 | `tree::{Tree, TreeItem}`：展开折叠 / 层级 / 方向键 / 单选 |
-| ⑩ | 输入框 | `input::{InputSpec, InputState, InputNode}`：单行 / 掩码 / 禁用 / 多行 + IME 提示 |
-| ⑪ | markdown | `markdown::{parse::parse_document, view::MarkdownView}`：富文本 / 代码 / 表格 / 引用 / 列表 / 行内图片占位 |
-| ⑫ | 浮层 | 独立 `overlay::Overlay`、`tooltip::Tooltip`、`dropdown`、`select`（多选 + 标签）、`menu`、`context_menu` |
-| ⑬ | 对话框 | `dialog::DialogBuilder`（普通对话框 + `alert` 形状 / 确认取消 / on_close / 模态遮罩） |
-| ⑭ | 颜色选择器 | `color_picker::ColorPicker`（触发器 + on_change） |
-| ⑮ | 交互日志 | 最近 8 条事件（指针命中节点 debug id / 主题 / 按钮 / 开关 / 表格 / 菜单 / 对话框） |
+| **⑩** | **宽表（新增）** | `Table` 横向滚动 + **内部 sticky 表头**：窄容器 420（出现水平条、可横向滚动/表头跟随）与宽容器 1100（无水平条）对照；三参数列配置；G7–G9 |
+| ⑪ | 输入框 | `input::{InputSpec, InputState, InputNode}`：单行 / 掩码 / 禁用 / 多行 + IME 提示 |
+| ⑫ | markdown | `markdown::{parse::parse_document, view::MarkdownView}`：富文本 / 代码 / 表格 / 引用 / 列表 / 行内图片占位 |
+| ⑬ | 浮层 | 独立 `overlay::Overlay`、`tooltip::Tooltip`、`dropdown`、`select`（多选 + 标签）、`menu`、`context_menu` |
+| ⑭ | 对话框 | `dialog::DialogBuilder`（普通对话框 + `alert` 形状 / 确认取消 / on_close / 模态遮罩） |
+| ⑮ | 颜色选择器 | `color_picker::ColorPicker`（触发器 + on_change） |
+| ⑯ | 交互日志 | 最近 8 条事件（指针命中节点 debug id / 主题 / 按钮 / 开关 / 表格 / 菜单 / 对话框） |
+
+> **编号说明**：本文件 §9–§11 中 P2-5/P2-6b 时期的日志与引用沿用当时 15 分区编号（旧 ⑩ 输入框、⑪ markdown … ⑮ 日志）；P3 起现行编号以上表为准（**⑩ 宽表**，旧 ⑩–⑮ 顺延为 ⑪–⑯，共 16 分区）。
 
 实现要点：
 
 - **组合根义务**：`ThemeHandle` / `Layer` / `AnimationRouter` 各一份；`App::on_frame` 单钩子里 `drain_events → 各组件 dispatch → status 镜像 → 各组件 sync`（与 `kit/mod.rs` 的组件形态一致）；
 - 页面滚动：内容列显式 `height(total)` + `flex_none()`（taffy 默认 `flex_shrink:1` 会把卡片压扁——gallery 首版曾只显示分区标题）；
-- 验收钩子：`--auto-demo`（`dispatch_action(Programmatic)` 触发主按钮）、`--idle-check`（1 s 基线 + 3 s 帧增量 ≤2，PASS 后关窗）、`--probe`（打印关键节点布局盒 + 底部滚动偏移 + 嵌套列表 `mounted_rows`，供外部点击换算坐标）、`--scroll-to=<y>`（程序化滚动，截图用）；退出码 0/3；
+- 验收钩子：`--auto-demo`（`dispatch_action(Programmatic)` 触发主按钮）、`--idle-check`（1 s 基线 + 3 s 帧增量 ≤2，PASS 后关窗）、`--wheel-check`（进程内注入滚轮/拖拽，G1–G9 **37 断言**；PASS 文案 `gallery: wheel-check PASS (G1-G5, G7-G9; 37 assertion(s))`）、`--probe`（打印关键节点布局盒 + 底部滚动偏移 + 嵌套列表 `mounted_rows`，供外部点击换算坐标）、`--scroll-to=<y>`（程序化滚动，截图用）；退出码 0/3；
+- 页面滚动条：**Hover 淡入的 overlay 滚动条**（页面可滚时出现，不占布局；⑦ 的两条条是独立容器内的常驻 bar）；
+- 宽表 ⑩：窄 420 / 宽 1100 两个 `Table` 对照（sticky 表头、水平条 tail gap 4 px、三参数列配置）；G7 覆盖水平条 track 滚轮 + thumb 拖动；
 - 截图/点击脚本（仅本地，`.review` gitignored）：`mig-p2-5-win-final.ps1`（DPI-aware OS 级点击 / 滚轮 / 键盘）、`mig-p2-5-mac-gallery.sh`、`mig-p2-5-linux-gallery.sh`。
 
 ## 2. 三端真实运行结果
@@ -65,7 +70,7 @@ bash .review/p2-5-linux-gallery.sh   # 通过 ssh my_ubuntu 执行
 `mig-p2-5-gallery-win-run.log` / 截图底部交互日志（最近 8 条）：
 
 ```text
-gallery: 建树完成（15 个分区）
+gallery: 建树完成（16 个分区；P2-5 时为 15，P3 插入 ⑩ 宽表后为 16）
 window: resize 1200×800
 window: focus=true
 theme: 切换为 Light                      ← 真实点击顶栏按钮（截图 -theme.png 全窗变浅色）
@@ -596,13 +601,13 @@ gallery 收尾：
 
 ## 12. P5 回写：§10 输入演示 / `--probe` 新增输出 / `--idle-check`·`--theme-check` 校验口径
 
-- 背景：`gallery.rs` 在文本输入重构（P0–P4，`.docs/text-input-redesign-design.md` §11）后，第 ⑩ 节的
+- 背景：`gallery.rs` 在文本输入重构（P0–P4，`.docs/text-input-redesign-design.md` §11）后，第 ⑪ 节的
   输入框改由 `ui_core::text_edit` 绘制与编辑，`ui_kit::kit::input` 只是薄壳。本节记录 P5 收尾时
   该演示与三个检查开关的**最终**口径；§1 的表格与 §11.8.5 的旧数字是 P2 时期快照，不再更新。
 - head：`cb965b56` + P5 工作区改动（仅 `gallery.rs` 演示数据 + 文档）。日志
   `.review/text-input/p5-gallery-probe.log`。
 
-### 12.1 第 ⑩ 节（输入框）结构与演示数据
+### 12.1 第 ⑪ 节（输入框）结构与演示数据
 
 | 控件 | spec | 演示值 |
 |---|---|---|

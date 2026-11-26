@@ -3035,6 +3035,434 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
 }
 
 #[test]
+fn keyboard_scrolls_focused_container_through_proxy() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(400.0)),
+    );
+    let track = NodeBuilder::boxed()
+        .style(StyleBuilder::new().size(px(20.0), px(80.0)).build())
+        .on_click(Action::custom("track"))
+        .build(app.window_mut(window).expect("window").tree_mut(), page)
+        .expect("track");
+    let thumb = NodeBuilder::boxed()
+        .style(StyleBuilder::new().size(px(20.0), px(20.0)).build())
+        .on_click(Action::custom("thumb"))
+        .build(app.window_mut(window).expect("window").tree_mut(), track)
+        .expect("thumb");
+    app.set_scroll_proxy(window, track, Some(pane))
+        .expect("proxy");
+    frame(&mut app, window);
+
+    assert!(app.set_focus(window, Some(track)));
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, pane).y,
+        px(48.0),
+        "焦点在 bar track 上时经代理滚所属容器"
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(0.0), "外层页面不动");
+
+    assert!(app.set_focus(window, Some(thumb)));
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, pane).y,
+        px(148.0),
+        "焦点在 thumb 上同样解析到 track 的代理目标（一页 = 视口高 100）"
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(0.0));
+}
+
+#[test]
+fn keyboard_both_axis_mapping_and_bar_focus_proxy() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Both,
+        48.0,
+        LogicalSize::new(px(400.0), px(400.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), pane)
+        .expect("row");
+    let track = NodeBuilder::boxed()
+        .layout_override(LogicalRect::new(px(180.0), px(0.0), px(20.0), px(80.0)))
+        .on_click(Action::custom("bar"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("track");
+    app.set_scroll_proxy(window, track, Some(pane))
+        .expect("proxy");
+    frame(&mut app, window);
+
+    let press = |app: &mut App, code: KeyCode| {
+        app.dispatch_input(window, InputEvent::key_down(code, Modifiers::empty()));
+        app.window(window)
+            .expect("window")
+            .tree()
+            .scroll_slot(pane)
+            .expect("slot")
+            .offset
+    };
+
+    assert!(app.set_focus(window, Some(row)));
+    assert_eq!(
+        press(&mut app, KeyCode::PageDown),
+        LogicalPoint::new(px(0.0), px(150.0)),
+        "Both 容器上 Page/Home/End 映射到纵轴"
+    );
+    assert_eq!(press(&mut app, KeyCode::Home), LogicalPoint::ZERO);
+    assert_eq!(
+        press(&mut app, KeyCode::End),
+        LogicalPoint::new(px(0.0), px(250.0))
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::ArrowRight),
+        LogicalPoint::new(px(48.0), px(250.0)),
+        "方向键按轴映射到横轴，纵轴保持"
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::PageUp),
+        LogicalPoint::new(px(48.0), px(100.0)),
+        "Page 仍走纵轴，横轴保持"
+    );
+
+    assert!(app.set_focus(window, Some(track)));
+    assert_eq!(
+        press(&mut app, KeyCode::ArrowRight),
+        LogicalPoint::new(px(96.0), px(100.0)),
+        "焦点在 bar 上经代理滚容器的横轴"
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::ArrowDown),
+        LogicalPoint::new(px(96.0), px(148.0))
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::End),
+        LogicalPoint::new(px(96.0), px(250.0))
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::Home),
+        LogicalPoint::new(px(96.0), px(0.0))
+    );
+}
+
+#[test]
+fn keyboard_page_falls_through_horizontal_inner_to_vertical_page() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Horizontal,
+        48.0,
+        LogicalSize::new(px(400.0), px(80.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).x,
+        px(0.0),
+        "横向内层没有纵轴，PageDown 不得滚它"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(150.0),
+        "PageDown 沿候选链落到纵向页面（步长 = 页面视口高）"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowRight, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).x,
+        px(48.0),
+        "横向动作仍由最近的横向容器消费"
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(150.0));
+}
+
+#[test]
+fn keyboard_arrow_down_falls_through_horizontal_inner_to_vertical_page() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Horizontal,
+        48.0,
+        LogicalSize::new(px(400.0), px(80.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).x,
+        px(0.0),
+        "横向内层没有纵轴，ArrowDown 不得滚它"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(48.0),
+        "ArrowDown 沿候选链落到纵向页面（一行）"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowRight, Modifiers::empty()),
+    );
+    assert_eq!(slot_offset(&app, window, inner).x, px(48.0));
+    assert_eq!(slot_offset(&app, window, page).y, px(48.0));
+}
+
+#[test]
+fn keyboard_skips_hidden_and_disabled_scroll_candidates() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(200.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_style_patch_for_test(
+            inner,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(0.0),
+        "隐藏候选不得滚"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(48.0),
+        "隐藏候选被跳过，动作落到外层页面"
+    );
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_style_patch_for_test(
+            inner,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(0.0),
+        "禁用候选不得滚"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(96.0),
+        "禁用候选被跳过，动作落到外层页面"
+    );
+}
+
+#[test]
+fn keyboard_page_down_falls_back_to_horizontal_when_chain_has_no_vertical() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(300.0), px(100.0)),
+        ScrollAxes::Horizontal,
+        48.0,
+        LogicalSize::new(px(800.0), px(100.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Horizontal,
+        48.0,
+        LogicalSize::new(px(400.0), px(80.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).x,
+        px(100.0),
+        "纯横向链上 PageDown 回退到横轴（步长 = 内层视口宽）"
+    );
+    assert_eq!(slot_offset(&app, window, page).x, px(0.0));
+}
+
+#[test]
+fn keyboard_boundary_does_not_chain_to_the_outer_container() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(120.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::End, Modifiers::empty()),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(40.0), "内层到 max");
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "End 不得链式滚外层"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(40.0), "内层保持夹紧");
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "PageDown 在边界不得链式滚外层"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(40.0));
+    assert_eq!(slot_offset(&app, window, page).y, px(0.0));
+}
+
+#[test]
 fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
