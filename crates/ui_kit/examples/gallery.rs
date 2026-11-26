@@ -42,7 +42,7 @@ use ui_kit::{
         input::{self, InputNode, InputSpec, InputState},
         layer::{Band, Layer},
         list::{List, ListOptions, SelectionMode},
-        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        markdown::{MarkdownAssets, MarkdownNode},
         menu::{Menu, MenuAction, MenuEntry, MenuOptions, MenuSubmenu},
         overlay::{Anchor, AnimationRouter, Overlay, OverlayOptions},
         progress::Progress,
@@ -80,7 +80,7 @@ const H_SCROLLBAR: f32 = 200.0;
 const H_TABLE: f32 = 320.0;
 const H_TREE: f32 = 290.0;
 const H_INPUTS: f32 = 250.0;
-const H_MARKDOWN: f32 = 620.0;
+const H_MARKDOWN: f32 = 1000.0;
 const H_OVERLAYS: f32 = 150.0;
 const H_DIALOGS: f32 = 120.0;
 const H_PICKER: f32 = 110.0;
@@ -88,15 +88,31 @@ const H_LOG: f32 = 240.0;
 
 const MARKDOWN_SOURCE: &str = r#"# Markdown 视图
 
-**粗体**、*斜体*、~~删除线~~、`inline code`、[链接](https://example.com)。
+**粗体**、*斜体*、~~删除线~~、`inline code`、[链接](https://example.com)、<kbd>Ctrl</kbd>+<kbd>S</kbd>、软
+换行与硬<br>换行。
 
 ## 二级标题
 
-1. 列表项一
-2. 列表项二
+### 三级标题
+
+1. 有序项一
+2. 有序项二
    - 嵌套项
+   - 嵌套项二
+
+- 无序项
+- 另一项
 
 > 引用块：行内图片走占位绘制（资源通路未接线）。
+>
+> > 嵌套引用。
+
+- [ ] 未勾选任务
+- [x] 已勾选任务
+
+<p align="center">块级 HTML 容器内的文字按纯文本段落落地（第 2/3 步换成语义子集）。</p>
+
+---
 
 ## 代码
 
@@ -106,14 +122,16 @@ fn main() {
 }
 ```
 
+    缩进代码块
+
 ## 表格
 
 | 列 A | 列 B | 列 C |
-|------|------|------|
+|:-----|:----:|-----:|
 | 1 | 2 | 3 |
-| 4 | 5 | 6 |
+| 4 | **5** | `6` |
 
-行内图片：![icon](file://gallery-icon.png?size=24)
+行内图片：![icon](file://gallery-icon.png?size=24) 与 ![](file://icons/phosphoricons/graph.svg?size=16)
 "#;
 
 #[derive(Clone, Copy, Default)]
@@ -1310,9 +1328,9 @@ impl Gallery {
             H_MARKDOWN,
             &theme,
         );
-        let doc = Arc::new(parse_document(MARKDOWN_SOURCE, &NoAssets));
-        let markdown = MarkdownNode::mount(app, window, s11, theme.clone(), doc)
-            .expect("the gallery's markdown mounts");
+        let markdown =
+            MarkdownNode::mount(app, window, s11, theme.clone(), MARKDOWN_SOURCE, NoAssets)
+                .expect("the gallery's markdown mounts");
 
         let s12 = section(
             app,
