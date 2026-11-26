@@ -306,7 +306,9 @@ impl ShapedText {
                     let mut snapshot = snapshot.borrow_mut();
                     let size = if width >= snapshot.max_size.width {
                         snapshot.max_size
-                    } else if width <= snapshot.min_size.width {
+                    } else if self.style.wrap != TextWrap::BreakWord
+                        && width <= snapshot.min_size.width
+                    {
                         snapshot.min_size
                     } else {
                         self.measure_breaks.set(self.measure_breaks.get() + 1);
@@ -736,6 +738,9 @@ pub(super) fn push_shaping_defaults<'a>(
         TextWrap::NoWrap => {
             builder.push_default(StyleProperty::TextWrapMode(ParleyTextWrapMode::NoWrap));
         }
+        TextWrap::BreakWord => {
+            builder.push_default(StyleProperty::OverflowWrap(ParleyOverflowWrap::BreakWord));
+        }
         TextWrap::Anywhere => {
             builder.push_default(StyleProperty::WordBreak(ParleyWordBreak::BreakAll));
             builder.push_default(StyleProperty::OverflowWrap(ParleyOverflowWrap::Anywhere));
@@ -837,6 +842,7 @@ fn push_run_style<'a>(
                 range,
             );
         }
+        TextWrap::BreakWord => {}
         TextWrap::Anywhere => {
             builder.push(
                 StyleProperty::WordBreak(ParleyWordBreak::BreakAll),
@@ -4239,5 +4245,346 @@ mod tests {
                 "{text:?} 是纯 ASCII 数字文本：无论走快速路径还是 parley，都不该有 RTL run"
             );
         }
+    }
+
+    fn broken_line_edges(shaped: &super::ShapedText, width: f32) -> Vec<(f32, f32)> {
+        let text = shaped.text();
+        let layout = shaped.layout_at(px(width));
+        let mut edges = Vec::with_capacity(layout.lines().count());
+        for line in layout.lines() {
+            let mut rights: Vec<f32> = Vec::new();
+            for item in line.items() {
+                let parley::PositionedLayoutItem::GlyphRun(run) = item else {
+                    continue;
+                };
+                for glyph in run.positioned_glyphs() {
+                    rights.push(glyph.x + glyph.advance);
+                }
+            }
+            if text.as_bytes().get(line.text_range().end.wrapping_sub(1)) == Some(&b' ') {
+                rights.pop();
+            }
+            edges.push((
+                line.metrics().advance,
+                rights.last().copied().unwrap_or(0.0),
+            ));
+        }
+        edges
+    }
+
+    fn line_advances(shaped: &super::ShapedText, width: f32) -> Vec<f32> {
+        shaped
+            .layout_at(px(width))
+            .lines()
+            .map(|line| line.metrics().advance)
+            .collect()
+    }
+
+    #[test]
+    fn break_word_wraps_an_unbreakable_cjk_punctuation_run() {
+        let mut harness = Harness::new();
+        let text = "。".repeat(50);
+        let style = TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord);
+        let shaped = harness.shape(&text, style);
+
+        let metrics = shaped.line_metrics(px(250.0), TextAlign::Start);
+        assert!(
+            metrics.line_count >= 3,
+            "50 个 CJK 句号在 250px 内必须折成多行：{metrics:?}"
+        );
+        assert!(
+            (metrics.content_height - metrics.line_height * metrics.line_count as f32).abs()
+                <= px(0.5),
+            "内容高必须是行高之和：{metrics:?}"
+        );
+        let size = shaped.measure(none_known(), definite(250.0));
+        assert!(
+            (size.height - metrics.content_height).abs() <= px(0.5),
+            "measure 高度必须等于断行后的内容高：{size:?} vs {metrics:?}"
+        );
+        assert!(
+            size.width <= px(251.0),
+            "measure 宽度必须是断行后的行宽，不是整段宽度：{size:?}"
+        );
+        for (advance, right) in broken_line_edges(&shaped, 250.0) {
+            assert!(
+                advance <= 251.0 && right <= 251.0,
+                "每行推进 {advance} 与字形右边界 {right} 都不得超过折行宽度 250"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_without_emergency_breaks_keeps_an_unbreakable_run_on_one_line() {
+        let mut harness = Harness::new();
+        let shaped = harness.shape(&"。".repeat(50), TextStyle::new(px(16.0)));
+
+        let metrics = shaped.line_metrics(px(250.0), TextAlign::Start);
+        assert_eq!(
+            metrics.line_count, 1,
+            "Wrap 只有 Unicode 断行机会，CJK 闭标点之间没有机会：{metrics:?}"
+        );
+        let size = shaped.measure(none_known(), definite(250.0));
+        assert!(
+            size.width > px(250.0),
+            "没有词内断行机会时只能溢出：{size:?}"
+        );
+    }
+
+    #[test]
+    fn rebreaking_one_layout_at_successive_widths_keeps_every_break() {
+        let mut harness = Harness::new();
+        let text = "。".repeat(50);
+        let style = TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord);
+        let shaped = harness.shape(&text, style.clone());
+
+        let wide = line_advances(&shaped, 610.0);
+        let narrow = line_advances(&shaped, 604.0);
+        let again = line_advances(&shaped, 610.0);
+
+        assert_ne!(wide, narrow, "610 与 604 必须折出不同的行宽");
+        assert_eq!(
+            wide, again,
+            "同一个 parley Layout 第三次折行必须回到 610 的结果（断行状态不得被消费）"
+        );
+
+        let fresh = harness.shape(&text, style);
+        assert_eq!(
+            wide,
+            line_advances(&fresh, 610.0),
+            "复用布局的 610 结果必须等于全新 shaping 的结果"
+        );
+        assert_eq!(
+            narrow,
+            line_advances(&fresh, 604.0),
+            "复用布局的 604 结果必须等于全新 shaping 的结果"
+        );
+    }
+
+    #[test]
+    fn break_word_measure_memo_follows_the_requested_width() {
+        let mut harness = Harness::new();
+        let style = TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord);
+        let shaped = harness.shape(&"。".repeat(50), style);
+
+        let narrow = shaped.measure(none_known(), definite(200.0));
+        let wide = shaped.measure(none_known(), definite(700.0));
+        assert!(
+            narrow.height > wide.height,
+            "窄宽必须折成更多行（不能被 min-content 快路径短路）：{narrow:?} vs {wide:?}"
+        );
+        assert!(narrow.width <= px(201.0), "{narrow:?}");
+        assert!(wide.width > px(600.0), "{wide:?}");
+        assert!(shaped.measure_breaks() >= 2, "两次不同宽度必须各断行一次");
+
+        let repeated = shaped.measure(none_known(), definite(200.0));
+        assert_eq!(repeated, narrow, "回到 200 必须得到同一结果");
+        let breaks = shaped.measure_breaks();
+        assert_eq!(
+            shaped.measure(none_known(), definite(200.0)),
+            narrow,
+            "同宽重复测量必须命中 memo"
+        );
+        assert_eq!(shaped.measure_breaks(), breaks, "同宽重复测量不得重新断行");
+    }
+
+    #[test]
+    fn break_word_keeps_word_boundaries_when_every_word_fits() {
+        let mut harness = Harness::new();
+        let text = "word ".repeat(20);
+        let normal = harness.shape(&text, TextStyle::new(px(16.0)));
+        let break_word = harness.shape(
+            &text,
+            TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord),
+        );
+
+        let normal_metrics = normal.line_metrics(px(200.0), TextAlign::Start);
+        let break_word_metrics = break_word.line_metrics(px(200.0), TextAlign::Start);
+        assert!(normal_metrics.line_count >= 3, "{normal_metrics:?}");
+        assert_eq!(
+            break_word_metrics.line_count, normal_metrics.line_count,
+            "有空格断行机会、且每个词都放得下时 BreakWord 不得改变折行结果：{break_word_metrics:?} vs {normal_metrics:?}"
+        );
+        let layout = break_word.layout_at(px(200.0));
+        for line in layout.lines() {
+            let range = line.text_range();
+            assert!(
+                range.end == text.len() || text.as_bytes()[range.end - 1] == b' ',
+                "拉丁词只在词边界折行：{range:?}"
+            );
+        }
+        for (_, right) in broken_line_edges(&break_word, 200.0) {
+            assert!(right <= 201.0, "字形右边界 {right} 不得超过折行宽度 200");
+        }
+    }
+
+    #[test]
+    fn break_word_splits_only_the_word_that_cannot_fit() {
+        let mut harness = Harness::new();
+        let long = "supercalifragilisticexpialidocious";
+        let text = format!("alpha {long} omega");
+        let width = 100.0;
+        let long_start = "alpha ".len();
+        let long_end = long_start + long.len();
+        let break_word = harness.shape(
+            &text,
+            TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord),
+        );
+        let lines: Vec<core::ops::Range<usize>> = break_word
+            .layout_at(px(width))
+            .lines()
+            .map(|line| line.text_range())
+            .collect();
+
+        assert!(lines.len() >= 3, "长词必须占多行：{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|range| range.end > long_start && range.end < long_end),
+            "整词放不下一行时必须在词内断开：{lines:?}"
+        );
+        let covered = lines
+            .iter()
+            .filter(|range| range.start < long_end && range.end > long_start)
+            .fold(long_start..long_start, |covered, range| {
+                covered.start.min(range.start)..covered.end.max(range.end)
+            });
+        assert_eq!(
+            (covered.start, covered.end.min(long_end)),
+            (long_start, long_end),
+            "长词必须从词首到词尾被完整排入（含悬挂空格）：{lines:?}"
+        );
+        for word in ["alpha", "omega"] {
+            let start = text.find(word).expect("fixture word");
+            let end = start + word.len();
+            assert!(
+                !lines
+                    .iter()
+                    .any(|range| (range.start > start && range.start < end)
+                        || (range.end > start && range.end < end)),
+                "放得下的短词 {word:?} 必须整词换行：{lines:?}"
+            );
+        }
+        assert!(
+            lines[0].start == 0 && lines[0].end >= "alpha".len(),
+            "首行必须整词容纳 alpha：{lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(|range| range.end),
+            Some(text.len()),
+            "末行必须收完整段文本：{lines:?}"
+        );
+        for (advance, right) in broken_line_edges(&break_word, width) {
+            assert!(
+                advance <= width + 1.0 && right <= width + 1.0,
+                "断词后不得横向溢出：行推进 {advance} / 字形右边界 {right} vs {width}"
+            );
+        }
+
+        let normal = harness.shape(&text, TextStyle::new(px(16.0)));
+        assert!(
+            broken_line_edges(&normal, width)
+                .iter()
+                .any(|(advance, _)| *advance > width + 1.0),
+            "夹具必须真的包含一个整行放不下的词（否则测不到词内应急断行）"
+        );
+    }
+
+    #[test]
+    fn break_word_keeps_intrinsic_sizes_of_an_unbreakable_run() {
+        let mut harness = Harness::new();
+        let text = "。".repeat(50);
+        let break_word = harness.shape(
+            &text,
+            TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord),
+        );
+        let widths = break_word.layout().calculate_content_widths();
+        assert!(
+            (widths.min - widths.max).abs() <= 0.01,
+            "BreakWord 不得改变 min-content（这是它与 Anywhere 的唯一差别）：{widths:?}"
+        );
+        let min = break_word.measure(
+            none_known(),
+            taffy::Size {
+                width: AvailableSpace::MinContent,
+                height: AvailableSpace::MinContent,
+            },
+        );
+        let max = break_word.measure(
+            none_known(),
+            taffy::Size {
+                width: AvailableSpace::MaxContent,
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        assert_eq!(
+            min.width.value().to_bits(),
+            max.width.value().to_bits(),
+            "MinContent 与 MaxContent 必须同为未断行整行宽：{min:?} vs {max:?}"
+        );
+        assert!(
+            (min.width - px(widths.max)).abs() <= px(0.5),
+            "固有宽度必须等于未断行整行宽：{min:?} vs {widths:?}"
+        );
+        let single = break_word.line_metrics(px(widths.max), TextAlign::Start);
+        assert_eq!(single.line_count, 1, "{single:?}");
+        assert!(
+            (min.height - single.content_height).abs() <= px(0.5),
+            "MinContent 高度必须是 1 行：{min:?} vs {single:?}"
+        );
+
+        let anywhere = harness.shape(
+            &text,
+            TextStyle::new(px(16.0)).with_wrap(TextWrap::Anywhere),
+        );
+        let anywhere_widths = anywhere.layout().calculate_content_widths();
+        assert!(
+            anywhere_widths.min * 2.0 < anywhere_widths.max,
+            "Anywhere 必须把 min-content 压到单 atom，才能与 BreakWord 区分：break={widths:?} anywhere={anywhere_widths:?}"
+        );
+        let anywhere_min = anywhere.measure(
+            none_known(),
+            taffy::Size {
+                width: AvailableSpace::MinContent,
+                height: AvailableSpace::MinContent,
+            },
+        );
+        assert!(
+            anywhere_min.width * 2.0 < min.width,
+            "Anywhere 的 MinContent 测量必须明显小于 BreakWord：{anywhere_min:?} vs {min:?}"
+        );
+    }
+
+    #[test]
+    fn run_level_wrap_does_not_change_the_paragraph_wrap_mode() {
+        let mut harness = Harness::new();
+        let text = "。".repeat(50);
+        let run_style = TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord);
+        let content = TextContent::new(&text, TextStyle::new(px(16.0)))
+            .with_runs([TextRun::new(0..text.len(), run_style)]);
+        let shaped = harness.shape_content(&content);
+
+        let metrics = shaped.line_metrics(px(250.0), TextAlign::Start);
+        assert_eq!(
+            metrics.line_count, 1,
+            "run 级 wrap 只能收紧（NoWrap/Anywhere），不得把 base Wrap 放宽成 break-word：{metrics:?}"
+        );
+        let size = shaped.measure(none_known(), definite(250.0));
+        assert!(
+            (size.height - metrics.content_height).abs() <= px(0.5),
+            "measure 与光栅化必须一致（run 级 wrap 不参与 measure 守卫）：{size:?} vs {metrics:?}"
+        );
+
+        let base_break_word = harness.shape(
+            &text,
+            TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord),
+        );
+        assert!(
+            base_break_word
+                .line_metrics(px(250.0), TextAlign::Start)
+                .line_count
+                >= 3,
+            "只有整段兜底样式的 BreakWord 才改变折行"
+        );
     }
 }

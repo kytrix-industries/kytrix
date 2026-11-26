@@ -550,3 +550,15 @@ nightly 的 2 条 clippy）见 §11.7/§11.8。
 
 Linux 的 4 条 nsure_visible_*、macOS 的 3 条失败均在 P5 收尾修掉（引擎口径修复 + 用例口径修复 +
 2 条渲染类用例改为显式环境前置），详见设计文档 §11.8/§11.9。
+
+### 10.7 平台与基线口径（原仓库级约定，随本任务收尾移入）
+
+- **Linux 尺寸基线差异**：Linux 上 `Node` / `Shadows` / `PaintSpec` 的 `size_of` 基线比 Windows / macOS 略小
+  （`smallvec` / `union` 经 `wayland-backend` 的布局差异），尺寸断言按平台分档维护，不是回归。
+- **三端 `readback` 的 `cfg` 已统一**为 `#[cfg(any(test, feature = "test-support"))]`（Windows / macOS / Linux），
+  因此 Linux 的纯 `cfg(test)` 也会编译读回路径；`render/linux/readback.rs` 的尺寸字段必须在锁内测试里被读取，
+  否则 Linux 默认 clippy 会报 `dead_code`。
+- **golden 生成与豁免**：见 `crates/ui_core/tests/golden/README.md`（生成环境指纹、三端策略、
+  `KYTRIX_TEST_SKIP_GPU_PIXELS=1` 的显式豁免与限制、重基四项检查）。
+- **EOL / `.gitattributes`**：仓库不跟踪 `.gitattributes`（`.gitignore` 的 `.*` 规则生效），各开发机按需自行配置
+  （`* text=auto` + 脚本/源码 LF），远端与 CI 不依赖该文件。

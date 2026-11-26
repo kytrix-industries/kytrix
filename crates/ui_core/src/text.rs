@@ -111,6 +111,7 @@ pub enum TextWrap {
     #[default]
     Wrap,
     NoWrap,
+    BreakWord,
     Anywhere,
 }
 

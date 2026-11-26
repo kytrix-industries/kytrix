@@ -940,7 +940,7 @@ fn editable_role(spec: &InputSpec) -> A11yRole {
 
 fn text_style(spec: &InputSpec, size: &crate::theme::components::SizeTokens) -> TextStyle {
     let wrap = if spec.multiline {
-        TextWrap::Wrap
+        TextWrap::BreakWord
     } else {
         TextWrap::NoWrap
     };
@@ -3222,6 +3222,112 @@ mod tests {
             "拖拽自动滚动步长上限必须是 2×引擎行高（{}），实际 {offset:?}（字号回退会是 {:?}）",
             metrics.line_height * 2.0,
             font_size * 2.0
+        );
+    }
+
+    fn harness_at_width(width: f32, spec: InputSpec, initial: &str) -> Harness {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let state = app.app_mut().signal(InputState::new(initial));
+        let placeholder = app.app_mut().signal(spec.placeholder.clone());
+        let spec = Arc::new(spec);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口存在").tree().root();
+        let host = {
+            let tree = app
+                .app_mut()
+                .window_mut(window)
+                .expect("窗口存在")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .style(StyleBuilder::new().width(px(width)).build())
+                .build(tree, root)
+                .expect("宿主盒")
+        };
+        let node = build(
+            app.app_mut()
+                .window_mut(window)
+                .expect("窗口存在")
+                .tree_mut(),
+            host,
+            Arc::clone(&spec),
+            &theme,
+            &state,
+            &placeholder,
+        );
+        node.install(app.app_mut());
+        for _ in 0..3 {
+            let _ = node.sync(app.app_mut());
+            app.drain().expect("稳定帧");
+        }
+        Harness {
+            app,
+            node,
+            state,
+            placeholder,
+            theme,
+        }
+    }
+
+    fn editable_glyph_right(harness: &Harness) -> LogicalPx {
+        harness
+            .app
+            .rendered()
+            .expect("已提交")
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                primitive.node == harness.node.editable && primitive.kind == PrimitiveKind::GlyphRun
+            })
+            .map(|primitive| primitive.bounds.max().x)
+            .fold(px(0.0), LogicalPx::max)
+    }
+
+    #[test]
+    fn cjk_punctuation_typed_into_a_multiline_field_wraps_without_horizontal_overflow() {
+        let mut harness = harness_at_width(160.0, multiline_spec(Some(3)), "");
+        harness.focus();
+        let window = harness.window();
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(window, harness.node.viewport)
+            .expect("多行滚动槽");
+        for step in 0..40 {
+            harness.type_text("。");
+            let state = harness.app.app().scroll_state(&handle).expect("滚动状态");
+            assert_eq!(
+                state.offset.x,
+                px(0.0),
+                "多行输入不得横向滚动（第 {step} 个字符）：{state:?}"
+            );
+            let metrics = harness.metrics();
+            assert!(
+                (metrics.content_height - metrics.line_height * metrics.line_count as f32).abs()
+                    <= px(0.5),
+                "内容高必须等于行高之和（第 {step} 个字符）：{metrics:?}"
+            );
+            let editable = harness.editable_bounds();
+            let glyph_right = editable_glyph_right(&harness);
+            assert!(
+                glyph_right <= editable.max().x + 1.0,
+                "字形不得越过文本盒（第 {step} 个字符）：{glyph_right} vs {editable:?}"
+            );
+        }
+        let metrics = harness.metrics();
+        assert!(
+            metrics.line_count >= 3,
+            "40 个句号在 160px 宿主内必须折成至少 3 行：{metrics:?}"
+        );
+        assert!(
+            metrics.content_height > metrics.line_height * 3.0,
+            "内容必须超过 visible_lines=3 的视口高度：{metrics:?}"
+        );
+        let bar = harness.node.scrollbar.borrow().clone().expect("多行滚动条");
+        assert!(
+            bar.scrollable(harness.app.app()),
+            "内容超过 3 行后滚动条必须可滚动"
         );
     }
 }

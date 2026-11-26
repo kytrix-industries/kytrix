@@ -425,7 +425,11 @@ fn eligibility(text: &str, style: &TextStyle) -> Result<(), Ineligible> {
     {
         return Err(Ineligible::Alphabet);
     }
-    if style.wrap != super::TextWrap::NoWrap && has_line_break_opportunity(text) {
+    if matches!(
+        style.wrap,
+        super::TextWrap::BreakWord | super::TextWrap::Anywhere
+    ) || (style.wrap != super::TextWrap::NoWrap && has_line_break_opportunity(text))
+    {
         return Err(Ineligible::Wrap);
     }
     Ok(())
@@ -824,6 +828,33 @@ mod tests {
         assert_eq!(
             eligibility("1,234.56", &style.with_direction(TextDirection::Rtl)),
             Err(Ineligible::Rtl)
+        );
+    }
+
+    #[test]
+    fn eligibility_rejects_wrap_modes_that_break_inside_a_number() {
+        let style = TextStyle::new(px(12.0));
+        let assembled: String = ALPHABET.iter().collect();
+        for wrap in [TextWrap::BreakWord, TextWrap::Anywhere] {
+            assert_eq!(
+                eligibility("1234567890", &style.clone().with_wrap(wrap)),
+                Err(Ineligible::Wrap),
+                "{wrap:?} 在窄宽下会把数字串断成多行 ⇒ 单行快速路径前提不成立"
+            );
+            assert_eq!(
+                eligibility(&assembled, &style.clone().with_wrap(wrap)),
+                Err(Ineligible::Wrap),
+                "{wrap:?} 对完整字符集同样必须拒绝：{assembled:?}"
+            );
+        }
+        assert_eq!(
+            eligibility("1234567890", &style.clone().with_wrap(TextWrap::Wrap)),
+            Ok(()),
+            "Wrap + 无断行机会的数字串仍是单行（既有行为）"
+        );
+        assert_eq!(
+            eligibility("1234567890", &style.with_wrap(TextWrap::NoWrap)),
+            Ok(())
         );
     }
 

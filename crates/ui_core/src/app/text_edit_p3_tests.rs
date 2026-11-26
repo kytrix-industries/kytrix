@@ -47,7 +47,7 @@ fn spec(multiline: bool) -> EditableSpec {
         submit: None,
         text_style: TextStyle::new(px(16.0))
             .with_wrap(if multiline {
-                TextWrap::Wrap
+                TextWrap::BreakWord
             } else {
                 TextWrap::NoWrap
             })

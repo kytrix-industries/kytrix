@@ -1775,6 +1775,7 @@ impl Gallery {
             });
         }
         if self.flags.probe {
+            let gallery = self.clone();
             let nodes = self.probe_nodes.clone();
             let viewport = self.viewport;
             let content_height = self.content_height;
@@ -1820,7 +1821,12 @@ impl Gallery {
                                 multiline.editable
                             );
                             print_input_probe(app, window, &inputs, "multiline ");
+                            multiline_wrap_probe(app, window, multiline, "multiline ");
                         }
+                        let gallery = gallery.clone();
+                        let _ = app.after(window, Duration::from_millis(500), move |app| {
+                            gallery.probe_multiline_wrap(app, window);
+                        });
                         let _ = app.after(window, Duration::from_millis(600), move |app| {
                             print_input_probe(app, window, &inputs, "blink ");
                         });
@@ -2004,6 +2010,47 @@ impl Gallery {
                 app.handle().wake();
             });
         }
+    }
+
+    fn probe_multiline_wrap(&self, app: &mut App, window: WindowId) {
+        let Some(target) = app.window(window) else {
+            return;
+        };
+        let root = target.tree().root();
+        let host = {
+            let tree = app.window_mut(window).expect("window exists").tree_mut();
+            NodeBuilder::boxed()
+                .id("gallery.wrap-probe.host")
+                .style(
+                    StyleBuilder::new()
+                        .width(px(160.0))
+                        .height(px(60.0))
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("wrap probe host")
+        };
+        let input = make_input(
+            app,
+            window,
+            host,
+            &self.theme,
+            "gallery.input.wrap-probe",
+            "",
+            false,
+            false,
+            true,
+            Some(3),
+            ControlSize::Small,
+        );
+        input.update_value(app, "。".repeat(40).as_str());
+        let _ = input.sync(app);
+        app.handle().wake();
+        let _ = app.after(window, Duration::from_millis(800), move |app| {
+            let _ = input.sync(app);
+            multiline_wrap_probe(app, window, &input, "wrap-probe-40 ");
+            app.handle().wake();
+        });
     }
 
     fn tick(&mut self, app: &mut App) {
@@ -2483,6 +2530,64 @@ fn print_probe_rects(app: &mut App, window: WindowId, nodes: &[(SmolStr, NodeId)
             None => println!("gallery: probe {prefix}{name} node={node:?} missing"),
         }
     }
+}
+
+fn multiline_wrap_probe(app: &App, window: WindowId, input: &InputNode, prefix: &str) {
+    let Some(target) = app.window(window) else {
+        return;
+    };
+    let Some(value) = app.text_edit_value(window, input.editable).ok() else {
+        return;
+    };
+    let Ok(metrics) = app.text_edit_metrics(window, input.editable) else {
+        return;
+    };
+    let editable = target
+        .tree()
+        .get(input.editable)
+        .ok()
+        .map(|node| node.layout().bounds);
+    let mut lines: Vec<(f32, f32)> = Vec::new();
+    for byte in 0..=value.len() {
+        if !value.is_char_boundary(byte) {
+            continue;
+        }
+        let Ok(caret) = target.text_caret_rect(input.editable, byte) else {
+            continue;
+        };
+        let y = caret.origin.y.value();
+        let x = caret.origin.x.value();
+        match lines.iter_mut().find(|(line_y, _)| *line_y == y) {
+            Some((_, right)) => *right = right.max(x),
+            None => lines.push((y, x)),
+        }
+    }
+    let widest = lines.iter().map(|(_, right)| *right).fold(0.0f32, f32::max);
+    let scroll = app
+        .scroll_handle(window, input.viewport)
+        .and_then(|handle| app.scroll_state(&handle))
+        .map(|state| {
+            (
+                state.offset.x.value(),
+                state.offset.y.value(),
+                state.content.height.value(),
+                state.viewport.height.value(),
+            )
+        });
+    let scrollable = input
+        .scrollbar
+        .borrow()
+        .as_ref()
+        .map(|bar| bar.scrollable(app));
+    println!(
+        "gallery: wrap-probe {prefix}chars={} lines={} content_height={} line_height={} per_line_right={lines:?} widest_right={widest} editable_width={:?} horizontal_overflow={} scroll(x,y,content,viewport)={scroll:?} scrollable={scrollable:?}",
+        value.chars().count(),
+        metrics.line_count,
+        metrics.content_height.value(),
+        metrics.line_height.value(),
+        editable.map(|bounds| bounds.size.width.value()),
+        editable.is_some_and(|bounds| widest > bounds.size.width.value() + 1.0),
+    );
 }
 
 fn print_input_probe(app: &App, window: WindowId, inputs: &[InputNode], prefix: &str) {

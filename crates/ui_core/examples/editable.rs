@@ -11,7 +11,7 @@ use ui_core::{
         style::Style,
         style_builder::{PaintBuilder, StyleBuilder},
     },
-    text::TextStyle,
+    text::{TextStyle, TextWrap},
     text_edit::{EditableSpec, TextEditMetrics, TextEditSnapshot},
     window::{WindowId, WindowOptions},
 };
@@ -279,6 +279,120 @@ fn run_headless(probe: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn caret_line_rights(app: &App, window: WindowId, node: NodeId) -> Vec<(f32, f32)> {
+    let Some(target) = app.window(window) else {
+        return Vec::new();
+    };
+    let Some(value) = app.text_edit_value(window, node).ok() else {
+        return Vec::new();
+    };
+    let mut lines: Vec<(f32, f32)> = Vec::new();
+    for byte in 0..=value.len() {
+        if !value.is_char_boundary(byte) {
+            continue;
+        }
+        let Ok(caret) = target.text_caret_rect(node, byte) else {
+            continue;
+        };
+        let y = caret.origin.y.value();
+        let x = caret.origin.x.value();
+        match lines.iter_mut().find(|(line_y, _)| *line_y == y) {
+            Some((_, right)) => *right = right.max(x),
+            None => lines.push((y, x)),
+        }
+    }
+    lines
+}
+
+fn run_wrap_probe() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut app = App::new(runtime.handle().clone());
+    let window = app.create_window(WindowOptions {
+        title: SmolStr::new_static(TITLE),
+        size: LogicalSize::new(px(720.0), px(480.0)),
+        background: Color::from_rgba8([18, 21, 27, 255]),
+        ..WindowOptions::default()
+    });
+    let root = app.window(window).expect("window exists").tree().root();
+    let mut probe_spec = spec(true, "Wrap probe", "");
+    probe_spec.text_style = TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord);
+    let node = NodeBuilder::editable_text(probe_spec)
+        .id("editable-wrap-probe")
+        .style(editable_style(200.0))
+        .build(
+            app.window_mut(window).expect("window exists").tree_mut(),
+            root,
+        )
+        .expect("wrap probe node");
+    for _ in 0..3 {
+        app.frame(window).expect("window exists").expect("frame");
+    }
+    let _ = app.set_focus(window, Some(node));
+
+    for step in 0..40 {
+        let prefix = "。".repeat(step + 1);
+        app.text_edit_set_value(window, node, prefix.as_str())
+            .expect("wrap probe value");
+        app.frame(window).expect("window exists").expect("frame");
+        let metrics = app.text_edit_metrics(window, node).expect("metrics");
+        let lines = caret_line_rights(&app, window, node);
+        if step < 4 || step % 10 == 9 {
+            println!(
+                "wrap-probe: chars={} lines={} content_height={} line_height={} line_rights={lines:?}",
+                step + 1,
+                metrics.line_count,
+                metrics.content_height.value(),
+                metrics.line_height.value(),
+            );
+        }
+        assert!(
+            (metrics.content_height - metrics.line_height * metrics.line_count as f32).abs()
+                <= px(0.5),
+            "内容高必须等于行高之和（第 {} 个字符）：{metrics:?}",
+            step + 1
+        );
+        let width = node_rect(&app, window, node)
+            .expect("wrap probe bounds")
+            .size
+            .width;
+        let widest = lines.iter().map(|(_, right)| *right).fold(0.0f32, f32::max);
+        assert!(
+            widest <= width.value() + 1.0,
+            "第 {} 个字符后最右字形 {widest} 越过文本盒宽 {}",
+            step + 1,
+            width.value()
+        );
+    }
+
+    let metrics = app.text_edit_metrics(window, node).expect("metrics");
+    let bounds = node_rect(&app, window, node).expect("wrap probe bounds");
+    let lines = caret_line_rights(&app, window, node);
+    assert_eq!(
+        lines.len(),
+        metrics.line_count,
+        "逐字节 caret 采样必须得到与引擎一致的行数：{lines:?} vs {metrics:?}"
+    );
+    assert!(
+        metrics.line_count >= 3,
+        "40 个句号在 200px 内必须折成至少 3 行：{metrics:?}"
+    );
+    println!(
+        "wrap-probe: value_chars={} line_count={} line_height={} content_height={} node={:?} line_rights={lines:?}",
+        app.text_edit_value(window, node)
+            .expect("value")
+            .chars()
+            .count(),
+        metrics.line_count,
+        metrics.line_height.value(),
+        metrics.content_height.value(),
+        bounds,
+    );
+    println!("wrap-probe: OK (no horizontal overflow, wraps every line)");
+    Ok(())
+}
+
 fn auto_close_after(args: &[String]) -> Option<Duration> {
     let index = args.iter().position(|arg| arg == "--auto-close")?;
     let seconds = args
@@ -288,7 +402,6 @@ fn auto_close_after(args: &[String]) -> Option<Duration> {
         .unwrap_or(5.0);
     Some(Duration::from_secs_f32(seconds))
 }
-
 fn run_windowed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let probe = args.iter().any(|arg| arg == "--probe");
     let auto_close = auto_close_after(args);
@@ -342,8 +455,14 @@ fn run_windowed(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "--headless") {
-        return run_headless(args.iter().any(|arg| arg == "--probe"));
+    let headless = args.iter().any(|arg| arg == "--headless");
+    let wrap_probe = args.iter().any(|arg| arg == "--wrap-probe");
+    if headless || wrap_probe {
+        return if wrap_probe {
+            run_wrap_probe()
+        } else {
+            run_headless(args.iter().any(|arg| arg == "--probe"))
+        };
     }
     run_windowed(&args)
 }

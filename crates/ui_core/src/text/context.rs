@@ -369,7 +369,9 @@ mod tests {
     use super::TextContext;
     use crate::{
         math::px,
-        text::{FontStack, FontStackStatus, TextContent, TextDiagnostic, TextStyle},
+        text::{
+            FontStack, FontStackStatus, TextAlign, TextContent, TextDiagnostic, TextStyle, TextWrap,
+        },
     };
 
     fn content(text: &str) -> TextContent {
@@ -481,6 +483,39 @@ mod tests {
         assert!(std::rc::Rc::ptr_eq(&first, &second));
         assert!(std::rc::Rc::ptr_eq(&first, &third));
         assert_eq!(context.cached_shapes(), 1);
+    }
+
+    #[test]
+    fn break_word_numbers_bypass_the_fast_path_and_wrap() {
+        let mut context = TextContext::new();
+        if context.family_count() == 0 {
+            eprintln!("skip: no system fonts");
+            return;
+        }
+        let content = TextContent::new(
+            "1234567890",
+            TextStyle::new(px(12.0)).with_wrap(TextWrap::BreakWord),
+        );
+        let (shaped, _) = context.shape_cached(&content);
+        assert!(
+            !shaped.is_simple(),
+            "BreakWord 数字文本在窄宽下必须能折行：不得命中单行快速路径"
+        );
+        let metrics = shaped.line_metrics(px(30.0), TextAlign::Start);
+        assert!(
+            metrics.line_count > 1,
+            "窄宽 BreakWord 数字串必须折成多行：{metrics:?}"
+        );
+
+        let no_wrap = TextContent::new(
+            "1234567890",
+            TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap),
+        );
+        let (shaped, _) = context.shape_cached(&no_wrap);
+        assert!(
+            shaped.is_simple(),
+            "NoWrap 数字文本仍走单行快速路径（既有行为不变）"
+        );
     }
 
     #[test]

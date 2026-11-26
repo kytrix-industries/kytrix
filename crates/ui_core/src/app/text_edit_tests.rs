@@ -13,7 +13,7 @@ use crate::{
         style::{Clip, Style, StylePatch},
         style_builder::StyleBuilder,
     },
-    text::{TextPassReport, TextStyle},
+    text::{TextPassReport, TextStyle, TextWrap},
     text_edit::{EditableSpec, TextAffinity},
     window::{WindowId, WindowOptions},
 };
@@ -7303,4 +7303,191 @@ fn set_scroll_line_height_validates_its_input_and_reports_typed_errors() {
         app.set_scroll_line_height(&handle, px(20.0)).is_ok(),
         "窗口已关闭时是空操作而不是错误"
     );
+}
+
+fn shaped_line_advances(app: &App, window: WindowId, node: NodeId) -> Vec<LogicalPx> {
+    app.window(window)
+        .expect("窗口存在")
+        .tree()
+        .text_line(node)
+        .expect("行快照")
+        .lines
+        .iter()
+        .map(|line| line.advance)
+        .collect()
+}
+
+fn shaped_line_right_edges(app: &App, window: WindowId, node: NodeId) -> Vec<LogicalPx> {
+    app.window(window)
+        .expect("窗口存在")
+        .tree()
+        .text_line(node)
+        .expect("行快照")
+        .lines
+        .iter()
+        .map(|line| {
+            line.items
+                .iter()
+                .flat_map(|item| match item {
+                    crate::text::ShapedTextItem::GlyphRun(run) => run.glyphs.iter(),
+                    crate::text::ShapedTextItem::InlineBox(_) => [].iter(),
+                })
+                .fold(LogicalPx::ZERO, |right, glyph| {
+                    right.max(glyph.position.x + glyph.size.width)
+                })
+        })
+        .collect()
+}
+
+fn assert_content_height(
+    app: &App,
+    window: WindowId,
+    node: NodeId,
+    content_height: LogicalPx,
+    line_height: LogicalPx,
+    line_count: usize,
+) {
+    assert!(line_count >= 1, "断行后的行数必须是正数：{line_count}");
+    assert!(
+        (content_height - line_height * line_count as f32).abs() <= px(0.5),
+        "内容高必须等于行高之和：{content_height} vs {line_height} × {line_count}"
+    );
+    assert_near(bounds(app, window, node).size.height, content_height);
+    assert_eq!(
+        shaped_line_advances(app, window, node).len(),
+        line_count,
+        "行快照与度量行数必须一致"
+    );
+}
+
+fn assert_lines_fit(app: &App, window: WindowId, node: NodeId, width: LogicalPx) {
+    for (index, advance) in shaped_line_advances(app, window, node).iter().enumerate() {
+        assert!(
+            *advance <= width + px(1.0),
+            "第 {index} 行推进 {advance} 超过折行宽度 {width}"
+        );
+    }
+    for (index, right) in shaped_line_right_edges(app, window, node)
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            *right <= width + px(1.0),
+            "第 {index} 行字形右边界 {right} 超过折行宽度 {width}"
+        );
+    }
+}
+
+#[test]
+fn typed_repeated_cjk_punctuation_wraps_onto_new_lines() {
+    let (_rt, mut app, window) = new_app();
+    let style = TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord);
+    let node = mount_editable(&mut app, window, spec(style, true), Some(200.0), "");
+    for step in 0..50 {
+        assert!(
+            type_text(&mut app, window, "。"),
+            "第 {step} 个句号必须被多行输入消费"
+        );
+        frame(&mut app, window);
+        let metrics = app.text_edit_metrics(window, node).expect("度量");
+        assert_content_height(
+            &app,
+            window,
+            node,
+            metrics.content_height,
+            metrics.line_height,
+            metrics.line_count,
+        );
+        assert_lines_fit(&app, window, node, px(200.0));
+    }
+    let metrics = app.text_edit_metrics(window, node).expect("度量");
+    assert!(
+        metrics.line_count >= 3,
+        "50 个句号在 200px 内必须折成至少 3 行：{metrics:?}"
+    );
+    assert_eq!(text_of(&app, window, node), "。".repeat(50));
+}
+
+#[test]
+fn set_value_repeated_cjk_punctuation_wraps_onto_new_lines() {
+    let (_rt, mut app, window) = new_app();
+    let style = TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord);
+    let node = mount_editable(&mut app, window, spec(style, true), Some(200.0), "");
+    assert!(
+        app.text_edit_set_value(window, node, "。".repeat(50).as_str())
+            .expect("写入成功")
+    );
+    frame(&mut app, window);
+
+    let metrics = app.text_edit_metrics(window, node).expect("度量");
+    assert!(
+        metrics.line_count >= 3,
+        "一次性写入 50 个句号在 200px 内必须折成至少 3 行：{metrics:?}"
+    );
+    assert_content_height(
+        &app,
+        window,
+        node,
+        metrics.content_height,
+        metrics.line_height,
+        metrics.line_count,
+    );
+    assert_lines_fit(&app, window, node, px(200.0));
+}
+
+#[test]
+fn break_word_multiline_keeps_latin_words_whole() {
+    let (_rt, mut app, window) = new_app();
+    let text = "word ".repeat(20);
+    let style = TextStyle::new(px(16.0)).with_wrap(TextWrap::BreakWord);
+    let node = mount_editable(&mut app, window, spec(style, true), Some(200.0), "");
+    assert!(
+        app.text_edit_set_value(window, node, text.as_str())
+            .expect("写入成功")
+    );
+    frame(&mut app, window);
+
+    let metrics = app.text_edit_metrics(window, node).expect("度量");
+    assert!(metrics.line_count >= 3, "{metrics:?}");
+    assert_content_height(
+        &app,
+        window,
+        node,
+        metrics.content_height,
+        metrics.line_height,
+        metrics.line_count,
+    );
+    let shaped = app
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .text_line(node)
+        .expect("行快照")
+        .clone();
+    assert_eq!(shaped.lines.len(), metrics.line_count);
+    for line in &shaped.lines {
+        assert!(
+            line.text_range.end == text.len() || text.as_bytes()[line.text_range.end - 1] == b' ',
+            "有空格断行机会时只在词边界折行：{:?}",
+            line.text_range
+        );
+        let mut rights: Vec<LogicalPx> = line
+            .items
+            .iter()
+            .flat_map(|item| match item {
+                crate::text::ShapedTextItem::GlyphRun(run) => run.glyphs.iter(),
+                crate::text::ShapedTextItem::InlineBox(_) => [].iter(),
+            })
+            .map(|glyph| glyph.position.x + glyph.size.width)
+            .collect();
+        if text.as_bytes().get(line.text_range.end.wrapping_sub(1)) == Some(&b' ') {
+            rights.pop();
+        }
+        if let Some(right) = rights.last() {
+            assert!(
+                *right <= px(201.0),
+                "词内字形右边界 {right} 超过折行宽度 200"
+            );
+        }
+    }
 }

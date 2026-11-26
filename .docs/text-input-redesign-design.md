@@ -699,7 +699,7 @@ pub struct InputSpec {
 | P3 | `589a462a` | caret 闪烁时钟/唤醒、ensure-visible、多行 viewport + overlay ScrollBar |
 | P4 | `eee0f04e` + merge `cb965b56` | 彩色字形 RGBA 图集、`KIND_COLOR_GLYPH`、三端 pipeline/shader/contract、彩色 emoji golden |
 
-### 11.2 已登记的设计偏差（①–㊽）
+### 11.2 已登记的设计偏差（①–㊾）
 
 | # | 偏差（相对本文 §3–§5） | 落地 |
 |---|---|---|
@@ -741,7 +741,7 @@ pub struct InputSpec {
 | ㊱ | `stale_text` / `line_is_live` 修复路径加**去抖记账**：同一节点在同一帧内只记一次「需修复」，避免逐 tile LRU 淘汰导致每帧 `invalidate_text_line + request_frame` 的理论活锁 | P4-08（裁决 8） |
 | ㊲ | `MissingLabel` 诊断**纳入「有 value 无 label」**：条件不再是 `label.is_none() && value.is_none()`（该条件因 `EditableText::a11y_patch` 恒填 value 而永不触发）；未加 label 的输入框现在会报该诊断 | P4-09（裁决 9） |
 | ㊳ | press 宿主**显式目标 + 按点落 caret**：`NodeTree::set_press_focus_target(host, target)` 由宿主显式指定**唯一**目标 editable（builder 带参版本因 root 先于 editable 构建会成死 API，最终改为 build 后回填）（旧的「DFS 取子树第一个 editable」隐式解析删除），按下时聚焦 `target` 并按落点置 caret；契约约束「一个 press 宿主显式指定一个目标」，多个候选不再由遍历顺序决定（含 P4-11） | P4-10 / P4-11（裁决 10） |
-| ㊴ | `.gitattributes` **不入库**：`.gitignore` 的 `.*` 规则继续生效，且**不**新增 `!.gitattributes` 豁免；EOL 规则改为「本机配置」写进 `CONTRIBUTING.md`（附可直接复制的文件内容与校验命令），worktree/远端不依赖该文件 | P4-12（裁决 11） |
+| ㊴ | `.gitattributes` **不入库**：`.gitignore` 的 `.*` 规则继续生效，且**不**新增 `!.gitattributes` 豁免；EOL 规则由各开发机按需自行配置（不随仓库分发，根 `CONTRIBUTING.md` 已删除），worktree/远端不依赖该文件 | P4-12（裁决 11） |
 | ㊵ | COLRv1 `numBaseGlyphPaintRecords` 读取后**按表长 clamp**（`min(count, 表中可用记录数)`）再迭代：损坏/恶意字体不再可能迭代 43 亿次，正常字体行为不变 | P4-13（裁决 12） |
 | ㊶ | ScrollBar 极短 track（`visible_lines = 1` 的 16 px）时**最小 thumb 按 track 比例收缩**：`min_thumb` 不再被 `min(track_len)` 截断成 `usable = 0`，拖拽与轨道点击保持可动（滚轮路径不受影响） | P4-14（裁决 13） |
 | ㊷ | **P4-76…P4-96 共 21 条全部 WONTFIX 登记不修**（逐条编号 + 一句话 + 理由分类见 §11.11.2）；本节不再为这些条目保留「待修」状态，代码不再为其加防御/测试 | P4-76…P4-96（裁决 14） |
@@ -751,6 +751,7 @@ pub struct InputSpec {
 | ㊻ | **Shift+双击不选词**（刻意分层）：Shift 前缀一律走「按簇扩展 / `shift_click_extension`」，因此 Shift+双击等价于两次 Shift+点击，不触发双击选词；双击选词只在无 Shift 时生效 | P4-43 |
 | ㊼ | a11y **action 优先级例外登记**：可编辑节点的 `SetTextSelection` / `ReplaceSelectedText` 由引擎**先于**应用 handler 接管（`editable_action` 在 `run_handler` 之前返回），其余 action 仍是 handler 优先；与 §4.12「a11y 文本动作由引擎处理」一致 | P4-59 |
 | ㊽ | §5.1 的**组合 setter 拆分落地**：placeholder 文本与颜色拆成 `text_edit_set_placeholder` / `text_edit_set_placeholder_color`；**没有** `EditableColors` 打包类型（四个独立 `text_edit_set_*_color`）；submit 无运行期 setter（⑰）。§5.1 / §5.2 已按实际落地改写 | P4-35 |
+| ㊾ | **多行输入折行语义补齐（break-word）**：`TextWrap` 新增 `BreakWord` = CSS `text-wrap: wrap` + `overflow-wrap: break-word`——只在整词放不进一行时按 atom 边界**应急断行**，**不改变 min-content / max-content**（区别于既有 `Anywhere` 的 `word-break: break-all`，其 min-content 会压到单 atom）；`ui_kit` 多行输入默认 `BreakWord`、单行仍 `NoWrap`；`ShapedText::measure` 的「窄宽 ≤ min-content 直接返回 min-content 尺寸」快路径对 `BreakWord` 关闭（无断行机会的串 min-content == max-content == 未断行整行宽，否则节点高停在 1 行、后续行被裁）；legacy `TextWrap::Wrap`（`overflow-wrap: normal`）语义不变，`ContentWidths` 也不变；数字快速路径把 `BreakWord` / `Anywhere` 判 ineligible（单行假设不成立）；run 级仍只下发收紧属性（`NoWrap` / `Anywhere`），`wrap` 归属整段兜底样式（`crates/ui_core/design/custom-gui-engine-design.md` §11.2 语义 1） | 本轮修复（`.review/text-input/wrapfix-report.md`） |
 
 ### 11.3 最终公开 API 清单
 
@@ -763,6 +764,8 @@ NodeTree::set_press_focus_target(host, target) -> Result<(), EngineError>  // pr
 // 类型（不暴露 parley）
 text_edit::{TextAffinity, TextCursor, TextSelection, TextEditSnapshot, TextEditMetrics,
             TextEditComposition, EditableSpec, sanitize_text}
+// 文本折行模式（新增 BreakWord，偏差 ㊾）
+TextWrap::{Wrap, NoWrap, BreakWord, Anywhere}   // BreakWord = text-wrap: wrap + overflow-wrap: break-word
 // App 读面
 App::text_edit_value(window, node) -> Result<SmolStr, EngineError>
 App::text_edit_snapshot(window, node) -> Result<TextEditSnapshot, EngineError>
@@ -793,7 +796,8 @@ visible_lines,size,submit}`、`InputState`（镜像 + `error`，只读面 + `set
 `InputError{Empty,TooLong,Invalid}`、`InputNode{root,viewport,editable,scrollbar,placeholder_state,
 state,spec}`、`input::build`、`InputNode::{install,release,sync,value,update_value,update_label,
 update_placeholder,clear,set_clearable,set_submit_on_blur}`（`set_clearable(&self, …)`，与其它运行期
-setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`。
+setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`；输入框文本折行模式：多行
+`TextWrap::BreakWord`、单行 `TextWrap::NoWrap`（偏差 ㊾）。
 
 ### 11.4 测试与门禁基线（Windows，HEAD `cb965b56` + P5 工作区改动）
 
@@ -881,18 +885,16 @@ setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`。
   A/B 证据**（例如 `idle_frame` 会显示 +71.8%，而绝对耗时只有 432 ns）。
 
 head `92b573cb`（P4 遗留清零轮实测 head；其后 `7f586728` 及之后仅文档改动）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
-head `92b573cb`（P4 遗留清零轮最终提交）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
-> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`，其后的文档修正不改变计数）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，已在 `CONTRIBUTING.md` 记录。
-> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，已在 `CONTRIBUTING.md` 记录。
+> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`，其后的文档修正不改变计数）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，属环境差异。
 
 **Windows（全工作区）**
 
 | 门禁 | 结果 |
 |---|---|
 | `cargo test --workspace` | **8924 passed / 0 failed / 30 ignored**（102 个二进制） |
-| `cargo test -p ui_core --lib` / `--features test-support` | **2315 passed + 1 ignored** / **2656 passed + 1 ignored** |
+| `cargo test -p ui_core --lib` / `--features test-support` | **2328 passed + 1 ignored** / **2669 passed + 1 ignored** |
 | `cargo test -p ui_core --features test-support --tests` | frame_record **8** / layout **4** / snapshot **14** / demo **39**（gui_smoke 1 ignored） |
-| `cargo test -p ui_kit --lib` / `cargo test -p settings_ui --lib` | **758 passed / 0 failed**、**236 passed / 0 failed** |
+| `cargo test -p ui_kit --lib` / `cargo test -p settings_ui --lib` | **759 passed / 0 failed**、**236 passed / 0 failed** |
 | `cargo +nightly clippy --workspace --all-targets -- -D warnings` | **exit 0** |
 | `cargo +nightly fmt --check` | **exit 0** |
 | gallery `--idle-check` / `--theme-check` | PASS（**0 帧/3 s**；Dark→Light→Dark 0 failure） |
@@ -902,10 +904,10 @@ head `92b573cb`（P4 遗留清零轮最终提交）；判据为 0 failed、clipp
 | 项 | 结果 |
 |---|---|
 | `cargo +nightly fmt --check` | **PASS**（exit 0） |
-| `cargo test -p ui_core --lib` | **2098 passed / 0 failed** |
+| `cargo test -p ui_core --lib` | **2111 passed / 0 failed** |
 | `cargo test -p ui_core --lib --features test-support` | **2432 passed / 0 failed** |
 | `cargo test -p ui_core --features test-support --tests` | lib 2432 / snapshot **14** 全 0 failed（frame_record/layout/demo 本机同套用例已绿，远端未单独复跑） |
-| `cargo test -p ui_kit --lib` / `cargo test -p ui_kit` | **758 passed / 0 failed**（两者一致） |
+| `cargo test -p ui_kit --lib` / `cargo test -p ui_kit` | **759 passed / 0 failed**（两者一致） |
 | `cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings`（默认 + `--features test-support`） | **exit 0 / exit 0** |
 | gallery 构建 + `--idle-check` / `--theme-check` | 构建 PASS；idle **PASS（2 帧/3 s，门槛 ≤2）**；theme **PASS（0 failure）** |
 | 测后 `git checkout -- .` | 干净（`STATUS_AFTER=0`） |
@@ -915,10 +917,10 @@ head `92b573cb`（P4 遗留清零轮最终提交）；判据为 0 failed、clipp
 | 项 | 结果 |
 |---|---|
 | `cargo +nightly fmt --check` | **PASS** |
-| `cargo test -p ui_core --lib` | **2062 passed / 0 failed** |
+| `cargo test -p ui_core --lib` | **2075 passed / 0 failed** |
 | `cargo test -p ui_core --lib --features test-support` | **2397 passed / 0 failed** |
 | `cargo test -p ui_core --features test-support --tests` | lib 2397 / snapshot **14** 全 0 failed（frame_record/layout/demo 本机同套用例已绿，远端未单独复跑） |
-| `cargo test -p ui_kit --lib` / `cargo test -p ui_kit` | **758 passed / 0 failed** |
+| `cargo test -p ui_kit --lib` / `cargo test -p ui_kit` | **759 passed / 0 failed** |
 | `cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings`（默认 + `--features test-support`） | **exit 0 / exit 0** |
 | gallery 构建 + `--idle-check` / `--theme-check` | 构建 PASS；idle **PASS（1 帧/3 s，门槛 ≤2）**；theme **PASS（0 failure）** |
 
@@ -973,8 +975,8 @@ ensure-visible 的「已达」判定改为「clamp 后目标」。二者都不�
 |---|---|
 | 变异 11 项重跑（`.review/text-input/p5-mutations-r3.log`） | M1/M2/M1b/M3/M4/M5/M6/M7/M8/**M9**/M10 全部 **RED**（M9 = 新用例变红），每项 `restore identical=True`；M3 在新几何下仍 2/2 红 |
 | Windows | 见 §11.7（8924 passed / clippy 0 / fmt 0 / gallery 0 帧 + 0 failure） |
-| Ubuntu | 见 §11.7（ui_core 2098 & 2432 全绿、ui_kit 758、clippy 0、gallery idle 1 帧 + theme 0 failure） |
-| macOS | 见 §11.7（ui_core 2062 & 2397 全绿、ui_kit 758、clippy 0、gallery idle 0 帧 + theme 0 failure） |
+| Ubuntu | 见 §11.7（ui_core 2111 全绿、ui_kit 759、clippy 0、gallery idle 1 帧 + theme 0 failure） |
+| macOS | 见 §11.7（ui_core 2075 全绿、ui_kit 759、clippy 0、gallery idle 0 帧 + theme 0 failure） |
 
 ### 11.10 终审 round 1 修复记录（P3×3 + 廉价 P4）
 
@@ -1036,7 +1038,7 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 | P4-08 | `stale_text` / `line_is_live` 修复路径加去抖记账（一节点一帧一次） | `paint/pass.rs`、`app/frame.rs`；㊱ |
 | P4-09 | `MissingLabel` 诊断纳入「有 value 无 label」的可编辑节点 | `a11y/tree.rs`；㊲ |
 | P4-10 / P4-11 | `NodeTree::set_press_focus_target(host, target)`：宿主**显式指定唯一目标** + 按点落 caret；「一个 press 宿主一个目标」成文 | `node/tree.rs`、`interaction/focus.rs`、`app/input.rs`、`ui_kit/src/kit/input.rs`、引擎设计 §1.3；㊳ |
-| P4-12 | `.gitattributes` **不跟踪**（不加 `!.gitattributes`），规则改写入 `CONTRIBUTING.md` | `CONTRIBUTING.md` §1；㊴ |
+| P4-12 | `.gitattributes` **不跟踪**（不加 `!.gitattributes`），EOL 规则由各开发机按需配置、不随仓库分发 | ㊴ |
 | P4-13 | COLRv1 `numBaseGlyphPaintRecords` **按表长 clamp** 后再迭代 | `text/raster.rs`；㊵ |
 | P4-14 | ScrollBar 极短 track 的**最小 thumb 按 track 比例收缩** | `ui_kit/src/kit/scroll_bar.rs`；㊶ |
 
@@ -1050,7 +1052,7 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 | a11y（§2.4） | P4-56…P4-64 | `node_for` 回落 focus 字段；`focus_ancestors` 补真实 consumer 用例；角色判定去重；`editable_action` 优先级例外成文（59，见 ㊼）；Replace 的 `?` 传播判别测试；密码扫描覆盖 custom action；删 `apply_caret` 冗余守卫与不可达 run 分支；组合期 cancel 排序判别 | `a11y.rs`、`a11y/adapter.rs`、`a11y/action.rs`、`a11y/mapping.rs`、`a11y/tree.rs`、`a11y/contract_tests.rs`、`app/text_edit_tests.rs` |
 | ui_kit（§2.5） | P4-65…P4-70 | 非法 style 不改状态；IME 回归区分 `focused_editable` 与 `focused`；`visible_lines_height` 的 `padding_y` 形参修正；placeholder 颜色断言走引擎；`update_value` 的 error 变化也 `request_repaint` | `ui_kit/src/kit/input.rs`、`app/text_edit_tests.rs` |
 | settings_ui（§2.6） | P4-71 | 失焦提交帧的下拉/表格消费点改用**新目录**（不再用提交前快照） | `settings_ui/src/pages/translation/page.rs` |
-| 文档 / 设计基线（§2.7） | P4-72、73、74、75 | 三端计数按实测回填（72：Windows 8924/0/30、Ubuntu 2098+2432、macOS 2062+2397）；`drain_events_where` 残留注记（73，见引擎设计 §1.3）；Linux 尺寸基线机理（75）与 `render/linux.rs` cfg 口径（74）写入 `CONTRIBUTING.md` | 本文 §11.7 / §11.9、`crates/ui_core/design/custom-gui-engine-design.md` §1.3、`CONTRIBUTING.md` §2/§3 |
+| 文档 / 设计基线（§2.7） | P4-72、73、74、75 | 三端计数按实测回填（72：Windows 8924/0/30、Ubuntu 2111、macOS 2075）；`drain_events_where` 残留注记（73，见引擎设计 §1.3）；Linux 尺寸基线机理与 `render/linux.rs` cfg 口径见 `.docs/gui-migration/spec-deltas/kit-text.md` §10.7 | 本文 §11.7 / §11.9、`crates/ui_core/design/custom-gui-engine-design.md` §1.3、`.docs/gui-migration/spec-deltas/kit-text.md` §10.7 |
 
 > 批次划分（清单 §6）：1A 文档与登记 / 1B `ui_core` 测试 / 1C `ui_kit` 测试 / 2A 引擎微调 / 2B kit+settings_ui /
 > 3 渲染与彩色字形（含 golden 重建）/ 4 a11y 读面。**说明**：机械项以清单分组归纳，逐条内容不在此复制。
@@ -1104,7 +1106,7 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 | 8 | P4-08 stale_text 逐 tile LRU 抖动 | **加去抖记账** | ㊱ |
 | 9 | P4-09 `MissingLabel` | 诊断纳入「**有 value 无 label**」 | ㊲ |
 | 10 | P4-10 press 宿主（含 P4-11） | 实现**按点落 caret** + **显式指定目标 editable**（新引擎 API），并约束「一个 press 宿主显式指定一个目标」 | ㊳、引擎设计 §1.3 |
-| 11 | P4-12 `.gitattributes` | **不跟踪**，改为文档记录（`CONTRIBUTING.md` 的「本机配置」） | ㊴ |
+| 11 | P4-12 `.gitattributes` | **不跟踪**，EOL 规则由各开发机按需配置（不随仓库分发） | ㊴ |
 | 12 | P4-13 COLRv1 记录数 | **按表长 clamp** | ㊵ |
 | 13 | P4-14 ScrollBar 极短 track | **最小 thumb 按 track 比例收缩** | ㊶ |
 | 14 | P4-76…P4-96（21 条） | **全部登记不修** | §11.11.2、㊷ |
@@ -1113,9 +1115,8 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 
 | 项 | 状态 |
 |---|---|
-| §11.7 / §11.9 三端测试计数（P4-72） | 已按实测回填（Windows workspace 8924/0/30、lib 2315、TS 2656；Ubuntu lib 2098、TS 2432；macOS lib 2062、TS 2397） |
+| §11.7 / §11.9 三端测试计数（P4-72） | 已按实测回填（Windows workspace 8924/0/30、lib 2328、TS 2669；Ubuntu lib 2111；macOS lib 207562、TS 2397） |
 | 旧计数口径 | 各轮历史记录保留原值供追溯；当前口径只认 §11.7 的实测值，不得引用更早的 `2062/2386/748`、`2027/2351/748`、`2067/2392/752`、`2032/2357/752` |
-| 旧计数 `2062/2386/748`、`2027/2351/748` | 已在 §11.7 注明**过期**（round 2 为 `2067/2392/752`、`2032/2357/752`），不得引用 |
 
 ## 附录 A：关键证据索引
 
