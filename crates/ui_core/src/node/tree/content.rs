@@ -964,6 +964,18 @@ pub(crate) fn scroll_slot_mut(tree: &mut NodeTree, node: NodeId) -> Option<&mut 
         .and_then(|slot| slot.scroll.as_mut())
 }
 
+pub(crate) fn scroll_proxy(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+    tree.interaction(node).and_then(|slot| slot.scroll_proxy)
+}
+
+pub(crate) fn set_scroll_proxy(tree: &mut NodeTree, node: NodeId, proxy: Option<NodeId>) -> bool {
+    let Some(interaction) = tree.ensure_interaction(node) else {
+        return false;
+    };
+    interaction.scroll_proxy = proxy;
+    true
+}
+
 pub(crate) fn overlay_slot(tree: &NodeTree, node: NodeId) -> Option<OverlaySlot> {
     tree.interaction(node).and_then(|slot| slot.overlay)
 }

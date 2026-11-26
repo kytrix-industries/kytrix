@@ -132,6 +132,9 @@ fn remove(
     if modal && let Some(target) = app.windows.get_mut(&window) {
         crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
     }
+    if modal {
+        crate::interaction::scroll::clear_scroll_session(app, window);
+    }
     super::focus::restore_focus(app, window, opener);
     if let Some(scope) = scope {
         let animations_before = app.animations.len();

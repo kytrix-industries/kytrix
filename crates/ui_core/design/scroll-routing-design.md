@@ -14,7 +14,7 @@
 |---|---|---|---|
 | D1 | 路由模型 | **Chrome 式：单目标闩锁** | 一次连续滚动序列只服务序列开始时选出的一个容器；到边界后余量丢弃，序列结束后再次滚动才重新仲裁（可能轮到外层）。删除现有“同一事件内逐祖先链式消费”。 |
 | D2 | 滚动条归属 | **滚它所属的容器** | 引入节点级 `scroll_proxy`；`ScrollBar` track/thumb、`Table` header、多行 `Input` clear 按钮等装饰节点显式归属其滚动容器。 |
-| D3 | 行单位滚轮动画 | **改为立即到位** | 删除“行滚轮 120 ms 动画 + 动画目标累加”；`scroll_to_animated` 仅保留给程序化滚动/ensure-visible。 |
+| D3 | 行单位滚轮动画 / 滚动动画能力 | **改为立即到位；滚动动画能力整体删除（裁决 C）** | 删除“行滚轮 120 ms 动画 + 动画目标累加”，并删除 `scroll_to_animated` 与 `AnimationTarget::Scroll`；**行滚轮与程序化滚动均立即 `scroll_to`**，不再保留滚动动画 API。 |
 | D4 | 实施范围 | **路由 + 统一目标解析 + 双轴容器（E22）** | 新增 `ScrollAxes` 双轴模型；滚轮/键盘/a11y 共用同一目标解析器；`ScrollSlot` 从单轴改为双轴。 |
 | D5 | 附加项 | 滚动后重算 hover；gallery `--wheel-check`；gallery 外层页面加可见滚动条 | 纳入 P2/P3。**不新增**每容器链式策略 API（未选中；按 AGENTS“不做预防性抽象”暂缓）。 |
 | D6 | 文档落点 | `crates/ui_core/design/scroll-routing-design.md` | 本文件；实施完成后回写偏差（附录 D）。 |
@@ -101,7 +101,7 @@
 | C | 内层到边界后继续滚 | 按 D1（Chrome）本次序列停住 | 真实 ⑦ 滚 3 个刻度：内层到 max 344，同一序列余量 88 逻辑 px（432−344）驱动外层（截图像素差 110 物理 px = 88 逻辑 px） | **按 D1 需改**：当前是 Qt 式链式 |
 | D | 连续滚动中指针跨容器 | 目标不变 | 代码：每事件重新 `hit_at` + 重建 chain（`input.rs:584-627`） | **缺陷**：无序列锁定 |
 | E | 滚动后指针下内容变化 | hover/tooltip/滚动条状态更新 | `revalidate_hover` 只在模态浮层创建（`app/overlay.rs:60`）与置顶（`:153`）调用；它只按已有 hover 节点重过滤模态作用域，`scroll_to`/关闭都不按指针重新命中 | **缺陷**（D5 纳入） |
-| F | 行滚轮手感 | 立即 3 行 | 120 ms 动画（`input.rs:605`、`639-646`） | **按 D3 需改** |
+| F | 行滚轮手感 | 立即 3 行 | 120 ms 动画（`input.rs:605`、`639-646`） | **按 D3/裁决 C 需改**：行滚轮立即；滚动动画能力删除 |
 | G | 双轴容器（宽表格/大图） | 横竖都能滚 | `ScrollSlot` 单轴，非本轴恒 0（`interaction/scroll.rs:15-32`）；设计文档登记 E22 未实现（`design/custom-gui-engine-design.md:4780-4781`） | **按 D4 本批实现** |
 
 **缺陷 B 的结构性根因**（`codebase-survey.md` §6）：
@@ -136,7 +136,7 @@
 | `wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll`（`:1416-1484`） | 内层 max=0 ⇒ 外层 48 | 保留；新语义下由“候选选择跳过不可消费内层”实现 |
 | `a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain`（`:3820-3885`） | 内层横 12、外层纵 3（逐轴拆分） | **删除并替代**：单目标闩锁下横内层吃掉整段（外层 0） |
 | `pixel_scroll_follows_immediately_while_line_scroll_is_animated`（`:3122-3171`） | Line 走动画、Pixel 立即 | **删除并替代**：两者都立即 |
-| `programmatic_scroll_cancels_a_pending_wheel_animation`（`:3656-3704`） | 滚轮动画被 `scroll_to` 取消 | **改写**：程序化动画（`scroll_to_animated`）被 `scroll_to` 取消 |
+| `programmatic_scroll_cancels_a_pending_wheel_animation`（`:3656-3704`） | 滚轮动画被 `scroll_to` 取消 | **删除**：滚动动画能力删除（裁决 C），该用例与 E31 一并删除 |
 | `key_up_lands_and_arrow_keys_scroll_the_focused_container`（`:2944-3024`） | 焦点容器方向键/翻页 | 保留；补代理与双轴用例 |
 | `wheel_...`/nested scroll 相关（`:719-781`、`:783-880`） | 嵌套槽位裁剪/烘焙 | 保留（绘制路径不应回归） |
 | `a11y/action.rs:1603` 等 | a11y 滚动收敛到容器 | 保留；双轴/代理后补 a11y 用例 |
@@ -299,42 +299,34 @@ pub(crate) struct ScrollSession {
 
 **候选链**（替代 `on_scroll` 的父链收集）
 
-```rust
-fn scroll_candidates(tree: &NodeTree, from: NodeId) -> SmallVec<[NodeId; 8]> {
-    let mut out = SmallVec::new();
-    let mut visited = SmallVec::<[NodeId; 16]>::new();
-    let mut cursor = Some(from);
-    let mut hops = 0_usize;
-    while let Some(node) = cursor {
-        hops += 1;
-        if hops > MAX_CHAIN_HOPS { break; }
-        if visited.contains(&node) { break; }
-        visited.push(node);
-        if let Some(proxy) = tree.scroll_proxy(node) {
-            if !visited.contains(&proxy) && tree.scroll_slot(proxy).is_some() {
-                let _ = push_unique(&mut out, proxy);
-                cursor = tree.parent(proxy);
-                continue;
-            }
-        }
-        if tree.scroll_slot(node).is_some() {
-            let _ = push_unique(&mut out, node);
-        }
-        cursor = tree.parent(node);
-    }
-    out
-}
+```text
+scroll_candidates(from):
+    out/visited/hops
+    cursor = from
+    while cursor:
+        hops += 1; if hops > MAX_CHAIN_HOPS or visited.contains(cursor): break
+        visited.push(cursor)
+        if let Some(proxy) = scroll_proxy(cursor):
+            # 连续代理链 A→B→C：沿代理一直跟随，中间节点不产出；失效/环/hop 超限即停
+            chain = follow_proxy_chain(proxy)       # 逐跳校验 scroll_slot、visited、hops
+            if chain is valid:
+                push_unique(out, chain.final_target)
+                cursor = parent(chain.final_target)  # 目标祖先仍在链上
+                continue
+            # 失效代理：按“无代理”继续
+        if scroll_slot(cursor).is_some(): push_unique(out, cursor)
+        cursor = parent(cursor)
 ```
 
 规则：
 
-1. **代理优先于自身**：节点有 `scroll_proxy` 时只产出目标容器（不产出自身，即使自身有 `ScrollSlot`）。
-2. **代理后从目标的父节点继续**：保证目标容器的祖先仍在链上（滚动条到边界后，新序列可轮到页面）。
-3. **代理必须仍有效**：`proxy` 必须存在且仍拥有 `ScrollSlot`；失效（目标被卸载）时按“无代理”继续 `parent(node)`，不产出死节点。
-4. **环防护**：`visited` 记录走过的节点；`MAX_CHAIN_HOPS = 32` 是纯安全阀，与 `SmallVec` 的 inline 容量解耦；`push_unique` 返回是否新增，重复即终止。**不设 8 层硬截断**（旧实现的 `SmallVec<[…; 8]>` 只是 inline 容量，超出会 spill，不是上限）。
+1. **代理优先于自身**：节点有 `scroll_proxy` 时只产出（代理链的）目标容器，不产出自身，即使自身有 `ScrollSlot`。
+2. **连续代理链**：`A→B→C` 时继续跟随 `B→C`，**中间节点不产出**（含 B 的自身槽）；只产出最终目标 C，并从 `parent(C)` 继续，保证目标祖先仍在链上。代理链在“无代理 / 目标无 `ScrollSlot`（失效）/ 命中 `visited`（环）/ `hops > MAX_CHAIN_HOPS`”时停止；任一失败按失效代理处理（退化为“无代理”：产出自身槽，从 `parent(node)` 继续）。
+3. **代理必须仍有效**：代理链每一跳的节点都必须存在且拥有 `ScrollSlot`；失效（目标被卸载）时按“无代理”继续 `parent(node)`，不产出死节点。
+4. **环防护**：`visited` 记录走过的节点（含代理链中间节点）；`MAX_CHAIN_HOPS = 32` 是纯安全阀（代理跳也计数），与 `SmallVec` 的 inline 容量解耦；`push_unique` 返回是否新增，重复即终止。**不设 8 层硬截断**（旧实现的 `SmallVec<[…; 8]>` 只是 inline 容量，超出会 spill，不是上限）。
 5. **设置时拒绝后代目标**：`set_scroll_proxy` 拒绝 `target` 是 `node` 的后代（`tree.is_ancestor(node, target)`），从源头消除最常见的 A 祖先→B 后代环；`visited` 兜底任意 A→B→C→A 环。
 6. **模态作用域**：仍在事件入口过滤（保持 `on_scroll` 现有行为与 `input.rs:589-596`），不进入候选链逻辑。
-7. **可见/禁用**：命中测试已排除命中路径上的不可见/禁用节点；但代理目标可能是兄弟子树，`select_target` 额外要求候选 `tree.is_visible_locally(target) && tree.is_effectively_interactive(target)`。不可见/禁用目标不进入候选（补 K10 用例）。
+7. **可见/禁用**：命中路径已排除不可见/禁用节点；但代理目标可能跨子树，`select_target` 额外要求候选 **`tree.is_effectively_visible(target)`（自身与全部祖先都可见，含隐藏祖先）&& `tree.is_effectively_interactive(target)`**。不满足的候选**跳过并继续向上**（不终止链；补 K10 用例）。
 
 **来源映射**
 
@@ -372,7 +364,7 @@ Active ──End(Discrete)/Cancel──▶ Idle
 Active ──End(Continuous)──▶ Grace(target, ended_at=now)
 Grace ──Momentum/Update 且 now-last_at ≤ IDLE──▶ Grace(同 target)
 Grace ──now-last_at > IDLE / Begin / Cancel──▶ Idle（Begin 重新仲裁）
-Active ──目标节点失效──▶ 重新仲裁/Idle
+Active ──目标节点失效──▶ Discrete/Update/Momentum：当前事件重新仲裁并消费；End：只清会话（Idle）
 Active ──窗口失焦/模态浮层开闭/目标卸载──▶ Idle
 ```
 
@@ -383,13 +375,15 @@ Active ──窗口失焦/模态浮层开闭/目标卸载──▶ Idle
 | 事件 | 行为 |
 |---|---|
 | `Phase::Discrete`（Windows 滚轮） | 无会话或 `now - last_event_at > IDLE` → 新序列（重新仲裁）；否则沿用目标。处理后 `last_event_at = now`、`ended_at = None` |
-| `Phase::Begin` | 强制新序列（重新仲裁），`ended_at = None` |
+| `Phase::Begin` | 强制新序列：**先清旧会话**；非零 delta → 重新仲裁并建立新会话；**零 delta `Begin` 清会话但不建立新会话**（后续 `Update` 再重新仲裁），`ended_at = None` |
 | `Phase::Update` | 有会话且同窗口 → 沿用；无会话 → 新序列 |
 | `Phase::Momentum` | 有会话且 `now - last_event_at <= IDLE` → 沿用（即使 `ended_at` 已置位）；超过 IDLE → 清会话并按新序列仲裁 |
-| `Phase::End` | 先按当前目标处理本次事件（若有 delta）；`Discrete` 会话直接清；`Continuous` 会话只置 `ended_at = Some(now)` 并把 `last_event_at = now`（进入 Grace，等待可能的 Momentum） |
+| `Phase::End` | 有会话时：先按当前目标处理本次事件（若有 delta），`Discrete` 会话直接清，`Continuous` 会话只置 `ended_at = Some(now)` 并把 `last_event_at = now`（进入 Grace，等待可能的 Momentum）。**无会话时不建立新会话、不滚动**（仅按收盘语义结束） |
 | `Phase::Cancel` | 立即清会话，不处理 delta |
 | 指针移动 | 不改变会话目标；hover 仍按普通指针路径更新 |
-| 目标节点失效 | 下一事件重新仲裁；当前事件丢弃（避免使用悬空节点） |
+| 目标节点失效 | **`Discrete`/`Update`/`Momentum`：当前事件重新仲裁并处理本次 delta**（不丢事件）；**`End`：只清会话、不消费**；避免访问悬空节点 |
+
+> **无命中（`hit=None`）**：不选目标、不滚动闩锁目标；仍执行相位状态机（`Cancel`/`End(Discrete)` 清会话、`End(Continuous)` 只收盘；`Begin`/`Update`/`Momentum` 不滚动）。详见 §4.5/§4.10。
 
 > macOS 的顺序是 `phase Ended` 之后跟随 `momentumPhase Began/Changed/Ended`（`platform/macos/view.rs:980-999`）。若 `End` 立即清会话，惯性会被当成新序列重新命中，可能在惯性中换目标——因此 `End` 只“收盘”不清会话，`Momentum` 在 `IDLE` 宽限内继续沿用；`Begin`/`Cancel`/失焦/模态开闭才强制清。补 E27 `continuous_end_then_momentum_keeps_target`。
 
@@ -402,7 +396,11 @@ Active ──窗口失焦/模态浮层开闭/目标卸载──▶ Idle
 ```text
 route_wheel(window, position, delta, unit, phase, modifiers):
     hit = hit_at(position) filtered by modal scope
-    if hit is None: return
+    if hit is None:
+        # 无命中：只做相位清理，绝不滚动闩锁目标
+        按相位清理会话（Cancel/End(Discrete) 清会话；End(Continuous) 只收盘；
+                        Begin 清旧会话；Update/Momentum 保持）
+        return
     session = session_for(window, phase, event.timestamp)
     target = match session:
         Some(s) if s.target alive => s.target
@@ -414,21 +412,20 @@ route_wheel(window, position, delta, unit, phase, modifiers):
         refresh_hover_under_pointer(window)
         request_frame (由 scroll_to 内部完成)
 
-apply_to_target(target, delta, unit):
+apply_to_target(target, raw, unit):
     slot = tree.scroll_slot(target)
-    goal = slot.offset
-    for axis in [Vertical, Horizontal] where slot.axes has axis:
-        drives = delta 分量（Line ⇒ × line_height）
-        if drives == 0: continue
-        goal.axis = clamp(slot.offset.axis - drives, max_offset.axis)
-    if goal != slot.offset:
-        scroll_to(handle, goal)          // 一次调用同时写两轴：cancel 同槽动画、damage、a11y、rewindow_virtual 各一次
+    requested = request_px(slot, raw, unit)          // 归一化：offset 增加方向；Line 用目标 line_height
+    application = apply_scroll(slot, viewport(target), requested)   // addendum §2.4（applied/consumed/moved）
+    if application.moved:
+        goal = slot.offset + application.applied     // 一次调用同时写两轴：damage、a11y、rewindow_virtual 各一次
+        scroll_to(handle, goal)
     // 余量丢弃：不再循环到祖先
 ```
 
 - **整包消费**：`apply_to_target` 只作用于闩锁目标；不把剩余量给候选链后续节点。
+- **无命中/无会话 End**：`hit=None` 时只做相位清理，**不选目标、不滚动闩锁目标**；无会话的非零 `End` 也**不建立新会话、不滚动**（§4.4/§4.10）。
 - **双轴**：同一目标内两轴合并为**一次** `scroll_to(goal)`（`goal` 从原 `slot.offset` 构造、只改需要动的轴；一次 damage / 一次 `rewindow_virtual`）。
-- **无动画**：删除 `scroll_animation_target` 与 `on_scroll` 中的动画分支；`scroll_to_animated` 仅供程序化/ensure-visible。
+- **无动画（能力已删除，裁决 C）**：删除 `scroll_animation_target`、`scroll_to_animated`、`AnimationTarget::Scroll` 与 `on_scroll` 动画分支；**行滚轮与程序化滚动统一立即 `scroll_to`**，不再有“动画目标”状态。
 - **无滚动时**：不 `request_frame`、不刷新 hover（I7）。
 - **滚动后 hover**：调用新 `refresh_hover_under_pointer(window)`：读取 `Window::pointer_position()` → `hit_at` → `update_hover`；无指针位置或指针被捕获时跳过（避免打断拖拽）。只做一次命中测试，成本与指针移动同阶。
 - **`direct` 标志删除**：滚轮不再区分 Pixel/Line 的执行方式；单位只影响步长换算。
@@ -489,7 +486,7 @@ impl App {
   - `Table`：`TableInner::Geometry` 增加 `header: Option<NodeId>`（当前只存 `outer/body/header_row`，`table.rs:240-246`），`build` 时记录 header 节点；`attach` 在 `self.inner.list.attach(...)` 之后取 `list.viewport_node()` 设置 header 代理。`header` 与 `body` 是兄弟子树（`table.rs:484-497` vs `625-637`）。
   - 多行 `Input`：clear 按钮在 `set_clearable(true)` 时才创建（`input.rs:537-573`），不能在 `install_scroll`（`:643-686`）接线。改为：`set_clearable(true)` 成功后、以及 `sync_clear_button` 首次拿到 `button.node()` 时调用 `set_scroll_proxy(.., Some(field.viewport))`；`set_clearable(false)` 移除前设 `None`；`install_scroll` 对 disabled 输入直接跳过（`:463-465`），此时目标无 `ScrollSlot` 则跳过代理。`release` 清理。
 - **环/悬空**：`set_scroll_proxy` 拒绝 `target` 为 `node` 后代与自指；候选链 `visited` 防任意环；目标卸载后候选链按“失效代理”跳过并重新落到祖先（I9）。
-- **可见性/禁用**：`select_target` 只接受 `tree.is_visible_locally(target) && tree.is_effectively_interactive(target)` 的候选；不可见/禁用目标视为无候选，继续向上。
+- **可见性/禁用**：`select_target` 只接受 **`tree.is_effectively_visible(target)`（自身与全部祖先可见，含隐藏祖先）&& `tree.is_effectively_interactive(target)`** 的候选；不满足的候选跳过并继续向上（不终止链）。
 - **语义**：代理节点只影响“滚轮/滚轮类滚动目标解析”，不改变点击、拖拽、hover、a11y 角色。
 
 ### 4.8 统一目标解析
@@ -503,13 +500,14 @@ impl App {
 
 **键盘语义保持不变**：焦点容器到边界不链式、不回退；`bind_key` 仍优先于默认滚动（`input.rs:780-815`）。仅把“找容器”换成代理感知的共享解析器。
 
-### 4.9 与动画、虚拟列表、绘制、hover 的关系
+### 4.9 与滚动动画（已删除）、虚拟列表、绘制、hover 的关系
 
-- **动画**：滚轮不再创建/读取滚动动画；`scroll_to_animated`（`app/scroll.rs:207-238`）与 `AnimationTarget::Scroll` 保留给程序化/ensure-visible；`scroll_animation_target`（`app/animation.rs:15-29`）删除（无调用方）。`scroll_to` 仍取消同槽动画（`app/scroll.rs:122`），保证程序化滚动打断动画。
+- **动画（能力已删除，裁决 C）**：滚轮与**程序化滚动都立即 `scroll_to`**；`App::scroll_to_animated`、`AnimationTarget::Scroll`、`scroll_animation_target`（`app/animation.rs:15-29`）**全部删除**；`scroll_to` 是唯一写偏移入口（不再有“取消同槽动画”语义）。
 - **虚拟列表**：`scroll_to` 已调用 `rewindow_virtual`（`app/scroll.rs:143`）；滚轮立即路径无需新增钩子。嵌套虚拟列表的槽位裁剪/烘焙仍走既有 `paint.rs` 逻辑（§2.1），本批不改渲染。
 - **绘制/damage**：只复用 `scroll_to` 的 damage/`a11y_note_scroll` 路径；`refresh_hover_under_pointer` 只更新 hover 绑定（`update_hover` 已有 hover 链 diff + `mark_bind/mark_paint`），不触发样式全量重算。
 - **hover**：滚轮导致的实际滚动后刷新一次；程序化滚动是否刷新不在本批（避免 `ensure_visible` 等高频路径额外命中测试；§9-O4）。
 - **光标/滚动条淡入**：`ScrollBar::sync` 用 `app.hovered()` 判 `node_in_subtree(track, hovered)`；hover 刷新后自然得到正确状态。
+- **模块可见性**：`app::input` **保持私有**；仅以窄导出 `pub(crate) use refresh_hover_under_pointer`（或同义窄入口）供 `interaction/scroll.rs` 复用，不把整个 `app::input` 提升为 `pub(crate)`。
 
 ### 4.10 边界情况
 
@@ -517,11 +515,14 @@ impl App {
 |---|---|
 | 模态浮层（dialog/dropdown/menu） | 保留入口的 modal scope 过滤：作用域外滚轮直接丢弃（现状）；作用域内正常路由。浮层开/关清会话 |
 | 非模态浮层（tooltip 等） | 命中在浮层节点上时按其候选链滚动；浮层通常无滚动槽 → 落到页面（可接受） |
-| 目标节点在序列中被卸载 | 下一事件检测 `tree.get(target)` 失败 → 重新仲裁；会话清理；不 panic |
+| 目标节点在序列中被卸载 | **`Discrete`/`Update`/`Momentum` 检测到 target 失效 → 当前事件重新仲裁并处理本次 delta**（不丢事件）；**`End` 遇失效 target 只清会话、不消费**；避免访问悬空节点 |
 | 窗口失焦 | `on_window_focus_lost` 清会话（`app/input.rs:902-914`） |
 | 指针离开窗口 | 会话保留到 IDLE 自然过期；滚轮不再到达 |
 | 多窗口 | 会话按 `WindowId` 隔离 |
-| 禁用/不可见节点 | 命中测试已排除；代理目标不做额外可见性判断 |
+| 禁用/不可见节点 | 命中测试已排除；**代理/闩锁目标用 `is_effectively_visible`（自身与全部祖先可见，含隐藏祖先）+ `is_effectively_interactive` 过滤**；不满足的候选跳过并回退到链上的下一个 |
+| 无命中（`hit=None`） | 只做相位清理：`Cancel`/`End(Discrete)` 清会话、`End(Continuous)` 只收盘；**不选目标、不滚动闩锁目标** |
+| 零 delta `Begin` | 清旧会话、**不建立新会话**（后续 `Update` 再重新仲裁） |
+| 无会话 + 非零 `End` | **不建立新会话、不滚动**（仅按收盘语义结束） |
 | 深层嵌套（>8） | **不设 8 层截断**（旧 `SmallVec` 容量只是 inline 优化）；`visited` + `MAX_CHAIN_HOPS=32` 纯安全阀；E22 用 12 层验证第 9 层可滚 |
 | 双轴 + Shift | 先换轴再选目标；换轴后只按新 delta 判定 |
 | 滚动条在双轴容器 | 两个 bar 各自代理同一节点；滚轮在任一 bar 上都滚目标容器（两轴都消费） |
@@ -556,6 +557,8 @@ impl App {
 | `a11y/action.rs` 步长 | 所有动作 `viewport.height` | `ScrollUp/Down/Page*` 用 height；`ScrollLeft/Right` 用 width；`ScrollByItem` 用 line_height |
 | `ScrollBar` | `attach` 只记 `ScrollHandle`；`ScrollbarAxis::point` 清零另一轴 | `attach -> Result` 并设 track 代理；`release` 清理；`point(current, offset)` 只改本轴；`Table`/`Input` 见 §4.7 |
 | `Table` | `Geometry` 只存 outer/body/header_row | 增加 `header: Option<NodeId>`；attach 后设 header 代理 |
+| `App::scroll_to_animated` | 计划保留公共/`pub(crate)` 包装 | **删除（裁决 C：滚动动画能力移除）**；程序化滚动统一 `scroll_to`（立即），无替代动画 API |
+| `app::input` | P2 曾提升模块可见性 | **模块保持私有**；仅窄导出 `refresh_hover_under_pointer`（`pub(crate)`）供 `interaction/scroll.rs` 调用 |
 
 ### 5.3 删除（不保留兼容层）
 
@@ -563,7 +566,7 @@ impl App {
 - `on_scroll` 内联 `chain` 构建与逐祖先消费（`app/input.rs:609-682`）。
 - `direct`（`unit == Pixel || phase.is_continuous()`）分支与行滚轮动画分支；连带删除 `ScrollPhase::is_continuous`（`event.rs:315-320`，删 `direct` 后无生产调用方）。
 - **已删除（P1）**：`scroll::scroll_ancestor_on`（原 `interaction/scroll.rs:63-70`）及其在 `text_edit.rs` 的调用；P4 不再处理该项。
-- `scroll_animation_target`：`app/animation.rs:15-29` **与** `App::scroll_animation_target` 包装（`app.rs:1005-1007`）。
+- **裁决 C 删除（滚动动画能力）**：`scroll_to_animated`（`app/scroll.rs:207-238`）、`AnimationTarget::Scroll`、`scroll_animation_target`（`app/animation.rs:15-29`）与 `App::scroll_animation_target` 包装（`app.rs:1005-1007`）全部删除；程序化滚动统一立即 `scroll_to`。
 - 旧断言测试（§2.4 明确列出）与相关测试辅助。
 - **保留**：`scroll::scroll_ancestor` / `scroll_ancestors` 作为 text_edit/a11y 的结构性（非代理）助手保留——它们仍被 `text_edit.rs:3544/4132/4158` 与 `a11y/mapping.rs:297` 使用；本批只把滚轮/键盘/a11y 的“找滚动目标”迁移到 `scroll_candidates`，不强行删除底层遍历器。若 P4 后发现可统一再删。
 
@@ -581,11 +584,11 @@ impl App {
 |---|---|
 | `ui_core::interaction.rs` | `ScrollAxis` 定义删除；`ScrollConfig`/`ScrollState`/`ScrollSlot` 字段换 `axes` |
 | `ui_core::interaction/scroll.rs` | `max_offset`/`clamp_offset` 双轴；`scroll_ancestor_on` **已删除（P1）**；测试槽构造换 `axes` |
-| `ui_core::app/input.rs` | **P1 就要改**（否则删 `ScrollAxis` 后不编译）：`on_scroll`/`default_key_scroll` 的单轴 match 机械改为 `axes`（旧链式保留）；P2 再整体重写 `on_scroll`，并把 `InputEvent::Scroll.timestamp` 透传到 `App::on_scroll`（当前 `input.rs:167-182` 用 `..` 丢弃） |
+| `ui_core::app/input.rs` | **P1 就要改**（否则删 `ScrollAxis` 后不编译）：`on_scroll`/`default_key_scroll` 的单轴 match 机械改为 `axes`（旧链式保留）；P2 再整体重写 `on_scroll`，并把 `InputEvent::Scroll.timestamp` 透传到 `App::on_scroll`（当前 `input.rs:167-182` 用 `..` 丢弃）；**模块保持私有**，仅窄导出 `refresh_hover_under_pointer`（`pub(crate)`）供 `interaction/scroll.rs` |
 | `ui_core::app.rs` | `App::on_scroll` 签名加 `timestamp`；删除 `App::scroll_animation_target` 包装（`app.rs:1005-1007`） |
 | `ui_core::app/scroll.rs` | `make_scroll` 校验/写入 `axes`；`scroll_to` 双轴夹紧；`ScrollState.axes` |
 | `ui_core::app/virtual_list.rs` | `VirtualListConfig.content_width`；`ScrollSlot { axes: Vertical | Both }`（`content_width=Some` 时 Both）；三处 `scroll.content` 写入保留横向内容宽（`content_width.unwrap_or(viewport.width)`） |
-| `ui_core::app/animation.rs` | 删除 `scroll_animation_target`；`AnimationTarget::Scroll` 保留 |
+| `ui_core::app/animation.rs` | 删除 `scroll_animation_target` **与 `AnimationTarget::Scroll`**（滚动动画能力删除，裁决 C）；动画系统仅保留 UI 动画（`AnimatedValue` 等） |
 | `ui_core::text_edit.rs` | **P1 已收口**：`scroll_ancestor_on` 已删除（P1），reveal/ensure-visible 改走 `scroll::scroll_ancestors` + 轴过滤；**单行 `Both` 横向优先、多行 `Both` 纵向优先**（`text_edit.rs:3580-3598` 的 preferred 顺序、`:4216`/`:4234` 的 reveal 分支）；多行 `Both` 若横向 overflow 也 reveal 横向（P1 收口）；**生产 `Input` 仍只建单轴槽**（单行 `Horizontal` / 多行 `Vertical`），`Both` 仅出现在测试/未来双轴输入；`match slot.axis` 已改 `axes` |
 | `ui_core::a11y.rs`、`a11y/{tree,adapter}.rs` | `A11yScroll.vertical` → `orientation: Option<A11yOrientation>`；`scroll_state` 按 `axes` 计算；adapter 仅 `Some` 时设置；测试槽构造 |
 | `ui_core::a11y/action.rs` | 横向动作步长改用 `viewport.width`（`455-458` 现为 height，既有缺陷）；`a11y_scroll_target` 按动作轴过滤 |
@@ -642,7 +645,9 @@ impl App {
 | P2-6 45° 内核（addendum §2，增量） | `interaction/scroll.rs` 的 `request_px`（逐候选/目标 `line_height` + 符号归一化）、`applied_delta`、`smallest_angle_between`、`project_vector`、`apply_scroll`；`route_wheel` 用首事件 raw delta 做逐候选 hint；`consumed` 记账 | E34–E38、E34m/E34n 绿；E12 按“偏移不变、consumed 记账”改写；E4/E5 保持 |
 | P2-7 零 delta/相位（addendum §2.6/§2.7，增量） | 零 delta 不建立会话；`End/Cancel` 先处理相位再判零 delta；`requested = -raw×line_height` 只在路由内部 | E8、E28 扩断言 |
 
-**文件作用域**：`crates/ui_core/src/interaction/scroll.rs`（`scroll_candidates`/`route_wheel`/`ScrollSession`/45° 纯函数）、`app/input.rs`、`app.rs`、`app/animation.rs`、`app/scroll.rs`、`interaction.rs`、`node/tree.rs`、`node/tree/content.rs`、`app/interaction_tests.rs`。**不新建模块/结构体层**（45° 函数与路由同文件）。
+**文件作用域**：`crates/ui_core/src/interaction/scroll.rs`（`scroll_candidates`/`follow_proxy_chain`/`route_wheel`/`ScrollSession`/45° 纯函数）、`app/input.rs`、`app.rs`、`app/animation.rs`、`app/scroll.rs`、`app/overlay.rs`、`app/window_set.rs`、`app/removal_tests.rs`（裁决 C 删除滚动动画槽用例）、`interaction.rs`、`interaction/animation.rs`（裁决 C 删除 `lerp_point`）、`node/tree.rs`、`node/tree/content.rs`、`error.rs`（`InvalidScrollProxy`）、`event.rs`（删除 `is_continuous`）、`app/interaction_tests.rs`。**不新建模块/结构体层**（45° 函数与路由同文件）。
+
+> **P2 测试计数/分类（最终实测；证据：`E:\kytrix-scratch\scroll-impl\P2\README.md` + `E:\kytrix-scratch\research\review-p2-final.md`）**：`ui_core` lib **2736 passed / 1 ignored**、`ui_kit` lib **769 passed / 2 ignored**；相对 P1 基线（2691 passed / 5 ignored）为 **+45 passed、−4 ignored**；相对修复前 P2（2728/1）为 **+11 新增测试函数、−3 裁决 C 删除**。P2 清单：原 **34 项** → 裁决 C 删除 2 项（E31、程序化动画取消改写）→ **32 项**；另删除 1 条 P2 前既有用例（`removal_tests::scroll_animations_are_cancelled_with_their_container`，不在 34 项内）；修复轮新增 **11 条**（原 9 条 + 收口轮 2 条）⇒ 最终 **32 + 11 = 43 项新增/转绿**。类别按 README 标注 **existing / unignored（E2/E4/E5/E6）/ rewrite（E8/E9 等）/ new**。`--ignored` 剩余为 K1/K2（P3）+ 既有 dark-mode 1 条 + `tests/gui_smoke.rs` 1 条；`--all-features --lib -- scroll wheel` 回归通过（以 `all-features-test.log` 为准）。P2 README 偏差 1（`scroll_to_animated` 公开）随裁决 C 作废——**不保留该 API**。
 
 **依赖**：P1。**门禁**：全部引擎用例绿；`--idle-check` 无额外帧；clippy/fmt。
 
@@ -674,7 +679,7 @@ impl App {
 | 任务 | 产出 | 验收 |
 |---|---|---|
 | P4-1 键盘/a11y 统一 | 共享 `scroll_candidates`（按动作轴过滤）；键盘语义不变；`a11y/action.rs` 横向步长改 width | E17/E18/E32/E32b/E33 绿；既有键盘/树/a11y 用例全绿 |
-| P4-2 删除遗留 | 单轴枚举、`scroll_animation_target` + `App` 包装、`is_continuous`、旧链式、过时测试（`scroll_ancestor_on` **已在 P1 删除，P4 不再检查**） | 限定 `rg 'interaction::ScrollAxis'` 无残留（排除 Wayland 同名枚举）；`rg 'scroll_ancestor_on'` 仅允许出现在历史文档；编译零 warning |
+| P4-2 删除遗留 | 单轴枚举、`scroll_animation_target` + `App` 包装、**`AnimationTarget::Scroll`、`scroll_to_animated`（裁决 C）**、`is_continuous`、旧链式、过时测试（`scroll_ancestor_on` **已在 P1 删除，P4 不再检查**） | 限定 `rg 'interaction::ScrollAxis'` 无残留（排除 Wayland 同名枚举）；`rg 'scroll_ancestor_on|scroll_to_animated|AnimationTarget::Scroll'` 仅允许历史文档；编译零 warning |
 | P4-3 文档回写 | 本文件状态/偏差；`custom-gui-engine-design.md` §1.3 API + §8.4 滚动段 + E22 状态（`:140/:4780/:5013`）；`.docs/.../kit-gallery.md` | 文档引用源码行号核对；E22.md 缺失引用修复或创建 |
 | P4-4 三端验证 | Windows 125%（必须）；macOS/Linux（可用则跑） | §10 清单；证据归档 |
 | P4-5 变异自检 | 恢复关键旧代码 → 对应用例红；还原 → 绿（含代理环、End→Momentum、ScrollbarAxis::point） | 变异日志 |
@@ -726,7 +731,7 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 | E28 | `timestamp_sequence_boundaries_are_monotonic_and_robust` | 同 timestamp/回退 timestamp/粗粒度 timestamp 三组确定性行为 | **红** |
 | E29 | `wheel_hover_refresh_skipped_during_pointer_capture` | 捕获期间不打断 hover；释放后恢复 | **红** |
 | E30 | `scroll_sequences_are_isolated_per_window` | 两个窗口各自闩锁互不影响 | **红** |
-| E31 | `scroll_animation_is_cancelled_by_new_wheel_sequence` | 程序化动画进行中，新序列滚轮取消同槽动画并重新仲裁 | **红** |
+| E31 | ~~`scroll_animation_is_cancelled_by_new_wheel_sequence`~~ | **已删除（裁决 C：滚动动画能力删除）**；P2 同步删除程序化动画取消用例，不再验收 | 删除 |
 | E32 | `a11y_horizontal_steps_use_viewport_width` | ScrollLeft/Right 用 width；Both 不自动 orientation | **红** |
 | E32b | `a11y_scroll_down_falls_through_horizontal_inner` | 横向内层 + 纵向页面：ScrollDown 落到外层（与 E13 一致） | **红** |
 | E33 | `keyboard_both_axis_mapping_and_bar_focus_proxy` | Both 容器 Page/Home 轴映射；bar 焦点代理 | **红** |
@@ -778,7 +783,7 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 | 移除 `visited`/环防护 | E10b |
 | 移除序列闩锁（每事件重新 `hit_at`） | E6/E7 |
 | 恢复“逐祖先消费余量” | E4/E12 |
-| 行滚轮恢复动画分支 | E2（且 E4 可能因动画目标漂移而红） |
+| ~~行滚轮恢复动画分支~~（能力已删除，裁决 C，不再作为变异项） | 由 E2/E3 直接守卫“立即语义”；变异改为“`scroll_to` 延迟生效” → E2/E3 红 |
 | 恢复单轴 `clamp_offset` | E14/E15 |
 | `End` 立即清会话 | E27 |
 | `ScrollbarAxis::point` 清零另一轴 | K7b |
@@ -802,9 +807,10 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 
 - `interaction::ScrollAxis` 枚举及 `ScrollSlot.axis`/`ScrollConfig.axis`/`ScrollState.axis`（P1 已删除）。
 - `interaction/scroll.rs::scroll_ancestor_on` **已删除（P1）**；`scroll_ancestors` 保留为结构性助手（text_edit/a11y 仍用，见 §5.3）。
-- `app/animation.rs::scroll_animation_target`。
+- `app/animation.rs::scroll_animation_target`、`AnimationTarget::Scroll`（裁决 C）。
+- `app/scroll.rs::scroll_to_animated` 与 `App::scroll_to_animated` 包装（裁决 C：滚动动画能力删除，程序化统一立即 `scroll_to`）。
 - `app/input.rs::on_scroll` 内联 `chain`/`direct`/动画分支（`609-682`、`605`、`639-646`）。
-- 旧测试：`a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain`（替代为 E12）、`pixel_scroll_follows_immediately_while_line_scroll_is_animated`（替代为 E2/E3）、`programmatic_scroll_cancels_a_pending_wheel_animation`（改写为程序化动画取消）。
+- 旧测试：`a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain`（替代为 E12）、`pixel_scroll_follows_immediately_while_line_scroll_is_animated`（替代为 E2/E3）、`programmatic_scroll_cancels_a_pending_wheel_animation`（**删除**，裁决 C：滚动动画能力删除；E31 一并删除）。
 - 任何为单轴假设服务的死代码/匹配分支。
 
 ### 8.2 文档回写

@@ -27,6 +27,7 @@ use std::{
 };
 
 use bytes::Bytes;
+pub(crate) use input::refresh_hover_under_pointer;
 
 #[cfg(feature = "hud")]
 use crate::debug_hud::DebugHudState;
@@ -196,11 +197,6 @@ enum AnimationTarget {
         from: Color,
         to: Color,
     },
-    Scroll {
-        handle: ScrollHandle,
-        from: LogicalPoint,
-        to: LogicalPoint,
-    },
 }
 
 impl AnimationTarget {
@@ -222,9 +218,6 @@ impl AnimationTarget {
                     transient: right, ..
                 },
             ) => left.id() == right.id(),
-            (Self::Scroll { handle: left, .. }, Self::Scroll { handle: right, .. }) => {
-                *left == *right
-            }
             _ => false,
         }
     }
@@ -233,7 +226,6 @@ impl AnimationTarget {
         match self {
             Self::Scalar { transient, .. } => ids.contains(&transient.id()),
             Self::Color { transient, .. } => ids.contains(&transient.id()),
-            Self::Scroll { .. } => false,
         }
     }
 }
@@ -995,15 +987,12 @@ impl App {
         unit: crate::event::ScrollUnit,
         phase: crate::event::ScrollPhase,
         modifiers: Modifiers,
+        timestamp: Instant,
         outcome: &mut InputOutcome,
     ) {
         input::on_scroll(
-            self, window, position, delta, unit, phase, modifiers, outcome,
+            self, window, position, delta, unit, phase, modifiers, timestamp, outcome,
         )
-    }
-
-    fn scroll_animation_target(&self, node: NodeId, window: WindowId) -> Option<LogicalPoint> {
-        animation::scroll_animation_target(self, node, window)
     }
 
     fn on_key(
@@ -1128,6 +1117,15 @@ impl App {
         scroll::make_scroll(self, window, node, config)
     }
 
+    pub fn set_scroll_proxy(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        target: Option<NodeId>,
+    ) -> Result<(), EngineError> {
+        scroll::set_scroll_proxy(self, window, node, target)
+    }
+
     pub fn set_scroll_content(
         &mut self,
         handle: &ScrollHandle,
@@ -1171,14 +1169,6 @@ impl App {
     #[must_use]
     pub fn scroll_state(&self, handle: &ScrollHandle) -> Option<ScrollState> {
         scroll::scroll_state(self, handle)
-    }
-
-    fn scroll_to_animated(
-        &mut self,
-        handle: &ScrollHandle,
-        target: LogicalPoint,
-    ) -> Result<(), EngineError> {
-        scroll::scroll_to_animated(self, handle, target)
     }
 
     pub fn make_virtual_list(

@@ -6,36 +6,10 @@ use super::{AnimationCompletion, AnimationEndKind, AnimationSlot, AnimationTarge
 use crate::{
     error::EngineError,
     interaction::{AnimatedValue, AnimationId, AnimationSpec, animation as anim},
-    math::LogicalPoint,
     node::{id::NodeId, signal::SignalId},
     paint::color::Color,
     window::WindowId,
 };
-
-pub(crate) fn scroll_animation_target(
-    app: &App,
-    node: NodeId,
-    window: WindowId,
-) -> Option<LogicalPoint> {
-    app.animations.iter().rev().find_map(|slot| {
-        if slot.window != window {
-            return None;
-        }
-        match &slot.target {
-            AnimationTarget::Scroll { handle, to, .. } if handle.node() == node => Some(*to),
-            _ => None,
-        }
-    })
-}
-
-pub(crate) fn cancel_scroll_animation(app: &mut App, handle: &crate::interaction::ScrollHandle) {
-    app.animations.retain(|slot| {
-        !matches!(
-            &slot.target,
-            AnimationTarget::Scroll { handle: target, .. } if *target == *handle
-        )
-    });
-}
 
 fn queue_completion(app: &mut App, id: AnimationId, kind: AnimationEndKind) {
     app.animation_completions
@@ -47,7 +21,7 @@ fn take_same_target_slots(app: &mut App, target: &AnimationTarget) -> Vec<Animat
     let mut replaced = Vec::new();
     app.animations.retain(|slot| {
         let hit = slot.target.same_target(target);
-        if hit && !matches!(slot.target, AnimationTarget::Scroll { .. }) {
+        if hit {
             replaced.push(AnimationId::new(slot.window, slot.id));
         }
         !hit
@@ -77,7 +51,7 @@ pub(crate) fn release_scope_animations(app: &mut App, signals: &[SignalId]) {
     let mut released = Vec::new();
     app.animations.retain(|slot| {
         let hit = slot.target.targets_any(signals);
-        if hit && !matches!(slot.target, AnimationTarget::Scroll { .. }) {
+        if hit {
             released.push(AnimationId::new(slot.window, slot.id));
         }
         !hit
@@ -102,12 +76,6 @@ pub(crate) fn cancel_node_animations(
     app.animations.retain_mut(|slot| {
         if slot.window != window {
             return true;
-        }
-        if let AnimationTarget::Scroll { handle, .. } = &slot.target
-            && removed.contains(&handle.node())
-        {
-            count += 1;
-            return false;
         }
         let had_nodes = !slot.nodes.is_empty();
         slot.nodes.retain(|node| !removed.contains(node));
@@ -216,9 +184,6 @@ fn settle_immediately(
         AnimationTarget::Color { transient, to, .. } => {
             app.store.set_transient(transient.id(), *to)
         }
-        AnimationTarget::Scroll { .. } => {
-            debug_assert!(false, "zero-duration scroll animation is not reachable");
-        }
     }
     app.mark_nodes_paint(window, nodes);
     app.request_frame();
@@ -233,7 +198,7 @@ pub(crate) fn cancel_animation(app: &mut App, id: &AnimationId) -> bool {
     let mut cancelled = Vec::new();
     app.animations.retain(|slot| {
         let hit = slot.window == id.window() && slot.id == id.generation();
-        if hit && !matches!(slot.target, AnimationTarget::Scroll { .. }) {
+        if hit {
             cancelled.push(AnimationId::new(slot.window, slot.id));
         }
         !hit
@@ -298,10 +263,6 @@ pub(crate) fn tick_animations(app: &mut App, window: WindowId) {
                 app.store
                     .set_transient(transient.id(), anim::lerp_color(*from, *to, eased));
             }
-            AnimationTarget::Scroll { handle, from, to } => {
-                let point = anim::lerp_point(*from, *to, eased);
-                let _ = app.scroll_to(handle, point);
-            }
         }
         for node in &slot.nodes {
             if let Some(target) = app.windows.get_mut(&window) {
@@ -311,7 +272,7 @@ pub(crate) fn tick_animations(app: &mut App, window: WindowId) {
         }
         if t < 1.0 {
             keep.push(slot);
-        } else if !matches!(slot.target, AnimationTarget::Scroll { .. }) {
+        } else {
             finished.push(AnimationId::new(slot.window, slot.id));
         }
     }

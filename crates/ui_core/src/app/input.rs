@@ -13,7 +13,7 @@ use crate::{
         PressRecord, ScrollHandle, drag as drag_util, focus, overlay as overlay_util, scroll,
     },
     layout::hit_test::HitResult,
-    math::{LogicalPoint, LogicalPx, px},
+    math::{LogicalPoint, LogicalPx},
     node::id::NodeId,
     paint::style::Cursor,
     window::{Window, WindowId},
@@ -170,7 +170,7 @@ pub(crate) fn dispatch_input_tracked(
             unit,
             phase,
             modifiers,
-            ..
+            timestamp,
         } => app.on_scroll(
             window,
             position,
@@ -178,6 +178,7 @@ pub(crate) fn dispatch_input_tracked(
             unit,
             phase,
             modifiers,
+            timestamp,
             &mut outcome,
         ),
         InputEvent::Key {
@@ -579,18 +580,21 @@ pub(crate) fn on_scroll(
     unit: ScrollUnit,
     phase: ScrollPhase,
     modifiers: Modifiers,
+    timestamp: Instant,
     outcome: &mut InputOutcome,
 ) {
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
-    let Some(result) = hit else {
-        return;
-    };
-    if let Some(scope) = app.modal_scope(window) {
+    if let Some(result) = hit
+        && let Some(scope) = app.modal_scope(window)
+    {
         let inside = app.windows.get(&window).is_some_and(|target| {
             overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
         });
         if !inside {
+            if matches!(phase, ScrollPhase::End | ScrollPhase::Cancel) {
+                scroll::clear_scroll_session(app, window);
+            }
             return;
         }
     }
@@ -599,94 +603,15 @@ pub(crate) fn on_scroll(
     } else {
         (delta.x, delta.y)
     };
-    if delta_x == LogicalPx::ZERO && delta_y == LogicalPx::ZERO {
-        return;
-    }
-    let direct = unit == ScrollUnit::Pixel || phase.is_continuous();
-    let Some(target) = app.windows.get(&window) else {
-        return;
-    };
-    let mut chain: SmallVec<
-        [(
-            NodeId,
-            crate::interaction::ScrollSlot,
-            crate::math::LogicalSize,
-        ); 8],
-    > = SmallVec::new();
-    let mut cursor = Some(result.node);
-    while let Some(current) = cursor {
-        if let Some(slot) = target.tree().scroll_slot(current) {
-            let size = scroll::viewport(target.tree(), current).size;
-            chain.push((current, slot, size));
-        }
-        cursor = target
-            .tree()
-            .get(current)
-            .ok()
-            .and_then(|node| node.parent());
-    }
-    let mut dx = delta_x;
-    let mut dy = delta_y;
-    for (node, slot, size) in chain {
-        let drives_y = if slot.axes.vertical() {
-            dy
-        } else {
-            LogicalPx::ZERO
-        };
-        let drives_x = if slot.axes.horizontal() {
-            dx
-        } else {
-            LogicalPx::ZERO
-        };
-        if drives_x == LogicalPx::ZERO && drives_y == LogicalPx::ZERO {
-            continue;
-        }
-        let max = scroll::max_offset(&slot, size);
-        let pending = if direct {
-            let handle = ScrollHandle::new(window, node);
-            super::animation::cancel_scroll_animation(app, &handle);
-            slot.offset
-        } else {
-            app.scroll_animation_target(node, window)
-                .unwrap_or(slot.offset)
-        };
-        let step = if unit == ScrollUnit::Line {
-            slot.line_height
-        } else {
-            px(1.0)
-        };
-        let before_y = px(pending.y.value().clamp(0.0, max.y.value()));
-        let after_y = px((before_y - step * drives_y.value())
-            .value()
-            .clamp(0.0, max.y.value()));
-        let consumed_y = px((before_y - after_y) / step);
-        let before_x = px(pending.x.value().clamp(0.0, max.x.value()));
-        let after_x = px((before_x - step * drives_x.value())
-            .value()
-            .clamp(0.0, max.x.value()));
-        let consumed_x = px((before_x - after_x) / step);
-        let mut goal = pending;
-        if consumed_y != LogicalPx::ZERO {
-            goal.y = after_y;
-            dy -= consumed_y;
-        }
-        if consumed_x != LogicalPx::ZERO {
-            goal.x = after_x;
-            dx -= consumed_x;
-        }
-        if goal == pending {
-            continue;
-        }
-        let handle = ScrollHandle::new(window, node);
-        if direct {
-            let _ = app.scroll_to(&handle, goal);
-        } else {
-            let _ = app.scroll_to_animated(&handle, goal);
-        }
-        if dx == LogicalPx::ZERO && dy == LogicalPx::ZERO {
-            break;
-        }
-    }
+    scroll::route_wheel(
+        app,
+        window,
+        hit.map(|result| result.node),
+        LogicalPoint::new(delta_x, delta_y),
+        unit,
+        phase,
+        timestamp,
+    );
 }
 
 pub(crate) fn on_key(
@@ -922,6 +847,7 @@ pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
     app.held_keys.remove(&window);
     app.consumed_keys.remove(&window);
     crate::text_edit::cancel_composition_on_focus_loss(app, window);
+    scroll::clear_scroll_session(app, window);
     if app
         .windows
         .get_mut(&window)
@@ -1054,6 +980,20 @@ pub(crate) fn revalidate_hover(app: &mut App, window: WindowId) {
     update_hover(app, window, next);
 }
 
+pub(crate) fn refresh_hover_under_pointer(app: &mut App, window: WindowId) {
+    let Some(target) = app.windows.get(&window) else {
+        return;
+    };
+    if target.pointer().capture.is_some() {
+        return;
+    }
+    let Some(position) = target.pointer_position() else {
+        return;
+    };
+    let hit = app.hit_at(window, position);
+    update_hover(app, window, hit.map(|result| result.node));
+}
+
 pub(crate) fn cleanup_removed_pointer_state(
     app: &mut App,
     window: WindowId,
@@ -1088,6 +1028,12 @@ pub(crate) fn cleanup_removed_pointer_state(
             .is_some_and(|hit| removed.contains(&hit.node))
         {
             pointer.last_hit = None;
+        }
+        if pointer
+            .scroll_session
+            .is_some_and(|session| removed.contains(&session.target))
+        {
+            pointer.scroll_session = None;
         }
     }
     let Some(chain) = removed_hover_chain else {

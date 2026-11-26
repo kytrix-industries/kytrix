@@ -126,6 +126,7 @@ pub(crate) struct PointerState {
     pub last_hit: Option<HitResult>,
     pub modifiers: Modifiers,
     pub text_edit: Option<crate::text_edit::TextPointerPress>,
+    pub scroll_session: Option<scroll::ScrollSession>,
 }
 
 impl PointerState {
@@ -140,6 +141,7 @@ impl PointerState {
             last_hit: None,
             modifiers: Modifiers::empty(),
             text_edit: None,
+            scroll_session: None,
         }
     }
 
@@ -612,6 +614,7 @@ pub(crate) struct NodeInteraction {
     pub drag: Option<Action>,
     pub press_focus_target: Option<NodeId>,
     pub scroll: Option<ScrollSlot>,
+    pub scroll_proxy: Option<NodeId>,
     pub virtual_list: Option<VirtualSlot>,
     pub overlay: Option<OverlaySlot>,
     pub focus_ring: Option<crate::paint::style::FocusRing>,
@@ -624,6 +627,7 @@ impl NodeInteraction {
             drag: None,
             press_focus_target: None,
             scroll: None,
+            scroll_proxy: None,
             virtual_list: None,
             overlay: None,
             focus_ring: None,
@@ -638,6 +642,7 @@ impl std::fmt::Debug for NodeInteraction {
             .field("drag", &self.drag)
             .field("press_focus_target", &self.press_focus_target)
             .field("scroll", &self.scroll)
+            .field("scroll_proxy", &self.scroll_proxy)
             .field("virtual_list", &self.virtual_list)
             .field("overlay", &self.overlay)
             .field("focus_ring", &self.focus_ring)

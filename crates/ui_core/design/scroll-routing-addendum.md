@@ -40,7 +40,8 @@
 | A1 | O1 对角规则 | **精确复刻 Chrome 的 45° 规则与向量投影**，不做“简化首个可消费” | 主计划书 §3.5/§4.5 的简化作废 |
 | A2 | O3 Table 横向 | **Table 横向滚动纳入本批**；Table 内容宽度 = **所有 Fixed 列宽总和 + 所有 Flex 列最小宽度总和**；Flex 最小宽必须由构造点给出（A2 原文“默认 80 + 链式覆盖”已被 AD4 修订） | 主计划书 §4.6/§9.2-O3/R13 的“不在本批”作废 |
 | A3 | gallery 演示 | **新增宽表演示**（窄视口出现水平条、宽视口不出现，表头与表体对齐） | 主计划书只有 ⑦ 双轴演示 |
-| A4 | 其余裁决 | 主计划书 D1–D6、O2、O4–O10 **不变** | 无 |
+| A4 | 其余裁决 | 主计划书 D1–D6、O2、O4–O10 不变（**D3 后由裁决 C 追加修订**：滚动动画能力删除，见下） | 无 |
+| C | 滚动动画能力（D3 追加，用户选 C） | **删除 `scroll_to_animated` / `AnimationTarget::Scroll`（滚动动画能力整体删除）**；行滚轮与程序化滚动统一立即 `scroll_to` | 主计划 D3 原文“`scroll_to_animated` 仅保留给程序化/ensure-visible”作废 |
 
 ### 1.2 第二轮（2026-11-26，AD1–AD4，覆盖本文 v1 的对应草稿）
 
@@ -92,7 +93,7 @@ InputHandlerProxy::HandleGestureScrollUpdate        input_handler_proxy.cc:1292
 
 ### 2.2 `ScrollLatchedScroller` 的精确顺序（`input_handler.cc:2195-2334`）
 
-动画路径（`:2208-2253`）本引擎不采纳（D3 立即到位）。非动画路径逐行：
+动画路径（`:2208-2253`）本引擎不采纳（D3 立即到位；**裁决 C 进一步删除滚动动画能力**）。非动画路径逐行：
 
 ```text
 1. delta := (scroll_state.delta_x, scroll_state.delta_y)                     // :2201
@@ -227,7 +228,8 @@ Chrome 语义：只在**序列开始**判定（`input_handler.cc:264`）；用**
 ```text
 select_target(candidates, raw_delta, unit):
     对候选链自近到远：
-        若 !tree.is_visible_locally(c) || !tree.is_effectively_interactive(c): continue   // 主计划书 §4.3-7
+        若 !tree.is_effectively_visible(c)（自身与全部祖先可见，含隐藏祖先）
+           || !tree.is_effectively_interactive(c): continue      // 主计划书 §4.3-7；跳过并继续向上
         slot = scroll_slot(c)
         若 slot.axes == 无启用轴: continue                       // 对应 :2381-2385（两轴皆不可滚则跳过）
         requested = request_px(slot, raw_delta, unit)            // 用该候选自己的 line_height + 归一化符号
@@ -235,6 +237,9 @@ select_target(candidates, raw_delta, unit):
         若 |applied.x| > EPS || |applied.y| > EPS: return c        // 对应 CanConsumeDelta==true
     返回 None（滚轮丢弃；本引擎没有“回退到视口”的隐式目标）
 ```
+
+- **候选链的连续代理**：`scroll_candidates` 支持 `A→B→C` 连续代理链（沿代理一直跟随到无代理/失效/环/hop 超限；中间节点不产出），见主计划书 §4.3 规则 2/4。
+- **可见性**：命中路径已排除不可见节点；代理目标可能跨子树，故必须用 `is_effectively_visible`（含隐藏祖先）而不是 `is_visible_locally`；不满足的候选跳过并继续链，不终止。
 
 - **hint = 序列首事件的原始 delta + unit**，由各候选按自己的 `line_height` 解释；本引擎没有独立 GSB，序列首事件同时充当 hint 与请求量（Chrome 的 GSB(hint)+首 GSU(delta) 合并为一次，因为两者 delta 相同）。
 - 目标选定后，本事件再用 §2.4 的 `apply_scroll` 应用同一原始 delta（换算用目标行高）。
@@ -246,10 +251,20 @@ select_target(candidates, raw_delta, unit):
 ```text
 route_wheel(window, position, delta, unit, phase, modifiers, timestamp):
     hit = hit_at(position)（模态作用域过滤保持现状，app/input.rs:589-596）
-    if hit is None: return
+    if hit is None:
+        # 无命中：只做相位清理，绝不滚动闩锁目标
+        按相位清理会话（Cancel/End(Discrete) 清会话；End(Continuous) 只收盘；
+                        Begin 清旧会话；Update/Momentum 保持）
+        return
     raw = shift_swap(delta, modifiers)            // Shift 先换轴（原始单位；不改 InputEvent.delta 语义）
-    if raw == 0: 仅更新会话时间戳/相位（主计划书 §4.4），return
-    session = session_for(window, phase, timestamp)                 // 主计划书 §4.4 不变
+    if raw == 0: 只做相位清理（含零 delta Begin 清会话、End 收盘），return
+    session = session_for(window, phase, timestamp)                 // 主计划书 §4.4
+    if session 的 target 已失效:
+        if phase == End: 清会话; return                              # End 遇失效 target：只清会话、不消费
+        session = None                                                # Discrete/Update/Momentum：当前事件重新仲裁并继续消费
+    if phase == End && session is None:
+        # 无会话 End：不建立新会话、不滚动（仅按收盘语义结束）
+        return
     target = match session:
         Some(s) if s.target 存活 => s.target                        // D1/I5：不重选
         _ => select_target(scroll_candidates(hit.node), raw, unit)  // §2.6：逐候选换算+归一化
@@ -261,11 +276,13 @@ route_wheel(window, position, delta, unit, phase, modifiers, timestamp):
         goal = slot.offset + application.applied                     // 等价的 offset 加法；不重置另一轴
         scroll_to(handle(target), goal)                              // 一次写两轴
         refresh_hover_under_pointer(window)
-    // consumed 只记账；本批无 overscroll/结转消费者（D1/I4）
+    // consumed 只记账（见下），不参与 offset/帧/hover 决策
     if session newly created: store(session{target, ...})
 ```
 
-记账去向（最小化，不引入预防性抽象）：`ScrollApplication` 返回值在 `route_wheel` 内用于 (a) 是否 `scroll_to`；(b) `--wheel-check` 探针/单测断言。`requested - applied` 与 `consumed - applied` 均**不传给其它容器**；不在 `InputOutcome`/公共 API 新增字段。
+**目标失效语义**：`Discrete`/`Update`/`Momentum` 检测到会话 target 失效时，**当前事件重新仲裁并处理本次 delta**（不丢事件）；`End` 遇失效 target **只清会话、不消费**。与主设计 §4.4/§4.10 一致；会话中的节点卸载不 panic、不访问悬空节点。
+
+**`consumed` 的用途（本批）**：`ScrollApplication.consumed` **只供单测/未来 overscroll 记账**；本批**没有生产消费者**——不参与 `scroll_to` 的 goal、不影响 `requested_frame`/hover/a11y/damage，也不传给其它容器（D1/I4）。`requested - applied` 与 `consumed - applied` 同样不传给其它容器；不在 `InputOutcome`/公共 API 新增字段。
 
 ### 2.8 45° 与行高判定用例（纯函数级，确定性）
 
@@ -579,6 +596,8 @@ vec![
 | P2-6 45° 内核 | §2.4 的 `request_px`/`applied_delta`/`smallest_angle_between`/`project_vector`/`apply_scroll`；`route_wheel` 逐候选换算 hint（§2.6） | E34–E38 绿；E12 按“偏移不变、consumed 记账”改写；E4/E5 保持 |
 | P2-7 零 delta/相位 | 零 delta 不建立会话；`End/Cancel` 先处理相位再判零 delta | E8、E28 扩断言 |
 
+> **裁决 C（滚动动画能力删除）与本轮修复的增量**：删除 E31 `scroll_animation_is_cancelled_by_new_wheel_sequence`、程序化动画取消改写（P2 清单 34→32），另删除 1 条 P2 前既有 `removal_tests` 滚动动画用例；`scroll_to_animated`/`AnimationTarget::Scroll`/`cancel_scroll_animation`/`lerp_point` 不保留。修复轮新增 11 条（原 9 条 + 收口轮 2 条）⇒ 最终 43 项新增/转绿；类别按 README 逐项标注 **existing / unignored / rewrite / new**。**最终实测**：`ui_core` lib **2736 passed / 1 ignored**、`ui_kit` lib **769 / 2 ignored**（P1 基线 2691/5 ⇒ +45/−4；相对修复前 P2 2728/1 ⇒ +11/−3）；`--all-features` 回归通过（日志为准）。证据：`scroll-impl/P2/README.md` + `research/review-p2-final.md`。
+
 ### P3（追加 1.5 人日）
 
 | 任务 | 产出 | 验收 |
@@ -662,6 +681,7 @@ vec![
 | 测试是否含两轴互不重置/窄宽视口/header-body 同步/sticky/resize | 是（K13–K17、K19–K21、G7–G9；resize 见 R1） |
 | 是否留有“静默失败” | 否（AD4 取消链式，无 no-op builder；17 处编译期缺参数） |
 | 是否需要引擎新增 API | 否（sticky 用 `NodeTree::set_style`/`Style` 既有公共 API；a11y 标记方案已删） |
+| 滚动动画能力是否删除（裁决 C） | 是：`scroll_to_animated`/`AnimationTarget::Scroll`/`scroll_animation_target` 全删，程序化与滚轮统一立即 `scroll_to`；E31 与程序化动画取消用例删除（§7 自检、主设计 §4.9/§5.2/§5.3/§8.1） |
 
 ---
 
@@ -684,7 +704,7 @@ vec![
 - `crates/ui_core/src/interaction.rs`：`ScrollAxis` 153-157；`ScrollConfig` 159-172；`ScrollState` 196-202；`ScrollSlot` 204-210；`PointerState` 118-129；`NodeInteraction` 593-601。
 - `crates/ui_core/src/interaction/scroll.rs`：`clamp` 7-13；`max_offset` 15-23；`clamp_offset` 25-32；`viewport` 34-40；`scroll_ancestors` 42-56；`scroll_ancestor` 58-61；`scroll_ancestor_on` 63-70；`ancestor_offset` 72-83；`to_screen` 85-89。
 - `crates/ui_core/src/app/input.rs`：`dispatch_input_tracked` 120-132、Scroll 分发 167-182；`on_scroll` 574-683（Shift 597-601、零 delta 602-604、chain 609-627、逐祖先消费 630-682）。
-- `crates/ui_core/src/app/scroll.rs`：`make_scroll` 22-49；`set_scroll_content` 51-72；`scroll_to` 99-145（同槽取消动画 122、no-op 133-135、damage/a11y/request_frame 136-143）；`clamp_scroll_offsets` 153-178；`scroll_state` 194-205；`scroll_to_animated` 207-239。
+- `crates/ui_core/src/app/scroll.rs`：`make_scroll` 22-49；`set_scroll_content` 51-72；`scroll_to` 99-145（no-op 133-135、damage/a11y/request_frame 136-143）；`clamp_scroll_offsets` 153-178；`scroll_state` 194-205；**`scroll_to_animated` 207-239 已删除（裁决 C）**。
 - `crates/ui_core/src/app/virtual_list.rs`：`make_virtual_list` 14-49；content 覆盖 97-110、247-249、316-318；`rewindow_virtual` 166-257；`apply_virtual_extents` 285-329。
 - `crates/ui_core/src/node/tree.rs`：`Node::style()` 206；`set_style` 528-530；`set_layout_override` 531-537；`set_virtual_row` 538-545。
 - `crates/ui_core/src/node/tree/layout.rs`：`set_style` 46-60；`set_absolute_inset` 101-115；`set_virtual_row` 78-99。

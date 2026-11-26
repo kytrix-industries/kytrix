@@ -58,6 +58,7 @@ pub(crate) fn create_overlay(
     }
     if trap_focus {
         input::revalidate_hover(app, window);
+        crate::interaction::scroll::clear_scroll_session(app, window);
     }
     #[cfg(feature = "hud")]
     app.raise_debug_hud(window);

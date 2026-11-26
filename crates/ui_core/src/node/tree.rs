@@ -1247,6 +1247,13 @@ impl NodeTree {
         content::scroll_slot_mut(self, node)
     }
     #[must_use]
+    pub(crate) fn scroll_proxy(&self, node: NodeId) -> Option<NodeId> {
+        content::scroll_proxy(self, node)
+    }
+    pub(crate) fn set_scroll_proxy(&mut self, node: NodeId, proxy: Option<NodeId>) -> bool {
+        content::set_scroll_proxy(self, node, proxy)
+    }
+    #[must_use]
     pub(crate) fn overlay_slot(&self, node: NodeId) -> Option<OverlaySlot> {
         content::overlay_slot(self, node)
     }

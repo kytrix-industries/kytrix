@@ -9,9 +9,7 @@ use super::{AnimationEndKind, App};
 use crate::{
     error::EngineError,
     event::{Action, Event, InputEvent, KeyBinding, KeyCode, Modifiers, PointerButton},
-    interaction::{
-        AnimatedValue, AnimationSpec, Easing, ScrollConfig, ScrollHandle, VirtualListConfig,
-    },
+    interaction::{AnimatedValue, AnimationSpec, Easing, ScrollHandle, VirtualListConfig},
     math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
@@ -66,15 +64,6 @@ fn mount_bound(app: &mut App, window: WindowId, parent: NodeId, signal: Signal<u
         })
         .build(app.window_mut(window).expect("window").tree_mut(), parent)
         .expect("mount bound")
-}
-
-fn mount_scroll(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
-    let mut style = boxed_style(100.0, 100.0);
-    style.clip = Clip::Bounds;
-    NodeBuilder::boxed()
-        .style(style)
-        .build(app.window_mut(window).expect("window").tree_mut(), parent)
-        .expect("mount scroll")
 }
 
 fn binding(key: KeyCode, action: Action) -> KeyBinding {
@@ -280,37 +269,6 @@ fn animations_that_only_drive_surviving_nodes_are_untouched() {
             .iter()
             .any(|slot| slot.id == id.generation() && slot.nodes == vec![kept]),
         "无关动画保持原样"
-    );
-}
-
-#[test]
-fn scroll_animations_are_cancelled_with_their_container() {
-    let (_rt, mut app, window) = setup();
-    let root = root(&app, window);
-    let container = mount_scroll(&mut app, window, root);
-    let handle = app
-        .make_scroll(window, container, ScrollConfig::default())
-        .expect("scroll container");
-    app.set_scroll_content(&handle, LogicalSize::new(px(100.0), px(400.0)))
-        .expect("content");
-    app.scroll_to_animated(&handle, LogicalPoint::new(px(0.0), px(120.0)))
-        .expect("animated scroll");
-    assert_eq!(animation_count(&app), 1);
-    assert!(app.needs_continuous_frames(), "滚动动画需要帧");
-
-    let outcome = app
-        .remove_node(window, container)
-        .expect("remove container");
-    assert_eq!(outcome.animations, 1);
-    assert_eq!(animation_count(&app), 0, "滚动动画槽随容器取消");
-    assert!(
-        !app.needs_continuous_frames(),
-        "取消后不得再因这条动画进入连续帧（I3）"
-    );
-    assert_eq!(
-        app.pending_animation_completions_for_test(),
-        0,
-        "滚动槽是引擎内部驱动，不产生公开完成事件"
     );
 }
 

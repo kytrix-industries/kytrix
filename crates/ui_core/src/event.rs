@@ -312,13 +312,6 @@ pub enum ScrollPhase {
     Cancel,
 }
 
-impl ScrollPhase {
-    #[must_use]
-    pub const fn is_continuous(self) -> bool {
-        !matches!(self, Self::Discrete)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GesturePhase {
     Begin,
@@ -1108,20 +1101,6 @@ mod tests {
         assert!(PointerButton::Primary.is_primary());
         assert!(!PointerButton::Secondary.is_primary());
         assert!(!PointerButton::Middle.is_primary());
-    }
-
-    #[test]
-    fn scroll_phases_distinguish_discrete_from_continuous() {
-        assert!(!ScrollPhase::Discrete.is_continuous());
-        for phase in [
-            ScrollPhase::Begin,
-            ScrollPhase::Update,
-            ScrollPhase::End,
-            ScrollPhase::Momentum,
-            ScrollPhase::Cancel,
-        ] {
-            assert!(phase.is_continuous(), "{phase:?} 是连续设备阶段");
-        }
     }
 
     #[test]
