@@ -300,6 +300,7 @@ impl Table {
             .iter()
             .map(|column| column.width.contribution())
             .sum::<f32>());
+        let list_content_width = (content_width > LogicalPx::ZERO).then_some(content_width);
         let list = List::new(
             app,
             theme.clone(),
@@ -316,7 +317,7 @@ impl Table {
                 row_stretch: fixed_rows,
                 scrollbar: false,
                 separator: false,
-                content_width: Some(content_width),
+                content_width: list_content_width,
             },
             move |tree, parent, row| {
                 let count = count_for_rows.get();
@@ -2652,6 +2653,77 @@ mod tests {
             state.content.width - state.viewport.width,
             px(576.0) - px(420.0),
             "横向范围按内容宽计算"
+        );
+    }
+
+    #[test]
+    fn all_flex_zero_min_width_tables_keep_the_viewport_layout() {
+        let mut app = TestApp::new();
+        let columns = (0..8)
+            .map(|index| {
+                let column = Column::flex(smol_str::format_smolstr!("c{index}"), 1.0, px(0.0));
+                if index == 0 { column.span(6) } else { column }
+            })
+            .collect();
+        let table = table_with(
+            &mut app,
+            columns,
+            TableOptions::fixed(px(28.0)),
+            8,
+            text_cell,
+        );
+        table.set_column_span(|row, column| if row == 0 && column == 0 { 6 } else { 1 });
+        mount_in(&mut app, &table, 240.0, 240.0);
+        assert_eq!(
+            table.content_width(),
+            LogicalPx::ZERO,
+            "全 flex 零最小宽：内容宽恒为 0"
+        );
+        let viewport = table.list().viewport_node().expect("viewport");
+        let handle = app
+            .app()
+            .scroll_handle(app.window_id(), viewport)
+            .expect("handle");
+        let state = app.app().scroll_state(&handle).expect("state");
+        assert_eq!(
+            state.axes,
+            ScrollAxes::Vertical,
+            "零内容宽不得把 List 切成双轴：{state:?}"
+        );
+        assert_eq!(
+            state.content.width, state.viewport.width,
+            "零内容宽没有横向范围：{state:?}"
+        );
+        let merged = table.cell_node(app.app(), 0, 0).expect("merged cell");
+        let merged = app.probe().bounds(merged).expect("merged bounds");
+        assert!(
+            merged.size.width > px(60.0),
+            "跨 6 列单元格按视口摊开而不是塌到最小内容宽：{merged:?}"
+        );
+        let single = table.cell_node(app.app(), 0, 6).expect("single cell");
+        let single = app.probe().bounds(single).expect("single bounds");
+        assert!(
+            merged.size.width > single.size.width,
+            "跨列宽于单列：{merged:?} vs {single:?}"
+        );
+        assert!(single.size.width > px(20.0), "单列按视口八等分：{single:?}");
+        assert!(
+            !table.horizontal_bar().scrollable(app.app()),
+            "零内容宽不出现水平条"
+        );
+        assert!(
+            table.vertical_bar().scrollable(app.app()),
+            "8 行 224 px 超过视口高：垂直条仍可滚"
+        );
+        let header = table.header_node(app.app(), 0).expect("header 0");
+        let header = app.probe().bounds(header).expect("header bounds");
+        assert!(
+            header.size.width > px(60.0),
+            "表头跨列与表体同宽：{header:?}"
+        );
+        assert!(
+            !table.sync(app.app_mut()).expect("sync"),
+            "稳态 sync 不再变化"
         );
     }
 

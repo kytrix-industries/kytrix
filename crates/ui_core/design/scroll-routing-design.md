@@ -48,7 +48,7 @@
 ### 1.4 工作量与门禁
 
 - 预计 5.5–7 个开发日（P0 0.5、P1 1.5、P2 2、P3 1、P4 1；含测试与三端验证）。
-- 每阶段必须通过：`cargo test`（对应子集）→ `cargo +nightly clippy -- -D warnings` → `cargo +nightly fmt`；最终 `cargo test --workspace`。
+- 每阶段必须通过：`cargo test`（对应子集）→ `cargo +nightly clippy -- -D warnings` → `cargo +nightly fmt`；最终 `cargo test --workspace`（**P4 按用户限制未跑 workspace 全量测试**，改为 `cargo test -p ui_core -p ui_kit` + `cargo check --workspace`）。
 - 每个缺陷修复必须有“先红后绿”用例；关键分支做变异自检（恢复旧代码必须红）。
 
 ## 2. 现状调查与根因（证据链）
@@ -450,7 +450,7 @@ apply_to_target(target, raw, unit):
 - `ScrollbarOptions.inset` 用于给双轴演示留出角落（水平条 `right` 内缩 = 垂直条厚度）；如实现中发现 `inset` 不足以表达，再评估是否加最小 API（§9-O3）。
 - 现有组件：`List`/`Table`/`Tree`/菜单面板/多行 `Input` 保持纵向；`Input` 单行保持横向。
 - 双轴演示：gallery ⑦ 升级为“双向可滚 + 两条滚动条”（内容尺寸大于视口，两个方向都可滚），作为引擎双轴能力的真实窗口证据。
-- 组件级横向滚动（如宽表列）：**原计划不在本批，已被 addendum A2 覆盖**（Table 横向滚动纳入本批且全局默认生效；内容宽 = Σ Fixed 宽 + Σ Flex 最小宽，`Column::flex` 为三参数显式最小宽；表头为 Table 内部 sticky、水平条/垂直条用局部 rail 留 4 px 尾隙；架构/API/迁移/测试见 `scroll-routing-addendum.md` §1.2/§3）。原 §5.2/§5.5 的 Table 迁移条目由 addendum 扩充，不改变既有纵向代理条款。
+- 组件级横向滚动（如宽表列）：**原计划不在本批，已被 addendum A2 覆盖**（Table 横向滚动纳入本批且全局默认生效；内容宽 = Σ `column_contribution`（Fixed 宽 + Flex 最小宽）；**`content_width == 0`（全 Flex 零 min）时回退纯纵向**：List `content_width=None`、`axes=Vertical`、行宽=viewport、无 hbar；`Column::flex` 为三参数显式最小宽；表头为 Table 内部 sticky、水平条/垂直条用局部 rail 留 4 px 尾隙；架构/API/迁移/测试见 `scroll-routing-addendum.md` §1.2/§3）。原 §5.2/§5.5 的 Table 迁移条目由 addendum 扩充，不改变既有纵向代理条款。
 
 **a11y**
 
@@ -671,7 +671,7 @@ impl App {
 | P3-4 `--wheel-check` | 进程内注入滚轮，断言内容/条/边界/双轴/hover/**宽表 G7–G9（含水平条 track 滚轮 + thumb 拖动）**；失败统一走退出码 3；**必须在 `--idle-check` 基线（1 s）之前完成并在基线前排空其滚动/淡入帧** | **P3 收口 PASS**：三端（至少 Windows）`gallery --wheel-check` G1–G9（**37 断言**）；与 `--idle-check` 分进程运行（idle frames 0） |
 | P3-5 应用层 bar 接线 | settings/updater/candlestick/widget_gallery | **P3 收口**：`cargo check --workspace` PASS；各应用最小用例/手测 PASS（`P3/gates.txt`） |
 | P3-6 `Column` API（addendum §3.3/§3.10，AD4 增量） | `ColumnWidth::Flex { weight, min_width }`、`Column::flex(header, weight, min_width: LogicalPx)`（无默认/无链式）、`contribution()`、`span_cell_style` 重写、`TableInner.content_width` | K11/K12 绿；17 处 `Column::flex` 全部显式给值；table 宽度断言重算 |
-| P3-7 Table sticky + 双 bar（addendum §3.4/§3.6/§3.8，AD2/AD3 增量） | outer/header/header_content 结构、sticky 写（`sticky_x` + `header_width` 双 Cell + `NodeTree::set_style`；**width 写 `max(content_width, viewport.width)`**）、List `scrollbar:false`、Table 自管垂直/水平 bar + rail 尾隙、`Table::sync` 聚合（含 resize 宽→窄夹回） | K13–K17、K19、K21 绿；K15 覆盖窄/宽视口列对齐 + header y 固定 + resize 稳态；K9 几何守卫不回归 |
+| P3-7 Table sticky + 双 bar（addendum §3.4/§3.6/§3.8，AD2/AD3 增量） | outer/header/header_content 结构、sticky 写（`sticky_x` + `header_width` 双 Cell + `NodeTree::set_style`；**width 写 `max(content_width, viewport.width)`**）、**`content_width > 0` 才传 `ListOptions.content_width=Some`（Both），`==0` 回退 `None`/Vertical/无 hbar**、List `scrollbar:false`、Table 自管垂直/水平 bar + rail 尾隙、`Table::sync` 聚合（含 resize 宽→窄夹回） | K13–K17、K19、K21 绿；K15 覆盖窄/宽视口列对齐 + header y 固定 + resize 稳态；零宽回退用例绿；K9 几何守卫不回归 |
 | P3-8 代理扩展（addendum §3.4，对 P3-1/P3-2 的增量） | 两条 bar 的 track 代理到 list viewport（P3-1 的 `attach` 已接线）；header 代理下横向滚轮也生效；确认表头无自身 `ScrollSlot` | K15/K16/K18、K4 保持 |
 | P3-9 gallery 宽表（addendum §4，增量） | **⑩ 宽表**（窄 420 / 宽 1100 对照，三参数列配置）；旧 **⑩–⑮ 顺延为 ⑪–⑯**（共 16 sections）；G7–G9 **追加到 P3-4 的 `--wheel-check`** | **P3 收口 PASS**：三端至少 Windows 真机（`P3/wheel.log`） |
 | P3-10 调用点迁移（addendum §3.10，AD1/AD4 增量） | 17 处 `Column::flex` 显式最小宽（widget 按旧密度取值并逐点记录）、`ListOptions`/`VirtualListConfig` 字面量、Table bar 归属；**与 P3-6 同提交**（避免两次迁移） | 编译零 warning；各 widget 最小用例/手测；`TableOptions` 不加字段 |
@@ -698,9 +698,9 @@ impl App {
 | P4-4 三端验证 | Windows 125%（必须）；macOS/Linux（可用则跑） | **Windows 125% 已跑**（cargo/gallery 全部门禁实跑）；**macOS/Wayland 未跑**（环境不可用，非代码门禁，**不构成三端闭环**）；**人工 M1–M6 未执行**——由 gallery 真实窗口自动断言（G1–G9/37 断言）替代，但**不计为已验收**，保留发布前人工清单（§7.3） |
 | P4-5 变异自检 | 恢复关键旧代码 → 对应用例红；还原 → 绿（含代理环、End→Momentum、ScrollbarAxis::point） | **完成**：M1 45° 严格边界、M2 投影参数反转、M3 代理优先移除、M4 键盘轴过滤移除、M5 a11y 轴过滤移除、**M6 a11y 动作能力过滤移除、M7 target 轴/可见性过滤移除**；逐项 RED→RESTORE SHA256 MATCH→GREEN（`P4/mutation-M*.log` / `P4/README.txt`） |
 
-> **P4 收口实测（2026-11-26，最终；HEAD `bbe29007` + 本轮工作区）**：`ui_core` lib **2757 passed / 1 ignored**（P3 2744/1 ⇒ **+13**；本复审轮新增 9 条：a11y 动作轴/溢出过滤、lifted/self 轴匹配、键盘边界/hidden）、`ui_kit` lib **797 passed / 0 ignored**；`--ignored` 仅既有 dark-mode + `gui_smoke` 2 条；gallery `--wheel-check` PASS（G1–G9 **37 断言**）、`--idle-check` 0 帧、`--probe` exit 0；`cargo test/clippy --workspace/fmt/check` 全 PASS。证据：`E:\kytrix-scratch\scroll-impl\P4\`（`README.txt`/`test.log`/`gates.txt`/`wheel.log`/`residuals.log`/`mutation-*`）。
+> **P4 收口实测（2026-11-26，最终；HEAD `bbe29007` + 本轮工作区）**：`ui_core` lib **2757 passed / 1 ignored**（P3 2744/1 ⇒ **+13**；本复审轮新增 10 条，含 a11y 动作轴/溢出过滤、lifted/self 轴匹配、键盘边界/hidden、零宽回退）、`ui_kit` lib **798 passed / 0 ignored**；`--ignored` 仅既有 dark-mode + `gui_smoke` 2 条；gallery `--wheel-check` PASS（G1–G9 **37 断言**）、`--idle-check` 0 帧、`--probe` exit 0；`cargo test -p ui_core -p ui_kit`、clippy `--workspace`、`fmt --all --check`、`check --workspace` 全 PASS；**按用户限制未跑 workspace 全量测试**。证据：`E:\kytrix-scratch\scroll-impl\P4\`（`README.txt`/`test.log`/`gates.txt`/`wheel.log`/`residuals.log`/`mutation-*`）。
 
-**依赖**：P2/P3。**门禁**：`cargo test --workspace`、`clippy -D warnings`、`fmt`、gallery 三模式（`--wheel-check`/`--idle-check`/`--probe`）。
+**依赖**：P2/P3。**门禁**：`cargo test -p ui_core -p ui_kit`（**workspace 全量测试按用户限制未跑**）、clippy `--workspace`、`fmt --all --check`、`check --workspace`、gallery 三模式（`--wheel-check`/`--idle-check`/`--probe`）。
 
 ### 6.1 关键路径与并行
 
@@ -910,6 +910,8 @@ cargo run -p ui_kit --example gallery -- --wheel-check
 cargo run -p ui_kit --example gallery -- --idle-check
 cargo run -p ui_kit --example gallery -- --probe
 ```
+
+> **P4 本轮执行口径**：按用户限制，测试只跑 `cargo test -p ui_core -p ui_kit`，**未跑 `cargo test --workspace`**；workspace 层面只跑 `cargo check --workspace`（另加 clippy `--workspace`、`fmt --all --check`）。设计门禁中的 workspace 全量测试保留为后续发布前门禁，不计入本轮已验收。
 
 - `--wheel-check`：PASS 时打印 `gallery: wheel-check PASS (...)`；任一断言失败打印 `gallery: wheel-check FAIL <case>` 并置 `failed = true`，与现有 `--idle-check`/`--theme-check`/`--dump-overlay` 统一走退出码 3。
 - `--idle-check`：滚动条静止不出帧，PASS 退出码 0。

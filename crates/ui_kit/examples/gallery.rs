@@ -603,6 +603,7 @@ struct WheelCheckReport {
     point: Option<LogicalPoint>,
     header_y: Option<LogicalPx>,
     header_content_y: Option<LogicalPx>,
+    page_bar_retries: u8,
 }
 
 impl WheelCheckReport {
@@ -615,6 +616,7 @@ impl WheelCheckReport {
             point: None,
             header_y: None,
             header_content_y: None,
+            page_bar_retries: 0,
         }
     }
 
@@ -2860,6 +2862,25 @@ impl Gallery {
     fn run_wheel_stage(&self, app: &mut App, stage: u8) -> Option<u8> {
         match stage {
             0 => {
+                let page_bar_ready = match self.page_bar.sync(app) {
+                    Ok(_) => self.page_bar.scrollable(app),
+                    Err(_) => false,
+                };
+                if !page_bar_ready {
+                    let retry = {
+                        let mut report = self.wheel_check.borrow_mut();
+                        if report.page_bar_retries < 3 {
+                            report.page_bar_retries += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if retry {
+                        let _ = app.request_repaint(self.window);
+                        return Some(0);
+                    }
+                }
                 let Some(point) = self.scroll_page_to(app, self.demo.viewport) else {
                     self.wheel_case("G1.demo.visible", false);
                     return Some(1);
@@ -2872,7 +2893,7 @@ impl Gallery {
                     self.demo_offset(app).y > px(0.0),
                 );
                 self.wheel_case("G1.content.page_stays", self.page_offset(app) == page);
-                self.wheel_case("G1.page_bar.scrollable", self.page_bar.scrollable(app));
+                self.wheel_case("G1.page_bar.scrollable", page_bar_ready);
                 let hit = app
                     .window(self.window)
                     .and_then(|target| target.tree().hit_test(point))

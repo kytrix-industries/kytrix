@@ -344,6 +344,7 @@ table_content_width = Σ column_contribution(c) for c in columns
 - `Column::flex(header, weight, min_width: LogicalPx)`：**最小宽由构造点显式给出**；无默认值、无链式覆盖（AD4）。
 - 视口宽 ≥ 内容宽 ⇒ `max_x = 0`，不出现水平条；Flex 列按权重吃满剩余宽度。
 - 视口宽 < 内容宽 ⇒ `max_x = content - viewport`，出现水平条；Flex 列停在各自 `min_width`。
+- **零宽回退（兼容旧纵向布局）**：`content_width == 0`（全部 Flex 且 `min_width` 均为 0）时，Table **不启用横向**——内层 List `content_width = None`、`axes = Vertical`、行宽 = viewport、`max_x = 0`、不建/不显示 hbar；新增零宽回退用例覆盖（`content_width > 0` 才传 `Some`/Both，见 §3.6/§3.7）。
 - span 列：跨列单元格宽 = 被跨列 `column_contribution` 之和，该跨列的权重参与剩余空间分配（结构同现状 `span_cell_style` 的 “fixed 和 + flex 权重和”，`table.rs:142-186`）。
 - **AD1**：横向对所有 Table 默认生效，不新增 `TableOptions` 字段。既有 widget 行情表在各自调用点显式给小的 `min_width`（如 `px(0.0)` 保持旧“可压缩到 0”密度），逐点记录在 §3.10。
 
@@ -424,15 +425,14 @@ pub struct Column {
 
 - `TableInner` 新增：`content_width: LogicalPx`、`sticky_x: Cell<LogicalPx>`（初值 0）；`TableGeometry` 新增 `header: Option<NodeId>`、`header_content: Option<NodeId>`、`list_handle: Option<ScrollHandle>`、`vbar/hbar`（两个 `ScrollBar`，随 `TableInner` 持有）。
 - `Table::new`（`table.rs:256-395`）：
-  - 计算 `content_width`（§3.2）并存入 `TableInner`；
-  - 内层 `ListOptions { content_width: Some(content_width), scrollbar: false, .. }`；
+  - 计算 `content_width`（§3.2）并存入 `TableInner`；**条件语义**：仅当 `content_width > 0` 时内层 `ListOptions { content_width: Some(content_width), scrollbar: false, .. }`（双轴）；**`content_width == 0`（全部 Flex 且 `min_width` 均为 0）时传 `None`、List 保持 `axes = Vertical`、行宽 = viewport、不建/不显示 hbar**（旧纯纵向布局兼容，避免零宽内容生成无意义双轴槽）；
   - 创建两个 `ScrollBar`：`ScrollbarAxis::Vertical`（key `{key}:body:scrollbar`，与原 List bar 同名沿用）与 `ScrollbarAxis::Horizontal`（key `{key}:scrollbar-h`），均 `ScrollbarOptions::default()`（thickness 4）。
 - `Table::build`（`table.rs:463-678`）：
   - `outer` 补 `.relative()`；`options.scrollbar` 时 `padding_bottom = hbar thickness (4 px)`（AD2 的底部带，§3.4）；
   - `header` 显式 `height(header_height + px(1.0))`、`overflow_hidden()`、`relative()`；
   - `header_content`：`.absolute().left(px(0)).top(px(0)).width(px(content_width)).height_full().flex_col()`（初始宽 = content_width；宽视口由 `Table::sync` 改写为 `max(content_width, viewport.width)`），先建 `header_row`（`flex_row`, `width_full`, `height(header_height)`）与 divider（`width_full`）；表头单元格仍用 `span_cell_style`（窄视口内容宽固定为 `content_width`，不再需要 `min_width`）；
   - `body` 保持 `flex_1/relative`；`list.build(tree, body)`（List 不再建内部 bar）；`vbar_rail` 建在 `body`，`vbar.build(tree, vbar_rail)`；
-  - `hbar_rail` 建在 `outer`（absolute left 0/right 4px/bottom 0/height 4），`hbar.build(tree, hbar_rail)`；
+  - `hbar_rail` 建在 `outer`（absolute left 0/right 4px/bottom 0/height 4），`hbar.build(tree, hbar_rail)`；**`content_width == 0` 时 hbar 不显示**（`scrollable=false`，不宣告横向；旧纵向布局无水平条）。
   - 记录 `geometry.{outer, header, header_content, body, header_row, empty}`。
 - `Table::attach`（`table.rs:680-688`）：
   1. `list.attach(app, window)?`；2. `let viewport = list.viewport_node().ok_or(...)`；
@@ -449,7 +449,7 @@ pub struct Column {
 
 ### 3.7 `scroll_state` / 内容宽度 / 滚动范围
 
-- 表体 `ScrollState.content = (content_width, virtual_content_height)`；`axes = Both`；`max_x = max(0, content_width - viewport.width)`。
+- 表体 `ScrollState.content = (content_width > 0 ? content_width : viewport.width, virtual_content_height)`；**`content_width > 0` 时 `axes = Both`、`max_x = max(0, content_width - viewport.width)`**；**`content_width == 0`（全 Flex 零 min）时 `axes = Vertical`、内容宽 = viewport、`max_x = 0`，不出现水平条**（旧纵向布局兼容）。
 - 水平 max 不随虚拟行窗口变化：`virtual_list.rs` 的 content 更新保留 `content_width`（§3.5）。
 - 水平偏移不参与虚拟行锚点（锚点只看 y：`virtual_list.rs:170-180`、`:291-325`），无需改动。
 - `clamp_scroll_offsets`（`app/scroll.rs:153-178`）每帧夹紧两轴；表头 x 由 `Table::sync` 跟随（resize 的一帧延迟见 §3.4/R1）。
@@ -625,7 +625,7 @@ vec![
 | P4-7 变异自检 | 45° 严格边界、投影参数、代理优先、键盘轴过滤、a11y 轴过滤、a11y 动作能力过滤、target 轴/可见性 | **完成**：M1–M7 逐项 RED→SHA256 还原→GREEN（见下）；P3-7 其余变异项（sticky 写/min_width/rail 尾隙/bar 代理）已在 P3 门禁完成，P4 未重复 |
 | P4-8 文档 | 主计划书附录 E + 冲突标注；本文件回写 `custom-gui-engine-design.md` E22/§8.4；`kit-gallery.md` | **完成**：主设计 §4.8/§7.1/§6 P4/附录 D；E22 状态/API/§8.4；kit-gallery 16 分区 + G1–G9；新增 `E22.md`；行号已按 P4 源码更新 |
 
-> **P4 收口实测（2026-11-26，最终）**：`ui_core` lib **2757 passed / 1 ignored**（P3 2744/1 ⇒ **+13**；本复审轮新增 9 条：a11y 动作轴/溢出过滤、lifted/self 轴匹配、键盘边界/hidden）、`ui_kit` lib **797 passed / 0 ignored**；`--ignored` 仅既有 dark-mode + `gui_smoke`；`gallery --wheel-check` PASS（G1–G9 **37 断言**）、`--idle-check` 0 帧、`--probe` exit 0；`cargo test/clippy --workspace/fmt/check` 全 PASS。证据：`E:\kytrix-scratch\scroll-impl\P4\README.txt`。
+> **P4 收口实测（2026-11-26，最终）**：`ui_core` lib **2757 passed / 1 ignored**（P3 2744/1 ⇒ **+13**；本复审轮新增 10 条，含 a11y 动作轴/溢出过滤、lifted/self 轴匹配、键盘边界/hidden、零宽回退）、`ui_kit` lib **798 passed / 0 ignored**；`--ignored` 仅既有 dark-mode + `gui_smoke`；`gallery --wheel-check` PASS（G1–G9 **37 断言**）、`--idle-check` 0 帧、`--probe` exit 0；`cargo test -p ui_core -p ui_kit`、clippy `--workspace`、`fmt --all --check`、`check --workspace` 全 PASS；**按用户限制未跑 workspace 全量测试**。证据：`E:\kytrix-scratch\scroll-impl\P4\README.txt`。
 >
 > **P4-7 七条变异结果**（脚本 `P4/mutate.ps1`；每项记录 HEAD/CMD/SHA256 BEFORE→RESTORED/MATCH/RED→GREEN）：
 > | # | 变异 | 红证据 | 还原 |
