@@ -229,7 +229,8 @@ impl Collector<'_> {
         if outside.is_empty() {
             return;
         }
-        let mut text = String::new();
+        let capacity = outside.iter().map(|range| range.len() + 2).sum();
+        let mut text = String::with_capacity(capacity);
         for range in outside {
             let piece = html::text_region(payload.get(range).unwrap_or_default());
             if piece.trim().is_empty() {

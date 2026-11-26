@@ -32,7 +32,7 @@
 | D14 | 主题切换 | **全量重建节点树**（不引入新的 `bind_style` 依赖边；根节点保留现状的外观依赖边） | 用户已裁决 | §5.7 |
 | D15 | 资源上限 | 块深 64 / 行内 marks 64 / 表格 200 行 × 20 列 / 溢出段落 100 行 / HTML 嵌套解析 16 次 × 64 KB；超限降级但**保留文字** | 用户已裁决 | §5.8 |
 | D16 | 文档结构 | 沿用 text-input 先例（含 §13 迁移与删除清单、§14 实施结果回写预留） | 用户已裁决 | 全文 |
-| D17 | 阶段 | **方案 B：合并原 P0+P1**，不写过渡 IR 适配层，直接进入新架构（中途不保证测试全绿，但每个提交都可编译） | 用户已裁决 | §7 |
+| D17 | 阶段 | **方案 B：合并原 P0+P1**，不写过渡 IR 适配层，直接进入新架构（中途不保证测试全绿，但每个提交都可编译；**唯一例外**：R1 提交只含 `ui_core`，单独检出时 `ui_kit` 旧 markdown 模块仍调用被替换的 API 故不可编译，R1/R2 成对使用，R2 后恢复全仓可编译，见 §7-R1） | 用户已裁决 | §7 |
 | D18 | 表格列宽实现路径 | **延迟建表**：`Start(Table)`…`End(Table)` 期间只累积 `TableBuf`/`CellBuf` 不建节点；`End(Table)` 时对每个 `CellBuf` 调 `App::measure_text(content, None)` 取**无约束自然宽**（max-content，**不是**限宽换行尺寸）→ 每列取最大值 + 2×CELL_PADDING 作为 border-box `width`；主路径**不调用 `flex_none()`/`flex_1()`**（保持 taffy 默认 `grow=0/shrink=1/basis=auto`，总宽超可用宽时按比例收缩），`min_width_0` + `overflow_hidden` + `TextWrap::BreakWord`；`measure_text` 不可用时**明确豁免**回退 `flex_1()` 等分。可用宽度建树前不可得 → **不做总宽归一化**。**不引入 grid**（`StyleBuilder` 只暴露 flex，`paint/style_builder.rs:28-49`；`Style::default` 的 `display` 恒为 `Display::Flex`，`paint/style.rs:453-463`） | 用户已裁决 | §5.10、§5.5 |
 | D19 | run 背景形态 | 水平内边距 2px + 圆角 2px、**不改变推进宽度**、覆盖**行盒高度**（`line_top..line_top+line_height`） | 用户已裁决 | §5.11 |
 | D20 | bench 与 xtask | bench **不纳入** `cargo xtask gates --step bench`（该命令硬编码 `-p ui_core --bench perf`，`xtask/src/gates.rs:599,701,703-704,776`），仅在提交说明与本文档声明 | 用户已裁决 | §7-R3、§11 |
@@ -149,7 +149,7 @@ source ──comrak 0.59 (arena AST)──► MarkdownDocument{blocks, links}
 | 文本测量 `App::measure_text(&mut self, &TextContent, Option<LogicalPx>)` | **`None` = 无约束（`AvailableSpace::MaxContent`），返回未换行的自然尺寸**；`Some(w)` = 限宽测量（返回在 w 下断行后的尺寸） | `app.rs:1892-1899`、`app/canvas_text.rs:207-233`、测试 `measure_text_returns_the_unwrapped_size`（`:409`）/`measure_text_wraps_at_the_requested_width`（`:422`） | **表格建表测量用 `None`**（D18/§5.10） |
 | 每个 run 只能一个 decoration | `TextStyleExtras.decoration: Option<TextDecoration>`（R1 前） | `text.rs:190-199,320-322`（R1 前） | **R1 改为集合**（`TextDecorations`） |
 | 无 per-run 背景/边框/基线偏移 | `TextStyleExtras` 无背景字段（R1 前） | `text.rs:190-199`（R1 前） | **R1 新增 `background: Option<TextBackground>`** |
-| inline box 可按字节索引插入、参与断行、可画四边形或图片 | `InlineBoxSpec{id,index,size,baseline,align,paint}`；`InlineBoxPaint::{Image{resource,modulation}, Quad{color,corner_radius:[LogicalPx;4]}}` | `text.rs:750-770`（R1 前） | 不变；**`file:` 图片继续用 `Quad`**（§6.4） |
+| inline box 可按字节索引插入、参与断行、可画四边形或图片 | `InlineBoxSpec{id,index,size,baseline,align,paint}`；`InlineBoxPaint::{Image{resource,modulation}, Quad{color,corner_radius:[LogicalPx;4]}}` | `text.rs:725-744`（R1 前；`InlineBoxPaint` `:725-734`、`InlineBoxSpec` `:737-744`） | 不变；**`file:` 图片继续用 `Quad`**（§6.4） |
 | 节点可读样式与布局盒 | `Node::style() -> &Style`、`Style::inner() -> &taffy::Style`、`Node::layout() -> LayoutBox`（border-box） | `node/tree.rs:206,257`、`paint/style.rs:28` | 门禁 7 用它读 padding 还原内容盒 |
 | 布局 = taffy flex + 绝对定位；**节点样式层无 grid、无 `flex_basis`/`flex_grow`/`flex_shrink` 单独 setter** | `StyleBuilder` 只有 `flex_row/flex_col/flex_1/flex_none`（`flex_1` = grow1/shrink1/basis0；`flex_none` = grow0/shrink0/basis auto）；`Style::default()` 即 taffy 默认（grow0/shrink1/basis auto） | `paint/style_builder.rs:28-50`、`paint/style.rs:453-463` | **表格列宽靠「`width()` + taffy 默认 shrink=1」实现**，禁止调用 `flex_none()`（§5.10） |
 | 文本 wrap 宽度 = 内容盒宽度（padding 已扣除） | `node/tree/layout.rs:160-176` | 已核实 | 不变 |
@@ -405,7 +405,7 @@ Arc<str> 源文本（MarkdownNode 持有）
 - 非首块且 `previous_blank`（上一块是 spacer）：`margin-top = 0`；
 - 若该块是标题且 `block_index > 0`：`margin-top += HEADING_SPACE_ABOVE`（**不受 `previous_blank` 抑制**）。
 
-**块 id**：只保留根 `MARKDOWN` 与静态可读 id（`MARKDOWN_CODE`、`MARKDOWN_CODE_TEXT`、`MARKDOWN_QUOTE`、`MARKDOWN_QUOTE_BAR`、`MARKDOWN_QUOTE_BODY`、`MARKDOWN_LIST`、`MARKDOWN_LIST_ITEM`、`MARKDOWN_LIST_MARKER`、`MARKDOWN_LIST_CONTENT`、`MARKDOWN_TABLE`、`MARKDOWN_TABLE_ROW`、`MARKDOWN_TABLE_CELL`、`MARKDOWN_TABLE_RULE`、`MARKDOWN_RULE`、`MARKDOWN_SPACER`）；**每块编号 id 一律删除**（`MARKDOWN_BLOCK_*` / `MARKDOWN_BLANK_*`）。产品测试按 `debug_id` **前缀**匹配（`crates/widget/src/test_support.rs:523`），`Probe::Selector` 是精确匹配，重复 id 无法区分——测试改用树路径 / `NodeKind` 遍历（§8.2）。
+**块 id**：只保留根 `MARKDOWN` 与静态可读 id（`MARKDOWN_CODE`、`MARKDOWN_QUOTE`、`MARKDOWN_QUOTE_BAR`、`MARKDOWN_QUOTE_BODY`、`MARKDOWN_LIST`、`MARKDOWN_LIST_ITEM`、`MARKDOWN_LIST_MARKER`、`MARKDOWN_LIST_CONTENT`、`MARKDOWN_LIST_CONTENT_TIGHT`、`MARKDOWN_TABLE`、`MARKDOWN_TABLE_ROW`、`MARKDOWN_TABLE_CELL`、`MARKDOWN_TABLE_RULE`、`MARKDOWN_RULE`、`MARKDOWN_SPACER`）；**每块编号 id 一律删除**（`MARKDOWN_BLOCK_*` / `MARKDOWN_BLANK_*`）。产品测试按 `debug_id` **前缀**匹配（`crates/widget/src/test_support.rs:523`），`Probe::Selector` 是精确匹配，重复 id 无法区分——测试改用树路径 / `NodeKind` 遍历（§8.2）。
 
 **代码块验证项（R2 已定稿，两个备选当时都已批准）**：备选 A（1 节点）成立的三条判据，全部以测试断言：
 
@@ -519,7 +519,7 @@ Arc<str> 源文本（MarkdownNode 持有）
 8. **不得依赖块区间切片**；区间只用于：空行重建（D4）、HTML 块源切片（§5.6.3）、调试。
 9. **空行只由「当前解析层」的根容器生成**；容器内部空行由块间距表达（差异登记 §10.1-7）。
 10. **`inline == None` 时的 `Text`/`Code` 事件**必须自动开 Tight 缓冲（否则紧列表项/隐式文本块丢字）。
-11. **fragment Builder 的状态隔离、`base_depth` 语义与偏移基准**：每个 `build_fragment` 在**自己的源切片**上工作——`slice` 由调用方给出（Pair 内容 / 开标签后文字 / 其他类文字），fragment 内部**重新构造 `SourceLines::new(slice)`**，所有事件 `Range<usize>` 都是**相对 `slice`** 的偏移。被隔离并「进入保存 / 退出恢复」的字段：`lines`、`last_block_end`、`block_index`、`previous_blank`、`table`、`inline`、`marks`、`align_windows`、`pending_window_close`。其中 `table` 与 `align_windows` 在 fragment 期**独立且为空**（嵌套表格各自有列宽；fragment 内**不允许开窗**，§5.6.3 对齐窗口规则 5）。`base_depth` = 外层容器深度，**只用于累加 `MAX_BLOCK_NESTING`**；判断「depth 0 的 HtmlBlock」时按 fragment 自己的解析层从 0 计（fragment 内的 HTML 块仍走四类处理与嵌套解析，不会因外层 depth > 0 被整体降级）。type 6/7 块天然不含空行 ⇒ fragment 内 spacer 恒为 0。fragment 产出的块追加到外层容器时**只读**继承外层 `block_index`/`previous_blank`（决定 margin），不写回。
+11. **fragment Builder 的状态隔离、`base_depth` 语义与偏移基准**：每个 `build_fragment` 在**自己的源切片**上工作——`slice` 由调用方给出（Pair 内容 / 开标签后文字 / 其他类文字），fragment 内部**重新构造 `SourceLines::new(slice)`**，所有事件 `Range<usize>` 都是**相对 `slice`** 的偏移。fragment 除 `block_index`/`previous_blank` 需**写回**外层（保证 fragment 之后首块的块间距，偏差 §10.1-27）外**全部隔离**：`lines`、`last_block_end`、`table`、`inline`、`marks`、`align_windows`、`pending_window_close` 进入保存 / 退出恢复。其中 `table` 与 `align_windows` 在 fragment 期**独立且为空**（嵌套表格各自有列宽；fragment 内**不允许开窗**，§5.6.3 对齐窗口规则 5）。`base_depth` = 外层容器深度，**只用于累加 `MAX_BLOCK_NESTING`**；判断「depth 0 的 HtmlBlock」时按 fragment 自己的解析层从 0 计（fragment 内的 HTML 块仍走四类处理与嵌套解析，不会因外层 depth > 0 被整体降级）。type 6/7 块天然不含空行 ⇒ fragment 内 spacer 恒为 0。fragment 产出的块追加到外层容器时，与普通块一样按外层 `block_index`/`previous_blank` 决定 margin（写回口径，§10.1-27）。
 12. **`End(TableCell)` 不建节点**：表格期间只累积 `CellBuf`（§5.10），`flush` 语义改为「落到 CellBuf」；表格行/列补齐与建表都在 `End(TableRow)` / `End(Table)` 完成。
 
 ### 5.5 `InlineBuf` 与样式映射
@@ -664,8 +664,8 @@ impl Builder<'_> {
     /// - base_depth = 外层容器深度，**只用于累加 MAX_BLOCK_NESTING**；
     ///   判断是否为「depth 0 的 HtmlBlock」时，fragment 内的顶层按**它自己的解析层**从 0 计
     ///   （即 fragment 里的 HTML 块仍走四类处理与嵌套解析，不会被当成 depth > 0 而整体降级）；
-    /// - fragment 期安装 slice 自己的 SourceLines、独立 block_index/previous_blank/last_block_end/
-    ///   align_windows/table/inline/marks（§5.4 约束 11），退出恢复。
+    /// - fragment 期安装 slice 自己的 SourceLines、独立 last_block_end/align_windows/table/inline/marks
+    ///   （§5.4 约束 11），退出恢复；block_index/previous_blank 写回外层（§10.1-27）。
     fn build_fragment(&mut self, slice: &str, kind: FragmentKind, base_depth: usize, budget: &mut HtmlBudget) -> Result<(), EngineError>;
 }
 ```
@@ -727,13 +727,14 @@ impl Builder<'_> {
 
 - **计数口径**：块容器深度 = 块级容器条目数（root 不计；quote/list/item/table/row/cell 各计 1；HTML 嵌套解析的块深度从调用方深度继续累加，因此同样受 `MAX_BLOCK_NESTING` 约束）；行内 marks 另用 `MAX_INLINE_NESTING`。
 - **抑制模式**：新容器深度 > 上限 → 不建节点，`skipped += 1`；此后文本事件追加到「最深允许容器内一个惰性创建的扁平 text 节点」（块之间插 `\n`）；`End` 对齐时 `skipped -= 1`，归零退出。抑制期间不创建任何节点，退出后兄弟块不受影响。
-- **行内上限**：marks 栈深度 > 上限 → 进入「丢弃」模式并 `skipped_inline += 1` 直到对应 `End`；该子树文字**丢弃**（与现状 `parse.rs:599-601` 一致，`parse_tests.rs:315-341` 钉死）。
+- **行内上限**：marks 栈深度 > 上限 → 进入「只截断 marks」模式并 `clipped_marks += 1` 直到对应 `End`；**文字、换行、图片与行内 HTML 照常落盘**（只截断超限的 marks，不丢内容；与 D15/§5.9「绝不吞字」一致。旧实现丢弃子树文字，最终审查 F-1 后修正，登记 §10.1-34）。
 - **表格上限**：
   - 列数 > `MAX_TABLE_COLUMNS` → 只建 20 列，超出列的 `CellBuf` 文本按空格拼进第 20 列（建表时按截断后的列数测量）；
   - 行数 > `MAX_TABLE_ROWS` → 表格只建 200 行；剩余行在 `End(Table)` 转成纯文本，**挂在表格容器所在的同一父容器下、位于表格容器之后**（普通段落、吃 `BLOCK_GAP`、不受列宽约束）；
   - 溢出段落本身上限 `MAX_TABLE_OVERFLOW_ROWS = 100`，超出不渲染（§10.1-12）。
 - **HTML 上限**：嵌套解析次数 / 内层字节（§5.6.3 嵌套解析），超限退化为纯文本段落（§10.1-18）；**EOF 未关窗 → 已施加的 align 保留、不撤销**（§10.1-22）。
-- 所有上限都必须让**文字可见**（除行内深嵌套的既有丢弃语义、type 1–5 的契约性忽略）。
+- 所有上限都必须让**文字可见**（唯一例外是 type 1–5 的契约性忽略；行内深嵌套超限只截断 marks、文字照常落地，§10.1-34）。
+- **无文档级节点上限**：只受上述块/行内/表格/HTML 的局部上限约束；512 KB 纯 markdown 实测 mount 68,324 节点 / release 0.48 s（§10.1-35，最终审查 F-7），10 MB 级按线性外推。
 - **节点数量级**（由 §5.3 形状推导，作为 §9.3 预算；含表头行分隔线）：200 行 × 20 列表格 = 1（表容器）+ 201 行 ×（1 行容器 + 40 cell×2 + 1 分隔线）= 1 + 201×42 = **8,443**；3 列 = 1 + 201×8 = **1,609**；补列 cell 只有 1 节点，故实际更小。对比「不设上限的 1 万行 × 3 列」= 6 万+ 节点。
 
 ### 5.9 错误与降级
@@ -843,7 +844,7 @@ pub(crate) struct ShapedQuad {            // 原 ShapedDecoration 更名并加�
 - 不用 bitflags：颜色/厚度本来就按 kind 分开；`Option<TextDecoration>` 每 kind 的模型与 parley 0.12 的 `Style{underline, strikethrough}` 同构；`TextStyleExtras` 已装箱，尺寸不敏感。
 - `TextStyle` 尺寸断言 `size_of::<TextStyle>() == 56` 保持不变。
 - **`TextRun` 不变** → 外部构造点零改动（`ui_kit/.../inline_flow.rs`、`widgets/x/src/view.rs:2012`）。
-- **`TextStyle` 的装饰访问器改名会波及 `ui_kit`**：`ui_kit/src/kit/markdown/inline_flow.rs` 有 8 处外部使用——R1 前基线 `:8`（`use …TextDecoration`）、`:301-314`（3 处 `with_decoration(TextDecoration::underline/strikethrough(...))`）、`:417`（`.decoration().is_none()`）、`:469-470`/`:479-480`/`:507-508`（3 处 `matches!(…, TextDecoration::Underline{..})` 与 `.decoration()`）、`:325`（测试 re-export）。**R1 必须一并做最小类型适配**（改成 `with_underline(…)/with_strikethrough(…)`、`decorations()`/`decorations().underline`），否则 R1 提交无法 `cargo check --workspace`（§7-R1）。
+- **`TextStyle` 的装饰访问器改名会波及 `ui_kit`**：`ui_kit/src/kit/markdown/inline_flow.rs` 有 8 处外部使用——R1 前基线 `:8`（`use …TextDecoration`）、`:301-314`（3 处 `with_decoration(TextDecoration::underline/strikethrough(...))`）、`:417`（`.decoration().is_none()`）、`:469-470`/`:479-480`/`:507-508`（3 处 `matches!(…, TextDecoration::Underline{..})` 与 `.decoration()`）、`:325`（测试 re-export）。**R1 提交不改 `ui_kit`**：这 8 处随 R2 的整体删除一并消失；R1 单独检出时 `ui_kit` 旧 markdown 模块仍调用被替换的 API，故不可编译（R1/R2 成对例外，见 §7-R1）。
 - 新增 `TextStyle` API：`decorations() -> TextDecorations`、`background() -> Option<TextBackground>`、`with_underline(LogicalPx, Option<Color>)`、`with_strikethrough(LogicalPx, Option<Color>)`、`with_background(TextBackground)`。
 - **`TextBackground::is_visible()`（硬要求）**：与 `TextDecoration::is_visible` 同语义——`color.is_transparent()`、`corner_radius`/`padding_x` 非有限（NaN/∞）或 `padding_x < 0` → 不可见。**shaping（`background_segments`）与 paint（`paint/pass.rs` 的 `emit_text` 与 `window/canvas_text.rs` 的非加速路径）都必须先调用它过滤**，否则 NaN 会进 Quad 几何、透明色会被当成有背景（影响快路径判据与 `is_simple()`）。
 
@@ -863,7 +864,7 @@ pub(crate) struct ShapedQuad {            // 原 ShapedDecoration 更名并加�
 | `window/canvas_text.rs`（**非加速 canvas text 绘制路径**） | 只画字形与装饰线，不画 run 背景 | **R1 必须同步画背景**：与 `paint/pass.rs` 用同一份 `ShapedTextLine.backgrounds`、同一 z 序（字形之前）、同一 `corner_radius`/颜色；两条路径行为必须一致（否则软件路径与 GPU 路径观感不同） |
 | `emit_text` + `emit_solid_quad`（`paint/pass.rs`，R1 前 `:1625-1769`/`:1769-1797`） | `emit_solid_quad` 原为 4 参（`context,bounds,color,opacity`）且硬编码 `corner_radius: [ZERO;4]`，**HEAD 调用点 3 处（`:1642`/`:1739`/`:1761`）** | **扩为 5 参**（新增 `corner_radius: LogicalPx`），全部调用点同步（R1 前 3 处、R1 后 5 处 = 原 3 + 背景 2）；`emit_text` 在**选区 Quad 之前**、`items` 字形循环之前插入背景 Quad 循环（传入 `background.corner_radius`；选区半透明色覆盖在背景之上是期望行为）；背景**不**走 `StylePatch.foreground` |
 | `paint/pass.rs` 的私有 `struct TextDecorations`（R1 前 `:1238`，可编辑文本的选区/下划线/caret 聚合） | 与新增的公开 `text::TextDecorations` **同名但不同模块**（无编译冲突，但同名会让后续实现者混淆） | **R1 必须改名为 `EditDecorations`**（纯改名、无行为变化）；`text_decorations()` 函数名保留（它不是类型） |
-| `ui_kit/.../inline_flow.rs:301-314` | `if link … else if strike … else if kbd` 三选一 | 三个独立 `if` + `if mark.code { with_background(...) }`（R1 只做类型适配，语义切换在 R2） |
+| `ui_kit/.../inline_flow.rs:301-314` | `if link … else if strike … else if kbd` 三选一 | 三个独立 `if` + `if mark.code { with_background(...) }`（R1 未实施：该文件随 R2 整体删除并重写，见 §7-R1） |
 | 既有测试 | `text.rs`（装饰 helper）、`cache.rs`（键区分）、`shape.rs`（装饰几何 7 组）、`pass.rs`（Quad 编码/foreground） | 按集合/背景改写断言（§5.11.4）；`shape.rs` 的 RTL 用例扩展到背景 |
 
 #### 5.11.3 run 背景的几何与绘制顺序（D19）
@@ -900,7 +901,7 @@ pub(crate) struct ShapedQuad {            // 原 ShapedDecoration 更名并加�
 | `paint/pass.rs` | `run_backgrounds_are_drawn_before_glyphs_and_ignore_foreground` | 背景 Quad 在选区与字形之前 push；`StylePatch.foreground` 只改字形与装饰线；组 opacity 照乘到背景色；透明 Quad 不产实例 |
 | `paint/pass.rs` | `canvas_text_recipe_draws_run_backgrounds_before_glyph_runs` | 非加速 canvas 路径：背景 Quad 先于 GlyphRun，几何与 GPU 路径一致，透明 Quad 不产实例 |
 | `paint/pass.rs` | `placeholder_line_draws_run_backgrounds` | 占位/回退路径也画背景（背景循环在占位文字色短路之前） |
-> **`ui_kit/.../inline_flow.rs` 的三条语义改写**（链接 + 删除线并存、行内代码底色、kbd 下划线 + 底色）**归 R2**（R1 只做类型适配、保持旧 else-if 语义，见 §5.11.2 末行与 §7-R1）；对应 3 条测试随 R2 交付。
+> **`ui_kit/.../inline_flow.rs` 的三条语义改写**（链接 + 删除线并存、行内代码底色、kbd 下划线 + 底色）**归 R2**（R1 未做类型适配；`inline_flow.rs` 随 R2 整体删除并重写，见 §5.11.2 末行与 §7-R1 成对例外）；对应 3 条测试随 R2 交付。
 
 #### 5.11.5 风险与性能影响
 
@@ -957,16 +958,17 @@ crates/ui_kit/src/kit/markdown/
         gates.rs           // §8.4 的七条性能与结构门禁 + 冻结夹具的渲染断言
         ledger.rs          // §8.6 台账「保留并改写」条目的实际落点断言（旧测试处置的替代，逐条对应台账编号）
         outline.rs         // §8.2 的 outline() 与节点树轮廓 helper（heading/list/table/align 的分类与文本化）
-        plain.rs           // §8.5 plain_text 冻结字面量（81 条 legacy 基线 + 2 条生产输入 + 2 条 document 冻结值）
+        plain.rs           // §8.5 plain_text 冻结字面量（81 条 legacy 基线 + 2 条已登记折叠偏差 + 2 条 document 冻结值 + 4 条生产输入）
         fixtures.rs        // 冻结夹具的模块声明
         fixtures/
             i18n_markdown.rs      // **冻结夹具**：39 个 key × {en, zh} 原文 + 富文本标记 + `PRODUCTION_NOTICES`（§8.5）
-            legacy_plain_text.rs  // **冻结夹具**：81 条 legacy plain_text 期望字面量 + 2 条 document 冻结值（R2 前用 comrak 管线生成）
+            legacy_plain_text.rs  // **冻结夹具**：81 条 legacy plain_text 期望字面量 + 2 条已登记折叠偏差 + 2 条 document 冻结值（R2 前用 comrak 管线生成）
 ```
 
 - **为什么测试用 `tests.rs` + `tests/` 而不是 `tests/mod.rs`（唯一强制偏差，必须保留）**：`ui_kit` 继承 workspace lint `definition_in_module_root = "forbid"`（root `Cargo.toml:340`），即**禁止在模块根（含 `mod.rs`）里定义条目**；而测试 harness（`mount` / `style` / `texts` / outline helper 等）恰好必须定义在 `tests` 这一层，放进 `tests/mod.rs` 会被该 lint 拦下。实际形态 = 自命名根文件 `tests.rs` 定义 harness 并声明 `mod corpus; mod fixtures; mod gates; mod ledger; mod outline; mod plain;`，子目录 `tests/` 只放子模块；语义与 v3 原稿（`tests/mod.rs` + `fixtures/`）等价，只换根文件名（`self_named_module_files = "allow"`，root `Cargo.toml:336`，是该形态的前提）。
 - 子模块声明放在 `markdown.rs`（`mod assets;` 等），`crates/ui_kit/src/kit/mod.rs:19` 保持 `pub mod markdown;` 不变；`mod tests;` 带 `#[cfg(test)]`。
 - **没有 `autolink.rs`**（D2）、**没有 `preprocess.rs`**（不做源文本级剥壳，D7 走 tokenizer + 对齐窗口 + 嵌套解析）。
+- **私有 helper 的单元测试保留在模块内**：`assets.rs` / `html.rs` / `lines.rs` 各一处内联 `#[cfg(test)] mod tests`（`source.rs` 的 20 条随迁 + `html`/`lines` 私有函数用例）；其余测试都在 `tests.rs` + `tests/` 下。
 - `html.rs` 实际 686 行（v3 预估 350–450 行；超出部分来自块级四类分类、对齐窗口与嵌套解析的容错分支）。
 - `SourceLines` 与空行计数的落点是 `lines.rs`（原 `parse.rs:26-74`/`:366-379`）；`parse.rs` 其余部分（comrak→IR）随 IR 一起删除。
 - `source.rs` 的 20 条测试随文件迁入 `assets.rs` 的 `#[cfg(test)] mod tests`（断言不变）；`InlineImageSource` 降为 `pub(super)`（模块外不再需要）。
@@ -1035,7 +1037,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 2. 逐事件：`Text`/`Code` → 追加；`SoftBreak`/`HardBreak` → `\n`；`CodeBlock` → literal 去一个尾随 `\n`；表格单元格之间 ` `、行之间 `\n`；行内 `InlineHtml` 的 `<kbd>` 忽略、`<br>` → `\n`，其余标签丢弃；`Image` 子树完全跳过（不取 alt）。
 3. 块与块之间一个 `\n`；列表项之间 `\n`；引用/列表等容器递归展开。
 4. 不保留空行冗余 `\n`（与现状差异登记 §10.1-8）。**块内连续两个硬换行仍产出 `\n\n`**（新用例钉死）。
-5. 契约用**冻结字面量**断言：`tests/fixtures/legacy_plain_text.rs` 存 **83 条**期望值（81 条 legacy 基线逐字符 + `document.rs` 两条冻结值），**由 R3 用 comrak 0.59 管线一次性生成后冻结入库**（R2 顺延、R3 落地；生成脚本不入库，命令与校验写进 R3 提交说明）。`common.market_not_loaded` 的四行块必须拼出 3 个 `\n`。
+5. 契约用**冻结字面量**断言：`tests/fixtures/legacy_plain_text.rs` 存 **85 条**期望值（81 条 legacy 基线逐字符 + 2 条已登记折叠偏差（`LEGACY_PLAIN_TEXT_FOLDED`）+ `document.rs` 两条冻结值）；另有 4 条生产 `plain_text` 入参（`PRODUCTION_PLAIN_TEXT_SOURCES`，只作输入不作期望）。**由 R3 用 comrak 0.59 管线一次性生成后冻结入库**（R2 顺延、R3 落地；生成脚本不入库，命令与校验写进 R3 提交说明）。`common.market_not_loaded` 的四行块必须拼出 3 个 `\n`。
 
 ### 6.4 删除清单与保留清单
 
@@ -1043,7 +1045,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 
 **图片绘制通路的替代（删掉 `ImagePaintSource` 后写死的做法）**：
 
-- `file:` 图片 → `InlineBoxSpec { id, index, size, baseline: None, align: InlineAlign::Baseline, paint: Some(InlineBoxPaint::Quad { color: style.image_placeholder, corner_radius: [px(2.0); 4] }) }`——与现状 `inline_flow.rs:96-108` 的占位四边形视觉一致；`InlineBoxPaint::Image{resource,modulation}`（`text.rs:750-760`）需要 App 资源注册管线，本轮**不用**。
+- `file:` 图片 → `InlineBoxSpec { id, index, size, baseline: None, align: InlineAlign::Baseline, paint: Some(InlineBoxPaint::Quad { color: style.image_placeholder, corner_radius: [px(2.0); 4] }) }`——与现状 `inline_flow.rs:96-108` 的占位四边形视觉一致；`InlineBoxPaint::Image{resource,modulation}`（`text.rs:725-734`）需要 App 资源注册管线，本轮**不用**。
 - 尺寸：`assets::InlineImageSource::parse(uri)` 给出 `size`（显式 `?size`）或内禀尺寸；**不可加载资产 → 16×16**（沿用 `source.rs` 的 `DEFAULT_IMAGE_SIZE`）。
 - 非 `file:` → `PendingBox::Alt(alt)`，有 alt 落文本、无 alt 不产节点（D6-④）。
 - `InvisibleImages` 的测试替身删除后，「图片不占文本字节 / 只产 box」的断言改读 `InlineBoxSpec.paint.is_some()` 与 `size`（§8.2）。
@@ -1083,23 +1085,24 @@ pub fn plain_text(source: &str) -> SmolStr;
 
 ## 7. 实施计划（方案 B：合并 P0+P1，D17）
 
-> D17：**不写过渡 IR 适配层**，直接进入新架构；每个提交都必须可编译（`cargo check --workspace --all-targets`）。
+> D17：**不写过渡 IR 适配层**，直接进入新架构；每个提交都必须可编译（`cargo check --workspace --all-targets`）。**唯一例外**：R1 提交只含 `ui_core`，单独检出时 `ui_kit` 旧 markdown 模块仍调用被替换的 API，故不可编译；R1/R2 成对使用，R2 后恢复全仓可编译（见 §7-R1 的成对例外登记）。
 > D21：验收只跑 `ui_core`/`ui_kit` 的测试；其它 crate 只要求编译；**产品侧受影响的 11 个 crate 在 R2/R4 手工补跑测试并记录结果**（命令见 §11）。
 
-### R1 — ui_core 引擎改造（D6-①②/D8/§5.11）+ ui_kit 最小编译适配
+### R1 — ui_core 引擎改造（D6-①②/D8/§5.11；交付物**只含 ui_core**）
 
 - 交付物（ui_core）：`text.rs`（`TextDecorations`/`TextDecoration`/`TextBackground`（含 `is_visible()`）+ getter/setter/hash + `ShapedTextLine.line_top/backgrounds` + `ShapedQuad.corner_radius`）、`text/shape.rs`（双线收集 + `background_segments`（分组/两端 padding/`line_top` 同源）+ `clamp_line_rects`）、`text/cache.rs`（键区分测试）、`text/context.rs`（快路径资格）、`text/fast_path.rs` + `window/{canvas_text.rs,tests.rs}`（字面量补字段 + 非加速路径画背景）、`paint/pass.rs`（`emit_solid_quad` 增 `corner_radius` + 背景 Quad 循环 + **私有 `TextDecorations` → `EditDecorations` 改名**）。（v3.3 起**除本节列出的双装饰线 / run 背景公开面外不新增任何引擎公开 API**，见 §5.13）
-- 交付物（ui_kit，**只做最小编译适配**，不改 markdown 语义）：`crates/ui_kit/src/kit/markdown/inline_flow.rs`——R1 前基线 `:8`（import）与 `:301-314`（3 处 `with_decoration(TextDecoration::underline/strikethrough(...))`）改成 `with_underline(px(1.0), Some(...))` / `with_strikethrough(...)`；`:417`（`.decoration().is_none()`）与 `:469-470`、`:479-480`、`:507-508`（`matches!(decoration, TextDecoration::Underline{..})`）改成 `decorations()`/`decorations().underline`；`:325`（测试 re-export）同步。**语义仍保持现状（三选一）**，R2 才改成独立叠加 + code 背景。
-- 验收命令：`cargo test -p ui_core -p ui_kit`、`cargo check --workspace --all-targets`、`cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings`、`cargo +nightly fmt`（R1 改了 `ui_kit` 的测试代码，必须跑 `-p ui_kit`，与 D21/§11-1 一致）。
-- 提交产出：一个提交；提交说明逐条列出 §5.11.4 的新增/改写测试（含 **RTL 背景用例**、**分数行高相邻行相接用例**、**组两端 padding 用例**、**非加速 canvas 路径背景用例**）、「哈希、快路径、z 序、clamp、接缝、RTL」六项风险的处理点，以及「ui_kit 只做了类型适配、语义未变」这一声明。
-- **R1 明确不做**：任何 markdown 语义改动（链接+删除线共存、行内代码底色、kbd 下划线+底色归 R2，见 §5.11.4 末尾与 §7-R2）；`TextBackground::is_visible()` 的调用方过滤只在引擎内部（组件侧由 R2 用它挡无效配置）。
+- **R1 交付物只含 `ui_core` 与设计文档**：实际提交 `9a4d3e8d` 没有任何 `ui_kit` 源码改动（`git show --numstat 9a4d3e8d` 可证）；原计划的「`ui_kit` 最小编译适配」未实施——旧 markdown 模块（`inline_flow.rs` 的 8 处旧装饰 API）随 R2 整体删除。
+- **R1 提交与 R2 提交成对**：R1 单独检出时 `ui_kit` 旧 markdown 模块仍调用被替换的 API，故不可编译；D17「每个提交可编译」对 R1/R2 这一对作**例外登记**（R2 提交后恢复全仓可编译）。
+- 验收命令（R1 单独检出只验证 `ui_core`）：`cargo test -p ui_core`、`cargo +nightly clippy -p ui_core --all-targets -- -D warnings`、`cargo +nightly fmt`；`cargo check --workspace --all-targets` 与 `-p ui_kit` 的测试在紧随其后的 R2 提交上验证（R1/R2 成对例外，与 D21/§11-1 的范围一致）。
+- 提交产出：一个提交；提交说明逐条列出 §5.11.4 的新增/改写测试（含 **RTL 背景用例**、**分数行高相邻行相接用例**、**组两端 padding 用例**、**非加速 canvas 路径背景用例**）、「哈希、快路径、z 序、clamp、接缝、RTL」六项风险的处理点，以及「R1 只落地 §5.11 已批准的公开面」这一声明。
+- **R1 明确不做**：任何 markdown 语义改动（链接+删除线共存、行内代码底色、kbd 下划线+底色归 R2，见 §5.11.4 末尾与 §7-R2）；也不含 `ui_kit` 的旧 API 类型适配（见上「成对例外」）；`TextBackground::is_visible()` 的调用方过滤只在引擎内部（组件侧由 R2 用它挡无效配置）。
 
 ### R2 — markdown 组件全量替换（**一个提交**）
 
 - **提交粒度：一个提交**（用户流程要求每轮一次提交）。若中途需要检查点，用工作树本地手段（如 `git stash create`）保留快照，**不产生额外提交**。
-- 交付物：新模块布局（§6.1）、`html.rs`（标签序列 + 对齐窗口 + tokenizer 迁移）、`build.rs`（Builder + 空行重建 + 布局常量）、`inline.rs`（**多装饰叠加语义**：链接+删除线共存、行内代码底色、kbd 下划线+底色，及其 3 条测试——从 R1 移入，见 §5.11.4 末尾）、`table.rs`（延迟建表 + `End(Table)` 测量）、`plain.rs`、`assets.rs`、`lines.rs`、公开面收敛（§6.2）、`plain_text` 事件旁路（§6.3）、对齐窗口在段落创建时经 `current_align()` 写入 `TextStyle.alignment`（§5.6.3「对齐只写一次」）、7 个调用点（§6.5）、旧测试按台账逐条处置、gallery `MARKDOWN_SOURCE` 扩到覆盖 GFM 全构造；**R2 第一个动作**：用当前 comrak 管线生成 `tests/fixtures/legacy_plain_text.rs`（§6.3-5），随后再动解析器。
+- 交付物：新模块布局（§6.1）、`html.rs`（标签序列 + 对齐窗口 + tokenizer 迁移）、`build.rs`（Builder + 空行重建 + 布局常量）、`inline.rs`（**多装饰叠加语义**：链接+删除线共存、行内代码底色、kbd 下划线+底色，及其 3 条测试，见 §5.11.4 末尾）、`table.rs`（延迟建表 + `End(Table)` 测量）、`plain.rs`、`assets.rs`、`lines.rs`、公开面收敛（§6.2）、`plain_text` 事件旁路（§6.3）、对齐窗口在段落创建时经 `current_align()` 写入 `TextStyle.alignment`（§5.6.3「对齐只写一次」）、7 个调用点（§6.5）、旧测试按台账逐条处置、gallery `MARKDOWN_SOURCE` 扩到覆盖 GFM 全构造；**R2 第一个动作**：用当前 comrak 管线生成 `tests/fixtures/legacy_plain_text.rs`（§6.3-5），随后再动解析器。
 - 验收命令：`cargo test -p ui_core -p ui_kit`、`cargo check --workspace --all-targets`、`cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings`、`cargo +nightly fmt`；gallery 手动帧检（`cargo run -p ui_kit --example gallery`）；**产品侧补跑**（记录结果，失败需逐条说明）：`cargo test -p widget -p updater_ui -p solana_wallet -p ethereum_wallet -p force_order -p market_trade -p news -p empty -p settings_ui -p watch_list -p widget_registry`。
-- 提交说明必须包含：① `markdown-test-inventory.md` 的 173 条逐条勾选（编号 + 测试名 + 处置）；② §10.1 的偏差逐条确认（R2 时 **28 条**，R3 追加 29–33 后为 **33 条**，逐条结果见 §14.4）；③ §8.5 覆盖边界（7 组原始串 key 不在范围内）；④ D21 让步声明。
+- 提交说明必须包含：① `markdown-test-inventory.md` 的 173 条逐条勾选（编号 + 测试名 + 处置）；② §10.1 的偏差逐条确认（R2 时 **28 条**，R3 追加 29–33 后为 **33 条**，最终对抗审查追加 34–36 后为 **36 条**，逐条结果见 §14.4）；③ §8.5 覆盖边界（7 组原始串 key 不在范围内）；④ D21 让步声明。
 
 **实际交付（R2 提交 `9447be99`，`refactor(ui_kit): markdown 组件切换为 pulldown-cmark 单遍管线`）**：
 
@@ -1118,7 +1121,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 **实际交付（R3 提交内容）**：
 
 - **测试拆分**：`tests.rs` 只留 harness（`EmbeddedAssets` / `mount` / `style` / `texts` / `tree_of` / `children` / `node_count` / `bounds` / `cell_widths` / `measured_width` 等）+ 子模块声明；用例拆进 `tests/{corpus,gates,ledger,outline,plain}.rs`，冻结夹具进 `tests/fixtures/{i18n_markdown,legacy_plain_text}.rs`（§6.1）。
-- **夹具**（R2 顺延项 ①）：`i18n_markdown.rs`（75 条 = en 36 + zh 39，含 21 条 `PRODUCTION_NOTICES`）与 `legacy_plain_text.rs`（81 条 legacy 基线 + 2 条 document 冻结值），一次性脚本生成后冻结入库。
+- **夹具**（R2 顺延项 ①）：`i18n_markdown.rs`（75 条 = en 36 + zh 39，含 21 条 `PRODUCTION_NOTICES`）与 `legacy_plain_text.rs`（81 条 legacy 基线 + 2 条已登记折叠偏差 + 2 条 document 冻结值；另有 4 条生产 `plain_text` 入参），一次性脚本生成后冻结入库。
 - **语料与门禁**（顺延项 ②④）：§8.3 语料 + `outline()` / HTML 发射器（`tests/corpus.rs`、`tests/outline.rs`）——`corpus.rs` 按 §8.1 的 8 个构造分类落齐 **90 条**用例（删除线 6 / 块级 15 / 行内 12 / 对齐 3 / 表格 12 / 任务清单 9 / HTML 语义子集 27 / 退化 6），另有 `the_gfm_conformance_corpus_covers_all_ninety_cases` 钉总数（8 个 builder 的 `len()` 求和 == 90）、5 条跳过清单逐条指向 §10.1 登记编号（运行时断言 `numbers == [3, 3, 5, 6, 16]`）；§8.4 七条门禁（`tests/gates.rs`，13 个测试）、§8.5 保真门禁、§8.6 台账落点断言（`tests/ledger.rs` / `tests/plain.rs` + `tests.rs` 的 `tests::*`）。
 - **生产代码改动**：`build.rs` 补 `#[cfg(test)]` 解析计数 seam（`parse_count` / `reset_parse_count`，顺延项 ③）并修 spacer 的 `flex_shrink(0.0)`——门禁 3 实测暴露：此前 spacer 走 taffy 默认 `shrink = 1`，父容器高度受限时会被压扁（`tests/gates.rs::the_blank_line_spacer_is_flex_fixed_at_one_line_height`）。
 - **bench**（顺延项 ④）：`crates/ui_kit/benches/markdown.rs` 的 **10 项**（8 项计划 + `build_notice_html_525b` / `table_widths_200x20`）+ `#[global_allocator]` 分配计数 + `[[bench]] name = "markdown"` / `harness = false` + criterion 0.8.2 dev-dependency（§9.2）；实测落档 §12.2。
@@ -1132,7 +1135,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 
 ### 最终 — 全局对抗审查
 
-按「回归／性能／正确性／偏差／文档一致性」五维度全量审查，逐项落到提交或文档修正；review 清单：① §8.4 七条门禁（13 个测试）都在 CI 可跑命令里；② §8.5 覆盖边界写明 7 组原始串 key；③ §10.1 每条「可接受性」仍成立（33 条逐条确认见 §14.4）；④ §6.5 的 7 处行号漂移则回写；⑤ §9.3 预算与实测一致（否则回写推导）；⑥ HTML 容错语义（未闭合/嵌套不配对/注释/引号/CRLF/段落内 `</p>`）都被 §8.1 的 27 条覆盖；⑦ 全文无未决项。
+按「回归／性能／正确性／偏差／文档一致性」五维度全量审查，逐项落到提交或文档修正；review 清单：① §8.4 七条门禁（13 个测试）都在 CI 可跑命令里；② §8.5 覆盖边界写明 7 组原始串 key；③ §10.1 每条「可接受性」仍成立（36 条逐条确认见 §14.4）；④ §6.5 的 7 处行号已就地声明为 R2 前基线，R4 起不再回写（§6.5 表头）；⑤ §9.3 预算与实测一致（否则回写推导）；⑥ HTML 容错语义（未闭合/嵌套不配对/注释/引号/CRLF/段落内 `</p>`）都被 §8.1 的 27 条覆盖；⑦ 全文无未决项（唯一登记例外：§10.1-9 的 CommonMark 版本差异按「登记不验证」处理）。
 
 ---
 
@@ -1151,7 +1154,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 | 行内 | 12 | 反斜杠转义、实体、`<kbd>` 简单形态、行内代码多重反引号/首尾空格、`file:` 图片、非 `file:` 图片回退（D6-④）、strong+em 嵌套、em、链接、链接内 strong、链接内代码 |
 | 段落对齐 | 3 | 对齐窗口/`<p align>` 的居左/居中/居右（断言 `TextStyle.alignment` + 首字形 x 偏移） |
 | **HTML 语义子集** | **27** | 见下方清单（逐条承接台账 §1 B 组与 C 组的容错语义） |
-| 退化 | 6 | 200 层引用、100 层强调、300 层列表、10,000 字符单段、空文档、纯空白 |
+| 退化 | 6 | 200 层引用、80 层强调（`*`×160，超 64 层上限）、300 层列表、10,000 字符单段、空文档、纯空白 |
 
 **行内语料的变化（R3 复核后的事实）**：v3.4 计划里的 **硬换行 / `<br>` / `<kbd>` 只包图片**三条不再作为 canonical 用例——它们描述的正是本实现**有意不区分**的行为（`\n` 与硬换行、软换行在文本模型里都一样，D5；`<kbd>` 包图只剩图片盒），继续留在规范语料里等于「以规范之名固化」自家偏差。三条改由 **§10.1-30（硬/软换行）与 §10.1-31（`<kbd>` 包图）** 登记，专项断言落在 `tests/ledger.rs` 的 `hard_breaks_become_newline_bytes_and_reset_marks` / `the_line_break_model_does_not_distinguish_hard_from_soft` / `kbd_around_an_image_keeps_only_the_image_box`；`<br>` 仍出现在 HTML 语义子集的复合用例 `html:inline-del-code-and-break` 里（标签 → `\n` 的一处映射），不再单独成条。
 
@@ -1225,7 +1228,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 | `image` | `<img>`（无 src，占位四边形的等价物） |
 
 - 语料（R3 实际交付）：**90 条**，分类与逐类计数见 §8.1；期望值是**规范输出**（归一化空白与属性顺序），由测试专用发射器把节点树渲染成规范化 HTML 后逐字符比对。发射器、8 个 corpus builder 与总数断言都在 `tests/corpus.rs`。
-- **不覆盖项**：① 扩展自动链接规范例（622–635）——D2 不实施（§12.3）；② 原始 HTML 规范例——D7 已登记偏差，改由 §8.1 的 HTML 语料守自家契约；③ 链接 `href`（§10.1-16）；④ 空行 spacer（§10.1-6）。
+- **不覆盖项**：① 扩展自动链接规范例（622–635）——D2 不实施（§12.3）；② 原始 HTML 规范例——D7 已登记偏差，改由 §8.1 的 HTML 语料守自家契约；③ 链接 `href`（§10.1-16）；④ 空行 spacer（§10.1-6）；⑤ mark 嵌套深度折叠（发射器把 `****x****` 归一为 1 层，GFM/cmark 为 2 层；§10.1-36）。
 - **显式 skip 列表 = 5 条**（`tests/corpus.rs` 的 `SKIPPED`，运行时由 `the_conformance_corpus_skips_are_registered_deviations` 校验：每条 reason 非空、每条编号必须在 §10.1 表内真实存在，排序后断言 `numbers == [3, 3, 5, 6, 16]`）：扩展自动链接 → §10.1-5（D2）；原始行内 HTML → §10.1-3（D7）；原始 HTML 块（type 1–5）→ §10.1-3（D7）；链接 `href` → §10.1-16（D9）；空行 spacer → §10.1-6（D4）。
 - **三条 canonical 用例已移出语料**：硬换行、`<br>`、`<kbd>` 只包图片不再作为规范期望值固化（理由与落点见 §8.1 末段、§10.1-30/-31）——规范一致性门禁只固化「本实现确实按 GFM 契约输出」的部分，不把已登记偏差写成期望值。
 - CommonMark 全量示例的**一次性 diff 报告**（与 comrak 0.59 输出对比）在 R2 前生成并存档到 `%TEMP%`（不入库；§10.1 的差异登记以它为依据）。
@@ -1238,7 +1241,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 | 2 | 稳定帧零 shape | `gates::gate_two_a_repaint_only_frame_shapes_and_lays_out_nothing`（**阳性对照 + 负样本两段，同一测试内**）：① 先读 mount 首帧的 `FrameStats`，断言 `text.shaped == 5 && text_layout.laid == 6`——证明这一帧确实有 5 个文本参与形状、6 个参与排版，后面的零值不是「报告没填」；② 再 `invalidate_all_lanes()` 制造纯重绘帧并 drain，断言该帧 `text.shaped == 0 && text_layout.laid == 0`，同时 `record.rendered == true` 保证它是真重绘帧而非 idle 帧 | `text.rs` 的 `TextPassReport`/`TextLayoutReport`、`app/frame.rs` |
 | 3 | 节点预算 + 空行 | `gates::gate_three_the_release_notes_stay_inside_the_node_budget`：`release_notes/v0.0.3/{en,zh-CN}.md` → 节点总数 **== 70**（先断言 `<= 72` 再断言 `== 70`）、**恰好 34 个 `MARKDOWN_SPACER`**，每个 spacer 的布局高度 == 行高（默认根下 `body_size 14 × 1.4 = 19.6px`）且**声明样式 `flex_shrink == 0` / `flex_grow == 0`**（R3 修复：此前是 taffy 默认 `shrink = 1`，父容器受限时空行会被压扁）；根的直接子节点 69（35 text + 34 spacer），`1 + 35 + 34 == 70`。单行 spacer 形态另由 `gates::the_blank_line_spacer_is_flex_fixed_at_one_line_height` 钉死；zh 的软换行合并由 `gates::the_zh_release_notes_merge_fifteen_soft_breaks_into_eleven_paragraphs` 钉死（35 段 / 11 个多行段 / 15 个 `\n`，节点仍 70） | §5.3、§5.4、§9.3 |
 | 4 | HTML 嵌套解析计数（替代 v2「零二次解析」） | 计数器 seam 为 `build.rs` 的 `#[cfg(test)] parse_count()` / `reset_parse_count()`（仅测试构建存在），口径 = **解析调用总次数**（主解析 + 嵌套解析）。① `gates::gate_four_the_nested_parse_count_follows_the_html_container_units`：release notes == 1；单条 `<p align>` notice == 2（主 1 + 嵌套 1）；行内 `<kbd>` 图片 == 1；混合 `<div>`（3 个容器 unit）== 4 且 `<= 1 + 3`、`<= 16`；② `gates::gate_four_every_production_rich_text_parses_exactly_once_or_once_nested`：`tests/fixtures/i18n_markdown.rs` 全 75 条中 70 条含 `<p align>` == 2、5 条 == 1；③ `gates::gate_four_plain_text_counts_the_nested_html_parse`：`plain_text` 共用同一 tokenizer 与预算 | §5.6.5 |
-| 5 | 无旧形状残留 | `gates::gate_five_no_legacy_block_or_blank_ids_survive`：全树遍历，不存在 `MARKDOWN_BLOCK*` / `MARKDOWN_BLANK*` 前缀的 debug id；根 id 仍是 `MARKDOWN` 且全树只有 1 个 | §6.4 |
+| 5 | 无旧形状残留 | `gates::gate_five_no_legacy_block_or_blank_ids_survive`：全树遍历 **2 份 release notes + 75 条 i18n 富文本 + 1 条含表格/列表/代码块/HTML 的合成文档（mounted == 77）**，不存在 `MARKDOWN_BLOCK*` / `MARKDOWN_BLANK*` 前缀的 debug id；根 id 仍是 `MARKDOWN` 且全树只有 1 个 | §6.4 |
 | 6 | 无依赖边（子树） | `gates::gate_six_the_markdown_subtree_holds_no_dependency_edges`：markdown **子树**逐个 `remove` 返回空依赖边集合；根节点 `remove` 返回 1 条自持外观依赖边（沿用 `view.rs:1426` 的回归测试口径） | §5.7、§2.5 |
 | 7 | 表格列宽（延迟建表） | `gates::gate_seven_table_columns_take_their_measured_natural_widths`：① 同列各 cell 的 `bounds.width` 相等；② 两列自然宽差异大时渲染宽**不相等**且宽度比 ≈ 自然宽比（±5%）；③ **仅在该表总自然宽 ≤ 可用宽（未触发 flex 收缩）时**断言：列内容宽（`bounds.width − 2×CELL_PADDING`，padding 读 `node.style().inner().padding`）== 该列 `max` 自然宽（±1px）；触发收缩时只断言 ①② 并额外断言「收缩列 < 自然宽 − 1px、两列合计 ≤ 可用宽」；④ 嵌套解析（HTML 容器内容）里的表格同样满足 ①②③ | §5.10、§4.4-③ |
 
@@ -1271,7 +1274,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 | `plain_text` 热路径 | 解析整树 + 拍平 | 纯事件旁路（HTML 容器仍走一次嵌套解析） | R3 bench（10.782 µs） |
 | 病态 1 万行表格 | 13.5 ms / 17 MB | 上限截断 → 节点 ≤ 8,443（20 列）/ 1,609（3 列）+ 溢出段落 ≤ 100 | §5.8 + bench（`build_table_10k` = 1,710 节点、8.7201 ms、18.05 MB） |
 
-**分配口径**：§3.1 的「pulldown 4 次分配」指**解析器自身**；建树阶段分配（`InlineBuf` 扩容、`TextContent`/`TextRun`/`InlineBoxSpec` 装箱、节点槽位）另计。**R3 已做分配计数**：`benches/markdown.rs` 挂 `#[global_allocator]`（`CountingAllocator` 统计 alloc / alloc_zeroed / realloc 调用次数、累计字节与峰值存活字节），实测见 §12.2——7 KB release notes 的 mount 是 **440 次 / 185,220 B**（量级比早先估计的 100–200 次高，因为每个 text 节点还要装箱 `TextContent`/run/inline box）；主题重建 **612 次 / 145,852 B**；单条 notice **45 次 / 36,793 B**（峰值 35,934 B）；首帧 **5,003 次 / 4.84 MB**（峰值 4.25 MB）；100 KB 文档 **67,999 次 / 40.74 MB**；10,000×3 表格 **132,427 次 / 18.05 MB**。延迟建表的额外分配 = 每表 `rows × cols` 个 `CellBuf`（受 200×20 上限约束，仅含表格的文档；`table_widths_200x20` 的 219,214 次 / 36.71 MB 就是「200 行 × 20 列 + 4,020 次 cell 测量」的总量）。
+**分配口径**：§3.1 的「pulldown 4 次分配」指**解析器自身**；建树阶段分配（`InlineBuf` 扩容、`TextContent`/`TextRun`/`InlineBoxSpec` 装箱、节点槽位）另计。**R3 已做分配计数**：`benches/markdown.rs` 挂 `#[global_allocator]`（`CountingAllocator` 统计 alloc / alloc_zeroed / realloc 调用次数、累计字节与峰值存活字节），实测见 §12.2——7 KB release notes 的 mount 在**默认页容器上下文**是 **432 次 / 184,740 B**；同夹具挂 **window-root 上下文**（bench 的 `fixture(false)` 组，label `build_7kb_window_root_context`）是 **440 次 / 185,220 B**（量级比早先估计的 100–200 次高，因为每个 text 节点还要装箱 `TextContent`/run/inline box）；主题重建 **612 次 / 145,852 B**；单条 notice **45 次 / 36,793 B**（峰值 35,934 B）；首帧 **5,003 次 / 4.84 MB**（峰值 4.25 MB）；100 KB 文档 **67,999 次 / 40.74 MB**；10,000×3 表格 **132,427 次 / 18.05 MB**。延迟建表的额外分配 = 每表 `rows × cols` 个 `CellBuf`（受 200×20 上限约束，仅含表格的文档；`table_widths_200x20` 的 219,214 次 / 36.71 MB 就是「200 行 × 20 列 + 4,020 次 cell 测量」的总量）。
 
 ### 9.2 基准方案
 
@@ -1282,8 +1285,8 @@ pub fn plain_text(source: &str) -> SmolStr;
 | `parse_only_7kb` | 只跑 pulldown 事件遍历，不建节点（`release_notes/v0.0.3/en.md`，7,047 B） | 6.0129 µs |
 | `parse_only_100kb` | 同上，合成 ≈100 KB 文档（`SYNTHETIC_BYTES = 100 × 1024` = 102,600 B） | 1.4111 ms |
 | `plain_text_7kb` | `plain_text()` 事件旁路（release notes） | 10.782 µs |
-| `build_7kb` | `MarkdownNode::mount` = parse + build（不渲染） | 55.907 µs；nodes 70 / spacers 34 / runs 19；分配 440 次 / 185,220 B |
-| `build_notice_html_525b` | 单条生产 notice 的 mount（夹具里最长的 `<p align>` en 原文，322 B，含 1 个 HTML 容器 unit） | 3.6145 µs；nodes 2；嵌套解析 1；分配 45 / 36,793 B / 峰值 35,934 B |
+| `build_7kb` | `MarkdownNode::mount` = parse + build（不渲染） | 55.907 µs；nodes 70 / spacers 34 / runs 19；分配 **432 次 / 184,740 B**（默认页容器上下文）；window-root 上下文另为 440 次 / 185,220 B |
+| `build_notice_html_525b` | 单条生产 notice 的 mount（夹具里最长的 `<p align>` en 原文，322 B，含 1 个 HTML 容器 unit） | 3.6145 µs；nodes 2；嵌套解析 1；分配 45 / 36,793 B / 峰值 35,934 B；**名字里的 525b 是历史口径**（§3.1 三条文案合计 525 B，本基准源实为 322 B） |
 | `frame_after_mount` | 挂载后的首帧 `TestApp::drain()`（layout + text + paint + encode） | 1.0736 ms；shaped 35 / laid 35 / primitives 88；分配 5,003 / 4.84 MB / 峰值 4.25 MB |
 | `theme_rebuild_7kb` | 只计 `MarkdownNode::sync` 的重建段（`ThemeHandle::set_appearance` 不在计时内） | 92.73 µs；分配 612 / 145,852 B |
 | `build_100kb` | 合成 ≈100 KB 文档的 mount | 17.646 ms；nodes 20,250 / runs 2,250；分配 67,999 / 40.74 MB / 峰值 36.49 MB |
@@ -1319,7 +1322,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 
 ## 10. 风险、偏差与自检
 
-### 10.1 已登记的偏差（共 33 条；1–22 为 v3.4 前登记，23–28 为 R2 落地时新增，29–33 为 R3 落地时新增。逐条确认结果见 §14.4）
+### 10.1 已登记的偏差（共 36 条；1–22 为 v3.4 前登记，23–28 为 R2 落地时新增，29–33 为 R3 落地时新增，34–36 为最终对抗审查新增（F-1/F-7/F-5）。逐条确认结果见 §14.4）
 
 | # | 偏差 | 来源 | 可接受性 |
 |---|---|---|---|
@@ -1328,10 +1331,10 @@ pub fn plain_text(source: &str) -> SmolStr;
 | 3 | HTML 语义映射的其余差异：白名单外标签丢标签保文字、不传 HTML 属性/样式、`align="justify"` → Left、**type 1–5 块整块忽略（文字不上屏）**、`<div>/<center>/<section>` 不建节点、跨块「半包裹」（`<details>`…`</details>`）不还原 | D7 | 生产只用到 `<p align>`/`<kbd>`；异常形态文字仍可见（type 1–5 例外，见左） |
 | 4 | **对齐窗口的边界**：只有主解析层顶层段落取窗口 align（heading/list/quote 内与 fragment 内段落各用其 align 参数）；正文里字面 `</p>` 会提前关窗、导致后续段落失去对齐；`<p ALIGN=…>`/`<P>` 等非精确形态按文字处理 | D7 | 生产 70 个 `<p align>` 全部成对、无字面 `</p>`，无影响 |
 | 5 | **不支持 GFM 扩展自动链接**（裸 URL/邮箱不成为链接） | D2 | 与当前 comrak 配置行为等价（现状也未启用）；与「完整 GFM」差 1 个扩展；94 条语料归档 §12.3 |
-| 6 | **保留源码空行占位节点**：每个空行仍占一行行高（与 GitHub 块间距语义不同） | D4 | 视觉与现状一致；节点预算按 1 节点/空行重算 |
+| 6 | **保留源码空行占位节点**：每个空行仍占一行行高（与 GitHub 块间距语义不同） | D4 | 视觉与现状一致；节点预算按 1 节点/空行重算；空行折叠到 `plain_text` 的差异另见 §10.1-8 |
 | 7 | 容器内部（引用/列表/表格内）空行不生成 spacer，由块间距表达 | D4 | 生产语料空行只在顶层 |
 | 8 | `plain_text` 不再为空行输出多余 `\n` | §6.3 | 两个生产消费者无空行 |
-| 9 | CommonMark 版本：pulldown 跟 0.31.2，GFM 基于 0.29 | 库事实 | 差异为勘误/澄清（**未逐条验证**，R3 抽查） |
+| 9 | CommonMark 版本：pulldown 跟 0.31.2，GFM 基于 0.29 | 库事实 | **结论句**：差异为勘误/澄清；本轮不逐条验证（登记项、非待办），规范一致性语料以 GFM 规范例为准（§8.3 的 90 条） |
 | 10 | 列表项目符号字符/有序分隔符不可得 | 事件模型缺失 | 统一 `•` / `1.` |
 | 11 | 表格内 `\|` 已核对，**与 GFM 输出一致，不再是偏差**（R3 结论；编号保留以免下游引用漂移）：表格语料 12 条里 `table:escaped-pipe` 覆盖单元格内 `\|`、`table:code-span-pipe` 覆盖代码跨度内 `\|`，两者都进规范一致性门禁 | GFM §4.10，R3 实测 | 结论句：已覆盖 |
 | 12 | 表格溢出段落上限（100 行）；溢出段落挂在表格容器之后、不受列宽约束 | D15 | 极端输入下尾行不显示 |
@@ -1349,13 +1352,16 @@ pub fn plain_text(source: &str) -> SmolStr;
 | 24 | 表格列宽测量只取单元格**前 1024 字符**；溢出行的空 cell 保留位 | §5.10 | 超长单元格列宽可能小于真实自然宽（门禁 7 用中度收缩验证）；溢出行结构不变 |
 | 25 | 同一 HTML 块内多个「标签外文字」区间合并为 **1 次**解析并统一落在配对之后 | §5.6.3 | 配对两侧都有尾巴的极端混合块文字顺序可能与源码顺序不同；解析次数 ≤ 1 + unit 数 |
 | 26 | 空**松**列表项的 loose 由 `Item` 事件区间是否含换行推断 | pulldown 不为空 item 发 `Paragraph` | 仅影响空项的间距，视觉差异极小 |
-| 27 | fragment 的 `block_index` / `previous_blank` 写回外层容器 | §5.4 约束 11 字面为「隔离」 | 写回才能让 fragment 之后的块间距正确（否则 fragment 后首块丢 margin） |
+| 27 | fragment 的 `block_index` / `previous_blank` 写回外层容器 | §5.4 约束 11（写回例外） | 写回才能让 fragment 之后的块间距正确（否则 fragment 后首块丢 margin；`tests.rs::a_paragraph_after_an_html_fragment_takes_the_block_gap` 钉死 tail `margin-top == 8px` + 布局间距 8px） |
 | 28 | `plain_text` 代码块尾随空行折叠、极端多段顺序变化 | §6.3-4 | 两个生产消费方均无代码块/空行，无可见影响 |
-| 29 | **嵌套列表的紧/松视觉间距不区分**：节点形态上紧/松可区分——纯紧项没有内容列（文本直接挂 item 行，`tight_lists_mount_markers_without_a_content_column` 断言 `MARKDOWN_LIST_CONTENT == 0`），需要内容列时（嵌套子块等）按 tight/loose 给不同 id（`MARKDOWN_LIST_CONTENT_TIGHT` / `MARKDOWN_LIST_CONTENT`，见 `build.rs::ensure_content`）；但渲染器**不在列表项内建模段落间距**，紧与松在屏幕上只差块间距语义 | R3 落地时发现（`ledger.rs::tight_and_loose_nested_lists_take_different_shapes` 暴露） | 节点形态与 outline 可区分（`item[tight]` / `item[loose]`，两种嵌套形态节点数都是 10），生产语料没有「同一列表里嵌套紧松混排且依赖段距」的形态；仅视觉间距与浏览器不同 |
+| 29 | **嵌套列表的紧/松视觉间距不区分**：节点形态上紧/松可区分——纯紧项没有内容列（文本直接挂 item 行，`tight_lists_mount_markers_without_a_content_column` 断言 `MARKDOWN_LIST_CONTENT == 0`），需要内容列时（嵌套子块等）按 tight/loose 给不同 id（`MARKDOWN_LIST_CONTENT_TIGHT` / `MARKDOWN_LIST_CONTENT`，见 `build.rs::ensure_content`）；但渲染器**不区分 tight/loose 的列表项内间距**（两种形态的段落间距相同），紧与松的差别只体现在节点形状与 outline 上 | R3 落地时发现（`ledger.rs::tight_and_loose_nested_lists_take_different_shapes` 暴露） | 节点形态与 outline 可区分（`item[tight]` / `item[loose]`，两种嵌套形态节点数都是 10）；间距实测**全等**（`ledger.rs::registered_deviation_29_nested_lists_keep_the_same_spacing`：嵌套子列表 y 偏移 27.6px、列表项行距 27.6px、外层列表高 47.2px、嵌套列表高 19.6px，tight/loose 逐项相同）；生产语料没有「同一列表里嵌套紧松混排且依赖段距」的形态，仅视觉间距与浏览器不同 |
 | 30 | **硬换行与软换行在文本模型上不区分**：两种都渲染为 `\n`（D5），文本内容/节点数/outline 完全一致，只有源码里的标记不同；`<br>` 同样落成 `\n` | D5；R3 复核（`the_line_break_model_does_not_distinguish_hard_from_soft`、`hard_breaks_become_newline_bytes_and_reset_marks`） | 与 D5 裁决一致（软换行必须合并、硬换行不额外断行）；`plain_text` 与可编辑文本都不依赖二者差异；视觉上是同一行盒 |
 | 31 | **`<kbd>` 包住图片时只保留图片 inline box**：`<kbd>![](file://…)</kbd>` 渲染为一个图片盒（`InlineBoxSpec`），kbd 的 mono 字体、下划线与底色**无处附着**（该 run 没有文字），视觉上只剩图片 | §5.6.2 HTML 映射 + D19 run 背景；R3 复核（`kbd_around_an_image_keeps_only_the_image_box`） | 生产 notice 的 `<kbd>![]()</kbd>` 正是这个形态：图片盒可见、文字不丢、kbd 语义无宿主可挂；不新增「盒装饰」抽象（AGENTS §1.2） |
 | 32 | **表格 200×20 上限内的 mount 成本**：53.0 ms / 219,214 次分配 / 36.7 MB 峰值 19.75 MB，其中 `End(Table)` 的 4,020 次 cell `measure_text(None)` 主导（§12.2 `table_widths_200x20`） | §5.10 + D15 上限；R3 bench 实测 | 200×20 是硬上限、属于极端输入；一次性 mount 53 ms 可接受，且测量次数被 ≤4,020 硬约束（§5.8 三上限）锁死，不会随行数线性失控 |
 | 33 | **空任务项 `- [ ]` 不产生 task marker**：pulldown 不为「只有标记、没有内容」的项发 `TaskListMarker`，于是渲染成普通文字 `[ ]`（无复选框） | pulldown 事件模型 + GFM §5.3；R3 语料 `task:empty-item-stays-text` | **与 GFM 输出一致**（`- [ ]` 没有段落内容，本就不是 task list item），`<li>[ ]</li>` 与 cmark-gfm 相同；文字不丢。注：带尾随空白的 `- [ ] ` 仍会产生 marker（`tests.rs::an_empty_task_item_still_shows_its_checkbox`） |
+| 34 | **行内 marks 超过 `MAX_INLINE_NESTING`（64）时只截断 marks、保留文字**：超出上限的 mark 不再入栈（样式丢弃），但该子树的 `Text`/`Code` 事件照常写入文本 | D15/§5.9「绝不吞字」；最终审查 F-1（旧实现丢弃子树文字） | 文字可见（`**`×100 + `x` + `**`×100 渲染 `x`）；只有 64 层以上的样式退化，属极端输入 |
+| 35 | **无全局节点上限**：只有块/行内/表格/HTML 的局部上限（§5.8），没有文档级节点预算；512 KB 纯 markdown 实测 mount 68,324 节点 / release 0.48 s | 最终审查 F-7；§9.1 只预算 7 KB 与 100 KB | 真实文案 ≤ 7 KB（70 节点）；100 KB 文档 20,250 节点 / 17.646 ms 已落档（§12.2）；10 MB 级按线性外推，属已知边界，不是本轮验收违约 |
+| 36 | **测试专用 HTML 发射器折叠 mark 嵌套**：`****x****` 归一为 1 层 `<strong>`（GFM/cmark 为 2 层） | 最终审查 F-5；`corpus.rs::the_emitter_flattens_mark_nesting_the_model_cannot_distinguish` | 仅影响一致性断言的期望值，不影响渲染与文字；语料不当作「完整 GFM 等价」证据（§8.3 不覆盖项⑤） |
 
 > **R2 提交时顺延到 R3 的交付物（已在提交说明逐条登记，不属静默丢弃）**：① `tests/fixtures/legacy_plain_text.rs` 冻结夹具与 `document.rs` 的两条冻结值；② 台账中 23 条「保留并改写」条目的对应断言；③ §8.4 门禁 4 的解析次数计数器 seam；④ GFM 语料剩余条目、测试专用 HTML 发射器、i18n 保真门禁、criterion bench。
 
@@ -1421,7 +1427,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 
 ## 11. 验收标准
 
-1. **测试范围（D21）**：`cargo test -p ui_core -p ui_kit` 通过（含 §8.1–§8.6）；其它 crate 只要求 `cargo check --workspace --all-targets` 通过（写进提交说明）。R3 实测：**2,693 passed / 1 ignored**（`ui_core`）+ **779 passed**（`ui_kit`，其中 markdown 189），见 §14.3。
+1. **测试范围（D21）**：`cargo test -p ui_core -p ui_kit` 通过（含 §8.1–§8.6）；其它 crate 只要求 `cargo check --workspace --all-targets` 通过（写进提交说明）。R3 基线：**2,693 passed / 1 ignored**（`ui_core`）+ **779 passed**（`ui_kit`，其中 markdown 189）；本轮最终代码修复新增 3 条测试（`tests::a_paragraph_after_an_html_fragment_takes_the_block_gap`、`assets::a_type_override_does_not_change_the_intrinsic_size`、`ledger::registered_deviation_29_nested_lists_keep_the_same_spacing`）后为 **782 passed / markdown 192**，见 §14.3。
 2. **产品侧补跑**（R2/R4 各一次，记录结果；失败逐条说明）：`cargo test -p widget -p updater_ui -p solana_wallet -p ethereum_wallet -p force_order -p market_trade -p news -p empty -p settings_ui -p watch_list -p widget_registry`。
 3. **clippy（D21）**：`cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings` 通过（全仓 clippy 不在本轮门禁内；既有门禁用 `--all-targets`，`xtask/src/gates.rs:745-755`）。
 4. `cargo +nightly fmt` 无 diff。
@@ -1432,7 +1438,7 @@ pub fn plain_text(source: &str) -> SmolStr;
 9. `crates/ui_core/design/custom-gui-engine-design.md` 的 **7 处**已更新（§7-R4；一律按节名定位，不再写行号）。
 10. 仓库内台账 `crates/ui_kit/design/markdown-test-inventory.md` 的 173 条在 R2 提交说明中逐条勾选。
 11. 冻结夹具 `tests/fixtures/{i18n_markdown.rs, legacy_plain_text.rs}` 已入库，§8.5 门禁全绿。
-12. §10.1 的 **33 条**偏差全部确认（逐条结果见 §14.4）；全文无未决项；§14 已回写（提交序列、公开 API 清单、测试与门禁基线、偏差确认、实测基准、决策变更日志）。
+12. §10.1 的 **36 条**偏差全部确认（逐条结果见 §14.4）；全文无未决项（唯一登记例外：§10.1-9 的 CommonMark 版本差异按「登记不验证」处理）；§14 已回写（提交序列、公开 API 清单、测试与门禁基线、偏差确认、实测基准、决策变更日志）。
 
 ---
 
@@ -1493,19 +1499,21 @@ Text(Borrowed("www.example.com https://bare.example/x?a=1 john@example.com ")) @
 | `parse_only_7kb` | 6.0129 µs | 全量事件遍历、不建节点；源 7,047 B |
 | `parse_only_100kb` | 1.4111 ms | 合成 102,600 B（`SYNTHETIC_BYTES = 100 × 1024`） |
 | `plain_text_7kb` | 10.782 µs | release notes → 纯文本（事件旁路，不建节点） |
-| `build_7kb` | 55.907 µs | nodes 70 / spacers 34 / runs 19；分配 **440 次 / 185,220 B** |
+| `build_7kb` | 55.907 µs | nodes 70 / spacers 34 / runs 19；分配 **432 次 / 184,740 B**（默认页容器上下文）；window-root 上下文另为 440 次 / 185,220 B |
 | `theme_rebuild_7kb` | 92.73 µs | 仅 `MarkdownNode::sync` 的重建段，70 节点；分配 **612 次 / 145,852 B** |
-| `build_notice_html_525b` | 3.6145 µs | 源 **322 B**（夹具里最长的 `<p align>` en 原文）；nodes 2（根 + 段落）；**嵌套解析 1 次**；分配 **45 次 / 36,793 B / 峰值 35,934 B** |
+| `build_notice_html_525b` | 3.6145 µs | 源 **322 B**（夹具里最长的 `<p align>` en 原文）；nodes 2（根 + 段落）；**嵌套解析 1 次**；分配 **45 次 / 36,793 B / 峰值 35,934 B**；label 名保留历史口径 `525b`，源实为 322 B |
 | `frame_after_mount` | 1.0736 ms | 挂载后首帧（layout + text + paint + encode）；shaped 35 / laid 35 / primitives 88；分配 **5,003 次 / 4.84 MB / 峰值 4.25 MB** |
 | `build_100kb` | 17.646 ms | 合成 102,600 B；nodes 20,250 / runs 2,250；分配 **67,999 次 / 40.74 MB / 峰值 36.49 MB** |
 | `build_table_10k` | 8.7201 ms | 10,000×3 表格（行上限生效）；nodes **1,710 = 根 1 + 表格 1,609 + 溢出 100**；分配 **132,427 次 / 18.05 MB / 峰值 8.76 MB** |
 | `table_widths_200x20` | **53.004 ms** | 200×20 宽表；源 36,394 B；nodes **8,444**；**measured cells 4,020**（`(200+1)×20`，逐单元格 `measure_text(None)` 主导）；分配 **219,214 次 / 36.71 MB / 峰值 19.75 MB** |
 
+**`build_7kb` 的两套上下文（分配数字不要混用）**：默认页容器上下文 = **432 次 / 184,740 B**（本节、§9.1、§14.5 引用这一组）；window-root 上下文 = **440 次 / 185,220 B**（`benches/markdown.rs` 的 `fixture(false)` 组，label `build_7kb_window_root_context`，节点数同为 70 / spacer 34 / run 19）。两套数字都真实，只是 fixture 的父节点不同。
+
 **与 §9.1 目标对照**：
 
 | 场景 | §9.1 目标 | 实测 | 结论 |
 |---|---|---|---|
-| 挂载 7 KB release notes | 1 次主遍历（预算 5.4 µs）+ 建树 ≤ bench 记录值；节点 ≤ 72（推导 70、34 spacer） | parse_only 6.0129 µs（单遍，+11% vs 预算 5.4 µs）、build 55.907 µs、nodes 70、spacers 34、分配 440 次 | 节点 / 空行命中；解析仍是 µs 级单遍 |
+| 挂载 7 KB release notes | 1 次主遍历（预算 5.4 µs）+ 建树 ≤ bench 记录值；节点 ≤ 72（推导 70、34 spacer） | parse_only 6.0129 µs（单遍，+11% vs 预算 5.4 µs）、build 55.907 µs、nodes 70、spacers 34、分配 432 次（默认页容器；window-root 440 次） | 节点 / 空行命中；解析仍是 µs 级单遍 |
 | 挂载单条 i18n notice | 1 次主遍历 + **1 次嵌套解析**（≤ 322 B）；无表格 → 无 `End(Table)` 测量 | 3.6145 µs、nodes 2、嵌套解析 1、源 322 B、分配 45 次 | 命中（HTML 容器只多一次 ≤322 B 的嵌套解析） |
 | 主题切换重建 7 KB | 重建 70 节点，耗时以 R3 落档 | **92.73 µs**（含子树 remove + 重建）、70 节点、分配 612 次 | 落档（≈1.66× `build_7kb`） |
 | `plain_text` 热路径 | 纯事件旁路 | 10.782 µs（parse 6.0129 µs + 旁路开销 ≈4.8 µs） | 落档 |
@@ -1566,7 +1574,7 @@ Text(Borrowed("www.example.com https://bare.example/x?a=1 john@example.com ")) @
 | `NodeTree::set_text_style` | **不新增**（v3.3 废弃关窗回写；对齐只在节点创建时写一次，§5.6.3/§5.13） |
 | 空行占位节点 | **保留**（D4）：2 节点 → **1 个 spacer**，高度不变（= 正文字行高）；`SourceLines` 的空行计数改为字节入参（§5.4） |
 | ui_core `TextStyleExtras.decoration: Option<TextDecoration>` | **替换**为 `decorations: TextDecorations` + `background: Option<TextBackground>`；`TextDecoration` 枚举 → 单线结构；`ShapedDecoration` → `ShapedQuad`（+`corner_radius`）；`ShapedTextLine` 增 `line_top`/`backgrounds`；`emit_solid_quad` 增 `corner_radius`；私有 `pass::TextDecorations` → `EditDecorations`（§5.11） |
-| `ui_kit/.../inline_flow.rs` | R1 做**最小编译适配**（8 处装饰 API：`:8`/`:301-314`/`:417`/`:469-470`/`:479-480`/`:507-508`/`:325`），R2 整体重写为 `inline.rs`（marks→run + 多装饰叠加 + code 背景） |
+| `ui_kit/.../inline_flow.rs` | R1 **未改**（R1 只含 `ui_core`；8 处旧装饰 API 见 §5.11.1，R1/R2 成对例外见 §7-R1）；R2 整体删除并重写为 `inline.rs`（marks→run + 多装饰叠加 + code 背景） |
 | `MarkdownAssets` trait / `file:` URI 解析与内禀尺寸（`InlineImageSource` → `assets.rs`，20 条测试随迁）/ mono 字体常量 | **保留**（语义不变） |
 | `MarkdownStyle` | **保留但字段变化**：现有 11 字段不变，新增 `task_border` / `task_fill` / `decoration_thickness` / `background_padding_x` / `background_radius`（§6.2） |
 | `ReleaseNotesAssets`（updater）/ gallery `NoAssets` | **保留** |
@@ -1583,9 +1591,9 @@ Text(Borrowed("www.example.com https://bare.example/x?a=1 john@example.com ")) @
 | 提交 | 说明 |
 |---|---|
 | `9d3b04ce` | docs(markdown): 设计定稿 v3.4（pulldown-cmark 单遍管线 + ui_core 引擎改造 + HTML 语义子集） |
-| `9a4d3e8d` | feat(ui_core): 文本引擎支持双装饰线与 run 背景——R1，`TextDecorations` / `TextBackground` / `TextDecoration` 单线结构 / `ShapedQuad` / 私有 `EditDecorations`；`ui_core` 侧只落地 §5.11 已批准的公开面，没有 `NodeTree::set_text_style` 之类的额外入口（§5.13） |
+| `9a4d3e8d` | feat(ui_core): 文本引擎支持双装饰线与 run 背景——R1，`TextDecorations` / `TextBackground` / `TextDecoration` 单线结构 / `ShapedQuad` / 私有 `EditDecorations`；`ui_core` 侧只落地 §5.11 已批准的公开面，没有 `NodeTree::set_text_style` 之类的额外入口（§5.13）；**本提交不含 `ui_kit` 改动，单独检出时 `ui_kit` 不可编译（R1/R2 成对例外，见 §7-R1）** |
 | `9447be99` | refactor(ui_kit): markdown 组件切换为 pulldown-cmark 单遍管线——R2，新模块布局 + 公开面收敛 + 7 个调用点 + comrak 删除（`Cargo.lock` +2/−10 净 −8 包） |
-| `0973bda5` | test(markdown): 冻结夹具 + 七条门禁（13 个测试）+ 90 条规范语料 + criterion 10 项基准——R3；另修 spacer `flex_shrink(0.0)`、`ui_kit → criterion` dev 边（`Cargo.lock` +1 行） |
+| `0973bda5` | test(markdown): 冻结夹具 + 七条门禁（13 个测试）+ 90 条规范语料 + criterion 10 项基准——R3；另修 spacer `flex_shrink(0.0)`、`ui_kit → criterion` dev 边（`Cargo.lock` +1 行）；§10.1 的 29–33 在收口提交 `c3fa5c52` 落盘（R3 提交说明提前引用） |
 | **本节所在提交** | docs(markdown): 文档收口——§8.1 / §8.3 / §8.4 / §9.1 / §9.2 / §10.1 / §10.2 / §11 / §12.2 / §13 / §14 与实现对齐；**在 §14.1 的记录之后产生**，SHA 不在此引用 |
 
 ### 14.2 最终公开 API 清单
@@ -1603,17 +1611,19 @@ Text(Borrowed("www.example.com https://bare.example/x?a=1 john@example.com ")) @
 
 | 命令 | 实测结果 |
 |---|---|
-| `cargo test -p ui_core -p ui_kit` | **2,693 passed / 1 ignored**（`ui_core` lib）+ **779 passed**（`ui_kit` lib，其中 `kit::markdown` **189** 条）；同一命令下所有 `test result:` 行均为 ok（lib / 集成 / example 目标，0 failed），本轮复跑 exit code 0 |
+| `cargo test -p ui_core -p ui_kit` | **2,693 passed / 1 ignored**（`ui_core` lib）+ **782 passed**（`ui_kit` lib，其中 `kit::markdown` **192** 条；R3 基线为 779 / 189，本轮最终修复新增 3 条）；同一命令下所有 `test result:` 行均为 ok（lib / 集成 / example 目标，0 failed），本轮复跑 exit code 0 |
 | `cargo check --workspace --all-targets` | 通过（D21 让步：其它 crate 只要求编译） |
 | `cargo +nightly clippy -p ui_core -p ui_kit --all-targets -- -D warnings` | 通过（0 warning） |
 | `cargo +nightly fmt --all -- --check` | 无 diff |
 | `cargo bench -p ui_kit --bench markdown` | **10 个基准**全部跑通并落档 §12.2；**不纳入** `cargo xtask gates --step bench`（D20，见 §9.2 末尾） |
 
+**产品侧 11 个依赖 `ui_kit` 的 crate**：在一次额外验证（逐 crate `cargo test`）中测试全绿——widget **183** / updater_ui **72** / solana_wallet **104** / ethereum_wallet **104** / settings_ui **236** / watch_list **112** 等；按 **D21** 这组结果只作记录，**不作为本轮门禁**（门禁仍是 `cargo test -p ui_core -p ui_kit`）。
+
 **§5.3 代码块节点形状验证项 → 备选 A（1 节点）**：代码块是单个 `MARKDOWN_CODE` text 节点（`code_background` + `padding(8px)` + `corner_radius(4px)` + mono），三条判据全部断言通过——① wrap 宽度 = 内容盒宽：`tests.rs::a_code_block_wraps_at_its_padded_content_width`（与同内容宽容器逐行比较）；② 背景 Quad 覆盖 border-box：`tests.rs::code_blocks_mount_one_text_node_with_background_padding_and_mono`（`quad.bounds == code_bounds`、四角 4px、`MARKDOWN_CODE_TEXT` 计数 0、整树 2 节点 = 根 + 代码）；③ 首帧后 idle：`tests.rs::a_code_block_settles_into_an_idle_frame`（第二帧 `rendered == false`）。因此门禁 3 不需要「≤2」的临时口径，节点预算直接断言 `== 70`。
 
 **门禁 3 的 spacer 修正（R3）**：R2 时 spacer 只有 `width_full + height(行高)`，走 taffy 默认 `shrink = 1`，父容器受限时会被压扁；R3 在 `build.rs` 的 `emit_blank_spacers` 里补 `flex_shrink(0.0)`（`flex_grow` 保持默认 0）。门禁 3 与 `gates.rs::the_blank_line_spacer_is_flex_fixed_at_one_line_height` 同时断言 `flex_shrink == 0.0 && flex_grow == 0.0`、高度 == `body_size × 1.4 = 19.6px`（默认 800×600 根下 34 个 spacer 各 19.6px）。
 
-### 14.4 §10.1 的 33 条偏差确认结果
+### 14.4 §10.1 的 36 条偏差确认结果
 
 | # | 确认 | 验证方式（测试 / 实现证据） |
 |---|---|---|
@@ -1622,10 +1632,10 @@ Text(Borrowed("www.example.com https://bare.example/x?a=1 john@example.com ")) @
 | 3 | ✅ 确认 | `corpus.rs::html:type-one-to-five-blocks-are-ignored`、`html:center-container-centers-its-content`、`html:section-container-scopes-its-content`；§8.3 的 skip 2/3 指向本行 |
 | 4 | ✅ 确认 | `corpus.rs::html:literal-closing-tag-ends-the-window`、`html:pair-across-blocks`、`html:nested-pair-windows`；`tests.rs::a_literal_closing_tag_in_a_paragraph_closes_the_window_early` |
 | 5 | ✅ 确认 | `corpus.rs` 的 `SKIPPED` 第 1 条指向本行；§12.3 的 94 条语料只归档不入库；全仓无 `autolink.rs` |
-| 6 | ✅ 确认 | `gates.rs::gate_three_the_release_notes_stay_inside_the_node_budget`（70 节点 / 34 spacer / 各 19.6px）；`plain.rs::plain_text_deviation_08_folds_*` 两条 |
+| 6 | ✅ 确认 | `gates.rs::gate_three_the_release_notes_stay_inside_the_node_budget`（70 节点 / 34 spacer / 各 19.6px）；`tests.rs::blank_lines_become_one_spacer_each` |
 | 7 | ✅ 确认 | `tests.rs::container_blocks_do_not_add_spacers_inside_themselves` |
-| 8 | ✅ 确认 | `plain.rs::plain_text_deviation_08_folds_the_release_note_blank_lines`、`plain_text_deviation_08_folds_the_document_baseline_blank_lines`；`tests/fixtures/legacy_plain_text.rs` 的 81 条冻结字面量 |
-| 9 | ✅ 确认（保留「未逐条验证」口径） | 90 条规范语料 + §12.1 的事件转储；本条是 CommonMark 版本差的**登记项**，不逐条验证，门禁只覆盖语料里实际出现的用例（与 §10.1-9 的登记一致） |
+| 8 | ✅ 确认 | `plain.rs::plain_text_deviation_08_folds_the_release_note_blank_lines`、`plain_text_deviation_08_folds_the_document_baseline_blank_lines`；`tests/fixtures/legacy_plain_text.rs` 的 81 条 legacy 基线 + 2 条已登记折叠偏差 |
+| 9 | ✅ 确认（登记不验证） | 90 条规范语料 + §12.1 的事件转储；CommonMark 0.31.2 vs 0.29 的已知差异属勘误/澄清类，本轮不逐条验证，规范一致性以 §8.3 的语料为准（与 §10.1-9 的结论句一致） |
 | 10 | ✅ 确认 | `tests.rs::tight_lists_mount_markers_without_a_content_column`、`ordered_markers_start_at_the_parsed_number`（标记统一 `•` / `1.`） |
 | 11 | ✅ 已核对（结论句） | `corpus.rs::table:escaped-pipe`、`table:code-span-pipe`；`tests.rs::escaped_pipes_keep_their_text_in_cells_and_code_spans` |
 | 12 | ✅ 确认 | `tests.rs::rows_beyond_the_table_cap_become_one_paragraph_after_the_table`、`a_table_is_capped_at_twenty_columns`；bench `build_table_10k`（1,710 节点） |
@@ -1643,17 +1653,20 @@ Text(Borrowed("www.example.com https://bare.example/x?a=1 john@example.com ")) @
 | 24 | ✅ 确认 | `tests.rs::a_cell_beyond_the_measured_character_cap_keeps_its_text_and_measures_a_prefix` |
 | 25 | ✅ 确认 | `tests.rs::several_html_tag_pairs_in_one_block_become_separate_paragraphs`（尾巴统一落在配对之后）+ `gates.rs::gate_four_the_nested_parse_count_follows_the_html_container_units`（混合 `<div>` 3 unit == 4 次） |
 | 26 | ✅ 确认 | `tests.rs::empty_loose_items_keep_a_content_column`、`empty_list_items_keep_the_body_line_height` |
-| 27 | ✅ 确认 | `tests.rs::an_html_pair_inside_a_center_keeps_its_own_alignment_and_the_tail_centers`（fragment 之后首块间距正确）+ §8.1 的空行语料 |
+| 27 | ✅ 确认 | `tests.rs::a_paragraph_after_an_html_fragment_takes_the_block_gap`（`<p align="center">x</p>\ntail` 的 tail `margin-top == 8px` + 布局间距 8px）；fragment 写回口径见 §10.1-27 |
 | 28 | ✅ 确认 | `tests/fixtures/legacy_plain_text.rs` 的 2 条已登记偏差；`plain.rs::plain_text_deviation_08_folds_*` |
-| 29 | ✅ 确认 | `ledger.rs::tight_and_loose_nested_lists_take_different_shapes`（id 区分 `MARKDOWN_LIST_CONTENT_TIGHT` / `MARKDOWN_LIST_CONTENT`、outline `item[tight]` vs `item[loose]`；两种形态节点数都是 10，差别不在节点数） |
+| 29 | ✅ 确认 | `ledger.rs::tight_and_loose_nested_lists_take_different_shapes`（id 区分 `MARKDOWN_LIST_CONTENT_TIGHT` / `MARKDOWN_LIST_CONTENT`、outline `item[tight]` vs `item[loose]`）；间距由 `ledger.rs::registered_deviation_29_nested_lists_keep_the_same_spacing` 钉死：tight `- a\n  - b` 与 loose `- a\n\n  - b` 的（嵌套 y 偏移 / 行距 / 外层高 / 嵌套高）全等 == (27.6, 27.6, 47.2, 19.6) px |
 | 30 | ✅ 确认 | `ledger.rs::the_line_break_model_does_not_distinguish_hard_from_soft`（`a\nb` 与 `a\\\nb` 的文本 / 节点数 / outline 全等）、`hard_breaks_become_newline_bytes_and_reset_marks` |
 | 31 | ✅ 确认 | `ledger.rs::kbd_around_an_image_keeps_only_the_image_box`（text 为 `\u{200B}`、1 个 inline box、runs 为空） |
 | 32 | ✅ 实测 | §12.2 `table_widths_200x20`：53.004 ms / 219,214 次分配 / 36.71 MB（峰值 19.75 MB）/ 4,020 次 cell 测量 |
 | 33 | ✅ 确认 | `corpus.rs::task:empty-item-stays-text`（`- [ ]` → `<ul><li>[ ]</li></ul>`）；带尾随空白的 `- [ ] ` 仍出 marker，由 `tests.rs::an_empty_task_item_still_shows_its_checkbox` 覆盖 |
+| 34 | ✅ 确认 | `tests.rs::inline_nesting_beyond_the_cap_keeps_the_text_and_clips_the_marks`（`**`×100：文字 `x` 可见、超出 64 层的 marks 被截断）+ `ledger.rs::a_deep_emphasis_keeps_the_text_and_drops_the_excess_marks`（`keep x tail` 全保留）+ `ledger.rs::emphasis_nested_past_the_limit_keeps_the_text_inside_the_cap`；mount 文本 == `plain_text` |
+| 35 | ✅ 实测 | 探针 512,008 B 纯 markdown → `nodes=68,324 / texts=25,172`、release 0.48 s；§12.2 `build_100kb` 20,250 节点 / 17.646 ms |
+| 36 | ✅ 确认 | `corpus.rs::the_emitter_flattens_mark_nesting_the_model_cannot_distinguish`（`****x****` == `**x**` == `<p><strong>x</strong></p>`；GFM 为两层） |
 
 ### 14.5 实测基准（§12.2）
 
-10 项中位数（完整环境、分配与计数见 §12.2）：`parse_only_7kb` 6.0129 µs、`parse_only_100kb` 1.4111 ms、`plain_text_7kb` 10.782 µs、`build_7kb` 55.907 µs（70 节点 / 34 spacer / 19 run / 440 次分配）、`theme_rebuild_7kb` 92.73 µs、`build_notice_html_525b` 3.6145 µs（源 322 B / 2 节点 / 嵌套解析 1）、`frame_after_mount` 1.0736 ms（shaped 35 / laid 35 / primitives 88）、`build_100kb` 17.646 ms（20,250 节点 / 2,250 run）、`build_table_10k` 8.7201 ms（1,710 节点）、`table_widths_200x20` 53.004 ms（8,444 节点 / 4,020 次测量）。**bench 不纳入** `cargo xtask gates --step bench`（D20）。
+10 项中位数（完整环境、分配与计数见 §12.2）：`parse_only_7kb` 6.0129 µs、`parse_only_100kb` 1.4111 ms、`plain_text_7kb` 10.782 µs、`build_7kb` 55.907 µs（70 节点 / 34 spacer / 19 run / **432 次分配 / 184,740 B**，默认页容器上下文；window-root 上下文另为 440 次 / 185,220 B）、`theme_rebuild_7kb` 92.73 µs、`build_notice_html_525b` 3.6145 µs（源 322 B / 2 节点 / 嵌套解析 1）、`frame_after_mount` 1.0736 ms（shaped 35 / laid 35 / primitives 88）、`build_100kb` 17.646 ms（20,250 节点 / 2,250 run）、`build_table_10k` 8.7201 ms（1,710 节点）、`table_widths_200x20` 53.004 ms（8,444 节点 / 4,020 次测量）。**bench 不纳入** `cargo xtask gates --step bench`（D20）。
 
 ### 14.6 决策变更日志（v2 → v3.4）
 
@@ -1663,7 +1676,7 @@ Text(Borrowed("www.example.com https://bare.example/x?a=1 john@example.com ")) @
 | D4 空行语义 | v2 决定保留空行占位（视觉与现状一致），但形状从「2 节点/空行」收成 1 个 | 每空行 **1 个 `MARKDOWN_SPACER`**（高 = `body_size × 1.4` = 19.6px、`flex_shrink = 0`），只在顶层容器生成 | D4、§5.3、§5.4、门禁 3（70 / 34） |
 | D6 保真度缺口 | v2 原案 ①②③ 都要改引擎，与 §4.4-③「不改引擎」冲突（F5） | **四项全实现**：①② 改引擎（同一 run 双装饰线 + per-run 背景）、③④ 用现有 API（延迟建表 `measure_text` / 非 `file:` alt 回退） | D6、§4.4、§5.11、R1 `9a4d3e8d` |
 | D7 HTML 语义 | v2 的「源文本级剥外层 `<p align>`」+「关窗回写样式」方案 | 语义映射子集 + 四类块模型 + 对齐窗口；align 在建节点时**写一次**，块级 `</p>` 立即出栈、段落内 `</p>` 延迟到 `End(Paragraph)`、EOF 不撤销 | D7、§5.6.3、J1/J2、§10.1-2/-3/-4/-22 |
-| D17 阶段 | v2 的 P0（解析内核）/ P1（渲染）分段推进 | **方案 B**：合并 P0+P1，不写过渡 IR 适配层，每个提交都可编译 | D17、§7（R1 → R2 单提交） |
+| D17 阶段 | v2 的 P0（解析内核）/ P1（渲染）分段推进 | **方案 B**：合并 P0+P1，不写过渡 IR 适配层，每个提交都可编译（**唯一例外**：R1 单独检出时 `ui_kit` 不可编译，R1/R2 成对，见 §7-R1） | D17、§7（R1 → R2 单提交） |
 | D18 表格列宽 | v2 的事件预扫 `column_widths`（G2 原案） | **延迟建表**：`End(Table)` 对每个 `CellBuf` 调 `measure_text(content, None)` 取自然宽；主路径不调 `flex_none()`/`flex_1()`、不做总宽归一化 | D18、§5.10、门禁 7、bench `table_widths_200x20` |
 | D19 run 背景 | v2 无 per-run 背景（D6-② 是新增项） | 2px 水平内边距 + 2px 圆角 + **行盒高度**、不改变推进宽度；`padding_x` 只加在同色/同圆角/同内边距组的**两端** | D19、§5.11.3、ui_core 文档 §4.5.1、R1 `9a4d3e8d` |
 | D20 bench 与 xtask | 曾计划把 markdown bench 纳入 `cargo xtask gates --step bench` | **不纳入**（该步骤硬编码 `-p ui_core --features test-support --bench perf`）；只在提交说明与 §12.2 声明 | D20、§9.2 末尾、`xtask/src/gates.rs:599`、`:701-706`、`:770-779` |
@@ -1680,7 +1693,7 @@ v3 → v3.1（可落地性对抗审查后的机制修正；每条都已落进正
 | B | 表格列宽：`measure_text(Some(可用宽))` + 夹紧 + 归一化到可用宽；gate 7 断言「等于预扫值 ±1px」 | `measure_text(None)` 取**自然宽**；cell `width = 自然宽 + 2×padding` + `min_width_0` + `overflow_hidden`，**不调用 `flex_none()`/`flex_1()`**（taffy 默认 `shrink=1` 允许按比例压缩）；**不做总宽归一化**（可用宽度建树前不可得）；gate 7 改断言「同列等宽 + 宽列更宽 + 比例一致」 | `Some(w)` 是限宽测量不是自然宽；可用宽在 mount 前不可得；`StyleBuilder` 没有 `flex_basis/grow/shrink` setter |
 | C | 深度 > 0 的 HtmlBlock 无分支（文字被静默丢弃） | 深度 > 0 → 拼 `Html`/`Text` 子事件去标签 → 非空白则纯文本段落（不解析 markdown、不消耗预算）；登记 §10.1-21 | 原伪代码只有 depth 0 分支，与「绝不吞字」冲突 |
 | D | 空行按 `source[last_block_end..block_start]` 字节片段计数 | 改为**行号口径**：`last_line_end` 端点规范化到行界、`SourceLines::blank_lines_between(字节入参)`、首个块前不生成、尾部不生成、容器内不生成；验收 `en.md` → 34 spacer / 70 节点 | 字节差端点在「块区间含尾随换行」时 off-by-N，打穿 70/≤72 门禁 |
-| E1 | R1「ui_core 之外不改任何代码」 | R1 允许对 `ui_kit/.../inline_flow.rs` 做**最小编译适配**（6 处装饰 API，语义不变），并列出基线行号；R1 验收补 `-p ui_kit` | 否则 R1 提交 `cargo check --workspace` 必失败，违反 D17「每个提交可编译」 |
+| E1 | R1「ui_core 之外不改任何代码」 | R1 允许对 `ui_kit/.../inline_flow.rs` 做**最小编译适配**（6 处装饰 API，语义不变），并列出基线行号；R1 验收补 `-p ui_kit`（v4 实际：该适配**未实施**——`inline_flow.rs` 随 R2 整体删除，R1/R2 以成对例外登记，见 §7-R1） | 否则 R1 提交 `cargo check --workspace` 必失败，违反 D17「每个提交可编译」 |
 | E2 | 代码块「1 或 2 节点」写成留待 R2 现场判定 | 明确为**两个都已批准的备选 + 三条可执行判据 + 结论回写 §14**（§5.3/§5.12）；门禁先按 ≤2 写 | 消除「无未决项」与验证项表述冲突 |
 | E3 | 列表项形状「每项 3 或 4 + 子块」含糊 | 紧项 = 内容列即 text 节点（3 节点）；松项 = `flex_col` 内容容器 + 段落（≥4）；任务项标记列 = 复选框盒 +（选中）勾文本 | 需写死 `inline == None` 时的惰性内容列规则 |
 | E4 | 布局常量只散落在 §2.3 | 新增 §5.3 **完整常量表**（block gap 8、heading 额外 8 且不被空行抑制、code padding 8/radius 4、quote bar 3/padding 8、marker 20、cell padding 4、rule 1、字号缩放、mono、装饰线宽…）+ 块间距规则写死 | 实施者照抄；修掉「空行后标题额外 8px」缺失导致既有断言必挂 |
@@ -1733,7 +1746,7 @@ v3.1 → v3.2（第三轮独立复审 17 项 + 用户 4 项裁决 + 引擎审查
 | I3 | `line_top` 与 `line_height` **同源且严格相接**（分数行高 19.6px 用例钉死无重叠/无缝隙） | §5.11.3、§5.11.4 |
 | I4 | 背景分组：按「同色 + 同圆角 + 同 padding」分组，**padding 只加在组两端**（防异组 2×padding 双绘） | §5.11.3、§5.11.4 |
 | I5 | 非加速 canvas text 路径（`window/canvas_text.rs`）也必须画 run 背景，z 序与 GPU 路径一致 | §5.11.2、§5.11.3、§7-R1 |
-| I6 | R1 只做最小编译适配（保持旧 else-if 语义）；三条语义改写（链接+删除线共存、code 底色、kbd 下划线+底色）及测试**归 R2** | §5.11.4 末尾、§7-R1、§7-R2 |
+| I6 | R1 **未实施**最小编译适配（R1 只含 ui_core；`inline_flow.rs` 随 R2 整体删除，R1/R2 成对例外见 §7-R1）；三条语义改写（链接+删除线共存、code 底色、kbd 下划线+底色）及测试**归 R2** | §5.11.4 末尾、§7-R1、§7-R2 |
 
 v3.2 → v3.3（第四轮收敛：废弃关窗回写、统一行号空行口径、补借用纪律）：
 
@@ -1762,7 +1775,7 @@ v3.3 → v3.4（终审 8 条清理，无设计变更）：
 |---|---|---|---|
 | K1 | §5.6.4 第 9/13 条仍是机制 B 处方（「登记 id 但不写 align」「关闭事件到达时统一写 align」「进窗口登记表」）；§8.1-9「各应用一次」；§5.8/§5.9 两处「EOF 未关窗 → 丢弃登记 / 段落保持默认对齐（§10.1-4）」；§10.2 R5「延迟应用：登记后忘记应用」 | 全部改为机制 A：段落创建时 `InlineBuf::paragraph(current_align())` 即写入 `TextStyle.alignment`，窗口只 push/pop、pop **不「应用」任何东西**（§8.1-9 改「各出栈一次」）；EOF 两处统一为「**不撤销已施加的 align**」并引用 **§10.1-22**；R5 改为「**时序**：行内 `</p>` 出栈过早 → 段落取不到 align；块级 `</p>` 出栈过晚 → 后续段落误取 align」 | 两套机制并存，照做即错；EOF 表述与新语义相反且引用错 |
 | K2 | 空行 `from_line = line_of(prev_end − 1)`（「最后一个字节」）在 List 上少算（`End(Item)`/`End(List)` 区间末尾常是多个换行，`prev_end−1` 落到空行） | 口径改为「上一块 `End` 区间内**最后一个非空白字节**（跳过 `\r\n`/`\n`/`\r`/空格/TAB）所在行；若区间全为空白，退回 `line_of(区间起点)`」；`to_line` 与公式不变；补 4 条 list 反例（`- a\n- b\n\np\n`→1、`- a\n\np\n`→1、`- a\n- b\n\n\np\n`→2、`1. x\n\np\n`→1），并注明其它块型不受影响 | 文档公式在列表上比实测少 1 |
-| K3 | §7-R2 提交说明「§10.1 的 21 条偏差」 | **22 条**（与当时的 §10.1 表头、实际行数一致；R2 落地时新增 23–28，R3 再新增 29–33，故现在是 **33 条**，见 §10.1 表头与 §14.4） | 计数漂移 |
+| K3 | §7-R2 提交说明「§10.1 的 21 条偏差」 | **22 条**（与当时的 §10.1 表头、实际行数一致；R2 落地时新增 23–28，R3 再新增 29–33，最终对抗审查再新增 34–36，故现在是 **36 条**，见 §10.1 表头与 §14.4） | 计数漂移 |
 | K4 | J16 声称「注释免责已扩到头部总则」，实际只在 §5.11 | 头部新增总则：**全文所有 `rust`/`text` 片段的 `//` 注释只为说明语义，实施按 AGENTS §1.6 不写注释**（§5.11 原句保留） | 免责未落地 |
 | K5 | §10.1 表内第 21 行与第 22 行之间有一个空行，`§10.1-22` 被挤出表格 | 删除该空行，22 行全部在表内 | 表格结构破损 |
 | K6 | §2.6-C 行引用 `§10.1-16` | `§10.1-17`（7 组原始串 key） | 引用错位 |

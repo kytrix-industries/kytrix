@@ -948,6 +948,7 @@ fn decoration_segments(
 ) -> Vec<ShapedQuad> {
     let line_range = line.text_range();
     let line_end = line_content_end(text, &line_range);
+    let capacity = (runs.len() + 1) * TextDecorationKind::ALL.len();
     let mut out = Vec::new();
     for kind in TextDecorationKind::ALL {
         let offset_em = match kind {
@@ -975,6 +976,9 @@ fn decoration_segments(
             let Some((left, width)) = visual_span(line, text, range) else {
                 continue;
             };
+            if out.is_empty() {
+                out.reserve(capacity);
+            }
             let thickness = decoration.thickness;
             out.push(ShapedQuad {
                 rect: LogicalRect::new(
@@ -1074,15 +1078,21 @@ fn covered_segments<T: Copy>(
     run_value: impl Fn(&TextStyle) -> Option<T>,
     base_value: Option<T>,
 ) -> Vec<(core::ops::Range<usize>, T)> {
-    let run_segments: Vec<(core::ops::Range<usize>, T)> = runs
-        .iter()
-        .filter_map(|run| {
-            let value = run_value(&run.style)?;
-            let start = run.range.start.max(line_start);
-            let end = run.range.end.min(line_end);
-            (start < end).then_some((start..end, value))
-        })
-        .collect();
+    let mut run_segments: Vec<(core::ops::Range<usize>, T)> = Vec::new();
+    for run in runs {
+        let Some(value) = run_value(&run.style) else {
+            continue;
+        };
+        let start = run.range.start.max(line_start);
+        let end = run.range.end.min(line_end);
+        if start >= end {
+            continue;
+        }
+        if run_segments.is_empty() {
+            run_segments.reserve(runs.len());
+        }
+        run_segments.push((start..end, value));
+    }
     let mut segments: Vec<(core::ops::Range<usize>, T)> =
         Vec::with_capacity(run_segments.len() + usize::from(base_value.is_some()));
     if let Some(value) = base_value {

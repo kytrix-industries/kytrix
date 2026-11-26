@@ -1,7 +1,7 @@
 use ui_core::{
     interaction::ScrollConfig,
     math::{LogicalPoint, LogicalSize, px},
-    node::builder::NodeBuilder,
+    node::{builder::NodeBuilder, tree::NodeKind},
     paint::{color::Color, style_builder::StyleBuilder},
     text::TextStyle,
 };
@@ -41,13 +41,16 @@ fn assert_strikethrough(style: &TextStyle) {
 }
 
 #[test]
-fn a_deep_emphasis_drop_keeps_the_sibling_text() {
+fn a_deep_emphasis_keeps_the_text_and_drops_the_excess_marks() {
     let source = format!("keep {}x{} tail", "*".repeat(200), "*".repeat(200));
     let (app, node) = mount(&source);
     let content = texts(&app, node.root());
     assert_eq!(content.len(), 1);
-    assert_eq!(content[0].text, "keep  tail");
-    assert!(content[0].runs().is_empty());
+    assert_eq!(content[0].text, "keep x tail");
+    let runs = content[0].runs();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].range, 5..6);
+    assert_eq!(runs[0].style.weight, 700);
     assert_eq!(node_count(&app, node.root()), 2);
 }
 
@@ -58,8 +61,11 @@ fn the_deep_nesting_guard_applies_inside_containers() {
     assert_eq!(count(&app, "MARKDOWN_QUOTE"), 1);
     let content = texts(&app, node.root());
     assert_eq!(content.len(), 1);
-    assert_eq!(content[0].text, "keep ");
-    assert!(content[0].runs().is_empty());
+    assert_eq!(content[0].text, "keep x");
+    let runs = content[0].runs();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].range, 5..6);
+    assert_eq!(runs[0].style.weight, 700);
 }
 
 #[test]
@@ -187,7 +193,7 @@ fn the_same_source_parses_to_the_same_document() {
     );
     assert_eq!(node_count(&first, first_node.root()), 24);
     assert_eq!(node_count(&second, second_node.root()), 24);
-    assert_eq!(plain_text(source), plain_text(source));
+    assert_eq!(plain_text(source), "H\na\nb\nx y\n1 2");
 }
 
 #[test]
@@ -288,7 +294,10 @@ fn kbd_and_code_paragraphs_keep_their_runs_and_layout() {
 fn releasing_the_markdown_unloads_its_root_and_stops_syncing() {
     let (mut app, mut node) = mount("# Title\n\nparagraph");
     let markdown_root = node.root();
-    assert!(tree_of(&app).get(markdown_root).is_ok());
+    let root_entry = tree_of(&app).get(markdown_root).expect("the root is alive");
+    assert!(matches!(root_entry.kind(), NodeKind::Box));
+    assert_eq!(node_count(&app, markdown_root), 4);
+    assert_eq!(children(&app, markdown_root).len(), 3);
     assert!(node.release(app.app_mut()));
     assert!(tree_of(&app).get(markdown_root).is_err());
     assert!(!node.release(app.app_mut()));
@@ -354,7 +363,7 @@ fn rebuilding_keeps_the_root_identity_and_the_page_offset() {
     assert_eq!(node.root(), root_before);
     let tree = tree_of(&app);
     let rebuilt = tree.get(root_before).expect("the root survives");
-    assert!(!rebuilt.children().is_empty());
+    assert_eq!(rebuilt.children().len(), 7);
     assert_ne!(rebuilt.children()[0], first_child_before);
     assert_eq!(rebuilt.parent(), Some(page));
     let offset_after = app
@@ -391,11 +400,17 @@ fn emphasis_nested_exactly_at_the_limit_is_kept() {
 }
 
 #[test]
-fn emphasis_nested_past_the_limit_is_dropped() {
+fn emphasis_nested_past_the_limit_keeps_the_text_inside_the_cap() {
     let source = format!("{}a{}", "*".repeat(130), "*".repeat(130));
     let (app, node) = mount(&source);
-    assert!(texts(&app, node.root()).is_empty());
-    assert_eq!(node_count(&app, node.root()), 1);
+    let content = texts(&app, node.root());
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0].text, "a");
+    let runs = content[0].runs();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].range, 0..1);
+    assert_eq!(runs[0].style.weight, 700);
+    assert_eq!(node_count(&app, node.root()), 2);
 }
 
 #[test]
@@ -502,6 +517,39 @@ fn tight_and_loose_nested_lists_take_different_shapes() {
     assert!(tight_outline.contains(&"  item[tight]".to_owned()));
     assert!(loose_outline.contains(&"  item[loose]".to_owned()));
     assert_ne!(tight_outline, loose_outline);
+}
+
+#[test]
+fn registered_deviation_29_nested_lists_keep_the_same_spacing() {
+    let spacing = |source: &str| {
+        let (app, node) = mount(source);
+        let lists = nodes_with_id(&app, node.root(), "MARKDOWN_LIST");
+        let items = nodes_with_id(&app, node.root(), "MARKDOWN_LIST_ITEM");
+        assert_eq!(lists.len(), 2);
+        assert_eq!(items.len(), 2);
+        let outer = bounds(&app, lists[0]);
+        let nested = bounds(&app, lists[1]);
+        let outer_item = bounds(&app, items[0]);
+        let nested_item = bounds(&app, items[1]);
+        (
+            nested.origin.y - outer.origin.y,
+            nested_item.origin.y - outer_item.origin.y,
+            outer.size.height,
+            nested.size.height,
+        )
+    };
+
+    let tight = spacing("- a\n  - b");
+    let loose = spacing("- a\n\n  - b");
+    assert_eq!(
+        tight, loose,
+        "the tight and the loose nested list must share one spacing"
+    );
+    assert_eq!(
+        tight,
+        (px(27.6), px(27.6), px(47.2), px(19.6)),
+        "the registered deviation 29 freezes one spacing for both list forms"
+    );
 }
 
 #[test]

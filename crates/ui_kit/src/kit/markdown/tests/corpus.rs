@@ -11,22 +11,30 @@ use super::{MarkdownStyle, TestApp, children, mount, style, tree_of};
 
 const DESIGN: &str = include_str!("../../../../design/markdown-redesign-design.md");
 
-const SKIPPED: &[(&str, u8, &str)] = &[
+const SKIPPED: &[(&str, u8, &str, &str)] = &[
     (
         "autolinks (GFM 622-635)",
         5,
+        "不支持 GFM 扩展自动链接",
         "D2: extension autolinks are not implemented",
     ),
-    ("raw inline html", 3, "D7: html mapping omits raw markup"),
+    (
+        "raw inline html",
+        3,
+        "白名单外标签丢标签保文字",
+        "D7: html mapping omits raw markup",
+    ),
     (
         "raw html blocks (type 1-5)",
         3,
+        "type 1–5 块整块忽略",
         "D7: type 1-5 blocks are ignored as a whole",
     ),
-    ("link href", 16, "D9: links keep no url"),
+    ("link href", 16, "链接不保留 URL", "D9: links keep no url"),
     (
         "blank-line spacers",
         6,
+        "保留源码空行占位节点",
         "D4: blank lines render as spacer nodes",
     ),
 ];
@@ -619,7 +627,7 @@ fn degenerate_corpus() -> Vec<(&'static str, String, String)> {
         "<blockquote>".repeat(64),
         "</blockquote>".repeat(64)
     );
-    let deep_emphasis = format!("{}x{}", "*".repeat(100), "*".repeat(100));
+    let deep_emphasis = format!("{}x{}", "*".repeat(160), "*".repeat(160));
     let deep_list = format!("{}x", "- ".repeat(300));
     let deep_list_html = format!("{}x{}", "<ul><li>".repeat(32), "</li></ul>".repeat(32));
     let long_paragraph = "a".repeat(10_000);
@@ -697,13 +705,21 @@ fn the_conformance_corpus_skips_are_registered_deviations() {
     let start = DESIGN.find("### 10.1").expect("the deviation chapter");
     let end = DESIGN.find("### 10.2").expect("the risk chapter");
     let deviations = &DESIGN[start..end];
+    let row = |number: u8| {
+        let marker = format!("| {number} |");
+        deviations
+            .lines()
+            .find(|line| line.starts_with(&marker))
+            .unwrap_or_else(|| panic!("the deviation {number} is registered"))
+    };
     assert_eq!(SKIPPED.len(), 5);
     let mut numbers = Vec::new();
-    for (case, number, reason) in SKIPPED {
+    for (case, number, keyword, reason) in SKIPPED {
         assert!(!reason.trim().is_empty(), "{case}");
+        let line = row(*number);
         assert!(
-            deviations.contains(&format!("| {number} |")),
-            "{case} cites the unregistered deviation {number}"
+            line.contains(keyword),
+            "{case} cites §10.1-{number}, whose row lacks {keyword:?}: {line}"
         );
         numbers.push(*number);
     }

@@ -190,22 +190,47 @@ fn gate_four_every_production_rich_text_parses_exactly_once_or_once_nested() {
     assert_eq!(inline, 5);
 }
 
-#[test]
-fn gate_five_no_legacy_block_or_blank_ids_survive() {
-    let (app, node) = mount(
-        "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n> q\n\n- [x] t\n\n```\ncode\n```\n\n---",
-    );
-    assert_eq!(tree_of(&app).debug_id(node.root()), Some("MARKDOWN"));
-    assert_eq!(count(&app, "MARKDOWN"), 1);
-    let tree = tree_of(&app);
-    let mut stack = vec![node.root()];
+fn assert_no_legacy_ids(app: &TestApp, root: NodeId) {
+    let tree = tree_of(app);
+    let mut roots = 0;
+    let mut stack = vec![root];
     while let Some(current) = stack.pop() {
         if let Some(id) = tree.debug_id(current) {
             assert!(!id.starts_with("MARKDOWN_BLOCK"), "{id}");
             assert!(!id.starts_with("MARKDOWN_BLANK"), "{id}");
+            if id == "MARKDOWN" {
+                roots += 1;
+            }
         }
         stack.extend(tree.get(current).expect("node alive").children());
     }
+    assert_eq!(roots, 1, "exactly one markdown root");
+}
+
+#[test]
+fn gate_five_no_legacy_block_or_blank_ids_survive() {
+    let mut mounted = 0;
+    for source in [EN_RELEASE_NOTES, ZH_RELEASE_NOTES] {
+        let (app, node) = mount(source);
+        assert_no_legacy_ids(&app, node.root());
+        mounted += 1;
+    }
+    for case in I18N_MARKDOWN {
+        for source in [case.en, case.zh] {
+            if source.is_empty() {
+                continue;
+            }
+            let (app, node) = mount(source);
+            assert_no_legacy_ids(&app, node.root());
+            mounted += 1;
+        }
+    }
+    assert_eq!(mounted, 77);
+    let (app, node) = mount(
+        "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n> q\n\n- [x] t\n\n```\ncode\n```\n\n---\n\n<div>\n<p align=\"center\">x</p>\n</div>",
+    );
+    assert_eq!(count(&app, "MARKDOWN"), 1);
+    assert_no_legacy_ids(&app, node.root());
 }
 
 #[test]

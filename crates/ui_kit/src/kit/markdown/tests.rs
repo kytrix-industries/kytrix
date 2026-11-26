@@ -13,7 +13,7 @@ use ui_core::{
     text::{FontStack, InlineBoxPaint, TextAlign, TextContent, TextStyle, TextWrap},
 };
 
-use super::{MarkdownAssets, MarkdownNode, MarkdownStyle, inline::MONO_FAMILY};
+use super::{MarkdownAssets, MarkdownNode, MarkdownStyle, inline::MONO_FAMILY, plain_text};
 use crate::theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role};
 
 mod corpus;
@@ -188,6 +188,23 @@ fn blocks_take_the_block_gap_and_headings_take_the_extra_space() {
     let blocks = children(&app, node.root());
     assert_eq!(blocks.len(), 2);
     assert!((gap_after(&app, blocks[0], blocks[1]) - px(16.0)).abs() < px(0.01));
+}
+
+#[test]
+fn a_paragraph_after_an_html_fragment_takes_the_block_gap() {
+    let (app, node) = mount("<p align=\"center\">x</p>\ntail");
+    let blocks = children(&app, node.root());
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(texts(&app, node.root())[0].text, "x");
+    assert!((gap_after(&app, blocks[0], blocks[1]) - px(8.0)).abs() < px(0.01));
+    let margin = tree_of(&app)
+        .get(blocks[1])
+        .expect("the tail paragraph is alive")
+        .style()
+        .inner()
+        .margin
+        .top;
+    assert_eq!(margin, taffy::style::LengthPercentageAuto::length(8.0));
 }
 
 #[test]
@@ -590,10 +607,17 @@ fn block_nesting_beyond_the_cap_flattens_into_one_text_node() {
 }
 
 #[test]
-fn inline_nesting_beyond_the_cap_drops_the_text() {
-    let source = format!("{}x{}", "**".repeat(80), "**".repeat(80));
+fn inline_nesting_beyond_the_cap_keeps_the_text_and_clips_the_marks() {
+    let source = format!("{}x{}", "**".repeat(100), "**".repeat(100));
     let (app, node) = mount(&source);
-    assert_eq!(node_count(&app, node.root()), 1);
+    assert!(node_count(&app, node.root()) >= 1);
+    let content = texts(&app, node.root());
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0].text, "x");
+    let runs = content[0].runs();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].style.weight, 700);
+    assert_eq!(content[0].text, plain_text(&source));
 }
 fn nodes_with_id(app: &TestApp, root: NodeId, id: &str) -> Vec<NodeId> {
     let tree = tree_of(app);

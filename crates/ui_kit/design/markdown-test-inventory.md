@@ -25,11 +25,11 @@
 
 | # | 测试名 | 行 | 组 | 断言摘要 | 处置 | 替代 / 新落点 | 轮次 | 落点（R3） |
 |---:|---|---:|:-:|---|---|---|------|---|
-| 1 | `deeply_nested_emphasis_is_dropped_instead_of_overflowing_the_stack` | 267 | A | 9600 个 `*` 的强调在超限时整段被丢弃、结果为空文档（不栈溢出） | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::inline_nesting_beyond_the_cap_drops_the_text` |
+| 1 | `deeply_nested_emphasis_is_dropped_instead_of_overflowing_the_stack` | 267 | A | 旧断言：9600 个 `*` 的强调在超限时整段被丢弃、结果为空文档（不栈溢出）；R3 定稿改为**保留文字、只截断超限 marks** | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::inline_nesting_beyond_the_cap_keeps_the_text_and_clips_the_marks` |
 | 2 | `emphasis_nested_within_the_limit_is_kept` | 274 | A | 16 个 `*`（8 层）在限内 → 一个段落、文字 `a` 为 strong | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::emphasis_nested_within_the_limit_is_kept` |
 | 3 | `emphasis_nested_exactly_at_the_limit_is_kept` | 297 | A | 恰好 64 层（128 个 `*`）在上限 → 仍有 1 个段落且文字 `a` 存活 | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::emphasis_nested_exactly_at_the_limit_is_kept` |
-| 4 | `emphasis_nested_past_the_limit_is_dropped` | 314 | A | 65 层（130 个 `*`）超限 → 空文档 | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::emphasis_nested_past_the_limit_is_dropped` |
-| 5 | `dropping_an_over_deep_nesting_keeps_its_siblings` | 326 | A | 200 层强调被丢弃，但同段落兄弟文字 `keep ` 与 ` tail` 保留（只丢子树文字） | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::a_deep_emphasis_drop_keeps_the_sibling_text` |
+| 4 | `emphasis_nested_past_the_limit_is_dropped` | 314 | A | 旧断言：65 层（130 个 `*`）超限 → 空文档；R3 定稿改为**文字保留、超限 marks 截断** | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `ledger::emphasis_nested_past_the_limit_keeps_the_text_inside_the_cap` |
+| 5 | `dropping_an_over_deep_nesting_keeps_its_siblings` | 326 | A | 旧断言：200 层强调被丢弃，但同段落兄弟文字 `keep ` 与 ` tail` 保留（只丢子树文字）；R3 定稿改为**文字全部保留、只丢超限 marks** | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `ledger::a_deep_emphasis_keeps_the_text_and_drops_the_excess_marks` |
 | 6 | `headings_take_their_level_from_the_number_of_hashes` | 343 | H | `#`→H1、`######`→H6 | 保留并改写 | §8.1「表格」「块级」+ §8.2 | R2 | `tests::headings_scale_with_their_level_and_stay_bold_and_left` |
 | 7 | `seven_hashes_are_not_a_heading` | 355 | H | `#######` 不是标题，按普通段落读原文 | 保留并改写 | §8.1「表格」「块级」+ §8.2 | R2 | `tests::seven_hashes_are_not_a_heading` |
 | 8 | `plain_text_is_one_paragraph_and_no_links` | 363 | F | `plain` → 单段落，`links` 为空 | 删除 | §5.5 flush 判定 + §8.2 outline | R2/R3 | — |
@@ -70,40 +70,40 @@
 | 43 | `a_line_of_spaces_is_a_blank_line` | 838 | E | 只含空格的行算空行 | 删除 | §8.4 门禁 3（spacer 形状）+ §8.1「块级」（空行重建） | R2/R3 | — |
 | 44 | `blank_lines_at_the_edges_of_the_document_are_not_kept` | 850 | E | 文档首尾空行不保留 | 删除 | §8.4 门禁 3（spacer 形状）+ §8.1「块级」（空行重建） | R2/R3 | — |
 | 45 | `blank_lines_are_counted_for_every_line_ending` | 864 | E | CRLF 与 CR 换行各算一个空行 | 删除 | §8.4 门禁 3（spacer 形状）+ §8.1「块级」（空行重建） | R2/R3 | — |
-| 46 | `an_align_tag_pair_becomes_a_paragraph_with_its_alignment` | 879 | B | `<p align="center/right/left">` 与无属性 `<p>` → 段落对齐 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 47 | `an_align_tag_pair_keeps_its_place_between_other_blocks` | 900 | B | 对齐段落按源顺序位于前后段落之间（含空行） | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 48 | `the_inside_of_an_align_tag_pair_is_inline_markdown` | 914 | B | 对内的强调、链接、图片、kbd 都按行内 markdown 解析 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 49 | `the_inside_of_an_align_tag_pair_may_span_lines` | 940 | B | 对内跨行成 LineBreak，首尾换行被剥掉 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 50 | `an_align_tag_pair_may_span_blank_lines` | 952 | B | 对内空行 → 拆成多个同对齐段落 + BlankLine | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 51 | `blank_lines_inside_an_align_tag_pair_are_kept` | 964 | B | 对内 4 个换行 → 3 个 BlankLine | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 52 | `a_blank_line_in_a_tag_pairs_content_keeps_the_whole_message` | 978 | B | 生产形态 `are:\nBinance\n\nOKX` 不丢内容 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 53 | `an_align_tag_pair_may_span_several_paragraphs` | 994 | B | 对内多段落各自带该对的对齐 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 54 | `blank_lines_at_the_edges_of_a_tag_pair_are_not_kept` | 1006 | B | 对内容首尾多余空行不保留 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 55 | `blank_lines_inside_a_pair_are_counted_for_every_line_ending` | 1018 | B | `\r\r` 在对内也算一个空行 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 56 | `blank_lines_between_align_tag_pairs_are_kept` | 1030 | B | 两个对之间的空行保留为 BlankLine | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 57 | `a_pair_after_a_consumed_close_tag_is_still_drawn` | 1042 | B | `</p>` 被消费后紧跟的第二对仍被画出 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 58 | `an_open_tag_inside_an_html_block_is_a_pair` | 1053 | B | HTML 块内的 `<p align>` 也算对；跨度内的标题等块仍画出（5 组断言） | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 59 | `an_unpaired_open_tag_does_not_swallow_the_pair_after_it` | 1089 | B | 未闭合开标签不吞掉后面完整闭合的对 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 60 | `a_supported_open_tag_nested_in_one_block_is_content` | 1098 | B | 同一 HTML 块内嵌套的第二个 `<p align>` 当内容而非新对 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 61 | `block_constructs_inside_an_align_tag_pair_are_drawn` | 1106 | B | 对内围栏代码块/有序列表成块级节点；对内 HTML 块仍被丢弃 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 62 | `headings_inside_an_align_tag_pair_are_drawn` | 1127 | B | 对内 ATX 与 setext 标题成标题块 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 63 | `a_tag_pair_that_is_not_markup_is_not_an_align_tag` | 1143 | B | 注释/pre/script/style/textarea/属性内的 `<p align>` 不算对（9 例全空文档） | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 64 | `a_comment_beside_an_align_tag_pair_does_not_hide_it` | 1164 | B | 旁侧 HTML 注释不阻断扫描 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 65 | `a_comment_does_not_disturb_the_align_tags_after_it` | 1172 | B | 注释内的 `'` 与 `>` 不提前结束注释，后续对仍画出（3 组） | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 66 | `a_close_tag_inside_a_comment_does_not_end_the_pair` | 1204 | B | 注释内的 `</p>` 不结束配对 → 文本合并 `ab` | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 67 | `an_abbreviated_comment_does_not_swallow_the_tags_after_it` | 1212 | B | `<!-->`/`<!--->` 即刻结束、不吞后续标签 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 68 | `an_unterminated_comment_at_the_end_of_a_multibyte_source_does_not_panic` | 1225 | B | 多字节源末尾未闭合注释不 panic | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 69 | `a_stray_less_than_sign_does_not_swallow_the_closing_tag` | 1234 | B | 裸 `<` 不吞掉闭合标签（3 组） | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 70 | `a_heading_inside_an_align_tag_pair_is_still_a_heading` | 1262 | B | 对内标题是标题，其前后段落保持该对对齐 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 71 | `a_tag_name_that_only_starts_with_p_is_not_the_align_tag` | 1275 | B | `<palign=…>` 不是 `<p>` → 空文档 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 72 | `several_align_tag_pairs_in_one_html_block_become_several_paragraphs` | 1283 | B | 一个 HTML 块内多个对 → 多个对齐段落；块内剩余原始 HTML 仍隐藏 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 73 | `the_content_of_an_align_tag_pair_ends_at_the_first_close_tag` | 1308 | B | 内容在第一个 `</p>` 结束（中间的 `<p class>` 段落被跳过） | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 74 | `only_the_exact_align_tag_pair_counts` | 1328 | B | 11 种非规范写法（大写/单引号/无引号/多属性/justify/未闭合…）整块丢弃 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 75 | `an_align_tag_pair_wrapped_in_other_html_still_counts` | 1351 | B | 被 `<div>` 包裹的对仍生效 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 76 | `an_open_align_tag_without_a_closing_tag_produces_nothing` | 1359 | B | 未闭合对不产块；已闭合的第一对保留 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 77 | `a_tag_whose_name_merely_starts_with_p_is_not_an_align_tag` | 1371 | B | `<pre>`/`<param>` 不算 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 78 | `an_empty_align_tag_pair_produces_no_block` | 1382 | B | 空/纯空白对不产块，其后空行也不画 | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
-| 79 | `an_inline_align_tag_changes_nothing` | 1398 | B | 行内出现的 `<p align>` 只剥标签、不改对齐（文字 `text x`） | 删除 | §8.1「HTML 语义子集」24 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 46 | `an_align_tag_pair_becomes_a_paragraph_with_its_alignment` | 879 | B | `<p align="center/right/left">` 与无属性 `<p>` → 段落对齐 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 47 | `an_align_tag_pair_keeps_its_place_between_other_blocks` | 900 | B | 对齐段落按源顺序位于前后段落之间（含空行） | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 48 | `the_inside_of_an_align_tag_pair_is_inline_markdown` | 914 | B | 对内的强调、链接、图片、kbd 都按行内 markdown 解析 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 49 | `the_inside_of_an_align_tag_pair_may_span_lines` | 940 | B | 对内跨行成 LineBreak，首尾换行被剥掉 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 50 | `an_align_tag_pair_may_span_blank_lines` | 952 | B | 对内空行 → 拆成多个同对齐段落 + BlankLine | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 51 | `blank_lines_inside_an_align_tag_pair_are_kept` | 964 | B | 对内 4 个换行 → 3 个 BlankLine | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 52 | `a_blank_line_in_a_tag_pairs_content_keeps_the_whole_message` | 978 | B | 生产形态 `are:\nBinance\n\nOKX` 不丢内容 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 53 | `an_align_tag_pair_may_span_several_paragraphs` | 994 | B | 对内多段落各自带该对的对齐 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 54 | `blank_lines_at_the_edges_of_a_tag_pair_are_not_kept` | 1006 | B | 对内容首尾多余空行不保留 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 55 | `blank_lines_inside_a_pair_are_counted_for_every_line_ending` | 1018 | B | `\r\r` 在对内也算一个空行 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 56 | `blank_lines_between_align_tag_pairs_are_kept` | 1030 | B | 两个对之间的空行保留为 BlankLine | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 57 | `a_pair_after_a_consumed_close_tag_is_still_drawn` | 1042 | B | `</p>` 被消费后紧跟的第二对仍被画出 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 58 | `an_open_tag_inside_an_html_block_is_a_pair` | 1053 | B | HTML 块内的 `<p align>` 也算对；跨度内的标题等块仍画出（5 组断言） | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 59 | `an_unpaired_open_tag_does_not_swallow_the_pair_after_it` | 1089 | B | 未闭合开标签不吞掉后面完整闭合的对 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 60 | `a_supported_open_tag_nested_in_one_block_is_content` | 1098 | B | 同一 HTML 块内嵌套的第二个 `<p align>` 当内容而非新对 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 61 | `block_constructs_inside_an_align_tag_pair_are_drawn` | 1106 | B | 对内围栏代码块/有序列表成块级节点；对内 HTML 块仍被丢弃 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 62 | `headings_inside_an_align_tag_pair_are_drawn` | 1127 | B | 对内 ATX 与 setext 标题成标题块 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 63 | `a_tag_pair_that_is_not_markup_is_not_an_align_tag` | 1143 | B | 注释/pre/script/style/textarea/属性内的 `<p align>` 不算对（9 例全空文档） | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 64 | `a_comment_beside_an_align_tag_pair_does_not_hide_it` | 1164 | B | 旁侧 HTML 注释不阻断扫描 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 65 | `a_comment_does_not_disturb_the_align_tags_after_it` | 1172 | B | 注释内的 `'` 与 `>` 不提前结束注释，后续对仍画出（3 组） | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 66 | `a_close_tag_inside_a_comment_does_not_end_the_pair` | 1204 | B | 注释内的 `</p>` 不结束配对 → 文本合并 `ab` | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 67 | `an_abbreviated_comment_does_not_swallow_the_tags_after_it` | 1212 | B | `<!-->`/`<!--->` 即刻结束、不吞后续标签 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 68 | `an_unterminated_comment_at_the_end_of_a_multibyte_source_does_not_panic` | 1225 | B | 多字节源末尾未闭合注释不 panic | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 69 | `a_stray_less_than_sign_does_not_swallow_the_closing_tag` | 1234 | B | 裸 `<` 不吞掉闭合标签（3 组） | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 70 | `a_heading_inside_an_align_tag_pair_is_still_a_heading` | 1262 | B | 对内标题是标题，其前后段落保持该对对齐 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 71 | `a_tag_name_that_only_starts_with_p_is_not_the_align_tag` | 1275 | B | `<palign=…>` 不是 `<p>` → 空文档 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 72 | `several_align_tag_pairs_in_one_html_block_become_several_paragraphs` | 1283 | B | 一个 HTML 块内多个对 → 多个对齐段落；块内剩余原始 HTML 仍隐藏 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 73 | `the_content_of_an_align_tag_pair_ends_at_the_first_close_tag` | 1308 | B | 内容在第一个 `</p>` 结束（中间的 `<p class>` 段落被跳过） | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 74 | `only_the_exact_align_tag_pair_counts` | 1328 | B | 11 种非规范写法（大写/单引号/无引号/多属性/justify/未闭合…）整块丢弃 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 75 | `an_align_tag_pair_wrapped_in_other_html_still_counts` | 1351 | B | 被 `<div>` 包裹的对仍生效 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 76 | `an_open_align_tag_without_a_closing_tag_produces_nothing` | 1359 | B | 未闭合对不产块；已闭合的第一对保留 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 77 | `a_tag_whose_name_merely_starts_with_p_is_not_an_align_tag` | 1371 | B | `<pre>`/`<param>` 不算 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 78 | `an_empty_align_tag_pair_produces_no_block` | 1382 | B | 空/纯空白对不产块，其后空行也不画 | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
+| 79 | `an_inline_align_tag_changes_nothing` | 1398 | B | 行内出现的 `<p align>` 只剥标签、不改对齐（文字 `text x`） | 删除 | §8.1「HTML 语义子集」27 条（容错语义）+「段落对齐」3 条 | R2/R3 | — |
 | 80 | `formerly_dropped_block_nodes_are_now_drawn` | 1406 | J | 列表/引用/围栏代码块都成块；HTML 块仍不留内容 | 保留并改写 | §8.1「HTML 语义子集」+ §8.2 | R2 | `tests::code_blocks_mount_one_text_node_with_background_padding_and_mono` |
 | 81 | `an_empty_source_has_no_blocks_and_no_links` | 1431 | J | 空源 → 空文档 | 保留并改写 | §8.1「HTML 语义子集」+ §8.2 | R2 | `tests::an_empty_source_mounts_only_the_root` |
 | 82 | `the_same_source_parses_to_the_same_document` | 1436 | J | 同一源两次解析结果相等（确定性） | 保留并改写 | §8.1「HTML 语义子集」+ §8.2 | R2 | `tests::the_same_source_parses_to_the_same_document` |
@@ -132,7 +132,7 @@
 | 105 | `a_kbd_pair_is_counted_per_table_cell` | 1978 | C | 每个表格单元格的 kbd run 编号各自从 0 开始 | 删除 | §8.1「行内」（kbd 精确形态 / `<kbd>` 内图片） | R2 | — |
 | 106 | `blank_lines_around_the_new_block_kinds_are_kept` | 1992 | E | 代码块/列表/引用周围的源空行保留 | 删除 | §8.4 门禁 3（spacer 形状）+ §8.1「块级」（空行重建） | R2/R3 | — |
 | 107 | `container_blocks_do_not_synthesize_blank_lines` | 2021 | E | 列表/引用内部不合成空行 | 删除 | §8.4 门禁 3（spacer 形状）+ §8.1「块级」（空行重建） | R2/R3 | — |
-| 108 | `the_deep_nesting_guard_applies_inside_containers` | 2043 | A | 超深行内强调在引用/列表项内也被丢弃，但容器块本身保留 | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::the_deep_nesting_guard_applies_inside_containers` |
+| 108 | `the_deep_nesting_guard_applies_inside_containers` | 2043 | A | 超深行内强调在引用/列表项内只截断 marks、文字保留，容器块本身保留（R3 定稿语义） | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `ledger::the_deep_nesting_guard_applies_inside_containers` |
 | 109 | `deeply_nested_quotes_are_capped_instead_of_overflowing_the_stack` | 2102 | A | 1000 层引用：文字仍可见、IR 容器深度 ≤ 64 | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::degrading_an_over_deep_container_keeps_its_siblings` |
 | 110 | `quotes_exactly_at_the_block_nesting_limit_stay_structured` | 2119 | A | 64 层引用全部保留为 Quote 结构 | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::degrading_an_over_deep_container_keeps_its_siblings` |
 | 111 | `quotes_past_the_block_nesting_limit_degrade_to_flat_text` | 2132 | A | 65 层 → 深度停在 64，第 65 层降级为段落文字 `deep` | 保留并改写 | §8.1「退化」+ §8.2 outline | R2 | `tests::degrading_an_over_deep_container_keeps_its_siblings` |
@@ -199,7 +199,7 @@
 | 12 | `multi_byte_offsets_stay_on_char_boundaries` | 568 | §8.6：保留语义改写 | 多字节文本后 run 区间 6..9 且落在字符边界 | 保留并改写 | §8.2 outline（run / inline box / 装饰集合 / 背景） | R2 | `tests::multi_byte_offsets_stay_on_char_boundaries` |
 | 13 | `link_span_covers_multi_byte_text_exactly` | 580 | §8.6：删除 | 中文链接 `link_spans[0]` = 0..6，`link_at(5)=Some`、`link_at(6)=None` | 删除 | §6.4 公开面删除（`LinkSpan` / `link_at` / `ImagePaintSource`） | R2 | — |
 | 14 | `link_span_and_kbd_span_close_at_piece_boundaries` | 592 | §8.6：删除 | 相邻 piece 的 link span 分成两段、kbd span 只在首段 | 删除 | §6.4 公开面删除（`LinkSpan` / `link_at` / `ImagePaintSource`） | R2 | — |
-| 15 | `links_around_images_keep_their_ranges` | 607 | §8.6：保留语义改写 | 链接内图片不打断 link span（0..2，含图片插入点） | 删除 | §6.4 公开面删除（见落点理由） | R2 | 删除：§6.4 删除 `LinkSpan`/`link_at`：`InlineBoxSpec` 不承载链接区间，旧断言「链接内图片不打断 link span」不可观察（D9） |
+| 15 | `links_around_images_keep_their_ranges` | 607 | §8.6：删除（R3 改判） | 链接内图片不打断 link span（0..2，含图片插入点） | 删除 | §6.4 公开面删除（见落点理由） | R2 | 删除：§6.4 删除 `LinkSpan`/`link_at`：`InlineBoxSpec` 不承载链接区间，旧断言「链接内图片不打断 link span」不可观察（D9） |
 | 16 | `image_paint_source_can_choose_image_or_skip` | 632 | §8.6：删除 | 自定义 `ImagePaintSource` 可决定图片绘制方式（Quad 颜色由 size 派生） | 删除 | §6.4 公开面删除（`LinkSpan` / `link_at` / `ImagePaintSource`） | R2 | — |
 
 ---
@@ -233,7 +233,7 @@
 
 ## 5.1 R3 对抗性审查后的追加加固
 
-`review-r3.md` 的 P1×3 / P2×8 已处理：spacer 加 `flex_shrink(0)` 并把门禁 3 改回默认根（34 个 spacer 各 19.6px）；规范一致性语料补齐到 86 条并扩展发射器（表格/任务/HTML 子集）；`i18n_markdown.rs` 改为 §8.5 的 39 key 矩阵 + 21 条 `PRODUCTION_NOTICES` + 冻结可见文本；gate2 加阳性对照；gate6 加根 appearance 边；补 `outline()`、图片 index 断言、plain_text 解析计数、skip 编号修正。设计文档 §6.1/§8.6/§10.1 表头的数字与模块清单属于 R4 文档回写（本轮未改设计主文档）。
+`review-r3.md` 的 P1×3 / P2×8 已处理：spacer 加 `flex_shrink(0)` 并把门禁 3 改回默认根（34 个 spacer 各 19.6px）；规范一致性语料补齐到 **90** 条（表格 12 / 任务清单 9 / 删除线 6 / 块级 15 / 行内 12 / 段落对齐 3 / HTML 子集 27 / 退化 6）并扩展发射器（表格/任务/HTML 子集）；`i18n_markdown.rs` 改为 §8.5 的 39 key 矩阵 + 21 条 `PRODUCTION_NOTICES` + 冻结可见文本；gate2 加阳性对照；gate6 加根 appearance 边；补 `outline()`、图片 index 断言、plain_text 解析计数、skip 编号修正。设计文档 §6.1/§8.6/§10.1 表头的数字与模块清单属于 R4 文档回写（本轮未改设计主文档）→ **已由 `c3fa5c52` 完成**（设计文档回写提交）。
 
 ---
 
@@ -243,7 +243,7 @@
 2. **`parse_tests.rs` A 组「11 条」的前缀清单补齐 4 条**：inventory §6-2 指出 v2 文档列出的前缀只覆盖 7 条；本表按测试名逐条列出，不再依赖前缀。
 3. **`parse_tests.rs` D 组「13 条」按语义补入 2 条**：`a_type_overrides_the_extension`、`a_path_with_at_signs_or_non_ascii_survives_the_markdown_parser` 不被 v2 列出的前缀覆盖，本表已按测试名列出。
 
-> 另：`parse_tests.rs` 的 B 组 34 条测试**删除的是 IR 形态断言**，其容错输入（精确形态 / 同名嵌套与非配对 / 注释 / 引号 / 未闭合 / CRLF / 同块多对 / 尾巴文本 / type 1–5 排除 / 行中 `<p>`）必须逐条迁移到 §8.1 的 HTML 语义子集 24 条——这是「删除但不丢语义」的判据。
+> 另：`parse_tests.rs` 的 B 组 34 条测试**删除的是 IR 形态断言**，其容错输入（精确形态 / 同名嵌套与非配对 / 注释 / 引号 / 未闭合 / CRLF / 同块多对 / 尾巴文本 / type 1–5 排除 / 行中 `<p>`）必须逐条迁移到 §8.1 的 HTML 语义子集 27 条——这是「删除但不丢语义」的判据。
 
 ---
 
@@ -253,8 +253,8 @@ R3 对 P2-2 点名的 23 条逐条补测或改判（下表 24 行：document §3
 
 | P2-2 条目 | 台账编号 | R3 处置 | 落点 / 理由 |
 |---|---|---|---|
-| 深强调丢子树保兄弟 | §1 #5 | 补测 | `tests::a_deep_emphasis_drop_keeps_the_sibling_text`（`keep  tail` 逐字符） |
-| 嵌套上限作用于容器内 | §1 #108 | 补测 | `tests::the_deep_nesting_guard_applies_inside_containers` |
+| 深强调保留文字、只丢超限 marks | §1 #5 | 补测（语义随 F-1 修正） | `ledger::a_deep_emphasis_keeps_the_text_and_drops_the_excess_marks`（`keep x tail` 逐字符 + marks 截断） |
+| 嵌套上限作用于容器内 | §1 #108 | 补测 | `ledger::the_deep_nesting_guard_applies_inside_containers` |
 | 深列表封顶 | §1 #112 | 补测 | `tests::deeply_nested_lists_are_capped_at_thirty_two_levels`（32 list / 32 item / 129 节点） |
 | 降级容器保兄弟 | §1 #113 | 补测 | `tests::degrading_an_over_deep_container_keeps_its_siblings`（64 quote + sibling + 1 spacer） |
 | 链接内样式 | §1 #13 | 补测 | `tests::styles_inside_a_link_are_kept`（2 run：strong+link / link） |
@@ -278,4 +278,4 @@ R3 对 P2-2 点名的 23 条逐条补测或改判（下表 24 行：document §3
 | document 两条 plain_text 冻结值 | §3 #3/#4 | 补测 | `plain::plain_text_deviation_08_folds_the_document_baseline_blank_lines`（冻结字面量逐字符 + 仅折行不改字） |
 | 链接内图片链接区间 | §4 #15 | 改判删除 | 同上：`LinkSpan`/`link_at` 已删（§6.4，D9） |
 
-R3 的其余加固：§8.3 规范一致性语料（`corpus::*` 11 个测试 / **86 条**用例：表格 12、任务清单 8、删除线 6、块级 15、行内 12、段落对齐 3、HTML 子集 24、退化 6；skip 5 条指向 §10.1-3/-3/-5/-6/-16）、§8.2 `outline()` 分类器（`tests::outline` 2 条）、§8.4 七条门禁（`gates::gate_one_a_stable_frame_commits_nothing` … `gates::gate_seven_table_columns_take_their_measured_natural_widths`，另加 spacer flex 固定与 plain_text 计数 2 条）、§8.5 冻结夹具（`fixtures/legacy_plain_text.rs` 81 条 + 2 条 document 值 + 2 条 release 折叠值 + 4 条生产 plain_text 入参；`fixtures/i18n_markdown.rs` 39 key × {en,zh,en_rich,zh_rich,en_visible,zh_visible} + 21 条 `PRODUCTION_NOTICES`）。
+R3 的其余加固：§8.3 规范一致性语料（`corpus::*` 11 个测试 / **90 条**用例：表格 12、任务清单 9、删除线 6、块级 15、行内 12、段落对齐 3、HTML 子集 27、退化 6；skip 5 条指向 §10.1-3/-3/-5/-6/-16）、§8.2 `outline()` 分类器（`tests::outline` 2 条）、§8.4 七条门禁（`gates::gate_one_a_stable_frame_commits_nothing` … `gates::gate_seven_table_columns_take_their_measured_natural_widths`，另加 spacer flex 固定与 plain_text 计数 2 条）、§8.5 冻结夹具（`fixtures/legacy_plain_text.rs` 81 条 + 2 条 document 值 + 2 条 release 折叠值 + 4 条生产 plain_text 入参；`fixtures/i18n_markdown.rs` 39 key × {en,zh,en_rich,zh_rich,en_visible,zh_visible} + 21 条 `PRODUCTION_NOTICES`）。

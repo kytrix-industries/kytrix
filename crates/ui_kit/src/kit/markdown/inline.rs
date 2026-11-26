@@ -109,7 +109,7 @@ pub(super) struct InlineBuf {
     text: String,
     spans: Vec<(Range<usize>, Marks)>,
     boxes: Vec<InlineBox>,
-    kind: InlineKind,
+    pub kind: InlineKind,
 }
 
 impl InlineBuf {
@@ -120,10 +120,6 @@ impl InlineBuf {
             boxes: Vec::new(),
             kind,
         }
-    }
-
-    pub(super) fn kind(&self) -> InlineKind {
-        self.kind
     }
 
     pub(super) fn is_empty(&self) -> bool {

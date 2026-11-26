@@ -15,8 +15,8 @@ const MAX_MEASURED_CELL_CHARS: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub(super) struct CellBuf {
-    base: TextStyle,
-    content: InlineContent,
+    pub base: TextStyle,
+    pub content: InlineContent,
 }
 
 impl CellBuf {
@@ -27,18 +27,14 @@ impl CellBuf {
     pub(super) fn is_empty(&self) -> bool {
         self.content.is_empty()
     }
-
-    pub(super) fn into_parts(self) -> (TextStyle, InlineContent) {
-        (self.base, self.content)
-    }
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct TableBuf {
     alignments: Vec<Alignment>,
-    header: Option<Vec<CellBuf>>,
-    rows: Vec<Vec<CellBuf>>,
-    overflow: Vec<SmolStr>,
+    pub header: Option<Vec<CellBuf>>,
+    pub rows: Vec<Vec<CellBuf>>,
+    pub overflow: Vec<SmolStr>,
     row: Vec<CellBuf>,
     extra: Vec<CellBuf>,
     in_head: bool,
@@ -122,10 +118,6 @@ impl TableBuf {
             .collect::<Vec<&str>>()
             .join(" ");
         self.overflow.push(SmolStr::new(line.trim_end()));
-    }
-
-    pub(super) fn into_parts(self) -> (Option<Vec<CellBuf>>, Vec<Vec<CellBuf>>, Vec<SmolStr>) {
-        (self.header, self.rows, self.overflow)
     }
 
     pub(super) fn column_widths(&self, app: &mut App) -> Option<Vec<LogicalPx>> {

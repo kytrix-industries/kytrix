@@ -70,7 +70,7 @@ pub(super) struct Builder<'a> {
     inline: Option<InlineBuf>,
     cell: Option<InlineBuf>,
     marks: Vec<Mark>,
-    skipped_inline: usize,
+    clipped_marks: usize,
     skipped_blocks: usize,
     suppressed: String,
     lines: SourceLines,
@@ -146,7 +146,7 @@ struct FragmentState {
     inline: Option<InlineBuf>,
     cell: Option<InlineBuf>,
     marks: Vec<Mark>,
-    skipped_inline: usize,
+    clipped_marks: usize,
     skipped_blocks: usize,
     suppressed: String,
     lines: SourceLines,
@@ -185,7 +185,7 @@ impl<'a> Builder<'a> {
             inline: None,
             cell: None,
             marks: Vec::with_capacity(4),
-            skipped_inline: 0,
+            clipped_marks: 0,
             skipped_blocks: 0,
             suppressed: String::new(),
             lines: SourceLines::default(),
@@ -847,7 +847,8 @@ impl<'a> Builder<'a> {
         if ranges.is_empty() {
             return Ok(());
         }
-        let mut text = String::new();
+        let capacity = ranges.iter().map(|range| range.len() + 2).sum();
+        let mut text = String::with_capacity(capacity);
         for range in ranges {
             let piece = html::text_region(payload.get(range).unwrap_or_default());
             if piece.trim().is_empty() {
@@ -930,7 +931,7 @@ impl<'a> Builder<'a> {
             inline: self.inline.take(),
             cell: self.cell.take(),
             marks: std::mem::take(&mut self.marks),
-            skipped_inline: std::mem::take(&mut self.skipped_inline),
+            clipped_marks: std::mem::take(&mut self.clipped_marks),
             skipped_blocks: std::mem::take(&mut self.skipped_blocks),
             suppressed: std::mem::take(&mut self.suppressed),
             lines: std::mem::take(&mut self.lines),
@@ -952,7 +953,7 @@ impl<'a> Builder<'a> {
         self.inline = saved.inline;
         self.cell = saved.cell;
         self.marks = saved.marks;
-        self.skipped_inline = saved.skipped_inline;
+        self.clipped_marks = saved.clipped_marks;
         self.skipped_blocks = saved.skipped_blocks;
         self.suppressed = saved.suppressed;
         self.lines = saved.lines;
@@ -1008,7 +1009,7 @@ impl<'a> Builder<'a> {
         let Some(cell) = self.cell.take() else {
             return Ok(());
         };
-        let base = self.base_style(cell.kind());
+        let base = self.base_style(cell.kind);
         let content = cell.finish(&base, self.style).unwrap_or_default();
         let Some(table) = self.table.as_mut() else {
             return Ok(());
@@ -1054,7 +1055,9 @@ impl<'a> Builder<'a> {
                 .id(TABLE_ID),
             parent,
         )?;
-        let (header, rows, overflow) = buf.into_parts();
+        let header = buf.header;
+        let rows = buf.rows;
+        let overflow = buf.overflow;
         if let Some(header) = header {
             self.build_table_row(table, header, widths.as_deref())?;
         }
@@ -1114,8 +1117,7 @@ impl<'a> Builder<'a> {
                 row_node,
             )?;
             if !cell.is_empty() {
-                let (base, content) = cell.into_parts();
-                self.create_text_node(cell_node, &base, content, LogicalPx::ZERO)?;
+                self.create_text_node(cell_node, &cell.base, cell.content, LogicalPx::ZERO)?;
             }
         }
         self.build_node(
@@ -1134,27 +1136,23 @@ impl<'a> Builder<'a> {
     }
 
     fn start_mark(&mut self, mark: Mark) {
-        if self.skipped_inline > 0 {
-            self.skipped_inline += 1;
-            return;
-        }
-        if self.marks.len() >= MAX_INLINE_NESTING {
-            self.skipped_inline = 1;
+        if self.clipped_marks > 0 || self.marks.len() >= MAX_INLINE_NESTING {
+            self.clipped_marks += 1;
             return;
         }
         self.marks.push(mark);
     }
 
     fn end_mark(&mut self, mark: Mark) {
-        if self.skipped_inline > 0 {
-            self.skipped_inline -= 1;
+        if self.clipped_marks > 0 {
+            self.clipped_marks -= 1;
             return;
         }
         Mark::pop(&mut self.marks, mark);
     }
 
     fn start_image(&mut self, dest: &str) {
-        if self.skipped_inline > 0 || self.skipped_blocks > 0 {
+        if self.skipped_blocks > 0 {
             return;
         }
         self.image = Some(ImageBuf {
@@ -1230,7 +1228,7 @@ impl<'a> Builder<'a> {
     }
 
     fn write_inline(&mut self, text: &str, marks: Marks) {
-        if self.skipped_inline > 0 || text.is_empty() {
+        if text.is_empty() {
             return;
         }
         if self.skipped_blocks > 0 {
@@ -1245,9 +1243,6 @@ impl<'a> Builder<'a> {
     }
 
     fn push_break(&mut self) -> Result<(), EngineError> {
-        if self.skipped_inline > 0 {
-            return Ok(());
-        }
         if self.skipped_blocks > 0 {
             self.suppressed.push('\n');
             return Ok(());
@@ -1275,9 +1270,6 @@ impl<'a> Builder<'a> {
     }
 
     fn push_inline_html(&mut self, tag: &str) -> Result<(), EngineError> {
-        if self.skipped_inline > 0 {
-            return Ok(());
-        }
         match html::inline_tag(tag) {
             InlineTag::Open(mark) => self.start_mark(mark),
             InlineTag::Close(mark) => self.end_mark(mark),
@@ -1325,7 +1317,7 @@ impl<'a> Builder<'a> {
 
     fn flush_inline(&mut self) -> Result<(), EngineError> {
         self.marks.clear();
-        self.skipped_inline = 0;
+        self.clipped_marks = 0;
         let Some(inline) = self.inline.take() else {
             return Ok(());
         };
@@ -1333,7 +1325,7 @@ impl<'a> Builder<'a> {
             cell.extend(inline);
             return Ok(());
         }
-        let kind = inline.kind();
+        let kind = inline.kind;
         let base = self.base_style(kind);
         let Some(content) = inline.finish(&base, self.style) else {
             return Ok(());

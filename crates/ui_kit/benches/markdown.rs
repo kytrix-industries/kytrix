@@ -380,23 +380,23 @@ fn bench_plain_text_7kb(c: &mut Criterion) {
 }
 
 fn bench_build_7kb(c: &mut Criterion) {
+    let mut page_fixture = fixture(true);
+    report(&mut page_fixture, "build_7kb", RELEASE_EN);
     let mut root_fixture = fixture(false);
     report(
         &mut root_fixture,
         "build_7kb_window_root_context",
         RELEASE_EN,
     );
-    let mut fixture = fixture(true);
-    report(&mut fixture, "build_7kb", RELEASE_EN);
     c.bench_function("build_7kb", |b| {
         b.iter_custom(|iters| {
             let mut elapsed = Duration::ZERO;
             for _ in 0..iters {
                 let start = Instant::now();
-                let mut node = mount(&mut fixture, RELEASE_EN);
+                let mut node = mount(&mut page_fixture, RELEASE_EN);
                 elapsed += start.elapsed();
                 black_box(node.root());
-                node.release(fixture.app.app_mut());
+                node.release(page_fixture.app.app_mut());
             }
             elapsed
         });

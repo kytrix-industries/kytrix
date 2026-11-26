@@ -85,18 +85,15 @@ impl InlineImageSource {
         if let Some(size) = self.size {
             return size;
         }
-        let intrinsic = match self.format {
-            InlineImageFormat::Svg => None,
-            InlineImageFormat::Image => assets
-                .load(&self.path)
-                .as_deref()
-                .and_then(intrinsic_size)
-                .filter(|size| *size != LogicalSize::ZERO),
-        }
-        .unwrap_or(LogicalSize::new(
-            px(DEFAULT_IMAGE_SIZE),
-            px(DEFAULT_IMAGE_SIZE),
-        ));
+        let intrinsic = assets
+            .load(&self.path)
+            .as_deref()
+            .and_then(intrinsic_size)
+            .filter(|size| *size != LogicalSize::ZERO)
+            .unwrap_or(LogicalSize::new(
+                px(DEFAULT_IMAGE_SIZE),
+                px(DEFAULT_IMAGE_SIZE),
+            ));
 
         LogicalSize::new(
             intrinsic.width.max(px(MIN_INTRINSIC_SIZE)),
@@ -521,6 +518,24 @@ mod tests {
         assert_eq!(
             resolve("file://icons/phosphoricons/graph.svg"),
             LogicalSize::new(px(16.), px(16.))
+        );
+    }
+
+    #[test]
+    fn a_type_override_does_not_change_the_intrinsic_size() {
+        let resolve = |uri: &str| {
+            InlineImageSource::parse(uri)
+                .expect("the fixture URI should be usable")
+                .resolve(&EmbeddedAssets)
+        };
+
+        assert_eq!(
+            resolve("file://brands/Binance/binance.png?type=svg"),
+            LogicalSize::new(px(128.), px(128.))
+        );
+        assert_eq!(
+            resolve("file://brands/Ethereum/colored@72px.png?type=\"svg\""),
+            LogicalSize::new(px(44.), px(72.))
         );
     }
 

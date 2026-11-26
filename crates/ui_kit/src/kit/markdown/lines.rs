@@ -45,16 +45,15 @@ impl SourceLines {
         let bytes = source.as_bytes();
         let end = previous.end.min(bytes.len());
         let start = previous.start.min(end);
-        let from_line = match bytes[start..end].iter().rposition(|byte| !is_blank(*byte)) {
+        let from_line = match bytes[start..end]
+            .iter()
+            .rposition(|byte| !matches!(*byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
             Some(index) => self.line_of(start + index),
             None => self.line_of(start),
         };
         self.line_of(next_start).saturating_sub(from_line + 1)
     }
-}
-
-fn is_blank(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 #[cfg(test)]

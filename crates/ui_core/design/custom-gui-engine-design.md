@@ -3748,7 +3748,7 @@ impl App {
 | 旧模块（已删除） | 旧 `src/style/`（5 个模块 + `mod.rs`）、`src/` 顶层组件文件、旧 `src/markdown/`（9 文件）共 **37 个模块/目录、25,471 行**，已由 **P5-2**（`6239b84`）删除；`src/` 只剩 `kit/`、`theme/`、`lib.rs`（`style_builder.rs` 已由 B1b 迁入 `ui_core`，§12.7） |
 | 迁移形态裁决 | **模块级增量**：新模块用新路径与新 API，旧模块不改造、不桥接、不 re-export；**不是**公开 API 兼容层（AGENTS §1.1） |
 | 依赖 | `crates/ui_kit/Cargo.toml` 运行时只依赖 `ui_core`（构建期 `resvg`/`usvg`/`image`）；`gpui-kit` 已随 P5-2 删除，`grep -r gpui crates/ui_kit` = **0**（`cargo tree -p ui_kit \| grep gpui` 亦 0） |
-| 测试事实标准 | `cargo test -p ui_kit --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **779 passed**（其中 `kit::markdown` 189 条；本迁移 B1b 时点 765、P2 时点 1,139，markdown 重构后重新实测） |
+| 测试事实标准 | `cargo test -p ui_kit --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **782 passed**（其中 `kit::markdown` **192** 条；R3 基线 779 / 189，本轮最终修复新增 3 条；本迁移 B1b 时点 765、P2 时点 1,139，markdown 重构后重新实测） |
 
 #### 12.1.1 `kit/markdown` 的实际布局（R2 单提交 `9447be99` 落地，R3 `0973bda5` 补齐测试 / 门禁 / 夹具）
 
@@ -3761,20 +3761,20 @@ impl App {
 `gate_four_every_production_rich_text_parses_exactly_once_or_once_nested`、`gate_four_plain_text_counts_the_nested_html_parse`；
 生产富文本 = 1 次主解析，或 1 次主解析 + 有限次嵌套解析）。
 
-文件行数按 2026-11-26 工作树实测（R3 之后重新核对；为避免再次漂移，下表**只标函数 / 符号名与文件头常量段，不再写 `file:line`**）：
+文件行数为**最终值（随本轮最终提交核对）**（为避免再次漂移，下表**只标函数 / 符号名与文件头常量段，不再写 `file:line`**）：
 
 | 文件（实测算行） | 职责 |
 |---|---|
 | `markdown.rs`（186） | 自命名模块根 = 公开面：`MarkdownAssets` / `MarkdownStyle` / `MarkdownNode` / `plain_text` + 子模块声明（`mod assets;` … `#[cfg(test)] mod tests;`）+ 4 个主题常量（行高 1.4 / 装饰线宽 1 px / 背景内边距与圆角 2 px，集中在文件头的 `const` 段） |
-| `assets.rs`（582） | `file:` 行内图片源解析：显式 `?size`（1..256 clamp）> 图片内禀尺寸 > 16×16 回退；`InlineImageSource` 收为 `pub(super)`（类型声明与 `resolve()` 都在该文件） |
-| `build.rs`（1781） | 事件 → 节点树单遍构建：容器栈 / 行内缓冲刷新 / 空行 spacer 重建（`emit_blank_spacers`）/ 对齐窗口 / 嵌套上限 / 布局常量表（文件头常量段） |
+| `assets.rs`（597） | `file:` 行内图片源解析：显式 `?size`（1..256 clamp）> 图片内禀尺寸 > 16×16 回退；`InlineImageSource` 收为 `pub(super)`（类型声明与 `resolve()` 都在该文件） |
+| `build.rs`（1773） | 事件 → 节点树单遍构建：容器栈 / 行内缓冲刷新 / 空行 spacer 重建（`emit_blank_spacers`）/ 对齐窗口 / 嵌套上限 / 布局常量表（文件头常量段） |
 | `html.rs`（686） | HTML 块切片 + tokenizer（`classify` / `units` / 开闭标签 / 块类推断）+ 白名单映射 + 唯一嵌套解析入口（`HtmlBudget`）；`MAX_HTML_NESTED_PARSES` / `MAX_HTML_INNER_BYTES` / `MAX_HTML_BLOCK_BYTES` 在文件头常量段 |
-| `inline.rs`（258） | `InlineBuf` → `InlineContent`（`TextRun` + `InlineBoxSpec`）+ marks → `TextStyle` 映射（多装饰叠加 / run 背景 / 行内代码 mono）；入口 `InlineBuf::finish`、样式映射 `run_style` |
-| `lines.rs`（105） | `SourceLines`（行首表）+ 字节入参的空行计数（`blank_lines_between`） |
-| `plain.rs`（315） | `plain_text` 事件旁路（复用 `html` tokenizer 取标签内文字；表格 / 列表 / 代码块 / 图片跳过口径） |
-| `table.rs`（213） | 延迟建表 `TableBuf` / `CellBuf` + `End(Table)` 逐单元格 `measure_text(content, None)` 定列宽 + 行 / 列 / 溢出 / 测量字符上限（文件头常量段） |
-| `tests.rs`（1943） | 测试 harness（`mount` / `style` / `texts` / `tree_of` / `children` / `node_count` / `bounds` / `cell_widths` / `measured_width` 等）+ 子模块声明（测试根文件用自命名 `tests.rs` 而不是 `tests/mod.rs`，理由见 markdown 设计文档 §6.1） |
-| `tests/`（3,158） | `corpus` 1,008 / `gates` 406 / `ledger` 528 / `outline` 355 / `plain` 125 / `fixtures` 2 + 冻结夹具 `i18n_markdown` 387 / `legacy_plain_text` 347 |
+| `inline.rs`（254） | `InlineBuf` → `InlineContent`（`TextRun` + `InlineBoxSpec`）+ marks → `TextStyle` 映射（多装饰叠加 / run 背景 / 行内代码 mono）；入口 `InlineBuf::finish`、样式映射 `run_style` |
+| `lines.rs`（104） | `SourceLines`（行首表）+ 字节入参的空行计数（`blank_lines_between`） |
+| `plain.rs`（316） | `plain_text` 事件旁路（复用 `html` tokenizer 取标签内文字；表格 / 列表 / 代码块 / 图片跳过口径） |
+| `table.rs`（205） | 延迟建表 `TableBuf` / `CellBuf` + `End(Table)` 逐单元格 `measure_text(content, None)` 定列宽 + 行 / 列 / 溢出 / 测量字符上限（文件头常量段） |
+| `tests.rs`（1967） | 测试 harness（`mount` / `style` / `texts` / `tree_of` / `children` / `node_count` / `bounds` / `cell_widths` / `measured_width` 等）+ 子模块声明（测试根文件用自命名 `tests.rs` 而不是 `tests/mod.rs`，理由见 markdown 设计文档 §6.1） |
+| `tests/`（3,247） | `corpus` 1,024 / `gates` 431 / `ledger` 576 / `outline` 355 / `plain` 125 / `fixtures` 2 + 冻结夹具 `i18n_markdown` 387 / `legacy_plain_text` 347 |
 
 **spacer 的 flex 收缩（R3 已修复，不再是已知问题）**：spacer 节点（`MARKDOWN_SPACER`，每源码空行 1 个，`build.rs` 的
 `emit_blank_spacers`）除 `width_full + height(正文字行高)` 外**显式写 `flex_shrink = 0`**（`style.flex_shrink(0.0)`），
@@ -3822,7 +3822,7 @@ impl App {
 | `interactive` / `button` / `toggle` / `badge` / `progress` / `spinner` / `separator` / `empty_state` / `alert` / `tab_bar` | 状态（hover/pressed/focus/disabled/loading/selected）→ `StylePatch` + `A11yPatch`；150 ms hover 用 `Transient` + `App::animate`（不进依赖图） |
 | `list` / `table` / `tree` / `deque_*` / `scroll_bar` | 虚拟化行窗口 + E3 变高；行/单元格/树项**声明**集合角色（E9/E15 语义，§11.11/§11.15） |
 | `overlay` / `layer` / `tooltip` / `dialog` / `alert` / `menu` / `dropdown` / `select` / `context_menu` / `color_picker` | `Overlay` 栈 + 固定 z 层带（`View < Dialog < Alert < Popup < ContextMenu < Tooltip`）+ `Layer` 按窗口分区；`OverlaySurface::{dialog,menu}` 统一表面（双层阴影按旧值回填，E13 真实接入）；模态走 `trap_focus` + `restore_focus`（E12） |
-| `markdown` / `input` | markdown = `kit/markdown.rs`（公开面）+ 7 个子模块 + 自命名测试根 `tests.rs` + `tests/`（布局 / 职责 / 行数见 §12.1.1），pulldown-cmark 单遍事件→节点树（无持久 IR）。上限：块容器 `MAX_BLOCK_NESTING = 64`、行内 marks `MAX_INLINE_NESTING = 64`、表格 `MAX_TABLE_ROWS = 200` / `MAX_TABLE_COLUMNS = 20` / 溢出段 `MAX_TABLE_OVERFLOW_ROWS = 100` / 列宽测量只取单元格前 1024 字符、HTML 嵌套解析 `MAX_HTML_NESTED_PARSES = 16` / 内层字节 `MAX_HTML_INNER_BYTES = 64 KB`、HTML 配对三上限（单块标签 4096 / 单块 payload 256 KB / 每文档参与配对的标签总数 16384）。超限一律**保留文字**降级：块容器进抑制模式（不建节点、文本压进最深允许容器内的扁平 text 节点）、表格超出部分转纯文本段落、HTML 预算超限退化为纯文本段落 / 去标签保文字；只有 type 1–5 HTML 块与行内深嵌套是**有意的丢弃契约**（细则见 `crates/ui_kit/design/markdown-redesign-design.md` §5.8 / §5.9 / §10.1）。`input` 是应用层编辑状态机（IME / 水平滚动 / undo·redo / 拖选 / 双击选词），**不是**引擎能力 |
+| `markdown` / `input` | markdown = `kit/markdown.rs`（公开面）+ 7 个子模块 + 自命名测试根 `tests.rs` + `tests/`（布局 / 职责 / 行数见 §12.1.1），pulldown-cmark 单遍事件→节点树（无持久 IR）。上限：块容器 `MAX_BLOCK_NESTING = 64`、行内 marks `MAX_INLINE_NESTING = 64`、表格 `MAX_TABLE_ROWS = 200` / `MAX_TABLE_COLUMNS = 20` / 溢出段 `MAX_TABLE_OVERFLOW_ROWS = 100` / 列宽测量只取单元格前 1024 字符、HTML 嵌套解析 `MAX_HTML_NESTED_PARSES = 16` / 内层字节 `MAX_HTML_INNER_BYTES = 64 KB`、HTML 配对三上限（单块标签 4096 / 单块 payload 256 KB / 每文档参与配对的标签总数 16384）。超限一律**保留文字**降级：块容器进抑制模式（不建节点、文本压进最深允许容器内的扁平 text 节点）、表格超出部分转纯文本段落、HTML 预算超限退化为纯文本段落 / 去标签保文字；行内深嵌套超限只**截断 marks**、文字照常落地（不再丢子树文字，`markdown-redesign-design.md` §10.1-34）；只有 type 1–5 HTML 块是**有意的丢弃契约**；没有文档级节点上限（512 KB 纯 markdown 实测 68,324 节点，§10.1-35；细则见 `crates/ui_kit/design/markdown-redesign-design.md` §5.8 / §5.9 / §10.1）。`input` 是应用层编辑状态机（IME / 水平滚动 / undo·redo / 拖选 / 双击选词），**不是**引擎能力 |
 
 **`AnimationRouter`（唯一动画完成注册者，硬契约）**：引擎 `App::on_animation_complete` 是**单槽**（后注册覆盖）；kit 的
 `kit/overlay.rs` 里的 `AnimationRouter`（`Rc<RefCell<…>>`，`Clone + Default`）是**应用层唯一**注册者——`install(app)` 幂等装一次，
