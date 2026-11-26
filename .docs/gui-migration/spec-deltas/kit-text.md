@@ -239,10 +239,9 @@ selection_anchor / is_composing / is_focused / error / can_undo / can_redo`。�
    登记成 `ScrollAxis::Horizontal` 滚动容器；reveal 已由引擎接管（`ui_core::text_edit::ensure_visible`），
    组件 `sync` 只写滚动槽内容尺寸、不再计算 caret 滚动。引擎在 layout 之后把滚动槽 `content` 与
    聚焦 editable 已布局尺寸取并集（只放大不缩小），因此键入/删除/caret 移动当帧即可露出最新字符
-   （细节与测试见 `.docs/text-input-redesign-design.md` §11.12）。**caret/选区画布用屏幕绝对坐标**：
-   `Window::text_caret_rect` 已含祖先滚动偏移，选区矩形补「窗口绝对 − 局部」原点差即得屏幕坐标；
-   **不再减一次滚动偏移**（P2-3b 曾重复减，P2-3c 修正，见 §9）。点击/拖选用
-   `HitResult.local_point`（hit test 已做滚动换算）→ E5，不需要额外偏移。
+   （细节与测试见 `.docs/text-input-redesign-design.md` §11.12）。caret/选区/placeholder 由引擎绘制，
+   `Window::text_caret_rect` 返回**屏幕绝对坐标**（已含节点原点、内边距与祖先滚动偏移），kit 不再自行换算；
+   点击/拖选用 `HitResult.local_point`（hit test 已做滚动换算）→ E5，不需要额外偏移。
 10. **`sync`/`dispatch` 由外壳驱动**：见 §3.1。同窗多输入框的 IME 开关是**窗口级**状态
     （`App::set_ime_enabled`），本模块在"本输入框失焦"时关闭、"聚焦"时打开 ⇒ 外壳应只同步聚焦
     控件，或按"先失焦者、后得焦者"的顺序调用；登记为引擎缺口（per-node IME 无 API）。

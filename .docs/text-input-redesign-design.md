@@ -698,8 +698,9 @@ pub struct InputSpec {
 | P2 | `dfbf4f9c` | `ui_kit::input` 薄壳重写 + 18 处调用点迁移；删除旧状态机 |
 | P3 | `589a462a` | caret 闪烁时钟/唤醒、ensure-visible、多行 viewport + overlay ScrollBar |
 | P4 | `eee0f04e` + merge `cb965b56` | 彩色字形 RGBA 图集、`KIND_COLOR_GLYPH`、三端 pipeline/shader/contract、彩色 emoji golden |
+| reveal 同帧 | `baf08cee` + `2997e0b4` | 溢出输入框同帧 reveal（`grow_reveal_content`：滚动槽 `content` 与聚焦 editable 已布局尺寸取并集）、8 条用例、三端亚像素容差（§11.12） |
 
-### 11.2 已登记的设计偏差（①–㊾）
+### 11.2 已登记的设计偏差（①–㊿）
 
 | # | 偏差（相对本文 §3–§5） | 落地 |
 |---|---|---|
@@ -752,6 +753,7 @@ pub struct InputSpec {
 | ㊼ | a11y **action 优先级例外登记**：可编辑节点的 `SetTextSelection` / `ReplaceSelectedText` 由引擎**先于**应用 handler 接管（`editable_action` 在 `run_handler` 之前返回），其余 action 仍是 handler 优先；与 §4.12「a11y 文本动作由引擎处理」一致 | P4-59 |
 | ㊽ | §5.1 的**组合 setter 拆分落地**：placeholder 文本与颜色拆成 `text_edit_set_placeholder` / `text_edit_set_placeholder_color`；**没有** `EditableColors` 打包类型（四个独立 `text_edit_set_*_color`）；submit 无运行期 setter（⑰）。§5.1 / §5.2 已按实际落地改写 | P4-35 |
 | ㊾ | **多行输入折行语义补齐（break-word）**：`TextWrap` 新增 `BreakWord` = CSS `text-wrap: wrap` + `overflow-wrap: break-word`——只在整词放不进一行时按 atom 边界**应急断行**，**不改变 min-content / max-content**（区别于既有 `Anywhere` 的 `word-break: break-all`，其 min-content 会压到单 atom）；`ui_kit` 多行输入默认 `BreakWord`、单行仍 `NoWrap`；`ShapedText::measure` 的「窄宽 ≤ min-content 直接返回 min-content 尺寸」快路径对 `BreakWord` 关闭（无断行机会的串 min-content == max-content == 未断行整行宽，否则节点高停在 1 行、后续行被裁）；legacy `TextWrap::Wrap`（`overflow-wrap: normal`）语义不变，`ContentWidths` 也不变；数字快速路径把 `BreakWord` / `Anywhere` 判 ineligible（单行假设不成立）；run 级仍只下发收紧属性（`NoWrap` / `Anywhere`），`wrap` 归属整段兜底样式（`crates/ui_core/design/custom-gui-engine-design.md` §11.2 语义 1） | 本轮修复（`.review/text-input/wrapfix-report.md`） |
+| ㊿ | **reveal 的 clamp 上界取并集**：引擎在算 reveal 几何之前，把「聚焦 editable 的最近滚动祖先」滚动槽 `content` 与该 editable 已布局外接尺寸按轴取 `max` 写回（引擎内部直写 `ScrollSlot.content`、只放大不缩小），宿主帧前 hook 写入的上一帧内容尺寸因此不再延迟 reveal——键入/删除/caret 移动/粘贴/IME 提交当帧即可完整露出最新字符；不新增公开 API，kit 的 `set_scroll_content` 写入保留且与引擎侧数值一致（删字收缩仍沿用「下一帧由宿主缩小」的既有节奏），拖拽自动滚动仍使用宿主 `content`（沿用现状） | `baf08cee`（§11.12） |
 
 ### 11.3 最终公开 API 清单
 
@@ -884,8 +886,8 @@ setter 一致）、`kit::ScrollBar` 的 `ScrollbarOptions::tab_stop(bool)`；输
   ui_core 整改批次），criterion 打印的 `change:` 百分比对照的是那份陈旧基线，**不作为本轮
   A/B 证据**（例如 `idle_frame` 会显示 +71.8%，而绝对耗时只有 432 ns）。
 
-head `92b573cb`（P4 遗留清零轮实测 head；该 head 之后未再复核计数，§11.12 修复新增 8 条用例后的 Windows 计数见 §11.12）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
-> **计数口径（P4-72）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的最终实测值（head `92b573cb`，其后的文档修正不改变计数）；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，属环境差异。**本节计数已非当前口径**：§11.12 的 reveal 修复新增 4 条 `ui_core`(test-support) + 4 条 `ui_kit` 用例，Windows 实测 2673 / 763（workspace 按 +8 推算 8932），当前口径见 §11.12。
+本表为 **P4 遗留清零轮（head `92b573cb`）** 的三端验收数据；其中 Windows 三行在 wrapfix `2cb3abad`（多行 break-word 修复）时刷新为 2328/2669/759，而 Ubuntu `2432`、macOS `2397` 仍是 `92b573cb` 时值、wrapfix 后未复测，属历史混排（已登记为 P4）；判据为 0 failed、clippy/fmt exit 0、gallery 门槛。
+> **计数口径（P4-72，历史）**：本节与 §11.9 的「测试通过数 / 二进制数」为 P4 遗留清零轮的实测值（head `92b573cb`：lib 2315、test-support 2656、ui_kit 758；wrapfix `2cb3abad` 后 Windows 为 2328/2669/759），其后的文档修正不改变计数；`cargo test --workspace` 的 8924 为本机 Windows 末次全量结果，llama_sys CUDA 冷构建可能使该命令在 CI/新环境长时间占用，属环境限制。三端 nightly 版本不同导致 clippy 命中项差异，属环境差异。**本节计数已非当前口径**：§11.12 的 reveal 修复新增 4 条 `ui_core`(test-support) + 4 条 `ui_kit` 用例，当前三端口径见 §11.12。
 
 **Windows（全工作区）**
 
@@ -1115,8 +1117,8 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 
 | 项 | 状态 |
 |---|---|
-| §11.7 / §11.9 三端测试计数（P4-72） | 已按实测回填（Windows workspace 8924/0/30、lib 2328、TS 2669；Ubuntu lib 2111；macOS lib 207562、TS 2397） |
-| 旧计数口径 | 各轮历史记录保留原值供追溯；当前口径以 §11.12 的本提交实测（Windows 2328/2673/763/236；workspace 按 +8 推算 8932）为准，§11.7 / §11.9 为 P4 遗留清零轮历史 head `92b573cb` 口径；不得引用更早的 `2062/2386/748`、`2027/2351/748`、`2067/2392/752`、`2032/2357/752` |
+| §11.7 / §11.9 三端测试计数（P4-72，**历史**） | 已按实测回填（head `92b573cb`：Windows workspace 8924/0/30、lib 2315、test-support 2656、ui_kit 758；Ubuntu lib 2111、test-support 2432；macOS lib 2075、test-support 2397）；Windows 的 2328/2669/759 为 wrapfix `2cb3abad` 刷新值 |
+| 旧计数口径 | 各轮历史记录保留原值供追溯；**当前口径以 §11.12 的三端实测为准**（Windows 2328/2673/763/236、Ubuntu 2111/2449/763、macOS 2075/2414/763），§11.7 / §11.9 为历史 head 口径；不得引用更早的 `2062/2386/748`、`2027/2351/748`、`2067/2392/752`、`2032/2357/752` |
 
 ### 11.12 输入 reveal 同帧性修复（溢出时最新输入的字符不再等下一次 caret 闪烁）
 
@@ -1126,12 +1128,12 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 
 **修法**（`ui_core::text_edit::grow_reveal_content`）：在 `ensure_visible` 算 reveal 几何**之前**，把聚焦 editable 的**最近滚动祖先**滚动槽 `content` 与该 editable 已布局外接尺寸按轴取 `max` 写回（引擎内部直接写 `ScrollSlot.content`，不重入 `App::set_scroll_content`，与虚拟列表同一先例——`crates/ui_core/design/custom-gui-engine-design.md` §11.3 第 6 条 `:3084`）；**只放大不缩小**，不新增公开 API、不新增整形/布局工作、不新增提交帧（`scroll_to` 既有的 `request_frame` 唤醒仍由下一帧 a11y-only 分支吸收）。kit 侧 `set_scroll_content` 写入保留：修复后两侧数值一致、无振荡；删字收缩仍沿用「下一帧由宿主缩小」的既有节奏。
 
-**语义**：reveal 的 clamp 上界 = `max(滚动槽 content, 聚焦 editable 已布局外接尺寸)` 的并集，因此「宿主内容滞后」不再延迟 reveal——键入/删除/caret 移动/粘贴/IME 提交当帧即可把最新字符完整落入视口。偏差登记：待 §11.2 新增 **㊿**（clamp 上界取并集 + 引擎内部写最近滚动祖先 `content`；偏差行由 Lead 在提交后统一补行）。
+**语义**：reveal 的 clamp 上界 = `max(滚动槽 content, 聚焦 editable 已布局外接尺寸)` 的并集，因此「宿主内容滞后」不再延迟 reveal——键入/删除/caret 移动/粘贴/IME 提交当帧即可把最新字符完整落入视口。偏差登记：§11.2 **㊿**。
 
 **测试**（修复前 RED = 引擎 3 条新用例 + 改写后的 retries 用例 + kit 4 条；修复后 GREEN。`ensure_visible_keeps_a_larger_host_content_when_it_reveals` 是**负向守卫**：修复前后皆 GREEN，其判别力来自「缩小语义」变异 M2）：
 
 - 引擎（`ui_core::app::text_edit_p3_tests`）：`ensure_visible_reveals_a_typed_character_in_one_frame_when_the_host_content_lags`（单行水平单帧）、`ensure_visible_reveals_a_typed_line_in_one_frame_when_the_host_content_lags`（多行垂直单帧）、`ensure_visible_never_grows_an_outer_scroll_content`（嵌套滚动只动最近祖先、外层 `content` 不变）；`ensure_visible_keeps_a_larger_host_content_when_it_reveals` 为「只放大不缩小」的负向守卫（修复前即 GREEN，缩小语义变异 M2 可令其 RED）；原 `ensure_visible_retries_once_when_the_scroll_content_was_stale` 的首帧预期正是本条缺陷，改写为 `ensure_visible_retries_once_when_the_scroll_content_changes_after_the_first_reveal`（覆盖「内容尺寸后续变化时补一次 reveal、稳定后不再滚」，变异 M8 可令其 RED）。
-- kit（`ui_kit::kit::input::tests`）：`typing_into_an_overflowing_single_line_field_reveals_the_newest_character_in_one_frame`、`typing_wide_cjk_characters_reveals_the_newest_character_in_one_frame`、`typing_into_an_overflowing_masked_field_reveals_the_newest_character_in_one_frame`（ASCII / CJK 宽字符 / 掩码各连续键入 20 字符，每次 `type_text` 后**单帧**断言 caret 屏幕矩形完整落在 viewport 内、滚动槽 `content.width` 等于已布局 editable 宽度且 `offset.x == content.width − viewport.width`）、`typing_at_the_bottom_of_a_visible_lines_field_keeps_the_caret_visible_in_one_frame`（多行末行继续输入 40 字符，纵向单帧）。
+- kit（`ui_kit::kit::input::tests`）：`typing_into_an_overflowing_single_line_field_reveals_the_newest_character_in_one_frame`、`typing_wide_cjk_characters_reveals_the_newest_character_in_one_frame`、`typing_into_an_overflowing_masked_field_reveals_the_newest_character_in_one_frame`（ASCII / CJK 宽字符 / 掩码各连续键入 20 字符，每次 `type_text` 后**单帧**断言 caret 屏幕矩形完整落在 viewport 内、滚动槽 `content.width` 与已布局 editable 宽度在 0.01 px 容差内相等、`offset.x` 与 `content.width − viewport.width` 在 0.01 px 容差内相等——布局/滚动派生浮点用亚像素容差，caret 可见性与「只放大不缩小」等行为判据保持精确）、`typing_at_the_bottom_of_a_visible_lines_field_keeps_the_caret_visible_in_one_frame`（多行末行继续输入 40 字符，纵向单帧）。
 
 **已知边界/前提**：
 
@@ -1141,7 +1143,18 @@ P4-6（恒 `mirror_dirty=true`）→ 目标测试全部变红，每项 `restored
 
 **性能**（Windows 本机 debug 构建，单行溢出输入连续键入 200 次、每次 1 帧；同机先后 3 次取中位数）：修复前 **591.12 ms**、修复后 **592.61 ms**（+0.25%，噪声量级）；每键入帧的提交帧数修复前后均 **1**（`scroll_to` 的既有 `request_frame` 唤醒被下一帧的 a11y-only 分支吸收，不增加提交帧），键入停止后连续 `drain` 到 `Drained::Idle`（0 额外提交帧）。修复后末态 `offset.x = 1367.91`（= 当帧内容宽 − 视口宽），修复前为 `1362.60`（滞后一个字符宽）。
 
-**本提交验收（Windows，`fix/typing-reveal`）**：`ui_core --lib` **2328 passed + 1 ignored**；`ui_core --features test-support --lib` **2673 passed + 1 ignored**；`ui_kit --lib` **763 passed**；`settings_ui` **236 passed**；`cargo test --workspace` 本轮未实跑，按新增 8 条用例推算 **8932**。Ubuntu / macOS 数字由 Lead 合并后补。§11.7 / §11.9 的 2328/2669/759/8924 是 P4 遗留清零轮历史 head `92b573cb` 口径，保留供追溯，不再作为当前口径。
+**本提交验收（三端，head `2997e0b4`；本小节为当前口径）**：
+
+| 平台 | `ui_core --lib` | `ui_core --features test-support --lib` | `ui_kit --lib` | `settings_ui` | clippy `-D warnings` | `fmt --check` |
+|---|---|---|---|---|---|---|
+| Windows（WARP） | **2328 + 1 ignored** | **2673 + 1 ignored** | **763** | **236** | exit 0 | exit 0 |
+| Ubuntu（Wayland/Vulkan） | **2111** | **2449** | **763** | 未跑（既有 Linux 债务） | exit 0 | exit 0 |
+| macOS（ssh 无 GUI 会话） | **2075** | **2414** | **763** | 未跑 | exit 0 | exit 0 |
+
+- Windows 集成用例 frame_record **8** / layout **4** / snapshot **14** 全绿；gallery `--idle-check` **0 帧/3 s**、`--theme-check` **0 failure**；`editable --wrap-probe` 40 个 `。` → 4 行、无水平溢出。
+- Ubuntu gallery `--idle-check` **1 帧/3 s**（门槛 ≤2）、`--theme-check` **0 failure**。
+- 三端首次验收时 Ubuntu 曾红 1 条：`typing_wide_cjk_characters_reveals_the_newest_character_in_one_frame` 的 `offset.x == content.width − viewport.width` 精确浮点相等在 Linux clamp 舍入下差 3e−5 px；`2997e0b4` 把该组布局/滚动派生浮点断言改为 0.01 px 亚像素容差（Ubuntu 上 RED → GREEN 已实测），行为判据未放宽。
+- `cargo test --workspace` 本轮未实跑，按新增 8 条用例在 Windows 8924 基础上推算 **8932**。§11.7 / §11.9 保留为历史 head 数据（见其注）。
 
 ## 附录 A：关键证据索引
 
