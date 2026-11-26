@@ -1146,7 +1146,7 @@ fn columns(translate: &Translate) -> impl Iterator<Item = Column> + '_ {
     ]
     .into_iter()
     .zip(COLUMN_WEIGHTS)
-    .map(|(header, weight)| Column::flex(header, weight).align(ColumnAlign::Start))
+    .map(|(header, weight)| Column::flex(header, weight, LogicalPx::ZERO).align(ColumnAlign::Start))
 }
 
 fn table_options(row_height: LogicalPx) -> TableOptions {
@@ -2618,7 +2618,10 @@ mod tests {
         for (index, column) in table.columns().iter().enumerate() {
             assert_eq!(
                 column.width,
-                ui_kit::kit::table::ColumnWidth::Flex(COLUMN_WEIGHTS[index]),
+                ui_kit::kit::table::ColumnWidth::Flex {
+                    weight: COLUMN_WEIGHTS[index],
+                    min_width: LogicalPx::ZERO
+                },
                 "column {index} keeps its declared width weight"
             );
             assert_eq!(column.align, ColumnAlign::Start);

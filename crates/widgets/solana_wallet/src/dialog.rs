@@ -973,7 +973,7 @@ impl DialogState {
                 &self.input_placeholder,
             )
         };
-        input.install(app);
+        input.install(app)?;
         let submit_input = input.clone();
         let submit_addresses = self.addresses;
         let submit_limit = self.limit;

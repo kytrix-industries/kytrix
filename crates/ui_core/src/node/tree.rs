@@ -1246,7 +1246,25 @@ impl NodeTree {
     pub(crate) fn scroll_slot_mut(&mut self, node: NodeId) -> Option<&mut ScrollSlot> {
         content::scroll_slot_mut(self, node)
     }
+    pub(crate) fn clear_scroll(&mut self, node: NodeId) {
+        if let Some(target) = self.arena.get_mut(node)
+            && let Some(interaction) = target.interaction.as_deref_mut()
+        {
+            interaction.scroll = None;
+        }
+        if self.scroll_containers.contains(&node) {
+            self.scroll_containers
+                .retain(|container| *container != node);
+            self.scroll_reg_epoch = self.scroll_reg_epoch.wrapping_add(1);
+        }
+    }
     #[must_use]
+    #[cfg(any(test, feature = "test-support", feature = "automation"))]
+    pub fn scroll_proxy(&self, node: NodeId) -> Option<NodeId> {
+        content::scroll_proxy(self, node)
+    }
+    #[must_use]
+    #[cfg(not(any(test, feature = "test-support", feature = "automation")))]
     pub(crate) fn scroll_proxy(&self, node: NodeId) -> Option<NodeId> {
         content::scroll_proxy(self, node)
     }

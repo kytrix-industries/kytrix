@@ -325,7 +325,7 @@ impl PageView for TranslationPage {
                         &placeholder,
                     )
                 };
-                input.install(app);
+                input.install(app)?;
                 input.set_submit_on_blur(true);
                 let _ = input.sync(app);
                 *directory_sink.borrow_mut() = Some(input);

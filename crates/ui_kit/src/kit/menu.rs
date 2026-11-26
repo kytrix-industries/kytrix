@@ -2639,4 +2639,72 @@ mod tests {
             "行声明 ListBoxOption"
         );
     }
+
+    fn find_debug_id(app: &ui_core::app::App, window: WindowId, id: &str) -> Option<NodeId> {
+        let tree = app.window(window)?.tree();
+        let mut stack = vec![tree.root()];
+        while let Some(node) = stack.pop() {
+            if tree.debug_id(node) == Some(id) {
+                return Some(node);
+            }
+            if let Ok(entry) = tree.get(node) {
+                stack.extend(entry.children().iter().copied());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn menu_panel_wheel_over_bar_scrolls_the_panel_list() {
+        let mut harness = Harness::new();
+        let entries: Vec<MenuEntry> = (0..40)
+            .map(|index| {
+                MenuEntry::Action(MenuAction::new(
+                    smol_str::format_smolstr!("row.{index}"),
+                    smol_str::format_smolstr!("行 {index}"),
+                ))
+            })
+            .collect();
+        let menu = harness.menu(entries, MenuOptions::default().max_height(px(120.0)));
+        assert!(harness.open(&menu), "菜单已打开");
+        let track = find_debug_id(
+            harness.app.app(),
+            harness.window,
+            "menu:panel:list:scrollbar:track",
+        )
+        .expect("menu 面板滚动条轨道");
+        let bounds = harness.app.probe().bounds(track).expect("track bounds");
+        let point = LogicalPoint::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        assert_eq!(
+            harness.app.probe().hit(point).map(|hit| hit.node),
+            Some(track),
+            "滚轮落点必须命中面板滚动条轨道"
+        );
+        let before = menu
+            .inner
+            .panel
+            .list()
+            .offset(harness.app.app())
+            .unwrap_or(px(0.0));
+        let _ = harness.app.inject(InputEvent::scroll_lines(
+            point,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            Modifiers::empty(),
+        ));
+        let _ = harness.app.drain().expect("frame");
+        let _ = menu.sync(harness.app.app_mut());
+        let after = menu
+            .inner
+            .panel
+            .list()
+            .offset(harness.app.app())
+            .unwrap_or(px(0.0));
+        assert!(
+            after > before,
+            "面板滚动条上的滚轮必须滚面板列表：{before} -> {after}"
+        );
+    }
 }

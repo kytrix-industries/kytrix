@@ -18,7 +18,7 @@ unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-ui_core = { workspace = true, features = ["test-support"] }
+ui_core = { workspace = true, features = ["test-support", "automation"] }
 
 [lints]
 workspace = true

@@ -718,7 +718,7 @@ impl FormBuild<'_> {
                 .tree_mut();
             input::build(tree, wrapper, spec, self.theme, &state, &placeholder)
         };
-        input.install(app);
+        input.install(app)?;
 
         let theme = self.theme.clone();
         layout::build_node(app, self.window, wrapper, move |tree, parent| {

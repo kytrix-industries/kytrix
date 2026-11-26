@@ -1171,6 +1171,10 @@ impl App {
         scroll::scroll_state(self, handle)
     }
 
+    pub fn clear_scroll(&mut self, handle: &ScrollHandle) -> Result<(), EngineError> {
+        scroll::clear_scroll(self, handle)
+    }
+
     pub fn make_virtual_list(
         &mut self,
         window: WindowId,

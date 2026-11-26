@@ -558,6 +558,7 @@ impl App {
 | `ScrollBar` | `attach` 只记 `ScrollHandle`；`ScrollbarAxis::point` 清零另一轴 | `attach -> Result` 并设 track 代理；`release` 清理；`point(current, offset)` 只改本轴；`Table`/`Input` 见 §4.7 |
 | `Table` | `Geometry` 只存 outer/body/header_row | 增加 `header: Option<NodeId>`；attach 后设 header 代理 |
 | `App::scroll_to_animated` | 计划保留公共/`pub(crate)` 包装 | **删除（裁决 C：滚动动画能力移除）**；程序化滚动统一 `scroll_to`（立即），无替代动画 API |
+| `App::clear_scroll` | —（无此 API） | `fn(&mut self, handle: &ScrollHandle) -> Result<(), EngineError>`：**清除该节点滚动槽**；供 `Input::attach` 失败路径清理已建槽（最小公共 API，不引入回滚框架）；**不请求帧**、不 damage、不更新 a11y |
 | `app::input` | P2 曾提升模块可见性 | **模块保持私有**；仅窄导出 `refresh_hover_under_pointer`（`pub(crate)`）供 `interaction/scroll.rs` 调用 |
 
 ### 5.3 删除（不保留兼容层）
@@ -575,7 +576,8 @@ impl App {
 - 不新增 crate；`ScrollAxes` 用普通枚举，不引入 `bitflags` 也足够（`bitflags` 已在依赖图内，但避免为二值集合引入新习惯）。
 - 错误：窗口/节点/目标非滚动容器复用 `EngineError::{UnknownWindow, StaleNode, NotScrollable}`；**自指或后代目标新增 `EngineError::InvalidScrollProxy { node, target }`**（语义明确的强类型错误；不复用 `NotScrollable` 误导调用方）。
 - `set_scroll_proxy` 校验顺序：窗口 → 节点 → 目标存在且拥有 `ScrollSlot` → 自指拒绝 → 后代目标拒绝（`tree.is_ancestor(node, target)`）；任一步失败不产生半写状态。
-- `ScrollBar::attach` 改为 `Result<(), EngineError>`（现有调用点多为 `let _ = ...` 或 `.expect`，由调用方处理）；`release` 内部只忽略 `StaleNode`。
+- `ScrollBar::attach` 改为 `Result<(), EngineError>`（现有调用点多为 `let _ = ...` 或 `.expect`，由调用方处理）；`release` 内部只忽略 `StaleNode`。**attach 失败语义**：先全部校验（窗口/节点/目标 `ScrollSlot`）再一次性写 proxy/句柄，**失败无半写**；`release` 对已释放/失效节点幂等（K8/K18 覆盖）。
+- **`Input::attach` 失败传播**：不吞错，向上返回 `EngineError`；**`Table::attach` 失败回滚**：list/header proxy/vbar/hbar 任一步失败时清理已建 proxy、release 已 attach 的 bar 后再返回，后续 `release` 幂等（P3 收口，见 §6 P3 注）。
 - 不给 `ScrollConfig`/`ScrollState` 增加“策略/优先级”字段（D5 未选）。
 
 ### 5.5 调用点迁移清单（编译期穷举）
@@ -586,7 +588,7 @@ impl App {
 | `ui_core::interaction/scroll.rs` | `max_offset`/`clamp_offset` 双轴；`scroll_ancestor_on` **已删除（P1）**；测试槽构造换 `axes` |
 | `ui_core::app/input.rs` | **P1 就要改**（否则删 `ScrollAxis` 后不编译）：`on_scroll`/`default_key_scroll` 的单轴 match 机械改为 `axes`（旧链式保留）；P2 再整体重写 `on_scroll`，并把 `InputEvent::Scroll.timestamp` 透传到 `App::on_scroll`（当前 `input.rs:167-182` 用 `..` 丢弃）；**模块保持私有**，仅窄导出 `refresh_hover_under_pointer`（`pub(crate)`）供 `interaction/scroll.rs` |
 | `ui_core::app.rs` | `App::on_scroll` 签名加 `timestamp`；删除 `App::scroll_animation_target` 包装（`app.rs:1005-1007`） |
-| `ui_core::app/scroll.rs` | `make_scroll` 校验/写入 `axes`；`scroll_to` 双轴夹紧；`ScrollState.axes` |
+| `ui_core::app/scroll.rs` | `make_scroll` 校验/写入 `axes`；`scroll_to` 双轴夹紧；`ScrollState.axes`；**新增 `App::clear_scroll`（清滚动槽、失败路径清理、不请求帧）** |
 | `ui_core::app/virtual_list.rs` | `VirtualListConfig.content_width`；`ScrollSlot { axes: Vertical | Both }`（`content_width=Some` 时 Both）；三处 `scroll.content` 写入保留横向内容宽（`content_width.unwrap_or(viewport.width)`） |
 | `ui_core::app/animation.rs` | 删除 `scroll_animation_target` **与 `AnimationTarget::Scroll`**（滚动动画能力删除，裁决 C）；动画系统仅保留 UI 动画（`AnimatedValue` 等） |
 | `ui_core::text_edit.rs` | **P1 已收口**：`scroll_ancestor_on` 已删除（P1），reveal/ensure-visible 改走 `scroll::scroll_ancestors` + 轴过滤；**单行 `Both` 横向优先、多行 `Both` 纵向优先**（`text_edit.rs:3580-3598` 的 preferred 顺序、`:4216`/`:4234` 的 reveal 分支）；多行 `Both` 若横向 overflow 也 reveal 横向（P1 收口）；**生产 `Input` 仍只建单轴槽**（单行 `Horizontal` / 多行 `Vertical`），`Both` 仅出现在测试/未来双轴输入；`match slot.axis` 已改 `axes` |
@@ -658,17 +660,21 @@ impl App {
 | P3-1 ScrollBar 代理 | `attach -> Result` 设 track 代理；`release` 清除；`ScrollbarAxis::point(current, offset)` 保留另一轴 | K1/K2/K6/K7b/K8 绿；**删除 K1/K2 的 `#[ignore]`，默认 `cargo test` 必须运行并通过，`--ignored` 不再出现 K1/K2（E2/E4/E5/E6 已在 P2 删除；合计 6 条全部消失）** |
 | P3-2 Table header / Input clear 代理 | Table header 代理接线（**header 节点由 P3-7 创建**，本项只 `set_scroll_proxy` + K4 验收；`Geometry.header` 由 P3-7 记录）；clear 在 `set_clearable` 生命周期接线（不在 `install_scroll`） | K3/K4/K5/K10 绿 |
 | P3-3 双轴演示 + 页面 bar | gallery ⑦ 双轴 + 两条 bar；外层页面可见 bar | 真实窗口两轴可滚、拖垂直条 x 不变、拖水平条 y 不变、页面 bar 与内容同步 |
-| P3-4 `--wheel-check` | 进程内注入滚轮，断言内容/条/边界/双轴/hover；失败统一走退出码 3；**必须在 `--idle-check` 基线（1 s）之前完成并在基线前排空其滚动/淡入帧** | 三端（至少 Windows）PASS；与 `--idle-check` 分进程运行；组合模式（若加）有明确时序 |
-| P3-5 应用层 bar 接线 | settings/updater/candlestick/widget_gallery | 编译 + 各自最小用例/手测 |
+| P3-4 `--wheel-check` | 进程内注入滚轮，断言内容/条/边界/双轴/hover/**宽表 G7–G9（含水平条 track 滚轮 + thumb 拖动）**；失败统一走退出码 3；**必须在 `--idle-check` 基线（1 s）之前完成并在基线前排空其滚动/淡入帧** | **P3 收口 PASS**：三端（至少 Windows）`gallery --wheel-check` G1–G9（**37 断言**）；与 `--idle-check` 分进程运行（idle frames 0） |
+| P3-5 应用层 bar 接线 | settings/updater/candlestick/widget_gallery | **P3 收口**：`cargo check --workspace` PASS；各应用最小用例/手测 PASS（`P3/gates.txt`） |
 | P3-6 `Column` API（addendum §3.3/§3.10，AD4 增量） | `ColumnWidth::Flex { weight, min_width }`、`Column::flex(header, weight, min_width: LogicalPx)`（无默认/无链式）、`contribution()`、`span_cell_style` 重写、`TableInner.content_width` | K11/K12 绿；17 处 `Column::flex` 全部显式给值；table 宽度断言重算 |
-| P3-7 Table sticky + 双 bar（addendum §3.4/§3.6/§3.8，AD2/AD3 增量） | outer/header/header_content 结构、sticky 写（`sticky_x` + `NodeTree::set_style`）、List `scrollbar:false`、Table 自管垂直/水平 bar + rail 尾隙、`Table::sync` 聚合 | K13–K17、K19、K21 绿；K9 几何守卫不回归 |
+| P3-7 Table sticky + 双 bar（addendum §3.4/§3.6/§3.8，AD2/AD3 增量） | outer/header/header_content 结构、sticky 写（`sticky_x` + `header_width` 双 Cell + `NodeTree::set_style`；**width 写 `max(content_width, viewport.width)`**）、List `scrollbar:false`、Table 自管垂直/水平 bar + rail 尾隙、`Table::sync` 聚合（含 resize 宽→窄夹回） | K13–K17、K19、K21 绿；K15 覆盖窄/宽视口列对齐 + header y 固定 + resize 稳态；K9 几何守卫不回归 |
 | P3-8 代理扩展（addendum §3.4，对 P3-1/P3-2 的增量） | 两条 bar 的 track 代理到 list viewport（P3-1 的 `attach` 已接线）；header 代理下横向滚轮也生效；确认表头无自身 `ScrollSlot` | K15/K16/K18、K4 保持 |
-| P3-9 gallery 宽表（addendum §4，增量） | ⑩ 宽表（窄 420 / 宽 1100 对照，三参数列配置）；G7–G9 **追加到 P3-4 的 `--wheel-check`** | 三端至少 Windows 真机 PASS |
+| P3-9 gallery 宽表（addendum §4，增量） | **⑩ 宽表**（窄 420 / 宽 1100 对照，三参数列配置）；旧 **⑩–⑮ 顺延为 ⑪–⑯**（共 16 sections）；G7–G9 **追加到 P3-4 的 `--wheel-check`** | **P3 收口 PASS**：三端至少 Windows 真机（`P3/wheel.log`） |
 | P3-10 调用点迁移（addendum §3.10，AD1/AD4 增量） | 17 处 `Column::flex` 显式最小宽（widget 按旧密度取值并逐点记录）、`ListOptions`/`VirtualListConfig` 字面量、Table bar 归属；**与 P3-6 同提交**（避免两次迁移） | 编译零 warning；各 widget 最小用例/手测；`TableOptions` 不加字段 |
 
 > 编号对齐：本表 P1-5/P1-6、P2-6/P2-7、P3-6…P3-10 与 `scroll-routing-addendum.md` §5 一一对应，无重复编号。依赖顺序：P3-7（节点结构）→ P3-2（header 代理）/P3-8（bar 代理验收）；P3-6 与 P3-10 同提交；P3-9 的检查项挂在 P3-4。
 
-**文件作用域**：`crates/ui_kit/src/kit/{scroll_bar,list,table,input,tree,menu,dropdown}.rs`（含测试；`table.rs` 为 sticky/双 bar/Column API 主要落点，`list.rs` 为 `content_width` 通道）、`crates/ui_kit/examples/gallery.rs`（目录 ⑩ + `--wheel-check`）、`crates/ui_kit/Cargo.toml`（dev-dependency 增加 `automation` feature，仅测试/示例构建）、**addendum 迁移**：`crates/widgets/{force_order,financial_index,financial_calendar,hyperliquid_wallet,market_trade,watch_list}/**`、`crates/settings_ui/src/pages/proxy/table.rs`（仅 `Column::flex` 第三参数与按需 min_width；不改其滚动接线）、应用层各自 scroll 接线文件。
+**文件作用域**：`crates/ui_kit/src/kit/{scroll_bar,list,table,input,tree,menu,dropdown}.rs`（含测试；`table.rs` 为 sticky/双 bar/Column API 主要落点，`list.rs` 为 `content_width` 通道）、`crates/ui_kit/examples/gallery.rs`（目录 ⑩ + `--wheel-check`）、`crates/ui_kit/Cargo.toml`（dev-dependency 增加 `automation` feature，仅测试/示例构建）、**addendum 迁移**：`crates/widgets/{force_order,financial_index,financial_calendar,hyperliquid_wallet,market_trade,watch_list}/**`、`crates/settings_ui/src/pages/proxy/table.rs`（仅 `Column::flex` 第三参数与按需 min_width；不改其滚动接线）、**应用层 bar 接线**：`crates/settings_ui/src/layout.rs`、`crates/updater_ui/src/dialog.rs`、`crates/widget_gallery_ui/src/gallery.rs`、`crates/widgets/candlestick/src/panel/view.rs`、**`Input::install -> Result` 调用点迁移（P3 编译必需，非可选）**：`crates/instrument_selector_ui/src/{instrument_selector.rs,prediction_selector.rs}`、`crates/settings_ui/src/{layout.rs,settings.rs,pages/proxy/editor.rs,pages/translation/page.rs,pages/venues/credentials.rs}`、`crates/ui_kit/src/kit/{alert.rs,color_picker.rs}`、`crates/widget_gallery_ui/src/gallery.rs`、`crates/widgets/candlestick/src/panel/{inputs.rs,rows.rs}`、`crates/widgets/{ethereum_wallet,financial_index,hyperliquid_wallet,solana_wallet,x}/src/dialog.rs`、`crates/ui_kit/examples/gallery.rs`（共 18 个文件；`crates/ui_kit/src/kit/input.rs` 的测试 `.install(...).expect(...)` 随同文件迁移）、**平台事件泵**：`crates/ui_core/src/platform/windows/event_loop/pump.rs`（P3 实际 diff 的 3 行 close/gate 修复；不改变滚动路由语义）。
+
+> **P3 错误语义收口**：① `Input::attach` 失败**向上传播**（不吞错；调用方拿到 `EngineError`）；② `ScrollBar::attach` 先全部校验（窗口/节点/目标槽）后一次性写入，**失败无半写**（不残留 proxy/信号/句柄），`release` 对已释放/失效节点幂等；③ `Table::attach` 任一步（list/header proxy/vbar/hbar）失败时**回滚已建部分**（清 proxy、release 已 attach 的 bar）并返回错误，后续 `release` 幂等；④ `Input::attach` 失败清理调用新增 `App::clear_scroll(&handle)` 清除已建滚动槽（不请求帧），不引入回滚框架。验收：K8/K18 + 各 attach 用例 + 变异自检。
+
+> **P3 README 偏差（`P3/README.txt`）**：偏差 1“header_content 初始 width=content_width”在宽视口会与表体错位 ⇒ 实现为 `Table::sync` 写 `width=max(content_width, viewport.width)`（本文件 §3.4 已同步）；偏差 2“resize 宽→窄”：虚拟列表 x 不在引擎 `clamp_scroll_offsets` 的 `scroll_containers` 内，kit 在 `Table::sync` 用 `scroll_to` 夹回，同帧可能错位 1 帧后收敛（addendum R1）。
 
 > **ignore 清理合并门禁（P2+P3）**：默认 `cargo test` 必须运行并通过，`--ignored` 不再出现 E2/E4/E5/E6/K1/K2 共 6 条（P2 删 4 条、P3 删 2 条）；每阶段删除后立即跑默认与 `--ignored` 两套并记录 commit。
 
@@ -742,25 +748,39 @@ P1 的调用点迁移是机械但面广的步骤，必须独立提交、先保�
 
 | ID | 用例 | 断言 | 当前 |
 |---|---|---|---|
-| K1 | `list_wheel_over_track_scrolls_list_not_page` | page 0，list 动 | **红**（P0 已 `#[ignore]`，P3 转绿） |
-| K2 | `list_wheel_over_thumb_scrolls_list` | 同上 | **红**（P0 已 `#[ignore]`，P3 转绿） |
-| K3 | `multiline_input_wheel_over_bar_scrolls_input` | input 动，page 0 | **红** |
-| K4 | `table_header_wheel_scrolls_body` | body 动，page 0；`Table::Geometry.header` 已存 | **红** |
-| K5 | `input_clear_button_wheel_scrolls_input` | 在 `set_clearable(true)` 后创建按钮的场景下，input 动、page 0 | **红** |
-| K6 | `menu_panel_wheel_over_bar_scrolls_panel_list` | 面板列表动 | **红** |
-| K7 | `dual_axis_demo_bars_scroll_both_axes` | 两条 bar 各自轴生效 | **红** |
-| K7b | `dual_axis_scrollbar_preserves_other_axis` | 拖垂直条 x 不变；拖水平条 y 不变 | 绿（P1 已加 ScrollBar 组件级 track click + thumb drag 测试；P3 仍补 Table/代理完整 K7b） |
-| K8 | `scrollbar_release_clears_proxy_and_is_safe` | 重复 release 幂等；卸载后不 panic | **红** |
+| K1 | `list_wheel_over_track_scrolls_list_not_page` | page 0，list 动 | 绿（P0 基线红并 `#[ignore]`；P3 去 ignore 收口转绿） |
+| K2 | `list_wheel_over_thumb_scrolls_list` | 同上 | 绿（P0 基线红并 `#[ignore]`；P3 去 ignore 收口转绿） |
+| K3 | `multiline_input_wheel_over_bar_scrolls_input` | input 动，page 0 | 绿（P3 收口） |
+| K4 | `table_header_wheel_scrolls_body` | body 动，page 0；`Table::Geometry.header` 已存 | 绿（P3 收口） |
+| K5 | `input_clear_button_wheel_scrolls_input` | 在 `set_clearable(true)` 后创建按钮的场景下，input 动、page 0 | 绿（P3 收口） |
+| K6 | `menu_panel_wheel_over_bar_scrolls_panel_list` | 面板列表动 | 绿（P3 收口） |
+| K7 | `dual_axis_demo_bars_scroll_both_axes` | 两条 bar 各自轴生效 | 绿（P3 收口；gallery G5 + K7b 共同覆盖） |
+| K7b | `dual_axis_scrollbar_preserves_other_axis` | 拖垂直条 x 不变；拖水平条 y 不变 | 绿（P1 组件级 + P3 Table/代理完整 K7b） |
+| K8 | `scrollbar_release_clears_proxy_and_is_safe` | 重复 release 幂等；卸载后不 panic | 绿（P3 收口） |
 | K9 | `scrollbar_geometry_unchanged_by_proxy` | thumb/track 几何与旧断言一致 | 绿（守卫） |
-| K10 | `proxy_target_disabled_or_hidden_is_skipped` | track 可见、target 禁用/隐藏时不滚目标，继续向外层 | **红** |
-| G1 | `--wheel-check`：内容点 | 只滚内层 | **红** |
-| G2 | `--wheel-check`：条/表头/clear 点 | 只滚所属容器 | **红** |
-| G3 | `--wheel-check`：边界 | 同序列不滚外层；停顿后滚外层 | **红** |
-| G4 | `--wheel-check`：hover | 滚动后 hover 更新 | **红** |
-| G5 | `--wheel-check`：双轴 | ⑦ 两轴都可滚 | **红** |
-| G6 | `--wheel-check` 后独立运行 `--idle-check` | 无额外帧 | 守卫（分进程） |
+| K10 | `proxy_target_disabled_or_hidden_is_skipped` | track 可见、target 禁用/隐藏时不滚目标，继续向外层 | 绿（P3 收口） |
+| K11 | `table_content_width_is_fixed_sum_plus_flex_min_sum` | Σ Fixed + Σ Flex min；span 覆盖列仍计入 | 绿（P3 收口） |
+| K12 | `flex_columns_require_an_explicit_min_width` | 三参数构造；无默认/无链式；`ColumnWidth::Flex { weight, min_width }` | 绿（P3 收口） |
+| K13 | `wide_viewport_shows_no_horizontal_bar` | hbar 不可滚、thumb 不可见、`max_x == 0` | 绿（P3 收口） |
+| K14 | `narrow_viewport_shows_horizontal_bar_with_the_remaining_range` | hbar 可滚、`max_x == content - viewport` | 绿（P3 收口） |
+| K15 | `sticky_header_follows_the_list_offset_and_columns_align` | x/width 同步（width=max(content,viewport)）、窄/宽视口列对齐、header y 固定、resize 稳态 | 绿（P3 收口） |
+| K16 | `wheel_over_header_scrolls_body_and_not_the_page` | 表头水平滚轮滚表体；页面不动 | 绿（P3 收口） |
+| K17 | `two_axis_drags_do_not_reset_each_other`（含 K7b） | 两轴拖拽互不重置 | 绿（P3 收口） |
+| K18 | `table_release_clears_header_proxy_and_is_idempotent` | header proxy 清除、两 bar 释放、重复 release 幂等 | 绿（P3 收口） |
+| K19 | `horizontal_scroll_state_keeps_both_axes_after_rewindowing` | rewindow/extents 后 content 宽保持、axes=Both | 绿（P3 收口） |
+| K20 | `table_horizontal_a11y_exposes_both_axes` | x_max>0、orientation None、无额外滚动容器、表头/表体 a11y 对齐 | 绿（P3 收口） |
+| K21 | `scrollbar_tail_gaps_do_not_overlap` | 垂直条底 4px、水平条右 4px、二者不相交 | 绿（P3 收口） |
+| G1 | `--wheel-check`：内容点 | 只滚内层 | 绿（P3 收口） |
+| G2 | `--wheel-check`：条/表头/clear 点 | 只滚所属容器 | 绿（P3 收口） |
+| G3 | `--wheel-check`：边界 | 同序列不滚外层；停顿后滚外层 | 绿（P3 收口） |
+| G4 | `--wheel-check`：hover | 滚动后 hover 更新 | 绿（P3 收口） |
+| G5 | `--wheel-check`：双轴 | ⑦ 两轴都可滚 | 绿（P3 收口） |
+| G6 | `--wheel-check` 后独立运行 `--idle-check` | 无额外帧 | 绿（P3 收口，idle frames 0） |
+| G7 | `--wheel-check`：宽表窄视口 | 内容/表头/水平条 track 滚轮/thumb 拖动；表头与表体同帧同偏移 | 绿（P3 收口） |
+| G8 | `--wheel-check`：宽表宽视口 | 不出现水平条；垂直滚轮只滚表体；页面不动 | 绿（P3 收口） |
+| G9 | `--wheel-check`：表头/表体列对齐 | 滚动后表头/表体同列屏幕 x 差为 0 | 绿（P3 收口） |
 
-> K7b 分两段：P1 已覆盖 ScrollBar 组件级 track click / thumb drag 的“保留另一轴”行为（`ScrollbarAxis::point(current, offset)`），状态转绿；P3 仍补 Table 双轴 + 代理链路的完整 K7b（拖垂直条 x 不变、拖水平条 y 不变，含 header 镜像偏移与双 bar 归属）。
+> **P3 收口实测（2026-11-26，含 `App::clear_scroll` 收口）**：`ui_core` lib **2744 passed / 1 ignored**、`ui_kit` lib **796 passed / 0 ignored**（K1/K2 已去 `#[ignore]`；含 `clear_scroll` 清理用例）；`gallery --wheel-check` PASS（G1–G9 **37 断言**）、`--idle-check` idle frames 0；`cargo check --workspace`/clippy/fmt PASS。**P3 门禁改动集 37 文件**；本轮收口后工作区 **40 文件**（含 `clear_scroll` 测试）。P0 基线（K1/K2 `#[ignore]`、K3–K10 红）作为历史保留在 §7.2 状态列；证据 `E:\kytrix-scratch\scroll-impl\P3\`（README 由 fixer 记录）。K11–K21 详细断言见 `scroll-routing-addendum.md` §3.11。
 
 ### 7.3 手工验收矩阵（真实窗口）
 

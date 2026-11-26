@@ -1410,7 +1410,7 @@ fn table_columns(translate: &Translate) -> impl Iterator<Item = Column> + '_ {
         } else {
             ColumnAlign::End
         };
-        Column::flex(header, weight).align(align)
+        Column::flex(header, weight, LogicalPx::ZERO).align(align)
     })
 }
 

@@ -274,12 +274,26 @@ impl ScrollBar {
         Ok(track)
     }
 
-    pub fn attach(&self, app: &mut App, window: WindowId, scroll_node: NodeId) {
-        let handle = app.scroll_handle(window, scroll_node);
+    pub fn attach(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        scroll_node: NodeId,
+    ) -> Result<(), EngineError> {
+        let handle = app
+            .scroll_handle(window, scroll_node)
+            .ok_or(EngineError::NotScrollable { node: scroll_node })?;
+        let track = self
+            .inner
+            .geometry
+            .borrow()
+            .track
+            .ok_or(EngineError::StaleNode { node: scroll_node })?;
+        app.set_scroll_proxy(window, track, Some(scroll_node))?;
         {
             let mut geometry = self.inner.geometry.borrow_mut();
             geometry.window = Some(window);
-            geometry.handle = handle;
+            geometry.handle = Some(handle);
         }
         let track = self.clone();
         app.on_action(self.inner.track_action.clone(), move |ctx| {
@@ -290,9 +304,17 @@ impl ScrollBar {
         app.on_action(self.inner.drag_action.clone(), move |ctx| {
             drag.on_thumb_drag(ctx);
         });
+        Ok(())
     }
 
     pub fn release(&self, app: &mut App) -> usize {
+        let (window, track) = {
+            let geometry = self.inner.geometry.borrow();
+            (geometry.window, geometry.track)
+        };
+        if let (Some(window), Some(track)) = (window, track) {
+            detach_proxy(app, window, track);
+        }
         app.off_action(&self.inner.track_action);
         app.off_action(&self.inner.thumb_action);
         app.off_action(&self.inner.drag_action);
@@ -520,6 +542,18 @@ impl ScrollBar {
                 let _ = ctx.app_mut().release_pointer(window);
             }
         }
+    }
+}
+
+pub(crate) fn detach_proxy(app: &mut App, window: WindowId, node: NodeId) {
+    if let Err(error) = app.set_scroll_proxy(window, node, None) {
+        debug_assert!(
+            matches!(
+                error,
+                EngineError::StaleNode { .. } | EngineError::UnknownWindow { .. }
+            ),
+            "detaching a scroll proxy must tolerate unloaded nodes: {error}"
+        );
     }
 }
 
@@ -828,11 +862,12 @@ mod ui_tests {
     use std::time::Duration;
 
     use ui_core::{
+        error::EngineError,
         event::{Action, InputEvent, Modifiers, PointerButton},
         interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
         math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
-        paint::style_builder::StyleBuilder,
+        paint::{style::StylePatch, style_builder::StyleBuilder},
         test_support::app::TestApp,
     };
 
@@ -896,7 +931,8 @@ mod ui_tests {
             let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
             bar.build(tree, container).expect("scrollbar");
         }
-        bar.attach(app.app_mut(), window, container);
+        bar.attach(app.app_mut(), window, container)
+            .expect("scrollbar attach");
         let mut harness = ScrollHarness {
             app,
             bar,
@@ -1370,8 +1406,12 @@ mod ui_tests {
             vertical.build(tree, outer).expect("垂直滚动条");
             horizontal.build(tree, outer).expect("水平滚动条");
         }
-        vertical.attach(app.app_mut(), window, container);
-        horizontal.attach(app.app_mut(), window, container);
+        vertical
+            .attach(app.app_mut(), window, container)
+            .expect("vertical attach");
+        horizontal
+            .attach(app.app_mut(), window, container)
+            .expect("horizontal attach");
         let mut harness = BothAxesHarness {
             app,
             vertical,
@@ -1564,5 +1604,284 @@ mod ui_tests {
             after_horizontal.y, after_vertical.y,
             "水平滑块拖动不得清掉纵向偏移：{after_horizontal:?}"
         );
+    }
+
+    struct PageBarHarness {
+        app: TestApp,
+        bar: ScrollBar,
+        page: ScrollHandle,
+        inner: ScrollHandle,
+    }
+
+    enum TargetState {
+        Active,
+        Hidden,
+        Disabled,
+    }
+
+    fn page_bar_harness(state: TargetState) -> PageBarHarness {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let root = app.app().window(window).expect("window").tree().root();
+        let page = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .id("page")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .width(px(360.0))
+                        .height(px(240.0))
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("page")
+        };
+        let page_handle = app
+            .app_mut()
+            .make_scroll(window, page, ScrollConfig::default())
+            .expect("page scroll");
+        app.app_mut()
+            .set_scroll_content(&page_handle, LogicalSize::new(px(360.0), px(2_000.0)))
+            .expect("page content");
+        let inner = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            let builder = NodeBuilder::boxed().id("inner").style(
+                StyleBuilder::new()
+                    .relative()
+                    .width(px(200.0))
+                    .height(px(120.0))
+                    .overflow_hidden()
+                    .build(),
+            );
+            let builder = match state {
+                TargetState::Active => builder,
+                TargetState::Hidden => builder.bind_style(|_| StylePatch {
+                    visible: Some(false),
+                    ..StylePatch::default()
+                }),
+                TargetState::Disabled => builder.bind_style(|_| StylePatch {
+                    interactive: Some(false),
+                    ..StylePatch::default()
+                }),
+            };
+            builder.build(tree, page).expect("inner")
+        };
+        let inner_handle = app
+            .app_mut()
+            .make_scroll(window, inner, ScrollConfig::default())
+            .expect("inner scroll");
+        app.app_mut()
+            .set_scroll_content(&inner_handle, LogicalSize::new(px(200.0), px(400.0)))
+            .expect("inner content");
+        let bar = ScrollBar::new(
+            app.app_mut(),
+            theme,
+            "page-bar",
+            ScrollbarAxis::Vertical,
+            ScrollbarOptions::default(),
+        );
+        {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            bar.build(tree, page).expect("bar");
+        }
+        bar.attach(app.app_mut(), window, inner)
+            .expect("bar attach");
+        let mut harness = PageBarHarness {
+            app,
+            bar,
+            page: page_handle,
+            inner: inner_handle,
+        };
+        settle_page_bar(&mut harness);
+        harness
+    }
+
+    fn settle_page_bar(harness: &mut PageBarHarness) {
+        for _ in 0..4 {
+            let _ = harness.app.drain().expect("frame");
+            let _ = harness.bar.sync(harness.app.app_mut()).expect("sync");
+        }
+        let _ = harness.app.drain().expect("frame");
+    }
+
+    fn wheel_point(harness: &PageBarHarness) -> LogicalPoint {
+        let (track, _) = harness.bar.nodes();
+        let track = track.expect("track");
+        let bounds = harness.app.probe().bounds(track).expect("track bounds");
+        LogicalPoint::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        )
+    }
+
+    fn wheel(harness: &mut PageBarHarness, point: LogicalPoint) {
+        let _ = harness.app.inject(InputEvent::scroll_lines(
+            point,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            Modifiers::empty(),
+        ));
+    }
+
+    fn offsets(harness: &PageBarHarness) -> (LogicalPoint, LogicalPoint) {
+        let inner = harness
+            .app
+            .app()
+            .scroll_state(&harness.inner)
+            .expect("inner state")
+            .offset;
+        let page = harness
+            .app
+            .app()
+            .scroll_state(&harness.page)
+            .expect("page state")
+            .offset;
+        (inner, page)
+    }
+
+    #[test]
+    fn scrollbar_release_clears_the_proxy_and_is_safe() {
+        let mut harness = page_bar_harness(TargetState::Active);
+        let point = wheel_point(&harness);
+        assert_eq!(
+            harness.app.probe().hit(point).map(|hit| hit.node),
+            harness.bar.nodes().0,
+            "滚轮落点必须命中轨道"
+        );
+        wheel(&mut harness, point);
+        let (inner, page) = offsets(&harness);
+        assert!(inner.y > px(0.0), "代理生效：滚轮滚内层");
+        assert_eq!(page, LogicalPoint::ZERO, "不得滚外层页面");
+
+        let released = harness.bar.release(harness.app.app_mut());
+        assert!(released > 0, "释放回收滚动条状态");
+        assert_eq!(
+            harness.bar.release(harness.app.app_mut()),
+            0,
+            "重复释放幂等"
+        );
+        harness.app.advance(Duration::from_millis(300));
+        wheel(&mut harness, point);
+        let (inner_after, page_after) = offsets(&harness);
+        assert_eq!(inner_after, inner, "释放后内层不再被滚动条代理");
+        assert!(
+            page_after.y > page.y,
+            "释放后滚轮继续落到外层页面：{page:?} -> {page_after:?}"
+        );
+        let window = harness.app.window_id();
+        harness
+            .app
+            .app_mut()
+            .remove_node(window, harness.bar.nodes().0.expect("track"))
+            .expect("remove track");
+        assert_eq!(
+            harness.bar.release(harness.app.app_mut()),
+            0,
+            "节点卸载后释放不 panic"
+        );
+        let _ = harness.app.drain().expect("frame");
+    }
+
+    #[test]
+    fn proxy_target_that_is_hidden_or_disabled_is_skipped() {
+        for state in [TargetState::Hidden, TargetState::Disabled] {
+            let mut harness = page_bar_harness(state);
+            let point = wheel_point(&harness);
+            wheel(&mut harness, point);
+            let (inner, page) = offsets(&harness);
+            assert_eq!(inner, LogicalPoint::ZERO, "不可见/禁用的目标不得滚动");
+            assert!(page.y > px(0.0), "候选被跳过后继续向外层页面滚动：{page:?}");
+        }
+    }
+
+    #[test]
+    fn attach_validates_the_target_before_writing_its_geometry() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let root = app.app().window(window).expect("window").tree().root();
+        let container = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .id("proxy-target")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .width(px(200.0))
+                        .height(px(100.0))
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("container")
+        };
+        let handle = app
+            .app_mut()
+            .make_scroll(window, container, ScrollConfig::default())
+            .expect("scrollable");
+        app.app_mut()
+            .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
+            .expect("content");
+        let bare = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .id("bare")
+                .style(StyleBuilder::new().width(px(40.0)).height(px(40.0)).build())
+                .build(tree, root)
+                .expect("bare")
+        };
+        let bar = ScrollBar::new(
+            app.app_mut(),
+            theme,
+            "validated",
+            ScrollbarAxis::Vertical,
+            ScrollbarOptions::default(),
+        );
+        let error = bar
+            .attach(app.app_mut(), window, container)
+            .expect_err("未构建的滚动条不得 attach");
+        assert!(
+            matches!(error, EngineError::StaleNode { node } if node == container),
+            "未构建必须报 StaleNode(target)：{error:?}"
+        );
+        assert_eq!(bar.nodes(), (None, None), "失败不得写 geometry");
+        {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            bar.build(tree, container).expect("scrollbar");
+        }
+        let track = bar.nodes().0.expect("track");
+        let error = bar
+            .attach(app.app_mut(), window, bare)
+            .expect_err("非滚动目标不得 attach");
+        assert!(
+            matches!(error, EngineError::NotScrollable { node } if node == bare),
+            "非滚动目标必须报 NotScrollable：{error:?}"
+        );
+        assert!(
+            bar.thumb_rect(app.app()).is_none(),
+            "代理失败不得半写 geometry"
+        );
+        {
+            let tree = app.app().window(window).expect("window").tree();
+            assert!(
+                tree.scroll_proxy(track).is_none(),
+                "代理失败不得注册 track 代理"
+            );
+        }
+        bar.attach(app.app_mut(), window, container)
+            .expect("合法目标 attach");
+        {
+            let tree = app.app().window(window).expect("window").tree();
+            assert_eq!(
+                tree.scroll_proxy(track),
+                Some(container),
+                "attach 成功后 track 代理到滚动目标"
+            );
+        }
+        assert!(bar.thumb_rect(app.app()).is_some());
+        assert!(bar.release(app.app_mut()) > 0);
+        assert_eq!(bar.release(app.app_mut()), 0, "重复释放幂等");
     }
 }

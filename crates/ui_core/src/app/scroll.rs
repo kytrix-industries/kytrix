@@ -229,3 +229,16 @@ pub(crate) fn scroll_state(app: &App, handle: &ScrollHandle) -> Option<ScrollSta
         axes: slot.axes,
     })
 }
+
+pub(crate) fn clear_scroll(app: &mut App, handle: &ScrollHandle) -> Result<(), EngineError> {
+    let window = handle.window();
+    let node = handle.node();
+    let Some(target) = app.windows.get_mut(&window) else {
+        return Ok(());
+    };
+    if target.tree().get(node).is_err() {
+        return Err(EngineError::StaleNode { node });
+    }
+    target.tree_mut().clear_scroll(node);
+    Ok(())
+}

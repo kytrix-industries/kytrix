@@ -106,7 +106,7 @@ impl FieldInput {
         parent: ui_core::node::id::NodeId,
         field: &InputField,
         suffix: &str,
-    ) -> Self {
+    ) -> Result<Self, ui_core::error::EngineError> {
         let theme: ThemeHandle = cx.theme().clone();
         let name = cx.unique_key(suffix);
         let text = period_text(field.period);
@@ -129,8 +129,8 @@ impl FieldInput {
             submit: None,
         });
         let node = kit_input::build(cx.tree_mut(), parent, spec, &theme, &state, &placeholder);
-        node.install(cx.app_mut());
-        Self {
+        node.install(cx.app_mut())?;
+        Ok(Self {
             key: InputKey {
                 id: field.id,
                 row: field.row,
@@ -143,7 +143,7 @@ impl FieldInput {
             scope,
             last_text: text,
             last_focused: false,
-        }
+        })
     }
 
     pub(super) fn sync(

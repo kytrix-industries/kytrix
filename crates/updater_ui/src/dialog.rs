@@ -511,7 +511,7 @@ fn build_notes(
         ScrollbarOptions::default(),
     );
     let _ = scrollbar.build(tree_mut(app, window)?, scrollbar_band)?;
-    scrollbar.attach(app, window, viewport);
+    scrollbar.attach(app, window, viewport)?;
     widgets.scrollbar = Some(scrollbar);
 
     if !plan.install_supported {

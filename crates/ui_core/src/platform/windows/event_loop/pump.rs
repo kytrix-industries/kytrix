@@ -720,6 +720,9 @@ pub(super) fn pump_loop(
             }
         }
 
+        if app_cell.borrow().windows().next().is_none() {
+            return Ok(());
+        }
         let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if result.0 == 0 {
             return Ok(());

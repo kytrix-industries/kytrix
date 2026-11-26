@@ -411,7 +411,7 @@ pub(crate) fn scroll_region(
     build_node(app, window, outer, |tree, parent| {
         bar.build(tree, parent).map(|_| parent)
     })?;
-    bar.attach(app, window, viewport);
+    bar.attach(app, window, viewport)?;
 
     Ok((handle, content, bar))
 }

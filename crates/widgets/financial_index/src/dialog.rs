@@ -618,7 +618,7 @@ impl SelectorState {
                 &self.input_placeholder,
             )
         };
-        filter.install(app);
+        filter.install(app)?;
         self.input = Some(filter);
 
         let count = self.count;

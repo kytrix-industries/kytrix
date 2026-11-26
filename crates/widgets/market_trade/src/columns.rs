@@ -105,7 +105,9 @@ pub(super) fn columns(headers: [SmolStr; COLUMN_COUNT]) -> Vec<Column> {
     headers
         .into_iter()
         .zip(COLUMN_WEIGHTS)
-        .map(|(header, weight)| Column::flex(header, weight).align(ColumnAlign::End))
+        .map(|(header, weight)| {
+            Column::flex(header, weight, LogicalPx::ZERO).align(ColumnAlign::End)
+        })
         .collect()
 }
 

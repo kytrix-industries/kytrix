@@ -379,7 +379,8 @@ pub struct Column {
 ├── {key}:header             header（flex_none, width_full, height=header_height+1,
 │                                    overflow_hidden(Clip::Bounds), relative）★
 │   └── {key}:header:content header_content（absolute; top=0; left=-list.offset.x〔Table::sync 写入〕;
-│                                           width=content_width; height=100%; flex_col）
+│                                           width=max(content_width, viewport.width)〔Table::sync 写入〕;
+│                                           height=100%; flex_col）
 │       ├── {key}:header:row header_row（flex_row, width_full, height=header_height）
 │       │   └── 各表头单元格（span_cell_style，与表体同构）
 │       └── divider（width_full, height=1）
@@ -395,15 +396,15 @@ pub struct Column {
 
 ★ 为本次新增/修改的样式（`relative` 用于给绝对定位装饰提供包含块，依据 `layout/taffy_tree.rs:587-615`；List 的 outer 也是这么做的，`list.rs:570-582`）。
 
-- **sticky 语义**：`header` 是 `body` 的兄弟，位于布局上方 ⇒ 垂直位置天然固定（不随 List 纵向滚动）；`header_content` 的水平位置由 `Table::sync` 写成 `left = -List.offset.x`，被 `header` 的 `Clip::Bounds` 裁剪 ⇒ 表头在视觉上横向跟随表体、纵向固定。
-- **水平偏移唯一真源 = 表体 `List` 的 `ScrollSlot.offset.x`**。表头**没有 `ScrollSlot`**、没有镜像滚动槽、没有代理目标写入；`Table::sync` 只做“读 x → 写 `header_content.style.inset_left(-x)`”。AD3 所说的“`Table::sync` 写入 header”落地为写入 `header` 的内容子节点（`header` 容器本身不动，负责背景与裁剪），语义上即“表头横向偏移由 Table 按 List offset 写入”。
-- **写入机制（不新增引擎 API）**：`Table::sync` 在 `&mut NodeTree` 上 `let mut style = tree.get(header_content)?.style().clone();` → `style.position(Position::Absolute); style.inset_top(px(0)); style.inset_left(px(-x));` → `tree.set_style(header_content, style)?;`。`set_style` 只用既有公共 API（`node/tree.rs:528-530`、`paint/style.rs:56-59`、`:296-314`）；变化时才写（`TableInner.sticky_x: Cell<LogicalPx>` 记录上次值），静止时不触发布局（`node/tree/layout.rs:54-56` 的相等短路）。
-- **同步时机**：Windows 事件泵先 `app.run_frame_hook()`（gallery `tick` → `Table::sync`）再 `frame_all`（`platform/windows/event_loop/pump.rs:646-654`）。滚动在输入阶段写入 List offset，故**同一帧**绘制前 header_content 已更新。`Table::sync` 在写入后调用 `app.request_frame()`（幂等；正常路径 `scroll_to` 已请求）。
-- **resize 行为**：窗口变宽时帧内 `clamp_scroll_offsets`（`app/frame.rs:151-155`、`app/scroll.rs:153-178`）把 `List.offset.x` 夹小；该帧的 `Table::sync` 发生在夹紧之前，header 的 x 仍是旧值 ⇒ **可能有一帧表头/表体错位**，下一帧收敛。缓解：`Table::sync` 用当前 `scroll_state.viewport` 先按 `max_x = max(0, content - viewport)` 预夹紧 x（视图尺寸在 resize 帧仍是旧布局值，无法完全消除一帧）；测试断言“稳态无错位”，R1 记录。
+- **sticky 语义**：`header` 是 `body` 的兄弟，位于布局上方 ⇒ 垂直位置天然固定（不随 List 纵向滚动，K15 断言纵向滚动后表头 y 不变）；`header_content` 的水平位置由 `Table::sync` 写成 `left = -List.offset.x`，宽度写成 `max(content_width, viewport.width)`，被 `header` 的 `Clip::Bounds` 裁剪 ⇒ 表头在视觉上横向跟随表体、纵向固定、宽视口下与表体同宽（列表行宽同为 `max(视口, content_width)`，否则宽视口列会错位）。
+- **水平偏移唯一真源 = 表体 `List` 的 `ScrollSlot.offset.x`**。表头**没有 `ScrollSlot`**、没有镜像滚动槽、没有代理目标写入；`Table::sync` 做两件事：① 读 x（超界时先 `scroll_to` 夹回 `[0, max_x]`）→ 写 `header_content.style.inset_left(-x)`；② 读 `state.viewport.width` → 写 `header_content.style.width = max(content_width, viewport.width)`（viewport 宽变化时也写）。AD3 所说的“`Table::sync` 写入 header”落地为写入 `header` 的内容子节点（`header` 容器本身不动，负责背景与裁剪），语义上即“表头横向偏移与宽度由 Table 按 List offset/viewport 写入”。
+- **写入机制（不新增引擎 API）**：`Table::sync` 在 `&mut NodeTree` 上 `let mut style = tree.get(header_content)?.style().clone();` → `style.position(Position::Absolute); style.inset_top(px(0)); style.inset_left(px(-x)); style.width_length(width);` → `tree.set_style(header_content, style)?;`。`set_style` 只用既有公共 API（`node/tree.rs:528-530`、`paint/style.rs:56-59`、`:296-314`）；x 与 width 都变化时才写（`TableInner.sticky_x`/`header_width: Cell<LogicalPx>` 双短路），静止时不触发布局（`node/tree/layout.rs:54-56` 的相等短路）。
+- **同步时机**：Windows 事件泵先 `app.run_frame_hook()`（gallery `tick` → `Table::sync`）再 `frame_all`（`platform/windows/event_loop/pump.rs:646-654`）。滚动在输入阶段写入 List offset，故**同一帧**绘制前 header_content 已更新。`Table::sync` 在写入后调用 `app.request_frame()`（幂等；正常路径 `scroll_to`/`request_repaint` 已请求）。
+- **resize 行为（P3 收口实测）**：虚拟列表 viewport 未纳入引擎 `clamp_scroll_offsets` 的 `scroll_containers`（`make_virtual_list` 只记 `virtual_containers`），因此**引擎不会在 resize 后夹紧虚拟列表的 x**；kit 侧在 `Table::sync` 中检测 `offset.x > max_x` 时用 `scroll_to` 夹回，并同步写 header 的 x/width。宽→窄 resize 的同一帧内可能有一帧错位，下一帧/夹回后收敛；K15 断言 resize 稳态列对齐（`P3/README.txt` 偏差 2，R1）。
 - **为什么不是“把 header 放进 List viewport”**（v1 镜像槽之外的另一种 sticky 实现，被否决）：① 行由虚拟列表在 attach 后惰性挂载，树顺序上晚于 header ⇒ 行会盖住 header，引擎没有 z-index；② 需要每帧写 `top = offset.y`（纵向 pin），且 header 仍要 `Clip::Bounds`，收益不抵成本。
 - **为什么删除镜像 `ScrollSlot`（AD3）**：镜像槽会让表头成为第二个滚动容器（目标解析、a11y、拖拽都要特判）；sticky 方案下表头不是滚动容器，`List.offset.x` 是唯一状态。
 - **header 仍做纵向代理**：`App::set_scroll_proxy(header, Some(list_viewport))`。表头单元格上的滚轮候选链：cell → header_content → header（代理）→ list viewport（Both），因此纵向滚轮滚表体（K4 保持）、横向滚轮也滚表体；header 无自身 `ScrollSlot`，不会与代理冲突。`set_scroll_proxy` 校验“target 不是 node 后代”：list viewport 在 body 子树，header 与 body 是兄弟 ⇒ 合法。
-- **裁剪/背景**：背景色仍在 `header` 节点上（不随内容移动）；`header_content` 与单元格透明；`header` 的 `Clip::Bounds` 负责横向裁剪。divider 放在 `header_content` 内，宽 = content_width，横向滚动后仍覆盖视口（`content_width - x >= viewport`，x ≤ `max_x`）。
+- **裁剪/背景**：背景色仍在 `header` 节点上（不随内容移动）；`header_content` 与单元格透明；`header` 的 `Clip::Bounds` 负责横向裁剪。divider/header_row 放在 `header_content` 内、`width_full`，随 `header_content` 宽 = `max(content_width, viewport.width)`；窄视口下等于 content_width，宽视口下等于视口宽，横向滚动后仍覆盖视口（`width - x ≥ viewport`，x ≤ `max_x`）。
 
 ### 3.5 List 的最小重构（引擎 + kit）
 
@@ -429,7 +430,7 @@ pub struct Column {
 - `Table::build`（`table.rs:463-678`）：
   - `outer` 补 `.relative()`；`options.scrollbar` 时 `padding_bottom = hbar thickness (4 px)`（AD2 的底部带，§3.4）；
   - `header` 显式 `height(header_height + px(1.0))`、`overflow_hidden()`、`relative()`；
-  - `header_content`：`.absolute().left(px(0)).top(px(0)).width(px(content_width)).height_full().flex_col()`，先建 `header_row`（`height(header_height)`）与 divider；表头单元格仍用 `span_cell_style`（内容宽固定为 `content_width`，不再需要 `min_width`）；
+  - `header_content`：`.absolute().left(px(0)).top(px(0)).width(px(content_width)).height_full().flex_col()`（初始宽 = content_width；宽视口由 `Table::sync` 改写为 `max(content_width, viewport.width)`），先建 `header_row`（`flex_row`, `width_full`, `height(header_height)`）与 divider（`width_full`）；表头单元格仍用 `span_cell_style`（窄视口内容宽固定为 `content_width`，不再需要 `min_width`）；
   - `body` 保持 `flex_1/relative`；`list.build(tree, body)`（List 不再建内部 bar）；`vbar_rail` 建在 `body`，`vbar.build(tree, vbar_rail)`；
   - `hbar_rail` 建在 `outer`（absolute left 0/right 4px/bottom 0/height 4），`hbar.build(tree, hbar_rail)`；
   - 记录 `geometry.{outer, header, header_content, body, header_row, empty}`。
@@ -440,11 +441,11 @@ pub struct Column {
   5. 记录 `geometry.{window, list_handle}`，注册 sort handler（现状）。
 - `Table::sync`（`table.rs:706-708`）：
   1. `list.sync(app)?`；
-  2. sticky 写：`let x = list.handle` 的 `scroll_state.offset.x`（clamp 到 `[0, content - state.viewport.width]`）；若 `x != sticky_x` ⇒ 改 `header_content` 的 `Style`（`inset_left(-x)`，`position`/`inset_top` 保持）→ `tree.set_style(...)` → `sticky_x.set(x)` → `app.request_frame()`；
+  2. sticky 写：读 `scroll_state`；`max_x = max(0, content_width - viewport.width)`；若 `offset.x > max_x` 先 `app.scroll_to(..., max_x)` 夹回（虚拟列表不在引擎 `clamp_scroll_offsets` 的范围内，kit 侧兜底）；再令 `x = offset.x`、`width = max(content_width, viewport.width)`；若 `x != sticky_x` **或** `width != header_width` ⇒ 改 `header_content` 的 `Style`（`inset_left(-x)`、`width_length(width)`，`position`/`inset_top` 保持）→ `tree.set_style(...)` → 两个 Cell 更新 → `request_repaint`；
   3. `vbar.sync(app)?`、`hbar.sync(app)?`；
   4. 聚合 changed 返回。
 - `Table::release`（`table.rs:407-410`）：`set_scroll_proxy(header, None)`（忽略 `StaleNode`）→ `vbar.release` + `hbar.release` + `list.release` + `off_action`/`release_scope`（现状）。信号回收数从“列表三条 + 一条 bar 两条 + 排序一”变为“列表三条 + 两条 bar 各两条 + 排序一”，`releasing_the_table_scope_reclaims_its_signal_slots`（`:1623-1633`）的 `>= 6` 重算（预计 8）。
-- 列对齐不变量：header/body 使用同一 `content_width`、同一 `span_cell_style`、同一个行内 padding；body 行宽 = `max(视口宽, content_width)`，header_content 宽 = `content_width` 且 x 平移 = `-List.offset.x`；body 行的横向偏移也由同一个 `List.offset.x` 决定 ⇒ 列屏幕 x 恒等。
+- 列对齐不变量：header/body 使用同一 `content_width`、同一 `span_cell_style`、同一个行内 padding；body 行宽 = `max(视口宽, content_width)`，**header_content 宽 = `max(视口宽, content_width)`**（由 `Table::sync` 写入）且 x 平移 = `-List.offset.x`；body 行的横向偏移也由同一个 `List.offset.x` 决定 ⇒ 窄/宽视口下列屏幕 x 恒等（K15）。
 
 ### 3.7 `scroll_state` / 内容宽度 / 滚动范围
 
@@ -514,22 +515,25 @@ pub struct Column {
 | K12 | `flex_requires_explicit_min_width_and_override_is_removed` | 三参数构造；`.min_width()` 不存在（编译期）；`ColumnWidth::Flex { weight, min_width }` 存值正确；Fixed 无 min 概念 | P3 |
 | K13 | `wide_viewport_shows_no_horizontal_bar` | `hbar.scrollable == false`、thumb 不可见、`max_x == 0` | P3 |
 | K14 | `narrow_viewport_shows_horizontal_bar` | `hbar.scrollable == true`、thumb 出现、`max_x == content - viewport` | P3 |
-| K15 | `sticky_header_follows_list_offset_in_step` | 拖 hbar/滚轮后：`header_content` 的 `inset_left == -list.offset.x`；表头单元格与表体同列单元格屏幕 x 相同；`sticky_x` 与 offset 同步 | P3 |
-| K16 | `wheel_over_header_scrolls_body_horizontally` | 表头单元格上水平滚轮：list.x 变、y 不变；外层页面不动；`header.offset` 无独立状态（表头无 ScrollSlot） | P3 |
+| K15 | `sticky_header_follows_the_list_offset_and_columns_align` | 拖 hbar/滚轮后：`header_content.inset_left == -list.offset.x`、`width == max(content_width, viewport.width)`；表头单元格与表体同列单元格屏幕 x 相同（窄/宽视口两种）；**纵向滚动后表头 y 固定**；resize 宽→窄后夹回 `[0,max_x]` 且稳态对齐 | P3 |
+| K16 | `wheel_over_header_scrolls_body_and_not_the_page` | 表头单元格上水平滚轮：list.x 变、y 不变；外层页面不动；`header.offset` 无独立状态（表头无 ScrollSlot） | P3 |
 | K17 | `two_axis_drags_do_not_reset_each_other` | 先横拖再竖拖：x 保持；先竖拖再横拖：y 保持 | P3 |
-| K18 | `table_release_clears_proxy_and_releases_bars` | 释放后 header proxy 清除、两条 bar 释放、重复 release 幂等、无 panic；信号回收数 ≥ 8 | P3 |
-| K19 | `horizontal_scroll_state_has_both_axes` | `scroll_state(content/viewport/axes)` 正确；虚拟 rewindow/extents 后 `content.width` 不被覆盖 | P2/P3 |
-| K20 | `table_horizontal_a11y` | 窄表 x_max>0、orientation None、含 ScrollLeft/Right；无额外滚动容器；表头单元格 a11y bounds 与表体同列对齐 | P3/P4 |
-| K21 | `scrollbar_tail_gaps_do_not_overlap` | 垂直条 track 底 = 表底 − 4、水平条 track 右 = 表右 − 4；两者矩形不相交；`ScrollbarOptions` 无新字段 | P3 |
-| G7 | `--wheel-check`：宽表窄视口 | 内容/表头/水平条滚轮与拖拽；表头与表体同帧同偏移 | P3 |
+| K18 | `table_release_clears_header_proxy_and_is_idempotent` | 释放后 header proxy 清除、两条 bar 释放、重复 release 幂等、无 panic；信号回收数 ≥ 8 | P3 |
+| K19 | `horizontal_scroll_state_keeps_both_axes_after_rewindowing` | 虚拟 rewindow/extents 后 `content.width` 不被覆盖；`ScrollState.axes = Both` | P3 |
+| K20 | `table_horizontal_a11y_exposes_both_axes` | 窄表 x_max>0、orientation None、含 ScrollLeft/Right；无额外滚动容器；表头单元格 a11y bounds 与表体同列对齐 | P3 |
+| K21 | `scrollbar_tail_gaps_do_not_overlap` | 垂直条 track 底 = 表底 − 4、水平条 track 右 = 表右 − 4；两矩形不相交；`ScrollbarOptions` 无新字段 | P3 |
+| G7 | `--wheel-check`：宽表窄视口 | 内容/表头/**水平条 track 滚轮**/**thumb 拖动**；表头与表体同帧同偏移；表头 y 固定 | P3 |
 | G8 | `--wheel-check`：宽表宽视口 | 不出现水平条；垂直滚轮仍只滚表体；页面不动 | P3 |
 | G9 | `--wheel-check`：表头/表体列对齐 | 滚动后 `cell_node(0,k)` 与 `header_node(k)` 的屏幕 x 差为 0 | P3 |
+
+> **P3 收口状态（2026-11-26，最终）**：K1/K2 已去 `#[ignore]` 并默认通过；K3–K21 默认 `cargo test -p ui_core -p ui_kit` 全绿（`ui_core` lib **2744 passed / 1 ignored**、`ui_kit` lib **796 passed / 0 ignored**，含 `App::clear_scroll` 清理用例）；header y 固定、G7 水平条 track 滚轮 + thumb 拖动、resize 宽→窄（kit 侧夹回、稳态对齐）、应用层 smoke 均随 P3 收口通过；`gallery --wheel-check` PASS（G1–G9 **37 断言**）、`--idle-check` idle frames 0。**P3 门禁改动集 37 文件；收口后工作区 40 文件**（含 `clear_scroll` 测试）。证据：`E:\kytrix-scratch\scroll-impl\P3\`（README 由 fixer 记录）。
 
 #### 3.11.1 sticky 与列对齐的可测法
 
 - 引擎 `interaction/scroll.rs::to_screen` 只累加祖先滚动偏移（`:85-89`）；sticky 表头的平移是**布局**（`header_content` 的 absolute left），不是滚动槽，因此：
-  - 断言 `header_content` 的布局 `bounds.origin.x == -list.offset.x`（`app.probe().bounds(header_content)`）；
-  - 断言 `header_node(k).bounds.origin.x - header_content.origin.x == cell_node(0,k).bounds.origin.x - body_list.offset.x`（两边的“内容坐标”相同）；
+  - 断言 `header_content` 的布局 `bounds.origin.x == -list.offset.x`、`bounds.size.width == max(content_width, viewport.width)`（`app.probe().bounds(header_content)`）；
+  - 断言 `header_node(k).bounds.origin.x - header_content.origin.x == cell_node(0,k).bounds.origin.x - body_list.offset.x`（两边的“内容坐标”相同；窄/宽视口各一次）；
+  - 纵向滚动一屏后断言 `header_content.bounds.origin.y` 与 `header_node(k).bounds.origin.y` 不变（header y 固定）；
   - 用 `Table` 内部 `geometry` 读 List `ScrollHandle` 的 offset，避免依赖未偏移布局当屏幕坐标。
 
 ---
@@ -538,7 +542,7 @@ pub struct Column {
 
 ### 4.1 演示位置
 
-- 新增 **⑩ 宽表（水平滚动 + sticky 表头）** 小节，追加在现有 ⑨ 之后（不改变既有编号）。
+- 新增 **⑩ 宽表（水平滚动 + sticky 表头）** 小节，追加在现有 ⑨ 之后；旧 **⑩–⑮ 顺延为 ⑪–⑯**（gallery 共 **16 sections**，`gallery.rs` 的 `section()` 编号已按此排列）。
 - 两个 `Table`，同一列配置：
   - **窄容器**：`sized_box(..., 420.0, 240.0)` ⇒ 出现水平条（G7）；
   - **宽容器**：`sized_box(..., 1100.0, 240.0)` ⇒ 不出现水平条（G8）。
@@ -565,12 +569,15 @@ vec![
 |---|---|
 | 窄表 hbar | `scrollable == true`；thumb 出现；`max_x == 796 - 表宽` |
 | 宽表 hbar | `scrollable == false`；thumb 不可见；`max_x == 0` |
-| sticky 表头 | 窄表水平滚动 1 格后：`header_content.left == -list.offset.x`；表头/表体首列屏幕 x 相同；纵向滚动时表头 y 不变 |
+| sticky 表头 | 窄表水平滚动 1 格后：`header_content.left == -list.offset.x`、`width == max(796, 表宽)`；表头/表体首列屏幕 x 相同；纵向滚动时表头 y 不变 |
+| G7 水平条交互（P3 收口） | 水平条 **track 滚轮** 与 **thumb 拖动**均只改 x、y 保持；表头与表体同帧同偏移；`gallery --wheel-check` PASS（G1–G9 **37 断言**） |
+| resize 宽→窄（P3 收口） | kit 侧夹回 `x ≤ max_x`，header 写新 `width=max(content, viewport)`；稳态列对齐（同帧可能错位 1 帧后收敛，`P3/README.txt` 偏差 2） |
+| 应用层 smoke（P3 收口） | `settings_ui` / `updater_ui` / `widget_gallery_ui` / `candlestick` 接线后编译通过、各自 smoke/手测通过（`cargo check --workspace` PASS） |
 | 两轴不互斥 | 窄表先横拖到 x=100，再纵向滚轮：x 保持；再纵拖到底，x 保持 |
 | 边界 | 水平滚到 max 后同序列继续：x 不再变、页面不动；停顿后再次水平滚：外层按新序列（Chrome 式） |
 | 垂直能力不退化 | 窄表表体垂直滚轮只滚表体；表头滚轮滚表体（K4 保持） |
 | 水平条尾隙 | 垂直条底与水平条右端在角部不相交（K21） |
-| idle | `--wheel-check` 后分进程跑 `--idle-check`：无额外帧（I7；sticky 仅在 x 变化时写 style） |
+| idle | `--wheel-check` 后分进程跑 `--idle-check`：无额外帧（I7；sticky 仅在 x/width 变化时写 style） |
 
 ---
 
@@ -603,10 +610,12 @@ vec![
 | 任务 | 产出 | 验收 |
 |---|---|---|
 | P3-6 `Column` API（AD4） | `ColumnWidth::Flex { weight, min_width }`、`Column::flex(header, weight, min_width)`（删默认/链式）、`contribution()`、`span_cell_style` 重写、`TableInner.content_width` | K11/K12 绿；17 处 `Column::flex` 调用点全部显式给值；table 宽度断言重算 |
-| P3-7 Table sticky + 双 bar（AD3/AD2） | outer/header/header_content 结构与 `relative`、header 显式高度、sticky 写（`sticky_x` + `set_style`）、List `scrollbar:false`、vbar/hbar 与 rail 尾隙、`Table::sync` 聚合 | K13–K17、K19、K21 绿；K9（几何守卫）不回归 |
+| P3-7 Table sticky + 双 bar（AD3/AD2） | outer/header/header_content 结构与 `relative`、header 显式高度、sticky 写（`sticky_x` + `header_width` 双 Cell + `set_style`，宽度写 `max(content_width, viewport.width)`）、List `scrollbar:false`、vbar/hbar 与 rail 尾隙、`Table::sync` 聚合 | K13–K17、K19、K21 绿；K15 覆盖宽/窄视口列对齐与 header y 固定；K9（几何守卫）不回归 |
 | P3-8 代理扩展（对 P3-1/P3-2 的增量） | 两条 bar 的 track 代理到 list viewport；header 代理下横向滚轮也生效；header 无自身滚动槽 | K15/K16/K18、K4 保持 |
-| P3-9 gallery | ⑩ 宽表（三参数列配置）+ `--wheel-check` G7–G9 | 三端至少 Windows 真机 PASS |
+| P3-9 gallery | **⑩ 宽表**（三参数列配置；旧 ⑩–⑮ 顺延为 ⑪–⑯，共 16 sections）+ `--wheel-check` G7–G9（G7 含水平条 track 滚轮与 thumb 拖动） | 三端至少 Windows 真机 PASS；`P3/wheel.log` 记录 G1–G9 **37 断言** PASS |
 | P3-10 迁移（AD1） | §3.10 调用点：17 处 flex 显式 min_width、widget 表按旧密度取值并逐点记录、List/VirtualListConfig 字面量、Table 条归属 | 编译零 warning；各 widget 最小用例/手测；`TableOptions` 不加字段 |
+
+> **P3 错误语义（收口）**：`Input::attach` 失败**向上传播**（不吞错）；`ScrollBar::attach` 先校验后一次性写入，**失败无半写**、`release` 幂等；`Table::attach` 任一步失败**回滚已建部分**（清 header proxy、release 已 attach 的 bar）后返回错误，后续 `release` 幂等。新增最小公共 API **`App::clear_scroll(&ScrollHandle) -> Result<(), EngineError>`**：清除节点滚动槽，供 `Input::attach` 失败路径清理（**不请求帧**、不 damage、不更新 a11y）。`pump.rs` 的 **3 行 close/gate fix** 随 P3 实际 diff（门禁改动集 **37 文件**；收口后工作区 **40 文件**，含 `clear_scroll` 测试）。验收：K8/K18 + 各自 attach/clear_scroll 用例；主设计 §5.2/§5.4/§6 P3 注同步。
 
 ### P4（追加 0.5 人日）
 
@@ -624,10 +633,10 @@ vec![
 
 | ID | 风险 | 影响 | 缓解 |
 |---|---|---|---|
-| R1 | sticky 写与 List offset 分属两个原子操作：正常同帧（`pump.rs:646-654`），但窗口 resize 时帧内 `clamp_scroll_offsets` 在 sync 之后，表头可能瞬错位 1 帧 | resize 时视觉 | `Table::sync` 用当前 state 预夹紧；测试断言稳态；真机确认 |
+| R1 | resize 宽→窄：虚拟列表 x 不在引擎 `clamp_scroll_offsets` 范围（`scroll_containers` 不含 virtual container），kit 在 `Table::sync` 用 `scroll_to` 夹回；夹回前同一帧可能错位 1 帧 | resize 时视觉 | 已实现 kit 侧夹回 + header x/width 同帧写；K15 断言稳态对齐；P3 README 偏差 2 记录（不改引擎）；真机确认 |
 | R2 | AD1 全局默认 + AD4 强制显式最小宽：17 处调用点必须逐个决策，widget 行情表取值不当会改变密度 | 交易类表格观感 | 编译期清单 + P3-10 逐点记录取值；测试覆盖 1–2 个代表性 widget |
-| R3 | sticky 写通过 `NodeTree::set_style` 触发 `header_content` 子树布局失效（`layout.rs:46-60`） | 每帧滚动一次小范围布局 | 只在 x 变化时写（`sticky_x` 短路）；header 子树小；I7/idle 守卫 |
-| R4 | 表头/表体列对齐依赖 header_content 与 List rows 使用同一 `content_width` 与同一 cell 样式 | 列错位 | K11/K15/G9 守卫；`Table::sync` 只写 x，不改宽 |
+| R3 | sticky 写通过 `NodeTree::set_style` 触发 `header_content` 子树布局失效（`layout.rs:46-60`） | 每帧滚动一次小范围布局 | 只在 x 或 width 变化时写（`sticky_x`/`header_width` 双短路）；header 子树小；I7/idle 守卫（`--idle-check` idle frames 0） |
+| R4 | 表头/表体列对齐依赖 header_content 宽与 List rows 同宽、同一 cell 样式 | 宽视口/跨视口 resize 时列错位 | **`Table::sync` 写 `width=max(content_width, viewport.width)`**（窄视口=content_width）；K11/K15/G9 守卫；P3 收口后 K15 覆盖窄/宽两种视口与 resize 稳态 |
 | R5 | 虚拟列表三处 `content` 写入漏改 | rewindow/extents 后横向范围清零、hbar 消失 | K19 覆盖 rewindow + extents；变异自检 |
 | R6 | `options.scrollbar=true` 时 `outer` 底部固定预留 4px 带；宽视口下无 bar 但有 4px 空白 | 密集表少 4px 高 | 已按 D2 选择“静态预留”最小实现；若要求宽视口零占位需动态带（额外状态/布局），列入 §6.2 待确认 |
 | R7 | 45° 在本引擎下只影响消费记账，不改变偏移 | 若期望“斜向滚动有可见差异”会失望 | §2.3 源码澄清；E34 固化；overscroll/结转未来落地时才可见 |
@@ -644,7 +653,8 @@ vec![
 | U3 | 本引擎未来是否需要 overscroll 记账入口 | 本批不实现；纯函数返回值已就绪 |
 | U5 | 逐候选 `line_height` 与 Chrome 共享 px delta 的差异 | 本文映射决定（非未验证）；E34m/E34n 固化；若要求同构需与 O2 一起裁决 |
 | I1 | 宽视口下 `outer` 底部是否允许保留 4px 空带（AD2 的静态预留） | 本文取“允许（无绘制、不可命中内容）”；若要求零占位，需在 resize/阈值变化时改 padding（额外状态，未选） |
-| I2 | `Table::sync` 用 `NodeTree::set_style` 写 sticky 偏移 | 已核实为既有公共 API（`node/tree.rs:528-530`、`paint/style.rs:56-59/296-314`），无需引擎改动；若后续引入“运行时平移”公共 API 可替换 |
+| I2 | `Table::sync` 用 `NodeTree::set_style` 写 sticky 偏移与宽度 | 已核实为既有公共 API（`node/tree.rs:528-530`、`paint/style.rs:56-59/296-314`），无需引擎改动；若后续引入“运行时平移/尺寸”公共 API 可替换 |
+| I3 | resize 宽→窄的一帧错位（P3 README 偏差 2） | 虚拟列表 x 不在引擎 `clamp_scroll_offsets` 范围；kit 在 `Table::sync` 用 `scroll_to` 夹回并同帧写 x/width，稳态无错位；接受一帧瞬态（R1），未改引擎 |
 
 ### 6.3 已裁决项（AD1–AD4，第二轮，已关闭）
 
@@ -672,13 +682,13 @@ vec![
 | 45° 是否被误述为改变偏移 | 否（§2.3 末、R7 明确澄清） |
 | Table 公式是否与用户裁决一致 | 是（§3.2；Fixed 和 + Flex 最小宽和；AD1 全局默认） |
 | `Column` API 是否为 AD4 形态 | 是（§3.3；三参数、无默认、无链式；`ColumnWidth::Flex { weight, min_width }` 保留） |
-| 表头/表体共享偏移是否为 AD3 sticky 形态 | 是（§3.4/§3.6；无镜像滚动槽、无 a11y 标记；List.offset.x 唯一真源；同帧 sync；resize 行为与 R1 记录） |
+| 表头/表体共享偏移是否为 AD3 sticky 形态 | 是（§3.4/§3.6；无镜像滚动槽、无 a11y 标记；List.offset.x 唯一真源；`Table::sync` 同帧写 `left=-x` 与 `width=max(content,viewport)`；header y 固定；resize 稳态由 K15 覆盖，R1/I3 记录一帧瞬态） |
 | 滚动条几何是否为 AD2 形态 | 是（§3.8；rail 尾隙、不重叠、无 `ScrollbarOptions` 扩展；K21 守卫） |
 | 水平条是否可命中/代理 | 是（§3.8；P3-1 代理 + A-H2 point 修正） |
 | 与 List 纵向槽关系是否明确 | 是（表体 List 单槽双轴；表头非滚动容器；无第二套链式） |
 | 现有 List 是否无法承载 | 是，给出最小重构（§3.5）；默认 `content_width=None` 时行为不变 |
 | 迁移影响是否穷举 | 是（§3.10；17 处 flex 显式参数、14 处 Fixed 不受影响、List/VirtualList 字面量、table 宽度/a11y 断言、bar 归属） |
-| 测试是否含两轴互不重置/窄宽视口/header-body 同步/sticky/resize | 是（K13–K17、K19–K21、G7–G9；resize 见 R1） |
+| 测试是否含两轴互不重置/窄宽视口/header-body 同步/sticky/resize | 是（K13–K17、K19–K21、G7–G9；K15 覆盖窄/宽视口列对齐、header y 固定与 resize 稳态；resize 一帧瞬态见 R1/I3） |
 | 是否留有“静默失败” | 否（AD4 取消链式，无 no-op builder；17 处编译期缺参数） |
 | 是否需要引擎新增 API | 否（sticky 用 `NodeTree::set_style`/`Style` 既有公共 API；a11y 标记方案已删） |
 | 滚动动画能力是否删除（裁决 C） | 是：`scroll_to_animated`/`AnimationTarget::Scroll`/`scroll_animation_target` 全删，程序化与滚轮统一立即 `scroll_to`；E31 与程序化动画取消用例删除（§7 自检、主设计 §4.9/§5.2/§5.3/§8.1） |
@@ -714,7 +724,7 @@ vec![
 - `crates/ui_core/src/a11y/tree.rs`：`scroll_state` 506-517；`lifted_scroll_root/window` 771-802；`a11y_scroll_target` 804-812。
 - `crates/ui_core/src/a11y/mapping.rs`：滚动动作提升 286-301。
 - `crates/ui_core/src/a11y/action.rs`：滚动动作分发 151-155；步长 450-464。
-- `crates/ui_core/src/platform/windows/event_loop/pump.rs`：`run_frame_hook` → `frame_all` 646-654。
+- `crates/ui_core/src/platform/windows/event_loop/pump.rs`：`run_frame_hook` → `frame_all` 646-654；P3 **3 行 close/gate fix**（P3 门禁改动集 37 文件之一，不改变滚动路由语义）。
 - `crates/ui_core/src/app/frame.rs`：帧内 `rewindow_virtuals`/`clamp_scroll_offsets` 151-155。
 - `crates/ui_kit/src/kit/table.rs`：`ColumnWidth` 37-51；`Column` 82-140；`span_cell_style` 142-186；`clamp_span` 188-190；`TableOptions` 192-222；`TableInner` 224-239；`TableGeometry` 241-248；`new` 256-395；`build` 463-678；`attach` 680-688；`sync` 706-708；`release` 407-410；`header_node` 721-734；`cell_node` 737-755；outer/body 样式 466-482 / 625-637。
 - `crates/ui_kit/src/kit/list.rs`：`ListOptions` 62-74；`ListInner` 480-497；`build` 570-607（bar 开关 600-602）；`attach` 609-646（bar 开关 637-639）；`sync` 861-928；`row_builder` 1076-1137。

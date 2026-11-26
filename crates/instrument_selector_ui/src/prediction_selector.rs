@@ -1081,7 +1081,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 &self.search_placeholder,
             )
         };
-        search.install(app);
+        search.install(app)?;
         self.search_node = Some(search);
 
         let tab_row = build_node(app, window, root, |tree, root| {

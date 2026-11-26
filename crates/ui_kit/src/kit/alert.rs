@@ -255,7 +255,7 @@ impl AlertBuilder {
                     .tree_mut(),
                 input_column,
             );
-            input.install(app);
+            input.install(app)?;
             let error_theme = theme.clone();
             NodeBuilder::text("", TextStyle::new(px(14.0)))
                 .bind_text(move |cx| cx.read(&error).clone().unwrap_or_else(SmolStr::default))

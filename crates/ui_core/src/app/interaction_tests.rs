@@ -6535,3 +6535,74 @@ fn wheel_over_chained_proxy_scrolls_the_terminal_container() {
         "外层页面不得被滚动"
     );
 }
+
+#[test]
+fn clear_scroll_drops_only_the_scroll_slot_and_its_container_registration() {
+    let (_rt, mut app, window, container, child) = scrollable_app();
+    app.set_scroll_proxy(window, child, Some(container))
+        .expect("proxy to the scroll container");
+    let handle = app.scroll_handle(window, container).expect("scroll handle");
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(40.0)))
+        .expect("scroll");
+    frame(&mut app, window);
+    let _ = app.take_wake_request();
+
+    app.clear_scroll(&handle).expect("clear scroll");
+
+    assert!(app.scroll_state(&handle).is_none(), "滚动槽已清除");
+    assert!(
+        app.scroll_handle(window, container).is_none(),
+        "不得再返回滚动句柄"
+    );
+    {
+        let tree = app.window(window).expect("window").tree();
+        assert!(tree.get(container).is_ok(), "节点本身保留");
+        assert!(tree.scroll_slot(container).is_none(), "节点滚动槽为 None");
+        assert!(
+            !tree.scroll_containers().contains(&container),
+            "节点必须从滚动容器登记中移除"
+        );
+        assert_eq!(
+            tree.scroll_proxy(child),
+            Some(container),
+            "不得清除其它节点的代理交互"
+        );
+    }
+    assert!(!app.take_wake_request(), "清理滚动槽不得请求帧");
+    app.clear_scroll(&handle).expect("重复清理幂等");
+    assert!(app.scroll_state(&handle).is_none());
+}
+
+#[test]
+fn clear_scroll_accepts_a_missing_slot_and_reports_stale_or_closed_targets() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let plain = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)),
+    );
+    let plain_handle = ScrollHandle::new(window, plain);
+    app.clear_scroll(&plain_handle).expect("无滚动槽必须 Ok");
+    {
+        let tree = app.window(window).expect("window").tree();
+        assert!(tree.get(plain).is_ok());
+        assert!(
+            tree.interaction(plain).is_none(),
+            "清理不存在的滚动槽不得创建节点交互"
+        );
+    }
+    app.remove_node(window, plain).expect("remove plain");
+    let error = app
+        .clear_scroll(&plain_handle)
+        .expect_err("节点缺失必须报错");
+    assert!(
+        matches!(error, EngineError::StaleNode { node } if node == plain),
+        "缺失节点必须报 StaleNode：{error:?}"
+    );
+    assert!(app.close_window(window));
+    let closed_handle = ScrollHandle::new(window, root);
+    app.clear_scroll(&closed_handle)
+        .expect("窗口关闭后清理必须 Ok（与既有 handle API 一致）");
+}

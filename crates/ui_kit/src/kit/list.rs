@@ -643,7 +643,7 @@ impl List {
             geometry.handle = handle;
         }
         if options.scrollbar {
-            self.inner.scrollbar.attach(app, window, viewport);
+            self.inner.scrollbar.attach(app, window, viewport)?;
         }
         let select = self.clone();
         app.on_action(self.inner.select_action.clone(), move |ctx| {
@@ -2927,7 +2927,6 @@ mod ui_tests {
     }
 
     #[test]
-    #[ignore = "P0 red until P3"]
     fn list_wheel_over_track_scrolls_list_not_page() {
         let mut harness = page_with_list();
         let (track, _) = harness.list.inner.scrollbar.nodes();
@@ -2940,7 +2939,6 @@ mod ui_tests {
     }
 
     #[test]
-    #[ignore = "P0 red until P3"]
     fn list_wheel_over_thumb_scrolls_list() {
         let mut harness = page_with_list();
         let (_, thumb) = harness.list.inner.scrollbar.nodes();

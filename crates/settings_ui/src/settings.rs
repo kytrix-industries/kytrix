@@ -183,7 +183,7 @@ impl SettingsPage {
                 &search_placeholder,
             )
         };
-        search_input.install(app);
+        search_input.install(app)?;
         search_input.set_clearable(app, true);
 
         let body_row = layout::build_node(app, window, root, |tree, parent| {

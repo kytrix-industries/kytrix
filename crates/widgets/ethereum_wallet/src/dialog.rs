@@ -1014,7 +1014,7 @@ impl DialogState {
                 &self.input_placeholder,
             )
         };
-        input.install(app);
+        input.install(app)?;
         self.input = Some(input.clone());
         *self.input_slot.borrow_mut() = Some(input);
 

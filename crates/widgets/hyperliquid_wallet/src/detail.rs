@@ -862,7 +862,14 @@ fn specs(tab: DetailTab) -> &'static [ColumnSpec] {
 fn columns(tab: DetailTab, translate: &Translate) -> Vec<Column> {
     specs(tab)
         .iter()
-        .map(|spec| Column::flex(t_smol!(translate, spec.header), spec.weight).align(spec.align))
+        .map(|spec| {
+            Column::flex(
+                t_smol!(translate, spec.header),
+                spec.weight,
+                LogicalPx::ZERO,
+            )
+            .align(spec.align)
+        })
         .collect()
 }
 

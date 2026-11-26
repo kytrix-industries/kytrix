@@ -232,7 +232,7 @@ fn columns(translate: &Translate) -> Vec<Column> {
         .into_iter()
         .zip(COLUMN_WEIGHTS)
         .zip(COLUMN_ALIGNS)
-        .map(|((header, weight), align)| Column::flex(header, weight).align(align))
+        .map(|((header, weight), align)| Column::flex(header, weight, LogicalPx::ZERO).align(align))
         .collect()
 }
 
@@ -1384,7 +1384,10 @@ mod tests {
         for (index, column) in table.columns().iter().enumerate() {
             assert_eq!(
                 column.width,
-                ColumnWidth::Flex(COLUMN_WEIGHTS[index]),
+                ColumnWidth::Flex {
+                    weight: COLUMN_WEIGHTS[index],
+                    min_width: LogicalPx::ZERO
+                },
                 "column {index} keeps its declared width weight"
             );
             assert_eq!(column.align, COLUMN_ALIGNS[index]);

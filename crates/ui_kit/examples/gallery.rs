@@ -9,9 +9,10 @@ use std::{
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::{App, Application},
-    event::{Action, ActionSource, Event, InputEvent},
-    interaction::ScrollConfig,
-    math::{LogicalPoint, LogicalRect, LogicalSize, px},
+    error::EngineError,
+    event::{Action, ActionSource, Event, InputEvent, Modifiers, PointerButton},
+    interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -84,7 +85,13 @@ const H_MARKDOWN: f32 = 620.0;
 const H_OVERLAYS: f32 = 150.0;
 const H_DIALOGS: f32 = 120.0;
 const H_PICKER: f32 = 110.0;
+const H_WIDE_TABLE: f32 = 560.0;
 const H_LOG: f32 = 240.0;
+
+const DEMO_VIEW_W: f32 = 360.0;
+const DEMO_VIEW_H: f32 = 176.0;
+const DEMO_CONTENT_W: f32 = 640.0;
+const DEMO_CONTENT_H: f32 = 520.0;
 
 const MARKDOWN_SOURCE: &str = r#"# Markdown 视图
 
@@ -402,7 +409,13 @@ fn section(
     )
 }
 
-fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHandle) -> ScrollBar {
+fn scroll_demo(
+    app: &mut App,
+    window: WindowId,
+    parent: NodeId,
+    theme: &ThemeHandle,
+    report: &Rc<RefCell<WheelCheckReport>>,
+) -> DemoScroll {
     let initial = theme.theme_for(Appearance::Dark);
     let fg = initial.role(Role::FgMuted);
     let outer = container(
@@ -410,8 +423,8 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
         window,
         parent,
         StyleBuilder::new()
-            .width(px(360.0))
-            .height(px(176.0))
+            .width(px(DEMO_VIEW_W))
+            .height(px(DEMO_VIEW_H))
             .relative()
             .build(),
     );
@@ -420,8 +433,8 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
         window,
         outer,
         StyleBuilder::new()
-            .width(px(360.0))
-            .height(px(176.0))
+            .width(px(DEMO_VIEW_W))
+            .height(px(DEMO_VIEW_H))
             .relative()
             .overflow_hidden()
             .build(),
@@ -437,7 +450,7 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
             .layout_override(LogicalRect::new(
                 px(0.0),
                 px(index as f32 * 26.0),
-                px(360.0),
+                px(DEMO_CONTENT_W),
                 px(25.0),
             ))
             .bind_style(move |cx| StylePatch {
@@ -448,13 +461,15 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
             .expect("scroll row");
         let label_theme = theme.clone();
         let _ = NodeBuilder::text(
-            format_smolstr!("滚动行 #{index} — 滚轮 / 拖条 / 轨道点击"),
+            format_smolstr!(
+                "滚动行 #{index} — 滚轮 / 拖条 / 轨道点击 / 横向可滚（内容宽 {DEMO_CONTENT_W:.0}）"
+            ),
             text_style(12.0, 400, fg),
         )
         .layout_override(LogicalRect::new(
             px(12.0),
             px(index as f32 * 26.0 + 4.0),
-            px(320.0),
+            px(DEMO_CONTENT_W - 24.0),
             px(18.0),
         ))
         .bind_style(move |cx| StylePatch {
@@ -464,19 +479,163 @@ fn scroll_demo(app: &mut App, window: WindowId, parent: NodeId, theme: &ThemeHan
         .build(tree(app, window), viewport)
         .expect("scroll label");
     }
-    if let Ok(handle) = app.make_scroll(window, viewport, ScrollConfig::default()) {
-        let _ = app.set_scroll_content(&handle, LogicalSize::new(px(360.0), px(20.0 * 26.0)));
+    match app.make_scroll(
+        window,
+        viewport,
+        ScrollConfig {
+            axes: ScrollAxes::Both,
+            line_height: px(48.0),
+        },
+    ) {
+        Ok(handle) => {
+            if let Err(error) = app.set_scroll_content(
+                &handle,
+                LogicalSize::new(px(DEMO_CONTENT_W), px(DEMO_CONTENT_H)),
+            ) {
+                report
+                    .borrow_mut()
+                    .setup_failure("⑦ demo viewport content", &error);
+            }
+        }
+        Err(error) => {
+            report
+                .borrow_mut()
+                .setup_failure("⑦ demo viewport scroll", &error);
+        }
     }
-    let bar = ScrollBar::new(
+    let vertical = ScrollBar::new(
         app,
         theme.clone(),
         "gallery.scrollbar",
         ScrollbarAxis::Vertical,
         ScrollbarOptions::default(),
     );
-    let _ = bar.build(tree(app, window), outer);
-    bar.attach(app, window, viewport);
-    bar
+    let horizontal = ScrollBar::new(
+        app,
+        theme.clone(),
+        "gallery.scrollbar-h",
+        ScrollbarAxis::Horizontal,
+        ScrollbarOptions::default().inset(px(4.0)),
+    );
+    if let Err(error) = vertical.build(tree(app, window), outer) {
+        report
+            .borrow_mut()
+            .setup_failure("⑦ vertical scrollbar build", &error);
+    }
+    if let Err(error) = horizontal.build(tree(app, window), outer) {
+        report
+            .borrow_mut()
+            .setup_failure("⑦ horizontal scrollbar build", &error);
+    }
+    if let Err(error) = vertical.attach(app, window, viewport) {
+        report
+            .borrow_mut()
+            .setup_failure("⑦ vertical scrollbar attach", &error);
+    }
+    if let Err(error) = horizontal.attach(app, window, viewport) {
+        report
+            .borrow_mut()
+            .setup_failure("⑦ horizontal scrollbar attach", &error);
+    }
+    DemoScroll {
+        viewport,
+        vertical,
+        horizontal,
+    }
+}
+
+fn wide_table(app: &mut App, theme: &ThemeHandle, key: &'static str, rows: usize) -> Table {
+    let columns = vec![
+        Column::fixed("代码", 140.0).sortable(),
+        Column::fixed("名称", 160.0).sortable(),
+        Column::flex("备注", 2.0, px(80.0)),
+        Column::flex("分类", 1.0, px(96.0)),
+        Column::fixed("价格", 100.0).align(ColumnAlign::End),
+        Column::fixed("涨跌", 100.0).align(ColumnAlign::End),
+        Column::fixed("成交额", 120.0).align(ColumnAlign::End),
+    ];
+    let cell_theme = theme.clone();
+    let table = Table::new(
+        app,
+        theme.clone(),
+        key,
+        columns,
+        TableOptions::fixed(px(28.0)),
+        move |tree: &mut NodeTree, parent: NodeId, row: usize, column: usize| {
+            let text = match column {
+                0 => format_smolstr!("代码 {row:03}"),
+                1 => format_smolstr!("资产 {row}"),
+                2 => format_smolstr!("备注 {row}：宽表横向滚动 + sticky 表头"),
+                3 => SmolStr::new_static("分类"),
+                4 => format_smolstr!("{}", 100 + row),
+                5 => format_smolstr!("+{}", row % 7),
+                _ => format_smolstr!("{}", row * 1_000),
+            };
+            let theme = cell_theme.clone();
+            NodeBuilder::text(text, text_style(11.5, 400, Color::WHITE))
+                .style(StyleBuilder::new().width_full().build())
+                .bind_style(move |cx| StylePatch {
+                    foreground: Some(theme.role(cx, Role::FgDefault)),
+                    ..StylePatch::default()
+                })
+                .build(tree, parent)
+                .expect("wide table cell");
+        },
+        "暂无行情",
+    );
+    table.set_initial_rows(app, rows);
+    table
+}
+
+#[derive(Clone)]
+struct DemoScroll {
+    viewport: NodeId,
+    vertical: ScrollBar,
+    horizontal: ScrollBar,
+}
+
+#[derive(Debug)]
+struct WheelCheckReport {
+    failures: Vec<SmolStr>,
+    cases: usize,
+    done: bool,
+    active: bool,
+    point: Option<LogicalPoint>,
+    header_y: Option<LogicalPx>,
+    header_content_y: Option<LogicalPx>,
+}
+
+impl WheelCheckReport {
+    fn new(active: bool) -> Self {
+        Self {
+            failures: Vec::with_capacity(8),
+            cases: 0,
+            done: false,
+            active,
+            point: None,
+            header_y: None,
+            header_content_y: None,
+        }
+    }
+
+    fn fail(&mut self, case: &str) {
+        println!("gallery: wheel-check FAIL {case}");
+        self.failures.push(SmolStr::new(case));
+    }
+
+    fn setup_failure(&mut self, case: &str, error: &EngineError) {
+        let label = format_smolstr!("setup.{case}");
+        if self.active {
+            println!("gallery: wheel-check FAIL {label}: {error}");
+        } else {
+            println!("gallery: WARN {label}: {error}");
+        }
+        self.failures.push(label);
+    }
+
+    fn pass(&self) -> bool {
+        self.done && self.failures.is_empty()
+    }
 }
 
 #[derive(Clone)]
@@ -496,7 +655,11 @@ struct Gallery {
     tab_bar: TabBar,
     lists: Vec<List>,
     scroll_bars: Vec<ScrollBar>,
+    demo: DemoScroll,
+    page_bar: ScrollBar,
     table: Table,
+    wide_narrow: Table,
+    wide_wide: Table,
     tree: Tree,
     inputs: Vec<InputNode>,
     markdown: Rc<RefCell<MarkdownNode>>,
@@ -513,6 +676,7 @@ struct Gallery {
     alert_dialog: Dialog,
     color_picker: ColorPicker,
     flags: Flags,
+    wheel_check: Rc<RefCell<WheelCheckReport>>,
     idle: Rc<RefCell<IdleReport>>,
     demo_fired: Rc<Cell<bool>>,
     probe_nodes: Vec<(SmolStr, NodeId)>,
@@ -543,6 +707,7 @@ impl Gallery {
         let appearance = app.signal(start_appearance);
         let log = app.signal(Vec::<SmolStr>::new());
         let status = app.signal(SmolStr::new_static("DPI 读取中…"));
+        let wheel_check = Rc::new(RefCell::new(WheelCheckReport::new(flags.wheel_check)));
         let mut buttons: Vec<Button> = Vec::with_capacity(32);
         let mut chrome_buttons: Vec<Button> = Vec::with_capacity(1);
         let mut primary_button: Option<Button> = None;
@@ -550,7 +715,14 @@ impl Gallery {
 
         let root = tree(app, window).root();
         tree(app, window)
-            .set_style(root, StyleBuilder::new().flex_col().size_full().build())
+            .set_style(
+                root,
+                StyleBuilder::new()
+                    .flex_col()
+                    .size_full()
+                    .relative()
+                    .build(),
+            )
             .expect("root style");
         let header = NodeBuilder::boxed()
             .id("gallery.header")
@@ -644,6 +816,7 @@ impl Gallery {
             H_SCROLLBAR,
             H_TABLE,
             H_TREE,
+            H_WIDE_TABLE,
             H_INPUTS,
             H_MARKDOWN,
             H_OVERLAYS,
@@ -678,7 +851,7 @@ impl Gallery {
         let mut toggles: Vec<Toggle> = Vec::with_capacity(10);
         let mut inputs: Vec<InputNode> = Vec::with_capacity(4);
         let mut lists: Vec<List> = Vec::with_capacity(3);
-        let mut scroll_bars: Vec<ScrollBar> = Vec::with_capacity(1);
+        let mut scroll_bars: Vec<ScrollBar> = Vec::with_capacity(4);
 
         let s1 = section(
             app,
@@ -1076,7 +1249,11 @@ impl Gallery {
         };
         for list in [&fixed_list, &variable_list, &deque_list] {
             let holder = sized_box(app, window, list_columns, 360.0, 240.0);
-            let _ = list.mount(app, window, holder);
+            if let Err(error) = list.mount(app, window, holder) {
+                wheel_check
+                    .borrow_mut()
+                    .setup_failure("⑥ list mount", &error);
+            }
         }
         let _ = fixed_list.set_items(app, 8);
         let _ = variable_list.set_items(app, 6);
@@ -1094,12 +1271,14 @@ impl Gallery {
             &theme,
         );
         let scroll_row = row(app, window, s7, 16.0);
-        scroll_bars.push(scroll_demo(app, window, scroll_row, &theme));
+        let demo = scroll_demo(app, window, scroll_row, &theme, &wheel_check);
+        scroll_bars.push(demo.vertical.clone());
+        scroll_bars.push(demo.horizontal.clone());
         themed_label(
             app,
             window,
             scroll_row,
-            "拖拽滑块 / 点击轨道 / 滚轮",
+            "双轴：拖拽滑块 / 点击轨道 / 滚轮 / 横向滚动",
             12.0,
             400,
             Role::FgMuted,
@@ -1119,7 +1298,7 @@ impl Gallery {
         let columns = vec![
             Column::fixed("名称", 150.0).sortable(),
             Column::fixed("类型", 110.0).sortable(),
-            Column::flex("描述", 2.0),
+            Column::flex("描述", 2.0, px(80.0)),
             Column::fixed("标签", 130.0).span(2),
             Column::fixed("数值", 90.0).align(ColumnAlign::End),
         ];
@@ -1162,8 +1341,12 @@ impl Gallery {
             },
             "表格无数据",
         );
-        let _ = table.mount(app, window, table_holder);
-        let _ = table.set_rows(app, 8);
+        if let Err(error) = table.mount(app, window, table_holder) {
+            wheel_check
+                .borrow_mut()
+                .setup_failure("⑧ table mount", &error);
+        }
+        let _ = table.set_rows(app, 40);
         table.on_sort({
             move |app, sort| {
                 let text = match sort {
@@ -1207,7 +1390,11 @@ impl Gallery {
             roots,
             TreeOptions::default(),
         );
-        let _ = tree_view.mount(app, window, tree_holder);
+        if let Err(error) = tree_view.mount(app, window, tree_holder) {
+            wheel_check
+                .borrow_mut()
+                .setup_failure("⑨ tree mount", &error);
+        }
         if !tree_view.state(app).is_expanded("src") {
             let _ = tree_view.toggle(app, "src");
         }
@@ -1218,12 +1405,46 @@ impl Gallery {
             let _ = tree_view.toggle(app, "docs");
         }
 
-        let s10 = section(
+        let s_wide = section(
             app,
             window,
             content,
             10,
-            "⑩ 输入框（单行 / 掩码 / 禁用 / 多行 + IME）",
+            "⑩ 宽表（水平滚动 + sticky 表头；窄 420 / 宽 1100）",
+            H_WIDE_TABLE,
+            &theme,
+        );
+        let narrow_holder = sized_box(app, window, s_wide, 420.0, 240.0);
+        let wide_narrow = wide_table(app, &theme, "gallery.wide.narrow", 100);
+        if let Err(error) = wide_narrow.mount(app, window, narrow_holder) {
+            wheel_check
+                .borrow_mut()
+                .setup_failure("⑩ narrow table mount", &error);
+        }
+        let wide_holder = sized_box(app, window, s_wide, 1100.0, 240.0);
+        let wide_wide = wide_table(app, &theme, "gallery.wide.wide", 100);
+        if let Err(error) = wide_wide.mount(app, window, wide_holder) {
+            wheel_check
+                .borrow_mut()
+                .setup_failure("⑩ wide table mount", &error);
+        }
+        themed_label(
+            app,
+            window,
+            s_wide,
+            "同一列配置（内容宽 796）：窄容器出现水平条，宽容器不出现；表头与表体同偏移。",
+            11.5,
+            400,
+            Role::FgMuted,
+            &theme,
+        );
+
+        let s10 = section(
+            app,
+            window,
+            content,
+            11,
+            "⑪ 输入框（单行 / 掩码 / 禁用 / 多行 + IME）",
             H_INPUTS,
             &theme,
         );
@@ -1241,6 +1462,7 @@ impl Gallery {
             false,
             None,
             ControlSize::Medium,
+            &wheel_check,
         );
         single.update_value(app, "Kytrix 单行输入 · IME 演示");
         let masked_box = sized_box(app, window, input_row, 240.0, 30.0);
@@ -1256,6 +1478,7 @@ impl Gallery {
             false,
             None,
             ControlSize::Medium,
+            &wheel_check,
         );
         masked.update_value(app, "s3cret-密码");
         let disabled_box = sized_box(app, window, input_row, 240.0, 30.0);
@@ -1271,6 +1494,7 @@ impl Gallery {
             false,
             None,
             ControlSize::Medium,
+            &wheel_check,
         );
         inputs.extend([single, masked, disabled]);
         let multiline_row = row(app, window, s10, 12.0);
@@ -1287,11 +1511,13 @@ impl Gallery {
             true,
             Some(3),
             ControlSize::Small,
+            &wheel_check,
         );
         multiline.update_value(
             app,
             "第一行 🌍 彩色字形\n第二行 👨‍👩‍👧 emoji 走 RGBA 图集，整簇可删可移\n第三行\n第四行\n第五行\n第六行（可视 3 行：滚轮滚动、caret 移动自动露出、右侧 hover 出现滚动条）",
         );
+        let _ = multiline.set_clearable(app, true);
         inputs.push(multiline);
         themed_label(
             app,
@@ -1308,8 +1534,8 @@ impl Gallery {
             app,
             window,
             content,
-            11,
-            "⑪ markdown（富文本 / 代码 / 表格 / 行内图片占位）",
+            12,
+            "⑫ markdown（富文本 / 代码 / 表格 / 行内图片占位）",
             H_MARKDOWN,
             &theme,
         );
@@ -1321,8 +1547,8 @@ impl Gallery {
             app,
             window,
             content,
-            12,
-            "⑫ 浮层（Overlay / Tooltip / Dropdown / Select / Menu / ContextMenu）",
+            13,
+            "⑬ 浮层（Overlay / Tooltip / Dropdown / Select / Menu / ContextMenu）",
             H_OVERLAYS,
             &theme,
         );
@@ -1417,7 +1643,11 @@ impl Gallery {
                 DropdownItem::new("c", "选项 C（禁用）").disabled(true),
             ],
         );
-        let _ = dropdown.mount(app, window, overlay_row);
+        if let Err(error) = dropdown.mount(app, window, overlay_row) {
+            wheel_check
+                .borrow_mut()
+                .setup_failure("⑬ dropdown mount", &error);
+        }
 
         let select = Select::new(
             app,
@@ -1440,7 +1670,11 @@ impl Gallery {
                 SelectItem::new("d5", "标签五"),
             ],
         );
-        let _ = select.mount(app, window, overlay_row);
+        if let Err(error) = select.mount(app, window, overlay_row) {
+            wheel_check
+                .borrow_mut()
+                .setup_failure("⑬ select mount", &error);
+        }
 
         let menu = Menu::new(
             app,
@@ -1545,8 +1779,8 @@ impl Gallery {
             app,
             window,
             content,
-            13,
-            "⑬ 对话框（Dialog 模态 + Alert 内容面板）",
+            14,
+            "⑭ 对话框（Dialog 模态 + Alert 内容面板）",
             H_DIALOGS,
             &theme,
         );
@@ -1634,8 +1868,8 @@ impl Gallery {
             app,
             window,
             content,
-            14,
-            "⑭ 颜色选择器（ColorPicker：色板 / HSLA / HEX）",
+            15,
+            "⑮ 颜色选择器（ColorPicker：色板 / HSLA / HEX）",
             H_PICKER,
             &theme,
         );
@@ -1659,8 +1893,8 @@ impl Gallery {
             app,
             window,
             content,
-            15,
-            "⑮ 交互日志（最近 8 条：点击 / 切换 / 选择 / 浮层 / 对话框）",
+            16,
+            "⑯ 交互日志（最近 8 条：点击 / 切换 / 选择 / 浮层 / 对话框）",
             H_LOG,
             &theme,
         );
@@ -1693,11 +1927,51 @@ impl Gallery {
 
         match app.make_scroll(window, viewport, ScrollConfig::default()) {
             Ok(handle) => {
-                let _ = app
-                    .set_scroll_content(&handle, LogicalSize::new(px(WINDOW_W), px(total_height)));
+                if let Err(error) = app
+                    .set_scroll_content(&handle, LogicalSize::new(px(WINDOW_W), px(total_height)))
+                {
+                    wheel_check
+                        .borrow_mut()
+                        .setup_failure("⑦ page viewport content", &error);
+                }
             }
-            Err(error) => println!("gallery: WARN viewport scroll registration failed: {error}"),
+            Err(error) => {
+                wheel_check
+                    .borrow_mut()
+                    .setup_failure("⑦ page viewport scroll", &error);
+            }
         }
+
+        let page_bar_rail = container(
+            app,
+            window,
+            root,
+            StyleBuilder::new()
+                .absolute()
+                .top(px(HEADER_H))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .width(px(4.0))
+                .build(),
+        );
+        let page_bar = ScrollBar::new(
+            app,
+            theme.clone(),
+            "gallery.page.scrollbar",
+            ScrollbarAxis::Vertical,
+            ScrollbarOptions::default().hover(),
+        );
+        if let Err(error) = page_bar.build(tree(app, window), page_bar_rail) {
+            wheel_check
+                .borrow_mut()
+                .setup_failure("⑦ page scrollbar build", &error);
+        }
+        if let Err(error) = page_bar.attach(app, window, viewport) {
+            wheel_check
+                .borrow_mut()
+                .setup_failure("⑦ page scrollbar attach", &error);
+        }
+        scroll_bars.push(page_bar.clone());
 
         buttons.extend(chrome_buttons);
         let mut probe_nodes: Vec<(SmolStr, NodeId)> = Vec::with_capacity(8);
@@ -1725,7 +1999,7 @@ impl Gallery {
         for (index, input) in inputs.iter().enumerate() {
             probe_nodes.push((format_smolstr!("input{index}"), input.editable));
         }
-        log_line(app, &log, "gallery: 建树完成（15 个分区）");
+        log_line(app, &log, "gallery: 建树完成（16 个分区）");
 
         Self {
             window,
@@ -1743,7 +2017,11 @@ impl Gallery {
             tab_bar,
             lists,
             scroll_bars,
+            demo,
+            page_bar,
             table,
+            wide_narrow,
+            wide_wide,
             tree: tree_view,
             inputs,
             markdown: Rc::new(RefCell::new(markdown)),
@@ -1760,6 +2038,7 @@ impl Gallery {
             alert_dialog,
             color_picker,
             flags,
+            wheel_check,
             idle: Rc::new(RefCell::new(IdleReport::default())),
             demo_fired: Rc::new(Cell::new(false)),
             probe_nodes,
@@ -1974,37 +2253,9 @@ impl Gallery {
             });
         }
         if self.flags.wheel_check {
-            let viewport = self.viewport;
-            let lists = self.lists.clone();
-            let table = self.table.clone();
-            let _ = app.after(window, Duration::from_millis(500), move |app| {
-                let scroll = app
-                    .scroll_handle(window, viewport)
-                    .and_then(|handle| app.scroll_state(&handle));
-                let hit = app
-                    .window(window)
-                    .and_then(|target| {
-                        target
-                            .tree()
-                            .hit_test(LogicalPoint::new(px(WINDOW_W / 2.0), px(WINDOW_H / 2.0)))
-                    })
-                    .map(|hit| hit.node);
-                let table_offset = table.list().offset(app).map(|offset| offset.value());
-                let list_offset = lists
-                    .first()
-                    .and_then(|list| list.offset(app))
-                    .map(|offset| offset.value());
-                match scroll {
-                    Some(scroll) => println!(
-                        "gallery: wheel-check SKELETON page_offset={:.1} content_height={:.1} hit={hit:?} table_offset={table_offset:?} list_offset={list_offset:?}",
-                        scroll.offset.y, scroll.content.height
-                    ),
-                    None => println!(
-                        "gallery: wheel-check SKELETON page_offset=<missing> content_height=<missing> hit={hit:?} table_offset={table_offset:?} list_offset={list_offset:?}"
-                    ),
-                }
-                app.close_window(window);
-                app.handle().wake();
+            let gallery = self.clone();
+            let _ = app.after(window, Duration::from_millis(700), move |app| {
+                gallery.wheel_stage(app, 0);
             });
         }
         if self.flags.idle_check {
@@ -2079,6 +2330,7 @@ impl Gallery {
             true,
             Some(3),
             ControlSize::Small,
+            &self.wheel_check,
         );
         input.update_value(app, "。".repeat(40).as_str());
         let _ = input.sync(app);
@@ -2130,6 +2382,8 @@ impl Gallery {
             let _ = list.sync(app);
         }
         let _ = self.table.sync(app);
+        let _ = self.wide_narrow.sync(app);
+        let _ = self.wide_wide.sync(app);
         let _ = self.tree.sync(app);
         for input in &self.inputs {
             let _ = input.sync(app);
@@ -2407,6 +2661,561 @@ impl Gallery {
         self.dropdown.dispatch(app, event);
         self.select.dispatch(app, event);
     }
+    fn wheel_stage(&self, app: &mut App, stage: u8) {
+        if app.window(self.window).is_none() {
+            return;
+        }
+        let Some(next) = self.run_wheel_stage(app, stage) else {
+            self.finish_wheel_check(app);
+            return;
+        };
+        let gallery = self.clone();
+        let window = self.window;
+        if app
+            .after(window, Duration::from_millis(360), move |app| {
+                gallery.wheel_stage(app, next);
+            })
+            .is_err()
+        {
+            self.wheel_case("timer.schedule", false);
+            self.finish_wheel_check(app);
+        }
+    }
+
+    fn finish_wheel_check(&self, app: &mut App) {
+        let (failures, cases, page) = {
+            let mut report = self.wheel_check.borrow_mut();
+            report.done = true;
+            (report.failures.len(), report.cases, self.page_offset(app))
+        };
+        println!(
+            "gallery: wheel-check finished failures={failures} cases={cases} page_offset={:.1}",
+            page.value()
+        );
+        if let Some(state) = app.drag_state(self.window) {
+            app.cancel_drag(&state);
+        }
+        app.release_pointer(self.window);
+        let window = self.window;
+        let deferred = app.after(window, Duration::from_millis(1), move |app| {
+            app.close_window(window);
+            app.handle().wake();
+        });
+        if deferred.is_err() {
+            app.close_window(window);
+            app.handle().wake();
+        }
+    }
+
+    fn wheel_case(&self, case: &str, passed: bool) {
+        let mut report = self.wheel_check.borrow_mut();
+        report.cases += 1;
+        if !passed {
+            report.fail(case);
+        }
+    }
+
+    fn page_handle(&self, app: &App) -> Option<ScrollHandle> {
+        app.scroll_handle(self.window, self.viewport)
+    }
+
+    fn page_offset(&self, app: &App) -> LogicalPx {
+        self.page_handle(app)
+            .and_then(|handle| app.scroll_state(&handle))
+            .map_or(LogicalPx::ZERO, |state| state.offset.y)
+    }
+
+    fn scroll_page_to(&self, app: &mut App, node: NodeId) -> Option<LogicalPoint> {
+        let handle = self.page_handle(app)?;
+        let target = app
+            .window(self.window)?
+            .tree()
+            .get(node)
+            .ok()?
+            .layout()
+            .bounds;
+        let state = app.scroll_state(&handle)?;
+        let max = (state.content.height - state.viewport.height).max(LogicalPx::ZERO);
+        let y = (target.origin.y - px(HEADER_H + 40.0)).clamp(LogicalPx::ZERO, max);
+        let _ = app.scroll_to(&handle, LogicalPoint::new(LogicalPx::ZERO, y));
+        let offset = app
+            .scroll_state(&handle)
+            .map_or(LogicalPx::ZERO, |state| state.offset.y);
+        Some(LogicalPoint::new(
+            target.origin.x + target.size.width / 2.0,
+            target.origin.y + target.size.height / 2.0 - offset,
+        ))
+    }
+
+    fn wheel_at(&self, app: &mut App, point: LogicalPoint, dx: f32, dy: f32) {
+        let _ = app.inject_input(
+            self.window,
+            InputEvent::pointer_move(point, Modifiers::empty()),
+        );
+        let _ = app.inject_input(
+            self.window,
+            InputEvent::scroll_lines(point, LogicalPoint::new(px(dx), px(dy)), Modifiers::empty()),
+        );
+    }
+
+    fn drag_at(&self, app: &mut App, from: LogicalPoint, delta: LogicalPoint) {
+        let _ = app.inject_input(
+            self.window,
+            InputEvent::pointer_down(from, PointerButton::Primary, Modifiers::empty()),
+        );
+        let middle = LogicalPoint::new(from.x + delta.x / 2.0, from.y + delta.y / 2.0);
+        let _ = app.inject_input(
+            self.window,
+            InputEvent::pointer_move(middle, Modifiers::empty()),
+        );
+        let end = LogicalPoint::new(from.x + delta.x, from.y + delta.y);
+        let _ = app.inject_input(
+            self.window,
+            InputEvent::pointer_move(end, Modifiers::empty()),
+        );
+        let _ = app.inject_input(
+            self.window,
+            InputEvent::pointer_up(end, PointerButton::Primary, Modifiers::empty()),
+        );
+    }
+
+    fn node_bounds(&self, app: &App, node: NodeId) -> Option<LogicalRect> {
+        Some(
+            app.window(self.window)?
+                .tree()
+                .get(node)
+                .ok()?
+                .layout()
+                .bounds,
+        )
+    }
+
+    fn screen_y(&self, app: &App, node: NodeId) -> Option<LogicalPx> {
+        let tree = app.window(self.window)?.tree();
+        let origin = tree.get(node).ok()?.layout().bounds.origin.y;
+        let mut offset = LogicalPx::ZERO;
+        let mut cursor = tree.get(node).ok()?.parent();
+        while let Some(current) = cursor {
+            if let Some(handle) = app.scroll_handle(self.window, current)
+                && let Some(state) = app.scroll_state(&handle)
+            {
+                offset += state.offset.y;
+            }
+            cursor = tree.get(current).ok()?.parent();
+        }
+        Some(origin - offset)
+    }
+
+    fn list_handle(&self, app: &App, table: &Table) -> Option<ScrollHandle> {
+        let viewport = table.list().viewport_node()?;
+        app.scroll_handle(self.window, viewport)
+    }
+
+    fn scroll_offset(&self, app: &App, handle: &ScrollHandle) -> LogicalPoint {
+        app.scroll_state(handle)
+            .map_or(LogicalPoint::ZERO, |state| state.offset)
+    }
+
+    fn demo_offset(&self, app: &App) -> LogicalPoint {
+        app.scroll_handle(self.window, self.demo.viewport)
+            .and_then(|handle| app.scroll_state(&handle))
+            .map_or(LogicalPoint::ZERO, |state| state.offset)
+    }
+
+    fn hover_inside(&self, app: &App, root: NodeId) -> bool {
+        let Some(window) = app.window(self.window) else {
+            return false;
+        };
+        let tree = window.tree();
+        let mut cursor = app.hovered(self.window);
+        while let Some(node) = cursor {
+            if node == root {
+                return true;
+            }
+            cursor = tree.get(node).ok().and_then(|target| target.parent());
+        }
+        false
+    }
+
+    fn header_aligned(&self, app: &App, table: &Table, x: LogicalPx, column: usize) -> bool {
+        let Some((row, _)) = table.list().mounted_rows(app).first().copied() else {
+            return false;
+        };
+        let (Some(header), Some(cell)) = (
+            table.header_node(app, column),
+            table.cell_node(app, row, column),
+        ) else {
+            return false;
+        };
+        let Some(window) = app.window(self.window) else {
+            return false;
+        };
+        let tree = window.tree();
+        let (Ok(header), Ok(cell)) = (tree.get(header), tree.get(cell)) else {
+            return false;
+        };
+        (header.layout().bounds.origin.x + x - cell.layout().bounds.origin.x).abs() < px(0.5)
+    }
+
+    fn run_wheel_stage(&self, app: &mut App, stage: u8) -> Option<u8> {
+        match stage {
+            0 => {
+                let Some(point) = self.scroll_page_to(app, self.demo.viewport) else {
+                    self.wheel_case("G1.demo.visible", false);
+                    return Some(1);
+                };
+                self.wheel_check.borrow_mut().point = Some(point);
+                let page = self.page_offset(app);
+                self.wheel_at(app, point, 0.0, -2.0);
+                self.wheel_case(
+                    "G1.content.scrolls_inner",
+                    self.demo_offset(app).y > px(0.0),
+                );
+                self.wheel_case("G1.content.page_stays", self.page_offset(app) == page);
+                self.wheel_case("G1.page_bar.scrollable", self.page_bar.scrollable(app));
+                let hit = app
+                    .window(self.window)
+                    .and_then(|target| target.tree().hit_test(point))
+                    .map(|hit| hit.node);
+                self.wheel_case(
+                    "G4.hover.follows_scroll",
+                    hit.is_some() && app.hovered(self.window) == hit,
+                );
+                self.wheel_case(
+                    "G4.hover.in_viewport",
+                    self.hover_inside(app, self.demo.viewport),
+                );
+                Some(1)
+            }
+            1 => {
+                let Some(point) = self.wheel_check.borrow().point else {
+                    self.wheel_case("G5.demo.point", false);
+                    return Some(2);
+                };
+                let page = self.page_offset(app);
+                self.wheel_at(app, point, -1.0, 0.0);
+                self.wheel_case(
+                    "G5.horizontal.scrolls_inner",
+                    self.demo_offset(app).x > px(0.0),
+                );
+                self.wheel_case("G5.horizontal.page_stays", self.page_offset(app) == page);
+                Some(2)
+            }
+            2 => {
+                let Some(point) = self.wheel_check.borrow().point else {
+                    self.wheel_case("G3.boundary.point", false);
+                    return Some(3);
+                };
+                if let Some(handle) = app.scroll_handle(self.window, self.demo.viewport)
+                    && let Some(state) = app.scroll_state(&handle)
+                {
+                    let max_x = (state.content.width - state.viewport.width).max(LogicalPx::ZERO);
+                    let max_y = (state.content.height - state.viewport.height).max(LogicalPx::ZERO);
+                    let _ = app.scroll_to(
+                        &handle,
+                        LogicalPoint::new(max_x, (max_y - px(48.0)).max(LogicalPx::ZERO)),
+                    );
+                    let page = self.page_offset(app);
+                    self.wheel_at(app, point, 0.0, -1.0);
+                    self.wheel_at(app, point, 0.0, -1.0);
+                    self.wheel_case(
+                        "G3.boundary.inner_holds",
+                        self.demo_offset(app) == LogicalPoint::new(max_x, max_y),
+                    );
+                    self.wheel_case("G3.boundary.page_holds", self.page_offset(app) == page);
+                } else {
+                    self.wheel_case("G3.boundary.handle", false);
+                }
+                Some(3)
+            }
+            3 => {
+                let Some(point) = self.wheel_check.borrow().point else {
+                    self.wheel_case("G3.pause.point", false);
+                    return Some(4);
+                };
+                let page = self.page_offset(app);
+                self.wheel_at(app, point, 0.0, -1.0);
+                self.wheel_case("G3.after_pause.page_scrolls", self.page_offset(app) > page);
+                Some(4)
+            }
+            4 => {
+                if let Some(handle) = app.scroll_handle(self.window, self.demo.viewport) {
+                    let _ = app.scroll_to(&handle, LogicalPoint::ZERO);
+                }
+                let track = self.demo.vertical.nodes().0;
+                let Some(point) = track.and_then(|track| self.scroll_page_to(app, track)) else {
+                    self.wheel_case("G2.bar.visible", false);
+                    return Some(5);
+                };
+                let page = self.page_offset(app);
+                let before = self.demo_offset(app);
+                self.wheel_at(app, point, 0.0, -1.0);
+                self.wheel_case("G2.bar.scrolls_owner", self.demo_offset(app).y > before.y);
+                self.wheel_case("G2.bar.page_stays", self.page_offset(app) == page);
+                Some(5)
+            }
+            5 => {
+                let Some(point) = self
+                    .table
+                    .header_node(app, 0)
+                    .and_then(|header| self.scroll_page_to(app, header))
+                else {
+                    self.wheel_case("G2.table_header.visible", false);
+                    return Some(6);
+                };
+                let Some(handle) = self.list_handle(app, &self.table) else {
+                    self.wheel_case("G2.table_header.handle", false);
+                    return Some(6);
+                };
+                let page = self.page_offset(app);
+                let before = self.scroll_offset(app, &handle);
+                self.wheel_at(app, point, 0.0, -1.0);
+                let after = self.scroll_offset(app, &handle);
+                self.wheel_case("G2.table_header.scrolls_table", after.y > before.y);
+                self.wheel_case("G2.table_header.page_stays", self.page_offset(app) == page);
+                Some(6)
+            }
+            6 => {
+                let Some(node) = find_debug_id(
+                    app,
+                    self.window,
+                    "gallery.input.multiline.clear:interactive",
+                ) else {
+                    self.wheel_case("G2.clear.visible", false);
+                    return Some(7);
+                };
+                let Some(point) = self.scroll_page_to(app, node) else {
+                    self.wheel_case("G2.clear.scroll", false);
+                    return Some(7);
+                };
+                let Some(input) = self.inputs.get(3) else {
+                    self.wheel_case("G2.clear.input", false);
+                    return Some(7);
+                };
+                let Some(handle) = app.scroll_handle(self.window, input.viewport) else {
+                    self.wheel_case("G2.clear.handle", false);
+                    return Some(7);
+                };
+                let page = self.page_offset(app);
+                let before = self.scroll_offset(app, &handle);
+                self.wheel_at(app, point, 0.0, -1.0);
+                let after = self.scroll_offset(app, &handle);
+                self.wheel_case("G2.clear.scrolls_input", after.y > before.y);
+                self.wheel_case("G2.clear.page_stays", self.page_offset(app) == page);
+                Some(7)
+            }
+            7 => {
+                let Some(point) = self
+                    .wide_narrow
+                    .header_node(app, 0)
+                    .and_then(|header| self.scroll_page_to(app, header))
+                else {
+                    self.wheel_case("G7.narrow.visible", false);
+                    return Some(8);
+                };
+                let Some(handle) = self.list_handle(app, &self.wide_narrow) else {
+                    self.wheel_case("G7.narrow.handle", false);
+                    return Some(8);
+                };
+                let (Some(state), hbar) =
+                    (app.scroll_state(&handle), self.wide_narrow.horizontal_bar())
+                else {
+                    self.wheel_case("G7.narrow.state", false);
+                    return Some(8);
+                };
+                self.wheel_case(
+                    "G7.narrow.hbar_scrollable",
+                    hbar.scrollable(app) && state.content.width > state.viewport.width,
+                );
+                let page = self.page_offset(app);
+                self.wheel_at(app, point, -1.0, 0.0);
+                self.wheel_case(
+                    "G7.narrow.hscroll_moves",
+                    self.scroll_offset(app, &handle).x > px(0.0),
+                );
+                self.wheel_case("G7.narrow.page_stays", self.page_offset(app) == page);
+                Some(8)
+            }
+            8 => {
+                let (Some(track), Some(thumb)) = self.wide_narrow.horizontal_bar().nodes() else {
+                    self.wheel_case("G7.hbar_track.visible", false);
+                    return Some(9);
+                };
+                let Some(handle) = self.list_handle(app, &self.wide_narrow) else {
+                    self.wheel_case("G7.hbar_track.handle", false);
+                    return Some(9);
+                };
+                let Some(point) = self.scroll_page_to(app, track) else {
+                    self.wheel_case("G7.hbar_track.point", false);
+                    return Some(9);
+                };
+                let hit = app
+                    .window(self.window)
+                    .and_then(|target| target.tree().hit_test(point))
+                    .map(|hit| hit.node);
+                self.wheel_case(
+                    "G7.hbar_track.hit",
+                    hit.is_some_and(|hit| hit == track || hit == thumb),
+                );
+                let page = self.page_offset(app);
+                let before = self.scroll_offset(app, &handle);
+                self.wheel_at(app, point, 0.0, -1.0);
+                let after = self.scroll_offset(app, &handle);
+                self.wheel_case("G7.hbar_track.scrolls_body_y", after.y > before.y);
+                self.wheel_case("G7.hbar_track.page_stays", self.page_offset(app) == page);
+                Some(9)
+            }
+            9 => {
+                let Some(track) = self.wide_narrow.horizontal_bar().nodes().0 else {
+                    self.wheel_case("G7.hbar_thumb.visible", false);
+                    return Some(10);
+                };
+                let Some(handle) = self.list_handle(app, &self.wide_narrow) else {
+                    self.wheel_case("G7.hbar_thumb.handle", false);
+                    return Some(10);
+                };
+                let Some(track_center) = self.scroll_page_to(app, track) else {
+                    self.wheel_case("G7.hbar_thumb.point", false);
+                    return Some(10);
+                };
+                let (Some(track_bounds), Some(thumb)) = (
+                    self.node_bounds(app, track),
+                    self.wide_narrow.horizontal_bar().thumb_rect(app),
+                ) else {
+                    self.wheel_case("G7.hbar_thumb.geometry", false);
+                    return Some(10);
+                };
+                let thumb_center = LogicalPoint::new(
+                    track_center.x - track_bounds.size.width / 2.0
+                        + thumb.origin.x
+                        + thumb.size.width / 2.0,
+                    track_center.y,
+                );
+                let page = self.page_offset(app);
+                let before = self.scroll_offset(app, &handle);
+                self.drag_at(
+                    app,
+                    thumb_center,
+                    LogicalPoint::new(px(40.0), LogicalPx::ZERO),
+                );
+                let after = self.scroll_offset(app, &handle);
+                self.wheel_case("G7.hbar_thumb.drag_moves_x", after.x > before.x);
+                self.wheel_case("G7.hbar_thumb.y_holds", after.y == before.y);
+                self.wheel_case("G7.hbar_thumb.page_stays", self.page_offset(app) == page);
+                Some(10)
+            }
+            10 => {
+                let Some(header) = self.wide_narrow.header_node(app, 0) else {
+                    self.wheel_case("G7.header.visible", false);
+                    return Some(11);
+                };
+                let Some(header_content) =
+                    find_debug_id(app, self.window, "gallery.wide.narrow:header:content")
+                else {
+                    self.wheel_case("G7.header.content_visible", false);
+                    return Some(11);
+                };
+                let Some(handle) = self.list_handle(app, &self.wide_narrow) else {
+                    self.wheel_case("G7.header.handle", false);
+                    return Some(11);
+                };
+                let Some(viewport) = self.wide_narrow.list().viewport_node() else {
+                    self.wheel_case("G7.header.viewport", false);
+                    return Some(11);
+                };
+                let Some(point) = self.scroll_page_to(app, viewport) else {
+                    self.wheel_case("G7.header.point", false);
+                    return Some(11);
+                };
+                let (Some(header_y), Some(header_content_y)) = (
+                    self.screen_y(app, header),
+                    self.screen_y(app, header_content),
+                ) else {
+                    self.wheel_case("G7.header.screen_y", false);
+                    return Some(11);
+                };
+                let page = self.page_offset(app);
+                let before = self.scroll_offset(app, &handle);
+                self.wheel_at(app, point, 0.0, -2.0);
+                let after = self.scroll_offset(app, &handle);
+                self.wheel_case("G7.header.body_scrolls_y", after.y > before.y);
+                self.wheel_case("G7.header.page_stays", self.page_offset(app) == page);
+                let mut report = self.wheel_check.borrow_mut();
+                report.header_y = Some(header_y);
+                report.header_content_y = Some(header_content_y);
+                Some(11)
+            }
+            11 => {
+                let (header_y, header_content_y) = {
+                    let report = self.wheel_check.borrow();
+                    (report.header_y, report.header_content_y)
+                };
+                let (Some(header), Some(header_content), Some(header_y), Some(header_content_y)) = (
+                    self.wide_narrow.header_node(app, 0),
+                    find_debug_id(app, self.window, "gallery.wide.narrow:header:content"),
+                    header_y,
+                    header_content_y,
+                ) else {
+                    self.wheel_case("G7.header.y_fixed", false);
+                    return Some(12);
+                };
+                self.wheel_case(
+                    "G7.header.y_fixed",
+                    self.screen_y(app, header)
+                        .is_some_and(|y| (y - header_y).abs() < px(0.5)),
+                );
+                self.wheel_case(
+                    "G7.header.content_y_fixed",
+                    self.screen_y(app, header_content)
+                        .is_some_and(|y| (y - header_content_y).abs() < px(0.5)),
+                );
+                let Some(handle) = self.list_handle(app, &self.wide_narrow) else {
+                    self.wheel_case("G9.handle", false);
+                    return Some(12);
+                };
+                let x = self.scroll_offset(app, &handle).x;
+                self.wheel_case("G9.sticky_has_offset", x > px(0.0));
+                for column in [0usize, 1, 2, 6] {
+                    let aligned = self.header_aligned(app, &self.wide_narrow, x, column);
+                    self.wheel_case("G9.columns_align", aligned);
+                }
+                Some(12)
+            }
+            12 => {
+                let Some(point) = self
+                    .wide_wide
+                    .header_node(app, 0)
+                    .and_then(|header| self.scroll_page_to(app, header))
+                else {
+                    self.wheel_case("G8.wide.visible", false);
+                    return Some(13);
+                };
+                let Some(handle) = self.list_handle(app, &self.wide_wide) else {
+                    self.wheel_case("G8.wide.handle", false);
+                    return Some(13);
+                };
+                let Some(state) = app.scroll_state(&handle) else {
+                    self.wheel_case("G8.wide.state", false);
+                    return Some(13);
+                };
+                self.wheel_case(
+                    "G8.wide.no_hbar",
+                    !self.wide_wide.horizontal_bar().scrollable(app)
+                        && state.content.width <= state.viewport.width,
+                );
+                let page = self.page_offset(app);
+                let before = self.scroll_offset(app, &handle);
+                self.wheel_at(app, point, 0.0, -1.0);
+                self.wheel_case(
+                    "G8.wide.vertical_scrolls_body",
+                    self.scroll_offset(app, &handle).y > before.y,
+                );
+                self.wheel_case("G8.wide.page_stays", self.page_offset(app) == page);
+                Some(13)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn make_button(
@@ -2510,6 +3319,7 @@ fn make_input(
     multiline: bool,
     visible_lines: Option<u16>,
     size: ControlSize,
+    report: &Rc<RefCell<WheelCheckReport>>,
 ) -> InputNode {
     let spec = Arc::new(InputSpec {
         name: SmolStr::new_static(name),
@@ -2534,7 +3344,9 @@ fn make_input(
         &state,
         &placeholder_signal,
     );
-    node.install(app);
+    if let Err(error) = node.install(app) {
+        report.borrow_mut().setup_failure("input install", &error);
+    }
     node
 }
 
@@ -2787,7 +3599,6 @@ fn record_picker_metrics(
 }
 
 struct NoAssets;
-
 impl MarkdownAssets for NoAssets {
     fn load(&self, _path: &str) -> Option<Cow<'static, [u8]>> {
         None
@@ -2796,13 +3607,22 @@ impl MarkdownAssets for NoAssets {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flags = parse_flags();
+    if flags.wheel_check {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(15));
+            println!(
+                "gallery: wheel-check FAIL (watchdog timeout after 15 s, process did not exit)"
+            );
+            std::process::exit(3);
+        });
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let mut app = App::new(runtime.handle().clone());
     let gallery = Gallery::build(&mut app, flags);
     println!(
-        "gallery: window {:?} created ({}×{} logical), 15 sections",
+        "gallery: window {:?} created ({}×{} logical), 16 sections",
         gallery.window, WINDOW_W, WINDOW_H
     );
     gallery.install(&mut app);
@@ -2858,8 +3678,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if gallery.flags.wheel_check {
-        println!("gallery: wheel-check FAIL (skeleton: assertions land in P3)");
-        failed = true;
+        let report = gallery.wheel_check.borrow();
+        if report.pass() {
+            println!(
+                "gallery: wheel-check PASS (G1-G5, G7-G9; {} assertion(s))",
+                report.cases
+            );
+        } else {
+            println!(
+                "gallery: wheel-check FAIL ({} failure(s) / {} assertion(s), see lines above)",
+                report.failures.len(),
+                report.cases
+            );
+            failed = true;
+        }
     }
     if failed {
         std::process::exit(3);

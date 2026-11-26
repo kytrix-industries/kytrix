@@ -1613,7 +1613,7 @@ impl ColorPicker {
             })
             .build(tree, confirm)?;
 
-        input.install(app);
+        input.install(app)?;
 
         let body_view = self.build_body(app, window, body, active)?;
         let panel = Panel {
