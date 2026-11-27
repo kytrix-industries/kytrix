@@ -1098,6 +1098,21 @@ impl Window {
         record::set_frame_stats(self, stats)
     }
     #[cfg(feature = "test-support")]
+    pub(crate) fn set_frame_cpu(&mut self, cpu: std::time::Duration) {
+        record::set_frame_cpu(self, cpu)
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_popup_frame_work(
+        &mut self,
+        tick: crate::popup::animation::PopupAnimationTick,
+    ) {
+        record::set_popup_frame_work(self, tick)
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_popup_settle_rounds(&mut self, rounds: usize) {
+        record::set_popup_settle_rounds(self, rounds)
+    }
+    #[cfg(feature = "test-support")]
     #[must_use]
     pub fn frame_stats(&self) -> Option<&FrameStats> {
         self.record.as_ref().map(|record| &record.stats)

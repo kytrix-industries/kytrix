@@ -6,11 +6,18 @@ use crate::{
     math::LogicalPoint,
     node::tree::PopupTransform,
     popup::{
-        POPUP_CLOSE_DURATION, POPUP_OPEN_DURATION, POPUP_SLIDE_DISTANCE, PopupAnimation,
-        PopupAnimationKind, PopupAnimationState, PopupId, PopupState, PopupTier, Side,
+        POPUP_CLOSE_DURATION, POPUP_OPEN_DURATION, POPUP_SCALE_FROM, POPUP_SLIDE_DISTANCE,
+        PopupAnimation, PopupAnimationKind, PopupAnimationState, PopupId, PopupState, Side,
     },
     window::WindowId,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PopupAnimationTick {
+    pub opening: bool,
+    pub closing: bool,
+    pub records: usize,
+}
 
 fn slide_origin(side: Side) -> LogicalPoint {
     let distance = POPUP_SLIDE_DISTANCE;
@@ -32,18 +39,25 @@ pub(crate) fn start_open(app: &mut App, window: WindowId, id: PopupId) {
     };
     let node = entry.node;
     let animation = entry.animation;
-    let modal = entry.is_modal();
-    let tier = entry.tier;
+    let fade_only = entry.is_fade_only();
     let side = entry.placement.side;
+    let pivot = entry.paint_center();
     let offset = match animation {
-        PopupAnimation::None | PopupAnimation::Fade => LogicalPoint::ZERO,
+        PopupAnimation::None | PopupAnimation::Fade | PopupAnimation::FadeScale => {
+            LogicalPoint::ZERO
+        }
         PopupAnimation::FadeSlide => {
-            if modal || tier == PopupTier::Modal {
+            if fade_only {
                 LogicalPoint::ZERO
             } else {
                 slide_origin(side)
             }
         }
+    };
+    let scale = if animation == PopupAnimation::FadeScale && !fade_only {
+        POPUP_SCALE_FROM
+    } else {
+        1.0
     };
     if animation == PopupAnimation::None {
         let _ = target.popups_mut().set_state(id, PopupState::Open);
@@ -55,6 +69,8 @@ pub(crate) fn start_open(app: &mut App, window: WindowId, id: PopupId) {
         Some(PopupTransform {
             offset,
             opacity: 0.0,
+            scale,
+            pivot,
             blocked: false,
         }),
     );
@@ -65,6 +81,8 @@ pub(crate) fn start_open(app: &mut App, window: WindowId, id: PopupId) {
         started: now,
         paint_offset: offset,
         opacity: 1.0,
+        scale_from: scale,
+        scale_to: 1.0,
     });
 }
 
@@ -80,12 +98,17 @@ fn progress(state: &PopupAnimationState, now: std::time::Instant) -> f32 {
     (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
 }
 
-pub(crate) fn tick(app: &mut App, window: WindowId) {
+fn interpolate(from: f32, to: f32, t: f32) -> f32 {
+    from + (to - from) * t
+}
+
+pub(crate) fn tick(app: &mut App, window: WindowId) -> PopupAnimationTick {
+    let mut report = PopupAnimationTick::default();
     let Some(target) = app.window(window) else {
-        return;
+        return report;
     };
     if !target.popups().animating() {
-        return;
+        return report;
     }
     let now = app.now();
     let records: SmallVec<[PopupAnimationState; 8]> =
@@ -94,25 +117,36 @@ pub(crate) fn tick(app: &mut App, window: WindowId) {
     let mut finished_opening: SmallVec<[PopupId; 8]> = SmallVec::new();
     let mut damage: SmallVec<[crate::math::LogicalRect; 8]> = SmallVec::new();
     for record in records {
+        report.records += 1;
         let Some(target) = app.window_mut(window) else {
-            return;
+            return report;
         };
-        let Some((node, rect, state, previous)) =
+        let Some((node, rect, pivot, state, previous)) =
             target.popups().entry(record.id).ok().map(|entry| {
                 let rect = if entry.paint_rect.is_empty() {
                     entry.hit_rect
                 } else {
                     entry.paint_rect
                 };
-                let node = entry.node;
-                (node, rect, entry.state, target.tree().popup_transform(node))
+                (
+                    entry.node,
+                    rect,
+                    entry.paint_center(),
+                    entry.state,
+                    target.tree().popup_transform(entry.node),
+                )
             })
         else {
             finished_closing.push(record.id);
             continue;
         };
+        match record.kind {
+            PopupAnimationKind::Opening => report.opening = true,
+            PopupAnimationKind::Closing => report.closing = true,
+        }
         let t = progress(&record, now);
         let eased = Easing::EaseOutCubic.sample(t);
+        let scale = interpolate(record.scale_from, record.scale_to, eased);
         let (offset, opacity, done) = match record.kind {
             PopupAnimationKind::Opening => {
                 let offset = LogicalPoint::new(
@@ -143,6 +177,8 @@ pub(crate) fn tick(app: &mut App, window: WindowId) {
             Some(PopupTransform {
                 offset,
                 opacity,
+                scale,
+                pivot,
                 blocked: matches!(state, PopupState::DismissPending | PopupState::Closing),
             })
         };
@@ -184,4 +220,5 @@ pub(crate) fn tick(app: &mut App, window: WindowId) {
     {
         app.request_frame();
     }
+    report
 }

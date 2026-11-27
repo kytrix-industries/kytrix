@@ -154,6 +154,7 @@ impl PaintPass<'_> {
             0,
             0,
             1.0,
+            None,
             mode.is_full(),
         )?;
         let order_rebuilt = match context.mode {
@@ -230,6 +231,127 @@ struct PaintContext<'a> {
 
 fn offset_between(total: LogicalPoint, slot_offset: LogicalPoint) -> LogicalPoint {
     LogicalPoint::new(total.x - slot_offset.x, total.y - slot_offset.y)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PopupScale {
+    factor: f32,
+    pivot: LogicalPoint,
+}
+
+impl PopupScale {
+    fn point(self, point: LogicalPoint) -> LogicalPoint {
+        LogicalPoint::new(
+            px(self.pivot.x.value() + self.factor * (point.x - self.pivot.x).value()),
+            px(self.pivot.y.value() + self.factor * (point.y - self.pivot.y).value()),
+        )
+    }
+
+    fn length(self, length: LogicalPx) -> LogicalPx {
+        px(length.value() * self.factor)
+    }
+
+    fn size(self, size: crate::math::LogicalSize) -> crate::math::LogicalSize {
+        crate::math::LogicalSize::new(self.length(size.width), self.length(size.height))
+    }
+
+    fn rect(self, rect: LogicalRect) -> LogicalRect {
+        let origin = self.point(rect.origin);
+        LogicalRect::new(
+            origin.x,
+            origin.y,
+            self.length(rect.size.width),
+            self.length(rect.size.height),
+        )
+    }
+
+    fn clip(self, mut clip: ClipRect) -> ClipRect {
+        clip.rect = self.rect(clip.rect);
+        clip.corner_radius = clip.corner_radius.map(|radius| self.length(radius));
+        clip
+    }
+
+    fn transform(self) -> crate::math::Transform {
+        crate::math::Transform::translate(-self.pivot.x, -self.pivot.y)
+            .then(crate::math::Transform::scale(self.factor, self.factor))
+            .then(crate::math::Transform::translate(
+                self.pivot.x,
+                self.pivot.y,
+            ))
+    }
+
+    fn primitive(self, primitive: Primitive) -> Primitive {
+        match primitive {
+            Primitive::Quad(mut quad) => {
+                quad.bounds = self.rect(quad.bounds);
+                quad.corner_radius = quad.corner_radius.map(|radius| self.length(radius));
+                quad.paint = match quad.paint {
+                    QuadPaint::Solid { fill, border } => QuadPaint::Solid {
+                        fill,
+                        border: border.map(|border| crate::paint::primitive::Border {
+                            width: self.length(border.width),
+                            color: border.color,
+                        }),
+                    },
+                    QuadPaint::Gradient(gradient) => QuadPaint::Gradient(gradient),
+                };
+                Primitive::Quad(quad)
+            }
+            Primitive::Shadow(mut shadow) => {
+                shadow.rect = self.rect(shadow.rect);
+                shadow.offset =
+                    LogicalPoint::new(self.length(shadow.offset.x), self.length(shadow.offset.y));
+                shadow.blur = self.length(shadow.blur);
+                shadow.corner_radius = shadow.corner_radius.map(|radius| self.length(radius));
+                Primitive::Shadow(shadow)
+            }
+            Primitive::Image(mut image) => {
+                image.bounds = self.rect(image.bounds);
+                Primitive::Image(image)
+            }
+            Primitive::GlyphRun(mut run) => {
+                for glyph in &mut run.glyphs {
+                    glyph.position = self.point(glyph.position);
+                    glyph.size = self.size(glyph.size);
+                }
+                Primitive::GlyphRun(run)
+            }
+            Primitive::Path(path) => Primitive::Geometry(GeometryDraw {
+                id: path.geometry,
+                transform: self.transform(),
+                color: path.fill,
+                range: crate::paint::geometry::FULL_INDEX_RANGE,
+            }),
+            Primitive::Geometry(mut draw) => {
+                draw.transform = draw.transform.then(self.transform());
+                Primitive::Geometry(draw)
+            }
+            Primitive::Clip(ClipOp::Push(clip)) => Primitive::Clip(ClipOp::Push(self.clip(clip))),
+            Primitive::Clip(ClipOp::Pop) => Primitive::Clip(ClipOp::Pop),
+            Primitive::Canvas(draw) => {
+                let local = Self {
+                    factor: self.factor,
+                    pivot: LogicalPoint::ZERO,
+                };
+                Primitive::Canvas(CanvasDraw {
+                    canvas: scale_canvas(&draw.canvas, local),
+                    offset: self.point(draw.offset),
+                })
+            }
+            Primitive::Text(text) => Primitive::Text(text),
+        }
+    }
+}
+
+fn scale_canvas(
+    canvas: &crate::paint::canvas::Canvas,
+    scale: PopupScale,
+) -> Arc<crate::paint::canvas::Canvas> {
+    let mut scaled = crate::paint::canvas::Canvas::new(scale.rect(canvas.bounds()));
+    for primitive in canvas.primitives() {
+        scaled.push_primitive(scale.primitive(primitive.clone()));
+    }
+    Arc::new(scaled)
 }
 
 #[derive(Default)]
@@ -389,22 +511,27 @@ fn paint_node(
     slot: u32,
     boundary: usize,
     inherited_opacity: f32,
+    inherited_scale: Option<PopupScale>,
     force: bool,
 ) -> Result<(), EngineError> {
     if !force && !context.tree.paint_marked(node) {
         return Ok(());
     }
     context.visited += 1;
-    let (total, inherited_opacity) =
-        context
-            .tree
-            .popup_transform(node)
-            .map_or((total, inherited_opacity), |transform| {
-                (
-                    LogicalPoint::new(total.x - transform.offset.x, total.y - transform.offset.y),
-                    inherited_opacity * transform.opacity,
-                )
-            });
+    let transform = context.tree.popup_transform(node);
+    let (total, inherited_opacity) = transform.map_or((total, inherited_opacity), |transform| {
+        (
+            LogicalPoint::new(total.x - transform.offset.x, total.y - transform.offset.y),
+            inherited_opacity * transform.opacity,
+        )
+    });
+    let popup_scale = transform
+        .map(|transform| PopupScale {
+            factor: transform.paint_scale(),
+            pivot: transform.pivot,
+        })
+        .filter(|scale| scale.factor != 1.0)
+        .or(inherited_scale);
     let current_key = clip.key();
     let Some(state) = context.tree.paint_state(
         node,
@@ -412,6 +539,9 @@ fn paint_node(
         offset_between(total, slot_offset),
         current_key,
         inherited_opacity,
+        popup_scale.map_or((1.0, LogicalPoint::ZERO), |scale| {
+            (scale.factor, scale.pivot)
+        }),
     ) else {
         return Ok(());
     };
@@ -429,7 +559,16 @@ fn paint_node(
             .lane
             .is_none_or(|lane| context.scene.lane_scroll(lane) == node_slot);
     if let Some(geometry) = state.geometry {
-        paint_geometry_node(context, node, &state, geometry, clip, total, state.opacity)?;
+        paint_geometry_node(
+            context,
+            node,
+            &state,
+            geometry,
+            clip,
+            total,
+            state.opacity,
+            popup_scale,
+        )?;
     } else if reusable {
         if context.mode.is_full()
             && let Some(lane) = state.lane
@@ -459,6 +598,7 @@ fn paint_node(
             node_slot_offset,
             boundary,
             state.opacity,
+            popup_scale,
         )?;
     }
 
@@ -501,6 +641,7 @@ fn paint_node(
             child_slot,
             child_boundary,
             state.opacity,
+            popup_scale,
             expand,
         )?;
     }
@@ -653,6 +794,7 @@ fn rebuild_lane(
     slot_offset: LogicalPoint,
     boundary: usize,
     opacity: f32,
+    popup_scale: Option<PopupScale>,
 ) -> Result<(), EngineError> {
     let created = context.tree.lane_of(node).is_none();
     let lane = match context.tree.lane_of(node) {
@@ -729,13 +871,13 @@ fn rebuild_lane(
     } else {
         &clip.rects[boundary.min(clip.rects.len())..]
     };
-    for clip_rect in inner_clips {
-        let mut baked = *clip_rect;
-        baked.rect = baked.rect.translate(slot_offset);
-        let _ = context
-            .scene
-            .push(lane, Primitive::Clip(ClipOp::Push(baked)));
-    }
+    let lane_scale = popup_scale.map(|scale| PopupScale {
+        factor: scale.factor,
+        pivot: LogicalPoint::new(
+            scale.pivot.x + negate(slot_offset).x,
+            scale.pivot.y + negate(slot_offset).y,
+        ),
+    });
 
     let mut emitter = PrimitiveEmitter {
         node,
@@ -757,7 +899,13 @@ fn rebuild_lane(
         opacity,
         painted: LogicalRect::default(),
         layout_extent_shift: total + negate(slot_offset),
+        popup_scale: lane_scale,
     };
+    for clip_rect in inner_clips {
+        let mut baked = *clip_rect;
+        baked.rect = baked.rect.translate(slot_offset);
+        emitter.push_clip(context, baked);
+    }
     emitter.emit(context);
     let painted_extent = emitter.painted_extent();
     push_painted_shadow(context, &previous_content, total, clip.covering);
@@ -780,6 +928,11 @@ fn rebuild_lane(
     context.tree.set_clip_key(node, clip.key());
     context.tree.set_lane_offset(node, bake);
     context.tree.set_paint_opacity(node, opacity);
+    context.tree.set_paint_scale(
+        node,
+        popup_scale.map_or(1.0, |scale| scale.factor),
+        popup_scale.map_or(LogicalPoint::ZERO, |scale| scale.pivot),
+    );
     context.tree.clear_paint(node);
     context.tree.set_painted_extent(node, painted_extent);
     if needs_screen_bake {
@@ -970,6 +1123,7 @@ fn paint_geometry_node(
     clip: &ClipContext,
     total: LogicalPoint,
     opacity: f32,
+    popup_scale: Option<PopupScale>,
 ) -> Result<(), EngineError> {
     let snapshot = context.geometry.snapshot_arc(geometry_id);
     let desired = snapshot
@@ -1015,6 +1169,11 @@ fn paint_geometry_node(
             bake,
         );
         context.tree.set_paint_opacity(node, opacity);
+        context.tree.set_paint_scale(
+            node,
+            popup_scale.map_or(1.0, |scale| scale.factor),
+            popup_scale.map_or(LogicalPoint::ZERO, |scale| scale.pivot),
+        );
         context.tree.set_baked_screen_bounds(node, bounds);
         return Ok(());
     }
@@ -1078,11 +1237,6 @@ fn paint_geometry_node(
             .scene
             .set_lane_geometry_chunk(lane, Some((geometry_id, chunk as u32)));
         context.tree.set_lane_offset(node, bake);
-        for clip_rect in inner_clips {
-            let _ = context
-                .scene
-                .push(lane, Primitive::Clip(ClipOp::Push(*clip_rect)));
-        }
         let mut emitter = PrimitiveEmitter {
             lane,
             node,
@@ -1107,7 +1261,11 @@ fn paint_geometry_node(
             opacity,
             painted: LogicalRect::default(),
             layout_extent_shift: total,
+            popup_scale,
         };
+        for clip_rect in inner_clips {
+            emitter.push_clip(context, *clip_rect);
+        }
         if chunk == 0 {
             emitter.emit_decorations(context, opacity);
         }
@@ -1228,6 +1386,11 @@ fn paint_geometry_node(
     context.tree.set_clip_key(node, clip.key());
     context.tree.set_lane_offset(node, bake);
     context.tree.set_paint_opacity(node, opacity);
+    context.tree.set_paint_scale(
+        node,
+        popup_scale.map_or(1.0, |scale| scale.factor),
+        popup_scale.map_or(LogicalPoint::ZERO, |scale| scale.pivot),
+    );
     context.tree.clear_paint(node);
     context.tree.set_baked_screen_bounds(node, bounds);
     if !context.mode.is_full() && created_any {
@@ -1307,6 +1470,7 @@ struct PrimitiveEmitter {
     opacity: f32,
     painted: LogicalRect,
     layout_extent_shift: LogicalPoint,
+    popup_scale: Option<PopupScale>,
 }
 
 struct TextDecorations {
@@ -1574,8 +1738,19 @@ fn geometry_drawn_bounds(
 
 impl PrimitiveEmitter {
     fn push(&mut self, context: &mut PaintContext<'_>, primitive: Primitive) {
+        let primitive = match self.popup_scale {
+            Some(scale) => scale.primitive(primitive),
+            None => primitive,
+        };
         let _ = context.scene.push(self.lane, primitive);
         self.emitted += 1;
+    }
+
+    fn push_clip(&mut self, context: &mut PaintContext<'_>, clip: ClipRect) {
+        let clip = self.popup_scale.map_or(clip, |scale| scale.clip(clip));
+        let _ = context
+            .scene
+            .push(self.lane, Primitive::Clip(ClipOp::Push(clip)));
     }
 
     fn note_painted(&mut self, lane_bounds: LogicalRect) {
@@ -1778,9 +1953,7 @@ impl PrimitiveEmitter {
             corner_radius: [LogicalPx::ZERO; 4],
         });
         if let Some(clip_rect) = content_clip {
-            let _ = context
-                .scene
-                .push(self.lane, Primitive::Clip(ClipOp::Push(clip_rect)));
+            self.push_clip(context, clip_rect);
         }
         self.push(
             context,
@@ -1810,9 +1983,7 @@ impl PrimitiveEmitter {
                 corner_radius: [LogicalPx::ZERO; 4],
             });
         if let Some(clip_rect) = content_clip {
-            let _ = context
-                .scene
-                .push(self.lane, Primitive::Clip(ClipOp::Push(clip_rect)));
+            self.push_clip(context, clip_rect);
         }
         match std::mem::replace(&mut self.content, Content::Box) {
             Content::Box => {}

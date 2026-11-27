@@ -56,6 +56,26 @@ pub(crate) fn set_frame_stats(window: &mut Window, stats: FrameStats) {
     window.stats = stats;
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) fn set_frame_cpu(window: &mut Window, cpu: std::time::Duration) {
+    window.stats.frame_cpu = Some(cpu);
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn set_popup_frame_work(
+    window: &mut Window,
+    tick: crate::popup::animation::PopupAnimationTick,
+) {
+    window.stats.popup_opening = tick.opening;
+    window.stats.popup_closing = tick.closing;
+    window.stats.popup_animation_records = tick.records;
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn set_popup_settle_rounds(window: &mut Window, rounds: usize) {
+    window.stats.popup_settle_rounds = window.stats.popup_settle_rounds.saturating_add(rounds);
+}
+
 #[cfg(feature = "hud")]
 pub(crate) fn reset_debug_hud_timing(window: &mut Window) {
     window.render_stats = crate::render::RenderStats::default();

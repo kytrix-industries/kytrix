@@ -332,7 +332,7 @@ mod tests {
         math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::style_builder::StyleBuilder,
-        popup::{PopupError, PopupId, PopupSnapshotEntry, PopupState},
+        popup::{DismissReason, PopupError, PopupId, PopupSnapshotEntry, PopupState},
         test_support::app::TestApp,
         window::WindowId,
     };
@@ -852,6 +852,28 @@ mod tests {
             "背景滚动必须关闭右键菜单整链（设计 §4.7 矩阵）"
         );
         assert_eq!(harness.closes.get(), 1, "关闭只上报一次");
+    }
+
+    #[test]
+    fn a_page_scroll_close_reports_anchor_lost() {
+        let mut harness = Harness::new();
+        let page = scroll_page(&mut harness);
+        let reasons: Rc<RefCell<Vec<DismissReason>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = reasons.clone();
+        let menu = harness
+            .menu(options())
+            .on_close(move |_, reason| sink.borrow_mut().push(reason));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
+        assert!(menu.is_open(harness.app.app()), "右键菜单打开");
+
+        wheel(&mut harness, &menu, LogicalPoint::new(px(700.0), px(500.0)));
+        assert!(page_offset(&harness, &page) > 50.0);
+        assert!(!menu.is_open(harness.app.app()));
+        assert_eq!(
+            reasons.borrow().as_slice(),
+            &[DismissReason::AnchorLost],
+            "外部滚动关闭整链必须上报 AnchorLost（R2-02/Q2-07）"
+        );
     }
 
     #[test]

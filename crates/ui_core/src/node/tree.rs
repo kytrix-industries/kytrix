@@ -376,7 +376,20 @@ pub(crate) struct BakedGeometryChunk {
 pub(crate) struct PopupTransform {
     pub offset: LogicalPoint,
     pub opacity: f32,
+    pub scale: f32,
+    pub pivot: LogicalPoint,
     pub blocked: bool,
+}
+
+impl PopupTransform {
+    #[must_use]
+    pub(crate) fn paint_scale(self) -> f32 {
+        if self.scale.is_finite() {
+            self.scale.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -400,6 +413,7 @@ pub struct NodeTree {
     baked_screen_bounds: Vec<Option<LogicalRect>>,
     painted_extents: Vec<Option<PaintedExtent>>,
     popup_transforms: Vec<Option<PopupTransform>>,
+    paint_scales: Vec<(f32, LogicalPoint)>,
     popup_pointer_transparent: Vec<bool>,
     subtree_bounds: Vec<LogicalRect>,
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
@@ -1304,6 +1318,9 @@ impl NodeTree {
     pub(crate) fn set_paint_opacity(&mut self, node: NodeId, opacity: f32) {
         content::set_paint_opacity(self, node, opacity)
     }
+    pub(crate) fn set_paint_scale(&mut self, node: NodeId, scale: f32, pivot: LogicalPoint) {
+        content::set_paint_scale(self, node, scale, pivot)
+    }
     pub(crate) fn paint_state(
         &self,
         node: NodeId,
@@ -1311,6 +1328,7 @@ impl NodeTree {
         bake_offset: LogicalPoint,
         clip_key: (u8, Option<DeviceRect>),
         inherited_opacity: f32,
+        paint_scale: (f32, LogicalPoint),
     ) -> Option<PaintNodeState> {
         content::paint_state(
             self,
@@ -1319,6 +1337,7 @@ impl NodeTree {
             bake_offset,
             clip_key,
             inherited_opacity,
+            paint_scale,
         )
     }
     pub(crate) fn set_clip_key(&mut self, node: NodeId, key: (u8, Option<DeviceRect>)) {

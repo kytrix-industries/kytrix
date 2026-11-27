@@ -11,8 +11,8 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     popup::{
-        Alignment, Anchor, DismissPolicy, EscapePolicy, FocusPolicy, HasPopup, OutsidePress,
-        PlacementSpec, PopupError, PopupTier, RestoreFocus, Side,
+        Alignment, Anchor, DismissPolicy, DismissReason, EscapePolicy, FocusPolicy, HasPopup,
+        OutsidePress, PlacementSpec, PopupError, PopupTier, RestoreFocus, Side,
     },
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
@@ -524,8 +524,12 @@ impl Dropdown {
     }
 
     pub fn close(&self, app: &mut App) -> bool {
+        self.close_with_reason(app, DismissReason::Programmatic)
+    }
+
+    fn close_with_reason(&self, app: &mut App, reason: DismissReason) -> bool {
         self.inner.watch.borrow_mut().reset();
-        self.inner.panel.close(app)
+        self.inner.panel.close_with_reason(app, reason)
     }
 
     pub fn close_now(&self, app: &mut App) -> bool {
@@ -547,7 +551,7 @@ impl Dropdown {
                     self.inner.watch.borrow_mut().observe(app, id, window) == AnchorChange::Lost
                 });
             if lost {
-                changed |= self.close(app);
+                changed |= self.close_with_reason(app, DismissReason::AnchorLost);
             }
             self.measure_trigger(app);
             if self.inner.options.width.is_none() {
@@ -850,7 +854,7 @@ mod tests {
         math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
         paint::style_builder::StyleBuilder,
-        popup::{HasPopup, PopupId, PopupSnapshotEntry, PopupState},
+        popup::{DismissReason, HasPopup, PopupId, PopupSnapshotEntry, PopupState},
         test_support::app::TestApp,
         window::WindowId,
     };
@@ -1368,6 +1372,56 @@ mod tests {
     }
 
     #[test]
+    fn the_dropdown_slides_in_without_moving_the_settled_rect() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        let _ = harness.app.drain().expect("帧");
+        harness.press_release(harness.center(trigger));
+        let opening_frame = harness.app.drain().expect("打开帧").clone();
+        let opening = harness.popup_entry(&dropdown);
+        assert_eq!(
+            opening.paint_scale, 1.0,
+            "FadeSlide 不做 scale（scale 只属于 FadeScale）"
+        );
+        assert!(
+            opening.paint_offset.x == LogicalPx::ZERO
+                && (opening.paint_offset.y - px(4.0)).abs() < px(0.5),
+            "Dropdown 必须与 Menu 一致使用 FadeSlide（打开帧向下 4px）：{:?}",
+            opening.paint_offset
+        );
+        assert!(
+            !opening_frame.damage_full,
+            "slide 打开帧必须局部重绘（I6）：{:?}",
+            opening_frame.damage
+        );
+        let first = opening.hit_rect;
+        for _ in 0..3 {
+            harness.app.advance(Duration::from_millis(16));
+            let record = harness.app.drain().expect("slide 帧").clone();
+            assert!(
+                !record.damage_full,
+                "slide 帧必须局部重绘：{:?}",
+                record.damage
+            );
+        }
+        harness.settle(&dropdown);
+        let settled = harness.popup_entry(&dropdown);
+        assert_eq!(
+            settled.paint_offset,
+            LogicalPoint::ZERO,
+            "动画结束后 paint_offset 必须归零"
+        );
+        assert_eq!(settled.paint_scale, 1.0);
+        assert_eq!(
+            settled.hit_rect, first,
+            "slide 只改绘制偏移，settle rect 必须首帧即稳定"
+        );
+        assert_eq!(settled.state, PopupState::Open);
+    }
+
+    #[test]
     fn scrolling_the_trigger_out_of_the_page_closes_the_dropdown() {
         let mut harness = Harness::new();
         let (page, scroll) = harness.scroll_page();
@@ -1386,6 +1440,39 @@ mod tests {
         assert!(
             !dropdown.is_open(harness.app.app()),
             "触发器滚出滚动页后关闭面板"
+        );
+    }
+
+    #[test]
+    fn losing_the_anchor_reports_anchor_lost() {
+        let mut harness = Harness::new();
+        let (page, scroll) = harness.scroll_page();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount_under(&dropdown, items(), page);
+        let reasons: Rc<RefCell<Vec<DismissReason>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = reasons.clone();
+        dropdown
+            .inner
+            .panel
+            .on_close(move |_, reason| sink.borrow_mut().push(reason));
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&scroll, LogicalPoint::new(px(0.0), px(600.0)))
+            .expect("滚动");
+        harness.settle(&dropdown);
+        assert!(
+            !dropdown.is_open(harness.app.app()),
+            "锚点滚出视口后关闭面板"
+        );
+        assert_eq!(
+            reasons.borrow().as_slice(),
+            &[DismissReason::AnchorLost],
+            "锚点丢失/滚出视口关闭必须上报 AnchorLost（R2-02/Q2-07）"
         );
     }
 

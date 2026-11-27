@@ -732,7 +732,7 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 - **94 条构成**：32 条逐帧采样断言（`changed-outside-damage`；首帧整帧重放时 `full-replay`）+ 16 条 `background-residue`（open/reopen 两个采样窗各 8 帧）+ 46 条静态断言（20 `idle-frames` + 3 `restored` + 2 `close-frames` + 18 具名不变量 + 3 `sampled-animation-floor`）。
 - **相对 P0 108 条的差异（口径说明）**：采样帧 45→32（场景迁到 PopupPanel 后动画时长/采样窗口变化）；idle 期在 `PixelFrame::Idle` 提前返回、不再产生 `background-residue` 逐像素比较（P0 的 20 条 idle 期 background-residue 由 20 条 `idle-frames` + `idle-no-animation` 覆盖“无动画源/无绘制帧”），因此 94 与 108 **不是逐条等价**。
 - **`sampled-animation-floor` 口径**：open/close 的“已提交帧增量”下界；终审 K1-06 修复后按**单次关闭分段**校验（open ≥4、close#1 ≥3、close#2 ≥3，实测 8 / 6+6），防止动画常量变短或单次关闭完全不播动画时被累计采样掩盖；它仍**不是**“每一帧都是动画帧”的逐帧计数。
-- **`--debug-stack` 实测基线**：`menu` 度量 `(6, 180.0, 127.5125)`、picker children=4、最终 `entries=0`、`overlay-check PASS`，exit 0；自动化完成后自行关窗（`overlay-check complete -> closing window`），`--auto-close` 仅 ≥30s 看门狗，带 9 与不带 auto-close 均 PASS。`menu_frames`/`picker_frames` 为逐帧采样计数、运行间浮动（只断言 >0），不是固定契约。
+- **`--debug-stack` 实测基线（P1/P2 历史）**：`menu` 度量 `(6, 180.0, 127.5125)`、picker children=4、最终 `entries=0`、`overlay-check PASS`，exit 0；**P3 现测 `menu=(9, 270.0, 180.075)`（见 §14）**；自动化完成后自行关窗（`overlay-check complete -> closing window`），`--auto-close` 仅 ≥30s 看门狗，带 9 与不带 auto-close 均 PASS。`menu_frames`/`picker_frames` 为逐帧采样计数、运行间浮动（只断言 >0），不是固定契约。
 - **旧 `--dump-overlay` 已移除且显式失败**：参数表中不再存在；传旧名会打印 `gallery: --dump-overlay was renamed; use --debug-stack --auto-close=9` 并 **exit 2**；其它未知参数会打印 `gallery: unknown argument <arg>` 与 usage 并 **exit 2**；`--help` 仍 exit 0（不再“忽略后 exit 0”假绿，终审 K1-04/Q1-07）。三端脚本与 README 一律改 `--debug-stack`。
 - **P1 完成状态**：gallery 的 ⑭ ColorPicker 场景与 overlay-check 已全部跑在新 popup API 上；真实窗口像素 readback/截图与三端验收仍为 **P3-6**（`--debug-stack` 只断言栈/rect）。
 - **最终数字（round-3）**：`--pixel-check` `checks=94`、`close 6+6=12` 不变；`cargo test -p ui_core -p ui_kit` 最终 3780 passed / 2 ignored（ui_kit 801），详见设计 §12.5。**P2 后记录见 §13.6。**
@@ -745,3 +745,29 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 - **命令不变**：`cargo run -p ui_kit --example gallery -- --debug-stack`（自行退出 0/3；`--auto-close` 仅 ≥30s 看门狗）；`--pixel-check` 仍为原语义（32 sampled + 16 background-residue + 46 static + close 6+6；P2 不改像素门禁）。
 - **最终数字（task-62 收口后，P2 最终）**：`cargo test -p ui_core -p ui_kit` **3847 passed / 0 failed / 2 ignored**（ui_core lib 2805、popup_behavior 111、ui_kit lib 866）；`--pixel-check` **PASS 94 checks**（32 sampled + 16 background-residue + 46 static；close 6+6）；`--debug-stack` **PASS**（含上述 3 级链阶段）；clippy/fmt/workspace check PASS。详见设计 §13.6。
 - **P1 记录保留**：§13.3/§13.5 的 P1 语义与 94 checks 构成不变；P2 只新增链阶段与菜单行为。P2 的逐文件 `#[test]` 计数见设计 §13.6（menu 76 / menu_chain 13 / context_menu 20 = 109）。
+
+### 14. P3 回写：真实窗口像素验收与动画/性能（2026-11-27）
+
+> 依据：设计 §14（P3 回写）；实现 `crates/ui_kit/examples/gallery.rs` 的 `--real-pixel-check`、`tools/real-pixel-check-{macos,linux}.sh`。P3 只新增验收能力与动画/关闭 reason 例外，不改变 `--pixel-check`/`--debug-stack` 的既有语义。
+
+- **`--real-pixel-check`（P3-6，真实窗口截图像素门禁）**：固定 960×720 always-on-top 窗口，内容边缘 6 px `#FF00FF` 标记环；平台截图命令抓全屏后解码，由品红框给出内容原点/物理尺寸/DPR，引擎 popup rect 乘窗口 scale 映射到物理像素；序列 `baseline → ColorPicker open/close → 3 级 MenuChain open/close → Dialog+scrim open/close`，打开必须出现可见变化（覆盖量/分散像素），关闭必须逐像素恢复（容差 2/255、coverage floor、触发器环排除）；负向自检（基线平移 (4,3)、改色）必须判红；全部通过 exit 0，失败 exit 3；看门狗 180 s；证据写 `target/real-pixels/<platform>/report.txt` + 00-warmup/00-baseline/01-picker-open/02-picker-closed/03-menu-open/04-menu-closed/05-dialog-open/06-dialog-closed PNG。
+- **命令**：
+  - Windows：`cargo run -p ui_kit --example gallery -- --real-pixel-check`（PowerShell `System.Drawing.CopyFromScreen` 虚拟屏幕）。
+  - macOS：`tools/real-pixel-check-macos.sh`（构建后 `open -a Terminal` + osascript 执行并等待 exit 文件；`screencapture -x` 需要 **Screen Recording/TCC**，普通 ssh 会话只能拍壁纸）。
+  - Linux/Wayland：`tools/real-pixel-check-linux.sh`（以父 Wayland socket 启 nested `sway --unsupported-gpu`，探测 grim-capable socket 后运行；`grim` 抓整个 wl_output 布局）。
+- **三端结果（2026-11-27，P3 最终树全部复跑）**：**Windows/macOS/Ubuntu 各 55 checks PASS**（新增 dialog-scrim-theme/composite/alpha + scrim/panel fault；report 含 source_revision/status/diff_sha/frame/elapsed/scrim_alpha；三端 pixel-check 94 / idle-check / theme-check / debug-stack 均 PASS；`--real-pixel-check` 需独占桌面，并发会假红）：
+
+| 平台 | 结果 | 内容尺寸 / DPR | 耗时 | 证据 |
+|---|---|---|---|---|
+| Windows 11 | PASS 55/0 | 1200×900 / 1.25（screen 4800×3072） | **16.0 s**（elapsed_ms=16004、frame 95） | `target/real-pixels/windows/`（report/run.log/PNG；screen 4800×3072、window_logical 960×720） |
+| macOS | PASS 55/0 | 1914×1437 / 2.0（screen 3360×2100；期望 1920×1440，容差 8） | **31.1 s**（elapsed_ms=31065、frame 97；TCC 需 Terminal） | `target/real-pixels/macos-remote/`（report/run.log/PNG）；远端 `/Users/chenbaiyu/kytrix-p3-accept/target/real-pixels/macos/` |
+| Ubuntu nested sway | PASS 55/0 | 1276×670 / 1.0（screen 1280×720；compositor 尺寸） | **8.1 s**（elapsed_ms=8082、frame 94；fresh nested sway parent wayland-0→wayland-1 + trap） | `target/real-pixels/linux-remote/`（report/run.log/sway.log/PNG）；远端 `/home/chenbaiyu/kytrix-p3-accept/target/real-pixels/linux/` |
+
+- **平台差异/限制**：**`--real-pixel-check` 需独占桌面/前台真实窗口；并发 gallery/截图/窗口操作会遮挡标记环或截错窗口 ⇒ 假红（exit 3）**；**并发桌面下 `--debug-stack` 可能 300 s timeout，验收脚本自动重试 3 次，单次 timeout 只记录该次日志、不改变 gates 总结果**；macOS TCC 权限与 Terminal 启动；Linux 需 Wayland + grim，缺前置时脚本 exit 2；Dialog scrim 覆盖标记环时先重试 scrim-dimmed tone，失败回退 baseline origin，关闭后恢复检测；**三端本次均走 Scrim tone**，`dialog-marker-under-scrim` 仅在 tone==Scrim 记录（Full tone 可检测时跳过）；三端反解 scrim alpha≈0.55（dark palette）；P3A-04 修复后新增 `dialog-scrim-theme`/`dialog-scrim-composite`/`dialog-scrim-alpha`，已校验主题色/合成/alpha。标记厚度 = 6 px × DPR（Windows 8/macOS 10/Linux 6），尺寸容差 `max(4,4×DPR)`；断言数量三端一致（55）而非像素值一致。
+- **证据口径**：三端证据以 `report.txt` 的 `source_revision`/`source_status`/`source_diff_sha`/`source_identity` 为准——**P3 最终快照 HEAD `f24a3441` + dirty(30 files)，`diff_sha=0a9a218b9114d787f9516d2fe227b80f7a25391b`，`source_identity=source-id-file`（三端一致）**；`tools/record-source-id.ps1` 生成 `tools/source-id.txt`（未跟踪生成物，提交前重生成；无则回退 git/unknown）；三端各含 `run.log`。**假绿修复**：`baseline-stable`/`close-residue` 按标记框内缩 `REAL_PIXEL_CORNER_INSET=4` 物理 px 比较，排除 OS 圆角 AA；`gallery.rs` SHA256=`d33facae908cd59d56d5fdaa2d552b6c4043aca0f75b618928e527cd0369d1b0`。
+- **`--pixel-check` 维持**：P3 后仍 **94 checks PASS**（32 sampled、8 open animation、close 6+6、`damage_full_frames=0`、首可见帧 rect==稳定帧）；动画常量（open 120 ms / close 90 ms）不改变采样下限语义。
+- **`--debug-stack` 维持**：真实窗口 3 级链/取色器栈/首可见帧/rect/Z/parent 断言 PASS（exit 0；menu 度量 `(9, 270.0, 180.075)`，P2 历史基线 `(6, 180.0, 127.5)`）；P3 的 `FadeSlide`/`FadeScale` 不改变 settle 后 hit/paint rect；dump 不含 `paint_scale`（P3K-08，P4）。
+- **P3 动画落点**：Menu/ContextMenu 打开动画改 `FadeSlide`（4 px slide + fade）；Dialog/ColorPicker 改 `FadeScale`（非模态 0.98→1/120 ms，modal fade-only）；Dropdown/Select 也经 `ItemPanel` 使用 `FadeSlide`。
+- **P3 新增测试落点**：gallery 侧真实像素自动化 + 三端脚本；引擎/kit 单测见设计 §14.5（`popup_behavior` 12 条、kit 12 条，含 FadeScale dpr/局部 damage/modal fade-only、shadow offset 向量、scrim fade-only、Glyph/Image 缩放、Dropdown/Select slide、reason 不泄漏）。
+- **P3 审查后加强**：Dropdown/Select 各补 slide 断言（打开帧 `paint_offset.y=4`→settle 归零、settle rect 不变）；`popup_panel` 补 scrim fade-only/scale 断言；`--debug-stack` 仍不含 `paint_scale`、像素门禁不采样动画帧（P3K-08，P4）。
+- **P4/未闭环（gallery 相关）**：P3A-03 acceptance 目录归档（命令日志/帧号/scrim 字段已补；报告写失败已 fail-fast，`damage_full` 仅注明 real-window unavailable）；P3A-04 内容正确性校验（圆角 AA 假绿已修）；P3K-08 debug-stack `scale=`/动画帧像素；P3-4 真实像素扩到更多组件/主题；`tools/source-id.txt` 未跟踪生成物，提交前用 `tools/record-source-id.ps1` 重生成。

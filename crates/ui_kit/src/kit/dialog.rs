@@ -412,7 +412,7 @@ impl Dialog {
             escape: self.inner.config.escape,
         };
         spec.animation = if self.inner.config.fade {
-            PopupAnimation::Fade
+            PopupAnimation::FadeScale
         } else {
             PopupAnimation::None
         };
@@ -476,8 +476,7 @@ impl Dialog {
         if self.inner.panel.id().is_none() {
             return Ok(false);
         }
-        let mut changed = self.recenter(app);
-        changed |= self.inner.panel.sync(app);
+        let mut changed = self.inner.panel.sync(app);
         if self.inner.panel.id().is_none() {
             return Ok(changed);
         }
@@ -897,35 +896,6 @@ impl Dialog {
             Some(bar) => bar.sync(app),
             None => Ok(false),
         }
-    }
-
-    fn recenter(&self, app: &mut App) -> bool {
-        let (Some(window), Some(panel)) = (
-            self.inner.state.borrow().window,
-            self.inner.panel.panel_node(),
-        ) else {
-            return false;
-        };
-        if !self.inner.panel.is_open(app) {
-            return false;
-        }
-        let Some(viewport) = app.window(window).map(|target| target.size()) else {
-            return false;
-        };
-        let Some(bounds) = app
-            .window(window)
-            .and_then(|target| target.tree().get(panel).ok())
-            .map(|target| target.layout().bounds)
-        else {
-            return false;
-        };
-        let desired = centered_origin(viewport, bounds.size);
-        if (bounds.origin.x - desired.x).abs().value() < 0.5
-            && (bounds.origin.y - desired.y).abs().value() < 0.5
-        {
-            return false;
-        }
-        self.inner.panel.set_anchor(app, center_anchor(desired))
     }
 
     fn apply_center(&self, app: &mut App, window: WindowId) -> Result<(), DialogError> {
@@ -1457,25 +1427,44 @@ mod tests {
     }
 
     #[test]
-    fn resizing_the_window_recenters_the_dialog() {
+    fn resizing_the_window_keeps_the_anchor_opened_with() {
         let mut harness = Harness::new();
-        let dialog = harness.dialog(DialogBuilder::new("Recenter").fade(false), "recenter");
+        let dialog = harness.dialog(DialogBuilder::new("Anchor").fade(false), "anchor");
+        let panel = dialog.panel_node().expect("面板");
+        let before = harness.bounds(panel);
+        assert_eq!(
+            before.origin,
+            harness.entry_of(&dialog).hit_rect.origin,
+            "打开时面板原点 = 锚点求解结果"
+        );
         harness
             .app
             .app_mut()
             .window_mut(harness.window)
             .expect("窗口")
-            .set_size(LogicalSize::new(px(600.0), px(400.0)));
+            .set_size(LogicalSize::new(px(700.0), px(500.0)));
         harness.tick(&dialog, Duration::from_millis(40));
         harness.tick(&dialog, Duration::from_millis(40));
-        let panel = harness.bounds(dialog.panel_node().expect("面板"));
-        let expected_x = (600.0 - panel.size.width.value()) * 0.5;
-        let expected_y = (400.0 - panel.size.height.value()) * 0.5;
-        assert!(
-            (panel.origin.x.value() - expected_x).abs() < 1.0
-                && (panel.origin.y.value() - expected_y).abs() < 1.0,
-            "resize 后对话框必须重新居中：{panel:?} 期望中心 ({expected_x:.1}, {expected_y:.1})"
+        let after = harness.bounds(panel);
+        assert_eq!(
+            after.origin, before.origin,
+            "resize 不得重新居中：居中只由 open 时的 anchor 决定"
         );
+        assert_eq!(
+            harness.entry_of(&dialog).hit_rect,
+            after,
+            "resize 后 popup rect 仍等于面板布局盒"
+        );
+        let centered_x = (700.0 - after.size.width.value()) * 0.5;
+        let centered_y = (500.0 - after.size.height.value()) * 0.5;
+        assert!(
+            (after.origin.x.value() - centered_x).abs() > 1.0
+                || (after.origin.y.value() - centered_y).abs() > 1.0,
+            "resize 后不得回到新视口中心（recenter 已删除）：{after:?} 中心 ({centered_x:.1}, \
+             {centered_y:.1})"
+        );
+        assert!(dialog.is_open(harness.app.app()), "resize 不得关闭对话框");
+        assert_eq!(dialog.state(harness.app.app()), Some(PopupState::Open));
     }
 
     #[test]
@@ -1516,6 +1505,38 @@ mod tests {
                 "popup rect 跟随稳定后的面板"
             );
         }
+    }
+
+    #[test]
+    fn the_modal_dialog_degrades_fade_scale_to_fade_only() {
+        let mut harness = Harness::new();
+        let dialog = harness.build(
+            DialogBuilder::new("Fade scale").content(content_box(120.0, 40.0)),
+            "fade-scale",
+        );
+        assert!(
+            dialog
+                .open(harness.app.app_mut(), harness.window)
+                .expect("打开"),
+            "首次打开"
+        );
+        harness.app.drain().expect("首帧");
+        let opening = harness.entry_of(&dialog);
+        assert_eq!(
+            opening.paint_scale, 1.0,
+            "modal 的 FadeScale 退化为 fade-only：只淡入不缩放"
+        );
+        let first = opening.hit_rect;
+        harness.settle(&dialog);
+        let settled = harness.entry_of(&dialog);
+        assert_eq!(settled.paint_scale, 1.0);
+        assert_eq!(settled.state, PopupState::Open);
+        assert_eq!(settled.hit_rect, first, "FadeScale 不改变 settle rect");
+        assert_eq!(
+            harness.bounds(dialog.panel_node().expect("面板")),
+            first,
+            "面板布局盒始终等于 popup rect"
+        );
     }
 
     #[test]

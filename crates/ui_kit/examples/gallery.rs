@@ -1,17 +1,20 @@
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use image::{Rgba, RgbaImage};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::{App, Application},
     event::{Action, ActionSource, Event, InputEvent},
     interaction::ScrollConfig,
-    math::{DeviceRect, LogicalPoint, LogicalRect, LogicalSize, px},
+    math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -133,10 +136,11 @@ struct Flags {
     probe: bool,
     debug_stack: bool,
     pixel_check: bool,
+    real_pixel_check: bool,
     scroll_to: Option<f32>,
 }
 
-const GALLERY_USAGE: &str = "gallery: usage: [--auto-demo] [--idle-check] [--theme-check] [--start-light] [--auto-close=<secs>] [--probe] [--debug-stack] [--pixel-check] [--scroll-to=<px>] [--help]; --auto-close is only a watchdog floor (>=30s) under --debug-stack, which exits 0/3 by itself when its final round completes";
+const GALLERY_USAGE: &str = "gallery: usage: [--auto-demo] [--idle-check] [--theme-check] [--start-light] [--auto-close=<secs>] [--probe] [--debug-stack] [--pixel-check] [--real-pixel-check] [--scroll-to=<px>] [--help]; --pixel-check = headless persistent-incremental pixel gate (exit 0/3); --debug-stack = real-window popup stack/rect gate (exit 0/3); --real-pixel-check = true-window full-screen screenshot pixel gate for ColorPicker/3-level MenuChain/Dialog+scrim (exit 0/3, evidence under target/real-pixels/<os>/); --auto-close is only a watchdog floor (>=30s) under --debug-stack, which exits 0/3 by itself when its final round completes";
 
 fn parse_flags() -> Flags {
     let mut flags = Flags::default();
@@ -162,6 +166,8 @@ fn parse_flags() -> Flags {
             flags.debug_stack = true;
         } else if arg == "--pixel-check" {
             flags.pixel_check = true;
+        } else if arg == "--real-pixel-check" {
+            flags.real_pixel_check = true;
         } else if let Some(value) = arg.strip_prefix("--scroll-to=") {
             let Ok(offset) = value.parse::<f32>() else {
                 println!("gallery: invalid --scroll-to value {value:?}: expected pixel offset");
@@ -3975,6 +3981,2476 @@ fn run_pixel_check() -> bool {
     }
     passed
 }
+const REAL_PIXEL_WINDOW_W: f32 = 960.0;
+const REAL_PIXEL_WINDOW_H: f32 = 720.0;
+const REAL_PIXEL_MARKER_BORDER: f32 = 6.0;
+const REAL_PIXEL_TRIGGER_X: f32 = 540.0;
+const REAL_PIXEL_TRIGGER_Y: f32 = 200.0;
+const REAL_PIXEL_TRIGGER_SIZE: f32 = 40.0;
+const REAL_PIXEL_TICK_MS: u64 = 120;
+const REAL_PIXEL_WARMUP_MS: u64 = 1_500;
+const REAL_PIXEL_BASELINE_GAP_MS: u64 = 400;
+const REAL_PIXEL_CAPTURE_DELAY_MS: u64 = 180;
+const REAL_PIXEL_MIN_STAGE_MS: u64 = 220;
+const REAL_PIXEL_MENU_STEP_MS: u64 = 180;
+const REAL_PIXEL_STAGE_TIMEOUT_MS: u64 = 20_000;
+const REAL_PIXEL_WATCHDOG_SECS: u64 = 180;
+const REAL_PIXEL_RESIDUE_TOLERANCE: u8 = 2;
+const REAL_PIXEL_OPEN_TOLERANCE: u8 = 8;
+const REAL_PIXEL_OPEN_PERMILLE: u64 = 50;
+const REAL_PIXEL_DIALOG_PANEL_PERMILLE: u64 = 200;
+const REAL_PIXEL_SCRIM_PERMILLE: u64 = 500;
+const REAL_PIXEL_VISIBLE_DELTA: u8 = 40;
+const REAL_PIXEL_COVERAGE_PERMILLE: u64 = 990;
+const REAL_PIXEL_SCRIM_ALPHA_TOLERANCE: f32 = 0.035;
+const REAL_PIXEL_SCRIM_PANEL_MARGIN: u32 = 96;
+const REAL_PIXEL_SCRIM_EDGE_MARGIN: u32 = 16;
+const REAL_PIXEL_CORNER_INSET: u32 = 4;
+const REAL_PIXEL_SCRIM_OUTLIER_PERMILLE: u64 = 10;
+const REAL_PIXEL_TRIGGER_MARGIN: u32 = 10;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RealPixelStage {
+    #[default]
+    Warmup,
+    Baseline,
+    PickerOpening,
+    PickerClosing,
+    MenuOpening,
+    MenuClosing,
+    DialogOpening,
+    DialogClosing,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RealPixelWait {
+    #[default]
+    Idle,
+    Capture,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RealPixelTone {
+    #[default]
+    Full,
+    Scrim,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RealPixelRegion {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl RealPixelRegion {
+    const fn new(x0: u32, y0: u32, x1: u32, y1: u32) -> Self {
+        Self { x0, y0, x1, y1 }
+    }
+
+    fn width(self) -> u32 {
+        self.x1.saturating_sub(self.x0)
+    }
+
+    fn height(self) -> u32 {
+        self.y1.saturating_sub(self.y0)
+    }
+
+    fn area(self) -> u64 {
+        u64::from(self.width()) * u64::from(self.height())
+    }
+
+    fn contains(self, x: u32, y: u32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
+
+    fn clamp(self, width: u32, height: u32) -> Option<Self> {
+        let region = Self::new(
+            self.x0.min(width),
+            self.y0.min(height),
+            self.x1.min(width),
+            self.y1.min(height),
+        );
+        (region.width() > 0 && region.height() > 0).then_some(region)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RealPixelDiff {
+    compared: u64,
+    differing: u64,
+    max_delta: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RealPixelMarker {
+    origin: (u32, u32),
+    size: (u32, u32),
+    thickness: u32,
+}
+
+struct RealPixelBaseline {
+    content: RgbaImage,
+    origin: (u32, u32),
+    size: (u32, u32),
+    thickness: u32,
+    scale: f32,
+    logical: LogicalSize,
+}
+
+#[derive(Default)]
+struct RealPixelReport {
+    stage: RealPixelStage,
+    wait: RealPixelWait,
+    stage_issued: Option<Instant>,
+    stage_frame: u32,
+    wait_since: Option<Instant>,
+    started: Option<Instant>,
+    completed: bool,
+    checks: u32,
+    failures: Vec<SmolStr>,
+    lines: Vec<SmolStr>,
+    warmup: Option<RealPixelBaseline>,
+    picker_rect: Option<LogicalRect>,
+    menu_rects: Vec<LogicalRect>,
+    menu_levels: u8,
+    menu_level2: Option<Menu>,
+    menu_level3: Option<Menu>,
+    dialog_panel: Option<LogicalRect>,
+    scrim_rect: Option<LogicalRect>,
+    trigger_exclude: Option<RealPixelRegion>,
+    platform: &'static str,
+    capture_command: SmolStr,
+    evidence: PathBuf,
+    screen: (u32, u32),
+    window_logical: LogicalSize,
+    dpi: f32,
+    last_frame: u32,
+    source_revision: SmolStr,
+    source_dirty: SmolStr,
+    source_diff_sha: SmolStr,
+    source_identity: SmolStr,
+    build_profile: SmolStr,
+    scrim: [f32; 4],
+    report_write_failed: bool,
+}
+
+impl RealPixelReport {
+    fn record(&mut self, ok: bool, label: &'static str, detail: SmolStr) {
+        self.checks = self.checks.saturating_add(1);
+        let line = if ok {
+            format_smolstr!("PASS {label}: {detail}")
+        } else {
+            format_smolstr!("FAIL {label}: {detail}")
+        };
+        println!("gallery: real-pixel-check {line}");
+        self.lines.push(line);
+        if !ok {
+            self.failures.push(format_smolstr!("{label}: {detail}"));
+        }
+    }
+
+    fn note(&mut self, detail: SmolStr) {
+        println!("gallery: real-pixel-check note {detail}");
+        self.lines.push(format_smolstr!("note {detail}"));
+    }
+}
+
+#[derive(Clone)]
+struct RealPixelAcceptance {
+    window: WindowId,
+    picker: ColorPicker,
+    chain_menu: Menu,
+    dialog: Dialog,
+    backdrop: NodeId,
+    marker: NodeId,
+    trigger: NodeId,
+    size: Rc<Cell<LogicalSize>>,
+    report: Rc<RefCell<RealPixelReport>>,
+    baseline: Rc<RefCell<Option<RealPixelBaseline>>>,
+    theme: ThemeHandle,
+}
+
+fn real_pixel_evidence_dir() -> PathBuf {
+    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+        || {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .map_or_else(|| PathBuf::from("target"), Path::to_path_buf)
+                .join("target")
+        },
+        PathBuf::from,
+    );
+    target.join("real-pixels").join(std::env::consts::OS)
+}
+
+fn real_pixel_capture_command() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "powershell -NoProfile -NonInteractive -Command <System.Drawing CopyFromScreen of the virtual screen -> PNG>"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "screencapture -x <tmp.png> (full screen, no cursor, no sound)"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "grim <tmp.png> (Wayland output layout, no cursor)"
+    }
+}
+
+fn real_pixel_run_process(program: &str, args: &[&str]) -> Result<(), SmolStr> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format_smolstr!("{program} 启动失败：{error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format_smolstr!("{program} 截图超时（45 s）"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format_smolstr!("{program} 等待失败：{error}")),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format_smolstr!("{program} 收集输出失败：{error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format_smolstr!(
+        "{program} 退出码 {:?} stderr={} stdout={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+        String::from_utf8_lossy(&output.stdout).trim()
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn real_pixel_capture_file(path: &Path) -> Result<(), SmolStr> {
+    let script = format!(
+        "Add-Type -AssemblyName System.Drawing; Add-Type -AssemblyName System.Windows.Forms; \
+         $vs=[System.Windows.Forms.SystemInformation]::VirtualScreen; \
+         $bmp=New-Object System.Drawing.Bitmap $vs.Width,$vs.Height; \
+         $g=[System.Drawing.Graphics]::FromImage($bmp); \
+         $g.CopyFromScreen($vs.X,$vs.Y,0,0,$bmp.Size); \
+         $bmp.Save('{}',[System.Drawing.Imaging.ImageFormat]::Png); \
+         $g.Dispose(); $bmp.Dispose()",
+        path.display()
+    );
+    real_pixel_run_process(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn real_pixel_capture_file(path: &Path) -> Result<(), SmolStr> {
+    let target = path.to_string_lossy();
+    real_pixel_run_process("screencapture", &["-x", &target])
+}
+
+#[cfg(target_os = "linux")]
+fn real_pixel_capture_file(path: &Path) -> Result<(), SmolStr> {
+    let target = path.to_string_lossy();
+    real_pixel_run_process("grim", &[&target])
+}
+
+fn real_pixel_stage_slug(stage: RealPixelStage) -> &'static str {
+    match stage {
+        RealPixelStage::Warmup => "00-warmup",
+        RealPixelStage::Baseline => "00-baseline",
+        RealPixelStage::PickerOpening => "01-picker-open",
+        RealPixelStage::PickerClosing => "02-picker-closed",
+        RealPixelStage::MenuOpening => "03-menu-open",
+        RealPixelStage::MenuClosing => "04-menu-closed",
+        RealPixelStage::DialogOpening => "05-dialog-open",
+        RealPixelStage::DialogClosing => "06-dialog-closed",
+        RealPixelStage::Done => "done",
+    }
+}
+
+fn real_pixel_marker_pixel(pixel: [u8; 4], tone: RealPixelTone) -> bool {
+    let [red, green, blue, _alpha] = pixel;
+    match tone {
+        RealPixelTone::Full => red >= 200 && blue >= 200 && green <= 60 && red.abs_diff(blue) <= 40,
+        RealPixelTone::Scrim => {
+            red >= 80
+                && blue >= 80
+                && red <= 235
+                && blue <= 235
+                && green <= 40
+                && red.abs_diff(blue) <= 32
+        }
+    }
+}
+
+fn real_pixel_detect_marker(
+    shot: &RgbaImage,
+    expected_w: u32,
+    expected_h: u32,
+    tone: RealPixelTone,
+) -> Option<RealPixelMarker> {
+    let (width, height) = shot.dimensions();
+    if width == 0 || height == 0 || expected_w == 0 || expected_h == 0 {
+        return None;
+    }
+    let min_run = ((expected_w as f32 * 0.8) as u32).max(32) as usize;
+    let max_run = ((expected_w as f32 * 1.2) as u32 + 8) as usize;
+    let raw = shot.as_raw();
+    let stride = width as usize * 4;
+    let mut rows: Vec<(u32, u32, u32)> = Vec::with_capacity(64);
+    for y in 0..height as usize {
+        let row = &raw[y * stride..(y + 1) * stride];
+        let mut best_start = 0usize;
+        let mut best_len = 0usize;
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        for (x, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
+            if real_pixel_marker_pixel([pixel[0], pixel[1], pixel[2], pixel[3]], tone) {
+                if run_len == 0 {
+                    run_start = x;
+                }
+                run_len += 1;
+                if run_len > best_len {
+                    best_len = run_len;
+                    best_start = run_start;
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+        if best_len >= min_run && best_len <= max_run {
+            rows.push((y as u32, best_start as u32, (best_start + best_len) as u32));
+        }
+    }
+    if rows.len() < 2 {
+        return None;
+    }
+    let mut groups: Vec<Vec<(u32, u32, u32)>> = Vec::with_capacity(4);
+    for row in rows {
+        let consecutive = groups
+            .last()
+            .and_then(|group| group.last())
+            .is_some_and(|last| row.0 <= last.0 + 1);
+        if consecutive {
+            if let Some(group) = groups.last_mut() {
+                group.push(row);
+            }
+        } else {
+            groups.push(vec![row]);
+        }
+    }
+    let height_tolerance = (expected_h as f32 * 0.02 + 4.0).max(8.0);
+    let width_tolerance = expected_w as f32 * 0.02 + 4.0;
+    let group_bounds = |group: &[(u32, u32, u32)]| -> Option<(u32, u32, u32, u32, u32)> {
+        let first = group.first()?;
+        let last = group.last()?;
+        let widest = group.iter().max_by_key(|row| row.2.saturating_sub(row.1))?;
+        Some((first.0, last.0, widest.1, widest.2, last.0 + 1 - first.0))
+    };
+    let mut best: Option<(f32, RealPixelMarker)> = None;
+    for top_index in 0..groups.len() {
+        for bottom_index in (top_index + 1)..groups.len() {
+            let (
+                Some((top_y0, _top_y1, top_x0, top_x1, top_thickness)),
+                Some((_bottom_y0, bottom_y1, bottom_x0, bottom_x1, _bottom_thickness)),
+            ) = (
+                group_bounds(&groups[top_index]),
+                group_bounds(&groups[bottom_index]),
+            )
+            else {
+                continue;
+            };
+            let pixel_height = bottom_y1 + 1 - top_y0;
+            if (pixel_height as f32 - expected_h as f32).abs() > height_tolerance {
+                continue;
+            }
+            let pixel_width = top_x1 - top_x0;
+            if (pixel_width as f32 - expected_w as f32).abs() > width_tolerance {
+                continue;
+            }
+            if top_x0.abs_diff(bottom_x0) > 3 || top_x1.abs_diff(bottom_x1) > 3 {
+                continue;
+            }
+            if top_thickness == 0 || top_thickness > 64 {
+                continue;
+            }
+            let score = top_x0.abs_diff(bottom_x0) as f32
+                + top_x1.abs_diff(bottom_x1) as f32
+                + (pixel_width as f32 - expected_w as f32).abs()
+                + (pixel_height as f32 - expected_h as f32).abs();
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score < *best_score)
+            {
+                best = Some((
+                    score,
+                    RealPixelMarker {
+                        origin: (top_x0, top_y0),
+                        size: (pixel_width, pixel_height),
+                        thickness: top_thickness,
+                    },
+                ));
+            }
+        }
+    }
+    best.map(|(_, marker)| marker)
+}
+
+fn real_pixel_crop(shot: &RgbaImage, marker: RealPixelMarker) -> Option<RgbaImage> {
+    let (width, height) = shot.dimensions();
+    let right = marker.origin.0.checked_add(marker.size.0)?;
+    let bottom = marker.origin.1.checked_add(marker.size.1)?;
+    if marker.size.0 == 0 || marker.size.1 == 0 || right > width || bottom > height {
+        return None;
+    }
+    Some(
+        image::imageops::crop_imm(
+            shot,
+            marker.origin.0,
+            marker.origin.1,
+            marker.size.0,
+            marker.size.1,
+        )
+        .to_image(),
+    )
+}
+
+fn real_pixel_compare(
+    base: &RgbaImage,
+    shot: &RgbaImage,
+    region: RealPixelRegion,
+    tolerance: u8,
+    exclusion: Option<RealPixelRegion>,
+) -> RealPixelDiff {
+    let mut diff = RealPixelDiff::default();
+    let (width, height) = base.dimensions();
+    if shot.dimensions() != (width, height) {
+        return diff;
+    }
+    let Some(region) = region.clamp(width, height) else {
+        return diff;
+    };
+    let base_raw = base.as_raw();
+    let shot_raw = shot.as_raw();
+    let stride = width as usize * 4;
+    for y in region.y0..region.y1 {
+        let row = y as usize * stride;
+        for x in region.x0..region.x1 {
+            if exclusion.is_some_and(|excluded| excluded.contains(x, y)) {
+                continue;
+            }
+            let index = row + x as usize * 4;
+            let left = &base_raw[index..index + 4];
+            let right = &shot_raw[index..index + 4];
+            let delta = left[0]
+                .abs_diff(right[0])
+                .max(left[1].abs_diff(right[1]))
+                .max(left[2].abs_diff(right[2]))
+                .max(left[3].abs_diff(right[3]));
+            diff.compared = diff.compared.saturating_add(1);
+            if delta > tolerance {
+                diff.differing = diff.differing.saturating_add(1);
+            }
+            diff.max_delta = diff.max_delta.max(delta);
+        }
+    }
+    diff
+}
+
+fn real_pixel_shifted(image: &RgbaImage, dx: i32, dy: i32) -> RgbaImage {
+    let (width, height) = image.dimensions();
+    let mut shifted = RgbaImage::new(width, height);
+    if width == 0 || height == 0 {
+        return shifted;
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let source_x = (i64::from(x) - i64::from(dx)).clamp(0, i64::from(width - 1)) as u32;
+            let source_y = (i64::from(y) - i64::from(dy)).clamp(0, i64::from(height - 1)) as u32;
+            shifted.put_pixel(x, y, *image.get_pixel(source_x, source_y));
+        }
+    }
+    shifted
+}
+
+fn real_pixel_recolored(image: &RgbaImage, region: RealPixelRegion) -> RgbaImage {
+    let mut recolored = image.clone();
+    let Some(region) = region.clamp(image.width(), image.height()) else {
+        return recolored;
+    };
+    let color = Rgba([0xFF, 0x00, 0xFF, 0xFF]);
+    for y in region.y0..region.y1 {
+        for x in region.x0..region.x1 {
+            recolored.put_pixel(x, y, color);
+        }
+    }
+    recolored
+}
+
+fn real_pixel_content_region(baseline: &RealPixelBaseline) -> RealPixelRegion {
+    RealPixelRegion::new(0, 0, baseline.size.0, baseline.size.1)
+}
+
+fn real_pixel_content_inner_region(baseline: &RealPixelBaseline) -> RealPixelRegion {
+    let region = real_pixel_content_region(baseline);
+    let inset =
+        (REAL_PIXEL_MARKER_BORDER * baseline.scale).round() as u32 + REAL_PIXEL_CORNER_INSET;
+    RealPixelRegion::new(
+        region.x0.saturating_add(inset),
+        region.y0.saturating_add(inset),
+        region.x1.saturating_sub(inset),
+        region.y1.saturating_sub(inset),
+    )
+}
+
+fn real_pixel_map_rect(
+    baseline: &RealPixelBaseline,
+    rect: LogicalRect,
+    inflate: u32,
+) -> Option<RealPixelRegion> {
+    let dpr = DevicePixelRatio::new(baseline.scale)?;
+    let device = dpr.to_covering_device_rect(rect);
+    let content_w = i32::try_from(baseline.size.0).ok()?;
+    let content_h = i32::try_from(baseline.size.1).ok()?;
+    let margin = i32::try_from(inflate).ok()?;
+    let x0 = (i32::from(device.x0) - margin).clamp(0, content_w);
+    let y0 = (i32::from(device.y0) - margin).clamp(0, content_h);
+    let x1 = (i32::from(device.x1) + margin).clamp(0, content_w);
+    let y1 = (i32::from(device.y1) + margin).clamp(0, content_h);
+    (x1 > x0 && y1 > y0).then(|| RealPixelRegion::new(x0 as u32, y0 as u32, x1 as u32, y1 as u32))
+}
+
+fn real_pixel_contained(baseline: &RealPixelBaseline, rect: LogicalRect) -> bool {
+    let Some(dpr) = DevicePixelRatio::new(baseline.scale) else {
+        return false;
+    };
+    let device = dpr.to_covering_device_rect(rect);
+    i32::from(device.x0) >= -1
+        && i32::from(device.y0) >= -1
+        && i32::from(device.x1) <= baseline.size.0 as i32 + 1
+        && i32::from(device.y1) <= baseline.size.1 as i32 + 1
+}
+
+fn real_pixel_rect_detail(rect: LogicalRect) -> SmolStr {
+    format_smolstr!(
+        "({:.1},{:.1} {:.1}x{:.1})",
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height
+    )
+}
+
+fn real_pixel_visibility_check(
+    report: &mut RealPixelReport,
+    label: &'static str,
+    baseline: &RealPixelBaseline,
+    shot: &RgbaImage,
+    rect: LogicalRect,
+    minimum_permille: u64,
+) {
+    let Some(region) = real_pixel_map_rect(baseline, rect, 2) else {
+        report.record(
+            false,
+            label,
+            SmolStr::new_static("popup rect 无法映射到窗口内容区"),
+        );
+        return;
+    };
+    let diff = real_pixel_compare(
+        &baseline.content,
+        shot,
+        region,
+        REAL_PIXEL_OPEN_TOLERANCE,
+        None,
+    );
+    let permille = diff
+        .compared
+        .saturating_mul(1000)
+        .checked_div(region.area())
+        .unwrap_or(0);
+    report.record(
+        permille >= minimum_permille && diff.max_delta >= REAL_PIXEL_VISIBLE_DELTA,
+        label,
+        format_smolstr!(
+            "rect={} region={region:?} compared={} changed={} ({permille}‰) max_delta={}",
+            real_pixel_rect_detail(rect),
+            diff.compared,
+            diff.differing,
+            diff.max_delta
+        ),
+    );
+}
+
+fn real_pixel_residue_check(
+    report: &mut RealPixelReport,
+    label: &'static str,
+    baseline: &RealPixelBaseline,
+    shot: &RgbaImage,
+    rect: LogicalRect,
+) {
+    let Some(region) = real_pixel_map_rect(baseline, rect, 2) else {
+        report.record(
+            false,
+            label,
+            SmolStr::new_static("popup rect 无法映射到窗口内容区"),
+        );
+        return;
+    };
+    let diff = real_pixel_compare(
+        &baseline.content,
+        shot,
+        region,
+        REAL_PIXEL_RESIDUE_TOLERANCE,
+        None,
+    );
+    let permille = diff
+        .compared
+        .saturating_mul(1000)
+        .checked_div(region.area())
+        .unwrap_or(0);
+    report.record(
+        diff.differing == 0 && permille >= REAL_PIXEL_COVERAGE_PERMILLE,
+        label,
+        format_smolstr!(
+            "rect={} region={region:?} compared={} coverage={permille}‰ differing={} max_delta={} tolerance={REAL_PIXEL_RESIDUE_TOLERANCE}",
+            real_pixel_rect_detail(rect),
+            diff.compared,
+            diff.differing,
+            diff.max_delta
+        ),
+    );
+}
+
+fn real_pixel_content_residue_check(
+    report: &mut RealPixelReport,
+    label: &'static str,
+    baseline: &RealPixelBaseline,
+    shot: &RgbaImage,
+) {
+    let region = real_pixel_content_inner_region(baseline);
+    let exclusion = report.trigger_exclude;
+    let expected = region
+        .area()
+        .saturating_sub(exclusion.map_or(0, RealPixelRegion::area));
+    let diff = real_pixel_compare(
+        &baseline.content,
+        shot,
+        region,
+        REAL_PIXEL_RESIDUE_TOLERANCE,
+        exclusion,
+    );
+    let permille = diff
+        .compared
+        .saturating_mul(1000)
+        .checked_div(expected)
+        .unwrap_or(0);
+    report.record(
+        diff.differing == 0 && permille >= REAL_PIXEL_COVERAGE_PERMILLE,
+        label,
+        format_smolstr!(
+            "content={region:?} excluded={exclusion:?} compared={} coverage={permille}‰ differing={} max_delta={} tolerance={REAL_PIXEL_RESIDUE_TOLERANCE}",
+            diff.compared,
+            diff.differing,
+            diff.max_delta
+        ),
+    );
+}
+
+fn real_pixel_srgb_to_linear(value: u8) -> f32 {
+    let channel = f32::from(value) / 255.0;
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn real_pixel_linear_to_srgb(value: f32) -> u8 {
+    let channel = value.clamp(0.0, 1.0);
+    let encoded = if channel <= 0.003_130_8 {
+        channel * 12.92
+    } else {
+        1.055 * channel.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn real_pixel_scrim_predicted(base: &RgbaImage, scrim: [f32; 4]) -> RgbaImage {
+    let mut predicted = RgbaImage::new(base.width(), base.height());
+    let alpha = scrim[3].clamp(0.0, 1.0);
+    for (x, y, pixel) in base.enumerate_pixels() {
+        let mut out = [0u8; 4];
+        for channel in 0..3 {
+            let linear = scrim[channel] + (1.0 - alpha) * real_pixel_srgb_to_linear(pixel[channel]);
+            out[channel] = real_pixel_linear_to_srgb(linear);
+        }
+        out[3] = 255;
+        predicted.put_pixel(x, y, Rgba(out));
+    }
+    predicted
+}
+
+fn real_pixel_derive_scrim_alpha(
+    baseline: &RealPixelBaseline,
+    shot: &RgbaImage,
+    scrim: [f32; 4],
+) -> Option<(f32, u64)> {
+    let (width, height) = shot.dimensions();
+    if width != baseline.content.width() || height != baseline.content.height() {
+        return None;
+    }
+    let thickness = baseline.thickness.max(2);
+    let y = ((thickness - 1) / 2).max(1);
+    let x0 = width / 5;
+    let x1 = width - x0;
+    let mut samples: Vec<f32> = Vec::with_capacity((x1 - x0) as usize * 3);
+    for x in x0..x1 {
+        let base = baseline.content.get_pixel(x, y).0;
+        let observed = shot.get_pixel(x, y).0;
+        for channel in 0..3 {
+            let base_linear = real_pixel_srgb_to_linear(base[channel]);
+            if base_linear < 0.2 {
+                continue;
+            }
+            let observed_linear = real_pixel_srgb_to_linear(observed[channel]);
+            let derived = 1.0 - (observed_linear - scrim[channel]) / base_linear;
+            if derived.is_finite() && (0.0..=1.0).contains(&derived) {
+                samples.push(derived);
+            }
+        }
+    }
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(f32::total_cmp);
+    Some((samples[samples.len() / 2], samples.len() as u64))
+}
+
+fn real_pixel_compare_multi(
+    base: &RgbaImage,
+    shot: &RgbaImage,
+    region: RealPixelRegion,
+    tolerance: u8,
+    exclusions: &[RealPixelRegion],
+) -> RealPixelDiff {
+    let mut diff = RealPixelDiff::default();
+    let (width, height) = base.dimensions();
+    if shot.dimensions() != (width, height) {
+        return diff;
+    }
+    let Some(region) = region.clamp(width, height) else {
+        return diff;
+    };
+    let base_raw = base.as_raw();
+    let shot_raw = shot.as_raw();
+    let stride = width as usize * 4;
+    for y in region.y0..region.y1 {
+        let row = y as usize * stride;
+        for x in region.x0..region.x1 {
+            if exclusions.iter().any(|excluded| excluded.contains(x, y)) {
+                continue;
+            }
+            let index = row + x as usize * 4;
+            let left = &base_raw[index..index + 4];
+            let right = &shot_raw[index..index + 4];
+            let delta = left[0]
+                .abs_diff(right[0])
+                .max(left[1].abs_diff(right[1]))
+                .max(left[2].abs_diff(right[2]))
+                .max(left[3].abs_diff(right[3]));
+            diff.compared = diff.compared.saturating_add(1);
+            if delta > tolerance {
+                diff.differing = diff.differing.saturating_add(1);
+            }
+            diff.max_delta = diff.max_delta.max(delta);
+        }
+    }
+    diff
+}
+
+fn real_pixel_scrim_analysis(
+    predicted: &RgbaImage,
+    shot: &RgbaImage,
+    region: RealPixelRegion,
+    exclusions: &[RealPixelRegion],
+) -> (RealPixelDiff, RealPixelDiff) {
+    let loose = real_pixel_compare_multi(predicted, shot, region, 4, exclusions);
+    let strict = real_pixel_compare_multi(predicted, shot, region, 12, exclusions);
+    (loose, strict)
+}
+
+fn real_pixel_source_identity_from_file() -> Option<(SmolStr, SmolStr, SmolStr)> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/source-id.txt");
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut revision = None;
+    let mut status = None;
+    let mut diff_sha = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("revision=") {
+            revision = Some(SmolStr::new(value.trim()));
+        } else if let Some(value) = line.strip_prefix("status=") {
+            status = Some(SmolStr::new(value.trim()));
+        } else if let Some(value) = line.strip_prefix("diff_sha=") {
+            diff_sha = Some(SmolStr::new(value.trim()));
+        }
+    }
+    Some((revision?, status?, diff_sha?))
+}
+
+fn real_pixel_source_revision() -> (SmolStr, SmolStr, SmolStr, SmolStr) {
+    use std::io::Write as _;
+    if let Some((revision, status, diff_sha)) = real_pixel_source_identity_from_file() {
+        return (
+            revision,
+            status,
+            diff_sha,
+            SmolStr::new_static("source-id-file"),
+        );
+    }
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-C", manifest])
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+    };
+    let revision = git(&["rev-parse", "--short", "HEAD"]).map_or_else(
+        || SmolStr::new_static("unknown"),
+        |output| SmolStr::new(String::from_utf8_lossy(&output.stdout).trim()),
+    );
+    let status = git(&["status", "--porcelain"]).map(|output| {
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.lines().filter(|line| !line.trim().is_empty()).count()
+    });
+    let dirty = match status {
+        None => SmolStr::new_static("unknown"),
+        Some(0) => SmolStr::new_static("clean"),
+        Some(count) => format_smolstr!("dirty({count} files)"),
+    };
+    let diff_sha = git(&["diff", "HEAD"])
+        .and_then(|output| {
+            let mut child = Command::new("git")
+                .args(["-C", manifest, "hash-object", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .ok()?;
+            child
+                .stdin
+                .take()
+                .and_then(|mut stdin| stdin.write_all(&output.stdout).ok())?;
+            child.wait_with_output().ok()
+        })
+        .filter(|output| output.status.success())
+        .map_or_else(
+            || SmolStr::new_static("unknown"),
+            |output| SmolStr::new(String::from_utf8_lossy(&output.stdout).trim()),
+        );
+    (revision, dirty, diff_sha, SmolStr::new_static("git"))
+}
+
+fn real_pixel_theme_scrim(theme: &ThemeHandle) -> [f32; 4] {
+    let color = theme.theme_for(Appearance::Dark).role(Role::Scrim);
+    ColorResolver.resolve(color).components
+}
+
+fn real_pixel_stack_entries(
+    app: &App,
+    window: WindowId,
+) -> Vec<ui_core::popup::PopupSnapshotEntry> {
+    app.popup_stack(window)
+        .map_or_else(Vec::new, |stack| stack.entries)
+}
+
+fn real_pixel_stack_ready(app: &App, window: WindowId, expected: usize) -> bool {
+    if app.animations_running(window) {
+        return false;
+    }
+    let entries = real_pixel_stack_entries(app, window);
+    entries.len() == expected
+        && entries
+            .iter()
+            .all(|entry| entry.state == ui_core::popup::PopupState::Open)
+}
+
+fn real_pixel_stack_empty(app: &App, window: WindowId) -> bool {
+    if app.animations_running(window) {
+        return false;
+    }
+    app.popup_stack(window)
+        .is_some_and(|stack| stack.entries.is_empty())
+}
+
+fn real_pixel_menu_result(result: &Result<Option<Menu>, ui_core::popup::PopupError>) -> SmolStr {
+    match result {
+        Ok(Some(_)) => SmolStr::new_static("Some(menu)"),
+        Ok(None) => SmolStr::new_static("None"),
+        Err(error) => format_smolstr!("Err({error})"),
+    }
+}
+
+impl RealPixelAcceptance {
+    fn build(app: &mut App) -> Self {
+        println!(
+            "gallery: real-pixel-check semantics: true-window screenshot gate (exit 0/3); a fixed \
+             {REAL_PIXEL_WINDOW_W}×{REAL_PIXEL_WINDOW_H} always-on-top window draws a \
+             {REAL_PIXEL_MARKER_BORDER} px #FF00FF ring at the content edge; the full-screen screenshot is \
+             decoded, the magenta box gives the content origin/physical size/scale, engine popup rects are \
+             mapped through the window scale factor, and the sequence baseline → ColorPicker open/close → \
+             3-level MenuChain open/close → Dialog+scrim open/close must change each popup region on open \
+             and restore it pixel-for-pixel on close (coverage floor; trigger ring excluded); negative \
+             self-checks inject an offset and a recolor fault that must both turn the detector red"
+        );
+        println!(
+            "gallery: real-pixel-check platform={} capture={}",
+            std::env::consts::OS,
+            real_pixel_capture_command()
+        );
+        println!(
+            "gallery: real-pixel-check platform notes: windows = CopyFromScreen of the virtual screen \
+             (multi-monitor offsets and per-window DPR are resolved from the marker box); macos = \
+             screencapture -x needs Screen Recording for the launching session, a plain ssh session only \
+             captures the wallpaper (launch through Terminal, see tools/real-pixel-check-macos.sh); linux = \
+             grim captures the whole wl_output layout and a tiled nested-sway window is resized to the \
+             output, so the content size is the compositor size, not the requested 960×720"
+        );
+        println!(
+            "gallery: real-pixel-check note: the Dialog scrim covers the border marker, so the dialog-open \
+             step first retries the marker with the scrim-dimmed tone and otherwise falls back to the baseline \
+             origin (printed as a note); the marker is re-detected and compared after close"
+        );
+        println!(
+            "gallery: real-pixel-check retry note: the companion gate scripts (tools/real-pixel-check-*) run \
+             --pixel-check/--real-pixel-check/--idle-check/--theme-check/--debug-stack; under a busy or \
+             concurrent desktop --debug-stack can exceed the 300 s gate timeout, the scripts retry it up to 3 \
+             attempts and a single timeout is retried without changing the gate result (final result = first \
+             successful attempt)"
+        );
+        let evidence = real_pixel_evidence_dir();
+        for name in [
+            "report.txt",
+            "00-warmup.png",
+            "00-baseline.png",
+            "01-picker-open.png",
+            "02-picker-closed.png",
+            "03-menu-open.png",
+            "04-menu-closed.png",
+            "05-dialog-open.png",
+            "06-dialog-closed.png",
+            "failed-marker-00-warmup.png",
+        ] {
+            let _ = std::fs::remove_file(evidence.join(name));
+        }
+        if let Err(error) = std::fs::create_dir_all(&evidence) {
+            println!(
+                "gallery: real-pixel-check FAIL evidence dir {}: {error}",
+                evidence.display()
+            );
+            std::process::exit(3);
+        }
+        println!("gallery: real-pixel-check evidence={}", evidence.display());
+        let theme = ThemeHandle::new(app, Appearance::Dark);
+        let scrim = real_pixel_theme_scrim(&theme);
+        let (source_revision, source_dirty, source_diff_sha, source_identity) =
+            real_pixel_source_revision();
+        println!(
+            "gallery: real-pixel-check metadata revision={source_revision} status={source_dirty} diff_sha={source_diff_sha} identity={source_identity} profile={} scrim_alpha={:.3}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            scrim[3]
+        );
+        let window = app.create_window(WindowOptions {
+            title: SmolStr::new_static("Kytrix · gallery real pixel acceptance"),
+            size: LogicalSize::new(px(REAL_PIXEL_WINDOW_W), px(REAL_PIXEL_WINDOW_H)),
+            position: Some(LogicalPoint::new(px(120.0), px(90.0))),
+            always_on_top: true,
+            ..WindowOptions::default()
+        });
+        let size = app.window(window).map_or(
+            LogicalSize::new(px(REAL_PIXEL_WINDOW_W), px(REAL_PIXEL_WINDOW_H)),
+            |target| target.size(),
+        );
+        let root = tree(app, window).root();
+        tree(app, window)
+            .set_style(root, StyleBuilder::new().flex_col().size_full().build())
+            .expect("real-pixel root style");
+        let full = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
+        let backdrop = NodeBuilder::boxed()
+            .id("gallery.real-pixel:backdrop")
+            .layout_override(full)
+            .paint(PaintSpec {
+                background: Color::from_rgba8([0x10, 0x14, 0x1A, 0xFF]),
+                ..PaintSpec::default()
+            })
+            .build(tree(app, window), root)
+            .expect("real-pixel backdrop");
+        let cards: [(LogicalRect, [u8; 4]); 4] = [
+            (
+                LogicalRect::new(px(60.0), px(430.0), px(240.0), px(120.0)),
+                [0x2A, 0x32, 0x3E, 0xFF],
+            ),
+            (
+                LogicalRect::new(px(330.0), px(430.0), px(240.0), px(120.0)),
+                [0x36, 0x2E, 0x3E, 0xFF],
+            ),
+            (
+                LogicalRect::new(px(600.0), px(430.0), px(240.0), px(120.0)),
+                [0x2E, 0x3E, 0x38, 0xFF],
+            ),
+            (
+                LogicalRect::new(px(60.0), px(580.0), px(300.0), px(100.0)),
+                [0x3A, 0x36, 0x2A, 0xFF],
+            ),
+        ];
+        for (index, (rect, rgb)) in cards.into_iter().enumerate() {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("gallery.real-pixel:card{index}"))
+                .layout_override(rect)
+                .paint(PaintSpec {
+                    background: Color::from_rgba8(rgb),
+                    ..PaintSpec::default()
+                })
+                .build(tree(app, window), root)
+                .expect("real-pixel card");
+        }
+        let picker = ColorPicker::new(
+            app,
+            theme.clone(),
+            "gallery.real-pixel-picker",
+            Color::from_rgba8([0x4C, 0x9A, 0xFF, 0xFF]),
+            UnifiedSize::Medium,
+        );
+        let _ = picker.build(app, window, root).expect("real-pixel picker");
+        let trigger = picker.trigger_node().expect("real-pixel picker trigger");
+        tree(app, window)
+            .set_layout_override(
+                trigger,
+                Some(ui_core::layout::LayoutOverride::new(LogicalRect::new(
+                    px(REAL_PIXEL_TRIGGER_X),
+                    px(REAL_PIXEL_TRIGGER_Y),
+                    px(REAL_PIXEL_TRIGGER_SIZE),
+                    px(REAL_PIXEL_TRIGGER_SIZE),
+                ))),
+            )
+            .expect("real-pixel picker trigger placement");
+        let marker = NodeBuilder::boxed()
+            .id("gallery.real-pixel:marker")
+            .layout_override(full)
+            .paint(PaintSpec {
+                border: Some(Border {
+                    width: px(REAL_PIXEL_MARKER_BORDER),
+                    color: Color::from_rgba8([0xFF, 0x00, 0xFF, 0xFF]),
+                }),
+                ..PaintSpec::default()
+            })
+            .build(tree(app, window), root)
+            .expect("real-pixel marker");
+        let chain_menu = Menu::new(
+            app,
+            theme.clone(),
+            "gallery.real-pixel-menu",
+            [
+                MenuEntry::Action(MenuAction::new("first", "第一项").checkbox(true)),
+                MenuEntry::Action(MenuAction::new("second", "第二项")),
+                MenuEntry::Submenu(MenuSubmenu::new(
+                    "二级",
+                    [
+                        MenuEntry::Action(MenuAction::new("inner", "内部")),
+                        MenuEntry::Submenu(MenuSubmenu::new(
+                            "三级",
+                            [
+                                MenuEntry::Action(MenuAction::new("third", "第三项").radio(true)),
+                                MenuEntry::Action(MenuAction::new("fourth", "第四项")),
+                            ],
+                        )),
+                    ],
+                )),
+            ],
+            MenuOptions::default(),
+        );
+        let dialog_theme = theme.clone();
+        let dialog = DialogBuilder::new("真实窗口像素验收")
+            .content(move |app, window, body| {
+                let theme = dialog_theme.clone();
+                NodeBuilder::text(
+                    "Dialog + scrim 的真实窗口像素验收：打开必须可见变化，关闭必须逐像素回到基线。",
+                    text_style(12.5, 400, Color::WHITE).with_wrap(TextWrap::Wrap),
+                )
+                .style(StyleBuilder::new().width_full().build())
+                .bind_style(move |cx| StylePatch {
+                    foreground: Some(theme.role(cx, Role::FgDefault)),
+                    ..StylePatch::default()
+                })
+                .build(tree(app, window), body)?;
+                Ok(())
+            })
+            .confirm("确定", |_app| {})
+            .cancel("取消", |_app| {})
+            .build(app, theme.clone(), "gallery.real-pixel-dialog");
+        let report = RealPixelReport {
+            platform: std::env::consts::OS,
+            capture_command: SmolStr::new_static(real_pixel_capture_command()),
+            evidence,
+            window_logical: size,
+            source_revision,
+            source_dirty,
+            source_diff_sha,
+            source_identity,
+            build_profile: SmolStr::new_static(if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }),
+            scrim,
+            ..RealPixelReport::default()
+        };
+        Self {
+            window,
+            picker,
+            chain_menu,
+            dialog,
+            backdrop,
+            marker,
+            trigger,
+            size: Rc::new(Cell::new(size)),
+            report: Rc::new(RefCell::new(report)),
+            baseline: Rc::new(RefCell::new(None)),
+            theme,
+        }
+    }
+
+    fn install(&self, app: &mut App) {
+        {
+            let mut report = self.report.borrow_mut();
+            let now = Instant::now();
+            report.started = Some(now);
+            report.stage_issued = Some(now);
+        }
+        self.schedule(app);
+        let this = self.clone();
+        let _ = app.after(
+            self.window,
+            Duration::from_secs(REAL_PIXEL_WATCHDOG_SECS),
+            move |app| {
+                let finished = {
+                    let mut report = this.report.borrow_mut();
+                    if report.completed {
+                        true
+                    } else {
+                        report.record(
+                            false,
+                            "watchdog",
+                            format_smolstr!(
+                                "--real-pixel-check 自动化在 {REAL_PIXEL_WATCHDOG_SECS} s 内未完成"
+                            ),
+                        );
+                        false
+                    }
+                };
+                if !finished {
+                    this.finish(app);
+                }
+            },
+        );
+    }
+
+    fn schedule(&self, app: &mut App) {
+        let this = self.clone();
+        let _ = app.after(
+            self.window,
+            Duration::from_millis(REAL_PIXEL_TICK_MS),
+            move |app| {
+                if this.tick(app) {
+                    this.schedule(app);
+                }
+            },
+        );
+    }
+
+    fn tick(&self, app: &mut App) -> bool {
+        self.sync_components(app);
+        self.sync_layout(app);
+        let Some(window_size) = app.window(self.window).map(|target| target.size()) else {
+            return false;
+        };
+        let frame = app
+            .window(self.window)
+            .map_or(0, |target| target.frame_index().get());
+        let now = Instant::now();
+        let stale_logical = {
+            let baseline = self.baseline.borrow();
+            baseline
+                .as_ref()
+                .map(|baseline| baseline.logical)
+                .filter(|logical| *logical != window_size)
+        };
+        if let Some(baseline_logical) = stale_logical {
+            let mut report = self.report.borrow_mut();
+            report.record(
+                false,
+                "window-stable",
+                format_smolstr!(
+                    "验收过程中窗口逻辑尺寸变化：{:?} != {:?}",
+                    window_size,
+                    baseline_logical
+                ),
+            );
+            drop(report);
+            self.finish(app);
+            return false;
+        }
+        let mut report = self.report.borrow_mut();
+        if report.completed {
+            return false;
+        }
+        if report.started.is_none() {
+            report.started = Some(now);
+        }
+        if report.stage == RealPixelStage::Done {
+            drop(report);
+            self.finish(app);
+            return false;
+        }
+        if report.wait == RealPixelWait::Capture {
+            let elapsed = report
+                .wait_since
+                .map_or(Duration::ZERO, |since| now.duration_since(since));
+            if elapsed >= Duration::from_millis(REAL_PIXEL_CAPTURE_DELAY_MS)
+                && frame > report.stage_frame
+            {
+                report.wait = RealPixelWait::Idle;
+                let keep = self.capture(app, &mut report);
+                if !keep {
+                    drop(report);
+                    self.finish(app);
+                    return false;
+                }
+            }
+            return true;
+        }
+        let stage_issued = report.stage_issued.unwrap_or(now);
+        if now.duration_since(stage_issued) > Duration::from_millis(REAL_PIXEL_STAGE_TIMEOUT_MS) {
+            let stage = report.stage;
+            let entries = real_pixel_stack_entries(app, self.window);
+            let states: Vec<String> = entries
+                .iter()
+                .map(|entry| format!("{:?}/z{}/{:?}", entry.tier, entry.z, entry.state))
+                .collect();
+            let animations = app.animations_running(self.window);
+            report.record(
+                false,
+                "stage-timeout",
+                format_smolstr!(
+                    "阶段 {stage:?} 在 {REAL_PIXEL_STAGE_TIMEOUT_MS} ms 内未稳定（动画/输入无法 settle）；stack={states:?} animations_running={animations}"
+                ),
+            );
+            drop(report);
+            self.finish(app);
+            return false;
+        }
+        if report.stage == RealPixelStage::MenuOpening && !self.advance_menu(app, &mut report, now)
+        {
+            drop(report);
+            self.finish(app);
+            return false;
+        }
+        if self.stage_ready(app, &report, now, frame) {
+            let _ = app.request_repaint(self.window);
+            report.wait = RealPixelWait::Capture;
+            report.wait_since = Some(now);
+            report.stage_frame = frame;
+        }
+        true
+    }
+
+    fn advance_menu(&self, app: &mut App, report: &mut RealPixelReport, now: Instant) -> bool {
+        if report.menu_levels >= 3 {
+            return true;
+        }
+        if report.stage_issued.is_some_and(|issued| {
+            now.duration_since(issued) < Duration::from_millis(REAL_PIXEL_MENU_STEP_MS)
+        }) {
+            return true;
+        }
+        let entries = real_pixel_stack_entries(app, self.window);
+        let settled = |expected: usize| {
+            entries.len() == expected
+                && entries
+                    .iter()
+                    .all(|entry| entry.state == ui_core::popup::PopupState::Open)
+        };
+        match report.menu_levels {
+            1 if settled(1) => match self.chain_menu.open_submenu(app, 2) {
+                Ok(Some(menu)) => {
+                    report.menu_level2 = Some(menu);
+                    report.menu_levels = 2;
+                    report.record(
+                        true,
+                        "menu-open-level2",
+                        SmolStr::new_static("open_submenu(二级) -> Some"),
+                    );
+                    report.stage_issued = Some(now);
+                    let _ = app.request_repaint(self.window);
+                    true
+                }
+                other => {
+                    report.record(
+                        false,
+                        "menu-open-level2",
+                        format_smolstr!("open_submenu(二级) -> {}", real_pixel_menu_result(&other)),
+                    );
+                    false
+                }
+            },
+            2 if settled(2) => {
+                let Some(level2) = report.menu_level2.as_ref() else {
+                    report.record(
+                        false,
+                        "menu-open-level3",
+                        SmolStr::new_static("二级 Menu 句柄缺失"),
+                    );
+                    return false;
+                };
+                match level2.open_submenu(app, 1) {
+                    Ok(Some(menu)) => {
+                        report.menu_level3 = Some(menu);
+                        report.menu_levels = 3;
+                        report.record(
+                            true,
+                            "menu-open-level3",
+                            SmolStr::new_static("open_submenu(三级) -> Some"),
+                        );
+                        report.stage_issued = Some(now);
+                        let _ = app.request_repaint(self.window);
+                        true
+                    }
+                    other => {
+                        report.record(
+                            false,
+                            "menu-open-level3",
+                            format_smolstr!(
+                                "open_submenu(三级) -> {}",
+                                real_pixel_menu_result(&other)
+                            ),
+                        );
+                        false
+                    }
+                }
+            }
+            _ => true,
+        }
+    }
+
+    fn stage_ready(&self, app: &App, report: &RealPixelReport, now: Instant, frame: u32) -> bool {
+        let Some(issued) = report.stage_issued else {
+            return false;
+        };
+        let minimum = match report.stage {
+            RealPixelStage::Warmup => REAL_PIXEL_WARMUP_MS,
+            RealPixelStage::Baseline => REAL_PIXEL_BASELINE_GAP_MS,
+            _ => REAL_PIXEL_MIN_STAGE_MS,
+        };
+        if frame <= report.stage_frame
+            || now.duration_since(issued) < Duration::from_millis(minimum)
+        {
+            return false;
+        }
+        match report.stage {
+            RealPixelStage::Warmup | RealPixelStage::Baseline | RealPixelStage::Done => true,
+            RealPixelStage::PickerOpening => real_pixel_stack_ready(app, self.window, 1),
+            RealPixelStage::MenuOpening => {
+                real_pixel_stack_ready(app, self.window, 3) && report.menu_levels >= 3
+            }
+            RealPixelStage::DialogOpening => real_pixel_stack_ready(app, self.window, 2),
+            RealPixelStage::PickerClosing
+            | RealPixelStage::MenuClosing
+            | RealPixelStage::DialogClosing => real_pixel_stack_empty(app, self.window),
+        }
+    }
+
+    fn sync_components(&self, app: &mut App) {
+        let _ = self.picker.sync(app);
+        let _ = self.chain_menu.sync(app);
+        let _ = self.dialog.sync(app);
+    }
+
+    fn sync_layout(&self, app: &mut App) {
+        let Some(size) = app.window(self.window).map(|target| target.size()) else {
+            return;
+        };
+        if self.size.get() == size {
+            return;
+        }
+        self.size.set(size);
+        let Some(target) = app.window_mut(self.window) else {
+            return;
+        };
+        let tree = target.tree_mut();
+        let full = LogicalRect::from_origin_size(LogicalPoint::ZERO, size);
+        for node in [self.backdrop, self.marker] {
+            let _ =
+                tree.set_layout_override(node, Some(ui_core::layout::LayoutOverride::new(full)));
+        }
+    }
+
+    fn screenshot(&self, stage: RealPixelStage) -> Result<RgbaImage, SmolStr> {
+        let path = std::env::temp_dir().join(format!(
+            "kytrix-real-pixel-{}-{}.png",
+            std::process::id(),
+            real_pixel_stage_slug(stage)
+        ));
+        let _ = std::fs::remove_file(&path);
+        real_pixel_capture_file(&path)?;
+        let decoded = image::open(&path)
+            .map_err(|error| format_smolstr!("截图解码失败 {}：{error}", path.display()))
+            .map(|decoded| decoded.to_rgba8());
+        let _ = std::fs::remove_file(&path);
+        decoded
+    }
+
+    fn advance(
+        &self,
+        app: &mut App,
+        report: &mut RealPixelReport,
+        stage: RealPixelStage,
+        frame: u32,
+    ) {
+        report.stage = stage;
+        report.stage_issued = Some(Instant::now());
+        report.stage_frame = frame;
+        report.wait = RealPixelWait::Idle;
+        let _ = app.request_repaint(self.window);
+    }
+
+    fn save_evidence(
+        &self,
+        report: &mut RealPixelReport,
+        stage: RealPixelStage,
+        content: &RgbaImage,
+    ) -> bool {
+        let path = report
+            .evidence
+            .join(format!("{}.png", real_pixel_stage_slug(stage)));
+        match content.save(&path) {
+            Ok(()) => {
+                let line = format_smolstr!("evidence {}", path.display());
+                println!("gallery: real-pixel-check {line}");
+                report.lines.push(line);
+                true
+            }
+            Err(error) => {
+                report.record(
+                    false,
+                    "evidence",
+                    format_smolstr!("证据写入失败 {}：{error}", path.display()),
+                );
+                false
+            }
+        }
+    }
+
+    fn capture(&self, app: &mut App, report: &mut RealPixelReport) -> bool {
+        let stage = report.stage;
+        let Some(logical) = app.window(self.window).map(|target| target.size()) else {
+            report.record(false, "window", SmolStr::new_static("截图前窗口消失"));
+            return false;
+        };
+        let dpr = app
+            .window(self.window)
+            .map_or(1.0, |target| target.device_pixel_ratio().factor());
+        let frame = app
+            .window(self.window)
+            .map_or(0, |target| target.frame_index().get());
+        let expected_w = (logical.width.value() * dpr).round().max(1.0) as u32;
+        let expected_h = (logical.height.value() * dpr).round().max(1.0) as u32;
+        let started = Instant::now();
+        let shot = match self.screenshot(stage) {
+            Ok(shot) => shot,
+            Err(error) => {
+                report.record(false, "screenshot", error);
+                return false;
+            }
+        };
+        report.screen = shot.dimensions();
+        report.window_logical = logical;
+        report.dpi = dpr;
+        let capture_line = format_smolstr!(
+            "capture stage={stage:?} frame={frame} screen={}x{} window={:.0}x{:.0} dpr={dpr:.3} took={} ms frame_cpu={:?} popup_opening={} popup_closing={} primitives={}",
+            report.screen.0,
+            report.screen.1,
+            logical.width.value(),
+            logical.height.value(),
+            started.elapsed().as_millis(),
+            app.window(self.window)
+                .and_then(|target| target.frame_stats())
+                .and_then(|stats| stats.frame_cpu),
+            app.window(self.window)
+                .and_then(|target| target.frame_stats())
+                .is_some_and(|stats| stats.popup_opening),
+            app.window(self.window)
+                .and_then(|target| target.frame_stats())
+                .is_some_and(|stats| stats.popup_closing),
+            app.window(self.window)
+                .and_then(|target| target.frame_stats())
+                .map_or(0, |stats| stats.primitives),
+        );
+        report.lines.push(capture_line);
+        report.last_frame = frame;
+        let mut tone = RealPixelTone::Full;
+        let mut marker = real_pixel_detect_marker(&shot, expected_w, expected_h, tone);
+        if marker.is_none() && stage == RealPixelStage::DialogOpening {
+            tone = RealPixelTone::Scrim;
+            marker = real_pixel_detect_marker(&shot, expected_w, expected_h, tone);
+        }
+        let marker = match marker {
+            Some(marker) => Some(marker),
+            None => {
+                let fallback = if stage == RealPixelStage::DialogOpening {
+                    self.baseline
+                        .borrow()
+                        .as_ref()
+                        .map(|baseline| RealPixelMarker {
+                            origin: baseline.origin,
+                            size: baseline.size,
+                            thickness: baseline.thickness,
+                        })
+                } else {
+                    None
+                };
+                if let Some(marker) = fallback {
+                    report.note(format_smolstr!(
+                        "stage={stage:?} 未检测到 {} 调标记（scrim 遮挡），回退到 baseline 原点 {:?}",
+                        match tone {
+                            RealPixelTone::Full => "full",
+                            RealPixelTone::Scrim => "scrim",
+                        },
+                        marker.origin
+                    ));
+                    Some(marker)
+                } else {
+                    let marker_rect = app
+                        .window(self.window)
+                        .and_then(|target| target.node_screen_rect(self.marker));
+                    let root_rect = app
+                        .window(self.window)
+                        .and_then(|target| target.node_screen_rect(target.tree().root()));
+                    let failure_screen = report.evidence.join(format!(
+                        "failed-marker-{}.png",
+                        real_pixel_stage_slug(stage)
+                    ));
+                    let saved = shot.save(&failure_screen).is_ok();
+                    report.record(
+                        false,
+                        "marker",
+                        format_smolstr!(
+                            "stage={stage:?} tone={tone:?} expected={expected_w}x{expected_h} screen={}x{}：未检测到 #FF00FF {REAL_PIXEL_MARKER_BORDER} px 内容边框标记（窗口被遮挡/不可见/标记被覆盖）；marker_node={marker_rect:?} root={root_rect:?} failure_screen={} saved={saved}",
+                            report.screen.0,
+                            report.screen.1,
+                            failure_screen.display()
+                        ),
+                    );
+                    None
+                }
+            }
+        };
+        let Some(marker) = marker else {
+            return false;
+        };
+        let Some(content) = real_pixel_crop(&shot, marker) else {
+            report.record(
+                false,
+                "crop",
+                format_smolstr!("标记框 {:?} 超出截图范围 {:?}", marker, report.screen),
+            );
+            return false;
+        };
+        match stage {
+            RealPixelStage::Warmup => {
+                let expected_thickness = (REAL_PIXEL_MARKER_BORDER * dpr).round() as u32;
+                let size_tolerance = (dpr * 4.0).round().max(4.0) as u32;
+                report.record(
+                    true,
+                    "marker-detected",
+                    format_smolstr!(
+                        "tone={tone:?} origin={:?} size={:?} thickness={}",
+                        marker.origin,
+                        marker.size,
+                        marker.thickness
+                    ),
+                );
+                report.record(
+                    marker.size.0.abs_diff(expected_w) <= size_tolerance
+                        && marker.size.1.abs_diff(expected_h) <= size_tolerance,
+                    "content-physical-size",
+                    format_smolstr!(
+                        "detected={}x{} expected={expected_w}x{expected_h} tolerance={size_tolerance} logical={:.0}x{:.0} dpr={dpr:.3}",
+                        marker.size.0,
+                        marker.size.1,
+                        logical.width.value(),
+                        logical.height.value()
+                    ),
+                );
+                report.record(
+                    marker.thickness.abs_diff(expected_thickness) <= 3,
+                    "marker-thickness",
+                    format_smolstr!(
+                        "detected={} expected={expected_thickness}（{REAL_PIXEL_MARKER_BORDER} px × dpr）",
+                        marker.thickness
+                    ),
+                );
+                report.record(
+                    marker.origin.0 < report.screen.0
+                        && marker.origin.1 < report.screen.1
+                        && marker.origin.0 + marker.size.0 <= report.screen.0
+                        && marker.origin.1 + marker.size.1 <= report.screen.1,
+                    "marker-on-screen",
+                    format_smolstr!(
+                        "origin={:?} size={:?} screen={}x{}",
+                        marker.origin,
+                        marker.size,
+                        report.screen.0,
+                        report.screen.1
+                    ),
+                );
+                self.save_evidence(report, stage, &content);
+                report.warmup = Some(RealPixelBaseline {
+                    content,
+                    origin: marker.origin,
+                    size: marker.size,
+                    thickness: marker.thickness,
+                    scale: dpr,
+                    logical,
+                });
+                self.advance(app, report, RealPixelStage::Baseline, frame);
+                true
+            }
+            RealPixelStage::Baseline => {
+                let (same_marker, stable) = {
+                    let Some(warmup) = report.warmup.as_ref() else {
+                        report.record(false, "baseline", SmolStr::new_static("warmup 缺失"));
+                        return false;
+                    };
+                    let same_marker = marker.origin == warmup.origin && marker.size == warmup.size;
+                    let stable = real_pixel_compare(
+                        &warmup.content,
+                        &content,
+                        real_pixel_content_inner_region(warmup),
+                        REAL_PIXEL_RESIDUE_TOLERANCE,
+                        None,
+                    );
+                    (same_marker, stable)
+                };
+                report.record(
+                    same_marker,
+                    "marker-stable",
+                    format_smolstr!("origin={:?} size={:?}", marker.origin, marker.size),
+                );
+                report.record(
+                    stable.differing == 0,
+                    "baseline-stable",
+                    format_smolstr!(
+                        "compared={} differing={} max_delta={}",
+                        stable.compared,
+                        stable.differing,
+                        stable.max_delta
+                    ),
+                );
+                let whole = RealPixelRegion::new(0, 0, content.width(), content.height());
+                let shifted = real_pixel_shifted(&content, 4, 3);
+                let shifted_diff = real_pixel_compare(
+                    &content,
+                    &shifted,
+                    whole,
+                    REAL_PIXEL_RESIDUE_TOLERANCE,
+                    None,
+                );
+                report.record(
+                    shifted_diff.differing > 0,
+                    "self-check-offset",
+                    format_smolstr!(
+                        "r 基线块平移 (4,3) 后检测器必须判红：differing={} max_delta={}",
+                        shifted_diff.differing,
+                        shifted_diff.max_delta
+                    ),
+                );
+                let block = RealPixelRegion::new(
+                    whole.width() / 2,
+                    whole.height() / 2,
+                    whole.width() / 2 + 48,
+                    whole.height() / 2 + 48,
+                );
+                let recolored = real_pixel_recolored(&content, block);
+                let recolor_diff = real_pixel_compare(
+                    &content,
+                    &recolored,
+                    whole,
+                    REAL_PIXEL_RESIDUE_TOLERANCE,
+                    None,
+                );
+                report.record(
+                    recolor_diff.differing > 0,
+                    "self-check-recolor",
+                    format_smolstr!(
+                        "基线块改色 {:?} 后检测器必须判红：differing={} max_delta={}",
+                        block,
+                        recolor_diff.differing,
+                        recolor_diff.max_delta
+                    ),
+                );
+                let trigger_rect = app
+                    .window(self.window)
+                    .and_then(|target| target.node_screen_rect(self.trigger));
+                *self.baseline.borrow_mut() = Some(RealPixelBaseline {
+                    content,
+                    origin: marker.origin,
+                    size: marker.size,
+                    thickness: marker.thickness,
+                    scale: dpr,
+                    logical,
+                });
+                let exclusion = {
+                    let baseline = self.baseline.borrow();
+                    baseline.as_ref().and_then(|baseline| {
+                        trigger_rect.and_then(|rect| {
+                            real_pixel_map_rect(baseline, rect, REAL_PIXEL_TRIGGER_MARGIN)
+                        })
+                    })
+                };
+                report.trigger_exclude = exclusion;
+                report.record(
+                    exclusion.is_some(),
+                    "trigger-exclusion",
+                    format_smolstr!(
+                        "悬停/焦点敏感触发器 rect={trigger_rect:?} 从全窗残影比较中排除 {exclusion:?}"
+                    ),
+                );
+                {
+                    let baseline = self.baseline.borrow();
+                    if let Some(baseline) = baseline.as_ref() {
+                        self.save_evidence(report, stage, &baseline.content);
+                    }
+                }
+                match self.picker.open(app, self.window) {
+                    Ok(true) => report.record(
+                        true,
+                        "picker-open-call",
+                        SmolStr::new_static("ColorPicker::open -> true"),
+                    ),
+                    Ok(false) => {
+                        report.record(
+                            false,
+                            "picker-open-call",
+                            SmolStr::new_static("ColorPicker::open -> false（已打开？）"),
+                        );
+                        return false;
+                    }
+                    Err(error) => {
+                        report.record(
+                            false,
+                            "picker-open-call",
+                            format_smolstr!("ColorPicker::open 失败：{error}"),
+                        );
+                        return false;
+                    }
+                }
+                self.advance(app, report, RealPixelStage::PickerOpening, frame);
+                true
+            }
+            RealPixelStage::PickerOpening => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    marker.origin == baseline.origin && marker.size == baseline.size,
+                    "marker-stable",
+                    format_smolstr!("origin={:?} size={:?}", marker.origin, marker.size),
+                );
+                let entries = real_pixel_stack_entries(app, self.window);
+                let picker_node = self.picker.popup_node();
+                let entry = entries.iter().find(|entry| Some(entry.node) == picker_node);
+                report.record(
+                    entries.len() == 1,
+                    "picker-stack-size",
+                    format_smolstr!("打开后 popup 栈应有 1 条，实际 {}", entries.len()),
+                );
+                report.record(
+                    entry.is_some_and(|entry| entry.state == ui_core::popup::PopupState::Open),
+                    "picker-state",
+                    format_smolstr!("{:?}", entry.map(|entry| entry.state)),
+                );
+                report.record(
+                    entry.is_some_and(|entry| {
+                        entry.paint_offset.x.value().abs() < 0.5
+                            && entry.paint_offset.y.value().abs() < 0.5
+                    }),
+                    "picker-settled",
+                    format_smolstr!("paint_offset={:?}", entry.map(|entry| entry.paint_offset)),
+                );
+                let Some(entry) = entry else {
+                    report.record(
+                        false,
+                        "picker-entry",
+                        SmolStr::new_static("找不到 picker popup 条目"),
+                    );
+                    return false;
+                };
+                let rect = entry.paint_rect;
+                report.picker_rect = Some(rect);
+                report.record(
+                    real_pixel_contained(baseline, rect),
+                    "picker-in-window",
+                    real_pixel_rect_detail(rect),
+                );
+                real_pixel_visibility_check(
+                    report,
+                    "picker-open-visible",
+                    baseline,
+                    &content,
+                    rect,
+                    REAL_PIXEL_OPEN_PERMILLE,
+                );
+                self.save_evidence(report, stage, &content);
+                let closed = self.picker.close(app);
+                report.record(
+                    closed,
+                    "picker-close-call",
+                    format_smolstr!("ColorPicker::close -> {closed}"),
+                );
+                self.advance(app, report, RealPixelStage::PickerClosing, frame);
+                true
+            }
+            RealPixelStage::PickerClosing => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    real_pixel_stack_entries(app, self.window).is_empty(),
+                    "picker-stack-empty",
+                    SmolStr::new_static("关闭后 popup 栈必须为空"),
+                );
+                let Some(rect) = report.picker_rect else {
+                    report.record(
+                        false,
+                        "picker-rect",
+                        SmolStr::new_static("缺少 picker rect"),
+                    );
+                    return false;
+                };
+                real_pixel_residue_check(report, "picker-close-residue", baseline, &content, rect);
+                self.save_evidence(report, stage, &content);
+                let anchor = ui_core::popup::Anchor::WindowRect(LogicalRect::from_origin_size(
+                    LogicalPoint::new(px(80.0), px(120.0)),
+                    LogicalSize::new(px(1.0), px(1.0)),
+                ));
+                let root = self.chain_menu.open(app, self.window, anchor);
+                report.record(
+                    matches!(root, Ok(true)),
+                    "menu-open-call",
+                    format_smolstr!("MenuChain::open(root) -> {root:?}"),
+                );
+                if !matches!(root, Ok(true)) {
+                    return false;
+                }
+                report.menu_levels = 1;
+                self.advance(app, report, RealPixelStage::MenuOpening, frame);
+                true
+            }
+            RealPixelStage::MenuOpening => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    marker.origin == baseline.origin && marker.size == baseline.size,
+                    "marker-stable",
+                    format_smolstr!("origin={:?} size={:?}", marker.origin, marker.size),
+                );
+                let entries = real_pixel_stack_entries(app, self.window);
+                report.record(
+                    entries.len() == 3,
+                    "menu-stack-size",
+                    format_smolstr!("3 级菜单链应有 3 条 popup，实际 {}", entries.len()),
+                );
+                report.record(
+                    entries.len() == 3
+                        && entries
+                            .iter()
+                            .all(|entry| entry.state == ui_core::popup::PopupState::Open),
+                    "menu-state",
+                    format_smolstr!(
+                        "states={:?}",
+                        entries.iter().map(|entry| entry.state).collect::<Vec<_>>()
+                    ),
+                );
+                report.record(
+                    entries.len() == 3
+                        && entries[0].z < entries[1].z
+                        && entries[1].z < entries[2].z,
+                    "menu-z-order",
+                    format_smolstr!(
+                        "z={:?}",
+                        entries.iter().map(|entry| entry.z).collect::<Vec<_>>()
+                    ),
+                );
+                report.record(
+                    entries.len() == 3
+                        && entries[1].parent == Some(entries[0].id)
+                        && entries[2].parent == Some(entries[1].id),
+                    "menu-parent-chain",
+                    format_smolstr!(
+                        "parents={:?}",
+                        entries.iter().map(|entry| entry.parent).collect::<Vec<_>>()
+                    ),
+                );
+                report.record(
+                    entries.len() == 3
+                        && entries
+                            .iter()
+                            .all(|entry| real_pixel_contained(baseline, entry.paint_rect)),
+                    "menu-in-window",
+                    format_smolstr!(
+                        "rects={:?}",
+                        entries
+                            .iter()
+                            .map(|entry| entry.paint_rect)
+                            .collect::<Vec<_>>()
+                    ),
+                );
+                report.menu_rects = entries.iter().map(|entry| entry.paint_rect).collect();
+                for (index, rect) in report.menu_rects.clone().into_iter().enumerate() {
+                    let label = match index {
+                        0 => "menu-open-visible-root",
+                        1 => "menu-open-visible-level2",
+                        _ => "menu-open-visible-level3",
+                    };
+                    real_pixel_visibility_check(
+                        report,
+                        label,
+                        baseline,
+                        &content,
+                        rect,
+                        REAL_PIXEL_OPEN_PERMILLE,
+                    );
+                }
+                self.save_evidence(report, stage, &content);
+                let closed = self.chain_menu.close(app);
+                report.record(
+                    closed,
+                    "menu-close-call",
+                    format_smolstr!("MenuChain::close -> {closed}"),
+                );
+                self.advance(app, report, RealPixelStage::MenuClosing, frame);
+                true
+            }
+            RealPixelStage::MenuClosing => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    real_pixel_stack_entries(app, self.window).is_empty(),
+                    "menu-stack-empty",
+                    SmolStr::new_static("3 级菜单链关闭后 popup 栈必须为空"),
+                );
+                let rects = report.menu_rects.clone();
+                for (index, rect) in rects.into_iter().enumerate() {
+                    let label = match index {
+                        0 => "menu-close-residue-root",
+                        1 => "menu-close-residue-level2",
+                        _ => "menu-close-residue-level3",
+                    };
+                    real_pixel_residue_check(report, label, baseline, &content, rect);
+                }
+                self.save_evidence(report, stage, &content);
+                match self.dialog.open(app, self.window) {
+                    Ok(true) => report.record(
+                        true,
+                        "dialog-open-call",
+                        SmolStr::new_static("Dialog::open -> true"),
+                    ),
+                    Ok(false) => {
+                        report.record(
+                            false,
+                            "dialog-open-call",
+                            SmolStr::new_static("Dialog::open -> false（已打开？）"),
+                        );
+                        return false;
+                    }
+                    Err(error) => {
+                        report.record(
+                            false,
+                            "dialog-open-call",
+                            format_smolstr!("Dialog::open 失败：{error}"),
+                        );
+                        return false;
+                    }
+                }
+                self.advance(app, report, RealPixelStage::DialogOpening, frame);
+                true
+            }
+            RealPixelStage::DialogOpening => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                if tone == RealPixelTone::Scrim {
+                    report.record(
+                        marker.origin == baseline.origin && marker.size == baseline.size,
+                        "dialog-marker-under-scrim",
+                        format_smolstr!(
+                            "scrim 调标记 origin={:?} size={:?} baseline={:?}",
+                            marker.origin,
+                            marker.size,
+                            baseline.origin
+                        ),
+                    );
+                }
+                let entries = real_pixel_stack_entries(app, self.window);
+                let dialog_node = self.dialog.popup_node();
+                let dialog_entry = entries.iter().find(|entry| Some(entry.node) == dialog_node);
+                let scrim_entry = entries
+                    .iter()
+                    .find(|entry| entry.tier == ui_core::popup::PopupTier::Scrim);
+                report.record(
+                    entries.len() == 2,
+                    "dialog-stack-size",
+                    format_smolstr!("模态 + scrim 应有 2 条 popup，实际 {}", entries.len()),
+                );
+                report.record(
+                    dialog_entry.is_some_and(|entry| {
+                        entry.state == ui_core::popup::PopupState::Open
+                            && entry.tier == ui_core::popup::PopupTier::Modal
+                    }),
+                    "dialog-state",
+                    format_smolstr!(
+                        "dialog={:?}",
+                        dialog_entry.map(|entry| (entry.state, entry.tier))
+                    ),
+                );
+                report.record(
+                    scrim_entry
+                        .is_some_and(|entry| entry.state == ui_core::popup::PopupState::Open),
+                    "dialog-scrim-state",
+                    format_smolstr!("scrim={:?}", scrim_entry.map(|entry| entry.state)),
+                );
+                let Some(dialog_entry) = dialog_entry else {
+                    report.record(
+                        false,
+                        "dialog-entry",
+                        SmolStr::new_static("找不到 dialog popup 条目"),
+                    );
+                    return false;
+                };
+                let panel = dialog_entry.paint_rect;
+                report.dialog_panel = Some(panel);
+                report.record(
+                    real_pixel_contained(baseline, panel),
+                    "dialog-in-window",
+                    real_pixel_rect_detail(panel),
+                );
+                if let Some(scrim_entry) = scrim_entry {
+                    report.scrim_rect = Some(scrim_entry.paint_rect);
+                    let scrim_covers = real_pixel_map_rect(baseline, scrim_entry.paint_rect, 0)
+                        .is_some_and(|region| {
+                            region.x0 <= 2
+                                && region.y0 <= 2
+                                && region.x1 + 2 >= baseline.size.0
+                                && region.y1 + 2 >= baseline.size.1
+                        });
+                    report.record(
+                        scrim_covers,
+                        "dialog-scrim-covers-content",
+                        format_smolstr!(
+                            "scrim={} content={}x{}",
+                            real_pixel_rect_detail(scrim_entry.paint_rect),
+                            baseline.size.0,
+                            baseline.size.1
+                        ),
+                    );
+                }
+                real_pixel_visibility_check(
+                    report,
+                    "dialog-panel-visible",
+                    baseline,
+                    &content,
+                    panel,
+                    REAL_PIXEL_DIALOG_PANEL_PERMILLE,
+                );
+                let whole = real_pixel_content_region(baseline);
+                let scrim = report.scrim;
+                let live_scrim = real_pixel_theme_scrim(&self.theme);
+                report.record(
+                    live_scrim == scrim,
+                    "dialog-scrim-theme",
+                    format_smolstr!("运行中主题 scrim 未变化：build={scrim:?} live={live_scrim:?}"),
+                );
+                let predicted = real_pixel_scrim_predicted(&baseline.content, scrim);
+                let shadow_margin =
+                    (REAL_PIXEL_SCRIM_PANEL_MARGIN as f32 * baseline.scale).round() as u32;
+                let panel_exclusion = real_pixel_map_rect(baseline, panel, shadow_margin);
+                let edge_margin = ((REAL_PIXEL_MARKER_BORDER + 4.0) * baseline.scale)
+                    .round()
+                    .max(REAL_PIXEL_SCRIM_EDGE_MARGIN as f32)
+                    as u32;
+                let inner = RealPixelRegion::new(
+                    edge_margin,
+                    edge_margin,
+                    whole.x1.saturating_sub(edge_margin),
+                    whole.y1.saturating_sub(edge_margin),
+                );
+                let mut exclusions: Vec<RealPixelRegion> = Vec::with_capacity(2);
+                if let Some(panel_exclusion) = panel_exclusion {
+                    exclusions.push(panel_exclusion);
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let width = (160.0 * baseline.scale).round() as u32;
+                    let height = (48.0 * baseline.scale).round() as u32;
+                    exclusions.push(RealPixelRegion::new(
+                        0,
+                        0,
+                        width.min(whole.x1),
+                        height.min(whole.y1),
+                    ));
+                }
+                let (loose, strict) =
+                    real_pixel_scrim_analysis(&predicted, &content, inner, &exclusions);
+                let outlier_permille = loose
+                    .differing
+                    .saturating_mul(1000)
+                    .checked_div(loose.compared.max(1))
+                    .unwrap_or(0);
+                report.record(
+                    loose.compared >= 500_000
+                        && outlier_permille <= REAL_PIXEL_SCRIM_OUTLIER_PERMILLE
+                        && strict.differing == 0
+                        && strict.max_delta <= 24,
+                    "dialog-scrim-composite",
+                    format_smolstr!(
+                        "scrim={:?} alpha={:.4} predicted-from-baseline: compared={} outliers>4={outlier_permille}‰ outliers>12={} max_delta={} exclusions={exclusions:?}",
+                        [scrim[0], scrim[1], scrim[2]],
+                        scrim[3],
+                        loose.compared,
+                        strict.differing,
+                        strict.max_delta
+                    ),
+                );
+                let derived = real_pixel_derive_scrim_alpha(baseline, &content, scrim);
+                report.record(
+                    derived.is_some_and(|(alpha, samples)| {
+                        samples >= 1000
+                            && (alpha - scrim[3]).abs() <= REAL_PIXEL_SCRIM_ALPHA_TOLERANCE
+                    }),
+                    "dialog-scrim-alpha",
+                    format_smolstr!(
+                        "theme_alpha={:.4} derived_from_marker={derived:?} tolerance={REAL_PIXEL_SCRIM_ALPHA_TOLERANCE}",
+                        scrim[3]
+                    ),
+                );
+                let panel_region = real_pixel_map_rect(baseline, panel, 2);
+                let Some(panel_region) = panel_region else {
+                    report.record(
+                        false,
+                        "dialog-panel-above-scrim",
+                        SmolStr::new_static("panel rect 无法映射到内容区"),
+                    );
+                    return false;
+                };
+                let above = real_pixel_compare(
+                    &predicted,
+                    &content,
+                    panel_region,
+                    REAL_PIXEL_OPEN_TOLERANCE,
+                    None,
+                );
+                let above_permille = above
+                    .compared
+                    .saturating_mul(1000)
+                    .checked_div(panel_region.area())
+                    .unwrap_or(0);
+                report.record(
+                    above_permille >= 500 && above.max_delta >= REAL_PIXEL_VISIBLE_DELTA,
+                    "dialog-panel-above-scrim",
+                    format_smolstr!(
+                        "panel={panel_region:?} changed_vs_scrim_composite={} ({above_permille}‰) max_delta={}",
+                        above.differing,
+                        above.max_delta
+                    ),
+                );
+                let mut scrim_fault = content.clone();
+                for y in whole.y0..whole.y1 {
+                    for x in whole.x0..whole.x1 {
+                        scrim_fault.put_pixel(x, y, *baseline.content.get_pixel(x, y));
+                    }
+                }
+                let (fault_loose, _) =
+                    real_pixel_scrim_analysis(&predicted, &scrim_fault, inner, &exclusions);
+                let fault_alpha = real_pixel_derive_scrim_alpha(baseline, &scrim_fault, scrim);
+                let scrim_fault_detected = fault_loose.differing > 0
+                    || !fault_alpha.is_some_and(|(alpha, _)| {
+                        (alpha - scrim[3]).abs() <= REAL_PIXEL_SCRIM_ALPHA_TOLERANCE
+                    });
+                report.record(
+                    scrim_fault_detected,
+                    "self-check-scrim-fault",
+                    format_smolstr!(
+                        "把 scrim 区域替换回 baseline 后检测器必须判红：composite_outliers={} derived={fault_alpha:?}",
+                        fault_loose.differing
+                    ),
+                );
+                let mut panel_fault = content.clone();
+                for y in panel_region.y0..panel_region.y1 {
+                    for x in panel_region.x0..panel_region.x1 {
+                        panel_fault.put_pixel(x, y, *predicted.get_pixel(x, y));
+                    }
+                }
+                let above_fault = real_pixel_compare(
+                    &predicted,
+                    &panel_fault,
+                    panel_region,
+                    REAL_PIXEL_OPEN_TOLERANCE,
+                    None,
+                );
+                let above_fault_permille = above_fault
+                    .differing
+                    .saturating_mul(1000)
+                    .checked_div(panel_region.area())
+                    .unwrap_or(0);
+                report.record(
+                    above_fault_permille < 500,
+                    "self-check-panel-fault",
+                    format_smolstr!(
+                        "把 panel 区域替换为 scrim 合成后检测器必须判红：changed={above_fault_permille}‰ (需 <500)"
+                    ),
+                );
+                let diff = real_pixel_compare(
+                    &baseline.content,
+                    &content,
+                    whole,
+                    REAL_PIXEL_OPEN_TOLERANCE,
+                    None,
+                );
+                let permille = diff
+                    .compared
+                    .saturating_mul(1000)
+                    .checked_div(whole.area())
+                    .unwrap_or(0);
+                report.record(
+                    permille >= REAL_PIXEL_SCRIM_PERMILLE
+                        && diff.max_delta >= REAL_PIXEL_VISIBLE_DELTA,
+                    "dialog-scrim-visible",
+                    format_smolstr!(
+                        "content={whole:?} changed={} ({permille}‰) max_delta={}",
+                        diff.differing,
+                        diff.max_delta
+                    ),
+                );
+                self.save_evidence(report, stage, &content);
+                let closed = self.dialog.close(app);
+                report.record(
+                    closed,
+                    "dialog-close-call",
+                    format_smolstr!("Dialog::close -> {closed}"),
+                );
+                self.advance(app, report, RealPixelStage::DialogClosing, frame);
+                true
+            }
+            RealPixelStage::DialogClosing => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    marker.origin == baseline.origin && marker.size == baseline.size,
+                    "dialog-close-marker-restored",
+                    format_smolstr!(
+                        "tone={tone:?} origin={:?} size={:?} baseline={:?}",
+                        marker.origin,
+                        marker.size,
+                        baseline.origin
+                    ),
+                );
+                report.record(
+                    real_pixel_stack_entries(app, self.window).is_empty(),
+                    "dialog-stack-empty",
+                    SmolStr::new_static("Dialog 关闭后 popup 栈必须为空（含 scrim）"),
+                );
+                real_pixel_content_residue_check(
+                    report,
+                    "dialog-close-residue",
+                    baseline,
+                    &content,
+                );
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::Done, frame);
+                true
+            }
+            RealPixelStage::Done => true,
+        }
+    }
+
+    fn finish(&self, app: &mut App) {
+        {
+            let mut report = self.report.borrow_mut();
+            if report.completed {
+                return;
+            }
+            report.completed = true;
+            if let Err(error) = real_pixel_write_report(&report) {
+                report.report_write_failed = true;
+                report
+                    .failures
+                    .push(format_smolstr!("report-write: {error}"));
+                println!("gallery: real-pixel-check FAIL report write: {error}");
+            }
+            let elapsed = report
+                .started
+                .map_or(Duration::ZERO, |started| started.elapsed());
+            println!(
+                "gallery: real-pixel-check summary platform={} checks={} failures={} elapsed={} ms frame={} revision={} status={} diff_sha={} identity={} profile={} evidence={}",
+                report.platform,
+                report.checks,
+                report.failures.len(),
+                elapsed.as_millis(),
+                report.last_frame,
+                report.source_revision,
+                report.source_dirty,
+                report.source_diff_sha,
+                report.source_identity,
+                report.build_profile,
+                report.evidence.display()
+            );
+        }
+        app.close_window(self.window);
+        app.handle().wake();
+    }
+
+    fn final_report(&self) -> bool {
+        let report = self.report.borrow();
+        let passed = report.completed && report.failures.is_empty() && !report.report_write_failed;
+        if !report.completed {
+            println!(
+                "gallery: real-pixel-check FAIL automation did not finish (window closed before the final round; evidence {})",
+                report.evidence.display()
+            );
+            return false;
+        }
+        if passed {
+            println!(
+                "gallery: real-pixel-check PASS ({} checks; evidence {}; exit 0)",
+                report.checks,
+                report.evidence.display()
+            );
+        } else {
+            for failure in &report.failures {
+                println!("gallery: real-pixel-check failure {failure}");
+            }
+            println!(
+                "gallery: real-pixel-check FAIL ({} failure(s) in {} checks; evidence {}; exit 3)",
+                report.failures.len(),
+                report.checks,
+                report.evidence.display()
+            );
+        }
+        passed
+    }
+}
+
+fn real_pixel_write_report(report: &RealPixelReport) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let path = report.evidence.join("report.txt");
+    let mut text = String::with_capacity(16384);
+    let _ = writeln!(text, "platform={}", report.platform);
+    let _ = writeln!(text, "source_revision={}", report.source_revision);
+    let _ = writeln!(text, "source_status={}", report.source_dirty);
+    let _ = writeln!(text, "source_diff_sha={}", report.source_diff_sha);
+    let _ = writeln!(text, "source_identity={}", report.source_identity);
+    let _ = writeln!(text, "build_profile={}", report.build_profile);
+    let _ = writeln!(text, "capture_command={}", report.capture_command);
+    let _ = writeln!(text, "screen={}x{}", report.screen.0, report.screen.1);
+    let _ = writeln!(
+        text,
+        "window_logical={:.1}x{:.1}",
+        report.window_logical.width.value(),
+        report.window_logical.height.value()
+    );
+    let _ = writeln!(text, "dpi_scale={:.4}", report.dpi);
+    let _ = writeln!(
+        text,
+        "scrim_color_linear=[{:.4}, {:.4}, {:.4}] scrim_alpha={:.4}",
+        report.scrim[0], report.scrim[1], report.scrim[2], report.scrim[3]
+    );
+    let _ = writeln!(
+        text,
+        "last_frame={} elapsed_ms={}",
+        report.last_frame,
+        report
+            .started
+            .map_or(Duration::ZERO, |started| started.elapsed())
+            .as_millis()
+    );
+    let _ = writeln!(
+        text,
+        "damage_full=unavailable(real-window; the headless --pixel-check gate asserts damage_full_frames=0)"
+    );
+    let _ = writeln!(
+        text,
+        "residue_rule=tolerance {REAL_PIXEL_RESIDUE_TOLERANCE}, coverage>={REAL_PIXEL_COVERAGE_PERMILLE}permille, trigger-exclusion {REAL_PIXEL_TRIGGER_MARGIN}px"
+    );
+    let _ = writeln!(text, "checks={}", report.checks);
+    let _ = writeln!(text, "failures={}", report.failures.len());
+    let result = if report.completed && report.failures.is_empty() && !report.report_write_failed {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let _ = writeln!(text, "result={result}");
+    let _ = writeln!(text, "evidence_dir={}", report.evidence.display());
+    let _ = writeln!(
+        text,
+        "evidence_layout=<evidence_dir>/00-warmup.png,00-baseline.png,01-picker-open.png,02-picker-closed.png,03-menu-open.png,04-menu-closed.png,05-dialog-open.png,06-dialog-closed.png,report.txt,run.log"
+    );
+    for line in &report.lines {
+        let _ = writeln!(text, "{line}");
+    }
+    std::fs::write(&path, text)
+        .map_err(|error| format!("{}: {error}", path.display()))
+        .map(|()| {
+            println!(
+                "gallery: real-pixel-check report written {}",
+                path.display()
+            );
+        })
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flags = parse_flags();
     if flags.pixel_check {
@@ -3987,13 +6463,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let mut app = App::new(runtime.handle().clone());
+    if flags.real_pixel_check {
+        let acceptance = RealPixelAcceptance::build(&mut app);
+        acceptance.install(&mut app);
+        Application::new().run(app)?;
+        println!("gallery: real-pixel-check event loop exited");
+        if !acceptance.final_report() {
+            std::process::exit(3);
+        }
+        return Ok(());
+    }
     let gallery = Gallery::build(&mut app, flags);
     println!(
         "gallery: window {:?} created ({}×{} logical), 15 sections",
         gallery.window, WINDOW_W, WINDOW_H
     );
     println!(
-        "gallery: gates: --pixel-check = headless pixel gate (exit 0/3); --debug-stack = real-window popup stack/rect gate (exit 0/3 when its final round completes; --auto-close only raises its >=30s watchdog, covers the removed --dump-overlay)"
+        "gallery: gates: --pixel-check = headless pixel gate (exit 0/3); --debug-stack = real-window popup stack/rect gate (exit 0/3 when its final round completes; --auto-close only raises its >=30s watchdog, covers the removed --dump-overlay); --real-pixel-check = true-window full-screen screenshot pixel gate (exit 0/3, evidence under target/real-pixels/<os>/); note: under a busy/concurrent desktop (screenshot tooling, parallel gates, IDE load) --debug-stack can exceed 300 s, the acceptance scripts enforce a 300 s timeout and retry up to 3 attempts — a single timeout is retried and does not change the gate result"
     );
     gallery.install(&mut app);
     Application::new().run(app)?;

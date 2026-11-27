@@ -119,12 +119,19 @@ fn remove_clears_the_extent_and_baked_screen_bounds_side_tables() {
         Some(crate::node::tree::PopupTransform {
             offset: LogicalPoint::new(px(3.0), px(5.0)),
             opacity: 0.5,
+            scale: 1.0,
+            pivot: LogicalPoint::ZERO,
             blocked: true,
         }),
     );
     tree.set_popup_pointer_transparent(node, true);
+    tree.set_paint_scale(node, 0.98, LogicalPoint::new(px(10.0), px(20.0)));
     assert!(tree.popup_transform(node).is_some());
     assert!(tree.popup_pointer_transparent(node));
+    assert_eq!(
+        tree.paint_scales.get(index).copied(),
+        Some((0.98, LogicalPoint::new(px(10.0), px(20.0))))
+    );
     assert!(tree.painted_extents.get(index).copied().flatten().is_some());
     assert!(
         tree.baked_screen_bounds
@@ -156,6 +163,11 @@ fn remove_clears_the_extent_and_baked_screen_bounds_side_tables() {
             .is_none(),
         "remove 必须清空 baked_screen_bounds（与 painted_extents 对称）"
     );
+    assert_eq!(
+        tree.paint_scales.get(index).copied(),
+        Some((1.0, LogicalPoint::ZERO)),
+        "remove 必须重置 paint_scales（与 popup_transforms 等侧表一致）"
+    );
 
     let reused = boxed(&mut tree, root);
     assert_eq!(reused.index(), node.index(), "节点索引必须被复用");
@@ -166,6 +178,11 @@ fn remove_clears_the_extent_and_baked_screen_bounds_side_tables() {
     assert!(
         !tree.popup_pointer_transparent(reused),
         "复用槽位不得继承 popup_pointer_transparent"
+    );
+    assert_eq!(
+        tree.paint_scales.get(index).copied(),
+        Some((1.0, LogicalPoint::ZERO)),
+        "复用槽位不得继承 paint_scales"
     );
     assert!(tree.painted_extents.get(index).copied().flatten().is_none());
     assert!(
@@ -1413,4 +1430,52 @@ fn writing_an_equal_runtime_max_size_is_a_no_op() {
         .expect("same limit");
 
     assert!(!tree.has_layout_work(), "等值写入不得请求布局");
+}
+
+#[test]
+fn the_paint_reuse_key_includes_the_scale_pivot() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let node = boxed(&mut tree, root);
+    let pivot = LogicalPoint::new(px(10.0), px(20.0));
+    tree.set_reusable(node);
+    tree.set_clip_key(node, (0, None));
+    tree.set_lane_offset(node, LogicalPoint::ZERO);
+    tree.set_paint_scale(node, 0.98, pivot);
+    let state = tree
+        .paint_state(
+            node,
+            LogicalPoint::ZERO,
+            LogicalPoint::ZERO,
+            (0, None),
+            1.0,
+            (0.98, pivot),
+        )
+        .expect("paint state");
+    assert!(state.reusable, "缓存键完全一致时必须复用");
+    let state = tree
+        .paint_state(
+            node,
+            LogicalPoint::ZERO,
+            LogicalPoint::ZERO,
+            (0, None),
+            1.0,
+            (0.98, LogicalPoint::new(px(11.0), px(20.0))),
+        )
+        .expect("paint state");
+    assert!(
+        !state.reusable,
+        "pivot 变化必须破坏复用键（pivot 参与缓存键）"
+    );
+    let state = tree
+        .paint_state(
+            node,
+            LogicalPoint::ZERO,
+            LogicalPoint::ZERO,
+            (0, None),
+            1.0,
+            (1.0, LogicalPoint::ZERO),
+        )
+        .expect("paint state");
+    assert!(!state.reusable, "scale 变化必须破坏复用键");
 }

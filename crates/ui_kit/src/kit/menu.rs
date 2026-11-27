@@ -465,7 +465,7 @@ impl ItemPanel {
         spec.dismiss = self.inner.options.dismiss;
         spec.focus = request.focus;
         spec.opener = request.opener;
-        spec.animation = PopupAnimation::Fade;
+        spec.animation = PopupAnimation::FadeSlide;
         spec.a11y = PopupA11y {
             role: self.inner.options.roles.panel,
             label: self.inner.options.label.clone(),
@@ -656,6 +656,10 @@ impl ItemPanel {
 
     pub(crate) fn close(&self, app: &mut App) -> bool {
         self.inner.panel.close(app)
+    }
+
+    pub(crate) fn close_with_reason(&self, app: &mut App, reason: DismissReason) -> bool {
+        self.inner.panel.close_with_reason(app, reason)
     }
 
     pub(crate) fn close_now(&self, app: &mut App) -> bool {
@@ -1146,6 +1150,7 @@ struct MenuInner {
     last_hovered: Cell<Option<usize>>,
     window: Cell<Option<WindowId>>,
     watch: RefCell<AnchorWatch>,
+    watch_animation: Cell<bool>,
     scroll_closes: Cell<bool>,
     internal_scroll: Cell<Option<LogicalPx>>,
     right_action: Action,
@@ -1246,6 +1251,7 @@ impl Menu {
             last_hovered: Cell::new(None),
             window: Cell::new(None),
             watch: RefCell::new(AnchorWatch::default()),
+            watch_animation: Cell::new(false),
             scroll_closes: Cell::new(false),
             internal_scroll: Cell::new(None),
             right_action: Action::Custom(format_smolstr!("{key}.right")),
@@ -1387,6 +1393,7 @@ impl Menu {
         };
         self.inner.opener.set(opener);
         self.inner.watch.borrow_mut().reset();
+        self.inner.watch_animation.set(false);
         self.inner.internal_scroll.set(None);
         let level = match self.level() {
             Some(level) => level,
@@ -2275,7 +2282,7 @@ impl Menu {
         if let Some(callback) = self.inner.sink.on_activate.borrow().clone() {
             callback(app, activation);
         }
-        self.close_chain(app);
+        self.close_chain(app, DismissReason::Programmatic);
     }
 
     fn toggle_checked(&self, app: &mut App, row: usize, index: usize, keep_open: bool) {
@@ -2322,7 +2329,7 @@ impl Menu {
             callback(app, activation);
         }
         if !keep_open {
-            self.close_chain(app);
+            self.close_chain(app, DismissReason::Programmatic);
         }
     }
 
@@ -2372,9 +2379,9 @@ impl Menu {
         true
     }
 
-    fn close_chain(&self, app: &mut App) {
+    fn close_chain(&self, app: &mut App, reason: DismissReason) {
         let root = self.root();
-        let _ = root.inner.panel.close(app);
+        let _ = root.inner.panel.close_with_reason(app, reason);
     }
 
     fn page_highlight(&self, app: &mut App, direction: isize) {
@@ -2633,7 +2640,7 @@ impl Menu {
                     ..A11yPatch::default()
                 },
                 MenuEntry::Group(label) => A11yPatch {
-                    role: Some(A11yRole::Label),
+                    role: Some(A11yRole::Group),
                     label: Some(label.clone()),
                     ..A11yPatch::default()
                 },
@@ -2873,20 +2880,51 @@ impl Menu {
         let (Some(id), Some(window)) = (self.inner.panel.id(), self.inner.window.get()) else {
             return false;
         };
+        let animating = self.ancestors_animating(app);
+        let was_animating = self.inner.watch_animation.replace(animating);
         let change = self.inner.watch.borrow_mut().observe(app, id, window);
         let internal_scroll = self.sync_internal_scroll(app);
+        let change = if change == AnchorChange::Moved && (animating || was_animating) {
+            AnchorChange::None
+        } else {
+            change
+        };
 
         match change {
             AnchorChange::Lost | AnchorChange::Resized | AnchorChange::Moved => {
-                self.close_chain(app);
+                self.close_chain(app, DismissReason::AnchorLost);
                 true
             }
             AnchorChange::Scrolled if self.inner.scroll_closes.get() && !internal_scroll => {
-                self.close_chain(app);
+                self.close_chain(app, DismissReason::AnchorLost);
                 true
             }
             AnchorChange::None | AnchorChange::Scrolled => false,
         }
+    }
+
+    fn ancestors_animating(&self, app: &App) -> bool {
+        let Some(window) = self.inner.window.get() else {
+            return false;
+        };
+        let Some(stack) = app.popup_stack(window) else {
+            return false;
+        };
+        let chain = self.chain();
+        let mut level = self.level();
+        while let Some(parent) = level.and_then(|level| chain.parent(level)) {
+            if let Some(menu) = self.inner.sink.owner(parent)
+                && let Some(id) = menu.inner.panel.id()
+                && stack.entries.iter().any(|entry| {
+                    entry.id == id
+                        && (entry.paint_offset != LogicalPoint::ZERO || entry.paint_scale != 1.0)
+                })
+            {
+                return true;
+            }
+            level = Some(parent);
+        }
+        false
     }
 
     fn sync_internal_scroll(&self, app: &App) -> bool {
@@ -3185,7 +3223,7 @@ mod tests {
         a11y::{A11yAction, A11yRole},
         event::{Action, ActionSource, InputEvent, KeyCode, Modifiers, PointerButton},
         interaction::ScrollConfig,
-        math::{LogicalPoint, LogicalRect, LogicalSize, px},
+        math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::style_builder::StyleBuilder,
         popup::{
@@ -3400,6 +3438,11 @@ mod tests {
                 .into_iter()
                 .find(|entry| entry.node == node)
                 .expect("根菜单在栈里")
+        }
+
+        fn popup_rect(&self, menu: &Menu) -> LogicalRect {
+            let id = self.root_entry(menu).id;
+            self.app.app().popup_rect(id).expect("浮层 rect").hit
         }
 
         fn submenu_entry(&self, root: PopupId) -> PopupSnapshotEntry {
@@ -3721,6 +3764,44 @@ mod tests {
         harness.settle(&menu);
         assert_eq!(harness.closes.get(), 1);
         assert!(!menu.is_open(harness.app.app()));
+    }
+
+    #[test]
+    fn group_and_separator_rows_expose_their_a11y_roles() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let menu = harness.menu(entries(), options());
+        harness.open(&menu);
+        let group = harness.find("menu:panel:list:row:0").expect("分组头行节点");
+        let separator = harness.find("menu:panel:list:row:3").expect("分隔线行节点");
+        let action = harness
+            .find("menu:panel:list:row:1")
+            .expect("普通菜单项行节点");
+        let snapshot = full_a11y(&mut harness.app);
+        let group_record = snapshot.node_for(group).expect("分组头 a11y");
+        assert_eq!(
+            group_record.role,
+            A11yRole::Group,
+            "菜单分组头按 Group 投影（D-P2-10 修正）"
+        );
+        assert_eq!(group_record.label_text(), Some("账户"));
+        assert!(
+            !group_record.actions.contains(&A11yAction::Focus),
+            "分组头不可聚焦：{:?}",
+            group_record.actions
+        );
+        let separator_record = snapshot.node_for(separator).expect("分隔线 a11y");
+        assert_eq!(separator_record.role, A11yRole::Separator);
+        assert!(separator_record.hidden, "菜单分隔线 a11y hidden（D-P2-10）");
+        assert!(
+            !separator_record.actions.contains(&A11yAction::Focus),
+            "分隔线不可聚焦：{:?}",
+            separator_record.actions
+        );
+        let action_record = snapshot.node_for(action).expect("菜单项 a11y");
+        assert_eq!(action_record.role, A11yRole::MenuItem);
+        assert!(!action_record.hidden);
+        assert_eq!(action_record.label_text(), Some("资料"));
     }
 
     #[test]
@@ -5048,6 +5129,116 @@ mod tests {
             level2_menu.highlighted(harness.app.app()),
             Some(1),
             "二级 active 不被三级 hover 改变"
+        );
+    }
+
+    #[test]
+    fn the_anchor_matrix_closes_report_anchor_lost_and_programmatic_closes_report_programmatic() {
+        let mut harness = Harness::new();
+        let reasons: Rc<RefCell<Vec<DismissReason>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = reasons.clone();
+        let menu = Menu::new(
+            harness.app.app_mut(),
+            harness.theme.clone(),
+            "menu",
+            entries(),
+            options(),
+        )
+        .on_close(move |_, reason| sink.borrow_mut().push(reason));
+        assert!(harness.open(&menu));
+        harness
+            .app
+            .app_mut()
+            .window_mut(harness.window)
+            .expect("窗口")
+            .set_size(LogicalSize::new(px(700.0), px(500.0)));
+        harness.advance(&menu, Duration::from_millis(40));
+        harness.settle(&menu);
+        assert!(
+            !menu.is_open(harness.app.app()),
+            "窗口 resize 必须关闭整链（锚点矩阵）"
+        );
+        assert_eq!(
+            reasons.borrow().as_slice(),
+            &[DismissReason::AnchorLost],
+            "锚点矩阵关闭必须上报 AnchorLost（R2-02/Q2-07）"
+        );
+
+        assert!(harness.open(&menu));
+        assert!(menu.close(harness.app.app_mut()));
+        harness.settle(&menu);
+        assert_eq!(
+            reasons.borrow().as_slice(),
+            &[DismissReason::AnchorLost, DismissReason::Programmatic],
+            "程序化关闭仍上报 Programmatic"
+        );
+    }
+
+    #[test]
+    fn the_menu_slides_in_without_moving_the_settled_rect() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        assert!(harness.open(&menu));
+        let node = menu.popup_node().expect("浮层节点");
+        let opening = harness.root_entry(&menu);
+        assert_eq!(opening.node, node, "打开时菜单必须在栈里");
+        assert!(
+            opening.paint_offset.x == LogicalPx::ZERO
+                && opening.paint_offset.y > LogicalPx::ZERO
+                && opening.paint_offset.y <= px(4.0),
+            "FadeSlide 首帧必须带向下的 4px 绘制偏移：{:?}（state={:?}）",
+            opening.paint_offset,
+            opening.state
+        );
+        let first_rect = harness.popup_rect(&menu);
+        for _ in 0..4 {
+            harness.app.advance(Duration::from_millis(16));
+            let record = harness.drain(&menu);
+            assert!(
+                !record.damage_full,
+                "slide 帧必须局部重绘（I6）：{:?}",
+                record.stats
+            );
+        }
+        harness.settle(&menu);
+        let settled = harness.root_entry(&menu);
+        assert_eq!(
+            settled.paint_offset,
+            LogicalPoint::ZERO,
+            "动画结束后 paint_offset 必须归零"
+        );
+        assert_eq!(settled.state, PopupState::Open);
+        assert_eq!(
+            harness.popup_rect(&menu),
+            first_rect,
+            "slide 只改绘制偏移，settle rect 必须首帧即稳定"
+        );
+
+        assert!(menu.close(harness.app.app_mut()), "关闭动画开始");
+        harness.app.advance(Duration::from_millis(16));
+        let closing = harness.drain(&menu);
+        assert!(
+            !closing.damage_full,
+            "关闭 slide 帧必须局部重绘：{:?}",
+            closing.stats
+        );
+        let dpr = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .device_pixel_ratio();
+        let expected = dpr.to_covering_device_rect(first_rect);
+        let covered = closing.damage.iter().any(|damage| {
+            damage.x0.value() <= expected.x0.value()
+                && damage.y0.value() <= expected.y0.value()
+                && damage.x1.value() >= expected.x1.value()
+                && damage.y1.value() >= expected.y1.value()
+        });
+        assert!(
+            covered,
+            "关闭帧 damage 必须覆盖旧菜单 rect（无残影）：damage={:?} rect={expected:?}",
+            closing.damage
         );
     }
 

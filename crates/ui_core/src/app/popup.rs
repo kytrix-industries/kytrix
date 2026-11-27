@@ -753,6 +753,10 @@ pub(crate) fn popup_stack(app: &App, window: WindowId) -> Option<PopupStackSnaps
             owner_modal: entry.owner_modal,
             focus: entry.focus,
             paint_offset: entry.paint_offset,
+            paint_scale: target
+                .tree()
+                .popup_transform(entry.node)
+                .map_or(1.0, crate::node::tree::PopupTransform::paint_scale),
             constrained_size: entry.constrained_size,
         });
     }

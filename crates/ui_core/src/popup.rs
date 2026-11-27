@@ -214,6 +214,7 @@ pub enum PopupAnimation {
     None,
     Fade,
     FadeSlide,
+    FadeScale,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -337,6 +338,7 @@ pub struct PopupSnapshotEntry {
     pub owner_modal: Option<PopupId>,
     pub focus: FocusPolicy,
     pub paint_offset: LogicalPoint,
+    pub paint_scale: f32,
     pub constrained_size: Option<LogicalSize>,
 }
 
@@ -565,6 +567,24 @@ impl PopupEntry {
     pub fn is_modal(&self) -> bool {
         self.focus.is_modal()
     }
+
+    #[must_use]
+    pub(crate) fn is_fade_only(&self) -> bool {
+        self.is_modal() || matches!(self.tier, PopupTier::Modal | PopupTier::Scrim)
+    }
+
+    #[must_use]
+    pub(crate) fn paint_center(&self) -> LogicalPoint {
+        let rect = if self.paint_rect.is_empty() {
+            self.hit_rect
+        } else {
+            self.paint_rect
+        };
+        LogicalPoint::new(
+            rect.origin.x + rect.size.width / 2.0,
+            rect.origin.y + rect.size.height / 2.0,
+        )
+    }
 }
 
 pub struct PopupStack {
@@ -591,6 +611,8 @@ pub(crate) struct PopupAnimationState {
     pub started: Instant,
     pub paint_offset: LogicalPoint,
     pub opacity: f32,
+    pub scale_from: f32,
+    pub scale_to: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -604,6 +626,8 @@ pub(crate) const POPUP_OPEN_DURATION: std::time::Duration = std::time::Duration:
 pub(crate) const POPUP_CLOSE_DURATION: std::time::Duration = std::time::Duration::from_millis(90);
 
 pub(crate) const POPUP_SLIDE_DISTANCE: LogicalPx = LogicalPx::new(4.0);
+
+pub(crate) const POPUP_SCALE_FROM: f32 = 0.98;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PopupDiagnostic {

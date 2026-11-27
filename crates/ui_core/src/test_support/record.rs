@@ -130,6 +130,10 @@ pub struct FrameStats {
     pub scroll_offset_frames: usize,
     pub popup_settle_rounds: usize,
     pub popup_unsettled: bool,
+    pub popup_opening: bool,
+    pub popup_closing: bool,
+    pub popup_animation_records: usize,
+    pub frame_cpu: Option<std::time::Duration>,
     pub a11y_only_frames: usize,
 }
 
@@ -222,7 +226,6 @@ pub(crate) fn capture(
             }
         }
     }
-
     let damage = if report.damage.full {
         vec![frame_rect]
     } else {

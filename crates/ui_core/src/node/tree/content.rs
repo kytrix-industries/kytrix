@@ -738,6 +738,7 @@ pub(crate) fn paint_state(
     bake_offset: LogicalPoint,
     clip_key: (u8, Option<DeviceRect>),
     inherited_opacity: f32,
+    paint_scale: (f32, LogicalPoint),
 ) -> Option<super::PaintNodeState> {
     let target = tree.arena.get(node)?;
     let hidden = matches!(target.style.inner().display, taffy::style::Display::None)
@@ -772,6 +773,7 @@ pub(crate) fn paint_state(
         && tree.clip_key(node) == Some(clip_key)
         && target.lane_offset == effective_bake
         && target.paint_opacity == opacity
+        && paint_scale_of(tree, node) == paint_scale
         && stored_screen_bounds == current_screen_bounds;
     let clip_bounds = (target.style.clip == crate::paint::style::Clip::Bounds).then(|| {
         target
@@ -806,6 +808,22 @@ pub(crate) fn set_paint_opacity(tree: &mut NodeTree, node: NodeId, opacity: f32)
     if let Some(target) = tree.arena.get_mut(node) {
         target.paint_opacity = opacity;
     }
+}
+
+pub(crate) fn set_paint_scale(tree: &mut NodeTree, node: NodeId, scale: f32, pivot: LogicalPoint) {
+    let index = node.index() as usize;
+    if tree.paint_scales.len() <= index {
+        tree.paint_scales
+            .resize(index + 1, (1.0, LogicalPoint::ZERO));
+    }
+    tree.paint_scales[index] = (scale, pivot);
+}
+
+fn paint_scale_of(tree: &NodeTree, node: NodeId) -> (f32, LogicalPoint) {
+    tree.paint_scales
+        .get(node.index() as usize)
+        .copied()
+        .unwrap_or((1.0, LogicalPoint::ZERO))
 }
 
 pub(crate) fn clip_key(tree: &NodeTree, node: NodeId) -> Option<(u8, Option<DeviceRect>)> {

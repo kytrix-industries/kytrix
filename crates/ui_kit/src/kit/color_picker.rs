@@ -26,8 +26,9 @@ use ui_core::{
         style_builder::{PaintBuilder, StyleBuilder},
     },
     popup::{
-        Anchor, DismissPolicy, EscapePolicy, FocusPolicy, OutsidePress, PlacementSpec, PopupA11y,
-        PopupAnimation, PopupError, PopupSpec, PopupState, PopupTier, RestoreFocus,
+        Anchor, DismissPolicy, DismissReason, EscapePolicy, FocusPolicy, OutsidePress,
+        PlacementSpec, PopupA11y, PopupAnimation, PopupError, PopupSpec, PopupState, PopupTier,
+        RestoreFocus,
     },
     text::{TextAlign, TextStyle},
     window::WindowId,
@@ -1045,7 +1046,9 @@ impl ColorPicker {
         if inner.watch.borrow_mut().observe(app, id, window) != AnchorChange::Lost {
             return false;
         }
-        inner.popup.close(app)
+        inner
+            .popup
+            .close_with_reason(app, DismissReason::AnchorLost)
     }
 
     pub fn release(&self, app: &mut App) -> usize {
@@ -1377,7 +1380,7 @@ impl ColorPicker {
         };
         spec.dismiss = PICKER_DISMISS;
         spec.opener = Some(trigger);
-        spec.animation = PopupAnimation::Fade;
+        spec.animation = PopupAnimation::FadeScale;
         spec.a11y = PopupA11y {
             role: Some(A11yRole::Dialog),
             label: Some(panel_label),
@@ -3035,6 +3038,18 @@ mod ui_tests {
             false
         }
 
+        fn popup_entry(&self) -> ui_core::popup::PopupSnapshotEntry {
+            let node = self.picker.popup_node().expect("浮层节点");
+            self.app
+                .app()
+                .popup_stack(self.window)
+                .expect("浮层栈")
+                .entries
+                .into_iter()
+                .find(|entry| entry.node == node)
+                .expect("取色器在栈里")
+        }
+
         fn bounds(&self, node: ui_core::node::id::NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("节点已布局")
         }
@@ -3373,6 +3388,78 @@ mod ui_tests {
         harness.settle();
         let settled = harness.bounds(panel);
         assert_eq!(first, settled, "首个可见帧面板 rect 必须等于稳定帧 rect");
+    }
+
+    #[test]
+    fn the_panel_fades_and_scales_in_without_moving_the_settled_rect() {
+        let mut harness = Harness::new();
+        assert!(
+            harness
+                .picker
+                .open(harness.app.app_mut(), harness.window)
+                .expect("打开取色器")
+        );
+        let first_frame = harness.app.drain().expect("打开帧").clone();
+        assert!(
+            !first_frame.damage_full,
+            "取色器打开帧不得整帧重绘：{:?}",
+            first_frame.damage
+        );
+        let _ = harness.picker.sync(harness.app.app_mut()).expect("sync");
+        let second_frame = harness.app.drain().expect("首个可见帧").clone();
+        assert!(
+            !second_frame.damage_full,
+            "取色器首个可见帧不得整帧重绘：{:?}",
+            second_frame.damage
+        );
+        let opening = harness.popup_entry();
+        assert!(
+            opening.paint_scale >= 0.98 && opening.paint_scale < 1.0,
+            "非模态取色器首帧必须带 0.98→1 的 lane scale：{}",
+            opening.paint_scale
+        );
+        let first = opening.hit_rect;
+        let panel = harness.picker.panel_node().expect("面板节点已挂载");
+        let first_panel = harness.bounds(panel);
+        for _ in 0..8 {
+            harness.app.advance(Duration::from_millis(16));
+            let record = harness.app.drain().expect("打开缩放帧").clone();
+            let _ = harness.picker.sync(harness.app.app_mut()).expect("sync");
+            assert!(
+                !record.damage_full,
+                "非模态取色器的 scale 帧必须局部重绘（I6）：{:?}",
+                record.damage
+            );
+        }
+        harness.settle();
+        let settled = harness.popup_entry();
+        assert_eq!(settled.paint_scale, 1.0, "动画结束 scale 必须回到 1.0");
+        assert_eq!(settled.hit_rect, first, "scale 不改变 layout/hit rect");
+        assert_eq!(harness.bounds(panel), first_panel, "scale 不改变面板布局盒");
+
+        let old = settled.hit_rect;
+        assert!(harness.picker.close(harness.app.app_mut()), "关闭动画开始");
+        harness.app.advance(Duration::from_millis(16));
+        let record = harness.app.drain().expect("关闭帧").clone();
+        assert!(!record.damage_full, "非模态取色器关闭帧不得整帧重绘");
+        let expected = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .device_pixel_ratio()
+            .to_covering_device_rect(old);
+        let covered = record.damage.iter().any(|damage| {
+            damage.x0.value() <= expected.x0.value()
+                && damage.y0.value() <= expected.y0.value()
+                && damage.x1.value() >= expected.x1.value()
+                && damage.y1.value() >= expected.y1.value()
+        });
+        assert!(
+            covered,
+            "关闭帧 damage 必须覆盖旧浮层 rect（无残影）：damage={:?} rect={expected:?}",
+            record.damage
+        );
     }
 
     #[test]

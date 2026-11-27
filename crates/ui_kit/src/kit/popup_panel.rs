@@ -425,12 +425,15 @@ impl PopupPanel {
                 let Some(inner) = weak.upgrade() else {
                     return DismissOutcome::Close;
                 };
-                inner.reason.set(Some(dismiss.reason));
                 let callback = inner.on_dismiss.borrow().clone();
-                match callback {
+                let outcome = match callback {
                     Some(callback) => callback(app, &dismiss),
                     None => DismissOutcome::Close,
+                };
+                if outcome != DismissOutcome::Ignore {
+                    inner.reason.set(Some(dismiss.reason));
                 }
+                outcome
             })),
         )?;
         let Some(built) = built.borrow_mut().take() else {
@@ -455,17 +458,19 @@ impl PopupPanel {
     }
 
     pub fn close(&self, app: &mut App) -> bool {
+        self.close_with_reason(app, DismissReason::Programmatic)
+    }
+
+    pub fn close_with_reason(&self, app: &mut App, reason: DismissReason) -> bool {
         let Some(id) = self.inner.state.borrow().id else {
             return false;
         };
         if self.is_closing(app) {
             return true;
         }
-        self.inner.reason.set(Some(DismissReason::Programmatic));
-        let closing = app
-            .begin_close_popup(id, DismissReason::Programmatic)
-            .unwrap_or(false);
+        let closing = app.begin_close_popup(id, reason).unwrap_or(false);
         if closing {
+            self.inner.reason.set(Some(reason));
             let _ = app.write(&self.inner.open, false);
         }
         closing
@@ -851,8 +856,8 @@ mod tests {
         node::builder::NodeBuilder,
         paint::{primitive::Primitive, style_builder::StyleBuilder},
         popup::{
-            Anchor, DismissReason, FocusPolicy, PlacementSpec, PopupA11y, PopupAnimation, PopupId,
-            PopupSpec,
+            Anchor, DismissOutcome, DismissReason, FocusPolicy, PlacementSpec, PopupA11y,
+            PopupAnimation, PopupId, PopupSpec,
         },
         test_support::{app::TestApp, record::FrameRecord},
         window::WindowId,
@@ -1326,6 +1331,67 @@ mod tests {
             harness.reasons.borrow().as_slice(),
             &[DismissReason::Programmatic]
         );
+    }
+
+    #[test]
+    fn closing_with_an_explicit_reason_reports_that_reason() {
+        let mut harness = Harness::new(PanelWidth::Exact(px(160.0)));
+        let id = harness.open();
+        harness.drain();
+        assert!(
+            harness
+                .panel
+                .close_with_reason(harness.app.app_mut(), DismissReason::AnchorLost),
+            "带原因的关闭必须启动关闭事务"
+        );
+        assert!(harness.panel.is_closing(harness.app.app()));
+        for _ in 0..20 {
+            harness.advance(Duration::from_millis(16));
+            let _ = harness.panel.sync(harness.app.app_mut());
+            if harness.app.app().popup_rect(id).is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            harness.reasons.borrow().as_slice(),
+            &[DismissReason::AnchorLost],
+            "on_close 必须收到调用方显式给出的原因"
+        );
+        assert!(
+            !harness
+                .panel
+                .close_with_reason(harness.app.app_mut(), DismissReason::AnchorLost),
+            "已关闭的面板不再启动关闭"
+        );
+        assert_eq!(harness.reasons.borrow().len(), 1, "on_close 不得重复回调");
+    }
+
+    #[test]
+    fn a_refused_close_does_not_leak_its_reason_into_a_later_close() {
+        let mut harness = Harness::new(PanelWidth::Exact(px(160.0)));
+        let id = harness.open();
+        harness.drain();
+        harness.panel.on_dismiss(|_, _| DismissOutcome::Ignore);
+        assert!(
+            !harness
+                .panel
+                .close_with_reason(harness.app.app_mut(), DismissReason::AnchorLost),
+            "dismiss handler 拒绝时不得进入关闭事务"
+        );
+        assert!(!harness.panel.is_closing(harness.app.app()));
+        assert_eq!(
+            harness.panel.state(harness.app.app()),
+            Some(ui_core::popup::PopupState::Open),
+            "拒绝后保持打开"
+        );
+        assert!(harness.app.app().popup_rect(id).is_some(), "拒绝后浮层仍在");
+        assert!(harness.panel.close_now(harness.app.app_mut()));
+        assert_eq!(
+            harness.reasons.borrow().as_slice(),
+            &[DismissReason::Programmatic],
+            "失败关闭尝试的 AnchorLost 不得泄漏到后续非 dispatch 关闭（P3E-08）"
+        );
+        assert_eq!(harness.reasons.borrow().len(), 1);
     }
 
     #[test]

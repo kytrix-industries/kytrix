@@ -2,11 +2,14 @@ use std::time::Duration;
 
 use ui_core::{
     event::{Action, Event, ImeEvent, InputEvent, KeyCode, Modifiers, PointerButton},
-    math::{LogicalPoint, LogicalRect, LogicalSize, px},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
+        atlas::{AtlasKind, AtlasTile},
+        canvas::Canvas,
         color::Color,
-        style::{Clip, PaintSpec},
+        primitive::{Image as PaintImage, Quad, QuadPaint},
+        style::{Clip, PaintSpec, ShadowSpec, Shadows},
         style_builder::StyleBuilder,
     },
     popup::{
@@ -14,7 +17,7 @@ use ui_core::{
         InitialFocus, Placement, PlacementSpec, PopupA11y, PopupAnimation, PopupId, PopupSpec,
         PopupState, PopupTier, RestoreFocus, ScrimSpec, Side,
     },
-    test_support::app::TestApp,
+    test_support::{app::TestApp, record::PrimitiveKind},
     window::WindowId,
 };
 
@@ -5426,4 +5429,787 @@ fn popup_a11y_active_descendant_is_validated_and_cleared() {
             .is_none(),
         "open 时的非法 active_descendant 不得进入 a11y 树"
     );
+}
+
+fn popup_snapshot(app: &TestApp, id: PopupId) -> ui_core::popup::PopupSnapshotEntry {
+    app.app()
+        .popup_stack(win(app))
+        .expect("stack")
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .expect("popup entry")
+}
+
+fn popup_painted_child(app: &TestApp, id: PopupId) -> NodeId {
+    let content = popup_node(app, id);
+    let window = win(app);
+    app.app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(content)
+        .expect("popup content")
+        .children()
+        .first()
+        .copied()
+        .expect("popup content child")
+}
+
+fn painted_quad(app: &TestApp, node: NodeId) -> LogicalRect {
+    app.rendered()
+        .expect("rendered frame")
+        .quads
+        .iter()
+        .find(|quad| quad.node == node)
+        .map(|quad| quad.bounds)
+        .expect("popup content quad must be painted")
+}
+
+fn scaled_about(rect: LogicalRect, factor: f32) -> LogicalRect {
+    let center = rect_center(rect);
+    LogicalRect::new(
+        px(center.x.value() - rect.size.width.value() * factor / 2.0),
+        px(center.y.value() - rect.size.height.value() * factor / 2.0),
+        px(rect.size.width.value() * factor),
+        px(rect.size.height.value() * factor),
+    )
+}
+
+fn rect_center(rect: LogicalRect) -> LogicalPoint {
+    point(
+        (rect.origin.x + rect.size.width / 2.0).value(),
+        (rect.origin.y + rect.size.height / 2.0).value(),
+    )
+}
+
+fn assert_rect_close(actual: LogicalRect, expected: LogicalRect) {
+    let close = |left: f32, right: f32| (left - right).abs() < 0.05;
+    assert!(
+        close(actual.origin.x.value(), expected.origin.x.value())
+            && close(actual.origin.y.value(), expected.origin.y.value())
+            && close(actual.size.width.value(), expected.size.width.value())
+            && close(actual.size.height.value(), expected.size.height.value()),
+        "绘制矩形不一致：actual={actual:?} expected={expected:?}"
+    );
+}
+
+fn percentile(samples: &[Duration], percentile: f32) -> Duration {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() as f32 - 1.0) * percentile / 100.0).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+fn scaled_rect_about(rect: LogicalRect, pivot: LogicalPoint, factor: f32) -> LogicalRect {
+    LogicalRect::new(
+        px(pivot.x.value() + factor * (rect.origin.x - pivot.x).value()),
+        px(pivot.y.value() + factor * (rect.origin.y - pivot.y).value()),
+        px(rect.size.width.value() * factor),
+        px(rect.size.height.value() * factor),
+    )
+}
+
+#[test]
+fn fade_scale_open_paints_the_panel_scaled_around_its_center() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::FadeScale;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let settled = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(settled, rect(100.0, 124.0, 120.0, 80.0));
+    assert_eq!(app.app().popup_rect(id).expect("rect").a11y, settled);
+    let center = point(160.0, 164.0);
+    let child = popup_painted_child(&app, id);
+    let entry = popup_snapshot(&app, id);
+    assert_eq!(
+        entry.paint_offset,
+        LogicalPoint::ZERO,
+        "FadeScale 只做 fade+scale"
+    );
+    assert!(
+        (entry.paint_scale - 0.98).abs() < 0.001,
+        "首帧（opacity 0）即处于 0.98：{}",
+        entry.paint_scale
+    );
+    assert_eq!(
+        app.app().popup_rect(id).expect("rect").hit,
+        settled,
+        "scale 不得改变 settle/hit/a11y rect"
+    );
+    assert_eq!(app.app().popup_rect(id).expect("rect").a11y, settled);
+    assert!(!app.frame_record().damage_full, "open 缩放帧不得整帧重绘");
+
+    app.advance(Duration::from_millis(6));
+    frame(&mut app);
+    let early = popup_snapshot(&app, id).paint_scale;
+    assert!(
+        early > 0.98 && early < 1.0,
+        "首可见帧 scale 必须收敛：{early}"
+    );
+    let first = painted_quad(&app, child);
+    assert_rect_close(first, scaled_about(settled, early));
+    let first_center = rect_center(first);
+    assert!(
+        (first_center.x - center.x).value().abs() < 0.05
+            && (first_center.y - center.y).value().abs() < 0.05,
+        "缩放中心必须保持 popup 中心：{first_center:?} vs {center:?}"
+    );
+    let hit = app
+        .probe()
+        .hit(point(
+            settled.origin.x.value() + 1.0,
+            settled.origin.y.value() + 1.0,
+        ))
+        .map(|result| result.node)
+        .expect("稳定 rect 内必须可命中");
+    assert_ne!(hit, root_node(&app), "命中不得跟随绘制缩放");
+    assert!(damage_covers(&app, settled), "damage 必须覆盖缩放外延");
+    assert!(!app.frame_record().damage_full, "首可见缩放帧不得整帧重绘");
+
+    app.advance(Duration::from_millis(24));
+    frame(&mut app);
+    let mid = popup_snapshot(&app, id).paint_scale;
+    assert!(mid > 0.98 && mid < 1.0, "中段 scale 必须收敛：{mid}");
+    let mid_quad = painted_quad(&app, child);
+    assert_rect_close(mid_quad, scaled_about(settled, mid));
+    let mid_center = rect_center(mid_quad);
+    assert!(
+        (mid_center.x - center.x).value().abs() < 0.05
+            && (mid_center.y - center.y).value().abs() < 0.05,
+        "动画中段中心必须不变：{mid_center:?}"
+    );
+    assert_eq!(app.app().popup_rect(id).expect("rect").hit, settled);
+    assert!(damage_covers(&app, settled));
+    assert!(!app.frame_record().damage_full);
+
+    app.advance(Duration::from_millis(120));
+    frame(&mut app);
+    assert_eq!(popup_snapshot(&app, id).paint_scale, 1.0);
+    assert_eq!(
+        painted_quad(&app, child),
+        settled,
+        "动画结束后绘制回到稳定 rect"
+    );
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Open));
+}
+
+#[test]
+fn fade_scale_close_reverses_the_scale_and_keeps_damage_local() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::FadeScale;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    app.advance(Duration::from_millis(130));
+    frame(&mut app);
+    assert_eq!(popup_snapshot(&app, id).paint_scale, 1.0);
+    let settled = app.app().popup_rect(id).expect("rect").hit;
+    let child = popup_painted_child(&app, id);
+    assert!(
+        app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .expect("begin close")
+    );
+    assert_eq!(app.app().popup_state(id), Some(PopupState::DismissPending));
+    app.advance(Duration::from_millis(45));
+    frame(&mut app);
+    let scale = popup_snapshot(&app, id).paint_scale;
+    assert!(scale > 0.98 && scale < 1.0, "关闭必须 1→0.98 反向：{scale}");
+    let quad = painted_quad(&app, child);
+    assert_rect_close(quad, scaled_about(settled, scale));
+    let center = rect_center(settled);
+    let quad_center = rect_center(quad);
+    assert!(
+        (quad_center.x - center.x).value().abs() < 0.05
+            && (quad_center.y - center.y).value().abs() < 0.05,
+        "关闭动画中心必须不变：{quad_center:?} vs {center:?}"
+    );
+    assert!(
+        damage_covers(&app, settled),
+        "关闭帧 damage 必须覆盖稳定 rect"
+    );
+    assert!(!app.frame_record().damage_full, "关闭缩放帧不得整帧重绘");
+    app.advance(Duration::from_millis(60));
+    frame(&mut app);
+    assert!(app.app().popup_rect(id).is_none(), "关闭动画结束后必须移除");
+    assert!(!app.frame_record().damage_full, "关闭移除帧不得整帧重绘");
+    assert!(damage_covers(&app, settled));
+}
+
+#[test]
+fn fade_scale_paints_the_same_logical_geometry_at_dpr_one_and_two() {
+    let mut painted = Vec::new();
+    for factor in [1.0_f32, 2.0] {
+        let dpr = DevicePixelRatio::new(factor).expect("dpr");
+        let mut app = TestApp::with_scale(dpr);
+        let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+        spec.animation = PopupAnimation::FadeScale;
+        let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+        frame(&mut app);
+        app.advance(Duration::from_millis(30));
+        frame(&mut app);
+        let settled = app.app().popup_rect(id).expect("rect").hit;
+        let scale = popup_snapshot(&app, id).paint_scale;
+        assert!(scale > 0.98 && scale < 1.0);
+        let child = popup_painted_child(&app, id);
+        let quad = painted_quad(&app, child);
+        assert_rect_close(quad, scaled_about(settled, scale));
+        let dump = ui_core::test_support::diagnostics::frame_dump(&app);
+        let expected = [
+            quad.origin.x.value() * factor,
+            quad.origin.y.value() * factor,
+            quad.size.width.value() * factor,
+            quad.size.height.value() * factor,
+        ];
+        let matched = dump.instances.iter().any(|instance| {
+            (0..4).all(|index| (instance.bounds[index] - expected[index]).abs() <= 1.5)
+        });
+        assert!(
+            matched,
+            "DPR {factor} 必须把缩放后的逻辑矩形落到对应物理像素：{expected:?} in {:?}",
+            dump.instances
+                .iter()
+                .map(|instance| instance.bounds)
+                .collect::<Vec<_>>()
+        );
+        painted.push(quad);
+    }
+    assert_eq!(
+        painted[0], painted[1],
+        "缩放变换是逻辑空间变换，逻辑绘制几何必须与 DPR 无关"
+    );
+}
+
+#[test]
+fn modal_fade_scale_is_fade_only() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    spec.animation = PopupAnimation::FadeScale;
+    let id = open_sized(&mut app, spec, (200.0, 120.0), None);
+    frame(&mut app);
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    assert_eq!(
+        popup_snapshot(&app, id).paint_scale,
+        1.0,
+        "Modal 只允许 fade，不得 scale"
+    );
+}
+
+#[test]
+fn fade_scale_coexists_with_fade_and_fade_slide() {
+    let mut app = TestApp::new();
+    let mut root_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    root_spec.animation = PopupAnimation::FadeSlide;
+    let root = open_sized(&mut app, root_spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let mut child_spec = base_spec(Anchor::WindowRect(rect(300.0, 100.0, 40.0, 20.0)));
+    child_spec.parent = Some(root);
+    child_spec.placement = menu_placement();
+    child_spec.animation = PopupAnimation::FadeScale;
+    let child = open_sized(&mut app, child_spec, (80.0, 60.0), None);
+    let mut hint_spec = base_spec(Anchor::WindowRect(rect(500.0, 100.0, 30.0, 20.0)));
+    hint_spec.tier = PopupTier::Hint;
+    hint_spec.dismiss = DismissPolicy::Hint { escape: true };
+    hint_spec.animation = PopupAnimation::Fade;
+    let hint = open_sized(&mut app, hint_spec, (60.0, 24.0), None);
+    frame(&mut app);
+    let root_entry = popup_snapshot(&app, root);
+    let child_entry = popup_snapshot(&app, child);
+    let hint_entry = popup_snapshot(&app, hint);
+    assert!(
+        root_entry.paint_offset.y > px(0.0),
+        "FadeSlide 必须仍有 slide 偏移：{:?}",
+        root_entry.paint_offset
+    );
+    assert!(
+        child_entry.paint_scale < 1.0,
+        "FadeScale 子层必须有缩放：{}",
+        child_entry.paint_scale
+    );
+    assert_eq!(hint_entry.paint_scale, 1.0, "Fade 不得被 scale 污染");
+    assert!(
+        !app.frame_record().damage_full,
+        "三类动画共存帧不得整帧重绘"
+    );
+    app.advance(Duration::from_millis(130));
+    frame(&mut app);
+    assert_eq!(popup_snapshot(&app, root).paint_offset, LogicalPoint::ZERO);
+    assert_eq!(popup_snapshot(&app, child).paint_scale, 1.0);
+    assert_eq!(popup_snapshot(&app, hint).paint_scale, 1.0);
+    assert_eq!(app.app().popup_state(child), Some(PopupState::Open));
+}
+
+#[test]
+fn begin_close_popup_forwards_an_explicit_reason_to_the_dismiss_handler() {
+    let mut app = TestApp::new();
+    let reasons = std::rc::Rc::new(std::cell::Cell::new(None));
+    let recorded = std::rc::Rc::clone(&reasons);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 80.0),
+        Some(Box::new(move |_app, dismiss| {
+            recorded.set(Some(dismiss.reason));
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    assert!(
+        app.app_mut()
+            .begin_close_popup(id, DismissReason::AnchorLost)
+            .expect("begin close")
+    );
+    assert_eq!(
+        reasons.get(),
+        Some(DismissReason::AnchorLost),
+        "begin_close_popup 必须把调用方 reason 原样交给 on_dismiss"
+    );
+    frame(&mut app);
+    assert!(app.app().popup_rect(id).is_none(), "无动画时关闭立即生效");
+}
+
+#[test]
+fn idle_frames_do_no_popup_settle_or_damage_work() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::FadeScale;
+    let _id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    app.advance(Duration::from_millis(130));
+    frame(&mut app);
+    assert!(
+        !app.app().animations_running(window),
+        "稳定后不得残留动画源"
+    );
+    for _ in 0..8 {
+        frame(&mut app);
+        let record = app.frame_record().clone();
+        assert!(!record.rendered, "稳定后必须是空闲帧");
+        assert!(record.damage.is_empty(), "空闲帧不得产生 damage");
+        assert!(!record.damage_full, "空闲帧不得整帧重绘");
+        assert_eq!(
+            record.stats.popup_animation_records, 0,
+            "空闲帧的 popup 动画 tick 记录数必须为 0（tick 真实回填，非默认值）"
+        );
+        assert!(
+            !record.stats.popup_opening && !record.stats.popup_closing,
+            "空闲帧不得有 open/close popup 动画工作（tick 真实回填）"
+        );
+        assert_eq!(
+            record.stats.popup_settle_rounds, 0,
+            "空闲帧的 settle 轮数必须为 0（settle.rs 真实回填，非默认构造）"
+        );
+        assert!(!record.stats.popup_unsettled);
+        assert!(
+            record.stats.frame_cpu.is_some(),
+            "空闲帧也必须记录 CPU 测量入口"
+        );
+        app.advance(Duration::from_millis(16));
+    }
+}
+
+#[test]
+fn popup_open_and_close_frames_stay_within_the_frame_budget() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::FadeScale;
+    let id = open_sized(&mut app, spec, (240.0, 160.0), None);
+    let mut open_frames = Vec::new();
+    for index in 0..10 {
+        frame(&mut app);
+        if app.frame_record().stats.popup_opening {
+            if index == 0 {
+                assert!(
+                    app.frame_record().stats.popup_animation_records > 0,
+                    "open 帧的动画 tick 记录数必须真实回填"
+                );
+            }
+            open_frames.push(app.frame_record().stats.frame_cpu.expect("open frame cpu"));
+        }
+        app.advance(Duration::from_millis(12));
+    }
+    frame(&mut app);
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Open));
+    let mut idle_frames = Vec::new();
+    for _ in 0..12 {
+        frame(&mut app);
+        assert!(!app.frame_record().rendered, "稳定后必须是空闲帧");
+        idle_frames.push(app.frame_record().stats.frame_cpu.expect("idle frame cpu"));
+        app.advance(Duration::from_millis(8));
+    }
+    assert!(
+        app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .expect("begin close")
+    );
+    let mut close_frames = Vec::new();
+    for _ in 0..12 {
+        app.advance(Duration::from_millis(9));
+        frame(&mut app);
+        if app.frame_record().stats.popup_closing {
+            close_frames.push(app.frame_record().stats.frame_cpu.expect("close frame cpu"));
+        }
+        if app.app().popup_rect(id).is_none() {
+            break;
+        }
+    }
+    assert!(!open_frames.is_empty(), "必须采样到 open 帧");
+    assert!(!close_frames.is_empty(), "必须采样到 close 帧");
+    let open_median = percentile(&open_frames, 50.0);
+    let open_p95 = percentile(&open_frames, 95.0);
+    let close_median = percentile(&close_frames, 50.0);
+    let close_p95 = percentile(&close_frames, 95.0);
+    let idle_p95 = percentile(&idle_frames, 95.0);
+    let budget = idle_p95 + Duration::from_millis(2);
+    assert!(
+        open_median <= budget,
+        "popup open 中位帧 {open_median:?} 超出 idle p95 {idle_p95:?} + 2ms（样本 {open_frames:?}）"
+    );
+    assert!(
+        close_median <= budget,
+        "popup close 中位帧 {close_median:?} 超出 idle p95 {idle_p95:?} + 2ms（样本 {close_frames:?}）"
+    );
+    println!(
+        "popup frame budget: idle_p95={idle_p95:?} open_median={open_median:?} open_p95={open_p95:?} \
+         close_median={close_median:?} close_p95={close_p95:?} \
+         open_samples={open_frames:?} close_samples={close_frames:?} \
+         idle_samples={idle_frames:?}（open 首帧含 atlas/text 冷启动，故用中位数守卫设计目标 idle p95 + 2ms，p95 仅记录）"
+    );
+}
+
+#[test]
+fn fade_scale_scales_canvas_content_about_the_popup_center() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::FadeScale;
+    let window = win(&app);
+    let id = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            move |app, window, node| {
+                let mut canvas =
+                    Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(60.0), px(40.0)));
+                canvas.push_quad(Quad {
+                    bounds: LogicalRect::new(px(10.0), px(8.0), px(30.0), px(20.0)),
+                    corner_radius: [px(0.0); 4],
+                    paint: QuadPaint::Solid {
+                        fill: Color::WHITE,
+                        border: None,
+                    },
+                });
+                NodeBuilder::canvas(canvas)
+                    .style(StyleBuilder::new().size(px(60.0), px(40.0)).build())
+                    .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                Ok(())
+            },
+            None,
+        )
+        .expect("open canvas popup");
+    frame(&mut app);
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    let settled = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(settled, rect(100.0, 124.0, 60.0, 40.0));
+    let scale = popup_snapshot(&app, id).paint_scale;
+    assert!(scale > 0.98 && scale < 1.0, "scale 必须收敛：{scale}");
+    let canvas_node = popup_painted_child(&app, id);
+    let quad_world = LogicalRect::new(px(110.0), px(132.0), px(30.0), px(20.0));
+    let expected = scaled_about(quad_world, scale);
+    let recorded = app
+        .rendered()
+        .expect("rendered frame")
+        .primitives
+        .iter()
+        .find(|primitive| primitive.node == canvas_node && primitive.kind == PrimitiveKind::Quad)
+        .map(|primitive| primitive.bounds)
+        .expect("canvas content quad must be recorded");
+    assert_rect_close(recorded, expected);
+    let center = rect_center(settled);
+    assert!(
+        (center.x - px(130.0)).value().abs() < 0.05 && (center.y - px(144.0)).value().abs() < 0.05,
+        "Canvas popup 中心保持稳定 rect 中心"
+    );
+    assert!(!app.frame_record().damage_full);
+}
+
+#[test]
+fn fade_scale_scales_the_shadow_offset_as_a_vector() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut spec = base_spec(Anchor::WindowRect(rect(576.5, 450.0, 0.0, 0.0)));
+    spec.animation = PopupAnimation::FadeScale;
+    let id = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            move |app, window, node| {
+                NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(200.0), px(100.0)).build())
+                    .paint(PaintSpec {
+                        background: Color::WHITE,
+                        shadows: Shadows::new([ShadowSpec {
+                            offset: point(0.0, 13.0),
+                            blur: px(8.0),
+                            spread: px(2.0),
+                            color: Color::BLACK,
+                        }]),
+                        ..PaintSpec::default()
+                    })
+                    .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                Ok(())
+            },
+            None,
+        )
+        .expect("open shadow popup");
+    frame(&mut app);
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    let settled = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(settled, rect(576.0, 454.0, 200.0, 100.0));
+    let pivot = point(676.0, 504.0);
+    assert!(
+        (rect_center(settled).x - pivot.x).value().abs() < 0.05
+            && (rect_center(settled).y - pivot.y).value().abs() < 0.05,
+        "测试场景的 pivot 必须是 (676,504)：{:?}",
+        rect_center(settled)
+    );
+    let scale = popup_snapshot(&app, id).paint_scale;
+    assert!(
+        (scale - 0.991_562_5).abs() < 1e-5,
+        "30ms 处 scale 必须是 0.9915625：{scale}"
+    );
+    let child = popup_painted_child(&app, id);
+    let shadow_rect = settled.outset(px(2.0));
+    let shadow_offset = point(0.0, 13.0);
+    let scaled_rect = scaled_rect_about(shadow_rect, pivot, scale);
+    let expected_origin = point(
+        scaled_rect.origin.x.value() + scale * shadow_offset.x.value(),
+        scaled_rect.origin.y.value() + scale * shadow_offset.y.value(),
+    );
+    let expected = LogicalRect::new(
+        expected_origin.x,
+        expected_origin.y,
+        scaled_rect.size.width,
+        scaled_rect.size.height,
+    );
+    let recorded = app
+        .rendered()
+        .expect("rendered frame")
+        .primitives
+        .iter()
+        .find(|primitive| primitive.node == child && primitive.kind == PrimitiveKind::Shadow)
+        .map(|primitive| primitive.bounds)
+        .expect("shadow primitive must be recorded");
+    assert_rect_close(recorded, scaled_rect);
+    let buggy_offset = point(
+        pivot.x.value() + scale * (shadow_offset.x - pivot.x).value(),
+        pivot.y.value() + scale * (shadow_offset.y - pivot.y).value(),
+    );
+    assert!(
+        (expected.origin.y - (scaled_rect.origin.y + buggy_offset.y))
+            .value()
+            .abs()
+            > 2.0,
+        "回归守卫：把阴影 offset 当点变换会产生 >2px 的漂移"
+    );
+    let dump = ui_core::test_support::diagnostics::frame_dump(&app);
+    let expected_device = [
+        expected.origin.x.value(),
+        expected.origin.y.value(),
+        expected.size.width.value(),
+        expected.size.height.value(),
+    ];
+    let matched = dump.instances.iter().any(|instance| {
+        instance.kind == 3u32
+            && (0..4).all(|index| (instance.bounds[index] - expected_device[index]).abs() <= 1.5)
+    });
+    assert!(
+        matched,
+        "阴影 GPU 实例必须等于 f*offset + pivot 变换（DPR1，pivot 676,504，f={scale}）：期望 {expected_device:?}，实际 {:?}",
+        dump.instances
+            .iter()
+            .filter(|instance| instance.kind == 3u32)
+            .map(|instance| instance.bounds)
+            .collect::<Vec<_>>()
+    );
+    assert!(!app.frame_record().damage_full);
+}
+
+#[test]
+fn fade_scale_modal_scrim_is_fade_only() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    spec.scrim = Some(ScrimSpec {
+        density: 0.5,
+        ..ScrimSpec::default()
+    });
+    spec.animation = PopupAnimation::FadeScale;
+    let modal = open_sized(&mut app, spec, (200.0, 120.0), None);
+    frame(&mut app);
+    let window = win(&app);
+    let scrim = app
+        .app()
+        .popup_stack(window)
+        .expect("stack")
+        .entries
+        .iter()
+        .find(|entry| entry.tier == PopupTier::Scrim)
+        .map(|entry| entry.id)
+        .expect("scrim entry");
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    assert_eq!(
+        popup_snapshot(&app, modal).paint_scale,
+        1.0,
+        "modal 的 FadeScale 必须退化为 fade-only"
+    );
+    assert_eq!(
+        popup_snapshot(&app, scrim).paint_scale,
+        1.0,
+        "打开期间 scrim 不得被缩放"
+    );
+    assert!(
+        app.app_mut()
+            .begin_close_popup(modal, DismissReason::Programmatic)
+            .expect("begin close")
+    );
+    app.advance(Duration::from_millis(45));
+    frame(&mut app);
+    assert_eq!(
+        popup_snapshot(&app, modal).paint_scale,
+        1.0,
+        "关闭帧 modal 不得缩放"
+    );
+    assert_eq!(
+        popup_snapshot(&app, scrim).paint_scale,
+        1.0,
+        "关闭帧 scrim 不得缩放（FadeScale 对 Scrim 必须 fade-only）"
+    );
+    app.advance(Duration::from_millis(60));
+    frame(&mut app);
+    assert!(
+        app.app().popup_rect(scrim).is_none(),
+        "关闭动画结束后 scrim 必须移除"
+    );
+}
+
+fn open_glyph_image_popup(app: &mut TestApp, animation: PopupAnimation) -> PopupId {
+    let window = win(app);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = animation;
+    app.app_mut()
+        .open_popup(
+            window,
+            spec,
+            move |app, window, node| {
+                {
+                    let tree = app.window_mut(window).expect("window").tree_mut();
+                    NodeBuilder::text("Scale", ui_core::text::TextStyle::new(px(16.0)))
+                        .style(StyleBuilder::new().width(px(90.0)).build())
+                        .build(tree, node)?;
+                }
+                let mut canvas =
+                    Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(30.0)));
+                canvas.push_image(PaintImage {
+                    bounds: LogicalRect::new(px(4.0), px(6.0), px(20.0), px(10.0)),
+                    tile: AtlasTile {
+                        atlas: AtlasKind::Image,
+                        page: 0,
+                        u0: 0.0,
+                        v0: 0.0,
+                        u1: 0.5,
+                        v1: 0.5,
+                        generation: 1,
+                        slot: 0,
+                        slot_epoch: 0,
+                    },
+                    modulation: Color::WHITE,
+                });
+                NodeBuilder::canvas(canvas)
+                    .style(StyleBuilder::new().size(px(40.0), px(30.0)).build())
+                    .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                Ok(())
+            },
+            None,
+        )
+        .expect("open glyph/image popup")
+}
+
+#[test]
+fn fade_scale_scales_glyph_runs_and_images_in_animation_frames() {
+    let mut baseline_app = TestApp::new();
+    let baseline = open_glyph_image_popup(&mut baseline_app, PopupAnimation::None);
+    frame(&mut baseline_app);
+    let settled = baseline_app.app().popup_rect(baseline).expect("rect").hit;
+    let glyph_node = baseline_app
+        .rendered()
+        .expect("baseline frame")
+        .primitives
+        .iter()
+        .find(|primitive| primitive.kind == PrimitiveKind::GlyphRun)
+        .map(|primitive| (primitive.node, primitive.bounds))
+        .expect("baseline glyph run");
+    let image_node = baseline_app
+        .rendered()
+        .expect("baseline frame")
+        .primitives
+        .iter()
+        .find(|primitive| primitive.kind == PrimitiveKind::Image)
+        .map(|primitive| (primitive.node, primitive.bounds))
+        .expect("baseline image");
+
+    let mut app = TestApp::new();
+    let id = open_glyph_image_popup(&mut app, PopupAnimation::FadeScale);
+    frame(&mut app);
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    assert_eq!(app.app().popup_rect(id).expect("rect").hit, settled);
+    let scale = popup_snapshot(&app, id).paint_scale;
+    assert!(scale > 0.98 && scale < 1.0, "scale 必须收敛：{scale}");
+    let pivot = rect_center(settled);
+    let rendered = app.rendered().expect("scaled frame");
+    let glyph = rendered
+        .primitives
+        .iter()
+        .find(|primitive| {
+            primitive.node == glyph_node.0 && primitive.kind == PrimitiveKind::GlyphRun
+        })
+        .map(|primitive| primitive.bounds)
+        .expect("scaled glyph run");
+    let image = rendered
+        .primitives
+        .iter()
+        .find(|primitive| primitive.node == image_node.0 && primitive.kind == PrimitiveKind::Image)
+        .map(|primitive| primitive.bounds)
+        .expect("scaled image");
+    assert_rect_close(glyph, scaled_rect_about(glyph_node.1, pivot, scale));
+    assert_rect_close(image, scaled_rect_about(image_node.1, pivot, scale));
+    assert!(
+        glyph.size.width < glyph_node.1.size.width && glyph.size.height < glyph_node.1.size.height,
+        "GlyphRun 尺寸必须随 scale 收缩：{glyph:?} vs {:?}",
+        glyph_node.1
+    );
+    assert!(
+        image.size.width < image_node.1.size.width,
+        "Image 尺寸必须随 scale 收缩：{image:?} vs {:?}",
+        image_node.1
+    );
+    assert!(!app.frame_record().damage_full, "scale 动画帧不得整帧重绘");
 }

@@ -27,6 +27,7 @@ pub(crate) fn frame(
     window: WindowId,
     forced: bool,
 ) -> Option<Result<FrameOutcome, EngineError>> {
+    let frame_started = Instant::now();
     super::timer::run_due(app);
     super::animation::dispatch_completions(app);
     if !app.windows.contains_key(&window) {
@@ -43,11 +44,13 @@ pub(crate) fn frame(
             }
         }
         Err(error) => {
+            note_idle_cpu(app, window, frame_started.elapsed());
             app.record_idle(window);
             return Some(Err(error));
         }
     }
     if let Some(error) = crate::render::compositor_thread::compositor().take_error() {
+        note_idle_cpu(app, window, frame_started.elapsed());
         app.record_idle(window);
         return Some(Err(error));
     }
@@ -58,12 +61,14 @@ pub(crate) fn frame(
     app.normalize_scroll_offsets(window);
     let wake = app.take_wake_request();
     app.tick_animations(window);
-    crate::popup::animation::tick(app, window);
+    let popup_tick = crate::popup::animation::tick(app, window);
+    note_popup_frame_work(app, window, popup_tick);
     let needs_frame = app
         .windows
         .get(&window)
         .is_some_and(|candidate| candidate.needs_frame(wake));
     if !needs_frame {
+        note_idle_cpu(app, window, frame_started.elapsed());
         app.record_idle(window);
         return Some(Ok(FrameOutcome::Idle));
     }
@@ -76,6 +81,7 @@ pub(crate) fn frame(
         if let Some(target) = app.windows.get_mut(&window) {
             target.note_frame_budget_deferred();
         }
+        note_idle_cpu(app, window, frame_started.elapsed());
         record_budget_deferred(app, window);
         return Some(Ok(FrameOutcome::Idle));
     }
@@ -275,6 +281,10 @@ pub(crate) fn frame(
             scroll_offset_frames: 0,
             popup_settle_rounds: settlement.rounds,
             popup_unsettled: settlement.unsettled,
+            popup_opening: popup_tick.opening,
+            popup_closing: popup_tick.closing,
+            popup_animation_records: popup_tick.records,
+            frame_cpu: Some(frame_started.elapsed()),
             a11y_only_frames: target.a11y_only_frames(),
         };
         let Some(target) = app.windows.get_mut(&window) else {
@@ -285,7 +295,7 @@ pub(crate) fn frame(
     }
     #[cfg(not(feature = "test-support"))]
     {
-        let _ = (&styles, &text, &text_layout, &layout);
+        let _ = (&styles, &text, &text_layout, &layout, popup_tick);
     }
     let Some(target) = app.windows.get_mut(&window) else {
         app.abort_frame(window, ticket);
@@ -446,6 +456,28 @@ pub(crate) fn record_budget_deferred(app: &mut App, window: WindowId) {
     }
     #[cfg(not(feature = "test-support"))]
     let _ = (app, window);
+}
+
+fn note_idle_cpu(app: &mut App, window: WindowId, cpu: std::time::Duration) {
+    #[cfg(feature = "test-support")]
+    if let Some(target) = app.windows.get_mut(&window) {
+        target.set_frame_cpu(cpu);
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = (app, window, cpu);
+}
+
+fn note_popup_frame_work(
+    app: &mut App,
+    window: WindowId,
+    tick: crate::popup::animation::PopupAnimationTick,
+) {
+    #[cfg(feature = "test-support")]
+    if let Some(target) = app.windows.get_mut(&window) {
+        target.set_popup_frame_work(tick);
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = (app, window, tick);
 }
 
 #[cfg(all(test, feature = "test-support"))]

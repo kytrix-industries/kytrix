@@ -2173,6 +2173,8 @@ fn ime_cursor_area_includes_ancestor_popup_transform_offsets() {
             Some(crate::node::tree::PopupTransform {
                 offset: crate::math::LogicalPoint::new(px(0.0), px(4.0)),
                 opacity: 1.0,
+                scale: 1.0,
+                pivot: crate::math::LogicalPoint::ZERO,
                 blocked: false,
             }),
         );

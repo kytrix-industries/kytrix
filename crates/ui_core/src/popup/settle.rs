@@ -349,6 +349,22 @@ pub(crate) fn settle(
         };
         let (stack, tree) = target.popups_and_tree();
         stack.sync_rects(tree);
+        for current in &solved {
+            let Some((node, pivot)) = stack
+                .entry(current.id)
+                .ok()
+                .map(|entry| (entry.node, entry.paint_center()))
+            else {
+                continue;
+            };
+            let Some(mut transform) = tree.popup_transform(node) else {
+                continue;
+            };
+            if transform.scale != 1.0 && transform.pivot != pivot {
+                transform.pivot = pivot;
+                tree.set_popup_transform(node, Some(transform));
+            }
+        }
         for (id, before) in pre_placement_sizes {
             let Ok(entry) = stack.entry(id) else {
                 continue;
@@ -396,6 +412,10 @@ pub(crate) fn settle(
     }
     if outcome.unsettled {
         app.request_frame();
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(target) = app.window_mut(window) {
+        target.set_popup_settle_rounds(outcome.rounds);
     }
     Ok(Some(outcome))
 }

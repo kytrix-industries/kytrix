@@ -73,6 +73,7 @@ pub(crate) fn new() -> NodeTree {
         baked_screen_bounds: vec![None],
         painted_extents: vec![None],
         popup_transforms: vec![None],
+        paint_scales: vec![(1.0, LogicalPoint::ZERO)],
         popup_pointer_transparent: vec![false],
         subtree_bounds: vec![LogicalRect::default()],
         a11y_slots: vec![None],
@@ -605,6 +606,9 @@ pub(crate) fn remove(
 
         if let Some(slot) = tree.popup_transforms.get_mut(index) {
             *slot = None;
+        }
+        if let Some(slot) = tree.paint_scales.get_mut(index) {
+            *slot = (1.0, LogicalPoint::ZERO);
         }
         if let Some(slot) = tree.popup_pointer_transparent.get_mut(index) {
             *slot = false;

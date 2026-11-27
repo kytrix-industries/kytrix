@@ -90,10 +90,11 @@ fn block_entry(app: &mut App, window: WindowId, id: PopupId) {
     }
     let node = entry.node;
     let offset = entry.paint_offset;
-    let opacity = target
+    let pivot = entry.paint_center();
+    let (opacity, scale) = target
         .tree()
         .popup_transform(node)
-        .map_or(1.0, |transform| transform.opacity);
+        .map_or((1.0, 1.0), |transform| (transform.opacity, transform.scale));
     let _ = target
         .popups_mut()
         .set_state(id, PopupState::DismissPending);
@@ -102,6 +103,8 @@ fn block_entry(app: &mut App, window: WindowId, id: PopupId) {
         Some(crate::node::tree::PopupTransform {
             offset,
             opacity,
+            scale,
+            pivot,
             blocked: true,
         }),
     );
@@ -200,10 +203,15 @@ fn begin_close_inner(app: &mut App, window: WindowId, id: PopupId, chain: bool) 
         };
         let node = entry.node;
         let offset = entry.paint_offset;
-        let opacity = target
-            .tree()
-            .popup_transform(node)
-            .map_or(1.0, |transform| transform.opacity);
+        let fade_only = entry.is_fade_only();
+        let transform = target.tree().popup_transform(node);
+        let opacity = transform.map_or(1.0, |transform| transform.opacity);
+        let scale_from = transform.map_or(1.0, |transform| transform.scale);
+        let scale_to = if animation == crate::popup::PopupAnimation::FadeScale && !fade_only {
+            crate::popup::POPUP_SCALE_FROM
+        } else {
+            scale_from
+        };
         target
             .popups_mut()
             .push_animation(crate::popup::PopupAnimationState {
@@ -212,6 +220,8 @@ fn begin_close_inner(app: &mut App, window: WindowId, id: PopupId, chain: bool) 
                 started: now,
                 paint_offset: offset,
                 opacity,
+                scale_from,
+                scale_to,
             });
     }
     if animated {
