@@ -1589,11 +1589,45 @@ mod tests {
             Some(3),
             "CO 前缀继续匹配 Cobalt"
         );
+        harness.app.advance(Duration::from_millis(2100));
+        let _ = harness.drain(&dropdown);
+        harness.key_with(&dropdown, KeyCode::KeyA, Modifiers::SHIFT);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(4),
+            "Shift+A 大写输入也按不区分大小写匹配 Aurora"
+        );
         assert!(
             dropdown.selected(harness.app.app()).is_none(),
             "typeahead 只移动高亮，不选择"
         );
         assert!(dropdown.is_open(harness.app.app()), "typeahead 不关闭面板");
+    }
+
+    #[test]
+    fn shift_letter_typeahead_matches_case_insensitively() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, typeahead_items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+
+        harness.key_with(&dropdown, KeyCode::KeyA, Modifiers::SHIFT);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(4),
+            "Shift+A 必须像 A 一样匹配 Aurora（大小写不敏感）"
+        );
+        harness.app.advance(Duration::from_millis(2100));
+        let _ = harness.drain(&dropdown);
+        harness.key_with(&dropdown, KeyCode::KeyB, Modifiers::SHIFT);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(1),
+            "Shift+B 匹配 Beta（大写输入和普通输入同路径）"
+        );
+        assert!(dropdown.is_open(harness.app.app()), "Shift 字母不关闭面板");
     }
 
     #[test]

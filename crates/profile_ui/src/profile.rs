@@ -13,7 +13,7 @@ use ui_core::{
     a11y::A11yRole,
     app::App,
     error::EngineError,
-    event::Event,
+    event::{Event, InputEvent, KeyCode, KeyState, Modifiers},
     math::{LogicalSize, px},
     node::{
         builder::NodeBuilder,
@@ -118,6 +118,7 @@ struct State {
     sign_in: Option<oneshot::Sender<()>>,
     awaiting_alert: bool,
     dismissed: Rc<Cell<Option<DismissReason>>>,
+    tabbed_out: Rc<Cell<bool>>,
     session: Option<oneshot::Sender<()>>,
 }
 
@@ -208,6 +209,7 @@ impl ProfileMenu {
             sign_in: None,
             awaiting_alert: false,
             dismissed,
+            tabbed_out: Rc::new(Cell::new(false)),
             session: None,
         };
         self.start_session_watch(app, &mut state);
@@ -233,14 +235,68 @@ impl ProfileMenu {
     }
 
     pub fn dispatch(&mut self, app: &mut App, event: &Event) {
-        let Some(state) = self.state.as_mut() else {
+        let tab = match event {
+            Event::Input(InputEvent::Key {
+                code: KeyCode::Tab,
+                state: KeyState::Down,
+                modifiers,
+                ..
+            }) => Some(modifiers.contains(Modifiers::SHIFT)),
+            _ => None,
+        };
+        {
+            let Some(state) = self.state.as_mut() else {
+                return;
+            };
+            let _ = state.trigger.button.dispatch(app, event);
+            if let Some(content) = &state.menu {
+                let _ = content.open_account.dispatch(app, event);
+                let _ = content.sign_out.dispatch(app, event);
+                let _ = content.copy.dispatch(app, event);
+            }
+        }
+        if let Some(backwards) = tab {
+            self.close_menu_after_tab(app, backwards);
+        }
+    }
+
+    fn close_menu_after_tab(&self, app: &mut App, backwards: bool) {
+        let Some(state) = self.state.as_ref() else {
             return;
         };
-        let _ = state.trigger.button.dispatch(app, event);
-        if let Some(content) = &state.menu {
-            let _ = content.open_account.dispatch(app, event);
-            let _ = content.sign_out.dispatch(app, event);
-            let _ = content.copy.dispatch(app, event);
+        if !state.panel.is_open(app) {
+            return;
+        }
+        let Some(popup) = state.panel.popup_node() else {
+            return;
+        };
+        let window = state.window;
+        let focused = {
+            let Some(target) = app.window(window) else {
+                return;
+            };
+            let tree = target.tree();
+            app.focused(window).filter(|node| {
+                let mut cursor = Some(*node);
+                while let Some(current) = cursor {
+                    if current == popup {
+                        return true;
+                    }
+                    cursor = tree.get(current).ok().and_then(|entry| entry.parent());
+                }
+                false
+            })
+        };
+        if focused.is_some() {
+            return;
+        }
+        state.tabbed_out.set(true);
+        state.panel.close_now(app);
+        let _ = app.set_focus(window, Some(state.trigger.node));
+        if backwards {
+            app.focus_prev(window);
+        } else {
+            app.focus_next(window);
         }
     }
 
@@ -253,10 +309,7 @@ impl ProfileMenu {
         if let Some(alert) = state.alert.take() {
             alert.release(app);
         }
-        if let Some(content) = state.menu.take() {
-            remove_if_present(app, state.window, content.root);
-            content.release(app);
-        }
+        self.release_menu_content(app, &mut state);
         state.panel.release(app);
         state.tooltip.release(app);
         state.trigger.button.release(app);
@@ -695,6 +748,9 @@ impl ProfileMenu {
     fn sync_menu(&self, app: &mut App, state: &mut State) -> Result<(), EngineError> {
         let was_open = state.panel.is_open(app);
         state.panel.sync(app);
+        if state.tabbed_out.take() {
+            state.wants_open = false;
+        }
         if let Some(reason) = state.dismissed.take()
             && reason != DismissReason::Programmatic
         {
@@ -1348,8 +1404,9 @@ mod tests {
     };
     use smol_str::SmolStr;
     use ui_core::{
+        event::{KeyCode, Modifiers},
         math::{DevicePixelRatio, LogicalSize, px},
-        node::{image::ImageSource, tree::NodeKind},
+        node::{id::NodeId, image::ImageSource, tree::NodeKind},
         popup::PopupTier,
         resources::ImageResourceKind,
     };
@@ -1807,6 +1864,106 @@ mod tests {
         assert!(
             !harness.menu().is_menu_open(harness.app()),
             "a press outside the menu closes it"
+        );
+    }
+
+    fn focus_is_in_popup(harness: &Harness, node: NodeId) -> bool {
+        let Some(popup) = harness
+            .app()
+            .popup_stack(harness.window())
+            .and_then(|stack| {
+                stack
+                    .entries
+                    .iter()
+                    .find(|entry| entry.tier != PopupTier::Scrim)
+                    .map(|entry| entry.node)
+            })
+        else {
+            return false;
+        };
+        let tree = harness
+            .app()
+            .window(harness.window())
+            .expect("the harness window")
+            .tree();
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            if current == popup {
+                return true;
+            }
+            cursor = tree.get(current).ok().and_then(|entry| entry.parent());
+        }
+        false
+    }
+
+    #[test]
+    fn tab_should_close_the_menu_and_move_focus_past_the_trigger() {
+        let mut harness = Harness::signed_in();
+        let after_one = harness.focus_stop("TEST_PROFILE_AFTER_ONE");
+        let after_two = harness.focus_stop("TEST_PROFILE_AFTER_TWO");
+        show_menu(&mut harness);
+        let focused = harness
+            .app()
+            .focused(harness.window())
+            .expect("the open menu takes focus");
+        assert!(
+            focus_is_in_popup(&harness, focused),
+            "the menu starts with the focus inside its popup"
+        );
+
+        harness.press_key(KeyCode::Tab, Modifiers::empty());
+        assert!(
+            harness.menu().is_menu_open(harness.app()),
+            "Tab moves through the menu's entries before it leaves"
+        );
+        assert!(
+            focus_is_in_popup(
+                &harness,
+                harness
+                    .app()
+                    .focused(harness.window())
+                    .expect("the menu keeps a focused entry")
+            ),
+            "the menu's own entries stay reachable by Tab"
+        );
+
+        let mut tabs = 1;
+        while harness.menu().is_menu_open(harness.app()) && tabs < 8 {
+            harness.press_key(KeyCode::Tab, Modifiers::empty());
+            tabs += 1;
+        }
+
+        assert!(
+            !harness.menu().is_menu_open(harness.app()),
+            "the Tab that leaves the menu closes it instead of leaving it open behind the focus"
+        );
+        assert!(tabs > 1, "the menu offered more than one Tab stop");
+        assert_eq!(
+            harness.app().focused(harness.window()),
+            Some(after_one),
+            "leaving by Tab lands on the stop after the trigger"
+        );
+
+        show_menu(&mut harness);
+        let focused = harness
+            .app()
+            .focused(harness.window())
+            .expect("the menu takes focus again");
+        assert!(
+            focus_is_in_popup(&harness, focused),
+            "the reopened menu takes the focus back"
+        );
+
+        harness.press_key(KeyCode::Tab, Modifiers::SHIFT);
+
+        assert!(
+            !harness.menu().is_menu_open(harness.app()),
+            "Shift+Tab closes the menu too"
+        );
+        assert_eq!(
+            harness.app().focused(harness.window()),
+            Some(after_two),
+            "Shift+Tab moves by the previous stop of the focus ring"
         );
     }
 

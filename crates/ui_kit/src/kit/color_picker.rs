@@ -514,6 +514,21 @@ pub struct ColorPicker {
     inner: Rc<Inner>,
 }
 
+fn descends_from(app: &App, window: WindowId, root: NodeId, node: NodeId) -> bool {
+    let Some(target) = app.window(window) else {
+        return false;
+    };
+    let tree = target.tree();
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if current == root {
+            return true;
+        }
+        cursor = tree.get(current).ok().and_then(|current| current.parent());
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TriggerView {
     node: NodeId,
@@ -523,6 +538,7 @@ struct TriggerView {
 struct Panel {
     window: WindowId,
     body: NodeId,
+    content: NodeId,
     body_view: BodyView,
     tab_active: ColorPickerTab,
     appearance: Appearance,
@@ -1136,6 +1152,23 @@ impl ColorPicker {
         let Some(window) = trigger.and_then(|node| node.window()) else {
             return;
         };
+        let Some(content) = self
+            .inner
+            .panel
+            .borrow()
+            .as_ref()
+            .map(|panel| panel.content)
+        else {
+            return;
+        };
+        let next = if forward {
+            app.focus_next(window)
+        } else {
+            app.focus_prev(window)
+        };
+        if next.is_some_and(|node| descends_from(app, window, content, node)) {
+            return;
+        }
         if !self.inner.popup.close_now(app) {
             return;
         }
@@ -1734,6 +1767,7 @@ impl ColorPicker {
         let panel = Panel {
             window,
             body,
+            content,
             body_view,
             tab_active: active,
             appearance,
@@ -3091,6 +3125,28 @@ mod ui_tests {
                 .expect("可聚焦节点")
         }
 
+        fn mount_focusable_before(&mut self, id: &'static str, rect: LogicalRect) -> NodeId {
+            let node = self.mount_focusable(id, rect);
+            let root = self
+                .app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let tree = self
+                .app
+                .app_mut()
+                .window_mut(self.window)
+                .expect("窗口")
+                .tree_mut();
+            let mut order = tree.get(root).expect("根").children().to_vec();
+            order.retain(|child| *child != node);
+            order.insert(0, node);
+            tree.reorder_children(root, &order).expect("重排主树");
+            node
+        }
+
         fn key_with(&mut self, code: KeyCode, modifiers: Modifiers) {
             let _ = self.app.inject(InputEvent::key_down(code, modifiers));
             let _ = self.app.inject(InputEvent::key_up(code, modifiers));
@@ -3563,7 +3619,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn tab_closes_the_picker_and_moves_focus_to_the_next_control() {
+    fn tab_walks_the_panel_controls_and_closes_only_at_the_last_one() {
         let mut harness = Harness::new();
         let after = harness.mount_focusable(
             "picker-after",
@@ -3571,17 +3627,35 @@ mod ui_tests {
         );
         harness.open();
         assert!(harness.panel_open(), "面板打开");
-        let focused = harness.focused_debug_id().expect("打开后焦点在面板内");
-        assert!(
-            focused.starts_with("picker:panel"),
-            "打开后焦点在取色器面板内：{focused}"
+        assert_eq!(
+            harness.focused_debug_id().as_deref(),
+            Some("picker:panel.tab.0"),
+            "打开后焦点在第一个页签"
         );
 
         harness.key_with(KeyCode::Tab, Modifiers::empty());
-        assert!(
-            !harness.panel_open(),
-            "Tab 必须离开并关闭取色器（不得在面板内闭环）"
+        assert_eq!(
+            harness.focused_debug_id().as_deref(),
+            Some("picker:panel.tab.1"),
+            "Tab 在面板内部前进到第二个页签"
         );
+        assert!(harness.panel_open(), "内部导航不得关闭面板");
+
+        harness.key_with(KeyCode::Tab, Modifiers::empty());
+        let hex = harness.focused_debug_id().expect("焦点在 hex 输入");
+        assert!(hex.contains("hex"), "Tab 应到达 hex 输入控件：{hex}");
+        assert!(harness.panel_open(), "内部导航不得关闭面板");
+
+        harness.key_with(KeyCode::Tab, Modifiers::empty());
+        assert_eq!(
+            harness.focused_debug_id().as_deref(),
+            Some("picker:panel.confirm"),
+            "Tab 到达确认按钮"
+        );
+        assert!(harness.panel_open(), "内部导航不得关闭面板");
+
+        harness.key_with(KeyCode::Tab, Modifiers::empty());
+        assert!(!harness.panel_open(), "最后一个控件 Tab 后关闭面板");
         assert_eq!(
             harness.app.app().focused(harness.window),
             Some(after),
@@ -3590,19 +3664,35 @@ mod ui_tests {
     }
 
     #[test]
-    fn shift_tab_closes_the_picker_and_leaves_the_panel() {
+    fn shift_tab_walks_back_inside_the_panel_and_closes_at_the_first_control() {
         let mut harness = Harness::new();
+        let before = harness.mount_focusable_before(
+            "picker-before",
+            LogicalRect::new(px(0.0), px(100.0), px(80.0), px(32.0)),
+        );
         harness.open();
         assert!(harness.panel_open(), "面板打开");
+        harness.key_with(KeyCode::Tab, Modifiers::empty());
+        assert_eq!(
+            harness.focused_debug_id().as_deref(),
+            Some("picker:panel.tab.1"),
+            "先前进到第二个页签"
+        );
 
         harness.key_with(KeyCode::Tab, Modifiers::SHIFT);
-        assert!(!harness.panel_open(), "Shift+Tab 必须关闭取色器");
-        let focused = harness.focused_debug_id();
-        assert!(
-            focused
-                .as_deref()
-                .is_none_or(|id| !id.starts_with("picker:panel")),
-            "焦点不得留在面板内：{focused:?}"
+        assert_eq!(
+            harness.focused_debug_id().as_deref(),
+            Some("picker:panel.tab.0"),
+            "Shift+Tab 在面板内部后退"
+        );
+        assert!(harness.panel_open(), "内部导航不得关闭面板");
+
+        harness.key_with(KeyCode::Tab, Modifiers::SHIFT);
+        assert!(!harness.panel_open(), "第一个控件 Shift+Tab 后关闭面板");
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(before),
+            "焦点落到触发器之前的上一个 tab stop"
         );
     }
 

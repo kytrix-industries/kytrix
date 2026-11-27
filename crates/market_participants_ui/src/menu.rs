@@ -877,7 +877,11 @@ mod tests {
         display::lexical::scope_display_code, identifier::VenueScopeId, listing::route::VenueRoute,
     };
     use smol_str::SmolStr;
-    use ui_core::{math::LogicalPoint, node::builder::NodeBuilder};
+    use ui_core::{
+        event::{KeyCode, Modifiers},
+        math::LogicalPoint,
+        node::builder::NodeBuilder,
+    };
 
     use super::*;
     use crate::{
@@ -948,6 +952,49 @@ mod tests {
 
     fn activity(harness: &Harness, venue: VenueId) -> Option<Activity> {
         harness.menu().inner.borrow().activity.get(&venue).copied()
+    }
+
+    #[test]
+    fn tab_should_stay_inside_the_modal_panel() {
+        let mut harness = Harness::new();
+        open_panel(&mut harness);
+        let popup = harness
+            .app()
+            .popup_stack(harness.window())
+            .and_then(|stack| {
+                stack
+                    .entries
+                    .iter()
+                    .find(|entry| entry.tier != PopupTier::Scrim)
+                    .map(|entry| entry.node)
+            })
+            .expect("the open panel is in the popup stack");
+
+        harness.press_key(KeyCode::Tab, Modifiers::empty());
+
+        assert!(
+            harness.menu().is_open(harness.app()),
+            "the modal panel keeps the focus and stays open"
+        );
+        let focused = harness
+            .app()
+            .focused(harness.window())
+            .expect("the modal panel keeps a focused node");
+        let tree = harness
+            .app()
+            .window(harness.window())
+            .expect("the harness window")
+            .tree();
+        let mut cursor = Some(focused);
+        let mut within = false;
+        while let Some(current) = cursor {
+            if current == popup {
+                within = true;
+                break;
+            }
+            cursor = tree.get(current).ok().and_then(|entry| entry.parent());
+        }
+        assert!(within, "Tab keeps the focus inside the modal panel");
     }
 
     #[test]

@@ -5,3 +5,5 @@
 !.gitignore
 !.cargo
 **/.DS_Store
+tools/source-id.txt
+

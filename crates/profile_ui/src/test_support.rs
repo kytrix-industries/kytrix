@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use ui_core::{
     app::App,
     error::EngineError,
-    event::{InputEvent, Modifiers, PointerButton},
+    event::{Event, InputEvent, KeyCode, Modifiers, PointerButton},
     math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
     popup::PopupTier,
@@ -573,6 +573,31 @@ impl Harness {
             PointerButton::Primary,
             Modifiers::empty(),
         ));
+    }
+
+    pub(crate) fn press_key(&mut self, code: KeyCode, modifiers: Modifiers) {
+        let down = Event::Input(InputEvent::key_down(code, modifiers));
+        let up = Event::Input(InputEvent::key_up(code, modifiers));
+        self.app.inject(InputEvent::key_down(code, modifiers));
+        self.app.inject(InputEvent::key_up(code, modifiers));
+        let Harness { app, menu, .. } = self;
+        menu.dispatch(app.app_mut(), &down);
+        menu.dispatch(app.app_mut(), &up);
+        self.drain();
+    }
+
+    pub(crate) fn focus_stop(&mut self, id: &str) -> NodeId {
+        let window = self.window();
+        let root = self.root();
+        let theme = self.services.theme.clone();
+        let button = ui_kit::kit::button::Button::new(self.app.app_mut(), theme, id)
+            .label(SmolStr::new_static("stop"))
+            .on_click(|_| {});
+        let node = button
+            .build(self.app.app_mut(), window, root)
+            .expect("the focus stop builds");
+        self.settle(1);
+        node
     }
 
     pub(crate) fn click_trigger(&mut self) {

@@ -6242,16 +6242,16 @@ fn a_non_modal_take_popup_shift_tab_escapes_backwards() {
         .expect("take popup");
     frame(&mut app);
     let a = app.app().focused(window).expect("take focus");
+    assert_ne!(a, first, "Take 必须取走主树焦点");
     app.app_mut().focus_prev(window);
-    assert_ne!(
+    assert_eq!(
         app.app().focused(window),
-        Some(a),
-        "Shift+Tab 必须离开 popup scope"
+        Some(second),
+        "Shift+Tab 必须离开 popup scope，落到主树中打开前焦点之前的下一个可聚焦（环绕到 second）"
     );
     assert_eq!(
         app.app().popup_state(popup),
         Some(PopupState::Open),
         "Shift+Tab 跳出不得关闭 popup"
     );
-    let _ = second;
 }

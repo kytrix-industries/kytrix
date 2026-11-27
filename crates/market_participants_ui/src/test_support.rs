@@ -354,6 +354,12 @@ impl Harness {
         self.click(node);
     }
 
+    pub(crate) fn press_key(&mut self, code: ui_core::event::KeyCode, modifiers: Modifiers) {
+        self.app.inject(InputEvent::key_down(code, modifiers));
+        self.app.inject(InputEvent::key_up(code, modifiers));
+        self.settle(1);
+    }
+
     pub(crate) fn click_point(&mut self, position: LogicalPoint) {
         self.app.inject(InputEvent::pointer_down(
             position,

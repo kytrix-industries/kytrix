@@ -2306,11 +2306,46 @@ mod tests {
             Some(3),
             "CO 前缀继续匹配 Cobalt"
         );
+        harness.app.advance(Duration::from_millis(2100));
+        harness.settle(&select);
+        harness.key_with(&select, KeyCode::KeyA, Modifiers::SHIFT);
+        assert_eq!(
+            select.highlighted(harness.app.app()),
+            Some(4),
+            "Shift+A 大写输入也按不区分大小写匹配 Aurora"
+        );
         assert!(
             select.chosen(harness.app.app()).is_empty(),
             "typeahead 只移动高亮，不选择"
         );
         assert!(select.is_open(harness.app.app()), "typeahead 不关闭面板");
+    }
+
+    #[test]
+    fn shift_letter_typeahead_matches_case_insensitively() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(
+            &select,
+            vec![
+                SelectItem::new("alpha", "Alpha"),
+                SelectItem::new("beta", "Beta"),
+                SelectItem::new("charlie", "Charlie").disabled(true),
+                SelectItem::new("cobalt", "Cobalt"),
+                SelectItem::new("aurora", "Aurora"),
+            ],
+        );
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()), "面板打开");
+
+        harness.key_with(&select, KeyCode::KeyA, Modifiers::SHIFT);
+        assert_eq!(
+            select.highlighted(harness.app.app()),
+            Some(4),
+            "Shift+A 必须像 A 一样匹配 Aurora（大小写不敏感）"
+        );
+        assert!(select.is_open(harness.app.app()), "Shift 字母不关闭面板");
     }
 
     #[test]

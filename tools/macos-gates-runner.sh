@@ -5,6 +5,7 @@ ROOT="$1"
 OS_DIR="$2"
 EXIT_FILE="$3"
 cd "$ROOT" || exit 2
+export KYTRIX_REAL_PIXEL_EVIDENCE="$OS_DIR"
 FAIL=0
 
 run_with_timeout() {

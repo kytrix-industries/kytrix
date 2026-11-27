@@ -324,10 +324,7 @@ pub(crate) fn leave_owner_scope(
     let previous = app_focus::focused(app, window);
     let next = {
         let target = app.window(window)?;
-        let tree = target.tree();
-        anchor
-            .filter(|node| tree.get(*node).is_ok())
-            .and_then(|anchor| focus::next_focusable(tree, Some(anchor), backwards))
+        next_main_focusable(target.tree(), target.popups(), anchor, backwards)
     };
     if let Some(target) = app.window_mut(window) {
         target.popups_mut().set_focus_owner(None);
@@ -335,4 +332,35 @@ pub(crate) fn leave_owner_scope(
     }
     app_focus::apply_effective_focus(app, window, previous, next);
     next
+}
+
+fn next_main_focusable(
+    tree: &NodeTree,
+    stack: &crate::popup::PopupStack,
+    from: Option<NodeId>,
+    backwards: bool,
+) -> Option<NodeId> {
+    let order = tree.dfs_ids();
+    let candidate =
+        |node: &NodeId| stack.enclosing(tree, *node).is_none() && focus::focusable(tree, *node);
+    let start = from.and_then(|from| order.iter().position(|node| *node == from));
+    let Some(start) = start else {
+        return if backwards {
+            order.iter().rev().copied().find(candidate)
+        } else {
+            order.iter().copied().find(candidate)
+        };
+    };
+    let len = order.len();
+    for step in 1..=len {
+        let index = if backwards {
+            (start + len - step) % len
+        } else {
+            (start + step) % len
+        };
+        if candidate(&order[index]) {
+            return Some(order[index]);
+        }
+    }
+    None
 }

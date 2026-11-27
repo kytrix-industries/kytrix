@@ -633,6 +633,17 @@ impl ItemPanel {
                         action: action.clone(),
                     },
                 )?;
+                if character.is_ascii_alphabetic() {
+                    app.bind_key_scoped(
+                        window,
+                        surface,
+                        KeyBinding {
+                            key,
+                            modifiers: Modifiers::SHIFT,
+                            action: action.clone(),
+                        },
+                    )?;
+                }
             }
         }
         Ok(())
