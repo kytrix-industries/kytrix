@@ -6024,8 +6024,12 @@ impl RealPixelAcceptance {
                 }
                 let new_rect = rects[0];
                 let reanchored = report.resize_root_rect.is_some_and(|old| {
+                    let moved_x = (new_rect.origin.x.value() - old.origin.x.value()).abs();
+                    let moved_y = (new_rect.origin.y.value() - old.origin.y.value()).abs();
                     new_rect != old
-                        && new_rect.origin.x.value() > old.origin.x.value() + 40.0
+                        && (moved_x >= 40.0 || moved_y >= 40.0)
+                        && new_rect.origin.x.value() >= 0.0
+                        && new_rect.origin.y.value() >= 0.0
                         && new_rect.origin.x.value() + new_rect.size.width.value()
                             <= REAL_PIXEL_RESIZE_W + 0.5
                         && new_rect.origin.y.value() + new_rect.size.height.value()
@@ -6035,7 +6039,7 @@ impl RealPixelAcceptance {
                     reanchored,
                     "resize-reanchor",
                     format_smolstr!(
-                        "窗口逻辑尺寸 960x720→1120x840 后同一 WindowRect(900,600) 锚点弹层必须重新定位且在新窗口内：old={:?} new={}",
+                        "窗口逻辑尺寸改为目标 1120x840 后同一 WindowRect(900,600) 锚点弹层必须重新定位且在新窗口内：old={:?} new={}",
                         report.resize_root_rect,
                         real_pixel_rect_detail(new_rect)
                     ),
