@@ -770,6 +770,7 @@ impl Select {
                 parent: None,
                 width,
                 a11y_parent: None,
+                surface_action: None,
             },
         )?;
         if opened {

@@ -505,6 +505,10 @@ pub enum A11yDiagnostic {
         node: NodeId,
         parent: NodeId,
     },
+    InvalidActiveDescendant {
+        node: NodeId,
+        target: NodeId,
+    },
     ReservedCustomAction {
         node: NodeId,
         id: i32,

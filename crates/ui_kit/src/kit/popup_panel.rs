@@ -21,8 +21,8 @@ use ui_core::{
         style_builder::{PaintBuilder, StyleBuilder},
     },
     popup::{
-        Anchor, DismissOutcome, DismissReason, PopupA11y, PopupError, PopupId, PopupSpec,
-        PopupState,
+        Anchor, DismissOutcome, DismissReason, PopupA11y, PopupDismiss, PopupError, PopupId,
+        PopupSpec, PopupState,
     },
     text::{TextStyle, TextWrap},
     window::WindowId,
@@ -227,6 +227,7 @@ struct PanelInner {
     open: Signal<bool>,
     reason: Cell<Option<DismissReason>>,
     on_close: RefCell<Option<Rc<dyn Fn(&mut App, DismissReason)>>>,
+    on_dismiss: RefCell<Option<Rc<dyn Fn(&mut App, &PopupDismiss) -> DismissOutcome>>>,
     state: RefCell<PanelState>,
 }
 
@@ -255,6 +256,7 @@ impl PopupPanel {
                 open,
                 reason: Cell::new(None),
                 on_close: RefCell::new(None),
+                on_dismiss: RefCell::new(None),
                 state: RefCell::new(PanelState::default()),
             }),
         }
@@ -272,6 +274,13 @@ impl PopupPanel {
 
     pub fn on_close(&self, callback: impl Fn(&mut App, DismissReason) + 'static) {
         *self.inner.on_close.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    pub(crate) fn on_dismiss(
+        &self,
+        callback: impl Fn(&mut App, &PopupDismiss) -> DismissOutcome + 'static,
+    ) {
+        *self.inner.on_dismiss.borrow_mut() = Some(Rc::new(callback));
     }
 
     #[must_use]
@@ -412,11 +421,16 @@ impl PopupPanel {
                 });
                 Ok(())
             },
-            Some(Box::new(move |_app, dismiss| {
-                if let Some(inner) = weak.upgrade() {
-                    inner.reason.set(Some(dismiss.reason));
+            Some(Box::new(move |app, dismiss| {
+                let Some(inner) = weak.upgrade() else {
+                    return DismissOutcome::Close;
+                };
+                inner.reason.set(Some(dismiss.reason));
+                let callback = inner.on_dismiss.borrow().clone();
+                match callback {
+                    Some(callback) => callback(app, &dismiss),
+                    None => DismissOutcome::Close,
                 }
-                DismissOutcome::Close
             })),
         )?;
         let Some(built) = built.borrow_mut().take() else {
@@ -544,6 +558,7 @@ impl PopupPanel {
 
     pub fn release(&self, app: &mut App) {
         self.inner.on_close.borrow_mut().take();
+        self.inner.on_dismiss.borrow_mut().take();
         self.close_now(app);
         let _ = app.release_scope(self.inner.scope);
     }

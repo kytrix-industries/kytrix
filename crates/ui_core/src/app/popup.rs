@@ -286,7 +286,7 @@ pub(crate) fn open_popup(
         opener,
         pointer_transparent,
         animation,
-        a11y,
+        mut a11y,
         scrim,
         ..
     } = spec;
@@ -297,6 +297,18 @@ pub(crate) fn open_popup(
             node: content_node,
             source,
         });
+    }
+    if let Some(active) = a11y.active_descendant {
+        let valid = app.windows.get(&window).is_some_and(|target| {
+            a11y_active_descendant_in_scope(target.tree(), content_node, &a11y.owns, active)
+        });
+        if !valid {
+            app.a11y_note(crate::a11y::A11yDiagnostic::InvalidActiveDescendant {
+                node: content_node,
+                target: active,
+            });
+            a11y.active_descendant = None;
+        }
     }
     let scrim_node = match scrim {
         Some(spec) => match create_scrim_node(app, window, viewport, spec) {
@@ -839,24 +851,44 @@ pub(crate) fn popup_state(app: &App, id: PopupId) -> Option<PopupState> {
 pub(crate) fn set_popup_a11y(
     app: &mut App,
     id: PopupId,
-    a11y: PopupA11y,
+    mut a11y: PopupA11y,
 ) -> Result<bool, PopupError> {
     let window = id.window();
+    let mut diagnostic = None;
     {
         let Some(target) = app.windows.get_mut(&window) else {
             return Err(PopupError::UnknownWindow { window });
         };
         let (popups, tree) = target.popups_and_tree();
-        let entry = popups.entry_mut(id)?;
+        let entry = popups.entry(id)?;
         if entry.a11y == a11y {
             return Ok(false);
         }
-        entry.a11y = a11y;
         let node = entry.node;
+        let invalid = a11y
+            .active_descendant
+            .filter(|active| !a11y_active_descendant_in_scope(tree, node, &a11y.owns, *active));
+        if let Some(active) = invalid {
+            diagnostic = Some((node, active));
+            a11y.active_descendant = None;
+        }
+        popups.entry_mut(id)?.a11y = a11y;
         tree.mark_a11y(node);
+    }
+    if let Some((node, target)) = diagnostic {
+        app.a11y_note(crate::a11y::A11yDiagnostic::InvalidActiveDescendant { node, target });
     }
     app.request_frame();
     Ok(true)
+}
+
+fn a11y_active_descendant_in_scope(
+    tree: &crate::node::tree::NodeTree,
+    root: NodeId,
+    owns: &[NodeId],
+    target: NodeId,
+) -> bool {
+    tree.get(target).is_ok() && (tree.is_ancestor(root, target) || owns.contains(&target))
 }
 
 pub(crate) fn dismiss_topmost(app: &mut App, window: WindowId, reason: DismissReason) -> bool {

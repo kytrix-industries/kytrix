@@ -5275,3 +5275,155 @@ fn raising_a_modal_keeps_its_owner_modal_chain_above_it() {
         assert!(!record.hidden, "raise A 后 B 的 a11y 不得被隐藏");
     }
 }
+
+#[test]
+fn popup_a11y_active_descendant_is_validated_and_cleared() {
+    let mut app = TestApp::new();
+    app.enable_a11y_capture();
+    let window = win(&app);
+    let popup = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    let content = popup_node(&app, popup);
+    let target = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .a11y(ui_core::a11y::A11yOverride {
+                role: Some(ui_core::a11y::A11yRole::MenuItem),
+                label: Some("行".into()),
+                ..ui_core::a11y::A11yOverride::default()
+            })
+            .build(state.tree_mut(), content)
+            .expect("row")
+    };
+    frame(&mut app);
+    let a11y = |active: Option<NodeId>| ui_core::popup::PopupA11y {
+        role: Some(ui_core::a11y::A11yRole::ListBox),
+        active_descendant: active,
+        ..ui_core::popup::PopupA11y::default()
+    };
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, a11y(Some(target)))
+            .expect("valid active descendant"),
+        "content 后代必须被接受"
+    );
+    frame(&mut app);
+    let active = app
+        .a11y()
+        .expect("a11y snapshot")
+        .node_for(content)
+        .expect("content a11y")
+        .active_descendant
+        .expect("合法 active_descendant 必须投影到 popup 内容根");
+    let content_record = app
+        .a11y()
+        .expect("a11y snapshot")
+        .node_for(content)
+        .expect("content a11y");
+    assert!(
+        content_record.children.contains(&active) || content_record.owns.contains(&active),
+        "active_descendant target 必须位于 content 的后代或 owns 内"
+    );
+    let root = root_node(&app);
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, a11y(Some(root)))
+            .expect("invalid target is cleared"),
+        "非法 active_descendant 必须被清空并应用其它字段"
+    );
+    frame(&mut app);
+    assert!(
+        app.a11y()
+            .expect("a11y snapshot")
+            .node_for(content)
+            .expect("content a11y")
+            .active_descendant
+            .is_none(),
+        "非法 active_descendant 不得投影"
+    );
+    assert!(
+        app.app()
+            .a11y_diagnostics()
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                ui_core::a11y::A11yDiagnostic::InvalidActiveDescendant { node, target: reported }
+                    if *node == content && *reported == root
+            )),
+        "非法 active_descendant 必须留诊断：{:?}",
+        app.app().a11y_diagnostics()
+    );
+    let stale = root_box(&mut app, (10.0, 10.0), Color::BLACK);
+    app.app_mut().remove_node(window, stale).expect("remove");
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, a11y(Some(stale)))
+            .expect("missing target is cleared"),
+    );
+    assert!(
+        app.app()
+            .a11y_diagnostics()
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                ui_core::a11y::A11yDiagnostic::InvalidActiveDescendant { node, target: reported }
+                    if *node == content && *reported == stale
+            )),
+        "不存在的 active_descendant 必须留诊断"
+    );
+    let owned = root_box(&mut app, (10.0, 10.0), Color::BLACK);
+    let mut owned_a11y = a11y(Some(owned));
+    owned_a11y.owns.push(owned);
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, owned_a11y)
+            .expect("owned active descendant"),
+        "owns 列表内的节点即使不在 content 子树也必须被接受"
+    );
+    frame(&mut app);
+    let content_record = app
+        .a11y()
+        .expect("a11y snapshot")
+        .node_for(content)
+        .expect("content a11y");
+    let active = content_record
+        .active_descendant
+        .expect("owns 内的 active_descendant 必须投影");
+    assert!(
+        content_record.owns.contains(&active),
+        "owns 内的 active_descendant 必须出现在 owns 关系里"
+    );
+    let mut invalid_spec = base_spec(Anchor::WindowRect(rect(400.0, 300.0, 20.0, 20.0)));
+    invalid_spec.a11y = a11y(Some(root));
+    let opened = app
+        .app_mut()
+        .open_popup(window, invalid_spec, |_app, _window, _content| Ok(()), None)
+        .expect("open with invalid active descendant");
+    frame(&mut app);
+    let opened_content = popup_node(&app, opened);
+    assert!(
+        app.app()
+            .a11y_diagnostics()
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                ui_core::a11y::A11yDiagnostic::InvalidActiveDescendant { node, target: reported }
+                    if *node == opened_content && *reported == root
+            )),
+        "open 时非法 active_descendant 必须清空并留诊断"
+    );
+    assert!(
+        app.a11y()
+            .expect("a11y snapshot")
+            .node_for(opened_content)
+            .expect("opened content a11y")
+            .active_descendant
+            .is_none(),
+        "open 时的非法 active_descendant 不得进入 a11y 树"
+    );
+}

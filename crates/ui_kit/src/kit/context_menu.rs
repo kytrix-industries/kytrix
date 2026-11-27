@@ -4,14 +4,18 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
+    event::{Action, KeyBinding, KeyCode, Modifiers},
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::id::NodeId,
-    popup::{Alignment, Anchor, DismissReason, PlacementSpec, PopupError, ShiftPolicy, Side},
+    popup::{
+        Alignment, Anchor, DismissReason, OutsidePress, PlacementSpec, PopupError, ShiftPolicy,
+        Side,
+    },
     window::WindowId,
 };
 
 use crate::kit::{
-    menu::{Menu, MenuEntry, MenuOptions},
+    menu::{Menu, MenuCheckState, MenuEntry, MenuOptions},
     size::UnifiedSize,
 };
 
@@ -29,6 +33,7 @@ pub struct ContextMenuOptions {
     pub max_height: LogicalPx,
     pub anchor: MenuAnchor,
     pub label: Option<SmolStr>,
+    pub outside_press: OutsidePress,
 }
 
 impl Default for ContextMenuOptions {
@@ -39,6 +44,7 @@ impl Default for ContextMenuOptions {
             max_height: px(320.0),
             anchor: MenuAnchor::TopLeft,
             label: None,
+            outside_press: OutsidePress::Replay,
         }
     }
 }
@@ -67,6 +73,12 @@ impl ContextMenuOptions {
         self.label = Some(label.into());
         self
     }
+
+    #[must_use]
+    pub fn outside_press(mut self, outside_press: OutsidePress) -> Self {
+        self.outside_press = outside_press;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -75,8 +87,10 @@ pub struct ContextMenu {
 }
 
 struct ContextMenuInner {
+    key: SmolStr,
     menu: RefCell<Menu>,
-    on_item_click: RefCell<Option<Rc<dyn Fn(&mut App, SmolStr)>>>,
+    on_item_click: RefCell<Option<Rc<dyn Fn(&mut App, SmolStr, Option<MenuCheckState>)>>>,
+    trigger_action: RefCell<Option<Action>>,
 }
 
 impl ContextMenu {
@@ -97,8 +111,10 @@ impl ContextMenu {
         )
         .closing_on_scroll();
         let inner = Rc::new(ContextMenuInner {
+            key,
             menu: RefCell::new(menu),
             on_item_click: RefCell::new(None),
+            trigger_action: RefCell::new(None),
         });
         let context_menu = Self { inner };
         context_menu.install_handlers();
@@ -161,6 +177,58 @@ impl ContextMenu {
             .open_at(app, window, anchor, highlighted)
     }
 
+    pub fn open_on(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<bool, PopupError> {
+        let bounds = app
+            .window(window)
+            .and_then(|target| target.node_screen_rect(node))
+            .ok_or(PopupError::AnchorNodeMissing { node })?;
+        let point = LogicalPoint::new(bounds.origin.x, bounds.max().y);
+        self.open_at(app, window, point, None)
+    }
+
+    pub fn bind_trigger(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        trigger: NodeId,
+    ) -> Result<(), EngineError> {
+        if let Some(previous) = self.inner.trigger_action.borrow_mut().take() {
+            app.off_action(&previous);
+        }
+        let action = Action::Custom(format_smolstr!("{}.trigger", self.inner.key));
+        let this = self.clone();
+        app.on_action(action.clone(), move |ctx| {
+            let node = ctx.node();
+            let window = ctx.window();
+            let app = ctx.app_mut();
+            let _ = this.open_on(app, window, node);
+        });
+        self.inner
+            .trigger_action
+            .borrow_mut()
+            .replace(action.clone());
+        for (key, modifiers) in [
+            (KeyCode::F10, Modifiers::SHIFT),
+            (KeyCode::ContextMenu, Modifiers::empty()),
+        ] {
+            app.bind_key_scoped(
+                window,
+                trigger,
+                KeyBinding {
+                    key,
+                    modifiers,
+                    action: action.clone(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn close(&self, app: &mut App) -> bool {
         self.inner.menu.borrow().close(app)
     }
@@ -169,7 +237,10 @@ impl ContextMenu {
         self.inner.menu.borrow().close_now(app)
     }
 
-    pub fn on_item_click(self, callback: impl Fn(&mut App, SmolStr) + 'static) -> Self {
+    pub fn on_item_click(
+        self,
+        callback: impl Fn(&mut App, SmolStr, Option<MenuCheckState>) + 'static,
+    ) -> Self {
         *self.inner.on_item_click.borrow_mut() = Some(Rc::new(callback));
         self
     }
@@ -185,6 +256,9 @@ impl ContextMenu {
     }
 
     pub fn release(&self, app: &mut App) -> usize {
+        if let Some(action) = self.inner.trigger_action.borrow_mut().take() {
+            app.off_action(&action);
+        }
         self.inner.menu.borrow().release(app)
     }
 
@@ -201,7 +275,7 @@ impl ContextMenu {
                 };
                 inner.menu.borrow().close_now(app);
                 if let Some(callback) = inner.on_item_click.borrow().clone() {
-                    callback(app, activation.id);
+                    callback(app, activation.id, activation.check);
                 }
             });
         *self.inner.menu.borrow_mut() = menu;
@@ -231,6 +305,7 @@ fn menu_options(options: &ContextMenuOptions) -> MenuOptions {
         max_height: options.max_height,
         placement,
         label: options.label.clone(),
+        outside_press: options.outside_press,
         ..MenuOptions::default()
     }
 }
@@ -257,7 +332,7 @@ mod tests {
         math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::style_builder::StyleBuilder,
-        popup::{PopupId, PopupSnapshotEntry, PopupState},
+        popup::{PopupError, PopupId, PopupSnapshotEntry, PopupState},
         test_support::app::TestApp,
         window::WindowId,
     };
@@ -265,7 +340,7 @@ mod tests {
     use super::{ContextMenu, ContextMenuOptions, MenuAnchor, MenuEntry};
     use crate::{
         kit::{
-            menu::{MenuAction, MenuSubmenu},
+            menu::{MenuAction, MenuCheck, MenuCheckState, MenuSubmenu},
             test_support::a11y_snapshot_without_oracle,
         },
         theme::{appearance::Appearance, handle::ThemeHandle},
@@ -329,7 +404,7 @@ mod tests {
                 entries,
                 options,
             )
-            .on_item_click(move |_, id| reported.borrow_mut().push(id))
+            .on_item_click(move |_, id, _| reported.borrow_mut().push(id))
             .on_close(move |_, _| closes.set(closes.get() + 1))
         }
 
@@ -803,5 +878,270 @@ mod tests {
             "关闭动画结束后节点卸载"
         );
         assert_eq!(harness.closes.get(), 1);
+    }
+    fn focusable_node(harness: &mut Harness, id: &'static str, rect: LogicalRect) -> NodeId {
+        let root = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .tree()
+            .root();
+        let action = Action::Custom(SmolStr::new_static("context.trigger.click"));
+        harness.app.app_mut().on_action(action.clone(), move |_| {});
+        NodeBuilder::boxed()
+            .id(id)
+            .tab_stop(true)
+            .on_click(action)
+            .layout_override(rect)
+            .build(
+                harness
+                    .app
+                    .app_mut()
+                    .window_mut(harness.window)
+                    .expect("窗口")
+                    .tree_mut(),
+                root,
+            )
+            .expect("可聚焦节点")
+    }
+
+    #[test]
+    fn shift_f10_on_the_focus_node_opens_the_menu_at_the_node() {
+        let mut harness = Harness::new();
+        let trigger = focusable_node(
+            &mut harness,
+            "context.trigger",
+            LogicalRect::new(px(300.0), px(200.0), px(120.0), px(32.0)),
+        );
+        let _ = harness.app.drain().expect("布局帧");
+        let menu = harness.menu(options());
+        menu.bind_trigger(harness.app.app_mut(), harness.window, trigger)
+            .expect("绑定 Shift+F10");
+        assert!(
+            harness
+                .app
+                .app_mut()
+                .set_focus(harness.window, Some(trigger))
+        );
+        let _ = harness
+            .app
+            .inject(InputEvent::key_down(KeyCode::F10, Modifiers::SHIFT));
+        let _ = harness
+            .app
+            .inject(InputEvent::key_up(KeyCode::F10, Modifiers::SHIFT));
+        harness.settle(&menu);
+        assert!(menu.is_open(harness.app.app()), "Shift+F10 打开右键菜单");
+        let panel = harness.bounds(menu.panel_node().expect("面板"));
+        assert!(
+            (panel.origin.y - 232.0).abs().value() < 0.5,
+            "面板锚在节点底边：{panel:?}"
+        );
+
+        harness.key(&menu, KeyCode::Escape);
+        harness.settle(&menu);
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(trigger),
+            "关闭后焦点回到触发节点"
+        );
+
+        let _ = harness.app.inject(InputEvent::key_down(
+            KeyCode::ContextMenu,
+            Modifiers::empty(),
+        ));
+        let _ = harness
+            .app
+            .inject(InputEvent::key_up(KeyCode::ContextMenu, Modifiers::empty()));
+        harness.settle(&menu);
+        assert!(
+            menu.is_open(harness.app.app()),
+            "上下文菜单键同样打开右键菜单"
+        );
+    }
+
+    #[test]
+    fn a_context_menu_chain_opens_three_levels_and_closes_children_first() {
+        let mut harness = Harness::new();
+        let menu = harness.menu_with(
+            vec![
+                MenuEntry::Action(MenuAction::new("copy", "复制")),
+                MenuEntry::Submenu(MenuSubmenu::new(
+                    "更多",
+                    [
+                        MenuEntry::Action(MenuAction::new("inner", "内部")),
+                        MenuEntry::Submenu(MenuSubmenu::new(
+                            "更深",
+                            [MenuEntry::Action(MenuAction::new("deep", "深处"))],
+                        )),
+                    ],
+                )),
+            ],
+            options(),
+        );
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
+        let root = harness.root_entry(&menu).id;
+        let level2 = {
+            let handle = menu.inner.menu.borrow().clone();
+            handle
+                .open_submenu(harness.app.app_mut(), 1)
+                .expect("二级")
+                .expect("二级句柄")
+        };
+        let level3 = level2
+            .open_submenu(harness.app.app_mut(), 1)
+            .expect("三级")
+            .expect("三级句柄");
+        harness.settle(&menu);
+        assert_eq!(harness.stack().len(), 3, "右键菜单 3 级链");
+        let entries = harness.stack();
+        assert!(entries[0].z < entries[1].z && entries[1].z < entries[2].z);
+        assert_eq!(entries[1].parent, Some(root));
+        assert_eq!(entries[2].parent, Some(entries[1].id));
+        assert!(
+            level3.popup_node() != level2.popup_node(),
+            "三级与二级是两个独立面板"
+        );
+
+        harness.key(&menu, KeyCode::Escape);
+        harness.settle(&menu);
+        assert_eq!(harness.stack().len(), 2, "Esc 逐层：先关三级");
+        harness.key(&menu, KeyCode::Escape);
+        harness.settle(&menu);
+        assert_eq!(harness.stack().len(), 1);
+        assert!(menu.is_open(harness.app.app()));
+    }
+
+    #[test]
+    fn a_consuming_context_menu_swallows_the_outside_press() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(ContextMenuOptions {
+            outside_press: ui_core::popup::OutsidePress::Consume,
+            ..options()
+        });
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
+        harness.click(&menu, LogicalPoint::new(px(640.0), px(520.0)));
+        assert!(!menu.is_open(harness.app.app()), "外部按下关闭菜单");
+        assert_eq!(
+            harness.background_clicks.get(),
+            0,
+            "显式 Consume 不再把按下 replay 给背景"
+        );
+    }
+
+    #[test]
+    fn opening_on_a_removed_node_reports_the_missing_anchor() {
+        let mut harness = Harness::new();
+        let root = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .tree()
+            .root();
+        let gone = NodeBuilder::boxed()
+            .id("context-gone")
+            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(1.0), px(1.0)))
+            .build(
+                harness
+                    .app
+                    .app_mut()
+                    .window_mut(harness.window)
+                    .expect("窗口")
+                    .tree_mut(),
+                root,
+            )
+            .expect("临时节点");
+        harness
+            .app
+            .app_mut()
+            .window_mut(harness.window)
+            .expect("窗口")
+            .tree_mut()
+            .remove(gone)
+            .expect("移除临时节点");
+        let menu = harness.menu_with(
+            vec![MenuEntry::Action(MenuAction::new("copy", "复制"))],
+            options(),
+        );
+        let error = menu
+            .open_on(harness.app.app_mut(), harness.window, gone)
+            .expect_err("缺失节点必须返回强类型错误");
+        assert!(matches!(
+            error,
+            PopupError::AnchorNodeMissing { node } if node == gone
+        ));
+    }
+
+    #[test]
+    fn binding_the_trigger_twice_keeps_a_single_keyboard_handler() {
+        let mut harness = Harness::new();
+        let trigger = focusable_node(
+            &mut harness,
+            "context-rebind",
+            LogicalRect::new(px(200.0), px(40.0), px(80.0), px(32.0)),
+        );
+        let menu = harness.menu_with(
+            vec![MenuEntry::Action(MenuAction::new("copy", "复制"))],
+            options(),
+        );
+        menu.bind_trigger(harness.app.app_mut(), harness.window, trigger)
+            .expect("首次绑定");
+        menu.bind_trigger(harness.app.app_mut(), harness.window, trigger)
+            .expect("重复绑定");
+        let _ = harness
+            .app
+            .app_mut()
+            .set_focus(harness.window, Some(trigger));
+        let _ = harness
+            .app
+            .inject(InputEvent::key_down(KeyCode::F10, Modifiers::SHIFT));
+        let _ = harness
+            .app
+            .inject(InputEvent::key_up(KeyCode::F10, Modifiers::SHIFT));
+        harness.settle(&menu);
+        assert!(
+            menu.is_open(harness.app.app()),
+            "重复绑定后 Shift+F10 仍打开"
+        );
+        assert_eq!(
+            harness
+                .app
+                .app()
+                .popup_stack(harness.window)
+                .expect("栈")
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_item_click_callback_reports_the_new_check_state() {
+        let mut harness = Harness::new();
+        let reported: Rc<RefCell<Vec<(SmolStr, Option<MenuCheckState>)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let sink = reported.clone();
+        let menu = harness
+            .menu_with(
+                vec![MenuEntry::Action(
+                    MenuAction::new("toggle", "开关").checkbox(false),
+                )],
+                options(),
+            )
+            .on_item_click(move |_, id, check| sink.borrow_mut().push((id, check)));
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
+        harness.key(&menu, KeyCode::Enter);
+        let reported = reported.borrow();
+        assert_eq!(reported.len(), 1, "Enter 激活一次只回调一次");
+        assert_eq!(reported[0].0, SmolStr::new_static("toggle"));
+        assert_eq!(
+            reported[0].1,
+            Some(MenuCheckState {
+                kind: MenuCheck::Checkbox,
+                checked: true,
+            }),
+            "on_item_click 收到切换后的 check 状态"
+        );
     }
 }

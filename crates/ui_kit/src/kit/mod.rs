@@ -17,6 +17,7 @@ pub mod join;
 pub mod list;
 pub mod markdown;
 pub mod menu;
+pub mod menu_chain;
 pub mod motion;
 pub mod popup_panel;
 pub mod progress;

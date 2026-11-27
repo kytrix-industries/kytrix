@@ -251,6 +251,7 @@ impl DebugStackReport {
 struct OverlayCheck {
     window: WindowId,
     menu: Menu,
+    chain_menu: Menu,
     color_picker: ColorPicker,
     nodes: Rc<Vec<(SmolStr, NodeId)>>,
     report: Rc<RefCell<DebugStackReport>>,
@@ -262,6 +263,7 @@ impl OverlayCheck {
     fn new(
         window: WindowId,
         menu: Menu,
+        chain_menu: Menu,
         color_picker: ColorPicker,
         nodes: Vec<(SmolStr, NodeId)>,
         report: Rc<RefCell<DebugStackReport>>,
@@ -269,6 +271,7 @@ impl OverlayCheck {
         Self {
             window,
             menu,
+            chain_menu,
             color_picker,
             nodes: Rc::new(nodes),
             report,
@@ -313,7 +316,7 @@ impl OverlayCheck {
 
     fn schedule(&self, app: &mut App, start: u32) {
         let generation = self.generation.get();
-        for round in start..=5 {
+        for round in start..=6 {
             let this = self.clone();
             let delay = Duration::from_millis(u64::from(600 * (round + 1)));
             let _ = app.after(self.window, delay, move |app| {
@@ -344,6 +347,7 @@ impl OverlayCheck {
         );
         self.report.borrow_mut().reset_attempt();
         let _ = self.menu.close_now(app);
+        let _ = self.chain_menu.close_now(app);
         let _ = self.color_picker.close(app);
         app.handle().wake();
         let this = self.clone();
@@ -417,9 +421,91 @@ impl OverlayCheck {
                     "menu-close-call",
                     SmolStr::new_static("menu.close 必须接受关闭"),
                 );
+                let anchor = ui_core::popup::Anchor::WindowRect(LogicalRect::from_origin_size(
+                    LogicalPoint::new(px(360.0), px(180.0)),
+                    LogicalSize::new(px(1.0), px(1.0)),
+                ));
+                let root = self.chain_menu.open(app, window, anchor);
+                let level2 = self.chain_menu.open_submenu(app, 2).ok().flatten();
+                let level3 = level2
+                    .as_ref()
+                    .and_then(|menu| menu.open_submenu(app, 1).ok().flatten());
+                println!(
+                    "gallery: overlay-check chain open root={root:?} level2={} level3={}",
+                    level2.is_some(),
+                    level3.is_some()
+                );
+                self.report.borrow_mut().check(
+                    matches!(root, Ok(true)) && level2.is_some() && level3.is_some(),
+                    "chain-open",
+                    format_smolstr!(
+                        "3 级链打开失败：root={root:?} level2={} level3={}",
+                        level2.is_some(),
+                        level3.is_some()
+                    ),
+                );
+                dump_popup_stack(app, window, "chain-open");
             }
             2 => {
-                record_stack_empty(app, window, &self.report, "menu-close");
+                if !self.chain_menu.is_open(app) {
+                    self.retry(app, "3 级菜单链在阶段 2 采样前消失");
+                    return;
+                }
+                let entries = stack_entries(app, window);
+                let mut state = self.report.borrow_mut();
+                state.check(
+                    entries.len() == 3,
+                    "chain-stack-size",
+                    format_smolstr!("3 级菜单链应有 3 条 popup，实际 {}", entries.len()),
+                );
+                state.check(
+                    entries.len() == 3
+                        && entries[0].z < entries[1].z
+                        && entries[1].z < entries[2].z,
+                    "chain-z-order",
+                    format_smolstr!("最新层必须最上（z 升序）：{entries:?}"),
+                );
+                state.check(
+                    entries
+                        .first()
+                        .is_some_and(|entry| entry.tier == ui_core::popup::PopupTier::Auto),
+                    "chain-tier",
+                    format_smolstr!("菜单链必须是 Auto tier：{entries:?}"),
+                );
+                state.check(
+                    entries
+                        .get(1)
+                        .is_some_and(|entry| entry.parent == entries.first().map(|root| root.id)),
+                    "chain-parent-level2",
+                    format_smolstr!("二级必须挂在根下：{entries:?}"),
+                );
+                state.check(
+                    entries.get(2).is_some_and(|entry| {
+                        entries
+                            .get(1)
+                            .is_some_and(|level2| entry.parent == Some(level2.id))
+                    }),
+                    "chain-parent-level3",
+                    format_smolstr!("三级必须挂在二级下：{entries:?}"),
+                );
+                drop(state);
+                dump_popup_stack(app, window, "chain");
+                let closed = self.chain_menu.close(app);
+                println!("gallery: overlay-check chain.close -> {closed}");
+                self.report.borrow_mut().check(
+                    closed,
+                    "chain-close-call",
+                    SmolStr::new_static("3 级菜单链必须接受关闭"),
+                );
+            }
+            3 => {
+                let entries = stack_entries(app, window);
+                self.report.borrow_mut().check(
+                    entries.is_empty(),
+                    "chain-entries-zero",
+                    format_smolstr!("3 级菜单链关闭后 popup 栈必须清空：{entries:?}"),
+                );
+                dump_popup_stack(app, window, "chain-closed");
                 let opened = match self.color_picker.open(app, window) {
                     Ok(opened) => opened,
                     Err(error) => {
@@ -435,9 +521,9 @@ impl OverlayCheck {
                 );
                 dump_popup_stack(app, window, "picker-open");
             }
-            3 => {
+            4 => {
                 if !self.color_picker.is_open(app) {
-                    self.retry(app, "取色器在阶段 3 采样前消失");
+                    self.retry(app, "取色器在阶段 4 采样前消失");
                     return;
                 }
                 let (is_open, children) = picker_metrics(app, window, &self.color_picker);
@@ -466,9 +552,9 @@ impl OverlayCheck {
                 drop(state);
                 dump_popup_stack(app, window, "picker");
             }
-            4 => {
+            5 => {
                 if !self.color_picker.is_open(app) {
-                    self.retry(app, "取色器在阶段 4 关闭前消失");
+                    self.retry(app, "取色器在阶段 5 关闭前消失");
                     return;
                 }
                 let (is_open, children) = picker_metrics(app, window, &self.color_picker);
@@ -845,6 +931,7 @@ struct Gallery {
     dropdown: Dropdown,
     select: Select,
     menu: Menu,
+    chain_menu: Menu,
     context_menu: ContextMenu,
     tooltip: Tooltip,
     overlay: PopupPanel,
@@ -1783,12 +1870,22 @@ impl Gallery {
                 MenuEntry::Action(MenuAction::new("copy", "复制").shortcut("Ctrl+C")),
                 MenuEntry::Action(MenuAction::new("paste", "粘贴").shortcut("Ctrl+V")),
                 MenuEntry::Separator,
+                MenuEntry::Action(MenuAction::new("wrap", "自动换行").checkbox(true)),
+                MenuEntry::Action(MenuAction::new("minimap", "显示缩略图").checkbox(false)),
+                MenuEntry::Separator,
                 MenuEntry::Action(MenuAction::new("delete", "删除").danger(true)),
                 MenuEntry::Submenu(MenuSubmenu::new(
                     "更多",
                     [
                         MenuEntry::Action(MenuAction::new("export", "导出")),
                         MenuEntry::Action(MenuAction::new("settings", "设置").disabled(true)),
+                        MenuEntry::Submenu(MenuSubmenu::new(
+                            "视图",
+                            [
+                                MenuEntry::Action(MenuAction::new("light", "浅色").radio(true)),
+                                MenuEntry::Action(MenuAction::new("dark", "深色").radio(false)),
+                            ],
+                        )),
                     ],
                 )),
             ],
@@ -1796,7 +1893,16 @@ impl Gallery {
         )
         .on_activate({
             move |app, activation| {
-                log_line(app, &log, format_smolstr!("menu: 激活 {}", activation.id))
+                log_line(
+                    app,
+                    &log,
+                    match activation.check {
+                        Some(check) => {
+                            format_smolstr!("menu: 激活 {} / 勾选={}", activation.id, check.checked)
+                        }
+                        None => format_smolstr!("menu: 激活 {}", activation.id),
+                    },
+                );
             }
         });
         let menu_action = Action::Custom(SmolStr::new_static("gallery.menu.open"));
@@ -1821,6 +1927,41 @@ impl Gallery {
             }
         });
 
+        let chain_menu = Menu::new(
+            app,
+            theme.clone(),
+            "gallery.menu-chain",
+            [
+                MenuEntry::Action(MenuAction::new("first", "第一项").checkbox(true)),
+                MenuEntry::Action(MenuAction::new("second", "第二项")),
+                MenuEntry::Submenu(MenuSubmenu::new(
+                    "二级",
+                    [
+                        MenuEntry::Action(MenuAction::new("inner", "内部")),
+                        MenuEntry::Submenu(MenuSubmenu::new(
+                            "三级",
+                            [
+                                MenuEntry::Action(MenuAction::new("third", "第三项").radio(true)),
+                                MenuEntry::Action(
+                                    MenuAction::new("fourth", "第四项").disabled(true),
+                                ),
+                            ],
+                        )),
+                    ],
+                )),
+            ],
+            MenuOptions::default(),
+        )
+        .on_activate({
+            move |app, activation| {
+                log_line(
+                    app,
+                    &log,
+                    format_smolstr!("menu-chain: 激活 {}", activation.id),
+                );
+            }
+        });
+
         let context_menu = ContextMenu::new(
             app,
             theme.clone(),
@@ -1829,12 +1970,30 @@ impl Gallery {
                 MenuEntry::Action(MenuAction::new("inspect", "查看")),
                 MenuEntry::Action(MenuAction::new("duplicate", "复制一份")),
                 MenuEntry::Separator,
+                MenuEntry::Submenu(MenuSubmenu::new(
+                    "变换",
+                    [
+                        MenuEntry::Action(MenuAction::new("flip", "翻转")),
+                        MenuEntry::Action(MenuAction::new("rotate", "旋转 90°").disabled(true)),
+                    ],
+                )),
                 MenuEntry::Action(MenuAction::new("remove", "移除").danger(true)),
             ],
             ContextMenuOptions::default(),
         )
         .on_item_click({
-            move |app, id| log_line(app, &log, format_smolstr!("context-menu: 点击 {id}"))
+            move |app, id, check| {
+                log_line(
+                    app,
+                    &log,
+                    match check {
+                        Some(check) => {
+                            format_smolstr!("context-menu: 点击 {id} / 勾选={}", check.checked)
+                        }
+                        None => format_smolstr!("context-menu: 点击 {id}"),
+                    },
+                )
+            }
         });
         let context_action = Action::Custom(SmolStr::new_static("gallery.context.open"));
         let context_trigger = demo_trigger(
@@ -2061,6 +2220,7 @@ impl Gallery {
             dropdown,
             select,
             menu,
+            chain_menu,
             context_menu,
             tooltip,
             overlay,
@@ -2148,6 +2308,7 @@ impl Gallery {
         if self.flags.debug_stack {
             let viewport = self.viewport;
             let menu = self.menu.clone();
+            let chain_menu = self.chain_menu.clone();
             let color_picker = self.color_picker.clone();
             let nodes = self.probe_nodes.clone();
             let report = self.debug_stack.clone();
@@ -2160,6 +2321,7 @@ impl Gallery {
                 let check = OverlayCheck::new(
                     window,
                     menu.clone(),
+                    chain_menu.clone(),
                     color_picker.clone(),
                     nodes.clone(),
                     report.clone(),
@@ -2375,6 +2537,7 @@ impl Gallery {
         let _ = self.dropdown.sync(app);
         let _ = self.select.sync(app);
         let _ = self.menu.sync(app);
+        let _ = self.chain_menu.sync(app);
         let _ = self.context_menu.sync(app);
         let _ = self.overlay.sync(app);
         let _ = self.tooltip.sync(app);

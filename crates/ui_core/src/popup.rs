@@ -235,6 +235,7 @@ pub struct PopupA11y {
     pub has_popup: Option<HasPopup>,
     pub described_by: Option<NodeId>,
     pub a11y_parent: Option<NodeId>,
+    pub active_descendant: Option<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

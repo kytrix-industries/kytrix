@@ -23,6 +23,7 @@ pub(crate) struct A11yPopupOverlay {
     pub described_by: Option<NodeId>,
     pub actions: SmallVec<[A11yAction; 2]>,
     pub items: SmallVec<[NodeId; 2]>,
+    pub active_descendant: Option<NodeId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -152,6 +153,10 @@ pub(crate) fn project(
             overlay.hidden = !dismissable;
             overlay.owns = entry.a11y.owns.clone();
             overlay.items = declared_items(tree, entry);
+            overlay.active_descendant = entry.a11y.active_descendant.filter(|target| {
+                tree.get(*target).is_ok()
+                    && (tree.is_ancestor(entry.node, *target) || entry.a11y.owns.contains(target))
+            });
             if !dismissable {
                 return;
             }

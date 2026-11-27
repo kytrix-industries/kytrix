@@ -1717,3 +1717,148 @@ fn a_patch_only_a11y_parent_cycle_falls_back_to_the_physical_parent() {
         );
     }
 }
+
+#[test]
+fn a_declared_active_descendant_is_projected_updated_and_cleared() {
+    let mut app = TestApp::new();
+    app.enable_a11y_capture();
+    let window = window(&app);
+    let root = app.app().window(window).expect("window").tree().root();
+    let trigger = mount(app.app_mut(), window, root, A11yRole::Button, "选项");
+    let mut popup_spec = spec(trigger, A11yRole::ListBox, "选项");
+    popup_spec.focus = FocusPolicy::None;
+    let popup = app
+        .app_mut()
+        .open_popup(
+            window,
+            popup_spec,
+            |app, window, content| {
+                let first = mount(app, window, content, A11yRole::MenuItem, "一");
+                let second = mount(app, window, content, A11yRole::MenuItem, "二");
+                let tree = app.window_mut(window).expect("window").tree_mut();
+                crate::a11y::tree::write_a11y_patch(
+                    tree,
+                    content,
+                    crate::a11y::A11yPatch {
+                        owns: Some(smallvec::smallvec![first, second]),
+                        ..crate::a11y::A11yPatch::default()
+                    },
+                );
+                Ok(())
+            },
+            None,
+        )
+        .expect("listbox");
+    let content = popup_node(&app, popup);
+    let _ = app.drain().expect("open frame");
+    let snapshot = full_a11y(&mut app);
+    assert_eq!(
+        snapshot
+            .node_for(content)
+            .expect("content a11y")
+            .active_descendant,
+        None,
+        "未声明且无焦点时不得有 active_descendant"
+    );
+    let children: Vec<NodeId> = app
+        .app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(content)
+        .expect("content")
+        .children()
+        .to_vec();
+    let (first, second) = (children[0], children[1]);
+    let base = PopupA11y {
+        role: Some(A11yRole::ListBox),
+        label: Some(SmolStr::new_static("选项")),
+        owns: smallvec::smallvec![first, second],
+        active_descendant: Some(second),
+        ..PopupA11y::default()
+    };
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, base.clone())
+            .expect("set a11y")
+    );
+    let snapshot = full_a11y(&mut app);
+    let record = snapshot.node_for(content).expect("content a11y");
+    assert_eq!(
+        record.active_descendant,
+        Some(a11y_id(&snapshot, second)),
+        "PopupA11y.active_descendant 必须投影到 popup 内容根"
+    );
+    assert!(
+        record.children.contains(&a11y_id(&snapshot, second))
+            || record.owns.contains(&a11y_id(&snapshot, second)),
+        "active_descendant target 必须位于 content 的后代或 owns 内：children={:?} owns={:?}",
+        record.children,
+        record.owns
+    );
+    let mut updated = base.clone();
+    updated.active_descendant = Some(first);
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, updated.clone())
+            .expect("update a11y")
+    );
+    let snapshot = full_a11y(&mut app);
+    assert_eq!(
+        snapshot
+            .node_for(content)
+            .expect("content a11y")
+            .active_descendant,
+        Some(a11y_id(&snapshot, first)),
+        "同一帧更新必须生效"
+    );
+    let mut invalid = base.clone();
+    invalid.active_descendant = Some(root);
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, invalid)
+            .expect("invalid a11y is cleared, not rejected")
+    );
+    assert!(
+        app.app()
+            .a11y_diagnostics()
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                A11yDiagnostic::InvalidActiveDescendant { node, target }
+                    if *node == content && *target == root
+            )),
+        "非法 active_descendant 必须清空并留诊断：{:?}",
+        app.app().a11y_diagnostics()
+    );
+    let snapshot = full_a11y(&mut app);
+    assert_eq!(
+        snapshot
+            .node_for(content)
+            .expect("content a11y")
+            .active_descendant,
+        None,
+        "非法 active_descendant 必须被清空而不是残留"
+    );
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, updated)
+            .expect("restore a11y")
+    );
+    let mut cleared = base;
+    cleared.active_descendant = None;
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(popup, cleared)
+            .expect("clear a11y")
+    );
+    let snapshot = full_a11y(&mut app);
+    assert_eq!(
+        snapshot
+            .node_for(content)
+            .expect("content a11y")
+            .active_descendant,
+        None,
+        "清除后同一帧必须消失"
+    );
+}

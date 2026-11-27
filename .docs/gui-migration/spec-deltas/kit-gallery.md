@@ -714,7 +714,7 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 
 ### 13.3 `--dump-overlay` → `--debug-stack`（P1-12 更名；旧命令已移除）
 
-- P1-12 起真实窗口命令为 `cargo run -p ui_kit --example gallery -- --debug-stack`（`--auto-close` 可选）：dump `popup_stack` 快照（id/tier/parent/z/state/hit/paint/a11y/owner_modal/focus/node/paint_offset/constrained_size）+ probe rect，`overlay-check` 改为 popup 语义（栈条目数=1、menu tier、菜单度量、首可见帧 rect==稳定帧、关闭后无残留、结束时栈空）。**`--debug-stack` 在最后一轮完成后自行关窗并以 0/3 退出；`--auto-close=<secs>` 只是 ≥30s 看门狗（`max(secs,30)`），无需携带**。
+- P1-12 起真实窗口命令为 `cargo run -p ui_kit --example gallery -- --debug-stack`（`--auto-close` 可选）：dump `popup_stack` 快照（id/tier/parent/z/state/hit/paint/a11y/owner_modal/focus/node/paint_offset/constrained_size）+ probe rect，`overlay-check` 改为 popup 语义（栈条目数=1、menu tier、菜单度量、首可见帧 rect==稳定帧、关闭后无残留、结束时栈空）。**P2 起 overlay-check 另含 3 级菜单链阶段，见 §13.6。****`--debug-stack` 在最后一轮完成后自行关窗并以 0/3 退出；`--auto-close=<secs>` 只是 ≥30s 看门狗（`max(secs,30)`），无需携带**。
 - 旧 `--dump-overlay` 已从 `parse_flags` 删除（P1-11 删除 `kit::overlay` 后无节点树可打印）；**传旧名不再得到 overlay-check，而是打印改名提示并 exit 2**（终审 K1-04/Q1-07：不再“忽略后 exit 0”的假绿），详见 §13.5。
 - 真实窗口仍**不读像素**：真实窗口像素 readback/截图门禁登记为 **P3-6**（方案待定：readback vs 截图），届时与 headless `--pixel-check` 合并为同一退出码。`--idle-check`/`--theme-check` 语义不受影响。
 
@@ -735,4 +735,13 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 - **`--debug-stack` 实测基线**：`menu` 度量 `(6, 180.0, 127.5125)`、picker children=4、最终 `entries=0`、`overlay-check PASS`，exit 0；自动化完成后自行关窗（`overlay-check complete -> closing window`），`--auto-close` 仅 ≥30s 看门狗，带 9 与不带 auto-close 均 PASS。`menu_frames`/`picker_frames` 为逐帧采样计数、运行间浮动（只断言 >0），不是固定契约。
 - **旧 `--dump-overlay` 已移除且显式失败**：参数表中不再存在；传旧名会打印 `gallery: --dump-overlay was renamed; use --debug-stack --auto-close=9` 并 **exit 2**；其它未知参数会打印 `gallery: unknown argument <arg>` 与 usage 并 **exit 2**；`--help` 仍 exit 0（不再“忽略后 exit 0”假绿，终审 K1-04/Q1-07）。三端脚本与 README 一律改 `--debug-stack`。
 - **P1 完成状态**：gallery 的 ⑭ ColorPicker 场景与 overlay-check 已全部跑在新 popup API 上；真实窗口像素 readback/截图与三端验收仍为 **P3-6**（`--debug-stack` 只断言栈/rect）。
-- **最终数字（round-3）**：`--pixel-check` `checks=94`、`close 6+6=12` 不变；`cargo test -p ui_core -p ui_kit` 最终 3780 passed / 2 ignored（ui_kit 801），详见设计 §12.5。
+- **最终数字（round-3）**：`--pixel-check` `checks=94`、`close 6+6=12` 不变；`cargo test -p ui_core -p ui_kit` 最终 3780 passed / 2 ignored（ui_kit 801），详见设计 §12.5。**P2 后记录见 §13.6。**
+### 13.6 P2-7 回写：3 级链 overlay-check 与 P2 完成状态（2026-11-27）
+
+> 依据：设计 §13.2/§13.6、`review-p2-{menu,quality}.md`；实现 `crates/ui_kit/examples/gallery.rs` 的 overlay-check。
+
+- **P2 完成**：MenuChain（per-level 状态/timer/children-first/兄弟替换）、5 点 safe triangle + 300ms grace、完整键盘表/typeahead/checkable、2–3 级级联、链式 dismiss（祖先只关后代/Esc 逐层）、ContextMenu WindowRect/节点锚/键盘入口、a11y `active_descendant`/expanded/链嵌套均已落地（设计 §13.2；P2 审查 M2-01/02/03 与 Q2-03 由 task-58 修复）。
+- **`--debug-stack` 3 级链阶段**：overlay-check 在单层 menu 阶段后新增 `chain-open`（root+level2+level3 打开）、`chain-stack-size`（3 条 popup）、`chain-z-order`（z 升序）、`chain-tier`（Auto）、`chain-parent-level2`/`chain-parent-level3`（parent 链）、`chain-close-call`、`chain-entries-zero`（关闭后栈清空）。
+- **命令不变**：`cargo run -p ui_kit --example gallery -- --debug-stack`（自行退出 0/3；`--auto-close` 仅 ≥30s 看门狗）；`--pixel-check` 仍为原语义（32 sampled + 16 background-residue + 46 static + close 6+6；P2 不改像素门禁）。
+- **最终数字（task-62 收口后，P2 最终）**：`cargo test -p ui_core -p ui_kit` **3847 passed / 0 failed / 2 ignored**（ui_core lib 2805、popup_behavior 111、ui_kit lib 866）；`--pixel-check` **PASS 94 checks**（32 sampled + 16 background-residue + 46 static；close 6+6）；`--debug-stack` **PASS**（含上述 3 级链阶段）；clippy/fmt/workspace check PASS。详见设计 §13.6。
+- **P1 记录保留**：§13.3/§13.5 的 P1 语义与 94 checks 构成不变；P2 只新增链阶段与菜单行为。P2 的逐文件 `#[test]` 计数见设计 §13.6（menu 76 / menu_chain 13 / context_menu 20 = 109）。

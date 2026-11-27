@@ -436,6 +436,7 @@ pub(crate) fn node_a11y_records_with_cache(
         .or_else(|| overlay.and_then(|overlay| overlay.described_by));
     let declared_active = patch
         .and_then(|patch| patch.active_descendant)
+        .or_else(|| overlay.and_then(|overlay| overlay.active_descendant))
         .or_else(|| context.popup.active_descendant(tree, context.focus, node));
     let busy = patch
         .and_then(|patch| patch.busy)
