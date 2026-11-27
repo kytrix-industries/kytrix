@@ -12,7 +12,7 @@ use image::{Rgba, RgbaImage};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::{App, Application},
-    event::{Action, ActionSource, Event, InputEvent},
+    event::{Action, ActionSource, Event, InputEvent, KeyCode, Modifiers, PointerButton},
     interaction::ScrollConfig,
     math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{
@@ -53,7 +53,7 @@ use ui_kit::{
         input::{self, InputNode, InputSpec, InputState},
         list::{List, ListOptions, SelectionMode},
         markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
-        menu::{Menu, MenuAction, MenuEntry, MenuOptions, MenuSubmenu},
+        menu::{Menu, MenuAction, MenuActivation, MenuEntry, MenuOptions, MenuSubmenu},
         popup_panel::{PanelWidth, PopupPanel, PopupPanelOptions, PopupSurface},
         progress::Progress,
         scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
@@ -4008,6 +4008,19 @@ const REAL_PIXEL_SCRIM_EDGE_MARGIN: u32 = 16;
 const REAL_PIXEL_CORNER_INSET: u32 = 4;
 const REAL_PIXEL_SCRIM_OUTLIER_PERMILLE: u64 = 10;
 const REAL_PIXEL_TRIGGER_MARGIN: u32 = 10;
+const REAL_PIXEL_INTERACT_TRIGGER: (f32, f32, f32, f32) = (60.0, 80.0, 150.0, 36.0);
+const REAL_PIXEL_INTERACT_REPLAY: (f32, f32, f32, f32) = (700.0, 132.0, 150.0, 36.0);
+const REAL_PIXEL_INTERACT_STATUS: (f32, f32, f32, f32) = (700.0, 184.0, 150.0, 24.0);
+const REAL_PIXEL_SCROLL_VIEWPORT: (f32, f32, f32, f32) = (700.0, 236.0, 150.0, 110.0);
+const REAL_PIXEL_SCROLL_CONTENT_H: f32 = 400.0;
+const REAL_PIXEL_SCROLL_ANCHOR: (f32, f32, f32, f32) = (10.0, 80.0, 130.0, 30.0);
+const REAL_PIXEL_SCROLL_DELTA: f32 = 80.0;
+const REAL_PIXEL_INTERACT_STEP_MS: u64 = 140;
+const REAL_PIXEL_RESIZE_W: f32 = 1120.0;
+const REAL_PIXEL_RESIZE_H: f32 = 840.0;
+const REAL_PIXEL_INTERACT_PERMILLE: u64 = 30;
+const REAL_PIXEL_CAPTURE_RETRIES: u8 = 6;
+const REAL_PIXEL_CAPTURE_RETRY_MS: u64 = 150;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RealPixelStage {
@@ -4020,6 +4033,17 @@ enum RealPixelStage {
     MenuClosing,
     DialogOpening,
     DialogClosing,
+    InteractPointerOpen,
+    InteractHover,
+    InteractSafeTriangle,
+    InteractSibling,
+    InteractEscape,
+    InteractOutsideReplay,
+    InteractKeyboard,
+    InteractResizeBaseline,
+    InteractScrollOpen,
+    InteractScrollRestore,
+    InteractSelfChecks,
     Done,
 }
 
@@ -4135,6 +4159,23 @@ struct RealPixelReport {
     build_profile: SmolStr,
     scrim: [f32; 4],
     report_write_failed: bool,
+    interact_step: u8,
+    interact_at: Option<Instant>,
+    interact_root_node: Option<NodeId>,
+    interact_root_rect: Option<LogicalRect>,
+    interact_level2_node: Option<NodeId>,
+    interact_level2_rect: Option<LogicalRect>,
+    interact_sibling_node: Option<NodeId>,
+    interact_sibling_rect: Option<LogicalRect>,
+    interact_activation: Option<SmolStr>,
+    interact_replay_on: bool,
+    interact_status_on: bool,
+    interact_highlighted: Option<usize>,
+    interact_open_content: Option<RgbaImage>,
+    resize_root_rect: Option<LogicalRect>,
+    scroll_rect: Option<LogicalRect>,
+    scroll_delta: f32,
+    marker_retries: u32,
 }
 
 impl RealPixelReport {
@@ -4171,9 +4212,21 @@ struct RealPixelAcceptance {
     report: Rc<RefCell<RealPixelReport>>,
     baseline: Rc<RefCell<Option<RealPixelBaseline>>>,
     theme: ThemeHandle,
+    interact_trigger: NodeId,
+    replay_node: NodeId,
+    status_node: NodeId,
+    scroll_viewport: NodeId,
+    scroll_anchor: NodeId,
+    scroll_panel: PopupPanel,
+    replay_on: Signal<bool>,
+    status_on: Signal<bool>,
+    activated: Rc<RefCell<Option<SmolStr>>>,
 }
 
 fn real_pixel_evidence_dir() -> PathBuf {
+    if let Some(run_dir) = std::env::var_os("KYTRIX_REAL_PIXEL_EVIDENCE") {
+        return PathBuf::from(run_dir);
+    }
     let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
         || {
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4279,8 +4332,105 @@ fn real_pixel_stage_slug(stage: RealPixelStage) -> &'static str {
         RealPixelStage::MenuClosing => "04-menu-closed",
         RealPixelStage::DialogOpening => "05-dialog-open",
         RealPixelStage::DialogClosing => "06-dialog-closed",
+        RealPixelStage::InteractPointerOpen => "07-interact-open",
+        RealPixelStage::InteractHover => "08-interact-hover",
+        RealPixelStage::InteractSafeTriangle => "09-interact-safe-triangle",
+        RealPixelStage::InteractSibling => "10-interact-sibling",
+        RealPixelStage::InteractEscape => "11-interact-esc-closed",
+        RealPixelStage::InteractOutsideReplay => "12-interact-outside-replay",
+        RealPixelStage::InteractKeyboard => "13-interact-keyboard",
+        RealPixelStage::InteractResizeBaseline => "14-resize-reanchor",
+        RealPixelStage::InteractScrollOpen => "15-scroll-reanchored",
+        RealPixelStage::InteractScrollRestore => "16-scroll-restored",
+        RealPixelStage::InteractSelfChecks => "17-self-checks",
         RealPixelStage::Done => "done",
     }
+}
+
+fn real_pixel_allows_resize(stage: RealPixelStage) -> bool {
+    matches!(stage, RealPixelStage::InteractResizeBaseline)
+}
+
+fn real_pixel_interaction_stage(stage: RealPixelStage) -> bool {
+    matches!(
+        stage,
+        RealPixelStage::InteractPointerOpen
+            | RealPixelStage::InteractHover
+            | RealPixelStage::InteractSafeTriangle
+            | RealPixelStage::InteractSibling
+            | RealPixelStage::InteractEscape
+            | RealPixelStage::InteractOutsideReplay
+            | RealPixelStage::InteractKeyboard
+            | RealPixelStage::InteractResizeBaseline
+            | RealPixelStage::InteractScrollOpen
+            | RealPixelStage::InteractScrollRestore
+            | RealPixelStage::InteractSelfChecks
+    )
+}
+
+fn real_pixel_row_point(rect: LogicalRect, rows: usize, row: usize) -> LogicalPoint {
+    let rows = rows.max(1) as f32;
+    LogicalPoint::new(
+        px(rect.origin.x.value() + rect.size.width.value() * 0.5),
+        px(rect.origin.y.value() + rect.size.height.value() * (row as f32 + 0.5) / rows),
+    )
+}
+
+fn real_pixel_rect_center(rect: LogicalRect) -> LogicalPoint {
+    LogicalPoint::new(
+        px(rect.origin.x.value() + rect.size.width.value() * 0.5),
+        px(rect.origin.y.value() + rect.size.height.value() * 0.5),
+    )
+}
+
+fn real_pixel_visible_change(
+    baseline: &RealPixelBaseline,
+    shot: &RgbaImage,
+    rect: LogicalRect,
+    minimum_permille: u64,
+) -> bool {
+    let Some(region) = real_pixel_map_rect(baseline, rect, 2) else {
+        return false;
+    };
+    let diff = real_pixel_compare(
+        &baseline.content,
+        shot,
+        region,
+        REAL_PIXEL_OPEN_TOLERANCE,
+        None,
+    );
+    let permille = diff
+        .compared
+        .saturating_mul(1000)
+        .checked_div(region.area())
+        .unwrap_or(0);
+    permille >= minimum_permille && diff.max_delta >= REAL_PIXEL_VISIBLE_DELTA
+}
+
+fn real_pixel_node_region(
+    baseline: &RealPixelBaseline,
+    app: &App,
+    window: WindowId,
+    node: NodeId,
+    margin: u32,
+) -> Option<RealPixelRegion> {
+    let rect = app.window(window)?.node_screen_rect(node)?;
+    real_pixel_map_rect(baseline, rect, margin)
+}
+
+fn real_pixel_region_change(
+    baseline: &RgbaImage,
+    shot: &RgbaImage,
+    region: RealPixelRegion,
+    tolerance: u8,
+) -> (RealPixelDiff, u64) {
+    let diff = real_pixel_compare(baseline, shot, region, tolerance, None);
+    let permille = diff
+        .differing
+        .saturating_mul(1000)
+        .checked_div(region.area())
+        .unwrap_or(0);
+    (diff, permille)
 }
 
 fn real_pixel_marker_pixel(pixel: [u8; 4], tone: RealPixelTone) -> bool {
@@ -4915,9 +5065,14 @@ impl RealPixelAcceptance {
              {REAL_PIXEL_MARKER_BORDER} px #FF00FF ring at the content edge; the full-screen screenshot is \
              decoded, the magenta box gives the content origin/physical size/scale, engine popup rects are \
              mapped through the window scale factor, and the sequence baseline → ColorPicker open/close → \
-             3-level MenuChain open/close → Dialog+scrim open/close must change each popup region on open \
-             and restore it pixel-for-pixel on close (coverage floor; trigger ring excluded); negative \
-             self-checks inject an offset and a recolor fault that must both turn the detector red"
+             3-level MenuChain open/close → Dialog+scrim open/close → real-pointer/keyboard interaction \
+             (click-open, hover submenu, safe-triangle diagonal move, sibling replacement, per-level Esc, \
+             outside click + Replay to a background control, Tab/arrow/Enter keyboard path, scroll \
+             re-anchor, window resize re-anchor) must change each popup region on open and restore it \
+             pixel-for-pixel on close (coverage floor; trigger ring excluded); interactive steps are driven \
+             through the platform input path (InputEvent injection) and negative self-checks for the \
+             interaction detectors (static baseline as open, open frame as residue, wrong level count, \
+             static replay region) must turn red"
         );
         println!(
             "gallery: real-pixel-check platform={} capture={}",
@@ -4955,6 +5110,17 @@ impl RealPixelAcceptance {
             "04-menu-closed.png",
             "05-dialog-open.png",
             "06-dialog-closed.png",
+            "07-interact-open.png",
+            "08-interact-hover.png",
+            "09-interact-safe-triangle.png",
+            "10-interact-sibling.png",
+            "11-interact-esc-closed.png",
+            "12-interact-outside-replay.png",
+            "13-interact-keyboard.png",
+            "14-resize-reanchor.png",
+            "15-scroll-reanchored.png",
+            "16-scroll-restored.png",
+            "17-self-checks.png",
             "failed-marker-00-warmup.png",
         ] {
             let _ = std::fs::remove_file(evidence.join(name));
@@ -5066,6 +5232,9 @@ impl RealPixelAcceptance {
             })
             .build(tree(app, window), root)
             .expect("real-pixel marker");
+        let replay_on = app.signal(false);
+        let status_on = app.signal(false);
+        let activated: Rc<RefCell<Option<SmolStr>>> = Rc::new(RefCell::new(None));
         let chain_menu = Menu::new(
             app,
             theme.clone(),
@@ -5086,8 +5255,148 @@ impl RealPixelAcceptance {
                         )),
                     ],
                 )),
+                MenuEntry::Submenu(MenuSubmenu::new(
+                    "二级B",
+                    [MenuEntry::Action(MenuAction::new("sibling", "兄弟项"))],
+                )),
             ],
             MenuOptions::default(),
+        );
+        let activated_for_menu = Rc::clone(&activated);
+        let status_for_activate = status_on;
+        let chain_menu = chain_menu.on_activate(move |app, activation: MenuActivation| {
+            *activated_for_menu.borrow_mut() = Some(activation.id);
+            app.write(&status_for_activate, true);
+        });
+        let menu_for_trigger = chain_menu.clone();
+        let interact_trigger =
+            Button::new(app, theme.clone(), "gallery.real-pixel:interact-trigger")
+                .label("菜单触发")
+                .on_click(move |ctx| {
+                    let window = ctx.window();
+                    let node = ctx.node();
+                    let app = ctx.app_mut();
+                    let _ =
+                        menu_for_trigger.open(app, window, ui_core::popup::Anchor::Node { node });
+                })
+                .build(app, window, root)
+                .expect("real-pixel interact trigger");
+        tree(app, window)
+            .set_layout_override(
+                interact_trigger,
+                Some(ui_core::layout::LayoutOverride::new(LogicalRect::new(
+                    px(REAL_PIXEL_INTERACT_TRIGGER.0),
+                    px(REAL_PIXEL_INTERACT_TRIGGER.1),
+                    px(REAL_PIXEL_INTERACT_TRIGGER.2),
+                    px(REAL_PIXEL_INTERACT_TRIGGER.3),
+                ))),
+            )
+            .expect("real-pixel interact trigger placement");
+        let replay_rect = LogicalRect::new(
+            px(REAL_PIXEL_INTERACT_REPLAY.0),
+            px(REAL_PIXEL_INTERACT_REPLAY.1),
+            px(REAL_PIXEL_INTERACT_REPLAY.2),
+            px(REAL_PIXEL_INTERACT_REPLAY.3),
+        );
+        let replay_action = Action::Custom(SmolStr::new_static("gallery.real-pixel:replay"));
+        let replay_signal = replay_on;
+        let replay_node = NodeBuilder::boxed()
+            .id("gallery.real-pixel:replay")
+            .layout_override(replay_rect)
+            .on_click(replay_action.clone())
+            .bind_style(move |cx| StylePatch {
+                background: Some(if *cx.read(&replay_signal) {
+                    Color::from_rgba8([0x3C, 0x8C, 0x48, 0xFF])
+                } else {
+                    Color::from_rgba8([0x5C, 0x2A, 0x2A, 0xFF])
+                }),
+                ..StylePatch::default()
+            })
+            .build(tree(app, window), root)
+            .expect("real-pixel replay target");
+        let replay_signal_for_action = replay_on;
+        app.on_action(replay_action, move |ctx| {
+            let next = !*ctx.read(&replay_signal_for_action);
+            ctx.write(&replay_signal_for_action, next);
+        });
+        let status_rect = LogicalRect::new(
+            px(REAL_PIXEL_INTERACT_STATUS.0),
+            px(REAL_PIXEL_INTERACT_STATUS.1),
+            px(REAL_PIXEL_INTERACT_STATUS.2),
+            px(REAL_PIXEL_INTERACT_STATUS.3),
+        );
+        let status_signal = status_on;
+        let status_node = NodeBuilder::boxed()
+            .id("gallery.real-pixel:status")
+            .layout_override(status_rect)
+            .bind_style(move |cx| StylePatch {
+                background: Some(if *cx.read(&status_signal) {
+                    Color::from_rgba8([0x3C, 0x6C, 0x9C, 0xFF])
+                } else {
+                    Color::from_rgba8([0x2A, 0x2E, 0x36, 0xFF])
+                }),
+                ..StylePatch::default()
+            })
+            .build(tree(app, window), root)
+            .expect("real-pixel status box");
+        let viewport_style = StyleBuilder::new()
+            .absolute()
+            .left(px(REAL_PIXEL_SCROLL_VIEWPORT.0))
+            .top(px(REAL_PIXEL_SCROLL_VIEWPORT.1))
+            .size(
+                px(REAL_PIXEL_SCROLL_VIEWPORT.2),
+                px(REAL_PIXEL_SCROLL_VIEWPORT.3),
+            )
+            .overflow_hidden()
+            .build();
+        let scroll_viewport = NodeBuilder::boxed()
+            .id("gallery.real-pixel:scroll")
+            .style(viewport_style)
+            .build(tree(app, window), root)
+            .expect("real-pixel scroll viewport");
+        let scroll_content = NodeBuilder::boxed()
+            .id("gallery.real-pixel:scroll-content")
+            .style(
+                StyleBuilder::new()
+                    .size(
+                        px(REAL_PIXEL_SCROLL_VIEWPORT.2),
+                        px(REAL_PIXEL_SCROLL_CONTENT_H),
+                    )
+                    .build(),
+            )
+            .build(tree(app, window), scroll_viewport)
+            .expect("real-pixel scroll content");
+        let scroll_anchor = NodeBuilder::boxed()
+            .id("gallery.real-pixel:scroll-anchor")
+            .layout_override(LogicalRect::new(
+                px(REAL_PIXEL_SCROLL_ANCHOR.0),
+                px(REAL_PIXEL_SCROLL_ANCHOR.1),
+                px(REAL_PIXEL_SCROLL_ANCHOR.2),
+                px(REAL_PIXEL_SCROLL_ANCHOR.3),
+            ))
+            .paint(PaintSpec {
+                background: Color::from_rgba8([0x24, 0x8A, 0x9A, 0xFF]),
+                ..PaintSpec::default()
+            })
+            .build(tree(app, window), scroll_content)
+            .expect("real-pixel scroll anchor");
+        app.make_scroll(window, scroll_viewport, ScrollConfig::default())
+            .expect("real-pixel scroll setup");
+        let scroll_panel = PopupPanel::new(
+            app,
+            theme.clone(),
+            "gallery.real-pixel:scroll-panel",
+            PopupPanelOptions::new(PopupSurface::menu(), PanelWidth::Exact(px(140.0))),
+        );
+        let scroll_handle = app
+            .scroll_handle(window, scroll_viewport)
+            .expect("real-pixel scroll handle");
+        let _ = app.set_scroll_content(
+            &scroll_handle,
+            LogicalSize::new(
+                px(REAL_PIXEL_SCROLL_VIEWPORT.2),
+                px(REAL_PIXEL_SCROLL_CONTENT_H),
+            ),
         );
         let dialog_theme = theme.clone();
         let dialog = DialogBuilder::new("真实窗口像素验收")
@@ -5137,6 +5446,15 @@ impl RealPixelAcceptance {
             report: Rc::new(RefCell::new(report)),
             baseline: Rc::new(RefCell::new(None)),
             theme,
+            interact_trigger,
+            replay_node,
+            status_node,
+            scroll_viewport,
+            scroll_anchor,
+            scroll_panel,
+            replay_on,
+            status_on,
+            activated,
         }
     }
 
@@ -5198,12 +5516,14 @@ impl RealPixelAcceptance {
             .window(self.window)
             .map_or(0, |target| target.frame_index().get());
         let now = Instant::now();
+        let stage_now = self.report.borrow().stage;
         let stale_logical = {
             let baseline = self.baseline.borrow();
             baseline
                 .as_ref()
                 .map(|baseline| baseline.logical)
                 .filter(|logical| *logical != window_size)
+                .filter(|_| !real_pixel_allows_resize(stage_now))
         };
         if let Some(baseline_logical) = stale_logical {
             let mut report = self.report.borrow_mut();
@@ -5270,6 +5590,13 @@ impl RealPixelAcceptance {
             return false;
         }
         if report.stage == RealPixelStage::MenuOpening && !self.advance_menu(app, &mut report, now)
+        {
+            drop(report);
+            self.finish(app);
+            return false;
+        }
+        if real_pixel_interaction_stage(report.stage)
+            && !self.advance_interaction(app, &mut report, now)
         {
             drop(report);
             self.finish(app);
@@ -5362,6 +5689,497 @@ impl RealPixelAcceptance {
         }
     }
 
+    fn dispatch_pointer(&self, app: &mut App, point: LogicalPoint) {
+        let _ = app.dispatch_input_tracked_for_test(
+            self.window,
+            InputEvent::pointer_move(point, Modifiers::empty()),
+        );
+    }
+
+    fn dispatch_click(&self, app: &mut App, point: LogicalPoint) {
+        self.dispatch_pointer(app, point);
+        let _ = app.dispatch_input_tracked_for_test(
+            self.window,
+            InputEvent::pointer_down(point, PointerButton::Primary, Modifiers::empty()),
+        );
+        let _ = app.dispatch_input_tracked_for_test(
+            self.window,
+            InputEvent::pointer_up(point, PointerButton::Primary, Modifiers::empty()),
+        );
+    }
+
+    fn dispatch_key(&self, app: &mut App, code: KeyCode) {
+        let _ = app.dispatch_input_tracked_for_test(
+            self.window,
+            InputEvent::key_down(code, Modifiers::empty()),
+        );
+        let _ = app.dispatch_input_tracked_for_test(
+            self.window,
+            InputEvent::key_up(code, Modifiers::empty()),
+        );
+    }
+
+    fn interact_trigger_rect(&self, app: &App) -> LogicalRect {
+        app.window(self.window)
+            .and_then(|target| target.node_screen_rect(self.interact_trigger))
+            .unwrap_or_else(|| {
+                LogicalRect::new(
+                    px(REAL_PIXEL_INTERACT_TRIGGER.0),
+                    px(REAL_PIXEL_INTERACT_TRIGGER.1),
+                    px(REAL_PIXEL_INTERACT_TRIGGER.2),
+                    px(REAL_PIXEL_INTERACT_TRIGGER.3),
+                )
+            })
+    }
+
+    fn interact_entries(&self, app: &App) -> Vec<ui_core::popup::PopupSnapshotEntry> {
+        real_pixel_stack_entries(app, self.window)
+    }
+
+    fn scroll_handle(&self, app: &App) -> Option<ui_core::interaction::ScrollHandle> {
+        app.scroll_handle(self.window, self.scroll_viewport)
+    }
+
+    fn scroll_offset(&self, app: &App) -> Option<LogicalPoint> {
+        let handle = self.scroll_handle(app)?;
+        app.scroll_state(&handle).map(|state| state.offset)
+    }
+
+    fn advance_interaction(
+        &self,
+        app: &mut App,
+        report: &mut RealPixelReport,
+        now: Instant,
+    ) -> bool {
+        let stage = report.stage;
+        if stage == RealPixelStage::InteractSelfChecks {
+            return true;
+        }
+        let gated = report.interact_at.is_some_and(|at| {
+            now.duration_since(at) < Duration::from_millis(REAL_PIXEL_INTERACT_STEP_MS)
+        });
+        if gated {
+            return true;
+        }
+        let trigger_rect = self.interact_trigger_rect(app);
+        let entries = self.interact_entries(app);
+        let rects: Vec<LogicalRect> = entries.iter().map(|entry| entry.paint_rect).collect();
+        match (stage, report.interact_step) {
+            (RealPixelStage::InteractPointerOpen, 0) => {
+                report.interact_root_node = None;
+                report.interact_root_rect = None;
+                report.interact_level2_node = None;
+                report.interact_level2_rect = None;
+                report.interact_sibling_node = None;
+                report.interact_sibling_rect = None;
+                report.interact_open_content = None;
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+                self.dispatch_click(app, real_pixel_rect_center(trigger_rect));
+            }
+            (RealPixelStage::InteractHover, 0) => {
+                let Some(root) = rects.first().copied() else {
+                    return true;
+                };
+                let point = real_pixel_row_point(root, self.chain_menu.row_count(), 2);
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+                self.dispatch_pointer(app, point);
+            }
+
+            (RealPixelStage::InteractSafeTriangle, 0) => {
+                if rects.len() < 2 {
+                    return true;
+                }
+                let root = rects[0];
+                let level2 = rects[1];
+                report.interact_level2_rect = Some(level2);
+                let row3 = real_pixel_row_point(root, self.chain_menu.row_count(), 3);
+                let triangle = LogicalPoint::new(px(level2.origin.x.value() - 3.0), row3.y);
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+                self.dispatch_pointer(app, triangle);
+            }
+            (RealPixelStage::InteractSafeTriangle, 1) => {
+                let held = rects.len() == 2;
+                report.record(
+                    held,
+                    "safe-triangle-holds",
+                    format_smolstr!(
+                        "斜向移动进入 safe triangle 后不得关闭二级：stack={} rects={rects:?}",
+                        rects.len()
+                    ),
+                );
+                let Some(level2) = report.interact_level2_rect else {
+                    return false;
+                };
+                let point = real_pixel_row_point(level2, 2, 1);
+                report.interact_step = 2;
+                report.interact_at = Some(now);
+                self.dispatch_pointer(app, point);
+            }
+            (RealPixelStage::InteractSibling, 0) => {
+                let Some(root) = rects.first().copied() else {
+                    return true;
+                };
+                let row3 = real_pixel_row_point(root, self.chain_menu.row_count(), 3);
+                let point = LogicalPoint::new(px(root.origin.x.value() + 8.0), row3.y);
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+                self.dispatch_pointer(app, point);
+            }
+            (RealPixelStage::InteractSibling, 1) => {
+                let sibling = rects
+                    .get(1)
+                    .copied()
+                    .zip(entries.get(1))
+                    .map(|(rect, entry)| (entry.node, rect));
+                if let Some((node, rect)) = sibling
+                    && report.interact_level2_node != Some(node)
+                {
+                    report.interact_sibling_node = Some(node);
+                    report.interact_sibling_rect = Some(rect);
+                    report.interact_step = 2;
+                    report.interact_at = Some(now);
+                }
+            }
+            (RealPixelStage::InteractEscape, 0) => {
+                report.record(
+                    rects.len() == 2,
+                    "escape-before",
+                    format_smolstr!("逐层 Esc 起点应为 2 层，实际 stack={}", rects.len()),
+                );
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+                self.dispatch_key(app, KeyCode::Escape);
+            }
+            (RealPixelStage::InteractEscape, 1) => {
+                let after_first = rects.len();
+                report.record(
+                    after_first == 1,
+                    "escape-level1",
+                    format_smolstr!(
+                        "第一次 Esc 只关闭最上层（剩根菜单），实际 stack={after_first}"
+                    ),
+                );
+                report.interact_step = 2;
+                report.interact_at = Some(now);
+                self.dispatch_key(app, KeyCode::Escape);
+            }
+            (RealPixelStage::InteractEscape, 2) => {
+                let after_second = rects.len();
+                report.record(
+                    after_second == 0,
+                    "escape-level2",
+                    format_smolstr!("第二次 Esc 关闭根菜单，实际 stack={after_second}"),
+                );
+                report.interact_step = 3;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractOutsideReplay, 0) => {
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+                self.dispatch_click(app, real_pixel_rect_center(trigger_rect));
+            }
+            (RealPixelStage::InteractOutsideReplay, 1) => {
+                if rects.len() != 1 {
+                    return true;
+                }
+                let replay_rect = LogicalRect::new(
+                    px(REAL_PIXEL_INTERACT_REPLAY.0),
+                    px(REAL_PIXEL_INTERACT_REPLAY.1),
+                    px(REAL_PIXEL_INTERACT_REPLAY.2),
+                    px(REAL_PIXEL_INTERACT_REPLAY.3),
+                );
+                report.interact_step = 2;
+                report.interact_at = Some(now);
+                self.dispatch_click(app, real_pixel_rect_center(replay_rect));
+            }
+            (RealPixelStage::InteractOutsideReplay, 2) => {
+                let replay_on = app.read_with(&self.replay_on, |value| *value);
+                report.record(
+                    rects.is_empty() && !self.chain_menu.is_open(app) && replay_on,
+                    "outside-replay",
+                    format_smolstr!(
+                        "外部按下关闭整链并 Replay 到背景控件：stack={} menu_open={} replay_on={replay_on}",
+                        rects.len(),
+                        self.chain_menu.is_open(app)
+                    ),
+                );
+                report.interact_step = 3;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractKeyboard, 0) => {
+                let mut tabs = 0u8;
+                let mut focused = app.focused(self.window);
+                while focused != Some(self.interact_trigger) && tabs < 8 {
+                    self.dispatch_key(app, KeyCode::Tab);
+                    tabs = tabs.saturating_add(1);
+                    focused = app.focused(self.window);
+                }
+                report.record(
+                    focused == Some(self.interact_trigger),
+                    "keyboard-tab-focus",
+                    format_smolstr!("Tab×{tabs} 后焦点={focused:?} 期望 Some(interact_trigger)"),
+                );
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+                self.dispatch_key(app, KeyCode::Enter);
+            }
+            (RealPixelStage::InteractKeyboard, 1) => {
+                if rects.len() != 1 {
+                    return true;
+                }
+                let before = self.chain_menu.highlighted(app);
+                self.dispatch_key(app, KeyCode::ArrowDown);
+                let after = self.chain_menu.highlighted(app);
+                report.interact_highlighted = after;
+                report.record(
+                    after.is_some() && after != before,
+                    "keyboard-arrow-highlight",
+                    format_smolstr!("方向键移动高亮：{before:?} -> {after:?}"),
+                );
+                report.interact_step = 2;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractKeyboard, 2) => {
+                report.interact_step = 3;
+                report.interact_at = Some(now);
+                self.dispatch_key(app, KeyCode::Enter);
+            }
+            (RealPixelStage::InteractKeyboard, 3) => {
+                let activation = self.activated.borrow().clone();
+                report.interact_activation = activation.clone();
+                let status_on = app.read_with(&self.status_on, |value| *value);
+                report.record(
+                    activation.as_deref() == Some("second") && status_on && rects.is_empty(),
+                    "keyboard-enter-activate",
+                    format_smolstr!(
+                        "Enter 激活第二项并关闭菜单：activation={activation:?} status_on={status_on} stack={}",
+                        rects.len()
+                    ),
+                );
+                report.interact_step = 4;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractResizeBaseline, 0) => {
+                let anchor = ui_core::popup::Anchor::WindowRect(LogicalRect::new(
+                    px(900.0),
+                    px(600.0),
+                    px(1.0),
+                    px(1.0),
+                ));
+                let _ = self.chain_menu.open(app, self.window, anchor);
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractResizeBaseline, 1) => {
+                if rects.len() != 1 {
+                    return true;
+                }
+                report.resize_root_rect = rects.first().copied();
+                let closed = self.chain_menu.close(app);
+                report.record(
+                    closed,
+                    "resize-preopen",
+                    format_smolstr!(
+                        "缩放前用 WindowRect(900,600) 锚点打开并记录弹层 rect={:?}，关闭={closed}",
+                        report.resize_root_rect
+                    ),
+                );
+                report.interact_step = 2;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractResizeBaseline, 2) => {
+                let target = LogicalSize::new(px(REAL_PIXEL_RESIZE_W), px(REAL_PIXEL_RESIZE_H));
+                if let Some(window) = app.window_mut(self.window) {
+                    window.set_size(target);
+                }
+                let _ = app.request_repaint(self.window);
+                report.interact_step = 3;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractResizeBaseline, 3) => {
+                let size = app.window(self.window).map(|window| window.size());
+                let target_ok = size.is_some_and(|size| {
+                    (size.width.value() - REAL_PIXEL_RESIZE_W).abs() < 0.5
+                        && (size.height.value() - REAL_PIXEL_RESIZE_H).abs() < 0.5
+                });
+                if !target_ok {
+                    return true;
+                }
+                let anchor = ui_core::popup::Anchor::WindowRect(LogicalRect::new(
+                    px(900.0),
+                    px(600.0),
+                    px(1.0),
+                    px(1.0),
+                ));
+                let _ = self.chain_menu.open(app, self.window, anchor);
+                report.interact_step = 4;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractResizeBaseline, 4) => {
+                if rects.len() != 1 {
+                    return true;
+                }
+                let new_rect = rects[0];
+                let reanchored = report.resize_root_rect.is_some_and(|old| {
+                    new_rect != old
+                        && new_rect.origin.x.value() > old.origin.x.value() + 40.0
+                        && new_rect.origin.x.value() + new_rect.size.width.value()
+                            <= REAL_PIXEL_RESIZE_W + 0.5
+                        && new_rect.origin.y.value() + new_rect.size.height.value()
+                            <= REAL_PIXEL_RESIZE_H + 0.5
+                });
+                report.record(
+                    reanchored,
+                    "resize-reanchor",
+                    format_smolstr!(
+                        "窗口逻辑尺寸 960x720→1120x840 后同一 WindowRect(900,600) 锚点弹层必须重新定位且在新窗口内：old={:?} new={}",
+                        report.resize_root_rect,
+                        real_pixel_rect_detail(new_rect)
+                    ),
+                );
+                let closed = self.chain_menu.close(app);
+                report.record(
+                    closed,
+                    "resize-close-call",
+                    format_smolstr!("缩放断言后关闭菜单 -> {closed}"),
+                );
+                report.interact_step = 5;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractResizeBaseline, 5) => {
+                let original = self
+                    .baseline
+                    .borrow()
+                    .as_ref()
+                    .map(|baseline| baseline.logical);
+                if let Some(original) = original
+                    && let Some(window) = app.window_mut(self.window)
+                {
+                    window.set_size(original);
+                }
+                let _ = app.request_repaint(self.window);
+                report.interact_step = 6;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractResizeBaseline, 6) => {
+                let restored = self.baseline.borrow().as_ref().is_some_and(|baseline| {
+                    app.window(self.window)
+                        .is_some_and(|window| window.size() == baseline.logical)
+                });
+                if !restored {
+                    return true;
+                }
+                report.record(
+                    true,
+                    "resize-restored",
+                    SmolStr::new_static(
+                        "窗口逻辑尺寸已恢复；resize 断言不截屏（宿主不把内部分辨率变化同步到原生窗口），像素一致性由后续 scroll/self-check 阶段证明",
+                    ),
+                );
+                let frame = app
+                    .window(self.window)
+                    .map_or(0, |window| window.frame_index().get());
+                self.advance(app, report, RealPixelStage::InteractScrollOpen, frame);
+                return true;
+            }
+            (RealPixelStage::InteractScrollOpen, 0) => {
+                let spec = ui_core::popup::PopupSpec::new(
+                    ui_core::popup::Anchor::Node {
+                        node: self.scroll_anchor,
+                    },
+                    ui_core::popup::PlacementSpec::default(),
+                );
+                let opened = self
+                    .scroll_panel
+                    .open(app, self.window, spec, |app, window, body| {
+                        let Some(target) = app.window_mut(window) else {
+                            return Err(ui_core::error::EngineError::UnknownWindow { window });
+                        };
+                        let tree = target.tree_mut();
+                        NodeBuilder::boxed()
+                            .style(StyleBuilder::new().size(px(120.0), px(80.0)).build())
+                            .paint(PaintSpec {
+                                background: Color::from_rgba8([0x2C, 0x5C, 0x86, 0xFF]),
+                                ..PaintSpec::default()
+                            })
+                            .build(tree, body)?;
+                        Ok(())
+                    });
+                report.record(
+                    opened.is_ok(),
+                    "scroll-open-call",
+                    format_smolstr!("滚动锚点打开通用 PopupPanel：{opened:?}"),
+                );
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractScrollOpen, 1) => {
+                if rects.len() != 1 {
+                    return true;
+                }
+                report.scroll_rect = Some(rects[0]);
+                let Some(handle) = self.scroll_handle(app) else {
+                    report.record(
+                        false,
+                        "scroll-handle",
+                        SmolStr::new_static("缺少 scroll handle"),
+                    );
+                    return false;
+                };
+                let _ = app.scroll_by(
+                    &handle,
+                    LogicalPoint::new(px(0.0), px(REAL_PIXEL_SCROLL_DELTA)),
+                );
+                report.interact_step = 2;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractScrollOpen, 2) => {
+                let Some(before) = report.scroll_rect else {
+                    return true;
+                };
+                let Some(after) = rects.first().copied() else {
+                    return true;
+                };
+                let delta = after.origin.y.value() - before.origin.y.value();
+                report.scroll_delta = delta;
+                let offset = self
+                    .scroll_offset(app)
+                    .map_or(0.0, |offset| offset.y.value());
+                report.record(
+                    delta.abs() > 1.0
+                        && (delta.abs() - REAL_PIXEL_SCROLL_DELTA).abs() <= 6.0
+                        && offset > 1.0,
+                    "scroll-reanchor",
+                    format_smolstr!(
+                        "滚动 {REAL_PIXEL_SCROLL_DELTA} px 后通用弹层跟随锚点：Δy={delta:.1} offset_y={offset:.1} before={} after={}",
+                        real_pixel_rect_detail(before),
+                        real_pixel_rect_detail(after)
+                    ),
+                );
+                report.interact_step = 3;
+                report.interact_at = Some(now);
+            }
+            (RealPixelStage::InteractScrollRestore, 0) => {
+                if let Some(handle) = self.scroll_handle(app) {
+                    let _ = app.scroll_to(&handle, LogicalPoint::ZERO);
+                }
+                let closed = self.scroll_panel.close(app);
+                report.record(
+                    closed,
+                    "scroll-close-call",
+                    format_smolstr!("滚动还原并关闭通用弹层 -> {closed}"),
+                );
+                report.interact_step = 1;
+                report.interact_at = Some(now);
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn stage_ready(&self, app: &App, report: &RealPixelReport, now: Instant, frame: u32) -> bool {
         let Some(issued) = report.stage_issued else {
             return false;
@@ -5386,6 +6204,45 @@ impl RealPixelAcceptance {
             RealPixelStage::PickerClosing
             | RealPixelStage::MenuClosing
             | RealPixelStage::DialogClosing => real_pixel_stack_empty(app, self.window),
+            RealPixelStage::InteractPointerOpen => {
+                report.interact_step >= 1 && real_pixel_stack_ready(app, self.window, 1)
+            }
+            RealPixelStage::InteractHover => real_pixel_stack_ready(app, self.window, 2),
+            RealPixelStage::InteractSafeTriangle => {
+                report.interact_step >= 2 && real_pixel_stack_ready(app, self.window, 3)
+            }
+            RealPixelStage::InteractSibling => {
+                report.interact_step >= 2 && real_pixel_stack_ready(app, self.window, 2)
+            }
+            RealPixelStage::InteractEscape => {
+                report.interact_step >= 3 && real_pixel_stack_empty(app, self.window)
+            }
+            RealPixelStage::InteractOutsideReplay => {
+                report.interact_step >= 3
+                    && real_pixel_stack_empty(app, self.window)
+                    && app.read_with(&self.replay_on, |value| *value)
+            }
+            RealPixelStage::InteractKeyboard => {
+                report.interact_step >= 4
+                    && real_pixel_stack_empty(app, self.window)
+                    && app.read_with(&self.status_on, |value| *value)
+            }
+            RealPixelStage::InteractResizeBaseline => false,
+            RealPixelStage::InteractScrollOpen => {
+                report.interact_step >= 3
+                    && real_pixel_stack_ready(app, self.window, 1)
+                    && self
+                        .scroll_offset(app)
+                        .is_some_and(|offset| offset.y.value() > 1.0)
+            }
+            RealPixelStage::InteractScrollRestore => {
+                report.interact_step >= 1
+                    && real_pixel_stack_empty(app, self.window)
+                    && self
+                        .scroll_offset(app)
+                        .is_none_or(|offset| offset.y.value().abs() < 0.5)
+            }
+            RealPixelStage::InteractSelfChecks => true,
         }
     }
 
@@ -5393,6 +6250,7 @@ impl RealPixelAcceptance {
         let _ = self.picker.sync(app);
         let _ = self.chain_menu.sync(app);
         let _ = self.dialog.sync(app);
+        let _ = self.scroll_panel.sync(app);
     }
 
     fn sync_layout(&self, app: &mut App) {
@@ -5412,6 +6270,7 @@ impl RealPixelAcceptance {
             let _ =
                 tree.set_layout_override(node, Some(ui_core::layout::LayoutOverride::new(full)));
         }
+        let _ = app.request_repaint(self.window);
     }
 
     fn screenshot(&self, stage: RealPixelStage) -> Result<RgbaImage, SmolStr> {
@@ -5440,6 +6299,9 @@ impl RealPixelAcceptance {
         report.stage_issued = Some(Instant::now());
         report.stage_frame = frame;
         report.wait = RealPixelWait::Idle;
+        report.interact_step = 0;
+        report.interact_at = None;
+        report.marker_retries = 0;
         let _ = app.request_repaint(self.window);
     }
 
@@ -5485,13 +6347,43 @@ impl RealPixelAcceptance {
         let expected_w = (logical.width.value() * dpr).round().max(1.0) as u32;
         let expected_h = (logical.height.value() * dpr).round().max(1.0) as u32;
         let started = Instant::now();
-        let shot = match self.screenshot(stage) {
+        let mut shot = match self.screenshot(stage) {
             Ok(shot) => shot,
             Err(error) => {
                 report.record(false, "screenshot", error);
                 return false;
             }
         };
+        let mut attempts = 0u8;
+        while attempts < REAL_PIXEL_CAPTURE_RETRIES {
+            let found =
+                real_pixel_detect_marker(&shot, expected_w, expected_h, RealPixelTone::Full)
+                    .is_some()
+                    || (stage == RealPixelStage::DialogOpening
+                        && real_pixel_detect_marker(
+                            &shot,
+                            expected_w,
+                            expected_h,
+                            RealPixelTone::Scrim,
+                        )
+                        .is_some());
+            if found {
+                break;
+            }
+            attempts = attempts.saturating_add(1);
+            report.note(format_smolstr!(
+                "stage={stage:?} 截图未得到完整标记框（合成撕裂/窗口被遮挡），重试 #{attempts}/{REAL_PIXEL_CAPTURE_RETRIES}"
+            ));
+            std::thread::sleep(Duration::from_millis(REAL_PIXEL_CAPTURE_RETRY_MS));
+            let _ = app.request_repaint(self.window);
+            match self.screenshot(stage) {
+                Ok(next) => shot = next,
+                Err(error) => {
+                    report.record(false, "screenshot", error);
+                    return false;
+                }
+            }
+        }
         report.screen = shot.dimensions();
         report.window_logical = logical;
         report.dpi = dpr;
@@ -5526,6 +6418,15 @@ impl RealPixelAcceptance {
         let marker = match marker {
             Some(marker) => Some(marker),
             None => {
+                if real_pixel_allows_resize(stage) && report.marker_retries < 8 {
+                    report.marker_retries = report.marker_retries.saturating_add(1);
+                    report.note(format_smolstr!(
+                        "stage={stage:?} 标记尚未按新窗口尺寸出现，重试截图 #{}/8",
+                        report.marker_retries
+                    ));
+                    report.stage_frame = frame;
+                    return true;
+                }
                 let fallback = if stage == RealPixelStage::DialogOpening {
                     self.baseline
                         .borrow()
@@ -6311,15 +7212,559 @@ impl RealPixelAcceptance {
                     &content,
                 );
                 self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractPointerOpen, frame);
+                true
+            }
+            RealPixelStage::InteractPointerOpen => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    marker.origin == baseline.origin && marker.size == baseline.size,
+                    "interact-marker-stable",
+                    format_smolstr!("origin={:?} size={:?}", marker.origin, marker.size),
+                );
+                let entries = self.interact_entries(app);
+                report.record(
+                    entries.len() == 1
+                        && entries
+                            .first()
+                            .is_some_and(|entry| entry.state == ui_core::popup::PopupState::Open),
+                    "interact-open-stack",
+                    format_smolstr!(
+                        "真实指针点击触发器后 popup 栈应有 1 条 Open，实际 {:?}",
+                        entries
+                            .iter()
+                            .map(|entry| (entry.state, entry.tier))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+                report.record(
+                    self.chain_menu.is_open(app),
+                    "interact-open-menu",
+                    SmolStr::new_static(
+                        "Menu::is_open 必须为 true（指针点击打开，而非程序化 open_submenu）",
+                    ),
+                );
+                if let Some(entry) = entries.first() {
+                    report.interact_root_node = Some(entry.node);
+                    report.interact_root_rect = Some(entry.paint_rect);
+                    report.record(
+                        real_pixel_contained(baseline, entry.paint_rect),
+                        "interact-open-in-window",
+                        real_pixel_rect_detail(entry.paint_rect),
+                    );
+                    real_pixel_visibility_check(
+                        report,
+                        "interact-open-visible",
+                        baseline,
+                        &content,
+                        entry.paint_rect,
+                        REAL_PIXEL_INTERACT_PERMILLE,
+                    );
+                }
+                report.interact_open_content = Some(content.clone());
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractHover, frame);
+                true
+            }
+            RealPixelStage::InteractHover => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                let entries = self.interact_entries(app);
+                report.record(
+                    entries.len() == 2
+                        && entries
+                            .iter()
+                            .all(|entry| entry.state == ui_core::popup::PopupState::Open),
+                    "hover-opens-submenu",
+                    format_smolstr!(
+                        "指针悬停二级行后应 hover 打开子菜单（stack=2），实际 {:?}",
+                        entries.iter().map(|entry| entry.state).collect::<Vec<_>>()
+                    ),
+                );
+                report.record(
+                    entries.len() == 2
+                        && entries[1].parent == Some(entries[0].id)
+                        && entries[0].z < entries[1].z,
+                    "hover-parent-chain",
+                    format_smolstr!(
+                        "parents={:?} z={:?}",
+                        entries.iter().map(|entry| entry.parent).collect::<Vec<_>>(),
+                        entries.iter().map(|entry| entry.z).collect::<Vec<_>>()
+                    ),
+                );
+                let highlighted = self.chain_menu.highlighted(app);
+                report.record(
+                    highlighted == Some(2),
+                    "hover-row-highlight",
+                    format_smolstr!("悬停行高亮应为二级行 2，实际 {highlighted:?}"),
+                );
+                if let Some(entry) = entries.get(1) {
+                    report.interact_level2_node = Some(entry.node);
+                    report.interact_level2_rect = Some(entry.paint_rect);
+                    real_pixel_visibility_check(
+                        report,
+                        "hover-level2-visible",
+                        baseline,
+                        &content,
+                        entry.paint_rect,
+                        REAL_PIXEL_INTERACT_PERMILLE,
+                    );
+                }
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractSafeTriangle, frame);
+                true
+            }
+            RealPixelStage::InteractSafeTriangle => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                let entries = self.interact_entries(app);
+                report.record(
+                    entries.len() == 3
+                        && entries
+                            .iter()
+                            .all(|entry| entry.state == ui_core::popup::PopupState::Open),
+                    "safe-triangle-level3",
+                    format_smolstr!(
+                        "安全三角内斜向移动到三级行后应保持 3 层并打开三级，实际 {} 层",
+                        entries.len()
+                    ),
+                );
+                report.record(
+                    entries.len() == 3
+                        && entries[2].parent == Some(entries[1].id)
+                        && entries[1].parent == Some(entries[0].id),
+                    "safe-triangle-chain",
+                    format_smolstr!(
+                        "parents={:?}",
+                        entries.iter().map(|entry| entry.parent).collect::<Vec<_>>()
+                    ),
+                );
+                if let Some(entry) = entries.get(2) {
+                    real_pixel_visibility_check(
+                        report,
+                        "safe-triangle-level3-visible",
+                        baseline,
+                        &content,
+                        entry.paint_rect,
+                        REAL_PIXEL_INTERACT_PERMILLE,
+                    );
+                }
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractSibling, frame);
+                true
+            }
+            RealPixelStage::InteractSibling => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                let entries = self.interact_entries(app);
+                let sibling = entries.get(1).map(|entry| (entry.node, entry.paint_rect));
+                report.record(
+                    entries.len() == 2,
+                    "sibling-stack",
+                    format_smolstr!(
+                        "兄弟行替换后应保持 2 层（根+新二级），实际 {}",
+                        entries.len()
+                    ),
+                );
+                let replaced =
+                    sibling.is_some_and(|(node, _)| Some(node) != report.interact_level2_node);
+                report.record(
+                    replaced,
+                    "sibling-replaced",
+                    format_smolstr!(
+                        "旧二级 node={:?} 新二级 node={:?}",
+                        report.interact_level2_node,
+                        sibling.map(|(node, _)| node)
+                    ),
+                );
+                if let Some((node, rect)) = sibling {
+                    report.interact_sibling_node = Some(node);
+                    report.interact_sibling_rect = Some(rect);
+                    real_pixel_visibility_check(
+                        report,
+                        "sibling-visible",
+                        baseline,
+                        &content,
+                        rect,
+                        REAL_PIXEL_INTERACT_PERMILLE,
+                    );
+                }
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractEscape, frame);
+                true
+            }
+            RealPixelStage::InteractEscape => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    real_pixel_stack_entries(app, self.window).is_empty(),
+                    "escape-stack-empty",
+                    SmolStr::new_static("逐层 Esc 后 popup 栈必须为空"),
+                );
+                report.record(
+                    !self.chain_menu.is_open(app),
+                    "escape-menu-closed",
+                    SmolStr::new_static("逐层 Esc 后 Menu::is_open 必须为 false"),
+                );
+                real_pixel_content_residue_check(
+                    report,
+                    "interact-close-residue",
+                    baseline,
+                    &content,
+                );
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractOutsideReplay, frame);
+                true
+            }
+            RealPixelStage::InteractOutsideReplay => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    real_pixel_stack_entries(app, self.window).is_empty()
+                        && !self.chain_menu.is_open(app),
+                    "outside-close",
+                    SmolStr::new_static("外部点击后 popup 栈为空且菜单关闭"),
+                );
+                let replay_on = app.read_with(&self.replay_on, |value| *value);
+                report.interact_replay_on = replay_on;
+                report.record(
+                    replay_on,
+                    "outside-replay-signal",
+                    format_smolstr!("Replay 到背景控件后 replay_on 必须为 true，实际 {replay_on}"),
+                );
+                let replay_rect = LogicalRect::new(
+                    px(REAL_PIXEL_INTERACT_REPLAY.0),
+                    px(REAL_PIXEL_INTERACT_REPLAY.1),
+                    px(REAL_PIXEL_INTERACT_REPLAY.2),
+                    px(REAL_PIXEL_INTERACT_REPLAY.3),
+                );
+                if let Some(region) = real_pixel_map_rect(baseline, replay_rect, 2) {
+                    let (diff, permille) = real_pixel_region_change(
+                        &baseline.content,
+                        &content,
+                        region,
+                        REAL_PIXEL_OPEN_TOLERANCE,
+                    );
+                    report.record(
+                        permille >= REAL_PIXEL_INTERACT_PERMILLE
+                            && diff.max_delta >= REAL_PIXEL_VISIBLE_DELTA,
+                        "outside-replay-visible",
+                        format_smolstr!(
+                            "Replay 背景控件区域必须可见变化：changed={permille}‰ max_delta={}",
+                            diff.max_delta
+                        ),
+                    );
+                }
+                let mut exclusions: Vec<RealPixelRegion> = Vec::new();
+                if let Some(region) = report.trigger_exclude {
+                    exclusions.push(region);
+                }
+                for node in [
+                    self.interact_trigger,
+                    self.replay_node,
+                    self.status_node,
+                    self.scroll_viewport,
+                ] {
+                    if let Some(region) =
+                        real_pixel_node_region(baseline, app, self.window, node, 4)
+                    {
+                        exclusions.push(region);
+                    }
+                }
+                let inner = real_pixel_content_inner_region(baseline);
+                let diff = real_pixel_compare_multi(
+                    &baseline.content,
+                    &content,
+                    inner,
+                    REAL_PIXEL_RESIDUE_TOLERANCE,
+                    &exclusions,
+                );
+                report.record(
+                    diff.differing == 0,
+                    "outside-close-residue",
+                    format_smolstr!(
+                        "外部点击关闭后除背景控件外不得有残影：compared={} differing={} max_delta={}",
+                        diff.compared,
+                        diff.differing,
+                        diff.max_delta
+                    ),
+                );
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractKeyboard, frame);
+                true
+            }
+            RealPixelStage::InteractKeyboard => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    real_pixel_stack_entries(app, self.window).is_empty()
+                        && !self.chain_menu.is_open(app),
+                    "keyboard-menu-closed",
+                    SmolStr::new_static("键盘 Enter 激活条目后菜单必须关闭"),
+                );
+                let status_on = app.read_with(&self.status_on, |value| *value);
+                report.interact_status_on = status_on;
+                let activation = self.activated.borrow().clone();
+                report.record(
+                    status_on && activation.as_deref().is_some(),
+                    "keyboard-activation-signal",
+                    format_smolstr!("激活回调 status_on={status_on} activation={activation:?}"),
+                );
+                let status_rect = LogicalRect::new(
+                    px(REAL_PIXEL_INTERACT_STATUS.0),
+                    px(REAL_PIXEL_INTERACT_STATUS.1),
+                    px(REAL_PIXEL_INTERACT_STATUS.2),
+                    px(REAL_PIXEL_INTERACT_STATUS.3),
+                );
+                if let Some(region) = real_pixel_map_rect(baseline, status_rect, 2) {
+                    let (diff, permille) = real_pixel_region_change(
+                        &baseline.content,
+                        &content,
+                        region,
+                        REAL_PIXEL_OPEN_TOLERANCE,
+                    );
+                    report.record(
+                        permille >= REAL_PIXEL_INTERACT_PERMILLE
+                            && diff.max_delta >= REAL_PIXEL_VISIBLE_DELTA,
+                        "keyboard-status-visible",
+                        format_smolstr!(
+                            "键盘激活后的状态块必须可见变化：changed={permille}‰ max_delta={}",
+                            diff.max_delta
+                        ),
+                    );
+                }
+                let mut exclusions: Vec<RealPixelRegion> = Vec::new();
+                if let Some(region) = report.trigger_exclude {
+                    exclusions.push(region);
+                }
+                for node in [
+                    self.interact_trigger,
+                    self.replay_node,
+                    self.status_node,
+                    self.scroll_viewport,
+                ] {
+                    if let Some(region) =
+                        real_pixel_node_region(baseline, app, self.window, node, 4)
+                    {
+                        exclusions.push(region);
+                    }
+                }
+                let inner = real_pixel_content_inner_region(baseline);
+                let diff = real_pixel_compare_multi(
+                    &baseline.content,
+                    &content,
+                    inner,
+                    REAL_PIXEL_RESIDUE_TOLERANCE,
+                    &exclusions,
+                );
+                report.record(
+                    diff.differing == 0,
+                    "keyboard-close-residue",
+                    format_smolstr!(
+                        "键盘路径关闭后除状态块外不得有残影：compared={} differing={} max_delta={}",
+                        diff.compared,
+                        diff.differing,
+                        diff.max_delta
+                    ),
+                );
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractResizeBaseline, frame);
+                true
+            }
+            RealPixelStage::InteractScrollOpen => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                let entries = self.interact_entries(app);
+                report.record(
+                    entries.len() == 1,
+                    "scroll-open-stack",
+                    format_smolstr!("滚动锚点打开菜单 stack={}", entries.len()),
+                );
+                if let Some(entry) = entries.first() {
+                    real_pixel_visibility_check(
+                        report,
+                        "scroll-open-visible",
+                        baseline,
+                        &content,
+                        entry.paint_rect,
+                        REAL_PIXEL_INTERACT_PERMILLE,
+                    );
+                }
+                report.record(
+                    report.scroll_delta.abs() > 1.0,
+                    "scroll-delta-recorded",
+                    format_smolstr!("滚动后弹层 Δy={:.1}", report.scroll_delta),
+                );
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractScrollRestore, frame);
+                true
+            }
+            RealPixelStage::InteractScrollRestore => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                report.record(
+                    real_pixel_stack_entries(app, self.window).is_empty(),
+                    "scroll-close-stack-empty",
+                    SmolStr::new_static("滚动还原并关闭菜单后 popup 栈必须为空"),
+                );
+                report.record(
+                    self.scroll_offset(app)
+                        .is_none_or(|offset| offset.y.value().abs() < 0.5),
+                    "scroll-restored",
+                    format_smolstr!("滚动偏移必须回到 0：{:?}", self.scroll_offset(app)),
+                );
+                let mut exclusions: Vec<RealPixelRegion> = Vec::new();
+                if let Some(region) = report.trigger_exclude {
+                    exclusions.push(region);
+                }
+                for node in [self.replay_node, self.status_node] {
+                    if let Some(region) =
+                        real_pixel_node_region(baseline, app, self.window, node, 4)
+                    {
+                        exclusions.push(region);
+                    }
+                }
+                let inner = real_pixel_content_inner_region(baseline);
+                let diff = real_pixel_compare_multi(
+                    &baseline.content,
+                    &content,
+                    inner,
+                    REAL_PIXEL_RESIDUE_TOLERANCE,
+                    &exclusions,
+                );
+                report.record(
+                    diff.differing == 0,
+                    "scroll-close-residue",
+                    format_smolstr!(
+                        "滚动还原后除持久状态块外内容必须与原始基线一致：differing={} max_delta={}",
+                        diff.differing,
+                        diff.max_delta
+                    ),
+                );
+                self.save_evidence(report, stage, &content);
+                self.advance(app, report, RealPixelStage::InteractSelfChecks, frame);
+                true
+            }
+            RealPixelStage::InteractSelfChecks => {
+                let baseline_guard = self.baseline.borrow();
+                let Some(baseline) = baseline_guard.as_ref() else {
+                    report.record(false, "baseline", SmolStr::new_static("baseline 缺失"));
+                    return false;
+                };
+                let static_reject = report.interact_root_rect.is_some_and(|rect| {
+                    !real_pixel_visible_change(
+                        baseline,
+                        &baseline.content,
+                        rect,
+                        REAL_PIXEL_INTERACT_PERMILLE,
+                    )
+                });
+                report.record(
+                    static_reject,
+                    "self-check-visible-static",
+                    SmolStr::new_static(
+                        "未变化的基线当作“打开”输入时可见性检测器必须判红（避免恒真）",
+                    ),
+                );
+                let residue_detected = report.interact_open_content.as_ref().is_some_and(|open| {
+                    let inner = real_pixel_content_inner_region(baseline);
+                    real_pixel_compare(
+                        &baseline.content,
+                        open,
+                        inner,
+                        REAL_PIXEL_RESIDUE_TOLERANCE,
+                        None,
+                    )
+                    .differing
+                        > 0
+                });
+                report.record(
+                    residue_detected,
+                    "self-check-residue-open",
+                    SmolStr::new_static(
+                        "把“打开帧”当作关闭残影输入时残影检测器必须判红（differing>0）",
+                    ),
+                );
+                let entries = real_pixel_stack_entries(app, self.window);
+                let level_ok = |expected: usize| {
+                    entries.len() == expected
+                        && entries
+                            .iter()
+                            .all(|entry| entry.state == ui_core::popup::PopupState::Open)
+                };
+                report.record(
+                    !level_ok(1) && level_ok(0),
+                    "self-check-level-count",
+                    format_smolstr!(
+                        "层数断言必须区分 0/1：实际 {} 层，错误期望 1 -> {}, 正确期望 0 -> {}",
+                        entries.len(),
+                        level_ok(1),
+                        level_ok(0)
+                    ),
+                );
+                let replay_rect = LogicalRect::new(
+                    px(REAL_PIXEL_INTERACT_REPLAY.0),
+                    px(REAL_PIXEL_INTERACT_REPLAY.1),
+                    px(REAL_PIXEL_INTERACT_REPLAY.2),
+                    px(REAL_PIXEL_INTERACT_REPLAY.3),
+                );
+                let replay_static = real_pixel_map_rect(baseline, replay_rect, 2).map(|region| {
+                    let (diff, permille) = real_pixel_region_change(
+                        &baseline.content,
+                        &baseline.content,
+                        region,
+                        REAL_PIXEL_OPEN_TOLERANCE,
+                    );
+                    (permille, diff.compared, diff.differing, diff.max_delta)
+                });
+                let static_ok = replay_static
+                    .is_some_and(|(permille, _, _, _)| permille < REAL_PIXEL_INTERACT_PERMILLE);
+                report.record(
+                    static_ok,
+                    "self-check-replay-static",
+                    format_smolstr!(
+                        "未变化的背景控件区域不得被判定为 Replay 可见变化：stat={replay_static:?}"
+                    ),
+                );
+                self.save_evidence(report, stage, &content);
                 self.advance(app, report, RealPixelStage::Done, frame);
                 true
             }
+            RealPixelStage::InteractResizeBaseline => true,
             RealPixelStage::Done => true,
         }
     }
 
     fn finish(&self, app: &mut App) {
-        {
+        let pass = {
             let mut report = self.report.borrow_mut();
             if report.completed {
                 return;
@@ -6349,9 +7794,12 @@ impl RealPixelAcceptance {
                 report.build_profile,
                 report.evidence.display()
             );
-        }
+            report.completed && report.failures.is_empty() && !report.report_write_failed
+        };
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         app.close_window(self.window);
         app.handle().wake();
+        std::process::exit(if pass { 0 } else { 3 });
     }
 
     fn final_report(&self) -> bool {
@@ -6426,6 +7874,28 @@ fn real_pixel_write_report(report: &RealPixelReport) -> Result<(), String> {
         text,
         "residue_rule=tolerance {REAL_PIXEL_RESIDUE_TOLERANCE}, coverage>={REAL_PIXEL_COVERAGE_PERMILLE}permille, trigger-exclusion {REAL_PIXEL_TRIGGER_MARGIN}px"
     );
+    let _ = writeln!(
+        text,
+        "interact_root_rect={:?} level2_rect={:?} sibling_rect={:?}",
+        report.interact_root_rect, report.interact_level2_rect, report.interact_sibling_rect
+    );
+    let _ = writeln!(
+        text,
+        "interact_activation={:?} highlighted={:?} replay_on={} status_on={}",
+        report.interact_activation,
+        report.interact_highlighted,
+        report.interact_replay_on,
+        report.interact_status_on
+    );
+    let _ = writeln!(
+        text,
+        "resize_root_rect={:?} scroll_delta={:.1}",
+        report.resize_root_rect, report.scroll_delta
+    );
+    let _ = writeln!(
+        text,
+        "resize_note=anchor re-anchor is asserted via popup rects after logical resize; the embedded host does not propagate Window::set_size to the native window, so no resize screenshot is taken and pixel restoration is proven by the following scroll/self-check frames"
+    );
     let _ = writeln!(text, "checks={}", report.checks);
     let _ = writeln!(text, "failures={}", report.failures.len());
     let result = if report.completed && report.failures.is_empty() && !report.report_write_failed {
@@ -6437,7 +7907,7 @@ fn real_pixel_write_report(report: &RealPixelReport) -> Result<(), String> {
     let _ = writeln!(text, "evidence_dir={}", report.evidence.display());
     let _ = writeln!(
         text,
-        "evidence_layout=<evidence_dir>/00-warmup.png,00-baseline.png,01-picker-open.png,02-picker-closed.png,03-menu-open.png,04-menu-closed.png,05-dialog-open.png,06-dialog-closed.png,report.txt,run.log"
+        "evidence_layout=<evidence_dir>/00-warmup.png,00-baseline.png,01-picker-open.png,02-picker-closed.png,03-menu-open.png,04-menu-closed.png,05-dialog-open.png,06-dialog-closed.png,07-interact-open.png,08-interact-hover.png,09-interact-safe-triangle.png,10-interact-sibling.png,11-interact-esc-closed.png,12-interact-outside-replay.png,13-interact-keyboard.png,15-scroll-reanchored.png,16-scroll-restored.png,17-self-checks.png,report.txt,run.log"
     );
     for line in &report.lines {
         let _ = writeln!(text, "{line}");
@@ -6471,7 +7941,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !acceptance.final_report() {
             std::process::exit(3);
         }
-        return Ok(());
+        std::process::exit(0);
     }
     let gallery = Gallery::build(&mut app, flags);
     println!(
@@ -6544,5 +8014,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if failed {
         std::process::exit(3);
     }
-    Ok(())
+    std::process::exit(0)
 }

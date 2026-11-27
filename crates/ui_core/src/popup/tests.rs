@@ -11,7 +11,7 @@ use crate::{
     popup::{
         Anchor, DismissPolicy, FocusPolicy, MAX_POPUP_DEPTH, MAX_POPUP_ENTRIES, PlacementSpec,
         PopupA11y, PopupAnimation, PopupDirty, PopupEntry, PopupError, PopupId, PopupStack,
-        PopupState, PopupTier, ZPolicy,
+        PopupState, PopupTier,
     },
     window::WindowId,
 };
@@ -126,23 +126,6 @@ fn opening_popups_keeps_a_strictly_increasing_z_order() {
 }
 
 #[test]
-fn opening_above_an_existing_popup_shifts_the_entries_above_it() {
-    let (mut tree, mut stack) = empty_stack();
-    let first = push_popup(&mut tree, &mut stack, 1, PopupTier::Auto, None);
-    let second = push_popup(&mut tree, &mut stack, 2, PopupTier::Auto, None);
-    let third = push_popup(&mut tree, &mut stack, 3, PopupTier::Auto, None);
-
-    let inserted = stack.reserve_z(ZPolicy::Above(first)).expect("z");
-    let above = push_popup(&mut tree, &mut stack, inserted, PopupTier::Hint, None);
-
-    assert_eq!(z_of(&stack, first), 1);
-    assert_eq!(z_of(&stack, above), 2);
-    assert_eq!(z_of(&stack, second), 3);
-    assert_eq!(z_of(&stack, third), 4);
-    assert_eq!(stack.order(), &[first, above, second, third]);
-}
-
-#[test]
 fn slots_from_other_windows_and_unknown_slots_are_rejected() {
     let (mut tree, mut stack) = empty_stack();
     let id = push_popup(&mut tree, &mut stack, 1, PopupTier::Auto, None);
@@ -239,28 +222,9 @@ fn raising_moves_the_popup_and_its_children_above_everything() {
 #[test]
 fn a_scrim_pair_reserves_two_consecutive_z_values() {
     let (mut _tree, mut stack) = empty_stack();
-    let (scrim, modal) = stack.reserve_z_pair(ZPolicy::Newest).expect("pair");
+    let (scrim, modal) = stack.reserve_z_pair();
     assert_eq!(scrim + 1, modal);
     assert_eq!(stack.next_z(), modal + 1);
-
-    let missing = PopupId::new(test_window(), u32::MAX, 1);
-    assert!(matches!(
-        stack.reserve_z_pair(ZPolicy::Above(missing)),
-        Err(PopupError::UnknownPopup { id }) if id == missing
-    ));
-}
-
-#[test]
-fn reserve_z_pair_above_keeps_the_pair_consecutive() {
-    let (mut tree, mut stack) = empty_stack();
-    let first = push_popup(&mut tree, &mut stack, 1, PopupTier::Auto, None);
-    let second = push_popup(&mut tree, &mut stack, 2, PopupTier::Auto, None);
-
-    let (scrim, modal) = stack.reserve_z_pair(ZPolicy::Above(first)).expect("pair");
-
-    assert_eq!(modal, scrim + 1);
-    assert_eq!(z_of(&stack, first), 1);
-    assert_eq!(z_of(&stack, second), modal + 1);
 }
 
 #[test]

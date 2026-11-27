@@ -913,7 +913,7 @@ fn closing_animation_blocks_hit_immediately_then_removes_the_node() {
     let content = popup_node(&app, id);
     let stack = app.app().popup_stack(win(&app)).expect("stack");
     assert_eq!(stack.entries.len(), 1, "关闭动画期间节点保留");
-    assert_eq!(stack.entries[0].state, PopupState::DismissPending);
+    assert_eq!(stack.entries[0].state, PopupState::Closing);
     assert_ne!(
         app.probe()
             .hit(point(
@@ -1347,7 +1347,7 @@ fn escape_skips_closing_entries_and_closes_the_next_open_level() {
             .find(|entry| entry.id == second)
             .expect("second")
             .state,
-        PopupState::DismissPending
+        PopupState::Closing
     );
     let (_, consumed) = escape(&mut app);
     assert!(consumed, "第二次 Esc 必须跳过 Closing 并关闭下一层");
@@ -1360,7 +1360,7 @@ fn escape_skips_closing_entries_and_closes_the_next_open_level() {
             .find(|entry| entry.id == first)
             .expect("first")
             .state,
-        PopupState::DismissPending
+        PopupState::Closing
     );
 }
 
@@ -1810,7 +1810,7 @@ fn programmatic_begin_close_animates_the_fade_and_removes_after_it() {
             .begin_close_popup(id, DismissReason::Programmatic)
             .expect("begin close")
     );
-    assert_eq!(app.app().popup_state(id), Some(PopupState::DismissPending));
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Closing));
     assert!(
         app.app().popup_rect(id).is_some(),
         "Closing 事务必须保留节点/几何"
@@ -1855,7 +1855,7 @@ fn begin_close_is_idempotent_while_the_transaction_runs() {
             .expect("second")
     );
     assert_eq!(calls.get(), 1, "重复 begin_close 不得再次回调 on_dismiss");
-    assert_eq!(app.app().popup_state(id), Some(PopupState::DismissPending));
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Closing));
     app.advance(Duration::from_millis(95));
     frame(&mut app);
     assert!(app.app().popup_rect(id).is_none());
@@ -2006,23 +2006,6 @@ fn restore_opener_walks_to_the_nearest_focusable_ancestor() {
         app.app().focused(window),
         Some(outer),
         "不可聚焦 opener 必须回落到最近可聚焦祖先"
-    );
-}
-
-#[test]
-fn restore_root_fallback_clears_the_focus() {
-    let mut app = TestApp::new();
-    let window = win(&app);
-    let first = root_button(&mut app, (100.0, 30.0), "first");
-    let second = root_button(&mut app, (100.0, 30.0), "second");
-    frame(&mut app);
-    assert!(app.app_mut().set_focus(window, Some(first)));
-    let id = open_take_for_restore(&mut app, first, second, RestoreFocus::RootFallback);
-    app.app_mut().close_popup(id).expect("close");
-    assert_eq!(
-        app.app().focused(window),
-        None,
-        "RootFallback 必须把焦点交还 root"
     );
 }
 
@@ -2370,7 +2353,7 @@ fn a_modal_scrim_covers_the_full_viewport_and_damages_it() {
     );
     assert_eq!(
         app.app().popup_state(scrim),
-        Some(PopupState::DismissPending),
+        Some(PopupState::Closing),
         "scrim 与 modal 同帧进入关闭"
     );
     app.advance(Duration::from_millis(95));
@@ -2482,48 +2465,6 @@ fn parent_close_emits_parent_closed_for_children() {
 }
 
 #[test]
-fn escape_close_chain_policy_closes_the_whole_chain() {
-    let mut app = TestApp::new();
-    let window = win(&app);
-    let mut first_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
-    first_spec.animation = PopupAnimation::Fade;
-    let first = open_sized(&mut app, first_spec, (120.0, 160.0), None);
-    frame(&mut app);
-    let root_node = popup_node(&app, first);
-    let item = {
-        let tree = app.app_mut().window_mut(window).expect("window");
-        NodeBuilder::boxed()
-            .style(StyleBuilder::new().size(px(120.0), px(24.0)).build())
-            .build(tree.tree_mut(), root_node)
-            .expect("item")
-    };
-    frame(&mut app);
-    let mut second_spec = base_spec(Anchor::Node { node: item });
-    second_spec.parent = Some(first);
-    second_spec.placement = menu_placement();
-    second_spec.animation = PopupAnimation::Fade;
-    second_spec.dismiss = DismissPolicy::Chain {
-        outside: ui_core::popup::OutsidePress::Replay,
-        escape: EscapePolicy::CloseChain,
-        anchor_lost: true,
-        focus_lost: true,
-    };
-    let second = open_sized(&mut app, second_spec, (80.0, 60.0), None);
-    frame(&mut app);
-    let (_, consumed) = escape(&mut app);
-    assert!(consumed);
-    assert_eq!(
-        app.app().popup_state(first),
-        Some(PopupState::DismissPending),
-        "CloseChain 必须真实关闭整链（非 CloseTopmost）"
-    );
-    assert_eq!(
-        app.app().popup_state(second),
-        Some(PopupState::DismissPending)
-    );
-}
-
-#[test]
 fn pressing_the_opener_while_closing_cancels_the_close() {
     let mut app = TestApp::new();
     let trigger = root_button(&mut app, (100.0, 30.0), "trigger");
@@ -2544,7 +2485,7 @@ fn pressing_the_opener_while_closing_cancels_the_close() {
     frame(&mut app);
     let (_, consumed) = escape(&mut app);
     assert!(consumed);
-    assert_eq!(app.app().popup_state(id), Some(PopupState::DismissPending));
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Closing));
     let (_, down_consumed) = press(&mut app, point(20.0, 10.0));
     assert!(down_consumed, "Closing 中命中 opener 必须取消关闭并消费");
     let (_, _) = release(&mut app, point(20.0, 10.0));
@@ -3033,66 +2974,6 @@ fn popup_stack_rects_are_finite_and_respect_z_and_scope_invariants() {
 }
 
 #[test]
-fn invalid_z_policy_open_leaves_no_residue_and_next_open_works() {
-    let mut app = TestApp::new();
-    let window = win(&app);
-    let first = open_sized(
-        &mut app,
-        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
-        (120.0, 80.0),
-        None,
-    );
-    frame(&mut app);
-    app.app_mut().close_popup(first).expect("close first");
-    let popup_root = app.app().popup_stack(window).expect("stack").root;
-    let children_before = app
-        .app()
-        .window(window)
-        .expect("window")
-        .tree()
-        .get(popup_root)
-        .expect("popup root")
-        .children()
-        .len();
-    let stale = first;
-    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
-    spec.z = ui_core::popup::ZPolicy::Above(stale);
-    let failed = app
-        .app_mut()
-        .open_popup(window, spec, |_app, _window, _node| Ok(()), None);
-    assert!(failed.is_err(), "stale ZPolicy::Above 必须返回错误");
-    let children_after = app
-        .app()
-        .window(window)
-        .expect("window")
-        .tree()
-        .get(popup_root)
-        .expect("popup root")
-        .children()
-        .len();
-    assert_eq!(
-        children_before, children_after,
-        "open 失败不得在 popup root 留下孤儿节点"
-    );
-    let recovered = open_sized(
-        &mut app,
-        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
-        (120.0, 80.0),
-        None,
-    );
-    frame(&mut app);
-    let rect = app.app().popup_rect(recovered).expect("rect").hit;
-    let center = point(
-        (rect.origin.x + 10.0).value(),
-        (rect.origin.y + 10.0).value(),
-    );
-    assert!(
-        app.probe().hit(center).is_some(),
-        "失败后下一次 open 必须正常"
-    );
-}
-
-#[test]
 fn a_modal_blocks_new_hints_until_it_closes() {
     let mut app = TestApp::new();
     let window = win(&app);
@@ -3540,7 +3421,7 @@ fn dismiss_topmost_runs_the_closing_transaction() {
     );
     assert_eq!(
         app.app().popup_state(id),
-        Some(PopupState::DismissPending),
+        Some(PopupState::Closing),
         "程序化 dismiss 必须走 Closing 事务而不是立即删节点"
     );
     assert!(app.app().popup_rect(id).is_some());
@@ -4108,7 +3989,7 @@ fn a_closing_modal_swallows_background_presses_until_it_is_removed() {
     );
     assert_eq!(
         app.app().popup_state(modal),
-        Some(PopupState::DismissPending),
+        Some(PopupState::Closing),
         "关闭开始即进入 DismissPending"
     );
     let center = point(100.0, 20.0);
@@ -4239,10 +4120,7 @@ fn a_nested_modal_escape_sequence_closes_topmost_then_the_parent() {
     );
     let (_, consumed) = escape(&mut app);
     assert!(consumed, "Esc 必须关闭最上层 modal");
-    assert_eq!(
-        app.app().popup_state(inner),
-        Some(PopupState::DismissPending)
-    );
+    assert_eq!(app.app().popup_state(inner), Some(PopupState::Closing));
     assert_eq!(
         app.app().popup_state(outer),
         Some(PopupState::Open),
@@ -4264,10 +4142,7 @@ fn a_nested_modal_escape_sequence_closes_topmost_then_the_parent() {
     );
     let (_, consumed) = escape(&mut app);
     assert!(consumed, "父 modal 必须能被下一次 Esc 关闭");
-    assert_eq!(
-        app.app().popup_state(outer),
-        Some(PopupState::DismissPending)
-    );
+    assert_eq!(app.app().popup_state(outer), Some(PopupState::Closing));
     let (_, down) = press(&mut app, center);
     assert!(down, "父 modal 淡出期背景按下必须被吞");
     let (_, up) = release(&mut app, center);
@@ -4321,13 +4196,10 @@ fn closing_the_lower_modal_cascades_and_keeps_input_blocked_until_all_leave() {
             .begin_close_popup(outer, DismissReason::Programmatic)
             .expect("begin close")
     );
-    assert_eq!(
-        app.app().popup_state(outer),
-        Some(PopupState::DismissPending)
-    );
+    assert_eq!(app.app().popup_state(outer), Some(PopupState::Closing));
     assert_eq!(
         app.app().popup_state(child),
-        Some(PopupState::DismissPending),
+        Some(PopupState::Closing),
         "modal 关闭必须级联其内容链"
     );
     let center = point(100.0, 20.0);
@@ -5612,7 +5484,7 @@ fn fade_scale_close_reverses_the_scale_and_keeps_damage_local() {
             .begin_close_popup(id, DismissReason::Programmatic)
             .expect("begin close")
     );
-    assert_eq!(app.app().popup_state(id), Some(PopupState::DismissPending));
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Closing));
     app.advance(Duration::from_millis(45));
     frame(&mut app);
     let scale = popup_snapshot(&app, id).paint_scale;
@@ -6212,4 +6084,174 @@ fn fade_scale_scales_glyph_runs_and_images_in_animation_frames() {
         image_node.1
     );
     assert!(!app.frame_record().damage_full, "scale 动画帧不得整帧重绘");
+}
+
+#[test]
+fn an_ignored_outside_press_is_consumed_and_never_reaches_the_background() {
+    let mut app = TestApp::new();
+    let _background = root_button(&mut app, (300.0, 300.0), "background");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("background"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(600.0, 500.0, 20.0, 20.0))),
+        (60.0, 30.0),
+        Some(Box::new(|_app, dismiss| {
+            assert_eq!(dismiss.reason, DismissReason::OutsidePress);
+            DismissOutcome::Ignore
+        })),
+    );
+    frame(&mut app);
+    let center = point(100.0, 100.0);
+    let (_, down_consumed) = press(&mut app, center);
+    assert!(
+        down_consumed,
+        "safe triangle/grace 内 Ignore 必须 Consume，不得把按下 replay 给背景"
+    );
+    let (_, up_consumed) = release(&mut app, center);
+    assert!(up_consumed, "Ignore 的按下必须同时吞掉抬起");
+    assert_eq!(hits.get(), 0, "背景控件不得收到 Ignore 的 click");
+    assert!(app.app().popup_rect(id).is_some(), "Ignore 不得关闭 popup");
+}
+
+#[test]
+fn an_ignored_outside_press_does_not_drop_the_popup_or_leave_it_stuck() {
+    let mut app = TestApp::new();
+    let _background = root_button(&mut app, (300.0, 300.0), "background");
+    frame(&mut app);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(600.0, 500.0, 20.0, 20.0))),
+        (60.0, 30.0),
+        Some(Box::new(|_app, dismiss| {
+            if dismiss.reason == DismissReason::OutsidePress {
+                DismissOutcome::Ignore
+            } else {
+                DismissOutcome::Close
+            }
+        })),
+    );
+    frame(&mut app);
+    let center = point(100.0, 100.0);
+    press(&mut app, center);
+    release(&mut app, center);
+    assert_eq!(
+        app.app().popup_state(id),
+        Some(PopupState::Open),
+        "Ignore 后 popup 必须保持 Open 且可继续交互"
+    );
+    assert!(
+        app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .expect("close")
+    );
+    frame(&mut app);
+    assert!(
+        app.app().popup_rect(id).is_none(),
+        "Ignore 不得破坏后续正常关闭"
+    );
+}
+
+#[test]
+fn a_non_modal_take_popup_tabs_out_to_the_main_tree_instead_of_wrapping() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let second = root_button(&mut app, (100.0, 30.0), "second");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let mut spec = base_spec(Anchor::WindowRect(rect(400.0, 400.0, 20.0, 20.0)));
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Previous,
+    };
+    let popup = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            |app, window, node| {
+                for action in ["a", "b"] {
+                    NodeBuilder::boxed()
+                        .style(StyleBuilder::new().size(px(100.0), px(30.0)).build())
+                        .on_click(Action::custom(action))
+                        .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                }
+                Ok(())
+            },
+            None,
+        )
+        .expect("take popup");
+    frame(&mut app);
+    let a = app.app().focused(window).expect("take focus");
+    assert_ne!(a, first, "Take 必须取走主树焦点");
+    app.app_mut().focus_next(window);
+    let b = app.app().focused(window).expect("second popup focusable");
+    assert_ne!(b, a);
+    app.app_mut().focus_next(window);
+    assert_eq!(
+        app.app().focused(window),
+        Some(second),
+        "非 Trap popup 的 Tab 到边界必须跳到主树下一个可聚焦（打开前焦点之后）"
+    );
+    assert_eq!(
+        app.app().popup_state(popup),
+        Some(PopupState::Open),
+        "Tab 跳出不得关闭 popup"
+    );
+    app.app_mut().focus_prev(window);
+    assert_eq!(
+        app.app().focused(window),
+        Some(first),
+        "焦点已在主树后 Shift+Tab 继续主树顺序"
+    );
+}
+
+#[test]
+fn a_non_modal_take_popup_shift_tab_escapes_backwards() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let second = root_button(&mut app, (100.0, 30.0), "second");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let mut spec = base_spec(Anchor::WindowRect(rect(400.0, 400.0, 20.0, 20.0)));
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Previous,
+    };
+    let popup = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            |app, window, node| {
+                for action in ["a", "b"] {
+                    NodeBuilder::boxed()
+                        .style(StyleBuilder::new().size(px(100.0), px(30.0)).build())
+                        .on_click(Action::custom(action))
+                        .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                }
+                Ok(())
+            },
+            None,
+        )
+        .expect("take popup");
+    frame(&mut app);
+    let a = app.app().focused(window).expect("take focus");
+    app.app_mut().focus_prev(window);
+    assert_ne!(
+        app.app().focused(window),
+        Some(a),
+        "Shift+Tab 必须离开 popup scope"
+    );
+    assert_eq!(
+        app.app().popup_state(popup),
+        Some(PopupState::Open),
+        "Shift+Tab 跳出不得关闭 popup"
+    );
+    let _ = second;
 }

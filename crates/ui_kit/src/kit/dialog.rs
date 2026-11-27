@@ -1758,14 +1758,14 @@ mod tests {
         harness.escape();
         assert_eq!(
             dialog.state(harness.app.app()),
-            Some(PopupState::DismissPending),
-            "Esc 进入关闭事务（淡出期间不可命中）"
+            Some(PopupState::Closing),
+            "Esc 进入关闭事务（Closing 淡出期间不可命中）"
         );
         assert!(
             !dialog
                 .state(harness.app.app())
                 .is_some_and(PopupState::is_dismissable),
-            "DismissPending 不再可作为 dismiss 目标"
+            "Closing 不再可作为 dismiss 目标"
         );
         assert!(harness.tree_has(node), "淡出期间节点仍在");
         assert!(dialog.is_closing(harness.app.app()));

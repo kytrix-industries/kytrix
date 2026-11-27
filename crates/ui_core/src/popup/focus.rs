@@ -89,7 +89,6 @@ fn restore_target(snapshot: FocusSnapshot, tree: &NodeTree) -> Option<NodeId> {
             Some(opener) if alive(opener) => focus::nearest_focusable(tree, opener),
             _ => snapshot.node.filter(|node| alive(*node)),
         },
-        RestoreFocus::RootFallback => None,
     }
 }
 
@@ -287,4 +286,53 @@ pub(crate) fn next_in_popup_scope(
         }
     }
     None
+}
+
+pub(crate) fn next_in_owner_scope(
+    app: &App,
+    window: WindowId,
+    from: Option<NodeId>,
+    backwards: bool,
+) -> Option<NodeId> {
+    let target = app.window(window)?;
+    let stack = target.popups();
+    let tree = target.tree();
+    let (owner, _) = stack.focus_owner()?;
+    let candidate = |node: &NodeId| {
+        stack.node_in_focus_scope(tree, *node, owner) && focus::focusable(tree, *node)
+    };
+    let order = tree.dfs_ids();
+    let start = from.and_then(|from| order.iter().position(|node| *node == from))?;
+    if backwards {
+        order[..start].iter().rev().copied().find(candidate)
+    } else {
+        order[start + 1..].iter().copied().find(candidate)
+    }
+}
+
+pub(crate) fn leave_owner_scope(
+    app: &mut App,
+    window: WindowId,
+    backwards: bool,
+) -> Option<NodeId> {
+    let anchor = {
+        let target = app.window(window)?;
+        let stack = target.popups();
+        let (owner, _) = stack.focus_owner()?;
+        stack.focus_record(owner).and_then(|record| record.node)
+    };
+    let previous = app_focus::focused(app, window);
+    let next = {
+        let target = app.window(window)?;
+        let tree = target.tree();
+        anchor
+            .filter(|node| tree.get(*node).is_ok())
+            .and_then(|anchor| focus::next_focusable(tree, Some(anchor), backwards))
+    };
+    if let Some(target) = app.window_mut(window) {
+        target.popups_mut().set_focus_owner(None);
+        target.focus_mut().set(next);
+    }
+    app_focus::apply_effective_focus(app, window, previous, next);
+    next
 }

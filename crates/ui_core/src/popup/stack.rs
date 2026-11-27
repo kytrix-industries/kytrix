@@ -7,7 +7,7 @@ use crate::{
     popup::{
         FocusSnapshot, MAX_POPUP_DEPTH, MAX_POPUP_ENTRIES, PopupAnimationState, PopupDiagnostic,
         PopupDirty, PopupDismissHandler, PopupEntry, PopupError, PopupFocusState, PopupId,
-        PopupStack, PopupState, PopupTier, ZPolicy,
+        PopupStack, PopupState, PopupTier,
     },
     window::WindowId,
 };
@@ -194,35 +194,17 @@ impl PopupStack {
         std::mem::take(&mut self.dirty)
     }
 
-    pub(crate) fn reserve_z(&mut self, policy: ZPolicy) -> Result<u64, PopupError> {
-        match policy {
-            ZPolicy::Newest => {
-                let z = self.next_z;
-                self.next_z = self.next_z.saturating_add(1);
-                Ok(z)
-            }
-            ZPolicy::Above(id) => {
-                let below = self.entry(id)?.z;
-                Ok(self.reserve_above(below))
-            }
-        }
+    pub(crate) fn reserve_z(&mut self) -> u64 {
+        let z = self.next_z;
+        self.next_z = self.next_z.saturating_add(1);
+        z
     }
 
-    pub(crate) fn reserve_z_pair(&mut self, policy: ZPolicy) -> Result<(u64, u64), PopupError> {
-        match policy {
-            ZPolicy::Newest => {
-                let scrim = self.next_z;
-                let modal = self.next_z.saturating_add(1);
-                self.next_z = modal.saturating_add(1);
-                Ok((scrim, modal))
-            }
-            ZPolicy::Above(id) => {
-                let below = self.entry(id)?.z;
-                let scrim = self.reserve_above(below);
-                let modal = self.reserve_above(scrim);
-                Ok((scrim, modal))
-            }
-        }
+    pub(crate) fn reserve_z_pair(&mut self) -> (u64, u64) {
+        let scrim = self.next_z;
+        let modal = self.next_z.saturating_add(1);
+        self.next_z = modal.saturating_add(1);
+        (scrim, modal)
     }
 
     pub(crate) fn raise(&mut self, id: PopupId) -> Result<u64, PopupError> {
@@ -265,18 +247,6 @@ impl PopupStack {
             order: true,
         });
         Ok(base)
-    }
-
-    fn reserve_above(&mut self, below: u64) -> u64 {
-        let z = below.saturating_add(1);
-        for slot in self.entries.iter_mut().flatten() {
-            if slot.z >= z {
-                slot.z = slot.z.saturating_add(1);
-            }
-        }
-        self.next_z = self.next_z.max(z.saturating_add(1));
-        self.sort_order();
-        z
     }
 
     pub(crate) fn insert(
@@ -565,6 +535,15 @@ impl PopupStack {
             .iter()
             .position(|(existing, _)| *existing == id)?;
         Some(focus.records.remove(index).1)
+    }
+
+    #[must_use]
+    pub(crate) fn focus_record(&self, id: PopupId) -> Option<&FocusSnapshot> {
+        self.focus()
+            .records
+            .iter()
+            .find(|(existing, _)| *existing == id)
+            .map(|(_, snapshot)| snapshot)
     }
 
     #[must_use]

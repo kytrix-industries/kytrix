@@ -331,6 +331,7 @@ fn a_failed_write_should_keep_the_dialog_and_what_was_typed() {
 
     harness.press(KeyCode::Escape);
     harness.settle(3);
+    harness.advance(200);
     confirm_dialog(&mut harness);
 
     assert!(

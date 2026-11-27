@@ -6,7 +6,13 @@ use i18n::t_smol;
 use ui_core::event::{Action, KeyCode};
 use ui_kit::theme::appearance::Appearance as ThemeAppearance;
 
-use crate::{session::SettingsWriteError, settings_tests::test_support::Harness};
+use crate::{
+    session::SettingsWriteError,
+    settings_tests::{
+        test_support::Harness,
+        venues::{alert_is_open, click_alert},
+    },
+};
 
 fn appearance_key(key: &str) -> String {
     format!("{key}.appearance.appearance")
@@ -93,6 +99,26 @@ fn a_write_that_cannot_be_stored_should_be_reported_over_the_page() {
     assert!(
         !harness.has_write_failure(),
         "the reason should be taken out of the session once it was reported"
+    );
+    assert!(
+        alert_is_open(&harness),
+        "the report should be an alert the user can read"
+    );
+
+    click_alert(&mut harness, "ok");
+
+    assert!(
+        !alert_is_open(&harness),
+        "the report's confirm control closes it"
+    );
+    assert!(
+        !harness.has_text(harness.root(), title.as_str()),
+        "a closed report leaves no title behind"
+    );
+    assert_eq!(
+        harness.popup_total(),
+        0,
+        "the closed report leaves neither a dialog nor a scrim in the popup stack"
     );
 }
 

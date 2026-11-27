@@ -97,6 +97,8 @@ const TYPEAHEAD_KEYS: [(KeyCode, char); 36] = [
     (KeyCode::Digit9, '9'),
 ];
 
+const TYPEAHEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn build_icon(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -165,6 +167,7 @@ pub(crate) struct ItemPanelOptions {
     pub roles: PanelRoles,
     pub label: Option<SmolStr>,
     pub width: PanelWidth,
+    pub typeahead: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,11 +193,14 @@ struct PanelActions {
     end: Action,
     activate: Action,
     row: Action,
+    tab_next: Action,
+    tab_prev: Action,
 }
 
 struct PanelState {
     window: Option<WindowId>,
     surface: Option<NodeId>,
+    opener: Option<NodeId>,
     height: LogicalPx,
 }
 
@@ -208,6 +214,9 @@ struct PanelInner {
     on_activate: RefCell<Option<Rc<dyn Fn(&mut App, usize)>>>,
     on_close: RefCell<Option<Rc<dyn Fn(&mut App, DismissReason)>>>,
     state: RefCell<PanelState>,
+    typeahead_actions: Vec<(char, Action)>,
+    typeahead_buffer: RefCell<SmolStr>,
+    typeahead_timer: Cell<Option<TimerId>>,
 }
 
 #[derive(Clone)]
@@ -282,6 +291,20 @@ impl ItemPanel {
             )
         };
         list.set_row_action(row_action.clone());
+        list.set_rows_tab_stop(false);
+        let typeahead_actions = if options.typeahead {
+            TYPEAHEAD_KEYS
+                .iter()
+                .map(|(_, character)| {
+                    (
+                        *character,
+                        Action::Custom(format_smolstr!("{key}.typeahead.{character}")),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let panel = PopupPanel::new(
             app,
             theme,
@@ -296,6 +319,8 @@ impl ItemPanel {
                 end: Action::Custom(format_smolstr!("{key}.end")),
                 activate: Action::Custom(format_smolstr!("{key}.activate")),
                 row: row_action,
+                tab_next: Action::Custom(format_smolstr!("{key}.tab.next")),
+                tab_prev: Action::Custom(format_smolstr!("{key}.tab.prev")),
             },
             key,
             options,
@@ -307,8 +332,12 @@ impl ItemPanel {
             state: RefCell::new(PanelState {
                 window: None,
                 surface: None,
+                opener: None,
                 height: LogicalPx::ZERO,
             }),
+            typeahead_actions,
+            typeahead_buffer: RefCell::new(SmolStr::default()),
+            typeahead_timer: Cell::new(None),
         });
         let weak = Rc::downgrade(&inner);
         panel.on_close(move |app, reason| {
@@ -520,6 +549,7 @@ impl ItemPanel {
             let mut state = self.inner.state.borrow_mut();
             state.window = Some(window);
             state.surface = Some(surface);
+            state.opener = request.opener;
             state.height = height;
         }
         let _ = app.refresh_text(window);
@@ -566,16 +596,44 @@ impl ItemPanel {
             (KeyCode::ArrowDown, self.inner.actions.down.clone()),
             (KeyCode::Home, self.inner.actions.home.clone()),
             (KeyCode::End, self.inner.actions.end.clone()),
+            (KeyCode::Tab, self.inner.actions.tab_next.clone()),
+            (KeyCode::Tab, self.inner.actions.tab_prev.clone()),
         ] {
+            let modifiers = if key == KeyCode::Tab && action == self.inner.actions.tab_prev {
+                Modifiers::SHIFT
+            } else {
+                Modifiers::empty()
+            };
             app.bind_key_scoped(
                 window,
                 surface,
                 KeyBinding {
                     key,
-                    modifiers: Modifiers::empty(),
+                    modifiers,
                     action,
                 },
             )?;
+        }
+        if self.inner.options.typeahead {
+            for (key, character) in TYPEAHEAD_KEYS {
+                let Some((_, action)) = self
+                    .inner
+                    .typeahead_actions
+                    .iter()
+                    .find(|(value, _)| *value == character)
+                else {
+                    continue;
+                };
+                app.bind_key_scoped(
+                    window,
+                    surface,
+                    KeyBinding {
+                        key,
+                        modifiers: Modifiers::empty(),
+                        action: action.clone(),
+                    },
+                )?;
+            }
         }
         Ok(())
     }
@@ -649,8 +707,10 @@ impl ItemPanel {
             let mut state = self.inner.state.borrow_mut();
             state.window = None;
             state.surface = None;
+            state.opener = None;
             state.height = LogicalPx::ZERO;
         }
+        self.clear_typeahead(app);
         let _ = self.inner.list.clear_selection(app);
     }
 
@@ -760,9 +820,15 @@ impl ItemPanel {
             &self.inner.actions.end,
             &self.inner.actions.activate,
             &self.inner.actions.row,
+            &self.inner.actions.tab_next,
+            &self.inner.actions.tab_prev,
         ] {
             app.off_action(action);
         }
+        for (_, action) in &self.inner.typeahead_actions {
+            app.off_action(action);
+        }
+        self.clear_typeahead(app);
         self.inner.panel.release(app);
         self.inner.list.release(app)
     }
@@ -819,6 +885,103 @@ impl ItemPanel {
             this.focus(app);
             this.activate(app, index);
         });
+        let this = self.clone();
+        app.on_action(self.inner.actions.tab_next.clone(), move |ctx| {
+            this.tab_out(ctx.app_mut(), true);
+        });
+        let this = self.clone();
+        app.on_action(self.inner.actions.tab_prev.clone(), move |ctx| {
+            this.tab_out(ctx.app_mut(), false);
+        });
+        for (character, action) in self.inner.typeahead_actions.clone() {
+            let this = self.clone();
+            app.on_action(action, move |ctx| {
+                this.typeahead(ctx.app_mut(), character);
+            });
+        }
+    }
+
+    fn tab_out(&self, app: &mut App, forward: bool) {
+        let (Some(window), opener) = (
+            self.inner.state.borrow().window,
+            self.inner.state.borrow().opener,
+        ) else {
+            return;
+        };
+        self.close_now(app);
+        if let Some(opener) = opener {
+            let _ = app.set_focus(window, Some(opener));
+        }
+        if forward {
+            app.focus_next(window);
+        } else {
+            app.focus_prev(window);
+        }
+    }
+
+    fn typeahead(&self, app: &mut App, character: char) {
+        let Some(content) = self.inner.content.borrow().clone() else {
+            return;
+        };
+        let count = content.rows.len();
+        if count == 0 {
+            return;
+        }
+        let mut existing = self.inner.typeahead_buffer.borrow().clone();
+        if !existing.is_empty() && existing.chars().all(|value| value == character) {
+            self.clear_typeahead(app);
+            existing = SmolStr::default();
+        }
+        let buffer = format_smolstr!("{existing}{character}");
+        *self.inner.typeahead_buffer.borrow_mut() = buffer.clone();
+        self.arm_typeahead_timer(app);
+        let active = self.highlighted(app);
+        let start = if buffer.chars().count() == 1 {
+            active.map_or(0, |index| (index + 1) % count)
+        } else {
+            active.unwrap_or(0)
+        };
+        let found = (0..count)
+            .map(|offset| (start + offset) % count)
+            .find(|index| {
+                !content.rows[*index].disabled
+                    && (content.a11y)(*index)
+                        .label
+                        .is_some_and(|label| label.to_lowercase().starts_with(buffer.as_str()))
+            });
+        if let Some(row) = found {
+            self.set_highlighted(app, Some(row));
+        }
+    }
+
+    fn arm_typeahead_timer(&self, app: &mut App) {
+        self.cancel_typeahead_timer(app);
+        let (Some(window), Some(surface)) = (
+            self.inner.state.borrow().window,
+            self.inner.state.borrow().surface,
+        ) else {
+            return;
+        };
+        let weak = Rc::downgrade(&self.inner);
+        let timer = app.after_scoped(window, surface, TYPEAHEAD_TIMEOUT, move |_app| {
+            if let Some(inner) = weak.upgrade() {
+                *inner.typeahead_buffer.borrow_mut() = SmolStr::default();
+            }
+        });
+        if let Ok(timer) = timer {
+            self.inner.typeahead_timer.set(Some(timer));
+        }
+    }
+
+    fn cancel_typeahead_timer(&self, app: &mut App) {
+        if let Some(timer) = self.inner.typeahead_timer.take() {
+            let _ = app.cancel_timer(&timer);
+        }
+    }
+
+    fn clear_typeahead(&self, app: &mut App) {
+        self.cancel_typeahead_timer(app);
+        *self.inner.typeahead_buffer.borrow_mut() = SmolStr::default();
     }
 
     pub(crate) fn move_highlight(&self, app: &mut App, step: isize) {
@@ -1222,6 +1385,7 @@ impl Menu {
                 roles: MENU_ROLES,
                 label: options.label.clone(),
                 width: PanelWidth::Exact,
+                typeahead: false,
             },
         );
         let inner = Rc::new(MenuInner {
@@ -3385,6 +3549,28 @@ mod tests {
             self.drain(menu);
         }
 
+        fn mount_click_background(&mut self, id: &'static str, rect: LogicalRect) {
+            let root = self
+                .app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let tree = self
+                .app
+                .app_mut()
+                .window_mut(self.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id(id)
+                .layout_override(rect)
+                .on_click(Action::Custom(SmolStr::new_static("background.click")))
+                .build(tree, root)
+                .expect("背景覆盖节点");
+        }
+
         fn bounds(&self, node: NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("布局盒")
         }
@@ -5418,6 +5604,13 @@ mod tests {
     fn a_press_inside_the_safe_triangle_keeps_the_chain_open() {
         let mut harness = Harness::new();
         let (menu, child, triangle) = open_tall_chain(&mut harness);
+        harness.mount_click_background(
+            "safe-triangle-cover",
+            LogicalRect::from_origin_size(
+                LogicalPoint::new(triangle.x - px(12.0), triangle.y - px(12.0)),
+                LogicalSize::new(px(24.0), px(24.0)),
+            ),
+        );
         let background_clicks = harness.background_clicks.get();
         let root_level = menu.inner.level.get().expect("根层级");
         assert!(
@@ -5444,7 +5637,17 @@ mod tests {
         assert_eq!(
             harness.background_clicks.get() - background_clicks,
             0,
-            "安全三角按下没有落到背景控件"
+            "安全三角按下必须被吞掉，不得 replay 到落点下的背景控件"
+        );
+
+        let before_control = harness.background_clicks.get();
+        assert!(menu.close(harness.app.app_mut()));
+        harness.settle(&menu);
+        harness.click(&menu, triangle);
+        assert_eq!(
+            harness.background_clicks.get() - before_control,
+            1,
+            "自检：菜单关闭后同一落点必须点到覆盖背景节点（证明落点确实在背景控件上）"
         );
     }
 

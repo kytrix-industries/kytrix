@@ -330,6 +330,13 @@ impl Harness {
         ids
     }
 
+    pub(crate) fn popup_total(&self) -> usize {
+        self.app
+            .app()
+            .popup_stack(self.window)
+            .map_or(0, |stack| stack.entries.len())
+    }
+
     pub(crate) fn drain(&mut self) {
         if self.app.app().window(self.window).is_none() {
             return;

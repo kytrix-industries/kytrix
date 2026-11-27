@@ -262,6 +262,7 @@ impl Select {
                 } else {
                     PanelWidth::AtLeast
                 },
+                typeahead: true,
             },
         );
         let open_state = panel.open_state();
@@ -1465,13 +1466,38 @@ mod tests {
         }
 
         fn key(&mut self, select: &Select, code: KeyCode) {
-            let _ = self
-                .app
-                .inject(InputEvent::key_down(code, Modifiers::empty()));
-            let _ = self
-                .app
-                .inject(InputEvent::key_up(code, Modifiers::empty()));
+            self.key_with(select, code, Modifiers::empty());
+        }
+
+        fn key_with(&mut self, select: &Select, code: KeyCode, modifiers: Modifiers) {
+            let _ = self.app.inject(InputEvent::key_down(code, modifiers));
+            let _ = self.app.inject(InputEvent::key_up(code, modifiers));
             self.settle(select);
+        }
+
+        fn mount_focusable(&mut self, id: &'static str, rect: LogicalRect) -> NodeId {
+            let root = self
+                .app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let action = Action::Custom(format_smolstr!("{id}.click"));
+            self.app.app_mut().on_action(action.clone(), move |_| {});
+            let tree = self
+                .app
+                .app_mut()
+                .window_mut(self.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id(id)
+                .tab_stop(true)
+                .on_click(action)
+                .layout_override(rect)
+                .build(tree, root)
+                .expect("可聚焦节点")
         }
 
         fn press_release(&mut self, at: LogicalPoint) {
@@ -2149,36 +2175,169 @@ mod tests {
     }
 
     #[test]
+    fn tab_closes_the_select_and_moves_focus_past_the_trigger() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let after = harness.mount_focusable(
+            "select-after",
+            LogicalRect::new(px(0.0), px(450.0), px(80.0), px(32.0)),
+        );
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()), "面板打开");
+
+        harness.key(&select, KeyCode::Tab);
+        assert!(
+            !select.is_open(harness.app.app()),
+            "Tab 必须离开并关闭非模态面板"
+        );
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(after),
+            "焦点移到触发器之后的下一个 tab stop"
+        );
+    }
+
+    #[test]
+    fn shift_tab_closes_the_select_and_moves_focus_before_the_trigger() {
+        let mut harness = Harness::new();
+        let before = harness.mount_focusable(
+            "select-before",
+            LogicalRect::new(px(0.0), px(100.0), px(80.0), px(32.0)),
+        );
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()), "面板打开");
+
+        harness.key_with(&select, KeyCode::Tab, Modifiers::SHIFT);
+        assert!(
+            !select.is_open(harness.app.app()),
+            "Shift+Tab 必须离开并关闭面板"
+        );
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(before),
+            "焦点移到触发器之前的上一个 tab stop"
+        );
+    }
+
+    #[test]
+    fn enter_chooses_the_highlighted_row_and_rows_leave_the_tab_order() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()), "面板打开");
+
+        harness.key(&select, KeyCode::ArrowDown);
+        assert_eq!(
+            select.highlighted(harness.app.app()),
+            Some(1),
+            "方向键移动高亮到 Beta"
+        );
+        harness.key(&select, KeyCode::Enter);
+        assert_eq!(
+            select.chosen(harness.app.app()),
+            vec![SmolStr::new_static("b")],
+            "Enter 激活的是高亮行 Beta，而不是某个被 Tab 聚焦的行"
+        );
+
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()), "再次打开");
+        let row = harness
+            .find("select:panel:list:row:1")
+            .expect("行节点已挂载");
+        let _ = harness.app.drain().expect("a11y 帧");
+        let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
+        let record = snapshot.node_for(row).expect("行 a11y");
+        assert!(
+            !record.actions.contains(&A11yAction::Focus),
+            "列表行不得进入 Tab 序：{:?}",
+            record.actions
+        );
+    }
+
+    #[test]
+    fn typeahead_matches_labels_skips_disabled_and_cycles() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(
+            &select,
+            vec![
+                SelectItem::new("alpha", "Alpha"),
+                SelectItem::new("beta", "Beta"),
+                SelectItem::new("charlie", "Charlie").disabled(true),
+                SelectItem::new("cobalt", "Cobalt"),
+                SelectItem::new("aurora", "Aurora"),
+            ],
+        );
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()), "面板打开");
+
+        harness.key(&select, KeyCode::KeyA);
+        assert_eq!(
+            select.highlighted(harness.app.app()),
+            Some(4),
+            "A 从当前行循环到 Aurora"
+        );
+        harness.key(&select, KeyCode::KeyA);
+        assert_eq!(
+            select.highlighted(harness.app.app()),
+            Some(0),
+            "重复 A 循环回 Alpha"
+        );
+        harness.app.advance(Duration::from_millis(2100));
+        harness.settle(&select);
+        harness.key(&select, KeyCode::KeyC);
+        assert_eq!(
+            select.highlighted(harness.app.app()),
+            Some(3),
+            "C 跳过 disabled 的 Charlie 到 Cobalt"
+        );
+        harness.key(&select, KeyCode::KeyO);
+        assert_eq!(
+            select.highlighted(harness.app.app()),
+            Some(3),
+            "CO 前缀继续匹配 Cobalt"
+        );
+        assert!(
+            select.chosen(harness.app.app()).is_empty(),
+            "typeahead 只移动高亮，不选择"
+        );
+        assert!(select.is_open(harness.app.app()), "typeahead 不关闭面板");
+    }
+
+    #[test]
     fn row_hit_shells_are_not_in_the_tab_order() {
         let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
         let select = harness.select(SelectOptions::default());
         harness.mount(&select, items());
         let trigger = select.trigger_node().expect("触发器");
         harness.click(&select, harness.center(trigger));
         assert!(select.is_open(harness.app.app()));
 
-        let mut seen = Vec::new();
-        for _ in 0..6 {
-            harness.key(&select, KeyCode::Tab);
-            let focused = harness
-                .app
-                .app()
-                .focused(harness.window)
-                .expect("Tab 后有焦点");
-            let debug = harness
-                .app
-                .app()
-                .window(harness.window)
-                .expect("窗口")
-                .tree()
-                .debug_id(focused)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{focused:?}"));
-            seen.push(debug);
-        }
+        let shell = harness
+            .find("select:panel:list:row:0")
+            .expect("行节点已挂载");
+        let _ = harness.app.drain().expect("a11y 帧");
+        let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
+        let record = snapshot.node_for(shell).expect("行 a11y");
         assert!(
-            seen.iter().all(|id| !id.contains(":hit:")),
-            "Tab 序不得落到行命中壳：{seen:?}"
+            !record.actions.contains(&A11yAction::Focus),
+            "行（含命中壳）不得进入 Tab 序：{:?}",
+            record.actions
+        );
+        harness.key(&select, KeyCode::Tab);
+        assert!(
+            !select.is_open(harness.app.app()),
+            "Tab 关闭面板而不是在行之间循环"
         );
     }
 

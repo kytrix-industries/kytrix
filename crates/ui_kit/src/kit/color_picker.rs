@@ -9,7 +9,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     error::EngineError,
-    event::{Action, ActionSource},
+    event::{Action, ActionSource, KeyBinding, KeyCode, Modifiers},
     interaction::{ActionCtx, DragPhase},
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
@@ -567,6 +567,8 @@ struct Actions {
     tab: [Action; 2],
     track: [Action; 4],
     drag: [Action; 4],
+    tab_next: Action,
+    tab_prev: Action,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -701,6 +703,8 @@ impl ColorPicker {
                     HslaChannel::ALL[index].id()
                 ))
             }),
+            tab_next: Action::Custom(format_smolstr!("{key}.tab.next")),
+            tab_prev: Action::Custom(format_smolstr!("{key}.tab.prev")),
         };
         let labels = ColorPickerLabels::default();
         let popup = PopupPanel::new(
@@ -1074,6 +1078,8 @@ impl ColorPicker {
         list.extend(actions.tab.iter().cloned());
         list.extend(actions.track.iter().cloned());
         list.extend(actions.drag.iter().cloned());
+        list.push(actions.tab_next.clone());
+        list.push(actions.tab_prev.clone());
 
         list
     }
@@ -1115,6 +1121,55 @@ impl ColorPicker {
                 picker.on_track_drag(ctx, HslaChannel::ALL[index]);
             });
         }
+        let next = self.clone();
+        app.on_action(self.inner.actions.tab_next.clone(), move |ctx| {
+            next.tab_out(ctx.app_mut(), true);
+        });
+        let prev = self.clone();
+        app.on_action(self.inner.actions.tab_prev.clone(), move |ctx| {
+            prev.tab_out(ctx.app_mut(), false);
+        });
+    }
+
+    fn tab_out(&self, app: &mut App, forward: bool) {
+        let trigger = self.inner.trigger.borrow().as_ref().map(|view| view.node);
+        let Some(window) = trigger.and_then(|node| node.window()) else {
+            return;
+        };
+        if !self.inner.popup.close_now(app) {
+            return;
+        }
+        if let Some(trigger) = trigger {
+            let _ = app.set_focus(window, Some(trigger));
+        }
+        if forward {
+            app.focus_next(window);
+        } else {
+            app.focus_prev(window);
+        }
+    }
+
+    fn bind_tab_keys(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        scope: NodeId,
+    ) -> Result<(), EngineError> {
+        for (modifiers, action) in [
+            (Modifiers::empty(), self.inner.actions.tab_next.clone()),
+            (Modifiers::SHIFT, self.inner.actions.tab_prev.clone()),
+        ] {
+            app.bind_key_scoped(
+                window,
+                scope,
+                KeyBinding {
+                    key: KeyCode::Tab,
+                    modifiers,
+                    action,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn on_confirm(&self, app: &mut App) {
@@ -1700,6 +1755,8 @@ impl ColorPicker {
         }
         *inner.last_hex_text.borrow_mut() = hex;
         inner.last_hex_focus.set(false);
+
+        self.bind_tab_keys(app, window, content)?;
 
         Ok(())
     }
@@ -2940,12 +2997,13 @@ mod ui_tests {
         time::Duration,
     };
 
-    use smol_str::SmolStr;
+    use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
         a11y::A11yRole,
-        event::{Event, InputEvent, KeyCode, KeyState, Modifiers, PointerButton},
+        event::{Action, Event, InputEvent, KeyCode, KeyState, Modifiers, PointerButton},
         math::{LogicalPoint, LogicalRect, px},
         node::{
+            builder::NodeBuilder,
             id::NodeId,
             tree::{NodeKind, NodeTree},
         },
@@ -3006,6 +3064,48 @@ mod ui_tests {
             };
             harness.pump();
             harness
+        }
+
+        fn mount_focusable(&mut self, id: &'static str, rect: LogicalRect) -> NodeId {
+            let root = self
+                .app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let action = Action::Custom(format_smolstr!("{id}.click"));
+            self.app.app_mut().on_action(action.clone(), move |_| {});
+            let tree = self
+                .app
+                .app_mut()
+                .window_mut(self.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id(id)
+                .tab_stop(true)
+                .on_click(action)
+                .layout_override(rect)
+                .build(tree, root)
+                .expect("可聚焦节点")
+        }
+
+        fn key_with(&mut self, code: KeyCode, modifiers: Modifiers) {
+            let _ = self.app.inject(InputEvent::key_down(code, modifiers));
+            let _ = self.app.inject(InputEvent::key_up(code, modifiers));
+            self.pump();
+        }
+
+        fn focused_debug_id(&self) -> Option<String> {
+            let focused = self.app.app().focused(self.window)?;
+            self.app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .tree()
+                .debug_id(focused)
+                .map(str::to_owned)
         }
 
         fn pump(&mut self) -> bool {
@@ -3459,6 +3559,50 @@ mod ui_tests {
             covered,
             "关闭帧 damage 必须覆盖旧浮层 rect（无残影）：damage={:?} rect={expected:?}",
             record.damage
+        );
+    }
+
+    #[test]
+    fn tab_closes_the_picker_and_moves_focus_to_the_next_control() {
+        let mut harness = Harness::new();
+        let after = harness.mount_focusable(
+            "picker-after",
+            LogicalRect::new(px(0.0), px(500.0), px(80.0), px(32.0)),
+        );
+        harness.open();
+        assert!(harness.panel_open(), "面板打开");
+        let focused = harness.focused_debug_id().expect("打开后焦点在面板内");
+        assert!(
+            focused.starts_with("picker:panel"),
+            "打开后焦点在取色器面板内：{focused}"
+        );
+
+        harness.key_with(KeyCode::Tab, Modifiers::empty());
+        assert!(
+            !harness.panel_open(),
+            "Tab 必须离开并关闭取色器（不得在面板内闭环）"
+        );
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(after),
+            "焦点落到触发器之后的下一个 tab stop"
+        );
+    }
+
+    #[test]
+    fn shift_tab_closes_the_picker_and_leaves_the_panel() {
+        let mut harness = Harness::new();
+        harness.open();
+        assert!(harness.panel_open(), "面板打开");
+
+        harness.key_with(KeyCode::Tab, Modifiers::SHIFT);
+        assert!(!harness.panel_open(), "Shift+Tab 必须关闭取色器");
+        let focused = harness.focused_debug_id();
+        assert!(
+            focused
+                .as_deref()
+                .is_none_or(|id| !id.starts_with("picker:panel")),
+            "焦点不得留在面板内：{focused:?}"
         );
     }
 

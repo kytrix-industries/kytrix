@@ -31,19 +31,12 @@ pub fn solve_placement(input: PlacementInput) -> Result<PlacementResult, PopupEr
     let available_width = (viewport_width - 2.0 * margin).max(0.0);
     let available_height = (viewport_height - 2.0 * margin).max(0.0);
 
-    let mut width = size.width.value();
-    let content_width = width;
-    let mut resized = false;
-    if spec.max_size.shrinks_width() {
-        width = width.min(available_width);
-        resized |= content_width > available_width + 0.01;
-    }
-    let mut height = size.height.value();
-    let content_height = height;
-    if spec.max_size.shrinks_height() {
-        height = height.min(available_height);
-        resized |= content_height > available_height + 0.01;
-    }
+    let content_width = size.width.value();
+    let width = content_width.min(available_width);
+    let mut resized = content_width > available_width + 0.01;
+    let content_height = size.height.value();
+    let height = content_height.min(available_height);
+    resized |= content_height > available_height + 0.01;
 
     if width < 0.0 || height < 0.0 {
         return Err(PopupError::InvalidGeometry {
@@ -375,8 +368,8 @@ mod tests {
     use crate::{
         math::{LogicalRect, LogicalSize, px},
         popup::{
-            Alignment, MaxSize, Placement, PlacementInput, PlacementResult, PlacementSpec,
-            PopupError, ShiftPolicy, Side,
+            Alignment, Placement, PlacementInput, PlacementResult, PlacementSpec, PopupError,
+            ShiftPolicy, Side,
         },
     };
 
@@ -400,7 +393,6 @@ mod tests {
             fallbacks: SmallVec::new(),
             viewport_margin: px(4.0),
             shift: ShiftPolicy::Limit,
-            max_size: MaxSize::Viewport,
         }
     }
 
@@ -703,44 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn max_size_width_only_constrains_the_width() {
-        let spec = PlacementSpec {
-            gap: px(0.0),
-            viewport_margin: px(0.0),
-            max_size: MaxSize::Width,
-            ..bottom()
-        };
-        let result = solve(
-            rect(0.0, 0.0, 10.0, 10.0),
-            size(400.0, 300.0),
-            size(200.0, 100.0),
-            &spec,
-        )
-        .expect("placement");
-        assert!(result.resized);
-        assert_size(result.rect, (200.0, 300.0));
-    }
-
-    #[test]
-    fn max_size_height_only_constrains_the_height() {
-        let spec = PlacementSpec {
-            gap: px(0.0),
-            viewport_margin: px(0.0),
-            max_size: MaxSize::Height,
-            ..bottom()
-        };
-        let result = solve(
-            rect(0.0, 0.0, 10.0, 10.0),
-            size(400.0, 300.0),
-            size(200.0, 100.0),
-            &spec,
-        )
-        .expect("placement");
-        assert!(result.resized);
-        assert_size(result.rect, (400.0, 100.0));
-    }
-
-    #[test]
     fn a_submenu_falls_back_to_the_left_when_the_right_side_overflows() {
         let spec = PlacementSpec {
             side: Side::Right,
@@ -749,7 +703,6 @@ mod tests {
             fallbacks: SmallVec::from_slice(&[Placement::new(Side::Left, Alignment::Start)]),
             viewport_margin: px(0.0),
             shift: ShiftPolicy::Limit,
-            max_size: MaxSize::Viewport,
         };
         let result = solve(
             rect(250.0, 0.0, 20.0, 100.0),

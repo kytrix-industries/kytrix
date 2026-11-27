@@ -215,6 +215,7 @@ impl Dropdown {
                 } else {
                     PanelWidth::AtLeast
                 },
+                typeahead: true,
             },
         );
         let open_state = panel.open_state();
@@ -846,7 +847,7 @@ mod tests {
         time::Duration,
     };
 
-    use smol_str::SmolStr;
+    use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
         a11y::{A11yAction, A11yRole},
         event::{Action, ActionSource, InputEvent, KeyCode, Modifiers, PointerButton},
@@ -1012,13 +1013,38 @@ mod tests {
         }
 
         fn key(&mut self, dropdown: &Dropdown, code: KeyCode) {
-            let _ = self
-                .app
-                .inject(InputEvent::key_down(code, Modifiers::empty()));
-            let _ = self
-                .app
-                .inject(InputEvent::key_up(code, Modifiers::empty()));
+            self.key_with(dropdown, code, Modifiers::empty());
+        }
+
+        fn key_with(&mut self, dropdown: &Dropdown, code: KeyCode, modifiers: Modifiers) {
+            let _ = self.app.inject(InputEvent::key_down(code, modifiers));
+            let _ = self.app.inject(InputEvent::key_up(code, modifiers));
             self.drain(dropdown);
+        }
+
+        fn mount_focusable(&mut self, id: &'static str, rect: LogicalRect) -> NodeId {
+            let root = self
+                .app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let action = Action::Custom(format_smolstr!("{id}.click"));
+            self.app.app_mut().on_action(action.clone(), move |_| {});
+            let tree = self
+                .app
+                .app_mut()
+                .window_mut(self.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id(id)
+                .tab_stop(true)
+                .on_click(action)
+                .layout_override(rect)
+                .build(tree, root)
+                .expect("可聚焦节点")
         }
 
         fn press_release(&mut self, at: LogicalPoint) {
@@ -1419,6 +1445,186 @@ mod tests {
             "slide 只改绘制偏移，settle rect 必须首帧即稳定"
         );
         assert_eq!(settled.state, PopupState::Open);
+    }
+
+    fn typeahead_items() -> Vec<DropdownItem> {
+        vec![
+            DropdownItem::new("alpha", "Alpha"),
+            DropdownItem::new("beta", "Beta"),
+            DropdownItem::new("charlie", "Charlie").disabled(true),
+            DropdownItem::new("cobalt", "Cobalt"),
+            DropdownItem::new("aurora", "Aurora"),
+        ]
+    }
+
+    #[test]
+    fn tab_closes_the_dropdown_and_moves_focus_past_the_trigger() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let after = harness.mount_focusable(
+            "dropdown-after",
+            LogicalRect::new(px(0.0), px(450.0), px(80.0), px(32.0)),
+        );
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+
+        harness.key(&dropdown, KeyCode::Tab);
+        assert!(
+            !dropdown.is_open(harness.app.app()),
+            "Tab 必须离开并关闭非模态面板"
+        );
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(after),
+            "焦点移到触发器之后的下一个 tab stop"
+        );
+    }
+
+    #[test]
+    fn shift_tab_closes_the_dropdown_and_moves_focus_before_the_trigger() {
+        let mut harness = Harness::new();
+        let before = harness.mount_focusable(
+            "dropdown-before",
+            LogicalRect::new(px(0.0), px(100.0), px(80.0), px(32.0)),
+        );
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+
+        harness.key_with(&dropdown, KeyCode::Tab, Modifiers::SHIFT);
+        assert!(
+            !dropdown.is_open(harness.app.app()),
+            "Shift+Tab 必须离开并关闭面板"
+        );
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(before),
+            "焦点移到触发器之前的上一个 tab stop"
+        );
+    }
+
+    #[test]
+    fn enter_chooses_the_highlighted_row_and_rows_leave_the_tab_order() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+
+        harness.key(&dropdown, KeyCode::ArrowDown);
+        harness.key(&dropdown, KeyCode::ArrowDown);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(3),
+            "方向键跳过 disabled 行到 Delta"
+        );
+        harness.key(&dropdown, KeyCode::Enter);
+        assert_eq!(
+            dropdown.selected(harness.app.app()),
+            Some(SmolStr::new_static("d")),
+            "Enter 激活的是高亮行 Delta，而不是某个被 Tab 聚焦的行"
+        );
+
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "再次打开");
+        let row = harness
+            .find("dropdown:panel:list:row:2")
+            .expect("行节点已挂载");
+        let _ = harness.app.drain().expect("a11y 帧");
+        let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
+        let record = snapshot.node_for(row).expect("行 a11y");
+        assert!(
+            !record.actions.contains(&A11yAction::Focus),
+            "列表行不得进入 Tab 序：{:?}",
+            record.actions
+        );
+    }
+
+    #[test]
+    fn typeahead_matches_labels_skips_disabled_and_cycles() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, typeahead_items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+
+        harness.key(&dropdown, KeyCode::KeyA);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(4),
+            "A 从当前行循环到 Aurora"
+        );
+        harness.key(&dropdown, KeyCode::KeyA);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(0),
+            "重复 A 循环回 Alpha"
+        );
+        harness.app.advance(Duration::from_millis(2100));
+        let _ = harness.drain(&dropdown);
+        harness.key(&dropdown, KeyCode::KeyC);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(3),
+            "C 跳过 disabled 的 Charlie 到 Cobalt"
+        );
+        harness.app.advance(Duration::from_millis(2100));
+        let _ = harness.drain(&dropdown);
+        harness.key(&dropdown, KeyCode::KeyC);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(3),
+            "C 单候选保持 Cobalt"
+        );
+        harness.key(&dropdown, KeyCode::KeyO);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(3),
+            "CO 前缀继续匹配 Cobalt"
+        );
+        assert!(
+            dropdown.selected(harness.app.app()).is_none(),
+            "typeahead 只移动高亮，不选择"
+        );
+        assert!(dropdown.is_open(harness.app.app()), "typeahead 不关闭面板");
+    }
+
+    #[test]
+    fn typeahead_buffer_expires_after_the_timeout() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, typeahead_items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+
+        harness.key(&dropdown, KeyCode::KeyC);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(3),
+            "C → Cobalt"
+        );
+        harness.key(&dropdown, KeyCode::KeyO);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(3),
+            "CO → Cobalt"
+        );
+        harness.app.advance(Duration::from_millis(2100));
+        let _ = harness.drain(&dropdown);
+        harness.key(&dropdown, KeyCode::KeyA);
+        assert_eq!(
+            dropdown.highlighted(harness.app.app()),
+            Some(4),
+            "2s 后缓冲清空：A 单字符从 Cobalt 循环到 Aurora（而非 COA 前缀）"
+        );
     }
 
     #[test]

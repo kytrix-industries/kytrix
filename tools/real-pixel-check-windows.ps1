@@ -7,9 +7,22 @@ if ($env:CARGO_TARGET_DIR) {
     $Target = Join-Path $Root 'target'
 }
 $env:CARGO_TARGET_DIR = $Target
-$OsDir = Join-Path $Target 'real-pixels/windows'
-Remove-Item -Recurse -Force $OsDir -ErrorAction SilentlyContinue
+$OsRoot = Join-Path $Target 'real-pixels/windows'
+$SourceSha = ''
+$SourceIdPath = Join-Path $Root 'tools/source-id.txt'
+if (Test-Path $SourceIdPath) {
+    $SourceLine = Get-Content $SourceIdPath | Where-Object { $_ -like 'diff_sha=*' } | Select-Object -First 1
+    if ($SourceLine) {
+        $SourceSha = ($SourceLine -replace '^diff_sha=', '').Trim()
+        if ($SourceSha.Length -gt 8) { $SourceSha = $SourceSha.Substring(0, 8) }
+    }
+}
+if (-not $SourceSha) { $SourceSha = 'unknown' }
+$RunStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+$OsDir = Join-Path $OsRoot ("{0}-{1}" -f $RunStamp, $SourceSha)
 New-Item -ItemType Directory -Force -Path $OsDir | Out-Null
+Set-Content -Path (Join-Path $OsRoot 'latest.txt') -Value $OsDir
+$env:KYTRIX_REAL_PIXEL_EVIDENCE = $OsDir
 $Log = Join-Path $OsDir 'run.log'
 "== kytrix real-pixel gate $(Get-Date -Format o) ==" | Out-File -FilePath $Log -Encoding utf8
 "root=$Root" | Out-File -FilePath $Log -Append -Encoding utf8

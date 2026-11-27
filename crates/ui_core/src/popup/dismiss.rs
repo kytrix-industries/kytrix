@@ -114,6 +114,11 @@ pub(crate) fn begin_close(app: &mut App, window: WindowId, id: PopupId) {
     begin_close_inner(app, window, id, false);
 }
 
+fn mark_closing(app: &mut App, window: WindowId, id: PopupId) {
+    if let Some(target) = app.window_mut(window) {
+        let _ = target.popups_mut().set_state(id, PopupState::Closing);
+    }
+}
 pub(crate) fn begin_close_chain(app: &mut App, window: WindowId, id: PopupId) {
     begin_close_inner(app, window, id, true);
 }
@@ -189,6 +194,7 @@ fn begin_close_inner(app: &mut App, window: WindowId, id: PopupId, chain: bool) 
             continue;
         }
         block_entry(app, window, current);
+        mark_closing(app, window, current);
         crate::popup::focus::release_focus_on_close(app, window, current);
         if animation == crate::popup::PopupAnimation::None {
             app_popup::close_popup_now(app, current);
@@ -259,34 +265,13 @@ fn outside_consumes(popups: &PopupStack, id: PopupId) -> bool {
     })
 }
 
-fn outside_ignores(popups: &PopupStack, id: PopupId) -> bool {
-    popups.entry(id).is_ok_and(|entry| {
-        matches!(
-            entry.dismiss,
-            DismissPolicy::Chain {
-                outside: OutsidePress::Ignore,
-                ..
-            }
-        )
-    })
-}
-
 fn resolve_auto_outside(app: &mut App, window: WindowId, top_auto: PopupId) -> PressRouting {
-    let (ignores, consumes) = {
-        let Some(target) = app.window(window) else {
-            return PressRouting::Dispatch;
-        };
-        (
-            outside_ignores(target.popups(), top_auto),
-            outside_consumes(target.popups(), top_auto),
-        )
-    };
-    if ignores {
-        return PressRouting::Dispatch;
-    }
+    let consumes = app
+        .window(window)
+        .is_some_and(|target| outside_consumes(target.popups(), top_auto));
     let outcome = dispatch(app, window, top_auto, DismissReason::OutsidePress);
     match outcome {
-        DismissOutcome::Ignore => PressRouting::Dispatch,
+        DismissOutcome::Ignore => PressRouting::Consume,
         DismissOutcome::Close | DismissOutcome::CloseChain => {
             let _ = apply_outcome(app, window, top_auto, outcome);
             if consumes {
@@ -454,19 +439,6 @@ pub(crate) fn escape(app: &mut App, window: WindowId) -> bool {
         .map_or(EscapePolicy::CloseTopmost, |entry| entry.dismiss.escape());
     if policy == EscapePolicy::Ignore {
         return false;
-    }
-    if policy == EscapePolicy::CloseChain {
-        let outcome = dispatch(app, window, top, DismissReason::Escape);
-        if outcome == DismissOutcome::Ignore {
-            return false;
-        }
-        if let Some(root) = app
-            .window(window)
-            .and_then(|target| target.popups().chain_root(top))
-        {
-            begin_close_chain(app, window, root);
-        }
-        return true;
     }
     request_close(app, window, top, DismissReason::Escape).unwrap_or(false)
 }

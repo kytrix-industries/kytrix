@@ -532,10 +532,14 @@ impl SettingsPage {
         );
         let confirm = i18n::t_smol!(translate, "common.confirm");
         self.alert_count += 1;
-        let dialog = DialogBuilder::alert(title.clone(), move |_dialog, _theme| {
+        let dialog = DialogBuilder::alert(title.clone(), move |dialog, _theme| {
+            let dialog = dialog.clone();
             AlertBuilder::new()
                 .ok(title.clone(), message.clone())
                 .ok_text(confirm.clone())
+                .ok_action(move |_, app| {
+                    dialog.close(app);
+                })
         })
         .build(
             app,

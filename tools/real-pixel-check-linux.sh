@@ -3,14 +3,19 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
-OS_DIR="$ROOT/target/real-pixels/linux"
+OS_ROOT="$ROOT/target/real-pixels/linux"
+SOURCE_SHA="$(sed -n 's/^diff_sha=//p' "$ROOT/tools/source-id.txt" 2>/dev/null | head -1 | cut -c1-8)"
+RUN_DIR="$OS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-${SOURCE_SHA:-unknown}"
+mkdir -p "$RUN_DIR"
+ln -sfn "$RUN_DIR" "$OS_ROOT/latest"
+export KYTRIX_REAL_PIXEL_EVIDENCE="$RUN_DIR"
+OS_DIR="$RUN_DIR"
 LOG="$OS_DIR/run.log"
-rm -rf "$OS_DIR"
-mkdir -p "$OS_DIR"
 : > "$LOG"
 exec > >(tee -a "$LOG") 2>&1
 
 echo "== kytrix real-pixel gate $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
+echo "run_dir=$RUN_DIR"
 echo "note: under a busy/concurrent desktop (screenshots, parallel gates, IDE load) --debug-stack can exceed the 300 s gate timeout; the script retries it up to 3 attempts and a single timeout is retried without changing the gate result"
 if [ -f "$ROOT/tools/source-id.txt" ]; then echo "source_id=$(tr '\n' ' ' < "$ROOT/tools/source-id.txt")"; fi
 echo "root=$ROOT"

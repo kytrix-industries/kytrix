@@ -85,12 +85,9 @@ fn relayout(
 
 fn max_size_for(entry: &PopupEntry, viewport: LogicalSize) -> MaxSize {
     let margin = entry.placement.viewport_margin;
-    let available_width = px((viewport.width.value() - 2.0 * margin.value()).max(0.0));
-    let available_height = px((viewport.height.value() - 2.0 * margin.value()).max(0.0));
-    let max = entry.placement.max_size;
     MaxSize {
-        width: max.shrinks_width().then_some(available_width),
-        height: max.shrinks_height().then_some(available_height),
+        width: Some(px((viewport.width.value() - 2.0 * margin.value()).max(0.0))),
+        height: Some(px((viewport.height.value() - 2.0 * margin.value()).max(0.0))),
     }
 }
 

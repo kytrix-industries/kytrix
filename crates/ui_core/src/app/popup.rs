@@ -249,8 +249,8 @@ pub(crate) fn open_popup(
             .ok_or(PopupError::UnknownWindow { window })?;
         let stack = target.popups_mut();
         match spec.scrim {
-            Some(_) => stack.reserve_z_pair(spec.z)?,
-            None => (0, stack.reserve_z(spec.z)?),
+            Some(_) => stack.reserve_z_pair(),
+            None => (0, stack.reserve_z()),
         }
     };
     if spec.tier == PopupTier::Modal {

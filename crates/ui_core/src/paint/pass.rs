@@ -338,7 +338,7 @@ impl PopupScale {
                     offset: self.point(draw.offset),
                 })
             }
-            Primitive::Text(text) => Primitive::Text(text),
+            _ => primitive,
         }
     }
 }

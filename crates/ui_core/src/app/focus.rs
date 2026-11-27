@@ -229,12 +229,20 @@ pub(crate) fn ime_cursor_area(
 
 pub(crate) fn focus_next(app: &mut App, window: WindowId) -> Option<NodeId> {
     app.validate_focus(window);
-    let next = if app
-        .windows
-        .get(&window)
-        .is_some_and(|target| target.popups().focus_owner().is_some())
-    {
-        popup_focus::next_in_popup_scope(app, window, app.focused(window), false)
+    let (modal, owner) = app.windows.get(&window).map_or((false, false), |target| {
+        (
+            target.popups().topmost_modal().is_some(),
+            target.popups().focus_owner().is_some(),
+        )
+    });
+    let focused = app.focused(window);
+    let next = if modal {
+        popup_focus::next_in_popup_scope(app, window, focused, false)
+    } else if owner {
+        match popup_focus::next_in_owner_scope(app, window, focused, false) {
+            Some(next) => Some(next),
+            None => popup_focus::leave_owner_scope(app, window, false),
+        }
     } else {
         app.windows.get(&window).and_then(|target| {
             focus::next_focusable(target.tree(), target.focus().focused(), false)
@@ -249,12 +257,20 @@ pub(crate) fn focus_next(app: &mut App, window: WindowId) -> Option<NodeId> {
 
 pub(crate) fn focus_prev(app: &mut App, window: WindowId) -> Option<NodeId> {
     app.validate_focus(window);
-    let next = if app
-        .windows
-        .get(&window)
-        .is_some_and(|target| target.popups().focus_owner().is_some())
-    {
-        popup_focus::next_in_popup_scope(app, window, app.focused(window), true)
+    let (modal, owner) = app.windows.get(&window).map_or((false, false), |target| {
+        (
+            target.popups().topmost_modal().is_some(),
+            target.popups().focus_owner().is_some(),
+        )
+    });
+    let focused = app.focused(window);
+    let next = if modal {
+        popup_focus::next_in_popup_scope(app, window, focused, true)
+    } else if owner {
+        match popup_focus::next_in_owner_scope(app, window, focused, true) {
+            Some(next) => Some(next),
+            None => popup_focus::leave_owner_scope(app, window, true),
+        }
     } else {
         app.windows
             .get(&window)

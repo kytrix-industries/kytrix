@@ -494,6 +494,7 @@ struct ListInner {
     geometry: RefCell<Geometry>,
     select_action: Action,
     row_action: RefCell<Option<Action>>,
+    rows_tab_stop: Cell<bool>,
     activate: RefCell<Option<Rc<dyn Fn(&mut App, usize)>>>,
     scrollbar: ScrollBar,
 }
@@ -538,6 +539,7 @@ impl List {
                 content: Rc::new(content),
                 select_action: Action::Custom(format_smolstr!("{key}.select")),
                 row_action: RefCell::new(None),
+                rows_tab_stop: Cell::new(true),
                 activate: RefCell::new(None),
                 scrollbar,
                 theme,
@@ -559,6 +561,10 @@ impl List {
 
     pub(crate) fn set_disabled_rows(&self, rows: impl IntoIterator<Item = usize>) {
         *self.inner.disabled.borrow_mut() = rows.into_iter().collect();
+    }
+
+    pub(crate) fn set_rows_tab_stop(&self, tab_stop: bool) {
+        self.inner.rows_tab_stop.set(tab_stop);
     }
 
     #[must_use]
@@ -1111,6 +1117,7 @@ impl List {
             let mut row = NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:row:{index}"))
                 .style(row_style)
+                .tab_stop(inner.rows_tab_stop.get())
                 .bind_style(move |cx| {
                     let selected = cx.read(&selection).contains(index);
                     let hovered = *cx.read(&hovered) == Some(index);

@@ -108,22 +108,14 @@ impl PopupDirty {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZPolicy {
-    Newest,
-    Above(PopupId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutsidePress {
     Consume,
     Replay,
-    Ignore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EscapePolicy {
     CloseTopmost,
-    CloseChain,
     Ignore,
 }
 
@@ -172,7 +164,6 @@ impl Default for DismissPolicy {
 pub enum RestoreFocus {
     Opener,
     Previous,
-    RootFallback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +194,7 @@ impl FocusPolicy {
     #[must_use]
     pub fn restore(self) -> RestoreFocus {
         match self {
-            Self::None => RestoreFocus::RootFallback,
+            Self::None => RestoreFocus::Previous,
             Self::Take { restore } | Self::Trap { restore, .. } => restore,
         }
     }
@@ -266,7 +257,6 @@ pub struct PopupSpec {
     pub pointer_transparent: bool,
     pub animation: PopupAnimation,
     pub a11y: PopupA11y,
-    pub z: ZPolicy,
     pub scrim: Option<ScrimSpec>,
 }
 
@@ -286,7 +276,6 @@ impl PopupSpec {
             pointer_transparent: false,
             animation: PopupAnimation::Fade,
             a11y: PopupA11y::default(),
-            z: ZPolicy::Newest,
             scrim: None,
         }
     }
@@ -392,26 +381,6 @@ pub enum ShiftPolicy {
     Limit,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MaxSize {
-    Viewport,
-    Width,
-    Height,
-    WidthAndHeight,
-}
-
-impl MaxSize {
-    #[must_use]
-    pub fn shrinks_width(self) -> bool {
-        matches!(self, Self::Viewport | Self::Width | Self::WidthAndHeight)
-    }
-
-    #[must_use]
-    pub fn shrinks_height(self) -> bool {
-        matches!(self, Self::Viewport | Self::Height | Self::WidthAndHeight)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Anchor {
     Node { node: NodeId },
@@ -427,7 +396,6 @@ pub struct PlacementSpec {
     pub fallbacks: SmallVec<[Placement; 4]>,
     pub viewport_margin: LogicalPx,
     pub shift: ShiftPolicy,
-    pub max_size: MaxSize,
 }
 
 impl PlacementSpec {
@@ -451,7 +419,6 @@ impl Default for PlacementSpec {
             fallbacks: smallvec::smallvec![Placement::new(Side::Top, Alignment::Start)],
             viewport_margin: crate::math::px(4.0),
             shift: ShiftPolicy::Limit,
-            max_size: MaxSize::Viewport,
         }
     }
 }
