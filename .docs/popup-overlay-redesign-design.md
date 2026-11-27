@@ -1676,16 +1676,16 @@ cargo run -p ui_kit --example gallery -- --debug-stack
 
 ### 14.10 文档入库与复现路径
 
-- **仓库约定与本次入库**：`.gitignore:3:.*` 忽略 `.docs/`；当前 tracked 例外只有 `.docs/gui-migration/spec-deltas/kit-gallery.md`、`kit-text.md`、`.docs/text-input-redesign-design.md`。**以下提交清单将在 lead 执行 `git add -f` 后生效**：`.docs/popup-overlay-redesign-design.md` 与 `.docs/popup-overlay-redesign/implementation/` 全目录（41 个文件：`p0-summary.md`、`p1-summary.md`、`p1-cleanup-w7.md`、`p1-migration-inventory.md`、`p2-summary.md`、`p3-summary.md`、`review-final-*`、`review-p0-*`、`review-p1-*`、`review-p2-*`、`review-p3-{engine,kit,acceptance}{,-r2}.md`）；`.docs` 其余默认忽略；`kit-gallery.md` 已 tracked，正常 `git add`。
-- **最终提交链**：`d9949aca → 152616b1 → f24a3441 → fa41987c → 5df859b8 → 5374c4c8 → 00927ff9 → 35c9381d`（HEAD，clean；其后为本文档提交，由 lead 执行 `git add -f`）；设计/实施/审查文档随该文档提交入库。
+- **仓库约定与本次入库**：`.gitignore:3:.*` 忽略 `.docs/`；本次已随提交 `260ebf5f` 以 `git add -f` 入库：`.docs/popup-overlay-redesign-design.md` 与 `.docs/popup-overlay-redesign/implementation/` 全目录（43 个文件：`p0-summary.md`、`p1-summary.md`、`p1-cleanup-w7.md`、`p1-migration-inventory.md`、`p2-summary.md`、`p3-summary.md`、`review-final-*`、`review-p0-*`、`review-p1-*`、`review-p2-*`、`review-p3-{engine,kit,acceptance}{,-r2}.md`）；`.docs/gui-migration/spec-deltas/kit-gallery.md` 已 tracked；`.docs` 其余默认忽略。
+- **最终提交链**：`d9949aca → 152616b1 → f24a3441 → fa41987c → 5df859b8 → 5374c4c8 → 00927ff9 → 35c9381d`（产品代码最终，clean）`→ 260ebf5f`（P1-P3 文档回写入库）`→` 本文档口径收口提交（§14.10）；三端验收 source identity 均指向 `35c9381d clean`。
 - **§14 引用的 implementation 文件清单**（均 `.docs/popup-overlay-redesign/implementation/`）：
   - `p3-summary.md`（本阶段实施摘要）
   - `p1-summary.md`、`p2-summary.md`、`p0-summary.md`（阶段摘要；`p1-cleanup-w7.md` 为 P1 清理记录）
   - `review-p3-engine.md`、`review-p3-kit.md`、`review-p3-acceptance.md` 与 r2 复核 `review-p3-{engine,kit,acceptance}-r2.md`
-  - 最终审查 `review-final-quality.md`、`review-final-arch.md`、`review-final-interaction.md`
+  - 最终审查 `review-final-quality.md`、`review-final-arch.md`、`review-final-interaction.md` 与 r2/r3 复核
   - 历史审查（§11–§13 引用）：`review-p0-*.md`、`review-p1-*.md`、`review-p2-*.md`、`review-p0-disposition.md`
-- **复现命令**：`cargo test -p ui_core -p ui_kit`；`gallery --pixel-check`/`--debug-stack`/`--real-pixel-check`（Windows 直接运行；macOS/Linux 用 `tools/real-pixel-check-*.sh`，Linux 自起 fresh nested sway）；真实像素证据落 `target/real-pixels/<platform>/`（report/run.log/PNG，gitignored）。
-- **source-id**：`tools/record-source-id.ps1` 生成 `tools/source-id.txt`（未跟踪生成物，提交前重生成；远端 tar 树带上该文件即可上报同一 `diff_sha`）；未生成时 gallery 回退 git/unknown。建议把 `tools/source-id.txt` 加入忽略或提交前删除，避免误提交。
+- **复现命令**：`cargo test -p ui_core -p ui_kit`；`gallery --pixel-check`/`--debug-stack`/`--real-pixel-check`（Windows 直接运行；macOS/Linux 用 `tools/real-pixel-check-*.sh`，Linux 自起 fresh nested sway）；真实像素证据落 `target/real-pixels/<platform>/<run>/`（report/run.log/PNG，gitignored）。
+- **source-id**：`tools/record-source-id.ps1` 生成 `tools/source-id.txt`（未跟踪生成物，提交前重生成；远端 tar 树带上该文件即可上报同一 `diff_sha`）；`.gitignore:8` 已忽略 `tools/source-id.txt`，未生成时 gallery 回退 git/unknown。
 ---
 
 ## 附录 A：证据索引
