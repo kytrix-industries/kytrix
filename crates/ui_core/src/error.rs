@@ -234,8 +234,15 @@ pub enum EngineError {
     Clipboard { detail: SmolStr },
     #[error("node {node:?} is not scrollable (make_scroll / Clip::Bounds required)")]
     NotScrollable { node: NodeId },
+    #[error(
+        "invalid scroll proxy for {node:?}: target {target:?} must be another scrollable node, \
+         not the node itself or one of its descendants"
+    )]
+    InvalidScrollProxy { node: NodeId, target: NodeId },
     #[error("node {node:?} is not a virtual list (Clip::Bounds + position: relative required)")]
     NotVirtualList { node: NodeId },
+    #[error("invalid content width while building under {node:?}: must be finite and non-negative")]
+    InvalidContentWidth { node: NodeId },
 
     #[error("virtual list item count mismatch: expected {expected}, got {actual}")]
     VirtualListExtents { expected: usize, actual: usize },
@@ -375,6 +382,10 @@ mod tests {
                 node: NodeId::for_test(4, 1),
                 axis: Axis::X,
                 value: px(f32::NAN),
+            },
+            EngineError::InvalidScrollProxy {
+                node: NodeId::for_test(15, 1),
+                target: NodeId::for_test(16, 1),
             },
             EngineError::TextShape {
                 node: NodeId::for_test(5, 1),

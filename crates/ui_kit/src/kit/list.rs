@@ -71,6 +71,7 @@ pub struct ListOptions {
     pub row_stretch: bool,
     pub scrollbar: bool,
     pub separator: bool,
+    pub content_width: Option<LogicalPx>,
 }
 
 impl ListOptions {
@@ -88,6 +89,7 @@ impl ListOptions {
             row_stretch: false,
             scrollbar: true,
             separator: false,
+            content_width: None,
         }
     }
 
@@ -577,6 +579,11 @@ impl List {
     }
 
     pub fn build(&self, tree: &mut NodeTree, parent: NodeId) -> Result<NodeId, EngineError> {
+        if let Some(width) = self.inner.options.content_width
+            && (!width.is_finite() || width < LogicalPx::ZERO)
+        {
+            return Err(EngineError::InvalidContentWidth { node: parent });
+        }
         let key = &self.inner.key;
         let outer_style = StyleBuilder::new()
             .relative()
@@ -631,6 +638,7 @@ impl List {
                 extent: options.row_height.extent(),
                 extents: None,
                 overscan: options.overscan,
+                content_width: options.content_width,
             },
         )?;
         let count = self.count(app);
@@ -644,7 +652,7 @@ impl List {
             geometry.handle = handle;
         }
         if options.scrollbar {
-            self.inner.scrollbar.attach(app, window, viewport);
+            self.inner.scrollbar.attach(app, window, viewport)?;
         }
         let select = self.clone();
         app.on_action(self.inner.select_action.clone(), move |ctx| {
@@ -1112,6 +1120,12 @@ impl List {
             } else {
                 row_style.items_center().build()
             };
+            let mut row_style = row_style;
+            if let Some(content_width) = options.content_width {
+                row_style.min_width(taffy::style::LengthPercentageAuto::length(
+                    content_width.value(),
+                ));
+            }
             let row_theme = theme.clone();
             let a11y_inner = inner.clone();
             let mut row = NodeBuilder::boxed()
@@ -1449,7 +1463,8 @@ mod ui_tests {
         a11y::{A11yPatch, A11yRole},
         error::EngineError,
         event::{InputEvent, Modifiers, PointerButton},
-        math::{LogicalPoint, LogicalPx, px},
+        interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
+        math::{LogicalPoint, LogicalPx, LogicalSize, px},
         node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
         paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
@@ -1939,6 +1954,88 @@ mod ui_tests {
             row_texts(harness.app.app(), harness.app.window_id(), &harness.list, 2),
             vec![SmolStr::new_static("row2")]
         );
+    }
+
+    #[test]
+    fn content_width_makes_the_list_dual_axis_with_wide_rows() {
+        let mut options = ListOptions::fixed(px(ROW_EXTENT));
+        options.content_width = Some(px(300.0));
+        let harness = harness_with(options, 20, text_row);
+        let viewport = harness.list.viewport_node().expect("viewport");
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(harness.app.window_id(), viewport)
+            .expect("handle");
+        let state = harness.app.app().scroll_state(&handle).expect("state");
+        assert_eq!(state.axes, ScrollAxes::Both, "内容宽 > 视口 ⇒ 双轴");
+        assert_eq!(state.viewport.width, px(BOX_WIDTH));
+        assert_eq!(
+            state.content.width,
+            px(300.0),
+            "横向内容宽 = ListOptions.content_width"
+        );
+
+        let row = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        let bounds = harness.app.probe().bounds(row).expect("row bounds");
+        assert_eq!(
+            bounds.size.width,
+            px(300.0),
+            "挂载行必须撑到内容宽而不是视口宽：{bounds:?}"
+        );
+    }
+
+    #[test]
+    fn content_width_none_keeps_vertical_rows_at_the_viewport_width() {
+        let harness = harness(20);
+        let viewport = harness.list.viewport_node().expect("viewport");
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(harness.app.window_id(), viewport)
+            .expect("handle");
+        let state = harness.app.app().scroll_state(&handle).expect("state");
+        assert_eq!(state.axes, ScrollAxes::Vertical, "None 保持纵向单轴");
+        assert_eq!(
+            state.content.width, state.viewport.width,
+            "None：横向内容宽仍是视口宽"
+        );
+
+        let row = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        let bounds = harness.app.probe().bounds(row).expect("row bounds");
+        assert_eq!(
+            bounds.size.width,
+            px(BOX_WIDTH),
+            "None：行宽 = 视口宽（旧行为）"
+        );
+    }
+
+    #[test]
+    fn invalid_content_width_is_rejected_by_the_list_build() {
+        for width in [px(f32::NAN), px(-1.0)] {
+            let mut app = TestApp::new();
+            let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+            let mut options = ListOptions::fixed(px(ROW_EXTENT));
+            options.content_width = Some(width);
+            let list = List::new(app.app_mut(), theme, "invalid", options, text_row);
+            list.set_initial_count(app.app_mut(), 4);
+            let window = app.window_id();
+            let root = app.app().window(window).expect("window").tree().root();
+            let parent = {
+                let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+                NodeBuilder::boxed().build(tree, root).expect("parent")
+            };
+            let built = {
+                let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+                list.build(tree, parent)
+            };
+            match built {
+                Err(EngineError::InvalidContentWidth { .. }) => {}
+                other => {
+                    panic!("非法 content_width {width:?} 必须是 InvalidContentWidth：{other:?}")
+                }
+            }
+        }
     }
 
     #[test]
@@ -2743,6 +2840,132 @@ mod ui_tests {
                 "第 {index} 行 extent = 内容高 + 2 × padding_y"
             );
         }
+    }
+
+    struct PageHarness {
+        app: TestApp,
+        list: List,
+        page: ScrollHandle,
+    }
+
+    fn page_with_list() -> PageHarness {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let root = app.app().window(window).expect("window").tree().root();
+        let page = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .id("page")
+                .style(
+                    StyleBuilder::new()
+                        .width(px(BOX_WIDTH))
+                        .height(px(BOX_HEIGHT))
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("page")
+        };
+        let page_handle = app
+            .app_mut()
+            .make_scroll(window, page, ScrollConfig::default())
+            .expect("page scrollable");
+        app.app_mut()
+            .set_scroll_content(&page_handle, LogicalSize::new(px(BOX_WIDTH), px(400.0)))
+            .expect("page content");
+        let list = List::new(
+            app.app_mut(),
+            theme,
+            "page-list",
+            ListOptions::fixed(px(ROW_EXTENT)),
+            text_row,
+        );
+        list.set_initial_count(app.app_mut(), 40);
+        list.mount(app.app_mut(), window, page).expect("mount");
+        let mut harness = PageHarness {
+            app,
+            list,
+            page: page_handle,
+        };
+        settle_page(&mut harness);
+        harness
+    }
+
+    fn settle_page(harness: &mut PageHarness) {
+        for _ in 0..6 {
+            harness.app.advance(std::time::Duration::from_millis(100));
+            harness.app.drain().expect("frame");
+            harness.list.sync(harness.app.app_mut()).expect("sync");
+        }
+        harness.app.drain().expect("frame");
+    }
+
+    fn wheel_over_node(harness: &mut PageHarness, node: NodeId) {
+        let bounds = harness.app.probe().bounds(node).expect("node bounds");
+        let point = LogicalPoint::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        assert_eq!(
+            harness.app.probe().hit(point).map(|hit| hit.node),
+            Some(node),
+            "滚轮落点必须命中 track/thumb 本身：布局漂移不得让用例假通过"
+        );
+        let _outcome = harness.app.inject(InputEvent::scroll_lines(
+            point,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            Modifiers::empty(),
+        ));
+        settle_page(harness);
+    }
+
+    fn page_and_list_offsets(harness: &PageHarness) -> (LogicalPx, LogicalPx) {
+        let page = harness
+            .app
+            .app()
+            .scroll_state(&harness.page)
+            .expect("page state")
+            .offset
+            .y;
+        let viewport = harness.list.viewport_node().expect("list viewport");
+        let handle = harness
+            .app
+            .app()
+            .scroll_handle(harness.app.window_id(), viewport)
+            .expect("list handle");
+        let list = harness
+            .app
+            .app()
+            .scroll_state(&handle)
+            .expect("list state")
+            .offset
+            .y;
+        (page, list)
+    }
+
+    #[test]
+    fn list_wheel_over_track_scrolls_list_not_page() {
+        let mut harness = page_with_list();
+        let (track, _) = harness.list.inner.scrollbar.nodes();
+        let track = track.expect("track node");
+        wheel_over_node(&mut harness, track);
+        let (page, list) = page_and_list_offsets(&harness);
+        println!("kit: track wheel page_offset={page:.1} list_offset={list:.1}");
+        assert_eq!(page, px(0.0), "滚轮落在列表滚动条 track 上不得滚外层页面");
+        assert_eq!(list, px(48.0), "滚轮必须滚列表自身");
+    }
+
+    #[test]
+    fn list_wheel_over_thumb_scrolls_list() {
+        let mut harness = page_with_list();
+        let (_, thumb) = harness.list.inner.scrollbar.nodes();
+        let thumb = thumb.expect("thumb node");
+        wheel_over_node(&mut harness, thumb);
+        let (page, list) = page_and_list_offsets(&harness);
+        println!("kit: thumb wheel page_offset={page:.1} list_offset={list:.1}");
+        assert_eq!(page, px(0.0), "滚轮落在列表滚动条 thumb 上不得滚外层页面");
+        assert_eq!(list, px(48.0), "滚轮必须滚列表自身");
     }
 }
 

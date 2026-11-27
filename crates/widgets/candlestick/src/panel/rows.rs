@@ -373,7 +373,7 @@ impl Rows<'_, '_> {
             })
             .build(self.cx.tree_mut(), line)?;
         let suffix = format_smolstr!("panel.period.{name}.{}", setting_name(row.key));
-        let input = FieldInput::build(&mut *self.cx, field_node, &field, suffix.as_str());
+        let input = FieldInput::build(&mut *self.cx, field_node, &field, suffix.as_str())?;
         self.controls.push(Control::Input(input));
         self.invalid_hint(
             key,
@@ -588,7 +588,7 @@ impl Rows<'_, '_> {
             })
             .build(self.cx.tree_mut(), line_node)?;
         let suffix = format_smolstr!("panel.line.{name}.{index}.period");
-        let input = FieldInput::build(&mut *self.cx, field_node, &field, suffix.as_str());
+        let input = FieldInput::build(&mut *self.cx, field_node, &field, suffix.as_str())?;
         self.controls.push(Control::Input(input));
         NodeBuilder::boxed()
             .style(StyleBuilder::new().flex_1().build())

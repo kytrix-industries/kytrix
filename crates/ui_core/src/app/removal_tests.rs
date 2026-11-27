@@ -71,15 +71,6 @@ fn mount_bound(app: &mut App, window: WindowId, parent: NodeId, signal: Signal<u
         .expect("mount bound")
 }
 
-fn mount_scroll(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
-    let mut style = boxed_style(100.0, 100.0);
-    style.clip = Clip::Bounds;
-    NodeBuilder::boxed()
-        .style(style)
-        .build(app.window_mut(window).expect("window").tree_mut(), parent)
-        .expect("mount scroll")
-}
-
 fn binding(key: KeyCode, action: Action) -> KeyBinding {
     KeyBinding {
         key,
@@ -287,37 +278,6 @@ fn animations_that_only_drive_surviving_nodes_are_untouched() {
 }
 
 #[test]
-fn scroll_animations_are_cancelled_with_their_container() {
-    let (_rt, mut app, window) = setup();
-    let root = root(&app, window);
-    let container = mount_scroll(&mut app, window, root);
-    let handle = app
-        .make_scroll(window, container, ScrollConfig::default())
-        .expect("scroll container");
-    app.set_scroll_content(&handle, LogicalSize::new(px(100.0), px(400.0)))
-        .expect("content");
-    app.scroll_to_animated(&handle, LogicalPoint::new(px(0.0), px(120.0)))
-        .expect("animated scroll");
-    assert_eq!(animation_count(&app), 1);
-    assert!(app.needs_continuous_frames(), "滚动动画需要帧");
-
-    let outcome = app
-        .remove_node(window, container)
-        .expect("remove container");
-    assert_eq!(outcome.animations, 1);
-    assert_eq!(animation_count(&app), 0, "滚动动画槽随容器取消");
-    assert!(
-        !app.needs_continuous_frames(),
-        "取消后不得再因这条动画进入连续帧（I3）"
-    );
-    assert_eq!(
-        app.pending_animation_completions_for_test(),
-        0,
-        "滚动槽是引擎内部驱动，不产生公开完成事件"
-    );
-}
-
-#[test]
 fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
     let (_rt, mut app, window) = setup();
     let root = root(&app, window);
@@ -336,6 +296,7 @@ fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -965,6 +926,7 @@ fn removing_a_mounted_virtual_row_is_rejected_without_side_effects() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -1739,6 +1701,7 @@ fn a_virtual_list_keeps_its_scroll_table_consistent_across_item_churn_and_popups
                 extent: px(20.0),
                 extents: None,
                 overscan: 1,
+                content_width: None,
             },
         )
         .expect("virtual list");

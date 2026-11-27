@@ -144,7 +144,7 @@ pub struct A11yScroll {
     pub y: LogicalPx,
     pub x_max: LogicalPx,
     pub y_max: LogicalPx,
-    pub vertical: bool,
+    pub orientation: Option<A11yOrientation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

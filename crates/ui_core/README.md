@@ -76,7 +76,7 @@ cargo test -p ui_core --features test-support
 # P17：Debug HUD 的公开 API 集成测试（`hud` feature）
 cargo test -p ui_core --features "hud,test-support" --test hud
 
-# P18：demo example 的 36 项测试（23 单测 + 13 场景，含 HUD F12）；--example 聚焦运行
+# P18：demo example 的 40 项测试（26 单测 + 13 场景 + 1 HUD F12）；--example 聚焦运行
 cargo test -p ui_core --features "hud,test-support" --example demo
 
 # 单独跑某一层

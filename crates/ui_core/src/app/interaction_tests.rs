@@ -1,4 +1,8 @@
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use super::App;
 use crate::{
@@ -8,8 +12,9 @@ use crate::{
         PointerButton, ScrollPhase, ScrollUnit,
     },
     interaction::{
-        AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, ScrollAxis, ScrollConfig,
-        VirtualListConfig,
+        AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, ScrollAxes, ScrollConfig,
+        ScrollHandle, VirtualListConfig,
+        scroll::{ScrollSession, SessionKind},
     },
     math::{DeviceRect, LogicalPoint, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
@@ -21,7 +26,7 @@ use crate::{
     },
     popup::{
         Alignment, Anchor, DismissPolicy, FocusPolicy, InitialFocus, PlacementSpec, PopupAnimation,
-        PopupId, PopupSpec, PopupTier, RestoreFocus, Side,
+        PopupId, PopupSpec, PopupTier, RestoreFocus, ScrimSpec, Side,
     },
     window::{FrameOutcome, WindowId, WindowOptions},
 };
@@ -167,7 +172,7 @@ fn wheel_events_in_one_frame_accumulate() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -206,7 +211,7 @@ fn non_finite_scroll_inputs_are_rejected() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -245,7 +250,7 @@ fn non_positive_line_height_is_rejected() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height,
             },
         );
@@ -564,7 +569,7 @@ fn scrollable_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) 
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -623,7 +628,7 @@ fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -786,7 +791,7 @@ fn a_nested_scroll_container_follows_the_outer_container_scroll() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -798,7 +803,7 @@ fn a_nested_scroll_container_follows_the_outer_container_scroll() {
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -863,6 +868,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -877,7 +883,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
             window,
             page,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -1483,7 +1489,7 @@ fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -1495,7 +1501,7 @@ fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -1658,6 +1664,7 @@ fn virtual_rows_carry_their_position_in_the_set() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -1706,6 +1713,7 @@ fn virtual_list_mounts_the_visible_window_and_recycles() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -2064,6 +2072,7 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -2126,6 +2135,7 @@ fn virtual_rows_are_laid_out_with_the_configured_extent() {
                 extent: px(25.0),
                 extents: None,
                 overscan: 0,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -2846,7 +2856,7 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -2911,6 +2921,434 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
 }
 
 #[test]
+fn keyboard_scrolls_focused_container_through_proxy() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(400.0)),
+    );
+    let track = NodeBuilder::boxed()
+        .style(StyleBuilder::new().size(px(20.0), px(80.0)).build())
+        .on_click(Action::custom("track"))
+        .build(app.window_mut(window).expect("window").tree_mut(), page)
+        .expect("track");
+    let thumb = NodeBuilder::boxed()
+        .style(StyleBuilder::new().size(px(20.0), px(20.0)).build())
+        .on_click(Action::custom("thumb"))
+        .build(app.window_mut(window).expect("window").tree_mut(), track)
+        .expect("thumb");
+    app.set_scroll_proxy(window, track, Some(pane))
+        .expect("proxy");
+    frame(&mut app, window);
+
+    assert!(app.set_focus(window, Some(track)));
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, pane).y,
+        px(48.0),
+        "焦点在 bar track 上时经代理滚所属容器"
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(0.0), "外层页面不动");
+
+    assert!(app.set_focus(window, Some(thumb)));
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, pane).y,
+        px(148.0),
+        "焦点在 thumb 上同样解析到 track 的代理目标（一页 = 视口高 100）"
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(0.0));
+}
+
+#[test]
+fn keyboard_both_axis_mapping_and_bar_focus_proxy() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Both,
+        48.0,
+        LogicalSize::new(px(400.0), px(400.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), pane)
+        .expect("row");
+    let track = NodeBuilder::boxed()
+        .layout_override(LogicalRect::new(px(180.0), px(0.0), px(20.0), px(80.0)))
+        .on_click(Action::custom("bar"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("track");
+    app.set_scroll_proxy(window, track, Some(pane))
+        .expect("proxy");
+    frame(&mut app, window);
+
+    let press = |app: &mut App, code: KeyCode| {
+        app.dispatch_input(window, InputEvent::key_down(code, Modifiers::empty()));
+        app.window(window)
+            .expect("window")
+            .tree()
+            .scroll_slot(pane)
+            .expect("slot")
+            .offset
+    };
+
+    assert!(app.set_focus(window, Some(row)));
+    assert_eq!(
+        press(&mut app, KeyCode::PageDown),
+        LogicalPoint::new(px(0.0), px(150.0)),
+        "Both 容器上 Page/Home/End 映射到纵轴"
+    );
+    assert_eq!(press(&mut app, KeyCode::Home), LogicalPoint::ZERO);
+    assert_eq!(
+        press(&mut app, KeyCode::End),
+        LogicalPoint::new(px(0.0), px(250.0))
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::ArrowRight),
+        LogicalPoint::new(px(48.0), px(250.0)),
+        "方向键按轴映射到横轴，纵轴保持"
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::PageUp),
+        LogicalPoint::new(px(48.0), px(100.0)),
+        "Page 仍走纵轴，横轴保持"
+    );
+
+    assert!(app.set_focus(window, Some(track)));
+    assert_eq!(
+        press(&mut app, KeyCode::ArrowRight),
+        LogicalPoint::new(px(96.0), px(100.0)),
+        "焦点在 bar 上经代理滚容器的横轴"
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::ArrowDown),
+        LogicalPoint::new(px(96.0), px(148.0))
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::End),
+        LogicalPoint::new(px(96.0), px(250.0))
+    );
+    assert_eq!(
+        press(&mut app, KeyCode::Home),
+        LogicalPoint::new(px(96.0), px(0.0))
+    );
+}
+
+#[test]
+fn keyboard_page_falls_through_horizontal_inner_to_vertical_page() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Horizontal,
+        48.0,
+        LogicalSize::new(px(400.0), px(80.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).x,
+        px(0.0),
+        "横向内层没有纵轴，PageDown 不得滚它"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(150.0),
+        "PageDown 沿候选链落到纵向页面（步长 = 页面视口高）"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowRight, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).x,
+        px(48.0),
+        "横向动作仍由最近的横向容器消费"
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(150.0));
+}
+
+#[test]
+fn keyboard_arrow_down_falls_through_horizontal_inner_to_vertical_page() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Horizontal,
+        48.0,
+        LogicalSize::new(px(400.0), px(80.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).x,
+        px(0.0),
+        "横向内层没有纵轴，ArrowDown 不得滚它"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(48.0),
+        "ArrowDown 沿候选链落到纵向页面（一行）"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowRight, Modifiers::empty()),
+    );
+    assert_eq!(slot_offset(&app, window, inner).x, px(48.0));
+    assert_eq!(slot_offset(&app, window, page).y, px(48.0));
+}
+
+#[test]
+fn keyboard_skips_hidden_and_disabled_scroll_candidates() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(200.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_style_patch_for_test(
+            inner,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(0.0),
+        "隐藏候选不得滚"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(48.0),
+        "隐藏候选被跳过，动作落到外层页面"
+    );
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_style_patch_for_test(
+            inner,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(0.0),
+        "禁用候选不得滚"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(96.0),
+        "禁用候选被跳过，动作落到外层页面"
+    );
+}
+
+#[test]
+fn keyboard_page_down_falls_back_to_horizontal_when_chain_has_no_vertical() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(300.0), px(100.0)),
+        ScrollAxes::Horizontal,
+        48.0,
+        LogicalSize::new(px(800.0), px(100.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Horizontal,
+        48.0,
+        LogicalSize::new(px(400.0), px(80.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).x,
+        px(100.0),
+        "纯横向链上 PageDown 回退到横轴（步长 = 内层视口宽）"
+    );
+    assert_eq!(slot_offset(&app, window, page).x, px(0.0));
+}
+
+#[test]
+fn keyboard_boundary_does_not_chain_to_the_outer_container() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(80.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(120.0)),
+    );
+    let row = NodeBuilder::boxed()
+        .on_click(Action::custom("row"))
+        .build(app.window_mut(window).expect("window").tree_mut(), inner)
+        .expect("row");
+    frame(&mut app, window);
+    assert!(app.set_focus(window, Some(row)));
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::End, Modifiers::empty()),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(40.0), "内层到 max");
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "End 不得链式滚外层"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(40.0), "内层保持夹紧");
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "PageDown 在边界不得链式滚外层"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::key_down(KeyCode::ArrowDown, Modifiers::empty()),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(40.0));
+    assert_eq!(slot_offset(&app, window, page).y, px(0.0));
+}
+
+#[test]
 fn the_event_buffer_is_bounded() {
     let (_rt, mut app, window) = setup();
     let capacity = super::event_queue::EVENT_QUEUE_CAPACITY;
@@ -2919,57 +3357,6 @@ fn the_event_buffer_is_bounded() {
     }
     assert_eq!(app.drain_events().len(), capacity, "容量是硬上限");
     assert_eq!(app.events_dropped(), 3, "溢出条数必须可观测");
-}
-
-#[test]
-fn pixel_scroll_follows_immediately_while_line_scroll_is_animated() {
-    let (_rt, mut app, window) = setup();
-    let container = scrollable_container(&mut app, window);
-    frame(&mut app, window);
-    let handle = app
-        .make_scroll(
-            window,
-            container,
-            ScrollConfig {
-                axis: ScrollAxis::Vertical,
-                line_height: px(48.0),
-            },
-        )
-        .expect("scrollable");
-    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
-        .expect("content");
-    frame(&mut app, window);
-
-    app.dispatch_input(
-        window,
-        InputEvent::scroll_lines(
-            LogicalPoint::new(px(50.0), px(50.0)),
-            LogicalPoint::new(px(0.0), px(-1.0)),
-            Modifiers::empty(),
-        ),
-    );
-    assert_eq!(
-        app.scroll_state(&handle).expect("state").offset.y,
-        px(0.0),
-        "行单位走动画（同帧内还没动）"
-    );
-
-    app.dispatch_input(
-        window,
-        InputEvent::Scroll {
-            position: LogicalPoint::new(px(50.0), px(50.0)),
-            delta: LogicalPoint::new(px(0.0), px(-30.0)),
-            unit: ScrollUnit::Pixel,
-            phase: ScrollPhase::Update,
-            modifiers: Modifiers::empty(),
-            timestamp: std::time::Instant::now(),
-        },
-    );
-    assert_eq!(
-        app.scroll_state(&handle).expect("state").offset.y,
-        px(30.0),
-        "像素单位必须立即到位"
-    );
 }
 
 #[test]
@@ -3243,56 +3630,6 @@ fn removing_the_captured_node_releases_the_capture() {
 }
 
 #[test]
-fn programmatic_scroll_cancels_a_pending_wheel_animation() {
-    let (_rt, mut app, window) = setup();
-    let container = scrollable_container(&mut app, window);
-    frame(&mut app, window);
-    let handle = app
-        .make_scroll(
-            window,
-            container,
-            ScrollConfig {
-                axis: ScrollAxis::Vertical,
-                line_height: px(48.0),
-            },
-        )
-        .expect("scrollable");
-    app.set_scroll_content(&handle, LogicalSize::new(px(100.0), px(400.0)))
-        .expect("content");
-    frame(&mut app, window);
-
-    app.dispatch_input(
-        window,
-        InputEvent::scroll_lines(
-            LogicalPoint::new(px(50.0), px(50.0)),
-            LogicalPoint::new(px(0.0), px(-1.0)),
-            Modifiers::empty(),
-        ),
-    );
-    assert_eq!(app.scroll_state(&handle).expect("state").offset.y, px(0.0));
-    assert!(app.animations_running(window), "滚轮动画已登记");
-
-    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(300.0)))
-        .expect("scroll");
-    assert_eq!(
-        app.scroll_state(&handle).expect("state").offset.y,
-        px(300.0)
-    );
-    assert!(
-        !app.animations_running(window),
-        "scroll_to 必须取消同槽动画"
-    );
-
-    app.advance_clock(std::time::Duration::from_millis(200));
-    frame(&mut app, window);
-    assert_eq!(
-        app.scroll_state(&handle).expect("state").offset.y,
-        px(300.0),
-        "残留动画不得回弹"
-    );
-}
-
-#[test]
 fn held_keys_are_per_window_and_cleared_on_close() {
     let (_rt, mut app, window) = setup();
     let other = app.create_window(WindowOptions {
@@ -3407,7 +3744,7 @@ fn only_the_primary_button_drives_drag_sessions() {
 }
 
 #[test]
-fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
+fn diagonal_wheel_picks_one_winner_and_does_not_split_the_delta() {
     let (_rt, mut app, window) = setup();
     let outer = mount_scroll_container(&mut app, window, 100.0);
     let mut inner_style = StyleBuilder::new().size(px(100.0), px(50.0)).build();
@@ -3423,7 +3760,7 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             window,
             outer,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -3435,7 +3772,7 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             window,
             inner,
             ScrollConfig {
-                axis: ScrollAxis::Horizontal,
+                axes: ScrollAxes::Horizontal,
                 line_height: px(48.0),
             },
         )
@@ -3450,18 +3787,925 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             position: LogicalPoint::new(px(20.0), px(20.0)),
             delta: LogicalPoint::new(px(-12.0), px(-3.0)),
             unit: ScrollUnit::Pixel,
-            phase: ScrollPhase::Update,
+            phase: ScrollPhase::Discrete,
+            modifiers: Modifiers::empty(),
+            timestamp: std::time::Instant::now(),
+        },
+    );
+    let inner_state = app.scroll_state(&inner_handle).expect("inner state");
+    assert_eq!(
+        inner_state.offset.x,
+        px(12.0),
+        "单赢家必须吃整段 dx（不按轴拆给不同容器）"
+    );
+    assert_eq!(inner_state.offset.y, px(0.0), "内层没有纵向能力");
+    assert_eq!(
+        app.scroll_state(&outer_handle)
+            .expect("outer state")
+            .offset
+            .y,
+        px(0.0),
+        "余量不得结转给外层容器"
+    );
+}
+
+fn mount_wheel_pane(app: &mut App, window: WindowId, outer: NodeId, height: f32) -> NodeId {
+    let mut style = Style::default();
+    style.clip = Clip::Bounds;
+    NodeBuilder::boxed()
+        .style(style)
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(height)))
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("mount inner pane")
+}
+
+fn nested_wheel_app(
+    inner_content: f32,
+    outer_content: f32,
+) -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) {
+    let (rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 150.0);
+    let inner = mount_wheel_pane(&mut app, window, outer, 100.0);
+    frame(&mut app, window);
+    let outer_handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("outer scrollable");
+    app.set_scroll_content(
+        &outer_handle,
+        LogicalSize::new(px(200.0), px(outer_content)),
+    )
+    .expect("outer content");
+    let inner_handle = app
+        .make_scroll(
+            window,
+            inner,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("inner scrollable");
+    app.set_scroll_content(
+        &inner_handle,
+        LogicalSize::new(px(200.0), px(inner_content)),
+    )
+    .expect("inner content");
+    frame(&mut app, window);
+    (rt, app, window, outer, inner)
+}
+
+fn dispatch_wheel(
+    app: &mut App,
+    window: WindowId,
+    position: LogicalPoint,
+    lines: f32,
+    timestamp: std::time::Instant,
+) {
+    app.dispatch_input(
+        window,
+        InputEvent::Scroll {
+            position,
+            delta: LogicalPoint::new(px(0.0), px(lines)),
+            unit: ScrollUnit::Line,
+            phase: ScrollPhase::Discrete,
+            modifiers: Modifiers::empty(),
+            timestamp,
+        },
+    );
+}
+
+fn settle_frames(app: &mut App, window: WindowId) {
+    app.advance_clock(std::time::Duration::from_millis(400));
+    frame(app, window);
+}
+
+fn wheel_offset(app: &App, window: WindowId, node: NodeId) -> Option<LogicalPoint> {
+    app.window(window)
+        .expect("window")
+        .tree()
+        .scroll_slot(node)
+        .map(|slot| slot.offset)
+}
+
+#[test]
+fn wheel_over_inner_content_scrolls_only_inner() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = std::time::Instant::now();
+    for step in 0..3 {
+        dispatch_wheel(
+            &mut app,
+            window,
+            LogicalPoint::new(px(50.0), px(50.0)),
+            -1.0,
+            base + std::time::Duration::from_millis(50 * step),
+        );
+    }
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(144.0))),
+        "内层内容上的 3 行滚轮只滚内层"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::ZERO),
+        "同一序列外层必须保持不动"
+    );
+}
+
+#[test]
+fn line_wheel_applies_immediately_and_accumulates_in_one_frame() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
+        .expect("content");
+    frame(&mut app, window);
+
+    let base = std::time::Instant::now();
+    for step in 0..2 {
+        dispatch_wheel(
+            &mut app,
+            window,
+            LogicalPoint::new(px(50.0), px(50.0)),
+            -1.0,
+            base + std::time::Duration::from_millis(50 * step),
+        );
+    }
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::new(px(0.0), px(96.0))),
+        "行滚轮必须立即到位，同一帧内两次刻度累加为 96 px，不得有待等待动画"
+    );
+    assert!(
+        !app.has_animations(),
+        "行滚轮必须立即到位，不得创建滚动动画"
+    );
+}
+
+#[test]
+fn pixel_wheel_applies_immediately() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
+        .expect("content");
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        InputEvent::Scroll {
+            position: LogicalPoint::new(px(50.0), px(50.0)),
+            delta: LogicalPoint::new(px(0.0), px(-30.0)),
+            unit: ScrollUnit::Pixel,
+            phase: ScrollPhase::Discrete,
             modifiers: Modifiers::empty(),
             timestamp: std::time::Instant::now(),
         },
     );
     assert_eq!(
-        app.scroll_state(&inner_handle)
-            .expect("inner state")
-            .offset
-            .x,
-        px(12.0),
-        "内层横向容器消费 dx"
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::new(px(0.0), px(30.0))),
+        "单轴 Pixel 滚轮必须同帧立即到位"
+    );
+    assert!(!app.has_animations(), "Pixel 滚轮不得创建滚动动画");
+}
+
+#[test]
+fn inner_at_end_does_not_move_outer_in_same_sequence() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(148.0, 400.0);
+    let base = std::time::Instant::now();
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base,
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "前置条件：内层已到边界"
+    );
+
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(50),
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "内层停在边界"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::ZERO),
+        "同一序列的余量必须丢弃：外层不得移动"
+    );
+}
+
+#[test]
+fn new_sequence_after_idle_moves_outer_when_inner_at_end() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(148.0, 400.0);
+    let base = std::time::Instant::now();
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base,
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "前置条件：内层已到边界"
+    );
+
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(50),
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "同一序列内层停在边界"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::ZERO),
+        "同一序列的余量必须丢弃：旧链式会结转并让外层离开 0"
+    );
+
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(500),
+    );
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "新序列不从内层边界继续"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "间隔超过序列空闲阈值后重新仲裁：外层整包消费 48 px 并立即到位（旧动画实现此处仍是 0）"
+    );
+}
+
+#[test]
+fn wheel_sequence_latches_target_when_pointer_moves() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = std::time::Instant::now();
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base,
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "前置条件：内层已滚 1 行"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(120.0)), Modifiers::empty()),
+    );
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(120.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(50),
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(96.0))),
+        "指针移到页面后同一序列仍锁定内层"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::ZERO),
+        "序列内不得因指针移动改滚外层"
+    );
+}
+
+#[test]
+fn new_sequence_after_idle_retargets_to_hovered_container() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = std::time::Instant::now();
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(50.0)),
+        -1.0,
+        base,
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "前置条件：内层已滚 1 行"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(120.0)), Modifiers::empty()),
+    );
+    dispatch_wheel(
+        &mut app,
+        window,
+        LogicalPoint::new(px(50.0), px(120.0)),
+        -1.0,
+        base + std::time::Duration::from_millis(500),
+    );
+    settle_frames(&mut app, window);
+    assert_eq!(
+        wheel_offset(&app, window, inner),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "新序列必须重新命中：内层不再接收"
+    );
+    assert_eq!(
+        wheel_offset(&app, window, outer),
+        Some(LogicalPoint::new(px(0.0), px(48.0))),
+        "新序列按指针位置重定位到外层"
+    );
+}
+
+#[test]
+fn scroll_to_clamps_both_axes_and_keeps_the_other_axis_untouched() {
+    let (_rt, mut app, window) = setup();
+    let container = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axes: ScrollAxes::Both,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(600.0), px(600.0)))
+        .expect("content");
+    frame(&mut app, window);
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").axes,
+        ScrollAxes::Both
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(120.0), px(80.0)))
+        .expect("both axes");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(120.0), px(80.0)),
+        "双轴目标一次写入两轴"
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(200.0), px(80.0)))
+        .expect("x only");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(200.0), px(80.0)),
+        "只滚 x 时 y 保持"
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(200.0), px(140.0)))
+        .expect("y only");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(200.0), px(140.0)),
+        "只滚 y 时 x 保持"
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(10_000.0), px(10_000.0)))
+        .expect("clamp");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(400.0), px(450.0)),
+        "两轴按各自滚动范围独立夹紧"
+    );
+}
+
+#[test]
+fn default_scroll_config_stays_on_the_vertical_single_axis() {
+    let (_rt, mut app, window) = setup();
+    let container = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(window, container, ScrollConfig::default())
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(600.0), px(600.0)))
+        .expect("content");
+    frame(&mut app, window);
+
+    let state = app.scroll_state(&handle).expect("state");
+    assert_eq!(state.axes, ScrollAxes::Vertical);
+    assert_eq!(state.content, LogicalSize::new(px(600.0), px(600.0)));
+    app.scroll_to(&handle, LogicalPoint::new(px(120.0), px(80.0)))
+        .expect("scroll");
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(0.0), px(80.0)),
+        "默认纵向容器的横向偏移恒 0（旧行为不变）"
+    );
+}
+
+fn scroll_event(
+    position: LogicalPoint,
+    delta: LogicalPoint,
+    unit: ScrollUnit,
+    phase: ScrollPhase,
+    timestamp: Instant,
+) -> InputEvent {
+    InputEvent::Scroll {
+        position,
+        delta,
+        unit,
+        phase,
+        modifiers: Modifiers::empty(),
+        timestamp,
+    }
+}
+
+fn slot_offset(app: &App, window: WindowId, node: NodeId) -> LogicalPoint {
+    wheel_offset(app, window, node).expect("scroll slot")
+}
+
+fn scroll_session_of(app: &App, window: WindowId) -> Option<ScrollSession> {
+    app.window(window).expect("window").pointer().scroll_session
+}
+
+fn mount_scrollable(
+    app: &mut App,
+    window: WindowId,
+    parent: NodeId,
+    size: LogicalSize,
+    axes: ScrollAxes,
+    line_height: f32,
+    content: LogicalSize,
+) -> (NodeId, ScrollHandle) {
+    let mut style = StyleBuilder::new().size(size.width, size.height).build();
+    style.clip = Clip::Bounds;
+    let node = NodeBuilder::boxed()
+        .style(style)
+        .build(app.window_mut(window).expect("window").tree_mut(), parent)
+        .expect("mount scrollable");
+    frame(app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            node,
+            ScrollConfig {
+                axes,
+                line_height: px(line_height),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, content).expect("content");
+    frame(app, window);
+    (node, handle)
+}
+
+#[test]
+fn continuous_phases_bound_sequence() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let base = Instant::now();
+    let event = |phase: ScrollPhase, lines: f32, offset: Duration| {
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(lines)),
+            ScrollUnit::Line,
+            phase,
+            base + offset,
+        )
+    };
+
+    app.dispatch_input(window, event(ScrollPhase::Begin, -1.0, Duration::ZERO));
+    let session = scroll_session_of(&app, window).expect("Begin 建立会话");
+    assert_eq!(session.target, inner);
+    assert_eq!(session.kind, SessionKind::Continuous);
+    assert_eq!(session.ended_at, None);
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Update, -1.0, Duration::from_millis(50)),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(96.0));
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Momentum, -1.0, Duration::from_millis(100)),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(144.0));
+
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::End, 0.0, Duration::from_millis(150)),
+    );
+    let session = scroll_session_of(&app, window).expect("End 只收盘，不清会话");
+    assert_eq!(session.ended_at, Some(base + Duration::from_millis(150)));
+    assert_eq!(session.last_event_at, base + Duration::from_millis(150));
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(144.0),
+        "零 delta End 不得处理 delta"
+    );
+
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Cancel, -1.0, Duration::from_millis(160)),
+    );
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "Cancel 立即清会话"
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(144.0),
+        "Cancel 不处理 delta"
+    );
+
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Begin, -1.0, Duration::from_millis(200)),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(192.0));
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::End, 0.0, Duration::from_millis(250)),
+    );
+    assert!(
+        scroll_session_of(&app, window).is_some_and(|session| session.ended_at.is_some()),
+        "零 delta End 对连续会话只置 ended_at"
+    );
+
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Begin, -1.0, Duration::from_millis(300)),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(240.0));
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Cancel, 0.0, Duration::from_millis(350)),
+    );
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "零 delta Cancel 也生效"
+    );
+
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Discrete, -1.0, Duration::from_millis(400)),
+    );
+    let session = scroll_session_of(&app, window).expect("Discrete 建立会话");
+    assert_eq!(session.kind, SessionKind::Discrete);
+    assert_eq!(slot_offset(&app, window, inner).y, px(288.0));
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::End, 0.0, Duration::from_millis(450)),
+    );
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "Discrete 会话的 End 直接清"
+    );
+    let _ = outer;
+}
+
+#[test]
+fn removing_latched_container_mid_sequence_does_not_panic() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(inner)
+    );
+
+    assert!(app.remove_node(window, inner).is_ok());
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "目标卸载必须清理会话"
+    );
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(48.0),
+        "下一事件重新仲裁到外层且不 panic"
+    );
+}
+
+#[test]
+fn removing_proxy_target_falls_back_to_ancestor() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(400.0)),
+    );
+    let track = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(120.0), px(0.0), px(20.0), px(80.0)),
+    );
+    app.set_scroll_proxy(window, track, Some(pane))
+        .expect("proxy");
+    frame(&mut app, window);
+
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(125.0), px(40.0));
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, pane).y, px(48.0));
+    assert_eq!(slot_offset(&app, window, page).y, px(0.0));
+
+    assert!(app.remove_node(window, pane).is_ok());
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(48.0),
+        "代理目标失效后落到祖先，不 panic"
+    );
+}
+
+#[test]
+fn wheel_over_scroll_proxy_scrolls_target() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(400.0)),
+    );
+    let track = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(120.0), px(0.0), px(20.0), px(80.0)),
+    );
+    app.set_scroll_proxy(window, track, Some(pane))
+        .expect("proxy");
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(125.0), px(40.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, pane).y,
+        px(48.0),
+        "命中代理节点必须滚它的目标容器"
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(0.0), "外层不得滚动");
+}
+
+#[test]
+fn wheel_proxy_target_at_end_chains_to_ancestor_on_new_sequence() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(148.0)),
+    );
+    let track = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(120.0), px(0.0), px(20.0), px(80.0)),
+    );
+    app.set_scroll_proxy(window, track, Some(pane))
+        .expect("proxy");
+    frame(&mut app, window);
+
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(125.0), px(40.0));
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, pane).y, px(48.0), "内层到边界");
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "同一序列余量丢弃"
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(500),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(48.0),
+        "新序列重新仲裁：代理目标在边界，候选链继续到祖先"
+    );
+    assert_eq!(slot_offset(&app, window, pane).y, px(48.0));
+}
+
+#[test]
+fn vertical_wheel_over_horizontal_inner_scrolls_outer() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 100.0);
+    let mut inner_style = StyleBuilder::new().size(px(100.0), px(50.0)).build();
+    inner_style.clip = Clip::Bounds;
+    let inner = NodeBuilder::boxed()
+        .style(inner_style)
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("mount");
+    frame(&mut app, window);
+    let outer_handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("outer scrollable");
+    app.set_scroll_content(&outer_handle, LogicalSize::new(px(200.0), px(400.0)))
+        .expect("outer content");
+    let inner_handle = app
+        .make_scroll(
+            window,
+            inner,
+            ScrollConfig {
+                axes: ScrollAxes::Horizontal,
+                line_height: px(48.0),
+            },
+        )
+        .expect("inner scrollable");
+    app.set_scroll_content(&inner_handle, LogicalSize::new(px(400.0), px(50.0)))
+        .expect("inner content");
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(20.0), px(20.0)),
+            LogicalPoint::new(px(0.0), px(-3.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&inner_handle).expect("inner state").offset,
+        LogicalPoint::ZERO,
+        "横向内层不能消费纵向分量"
     );
     assert_eq!(
         app.scroll_state(&outer_handle)
@@ -3469,6 +4713,1671 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             .offset
             .y,
         px(3.0),
-        "纵向分量必须传给外层容器"
+        "候选链继续到可消费的外层"
     );
+}
+
+#[test]
+fn shift_wheel_swaps_axes_before_target_resolution() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 100.0);
+    let mut inner_style = StyleBuilder::new().size(px(100.0), px(50.0)).build();
+    inner_style.clip = Clip::Bounds;
+    let inner = NodeBuilder::boxed()
+        .style(inner_style)
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("mount");
+    frame(&mut app, window);
+    let outer_handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("outer scrollable");
+    app.set_scroll_content(&outer_handle, LogicalSize::new(px(200.0), px(400.0)))
+        .expect("outer content");
+    let inner_handle = app
+        .make_scroll(
+            window,
+            inner,
+            ScrollConfig {
+                axes: ScrollAxes::Horizontal,
+                line_height: px(48.0),
+            },
+        )
+        .expect("inner scrollable");
+    app.set_scroll_content(&inner_handle, LogicalSize::new(px(400.0), px(50.0)))
+        .expect("inner content");
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        InputEvent::Scroll {
+            position: LogicalPoint::new(px(20.0), px(20.0)),
+            delta: LogicalPoint::new(px(0.0), px(-3.0)),
+            unit: ScrollUnit::Pixel,
+            phase: ScrollPhase::Discrete,
+            modifiers: Modifiers::SHIFT,
+            timestamp: Instant::now(),
+        },
+    );
+    assert_eq!(
+        app.scroll_state(&inner_handle)
+            .expect("inner state")
+            .offset
+            .x,
+        px(3.0),
+        "SHIFT 必须在 raw 空间换轴后再解析目标"
+    );
+    assert_eq!(
+        app.scroll_state(&outer_handle).expect("outer state").offset,
+        LogicalPoint::ZERO
+    );
+}
+
+#[test]
+fn dual_axis_container_consumes_both_axes() {
+    let (_rt, mut app, window) = setup();
+    let container = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axes: ScrollAxes::Both,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(500.0), px(500.0)))
+        .expect("content");
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(-12.0), px(-3.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(12.0), px(3.0)),
+        "双轴容器一次 scroll_to 写入两轴"
+    );
+}
+
+#[test]
+fn dual_axis_clamps_each_axis_independently() {
+    let (_rt, mut app, window) = setup();
+    let container = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axes: ScrollAxes::Both,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(600.0), px(600.0)))
+        .expect("content");
+    frame(&mut app, window);
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let base = Instant::now();
+
+    app.scroll_to(&handle, LogicalPoint::new(px(100.0), px(120.0)))
+        .expect("baseline");
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-30.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(100.0), px(150.0)),
+        "只滚一轴时另一轴保持"
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(-30.0), px(0.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(130.0), px(150.0)),
+        "另一方向滚轮同样不重置对方轴"
+    );
+
+    app.scroll_to(&handle, LogicalPoint::new(px(400.0), px(10.0)))
+        .expect("x 到边界");
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(-30.0), px(-30.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(500),
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(400.0), px(40.0)),
+        "一轴到边界不影响另一轴"
+    );
+}
+
+#[test]
+fn disabled_axis_stays_zero_under_wheel() {
+    let (_rt, mut app, window) = setup();
+    let container = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(500.0), px(500.0)))
+        .expect("content");
+    frame(&mut app, window);
+    let base = Instant::now();
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(-30.0), px(0.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::ZERO,
+        "未启用轴不得消费"
+    );
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "不可消费时不建立会话"
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-30.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::new(px(0.0), px(30.0)),
+        "启用轴照常消费"
+    );
+}
+
+#[test]
+fn wheel_scroll_refreshes_hover_under_pointer() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(700.0)),
+    );
+    let first = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0)),
+    );
+    let second = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(0.0), px(300.0), px(200.0), px(100.0)),
+    );
+    frame(&mut app, window);
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(50.0)), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(first));
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-300.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(300.0));
+    assert_eq!(
+        app.hovered(window),
+        Some(second),
+        "滚动后必须按指针重新命中并刷新 hover"
+    );
+}
+
+#[test]
+fn wheel_without_movement_requests_no_frame() {
+    let (_rt, mut app, window) = setup();
+    let container = mount_scroll_container(&mut app, window, 150.0);
+    frame(&mut app, window);
+    let handle = app
+        .make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(150.0)))
+        .expect("content");
+    frame(&mut app, window);
+    let requests = app.frame_requests();
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-30.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset,
+        LogicalPoint::ZERO
+    );
+    assert_eq!(
+        app.frame_requests(),
+        requests,
+        "没有实际滚动不得请求帧（I7）"
+    );
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "没有可消费候选时不建立会话"
+    );
+}
+
+#[test]
+fn wheel_outside_modal_scope_is_dropped() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let mut spec = at_point(250.0, 150.0);
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Previous,
+        initial: InitialFocus::Container,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: false,
+        escape: true,
+    };
+    let _modal = open_box(&mut app, window, spec, (80.0, 60.0));
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "模态作用域外的滚轮必须丢弃"
+    );
+    assert!(scroll_session_of(&app, window).is_none());
+}
+
+#[test]
+fn modal_overlay_lifecycle_clears_scroll_sequence() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let base = Instant::now();
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(48.0));
+    let session = scroll_session_of(&app, window).expect("会话已建立");
+    assert_eq!(session.target, page);
+
+    let mut spec = at_point(250.0, 150.0);
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Previous,
+        initial: InitialFocus::Container,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: false,
+        escape: true,
+    };
+    let modal = open_box(&mut app, window, spec, (200.0, 150.0));
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "模态浮层创建必须清会话"
+    );
+
+    let modal_content = popup_content(&app, window, modal);
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        modal_content,
+        LogicalSize::new(px(150.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(150.0), px(400.0)),
+    );
+    frame(&mut app, window);
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(300.0), px(200.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, pane).y, px(48.0));
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(pane)
+    );
+
+    app.close_popup(modal).expect("关闭模态");
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "模态浮层关闭必须清会话"
+    );
+}
+
+#[test]
+fn closing_a_modal_clears_a_session_targeting_its_background() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let mut spec = at_point(250.0, 150.0);
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Previous,
+        initial: InitialFocus::Container,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: false,
+        escape: true,
+    };
+    let modal = open_box(&mut app, window, spec, (200.0, 150.0));
+    app.window_mut(window)
+        .expect("window")
+        .pointer_mut()
+        .scroll_session = Some(ScrollSession {
+        target: page,
+        kind: SessionKind::Discrete,
+        last_event_at: Instant::now(),
+        ended_at: None,
+    });
+    app.close_popup(modal).expect("关闭模态");
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "关闭模态必须清掉指向背景容器的会话，不能只依赖目标节点被删除"
+    );
+}
+
+#[test]
+fn wheel_on_a_modal_scrim_is_dropped() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let mut spec = at_point(100.0, 50.0);
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Previous,
+        initial: InitialFocus::Container,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: false,
+        escape: true,
+    };
+    spec.scrim = Some(ScrimSpec::default());
+    let _modal = open_box(&mut app, window, spec, (100.0, 80.0));
+    frame(&mut app, window);
+    assert_eq!(popup_len(&app, window), 2, "模态必须有 scrim 条目");
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(250.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "滚轮落在 scrim 上不得滚背景页面"
+    );
+    assert!(scroll_session_of(&app, window).is_none());
+}
+
+#[test]
+fn deeply_nested_candidates_no_panic() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let mut chain = Vec::new();
+    let mut parent = root;
+    for _ in 0..12 {
+        let mut style = StyleBuilder::new().size(px(200.0), px(150.0)).build();
+        style.clip = Clip::Bounds;
+        let node = NodeBuilder::boxed()
+            .style(style)
+            .build(app.window_mut(window).expect("window").tree_mut(), parent)
+            .expect("mount");
+        chain.push(node);
+        parent = node;
+    }
+    frame(&mut app, window);
+    let scrollable = chain[3];
+    let handle = app
+        .make_scroll(
+            window,
+            scrollable,
+            ScrollConfig {
+                axes: ScrollAxes::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scrollable");
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
+        .expect("content");
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, scrollable).y,
+        px(48.0),
+        "12 层嵌套中距命中节点 9 层的容器仍可被候选链解析（不设 8 层截断）"
+    );
+}
+
+#[test]
+fn window_focus_loss_clears_scroll_sequence() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(148.0, 400.0);
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0), "内层到边界");
+    assert!(scroll_session_of(&app, window).is_some());
+
+    app.on_window_focus_lost(window);
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "窗口失焦必须清会话"
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(48.0),
+        "失焦后的滚轮重新仲裁到外层"
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+}
+
+#[test]
+fn scroll_proxy_api_validates_and_clears() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (pane, _pane_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(400.0)),
+    );
+    let track = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(120.0), px(0.0), px(20.0), px(80.0)),
+    );
+    let bare = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(150.0), px(80.0), px(20.0), px(20.0)),
+    );
+    frame(&mut app, window);
+
+    assert!(
+        app.set_scroll_proxy(window, track, Some(pane)).is_ok(),
+        "合法代理"
+    );
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .scroll_proxy(track),
+        Some(pane)
+    );
+
+    let unknown = WindowId::for_test(999);
+    assert!(matches!(
+        app.set_scroll_proxy(unknown, track, Some(pane)),
+        Err(EngineError::UnknownWindow { window }) if window == unknown
+    ));
+
+    let gone = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(120.0), px(80.0), px(20.0), px(20.0)),
+    );
+    assert!(app.remove_node(window, gone).is_ok());
+    assert!(matches!(
+        app.set_scroll_proxy(window, gone, Some(pane)),
+        Err(EngineError::StaleNode { node }) if node == gone
+    ));
+
+    assert!(matches!(
+        app.set_scroll_proxy(window, track, Some(bare)),
+        Err(EngineError::NotScrollable { node }) if node == bare
+    ));
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .scroll_proxy(track),
+        Some(pane),
+        "校验失败不得半写代理"
+    );
+
+    assert!(matches!(
+        app.set_scroll_proxy(window, pane, Some(pane)),
+        Err(EngineError::InvalidScrollProxy { node, target }) if node == pane && target == pane
+    ));
+    assert!(matches!(
+        app.set_scroll_proxy(window, page, Some(pane)),
+        Err(EngineError::InvalidScrollProxy { node, target }) if node == page && target == pane
+    ));
+
+    assert!(app.set_scroll_proxy(window, track, None).is_ok());
+    assert_eq!(
+        app.window(window)
+            .expect("window")
+            .tree()
+            .scroll_proxy(track),
+        None,
+        "None 清除代理"
+    );
+}
+
+#[test]
+fn continuous_end_then_momentum_keeps_target() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let event = |phase: ScrollPhase, lines: f32, offset: Duration| {
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(lines)),
+            ScrollUnit::Line,
+            phase,
+            base + offset,
+        )
+    };
+
+    app.dispatch_input(window, event(ScrollPhase::Begin, -1.0, Duration::ZERO));
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Update, -1.0, Duration::from_millis(50)),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(96.0));
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::End, 0.0, Duration::from_millis(100)),
+    );
+    assert!(
+        scroll_session_of(&app, window).is_some_and(|session| session.ended_at.is_some()),
+        "End 只进入 Grace"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(120.0)), Modifiers::empty()),
+    );
+    app.dispatch_input(
+        window,
+        event(ScrollPhase::Momentum, -1.0, Duration::from_millis(150)),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(144.0),
+        "IDLE 内的 Momentum 沿用闩锁目标"
+    );
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(0.0),
+        "惯性不得因指针移动改滚外层"
+    );
+    let session = scroll_session_of(&app, window).expect("Grace 会话保持");
+    assert_eq!(session.target, inner);
+    assert_eq!(session.kind, SessionKind::Continuous);
+}
+
+#[test]
+fn timestamp_sequence_boundaries_are_monotonic_and_robust() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(148.0, 400.0);
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let wheel = |offset: Duration| {
+        scroll_event(
+            position,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + offset,
+        )
+    };
+
+    app.dispatch_input(window, wheel(Duration::ZERO));
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0), "内层到边界");
+    app.dispatch_input(window, wheel(Duration::ZERO));
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(0.0),
+        "同一时间戳仍在同一序列内"
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::Scroll {
+            position,
+            delta: LogicalPoint::new(px(0.0), px(-1.0)),
+            unit: ScrollUnit::Line,
+            phase: ScrollPhase::Discrete,
+            modifiers: Modifiers::empty(),
+            timestamp: base - Duration::from_millis(50),
+        },
+    );
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(0.0),
+        "回退的时间戳按饱和零间隔处理，仍在同一序列"
+    );
+    app.dispatch_input(window, wheel(Duration::from_millis(500)));
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(48.0),
+        "超过 IDLE 后新序列重新仲裁到外层"
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+}
+
+#[test]
+fn wheel_hover_refresh_skipped_during_pointer_capture() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(700.0)),
+    );
+    let first = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0)),
+    );
+    let _second = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(0.0), px(300.0), px(200.0), px(100.0)),
+    );
+    let third = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(0.0), px(450.0), px(200.0), px(100.0)),
+    );
+    frame(&mut app, window);
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(50.0)), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(first));
+    assert!(app.capture_pointer(window, page));
+
+    let base = Instant::now();
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-300.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(300.0));
+    assert_eq!(
+        app.hovered(window),
+        Some(first),
+        "指针捕获期间不得刷新 hover"
+    );
+
+    assert!(app.release_pointer(window));
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-150.0)),
+            ScrollUnit::Pixel,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, page).y, px(450.0));
+    assert_eq!(
+        app.hovered(window),
+        Some(third),
+        "释放捕获后滚动恢复 hover 刷新"
+    );
+}
+
+#[test]
+fn scroll_sequences_are_isolated_per_window() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(148.0)),
+    );
+
+    let other = app.create_window(WindowOptions {
+        title: "other".into(),
+        size: LogicalSize::new(px(400.0), px(300.0)),
+        ..WindowOptions::default()
+    });
+    frame(&mut app, other);
+    let other_root = root_of(&app, other);
+    let (other_container, _other_handle) = mount_scrollable(
+        &mut app,
+        other,
+        other_root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+
+    let base = Instant::now();
+    let first = LogicalPoint::new(px(50.0), px(50.0));
+    app.dispatch_input(
+        window,
+        scroll_event(
+            first,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(48.0),
+        "窗口 1 内层到边界"
+    );
+    app.dispatch_input(
+        other,
+        scroll_event(
+            first,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, other, other_container).y,
+        px(48.0),
+        "窗口 2 独立闩锁自己的容器"
+    );
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(120.0)), Modifiers::empty()),
+    );
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(120.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(100),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "窗口 2 的会话不得影响窗口 1 的闩锁"
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+}
+
+#[test]
+fn hint_based_target_selection_uses_first_event_delta() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (outer, _outer_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(600.0)),
+    );
+    let (inner, _inner_handle) = mount_scrollable(
+        &mut app,
+        window,
+        outer,
+        LogicalSize::new(px(200.0), px(100.0)),
+        ScrollAxes::Vertical,
+        20.0,
+        LogicalSize::new(px(200.0), px(600.0)),
+    );
+    frame(&mut app, window);
+    let base = Instant::now();
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(20.0),
+        "首事件按命中候选自己的 line_height 换算并选中内层"
+    );
+    assert_eq!(slot_offset(&app, window, outer).y, px(0.0));
+
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(120.0)), Modifiers::empty()),
+    );
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(120.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(40.0),
+        "序列内沿用闩锁目标，不按新指针位置重新选择"
+    );
+    assert_eq!(slot_offset(&app, window, outer).y, px(0.0));
+}
+
+#[test]
+fn wheel_without_hit_never_scrolls_the_latched_target() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = Instant::now();
+    let inside = LogicalPoint::new(px(50.0), px(50.0));
+    let outside = LogicalPoint::new(px(500.0), px(400.0));
+    let delta = LogicalPoint::new(px(0.0), px(-1.0));
+
+    app.dispatch_input(
+        window,
+        scroll_event(inside, delta, ScrollUnit::Line, ScrollPhase::Discrete, base),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(48.0),
+        "前置条件：内层已被闩锁并滚动"
+    );
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(inner)
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            outside,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(48.0),
+        "无命中时必须丢弃事件：不得滚动闩锁目标"
+    );
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(0.0),
+        "无命中时也不得滚动其它容器"
+    );
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(inner),
+        "无命中的 Discrete 不改变闩锁目标"
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            outside,
+            LogicalPoint::ZERO,
+            ScrollUnit::Line,
+            ScrollPhase::End,
+            base + Duration::from_millis(100),
+        ),
+    );
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "无命中的零 delta End 仍必须清理离散会话"
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            inside,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(150),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(96.0),
+        "会话清空后重新仲裁"
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            outside,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Update,
+            base + Duration::from_millis(200),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(96.0),
+        "无命中的 Update 不得滚动闩锁目标"
+    );
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(inner)
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            outside,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Cancel,
+            base + Duration::from_millis(250),
+        ),
+    );
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "无命中的 Cancel 必须清会话"
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(96.0),
+        "Cancel 不处理 delta"
+    );
+    assert_eq!(slot_offset(&app, window, outer).y, px(0.0));
+}
+
+#[test]
+fn end_without_session_does_not_scroll_or_create_a_session() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::End,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(0.0),
+        "无会话的非零 End 不得滚动任何容器"
+    );
+    assert_eq!(slot_offset(&app, window, outer).y, px(0.0));
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "无会话的非零 End 不得建立新会话"
+    );
+}
+
+#[test]
+fn zero_delta_begin_clears_the_session_without_a_new_target() {
+    let (_rt, mut app, window, _outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let delta = LogicalPoint::new(px(0.0), px(-1.0));
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+    assert!(scroll_session_of(&app, window).is_some());
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            LogicalPoint::ZERO,
+            ScrollUnit::Line,
+            ScrollPhase::Begin,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert!(
+        scroll_session_of(&app, window).is_none(),
+        "零 delta Begin 必须清旧会话"
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(48.0),
+        "零 delta Begin 不得滚动"
+    );
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Update,
+            base + Duration::from_millis(100),
+        ),
+    );
+    let session = scroll_session_of(&app, window).expect("Update 重新仲裁并建立会话");
+    assert_eq!(session.target, inner);
+    assert_eq!(session.kind, SessionKind::Continuous);
+    assert_eq!(slot_offset(&app, window, inner).y, px(96.0));
+}
+
+#[test]
+fn latched_target_hidden_mid_sequence_is_retargeted() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let delta = LogicalPoint::new(px(0.0), px(-1.0));
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(inner)
+    );
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_style_patch(
+            inner,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+    frame(&mut app, window);
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(48.0),
+        "闩锁目标被隐藏后下一滚轮必须重新仲裁到外层"
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(48.0),
+        "隐藏后的旧目标不得再滚动"
+    );
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(outer)
+    );
+}
+
+#[test]
+fn latched_target_disabled_mid_sequence_is_retargeted() {
+    let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+    let base = Instant::now();
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let delta = LogicalPoint::new(px(0.0), px(-1.0));
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base,
+        ),
+    );
+    assert_eq!(slot_offset(&app, window, inner).y, px(48.0));
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(inner)
+    );
+
+    app.window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .set_style_patch(
+            inner,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+    frame(&mut app, window);
+    app.dispatch_input(
+        window,
+        scroll_event(
+            position,
+            delta,
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            base + Duration::from_millis(50),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, outer).y,
+        px(48.0),
+        "闩锁目标被禁用后下一滚轮必须重新仲裁到外层"
+    );
+    assert_eq!(
+        slot_offset(&app, window, inner).y,
+        px(48.0),
+        "禁用后的旧目标不得再滚动"
+    );
+    assert_eq!(
+        scroll_session_of(&app, window).map(|session| session.target),
+        Some(outer)
+    );
+}
+
+#[test]
+fn end_with_dead_latched_target_clears_session_without_scrolling() {
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let delta = LogicalPoint::new(px(0.0), px(-1.0));
+    for (label, patch) in [
+        (
+            "隐藏",
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        ),
+        (
+            "禁用",
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        ),
+    ] {
+        let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+        let base = Instant::now();
+        app.dispatch_input(
+            window,
+            scroll_event(
+                position,
+                delta,
+                ScrollUnit::Line,
+                ScrollPhase::Discrete,
+                base,
+            ),
+        );
+        assert_eq!(
+            slot_offset(&app, window, inner).y,
+            px(48.0),
+            "{label}前内层已被闩锁并滚动"
+        );
+        assert_eq!(
+            scroll_session_of(&app, window).map(|session| session.target),
+            Some(inner)
+        );
+
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_patch(inner, patch);
+        frame(&mut app, window);
+        app.dispatch_input(
+            window,
+            scroll_event(
+                position,
+                delta,
+                ScrollUnit::Line,
+                ScrollPhase::End,
+                base + Duration::from_millis(50),
+            ),
+        );
+        assert_eq!(
+            slot_offset(&app, window, inner).y,
+            px(48.0),
+            "{label}后的 End 不得再滚动旧目标"
+        );
+        assert_eq!(
+            slot_offset(&app, window, outer).y,
+            px(0.0),
+            "{label}目标的 End 不得按当前事件重新仲裁并滚动外层"
+        );
+        assert!(
+            scroll_session_of(&app, window).is_none(),
+            "{label}目标的 End 必须清会话且不得留下 Grace 会话"
+        );
+    }
+}
+
+#[test]
+fn update_with_dead_latched_target_retargets_to_outer_in_current_event() {
+    let position = LogicalPoint::new(px(50.0), px(50.0));
+    let delta = LogicalPoint::new(px(0.0), px(-1.0));
+    for (label, patch) in [
+        (
+            "隐藏",
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        ),
+        (
+            "禁用",
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        ),
+    ] {
+        let (_rt, mut app, window, outer, inner) = nested_wheel_app(400.0, 400.0);
+        let base = Instant::now();
+        app.dispatch_input(
+            window,
+            scroll_event(position, delta, ScrollUnit::Line, ScrollPhase::Begin, base),
+        );
+        assert_eq!(
+            slot_offset(&app, window, inner).y,
+            px(48.0),
+            "{label}前内层已被闩锁并滚动"
+        );
+        assert_eq!(
+            scroll_session_of(&app, window).map(|session| (session.target, session.kind)),
+            Some((inner, SessionKind::Continuous))
+        );
+
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_patch(inner, patch);
+        frame(&mut app, window);
+        app.dispatch_input(
+            window,
+            scroll_event(
+                position,
+                delta,
+                ScrollUnit::Line,
+                ScrollPhase::Update,
+                base + Duration::from_millis(50),
+            ),
+        );
+        assert_eq!(
+            slot_offset(&app, window, inner).y,
+            px(48.0),
+            "{label}后的 Update 不得再滚动旧目标"
+        );
+        assert_eq!(
+            slot_offset(&app, window, outer).y,
+            px(48.0),
+            "{label}目标的 Update 必须按当前事件重新仲裁到外层"
+        );
+        assert_eq!(
+            scroll_session_of(&app, window).map(|session| (session.target, session.kind)),
+            Some((outer, SessionKind::Continuous)),
+            "重新仲裁后会话必须闩锁外层"
+        );
+    }
+}
+
+#[test]
+fn wheel_over_chained_proxy_scrolls_the_terminal_container() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let (page, _page_handle) = mount_scrollable(
+        &mut app,
+        window,
+        root,
+        LogicalSize::new(px(200.0), px(150.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(200.0), px(400.0)),
+    );
+    let (middle, _middle_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(400.0)),
+    );
+    let (terminal, _terminal_handle) = mount_scrollable(
+        &mut app,
+        window,
+        page,
+        LogicalSize::new(px(100.0), px(100.0)),
+        ScrollAxes::Vertical,
+        48.0,
+        LogicalSize::new(px(100.0), px(400.0)),
+    );
+    let hit = mount_override(
+        &mut app,
+        window,
+        page,
+        LogicalRect::new(px(150.0), px(0.0), px(50.0), px(50.0)),
+    );
+    app.set_scroll_proxy(window, hit, Some(middle))
+        .expect("first hop");
+    app.set_scroll_proxy(window, middle, Some(terminal))
+        .expect("second hop");
+    frame(&mut app, window);
+
+    app.dispatch_input(
+        window,
+        scroll_event(
+            LogicalPoint::new(px(160.0), px(10.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            ScrollUnit::Line,
+            ScrollPhase::Discrete,
+            Instant::now(),
+        ),
+    );
+    assert_eq!(
+        slot_offset(&app, window, terminal).y,
+        px(48.0),
+        "A 命中沿 A→B→C 代理链落到最终容器 C"
+    );
+    assert_eq!(
+        slot_offset(&app, window, middle).y,
+        px(0.0),
+        "中间节点 B 不得被滚动"
+    );
+    assert_eq!(
+        slot_offset(&app, window, page).y,
+        px(0.0),
+        "外层页面不得被滚动"
+    );
+}
+
+#[test]
+fn clear_scroll_drops_only_the_scroll_slot_and_its_container_registration() {
+    let (_rt, mut app, window, container, child) = scrollable_app();
+    app.set_scroll_proxy(window, child, Some(container))
+        .expect("proxy to the scroll container");
+    let handle = app.scroll_handle(window, container).expect("scroll handle");
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(40.0)))
+        .expect("scroll");
+    frame(&mut app, window);
+    let _ = app.take_wake_request();
+
+    app.clear_scroll(&handle).expect("clear scroll");
+
+    assert!(app.scroll_state(&handle).is_none(), "滚动槽已清除");
+    assert!(
+        app.scroll_handle(window, container).is_none(),
+        "不得再返回滚动句柄"
+    );
+    {
+        let tree = app.window(window).expect("window").tree();
+        assert!(tree.get(container).is_ok(), "节点本身保留");
+        assert!(tree.scroll_slot(container).is_none(), "节点滚动槽为 None");
+        assert!(
+            !tree.scroll_containers().contains(&container),
+            "节点必须从滚动容器登记中移除"
+        );
+        assert_eq!(
+            tree.scroll_proxy(child),
+            Some(container),
+            "不得清除其它节点的代理交互"
+        );
+    }
+    assert!(!app.take_wake_request(), "清理滚动槽不得请求帧");
+    app.clear_scroll(&handle).expect("重复清理幂等");
+    assert!(app.scroll_state(&handle).is_none());
+}
+
+#[test]
+fn clear_scroll_accepts_a_missing_slot_and_reports_stale_or_closed_targets() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let plain = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)),
+    );
+    let plain_handle = ScrollHandle::new(window, plain);
+    app.clear_scroll(&plain_handle).expect("无滚动槽必须 Ok");
+    {
+        let tree = app.window(window).expect("window").tree();
+        assert!(tree.get(plain).is_ok());
+        assert!(
+            tree.interaction(plain).is_none(),
+            "清理不存在的滚动槽不得创建节点交互"
+        );
+    }
+    app.remove_node(window, plain).expect("remove plain");
+    let error = app
+        .clear_scroll(&plain_handle)
+        .expect_err("节点缺失必须报错");
+    assert!(
+        matches!(error, EngineError::StaleNode { node } if node == plain),
+        "缺失节点必须报 StaleNode：{error:?}"
+    );
+    assert!(app.close_window(window));
+    let closed_handle = ScrollHandle::new(window, root);
+    app.clear_scroll(&closed_handle)
+        .expect("窗口关闭后清理必须 Ok（与既有 handle API 一致）");
 }

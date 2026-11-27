@@ -2601,7 +2601,7 @@ mod tests {
     #[test]
     fn scrolling_only_moves_the_slot_offset_not_the_lane_bytes() {
         use crate::{
-            interaction::{ScrollAxis, ScrollSlot},
+            interaction::{ScrollAxes, ScrollSlot},
             math::LogicalSize,
         };
 
@@ -2626,7 +2626,7 @@ mod tests {
             .scroll = Some(ScrollSlot {
             offset: LogicalPoint::ZERO,
             content: LogicalSize::new(px(100.0), px(400.0)),
-            axis: ScrollAxis::Vertical,
+            axes: ScrollAxes::Vertical,
             line_height: px(48.0),
         });
         h.tree.note_scroll_container(container);
@@ -3207,7 +3207,7 @@ mod tests {
     #[test]
     fn an_ancestor_scroll_bakes_the_canvas_content_exactly_once() {
         use crate::{
-            interaction::{ScrollAxis, ScrollSlot},
+            interaction::{ScrollAxes, ScrollSlot},
             math::LogicalSize,
         };
 
@@ -3230,7 +3230,7 @@ mod tests {
             .scroll = Some(ScrollSlot {
             offset: LogicalPoint::new(px(0.0), px(30.0)),
             content: LogicalSize::new(px(100.0), px(400.0)),
-            axis: ScrollAxis::Vertical,
+            axes: ScrollAxes::Vertical,
             line_height: px(48.0),
         });
         h.tree.note_scroll_container(container);
@@ -5216,7 +5216,7 @@ mod tests {
     #[test]
     fn incremental_reuses_the_cached_scroll_slot() {
         use crate::{
-            interaction::{ScrollAxis, ScrollSlot},
+            interaction::{ScrollAxes, ScrollSlot},
             math::LogicalSize,
         };
 
@@ -5241,7 +5241,7 @@ mod tests {
             .scroll = Some(ScrollSlot {
             offset: LogicalPoint::ZERO,
             content: LogicalSize::new(px(100.0), px(400.0)),
-            axis: ScrollAxis::Vertical,
+            axes: ScrollAxes::Vertical,
             line_height: px(48.0),
         });
         h.tree.note_scroll_container(container);

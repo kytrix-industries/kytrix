@@ -259,7 +259,7 @@ impl IndicatorPanel {
             ScrollbarOptions::default(),
         );
         scrollbar.build(cx.tree_mut(), root)?;
-        scrollbar.attach(cx.app_mut(), window, scroll);
+        scrollbar.attach(cx.app_mut(), window, scroll)?;
         self.root = Some(root);
         self.scroll = Some(scroll);
         self.content = Some(content);

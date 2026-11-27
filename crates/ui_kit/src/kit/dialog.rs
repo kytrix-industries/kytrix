@@ -676,7 +676,7 @@ impl Dialog {
             ScrollbarOptions::default().hover().tab_stop(false),
         );
         bar.build(tree_mut(app, window)?, scroll_outer)?;
-        bar.attach(app, window, viewport);
+        bar.attach(app, window, viewport)?;
         {
             let mut state = self.inner.state.borrow_mut();
             state.body = Some(content_body);

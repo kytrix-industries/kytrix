@@ -6,7 +6,7 @@ use market_participants_model::{
     prediction::{PredictionPricePoint, PredictionRange, PredictionSeries},
 };
 use ui_core::{
-    interaction::{ScrollAxis, ScrollConfig},
+    interaction::{ScrollAxes, ScrollConfig},
     math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, style_builder::StyleBuilder},
@@ -704,7 +704,7 @@ fn scroll_horizontally(harness: &mut ChartHarness, extra_width: LogicalPx, offse
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Horizontal,
+                axes: ScrollAxes::Horizontal,
                 line_height: px(48.0),
             },
         )

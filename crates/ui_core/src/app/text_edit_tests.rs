@@ -5,7 +5,7 @@ use crate::{
     a11y::{A11yAction, A11yNodeId, A11yRole, A11yTextSelection},
     error::EngineError,
     event::{Action, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers},
-    interaction::{ScrollAxis, ScrollConfig},
+    interaction::{ScrollAxes, ScrollConfig},
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
@@ -2309,7 +2309,7 @@ fn default_key_scroll_is_skipped_while_an_input_is_focused() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )
@@ -2584,7 +2584,7 @@ fn page_keys_use_the_scroll_viewport_height_for_line_counts() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(20.0),
             },
         )
@@ -7263,7 +7263,7 @@ fn set_scroll_line_height_validates_its_input_and_reports_typed_errors() {
             window,
             container,
             ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: px(20.0),
             },
         )

@@ -1,9 +1,9 @@
 use smallvec::SmallVec;
 
-use super::{AnimationSlot, AnimationTarget, App};
+use super::App;
 use crate::{
     error::EngineError,
-    interaction::{AnimationSpec, ScrollConfig, ScrollHandle, ScrollSlot, ScrollState, scroll},
+    interaction::{ScrollConfig, ScrollHandle, ScrollSlot, ScrollState, scroll},
     math::{LogicalPoint, LogicalPx, LogicalSize},
     node::id::NodeId,
     paint::style::Clip,
@@ -40,12 +40,39 @@ pub(crate) fn make_scroll(
         slot.scroll = Some(ScrollSlot {
             offset: LogicalPoint::ZERO,
             content: viewport,
-            axis: config.axis,
+            axes: config.axes,
             line_height: config.line_height,
         });
     }
     target.tree_mut().note_scroll_container(node);
     Ok(ScrollHandle::new(window, node))
+}
+
+pub(crate) fn set_scroll_proxy(
+    app: &mut App,
+    window: WindowId,
+    node: NodeId,
+    target: Option<NodeId>,
+) -> Result<(), EngineError> {
+    let Some(target_window) = app.windows.get(&window) else {
+        return Err(EngineError::UnknownWindow { window });
+    };
+    let tree = target_window.tree();
+    tree.get(node)?;
+    if let Some(target) = target {
+        tree.get(target)?;
+        if tree.scroll_slot(target).is_none() {
+            return Err(EngineError::NotScrollable { node: target });
+        }
+        if target == node || tree.is_ancestor(node, target) {
+            return Err(EngineError::InvalidScrollProxy { node, target });
+        }
+    }
+    let Some(target_window) = app.windows.get_mut(&window) else {
+        return Err(EngineError::UnknownWindow { window });
+    };
+    target_window.tree_mut().set_scroll_proxy(node, target);
+    Ok(())
 }
 
 pub(crate) fn set_scroll_content(
@@ -119,7 +146,6 @@ pub(crate) fn scroll_to(
             return Err(EngineError::NotScrollable { node });
         }
     }
-    super::animation::cancel_scroll_animation(app, handle);
     let Some(target) = app.windows.get_mut(&window) else {
         return Ok(());
     };
@@ -214,40 +240,19 @@ pub(crate) fn scroll_state(app: &App, handle: &ScrollHandle) -> Option<ScrollSta
         offset: slot.offset,
         content: slot.content,
         viewport: scroll::viewport(target.tree(), node).size,
-        axis: slot.axis,
+        axes: slot.axes,
     })
 }
 
-pub(crate) fn scroll_to_animated(
-    app: &mut App,
-    handle: &ScrollHandle,
-    target: LogicalPoint,
-) -> Result<(), EngineError> {
-    let Some(state) = app.scroll_state(handle) else {
-        return Err(EngineError::NotScrollable {
-            node: handle.node(),
-        });
-    };
-    let spec = AnimationSpec::short();
+pub(crate) fn clear_scroll(app: &mut App, handle: &ScrollHandle) -> Result<(), EngineError> {
     let window = handle.window();
-    app.animations.retain(|slot| {
-        !matches!(&slot.target, AnimationTarget::Scroll { handle: existing, .. } if *existing == *handle)
-    });
-    let id = app.next_animation;
-    app.next_animation = app.next_animation.wrapping_add(1);
-    app.animations.push(AnimationSlot {
-        id,
-        window,
-        target: AnimationTarget::Scroll {
-            handle: *handle,
-            from: state.offset,
-            to: target,
-        },
-        start: app.clock,
-        duration: spec.duration,
-        easing: spec.easing,
-        nodes: Vec::new(),
-    });
-    app.request_frame();
+    let node = handle.node();
+    let Some(target) = app.windows.get_mut(&window) else {
+        return Ok(());
+    };
+    if target.tree().get(node).is_err() {
+        return Err(EngineError::StaleNode { node });
+    }
+    target.tree_mut().clear_scroll(node);
     Ok(())
 }

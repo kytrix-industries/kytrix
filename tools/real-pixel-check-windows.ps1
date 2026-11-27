@@ -65,6 +65,7 @@ try {
     $Fail = 0
     $Gates = @(
         @{ Name = 'pixel-check'; Args = @('--pixel-check') },
+        @{ Name = 'wheel-check'; Args = @('--wheel-check') },
         @{ Name = 'real-pixel-check'; Args = @('--real-pixel-check') },
         @{ Name = 'idle-check'; Args = @('--idle-check') },
         @{ Name = 'theme-check'; Args = @('--theme-check') }

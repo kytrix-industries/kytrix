@@ -9,7 +9,10 @@ use crate::{
     },
     app::App,
     event::ActionSource,
-    interaction::focus::{action_target, focusable},
+    interaction::{
+        ScrollAxes,
+        focus::{action_target, focusable},
+    },
     math::{LogicalPoint, LogicalPx, px},
     node::{
         id::NodeId,
@@ -522,9 +525,10 @@ fn scroll_container(
     app: &App,
     window: WindowId,
     node: crate::node::id::NodeId,
+    axis: Option<ScrollAxes>,
 ) -> Option<crate::node::id::NodeId> {
     let tree = app.window(window)?.tree();
-    crate::a11y::tree::a11y_scroll_target(tree, node)
+    crate::a11y::tree::a11y_scroll_target(tree, node, axis)
 }
 
 fn scroll_by(
@@ -534,7 +538,11 @@ fn scroll_by(
     action: A11yAction,
     data: Option<&ActionData>,
 ) -> bool {
-    let Some(container) = scroll_container(app, window, node) else {
+    let axis = match action {
+        A11yAction::ScrollLeft | A11yAction::ScrollRight => ScrollAxes::Horizontal,
+        _ => ScrollAxes::Vertical,
+    };
+    let Some(container) = scroll_container(app, window, node, Some(axis)) else {
         return false;
     };
     let Some(slot) = app
@@ -547,8 +555,13 @@ fn scroll_by(
         app.window(window).expect("窗口存在").tree(),
         container,
     );
-    let step = match data {
-        Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)) => slot.line_height.max(px(1.0)),
+    let step = match (action, data) {
+        (_, Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item))) => {
+            slot.line_height.max(px(1.0))
+        }
+        (A11yAction::ScrollLeft | A11yAction::ScrollRight, _) => {
+            viewport.size.width.max(slot.line_height).max(px(1.0))
+        }
         _ => viewport.size.height.max(slot.line_height).max(px(1.0)),
     };
     let delta = match action {
@@ -562,7 +575,7 @@ fn scroll_by(
 }
 
 fn scroll_into_view(app: &mut App, window: WindowId, node: crate::node::id::NodeId) -> bool {
-    let Some(container) = scroll_container(app, window, node) else {
+    let Some(container) = scroll_container(app, window, node, None) else {
         return false;
     };
     let Some(tree) = app.window(window).map(|window_state| window_state.tree()) else {
@@ -597,7 +610,7 @@ fn scroll_to(
     node: crate::node::id::NodeId,
     offset: LogicalPoint,
 ) -> bool {
-    let Some(container) = scroll_container(app, window, node) else {
+    let Some(container) = scroll_container(app, window, node, None) else {
         return false;
     };
     let Some(handle) = app.scroll_handle(window, container) else {
@@ -639,8 +652,8 @@ mod tests {
         a11y::{A11yAction, A11yActionData, A11yOverride, A11yPatch},
         app::App,
         event::Action,
-        interaction::ScrollConfig,
-        math::{LogicalPoint, LogicalRect, px},
+        interaction::{ScrollAxes, ScrollConfig},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         paint::style::StylePatch,
         window::WindowOptions,
@@ -703,6 +716,48 @@ mod tests {
             )
         });
         assert!(offender.is_none(), "{message}: {offender:?}");
+    }
+
+    fn mount_scrollable(
+        app: &mut App,
+        window: crate::window::WindowId,
+        parent: crate::node::id::NodeId,
+        size: LogicalSize,
+        axes: ScrollAxes,
+        line_height: f32,
+        content: LogicalSize,
+    ) -> (crate::node::id::NodeId, crate::interaction::ScrollHandle) {
+        let mut style = crate::paint::style_builder::StyleBuilder::new()
+            .relative()
+            .size(size.width, size.height)
+            .build();
+        style.clip = crate::paint::style::Clip::Bounds;
+        let node = NodeBuilder::boxed()
+            .style(style)
+            .build(app.window_mut(window).expect("window").tree_mut(), parent)
+            .expect("scroll node");
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_layout_for_test(
+                node,
+                crate::node::tree::LayoutBox {
+                    bounds: LogicalRect::new(px(0.0), px(0.0), size.width, size.height),
+                    border: crate::math::LogicalEdges::uniform(px(0.0)),
+                },
+            );
+        let handle = app
+            .make_scroll(
+                window,
+                node,
+                ScrollConfig {
+                    axes,
+                    line_height: px(line_height),
+                },
+            )
+            .expect("scroll");
+        app.set_scroll_content(&handle, content).expect("content");
+        (node, handle)
     }
 
     #[test]
@@ -1365,8 +1420,259 @@ mod tests {
             Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
         );
         let state = app.scroll_state(&handle).expect("state");
-        assert!(state.offset.y > px(0.0), "ScrollDown 必须下移偏移");
+        assert_eq!(
+            state.offset.y,
+            px(48.0),
+            "ScrollByItem 的步长必须是 line_height"
+        );
         assert!(app.a11y_diagnostics().is_empty(), "滚动必须被处理");
+    }
+
+    #[test]
+    fn a11y_horizontal_steps_use_viewport_width() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let mut style = crate::paint::style_builder::StyleBuilder::new()
+            .relative()
+            .size(px(100.0), px(80.0))
+            .build();
+        style.clip = crate::paint::style::Clip::Bounds;
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("container");
+        let handle = app
+            .make_scroll(
+                window,
+                container,
+                ScrollConfig {
+                    axes: ScrollAxes::Both,
+                    line_height: px(48.0),
+                },
+            )
+            .expect("scroll");
+        app.set_scroll_content(&handle, crate::math::LogicalSize::new(px(400.0), px(400.0)))
+            .expect("content");
+        app.window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_layout_for_test(
+                container,
+                crate::node::tree::LayoutBox {
+                    bounds: LogicalRect::new(px(0.0), px(0.0), px(100.0), px(80.0)),
+                    border: crate::math::LogicalEdges::uniform(px(0.0)),
+                },
+            );
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::ScrollRight,
+            container,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Page)),
+        );
+        assert_eq!(
+            app.scroll_state(&handle).expect("state").offset,
+            LogicalPoint::new(px(100.0), px(0.0)),
+            "ScrollRight 的页步长必须是 viewport.width"
+        );
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::ScrollDown,
+            container,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Page)),
+        );
+        assert_eq!(
+            app.scroll_state(&handle).expect("state").offset,
+            LogicalPoint::new(px(100.0), px(80.0)),
+            "ScrollDown 的页步长必须是 viewport.height"
+        );
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::ScrollLeft,
+            container,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
+        );
+        assert_eq!(
+            app.scroll_state(&handle).expect("state").offset,
+            LogicalPoint::new(px(52.0), px(80.0)),
+            "ScrollByItem 的横向步长必须是 line_height"
+        );
+    }
+
+    #[test]
+    fn a11y_scroll_target_finds_dual_axis_containers() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let mut style = crate::paint::style_builder::StyleBuilder::new()
+            .relative()
+            .size(px(100.0), px(80.0))
+            .build();
+        style.clip = crate::paint::style::Clip::Bounds;
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .build(app.window_mut(window).expect("window").tree_mut(), root)
+            .expect("container");
+        let child = NodeBuilder::boxed()
+            .build(
+                app.window_mut(window).expect("window").tree_mut(),
+                container,
+            )
+            .expect("child");
+        app.make_scroll(
+            window,
+            container,
+            ScrollConfig {
+                axes: ScrollAxes::Both,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scroll");
+
+        let tree = app.window(window).expect("window").tree();
+        assert_eq!(
+            crate::a11y::tree::a11y_scroll_target(tree, container, Some(ScrollAxes::Horizontal)),
+            Some(container),
+            "滚动容器自身的 a11y 目标仍是自身"
+        );
+        for axis in [ScrollAxes::Vertical, ScrollAxes::Horizontal] {
+            let target =
+                crate::a11y::tree::a11y_scroll_target(tree, child, Some(axis)).expect("target");
+            assert_eq!(target, container, "双轴容器必须能被 a11y 目标解析找到");
+            assert_eq!(
+                tree.scroll_slot(target).expect("scroll slot").axes,
+                ScrollAxes::Both,
+                "解析到的目标必须是双轴容器本身"
+            );
+        }
+    }
+
+    #[test]
+    fn a11y_scroll_actions_follow_axes_and_proxy() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let (page, page_handle) = mount_scrollable(
+            &mut app,
+            window,
+            root,
+            LogicalSize::new(px(200.0), px(150.0)),
+            ScrollAxes::Vertical,
+            48.0,
+            LogicalSize::new(px(200.0), px(400.0)),
+        );
+        let (pane, pane_handle) = mount_scrollable(
+            &mut app,
+            window,
+            page,
+            LogicalSize::new(px(100.0), px(80.0)),
+            ScrollAxes::Both,
+            48.0,
+            LogicalSize::new(px(400.0), px(400.0)),
+        );
+        let proxy = NodeBuilder::boxed()
+            .build(app.window_mut(window).expect("window").tree_mut(), page)
+            .expect("proxy");
+        app.set_scroll_proxy(window, proxy, Some(pane))
+            .expect("proxy");
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::ScrollDown,
+            proxy,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Page)),
+        );
+        assert_eq!(
+            app.scroll_state(&pane_handle).expect("state").offset,
+            LogicalPoint::new(px(0.0), px(80.0)),
+            "代理节点上的 ScrollDown 落到目标容器的纵轴（Both 用 height）"
+        );
+        assert_eq!(
+            app.scroll_state(&page_handle).expect("state").offset,
+            LogicalPoint::ZERO,
+            "外层页面不得滚动"
+        );
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::ScrollRight,
+            proxy,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Page)),
+        );
+        assert_eq!(
+            app.scroll_state(&pane_handle).expect("state").offset,
+            LogicalPoint::new(px(100.0), px(80.0)),
+            "同一代理目标上的 ScrollRight 走横轴（Both 用 width）"
+        );
+        assert_no_action_diagnostics(&app, "轴过滤与代理目标解析不得记未处理诊断");
+    }
+
+    #[test]
+    fn a11y_scroll_down_falls_through_horizontal_inner() {
+        let (_runtime, mut app, window) = setup();
+        let root = app.window(window).expect("window").tree().root();
+        let (page, page_handle) = mount_scrollable(
+            &mut app,
+            window,
+            root,
+            LogicalSize::new(px(200.0), px(150.0)),
+            ScrollAxes::Vertical,
+            48.0,
+            LogicalSize::new(px(200.0), px(400.0)),
+        );
+        let (inner, inner_handle) = mount_scrollable(
+            &mut app,
+            window,
+            page,
+            LogicalSize::new(px(100.0), px(80.0)),
+            ScrollAxes::Horizontal,
+            48.0,
+            LogicalSize::new(px(400.0), px(80.0)),
+        );
+        let row = NodeBuilder::boxed()
+            .build(app.window_mut(window).expect("window").tree_mut(), inner)
+            .expect("row");
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::ScrollDown,
+            row,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Page)),
+        );
+        assert_eq!(
+            app.scroll_state(&inner_handle).expect("state").offset,
+            LogicalPoint::ZERO,
+            "横向内层没有纵轴，ScrollDown 不得落在它上面"
+        );
+        assert_eq!(
+            app.scroll_state(&page_handle).expect("state").offset,
+            LogicalPoint::new(px(0.0), px(150.0)),
+            "ScrollDown 沿候选链落到纵向页面（步长 = 页面视口高）"
+        );
+
+        dispatch_request(
+            &mut app,
+            window,
+            AkAction::ScrollRight,
+            row,
+            Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Page)),
+        );
+        assert_eq!(
+            app.scroll_state(&inner_handle).expect("state").offset,
+            LogicalPoint::new(px(100.0), px(0.0)),
+            "ScrollRight 落到横向内层（步长 = 内层视口宽）"
+        );
+        assert_eq!(
+            app.scroll_state(&page_handle).expect("state").offset.y,
+            px(150.0),
+            "页面纵轴保持已加载的偏移"
+        );
     }
 
     #[test]

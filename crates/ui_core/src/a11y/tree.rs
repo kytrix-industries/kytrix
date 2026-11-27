@@ -2,8 +2,8 @@ use smallvec::SmallVec;
 
 use crate::{
     a11y::{
-        A11yAction, A11yDiagnostic, A11yLabel, A11yLabelSource, A11yNode, A11yNodeId, A11yOverride,
-        A11yPatch, A11yRole, A11yScroll,
+        A11yAction, A11yDiagnostic, A11yLabel, A11yLabelSource, A11yNode, A11yNodeId,
+        A11yOrientation, A11yOverride, A11yPatch, A11yRole, A11yScroll,
         identity::{A11yIds, A11yKey},
         mapping::{
             a11y_disabled, a11y_read_only, bounds_of, effective_actions, effective_description,
@@ -13,7 +13,7 @@ use crate::{
         popup::{A11yPopupContext, A11yPopupOverlay, is_physical_descendant, resolve_parent},
         textrun,
     },
-    interaction::ScrollAxis,
+    interaction::ScrollAxes,
     math::DevicePixelRatio,
     node::{
         dependency::ReadCtx,
@@ -777,7 +777,11 @@ fn scroll_state(tree: &NodeTree, node: NodeId) -> Option<A11yScroll> {
         y: slot.offset.y,
         x_max: max.x,
         y_max: max.y,
-        vertical: matches!(slot.axis, ScrollAxis::Vertical),
+        orientation: match slot.axes {
+            ScrollAxes::Vertical => Some(A11yOrientation::Vertical),
+            ScrollAxes::Horizontal => Some(A11yOrientation::Horizontal),
+            ScrollAxes::Both => None,
+        },
     })
 }
 
@@ -1066,14 +1070,32 @@ pub(crate) fn lifted_scroll_window(tree: &NodeTree, root: NodeId) -> Option<Node
         .find(|window| lifted_scroll_root(tree, *window) == Some(root))
 }
 
-pub(crate) fn a11y_scroll_target(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
-    if tree.scroll_slot(node).is_some() {
-        return Some(node);
-    }
-    if let Some(window) = lifted_scroll_window(tree, node) {
+pub(crate) fn a11y_scroll_target(
+    tree: &NodeTree,
+    node: NodeId,
+    axis: Option<ScrollAxes>,
+) -> Option<NodeId> {
+    if let Some(window) = lifted_scroll_window(tree, node)
+        && tree
+            .scroll_slot(window)
+            .is_some_and(|slot| axis.is_none_or(|axis| slot.axes.supports(axis)))
+    {
         return Some(window);
     }
-    crate::interaction::scroll::scroll_ancestor(tree, node).map(|(container, _)| container)
+    if let Some(slot) = tree.scroll_slot(node)
+        && axis.is_none_or(|axis| slot.axes.supports(axis))
+    {
+        return Some(node);
+    }
+    crate::interaction::scroll::scroll_candidates(tree, node)
+        .into_iter()
+        .find(|candidate| {
+            tree.is_effectively_visible(*candidate)
+                && tree.is_effectively_interactive(*candidate)
+                && tree
+                    .scroll_slot(*candidate)
+                    .is_some_and(|slot| axis.is_none_or(|axis| slot.axes.supports(axis)))
+        })
 }
 
 pub(crate) fn write_a11y_patch(
@@ -1602,9 +1624,15 @@ mod tests {
 
     use super::{collect_subtree, resolve_focus};
     use crate::{
-        a11y::{A11yAction, A11yOverride, A11yRole, A11ySort, identity::A11yIds},
-        math::{DevicePixelRatio, px},
-        node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
+        a11y::{A11yAction, A11yOrientation, A11yOverride, A11yRole, A11ySort, identity::A11yIds},
+        interaction::{ScrollAxes, ScrollSlot},
+        math::{DevicePixelRatio, LogicalEdges, LogicalPoint, LogicalRect, LogicalSize, px},
+        node::{
+            builder::NodeBuilder,
+            id::NodeId,
+            tree::{LayoutBox, NodeTree},
+        },
+        paint::style::StylePatch,
         text::TextStyle,
     };
 
@@ -2561,7 +2589,7 @@ mod tests {
             .scroll = Some(crate::interaction::ScrollSlot {
             offset: crate::math::LogicalPoint::new(px(0.0), px(40.0)),
             content: crate::math::LogicalSize::new(px(0.0), px(2000.0)),
-            axis: crate::interaction::ScrollAxis::Vertical,
+            axes: crate::interaction::ScrollAxes::Vertical,
             line_height: px(20.0),
         });
 
@@ -2580,7 +2608,7 @@ mod tests {
             .expect("集合根必须接管窗口的 scroll（E9 R2 后半）");
         assert_eq!(scroll.y, px(40.0));
         assert_eq!(scroll.y_max, px(2000.0));
-        assert!(scroll.vertical);
+        assert_eq!(scroll.orientation, Some(A11yOrientation::Vertical));
         assert!(
             table_record.clips_children,
             "滚动容器的裁剪感知必须随语义上提"
@@ -2598,12 +2626,12 @@ mod tests {
             );
         }
         assert_eq!(
-            super::a11y_scroll_target(&tree, table),
+            super::a11y_scroll_target(&tree, table, Some(ScrollAxes::Vertical)),
             Some(viewport),
             "集合根的滚动目标 = 上提的窗口（不是 Table 自身、更不是物理滚动祖先）"
         );
         assert_eq!(
-            super::a11y_scroll_target(&tree, rows[0]),
+            super::a11y_scroll_target(&tree, rows[0], Some(ScrollAxes::Vertical)),
             Some(viewport),
             "行上的滚动动作仍落到窗口"
         );
@@ -2613,6 +2641,237 @@ mod tests {
         assert_eq!(ak.scroll_y_max(), Some(2000.0));
         assert!(ak.clips_children());
         assert!(ak.supports_action(accesskit::Action::ScrollDown));
+    }
+
+    fn attach_vertical_scroll(tree: &mut NodeTree, node: NodeId) {
+        tree.set_layout_for_test(
+            node,
+            LayoutBox {
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(100.0), px(80.0)),
+                border: LogicalEdges::uniform(px(0.0)),
+            },
+        );
+        tree.ensure_interaction(node).expect("interaction").scroll = Some(ScrollSlot {
+            offset: LogicalPoint::ZERO,
+            content: LogicalSize::new(px(100.0), px(400.0)),
+            axes: ScrollAxes::Vertical,
+            line_height: px(20.0),
+        });
+    }
+
+    #[test]
+    fn a_lifted_tree_scroll_target_filters_the_action_axis() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let tree_node = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Tree),
+                label: Some(smol_str::SmolStr::new_static("持仓")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("tree");
+        let list = NodeBuilder::boxed()
+            .build(&mut tree, tree_node)
+            .expect("list");
+        let viewport = NodeBuilder::boxed()
+            .build(&mut tree, list)
+            .expect("viewport");
+        let item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TreeItem),
+                label: Some(smol_str::SmolStr::new_static("BTC")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, viewport)
+            .expect("item");
+        declare_virtual_window(&mut tree, viewport, 100, &[(0, item)]);
+        attach_vertical_scroll(&mut tree, viewport);
+
+        assert_eq!(
+            super::a11y_scroll_target(&tree, tree_node, Some(ScrollAxes::Vertical)),
+            Some(viewport),
+            "集合根提升仍优先且轴匹配"
+        );
+        assert_eq!(
+            super::a11y_scroll_target(&tree, tree_node, Some(ScrollAxes::Horizontal)),
+            None,
+            "纵向提升窗口不得响应横向动作"
+        );
+        assert_eq!(
+            super::a11y_scroll_target(&tree, tree_node, None),
+            Some(viewport),
+            "None = 任意轴"
+        );
+        assert_eq!(
+            super::a11y_scroll_target(&tree, item, Some(ScrollAxes::Vertical)),
+            Some(viewport)
+        );
+        assert_eq!(
+            super::a11y_scroll_target(&tree, item, Some(ScrollAxes::Horizontal)),
+            None
+        );
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let record = snapshot_with(&tree, tree_node, &mut ids, &mut tables);
+        for action in [
+            A11yAction::ScrollUp,
+            A11yAction::ScrollDown,
+            A11yAction::ScrollIntoView,
+            A11yAction::SetScrollOffset,
+        ] {
+            assert!(
+                record.actions.contains(&action),
+                "纵向提升窗口必须宣告 {action:?}：{:?}",
+                record.actions
+            );
+        }
+        for action in [A11yAction::ScrollLeft, A11yAction::ScrollRight] {
+            assert!(
+                !record.actions.contains(&action),
+                "纵向提升窗口不得宣告 {action:?}：{:?}",
+                record.actions
+            );
+        }
+        assert!(
+            !crate::a11y::mapping::action_allowed(&tree, tree_node, A11yAction::ScrollLeft),
+            "能力门禁必须在目标轴校验前拒绝跨轴动作"
+        );
+        assert!(crate::a11y::mapping::action_allowed(
+            &tree,
+            tree_node,
+            A11yAction::ScrollDown
+        ));
+
+        let menu = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Menu),
+                label: Some(smol_str::SmolStr::new_static("菜单")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("menu");
+        let menu_list = NodeBuilder::boxed()
+            .build(&mut tree, menu)
+            .expect("menu list");
+        let menu_viewport = NodeBuilder::boxed()
+            .build(&mut tree, menu_list)
+            .expect("menu viewport");
+        let menu_item = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::MenuItem),
+                label: Some(smol_str::SmolStr::new_static("复制")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, menu_viewport)
+            .expect("menu item");
+        declare_virtual_window(&mut tree, menu_viewport, 10, &[(0, menu_item)]);
+        attach_vertical_scroll(&mut tree, menu_viewport);
+        assert_eq!(
+            super::a11y_scroll_target(&tree, menu, Some(ScrollAxes::Vertical)),
+            Some(menu_viewport),
+            "Menu 的纵向提升窗口仍是纵向动作目标"
+        );
+        assert_eq!(
+            super::a11y_scroll_target(&tree, menu, Some(ScrollAxes::Horizontal)),
+            None,
+            "Menu 的纵向提升窗口不得响应横向动作"
+        );
+    }
+
+    #[test]
+    fn a11y_scroll_target_skips_hidden_and_disabled_candidates() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let outer = NodeBuilder::boxed().build(&mut tree, root).expect("outer");
+        attach_vertical_scroll(&mut tree, outer);
+        let wrapper = NodeBuilder::boxed()
+            .build(&mut tree, outer)
+            .expect("wrapper");
+        let inner = NodeBuilder::boxed()
+            .build(&mut tree, wrapper)
+            .expect("inner");
+        attach_vertical_scroll(&mut tree, inner);
+        let child = NodeBuilder::boxed().build(&mut tree, inner).expect("child");
+
+        tree.set_style_patch_for_test(
+            wrapper,
+            StylePatch {
+                visible: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        assert_eq!(
+            super::a11y_scroll_target(&tree, child, Some(ScrollAxes::Vertical)),
+            Some(outer),
+            "隐藏祖先下的候选必须被跳过"
+        );
+
+        tree.set_style_patch_for_test(
+            wrapper,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        assert_eq!(
+            super::a11y_scroll_target(&tree, child, Some(ScrollAxes::Vertical)),
+            Some(outer),
+            "禁用祖先下的候选必须被跳过"
+        );
+
+        tree.set_style_patch_for_test(
+            outer,
+            StylePatch {
+                interactive: Some(false),
+                ..StylePatch::default()
+            },
+        );
+        assert_eq!(
+            super::a11y_scroll_target(&tree, child, Some(ScrollAxes::Vertical)),
+            None,
+            "全部候选不可交互时不得返回目标"
+        );
+    }
+
+    #[test]
+    fn both_axis_scrollers_report_both_ranges_without_an_orientation() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let scroller = NodeBuilder::boxed()
+            .build(&mut tree, root)
+            .expect("scroller");
+        tree.set_layout_for_test(
+            scroller,
+            crate::node::tree::LayoutBox {
+                bounds: crate::math::LogicalRect::new(px(0.0), px(0.0), px(120.0), px(80.0)),
+                border: crate::math::LogicalEdges::uniform(px(0.0)),
+            },
+        );
+        tree.ensure_interaction(scroller)
+            .expect("interaction")
+            .scroll = Some(crate::interaction::ScrollSlot {
+            offset: crate::math::LogicalPoint::new(px(30.0), px(40.0)),
+            content: crate::math::LogicalSize::new(px(1000.0), px(2000.0)),
+            axes: crate::interaction::ScrollAxes::Both,
+            line_height: px(20.0),
+        });
+
+        let mut ids = A11yIds::new();
+        let mut tables = super::CollectionSemanticsCache::default();
+        let record = snapshot_with(&tree, scroller, &mut ids, &mut tables);
+        let scroll = record.scroll.expect("scroll");
+        assert_eq!(scroll.x, px(30.0));
+        assert_eq!(scroll.y, px(40.0));
+        assert_eq!(scroll.x_max, px(880.0));
+        assert_eq!(scroll.y_max, px(1920.0));
+        assert_eq!(
+            scroll.orientation, None,
+            "Both 不得自动推导 orientation（O9/A-H3）"
+        );
+        let ak = crate::a11y::adapter::to_accesskit(&record);
+        assert_eq!(ak.orientation(), None, "Both 只在显式声明时才设置方向");
     }
 
     #[test]

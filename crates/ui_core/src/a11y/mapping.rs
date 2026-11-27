@@ -2,9 +2,9 @@ use smol_str::SmolStr;
 
 use crate::{
     a11y::{A11yAction, A11yLabelSource, A11yOverride, A11yPatch, A11yRole},
-    interaction::focus::focusable,
+    interaction::{ScrollAxes, focus::focusable},
     layout::hit_test::HitShape,
-    math::{DevicePixelRatio, DeviceRect},
+    math::{DevicePixelRatio, DeviceRect, LogicalPx},
     node::{
         id::NodeId,
         tree::{Node, NodeKind, NodeTree},
@@ -298,9 +298,23 @@ pub(crate) fn effective_actions(
         .or_else(|| over.and_then(|over| over.actions.clone()))
         .unwrap_or_else(|| default_actions(role));
     let lifted_scroll = crate::a11y::tree::lifted_scroll_window(tree, node);
-    if tree.scroll_slot(node).is_some() || lifted_scroll.is_some() {
+    let scroll_container = tree
+        .scroll_slot(node)
+        .is_some()
+        .then_some(node)
+        .or(lifted_scroll);
+    if let Some(container) = scroll_container {
+        actions.retain(|action| match action {
+            A11yAction::ScrollUp
+            | A11yAction::ScrollDown
+            | A11yAction::ScrollLeft
+            | A11yAction::ScrollRight
+            | A11yAction::ScrollIntoView
+            | A11yAction::SetScrollOffset => scroll_action_available(tree, container, *action),
+            _ => true,
+        });
         for action in default_actions(A11yRole::ScrollView) {
-            if !actions.contains(&action) {
+            if scroll_action_available(tree, container, action) && !actions.contains(&action) {
                 actions.push(action);
             }
         }
@@ -368,6 +382,33 @@ pub(crate) const fn is_value_mutation(action: A11yAction) -> bool {
     )
 }
 
+const fn scroll_action_axis(action: A11yAction) -> Option<ScrollAxes> {
+    match action {
+        A11yAction::ScrollUp | A11yAction::ScrollDown => Some(ScrollAxes::Vertical),
+        A11yAction::ScrollLeft | A11yAction::ScrollRight => Some(ScrollAxes::Horizontal),
+        _ => None,
+    }
+}
+
+fn scroll_action_available(tree: &NodeTree, container: NodeId, action: A11yAction) -> bool {
+    let Some(slot) = tree.scroll_slot(container) else {
+        return false;
+    };
+    let Some(axis) = scroll_action_axis(action) else {
+        return slot.axes.vertical() || slot.axes.horizontal();
+    };
+    if !slot.axes.supports(axis) {
+        return false;
+    }
+    let viewport = crate::interaction::scroll::viewport(tree, container).size;
+    let max = crate::interaction::scroll::max_offset(&slot, viewport);
+    match axis {
+        ScrollAxes::Vertical => max.y > LogicalPx::ZERO,
+        ScrollAxes::Horizontal => max.x > LogicalPx::ZERO,
+        ScrollAxes::Both => max.x > LogicalPx::ZERO && max.y > LogicalPx::ZERO,
+    }
+}
+
 pub(crate) fn a11y_read_only(tree: &NodeTree, node: NodeId) -> bool {
     let Some(slot) = tree.a11y_of(node) else {
         return false;
@@ -389,7 +430,12 @@ pub(crate) fn action_allowed(tree: &NodeTree, node: NodeId, action: A11yAction) 
         | A11yAction::ScrollRight
         | A11yAction::ScrollIntoView
         | A11yAction::SetScrollOffset => {
-            let Some(container) = crate::a11y::tree::a11y_scroll_target(tree, node) else {
+            let axis = match action {
+                A11yAction::ScrollUp | A11yAction::ScrollDown => Some(ScrollAxes::Vertical),
+                A11yAction::ScrollLeft | A11yAction::ScrollRight => Some(ScrollAxes::Horizontal),
+                _ => None,
+            };
+            let Some(container) = crate::a11y::tree::a11y_scroll_target(tree, node, axis) else {
                 return false;
             };
             effective_actions_of(tree, container).contains(&action)
@@ -601,17 +647,26 @@ pub(crate) fn is_disabled(
 mod tests {
     use super::{
         a11y_disabled, a11y_read_only, action_allowed, action_from_accesskit, action_to_accesskit,
-        bounds_of, default_actions, effective_actions, is_disabled, is_hidden, is_value_mutation,
-        orientation_to_accesskit, role_by_kind, role_to_accesskit, sort_to_accesskit,
+        bounds_of, default_actions, effective_actions, effective_actions_of, is_disabled,
+        is_hidden, is_value_mutation, orientation_to_accesskit, role_by_kind, role_to_accesskit,
+        sort_to_accesskit,
     };
     use crate::{
         a11y::{
             A11yAction, A11yLabel, A11yLabelSource, A11yOrientation, A11yOverride, A11yPatch,
             A11yRole, A11ySort,
         },
+        interaction::{ScrollAxes, ScrollSlot},
         layout::hit_test::HitShape,
-        math::{DevicePixelRatio, DeviceRect, dp, px},
-        node::{builder::NodeBuilder, tree::NodeTree},
+        math::{
+            DevicePixelRatio, DeviceRect, LogicalEdges, LogicalPoint, LogicalRect, LogicalSize, dp,
+            px,
+        },
+        node::{
+            builder::NodeBuilder,
+            id::NodeId,
+            tree::{LayoutBox, NodeTree},
+        },
         paint::{
             canvas::Canvas,
             style::{Clip, Style, StylePatch},
@@ -1467,5 +1522,183 @@ mod tests {
             .expect("custom");
         assert!(action_allowed(&tree, custom, A11yAction::Custom(3)));
         assert!(!action_allowed(&tree, custom, A11yAction::Custom(4)));
+    }
+
+    fn scroll_container(
+        tree: &mut NodeTree,
+        parent: NodeId,
+        viewport: LogicalSize,
+        axes: ScrollAxes,
+        content: LogicalSize,
+    ) -> NodeId {
+        let node = NodeBuilder::boxed()
+            .style(
+                crate::paint::style_builder::StyleBuilder::new()
+                    .size(viewport.width, viewport.height)
+                    .build(),
+            )
+            .build(tree, parent)
+            .expect("scroll container");
+        tree.set_layout_for_test(
+            node,
+            LayoutBox {
+                bounds: LogicalRect::new(px(0.0), px(0.0), viewport.width, viewport.height),
+                border: LogicalEdges::uniform(px(0.0)),
+            },
+        );
+        tree.ensure_interaction(node).expect("interaction").scroll = Some(ScrollSlot {
+            offset: LogicalPoint::ZERO,
+            content,
+            axes,
+            line_height: px(48.0),
+        });
+        node
+    }
+
+    #[test]
+    fn scroll_action_capabilities_follow_container_axes() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let vertical = scroll_container(
+            &mut tree,
+            root,
+            LogicalSize::new(px(100.0), px(80.0)),
+            ScrollAxes::Vertical,
+            LogicalSize::new(px(100.0), px(400.0)),
+        );
+        let horizontal = scroll_container(
+            &mut tree,
+            root,
+            LogicalSize::new(px(100.0), px(80.0)),
+            ScrollAxes::Horizontal,
+            LogicalSize::new(px(400.0), px(80.0)),
+        );
+        let both = scroll_container(
+            &mut tree,
+            root,
+            LogicalSize::new(px(100.0), px(80.0)),
+            ScrollAxes::Both,
+            LogicalSize::new(px(400.0), px(400.0)),
+        );
+        let child = NodeBuilder::boxed()
+            .build(&mut tree, vertical)
+            .expect("child");
+        let actions = |node: NodeId| effective_actions_of(&tree, node);
+
+        assert_eq!(
+            actions(vertical),
+            vec![
+                A11yAction::ScrollUp,
+                A11yAction::ScrollDown,
+                A11yAction::ScrollIntoView,
+                A11yAction::SetScrollOffset,
+            ],
+            "纵轴容器只宣告纵轴方向动作 + 任意轴动作"
+        );
+        assert_eq!(
+            actions(horizontal),
+            vec![
+                A11yAction::ScrollLeft,
+                A11yAction::ScrollRight,
+                A11yAction::ScrollIntoView,
+                A11yAction::SetScrollOffset,
+            ],
+            "横轴容器只宣告横轴方向动作 + 任意轴动作"
+        );
+        assert_eq!(
+            actions(both),
+            default_actions(A11yRole::ScrollView),
+            "Both 容器宣告完整滚动动作表"
+        );
+        assert!(
+            !actions(child).contains(&A11yAction::ScrollDown),
+            "非滚动容器的能力表不带滚动动作：{:?}",
+            actions(child)
+        );
+
+        assert!(action_allowed(&tree, vertical, A11yAction::ScrollDown));
+        assert!(!action_allowed(&tree, vertical, A11yAction::ScrollLeft));
+        assert!(!action_allowed(&tree, vertical, A11yAction::ScrollRight));
+        assert!(action_allowed(&tree, horizontal, A11yAction::ScrollRight));
+        assert!(!action_allowed(&tree, horizontal, A11yAction::ScrollDown));
+        for action in default_actions(A11yRole::ScrollView) {
+            assert!(
+                action_allowed(&tree, both, action),
+                "Both 容器必须允许 {action:?}"
+            );
+        }
+        assert!(action_allowed(&tree, child, A11yAction::ScrollDown));
+        assert!(
+            !action_allowed(&tree, child, A11yAction::ScrollLeft),
+            "纵向容器内的节点不得把横向动作宣告为可用"
+        );
+    }
+
+    #[test]
+    fn scroll_actions_require_overflow_on_their_axis() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let wide_both = scroll_container(
+            &mut tree,
+            root,
+            LogicalSize::new(px(200.0), px(80.0)),
+            ScrollAxes::Both,
+            LogicalSize::new(px(120.0), px(400.0)),
+        );
+        let flat_vertical = scroll_container(
+            &mut tree,
+            root,
+            LogicalSize::new(px(100.0), px(80.0)),
+            ScrollAxes::Vertical,
+            LogicalSize::new(px(100.0), px(40.0)),
+        );
+        let wide = effective_actions(
+            &tree,
+            wide_both,
+            A11yRole::ScrollView,
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(
+            wide,
+            vec![
+                A11yAction::ScrollUp,
+                A11yAction::ScrollDown,
+                A11yAction::ScrollIntoView,
+                A11yAction::SetScrollOffset,
+            ],
+            "横向范围为零时不得宣告 ScrollLeft/ScrollRight：{wide:?}"
+        );
+        assert!(!action_allowed(&tree, wide_both, A11yAction::ScrollLeft));
+        assert!(!action_allowed(&tree, wide_both, A11yAction::ScrollRight));
+        assert!(action_allowed(&tree, wide_both, A11yAction::ScrollDown));
+
+        let flat = effective_actions(
+            &tree,
+            flat_vertical,
+            A11yRole::ScrollView,
+            None,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(
+            flat,
+            vec![A11yAction::ScrollIntoView, A11yAction::SetScrollOffset,],
+            "纵轴无溢出时不得宣告 ScrollUp/ScrollDown：{flat:?}"
+        );
+        assert!(!action_allowed(&tree, flat_vertical, A11yAction::ScrollUp));
+        assert!(!action_allowed(
+            &tree,
+            flat_vertical,
+            A11yAction::ScrollDown
+        ));
+        assert!(action_allowed(
+            &tree,
+            flat_vertical,
+            A11yAction::ScrollIntoView
+        ));
     }
 }

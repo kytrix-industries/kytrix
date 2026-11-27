@@ -601,7 +601,7 @@ pub(super) fn columns(market: WatchListMarket, translate: &Translate) -> Vec<Col
         .into_iter()
         .zip(COLUMN_WEIGHTS)
         .zip(COLUMN_ALIGNS)
-        .map(|((header, weight), align)| Column::flex(header, weight).align(align))
+        .map(|((header, weight), align)| Column::flex(header, weight, LogicalPx::ZERO).align(align))
         .collect()
 }
 

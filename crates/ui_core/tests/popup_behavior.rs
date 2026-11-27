@@ -2628,6 +2628,7 @@ fn a_virtual_list_inside_a_popup_settles_after_item_changes() {
                 extent: px(20.0),
                 extents: None,
                 overscan: 1,
+                content_width: None,
             },
         )
         .expect("virtual list");
@@ -3927,7 +3928,7 @@ fn a_node_anchor_follows_scrolling_ancestors() {
             window,
             container,
             ui_core::interaction::ScrollConfig {
-                axis: ui_core::interaction::ScrollAxis::Vertical,
+                axes: ui_core::interaction::ScrollAxes::Vertical,
                 line_height: px(48.0),
             },
         )

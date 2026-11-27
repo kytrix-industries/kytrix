@@ -99,6 +99,7 @@ run_gate() {
 }
 
 run_gate pixel-check --pixel-check
+run_gate wheel-check --wheel-check
 run_gate real-pixel-check --real-pixel-check
 run_gate idle-check --idle-check
 run_gate theme-check --theme-check

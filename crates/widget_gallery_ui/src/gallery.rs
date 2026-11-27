@@ -285,7 +285,7 @@ impl GalleryCore {
             ScrollbarOptions::default(),
         );
         scrollbar.build(tree(app, window), body)?;
-        scrollbar.attach(app, window, viewport);
+        scrollbar.attach(app, window, viewport)?;
         let footer = build_footer(app, window, &keys, left)?;
         let preview_host = build_preview(
             app,
@@ -505,7 +505,7 @@ impl GalleryCore {
             &placeholder,
         );
         input.set_clearable(app, true);
-        input.install(app);
+        input.install(app)?;
 
         let sidebar = self.sidebar;
         let mut categories = Vec::with_capacity(WidgetCategory::ALL.len());

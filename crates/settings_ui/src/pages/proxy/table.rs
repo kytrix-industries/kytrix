@@ -12,7 +12,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event},
     interaction::ActionCtx,
-    math::px,
+    math::{LogicalPx, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -548,7 +548,7 @@ fn columns(translate: &Translate) -> Vec<Column> {
         .into_iter()
         .zip(COLUMN_WEIGHTS)
         .zip(COLUMN_ALIGNS)
-        .map(|((header, weight), align)| Column::flex(header, weight).align(align))
+        .map(|((header, weight), align)| Column::flex(header, weight, LogicalPx::ZERO).align(align))
         .collect()
 }
 

@@ -13,7 +13,7 @@ use crate::{
         PressRecord, ScrollHandle, drag as drag_util, focus, scroll,
     },
     layout::hit_test::HitResult,
-    math::{LogicalPoint, LogicalPx, px},
+    math::{LogicalPoint, LogicalPx},
     node::id::NodeId,
     paint::style::Cursor,
     window::{Window, WindowId},
@@ -164,7 +164,7 @@ pub(crate) fn dispatch_input_tracked(
             unit,
             phase,
             modifiers,
-            ..
+            timestamp,
         } => app.on_scroll(
             window,
             position,
@@ -172,6 +172,7 @@ pub(crate) fn dispatch_input_tracked(
             unit,
             phase,
             modifiers,
+            timestamp,
             &mut outcome,
         ),
         InputEvent::Key {
@@ -578,16 +579,17 @@ pub(crate) fn on_scroll(
     unit: ScrollUnit,
     phase: ScrollPhase,
     modifiers: Modifiers,
+    timestamp: Instant,
     outcome: &mut InputOutcome,
 ) {
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
-    let Some(result) = hit else {
-        return;
-    };
     if crate::app::focus::scope_active(app, window)
-        && !crate::app::focus::in_input_scope(app, window, result.node)
+        && !hit.is_some_and(|result| crate::app::focus::in_input_scope(app, window, result.node))
     {
+        if matches!(phase, ScrollPhase::End | ScrollPhase::Cancel) {
+            scroll::clear_scroll_session(app, window);
+        }
         return;
     }
     let (delta_x, delta_y) = if modifiers.contains(Modifiers::SHIFT) {
@@ -595,87 +597,15 @@ pub(crate) fn on_scroll(
     } else {
         (delta.x, delta.y)
     };
-    if delta_x == LogicalPx::ZERO && delta_y == LogicalPx::ZERO {
-        return;
-    }
-    let direct = unit == ScrollUnit::Pixel || phase.is_continuous();
-    let Some(target) = app.windows.get(&window) else {
-        return;
-    };
-    let mut chain: SmallVec<
-        [(
-            NodeId,
-            crate::interaction::ScrollSlot,
-            crate::math::LogicalSize,
-        ); 8],
-    > = SmallVec::new();
-    let mut cursor = Some(result.node);
-    while let Some(current) = cursor {
-        if let Some(slot) = target.tree().scroll_slot(current) {
-            let size = scroll::viewport(target.tree(), current).size;
-            chain.push((current, slot, size));
-        }
-        cursor = target
-            .tree()
-            .get(current)
-            .ok()
-            .and_then(|node| node.parent());
-    }
-    let mut dx = delta_x;
-    let mut dy = delta_y;
-    for (node, slot, size) in chain {
-        let drives = match slot.axis {
-            crate::interaction::ScrollAxis::Vertical => dy,
-            crate::interaction::ScrollAxis::Horizontal => dx,
-        };
-        if drives == LogicalPx::ZERO {
-            continue;
-        }
-        let max = scroll::max_offset(&slot, size);
-        let pending = if direct {
-            let handle = ScrollHandle::new(window, node);
-            super::animation::cancel_scroll_animation(app, &handle);
-            slot.offset
-        } else {
-            app.scroll_animation_target(node, window)
-                .unwrap_or(slot.offset)
-        };
-        let (before, limit) = match slot.axis {
-            crate::interaction::ScrollAxis::Vertical => (pending.y, max.y),
-            crate::interaction::ScrollAxis::Horizontal => (pending.x, max.x),
-        };
-        let before = px(before.value().clamp(0.0, limit.value()));
-        let step = if unit == ScrollUnit::Line {
-            slot.line_height
-        } else {
-            px(1.0)
-        };
-        let after = px((before - step * drives.value())
-            .value()
-            .clamp(0.0, limit.value()));
-        let consumed = px((before - after) / step);
-        if consumed == LogicalPx::ZERO {
-            continue;
-        }
-        let handle = ScrollHandle::new(window, node);
-        let mut goal = LogicalPoint::new(px(0.0), px(0.0));
-        match slot.axis {
-            crate::interaction::ScrollAxis::Vertical => goal.y = after,
-            crate::interaction::ScrollAxis::Horizontal => goal.x = after,
-        }
-        if direct {
-            let _ = app.scroll_to(&handle, goal);
-        } else {
-            let _ = app.scroll_to_animated(&handle, goal);
-        }
-        match slot.axis {
-            crate::interaction::ScrollAxis::Vertical => dy -= consumed,
-            crate::interaction::ScrollAxis::Horizontal => dx -= consumed,
-        }
-        if dx == LogicalPx::ZERO && dy == LogicalPx::ZERO {
-            break;
-        }
-    }
+    scroll::route_wheel(
+        app,
+        window,
+        hit.map(|result| result.node),
+        LogicalPoint::new(delta_x, delta_y),
+        unit,
+        phase,
+        timestamp,
+    );
 }
 
 pub(crate) fn on_key(
@@ -815,7 +745,7 @@ pub(crate) fn on_key(
 }
 
 fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
-    use crate::{event::Key, interaction::ScrollAxis};
+    use crate::{event::Key, interaction::ScrollAxes};
     let Some(key) = Key::from_code(code) else {
         return false;
     };
@@ -825,25 +755,47 @@ fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
     let Some(target) = app.windows.get(&window) else {
         return false;
     };
-    let Some((node, slot)) = scroll::scroll_ancestor(target.tree(), focused) else {
+    let tree = target.tree();
+    let requested: &[ScrollAxes] = match key {
+        Key::ArrowLeft | Key::ArrowRight => &[ScrollAxes::Horizontal],
+        Key::ArrowUp | Key::ArrowDown => &[ScrollAxes::Vertical],
+        Key::PageUp | Key::PageDown | Key::Home | Key::End => {
+            &[ScrollAxes::Vertical, ScrollAxes::Horizontal]
+        }
+        _ => return false,
+    };
+    let candidates = scroll::scroll_candidates(tree, focused);
+    let mut selected = None;
+    for axis in requested {
+        let found = candidates.iter().copied().find_map(|candidate| {
+            let slot = tree.scroll_slot(candidate)?;
+            if !tree.is_effectively_visible(candidate)
+                || !tree.is_effectively_interactive(candidate)
+            {
+                return None;
+            }
+            slot.axes.supports(*axis).then_some((candidate, slot))
+        });
+        if let Some((node, slot)) = found {
+            selected = Some((node, slot, *axis));
+            break;
+        }
+    }
+    let Some((node, slot, axis)) = selected else {
         return false;
     };
-    let viewport = scroll::viewport(target.tree(), node).size;
+    let viewport = scroll::viewport(tree, node).size;
     let max = scroll::max_offset(&slot, viewport);
-    let limit = match slot.axis {
-        ScrollAxis::Vertical => max.y,
-        ScrollAxis::Horizontal => max.x,
-    };
     let line = slot.line_height;
-    let page = match slot.axis {
-        ScrollAxis::Vertical => viewport.height,
-        ScrollAxis::Horizontal => viewport.width,
+    let (limit, page) = match axis {
+        ScrollAxes::Horizontal => (max.x, viewport.width),
+        _ => (max.y, viewport.height),
     };
-    let goal = match (slot.axis, key) {
-        (ScrollAxis::Vertical, Key::ArrowUp) => Some(-line),
-        (ScrollAxis::Vertical, Key::ArrowDown) => Some(line),
-        (ScrollAxis::Horizontal, Key::ArrowLeft) => Some(-line),
-        (ScrollAxis::Horizontal, Key::ArrowRight) => Some(line),
+    let goal = match (axis, key) {
+        (ScrollAxes::Vertical, Key::ArrowUp) => Some(-line),
+        (ScrollAxes::Vertical, Key::ArrowDown) => Some(line),
+        (ScrollAxes::Horizontal, Key::ArrowLeft) => Some(-line),
+        (ScrollAxes::Horizontal, Key::ArrowRight) => Some(line),
         (_, Key::PageUp) => Some(-page),
         (_, Key::PageDown) => Some(page),
         (_, Key::Home) => Some(-limit),
@@ -854,11 +806,11 @@ fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
         return false;
     };
     let handle = ScrollHandle::new(window, node);
-    let mut movement = LogicalPoint::new(px(0.0), px(0.0));
-    match slot.axis {
-        ScrollAxis::Vertical => movement.y = delta,
-        ScrollAxis::Horizontal => movement.x = delta,
-    }
+    let movement = if axis == ScrollAxes::Horizontal {
+        LogicalPoint::new(delta, LogicalPx::ZERO)
+    } else {
+        LogicalPoint::new(LogicalPx::ZERO, delta)
+    };
     app.scroll_by(&handle, movement).is_ok()
 }
 
@@ -903,6 +855,7 @@ pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
     app.consumed_keys.remove(&window);
     crate::text_edit::cancel_composition_on_focus_loss(app, window);
     crate::popup::dismiss::window_deactivated(app, window);
+    scroll::clear_scroll_session(app, window);
     if app
         .windows
         .get_mut(&window)
@@ -1027,6 +980,19 @@ fn update_hover(app: &mut App, window: WindowId, mut next: Option<NodeId>) {
     app.request_frame();
 }
 
+pub(crate) fn refresh_hover_under_pointer(app: &mut App, window: WindowId) {
+    let Some(target) = app.windows.get(&window) else {
+        return;
+    };
+    if target.pointer().capture.is_some() {
+        return;
+    }
+    let Some(position) = target.pointer_position() else {
+        return;
+    };
+    let hit = app.hit_at(window, position);
+    update_hover(app, window, hit.map(|result| result.node));
+}
 pub(crate) fn cleanup_removed_pointer_state(
     app: &mut App,
     window: WindowId,
@@ -1061,6 +1027,12 @@ pub(crate) fn cleanup_removed_pointer_state(
             .is_some_and(|hit| removed.contains(&hit.node))
         {
             pointer.last_hit = None;
+        }
+        if pointer
+            .scroll_session
+            .is_some_and(|session| removed.contains(&session.target))
+        {
+            pointer.scroll_session = None;
         }
     }
     let Some(chain) = removed_hover_chain else {

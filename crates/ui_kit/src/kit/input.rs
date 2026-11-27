@@ -9,8 +9,9 @@ use taffy::style::{Dimension, LengthPercentageAuto};
 use ui_core::{
     a11y::A11yRole,
     app::App,
+    error::EngineError,
     event::Action,
-    interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
+    interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
     math::{LogicalPoint, LogicalPx, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
@@ -28,7 +29,7 @@ use crate::{
     kit::{
         button::Button,
         icon::IconKind,
-        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
+        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions, detach_proxy},
         size::UnifiedSizable,
     },
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
@@ -203,6 +204,7 @@ pub struct InputNode {
     pub state: Signal<InputState>,
     pub spec: Arc<InputSpec>,
     clear: RefCell<Option<Button>>,
+    clear_proxy: Cell<bool>,
     theme: ThemeHandle,
     scroll_handle: Cell<Option<ScrollHandle>>,
     scroll_content: Cell<Option<LogicalSize>>,
@@ -430,6 +432,7 @@ pub fn build(
         state: *state,
         spec,
         clear: RefCell::new(None),
+        clear_proxy: Cell::new(false),
         theme: theme.clone(),
         scroll_handle: Cell::new(None),
         scroll_content: Cell::new(None),
@@ -444,9 +447,9 @@ pub fn build(
 }
 
 impl InputNode {
-    pub fn install(&self, app: &mut App) {
+    pub fn install(&self, app: &mut App) -> Result<(), EngineError> {
         let Some(window) = self.root.window() else {
-            return;
+            return Err(EngineError::StaleNode { node: self.root });
         };
         let initial = app.read(&self.state).text().to_owned();
         let _ = app.text_edit_set_value(window, self.editable, &initial);
@@ -461,9 +464,10 @@ impl InputNode {
             app.write(&self.state, next);
         }
         if !self.spec.disabled {
-            self.install_scroll(app, window);
+            self.install_scroll(app, window)?;
         }
         let _ = self.sync_layout(app, window);
+        Ok(())
     }
 
     pub fn release(&self, app: &mut App) -> usize {
@@ -472,6 +476,7 @@ impl InputNode {
             released += scrollbar.release(app);
         }
         if let Some(button) = self.clear.borrow_mut().take() {
+            self.detach_clear_proxy(app, &button);
             released += button.release(app);
         }
         released
@@ -543,6 +548,7 @@ impl InputNode {
         };
         if !clearable {
             if let Some(button) = self.clear.borrow_mut().take() {
+                self.detach_clear_proxy(app, &button);
                 if let Some(node) = button.node()
                     && app
                         .window(window)
@@ -640,49 +646,61 @@ impl InputNode {
         (grapheme_count(cleaned.as_str()) > max).then_some(InputError::TooLong { max })
     }
 
-    fn install_scroll(&self, app: &mut App, window: WindowId) {
+    fn install_scroll(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let tokens = self.theme.tokens();
         let size = tokens.for_size(self.spec.size);
         let axis = FieldAxis::of(&self.spec);
         let config = match axis {
             FieldAxis::SingleLine => ScrollConfig {
-                axis: ScrollAxis::Horizontal,
+                axes: ScrollAxes::Horizontal,
                 line_height: size.font_size,
             },
             FieldAxis::Multiline => ScrollConfig {
-                axis: ScrollAxis::Vertical,
+                axes: ScrollAxes::Vertical,
                 line_height: self
                     .metrics
                     .get()
                     .map_or(size.font_size, |metrics| metrics.line_height),
             },
         };
-        let Ok(handle) = app.make_scroll(window, self.viewport, config) else {
-            return;
-        };
-        self.scroll_handle.set(Some(handle));
         if axis == FieldAxis::SingleLine {
-            return;
+            let handle = app.make_scroll(window, self.viewport, config)?;
+            self.scroll_handle.set(Some(handle));
+            return Ok(());
         }
         let scrollbar = ScrollBar::new(
             app,
             self.theme.clone(),
             format_smolstr!("{}.scrollbar", self.spec.name),
-            scrollbar_axis(ScrollAxis::Vertical),
+            ScrollbarAxis::Vertical,
             ScrollbarOptions::default()
                 .hover()
                 .inset(size.padding_x)
                 .focus_opacity(SCROLLBAR_FOCUS_OPACITY)
                 .tab_stop(false),
         );
-        let built = app
-            .window_mut(window)
-            .is_some_and(|target| scrollbar.build(target.tree_mut(), self.root).is_ok());
-        if !built {
-            return;
+        {
+            let Some(target) = app.window_mut(window) else {
+                return Err(EngineError::UnknownWindow { window });
+            };
+            scrollbar.build(target.tree_mut(), self.root)?;
         }
-        scrollbar.attach(app, window, self.viewport);
+        let handle = match app.make_scroll(window, self.viewport, config) {
+            Ok(handle) => handle,
+            Err(error) => {
+                discard_scrollbar(app, window, &scrollbar);
+                return Err(error);
+            }
+        };
+        self.scroll_handle.set(Some(handle));
+        if let Err(error) = scrollbar.attach(app, window, self.viewport) {
+            discard_scrollbar(app, window, &scrollbar);
+            let _ = app.clear_scroll(&handle);
+            self.scroll_handle.set(None);
+            return Err(error);
+        }
         *self.scrollbar.borrow_mut() = Some(scrollbar);
+        Ok(())
     }
 
     fn sync_theme(&self, app: &mut App, window: WindowId) -> bool {
@@ -853,7 +871,7 @@ impl InputNode {
         let Some(state) = app.scroll_state(&handle) else {
             return;
         };
-        if state.axis != ScrollAxis::Horizontal || state.offset.x == LogicalPx::ZERO {
+        if state.axes != ScrollAxes::Horizontal || state.offset.x == LogicalPx::ZERO {
             return;
         }
         let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), state.offset.y));
@@ -866,6 +884,7 @@ impl InputNode {
         let Some(node) = button.node() else {
             return false;
         };
+        self.attach_clear_proxy(app, node);
         let mut changed = button.set_disabled(app, self.spec.disabled);
         let display = if app.read(&self.state).text().is_empty() {
             taffy::style::Display::None
@@ -889,6 +908,45 @@ impl InputNode {
             changed = true;
         }
         changed
+    }
+
+    fn attach_clear_proxy(&self, app: &mut App, node: NodeId) {
+        if self.clear_proxy.get() {
+            return;
+        }
+        let Some(window) = node.window() else {
+            return;
+        };
+        if app.scroll_handle(window, self.viewport).is_none() {
+            return;
+        }
+        if app
+            .set_scroll_proxy(window, node, Some(self.viewport))
+            .is_ok()
+        {
+            self.clear_proxy.set(true);
+        }
+    }
+
+    fn detach_clear_proxy(&self, app: &mut App, button: &Button) {
+        if !self.clear_proxy.get() {
+            return;
+        }
+        self.clear_proxy.set(false);
+        let Some(node) = button.node() else {
+            return;
+        };
+        let Some(window) = node.window() else {
+            return;
+        };
+        detach_proxy(app, window, node);
+    }
+}
+
+fn discard_scrollbar(app: &mut App, window: WindowId, scrollbar: &ScrollBar) {
+    scrollbar.release(app);
+    if let Some(track) = scrollbar.nodes().0 {
+        let _ = app.remove_node(window, track);
     }
 }
 
@@ -950,13 +1008,6 @@ fn text_style(spec: &InputSpec, size: &crate::theme::components::SizeTokens) -> 
         .with_overflow(TextOverflow::Clip, 0)
 }
 
-fn scrollbar_axis(axis: ScrollAxis) -> ScrollbarAxis {
-    match axis {
-        ScrollAxis::Horizontal => ScrollbarAxis::Horizontal,
-        ScrollAxis::Vertical => ScrollbarAxis::Vertical,
-    }
-}
-
 fn grapheme_count(text: &str) -> usize {
     text.graphemes(true).count()
 }
@@ -969,12 +1020,14 @@ mod tests {
     use ui_core::{
         a11y::{A11yRole, A11yTextSelection},
         app::App,
+        error::EngineError,
         event::{Action, ImeEvent, InputEvent, KeyCode, Modifiers, PointerButton},
-        interaction::{ScrollAxis, ScrollConfig, ScrollHandle},
+        interaction::{ScrollAxes, ScrollConfig, ScrollHandle},
         math::{LogicalPoint, LogicalPx, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeKind},
         paint::{
             color::{Color, ColorResolver},
+            style::Style,
             style_builder::StyleBuilder,
         },
         test_support::{
@@ -1056,7 +1109,7 @@ mod tests {
             &state,
             &placeholder,
         );
-        node.install(app.app_mut());
+        node.install(app.app_mut()).expect("install");
         for _ in 0..3 {
             let _ = node.sync(app.app_mut());
             app.drain().expect("稳定帧");
@@ -1949,7 +2002,7 @@ mod tests {
                 &placeholder,
             )
         };
-        node.install(app.app_mut());
+        node.install(app.app_mut()).expect("install");
         app.drain().expect("首帧");
         let bounds = app.probe().bounds(node.root).expect("root 已布局");
         assert!(
@@ -2047,7 +2100,7 @@ mod tests {
                 window,
                 wrapper,
                 ScrollConfig {
-                    axis: ui_core::interaction::ScrollAxis::Vertical,
+                    axes: ui_core::interaction::ScrollAxes::Vertical,
                     line_height: px(20.0),
                 },
             )
@@ -2086,7 +2139,7 @@ mod tests {
                 &placeholder,
             )
         };
-        node.install(app.app_mut());
+        node.install(app.app_mut()).expect("install");
         app.drain().expect("首帧");
         app.drain().expect("布局帧");
         app.drain().expect("高度帧");
@@ -2672,7 +2725,7 @@ mod tests {
                 .tree_mut();
             build(tree, root, Arc::new(spec), &theme, &state, &placeholder)
         };
-        node.install(app.app_mut());
+        node.install(app.app_mut()).expect("install");
         let mut heights = Vec::with_capacity(5);
         for _ in 0..5 {
             let _ = node.sync(app.app_mut());
@@ -2733,7 +2786,7 @@ mod tests {
                     .tree_mut();
                 build(tree, root, Arc::new(spec), &theme, &state, &placeholder)
             };
-            node.install(app.app_mut());
+            node.install(app.app_mut()).expect("install");
             nodes.push(node);
         }
         let first = nodes[0].clone();
@@ -3128,7 +3181,7 @@ mod tests {
             .scroll_handle(window, harness.node.viewport)
             .expect("单行 viewport 有水平滚动槽");
         let state = harness.app.app().scroll_state(&handle).expect("滚动状态");
-        assert_eq!(state.axis, ScrollAxis::Horizontal);
+        assert_eq!(state.axes, ScrollAxes::Horizontal);
         let tree = harness.app.app().window(window).expect("窗口").tree();
         assert_eq!(
             tree.get(harness.node.root).expect("root").children().len(),
@@ -3382,7 +3435,7 @@ mod tests {
             &state,
             &placeholder,
         );
-        node.install(app.app_mut());
+        node.install(app.app_mut()).expect("install");
         for _ in 0..3 {
             let _ = node.sync(app.app_mut());
             app.drain().expect("稳定帧");
@@ -3454,6 +3507,353 @@ mod tests {
         assert!(
             bar.scrollable(harness.app.app()),
             "内容超过 3 行后滚动条必须可滚动"
+        );
+    }
+
+    fn page_harness(spec: InputSpec, initial: &str) -> (TestApp, InputNode, ScrollHandle) {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let page = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .id("page")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .width(px(400.0))
+                        .height(px(300.0))
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("page")
+        };
+        let page_handle = app
+            .app_mut()
+            .make_scroll(window, page, ScrollConfig::default())
+            .expect("page scroll");
+        app.app_mut()
+            .set_scroll_content(&page_handle, LogicalSize::new(px(400.0), px(1_200.0)))
+            .expect("page content");
+        let state = app.app_mut().signal(InputState::new(initial));
+        let placeholder = app.app_mut().signal(spec.placeholder.clone());
+        let spec = Arc::new(spec);
+        let node = build(
+            app.app_mut().window_mut(window).expect("window").tree_mut(),
+            page,
+            spec,
+            &theme,
+            &state,
+            &placeholder,
+        );
+        node.install(app.app_mut()).expect("install");
+        for _ in 0..3 {
+            let _ = node.sync(app.app_mut());
+            let _ = app.drain().expect("frame");
+        }
+        (app, node, page_handle)
+    }
+
+    fn long_multiline_text() -> String {
+        let mut text = String::new();
+        for index in 0..24 {
+            text.push_str(&format!("第 {index} 行内容\n"));
+        }
+        text
+    }
+
+    fn wheel_down(app: &mut TestApp, point: LogicalPoint) {
+        let _ = app.inject(InputEvent::scroll_lines(
+            point,
+            LogicalPoint::new(px(0.0), px(-1.0)),
+            Modifiers::empty(),
+        ));
+    }
+
+    fn descendant_of(app: &TestApp, node: NodeId, ancestor: NodeId) -> bool {
+        let window = app.window_id();
+        let tree = app.app().window(window).expect("window").tree();
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            if current == ancestor {
+                return true;
+            }
+            cursor = tree.get(current).ok().and_then(|target| target.parent());
+        }
+        false
+    }
+
+    fn point_center(app: &TestApp, node: NodeId) -> LogicalPoint {
+        let bounds = app.probe().bounds(node).expect("bounds");
+        LogicalPoint::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        )
+    }
+
+    fn scroll_proxy(app: &TestApp, node: NodeId) -> Option<NodeId> {
+        let window = app.window_id();
+        app.app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .scroll_proxy(node)
+    }
+
+    #[test]
+    fn multiline_input_wheel_over_bar_scrolls_the_input_not_the_page() {
+        let text = long_multiline_text();
+        let (mut app, node, page) = page_harness(multiline_spec(Some(2)), text.as_str());
+        assert!(node.scrollbar.borrow().is_some(), "多行输入必须有滚动条");
+        let window = app.window_id();
+        let handle = app
+            .app()
+            .scroll_handle(window, node.viewport)
+            .expect("input scroll slot");
+        let before = app.app().scroll_state(&handle).expect("state").offset.y;
+        let bar = node.scrollbar.borrow().clone().expect("bar");
+        let (track, _) = bar.nodes();
+        let track = track.expect("track");
+        let point = point_center(&app, track);
+        assert_eq!(
+            app.probe().hit(point).map(|hit| hit.node),
+            Some(track),
+            "滚轮落点必须命中轨道"
+        );
+        wheel_down(&mut app, point);
+        let after = app.app().scroll_state(&handle).expect("state").offset.y;
+        assert!(
+            after > before,
+            "滚轮在轨道上必须滚输入自身：{before} -> {after}"
+        );
+        assert_eq!(
+            app.app().scroll_state(&page).expect("page state").offset,
+            LogicalPoint::ZERO,
+            "不得滚外层页面"
+        );
+        let _ = app.drain();
+    }
+
+    #[test]
+    fn input_clear_button_wheel_scrolls_the_input_not_the_page() {
+        let text = long_multiline_text();
+        let (mut app, node, page) = page_harness(multiline_spec(Some(2)), text.as_str());
+        assert!(node.set_clearable(app.app_mut(), true), "清空按钮已创建");
+        for _ in 0..2 {
+            let _ = node.sync(app.app_mut());
+            let _ = app.drain().expect("frame");
+        }
+        let button = node.clear.borrow().clone().expect("clear button");
+        let button_node = button.node().expect("clear button node");
+        assert_eq!(
+            scroll_proxy(&app, button_node),
+            Some(node.viewport),
+            "清空按钮代理到输入视口"
+        );
+        let window = app.window_id();
+        let handle = app
+            .app()
+            .scroll_handle(window, node.viewport)
+            .expect("input scroll slot");
+        let before = app.app().scroll_state(&handle).expect("state").offset.y;
+        let point = point_center(&app, button_node);
+        let hit = app.probe().hit(point).map(|hit| hit.node);
+        assert!(
+            hit.is_some_and(|hit| descendant_of(&app, hit, button_node)),
+            "滚轮落点必须在清空按钮内：{hit:?}"
+        );
+        wheel_down(&mut app, point);
+        let after = app.app().scroll_state(&handle).expect("state").offset.y;
+        assert!(
+            after > before,
+            "清空按钮上的滚轮必须滚输入自身：{before} -> {after}"
+        );
+        assert_eq!(
+            app.app().scroll_state(&page).expect("page state").offset,
+            LogicalPoint::ZERO,
+            "不得滚外层页面"
+        );
+        assert!(node.set_clearable(app.app_mut(), false), "清空按钮已移除");
+        let _ = app.drain();
+    }
+
+    #[test]
+    fn clear_button_proxy_is_cleared_when_the_button_is_removed_or_released() {
+        let text = long_multiline_text();
+        let (mut app, node, _page) = page_harness(multiline_spec(Some(2)), text.as_str());
+        assert!(node.set_clearable(app.app_mut(), true), "清空按钮已创建");
+        for _ in 0..2 {
+            let _ = node.sync(app.app_mut());
+            let _ = app.drain().expect("frame");
+        }
+        let button_node = node
+            .clear
+            .borrow()
+            .clone()
+            .expect("clear button")
+            .node()
+            .expect("clear button node");
+        assert_eq!(
+            scroll_proxy(&app, button_node),
+            Some(node.viewport),
+            "清空按钮代理到输入视口"
+        );
+        assert!(node.set_clearable(app.app_mut(), false), "清空按钮已移除");
+        let _ = app.drain().expect("frame");
+        {
+            let window = app.window_id();
+            let tree = app.app().window(window).expect("window").tree();
+            assert!(tree.get(button_node).is_err(), "按钮节点随之卸载");
+        }
+        assert_eq!(
+            scroll_proxy(&app, button_node),
+            None,
+            "节点卸载后读代理不 panic 且为 None"
+        );
+        assert!(node.set_clearable(app.app_mut(), true), "清空按钮已重建");
+        for _ in 0..2 {
+            let _ = node.sync(app.app_mut());
+            let _ = app.drain().expect("frame");
+        }
+        let button_node = node
+            .clear
+            .borrow()
+            .clone()
+            .expect("clear button")
+            .node()
+            .expect("clear button node");
+        assert_eq!(scroll_proxy(&app, button_node), Some(node.viewport));
+        assert!(node.release(app.app_mut()) > 0, "release 回收组件");
+        assert_eq!(
+            scroll_proxy(&app, button_node),
+            None,
+            "release 后按钮代理被清除"
+        );
+        assert_eq!(node.release(app.app_mut()), 0, "release 幂等");
+        let _ = app.drain().expect("frame");
+    }
+
+    #[test]
+    fn install_reports_missing_install_targets_and_keeps_no_scrollbar() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let state = app.app_mut().signal(InputState::new("abc"));
+        let placeholder = app.app_mut().signal(SmolStr::new_static("占位"));
+        let spec = Arc::new(multiline_spec(Some(2)));
+        let node = build(
+            app.app_mut().window_mut(window).expect("window").tree_mut(),
+            root,
+            spec,
+            &theme,
+            &state,
+            &placeholder,
+        );
+        let viewport = node.viewport;
+        let root_children = |app: &TestApp| {
+            app.app()
+                .window(window)
+                .expect("window")
+                .tree()
+                .get(root)
+                .expect("root")
+                .children()
+                .len()
+        };
+        let children_before = root_children(&app);
+        app.app_mut()
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style(viewport, Style::default())
+            .expect("视口样式");
+        let error = node
+            .install(app.app_mut())
+            .expect_err("非滚动视口必须让 install 报错");
+        assert!(
+            matches!(error, EngineError::NotScrollable { node } if node == viewport),
+            "缺失滚动槽必须报 NotScrollable：{error:?}"
+        );
+        assert!(
+            node.scrollbar.borrow().is_none(),
+            "make_scroll 失败不得保存（注册）滚动条"
+        );
+        assert!(
+            node.scroll_handle.get().is_none(),
+            "make_scroll 失败后不得保留滚动句柄"
+        );
+        assert_eq!(
+            root_children(&app),
+            children_before,
+            "build 已建出的滚动条节点必须在 make_scroll 失败时回收"
+        );
+        {
+            let tree = app.app().window(window).expect("window").tree();
+            assert!(tree.get(viewport).is_ok(), "视口节点仍在");
+        }
+        assert!(
+            app.app().scroll_handle(window, viewport).is_none(),
+            "install 失败后不得残留滚动槽或返回滚动句柄"
+        );
+        assert!(
+            app.app()
+                .window(window)
+                .expect("window")
+                .tree()
+                .scroll_proxy(node.root)
+                .is_none(),
+            "失败不得留下代理"
+        );
+        app.app_mut()
+            .remove_node(window, viewport)
+            .expect("remove viewport");
+        let children_before_missing_viewport = root_children(&app);
+        let error = node
+            .install(app.app_mut())
+            .expect_err("视口卸载后 install 必须报错");
+        assert!(
+            matches!(error, EngineError::StaleNode { node } if node == viewport),
+            "缺失可滚动视口必须报 StaleNode：{error:?}"
+        );
+        assert!(
+            node.scrollbar.borrow().is_none(),
+            "失败不得保存（注册）滚动条"
+        );
+        assert!(
+            node.scroll_handle.get().is_none(),
+            "视口卸载后 install 失败不得保留滚动句柄"
+        );
+        assert_eq!(
+            root_children(&app),
+            children_before_missing_viewport,
+            "build 已建出的滚动条节点必须在 make_scroll 失败时回收"
+        );
+        assert!(
+            app.app()
+                .window(window)
+                .expect("window")
+                .tree()
+                .scroll_proxy(node.root)
+                .is_none(),
+            "失败不得留下代理"
+        );
+        app.app_mut()
+            .remove_node(window, node.root)
+            .expect("remove root");
+        let expected_root = node.root;
+        let error = node
+            .install(app.app_mut())
+            .expect_err("根节点卸载后必须报错");
+        assert!(
+            matches!(error, EngineError::StaleNode { node } if node == expected_root),
+            "build 失败必须报 StaleNode：{error:?}"
+        );
+        assert!(
+            node.scrollbar.borrow().is_none(),
+            "build 失败不得保存滚动条"
         );
     }
 }

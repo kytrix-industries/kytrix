@@ -962,7 +962,7 @@ impl CredentialsEditor {
                     .tree_mut();
                 input::build(tree, column, spec, &theme, &state, &placeholder)
             };
-            input.install(app);
+            input.install(app)?;
             let error: Signal<Option<SmolStr>> = app.signal_scoped(scope, None);
             let error_theme = theme.clone();
             layout::build_node(app, window, column, move |tree, parent| {

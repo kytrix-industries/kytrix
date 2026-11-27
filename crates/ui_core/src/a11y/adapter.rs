@@ -729,12 +729,8 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     }
     if let Some(orientation) = record.orientation {
         node.set_orientation(orientation_to_accesskit(orientation));
-    } else if let Some(scroll) = record.scroll {
-        node.set_orientation(if scroll.vertical {
-            accesskit::Orientation::Vertical
-        } else {
-            accesskit::Orientation::Horizontal
-        });
+    } else if let Some(orientation) = record.scroll.and_then(|scroll| scroll.orientation) {
+        node.set_orientation(orientation_to_accesskit(orientation));
     }
     if record.clips_children {
         node.set_clips_children();
@@ -2031,7 +2027,7 @@ mod tests {
             .scroll = Some(crate::interaction::ScrollSlot {
             offset: crate::math::LogicalPoint::ZERO,
             content: crate::math::LogicalSize::new(px(10.0), px(100.0)),
-            axis: crate::interaction::ScrollAxis::Vertical,
+            axes: crate::interaction::ScrollAxes::Vertical,
             line_height: px(40.0),
         });
         let mut ids = crate::a11y::identity::A11yIds::new();
@@ -2054,7 +2050,7 @@ mod tests {
         assert_eq!(
             to_accesskit(&record).orientation(),
             Some(accesskit::Orientation::Horizontal),
-            "显式声明必须胜过 scroll.vertical 推导"
+            "显式声明必须胜过滚动轴推导"
         );
 
         let derived = NodeBuilder::boxed()
@@ -2070,7 +2066,7 @@ mod tests {
             .scroll = Some(crate::interaction::ScrollSlot {
             offset: crate::math::LogicalPoint::ZERO,
             content: crate::math::LogicalSize::new(px(10.0), px(100.0)),
-            axis: crate::interaction::ScrollAxis::Vertical,
+            axes: crate::interaction::ScrollAxes::Vertical,
             line_height: px(40.0),
         });
         let record = crate::a11y::tree::node_a11y_with_cache(
@@ -2087,7 +2083,7 @@ mod tests {
         assert_eq!(
             to_accesskit(&record).orientation(),
             Some(accesskit::Orientation::Vertical),
-            "滚动容器无显式方向 ⇒ 按 vertical 轴推导"
+            "滚动容器无显式方向 ⇒ 按 Vertical 轴推导"
         );
     }
 

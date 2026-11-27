@@ -1483,7 +1483,7 @@ impl DialogState {
                 &self.filter_placeholder,
             )
         };
-        filter.install(app);
+        filter.install(app)?;
         self.filter = Some(filter);
 
         let area = build_node(app, window, root, |tree, root| {
@@ -1841,7 +1841,7 @@ impl DialogState {
                 &self.query_placeholder,
             )
         };
-        query.install(app);
+        query.install(app)?;
         *submit_slot.borrow_mut() = Some(query.clone());
         self.query = Some(query);
         let search_holder = build_node(app, window, toolbar, |tree, toolbar| {

@@ -9,7 +9,7 @@
 
 ## 1. 示例结构
 
-单文件、只依赖 `ui_core` + `base_ui::{kit, theme, style_builder}`；窗口 1200×800、系统标题栏、引擎 scroll 容器承载 15 个分区卡片（`flow flex_col`，内容总高 3854 逻辑像素）：
+单文件、只依赖 `ui_core` + `base_ui::{kit, theme, style_builder}`；窗口 1200×800、系统标题栏、引擎 scroll 容器承载 **16 个分区**卡片（`flow flex_col`；P2-5 时为 15 个，P3 在 ⑨ 后插入 ⑩ 宽表，旧 ⑩–⑮ 顺延为 ⑪–⑯）：
 
 | # | 分区 | 覆盖组件 / 能力 |
 |---|---|---|
@@ -19,21 +19,26 @@
 | ④ | 反馈 | `badge` 6 色、`progress`、`spinner`（静态，见 G6）、`separator`、`empty_state` |
 | ⑤ | 标签栏 | `tab_bar::TabBar`（Slide 指示条 / 关闭按钮 / 方向键） |
 | ⑥ | 列表 | `list::List` 等高 / 变高（`RowHeight::Variable` 实测回写）/ 双端 deque（push 按钮） |
-| ⑦ | 滚动条 | 独立 `scroll_bar::ScrollBar` + 引擎 `App::make_scroll`（20 行，拖拽 / 轨道点击） |
-| ⑧ | 表格 | `table::{Table, Column}`：固定/弹性列、跨列（`span(2)`）、可排序表头、`SelectionMode::Multi`、变高行 |
+| ⑦ | **双轴滚动演示** | `scroll_bar::ScrollBar` 垂直 + 水平两条 bar 代理同一 `App::make_scroll` 容器（20 行 × 宽内容；两轴可滚、拖拽 / track 滚轮 / 轨道点击）；**外层页面还有 hover 淡入的 overlay 滚动条**（页面可滚时出现） |
+| ⑧ | 表格 | `table::{Table, Column}`：固定/弹性列（`Column::flex(header, weight, min_width)` 三参数）、跨列（`span(2)`）、可排序表头、`SelectionMode::Multi`、变高行 |
 | ⑨ | 树 | `tree::{Tree, TreeItem}`：展开折叠 / 层级 / 方向键 / 单选 |
-| ⑩ | 输入框 | `input::{InputSpec, InputState, InputNode}`：单行 / 掩码 / 禁用 / 多行 + IME 提示 |
-| ⑪ | markdown | `markdown::{parse::parse_document, view::MarkdownView}`：富文本 / 代码 / 表格 / 引用 / 列表 / 行内图片占位 |
-| ⑫ | 浮层 | 独立 `overlay::Overlay`、`tooltip::Tooltip`、`dropdown`、`select`（多选 + 标签）、`menu`、`context_menu` |
-| ⑬ | 对话框 | `dialog::DialogBuilder`（普通对话框 + `alert` 形状 / 确认取消 / on_close / 模态遮罩） |
-| ⑭ | 颜色选择器 | `color_picker::ColorPicker`（触发器 + on_change） |
-| ⑮ | 交互日志 | 最近 8 条事件（指针命中节点 debug id / 主题 / 按钮 / 开关 / 表格 / 菜单 / 对话框） |
+| **⑩** | **宽表（新增）** | `Table` 横向滚动 + **内部 sticky 表头**：窄容器 420（出现水平条、可横向滚动/表头跟随）与宽容器 1100（无水平条）对照；三参数列配置；G7–G9 |
+| ⑪ | 输入框 | `input::{InputSpec, InputState, InputNode}`：单行 / 掩码 / 禁用 / 多行 + IME 提示 |
+| ⑫ | markdown | `markdown::{parse::parse_document, view::MarkdownView}`：富文本 / 代码 / 表格 / 引用 / 列表 / 行内图片占位 |
+| ⑬ | 浮层 | `popup_panel::PopupPanel` / `MenuChain`、`tooltip::Tooltip`、`dropdown`、`select`（多选 + 标签）、`menu`、`context_menu` |
+| ⑭ | 对话框 | `dialog::DialogBuilder`（普通对话框 + `alert` 形状 / 确认取消 / on_close / 模态遮罩） |
+| ⑮ | 颜色选择器 | `color_picker::ColorPicker`（触发器 + on_change） |
+| ⑯ | 交互日志 | 最近 8 条事件（指针命中节点 debug id / 主题 / 按钮 / 开关 / 表格 / 菜单 / 对话框） |
+
+> **编号说明**：本文件 §2–§4、§9–§11、§13.5 中 P2-5/P2-6b 时期的日志与引用沿用当时 15 分区编号（旧 ⑩ 输入框、⑪ markdown … ⑮ 日志）；P3 起现行编号以上表为准（**⑩ 宽表**，旧 ⑩–⑮ 顺延为 ⑪–⑯，共 16 分区）。
 
 实现要点：
 
-- **组合根义务**：`ThemeHandle` / `Layer` / `AnimationRouter` 各一份；`App::on_frame` 单钩子里 `drain_events → 各组件 dispatch → status 镜像 → 各组件 sync`（与 `kit/mod.rs` 的组件形态一致）；
+- **组合根义务**：`ThemeHandle` / `FrameRouter` 各一份（浮层由引擎 popup 栈持有，不再有 `Layer` / `AnimationRouter`）；`App::on_frame` 单钩子里 `drain_events → 各组件 dispatch → status 镜像 → 各组件 sync`（与 `kit/mod.rs` 的组件形态一致）；
 - 页面滚动：内容列显式 `height(total)` + `flex_none()`（taffy 默认 `flex_shrink:1` 会把卡片压扁——gallery 首版曾只显示分区标题）；
-- 验收钩子：`--auto-demo`（`dispatch_action(Programmatic)` 触发主按钮）、`--idle-check`（1 s 基线 + 3 s 帧增量 ≤2，PASS 后关窗）、`--probe`（打印关键节点布局盒 + 底部滚动偏移 + 嵌套列表 `mounted_rows`，供外部点击换算坐标）、`--scroll-to=<y>`（程序化滚动，截图用）；退出码 0/3；
+- 验收钩子：`--auto-demo`（`dispatch_action(Programmatic)` 触发主按钮）、`--idle-check`（1 s 基线 + 3 s 帧增量 ≤2，PASS 后关窗）、`--wheel-check`（进程内注入滚轮/拖拽，G1–G9 **37 断言**；PASS 文案 `gallery: wheel-check PASS (G1-G5, G7-G9; 37 assertion(s))`；G6 已并入 G2/取消）、`--probe`（打印关键节点布局盒 + 底部滚动偏移 + 嵌套列表 `mounted_rows`，供外部点击换算坐标）、`--scroll-to=<y>`（程序化滚动，截图用）；退出码 0/3；
+- 页面滚动条：**Hover 淡入的 overlay 滚动条**（页面可滚时出现，不占布局；⑦ 的两条条是独立容器内的常驻 bar）；
+- 宽表 ⑩：窄 420 / 宽 1100 两个 `Table` 对照（sticky 表头、水平条 tail gap 4 px、三参数列配置）；G7 覆盖水平条 track 滚轮 + thumb 拖动；
 - 截图/点击脚本（仅本地，`.review` gitignored）：`mig-p2-5-win-final.ps1`（DPI-aware OS 级点击 / 滚轮 / 键盘）、`mig-p2-5-mac-gallery.sh`、`mig-p2-5-linux-gallery.sh`。
 
 ## 2. 三端真实运行结果
@@ -65,7 +70,7 @@ bash .review/p2-5-linux-gallery.sh   # 通过 ssh my_ubuntu 执行
 `mig-p2-5-gallery-win-run.log` / 截图底部交互日志（最近 8 条）：
 
 ```text
-gallery: 建树完成（15 个分区）
+gallery: 建树完成（16 个分区；P2-5 时为 15，P3 插入 ⑩ 宽表后为 16）
 window: resize 1200×800
 window: focus=true
 theme: 切换为 Light                      ← 真实点击顶栏按钮（截图 -theme.png 全窗变浅色）
@@ -596,13 +601,13 @@ gallery 收尾：
 
 ## 12. P5 回写：§10 输入演示 / `--probe` 新增输出 / `--idle-check`·`--theme-check` 校验口径
 
-- 背景：`gallery.rs` 在文本输入重构（P0–P4，`.docs/text-input-redesign-design.md` §11）后，第 ⑩ 节的
+- 背景：`gallery.rs` 在文本输入重构（P0–P4，`.docs/text-input-redesign-design.md` §11）后，第 ⑪ 节的
   输入框改由 `ui_core::text_edit` 绘制与编辑，`ui_kit::kit::input` 只是薄壳。本节记录 P5 收尾时
   该演示与三个检查开关的**最终**口径；§1 的表格与 §11.8.5 的旧数字是 P2 时期快照，不再更新。
 - head：`cb965b56` + P5 工作区改动（仅 `gallery.rs` 演示数据 + 文档）。日志
   `.review/text-input/p5-gallery-probe.log`。
 
-### 12.1 第 ⑩ 节（输入框）结构与演示数据
+### 12.1 第 ⑪ 节（输入框）结构与演示数据
 
 | 控件 | spec | 演示值 |
 |---|---|---|
@@ -734,7 +739,7 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 - **`sampled-animation-floor` 口径**：open/close 的“已提交帧增量”下界；终审 K1-06 修复后按**单次关闭分段**校验（open ≥4、close#1 ≥3、close#2 ≥3，实测 8 / 6+6），防止动画常量变短或单次关闭完全不播动画时被累计采样掩盖；它仍**不是**“每一帧都是动画帧”的逐帧计数。
 - **`--debug-stack` 实测基线（P1/P2 历史）**：`menu` 度量 `(6, 180.0, 127.5125)`、picker children=4、最终 `entries=0`、`overlay-check PASS`，exit 0；**P3 现测 `menu=(9, 270.0, 180.075)`（见 §14）**；自动化完成后自行关窗（`overlay-check complete -> closing window`），`--auto-close` 仅 ≥30s 看门狗，带 9 与不带 auto-close 均 PASS。`menu_frames`/`picker_frames` 为逐帧采样计数、运行间浮动（只断言 >0），不是固定契约。
 - **旧 `--dump-overlay` 已移除且显式失败**：参数表中不再存在；传旧名会打印 `gallery: --dump-overlay was renamed; use --debug-stack --auto-close=9` 并 **exit 2**；其它未知参数会打印 `gallery: unknown argument <arg>` 与 usage 并 **exit 2**；`--help` 仍 exit 0（不再“忽略后 exit 0”假绿，终审 K1-04/Q1-07）。三端脚本与 README 一律改 `--debug-stack`。
-- **P1 完成状态**：gallery 的 ⑭ ColorPicker 场景与 overlay-check 已全部跑在新 popup API 上；真实窗口像素 readback/截图与三端验收仍为 **P3-6**（`--debug-stack` 只断言栈/rect）。
+- **P1 完成状态**：gallery 的 ⑮ ColorPicker 场景与 overlay-check 已全部跑在新 popup API 上；真实窗口像素 readback/截图与三端验收仍为 **P3-6**（`--debug-stack` 只断言栈/rect）。
 - **最终数字（round-3）**：`--pixel-check` `checks=94`、`close 6+6=12` 不变；`cargo test -p ui_core -p ui_kit` 最终 3780 passed / 2 ignored（ui_kit 801），详见设计 §12.5。**P2 后记录见 §13.6。**
 ### 13.6 P2-7 回写：3 级链 overlay-check 与 P2 完成状态（2026-11-27）
 
@@ -755,7 +760,7 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
   - Windows：`cargo run -p ui_kit --example gallery -- --real-pixel-check`（PowerShell `System.Drawing.CopyFromScreen` 虚拟屏幕）。
   - macOS：`tools/real-pixel-check-macos.sh`（构建后 `open -a Terminal` + osascript 执行并等待 exit 文件；`screencapture -x` 需要 **Screen Recording/TCC**，普通 ssh 会话只能拍壁纸）。
   - Linux/Wayland：`tools/real-pixel-check-linux.sh`（以父 Wayland socket 启 nested `sway --unsupported-gpu`，探测 grim-capable socket 后运行；`grim` 抓整个 wl_output 布局）。
-- **三端结果（2026-11-27，P3 最终树全部复跑）**：**三端 HEAD `35c9381d` clean 各 106 checks / 0 failures PASS**：Windows 45.9 s/frame 280（隔离 43.3/277）、macOS 72.2 s/frame 283、Ubuntu 20.3 s/frame 311；含 dialog-scrim-theme/composite/alpha + scrim/panel fault + 交互/self-check；report 含 source_revision/status/diff_sha/source_identity/frame/elapsed/scrim_alpha；pixel-check 94 / idle-check / theme-check / debug-stack 均 PASS；`--real-pixel-check` 需独占桌面，并发会假红：
+- **三端结果（2026-11-27，P3 时点证据；合入滚动分支后已在本机 Windows 复跑 106/0，`gallery.rs` 新 SHA 以复跑 report 为准）**：**三端 HEAD `35c9381d` clean 各 106 checks / 0 failures PASS**：Windows 45.9 s/frame 280（隔离 43.3/277）、macOS 72.2 s/frame 283、Ubuntu 20.3 s/frame 311；含 dialog-scrim-theme/composite/alpha + scrim/panel fault + 交互/self-check；report 含 source_revision/status/diff_sha/source_identity/frame/elapsed/scrim_alpha；pixel-check 94 / idle-check / theme-check / debug-stack 均 PASS；`--real-pixel-check` 需独占桌面，并发会假红：
 
 | 平台 | 结果 | 内容尺寸 / DPR | 耗时 | 证据 |
 |---|---|---|---|---|

@@ -276,6 +276,7 @@ pub(crate) fn open_popup(
             close_popup(app, child)?;
         }
     }
+    let traps_focus = spec.focus.is_modal();
     let PopupSpec {
         parent,
         tier,
@@ -412,6 +413,9 @@ pub(crate) fn open_popup(
     if let Err(error) = finalize_open(app, window, modal_id, content_node) {
         let _ = close_popup(app, modal_id);
         return Err(error);
+    }
+    if traps_focus {
+        crate::interaction::scroll::clear_scroll_session(app, window);
     }
     if tier == PopupTier::Modal {
         force_full_paint(app, window);
@@ -587,6 +591,9 @@ fn close_entry(app: &mut App, id: PopupId) -> Result<(), PopupError> {
     for (_, descendant) in ordered_descendants {
         crate::popup::dismiss::notify_dismiss(app, window, descendant, DismissReason::ParentClosed);
         let _ = close_entry(app, descendant);
+    }
+    if is_modal {
+        crate::interaction::scroll::clear_scroll_session(app, window);
     }
     crate::popup::focus::release_focus_on_close(app, window, id);
     if is_modal || is_scrim {

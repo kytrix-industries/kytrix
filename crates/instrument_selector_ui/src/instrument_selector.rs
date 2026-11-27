@@ -588,7 +588,7 @@ impl SelectorState {
                 &self.input_placeholder,
             )
         };
-        input.install(app);
+        input.install(app)?;
         self.input = Some(input);
 
         let list_panel = build_node(app, window, right, |tree, right| {
