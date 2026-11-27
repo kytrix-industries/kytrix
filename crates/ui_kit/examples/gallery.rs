@@ -980,8 +980,34 @@ impl Gallery {
 
         let root = tree(app, window).root();
         tree(app, window)
-            .set_style(root, StyleBuilder::new().flex_col().size_full().build())
+            .set_style(
+                root,
+                StyleBuilder::new()
+                    .relative()
+                    .flex_col()
+                    .size_full()
+                    .build(),
+            )
             .expect("root style");
+        let backdrop_theme = theme.clone();
+        NodeBuilder::boxed()
+            .id("gallery.backdrop")
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .build(),
+            )
+            .paint(PaintBuilder::new().background(canvas).build())
+            .bind_style(move |cx| StylePatch {
+                background: Some(backdrop_theme.role(cx, Role::SurfaceCanvas)),
+                ..StylePatch::default()
+            })
+            .build(tree(app, window), root)
+            .expect("backdrop");
         let header = NodeBuilder::boxed()
             .id("gallery.header")
             .style(

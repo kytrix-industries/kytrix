@@ -1688,6 +1688,20 @@ cargo run -p ui_kit --example gallery -- --debug-stack
 - **source-id**：`tools/record-source-id.ps1` 生成 `tools/source-id.txt`（未跟踪生成物，提交前重生成；远端 tar 树带上该文件即可上报同一 `diff_sha`）；`.gitignore:8` 已忽略 `tools/source-id.txt`，未生成时 gallery 回退 git/unknown。
 ---
 
+## 15 P3 后实机 BUG 修复：ColorPicker 关闭残影（2026-11-27）
+
+- **现象（用户实机）**：`gallery` 滚动到 section ⑭ 后打开 ColorPicker，关闭后原浮层位置的 **section 卡片间隙**残留色板/OK 按钮像素；OK、Esc、外部点击三条关闭路径均复现；残影静态不变，只有整帧重绘（如滚轮滚动触发 Full）才清除。
+- **根因（不是 damage 漏旧矩形）**：headless 持久增量探针证明关闭帧 `damage_full=false` 且 damage 完整覆盖旧浮层 `(540,321)-(840,696)`；真正缺口是 **gallery 没有不透明全窗背景节点**（只有 `WindowOptions.background` clear color），而 Windows 增量合成在 damage scissor 内只重画与 damage 相交的图元、**不 clear**；浮层覆盖的卡片被重画，卡片之间的 12 logical px 间隙无图元覆盖 → 旧浮层像素保留；FadeScale 关闭动画把半透明帧叠到残留像素上导致 alpha 累积。
+- **修复（用户裁决 A：宿主补 backdrop）**：gallery root 增加全窗不透明 backdrop 节点（`gallery.backdrop`，absolute inset 0，`Role::SurfaceCanvas` 主题绑定，root 改 `relative`），与 `crates/kytrix` 的 `WINDOW_BACKDROP` 同款；复用 `WindowOptions.background` 的初始色 + `bind_style` 主题跟随。
+- **验证（实机 Windows，DPI 125%，`--scroll-to=3150`）**：OK/Esc/外部三路径关闭后与打开前同位置截图对比，除 trigger focus ring / 交互日志 / 窗口边缘外无差异；修复前 OK 路径整帧 23681 changed（含 3 条间隙横条），修复后 OK 38 px（仅窗底边缘）、Esc 2822 px（仅 trigger focus ring 区）、外部 0 px；headless 无 backdrop 探针残留 3696 px、加 backdrop 后 0。
+- **门禁**：`cargo test -p ui_core -p ui_kit`、clippy、fmt、`cargo check --workspace --all-targets`、`gallery --pixel-check` 94、`--debug-stack`、`--real-pixel-check` 106、`--theme-check` 全 PASS。
+- **用户裁决**：本次不新增防回归门禁（不新增 real-gallery ghost gate / headless 无 backdrop 测试），相关建议保留在复现报告中供后续 P4 评估。
+- **审计**：生产 `kytrix` shell 已有 `WINDOW_BACKDROP`；`gallery` 是本次唯一受影响的产品示例宿主；`ui_core/examples` 等开发工具未纳入本次修复。
+- **证据**：`.docs/popup-overlay-redesign/implementation/repro-colorpicker-ghost.md`；实机截图/对比 `E:\kytrix\target\ghost-real\`（`fix-01-before` / `fix-02-open` / `fix-03-closed` / `fix-11-esc-closed` / `fix-12-outside-closed` 与 `*-diff.png`）。
+- **残余观察（P4）**：header 文本亮度在浮层交互后轻微变亮、整帧重绘后恢复，疑似同类增量重合成效应，未定位。
+
+---
+
 ## 附录 A：证据索引
 
 - `popup-overlay-redesign/evidence/engine-overlay-audit.md` — 引擎审计（F1–F12）
